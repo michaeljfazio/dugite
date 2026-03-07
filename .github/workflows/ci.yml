@@ -16,6 +16,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Install system dependencies
+        run: sudo apt-get update && sudo apt-get install -y libclang-dev
+
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
 
@@ -30,14 +33,14 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-cargo-
 
-      - name: Build
-        run: cargo build --all-targets
-
-      - name: Run tests
-        run: cargo test --all
-
       - name: Check formatting
         run: cargo fmt --all -- --check
 
+      - name: Build
+        run: cargo build --all-targets
+
       - name: Clippy
         run: cargo clippy --all-targets -- -D warnings
+
+      - name: Run tests
+        run: cargo test --all
