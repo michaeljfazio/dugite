@@ -425,9 +425,7 @@ fn convert_alonzo_certificate(
         )),
         AC::StakeDelegation(cred, pool_hash) => Some(Certificate::StakeDelegation {
             credential: convert_pallas_stake_credential(cred),
-            pool_hash: pallas_hash_to_torsten32(&pallas_crypto::hash::Hash::from(
-                pool_hash.as_ref(),
-            )),
+            pool_hash: pallas_hash_to_torsten28(pool_hash),
         }),
         AC::PoolRegistration {
             operator,
@@ -440,9 +438,9 @@ fn convert_alonzo_certificate(
             relays,
             pool_metadata,
         } => {
-            let owners: Vec<Hash32> = pool_owners
+            let owners = pool_owners
                 .iter()
-                .map(|h| pallas_hash_to_torsten32(&pallas_crypto::hash::Hash::from(h.as_ref())))
+                .map(pallas_hash_to_torsten28)
                 .collect();
             let pool_relays = relays.iter().filter_map(convert_relay).collect();
             let metadata = pool_metadata.clone();
@@ -452,12 +450,8 @@ fn convert_alonzo_certificate(
             });
 
             Some(Certificate::PoolRegistration(PoolParams {
-                operator: pallas_hash_to_torsten32(&pallas_crypto::hash::Hash::from(
-                    operator.as_ref(),
-                )),
-                vrf_keyhash: pallas_hash_to_torsten32(&pallas_crypto::hash::Hash::from(
-                    vrf_keyhash.as_ref(),
-                )),
+                operator: pallas_hash_to_torsten28(operator),
+                vrf_keyhash: pallas_hash_to_torsten32(vrf_keyhash),
                 pledge: Lovelace(*pledge),
                 cost: Lovelace(*cost),
                 margin: Rational {
@@ -471,9 +465,7 @@ fn convert_alonzo_certificate(
             }))
         }
         AC::PoolRetirement(pool_hash, epoch) => Some(Certificate::PoolRetirement {
-            pool_hash: pallas_hash_to_torsten32(&pallas_crypto::hash::Hash::from(
-                pool_hash.as_ref(),
-            )),
+            pool_hash: pallas_hash_to_torsten28(pool_hash),
             epoch: *epoch,
         }),
         _ => None, // GenesisKeyDelegation, MoveInstantaneousRewards
@@ -493,9 +485,7 @@ fn convert_conway_certificate(
         )),
         CC::StakeDelegation(cred, pool_hash) => Some(Certificate::StakeDelegation {
             credential: convert_pallas_stake_credential(cred),
-            pool_hash: pallas_hash_to_torsten32(&pallas_crypto::hash::Hash::from(
-                pool_hash.as_ref(),
-            )),
+            pool_hash: pallas_hash_to_torsten28(pool_hash),
         }),
         CC::PoolRegistration {
             operator,
@@ -508,9 +498,9 @@ fn convert_conway_certificate(
             relays,
             pool_metadata,
         } => {
-            let owners: Vec<Hash32> = pool_owners
+            let owners = pool_owners
                 .iter()
-                .map(|h| pallas_hash_to_torsten32(&pallas_crypto::hash::Hash::from(h.as_ref())))
+                .map(pallas_hash_to_torsten28)
                 .collect();
             let pool_relays = relays.iter().filter_map(convert_relay).collect();
             let metadata = pool_metadata.clone();
@@ -520,12 +510,8 @@ fn convert_conway_certificate(
             });
 
             Some(Certificate::PoolRegistration(PoolParams {
-                operator: pallas_hash_to_torsten32(&pallas_crypto::hash::Hash::from(
-                    operator.as_ref(),
-                )),
-                vrf_keyhash: pallas_hash_to_torsten32(&pallas_crypto::hash::Hash::from(
-                    vrf_keyhash.as_ref(),
-                )),
+                operator: pallas_hash_to_torsten28(operator),
+                vrf_keyhash: pallas_hash_to_torsten32(vrf_keyhash),
                 pledge: Lovelace(*pledge),
                 cost: Lovelace(*cost),
                 margin: Rational {
@@ -539,16 +525,12 @@ fn convert_conway_certificate(
             }))
         }
         CC::PoolRetirement(pool_hash, epoch) => Some(Certificate::PoolRetirement {
-            pool_hash: pallas_hash_to_torsten32(&pallas_crypto::hash::Hash::from(
-                pool_hash.as_ref(),
-            )),
+            pool_hash: pallas_hash_to_torsten28(pool_hash),
             epoch: *epoch,
         }),
         CC::StakeRegDeleg(cred, pool_hash, deposit) => Some(Certificate::RegStakeDeleg {
             credential: convert_pallas_stake_credential(cred),
-            pool_hash: pallas_hash_to_torsten32(&pallas_crypto::hash::Hash::from(
-                pool_hash.as_ref(),
-            )),
+            pool_hash: pallas_hash_to_torsten28(pool_hash),
             deposit: Lovelace(*deposit),
         }),
         CC::Reg(cred, _deposit) => Some(Certificate::StakeRegistration(

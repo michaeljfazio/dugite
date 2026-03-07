@@ -3,7 +3,7 @@ use std::collections::BTreeMap;
 use torsten_primitives::block::{Block, Point, Tip};
 use torsten_primitives::credentials::Credential;
 use torsten_primitives::era::Era;
-use torsten_primitives::hash::Hash32;
+use torsten_primitives::hash::{Hash28, Hash32};
 use torsten_primitives::protocol_params::ProtocolParameters;
 use torsten_primitives::time::{BlockNo, EpochNo, SlotNo};
 use torsten_primitives::transaction::Certificate;
@@ -29,10 +29,10 @@ pub struct LedgerState {
     pub treasury: Lovelace,
     /// Reserves balance
     pub reserves: Lovelace,
-    /// Delegation state
-    pub delegations: BTreeMap<Hash32, Hash32>,
-    /// Pool registrations
-    pub pool_params: BTreeMap<Hash32, PoolRegistration>,
+    /// Delegation state: credential_hash -> pool_id
+    pub delegations: BTreeMap<Hash32, Hash28>,
+    /// Pool registrations: pool_id -> pool registration
+    pub pool_params: BTreeMap<Hash28, PoolRegistration>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -42,7 +42,7 @@ pub struct StakeDistributionState {
 
 #[derive(Debug, Clone)]
 pub struct PoolRegistration {
-    pub pool_id: Hash32,
+    pub pool_id: Hash28,
     pub vrf_keyhash: Hash32,
     pub pledge: Lovelace,
     pub cost: Lovelace,
@@ -444,7 +444,7 @@ mod tests {
         let mut state = LedgerState::new(params);
 
         let cred = Credential::VerificationKey(Hash28::from_bytes([42u8; 28]));
-        let pool_hash = Hash32::from_bytes([99u8; 32]);
+        let pool_hash = Hash28::from_bytes([99u8; 28]);
 
         // Register first
         state.process_certificate(&Certificate::StakeRegistration(cred.clone()));
@@ -463,7 +463,7 @@ mod tests {
         let params = ProtocolParameters::mainnet_defaults();
         let mut state = LedgerState::new(params);
 
-        let pool_id = Hash32::from_bytes([1u8; 32]);
+        let pool_id = Hash28::from_bytes([1u8; 28]);
         let pool_params = PoolParams {
             operator: pool_id,
             vrf_keyhash: Hash32::from_bytes([2u8; 32]),
@@ -490,7 +490,7 @@ mod tests {
         let mut state = LedgerState::new(params);
 
         let cred = Credential::VerificationKey(Hash28::from_bytes([42u8; 28]));
-        let pool_hash = Hash32::from_bytes([99u8; 32]);
+        let pool_hash = Hash28::from_bytes([99u8; 28]);
         let key = credential_to_hash(&cred);
 
         // Register and delegate
@@ -512,7 +512,7 @@ mod tests {
         let params = ProtocolParameters::mainnet_defaults();
         let mut state = LedgerState::new(params);
 
-        let pool_id = Hash32::from_bytes([1u8; 32]);
+        let pool_id = Hash28::from_bytes([1u8; 28]);
         let pool_params = PoolParams {
             operator: pool_id,
             vrf_keyhash: Hash32::from_bytes([2u8; 32]),

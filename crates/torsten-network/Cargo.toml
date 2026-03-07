@@ -19,6 +19,7 @@ tracing = { workspace = true }
 minicbor = { workspace = true }
 pallas-network = { workspace = true }
 pallas-crypto = { workspace = true }
+pallas-traverse = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }

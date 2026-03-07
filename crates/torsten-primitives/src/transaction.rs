@@ -1,6 +1,8 @@
 use crate::address::Address;
 use crate::credentials::Credential;
-use crate::hash::{AuxiliaryDataHash, DatumHash, Hash32, PolicyId, ScriptHash, TransactionHash};
+use crate::hash::{
+    AuxiliaryDataHash, DatumHash, Hash28, Hash32, PolicyId, ScriptHash, TransactionHash,
+};
 use crate::time::SlotNo;
 use crate::value::{AssetName, Lovelace, Value};
 use serde::{Deserialize, Serialize};
@@ -100,11 +102,11 @@ pub enum Certificate {
     StakeDeregistration(Credential),
     StakeDelegation {
         credential: Credential,
-        pool_hash: Hash32,
+        pool_hash: Hash28,
     },
     PoolRegistration(PoolParams),
     PoolRetirement {
-        pool_hash: Hash32,
+        pool_hash: Hash28,
         epoch: u64,
     },
     // Conway-era governance certificates
@@ -127,12 +129,12 @@ pub enum Certificate {
     },
     StakeVoteDelegation {
         credential: Credential,
-        pool_hash: Hash32,
+        pool_hash: Hash28,
         drep: DRep,
     },
     RegStakeDeleg {
         credential: Credential,
-        pool_hash: Hash32,
+        pool_hash: Hash28,
         deposit: Lovelace,
     },
     CommitteeHotAuth {
@@ -164,13 +166,13 @@ pub struct Anchor {
 /// Stake pool parameters
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PoolParams {
-    pub operator: Hash32,
+    pub operator: Hash28,
     pub vrf_keyhash: Hash32,
     pub pledge: Lovelace,
     pub cost: Lovelace,
     pub margin: Rational,
     pub reward_account: Vec<u8>,
-    pub pool_owners: Vec<Hash32>,
+    pub pool_owners: Vec<Hash28>,
     pub relays: Vec<Relay>,
     pub pool_metadata: Option<PoolMetadata>,
 }

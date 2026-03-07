@@ -2,6 +2,7 @@ use pallas_network::facades::PeerClient;
 use pallas_network::miniprotocols::chainsync::NextResponse;
 use pallas_network::miniprotocols::chainsync::Tip as PallasTip;
 use pallas_network::miniprotocols::Point as PallasPoint;
+use pallas_traverse::MultiEraHeader;
 use std::net::SocketAddr;
 use thiserror::Error;
 use tokio::net::ToSocketAddrs;
@@ -94,8 +95,9 @@ impl NodeToNodeClient {
     }
 
     /// Request the next chain sync event.
-    /// This will either deliver a block, a rollback, or signal that
-    /// we've caught up to the tip.
+    ///
+    /// N2N chainsync delivers headers. When we receive a header, we immediately
+    /// fetch the full block via blockfetch and return it as a RollForward event.
     pub async fn request_next(&mut self) -> Result<ChainSyncEvent, ClientError> {
         let response = self
             .peer
@@ -107,13 +109,38 @@ impl NodeToNodeClient {
         match response {
             NextResponse::RollForward(header, tip) => {
                 let torsten_tip = pallas_tip_to_torsten(&tip);
-                // N2N chainsync delivers headers, we need to fetch the full block
-                // For now, we'll create a minimal block from the header data
-                let block = decode_block(&header.cbor)
-                    .map_err(|e| ClientError::BlockDecode(format!("{e}")))?;
+
+                // Parse the header to extract slot + hash for blockfetch
+                let subtag = header.byron_prefix.map(|(st, _)| st);
+                let multi_era_header =
+                    MultiEraHeader::decode(header.variant, subtag, &header.cbor)
+                        .map_err(|e| ClientError::BlockDecode(format!("header decode: {e}")))?;
+
+                let slot = multi_era_header.slot();
+                let block_no = multi_era_header.number();
+                let hash = multi_era_header.hash();
+
+                let block_point = PallasPoint::Specific(slot, hash.to_vec());
+
+                // Fetch the full block via blockfetch
+                let bodies = self
+                    .peer
+                    .blockfetch()
+                    .fetch_range((block_point.clone(), block_point))
+                    .await
+                    .map_err(|e| ClientError::BlockFetch(format!("fetch block: {e}")))?;
+
+                let cbor = bodies
+                    .into_iter()
+                    .next()
+                    .ok_or_else(|| ClientError::BlockFetch("no block returned".into()))?;
+
+                let block =
+                    decode_block(&cbor).map_err(|e| ClientError::BlockDecode(format!("{e}")))?;
+
                 debug!(
-                    slot = block.slot().0,
-                    block_no = block.block_number().0,
+                    slot,
+                    block_no,
                     txs = block.tx_count(),
                     "roll forward"
                 );
