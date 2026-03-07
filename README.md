@@ -2,6 +2,8 @@
 
 A Cardano node implementation written in Rust, aiming for 100% compatibility with [cardano-node](https://github.com/IntersectMBO/cardano-node).
 
+Built by [Sandstone Pool](https://www.sandstone.io/)
+
 [![CI](https://github.com/michaeljfazio/torsten/actions/workflows/ci.yml/badge.svg)](https://github.com/michaeljfazio/torsten/actions/workflows/ci.yml)
 
 ## Architecture
@@ -116,13 +118,13 @@ Zero-warning policy enforced — all code must compile with `cargo clippy -- -D 
 - [x] Conway governance: DRep registration, vote delegation, committee auth, proposals, voting
 - [x] CLI: transaction build, sign, view, txid
 - [x] CLI: key generation (payment, stake, DRep), address building
+- [x] Transaction submission via LocalTxSubmission mini-protocol
 
 ### In Progress
 
 - [ ] VRF/KES cryptographic verification
 - [ ] Full Plutus script validation (CEK machine)
 - [ ] Governance action ratification and enactment
-- [ ] Transaction submission via LocalTxSubmission
 - [ ] Full cardano-cli command parity
 - [ ] Performance optimization for initial sync
 

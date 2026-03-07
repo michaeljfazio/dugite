@@ -22,6 +22,7 @@ pub enum N2CClientError {
 
 /// N2C mini-protocol IDs
 const MINI_PROTOCOL_HANDSHAKE: u16 = 0;
+const MINI_PROTOCOL_TX_SUBMISSION: u16 = 6;
 const MINI_PROTOCOL_STATE_QUERY: u16 = 7;
 
 /// Node-to-Client client for connecting to a Cardano node via Unix socket.
@@ -254,6 +255,87 @@ impl N2CClient {
         parse_u64_result(&result)
     }
 
+    /// Submit a transaction via LocalTxSubmission
+    ///
+    /// The tx_cbor should be the raw CBOR bytes of the signed transaction.
+    /// Returns Ok(()) if accepted, Err with rejection reason if rejected.
+    pub async fn submit_tx(&mut self, tx_cbor: &[u8]) -> Result<(), N2CClientError> {
+        // Build MsgSubmitTx: [0, [era_id, tx_bytes]]
+        // era_id 6 = Conway
+        let mut payload = Vec::new();
+        let mut enc = minicbor::Encoder::new(&mut payload);
+        enc.array(2)
+            .map_err(|e| N2CClientError::Protocol(e.to_string()))?;
+        enc.u32(0)
+            .map_err(|e| N2CClientError::Protocol(e.to_string()))?; // MsgSubmitTx
+        enc.array(2)
+            .map_err(|e| N2CClientError::Protocol(e.to_string()))?;
+        enc.u32(6)
+            .map_err(|e| N2CClientError::Protocol(e.to_string()))?; // Conway era
+        enc.bytes(tx_cbor)
+            .map_err(|e| N2CClientError::Protocol(e.to_string()))?;
+
+        let segment = Segment {
+            transmission_time: 0,
+            protocol_id: MINI_PROTOCOL_TX_SUBMISSION,
+            is_responder: false,
+            payload,
+        };
+        self.send_segment(&segment).await?;
+
+        // Read response: MsgAcceptTx [1] or MsgRejectTx [2, reason]
+        let resp = self.recv_segment().await?;
+        if resp.protocol_id != MINI_PROTOCOL_TX_SUBMISSION {
+            return Err(N2CClientError::Protocol(format!(
+                "Expected tx submission response, got protocol {}",
+                resp.protocol_id
+            )));
+        }
+
+        let mut decoder = minicbor::Decoder::new(&resp.payload);
+        let _ = decoder.array();
+        let msg_tag = decoder
+            .u32()
+            .map_err(|e| N2CClientError::Protocol(format!("bad tx response tag: {e}")))?;
+
+        match msg_tag {
+            1 => Ok(()), // MsgAcceptTx
+            2 => {
+                // MsgRejectTx - extract reason
+                let reason = if let Ok(Some(_)) = decoder.array() {
+                    decoder.str().unwrap_or("unknown rejection reason").to_string()
+                } else {
+                    "transaction rejected".to_string()
+                };
+                Err(N2CClientError::Protocol(format!(
+                    "Transaction rejected: {reason}"
+                )))
+            }
+            other => Err(N2CClientError::Protocol(format!(
+                "unexpected tx submission response tag: {other}"
+            ))),
+        }
+    }
+
+    /// Send MsgDone for the LocalTxSubmission protocol
+    pub async fn tx_submission_done(&mut self) -> Result<(), N2CClientError> {
+        let mut payload = Vec::new();
+        let mut enc = minicbor::Encoder::new(&mut payload);
+        enc.array(1)
+            .map_err(|e| N2CClientError::Protocol(e.to_string()))?;
+        enc.u32(3)
+            .map_err(|e| N2CClientError::Protocol(e.to_string()))?; // MsgDone
+
+        let segment = Segment {
+            transmission_time: 0,
+            protocol_id: MINI_PROTOCOL_TX_SUBMISSION,
+            is_responder: false,
+            payload,
+        };
+        self.send_segment(&segment).await?;
+        Ok(())
+    }
+
     /// Send a Shelley-era query and return the raw MsgResult payload
     async fn send_query(&mut self, shelley_tag: u32) -> Result<Vec<u8>, N2CClientError> {
         // Build MsgQuery: [3, [era, [shelley_tag]]]
@@ -437,5 +519,42 @@ mod tests {
         enc.u64(100).unwrap();
 
         assert!(parse_u64_result(&buf).is_err());
+    }
+
+    #[test]
+    fn test_parse_tx_accept_response() {
+        // Simulate what submit_tx would parse: MsgAcceptTx [1]
+        let mut buf = Vec::new();
+        let mut enc = minicbor::Encoder::new(&mut buf);
+        enc.array(1).unwrap();
+        enc.u32(1).unwrap(); // MsgAcceptTx
+
+        let mut decoder = minicbor::Decoder::new(&buf);
+        let _ = decoder.array();
+        let tag = decoder.u32().unwrap();
+        assert_eq!(tag, 1);
+    }
+
+    #[test]
+    fn test_parse_tx_reject_response() {
+        // Simulate MsgRejectTx [2, ["reason"]]
+        let mut buf = Vec::new();
+        let mut enc = minicbor::Encoder::new(&mut buf);
+        enc.array(2).unwrap();
+        enc.u32(2).unwrap(); // MsgRejectTx
+        enc.array(1).unwrap();
+        enc.str("mempool full").unwrap();
+
+        let mut decoder = minicbor::Decoder::new(&buf);
+        let _ = decoder.array();
+        let tag = decoder.u32().unwrap();
+        assert_eq!(tag, 2);
+
+        if let Ok(Some(_)) = decoder.array() {
+            let reason = decoder.str().unwrap();
+            assert_eq!(reason, "mempool full");
+        } else {
+            panic!("expected array");
+        }
     }
 }

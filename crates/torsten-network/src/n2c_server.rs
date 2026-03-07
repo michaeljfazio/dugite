@@ -4,6 +4,8 @@ use thiserror::Error;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UnixListener;
 use tokio::sync::RwLock;
+use torsten_mempool::Mempool;
+use torsten_primitives::hash::Hash32;
 use tracing::{debug, error, info, warn};
 
 use crate::multiplexer::Segment;
@@ -28,11 +30,15 @@ const MINI_PROTOCOL_STATE_QUERY: u16 = 7;
 /// Node-to-Client server that listens on a Unix domain socket.
 pub struct N2CServer {
     query_handler: Arc<RwLock<QueryHandler>>,
+    mempool: Arc<Mempool>,
 }
 
 impl N2CServer {
-    pub fn new(query_handler: Arc<RwLock<QueryHandler>>) -> Self {
-        N2CServer { query_handler }
+    pub fn new(query_handler: Arc<RwLock<QueryHandler>>, mempool: Arc<Mempool>) -> Self {
+        N2CServer {
+            query_handler,
+            mempool,
+        }
     }
 
     /// Start listening on the given Unix socket path.
@@ -51,8 +57,9 @@ impl N2CServer {
                 Ok((stream, _addr)) => {
                     info!("N2C client connected");
                     let handler = self.query_handler.clone();
+                    let mempool = self.mempool.clone();
                     tokio::spawn(async move {
-                        if let Err(e) = handle_n2c_connection(stream, handler).await {
+                        if let Err(e) = handle_n2c_connection(stream, handler, mempool).await {
                             warn!("N2C connection error: {e}");
                         }
                         debug!("N2C client disconnected");
@@ -70,6 +77,7 @@ impl N2CServer {
 async fn handle_n2c_connection(
     mut stream: tokio::net::UnixStream,
     query_handler: Arc<RwLock<QueryHandler>>,
+    mempool: Arc<Mempool>,
 ) -> Result<(), N2CServerError> {
     let mut buf = vec![0u8; 65536];
 
@@ -92,7 +100,8 @@ async fn handle_n2c_connection(
                     offset += consumed;
 
                     // Process the segment
-                    let response = process_segment(&segment, &query_handler).await?;
+                    let response =
+                        process_segment(&segment, &query_handler, &mempool).await?;
                     if let Some(resp_segment) = response {
                         let encoded = resp_segment.encode();
                         stream.write_all(&encoded).await?;
@@ -110,14 +119,12 @@ async fn handle_n2c_connection(
 async fn process_segment(
     segment: &Segment,
     query_handler: &Arc<RwLock<QueryHandler>>,
+    mempool: &Arc<Mempool>,
 ) -> Result<Option<Segment>, N2CServerError> {
     match segment.protocol_id {
         MINI_PROTOCOL_HANDSHAKE => handle_handshake(&segment.payload),
         MINI_PROTOCOL_STATE_QUERY => handle_state_query(&segment.payload, query_handler).await,
-        MINI_PROTOCOL_TX_SUBMISSION => {
-            debug!("LocalTxSubmission message received (not yet implemented)");
-            Ok(None)
-        }
+        MINI_PROTOCOL_TX_SUBMISSION => handle_tx_submission(&segment.payload, mempool),
         MINI_PROTOCOL_CHAINSYNC => {
             debug!("LocalChainSync message received (not yet implemented)");
             Ok(None)
@@ -219,6 +226,139 @@ fn parse_highest_version(payload: &[u8]) -> Option<u16> {
     } else {
         None
     }
+}
+
+/// Handle LocalTxSubmission messages
+///
+/// Protocol flow:
+///   Client: MsgSubmitTx(era_id, tx_cbor) → Server: MsgAcceptTx | MsgRejectTx(reason)
+///   Client: MsgDone → (end)
+///
+/// Message tags:
+///   0: MsgSubmitTx [0, [era_id, tagged_tx_bytes]]
+///   1: MsgAcceptTx [1]
+///   2: MsgRejectTx [2, reason]
+///   3: MsgDone     [3]
+fn handle_tx_submission(
+    payload: &[u8],
+    mempool: &Arc<Mempool>,
+) -> Result<Option<Segment>, N2CServerError> {
+    let mut decoder = minicbor::Decoder::new(payload);
+
+    let msg_tag = match decoder.array() {
+        Ok(Some(len)) if len >= 1 => decoder
+            .u32()
+            .map_err(|e| N2CServerError::Protocol(format!("bad tx submission msg tag: {e}")))?,
+        Ok(None) => decoder
+            .u32()
+            .map_err(|e| N2CServerError::Protocol(format!("bad tx submission msg tag: {e}")))?,
+        _ => {
+            return Err(N2CServerError::Protocol(
+                "invalid tx submission message".into(),
+            ))
+        }
+    };
+
+    match msg_tag {
+        0 => {
+            // MsgSubmitTx: [0, [era_id, tx_bytes]]
+            debug!("LocalTxSubmission: MsgSubmitTx");
+
+            // Extract the raw transaction bytes from the submission
+            // The payload after tag 0 is [era_id, tx_cbor]
+            let tx_cbor = extract_submitted_tx(&mut decoder);
+
+            match tx_cbor {
+                Some(tx_bytes) => {
+                    // Compute transaction hash from the CBOR bytes
+                    let tx_hash_bytes = torsten_primitives::hash::blake2b_256(&tx_bytes);
+                    let tx_hash = Hash32::from_bytes(*tx_hash_bytes.as_bytes());
+                    let tx_size = tx_bytes.len();
+
+                    // Create a minimal transaction for mempool storage
+                    let tx = torsten_primitives::transaction::Transaction::empty_with_hash(tx_hash);
+
+                    match mempool.add_tx(tx_hash, tx, tx_size) {
+                        Ok(torsten_mempool::MempoolAddResult::Added) => {
+                            info!("Transaction accepted into mempool: {tx_hash}");
+                            encode_tx_accept()
+                        }
+                        Ok(torsten_mempool::MempoolAddResult::AlreadyExists) => {
+                            debug!("Transaction already in mempool: {tx_hash}");
+                            encode_tx_accept()
+                        }
+                        Err(e) => {
+                            warn!("Transaction rejected: {e}");
+                            encode_tx_reject(&e.to_string())
+                        }
+                    }
+                }
+                None => {
+                    warn!("Failed to extract transaction from submission");
+                    encode_tx_reject("Failed to decode submitted transaction")
+                }
+            }
+        }
+        3 => {
+            // MsgDone
+            debug!("LocalTxSubmission: MsgDone");
+            Ok(None)
+        }
+        other => {
+            warn!("Unknown LocalTxSubmission message tag: {other}");
+            Ok(None)
+        }
+    }
+}
+
+/// Extract transaction CBOR bytes from a MsgSubmitTx payload
+fn extract_submitted_tx(decoder: &mut minicbor::Decoder) -> Option<Vec<u8>> {
+    // The structure after the tag is: [era_id, tx_bytes]
+    // era_id is a u16, tx_bytes is CBOR bytes
+    let _ = decoder.array().ok()?;
+    let _era_id = decoder.u32().ok()?;
+    // The tx is encoded as a CBOR byte string containing the serialized transaction
+    let tx_bytes = decoder.bytes().ok()?;
+    Some(tx_bytes.to_vec())
+}
+
+/// Encode MsgAcceptTx response: [1]
+fn encode_tx_accept() -> Result<Option<Segment>, N2CServerError> {
+    let mut buf = Vec::new();
+    let mut enc = minicbor::Encoder::new(&mut buf);
+    enc.array(1)
+        .map_err(|e| N2CServerError::Protocol(e.to_string()))?;
+    enc.u32(1)
+        .map_err(|e| N2CServerError::Protocol(e.to_string()))?;
+
+    Ok(Some(Segment {
+        transmission_time: 0,
+        protocol_id: MINI_PROTOCOL_TX_SUBMISSION,
+        is_responder: true,
+        payload: buf,
+    }))
+}
+
+/// Encode MsgRejectTx response: [2, [reason_tag, reason_text]]
+fn encode_tx_reject(reason: &str) -> Result<Option<Segment>, N2CServerError> {
+    let mut buf = Vec::new();
+    let mut enc = minicbor::Encoder::new(&mut buf);
+    enc.array(2)
+        .map_err(|e| N2CServerError::Protocol(e.to_string()))?;
+    enc.u32(2)
+        .map_err(|e| N2CServerError::Protocol(e.to_string()))?;
+    // Rejection reason as an array with a text description
+    enc.array(1)
+        .map_err(|e| N2CServerError::Protocol(e.to_string()))?;
+    enc.str(reason)
+        .map_err(|e| N2CServerError::Protocol(e.to_string()))?;
+
+    Ok(Some(Segment {
+        transmission_time: 0,
+        protocol_id: MINI_PROTOCOL_TX_SUBMISSION,
+        is_responder: true,
+        payload: buf,
+    }))
 }
 
 /// Handle LocalStateQuery messages
@@ -426,5 +566,113 @@ mod tests {
         };
         let cbor = encode_query_result(&result);
         assert!(!cbor.is_empty());
+    }
+
+    #[test]
+    fn test_handle_tx_submission_accept() {
+        let mempool = Arc::new(Mempool::new(torsten_mempool::MempoolConfig::default()));
+
+        // Build MsgSubmitTx: [0, [6, tx_bytes]]
+        let tx_bytes = vec![0xa0u8]; // minimal CBOR (empty map)
+        let mut payload = Vec::new();
+        let mut enc = minicbor::Encoder::new(&mut payload);
+        enc.array(2).unwrap();
+        enc.u32(0).unwrap(); // MsgSubmitTx
+        enc.array(2).unwrap();
+        enc.u32(6).unwrap(); // Conway era
+        enc.bytes(&tx_bytes).unwrap();
+
+        let result = handle_tx_submission(&payload, &mempool).unwrap();
+        assert!(result.is_some());
+
+        let segment = result.unwrap();
+        assert_eq!(segment.protocol_id, MINI_PROTOCOL_TX_SUBMISSION);
+        assert!(segment.is_responder);
+
+        // Verify MsgAcceptTx [1]
+        let mut decoder = minicbor::Decoder::new(&segment.payload);
+        let _ = decoder.array();
+        let tag = decoder.u32().unwrap();
+        assert_eq!(tag, 1); // MsgAcceptTx
+
+        // Verify tx was added to mempool
+        assert_eq!(mempool.len(), 1);
+    }
+
+    #[test]
+    fn test_handle_tx_submission_duplicate() {
+        let mempool = Arc::new(Mempool::new(torsten_mempool::MempoolConfig::default()));
+
+        let tx_bytes = vec![0xa0u8];
+        let mut payload = Vec::new();
+        let mut enc = minicbor::Encoder::new(&mut payload);
+        enc.array(2).unwrap();
+        enc.u32(0).unwrap();
+        enc.array(2).unwrap();
+        enc.u32(6).unwrap();
+        enc.bytes(&tx_bytes).unwrap();
+
+        // Submit twice - both should accept
+        let _ = handle_tx_submission(&payload, &mempool).unwrap();
+        let result = handle_tx_submission(&payload, &mempool).unwrap();
+        assert!(result.is_some());
+
+        let segment = result.unwrap();
+        let mut decoder = minicbor::Decoder::new(&segment.payload);
+        let _ = decoder.array();
+        assert_eq!(decoder.u32().unwrap(), 1); // Still accepted (AlreadyExists)
+        assert_eq!(mempool.len(), 1);
+    }
+
+    #[test]
+    fn test_handle_tx_submission_full_mempool() {
+        let config = torsten_mempool::MempoolConfig {
+            max_transactions: 1,
+            max_bytes: 1024 * 1024,
+        };
+        let mempool = Arc::new(Mempool::new(config));
+
+        // Fill the mempool
+        let tx_bytes_1 = vec![0xa0u8];
+        let mut payload1 = Vec::new();
+        let mut enc = minicbor::Encoder::new(&mut payload1);
+        enc.array(2).unwrap();
+        enc.u32(0).unwrap();
+        enc.array(2).unwrap();
+        enc.u32(6).unwrap();
+        enc.bytes(&tx_bytes_1).unwrap();
+        let _ = handle_tx_submission(&payload1, &mempool).unwrap();
+
+        // Submit a different tx - should be rejected
+        let tx_bytes_2 = vec![0xa1u8, 0x00, 0x01]; // different CBOR
+        let mut payload2 = Vec::new();
+        let mut enc = minicbor::Encoder::new(&mut payload2);
+        enc.array(2).unwrap();
+        enc.u32(0).unwrap();
+        enc.array(2).unwrap();
+        enc.u32(6).unwrap();
+        enc.bytes(&tx_bytes_2).unwrap();
+
+        let result = handle_tx_submission(&payload2, &mempool).unwrap();
+        assert!(result.is_some());
+
+        let segment = result.unwrap();
+        let mut decoder = minicbor::Decoder::new(&segment.payload);
+        let _ = decoder.array();
+        assert_eq!(decoder.u32().unwrap(), 2); // MsgRejectTx
+    }
+
+    #[test]
+    fn test_handle_tx_submission_done() {
+        let mempool = Arc::new(Mempool::new(torsten_mempool::MempoolConfig::default()));
+
+        // Build MsgDone: [3]
+        let mut payload = Vec::new();
+        let mut enc = minicbor::Encoder::new(&mut payload);
+        enc.array(1).unwrap();
+        enc.u32(3).unwrap();
+
+        let result = handle_tx_submission(&payload, &mempool).unwrap();
+        assert!(result.is_none());
     }
 }

@@ -355,6 +355,49 @@ pub struct Transaction {
     pub auxiliary_data: Option<AuxiliaryData>,
 }
 
+impl Transaction {
+    /// Create a minimal transaction with only a hash set, used for mempool tracking
+    pub fn empty_with_hash(hash: crate::hash::TransactionHash) -> Self {
+        Transaction {
+            hash,
+            body: TransactionBody {
+                inputs: vec![],
+                outputs: vec![],
+                fee: crate::value::Lovelace(0),
+                ttl: None,
+                certificates: vec![],
+                withdrawals: std::collections::BTreeMap::new(),
+                auxiliary_data_hash: None,
+                validity_interval_start: None,
+                mint: std::collections::BTreeMap::new(),
+                script_data_hash: None,
+                collateral: vec![],
+                required_signers: vec![],
+                network_id: None,
+                collateral_return: None,
+                total_collateral: None,
+                reference_inputs: vec![],
+                voting_procedures: std::collections::BTreeMap::new(),
+                proposal_procedures: vec![],
+                treasury_value: None,
+                donation: None,
+            },
+            witness_set: TransactionWitnessSet {
+                vkey_witnesses: vec![],
+                native_scripts: vec![],
+                bootstrap_witnesses: vec![],
+                plutus_v1_scripts: vec![],
+                plutus_v2_scripts: vec![],
+                plutus_v3_scripts: vec![],
+                plutus_data: vec![],
+                redeemers: vec![],
+            },
+            is_valid: true,
+            auxiliary_data: None,
+        }
+    }
+}
+
 /// Transaction body
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TransactionBody {

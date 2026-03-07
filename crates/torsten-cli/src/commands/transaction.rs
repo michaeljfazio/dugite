@@ -280,11 +280,40 @@ impl TransactionCmd {
             }
             TxSubcommand::Submit {
                 tx_file,
-                socket_path: _,
+                socket_path,
             } => {
-                println!("Transaction submission via local socket not yet implemented.");
-                println!("File: {}", tx_file.display());
-                println!("(Requires LocalTxSubmission mini-protocol implementation)");
+                // Read signed transaction
+                let content = std::fs::read_to_string(&tx_file)?;
+                let envelope: serde_json::Value = serde_json::from_str(&content)?;
+                let cbor_hex = envelope["cborHex"]
+                    .as_str()
+                    .ok_or_else(|| anyhow::anyhow!("Missing cborHex in tx file"))?;
+                let tx_cbor = hex::decode(cbor_hex)?;
+
+                // Compute the transaction ID for display
+                let body_cbor = extract_tx_body(&tx_cbor)?;
+                let tx_hash = torsten_crypto::signing::hash_transaction(&body_cbor);
+
+                // Submit via N2C socket
+                let rt = tokio::runtime::Runtime::new()?;
+                rt.block_on(async {
+                    let mut client =
+                        torsten_network::N2CClient::connect(&socket_path).await
+                            .map_err(|e| anyhow::anyhow!("Cannot connect to node socket: {e}"))?;
+
+                    // Handshake (use mainnet magic by default, will be negotiated)
+                    client.handshake(764824073).await
+                        .map_err(|e| anyhow::anyhow!("Handshake failed: {e}"))?;
+
+                    // Submit the transaction
+                    client.submit_tx(&tx_cbor).await
+                        .map_err(|e| anyhow::anyhow!("{e}"))?;
+
+                    println!("Transaction successfully submitted.");
+                    println!("Transaction ID: {tx_hash}");
+                    Ok::<(), anyhow::Error>(())
+                })?;
+
                 Ok(())
             }
             TxSubcommand::TxId { tx_file } => {
