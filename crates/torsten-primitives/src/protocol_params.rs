@@ -44,6 +44,26 @@ pub struct ProtocolParameters {
     pub committee_min_size: u64,
     pub committee_max_term_length: u64,
 
+    // Governance voting thresholds (as rationals)
+    /// DRep voting threshold for ParameterChange
+    pub dvt_p_param_change: Rational,
+    /// DRep voting threshold for HardForkInitiation
+    pub dvt_hard_fork: Rational,
+    /// DRep voting threshold for NoConfidence
+    pub dvt_no_confidence: Rational,
+    /// DRep voting threshold for UpdateCommittee (normal state)
+    pub dvt_committee_normal: Rational,
+    /// DRep voting threshold for UpdateCommittee (no confidence state)
+    pub dvt_committee_no_confidence: Rational,
+    /// DRep voting threshold for NewConstitution
+    pub dvt_constitution: Rational,
+    /// DRep voting threshold for TreasuryWithdrawals
+    pub dvt_treasury_withdrawal: Rational,
+    /// SPO voting threshold for HardForkInitiation
+    pub pvt_hard_fork: Rational,
+    /// SPO voting threshold for NoConfidence/UpdateCommittee
+    pub pvt_committee: Rational,
+
     // Protocol version
     pub protocol_version_major: u64,
     pub protocol_version_minor: u64,
@@ -124,6 +144,42 @@ impl ProtocolParameters {
             gov_action_lifetime: 6,
             committee_min_size: 7,
             committee_max_term_length: 146,
+            dvt_p_param_change: Rational {
+                numerator: 67,
+                denominator: 100,
+            },
+            dvt_hard_fork: Rational {
+                numerator: 60,
+                denominator: 100,
+            },
+            dvt_no_confidence: Rational {
+                numerator: 67,
+                denominator: 100,
+            },
+            dvt_committee_normal: Rational {
+                numerator: 67,
+                denominator: 100,
+            },
+            dvt_committee_no_confidence: Rational {
+                numerator: 60,
+                denominator: 100,
+            },
+            dvt_constitution: Rational {
+                numerator: 75,
+                denominator: 100,
+            },
+            dvt_treasury_withdrawal: Rational {
+                numerator: 67,
+                denominator: 100,
+            },
+            pvt_hard_fork: Rational {
+                numerator: 51,
+                denominator: 100,
+            },
+            pvt_committee: Rational {
+                numerator: 51,
+                denominator: 100,
+            },
             protocol_version_major: 9,
             protocol_version_minor: 0,
         }
