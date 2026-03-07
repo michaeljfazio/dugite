@@ -185,6 +185,11 @@ impl Node {
                                             error!("Failed to store block: {e}");
                                         }
 
+                                        // Apply block to ledger state
+                                        if let Err(e) = self.ledger_state.apply_block(&block) {
+                                            error!("Failed to apply block to ledger: {e}");
+                                        }
+
                                         // Update consensus tip
                                         self.consensus.update_tip(block.tip());
 
@@ -198,11 +203,15 @@ impl Node {
                                             } else {
                                                 0.0
                                             };
+                                            let utxo_count = self.ledger_state.utxo_set.len();
+                                            let epoch = self.ledger_state.epoch.0;
                                             info!(
                                                 slot,
                                                 block_no,
                                                 tx_count,
                                                 blocks_received,
+                                                utxo_count,
+                                                epoch,
                                                 progress = format!("{progress:.2}%"),
                                                 "sync progress"
                                             );

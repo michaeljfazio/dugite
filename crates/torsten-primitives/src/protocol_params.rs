@@ -55,6 +55,11 @@ impl ProtocolParameters {
         Lovelace(self.min_fee_a * tx_size + self.min_fee_b)
     }
 
+    /// Active slot coefficient (1/20 = 0.05 on mainnet)
+    pub fn active_slot_coeff(&self) -> f64 {
+        0.05 // TODO: make configurable per-network
+    }
+
     /// Calculate minimum UTxO value (ada-only)
     pub fn min_utxo_value(&self) -> Lovelace {
         // Minimum UTxO for a simple ada-only output (roughly 29 bytes overhead)

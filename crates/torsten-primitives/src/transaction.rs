@@ -184,6 +184,16 @@ pub struct Rational {
     pub denominator: u64,
 }
 
+impl Rational {
+    /// Convert to f64
+    pub fn as_f64(&self) -> f64 {
+        if self.denominator == 0 {
+            return 0.0;
+        }
+        self.numerator as f64 / self.denominator as f64
+    }
+}
+
 /// Pool relay
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Relay {
