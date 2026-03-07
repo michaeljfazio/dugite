@@ -159,6 +159,106 @@ impl NodeToNodeClient {
         }
     }
 
+    /// Request a batch of blocks from chain sync, fetching them via blockfetch in ranges.
+    /// This is much faster than fetching one block at a time during initial sync.
+    /// Returns a vec of events (RollForward/RollBackward) or Await if caught up.
+    pub async fn request_next_batch(
+        &mut self,
+        batch_size: usize,
+    ) -> Result<Vec<ChainSyncEvent>, ClientError> {
+        let mut events = Vec::new();
+        let mut pending_points: Vec<PallasPoint> = Vec::new();
+        let mut latest_tip = None;
+
+        // Collect headers from chainsync
+        for _ in 0..batch_size {
+            let response = self
+                .peer
+                .chainsync()
+                .request_or_await_next()
+                .await
+                .map_err(|e| ClientError::ChainSync(format!("request_next: {e}")))?;
+
+            match response {
+                NextResponse::RollForward(header, tip) => {
+                    latest_tip = Some(tip);
+                    let subtag = header.byron_prefix.map(|(st, _)| st);
+                    let multi_era_header =
+                        MultiEraHeader::decode(header.variant, subtag, &header.cbor)
+                            .map_err(|e| {
+                                ClientError::BlockDecode(format!("header decode: {e}"))
+                            })?;
+
+                    let slot = multi_era_header.slot();
+                    let hash = multi_era_header.hash();
+                    pending_points.push(PallasPoint::Specific(slot, hash.to_vec()));
+                }
+                NextResponse::RollBackward(point, tip) => {
+                    // Flush any pending blocks before the rollback
+                    if !pending_points.is_empty() {
+                        let tip_ref = latest_tip.as_ref().unwrap();
+                        let fetched =
+                            self.fetch_and_decode_range(&pending_points, tip_ref).await?;
+                        events.extend(fetched);
+                        pending_points.clear();
+                    }
+                    let torsten_point = pallas_point_to_torsten(&point);
+                    let torsten_tip = pallas_tip_to_torsten(&tip);
+                    warn!("rollback to {torsten_point}");
+                    events.push(ChainSyncEvent::RollBackward(torsten_point, torsten_tip));
+                    break;
+                }
+                NextResponse::Await => {
+                    // Flush pending blocks, then signal await
+                    if !pending_points.is_empty() {
+                        let tip_ref = latest_tip.as_ref().unwrap();
+                        let fetched =
+                            self.fetch_and_decode_range(&pending_points, tip_ref).await?;
+                        events.extend(fetched);
+                        pending_points.clear();
+                    }
+                    events.push(ChainSyncEvent::Await);
+                    break;
+                }
+            }
+        }
+
+        // Fetch all pending blocks in one range
+        if !pending_points.is_empty() {
+            let tip_ref = latest_tip.as_ref().unwrap();
+            let fetched = self.fetch_and_decode_range(&pending_points, tip_ref).await?;
+            events.extend(fetched);
+        }
+
+        Ok(events)
+    }
+
+    /// Fetch a range of blocks and decode them into ChainSyncEvents
+    async fn fetch_and_decode_range(
+        &mut self,
+        points: &[PallasPoint],
+        tip: &PallasTip,
+    ) -> Result<Vec<ChainSyncEvent>, ClientError> {
+        let first = points.first().unwrap().clone();
+        let last = points.last().unwrap().clone();
+
+        let bodies = self
+            .peer
+            .blockfetch()
+            .fetch_range((first, last))
+            .await
+            .map_err(|e| ClientError::BlockFetch(format!("fetch range: {e}")))?;
+
+        let torsten_tip = pallas_tip_to_torsten(tip);
+        let mut events = Vec::with_capacity(bodies.len());
+        for cbor in bodies {
+            let block =
+                decode_block(&cbor).map_err(|e| ClientError::BlockDecode(format!("{e}")))?;
+            events.push(ChainSyncEvent::RollForward(Box::new(block), torsten_tip.clone()));
+        }
+        Ok(events)
+    }
+
     /// Fetch a range of blocks from the peer using the block-fetch protocol.
     pub async fn fetch_block_range(
         &mut self,

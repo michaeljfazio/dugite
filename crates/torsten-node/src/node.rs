@@ -151,9 +151,10 @@ impl Node {
         }
         info!("Remote tip: {remote_tip}");
 
-        // Main sync loop
+        // Main sync loop — fetch blocks in batches for faster sync
         let mut blocks_received: u64 = 0;
         let mut last_log_slot: u64 = 0;
+        let batch_size = 100;
 
         loop {
             // Check for shutdown
@@ -163,58 +164,65 @@ impl Node {
             }
 
             tokio::select! {
-                result = client.request_next() => {
+                result = client.request_next_batch(batch_size) => {
                     match result {
-                        Ok(ChainSyncEvent::RollForward(block, tip)) => {
-                            let slot = block.slot().0;
-                            let block_no = block.block_number().0;
-                            let tx_count = block.tx_count();
+                        Ok(events) => {
+                            for event in events {
+                                match event {
+                                    ChainSyncEvent::RollForward(block, tip) => {
+                                        let slot = block.slot().0;
+                                        let block_no = block.block_number().0;
+                                        let tx_count = block.tx_count();
 
-                            // Store the block
-                            if let Err(e) = self.chain_db.add_block(
-                                *block.hash(),
-                                block.slot(),
-                                block.block_number(),
-                                *block.prev_hash(),
-                                block.raw_cbor.clone().unwrap_or_default(),
-                            ) {
-                                error!("Failed to store block: {e}");
+                                        // Store the block
+                                        if let Err(e) = self.chain_db.add_block(
+                                            *block.hash(),
+                                            block.slot(),
+                                            block.block_number(),
+                                            *block.prev_hash(),
+                                            block.raw_cbor.clone().unwrap_or_default(),
+                                        ) {
+                                            error!("Failed to store block: {e}");
+                                        }
+
+                                        // Update consensus tip
+                                        self.consensus.update_tip(block.tip());
+
+                                        blocks_received += 1;
+
+                                        // Log progress periodically
+                                        if slot - last_log_slot >= 10000 || blocks_received <= 5 {
+                                            let tip_slot = tip.point.slot().map(|s| s.0).unwrap_or(0);
+                                            let progress = if tip_slot > 0 {
+                                                (slot as f64 / tip_slot as f64 * 100.0).min(100.0)
+                                            } else {
+                                                0.0
+                                            };
+                                            info!(
+                                                slot,
+                                                block_no,
+                                                tx_count,
+                                                blocks_received,
+                                                progress = format!("{progress:.2}%"),
+                                                "sync progress"
+                                            );
+                                            last_log_slot = slot;
+                                        }
+                                    }
+                                    ChainSyncEvent::RollBackward(point, tip) => {
+                                        warn!("Rollback to {point}, tip: {tip}");
+                                        if let Err(e) = self.chain_db.rollback_to_point(&point) {
+                                            error!("Rollback failed: {e}");
+                                        }
+                                    }
+                                    ChainSyncEvent::Await => {
+                                        info!(
+                                            blocks_received,
+                                            "Caught up to chain tip, awaiting new blocks"
+                                        );
+                                    }
+                                }
                             }
-
-                            // Update consensus tip
-                            self.consensus.update_tip(block.tip());
-
-                            blocks_received += 1;
-
-                            // Log progress periodically
-                            if slot - last_log_slot >= 10000 || blocks_received <= 5 {
-                                let tip_slot = tip.point.slot().map(|s| s.0).unwrap_or(0);
-                                let progress = if tip_slot > 0 {
-                                    (slot as f64 / tip_slot as f64 * 100.0).min(100.0)
-                                } else {
-                                    0.0
-                                };
-                                info!(
-                                    slot,
-                                    block_no,
-                                    tx_count,
-                                    blocks_received,
-                                    progress = format!("{progress:.2}%"),
-                                    "sync progress"
-                                );
-                                last_log_slot = slot;
-                            }
-                        }
-                        Ok(ChainSyncEvent::RollBackward(point, tip)) => {
-                            warn!("Rollback to {point}, tip: {tip}");
-                            // TODO: Handle chain rollback in storage/ledger
-                        }
-                        Ok(ChainSyncEvent::Await) => {
-                            info!(
-                                blocks_received,
-                                "Caught up to chain tip, awaiting new blocks"
-                            );
-                            // Continue the loop to wait for new blocks
                         }
                         Err(e) => {
                             error!("Chain sync error: {e}");
