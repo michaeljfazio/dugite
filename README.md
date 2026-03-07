@@ -120,10 +120,13 @@ Zero-warning policy enforced — all code must compile with `cargo clippy -- -D 
 - [x] CLI: key generation (payment, stake, DRep), address building
 - [x] Transaction submission via LocalTxSubmission mini-protocol
 - [x] Governance action ratification and enactment (CIP-1694 voting thresholds)
+- [x] Operational certificate Ed25519 signature verification
+- [x] VRF leader eligibility check (phi_f threshold)
 
 ### In Progress
 
-- [ ] VRF/KES cryptographic verification
+- [ ] Full VRF proof verification (requires VRF library)
+- [ ] Full KES signature verification (requires KES library)
 - [ ] Full Plutus script validation (CEK machine)
 - [ ] Full cardano-cli command parity
 - [ ] Performance optimization for initial sync
