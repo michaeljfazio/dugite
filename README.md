@@ -110,14 +110,19 @@ Zero-warning policy enforced — all code must compile with `cargo clippy -- -D 
 - [x] Ledger state: UTxO, certificates, stake delegation
 - [x] Epoch transitions: mark/set/go snapshots, reward distribution
 - [x] N2C Unix socket server with local state query handler
+- [x] N2C client for CLI queries (query tip, epoch, era)
 - [x] Native script evaluation
 - [x] Pallas 1.0 integration (N2N V14+)
+- [x] Conway governance: DRep registration, vote delegation, committee auth, proposals, voting
+- [x] CLI: transaction build, sign, view, txid
+- [x] CLI: key generation (payment, stake, DRep), address building
 
 ### In Progress
 
 - [ ] VRF/KES cryptographic verification
 - [ ] Full Plutus script validation (CEK machine)
-- [ ] Conway governance actions (DRep, voting, proposals)
+- [ ] Governance action ratification and enactment
+- [ ] Transaction submission via LocalTxSubmission
 - [ ] Full cardano-cli command parity
 - [ ] Performance optimization for initial sync
 

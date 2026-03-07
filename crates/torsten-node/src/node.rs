@@ -293,6 +293,8 @@ impl Node {
             pool_count: self.ledger_state.pool_params.len(),
             treasury: self.ledger_state.treasury.0,
             reserves: self.ledger_state.reserves.0,
+            drep_count: self.ledger_state.governance.dreps.len(),
+            proposal_count: self.ledger_state.governance.proposals.len(),
         };
         let mut handler = self.query_handler.write().await;
         handler.update_state(snapshot);

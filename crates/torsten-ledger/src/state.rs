@@ -6,7 +6,9 @@ use torsten_primitives::era::Era;
 use torsten_primitives::hash::{Hash28, Hash32};
 use torsten_primitives::protocol_params::ProtocolParameters;
 use torsten_primitives::time::{BlockNo, EpochNo, SlotNo};
-use torsten_primitives::transaction::Certificate;
+use torsten_primitives::transaction::{
+    Anchor, Certificate, DRep, GovActionId, ProposalProcedure, Vote, Voter, VotingProcedure,
+};
 use torsten_primitives::value::Lovelace;
 use tracing::{debug, info};
 
@@ -57,6 +59,49 @@ pub struct LedgerState {
     /// Nonce contribution window: first stability_window slots of each epoch
     /// (3k/f = 129600 slots on mainnet)
     pub stability_window: u64,
+    /// Conway governance state
+    pub governance: GovernanceState,
+}
+
+/// Conway-era governance state (CIP-1694)
+#[derive(Debug, Clone, Default)]
+pub struct GovernanceState {
+    /// Registered DReps: credential -> DRepState
+    pub dreps: BTreeMap<Hash32, DRepRegistration>,
+    /// Vote delegations: stake credential hash -> DRep
+    pub vote_delegations: BTreeMap<Hash32, DRep>,
+    /// Constitutional committee: cold credential -> hot credential
+    pub committee_hot_keys: BTreeMap<Hash32, Hash32>,
+    /// Resigned committee members
+    pub committee_resigned: BTreeMap<Hash32, Option<Anchor>>,
+    /// Active governance proposals indexed by GovActionId
+    pub proposals: BTreeMap<GovActionId, ProposalState>,
+    /// Votes cast: (voter, action_id) -> vote
+    pub votes: BTreeMap<(Voter, GovActionId), VotingProcedure>,
+    /// Total DRep registrations count (including deregistered)
+    pub drep_registration_count: u64,
+    /// Total proposals submitted
+    pub proposal_count: u64,
+}
+
+/// Registration state for a DRep
+#[derive(Debug, Clone)]
+pub struct DRepRegistration {
+    pub credential: Credential,
+    pub deposit: Lovelace,
+    pub anchor: Option<Anchor>,
+    pub registered_epoch: EpochNo,
+}
+
+/// State of a governance proposal
+#[derive(Debug, Clone)]
+pub struct ProposalState {
+    pub procedure: ProposalProcedure,
+    pub proposed_epoch: EpochNo,
+    pub expires_epoch: EpochNo,
+    pub yes_votes: u64,
+    pub no_votes: u64,
+    pub abstain_votes: u64,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -123,6 +168,7 @@ impl LedgerState {
             rolling_nonce: Hash32::ZERO,
             epoch_nonce: Hash32::ZERO,
             stability_window: 129600, // 3k/f on mainnet
+            governance: GovernanceState::default(),
         }
     }
 
@@ -182,6 +228,23 @@ impl LedgerState {
             // Process withdrawals (rewards are consumed, no UTxO effect)
             for (reward_account, amount) in &tx.body.withdrawals {
                 self.process_withdrawal(reward_account, *amount);
+            }
+
+            // Process Conway governance proposals
+            for (idx, proposal) in tx.body.proposal_procedures.iter().enumerate() {
+                self.process_proposal(&tx.hash, idx as u32, proposal);
+            }
+
+            // Process Conway governance votes
+            for (voter, action_votes) in &tx.body.voting_procedures {
+                for (action_id, procedure) in action_votes {
+                    self.process_vote(voter, action_id, procedure);
+                }
+            }
+
+            // Process treasury donations
+            if let Some(donation) = tx.body.donation {
+                self.treasury += donation;
             }
         }
 
@@ -276,15 +339,85 @@ impl LedgerState {
                 self.reward_accounts.entry(key).or_insert(Lovelace(0));
                 self.delegations.insert(key, *pool_hash);
             }
-            // Governance certificates — tracked but not yet acted upon
-            Certificate::RegDRep { .. }
-            | Certificate::UnregDRep { .. }
-            | Certificate::UpdateDRep { .. }
-            | Certificate::VoteDelegation { .. }
-            | Certificate::StakeVoteDelegation { .. }
-            | Certificate::CommitteeHotAuth { .. }
-            | Certificate::CommitteeColdResign { .. } => {
-                // Conway governance — will be implemented in a later iteration
+            Certificate::RegDRep {
+                credential,
+                deposit,
+                anchor,
+            } => {
+                let key = credential_to_hash(credential);
+                self.governance.dreps.insert(
+                    key,
+                    DRepRegistration {
+                        credential: credential.clone(),
+                        deposit: *deposit,
+                        anchor: anchor.clone(),
+                        registered_epoch: self.epoch,
+                    },
+                );
+                self.governance.drep_registration_count += 1;
+                debug!("DRep registered: {}", key.to_hex());
+            }
+            Certificate::UnregDRep {
+                credential,
+                refund: _,
+            } => {
+                let key = credential_to_hash(credential);
+                self.governance.dreps.remove(&key);
+                debug!("DRep deregistered: {}", key.to_hex());
+            }
+            Certificate::UpdateDRep { credential, anchor } => {
+                let key = credential_to_hash(credential);
+                if let Some(drep) = self.governance.dreps.get_mut(&key) {
+                    drep.anchor = anchor.clone();
+                    debug!("DRep updated: {}", key.to_hex());
+                }
+            }
+            Certificate::VoteDelegation { credential, drep } => {
+                let key = credential_to_hash(credential);
+                self.governance.vote_delegations.insert(key, drep.clone());
+                debug!("Vote delegated to {:?}", drep);
+            }
+            Certificate::StakeVoteDelegation {
+                credential,
+                pool_hash,
+                drep,
+            } => {
+                let key = credential_to_hash(credential);
+                // Stake delegation
+                self.delegations.insert(key, *pool_hash);
+                // Vote delegation
+                self.governance.vote_delegations.insert(key, drep.clone());
+                debug!(
+                    "Stake+vote delegated to pool {} and drep {:?}",
+                    pool_hash.to_hex(),
+                    drep
+                );
+            }
+            Certificate::CommitteeHotAuth {
+                cold_credential,
+                hot_credential,
+            } => {
+                let cold_key = credential_to_hash(cold_credential);
+                let hot_key = credential_to_hash(hot_credential);
+                self.governance.committee_hot_keys.insert(cold_key, hot_key);
+                // Remove from resigned if re-authorizing
+                self.governance.committee_resigned.remove(&cold_key);
+                debug!(
+                    "Committee hot key authorized: {} -> {}",
+                    cold_key.to_hex(),
+                    hot_key.to_hex()
+                );
+            }
+            Certificate::CommitteeColdResign {
+                cold_credential,
+                anchor,
+            } => {
+                let cold_key = credential_to_hash(cold_credential);
+                self.governance
+                    .committee_resigned
+                    .insert(cold_key, anchor.clone());
+                self.governance.committee_hot_keys.remove(&cold_key);
+                debug!("Committee member resigned: {}", cold_key.to_hex());
             }
         }
     }
@@ -336,6 +469,27 @@ impl LedgerState {
         // Clean up retirements from past epochs (shouldn't happen but be safe)
         self.pending_retirements
             .retain(|epoch, _| *epoch >= new_epoch);
+
+        // Expire governance proposals that have passed their lifetime
+        let expired: Vec<GovActionId> = self
+            .governance
+            .proposals
+            .iter()
+            .filter(|(_, state)| state.expires_epoch <= new_epoch)
+            .map(|(id, _)| id.clone())
+            .collect();
+        for action_id in &expired {
+            self.governance.proposals.remove(action_id);
+            // Remove associated votes
+            self.governance.votes.retain(|(_, id), _| id != action_id);
+        }
+        if !expired.is_empty() {
+            debug!(
+                "Expired {} governance proposals at epoch {}",
+                expired.len(),
+                new_epoch.0
+            );
+        }
 
         // Compute new epoch nonce: hash(prev_nonce || rolling_nonce)
         let prev_nonce = self.epoch_nonce;
@@ -514,6 +668,67 @@ impl LedgerState {
         data.extend_from_slice(self.rolling_nonce.as_bytes());
         data.extend_from_slice(vrf_hash.as_bytes());
         self.rolling_nonce = torsten_primitives::hash::blake2b_256(&data);
+    }
+
+    /// Process a governance proposal
+    fn process_proposal(
+        &mut self,
+        tx_hash: &Hash32,
+        action_index: u32,
+        proposal: &ProposalProcedure,
+    ) {
+        let action_id = GovActionId {
+            transaction_id: *tx_hash,
+            action_index,
+        };
+
+        // Governance action lifetime: proposals expire after a configurable number of epochs
+        // Default: 6 epochs (govActionLifetime parameter)
+        let gov_action_lifetime = 6;
+        let expires_epoch = EpochNo(self.epoch.0 + gov_action_lifetime);
+
+        let state = ProposalState {
+            procedure: proposal.clone(),
+            proposed_epoch: self.epoch,
+            expires_epoch,
+            yes_votes: 0,
+            no_votes: 0,
+            abstain_votes: 0,
+        };
+
+        debug!(
+            "Governance proposal submitted: {:?} (expires epoch {})",
+            action_id, expires_epoch.0
+        );
+        self.governance.proposals.insert(action_id, state);
+        self.governance.proposal_count += 1;
+    }
+
+    /// Process a governance vote
+    fn process_vote(
+        &mut self,
+        voter: &Voter,
+        action_id: &GovActionId,
+        procedure: &VotingProcedure,
+    ) {
+        // Update vote tally on the proposal
+        if let Some(proposal) = self.governance.proposals.get_mut(action_id) {
+            match procedure.vote {
+                Vote::Yes => proposal.yes_votes += 1,
+                Vote::No => proposal.no_votes += 1,
+                Vote::Abstain => proposal.abstain_votes += 1,
+            }
+        }
+
+        // Record the vote
+        self.governance
+            .votes
+            .insert((voter.clone(), action_id.clone()), procedure.clone());
+
+        debug!(
+            "Vote cast by {:?} on {:?}: {:?}",
+            voter, action_id, procedure.vote
+        );
     }
 
     /// Process a withdrawal from a reward account
@@ -1233,6 +1448,286 @@ mod tests {
         assert_ne!(state.epoch_nonce, nonce_before_transition);
         // Rolling nonce should be reset
         assert_eq!(state.rolling_nonce, Hash32::ZERO);
+    }
+
+    #[test]
+    fn test_drep_registration() {
+        let params = ProtocolParameters::mainnet_defaults();
+        let mut state = LedgerState::new(params);
+
+        let cred = Credential::VerificationKey(Hash28::from_bytes([50u8; 28]));
+        let key = credential_to_hash(&cred);
+
+        state.process_certificate(&Certificate::RegDRep {
+            credential: cred.clone(),
+            deposit: Lovelace(500_000_000),
+            anchor: Some(Anchor {
+                url: "https://example.com/drep.json".to_string(),
+                data_hash: Hash32::ZERO,
+            }),
+        });
+
+        assert!(state.governance.dreps.contains_key(&key));
+        assert_eq!(state.governance.dreps[&key].deposit, Lovelace(500_000_000));
+        assert_eq!(state.governance.drep_registration_count, 1);
+    }
+
+    #[test]
+    fn test_drep_deregistration() {
+        let params = ProtocolParameters::mainnet_defaults();
+        let mut state = LedgerState::new(params);
+
+        let cred = Credential::VerificationKey(Hash28::from_bytes([50u8; 28]));
+        let key = credential_to_hash(&cred);
+
+        // Register
+        state.process_certificate(&Certificate::RegDRep {
+            credential: cred.clone(),
+            deposit: Lovelace(500_000_000),
+            anchor: None,
+        });
+        assert!(state.governance.dreps.contains_key(&key));
+
+        // Deregister
+        state.process_certificate(&Certificate::UnregDRep {
+            credential: cred,
+            refund: Lovelace(500_000_000),
+        });
+        assert!(!state.governance.dreps.contains_key(&key));
+    }
+
+    #[test]
+    fn test_drep_update() {
+        let params = ProtocolParameters::mainnet_defaults();
+        let mut state = LedgerState::new(params);
+
+        let cred = Credential::VerificationKey(Hash28::from_bytes([50u8; 28]));
+        let key = credential_to_hash(&cred);
+
+        // Register without anchor
+        state.process_certificate(&Certificate::RegDRep {
+            credential: cred.clone(),
+            deposit: Lovelace(500_000_000),
+            anchor: None,
+        });
+        assert!(state.governance.dreps[&key].anchor.is_none());
+
+        // Update with anchor
+        state.process_certificate(&Certificate::UpdateDRep {
+            credential: cred,
+            anchor: Some(Anchor {
+                url: "https://example.com/drep.json".to_string(),
+                data_hash: Hash32::ZERO,
+            }),
+        });
+        assert!(state.governance.dreps[&key].anchor.is_some());
+    }
+
+    #[test]
+    fn test_vote_delegation() {
+        let params = ProtocolParameters::mainnet_defaults();
+        let mut state = LedgerState::new(params);
+
+        let cred = Credential::VerificationKey(Hash28::from_bytes([42u8; 28]));
+        let key = credential_to_hash(&cred);
+
+        state.process_certificate(&Certificate::VoteDelegation {
+            credential: cred,
+            drep: DRep::Abstain,
+        });
+
+        assert_eq!(state.governance.vote_delegations[&key], DRep::Abstain);
+    }
+
+    #[test]
+    fn test_stake_vote_delegation() {
+        let params = ProtocolParameters::mainnet_defaults();
+        let mut state = LedgerState::new(params);
+
+        let cred = Credential::VerificationKey(Hash28::from_bytes([42u8; 28]));
+        let pool_id = Hash28::from_bytes([1u8; 28]);
+        let key = credential_to_hash(&cred);
+
+        state.process_certificate(&Certificate::StakeVoteDelegation {
+            credential: cred,
+            pool_hash: pool_id,
+            drep: DRep::NoConfidence,
+        });
+
+        // Both delegations should be set
+        assert_eq!(state.delegations[&key], pool_id);
+        assert_eq!(state.governance.vote_delegations[&key], DRep::NoConfidence);
+    }
+
+    #[test]
+    fn test_committee_hot_auth() {
+        let params = ProtocolParameters::mainnet_defaults();
+        let mut state = LedgerState::new(params);
+
+        let cold = Credential::VerificationKey(Hash28::from_bytes([10u8; 28]));
+        let hot = Credential::VerificationKey(Hash28::from_bytes([20u8; 28]));
+        let cold_key = credential_to_hash(&cold);
+        let hot_key = credential_to_hash(&hot);
+
+        state.process_certificate(&Certificate::CommitteeHotAuth {
+            cold_credential: cold,
+            hot_credential: hot,
+        });
+
+        assert_eq!(state.governance.committee_hot_keys[&cold_key], hot_key);
+    }
+
+    #[test]
+    fn test_committee_cold_resign() {
+        let params = ProtocolParameters::mainnet_defaults();
+        let mut state = LedgerState::new(params);
+
+        let cold = Credential::VerificationKey(Hash28::from_bytes([10u8; 28]));
+        let hot = Credential::VerificationKey(Hash28::from_bytes([20u8; 28]));
+        let cold_key = credential_to_hash(&cold);
+
+        // First authorize
+        state.process_certificate(&Certificate::CommitteeHotAuth {
+            cold_credential: cold.clone(),
+            hot_credential: hot,
+        });
+        assert!(state.governance.committee_hot_keys.contains_key(&cold_key));
+
+        // Then resign
+        state.process_certificate(&Certificate::CommitteeColdResign {
+            cold_credential: cold,
+            anchor: None,
+        });
+        assert!(!state.governance.committee_hot_keys.contains_key(&cold_key));
+        assert!(state.governance.committee_resigned.contains_key(&cold_key));
+    }
+
+    #[test]
+    fn test_governance_proposal_and_vote() {
+        let params = ProtocolParameters::mainnet_defaults();
+        let mut state = LedgerState::new(params);
+
+        let tx_hash = Hash32::from_bytes([99u8; 32]);
+        let proposal = ProposalProcedure {
+            deposit: Lovelace(100_000_000_000),
+            return_addr: vec![0u8; 29],
+            gov_action: GovAction::InfoAction,
+            anchor: Anchor {
+                url: "https://example.com/proposal.json".to_string(),
+                data_hash: Hash32::ZERO,
+            },
+        };
+
+        state.process_proposal(&tx_hash, 0, &proposal);
+        assert_eq!(state.governance.proposals.len(), 1);
+        assert_eq!(state.governance.proposal_count, 1);
+
+        let action_id = GovActionId {
+            transaction_id: tx_hash,
+            action_index: 0,
+        };
+
+        // Cast votes
+        let drep_voter = Voter::DRep(Credential::VerificationKey(Hash28::from_bytes([50u8; 28])));
+        let yes_vote = VotingProcedure {
+            vote: Vote::Yes,
+            anchor: None,
+        };
+        state.process_vote(&drep_voter, &action_id, &yes_vote);
+
+        let spo_voter = Voter::StakePool(Hash32::from_bytes([1u8; 32]));
+        let no_vote = VotingProcedure {
+            vote: Vote::No,
+            anchor: None,
+        };
+        state.process_vote(&spo_voter, &action_id, &no_vote);
+
+        let p = &state.governance.proposals[&action_id];
+        assert_eq!(p.yes_votes, 1);
+        assert_eq!(p.no_votes, 1);
+        assert_eq!(p.abstain_votes, 0);
+        assert_eq!(state.governance.votes.len(), 2);
+    }
+
+    #[test]
+    fn test_governance_proposal_expiry() {
+        let params = ProtocolParameters::mainnet_defaults();
+        let mut state = LedgerState::new(params);
+        state.epoch_length = 100;
+
+        let tx_hash = Hash32::from_bytes([99u8; 32]);
+        let proposal = ProposalProcedure {
+            deposit: Lovelace(100_000_000_000),
+            return_addr: vec![0u8; 29],
+            gov_action: GovAction::InfoAction,
+            anchor: Anchor {
+                url: "https://example.com".to_string(),
+                data_hash: Hash32::ZERO,
+            },
+        };
+
+        // Submit at epoch 0 → expires at epoch 6
+        state.process_proposal(&tx_hash, 0, &proposal);
+        assert_eq!(state.governance.proposals.len(), 1);
+
+        // Advance to epoch 5 — should still be active
+        for e in 1..=5 {
+            state.process_epoch_transition(EpochNo(e));
+        }
+        assert_eq!(state.governance.proposals.len(), 1);
+
+        // Advance to epoch 6 — should expire
+        state.process_epoch_transition(EpochNo(6));
+        assert_eq!(state.governance.proposals.len(), 0);
+    }
+
+    #[test]
+    fn test_treasury_donation() {
+        let params = ProtocolParameters::mainnet_defaults();
+        let mut state = LedgerState::new(params);
+
+        let tx = Transaction {
+            hash: Hash32::from_bytes([2u8; 32]),
+            body: TransactionBody {
+                inputs: vec![],
+                outputs: vec![],
+                fee: Lovelace(200_000),
+                ttl: None,
+                certificates: vec![],
+                withdrawals: BTreeMap::new(),
+                auxiliary_data_hash: None,
+                validity_interval_start: None,
+                mint: BTreeMap::new(),
+                script_data_hash: None,
+                collateral: vec![],
+                required_signers: vec![],
+                network_id: None,
+                collateral_return: None,
+                total_collateral: None,
+                reference_inputs: vec![],
+                voting_procedures: BTreeMap::new(),
+                proposal_procedures: vec![],
+                treasury_value: None,
+                donation: Some(Lovelace(1_000_000)),
+            },
+            witness_set: TransactionWitnessSet {
+                vkey_witnesses: vec![],
+                native_scripts: vec![],
+                bootstrap_witnesses: vec![],
+                plutus_v1_scripts: vec![],
+                plutus_v2_scripts: vec![],
+                plutus_v3_scripts: vec![],
+                plutus_data: vec![],
+                redeemers: vec![],
+            },
+            is_valid: true,
+            auxiliary_data: None,
+        };
+
+        let block = make_test_block(100, 1, Hash32::ZERO, vec![tx]);
+        state.apply_block(&block).unwrap();
+
+        assert_eq!(state.treasury, Lovelace(1_000_000));
     }
 
     #[test]

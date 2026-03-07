@@ -33,6 +33,8 @@ pub struct NodeStateSnapshot {
     pub pool_count: usize,
     pub treasury: u64,
     pub reserves: u64,
+    pub drep_count: usize,
+    pub proposal_count: usize,
 }
 
 impl Default for NodeStateSnapshot {
@@ -48,6 +50,8 @@ impl Default for NodeStateSnapshot {
             pool_count: 0,
             treasury: 0,
             reserves: 0,
+            drep_count: 0,
+            proposal_count: 0,
         }
     }
 }
