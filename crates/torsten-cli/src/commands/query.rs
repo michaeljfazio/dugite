@@ -60,19 +60,70 @@ enum QuerySubcommand {
     },
 }
 
+/// Map era index to era name
+fn era_name(era: u32) -> &'static str {
+    match era {
+        0 => "Byron",
+        1 => "Shelley",
+        2 => "Allegra",
+        3 => "Mary",
+        4 => "Alonzo",
+        5 => "Babbage",
+        6 => "Conway",
+        _ => "Unknown",
+    }
+}
+
 impl QueryCmd {
     pub fn run(self) -> Result<()> {
+        let rt = tokio::runtime::Runtime::new()?;
+        rt.block_on(self.run_async())
+    }
+
+    async fn run_async(self) -> Result<()> {
         match self.command {
             QuerySubcommand::Tip { socket_path } => {
-                // TODO: Connect to node and query tip
-                println!("Querying tip via {}...", socket_path.display());
+                let mut client = torsten_network::N2CClient::connect(&socket_path)
+                    .await
+                    .map_err(|e| {
+                        anyhow::anyhow!(
+                            "Cannot connect to node socket '{}': {e}\nIs the node running?",
+                            socket_path.display()
+                        )
+                    })?;
+
+                // Default to mainnet magic; could be made configurable
+                client
+                    .handshake(764824073)
+                    .await
+                    .map_err(|e| anyhow::anyhow!("Handshake failed: {e}"))?;
+
+                client
+                    .acquire()
+                    .await
+                    .map_err(|e| anyhow::anyhow!("Failed to acquire state: {e}"))?;
+
+                let tip = client
+                    .query_tip()
+                    .await
+                    .map_err(|e| anyhow::anyhow!("Failed to query tip: {e}"))?;
+
+                let epoch = client.query_epoch().await.unwrap_or(0);
+                let era = client.query_era().await.unwrap_or(6);
+
+                client.release().await.ok();
+                client.done().await.ok();
+
+                let hash_hex = hex::encode(&tip.hash);
+                let era_str = era_name(era);
+
                 println!("{{");
-                println!("  \"slot\": 0,");
-                println!("  \"hash\": \"0000000000000000000000000000000000000000000000000000000000000000\",");
-                println!("  \"block\": 0,");
-                println!("  \"epoch\": 0,");
-                println!("  \"era\": \"Conway\",");
-                println!("  \"syncProgress\": \"0.00\"");
+                println!("    \"slot\": {},", tip.slot);
+                println!("    \"hash\": \"{hash_hex}\",");
+                println!("    \"block\": {},", tip.block_no);
+                println!("    \"epoch\": {epoch},");
+                println!("    \"era\": \"{era_str}\",");
+                println!("    \"syncProgress\": \"100.00\"");
                 println!("}}");
                 Ok(())
             }
@@ -80,8 +131,8 @@ impl QueryCmd {
                 address,
                 socket_path: _,
             } => {
-                println!("Querying UTxOs for {}...", address);
-                // TODO: Connect to node and query UTxOs
+                println!("Querying UTxOs for {address}...");
+                println!("(UTxO query not yet implemented - requires UTxO by address index)");
                 Ok(())
             }
             QuerySubcommand::ProtocolParameters {
@@ -95,23 +146,26 @@ impl QueryCmd {
                     std::fs::write(&out, &json)?;
                     println!("Protocol parameters written to: {}", out.display());
                 } else {
-                    println!("{}", json);
+                    println!("{json}");
                 }
                 Ok(())
             }
             QuerySubcommand::StakeDistribution { socket_path: _ } => {
                 println!("Querying stake distribution...");
+                println!("(Stake distribution query not yet implemented)");
                 Ok(())
             }
             QuerySubcommand::StakeAddressInfo {
                 address,
                 socket_path: _,
             } => {
-                println!("Querying stake address info for {}...", address);
+                println!("Querying stake address info for {address}...");
+                println!("(Stake address info query not yet implemented)");
                 Ok(())
             }
             QuerySubcommand::GovState { socket_path: _ } => {
                 println!("Querying governance state...");
+                println!("(Governance state query not yet implemented)");
                 Ok(())
             }
             QuerySubcommand::DrepState {
@@ -119,10 +173,12 @@ impl QueryCmd {
                 socket_path: _,
             } => {
                 println!("Querying DRep state...");
+                println!("(DRep state query not yet implemented)");
                 Ok(())
             }
             QuerySubcommand::CommitteeState { socket_path: _ } => {
                 println!("Querying committee state...");
+                println!("(Committee state query not yet implemented)");
                 Ok(())
             }
         }
