@@ -55,6 +55,19 @@ impl Era {
     pub fn supports_reference_scripts(&self) -> bool {
         matches!(self, Era::Babbage | Era::Conway)
     }
+
+    /// Era index for the N2C protocol (hard-fork combinator era index)
+    pub fn to_era_index(self) -> u32 {
+        match self {
+            Era::Byron => 0,
+            Era::Shelley => 1,
+            Era::Allegra => 2,
+            Era::Mary => 3,
+            Era::Alonzo => 4,
+            Era::Babbage => 5,
+            Era::Conway => 6,
+        }
+    }
 }
 
 impl std::fmt::Display for Era {

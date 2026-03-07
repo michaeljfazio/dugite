@@ -2,14 +2,16 @@ use anyhow::Result;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::signal;
-use tokio::sync::watch;
+use tokio::sync::{watch, RwLock};
 use tracing::{error, info, warn};
 
 use torsten_consensus::OuroborosPraos;
 use torsten_ledger::LedgerState;
 use torsten_mempool::{Mempool, MempoolConfig};
 use torsten_network::server::NodeServerConfig;
-use torsten_network::{ChainSyncEvent, NodeServer, NodeToNodeClient};
+use torsten_network::{
+    ChainSyncEvent, N2CServer, NodeServer, NodeStateSnapshot, NodeToNodeClient, QueryHandler,
+};
 use torsten_primitives::block::Point;
 use torsten_primitives::protocol_params::ProtocolParameters;
 use torsten_storage::ChainDB;
@@ -36,6 +38,8 @@ pub struct Node {
     mempool: Arc<Mempool>,
     #[allow(dead_code)]
     server: NodeServer,
+    query_handler: Arc<RwLock<QueryHandler>>,
+    socket_path: PathBuf,
 }
 
 impl Node {
@@ -53,12 +57,14 @@ impl Node {
         let mempool = Arc::new(Mempool::new(MempoolConfig::default()));
         info!("Mempool initialized");
 
+        let socket_path = args.socket_path.clone();
         let server_config = NodeServerConfig {
             listen_addr: format!("{}:{}", args.host_addr, args.port).parse()?,
             socket_path: args.socket_path,
             max_connections: 200,
         };
         let server = NodeServer::new(server_config);
+        let query_handler = Arc::new(RwLock::new(QueryHandler::new()));
 
         Ok(Node {
             config: args.config,
@@ -68,6 +74,8 @@ impl Node {
             consensus,
             mempool,
             server,
+            query_handler,
+            socket_path,
         })
     }
 
@@ -86,6 +94,15 @@ impl Node {
             signal::ctrl_c().await.ok();
             info!("Shutdown signal received");
             shutdown_tx.send(true).ok();
+        });
+
+        // Start N2C server on Unix socket
+        let n2c_server = N2CServer::new(self.query_handler.clone());
+        let n2c_socket_path = self.socket_path.clone();
+        tokio::spawn(async move {
+            if let Err(e) = n2c_server.listen(&n2c_socket_path).await {
+                error!("N2C server error: {e}");
+            }
         });
 
         // Get all peers from topology
@@ -216,6 +233,8 @@ impl Node {
                                                 "sync progress"
                                             );
                                             last_log_slot = slot;
+                                            // Update N2C query handler with latest state
+                                            self.update_query_state().await;
                                         }
                                     }
                                     ChainSyncEvent::RollBackward(point, tip) => {
@@ -248,5 +267,23 @@ impl Node {
 
         info!("Chain sync stopped after {blocks_received} blocks");
         Ok(())
+    }
+
+    /// Update the query handler with the current ledger state
+    async fn update_query_state(&self) {
+        let snapshot = NodeStateSnapshot {
+            tip: self.ledger_state.tip.clone(),
+            epoch: self.ledger_state.epoch,
+            era: self.ledger_state.era.to_era_index(),
+            block_number: self.ledger_state.current_block_number(),
+            system_start: "2017-09-23T21:44:51Z".to_string(),
+            utxo_count: self.ledger_state.utxo_set.len(),
+            delegations_count: self.ledger_state.delegations.len(),
+            pool_count: self.ledger_state.pool_params.len(),
+            treasury: self.ledger_state.treasury.0,
+            reserves: self.ledger_state.reserves.0,
+        };
+        let mut handler = self.query_handler.write().await;
+        handler.update_state(snapshot);
     }
 }
