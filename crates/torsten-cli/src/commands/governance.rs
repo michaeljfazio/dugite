@@ -40,6 +40,9 @@ enum DRepSubcommand {
     Id {
         #[arg(long)]
         drep_verification_key_file: PathBuf,
+        /// Output format: bech32 (default) or hex
+        #[arg(long, default_value = "bech32")]
+        output_format: String,
     },
     /// Create DRep registration certificate
     RegistrationCertificate {
@@ -47,6 +50,32 @@ enum DRepSubcommand {
         drep_verification_key_file: PathBuf,
         #[arg(long)]
         key_reg_deposit_amt: u64,
+        /// Optional anchor URL for DRep metadata
+        #[arg(long)]
+        anchor_url: Option<String>,
+        /// Optional anchor data hash
+        #[arg(long)]
+        anchor_data_hash: Option<String>,
+        #[arg(long)]
+        out_file: PathBuf,
+    },
+    /// Create DRep deregistration (retirement) certificate
+    RetirementCertificate {
+        #[arg(long)]
+        drep_verification_key_file: PathBuf,
+        #[arg(long)]
+        deposit_amt: u64,
+        #[arg(long)]
+        out_file: PathBuf,
+    },
+    /// Create DRep metadata update certificate
+    UpdateCertificate {
+        #[arg(long)]
+        drep_verification_key_file: PathBuf,
+        #[arg(long)]
+        anchor_url: Option<String>,
+        #[arg(long)]
+        anchor_data_hash: Option<String>,
         #[arg(long)]
         out_file: PathBuf,
     },
@@ -60,16 +89,24 @@ enum VoteSubcommand {
         governance_action_tx_id: String,
         #[arg(long)]
         governance_action_index: u32,
+        /// Vote: yes, no, or abstain
         #[arg(long)]
         vote: String,
         #[arg(long)]
         drep_verification_key_file: Option<PathBuf>,
+        #[arg(long)]
+        cold_verification_key_file: Option<PathBuf>,
+        #[arg(long)]
+        anchor_url: Option<String>,
+        #[arg(long)]
+        anchor_data_hash: Option<String>,
         #[arg(long)]
         out_file: PathBuf,
     },
 }
 
 #[derive(Subcommand, Debug)]
+#[allow(clippy::enum_variant_names)]
 enum ActionSubcommand {
     /// Create an info action
     CreateInfo {
@@ -84,6 +121,56 @@ enum ActionSubcommand {
         #[arg(long)]
         out_file: PathBuf,
     },
+    /// Create a no-confidence action
+    CreateNoConfidence {
+        #[arg(long)]
+        anchor_url: String,
+        #[arg(long)]
+        anchor_data_hash: String,
+        #[arg(long)]
+        deposit: u64,
+        #[arg(long)]
+        return_addr: String,
+        #[arg(long)]
+        prev_governance_action_tx_id: Option<String>,
+        #[arg(long)]
+        prev_governance_action_index: Option<u32>,
+        #[arg(long)]
+        out_file: PathBuf,
+    },
+    /// Create a treasury withdrawal action
+    CreateTreasuryWithdrawal {
+        #[arg(long)]
+        anchor_url: String,
+        #[arg(long)]
+        anchor_data_hash: String,
+        #[arg(long)]
+        deposit: u64,
+        #[arg(long)]
+        return_addr: String,
+        /// Withdrawal target: address+amount
+        #[arg(long)]
+        funds_receiving_stake_verification_key_file: PathBuf,
+        #[arg(long)]
+        transfer: u64,
+        #[arg(long)]
+        out_file: PathBuf,
+    },
+}
+
+fn simple_cbor_wrap(data: &[u8]) -> Vec<u8> {
+    let mut result = Vec::new();
+    if data.len() < 24 {
+        result.push(0x40 | data.len() as u8);
+    } else if data.len() < 256 {
+        result.push(0x58);
+        result.push(data.len() as u8);
+    } else {
+        result.push(0x59);
+        result.extend_from_slice(&(data.len() as u16).to_be_bytes());
+    }
+    result.extend_from_slice(data);
+    result
 }
 
 impl GovernanceCmd {
@@ -119,48 +206,347 @@ impl GovernanceCmd {
                 }
                 DRepSubcommand::Id {
                     drep_verification_key_file,
+                    output_format,
                 } => {
-                    let content = std::fs::read_to_string(&drep_verification_key_file)?;
-                    let env: serde_json::Value = serde_json::from_str(&content)?;
-                    let cbor_hex = env["cborHex"].as_str().unwrap_or("");
-                    let cbor_bytes = hex::decode(cbor_hex)?;
-                    let key_bytes = if cbor_bytes.len() > 2 {
-                        &cbor_bytes[2..]
+                    let key_hash = load_key_hash(&drep_verification_key_file)?;
+
+                    if output_format == "hex" {
+                        println!("{}", hex::encode(&key_hash));
                     } else {
-                        &cbor_bytes
-                    };
-                    let hash = torsten_primitives::hash::blake2b_224(key_bytes);
-                    let drep_id = bech32::encode::<bech32::Bech32>(
-                        bech32::Hrp::parse("drep")?,
-                        hash.as_bytes(),
-                    )?;
-                    println!("{}", drep_id);
+                        let drep_id = bech32::encode::<bech32::Bech32>(
+                            bech32::Hrp::parse("drep")?,
+                            &key_hash,
+                        )?;
+                        println!("{drep_id}");
+                    }
                     Ok(())
                 }
-                _ => {
-                    println!("Command not yet implemented");
+                DRepSubcommand::RegistrationCertificate {
+                    drep_verification_key_file,
+                    key_reg_deposit_amt,
+                    anchor_url,
+                    anchor_data_hash,
+                    out_file,
+                } => {
+                    let key_hash = load_key_hash(&drep_verification_key_file)?;
+
+                    // Build DRep registration certificate CBOR
+                    // Conway cert type 16 = RegDRep
+                    let mut cert_cbor = Vec::new();
+                    let mut enc = minicbor::Encoder::new(&mut cert_cbor);
+
+                    let has_anchor = anchor_url.is_some() && anchor_data_hash.is_some();
+                    enc.array(if has_anchor { 4 } else { 3 })?;
+                    enc.u32(16)?; // RegDRep tag
+                                  // Credential: [0, key_hash] for verification key
+                    enc.array(2)?;
+                    enc.u32(0)?;
+                    enc.bytes(&key_hash)?;
+                    enc.u64(key_reg_deposit_amt)?;
+
+                    if let (Some(url), Some(hash_hex)) = (&anchor_url, &anchor_data_hash) {
+                        let hash_bytes = hex::decode(hash_hex)?;
+                        enc.array(2)?;
+                        enc.str(url)?;
+                        enc.bytes(&hash_bytes)?;
+                    }
+
+                    let cert_env = serde_json::json!({
+                        "type": "CertificateConway",
+                        "description": "DRep Registration Certificate",
+                        "cborHex": hex::encode(&cert_cbor)
+                    });
+
+                    std::fs::write(&out_file, serde_json::to_string_pretty(&cert_env)?)?;
+                    println!(
+                        "DRep registration certificate written to: {}",
+                        out_file.display()
+                    );
+                    Ok(())
+                }
+                DRepSubcommand::RetirementCertificate {
+                    drep_verification_key_file,
+                    deposit_amt,
+                    out_file,
+                } => {
+                    let key_hash = load_key_hash(&drep_verification_key_file)?;
+
+                    // Conway cert type 17 = UnregDRep
+                    let mut cert_cbor = Vec::new();
+                    let mut enc = minicbor::Encoder::new(&mut cert_cbor);
+                    enc.array(3)?;
+                    enc.u32(17)?;
+                    enc.array(2)?;
+                    enc.u32(0)?;
+                    enc.bytes(&key_hash)?;
+                    enc.u64(deposit_amt)?;
+
+                    let cert_env = serde_json::json!({
+                        "type": "CertificateConway",
+                        "description": "DRep Retirement Certificate",
+                        "cborHex": hex::encode(&cert_cbor)
+                    });
+
+                    std::fs::write(&out_file, serde_json::to_string_pretty(&cert_env)?)?;
+                    println!(
+                        "DRep retirement certificate written to: {}",
+                        out_file.display()
+                    );
+                    Ok(())
+                }
+                DRepSubcommand::UpdateCertificate {
+                    drep_verification_key_file,
+                    anchor_url,
+                    anchor_data_hash,
+                    out_file,
+                } => {
+                    let key_hash = load_key_hash(&drep_verification_key_file)?;
+
+                    // Conway cert type 18 = UpdateDRep
+                    let mut cert_cbor = Vec::new();
+                    let mut enc = minicbor::Encoder::new(&mut cert_cbor);
+
+                    let has_anchor = anchor_url.is_some() && anchor_data_hash.is_some();
+                    enc.array(if has_anchor { 3 } else { 2 })?;
+                    enc.u32(18)?;
+                    enc.array(2)?;
+                    enc.u32(0)?;
+                    enc.bytes(&key_hash)?;
+
+                    if let (Some(url), Some(hash_hex)) = (&anchor_url, &anchor_data_hash) {
+                        let hash_bytes = hex::decode(hash_hex)?;
+                        enc.array(2)?;
+                        enc.str(url)?;
+                        enc.bytes(&hash_bytes)?;
+                    }
+
+                    let cert_env = serde_json::json!({
+                        "type": "CertificateConway",
+                        "description": "DRep Update Certificate",
+                        "cborHex": hex::encode(&cert_cbor)
+                    });
+
+                    std::fs::write(&out_file, serde_json::to_string_pretty(&cert_env)?)?;
+                    println!("DRep update certificate written to: {}", out_file.display());
                     Ok(())
                 }
             },
-            _ => {
-                println!("Command not yet implemented");
-                Ok(())
-            }
+            GovernanceSubcommand::Vote { command } => match command {
+                VoteSubcommand::Create {
+                    governance_action_tx_id,
+                    governance_action_index,
+                    vote,
+                    drep_verification_key_file,
+                    cold_verification_key_file: _,
+                    anchor_url,
+                    anchor_data_hash,
+                    out_file,
+                } => {
+                    let vote_value = match vote.to_lowercase().as_str() {
+                        "yes" => 1u32,
+                        "no" => 0,
+                        "abstain" => 2,
+                        _ => anyhow::bail!("Invalid vote: '{vote}'. Must be yes, no, or abstain"),
+                    };
+
+                    let action_tx_hash = hex::decode(&governance_action_tx_id)?;
+                    if action_tx_hash.len() != 32 {
+                        anyhow::bail!("Invalid governance action tx id length");
+                    }
+
+                    // Get voter credential
+                    let voter_hash = if let Some(ref drep_file) = drep_verification_key_file {
+                        load_key_hash(drep_file)?
+                    } else {
+                        anyhow::bail!(
+                            "Must provide --drep-verification-key-file or --cold-verification-key-file"
+                        );
+                    };
+
+                    // Build vote CBOR
+                    let mut vote_cbor = Vec::new();
+                    let mut enc = minicbor::Encoder::new(&mut vote_cbor);
+
+                    // Voting procedures map: { voter => { action_id => voting_procedure } }
+                    enc.map(1)?;
+                    // Voter: [voter_type, credential]
+                    // DRep voter = type 2
+                    enc.array(2)?;
+                    enc.u32(2)?; // DRep voter
+                    enc.array(2)?;
+                    enc.u32(0)?; // key credential
+                    enc.bytes(&voter_hash)?;
+                    // Action votes map
+                    enc.map(1)?;
+                    // Action ID: [tx_hash, index]
+                    enc.array(2)?;
+                    enc.bytes(&action_tx_hash)?;
+                    enc.u32(governance_action_index)?;
+                    // Voting procedure: [vote, anchor]
+                    enc.array(2)?;
+                    enc.u32(vote_value)?;
+                    if let (Some(url), Some(hash_hex)) = (&anchor_url, &anchor_data_hash) {
+                        let hash_bytes = hex::decode(hash_hex)?;
+                        enc.array(2)?;
+                        enc.str(url)?;
+                        enc.bytes(&hash_bytes)?;
+                    } else {
+                        enc.null()?;
+                    }
+
+                    let vote_env = serde_json::json!({
+                        "type": "VoteConway",
+                        "description": "Governance Vote",
+                        "cborHex": hex::encode(&vote_cbor)
+                    });
+
+                    std::fs::write(&out_file, serde_json::to_string_pretty(&vote_env)?)?;
+
+                    let vote_str = match vote_value {
+                        0 => "No",
+                        1 => "Yes",
+                        _ => "Abstain",
+                    };
+                    println!("Vote file written to: {}", out_file.display());
+                    println!(
+                        "Vote: {vote_str} on {governance_action_tx_id}#{governance_action_index}"
+                    );
+                    Ok(())
+                }
+            },
+            GovernanceSubcommand::Action { command } => match command {
+                ActionSubcommand::CreateInfo {
+                    anchor_url,
+                    anchor_data_hash,
+                    deposit,
+                    return_addr,
+                    out_file,
+                } => {
+                    let anchor_hash = hex::decode(&anchor_data_hash)?;
+                    let (_, return_addr_bytes) = bech32::decode(&return_addr)?;
+
+                    // Build governance action CBOR
+                    // ProposalProcedure: [deposit, return_addr, gov_action, anchor]
+                    let mut action_cbor = Vec::new();
+                    let mut enc = minicbor::Encoder::new(&mut action_cbor);
+                    enc.array(4)?;
+                    enc.u64(deposit)?;
+                    enc.bytes(&return_addr_bytes)?;
+                    // InfoAction = tag 6, no params
+                    enc.array(1)?;
+                    enc.u32(6)?;
+                    // Anchor
+                    enc.array(2)?;
+                    enc.str(&anchor_url)?;
+                    enc.bytes(&anchor_hash)?;
+
+                    let action_env = serde_json::json!({
+                        "type": "GovernanceActionConway",
+                        "description": "Info Governance Action",
+                        "cborHex": hex::encode(&action_cbor)
+                    });
+
+                    std::fs::write(&out_file, serde_json::to_string_pretty(&action_env)?)?;
+                    println!("Info action written to: {}", out_file.display());
+                    Ok(())
+                }
+                ActionSubcommand::CreateNoConfidence {
+                    anchor_url,
+                    anchor_data_hash,
+                    deposit,
+                    return_addr,
+                    prev_governance_action_tx_id: _,
+                    prev_governance_action_index: _,
+                    out_file,
+                } => {
+                    let anchor_hash = hex::decode(&anchor_data_hash)?;
+                    let (_, return_addr_bytes) = bech32::decode(&return_addr)?;
+
+                    let mut action_cbor = Vec::new();
+                    let mut enc = minicbor::Encoder::new(&mut action_cbor);
+                    enc.array(4)?;
+                    enc.u64(deposit)?;
+                    enc.bytes(&return_addr_bytes)?;
+                    // NoConfidence = tag 3
+                    enc.array(2)?;
+                    enc.u32(3)?;
+                    enc.null()?; // prev_action_id (null for first)
+                                 // Anchor
+                    enc.array(2)?;
+                    enc.str(&anchor_url)?;
+                    enc.bytes(&anchor_hash)?;
+
+                    let action_env = serde_json::json!({
+                        "type": "GovernanceActionConway",
+                        "description": "No Confidence Governance Action",
+                        "cborHex": hex::encode(&action_cbor)
+                    });
+
+                    std::fs::write(&out_file, serde_json::to_string_pretty(&action_env)?)?;
+                    println!("No-confidence action written to: {}", out_file.display());
+                    Ok(())
+                }
+                ActionSubcommand::CreateTreasuryWithdrawal {
+                    anchor_url,
+                    anchor_data_hash,
+                    deposit,
+                    return_addr,
+                    funds_receiving_stake_verification_key_file: _,
+                    transfer,
+                    out_file,
+                } => {
+                    let anchor_hash = hex::decode(&anchor_data_hash)?;
+                    let (_, return_addr_bytes) = bech32::decode(&return_addr)?;
+
+                    let mut action_cbor = Vec::new();
+                    let mut enc = minicbor::Encoder::new(&mut action_cbor);
+                    enc.array(4)?;
+                    enc.u64(deposit)?;
+                    enc.bytes(&return_addr_bytes)?;
+                    // TreasuryWithdrawals = tag 2
+                    enc.array(3)?;
+                    enc.u32(2)?;
+                    // Withdrawals map
+                    enc.map(1)?;
+                    enc.bytes(&return_addr_bytes)?;
+                    enc.u64(transfer)?;
+                    enc.null()?; // policy_hash
+                                 // Anchor
+                    enc.array(2)?;
+                    enc.str(&anchor_url)?;
+                    enc.bytes(&anchor_hash)?;
+
+                    let action_env = serde_json::json!({
+                        "type": "GovernanceActionConway",
+                        "description": "Treasury Withdrawal Governance Action",
+                        "cborHex": hex::encode(&action_cbor)
+                    });
+
+                    std::fs::write(&out_file, serde_json::to_string_pretty(&action_env)?)?;
+                    println!(
+                        "Treasury withdrawal action written to: {}",
+                        out_file.display()
+                    );
+                    Ok(())
+                }
+            },
         }
     }
 }
 
-fn simple_cbor_wrap(data: &[u8]) -> Vec<u8> {
-    let mut result = Vec::new();
-    if data.len() < 24 {
-        result.push(0x40 | data.len() as u8);
-    } else if data.len() < 256 {
-        result.push(0x58);
-        result.push(data.len() as u8);
+/// Load a verification key file and return the blake2b-224 hash
+fn load_key_hash(path: &PathBuf) -> Result<Vec<u8>> {
+    let content = std::fs::read_to_string(path)?;
+    let env: serde_json::Value = serde_json::from_str(&content)?;
+    let cbor_hex = env["cborHex"]
+        .as_str()
+        .ok_or_else(|| anyhow::anyhow!("Missing cborHex in {}", path.display()))?;
+    let cbor_bytes = hex::decode(cbor_hex)?;
+    let key_bytes = if cbor_bytes.len() > 2 {
+        &cbor_bytes[2..]
     } else {
-        result.push(0x59);
-        result.extend_from_slice(&(data.len() as u16).to_be_bytes());
-    }
-    result.extend_from_slice(data);
-    result
+        &cbor_bytes
+    };
+    let hash = torsten_primitives::hash::blake2b_224(key_bytes);
+    Ok(hash.as_bytes().to_vec())
 }
