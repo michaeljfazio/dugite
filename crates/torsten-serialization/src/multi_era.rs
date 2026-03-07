@@ -533,7 +533,74 @@ fn convert_conway_certificate(
         CC::UnReg(cred, _refund) => Some(Certificate::StakeDeregistration(
             convert_pallas_stake_credential(cred),
         )),
-        _ => None, // Other Conway governance certs handled later
+        CC::VoteDeleg(cred, drep) => Some(Certificate::VoteDelegation {
+            credential: convert_pallas_stake_credential(cred),
+            drep: convert_pallas_drep(drep),
+        }),
+        CC::StakeVoteDeleg(cred, pool_hash, drep) => Some(Certificate::StakeVoteDelegation {
+            credential: convert_pallas_stake_credential(cred),
+            pool_hash: pallas_hash_to_torsten28(pool_hash),
+            drep: convert_pallas_drep(drep),
+        }),
+        CC::RegDRepCert(cred, deposit, anchor) => Some(Certificate::RegDRep {
+            credential: convert_pallas_stake_credential(cred),
+            deposit: Lovelace(*deposit),
+            anchor: anchor.as_ref().map(convert_pallas_anchor),
+        }),
+        CC::UnRegDRepCert(cred, refund) => Some(Certificate::UnregDRep {
+            credential: convert_pallas_stake_credential(cred),
+            refund: Lovelace(*refund),
+        }),
+        CC::UpdateDRepCert(cred, anchor) => Some(Certificate::UpdateDRep {
+            credential: convert_pallas_stake_credential(cred),
+            anchor: anchor.as_ref().map(convert_pallas_anchor),
+        }),
+        CC::AuthCommitteeHot(cold_cred, hot_cred) => Some(Certificate::CommitteeHotAuth {
+            cold_credential: convert_pallas_stake_credential(cold_cred),
+            hot_credential: convert_pallas_stake_credential(hot_cred),
+        }),
+        CC::ResignCommitteeCold(cold_cred, anchor) => Some(Certificate::CommitteeColdResign {
+            cold_credential: convert_pallas_stake_credential(cold_cred),
+            anchor: anchor.as_ref().map(convert_pallas_anchor),
+        }),
+        CC::StakeVoteRegDeleg(cred, pool_hash, drep, _deposit) => {
+            // Combined: register stake + delegate to pool + delegate vote
+            // We use RegStakeDeleg (closest match) and also handle vote
+            // For simplicity, treat as RegStakeDeleg + VoteDelegation combo
+            // but our cert type can only represent one, so use StakeVoteDelegation
+            // since registration is implicit
+            Some(Certificate::StakeVoteDelegation {
+                credential: convert_pallas_stake_credential(cred),
+                pool_hash: pallas_hash_to_torsten28(pool_hash),
+                drep: convert_pallas_drep(drep),
+            })
+        }
+        CC::VoteRegDeleg(cred, drep, _deposit) => {
+            // Register + vote delegation
+            Some(Certificate::VoteDelegation {
+                credential: convert_pallas_stake_credential(cred),
+                drep: convert_pallas_drep(drep),
+            })
+        }
+    }
+}
+
+fn convert_pallas_drep(drep: &pallas_primitives::conway::DRep) -> DRep {
+    use pallas_primitives::conway::DRep as PD;
+    match drep {
+        PD::Key(h) => DRep::KeyHash(pallas_hash_to_torsten32(&pallas_crypto::hash::Hash::from(
+            h.as_ref(),
+        ))),
+        PD::Script(h) => DRep::ScriptHash(pallas_hash_to_torsten28(h)),
+        PD::Abstain => DRep::Abstain,
+        PD::NoConfidence => DRep::NoConfidence,
+    }
+}
+
+fn convert_pallas_anchor(anchor: &pallas_primitives::conway::Anchor) -> Anchor {
+    Anchor {
+        url: anchor.url.clone(),
+        data_hash: pallas_hash_to_torsten32(&anchor.content_hash),
     }
 }
 
