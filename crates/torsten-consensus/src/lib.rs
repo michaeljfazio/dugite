@@ -5,3 +5,4 @@ pub mod slot_leader;
 
 pub use chain_selection::ChainSelection;
 pub use praos::OuroborosPraos;
+pub use slot_leader::{compute_leader_schedule, LeaderSlot};
