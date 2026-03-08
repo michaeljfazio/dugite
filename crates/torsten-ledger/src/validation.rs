@@ -1,10 +1,10 @@
 use crate::utxo::UtxoSet;
-use std::collections::HashSet;
-use torsten_primitives::hash::Hash32;
+use std::collections::{BTreeMap, HashSet};
+use torsten_primitives::hash::{Hash32, PolicyId};
 use torsten_primitives::protocol_params::ProtocolParameters;
 use torsten_primitives::time::SlotNo;
 use torsten_primitives::transaction::{Certificate, NativeScript, Transaction};
-use torsten_primitives::value::Lovelace;
+use torsten_primitives::value::{AssetName, Lovelace};
 use tracing::{debug, trace, warn};
 
 #[derive(Debug, thiserror::Error)]
@@ -33,6 +33,12 @@ pub enum ValidationError {
     ScriptFailed(String),
     #[error("Insufficient collateral")]
     InsufficientCollateral,
+    #[error("Multi-asset not conserved for policy {policy}: inputs+mint={input_side}, outputs={output_side}")]
+    MultiAssetNotConserved {
+        policy: String,
+        input_side: i128,
+        output_side: i128,
+    },
     #[error("Negative minting without policy script")]
     InvalidMint,
     #[error("Max execution units exceeded")]
@@ -101,6 +107,55 @@ pub fn validate_transaction(
                 outputs: output_value,
                 fee: body.fee.0,
             });
+        }
+    }
+
+    // Rule 3b: Multi-asset conservation
+    // For each (policy, asset): sum(input_tokens) + mint = sum(output_tokens)
+    if errors.is_empty() && (!body.mint.is_empty() || has_multi_assets_in_tx(tx, utxo_set)) {
+        let mut asset_balance: BTreeMap<(PolicyId, AssetName), i128> = BTreeMap::new();
+
+        // Add input tokens (positive)
+        for input in &body.inputs {
+            if let Some(output) = utxo_set.lookup(input) {
+                for (policy, assets) in &output.value.multi_asset {
+                    for (name, qty) in assets {
+                        *asset_balance.entry((*policy, name.clone())).or_insert(0) += *qty as i128;
+                    }
+                }
+            }
+        }
+
+        // Add minted tokens (can be positive or negative)
+        for (policy, assets) in &body.mint {
+            for (name, qty) in assets {
+                *asset_balance.entry((*policy, name.clone())).or_insert(0) += *qty as i128;
+            }
+        }
+
+        // Subtract output tokens
+        for output in &body.outputs {
+            for (policy, assets) in &output.value.multi_asset {
+                for (name, qty) in assets {
+                    *asset_balance.entry((*policy, name.clone())).or_insert(0) -= *qty as i128;
+                }
+            }
+        }
+
+        // Every asset must balance to zero
+        for ((policy, _asset), balance) in &asset_balance {
+            if *balance != 0 {
+                errors.push(ValidationError::MultiAssetNotConserved {
+                    policy: policy.to_hex(),
+                    input_side: if *balance > 0 { *balance } else { 0 },
+                    output_side: if *balance < 0 {
+                        balance.unsigned_abs() as i128
+                    } else {
+                        0
+                    },
+                });
+                break; // One error is enough
+            }
         }
     }
 
@@ -221,6 +276,25 @@ fn calculate_deposits_and_refunds(
     }
 
     (deposits, refunds)
+}
+
+/// Check if the transaction involves any multi-asset tokens (in inputs or outputs).
+fn has_multi_assets_in_tx(tx: &Transaction, utxo_set: &UtxoSet) -> bool {
+    // Check inputs
+    for input in &tx.body.inputs {
+        if let Some(output) = utxo_set.lookup(input) {
+            if !output.value.multi_asset.is_empty() {
+                return true;
+            }
+        }
+    }
+    // Check outputs
+    for output in &tx.body.outputs {
+        if !output.value.multi_asset.is_empty() {
+            return true;
+        }
+    }
+    false
 }
 
 fn has_plutus_scripts(tx: &Transaction) -> bool {
@@ -628,5 +702,256 @@ mod tests {
         let (deposits, refunds) = calculate_deposits_and_refunds(&certs, &params);
         assert_eq!(deposits, params.key_deposit.0 * 2);
         assert_eq!(refunds, params.key_deposit.0);
+    }
+
+    #[test]
+    fn test_multi_asset_conservation_valid() {
+        // Input has 10 ADA + 100 tokens, output has 9.8 ADA + 100 tokens, fee = 0.2 ADA
+        let policy = torsten_primitives::hash::Hash28::from_bytes([10u8; 28]);
+        let asset = AssetName::new(b"Token".to_vec()).unwrap();
+
+        let mut utxo_set = UtxoSet::new();
+        let input = TransactionInput {
+            transaction_id: Hash32::from_bytes([1u8; 32]),
+            index: 0,
+        };
+        let mut input_value = Value::lovelace(10_000_000);
+        input_value
+            .multi_asset
+            .entry(policy)
+            .or_default()
+            .insert(asset.clone(), 100);
+        utxo_set.insert(
+            input.clone(),
+            TransactionOutput {
+                address: Address::Byron(ByronAddress {
+                    payload: vec![0u8; 32],
+                }),
+                value: input_value,
+                datum: OutputDatum::None,
+                script_ref: None,
+            },
+        );
+
+        let mut output_value = Value::lovelace(9_800_000);
+        output_value
+            .multi_asset
+            .entry(policy)
+            .or_default()
+            .insert(asset, 100);
+
+        let params = ProtocolParameters::mainnet_defaults();
+        let tx = Transaction {
+            hash: Hash32::ZERO,
+            body: TransactionBody {
+                inputs: vec![input],
+                outputs: vec![TransactionOutput {
+                    address: Address::Byron(ByronAddress {
+                        payload: vec![0u8; 32],
+                    }),
+                    value: output_value,
+                    datum: OutputDatum::None,
+                    script_ref: None,
+                }],
+                fee: Lovelace(200_000),
+                ttl: None,
+                certificates: vec![],
+                withdrawals: BTreeMap::new(),
+                auxiliary_data_hash: None,
+                validity_interval_start: None,
+                mint: BTreeMap::new(),
+                script_data_hash: None,
+                collateral: vec![],
+                required_signers: vec![],
+                network_id: None,
+                collateral_return: None,
+                total_collateral: None,
+                reference_inputs: vec![],
+                voting_procedures: BTreeMap::new(),
+                proposal_procedures: vec![],
+                treasury_value: None,
+                donation: None,
+            },
+            witness_set: TransactionWitnessSet {
+                vkey_witnesses: vec![],
+                native_scripts: vec![],
+                bootstrap_witnesses: vec![],
+                plutus_v1_scripts: vec![],
+                plutus_v2_scripts: vec![],
+                plutus_v3_scripts: vec![],
+                plutus_data: vec![],
+                redeemers: vec![],
+            },
+            is_valid: true,
+            auxiliary_data: None,
+        };
+
+        let result = validate_transaction(&tx, &utxo_set, &params, 100, 300);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_multi_asset_not_conserved() {
+        // Input has 100 tokens but output has 200 — tokens created from thin air
+        let policy = torsten_primitives::hash::Hash28::from_bytes([10u8; 28]);
+        let asset = AssetName::new(b"Token".to_vec()).unwrap();
+
+        let mut utxo_set = UtxoSet::new();
+        let input = TransactionInput {
+            transaction_id: Hash32::from_bytes([1u8; 32]),
+            index: 0,
+        };
+        let mut input_value = Value::lovelace(10_000_000);
+        input_value
+            .multi_asset
+            .entry(policy)
+            .or_default()
+            .insert(asset.clone(), 100);
+        utxo_set.insert(
+            input.clone(),
+            TransactionOutput {
+                address: Address::Byron(ByronAddress {
+                    payload: vec![0u8; 32],
+                }),
+                value: input_value,
+                datum: OutputDatum::None,
+                script_ref: None,
+            },
+        );
+
+        let mut output_value = Value::lovelace(9_800_000);
+        output_value
+            .multi_asset
+            .entry(policy)
+            .or_default()
+            .insert(asset, 200); // More tokens than input!
+
+        let params = ProtocolParameters::mainnet_defaults();
+        let tx = Transaction {
+            hash: Hash32::ZERO,
+            body: TransactionBody {
+                inputs: vec![input],
+                outputs: vec![TransactionOutput {
+                    address: Address::Byron(ByronAddress {
+                        payload: vec![0u8; 32],
+                    }),
+                    value: output_value,
+                    datum: OutputDatum::None,
+                    script_ref: None,
+                }],
+                fee: Lovelace(200_000),
+                ttl: None,
+                certificates: vec![],
+                withdrawals: BTreeMap::new(),
+                auxiliary_data_hash: None,
+                validity_interval_start: None,
+                mint: BTreeMap::new(),
+                script_data_hash: None,
+                collateral: vec![],
+                required_signers: vec![],
+                network_id: None,
+                collateral_return: None,
+                total_collateral: None,
+                reference_inputs: vec![],
+                voting_procedures: BTreeMap::new(),
+                proposal_procedures: vec![],
+                treasury_value: None,
+                donation: None,
+            },
+            witness_set: TransactionWitnessSet {
+                vkey_witnesses: vec![],
+                native_scripts: vec![],
+                bootstrap_witnesses: vec![],
+                plutus_v1_scripts: vec![],
+                plutus_v2_scripts: vec![],
+                plutus_v3_scripts: vec![],
+                plutus_data: vec![],
+                redeemers: vec![],
+            },
+            is_valid: true,
+            auxiliary_data: None,
+        };
+
+        let result = validate_transaction(&tx, &utxo_set, &params, 100, 300);
+        assert!(result.is_err());
+        let errors = result.unwrap_err();
+        assert!(errors
+            .iter()
+            .any(|e| matches!(e, ValidationError::MultiAssetNotConserved { .. })));
+    }
+
+    #[test]
+    fn test_multi_asset_with_minting() {
+        // Input has 10 ADA, mint 50 tokens, output has 9.8 ADA + 50 tokens
+        let policy = torsten_primitives::hash::Hash28::from_bytes([10u8; 28]);
+        let asset = AssetName::new(b"Token".to_vec()).unwrap();
+
+        let (utxo_set, input) = make_simple_utxo_set();
+
+        let mut output_value = Value::lovelace(9_800_000);
+        output_value
+            .multi_asset
+            .entry(policy)
+            .or_default()
+            .insert(asset.clone(), 50);
+
+        let mut mint: BTreeMap<PolicyId, BTreeMap<AssetName, i64>> = BTreeMap::new();
+        mint.entry(policy).or_default().insert(asset, 50);
+
+        let params = ProtocolParameters::mainnet_defaults();
+        let mut tx = make_simple_tx(input, 9_800_000, 200_000);
+        tx.body.outputs[0].value = output_value;
+        tx.body.mint = mint;
+
+        let result = validate_transaction(&tx, &utxo_set, &params, 100, 300);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_multi_asset_burning() {
+        // Input has 100 tokens, burn 30, output has 70
+        let policy = torsten_primitives::hash::Hash28::from_bytes([10u8; 28]);
+        let asset = AssetName::new(b"Token".to_vec()).unwrap();
+
+        let mut utxo_set = UtxoSet::new();
+        let input = TransactionInput {
+            transaction_id: Hash32::from_bytes([1u8; 32]),
+            index: 0,
+        };
+        let mut input_value = Value::lovelace(10_000_000);
+        input_value
+            .multi_asset
+            .entry(policy)
+            .or_default()
+            .insert(asset.clone(), 100);
+        utxo_set.insert(
+            input.clone(),
+            TransactionOutput {
+                address: Address::Byron(ByronAddress {
+                    payload: vec![0u8; 32],
+                }),
+                value: input_value,
+                datum: OutputDatum::None,
+                script_ref: None,
+            },
+        );
+
+        let mut output_value = Value::lovelace(9_800_000);
+        output_value
+            .multi_asset
+            .entry(policy)
+            .or_default()
+            .insert(asset.clone(), 70);
+
+        let mut mint: BTreeMap<PolicyId, BTreeMap<AssetName, i64>> = BTreeMap::new();
+        mint.entry(policy).or_default().insert(asset, -30); // burn 30
+
+        let params = ProtocolParameters::mainnet_defaults();
+        let mut tx = make_simple_tx(input, 9_800_000, 200_000);
+        tx.body.outputs[0].value = output_value;
+        tx.body.mint = mint;
+
+        let result = validate_transaction(&tx, &utxo_set, &params, 100, 300);
+        assert!(result.is_ok());
     }
 }
