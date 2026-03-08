@@ -243,10 +243,12 @@ impl ShelleyGenesis {
         let zero_time = chrono::DateTime::parse_from_rfc3339(&self.system_start)
             .map(|dt| dt.timestamp_millis() as u64)
             .unwrap_or(0);
+        // slot_length in genesis is in seconds; SlotConfig needs milliseconds
+        let slot_length_ms = (self.slot_length * 1000) as u32;
         SlotConfig {
             zero_time,
             zero_slot: 0,
-            slot_length: self.slot_length as u32,
+            slot_length: slot_length_ms,
         }
     }
 }
@@ -364,7 +366,12 @@ impl AlonzoGenesis {
     }
 }
 
-/// Parse a cost model from JSON (either an array of ints, or a map of string->int)
+/// Parse a cost model from JSON.
+///
+/// Cost models come in several formats:
+/// - Array of integers: `[val1, val2, ...]`
+/// - Indexed map: `{"key-0": val, "key-1": val, ...}` (Conway genesis)
+/// - Named map: `{"paramName": val, ...}` (Alonzo genesis) — sorted alphabetically
 fn parse_cost_model(value: &serde_json::Value) -> Option<Vec<i64>> {
     match value {
         serde_json::Value::Array(arr) => {
@@ -376,20 +383,32 @@ fn parse_cost_model(value: &serde_json::Value) -> Option<Vec<i64>> {
             }
         }
         serde_json::Value::Object(map) => {
-            // Cost models may be encoded as {"key-0": val, "key-1": val, ...}
-            let mut indexed: Vec<(usize, i64)> = Vec::new();
-            for (k, v) in map {
-                if let Some(idx) = k.strip_prefix("key-").and_then(|s| s.parse::<usize>().ok()) {
-                    if let Some(val) = v.as_i64() {
-                        indexed.push((idx, val));
-                    }
-                }
-            }
-            if indexed.is_empty() {
+            if map.is_empty() {
                 return None;
             }
-            indexed.sort_by_key(|(idx, _)| *idx);
-            Some(indexed.into_iter().map(|(_, v)| v).collect())
+            // Check if keys are "key-N" format (indexed)
+            let first_key = map.keys().next().unwrap();
+            if first_key.starts_with("key-") {
+                let mut indexed: Vec<(usize, i64)> = Vec::new();
+                for (k, v) in map {
+                    if let Some(idx) = k.strip_prefix("key-").and_then(|s| s.parse::<usize>().ok())
+                    {
+                        if let Some(val) = v.as_i64() {
+                            indexed.push((idx, val));
+                        }
+                    }
+                }
+                indexed.sort_by_key(|(idx, _)| *idx);
+                Some(indexed.into_iter().map(|(_, v)| v).collect())
+            } else {
+                // Named parameters (Alonzo genesis format) — sort alphabetically
+                let mut named: Vec<(&String, i64)> = map
+                    .iter()
+                    .filter_map(|(k, v)| v.as_i64().map(|val| (k, val)))
+                    .collect();
+                named.sort_by_key(|(k, _)| k.to_owned());
+                Some(named.into_iter().map(|(_, v)| v).collect())
+            }
         }
         _ => None,
     }
