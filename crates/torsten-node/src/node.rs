@@ -11,7 +11,8 @@ use torsten_mempool::{Mempool, MempoolConfig};
 use torsten_network::query_handler::{UtxoQueryProvider, UtxoSnapshot};
 use torsten_network::server::NodeServerConfig;
 use torsten_network::{
-    ChainSyncEvent, N2CServer, NodeServer, NodeStateSnapshot, NodeToNodeClient, QueryHandler,
+    BlockProvider, ChainSyncEvent, N2CServer, N2NServer, NodeServer, NodeStateSnapshot,
+    NodeToNodeClient, QueryHandler,
 };
 use torsten_primitives::block::Point;
 use torsten_primitives::protocol_params::ProtocolParameters;
@@ -30,6 +31,49 @@ pub struct NodeArgs {
     pub port: u16,
     /// Directory containing the config file (for resolving relative genesis paths)
     pub config_dir: PathBuf,
+}
+
+/// Provides block data from ChainDB for the N2N server
+struct ChainDBBlockProvider {
+    chain_db: Arc<RwLock<ChainDB>>,
+}
+
+impl BlockProvider for ChainDBBlockProvider {
+    fn get_block(&self, hash: &[u8; 32]) -> Option<Vec<u8>> {
+        let block_hash = torsten_primitives::hash::Hash32::from_bytes(*hash);
+        let db = self.chain_db.try_read().ok()?;
+        db.get_block(&block_hash).ok().flatten()
+    }
+
+    fn has_block(&self, hash: &[u8; 32]) -> bool {
+        let block_hash = torsten_primitives::hash::Hash32::from_bytes(*hash);
+        match self.chain_db.try_read() {
+            Ok(db) => db.has_block(&block_hash),
+            Err(_) => false,
+        }
+    }
+
+    fn get_tip(&self) -> (u64, [u8; 32], u64) {
+        match self.chain_db.try_read() {
+            Ok(db) => {
+                let tip = db.get_tip();
+                let slot = tip.point.slot().map(|s| s.0).unwrap_or(0);
+                let hash = tip
+                    .point
+                    .hash()
+                    .map(|h| {
+                        let bytes: &[u8] = h.as_ref();
+                        let mut arr = [0u8; 32];
+                        arr.copy_from_slice(bytes);
+                        arr
+                    })
+                    .unwrap_or([0u8; 32]);
+                let block_no = tip.block_number.0;
+                (slot, hash, block_no)
+            }
+            Err(_) => (0, [0u8; 32], 0),
+        }
+    }
 }
 
 /// Provides UTxO lookups from the live ledger state
@@ -68,7 +112,7 @@ impl UtxoQueryProvider for LedgerUtxoProvider {
 pub struct Node {
     config: NodeConfig,
     topology: Topology,
-    chain_db: ChainDB,
+    chain_db: Arc<RwLock<ChainDB>>,
     ledger_state: Arc<RwLock<LedgerState>>,
     consensus: OuroborosPraos,
     mempool: Arc<Mempool>,
@@ -76,12 +120,14 @@ pub struct Node {
     server: NodeServer,
     query_handler: Arc<RwLock<QueryHandler>>,
     socket_path: PathBuf,
+    listen_addr: std::net::SocketAddr,
+    network_magic: u64,
     shelley_genesis: Option<ShelleyGenesis>,
 }
 
 impl Node {
     pub fn new(args: NodeArgs) -> Result<Self> {
-        let chain_db = ChainDB::open(&args.database_path)?;
+        let chain_db = Arc::new(RwLock::new(ChainDB::open(&args.database_path)?));
         info!("ChainDB opened at {}", args.database_path.display());
 
         let mut protocol_params = ProtocolParameters::mainnet_defaults();
@@ -197,8 +243,14 @@ impl Node {
         info!("Mempool initialized");
 
         let socket_path = args.socket_path.clone();
+        let listen_addr: std::net::SocketAddr =
+            format!("{}:{}", args.host_addr, args.port).parse()?;
+        let network_magic = args
+            .config
+            .network_magic
+            .unwrap_or_else(|| args.config.network.magic());
         let server_config = NodeServerConfig {
-            listen_addr: format!("{}:{}", args.host_addr, args.port).parse()?,
+            listen_addr,
             socket_path: args.socket_path,
             max_connections: 200,
         };
@@ -221,12 +273,14 @@ impl Node {
             server,
             query_handler,
             socket_path,
+            listen_addr,
+            network_magic,
             shelley_genesis,
         })
     }
 
     pub async fn run(&mut self) -> Result<()> {
-        let tip = self.chain_db.get_tip();
+        let tip = self.chain_db.read().await.get_tip();
         info!("Current chain tip: {tip}");
         {
             let ls = self.ledger_state.read().await;
@@ -251,6 +305,22 @@ impl Node {
             }
         });
 
+        // Start N2N server for inbound peer connections
+        let n2n_server = N2NServer::new(
+            self.listen_addr,
+            self.network_magic,
+            self.query_handler.clone(),
+            Arc::new(ChainDBBlockProvider {
+                chain_db: self.chain_db.clone(),
+            }),
+            200,
+        );
+        tokio::spawn(async move {
+            if let Err(e) = n2n_server.listen().await {
+                error!("N2N server error: {e}");
+            }
+        });
+
         // Get all peers from topology
         let peers = self.topology.all_peers();
         if peers.is_empty() {
@@ -258,10 +328,7 @@ impl Node {
             return Ok(());
         }
 
-        let network_magic = self
-            .config
-            .network_magic
-            .unwrap_or_else(|| self.config.network.magic());
+        let network_magic = self.network_magic;
 
         // Main connection loop with reconnection support
         let mut retry_count = 0u32;
@@ -353,7 +420,7 @@ impl Node {
         mut shutdown_rx: watch::Receiver<bool>,
     ) -> Result<()> {
         // Find intersection with our current chain
-        let known_points = vec![self.chain_db.get_tip().point, Point::Origin];
+        let known_points = vec![self.chain_db.read().await.get_tip().point, Point::Origin];
         let (intersect, remote_tip) = client.find_intersect(known_points).await?;
 
         match &intersect {
@@ -386,14 +453,17 @@ impl Node {
                                         let tx_count = block.tx_count();
 
                                         // Store the block
-                                        if let Err(e) = self.chain_db.add_block(
-                                            *block.hash(),
-                                            block.slot(),
-                                            block.block_number(),
-                                            *block.prev_hash(),
-                                            block.raw_cbor.clone().unwrap_or_default(),
-                                        ) {
-                                            error!("Failed to store block: {e}");
+                                        {
+                                            let mut db = self.chain_db.write().await;
+                                            if let Err(e) = db.add_block(
+                                                *block.hash(),
+                                                block.slot(),
+                                                block.block_number(),
+                                                *block.prev_hash(),
+                                                block.raw_cbor.clone().unwrap_or_default(),
+                                            ) {
+                                                error!("Failed to store block: {e}");
+                                            }
                                         }
 
                                         // Validate block header against consensus rules
@@ -450,8 +520,11 @@ impl Node {
                                     }
                                     ChainSyncEvent::RollBackward(point, tip) => {
                                         warn!("Rollback to {point}, tip: {tip}");
-                                        if let Err(e) = self.chain_db.rollback_to_point(&point) {
-                                            error!("Rollback failed: {e}");
+                                        {
+                                            let mut db = self.chain_db.write().await;
+                                            if let Err(e) = db.rollback_to_point(&point) {
+                                                error!("Rollback failed: {e}");
+                                            }
                                         }
                                     }
                                     ChainSyncEvent::Await => {
