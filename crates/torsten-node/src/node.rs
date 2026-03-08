@@ -553,8 +553,19 @@ impl Node {
                                     }
                                 }
 
-                                // Update consensus tip to last block
+                                // Validate last block header for consensus (lightweight check)
                                 if let Some((last_block, _)) = forward_blocks.last() {
+                                    if last_block.era.is_shelley_based() {
+                                        if let Err(e) = self.consensus.validate_header(
+                                            &last_block.header,
+                                            last_block.slot(),
+                                        ) {
+                                            warn!(
+                                                slot = last_block.slot().0,
+                                                "Consensus validation warning: {e}"
+                                            );
+                                        }
+                                    }
                                     self.consensus.update_tip(last_block.tip());
                                 }
 
