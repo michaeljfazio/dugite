@@ -26,6 +26,7 @@ const MINI_PROTOCOL_HANDSHAKE: u16 = 0;
 const MINI_PROTOCOL_CHAINSYNC: u16 = 5;
 const MINI_PROTOCOL_TX_SUBMISSION: u16 = 6;
 const MINI_PROTOCOL_STATE_QUERY: u16 = 7;
+const MINI_PROTOCOL_TX_MONITOR: u16 = 12;
 
 /// Node-to-Client server that listens on a Unix domain socket.
 pub struct N2CServer {
@@ -124,6 +125,7 @@ async fn process_segment(
         MINI_PROTOCOL_HANDSHAKE => handle_handshake(&segment.payload),
         MINI_PROTOCOL_STATE_QUERY => handle_state_query(&segment.payload, query_handler).await,
         MINI_PROTOCOL_TX_SUBMISSION => handle_tx_submission(&segment.payload, mempool),
+        MINI_PROTOCOL_TX_MONITOR => handle_tx_monitor(&segment.payload, mempool),
         MINI_PROTOCOL_CHAINSYNC => {
             debug!("LocalChainSync message received (not yet implemented)");
             Ok(None)
@@ -305,6 +307,161 @@ fn handle_tx_submission(
         }
         other => {
             warn!("Unknown LocalTxSubmission message tag: {other}");
+            Ok(None)
+        }
+    }
+}
+
+/// Handle LocalTxMonitor messages
+///
+/// Protocol flow:
+///   Client: MsgAcquire           → Server: MsgAcquired(slot_no)
+///   Client: MsgHasTx(tx_id)      → Server: MsgHasTxReply(bool)
+///   Client: MsgNextTx            → Server: MsgNextTxReply(maybe_tx)
+///   Client: MsgGetSizes          → Server: MsgGetSizesReply(sizes)
+///   Client: MsgRelease           → (back to idle)
+///   Client: MsgDone              → (end)
+///
+/// Message tags:
+///   0: MsgAcquire     [0]
+///   1: MsgAcquired    [1, slot_no]
+///   2: MsgRelease     [2]
+///   3: MsgDone        [3]
+///   4: MsgHasTx       [4, tx_id_bytes]
+///   5: MsgHasTxReply  [5, bool]
+///   6: MsgNextTx      [6]
+///   7: MsgNextTxReply [7, null | [era_id, tx_bytes]]
+///   8: MsgGetSizes    [8]
+///   9: MsgGetSizesReply [9, [capacity, size, num_txs]]
+fn handle_tx_monitor(
+    payload: &[u8],
+    mempool: &Arc<Mempool>,
+) -> Result<Option<Segment>, N2CServerError> {
+    let mut decoder = minicbor::Decoder::new(payload);
+
+    let msg_tag = match decoder.array() {
+        Ok(Some(len)) if len >= 1 => decoder
+            .u32()
+            .map_err(|e| N2CServerError::Protocol(format!("bad tx monitor msg tag: {e}")))?,
+        Ok(None) => decoder
+            .u32()
+            .map_err(|e| N2CServerError::Protocol(format!("bad tx monitor msg tag: {e}")))?,
+        _ => {
+            return Err(N2CServerError::Protocol(
+                "invalid tx monitor message".into(),
+            ))
+        }
+    };
+
+    match msg_tag {
+        0 => {
+            // MsgAcquire → MsgAcquired(slot_no)
+            debug!("LocalTxMonitor: MsgAcquire");
+            // Return current slot (0 if unknown — will be updated when blocks arrive)
+            let mut buf = Vec::new();
+            let mut enc = minicbor::Encoder::new(&mut buf);
+            enc.array(2)
+                .map_err(|e| N2CServerError::Protocol(e.to_string()))?;
+            enc.u32(1)
+                .map_err(|e| N2CServerError::Protocol(e.to_string()))?; // MsgAcquired
+            enc.u64(0)
+                .map_err(|e| N2CServerError::Protocol(e.to_string()))?; // slot_no placeholder
+            Ok(Some(Segment {
+                transmission_time: 0,
+                protocol_id: MINI_PROTOCOL_TX_MONITOR,
+                is_responder: true,
+                payload: buf,
+            }))
+        }
+        2 => {
+            // MsgRelease
+            debug!("LocalTxMonitor: MsgRelease");
+            Ok(None)
+        }
+        3 => {
+            // MsgDone
+            debug!("LocalTxMonitor: MsgDone");
+            Ok(None)
+        }
+        4 => {
+            // MsgHasTx(tx_id) → MsgHasTxReply(bool)
+            let tx_id_bytes = decoder.bytes().unwrap_or(&[]);
+            let has_tx = if tx_id_bytes.len() == 32 {
+                let tx_hash = Hash32::from_bytes(tx_id_bytes.try_into().unwrap());
+                let exists = mempool.contains(&tx_hash);
+                debug!("LocalTxMonitor: MsgHasTx {} → {exists}", tx_hash.to_hex());
+                exists
+            } else {
+                debug!("LocalTxMonitor: MsgHasTx with invalid tx_id length");
+                false
+            };
+
+            let mut buf = Vec::new();
+            let mut enc = minicbor::Encoder::new(&mut buf);
+            enc.array(2)
+                .map_err(|e| N2CServerError::Protocol(e.to_string()))?;
+            enc.u32(5)
+                .map_err(|e| N2CServerError::Protocol(e.to_string()))?; // MsgHasTxReply
+            enc.bool(has_tx)
+                .map_err(|e| N2CServerError::Protocol(e.to_string()))?;
+            Ok(Some(Segment {
+                transmission_time: 0,
+                protocol_id: MINI_PROTOCOL_TX_MONITOR,
+                is_responder: true,
+                payload: buf,
+            }))
+        }
+        6 => {
+            // MsgNextTx → MsgNextTxReply(null | [era_id, tx_bytes])
+            debug!("LocalTxMonitor: MsgNextTx");
+            // For now, return null (no tx) since we don't iterate the mempool
+            let mut buf = Vec::new();
+            let mut enc = minicbor::Encoder::new(&mut buf);
+            enc.array(2)
+                .map_err(|e| N2CServerError::Protocol(e.to_string()))?;
+            enc.u32(7)
+                .map_err(|e| N2CServerError::Protocol(e.to_string()))?; // MsgNextTxReply
+            enc.null()
+                .map_err(|e| N2CServerError::Protocol(e.to_string()))?; // no tx
+            Ok(Some(Segment {
+                transmission_time: 0,
+                protocol_id: MINI_PROTOCOL_TX_MONITOR,
+                is_responder: true,
+                payload: buf,
+            }))
+        }
+        8 => {
+            // MsgGetSizes → MsgGetSizesReply([capacity, size, num_txs])
+            let num_txs = mempool.len() as u64;
+            let size_bytes = mempool.total_bytes() as u64;
+            let capacity = mempool.capacity() as u64;
+            debug!(
+                "LocalTxMonitor: MsgGetSizes → cap={capacity}, size={size_bytes}, txs={num_txs}"
+            );
+
+            let mut buf = Vec::new();
+            let mut enc = minicbor::Encoder::new(&mut buf);
+            enc.array(2)
+                .map_err(|e| N2CServerError::Protocol(e.to_string()))?;
+            enc.u32(9)
+                .map_err(|e| N2CServerError::Protocol(e.to_string()))?; // MsgGetSizesReply
+            enc.array(3)
+                .map_err(|e| N2CServerError::Protocol(e.to_string()))?;
+            enc.u64(capacity)
+                .map_err(|e| N2CServerError::Protocol(e.to_string()))?;
+            enc.u64(size_bytes)
+                .map_err(|e| N2CServerError::Protocol(e.to_string()))?;
+            enc.u64(num_txs)
+                .map_err(|e| N2CServerError::Protocol(e.to_string()))?;
+            Ok(Some(Segment {
+                transmission_time: 0,
+                protocol_id: MINI_PROTOCOL_TX_MONITOR,
+                is_responder: true,
+                payload: buf,
+            }))
+        }
+        other => {
+            warn!("Unknown LocalTxMonitor message tag: {other}");
             Ok(None)
         }
     }
@@ -867,6 +1024,139 @@ mod tests {
         enc.u32(3).unwrap();
 
         let result = handle_tx_submission(&payload, &mempool).unwrap();
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_handle_tx_monitor_acquire() {
+        let mempool = Arc::new(Mempool::new(torsten_mempool::MempoolConfig::default()));
+
+        // MsgAcquire: [0]
+        let mut payload = Vec::new();
+        let mut enc = minicbor::Encoder::new(&mut payload);
+        enc.array(1).unwrap();
+        enc.u32(0).unwrap();
+
+        let result = handle_tx_monitor(&payload, &mempool).unwrap();
+        assert!(result.is_some());
+
+        let segment = result.unwrap();
+        assert_eq!(segment.protocol_id, MINI_PROTOCOL_TX_MONITOR);
+        assert!(segment.is_responder);
+
+        // Verify MsgAcquired [1, slot_no]
+        let mut decoder = minicbor::Decoder::new(&segment.payload);
+        let _ = decoder.array();
+        assert_eq!(decoder.u32().unwrap(), 1); // MsgAcquired
+        let _slot = decoder.u64().unwrap();
+    }
+
+    #[test]
+    fn test_handle_tx_monitor_has_tx() {
+        let mempool = Arc::new(Mempool::new(torsten_mempool::MempoolConfig::default()));
+        let tx_hash = Hash32::from_bytes([0xAA; 32]);
+        let tx = torsten_primitives::transaction::Transaction::empty_with_hash(tx_hash);
+        mempool.add_tx(tx_hash, tx, 100).unwrap();
+
+        // MsgHasTx: [4, tx_id_bytes]
+        let mut payload = Vec::new();
+        let mut enc = minicbor::Encoder::new(&mut payload);
+        enc.array(2).unwrap();
+        enc.u32(4).unwrap();
+        enc.bytes(tx_hash.as_bytes()).unwrap();
+
+        let result = handle_tx_monitor(&payload, &mempool).unwrap();
+        assert!(result.is_some());
+
+        let segment = result.unwrap();
+        let mut decoder = minicbor::Decoder::new(&segment.payload);
+        let _ = decoder.array();
+        assert_eq!(decoder.u32().unwrap(), 5); // MsgHasTxReply
+        assert!(decoder.bool().unwrap()); // tx exists
+    }
+
+    #[test]
+    fn test_handle_tx_monitor_has_tx_missing() {
+        let mempool = Arc::new(Mempool::new(torsten_mempool::MempoolConfig::default()));
+
+        // MsgHasTx for non-existent tx
+        let tx_hash = Hash32::from_bytes([0xBB; 32]);
+        let mut payload = Vec::new();
+        let mut enc = minicbor::Encoder::new(&mut payload);
+        enc.array(2).unwrap();
+        enc.u32(4).unwrap();
+        enc.bytes(tx_hash.as_bytes()).unwrap();
+
+        let result = handle_tx_monitor(&payload, &mempool).unwrap();
+        assert!(result.is_some());
+
+        let segment = result.unwrap();
+        let mut decoder = minicbor::Decoder::new(&segment.payload);
+        let _ = decoder.array();
+        assert_eq!(decoder.u32().unwrap(), 5); // MsgHasTxReply
+        assert!(!decoder.bool().unwrap()); // tx does not exist
+    }
+
+    #[test]
+    fn test_handle_tx_monitor_get_sizes() {
+        let mempool = Arc::new(Mempool::new(torsten_mempool::MempoolConfig::default()));
+        let tx_hash = Hash32::from_bytes([0xAA; 32]);
+        let tx = torsten_primitives::transaction::Transaction::empty_with_hash(tx_hash);
+        mempool.add_tx(tx_hash, tx, 500).unwrap();
+
+        // MsgGetSizes: [8]
+        let mut payload = Vec::new();
+        let mut enc = minicbor::Encoder::new(&mut payload);
+        enc.array(1).unwrap();
+        enc.u32(8).unwrap();
+
+        let result = handle_tx_monitor(&payload, &mempool).unwrap();
+        assert!(result.is_some());
+
+        let segment = result.unwrap();
+        let mut decoder = minicbor::Decoder::new(&segment.payload);
+        let _ = decoder.array();
+        assert_eq!(decoder.u32().unwrap(), 9); // MsgGetSizesReply
+        let _ = decoder.array();
+        let capacity = decoder.u64().unwrap();
+        let size = decoder.u64().unwrap();
+        let num_txs = decoder.u64().unwrap();
+        assert_eq!(capacity, 16384); // default max_transactions
+        assert_eq!(size, 500);
+        assert_eq!(num_txs, 1);
+    }
+
+    #[test]
+    fn test_handle_tx_monitor_next_tx() {
+        let mempool = Arc::new(Mempool::new(torsten_mempool::MempoolConfig::default()));
+
+        // MsgNextTx: [6]
+        let mut payload = Vec::new();
+        let mut enc = minicbor::Encoder::new(&mut payload);
+        enc.array(1).unwrap();
+        enc.u32(6).unwrap();
+
+        let result = handle_tx_monitor(&payload, &mempool).unwrap();
+        assert!(result.is_some());
+
+        let segment = result.unwrap();
+        let mut decoder = minicbor::Decoder::new(&segment.payload);
+        let _ = decoder.array();
+        assert_eq!(decoder.u32().unwrap(), 7); // MsgNextTxReply
+        assert!(decoder.null().is_ok()); // no tx available
+    }
+
+    #[test]
+    fn test_handle_tx_monitor_done() {
+        let mempool = Arc::new(Mempool::new(torsten_mempool::MempoolConfig::default()));
+
+        // MsgDone: [3]
+        let mut payload = Vec::new();
+        let mut enc = minicbor::Encoder::new(&mut payload);
+        enc.array(1).unwrap();
+        enc.u32(3).unwrap();
+
+        let result = handle_tx_monitor(&payload, &mempool).unwrap();
         assert!(result.is_none());
     }
 }

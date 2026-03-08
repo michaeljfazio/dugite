@@ -222,6 +222,11 @@ impl Mempool {
         *self.total_bytes.read()
     }
 
+    /// Maximum number of transactions the mempool can hold
+    pub fn capacity(&self) -> usize {
+        self.config.max_transactions
+    }
+
     /// Snapshot of current mempool state
     pub fn snapshot(&self) -> MempoolSnapshot {
         MempoolSnapshot {
