@@ -28,6 +28,8 @@ pub struct NodeArgs {
     pub socket_path: PathBuf,
     pub host_addr: String,
     pub port: u16,
+    /// Directory containing the config file (for resolving relative genesis paths)
+    pub config_dir: PathBuf,
 }
 
 /// Provides UTxO lookups from the live ledger state
@@ -85,10 +87,11 @@ impl Node {
         let mut protocol_params = ProtocolParameters::mainnet_defaults();
 
         // Load Shelley genesis if configured (with hash for nonce initialization)
+        let config_dir = args.config_dir.clone();
         let (shelley_genesis, shelley_genesis_hash) =
             if let Some(ref genesis_path) = args.config.shelley_genesis_file {
-                let genesis_path = std::path::Path::new(genesis_path);
-                match ShelleyGenesis::load_with_hash(genesis_path) {
+                let genesis_path = config_dir.join(genesis_path);
+                match ShelleyGenesis::load_with_hash(&genesis_path) {
                     Ok((genesis, hash)) => {
                         info!(
                             "Shelley genesis loaded: magic={}, system_start={}, epoch_length={}",
@@ -108,8 +111,8 @@ impl Node {
 
         // Load Alonzo genesis if configured
         if let Some(ref genesis_path) = args.config.alonzo_genesis_file {
-            let genesis_path = std::path::Path::new(genesis_path);
-            match AlonzoGenesis::load(genesis_path) {
+            let genesis_path = config_dir.join(genesis_path);
+            match AlonzoGenesis::load(&genesis_path) {
                 Ok(genesis) => {
                     info!(
                         max_val_size = genesis.max_value_size,
@@ -127,8 +130,8 @@ impl Node {
 
         // Load Conway genesis if configured
         if let Some(ref genesis_path) = args.config.conway_genesis_file {
-            let genesis_path = std::path::Path::new(genesis_path);
-            match ConwayGenesis::load(genesis_path) {
+            let genesis_path = config_dir.join(genesis_path);
+            match ConwayGenesis::load(&genesis_path) {
                 Ok(genesis) => {
                     info!(
                         drep_deposit = genesis.d_rep_deposit,

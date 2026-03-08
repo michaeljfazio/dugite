@@ -85,12 +85,22 @@ async fn run_node(args: RunArgs) -> Result<()> {
 
     // Load topology
     let topology = topology::Topology::load(&args.topology)?;
+    let all_peers = topology.all_peers();
     info!(
-        "Topology: {} producers configured",
-        topology.producers.len()
+        "Topology: {} peers configured (producers={}, bootstrap={}, local_roots={}, public_roots={})",
+        all_peers.len(),
+        topology.producers.len(),
+        topology.bootstrap_peers.len(),
+        topology.local_roots.iter().map(|g| g.access_points.len()).sum::<usize>(),
+        topology.public_roots.iter().map(|r| r.access_points.len()).sum::<usize>(),
     );
 
     // Initialize the node
+    let config_dir = args
+        .config
+        .parent()
+        .unwrap_or_else(|| std::path::Path::new("."))
+        .to_path_buf();
     let mut node = node::Node::new(node::NodeArgs {
         config: node_config,
         topology,
@@ -98,6 +108,7 @@ async fn run_node(args: RunArgs) -> Result<()> {
         socket_path: args.socket_path,
         host_addr: args.host_addr,
         port: args.port,
+        config_dir,
     })?;
 
     // Run the node
