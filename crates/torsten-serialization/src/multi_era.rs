@@ -175,13 +175,16 @@ fn decode_transaction_from_pallas(tx: &PallasTx) -> Result<Transaction, Serializ
         ttl,
         certificates,
         withdrawals,
-        auxiliary_data_hash: None,
+        auxiliary_data_hash: extract_auxiliary_data_hash(tx),
         validity_interval_start,
         mint,
         script_data_hash: extract_script_data_hash(tx),
         collateral,
         required_signers,
-        network_id: None,
+        network_id: tx.network_id().map(|n| match n {
+            pallas_primitives::NetworkId::Testnet => 0,
+            pallas_primitives::NetworkId::Mainnet => 1,
+        }),
         collateral_return: tx.collateral_return().and_then(|o| convert_output(&o).ok()),
         total_collateral: tx.total_collateral().map(Lovelace),
         reference_inputs,
@@ -368,6 +371,35 @@ fn convert_mint(tx: &PallasTx) -> BTreeMap<Hash28, BTreeMap<AssetName, i64>> {
     }
 
     result
+}
+
+fn extract_auxiliary_data_hash(tx: &PallasTx) -> Option<Hash32> {
+    if let Some(alonzo) = tx.as_alonzo() {
+        alonzo
+            .transaction_body
+            .auxiliary_data_hash
+            .as_ref()
+            .map(pallas_hash_to_torsten32)
+    } else if let Some(babbage) = tx.as_babbage() {
+        babbage
+            .transaction_body
+            .auxiliary_data_hash
+            .as_ref()
+            .map(|b| {
+                let mut bytes = [0u8; 32];
+                let len = b.len().min(32);
+                bytes[..len].copy_from_slice(&b[..len]);
+                Hash32::from_bytes(bytes)
+            })
+    } else if let Some(conway) = tx.as_conway() {
+        conway
+            .transaction_body
+            .auxiliary_data_hash
+            .as_ref()
+            .map(pallas_hash_to_torsten32)
+    } else {
+        None
+    }
 }
 
 fn extract_script_data_hash(tx: &PallasTx) -> Option<Hash32> {
