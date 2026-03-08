@@ -33,6 +33,12 @@ pub enum ValidationError {
     ScriptFailed(String),
     #[error("Insufficient collateral")]
     InsufficientCollateral,
+    #[error("Too many collateral inputs: max={max}, actual={actual}")]
+    TooManyCollateralInputs { max: u64, actual: u64 },
+    #[error("Collateral input not found in UTxO set: {0}")]
+    CollateralNotFound(String),
+    #[error("Collateral input contains tokens (must be pure ADA): {0}")]
+    CollateralHasTokens(String),
     #[error("Multi-asset not conserved for policy {policy}: inputs+mint={input_side}, outputs={output_side}")]
     MultiAssetNotConserved {
         policy: String,
@@ -212,16 +218,51 @@ pub fn validate_transaction(
         if body.collateral.is_empty() {
             errors.push(ValidationError::InsufficientCollateral);
         } else {
+            // Check max collateral inputs
+            if body.collateral.len() as u64 > params.max_collateral_inputs {
+                errors.push(ValidationError::TooManyCollateralInputs {
+                    max: params.max_collateral_inputs,
+                    actual: body.collateral.len() as u64,
+                });
+            }
+
             let mut collateral_value = 0u64;
             for col_input in &body.collateral {
-                if let Some(output) = utxo_set.lookup(col_input) {
-                    collateral_value += output.value.coin.0;
+                match utxo_set.lookup(col_input) {
+                    Some(output) => {
+                        // Collateral inputs must be pure ADA (no multi-assets)
+                        if !output.value.multi_asset.is_empty() {
+                            errors
+                                .push(ValidationError::CollateralHasTokens(col_input.to_string()));
+                        }
+                        collateral_value += output.value.coin.0;
+                    }
+                    None => {
+                        errors.push(ValidationError::CollateralNotFound(col_input.to_string()));
+                    }
                 }
             }
             let required_collateral = body.fee.0 * params.collateral_percentage / 100;
             if collateral_value < required_collateral {
                 errors.push(ValidationError::InsufficientCollateral);
             }
+        }
+
+        // Check total execution units don't exceed per-tx limits
+        let total_mem: u64 = tx
+            .witness_set
+            .redeemers
+            .iter()
+            .map(|r| r.ex_units.mem)
+            .sum();
+        let total_steps: u64 = tx
+            .witness_set
+            .redeemers
+            .iter()
+            .map(|r| r.ex_units.steps)
+            .sum();
+        if total_mem > params.max_tx_ex_units.mem || total_steps > params.max_tx_ex_units.steps {
+            errors.push(ValidationError::ExUnitsExceeded);
         }
     }
 
@@ -953,5 +994,240 @@ mod tests {
 
         let result = validate_transaction(&tx, &utxo_set, &params, 100, 300);
         assert!(result.is_ok());
+    }
+
+    fn make_plutus_tx_with_collateral(
+        input: TransactionInput,
+        output_value: u64,
+        fee: u64,
+        collateral: Vec<TransactionInput>,
+    ) -> Transaction {
+        let mut tx = make_simple_tx(input, output_value, fee);
+        tx.body.collateral = collateral;
+        // Add a dummy redeemer to make it a Plutus tx
+        tx.witness_set.redeemers.push(Redeemer {
+            tag: RedeemerTag::Spend,
+            index: 0,
+            data: PlutusData::Integer(0),
+            ex_units: ExUnits {
+                mem: 1_000_000,
+                steps: 1_000_000_000,
+            },
+        });
+        tx.witness_set.plutus_v2_scripts.push(vec![0x01]); // dummy script
+        tx
+    }
+
+    #[test]
+    fn test_plutus_collateral_valid() {
+        let mut utxo_set = UtxoSet::new();
+        let input = TransactionInput {
+            transaction_id: Hash32::from_bytes([1u8; 32]),
+            index: 0,
+        };
+        utxo_set.insert(
+            input.clone(),
+            TransactionOutput {
+                address: Address::Byron(ByronAddress {
+                    payload: vec![0u8; 32],
+                }),
+                value: Value::lovelace(10_000_000),
+                datum: OutputDatum::None,
+                script_ref: None,
+            },
+        );
+        let col_input = TransactionInput {
+            transaction_id: Hash32::from_bytes([2u8; 32]),
+            index: 0,
+        };
+        utxo_set.insert(
+            col_input.clone(),
+            TransactionOutput {
+                address: Address::Byron(ByronAddress {
+                    payload: vec![0u8; 32],
+                }),
+                value: Value::lovelace(5_000_000),
+                datum: OutputDatum::None,
+                script_ref: None,
+            },
+        );
+
+        let params = ProtocolParameters::mainnet_defaults();
+        let tx = make_plutus_tx_with_collateral(input, 9_800_000, 200_000, vec![col_input]);
+        let result = validate_transaction(&tx, &utxo_set, &params, 100, 300);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_plutus_collateral_not_found() {
+        let (utxo_set, input) = make_simple_utxo_set();
+        let params = ProtocolParameters::mainnet_defaults();
+
+        let missing_col = TransactionInput {
+            transaction_id: Hash32::from_bytes([99u8; 32]),
+            index: 0,
+        };
+        let tx = make_plutus_tx_with_collateral(input, 9_800_000, 200_000, vec![missing_col]);
+        let result = validate_transaction(&tx, &utxo_set, &params, 100, 300);
+        assert!(result.is_err());
+        let errors = result.unwrap_err();
+        assert!(errors
+            .iter()
+            .any(|e| matches!(e, ValidationError::CollateralNotFound(_))));
+    }
+
+    #[test]
+    fn test_plutus_collateral_has_tokens() {
+        let policy = torsten_primitives::hash::Hash28::from_bytes([10u8; 28]);
+        let asset = AssetName::new(b"Token".to_vec()).unwrap();
+
+        let mut utxo_set = UtxoSet::new();
+        let input = TransactionInput {
+            transaction_id: Hash32::from_bytes([1u8; 32]),
+            index: 0,
+        };
+        utxo_set.insert(
+            input.clone(),
+            TransactionOutput {
+                address: Address::Byron(ByronAddress {
+                    payload: vec![0u8; 32],
+                }),
+                value: Value::lovelace(10_000_000),
+                datum: OutputDatum::None,
+                script_ref: None,
+            },
+        );
+
+        // Collateral with tokens
+        let col_input = TransactionInput {
+            transaction_id: Hash32::from_bytes([2u8; 32]),
+            index: 0,
+        };
+        let mut col_value = Value::lovelace(5_000_000);
+        col_value
+            .multi_asset
+            .entry(policy)
+            .or_default()
+            .insert(asset, 100);
+        utxo_set.insert(
+            col_input.clone(),
+            TransactionOutput {
+                address: Address::Byron(ByronAddress {
+                    payload: vec![0u8; 32],
+                }),
+                value: col_value,
+                datum: OutputDatum::None,
+                script_ref: None,
+            },
+        );
+
+        let params = ProtocolParameters::mainnet_defaults();
+        let tx = make_plutus_tx_with_collateral(input, 9_800_000, 200_000, vec![col_input]);
+        let result = validate_transaction(&tx, &utxo_set, &params, 100, 300);
+        assert!(result.is_err());
+        let errors = result.unwrap_err();
+        assert!(errors
+            .iter()
+            .any(|e| matches!(e, ValidationError::CollateralHasTokens(_))));
+    }
+
+    #[test]
+    fn test_plutus_too_many_collateral_inputs() {
+        let mut utxo_set = UtxoSet::new();
+        let input = TransactionInput {
+            transaction_id: Hash32::from_bytes([1u8; 32]),
+            index: 0,
+        };
+        utxo_set.insert(
+            input.clone(),
+            TransactionOutput {
+                address: Address::Byron(ByronAddress {
+                    payload: vec![0u8; 32],
+                }),
+                value: Value::lovelace(10_000_000),
+                datum: OutputDatum::None,
+                script_ref: None,
+            },
+        );
+
+        // Create 4 collateral inputs (max is 3)
+        let mut collateral = Vec::new();
+        for i in 2..=5u8 {
+            let col = TransactionInput {
+                transaction_id: Hash32::from_bytes([i; 32]),
+                index: 0,
+            };
+            utxo_set.insert(
+                col.clone(),
+                TransactionOutput {
+                    address: Address::Byron(ByronAddress {
+                        payload: vec![0u8; 32],
+                    }),
+                    value: Value::lovelace(1_000_000),
+                    datum: OutputDatum::None,
+                    script_ref: None,
+                },
+            );
+            collateral.push(col);
+        }
+
+        let params = ProtocolParameters::mainnet_defaults();
+        let tx = make_plutus_tx_with_collateral(input, 9_800_000, 200_000, collateral);
+        let result = validate_transaction(&tx, &utxo_set, &params, 100, 300);
+        assert!(result.is_err());
+        let errors = result.unwrap_err();
+        assert!(errors
+            .iter()
+            .any(|e| matches!(e, ValidationError::TooManyCollateralInputs { .. })));
+    }
+
+    #[test]
+    fn test_plutus_ex_units_exceeded() {
+        let mut utxo_set = UtxoSet::new();
+        let input = TransactionInput {
+            transaction_id: Hash32::from_bytes([1u8; 32]),
+            index: 0,
+        };
+        utxo_set.insert(
+            input.clone(),
+            TransactionOutput {
+                address: Address::Byron(ByronAddress {
+                    payload: vec![0u8; 32],
+                }),
+                value: Value::lovelace(10_000_000),
+                datum: OutputDatum::None,
+                script_ref: None,
+            },
+        );
+        let col_input = TransactionInput {
+            transaction_id: Hash32::from_bytes([2u8; 32]),
+            index: 0,
+        };
+        utxo_set.insert(
+            col_input.clone(),
+            TransactionOutput {
+                address: Address::Byron(ByronAddress {
+                    payload: vec![0u8; 32],
+                }),
+                value: Value::lovelace(5_000_000),
+                datum: OutputDatum::None,
+                script_ref: None,
+            },
+        );
+
+        let params = ProtocolParameters::mainnet_defaults();
+        let mut tx = make_plutus_tx_with_collateral(input, 9_800_000, 200_000, vec![col_input]);
+        // Set excessive execution units
+        tx.witness_set.redeemers[0].ex_units = ExUnits {
+            mem: u64::MAX,
+            steps: u64::MAX,
+        };
+
+        let result = validate_transaction(&tx, &utxo_set, &params, 100, 300);
+        assert!(result.is_err());
+        let errors = result.unwrap_err();
+        assert!(errors
+            .iter()
+            .any(|e| matches!(e, ValidationError::ExUnitsExceeded)));
     }
 }
