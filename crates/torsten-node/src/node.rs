@@ -173,6 +173,7 @@ pub struct Node {
     network_magic: u64,
     shelley_genesis: Option<ShelleyGenesis>,
     topology_path: PathBuf,
+    metrics: Arc<crate::metrics::NodeMetrics>,
 }
 
 impl Node {
@@ -366,6 +367,7 @@ impl Node {
             network_magic,
             shelley_genesis,
             topology_path: args.topology_path,
+            metrics: Arc::new(crate::metrics::NodeMetrics::new()),
         })
     }
 
@@ -386,29 +388,13 @@ impl Node {
             shutdown_tx.send(true).ok();
         });
 
-        // Setup SIGHUP handler for topology reload
-        #[cfg(unix)]
+        // SIGHUP handler is set up after peer_manager initialization below
+
+        // Start Prometheus metrics server on port 12798
         {
-            let topology_path = self.topology_path.clone();
+            let metrics = self.metrics.clone();
             tokio::spawn(async move {
-                let mut hup = signal::unix::signal(signal::unix::SignalKind::hangup()).unwrap();
-                loop {
-                    hup.recv().await;
-                    info!(
-                        "SIGHUP received — reloading topology from {}",
-                        topology_path.display()
-                    );
-                    match Topology::load(&topology_path) {
-                        Ok(new_topology) => {
-                            let peers = new_topology.all_peers();
-                            info!("Topology reloaded: {} peers configured", peers.len());
-                            // TODO: update peer manager with new peers
-                        }
-                        Err(e) => {
-                            error!("Failed to reload topology: {e}");
-                        }
-                    }
-                }
+                crate::metrics::start_metrics_server(12798, metrics).await;
             });
         }
 
@@ -461,6 +447,54 @@ impl Node {
             );
         }
         let peers = self.topology.all_peers();
+
+        // Setup SIGHUP handler for topology reload
+        #[cfg(unix)]
+        {
+            let topology_path = self.topology_path.clone();
+            let pm_for_sighup = peer_manager.clone();
+            tokio::spawn(async move {
+                let mut hup = signal::unix::signal(signal::unix::SignalKind::hangup()).unwrap();
+                loop {
+                    hup.recv().await;
+                    info!(
+                        "SIGHUP received — reloading topology from {}",
+                        topology_path.display()
+                    );
+                    match Topology::load(&topology_path) {
+                        Ok(new_topology) => {
+                            let new_peers = new_topology.detailed_peers();
+                            let mut pm = pm_for_sighup.write().await;
+                            let mut added = 0usize;
+                            for peer in &new_peers {
+                                if let Ok(mut addrs) = tokio::net::lookup_host(format!(
+                                    "{}:{}",
+                                    peer.address, peer.port
+                                ))
+                                .await
+                                {
+                                    if let Some(socket_addr) = addrs.next() {
+                                        pm.add_config_peer(
+                                            socket_addr,
+                                            peer.trustable,
+                                            peer.advertise,
+                                        );
+                                        added += 1;
+                                    }
+                                }
+                            }
+                            info!(
+                                "Topology reloaded: {added} peers registered, {}",
+                                pm.stats()
+                            );
+                        }
+                        Err(e) => {
+                            error!("Failed to reload topology: {e}");
+                        }
+                    }
+                }
+            });
+        }
 
         // Start N2N server for inbound peer connections (bidirectional mode)
         let mut n2n_server = torsten_network::n2n_server::N2NServer::with_config(
@@ -975,10 +1009,14 @@ impl Node {
 
         *blocks_received += batch_count;
         *blocks_since_last_log += batch_count;
+        self.metrics.add_blocks_received(batch_count);
+        self.metrics.add_blocks_applied(batch_count);
 
         let last_block = blocks.last().unwrap();
         let slot = last_block.slot().0;
         let block_no = last_block.block_number().0;
+        self.metrics.set_slot(slot);
+        self.metrics.set_block_number(block_no);
 
         {
             let current_epoch = self.ledger_state.read().await.epoch.0;
@@ -1009,6 +1047,10 @@ impl Node {
             let blocks_remaining = tip_block.saturating_sub(block_no);
             {
                 let ls = self.ledger_state.read().await;
+                self.metrics.set_epoch(ls.epoch.0);
+                self.metrics.set_utxo_count(ls.utxo_set.len() as u64);
+                self.metrics.set_sync_progress(progress);
+                self.metrics.set_mempool_count(self.mempool.len() as u64);
                 info!(
                     "Syncing {progress:.2}% | slot {slot}/{tip_slot} | block {block_no}/{tip_block} | epoch {} | {blocks_per_sec:.0} blocks/s | {} UTxOs | {blocks_remaining} blocks remaining",
                     ls.epoch.0,
