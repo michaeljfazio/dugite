@@ -1228,8 +1228,8 @@ impl Node {
         let ls = self.ledger_state.read().await;
 
         // Build per-pool stake map from delegations for accurate reporting
-        let mut pool_stake_map: std::collections::BTreeMap<torsten_primitives::hash::Hash28, u64> =
-            std::collections::BTreeMap::new();
+        let mut pool_stake_map: std::collections::HashMap<torsten_primitives::hash::Hash28, u64> =
+            std::collections::HashMap::new();
         for (cred_hash, pool_id) in &ls.delegations {
             let stake = ls
                 .stake_distribution
