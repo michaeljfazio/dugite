@@ -182,7 +182,7 @@ fn decode_transaction_from_pallas(tx: &PallasTx) -> Result<Transaction, Serializ
         collateral,
         required_signers,
         network_id: None,
-        collateral_return: None,
+        collateral_return: tx.collateral_return().and_then(|o| convert_output(&o).ok()),
         total_collateral: None,
         reference_inputs,
         voting_procedures: convert_voting_procedures(tx),
