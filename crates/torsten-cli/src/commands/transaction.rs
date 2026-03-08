@@ -28,6 +28,15 @@ enum TxSubcommand {
         /// Time-to-live (slot number)
         #[arg(long)]
         ttl: Option<u64>,
+        /// Certificate files to include
+        #[arg(long)]
+        certificate_file: Vec<PathBuf>,
+        /// Withdrawal (format: stake_address+amount)
+        #[arg(long)]
+        withdrawal: Vec<String>,
+        /// Metadata JSON file
+        #[arg(long)]
+        metadata_json_file: Option<PathBuf>,
         /// Output file for the transaction body
         #[arg(long)]
         out_file: PathBuf,
@@ -116,16 +125,28 @@ fn build_tx_body_cbor(
     outputs: &[(String, u64)],
     fee: u64,
     ttl: Option<u64>,
+    certificates: &[Vec<u8>],
+    withdrawals: &[(Vec<u8>, u64)],
+    auxiliary_data: Option<&[u8]>,
 ) -> Result<Vec<u8>> {
     let mut buf = Vec::new();
     let mut enc = minicbor::Encoder::new(&mut buf);
 
     // Transaction body is a map with fields:
-    // 0: inputs (set of [tx_hash, index])
-    // 1: outputs (array of [address_bytes, amount])
-    // 2: fee
-    // 3: ttl (optional)
-    let field_count = if ttl.is_some() { 4u64 } else { 3 };
+    // 0: inputs, 1: outputs, 2: fee, 3: ttl, 4: certificates, 5: withdrawals, 7: auxiliary_data_hash
+    let mut field_count = 3u64; // inputs + outputs + fee
+    if ttl.is_some() {
+        field_count += 1;
+    }
+    if !certificates.is_empty() {
+        field_count += 1;
+    }
+    if !withdrawals.is_empty() {
+        field_count += 1;
+    }
+    if auxiliary_data.is_some() {
+        field_count += 1;
+    }
     enc.map(field_count)?;
 
     // Field 0: inputs
@@ -142,7 +163,6 @@ fn build_tx_body_cbor(
     enc.array(outputs.len() as u64)?;
     for (address, amount) in outputs {
         enc.array(2)?;
-        // Decode bech32 address to raw bytes
         let (_hrp, addr_bytes) = bech32::decode(address)
             .map_err(|e| anyhow::anyhow!("Invalid bech32 address '{address}': {e}"))?;
         enc.bytes(&addr_bytes)?;
@@ -159,7 +179,124 @@ fn build_tx_body_cbor(
         enc.u64(ttl_val)?;
     }
 
+    // Field 4: certificates (optional)
+    if !certificates.is_empty() {
+        enc.u32(4)?;
+        enc.array(certificates.len() as u64)?;
+        for cert_cbor in certificates {
+            // Re-encode each cert byte-by-byte through the encoder's writer
+            // by writing raw CBOR via the underlying writer
+            enc.writer_mut().extend_from_slice(cert_cbor);
+        }
+    }
+
+    // Field 5: withdrawals (optional)
+    if !withdrawals.is_empty() {
+        enc.u32(5)?;
+        enc.map(withdrawals.len() as u64)?;
+        for (reward_addr, amount) in withdrawals {
+            enc.bytes(reward_addr)?;
+            enc.u64(*amount)?;
+        }
+    }
+
+    // Field 7: auxiliary data hash (optional)
+    if let Some(aux_data) = auxiliary_data {
+        let aux_hash = torsten_primitives::hash::blake2b_256(aux_data);
+        enc.u32(7)?;
+        enc.bytes(aux_hash.as_bytes())?;
+    }
+
     Ok(buf)
+}
+
+/// Load certificate CBOR from a text envelope file
+fn load_certificate_cbor(path: &PathBuf) -> Result<Vec<u8>> {
+    let content = std::fs::read_to_string(path)?;
+    let env: serde_json::Value = serde_json::from_str(&content)?;
+    let cbor_hex = env["cborHex"]
+        .as_str()
+        .ok_or_else(|| anyhow::anyhow!("Missing cborHex in {}", path.display()))?;
+    Ok(hex::decode(cbor_hex)?)
+}
+
+/// Parse a withdrawal string "stake_address+amount"
+fn parse_withdrawal(s: &str) -> Result<(Vec<u8>, u64)> {
+    let parts: Vec<&str> = s.split('+').collect();
+    if parts.len() != 2 {
+        bail!("Invalid withdrawal format: '{s}'. Expected stake_address+amount");
+    }
+    let (_hrp, addr_bytes) = bech32::decode(parts[0])
+        .map_err(|e| anyhow::anyhow!("Invalid stake address '{}': {e}", parts[0]))?;
+    let amount: u64 = parts[1].trim().parse()?;
+    Ok((addr_bytes, amount))
+}
+
+/// Build auxiliary data CBOR from a JSON metadata file
+fn build_auxiliary_data(metadata_json: &serde_json::Value) -> Result<Vec<u8>> {
+    let mut buf = Vec::new();
+    let mut enc = minicbor::Encoder::new(&mut buf);
+
+    // Auxiliary data is: map { 0: metadata_map }
+    // where metadata_map is: { label => value }
+    enc.map(1)?;
+    enc.u32(0)?;
+
+    if let Some(obj) = metadata_json.as_object() {
+        enc.map(obj.len() as u64)?;
+        for (key, value) in obj {
+            let label: u64 = key
+                .parse()
+                .map_err(|_| anyhow::anyhow!("Metadata label must be an integer, got '{key}'"))?;
+            enc.u64(label)?;
+            encode_metadata_value(&mut enc, value)?;
+        }
+    } else {
+        anyhow::bail!("Metadata JSON must be an object with integer keys");
+    }
+
+    Ok(buf)
+}
+
+/// Recursively encode a JSON metadata value as CBOR
+fn encode_metadata_value(
+    enc: &mut minicbor::Encoder<&mut Vec<u8>>,
+    value: &serde_json::Value,
+) -> Result<()> {
+    match value {
+        serde_json::Value::Number(n) => {
+            if let Some(i) = n.as_i64() {
+                if i >= 0 {
+                    enc.u64(i as u64)?;
+                } else {
+                    enc.i64(i)?;
+                }
+            }
+        }
+        serde_json::Value::String(s) => {
+            enc.str(s)?;
+        }
+        serde_json::Value::Array(arr) => {
+            enc.array(arr.len() as u64)?;
+            for item in arr {
+                encode_metadata_value(enc, item)?;
+            }
+        }
+        serde_json::Value::Object(obj) => {
+            enc.map(obj.len() as u64)?;
+            for (k, v) in obj {
+                enc.str(k)?;
+                encode_metadata_value(enc, v)?;
+            }
+        }
+        serde_json::Value::Bool(b) => {
+            enc.bool(*b)?;
+        }
+        serde_json::Value::Null => {
+            enc.null()?;
+        }
+    }
+    Ok(())
 }
 
 impl TransactionCmd {
@@ -171,6 +308,9 @@ impl TransactionCmd {
                 change_address: _,
                 fee,
                 ttl,
+                certificate_file,
+                withdrawal,
+                metadata_json_file,
                 out_file,
             } => {
                 if tx_in.is_empty() {
@@ -189,7 +329,33 @@ impl TransactionCmd {
                     .map(|s| parse_tx_output(s))
                     .collect::<Result<_>>()?;
 
-                let tx_body_cbor = build_tx_body_cbor(&inputs, &outputs, fee, ttl)?;
+                let certificates: Vec<Vec<u8>> = certificate_file
+                    .iter()
+                    .map(load_certificate_cbor)
+                    .collect::<Result<_>>()?;
+
+                let withdrawals: Vec<(Vec<u8>, u64)> = withdrawal
+                    .iter()
+                    .map(|s| parse_withdrawal(s))
+                    .collect::<Result<_>>()?;
+
+                let auxiliary_data = if let Some(ref meta_file) = metadata_json_file {
+                    let meta_content = std::fs::read_to_string(meta_file)?;
+                    let meta_json: serde_json::Value = serde_json::from_str(&meta_content)?;
+                    Some(build_auxiliary_data(&meta_json)?)
+                } else {
+                    None
+                };
+
+                let tx_body_cbor = build_tx_body_cbor(
+                    &inputs,
+                    &outputs,
+                    fee,
+                    ttl,
+                    &certificates,
+                    &withdrawals,
+                    auxiliary_data.as_deref(),
+                )?;
 
                 // Write as text envelope (cardano-cli compatible format)
                 let envelope = serde_json::json!({
@@ -510,9 +676,56 @@ mod tests {
     fn test_build_tx_body_cbor() {
         let inputs = vec![(Hash32::from_bytes([0xab; 32]), 0)];
         let outputs = vec![];
-        let result = build_tx_body_cbor(&inputs, &outputs, 200000, None);
-        // Will fail because no valid bech32 outputs, but at least check with empty outputs
-        // Actually with empty outputs it should work fine
+        let result = build_tx_body_cbor(&inputs, &outputs, 200000, None, &[], &[], None);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_build_tx_body_with_certificates() {
+        let inputs = vec![(Hash32::from_bytes([0xab; 32]), 0)];
+        let outputs = vec![];
+        // A simple cert CBOR: [0, [0, bytes(28)]]
+        let cert = vec![0x82, 0x00, 0x82, 0x00, 0x58, 0x1c];
+        let certs = vec![cert];
+        let result = build_tx_body_cbor(&inputs, &outputs, 200000, None, &certs, &[], None);
+        assert!(result.is_ok());
+        let cbor = result.unwrap();
+        // Should have 4 fields: inputs, outputs, fee, certificates
+        let mut dec = minicbor::Decoder::new(&cbor);
+        assert_eq!(dec.map().unwrap(), Some(4));
+    }
+
+    #[test]
+    fn test_parse_withdrawal() {
+        // Build a valid stake address for testing
+        let key_hash = [0xab; 28];
+        let mut addr_bytes = vec![0xe0u8]; // testnet reward addr
+        addr_bytes.extend_from_slice(&key_hash);
+        let addr = bech32::encode::<bech32::Bech32>(
+            bech32::Hrp::parse("stake_test").unwrap(),
+            &addr_bytes,
+        )
+        .unwrap();
+
+        let input = format!("{addr}+1000000");
+        let result = parse_withdrawal(&input);
+        assert!(result.is_ok());
+        let (decoded_addr, amount) = result.unwrap();
+        assert_eq!(decoded_addr, addr_bytes);
+        assert_eq!(amount, 1000000);
+    }
+
+    #[test]
+    fn test_parse_withdrawal_invalid() {
+        assert!(parse_withdrawal("no_plus").is_err());
+    }
+
+    #[test]
+    fn test_encode_metadata_value() {
+        let json: serde_json::Value = serde_json::json!({
+            "674": { "msg": ["Hello, Cardano!"] }
+        });
+        let result = build_auxiliary_data(&json);
         assert!(result.is_ok());
     }
 
