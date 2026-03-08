@@ -4,6 +4,7 @@ pub mod handshake;
 pub mod keepalive;
 pub mod localstatequery;
 pub mod localtxsubmission;
+pub mod peersharing;
 pub mod txsubmission;
 
 /// Mini-protocol IDs as used by the Ouroboros multiplexer
@@ -14,6 +15,7 @@ pub enum MiniProtocolId {
     BlockFetch = 3,
     TxSubmission2 = 6,
     KeepAlive = 8,
+    PeerSharing = 10,
     LocalChainSync = 5,
     LocalTxSubmission = 9,
     LocalStateQuery = 7,
@@ -31,6 +33,7 @@ impl MiniProtocolId {
             7 => Some(MiniProtocolId::LocalStateQuery),
             8 => Some(MiniProtocolId::KeepAlive),
             9 => Some(MiniProtocolId::LocalTxSubmission),
+            10 => Some(MiniProtocolId::PeerSharing),
             12 => Some(MiniProtocolId::LocalTxMonitor),
             _ => None,
         }

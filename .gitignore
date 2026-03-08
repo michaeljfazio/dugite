@@ -8,3 +8,5 @@
 node.sock
 db/
 node.sock
+*.bin
+db-*/

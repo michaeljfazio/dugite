@@ -6,7 +6,9 @@ use tokio::net::TcpListener;
 use tokio::sync::RwLock;
 use tracing::{debug, error, info, warn};
 
+use crate::miniprotocols::peersharing::{self, PeerAddress, PeerSharingMessage};
 use crate::multiplexer::Segment;
+use crate::peer_manager::PeerManager;
 use crate::query_handler::QueryHandler;
 
 /// Callback trait for retrieving block data from storage
@@ -35,6 +37,7 @@ const MINI_PROTOCOL_CHAINSYNC: u16 = 2;
 const MINI_PROTOCOL_BLOCKFETCH: u16 = 3;
 const MINI_PROTOCOL_TXSUBMISSION: u16 = 4;
 const MINI_PROTOCOL_KEEPALIVE: u16 = 8;
+const MINI_PROTOCOL_PEERSHARING: u16 = 10;
 
 /// Peer sharing mode for N2N handshake
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -56,6 +59,8 @@ pub struct N2NServer {
     pub initiator_and_responder: bool,
     /// Whether peer sharing is enabled
     pub peer_sharing: PeerSharingMode,
+    /// Peer manager for sharing peers via PeerSharing protocol
+    peer_manager: Option<Arc<RwLock<PeerManager>>>,
 }
 
 impl N2NServer {
@@ -74,6 +79,7 @@ impl N2NServer {
             max_connections,
             initiator_and_responder: true,
             peer_sharing: PeerSharingMode::PeerSharingEnabled,
+            peer_manager: None,
         }
     }
 
@@ -95,7 +101,13 @@ impl N2NServer {
             max_connections,
             initiator_and_responder,
             peer_sharing,
+            peer_manager: None,
         }
+    }
+
+    /// Set the peer manager for PeerSharing protocol support
+    pub fn set_peer_manager(&mut self, peer_manager: Arc<RwLock<PeerManager>>) {
+        self.peer_manager = Some(peer_manager);
     }
 
     /// Start listening for inbound N2N connections.
@@ -129,6 +141,7 @@ impl N2NServer {
                     let counter = active_connections.clone();
                     let initiator_and_responder = self.initiator_and_responder;
                     let peer_sharing_mode = self.peer_sharing;
+                    let peer_manager = self.peer_manager.clone();
 
                     tokio::spawn(async move {
                         if let Err(e) = handle_n2n_connection(
@@ -139,6 +152,7 @@ impl N2NServer {
                             block_provider,
                             initiator_and_responder,
                             peer_sharing_mode,
+                            peer_manager,
                         )
                         .await
                         {
@@ -178,6 +192,7 @@ impl PeerState {
 }
 
 /// Handle a single inbound N2N peer connection
+#[allow(clippy::too_many_arguments)]
 async fn handle_n2n_connection(
     mut stream: tokio::net::TcpStream,
     peer_addr: SocketAddr,
@@ -186,6 +201,7 @@ async fn handle_n2n_connection(
     block_provider: Arc<dyn BlockProvider>,
     initiator_and_responder: bool,
     peer_sharing_mode: PeerSharingMode,
+    peer_manager: Option<Arc<RwLock<PeerManager>>>,
 ) -> Result<(), N2NServerError> {
     let mut buf = vec![0u8; 65536];
     let mut partial = Vec::new();
@@ -220,6 +236,7 @@ async fn handle_n2n_connection(
                         initiator_and_responder,
                         peer_sharing_mode,
                         &mut peer_state,
+                        &peer_manager,
                     )
                     .await?;
 
@@ -252,6 +269,7 @@ async fn process_n2n_segment(
     initiator_and_responder: bool,
     peer_sharing_mode: PeerSharingMode,
     peer_state: &mut PeerState,
+    peer_manager: &Option<Arc<RwLock<PeerManager>>>,
 ) -> Result<Vec<Segment>, N2NServerError> {
     match segment.protocol_id {
         MINI_PROTOCOL_HANDSHAKE => {
@@ -279,6 +297,12 @@ async fn process_n2n_segment(
         }
         MINI_PROTOCOL_KEEPALIVE => {
             let resp = handle_keepalive(&segment.payload)?;
+            Ok(resp.into_iter().collect())
+        }
+        MINI_PROTOCOL_PEERSHARING => {
+            let resp =
+                handle_peersharing(&segment.payload, peer_addr, peer_sharing_mode, peer_manager)
+                    .await?;
             Ok(resp.into_iter().collect())
         }
         other => {
@@ -877,6 +901,65 @@ fn handle_n2n_txsubmission(
         }
         other => {
             debug!("TxSubmission2: unknown tag {other}");
+            Ok(None)
+        }
+    }
+}
+
+/// Handle PeerSharing mini-protocol messages.
+///
+/// As a server (responder), we respond to:
+///   MsgShareRequest (0) [amount] → MsgSharePeers (1) [peer_list]
+///   MsgDone (2) → close protocol
+async fn handle_peersharing(
+    payload: &[u8],
+    peer_addr: SocketAddr,
+    peer_sharing_mode: PeerSharingMode,
+    peer_manager: &Option<Arc<RwLock<PeerManager>>>,
+) -> Result<Option<Segment>, N2NServerError> {
+    let msg = peersharing::decode_message(payload)
+        .map_err(|e| N2NServerError::Protocol(format!("PeerSharing decode error: {e}")))?;
+
+    match msg {
+        PeerSharingMessage::ShareRequest(amount) => {
+            debug!(peer = %peer_addr, amount, "PeerSharing: received share request");
+
+            let peers = if peer_sharing_mode == PeerSharingMode::NoPeerSharing {
+                vec![]
+            } else if let Some(pm) = peer_manager {
+                let pm = pm.read().await;
+                pm.peers_for_sharing(amount as usize)
+                    .into_iter()
+                    .map(PeerAddress::from_socket_addr)
+                    .collect()
+            } else {
+                vec![]
+            };
+
+            debug!(
+                peer = %peer_addr,
+                count = peers.len(),
+                "PeerSharing: responding with peers"
+            );
+
+            let response_msg = PeerSharingMessage::SharePeers(peers);
+            let response_bytes = peersharing::encode_message(&response_msg)
+                .map_err(|e| N2NServerError::Protocol(format!("PeerSharing encode error: {e}")))?;
+
+            Ok(Some(Segment {
+                transmission_time: 0,
+                protocol_id: MINI_PROTOCOL_PEERSHARING,
+                is_responder: true,
+                payload: response_bytes,
+            }))
+        }
+        PeerSharingMessage::Done => {
+            debug!(peer = %peer_addr, "PeerSharing: peer sent MsgDone");
+            Ok(None)
+        }
+        PeerSharingMessage::SharePeers(_) => {
+            // We shouldn't receive SharePeers as a responder
+            warn!(peer = %peer_addr, "PeerSharing: unexpected MsgSharePeers from initiator");
             Ok(None)
         }
     }

@@ -98,6 +98,44 @@ flowchart TD
     ROLL[Rollback] -->|remove from volatile| VOL
 ```
 
+### Relay Node Architecture
+
+```mermaid
+flowchart TB
+    subgraph Inbound ["Inbound Connections"]
+        IN1[Peer A] -->|N2N| MUX_IN[Multiplexer]
+        IN2[Peer B] -->|N2N| MUX_IN
+        IN3[Wallet] -->|N2C| MUX_N2C[N2C Server]
+    end
+
+    subgraph Outbound ["Outbound Connections"]
+        MUX_OUT[Multiplexer] -->|ChainSync| PEER1[Bootstrap Peer]
+        MUX_OUT -->|BlockFetch| PEER1
+        MUX_OUT -->|TxSubmission| PEER1
+    end
+
+    subgraph Core ["Node Core"]
+        PM[Peer Manager<br/>Cold→Warm→Hot]
+        MP[Mempool<br/>Tx Validation]
+        CDB[(ChainDB)]
+        LS[Ledger State]
+        CONS[Consensus<br/>Ouroboros Praos]
+    end
+
+    MUX_IN -->|ChainSync| CDB
+    MUX_IN -->|BlockFetch| CDB
+    MUX_IN -->|TxSubmission| MP
+    MUX_N2C -->|LocalStateQuery| LS
+    MUX_N2C -->|LocalTxSubmission| MP
+    MUX_N2C -->|LocalTxMonitor| MP
+
+    PEER1 -->|blocks| CDB
+    CDB --> LS
+    LS --> CONS
+    PM -->|manage| MUX_OUT
+    PM -->|manage| MUX_IN
+```
+
 ### Ouroboros Protocol Stack
 
 ```mermaid
@@ -216,16 +254,15 @@ Zero-warning policy enforced — all code must compile with `cargo clippy -- -D 
 
 #### Network (N2N — Node-to-Node)
 - [x] Ouroboros N2N handshake (V14+, pallas 1.0)
-- [x] ChainSync mini-protocol (header collection)
-- [x] BlockFetch mini-protocol (block retrieval)
-- [x] TxSubmission2 mini-protocol (N2N server)
-- [x] KeepAlive mini-protocol
+- [x] ChainSync mini-protocol (header collection + block fetch)
+- [x] BlockFetch mini-protocol (block retrieval, sub-batched with 100-block chunks)
+- [x] TxSubmission2 mini-protocol (N2N server — message types)
+- [x] KeepAlive mini-protocol (message types)
 - [x] N2N server for inbound peer connections
-- [x] Per-peer ChainSync cursor tracking
-- [x] Multi-peer concurrent block fetching (BlockFetchPool)
-- [x] Pipelined header collection with parallel block fetch
-- [x] Peer manager (cold/warm/hot lifecycle, failure backoff)
+- [x] Peer manager (cold/warm/hot lifecycle, failure backoff, exponential retry)
 - [x] Bidirectional diffusion mode (InitiatorAndResponder)
+- [x] DNS multi-resolution (all IPs per hostname for peer discovery)
+- [x] Batched RocksDB WriteBatch for efficient volatile→immutable flush
 
 #### Network (N2C — Node-to-Client)
 - [x] Unix domain socket server
@@ -305,6 +342,26 @@ Zero-warning policy enforced — all code must compile with `cargo clippy -- -D 
 
 ### Not Yet Implemented
 
+#### Relay Node Compliance
+- [ ] PeerSharing mini-protocol (gossip-based peer discovery)
+- [ ] Ledger-based peer discovery (transition from bootstrap to ledger peers)
+- [ ] N2N ChainSync server (responder side for inbound peers)
+- [ ] N2N TxSubmission2 full flow (mempool ↔ peer transaction exchange)
+- [ ] KeepAlive heartbeat scheduling on active connections
+- [ ] Connection backpressure and flow control (ack/req counts)
+- [ ] Concurrent ChainSync from multiple peers
+- [ ] Adaptive peer selection (latency-based ranking, reputation)
+- [ ] Inbound connection rate limiting and DoS protection
+- [ ] SIGHUP topology reload
+
+#### Block Producer
+- [ ] KES key management (generation, rotation, period tracking)
+- [ ] VRF key management and slot leader check
+- [ ] Block forging (create blocks from mempool transactions)
+- [ ] Operational certificate generation and rotation
+- [ ] Block announcement (propagate forged blocks to peers)
+- [ ] Leader schedule calculation
+
 #### Cryptographic Verification
 - [ ] Full VRF proof verification (requires VRF library integration)
 - [ ] Full KES signature verification (requires KES library integration)
@@ -315,10 +372,9 @@ Zero-warning policy enforced — all code must compile with `cargo clippy -- -D 
 - [ ] Script context construction
 
 #### Performance
-- [ ] Concurrent chainsync from multiple peers (protocol-limited to ~3 headers/s per peer)
-- [ ] Peer sharing protocol (PeerSharing gossip-based discovery)
-- [ ] SIGHUP topology reload
 - [ ] Mithril snapshot import for fast initial sync
+- [ ] Parallel block validation
+- [ ] Memory-mapped UTxO set for large chains
 
 #### Full CLI Parity
 - [ ] Node operational certificate commands
