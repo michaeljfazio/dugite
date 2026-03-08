@@ -79,6 +79,15 @@ impl ChainDB {
         blocks: &[(BlockHeaderHash, SlotNo, BlockNo, BlockHeaderHash, Vec<u8>)],
     ) -> Result<(), ChainDBError> {
         for (hash, slot, block_no, prev_hash, cbor) in blocks {
+            // Skip blocks that already exist (e.g. replaying after Mithril import)
+            if self.has_block(hash) {
+                trace!(
+                    hash = %hash.to_hex(),
+                    slot = slot.0,
+                    "ChainDB: block already exists, skipping"
+                );
+                continue;
+            }
             trace!(
                 hash = %hash.to_hex(),
                 slot = slot.0,
