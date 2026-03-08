@@ -261,6 +261,76 @@ impl VolatileDB {
         result
     }
 
+    /// Store multiple blocks in a single lock acquisition.
+    /// More efficient than calling put_block repeatedly — acquires each lock only once.
+    /// Skips blocks that already exist (idempotent).
+    pub fn put_blocks_batch(
+        &self,
+        batch: Vec<(BlockHeaderHash, SlotNo, BlockNo, BlockHeaderHash, Vec<u8>)>,
+    ) -> usize {
+        if batch.is_empty() {
+            return 0;
+        }
+
+        let mut blocks = self.blocks.write();
+        let mut slot_index = self.slot_index.write();
+        let mut tip = self.tip.write();
+        let mut inserted = 0;
+
+        for (hash, slot, block_no, prev_hash, cbor) in batch {
+            if blocks.contains_key(&hash) {
+                debug!(hash = %hash.to_hex(), "VolatileDB: block already exists (batch), skipping");
+                continue;
+            }
+
+            blocks.insert(
+                hash,
+                VolatileEntry {
+                    slot,
+                    block_no,
+                    prev_hash,
+                    cbor,
+                },
+            );
+
+            slot_index.entry(slot).or_default().push(hash);
+
+            let should_update = match &*tip {
+                None => true,
+                Some((_, _, current_block_no)) => block_no > *current_block_no,
+            };
+            if should_update {
+                *tip = Some((hash, slot, block_no));
+            }
+
+            inserted += 1;
+        }
+
+        // Garbage collect if needed
+        if blocks.len() > self.max_blocks {
+            debug!(
+                count = blocks.len(),
+                max = self.max_blocks,
+                "VolatileDB: garbage collecting oldest blocks (batch)"
+            );
+            // Inline GC since we already hold the slot_index lock
+            while blocks.len() > self.max_blocks {
+                if let Some((&oldest_slot, _)) = slot_index.iter().next() {
+                    if let Some(hashes) = slot_index.remove(&oldest_slot) {
+                        for hash in hashes {
+                            blocks.remove(&hash);
+                        }
+                    }
+                } else {
+                    break;
+                }
+            }
+        }
+
+        trace!(inserted, "VolatileDB: batch insert complete");
+        inserted
+    }
+
     pub fn block_count(&self) -> usize {
         self.blocks.read().len()
     }
@@ -472,5 +542,107 @@ mod tests {
         // Next after slot 30 should be None
         let result = vdb.get_next_block_after_slot(SlotNo(30));
         assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_put_blocks_batch() {
+        let vdb = VolatileDB::new(100);
+
+        let batch = vec![
+            (
+                make_hash(1),
+                SlotNo(10),
+                BlockNo(1),
+                make_hash(0),
+                b"b1".to_vec(),
+            ),
+            (
+                make_hash(2),
+                SlotNo(20),
+                BlockNo(2),
+                make_hash(1),
+                b"b2".to_vec(),
+            ),
+            (
+                make_hash(3),
+                SlotNo(30),
+                BlockNo(3),
+                make_hash(2),
+                b"b3".to_vec(),
+            ),
+        ];
+
+        let inserted = vdb.put_blocks_batch(batch);
+        assert_eq!(inserted, 3);
+        assert_eq!(vdb.block_count(), 3);
+
+        // Verify all blocks are stored
+        assert_eq!(vdb.get_block(&make_hash(1)).unwrap(), b"b1");
+        assert_eq!(vdb.get_block(&make_hash(2)).unwrap(), b"b2");
+        assert_eq!(vdb.get_block(&make_hash(3)).unwrap(), b"b3");
+
+        // Verify tip is the highest block
+        let tip = vdb.get_tip().unwrap();
+        assert_eq!(tip.block_number, BlockNo(3));
+    }
+
+    #[test]
+    fn test_put_blocks_batch_skips_duplicates() {
+        let vdb = VolatileDB::new(100);
+
+        // Insert first block individually
+        vdb.put_block(
+            make_hash(1),
+            SlotNo(10),
+            BlockNo(1),
+            make_hash(0),
+            b"b1".to_vec(),
+        )
+        .unwrap();
+
+        // Batch includes the duplicate and a new block
+        let batch = vec![
+            (
+                make_hash(1),
+                SlotNo(10),
+                BlockNo(1),
+                make_hash(0),
+                b"b1_dup".to_vec(),
+            ),
+            (
+                make_hash(2),
+                SlotNo(20),
+                BlockNo(2),
+                make_hash(1),
+                b"b2".to_vec(),
+            ),
+        ];
+
+        let inserted = vdb.put_blocks_batch(batch);
+        assert_eq!(inserted, 1); // Only block 2 was new
+        assert_eq!(vdb.block_count(), 2);
+
+        // Original block 1 data should be unchanged
+        assert_eq!(vdb.get_block(&make_hash(1)).unwrap(), b"b1");
+    }
+
+    #[test]
+    fn test_put_blocks_batch_gc() {
+        let vdb = VolatileDB::new(3);
+
+        let batch: Vec<_> = (1..=5u8)
+            .map(|i| {
+                (
+                    make_hash(i),
+                    SlotNo(i as u64),
+                    BlockNo(i as u64),
+                    make_hash(i - 1),
+                    format!("block{}", i).into_bytes(),
+                )
+            })
+            .collect();
+
+        vdb.put_blocks_batch(batch);
+        assert!(vdb.block_count() <= 3);
     }
 }

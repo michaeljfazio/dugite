@@ -1078,7 +1078,7 @@ impl Node {
     #[allow(clippy::too_many_arguments)]
     async fn process_forward_blocks(
         &mut self,
-        blocks: Vec<torsten_primitives::block::Block>,
+        mut blocks: Vec<torsten_primitives::block::Block>,
         tip: &torsten_primitives::block::Tip,
         blocks_received: &mut u64,
         blocks_since_last_log: &mut u64,
@@ -1091,16 +1091,16 @@ impl Node {
         }
         let batch_count = blocks.len() as u64;
 
-        // Build ChainDB batch data upfront
+        // Build ChainDB batch data, taking ownership of raw_cbor to avoid cloning
         let db_batch: Vec<_> = blocks
-            .iter()
+            .iter_mut()
             .map(|block| {
                 (
                     *block.hash(),
                     block.slot(),
                     block.block_number(),
                     *block.prev_hash(),
-                    block.raw_cbor.clone().unwrap_or_default(),
+                    block.raw_cbor.take().unwrap_or_default(),
                 )
             })
             .collect();
@@ -1111,7 +1111,7 @@ impl Node {
         tokio::join!(
             async {
                 let mut db = chain_db.write().await;
-                if let Err(e) = db.add_blocks_batch(&db_batch) {
+                if let Err(e) = db.add_blocks_batch(db_batch) {
                     error!("Failed to store block batch: {e}");
                 }
             },
@@ -1227,19 +1227,26 @@ impl Node {
 
         let ls = self.ledger_state.read().await;
 
-        // Build stake pool snapshots
+        // Build per-pool stake map from delegations for accurate reporting
+        let mut pool_stake_map: std::collections::BTreeMap<torsten_primitives::hash::Hash28, u64> =
+            std::collections::BTreeMap::new();
+        for (cred_hash, pool_id) in &ls.delegations {
+            let stake = ls
+                .stake_distribution
+                .stake_map
+                .get(cred_hash)
+                .map(|l| l.0)
+                .unwrap_or(0);
+            *pool_stake_map.entry(*pool_id).or_default() += stake;
+        }
+
+        // Build stake pool snapshots with actual per-pool stake
         let stake_pools: Vec<StakePoolSnapshot> = ls
             .pool_params
             .iter()
             .map(|(pool_id, reg)| StakePoolSnapshot {
                 pool_id: pool_id.as_ref().to_vec(),
-                stake: ls
-                    .stake_distribution
-                    .stake_map
-                    .values()
-                    .map(|l| l.0)
-                    .sum::<u64>()
-                    / ls.pool_params.len().max(1) as u64, // approximate per-pool
+                stake: pool_stake_map.get(pool_id).copied().unwrap_or(0),
                 pledge: reg.pledge.0,
                 cost: reg.cost.0,
                 margin_num: reg.margin_numerator,

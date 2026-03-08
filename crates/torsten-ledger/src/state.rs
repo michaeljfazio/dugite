@@ -706,6 +706,16 @@ impl LedgerState {
 
         let mut total_distributed: u64 = 0;
 
+        // Build delegators-by-pool index for O(n) reward distribution
+        // instead of O(n*m) inner loop over all delegations per pool
+        let mut delegators_by_pool: BTreeMap<Hash28, Vec<Hash32>> = BTreeMap::new();
+        for (cred_hash, pool_id) in &go_snapshot.delegations {
+            delegators_by_pool
+                .entry(*pool_id)
+                .or_default()
+                .push(*cred_hash);
+        }
+
         // Calculate rewards per pool
         for (pool_id, pool_active_stake) in &go_snapshot.pool_stake {
             let pool_reg = match go_snapshot.pool_params.get(pool_id) {
@@ -745,36 +755,30 @@ impl LedgerState {
             let member_reward_pot = pool_reward.saturating_sub(operator_reward);
 
             // Distribute member rewards proportionally to delegators
-            for (cred_hash, delegated_pool) in &go_snapshot.delegations {
-                if delegated_pool != pool_id {
-                    continue;
-                }
-                let member_stake = go_snapshot
-                    .pool_stake
-                    .get(pool_id)
-                    .map(|_| {
-                        self.stake_distribution
-                            .stake_map
-                            .get(cred_hash)
-                            .copied()
-                            .unwrap_or(Lovelace(0))
-                            .0
-                    })
-                    .unwrap_or(0);
+            if let Some(delegators) = delegators_by_pool.get(pool_id) {
+                for cred_hash in delegators {
+                    let member_stake = self
+                        .stake_distribution
+                        .stake_map
+                        .get(cred_hash)
+                        .copied()
+                        .unwrap_or(Lovelace(0))
+                        .0;
 
-                if member_stake == 0 || pool_active_stake.0 == 0 {
-                    continue;
-                }
+                    if member_stake == 0 || pool_active_stake.0 == 0 {
+                        continue;
+                    }
 
-                let member_share = (member_reward_pot as f64 * member_stake as f64
-                    / pool_active_stake.0 as f64) as u64;
+                    let member_share = (member_reward_pot as f64 * member_stake as f64
+                        / pool_active_stake.0 as f64) as u64;
 
-                if member_share > 0 {
-                    *self
-                        .reward_accounts
-                        .entry(*cred_hash)
-                        .or_insert(Lovelace(0)) += Lovelace(member_share);
-                    total_distributed += member_share;
+                    if member_share > 0 {
+                        *self
+                            .reward_accounts
+                            .entry(*cred_hash)
+                            .or_insert(Lovelace(0)) += Lovelace(member_share);
+                        total_distributed += member_share;
+                    }
                 }
             }
 

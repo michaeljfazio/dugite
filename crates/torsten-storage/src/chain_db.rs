@@ -73,31 +73,41 @@ impl ChainDB {
     }
 
     /// Store multiple blocks in a batch, flushing to immutable only once at the end.
-    /// More efficient than calling add_block repeatedly.
+    /// Uses batched volatile DB writes (single lock acquisition) for performance.
+    /// Takes ownership of blocks to avoid cloning CBOR data.
     pub fn add_blocks_batch(
         &mut self,
-        blocks: &[(BlockHeaderHash, SlotNo, BlockNo, BlockHeaderHash, Vec<u8>)],
+        blocks: Vec<(BlockHeaderHash, SlotNo, BlockNo, BlockHeaderHash, Vec<u8>)>,
     ) -> Result<(), ChainDBError> {
-        for (hash, slot, block_no, prev_hash, cbor) in blocks {
-            // Skip blocks that already exist (e.g. replaying after Mithril import)
-            if self.has_block(hash) {
-                trace!(
-                    hash = %hash.to_hex(),
-                    slot = slot.0,
-                    "ChainDB: block already exists, skipping"
-                );
-                continue;
-            }
-            trace!(
-                hash = %hash.to_hex(),
-                slot = slot.0,
-                block_no = block_no.0,
-                cbor_bytes = cbor.len(),
-                "ChainDB: adding block (batch)"
-            );
-            self.volatile
-                .put_block(*hash, *slot, *block_no, *prev_hash, cbor.clone())?;
+        if blocks.is_empty() {
+            return Ok(());
         }
+
+        // Filter out blocks that already exist in immutable DB
+        // (volatile duplicates are handled by put_blocks_batch)
+        let batch: Vec<_> = blocks
+            .into_iter()
+            .filter(|(hash, slot, _, _, _)| {
+                let exists = self
+                    .immutable
+                    .get_block_by_hash(hash)
+                    .ok()
+                    .flatten()
+                    .is_some();
+                if exists {
+                    trace!(
+                        hash = %hash.to_hex(),
+                        slot = slot.0,
+                        "ChainDB: block already in immutable DB, skipping"
+                    );
+                }
+                !exists
+            })
+            .collect();
+
+        let inserted = self.volatile.put_blocks_batch(batch);
+        trace!(inserted, "ChainDB: batch insert to volatile complete");
+
         // Flush once at the end of the batch
         self.maybe_flush_to_immutable()?;
         Ok(())
