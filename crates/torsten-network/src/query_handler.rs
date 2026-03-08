@@ -190,6 +190,11 @@ impl QueryHandler {
         self.state = snapshot;
     }
 
+    /// Get a reference to the current node state snapshot
+    pub fn state(&self) -> &NodeStateSnapshot {
+        &self.state
+    }
+
     /// Handle a raw CBOR query message and return a result.
     ///
     /// The CBOR payload from MsgQuery is: [3, query]

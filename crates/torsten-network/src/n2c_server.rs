@@ -126,10 +126,7 @@ async fn process_segment(
         MINI_PROTOCOL_STATE_QUERY => handle_state_query(&segment.payload, query_handler).await,
         MINI_PROTOCOL_TX_SUBMISSION => handle_tx_submission(&segment.payload, mempool),
         MINI_PROTOCOL_TX_MONITOR => handle_tx_monitor(&segment.payload, mempool),
-        MINI_PROTOCOL_CHAINSYNC => {
-            debug!("LocalChainSync message received (not yet implemented)");
-            Ok(None)
-        }
+        MINI_PROTOCOL_CHAINSYNC => handle_local_chainsync(&segment.payload, query_handler).await,
         other => {
             debug!("Unknown N2C mini-protocol: {other}");
             Ok(None)
@@ -465,6 +462,174 @@ fn handle_tx_monitor(
             Ok(None)
         }
     }
+}
+
+/// Handle LocalChainSync messages
+///
+/// Protocol flow:
+///   Client: MsgFindIntersect(points) → Server: MsgIntersectFound(point, tip) | MsgIntersectNotFound(tip)
+///   Client: MsgRequestNext            → Server: MsgRollForward(block, tip) | MsgRollBackward(point, tip) | MsgAwaitReply
+///   Client: MsgDone                   → (end)
+///
+/// Message tags:
+///   0: MsgRequestNext
+///   1: MsgAwaitReply
+///   2: MsgRollForward    [2, wrapped_header, tip]
+///   3: MsgRollBackward   [3, point, tip]
+///   4: MsgFindIntersect  [4, [point, ...]]
+///   5: MsgIntersectFound [5, point, tip]
+///   6: MsgIntersectNotFound [6, tip]
+///   7: MsgDone
+async fn handle_local_chainsync(
+    payload: &[u8],
+    query_handler: &Arc<RwLock<QueryHandler>>,
+) -> Result<Option<Segment>, N2CServerError> {
+    let mut decoder = minicbor::Decoder::new(payload);
+
+    let msg_tag = match decoder.array() {
+        Ok(Some(len)) if len >= 1 => decoder
+            .u32()
+            .map_err(|e| N2CServerError::Protocol(format!("bad chainsync msg tag: {e}")))?,
+        Ok(None) => decoder
+            .u32()
+            .map_err(|e| N2CServerError::Protocol(format!("bad chainsync msg tag: {e}")))?,
+        _ => return Err(N2CServerError::Protocol("invalid chainsync message".into())),
+    };
+
+    match msg_tag {
+        0 => {
+            // MsgRequestNext → MsgAwaitReply [1]
+            // For now, always respond with MsgAwaitReply since we don't push blocks to clients
+            debug!("LocalChainSync: MsgRequestNext → MsgAwaitReply");
+            let mut buf = Vec::new();
+            let mut enc = minicbor::Encoder::new(&mut buf);
+            enc.array(1)
+                .map_err(|e| N2CServerError::Protocol(e.to_string()))?;
+            enc.u32(1)
+                .map_err(|e| N2CServerError::Protocol(e.to_string()))?; // MsgAwaitReply
+            Ok(Some(Segment {
+                transmission_time: 0,
+                protocol_id: MINI_PROTOCOL_CHAINSYNC,
+                is_responder: true,
+                payload: buf,
+            }))
+        }
+        4 => {
+            // MsgFindIntersect(points) → MsgIntersectFound(point, tip) or MsgIntersectNotFound(tip)
+            debug!("LocalChainSync: MsgFindIntersect");
+            let handler = query_handler.read().await;
+            let state = handler.state();
+            let tip_slot = state.tip.point.slot().map(|s| s.0).unwrap_or(0);
+            let tip_hash = state.tip.point.hash().copied().unwrap_or(Hash32::ZERO);
+            let tip_block_no = state.block_number.0;
+
+            // Try to parse the client's points and find one that matches our tip
+            // (basic implementation — checks if any point matches our current tip)
+            let found_point = parse_client_points(&mut decoder, tip_slot, &tip_hash);
+
+            let mut buf = Vec::new();
+            let mut enc = minicbor::Encoder::new(&mut buf);
+
+            if let Some((slot, hash)) = found_point {
+                debug!(slot, "LocalChainSync: MsgIntersectFound");
+                // MsgIntersectFound [5, point, tip]
+                enc.array(3)
+                    .map_err(|e| N2CServerError::Protocol(e.to_string()))?;
+                enc.u32(5)
+                    .map_err(|e| N2CServerError::Protocol(e.to_string()))?;
+                // point: [slot, hash]
+                encode_point(&mut enc, slot, &hash)?;
+                // tip: [point, block_no]
+                encode_tip(&mut enc, tip_slot, &tip_hash, tip_block_no)?;
+            } else {
+                debug!("LocalChainSync: MsgIntersectNotFound");
+                // MsgIntersectNotFound [6, tip]
+                enc.array(2)
+                    .map_err(|e| N2CServerError::Protocol(e.to_string()))?;
+                enc.u32(6)
+                    .map_err(|e| N2CServerError::Protocol(e.to_string()))?;
+                // tip: [point, block_no]
+                encode_tip(&mut enc, tip_slot, &tip_hash, tip_block_no)?;
+            }
+
+            Ok(Some(Segment {
+                transmission_time: 0,
+                protocol_id: MINI_PROTOCOL_CHAINSYNC,
+                is_responder: true,
+                payload: buf,
+            }))
+        }
+        7 => {
+            // MsgDone
+            debug!("LocalChainSync: MsgDone");
+            Ok(None)
+        }
+        other => {
+            warn!("Unknown LocalChainSync message tag: {other}");
+            Ok(None)
+        }
+    }
+}
+
+/// Parse client points from MsgFindIntersect and check if any match our tip
+fn parse_client_points(
+    decoder: &mut minicbor::Decoder,
+    tip_slot: u64,
+    tip_hash: &Hash32,
+) -> Option<(u64, Hash32)> {
+    let arr_len = decoder.array().ok()??;
+    for _ in 0..arr_len {
+        // Each point is either [slot, hash] or "origin" (encoded as array of 0 elements)
+        if let Ok(Some(point_len)) = decoder.array() {
+            if point_len == 2 {
+                if let (Ok(slot), Ok(hash_bytes)) = (decoder.u64(), decoder.bytes()) {
+                    if slot == tip_slot && hash_bytes.len() == 32 {
+                        let point_hash = Hash32::from_bytes(hash_bytes.try_into().unwrap());
+                        if point_hash == *tip_hash {
+                            return Some((slot, point_hash));
+                        }
+                    }
+                    continue;
+                }
+            } else if point_len == 0 {
+                // Origin point
+                continue;
+            }
+        }
+        // Skip malformed point
+        let _ = decoder.skip();
+    }
+    None
+}
+
+/// Encode a point as [slot, hash]
+fn encode_point(
+    enc: &mut minicbor::Encoder<&mut Vec<u8>>,
+    slot: u64,
+    hash: &Hash32,
+) -> Result<(), N2CServerError> {
+    enc.array(2)
+        .map_err(|e| N2CServerError::Protocol(e.to_string()))?;
+    enc.u64(slot)
+        .map_err(|e| N2CServerError::Protocol(e.to_string()))?;
+    enc.bytes(hash.as_bytes())
+        .map_err(|e| N2CServerError::Protocol(e.to_string()))?;
+    Ok(())
+}
+
+/// Encode tip as [[slot, hash], block_no]
+fn encode_tip(
+    enc: &mut minicbor::Encoder<&mut Vec<u8>>,
+    slot: u64,
+    hash: &Hash32,
+    block_no: u64,
+) -> Result<(), N2CServerError> {
+    enc.array(2)
+        .map_err(|e| N2CServerError::Protocol(e.to_string()))?;
+    encode_point(enc, slot, hash)?;
+    enc.u64(block_no)
+        .map_err(|e| N2CServerError::Protocol(e.to_string()))?;
+    Ok(())
 }
 
 /// Extract transaction CBOR bytes from a MsgSubmitTx payload
@@ -1157,6 +1322,66 @@ mod tests {
         enc.u32(3).unwrap();
 
         let result = handle_tx_monitor(&payload, &mempool).unwrap();
+        assert!(result.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_handle_local_chainsync_request_next() {
+        let handler = Arc::new(RwLock::new(QueryHandler::new()));
+
+        // MsgRequestNext: [0]
+        let mut payload = Vec::new();
+        let mut enc = minicbor::Encoder::new(&mut payload);
+        enc.array(1).unwrap();
+        enc.u32(0).unwrap();
+
+        let result = handle_local_chainsync(&payload, &handler).await.unwrap();
+        assert!(result.is_some());
+
+        let segment = result.unwrap();
+        assert_eq!(segment.protocol_id, MINI_PROTOCOL_CHAINSYNC);
+        assert!(segment.is_responder);
+
+        // Should be MsgAwaitReply [1]
+        let mut decoder = minicbor::Decoder::new(&segment.payload);
+        let _ = decoder.array();
+        assert_eq!(decoder.u32().unwrap(), 1); // MsgAwaitReply
+    }
+
+    #[tokio::test]
+    async fn test_handle_local_chainsync_find_intersect_not_found() {
+        let handler = Arc::new(RwLock::new(QueryHandler::new()));
+
+        // MsgFindIntersect: [4, [[12345, hash]]]
+        let mut payload = Vec::new();
+        let mut enc = minicbor::Encoder::new(&mut payload);
+        enc.array(2).unwrap();
+        enc.u32(4).unwrap(); // MsgFindIntersect
+        enc.array(1).unwrap(); // one point
+        enc.array(2).unwrap(); // point: [slot, hash]
+        enc.u64(12345).unwrap();
+        enc.bytes(&[0xaa; 32]).unwrap();
+
+        let result = handle_local_chainsync(&payload, &handler).await.unwrap();
+        assert!(result.is_some());
+
+        let segment = result.unwrap();
+        let mut decoder = minicbor::Decoder::new(&segment.payload);
+        let _ = decoder.array();
+        assert_eq!(decoder.u32().unwrap(), 6); // MsgIntersectNotFound
+    }
+
+    #[tokio::test]
+    async fn test_handle_local_chainsync_done() {
+        let handler = Arc::new(RwLock::new(QueryHandler::new()));
+
+        // MsgDone: [7]
+        let mut payload = Vec::new();
+        let mut enc = minicbor::Encoder::new(&mut payload);
+        enc.array(1).unwrap();
+        enc.u32(7).unwrap();
+
+        let result = handle_local_chainsync(&payload, &handler).await.unwrap();
         assert!(result.is_none());
     }
 }
