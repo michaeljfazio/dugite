@@ -18,7 +18,7 @@ use torsten_primitives::protocol_params::ProtocolParameters;
 use torsten_storage::ChainDB;
 
 use crate::config::NodeConfig;
-use crate::genesis::ShelleyGenesis;
+use crate::genesis::{AlonzoGenesis, ConwayGenesis, ShelleyGenesis};
 use crate::topology::Topology;
 
 pub struct NodeArgs {
@@ -104,6 +104,44 @@ impl Node {
         } else {
             None
         };
+
+        // Load Alonzo genesis if configured
+        if let Some(ref genesis_path) = args.config.alonzo_genesis_file {
+            let genesis_path = std::path::Path::new(genesis_path);
+            match AlonzoGenesis::load(genesis_path) {
+                Ok(genesis) => {
+                    info!(
+                        max_val_size = genesis.max_value_size,
+                        collateral_pct = genesis.collateral_percentage,
+                        max_tx_ex_mem = genesis.max_tx_ex_units.ex_units_mem,
+                        "Alonzo genesis loaded"
+                    );
+                    genesis.apply_to_protocol_params(&mut protocol_params);
+                }
+                Err(e) => {
+                    warn!("Failed to load Alonzo genesis: {e}");
+                }
+            }
+        }
+
+        // Load Conway genesis if configured
+        if let Some(ref genesis_path) = args.config.conway_genesis_file {
+            let genesis_path = std::path::Path::new(genesis_path);
+            match ConwayGenesis::load(genesis_path) {
+                Ok(genesis) => {
+                    info!(
+                        drep_deposit = genesis.d_rep_deposit,
+                        gov_action_deposit = genesis.gov_action_deposit,
+                        committee_min_size = genesis.committee_min_size,
+                        "Conway genesis loaded"
+                    );
+                    genesis.apply_to_protocol_params(&mut protocol_params);
+                }
+                Err(e) => {
+                    warn!("Failed to load Conway genesis: {e}");
+                }
+            }
+        }
 
         let ledger_state = Arc::new(RwLock::new(LedgerState::new(protocol_params)));
         info!("Ledger state initialized");

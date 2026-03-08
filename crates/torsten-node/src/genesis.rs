@@ -1,9 +1,11 @@
 use anyhow::{Context, Result};
 use serde::Deserialize;
+use std::collections::HashMap;
 use std::path::Path;
 use torsten_primitives::protocol_params::ProtocolParameters;
 use torsten_primitives::transaction::Rational;
 use torsten_primitives::value::Lovelace;
+use tracing::info;
 
 /// Shelley genesis configuration (compatible with cardano-node shelley-genesis.json)
 #[derive(Debug, Clone, Deserialize)]
@@ -85,6 +87,203 @@ impl ShelleyGenesis {
     }
 }
 
+// ──────────────────────────────────────────────────────────────────────────
+// Alonzo genesis
+// ──────────────────────────────────────────────────────────────────────────
+
+/// Alonzo genesis configuration (compatible with cardano-node alonzo-genesis.json)
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[allow(dead_code)]
+pub struct AlonzoGenesis {
+    pub lovelace_per_u_tx_o_word: Option<u64>,
+    pub execution_prices: AlonzoExPrices,
+    pub max_tx_ex_units: AlonzoExUnits,
+    pub max_block_ex_units: AlonzoExUnits,
+    pub max_value_size: u64,
+    pub collateral_percentage: u64,
+    pub max_collateral_inputs: u64,
+    #[serde(default)]
+    pub cost_models: HashMap<String, serde_json::Value>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AlonzoExPrices {
+    pub pr_steps: AlonzoRational,
+    pub pr_mem: AlonzoRational,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct AlonzoRational {
+    pub numerator: u64,
+    pub denominator: u64,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AlonzoExUnits {
+    pub ex_units_mem: u64,
+    pub ex_units_steps: u64,
+}
+
+impl AlonzoGenesis {
+    pub fn load(path: &Path) -> Result<Self> {
+        let content = std::fs::read_to_string(path)
+            .with_context(|| format!("Failed to read Alonzo genesis: {}", path.display()))?;
+        serde_json::from_str(&content)
+            .with_context(|| format!("Failed to parse Alonzo genesis: {}", path.display()))
+    }
+
+    /// Apply Alonzo genesis parameters to protocol parameters
+    pub fn apply_to_protocol_params(&self, params: &mut ProtocolParameters) {
+        info!(
+            max_tx_ex_mem = self.max_tx_ex_units.ex_units_mem,
+            max_tx_ex_steps = self.max_tx_ex_units.ex_units_steps,
+            max_val_size = self.max_value_size,
+            collateral_pct = self.collateral_percentage,
+            "Applying Alonzo genesis params"
+        );
+
+        // Execution unit prices
+        params.execution_costs.step_price = Rational {
+            numerator: self.execution_prices.pr_steps.numerator,
+            denominator: self.execution_prices.pr_steps.denominator,
+        };
+        params.execution_costs.mem_price = Rational {
+            numerator: self.execution_prices.pr_mem.numerator,
+            denominator: self.execution_prices.pr_mem.denominator,
+        };
+
+        // Execution unit limits
+        params.max_tx_ex_units.mem = self.max_tx_ex_units.ex_units_mem;
+        params.max_tx_ex_units.steps = self.max_tx_ex_units.ex_units_steps;
+        params.max_block_ex_units.mem = self.max_block_ex_units.ex_units_mem;
+        params.max_block_ex_units.steps = self.max_block_ex_units.ex_units_steps;
+
+        // Size and collateral
+        params.max_val_size = self.max_value_size;
+        params.collateral_percentage = self.collateral_percentage;
+        params.max_collateral_inputs = self.max_collateral_inputs;
+
+        // UTxO cost
+        if let Some(lovelace_per_word) = self.lovelace_per_u_tx_o_word {
+            // Convert lovelacePerUTxOWord to adaPerUTxOByte
+            // 1 word = 8 bytes, so per-byte cost = per-word / 8
+            // But Babbage uses adaPerUTxOByte directly; for Alonzo era we approximate
+            params.ada_per_utxo_byte = Lovelace(lovelace_per_word / 8);
+        }
+    }
+}
+
+// ──────────────────────────────────────────────────────────────────────────
+// Conway genesis
+// ──────────────────────────────────────────────────────────────────────────
+
+/// Conway genesis configuration (compatible with cardano-node conway-genesis.json)
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[allow(dead_code)]
+pub struct ConwayGenesis {
+    pub pool_voting_thresholds: PoolVotingThresholds,
+    #[serde(alias = "dRepVotingThresholds")]
+    pub d_rep_voting_thresholds: DRepVotingThresholds,
+    pub committee_min_size: u64,
+    pub committee_max_term_length: u64,
+    pub gov_action_lifetime: u64,
+    pub gov_action_deposit: u64,
+    #[serde(alias = "dRepDeposit")]
+    pub d_rep_deposit: u64,
+    #[serde(alias = "dRepActivity")]
+    pub d_rep_activity: u64,
+    #[serde(default)]
+    pub min_fee_ref_script_cost_per_byte: Option<u64>,
+    #[serde(default)]
+    pub plutus_v3_cost_model: Option<Vec<i64>>,
+    #[serde(default)]
+    pub constitution: Option<serde_json::Value>,
+    #[serde(default)]
+    pub committee: Option<serde_json::Value>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[allow(dead_code)]
+pub struct PoolVotingThresholds {
+    pub committee_normal: f64,
+    pub committee_no_confidence: f64,
+    pub hard_fork_initiation: f64,
+    pub motion_no_confidence: f64,
+    #[serde(default)]
+    pub pp_security_group: f64,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[allow(dead_code)]
+pub struct DRepVotingThresholds {
+    pub motion_no_confidence: f64,
+    pub committee_normal: f64,
+    pub committee_no_confidence: f64,
+    pub update_to_constitution: f64,
+    pub hard_fork_initiation: f64,
+    #[serde(default)]
+    pub pp_network_group: f64,
+    #[serde(default)]
+    pub pp_economic_group: f64,
+    #[serde(default)]
+    pub pp_technical_group: f64,
+    #[serde(default)]
+    pub pp_gov_group: f64,
+    pub treasury_withdrawal: f64,
+}
+
+impl ConwayGenesis {
+    pub fn load(path: &Path) -> Result<Self> {
+        let content = std::fs::read_to_string(path)
+            .with_context(|| format!("Failed to read Conway genesis: {}", path.display()))?;
+        serde_json::from_str(&content)
+            .with_context(|| format!("Failed to parse Conway genesis: {}", path.display()))
+    }
+
+    /// Apply Conway genesis parameters to protocol parameters
+    pub fn apply_to_protocol_params(&self, params: &mut ProtocolParameters) {
+        info!(
+            drep_deposit = self.d_rep_deposit,
+            drep_activity = self.d_rep_activity,
+            gov_action_deposit = self.gov_action_deposit,
+            gov_action_lifetime = self.gov_action_lifetime,
+            committee_min_size = self.committee_min_size,
+            "Applying Conway genesis params"
+        );
+
+        // Governance parameters
+        params.drep_deposit = Lovelace(self.d_rep_deposit);
+        params.drep_activity = self.d_rep_activity;
+        params.gov_action_deposit = Lovelace(self.gov_action_deposit);
+        params.gov_action_lifetime = self.gov_action_lifetime;
+        params.committee_min_size = self.committee_min_size;
+        params.committee_max_term_length = self.committee_max_term_length;
+
+        // DRep voting thresholds
+        let dvt = &self.d_rep_voting_thresholds;
+        params.dvt_no_confidence = float_to_rational(dvt.motion_no_confidence);
+        params.dvt_committee_normal = float_to_rational(dvt.committee_normal);
+        params.dvt_committee_no_confidence = float_to_rational(dvt.committee_no_confidence);
+        params.dvt_constitution = float_to_rational(dvt.update_to_constitution);
+        params.dvt_hard_fork = float_to_rational(dvt.hard_fork_initiation);
+        params.dvt_treasury_withdrawal = float_to_rational(dvt.treasury_withdrawal);
+        // ppParamChange uses the average of network/economic/technical/gov group thresholds
+        // In practice, the protocol uses the most restrictive of the group thresholds
+        params.dvt_p_param_change = float_to_rational(dvt.pp_gov_group);
+
+        // Pool voting thresholds
+        let pvt = &self.pool_voting_thresholds;
+        params.pvt_hard_fork = float_to_rational(pvt.hard_fork_initiation);
+        params.pvt_committee = float_to_rational(pvt.committee_normal);
+    }
+}
+
 /// Convert a float to a rational approximation
 fn float_to_rational(f: f64) -> Rational {
     if f == 0.0 {
@@ -130,6 +329,89 @@ mod tests {
         let r = float_to_rational(0.003);
         assert_eq!(r.numerator, 3);
         assert_eq!(r.denominator, 1000);
+    }
+
+    #[test]
+    fn test_parse_alonzo_genesis() {
+        let json = r#"{
+            "lovelacePerUTxOWord": 34482,
+            "executionPrices": {
+                "prSteps": { "numerator": 721, "denominator": 10000000 },
+                "prMem": { "numerator": 577, "denominator": 10000 }
+            },
+            "maxTxExUnits": { "exUnitsMem": 10000000, "exUnitsSteps": 10000000000 },
+            "maxBlockExUnits": { "exUnitsMem": 50000000, "exUnitsSteps": 40000000000 },
+            "maxValueSize": 5000,
+            "collateralPercentage": 150,
+            "maxCollateralInputs": 3,
+            "costModels": {
+                "PlutusV1": {}
+            }
+        }"#;
+
+        let genesis: AlonzoGenesis = serde_json::from_str(json).unwrap();
+        assert_eq!(genesis.max_value_size, 5000);
+        assert_eq!(genesis.collateral_percentage, 150);
+        assert_eq!(genesis.max_collateral_inputs, 3);
+        assert_eq!(genesis.max_tx_ex_units.ex_units_mem, 10000000);
+        assert_eq!(genesis.max_block_ex_units.ex_units_steps, 40000000000);
+        assert_eq!(genesis.execution_prices.pr_steps.numerator, 721);
+        assert_eq!(genesis.execution_prices.pr_mem.denominator, 10000);
+
+        let mut pp = ProtocolParameters::mainnet_defaults();
+        genesis.apply_to_protocol_params(&mut pp);
+        assert_eq!(pp.max_val_size, 5000);
+        assert_eq!(pp.collateral_percentage, 150);
+        assert_eq!(pp.max_tx_ex_units.mem, 10000000);
+        assert_eq!(pp.execution_costs.step_price.numerator, 721);
+    }
+
+    #[test]
+    fn test_parse_conway_genesis() {
+        let json = r#"{
+            "poolVotingThresholds": {
+                "committeeNormal": 0.51,
+                "committeeNoConfidence": 0.51,
+                "hardForkInitiation": 0.51,
+                "motionNoConfidence": 0.51,
+                "ppSecurityGroup": 0.51
+            },
+            "dRepVotingThresholds": {
+                "motionNoConfidence": 0.67,
+                "committeeNormal": 0.67,
+                "committeeNoConfidence": 0.6,
+                "updateToConstitution": 0.75,
+                "hardForkInitiation": 0.6,
+                "ppNetworkGroup": 0.67,
+                "ppEconomicGroup": 0.67,
+                "ppTechnicalGroup": 0.67,
+                "ppGovGroup": 0.75,
+                "treasuryWithdrawal": 0.67
+            },
+            "committeeMinSize": 7,
+            "committeeMaxTermLength": 146,
+            "govActionLifetime": 6,
+            "govActionDeposit": 100000000000,
+            "dRepDeposit": 500000000,
+            "dRepActivity": 20,
+            "minFeeRefScriptCostPerByte": 15
+        }"#;
+
+        let genesis: ConwayGenesis = serde_json::from_str(json).unwrap();
+        assert_eq!(genesis.committee_min_size, 7);
+        assert_eq!(genesis.d_rep_deposit, 500000000);
+        assert_eq!(genesis.gov_action_deposit, 100000000000);
+        assert_eq!(genesis.d_rep_activity, 20);
+
+        let mut pp = ProtocolParameters::mainnet_defaults();
+        genesis.apply_to_protocol_params(&mut pp);
+        assert_eq!(pp.drep_deposit, Lovelace(500000000));
+        assert_eq!(pp.gov_action_deposit, Lovelace(100000000000));
+        assert_eq!(pp.committee_min_size, 7);
+        assert_eq!(pp.committee_max_term_length, 146);
+        // DRep voting thresholds
+        assert_eq!(pp.dvt_constitution.numerator, 3);
+        assert_eq!(pp.dvt_constitution.denominator, 4); // 0.75
     }
 
     #[test]
