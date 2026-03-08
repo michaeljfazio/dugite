@@ -153,8 +153,10 @@ impl NodeToNodeClient {
         }
     }
 
-    /// Request a batch of blocks from chain sync, fetching them via blockfetch in ranges.
-    /// This is much faster than fetching one block at a time during initial sync.
+    /// Request a batch of blocks from chain sync.
+    ///
+    /// Collects headers sequentially, then fetches all blocks in a single
+    /// blockfetch range request, reducing overhead per block.
     /// Returns a vec of events (RollForward/RollBackward) or Await if caught up.
     pub async fn request_next_batch(
         &mut self,
@@ -164,7 +166,6 @@ impl NodeToNodeClient {
         let mut pending_points: Vec<PallasPoint> = Vec::new();
         let mut latest_tip = None;
 
-        // Collect headers from chainsync
         for _ in 0..batch_size {
             let response = self
                 .peer
