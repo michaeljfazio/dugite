@@ -4,8 +4,10 @@ use pallas_network::miniprotocols::chainsync::Tip as PallasTip;
 use pallas_network::miniprotocols::Point as PallasPoint;
 use pallas_traverse::MultiEraHeader;
 use std::net::SocketAddr;
+use std::sync::Arc;
 use thiserror::Error;
 use tokio::net::ToSocketAddrs;
+use tokio::sync::Mutex;
 use torsten_primitives::block::{Block, Point, Tip};
 use torsten_primitives::hash::Hash32;
 use torsten_primitives::time::{BlockNo, SlotNo};
@@ -320,10 +322,231 @@ impl NodeToNodeClient {
         &self.remote_addr
     }
 
+    /// Request a batch of headers only (no block fetching).
+    /// Returns header metadata that can be used for parallel block fetching.
+    pub async fn request_headers_batch(
+        &mut self,
+        batch_size: usize,
+    ) -> Result<HeaderBatchResult, ClientError> {
+        let mut headers = Vec::with_capacity(batch_size);
+        let mut latest_tip = None;
+
+        for _ in 0..batch_size {
+            let response = self
+                .peer
+                .chainsync()
+                .request_or_await_next()
+                .await
+                .map_err(|e| ClientError::ChainSync(format!("request_next: {e}")))?;
+
+            match response {
+                NextResponse::RollForward(header, tip) => {
+                    latest_tip = Some(pallas_tip_to_torsten(&tip));
+                    let subtag = header.byron_prefix.map(|(st, _)| st);
+                    let multi_era_header =
+                        MultiEraHeader::decode(header.variant, subtag, &header.cbor)
+                            .map_err(|e| ClientError::BlockDecode(format!("header decode: {e}")))?;
+
+                    let slot = multi_era_header.slot();
+                    let hash = multi_era_header.hash();
+                    let block_no = multi_era_header.number();
+
+                    let mut hash_bytes = [0u8; 32];
+                    let hash_vec = hash.to_vec();
+                    hash_bytes.copy_from_slice(&hash_vec);
+                    headers.push(HeaderInfo {
+                        slot,
+                        hash: hash_bytes,
+                        block_no,
+                    });
+                }
+                NextResponse::RollBackward(point, tip) => {
+                    let torsten_tip = pallas_tip_to_torsten(&tip);
+                    if !headers.is_empty() {
+                        return Ok(HeaderBatchResult::HeadersAndRollback {
+                            headers,
+                            tip: torsten_tip.clone(),
+                            rollback_point: pallas_point_to_torsten(&point),
+                            rollback_tip: torsten_tip,
+                        });
+                    }
+                    return Ok(HeaderBatchResult::RollBackward(
+                        pallas_point_to_torsten(&point),
+                        torsten_tip,
+                    ));
+                }
+                NextResponse::Await => {
+                    if !headers.is_empty() {
+                        return Ok(HeaderBatchResult::Headers(headers, latest_tip.unwrap()));
+                    }
+                    return Ok(HeaderBatchResult::Await);
+                }
+            }
+        }
+
+        Ok(HeaderBatchResult::Headers(headers, latest_tip.unwrap()))
+    }
+
+    /// Fetch blocks by a list of points using the blockfetch protocol.
+    /// Does not use chainsync — the caller provides the known points.
+    pub async fn fetch_blocks_by_points(
+        &mut self,
+        points: &[HeaderInfo],
+    ) -> Result<Vec<Block>, ClientError> {
+        if points.is_empty() {
+            return Ok(vec![]);
+        }
+
+        let first = PallasPoint::Specific(points[0].slot, points[0].hash.to_vec());
+        let last = PallasPoint::Specific(
+            points.last().unwrap().slot,
+            points.last().unwrap().hash.to_vec(),
+        );
+
+        let bodies = self
+            .peer
+            .blockfetch()
+            .fetch_range((first, last))
+            .await
+            .map_err(|e| ClientError::BlockFetch(format!("fetch range: {e}")))?;
+
+        // Decode on blocking thread
+        let decoded = tokio::task::spawn_blocking(move || {
+            let mut blocks = Vec::with_capacity(bodies.len());
+            for cbor in bodies {
+                let block =
+                    decode_block(&cbor).map_err(|e| ClientError::BlockDecode(format!("{e}")))?;
+                blocks.push(block);
+            }
+            Ok::<_, ClientError>(blocks)
+        })
+        .await
+        .map_err(|e| ClientError::BlockDecode(format!("decode task: {e}")))??;
+
+        Ok(decoded)
+    }
+
     /// Disconnect from the peer.
     pub async fn disconnect(self) {
         info!("disconnecting from peer {}", self.remote_addr);
         self.peer.abort().await;
+    }
+}
+
+/// Metadata about a block header, used for parallel block fetching.
+#[derive(Debug, Clone)]
+pub struct HeaderInfo {
+    pub slot: u64,
+    pub hash: [u8; 32],
+    pub block_no: u64,
+}
+
+/// Result of a header-only batch request.
+#[derive(Debug)]
+pub enum HeaderBatchResult {
+    /// Got a batch of headers
+    Headers(Vec<HeaderInfo>, Tip),
+    /// Got a rollback
+    RollBackward(Point, Tip),
+    /// Got headers followed by a rollback in the same batch
+    HeadersAndRollback {
+        headers: Vec<HeaderInfo>,
+        tip: Tip,
+        rollback_point: Point,
+        rollback_tip: Tip,
+    },
+    /// Caught up to tip
+    Await,
+}
+
+/// A pool of peer connections for concurrent block fetching.
+/// Headers are collected from a primary peer via ChainSync,
+/// then blocks are fetched from multiple peers in parallel.
+#[derive(Default)]
+pub struct BlockFetchPool {
+    fetchers: Vec<Arc<Mutex<NodeToNodeClient>>>,
+}
+
+impl BlockFetchPool {
+    /// Create a new pool with no fetchers.
+    pub fn new() -> Self {
+        BlockFetchPool {
+            fetchers: Vec::new(),
+        }
+    }
+
+    /// Add a connected peer to the pool.
+    pub fn add_fetcher(&mut self, client: NodeToNodeClient) {
+        self.fetchers.push(Arc::new(Mutex::new(client)));
+    }
+
+    /// Number of fetchers in the pool.
+    pub fn len(&self) -> usize {
+        self.fetchers.len()
+    }
+
+    /// Returns true if the pool has no fetchers.
+    pub fn is_empty(&self) -> bool {
+        self.fetchers.is_empty()
+    }
+
+    /// Fetch blocks for the given headers using all available fetchers concurrently.
+    /// Splits the headers into ranges and assigns each range to a different fetcher.
+    pub async fn fetch_blocks_concurrent(
+        &self,
+        headers: &[HeaderInfo],
+    ) -> Result<Vec<Block>, ClientError> {
+        if headers.is_empty() {
+            return Ok(vec![]);
+        }
+
+        let num_fetchers = self.fetchers.len();
+        if num_fetchers == 0 {
+            return Err(ClientError::Connection("no fetchers available".into()));
+        }
+
+        if num_fetchers == 1 {
+            // Single fetcher — no need to split
+            let fetcher = &self.fetchers[0];
+            let mut client = fetcher.lock().await;
+            return client.fetch_blocks_by_points(headers).await;
+        }
+
+        // Split headers into chunks for concurrent fetching
+        let chunk_size = headers.len().div_ceil(num_fetchers);
+        let chunks: Vec<&[HeaderInfo]> = headers.chunks(chunk_size).collect();
+
+        let mut tasks = Vec::new();
+        for (i, chunk) in chunks.into_iter().enumerate() {
+            let fetcher_idx = i % num_fetchers;
+            let fetcher = self.fetchers[fetcher_idx].clone();
+            let chunk_owned: Vec<HeaderInfo> = chunk.to_vec();
+
+            tasks.push(tokio::spawn(async move {
+                let mut client = fetcher.lock().await;
+                client.fetch_blocks_by_points(&chunk_owned).await
+            }));
+        }
+
+        // Collect results in order
+        let mut all_blocks = Vec::with_capacity(headers.len());
+        for task in tasks {
+            let blocks = task
+                .await
+                .map_err(|e| ClientError::BlockFetch(format!("fetch task panicked: {e}")))??;
+            all_blocks.extend(blocks);
+        }
+
+        Ok(all_blocks)
+    }
+
+    /// Disconnect all fetchers.
+    pub async fn disconnect_all(self) {
+        for fetcher in self.fetchers {
+            if let Ok(client) = Arc::try_unwrap(fetcher) {
+                client.into_inner().disconnect().await;
+            }
+        }
     }
 }
 

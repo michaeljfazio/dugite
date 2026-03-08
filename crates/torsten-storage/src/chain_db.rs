@@ -5,7 +5,7 @@ use thiserror::Error;
 use torsten_primitives::block::{Point, Tip};
 use torsten_primitives::hash::{BlockHeaderHash, Hash32};
 use torsten_primitives::time::{BlockNo, SlotNo};
-use tracing::{debug, info, trace, warn};
+use tracing::{info, trace, warn};
 
 #[derive(Error, Debug)]
 pub enum ChainDBError {
@@ -209,7 +209,8 @@ impl ChainDB {
                 .is_some()
     }
 
-    /// Flush old blocks from volatile to immutable when chain is long enough
+    /// Flush old blocks from volatile to immutable when chain is long enough.
+    /// Uses batched RocksDB writes for performance.
     fn maybe_flush_to_immutable(&mut self) -> Result<(), ChainDBError> {
         let volatile_count = self.volatile.block_count();
         if volatile_count <= SECURITY_PARAM_K {
@@ -224,17 +225,12 @@ impl ChainDB {
         );
         let flushed = self.volatile.drain_oldest(to_flush);
 
-        for (hash, slot, block_no, cbor) in &flushed {
-            debug!(
-                hash = %hash.to_hex(),
-                slot = slot.0,
-                block_no = block_no.0,
-                cbor_bytes = cbor.len(),
-                "ChainDB: flushing block to immutable"
-            );
-            self.immutable
-                .put_block_with_blockno(*slot, hash, *block_no, cbor)?;
-        }
+        // Use batched write — all blocks in a single atomic RocksDB WriteBatch
+        let batch: Vec<_> = flushed
+            .iter()
+            .map(|(hash, slot, block_no, cbor)| (*slot, hash, *block_no, cbor.as_slice()))
+            .collect();
+        self.immutable.put_blocks_batch(&batch)?;
 
         info!(
             flushed = flushed.len(),

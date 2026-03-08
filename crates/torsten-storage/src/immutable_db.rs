@@ -76,6 +76,52 @@ impl ImmutableDB {
         self.put_block_inner(slot, hash, None, cbor)
     }
 
+    /// Store multiple blocks atomically using a WriteBatch.
+    /// Much faster than individual put_block calls for bulk inserts.
+    pub fn put_blocks_batch(
+        &mut self,
+        blocks: &[(SlotNo, &BlockHeaderHash, BlockNo, &[u8])],
+    ) -> Result<(), ImmutableDBError> {
+        if blocks.is_empty() {
+            return Ok(());
+        }
+        let db = self
+            .db
+            .as_ref()
+            .ok_or_else(|| ImmutableDBError::RocksDB("DB not open".into()))?;
+
+        let mut batch = rocksdb::WriteBatch::default();
+        let mut max_tip_slot = self.tip_slot;
+        let mut tip_entry: Option<(SlotNo, &BlockHeaderHash, BlockNo)> = None;
+
+        for (slot, hash, block_no, cbor) in blocks {
+            let slot_key = slot.0.to_be_bytes();
+            batch.put(slot_key, cbor);
+
+            let hash_key = [b"hash:", hash.as_bytes().as_slice()].concat();
+            batch.put(hash_key, slot_key);
+
+            if *slot > max_tip_slot {
+                max_tip_slot = *slot;
+                tip_entry = Some((*slot, hash, *block_no));
+            }
+        }
+
+        if let Some((slot, hash, block_no)) = tip_entry {
+            let mut tip_value = Vec::with_capacity(48);
+            tip_value.extend_from_slice(&slot.0.to_be_bytes());
+            tip_value.extend_from_slice(hash.as_bytes());
+            tip_value.extend_from_slice(&block_no.0.to_be_bytes());
+            batch.put(b"meta:tip", &tip_value);
+        }
+
+        db.write(batch)
+            .map_err(|e| ImmutableDBError::RocksDB(e.to_string()))?;
+        self.tip_slot = max_tip_slot;
+
+        Ok(())
+    }
+
     fn put_block_inner(
         &mut self,
         slot: SlotNo,
@@ -269,6 +315,55 @@ mod tests {
         db.put_block(SlotNo(100), &Hash32::from_bytes([2u8; 32]), b"block2")
             .unwrap();
         assert_eq!(db.tip_slot(), SlotNo(100));
+    }
+
+    #[test]
+    fn test_put_blocks_batch() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut db = ImmutableDB::open(dir.path()).unwrap();
+
+        let hash1 = Hash32::from_bytes([1u8; 32]);
+        let hash2 = Hash32::from_bytes([2u8; 32]);
+        let hash3 = Hash32::from_bytes([3u8; 32]);
+
+        let blocks = vec![
+            (SlotNo(100), &hash1, BlockNo(10), b"block1".as_slice()),
+            (SlotNo(200), &hash2, BlockNo(20), b"block2".as_slice()),
+            (SlotNo(300), &hash3, BlockNo(30), b"block3".as_slice()),
+        ];
+
+        db.put_blocks_batch(&blocks).unwrap();
+
+        // Verify all blocks stored
+        assert_eq!(
+            db.get_block_by_slot(SlotNo(100)).unwrap().as_deref(),
+            Some(b"block1".as_slice())
+        );
+        assert_eq!(
+            db.get_block_by_hash(&hash2).unwrap().as_deref(),
+            Some(b"block2".as_slice())
+        );
+        assert_eq!(
+            db.get_block_by_slot(SlotNo(300)).unwrap().as_deref(),
+            Some(b"block3".as_slice())
+        );
+
+        // Tip should be the highest slot
+        assert_eq!(db.tip_slot(), SlotNo(300));
+        let tip_info = db.get_tip_info().unwrap();
+        assert_eq!(tip_info.0, SlotNo(300));
+        assert_eq!(tip_info.1, hash3);
+        assert_eq!(tip_info.2, BlockNo(30));
+    }
+
+    #[test]
+    fn test_put_blocks_batch_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut db = ImmutableDB::open(dir.path()).unwrap();
+
+        // Empty batch should be no-op
+        db.put_blocks_batch(&[]).unwrap();
+        assert_eq!(db.tip_slot(), SlotNo(0));
     }
 
     #[test]
