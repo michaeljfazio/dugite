@@ -251,6 +251,7 @@ Zero-warning policy enforced — all code must compile with `cargo clippy -- -D 
 - [x] Configuration file parsing (node config, genesis files)
 - [x] Full P2P topology configuration (bootstrapPeers, localRoots, publicRoots, hotValency, warmValency, trustable, diffusionMode)
 - [x] Byron, Shelley, Alonzo, Conway genesis file loading
+- [x] Prometheus metrics endpoint (port 12798, block/slot/epoch/UTxO/mempool/sync progress)
 
 #### Network (N2N — Node-to-Node)
 - [x] Ouroboros N2N handshake (V14+, pallas 1.0)
@@ -267,8 +268,9 @@ Zero-warning policy enforced — all code must compile with `cargo clippy -- -D 
 - [x] N2N ChainSync server (sequential block serving for inbound peers)
 - [x] N2N TxSubmission2 mempool integration (serve tx IDs and bodies to peers)
 - [x] Inbound connection rate limiting (per-IP token bucket DoS protection)
-- [x] SIGHUP topology reload
+- [x] SIGHUP topology reload (peer manager updated with reloaded peers)
 - [x] Ledger-based peer discovery (SPO relay addresses from pool registrations, periodic sampling)
+- [x] Multi-peer block fetch pool (parallel block retrieval from up to 4 peers)
 
 #### Network (N2C — Node-to-Client)
 - [x] Unix domain socket server
@@ -340,6 +342,7 @@ Zero-warning policy enforced — all code must compile with `cargo clippy -- -D 
 - [x] Stake address commands (registration, deregistration, delegation, vote delegation)
 - [x] Pool retirement certificate
 - [x] Governance and stake distribution queries
+- [x] Tx mempool queries (info, has-tx via LocalTxMonitor)
 
 #### Serialization
 - [x] Multi-era block decoding (Byron–Conway) via pallas
@@ -362,7 +365,7 @@ Zero-warning policy enforced — all code must compile with `cargo clippy -- -D 
 - [ ] Leader schedule calculation
 
 #### Cryptographic Verification
-- [ ] Full VRF proof verification (requires VRF library integration)
+- [x] Full VRF proof verification (ECVRF-ED25519-SHA512-Elligator2 via vrf_dalek)
 - [ ] Full KES signature verification (requires KES library integration)
 
 #### Plutus Smart Contracts
@@ -377,8 +380,8 @@ Zero-warning policy enforced — all code must compile with `cargo clippy -- -D 
 - [ ] Memory-mapped UTxO set for large chains
 
 #### Full CLI Parity
-- [ ] Node operational certificate commands
-- [ ] KES key generation and rotation
+- [x] Node key generation (cold keys, KES, VRF)
+- [x] Operational certificate issuance and counter management
 - [x] Pool registration certificate (with relay and metadata support)
 - [ ] Metadata submission
 - [ ] Full query command set
