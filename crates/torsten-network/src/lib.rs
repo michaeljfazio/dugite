@@ -5,6 +5,7 @@ pub mod n2c_client;
 pub mod n2c_server;
 pub mod n2n_server;
 pub mod peer;
+pub mod peer_manager;
 pub mod query_handler;
 pub mod server;
 
@@ -13,5 +14,6 @@ pub use n2c_client::N2CClient;
 pub use n2c_server::N2CServer;
 pub use n2n_server::{BlockProvider, N2NServer};
 pub use peer::PeerConnection;
+pub use peer_manager::{DiffusionMode, PeerManager, PeerManagerConfig};
 pub use query_handler::{NodeStateSnapshot, QueryHandler, QueryResult};
 pub use server::NodeServer;

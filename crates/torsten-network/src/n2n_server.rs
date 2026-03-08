@@ -35,6 +35,15 @@ const MINI_PROTOCOL_CHAINSYNC: u16 = 2;
 const MINI_PROTOCOL_BLOCKFETCH: u16 = 3;
 const MINI_PROTOCOL_KEEPALIVE: u16 = 8;
 
+/// Peer sharing mode for N2N handshake
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PeerSharingMode {
+    /// No peer sharing
+    NoPeerSharing = 0,
+    /// Peer sharing enabled
+    PeerSharingEnabled = 1,
+}
+
 /// Node-to-Node server that accepts inbound TCP connections from remote peers.
 pub struct N2NServer {
     listen_addr: SocketAddr,
@@ -42,6 +51,10 @@ pub struct N2NServer {
     query_handler: Arc<RwLock<QueryHandler>>,
     block_provider: Arc<dyn BlockProvider>,
     max_connections: usize,
+    /// Whether this node operates in InitiatorAndResponder (bidirectional) mode
+    pub initiator_and_responder: bool,
+    /// Whether peer sharing is enabled
+    pub peer_sharing: PeerSharingMode,
 }
 
 impl N2NServer {
@@ -58,6 +71,29 @@ impl N2NServer {
             query_handler,
             block_provider,
             max_connections,
+            initiator_and_responder: true,
+            peer_sharing: PeerSharingMode::PeerSharingEnabled,
+        }
+    }
+
+    /// Create with explicit diffusion mode and peer sharing settings
+    pub fn with_config(
+        listen_addr: SocketAddr,
+        network_magic: u64,
+        query_handler: Arc<RwLock<QueryHandler>>,
+        block_provider: Arc<dyn BlockProvider>,
+        max_connections: usize,
+        initiator_and_responder: bool,
+        peer_sharing: PeerSharingMode,
+    ) -> Self {
+        N2NServer {
+            listen_addr,
+            network_magic,
+            query_handler,
+            block_provider,
+            max_connections,
+            initiator_and_responder,
+            peer_sharing,
         }
     }
 
@@ -90,6 +126,8 @@ impl N2NServer {
                     let block_provider = self.block_provider.clone();
                     let network_magic = self.network_magic;
                     let counter = active_connections.clone();
+                    let initiator_and_responder = self.initiator_and_responder;
+                    let peer_sharing_mode = self.peer_sharing;
 
                     tokio::spawn(async move {
                         if let Err(e) = handle_n2n_connection(
@@ -98,6 +136,8 @@ impl N2NServer {
                             network_magic,
                             query_handler,
                             block_provider,
+                            initiator_and_responder,
+                            peer_sharing_mode,
                         )
                         .await
                         {
@@ -122,6 +162,8 @@ async fn handle_n2n_connection(
     network_magic: u64,
     query_handler: Arc<RwLock<QueryHandler>>,
     block_provider: Arc<dyn BlockProvider>,
+    initiator_and_responder: bool,
+    peer_sharing_mode: PeerSharingMode,
 ) -> Result<(), N2NServerError> {
     let mut buf = vec![0u8; 65536];
     let mut partial = Vec::new();
@@ -152,6 +194,8 @@ async fn handle_n2n_connection(
                         network_magic,
                         &query_handler,
                         &block_provider,
+                        initiator_and_responder,
+                        peer_sharing_mode,
                     )
                     .await?;
 
@@ -180,10 +224,17 @@ async fn process_n2n_segment(
     network_magic: u64,
     query_handler: &Arc<RwLock<QueryHandler>>,
     block_provider: &Arc<dyn BlockProvider>,
+    initiator_and_responder: bool,
+    peer_sharing_mode: PeerSharingMode,
 ) -> Result<Vec<Segment>, N2NServerError> {
     match segment.protocol_id {
         MINI_PROTOCOL_HANDSHAKE => {
-            let resp = handle_n2n_handshake(&segment.payload, network_magic)?;
+            let resp = handle_n2n_handshake(
+                &segment.payload,
+                network_magic,
+                initiator_and_responder,
+                peer_sharing_mode,
+            )?;
             Ok(resp.into_iter().collect())
         }
         MINI_PROTOCOL_CHAINSYNC => {
@@ -215,6 +266,8 @@ async fn process_n2n_segment(
 fn handle_n2n_handshake(
     payload: &[u8],
     network_magic: u64,
+    initiator_and_responder: bool,
+    peer_sharing: PeerSharingMode,
 ) -> Result<Option<Segment>, N2NServerError> {
     let mut decoder = minicbor::Decoder::new(payload);
 
@@ -298,14 +351,16 @@ fn handle_n2n_handshake(
         .map_err(|e| N2NServerError::Protocol(e.to_string()))?;
 
     // Version params: [magic, initiator_only_diffusion_mode, peer_sharing, query]
+    // initiator_only_diffusion_mode: true = unidirectional, false = bidirectional
+    let initiator_only = !initiator_and_responder;
     enc.array(4)
         .map_err(|e| N2NServerError::Protocol(e.to_string()))?;
     enc.u64(network_magic)
         .map_err(|e| N2NServerError::Protocol(e.to_string()))?;
-    enc.bool(false)
-        .map_err(|e| N2NServerError::Protocol(e.to_string()))?; // initiator_only = false
-    enc.u32(0)
-        .map_err(|e| N2NServerError::Protocol(e.to_string()))?; // peer_sharing = NoPeerSharing
+    enc.bool(initiator_only)
+        .map_err(|e| N2NServerError::Protocol(e.to_string()))?;
+    enc.u32(peer_sharing as u32)
+        .map_err(|e| N2NServerError::Protocol(e.to_string()))?;
     enc.bool(false)
         .map_err(|e| N2NServerError::Protocol(e.to_string()))?; // query = false
 
@@ -596,7 +651,8 @@ mod tests {
         enc.u32(0).unwrap();
         enc.bool(false).unwrap();
 
-        let result = handle_n2n_handshake(&buf, 2).unwrap();
+        let result =
+            handle_n2n_handshake(&buf, 2, true, PeerSharingMode::PeerSharingEnabled).unwrap();
         assert!(result.is_some());
         let seg = result.unwrap();
         assert_eq!(seg.protocol_id, MINI_PROTOCOL_HANDSHAKE);
@@ -623,7 +679,8 @@ mod tests {
         enc.array(1).unwrap();
         enc.u64(764824073).unwrap();
 
-        let result = handle_n2n_handshake(&buf, 764824073).unwrap();
+        let result =
+            handle_n2n_handshake(&buf, 764824073, true, PeerSharingMode::NoPeerSharing).unwrap();
         assert!(result.is_some());
         let seg = result.unwrap();
 
