@@ -753,9 +753,7 @@ impl LedgerState {
             .governance
             .proposals
             .iter()
-            .filter(|(action_id, state)| {
-                self.check_ratification(action_id, state, total_dreps)
-            })
+            .filter(|(action_id, state)| self.check_ratification(action_id, state, total_dreps))
             .map(|(id, state)| (id.clone(), state.procedure.gov_action.clone()))
             .collect();
 
@@ -765,13 +763,14 @@ impl LedgerState {
             self.enact_gov_action(action);
             // Remove the proposal and its votes
             self.governance.proposals.remove(action_id);
-            self.governance
-                .votes
-                .retain(|(_, id), _| id != action_id);
+            self.governance.votes.retain(|(_, id), _| id != action_id);
         }
 
         if !ratified.is_empty() {
-            info!("{} governance proposal(s) ratified and enacted", ratified.len());
+            info!(
+                "{} governance proposal(s) ratified and enacted",
+                ratified.len()
+            );
         }
     }
 
@@ -802,40 +801,46 @@ impl LedgerState {
             }
             GovAction::ParameterChange { .. } => {
                 let drep_threshold = self.protocol_params.dvt_p_param_change.as_f64();
-                let drep_met = check_threshold(drep_yes, drep_total.max(total_dreps), drep_threshold);
+                let drep_met =
+                    check_threshold(drep_yes, drep_total.max(total_dreps), drep_threshold);
                 let cc_met = check_cc_approval(cc_yes, cc_total, &self.governance);
                 drep_met && cc_met
             }
             GovAction::HardForkInitiation { .. } => {
                 let drep_threshold = self.protocol_params.dvt_hard_fork.as_f64();
                 let spo_threshold = self.protocol_params.pvt_hard_fork.as_f64();
-                let drep_met = check_threshold(drep_yes, drep_total.max(total_dreps), drep_threshold);
+                let drep_met =
+                    check_threshold(drep_yes, drep_total.max(total_dreps), drep_threshold);
                 let spo_met = check_threshold(spo_yes, spo_total, spo_threshold);
                 drep_met && spo_met
             }
             GovAction::NoConfidence { .. } => {
                 let drep_threshold = self.protocol_params.dvt_no_confidence.as_f64();
                 let spo_threshold = self.protocol_params.pvt_committee.as_f64();
-                let drep_met = check_threshold(drep_yes, drep_total.max(total_dreps), drep_threshold);
+                let drep_met =
+                    check_threshold(drep_yes, drep_total.max(total_dreps), drep_threshold);
                 let spo_met = check_threshold(spo_yes, spo_total, spo_threshold);
                 drep_met && spo_met
             }
             GovAction::UpdateCommittee { .. } => {
                 let drep_threshold = self.protocol_params.dvt_committee_normal.as_f64();
                 let spo_threshold = self.protocol_params.pvt_committee.as_f64();
-                let drep_met = check_threshold(drep_yes, drep_total.max(total_dreps), drep_threshold);
+                let drep_met =
+                    check_threshold(drep_yes, drep_total.max(total_dreps), drep_threshold);
                 let spo_met = check_threshold(spo_yes, spo_total, spo_threshold);
                 drep_met && spo_met
             }
             GovAction::NewConstitution { .. } => {
                 let drep_threshold = self.protocol_params.dvt_constitution.as_f64();
-                let drep_met = check_threshold(drep_yes, drep_total.max(total_dreps), drep_threshold);
+                let drep_met =
+                    check_threshold(drep_yes, drep_total.max(total_dreps), drep_threshold);
                 let cc_met = check_cc_approval(cc_yes, cc_total, &self.governance);
                 drep_met && cc_met
             }
             GovAction::TreasuryWithdrawals { .. } => {
                 let drep_threshold = self.protocol_params.dvt_treasury_withdrawal.as_f64();
-                let drep_met = check_threshold(drep_yes, drep_total.max(total_dreps), drep_threshold);
+                let drep_met =
+                    check_threshold(drep_yes, drep_total.max(total_dreps), drep_threshold);
                 let cc_met = check_cc_approval(cc_yes, cc_total, &self.governance);
                 drep_met && cc_met
             }
@@ -2115,7 +2120,9 @@ mod tests {
 
         // 7 out of 10 DReps vote yes (70% > 67% threshold)
         for i in 0..7 {
-            let voter = Voter::DRep(Credential::VerificationKey(Hash28::from_bytes([i as u8; 28])));
+            let voter = Voter::DRep(Credential::VerificationKey(Hash28::from_bytes(
+                [i as u8; 28],
+            )));
             state.process_vote(
                 &voter,
                 &action_id,
@@ -2127,7 +2134,9 @@ mod tests {
         }
         // 3 vote no
         for i in 7..10 {
-            let voter = Voter::DRep(Credential::VerificationKey(Hash28::from_bytes([i as u8; 28])));
+            let voter = Voter::DRep(Credential::VerificationKey(Hash28::from_bytes(
+                [i as u8; 28],
+            )));
             state.process_vote(
                 &voter,
                 &action_id,
@@ -2195,7 +2204,9 @@ mod tests {
 
         // Only 5 out of 10 DReps vote yes (50% < 67% threshold)
         for i in 0..5 {
-            let voter = Voter::DRep(Credential::VerificationKey(Hash28::from_bytes([i as u8; 28])));
+            let voter = Voter::DRep(Credential::VerificationKey(Hash28::from_bytes(
+                [i as u8; 28],
+            )));
             state.process_vote(
                 &voter,
                 &action_id,
@@ -2259,7 +2270,9 @@ mod tests {
 
         // 7/10 DReps vote yes
         for i in 0..7 {
-            let voter = Voter::DRep(Credential::VerificationKey(Hash28::from_bytes([i as u8; 28])));
+            let voter = Voter::DRep(Credential::VerificationKey(Hash28::from_bytes(
+                [i as u8; 28],
+            )));
             state.process_vote(
                 &voter,
                 &action_id,
@@ -2343,7 +2356,9 @@ mod tests {
 
         // 7/10 DReps vote yes (70% > 67%)
         for i in 0..7 {
-            let voter = Voter::DRep(Credential::VerificationKey(Hash28::from_bytes([i as u8; 28])));
+            let voter = Voter::DRep(Credential::VerificationKey(Hash28::from_bytes(
+                [i as u8; 28],
+            )));
             state.process_vote(
                 &voter,
                 &action_id,
@@ -2422,7 +2437,9 @@ mod tests {
 
         // 6/10 DReps vote yes (60% = dvt_hard_fork threshold)
         for i in 0..6 {
-            let voter = Voter::DRep(Credential::VerificationKey(Hash28::from_bytes([i as u8; 28])));
+            let voter = Voter::DRep(Credential::VerificationKey(Hash28::from_bytes(
+                [i as u8; 28],
+            )));
             state.process_vote(
                 &voter,
                 &action_id,

@@ -75,9 +75,7 @@ fn era_name(era: u32) -> &'static str {
 }
 
 /// Connect to the node, perform handshake, and acquire state
-async fn connect_and_acquire(
-    socket_path: &std::path::Path,
-) -> Result<torsten_network::N2CClient> {
+async fn connect_and_acquire(socket_path: &std::path::Path) -> Result<torsten_network::N2CClient> {
     let mut client = torsten_network::N2CClient::connect(socket_path)
         .await
         .map_err(|e| {
@@ -215,10 +213,81 @@ impl QueryCmd {
             }
             QuerySubcommand::StakeAddressInfo {
                 address,
-                socket_path: _,
+                socket_path,
             } => {
-                println!("Querying stake address info for {address}...");
-                println!("(Stake address info query not yet implemented)");
+                // Decode bech32 address to get credential hash
+                let (_, addr_bytes) = bech32::decode(&address)
+                    .map_err(|e| anyhow::anyhow!("Invalid bech32 address: {e}"))?;
+
+                // For a reward/stake address, the credential hash is bytes 1..29
+                let credential_hex = if addr_bytes.len() >= 29 {
+                    hex::encode(&addr_bytes[1..29])
+                } else {
+                    hex::encode(&addr_bytes)
+                };
+
+                let mut client = connect_and_acquire(&socket_path).await?;
+
+                let raw = client
+                    .query_stake_address_info()
+                    .await
+                    .map_err(|e| anyhow::anyhow!("Failed to query stake address info: {e}"))?;
+
+                release_and_done(&mut client).await;
+
+                // Parse MsgResult [4, array[map{...}]]
+                let mut decoder = minicbor::Decoder::new(&raw);
+                let _ = decoder.array();
+                let tag = decoder.u32().unwrap_or(999);
+                if tag != 4 {
+                    anyhow::bail!("Expected MsgResult(4), got {tag}");
+                }
+
+                let arr_len = decoder.array().unwrap_or(Some(0)).unwrap_or(0);
+                let mut found = false;
+
+                println!("[");
+                for i in 0..arr_len {
+                    let map_len = decoder.map().unwrap_or(Some(0)).unwrap_or(0);
+                    let mut cred = String::new();
+                    let mut pool = String::new();
+                    let mut rewards = 0u64;
+
+                    for _ in 0..map_len {
+                        let key = decoder.str().unwrap_or("");
+                        match key {
+                            "credential" => cred = hex::encode(decoder.bytes().unwrap_or(&[])),
+                            "delegated_pool" => {
+                                pool = decoder.bytes().map(hex::encode).unwrap_or_default()
+                            }
+                            "reward_balance" => rewards = decoder.u64().unwrap_or(0),
+                            _ => {
+                                decoder.skip().ok();
+                            }
+                        }
+                    }
+
+                    // Filter to match the requested address
+                    if cred.contains(&credential_hex) || credential_hex.is_empty() {
+                        found = true;
+                        let comma = if i + 1 < arr_len { "," } else { "" };
+                        println!("  {{");
+                        println!("    \"address\": \"{address}\",");
+                        if pool.is_empty() {
+                            println!("    \"delegation\": null,");
+                        } else {
+                            println!("    \"delegation\": \"{pool}\",");
+                        }
+                        println!("    \"rewardAccountBalance\": {}", rewards);
+                        println!("  }}{comma}");
+                    }
+                }
+                println!("]");
+
+                if !found {
+                    println!("No stake address info found for {address}");
+                }
+
                 Ok(())
             }
             QuerySubcommand::GovState { socket_path } => {
@@ -252,11 +321,9 @@ impl QueryCmd {
                         "committee_member_count" => committee_count = decoder.u64().unwrap_or(0),
                         "treasury" => treasury = decoder.u64().unwrap_or(0),
                         "proposals" => {
-                            let arr_len =
-                                decoder.array().unwrap_or(Some(0)).unwrap_or(0);
+                            let arr_len = decoder.array().unwrap_or(Some(0)).unwrap_or(0);
                             for _ in 0..arr_len {
-                                let pmap_len =
-                                    decoder.map().unwrap_or(Some(0)).unwrap_or(0);
+                                let pmap_len = decoder.map().unwrap_or(Some(0)).unwrap_or(0);
                                 let mut tx_id = String::new();
                                 let mut action_idx = 0u32;
                                 let mut action_type = String::new();
@@ -267,35 +334,21 @@ impl QueryCmd {
                                     let pkey = decoder.str().unwrap_or("");
                                     match pkey {
                                         "tx_id" => {
-                                            tx_id = hex::encode(
-                                                decoder.bytes().unwrap_or(&[]),
-                                            )
+                                            tx_id = hex::encode(decoder.bytes().unwrap_or(&[]))
                                         }
-                                        "action_index" => {
-                                            action_idx = decoder.u32().unwrap_or(0)
-                                        }
+                                        "action_index" => action_idx = decoder.u32().unwrap_or(0),
                                         "action_type" => {
-                                            action_type =
-                                                decoder.str().unwrap_or("").to_string()
+                                            action_type = decoder.str().unwrap_or("").to_string()
                                         }
                                         "yes_votes" => yes = decoder.u64().unwrap_or(0),
                                         "no_votes" => no = decoder.u64().unwrap_or(0),
-                                        "abstain_votes" => {
-                                            abstain = decoder.u64().unwrap_or(0)
-                                        }
+                                        "abstain_votes" => abstain = decoder.u64().unwrap_or(0),
                                         _ => {
                                             decoder.skip().ok();
                                         }
                                     }
                                 }
-                                proposals.push((
-                                    tx_id,
-                                    action_idx,
-                                    action_type,
-                                    yes,
-                                    no,
-                                    abstain,
-                                ));
+                                proposals.push((tx_id, action_idx, action_type, yes, no, abstain));
                             }
                         }
                         _ => {
@@ -306,10 +359,7 @@ impl QueryCmd {
 
                 println!("Governance State (Conway)");
                 println!("========================");
-                println!(
-                    "Treasury:         {} ADA",
-                    treasury / 1_000_000
-                );
+                println!("Treasury:         {} ADA", treasury / 1_000_000);
                 println!("Registered DReps: {drep_count}");
                 println!("Committee Members: {committee_count}");
                 println!("Active Proposals: {}", proposals.len());
@@ -327,9 +377,7 @@ impl QueryCmd {
                         } else {
                             format!("{tx_id}#{idx}")
                         };
-                        println!(
-                            "{action_type:<20} {short_tx:<8} {yes:>6} {no:>6} {abstain:>8}"
-                        );
+                        println!("{action_type:<20} {short_tx:<8} {yes:>6} {no:>6} {abstain:>8}");
                     }
                 }
 
@@ -369,9 +417,7 @@ impl QueryCmd {
                     for _ in 0..map_len {
                         let key = decoder.str().unwrap_or("");
                         match key {
-                            "credential" => {
-                                cred = hex::encode(decoder.bytes().unwrap_or(&[]))
-                            }
+                            "credential" => cred = hex::encode(decoder.bytes().unwrap_or(&[])),
                             "deposit" => deposit = decoder.u64().unwrap_or(0),
                             "anchor_url" => {
                                 anchor = decoder.str().map(|s| s.to_string()).unwrap_or_default()
@@ -442,26 +488,18 @@ impl QueryCmd {
                     let key = decoder.str().unwrap_or("");
                     match key {
                         "members" => {
-                            let arr_len =
-                                decoder.array().unwrap_or(Some(0)).unwrap_or(0);
+                            let arr_len = decoder.array().unwrap_or(Some(0)).unwrap_or(0);
                             for _ in 0..arr_len {
-                                let mmap_len =
-                                    decoder.map().unwrap_or(Some(0)).unwrap_or(0);
+                                let mmap_len = decoder.map().unwrap_or(Some(0)).unwrap_or(0);
                                 let mut cold = String::new();
                                 let mut hot = String::new();
                                 for _ in 0..mmap_len {
                                     let mkey = decoder.str().unwrap_or("");
                                     match mkey {
                                         "cold" => {
-                                            cold = hex::encode(
-                                                decoder.bytes().unwrap_or(&[]),
-                                            )
+                                            cold = hex::encode(decoder.bytes().unwrap_or(&[]))
                                         }
-                                        "hot" => {
-                                            hot = hex::encode(
-                                                decoder.bytes().unwrap_or(&[]),
-                                            )
-                                        }
+                                        "hot" => hot = hex::encode(decoder.bytes().unwrap_or(&[])),
                                         _ => {
                                             decoder.skip().ok();
                                         }
@@ -471,12 +509,9 @@ impl QueryCmd {
                             }
                         }
                         "resigned" => {
-                            let arr_len =
-                                decoder.array().unwrap_or(Some(0)).unwrap_or(0);
+                            let arr_len = decoder.array().unwrap_or(Some(0)).unwrap_or(0);
                             for _ in 0..arr_len {
-                                resigned.push(hex::encode(
-                                    decoder.bytes().unwrap_or(&[]),
-                                ));
+                                resigned.push(hex::encode(decoder.bytes().unwrap_or(&[])));
                             }
                         }
                         _ => {
@@ -491,10 +526,7 @@ impl QueryCmd {
                 println!("Resigned Members: {}", resigned.len());
 
                 if !members.is_empty() {
-                    println!(
-                        "\n{:<66} {:<66}",
-                        "Cold Credential", "Hot Credential"
-                    );
+                    println!("\n{:<66} {:<66}", "Cold Credential", "Hot Credential");
                     println!("{}", "-".repeat(134));
                     for (cold, hot) in &members {
                         println!("{cold:<66} {hot:<66}");

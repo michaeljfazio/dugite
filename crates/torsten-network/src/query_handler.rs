@@ -19,6 +19,7 @@ pub enum QueryResult {
     GovState(GovStateSnapshot),
     DRepState(Vec<DRepSnapshot>),
     CommitteeState(CommitteeSnapshot),
+    StakeAddressInfo(Vec<StakeAddressSnapshot>),
     Error(String),
 }
 
@@ -64,6 +65,14 @@ pub struct ProposalSnapshot {
     pub abstain_votes: u64,
 }
 
+/// Snapshot of a stake address for query results
+#[derive(Debug, Clone)]
+pub struct StakeAddressSnapshot {
+    pub credential_hash: Vec<u8>,
+    pub delegated_pool: Option<Vec<u8>>,
+    pub reward_balance: u64,
+}
+
 /// Snapshot of the constitutional committee
 #[derive(Debug, Clone, Default)]
 pub struct CommitteeSnapshot {
@@ -104,6 +113,8 @@ pub struct NodeStateSnapshot {
     pub governance_proposals: Vec<ProposalSnapshot>,
     /// Committee members
     pub committee: CommitteeSnapshot,
+    /// Stake address info (delegations + rewards)
+    pub stake_addresses: Vec<StakeAddressSnapshot>,
 }
 
 impl Default for NodeStateSnapshot {
@@ -126,6 +137,7 @@ impl Default for NodeStateSnapshot {
             drep_entries: Vec::new(),
             governance_proposals: Vec::new(),
             committee: CommitteeSnapshot::default(),
+            stake_addresses: Vec::new(),
         }
     }
 }
@@ -317,6 +329,11 @@ impl QueryHandler {
                 // GetCommitteeState
                 debug!("Query: GetCommitteeState");
                 QueryResult::CommitteeState(self.state.committee.clone())
+            }
+            23 => {
+                // GetStakeAddressInfo
+                debug!("Query: GetStakeAddressInfo");
+                QueryResult::StakeAddressInfo(self.state.stake_addresses.clone())
             }
             _ => {
                 debug!("Unhandled Shelley query tag: {query_tag}");
@@ -589,6 +606,37 @@ mod tests {
                 assert_eq!(committee.resigned[0], vec![0x05; 32]);
             }
             other => panic!("Expected CommitteeState, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_query_handler_stake_address_info() {
+        let mut handler = QueryHandler::new();
+        handler.update_state(NodeStateSnapshot {
+            stake_addresses: vec![
+                StakeAddressSnapshot {
+                    credential_hash: vec![0xaa; 28],
+                    delegated_pool: Some(vec![0xbb; 28]),
+                    reward_balance: 5_000_000,
+                },
+                StakeAddressSnapshot {
+                    credential_hash: vec![0xcc; 28],
+                    delegated_pool: None,
+                    reward_balance: 0,
+                },
+            ],
+            ..Default::default()
+        });
+
+        match handler.handle_shelley_query(23) {
+            QueryResult::StakeAddressInfo(addrs) => {
+                assert_eq!(addrs.len(), 2);
+                assert_eq!(addrs[0].credential_hash, vec![0xaa; 28]);
+                assert_eq!(addrs[0].delegated_pool, Some(vec![0xbb; 28]));
+                assert_eq!(addrs[0].reward_balance, 5_000_000);
+                assert_eq!(addrs[1].delegated_pool, None);
+            }
+            other => panic!("Expected StakeAddressInfo, got {other:?}"),
         }
     }
 

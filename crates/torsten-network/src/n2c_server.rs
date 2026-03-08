@@ -100,8 +100,7 @@ async fn handle_n2c_connection(
                     offset += consumed;
 
                     // Process the segment
-                    let response =
-                        process_segment(&segment, &query_handler, &mempool).await?;
+                    let response = process_segment(&segment, &query_handler, &mempool).await?;
                     if let Some(resp_segment) = response {
                         let encoded = resp_segment.encode();
                         stream.write_all(&encoded).await?;
@@ -565,6 +564,22 @@ fn encode_query_result(result: &QueryResult) -> Vec<u8> {
             enc.array(committee.resigned.len() as u64).ok();
             for cred in &committee.resigned {
                 enc.bytes(cred).ok();
+            }
+        }
+        QueryResult::StakeAddressInfo(addrs) => {
+            enc.array(addrs.len() as u64).ok();
+            for addr in addrs {
+                enc.map(3).ok();
+                enc.str("credential").ok();
+                enc.bytes(&addr.credential_hash).ok();
+                enc.str("delegated_pool").ok();
+                if let Some(pool) = &addr.delegated_pool {
+                    enc.bytes(pool).ok();
+                } else {
+                    enc.null().ok();
+                }
+                enc.str("reward_balance").ok();
+                enc.u64(addr.reward_balance).ok();
             }
         }
         QueryResult::Error(msg) => {

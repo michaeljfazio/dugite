@@ -577,13 +577,7 @@ mod tests {
         let signature = cold_sk.sign(&body);
 
         // Verify with wrong key should fail
-        let result = verify_opcert_signature(
-            &wrong_vk.to_bytes(),
-            &hot_vkey,
-            seq,
-            kes,
-            &signature,
-        );
+        let result = verify_opcert_signature(&wrong_vk.to_bytes(), &hot_vkey, seq, kes, &signature);
         assert!(result.is_err());
     }
 

@@ -284,7 +284,7 @@ impl Node {
     async fn update_query_state(&self) {
         use torsten_network::query_handler::{
             CommitteeMemberSnapshot, CommitteeSnapshot, DRepSnapshot, ProposalSnapshot,
-            StakePoolSnapshot,
+            StakeAddressSnapshot, StakePoolSnapshot,
         };
 
         // Build stake pool snapshots
@@ -385,9 +385,28 @@ impl Node {
                 .collect(),
         };
 
+        // Build stake address snapshots (delegations + rewards)
+        let stake_addresses: Vec<StakeAddressSnapshot> = self
+            .ledger_state
+            .reward_accounts
+            .iter()
+            .map(|(cred_hash, rewards)| {
+                let delegated_pool = self
+                    .ledger_state
+                    .delegations
+                    .get(cred_hash)
+                    .map(|pool_id| pool_id.as_ref().to_vec());
+                StakeAddressSnapshot {
+                    credential_hash: cred_hash.as_ref().to_vec(),
+                    delegated_pool,
+                    reward_balance: rewards.0,
+                }
+            })
+            .collect();
+
         // Serialize protocol params
-        let protocol_params_json = serde_json::to_string_pretty(&self.ledger_state.protocol_params)
-            .unwrap_or_default();
+        let protocol_params_json =
+            serde_json::to_string_pretty(&self.ledger_state.protocol_params).unwrap_or_default();
 
         let snapshot = NodeStateSnapshot {
             tip: self.ledger_state.tip.clone(),
@@ -407,6 +426,7 @@ impl Node {
             drep_entries,
             governance_proposals,
             committee,
+            stake_addresses,
         };
         let mut handler = self.query_handler.write().await;
         handler.update_state(snapshot);

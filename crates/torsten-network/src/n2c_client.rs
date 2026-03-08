@@ -286,6 +286,12 @@ impl N2CClient {
         Ok(result)
     }
 
+    /// Query stake address info (GetStakeAddressInfo - query tag 23)
+    pub async fn query_stake_address_info(&mut self) -> Result<Vec<u8>, N2CClientError> {
+        let result = self.send_query(23).await?;
+        Ok(result)
+    }
+
     /// Submit a transaction via LocalTxSubmission
     ///
     /// The tx_cbor should be the raw CBOR bytes of the signed transaction.
@@ -334,7 +340,10 @@ impl N2CClient {
             2 => {
                 // MsgRejectTx - extract reason
                 let reason = if let Ok(Some(_)) = decoder.array() {
-                    decoder.str().unwrap_or("unknown rejection reason").to_string()
+                    decoder
+                        .str()
+                        .unwrap_or("unknown rejection reason")
+                        .to_string()
                 } else {
                     "transaction rejected".to_string()
                 };

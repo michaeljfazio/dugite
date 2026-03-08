@@ -297,16 +297,20 @@ impl TransactionCmd {
                 // Submit via N2C socket
                 let rt = tokio::runtime::Runtime::new()?;
                 rt.block_on(async {
-                    let mut client =
-                        torsten_network::N2CClient::connect(&socket_path).await
-                            .map_err(|e| anyhow::anyhow!("Cannot connect to node socket: {e}"))?;
+                    let mut client = torsten_network::N2CClient::connect(&socket_path)
+                        .await
+                        .map_err(|e| anyhow::anyhow!("Cannot connect to node socket: {e}"))?;
 
                     // Handshake (use mainnet magic by default, will be negotiated)
-                    client.handshake(764824073).await
+                    client
+                        .handshake(764824073)
+                        .await
                         .map_err(|e| anyhow::anyhow!("Handshake failed: {e}"))?;
 
                     // Submit the transaction
-                    client.submit_tx(&tx_cbor).await
+                    client
+                        .submit_tx(&tx_cbor)
+                        .await
                         .map_err(|e| anyhow::anyhow!("{e}"))?;
 
                     println!("Transaction successfully submitted.");
