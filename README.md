@@ -23,6 +23,104 @@ Torsten is organized as a 10-crate Cargo workspace:
 | `torsten-node` | Main binary, config, topology, pipelined chain sync loop |
 | `torsten-cli` | cardano-cli compatible CLI |
 
+### Crate Dependency Graph
+
+```mermaid
+graph TD
+    NODE[torsten-node] --> NET[torsten-network]
+    NODE --> CONS[torsten-consensus]
+    NODE --> LEDGER[torsten-ledger]
+    NODE --> STORE[torsten-storage]
+    NODE --> POOL[torsten-mempool]
+    CLI[torsten-cli] --> NET
+    CLI --> PRIM[torsten-primitives]
+    CLI --> CRYPTO[torsten-crypto]
+    CLI --> SER[torsten-serialization]
+    NET --> PRIM
+    NET --> CRYPTO
+    NET --> SER
+    NET --> POOL
+    CONS --> PRIM
+    CONS --> CRYPTO
+    LEDGER --> PRIM
+    LEDGER --> CRYPTO
+    LEDGER --> SER
+    STORE --> PRIM
+    STORE --> SER
+    POOL --> PRIM
+    SER --> PRIM
+    CRYPTO --> PRIM
+```
+
+### Sync Pipeline
+
+Torsten uses a pipelined multi-peer architecture for block synchronization:
+
+```mermaid
+flowchart LR
+    subgraph Primary Peer
+        CS[ChainSync<br/>Header Collection]
+    end
+
+    CS -->|headers| HQ[Header Queue]
+
+    subgraph Block Fetch Pool
+        BF1[Peer 1<br/>BlockFetch]
+        BF2[Peer 2<br/>BlockFetch]
+        BF3[Peer N<br/>BlockFetch]
+    end
+
+    HQ -->|range 1| BF1
+    HQ -->|range 2| BF2
+    HQ -->|range N| BF3
+
+    BF1 -->|blocks| BP[Block Processor]
+    BF2 -->|blocks| BP
+    BF3 -->|blocks| BP
+
+    BP --> CDB[(ChainDB)]
+    BP --> LS[Ledger State]
+```
+
+### Storage Architecture
+
+```mermaid
+flowchart TD
+    CDB[ChainDB] --> VOL[VolatileDB<br/>In-Memory BTreeMap<br/>Last k=2160 blocks]
+    CDB --> IMM[ImmutableDB<br/>RocksDB with WriteBatch<br/>Permanent blocks]
+
+    NEW[New Block] -->|add_block| VOL
+    VOL -->|flush when > k blocks| IMM
+
+    READ[Block Query] -->|1. check volatile| VOL
+    READ -->|2. fallback to immutable| IMM
+
+    ROLL[Rollback] -->|remove from volatile| VOL
+```
+
+### Ouroboros Protocol Stack
+
+```mermaid
+flowchart TB
+    subgraph N2N ["Node-to-Node (TCP)"]
+        HS[Handshake V14+]
+        CSP[ChainSync<br/>Headers]
+        BFP[BlockFetch<br/>Block Bodies]
+        TX[TxSubmission2<br/>Transactions]
+        KA[KeepAlive<br/>Liveness]
+    end
+
+    subgraph N2C ["Node-to-Client (Unix Socket)"]
+        HSC[Handshake]
+        LSQ[LocalStateQuery<br/>Ledger Queries]
+        LTS[LocalTxSubmission<br/>Submit Transactions]
+        LTM[LocalTxMonitor<br/>Mempool Queries]
+    end
+
+    MUX[Multiplexer] --> N2N
+    MUX --> N2C
+```
+
 ## Building
 
 ```bash
