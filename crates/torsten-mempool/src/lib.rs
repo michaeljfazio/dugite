@@ -181,6 +181,11 @@ impl Mempool {
         self.txs.get(tx_hash).map(|r| r.tx.clone())
     }
 
+    /// Get a transaction's size in bytes
+    pub fn get_tx_size(&self, tx_hash: &TransactionHash) -> Option<usize> {
+        self.txs.get(tx_hash).map(|r| r.size_bytes)
+    }
+
     /// Check if a transaction is in the mempool
     pub fn contains(&self, tx_hash: &TransactionHash) -> bool {
         self.txs.contains_key(tx_hash)

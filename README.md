@@ -343,10 +343,10 @@ Zero-warning policy enforced — all code must compile with `cargo clippy -- -D 
 ### Not Yet Implemented
 
 #### Relay Node Compliance
-- [ ] PeerSharing mini-protocol (gossip-based peer discovery)
+- [x] PeerSharing mini-protocol (gossip-based peer discovery)
 - [ ] Ledger-based peer discovery (transition from bootstrap to ledger peers)
-- [ ] N2N ChainSync server (responder side for inbound peers)
-- [ ] N2N TxSubmission2 full flow (mempool ↔ peer transaction exchange)
+- [x] N2N ChainSync server (sequential block serving for inbound peers)
+- [x] N2N TxSubmission2 mempool integration (serve tx IDs and bodies to peers)
 - [ ] KeepAlive heartbeat scheduling on active connections
 - [ ] Connection backpressure and flow control (ack/req counts)
 - [ ] Concurrent ChainSync from multiple peers

@@ -141,6 +141,29 @@ impl VolatileDB {
         result
     }
 
+    /// Get the first block after the given slot.
+    /// Returns (slot, hash, cbor) of the next block, or None if no block exists after this slot.
+    pub fn get_next_block_after_slot(
+        &self,
+        after_slot: SlotNo,
+    ) -> Option<(SlotNo, BlockHeaderHash, Vec<u8>)> {
+        let blocks = self.blocks.read();
+        let slot_index = self.slot_index.read();
+
+        // Use BTreeMap range to find the first slot strictly after `after_slot`
+        for (&slot, hashes) in slot_index.range((
+            std::ops::Bound::Excluded(after_slot),
+            std::ops::Bound::Unbounded,
+        )) {
+            if let Some(hash) = hashes.first() {
+                if let Some(entry) = blocks.get(hash) {
+                    return Some((slot, *hash, entry.cbor.clone()));
+                }
+            }
+        }
+        None
+    }
+
     /// Get the current tip
     pub fn get_tip(&self) -> Option<Tip> {
         self.tip.read().map(|(hash, slot, block_no)| Tip {
@@ -411,5 +434,43 @@ mod tests {
         }
 
         assert!(vdb.block_count() <= 3);
+    }
+
+    #[test]
+    fn test_get_next_block_after_slot() {
+        let vdb = VolatileDB::new(100);
+
+        // Add blocks at slots 10, 20, 30
+        for (i, slot) in [10u64, 20, 30].iter().enumerate() {
+            vdb.put_block(
+                make_hash((i + 1) as u8),
+                SlotNo(*slot),
+                BlockNo(i as u64 + 1),
+                make_hash(i as u8),
+                format!("block{}", slot).into_bytes(),
+            )
+            .unwrap();
+        }
+
+        // Next after slot 0 should be slot 10
+        let result = vdb.get_next_block_after_slot(SlotNo(0));
+        assert!(result.is_some());
+        let (slot, hash, _) = result.unwrap();
+        assert_eq!(slot, SlotNo(10));
+        assert_eq!(hash, make_hash(1));
+
+        // Next after slot 10 should be slot 20
+        let result = vdb.get_next_block_after_slot(SlotNo(10));
+        assert!(result.is_some());
+        assert_eq!(result.unwrap().0, SlotNo(20));
+
+        // Next after slot 15 should be slot 20
+        let result = vdb.get_next_block_after_slot(SlotNo(15));
+        assert!(result.is_some());
+        assert_eq!(result.unwrap().0, SlotNo(20));
+
+        // Next after slot 30 should be None
+        let result = vdb.get_next_block_after_slot(SlotNo(30));
+        assert!(result.is_none());
     }
 }

@@ -10,6 +10,7 @@ use crate::miniprotocols::peersharing::{self, PeerAddress, PeerSharingMessage};
 use crate::multiplexer::Segment;
 use crate::peer_manager::PeerManager;
 use crate::query_handler::QueryHandler;
+use torsten_mempool::Mempool;
 
 /// Callback trait for retrieving block data from storage
 pub trait BlockProvider: Send + Sync + 'static {
@@ -19,6 +20,9 @@ pub trait BlockProvider: Send + Sync + 'static {
     fn has_block(&self, hash: &[u8; 32]) -> bool;
     /// Get the current chain tip (slot, hash, block_number)
     fn get_tip(&self) -> (u64, [u8; 32], u64);
+    /// Get the next block after a given slot.
+    /// Returns (slot, hash, cbor) of the first block with slot > after_slot.
+    fn get_next_block_after_slot(&self, after_slot: u64) -> Option<(u64, [u8; 32], Vec<u8>)>;
 }
 
 #[derive(Error, Debug)]
@@ -61,6 +65,8 @@ pub struct N2NServer {
     pub peer_sharing: PeerSharingMode,
     /// Peer manager for sharing peers via PeerSharing protocol
     peer_manager: Option<Arc<RwLock<PeerManager>>>,
+    /// Optional mempool for TxSubmission2 protocol
+    mempool: Option<Arc<Mempool>>,
 }
 
 impl N2NServer {
@@ -80,6 +86,7 @@ impl N2NServer {
             initiator_and_responder: true,
             peer_sharing: PeerSharingMode::PeerSharingEnabled,
             peer_manager: None,
+            mempool: None,
         }
     }
 
@@ -102,7 +109,13 @@ impl N2NServer {
             initiator_and_responder,
             peer_sharing,
             peer_manager: None,
+            mempool: None,
         }
+    }
+
+    /// Set the mempool for TxSubmission2 protocol support
+    pub fn set_mempool(&mut self, mempool: Arc<Mempool>) {
+        self.mempool = Some(mempool);
     }
 
     /// Set the peer manager for PeerSharing protocol support
@@ -142,6 +155,7 @@ impl N2NServer {
                     let initiator_and_responder = self.initiator_and_responder;
                     let peer_sharing_mode = self.peer_sharing;
                     let peer_manager = self.peer_manager.clone();
+                    let mempool = self.mempool.clone();
 
                     tokio::spawn(async move {
                         if let Err(e) = handle_n2n_connection(
@@ -153,6 +167,7 @@ impl N2NServer {
                             initiator_and_responder,
                             peer_sharing_mode,
                             peer_manager,
+                            mempool,
                         )
                         .await
                         {
@@ -202,6 +217,7 @@ async fn handle_n2n_connection(
     initiator_and_responder: bool,
     peer_sharing_mode: PeerSharingMode,
     peer_manager: Option<Arc<RwLock<PeerManager>>>,
+    mempool: Option<Arc<Mempool>>,
 ) -> Result<(), N2NServerError> {
     let mut buf = vec![0u8; 65536];
     let mut partial = Vec::new();
@@ -237,6 +253,7 @@ async fn handle_n2n_connection(
                         peer_sharing_mode,
                         &mut peer_state,
                         &peer_manager,
+                        &mempool,
                     )
                     .await?;
 
@@ -270,6 +287,7 @@ async fn process_n2n_segment(
     peer_sharing_mode: PeerSharingMode,
     peer_state: &mut PeerState,
     peer_manager: &Option<Arc<RwLock<PeerManager>>>,
+    mempool: &Option<Arc<Mempool>>,
 ) -> Result<Vec<Segment>, N2NServerError> {
     match segment.protocol_id {
         MINI_PROTOCOL_HANDSHAKE => {
@@ -292,7 +310,7 @@ async fn process_n2n_segment(
             Ok(resp)
         }
         MINI_PROTOCOL_TXSUBMISSION => {
-            let resp = handle_n2n_txsubmission(&segment.payload, peer_state)?;
+            let resp = handle_n2n_txsubmission(&segment.payload, peer_state, mempool)?;
             Ok(resp.into_iter().collect())
         }
         MINI_PROTOCOL_KEEPALIVE => {
@@ -476,14 +494,13 @@ async fn handle_n2n_chainsync(
                 }));
             }
 
-            // We have blocks ahead of cursor — serve the tip as a roll-forward
-            // In a full implementation we'd iterate through blocks sequentially,
-            // but for now we jump to tip since we don't have slot-based iteration
-            // in the block provider trait yet.
-            if let Some(block_cbor) = block_provider.get_block(&tip_hash) {
-                // Update cursor to tip
-                peer_state.chainsync_cursor_slot = Some(tip_slot);
-                peer_state.chainsync_cursor_hash = Some(tip_hash);
+            // Serve the next block sequentially after the cursor
+            if let Some((next_slot, next_hash, block_cbor)) =
+                block_provider.get_next_block_after_slot(cursor_slot)
+            {
+                // Update cursor to this block
+                peer_state.chainsync_cursor_slot = Some(next_slot);
+                peer_state.chainsync_cursor_hash = Some(next_hash);
 
                 // MsgRollForward: [2, wrapped_header, tip]
                 // N2N chainsync sends headers, not full blocks.
@@ -827,6 +844,7 @@ fn handle_keepalive(payload: &[u8]) -> Result<Option<Segment>, N2NServerError> {
 fn handle_n2n_txsubmission(
     payload: &[u8],
     peer_state: &mut PeerState,
+    mempool: &Option<Arc<Mempool>>,
 ) -> Result<Option<Segment>, N2NServerError> {
     let mut decoder = minicbor::Decoder::new(payload);
     let _arr_len = decoder
@@ -860,15 +878,43 @@ fn handle_n2n_txsubmission(
         }
         // MsgRequestTxIds: [0, blocking, ack_count, req_count]
         0 => {
+            // Parse req_count (skip blocking and ack_count)
+            let _blocking = decoder.bool().unwrap_or(false);
+            let _ack_count = decoder.u32().unwrap_or(0);
+            let req_count = decoder.u32().unwrap_or(0) as usize;
+
             let mut buf = Vec::new();
             let mut enc = minicbor::Encoder::new(&mut buf);
+
+            // Get tx IDs from mempool if available
+            let txs: Vec<_> = if let Some(mp) = mempool {
+                let snapshot = mp.snapshot();
+                snapshot
+                    .tx_hashes
+                    .iter()
+                    .take(req_count.max(1))
+                    .filter_map(|h| mp.get_tx_size(h).map(|size| (h.as_bytes().to_vec(), size)))
+                    .collect()
+            } else {
+                vec![]
+            };
+
+            // MsgReplyTxIds: [1, [[tx_id, size], ...]]
             enc.array(2)
                 .map_err(|e| N2NServerError::Protocol(e.to_string()))?;
             enc.u32(1)
                 .map_err(|e| N2NServerError::Protocol(e.to_string()))?;
-            enc.array(0)
+            enc.array(txs.len() as u64)
                 .map_err(|e| N2NServerError::Protocol(e.to_string()))?;
-            debug!("TxSubmission2: replied with empty tx ids");
+            for (tx_hash, size) in &txs {
+                enc.array(2)
+                    .map_err(|e| N2NServerError::Protocol(e.to_string()))?;
+                enc.bytes(tx_hash)
+                    .map_err(|e| N2NServerError::Protocol(e.to_string()))?;
+                enc.u32(*size as u32)
+                    .map_err(|e| N2NServerError::Protocol(e.to_string()))?;
+            }
+            debug!(count = txs.len(), "TxSubmission2: replied with tx ids");
             Ok(Some(Segment {
                 transmission_time: 0,
                 protocol_id: MINI_PROTOCOL_TXSUBMISSION,
@@ -878,15 +924,44 @@ fn handle_n2n_txsubmission(
         }
         // MsgRequestTxs: [2, [tx_ids]]
         2 => {
+            // Parse requested tx IDs
+            let requested_len = decoder
+                .array()
+                .map_err(|e| N2NServerError::Protocol(e.to_string()))?
+                .unwrap_or(0);
+
+            let mut tx_bodies = Vec::new();
+            if let Some(mp) = mempool {
+                for _ in 0..requested_len {
+                    if let Ok(tx_hash_bytes) = decoder.bytes() {
+                        if tx_hash_bytes.len() == 32 {
+                            let hash = torsten_primitives::hash::Hash32::from_bytes(
+                                tx_hash_bytes.try_into().unwrap(),
+                            );
+                            if let Some(tx) = mp.get_tx(&hash) {
+                                if let Some(ref raw) = tx.raw_cbor {
+                                    tx_bodies.push(raw.clone());
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            // MsgReplyTxs: [3, [tx_cbor, ...]]
             let mut buf = Vec::new();
             let mut enc = minicbor::Encoder::new(&mut buf);
             enc.array(2)
                 .map_err(|e| N2NServerError::Protocol(e.to_string()))?;
             enc.u32(3)
                 .map_err(|e| N2NServerError::Protocol(e.to_string()))?;
-            enc.array(0)
+            enc.array(tx_bodies.len() as u64)
                 .map_err(|e| N2NServerError::Protocol(e.to_string()))?;
-            debug!("TxSubmission2: replied with empty txs");
+            for body in &tx_bodies {
+                enc.bytes(body)
+                    .map_err(|e| N2NServerError::Protocol(e.to_string()))?;
+            }
+            debug!(count = tx_bodies.len(), "TxSubmission2: replied with txs");
             Ok(Some(Segment {
                 transmission_time: 0,
                 protocol_id: MINI_PROTOCOL_TXSUBMISSION,
@@ -1090,6 +1165,13 @@ mod tests {
         fn get_tip(&self) -> (u64, [u8; 32], u64) {
             (100, [0xAA; 32], 50)
         }
+        fn get_next_block_after_slot(&self, after_slot: u64) -> Option<(u64, [u8; 32], Vec<u8>)> {
+            if after_slot < 100 {
+                Some((after_slot + 1, [0xBB; 32], vec![0x82, 0x01, 0x02]))
+            } else {
+                None
+            }
+        }
     }
 
     #[test]
@@ -1148,7 +1230,8 @@ mod tests {
         enc.array(1).unwrap();
         enc.u32(6).unwrap();
 
-        let result = handle_n2n_txsubmission(&buf, &mut peer_state).unwrap();
+        let no_mempool: Option<Arc<Mempool>> = None;
+        let result = handle_n2n_txsubmission(&buf, &mut peer_state, &no_mempool).unwrap();
         assert!(result.is_some());
         let seg = result.unwrap();
         assert_eq!(seg.protocol_id, MINI_PROTOCOL_TXSUBMISSION);
@@ -1158,7 +1241,7 @@ mod tests {
         assert_eq!(dec.u32().unwrap(), 6); // MsgInit response
 
         // Second init should be no-op
-        let result2 = handle_n2n_txsubmission(&buf, &mut peer_state).unwrap();
+        let result2 = handle_n2n_txsubmission(&buf, &mut peer_state, &no_mempool).unwrap();
         assert!(result2.is_none());
     }
 
@@ -1176,7 +1259,8 @@ mod tests {
         enc.u32(0).unwrap();
         enc.u32(1).unwrap();
 
-        let result = handle_n2n_txsubmission(&buf, &mut peer_state).unwrap();
+        let no_mempool: Option<Arc<Mempool>> = None;
+        let result = handle_n2n_txsubmission(&buf, &mut peer_state, &no_mempool).unwrap();
         assert!(result.is_some());
         let seg = result.unwrap();
 

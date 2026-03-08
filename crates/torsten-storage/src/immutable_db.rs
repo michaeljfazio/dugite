@@ -99,7 +99,11 @@ impl ImmutableDB {
             batch.put(slot_key, cbor);
 
             let hash_key = [b"hash:", hash.as_bytes().as_slice()].concat();
-            batch.put(hash_key, slot_key);
+            batch.put(&hash_key, slot_key);
+
+            // Reverse index: slot_hash:slot -> hash
+            let slot_hash_key = [b"slot_hash:", &slot_key[..]].concat();
+            batch.put(slot_hash_key, hash.as_bytes());
 
             if *slot > max_tip_slot {
                 max_tip_slot = *slot;
@@ -147,7 +151,12 @@ impl ImmutableDB {
 
         // Secondary index: hash -> slot
         let hash_key = [b"hash:", hash.as_bytes().as_slice()].concat();
-        db.put(hash_key, slot_key)
+        db.put(&hash_key, slot_key)
+            .map_err(|e| ImmutableDBError::RocksDB(e.to_string()))?;
+
+        // Reverse index: slot_hash:slot -> hash (for slot→hash lookups)
+        let slot_hash_key = [b"slot_hash:", &slot_key[..]].concat();
+        db.put(slot_hash_key, hash.as_bytes())
             .map_err(|e| ImmutableDBError::RocksDB(e.to_string()))?;
 
         if slot > self.tip_slot {
@@ -230,6 +239,56 @@ impl ImmutableDB {
             blocks.push(value.to_vec());
         }
         Ok(blocks)
+    }
+
+    /// Get the first block after the given slot.
+    /// Returns (slot, hash, cbor) of the next block, or None.
+    pub fn get_next_block_after_slot(
+        &self,
+        after_slot: SlotNo,
+    ) -> Result<Option<(SlotNo, BlockHeaderHash, Vec<u8>)>, ImmutableDBError> {
+        let db = self
+            .db
+            .as_ref()
+            .ok_or_else(|| ImmutableDBError::RocksDB("DB not open".into()))?;
+
+        // Start iterating from after_slot + 1
+        let start_key = (after_slot.0 + 1).to_be_bytes();
+        let iter = db.iterator(rocksdb::IteratorMode::From(
+            &start_key,
+            rocksdb::Direction::Forward,
+        ));
+        for item in iter {
+            let (key, value) = item.map_err(|e| ImmutableDBError::RocksDB(e.to_string()))?;
+            // Skip non-slot keys (metadata, hash index, slot_hash index)
+            if key.len() != 8 {
+                continue;
+            }
+            let mut slot_bytes = [0u8; 8];
+            slot_bytes.copy_from_slice(&key);
+            let slot = SlotNo(u64::from_be_bytes(slot_bytes));
+
+            // Look up the hash via slot_hash: index
+            let slot_hash_key = [b"slot_hash:", &slot_bytes[..]].concat();
+            let hash = if let Some(hash_bytes) = db
+                .get(slot_hash_key)
+                .map_err(|e| ImmutableDBError::RocksDB(e.to_string()))?
+            {
+                if hash_bytes.len() == 32 {
+                    let mut h = [0u8; 32];
+                    h.copy_from_slice(&hash_bytes);
+                    Hash32::from_bytes(h)
+                } else {
+                    Hash32::from_bytes([0u8; 32])
+                }
+            } else {
+                // Fallback for blocks written before slot_hash index existed
+                Hash32::from_bytes([0u8; 32])
+            };
+
+            return Ok(Some((slot, hash, value.to_vec())));
+        }
+        Ok(None)
     }
 
     pub fn tip_slot(&self) -> SlotNo {

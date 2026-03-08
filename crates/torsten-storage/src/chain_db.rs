@@ -198,6 +198,30 @@ impl ChainDB {
         Ok(blocks)
     }
 
+    /// Get the first block after the given slot.
+    /// Returns (slot, hash, cbor) of the next block, or None.
+    /// Checks both immutable and volatile DB, returns the block with the lowest slot.
+    pub fn get_next_block_after_slot(
+        &self,
+        after_slot: SlotNo,
+    ) -> Result<Option<(SlotNo, BlockHeaderHash, Vec<u8>)>, ChainDBError> {
+        let imm_result = self.immutable.get_next_block_after_slot(after_slot)?;
+        let vol_result = self.volatile.get_next_block_after_slot(after_slot);
+
+        match (imm_result, vol_result) {
+            (Some((imm_slot, imm_hash, imm_cbor)), Some((vol_slot, vol_hash, vol_cbor))) => {
+                if vol_slot <= imm_slot {
+                    Ok(Some((vol_slot, vol_hash, vol_cbor)))
+                } else {
+                    Ok(Some((imm_slot, imm_hash, imm_cbor)))
+                }
+            }
+            (Some(imm), None) => Ok(Some(imm)),
+            (None, Some(vol)) => Ok(Some(vol)),
+            (None, None) => Ok(None),
+        }
+    }
+
     /// Check if a block exists in the chain DB
     pub fn has_block(&self, hash: &BlockHeaderHash) -> bool {
         self.volatile.get_block(hash).is_some()

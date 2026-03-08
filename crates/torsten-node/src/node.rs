@@ -74,6 +74,19 @@ impl BlockProvider for ChainDBBlockProvider {
             Err(_) => (0, [0u8; 32], 0),
         }
     }
+
+    fn get_next_block_after_slot(&self, after_slot: u64) -> Option<(u64, [u8; 32], Vec<u8>)> {
+        let db = self.chain_db.try_read().ok()?;
+        let slot = torsten_primitives::time::SlotNo(after_slot);
+        match db.get_next_block_after_slot(slot) {
+            Ok(Some((s, hash, cbor))) => {
+                let mut hash_arr = [0u8; 32];
+                hash_arr.copy_from_slice(hash.as_bytes());
+                Some((s.0, hash_arr, cbor))
+            }
+            _ => None,
+        }
+    }
 }
 
 /// Provides UTxO lookups from the live ledger state
@@ -381,7 +394,7 @@ impl Node {
         let peers = self.topology.all_peers();
 
         // Start N2N server for inbound peer connections (bidirectional mode)
-        let n2n_server = torsten_network::n2n_server::N2NServer::with_config(
+        let mut n2n_server = torsten_network::n2n_server::N2NServer::with_config(
             self.listen_addr,
             self.network_magic,
             self.query_handler.clone(),
@@ -392,6 +405,7 @@ impl Node {
             pm_config.diffusion_mode == DiffusionMode::InitiatorAndResponder,
             torsten_network::n2n_server::PeerSharingMode::PeerSharingEnabled,
         );
+        n2n_server.set_mempool(self.mempool.clone());
         info!(
             "N2N server: diffusion_mode={:?}, peer_sharing=enabled",
             pm_config.diffusion_mode
