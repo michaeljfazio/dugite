@@ -60,6 +60,7 @@ pallas-primitives = "1.0.0-alpha.5"
 pallas-traverse = "1.0.0-alpha.5"
 pallas-crypto = "1.0.0-alpha.5"
 pallas-addresses = "1.0.0-alpha.5"
+vrf_dalek = { git = "https://github.com/input-output-hk/vrf", branch = "main" }
 
 # Storage
 rocksdb = "0.22"
