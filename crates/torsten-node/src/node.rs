@@ -11,8 +11,9 @@ use torsten_mempool::{Mempool, MempoolConfig};
 use torsten_network::query_handler::{UtxoQueryProvider, UtxoSnapshot};
 use torsten_network::server::NodeServerConfig;
 use torsten_network::{
-    BlockProvider, ChainSyncEvent, DiffusionMode, N2CServer, NodeServer, NodeStateSnapshot,
-    NodeToNodeClient, PeerManager, PeerManagerConfig, QueryHandler, TxValidator,
+    BlockFetchPool, BlockProvider, ChainSyncEvent, DiffusionMode, HeaderBatchResult, N2CServer,
+    NodeServer, NodeStateSnapshot, NodeToNodeClient, PeerManager, PeerManagerConfig, QueryHandler,
+    TxValidator,
 };
 use torsten_primitives::block::Point;
 use torsten_primitives::protocol_params::ProtocolParameters;
@@ -675,10 +676,43 @@ impl Node {
                 info!("P2P: {}", pm.stats());
             }
 
-            // Run chain sync with connected peer
+            // Connect additional peers as block fetchers for parallel block fetch
+            let mut fetch_pool = BlockFetchPool::new();
+            {
+                let pm = peer_manager.read().await;
+                let additional_peers: Vec<std::net::SocketAddr> = pm
+                    .peers_to_connect()
+                    .into_iter()
+                    .filter(|a| *a != peer_addr)
+                    .take(4)
+                    .collect();
+                drop(pm);
+
+                for addr in &additional_peers {
+                    let target = addr.to_string();
+                    match NodeToNodeClient::connect(&*target, network_magic).await {
+                        Ok(c) => {
+                            info!("Connected block fetcher to {target}");
+                            peer_manager.write().await.peer_connected(addr, 14, true);
+                            fetch_pool.add_fetcher(c);
+                        }
+                        Err(e) => {
+                            warn!("Failed to connect fetcher to {target}: {e}");
+                        }
+                    }
+                }
+                if !fetch_pool.is_empty() {
+                    info!(
+                        "Block fetch pool: {} fetcher(s) for parallel block retrieval",
+                        fetch_pool.len()
+                    );
+                }
+            }
+
+            // Run chain sync with connected peer + fetch pool
             let sync_shutdown = shutdown_rx.clone();
             match self
-                .chain_sync_loop(&mut active_client, sync_shutdown)
+                .chain_sync_loop(&mut active_client, fetch_pool, sync_shutdown)
                 .await
             {
                 Ok(()) => {
@@ -720,6 +754,7 @@ impl Node {
     async fn chain_sync_loop(
         &mut self,
         client: &mut NodeToNodeClient,
+        fetch_pool: BlockFetchPool,
         mut shutdown_rx: watch::Receiver<bool>,
     ) -> Result<()> {
         // Find intersection with our current chain
@@ -741,15 +776,20 @@ impl Node {
         }
         info!("Remote tip: {remote_tip}");
 
-        // Single-peer sync loop — ChainSync and BlockFetch use the same
-        // multiplexed connection for correctness (no cross-peer EBB/chain discrepancies).
-        // The Ouroboros ChainSync protocol is the bottleneck at ~3 headers/s.
+        let use_pool = !fetch_pool.is_empty();
+        if use_pool {
+            info!(
+                "Multi-peer sync: headers from primary peer, blocks from {} fetcher(s)",
+                fetch_pool.len()
+            );
+        }
+
         let mut blocks_received: u64 = 0;
         let mut last_snapshot_epoch: u64 = self.ledger_state.read().await.epoch.0;
         let mut last_log_time = std::time::Instant::now();
         let mut last_query_update = std::time::Instant::now();
         let mut blocks_since_last_log: u64 = 0;
-        let batch_size = 100;
+        let header_batch_size = if use_pool { 500 } else { 100 };
 
         loop {
             if *shutdown_rx.borrow() {
@@ -757,126 +797,231 @@ impl Node {
                 break;
             }
 
-            tokio::select! {
-                result = client.request_next_batch(batch_size) => {
-                    match result {
-                        Ok(events) => {
-                            let mut forward_blocks = Vec::new();
-                            let mut other_events = Vec::new();
-
-                            for event in events {
-                                match event {
-                                    ChainSyncEvent::RollForward(block, tip) => {
-                                        forward_blocks.push((block, tip));
-                                    }
-                                    other => other_events.push(other),
-                                }
-                            }
-
-                            if !forward_blocks.is_empty() {
-                                let batch_count = forward_blocks.len() as u64;
-
-                                {
-                                    let batch: Vec<_> = forward_blocks
-                                        .iter()
-                                        .map(|(block, _)| {
-                                            (
-                                                *block.hash(),
-                                                block.slot(),
-                                                block.block_number(),
-                                                *block.prev_hash(),
-                                                block.raw_cbor.clone().unwrap_or_default(),
-                                            )
-                                        })
-                                        .collect();
-                                    let mut db = self.chain_db.write().await;
-                                    if let Err(e) = db.add_blocks_batch(&batch) {
-                                        error!("Failed to store block batch: {e}");
-                                    }
-                                }
-
-                                {
-                                    let mut ls = self.ledger_state.write().await;
-                                    for (block, _) in &forward_blocks {
-                                        if let Err(e) = ls.apply_block(block) {
-                                            error!("Failed to apply block to ledger: {e}");
+            if use_pool {
+                // Multi-peer mode: collect headers from primary, fetch blocks from pool
+                tokio::select! {
+                    result = client.request_headers_batch(header_batch_size) => {
+                        match result {
+                            Ok(batch_result) => {
+                                match batch_result {
+                                    HeaderBatchResult::Headers(headers, tip) => {
+                                        match fetch_pool.fetch_blocks_concurrent(&headers).await {
+                                            Ok(blocks) => {
+                                                self.process_forward_blocks(blocks, &tip, &mut blocks_received, &mut blocks_since_last_log, &mut last_snapshot_epoch, &mut last_log_time, &mut last_query_update).await;
+                                            }
+                                            Err(e) => {
+                                                warn!("Pool fetch failed, falling back to primary peer: {e}");
+                                                match client.fetch_blocks_by_points(&headers).await {
+                                                    Ok(blocks) => {
+                                                        self.process_forward_blocks(blocks, &tip, &mut blocks_received, &mut blocks_since_last_log, &mut last_snapshot_epoch, &mut last_log_time, &mut last_query_update).await;
+                                                    }
+                                                    Err(e2) => { error!("Primary peer fetch also failed: {e2}"); break; }
+                                                }
+                                            }
                                         }
                                     }
-                                }
-
-                                if let Some((last_block, _)) = forward_blocks.last() {
-                                    if last_block.era.is_shelley_based() {
-                                        if let Err(e) = self.consensus.validate_header(&last_block.header, last_block.slot()) {
-                                            warn!(slot = last_block.slot().0, "Consensus validation warning: {e}");
+                                    HeaderBatchResult::HeadersAndRollback { headers, tip, rollback_point, .. } => {
+                                        // Process any headers before the rollback
+                                        if !headers.is_empty() {
+                                            match fetch_pool.fetch_blocks_concurrent(&headers).await {
+                                                Ok(blocks) => {
+                                                    self.process_forward_blocks(blocks, &tip, &mut blocks_received, &mut blocks_since_last_log, &mut last_snapshot_epoch, &mut last_log_time, &mut last_query_update).await;
+                                                }
+                                                Err(e) => { warn!("Pool fetch failed during rollback batch: {e}"); }
+                                            }
                                         }
-                                    }
-                                    self.consensus.update_tip(last_block.tip());
-                                }
-
-                                blocks_received += batch_count;
-                                blocks_since_last_log += batch_count;
-
-                                let (last_block, last_tip) = forward_blocks.last().unwrap();
-                                let slot = last_block.slot().0;
-                                let block_no = last_block.block_number().0;
-
-                                {
-                                    let current_epoch = self.ledger_state.read().await.epoch.0;
-                                    if current_epoch > last_snapshot_epoch {
-                                        info!(epoch = current_epoch, "Epoch transition — saving ledger snapshot");
-                                        self.save_ledger_snapshot().await;
-                                        last_snapshot_epoch = current_epoch;
-                                    }
-                                }
-
-                                let elapsed = last_log_time.elapsed();
-                                if elapsed.as_secs() >= 5 || blocks_received <= 5 {
-                                    let tip_slot = last_tip.point.slot().map(|s| s.0).unwrap_or(0);
-                                    let tip_block = last_tip.block_number.0;
-                                    let progress = if tip_slot > 0 { (slot as f64 / tip_slot as f64 * 100.0).min(100.0) } else { 0.0 };
-                                    let blocks_per_sec = if elapsed.as_secs_f64() > 0.0 { blocks_since_last_log as f64 / elapsed.as_secs_f64() } else { 0.0 };
-                                    let blocks_remaining = tip_block.saturating_sub(block_no);
-                                    {
-                                        let ls = self.ledger_state.read().await;
-                                        info!("Syncing {progress:.2}% | slot {slot}/{tip_slot} | block {block_no}/{tip_block} | epoch {} | {blocks_per_sec:.0} blocks/s | {} UTxOs | {blocks_remaining} blocks remaining", ls.epoch.0, ls.utxo_set.len());
-                                    }
-                                    last_log_time = std::time::Instant::now();
-                                    blocks_since_last_log = 0;
-                                    if last_query_update.elapsed().as_secs() >= 30 {
-                                        self.update_query_state().await;
-                                        last_query_update = std::time::Instant::now();
-                                    }
-                                }
-                            }
-
-                            for event in other_events {
-                                match event {
-                                    ChainSyncEvent::RollBackward(point, tip) => {
-                                        warn!("Rollback to {point}, tip: {tip}");
+                                        warn!("Rollback to {rollback_point}");
                                         let mut db = self.chain_db.write().await;
-                                        if let Err(e) = db.rollback_to_point(&point) { error!("Rollback failed: {e}"); }
+                                        if let Err(e) = db.rollback_to_point(&rollback_point) {
+                                            error!("Rollback failed: {e}");
+                                        }
                                     }
-                                    ChainSyncEvent::Await => {
+                                    HeaderBatchResult::RollBackward(point, _tip) => {
+                                        warn!("Rollback to {point}");
+                                        let mut db = self.chain_db.write().await;
+                                        if let Err(e) = db.rollback_to_point(&point) {
+                                            error!("Rollback failed: {e}");
+                                        }
+                                    }
+                                    HeaderBatchResult::Await => {
                                         info!(blocks_received, "Caught up to chain tip, awaiting new blocks");
                                         self.update_query_state().await;
                                     }
-                                    ChainSyncEvent::RollForward(..) => unreachable!(),
                                 }
                             }
+                            Err(e) => { error!("Chain sync error: {e}"); break; }
                         }
-                        Err(e) => { error!("Chain sync error: {e}"); break; }
+                    }
+                    _ = shutdown_rx.changed() => {
+                        info!("Shutdown requested during sync");
+                        break;
                     }
                 }
-                _ = shutdown_rx.changed() => {
-                    info!("Shutdown requested during sync");
-                    break;
+            } else {
+                // Single-peer mode: use request_next_batch (headers + blocks from same peer)
+                tokio::select! {
+                    result = client.request_next_batch(header_batch_size) => {
+                        match result {
+                            Ok(events) => {
+                                let mut forward_blocks = Vec::new();
+                                let mut other_events = Vec::new();
+
+                                for event in events {
+                                    match event {
+                                        ChainSyncEvent::RollForward(block, tip) => {
+                                            forward_blocks.push((*block, tip));
+                                        }
+                                        other => other_events.push(other),
+                                    }
+                                }
+
+                                if !forward_blocks.is_empty() {
+                                    let blocks: Vec<_> = forward_blocks.iter().map(|(b, _)| b.clone()).collect();
+                                    let tip = &forward_blocks.last().unwrap().1;
+                                    self.process_forward_blocks(blocks, tip, &mut blocks_received, &mut blocks_since_last_log, &mut last_snapshot_epoch, &mut last_log_time, &mut last_query_update).await;
+                                }
+
+                                for event in other_events {
+                                    match event {
+                                        ChainSyncEvent::RollBackward(point, tip) => {
+                                            warn!("Rollback to {point}, tip: {tip}");
+                                            let mut db = self.chain_db.write().await;
+                                            if let Err(e) = db.rollback_to_point(&point) { error!("Rollback failed: {e}"); }
+                                        }
+                                        ChainSyncEvent::Await => {
+                                            info!(blocks_received, "Caught up to chain tip, awaiting new blocks");
+                                            self.update_query_state().await;
+                                        }
+                                        ChainSyncEvent::RollForward(..) => unreachable!(),
+                                    }
+                                }
+                            }
+                            Err(e) => { error!("Chain sync error: {e}"); break; }
+                        }
+                    }
+                    _ = shutdown_rx.changed() => {
+                        info!("Shutdown requested during sync");
+                        break;
+                    }
                 }
             }
         }
 
         self.save_ledger_snapshot().await;
+        fetch_pool.disconnect_all().await;
         info!("Chain sync stopped after {blocks_received} blocks");
         Ok(())
+    }
+
+    /// Process a batch of forward blocks: store in ChainDB, apply to ledger, validate, log progress
+    #[allow(clippy::too_many_arguments)]
+    async fn process_forward_blocks(
+        &mut self,
+        blocks: Vec<torsten_primitives::block::Block>,
+        tip: &torsten_primitives::block::Tip,
+        blocks_received: &mut u64,
+        blocks_since_last_log: &mut u64,
+        last_snapshot_epoch: &mut u64,
+        last_log_time: &mut std::time::Instant,
+        last_query_update: &mut std::time::Instant,
+    ) {
+        if blocks.is_empty() {
+            return;
+        }
+        let batch_count = blocks.len() as u64;
+
+        {
+            let batch: Vec<_> = blocks
+                .iter()
+                .map(|block| {
+                    (
+                        *block.hash(),
+                        block.slot(),
+                        block.block_number(),
+                        *block.prev_hash(),
+                        block.raw_cbor.clone().unwrap_or_default(),
+                    )
+                })
+                .collect();
+            let mut db = self.chain_db.write().await;
+            if let Err(e) = db.add_blocks_batch(&batch) {
+                error!("Failed to store block batch: {e}");
+            }
+        }
+
+        {
+            let mut ls = self.ledger_state.write().await;
+            for block in &blocks {
+                if let Err(e) = ls.apply_block(block) {
+                    error!("Failed to apply block to ledger: {e}");
+                }
+            }
+        }
+
+        if let Some(last_block) = blocks.last() {
+            if last_block.era.is_shelley_based() {
+                if let Err(e) = self
+                    .consensus
+                    .validate_header(&last_block.header, last_block.slot())
+                {
+                    warn!(
+                        slot = last_block.slot().0,
+                        "Consensus validation warning: {e}"
+                    );
+                }
+            }
+            self.consensus.update_tip(last_block.tip());
+        }
+
+        *blocks_received += batch_count;
+        *blocks_since_last_log += batch_count;
+
+        let last_block = blocks.last().unwrap();
+        let slot = last_block.slot().0;
+        let block_no = last_block.block_number().0;
+
+        {
+            let current_epoch = self.ledger_state.read().await.epoch.0;
+            if current_epoch > *last_snapshot_epoch {
+                info!(
+                    epoch = current_epoch,
+                    "Epoch transition — saving ledger snapshot"
+                );
+                self.save_ledger_snapshot().await;
+                *last_snapshot_epoch = current_epoch;
+            }
+        }
+
+        let elapsed = last_log_time.elapsed();
+        if elapsed.as_secs() >= 5 || *blocks_received <= 5 {
+            let tip_slot = tip.point.slot().map(|s| s.0).unwrap_or(0);
+            let tip_block = tip.block_number.0;
+            let progress = if tip_slot > 0 {
+                (slot as f64 / tip_slot as f64 * 100.0).min(100.0)
+            } else {
+                0.0
+            };
+            let blocks_per_sec = if elapsed.as_secs_f64() > 0.0 {
+                *blocks_since_last_log as f64 / elapsed.as_secs_f64()
+            } else {
+                0.0
+            };
+            let blocks_remaining = tip_block.saturating_sub(block_no);
+            {
+                let ls = self.ledger_state.read().await;
+                info!(
+                    "Syncing {progress:.2}% | slot {slot}/{tip_slot} | block {block_no}/{tip_block} | epoch {} | {blocks_per_sec:.0} blocks/s | {} UTxOs | {blocks_remaining} blocks remaining",
+                    ls.epoch.0,
+                    ls.utxo_set.len()
+                );
+            }
+            *last_log_time = std::time::Instant::now();
+            *blocks_since_last_log = 0;
+            if last_query_update.elapsed().as_secs() >= 30 {
+                self.update_query_state().await;
+                *last_query_update = std::time::Instant::now();
+            }
+        }
     }
 
     /// Update the query handler with the current ledger state
