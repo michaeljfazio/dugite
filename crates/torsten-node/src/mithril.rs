@@ -383,12 +383,16 @@ fn import_chunk_files(extract_dir: &Path, database_path: &Path) -> Result<()> {
         let chunk_path = immutable_dir.join(format!("{chunk_num:05}.chunk"));
         let secondary_path = immutable_dir.join(format!("{chunk_num:05}.secondary"));
 
-        let blocks = if secondary_path.exists() {
+        let mut blocks = if secondary_path.exists() {
             parse_chunk_with_index(&chunk_path, &secondary_path)?
         } else {
-            // Fallback: parse chunk file by sequential CBOR decoding
-            parse_chunk_sequential(&chunk_path)?
+            Vec::new()
         };
+
+        // Fallback to sequential CBOR decoding if secondary index yielded no blocks
+        if blocks.is_empty() {
+            blocks = parse_chunk_sequential(&chunk_path)?;
+        }
 
         if blocks.is_empty() {
             pb.inc(1);
