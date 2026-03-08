@@ -1117,7 +1117,12 @@ impl Node {
             },
             async {
                 let mut ls = ledger_state.write().await;
+                let ledger_slot = ls.tip.point.slot().map(|s| s.0).unwrap_or(0);
                 for block in &blocks {
+                    // Skip blocks the ledger has already applied (e.g. replaying from origin)
+                    if block.slot().0 <= ledger_slot {
+                        continue;
+                    }
                     if let Err(e) = ls.apply_block(block) {
                         error!("Failed to apply block to ledger: {e}");
                     }
