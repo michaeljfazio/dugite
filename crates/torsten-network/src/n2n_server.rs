@@ -5,7 +5,7 @@ use std::time::Instant;
 use thiserror::Error;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
-use tokio::sync::RwLock;
+use tokio::sync::{broadcast, RwLock};
 use tracing::{debug, error, info, warn};
 
 use crate::miniprotocols::peersharing::{self, PeerAddress, PeerSharingMessage};
@@ -13,6 +13,17 @@ use crate::multiplexer::Segment;
 use crate::peer_manager::PeerManager;
 use crate::query_handler::QueryHandler;
 use torsten_mempool::Mempool;
+
+/// Notification sent when a new block is forged and should be announced to peers
+#[derive(Debug, Clone)]
+pub struct BlockAnnouncement {
+    /// Slot number of the new block
+    pub slot: u64,
+    /// Header hash of the new block
+    pub hash: [u8; 32],
+    /// Block number
+    pub block_number: u64,
+}
 
 /// Callback trait for retrieving block data from storage
 pub trait BlockProvider: Send + Sync + 'static {
@@ -120,6 +131,8 @@ pub struct N2NServer {
     peer_manager: Option<Arc<RwLock<PeerManager>>>,
     /// Optional mempool for TxSubmission2 protocol
     mempool: Option<Arc<Mempool>>,
+    /// Broadcast channel for block announcements to connected peers
+    block_announcement_tx: broadcast::Sender<BlockAnnouncement>,
 }
 
 impl N2NServer {
@@ -130,6 +143,7 @@ impl N2NServer {
         block_provider: Arc<dyn BlockProvider>,
         max_connections: usize,
     ) -> Self {
+        let (block_announcement_tx, _) = broadcast::channel(64);
         N2NServer {
             listen_addr,
             network_magic,
@@ -140,6 +154,7 @@ impl N2NServer {
             peer_sharing: PeerSharingMode::PeerSharingEnabled,
             peer_manager: None,
             mempool: None,
+            block_announcement_tx,
         }
     }
 
@@ -153,6 +168,7 @@ impl N2NServer {
         initiator_and_responder: bool,
         peer_sharing: PeerSharingMode,
     ) -> Self {
+        let (block_announcement_tx, _) = broadcast::channel(64);
         N2NServer {
             listen_addr,
             network_magic,
@@ -163,6 +179,7 @@ impl N2NServer {
             peer_sharing,
             peer_manager: None,
             mempool: None,
+            block_announcement_tx,
         }
     }
 
@@ -174,6 +191,25 @@ impl N2NServer {
     /// Set the peer manager for PeerSharing protocol support
     pub fn set_peer_manager(&mut self, peer_manager: Arc<RwLock<PeerManager>>) {
         self.peer_manager = Some(peer_manager);
+    }
+
+    /// Announce a newly forged block to all connected peers.
+    /// Peers waiting in MsgAwaitReply will be woken up to fetch the new block.
+    pub fn announce_block(&self, slot: u64, hash: [u8; 32], block_number: u64) {
+        let announcement = BlockAnnouncement {
+            slot,
+            hash,
+            block_number,
+        };
+        // Ignore send errors (no receivers yet or all dropped)
+        let _ = self.block_announcement_tx.send(announcement);
+        info!(slot, block_number, "Block announced to peers");
+    }
+
+    /// Get a broadcast sender for block announcements.
+    /// Used by the node to announce blocks without a direct reference to the server.
+    pub fn block_announcement_sender(&self) -> broadcast::Sender<BlockAnnouncement> {
+        self.block_announcement_tx.clone()
     }
 
     /// Start listening for inbound N2N connections.
@@ -234,6 +270,7 @@ impl N2NServer {
                     let peer_sharing_mode = self.peer_sharing;
                     let peer_manager = self.peer_manager.clone();
                     let mempool = self.mempool.clone();
+                    let announcement_rx = self.block_announcement_tx.subscribe();
 
                     tokio::spawn(async move {
                         if let Err(e) = handle_n2n_connection(
@@ -246,6 +283,7 @@ impl N2NServer {
                             peer_sharing_mode,
                             peer_manager,
                             mempool,
+                            announcement_rx,
                         )
                         .await
                         {
@@ -287,7 +325,8 @@ impl PeerState {
     }
 }
 
-/// Handle a single inbound N2N peer connection
+/// Handle a single inbound N2N peer connection.
+/// Listens for both peer messages and block announcements concurrently.
 #[allow(clippy::too_many_arguments)]
 async fn handle_n2n_connection(
     mut stream: tokio::net::TcpStream,
@@ -299,59 +338,122 @@ async fn handle_n2n_connection(
     peer_sharing_mode: PeerSharingMode,
     peer_manager: Option<Arc<RwLock<PeerManager>>>,
     mempool: Option<Arc<Mempool>>,
+    mut announcement_rx: broadcast::Receiver<BlockAnnouncement>,
 ) -> Result<(), N2NServerError> {
     let mut buf = vec![0u8; 65536];
     let mut partial = Vec::new();
     let mut peer_state = PeerState::new();
 
     loop {
-        let n = stream.read(&mut buf).await?;
-        if n == 0 {
-            return Ok(()); // Peer disconnected
-        }
+        tokio::select! {
+            // Listen for peer messages
+            read_result = stream.read(&mut buf) => {
+                let n = read_result?;
+                if n == 0 {
+                    return Ok(()); // Peer disconnected
+                }
 
-        partial.extend_from_slice(&buf[..n]);
+                partial.extend_from_slice(&buf[..n]);
 
-        // Process all complete segments
-        let mut offset = 0;
-        while offset < partial.len() {
-            let remaining = &partial[offset..];
-            if remaining.len() < 8 {
-                break;
-            }
+                // Process all complete segments
+                let mut offset = 0;
+                while offset < partial.len() {
+                    let remaining = &partial[offset..];
+                    if remaining.len() < 8 {
+                        break;
+                    }
 
-            match Segment::decode(remaining) {
-                Ok((segment, consumed)) => {
-                    offset += consumed;
+                    match Segment::decode(remaining) {
+                        Ok((segment, consumed)) => {
+                            offset += consumed;
 
-                    let response = process_n2n_segment(
-                        &segment,
-                        peer_addr,
-                        network_magic,
-                        &query_handler,
-                        &block_provider,
-                        initiator_and_responder,
-                        peer_sharing_mode,
-                        &mut peer_state,
-                        &peer_manager,
-                        &mempool,
-                    )
-                    .await?;
+                            let response = process_n2n_segment(
+                                &segment,
+                                peer_addr,
+                                network_magic,
+                                &query_handler,
+                                &block_provider,
+                                initiator_and_responder,
+                                peer_sharing_mode,
+                                &mut peer_state,
+                                &peer_manager,
+                                &mempool,
+                            )
+                            .await?;
 
-                    for resp in response {
-                        let encoded = resp.encode();
-                        stream.write_all(&encoded).await?;
+                            for resp in response {
+                                let encoded = resp.encode();
+                                stream.write_all(&encoded).await?;
+                            }
+                        }
+                        Err(_) => {
+                            break; // Incomplete segment, wait for more data
+                        }
                     }
                 }
-                Err(_) => {
-                    break; // Incomplete segment, wait for more data
+
+                // Keep any unprocessed data
+                if offset > 0 {
+                    partial.drain(..offset);
                 }
             }
-        }
+            // Listen for block announcements from our node
+            announcement = announcement_rx.recv() => {
+                match announcement {
+                    Ok(ann) => {
+                        // If peer is at tip (waiting for new block), send them the new
+                        // block via MsgRollForward on ChainSync protocol.
+                        if let Some(cursor_slot) = peer_state.chainsync_cursor_slot {
+                            if cursor_slot < ann.slot {
+                                // Peer is behind the announced block — serve the next block
+                                if let Some((_next_slot, next_hash, block_cbor)) =
+                                    block_provider.get_next_block_after_slot(cursor_slot)
+                                {
+                                    peer_state.chainsync_cursor_slot = Some(ann.slot);
+                                    peer_state.chainsync_cursor_hash = Some(next_hash);
 
-        // Keep any unprocessed data
-        if offset > 0 {
-            partial.drain(..offset);
+                                    let mut payload = Vec::new();
+                                    let mut enc = minicbor::Encoder::new(&mut payload);
+                                    enc.array(3)
+                                        .map_err(|e| N2NServerError::Protocol(e.to_string()))?;
+                                    enc.u32(2)
+                                        .map_err(|e| N2NServerError::Protocol(e.to_string()))?;
+
+                                    // Wrapped header
+                                    enc.tag(minicbor::data::Tag::new(24))
+                                        .map_err(|e| N2NServerError::Protocol(e.to_string()))?;
+                                    enc.bytes(&block_cbor)
+                                        .map_err(|e| N2NServerError::Protocol(e.to_string()))?;
+
+                                    // Tip
+                                    encode_tip(&mut enc, ann.slot, &ann.hash, ann.block_number)?;
+
+                                    let segment = Segment {
+                                        transmission_time: 0,
+                                        protocol_id: MINI_PROTOCOL_CHAINSYNC,
+                                        is_responder: true,
+                                        payload,
+                                    };
+                                    let encoded = segment.encode();
+                                    stream.write_all(&encoded).await?;
+                                    debug!(
+                                        peer = %peer_addr,
+                                        slot = ann.slot,
+                                        "Pushed block announcement to peer"
+                                    );
+                                }
+                            }
+                        }
+                    }
+                    Err(broadcast::error::RecvError::Lagged(n)) => {
+                        debug!(peer = %peer_addr, skipped = n, "Block announcement receiver lagged");
+                    }
+                    Err(broadcast::error::RecvError::Closed) => {
+                        // Sender dropped, server is shutting down
+                        return Ok(());
+                    }
+                }
+            }
         }
     }
 }

@@ -183,6 +183,9 @@ pub struct Node {
     metrics: Arc<crate::metrics::NodeMetrics>,
     /// Block producer credentials (None = relay-only mode)
     block_producer: Option<crate::forge::BlockProducerCredentials>,
+    /// Broadcast sender for announcing forged blocks to connected peers
+    block_announcement_tx:
+        Option<tokio::sync::broadcast::Sender<torsten_network::BlockAnnouncement>>,
 }
 
 impl Node {
@@ -409,6 +412,7 @@ impl Node {
             topology_path: args.topology_path,
             metrics: Arc::new(crate::metrics::NodeMetrics::new()),
             block_producer,
+            block_announcement_tx: None,
         })
     }
 
@@ -553,6 +557,8 @@ impl Node {
             torsten_network::n2n_server::PeerSharingMode::PeerSharingEnabled,
         );
         n2n_server.set_mempool(self.mempool.clone());
+        // Get the block announcement sender before spawning the server
+        self.block_announcement_tx = Some(n2n_server.block_announcement_sender());
         info!(
             "N2N server: diffusion_mode={:?}, peer_sharing=enabled",
             self.peer_manager.read().await.diffusion_mode()
@@ -1510,8 +1516,18 @@ impl Node {
                     "Forged block applied to local chain"
                 );
 
-                // Note: Block announcement to peers is not yet implemented.
-                // The N2N server will serve the block to peers that request it via BlockFetch.
+                // Announce the new block to all connected peers
+                // Announce the new block to all connected peers
+                if let Some(ref tx) = self.block_announcement_tx {
+                    let mut hash_bytes = [0u8; 32];
+                    hash_bytes.copy_from_slice(block.header.header_hash.as_ref());
+                    tx.send(torsten_network::BlockAnnouncement {
+                        slot: next_slot.0,
+                        hash: hash_bytes,
+                        block_number: block_number.0,
+                    })
+                    .ok();
+                }
             }
             Err(e) => {
                 error!("Block forging failed: {e}");
