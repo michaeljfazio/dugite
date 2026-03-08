@@ -552,9 +552,9 @@ impl LedgerState {
     pub fn process_epoch_transition(&mut self, new_epoch: EpochNo) {
         info!("Epoch transition: {} -> {}", self.epoch.0, new_epoch.0);
 
-        // Calculate and distribute rewards using the "go" snapshot
-        if let Some(ref go_snapshot) = self.snapshots.go {
-            self.calculate_and_distribute_rewards(go_snapshot.clone());
+        // Calculate and distribute rewards using the "go" snapshot (take ownership to avoid clone)
+        if let Some(go_snapshot) = self.snapshots.go.take() {
+            self.calculate_and_distribute_rewards(go_snapshot);
         }
 
         // Rotate snapshots: go = set, set = mark, mark = new snapshot
