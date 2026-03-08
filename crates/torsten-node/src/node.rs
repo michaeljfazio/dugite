@@ -209,7 +209,7 @@ impl Node {
         info!("Mempool: {} transactions", self.mempool.len());
 
         // Setup shutdown signal
-        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let (shutdown_tx, mut shutdown_rx) = watch::channel(false);
         tokio::spawn(async move {
             signal::ctrl_c().await.ok();
             info!("Shutdown signal received");
@@ -237,38 +237,86 @@ impl Node {
             .network_magic
             .unwrap_or_else(|| self.config.network.magic());
 
-        // Try each peer until we connect successfully
-        let mut client = None;
-        for (addr, port) in &peers {
-            let target = format!("{addr}:{port}");
-            info!("Attempting connection to {target}...");
+        // Main connection loop with reconnection support
+        let mut retry_count = 0u32;
+        let max_retries = 100; // effectively unlimited retries
+        let base_delay_secs = 5u64;
+        let max_delay_secs = 60u64;
 
-            match NodeToNodeClient::connect(&*target, network_magic).await {
-                Ok(c) => {
-                    info!("Connected to {target}");
-                    client = Some(c);
-                    break;
+        loop {
+            if *shutdown_rx.borrow() {
+                break;
+            }
+
+            // Try each peer until we connect successfully
+            let mut client = None;
+            for (addr, port) in &peers {
+                let target = format!("{addr}:{port}");
+                info!("Attempting connection to {target}...");
+
+                match NodeToNodeClient::connect(&*target, network_magic).await {
+                    Ok(c) => {
+                        info!("Connected to {target}");
+                        client = Some(c);
+                        break;
+                    }
+                    Err(e) => {
+                        warn!("Failed to connect to {target}: {e}");
+                        continue;
+                    }
                 }
-                Err(e) => {
-                    warn!("Failed to connect to {target}: {e}");
+            }
+
+            let mut client = match client {
+                Some(c) => {
+                    retry_count = 0; // Reset on successful connection
+                    c
+                }
+                None => {
+                    retry_count += 1;
+                    if retry_count > max_retries {
+                        error!("Exhausted connection retries");
+                        break;
+                    }
+                    let delay = base_delay_secs
+                        .saturating_mul(2u64.saturating_pow(retry_count.min(4)))
+                        .min(max_delay_secs);
+                    warn!(
+                        retry_count,
+                        delay_secs = delay,
+                        "Could not connect to any peer, retrying..."
+                    );
+                    tokio::select! {
+                        _ = tokio::time::sleep(std::time::Duration::from_secs(delay)) => {}
+                        _ = shutdown_rx.changed() => { break; }
+                    }
                     continue;
                 }
+            };
+
+            // Run chain sync — returns when disconnected or error
+            let sync_shutdown = shutdown_rx.clone();
+            match self.chain_sync_loop(&mut client, sync_shutdown).await {
+                Ok(()) => {
+                    client.disconnect().await;
+                    if *shutdown_rx.borrow() {
+                        break; // Clean shutdown
+                    }
+                    // Sync ended without shutdown — likely peer disconnected
+                    info!("Sync ended, will reconnect...");
+                }
+                Err(e) => {
+                    warn!("Sync error: {e}, will reconnect...");
+                }
+            }
+
+            // Brief delay before reconnecting
+            tokio::select! {
+                _ = tokio::time::sleep(std::time::Duration::from_secs(2)) => {}
+                _ = shutdown_rx.changed() => { break; }
             }
         }
 
-        let mut client = match client {
-            Some(c) => c,
-            None => {
-                error!("Could not connect to any peer");
-                return Ok(());
-            }
-        };
-
-        // Run chain sync
-        self.chain_sync_loop(&mut client, shutdown_rx).await?;
-
-        // Clean shutdown
-        client.disconnect().await;
         info!("Node shutdown complete");
         Ok(())
     }

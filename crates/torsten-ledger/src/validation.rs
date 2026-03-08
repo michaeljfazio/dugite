@@ -3,7 +3,7 @@ use std::collections::HashSet;
 use torsten_primitives::hash::Hash32;
 use torsten_primitives::protocol_params::ProtocolParameters;
 use torsten_primitives::time::SlotNo;
-use torsten_primitives::transaction::{NativeScript, Transaction};
+use torsten_primitives::transaction::{Certificate, NativeScript, Transaction};
 use torsten_primitives::value::Lovelace;
 use tracing::{debug, trace, warn};
 
@@ -77,16 +77,27 @@ pub fn validate_transaction(
         }
     }
 
-    // Rule 3: Value conservation (inputs = outputs + fee + deposits - withdrawals)
+    // Rule 3: Value conservation
+    // consumed = sum(inputs) + withdrawals + deposit_refunds
+    // produced = sum(outputs) + fee + deposits
+    // consumed must equal produced
     if errors.is_empty() {
         let output_value: u64 = body.outputs.iter().map(|o| o.value.coin.0).sum();
         let withdrawal_value: u64 = body.withdrawals.values().map(|l| l.0).sum::<u64>();
-        let total_out = output_value + body.fee.0;
 
-        // Simplified: not accounting for deposits/refunds/minting here
-        if input_value.0 + withdrawal_value != total_out {
+        // Calculate deposits and refunds from certificates
+        let (total_deposits, total_refunds) =
+            calculate_deposits_and_refunds(&body.certificates, params);
+
+        // Proposal deposits (Conway governance)
+        let proposal_deposits = body.proposal_procedures.len() as u64 * params.gov_action_deposit.0;
+
+        let consumed = input_value.0 + withdrawal_value + total_refunds;
+        let produced = output_value + body.fee.0 + total_deposits + proposal_deposits;
+
+        if consumed != produced {
             errors.push(ValidationError::ValueNotConserved {
-                inputs: input_value.0 + withdrawal_value,
+                inputs: consumed,
                 outputs: output_value,
                 fee: body.fee.0,
             });
@@ -171,6 +182,45 @@ pub fn validate_transaction(
         );
         Err(errors)
     }
+}
+
+/// Calculate total deposits and refunds from certificates in a transaction.
+///
+/// Deposits are required for: stake registration, pool registration, DRep registration,
+/// stake+delegation registration.
+/// Refunds are returned for: stake deregistration, DRep unregistration.
+fn calculate_deposits_and_refunds(
+    certificates: &[Certificate],
+    params: &ProtocolParameters,
+) -> (u64, u64) {
+    let mut deposits = 0u64;
+    let mut refunds = 0u64;
+
+    for cert in certificates {
+        match cert {
+            Certificate::StakeRegistration(_) => {
+                deposits += params.key_deposit.0;
+            }
+            Certificate::StakeDeregistration(_) => {
+                refunds += params.key_deposit.0;
+            }
+            Certificate::PoolRegistration(_) => {
+                deposits += params.pool_deposit.0;
+            }
+            Certificate::RegDRep { deposit, .. } => {
+                deposits += deposit.0;
+            }
+            Certificate::UnregDRep { refund, .. } => {
+                refunds += refund.0;
+            }
+            Certificate::RegStakeDeleg { deposit, .. } => {
+                deposits += deposit.0;
+            }
+            _ => {}
+        }
+    }
+
+    (deposits, refunds)
 }
 
 fn has_plutus_scripts(tx: &Transaction) -> bool {
@@ -506,5 +556,77 @@ mod tests {
         // Missing signer
         let empty: HashSet<Hash32> = HashSet::new();
         assert!(!evaluate_native_script(&script, &empty, SlotNo(100)));
+    }
+
+    #[test]
+    fn test_stake_registration_deposit() {
+        let (utxo_set, input) = make_simple_utxo_set();
+        let params = ProtocolParameters::mainnet_defaults();
+        let key_deposit = params.key_deposit.0; // 2_000_000
+
+        // With stake registration: inputs = outputs + fee + deposit
+        let mut tx = make_simple_tx(input, 10_000_000 - 200_000 - key_deposit, 200_000);
+        tx.body.certificates.push(Certificate::StakeRegistration(
+            torsten_primitives::credentials::Credential::VerificationKey(
+                torsten_primitives::hash::Hash28::from_bytes([5u8; 28]),
+            ),
+        ));
+
+        let result = validate_transaction(&tx, &utxo_set, &params, 100, 300);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_stake_deregistration_refund() {
+        let (utxo_set, input) = make_simple_utxo_set();
+        let params = ProtocolParameters::mainnet_defaults();
+        let key_deposit = params.key_deposit.0; // 2_000_000
+
+        // With stake deregistration: inputs + refund = outputs + fee
+        let mut tx = make_simple_tx(input, 10_000_000 - 200_000 + key_deposit, 200_000);
+        tx.body.certificates.push(Certificate::StakeDeregistration(
+            torsten_primitives::credentials::Credential::VerificationKey(
+                torsten_primitives::hash::Hash28::from_bytes([5u8; 28]),
+            ),
+        ));
+
+        let result = validate_transaction(&tx, &utxo_set, &params, 100, 300);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_deposit_not_accounted_fails() {
+        let (utxo_set, input) = make_simple_utxo_set();
+        let params = ProtocolParameters::mainnet_defaults();
+
+        // Stake registration without accounting for deposit should fail
+        let mut tx = make_simple_tx(input, 9_800_000, 200_000);
+        tx.body.certificates.push(Certificate::StakeRegistration(
+            torsten_primitives::credentials::Credential::VerificationKey(
+                torsten_primitives::hash::Hash28::from_bytes([5u8; 28]),
+            ),
+        ));
+
+        let result = validate_transaction(&tx, &utxo_set, &params, 100, 300);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_deposits_and_refunds_calculation() {
+        let params = ProtocolParameters::mainnet_defaults();
+        let cred = torsten_primitives::credentials::Credential::VerificationKey(
+            torsten_primitives::hash::Hash28::from_bytes([5u8; 28]),
+        );
+
+        // Two registrations, one deregistration
+        let certs = vec![
+            Certificate::StakeRegistration(cred.clone()),
+            Certificate::StakeRegistration(cred.clone()),
+            Certificate::StakeDeregistration(cred),
+        ];
+
+        let (deposits, refunds) = calculate_deposits_and_refunds(&certs, &params);
+        assert_eq!(deposits, params.key_deposit.0 * 2);
+        assert_eq!(refunds, params.key_deposit.0);
     }
 }
