@@ -445,6 +445,111 @@ impl Node {
             }
         });
 
+        // Start ledger-based peer discovery task
+        {
+            let ledger = self.ledger_state.clone();
+            let pm = peer_manager.clone();
+            let topology = self.topology.clone();
+            let shutdown = shutdown_rx.clone();
+            tokio::spawn(async move {
+                // Check every 5 minutes for new ledger peers
+                let mut interval = tokio::time::interval(std::time::Duration::from_secs(300));
+                interval.tick().await; // skip first immediate tick
+                let mut shutdown = shutdown;
+                loop {
+                    tokio::select! {
+                        _ = interval.tick() => {}
+                        _ = shutdown.changed() => { break; }
+                    }
+
+                    let current_slot = {
+                        let ls = ledger.read().await;
+                        ls.tip.point.slot().map(|s| s.0).unwrap_or(0)
+                    };
+
+                    if !topology.ledger_peers_enabled(current_slot) {
+                        continue;
+                    }
+
+                    // Extract relay addresses from registered pools
+                    let relays: Vec<(String, u16)> = {
+                        let ls = ledger.read().await;
+                        let mut relays = Vec::new();
+                        for pool_reg in ls.pool_params.values() {
+                            for relay in &pool_reg.relays {
+                                match relay {
+                                    torsten_primitives::transaction::Relay::SingleHostAddr {
+                                        port,
+                                        ipv4,
+                                        ..
+                                    } => {
+                                        if let (Some(port), Some(ipv4)) = (port, ipv4) {
+                                            let addr = format!(
+                                                "{}.{}.{}.{}",
+                                                ipv4[0], ipv4[1], ipv4[2], ipv4[3]
+                                            );
+                                            relays.push((addr, *port));
+                                        }
+                                    }
+                                    torsten_primitives::transaction::Relay::SingleHostName {
+                                        port,
+                                        dns_name,
+                                    } => {
+                                        if let Some(port) = port {
+                                            relays.push((dns_name.clone(), *port));
+                                        }
+                                    }
+                                    torsten_primitives::transaction::Relay::MultiHostName {
+                                        dns_name,
+                                    } => {
+                                        relays.push((dns_name.clone(), 3001));
+                                    }
+                                }
+                            }
+                        }
+                        relays
+                    };
+
+                    if relays.is_empty() {
+                        continue;
+                    }
+
+                    // Sample a subset of ledger peers
+                    // (don't try to resolve all thousands of pool relays)
+                    let sample_size = 20.min(relays.len());
+                    let step = relays.len() / sample_size;
+                    let offset = (current_slot as usize) % step.max(1);
+                    let sample: Vec<_> = relays
+                        .iter()
+                        .skip(offset)
+                        .step_by(step.max(1))
+                        .take(sample_size)
+                        .collect();
+
+                    let mut added = 0u32;
+                    for (host, port) in sample {
+                        if let Ok(mut addrs) =
+                            tokio::net::lookup_host(format!("{host}:{port}")).await
+                        {
+                            if let Some(socket_addr) = addrs.next() {
+                                let mut pm_w = pm.write().await;
+                                pm_w.add_ledger_peer(socket_addr);
+                                added += 1;
+                            }
+                        }
+                    }
+                    if added > 0 {
+                        let pm_r = pm.read().await;
+                        info!(
+                            "Ledger peer discovery: added {added} peers from {} pool relays (slot {current_slot}), {}",
+                            relays.len(),
+                            pm_r.stats()
+                        );
+                    }
+                }
+            });
+        }
+
         let network_magic = self.network_magic;
 
         // Main connection loop — connect to peers and sync

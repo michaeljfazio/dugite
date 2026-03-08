@@ -268,6 +268,7 @@ Zero-warning policy enforced — all code must compile with `cargo clippy -- -D 
 - [x] N2N TxSubmission2 mempool integration (serve tx IDs and bodies to peers)
 - [x] Inbound connection rate limiting (per-IP token bucket DoS protection)
 - [x] SIGHUP topology reload
+- [x] Ledger-based peer discovery (SPO relay addresses from pool registrations, periodic sampling)
 
 #### Network (N2C — Node-to-Client)
 - [x] Unix domain socket server
@@ -348,7 +349,6 @@ Zero-warning policy enforced — all code must compile with `cargo clippy -- -D 
 ### Not Yet Implemented
 
 #### Relay Node Compliance
-- [ ] Ledger-based peer discovery (transition from bootstrap to ledger peers)
 - [ ] Connection backpressure and flow control (ack/req counts)
 - [ ] Concurrent ChainSync from multiple peers
 - [ ] Adaptive peer selection (latency-based ranking, reputation)

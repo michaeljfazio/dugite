@@ -271,7 +271,6 @@ impl Topology {
     }
 
     /// Whether ledger-based peer discovery is enabled at the given slot
-    #[allow(dead_code)]
     pub fn ledger_peers_enabled(&self, current_slot: u64) -> bool {
         match self.use_ledger_after_slot {
             Some(slot) if slot >= 0 => current_slot >= slot as u64,
@@ -280,7 +279,6 @@ impl Topology {
     }
 
     /// Whether bootstrap peers are configured
-    #[allow(dead_code)]
     pub fn has_bootstrap_peers(&self) -> bool {
         self.bootstrap_peers
             .as_ref()

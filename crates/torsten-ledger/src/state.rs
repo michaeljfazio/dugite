@@ -10,7 +10,7 @@ use torsten_primitives::hash::{Hash28, Hash32};
 use torsten_primitives::protocol_params::ProtocolParameters;
 use torsten_primitives::time::{BlockNo, EpochNo, SlotNo};
 use torsten_primitives::transaction::{
-    Anchor, Certificate, DRep, GovAction, GovActionId, ProposalProcedure, Vote, Voter,
+    Anchor, Certificate, DRep, GovAction, GovActionId, ProposalProcedure, Relay, Vote, Voter,
     VotingProcedure,
 };
 use torsten_primitives::value::Lovelace;
@@ -155,6 +155,9 @@ pub struct PoolRegistration {
     pub cost: Lovelace,
     pub margin_numerator: u64,
     pub margin_denominator: u64,
+    /// Relay endpoints declared by the pool operator
+    #[serde(default)]
+    pub relays: Vec<Relay>,
 }
 
 impl LedgerState {
@@ -396,6 +399,7 @@ impl LedgerState {
                     cost: params.cost,
                     margin_numerator: params.margin.numerator,
                     margin_denominator: params.margin.denominator,
+                    relays: params.relays.clone(),
                 };
                 debug!("Pool registered: {}", params.operator.to_hex());
                 self.pool_params.insert(params.operator, pool_reg);
@@ -2525,6 +2529,7 @@ mod tests {
                     cost: Lovelace(340_000_000),
                     margin_numerator: 1,
                     margin_denominator: 100,
+                    relays: vec![],
                 },
             );
         }

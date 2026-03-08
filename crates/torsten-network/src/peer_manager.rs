@@ -172,6 +172,20 @@ impl PeerManager {
         self.peers.insert(addr, info);
     }
 
+    /// Add a peer discovered from the ledger (SPO relay registrations)
+    pub fn add_ledger_peer(&mut self, addr: SocketAddr) {
+        if self.peers.contains_key(&addr) {
+            return; // Already known
+        }
+        if self.peers.len() >= self.config.target_known_peers {
+            return; // At capacity
+        }
+        let info = PeerInfo::new(addr, PeerSource::Ledger);
+        self.cold_peers.insert(addr);
+        self.peers.insert(addr, info);
+        debug!(%addr, "Discovered peer from ledger");
+    }
+
     /// Add a peer discovered via peer sharing
     pub fn add_shared_peer(&mut self, addr: SocketAddr) {
         if self.peers.contains_key(&addr) {
@@ -545,6 +559,40 @@ mod tests {
         pm.add_config_peer(test_addr(3001), false, false);
         pm.add_config_peer(test_addr(3002), false, false);
         pm.add_shared_peer(test_addr(3003)); // At capacity
+        assert_eq!(pm.peers.len(), 2);
+    }
+
+    #[test]
+    fn test_add_ledger_peer() {
+        let mut pm = PeerManager::new(PeerManagerConfig::default());
+        let addr = test_addr(3001);
+        pm.add_ledger_peer(addr);
+
+        assert_eq!(pm.peers.len(), 1);
+        assert!(pm.cold_peers.contains(&addr));
+        assert_eq!(pm.peers[&addr].source, PeerSource::Ledger);
+    }
+
+    #[test]
+    fn test_add_ledger_peer_dedup() {
+        let mut pm = PeerManager::new(PeerManagerConfig::default());
+        let addr = test_addr(3001);
+        pm.add_config_peer(addr, false, false);
+        pm.add_ledger_peer(addr); // Already known from config
+        assert_eq!(pm.peers.len(), 1);
+        assert_eq!(pm.peers[&addr].source, PeerSource::Config); // Source unchanged
+    }
+
+    #[test]
+    fn test_add_ledger_peer_capacity() {
+        let config = PeerManagerConfig {
+            target_known_peers: 2,
+            ..PeerManagerConfig::default()
+        };
+        let mut pm = PeerManager::new(config);
+        pm.add_ledger_peer(test_addr(3001));
+        pm.add_ledger_peer(test_addr(3002));
+        pm.add_ledger_peer(test_addr(3003)); // At capacity
         assert_eq!(pm.peers.len(), 2);
     }
 }
