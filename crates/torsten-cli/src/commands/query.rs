@@ -14,6 +14,8 @@ enum QuerySubcommand {
     Tip {
         #[arg(long, default_value = "node.sock")]
         socket_path: PathBuf,
+        #[arg(long)]
+        testnet_magic: Option<u64>,
     },
     /// Query UTxOs at an address
     Utxo {
@@ -21,6 +23,8 @@ enum QuerySubcommand {
         address: String,
         #[arg(long, default_value = "node.sock")]
         socket_path: PathBuf,
+        #[arg(long)]
+        testnet_magic: Option<u64>,
     },
     /// Query protocol parameters
     ProtocolParameters {
@@ -28,11 +32,15 @@ enum QuerySubcommand {
         socket_path: PathBuf,
         #[arg(long)]
         out_file: Option<PathBuf>,
+        #[arg(long)]
+        testnet_magic: Option<u64>,
     },
     /// Query stake distribution
     StakeDistribution {
         #[arg(long, default_value = "node.sock")]
         socket_path: PathBuf,
+        #[arg(long)]
+        testnet_magic: Option<u64>,
     },
     /// Query stake address info
     StakeAddressInfo {
@@ -40,11 +48,15 @@ enum QuerySubcommand {
         address: String,
         #[arg(long, default_value = "node.sock")]
         socket_path: PathBuf,
+        #[arg(long)]
+        testnet_magic: Option<u64>,
     },
     /// Query governance state (Conway era)
     GovState {
         #[arg(long, default_value = "node.sock")]
         socket_path: PathBuf,
+        #[arg(long)]
+        testnet_magic: Option<u64>,
     },
     /// Query DRep state (Conway era)
     DrepState {
@@ -52,11 +64,15 @@ enum QuerySubcommand {
         drep_key_hash: Option<String>,
         #[arg(long, default_value = "node.sock")]
         socket_path: PathBuf,
+        #[arg(long)]
+        testnet_magic: Option<u64>,
     },
     /// Query committee state (Conway era)
     CommitteeState {
         #[arg(long, default_value = "node.sock")]
         socket_path: PathBuf,
+        #[arg(long)]
+        testnet_magic: Option<u64>,
     },
     /// Query the transaction mempool
     TxMempool {
@@ -68,11 +84,15 @@ enum QuerySubcommand {
         /// Transaction ID (for has-tx)
         #[arg(long)]
         tx_id: Option<String>,
+        #[arg(long)]
+        testnet_magic: Option<u64>,
     },
     /// Query registered stake pools
     StakePools {
         #[arg(long, default_value = "node.sock")]
         socket_path: PathBuf,
+        #[arg(long)]
+        testnet_magic: Option<u64>,
     },
 }
 
@@ -91,7 +111,10 @@ fn era_name(era: u32) -> &'static str {
 }
 
 /// Connect to the node, perform handshake, and acquire state
-async fn connect_and_acquire(socket_path: &std::path::Path) -> Result<torsten_network::N2CClient> {
+async fn connect_and_acquire(
+    socket_path: &std::path::Path,
+    testnet_magic: Option<u64>,
+) -> Result<torsten_network::N2CClient> {
     let mut client = torsten_network::N2CClient::connect(socket_path)
         .await
         .map_err(|e| {
@@ -101,8 +124,11 @@ async fn connect_and_acquire(socket_path: &std::path::Path) -> Result<torsten_ne
             )
         })?;
 
+    // Use testnet magic if provided, otherwise use mainnet magic
+    let magic = testnet_magic.unwrap_or(764824073);
+
     client
-        .handshake(764824073)
+        .handshake(magic)
         .await
         .map_err(|e| anyhow::anyhow!("Handshake failed: {e}"))?;
 
@@ -128,8 +154,11 @@ impl QueryCmd {
 
     async fn run_async(self) -> Result<()> {
         match self.command {
-            QuerySubcommand::Tip { socket_path } => {
-                let mut client = connect_and_acquire(&socket_path).await?;
+            QuerySubcommand::Tip {
+                socket_path,
+                testnet_magic,
+            } => {
+                let mut client = connect_and_acquire(&socket_path, testnet_magic).await?;
 
                 let tip = client
                     .query_tip()
@@ -138,31 +167,53 @@ impl QueryCmd {
 
                 let epoch = client.query_epoch().await.unwrap_or(0);
                 let era = client.query_era().await.unwrap_or(6);
+                let block_no = client.query_block_no().await.unwrap_or(tip.block_no);
 
                 release_and_done(&mut client).await;
 
                 let hash_hex = hex::encode(&tip.hash);
                 let era_str = era_name(era);
 
+                // Estimate sync progress based on slot vs current time
+                // Shelley mainnet started at Unix time 1596059091 (slot 4492800)
+                // Preview/testnet may differ, but this gives a reasonable estimate
+                let now_secs = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs();
+                let shelley_start_time = if testnet_magic.is_some() {
+                    1_666_656_000u64 // Preview genesis
+                } else {
+                    1_596_059_091u64 // Mainnet Shelley start
+                };
+                let elapsed_secs = now_secs.saturating_sub(shelley_start_time);
+                let expected_tip_slot = elapsed_secs; // 1 slot = 1 second
+                let sync_progress = if expected_tip_slot > 0 {
+                    (tip.slot as f64 / expected_tip_slot as f64 * 100.0).min(100.0)
+                } else {
+                    100.0
+                };
+
                 println!("{{");
                 println!("    \"slot\": {},", tip.slot);
                 println!("    \"hash\": \"{hash_hex}\",");
-                println!("    \"block\": {},", tip.block_no);
+                println!("    \"block\": {block_no},");
                 println!("    \"epoch\": {epoch},");
                 println!("    \"era\": \"{era_str}\",");
-                println!("    \"syncProgress\": \"100.00\"");
+                println!("    \"syncProgress\": \"{sync_progress:.2}\"");
                 println!("}}");
                 Ok(())
             }
             QuerySubcommand::Utxo {
                 address,
                 socket_path,
+                testnet_magic,
             } => {
                 // Decode bech32 address to raw bytes
                 let (_, addr_bytes) = bech32::decode(&address)
                     .map_err(|e| anyhow::anyhow!("Invalid bech32 address: {e}"))?;
 
-                let mut client = connect_and_acquire(&socket_path).await?;
+                let mut client = connect_and_acquire(&socket_path, testnet_magic).await?;
 
                 let raw = client
                     .query_utxo_by_address(&addr_bytes)
@@ -220,8 +271,9 @@ impl QueryCmd {
             QuerySubcommand::ProtocolParameters {
                 socket_path,
                 out_file,
+                testnet_magic,
             } => {
-                let mut client = connect_and_acquire(&socket_path).await?;
+                let mut client = connect_and_acquire(&socket_path, testnet_magic).await?;
 
                 let json = match client.query_protocol_params().await {
                     Ok(params_json) if !params_json.is_empty() => params_json,
@@ -243,8 +295,11 @@ impl QueryCmd {
                 }
                 Ok(())
             }
-            QuerySubcommand::StakeDistribution { socket_path } => {
-                let mut client = connect_and_acquire(&socket_path).await?;
+            QuerySubcommand::StakeDistribution {
+                socket_path,
+                testnet_magic,
+            } => {
+                let mut client = connect_and_acquire(&socket_path, testnet_magic).await?;
 
                 let raw = client
                     .query_stake_distribution()
@@ -285,6 +340,7 @@ impl QueryCmd {
             QuerySubcommand::StakeAddressInfo {
                 address,
                 socket_path,
+                testnet_magic,
             } => {
                 // Decode bech32 address to get credential hash
                 let (_, addr_bytes) = bech32::decode(&address)
@@ -297,7 +353,7 @@ impl QueryCmd {
                     hex::encode(&addr_bytes)
                 };
 
-                let mut client = connect_and_acquire(&socket_path).await?;
+                let mut client = connect_and_acquire(&socket_path, testnet_magic).await?;
 
                 let raw = client
                     .query_stake_address_info()
@@ -361,8 +417,11 @@ impl QueryCmd {
 
                 Ok(())
             }
-            QuerySubcommand::GovState { socket_path } => {
-                let mut client = connect_and_acquire(&socket_path).await?;
+            QuerySubcommand::GovState {
+                socket_path,
+                testnet_magic,
+            } => {
+                let mut client = connect_and_acquire(&socket_path, testnet_magic).await?;
 
                 let raw = client
                     .query_gov_state()
@@ -457,8 +516,9 @@ impl QueryCmd {
             QuerySubcommand::DrepState {
                 drep_key_hash,
                 socket_path,
+                testnet_magic,
             } => {
-                let mut client = connect_and_acquire(&socket_path).await?;
+                let mut client = connect_and_acquire(&socket_path, testnet_magic).await?;
 
                 let raw = client
                     .query_drep_state()
@@ -533,8 +593,11 @@ impl QueryCmd {
 
                 Ok(())
             }
-            QuerySubcommand::CommitteeState { socket_path } => {
-                let mut client = connect_and_acquire(&socket_path).await?;
+            QuerySubcommand::CommitteeState {
+                socket_path,
+                testnet_magic,
+            } => {
+                let mut client = connect_and_acquire(&socket_path, testnet_magic).await?;
 
                 let raw = client
                     .query_committee_state()
@@ -617,6 +680,7 @@ impl QueryCmd {
                 socket_path: _,
                 subcmd,
                 tx_id,
+                testnet_magic: _,
             } => {
                 // LocalTxMonitor protocol (mini-protocol 10) is used for mempool queries
                 // This requires a separate protocol handler from LocalStateQuery
@@ -639,8 +703,11 @@ impl QueryCmd {
                 }
                 Ok(())
             }
-            QuerySubcommand::StakePools { socket_path } => {
-                let mut client = connect_and_acquire(&socket_path).await?;
+            QuerySubcommand::StakePools {
+                socket_path,
+                testnet_magic,
+            } => {
+                let mut client = connect_and_acquire(&socket_path, testnet_magic).await?;
 
                 let raw = client
                     .query_stake_distribution()
