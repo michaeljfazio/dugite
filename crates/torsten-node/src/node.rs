@@ -468,7 +468,18 @@ impl Node {
         mut shutdown_rx: watch::Receiver<bool>,
     ) -> Result<()> {
         // Find intersection with our current chain
-        let known_points = vec![self.chain_db.read().await.get_tip().point, Point::Origin];
+        // Use both ChainDB tip and ledger tip (snapshot may be ahead of ChainDB)
+        let chain_tip = self.chain_db.read().await.get_tip().point;
+        let ledger_tip = self.ledger_state.read().await.tip.point.clone();
+        let mut known_points = Vec::new();
+        // Add the more recent point first (higher slot = better intersection)
+        if ledger_tip > chain_tip {
+            known_points.push(ledger_tip);
+        }
+        if chain_tip != Point::Origin {
+            known_points.push(chain_tip);
+        }
+        known_points.push(Point::Origin);
         let (intersect, remote_tip) = client.find_intersect(known_points).await?;
 
         match &intersect {
