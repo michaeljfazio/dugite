@@ -263,6 +263,11 @@ Zero-warning policy enforced — all code must compile with `cargo clippy -- -D 
 - [x] Bidirectional diffusion mode (InitiatorAndResponder)
 - [x] DNS multi-resolution (all IPs per hostname for peer discovery)
 - [x] Batched RocksDB WriteBatch for efficient volatile→immutable flush
+- [x] PeerSharing mini-protocol (gossip-based peer discovery)
+- [x] N2N ChainSync server (sequential block serving for inbound peers)
+- [x] N2N TxSubmission2 mempool integration (serve tx IDs and bodies to peers)
+- [x] Inbound connection rate limiting (per-IP token bucket DoS protection)
+- [x] SIGHUP topology reload
 
 #### Network (N2C — Node-to-Client)
 - [x] Unix domain socket server
@@ -343,16 +348,10 @@ Zero-warning policy enforced — all code must compile with `cargo clippy -- -D 
 ### Not Yet Implemented
 
 #### Relay Node Compliance
-- [x] PeerSharing mini-protocol (gossip-based peer discovery)
 - [ ] Ledger-based peer discovery (transition from bootstrap to ledger peers)
-- [x] N2N ChainSync server (sequential block serving for inbound peers)
-- [x] N2N TxSubmission2 mempool integration (serve tx IDs and bodies to peers)
-- [ ] KeepAlive heartbeat scheduling on active connections
 - [ ] Connection backpressure and flow control (ack/req counts)
 - [ ] Concurrent ChainSync from multiple peers
 - [ ] Adaptive peer selection (latency-based ranking, reputation)
-- [x] Inbound connection rate limiting (per-IP token bucket DoS protection)
-- [x] SIGHUP topology reload
 
 #### Block Producer
 - [ ] KES key management (generation, rotation, period tracking)
@@ -367,9 +366,10 @@ Zero-warning policy enforced — all code must compile with `cargo clippy -- -D 
 - [ ] Full KES signature verification (requires KES library integration)
 
 #### Plutus Smart Contracts
-- [ ] CEK machine for Plutus V1/V2/V3 script execution
-- [ ] Plutus cost model evaluation
-- [ ] Script context construction
+- [x] Plutus V1/V2/V3 script evaluation via uplc CEK machine
+- [x] Phase-2 validation (eval_phase_two_raw)
+- [ ] Plutus evaluation in LocalTxSubmission (currently trusts block producer's is_valid flag)
+- [ ] Script context construction for CLI transaction building
 
 #### Performance
 - [ ] Mithril snapshot import for fast initial sync
