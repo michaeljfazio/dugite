@@ -363,6 +363,12 @@ fn calculate_deposits_and_refunds(
             Certificate::RegStakeDeleg { deposit, .. } => {
                 deposits += deposit.0;
             }
+            Certificate::RegStakeVoteDeleg { deposit, .. } => {
+                deposits += deposit.0;
+            }
+            Certificate::VoteRegDeleg { deposit, .. } => {
+                deposits += deposit.0;
+            }
             _ => {}
         }
     }

@@ -145,6 +145,19 @@ pub enum Certificate {
         cold_credential: Credential,
         anchor: Option<Anchor>,
     },
+    /// Combined: register stake + delegate to pool + delegate vote (CIP-1694)
+    RegStakeVoteDeleg {
+        credential: Credential,
+        pool_hash: Hash28,
+        drep: DRep,
+        deposit: Lovelace,
+    },
+    /// Combined: register stake + delegate vote (CIP-1694)
+    VoteRegDeleg {
+        credential: Credential,
+        drep: DRep,
+        deposit: Lovelace,
+    },
 }
 
 /// Delegated Representative

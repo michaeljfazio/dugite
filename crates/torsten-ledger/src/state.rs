@@ -487,6 +487,43 @@ impl LedgerState {
                 self.governance.committee_hot_keys.remove(&cold_key);
                 debug!("Committee member resigned: {}", cold_key.to_hex());
             }
+            Certificate::RegStakeVoteDeleg {
+                credential,
+                pool_hash,
+                drep,
+                ..
+            } => {
+                let key = credential_to_hash(credential);
+                // Register stake credential
+                self.stake_distribution
+                    .stake_map
+                    .entry(key)
+                    .or_insert(Lovelace(0));
+                self.reward_accounts.entry(key).or_insert(Lovelace(0));
+                // Stake delegation
+                self.delegations.insert(key, *pool_hash);
+                // Vote delegation
+                self.governance.vote_delegations.insert(key, drep.clone());
+                debug!(
+                    "Reg+stake+vote delegated: pool={}, drep={:?}",
+                    pool_hash.to_hex(),
+                    drep
+                );
+            }
+            Certificate::VoteRegDeleg {
+                credential, drep, ..
+            } => {
+                let key = credential_to_hash(credential);
+                // Register stake credential
+                self.stake_distribution
+                    .stake_map
+                    .entry(key)
+                    .or_insert(Lovelace(0));
+                self.reward_accounts.entry(key).or_insert(Lovelace(0));
+                // Vote delegation
+                self.governance.vote_delegations.insert(key, drep.clone());
+                debug!("Reg+vote delegated to {:?}", drep);
+            }
         }
     }
 
