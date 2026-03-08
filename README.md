@@ -358,11 +358,11 @@ Zero-warning policy enforced — all code must compile with `cargo clippy -- -D 
 
 #### Block Producer
 - [ ] KES key management (generation, rotation, period tracking)
-- [ ] VRF key management and slot leader check
+- [x] VRF key generation and proof signing (ECVRF-ED25519-SHA512-Elligator2)
 - [ ] Block forging (create blocks from mempool transactions)
-- [ ] Operational certificate generation and rotation
+- [x] Operational certificate generation and rotation
 - [ ] Block announcement (propagate forged blocks to peers)
-- [ ] Leader schedule calculation
+- [x] Leader schedule calculation
 
 #### Cryptographic Verification
 - [x] Full VRF proof verification (ECVRF-ED25519-SHA512-Elligator2 via vrf_dalek)
