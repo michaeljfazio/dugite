@@ -264,30 +264,35 @@ fn handle_tx_submission(
 
             // Extract the raw transaction bytes from the submission
             // The payload after tag 0 is [era_id, tx_cbor]
-            let tx_cbor = extract_submitted_tx(&mut decoder);
+            let tx_data = extract_submitted_tx(&mut decoder);
 
-            match tx_cbor {
-                Some(tx_bytes) => {
-                    // Compute transaction hash from the CBOR bytes
-                    let tx_hash_bytes = torsten_primitives::hash::blake2b_256(&tx_bytes);
-                    let tx_hash = Hash32::from_bytes(*tx_hash_bytes.as_bytes());
+            match tx_data {
+                Some((era_id, tx_bytes)) => {
                     let tx_size = tx_bytes.len();
 
-                    // Create a minimal transaction for mempool storage
-                    let tx = torsten_primitives::transaction::Transaction::empty_with_hash(tx_hash);
+                    // Parse the full transaction
+                    match torsten_serialization::decode_transaction(era_id, &tx_bytes) {
+                        Ok(tx) => {
+                            let tx_hash = tx.hash;
 
-                    match mempool.add_tx(tx_hash, tx, tx_size) {
-                        Ok(torsten_mempool::MempoolAddResult::Added) => {
-                            info!("Transaction accepted into mempool: {tx_hash}");
-                            encode_tx_accept()
-                        }
-                        Ok(torsten_mempool::MempoolAddResult::AlreadyExists) => {
-                            debug!("Transaction already in mempool: {tx_hash}");
-                            encode_tx_accept()
+                            match mempool.add_tx(tx_hash, tx, tx_size) {
+                                Ok(torsten_mempool::MempoolAddResult::Added) => {
+                                    info!("Transaction accepted into mempool: {tx_hash}");
+                                    encode_tx_accept()
+                                }
+                                Ok(torsten_mempool::MempoolAddResult::AlreadyExists) => {
+                                    debug!("Transaction already in mempool: {tx_hash}");
+                                    encode_tx_accept()
+                                }
+                                Err(e) => {
+                                    warn!("Transaction rejected: {e}");
+                                    encode_tx_reject(&e.to_string())
+                                }
+                            }
                         }
                         Err(e) => {
-                            warn!("Transaction rejected: {e}");
-                            encode_tx_reject(&e.to_string())
+                            warn!("Failed to decode transaction: {e}");
+                            encode_tx_reject(&format!("Failed to decode transaction: {e}"))
                         }
                     }
                 }
@@ -633,14 +638,14 @@ fn encode_tip(
 }
 
 /// Extract transaction CBOR bytes from a MsgSubmitTx payload
-fn extract_submitted_tx(decoder: &mut minicbor::Decoder) -> Option<Vec<u8>> {
+fn extract_submitted_tx(decoder: &mut minicbor::Decoder) -> Option<(u16, Vec<u8>)> {
     // The structure after the tag is: [era_id, tx_bytes]
     // era_id is a u16, tx_bytes is CBOR bytes
     let _ = decoder.array().ok()?;
-    let _era_id = decoder.u32().ok()?;
+    let era_id = decoder.u32().ok()? as u16;
     // The tx is encoded as a CBOR byte string containing the serialized transaction
     let tx_bytes = decoder.bytes().ok()?;
-    Some(tx_bytes.to_vec())
+    Some((era_id, tx_bytes.to_vec()))
 }
 
 /// Encode MsgAcceptTx response: [1]
@@ -985,19 +990,50 @@ mod tests {
         assert!(!cbor.is_empty());
     }
 
-    #[test]
-    fn test_handle_tx_submission_accept() {
-        let mempool = Arc::new(Mempool::new(torsten_mempool::MempoolConfig::default()));
+    /// Build a minimal valid Conway transaction CBOR for testing.
+    ///
+    /// Conway tx is a 4-element array: [body, witness_set, is_valid, auxiliary_data]
+    /// Body is a map with: 0 -> inputs (array), 1 -> outputs (array), 2 -> fee (uint)
+    fn build_test_tx_cbor(fee: u64) -> Vec<u8> {
+        let mut buf = Vec::new();
+        let mut enc = minicbor::Encoder::new(&mut buf);
+        // Transaction: [body, witness_set, is_valid, null]
+        enc.array(4).unwrap();
+        // Body: {0: [], 1: [], 2: fee}
+        enc.map(3).unwrap();
+        enc.u32(0).unwrap();
+        enc.array(0).unwrap(); // inputs (empty)
+        enc.u32(1).unwrap();
+        enc.array(0).unwrap(); // outputs (empty)
+        enc.u32(2).unwrap();
+        enc.u64(fee).unwrap(); // fee
+                               // Witness set: {}
+        enc.map(0).unwrap();
+        // is_valid
+        enc.bool(true).unwrap();
+        // auxiliary_data
+        enc.null().unwrap();
+        buf
+    }
 
-        // Build MsgSubmitTx: [0, [6, tx_bytes]]
-        let tx_bytes = vec![0xa0u8]; // minimal CBOR (empty map)
+    /// Build MsgSubmitTx payload: [0, [era_id, tx_bytes]]
+    fn build_submit_payload(era_id: u32, tx_bytes: &[u8]) -> Vec<u8> {
         let mut payload = Vec::new();
         let mut enc = minicbor::Encoder::new(&mut payload);
         enc.array(2).unwrap();
         enc.u32(0).unwrap(); // MsgSubmitTx
         enc.array(2).unwrap();
-        enc.u32(6).unwrap(); // Conway era
-        enc.bytes(&tx_bytes).unwrap();
+        enc.u32(era_id).unwrap();
+        enc.bytes(tx_bytes).unwrap();
+        payload
+    }
+
+    #[test]
+    fn test_handle_tx_submission_accept() {
+        let mempool = Arc::new(Mempool::new(torsten_mempool::MempoolConfig::default()));
+
+        let tx_bytes = build_test_tx_cbor(200_000);
+        let payload = build_submit_payload(6, &tx_bytes); // Conway era
 
         let result = handle_tx_submission(&payload, &mempool).unwrap();
         assert!(result.is_some());
@@ -1020,14 +1056,8 @@ mod tests {
     fn test_handle_tx_submission_duplicate() {
         let mempool = Arc::new(Mempool::new(torsten_mempool::MempoolConfig::default()));
 
-        let tx_bytes = vec![0xa0u8];
-        let mut payload = Vec::new();
-        let mut enc = minicbor::Encoder::new(&mut payload);
-        enc.array(2).unwrap();
-        enc.u32(0).unwrap();
-        enc.array(2).unwrap();
-        enc.u32(6).unwrap();
-        enc.bytes(&tx_bytes).unwrap();
+        let tx_bytes = build_test_tx_cbor(200_000);
+        let payload = build_submit_payload(6, &tx_bytes);
 
         // Submit twice - both should accept
         let _ = handle_tx_submission(&payload, &mempool).unwrap();
@@ -1042,6 +1072,23 @@ mod tests {
     }
 
     #[test]
+    fn test_handle_tx_submission_invalid_cbor() {
+        let mempool = Arc::new(Mempool::new(torsten_mempool::MempoolConfig::default()));
+
+        let tx_bytes = vec![0xa0u8]; // not a valid transaction
+        let payload = build_submit_payload(6, &tx_bytes);
+
+        let result = handle_tx_submission(&payload, &mempool).unwrap();
+        assert!(result.is_some());
+
+        let segment = result.unwrap();
+        let mut decoder = minicbor::Decoder::new(&segment.payload);
+        let _ = decoder.array();
+        assert_eq!(decoder.u32().unwrap(), 2); // MsgRejectTx
+        assert_eq!(mempool.len(), 0);
+    }
+
+    #[test]
     fn test_handle_tx_submission_full_mempool() {
         let config = torsten_mempool::MempoolConfig {
             max_transactions: 1,
@@ -1050,25 +1097,13 @@ mod tests {
         let mempool = Arc::new(Mempool::new(config));
 
         // Fill the mempool
-        let tx_bytes_1 = vec![0xa0u8];
-        let mut payload1 = Vec::new();
-        let mut enc = minicbor::Encoder::new(&mut payload1);
-        enc.array(2).unwrap();
-        enc.u32(0).unwrap();
-        enc.array(2).unwrap();
-        enc.u32(6).unwrap();
-        enc.bytes(&tx_bytes_1).unwrap();
+        let tx_bytes_1 = build_test_tx_cbor(100_000);
+        let payload1 = build_submit_payload(6, &tx_bytes_1);
         let _ = handle_tx_submission(&payload1, &mempool).unwrap();
 
-        // Submit a different tx - should be rejected
-        let tx_bytes_2 = vec![0xa1u8, 0x00, 0x01]; // different CBOR
-        let mut payload2 = Vec::new();
-        let mut enc = minicbor::Encoder::new(&mut payload2);
-        enc.array(2).unwrap();
-        enc.u32(0).unwrap();
-        enc.array(2).unwrap();
-        enc.u32(6).unwrap();
-        enc.bytes(&tx_bytes_2).unwrap();
+        // Submit a different tx - should be rejected (full)
+        let tx_bytes_2 = build_test_tx_cbor(200_000);
+        let payload2 = build_submit_payload(6, &tx_bytes_2);
 
         let result = handle_tx_submission(&payload2, &mempool).unwrap();
         assert!(result.is_some());

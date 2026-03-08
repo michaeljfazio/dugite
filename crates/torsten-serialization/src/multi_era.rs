@@ -15,6 +15,34 @@ use torsten_primitives::time::{BlockNo, SlotNo};
 use torsten_primitives::transaction::*;
 use torsten_primitives::value::{AssetName, Lovelace, Value};
 
+/// Decode a transaction from raw CBOR bytes.
+///
+/// The `era_id` corresponds to the Cardano era encoding:
+/// 0 = Byron, 1 = Shelley, 2 = Allegra, 3 = Mary, 4 = Alonzo, 5 = Babbage, 6 = Conway
+pub fn decode_transaction(era_id: u16, tx_cbor: &[u8]) -> Result<Transaction, SerializationError> {
+    use pallas_traverse::Era as PallasEra;
+
+    let pallas_era = match era_id {
+        0 => PallasEra::Byron,
+        1 => PallasEra::Shelley,
+        2 => PallasEra::Allegra,
+        3 => PallasEra::Mary,
+        4 => PallasEra::Alonzo,
+        5 => PallasEra::Babbage,
+        6 => PallasEra::Conway,
+        _ => {
+            return Err(SerializationError::CborDecode(format!(
+                "unknown era id: {era_id}"
+            )))
+        }
+    };
+
+    let pallas_tx = PallasTx::decode_for_era(pallas_era, tx_cbor)
+        .map_err(|e| SerializationError::CborDecode(format!("tx decode: {e}")))?;
+
+    decode_transaction_from_pallas(&pallas_tx)
+}
+
 /// Decode a multi-era block from raw CBOR bytes into a torsten Block.
 pub fn decode_block(cbor: &[u8]) -> Result<Block, SerializationError> {
     let pallas_block = PallasBlock::decode(cbor)
