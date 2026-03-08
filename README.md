@@ -332,6 +332,8 @@ Zero-warning policy enforced — all code must compile with `cargo clippy -- -D 
 - [x] DRep state query
 - [x] Committee state query
 - [x] Governance state query
+- [x] Stake snapshot query (mark/set/go)
+- [x] Pool parameters query
 
 #### CLI (cardano-cli compatible)
 - [x] Key generation (payment, stake, DRep)
@@ -357,7 +359,7 @@ Zero-warning policy enforced — all code must compile with `cargo clippy -- -D 
 #### Relay Node Compliance
 - [x] TxSubmission2 flow control (ack/req counts, inflight tracking per peer)
 - [ ] Concurrent ChainSync from multiple peers
-- [ ] Adaptive peer selection (latency-based ranking, reputation)
+- [x] Adaptive peer selection (latency-based ranking, reputation scoring, EWMA metrics)
 
 #### Block Producer
 - [ ] KES key management (generation, rotation, period tracking)
@@ -365,7 +367,7 @@ Zero-warning policy enforced — all code must compile with `cargo clippy -- -D 
 - [x] Block forging (create blocks from mempool transactions, VRF proof, header hash computation)
 - [x] Operational certificate generation and rotation
 - [x] Block producer CLI args (--shelley-kes-key, --shelley-vrf-key, --shelley-operational-certificate)
-- [ ] Block announcement (propagate forged blocks to peers)
+- [x] Block announcement (propagate forged blocks to peers via broadcast channel)
 - [x] Leader schedule calculation
 
 #### Cryptographic Verification
