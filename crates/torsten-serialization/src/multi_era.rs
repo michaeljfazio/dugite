@@ -187,8 +187,13 @@ fn decode_transaction_from_pallas(tx: &PallasTx) -> Result<Transaction, Serializ
         reference_inputs,
         voting_procedures: convert_voting_procedures(tx),
         proposal_procedures: convert_proposal_procedures(tx),
-        treasury_value: None,
-        donation: None,
+        treasury_value: tx
+            .as_conway()
+            .and_then(|ct| ct.transaction_body.treasury_value)
+            .map(Lovelace),
+        donation: tx
+            .as_conway()
+            .and_then(|ct| ct.transaction_body.donation.map(|d| Lovelace(u64::from(d)))),
     };
 
     let vkey_witnesses = tx
