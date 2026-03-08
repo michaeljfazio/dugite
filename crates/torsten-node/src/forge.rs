@@ -18,6 +18,8 @@ pub struct BlockProducerCredentials {
     pub cold_skey: torsten_crypto::keys::PaymentSigningKey,
     /// Cold verification key
     pub cold_vkey: Vec<u8>,
+    /// KES secret key bytes (Sum6Kes format, 612 bytes)
+    pub kes_skey: Vec<u8>,
     /// KES verification key (hot key from opcert)
     pub kes_vkey: Vec<u8>,
     /// Operational certificate sequence number
@@ -55,11 +57,15 @@ impl BlockProducerCredentials {
         let vrf_keypair = torsten_crypto::vrf::generate_vrf_keypair_from_secret(&vrf_skey);
         let vrf_vkey = vrf_keypair.public_key;
 
-        // Load KES signing key (we store it but don't use it for actual KES signing yet)
+        // Load KES signing key
         let kes_content = std::fs::read_to_string(kes_skey_path)
             .with_context(|| format!("Failed to read KES skey: {}", kes_skey_path.display()))?;
         let kes_env: serde_json::Value = serde_json::from_str(&kes_content)?;
-        let _kes_type = kes_env["type"].as_str().unwrap_or("");
+        let kes_cbor_hex = kes_env["cborHex"]
+            .as_str()
+            .ok_or_else(|| anyhow::anyhow!("Missing cborHex in KES skey file"))?;
+        let kes_cbor = hex::decode(kes_cbor_hex)?;
+        let kes_key_bytes = unwrap_cbor(&kes_cbor).to_vec();
 
         // Load operational certificate
         let opcert_content = std::fs::read_to_string(opcert_path)
@@ -96,6 +102,7 @@ impl BlockProducerCredentials {
             vrf_vkey,
             cold_skey: torsten_crypto::keys::PaymentSigningKey::generate(), // placeholder
             cold_vkey: vec![],
+            kes_skey: kes_key_bytes,
             kes_vkey: kes_vkey_bytes,
             opcert_sequence,
             opcert_kes_period,
@@ -169,7 +176,7 @@ impl Default for BlockProducerConfig {
 /// Forge a new block from mempool transactions.
 ///
 /// Returns the constructed block and its CBOR encoding.
-/// The KES signature field is populated with a placeholder (real KES signing is not yet implemented).
+/// The block header is signed with the KES secret key at the appropriate period.
 pub fn forge_block(
     creds: &BlockProducerCredentials,
     config: &BlockProducerConfig,
@@ -217,10 +224,30 @@ pub fn forge_block(
     let header_body_cbor = torsten_serialization::encode_block_header_body(&header);
     let header_hash = blake2b_256(&header_body_cbor);
 
-    // KES signature placeholder (real KES signing not yet implemented)
-    // A real implementation would use: kes_sign(kes_skey, header_body_cbor)
-    let kes_signature = vec![0u8; 448];
-    warn!("Block forged with placeholder KES signature (KES signing not yet implemented)");
+    // KES signing: evolve key to the correct period and sign the header body
+    let current_slot_kes_period = torsten_crypto::kes::kes_period_for_slot(slot.0);
+    let kes_period_offset = current_slot_kes_period.saturating_sub(creds.opcert_kes_period);
+
+    let kes_signature = if !creds.kes_skey.is_empty() {
+        let evolved_kes =
+            torsten_crypto::kes::kes_evolve_to_period(&creds.kes_skey, kes_period_offset as u32)
+                .map_err(|e| anyhow::anyhow!("KES key evolution failed: {e}"))?;
+
+        let (sig_bytes, period) =
+            torsten_crypto::kes::kes_sign_bytes(&evolved_kes, &header_body_cbor)
+                .map_err(|e| anyhow::anyhow!("KES signing failed: {e}"))?;
+
+        debug!(
+            kes_period = period,
+            slot_kes_period = current_slot_kes_period,
+            opcert_kes_period = creds.opcert_kes_period,
+            "KES signature produced"
+        );
+        sig_bytes
+    } else {
+        warn!("No KES secret key loaded, using placeholder KES signature");
+        vec![0u8; 448]
+    };
 
     // Build the final block with correct header hash
     let mut block = Block {
@@ -295,12 +322,17 @@ mod tests {
         let cold_sk = torsten_crypto::keys::PaymentSigningKey::generate();
         let cold_vk = cold_sk.verification_key();
 
+        // Generate a KES key pair for testing
+        let seed = [42u8; 32];
+        let (kes_sk, kes_pk) = torsten_crypto::kes::kes_keygen(&seed).unwrap();
+
         BlockProducerCredentials {
             vrf_skey: vrf_kp.secret_key,
             vrf_vkey: vrf_kp.public_key,
             cold_skey: cold_sk,
             cold_vkey: cold_vk.to_bytes().to_vec(),
-            kes_vkey: vec![0u8; 32],
+            kes_skey: kes_sk,
+            kes_vkey: kes_pk.to_vec(),
             opcert_sequence: 0,
             opcert_kes_period: 0,
             opcert_sigma: vec![0u8; 64],

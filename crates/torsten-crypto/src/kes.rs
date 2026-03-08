@@ -83,6 +83,30 @@ pub fn kes_sign_message(sk_bytes: &[u8], message: &[u8]) -> Result<(Sum6KesSig, 
     Ok((sig, period))
 }
 
+/// Sign a message using a KES secret key and return the signature as raw bytes.
+///
+/// Returns (signature_bytes, period). The signature is 448 bytes (Sum6KesSig).
+pub fn kes_sign_bytes(sk_bytes: &[u8], message: &[u8]) -> Result<(Vec<u8>, u32), KesError> {
+    let (sig, period) = kes_sign_message(sk_bytes, message)?;
+    Ok((sig.to_bytes().to_vec(), period))
+}
+
+/// Evolve a KES secret key to the target period.
+///
+/// Returns the evolved key bytes. If already at or past the target period, returns as-is.
+pub fn kes_evolve_to_period(sk_bytes: &[u8], target_period: u32) -> Result<Vec<u8>, KesError> {
+    let current = kes_get_period(sk_bytes)?;
+    if current >= target_period {
+        return Ok(sk_bytes.to_vec());
+    }
+    let mut current_sk = sk_bytes.to_vec();
+    for _ in current..target_period {
+        let (new_sk, _) = kes_update(&current_sk)?;
+        current_sk = new_sk;
+    }
+    Ok(current_sk)
+}
+
 /// Verify a KES signature against a public key and message.
 pub fn kes_verify(
     pk_bytes: &[u8; 32],
