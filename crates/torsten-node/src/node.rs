@@ -143,11 +143,29 @@ impl Node {
             }
         }
 
-        let ledger_state = Arc::new(RwLock::new(LedgerState::new(protocol_params)));
+        let mut ledger = LedgerState::new(protocol_params);
+        // Apply epoch length from Shelley genesis
+        if let Some(ref genesis) = shelley_genesis {
+            ledger.set_epoch_length(genesis.epoch_length, genesis.security_param);
+        }
+        let ledger_state = Arc::new(RwLock::new(ledger));
         info!("Ledger state initialized");
 
-        let consensus = OuroborosPraos::new();
-        info!("Ouroboros Praos consensus initialized");
+        let consensus = if let Some(ref genesis) = shelley_genesis {
+            OuroborosPraos::with_params(
+                genesis.active_slots_coeff,
+                genesis.security_param,
+                torsten_primitives::time::EpochLength(genesis.epoch_length),
+            )
+        } else {
+            OuroborosPraos::new()
+        };
+        info!(
+            epoch_length = consensus.epoch_length.0,
+            security_param = consensus.security_param,
+            active_slot_coeff = consensus.active_slot_coeff,
+            "Ouroboros Praos consensus initialized"
+        );
 
         let mempool = Arc::new(Mempool::new(MempoolConfig::default()));
         info!("Mempool initialized");

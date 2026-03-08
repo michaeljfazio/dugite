@@ -173,6 +173,20 @@ impl LedgerState {
         }
     }
 
+    /// Configure the epoch length (from Shelley genesis)
+    pub fn set_epoch_length(&mut self, epoch_length: u64, security_param: u64) {
+        self.epoch_length = epoch_length;
+        // stability_window = 3k/f where f = active_slot_coeff
+        let f = self.protocol_params.active_slot_coeff();
+        self.stability_window = (3.0 * security_param as f64 / f) as u64;
+        info!(
+            epoch_length,
+            stability_window = self.stability_window,
+            security_param,
+            "Ledger: epoch length configured"
+        );
+    }
+
     /// Apply a block to the ledger state
     pub fn apply_block(&mut self, block: &Block) -> Result<(), LedgerError> {
         trace!(
