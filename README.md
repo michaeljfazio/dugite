@@ -349,7 +349,7 @@ Zero-warning policy enforced — all code must compile with `cargo clippy -- -D 
 ### Not Yet Implemented
 
 #### Relay Node Compliance
-- [ ] Connection backpressure and flow control (ack/req counts)
+- [x] TxSubmission2 flow control (ack/req counts, inflight tracking per peer)
 - [ ] Concurrent ChainSync from multiple peers
 - [ ] Adaptive peer selection (latency-based ranking, reputation)
 

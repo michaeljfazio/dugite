@@ -272,6 +272,8 @@ struct PeerState {
     chainsync_cursor_hash: Option<[u8; 32]>,
     /// TxSubmission2 state: whether we've sent MsgInit
     tx_submission_init_sent: bool,
+    /// TxSubmission2 flow control: tx IDs sent but not yet acknowledged
+    tx_inflight: Vec<[u8; 32]>,
 }
 
 impl PeerState {
@@ -280,6 +282,7 @@ impl PeerState {
             chainsync_cursor_slot: None,
             chainsync_cursor_hash: None,
             tx_submission_init_sent: false,
+            tx_inflight: Vec::new(),
         }
     }
 }
@@ -956,26 +959,45 @@ fn handle_n2n_txsubmission(
         }
         // MsgRequestTxIds: [0, blocking, ack_count, req_count]
         0 => {
-            // Parse req_count (skip blocking and ack_count)
             let _blocking = decoder.bool().unwrap_or(false);
-            let _ack_count = decoder.u32().unwrap_or(0);
+            let ack_count = decoder.u32().unwrap_or(0) as usize;
             let req_count = decoder.u32().unwrap_or(0) as usize;
+
+            // Acknowledge previously sent tx IDs (remove from inflight)
+            if ack_count > 0 && ack_count <= peer_state.tx_inflight.len() {
+                peer_state.tx_inflight.drain(..ack_count);
+                debug!(ack_count, "TxSubmission2: acknowledged tx ids");
+            } else if ack_count > 0 {
+                peer_state.tx_inflight.clear();
+            }
 
             let mut buf = Vec::new();
             let mut enc = minicbor::Encoder::new(&mut buf);
 
-            // Get tx IDs from mempool if available
+            // Get new tx IDs from mempool, excluding those already inflight
             let txs: Vec<_> = if let Some(mp) = mempool {
                 let snapshot = mp.snapshot();
                 snapshot
                     .tx_hashes
                     .iter()
+                    .filter(|h| {
+                        let bytes = h.as_bytes();
+                        !peer_state
+                            .tx_inflight
+                            .iter()
+                            .any(|inflight| inflight == bytes)
+                    })
                     .take(req_count.max(1))
-                    .filter_map(|h| mp.get_tx_size(h).map(|size| (h.as_bytes().to_vec(), size)))
+                    .filter_map(|h| mp.get_tx_size(h).map(|size| (*h.as_bytes(), size)))
                     .collect()
             } else {
                 vec![]
             };
+
+            // Track newly sent tx IDs as inflight
+            for (tx_hash, _) in &txs {
+                peer_state.tx_inflight.push(*tx_hash);
+            }
 
             // MsgReplyTxIds: [1, [[tx_id, size], ...]]
             enc.array(2)
@@ -992,7 +1014,11 @@ fn handle_n2n_txsubmission(
                 enc.u32(*size as u32)
                     .map_err(|e| N2NServerError::Protocol(e.to_string()))?;
             }
-            debug!(count = txs.len(), "TxSubmission2: replied with tx ids");
+            debug!(
+                count = txs.len(),
+                inflight = peer_state.tx_inflight.len(),
+                "TxSubmission2: replied with tx ids"
+            );
             Ok(Some(Segment {
                 transmission_time: 0,
                 protocol_id: MINI_PROTOCOL_TXSUBMISSION,
@@ -1345,6 +1371,47 @@ mod tests {
         let mut dec = minicbor::Decoder::new(&seg.payload);
         dec.array().unwrap();
         assert_eq!(dec.u32().unwrap(), 1); // MsgReplyTxIds
+    }
+
+    #[test]
+    fn test_txsubmission_flow_control() {
+        let mut peer_state = PeerState::new();
+        peer_state.tx_submission_init_sent = true;
+
+        // Simulate sending tx IDs: peer_state inflight tracking
+        let hash1 = [1u8; 32];
+        let hash2 = [2u8; 32];
+        peer_state.tx_inflight.push(hash1);
+        peer_state.tx_inflight.push(hash2);
+        assert_eq!(peer_state.tx_inflight.len(), 2);
+
+        // MsgRequestTxIds with ack_count=1: acknowledge first tx
+        let mut buf = Vec::new();
+        let mut enc = minicbor::Encoder::new(&mut buf);
+        enc.array(4).unwrap();
+        enc.u32(0).unwrap();
+        enc.bool(false).unwrap();
+        enc.u32(1).unwrap(); // ack 1
+        enc.u32(1).unwrap(); // request 1
+
+        let no_mempool: Option<Arc<Mempool>> = None;
+        let _result = handle_n2n_txsubmission(&buf, &mut peer_state, &no_mempool).unwrap();
+
+        // Should have removed one from inflight
+        assert_eq!(peer_state.tx_inflight.len(), 1);
+        assert_eq!(peer_state.tx_inflight[0], hash2);
+
+        // Ack remaining
+        let mut buf2 = Vec::new();
+        let mut enc2 = minicbor::Encoder::new(&mut buf2);
+        enc2.array(4).unwrap();
+        enc2.u32(0).unwrap();
+        enc2.bool(false).unwrap();
+        enc2.u32(1).unwrap(); // ack 1
+        enc2.u32(1).unwrap();
+
+        let _result2 = handle_n2n_txsubmission(&buf2, &mut peer_state, &no_mempool).unwrap();
+        assert!(peer_state.tx_inflight.is_empty());
     }
 
     #[test]
