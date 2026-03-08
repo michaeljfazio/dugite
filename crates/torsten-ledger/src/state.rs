@@ -1,7 +1,7 @@
 use crate::plutus::SlotConfig;
 use crate::utxo::UtxoSet;
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
 use torsten_primitives::block::{Block, Point, Tip};
 use torsten_primitives::credentials::Credential;
@@ -41,19 +41,19 @@ pub struct LedgerState {
     /// Reserves balance (ADA not yet in circulation)
     pub reserves: Lovelace,
     /// Delegation state: credential_hash -> pool_id
-    pub delegations: BTreeMap<Hash32, Hash28>,
+    pub delegations: HashMap<Hash32, Hash28>,
     /// Pool registrations: pool_id -> pool registration
-    pub pool_params: BTreeMap<Hash28, PoolRegistration>,
+    pub pool_params: HashMap<Hash28, PoolRegistration>,
     /// Pool retirements pending at a given epoch
     pub pending_retirements: BTreeMap<EpochNo, Vec<Hash28>>,
     /// Stake snapshots for the Cardano "mark/set/go" snapshot model
     pub snapshots: EpochSnapshots,
     /// Reward accounts: stake credential hash -> accumulated rewards
-    pub reward_accounts: BTreeMap<Hash32, Lovelace>,
+    pub reward_accounts: HashMap<Hash32, Lovelace>,
     /// Fees collected in the current epoch
     pub epoch_fees: Lovelace,
     /// Number of blocks produced by each pool in the current epoch
-    pub epoch_blocks_by_pool: BTreeMap<Hash28, u64>,
+    pub epoch_blocks_by_pool: HashMap<Hash28, u64>,
     /// Total blocks in the current epoch
     pub epoch_block_count: u64,
     /// Rolling nonce (eta_v): accumulated hash of VRF outputs in the nonce contribution window
@@ -79,13 +79,13 @@ pub struct LedgerState {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct GovernanceState {
     /// Registered DReps: credential -> DRepState
-    pub dreps: BTreeMap<Hash32, DRepRegistration>,
+    pub dreps: HashMap<Hash32, DRepRegistration>,
     /// Vote delegations: stake credential hash -> DRep
-    pub vote_delegations: BTreeMap<Hash32, DRep>,
+    pub vote_delegations: HashMap<Hash32, DRep>,
     /// Constitutional committee: cold credential -> hot credential
-    pub committee_hot_keys: BTreeMap<Hash32, Hash32>,
+    pub committee_hot_keys: HashMap<Hash32, Hash32>,
     /// Resigned committee members
-    pub committee_resigned: BTreeMap<Hash32, Option<Anchor>>,
+    pub committee_resigned: HashMap<Hash32, Option<Anchor>>,
     /// Active governance proposals indexed by GovActionId
     pub proposals: BTreeMap<GovActionId, ProposalState>,
     /// Votes cast: (voter, action_id) -> vote
@@ -118,7 +118,7 @@ pub struct ProposalState {
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct StakeDistributionState {
-    pub stake_map: BTreeMap<Hash32, Lovelace>,
+    pub stake_map: HashMap<Hash32, Lovelace>,
 }
 
 /// Cardano uses a "mark / set / go" snapshot model:
@@ -140,11 +140,11 @@ pub struct EpochSnapshots {
 pub struct StakeSnapshot {
     pub epoch: EpochNo,
     /// stake credential hash -> pool_id delegation
-    pub delegations: BTreeMap<Hash32, Hash28>,
+    pub delegations: HashMap<Hash32, Hash28>,
     /// pool_id -> total active stake delegated to that pool
-    pub pool_stake: BTreeMap<Hash28, Lovelace>,
+    pub pool_stake: HashMap<Hash28, Lovelace>,
     /// pool_id -> pool parameters at snapshot time
-    pub pool_params: BTreeMap<Hash28, PoolRegistration>,
+    pub pool_params: HashMap<Hash28, PoolRegistration>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -172,13 +172,13 @@ impl LedgerState {
             stake_distribution: StakeDistributionState::default(),
             treasury: Lovelace(0),
             reserves: Lovelace(MAX_LOVELACE_SUPPLY),
-            delegations: BTreeMap::new(),
-            pool_params: BTreeMap::new(),
+            delegations: HashMap::new(),
+            pool_params: HashMap::new(),
             pending_retirements: BTreeMap::new(),
             snapshots: EpochSnapshots::default(),
-            reward_accounts: BTreeMap::new(),
+            reward_accounts: HashMap::new(),
             epoch_fees: Lovelace(0),
-            epoch_blocks_by_pool: BTreeMap::new(),
+            epoch_blocks_by_pool: HashMap::new(),
             epoch_block_count: 0,
             rolling_nonce: Hash32::ZERO,
             epoch_nonce: Hash32::ZERO,
@@ -562,7 +562,7 @@ impl LedgerState {
         self.snapshots.set = self.snapshots.mark.take();
 
         // Take a new "mark" snapshot of current stake distribution
-        let mut pool_stake: BTreeMap<Hash28, Lovelace> = BTreeMap::new();
+        let mut pool_stake: HashMap<Hash28, Lovelace> = HashMap::new();
         for (cred_hash, pool_id) in &self.delegations {
             let stake = self
                 .stake_distribution
@@ -708,7 +708,7 @@ impl LedgerState {
 
         // Build delegators-by-pool index for O(n) reward distribution
         // instead of O(n*m) inner loop over all delegations per pool
-        let mut delegators_by_pool: BTreeMap<Hash28, Vec<Hash32>> = BTreeMap::new();
+        let mut delegators_by_pool: HashMap<Hash28, Vec<Hash32>> = HashMap::new();
         for (cred_hash, pool_id) in &go_snapshot.delegations {
             delegators_by_pool
                 .entry(*pool_id)
