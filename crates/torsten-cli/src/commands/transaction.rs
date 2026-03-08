@@ -108,21 +108,74 @@ fn parse_tx_input(s: &str) -> Result<(Hash32, u32)> {
     Ok((hash, index))
 }
 
-/// Parse a tx output string "address+amount" into (address, lovelace)
-fn parse_tx_output(s: &str) -> Result<(String, u64)> {
-    let parts: Vec<&str> = s.split('+').collect();
-    if parts.len() != 2 {
-        bail!("Invalid tx output format: '{s}'. Expected address+amount");
+/// Parsed transaction output with optional multi-asset tokens
+struct ParsedTxOutput {
+    address: String,
+    lovelace: u64,
+    /// Native tokens: Vec<(policy_hex, asset_name_hex, quantity)>
+    tokens: Vec<(String, String, u64)>,
+}
+
+/// Parse a tx output string into address, lovelace, and optional native tokens.
+///
+/// Supported formats:
+/// - `address+amount` (ADA only)
+/// - `address+amount+"policy_id.asset_name amount+..."` (with native tokens)
+fn parse_tx_output(s: &str) -> Result<ParsedTxOutput> {
+    let parts: Vec<&str> = s.splitn(3, '+').collect();
+    if parts.len() < 2 {
+        bail!("Invalid tx output format: '{s}'. Expected address+amount[+tokens]");
     }
     let address = parts[0].to_string();
-    let amount: u64 = parts[1].trim().parse()?;
-    Ok((address, amount))
+    let lovelace: u64 = parts[1].trim().parse()?;
+
+    let mut tokens = Vec::new();
+    if parts.len() == 3 {
+        // Parse multi-asset tokens: "policy.name qty+policy.name qty+..."
+        let token_str = parts[2].trim().trim_matches('"');
+        for token_part in token_str.split('+') {
+            let token_part = token_part.trim();
+            if token_part.is_empty() {
+                continue;
+            }
+            // Format: "policy_id.asset_name qty" or "policy_id qty"
+            let token_parts: Vec<&str> = token_part.splitn(2, ' ').collect();
+            if token_parts.len() != 2 {
+                bail!("Invalid token format: '{token_part}'. Expected 'policy_id.asset_name quantity'");
+            }
+            let qty: u64 = token_parts[1].trim().parse()?;
+            let asset_id = token_parts[0];
+            let (policy, asset_name) = if let Some(dot_pos) = asset_id.find('.') {
+                (
+                    asset_id[..dot_pos].to_string(),
+                    asset_id[dot_pos + 1..].to_string(),
+                )
+            } else {
+                (asset_id.to_string(), String::new())
+            };
+            // Validate policy is valid hex (56 chars = 28 bytes)
+            if policy.len() != 56 {
+                bail!(
+                    "Invalid policy ID length: expected 56 hex chars, got {}",
+                    policy.len()
+                );
+            }
+            hex::decode(&policy)?;
+            tokens.push((policy, asset_name, qty));
+        }
+    }
+
+    Ok(ParsedTxOutput {
+        address,
+        lovelace,
+        tokens,
+    })
 }
 
 /// Build a CBOR transaction body
 fn build_tx_body_cbor(
     inputs: &[(Hash32, u32)],
-    outputs: &[(String, u64)],
+    outputs: &[ParsedTxOutput],
     fee: u64,
     ttl: Option<u64>,
     certificates: &[Vec<u8>],
@@ -158,15 +211,49 @@ fn build_tx_body_cbor(
         enc.u32(*index)?;
     }
 
-    // Field 1: outputs
+    // Field 1: outputs (post-Alonzo format)
     enc.u32(1)?;
     enc.array(outputs.len() as u64)?;
-    for (address, amount) in outputs {
-        enc.array(2)?;
-        let (_hrp, addr_bytes) = bech32::decode(address)
-            .map_err(|e| anyhow::anyhow!("Invalid bech32 address '{address}': {e}"))?;
-        enc.bytes(&addr_bytes)?;
-        enc.u64(*amount)?;
+    for output in outputs {
+        let (_hrp, addr_bytes) = bech32::decode(&output.address)
+            .map_err(|e| anyhow::anyhow!("Invalid bech32 address '{}': {e}", output.address))?;
+
+        if output.tokens.is_empty() {
+            // Simple output: [address, amount]
+            enc.array(2)?;
+            enc.bytes(&addr_bytes)?;
+            enc.u64(output.lovelace)?;
+        } else {
+            // Multi-asset output: [address, [lovelace, {policy: {asset: qty}}]]
+            enc.array(2)?;
+            enc.bytes(&addr_bytes)?;
+
+            // Value: [lovelace, multi_asset_map]
+            enc.array(2)?;
+            enc.u64(output.lovelace)?;
+
+            // Group tokens by policy
+            let mut policy_map: std::collections::BTreeMap<Vec<u8>, Vec<(Vec<u8>, u64)>> =
+                std::collections::BTreeMap::new();
+            for (policy_hex, asset_name_hex, qty) in &output.tokens {
+                let policy_bytes = hex::decode(policy_hex)?;
+                let asset_bytes = hex::decode(asset_name_hex).unwrap_or_default();
+                policy_map
+                    .entry(policy_bytes)
+                    .or_default()
+                    .push((asset_bytes, *qty));
+            }
+
+            enc.map(policy_map.len() as u64)?;
+            for (policy_bytes, assets) in &policy_map {
+                enc.bytes(policy_bytes)?;
+                enc.map(assets.len() as u64)?;
+                for (asset_name, qty) in assets {
+                    enc.bytes(asset_name)?;
+                    enc.u64(*qty)?;
+                }
+            }
+        }
     }
 
     // Field 2: fee
@@ -324,7 +411,7 @@ impl TransactionCmd {
                     .iter()
                     .map(|s| parse_tx_input(s))
                     .collect::<Result<_>>()?;
-                let outputs: Vec<(String, u64)> = tx_out
+                let outputs: Vec<ParsedTxOutput> = tx_out
                     .iter()
                     .map(|s| parse_tx_output(s))
                     .collect::<Result<_>>()?;
@@ -662,9 +749,23 @@ mod tests {
 
     #[test]
     fn test_parse_tx_output_valid() {
-        let (addr, amount) = parse_tx_output("addr_test1abc+5000000").unwrap();
-        assert_eq!(addr, "addr_test1abc");
-        assert_eq!(amount, 5000000);
+        let output = parse_tx_output("addr_test1abc+5000000").unwrap();
+        assert_eq!(output.address, "addr_test1abc");
+        assert_eq!(output.lovelace, 5000000);
+        assert!(output.tokens.is_empty());
+    }
+
+    #[test]
+    fn test_parse_tx_output_with_tokens() {
+        let policy = "a".repeat(56);
+        let s = format!("addr_test1abc+5000000+\"{policy}.deadbeef 100\"");
+        let output = parse_tx_output(&s).unwrap();
+        assert_eq!(output.address, "addr_test1abc");
+        assert_eq!(output.lovelace, 5000000);
+        assert_eq!(output.tokens.len(), 1);
+        assert_eq!(output.tokens[0].0, policy);
+        assert_eq!(output.tokens[0].1, "deadbeef");
+        assert_eq!(output.tokens[0].2, 100);
     }
 
     #[test]
@@ -676,6 +777,23 @@ mod tests {
     fn test_build_tx_body_cbor() {
         let inputs = vec![(Hash32::from_bytes([0xab; 32]), 0)];
         let outputs = vec![];
+        let result = build_tx_body_cbor(&inputs, &outputs, 200000, None, &[], &[], None);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_build_tx_body_with_multi_asset() {
+        let inputs = vec![(Hash32::from_bytes([0xab; 32]), 0)];
+        let policy = "a".repeat(56);
+        let outputs = vec![ParsedTxOutput {
+            address: bech32::encode::<bech32::Bech32>(
+                bech32::Hrp::parse("addr_test").unwrap(),
+                &[0x00; 57],
+            )
+            .unwrap(),
+            lovelace: 2_000_000,
+            tokens: vec![(policy, "deadbeef".to_string(), 100)],
+        }];
         let result = build_tx_body_cbor(&inputs, &outputs, 200000, None, &[], &[], None);
         assert!(result.is_ok());
     }

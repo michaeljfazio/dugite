@@ -223,15 +223,18 @@ impl StakePoolCmd {
                 Ok(())
             }
             StakePoolSubcommand::IssueOpCert {
-                kes_verification_key_file: _,
-                cold_signing_key_file: _,
-                operational_certificate_counter_file: _,
-                kes_period: _,
-                out_file: _,
-            } => {
-                println!("Use `torsten-cli node issue-op-cert` to issue operational certificates.");
-                Ok(())
-            }
+                kes_verification_key_file,
+                cold_signing_key_file,
+                operational_certificate_counter_file,
+                kes_period,
+                out_file,
+            } => super::node::issue_op_cert(
+                &kes_verification_key_file,
+                &cold_signing_key_file,
+                &operational_certificate_counter_file,
+                kes_period,
+                &out_file,
+            ),
             StakePoolSubcommand::RetirementCertificate {
                 cold_verification_key_file,
                 epoch,

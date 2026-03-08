@@ -92,10 +92,15 @@ enum VoteSubcommand {
         /// Vote: yes, no, or abstain
         #[arg(long)]
         vote: String,
+        /// DRep verification key file (for DRep voter)
         #[arg(long)]
         drep_verification_key_file: Option<PathBuf>,
+        /// SPO cold verification key file (for SPO voter)
         #[arg(long)]
         cold_verification_key_file: Option<PathBuf>,
+        /// CC hot verification key file (for Constitutional Committee voter)
+        #[arg(long)]
+        cc_hot_verification_key_file: Option<PathBuf>,
         #[arg(long)]
         anchor_url: Option<String>,
         #[arg(long)]
@@ -195,6 +200,55 @@ enum ActionSubcommand {
         /// Anchor text to hash directly
         #[arg(long)]
         file_text: Option<PathBuf>,
+    },
+    /// Create a protocol parameters update action
+    CreateProtocolParametersUpdate {
+        #[arg(long)]
+        anchor_url: String,
+        #[arg(long)]
+        anchor_data_hash: String,
+        #[arg(long)]
+        deposit: u64,
+        #[arg(long)]
+        return_addr: String,
+        /// Protocol parameter changes as JSON file
+        #[arg(long)]
+        protocol_parameters_update: PathBuf,
+        /// Optional guardrail script hash
+        #[arg(long)]
+        constitution_script_hash: Option<String>,
+        #[arg(long)]
+        prev_governance_action_tx_id: Option<String>,
+        #[arg(long)]
+        prev_governance_action_index: Option<u32>,
+        #[arg(long)]
+        out_file: PathBuf,
+    },
+    /// Create an update committee action
+    CreateUpdateCommittee {
+        #[arg(long)]
+        anchor_url: String,
+        #[arg(long)]
+        anchor_data_hash: String,
+        #[arg(long)]
+        deposit: u64,
+        #[arg(long)]
+        return_addr: String,
+        /// Cold verification key files of members to remove
+        #[arg(long)]
+        remove_cc_cold_verification_key_hash: Vec<String>,
+        /// New committee member: key_hash,expiry_epoch
+        #[arg(long)]
+        add_cc_cold_verification_key_hash: Vec<String>,
+        /// Quorum threshold as rational (e.g., "2/3")
+        #[arg(long)]
+        threshold: String,
+        #[arg(long)]
+        prev_governance_action_tx_id: Option<String>,
+        #[arg(long)]
+        prev_governance_action_index: Option<u32>,
+        #[arg(long)]
+        out_file: PathBuf,
     },
     /// Create a treasury withdrawal action
     CreateTreasuryWithdrawal {
@@ -395,7 +449,8 @@ impl GovernanceCmd {
                     governance_action_index,
                     vote,
                     drep_verification_key_file,
-                    cold_verification_key_file: _,
+                    cold_verification_key_file,
+                    cc_hot_verification_key_file,
                     anchor_url,
                     anchor_data_hash,
                     out_file,
@@ -412,13 +467,20 @@ impl GovernanceCmd {
                         anyhow::bail!("Invalid governance action tx id length");
                     }
 
-                    // Get voter credential
-                    let voter_hash = if let Some(ref drep_file) = drep_verification_key_file {
-                        load_key_hash(drep_file)?
+                    // Determine voter type and credential
+                    // CC Hot = type 0, SPO = type 1, DRep = type 2
+                    let (voter_type, voter_hash) = if let Some(ref cc_file) =
+                        cc_hot_verification_key_file
+                    {
+                        (0u32, load_key_hash(cc_file)?)
+                    } else if let Some(ref cold_file) = cold_verification_key_file {
+                        (1, load_key_hash(cold_file)?)
+                    } else if let Some(ref drep_file) = drep_verification_key_file {
+                        (2, load_key_hash(drep_file)?)
                     } else {
                         anyhow::bail!(
-                            "Must provide --drep-verification-key-file or --cold-verification-key-file"
-                        );
+                                "Must provide --drep-verification-key-file, --cold-verification-key-file, or --cc-hot-verification-key-file"
+                            );
                     };
 
                     // Build vote CBOR
@@ -428,9 +490,8 @@ impl GovernanceCmd {
                     // Voting procedures map: { voter => { action_id => voting_procedure } }
                     enc.map(1)?;
                     // Voter: [voter_type, credential]
-                    // DRep voter = type 2
                     enc.array(2)?;
-                    enc.u32(2)?; // DRep voter
+                    enc.u32(voter_type)?;
                     enc.array(2)?;
                     enc.u32(0)?; // key credential
                     enc.bytes(&voter_hash)?;
@@ -452,9 +513,14 @@ impl GovernanceCmd {
                         enc.null()?;
                     }
 
+                    let voter_desc = match voter_type {
+                        0 => "Constitutional Committee",
+                        1 => "Stake Pool Operator",
+                        _ => "DRep",
+                    };
                     let vote_env = serde_json::json!({
                         "type": "VoteConway",
-                        "description": "Governance Vote",
+                        "description": format!("{voter_desc} Governance Vote"),
                         "cborHex": hex::encode(&vote_cbor)
                     });
 
@@ -467,7 +533,7 @@ impl GovernanceCmd {
                     };
                     println!("Vote file written to: {}", out_file.display());
                     println!(
-                        "Vote: {vote_str} on {governance_action_tx_id}#{governance_action_index}"
+                        "Vote: {vote_str} ({voter_desc}) on {governance_action_tx_id}#{governance_action_index}"
                     );
                     Ok(())
                 }
@@ -670,6 +736,149 @@ impl GovernanceCmd {
                     println!("{}", hex::encode(hash.as_bytes()));
                     Ok(())
                 }
+                ActionSubcommand::CreateProtocolParametersUpdate {
+                    anchor_url,
+                    anchor_data_hash,
+                    deposit,
+                    return_addr,
+                    protocol_parameters_update,
+                    constitution_script_hash,
+                    prev_governance_action_tx_id,
+                    prev_governance_action_index,
+                    out_file,
+                } => {
+                    let anchor_hash = hex::decode(&anchor_data_hash)?;
+                    let (_, return_addr_bytes) = bech32::decode(&return_addr)?;
+
+                    // Read protocol parameter update JSON
+                    let pp_content = std::fs::read_to_string(&protocol_parameters_update)?;
+                    let pp_json: serde_json::Value = serde_json::from_str(&pp_content)?;
+
+                    // Encode protocol parameter update as CBOR map
+                    let pp_cbor = encode_protocol_param_update(&pp_json)?;
+
+                    let mut action_cbor = Vec::new();
+                    let mut enc = minicbor::Encoder::new(&mut action_cbor);
+                    enc.array(4)?;
+                    enc.u64(deposit)?;
+                    enc.bytes(&return_addr_bytes)?;
+                    // ParameterChange = tag 0
+                    enc.array(4)?;
+                    enc.u32(0)?;
+                    encode_prev_action_id(
+                        &mut enc,
+                        &prev_governance_action_tx_id,
+                        &prev_governance_action_index,
+                    )?;
+                    // Embed raw protocol param update CBOR
+                    enc.writer_mut().extend_from_slice(&pp_cbor);
+                    // Policy hash
+                    if let Some(ref script_hash_hex) = constitution_script_hash {
+                        let script_hash = hex::decode(script_hash_hex)?;
+                        enc.bytes(&script_hash)?;
+                    } else {
+                        enc.null()?;
+                    }
+                    // Anchor
+                    enc.array(2)?;
+                    enc.str(&anchor_url)?;
+                    enc.bytes(&anchor_hash)?;
+
+                    let action_env = serde_json::json!({
+                        "type": "GovernanceActionConway",
+                        "description": "Protocol Parameters Update Governance Action",
+                        "cborHex": hex::encode(&action_cbor)
+                    });
+
+                    std::fs::write(&out_file, serde_json::to_string_pretty(&action_env)?)?;
+                    println!(
+                        "Protocol parameters update action written to: {}",
+                        out_file.display()
+                    );
+                    Ok(())
+                }
+                ActionSubcommand::CreateUpdateCommittee {
+                    anchor_url,
+                    anchor_data_hash,
+                    deposit,
+                    return_addr,
+                    remove_cc_cold_verification_key_hash,
+                    add_cc_cold_verification_key_hash,
+                    threshold,
+                    prev_governance_action_tx_id,
+                    prev_governance_action_index,
+                    out_file,
+                } => {
+                    let anchor_hash = hex::decode(&anchor_data_hash)?;
+                    let (_, return_addr_bytes) = bech32::decode(&return_addr)?;
+
+                    // Parse threshold as rational "num/den"
+                    let thresh_parts: Vec<&str> = threshold.split('/').collect();
+                    if thresh_parts.len() != 2 {
+                        anyhow::bail!(
+                            "Invalid threshold format: '{threshold}'. Expected num/den (e.g., 2/3)"
+                        );
+                    }
+                    let thresh_num: u64 = thresh_parts[0].parse()?;
+                    let thresh_den: u64 = thresh_parts[1].parse()?;
+
+                    let mut action_cbor = Vec::new();
+                    let mut enc = minicbor::Encoder::new(&mut action_cbor);
+                    enc.array(4)?;
+                    enc.u64(deposit)?;
+                    enc.bytes(&return_addr_bytes)?;
+                    // UpdateCommittee = tag 4
+                    enc.array(5)?;
+                    enc.u32(4)?;
+                    encode_prev_action_id(
+                        &mut enc,
+                        &prev_governance_action_tx_id,
+                        &prev_governance_action_index,
+                    )?;
+                    // Members to remove (set of credentials)
+                    enc.array(remove_cc_cold_verification_key_hash.len() as u64)?;
+                    for hash_hex in &remove_cc_cold_verification_key_hash {
+                        let hash_bytes = hex::decode(hash_hex)?;
+                        enc.array(2)?;
+                        enc.u32(0)?; // key credential
+                        enc.bytes(&hash_bytes)?;
+                    }
+                    // Members to add: { credential => expiry_epoch }
+                    enc.map(add_cc_cold_verification_key_hash.len() as u64)?;
+                    for entry in &add_cc_cold_verification_key_hash {
+                        // Format: "key_hash,expiry_epoch"
+                        let parts: Vec<&str> = entry.split(',').collect();
+                        if parts.len() != 2 {
+                            anyhow::bail!(
+                                "Invalid add member format: '{entry}'. Expected key_hash,expiry_epoch"
+                            );
+                        }
+                        let hash_bytes = hex::decode(parts[0])?;
+                        let expiry: u64 = parts[1].parse()?;
+                        enc.array(2)?;
+                        enc.u32(0)?;
+                        enc.bytes(&hash_bytes)?;
+                        enc.u64(expiry)?;
+                    }
+                    // Threshold as rational
+                    enc.array(2)?;
+                    enc.u64(thresh_num)?;
+                    enc.u64(thresh_den)?;
+                    // Anchor
+                    enc.array(2)?;
+                    enc.str(&anchor_url)?;
+                    enc.bytes(&anchor_hash)?;
+
+                    let action_env = serde_json::json!({
+                        "type": "GovernanceActionConway",
+                        "description": "Update Committee Governance Action",
+                        "cborHex": hex::encode(&action_cbor)
+                    });
+
+                    std::fs::write(&out_file, serde_json::to_string_pretty(&action_env)?)?;
+                    println!("Update committee action written to: {}", out_file.display());
+                    Ok(())
+                }
                 ActionSubcommand::CreateTreasuryWithdrawal {
                     anchor_url,
                     anchor_data_hash,
@@ -736,6 +945,78 @@ fn encode_prev_action_id(
         enc.null()?;
     }
     Ok(())
+}
+
+/// Encode protocol parameter update JSON as CBOR map
+///
+/// Maps JSON field names to their Conway-era CBOR key numbers
+fn encode_protocol_param_update(json: &serde_json::Value) -> Result<Vec<u8>> {
+    let obj = json
+        .as_object()
+        .ok_or_else(|| anyhow::anyhow!("Protocol param update must be a JSON object"))?;
+
+    let mut buf = Vec::new();
+    let mut enc = minicbor::Encoder::new(&mut buf);
+
+    // Count non-null fields
+    let field_count = obj.values().filter(|v| !v.is_null()).count();
+    enc.map(field_count as u64)?;
+
+    // Map of JSON keys to CBOR field numbers
+    let field_map: &[(&str, u32)] = &[
+        ("txFeePerByte", 0),
+        ("minFeeA", 0),
+        ("txFeeFixed", 1),
+        ("minFeeB", 1),
+        ("maxBlockBodySize", 2),
+        ("maxTxSize", 3),
+        ("maxBlockHeaderSize", 4),
+        ("stakeAddressDeposit", 5),
+        ("keyDeposit", 5),
+        ("stakePoolDeposit", 6),
+        ("poolDeposit", 6),
+        ("poolRetireMaxEpoch", 7),
+        ("eMax", 7),
+        ("stakePoolTargetNum", 8),
+        ("nOpt", 8),
+        ("minPoolCost", 16),
+        ("utxoCostPerByte", 17),
+        ("adaPerUtxoByte", 17),
+        ("maxTxExecutionUnits", 20),
+        ("maxBlockExecutionUnits", 21),
+        ("maxValueSize", 22),
+        ("collateralPercentage", 23),
+        ("maxCollateralInputs", 24),
+        ("drepDeposit", 30),
+        ("govActionDeposit", 31),
+        ("govActionLifetime", 32),
+    ];
+
+    let mut written_keys = std::collections::HashSet::new();
+    for (json_key, cbor_key) in field_map {
+        if let Some(value) = obj.get(*json_key) {
+            if value.is_null() || written_keys.contains(cbor_key) {
+                continue;
+            }
+            written_keys.insert(cbor_key);
+            enc.u32(*cbor_key)?;
+            if let Some(n) = value.as_u64() {
+                enc.u64(n)?;
+            } else if let Some(obj) = value.as_object() {
+                // Execution units: { "memory": N, "steps": N }
+                if let (Some(mem), Some(steps)) = (
+                    obj.get("memory").and_then(|v| v.as_u64()),
+                    obj.get("steps").and_then(|v| v.as_u64()),
+                ) {
+                    enc.array(2)?;
+                    enc.u64(steps)?;
+                    enc.u64(mem)?;
+                }
+            }
+        }
+    }
+
+    Ok(buf)
 }
 
 /// Load a verification key file and return the blake2b-224 hash

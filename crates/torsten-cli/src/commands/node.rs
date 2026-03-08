@@ -115,101 +115,115 @@ impl NodeCmd {
                 operational_certificate_counter_file,
                 kes_period,
                 out_file,
-            } => {
-                // Read the KES verification key
-                let kes_content = std::fs::read_to_string(&kes_verification_key_file)?;
-                let kes_env: serde_json::Value = serde_json::from_str(&kes_content)?;
-                let kes_cbor_hex = kes_env["cborHex"]
-                    .as_str()
-                    .ok_or_else(|| anyhow::anyhow!("Missing cborHex in KES vkey file"))?;
-                let kes_cbor = hex::decode(kes_cbor_hex)?;
-                let kes_vkey = if kes_cbor.len() > 2 {
-                    &kes_cbor[2..]
-                } else {
-                    &kes_cbor
-                };
-
-                // Read the cold signing key
-                let cold_content = std::fs::read_to_string(&cold_signing_key_file)?;
-                let cold_env: serde_json::Value = serde_json::from_str(&cold_content)?;
-                let cold_cbor_hex = cold_env["cborHex"]
-                    .as_str()
-                    .ok_or_else(|| anyhow::anyhow!("Missing cborHex in cold skey file"))?;
-                let cold_cbor = hex::decode(cold_cbor_hex)?;
-                let cold_key_bytes = if cold_cbor.len() > 2 {
-                    &cold_cbor[2..]
-                } else {
-                    &cold_cbor
-                };
-                let cold_sk = torsten_crypto::keys::PaymentSigningKey::from_bytes(cold_key_bytes)?;
-
-                // Read the counter
-                let counter_content =
-                    std::fs::read_to_string(&operational_certificate_counter_file)?;
-                let counter_env: serde_json::Value = serde_json::from_str(&counter_content)?;
-                let counter_cbor_hex = counter_env["cborHex"].as_str().unwrap_or("8200");
-                let counter_cbor = hex::decode(counter_cbor_hex)?;
-
-                // Parse counter value
-                let mut decoder = minicbor::Decoder::new(&counter_cbor);
-                let _ = decoder.array();
-                let counter_value = decoder.u64().unwrap_or(0);
-
-                // Build the operational certificate body to sign:
-                // [hot_vkey, sequence_number, kes_period]
-                let mut cert_body = Vec::new();
-                let mut enc = minicbor::Encoder::new(&mut cert_body);
-                enc.array(3)?;
-                enc.bytes(kes_vkey)?;
-                enc.u64(counter_value)?;
-                enc.u64(kes_period)?;
-
-                // Sign with the cold key
-                let signature = cold_sk.sign(&cert_body);
-
-                // Build the full operational certificate:
-                // [hot_vkey, sequence_number, kes_period, cold_key_signature]
-                let mut opcert_cbor = Vec::new();
-                let mut enc = minicbor::Encoder::new(&mut opcert_cbor);
-                enc.array(4)?;
-                enc.bytes(kes_vkey)?;
-                enc.u64(counter_value)?;
-                enc.u64(kes_period)?;
-                enc.bytes(&signature)?;
-
-                let opcert_env = serde_json::json!({
-                    "type": "NodeOperationalCertificate",
-                    "description": "",
-                    "cborHex": hex::encode(&opcert_cbor)
-                });
-
-                std::fs::write(&out_file, serde_json::to_string_pretty(&opcert_env)?)?;
-
-                // Increment the counter
-                let new_counter = counter_value + 1;
-                let cold_vk = cold_sk.verification_key();
-                let mut new_counter_cbor = Vec::new();
-                let mut enc = minicbor::Encoder::new(&mut new_counter_cbor);
-                enc.array(2)?;
-                enc.u64(new_counter)?;
-                enc.bytes(&simple_cbor_wrap(&cold_vk.to_bytes()))?;
-
-                let new_counter_env = serde_json::json!({
-                    "type": "NodeOperationalCertificateIssueCounter",
-                    "description": format!("Next certificate issue number: {new_counter}"),
-                    "cborHex": hex::encode(&new_counter_cbor)
-                });
-                std::fs::write(
-                    &operational_certificate_counter_file,
-                    serde_json::to_string_pretty(&new_counter_env)?,
-                )?;
-
-                println!("Operational certificate issued.");
-                println!("Certificate: {}", out_file.display());
-                println!("KES period: {kes_period}");
-                println!("Counter: {counter_value} -> {new_counter}");
-                Ok(())
-            }
+            } => issue_op_cert(
+                &kes_verification_key_file,
+                &cold_signing_key_file,
+                &operational_certificate_counter_file,
+                kes_period,
+                &out_file,
+            ),
         }
     }
+}
+
+/// Issue an operational certificate. Shared between `node issue-op-cert` and `stake-pool issue-op-cert`.
+pub fn issue_op_cert(
+    kes_verification_key_file: &PathBuf,
+    cold_signing_key_file: &PathBuf,
+    operational_certificate_counter_file: &PathBuf,
+    kes_period: u64,
+    out_file: &PathBuf,
+) -> Result<()> {
+    // Read the KES verification key
+    let kes_content = std::fs::read_to_string(kes_verification_key_file)?;
+    let kes_env: serde_json::Value = serde_json::from_str(&kes_content)?;
+    let kes_cbor_hex = kes_env["cborHex"]
+        .as_str()
+        .ok_or_else(|| anyhow::anyhow!("Missing cborHex in KES vkey file"))?;
+    let kes_cbor = hex::decode(kes_cbor_hex)?;
+    let kes_vkey = if kes_cbor.len() > 2 {
+        &kes_cbor[2..]
+    } else {
+        &kes_cbor
+    };
+
+    // Read the cold signing key
+    let cold_content = std::fs::read_to_string(cold_signing_key_file)?;
+    let cold_env: serde_json::Value = serde_json::from_str(&cold_content)?;
+    let cold_cbor_hex = cold_env["cborHex"]
+        .as_str()
+        .ok_or_else(|| anyhow::anyhow!("Missing cborHex in cold skey file"))?;
+    let cold_cbor = hex::decode(cold_cbor_hex)?;
+    let cold_key_bytes = if cold_cbor.len() > 2 {
+        &cold_cbor[2..]
+    } else {
+        &cold_cbor
+    };
+    let cold_sk = torsten_crypto::keys::PaymentSigningKey::from_bytes(cold_key_bytes)?;
+
+    // Read the counter
+    let counter_content = std::fs::read_to_string(operational_certificate_counter_file)?;
+    let counter_env: serde_json::Value = serde_json::from_str(&counter_content)?;
+    let counter_cbor_hex = counter_env["cborHex"].as_str().unwrap_or("8200");
+    let counter_cbor = hex::decode(counter_cbor_hex)?;
+
+    // Parse counter value
+    let mut decoder = minicbor::Decoder::new(&counter_cbor);
+    let _ = decoder.array();
+    let counter_value = decoder.u64().unwrap_or(0);
+
+    // Build the operational certificate body to sign:
+    // [hot_vkey, sequence_number, kes_period]
+    let mut cert_body = Vec::new();
+    let mut enc = minicbor::Encoder::new(&mut cert_body);
+    enc.array(3)?;
+    enc.bytes(kes_vkey)?;
+    enc.u64(counter_value)?;
+    enc.u64(kes_period)?;
+
+    // Sign with the cold key
+    let signature = cold_sk.sign(&cert_body);
+
+    // Build the full operational certificate:
+    // [hot_vkey, sequence_number, kes_period, cold_key_signature]
+    let mut opcert_cbor = Vec::new();
+    let mut enc = minicbor::Encoder::new(&mut opcert_cbor);
+    enc.array(4)?;
+    enc.bytes(kes_vkey)?;
+    enc.u64(counter_value)?;
+    enc.u64(kes_period)?;
+    enc.bytes(&signature)?;
+
+    let opcert_env = serde_json::json!({
+        "type": "NodeOperationalCertificate",
+        "description": "",
+        "cborHex": hex::encode(&opcert_cbor)
+    });
+
+    std::fs::write(out_file, serde_json::to_string_pretty(&opcert_env)?)?;
+
+    // Increment the counter
+    let new_counter = counter_value + 1;
+    let cold_vk = cold_sk.verification_key();
+    let mut new_counter_cbor = Vec::new();
+    let mut enc = minicbor::Encoder::new(&mut new_counter_cbor);
+    enc.array(2)?;
+    enc.u64(new_counter)?;
+    enc.bytes(&simple_cbor_wrap(&cold_vk.to_bytes()))?;
+
+    let new_counter_env = serde_json::json!({
+        "type": "NodeOperationalCertificateIssueCounter",
+        "description": format!("Next certificate issue number: {new_counter}"),
+        "cborHex": hex::encode(&new_counter_cbor)
+    });
+    std::fs::write(
+        operational_certificate_counter_file,
+        serde_json::to_string_pretty(&new_counter_env)?,
+    )?;
+
+    println!("Operational certificate issued.");
+    println!("Certificate: {}", out_file.display());
+    println!("KES period: {kes_period}");
+    println!("Counter: {counter_value} -> {new_counter}");
+    Ok(())
 }
