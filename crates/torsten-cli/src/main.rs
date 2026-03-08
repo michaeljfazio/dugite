@@ -21,6 +21,8 @@ enum Commands {
     Transaction(commands::transaction::TransactionCmd),
     /// Query commands
     Query(commands::query::QueryCmd),
+    /// Stake address commands
+    StakeAddress(commands::stake_address::StakeAddressCmd),
     /// Stake pool commands
     StakePool(commands::stake_pool::StakePoolCmd),
     /// Governance commands (Conway era)
@@ -37,6 +39,7 @@ fn main() -> Result<()> {
         Commands::Key(cmd) => cmd.run(),
         Commands::Transaction(cmd) => cmd.run(),
         Commands::Query(cmd) => cmd.run(),
+        Commands::StakeAddress(cmd) => cmd.run(),
         Commands::StakePool(cmd) => cmd.run(),
         Commands::Governance(cmd) => cmd.run(),
         Commands::Node(cmd) => cmd.run(),

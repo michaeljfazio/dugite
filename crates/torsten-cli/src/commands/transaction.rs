@@ -59,6 +59,18 @@ enum TxSubcommand {
         #[arg(long)]
         tx_file: PathBuf,
     },
+    /// Calculate the minimum fee for a transaction
+    CalculateMinFee {
+        /// Transaction body file
+        #[arg(long)]
+        tx_body_file: PathBuf,
+        /// Number of signing keys (witnesses)
+        #[arg(long, default_value = "1")]
+        witness_count: u64,
+        /// Protocol parameters file (JSON)
+        #[arg(long)]
+        protocol_params_file: PathBuf,
+    },
     /// View transaction contents
     View {
         /// Transaction file
@@ -342,6 +354,43 @@ impl TransactionCmd {
 
                 let hash = torsten_crypto::signing::hash_transaction(&body_cbor);
                 println!("{hash}");
+                Ok(())
+            }
+            TxSubcommand::CalculateMinFee {
+                tx_body_file,
+                witness_count,
+                protocol_params_file,
+            } => {
+                // Read protocol parameters
+                let pp_content = std::fs::read_to_string(&protocol_params_file)?;
+                let pp: serde_json::Value = serde_json::from_str(&pp_content)?;
+
+                let min_fee_a = pp["txFeePerByte"]
+                    .as_u64()
+                    .or_else(|| pp["minFeeA"].as_u64())
+                    .unwrap_or(44);
+                let min_fee_b = pp["txFeeFixed"]
+                    .as_u64()
+                    .or_else(|| pp["minFeeB"].as_u64())
+                    .unwrap_or(155381);
+
+                // Read tx body to get its size
+                let content = std::fs::read_to_string(&tx_body_file)?;
+                let envelope: serde_json::Value = serde_json::from_str(&content)?;
+                let cbor_hex = envelope["cborHex"]
+                    .as_str()
+                    .ok_or_else(|| anyhow::anyhow!("Missing cborHex in tx body file"))?;
+                let tx_body_cbor = hex::decode(cbor_hex)?;
+
+                // Estimate full signed tx size:
+                // tx body + witness overhead per key (vkey 32 + sig 64 + CBOR wrapping ~10)
+                let witness_overhead = witness_count * 106;
+                // Signed tx envelope: array(4) + body + witness_set + bool + null (~4 bytes)
+                let estimated_size = tx_body_cbor.len() as u64 + witness_overhead + 11;
+
+                // fee = min_fee_a * tx_size + min_fee_b
+                let fee = min_fee_a * estimated_size + min_fee_b;
+                println!("{fee} Lovelace");
                 Ok(())
             }
             TxSubcommand::View { tx_file } => {

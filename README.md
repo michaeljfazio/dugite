@@ -122,6 +122,9 @@ Zero-warning policy enforced — all code must compile with `cargo clippy -- -D 
 - [x] Conway governance: DRep registration, vote delegation, committee auth, proposals, voting
 - [x] CLI: transaction build, sign, view, txid
 - [x] CLI: key generation (payment, stake, DRep), address building
+- [x] CLI: stake address commands (registration, deregistration, delegation, vote delegation)
+- [x] CLI: transaction calculate-min-fee
+- [x] CLI: pool retirement certificate
 - [x] Transaction submission via LocalTxSubmission mini-protocol
 - [x] Governance action ratification and enactment (CIP-1694 voting thresholds)
 - [x] Operational certificate Ed25519 signature verification

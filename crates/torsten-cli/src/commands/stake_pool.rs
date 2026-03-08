@@ -51,6 +51,16 @@ enum StakePoolSubcommand {
         #[arg(long)]
         out_file: PathBuf,
     },
+    /// Create stake pool retirement certificate
+    RetirementCertificate {
+        #[arg(long)]
+        cold_verification_key_file: PathBuf,
+        /// Epoch at which the pool retires
+        #[arg(long)]
+        epoch: u64,
+        #[arg(long)]
+        out_file: PathBuf,
+    },
     /// Create stake pool registration certificate
     RegistrationCertificate {
         #[arg(long)]
@@ -220,6 +230,35 @@ impl StakePoolCmd {
                 out_file: _,
             } => {
                 println!("Use `torsten-cli node issue-op-cert` to issue operational certificates.");
+                Ok(())
+            }
+            StakePoolSubcommand::RetirementCertificate {
+                cold_verification_key_file,
+                epoch,
+                out_file,
+            } => {
+                let pool_hash = load_vkey_hash(&cold_verification_key_file)?;
+
+                // PoolRetirement (cert type 4) = [4, pool_hash, epoch]
+                let mut cert_cbor = Vec::new();
+                let mut enc = minicbor::Encoder::new(&mut cert_cbor);
+                enc.array(3)?;
+                enc.u32(4)?;
+                enc.bytes(&pool_hash)?;
+                enc.u64(epoch)?;
+
+                let cert_env = serde_json::json!({
+                    "type": "CertificateShelley",
+                    "description": "Stake Pool Retirement Certificate",
+                    "cborHex": hex::encode(&cert_cbor)
+                });
+
+                std::fs::write(&out_file, serde_json::to_string_pretty(&cert_env)?)?;
+                println!(
+                    "Pool retirement certificate written to: {}",
+                    out_file.display()
+                );
+                println!("Pool retires at epoch: {epoch}");
                 Ok(())
             }
             StakePoolSubcommand::RegistrationCertificate {
