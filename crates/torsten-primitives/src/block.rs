@@ -70,6 +70,9 @@ pub struct BlockHeader {
     pub body_hash: Hash32,
     pub operational_cert: OperationalCert,
     pub protocol_version: ProtocolVersion,
+    /// KES signature over the header body (448 bytes for Sum6Kes)
+    #[serde(default)]
+    pub kes_signature: Vec<u8>,
 }
 
 /// VRF output

@@ -107,6 +107,20 @@ pub fn kes_evolve_to_period(sk_bytes: &[u8], target_period: u32) -> Result<Vec<u
     Ok(current_sk)
 }
 
+/// Verify a KES signature from raw bytes against a public key and message.
+///
+/// This parses the signature bytes into a Sum6KesSig and verifies it.
+pub fn kes_verify_bytes(
+    pk_bytes: &[u8; 32],
+    period: u32,
+    sig_bytes: &[u8],
+    message: &[u8],
+) -> Result<(), KesError> {
+    let sig = Sum6KesSig::from_bytes(sig_bytes)
+        .map_err(|e| KesError::VerificationFailed(format!("invalid KES sig bytes: {e}")))?;
+    kes_verify(pk_bytes, period, &sig, message)
+}
+
 /// Verify a KES signature against a public key and message.
 pub fn kes_verify(
     pk_bytes: &[u8; 32],

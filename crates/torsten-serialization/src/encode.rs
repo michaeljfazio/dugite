@@ -1532,6 +1532,7 @@ mod tests {
                 sigma: vec![0u8; 64],
             },
             protocol_version: ProtocolVersion { major: 9, minor: 0 },
+            kes_signature: vec![],
         };
 
         let encoded = encode_block_header_body(&header);
@@ -1562,6 +1563,7 @@ mod tests {
                     sigma: vec![0u8; 64],
                 },
                 protocol_version: ProtocolVersion { major: 9, minor: 0 },
+                kes_signature: vec![],
             },
             transactions: vec![],
             era: Era::Conway,

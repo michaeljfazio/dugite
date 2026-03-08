@@ -218,6 +218,7 @@ pub fn forge_block(
             sigma: creds.opcert_sigma.clone(),
         },
         protocol_version: config.protocol_version,
+        kes_signature: vec![], // Set after signing below
     };
 
     // Encode the header body for hashing and KES signing
@@ -257,6 +258,7 @@ pub fn forge_block(
         raw_cbor: None,
     };
     block.header.header_hash = header_hash;
+    block.header.kes_signature = kes_signature.clone();
 
     // Encode the full block
     let block_cbor = torsten_serialization::encode_block(&block, &kes_signature);

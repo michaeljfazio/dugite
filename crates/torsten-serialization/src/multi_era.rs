@@ -88,7 +88,7 @@ fn decode_block_header(block: &PallasBlock) -> Result<BlockHeader, Serialization
     let body_size = block.body_size().unwrap_or(0) as u64;
 
     // Extract era-specific header body fields
-    let (vrf_result, body_hash, op_cert, protocol_version) =
+    let (vrf_result, body_hash, op_cert, protocol_version, kes_signature) =
         if let Some(babbage) = pallas_header.as_babbage() {
             let hb = &babbage.header_body;
             (
@@ -107,6 +107,7 @@ fn decode_block_header(block: &PallasBlock) -> Result<BlockHeader, Serialization
                     major: hb.protocol_version.0,
                     minor: hb.protocol_version.1,
                 },
+                babbage.body_signature.to_vec(),
             )
         } else if let Some(alonzo) = pallas_header.as_alonzo() {
             let hb = &alonzo.header_body;
@@ -126,6 +127,7 @@ fn decode_block_header(block: &PallasBlock) -> Result<BlockHeader, Serialization
                     major: hb.protocol_major,
                     minor: hb.protocol_minor,
                 },
+                alonzo.body_signature.to_vec(),
             )
         } else {
             // Byron
@@ -145,6 +147,7 @@ fn decode_block_header(block: &PallasBlock) -> Result<BlockHeader, Serialization
                     sigma: Vec::new(),
                 },
                 ProtocolVersion { major: 1, minor: 0 },
+                Vec::new(), // Byron has no KES signature
             )
         };
 
@@ -161,6 +164,7 @@ fn decode_block_header(block: &PallasBlock) -> Result<BlockHeader, Serialization
         body_hash,
         operational_cert: op_cert,
         protocol_version,
+        kes_signature,
     })
 }
 

@@ -1257,6 +1257,7 @@ mod tests {
                     sigma: vec![],
                 },
                 protocol_version: torsten_primitives::block::ProtocolVersion { major: 9, minor: 0 },
+                kes_signature: vec![],
             },
             transactions,
             era: Era::Conway,
