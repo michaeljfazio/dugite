@@ -633,14 +633,21 @@ impl Node {
                                 let batch_count = forward_blocks.len() as u64;
 
                                 {
+                                    let batch: Vec<_> = forward_blocks
+                                        .iter()
+                                        .map(|(block, _)| {
+                                            (
+                                                *block.hash(),
+                                                block.slot(),
+                                                block.block_number(),
+                                                *block.prev_hash(),
+                                                block.raw_cbor.clone().unwrap_or_default(),
+                                            )
+                                        })
+                                        .collect();
                                     let mut db = self.chain_db.write().await;
-                                    for (block, _) in &forward_blocks {
-                                        if let Err(e) = db.add_block(
-                                            *block.hash(), block.slot(), block.block_number(),
-                                            *block.prev_hash(), block.raw_cbor.clone().unwrap_or_default(),
-                                        ) {
-                                            error!("Failed to store block: {e}");
-                                        }
+                                    if let Err(e) = db.add_blocks_batch(&batch) {
+                                        error!("Failed to store block batch: {e}");
                                     }
                                 }
 

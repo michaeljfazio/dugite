@@ -72,6 +72,28 @@ impl ChainDB {
         Ok(())
     }
 
+    /// Store multiple blocks in a batch, flushing to immutable only once at the end.
+    /// More efficient than calling add_block repeatedly.
+    pub fn add_blocks_batch(
+        &mut self,
+        blocks: &[(BlockHeaderHash, SlotNo, BlockNo, BlockHeaderHash, Vec<u8>)],
+    ) -> Result<(), ChainDBError> {
+        for (hash, slot, block_no, prev_hash, cbor) in blocks {
+            trace!(
+                hash = %hash.to_hex(),
+                slot = slot.0,
+                block_no = block_no.0,
+                cbor_bytes = cbor.len(),
+                "ChainDB: adding block (batch)"
+            );
+            self.volatile
+                .put_block(*hash, *slot, *block_no, *prev_hash, cbor.clone())?;
+        }
+        // Flush once at the end of the batch
+        self.maybe_flush_to_immutable()?;
+        Ok(())
+    }
+
     /// Get block CBOR by hash (checks volatile first, then immutable)
     pub fn get_block(&self, hash: &BlockHeaderHash) -> Result<Option<Vec<u8>>, ChainDBError> {
         if let Some(cbor) = self.volatile.get_block(hash) {
