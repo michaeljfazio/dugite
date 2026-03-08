@@ -724,24 +724,74 @@ impl QueryCmd {
                 }
 
                 let arr_len = decoder.array().unwrap_or(Some(0)).unwrap_or(0);
-                let mut pool_ids = Vec::new();
+                struct PoolInfo {
+                    pool_id: String,
+                    stake: u64,
+                    pledge: u64,
+                    cost: u64,
+                    margin_num: u64,
+                    margin_den: u64,
+                }
+                let mut pools = Vec::new();
                 for _ in 0..arr_len {
+                    let mut pi = PoolInfo {
+                        pool_id: String::new(),
+                        stake: 0,
+                        pledge: 0,
+                        cost: 0,
+                        margin_num: 0,
+                        margin_den: 1,
+                    };
                     let map_len = decoder.map().unwrap_or(Some(0)).unwrap_or(0);
                     for _ in 0..map_len {
                         let key = decoder.str().unwrap_or("");
-                        if key == "pool_id" {
-                            let bytes = decoder.bytes().unwrap_or(&[]);
-                            pool_ids.push(hex::encode(bytes));
-                        } else {
-                            decoder.skip().ok();
+                        match key {
+                            "pool_id" => {
+                                pi.pool_id = hex::encode(decoder.bytes().unwrap_or(&[]));
+                            }
+                            "stake" => {
+                                pi.stake = decoder.u64().unwrap_or(0);
+                            }
+                            "pledge" => {
+                                pi.pledge = decoder.u64().unwrap_or(0);
+                            }
+                            "cost" => {
+                                pi.cost = decoder.u64().unwrap_or(0);
+                            }
+                            "margin_num" => {
+                                pi.margin_num = decoder.u64().unwrap_or(0);
+                            }
+                            "margin_den" => {
+                                pi.margin_den = decoder.u64().unwrap_or(1);
+                            }
+                            _ => {
+                                decoder.skip().ok();
+                            }
                         }
                     }
+                    pools.push(pi);
                 }
 
-                println!("Registered Stake Pools: {}", pool_ids.len());
-                for id in &pool_ids {
-                    println!("  pool {id}");
+                println!(
+                    "{:<58} {:>15} {:>15} {:>8}",
+                    "PoolId", "Pledge (ADA)", "Cost (ADA)", "Margin"
+                );
+                println!("{}", "-".repeat(100));
+                for p in &pools {
+                    let margin_pct = if p.margin_den > 0 {
+                        p.margin_num as f64 / p.margin_den as f64 * 100.0
+                    } else {
+                        0.0
+                    };
+                    println!(
+                        "{:<58} {:>15.6} {:>15.6} {:>7.2}%",
+                        p.pool_id,
+                        p.pledge as f64 / 1_000_000.0,
+                        p.cost as f64 / 1_000_000.0,
+                        margin_pct
+                    );
                 }
+                println!("\nTotal pools: {}", pools.len());
                 Ok(())
             }
         }
