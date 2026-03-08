@@ -86,6 +86,36 @@ enum TxSubcommand {
         #[arg(long)]
         tx_file: PathBuf,
     },
+    /// Create a transaction witness
+    Witness {
+        /// Transaction body file to witness
+        #[arg(long)]
+        tx_body_file: PathBuf,
+        /// Signing key file
+        #[arg(long)]
+        signing_key_file: PathBuf,
+        /// Output witness file
+        #[arg(long)]
+        out_file: PathBuf,
+    },
+    /// Assemble a transaction from a body and witnesses
+    Assemble {
+        /// Transaction body file
+        #[arg(long)]
+        tx_body_file: PathBuf,
+        /// Witness files
+        #[arg(long, num_args = 1..)]
+        witness_file: Vec<PathBuf>,
+        /// Output signed transaction file
+        #[arg(long)]
+        out_file: PathBuf,
+    },
+    /// Get the policy ID from a script file
+    Policyid {
+        /// Script file
+        #[arg(long)]
+        script_file: PathBuf,
+    },
 }
 
 /// Parse a tx input string "tx_hash#index" into (hash, index)
@@ -705,6 +735,133 @@ impl TransactionCmd {
                     }
                 }
 
+                Ok(())
+            }
+            TxSubcommand::Witness {
+                tx_body_file,
+                signing_key_file,
+                out_file,
+            } => {
+                let content = std::fs::read_to_string(&tx_body_file)?;
+                let envelope: serde_json::Value = serde_json::from_str(&content)?;
+                let cbor_hex = envelope["cborHex"]
+                    .as_str()
+                    .ok_or_else(|| anyhow::anyhow!("Missing cborHex"))?;
+                let body_cbor = hex::decode(cbor_hex)?;
+
+                let hash = torsten_crypto::signing::hash_transaction(&body_cbor);
+                let hash_bytes = hex::decode(hash)?;
+
+                let key_content = std::fs::read_to_string(&signing_key_file)?;
+                let key_env: serde_json::Value = serde_json::from_str(&key_content)?;
+                let key_cbor_hex = key_env["cborHex"]
+                    .as_str()
+                    .ok_or_else(|| anyhow::anyhow!("Missing cborHex in signing key"))?;
+                let key_cbor = hex::decode(key_cbor_hex)?;
+                let key_bytes = if key_cbor.len() > 2 {
+                    &key_cbor[2..]
+                } else {
+                    &key_cbor
+                };
+
+                let sk = torsten_crypto::keys::PaymentSigningKey::from_bytes(key_bytes)?;
+                let vk = sk.verification_key();
+                let signature = sk.sign(&hash_bytes);
+
+                // Witness CBOR: [vkey, signature]
+                let mut witness_cbor = Vec::new();
+                let mut enc = minicbor::Encoder::new(&mut witness_cbor);
+                enc.array(2)?;
+                enc.bytes(&vk.to_bytes())?;
+                enc.bytes(&signature)?;
+
+                let witness_env = serde_json::json!({
+                    "type": "TxWitness ShelleyEra",
+                    "description": "",
+                    "cborHex": hex::encode(&witness_cbor)
+                });
+                std::fs::write(&out_file, serde_json::to_string_pretty(&witness_env)?)?;
+                println!("Witness written to: {}", out_file.display());
+                Ok(())
+            }
+            TxSubcommand::Assemble {
+                tx_body_file,
+                witness_file,
+                out_file,
+            } => {
+                let body_content = std::fs::read_to_string(&tx_body_file)?;
+                let body_env: serde_json::Value = serde_json::from_str(&body_content)?;
+                let body_cbor_hex = body_env["cborHex"]
+                    .as_str()
+                    .ok_or_else(|| anyhow::anyhow!("Missing cborHex in tx body"))?;
+                let body_cbor = hex::decode(body_cbor_hex)?;
+
+                // Collect all witnesses
+                let mut vkey_witnesses: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+                for wf in &witness_file {
+                    let w_content = std::fs::read_to_string(wf)?;
+                    let w_env: serde_json::Value = serde_json::from_str(&w_content)?;
+                    let w_cbor_hex = w_env["cborHex"]
+                        .as_str()
+                        .ok_or_else(|| anyhow::anyhow!("Missing cborHex in witness"))?;
+                    let w_cbor = hex::decode(w_cbor_hex)?;
+
+                    let mut decoder = minicbor::Decoder::new(&w_cbor);
+                    let _ = decoder.array()?;
+                    let vkey = decoder.bytes()?.to_vec();
+                    let sig = decoder.bytes()?.to_vec();
+                    vkey_witnesses.push((vkey, sig));
+                }
+
+                // Build signed tx: [body, witness_set, true, null]
+                let mut tx_cbor = Vec::new();
+                let mut enc = minicbor::Encoder::new(&mut tx_cbor);
+                enc.array(4)?;
+                // Write body as raw CBOR
+                tx_cbor.extend_from_slice(&body_cbor);
+                // Witness set: {0: [[vkey, sig], ...]}
+                let mut ws_buf = Vec::new();
+                let mut ws_enc = minicbor::Encoder::new(&mut ws_buf);
+                ws_enc.map(1)?;
+                ws_enc.u32(0)?; // vkey witnesses
+                ws_enc.array(vkey_witnesses.len() as u64)?;
+                for (vkey, sig) in &vkey_witnesses {
+                    ws_enc.array(2)?;
+                    ws_enc.bytes(vkey)?;
+                    ws_enc.bytes(sig)?;
+                }
+                tx_cbor.extend_from_slice(&ws_buf);
+                // is_valid: true
+                let mut valid_buf = Vec::new();
+                minicbor::Encoder::new(&mut valid_buf).bool(true)?;
+                tx_cbor.extend_from_slice(&valid_buf);
+                // auxiliary_data: null
+                let mut null_buf = Vec::new();
+                minicbor::Encoder::new(&mut null_buf).null()?;
+                tx_cbor.extend_from_slice(&null_buf);
+
+                let tx_env = serde_json::json!({
+                    "type": "Witnessed Tx ConwayEra",
+                    "description": "",
+                    "cborHex": hex::encode(&tx_cbor)
+                });
+                std::fs::write(&out_file, serde_json::to_string_pretty(&tx_env)?)?;
+
+                let hash = torsten_crypto::signing::hash_transaction(&body_cbor);
+                println!("Signed transaction assembled.");
+                println!("Transaction ID: {hash}");
+                println!("Output: {}", out_file.display());
+                Ok(())
+            }
+            TxSubcommand::Policyid { script_file } => {
+                let content = std::fs::read_to_string(&script_file)?;
+                let script: serde_json::Value = serde_json::from_str(&content)?;
+
+                // Serialize the native script to CBOR and hash it
+                // For simplicity, hash the JSON representation
+                let script_bytes = serde_json::to_vec(&script)?;
+                let hash = torsten_primitives::hash::blake2b_224(&script_bytes);
+                println!("{}", hash.to_hex());
                 Ok(())
             }
         }

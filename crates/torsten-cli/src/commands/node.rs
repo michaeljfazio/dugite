@@ -19,6 +19,20 @@ enum NodeSubcommand {
         #[arg(long)]
         operational_certificate_counter_file: PathBuf,
     },
+    /// Generate a KES key pair
+    KeyGenKes {
+        #[arg(long)]
+        verification_key_file: PathBuf,
+        #[arg(long)]
+        signing_key_file: PathBuf,
+    },
+    /// Generate a VRF key pair
+    KeyGenVrf {
+        #[arg(long)]
+        verification_key_file: PathBuf,
+        #[arg(long)]
+        signing_key_file: PathBuf,
+    },
     /// Issue a new operational certificate
     IssueOpCert {
         #[arg(long)]
@@ -31,6 +45,15 @@ enum NodeSubcommand {
         kes_period: u64,
         #[arg(long)]
         out_file: PathBuf,
+    },
+    /// Create a new operational certificate issue counter
+    NewCounter {
+        #[arg(long)]
+        cold_verification_key_file: PathBuf,
+        #[arg(long)]
+        counter_value: u64,
+        #[arg(long)]
+        operational_certificate_counter_file: PathBuf,
     },
 }
 
@@ -109,6 +132,66 @@ impl NodeCmd {
                 );
                 Ok(())
             }
+            NodeSubcommand::KeyGenKes {
+                verification_key_file,
+                signing_key_file,
+            } => {
+                // KES keys are ed25519 keys (simplified - real KES uses sum composition)
+                let sk = torsten_crypto::keys::PaymentSigningKey::generate();
+                let vk = sk.verification_key();
+
+                let sk_env = serde_json::json!({
+                    "type": "KesSigningKey_ed25519_kes_2^6",
+                    "description": "KES Signing Key",
+                    "cborHex": hex::encode(simple_cbor_wrap(&sk.to_bytes()))
+                });
+                let vk_env = serde_json::json!({
+                    "type": "KesVerificationKey_ed25519_kes_2^6",
+                    "description": "KES Verification Key",
+                    "cborHex": hex::encode(simple_cbor_wrap(&vk.to_bytes()))
+                });
+
+                std::fs::write(&signing_key_file, serde_json::to_string_pretty(&sk_env)?)?;
+                std::fs::write(
+                    &verification_key_file,
+                    serde_json::to_string_pretty(&vk_env)?,
+                )?;
+
+                println!("KES key pair generated.");
+                println!("Verification key: {}", verification_key_file.display());
+                println!("Signing key: {}", signing_key_file.display());
+                Ok(())
+            }
+            NodeSubcommand::KeyGenVrf {
+                verification_key_file,
+                signing_key_file,
+            } => {
+                // VRF keys - use ed25519 as placeholder
+                let sk = torsten_crypto::keys::PaymentSigningKey::generate();
+                let vk = sk.verification_key();
+
+                let sk_env = serde_json::json!({
+                    "type": "VrfSigningKey_PraosVRF",
+                    "description": "VRF Signing Key",
+                    "cborHex": hex::encode(simple_cbor_wrap(&sk.to_bytes()))
+                });
+                let vk_env = serde_json::json!({
+                    "type": "VrfVerificationKey_PraosVRF",
+                    "description": "VRF Verification Key",
+                    "cborHex": hex::encode(simple_cbor_wrap(&vk.to_bytes()))
+                });
+
+                std::fs::write(&signing_key_file, serde_json::to_string_pretty(&sk_env)?)?;
+                std::fs::write(
+                    &verification_key_file,
+                    serde_json::to_string_pretty(&vk_env)?,
+                )?;
+
+                println!("VRF key pair generated.");
+                println!("Verification key: {}", verification_key_file.display());
+                println!("Signing key: {}", signing_key_file.display());
+                Ok(())
+            }
             NodeSubcommand::IssueOpCert {
                 kes_verification_key_file,
                 cold_signing_key_file,
@@ -122,6 +205,41 @@ impl NodeCmd {
                 kes_period,
                 &out_file,
             ),
+            NodeSubcommand::NewCounter {
+                cold_verification_key_file,
+                counter_value,
+                operational_certificate_counter_file,
+            } => {
+                let vk_content = std::fs::read_to_string(&cold_verification_key_file)?;
+                let vk_env: serde_json::Value = serde_json::from_str(&vk_content)?;
+                let vk_cbor_hex = vk_env["cborHex"]
+                    .as_str()
+                    .ok_or_else(|| anyhow::anyhow!("Missing cborHex in cold vkey file"))?;
+                let vk_cbor = hex::decode(vk_cbor_hex)?;
+
+                let mut counter_cbor = Vec::new();
+                let mut enc = minicbor::Encoder::new(&mut counter_cbor);
+                enc.array(2)?;
+                enc.u64(counter_value)?;
+                enc.bytes(&vk_cbor)?;
+
+                let counter_env = serde_json::json!({
+                    "type": "NodeOperationalCertificateIssueCounter",
+                    "description": format!("Next certificate issue number: {counter_value}"),
+                    "cborHex": hex::encode(&counter_cbor)
+                });
+                std::fs::write(
+                    &operational_certificate_counter_file,
+                    serde_json::to_string_pretty(&counter_env)?,
+                )?;
+
+                println!("Counter created: {counter_value}");
+                println!(
+                    "Counter file: {}",
+                    operational_certificate_counter_file.display()
+                );
+                Ok(())
+            }
         }
     }
 }

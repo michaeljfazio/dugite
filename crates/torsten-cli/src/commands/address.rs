@@ -14,6 +14,21 @@ pub struct AddressCmd {
 
 #[derive(Subcommand, Debug)]
 enum AddressSubcommand {
+    /// Generate a payment key pair
+    KeyGen {
+        /// Output verification key file
+        #[arg(long)]
+        verification_key_file: PathBuf,
+        /// Output signing key file
+        #[arg(long)]
+        signing_key_file: PathBuf,
+    },
+    /// Get the hash of a verification key
+    KeyHash {
+        /// Payment verification key file
+        #[arg(long)]
+        payment_verification_key_file: PathBuf,
+    },
     /// Build an address from verification keys
     Build {
         /// Payment verification key file
@@ -37,9 +52,61 @@ enum AddressSubcommand {
     },
 }
 
+fn simple_cbor_wrap(data: &[u8]) -> Vec<u8> {
+    let mut result = Vec::new();
+    if data.len() < 24 {
+        result.push(0x40 | data.len() as u8);
+    } else if data.len() < 256 {
+        result.push(0x58);
+        result.push(data.len() as u8);
+    } else {
+        result.push(0x59);
+        result.extend_from_slice(&(data.len() as u16).to_be_bytes());
+    }
+    result.extend_from_slice(data);
+    result
+}
+
 impl AddressCmd {
     pub fn run(self) -> Result<()> {
         match self.command {
+            AddressSubcommand::KeyGen {
+                verification_key_file,
+                signing_key_file,
+            } => {
+                let sk = torsten_crypto::keys::PaymentSigningKey::generate();
+                let vk = sk.verification_key();
+
+                let sk_env = serde_json::json!({
+                    "type": "PaymentSigningKeyShelley_ed25519",
+                    "description": "Payment Signing Key",
+                    "cborHex": hex::encode(simple_cbor_wrap(&sk.to_bytes()))
+                });
+                let vk_env = serde_json::json!({
+                    "type": "PaymentVerificationKeyShelley_ed25519",
+                    "description": "Payment Verification Key",
+                    "cborHex": hex::encode(simple_cbor_wrap(&vk.to_bytes()))
+                });
+
+                std::fs::write(&signing_key_file, serde_json::to_string_pretty(&sk_env)?)?;
+                std::fs::write(
+                    &verification_key_file,
+                    serde_json::to_string_pretty(&vk_env)?,
+                )?;
+
+                println!("Payment key pair generated.");
+                println!("Verification key: {}", verification_key_file.display());
+                println!("Signing key: {}", signing_key_file.display());
+                Ok(())
+            }
+            AddressSubcommand::KeyHash {
+                payment_verification_key_file,
+            } => {
+                let vk = load_verification_key(&payment_verification_key_file)?;
+                let hash = vk.hash();
+                println!("{}", hash.to_hex());
+                Ok(())
+            }
             AddressSubcommand::Build {
                 payment_verification_key_file,
                 stake_verification_key_file,

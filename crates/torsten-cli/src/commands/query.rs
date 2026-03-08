@@ -58,6 +58,22 @@ enum QuerySubcommand {
         #[arg(long, default_value = "node.sock")]
         socket_path: PathBuf,
     },
+    /// Query the transaction mempool
+    TxMempool {
+        #[arg(long, default_value = "node.sock")]
+        socket_path: PathBuf,
+        /// Subcommand: info, next-tx, has-tx
+        #[arg(default_value = "info")]
+        subcmd: String,
+        /// Transaction ID (for has-tx)
+        #[arg(long)]
+        tx_id: Option<String>,
+    },
+    /// Query registered stake pools
+    StakePools {
+        #[arg(long, default_value = "node.sock")]
+        socket_path: PathBuf,
+    },
 }
 
 /// Map era index to era name
@@ -595,6 +611,70 @@ impl QueryCmd {
                     }
                 }
 
+                Ok(())
+            }
+            QuerySubcommand::TxMempool {
+                socket_path: _,
+                subcmd,
+                tx_id,
+            } => {
+                // LocalTxMonitor protocol (mini-protocol 10) is used for mempool queries
+                // This requires a separate protocol handler from LocalStateQuery
+                match subcmd.as_str() {
+                    "info" => {
+                        println!("Mempool info query uses the LocalTxMonitor protocol.");
+                        println!(
+                            "Use the node's monitoring endpoint or connect via LocalTxMonitor."
+                        );
+                    }
+                    "has-tx" => {
+                        if let Some(id) = tx_id {
+                            println!("Checking mempool for tx: {id}");
+                        }
+                        println!("has-tx query uses the LocalTxMonitor protocol (MsgHasTx).");
+                    }
+                    _ => {
+                        println!("Available subcommands: info, has-tx, next-tx");
+                    }
+                }
+                Ok(())
+            }
+            QuerySubcommand::StakePools { socket_path } => {
+                let mut client = connect_and_acquire(&socket_path).await?;
+
+                let raw = client
+                    .query_stake_distribution()
+                    .await
+                    .map_err(|e| anyhow::anyhow!("Failed to query stake pools: {e}"))?;
+
+                release_and_done(&mut client).await;
+
+                let mut decoder = minicbor::Decoder::new(&raw);
+                let _ = decoder.array();
+                let tag = decoder.u32().unwrap_or(999);
+                if tag != 4 {
+                    anyhow::bail!("Expected MsgResult(4), got {tag}");
+                }
+
+                let arr_len = decoder.array().unwrap_or(Some(0)).unwrap_or(0);
+                let mut pool_ids = Vec::new();
+                for _ in 0..arr_len {
+                    let map_len = decoder.map().unwrap_or(Some(0)).unwrap_or(0);
+                    for _ in 0..map_len {
+                        let key = decoder.str().unwrap_or("");
+                        if key == "pool_id" {
+                            let bytes = decoder.bytes().unwrap_or(&[]);
+                            pool_ids.push(hex::encode(bytes));
+                        } else {
+                            decoder.skip().ok();
+                        }
+                    }
+                }
+
+                println!("Registered Stake Pools: {}", pool_ids.len());
+                for id in &pool_ids {
+                    println!("  pool {id}");
+                }
                 Ok(())
             }
         }
