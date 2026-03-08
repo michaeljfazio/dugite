@@ -180,8 +180,8 @@ fn decode_transaction_from_pallas(tx: &PallasTx) -> Result<Transaction, Serializ
         collateral_return: None,
         total_collateral: None,
         reference_inputs,
-        voting_procedures: BTreeMap::new(),
-        proposal_procedures: Vec::new(),
+        voting_procedures: convert_voting_procedures(tx),
+        proposal_procedures: convert_proposal_procedures(tx),
         treasury_value: None,
         donation: None,
     };
@@ -651,6 +651,129 @@ fn convert_withdrawals(tx: &PallasTx) -> BTreeMap<Vec<u8>, Lovelace> {
         _ => {}
     }
     result
+}
+
+fn convert_voting_procedures(
+    tx: &PallasTx,
+) -> BTreeMap<Voter, BTreeMap<GovActionId, VotingProcedure>> {
+    let mut result = BTreeMap::new();
+
+    if let Some(conway_tx) = tx.as_conway() {
+        if let Some(voting_procs) = &conway_tx.transaction_body.voting_procedures {
+            for (pallas_voter, votes_by_action) in voting_procs.iter() {
+                let voter = convert_pallas_voter(pallas_voter);
+                let mut action_votes = BTreeMap::new();
+                for (pallas_action_id, pallas_proc) in votes_by_action.iter() {
+                    let action_id = GovActionId {
+                        transaction_id: pallas_hash_to_torsten32(&pallas_action_id.transaction_id),
+                        action_index: pallas_action_id.action_index,
+                    };
+                    let procedure = VotingProcedure {
+                        vote: convert_pallas_vote(&pallas_proc.vote),
+                        anchor: pallas_proc.anchor.as_ref().map(convert_pallas_anchor),
+                    };
+                    action_votes.insert(action_id, procedure);
+                }
+                result.insert(voter, action_votes);
+            }
+        }
+    }
+
+    result
+}
+
+fn convert_proposal_procedures(tx: &PallasTx) -> Vec<ProposalProcedure> {
+    tx.gov_proposals()
+        .iter()
+        .filter_map(|proposal| {
+            let conway_prop = proposal.as_conway()?;
+            Some(ProposalProcedure {
+                deposit: Lovelace(conway_prop.deposit),
+                return_addr: conway_prop.reward_account.to_vec(),
+                gov_action: convert_pallas_gov_action(&conway_prop.gov_action),
+                anchor: convert_pallas_anchor(&conway_prop.anchor),
+            })
+        })
+        .collect()
+}
+
+fn convert_pallas_voter(voter: &pallas_primitives::conway::Voter) -> Voter {
+    use pallas_primitives::conway::Voter as PV;
+    match voter {
+        PV::ConstitutionalCommitteeKey(h) => {
+            Voter::ConstitutionalCommittee(Credential::VerificationKey(pallas_hash_to_torsten28(h)))
+        }
+        PV::ConstitutionalCommitteeScript(h) => {
+            Voter::ConstitutionalCommittee(Credential::Script(pallas_hash_to_torsten28(h)))
+        }
+        PV::DRepKey(h) => Voter::DRep(Credential::VerificationKey(pallas_hash_to_torsten28(h))),
+        PV::DRepScript(h) => Voter::DRep(Credential::Script(pallas_hash_to_torsten28(h))),
+        PV::StakePoolKey(h) => Voter::StakePool(pallas_hash_to_torsten32(
+            &pallas_crypto::hash::Hash::from(h.as_ref()),
+        )),
+    }
+}
+
+fn convert_pallas_vote(vote: &pallas_primitives::conway::Vote) -> Vote {
+    use pallas_primitives::conway::Vote as PV;
+    match vote {
+        PV::No => Vote::No,
+        PV::Yes => Vote::Yes,
+        PV::Abstain => Vote::Abstain,
+    }
+}
+
+fn convert_pallas_gov_action(action: &pallas_primitives::conway::GovAction) -> GovAction {
+    use pallas_primitives::conway::GovAction as PGA;
+    let convert_prev = |prev_id: &Option<pallas_primitives::conway::GovActionId>| {
+        prev_id.as_ref().map(|id| GovActionId {
+            transaction_id: pallas_hash_to_torsten32(&id.transaction_id),
+            action_index: id.action_index,
+        })
+    };
+    match action {
+        PGA::ParameterChange(prev_id, _update, _script) => GovAction::ParameterChange {
+            prev_action_id: convert_prev(prev_id),
+            protocol_param_update: Box::default(),
+            policy_hash: None,
+        },
+        PGA::HardForkInitiation(prev_id, version) => GovAction::HardForkInitiation {
+            prev_action_id: convert_prev(prev_id),
+            protocol_version: (version.0, version.1),
+        },
+        PGA::TreasuryWithdrawals(withdrawals, _script) => {
+            let mut converted = BTreeMap::new();
+            for (account, amount) in withdrawals.iter() {
+                converted.insert(account.to_vec(), Lovelace(*amount));
+            }
+            GovAction::TreasuryWithdrawals {
+                withdrawals: converted,
+                policy_hash: None,
+            }
+        }
+        PGA::NoConfidence(prev_id) => GovAction::NoConfidence {
+            prev_action_id: convert_prev(prev_id),
+        },
+        PGA::UpdateCommittee(prev_id, _remove, _add, _threshold) => GovAction::UpdateCommittee {
+            prev_action_id: convert_prev(prev_id),
+            members_to_remove: Vec::new(),
+            members_to_add: BTreeMap::new(),
+            threshold: Rational {
+                numerator: 0,
+                denominator: 1,
+            },
+        },
+        PGA::NewConstitution(prev_id, constitution) => GovAction::NewConstitution {
+            prev_action_id: convert_prev(prev_id),
+            constitution: Constitution {
+                anchor: convert_pallas_anchor(&constitution.anchor),
+                script_hash: constitution
+                    .guardrail_script
+                    .map(|h| pallas_hash_to_torsten28(&h)),
+            },
+        },
+        PGA::Information => GovAction::InfoAction,
+    }
 }
 
 fn convert_era(era: pallas_traverse::Era) -> Era {
