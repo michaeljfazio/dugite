@@ -262,12 +262,14 @@ fn decode_transaction_from_pallas(tx: &PallasTx) -> Result<Transaction, Serializ
         redeemers,
     };
 
+    let auxiliary_data = convert_auxiliary_data(tx);
+
     Ok(Transaction {
         hash: tx_hash,
         body,
         witness_set,
         is_valid: tx.is_valid(),
-        auxiliary_data: None,
+        auxiliary_data,
     })
 }
 
@@ -371,6 +373,52 @@ fn convert_mint(tx: &PallasTx) -> BTreeMap<Hash28, BTreeMap<AssetName, i64>> {
     }
 
     result
+}
+
+fn convert_auxiliary_data(tx: &PallasTx) -> Option<AuxiliaryData> {
+    use pallas_traverse::MultiEraMeta;
+    match tx.metadata() {
+        MultiEraMeta::Empty | MultiEraMeta::NotApplicable => None,
+        MultiEraMeta::AlonzoCompatible(metadata) => {
+            let converted: BTreeMap<u64, TransactionMetadatum> = metadata
+                .iter()
+                .map(|(label, value)| (*label, convert_metadatum(value)))
+                .collect();
+            if converted.is_empty() {
+                None
+            } else {
+                Some(AuxiliaryData {
+                    metadata: converted,
+                    native_scripts: Vec::new(),
+                    plutus_v1_scripts: Vec::new(),
+                    plutus_v2_scripts: Vec::new(),
+                    plutus_v3_scripts: Vec::new(),
+                })
+            }
+        }
+        _ => None,
+    }
+}
+
+fn convert_metadatum(m: &pallas_primitives::Metadatum) -> TransactionMetadatum {
+    use pallas_primitives::Metadatum as PM;
+    match m {
+        PM::Int(i) => {
+            let val: i128 = (*i).into();
+            TransactionMetadatum::Int(val)
+        }
+        PM::Bytes(b) => TransactionMetadatum::Bytes(b.to_vec()),
+        PM::Text(s) => TransactionMetadatum::Text(s.clone()),
+        PM::Array(items) => {
+            TransactionMetadatum::List(items.iter().map(convert_metadatum).collect())
+        }
+        PM::Map(entries) => TransactionMetadatum::Map(
+            entries
+                .iter()
+                .map(|(k, v)| (convert_metadatum(k), convert_metadatum(v)))
+                .collect(),
+        ),
+    }
 }
 
 fn extract_auxiliary_data_hash(tx: &PallasTx) -> Option<Hash32> {
