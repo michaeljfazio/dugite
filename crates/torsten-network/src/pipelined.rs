@@ -217,17 +217,18 @@ impl PipelinedPeerClient {
                 Message::RollBackward(point, tip) => {
                     let torsten_tip = pallas_to_torsten_tip(&tip);
                     let rollback_point = pallas_to_torsten_point(&point);
-                    // Drain remaining in-flight responses before returning
-                    self.drain_in_flight().await;
-                    if !headers.is_empty() {
-                        return Ok(HeaderBatchResult::HeadersAndRollback {
-                            headers,
-                            tip: torsten_tip.clone(),
-                            rollback_point,
-                            rollback_tip: torsten_tip,
-                        });
+                    // After a rollback, any previously collected headers are
+                    // invalid (they were before the rollback). Clear them and
+                    // continue reading the remaining in-flight responses, which
+                    // contain the post-rollback headers.
+                    headers.clear();
+                    latest_tip = Some(torsten_tip.clone());
+                    // If no more in-flight, return the rollback
+                    if self.in_flight == 0 {
+                        return Ok(HeaderBatchResult::RollBackward(rollback_point, torsten_tip));
                     }
-                    return Ok(HeaderBatchResult::RollBackward(rollback_point, torsten_tip));
+                    // Otherwise continue the loop — remaining in-flight
+                    // responses will be post-rollback RollForward headers
                 }
                 Message::AwaitReply => {
                     // Server is at tip, no more blocks available right now.
