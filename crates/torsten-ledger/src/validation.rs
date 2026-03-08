@@ -39,6 +39,10 @@ pub enum ValidationError {
     CollateralNotFound(String),
     #[error("Collateral input contains tokens (must be pure ADA): {0}")]
     CollateralHasTokens(String),
+    #[error("Reference input not found in UTxO set: {0}")]
+    ReferenceInputNotFound(String),
+    #[error("Reference input overlaps with regular input: {0}")]
+    ReferenceInputOverlapsInput(String),
     #[error("Multi-asset not conserved for policy {policy}: inputs+mint={input_side}, outputs={output_side}")]
     MultiAssetNotConserved {
         policy: String,
@@ -213,7 +217,54 @@ pub fn validate_transaction(
         }
     }
 
-    // Rule 9: Collateral check for Plutus transactions
+    // Rule 9: Reference inputs must exist in UTxO and not overlap with regular inputs
+    if !body.reference_inputs.is_empty() {
+        let input_set: HashSet<_> = body.inputs.iter().collect();
+        for ref_input in &body.reference_inputs {
+            if utxo_set.lookup(ref_input).is_none() {
+                errors.push(ValidationError::ReferenceInputNotFound(
+                    ref_input.to_string(),
+                ));
+            }
+            if input_set.contains(ref_input) {
+                errors.push(ValidationError::ReferenceInputOverlapsInput(
+                    ref_input.to_string(),
+                ));
+            }
+        }
+    }
+
+    // Rule 10: Required signers must have corresponding vkey witnesses
+    // Required signers are key hashes (blake2b-224 of the verification key)
+    if !body.required_signers.is_empty() && !tx.witness_set.vkey_witnesses.is_empty() {
+        let witness_keyhashes: HashSet<_> = tx
+            .witness_set
+            .vkey_witnesses
+            .iter()
+            .map(|w| torsten_primitives::hash::blake2b_224(&w.vkey))
+            .collect();
+        for required_signer in &body.required_signers {
+            // Compare first 28 bytes (Hash32 may be zero-padded Hash28)
+            let signer_28 = &required_signer.as_bytes()[..28];
+            let has_witness = witness_keyhashes
+                .iter()
+                .any(|kh| kh.as_bytes() == signer_28);
+            if !has_witness {
+                errors.push(ValidationError::MissingRequiredSigner(
+                    required_signer.to_hex(),
+                ));
+            }
+        }
+    } else if !body.required_signers.is_empty() {
+        // Required signers but no vkey witnesses at all
+        for required_signer in &body.required_signers {
+            errors.push(ValidationError::MissingRequiredSigner(
+                required_signer.to_hex(),
+            ));
+        }
+    }
+
+    // Rule 11: Collateral check for Plutus transactions
     if has_plutus_scripts(tx) {
         if body.collateral.is_empty() {
             errors.push(ValidationError::InsufficientCollateral);
@@ -1229,5 +1280,100 @@ mod tests {
         assert!(errors
             .iter()
             .any(|e| matches!(e, ValidationError::ExUnitsExceeded)));
+    }
+
+    #[test]
+    fn test_reference_input_valid() {
+        let mut utxo_set = UtxoSet::new();
+        let input = TransactionInput {
+            transaction_id: Hash32::from_bytes([1u8; 32]),
+            index: 0,
+        };
+        utxo_set.insert(
+            input.clone(),
+            TransactionOutput {
+                address: Address::Byron(ByronAddress {
+                    payload: vec![0u8; 32],
+                }),
+                value: Value::lovelace(10_000_000),
+                datum: OutputDatum::None,
+                script_ref: None,
+            },
+        );
+        let ref_input = TransactionInput {
+            transaction_id: Hash32::from_bytes([2u8; 32]),
+            index: 0,
+        };
+        utxo_set.insert(
+            ref_input.clone(),
+            TransactionOutput {
+                address: Address::Byron(ByronAddress {
+                    payload: vec![0u8; 32],
+                }),
+                value: Value::lovelace(5_000_000),
+                datum: OutputDatum::None,
+                script_ref: None,
+            },
+        );
+
+        let params = ProtocolParameters::mainnet_defaults();
+        let mut tx = make_simple_tx(input, 9_800_000, 200_000);
+        tx.body.reference_inputs = vec![ref_input];
+        let result = validate_transaction(&tx, &utxo_set, &params, 100, 300);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_reference_input_not_found() {
+        let (utxo_set, input) = make_simple_utxo_set();
+        let params = ProtocolParameters::mainnet_defaults();
+
+        let missing_ref = TransactionInput {
+            transaction_id: Hash32::from_bytes([99u8; 32]),
+            index: 0,
+        };
+        let mut tx = make_simple_tx(input, 9_800_000, 200_000);
+        tx.body.reference_inputs = vec![missing_ref];
+
+        let result = validate_transaction(&tx, &utxo_set, &params, 100, 300);
+        assert!(result.is_err());
+        let errors = result.unwrap_err();
+        assert!(errors
+            .iter()
+            .any(|e| matches!(e, ValidationError::ReferenceInputNotFound(_))));
+    }
+
+    #[test]
+    fn test_reference_input_overlaps_input() {
+        let (utxo_set, input) = make_simple_utxo_set();
+        let params = ProtocolParameters::mainnet_defaults();
+
+        // Use the same input as both regular and reference
+        let mut tx = make_simple_tx(input.clone(), 9_800_000, 200_000);
+        tx.body.reference_inputs = vec![input];
+
+        let result = validate_transaction(&tx, &utxo_set, &params, 100, 300);
+        assert!(result.is_err());
+        let errors = result.unwrap_err();
+        assert!(errors
+            .iter()
+            .any(|e| matches!(e, ValidationError::ReferenceInputOverlapsInput(_))));
+    }
+
+    #[test]
+    fn test_required_signer_missing() {
+        let (utxo_set, input) = make_simple_utxo_set();
+        let params = ProtocolParameters::mainnet_defaults();
+
+        let mut tx = make_simple_tx(input, 9_800_000, 200_000);
+        // Require a signer that doesn't exist in witnesses
+        tx.body.required_signers = vec![Hash32::from_bytes([0xAA; 32])];
+
+        let result = validate_transaction(&tx, &utxo_set, &params, 100, 300);
+        assert!(result.is_err());
+        let errors = result.unwrap_err();
+        assert!(errors
+            .iter()
+            .any(|e| matches!(e, ValidationError::MissingRequiredSigner(_))));
     }
 }
