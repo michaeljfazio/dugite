@@ -468,7 +468,7 @@ impl N2CClient {
         let mut enc = minicbor::Encoder::new(&mut payload);
         enc.array(1)
             .map_err(|e| N2CClientError::Protocol(e.to_string()))?;
-        enc.u32(0)
+        enc.u32(1)
             .map_err(|e| N2CClientError::Protocol(e.to_string()))?; // MsgAcquire
 
         let segment = Segment {
@@ -485,9 +485,9 @@ impl N2CClient {
         let tag = decoder
             .u32()
             .map_err(|e| N2CClientError::Protocol(e.to_string()))?;
-        if tag != 1 {
+        if tag != 2 {
             return Err(N2CClientError::Protocol(format!(
-                "expected MsgAcquired(1), got {tag}"
+                "expected MsgAcquired(2), got {tag}"
             )));
         }
         let slot = decoder.u64().unwrap_or(0);
@@ -500,7 +500,7 @@ impl N2CClient {
         let mut enc = minicbor::Encoder::new(&mut payload);
         enc.array(2)
             .map_err(|e| N2CClientError::Protocol(e.to_string()))?;
-        enc.u32(4)
+        enc.u32(7)
             .map_err(|e| N2CClientError::Protocol(e.to_string()))?; // MsgHasTx
         enc.bytes(tx_hash)
             .map_err(|e| N2CClientError::Protocol(e.to_string()))?;
@@ -519,9 +519,9 @@ impl N2CClient {
         let tag = decoder
             .u32()
             .map_err(|e| N2CClientError::Protocol(e.to_string()))?;
-        if tag != 5 {
+        if tag != 8 {
             return Err(N2CClientError::Protocol(format!(
-                "expected MsgHasTxReply(5), got {tag}"
+                "expected MsgReplyHasTx(8), got {tag}"
             )));
         }
         let has_tx = decoder.bool().unwrap_or(false);
@@ -534,7 +534,7 @@ impl N2CClient {
         let mut enc = minicbor::Encoder::new(&mut payload);
         enc.array(1)
             .map_err(|e| N2CClientError::Protocol(e.to_string()))?;
-        enc.u32(8)
+        enc.u32(9)
             .map_err(|e| N2CClientError::Protocol(e.to_string()))?; // MsgGetSizes
 
         let segment = Segment {
@@ -551,9 +551,9 @@ impl N2CClient {
         let tag = decoder
             .u32()
             .map_err(|e| N2CClientError::Protocol(e.to_string()))?;
-        if tag != 9 {
+        if tag != 10 {
             return Err(N2CClientError::Protocol(format!(
-                "expected MsgGetSizesReply(9), got {tag}"
+                "expected MsgReplyGetSizes(10), got {tag}"
             )));
         }
         let _ = decoder.array();
@@ -570,7 +570,7 @@ impl N2CClient {
         let mut enc = minicbor::Encoder::new(&mut payload);
         enc.array(1)
             .map_err(|e| N2CClientError::Protocol(e.to_string()))?;
-        enc.u32(6)
+        enc.u32(5)
             .map_err(|e| N2CClientError::Protocol(e.to_string()))?; // MsgNextTx
 
         let segment = Segment {
@@ -587,9 +587,9 @@ impl N2CClient {
         let tag = decoder
             .u32()
             .map_err(|e| N2CClientError::Protocol(e.to_string()))?;
-        if tag != 7 {
+        if tag != 6 {
             return Err(N2CClientError::Protocol(format!(
-                "expected MsgNextTxReply(7), got {tag}"
+                "expected MsgReplyNextTx(6), got {tag}"
             )));
         }
         // Check if the response is null (no tx) or [era_id, tx_bytes]
@@ -614,7 +614,7 @@ impl N2CClient {
         let mut enc = minicbor::Encoder::new(&mut payload);
         enc.array(1)
             .map_err(|e| N2CClientError::Protocol(e.to_string()))?;
-        enc.u32(2)
+        enc.u32(3)
             .map_err(|e| N2CClientError::Protocol(e.to_string()))?; // MsgRelease
 
         let segment = Segment {
