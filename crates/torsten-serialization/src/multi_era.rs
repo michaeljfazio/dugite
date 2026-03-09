@@ -1161,14 +1161,26 @@ fn convert_pallas_protocol_param_update(
             .drep_voting_thresholds
             .as_ref()
             .map(|d| convert_rational(&d.treasury_withdrawal)),
+        pvt_motion_no_confidence: update
+            .pool_voting_thresholds
+            .as_ref()
+            .map(|p| convert_rational(&p.motion_no_confidence)),
+        pvt_committee_normal: update
+            .pool_voting_thresholds
+            .as_ref()
+            .map(|p| convert_rational(&p.committee_normal)),
+        pvt_committee_no_confidence: update
+            .pool_voting_thresholds
+            .as_ref()
+            .map(|p| convert_rational(&p.committee_no_confidence)),
         pvt_hard_fork: update
             .pool_voting_thresholds
             .as_ref()
             .map(|p| convert_rational(&p.hard_fork_initiation)),
-        pvt_committee: update
+        pvt_pp_security_group: update
             .pool_voting_thresholds
             .as_ref()
-            .map(|p| convert_rational(&p.committee_normal)),
+            .map(|p| convert_rational(&p.security_voting_threshold)),
         min_committee_size: update.min_committee_size,
         committee_term_limit: update.committee_term_limit,
         drep_activity: update.drep_inactivity_period,

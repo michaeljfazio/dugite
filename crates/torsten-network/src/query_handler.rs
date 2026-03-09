@@ -132,10 +132,16 @@ pub struct ProtocolParamsSnapshot {
     pub dvt_constitution_den: u64,
     pub dvt_treasury_withdrawal_num: u64,
     pub dvt_treasury_withdrawal_den: u64,
+    pub pvt_motion_no_confidence_num: u64,
+    pub pvt_motion_no_confidence_den: u64,
+    pub pvt_committee_normal_num: u64,
+    pub pvt_committee_normal_den: u64,
+    pub pvt_committee_no_confidence_num: u64,
+    pub pvt_committee_no_confidence_den: u64,
     pub pvt_hard_fork_num: u64,
     pub pvt_hard_fork_den: u64,
-    pub pvt_committee_num: u64,
-    pub pvt_committee_den: u64,
+    pub pvt_pp_security_group_num: u64,
+    pub pvt_pp_security_group_den: u64,
 }
 
 impl Default for ProtocolParamsSnapshot {
@@ -195,10 +201,16 @@ impl Default for ProtocolParamsSnapshot {
             dvt_constitution_den: 100,
             dvt_treasury_withdrawal_num: 67,
             dvt_treasury_withdrawal_den: 100,
+            pvt_motion_no_confidence_num: 51,
+            pvt_motion_no_confidence_den: 100,
+            pvt_committee_normal_num: 51,
+            pvt_committee_normal_den: 100,
+            pvt_committee_no_confidence_num: 51,
+            pvt_committee_no_confidence_den: 100,
             pvt_hard_fork_num: 51,
             pvt_hard_fork_den: 100,
-            pvt_committee_num: 51,
-            pvt_committee_den: 100,
+            pvt_pp_security_group_num: 51,
+            pvt_pp_security_group_den: 100,
         }
     }
 }

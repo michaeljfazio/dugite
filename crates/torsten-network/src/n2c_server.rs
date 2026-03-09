@@ -1205,34 +1205,35 @@ fn encode_protocol_params_cbor(
     enc.u64(pp.protocol_version_major).ok();
     enc.u64(pp.protocol_version_minor).ok();
 
-    // 26: pool_voting_thresholds [pvt_committee, pvt_hard_fork, ...]
+    // 26: pool_voting_thresholds [motion_no_confidence, committee_normal,
+    //     committee_no_confidence, hard_fork_initiation, pp_security_group]
     enc.u32(26).ok();
     enc.array(5).ok();
     // motion_no_confidence
     enc.tag(minicbor::data::Tag::new(30)).ok();
     enc.array(2).ok();
-    enc.u64(pp.pvt_committee_num).ok();
-    enc.u64(pp.pvt_committee_den).ok();
+    enc.u64(pp.pvt_motion_no_confidence_num).ok();
+    enc.u64(pp.pvt_motion_no_confidence_den).ok();
     // committee_normal
     enc.tag(minicbor::data::Tag::new(30)).ok();
     enc.array(2).ok();
-    enc.u64(pp.pvt_committee_num).ok();
-    enc.u64(pp.pvt_committee_den).ok();
+    enc.u64(pp.pvt_committee_normal_num).ok();
+    enc.u64(pp.pvt_committee_normal_den).ok();
     // committee_no_confidence
     enc.tag(minicbor::data::Tag::new(30)).ok();
     enc.array(2).ok();
-    enc.u64(pp.pvt_committee_num).ok();
-    enc.u64(pp.pvt_committee_den).ok();
+    enc.u64(pp.pvt_committee_no_confidence_num).ok();
+    enc.u64(pp.pvt_committee_no_confidence_den).ok();
     // hard_fork_initiation
     enc.tag(minicbor::data::Tag::new(30)).ok();
     enc.array(2).ok();
     enc.u64(pp.pvt_hard_fork_num).ok();
     enc.u64(pp.pvt_hard_fork_den).ok();
-    // pp_security_group (use pvt_committee as placeholder)
+    // pp_security_group
     enc.tag(minicbor::data::Tag::new(30)).ok();
     enc.array(2).ok();
-    enc.u64(pp.pvt_committee_num).ok();
-    enc.u64(pp.pvt_committee_den).ok();
+    enc.u64(pp.pvt_pp_security_group_num).ok();
+    enc.u64(pp.pvt_pp_security_group_den).ok();
 
     // 27: drep_voting_thresholds [dvt_*, ...]
     enc.u32(27).ok();

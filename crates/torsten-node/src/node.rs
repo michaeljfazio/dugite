@@ -1642,10 +1642,16 @@ impl Node {
             dvt_constitution_den: pp.dvt_constitution.denominator,
             dvt_treasury_withdrawal_num: pp.dvt_treasury_withdrawal.numerator,
             dvt_treasury_withdrawal_den: pp.dvt_treasury_withdrawal.denominator,
+            pvt_motion_no_confidence_num: pp.pvt_motion_no_confidence.numerator,
+            pvt_motion_no_confidence_den: pp.pvt_motion_no_confidence.denominator,
+            pvt_committee_normal_num: pp.pvt_committee_normal.numerator,
+            pvt_committee_normal_den: pp.pvt_committee_normal.denominator,
+            pvt_committee_no_confidence_num: pp.pvt_committee_no_confidence.numerator,
+            pvt_committee_no_confidence_den: pp.pvt_committee_no_confidence.denominator,
             pvt_hard_fork_num: pp.pvt_hard_fork.numerator,
             pvt_hard_fork_den: pp.pvt_hard_fork.denominator,
-            pvt_committee_num: pp.pvt_committee.numerator,
-            pvt_committee_den: pp.pvt_committee.denominator,
+            pvt_pp_security_group_num: pp.pvt_pp_security_group.numerator,
+            pvt_pp_security_group_den: pp.pvt_pp_security_group.denominator,
         };
 
         let snapshot = NodeStateSnapshot {

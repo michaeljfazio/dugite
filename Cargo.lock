@@ -3011,6 +3011,7 @@ dependencies = [
  "clap",
  "hex",
  "minicbor 0.25.1",
+ "rand 0.8.5",
  "serde",
  "serde_json",
  "thiserror 2.0.18",

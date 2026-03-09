@@ -60,10 +60,16 @@ pub struct ProtocolParameters {
     pub dvt_constitution: Rational,
     /// DRep voting threshold for TreasuryWithdrawals
     pub dvt_treasury_withdrawal: Rational,
+    /// SPO voting threshold for MotionNoConfidence
+    pub pvt_motion_no_confidence: Rational,
+    /// SPO voting threshold for UpdateCommittee (normal state)
+    pub pvt_committee_normal: Rational,
+    /// SPO voting threshold for UpdateCommittee (no confidence state)
+    pub pvt_committee_no_confidence: Rational,
     /// SPO voting threshold for HardForkInitiation
     pub pvt_hard_fork: Rational,
-    /// SPO voting threshold for NoConfidence/UpdateCommittee
-    pub pvt_committee: Rational,
+    /// SPO voting threshold for security-relevant protocol parameter changes
+    pub pvt_pp_security_group: Rational,
 
     // Protocol version
     pub protocol_version_major: u64,
@@ -192,11 +198,23 @@ impl ProtocolParameters {
                 numerator: 67,
                 denominator: 100,
             },
+            pvt_motion_no_confidence: Rational {
+                numerator: 51,
+                denominator: 100,
+            },
+            pvt_committee_normal: Rational {
+                numerator: 51,
+                denominator: 100,
+            },
+            pvt_committee_no_confidence: Rational {
+                numerator: 51,
+                denominator: 100,
+            },
             pvt_hard_fork: Rational {
                 numerator: 51,
                 denominator: 100,
             },
-            pvt_committee: Rational {
+            pvt_pp_security_group: Rational {
                 numerator: 51,
                 denominator: 100,
             },

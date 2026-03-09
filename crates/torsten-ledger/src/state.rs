@@ -1138,8 +1138,8 @@ impl LedgerState {
     /// - InfoAction: always ratified (no thresholds)
     /// - ParameterChange: requires DRep vote ≥ dvt_p_param_change AND CC approval
     /// - HardForkInitiation: requires DRep ≥ dvt_hard_fork AND SPO ≥ pvt_hard_fork
-    /// - NoConfidence: requires DRep ≥ dvt_no_confidence AND SPO ≥ pvt_committee
-    /// - UpdateCommittee: requires DRep ≥ dvt_committee AND SPO ≥ pvt_committee
+    /// - NoConfidence: requires DRep ≥ dvt_no_confidence AND SPO ≥ pvt_motion_no_confidence
+    /// - UpdateCommittee: requires DRep ≥ dvt_committee AND SPO ≥ pvt_committee_normal
     /// - NewConstitution: requires DRep ≥ dvt_constitution AND CC approval
     /// - TreasuryWithdrawals: requires DRep ≥ dvt_treasury_withdrawal AND CC approval
     fn check_ratification(
@@ -1174,7 +1174,7 @@ impl LedgerState {
             }
             GovAction::NoConfidence { .. } => {
                 let drep_threshold = self.protocol_params.dvt_no_confidence.as_f64();
-                let spo_threshold = self.protocol_params.pvt_committee.as_f64();
+                let spo_threshold = self.protocol_params.pvt_motion_no_confidence.as_f64();
                 let drep_met =
                     check_threshold(drep_yes, drep_total.max(total_drep_stake), drep_threshold);
                 let spo_met = check_threshold(spo_yes, spo_total, spo_threshold);
@@ -1182,7 +1182,7 @@ impl LedgerState {
             }
             GovAction::UpdateCommittee { .. } => {
                 let drep_threshold = self.protocol_params.dvt_committee_normal.as_f64();
-                let spo_threshold = self.protocol_params.pvt_committee.as_f64();
+                let spo_threshold = self.protocol_params.pvt_committee_normal.as_f64();
                 let drep_met =
                     check_threshold(drep_yes, drep_total.max(total_drep_stake), drep_threshold);
                 let spo_met = check_threshold(spo_yes, spo_total, spo_threshold);
@@ -1439,11 +1439,20 @@ impl LedgerState {
                 if let Some(ref v) = update.dvt_treasury_withdrawal {
                     self.protocol_params.dvt_treasury_withdrawal = v.clone();
                 }
+                if let Some(ref v) = update.pvt_motion_no_confidence {
+                    self.protocol_params.pvt_motion_no_confidence = v.clone();
+                }
+                if let Some(ref v) = update.pvt_committee_normal {
+                    self.protocol_params.pvt_committee_normal = v.clone();
+                }
+                if let Some(ref v) = update.pvt_committee_no_confidence {
+                    self.protocol_params.pvt_committee_no_confidence = v.clone();
+                }
                 if let Some(ref v) = update.pvt_hard_fork {
                     self.protocol_params.pvt_hard_fork = v.clone();
                 }
-                if let Some(ref v) = update.pvt_committee {
-                    self.protocol_params.pvt_committee = v.clone();
+                if let Some(ref v) = update.pvt_pp_security_group {
+                    self.protocol_params.pvt_pp_security_group = v.clone();
                 }
                 if let Some(v) = update.min_committee_size {
                     self.protocol_params.committee_min_size = v;

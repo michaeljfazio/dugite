@@ -530,8 +530,11 @@ impl ConwayGenesis {
 
         // Pool voting thresholds
         let pvt = &self.pool_voting_thresholds;
+        params.pvt_motion_no_confidence = float_to_rational(pvt.motion_no_confidence);
+        params.pvt_committee_normal = float_to_rational(pvt.committee_normal);
+        params.pvt_committee_no_confidence = float_to_rational(pvt.committee_no_confidence);
         params.pvt_hard_fork = float_to_rational(pvt.hard_fork_initiation);
-        params.pvt_committee = float_to_rational(pvt.committee_normal);
+        params.pvt_pp_security_group = float_to_rational(pvt.pp_security_group);
     }
 }
 
