@@ -1224,8 +1224,8 @@ fn handle_n2n_txsubmission(
         // MsgRequestTxIds: [0, blocking, ack_count, req_count]
         0 => {
             let _blocking = decoder.bool().unwrap_or(false);
-            let ack_count = decoder.u32().unwrap_or(0) as usize;
-            let req_count = decoder.u32().unwrap_or(0) as usize;
+            let ack_count = decoder.u16().unwrap_or(0) as usize;
+            let req_count = decoder.u16().unwrap_or(0) as usize;
 
             // Acknowledge previously sent tx IDs (remove from inflight)
             if ack_count > 0 && ack_count <= peer_state.tx_inflight.len() {

@@ -34,7 +34,7 @@ const MINI_PROTOCOL_HANDSHAKE: u16 = 0;
 const MINI_PROTOCOL_CHAINSYNC: u16 = 5;
 const MINI_PROTOCOL_TX_SUBMISSION: u16 = 6;
 const MINI_PROTOCOL_STATE_QUERY: u16 = 7;
-const MINI_PROTOCOL_TX_MONITOR: u16 = 12;
+const MINI_PROTOCOL_TX_MONITOR: u16 = 9;
 
 /// Node-to-Client server that listens on a Unix domain socket.
 pub struct N2CServer {

@@ -24,7 +24,7 @@ pub enum N2CClientError {
 const MINI_PROTOCOL_HANDSHAKE: u16 = 0;
 const MINI_PROTOCOL_TX_SUBMISSION: u16 = 6;
 const MINI_PROTOCOL_STATE_QUERY: u16 = 7;
-const MINI_PROTOCOL_TX_MONITOR: u16 = 12;
+const MINI_PROTOCOL_TX_MONITOR: u16 = 9;
 
 /// Node-to-Client client for connecting to a Cardano node via Unix socket.
 pub struct N2CClient {
@@ -204,15 +204,15 @@ impl N2CClient {
         Ok(())
     }
 
-    /// Query the chain tip (GetChainPoint - Shelley query tag 11)
+    /// Query the chain tip (GetLedgerTip - Shelley query tag 0)
     pub async fn query_tip(&mut self) -> Result<TipResult, N2CClientError> {
-        let result = self.send_query(11).await?;
+        let result = self.send_query(0).await?;
         parse_tip_result(&result)
     }
 
-    /// Query the current epoch number (GetEpochNo - Shelley query tag 0)
+    /// Query the current epoch number (GetEpochNo - Shelley query tag 1)
     pub async fn query_epoch(&mut self) -> Result<u64, N2CClientError> {
-        let result = self.send_query(0).await?;
+        let result = self.send_query(1).await?;
         parse_epoch_result(&result)
     }
 

@@ -13,13 +13,13 @@ pub enum MiniProtocolId {
     Handshake = 0,
     ChainSync = 2,
     BlockFetch = 3,
-    TxSubmission2 = 6,
+    TxSubmission2 = 4,
     KeepAlive = 8,
     PeerSharing = 10,
     LocalChainSync = 5,
-    LocalTxSubmission = 9,
+    LocalTxSubmission = 6,
     LocalStateQuery = 7,
-    LocalTxMonitor = 12,
+    LocalTxMonitor = 9,
 }
 
 impl MiniProtocolId {
@@ -28,13 +28,13 @@ impl MiniProtocolId {
             0 => Some(MiniProtocolId::Handshake),
             2 => Some(MiniProtocolId::ChainSync),
             3 => Some(MiniProtocolId::BlockFetch),
+            4 => Some(MiniProtocolId::TxSubmission2),
             5 => Some(MiniProtocolId::LocalChainSync),
-            6 => Some(MiniProtocolId::TxSubmission2),
+            6 => Some(MiniProtocolId::LocalTxSubmission),
             7 => Some(MiniProtocolId::LocalStateQuery),
             8 => Some(MiniProtocolId::KeepAlive),
-            9 => Some(MiniProtocolId::LocalTxSubmission),
+            9 => Some(MiniProtocolId::LocalTxMonitor),
             10 => Some(MiniProtocolId::PeerSharing),
-            12 => Some(MiniProtocolId::LocalTxMonitor),
             _ => None,
         }
     }

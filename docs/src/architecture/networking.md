@@ -218,13 +218,14 @@ All mini-protocols run over a single TCP connection (N2N) or Unix socket (N2C), 
 | Protocol ID | Mini-Protocol |
 |-------------|---------------|
 | 0 | Handshake |
-| 2 | ChainSync |
-| 3 | BlockFetch |
-| 5 | TxSubmission2 |
-| 8 | KeepAlive |
-| 10 | PeerSharing |
-| 7 | LocalStateQuery (N2C) |
+| 2 | ChainSync (N2N) |
+| 3 | BlockFetch (N2N) |
+| 4 | TxSubmission2 (N2N) |
+| 8 | KeepAlive (N2N) |
+| 10 | PeerSharing (N2N) |
+| 5 | LocalChainSync (N2C) |
 | 6 | LocalTxSubmission (N2C) |
-| 12 | LocalTxMonitor (N2C) |
+| 7 | LocalStateQuery (N2C) |
+| 9 | LocalTxMonitor (N2C) |
 
 The multiplexer uses length-prefixed frames with protocol ID headers, matching the Ouroboros specification.

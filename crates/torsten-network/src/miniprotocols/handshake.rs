@@ -49,7 +49,7 @@ pub fn propose_versions(network: NetworkId) -> Vec<(u32, VersionData)> {
             VersionData {
                 network_magic: magic,
                 initiator_and_responder: true,
-                peer_sharing: PeerSharing::PeerSharingDisabled,
+                peer_sharing: PeerSharing::PeerSharingEnabled,
                 query: false,
             },
         ),
@@ -58,7 +58,7 @@ pub fn propose_versions(network: NetworkId) -> Vec<(u32, VersionData)> {
             VersionData {
                 network_magic: magic,
                 initiator_and_responder: true,
-                peer_sharing: PeerSharing::PeerSharingDisabled,
+                peer_sharing: PeerSharing::PeerSharingEnabled,
                 query: false,
             },
         ),
