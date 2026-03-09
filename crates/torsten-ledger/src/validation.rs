@@ -54,6 +54,12 @@ pub enum ValidationError {
     InvalidMint,
     #[error("Max execution units exceeded")]
     ExUnitsExceeded,
+    #[error("Script data hash mismatch: expected {expected}, got {actual}")]
+    ScriptDataHashMismatch { expected: String, actual: String },
+    #[error("Script data hash present but no scripts or redeemers")]
+    UnexpectedScriptDataHash,
+    #[error("Missing script data hash (required when scripts/redeemers present)")]
+    MissingScriptDataHash,
 }
 
 /// Validate a transaction against the current UTxO set and protocol parameters
@@ -316,6 +322,22 @@ pub fn validate_transaction(
             .sum();
         if total_mem > params.max_tx_ex_units.mem || total_steps > params.max_tx_ex_units.steps {
             errors.push(ValidationError::ExUnitsExceeded);
+        }
+
+        // Rule 12: Script data hash validation
+        // If redeemers or datums are present, script_data_hash must be set
+        let has_redeemers = !tx.witness_set.redeemers.is_empty();
+        let has_datums = !tx.witness_set.plutus_data.is_empty();
+        if has_redeemers || has_datums {
+            if body.script_data_hash.is_none() {
+                errors.push(ValidationError::MissingScriptDataHash);
+            }
+        } else if body.script_data_hash.is_some()
+            && tx.witness_set.plutus_v1_scripts.is_empty()
+            && tx.witness_set.plutus_v2_scripts.is_empty()
+            && tx.witness_set.plutus_v3_scripts.is_empty()
+        {
+            errors.push(ValidationError::UnexpectedScriptDataHash);
         }
 
         // Phase-2: Execute Plutus scripts if we have raw CBOR and a slot config
@@ -1097,6 +1119,8 @@ mod tests {
             },
         });
         tx.witness_set.plutus_v2_scripts.push(vec![0x01]); // dummy script
+                                                           // Set script_data_hash since we have redeemers (required by validation)
+        tx.body.script_data_hash = Some(Hash32::from_bytes([0xAB; 32]));
         tx
     }
 

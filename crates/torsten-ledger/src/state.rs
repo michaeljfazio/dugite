@@ -10,8 +10,8 @@ use torsten_primitives::hash::{Hash28, Hash32};
 use torsten_primitives::protocol_params::ProtocolParameters;
 use torsten_primitives::time::{BlockNo, EpochNo, SlotNo};
 use torsten_primitives::transaction::{
-    Anchor, Certificate, DRep, GovAction, GovActionId, ProposalProcedure, Relay, Vote, Voter,
-    VotingProcedure,
+    Anchor, Certificate, Constitution, DRep, GovAction, GovActionId, ProposalProcedure, Relay,
+    Vote, Voter, VotingProcedure,
 };
 use torsten_primitives::value::Lovelace;
 use tracing::{debug, info, trace};
@@ -84,6 +84,8 @@ pub struct GovernanceState {
     pub vote_delegations: HashMap<Hash32, DRep>,
     /// Constitutional committee: cold credential -> hot credential
     pub committee_hot_keys: HashMap<Hash32, Hash32>,
+    /// Committee member expiration epochs (cold credential -> expiration epoch)
+    pub committee_expiration: HashMap<Hash32, EpochNo>,
     /// Resigned committee members
     pub committee_resigned: HashMap<Hash32, Option<Anchor>>,
     /// Active governance proposals indexed by GovActionId
@@ -94,6 +96,8 @@ pub struct GovernanceState {
     pub drep_registration_count: u64,
     /// Total proposals submitted
     pub proposal_count: u64,
+    /// Current constitution (set by NewConstitution governance action)
+    pub constitution: Option<Constitution>,
 }
 
 /// Registration state for a DRep
@@ -103,6 +107,8 @@ pub struct DRepRegistration {
     pub deposit: Lovelace,
     pub anchor: Option<Anchor>,
     pub registered_epoch: EpochNo,
+    /// Last epoch in which this DRep voted or updated (for activity tracking per CIP-1694)
+    pub last_active_epoch: EpochNo,
 }
 
 /// State of a governance proposal
@@ -441,6 +447,7 @@ impl LedgerState {
                         deposit: *deposit,
                         anchor: anchor.clone(),
                         registered_epoch: self.epoch,
+                        last_active_epoch: self.epoch,
                     },
                 );
                 self.governance.drep_registration_count += 1;
@@ -458,6 +465,7 @@ impl LedgerState {
                 let key = credential_to_hash(credential);
                 if let Some(drep) = self.governance.dreps.get_mut(&key) {
                     drep.anchor = anchor.clone();
+                    drep.last_active_epoch = self.epoch;
                     debug!("DRep updated: {}", key.to_hex());
                 }
             }
@@ -623,6 +631,53 @@ impl LedgerState {
             debug!(
                 "Expired {} governance proposals at epoch {}",
                 expired.len(),
+                new_epoch.0
+            );
+        }
+
+        // Expire inactive DReps per CIP-1694
+        // DReps that haven't voted or updated within drep_activity epochs are marked inactive
+        // and excluded from voting power calculations
+        let drep_activity = self.protocol_params.drep_activity;
+        if drep_activity > 0 {
+            let inactive_dreps: Vec<Hash32> = self
+                .governance
+                .dreps
+                .iter()
+                .filter(|(_, drep)| {
+                    new_epoch.0.saturating_sub(drep.last_active_epoch.0) > drep_activity
+                })
+                .map(|(hash, _)| *hash)
+                .collect();
+            if !inactive_dreps.is_empty() {
+                for hash in &inactive_dreps {
+                    self.governance.dreps.remove(hash);
+                }
+                info!(
+                    "Expired {} inactive DReps at epoch {} (activity threshold: {} epochs)",
+                    inactive_dreps.len(),
+                    new_epoch.0,
+                    drep_activity
+                );
+            }
+        }
+
+        // Expire committee members that have passed their expiration epoch
+        let expired_members: Vec<Hash32> = self
+            .governance
+            .committee_expiration
+            .iter()
+            .filter(|(_, exp_epoch)| **exp_epoch <= new_epoch)
+            .map(|(hash, _)| *hash)
+            .collect();
+        if !expired_members.is_empty() {
+            for hash in &expired_members {
+                self.governance.committee_hot_keys.remove(hash);
+                self.governance.committee_expiration.remove(hash);
+            }
+            info!(
+                "Expired {} committee members at epoch {}",
+                expired_members.len(),
                 new_epoch.0
             );
         }
@@ -869,6 +924,14 @@ impl LedgerState {
             }
         }
 
+        // Track DRep activity — voting counts as activity per CIP-1694
+        if let Voter::DRep(cred) = voter {
+            let drep_hash = credential_to_hash(cred);
+            if let Some(drep) = self.governance.dreps.get_mut(&drep_hash) {
+                drep.last_active_epoch = self.epoch;
+            }
+        }
+
         // Record the vote
         self.governance
             .votes
@@ -948,7 +1011,7 @@ impl LedgerState {
                 let drep_threshold = self.protocol_params.dvt_p_param_change.as_f64();
                 let drep_met =
                     check_threshold(drep_yes, drep_total.max(total_drep_stake), drep_threshold);
-                let cc_met = check_cc_approval(cc_yes, cc_total, &self.governance);
+                let cc_met = check_cc_approval(cc_yes, cc_total, &self.governance, self.epoch);
                 drep_met && cc_met
             }
             GovAction::HardForkInitiation { .. } => {
@@ -979,14 +1042,14 @@ impl LedgerState {
                 let drep_threshold = self.protocol_params.dvt_constitution.as_f64();
                 let drep_met =
                     check_threshold(drep_yes, drep_total.max(total_drep_stake), drep_threshold);
-                let cc_met = check_cc_approval(cc_yes, cc_total, &self.governance);
+                let cc_met = check_cc_approval(cc_yes, cc_total, &self.governance, self.epoch);
                 drep_met && cc_met
             }
             GovAction::TreasuryWithdrawals { .. } => {
                 let drep_threshold = self.protocol_params.dvt_treasury_withdrawal.as_f64();
                 let drep_met =
                     check_threshold(drep_yes, drep_total.max(total_drep_stake), drep_threshold);
-                let cc_met = check_cc_approval(cc_yes, cc_total, &self.governance);
+                let cc_met = check_cc_approval(cc_yes, cc_total, &self.governance, self.epoch);
                 drep_met && cc_met
             }
         }
@@ -1174,8 +1237,9 @@ impl LedgerState {
                 info!("Treasury withdrawal enacted: {} lovelace", total);
             }
             GovAction::NoConfidence { .. } => {
-                // No confidence motion: remove all committee hot key authorizations
+                // No confidence motion: remove all committee hot key authorizations and expirations
                 self.governance.committee_hot_keys.clear();
+                self.governance.committee_expiration.clear();
                 info!("No confidence motion enacted: committee disbanded");
             }
             GovAction::UpdateCommittee {
@@ -1187,12 +1251,16 @@ impl LedgerState {
                 for cred in members_to_remove {
                     let key = credential_to_hash(cred);
                     self.governance.committee_hot_keys.remove(&key);
+                    self.governance.committee_expiration.remove(&key);
                     self.governance.committee_resigned.remove(&key);
                 }
-                // Add new members (they must authorize hot keys separately)
-                for cred in members_to_add.keys() {
-                    let _key = credential_to_hash(cred);
-                    // Members are tracked; hot key auth comes via certificates
+                // Add new members with expiration epochs
+                for (cred, expiration_epoch) in members_to_add {
+                    let key = credential_to_hash(cred);
+                    self.governance
+                        .committee_expiration
+                        .insert(key, EpochNo(*expiration_epoch));
+                    // Hot key auth comes via CommitteeHotAuth certificates
                 }
                 info!(
                     "Committee updated: {} removed, {} added",
@@ -1200,10 +1268,12 @@ impl LedgerState {
                     members_to_add.len()
                 );
             }
-            GovAction::NewConstitution { .. } => {
-                // Constitution is stored in the governance state
-                // For now, we just log the enactment
-                info!("New constitution enacted");
+            GovAction::NewConstitution { constitution, .. } => {
+                self.governance.constitution = Some(constitution.clone());
+                info!(
+                    "New constitution enacted (script_hash: {:?})",
+                    constitution.script_hash.as_ref().map(|h| h.to_hex())
+                );
             }
             GovAction::InfoAction => {
                 // Info actions have no on-chain effect
@@ -1286,8 +1356,27 @@ fn check_threshold(yes: u64, total: u64, threshold: f64) -> bool {
 
 /// Check if the constitutional committee has approved (majority of active members voted yes).
 /// If there's no active committee (all resigned, or no hot keys), CC approval is not required.
-fn check_cc_approval(cc_yes: u64, cc_total: u64, governance: &GovernanceState) -> bool {
-    let active_cc = governance.committee_hot_keys.len() as u64;
+fn check_cc_approval(
+    cc_yes: u64,
+    cc_total: u64,
+    governance: &GovernanceState,
+    current_epoch: EpochNo,
+) -> bool {
+    // Count only non-expired, non-resigned committee members with hot keys
+    let active_cc = governance
+        .committee_hot_keys
+        .keys()
+        .filter(|cold| {
+            // Must not be expired
+            if let Some(exp) = governance.committee_expiration.get(*cold) {
+                if *exp <= current_epoch {
+                    return false;
+                }
+            }
+            // Must not be resigned
+            !governance.committee_resigned.contains_key(*cold)
+        })
+        .count() as u64;
     if active_cc == 0 {
         // No active committee — CC requirement is waived
         return true;
@@ -2092,6 +2181,100 @@ mod tests {
     }
 
     #[test]
+    fn test_drep_activity_tracking() {
+        let mut params = ProtocolParameters::mainnet_defaults();
+        params.drep_activity = 5; // DReps inactive after 5 epochs
+        let mut state = LedgerState::new(params);
+
+        let cred = Credential::VerificationKey(Hash28::from_bytes([50u8; 28]));
+        let key = credential_to_hash(&cred);
+
+        // Register at epoch 0
+        state.process_certificate(&Certificate::RegDRep {
+            credential: cred.clone(),
+            deposit: Lovelace(500_000_000),
+            anchor: None,
+        });
+        assert_eq!(state.governance.dreps[&key].last_active_epoch, EpochNo(0));
+
+        // Update at epoch 3 — should update last_active_epoch
+        state.epoch = EpochNo(3);
+        state.process_certificate(&Certificate::UpdateDRep {
+            credential: cred,
+            anchor: None,
+        });
+        assert_eq!(state.governance.dreps[&key].last_active_epoch, EpochNo(3));
+
+        // Epoch transition to epoch 7 — DRep last active at epoch 3, threshold is 5
+        // 7 - 3 = 4, which is not > 5, so DRep should remain
+        state.process_epoch_transition(EpochNo(7));
+        assert!(state.governance.dreps.contains_key(&key));
+
+        // Epoch transition to epoch 9 — 9 - 3 = 6 > 5, so DRep should be expired
+        state.process_epoch_transition(EpochNo(9));
+        assert!(!state.governance.dreps.contains_key(&key));
+    }
+
+    #[test]
+    fn test_committee_expiration_during_epoch_transition() {
+        let params = ProtocolParameters::mainnet_defaults();
+        let mut state = LedgerState::new(params);
+
+        // Add CC members with different expiration epochs
+        let cold1 = Hash32::from_bytes([1u8; 32]);
+        let cold2 = Hash32::from_bytes([2u8; 32]);
+        let hot1 = Hash32::from_bytes([11u8; 32]);
+        let hot2 = Hash32::from_bytes([12u8; 32]);
+
+        state.governance.committee_hot_keys.insert(cold1, hot1);
+        state
+            .governance
+            .committee_expiration
+            .insert(cold1, EpochNo(5));
+        state.governance.committee_hot_keys.insert(cold2, hot2);
+        state
+            .governance
+            .committee_expiration
+            .insert(cold2, EpochNo(10));
+
+        // At epoch 5, cold1 should be expired
+        state.process_epoch_transition(EpochNo(5));
+        assert!(!state.governance.committee_hot_keys.contains_key(&cold1));
+        assert!(!state.governance.committee_expiration.contains_key(&cold1));
+        // cold2 should remain
+        assert!(state.governance.committee_hot_keys.contains_key(&cold2));
+
+        // At epoch 10, cold2 should be expired
+        state.process_epoch_transition(EpochNo(10));
+        assert!(!state.governance.committee_hot_keys.contains_key(&cold2));
+    }
+
+    #[test]
+    fn test_constitution_storage() {
+        let params = ProtocolParameters::mainnet_defaults();
+        let mut state = LedgerState::new(params);
+
+        assert!(state.governance.constitution.is_none());
+
+        // Enact a NewConstitution governance action
+        let constitution = Constitution {
+            anchor: Anchor {
+                url: "https://constitution.cardano.org".to_string(),
+                data_hash: Hash32::from_bytes([42u8; 32]),
+            },
+            script_hash: Some(Hash28::from_bytes([99u8; 28])),
+        };
+        state.enact_gov_action(&GovAction::NewConstitution {
+            prev_action_id: None,
+            constitution: constitution.clone(),
+        });
+
+        let stored = state.governance.constitution.as_ref().unwrap();
+        assert_eq!(stored.anchor.url, "https://constitution.cardano.org");
+        assert!(stored.script_hash.is_some());
+    }
+
+    #[test]
     fn test_vote_delegation() {
         let params = ProtocolParameters::mainnet_defaults();
         let mut state = LedgerState::new(params);
@@ -2251,6 +2434,7 @@ mod tests {
                 deposit: Lovelace(500_000_000),
                 anchor: None,
                 registered_epoch: EpochNo(0),
+                last_active_epoch: EpochNo(0),
             },
         );
 
@@ -2377,6 +2561,7 @@ mod tests {
                     deposit: Lovelace(500_000_000),
                     anchor: None,
                     registered_epoch: EpochNo(0),
+                    last_active_epoch: EpochNo(0),
                 },
             );
         }
@@ -2462,6 +2647,7 @@ mod tests {
                     deposit: Lovelace(500_000_000),
                     anchor: None,
                     registered_epoch: EpochNo(0),
+                    last_active_epoch: EpochNo(0),
                 },
             );
             // Set up vote delegation and stake for each DRep
@@ -2542,6 +2728,7 @@ mod tests {
                     deposit: Lovelace(500_000_000),
                     anchor: None,
                     registered_epoch: EpochNo(0),
+                    last_active_epoch: EpochNo(0),
                 },
             );
         }
@@ -2616,6 +2803,7 @@ mod tests {
                     deposit: Lovelace(500_000_000),
                     anchor: None,
                     registered_epoch: EpochNo(0),
+                    last_active_epoch: EpochNo(0),
                 },
             );
         }
@@ -2713,6 +2901,7 @@ mod tests {
                     deposit: Lovelace(500_000_000),
                     anchor: None,
                     registered_epoch: EpochNo(0),
+                    last_active_epoch: EpochNo(0),
                 },
             );
         }
@@ -2784,24 +2973,50 @@ mod tests {
     fn test_cc_approval_no_committee() {
         let governance = GovernanceState::default();
         // No active committee => CC approval waived
-        assert!(check_cc_approval(0, 0, &governance));
+        assert!(check_cc_approval(0, 0, &governance, EpochNo(10)));
     }
 
     #[test]
     fn test_cc_approval_with_committee() {
         let mut governance = GovernanceState::default();
-        // Add 3 active CC members
+        let current_epoch = EpochNo(10);
+        // Add 3 active CC members with expiration in the future
+        for i in 0..3 {
+            let cold = Hash32::from_bytes([i as u8; 32]);
+            let hot = Hash32::from_bytes([10 + i as u8; 32]);
+            governance.committee_hot_keys.insert(cold, hot);
+            governance.committee_expiration.insert(cold, EpochNo(100)); // expires at epoch 100
+        }
+        // 2/3 voted yes => majority
+        assert!(check_cc_approval(2, 3, &governance, current_epoch));
+        // 1/3 voted yes => no majority
+        assert!(!check_cc_approval(1, 3, &governance, current_epoch));
+        // No CC voted at all => not approved
+        assert!(!check_cc_approval(0, 0, &governance, current_epoch));
+    }
+
+    #[test]
+    fn test_cc_approval_expired_members() {
+        let mut governance = GovernanceState::default();
+        let current_epoch = EpochNo(50);
+        // Add 3 CC members, but 2 are expired
         for i in 0..3 {
             let cold = Hash32::from_bytes([i as u8; 32]);
             let hot = Hash32::from_bytes([10 + i as u8; 32]);
             governance.committee_hot_keys.insert(cold, hot);
         }
-        // 2/3 voted yes => majority
-        assert!(check_cc_approval(2, 3, &governance));
-        // 1/3 voted yes => no majority
-        assert!(!check_cc_approval(1, 3, &governance));
-        // No CC voted at all => not approved
-        assert!(!check_cc_approval(0, 0, &governance));
+        // Member 0 and 1 expired, member 2 still active
+        governance
+            .committee_expiration
+            .insert(Hash32::from_bytes([0u8; 32]), EpochNo(30));
+        governance
+            .committee_expiration
+            .insert(Hash32::from_bytes([1u8; 32]), EpochNo(40));
+        governance
+            .committee_expiration
+            .insert(Hash32::from_bytes([2u8; 32]), EpochNo(100));
+        // Only 1 active member, so 1/1 required for majority
+        assert!(check_cc_approval(1, 1, &governance, current_epoch));
     }
 
     #[test]

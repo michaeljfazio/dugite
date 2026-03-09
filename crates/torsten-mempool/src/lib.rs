@@ -2,6 +2,7 @@ use dashmap::DashMap;
 use parking_lot::RwLock;
 use std::collections::VecDeque;
 use torsten_primitives::hash::TransactionHash;
+use torsten_primitives::time::SlotNo;
 use torsten_primitives::transaction::Transaction;
 use torsten_primitives::value::Lovelace;
 use tracing::{debug, info, trace, warn};
@@ -25,7 +26,6 @@ impl Default for MempoolConfig {
 }
 
 /// Transaction entry in the mempool
-#[allow(dead_code)]
 #[derive(Debug, Clone)]
 struct MempoolEntry {
     tx: Transaction,
@@ -83,12 +83,24 @@ impl Mempool {
         }
     }
 
-    /// Add a transaction to the mempool
+    /// Add a transaction to the mempool.
+    /// `fee` is the transaction fee (from tx body) used for priority ordering.
     pub fn add_tx(
         &self,
         tx_hash: TransactionHash,
         tx: Transaction,
         size_bytes: usize,
+    ) -> Result<MempoolAddResult, MempoolError> {
+        self.add_tx_with_fee(tx_hash, tx, size_bytes, Lovelace(0))
+    }
+
+    /// Add a transaction with explicit fee for priority ordering
+    pub fn add_tx_with_fee(
+        &self,
+        tx_hash: TransactionHash,
+        tx: Transaction,
+        size_bytes: usize,
+        fee: Lovelace,
     ) -> Result<MempoolAddResult, MempoolError> {
         // Check if already exists
         if self.txs.contains_key(&tx_hash) {
@@ -128,7 +140,7 @@ impl Mempool {
             tx,
             tx_hash,
             size_bytes,
-            fee: Lovelace(0), // Would be computed from tx body
+            fee,
             arrival_order,
         };
 
@@ -239,6 +251,114 @@ impl Mempool {
             total_bytes: *self.total_bytes.read(),
             tx_hashes: self.order.read().iter().copied().collect(),
         }
+    }
+
+    /// Evict transactions whose TTL has expired.
+    /// Returns the number of evicted transactions.
+    pub fn evict_expired(&self, current_slot: SlotNo) -> usize {
+        let expired: Vec<TransactionHash> = self
+            .txs
+            .iter()
+            .filter(|entry| {
+                if let Some(ttl) = entry.tx.body.ttl {
+                    current_slot.0 > ttl.0
+                } else {
+                    false
+                }
+            })
+            .map(|entry| entry.tx_hash)
+            .collect();
+
+        let count = expired.len();
+        for hash in &expired {
+            self.remove_tx(hash);
+        }
+        if count > 0 {
+            info!(
+                evicted = count,
+                slot = current_slot.0,
+                "Mempool: evicted expired transactions"
+            );
+        }
+        count
+    }
+
+    /// Get transactions for block production ordered by fee density (fee/byte, descending).
+    /// Transactions with higher fee density are prioritized.
+    pub fn get_txs_for_block_by_fee(&self, max_count: usize, max_size: usize) -> Vec<Transaction> {
+        // Collect all entries with their fee density and arrival order
+        let mut entries: Vec<(TransactionHash, u64, usize, u64)> = self
+            .txs
+            .iter()
+            .map(|entry| {
+                let fee_density = if entry.size_bytes > 0 {
+                    entry.fee.0 * 1000 / entry.size_bytes as u64 // fee per KB
+                } else {
+                    0
+                };
+                (
+                    entry.tx_hash,
+                    fee_density,
+                    entry.size_bytes,
+                    entry.arrival_order,
+                )
+            })
+            .collect();
+
+        // Sort by fee density descending, then by arrival order ascending (FIFO tiebreak)
+        entries.sort_by(|a, b| b.1.cmp(&a.1).then(a.3.cmp(&b.3)));
+
+        let mut result = Vec::new();
+        let mut total_size = 0;
+
+        for (hash, _, size, _) in entries {
+            if result.len() >= max_count {
+                break;
+            }
+            if total_size + size > max_size {
+                continue;
+            }
+            if let Some(entry) = self.txs.get(&hash) {
+                result.push(entry.tx.clone());
+                total_size += size;
+            }
+        }
+
+        result
+    }
+
+    /// Remove transactions that spend any of the given inputs (already consumed by a new block).
+    /// Returns the hashes of removed transactions.
+    pub fn revalidate_against_inputs(
+        &self,
+        consumed_inputs: &std::collections::HashSet<
+            torsten_primitives::transaction::TransactionInput,
+        >,
+    ) -> Vec<TransactionHash> {
+        let conflicting: Vec<TransactionHash> = self
+            .txs
+            .iter()
+            .filter(|entry| {
+                entry
+                    .tx
+                    .body
+                    .inputs
+                    .iter()
+                    .any(|input| consumed_inputs.contains(input))
+            })
+            .map(|entry| entry.tx_hash)
+            .collect();
+
+        for hash in &conflicting {
+            self.remove_tx(hash);
+        }
+        if !conflicting.is_empty() {
+            debug!(
+                removed = conflicting.len(),
+                "Mempool: removed conflicting transactions after new block"
+            );
+        }
+        conflicting
     }
 
     /// Clear all transactions
@@ -423,5 +543,171 @@ mod tests {
         mempool.clear();
         assert!(mempool.is_empty());
         assert_eq!(mempool.total_bytes(), 0);
+    }
+
+    fn make_tx_with_ttl(ttl: Option<SlotNo>) -> Transaction {
+        let mut tx = make_dummy_tx();
+        tx.body.ttl = ttl;
+        tx
+    }
+
+    fn make_tx_with_fee(fee: u64) -> Transaction {
+        let mut tx = make_dummy_tx();
+        tx.body.fee = Lovelace(fee);
+        tx
+    }
+
+    fn make_tx_with_input(tx_id: [u8; 32], index: u32) -> Transaction {
+        let mut tx = make_dummy_tx();
+        tx.body.inputs = vec![TransactionInput {
+            transaction_id: Hash32::from_bytes(tx_id),
+            index,
+        }];
+        tx
+    }
+
+    #[test]
+    fn test_evict_expired_ttl() {
+        let mempool = Mempool::new(MempoolConfig::default());
+
+        // Add tx with TTL at slot 100
+        mempool
+            .add_tx(
+                Hash32::from_bytes([1u8; 32]),
+                make_tx_with_ttl(Some(SlotNo(100))),
+                200,
+            )
+            .unwrap();
+        // Add tx with no TTL (never expires)
+        mempool
+            .add_tx(Hash32::from_bytes([2u8; 32]), make_tx_with_ttl(None), 200)
+            .unwrap();
+        // Add tx with TTL at slot 200
+        mempool
+            .add_tx(
+                Hash32::from_bytes([3u8; 32]),
+                make_tx_with_ttl(Some(SlotNo(200))),
+                200,
+            )
+            .unwrap();
+
+        assert_eq!(mempool.len(), 3);
+
+        // At slot 50, nothing should be evicted
+        assert_eq!(mempool.evict_expired(SlotNo(50)), 0);
+        assert_eq!(mempool.len(), 3);
+
+        // At slot 101, tx with TTL=100 should be evicted
+        assert_eq!(mempool.evict_expired(SlotNo(101)), 1);
+        assert_eq!(mempool.len(), 2);
+        assert!(!mempool.contains(&Hash32::from_bytes([1u8; 32])));
+
+        // At slot 201, tx with TTL=200 should be evicted
+        assert_eq!(mempool.evict_expired(SlotNo(201)), 1);
+        assert_eq!(mempool.len(), 1);
+        // No-TTL tx remains
+        assert!(mempool.contains(&Hash32::from_bytes([2u8; 32])));
+    }
+
+    #[test]
+    fn test_fee_based_priority() {
+        let mempool = Mempool::new(MempoolConfig::default());
+
+        // Add 3 txs with different fees, same size
+        let size = 500;
+        mempool
+            .add_tx_with_fee(
+                Hash32::from_bytes([1u8; 32]),
+                make_tx_with_fee(100_000),
+                size,
+                Lovelace(100_000),
+            )
+            .unwrap();
+        mempool
+            .add_tx_with_fee(
+                Hash32::from_bytes([2u8; 32]),
+                make_tx_with_fee(300_000),
+                size,
+                Lovelace(300_000),
+            )
+            .unwrap();
+        mempool
+            .add_tx_with_fee(
+                Hash32::from_bytes([3u8; 32]),
+                make_tx_with_fee(200_000),
+                size,
+                Lovelace(200_000),
+            )
+            .unwrap();
+
+        let txs = mempool.get_txs_for_block_by_fee(3, 100_000);
+        assert_eq!(txs.len(), 3);
+        // Highest fee first
+        assert_eq!(txs[0].body.fee.0, 300_000);
+        assert_eq!(txs[1].body.fee.0, 200_000);
+        assert_eq!(txs[2].body.fee.0, 100_000);
+    }
+
+    #[test]
+    fn test_revalidate_against_inputs() {
+        let mempool = Mempool::new(MempoolConfig::default());
+
+        let input_a = TransactionInput {
+            transaction_id: Hash32::from_bytes([10u8; 32]),
+            index: 0,
+        };
+        let input_b = TransactionInput {
+            transaction_id: Hash32::from_bytes([20u8; 32]),
+            index: 0,
+        };
+
+        // tx1 spends input_a
+        let mut tx1 = make_tx_with_input([10u8; 32], 0);
+        tx1.body.inputs = vec![input_a.clone()];
+        mempool
+            .add_tx(Hash32::from_bytes([1u8; 32]), tx1, 200)
+            .unwrap();
+
+        // tx2 spends input_b
+        let mut tx2 = make_tx_with_input([20u8; 32], 0);
+        tx2.body.inputs = vec![input_b.clone()];
+        mempool
+            .add_tx(Hash32::from_bytes([2u8; 32]), tx2, 200)
+            .unwrap();
+
+        // tx3 spends a different input
+        mempool
+            .add_tx(
+                Hash32::from_bytes([3u8; 32]),
+                make_tx_with_input([30u8; 32], 0),
+                200,
+            )
+            .unwrap();
+
+        assert_eq!(mempool.len(), 3);
+
+        // A new block consumed input_a
+        let mut consumed = std::collections::HashSet::new();
+        consumed.insert(input_a);
+        let removed = mempool.revalidate_against_inputs(&consumed);
+
+        assert_eq!(removed.len(), 1);
+        assert_eq!(mempool.len(), 2);
+        assert!(!mempool.contains(&Hash32::from_bytes([1u8; 32])));
+        assert!(mempool.contains(&Hash32::from_bytes([2u8; 32])));
+        assert!(mempool.contains(&Hash32::from_bytes([3u8; 32])));
+    }
+
+    #[test]
+    fn test_add_tx_with_fee() {
+        let mempool = Mempool::new(MempoolConfig::default());
+        let tx = make_tx_with_fee(500_000);
+        let hash = Hash32::from_bytes([1u8; 32]);
+
+        let result = mempool
+            .add_tx_with_fee(hash, tx, 1000, Lovelace(500_000))
+            .unwrap();
+        assert!(matches!(result, MempoolAddResult::Added));
+        assert_eq!(mempool.len(), 1);
     }
 }
