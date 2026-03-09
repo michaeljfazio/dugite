@@ -1551,10 +1551,18 @@ impl Node {
             self.consensus.update_tip(last_block.tip());
         }
 
+        let tx_count: u64 = blocks.iter().map(|b| b.transactions.len() as u64).sum();
+
         *blocks_received += batch_count;
         *blocks_since_last_log += batch_count;
         self.metrics.add_blocks_received(batch_count);
         self.metrics.add_blocks_applied(batch_count);
+        self.metrics
+            .transactions_received
+            .fetch_add(tx_count, std::sync::atomic::Ordering::Relaxed);
+        self.metrics
+            .transactions_validated
+            .fetch_add(tx_count, std::sync::atomic::Ordering::Relaxed);
 
         let last_block = blocks.last().unwrap();
         let slot = last_block.slot().0;
@@ -1618,6 +1626,18 @@ impl Node {
                         pm.hot_peer_count() as u64,
                         std::sync::atomic::Ordering::Relaxed,
                     );
+                    self.metrics.peers_cold.store(
+                        pm.cold_peer_count() as u64,
+                        std::sync::atomic::Ordering::Relaxed,
+                    );
+                    self.metrics.peers_warm.store(
+                        pm.warm_peer_count() as u64,
+                        std::sync::atomic::Ordering::Relaxed,
+                    );
+                    self.metrics.peers_hot.store(
+                        pm.hot_peer_count() as u64,
+                        std::sync::atomic::Ordering::Relaxed,
+                    );
                 }
                 self.metrics.delegation_count.store(
                     ls.delegations.len() as u64,
@@ -1626,11 +1646,14 @@ impl Node {
                 self.metrics
                     .treasury_lovelace
                     .store(ls.treasury.0, std::sync::atomic::Ordering::Relaxed);
-                info!(
-                    "Syncing {progress:.2}% | slot {slot}/{tip_slot} | block {block_no}/{tip_block} | epoch {} | {blocks_per_sec:.0} blocks/s | {} UTxOs | {blocks_remaining} blocks remaining",
-                    ls.epoch.0,
-                    ls.utxo_set.len()
-                );
+                // Only show sync progress when catching up, not when following the tip
+                if blocks_remaining > 0 {
+                    info!(
+                        "Syncing {progress:.2}% | slot {slot}/{tip_slot} | block {block_no}/{tip_block} | epoch {} | {blocks_per_sec:.0} blocks/s | {} UTxOs | {blocks_remaining} blocks remaining",
+                        ls.epoch.0,
+                        ls.utxo_set.len()
+                    );
+                }
             }
             *last_log_time = std::time::Instant::now();
             *blocks_since_last_log = 0;

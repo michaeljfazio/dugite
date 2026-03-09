@@ -54,12 +54,15 @@ torsten_peers_connected 8
 
 | Metric | Type | Description |
 |--------|------|-------------|
-| `torsten_blocks_received_total` | gauge | Total blocks received from peers |
-| `torsten_blocks_applied_total` | gauge | Total blocks successfully applied to the ledger |
-| `torsten_transactions_received_total` | gauge | Total transactions received |
-| `torsten_transactions_validated_total` | gauge | Total transactions validated |
-| `torsten_transactions_rejected_total` | gauge | Total transactions rejected |
-| `torsten_peers_connected` | gauge | Number of currently connected peers |
+| `torsten_blocks_received_total` | counter | Total blocks received from peers |
+| `torsten_blocks_applied_total` | counter | Total blocks successfully applied to the ledger |
+| `torsten_transactions_received_total` | counter | Total transactions received |
+| `torsten_transactions_validated_total` | counter | Total transactions validated |
+| `torsten_transactions_rejected_total` | counter | Total transactions rejected |
+| `torsten_peers_connected` | gauge | Number of connected peers |
+| `torsten_peers_cold` | gauge | Number of cold (known but unconnected) peers |
+| `torsten_peers_warm` | gauge | Number of warm (connected, not syncing) peers |
+| `torsten_peers_hot` | gauge | Number of hot (actively syncing) peers |
 | `torsten_sync_progress_percent` | gauge | Chain sync progress (0-10000; divide by 100 for percentage) |
 | `torsten_slot_number` | gauge | Current slot number |
 | `torsten_block_number` | gauge | Current block number |
@@ -67,8 +70,8 @@ torsten_peers_connected 8
 | `torsten_utxo_count` | gauge | Number of entries in the UTxO set |
 | `torsten_mempool_tx_count` | gauge | Number of transactions in the mempool |
 | `torsten_mempool_bytes` | gauge | Size of the mempool in bytes |
-| `torsten_rollback_count_total` | gauge | Total number of chain rollbacks |
-| `torsten_blocks_forged_total` | gauge | Total blocks forged by this node |
+| `torsten_rollback_count_total` | counter | Total number of chain rollbacks |
+| `torsten_blocks_forged_total` | counter | Total blocks forged by this node |
 | `torsten_delegation_count` | gauge | Number of active stake delegations |
 | `torsten_treasury_lovelace` | gauge | Total lovelace in the treasury |
 
@@ -98,6 +101,7 @@ You can create a Grafana dashboard to visualize Torsten metrics. Key panels to c
 - **UTxO Set Size:** `torsten_utxo_count`
 - **Mempool Size:** `torsten_mempool_tx_count`
 - **Connected Peers:** `torsten_peers_connected`
+- **Peer States:** `torsten_peers_cold`, `torsten_peers_warm`, `torsten_peers_hot`
 - **Transaction Rejection Rate:** `rate(torsten_transactions_rejected_total[5m])`
 - **Blocks Forged:** `torsten_blocks_forged_total`
 - **Rollback Count:** `torsten_rollback_count_total`

@@ -522,6 +522,16 @@ impl PeerManager {
         self.hot_peers.len()
     }
 
+    /// Number of currently warm (connected, not syncing) peers.
+    pub fn warm_peer_count(&self) -> usize {
+        self.warm_peers.len()
+    }
+
+    /// Number of currently cold (known but unconnected) peers.
+    pub fn cold_peer_count(&self) -> usize {
+        self.cold_peers.len()
+    }
+
     /// Get the best N peers by reputation for block fetching.
     /// Returns addresses of hot peers sorted by reputation (best first).
     pub fn best_peers_for_fetch(&self, count: usize) -> Vec<SocketAddr> {
