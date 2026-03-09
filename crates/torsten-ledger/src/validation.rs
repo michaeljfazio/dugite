@@ -75,6 +75,10 @@ pub enum ValidationError {
         expected: torsten_primitives::network::NetworkId,
         actual: torsten_primitives::network::NetworkId,
     },
+    #[error("Auxiliary data hash declared but no auxiliary data present")]
+    AuxiliaryDataHashWithoutData,
+    #[error("Auxiliary data present but no auxiliary data hash in tx body")]
+    AuxiliaryDataWithoutHash,
     #[error("Block execution units exceeded: {resource} limit={limit}, total={total}")]
     BlockExUnitsExceeded {
         resource: String,
@@ -117,6 +121,18 @@ pub fn validate_transaction(
                 errors.push(ValidationError::DuplicateInput(input.to_string()));
             }
         }
+    }
+
+    // Rule 1c: Auxiliary data hash consistency
+    // If auxiliary_data_hash is declared in the body, auxiliary_data must be present (and vice versa)
+    match (&body.auxiliary_data_hash, &tx.auxiliary_data) {
+        (Some(_), None) => {
+            errors.push(ValidationError::AuxiliaryDataHashWithoutData);
+        }
+        (None, Some(_)) => {
+            errors.push(ValidationError::AuxiliaryDataWithoutHash);
+        }
+        _ => {} // Both present or both absent — OK
     }
 
     // Rule 2: All inputs must exist in UTxO set
@@ -2099,5 +2115,60 @@ mod tests {
 
         let v3_script = ScriptRef::PlutusV3(vec![0u8; 1024]);
         assert_eq!(script_ref_byte_size(&v3_script), 1024);
+    }
+
+    #[test]
+    fn test_auxiliary_data_hash_without_data() {
+        let (utxo_set, input) = make_simple_utxo_set();
+        let params = ProtocolParameters::mainnet_defaults();
+        let mut tx = make_simple_tx(input, 9_000_000, 1_000_000);
+        // Set auxiliary_data_hash but no auxiliary_data
+        tx.body.auxiliary_data_hash = Some(Hash32::from_bytes([0xAB; 32]));
+        let result = validate_transaction(&tx, &utxo_set, &params, 100, 300, None);
+        assert!(result.is_err());
+        let errors = result.unwrap_err();
+        assert!(errors
+            .iter()
+            .any(|e| matches!(e, ValidationError::AuxiliaryDataHashWithoutData)));
+    }
+
+    #[test]
+    fn test_auxiliary_data_without_hash() {
+        let (utxo_set, input) = make_simple_utxo_set();
+        let params = ProtocolParameters::mainnet_defaults();
+        let mut tx = make_simple_tx(input, 9_000_000, 1_000_000);
+        // Set auxiliary_data but no auxiliary_data_hash
+        tx.auxiliary_data = Some(AuxiliaryData {
+            metadata: BTreeMap::new(),
+            native_scripts: vec![],
+            plutus_v1_scripts: vec![],
+            plutus_v2_scripts: vec![],
+            plutus_v3_scripts: vec![],
+        });
+        let result = validate_transaction(&tx, &utxo_set, &params, 100, 300, None);
+        assert!(result.is_err());
+        let errors = result.unwrap_err();
+        assert!(errors
+            .iter()
+            .any(|e| matches!(e, ValidationError::AuxiliaryDataWithoutHash)));
+    }
+
+    #[test]
+    fn test_auxiliary_data_with_hash_valid() {
+        let (utxo_set, input) = make_simple_utxo_set();
+        let params = ProtocolParameters::mainnet_defaults();
+        let mut tx = make_simple_tx(input, 9_000_000, 1_000_000);
+        // Both present — consistency check passes
+        tx.body.auxiliary_data_hash = Some(Hash32::from_bytes([0xAB; 32]));
+        tx.auxiliary_data = Some(AuxiliaryData {
+            metadata: BTreeMap::new(),
+            native_scripts: vec![],
+            plutus_v1_scripts: vec![],
+            plutus_v2_scripts: vec![],
+            plutus_v3_scripts: vec![],
+        });
+        let result = validate_transaction(&tx, &utxo_set, &params, 100, 300, None);
+        // Should pass (no auxiliary data hash mismatch errors)
+        assert!(result.is_ok());
     }
 }

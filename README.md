@@ -7,7 +7,9 @@ Built by [Sandstone Pool](https://www.sandstone.io/)
 [![CI](https://github.com/michaeljfazio/torsten/actions/workflows/ci.yml/badge.svg)](https://github.com/michaeljfazio/torsten/actions/workflows/ci.yml)
 [![Docs](https://github.com/michaeljfazio/torsten/actions/workflows/docs.yml/badge.svg)](https://michaeljfazio.github.io/torsten/)
 
-> **Warning:** Torsten is in early development and is **not recommended for production use**. APIs, storage formats, and behavior may change without notice. Use at your own risk on testnets only.
+> [!CAUTION]
+> **Torsten is in early development and is NOT recommended for production use.**
+> APIs, storage formats, and on-chain behavior may change without notice. Ledger validation is incomplete and may accept invalid transactions or reject valid ones. **Do not use this software to operate a stake pool, manage real funds, or participate in mainnet governance.** Use at your own risk on testnets only.
 
 ## Quick Start
 
