@@ -255,6 +255,7 @@ impl ImmutableDB {
 
     /// Get blocks in a slot range [from_slot, to_slot] inclusive.
     /// Returns raw CBOR block data in slot order.
+    /// Uses read-ahead prefetching for efficient sequential scan.
     pub fn get_blocks_in_slot_range(
         &self,
         from_slot: SlotNo,
@@ -269,10 +270,14 @@ impl ImmutableDB {
         let start_key = from_slot.0.to_be_bytes();
         let end_key = to_slot.0.to_be_bytes();
 
-        let iter = db.iterator(rocksdb::IteratorMode::From(
-            &start_key,
-            rocksdb::Direction::Forward,
-        ));
+        // Use read-ahead for sequential scan performance
+        let mut read_opts = rocksdb::ReadOptions::default();
+        read_opts.set_readahead_size(2 * 1024 * 1024); // 2MB readahead
+
+        let iter = db.iterator_opt(
+            rocksdb::IteratorMode::From(&start_key, rocksdb::Direction::Forward),
+            read_opts,
+        );
         for item in iter {
             let (key, value) = item.map_err(|e| ImmutableDBError::RocksDB(e.to_string()))?;
             // Skip non-slot keys (metadata, hash index)

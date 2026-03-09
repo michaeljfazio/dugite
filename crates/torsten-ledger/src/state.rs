@@ -1548,19 +1548,30 @@ impl LedgerState {
         }
     }
 
-    /// Save ledger state snapshot to disk using bincode serialization
+    /// Save ledger state snapshot to disk using bincode serialization.
+    /// Format: [4-byte magic][32-byte blake2b checksum][bincode data]
     pub fn save_snapshot(&self, path: &Path) -> Result<(), LedgerError> {
         let tmp_path = path.with_extension("tmp");
         let data = bincode::serialize(self).map_err(|e| {
             LedgerError::EpochTransition(format!("Failed to serialize ledger state: {e}"))
         })?;
-        std::fs::write(&tmp_path, &data)
+
+        // Compute checksum over the serialized data
+        let checksum = torsten_primitives::hash::blake2b_256(&data);
+
+        // Write: magic + checksum + data
+        let mut output = Vec::with_capacity(4 + 32 + data.len());
+        output.extend_from_slice(b"TRSN"); // Torsten Snapshot magic bytes
+        output.extend_from_slice(checksum.as_bytes());
+        output.extend_from_slice(&data);
+
+        std::fs::write(&tmp_path, &output)
             .map_err(|e| LedgerError::EpochTransition(format!("Failed to write snapshot: {e}")))?;
         std::fs::rename(&tmp_path, path)
             .map_err(|e| LedgerError::EpochTransition(format!("Failed to rename snapshot: {e}")))?;
         info!(
             path = %path.display(),
-            bytes = data.len(),
+            bytes = output.len(),
             utxo_count = self.utxo_set.len(),
             epoch = self.epoch.0,
             slot = ?self.tip.point.slot().map(|s| s.0),
@@ -1569,16 +1580,35 @@ impl LedgerState {
         Ok(())
     }
 
-    /// Load ledger state snapshot from disk
+    /// Load ledger state snapshot from disk.
+    /// Verifies magic bytes and blake2b checksum before deserializing.
     pub fn load_snapshot(path: &Path) -> Result<Self, LedgerError> {
-        let data = std::fs::read(path)
+        let raw = std::fs::read(path)
             .map_err(|e| LedgerError::EpochTransition(format!("Failed to read snapshot: {e}")))?;
-        let state: LedgerState = bincode::deserialize(&data).map_err(|e| {
+
+        // Try new format with magic + checksum header (36 bytes minimum)
+        let data = if raw.len() >= 36 && &raw[..4] == b"TRSN" {
+            let stored_checksum = &raw[4..36];
+            let payload = &raw[36..];
+            let computed = torsten_primitives::hash::blake2b_256(payload);
+            if computed.as_bytes() != stored_checksum {
+                return Err(LedgerError::EpochTransition(
+                    "Snapshot checksum mismatch — file may be corrupted".to_string(),
+                ));
+            }
+            payload
+        } else {
+            // Legacy format: raw bincode without header (backwards compatible)
+            warn!("Loading legacy snapshot without checksum verification");
+            &raw
+        };
+
+        let state: LedgerState = bincode::deserialize(data).map_err(|e| {
             LedgerError::EpochTransition(format!("Failed to deserialize ledger state: {e}"))
         })?;
         info!(
             path = %path.display(),
-            bytes = data.len(),
+            bytes = raw.len(),
             utxo_count = state.utxo_set.len(),
             epoch = state.epoch.0,
             slot = ?state.tip.point.slot().map(|s| s.0),
@@ -3421,6 +3451,31 @@ mod tests {
         assert_eq!(loaded.epoch, EpochNo(42));
         assert_eq!(loaded.tip.block_number, BlockNo(5000));
         assert_eq!(loaded.utxo_set.len(), 1);
+    }
+
+    #[test]
+    fn test_ledger_snapshot_corruption_detected() {
+        let dir = tempfile::tempdir().unwrap();
+        let snapshot_path = dir.path().join("ledger-snapshot.bin");
+
+        // Create and save a valid snapshot
+        let state = LedgerState::new(ProtocolParameters::mainnet_defaults());
+        state.save_snapshot(&snapshot_path).unwrap();
+
+        // Corrupt one byte in the payload area (after 36-byte header)
+        let mut data = std::fs::read(&snapshot_path).unwrap();
+        assert!(data.len() > 40);
+        data[40] ^= 0xFF; // Flip bits
+        std::fs::write(&snapshot_path, &data).unwrap();
+
+        // Load should fail with checksum mismatch
+        let result = LedgerState::load_snapshot(&snapshot_path);
+        assert!(result.is_err());
+        let err_msg = format!("{}", result.unwrap_err());
+        assert!(
+            err_msg.contains("checksum"),
+            "Expected checksum error, got: {err_msg}"
+        );
     }
 
     #[test]

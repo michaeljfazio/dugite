@@ -63,7 +63,8 @@ enum TxSubcommand {
         socket_path: PathBuf,
     },
     /// Calculate transaction hash
-    TxId {
+    #[command(name = "txid")]
+    Txid {
         /// Transaction file
         #[arg(long)]
         tx_file: PathBuf,
@@ -615,7 +616,7 @@ impl TransactionCmd {
 
                 Ok(())
             }
-            TxSubcommand::TxId { tx_file } => {
+            TxSubcommand::Txid { tx_file } => {
                 let content = std::fs::read_to_string(&tx_file)?;
                 let envelope: serde_json::Value = serde_json::from_str(&content)?;
                 let cbor_hex = envelope["cborHex"]

@@ -1195,12 +1195,15 @@ impl Node {
                     if strict {
                         error!(
                             slot = last_block.slot().0,
+                            block_no = last_block.block_number().0,
+                            hash = %last_block.hash().to_hex(),
                             "Rejecting block batch: consensus validation failed: {e}"
                         );
                         return;
                     }
                     warn!(
                         slot = last_block.slot().0,
+                        block_no = last_block.block_number().0,
                         "Consensus validation warning: {e}"
                     );
                 }
@@ -1223,37 +1226,32 @@ impl Node {
             })
             .collect();
 
-        // Run ChainDB write and ledger apply concurrently — they are independent
-        let chain_db = self.chain_db.clone();
-        let ledger_state = self.ledger_state.clone();
-        let store_failed = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let store_failed2 = store_failed.clone();
-        tokio::join!(
-            async {
-                let mut db = chain_db.write().await;
-                if let Err(e) = db.add_blocks_batch(db_batch) {
-                    error!("FATAL: Failed to store block batch: {e}");
-                    store_failed2.store(true, std::sync::atomic::Ordering::Relaxed);
+        // Store blocks to ChainDB FIRST, then apply to ledger.
+        // This ordering ensures the ledger never advances past what's persisted in storage,
+        // preventing state divergence if storage fails.
+        {
+            let mut db = self.chain_db.write().await;
+            if let Err(e) = db.add_blocks_batch(db_batch) {
+                error!(
+                    "FATAL: Failed to store block batch: {e} — halting to prevent state divergence"
+                );
+                return;
+            }
+        }
+
+        // Now apply blocks to ledger — storage is confirmed
+        {
+            let mut ls = self.ledger_state.write().await;
+            let ledger_slot = ls.tip.point.slot().map(|s| s.0).unwrap_or(0);
+            for block in &blocks {
+                // Skip blocks the ledger has already applied (e.g. replaying from origin)
+                if block.slot().0 <= ledger_slot {
+                    continue;
                 }
-            },
-            async {
-                let mut ls = ledger_state.write().await;
-                let ledger_slot = ls.tip.point.slot().map(|s| s.0).unwrap_or(0);
-                for block in &blocks {
-                    // Skip blocks the ledger has already applied (e.g. replaying from origin)
-                    if block.slot().0 <= ledger_slot {
-                        continue;
-                    }
-                    if let Err(e) = ls.apply_block(block) {
-                        error!("Failed to apply block to ledger: {e}");
-                    }
+                if let Err(e) = ls.apply_block(block) {
+                    error!("Failed to apply block to ledger: {e}");
                 }
             }
-        );
-
-        if store_failed.load(std::sync::atomic::Ordering::Relaxed) {
-            error!("Block storage failed — halting block processing to prevent state divergence");
-            return;
         }
 
         // Remove confirmed transactions from mempool and revalidate
