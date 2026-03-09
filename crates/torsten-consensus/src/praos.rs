@@ -94,6 +94,11 @@ impl OuroborosPraos {
         }
     }
 
+    /// Check if strict verification mode is enabled.
+    pub fn strict_verification(&self) -> bool {
+        self.strict_verification
+    }
+
     /// Enable strict verification mode (for when node is caught up to chain tip).
     /// In strict mode, VRF/KES/opcert verification failures reject blocks.
     pub fn set_strict_verification(&mut self, strict: bool) {

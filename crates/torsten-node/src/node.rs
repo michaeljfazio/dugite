@@ -1168,6 +1168,31 @@ impl Node {
         if blocks.is_empty() {
             return;
         }
+
+        // Validate block headers BEFORE storing. In strict mode (at tip), reject
+        // invalid blocks. During sync, log warnings but continue.
+        let strict = self.consensus.strict_verification();
+        if let Some(last_block) = blocks.last() {
+            if last_block.era.is_shelley_based() {
+                if let Err(e) = self
+                    .consensus
+                    .validate_header(&last_block.header, last_block.slot())
+                {
+                    if strict {
+                        error!(
+                            slot = last_block.slot().0,
+                            "Rejecting block batch: consensus validation failed: {e}"
+                        );
+                        return;
+                    }
+                    warn!(
+                        slot = last_block.slot().0,
+                        "Consensus validation warning: {e}"
+                    );
+                }
+            }
+        }
+
         let batch_count = blocks.len() as u64;
 
         // Build ChainDB batch data, taking ownership of raw_cbor to avoid cloning
@@ -1234,17 +1259,6 @@ impl Node {
         }
 
         if let Some(last_block) = blocks.last() {
-            if last_block.era.is_shelley_based() {
-                if let Err(e) = self
-                    .consensus
-                    .validate_header(&last_block.header, last_block.slot())
-                {
-                    warn!(
-                        slot = last_block.slot().0,
-                        "Consensus validation warning: {e}"
-                    );
-                }
-            }
             self.consensus.update_tip(last_block.tip());
         }
 
