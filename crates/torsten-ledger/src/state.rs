@@ -154,6 +154,9 @@ pub struct StakeSnapshot {
     pub pool_stake: HashMap<Hash28, Lovelace>,
     /// pool_id -> pool parameters at snapshot time
     pub pool_params: HashMap<Hash28, PoolRegistration>,
+    /// Individual stake per credential (for reward distribution and pledge verification)
+    #[serde(default)]
+    pub stake_distribution: HashMap<Hash32, Lovelace>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -641,6 +644,7 @@ impl LedgerState {
             delegations: self.delegations.clone(),
             pool_stake,
             pool_params: self.pool_params.clone(),
+            stake_distribution: self.stake_distribution.stake_map.clone(),
         });
 
         // Process pending pool retirements for this epoch
@@ -788,27 +792,22 @@ impl LedgerState {
         self.epoch = new_epoch;
     }
 
-    /// Calculate and distribute rewards according to the Cardano reward formula.
+    /// Calculate and distribute rewards according to the Cardano Shelley reward formula.
     ///
-    /// Uses the "go" snapshot (two epochs ago) for stake distribution and the
-    /// current epoch's fees and block production data.
-    ///
-    /// Reward formula:
-    ///   total_rewards = monetary_expansion_from_reserves + epoch_fees
-    ///   treasury_cut = tau * total_rewards
-    ///   pool_rewards_pot = total_rewards - treasury_cut
-    ///
-    /// For each pool:
-    ///   apparent_performance = blocks_minted / expected_blocks (capped at 1.0)
-    ///   pool_reward = pool_rewards_pot * (pool_relative_stake * apparent_performance)
-    ///   operator_reward = cost + margin * max(0, pool_reward - cost)
-    ///   member_rewards = pool_reward - operator_reward (shared proportionally)
+    /// Implements the formula from cardano-ledger-shelley:
+    ///   - maxPool'(a0, nOpt, R, sigma, p) for pledge-influenced pool rewards
+    ///   - mkApparentPerformance for beta/sigma performance calculation
+    ///   - Pledge verification (pool gets zero if owner stake < declared pledge)
+    ///   - Operator reward includes self-delegation share (margin + proportional)
+    ///   - Operator reward goes to pool's registered reward account
     fn calculate_and_distribute_rewards(&mut self, go_snapshot: StakeSnapshot) {
-        let rho = self.protocol_params.rho.as_f64();
-        let tau = self.protocol_params.tau.as_f64();
+        let rho_num = self.protocol_params.rho.numerator as i128;
+        let rho_den = self.protocol_params.rho.denominator.max(1) as i128;
+        let tau_num = self.protocol_params.tau.numerator as i128;
+        let tau_den = self.protocol_params.tau.denominator.max(1) as i128;
 
-        // Monetary expansion from reserves: rho * reserves
-        let expansion = (rho * self.reserves.0 as f64) as u64;
+        // Monetary expansion: floor(rho * reserves)
+        let expansion = (rho_num * self.reserves.0 as i128 / rho_den) as u64;
         let total_rewards_available = expansion + self.epoch_fees.0;
 
         if total_rewards_available == 0 {
@@ -818,33 +817,62 @@ impl LedgerState {
         // Move expansion from reserves
         self.reserves.0 = self.reserves.0.saturating_sub(expansion);
 
-        // Treasury cut
-        let treasury_cut = (tau * total_rewards_available as f64) as u64;
+        // Treasury cut: floor(tau * total_rewards)
+        let treasury_cut = (tau_num * total_rewards_available as i128 / tau_den) as u64;
         self.treasury.0 += treasury_cut;
 
-        let pool_rewards_pot = total_rewards_available - treasury_cut;
+        let reward_pot = total_rewards_available - treasury_cut;
 
-        // Calculate total active stake from the go snapshot
-        let total_active_stake: u64 = go_snapshot.pool_stake.values().map(|s| s.0).sum();
-        if total_active_stake == 0 {
-            // No active stake — all remaining goes to treasury
-            self.treasury.0 += pool_rewards_pot;
+        // Total stake for sigma denominator: circulation = maxSupply - reserves
+        let total_stake = MAX_LOVELACE_SUPPLY.saturating_sub(self.reserves.0);
+        if total_stake == 0 {
+            self.treasury.0 += reward_pot;
             return;
         }
 
-        // Expected number of blocks this epoch
-        let expected_blocks = self.epoch_length as f64 * self.protocol_params.active_slot_coeff();
+        // Total active stake (for apparent performance denominator)
+        let total_active_stake: u64 = go_snapshot.pool_stake.values().map(|s| s.0).sum();
+        if total_active_stake == 0 {
+            self.treasury.0 += reward_pot;
+            return;
+        }
+
+        // Total blocks produced this epoch
+        let total_blocks_in_epoch = self.epoch_block_count.max(1);
+
+        // Saturation point: z0 = 1/nOpt
+        let n_opt = self.protocol_params.n_opt.max(1);
+        // a0 pledge influence
+        let a0 = self.protocol_params.a0.as_f64();
 
         let mut total_distributed: u64 = 0;
 
         // Build delegators-by-pool index for O(n) reward distribution
-        // instead of O(n*m) inner loop over all delegations per pool
         let mut delegators_by_pool: HashMap<Hash28, Vec<Hash32>> = HashMap::new();
         for (cred_hash, pool_id) in &go_snapshot.delegations {
             delegators_by_pool
                 .entry(*pool_id)
                 .or_default()
                 .push(*cred_hash);
+        }
+
+        // Build owner-delegated-stake per pool for pledge check
+        let mut owner_stake_by_pool: HashMap<Hash28, u64> = HashMap::new();
+        for (pool_id, pool_reg) in &go_snapshot.pool_params {
+            let mut owner_stake = 0u64;
+            for owner in &pool_reg.owners {
+                let mut key_bytes = [0u8; 32];
+                key_bytes[..28].copy_from_slice(owner.as_bytes());
+                let owner_key = Hash32::from_bytes(key_bytes);
+                if go_snapshot.delegations.get(&owner_key) == Some(pool_id) {
+                    owner_stake += go_snapshot
+                        .stake_distribution
+                        .get(&owner_key)
+                        .map(|l| l.0)
+                        .unwrap_or(0);
+                }
+            }
+            owner_stake_by_pool.insert(*pool_id, owner_stake);
         }
 
         // Calculate rewards per pool
@@ -854,43 +882,79 @@ impl LedgerState {
                 None => continue,
             };
 
-            let relative_stake = pool_active_stake.0 as f64 / total_active_stake as f64;
+            // Pledge check: if owner-delegated stake < declared pledge, pool gets zero
+            let self_delegated = owner_stake_by_pool.get(pool_id).copied().unwrap_or(0);
+            if self_delegated < pool_reg.pledge.0 {
+                debug!(
+                    "Pool {} pledge not met: {} < {}",
+                    pool_id.to_hex(),
+                    self_delegated,
+                    pool_reg.pledge.0
+                );
+                continue;
+            }
 
-            // Pool performance: blocks produced / expected blocks for this stake
-            let expected_pool_blocks = expected_blocks * relative_stake;
-            let blocks_minted = self.epoch_blocks_by_pool.get(pool_id).copied().unwrap_or(0) as f64;
-            let performance = if expected_pool_blocks > 0.0 {
-                (blocks_minted / expected_pool_blocks).min(1.0)
+            // maxPool'(a0, nOpt, R, sigma, p):
+            //   z0 = 1/nOpt
+            //   sigma' = min(sigma, z0), p' = min(p, z0)
+            //   maxPool = R/(1+a0) * (sigma' + p' * a0 * (sigma' - p'*(z0-sigma')/z0) / z0)
+            let z0 = 1.0 / n_opt as f64;
+            let sigma = (pool_active_stake.0 as f64 / total_stake as f64).min(z0);
+            let p = (pool_reg.pledge.0 as f64 / total_stake as f64).min(z0);
+
+            let factor1 = reward_pot as f64 / (1.0 + a0);
+            let factor4 = (z0 - sigma) / z0;
+            let factor3 = (sigma - p * factor4) / z0;
+            let factor2 = sigma + p * a0 * factor3;
+            let max_pool = (factor1 * factor2).floor() as u64;
+
+            // Apparent performance: beta / sigma_a
+            //   beta = blocks_made / total_blocks
+            //   sigma_a = pool_stake / total_active_stake
+            //   perf = beta / sigma_a
+            let blocks_made = self.epoch_blocks_by_pool.get(pool_id).copied().unwrap_or(0);
+            let pool_reward = if blocks_made == 0 || pool_active_stake.0 == 0 {
+                0u64
             } else {
-                0.0
+                let beta = blocks_made as f64 / total_blocks_in_epoch as f64;
+                let sigma_a = pool_active_stake.0 as f64 / total_active_stake as f64;
+                let apparent_perf = if sigma_a > 0.0 { beta / sigma_a } else { 0.0 };
+                (apparent_perf * max_pool as f64).floor() as u64
             };
-
-            // Pool's share of the rewards pot
-            let pool_reward = (pool_rewards_pot as f64 * relative_stake * performance) as u64;
 
             if pool_reward == 0 {
                 continue;
             }
 
-            // Operator gets cost + margin * (pool_reward - cost)
+            // Operator reward: cost + (margin + (1-margin) * s/sigma) * max(0, pool_reward - cost)
+            // where s/sigma = self_delegated / pool_stake (owner's fraction of pool)
             let cost = pool_reg.cost.0;
-            let margin =
-                pool_reg.margin_numerator as f64 / pool_reg.margin_denominator.max(1) as f64;
+            let margin_num = pool_reg.margin_numerator as i128;
+            let margin_den = pool_reg.margin_denominator.max(1) as i128;
+            let pool_stake_i = pool_active_stake.0 as i128;
 
             let operator_reward = if pool_reward <= cost {
                 pool_reward
             } else {
-                cost + (margin * (pool_reward - cost) as f64) as u64
+                let remainder = (pool_reward - cost) as i128;
+                // operator_share = margin + (1-margin) * s/sigma
+                // = [margin_num * pool_stake + (margin_den - margin_num) * self_delegated] / (margin_den * pool_stake)
+                let share_num =
+                    margin_num * pool_stake_i + (margin_den - margin_num) * self_delegated as i128;
+                let share_den = margin_den * pool_stake_i;
+                let op_extra = if share_den == 0 {
+                    0i128
+                } else {
+                    remainder * share_num / share_den
+                };
+                cost + op_extra.max(0) as u64
             };
-
-            let member_reward_pot = pool_reward.saturating_sub(operator_reward);
 
             // Distribute member rewards proportionally to delegators
             if let Some(delegators) = delegators_by_pool.get(pool_id) {
                 for cred_hash in delegators {
-                    let member_stake = self
+                    let member_stake = go_snapshot
                         .stake_distribution
-                        .stake_map
                         .get(cred_hash)
                         .copied()
                         .unwrap_or(Lovelace(0))
@@ -900,8 +964,15 @@ impl LedgerState {
                         continue;
                     }
 
-                    let member_share = (member_reward_pot as f64 * member_stake as f64
-                        / pool_active_stake.0 as f64) as u64;
+                    // Member share: floor((pool_reward - cost) * (1 - margin) * member_stake / pool_stake)
+                    let member_share = if pool_reward <= cost {
+                        0u64
+                    } else {
+                        let remainder = (pool_reward - cost) as i128;
+                        let ms = remainder * (margin_den - margin_num) * member_stake as i128
+                            / (margin_den * pool_stake_i);
+                        ms.max(0) as u64
+                    };
 
                     if member_share > 0 {
                         *self
@@ -913,12 +984,9 @@ impl LedgerState {
                 }
             }
 
-            // Operator reward goes to pool's reward account
-            // (Use pool_id padded to 32 bytes as the reward key)
+            // Operator reward goes to pool's registered reward account
             if operator_reward > 0 {
-                let mut op_key_bytes = [0u8; 32];
-                op_key_bytes[..28].copy_from_slice(pool_id.as_bytes());
-                let op_key = Hash32::from_bytes(op_key_bytes);
+                let op_key = Self::reward_account_to_hash(&pool_reg.reward_account);
                 *self.reward_accounts.entry(op_key).or_insert(Lovelace(0)) +=
                     Lovelace(operator_reward);
                 total_distributed += operator_reward;
@@ -926,7 +994,7 @@ impl LedgerState {
         }
 
         // Any undistributed rewards go to treasury
-        let undistributed = pool_rewards_pot.saturating_sub(total_distributed);
+        let undistributed = reward_pot.saturating_sub(total_distributed);
         if undistributed > 0 {
             self.treasury.0 += undistributed;
         }
@@ -935,6 +1003,16 @@ impl LedgerState {
             "Rewards distributed: {} lovelace to accounts, {} to treasury (expansion: {}, fees: {})",
             total_distributed, treasury_cut + undistributed, expansion, self.epoch_fees.0
         );
+    }
+
+    /// Convert a reward account (raw bytes with network header) to a Hash32 key
+    fn reward_account_to_hash(reward_account: &[u8]) -> Hash32 {
+        let mut key_bytes = [0u8; 32];
+        if reward_account.len() >= 29 {
+            let copy_len = (reward_account.len() - 1).min(32);
+            key_bytes[..copy_len].copy_from_slice(&reward_account[1..1 + copy_len]);
+        }
+        Hash32::from_bytes(key_bytes)
     }
 
     /// Update the rolling nonce with a new VRF output.
@@ -2188,31 +2266,38 @@ mod tests {
     fn test_reward_calculation() {
         let params = ProtocolParameters::mainnet_defaults();
         let mut state = LedgerState::new(params);
-        state.epoch_length = 100; // Small epochs for testing
-        state.reserves = Lovelace(10_000_000_000); // 10k ADA in reserves
+        state.epoch_length = 432000; // Mainnet epoch length
+                                     // Realistic reserves: 10 billion ADA
+        state.reserves = Lovelace(10_000_000_000_000_000);
 
-        let cred = Credential::VerificationKey(Hash28::from_bytes([42u8; 28]));
+        let owner_hash = Hash28::from_bytes([42u8; 28]);
+        let cred = Credential::VerificationKey(owner_hash);
         let pool_id = Hash28::from_bytes([1u8; 28]);
         let key = credential_to_hash(&cred);
 
+        // Build reward account from owner credential
+        let mut reward_account = vec![0xE0u8];
+        reward_account.extend_from_slice(owner_hash.as_bytes());
+
         // Register stake, pool, and delegate
         state.process_certificate(&Certificate::StakeRegistration(cred.clone()));
+        // Realistic pool stake: 50 million ADA (large pool)
         state
             .stake_distribution
             .stake_map
-            .insert(key, Lovelace(1_000_000_000)); // 1000 ADA
+            .insert(key, Lovelace(50_000_000_000_000));
 
         state.process_certificate(&Certificate::PoolRegistration(PoolParams {
             operator: pool_id,
             vrf_keyhash: Hash32::from_bytes([2u8; 32]),
-            pledge: Lovelace(100_000_000),
+            pledge: Lovelace(1_000_000_000_000), // 1M ADA pledge
             cost: Lovelace(340_000_000),
             margin: Rational {
                 numerator: 1,
                 denominator: 100,
             },
-            reward_account: vec![0u8; 29],
-            pool_owners: vec![pool_id],
+            reward_account,
+            pool_owners: vec![owner_hash],
             relays: vec![],
             pool_metadata: None,
         }));
@@ -2222,62 +2307,66 @@ mod tests {
             pool_hash: pool_id,
         });
 
-        // Build up snapshots: need 3 rotations before "go" is populated
-        // Epoch 0→1: mark=snap1
+        // Build up snapshots: 3 rotations to populate "go"
         state.process_epoch_transition(EpochNo(1));
-        // Epoch 1→2: set=snap1, mark=snap2
         state.process_epoch_transition(EpochNo(2));
-        // Epoch 2→3: go=snap1, set=snap2, mark=snap3
         state.process_epoch_transition(EpochNo(3));
 
-        // Add fees and block production for epoch 3
-        state.epoch_fees = Lovelace(5_000_000); // 5 ADA in fees
-                                                // Pool produced all blocks for the epoch
-        state.epoch_blocks_by_pool.insert(pool_id, 5);
+        // Pool produced blocks proportional to its stake
+        state.epoch_fees = Lovelace(500_000_000_000); // 500k ADA fees
+        state.epoch_blocks_by_pool.insert(pool_id, 1000);
+        state.epoch_block_count = 1000;
 
         // Epoch 3→4: triggers reward calculation using "go" snapshot
         state.process_epoch_transition(EpochNo(4));
 
-        // Treasury should have increased (tau * total_rewards)
+        // Treasury should have increased
         assert!(state.treasury.0 > 0);
 
-        // Reserves should have decreased (monetary expansion)
-        assert!(state.reserves.0 < 10_000_000_000);
+        // Reserves should have decreased
+        assert!(state.reserves.0 < 10_000_000_000_000_000);
 
-        // Reward accounts should have received something
+        // Reward accounts should have received rewards
         let total_rewards: u64 = state.reward_accounts.values().map(|l| l.0).sum();
-        assert!(total_rewards > 0);
+        assert!(
+            total_rewards > 0,
+            "Expected rewards > 0, got {total_rewards}"
+        );
     }
 
     #[test]
     fn test_reward_calculation_no_blocks_no_rewards() {
         let params = ProtocolParameters::mainnet_defaults();
         let mut state = LedgerState::new(params);
-        state.epoch_length = 100;
-        state.reserves = Lovelace(10_000_000_000);
+        state.epoch_length = 432000;
+        state.reserves = Lovelace(10_000_000_000_000_000);
 
-        let cred = Credential::VerificationKey(Hash28::from_bytes([42u8; 28]));
+        let owner_hash = Hash28::from_bytes([42u8; 28]);
+        let cred = Credential::VerificationKey(owner_hash);
         let pool_id = Hash28::from_bytes([1u8; 28]);
         let key = credential_to_hash(&cred);
+
+        let mut reward_account = vec![0xE0u8];
+        reward_account.extend_from_slice(owner_hash.as_bytes());
 
         // Setup delegation
         state.process_certificate(&Certificate::StakeRegistration(cred.clone()));
         state
             .stake_distribution
             .stake_map
-            .insert(key, Lovelace(1_000_000_000));
+            .insert(key, Lovelace(50_000_000_000_000));
 
         state.process_certificate(&Certificate::PoolRegistration(PoolParams {
             operator: pool_id,
             vrf_keyhash: Hash32::from_bytes([2u8; 32]),
-            pledge: Lovelace(100_000_000),
+            pledge: Lovelace(1_000_000_000_000),
             cost: Lovelace(340_000_000),
             margin: Rational {
                 numerator: 0,
                 denominator: 1,
             },
-            reward_account: vec![0u8; 29],
-            pool_owners: vec![pool_id],
+            reward_account,
+            pool_owners: vec![owner_hash],
             relays: vec![],
             pool_metadata: None,
         }));
@@ -2303,6 +2392,146 @@ mod tests {
         assert_eq!(member_rewards, 0);
         // But treasury still gets the treasury cut + undistributed
         assert!(state.treasury.0 > 0);
+    }
+
+    #[test]
+    fn test_reward_pledge_not_met_zero_rewards() {
+        // Pool with pledge > owner stake should receive zero rewards
+        let params = ProtocolParameters::mainnet_defaults();
+        let mut state = LedgerState::new(params);
+        state.epoch_length = 432000;
+        state.reserves = Lovelace(10_000_000_000_000_000);
+
+        let owner_hash = Hash28::from_bytes([42u8; 28]);
+        let cred = Credential::VerificationKey(owner_hash);
+        let pool_id = Hash28::from_bytes([1u8; 28]);
+        let key = credential_to_hash(&cred);
+
+        let mut reward_account = vec![0xE0u8];
+        reward_account.extend_from_slice(owner_hash.as_bytes());
+
+        state.process_certificate(&Certificate::StakeRegistration(cred.clone()));
+        // Owner has only 1M ADA delegated
+        state
+            .stake_distribution
+            .stake_map
+            .insert(key, Lovelace(1_000_000_000_000));
+
+        state.process_certificate(&Certificate::PoolRegistration(PoolParams {
+            operator: pool_id,
+            vrf_keyhash: Hash32::from_bytes([2u8; 32]),
+            pledge: Lovelace(10_000_000_000_000), // 10M ADA pledge — NOT met
+            cost: Lovelace(340_000_000),
+            margin: Rational {
+                numerator: 1,
+                denominator: 100,
+            },
+            reward_account,
+            pool_owners: vec![owner_hash],
+            relays: vec![],
+            pool_metadata: None,
+        }));
+
+        state.process_certificate(&Certificate::StakeDelegation {
+            credential: cred,
+            pool_hash: pool_id,
+        });
+
+        state.process_epoch_transition(EpochNo(1));
+        state.process_epoch_transition(EpochNo(2));
+        state.process_epoch_transition(EpochNo(3));
+
+        state.epoch_fees = Lovelace(500_000_000_000);
+        state.epoch_blocks_by_pool.insert(pool_id, 1000);
+        state.epoch_block_count = 1000;
+        state.process_epoch_transition(EpochNo(4));
+
+        // No pool rewards when pledge not met — all goes to treasury as undistributed
+        let member_rewards: u64 = state.reward_accounts.values().map(|l| l.0).sum();
+        assert_eq!(
+            member_rewards, 0,
+            "Pledge-unmet pool should get zero rewards"
+        );
+        assert!(state.treasury.0 > 0);
+    }
+
+    #[test]
+    fn test_reward_operator_gets_registered_reward_account() {
+        // Verify operator rewards go to the pool's registered reward account, not pool_id
+        let params = ProtocolParameters::mainnet_defaults();
+        let mut state = LedgerState::new(params);
+        state.epoch_length = 432000;
+        state.reserves = Lovelace(10_000_000_000_000_000);
+
+        let owner_hash = Hash28::from_bytes([42u8; 28]);
+        let cred = Credential::VerificationKey(owner_hash);
+        let pool_id = Hash28::from_bytes([1u8; 28]);
+        let key = credential_to_hash(&cred);
+
+        // Reward account uses the owner's credential
+        let mut reward_account = vec![0xE0u8];
+        reward_account.extend_from_slice(owner_hash.as_bytes());
+
+        state.process_certificate(&Certificate::StakeRegistration(cred.clone()));
+        state
+            .stake_distribution
+            .stake_map
+            .insert(key, Lovelace(50_000_000_000_000));
+
+        state.process_certificate(&Certificate::PoolRegistration(PoolParams {
+            operator: pool_id,
+            vrf_keyhash: Hash32::from_bytes([2u8; 32]),
+            pledge: Lovelace(1_000_000_000_000),
+            cost: Lovelace(340_000_000),
+            margin: Rational {
+                numerator: 5,
+                denominator: 100,
+            },
+            reward_account,
+            pool_owners: vec![owner_hash],
+            relays: vec![],
+            pool_metadata: None,
+        }));
+
+        state.process_certificate(&Certificate::StakeDelegation {
+            credential: cred,
+            pool_hash: pool_id,
+        });
+
+        state.process_epoch_transition(EpochNo(1));
+        state.process_epoch_transition(EpochNo(2));
+        state.process_epoch_transition(EpochNo(3));
+
+        state.epoch_fees = Lovelace(500_000_000_000);
+        state.epoch_blocks_by_pool.insert(pool_id, 1000);
+        state.epoch_block_count = 1000;
+        state.process_epoch_transition(EpochNo(4));
+
+        // Operator reward should go to owner_hash credential, not pool_id padded to 32
+        let reward_key = credential_to_hash(&Credential::VerificationKey(owner_hash));
+        let owner_reward = state
+            .reward_accounts
+            .get(&reward_key)
+            .copied()
+            .unwrap_or(Lovelace(0));
+        assert!(
+            owner_reward.0 > 0,
+            "Owner should receive operator + member rewards at registered reward account"
+        );
+
+        // Pool_id padded to 32 bytes should NOT have rewards (old bug)
+        let mut pool_key_bytes = [0u8; 32];
+        pool_key_bytes[..28].copy_from_slice(pool_id.as_bytes());
+        let pool_key = Hash32::from_bytes(pool_key_bytes);
+        let pool_id_reward = state
+            .reward_accounts
+            .get(&pool_key)
+            .copied()
+            .unwrap_or(Lovelace(0));
+        assert_eq!(
+            pool_id_reward.0, 0,
+            "Pool ID should not receive rewards directly — must use registered reward account"
+        );
     }
 
     #[test]
