@@ -1360,7 +1360,7 @@ impl Node {
                                     // enable strict verification for new blocks
                                     pipeline_depth = 1;
                                     self.enable_strict_verification().await;
-                                    let old = pipelined.take().unwrap();
+                                    let old = pipelined.take().expect("pipelined client is Some after is_some_and guard");
                                     let addr = old.remote_addr();
                                     old.abort().await;
                                     match PipelinedPeerClient::connect(&addr.to_string() as &str, self.network_magic).await {
@@ -1408,7 +1408,7 @@ impl Node {
                                 }
 
                                 if !forward_blocks.is_empty() {
-                                    let tip = forward_blocks.last().unwrap().1.clone();
+                                    let tip = forward_blocks.last().expect("forward_blocks is non-empty").1.clone();
                                     let blocks: Vec<_> = forward_blocks.into_iter().map(|(b, _)| b).collect();
                                     self.process_forward_blocks(blocks, &tip, &mut blocks_received, &mut blocks_since_last_log, &mut last_snapshot_epoch, &mut last_log_time, &mut last_query_update).await;
                                 }
@@ -1629,7 +1629,9 @@ impl Node {
             .transactions_validated
             .fetch_add(tx_count, std::sync::atomic::Ordering::Relaxed);
 
-        let last_block = blocks.last().unwrap();
+        let last_block = blocks
+            .last()
+            .expect("blocks is non-empty (checked at function entry)");
         let slot = last_block.slot().0;
         let block_no = last_block.block_number().0;
         self.metrics.set_slot(slot);
