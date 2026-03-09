@@ -68,6 +68,17 @@ pub enum ValidationError {
     NativeScriptFailed,
     #[error("Witness signature verification failed for vkey: {0}")]
     InvalidWitnessSignature(String),
+    #[error("Output address network mismatch: expected {expected:?}, got {actual:?}")]
+    NetworkMismatch {
+        expected: torsten_primitives::network::NetworkId,
+        actual: torsten_primitives::network::NetworkId,
+    },
+    #[error("Block execution units exceeded: {resource} limit={limit}, total={total}")]
+    BlockExUnitsExceeded {
+        resource: String,
+        limit: u64,
+        total: u64,
+    },
 }
 
 /// Validate a transaction against the current UTxO set and protocol parameters
@@ -273,6 +284,27 @@ pub fn validate_transaction(
                 minimum: min_utxo.0,
                 actual: output.value.coin.0,
             });
+        }
+    }
+
+    // Rule 5b: Network ID validation
+    // If the transaction specifies a network_id, all Shelley output addresses must match
+    if let Some(tx_network_id) = body.network_id {
+        let expected_network = if tx_network_id == 0 {
+            torsten_primitives::network::NetworkId::Testnet
+        } else {
+            torsten_primitives::network::NetworkId::Mainnet
+        };
+        for output in &body.outputs {
+            if let Some(addr_network) = output.address.network_id() {
+                if addr_network != expected_network {
+                    errors.push(ValidationError::NetworkMismatch {
+                        expected: expected_network,
+                        actual: addr_network,
+                    });
+                    break;
+                }
+            }
         }
     }
 

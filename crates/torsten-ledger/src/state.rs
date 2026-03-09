@@ -284,6 +284,32 @@ impl LedgerState {
             self.process_epoch_transition(block_epoch);
         }
 
+        // Block-level execution unit budget check
+        let mut block_mem: u64 = 0;
+        let mut block_steps: u64 = 0;
+        for tx in &block.transactions {
+            if tx.is_valid {
+                for r in &tx.witness_set.redeemers {
+                    block_mem = block_mem.saturating_add(r.ex_units.mem);
+                    block_steps = block_steps.saturating_add(r.ex_units.steps);
+                }
+            }
+        }
+        if block_mem > self.protocol_params.max_block_ex_units.mem {
+            warn!(
+                block_mem,
+                limit = self.protocol_params.max_block_ex_units.mem,
+                "Block exceeds max execution unit memory budget"
+            );
+        }
+        if block_steps > self.protocol_params.max_block_ex_units.steps {
+            warn!(
+                block_steps,
+                limit = self.protocol_params.max_block_ex_units.steps,
+                "Block exceeds max execution unit step budget"
+            );
+        }
+
         // Apply each transaction
         for tx in &block.transactions {
             // Skip invalid transactions (phase-2 validation failure)

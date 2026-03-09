@@ -129,6 +129,37 @@ impl UtxoQueryProvider for LedgerUtxoProvider {
             })
             .collect()
     }
+
+    fn utxos_by_tx_inputs(&self, inputs: &[(Vec<u8>, u32)]) -> Vec<UtxoSnapshot> {
+        let ledger = match self.ledger.try_read() {
+            Ok(l) => l,
+            Err(_) => return vec![],
+        };
+        let mut results = Vec::new();
+        for (tx_hash_bytes, idx) in inputs {
+            if tx_hash_bytes.len() == 32 {
+                let mut hash_arr = [0u8; 32];
+                hash_arr.copy_from_slice(tx_hash_bytes);
+                let tx_input = torsten_primitives::transaction::TransactionInput {
+                    transaction_id: torsten_primitives::hash::Hash32::from_bytes(hash_arr),
+                    index: *idx,
+                };
+                if let Some(output) = ledger.utxo_set.lookup(&tx_input) {
+                    let addr_bytes = output.address.to_bytes();
+                    results.push(UtxoSnapshot {
+                        tx_hash: tx_hash_bytes.clone(),
+                        output_index: *idx,
+                        address: hex::encode(&addr_bytes),
+                        lovelace: output.value.coin.0,
+                        has_datum: output.datum
+                            != torsten_primitives::transaction::OutputDatum::None,
+                        has_script_ref: output.script_ref.is_some(),
+                    });
+                }
+            }
+        }
+        results
+    }
 }
 
 /// Validates transactions against the live ledger state (Phase-1 + Phase-2 Plutus)

@@ -203,6 +203,11 @@ pub struct UtxoSnapshot {
 pub trait UtxoQueryProvider: Send + Sync {
     /// Look up UTxOs at a specific address (raw bytes)
     fn utxos_at_address_bytes(&self, addr_bytes: &[u8]) -> Vec<UtxoSnapshot>;
+
+    /// Look up UTxOs by transaction input references (tx_hash, output_index pairs)
+    fn utxos_by_tx_inputs(&self, _inputs: &[(Vec<u8>, u32)]) -> Vec<UtxoSnapshot> {
+        vec![] // Default: no results
+    }
 }
 
 /// Handler for local state queries.
@@ -360,6 +365,26 @@ impl QueryHandler {
                 // GetEpochNo (alternate)
                 debug!("Query: GetEpochNo (alt)");
                 QueryResult::EpochNo(self.state.epoch.0)
+            }
+            2 => {
+                // GetUTxOByTxIn — look up specific UTxOs by transaction input references
+                debug!("Query: GetUTxOByTxIn");
+                let mut inputs = Vec::new();
+                // Try to decode array of [tx_hash, output_index] pairs
+                if let Ok(Some(n)) = decoder.array() {
+                    for _ in 0..n {
+                        if let Ok(Some(_)) = decoder.array() {
+                            let tx_hash = decoder.bytes().unwrap_or(&[]).to_vec();
+                            let idx = decoder.u32().unwrap_or(0);
+                            inputs.push((tx_hash, idx));
+                        }
+                    }
+                }
+                if let Some(provider) = &self.utxo_provider {
+                    QueryResult::UtxoByAddress(provider.utxos_by_tx_inputs(&inputs))
+                } else {
+                    QueryResult::UtxoByAddress(vec![])
+                }
             }
             4 => {
                 // GetUTxOByAddress
