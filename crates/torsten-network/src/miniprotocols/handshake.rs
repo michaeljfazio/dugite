@@ -14,14 +14,8 @@ pub enum HandshakeError {
 /// Supported node-to-node protocol versions
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NodeToNodeVersion {
-    V7 = 7,
-    V8 = 8,
-    V9 = 9,
-    V10 = 10,
-    V11 = 11,
-    V12 = 12,
-    V13 = 13,
     V14 = 14,
+    V15 = 15,
 }
 
 /// Supported node-to-client protocol versions
@@ -58,7 +52,7 @@ pub fn propose_versions(network: NetworkId) -> Vec<(u32, VersionData)> {
     let magic = network.magic();
     vec![
         (
-            13,
+            14,
             VersionData {
                 network_magic: magic,
                 initiator_and_responder: true,
@@ -67,7 +61,7 @@ pub fn propose_versions(network: NetworkId) -> Vec<(u32, VersionData)> {
             },
         ),
         (
-            14,
+            15,
             VersionData {
                 network_magic: magic,
                 initiator_and_responder: true,

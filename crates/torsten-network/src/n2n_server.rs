@@ -617,8 +617,8 @@ fn handle_n2n_handshake(
     }
 
     // Parse version map to find the highest version we support
-    // N2N versions: 7-14 (Shelley through Conway)
-    // We support versions 13-14 (Babbage/Conway)
+    // N2N versions: 14 (Plomin HF) and 15 (SRV DNS support)
+    // We support versions 14-15 (matching current cardano-node)
     let mut best_version: Option<u32> = None;
     let map_len = decoder
         .map()
@@ -634,8 +634,8 @@ fn handle_n2n_handshake(
             .skip()
             .map_err(|e| N2NServerError::HandshakeFailed(e.to_string()))?;
 
-        // Accept versions 13-14 (Babbage and Conway N2N)
-        if (13..=14).contains(&version)
+        // Accept versions 14-15 (current cardano-node N2N)
+        if (14..=15).contains(&version)
             && (best_version.is_none() || version > best_version.unwrap())
         {
             best_version = Some(version);
@@ -1392,21 +1392,21 @@ mod tests {
 
     #[test]
     fn test_handle_n2n_handshake_accept() {
-        // Build a MsgProposeVersions: [0, {13: [magic, false, 0, false], 14: [magic, false, 0, false]}]
+        // Build a MsgProposeVersions: [0, {14: [magic, false, 0, false], 15: [magic, false, 0, false]}]
         let mut buf = Vec::new();
         let mut enc = minicbor::Encoder::new(&mut buf);
         enc.array(2).unwrap();
         enc.u32(0).unwrap(); // MsgProposeVersions
         enc.map(2).unwrap();
-        // Version 13
-        enc.u32(13).unwrap();
+        // Version 14
+        enc.u32(14).unwrap();
         enc.array(4).unwrap();
         enc.u64(2).unwrap(); // preview magic
         enc.bool(false).unwrap();
         enc.u32(0).unwrap();
         enc.bool(false).unwrap();
-        // Version 14
-        enc.u32(14).unwrap();
+        // Version 15
+        enc.u32(15).unwrap();
         enc.array(4).unwrap();
         enc.u64(2).unwrap();
         enc.bool(false).unwrap();
@@ -1420,13 +1420,13 @@ mod tests {
         assert_eq!(seg.protocol_id, MINI_PROTOCOL_HANDSHAKE);
         assert!(seg.is_responder);
 
-        // Verify response contains MsgAcceptVersion (tag 1) with version 14
+        // Verify response contains MsgAcceptVersion (tag 1) with version 15
         let mut dec = minicbor::Decoder::new(&seg.payload);
         dec.array().unwrap();
         let tag = dec.u32().unwrap();
         assert_eq!(tag, 1); // MsgAcceptVersion
         let version = dec.u32().unwrap();
-        assert_eq!(version, 14); // highest supported
+        assert_eq!(version, 15); // highest supported
     }
 
     #[test]
