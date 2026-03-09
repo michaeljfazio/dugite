@@ -184,7 +184,9 @@ async fn process_segment(
         MINI_PROTOCOL_TX_SUBMISSION => {
             handle_tx_submission(&segment.payload, mempool, tx_validator)
         }
-        MINI_PROTOCOL_TX_MONITOR => handle_tx_monitor(&segment.payload, mempool),
+        MINI_PROTOCOL_TX_MONITOR => {
+            handle_tx_monitor(&segment.payload, mempool, query_handler).await
+        }
         MINI_PROTOCOL_CHAINSYNC => {
             handle_local_chainsync(
                 &segment.payload,
@@ -411,9 +413,10 @@ fn handle_tx_submission(
 ///   7: MsgNextTxReply [7, null | [era_id, tx_bytes]]
 ///   8: MsgGetSizes    [8]
 ///   9: MsgGetSizesReply [9, [capacity, size, num_txs]]
-fn handle_tx_monitor(
+async fn handle_tx_monitor(
     payload: &[u8],
     mempool: &Arc<Mempool>,
+    query_handler: &Arc<RwLock<QueryHandler>>,
 ) -> Result<Option<Segment>, N2CServerError> {
     let mut decoder = minicbor::Decoder::new(payload);
 
@@ -434,16 +437,19 @@ fn handle_tx_monitor(
     match msg_tag {
         0 => {
             // MsgAcquire → MsgAcquired(slot_no)
-            debug!("LocalTxMonitor: MsgAcquire");
-            // Return current slot (0 if unknown — will be updated when blocks arrive)
+            let tip_slot = {
+                let handler = query_handler.read().await;
+                handler.state().tip.point.slot().map(|s| s.0).unwrap_or(0)
+            };
+            debug!(tip_slot, "LocalTxMonitor: MsgAcquire");
             let mut buf = Vec::new();
             let mut enc = minicbor::Encoder::new(&mut buf);
             enc.array(2)
                 .map_err(|e| N2CServerError::Protocol(e.to_string()))?;
             enc.u32(1)
                 .map_err(|e| N2CServerError::Protocol(e.to_string()))?; // MsgAcquired
-            enc.u64(0)
-                .map_err(|e| N2CServerError::Protocol(e.to_string()))?; // slot_no placeholder
+            enc.u64(tip_slot)
+                .map_err(|e| N2CServerError::Protocol(e.to_string()))?;
             Ok(Some(Segment {
                 transmission_time: 0,
                 protocol_id: MINI_PROTOCOL_TX_MONITOR,
@@ -1804,9 +1810,10 @@ mod tests {
         assert!(result.is_none());
     }
 
-    #[test]
-    fn test_handle_tx_monitor_acquire() {
+    #[tokio::test]
+    async fn test_handle_tx_monitor_acquire() {
         let mempool = Arc::new(Mempool::new(torsten_mempool::MempoolConfig::default()));
+        let handler = Arc::new(RwLock::new(QueryHandler::new()));
 
         // MsgAcquire: [0]
         let mut payload = Vec::new();
@@ -1814,7 +1821,9 @@ mod tests {
         enc.array(1).unwrap();
         enc.u32(0).unwrap();
 
-        let result = handle_tx_monitor(&payload, &mempool).unwrap();
+        let result = handle_tx_monitor(&payload, &mempool, &handler)
+            .await
+            .unwrap();
         assert!(result.is_some());
 
         let segment = result.unwrap();
@@ -1828,9 +1837,10 @@ mod tests {
         let _slot = decoder.u64().unwrap();
     }
 
-    #[test]
-    fn test_handle_tx_monitor_has_tx() {
+    #[tokio::test]
+    async fn test_handle_tx_monitor_has_tx() {
         let mempool = Arc::new(Mempool::new(torsten_mempool::MempoolConfig::default()));
+        let handler = Arc::new(RwLock::new(QueryHandler::new()));
         let tx_hash = Hash32::from_bytes([0xAA; 32]);
         let tx = torsten_primitives::transaction::Transaction::empty_with_hash(tx_hash);
         mempool.add_tx(tx_hash, tx, 100).unwrap();
@@ -1842,7 +1852,9 @@ mod tests {
         enc.u32(4).unwrap();
         enc.bytes(tx_hash.as_bytes()).unwrap();
 
-        let result = handle_tx_monitor(&payload, &mempool).unwrap();
+        let result = handle_tx_monitor(&payload, &mempool, &handler)
+            .await
+            .unwrap();
         assert!(result.is_some());
 
         let segment = result.unwrap();
@@ -1852,9 +1864,10 @@ mod tests {
         assert!(decoder.bool().unwrap()); // tx exists
     }
 
-    #[test]
-    fn test_handle_tx_monitor_has_tx_missing() {
+    #[tokio::test]
+    async fn test_handle_tx_monitor_has_tx_missing() {
         let mempool = Arc::new(Mempool::new(torsten_mempool::MempoolConfig::default()));
+        let handler = Arc::new(RwLock::new(QueryHandler::new()));
 
         // MsgHasTx for non-existent tx
         let tx_hash = Hash32::from_bytes([0xBB; 32]);
@@ -1864,7 +1877,9 @@ mod tests {
         enc.u32(4).unwrap();
         enc.bytes(tx_hash.as_bytes()).unwrap();
 
-        let result = handle_tx_monitor(&payload, &mempool).unwrap();
+        let result = handle_tx_monitor(&payload, &mempool, &handler)
+            .await
+            .unwrap();
         assert!(result.is_some());
 
         let segment = result.unwrap();
@@ -1874,9 +1889,10 @@ mod tests {
         assert!(!decoder.bool().unwrap()); // tx does not exist
     }
 
-    #[test]
-    fn test_handle_tx_monitor_get_sizes() {
+    #[tokio::test]
+    async fn test_handle_tx_monitor_get_sizes() {
         let mempool = Arc::new(Mempool::new(torsten_mempool::MempoolConfig::default()));
+        let handler = Arc::new(RwLock::new(QueryHandler::new()));
         let tx_hash = Hash32::from_bytes([0xAA; 32]);
         let tx = torsten_primitives::transaction::Transaction::empty_with_hash(tx_hash);
         mempool.add_tx(tx_hash, tx, 500).unwrap();
@@ -1887,7 +1903,9 @@ mod tests {
         enc.array(1).unwrap();
         enc.u32(8).unwrap();
 
-        let result = handle_tx_monitor(&payload, &mempool).unwrap();
+        let result = handle_tx_monitor(&payload, &mempool, &handler)
+            .await
+            .unwrap();
         assert!(result.is_some());
 
         let segment = result.unwrap();
@@ -1903,9 +1921,10 @@ mod tests {
         assert_eq!(num_txs, 1);
     }
 
-    #[test]
-    fn test_handle_tx_monitor_next_tx() {
+    #[tokio::test]
+    async fn test_handle_tx_monitor_next_tx() {
         let mempool = Arc::new(Mempool::new(torsten_mempool::MempoolConfig::default()));
+        let handler = Arc::new(RwLock::new(QueryHandler::new()));
 
         // MsgNextTx: [6]
         let mut payload = Vec::new();
@@ -1913,7 +1932,9 @@ mod tests {
         enc.array(1).unwrap();
         enc.u32(6).unwrap();
 
-        let result = handle_tx_monitor(&payload, &mempool).unwrap();
+        let result = handle_tx_monitor(&payload, &mempool, &handler)
+            .await
+            .unwrap();
         assert!(result.is_some());
 
         let segment = result.unwrap();
@@ -1923,9 +1944,10 @@ mod tests {
         assert!(decoder.null().is_ok()); // no tx available
     }
 
-    #[test]
-    fn test_handle_tx_monitor_done() {
+    #[tokio::test]
+    async fn test_handle_tx_monitor_done() {
         let mempool = Arc::new(Mempool::new(torsten_mempool::MempoolConfig::default()));
+        let handler = Arc::new(RwLock::new(QueryHandler::new()));
 
         // MsgDone: [3]
         let mut payload = Vec::new();
@@ -1933,7 +1955,9 @@ mod tests {
         enc.array(1).unwrap();
         enc.u32(3).unwrap();
 
-        let result = handle_tx_monitor(&payload, &mempool).unwrap();
+        let result = handle_tx_monitor(&payload, &mempool, &handler)
+            .await
+            .unwrap();
         assert!(result.is_none());
     }
 
