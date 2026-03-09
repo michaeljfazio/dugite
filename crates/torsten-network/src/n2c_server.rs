@@ -1309,13 +1309,16 @@ fn encode_query_result(result: &QueryResult) -> Vec<u8> {
             encode_protocol_params_cbor(&mut enc, pp);
         }
         QueryResult::StakeDistribution(pools) => {
+            // Wire format: Map<pool_hash(28), IndividualPoolStake>
+            // IndividualPoolStake: array(2) [tag(30)[num,den], vrf_hash(32)]
             enc.map(pools.len() as u64).ok();
             for pool in pools {
                 enc.bytes(&pool.pool_id).ok();
-                enc.array(3).ok();
-                enc.u64(pool.stake).ok();
-                enc.u64(pool.pledge).ok();
-                enc.u64(pool.cost).ok();
+                enc.array(2).ok();
+                // Stake fraction as tagged rational
+                let total = pool.total_active_stake.max(1); // avoid div by zero
+                encode_tagged_rational(&mut enc, pool.stake, total);
+                enc.bytes(&pool.vrf_keyhash).ok();
             }
         }
         QueryResult::GovState(gov) => {
@@ -1345,41 +1348,98 @@ fn encode_query_result(result: &QueryResult) -> Vec<u8> {
             }
         }
         QueryResult::DRepState(dreps) => {
-            enc.array(dreps.len() as u64).ok();
+            // Wire format: Map<Credential, DRepState>
+            //   Credential: [0|1, hash(28)]
+            //   DRepState: array(4) [expiry, maybe_anchor, deposit, tag(258)[delegators]]
+            enc.map(dreps.len() as u64).ok();
             for drep in dreps {
-                enc.map(5).ok();
-                enc.str("credential").ok();
+                // Key: Credential
+                enc.array(2).ok();
+                enc.u8(drep.credential_type).ok();
                 enc.bytes(&drep.credential_hash).ok();
-                enc.str("deposit").ok();
-                enc.u64(drep.deposit).ok();
-                enc.str("anchor_url").ok();
-                if let Some(url) = &drep.anchor_url {
+                // Value: DRepState array(4)
+                enc.array(4).ok();
+                // [0] drepExpiry (EpochNo)
+                enc.u64(drep.expiry_epoch).ok();
+                // [1] drepAnchor (StrictMaybe Anchor)
+                if let (Some(url), Some(hash)) = (&drep.anchor_url, &drep.anchor_hash) {
+                    enc.array(1).ok(); // SJust
+                    enc.array(2).ok(); // Anchor
                     enc.str(url).ok();
+                    enc.bytes(hash).ok();
                 } else {
-                    enc.null().ok();
+                    enc.array(0).ok(); // SNothing
                 }
-                enc.str("registered_epoch").ok();
-                enc.u64(drep.registered_epoch).ok();
-                enc.str("active_until_epoch").ok();
-                enc.u64(drep.active_until_epoch).ok();
+                // [2] drepDeposit (Coin)
+                enc.u64(drep.deposit).ok();
+                // [3] drepDelegs: tag(258) Set of Credential
+                enc.tag(minicbor::data::Tag::new(258)).ok();
+                enc.array(drep.delegator_hashes.len() as u64).ok();
+                for dh in &drep.delegator_hashes {
+                    enc.array(2).ok();
+                    enc.u8(0).ok(); // KeyHashObj
+                    enc.bytes(dh).ok();
+                }
             }
         }
         QueryResult::CommitteeState(committee) => {
-            enc.map(2).ok();
-            enc.str("members").ok();
-            enc.array(committee.members.len() as u64).ok();
+            // Wire format: array(3) [map_members, maybe_threshold, epoch]
+            enc.array(3).ok();
+            // [0] Map<ColdCredential, CommitteeMemberState>
+            enc.map(committee.members.len() as u64).ok();
             for member in &committee.members {
-                enc.map(2).ok();
-                enc.str("cold").ok();
+                // Key: Credential [type, hash(28)]
+                enc.array(2).ok();
+                enc.u8(member.cold_credential_type).ok();
                 enc.bytes(&member.cold_credential).ok();
-                enc.str("hot").ok();
-                enc.bytes(&member.hot_credential).ok();
+                // Value: CommitteeMemberState array(4)
+                enc.array(4).ok();
+                // [0] HotCredAuthStatus (Sum type)
+                match member.hot_status {
+                    0 => {
+                        // MemberAuthorized: [0, credential]
+                        enc.array(2).ok();
+                        enc.u32(0).ok();
+                        if let Some(hot) = &member.hot_credential {
+                            enc.array(2).ok();
+                            enc.u8(0).ok(); // KeyHashObj
+                            enc.bytes(hot).ok();
+                        }
+                    }
+                    1 => {
+                        // MemberNotAuthorized: [1]
+                        enc.array(1).ok();
+                        enc.u32(1).ok();
+                    }
+                    _ => {
+                        // MemberResigned: [2, maybe_anchor]
+                        enc.array(2).ok();
+                        enc.u32(2).ok();
+                        enc.array(0).ok(); // SNothing anchor
+                    }
+                }
+                // [1] MemberStatus enum (0=Active, 1=Expired, 2=Unrecognized)
+                enc.u8(member.member_status).ok();
+                // [2] Maybe EpochNo (expiration)
+                if let Some(exp) = member.expiry_epoch {
+                    enc.array(1).ok();
+                    enc.u64(exp).ok();
+                } else {
+                    enc.array(0).ok();
+                }
+                // [3] NextEpochChange: NoChangeExpected [2]
+                enc.array(1).ok();
+                enc.u32(2).ok();
             }
-            enc.str("resigned").ok();
-            enc.array(committee.resigned.len() as u64).ok();
-            for cred in &committee.resigned {
-                enc.bytes(cred).ok();
+            // [1] Maybe UnitInterval (threshold)
+            if let Some((num, den)) = committee.threshold {
+                enc.array(1).ok();
+                encode_tagged_rational(&mut enc, num, den);
+            } else {
+                enc.array(0).ok();
             }
+            // [2] Current epoch
+            enc.u64(committee.current_epoch).ok();
         }
         QueryResult::UtxoByAddress(utxos) => {
             // Cardano wire format: Map<[tx_hash, index], TransactionOutput>
@@ -1820,11 +1880,13 @@ mod tests {
         use crate::query_handler::DRepSnapshot;
 
         let result = QueryResult::DRepState(vec![DRepSnapshot {
-            credential_hash: vec![0xdd; 32],
+            credential_hash: vec![0xdd; 28],
+            credential_type: 0,
             deposit: 500_000_000,
             anchor_url: Some("https://example.com".to_string()),
-            registered_epoch: 42,
-            active_until_epoch: 62,
+            anchor_hash: Some(vec![0xee; 32]),
+            expiry_epoch: 62,
+            delegator_hashes: Vec::new(),
         }]);
         let cbor = encode_query_result(&result);
         assert!(!cbor.is_empty());
@@ -1836,10 +1898,15 @@ mod tests {
 
         let result = QueryResult::CommitteeState(CommitteeSnapshot {
             members: vec![CommitteeMemberSnapshot {
-                cold_credential: vec![0x01; 32],
-                hot_credential: vec![0x02; 32],
+                cold_credential: vec![0x01; 28],
+                cold_credential_type: 0,
+                hot_status: 0,
+                hot_credential: Some(vec![0x02; 28]),
+                member_status: 0,
+                expiry_epoch: Some(200),
             }],
-            resigned: vec![vec![0x03; 32]],
+            threshold: Some((2, 3)),
+            current_epoch: 100,
         });
         let cbor = encode_query_result(&result);
         assert!(!cbor.is_empty());
@@ -1852,14 +1919,12 @@ mod tests {
         let result = QueryResult::StakeDistribution(vec![StakePoolSnapshot {
             pool_id: vec![0xaa; 28],
             stake: 1_000_000_000,
-            pledge: 500_000_000,
-            cost: 340_000_000,
-            margin_num: 1,
-            margin_den: 100,
+            vrf_keyhash: vec![0x11; 32],
+            total_active_stake: 3_000_000_000,
         }]);
         let cbor = encode_query_result(&result);
 
-        // Verify encoding: [4, [map{pool_id => [stake, pledge, cost]}]]
+        // Verify encoding: [4, [map{pool_id => [tag(30)[num,den], vrf_hash]}]]
         let mut decoder = minicbor::Decoder::new(&cbor);
         let _ = decoder.array();
         assert_eq!(decoder.u32().unwrap(), 4);
@@ -1870,10 +1935,17 @@ mod tests {
         assert_eq!(map_len, 1);
         let pool_id = decoder.bytes().unwrap();
         assert_eq!(pool_id, vec![0xaa; 28]);
-        let _ = decoder.array();
-        assert_eq!(decoder.u64().unwrap(), 1_000_000_000); // stake
-        assert_eq!(decoder.u64().unwrap(), 500_000_000); // pledge
-        assert_eq!(decoder.u64().unwrap(), 340_000_000); // cost
+        let _ = decoder.array(); // array(2) for IndividualPoolStake
+                                 // tag(30) rational fraction
+        let tag = decoder.tag().unwrap();
+        assert_eq!(tag.as_u64(), 30);
+        let _ = decoder.array(); // [num, den]
+        let num = decoder.u64().unwrap();
+        let den = decoder.u64().unwrap();
+        assert_eq!(num, 1_000_000_000);
+        assert_eq!(den, 3_000_000_000);
+        let vrf = decoder.bytes().unwrap();
+        assert_eq!(vrf, vec![0x11; 32]);
     }
 
     #[test]

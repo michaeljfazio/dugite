@@ -225,26 +225,35 @@ pub struct NonMyopicRewardEntry {
     pub pool_rewards: Vec<(Vec<u8>, u64)>,
 }
 
-/// Snapshot of a stake pool for query results
+/// Snapshot of a stake pool for query results (GetStakeDistribution).
+///
+/// Wire format: Map<pool_hash(28), [tag(30)[num,den], vrf_hash(32)]>
 #[derive(Debug, Clone)]
 pub struct StakePoolSnapshot {
     pub pool_id: Vec<u8>,
     pub stake: u64,
-    pub pledge: u64,
-    pub cost: u64,
-    pub margin_num: u64,
-    pub margin_den: u64,
+    pub vrf_keyhash: Vec<u8>,
+    /// Total active stake across all pools (for computing stake fraction)
+    pub total_active_stake: u64,
 }
 
-/// Snapshot of a DRep for query results
+/// Snapshot of a DRep for query results.
+///
+/// Wire format: Map<Credential, DRepState>
+///   Credential: [0=KeyHash|1=ScriptHash, hash(28)]
+///   DRepState: array(4) [expiry, maybe_anchor, deposit, set_delegators]
 #[derive(Debug, Clone)]
 pub struct DRepSnapshot {
     pub credential_hash: Vec<u8>,
+    /// 0 = KeyHashObj, 1 = ScriptHashObj
+    pub credential_type: u8,
     pub deposit: u64,
     pub anchor_url: Option<String>,
-    pub registered_epoch: u64,
-    /// Epoch until which this DRep is active (registered_epoch + drep_activity)
-    pub active_until_epoch: u64,
+    pub anchor_hash: Option<Vec<u8>>,
+    /// Epoch when this DRep expires (drepExpiry)
+    pub expiry_epoch: u64,
+    /// Delegator credential hashes
+    pub delegator_hashes: Vec<Vec<u8>>,
 }
 
 /// Snapshot of governance state
@@ -277,18 +286,33 @@ pub struct StakeAddressSnapshot {
     pub reward_balance: u64,
 }
 
-/// Snapshot of the constitutional committee
+/// Snapshot of the constitutional committee.
+///
+/// Wire format: array(3)
+///   [0] Map<ColdCredential, CommitteeMemberState>
+///   [1] Maybe(UnitInterval) — quorum threshold
+///   [2] EpochNo — current epoch
 #[derive(Debug, Clone, Default)]
 pub struct CommitteeSnapshot {
     pub members: Vec<CommitteeMemberSnapshot>,
-    pub resigned: Vec<Vec<u8>>,
+    /// Quorum threshold (numerator, denominator)
+    pub threshold: Option<(u64, u64)>,
+    /// Current epoch
+    pub current_epoch: u64,
 }
 
 /// Snapshot of a committee member
 #[derive(Debug, Clone)]
 pub struct CommitteeMemberSnapshot {
     pub cold_credential: Vec<u8>,
-    pub hot_credential: Vec<u8>,
+    pub cold_credential_type: u8,
+    /// Hot credential authorization status: 0=Authorized(cred), 1=NotAuthorized, 2=Resigned
+    pub hot_status: u8,
+    pub hot_credential: Option<Vec<u8>>,
+    /// 0=Active, 1=Expired, 2=Unrecognized
+    pub member_status: u8,
+    /// Term expiration epoch
+    pub expiry_epoch: Option<u64>,
 }
 
 /// Snapshot of the node state used for answering queries.
@@ -620,6 +644,13 @@ impl QueryHandler {
                 };
                 let total_stake: u64 = self.state.stake_pools.iter().map(|p| p.stake).sum();
                 let rewards_pot = self.state.reserves / 200;
+                // Build a cost/margin lookup from pool params
+                let pool_params_map: std::collections::HashMap<&[u8], &PoolParamsSnapshot> = self
+                    .state
+                    .pool_params_entries
+                    .iter()
+                    .map(|pp| (pp.pool_id.as_slice(), pp))
+                    .collect();
                 let mut result = Vec::new();
                 for amount in &stake_amounts {
                     let mut pool_rewards = Vec::new();
@@ -629,8 +660,15 @@ impl QueryHandler {
                         }
                         let pool_reward =
                             (pool.stake as u128 * rewards_pot as u128 / total_stake as u128) as u64;
-                        let after_cost = pool_reward.saturating_sub(pool.cost);
-                        let margin = pool.margin_num as f64 / pool.margin_den.max(1) as f64;
+                        // Look up cost/margin from pool params
+                        let (cost, margin) =
+                            if let Some(pp) = pool_params_map.get(pool.pool_id.as_slice()) {
+                                let m = pp.margin_num as f64 / pp.margin_den.max(1) as f64;
+                                (pp.cost, m)
+                            } else {
+                                (340_000_000, 0.0) // defaults
+                            };
+                        let after_cost = pool_reward.saturating_sub(cost);
                         let delegator_share = (after_cost as f64 * (1.0 - margin)) as u64;
                         let delegator_reward = (*amount as u128 * delegator_share as u128
                             / pool.stake.max(1) as u128)
@@ -969,18 +1007,14 @@ mod tests {
                 StakePoolSnapshot {
                     pool_id: vec![0xaa; 28],
                     stake: 1_000_000_000,
-                    pledge: 500_000_000,
-                    cost: 340_000_000,
-                    margin_num: 1,
-                    margin_den: 100,
+                    vrf_keyhash: vec![0x11; 32],
+                    total_active_stake: 3_000_000_000,
                 },
                 StakePoolSnapshot {
                     pool_id: vec![0xbb; 28],
                     stake: 2_000_000_000,
-                    pledge: 1_000_000_000,
-                    cost: 340_000_000,
-                    margin_num: 5,
-                    margin_den: 100,
+                    vrf_keyhash: vec![0x22; 32],
+                    total_active_stake: 3_000_000_000,
                 },
             ],
             ..Default::default()
@@ -1026,10 +1060,14 @@ mod tests {
             treasury: 1_000_000_000_000,
             committee: CommitteeSnapshot {
                 members: vec![CommitteeMemberSnapshot {
-                    cold_credential: vec![0x01; 32],
-                    hot_credential: vec![0x02; 32],
+                    cold_credential: vec![0x01; 28],
+                    cold_credential_type: 0,
+                    hot_status: 0,
+                    hot_credential: Some(vec![0x02; 28]),
+                    member_status: 0,
+                    expiry_epoch: Some(200),
                 }],
-                resigned: vec![],
+                ..Default::default()
             },
             governance_proposals: vec![ProposalSnapshot {
                 tx_id: vec![0xcc; 32],
@@ -1062,11 +1100,13 @@ mod tests {
         let mut handler = QueryHandler::new();
         handler.update_state(NodeStateSnapshot {
             drep_entries: vec![DRepSnapshot {
-                credential_hash: vec![0xdd; 32],
+                credential_hash: vec![0xdd; 28],
+                credential_type: 0,
                 deposit: 500_000_000,
                 anchor_url: Some("https://example.com/drep".to_string()),
-                registered_epoch: 42,
-                active_until_epoch: 62,
+                anchor_hash: Some(vec![0xee; 32]),
+                expiry_epoch: 62,
+                delegator_hashes: Vec::new(),
             }],
             ..Default::default()
         });
@@ -1074,13 +1114,13 @@ mod tests {
         match query(&handler, 25) {
             QueryResult::DRepState(dreps) => {
                 assert_eq!(dreps.len(), 1);
-                assert_eq!(dreps[0].credential_hash, vec![0xdd; 32]);
+                assert_eq!(dreps[0].credential_hash, vec![0xdd; 28]);
                 assert_eq!(dreps[0].deposit, 500_000_000);
                 assert_eq!(
                     dreps[0].anchor_url,
                     Some("https://example.com/drep".to_string())
                 );
-                assert_eq!(dreps[0].registered_epoch, 42);
+                assert_eq!(dreps[0].expiry_epoch, 62);
             }
             other => panic!("Expected DRepState, got {other:?}"),
         }
@@ -1093,15 +1133,24 @@ mod tests {
             committee: CommitteeSnapshot {
                 members: vec![
                     CommitteeMemberSnapshot {
-                        cold_credential: vec![0x01; 32],
-                        hot_credential: vec![0x02; 32],
+                        cold_credential: vec![0x01; 28],
+                        cold_credential_type: 0,
+                        hot_status: 0,
+                        hot_credential: Some(vec![0x02; 28]),
+                        member_status: 0,
+                        expiry_epoch: Some(200),
                     },
                     CommitteeMemberSnapshot {
-                        cold_credential: vec![0x03; 32],
-                        hot_credential: vec![0x04; 32],
+                        cold_credential: vec![0x03; 28],
+                        cold_credential_type: 0,
+                        hot_status: 2, // Resigned
+                        hot_credential: None,
+                        member_status: 0,
+                        expiry_epoch: Some(200),
                     },
                 ],
-                resigned: vec![vec![0x05; 32]],
+                threshold: Some((2, 3)),
+                current_epoch: 100,
             },
             ..Default::default()
         });
@@ -1109,10 +1158,9 @@ mod tests {
         match query(&handler, 27) {
             QueryResult::CommitteeState(committee) => {
                 assert_eq!(committee.members.len(), 2);
-                assert_eq!(committee.resigned.len(), 1);
-                assert_eq!(committee.members[0].cold_credential, vec![0x01; 32]);
-                assert_eq!(committee.members[0].hot_credential, vec![0x02; 32]);
-                assert_eq!(committee.resigned[0], vec![0x05; 32]);
+                assert_eq!(committee.members[0].cold_credential, vec![0x01; 28]);
+                assert_eq!(committee.members[0].hot_status, 0); // Authorized
+                assert_eq!(committee.members[1].hot_status, 2); // Resigned
             }
             other => panic!("Expected CommitteeState, got {other:?}"),
         }

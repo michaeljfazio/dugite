@@ -1631,16 +1631,15 @@ impl Node {
         }
 
         // Build stake pool snapshots with actual per-pool stake
+        let total_active_stake: u64 = pool_stake_map.values().sum();
         let stake_pools: Vec<StakePoolSnapshot> = ls
             .pool_params
             .iter()
             .map(|(pool_id, reg)| StakePoolSnapshot {
                 pool_id: pool_id.as_ref().to_vec(),
                 stake: pool_stake_map.get(pool_id).copied().unwrap_or(0),
-                pledge: reg.pledge.0,
-                cost: reg.cost.0,
-                margin_num: reg.margin_numerator,
-                margin_den: reg.margin_denominator,
+                vrf_keyhash: reg.vrf_keyhash.as_ref().to_vec(),
+                total_active_stake,
             })
             .collect();
 
@@ -1649,12 +1648,17 @@ impl Node {
             .governance
             .dreps
             .iter()
-            .map(|(hash, drep)| DRepSnapshot {
-                credential_hash: hash.as_ref().to_vec(),
-                deposit: drep.deposit.0,
-                anchor_url: drep.anchor.as_ref().map(|a| a.url.clone()),
-                registered_epoch: drep.registered_epoch.0,
-                active_until_epoch: drep.registered_epoch.0 + ls.protocol_params.drep_activity,
+            .map(|(hash, drep)| {
+                let expiry = drep.registered_epoch.0 + ls.protocol_params.drep_activity;
+                DRepSnapshot {
+                    credential_hash: hash.as_ref().to_vec(),
+                    credential_type: 0, // KeyHashObj (we don't track script DReps separately yet)
+                    deposit: drep.deposit.0,
+                    anchor_url: drep.anchor.as_ref().map(|a| a.url.clone()),
+                    anchor_hash: drep.anchor.as_ref().map(|a| a.data_hash.as_ref().to_vec()),
+                    expiry_epoch: expiry,
+                    delegator_hashes: Vec::new(), // TODO: populate from delegation index
+                }
             })
             .collect();
 
@@ -1699,22 +1703,31 @@ impl Node {
             .collect();
 
         // Build committee snapshot
+        let resigned_set: std::collections::HashSet<_> =
+            ls.governance.committee_resigned.keys().collect();
         let committee = CommitteeSnapshot {
             members: ls
                 .governance
                 .committee_hot_keys
                 .iter()
-                .map(|(cold, hot)| CommitteeMemberSnapshot {
-                    cold_credential: cold.as_ref().to_vec(),
-                    hot_credential: hot.as_ref().to_vec(),
+                .map(|(cold, hot)| {
+                    let is_resigned = resigned_set.contains(cold);
+                    CommitteeMemberSnapshot {
+                        cold_credential: cold.as_ref().to_vec(),
+                        cold_credential_type: 0, // KeyHashObj
+                        hot_status: if is_resigned { 2 } else { 0 },
+                        hot_credential: if is_resigned {
+                            None
+                        } else {
+                            Some(hot.as_ref().to_vec())
+                        },
+                        member_status: 0, // Active (simplified)
+                        expiry_epoch: None,
+                    }
                 })
                 .collect(),
-            resigned: ls
-                .governance
-                .committee_resigned
-                .keys()
-                .map(|k| k.as_ref().to_vec())
-                .collect(),
+            threshold: Some((2, 3)), // Default quorum 2/3
+            current_epoch: ls.epoch.0,
         };
 
         // Build stake address snapshots (delegations + rewards)
