@@ -240,7 +240,11 @@ impl N2NServer {
     }
 
     /// Start listening for inbound N2N connections.
-    pub async fn listen(&self) -> Result<(), N2NServerError> {
+    /// Accepts connections until the shutdown signal is received.
+    pub async fn listen(
+        &self,
+        mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
+    ) -> Result<(), N2NServerError> {
         let listener = TcpListener::bind(self.listen_addr).await?;
         info!("N2N server listening on {}", self.listen_addr);
 
@@ -262,7 +266,9 @@ impl N2NServer {
         });
 
         loop {
-            match listener.accept().await {
+            tokio::select! {
+            result = listener.accept() => {
+            match result {
                 Ok((stream, peer_addr)) => {
                     // Rate limiting check
                     if !rate_limiter.check_and_record(peer_addr.ip()) {
@@ -325,6 +331,12 @@ impl N2NServer {
                 Err(e) => {
                     error!("Failed to accept N2N connection: {e}");
                 }
+            }
+            }
+            _ = shutdown_rx.changed() => {
+                info!("N2N server shutting down");
+                return Ok(());
+            }
             }
         }
     }

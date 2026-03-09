@@ -522,8 +522,9 @@ impl Node {
         }));
         info!("N2C server: Plutus tx validation and block delivery enabled");
         let n2c_socket_path = self.socket_path.clone();
+        let n2c_shutdown_rx = shutdown_rx.clone();
         tokio::spawn(async move {
-            if let Err(e) = n2c_server.listen(&n2c_socket_path).await {
+            if let Err(e) = n2c_server.listen(&n2c_socket_path, n2c_shutdown_rx).await {
                 error!("N2C server error: {e}");
             }
         });
@@ -634,8 +635,9 @@ impl Node {
             "N2N server: diffusion_mode={:?}, peer_sharing=enabled",
             self.peer_manager.read().await.diffusion_mode()
         );
+        let n2n_shutdown_rx = shutdown_rx.clone();
         tokio::spawn(async move {
-            if let Err(e) = n2n_server.listen().await {
+            if let Err(e) = n2n_server.listen(n2n_shutdown_rx).await {
                 error!("N2N server error: {e}");
             }
         });

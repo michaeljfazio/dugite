@@ -65,8 +65,12 @@ impl N2CServer {
     }
 
     /// Start listening on the given Unix socket path.
-    /// This runs indefinitely, accepting connections and spawning tasks for each.
-    pub async fn listen(&self, socket_path: &Path) -> Result<(), N2CServerError> {
+    /// Accepts connections until the shutdown signal is received.
+    pub async fn listen(
+        &self,
+        socket_path: &Path,
+        mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
+    ) -> Result<(), N2CServerError> {
         // Remove existing socket file if present
         if socket_path.exists() {
             std::fs::remove_file(socket_path)?;
@@ -76,30 +80,40 @@ impl N2CServer {
         info!("N2C server listening on {}", socket_path.display());
 
         loop {
-            match listener.accept().await {
-                Ok((stream, _addr)) => {
-                    info!("N2C client connected");
-                    let handler = self.query_handler.clone();
-                    let mempool = self.mempool.clone();
-                    let validator = self.tx_validator.clone();
-                    let block_provider = self.block_provider.clone();
-                    tokio::spawn(async move {
-                        if let Err(e) = handle_n2c_connection(
-                            stream,
-                            handler,
-                            mempool,
-                            validator,
-                            block_provider,
-                        )
-                        .await
-                        {
-                            warn!("N2C connection error: {e}");
+            tokio::select! {
+                result = listener.accept() => {
+                    match result {
+                        Ok((stream, _addr)) => {
+                            info!("N2C client connected");
+                            let handler = self.query_handler.clone();
+                            let mempool = self.mempool.clone();
+                            let validator = self.tx_validator.clone();
+                            let block_provider = self.block_provider.clone();
+                            tokio::spawn(async move {
+                                if let Err(e) = handle_n2c_connection(
+                                    stream,
+                                    handler,
+                                    mempool,
+                                    validator,
+                                    block_provider,
+                                )
+                                .await
+                                {
+                                    warn!("N2C connection error: {e}");
+                                }
+                                debug!("N2C client disconnected");
+                            });
                         }
-                        debug!("N2C client disconnected");
-                    });
+                        Err(e) => {
+                            error!("Failed to accept N2C connection: {e}");
+                        }
+                    }
                 }
-                Err(e) => {
-                    error!("Failed to accept N2C connection: {e}");
+                _ = shutdown_rx.changed() => {
+                    info!("N2C server shutting down");
+                    // Clean up socket file
+                    let _ = std::fs::remove_file(socket_path);
+                    return Ok(());
                 }
             }
         }
