@@ -237,6 +237,9 @@ pub struct Node {
     /// Broadcast sender for announcing forged blocks to connected peers
     block_announcement_tx:
         Option<tokio::sync::broadcast::Sender<torsten_network::BlockAnnouncement>>,
+    /// Broadcast sender for notifying connected peers of chain rollbacks
+    rollback_announcement_tx:
+        Option<tokio::sync::broadcast::Sender<torsten_network::RollbackAnnouncement>>,
 }
 
 impl Node {
@@ -476,6 +479,7 @@ impl Node {
             metrics: Arc::new(crate::metrics::NodeMetrics::new()),
             block_producer,
             block_announcement_tx: None,
+            rollback_announcement_tx: None,
         })
     }
 
@@ -623,8 +627,9 @@ impl Node {
             torsten_network::n2n_server::PeerSharingMode::PeerSharingEnabled,
         );
         n2n_server.set_mempool(self.mempool.clone());
-        // Get the block announcement sender before spawning the server
+        // Get the broadcast senders before spawning the server
         self.block_announcement_tx = Some(n2n_server.block_announcement_sender());
+        self.rollback_announcement_tx = Some(n2n_server.rollback_announcement_sender());
         info!(
             "N2N server: diffusion_mode={:?}, peer_sharing=enabled",
             self.peer_manager.read().await.diffusion_mode()
@@ -1073,6 +1078,8 @@ impl Node {
                                         if let Err(e) = db.rollback_to_point(&rollback_point) {
                                             error!("Rollback failed: {e}");
                                         }
+                                        drop(db);
+                                        self.notify_rollback(&rollback_point).await;
                                     }
                                     HeaderBatchResult::RollBackward(point, _tip) => {
                                         warn!("Rollback to {point}");
@@ -1080,6 +1087,8 @@ impl Node {
                                         if let Err(e) = db.rollback_to_point(&point) {
                                             error!("Rollback failed: {e}");
                                         }
+                                        drop(db);
+                                        self.notify_rollback(&point).await;
                                     }
                                     HeaderBatchResult::Await => {
                                         info!(blocks_received, "Caught up to chain tip, awaiting new blocks");
@@ -1128,6 +1137,8 @@ impl Node {
                                             warn!("Rollback to {point}, tip: {tip}");
                                             let mut db = self.chain_db.write().await;
                                             if let Err(e) = db.rollback_to_point(&point) { error!("Rollback failed: {e}"); }
+                                            drop(db);
+                                            self.notify_rollback(&point).await;
                                         }
                                         ChainSyncEvent::Await => {
                                             info!(blocks_received, "Caught up to chain tip, awaiting new blocks");
@@ -1633,6 +1644,47 @@ impl Node {
 
         let mut handler = self.query_handler.write().await;
         handler.update_state(snapshot);
+    }
+
+    /// Notify connected N2N peers of a chain rollback by sending MsgRollBackward.
+    async fn notify_rollback(&self, rollback_point: &Point) {
+        if let Some(ref tx) = self.rollback_announcement_tx {
+            let (tip_slot, tip_hash, tip_block_number) = {
+                let db = self.chain_db.read().await;
+                let tip = db.get_tip();
+                let slot = tip.point.slot().map(|s| s.0).unwrap_or(0);
+                let hash = tip
+                    .point
+                    .hash()
+                    .map(|h| {
+                        let bytes: &[u8] = h.as_ref();
+                        let mut arr = [0u8; 32];
+                        arr.copy_from_slice(bytes);
+                        arr
+                    })
+                    .unwrap_or([0u8; 32]);
+                (slot, hash, tip.block_number.0)
+            };
+
+            let rb_slot = rollback_point.slot().map(|s| s.0).unwrap_or(0);
+            let rb_hash = rollback_point
+                .hash()
+                .map(|h| {
+                    let bytes: &[u8] = h.as_ref();
+                    let mut arr = [0u8; 32];
+                    arr.copy_from_slice(bytes);
+                    arr
+                })
+                .unwrap_or([0u8; 32]);
+
+            let _ = tx.send(torsten_network::RollbackAnnouncement {
+                slot: rb_slot,
+                hash: rb_hash,
+                tip_slot,
+                tip_hash,
+                tip_block_number,
+            });
+        }
     }
 
     /// Attempt to forge a block if we are in block producer mode and are the slot leader.

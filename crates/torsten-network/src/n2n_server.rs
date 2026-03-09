@@ -25,6 +25,22 @@ pub struct BlockAnnouncement {
     pub block_number: u64,
 }
 
+/// Notification that the chain has rolled back to a specific point.
+/// Sent via broadcast channel to connected peers so they receive MsgRollBackward.
+#[derive(Debug, Clone)]
+pub struct RollbackAnnouncement {
+    /// Slot to roll back to
+    pub slot: u64,
+    /// Hash of the block at the rollback point
+    pub hash: [u8; 32],
+    /// Current tip slot after rollback
+    pub tip_slot: u64,
+    /// Current tip hash after rollback
+    pub tip_hash: [u8; 32],
+    /// Current tip block number after rollback
+    pub tip_block_number: u64,
+}
+
 /// Callback trait for retrieving block data from storage
 pub trait BlockProvider: Send + Sync + 'static {
     /// Get raw CBOR block bytes by header hash
@@ -133,6 +149,8 @@ pub struct N2NServer {
     mempool: Option<Arc<Mempool>>,
     /// Broadcast channel for block announcements to connected peers
     block_announcement_tx: broadcast::Sender<BlockAnnouncement>,
+    /// Broadcast channel for rollback notifications to connected peers
+    rollback_announcement_tx: broadcast::Sender<RollbackAnnouncement>,
 }
 
 impl N2NServer {
@@ -144,6 +162,7 @@ impl N2NServer {
         max_connections: usize,
     ) -> Self {
         let (block_announcement_tx, _) = broadcast::channel(64);
+        let (rollback_announcement_tx, _) = broadcast::channel(64);
         N2NServer {
             listen_addr,
             network_magic,
@@ -155,6 +174,7 @@ impl N2NServer {
             peer_manager: None,
             mempool: None,
             block_announcement_tx,
+            rollback_announcement_tx,
         }
     }
 
@@ -169,6 +189,7 @@ impl N2NServer {
         peer_sharing: PeerSharingMode,
     ) -> Self {
         let (block_announcement_tx, _) = broadcast::channel(64);
+        let (rollback_announcement_tx, _) = broadcast::channel(64);
         N2NServer {
             listen_addr,
             network_magic,
@@ -180,6 +201,7 @@ impl N2NServer {
             peer_manager: None,
             mempool: None,
             block_announcement_tx,
+            rollback_announcement_tx,
         }
     }
 
@@ -210,6 +232,11 @@ impl N2NServer {
     /// Used by the node to announce blocks without a direct reference to the server.
     pub fn block_announcement_sender(&self) -> broadcast::Sender<BlockAnnouncement> {
         self.block_announcement_tx.clone()
+    }
+
+    /// Get a clone of the rollback announcement sender for notifying peers of chain rollbacks
+    pub fn rollback_announcement_sender(&self) -> broadcast::Sender<RollbackAnnouncement> {
+        self.rollback_announcement_tx.clone()
     }
 
     /// Start listening for inbound N2N connections.
@@ -271,6 +298,7 @@ impl N2NServer {
                     let peer_manager = self.peer_manager.clone();
                     let mempool = self.mempool.clone();
                     let announcement_rx = self.block_announcement_tx.subscribe();
+                    let rollback_rx = self.rollback_announcement_tx.subscribe();
 
                     tokio::spawn(async move {
                         if let Err(e) = handle_n2n_connection(
@@ -284,6 +312,7 @@ impl N2NServer {
                             peer_manager,
                             mempool,
                             announcement_rx,
+                            rollback_rx,
                         )
                         .await
                         {
@@ -339,6 +368,7 @@ async fn handle_n2n_connection(
     peer_manager: Option<Arc<RwLock<PeerManager>>>,
     mempool: Option<Arc<Mempool>>,
     mut announcement_rx: broadcast::Receiver<BlockAnnouncement>,
+    mut rollback_rx: broadcast::Receiver<RollbackAnnouncement>,
 ) -> Result<(), N2NServerError> {
     let mut buf = vec![0u8; 65536];
     let mut partial = Vec::new();
@@ -450,6 +480,51 @@ async fn handle_n2n_connection(
                     }
                     Err(broadcast::error::RecvError::Closed) => {
                         // Sender dropped, server is shutting down
+                        return Ok(());
+                    }
+                }
+            }
+            // Listen for rollback notifications
+            rollback = rollback_rx.recv() => {
+                match rollback {
+                    Ok(rb) => {
+                        // Only send rollback if peer's cursor is beyond the rollback point
+                        if let Some(cursor_slot) = peer_state.chainsync_cursor_slot {
+                            if cursor_slot > rb.slot {
+                                // Update peer cursor to the rollback point
+                                peer_state.chainsync_cursor_slot = Some(rb.slot);
+                                peer_state.chainsync_cursor_hash = Some(rb.hash);
+
+                                // MsgRollBackward: [3, point, tip]
+                                let mut payload = Vec::new();
+                                let mut enc = minicbor::Encoder::new(&mut payload);
+                                enc.array(3)
+                                    .map_err(|e| N2NServerError::Protocol(e.to_string()))?;
+                                enc.u32(3)
+                                    .map_err(|e| N2NServerError::Protocol(e.to_string()))?;
+                                encode_point(&mut enc, rb.slot, &rb.hash)?;
+                                encode_tip(&mut enc, rb.tip_slot, &rb.tip_hash, rb.tip_block_number)?;
+
+                                let segment = Segment {
+                                    transmission_time: 0,
+                                    protocol_id: MINI_PROTOCOL_CHAINSYNC,
+                                    is_responder: true,
+                                    payload,
+                                };
+                                let encoded = segment.encode();
+                                stream.write_all(&encoded).await?;
+                                debug!(
+                                    peer = %peer_addr,
+                                    rollback_slot = rb.slot,
+                                    "Sent MsgRollBackward to peer"
+                                );
+                            }
+                        }
+                    }
+                    Err(broadcast::error::RecvError::Lagged(n)) => {
+                        debug!(peer = %peer_addr, skipped = n, "Rollback announcement receiver lagged");
+                    }
+                    Err(broadcast::error::RecvError::Closed) => {
                         return Ok(());
                     }
                 }
@@ -904,21 +979,27 @@ fn handle_n2n_blockfetch(
             // The block provider currently works by hash, so we serve
             // all blocks we can find. For a single-block request (from == to),
             // we just serve that one block.
-            if from_slot == to_slot {
-                // Single block request
-                if let Some(block_data) = block_provider.get_block(&_from_hash) {
-                    segments.push(make_block_segment(&block_data)?);
-                }
-            } else {
-                // Range request — try to serve known blocks
-                // First the from block, then the to block.
-                // A proper implementation would iterate the chain between these points.
-                if let Some(block_data) = block_provider.get_block(&_from_hash) {
-                    segments.push(make_block_segment(&block_data)?);
-                }
-                if _from_hash != _to_hash {
-                    if let Some(block_data) = block_provider.get_block(&_to_hash) {
-                        segments.push(make_block_segment(&block_data)?);
+            // Serve all blocks in the range [from_slot, to_slot]
+            // Start with the from block, then iterate forward until we reach to_slot
+            if let Some(block_data) = block_provider.get_block(&_from_hash) {
+                segments.push(make_block_segment(&block_data)?);
+            }
+
+            if from_slot < to_slot {
+                let mut current_slot = from_slot;
+                while let Some((next_slot, next_hash, next_cbor)) =
+                    block_provider.get_next_block_after_slot(current_slot)
+                {
+                    if next_slot > to_slot {
+                        break;
+                    }
+                    // Skip the from block (already served above)
+                    if next_hash != _from_hash {
+                        segments.push(make_block_segment(&next_cbor)?);
+                    }
+                    current_slot = next_slot;
+                    if next_slot == to_slot {
+                        break;
                     }
                 }
             }
@@ -1373,7 +1454,11 @@ mod tests {
         }
         fn get_next_block_after_slot(&self, after_slot: u64) -> Option<(u64, [u8; 32], Vec<u8>)> {
             if after_slot < 100 {
-                Some((after_slot + 1, [0xBB; 32], vec![0x82, 0x01, 0x02]))
+                let next_slot = after_slot + 1;
+                let mut hash = [0u8; 32];
+                hash[0] = (next_slot & 0xFF) as u8;
+                hash[1] = ((next_slot >> 8) & 0xFF) as u8;
+                Some((next_slot, hash, vec![0x82, 0x01, 0x02]))
             } else {
                 None
             }
@@ -1399,16 +1484,21 @@ mod tests {
         enc.bytes(&[0xCC; 32]).unwrap();
 
         let segments = handle_n2n_blockfetch(&buf, &provider).unwrap();
-        // Should have: MsgStartBatch + 2 blocks + MsgBatchDone = 4 segments
-        assert_eq!(segments.len(), 4);
+        // Should have: MsgStartBatch + from_block + 10 range blocks (slots 11-20) + MsgBatchDone = 13
+        assert_eq!(segments.len(), 13);
 
         // First segment: MsgStartBatch [2]
         let mut dec = minicbor::Decoder::new(&segments[0].payload);
         dec.array().unwrap();
         assert_eq!(dec.u32().unwrap(), 2);
 
+        // Middle segments are MsgBlock [3, block_bytes]
+        let mut dec = minicbor::Decoder::new(&segments[1].payload);
+        dec.array().unwrap();
+        assert_eq!(dec.u32().unwrap(), 3);
+
         // Last segment: MsgBatchDone [5]
-        let mut dec = minicbor::Decoder::new(&segments[3].payload);
+        let mut dec = minicbor::Decoder::new(&segments[segments.len() - 1].payload);
         dec.array().unwrap();
         assert_eq!(dec.u32().unwrap(), 5);
     }
