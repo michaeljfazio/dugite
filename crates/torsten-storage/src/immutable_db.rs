@@ -29,6 +29,24 @@ pub struct ImmutableDB {
     tip_slot: SlotNo,
 }
 
+/// Build stack-allocated RocksDB key: "hash:" + 32-byte hash
+#[inline]
+fn make_hash_key(hash: &BlockHeaderHash) -> [u8; 37] {
+    let mut key = [0u8; 37];
+    key[..5].copy_from_slice(b"hash:");
+    key[5..].copy_from_slice(hash.as_bytes());
+    key
+}
+
+/// Build stack-allocated RocksDB key: "slot_hash:" + 8-byte slot
+#[inline]
+fn make_slot_hash_key(slot_bytes: &[u8; 8]) -> [u8; 18] {
+    let mut key = [0u8; 18];
+    key[..10].copy_from_slice(b"slot_hash:");
+    key[10..].copy_from_slice(slot_bytes);
+    key
+}
+
 impl ImmutableDB {
     pub fn open(path: &Path) -> Result<Self, ImmutableDBError> {
         info!(path = %path.display(), "Opening ImmutableDB (RocksDB)");
@@ -111,12 +129,8 @@ impl ImmutableDB {
             let slot_key = slot.0.to_be_bytes();
             batch.put(slot_key, cbor);
 
-            let hash_key = [b"hash:", hash.as_bytes().as_slice()].concat();
-            batch.put(&hash_key, slot_key);
-
-            // Reverse index: slot_hash:slot -> hash
-            let slot_hash_key = [b"slot_hash:", &slot_key[..]].concat();
-            batch.put(slot_hash_key, hash.as_bytes());
+            batch.put(make_hash_key(hash), slot_key);
+            batch.put(make_slot_hash_key(&slot_key), hash.as_bytes());
 
             if *slot > max_tip_slot {
                 max_tip_slot = *slot;
@@ -163,13 +177,11 @@ impl ImmutableDB {
             .map_err(|e| ImmutableDBError::RocksDB(e.to_string()))?;
 
         // Secondary index: hash -> slot
-        let hash_key = [b"hash:", hash.as_bytes().as_slice()].concat();
-        db.put(&hash_key, slot_key)
+        db.put(make_hash_key(hash), slot_key)
             .map_err(|e| ImmutableDBError::RocksDB(e.to_string()))?;
 
-        // Reverse index: slot_hash:slot -> hash (for slot→hash lookups)
-        let slot_hash_key = [b"slot_hash:", &slot_key[..]].concat();
-        db.put(slot_hash_key, hash.as_bytes())
+        // Reverse index: slot_hash:slot -> hash
+        db.put(make_slot_hash_key(&slot_key), hash.as_bytes())
             .map_err(|e| ImmutableDBError::RocksDB(e.to_string()))?;
 
         if slot > self.tip_slot {
@@ -203,7 +215,7 @@ impl ImmutableDB {
         let Some(db) = self.db.as_ref() else {
             return false;
         };
-        let hash_key = [b"hash:", hash.as_bytes().as_slice()].concat();
+        let hash_key = make_hash_key(hash);
         db.get(hash_key).ok().flatten().is_some()
     }
 
@@ -216,7 +228,7 @@ impl ImmutableDB {
             .db
             .as_ref()
             .ok_or_else(|| ImmutableDBError::RocksDB("DB not open".into()))?;
-        let hash_key = [b"hash:", hash.as_bytes().as_slice()].concat();
+        let hash_key = make_hash_key(hash);
 
         match db
             .get(hash_key)
@@ -291,7 +303,7 @@ impl ImmutableDB {
             let slot = SlotNo(u64::from_be_bytes(slot_bytes));
 
             // Look up the hash via slot_hash: index
-            let slot_hash_key = [b"slot_hash:", &slot_bytes[..]].concat();
+            let slot_hash_key = make_slot_hash_key(&slot_bytes);
             let hash = if let Some(hash_bytes) = db
                 .get(slot_hash_key)
                 .map_err(|e| ImmutableDBError::RocksDB(e.to_string()))?
