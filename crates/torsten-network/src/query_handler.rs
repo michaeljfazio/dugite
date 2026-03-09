@@ -37,6 +37,8 @@ pub enum QueryResult {
     },
     /// NonMyopicMemberRewards: map from stake_amount → pool rewards
     NonMyopicMemberRewards(Vec<NonMyopicRewardEntry>),
+    /// Empty proposed protocol parameter updates (Conway uses governance proposals)
+    ProposedPParamsUpdates,
     Error(String),
 }
 
@@ -650,9 +652,10 @@ impl QueryHandler {
                 QueryResult::ProtocolParams(Box::new(self.state.protocol_params.clone()))
             }
             8 => {
-                // GetProposedPParamsUpdates — returns empty (no pending updates tracked)
+                // GetProposedPParamsUpdates — no pending updates tracked in Conway era
+                // (governance proposals replace the old update mechanism)
                 debug!("Query: GetProposedPParamsUpdates");
-                QueryResult::StakeDistribution(vec![])
+                QueryResult::ProposedPParamsUpdates
             }
             10 => {
                 // GetChainBlockNo
@@ -699,9 +702,28 @@ impl QueryHandler {
                 })
             }
             21 => {
-                // GetDRepState
+                // GetDRepState — optionally filtered by credential hashes
                 debug!("Query: GetDRepState");
-                QueryResult::DRepState(self.state.drep_entries.clone())
+                let mut filter_hashes: Vec<Vec<u8>> = Vec::new();
+                if let Ok(Some(n)) = decoder.array() {
+                    for _ in 0..n {
+                        if let Ok(bytes) = decoder.bytes() {
+                            filter_hashes.push(bytes.to_vec());
+                        }
+                    }
+                }
+                if filter_hashes.is_empty() {
+                    QueryResult::DRepState(self.state.drep_entries.clone())
+                } else {
+                    let filtered = self
+                        .state
+                        .drep_entries
+                        .iter()
+                        .filter(|d| filter_hashes.iter().any(|h| h == &d.credential_hash))
+                        .cloned()
+                        .collect();
+                    QueryResult::DRepState(filtered)
+                }
             }
             22 => {
                 // GetCommitteeState
@@ -709,14 +731,52 @@ impl QueryHandler {
                 QueryResult::CommitteeState(self.state.committee.clone())
             }
             23 => {
-                // GetStakeAddressInfo
+                // GetStakeAddressInfo — optionally filtered by credential hashes
                 debug!("Query: GetStakeAddressInfo");
-                QueryResult::StakeAddressInfo(self.state.stake_addresses.clone())
+                let mut filter_hashes: Vec<Vec<u8>> = Vec::new();
+                if let Ok(Some(n)) = decoder.array() {
+                    for _ in 0..n {
+                        if let Ok(bytes) = decoder.bytes() {
+                            filter_hashes.push(bytes.to_vec());
+                        }
+                    }
+                }
+                if filter_hashes.is_empty() {
+                    QueryResult::StakeAddressInfo(self.state.stake_addresses.clone())
+                } else {
+                    let filtered = self
+                        .state
+                        .stake_addresses
+                        .iter()
+                        .filter(|s| filter_hashes.iter().any(|h| h == &s.credential_hash))
+                        .cloned()
+                        .collect();
+                    QueryResult::StakeAddressInfo(filtered)
+                }
             }
             12 => {
-                // GetStakePoolParams
+                // GetStakePoolParams — optionally filtered by pool IDs
                 debug!("Query: GetStakePoolParams");
-                QueryResult::PoolParams(self.state.pool_params_entries.clone())
+                let mut filter_pools: Vec<Vec<u8>> = Vec::new();
+                if let Ok(Some(n)) = decoder.array() {
+                    for _ in 0..n {
+                        if let Ok(bytes) = decoder.bytes() {
+                            filter_pools.push(bytes.to_vec());
+                        }
+                    }
+                }
+                if filter_pools.is_empty() {
+                    QueryResult::PoolParams(self.state.pool_params_entries.clone())
+                } else {
+                    let filtered = self
+                        .state
+                        .pool_params_entries
+                        .iter()
+                        .filter(|p| filter_pools.iter().any(|h| h == &p.pool_id))
+                        .cloned()
+                        .collect();
+                    QueryResult::PoolParams(filtered)
+                }
             }
             24 => {
                 // GetStakeSnapshots

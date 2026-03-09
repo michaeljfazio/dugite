@@ -1566,6 +1566,10 @@ fn encode_query_result(result: &QueryResult) -> Vec<u8> {
                 }
             }
         }
+        QueryResult::ProposedPParamsUpdates => {
+            // Empty map — Conway era uses governance proposals instead of PP updates
+            enc.map(0).ok();
+        }
         QueryResult::Error(msg) => {
             enc.str(msg).ok();
         }
