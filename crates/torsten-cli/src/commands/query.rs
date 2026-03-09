@@ -893,34 +893,88 @@ impl QueryCmd {
 
                 release_and_done(&mut client).await;
 
-                // Parse the CBOR response
+                // Parse MsgResult [4, map{"pools": [...], "total_mark_stake": n, ...}]
                 let mut decoder = minicbor::Decoder::new(&result);
-                let _ = decoder.array(); // MsgResult envelope
+                let _ = decoder.array();
                 let tag = decoder.u32().unwrap_or(999);
                 if tag != 4 {
                     anyhow::bail!("Unexpected response tag: {tag}");
                 }
 
-                // The result is JSON-like CBOR with pool data
-                // For now, parse pools from the raw CBOR
-                let snap_data = decoder.bytes().unwrap_or(&[]);
-                let mut snap_decoder = minicbor::Decoder::new(snap_data);
+                let map_len = decoder.map().unwrap_or(Some(0)).unwrap_or(0);
+                let mut total_mark = 0u64;
+                let mut total_set = 0u64;
+                let mut total_go = 0u64;
+                let mut pools: Vec<(String, u64, u64, u64)> = Vec::new();
 
-                let num_pools = match snap_decoder.array() {
-                    Ok(Some(n)) => n as usize,
-                    _ => 0,
+                for _ in 0..map_len {
+                    let key = decoder.str().unwrap_or("");
+                    match key {
+                        "pools" => {
+                            let arr_len = decoder.array().unwrap_or(Some(0)).unwrap_or(0);
+                            for _ in 0..arr_len {
+                                let pmap_len = decoder.map().unwrap_or(Some(0)).unwrap_or(0);
+                                let mut pool_id = String::new();
+                                let mut mark = 0u64;
+                                let mut set = 0u64;
+                                let mut go = 0u64;
+                                for _ in 0..pmap_len {
+                                    let pkey = decoder.str().unwrap_or("");
+                                    match pkey {
+                                        "pool_id" => {
+                                            pool_id = hex::encode(decoder.bytes().unwrap_or(&[]))
+                                        }
+                                        "mark_stake" => mark = decoder.u64().unwrap_or(0),
+                                        "set_stake" => set = decoder.u64().unwrap_or(0),
+                                        "go_stake" => go = decoder.u64().unwrap_or(0),
+                                        _ => {
+                                            decoder.skip().ok();
+                                        }
+                                    }
+                                }
+                                pools.push((pool_id, mark, set, go));
+                            }
+                        }
+                        "total_mark_stake" => total_mark = decoder.u64().unwrap_or(0),
+                        "total_set_stake" => total_set = decoder.u64().unwrap_or(0),
+                        "total_go_stake" => total_go = decoder.u64().unwrap_or(0),
+                        _ => {
+                            decoder.skip().ok();
+                        }
+                    }
+                }
+
+                println!("Stake Snapshot");
+                println!("==============");
+                println!("Total Mark Stake: {} ADA", total_mark / 1_000_000);
+                println!("Total Set Stake:  {} ADA", total_set / 1_000_000);
+                println!("Total Go Stake:   {} ADA", total_go / 1_000_000);
+                println!("Pools: {}", pools.len());
+
+                // Filter by pool ID if provided
+                let filtered: Vec<_> = if let Some(ref pool_id) = stake_pool_id {
+                    pools
+                        .iter()
+                        .filter(|(id, _, _, _)| id.contains(pool_id))
+                        .collect()
+                } else {
+                    pools.iter().collect()
                 };
 
-                println!(
-                    "{}",
-                    serde_json::json!({
-                        "pools": num_pools,
-                        "note": "Stake snapshot query returned raw data. Use --stake-pool-id to filter."
-                    })
-                );
-
-                if let Some(ref _pool_id) = stake_pool_id {
-                    println!("Pool filtering will be applied when connected to a running node.");
+                if !filtered.is_empty() {
+                    println!(
+                        "\n{:<58} {:>16} {:>16} {:>16}",
+                        "Pool ID", "Mark (ADA)", "Set (ADA)", "Go (ADA)"
+                    );
+                    println!("{}", "-".repeat(108));
+                    for (id, mark, set, go) in &filtered {
+                        println!(
+                            "{id:<58} {:>16} {:>16} {:>16}",
+                            mark / 1_000_000,
+                            set / 1_000_000,
+                            go / 1_000_000
+                        );
+                    }
                 }
                 Ok(())
             }
@@ -938,7 +992,7 @@ impl QueryCmd {
 
                 release_and_done(&mut client).await;
 
-                // Parse MsgResult envelope
+                // Parse MsgResult [4, array[map{...}]]
                 let mut decoder = minicbor::Decoder::new(&result);
                 let _ = decoder.array();
                 let tag = decoder.u32().unwrap_or(999);
@@ -946,25 +1000,79 @@ impl QueryCmd {
                     anyhow::bail!("Unexpected response tag: {tag}");
                 }
 
-                // Parse pool params from raw CBOR
-                let params_data = decoder.bytes().unwrap_or(&[]);
-                let mut params_decoder = minicbor::Decoder::new(params_data);
+                let arr_len = decoder.array().unwrap_or(Some(0)).unwrap_or(0);
 
-                let num_pools = match params_decoder.array() {
-                    Ok(Some(n)) => n as usize,
-                    _ => 0,
+                struct PoolInfo {
+                    pool_id: String,
+                    vrf_keyhash: String,
+                    pledge: u64,
+                    cost: u64,
+                    margin_num: u64,
+                    margin_den: u64,
+                    relays: Vec<String>,
+                }
+
+                let mut pools: Vec<PoolInfo> = Vec::new();
+
+                for _ in 0..arr_len {
+                    let map_len = decoder.map().unwrap_or(Some(0)).unwrap_or(0);
+                    let mut info = PoolInfo {
+                        pool_id: String::new(),
+                        vrf_keyhash: String::new(),
+                        pledge: 0,
+                        cost: 0,
+                        margin_num: 0,
+                        margin_den: 1,
+                        relays: Vec::new(),
+                    };
+                    for _ in 0..map_len {
+                        let key = decoder.str().unwrap_or("");
+                        match key {
+                            "pool_id" => info.pool_id = hex::encode(decoder.bytes().unwrap_or(&[])),
+                            "vrf_keyhash" => {
+                                info.vrf_keyhash = hex::encode(decoder.bytes().unwrap_or(&[]))
+                            }
+                            "pledge" => info.pledge = decoder.u64().unwrap_or(0),
+                            "cost" => info.cost = decoder.u64().unwrap_or(0),
+                            "margin_num" => info.margin_num = decoder.u64().unwrap_or(0),
+                            "margin_den" => info.margin_den = decoder.u64().unwrap_or(1),
+                            "relays" => {
+                                let relay_len = decoder.array().unwrap_or(Some(0)).unwrap_or(0);
+                                for _ in 0..relay_len {
+                                    info.relays.push(decoder.str().unwrap_or("").to_string());
+                                }
+                            }
+                            _ => {
+                                decoder.skip().ok();
+                            }
+                        }
+                    }
+                    pools.push(info);
+                }
+
+                // Filter by pool ID if provided
+                let filtered: Vec<_> = if let Some(ref pid) = stake_pool_id {
+                    pools.iter().filter(|p| p.pool_id.contains(pid)).collect()
+                } else {
+                    pools.iter().collect()
                 };
 
-                println!(
-                    "{}",
-                    serde_json::json!({
-                        "pools": num_pools,
-                        "note": "Pool params query returned raw data."
-                    })
-                );
+                println!("Pool Parameters");
+                println!("===============");
+                println!("Total Pools: {}", pools.len());
 
-                if let Some(ref _pool_id) = stake_pool_id {
-                    println!("Pool filtering will be applied when connected to a running node.");
+                for pool in &filtered {
+                    println!("\nPool ID:     {}", pool.pool_id);
+                    println!("VRF Key:     {}", pool.vrf_keyhash);
+                    println!("Pledge:      {} ADA", pool.pledge / 1_000_000);
+                    println!("Cost:        {} ADA", pool.cost / 1_000_000);
+                    if pool.margin_den > 0 {
+                        let margin_pct = (pool.margin_num as f64 / pool.margin_den as f64) * 100.0;
+                        println!("Margin:      {margin_pct:.2}%");
+                    }
+                    if !pool.relays.is_empty() {
+                        println!("Relays:      {}", pool.relays.join(", "));
+                    }
                 }
                 Ok(())
             }
