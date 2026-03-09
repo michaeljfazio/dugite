@@ -315,15 +315,25 @@ impl Default for NodeStateSnapshot {
     }
 }
 
-/// Snapshot of a UTxO entry for query results
+/// Multi-asset snapshot: Vec<(policy_id_bytes, Vec<(asset_name_bytes, quantity)>)>
+pub type MultiAssetSnapshot = Vec<(Vec<u8>, Vec<(Vec<u8>, u64)>)>;
+
+/// Snapshot of a UTxO entry for query results.
+///
+/// Encodes as Cardano wire format: Map<[tx_hash, index], output>
+/// where output = {0: address_bytes, 1: value, 2: datum_option, 3: script_ref}
 #[derive(Debug, Clone)]
 pub struct UtxoSnapshot {
     pub tx_hash: Vec<u8>,
     pub output_index: u32,
-    pub address: String,
+    /// Raw address bytes for CBOR encoding
+    pub address_bytes: Vec<u8>,
     pub lovelace: u64,
-    pub has_datum: bool,
-    pub has_script_ref: bool,
+    pub multi_asset: MultiAssetSnapshot,
+    /// Datum hash (32 bytes) if present
+    pub datum_hash: Option<Vec<u8>>,
+    /// Raw CBOR of the transaction output (for pass-through if available)
+    pub raw_cbor: Option<Vec<u8>>,
 }
 
 /// Trait for providing UTxO query access to the query handler.
@@ -928,10 +938,11 @@ mod tests {
                 vec![UtxoSnapshot {
                     tx_hash: vec![0xaa; 32],
                     output_index: 0,
-                    address: "addr_test1qz...".to_string(),
+                    address_bytes: vec![0x01; 57],
                     lovelace: 5_000_000,
-                    has_datum: false,
-                    has_script_ref: false,
+                    multi_asset: vec![],
+                    datum_hash: None,
+                    raw_cbor: None,
                 }]
             }
         }

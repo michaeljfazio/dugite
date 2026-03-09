@@ -843,6 +843,52 @@ async fn handle_state_query(
 }
 
 /// Encode a QueryResult into a MsgResult CBOR response
+/// Encode a UTxO output in PostAlonzo format (CBOR map with integer keys).
+///
+/// Format: {0: address_bytes, 1: value, 2?: datum_option, 3?: script_ref}
+/// Value: coin (integer) or [coin, {policy_id -> {asset_name -> quantity}}]
+fn encode_utxo_output(
+    enc: &mut minicbor::Encoder<&mut Vec<u8>>,
+    utxo: &crate::query_handler::UtxoSnapshot,
+) {
+    let has_datum = utxo.datum_hash.is_some();
+    let field_count = 2 + has_datum as u64; // address + value + optional datum
+    enc.map(field_count).ok();
+
+    // 0: address (raw bytes)
+    enc.u32(0).ok();
+    enc.bytes(&utxo.address_bytes).ok();
+
+    // 1: value
+    enc.u32(1).ok();
+    if utxo.multi_asset.is_empty() {
+        // Coin-only: encode as plain integer
+        enc.u64(utxo.lovelace).ok();
+    } else {
+        // Multi-asset: [coin, {policy_id -> {asset_name -> quantity}}]
+        enc.array(2).ok();
+        enc.u64(utxo.lovelace).ok();
+        enc.map(utxo.multi_asset.len() as u64).ok();
+        for (policy_id, assets) in &utxo.multi_asset {
+            enc.bytes(policy_id).ok();
+            enc.map(assets.len() as u64).ok();
+            for (asset_name, quantity) in assets {
+                enc.bytes(asset_name).ok();
+                enc.u64(*quantity).ok();
+            }
+        }
+    }
+
+    // 2: datum_option (if present)
+    if let Some(ref datum_hash) = utxo.datum_hash {
+        enc.u32(2).ok();
+        // DatumOption::Hash variant: [0, datum_hash]
+        enc.array(2).ok();
+        enc.u32(0).ok();
+        enc.bytes(datum_hash).ok();
+    }
+}
+
 /// Encode protocol parameters as CBOR map with integer keys per Cardano spec.
 ///
 /// Conway era protocol params use keys 0-33:
@@ -1220,19 +1266,16 @@ fn encode_query_result(result: &QueryResult) -> Vec<u8> {
             }
         }
         QueryResult::UtxoByAddress(utxos) => {
-            enc.array(utxos.len() as u64).ok();
+            // Cardano wire format: Map<[tx_hash, index], TransactionOutput>
+            enc.map(utxos.len() as u64).ok();
             for utxo in utxos {
-                enc.map(5).ok();
-                enc.str("tx_hash").ok();
+                // Key: [tx_hash, index]
+                enc.array(2).ok();
                 enc.bytes(&utxo.tx_hash).ok();
-                enc.str("output_index").ok();
                 enc.u32(utxo.output_index).ok();
-                enc.str("address").ok();
-                enc.str(&utxo.address).ok();
-                enc.str("lovelace").ok();
-                enc.u64(utxo.lovelace).ok();
-                enc.str("has_datum").ok();
-                enc.bool(utxo.has_datum).ok();
+
+                // Value: PostAlonzo TransactionOutput as CBOR map {0: addr, 1: value, ...}
+                encode_utxo_output(&mut enc, utxo);
             }
         }
         QueryResult::StakeAddressInfo(addrs) => {

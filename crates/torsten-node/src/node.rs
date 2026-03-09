@@ -119,14 +119,7 @@ impl UtxoQueryProvider for LedgerUtxoProvider {
             .utxo_set
             .utxos_at_address(&addr)
             .into_iter()
-            .map(|(input, output)| UtxoSnapshot {
-                tx_hash: input.transaction_id.as_ref().to_vec(),
-                output_index: input.index,
-                address: hex::encode(addr_bytes),
-                lovelace: output.value.coin.0,
-                has_datum: output.datum != torsten_primitives::transaction::OutputDatum::None,
-                has_script_ref: output.script_ref.is_some(),
-            })
+            .map(|(input, output)| utxo_to_snapshot(input, output))
             .collect()
     }
 
@@ -145,20 +138,45 @@ impl UtxoQueryProvider for LedgerUtxoProvider {
                     index: *idx,
                 };
                 if let Some(output) = ledger.utxo_set.lookup(&tx_input) {
-                    let addr_bytes = output.address.to_bytes();
-                    results.push(UtxoSnapshot {
-                        tx_hash: tx_hash_bytes.clone(),
-                        output_index: *idx,
-                        address: hex::encode(&addr_bytes),
-                        lovelace: output.value.coin.0,
-                        has_datum: output.datum
-                            != torsten_primitives::transaction::OutputDatum::None,
-                        has_script_ref: output.script_ref.is_some(),
-                    });
+                    results.push(utxo_to_snapshot(&tx_input, output));
                 }
             }
         }
         results
+    }
+}
+
+/// Convert a UTxO entry to a snapshot for N2C queries
+fn utxo_to_snapshot(
+    input: &torsten_primitives::transaction::TransactionInput,
+    output: &torsten_primitives::transaction::TransactionOutput,
+) -> UtxoSnapshot {
+    let multi_asset: torsten_network::query_handler::MultiAssetSnapshot = output
+        .value
+        .multi_asset
+        .iter()
+        .map(|(policy, assets)| {
+            let assets_vec: Vec<(Vec<u8>, u64)> = assets
+                .iter()
+                .map(|(name, qty)| (name.0.clone(), *qty))
+                .collect();
+            (policy.as_ref().to_vec(), assets_vec)
+        })
+        .collect();
+
+    let datum_hash = match &output.datum {
+        torsten_primitives::transaction::OutputDatum::DatumHash(h) => Some(h.as_ref().to_vec()),
+        _ => None,
+    };
+
+    UtxoSnapshot {
+        tx_hash: input.transaction_id.as_ref().to_vec(),
+        output_index: input.index,
+        address_bytes: output.address.to_bytes(),
+        lovelace: output.value.coin.0,
+        multi_asset,
+        datum_hash,
+        raw_cbor: output.raw_cbor.clone(),
     }
 }
 
