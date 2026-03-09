@@ -560,11 +560,11 @@ impl Node {
         {
             let mut pm = peer_manager.write().await;
             for peer in &detailed_peers {
-                // Resolve address to SocketAddr
-                if let Ok(mut addrs) =
+                // Resolve address to SocketAddr — register ALL resolved IPs
+                if let Ok(addrs) =
                     tokio::net::lookup_host(format!("{}:{}", peer.address, peer.port)).await
                 {
-                    if let Some(socket_addr) = addrs.next() {
+                    for socket_addr in addrs {
                         pm.add_config_peer(socket_addr, peer.trustable, peer.advertise);
                     }
                 }
@@ -603,13 +603,13 @@ impl Node {
                             let mut pm = pm_for_sighup.write().await;
                             let mut added = 0usize;
                             for peer in &new_peers {
-                                if let Ok(mut addrs) = tokio::net::lookup_host(format!(
+                                if let Ok(addrs) = tokio::net::lookup_host(format!(
                                     "{}:{}",
                                     peer.address, peer.port
                                 ))
                                 .await
                                 {
-                                    if let Some(socket_addr) = addrs.next() {
+                                    for socket_addr in addrs {
                                         pm.add_config_peer(
                                             socket_addr,
                                             peer.trustable,
@@ -1385,9 +1385,19 @@ impl Node {
         let strict = self.consensus.strict_verification();
         if let Some(last_block) = blocks.last() {
             if last_block.era.is_shelley_based() {
+                // Populate epoch_nonce from ledger state — the deserialized header
+                // always carries Hash32::ZERO for epoch_nonce since the wire format
+                // does not include the nonce; it must be injected from ledger state
+                // before VRF verification.
+                let epoch_nonce = {
+                    let ls = self.ledger_state.read().await;
+                    ls.epoch_nonce
+                };
+                let mut header_with_nonce = last_block.header.clone();
+                header_with_nonce.epoch_nonce = epoch_nonce;
                 if let Err(e) = self
                     .consensus
-                    .validate_header(&last_block.header, last_block.slot())
+                    .validate_header(&header_with_nonce, last_block.slot())
                 {
                     warn!(
                         slot = last_block.slot().0,
