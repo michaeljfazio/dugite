@@ -500,7 +500,7 @@ impl QueryCmd {
 
                 release_and_done(&mut client).await;
 
-                // Parse MsgResult [4, map{...}]
+                // Parse MsgResult [4, [array(7)]] — ConwayGovState with HFC wrapper
                 let mut decoder = minicbor::Decoder::new(&raw);
                 let _ = decoder.array();
                 let tag = decoder.u32().unwrap_or(999);
@@ -508,76 +508,152 @@ impl QueryCmd {
                     anyhow::bail!("Expected MsgResult(4), got {tag}");
                 }
 
-                let map_len = decoder.map().unwrap_or(Some(0)).unwrap_or(0);
-                let mut drep_count = 0u64;
-                let mut committee_count = 0u64;
-                let mut treasury = 0u64;
-                let mut proposals = Vec::new();
+                // Strip HFC success wrapper array(1)
+                let pos = decoder.position();
+                if let Ok(Some(1)) = decoder.array() {
+                    // HFC wrapper stripped
+                } else {
+                    decoder.set_position(pos);
+                }
 
-                for _ in 0..map_len {
-                    let key = decoder.str().unwrap_or("");
-                    match key {
-                        "drep_count" => drep_count = decoder.u64().unwrap_or(0),
-                        "committee_member_count" => committee_count = decoder.u64().unwrap_or(0),
-                        "treasury" => treasury = decoder.u64().unwrap_or(0),
-                        "proposals" => {
-                            let arr_len = decoder.array().unwrap_or(Some(0)).unwrap_or(0);
-                            for _ in 0..arr_len {
-                                let pmap_len = decoder.map().unwrap_or(Some(0)).unwrap_or(0);
-                                let mut tx_id = String::new();
-                                let mut action_idx = 0u32;
-                                let mut action_type = String::new();
-                                let mut yes = 0u64;
-                                let mut no = 0u64;
-                                let mut abstain = 0u64;
-                                for _ in 0..pmap_len {
-                                    let pkey = decoder.str().unwrap_or("");
-                                    match pkey {
-                                        "tx_id" => {
-                                            tx_id = hex::encode(decoder.bytes().unwrap_or(&[]))
+                let mut proposals = Vec::new();
+                let mut committee_count = 0usize;
+                let mut constitution_url = String::new();
+
+                // ConwayGovState = array(7)
+                if let Ok(Some(7)) = decoder.array() {
+                    // [0] Proposals = array(2) [roots, values]
+                    if let Ok(Some(2)) = decoder.array() {
+                        // roots: array(4) of StrictMaybe
+                        decoder.skip().ok(); // skip roots
+
+                        // values: array(n) of GovActionState
+                        if let Ok(Some(n)) = decoder.array() {
+                            for _ in 0..n {
+                                // GovActionState = array(7)
+                                if let Ok(Some(7)) = decoder.array() {
+                                    // [0] GovActionId = array(2) [tx_hash, index]
+                                    let _ = decoder.array();
+                                    let tx_id = hex::encode(decoder.bytes().unwrap_or(&[]));
+                                    let action_idx = decoder.u32().unwrap_or(0);
+                                    // [1] committeeVotes, [2] drepVotes, [3] spoVotes
+                                    decoder.skip().ok();
+                                    decoder.skip().ok();
+                                    decoder.skip().ok();
+                                    // [4] ProposalProcedure = array(4)
+                                    let mut action_type = String::new();
+                                    let mut deposit = 0u64;
+                                    if let Ok(Some(4)) = decoder.array() {
+                                        deposit = decoder.u64().unwrap_or(0);
+                                        decoder.skip().ok(); // return_addr
+                                                             // gov_action = sum type
+                                        if let Ok(Some(_)) = decoder.array() {
+                                            let gov_tag = decoder.u32().unwrap_or(6);
+                                            action_type = match gov_tag {
+                                                0 => "ParameterChange",
+                                                1 => "HardForkInitiation",
+                                                2 => "TreasuryWithdrawals",
+                                                3 => "NoConfidence",
+                                                4 => "UpdateCommittee",
+                                                5 => "NewConstitution",
+                                                _ => "InfoAction",
+                                            }
+                                            .to_string();
+                                            // Skip remaining gov_action fields based on tag
+                                            let skip_count = match gov_tag {
+                                                0 => 3, // ParameterChange: prev, params, policy
+                                                1 => 2, // HardFork: prev, version
+                                                2 => 2, // Treasury: map, policy
+                                                3 => 1, // NoConfidence: prev
+                                                4 => 4, // UpdateCommittee: prev, remove, add, quorum
+                                                5 => 2, // NewConstitution: prev, constitution
+                                                _ => 0, // InfoAction: no fields
+                                            };
+                                            for _ in 0..skip_count {
+                                                decoder.skip().ok();
+                                            }
                                         }
-                                        "action_index" => action_idx = decoder.u32().unwrap_or(0),
-                                        "action_type" => {
-                                            action_type = decoder.str().unwrap_or("").to_string()
-                                        }
-                                        "yes_votes" => yes = decoder.u64().unwrap_or(0),
-                                        "no_votes" => no = decoder.u64().unwrap_or(0),
-                                        "abstain_votes" => abstain = decoder.u64().unwrap_or(0),
-                                        _ => {
-                                            decoder.skip().ok();
-                                        }
+                                        // anchor = array(2) [url, hash]
+                                        decoder.skip().ok();
                                     }
+                                    // [5] proposedIn, [6] expiresAfter
+                                    let proposed = decoder.u64().unwrap_or(0);
+                                    let expires = decoder.u64().unwrap_or(0);
+                                    proposals.push((
+                                        tx_id,
+                                        action_idx,
+                                        action_type,
+                                        deposit,
+                                        proposed,
+                                        expires,
+                                    ));
+                                } else {
+                                    decoder.skip().ok();
                                 }
-                                proposals.push((tx_id, action_idx, action_type, yes, no, abstain));
                             }
                         }
-                        _ => {
-                            decoder.skip().ok();
-                        }
+                    } else {
+                        decoder.skip().ok();
                     }
+
+                    // [1] Committee
+                    if let Ok(Some(len)) = decoder.array() {
+                        if len == 1 {
+                            // StrictMaybe Just — array(2) [Map<Cred,Epoch>, threshold]
+                            if let Ok(Some(2)) = decoder.array() {
+                                let members = decoder.map().unwrap_or(Some(0)).unwrap_or(0);
+                                committee_count = members as usize;
+                                for _ in 0..members {
+                                    decoder.skip().ok(); // credential
+                                    decoder.skip().ok(); // epoch
+                                }
+                                decoder.skip().ok(); // threshold
+                            }
+                        }
+                        // else: Nothing (0), no committee
+                    }
+
+                    // [2] Constitution = array(2) [Anchor, MaybeScriptHash]
+                    if let Ok(Some(2)) = decoder.array() {
+                        // Anchor = array(2) [url, hash]
+                        if let Ok(Some(2)) = decoder.array() {
+                            constitution_url = decoder.str().unwrap_or("").to_string();
+                            decoder.skip().ok(); // hash
+                        }
+                        decoder.skip().ok(); // script hash
+                    }
+
+                    // [3]-[6] curPParams, prevPParams, FuturePParams, DRepPulsingState
+                    // We don't display these, just note they exist
                 }
 
                 println!("Governance State (Conway)");
                 println!("========================");
-                println!("Treasury:         {} ADA", treasury / 1_000_000);
-                println!("Registered DReps: {drep_count}");
                 println!("Committee Members: {committee_count}");
+                if !constitution_url.is_empty() {
+                    println!("Constitution:     {constitution_url}");
+                }
                 println!("Active Proposals: {}", proposals.len());
 
                 if !proposals.is_empty() {
                     println!("\nProposals:");
                     println!(
-                        "{:<20} {:<8} {:>6} {:>6} {:>8}",
-                        "Type", "TxId", "Yes", "No", "Abstain"
+                        "{:<20} {:<14} {:>15} {:>8} {:>8}",
+                        "Type", "TxId", "Deposit (ADA)", "Proposed", "Expires"
                     );
-                    println!("{}", "-".repeat(52));
-                    for (tx_id, idx, action_type, yes, no, abstain) in &proposals {
+                    println!("{}", "-".repeat(68));
+                    for (tx_id, idx, action_type, deposit, proposed, expires) in &proposals {
                         let short_tx = if tx_id.len() > 8 {
                             format!("{}#{idx}", &tx_id[..8])
                         } else {
                             format!("{tx_id}#{idx}")
                         };
-                        println!("{action_type:<20} {short_tx:<8} {yes:>6} {no:>6} {abstain:>8}");
+                        println!(
+                            "{action_type:<20} {short_tx:<14} {:>15} {:>8} {:>8}",
+                            deposit / 1_000_000,
+                            proposed,
+                            expires
+                        );
                     }
                 }
 
