@@ -607,11 +607,18 @@ impl Node {
             let mut pm = peer_manager.write().await;
             for peer in &detailed_peers {
                 // Resolve address to SocketAddr — register ALL resolved IPs
-                if let Ok(addrs) =
-                    tokio::net::lookup_host(format!("{}:{}", peer.address, peer.port)).await
-                {
-                    for socket_addr in addrs {
-                        pm.add_config_peer(socket_addr, peer.trustable, peer.advertise);
+                match tokio::net::lookup_host(format!("{}:{}", peer.address, peer.port)).await {
+                    Ok(addrs) => {
+                        for socket_addr in addrs {
+                            pm.add_config_peer(socket_addr, peer.trustable, peer.advertise);
+                        }
+                    }
+                    Err(e) => {
+                        warn!(
+                            address = %peer.address,
+                            port = peer.port,
+                            "Failed to resolve peer address: {e}"
+                        );
                     }
                 }
             }
@@ -649,19 +656,28 @@ impl Node {
                             let mut pm = pm_for_sighup.write().await;
                             let mut added = 0usize;
                             for peer in &new_peers {
-                                if let Ok(addrs) = tokio::net::lookup_host(format!(
+                                match tokio::net::lookup_host(format!(
                                     "{}:{}",
                                     peer.address, peer.port
                                 ))
                                 .await
                                 {
-                                    for socket_addr in addrs {
-                                        pm.add_config_peer(
-                                            socket_addr,
-                                            peer.trustable,
-                                            peer.advertise,
+                                    Ok(addrs) => {
+                                        for socket_addr in addrs {
+                                            pm.add_config_peer(
+                                                socket_addr,
+                                                peer.trustable,
+                                                peer.advertise,
+                                            );
+                                            added += 1;
+                                        }
+                                    }
+                                    Err(e) => {
+                                        warn!(
+                                            address = %peer.address,
+                                            port = peer.port,
+                                            "Failed to resolve peer address during topology reload: {e}"
                                         );
-                                        added += 1;
                                     }
                                 }
                             }
@@ -1583,7 +1599,13 @@ impl Node {
                     continue;
                 }
                 if let Err(e) = ls.apply_block(block) {
-                    error!("Failed to apply block to ledger: {e}");
+                    error!(
+                        slot = block.slot().0,
+                        block_no = block.block_number().0,
+                        hash = %block.hash().to_hex(),
+                        "Failed to apply block to ledger: {e} — skipping remaining blocks in batch"
+                    );
+                    break;
                 }
             }
         }
