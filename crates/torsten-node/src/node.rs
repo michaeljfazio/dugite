@@ -924,8 +924,14 @@ impl Node {
             }
         }
 
-        // Save final ledger snapshot on shutdown
+        // Save final ledger snapshot and flush ChainDB on shutdown
         self.save_ledger_snapshot().await;
+        {
+            let mut db = self.chain_db.write().await;
+            if let Err(e) = db.flush_volatile_to_immutable() {
+                error!("Failed to flush ChainDB on shutdown: {e}");
+            }
+        }
         info!("Node shutdown complete");
         Ok(())
     }

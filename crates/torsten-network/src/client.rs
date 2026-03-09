@@ -445,12 +445,28 @@ impl NodeToNodeClient {
             all_bodies = bodies;
         }
 
-        // Decode on blocking thread
+        // Decode on blocking thread and verify block hashes
+        let expected_points: Vec<(u64, [u8; 32])> =
+            points.iter().map(|p| (p.slot, p.hash)).collect();
         let decoded = tokio::task::spawn_blocking(move || {
             let mut blocks = Vec::with_capacity(all_bodies.len());
-            for cbor in all_bodies {
+            for (i, cbor) in all_bodies.into_iter().enumerate() {
                 let block =
                     decode_block(&cbor).map_err(|e| ClientError::BlockDecode(format!("{e}")))?;
+
+                // Verify block hash matches expected header hash
+                if i < expected_points.len() {
+                    let (expected_slot, expected_hash) = expected_points[i];
+                    let actual_hash = block.hash().as_bytes();
+                    if *actual_hash != expected_hash {
+                        return Err(ClientError::BlockDecode(format!(
+                            "Block hash mismatch at slot {expected_slot}: expected {:02x?}, got {:02x?}",
+                            &expected_hash[..8],
+                            &actual_hash[..8]
+                        )));
+                    }
+                }
+
                 blocks.push(block);
             }
             Ok::<_, ClientError>(blocks)

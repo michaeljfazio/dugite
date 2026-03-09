@@ -263,6 +263,27 @@ impl ChainDB {
         self.volatile.has_block(hash) || self.immutable.has_block(hash)
     }
 
+    /// Flush ALL volatile blocks to immutable DB. Called during graceful shutdown
+    /// to ensure no blocks are lost.
+    pub fn flush_volatile_to_immutable(&mut self) -> Result<(), ChainDBError> {
+        let volatile_count = self.volatile.block_count();
+        if volatile_count == 0 {
+            return Ok(());
+        }
+        info!(
+            volatile_count,
+            "ChainDB: flushing all volatile blocks to immutable DB on shutdown"
+        );
+        let flushed = self.volatile.drain_oldest(volatile_count);
+        let batch: Vec<_> = flushed
+            .iter()
+            .map(|(hash, slot, block_no, cbor)| (*slot, hash, *block_no, cbor.as_slice()))
+            .collect();
+        self.immutable.put_blocks_batch(&batch)?;
+        info!(flushed = flushed.len(), "ChainDB: shutdown flush complete");
+        Ok(())
+    }
+
     /// Flush old blocks from volatile to immutable when chain is long enough.
     /// Uses batched RocksDB writes for performance.
     fn maybe_flush_to_immutable(&mut self) -> Result<(), ChainDBError> {
