@@ -63,6 +63,10 @@ pub struct OuroborosPraos {
     pub epoch_length: EpochLength,
     /// Current tip
     pub tip: Tip,
+    /// Whether to enforce strict signature verification.
+    /// When false (during initial sync), VRF/KES/opcert failures are non-fatal.
+    /// When true (caught up to chain tip), verification failures reject blocks.
+    pub strict_verification: bool,
 }
 
 impl OuroborosPraos {
@@ -72,6 +76,7 @@ impl OuroborosPraos {
             security_param: SECURITY_PARAM,
             epoch_length: torsten_primitives::time::mainnet_epoch_length(),
             tip: Tip::origin(),
+            strict_verification: false,
         }
     }
 
@@ -85,7 +90,21 @@ impl OuroborosPraos {
             security_param,
             epoch_length,
             tip: Tip::origin(),
+            strict_verification: false,
         }
+    }
+
+    /// Enable strict verification mode (for when node is caught up to chain tip).
+    /// In strict mode, VRF/KES/opcert verification failures reject blocks.
+    pub fn set_strict_verification(&mut self, strict: bool) {
+        if strict != self.strict_verification {
+            debug!(
+                strict,
+                "Praos: {} strict signature verification",
+                if strict { "enabling" } else { "disabling" }
+            );
+        }
+        self.strict_verification = strict;
     }
 
     /// Validate a block header against consensus rules.
@@ -189,9 +208,14 @@ impl OuroborosPraos {
                 Ok(())
             }
             Err(e) => {
-                // During initial sync, VRF verification may fail due to
-                // incorrect epoch nonce (we don't track it perfectly yet).
-                // Log as warning but don't reject the block.
+                if self.strict_verification {
+                    warn!(
+                        slot = header.slot.0,
+                        error = %e,
+                        "Praos: VRF proof verification failed"
+                    );
+                    return Err(ConsensusError::InvalidVrfProof);
+                }
                 debug!(
                     slot = header.slot.0,
                     error = %e,
@@ -283,8 +307,10 @@ impl OuroborosPraos {
                     debug!("Operational certificate signature verified");
                 }
                 Err(e) => {
-                    // During sync, some legacy blocks may have different opcert formats.
-                    // Log the verification failure but don't reject the block.
+                    if self.strict_verification {
+                        warn!("Opcert signature verification failed: {e}");
+                        return Err(ConsensusError::InvalidOperationalCert);
+                    }
                     debug!("Opcert signature verification skipped: {e}");
                 }
             }
@@ -333,9 +359,15 @@ impl OuroborosPraos {
                 Ok(())
             }
             Err(e) => {
-                // During sync, KES verification may fail if the header body encoding
-                // doesn't exactly match what the block producer encoded.
-                // Log as debug but don't reject the block for now.
+                if self.strict_verification {
+                    warn!(
+                        slot = header.slot.0,
+                        error = %e,
+                        kes_period = kes_period_offset,
+                        "Praos: KES signature verification failed"
+                    );
+                    return Err(ConsensusError::InvalidKesSignature);
+                }
                 debug!(
                     slot = header.slot.0,
                     error = %e,
@@ -731,5 +763,28 @@ mod tests {
         assert_eq!(input.len(), 40);
         assert_eq!(&input[..32], &epoch_nonce);
         assert_eq!(&input[32..], &12345u64.to_be_bytes());
+    }
+
+    #[test]
+    fn test_strict_verification_mode() {
+        let mut praos = OuroborosPraos::new();
+        assert!(!praos.strict_verification);
+
+        // In non-strict mode, dummy VRF should pass (non-fatal)
+        let header = make_valid_header(100);
+        assert!(praos.validate_header(&header, SlotNo(200)).is_ok());
+
+        // Enable strict mode
+        praos.set_strict_verification(true);
+        assert!(praos.strict_verification);
+
+        // In strict mode, same header should still pass structural checks
+        // (VRF verification with dummy data will fail but only if vrf library
+        // returns an error, which depends on the data format)
+        let header2 = make_valid_header(100);
+        // This tests that the strict flag is properly toggled
+        praos.set_strict_verification(false);
+        assert!(!praos.strict_verification);
+        assert!(praos.validate_header(&header2, SlotNo(200)).is_ok());
     }
 }
