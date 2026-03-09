@@ -1785,13 +1785,29 @@ impl Node {
             })
             .collect();
 
-        // Build DRep snapshots
+        // Build DRep snapshots with delegator lookup
         let drep_entries: Vec<DRepSnapshot> = ls
             .governance
             .dreps
             .iter()
             .map(|(hash, drep)| {
                 let expiry = drep.registered_epoch.0 + ls.protocol_params.drep_activity;
+                // Collect stake credentials delegated to this DRep
+                let delegator_hashes: Vec<Vec<u8>> = ls
+                    .governance
+                    .vote_delegations
+                    .iter()
+                    .filter(|(_, d)| match d {
+                        torsten_primitives::transaction::DRep::KeyHash(h) => h == hash,
+                        torsten_primitives::transaction::DRep::ScriptHash(h) => {
+                            let mut padded = [0u8; 32];
+                            padded[..28].copy_from_slice(h.as_bytes());
+                            torsten_primitives::hash::Hash32::from_bytes(padded) == *hash
+                        }
+                        _ => false,
+                    })
+                    .map(|(stake_cred, _)| stake_cred.as_ref().to_vec())
+                    .collect();
                 DRepSnapshot {
                     credential_hash: hash.as_ref().to_vec(),
                     credential_type: 0, // KeyHashObj (we don't track script DReps separately yet)
@@ -1799,7 +1815,7 @@ impl Node {
                     anchor_url: drep.anchor.as_ref().map(|a| a.url.clone()),
                     anchor_hash: drep.anchor.as_ref().map(|a| a.data_hash.as_ref().to_vec()),
                     expiry_epoch: expiry,
-                    delegator_hashes: Vec::new(), // TODO: populate from delegation index
+                    delegator_hashes,
                 }
             })
             .collect();

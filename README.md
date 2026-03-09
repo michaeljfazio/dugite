@@ -155,8 +155,8 @@ graph TD
 | **Observability** | |
 | Prometheus metrics (port 12798) | :white_check_mark: |
 | SIGHUP topology reload | :white_check_mark: |
+| Full VRF/KES cryptographic verification | :white_check_mark: |
 | **Pending** | |
-| Full VRF/KES cryptographic verification | :construction: |
 | Mainnet production readiness | :construction: |
 | Genesis bootstrap from peers | :construction: |
 
