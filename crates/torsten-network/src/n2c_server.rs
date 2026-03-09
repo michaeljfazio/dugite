@@ -1544,26 +1544,21 @@ fn encode_query_result(result: &QueryResult) -> Vec<u8> {
             }
         }
         QueryResult::StakeSnapshots(snapshots) => {
-            enc.map(4).ok();
-            enc.str("pools").ok();
-            enc.array(snapshots.pools.len() as u64).ok();
+            // Wire format: array(4) [pool_map, mark_total, set_total, go_total]
+            // pool_map: Map<pool_hash(28), array(3) [mark_stake, set_stake, go_stake]>
+            enc.array(4).ok();
+            enc.map(snapshots.pools.len() as u64).ok();
             for pool in &snapshots.pools {
-                enc.map(4).ok();
-                enc.str("pool_id").ok();
                 enc.bytes(&pool.pool_id).ok();
-                enc.str("mark_stake").ok();
+                enc.array(3).ok();
                 enc.u64(pool.mark_stake).ok();
-                enc.str("set_stake").ok();
                 enc.u64(pool.set_stake).ok();
-                enc.str("go_stake").ok();
                 enc.u64(pool.go_stake).ok();
             }
-            enc.str("total_mark_stake").ok();
-            enc.u64(snapshots.total_mark_stake).ok();
-            enc.str("total_set_stake").ok();
-            enc.u64(snapshots.total_set_stake).ok();
-            enc.str("total_go_stake").ok();
-            enc.u64(snapshots.total_go_stake).ok();
+            // Totals (NonZero Coin — must be >= 1)
+            enc.u64(snapshots.total_mark_stake.max(1)).ok();
+            enc.u64(snapshots.total_set_stake.max(1)).ok();
+            enc.u64(snapshots.total_go_stake.max(1)).ok();
         }
         QueryResult::PoolParams(params) => {
             // Wire format: Map<pool_hash(28), PoolParams>

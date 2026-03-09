@@ -923,56 +923,39 @@ impl QueryCmd {
 
                 release_and_done(&mut client).await;
 
-                // Parse MsgResult [4, map{"pools": [...], "total_mark_stake": n, ...}]
+                // Parse MsgResult [4, [array(4) [pool_map, mark_total, set_total, go_total]]]
                 let mut decoder = minicbor::Decoder::new(&result);
                 let _ = decoder.array();
                 let tag = decoder.u32().unwrap_or(999);
                 if tag != 4 {
                     anyhow::bail!("Unexpected response tag: {tag}");
                 }
-
-                let map_len = decoder.map().unwrap_or(Some(0)).unwrap_or(0);
-                let mut total_mark = 0u64;
-                let mut total_set = 0u64;
-                let mut total_go = 0u64;
-                let mut pools: Vec<(String, u64, u64, u64)> = Vec::new();
-
-                for _ in 0..map_len {
-                    let key = decoder.str().unwrap_or("");
-                    match key {
-                        "pools" => {
-                            let arr_len = decoder.array().unwrap_or(Some(0)).unwrap_or(0);
-                            for _ in 0..arr_len {
-                                let pmap_len = decoder.map().unwrap_or(Some(0)).unwrap_or(0);
-                                let mut pool_id = String::new();
-                                let mut mark = 0u64;
-                                let mut set = 0u64;
-                                let mut go = 0u64;
-                                for _ in 0..pmap_len {
-                                    let pkey = decoder.str().unwrap_or("");
-                                    match pkey {
-                                        "pool_id" => {
-                                            pool_id = hex::encode(decoder.bytes().unwrap_or(&[]))
-                                        }
-                                        "mark_stake" => mark = decoder.u64().unwrap_or(0),
-                                        "set_stake" => set = decoder.u64().unwrap_or(0),
-                                        "go_stake" => go = decoder.u64().unwrap_or(0),
-                                        _ => {
-                                            decoder.skip().ok();
-                                        }
-                                    }
-                                }
-                                pools.push((pool_id, mark, set, go));
-                            }
-                        }
-                        "total_mark_stake" => total_mark = decoder.u64().unwrap_or(0),
-                        "total_set_stake" => total_set = decoder.u64().unwrap_or(0),
-                        "total_go_stake" => total_go = decoder.u64().unwrap_or(0),
-                        _ => {
-                            decoder.skip().ok();
-                        }
-                    }
+                // Strip HFC wrapper
+                let pos = decoder.position();
+                if let Ok(Some(1)) = decoder.array() {
+                    // consumed wrapper
+                } else {
+                    decoder.set_position(pos);
                 }
+
+                // array(4) [pool_map, mark_total, set_total, go_total]
+                let _ = decoder.array(); // array(4)
+
+                // pool_map: Map<pool_hash(28), array(3) [mark, set, go]>
+                let pool_count = decoder.map().unwrap_or(Some(0)).unwrap_or(0);
+                let mut pools: Vec<(String, u64, u64, u64)> = Vec::new();
+                for _ in 0..pool_count {
+                    let pool_id = hex::encode(decoder.bytes().unwrap_or(&[]));
+                    let _ = decoder.array(); // array(3)
+                    let mark = decoder.u64().unwrap_or(0);
+                    let set = decoder.u64().unwrap_or(0);
+                    let go = decoder.u64().unwrap_or(0);
+                    pools.push((pool_id, mark, set, go));
+                }
+
+                let total_mark = decoder.u64().unwrap_or(0);
+                let total_set = decoder.u64().unwrap_or(0);
+                let total_go = decoder.u64().unwrap_or(0);
 
                 println!("Stake Snapshot");
                 println!("==============");
