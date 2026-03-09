@@ -255,10 +255,12 @@ pub fn validate_transaction(
 
         for policy in body.mint.keys() {
             if !available_script_hashes.contains(policy) {
-                trace!(
+                debug!(
                     policy = %policy.to_hex(),
                     "Minting policy without matching script in witness set or reference inputs"
                 );
+                errors.push(ValidationError::InvalidMint);
+                break;
             }
         }
     }
@@ -1339,7 +1341,13 @@ mod tests {
     #[test]
     fn test_multi_asset_with_minting() {
         // Input has 10 ADA, mint 50 tokens, output has 9.8 ADA + 50 tokens
-        let policy = torsten_primitives::hash::Hash28::from_bytes([10u8; 28]);
+        // Create a native script that matches the minting policy
+        let script = NativeScript::ScriptAll(vec![]);
+        let script_cbor = torsten_serialization::encode_native_script(&script);
+        let mut tagged = vec![0x00];
+        tagged.extend_from_slice(&script_cbor);
+        let policy = torsten_primitives::hash::blake2b_224(&tagged);
+
         let asset = AssetName::new(b"Token".to_vec()).unwrap();
 
         let (utxo_set, input) = make_simple_utxo_set();
@@ -1358,6 +1366,7 @@ mod tests {
         let mut tx = make_simple_tx(input, 9_800_000, 200_000);
         tx.body.outputs[0].value = output_value;
         tx.body.mint = mint;
+        tx.witness_set.native_scripts.push(script);
 
         let result = validate_transaction(&tx, &utxo_set, &params, 100, 300, None);
         assert!(result.is_ok());
@@ -1366,7 +1375,13 @@ mod tests {
     #[test]
     fn test_multi_asset_burning() {
         // Input has 100 tokens, burn 30, output has 70
-        let policy = torsten_primitives::hash::Hash28::from_bytes([10u8; 28]);
+        // Create a native script that matches the minting policy
+        let script = NativeScript::ScriptAll(vec![]);
+        let script_cbor = torsten_serialization::encode_native_script(&script);
+        let mut tagged = vec![0x00];
+        tagged.extend_from_slice(&script_cbor);
+        let policy = torsten_primitives::hash::blake2b_224(&tagged);
+
         let asset = AssetName::new(b"Token".to_vec()).unwrap();
 
         let mut utxo_set = UtxoSet::new();
@@ -1407,9 +1422,42 @@ mod tests {
         let mut tx = make_simple_tx(input, 9_800_000, 200_000);
         tx.body.outputs[0].value = output_value;
         tx.body.mint = mint;
+        tx.witness_set.native_scripts.push(script);
 
         let result = validate_transaction(&tx, &utxo_set, &params, 100, 300, None);
         assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_minting_without_script_rejected() {
+        // Minting with a policy that has no matching script should fail
+        let policy = torsten_primitives::hash::Hash28::from_bytes([10u8; 28]);
+        let asset = AssetName::new(b"Token".to_vec()).unwrap();
+
+        let (utxo_set, input) = make_simple_utxo_set();
+
+        let mut output_value = Value::lovelace(9_800_000);
+        output_value
+            .multi_asset
+            .entry(policy)
+            .or_default()
+            .insert(asset.clone(), 50);
+
+        let mut mint: BTreeMap<PolicyId, BTreeMap<AssetName, i64>> = BTreeMap::new();
+        mint.entry(policy).or_default().insert(asset, 50);
+
+        let params = ProtocolParameters::mainnet_defaults();
+        let mut tx = make_simple_tx(input, 9_800_000, 200_000);
+        tx.body.outputs[0].value = output_value;
+        tx.body.mint = mint;
+        // No script in witness set!
+
+        let result = validate_transaction(&tx, &utxo_set, &params, 100, 300, None);
+        assert!(result.is_err());
+        let errors = result.unwrap_err();
+        assert!(errors
+            .iter()
+            .any(|e| matches!(e, ValidationError::InvalidMint)));
     }
 
     fn make_plutus_tx_with_collateral(
