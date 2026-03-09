@@ -83,9 +83,10 @@ impl NodeMetrics {
 
     /// Format metrics as Prometheus exposition format
     fn to_prometheus(&self) -> String {
-        let mut out = String::with_capacity(1024);
+        let mut out = String::with_capacity(2048);
 
-        let fields = [
+        // Counters (monotonically increasing totals)
+        let counters: &[(&str, &str, &AtomicU64)] = &[
             (
                 "torsten_blocks_received_total",
                 "Total blocks received from peers",
@@ -111,6 +112,20 @@ impl NodeMetrics {
                 "Total transactions rejected",
                 &self.transactions_rejected,
             ),
+            (
+                "torsten_rollback_count_total",
+                "Total number of chain rollbacks",
+                &self.rollback_count,
+            ),
+            (
+                "torsten_blocks_forged_total",
+                "Total blocks forged by this node",
+                &self.blocks_forged,
+            ),
+        ];
+
+        // Gauges (can go up and down)
+        let gauges: &[(&str, &str, &AtomicU64)] = &[
             (
                 "torsten_peers_connected",
                 "Number of connected peers",
@@ -152,16 +167,6 @@ impl NodeMetrics {
                 &self.mempool_bytes,
             ),
             (
-                "torsten_rollback_count_total",
-                "Total number of chain rollbacks",
-                &self.rollback_count,
-            ),
-            (
-                "torsten_blocks_forged_total",
-                "Total blocks forged by this node",
-                &self.blocks_forged,
-            ),
-            (
                 "torsten_delegation_count",
                 "Number of active stake delegations",
                 &self.delegation_count,
@@ -173,7 +178,14 @@ impl NodeMetrics {
             ),
         ];
 
-        for (name, help, value) in &fields {
+        for (name, help, value) in counters {
+            out.push_str(&format!(
+                "# HELP {name} {help}\n# TYPE {name} counter\n{name} {}\n",
+                value.load(Ordering::Relaxed)
+            ));
+        }
+
+        for (name, help, value) in gauges {
             out.push_str(&format!(
                 "# HELP {name} {help}\n# TYPE {name} gauge\n{name} {}\n",
                 value.load(Ordering::Relaxed)
@@ -259,6 +271,10 @@ mod tests {
         assert!(output.contains("torsten_epoch_number 42"));
         assert!(output.contains("torsten_blocks_applied_total 100"));
         assert!(output.contains("# HELP"));
-        assert!(output.contains("# TYPE"));
+        // Verify correct metric types
+        assert!(output.contains("# TYPE torsten_blocks_applied_total counter"));
+        assert!(output.contains("# TYPE torsten_slot_number gauge"));
+        assert!(output.contains("# TYPE torsten_rollback_count_total counter"));
+        assert!(output.contains("# TYPE torsten_peers_connected gauge"));
     }
 }
