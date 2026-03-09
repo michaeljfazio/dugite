@@ -879,12 +879,25 @@ impl Node {
                         }
                     }
                 }
-                if !fetch_pool.is_empty() {
-                    info!(
-                        "Block fetch pool: {} fetcher(s) for parallel block retrieval",
-                        fetch_pool.len()
-                    );
+                // If no fetchers connected, add a dedicated fetcher to the primary peer.
+                // This is necessary because the primary client connection is used for
+                // pipelined ChainSync headers and can't simultaneously fetch blocks.
+                if fetch_pool.is_empty() {
+                    let target = peer_addr.to_string();
+                    match NodeToNodeClient::connect(&*target, network_magic).await {
+                        Ok(c) => {
+                            info!("Connected dedicated block fetcher to primary peer {target}");
+                            fetch_pool.add_fetcher(c);
+                        }
+                        Err(e) => {
+                            warn!("Failed to connect dedicated fetcher to {target}: {e}");
+                        }
+                    }
                 }
+                info!(
+                    "Block fetch pool: {} fetcher(s) for block retrieval",
+                    fetch_pool.len()
+                );
             }
 
             // Create pipelined ChainSync connection to same peer for high-throughput headers
