@@ -1031,6 +1031,8 @@ impl Node {
                                     }
                                     HeaderBatchResult::Await => {
                                         info!(blocks_received, "Caught up to chain tip, awaiting new blocks");
+                                        // Enable strict VRF/KES verification now that we're synced
+                                        self.consensus.set_strict_verification(true);
                                         self.update_query_state().await;
                                         self.try_forge_block().await;
                                     }
@@ -1077,6 +1079,7 @@ impl Node {
                                         }
                                         ChainSyncEvent::Await => {
                                             info!(blocks_received, "Caught up to chain tip, awaiting new blocks");
+                                            self.consensus.set_strict_verification(true);
                                             self.update_query_state().await;
                                         }
                                         ChainSyncEvent::RollForward(..) => unreachable!(),
@@ -1156,7 +1159,7 @@ impl Node {
             }
         );
 
-        // Remove confirmed transactions from mempool
+        // Remove confirmed transactions from mempool and revalidate
         if !self.mempool.is_empty() {
             let confirmed_hashes: Vec<_> = blocks
                 .iter()
@@ -1164,6 +1167,19 @@ impl Node {
                 .collect();
             if !confirmed_hashes.is_empty() {
                 self.mempool.remove_txs(&confirmed_hashes);
+            }
+
+            // Remove mempool txs whose inputs conflict with the confirmed block inputs
+            let consumed_inputs: std::collections::HashSet<_> = blocks
+                .iter()
+                .flat_map(|b| b.transactions.iter())
+                .flat_map(|tx| tx.body.inputs.iter().cloned())
+                .collect();
+            self.mempool.revalidate_against_inputs(&consumed_inputs);
+
+            // Evict expired transactions based on current slot
+            if let Some(last_block) = blocks.last() {
+                self.mempool.evict_expired(last_block.slot());
             }
         }
 
