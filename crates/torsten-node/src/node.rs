@@ -492,6 +492,11 @@ impl Node {
         }
         info!("Mempool: {} transactions", self.mempool.len());
 
+        // Replay blocks from ChainDB if the ledger is behind storage
+        // This happens after a Mithril snapshot import — blocks are in storage
+        // but the ledger hasn't processed them yet.
+        self.replay_ledger_from_storage().await;
+
         // Setup shutdown signal
         let (shutdown_tx, mut shutdown_rx) = watch::channel(false);
         tokio::spawn(async move {
@@ -948,6 +953,126 @@ impl Node {
         let ls = self.ledger_state.read().await;
         if let Err(e) = ls.save_snapshot(&snapshot_path) {
             error!("Failed to save ledger snapshot: {e}");
+        }
+    }
+
+    /// Replay blocks from local ChainDB to catch the ledger up to storage tip.
+    ///
+    /// After a Mithril snapshot import, ChainDB contains millions of blocks
+    /// but the ledger state starts from genesis. This replays blocks locally
+    /// (no network needed) which is much faster than re-downloading from peers.
+    async fn replay_ledger_from_storage(&self) {
+        let db_tip = self.chain_db.read().await.get_tip();
+        let ledger_slot = {
+            let ls = self.ledger_state.read().await;
+            ls.tip.point.slot().map(|s| s.0).unwrap_or(0)
+        };
+        let db_tip_slot = db_tip.point.slot().map(|s| s.0).unwrap_or(0);
+
+        if db_tip_slot <= ledger_slot {
+            return; // Ledger is already caught up
+        }
+
+        let blocks_behind = db_tip.block_number.0.saturating_sub({
+            let ls = self.ledger_state.read().await;
+            ls.tip.block_number.0
+        });
+
+        info!(
+            ledger_slot,
+            db_tip_slot,
+            blocks_behind,
+            "Ledger is behind ChainDB — replaying blocks from local storage"
+        );
+
+        let start = std::time::Instant::now();
+        let mut current_slot = ledger_slot;
+        let mut replayed = 0u64;
+        let mut last_log = std::time::Instant::now();
+        let snapshot_path = self.database_path.join("ledger-snapshot.bin");
+
+        loop {
+            // Read block from ChainDB
+            let block_data = {
+                let db = self.chain_db.read().await;
+                db.get_next_block_after_slot(torsten_primitives::time::SlotNo(current_slot))
+            };
+
+            match block_data {
+                Ok(Some((next_slot, _hash, cbor))) => {
+                    if next_slot.0 > db_tip_slot {
+                        break;
+                    }
+                    match torsten_serialization::multi_era::decode_block(&cbor) {
+                        Ok(block) => {
+                            let mut ls = self.ledger_state.write().await;
+                            if let Err(e) = ls.apply_block(&block) {
+                                warn!(slot = next_slot.0, "Ledger replay apply failed: {e}");
+                            }
+                            replayed += 1;
+                            current_slot = next_slot.0;
+
+                            // Log progress every 5 seconds
+                            if last_log.elapsed().as_secs() >= 5 {
+                                let elapsed = start.elapsed().as_secs_f64();
+                                let speed = replayed as f64 / elapsed;
+                                let pct = if db_tip_slot > 0 {
+                                    current_slot as f64 / db_tip_slot as f64 * 100.0
+                                } else {
+                                    0.0
+                                };
+                                info!(
+                                    "Replaying {pct:.2}% | slot {current_slot}/{db_tip_slot} \
+                                     | {replayed} blocks | {speed:.0} blocks/s \
+                                     | {} UTxOs",
+                                    ls.utxo_set.len()
+                                );
+                                last_log = std::time::Instant::now();
+                            }
+
+                            // Save ledger snapshot every epoch (~100k blocks on preview, 432k on mainnet)
+                            if replayed.is_multiple_of(100_000) {
+                                if let Err(e) = ls.save_snapshot(&snapshot_path) {
+                                    warn!("Failed to save ledger snapshot during replay: {e}");
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            warn!(
+                                slot = next_slot.0,
+                                "Failed to decode block during replay: {e}"
+                            );
+                            current_slot = next_slot.0;
+                        }
+                    }
+                }
+                Ok(None) => break,
+                Err(e) => {
+                    warn!("Failed to read from ChainDB during replay: {e}");
+                    break;
+                }
+            }
+        }
+
+        let elapsed = start.elapsed().as_secs_f64();
+        let speed = if elapsed > 0.0 {
+            replayed as f64 / elapsed
+        } else {
+            0.0
+        };
+        info!(
+            replayed,
+            elapsed_secs = elapsed as u64,
+            speed = speed as u64,
+            "Ledger replay from local storage complete"
+        );
+
+        // Save final snapshot after replay
+        {
+            let ls = self.ledger_state.read().await;
+            if let Err(e) = ls.save_snapshot(&snapshot_path) {
+                error!("Failed to save ledger snapshot after replay: {e}");
+            }
         }
     }
 
