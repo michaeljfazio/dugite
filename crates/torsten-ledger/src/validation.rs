@@ -87,6 +87,8 @@ pub enum ValidationError {
     },
     #[error("Output value too large: maximum={maximum}, actual={actual}")]
     OutputValueTooLarge { maximum: u64, actual: u64 },
+    #[error("Plutus transaction missing raw CBOR for script evaluation")]
+    MissingRawCbor,
 }
 
 /// Validate a transaction against the current UTxO set and protocol parameters
@@ -536,15 +538,28 @@ pub fn validate_transaction(
             errors.push(ValidationError::UnexpectedScriptDataHash);
         }
 
-        // Phase-2: Execute Plutus scripts if we have raw CBOR and a slot config
-        if errors.is_empty() && tx.raw_cbor.is_some() {
+        // Phase-2: Execute Plutus scripts
+        if errors.is_empty() {
             if let Some(sc) = slot_config {
-                let cost_models_cbor = params.cost_models.to_cbor();
-                let max_ex = (params.max_tx_ex_units.mem, params.max_tx_ex_units.steps);
-                if let Err(e) =
-                    evaluate_plutus_scripts(tx, utxo_set, cost_models_cbor.as_deref(), max_ex, sc)
-                {
-                    errors.push(ValidationError::ScriptFailed(e.to_string()));
+                if let Some(ref _raw) = tx.raw_cbor {
+                    let cost_models_cbor = params.cost_models.to_cbor();
+                    let max_ex = (params.max_tx_ex_units.mem, params.max_tx_ex_units.steps);
+                    if let Err(e) = evaluate_plutus_scripts(
+                        tx,
+                        utxo_set,
+                        cost_models_cbor.as_deref(),
+                        max_ex,
+                        sc,
+                    ) {
+                        errors.push(ValidationError::ScriptFailed(e.to_string()));
+                    }
+                } else {
+                    // Plutus tx without raw CBOR cannot be validated — reject in mempool admission
+                    debug!(
+                        tx_hash = %tx.hash.to_hex(),
+                        "Plutus transaction missing raw CBOR for script evaluation"
+                    );
+                    errors.push(ValidationError::MissingRawCbor);
                 }
             }
         }

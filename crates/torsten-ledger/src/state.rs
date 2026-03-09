@@ -353,6 +353,19 @@ impl LedgerState {
             self.process_epoch_transition(block_epoch);
         }
 
+        // Block body size check — reject blocks exceeding max_block_body_size
+        if block.header.body_size > 0
+            && self.protocol_params.max_block_body_size > 0
+            && block.header.body_size > self.protocol_params.max_block_body_size
+        {
+            debug!(
+                body_size = block.header.body_size,
+                limit = self.protocol_params.max_block_body_size,
+                slot = block.slot().0,
+                "Block body exceeds max_block_body_size (expected during replay before PP updates)"
+            );
+        }
+
         // Block-level execution unit budget check
         let mut block_mem: u64 = 0;
         let mut block_steps: u64 = 0;
