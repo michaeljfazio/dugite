@@ -7,7 +7,7 @@ Torsten implements the full Ouroboros network protocol stack, supporting both No
 ```mermaid
 flowchart TB
     subgraph N2N ["Node-to-Node (TCP)"]
-        HS[Handshake V14+]
+        HS[Handshake V14/V15]
         CSP[ChainSync<br/>Headers]
         BFP[BlockFetch<br/>Block Bodies]
         TX[TxSubmission2<br/>Transactions]
@@ -67,10 +67,10 @@ flowchart TB
 
 N2N connections use TCP and carry multiple mini-protocols over a multiplexed connection.
 
-### Handshake (V14+)
+### Handshake (V14/V15)
 
 The N2N handshake negotiates the protocol version and network parameters:
-- Protocol version V14+ (pallas 1.0)
+- Protocol version V14 (Plomin HF) and V15 (SRV DNS support)
 - Network magic number
 - Diffusion mode: `InitiatorOnly` or `InitiatorAndResponder`
 - Peer sharing flags
@@ -121,7 +121,7 @@ The PeerSharing mini-protocol enables gossip-based peer discovery. Peers exchang
 
 ## Node-to-Client (N2C) Protocol
 
-N2C connections use Unix domain sockets and serve local clients (wallets, CLI tools).
+N2C connections use Unix domain sockets and serve local clients (wallets, CLI tools). The N2C handshake supports versions V16-V17 (Conway era) with automatic detection of the Haskell bit-15 version encoding used by cardano-cli.
 
 ### LocalStateQuery
 
@@ -143,6 +143,9 @@ Supports a wide range of ledger queries:
 | Governance state | Active proposals and votes |
 | Stake snapshot | Mark/set/go snapshots |
 | Pool parameters | Registered pool parameters |
+| Account state | Treasury and reserves |
+| Genesis config | System start, epoch length, slot length, security param |
+| Non-myopic rewards | Estimated rewards per pool for given stake amounts |
 
 The query protocol uses an acquire/query/release pattern:
 1. `MsgAcquire` -- Lock the ledger state at the current tip
