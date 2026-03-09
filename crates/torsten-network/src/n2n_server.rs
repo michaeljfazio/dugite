@@ -620,6 +620,7 @@ fn handle_n2n_handshake(
     // N2N versions: 14 (Plomin HF) and 15 (SRV DNS support)
     // We support versions 14-15 (matching current cardano-node)
     let mut best_version: Option<u32> = None;
+    let mut magic_mismatch_version: Option<u32> = None;
     let map_len = decoder
         .map()
         .map_err(|e| N2NServerError::HandshakeFailed(e.to_string()))?;
@@ -629,35 +630,70 @@ fn handle_n2n_handshake(
         let version = decoder
             .u32()
             .map_err(|e| N2NServerError::HandshakeFailed(e.to_string()))?;
+
+        // Try to extract network_magic from params: [magic, diffusion, peer_sharing, query]
+        let peer_magic = {
+            let pos = decoder.position();
+            let m = if let Ok(Some(_)) = decoder.array() {
+                decoder.u64().ok()
+            } else {
+                None
+            };
+            decoder.set_position(pos);
+            m
+        };
         // Skip the value (params)
         decoder
             .skip()
             .map_err(|e| N2NServerError::HandshakeFailed(e.to_string()))?;
 
         // Accept versions 14-15 (current cardano-node N2N)
-        if (14..=15).contains(&version)
-            && (best_version.is_none() || version > best_version.unwrap())
-        {
-            best_version = Some(version);
+        if (14..=15).contains(&version) {
+            if let Some(pm) = peer_magic {
+                if pm != network_magic {
+                    magic_mismatch_version = Some(version);
+                    continue;
+                }
+            }
+            if best_version.is_none() || version > best_version.unwrap() {
+                best_version = Some(version);
+            }
         }
     }
 
     let version = match best_version {
         Some(v) => v,
         None => {
-            // Refuse: no compatible version
             let mut buf = Vec::new();
             let mut enc = minicbor::Encoder::new(&mut buf);
             enc.array(2)
                 .map_err(|e| N2NServerError::Protocol(e.to_string()))?;
             enc.u32(2)
                 .map_err(|e| N2NServerError::Protocol(e.to_string()))?; // MsgRefuse
-            enc.array(2)
-                .map_err(|e| N2NServerError::Protocol(e.to_string()))?;
-            enc.u32(0)
-                .map_err(|e| N2NServerError::Protocol(e.to_string()))?; // VersionMismatch
-            enc.array(0)
-                .map_err(|e| N2NServerError::Protocol(e.to_string()))?; // empty list
+
+            if let Some(v) = magic_mismatch_version {
+                // Refused: [2, version, reason_text]
+                enc.array(3)
+                    .map_err(|e| N2NServerError::Protocol(e.to_string()))?;
+                enc.u32(2)
+                    .map_err(|e| N2NServerError::Protocol(e.to_string()))?; // Refused reason tag
+                enc.u32(v)
+                    .map_err(|e| N2NServerError::Protocol(e.to_string()))?;
+                enc.str(&format!("networkMagic mismatch: expected {network_magic}"))
+                    .map_err(|e| N2NServerError::Protocol(e.to_string()))?;
+            } else {
+                // VersionMismatch: [0, [supported_versions...]]
+                enc.array(2)
+                    .map_err(|e| N2NServerError::Protocol(e.to_string()))?;
+                enc.u32(0)
+                    .map_err(|e| N2NServerError::Protocol(e.to_string()))?;
+                enc.array(2)
+                    .map_err(|e| N2NServerError::Protocol(e.to_string()))?;
+                enc.u32(14)
+                    .map_err(|e| N2NServerError::Protocol(e.to_string()))?;
+                enc.u32(15)
+                    .map_err(|e| N2NServerError::Protocol(e.to_string()))?;
+            }
 
             return Ok(Some(Segment {
                 transmission_time: 0,
@@ -1450,6 +1486,35 @@ mod tests {
         dec.array().unwrap();
         let tag = dec.u32().unwrap();
         assert_eq!(tag, 2); // MsgRefuse
+    }
+
+    #[test]
+    fn test_handle_n2n_handshake_refuse_magic_mismatch() {
+        // Propose V14 with wrong network magic
+        let mut buf = Vec::new();
+        let mut enc = minicbor::Encoder::new(&mut buf);
+        enc.array(2).unwrap();
+        enc.u32(0).unwrap(); // MsgProposeVersions
+        enc.map(1).unwrap();
+        enc.u32(14).unwrap();
+        enc.array(4).unwrap();
+        enc.u64(999).unwrap(); // wrong magic
+        enc.bool(false).unwrap();
+        enc.u32(0).unwrap();
+        enc.bool(false).unwrap();
+
+        let result = handle_n2n_handshake(&buf, 2, true, PeerSharingMode::NoPeerSharing).unwrap();
+        assert!(result.is_some());
+        let seg = result.unwrap();
+
+        let mut dec = minicbor::Decoder::new(&seg.payload);
+        dec.array().unwrap();
+        let tag = dec.u32().unwrap();
+        assert_eq!(tag, 2); // MsgRefuse
+                            // Should be [2, version, reason_text] format
+        dec.array().unwrap();
+        let reason_tag = dec.u32().unwrap();
+        assert_eq!(reason_tag, 2); // Refused (not VersionMismatch)
     }
 
     #[test]
