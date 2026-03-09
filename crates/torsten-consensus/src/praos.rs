@@ -180,18 +180,15 @@ impl OuroborosPraos {
         Ok(())
     }
 
-    /// Verify the VRF proof in the block header.
+    /// Verify the VRF proof in the block header (Praos / Conway era).
     ///
-    /// The VRF input is constructed from the epoch nonce and the slot number:
-    ///   seed = epoch_nonce || slot_to_cbor(slot)
-    ///
-    /// This verifies that the block producer actually evaluated the VRF correctly,
+    /// VRF input = Blake2b-256(slot_u64_BE || epoch_nonce)
+    /// This verifies that the block producer correctly evaluated the VRF,
     /// proving they had the right to produce this block.
     fn verify_vrf_proof(&self, header: &BlockHeader) -> Result<(), ConsensusError> {
-        // Construct the VRF seed: epoch_nonce (32 bytes) || slot (8 bytes big-endian)
-        let mut seed = Vec::with_capacity(40);
-        seed.extend_from_slice(header.epoch_nonce.as_ref());
-        seed.extend_from_slice(&header.slot.0.to_be_bytes());
+        // Construct the VRF seed per Praos spec:
+        // input = Blake2b-256(slot_BE || epoch_nonce)
+        let seed = crate::slot_leader::vrf_input(&header.epoch_nonce, header.slot);
 
         match torsten_crypto::vrf::verify_vrf_proof(
             &header.vrf_vkey,

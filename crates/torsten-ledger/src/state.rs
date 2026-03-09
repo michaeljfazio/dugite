@@ -1019,10 +1019,16 @@ impl LedgerState {
     ///
     /// rolling_nonce = hash(rolling_nonce || hash(vrf_output))
     fn update_rolling_nonce(&mut self, vrf_output: &[u8]) {
-        let vrf_hash = torsten_primitives::hash::blake2b_256(vrf_output);
+        // Per Praos spec: nonce contribution = Blake2b-256(Blake2b-256("N" || raw_vrf_output))
+        // Domain-separated, double-hashed nonce value
+        let mut prefixed = Vec::with_capacity(1 + vrf_output.len());
+        prefixed.push(b'N');
+        prefixed.extend_from_slice(vrf_output);
+        let first_hash = torsten_primitives::hash::blake2b_256(&prefixed);
+        let nonce_value = torsten_primitives::hash::blake2b_256(first_hash.as_ref());
         let mut data = Vec::with_capacity(64);
         data.extend_from_slice(self.rolling_nonce.as_bytes());
-        data.extend_from_slice(vrf_hash.as_bytes());
+        data.extend_from_slice(nonce_value.as_bytes());
         self.rolling_nonce = torsten_primitives::hash::blake2b_256(&data);
     }
 
