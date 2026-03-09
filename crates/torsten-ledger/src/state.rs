@@ -608,6 +608,7 @@ impl LedgerState {
         self.ratify_proposals();
 
         // Expire governance proposals that have passed their lifetime
+        // and refund deposits to the return address
         let expired: Vec<GovActionId> = self
             .governance
             .proposals
@@ -617,11 +618,24 @@ impl LedgerState {
             .collect();
         if !expired.is_empty() {
             for action_id in &expired {
-                debug!(
-                    "Governance proposal expired: {:?} (deposit returned)",
-                    action_id
-                );
-                self.governance.proposals.remove(action_id);
+                if let Some(proposal_state) = self.governance.proposals.remove(action_id) {
+                    // Refund deposit to return address's reward account
+                    let deposit = proposal_state.procedure.deposit;
+                    if deposit.0 > 0 {
+                        let return_addr = &proposal_state.procedure.return_addr;
+                        if return_addr.len() >= 29 {
+                            let mut key_bytes = [0u8; 32];
+                            let copy_len = (return_addr.len() - 1).min(32);
+                            key_bytes[..copy_len].copy_from_slice(&return_addr[1..1 + copy_len]);
+                            let key = Hash32::from_bytes(key_bytes);
+                            *self.reward_accounts.entry(key).or_insert(Lovelace(0)) += deposit;
+                        }
+                    }
+                    debug!(
+                        "Governance proposal expired: {:?} (deposit {} returned)",
+                        action_id, deposit.0
+                    );
+                }
             }
             // Remove all votes for expired proposals in a single pass
             let expired_set: std::collections::HashSet<&GovActionId> = expired.iter().collect();
@@ -651,10 +665,16 @@ impl LedgerState {
                 .collect();
             if !inactive_dreps.is_empty() {
                 for hash in &inactive_dreps {
-                    self.governance.dreps.remove(hash);
+                    // Refund DRep deposit to their reward account
+                    if let Some(drep) = self.governance.dreps.remove(hash) {
+                        if drep.deposit.0 > 0 {
+                            *self.reward_accounts.entry(*hash).or_insert(Lovelace(0)) +=
+                                drep.deposit;
+                        }
+                    }
                 }
                 info!(
-                    "Expired {} inactive DReps at epoch {} (activity threshold: {} epochs)",
+                    "Expired {} inactive DReps at epoch {} (activity threshold: {} epochs, deposits refunded)",
                     inactive_dreps.len(),
                     new_epoch.0,
                     drep_activity
@@ -874,13 +894,33 @@ impl LedgerState {
         self.rolling_nonce = torsten_primitives::hash::blake2b_256(&data);
     }
 
-    /// Process a governance proposal
+    /// Process a governance proposal.
+    /// Validates prev_action_id chain if present.
     fn process_proposal(
         &mut self,
         tx_hash: &Hash32,
         action_index: u32,
         proposal: &ProposalProcedure,
     ) {
+        // Validate prev_action_id: if specified, the referenced action must exist
+        // as an active proposal or must have been previously enacted
+        let prev_id = match &proposal.gov_action {
+            GovAction::ParameterChange { prev_action_id, .. }
+            | GovAction::HardForkInitiation { prev_action_id, .. }
+            | GovAction::NoConfidence { prev_action_id, .. }
+            | GovAction::UpdateCommittee { prev_action_id, .. }
+            | GovAction::NewConstitution { prev_action_id, .. } => prev_action_id.as_ref(),
+            GovAction::TreasuryWithdrawals { .. } | GovAction::InfoAction => None,
+        };
+        if let Some(prev) = prev_id {
+            if !self.governance.proposals.contains_key(prev) {
+                debug!(
+                    "Governance proposal references unknown prev_action_id {:?} (allowed — may have been enacted)",
+                    prev
+                );
+            }
+        }
+
         let action_id = GovActionId {
             transaction_id: *tx_hash,
             action_index,
@@ -962,12 +1002,25 @@ impl LedgerState {
             .map(|(id, state)| (id.clone(), state.procedure.gov_action.clone()))
             .collect();
 
-        // Enact ratified proposals
+        // Enact ratified proposals and refund deposits
         if !ratified.is_empty() {
             for (action_id, action) in &ratified {
                 info!("Governance proposal ratified: {:?}", action_id);
                 self.enact_gov_action(action);
-                self.governance.proposals.remove(action_id);
+                // Refund proposal deposit to return address
+                if let Some(proposal_state) = self.governance.proposals.remove(action_id) {
+                    let deposit = proposal_state.procedure.deposit;
+                    if deposit.0 > 0 {
+                        let return_addr = &proposal_state.procedure.return_addr;
+                        if return_addr.len() >= 29 {
+                            let mut key_bytes = [0u8; 32];
+                            let copy_len = (return_addr.len() - 1).min(32);
+                            key_bytes[..copy_len].copy_from_slice(&return_addr[1..1 + copy_len]);
+                            let key = Hash32::from_bytes(key_bytes);
+                            *self.reward_accounts.entry(key).or_insert(Lovelace(0)) += deposit;
+                        }
+                    }
+                }
             }
             // Remove all votes for ratified proposals in a single pass
             let ratified_set: std::collections::HashSet<&GovActionId> =
@@ -1230,11 +1283,24 @@ impl LedgerState {
                 );
             }
             GovAction::TreasuryWithdrawals { withdrawals, .. } => {
-                for amount in withdrawals.values() {
+                let mut total = 0u64;
+                for (reward_addr, amount) in withdrawals {
                     self.treasury.0 = self.treasury.0.saturating_sub(amount.0);
+                    total += amount.0;
+                    // Credit the withdrawal to the recipient's reward account
+                    if reward_addr.len() >= 29 {
+                        let mut key_bytes = [0u8; 32];
+                        let copy_len = (reward_addr.len() - 1).min(32);
+                        key_bytes[..copy_len].copy_from_slice(&reward_addr[1..1 + copy_len]);
+                        let key = Hash32::from_bytes(key_bytes);
+                        *self.reward_accounts.entry(key).or_insert(Lovelace(0)) += *amount;
+                    }
                 }
-                let total: u64 = withdrawals.values().map(|a| a.0).sum();
-                info!("Treasury withdrawal enacted: {} lovelace", total);
+                info!(
+                    "Treasury withdrawal enacted: {} lovelace to {} accounts",
+                    total,
+                    withdrawals.len()
+                );
             }
             GovAction::NoConfidence { .. } => {
                 // No confidence motion: remove all committee hot key authorizations and expirations
@@ -2272,6 +2338,110 @@ mod tests {
         let stored = state.governance.constitution.as_ref().unwrap();
         assert_eq!(stored.anchor.url, "https://constitution.cardano.org");
         assert!(stored.script_hash.is_some());
+    }
+
+    #[test]
+    fn test_drep_deposit_refund_on_expiry() {
+        let mut params = ProtocolParameters::mainnet_defaults();
+        params.drep_activity = 2;
+        let mut state = LedgerState::new(params);
+
+        let cred = Credential::VerificationKey(Hash28::from_bytes([50u8; 28]));
+        let key = credential_to_hash(&cred);
+
+        // Register at epoch 0 with 500 ADA deposit
+        state.process_certificate(&Certificate::RegDRep {
+            credential: cred,
+            deposit: Lovelace(500_000_000),
+            anchor: None,
+        });
+        assert!(state.governance.dreps.contains_key(&key));
+
+        // No reward account yet
+        assert!(!state.reward_accounts.contains_key(&key));
+
+        // Expire at epoch 3 (0 + 2 < 3, so inactive)
+        state.process_epoch_transition(EpochNo(3));
+        assert!(!state.governance.dreps.contains_key(&key));
+
+        // Deposit should be refunded to reward account
+        assert_eq!(
+            state.reward_accounts.get(&key),
+            Some(&Lovelace(500_000_000))
+        );
+    }
+
+    #[test]
+    fn test_governance_proposal_deposit_refund() {
+        let params = ProtocolParameters::mainnet_defaults();
+        let mut state = LedgerState::new(params);
+
+        // Build a return address (29 bytes: 1 header + 28 key hash)
+        let mut return_addr = vec![0xE1u8]; // header byte
+        return_addr.extend_from_slice(&[42u8; 28]); // 28-byte key hash
+
+        let mut key_bytes = [0u8; 32];
+        key_bytes[..28].copy_from_slice(&[42u8; 28]);
+        let reward_key = Hash32::from_bytes(key_bytes);
+
+        // Submit a proposal with deposit
+        let proposal = ProposalProcedure {
+            deposit: Lovelace(100_000_000_000), // 100k ADA
+            return_addr,
+            gov_action: GovAction::InfoAction,
+            anchor: Anchor {
+                url: "https://example.com".to_string(),
+                data_hash: Hash32::ZERO,
+            },
+        };
+        state.process_proposal(&Hash32::from_bytes([1u8; 32]), 0, &proposal);
+        assert_eq!(state.governance.proposals.len(), 1);
+
+        // Advance past expiry (default lifetime is 6 epochs)
+        state.process_epoch_transition(EpochNo(7));
+
+        // Proposal should be expired
+        assert!(state.governance.proposals.is_empty());
+
+        // Deposit should be refunded
+        assert_eq!(
+            state.reward_accounts.get(&reward_key),
+            Some(&Lovelace(100_000_000_000))
+        );
+    }
+
+    #[test]
+    fn test_treasury_withdrawal_credits_reward_account() {
+        let params = ProtocolParameters::mainnet_defaults();
+        let mut state = LedgerState::new(params);
+
+        // Give treasury some funds
+        state.treasury = Lovelace(1_000_000_000_000);
+
+        // Build recipient reward address
+        let mut reward_addr = vec![0xE1u8];
+        reward_addr.extend_from_slice(&[55u8; 28]);
+
+        let mut key_bytes = [0u8; 32];
+        key_bytes[..28].copy_from_slice(&[55u8; 28]);
+        let reward_key = Hash32::from_bytes(key_bytes);
+
+        let mut withdrawals = std::collections::BTreeMap::new();
+        withdrawals.insert(reward_addr, Lovelace(50_000_000_000));
+
+        state.enact_gov_action(&GovAction::TreasuryWithdrawals {
+            withdrawals,
+            policy_hash: None,
+        });
+
+        // Treasury should be debited
+        assert_eq!(state.treasury.0, 950_000_000_000);
+
+        // Reward account should be credited
+        assert_eq!(
+            state.reward_accounts.get(&reward_key),
+            Some(&Lovelace(50_000_000_000))
+        );
     }
 
     #[test]

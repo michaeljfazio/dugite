@@ -60,6 +60,12 @@ pub enum ValidationError {
     UnexpectedScriptDataHash,
     #[error("Missing script data hash (required when scripts/redeemers present)")]
     MissingScriptDataHash,
+    #[error("Duplicate input in transaction: {0}")]
+    DuplicateInput(String),
+    #[error("Native script validation failed")]
+    NativeScriptFailed,
+    #[error("Witness signature verification failed for vkey: {0}")]
+    InvalidWitnessSignature(String),
 }
 
 /// Validate a transaction against the current UTxO set and protocol parameters
@@ -86,6 +92,16 @@ pub fn validate_transaction(
     // Rule 1: Must have at least one input
     if body.inputs.is_empty() {
         errors.push(ValidationError::NoInputs);
+    }
+
+    // Rule 1b: No duplicate inputs
+    {
+        let mut seen = HashSet::new();
+        for input in &body.inputs {
+            if !seen.insert(input) {
+                errors.push(ValidationError::DuplicateInput(input.to_string()));
+            }
+        }
     }
 
     // Rule 2: All inputs must exist in UTxO set
@@ -349,6 +365,57 @@ pub fn validate_transaction(
                     evaluate_plutus_scripts(tx, utxo_set, cost_models_cbor.as_deref(), max_ex, sc)
                 {
                     errors.push(ValidationError::ScriptFailed(e.to_string()));
+                }
+            }
+        }
+    }
+
+    // Rule 13: Native script validation
+    // All native scripts in the witness set must evaluate to true
+    if !tx.witness_set.native_scripts.is_empty() {
+        // Build set of signer key hashes from vkey witnesses
+        let signers: HashSet<Hash32> = tx
+            .witness_set
+            .vkey_witnesses
+            .iter()
+            .map(|w| {
+                // Hash the vkey to get the 28-byte key hash, then pad to Hash32
+                let kh = torsten_primitives::hash::blake2b_224(&w.vkey);
+                let mut bytes = [0u8; 32];
+                bytes[..28].copy_from_slice(kh.as_bytes());
+                Hash32::from_bytes(bytes)
+            })
+            .collect();
+        let slot = SlotNo(current_slot);
+
+        for script in &tx.witness_set.native_scripts {
+            if !evaluate_native_script(script, &signers, slot) {
+                errors.push(ValidationError::NativeScriptFailed);
+                break;
+            }
+        }
+    }
+
+    // Rule 14: Witness signature verification
+    // Each vkey witness must contain a valid Ed25519 signature over the tx body hash
+    if errors.is_empty() {
+        for witness in &tx.witness_set.vkey_witnesses {
+            if witness.vkey.len() == 32 && witness.signature.len() == 64 {
+                match torsten_crypto::keys::PaymentVerificationKey::from_bytes(&witness.vkey) {
+                    Ok(vk) => {
+                        if vk.verify(tx.hash.as_bytes(), &witness.signature).is_err() {
+                            errors.push(ValidationError::InvalidWitnessSignature(format!(
+                                "{:?}",
+                                &witness.vkey[..8]
+                            )));
+                        }
+                    }
+                    Err(_) => {
+                        errors.push(ValidationError::InvalidWitnessSignature(format!(
+                            "{:?}",
+                            &witness.vkey[..8.min(witness.vkey.len())]
+                        )));
+                    }
                 }
             }
         }
@@ -1440,5 +1507,83 @@ mod tests {
         assert!(errors
             .iter()
             .any(|e| matches!(e, ValidationError::MissingRequiredSigner(_))));
+    }
+
+    #[test]
+    fn test_duplicate_input() {
+        let (utxo_set, input) = make_simple_utxo_set();
+        let params = ProtocolParameters::mainnet_defaults();
+
+        let mut tx = make_simple_tx(input.clone(), 9_800_000, 200_000);
+        // Add the same input twice
+        tx.body.inputs.push(input);
+
+        let result = validate_transaction(&tx, &utxo_set, &params, 100, 300, None);
+        assert!(result.is_err());
+        let errors = result.unwrap_err();
+        assert!(errors
+            .iter()
+            .any(|e| matches!(e, ValidationError::DuplicateInput(_))));
+    }
+
+    #[test]
+    fn test_native_script_validation_in_tx() {
+        let (utxo_set, input) = make_simple_utxo_set();
+        let params = ProtocolParameters::mainnet_defaults();
+
+        let mut tx = make_simple_tx(input, 9_800_000, 200_000);
+        // Add a native script that requires a specific signer
+        let required_key = Hash32::from_bytes([0xBB; 32]);
+        tx.witness_set
+            .native_scripts
+            .push(NativeScript::ScriptPubkey(required_key));
+
+        // No vkey witnesses that satisfy the script => should fail
+        let result = validate_transaction(&tx, &utxo_set, &params, 100, 300, None);
+        assert!(result.is_err());
+        let errors = result.unwrap_err();
+        assert!(errors
+            .iter()
+            .any(|e| matches!(e, ValidationError::NativeScriptFailed)));
+    }
+
+    #[test]
+    fn test_native_script_timelock_in_tx() {
+        let (utxo_set, input) = make_simple_utxo_set();
+        let params = ProtocolParameters::mainnet_defaults();
+
+        let mut tx = make_simple_tx(input, 9_800_000, 200_000);
+        // Script that is invalid before slot 200
+        tx.witness_set
+            .native_scripts
+            .push(NativeScript::InvalidBefore(SlotNo(200)));
+
+        // Current slot is 100, before the validity window
+        let result = validate_transaction(&tx, &utxo_set, &params, 100, 300, None);
+        assert!(result.is_err());
+
+        // Current slot is 200, should pass
+        let result = validate_transaction(&tx, &utxo_set, &params, 200, 300, None);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_witness_signature_verification() {
+        let (utxo_set, input) = make_simple_utxo_set();
+        let params = ProtocolParameters::mainnet_defaults();
+
+        let mut tx = make_simple_tx(input, 9_800_000, 200_000);
+        // Add a witness with a valid key but wrong signature
+        tx.witness_set.vkey_witnesses.push(VKeyWitness {
+            vkey: vec![1u8; 32],      // dummy key
+            signature: vec![0u8; 64], // dummy (invalid) signature
+        });
+
+        let result = validate_transaction(&tx, &utxo_set, &params, 100, 300, None);
+        assert!(result.is_err());
+        let errors = result.unwrap_err();
+        assert!(errors
+            .iter()
+            .any(|e| matches!(e, ValidationError::InvalidWitnessSignature(_))));
     }
 }
