@@ -5,6 +5,7 @@ use tokio::signal;
 use tokio::sync::{watch, RwLock};
 use tracing::{debug, error, info, warn};
 
+use torsten_consensus::praos::BlockIssuerInfo;
 use torsten_consensus::OuroborosPraos;
 use torsten_ledger::LedgerState;
 use torsten_mempool::{Mempool, MempoolConfig};
@@ -1450,29 +1451,70 @@ impl Node {
             return;
         }
 
-        // Validate block headers BEFORE storing. Log warnings for validation
-        // failures. VRF/KES verification is not yet fully implemented, so
-        // failures are non-fatal to allow the node to continue syncing.
+        // Validate ALL block headers BEFORE storing.
+        // In strict mode (caught up to tip), validation failures reject the entire batch.
+        // In non-strict mode (during sync), failures are logged but non-fatal.
         let strict = self.consensus.strict_verification();
-        if let Some(last_block) = blocks.last() {
-            if last_block.era.is_shelley_based() {
-                // Populate epoch_nonce from ledger state — the deserialized header
-                // always carries Hash32::ZERO for epoch_nonce since the wire format
-                // does not include the nonce; it must be injected from ledger state
-                // before VRF verification.
-                let epoch_nonce = {
-                    let ls = self.ledger_state.read().await;
-                    ls.epoch_nonce
-                };
-                let mut header_with_nonce = last_block.header.clone();
+        {
+            // Read ledger state once for the whole batch
+            let ls = self.ledger_state.read().await;
+            let epoch_nonce = ls.epoch_nonce;
+
+            // Pre-compute total active stake for leader eligibility checks
+            let total_active_stake: u64 =
+                ls.stake_distribution.stake_map.values().map(|s| s.0).sum();
+
+            for block in &blocks {
+                if !block.era.is_shelley_based() {
+                    continue;
+                }
+
+                // Populate epoch_nonce — the wire format does not include the nonce;
+                // it must be injected from ledger state before VRF verification.
+                let mut header_with_nonce = block.header.clone();
                 header_with_nonce.epoch_nonce = epoch_nonce;
-                if let Err(e) = self
-                    .consensus
-                    .validate_header(&header_with_nonce, last_block.slot())
-                {
+
+                // Look up pool registration for VRF key binding and leader eligibility
+                let pool_id = torsten_primitives::hash::blake2b_224(&block.header.issuer_vkey);
+                let issuer_info = if !block.header.issuer_vkey.is_empty() {
+                    ls.pool_params.get(&pool_id).and_then(|pool_reg| {
+                        if total_active_stake == 0 {
+                            return None;
+                        }
+                        // Compute pool's relative stake
+                        let pool_stake: u64 = ls
+                            .delegations
+                            .iter()
+                            .filter(|(_, pid)| **pid == pool_id)
+                            .filter_map(|(cred, _)| {
+                                ls.stake_distribution.stake_map.get(cred).map(|s| s.0)
+                            })
+                            .sum();
+                        Some(BlockIssuerInfo {
+                            vrf_keyhash: pool_reg.vrf_keyhash,
+                            relative_stake: pool_stake as f64 / total_active_stake as f64,
+                        })
+                    })
+                } else {
+                    None
+                };
+
+                if let Err(e) = self.consensus.validate_header_full(
+                    &header_with_nonce,
+                    block.slot(),
+                    issuer_info.as_ref(),
+                ) {
+                    if strict {
+                        error!(
+                            slot = block.slot().0,
+                            block_no = block.block_number().0,
+                            "Consensus validation failed (strict): {e} — rejecting batch"
+                        );
+                        return;
+                    }
                     warn!(
-                        slot = last_block.slot().0,
-                        block_no = last_block.block_number().0,
+                        slot = block.slot().0,
+                        block_no = block.block_number().0,
                         "Consensus validation: {e}"
                     );
                 }
