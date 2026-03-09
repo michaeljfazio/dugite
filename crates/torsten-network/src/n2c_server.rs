@@ -246,7 +246,9 @@ fn handle_handshake(payload: &[u8]) -> Result<Option<Segment>, N2CServerError> {
     let network_magic = parse_handshake_magic(payload).unwrap_or(764824073); // mainnet default
     let (version, wire_version) = parse_highest_version(payload).unwrap_or((16, 16));
 
-    debug!("N2C handshake: accepting version {version} (wire: {wire_version}), magic {network_magic}");
+    debug!(
+        "N2C handshake: accepting version {version} (wire: {wire_version}), magic {network_magic}"
+    );
 
     // Encode accept response: [1, wire_version, [magic, false]]
     // Use wire_version to preserve bit-15 encoding if client sent it
