@@ -56,6 +56,10 @@ impl ImmutableDB {
         opts.create_if_missing(true);
         opts.set_compression_type(rocksdb::DBCompressionType::Lz4);
 
+        // Limit open file descriptors to avoid "too many open files" on macOS (default ulimit 256).
+        // RocksDB will use a table cache to manage SST file handles within this limit.
+        opts.set_max_open_files(128);
+
         // Performance tuning for block storage workload
         opts.set_write_buffer_size(128 * 1024 * 1024); // 128MB write buffer
         opts.set_max_write_buffer_number(3);
@@ -151,6 +155,14 @@ impl ImmutableDB {
         self.tip_slot = max_tip_slot;
 
         Ok(())
+    }
+
+    /// Trigger a manual compaction of the entire key range.
+    /// Useful during bulk import to consolidate SST files and reclaim space.
+    pub fn compact(&self) {
+        if let Some(db) = &self.db {
+            db.compact_range::<&[u8], &[u8]>(None, None);
+        }
     }
 
     fn put_block_inner(

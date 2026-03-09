@@ -429,6 +429,13 @@ fn import_chunk_files(extract_dir: &Path, database_path: &Path) -> Result<()> {
                 "Import progress"
             );
         }
+
+        // Compact every 500 chunks to consolidate SST files and avoid
+        // "too many open files" on systems with low ulimits (e.g. macOS default 256)
+        if *chunk_num % 500 == 0 && *chunk_num > 0 {
+            info!(chunk = chunk_num, "Triggering compaction...");
+            immutable_db.compact();
+        }
     }
 
     pb.finish_with_message("Import complete");
