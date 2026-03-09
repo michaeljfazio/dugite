@@ -41,6 +41,14 @@ pub enum QueryResult {
         data_hash: Vec<u8>,
         script_hash: Option<Vec<u8>>,
     },
+    /// Pool distribution: Map<pool_hash, IndividualPoolStake> (tag 21)
+    PoolDistr(Vec<StakePoolSnapshot>),
+    /// Stake delegation deposits: Map<Credential, Coin> (tag 22)
+    StakeDelegDeposits(Vec<StakeDelegDepositEntry>),
+    /// DRep stake distribution: Map<DRep, Coin> (tag 26)
+    DRepStakeDistr(Vec<DRepStakeEntry>),
+    /// Filtered vote delegatees: Map<Credential, DRep> (tag 28)
+    FilteredVoteDelegatees(Vec<VoteDelegateeEntry>),
     Error(String),
 }
 
@@ -254,6 +262,41 @@ pub struct NonMyopicRewardEntry {
     pub stake_amount: u64,
     /// Pool ID → estimated reward for this stake amount
     pub pool_rewards: Vec<(Vec<u8>, u64)>,
+}
+
+/// Stake delegation deposit entry for GetStakeDelegDeposits (tag 22)
+#[derive(Debug, Clone)]
+pub struct StakeDelegDepositEntry {
+    /// Stake credential hash (28 bytes)
+    pub credential_hash: Vec<u8>,
+    /// Credential type: 0=KeyHash, 1=ScriptHash
+    pub credential_type: u8,
+    /// Deposit amount in lovelace
+    pub deposit: u64,
+}
+
+/// DRep stake distribution entry for GetDRepStakeDistr (tag 26)
+#[derive(Debug, Clone)]
+pub struct DRepStakeEntry {
+    /// DRep type: 0=KeyHash, 1=ScriptHash, 2=AlwaysAbstain, 3=AlwaysNoConfidence
+    pub drep_type: u8,
+    /// DRep credential hash (28 bytes, None for AlwaysAbstain/AlwaysNoConfidence)
+    pub drep_hash: Option<Vec<u8>>,
+    /// Total delegated stake in lovelace
+    pub stake: u64,
+}
+
+/// Vote delegatee entry for GetFilteredVoteDelegatees (tag 28)
+#[derive(Debug, Clone)]
+pub struct VoteDelegateeEntry {
+    /// Stake credential hash (28 bytes)
+    pub credential_hash: Vec<u8>,
+    /// Credential type: 0=KeyHash, 1=ScriptHash
+    pub credential_type: u8,
+    /// DRep type: 0=KeyHash, 1=ScriptHash, 2=AlwaysAbstain, 3=AlwaysNoConfidence
+    pub drep_type: u8,
+    /// DRep credential hash (28 bytes, None for AlwaysAbstain/AlwaysNoConfidence)
+    pub drep_hash: Option<Vec<u8>>,
 }
 
 /// CompactGenesis snapshot for GetGenesisConfig (tag 11).
@@ -479,6 +522,12 @@ pub struct NodeStateSnapshot {
     pub security_param: u64,
     /// Full genesis config for GetGenesisConfig query (tag 11)
     pub genesis_config: Option<GenesisConfigSnapshot>,
+    /// Stake delegation deposits for GetStakeDelegDeposits (tag 22)
+    pub stake_deleg_deposits: Vec<StakeDelegDepositEntry>,
+    /// DRep stake distribution for GetDRepStakeDistr (tag 26)
+    pub drep_stake_distr: Vec<DRepStakeEntry>,
+    /// Vote delegatees for GetFilteredVoteDelegatees (tag 28)
+    pub vote_delegatees: Vec<VoteDelegateeEntry>,
 }
 
 impl Default for NodeStateSnapshot {
@@ -512,6 +561,9 @@ impl Default for NodeStateSnapshot {
             network_magic: 764824073, // Mainnet magic
             security_param: 2160,     // Mainnet security parameter
             genesis_config: None,
+            stake_deleg_deposits: Vec::new(),
+            drep_stake_distr: Vec::new(),
+            vote_delegatees: Vec::new(),
         }
     }
 }
@@ -1011,15 +1063,83 @@ impl QueryHandler {
                     QueryResult::PoolParams(filtered)
                 }
             }
-            // Tag 18: GetRewardInfoPools — not implemented
-            // Tag 19: GetPoolState — not implemented
+            // Tag 18: GetRewardInfoPools — not implemented (complex reward provenance data)
+            19 => {
+                // Tag 19: GetPoolState — returns pool params (same data as tag 17)
+                // Argument: tag(258) Set<KeyHash StakePool>
+                debug!("Query: GetPoolState");
+                let mut filter_pools: Vec<Vec<u8>> = Vec::new();
+                let _ = decoder.tag();
+                if let Ok(Some(n)) = decoder.array() {
+                    for _ in 0..n {
+                        if let Ok(bytes) = decoder.bytes() {
+                            filter_pools.push(bytes.to_vec());
+                        }
+                    }
+                }
+                if filter_pools.is_empty() {
+                    QueryResult::PoolParams(self.state.pool_params_entries.clone())
+                } else {
+                    let filtered = self
+                        .state
+                        .pool_params_entries
+                        .iter()
+                        .filter(|p| filter_pools.iter().any(|h| h == &p.pool_id))
+                        .cloned()
+                        .collect();
+                    QueryResult::PoolParams(filtered)
+                }
+            }
             20 => {
                 // Tag 20: GetStakeSnapshots
                 debug!("Query: GetStakeSnapshots");
                 QueryResult::StakeSnapshots(self.state.stake_snapshots.clone())
             }
-            // Tag 21: GetPoolDistr — not implemented
-            // Tag 22: GetStakeDelegDeposits — not implemented
+            21 => {
+                // Tag 21: GetPoolDistr — returns pool stake distribution
+                // Argument: tag(258) Set<KeyHash StakePool> (optional filter)
+                debug!("Query: GetPoolDistr");
+                let mut filter_pools: Vec<Vec<u8>> = Vec::new();
+                let _ = decoder.tag();
+                if let Ok(Some(n)) = decoder.array() {
+                    for _ in 0..n {
+                        if let Ok(bytes) = decoder.bytes() {
+                            filter_pools.push(bytes.to_vec());
+                        }
+                    }
+                }
+                if filter_pools.is_empty() {
+                    QueryResult::PoolDistr(self.state.stake_pools.clone())
+                } else {
+                    let filtered = self
+                        .state
+                        .stake_pools
+                        .iter()
+                        .filter(|p| filter_pools.iter().any(|h| h == &p.pool_id))
+                        .cloned()
+                        .collect();
+                    QueryResult::PoolDistr(filtered)
+                }
+            }
+            22 => {
+                // Tag 22: GetStakeDelegDeposits
+                // Argument: tag(258) Set<Credential>
+                // Returns: Map<Credential, Coin> — deposit amount per registered stake credential
+                debug!("Query: GetStakeDelegDeposits");
+                let filter_hashes = Self::parse_credential_set_static(decoder);
+                if filter_hashes.is_empty() {
+                    QueryResult::StakeDelegDeposits(self.state.stake_deleg_deposits.clone())
+                } else {
+                    let filtered = self
+                        .state
+                        .stake_deleg_deposits
+                        .iter()
+                        .filter(|d| filter_hashes.iter().any(|h| h == &d.credential_hash))
+                        .cloned()
+                        .collect();
+                    QueryResult::StakeDelegDeposits(filtered)
+                }
+            }
             23 => {
                 // Tag 23: GetConstitution
                 debug!("Query: GetConstitution");
@@ -1060,13 +1180,38 @@ impl QueryHandler {
                     QueryResult::DRepState(filtered)
                 }
             }
-            // Tag 26: GetDRepStakeDistr — not implemented
+            26 => {
+                // Tag 26: GetDRepStakeDistr
+                // Argument: tag(258) Set<DRep>
+                // Returns: Map<DRep, Coin> — total delegated stake per DRep
+                debug!("Query: GetDRepStakeDistr");
+                // Return all DRep stake distribution (filtering by DRep is complex, return all)
+                QueryResult::DRepStakeDistr(self.state.drep_stake_distr.clone())
+            }
             27 => {
                 // Tag 27: GetCommitteeMembersState
                 debug!("Query: GetCommitteeMembersState");
                 QueryResult::CommitteeState(self.state.committee.clone())
             }
-            // Tag 28: GetFilteredVoteDelegatees — not implemented
+            28 => {
+                // Tag 28: GetFilteredVoteDelegatees
+                // Argument: tag(258) Set<Credential>
+                // Returns: Map<Credential, DRep> — vote delegation for filtered credentials
+                debug!("Query: GetFilteredVoteDelegatees");
+                let filter_hashes = Self::parse_credential_set_static(decoder);
+                if filter_hashes.is_empty() {
+                    QueryResult::FilteredVoteDelegatees(self.state.vote_delegatees.clone())
+                } else {
+                    let filtered = self
+                        .state
+                        .vote_delegatees
+                        .iter()
+                        .filter(|v| filter_hashes.iter().any(|h| h == &v.credential_hash))
+                        .cloned()
+                        .collect();
+                    QueryResult::FilteredVoteDelegatees(filtered)
+                }
+            }
             29 => {
                 // Tag 29: GetAccountState (treasury + reserves)
                 debug!("Query: GetAccountState");
@@ -1535,6 +1680,167 @@ mod tests {
                 assert_eq!(params[0].relays.len(), 1);
             }
             other => panic!("Expected PoolParams, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_query_handler_pool_state() {
+        let mut handler = QueryHandler::new();
+        handler.update_state(NodeStateSnapshot {
+            pool_params_entries: vec![PoolParamsSnapshot {
+                pool_id: vec![0xcc; 28],
+                vrf_keyhash: vec![0xdd; 32],
+                pledge: 100_000_000,
+                cost: 170_000_000,
+                margin_num: 1,
+                margin_den: 100,
+                reward_account: vec![0xe0; 29],
+                owners: vec![vec![0x11; 28]],
+                relays: vec![],
+                metadata_url: None,
+                metadata_hash: None,
+            }],
+            ..Default::default()
+        });
+
+        // Tag 19: GetPoolState returns same format as PoolParams
+        match query(&handler, 19) {
+            QueryResult::PoolParams(params) => {
+                assert_eq!(params.len(), 1);
+                assert_eq!(params[0].pool_id, vec![0xcc; 28]);
+            }
+            other => panic!("Expected PoolParams, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_query_handler_pool_distr() {
+        let mut handler = QueryHandler::new();
+        handler.update_state(NodeStateSnapshot {
+            stake_pools: vec![
+                StakePoolSnapshot {
+                    pool_id: vec![0xaa; 28],
+                    stake: 1_000_000_000,
+                    vrf_keyhash: vec![0x11; 32],
+                    total_active_stake: 3_000_000_000,
+                },
+                StakePoolSnapshot {
+                    pool_id: vec![0xbb; 28],
+                    stake: 2_000_000_000,
+                    vrf_keyhash: vec![0x22; 32],
+                    total_active_stake: 3_000_000_000,
+                },
+            ],
+            ..Default::default()
+        });
+
+        // Tag 21: GetPoolDistr
+        match query(&handler, 21) {
+            QueryResult::PoolDistr(pools) => {
+                assert_eq!(pools.len(), 2);
+            }
+            other => panic!("Expected PoolDistr, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_query_handler_stake_deleg_deposits() {
+        let mut handler = QueryHandler::new();
+        handler.update_state(NodeStateSnapshot {
+            stake_deleg_deposits: vec![
+                StakeDelegDepositEntry {
+                    credential_hash: vec![0xaa; 28],
+                    credential_type: 0,
+                    deposit: 2_000_000,
+                },
+                StakeDelegDepositEntry {
+                    credential_hash: vec![0xbb; 28],
+                    credential_type: 0,
+                    deposit: 2_000_000,
+                },
+            ],
+            ..Default::default()
+        });
+
+        // Tag 22: GetStakeDelegDeposits
+        match query(&handler, 22) {
+            QueryResult::StakeDelegDeposits(deposits) => {
+                assert_eq!(deposits.len(), 2);
+                assert_eq!(deposits[0].deposit, 2_000_000);
+            }
+            other => panic!("Expected StakeDelegDeposits, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_query_handler_drep_stake_distr() {
+        let mut handler = QueryHandler::new();
+        handler.update_state(NodeStateSnapshot {
+            drep_stake_distr: vec![
+                DRepStakeEntry {
+                    drep_type: 0,
+                    drep_hash: Some(vec![0xdd; 28]),
+                    stake: 500_000_000,
+                },
+                DRepStakeEntry {
+                    drep_type: 2,
+                    drep_hash: None,
+                    stake: 100_000_000,
+                },
+            ],
+            ..Default::default()
+        });
+
+        // Tag 26: GetDRepStakeDistr
+        match query(&handler, 26) {
+            QueryResult::DRepStakeDistr(entries) => {
+                assert_eq!(entries.len(), 2);
+                assert_eq!(entries[0].stake, 500_000_000);
+            }
+            other => panic!("Expected DRepStakeDistr, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_query_handler_filtered_vote_delegatees() {
+        let mut handler = QueryHandler::new();
+        handler.update_state(NodeStateSnapshot {
+            vote_delegatees: vec![
+                VoteDelegateeEntry {
+                    credential_hash: vec![0xaa; 28],
+                    credential_type: 0,
+                    drep_type: 0,
+                    drep_hash: Some(vec![0xdd; 28]),
+                },
+                VoteDelegateeEntry {
+                    credential_hash: vec![0xbb; 28],
+                    credential_type: 0,
+                    drep_type: 2,
+                    drep_hash: None,
+                },
+            ],
+            ..Default::default()
+        });
+
+        // Tag 28: GetFilteredVoteDelegatees
+        match query(&handler, 28) {
+            QueryResult::FilteredVoteDelegatees(delegatees) => {
+                assert_eq!(delegatees.len(), 2);
+                assert_eq!(delegatees[0].drep_type, 0);
+                assert_eq!(delegatees[1].drep_type, 2);
+            }
+            other => panic!("Expected FilteredVoteDelegatees, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_query_handler_unsupported_tag() {
+        let handler = QueryHandler::new();
+        match query(&handler, 99) {
+            QueryResult::Error(msg) => {
+                assert!(msg.contains("99"));
+            }
+            other => panic!("Expected Error, got {other:?}"),
         }
     }
 }

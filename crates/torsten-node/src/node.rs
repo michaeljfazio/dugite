@@ -1752,9 +1752,10 @@ impl Node {
 
     async fn update_query_state(&self) {
         use torsten_network::query_handler::{
-            CommitteeMemberSnapshot, CommitteeSnapshot, DRepSnapshot, GenesisConfigSnapshot,
-            PoolParamsSnapshot, PoolStakeSnapshotEntry, ProposalSnapshot, ShelleyPParamsSnapshot,
-            StakeAddressSnapshot, StakePoolSnapshot, StakeSnapshotsResult,
+            CommitteeMemberSnapshot, CommitteeSnapshot, DRepSnapshot, DRepStakeEntry,
+            GenesisConfigSnapshot, PoolParamsSnapshot, PoolStakeSnapshotEntry, ProposalSnapshot,
+            ShelleyPParamsSnapshot, StakeAddressSnapshot, StakeDelegDepositEntry,
+            StakePoolSnapshot, StakeSnapshotsResult, VoteDelegateeEntry,
         };
 
         let ls = self.ledger_state.read().await;
@@ -2087,6 +2088,80 @@ impl Node {
             pvt_pp_security_group_den: pp.pvt_pp_security_group.denominator,
         };
 
+        // Build stake delegation deposits (registered stake credentials → key_deposit)
+        let key_deposit = ls.protocol_params.key_deposit.0;
+        let stake_deleg_deposits: Vec<StakeDelegDepositEntry> = ls
+            .reward_accounts
+            .keys()
+            .map(|cred_hash| StakeDelegDepositEntry {
+                credential_hash: cred_hash.as_ref()[..28].to_vec(),
+                credential_type: 0, // KeyHash (we don't distinguish script creds yet)
+                deposit: key_deposit,
+            })
+            .collect();
+
+        // Build DRep stake distribution (DRep → total delegated stake)
+        let drep_stake_distr: Vec<DRepStakeEntry> = {
+            use torsten_primitives::transaction::DRep;
+            let mut drep_stakes: std::collections::HashMap<String, (u8, Option<Vec<u8>>, u64)> =
+                std::collections::HashMap::new();
+            for (stake_cred, drep) in &ls.governance.vote_delegations {
+                let stake = ls
+                    .stake_distribution
+                    .stake_map
+                    .get(stake_cred)
+                    .map(|l| l.0)
+                    .unwrap_or(0);
+                let (key, drep_type, drep_hash) = match drep {
+                    DRep::KeyHash(h) => {
+                        let hb = h.as_ref()[..28].to_vec();
+                        (format!("0:{}", hex::encode(&hb)), 0u8, Some(hb))
+                    }
+                    DRep::ScriptHash(h) => {
+                        let hb = h.as_ref().to_vec();
+                        (format!("1:{}", hex::encode(&hb)), 1u8, Some(hb))
+                    }
+                    DRep::Abstain => ("2:abstain".to_string(), 2u8, None),
+                    DRep::NoConfidence => ("3:noconf".to_string(), 3u8, None),
+                };
+                let entry = drep_stakes
+                    .entry(key)
+                    .or_insert((drep_type, drep_hash.clone(), 0));
+                entry.2 += stake;
+            }
+            drep_stakes
+                .into_values()
+                .map(|(drep_type, drep_hash, stake)| DRepStakeEntry {
+                    drep_type,
+                    drep_hash,
+                    stake,
+                })
+                .collect()
+        };
+
+        // Build vote delegatee entries
+        let vote_delegatees: Vec<VoteDelegateeEntry> = {
+            use torsten_primitives::transaction::DRep;
+            ls.governance
+                .vote_delegations
+                .iter()
+                .map(|(stake_cred, drep)| {
+                    let (drep_type, drep_hash) = match drep {
+                        DRep::KeyHash(h) => (0u8, Some(h.as_ref()[..28].to_vec())),
+                        DRep::ScriptHash(h) => (1u8, Some(h.as_ref().to_vec())),
+                        DRep::Abstain => (2u8, None),
+                        DRep::NoConfidence => (3u8, None),
+                    };
+                    VoteDelegateeEntry {
+                        credential_hash: stake_cred.as_ref()[..28].to_vec(),
+                        credential_type: 0, // KeyHash
+                        drep_type,
+                        drep_hash,
+                    }
+                })
+                .collect()
+        };
+
         let snapshot = NodeStateSnapshot {
             tip: ls.tip.clone(),
             epoch: ls.epoch,
@@ -2133,6 +2208,9 @@ impl Node {
             slot_length_secs: 1, // Shelley slot length is always 1 second
             network_magic: self.network_magic as u32,
             security_param: self.consensus.security_param,
+            stake_deleg_deposits,
+            drep_stake_distr,
+            vote_delegatees,
             genesis_config: self.shelley_genesis.as_ref().map(|g| {
                 let gp = &g.protocol_params;
                 // Convert a0 from f64 to rational

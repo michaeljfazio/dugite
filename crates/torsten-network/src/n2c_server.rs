@@ -1951,6 +1951,79 @@ fn encode_query_result(result: &QueryResult) -> Vec<u8> {
                 enc.null().ok();
             }
         }
+        QueryResult::PoolDistr(pools) => {
+            // Wire format: Map<pool_hash(28), IndividualPoolStake>
+            // IndividualPoolStake: array(2) [tag(30)[num,den], vrf_hash(32)]
+            enc.map(pools.len() as u64).ok();
+            for pool in pools {
+                enc.bytes(&pool.pool_id).ok();
+                enc.array(2).ok();
+                // Rational as tag(30) [numerator, denominator]
+                enc.tag(minicbor::data::Tag::new(30)).ok();
+                enc.array(2).ok();
+                enc.u64(pool.stake).ok();
+                enc.u64(pool.total_active_stake.max(1)).ok();
+                enc.bytes(&pool.vrf_keyhash).ok();
+            }
+        }
+        QueryResult::StakeDelegDeposits(deposits) => {
+            // Wire format: Map<Credential, Coin>
+            // Credential: [0|1, hash(28)]
+            enc.map(deposits.len() as u64).ok();
+            for entry in deposits {
+                enc.array(2).ok();
+                enc.u8(entry.credential_type).ok();
+                enc.bytes(&entry.credential_hash).ok();
+                enc.u64(entry.deposit).ok();
+            }
+        }
+        QueryResult::DRepStakeDistr(entries) => {
+            // Wire format: Map<DRep, Coin>
+            // DRep: [0, keyhash(28)] | [1, scripthash(28)] | [2] | [3]
+            enc.map(entries.len() as u64).ok();
+            for entry in entries {
+                match entry.drep_type {
+                    0 | 1 => {
+                        enc.array(2).ok();
+                        enc.u8(entry.drep_type).ok();
+                        if let Some(ref h) = entry.drep_hash {
+                            enc.bytes(h).ok();
+                        }
+                    }
+                    _ => {
+                        enc.array(1).ok();
+                        enc.u8(entry.drep_type).ok();
+                    }
+                }
+                enc.u64(entry.stake).ok();
+            }
+        }
+        QueryResult::FilteredVoteDelegatees(delegatees) => {
+            // Wire format: Map<Credential, DRep>
+            // Credential: [0|1, hash(28)]
+            // DRep: [0, keyhash(28)] | [1, scripthash(28)] | [2] | [3]
+            enc.map(delegatees.len() as u64).ok();
+            for entry in delegatees {
+                // Key: Credential
+                enc.array(2).ok();
+                enc.u8(entry.credential_type).ok();
+                enc.bytes(&entry.credential_hash).ok();
+                // Value: DRep
+                match entry.drep_type {
+                    0 | 1 => {
+                        enc.array(2).ok();
+                        enc.u8(entry.drep_type).ok();
+                        if let Some(ref h) = entry.drep_hash {
+                            enc.bytes(h).ok();
+                        }
+                    }
+                    _ => {
+                        enc.array(1).ok();
+                        enc.u8(entry.drep_type).ok();
+                    }
+                }
+            }
+        }
         QueryResult::Error(msg) => {
             enc.str(msg).ok();
         }
@@ -2807,5 +2880,83 @@ mod tests {
         assert_eq!(dec.array().unwrap(), Some(2));
         assert_eq!(dec.map().unwrap(), Some(0));
         assert_eq!(dec.map().unwrap(), Some(0));
+    }
+
+    #[test]
+    fn test_encode_query_result_pool_distr() {
+        use crate::query_handler::StakePoolSnapshot;
+        let result = QueryResult::PoolDistr(vec![StakePoolSnapshot {
+            pool_id: vec![0xaa; 28],
+            stake: 1_000_000_000,
+            vrf_keyhash: vec![0x11; 32],
+            total_active_stake: 3_000_000_000,
+        }]);
+        let cbor = encode_query_result(&result);
+        assert!(!cbor.is_empty());
+        // [4, [1, map(1)]]
+        let mut dec = minicbor::Decoder::new(&cbor);
+        assert_eq!(dec.array().unwrap(), Some(2)); // MsgResult wrapper
+        assert_eq!(dec.u32().unwrap(), 4); // MsgResult tag
+        assert_eq!(dec.array().unwrap(), Some(1)); // HFC success wrapper
+        assert_eq!(dec.map().unwrap(), Some(1)); // 1 pool
+    }
+
+    #[test]
+    fn test_encode_query_result_stake_deleg_deposits() {
+        use crate::query_handler::StakeDelegDepositEntry;
+        let result = QueryResult::StakeDelegDeposits(vec![StakeDelegDepositEntry {
+            credential_hash: vec![0xaa; 28],
+            credential_type: 0,
+            deposit: 2_000_000,
+        }]);
+        let cbor = encode_query_result(&result);
+        assert!(!cbor.is_empty());
+        let mut dec = minicbor::Decoder::new(&cbor);
+        assert_eq!(dec.array().unwrap(), Some(2));
+        assert_eq!(dec.u32().unwrap(), 4);
+        assert_eq!(dec.array().unwrap(), Some(1));
+        assert_eq!(dec.map().unwrap(), Some(1));
+    }
+
+    #[test]
+    fn test_encode_query_result_drep_stake_distr() {
+        use crate::query_handler::DRepStakeEntry;
+        let result = QueryResult::DRepStakeDistr(vec![
+            DRepStakeEntry {
+                drep_type: 0,
+                drep_hash: Some(vec![0xdd; 28]),
+                stake: 500_000_000,
+            },
+            DRepStakeEntry {
+                drep_type: 2,
+                drep_hash: None,
+                stake: 100_000_000,
+            },
+        ]);
+        let cbor = encode_query_result(&result);
+        assert!(!cbor.is_empty());
+        let mut dec = minicbor::Decoder::new(&cbor);
+        assert_eq!(dec.array().unwrap(), Some(2));
+        assert_eq!(dec.u32().unwrap(), 4);
+        assert_eq!(dec.array().unwrap(), Some(1));
+        assert_eq!(dec.map().unwrap(), Some(2));
+    }
+
+    #[test]
+    fn test_encode_query_result_filtered_vote_delegatees() {
+        use crate::query_handler::VoteDelegateeEntry;
+        let result = QueryResult::FilteredVoteDelegatees(vec![VoteDelegateeEntry {
+            credential_hash: vec![0xaa; 28],
+            credential_type: 0,
+            drep_type: 0,
+            drep_hash: Some(vec![0xdd; 28]),
+        }]);
+        let cbor = encode_query_result(&result);
+        assert!(!cbor.is_empty());
+        let mut dec = minicbor::Decoder::new(&cbor);
+        assert_eq!(dec.array().unwrap(), Some(2));
+        assert_eq!(dec.u32().unwrap(), 4);
+        assert_eq!(dec.array().unwrap(), Some(1));
+        assert_eq!(dec.map().unwrap(), Some(1));
     }
 }
