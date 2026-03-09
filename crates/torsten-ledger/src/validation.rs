@@ -203,8 +203,14 @@ pub fn validate_transaction(
     }
 
     // Rule 5: All outputs must meet minimum UTxO value
-    let min_utxo = params.min_utxo_value();
+    // Use per-output size-based minimum when raw CBOR is available
+    let default_min_utxo = params.min_utxo_value();
     for output in &body.outputs {
+        let min_utxo = if let Some(ref cbor) = output.raw_cbor {
+            params.min_utxo_for_output_size(cbor.len() as u64)
+        } else {
+            default_min_utxo
+        };
         if output.value.coin.0 < min_utxo.0 {
             errors.push(ValidationError::OutputTooSmall {
                 minimum: min_utxo.0,

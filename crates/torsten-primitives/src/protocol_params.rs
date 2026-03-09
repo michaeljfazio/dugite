@@ -90,9 +90,18 @@ impl ProtocolParameters {
     }
 
     /// Calculate minimum UTxO value (ada-only)
+    /// Minimum UTxO for a simple ADA-only output (no multi-assets, no datum)
     pub fn min_utxo_value(&self) -> Lovelace {
-        // Minimum UTxO for a simple ada-only output (roughly 29 bytes overhead)
-        Lovelace(self.ada_per_utxo_byte.0 * 29)
+        // Babbage formula: coins_per_utxo_byte * (160 + output_size)
+        // Simple ADA-only output is ~29 bytes serialized
+        Lovelace(self.ada_per_utxo_byte.0 * (160 + 29))
+    }
+
+    /// Minimum UTxO for an output with a specific serialized size.
+    /// Uses the Babbage/Conway formula: coins_per_utxo_byte * (160 + output_size)
+    /// where 160 is the constant overhead for the UTxO entry itself.
+    pub fn min_utxo_for_output_size(&self, output_size_bytes: u64) -> Lovelace {
+        Lovelace(self.ada_per_utxo_byte.0 * (160 + output_size_bytes))
     }
 
     /// Default mainnet parameters (Conway era, approximate)
