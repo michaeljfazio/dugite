@@ -92,7 +92,7 @@ pub fn evaluate_plutus_scripts(
                 None => {
                     warn!(
                         input = %input,
-                        "Missing raw CBOR for UTxO output, skipping Plutus evaluation"
+                        "Missing raw CBOR for UTxO output"
                     );
                     return Err(PlutusError::MissingOutputCbor(input.to_string()));
                 }

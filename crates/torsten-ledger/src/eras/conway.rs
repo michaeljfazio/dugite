@@ -16,7 +16,7 @@
 /// 1. Proposal submitted in a transaction → stored in `governance.proposals`
 /// 2. Votes cast by DReps, CC members, and SPOs → tallied per proposal
 /// 3. At epoch boundary, expired proposals are removed
-/// 4. Ratified proposals are enacted (not yet implemented)
+/// 4. Ratified proposals are enacted at epoch boundary
 #[derive(Default)]
 pub struct ConwayLedger;
 

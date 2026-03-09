@@ -61,6 +61,12 @@ enum TxSubcommand {
         /// Node socket path
         #[arg(long, default_value = "node.sock")]
         socket_path: PathBuf,
+        /// Use mainnet (default)
+        #[arg(long)]
+        mainnet: bool,
+        /// Testnet network magic
+        #[arg(long)]
+        testnet_magic: Option<u64>,
     },
     /// Calculate transaction hash
     #[command(name = "txid")]
@@ -577,6 +583,8 @@ impl TransactionCmd {
             TxSubcommand::Submit {
                 tx_file,
                 socket_path,
+                testnet_magic,
+                ..
             } => {
                 // Read signed transaction
                 let content = std::fs::read_to_string(&tx_file)?;
@@ -597,9 +605,9 @@ impl TransactionCmd {
                         .await
                         .map_err(|e| anyhow::anyhow!("Cannot connect to node socket: {e}"))?;
 
-                    // Handshake (use mainnet magic by default, will be negotiated)
+                    let magic = testnet_magic.unwrap_or(764824073);
                     client
-                        .handshake(764824073)
+                        .handshake(magic)
                         .await
                         .map_err(|e| anyhow::anyhow!("Handshake failed: {e}"))?;
 
