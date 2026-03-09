@@ -1408,6 +1408,7 @@ impl Node {
                 deposit: drep.deposit.0,
                 anchor_url: drep.anchor.as_ref().map(|a| a.url.clone()),
                 registered_epoch: drep.registered_epoch.0,
+                active_until_epoch: drep.registered_epoch.0 + ls.protocol_params.drep_activity,
             })
             .collect();
 
@@ -1682,6 +1683,7 @@ impl Node {
             epoch_length: ls.epoch_length,
             slot_length_secs: 1, // Shelley slot length is always 1 second
             network_magic: self.network_magic as u32,
+            security_param: self.consensus.security_param,
         };
 
         // Drop the ledger read lock before acquiring the query handler write lock

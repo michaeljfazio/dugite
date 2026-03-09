@@ -243,6 +243,8 @@ pub struct DRepSnapshot {
     pub deposit: u64,
     pub anchor_url: Option<String>,
     pub registered_epoch: u64,
+    /// Epoch until which this DRep is active (registered_epoch + drep_activity)
+    pub active_until_epoch: u64,
 }
 
 /// Snapshot of governance state
@@ -327,6 +329,8 @@ pub struct NodeStateSnapshot {
     pub slot_length_secs: u64,
     /// Network magic number
     pub network_magic: u32,
+    /// Security parameter (k)
+    pub security_param: u64,
 }
 
 impl Default for NodeStateSnapshot {
@@ -355,6 +359,7 @@ impl Default for NodeStateSnapshot {
             epoch_length: 432000,     // Mainnet default
             slot_length_secs: 1,      // Shelley slot length
             network_magic: 764824073, // Mainnet magic
+            security_param: 2160,     // Mainnet security parameter
         }
     }
 }
@@ -683,7 +688,7 @@ impl QueryHandler {
                     network_magic: self.state.network_magic,
                     epoch_length: self.state.epoch_length,
                     slot_length_secs: self.state.slot_length_secs,
-                    security_param: 2160,
+                    security_param: self.state.security_param,
                 }
             }
             13 => {
@@ -1017,6 +1022,7 @@ mod tests {
                 deposit: 500_000_000,
                 anchor_url: Some("https://example.com/drep".to_string()),
                 registered_epoch: 42,
+                active_until_epoch: 62,
             }],
             ..Default::default()
         });

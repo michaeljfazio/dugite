@@ -1390,7 +1390,7 @@ fn encode_query_result(result: &QueryResult) -> Vec<u8> {
         QueryResult::DRepState(dreps) => {
             enc.array(dreps.len() as u64).ok();
             for drep in dreps {
-                enc.map(4).ok();
+                enc.map(5).ok();
                 enc.str("credential").ok();
                 enc.bytes(&drep.credential_hash).ok();
                 enc.str("deposit").ok();
@@ -1403,6 +1403,8 @@ fn encode_query_result(result: &QueryResult) -> Vec<u8> {
                 }
                 enc.str("registered_epoch").ok();
                 enc.u64(drep.registered_epoch).ok();
+                enc.str("active_until_epoch").ok();
+                enc.u64(drep.active_until_epoch).ok();
             }
         }
         QueryResult::CommitteeState(committee) => {
@@ -1820,6 +1822,7 @@ mod tests {
             deposit: 500_000_000,
             anchor_url: Some("https://example.com".to_string()),
             registered_epoch: 42,
+            active_until_epoch: 62,
         }]);
         let cbor = encode_query_result(&result);
         assert!(!cbor.is_empty());
