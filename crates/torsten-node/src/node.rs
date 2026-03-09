@@ -1326,6 +1326,13 @@ impl Node {
                 self.metrics.set_utxo_count(ls.utxo_set.len() as u64);
                 self.metrics.set_sync_progress(progress);
                 self.metrics.set_mempool_count(self.mempool.len() as u64);
+                self.metrics.delegation_count.store(
+                    ls.delegations.len() as u64,
+                    std::sync::atomic::Ordering::Relaxed,
+                );
+                self.metrics
+                    .treasury_lovelace
+                    .store(ls.treasury.0, std::sync::atomic::Ordering::Relaxed);
                 info!(
                     "Syncing {progress:.2}% | slot {slot}/{tip_slot} | block {block_no}/{tip_block} | epoch {} | {blocks_per_sec:.0} blocks/s | {} UTxOs | {blocks_remaining} blocks remaining",
                     ls.epoch.0,
@@ -1711,6 +1718,10 @@ impl Node {
     /// Handle a chain rollback: roll back ChainDB, reload ledger state from snapshot,
     /// and replay blocks from the snapshot up to the rollback point.
     async fn handle_rollback(&self, rollback_point: &Point) {
+        self.metrics
+            .rollback_count
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+
         // 1. Roll back ChainDB
         {
             let mut db = self.chain_db.write().await;
@@ -1912,6 +1923,9 @@ impl Node {
                 // Update consensus tip
                 self.consensus.update_tip(block.tip());
 
+                self.metrics
+                    .blocks_forged
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 info!(
                     slot = next_slot.0,
                     block_number = block_number.0,
@@ -1919,7 +1933,6 @@ impl Node {
                     "Forged block applied to local chain"
                 );
 
-                // Announce the new block to all connected peers
                 // Announce the new block to all connected peers
                 if let Some(ref tx) = self.block_announcement_tx {
                     let mut hash_bytes = [0u8; 32];

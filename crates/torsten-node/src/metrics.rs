@@ -19,6 +19,10 @@ pub struct NodeMetrics {
     pub utxo_count: AtomicU64,
     pub mempool_tx_count: AtomicU64,
     pub mempool_bytes: AtomicU64,
+    pub rollback_count: AtomicU64,
+    pub blocks_forged: AtomicU64,
+    pub delegation_count: AtomicU64,
+    pub treasury_lovelace: AtomicU64,
 }
 
 impl NodeMetrics {
@@ -37,6 +41,10 @@ impl NodeMetrics {
             utxo_count: AtomicU64::new(0),
             mempool_tx_count: AtomicU64::new(0),
             mempool_bytes: AtomicU64::new(0),
+            rollback_count: AtomicU64::new(0),
+            blocks_forged: AtomicU64::new(0),
+            delegation_count: AtomicU64::new(0),
+            treasury_lovelace: AtomicU64::new(0),
         }
     }
 
@@ -142,6 +150,26 @@ impl NodeMetrics {
                 "torsten_mempool_bytes",
                 "Size of mempool in bytes",
                 &self.mempool_bytes,
+            ),
+            (
+                "torsten_rollback_count_total",
+                "Total number of chain rollbacks",
+                &self.rollback_count,
+            ),
+            (
+                "torsten_blocks_forged_total",
+                "Total blocks forged by this node",
+                &self.blocks_forged,
+            ),
+            (
+                "torsten_delegation_count",
+                "Number of active stake delegations",
+                &self.delegation_count,
+            ),
+            (
+                "torsten_treasury_lovelace",
+                "Total lovelace in the treasury",
+                &self.treasury_lovelace,
             ),
         ];
 
