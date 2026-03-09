@@ -2334,6 +2334,11 @@ impl Node {
     async fn handle_rollback(&self, rollback_point: &Point) {
         let rollback_slot = rollback_point.slot().map(|s| s.0).unwrap_or(0);
 
+        // Count every rollback event for observability, even no-ops.
+        self.metrics
+            .rollback_count
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+
         // If the rollback point is at or beyond our ledger tip, it's a no-op.
         // This commonly happens after reconnection when the server confirms
         // the intersection by sending a RollBackward to the same point.
@@ -2348,10 +2353,6 @@ impl Node {
                 return;
             }
         }
-
-        self.metrics
-            .rollback_count
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
         // 1. Roll back ChainDB
         {
