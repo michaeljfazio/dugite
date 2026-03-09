@@ -67,6 +67,10 @@ torsten_peers_connected 8
 | `torsten_utxo_count` | gauge | Number of entries in the UTxO set |
 | `torsten_mempool_tx_count` | gauge | Number of transactions in the mempool |
 | `torsten_mempool_bytes` | gauge | Size of the mempool in bytes |
+| `torsten_rollback_count_total` | gauge | Total number of chain rollbacks |
+| `torsten_blocks_forged_total` | gauge | Total blocks forged by this node |
+| `torsten_delegation_count` | gauge | Number of active stake delegations |
+| `torsten_treasury_lovelace` | gauge | Total lovelace in the treasury |
 
 ## Prometheus Configuration
 
@@ -95,6 +99,10 @@ You can create a Grafana dashboard to visualize Torsten metrics. Key panels to c
 - **Mempool Size:** `torsten_mempool_tx_count`
 - **Connected Peers:** `torsten_peers_connected`
 - **Transaction Rejection Rate:** `rate(torsten_transactions_rejected_total[5m])`
+- **Blocks Forged:** `torsten_blocks_forged_total`
+- **Rollback Count:** `torsten_rollback_count_total`
+- **Active Delegations:** `torsten_delegation_count`
+- **Treasury Balance:** `torsten_treasury_lovelace / 1e6` (in ADA)
 
 ## Console Logging
 
