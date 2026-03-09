@@ -16,6 +16,7 @@ flowchart TB
 
     subgraph N2C ["Node-to-Client (Unix Socket)"]
         HSC[Handshake]
+        LCS[LocalChainSync<br/>Block Delivery]
         LSQ[LocalStateQuery<br/>Ledger Queries]
         LTS[LocalTxSubmission<br/>Submit Transactions]
         LTM[LocalTxMonitor<br/>Mempool Queries]
@@ -127,25 +128,34 @@ N2C connections use Unix domain sockets and serve local clients (wallets, CLI to
 
 Supports a wide range of ledger queries:
 
-| Query | Description |
-|-------|-------------|
-| Chain tip | Current slot, hash, block number |
-| Current epoch | Active epoch number |
-| Current era | Active era (Byron through Conway) |
-| Block number | Current chain height |
-| System start | Network genesis time |
-| Protocol parameters | Live protocol parameters |
-| UTxO by address | UTxO set filtered by address |
-| Stake distribution | Pool stake and pledge |
-| Stake address info | Delegation and rewards |
-| DRep state | Registered DReps |
-| Committee state | Constitutional committee members |
-| Governance state | Active proposals and votes |
-| Stake snapshot | Mark/set/go snapshots |
-| Pool parameters | Registered pool parameters |
-| Account state | Treasury and reserves |
-| Genesis config | System start, epoch length, slot length, security param |
-| Non-myopic rewards | Estimated rewards per pool for given stake amounts |
+| Query | Tag | Description |
+|-------|-----|-------------|
+| Chain tip | 0 | Current slot, hash, block number |
+| Current epoch | 1 | Active epoch number |
+| Current era | -- | Active era (Byron through Conway) |
+| Block number | -- | Current chain height |
+| System start | -- | Network genesis time |
+| Protocol parameters | 2 | Live protocol parameters |
+| Proposed PP updates | 4 | Proposed parameter updates (empty in Conway) |
+| Stake distribution | 5 | Pool stake and pledge |
+| UTxO by address | 6 | UTxO set filtered by address |
+| Stake address info | 10 | Delegation and rewards |
+| Genesis config | 11 | System start, epoch length, slot length, security param |
+| UTxO by TxIn | 15 | UTxO set filtered by transaction inputs |
+| Stake pools | 16 | Set of registered pool key hashes |
+| Pool parameters | 17 | Registered pool parameters |
+| Pool state | 19 | Pool state (same as pool parameters) |
+| Stake snapshots | 20 | Mark/set/go snapshots |
+| Pool distribution | 21 | Pool stake distribution with VRF keys |
+| Stake deleg deposits | 22 | Deposit amounts per registered stake credential |
+| Constitution | 23 | Constitution anchor and guardrail script |
+| Governance state | 24 | Active proposals, committee, and voting state |
+| DRep state | 25 | Registered DReps with delegators |
+| DRep stake distr | 26 | Total delegated stake per DRep |
+| Committee state | 27 | Constitutional committee members |
+| Vote delegatees | 28 | Vote delegation map per credential |
+| Account state | 29 | Treasury and reserves |
+| Non-myopic rewards | 6* | Estimated rewards per pool for given stake amounts |
 
 The query protocol uses an acquire/query/release pattern:
 1. `MsgAcquire` -- Lock the ledger state at the current tip
