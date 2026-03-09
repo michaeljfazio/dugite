@@ -511,9 +511,10 @@ impl ConwayGenesis {
         params.dvt_constitution = float_to_rational(dvt.update_to_constitution);
         params.dvt_hard_fork = float_to_rational(dvt.hard_fork_initiation);
         params.dvt_treasury_withdrawal = float_to_rational(dvt.treasury_withdrawal);
-        // ppParamChange uses the average of network/economic/technical/gov group thresholds
-        // In practice, the protocol uses the most restrictive of the group thresholds
-        params.dvt_p_param_change = float_to_rational(dvt.pp_gov_group);
+        params.dvt_pp_network_group = float_to_rational(dvt.pp_network_group);
+        params.dvt_pp_economic_group = float_to_rational(dvt.pp_economic_group);
+        params.dvt_pp_technical_group = float_to_rational(dvt.pp_technical_group);
+        params.dvt_pp_gov_group = float_to_rational(dvt.pp_gov_group);
 
         if let Some(cost) = self.min_fee_ref_script_cost_per_byte {
             params.min_fee_ref_script_cost_per_byte = cost;

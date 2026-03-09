@@ -1129,14 +1129,22 @@ fn convert_pallas_protocol_param_update(
         drep_deposit: update.drep_deposit.map(Lovelace),
         gov_action_deposit: update.governance_action_deposit.map(Lovelace),
         gov_action_lifetime: update.governance_action_validity_period,
-        dvt_p_param_change: update.drep_voting_thresholds.as_ref().map(|d| {
-            // Use the most restrictive param group threshold as the unified threshold
-            // (Cardano spec has 4 groups; we simplify to one)
-            Rational {
-                numerator: d.pp_governance_group.numerator,
-                denominator: d.pp_governance_group.denominator,
-            }
-        }),
+        dvt_pp_network_group: update
+            .drep_voting_thresholds
+            .as_ref()
+            .map(|d| convert_rational(&d.pp_network_group)),
+        dvt_pp_economic_group: update
+            .drep_voting_thresholds
+            .as_ref()
+            .map(|d| convert_rational(&d.pp_economic_group)),
+        dvt_pp_technical_group: update
+            .drep_voting_thresholds
+            .as_ref()
+            .map(|d| convert_rational(&d.pp_technical_group)),
+        dvt_pp_gov_group: update
+            .drep_voting_thresholds
+            .as_ref()
+            .map(|d| convert_rational(&d.pp_governance_group)),
         dvt_hard_fork: update
             .drep_voting_thresholds
             .as_ref()

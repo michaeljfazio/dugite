@@ -845,12 +845,52 @@ fn parse_protocol_params_cbor(payload: &[u8]) -> Result<String, N2CClientError> 
                         entries.push(format!("  \"utxoCostPerByte\": {val}"));
                     }
                     15 => {
-                        // costModels — skip for now
-                        let _ = decoder.skip();
+                        // costModels (map: {0: [v1], 1: [v2], 2: [v3]})
+                        let mut cm_entries = Vec::new();
+                        if let Ok(Some(map_len)) = decoder.map() {
+                            for _ in 0..map_len {
+                                let lang = decoder.u32().unwrap_or(0);
+                                let lang_name = match lang {
+                                    0 => "PlutusV1",
+                                    1 => "PlutusV2",
+                                    2 => "PlutusV3",
+                                    _ => "Unknown",
+                                };
+                                let mut costs = Vec::new();
+                                if let Ok(Some(arr_len)) = decoder.array() {
+                                    for _ in 0..arr_len {
+                                        costs.push(decoder.i64().unwrap_or(0));
+                                    }
+                                }
+                                let costs_str: Vec<String> =
+                                    costs.iter().map(|c| c.to_string()).collect();
+                                cm_entries.push(format!(
+                                    "    \"{lang_name}\": [{}]",
+                                    costs_str.join(", ")
+                                ));
+                            }
+                        } else {
+                            let _ = decoder.skip();
+                        }
+                        entries.push(format!(
+                            "  \"costModels\": {{\n{}\n  }}",
+                            cm_entries.join(",\n")
+                        ));
                     }
                     16 => {
-                        // prices [mem, step] — skip for now
-                        let _ = decoder.skip();
+                        // prices [mem_price, step_price] as tagged rationals
+                        let _ = decoder.array();
+                        let _ = decoder.tag();
+                        let _ = decoder.array();
+                        let mem_num = decoder.u64().unwrap_or(0);
+                        let mem_den = decoder.u64().unwrap_or(1);
+                        let _ = decoder.tag();
+                        let _ = decoder.array();
+                        let step_num = decoder.u64().unwrap_or(0);
+                        let step_den = decoder.u64().unwrap_or(1);
+                        entries.push(format!(
+                            "  \"executionUnitPrices\": {{\n    \"priceMemory\": {{\n      \"numerator\": {mem_num},\n      \"denominator\": {mem_den}\n    }},\n    \"priceSteps\": {{\n      \"numerator\": {step_num},\n      \"denominator\": {step_den}\n    }}\n  }}"
+                        ));
                     }
                     17 => {
                         // maxTxExUnits [mem, steps]
@@ -882,8 +922,96 @@ fn parse_protocol_params_cbor(payload: &[u8]) -> Result<String, N2CClientError> 
                         let val = decoder.u64().unwrap_or(0);
                         entries.push(format!("  \"maxCollateralInputs\": {val}"));
                     }
+                    22 => {
+                        // poolVotingThresholds (5 tagged rationals)
+                        let pvt_names = [
+                            "pvtMotionNoConfidence",
+                            "pvtCommitteeNormal",
+                            "pvtCommitteeNoConfidence",
+                            "pvtHardForkInitiation",
+                            "pvtPPSecurityGroup",
+                        ];
+                        let _ = decoder.array();
+                        let mut pvt_entries = Vec::new();
+                        for name in &pvt_names {
+                            let _ = decoder.tag();
+                            let _ = decoder.array();
+                            let num = decoder.u64().unwrap_or(0);
+                            let den = decoder.u64().unwrap_or(1);
+                            pvt_entries.push(format!(
+                                "    \"{name}\": {{\n      \"numerator\": {num},\n      \"denominator\": {den}\n    }}"
+                            ));
+                        }
+                        entries.push(format!(
+                            "  \"poolVotingThresholds\": {{\n{}\n  }}",
+                            pvt_entries.join(",\n")
+                        ));
+                    }
+                    23 => {
+                        // drepVotingThresholds (10 tagged rationals)
+                        let dvt_names = [
+                            "dvtMotionNoConfidence",
+                            "dvtCommitteeNormal",
+                            "dvtCommitteeNoConfidence",
+                            "dvtUpdateToConstitution",
+                            "dvtHardForkInitiation",
+                            "dvtPPNetworkGroup",
+                            "dvtPPEconomicGroup",
+                            "dvtPPTechnicalGroup",
+                            "dvtPPGovGroup",
+                            "dvtTreasuryWithdrawal",
+                        ];
+                        let _ = decoder.array();
+                        let mut dvt_entries = Vec::new();
+                        for name in &dvt_names {
+                            let _ = decoder.tag();
+                            let _ = decoder.array();
+                            let num = decoder.u64().unwrap_or(0);
+                            let den = decoder.u64().unwrap_or(1);
+                            dvt_entries.push(format!(
+                                "    \"{name}\": {{\n      \"numerator\": {num},\n      \"denominator\": {den}\n    }}"
+                            ));
+                        }
+                        entries.push(format!(
+                            "  \"drepVotingThresholds\": {{\n{}\n  }}",
+                            dvt_entries.join(",\n")
+                        ));
+                    }
+                    24 => {
+                        let val = decoder.u64().unwrap_or(0);
+                        entries.push(format!("  \"committeeMinSize\": {val}"));
+                    }
+                    25 => {
+                        let val = decoder.u64().unwrap_or(0);
+                        entries.push(format!("  \"committeeMaxTermLength\": {val}"));
+                    }
+                    26 => {
+                        let val = decoder.u64().unwrap_or(0);
+                        entries.push(format!("  \"govActionLifetime\": {val}"));
+                    }
+                    27 => {
+                        let val = decoder.u64().unwrap_or(0);
+                        entries.push(format!("  \"govActionDeposit\": {val}"));
+                    }
+                    28 => {
+                        let val = decoder.u64().unwrap_or(0);
+                        entries.push(format!("  \"dRepDeposit\": {val}"));
+                    }
+                    29 => {
+                        let val = decoder.u64().unwrap_or(0);
+                        entries.push(format!("  \"dRepActivity\": {val}"));
+                    }
+                    30 => {
+                        // minFeeRefScriptCostPerByte (tagged rational)
+                        let _ = decoder.tag();
+                        let _ = decoder.array();
+                        let num = decoder.u64().unwrap_or(0);
+                        let den = decoder.u64().unwrap_or(1);
+                        entries.push(format!(
+                            "  \"minFeeRefScriptCostPerByte\": {{\n    \"numerator\": {num},\n    \"denominator\": {den}\n  }}"
+                        ));
+                    }
                     _ => {
-                        // Skip remaining governance params for now
                         let _ = decoder.skip();
                     }
                 }
@@ -1094,16 +1222,54 @@ mod tests {
         enc.u64(5000).unwrap(); // [19] maxValSize
         enc.u64(150).unwrap(); // [20] collateralPercentage
         enc.u64(3).unwrap(); // [21] maxCollateralInputs
-                             // [22-30] governance params
-        for _ in 22..=30 {
-            enc.u64(0).unwrap();
+                             // [22] poolVotingThresholds (5 tagged rationals)
+        enc.array(5).unwrap();
+        for _ in 0..5 {
+            enc.tag(minicbor::data::Tag::new(30)).unwrap();
+            enc.array(2).unwrap();
+            enc.u64(51).unwrap();
+            enc.u64(100).unwrap();
         }
+        // [23] drepVotingThresholds (10 tagged rationals)
+        enc.array(10).unwrap();
+        for _ in 0..10 {
+            enc.tag(minicbor::data::Tag::new(30)).unwrap();
+            enc.array(2).unwrap();
+            enc.u64(67).unwrap();
+            enc.u64(100).unwrap();
+        }
+        enc.u64(7).unwrap(); // [24] committeeMinSize
+        enc.u64(146).unwrap(); // [25] committeeMaxTermLength
+        enc.u64(6).unwrap(); // [26] govActionLifetime
+        enc.u64(100_000_000_000).unwrap(); // [27] govActionDeposit
+        enc.u64(500_000_000).unwrap(); // [28] dRepDeposit
+        enc.u64(20).unwrap(); // [29] dRepActivity
+                              // [30] minFeeRefScriptCostPerByte (tagged rational)
+        enc.tag(minicbor::data::Tag::new(30)).unwrap();
+        enc.array(2).unwrap();
+        enc.u64(15).unwrap();
+        enc.u64(1).unwrap();
 
         let result = parse_protocol_params_cbor(&buf).unwrap();
         assert!(result.contains("\"txFeePerByte\": 44"));
         assert!(result.contains("\"txFeeFixed\": 155381"));
         assert!(result.contains("\"poolPledgeInfluence\""));
         assert!(result.contains("\"numerator\": 3"));
+        // Verify new fields are parsed
+        assert!(result.contains("\"costModels\""));
+        assert!(result.contains("\"executionUnitPrices\""));
+        assert!(result.contains("\"priceMemory\""));
+        assert!(result.contains("\"poolVotingThresholds\""));
+        assert!(result.contains("\"pvtMotionNoConfidence\""));
+        assert!(result.contains("\"drepVotingThresholds\""));
+        assert!(result.contains("\"dvtMotionNoConfidence\""));
+        assert!(result.contains("\"committeeMinSize\": 7"));
+        assert!(result.contains("\"committeeMaxTermLength\": 146"));
+        assert!(result.contains("\"govActionLifetime\": 6"));
+        assert!(result.contains("\"govActionDeposit\": 100000000000"));
+        assert!(result.contains("\"dRepDeposit\": 500000000"));
+        assert!(result.contains("\"dRepActivity\": 20"));
+        assert!(result.contains("\"minFeeRefScriptCostPerByte\""));
     }
 
     #[test]

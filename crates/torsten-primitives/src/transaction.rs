@@ -349,7 +349,10 @@ pub struct ProtocolParamUpdate {
     pub gov_action_deposit: Option<Lovelace>,
     pub gov_action_lifetime: Option<u64>,
     // Governance voting thresholds
-    pub dvt_p_param_change: Option<Rational>,
+    pub dvt_pp_network_group: Option<Rational>,
+    pub dvt_pp_economic_group: Option<Rational>,
+    pub dvt_pp_technical_group: Option<Rational>,
+    pub dvt_pp_gov_group: Option<Rational>,
     pub dvt_hard_fork: Option<Rational>,
     pub dvt_no_confidence: Option<Rational>,
     pub dvt_committee_normal: Option<Rational>,

@@ -1222,10 +1222,22 @@ fn encode_protocol_params_cbor(
     );
     encode_tagged_rational(enc, pp.dvt_constitution_num, pp.dvt_constitution_den);
     encode_tagged_rational(enc, pp.dvt_hard_fork_num, pp.dvt_hard_fork_den);
-    encode_tagged_rational(enc, pp.dvt_p_param_change_num, pp.dvt_p_param_change_den);
-    encode_tagged_rational(enc, pp.dvt_p_param_change_num, pp.dvt_p_param_change_den);
-    encode_tagged_rational(enc, pp.dvt_p_param_change_num, pp.dvt_p_param_change_den);
-    encode_tagged_rational(enc, pp.dvt_p_param_change_num, pp.dvt_p_param_change_den);
+    encode_tagged_rational(
+        enc,
+        pp.dvt_pp_network_group_num,
+        pp.dvt_pp_network_group_den,
+    );
+    encode_tagged_rational(
+        enc,
+        pp.dvt_pp_economic_group_num,
+        pp.dvt_pp_economic_group_den,
+    );
+    encode_tagged_rational(
+        enc,
+        pp.dvt_pp_technical_group_num,
+        pp.dvt_pp_technical_group_den,
+    );
+    encode_tagged_rational(enc, pp.dvt_pp_gov_group_num, pp.dvt_pp_gov_group_den);
     encode_tagged_rational(
         enc,
         pp.dvt_treasury_withdrawal_num,

@@ -1216,7 +1216,7 @@ impl LedgerState {
     ///
     /// CIP-1694 voting thresholds (stake-weighted):
     /// - InfoAction: always ratified (no thresholds)
-    /// - ParameterChange: requires DRep vote ≥ dvt_p_param_change AND CC approval
+    /// - ParameterChange: requires DRep vote ≥ dvt_pp_*_group (group-dependent) AND CC approval
     /// - HardForkInitiation: requires DRep ≥ dvt_hard_fork AND SPO ≥ pvt_hard_fork
     /// - NoConfidence: requires DRep ≥ dvt_no_confidence AND SPO ≥ pvt_motion_no_confidence
     /// - UpdateCommittee: requires DRep ≥ dvt_committee AND SPO ≥ pvt_committee_normal
@@ -1238,7 +1238,15 @@ impl LedgerState {
                 true
             }
             GovAction::ParameterChange { .. } => {
-                let drep_threshold = self.protocol_params.dvt_p_param_change.as_f64();
+                // Use the most restrictive (highest) PP group threshold
+                // TODO: classify by parameter group (network/economic/technical/gov)
+                let drep_threshold = self
+                    .protocol_params
+                    .dvt_pp_gov_group
+                    .as_f64()
+                    .max(self.protocol_params.dvt_pp_network_group.as_f64())
+                    .max(self.protocol_params.dvt_pp_economic_group.as_f64())
+                    .max(self.protocol_params.dvt_pp_technical_group.as_f64());
                 let drep_met =
                     check_threshold(drep_yes, drep_total.max(total_drep_stake), drep_threshold);
                 let cc_met = check_cc_approval(cc_yes, cc_total, &self.governance, self.epoch);
@@ -1507,8 +1515,17 @@ impl LedgerState {
                 if let Some(v) = update.gov_action_deposit {
                     self.protocol_params.gov_action_deposit = v;
                 }
-                if let Some(ref v) = update.dvt_p_param_change {
-                    self.protocol_params.dvt_p_param_change = v.clone();
+                if let Some(ref v) = update.dvt_pp_network_group {
+                    self.protocol_params.dvt_pp_network_group = v.clone();
+                }
+                if let Some(ref v) = update.dvt_pp_economic_group {
+                    self.protocol_params.dvt_pp_economic_group = v.clone();
+                }
+                if let Some(ref v) = update.dvt_pp_technical_group {
+                    self.protocol_params.dvt_pp_technical_group = v.clone();
+                }
+                if let Some(ref v) = update.dvt_pp_gov_group {
+                    self.protocol_params.dvt_pp_gov_group = v.clone();
                 }
                 if let Some(ref v) = update.dvt_hard_fork {
                     self.protocol_params.dvt_hard_fork = v.clone();

@@ -46,8 +46,14 @@ pub struct ProtocolParameters {
     pub committee_max_term_length: u64,
 
     // Governance voting thresholds (as rationals)
-    /// DRep voting threshold for ParameterChange
-    pub dvt_p_param_change: Rational,
+    /// DRep voting threshold for PP changes — network group
+    pub dvt_pp_network_group: Rational,
+    /// DRep voting threshold for PP changes — economic group
+    pub dvt_pp_economic_group: Rational,
+    /// DRep voting threshold for PP changes — technical group
+    pub dvt_pp_technical_group: Rational,
+    /// DRep voting threshold for PP changes — governance group
+    pub dvt_pp_gov_group: Rational,
     /// DRep voting threshold for HardForkInitiation
     pub dvt_hard_fork: Rational,
     /// DRep voting threshold for NoConfidence
@@ -170,7 +176,19 @@ impl ProtocolParameters {
             gov_action_lifetime: 6,
             committee_min_size: 7,
             committee_max_term_length: 146,
-            dvt_p_param_change: Rational {
+            dvt_pp_network_group: Rational {
+                numerator: 67,
+                denominator: 100,
+            },
+            dvt_pp_economic_group: Rational {
+                numerator: 67,
+                denominator: 100,
+            },
+            dvt_pp_technical_group: Rational {
+                numerator: 67,
+                denominator: 100,
+            },
+            dvt_pp_gov_group: Rational {
                 numerator: 67,
                 denominator: 100,
             },
