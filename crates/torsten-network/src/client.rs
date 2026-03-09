@@ -199,7 +199,7 @@ impl NodeToNodeClient {
 
                     // Flush sub-batch when we hit the threshold
                     if headers_collected % sub_batch_size == 0 && !pending_points.is_empty() {
-                        let tip_ref = latest_tip.as_ref().unwrap();
+                        let tip_ref = latest_tip.as_ref().expect("tip set by prior RollForward");
                         let fetched = self
                             .fetch_and_decode_range(&pending_points, tip_ref)
                             .await?;
@@ -210,7 +210,7 @@ impl NodeToNodeClient {
                 NextResponse::RollBackward(point, tip) => {
                     // Flush any pending blocks before the rollback
                     if !pending_points.is_empty() {
-                        let tip_ref = latest_tip.as_ref().unwrap();
+                        let tip_ref = latest_tip.as_ref().expect("tip set by prior RollForward");
                         let fetched = self
                             .fetch_and_decode_range(&pending_points, tip_ref)
                             .await?;
@@ -226,7 +226,7 @@ impl NodeToNodeClient {
                 NextResponse::Await => {
                     // Flush pending blocks, then signal await
                     if !pending_points.is_empty() {
-                        let tip_ref = latest_tip.as_ref().unwrap();
+                        let tip_ref = latest_tip.as_ref().expect("tip set by prior RollForward");
                         let fetched = self
                             .fetch_and_decode_range(&pending_points, tip_ref)
                             .await?;
@@ -241,7 +241,7 @@ impl NodeToNodeClient {
 
         // Flush remaining pending blocks
         if !pending_points.is_empty() {
-            let tip_ref = latest_tip.as_ref().unwrap();
+            let tip_ref = latest_tip.as_ref().expect("tip set by prior RollForward");
             let fetched = self
                 .fetch_and_decode_range(&pending_points, tip_ref)
                 .await?;
@@ -259,8 +259,8 @@ impl NodeToNodeClient {
         points: &[PallasPoint],
         tip: &PallasTip,
     ) -> Result<Vec<ChainSyncEvent>, ClientError> {
-        let first = points.first().unwrap().clone();
-        let last = points.last().unwrap().clone();
+        let first = points.first().expect("points non-empty").clone();
+        let last = points.last().expect("points non-empty").clone();
 
         let bodies = self
             .peer
@@ -377,14 +377,14 @@ impl NodeToNodeClient {
                 }
                 NextResponse::Await => {
                     if !headers.is_empty() {
-                        return Ok(HeaderBatchResult::Headers(headers, latest_tip.unwrap()));
+                        return Ok(HeaderBatchResult::Headers(headers, latest_tip.expect("tip set by prior RollForward")));
                     }
                     return Ok(HeaderBatchResult::Await);
                 }
             }
         }
 
-        Ok(HeaderBatchResult::Headers(headers, latest_tip.unwrap()))
+        Ok(HeaderBatchResult::Headers(headers, latest_tip.expect("tip set by prior RollForward")))
     }
 
     /// Fetch blocks by a list of points using the blockfetch protocol.

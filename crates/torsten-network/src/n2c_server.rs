@@ -328,7 +328,7 @@ fn parse_highest_version(payload: &[u8]) -> Option<(u16, u32)> {
                 wire_v
             };
             if (N2C_MIN_VERSION..=N2C_MAX_VERSION).contains(&logical)
-                && (best.is_none() || logical as u16 > best.unwrap().0)
+                && best.is_none_or(|(bv, _)| logical as u16 > bv)
             {
                 best = Some((logical as u16, wire_v));
             }
@@ -1762,7 +1762,11 @@ fn encode_query_result(result: &QueryResult) -> Vec<u8> {
                 enc.u32(0).ok(); // KeyHashObj
                 enc.bytes(&addr.credential_hash).ok();
                 // Pool hash value
-                enc.bytes(addr.delegated_pool.as_ref().unwrap()).ok();
+                if let Some(pool) = addr.delegated_pool.as_ref() {
+                    enc.bytes(pool).ok();
+                } else {
+                    enc.bytes(&[]).ok();
+                }
             }
             // Rewards map
             enc.map(addrs.len() as u64).ok();

@@ -2391,7 +2391,11 @@ impl Node {
                                     match torsten_serialization::multi_era::decode_block(&cbor) {
                                         Ok(block) => {
                                             if let Err(e) = ls.apply_block(&block) {
-                                                warn!("Ledger apply failed during replay: {e}");
+                                                error!(
+                                                    slot = next_slot.0,
+                                                    "Ledger apply failed during rollback replay: {e} — aborting replay"
+                                                );
+                                                break;
                                             }
                                             replayed += 1;
                                             current_slot = next_slot.0;

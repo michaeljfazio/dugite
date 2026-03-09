@@ -107,7 +107,7 @@ impl ConnectionRateLimiter {
     /// Returns true if allowed, false if rate-limited.
     fn check_and_record(&self, ip: IpAddr) -> bool {
         let now = Instant::now();
-        let mut attempts = self.attempts.lock().unwrap();
+        let mut attempts = self.attempts.lock().unwrap_or_else(|e| e.into_inner());
         let timestamps = attempts.entry(ip).or_default();
 
         // Remove timestamps outside the window
@@ -124,7 +124,7 @@ impl ConnectionRateLimiter {
     /// Remove stale entries to prevent memory growth
     fn cleanup(&self) {
         let now = Instant::now();
-        let mut attempts = self.attempts.lock().unwrap();
+        let mut attempts = self.attempts.lock().unwrap_or_else(|e| e.into_inner());
         attempts.retain(|_, timestamps| {
             timestamps.retain(|t| now.duration_since(*t) < self.window);
             !timestamps.is_empty()
@@ -655,7 +655,7 @@ fn handle_n2n_handshake(
                     continue;
                 }
             }
-            if best_version.is_none() || version > best_version.unwrap() {
+            if best_version.is_none_or(|bv| version > bv) {
                 best_version = Some(version);
             }
         }
@@ -837,7 +837,7 @@ async fn handle_n2n_chainsync(
                     // Check if we have this block
                     if block_provider.has_block(&hash) {
                         // Found intersection — use the highest slot
-                        if intersect_point.is_none() || slot > intersect_point.as_ref().unwrap().0 {
+                        if intersect_point.is_none_or(|(s, _)| slot > s) {
                             intersect_point = Some((slot, hash));
                         }
                     }
@@ -1037,8 +1037,9 @@ fn handle_n2n_blockfetch(
                 return Ok(segments);
             }
 
-            let (from_slot, _from_hash) = from.unwrap();
-            let (to_slot, _to_hash) = to.unwrap();
+            // Safety: from/to are guaranteed Some by the from_exists/to_exists check above
+            let (from_slot, _from_hash) = from.expect("from checked above");
+            let (to_slot, _to_hash) = to.expect("to checked above");
 
             // Limit range to prevent DoS — max 2000 blocks per request
             const MAX_BLOCKFETCH_RANGE: u64 = 2000;
