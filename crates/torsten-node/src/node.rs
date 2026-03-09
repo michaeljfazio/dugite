@@ -573,7 +573,13 @@ impl Node {
             let topology_path = self.topology_path.clone();
             let pm_for_sighup = peer_manager.clone();
             tokio::spawn(async move {
-                let mut hup = signal::unix::signal(signal::unix::SignalKind::hangup()).unwrap();
+                let mut hup = match signal::unix::signal(signal::unix::SignalKind::hangup()) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        warn!("Failed to setup SIGHUP handler: {e}");
+                        return;
+                    }
+                };
                 loop {
                     hup.recv().await;
                     info!(
@@ -1220,11 +1226,14 @@ impl Node {
         // Run ChainDB write and ledger apply concurrently — they are independent
         let chain_db = self.chain_db.clone();
         let ledger_state = self.ledger_state.clone();
+        let store_failed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let store_failed2 = store_failed.clone();
         tokio::join!(
             async {
                 let mut db = chain_db.write().await;
                 if let Err(e) = db.add_blocks_batch(db_batch) {
-                    error!("Failed to store block batch: {e}");
+                    error!("FATAL: Failed to store block batch: {e}");
+                    store_failed2.store(true, std::sync::atomic::Ordering::Relaxed);
                 }
             },
             async {
@@ -1241,6 +1250,11 @@ impl Node {
                 }
             }
         );
+
+        if store_failed.load(std::sync::atomic::Ordering::Relaxed) {
+            error!("Block storage failed — halting block processing to prevent state divergence");
+            return;
+        }
 
         // Remove confirmed transactions from mempool and revalidate
         if !self.mempool.is_empty() {
