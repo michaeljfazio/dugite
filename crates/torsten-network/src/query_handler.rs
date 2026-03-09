@@ -23,6 +23,8 @@ pub enum QueryResult {
     StakeAddressInfo(Vec<StakeAddressSnapshot>),
     UtxoByAddress(Vec<UtxoSnapshot>),
     StakeSnapshots(StakeSnapshotsResult),
+    /// Set of pool key hashes (GetStakePools tag 16)
+    StakePools(Vec<Vec<u8>>),
     PoolParams(Vec<PoolParamsSnapshot>),
     AccountState {
         treasury: u64,
@@ -471,6 +473,37 @@ impl QueryHandler {
         &self.state
     }
 
+    /// Parse a set of credential hashes from CBOR.
+    /// Handles: tag(258) [credential, ...] where credential = [0|1, hash(28)]
+    /// Also handles plain array of bytes (legacy/simplified format).
+    fn parse_credential_set_static(decoder: &mut minicbor::Decoder<'_>) -> Vec<Vec<u8>> {
+        let mut hashes = Vec::new();
+        // Try to consume tag(258) if present
+        let _ = decoder.tag();
+        if let Ok(Some(n)) = decoder.array() {
+            for _ in 0..n {
+                let pos = decoder.position();
+                // Try as credential structure: [0|1, hash(28)]
+                if let Ok(Some(2)) = decoder.array() {
+                    let _ = decoder.u32(); // credential type tag
+                    if let Ok(bytes) = decoder.bytes() {
+                        hashes.push(bytes.to_vec());
+                    }
+                } else {
+                    // Fall back to plain bytes
+                    decoder.set_position(pos);
+                    if let Ok(bytes) = decoder.bytes() {
+                        hashes.push(bytes.to_vec());
+                    } else {
+                        decoder.set_position(pos);
+                        decoder.skip().ok();
+                    }
+                }
+            }
+        }
+        hashes
+    }
+
     /// Handle a raw CBOR query message and return a result.
     ///
     /// The CBOR payload from MsgQuery is: [3, query]
@@ -734,15 +767,9 @@ impl QueryHandler {
             // Tag 9: GetCBOR — not implemented
             10 => {
                 // Tag 10: GetFilteredDelegationsAndRewardAccounts
+                // Argument: tag(258) Set<Credential> where Credential = [0|1, hash(28)]
                 debug!("Query: GetFilteredDelegationsAndRewardAccounts");
-                let mut filter_hashes: Vec<Vec<u8>> = Vec::new();
-                if let Ok(Some(n)) = decoder.array() {
-                    for _ in 0..n {
-                        if let Ok(bytes) = decoder.bytes() {
-                            filter_hashes.push(bytes.to_vec());
-                        }
-                    }
-                }
+                let filter_hashes = Self::parse_credential_set_static(decoder);
                 if filter_hashes.is_empty() {
                     QueryResult::StakeAddressInfo(self.state.stake_addresses.clone())
                 } else {
@@ -790,14 +817,23 @@ impl QueryHandler {
                 }
             }
             16 => {
-                // Tag 16: GetStakePools
+                // Tag 16: GetStakePools — returns Set<KeyHash StakePool>
                 debug!("Query: GetStakePools");
-                QueryResult::StakeDistribution(self.state.stake_pools.clone())
+                let pool_ids: Vec<Vec<u8>> = self
+                    .state
+                    .stake_pools
+                    .iter()
+                    .map(|p| p.pool_id.clone())
+                    .collect();
+                QueryResult::StakePools(pool_ids)
             }
             17 => {
                 // Tag 17: GetStakePoolParams
+                // Argument: tag(258) Set<KeyHash StakePool>
                 debug!("Query: GetStakePoolParams");
                 let mut filter_pools: Vec<Vec<u8>> = Vec::new();
+                // Try to consume tag(258) if present
+                let _ = decoder.tag();
                 if let Ok(Some(n)) = decoder.array() {
                     for _ in 0..n {
                         if let Ok(bytes) = decoder.bytes() {
@@ -840,15 +876,9 @@ impl QueryHandler {
             }
             25 => {
                 // Tag 25: GetDRepState
+                // Argument: tag(258) Set<Credential> where Credential = [0|1, hash(28)]
                 debug!("Query: GetDRepState");
-                let mut filter_hashes: Vec<Vec<u8>> = Vec::new();
-                if let Ok(Some(n)) = decoder.array() {
-                    for _ in 0..n {
-                        if let Ok(bytes) = decoder.bytes() {
-                            filter_hashes.push(bytes.to_vec());
-                        }
-                    }
-                }
+                let filter_hashes = Self::parse_credential_set_static(decoder);
                 if filter_hashes.is_empty() {
                     QueryResult::DRepState(self.state.drep_entries.clone())
                 } else {

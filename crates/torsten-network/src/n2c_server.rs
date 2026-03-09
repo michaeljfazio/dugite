@@ -1560,6 +1560,14 @@ fn encode_query_result(result: &QueryResult) -> Vec<u8> {
             enc.u64(snapshots.total_set_stake.max(1)).ok();
             enc.u64(snapshots.total_go_stake.max(1)).ok();
         }
+        QueryResult::StakePools(pool_ids) => {
+            // Wire format: tag(258) Set<KeyHash StakePool>
+            enc.tag(minicbor::data::Tag::new(258)).ok();
+            enc.array(pool_ids.len() as u64).ok();
+            for pid in pool_ids {
+                enc.bytes(pid).ok();
+            }
+        }
         QueryResult::PoolParams(params) => {
             // Wire format: Map<pool_hash(28), PoolParams>
             // PoolParams is a CDDL record (positional fields, no array wrapper):
