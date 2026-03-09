@@ -38,6 +38,19 @@ impl ImmutableDB {
         opts.create_if_missing(true);
         opts.set_compression_type(rocksdb::DBCompressionType::Lz4);
 
+        // Performance tuning for block storage workload
+        opts.set_write_buffer_size(128 * 1024 * 1024); // 128MB write buffer
+        opts.set_max_write_buffer_number(3);
+        opts.set_target_file_size_base(64 * 1024 * 1024); // 64MB SST files
+        opts.set_level_zero_file_num_compaction_trigger(4);
+        opts.set_max_bytes_for_level_base(512 * 1024 * 1024);
+
+        // Bloom filter for faster key lookups (reduces disk reads for missing keys)
+        let mut block_opts = rocksdb::BlockBasedOptions::default();
+        block_opts.set_bloom_filter(10.0, false);
+        block_opts.set_block_cache(&rocksdb::Cache::new_lru_cache(256 * 1024 * 1024)); // 256MB cache
+        opts.set_block_based_table_factory(&block_opts);
+
         let db =
             rocksdb::DB::open(&opts, path).map_err(|e| ImmutableDBError::RocksDB(e.to_string()))?;
 

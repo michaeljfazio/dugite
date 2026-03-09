@@ -90,8 +90,8 @@ pub struct GovernanceState {
     pub committee_resigned: HashMap<Hash32, Option<Anchor>>,
     /// Active governance proposals indexed by GovActionId
     pub proposals: BTreeMap<GovActionId, ProposalState>,
-    /// Votes cast: (voter, action_id) -> vote
-    pub votes: BTreeMap<(Voter, GovActionId), VotingProcedure>,
+    /// Votes cast, indexed by action ID for efficient ratification lookup
+    pub votes_by_action: BTreeMap<GovActionId, Vec<(Voter, VotingProcedure)>>,
     /// Total DRep registrations count (including deregistered)
     pub drep_registration_count: u64,
     /// Total proposals submitted
@@ -696,11 +696,10 @@ impl LedgerState {
                     );
                 }
             }
-            // Remove all votes for expired proposals in a single pass
-            let expired_set: std::collections::HashSet<&GovActionId> = expired.iter().collect();
-            self.governance
-                .votes
-                .retain(|(_, id), _| !expired_set.contains(id));
+            // Remove all votes for expired proposals
+            for id in &expired {
+                self.governance.votes_by_action.remove(id);
+            }
             debug!(
                 "Expired {} governance proposals at epoch {}",
                 expired.len(),
@@ -1064,10 +1063,18 @@ impl LedgerState {
             }
         }
 
-        // Record the vote
-        self.governance
-            .votes
-            .insert((voter.clone(), action_id.clone()), procedure.clone());
+        // Record the vote (indexed by action_id for efficient ratification)
+        let action_votes = self
+            .governance
+            .votes_by_action
+            .entry(action_id.clone())
+            .or_default();
+        // Replace existing vote from same voter, or add new
+        if let Some(existing) = action_votes.iter_mut().find(|(v, _)| v == voter) {
+            existing.1 = procedure.clone();
+        } else {
+            action_votes.push((voter.clone(), procedure.clone()));
+        }
 
         debug!(
             "Vote cast by {:?} on {:?}: {:?}",
@@ -1114,12 +1121,10 @@ impl LedgerState {
                     }
                 }
             }
-            // Remove all votes for ratified proposals in a single pass
-            let ratified_set: std::collections::HashSet<&GovActionId> =
-                ratified.iter().map(|(id, _)| id).collect();
-            self.governance
-                .votes
-                .retain(|(_, id), _| !ratified_set.contains(id));
+            // Remove all votes for ratified proposals
+            for (id, _) in &ratified {
+                self.governance.votes_by_action.remove(id);
+            }
             info!(
                 "{} governance proposal(s) ratified and enacted",
                 ratified.len()
@@ -1214,10 +1219,13 @@ impl LedgerState {
         let mut cc_yes = 0u64;
         let mut cc_total = 0u64;
 
-        for ((voter, aid), procedure) in &self.governance.votes {
-            if aid != action_id {
-                continue;
-            }
+        let empty = vec![];
+        let action_votes = self
+            .governance
+            .votes_by_action
+            .get(action_id)
+            .unwrap_or(&empty);
+        for (voter, procedure) in action_votes {
             match voter {
                 Voter::DRep(cred) => {
                     let drep_hash = credential_to_hash(cred);
@@ -2743,7 +2751,14 @@ mod tests {
         assert_eq!(p.yes_votes, 1);
         assert_eq!(p.no_votes, 1);
         assert_eq!(p.abstain_votes, 0);
-        assert_eq!(state.governance.votes.len(), 2);
+        // 2 votes for the same action_id should be in the same Vec
+        let total_votes: usize = state
+            .governance
+            .votes_by_action
+            .values()
+            .map(|v| v.len())
+            .sum();
+        assert_eq!(total_votes, 2);
     }
 
     #[test]
