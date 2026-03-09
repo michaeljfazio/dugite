@@ -722,16 +722,14 @@ fn strip_msg_result(decoder: &mut minicbor::Decoder) -> Result<(), N2CClientErro
 /// Strip the HardFork Combinator success wrapper [result] (1-element array).
 /// Handles both wrapped (from Haskell node) and unwrapped (from Torsten) responses.
 fn strip_hfc_wrapper(decoder: &mut minicbor::Decoder) -> Result<(), N2CClientError> {
-    // The HFC wrapper is array(1). Peek at the next type to detect it.
-    // If the next item is an array of length 1 AND the item inside it is NOT
-    // what we'd expect for the result, it's the wrapper. But the safest approach
-    // is to just always try to strip it — if the response comes from a Haskell
-    // node it will have the wrapper, if from Torsten it will also have it now.
+    // The HFC wrapper is array(1). Save position so we can restore if no wrapper.
+    let pos = decoder.position();
     if let Ok(Some(1)) = decoder.array() {
         // Consumed the HFC wrapper
         Ok(())
     } else {
-        // No wrapper or different structure — continue from current position
+        // No wrapper — restore position so the caller can read the actual value
+        decoder.set_position(pos);
         Ok(())
     }
 }
@@ -971,6 +969,18 @@ mod tests {
         enc.u32(4).unwrap();
         enc.array(1).unwrap(); // HFC success wrapper
         enc.u64(42000).unwrap();
+
+        assert_eq!(parse_u64_result(&buf).unwrap(), 42000);
+    }
+
+    #[test]
+    fn test_parse_u64_result_no_hfc_wrapper() {
+        // ChainBlockNo does NOT have HFC wrapper — just [4, value]
+        let mut buf = Vec::new();
+        let mut enc = minicbor::Encoder::new(&mut buf);
+        enc.array(2).unwrap();
+        enc.u32(4).unwrap();
+        enc.u64(42000).unwrap(); // No HFC wrapper
 
         assert_eq!(parse_u64_result(&buf).unwrap(), 42000);
     }
