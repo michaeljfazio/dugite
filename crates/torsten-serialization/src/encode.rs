@@ -1260,10 +1260,13 @@ pub fn compute_script_data_hash(
 
 /// Encode cost models as "language views" for script data hash computation.
 ///
-/// Per the Cardano ledger spec:
-/// - PlutusV1 uses integer key 0
-/// - PlutusV2 uses integer key 1
-/// - PlutusV3 uses integer key 2
+/// Per the Haskell cardano-ledger implementation:
+/// - PlutusV1: key = bstr(0x00) "double-bagged", value = bstr(indef_array(...))
+/// - PlutusV2: key = uint(1), value = array(...)
+/// - PlutusV3: key = uint(2), value = array(...)
+///
+/// Entries are sorted by short-lex order on key bytes:
+/// V2 (0x01, 1 byte) < V3 (0x02, 1 byte) < V1 (0x41 0x00, 2 bytes)
 ///
 /// Only includes cost models for languages actually used in the transaction.
 fn encode_language_views(
@@ -1272,52 +1275,62 @@ fn encode_language_views(
     has_v2: bool,
     has_v3: bool,
 ) -> Vec<u8> {
-    let mut count = 0;
-    if has_v1 && cost_models.plutus_v1.is_some() {
-        count += 1;
-    }
-    if has_v2 && cost_models.plutus_v2.is_some() {
-        count += 1;
-    }
-    if has_v3 && cost_models.plutus_v3.is_some() {
-        count += 1;
-    }
-
-    if count == 0 {
-        // Empty map
-        return encode_map_header(0);
-    }
-
-    let mut buf = encode_map_header(count);
+    // Collect (key_bytes, value_bytes) pairs
+    let mut entries: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
 
     if has_v1 {
         if let Some(v1) = &cost_models.plutus_v1 {
-            buf.extend(encode_uint(0));
-            buf.extend(encode_array_header(v1.len()));
+            // PlutusV1 key: "double-bagged" — serialize(serialize(0)) = bstr(0x00) = [0x41, 0x00]
+            let key = encode_bytes(&encode_uint(0));
+            // PlutusV1 value: bstr wrapping indefinite-length CBOR array
+            let mut indef_arr = vec![0x9Fu8]; // indefinite-length array start
             for cost in v1 {
-                buf.extend(encode_int(*cost as i128));
+                indef_arr.extend(encode_int(*cost as i128));
             }
+            indef_arr.push(0xFF); // break
+            let value = encode_bytes(&indef_arr);
+            entries.push((key, value));
         }
     }
     if has_v2 {
         if let Some(v2) = &cost_models.plutus_v2 {
-            buf.extend(encode_uint(1));
-            buf.extend(encode_array_header(v2.len()));
+            // PlutusV2 key: raw CBOR uint 1
+            let key = encode_uint(1);
+            // PlutusV2 value: definite-length CBOR array (raw, not byte-wrapped)
+            let mut value = encode_array_header(v2.len());
             for cost in v2 {
-                buf.extend(encode_int(*cost as i128));
+                value.extend(encode_int(*cost as i128));
             }
+            entries.push((key, value));
         }
     }
     if has_v3 {
         if let Some(v3) = &cost_models.plutus_v3 {
-            buf.extend(encode_uint(2));
-            buf.extend(encode_array_header(v3.len()));
+            // PlutusV3 key: raw CBOR uint 2
+            let key = encode_uint(2);
+            // PlutusV3 value: definite-length CBOR array (raw, not byte-wrapped)
+            let mut value = encode_array_header(v3.len());
             for cost in v3 {
-                buf.extend(encode_int(*cost as i128));
+                value.extend(encode_int(*cost as i128));
             }
+            entries.push((key, value));
         }
     }
 
+    if entries.is_empty() {
+        return encode_map_header(0);
+    }
+
+    // Sort by short-lex order on key bytes (shorter keys first, ties broken lexicographically)
+    entries.sort_by(|(a, _), (b, _)| {
+        a.len().cmp(&b.len()).then_with(|| a.cmp(b))
+    });
+
+    let mut buf = encode_map_header(entries.len());
+    for (key, value) in entries {
+        buf.extend(key);
+        buf.extend(value);
+    }
     buf
 }
 
@@ -1744,5 +1757,115 @@ mod tests {
         };
         let encoded = encode_certificate(&cert);
         assert_eq!(encoded[0], 0x84); // array of 4
+    }
+
+    #[test]
+    fn test_language_views_v1_double_bagged_key() {
+        let cost_models = CostModels {
+            plutus_v1: Some(vec![100, 200]),
+            plutus_v2: None,
+            plutus_v3: None,
+        };
+        let encoded = encode_language_views(&cost_models, true, false, false);
+        // map(1), key = bstr(0x00) = [0x41, 0x00]
+        assert_eq!(encoded[0], 0xA1); // map(1)
+        assert_eq!(encoded[1], 0x41); // bstr(1)
+        assert_eq!(encoded[2], 0x00); // inner byte 0x00
+        // value starts at [3]: bstr wrapping indefinite array
+        // Let's check what we actually got
+        assert!(
+            encoded[3] >= 0x40 && encoded[3] <= 0x5F,
+            "Expected bstr header at [3], got 0x{:02X}, full: {:02X?}",
+            encoded[3],
+            &encoded[..std::cmp::min(encoded.len(), 20)]
+        );
+    }
+
+    #[test]
+    fn test_language_views_v1_indefinite_array() {
+        let cost_models = CostModels {
+            plutus_v1: Some(vec![1, 2, 3]),
+            plutus_v2: None,
+            plutus_v3: None,
+        };
+        let encoded = encode_language_views(&cost_models, true, false, false);
+        // The value should be a bstr containing [0x9F, <ints>, 0xFF]
+        // Skip map header (1 byte) and key (2 bytes) to get the value
+        let value_start = 3;
+        // Parse the bstr: first byte tells us the bstr header
+        let (bstr_content_start, bstr_len) = if encoded[value_start] < 0x58 {
+            // bstr with 1-byte header
+            let len = (encoded[value_start] - 0x40) as usize;
+            (value_start + 1, len)
+        } else {
+            // bstr with 2-byte header (0x58 NN)
+            let len = encoded[value_start + 1] as usize;
+            (value_start + 2, len)
+        };
+        let inner = &encoded[bstr_content_start..bstr_content_start + bstr_len];
+        // First byte should be 0x9F (indefinite array start)
+        assert_eq!(inner[0], 0x9F);
+        // Last byte should be 0xFF (break)
+        assert_eq!(inner[inner.len() - 1], 0xFF);
+    }
+
+    #[test]
+    fn test_language_views_v2_definite_array() {
+        let cost_models = CostModels {
+            plutus_v1: None,
+            plutus_v2: Some(vec![10, 20]),
+            plutus_v3: None,
+        };
+        let encoded = encode_language_views(&cost_models, false, true, false);
+        // map(1), key = uint(1) = [0x01]
+        assert_eq!(encoded[0], 0xA1); // map(1)
+        assert_eq!(encoded[1], 0x01); // uint 1
+        // value: definite-length array, NOT byte-wrapped
+        assert_eq!(encoded[2], 0x82); // array(2)
+    }
+
+    #[test]
+    fn test_language_views_sort_order() {
+        // When V1 and V2 both present, V2 sorts first (1-byte key < 2-byte key)
+        let cost_models = CostModels {
+            plutus_v1: Some(vec![1]),
+            plutus_v2: Some(vec![2]),
+            plutus_v3: None,
+        };
+        let encoded = encode_language_views(&cost_models, true, true, false);
+        assert_eq!(encoded[0], 0xA2); // map(2)
+        // First entry should be V2 (key = 0x01, 1 byte)
+        assert_eq!(encoded[1], 0x01); // V2 key
+        // Not V1's double-bagged key (0x41, 0x00)
+        assert_ne!(encoded[1], 0x41);
+    }
+
+    #[test]
+    fn test_language_views_all_three_sort_order() {
+        let cost_models = CostModels {
+            plutus_v1: Some(vec![1]),
+            plutus_v2: Some(vec![2]),
+            plutus_v3: Some(vec![3]),
+        };
+        let encoded = encode_language_views(&cost_models, true, true, true);
+        assert_eq!(encoded[0], 0xA3); // map(3)
+        // Order: V2 (0x01), V3 (0x02), V1 (0x41 0x00)
+        assert_eq!(encoded[1], 0x01); // V2 key first
+        // Find V3 key after V2 value
+        // V2 value: array(1) + int(2) = [0x81, 0x02]
+        assert_eq!(encoded[2], 0x81); // array(1) for V2
+        assert_eq!(encoded[3], 0x02); // int 2 for V2
+        assert_eq!(encoded[4], 0x02); // V3 key second
+    }
+
+    #[test]
+    fn test_language_views_empty() {
+        let cost_models = CostModels {
+            plutus_v1: None,
+            plutus_v2: None,
+            plutus_v3: None,
+        };
+        let encoded = encode_language_views(&cost_models, false, false, false);
+        assert_eq!(encoded, encode_map_header(0));
     }
 }
