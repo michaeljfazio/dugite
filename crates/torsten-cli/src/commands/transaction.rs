@@ -780,11 +780,16 @@ impl TransactionCmd {
                 )?;
 
                 // Write as text envelope (cardano-cli compatible format)
-                let envelope = serde_json::json!({
+                let mut envelope = serde_json::json!({
                     "type": "TxBodyConway",
                     "description": "Transaction Body",
                     "cborHex": hex::encode(&tx_body_cbor)
                 });
+
+                // Include auxiliary data if present (for sign/assemble to embed in tx)
+                if let Some(ref aux) = auxiliary_data {
+                    envelope["auxiliaryDataCborHex"] = serde_json::Value::String(hex::encode(aux));
+                }
 
                 std::fs::write(&out_file, serde_json::to_string_pretty(&envelope)?)?;
                 println!("Transaction body written to: {}", out_file.display());
@@ -864,8 +869,21 @@ impl TransactionCmd {
                 let mut tail = Vec::new();
                 let mut tenc = minicbor::Encoder::new(&mut tail);
                 tenc.bool(true)?;
-                tenc.null()?;
                 final_buf.extend_from_slice(&tail);
+
+                // auxiliary_data: include if present in tx body envelope, otherwise null
+                if let Some(aux_hex) = envelope
+                    .get("auxiliaryDataCborHex")
+                    .and_then(|v| v.as_str())
+                {
+                    let aux_cbor = hex::decode(aux_hex)?;
+                    final_buf.extend_from_slice(&aux_cbor);
+                } else {
+                    let mut null_buf = Vec::new();
+                    let mut nenc = minicbor::Encoder::new(&mut null_buf);
+                    nenc.null()?;
+                    final_buf.extend_from_slice(&null_buf);
+                }
 
                 let signed_envelope = serde_json::json!({
                     "type": "Tx ConwayEra",
@@ -1184,7 +1202,7 @@ impl TransactionCmd {
                 let body_cbor = hex::decode(cbor_hex)?;
 
                 let hash = torsten_crypto::signing::hash_transaction(&body_cbor);
-                let hash_bytes = hex::decode(hash)?;
+                let hash_bytes = hash.to_vec();
 
                 let key_content = std::fs::read_to_string(&signing_key_file)?;
                 let key_env: serde_json::Value = serde_json::from_str(&key_content)?;
@@ -1269,10 +1287,18 @@ impl TransactionCmd {
                 let mut valid_buf = Vec::new();
                 minicbor::Encoder::new(&mut valid_buf).bool(true)?;
                 tx_cbor.extend_from_slice(&valid_buf);
-                // auxiliary_data: null
-                let mut null_buf = Vec::new();
-                minicbor::Encoder::new(&mut null_buf).null()?;
-                tx_cbor.extend_from_slice(&null_buf);
+                // auxiliary_data: include if present in tx body envelope, otherwise null
+                if let Some(aux_hex) = body_env
+                    .get("auxiliaryDataCborHex")
+                    .and_then(|v| v.as_str())
+                {
+                    let aux_cbor = hex::decode(aux_hex)?;
+                    tx_cbor.extend_from_slice(&aux_cbor);
+                } else {
+                    let mut null_buf = Vec::new();
+                    minicbor::Encoder::new(&mut null_buf).null()?;
+                    tx_cbor.extend_from_slice(&null_buf);
+                }
 
                 let tx_env = serde_json::json!({
                     "type": "Witnessed Tx ConwayEra",

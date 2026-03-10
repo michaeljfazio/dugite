@@ -10,3 +10,6 @@ db/
 node.sock
 *.bin
 db-*/
+keys/
+*.skey
+*.vkey
