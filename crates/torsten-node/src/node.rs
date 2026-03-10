@@ -1765,6 +1765,18 @@ impl Node {
                 self.metrics
                     .treasury_lovelace
                     .store(ls.treasury.0, std::sync::atomic::Ordering::Relaxed);
+                self.metrics.drep_count.store(
+                    ls.governance.dreps.len() as u64,
+                    std::sync::atomic::Ordering::Relaxed,
+                );
+                self.metrics.proposal_count.store(
+                    ls.governance.proposals.len() as u64,
+                    std::sync::atomic::Ordering::Relaxed,
+                );
+                self.metrics.pool_count.store(
+                    ls.pool_params.len() as u64,
+                    std::sync::atomic::Ordering::Relaxed,
+                );
                 // Only show sync progress when catching up, not when following the tip
                 if blocks_remaining > 0 {
                     info!(

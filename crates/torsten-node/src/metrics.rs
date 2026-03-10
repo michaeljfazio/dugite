@@ -26,6 +26,9 @@ pub struct NodeMetrics {
     pub blocks_forged: AtomicU64,
     pub delegation_count: AtomicU64,
     pub treasury_lovelace: AtomicU64,
+    pub drep_count: AtomicU64,
+    pub proposal_count: AtomicU64,
+    pub pool_count: AtomicU64,
 }
 
 impl NodeMetrics {
@@ -51,6 +54,9 @@ impl NodeMetrics {
             blocks_forged: AtomicU64::new(0),
             delegation_count: AtomicU64::new(0),
             treasury_lovelace: AtomicU64::new(0),
+            drep_count: AtomicU64::new(0),
+            proposal_count: AtomicU64::new(0),
+            pool_count: AtomicU64::new(0),
         }
     }
 
@@ -196,6 +202,21 @@ impl NodeMetrics {
                 "torsten_treasury_lovelace",
                 "Total lovelace in the treasury",
                 &self.treasury_lovelace,
+            ),
+            (
+                "torsten_drep_count",
+                "Number of registered DReps",
+                &self.drep_count,
+            ),
+            (
+                "torsten_proposal_count",
+                "Number of active governance proposals",
+                &self.proposal_count,
+            ),
+            (
+                "torsten_pool_count",
+                "Number of registered stake pools",
+                &self.pool_count,
             ),
         ];
 
