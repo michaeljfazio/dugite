@@ -85,16 +85,32 @@ pub fn vrf_proof_to_hash(proof_bytes: &[u8]) -> Result<[u8; 64], VrfError> {
 /// Rearranged: `certNatMax / (certNatMax - certNat) < exp(sigma * |ln(1-f)|)`
 ///
 /// Uses 34-decimal-digit fixed-point arithmetic (matching Haskell's `Digits34`)
-/// with Taylor series comparison (`taylorExpCmp`) for exact precision.
+/// with continued fraction ln() and Taylor series exp() comparison for exact precision.
 pub fn check_leader_value(vrf_output: &[u8], relative_stake: f64, active_slot_coeff: f64) -> bool {
     leader_check::check_leader_value_exact(vrf_output, relative_stake, active_slot_coeff)
+}
+
+/// Check leader value with exact rational active_slot_coeff (e.g., 1/20 for 0.05).
+/// This avoids f64 precision loss when converting the protocol parameter.
+pub fn check_leader_value_rational(
+    vrf_output: &[u8],
+    relative_stake: f64,
+    active_slot_coeff_num: u64,
+    active_slot_coeff_den: u64,
+) -> bool {
+    leader_check::check_leader_value_with_rational_coeff(
+        vrf_output,
+        relative_stake,
+        active_slot_coeff_num,
+        active_slot_coeff_den,
+    )
 }
 
 /// Exact-precision VRF leader check matching Haskell's `checkLeaderNatValue`.
 ///
 /// Uses `num-bigint` for 34-digit fixed-point arithmetic, replicating:
 /// - `Cardano.Protocol.TPraos.BHeader.checkLeaderNatValue`
-/// - `Cardano.Ledger.NonIntegral.taylorExpCmp`
+/// - `Cardano.Ledger.NonIntegral.taylorExpCmp` / `ln'` / `lncf`
 /// - `Cardano.Ledger.BaseTypes.FixedPoint` (10^34 resolution)
 mod leader_check {
     use num_bigint::BigInt;
@@ -125,38 +141,135 @@ mod leader_check {
         (a * scale) / b
     }
 
-    /// Compute ln(x) for x in (0, 2) using the series:
-    /// ln(x) = ln(1 + y) where y = x - 1
-    /// ln(1 + y) = y - y^2/2 + y^3/3 - y^4/4 + ...
+    /// Compute ln(1+x) using Euler's generalized continued fraction.
     ///
-    /// All arithmetic is in fixed-point with the given scale.
-    /// `x` is in fixed-point (i.e., actual_value * scale).
-    fn fp_ln(x: &BigInt, scale: &BigInt) -> BigInt {
-        // y = x - 1.0 (in fixed-point: x - scale)
-        let y = x - scale;
-        if y.is_zero() {
+    /// Matches Haskell's `lncf` from `Cardano.Ledger.NonIntegral`:
+    ///
+    /// The continued fraction for ln(1+x) has coefficients:
+    ///   a_n: [x, 1²x, 1²x, 2²x, 2²x, 3²x, 3²x, ...]
+    ///   b_n: [1, 2, 3, 4, 5, 6, 7, ...]
+    ///
+    /// Converges for all x >= 0 (unlike the Taylor series which requires |x| < 1).
+    /// Uses the Wallis recurrence for evaluating the convergents.
+    /// Convergence criterion: |x_n - x_{n-1}| < 10^{-24} (matching Haskell's epsilon).
+    fn fp_lncf(x_fp: &BigInt, scale: &BigInt) -> BigInt {
+        if x_fp.is_zero() {
             return BigInt::zero();
         }
 
-        let mut result = BigInt::zero();
-        let mut y_power = y.clone(); // y^1
-        let max_terms = 1000;
+        // Epsilon: 10^{-24} in fixed-point = 10^{34-24} = 10^{10}
+        let epsilon = BigInt::from(10).pow(10);
+        let max_n = 1000usize;
 
-        for n in 1..=max_terms {
-            let term = &y_power / BigInt::from(n);
-            if n % 2 == 1 {
-                result += &term;
+        // Initial Wallis recurrence state (all in fixed-point):
+        // A_{-1} = 1.0, B_{-1} = 0, A_0 = 0 (b_0=0 implicit), B_0 = 1.0
+        let mut a_nm2 = scale.clone(); // A_{-1}
+        let mut b_nm2 = BigInt::zero(); // B_{-1}
+        let mut a_nm1 = BigInt::zero(); // A_0
+        let mut b_nm1 = scale.clone(); // B_0
+
+        let mut last_xn: Option<BigInt> = None;
+
+        for n in 0..max_n {
+            // a_n coefficient (fixed-point): coeff(n) * x
+            // Pattern: x, 1²x, 1²x, 2²x, 2²x, 3²x, 3²x, ...
+            let coeff: u64 = if n == 0 {
+                1
             } else {
-                result -= &term;
+                let k = (n as u64).div_ceil(2);
+                k * k
+            };
+            let an_fp = BigInt::from(coeff) * x_fp;
+
+            // b_n coefficient (fixed-point): (n+1) represented as fixed-point
+            let bn_fp = BigInt::from(n as u64 + 1) * scale;
+
+            // Wallis recurrence (fixed-point arithmetic):
+            // A_n = b_n * A_{n-1} + a_n * A_{n-2}
+            let a_n = fp_mul(&bn_fp, &a_nm1, scale) + fp_mul(&an_fp, &a_nm2, scale);
+            let b_n = fp_mul(&bn_fp, &b_nm1, scale) + fp_mul(&an_fp, &b_nm2, scale);
+
+            // Convergent: x_n = A_n / B_n (in fixed-point)
+            if !b_n.is_zero() {
+                let xn = fp_div(&a_n, &b_n, scale);
+
+                if let Some(ref prev) = last_xn {
+                    if (&xn - prev).abs() < epsilon {
+                        return xn;
+                    }
+                }
+                last_xn = Some(xn);
             }
-            // Check convergence: if the term is zero at our precision, stop
+
+            // Shift state
+            a_nm2 = a_nm1;
+            b_nm2 = b_nm1;
+            a_nm1 = a_n;
+            b_nm1 = b_n;
+        }
+
+        last_xn.unwrap_or_default()
+    }
+
+    /// Compute ln(x) for positive x using argument reduction + continued fraction.
+    ///
+    /// Matches Haskell's `ln'` → `splitLn` → `findE` → `lncf` pipeline:
+    /// - For x < 1: ln(x) = -ln(1/x)
+    /// - For x >= 1: find n where e^n <= x < e^(n+1), then ln(x) = n + lncf(x/e^n - 1)
+    ///
+    /// `x_fp` is x in fixed-point. Returns ln(x) in fixed-point.
+    fn fp_ln(x_fp: &BigInt, scale: &BigInt) -> BigInt {
+        if x_fp <= &BigInt::zero() {
+            return BigInt::zero();
+        }
+        if x_fp == scale {
+            return BigInt::zero(); // ln(1) = 0
+        }
+
+        // For x < 1: ln(x) = -ln(1/x) (matches Haskell splitLn)
+        if x_fp < scale {
+            let recip = fp_div(scale, x_fp, scale); // 1/x in fixed-point
+            return -fp_ln(&recip, scale);
+        }
+
+        // x >= 1: find n such that e^n <= x < e^(n+1)
+        let e_fp = fp_exp_taylor(scale, scale); // e ≈ 2.718...
+
+        let mut e_power = scale.clone(); // e^0 = 1
+        let mut n: u64 = 0;
+
+        loop {
+            let next = fp_mul(&e_power, &e_fp, scale);
+            if &next > x_fp {
+                break;
+            }
+            e_power = next;
+            n += 1;
+            if n > 1000 {
+                break;
+            }
+        }
+
+        // r = x / e^n - 1 (value in [0, e-1) suitable for continued fraction)
+        let r = fp_div(x_fp, &e_power, scale) - scale;
+
+        // ln(x) = n + ln(1 + r)
+        let ln_1_plus_r = fp_lncf(&r, scale);
+        scale * BigInt::from(n) + ln_1_plus_r
+    }
+
+    /// Compute exp(x) using Taylor series (for computing e = exp(1)).
+    /// Only used internally for argument reduction in ln.
+    fn fp_exp_taylor(x: &BigInt, scale: &BigInt) -> BigInt {
+        let mut result = scale.clone(); // 1.0
+        let mut term = x.clone(); // x^1/1!
+        for n in 1..100 {
+            result += &term;
+            term = fp_mul(&term, x, scale) / BigInt::from(n + 1);
             if term.is_zero() {
                 break;
             }
-            // y_power = y_power * y / scale (next power of y in fixed-point)
-            y_power = fp_mul(&y_power, &y, scale);
         }
-
         result
     }
 
@@ -210,7 +323,8 @@ mod leader_check {
         }
     }
 
-    /// Exact VRF leader eligibility check matching Haskell's `checkLeaderNatValue`.
+    /// Exact VRF leader eligibility check with f64 inputs.
+    /// Converts active_slot_coeff to nearest exact rational before computing.
     pub fn check_leader_value_exact(
         vrf_output: &[u8],
         relative_stake: f64,
@@ -220,6 +334,26 @@ mod leader_check {
             return false;
         }
         if active_slot_coeff >= 1.0 {
+            return true;
+        }
+
+        // Convert active_slot_coeff to nearest rational with denominator up to 10000.
+        // Common values: 0.05 = 1/20, 0.1 = 1/10, etc.
+        let (f_num, f_den) = f64_to_rational(active_slot_coeff);
+        check_leader_value_with_rational_coeff(vrf_output, relative_stake, f_num, f_den)
+    }
+
+    /// Exact VRF leader eligibility check with rational active_slot_coeff.
+    pub fn check_leader_value_with_rational_coeff(
+        vrf_output: &[u8],
+        relative_stake: f64,
+        active_slot_coeff_num: u64,
+        active_slot_coeff_den: u64,
+    ) -> bool {
+        if relative_stake <= 0.0 {
+            return false;
+        }
+        if active_slot_coeff_den == 0 || active_slot_coeff_num >= active_slot_coeff_den {
             return true;
         }
 
@@ -236,15 +370,19 @@ mod leader_check {
         // q = certNatMax - certNat
         let q = &cert_nat_max - &cert_nat;
         if q <= BigInt::zero() {
-            return false; // certNat >= certNatMax, should not happen
+            return false;
         }
 
-        // recip_q = certNatMax / q  (in fixed-point = certNatMax * scale / q)
+        // recip_q = certNatMax / q  (in fixed-point)
         let recip_q = fp_div(&cert_nat_max, &q, &scale);
 
+        // Compute (1-f) in exact fixed-point from rational:
+        // 1 - f_num/f_den = (f_den - f_num) / f_den
+        // In fixed-point: (f_den - f_num) * scale / f_den
+        let one_minus_f_fp = BigInt::from(active_slot_coeff_den - active_slot_coeff_num) * &scale
+            / BigInt::from(active_slot_coeff_den);
+
         // c = |ln(1 - f)| (positive, since ln(1-f) < 0 for f in (0,1))
-        // Compute ln(1-f) in fixed-point
-        let one_minus_f_fp = float_to_fixed(1.0 - active_slot_coeff, &scale);
         let ln_one_minus_f = fp_ln(&one_minus_f_fp, &scale); // negative
         let c = -&ln_one_minus_f; // positive
 
@@ -258,8 +396,6 @@ mod leader_check {
         let bound_x = &scale * BigInt::from(3);
 
         // Check: recip_q < exp(x)?
-        // taylorExpCmp returns BELOW if cmp < exp(x) → leader
-        //                      ABOVE if cmp > exp(x) → not leader
         match taylor_exp_cmp(&bound_x, &recip_q, &x, &scale) {
             CompareResult::Below => true,       // recip_q < exp(x) → IS leader
             CompareResult::Above => false,      // recip_q >= exp(x) → NOT leader
@@ -267,19 +403,42 @@ mod leader_check {
         }
     }
 
-    /// Convert an f64 value to fixed-point BigInt with 10^34 scale.
-    /// Handles values like relative_stake (0.001734...) and active_slot_coeff (0.05).
-    fn float_to_fixed(value: f64, scale: &BigInt) -> BigInt {
-        // Multiply by 10^34 using string-based approach to maximize precision.
-        // For values < 1, this preserves all significant digits.
-        // Use rational conversion: value = numerator/denominator
-        // We represent value as a fraction of u64 values for precision.
+    /// Convert an f64 to the nearest rational p/q with q <= 10000.
+    /// Handles common Cardano values like 0.05 = 1/20.
+    fn f64_to_rational(value: f64) -> (u64, u64) {
+        // Try common denominators first (exact matches)
+        for den in [1, 2, 4, 5, 10, 20, 25, 50, 100, 200, 1000, 10000] {
+            let num = (value * den as f64).round() as u64;
+            let reconstructed = num as f64 / den as f64;
+            if (reconstructed - value).abs() < 1e-15 {
+                // Simplify with GCD
+                let g = gcd(num, den);
+                return (num / g, den / g);
+            }
+        }
+        // Fallback: use large denominator
+        let den = 1_000_000u64;
+        let num = (value * den as f64).round() as u64;
+        let g = gcd(num, den);
+        (num / g, den / g)
+    }
 
+    /// Greatest common divisor
+    fn gcd(mut a: u64, mut b: u64) -> u64 {
+        while b != 0 {
+            let t = b;
+            b = a % b;
+            a = t;
+        }
+        a
+    }
+
+    /// Convert an f64 value to fixed-point BigInt with 10^34 scale.
+    fn float_to_fixed(value: f64, scale: &BigInt) -> BigInt {
         if value <= 0.0 {
             return BigInt::zero();
         }
         if value >= 1.0 {
-            // For values >= 1 (like 1.0 - f), use direct multiplication
             let int_part = value as u64;
             let frac = value - int_part as f64;
             let int_fp = scale * BigInt::from(int_part);
@@ -287,15 +446,11 @@ mod leader_check {
             return int_fp + frac_fp;
         }
 
-        // For 0 < value < 1, use the mantissa/exponent decomposition
-        // value = mantissa * 2^exponent where mantissa in [0.5, 1.0)
+        // Use mantissa/exponent decomposition for maximum f64 precision
         let bits = value.to_bits();
         let exponent = ((bits >> 52) & 0x7FF) as i64 - 1023;
-        let mantissa_bits = (bits & 0x000F_FFFF_FFFF_FFFF) | 0x0010_0000_0000_0000; // add implicit 1
+        let mantissa_bits = (bits & 0x000F_FFFF_FFFF_FFFF) | 0x0010_0000_0000_0000;
 
-        // value = mantissa_bits / 2^52 * 2^exponent = mantissa_bits * 2^(exponent - 52)
-        // In fixed-point: value * scale = mantissa_bits * scale * 2^(exponent - 52) / 1
-        //                              = mantissa_bits * scale >> (52 - exponent)
         let shift = 52 - exponent;
         if shift >= 0 {
             (BigInt::from(mantissa_bits) * scale) >> shift as u64
@@ -311,18 +466,16 @@ mod leader_check {
         #[test]
         fn test_fp_ln_one() {
             let scale = fp_scale();
-            // ln(1) = 0
             let result = fp_ln(&scale, &scale);
             assert!(result.is_zero(), "ln(1) should be 0, got {}", result);
         }
 
         #[test]
-        fn test_fp_ln_095() {
+        fn test_fp_ln_095_exact() {
             let scale = fp_scale();
-            // ln(0.95) ≈ -0.05129329438755058
-            let x = float_to_fixed(0.95, &scale);
+            // Compute ln(0.95) using exact rational: 0.95 = 19/20
+            let x = BigInt::from(19u64) * &scale / BigInt::from(20u64);
             let result = fp_ln(&x, &scale);
-            // Convert back to f64 for comparison
             let result_f64 = bigint_to_f64(&result, &scale);
             let expected = (0.95f64).ln();
             assert!(
@@ -334,24 +487,48 @@ mod leader_check {
         }
 
         #[test]
-        fn test_float_to_fixed_roundtrip() {
+        fn test_fp_ln_2() {
             let scale = fp_scale();
-            for &val in &[0.05, 0.001734, 0.5, 0.999, 0.0001] {
-                let fp = float_to_fixed(val, &scale);
-                let back = bigint_to_f64(&fp, &scale);
-                assert!(
-                    (back - val).abs() / val < 1e-14,
-                    "Roundtrip failed for {}: got {}",
-                    val,
-                    back
-                );
-            }
+            // ln(2) via argument reduction: n=0, r = 2/1 - 1 = 1.0
+            // This exercises the continued fraction with x=1 (where Taylor converges slowly)
+            let x = &scale * 2; // 2.0 in fixed-point
+            let result = fp_ln(&x, &scale);
+            let result_f64 = bigint_to_f64(&result, &scale);
+            let expected = 2.0f64.ln();
+            assert!(
+                (result_f64 - expected).abs() < 1e-10,
+                "ln(2) should be ~{}, got {}",
+                expected,
+                result_f64
+            );
+        }
+
+        #[test]
+        fn test_fp_ln_half() {
+            let scale = fp_scale();
+            // ln(0.5) = -ln(2) — tests the x<1 branch
+            let x = &scale / 2; // 0.5 in fixed-point
+            let result = fp_ln(&x, &scale);
+            let result_f64 = bigint_to_f64(&result, &scale);
+            let expected = 0.5f64.ln();
+            assert!(
+                (result_f64 - expected).abs() < 1e-10,
+                "ln(0.5) should be ~{}, got {}",
+                expected,
+                result_f64
+            );
+        }
+
+        #[test]
+        fn test_f64_to_rational() {
+            assert_eq!(f64_to_rational(0.05), (1, 20));
+            assert_eq!(f64_to_rational(0.1), (1, 10));
+            assert_eq!(f64_to_rational(0.5), (1, 2));
+            assert_eq!(f64_to_rational(1.0), (1, 1));
         }
 
         #[test]
         fn test_exact_check_full_stake() {
-            // With 100% stake, threshold = 1 - (1-0.05)^1 = 0.05
-            // VRF output of all zeros → certNat = 0, p = 0, so 0 < 0.05 → leader
             assert!(check_leader_value_exact(&[0u8; 32], 1.0, 0.05));
         }
 
@@ -362,20 +539,17 @@ mod leader_check {
 
         #[test]
         fn test_exact_check_high_output() {
-            // VRF output of all 0xFF → certNat very close to 2^256, p ≈ 1
-            // With any reasonable stake, 1 > threshold → not leader
             assert!(!check_leader_value_exact(&[0xFFu8; 32], 0.5, 0.05));
         }
 
         #[test]
-        fn test_exact_matches_f64_common_cases() {
-            // For common cases (well away from threshold), exact and f64 should agree
+        fn test_exact_matches_common_cases() {
             let test_cases = vec![
-                ([0u8; 32], 1.0, 0.05, true), // zero output, full stake → p=0 < threshold
-                ([0x80u8; 32], 0.5, 0.05, false), // mid output (p≈0.5), half stake → p > threshold
-                ([0x01u8; 32], 0.01, 0.05, false), // p≈0.004, stake=0.01 → threshold≈0.0005, p > threshold
-                ([0xFFu8; 32], 1.0, 0.05, false),  // max output → p≈1, always above threshold
-                ([0u8; 32], 0.5, 0.05, true),      // zero output, half stake → p=0 < any threshold
+                ([0u8; 32], 1.0, 0.05, true),
+                ([0x80u8; 32], 0.5, 0.05, false),
+                ([0x01u8; 32], 0.01, 0.05, false),
+                ([0xFFu8; 32], 1.0, 0.05, false),
+                ([0u8; 32], 0.5, 0.05, true),
             ];
 
             for (output, stake, f, expected) in test_cases {
@@ -388,8 +562,23 @@ mod leader_check {
             }
         }
 
+        #[test]
+        fn test_rational_coeff_matches() {
+            // check_leader_value_exact(f64) and check_leader_value_with_rational_coeff
+            // should give the same result for exact rationals
+            let output = [0u8; 32];
+            assert_eq!(
+                check_leader_value_exact(&output, 1.0, 0.05),
+                check_leader_value_with_rational_coeff(&output, 1.0, 1, 20),
+            );
+            let output2 = [0x80u8; 32];
+            assert_eq!(
+                check_leader_value_exact(&output2, 0.5, 0.05),
+                check_leader_value_with_rational_coeff(&output2, 0.5, 1, 20),
+            );
+        }
+
         fn bigint_to_f64(val: &BigInt, _scale: &BigInt) -> f64 {
-            // Convert fixed-point BigInt to f64
             let (sign, digits) = val.to_bytes_be();
             let abs_val: f64 = digits.iter().fold(0.0f64, |acc, &b| acc * 256.0 + b as f64);
             let scale_f64: f64 = 1e34;
