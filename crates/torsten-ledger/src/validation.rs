@@ -5,7 +5,7 @@ use torsten_primitives::hash::{Hash28, Hash32, PolicyId};
 use torsten_primitives::protocol_params::ProtocolParameters;
 use torsten_primitives::time::SlotNo;
 use torsten_primitives::transaction::{
-    Certificate, NativeScript, ScriptRef, Transaction, TransactionInput,
+    Certificate, NativeScript, RedeemerTag, ScriptRef, Transaction, TransactionInput,
 };
 use torsten_primitives::value::{AssetName, Lovelace};
 use tracing::{debug, trace, warn};
@@ -89,6 +89,10 @@ pub enum ValidationError {
     OutputValueTooLarge { maximum: u64, actual: u64 },
     #[error("Plutus transaction missing raw CBOR for script evaluation")]
     MissingRawCbor,
+    #[error("Script-locked input at index {index} has no matching Spend redeemer")]
+    MissingSpendRedeemer { index: u32 },
+    #[error("Redeemer index out of range: tag={tag}, index={index}, max={max}")]
+    RedeemerIndexOutOfRange { tag: String, index: u32, max: usize },
 }
 
 /// Validate a transaction against the current UTxO set and protocol parameters
@@ -499,6 +503,80 @@ pub fn validate_transaction(
             .sum();
         if total_mem > params.max_tx_ex_units.mem || total_steps > params.max_tx_ex_units.steps {
             errors.push(ValidationError::ExUnitsExceeded);
+        }
+
+        // Rule 11b: Validate redeemer indices are within bounds
+        {
+            let input_count = body.inputs.len();
+            let mint_count = body.mint.len();
+            let cert_count = body.certificates.len();
+            let withdrawal_count = body.withdrawals.len();
+
+            for redeemer in &tx.witness_set.redeemers {
+                let (max, tag_name) = match redeemer.tag {
+                    RedeemerTag::Spend => (input_count, "Spend"),
+                    RedeemerTag::Mint => (mint_count, "Mint"),
+                    RedeemerTag::Cert => (cert_count, "Cert"),
+                    RedeemerTag::Reward => (withdrawal_count, "Reward"),
+                    RedeemerTag::Vote => continue,    // dynamic count
+                    RedeemerTag::Propose => continue, // dynamic count
+                };
+                if redeemer.index as usize >= max {
+                    errors.push(ValidationError::RedeemerIndexOutOfRange {
+                        tag: tag_name.to_string(),
+                        index: redeemer.index,
+                        max,
+                    });
+                }
+            }
+        }
+
+        // Rule 11c: Script-locked inputs must have matching Spend redeemers
+        {
+            let spend_indices: HashSet<u32> = tx
+                .witness_set
+                .redeemers
+                .iter()
+                .filter(|r| r.tag == RedeemerTag::Spend)
+                .map(|r| r.index)
+                .collect();
+
+            // Sort inputs for deterministic index assignment (Cardano sorts by (tx_id, index))
+            let mut sorted_inputs: Vec<_> = body.inputs.iter().collect();
+            sorted_inputs.sort_by(|a, b| {
+                a.transaction_id
+                    .cmp(&b.transaction_id)
+                    .then(a.index.cmp(&b.index))
+            });
+
+            for (idx, input) in sorted_inputs.iter().enumerate() {
+                if let Some(utxo) = utxo_set.lookup(input) {
+                    let is_script_locked = match &utxo.address {
+                        torsten_primitives::address::Address::Base(b) => {
+                            matches!(
+                                b.payment,
+                                torsten_primitives::credentials::Credential::Script(_)
+                            )
+                        }
+                        torsten_primitives::address::Address::Enterprise(e) => {
+                            matches!(
+                                e.payment,
+                                torsten_primitives::credentials::Credential::Script(_)
+                            )
+                        }
+                        torsten_primitives::address::Address::Pointer(p) => {
+                            matches!(
+                                p.payment,
+                                torsten_primitives::credentials::Credential::Script(_)
+                            )
+                        }
+                        _ => false,
+                    };
+                    if is_script_locked && !spend_indices.contains(&(idx as u32)) {
+                        errors.push(ValidationError::MissingSpendRedeemer { index: idx as u32 });
+                    }
+                }
+            }
         }
 
         // Rule 12: Script data hash validation
@@ -2388,5 +2466,262 @@ mod tests {
         let tx = make_simple_tx(input, 9_800_000, 200_000);
         let result = validate_transaction(&tx, &utxo_set, &params, 100, 300, None);
         assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_redeemer_index_out_of_range() {
+        let (utxo_set, input) = make_simple_utxo_set();
+        let params = ProtocolParameters::mainnet_defaults();
+        let mut tx = make_simple_tx(input.clone(), 9_000_000, 1_000_000);
+
+        // Add a Spend redeemer with index 5, but we only have 1 input
+        tx.witness_set.redeemers.push(Redeemer {
+            tag: RedeemerTag::Spend,
+            index: 5,
+            data: PlutusData::Integer(0),
+            ex_units: ExUnits {
+                mem: 100,
+                steps: 100,
+            },
+        });
+        // Add a Plutus V2 script to trigger Plutus path
+        tx.witness_set.plutus_v2_scripts.push(vec![0x01, 0x02]);
+
+        // Need collateral for Plutus tx
+        let col_input = TransactionInput {
+            transaction_id: Hash32::from_bytes([2u8; 32]),
+            index: 0,
+        };
+        let mut utxo = utxo_set;
+        utxo.insert(
+            col_input.clone(),
+            TransactionOutput {
+                address: Address::Byron(ByronAddress {
+                    payload: vec![0u8; 32],
+                }),
+                value: Value::lovelace(5_000_000),
+                datum: OutputDatum::None,
+                script_ref: None,
+                raw_cbor: None,
+            },
+        );
+        tx.body.collateral = vec![col_input];
+
+        let result = validate_transaction(&tx, &utxo, &params, 100, 300, None);
+        assert!(result.is_err());
+        let errors = result.unwrap_err();
+        assert!(errors
+            .iter()
+            .any(|e| matches!(e, ValidationError::RedeemerIndexOutOfRange { .. })));
+    }
+
+    #[test]
+    fn test_script_locked_input_missing_redeemer() {
+        use torsten_primitives::address::EnterpriseAddress;
+        use torsten_primitives::credentials::Credential;
+
+        let script_hash = Hash28::from_bytes([0xaa; 28]);
+        let input = TransactionInput {
+            transaction_id: Hash32::from_bytes([3u8; 32]),
+            index: 0,
+        };
+        let mut utxo_set = UtxoSet::new();
+        utxo_set.insert(
+            input.clone(),
+            TransactionOutput {
+                address: Address::Enterprise(EnterpriseAddress {
+                    network: torsten_primitives::network::NetworkId::Testnet,
+                    payment: Credential::Script(script_hash),
+                }),
+                value: Value::lovelace(10_000_000),
+                datum: OutputDatum::None,
+                script_ref: None,
+                raw_cbor: None,
+            },
+        );
+
+        // Add collateral
+        let col_input = TransactionInput {
+            transaction_id: Hash32::from_bytes([4u8; 32]),
+            index: 0,
+        };
+        utxo_set.insert(
+            col_input.clone(),
+            TransactionOutput {
+                address: Address::Byron(ByronAddress {
+                    payload: vec![0u8; 32],
+                }),
+                value: Value::lovelace(5_000_000),
+                datum: OutputDatum::None,
+                script_ref: None,
+                raw_cbor: None,
+            },
+        );
+
+        let params = ProtocolParameters::mainnet_defaults();
+        let tx = Transaction {
+            hash: Hash32::ZERO,
+            body: TransactionBody {
+                inputs: vec![input],
+                outputs: vec![TransactionOutput {
+                    address: Address::Byron(ByronAddress {
+                        payload: vec![0u8; 32],
+                    }),
+                    value: Value::lovelace(9_000_000),
+                    datum: OutputDatum::None,
+                    script_ref: None,
+                    raw_cbor: None,
+                }],
+                fee: Lovelace(1_000_000),
+                ttl: None,
+                certificates: vec![],
+                withdrawals: BTreeMap::new(),
+                auxiliary_data_hash: None,
+                validity_interval_start: None,
+                mint: BTreeMap::new(),
+                script_data_hash: None,
+                collateral: vec![col_input],
+                required_signers: vec![],
+                network_id: None,
+                collateral_return: None,
+                total_collateral: None,
+                reference_inputs: vec![],
+                voting_procedures: BTreeMap::new(),
+                proposal_procedures: vec![],
+                treasury_value: None,
+                donation: None,
+            },
+            witness_set: TransactionWitnessSet {
+                vkey_witnesses: vec![],
+                native_scripts: vec![],
+                bootstrap_witnesses: vec![],
+                plutus_v1_scripts: vec![],
+                plutus_v2_scripts: vec![vec![0x01]],
+                plutus_v3_scripts: vec![],
+                plutus_data: vec![],
+                redeemers: vec![], // No redeemers — missing for the script input
+            },
+            is_valid: true,
+            auxiliary_data: None,
+            raw_cbor: None,
+        };
+
+        let result = validate_transaction(&tx, &utxo_set, &params, 100, 300, None);
+        assert!(result.is_err());
+        let errors = result.unwrap_err();
+        assert!(errors
+            .iter()
+            .any(|e| matches!(e, ValidationError::MissingSpendRedeemer { .. })));
+    }
+
+    #[test]
+    fn test_script_locked_input_with_redeemer_ok() {
+        use torsten_primitives::address::EnterpriseAddress;
+        use torsten_primitives::credentials::Credential;
+
+        let script_hash = Hash28::from_bytes([0xbb; 28]);
+        let input = TransactionInput {
+            transaction_id: Hash32::from_bytes([5u8; 32]),
+            index: 0,
+        };
+        let mut utxo_set = UtxoSet::new();
+        utxo_set.insert(
+            input.clone(),
+            TransactionOutput {
+                address: Address::Enterprise(EnterpriseAddress {
+                    network: torsten_primitives::network::NetworkId::Testnet,
+                    payment: Credential::Script(script_hash),
+                }),
+                value: Value::lovelace(10_000_000),
+                datum: OutputDatum::None,
+                script_ref: None,
+                raw_cbor: None,
+            },
+        );
+
+        let col_input = TransactionInput {
+            transaction_id: Hash32::from_bytes([6u8; 32]),
+            index: 0,
+        };
+        utxo_set.insert(
+            col_input.clone(),
+            TransactionOutput {
+                address: Address::Byron(ByronAddress {
+                    payload: vec![0u8; 32],
+                }),
+                value: Value::lovelace(5_000_000),
+                datum: OutputDatum::None,
+                script_ref: None,
+                raw_cbor: None,
+            },
+        );
+
+        let params = ProtocolParameters::mainnet_defaults();
+        let tx = Transaction {
+            hash: Hash32::ZERO,
+            body: TransactionBody {
+                inputs: vec![input],
+                outputs: vec![TransactionOutput {
+                    address: Address::Byron(ByronAddress {
+                        payload: vec![0u8; 32],
+                    }),
+                    value: Value::lovelace(9_000_000),
+                    datum: OutputDatum::None,
+                    script_ref: None,
+                    raw_cbor: None,
+                }],
+                fee: Lovelace(1_000_000),
+                ttl: None,
+                certificates: vec![],
+                withdrawals: BTreeMap::new(),
+                auxiliary_data_hash: None,
+                validity_interval_start: None,
+                mint: BTreeMap::new(),
+                script_data_hash: Some(Hash32::ZERO), // Will be wrong but we skip that check
+                collateral: vec![col_input],
+                required_signers: vec![],
+                network_id: None,
+                collateral_return: None,
+                total_collateral: None,
+                reference_inputs: vec![],
+                voting_procedures: BTreeMap::new(),
+                proposal_procedures: vec![],
+                treasury_value: None,
+                donation: None,
+            },
+            witness_set: TransactionWitnessSet {
+                vkey_witnesses: vec![],
+                native_scripts: vec![],
+                bootstrap_witnesses: vec![],
+                plutus_v1_scripts: vec![],
+                plutus_v2_scripts: vec![vec![0x01]],
+                plutus_v3_scripts: vec![],
+                plutus_data: vec![],
+                redeemers: vec![Redeemer {
+                    tag: RedeemerTag::Spend,
+                    index: 0, // Matching index for the script input
+                    data: PlutusData::Integer(42),
+                    ex_units: ExUnits {
+                        mem: 1000,
+                        steps: 1000,
+                    },
+                }],
+            },
+            is_valid: true,
+            auxiliary_data: None,
+            raw_cbor: None,
+        };
+
+        let result = validate_transaction(&tx, &utxo_set, &params, 100, 300, None);
+        // Should not have MissingSpendRedeemer error
+        // (may have other errors like ScriptDataHashMismatch, but not missing redeemer)
+        match result {
+            Ok(()) => {} // OK
+            Err(errors) => {
+                assert!(!errors
+                    .iter()
+                    .any(|e| matches!(e, ValidationError::MissingSpendRedeemer { .. })));
+            }
+        }
     }
 }
