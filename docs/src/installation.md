@@ -73,7 +73,12 @@ Torsten requires **Rust 1.75 or later** (edition 2021).
 
 #### System Dependencies
 
-Torsten uses RocksDB for persistent storage, which requires `libclang` for compilation.
+The default build uses [cardano-lsm](https://crates.io/crates/cardano-lsm), a pure Rust storage backend with **no system dependencies** beyond the Rust toolchain. On all platforms, `cargo build` works out of the box.
+
+If you opt into the RocksDB backend (`--features rocksdb`), you will need `libclang` for compilation:
+
+<details>
+<summary>RocksDB system dependencies (only needed with <code>--features rocksdb</code>)</summary>
 
 **Ubuntu / Debian:**
 
@@ -106,6 +111,8 @@ sudo dnf install clang-devel
 sudo pacman -S clang
 ```
 
+</details>
+
 ### Build
 
 Clone the repository:
@@ -115,10 +122,16 @@ git clone https://github.com/michaeljfazio/torsten.git
 cd torsten
 ```
 
-Build in release mode:
+Build in release mode (default, uses cardano-lsm):
 
 ```bash
 cargo build --release
+```
+
+To build with the RocksDB backend instead:
+
+```bash
+cargo build --release --features rocksdb
 ```
 
 This produces two binaries in `target/release/`:
