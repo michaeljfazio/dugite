@@ -178,6 +178,16 @@ pub struct GovernanceState {
     /// This is the fraction of active CC members that must vote Yes to approve.
     #[serde(default)]
     pub committee_threshold: Option<Rational>,
+    /// Last enacted governance action IDs per purpose (for prev_action_id chain validation).
+    /// Matches Haskell's `GovRelation StrictMaybe` / `ensPrevGovActionIds`.
+    #[serde(default)]
+    pub enacted_pparam_update: Option<GovActionId>,
+    #[serde(default)]
+    pub enacted_hard_fork: Option<GovActionId>,
+    #[serde(default)]
+    pub enacted_committee: Option<GovActionId>,
+    #[serde(default)]
+    pub enacted_constitution: Option<GovActionId>,
 }
 
 /// Registration state for a DRep
@@ -1789,27 +1799,84 @@ impl LedgerState {
     /// A proposal is ratified when it meets the required voting thresholds.
     /// Thresholds vary by action type and involve DRep, SPO, and/or CC votes.
     /// Ratified proposals are enacted (their effects applied) and removed.
+    ///
+    /// Per Haskell Ratify.hs, proposals are processed:
+    /// 1. Sorted by priority (NoConfidence > UpdateCommittee > ... > InfoAction)
+    /// 2. Sequentially with state threading (enacted roots update between proposals)
+    /// 3. With a "delaying action" flag that blocks further ratification
+    /// 4. With prev_action_id chain validation (must match last enacted of same purpose)
     fn ratify_proposals(&mut self) {
         let total_drep_stake = self.compute_total_drep_stake();
         let total_spo_stake = self.compute_total_spo_stake();
 
-        // Collect ratified proposal IDs and their actions
-        let ratified: Vec<(GovActionId, GovAction)> = self
+        // Collect all proposals sorted by priority (lower = higher priority)
+        let mut candidates: Vec<(GovActionId, GovAction, EpochNo)> = self
             .governance
             .proposals
             .iter()
-            .filter(|(action_id, state)| {
-                self.check_ratification(action_id, state, total_drep_stake, total_spo_stake)
+            .map(|(id, state)| {
+                (
+                    id.clone(),
+                    state.procedure.gov_action.clone(),
+                    state.expires_epoch,
+                )
             })
-            .map(|(id, state)| (id.clone(), state.procedure.gov_action.clone()))
             .collect();
+        candidates.sort_by_key(|(_, action, _)| gov_action_priority(action));
 
-        // Enact ratified proposals and refund deposits
+        let mut ratified = Vec::new();
+        let mut delayed = false;
+
+        for (action_id, action, _expires) in &candidates {
+            // Check prev_action_id chain
+            if !prev_action_as_expected(action, &self.governance) {
+                debug!(
+                    action_id = %action_id.transaction_id.to_hex(),
+                    action_type = ?std::mem::discriminant(action),
+                    "Governance proposal: prev_action_id chain mismatch"
+                );
+                continue;
+            }
+
+            // If a delaying action was already enacted this epoch, skip remaining
+            if delayed {
+                debug!(
+                    action_id = %action_id.transaction_id.to_hex(),
+                    "Governance proposal: delayed by previously enacted action"
+                );
+                continue;
+            }
+
+            // Check voting thresholds
+            if let Some(state) = self.governance.proposals.get(action_id) {
+                let met =
+                    self.check_ratification(action_id, state, total_drep_stake, total_spo_stake);
+                if met {
+                    info!(
+                        action_id = %action_id.transaction_id.to_hex(),
+                        action_type = ?std::mem::discriminant(action),
+                        "Governance proposal ratified"
+                    );
+                    // Enact immediately and update roots (for chain validation of subsequent proposals)
+                    self.enact_gov_action(action);
+                    self.update_enacted_root(action_id, action);
+                    ratified.push(action_id.clone());
+                    if is_delaying_action(action) {
+                        delayed = true;
+                    }
+                } else if !matches!(action, GovAction::InfoAction) {
+                    debug!(
+                        action_id = %action_id.transaction_id.to_hex(),
+                        action_type = ?std::mem::discriminant(action),
+                        "Governance proposal not yet ratified"
+                    );
+                }
+            }
+        }
+
+        // Remove ratified proposals and refund deposits
         if !ratified.is_empty() {
-            for (action_id, action) in &ratified {
-                info!("Governance proposal ratified: {:?}", action_id);
-                self.enact_gov_action(action);
-                // Refund proposal deposit to return address
+            for action_id in &ratified {
                 if let Some(proposal_state) = self.governance.proposals.remove(action_id) {
                     let deposit = proposal_state.procedure.deposit;
                     if deposit.0 > 0 {
@@ -1823,15 +1890,32 @@ impl LedgerState {
                         }
                     }
                 }
-            }
-            // Remove all votes for ratified proposals
-            for (id, _) in &ratified {
-                self.governance.votes_by_action.remove(id);
+                self.governance.votes_by_action.remove(action_id);
             }
             info!(
                 "{} governance proposal(s) ratified and enacted",
                 ratified.len()
             );
+        }
+    }
+
+    /// Update the enacted governance root for a given purpose after enactment.
+    fn update_enacted_root(&mut self, action_id: &GovActionId, action: &GovAction) {
+        match action {
+            GovAction::ParameterChange { .. } => {
+                self.governance.enacted_pparam_update = Some(action_id.clone());
+            }
+            GovAction::HardForkInitiation { .. } => {
+                self.governance.enacted_hard_fork = Some(action_id.clone());
+            }
+            GovAction::NoConfidence { .. } | GovAction::UpdateCommittee { .. } => {
+                self.governance.enacted_committee = Some(action_id.clone());
+            }
+            GovAction::NewConstitution { .. } => {
+                self.governance.enacted_constitution = Some(action_id.clone());
+            }
+            // TreasuryWithdrawals and InfoAction don't update any root
+            GovAction::TreasuryWithdrawals { .. } | GovAction::InfoAction => {}
         }
     }
 
@@ -1923,7 +2007,7 @@ impl LedgerState {
                     self.protocol_params.committee_min_size,
                     bootstrap,
                 );
-                debug!(
+                info!(
                     action_id = %action_id.transaction_id.to_hex(),
                     version = ?protocol_version,
                     bootstrap,
@@ -2663,10 +2747,84 @@ fn check_cc_approval(
 
     // If all active members abstained, ratio is 0
     if total_excluding_abstain == 0 {
+        debug!(
+            action = %action_id.transaction_id.to_hex(),
+            active_size, yes_count, total_excluding_abstain, threshold,
+            cc_voters = cc_votes.len(),
+            committee_members = governance.committee_expiration.len(),
+            hot_keys = governance.committee_hot_keys.len(),
+            "CC approval check: all active members abstained"
+        );
         return false;
     }
 
-    (yes_count as f64 / total_excluding_abstain as f64) >= threshold
+    let ratio = yes_count as f64 / total_excluding_abstain as f64;
+    let result = ratio >= threshold;
+    if !result {
+        debug!(
+            action = %action_id.transaction_id.to_hex(),
+            active_size, yes_count, total_excluding_abstain, threshold,
+            ratio, result,
+            cc_voters = cc_votes.len(),
+            committee_members = governance.committee_expiration.len(),
+            hot_keys = governance.committee_hot_keys.len(),
+            "CC approval check failed"
+        );
+    }
+    result
+}
+
+/// Check that a proposal's `prev_action_id` matches the last enacted action of the same
+/// governance purpose. Per Haskell `prevActionAsExpected` in Ratify.hs.
+///
+/// NoConfidence and UpdateCommittee share the `Committee` purpose.
+/// TreasuryWithdrawals and InfoAction have no prev_action_id chain (always pass).
+fn prev_action_as_expected(action: &GovAction, governance: &GovernanceState) -> bool {
+    match action {
+        GovAction::ParameterChange { prev_action_id, .. } => {
+            *prev_action_id == governance.enacted_pparam_update
+        }
+        GovAction::HardForkInitiation { prev_action_id, .. } => {
+            *prev_action_id == governance.enacted_hard_fork
+        }
+        GovAction::NoConfidence { prev_action_id } => {
+            *prev_action_id == governance.enacted_committee
+        }
+        GovAction::UpdateCommittee { prev_action_id, .. } => {
+            *prev_action_id == governance.enacted_committee
+        }
+        GovAction::NewConstitution { prev_action_id, .. } => {
+            *prev_action_id == governance.enacted_constitution
+        }
+        // TreasuryWithdrawals and InfoAction have no chain requirement
+        GovAction::TreasuryWithdrawals { .. } | GovAction::InfoAction => true,
+    }
+}
+
+/// Returns the governance action priority for ratification ordering.
+/// Lower number = higher priority, per Haskell's `actionPriority`.
+fn gov_action_priority(action: &GovAction) -> u8 {
+    match action {
+        GovAction::NoConfidence { .. } => 0,
+        GovAction::UpdateCommittee { .. } => 1,
+        GovAction::NewConstitution { .. } => 2,
+        GovAction::HardForkInitiation { .. } => 3,
+        GovAction::ParameterChange { .. } => 4,
+        GovAction::TreasuryWithdrawals { .. } => 5,
+        GovAction::InfoAction => 6,
+    }
+}
+
+/// Whether enacting this action should delay all further ratification for this epoch.
+/// Per Haskell `delayingAction`: NoConfidence, HardFork, UpdateCommittee, NewConstitution.
+fn is_delaying_action(action: &GovAction) -> bool {
+    matches!(
+        action,
+        GovAction::NoConfidence { .. }
+            | GovAction::HardForkInitiation { .. }
+            | GovAction::UpdateCommittee { .. }
+            | GovAction::NewConstitution { .. }
+    )
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -5753,5 +5911,159 @@ mod tests {
         assert_eq!(state.protocol_params.protocol_version_major, 8);
         assert_eq!(state.protocol_params.protocol_version_minor, 0);
         assert!(state.pending_pp_updates.is_empty());
+    }
+
+    #[test]
+    fn test_prev_action_as_expected_none_chain() {
+        let governance = GovernanceState::default();
+        // Proposals with prev_action_id=None should pass when no actions have been enacted
+        let action = GovAction::HardForkInitiation {
+            prev_action_id: None,
+            protocol_version: (10, 0),
+        };
+        assert!(prev_action_as_expected(&action, &governance));
+
+        let action = GovAction::ParameterChange {
+            prev_action_id: None,
+            protocol_param_update: Box::new(ProtocolParamUpdate::default()),
+            policy_hash: None,
+        };
+        assert!(prev_action_as_expected(&action, &governance));
+    }
+
+    #[test]
+    fn test_prev_action_as_expected_chain_mismatch() {
+        let mut governance = GovernanceState::default();
+        // Set an enacted hard fork root
+        let enacted_id = GovActionId {
+            transaction_id: Hash32::from_bytes([1u8; 32]),
+            action_index: 0,
+        };
+        governance.enacted_hard_fork = Some(enacted_id.clone());
+
+        // Proposal with prev_action_id=None should FAIL (root is Some)
+        let action = GovAction::HardForkInitiation {
+            prev_action_id: None,
+            protocol_version: (11, 0),
+        };
+        assert!(!prev_action_as_expected(&action, &governance));
+
+        // Proposal with wrong prev_action_id should FAIL
+        let wrong_id = GovActionId {
+            transaction_id: Hash32::from_bytes([2u8; 32]),
+            action_index: 0,
+        };
+        let action = GovAction::HardForkInitiation {
+            prev_action_id: Some(wrong_id),
+            protocol_version: (11, 0),
+        };
+        assert!(!prev_action_as_expected(&action, &governance));
+
+        // Proposal with correct prev_action_id should PASS
+        let action = GovAction::HardForkInitiation {
+            prev_action_id: Some(enacted_id),
+            protocol_version: (11, 0),
+        };
+        assert!(prev_action_as_expected(&action, &governance));
+    }
+
+    #[test]
+    fn test_prev_action_committee_shared_purpose() {
+        let mut governance = GovernanceState::default();
+        let enacted_id = GovActionId {
+            transaction_id: Hash32::from_bytes([5u8; 32]),
+            action_index: 0,
+        };
+        governance.enacted_committee = Some(enacted_id.clone());
+
+        // NoConfidence and UpdateCommittee share the committee purpose
+        let no_confidence = GovAction::NoConfidence {
+            prev_action_id: Some(enacted_id.clone()),
+        };
+        assert!(prev_action_as_expected(&no_confidence, &governance));
+
+        let update_committee = GovAction::UpdateCommittee {
+            prev_action_id: Some(enacted_id),
+            members_to_remove: vec![],
+            members_to_add: BTreeMap::new(),
+            threshold: Rational {
+                numerator: 1,
+                denominator: 2,
+            },
+        };
+        assert!(prev_action_as_expected(&update_committee, &governance));
+    }
+
+    #[test]
+    fn test_treasury_and_info_always_pass_chain() {
+        // Even with arbitrary enacted roots, treasury and info always pass
+        let governance = GovernanceState {
+            enacted_pparam_update: Some(GovActionId {
+                transaction_id: Hash32::from_bytes([99u8; 32]),
+                action_index: 0,
+            }),
+            ..Default::default()
+        };
+
+        let treasury = GovAction::TreasuryWithdrawals {
+            withdrawals: BTreeMap::new(),
+            policy_hash: None,
+        };
+        assert!(prev_action_as_expected(&treasury, &governance));
+        assert!(prev_action_as_expected(&GovAction::InfoAction, &governance));
+    }
+
+    #[test]
+    fn test_gov_action_priority_ordering() {
+        assert!(
+            gov_action_priority(&GovAction::NoConfidence {
+                prev_action_id: None
+            }) < gov_action_priority(&GovAction::HardForkInitiation {
+                prev_action_id: None,
+                protocol_version: (10, 0)
+            })
+        );
+        assert!(
+            gov_action_priority(&GovAction::HardForkInitiation {
+                prev_action_id: None,
+                protocol_version: (10, 0)
+            }) < gov_action_priority(&GovAction::ParameterChange {
+                prev_action_id: None,
+                protocol_param_update: Box::new(ProtocolParamUpdate::default()),
+                policy_hash: None
+            })
+        );
+        assert!(
+            gov_action_priority(&GovAction::ParameterChange {
+                prev_action_id: None,
+                protocol_param_update: Box::new(ProtocolParamUpdate::default()),
+                policy_hash: None
+            }) < gov_action_priority(&GovAction::InfoAction)
+        );
+    }
+
+    #[test]
+    fn test_delaying_action() {
+        assert!(is_delaying_action(&GovAction::NoConfidence {
+            prev_action_id: None
+        }));
+        assert!(is_delaying_action(&GovAction::HardForkInitiation {
+            prev_action_id: None,
+            protocol_version: (10, 0)
+        }));
+        assert!(is_delaying_action(&GovAction::UpdateCommittee {
+            prev_action_id: None,
+            members_to_remove: vec![],
+            members_to_add: BTreeMap::new(),
+            threshold: Rational {
+                numerator: 1,
+                denominator: 2
+            },
+        }));
+        assert!(!is_delaying_action(&GovAction::TreasuryWithdrawals {
+            withdrawals: BTreeMap::new(),
+            policy_hash: None,
+        }));
+        assert!(!is_delaying_action(&GovAction::InfoAction));
     }
 }

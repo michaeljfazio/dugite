@@ -1601,10 +1601,28 @@ fn encode_query_result(result: &QueryResult) -> Vec<u8> {
 
             // [0] Proposals = array(2) [roots, values]
             enc.array(2).ok();
-            // roots = array(4) of StrictMaybe GovPurposeId (empty for now)
+            // roots = array(4) of StrictMaybe GovPurposeId
+            // Order: [PParamUpdate, HardFork, Committee, Constitution]
             enc.array(4).ok();
-            for _ in 0..4 {
-                enc.array(0).ok(); // StrictMaybe Nothing = array(0)
+            let roots = [
+                &gov.enacted_pparam_update,
+                &gov.enacted_hard_fork,
+                &gov.enacted_committee,
+                &gov.enacted_constitution,
+            ];
+            for root in &roots {
+                match root {
+                    Some((tx_hash, action_index)) => {
+                        // StrictMaybe Just = array(1) [GovActionId]
+                        enc.array(1).ok();
+                        enc.array(2).ok();
+                        enc.bytes(tx_hash).ok();
+                        enc.u32(*action_index).ok();
+                    }
+                    None => {
+                        enc.array(0).ok(); // StrictMaybe Nothing = array(0)
+                    }
+                }
             }
             // values = array(n) of GovActionState
             enc.array(gov.proposals.len() as u64).ok();
@@ -2413,7 +2431,7 @@ mod tests {
             CommitteeSnapshot, GovStateSnapshot, ProposalSnapshot, ProtocolParamsSnapshot,
         };
 
-        let result = QueryResult::GovState(GovStateSnapshot {
+        let result = QueryResult::GovState(Box::new(GovStateSnapshot {
             proposals: vec![ProposalSnapshot {
                 tx_id: vec![0xaa; 32],
                 action_index: 0,
@@ -2434,7 +2452,11 @@ mod tests {
             constitution_script: None,
             cur_pparams: Box::new(ProtocolParamsSnapshot::default()),
             prev_pparams: Box::new(ProtocolParamsSnapshot::default()),
-        });
+            enacted_pparam_update: None,
+            enacted_hard_fork: None,
+            enacted_committee: None,
+            enacted_constitution: None,
+        }));
         let cbor = encode_query_result(&result);
         assert!(!cbor.is_empty());
 

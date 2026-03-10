@@ -17,7 +17,7 @@ pub enum QueryResult {
     ChainBlockNo(u64),
     ProtocolParams(Box<ProtocolParamsSnapshot>),
     StakeDistribution(Vec<StakePoolSnapshot>),
-    GovState(GovStateSnapshot),
+    GovState(Box<GovStateSnapshot>),
     DRepState(Vec<DRepSnapshot>),
     CommitteeState(CommitteeSnapshot),
     StakeAddressInfo(Vec<StakeAddressSnapshot>),
@@ -443,6 +443,12 @@ pub struct GovStateSnapshot {
     pub cur_pparams: Box<ProtocolParamsSnapshot>,
     /// Previous protocol parameters (defaults to current if not tracked)
     pub prev_pparams: Box<ProtocolParamsSnapshot>,
+    /// Enacted governance roots (prev_action_ids per purpose)
+    /// Each is Option<(tx_hash_bytes, action_index)>
+    pub enacted_pparam_update: Option<(Vec<u8>, u32)>,
+    pub enacted_hard_fork: Option<(Vec<u8>, u32)>,
+    pub enacted_committee: Option<(Vec<u8>, u32)>,
+    pub enacted_constitution: Option<(Vec<u8>, u32)>,
 }
 
 /// Snapshot of a governance proposal (GovActionState)
@@ -527,6 +533,11 @@ pub struct NodeStateSnapshot {
     pub drep_entries: Vec<DRepSnapshot>,
     /// Governance proposals
     pub governance_proposals: Vec<ProposalSnapshot>,
+    /// Enacted governance action roots (for GovState query)
+    pub enacted_pparam_update: Option<(Vec<u8>, u32)>,
+    pub enacted_hard_fork: Option<(Vec<u8>, u32)>,
+    pub enacted_committee: Option<(Vec<u8>, u32)>,
+    pub enacted_constitution: Option<(Vec<u8>, u32)>,
     /// Committee members
     pub committee: CommitteeSnapshot,
     /// Constitution anchor URL
@@ -591,6 +602,10 @@ impl Default for NodeStateSnapshot {
             stake_pools: Vec::new(),
             drep_entries: Vec::new(),
             governance_proposals: Vec::new(),
+            enacted_pparam_update: None,
+            enacted_hard_fork: None,
+            enacted_committee: None,
+            enacted_constitution: None,
             committee: CommitteeSnapshot::default(),
             constitution_url: String::new(),
             constitution_hash: vec![0u8; 32],
@@ -1247,7 +1262,7 @@ impl QueryHandler {
             24 => {
                 // Tag 24: GetGovState
                 debug!("Query: GetGovState");
-                QueryResult::GovState(GovStateSnapshot {
+                QueryResult::GovState(Box::new(GovStateSnapshot {
                     proposals: self.state.governance_proposals.clone(),
                     committee: self.state.committee.clone(),
                     constitution_url: self.state.constitution_url.clone(),
@@ -1255,7 +1270,11 @@ impl QueryHandler {
                     constitution_script: self.state.constitution_script.clone(),
                     cur_pparams: Box::new(self.state.protocol_params.clone()),
                     prev_pparams: Box::new(self.state.protocol_params.clone()),
-                })
+                    enacted_pparam_update: self.state.enacted_pparam_update.clone(),
+                    enacted_hard_fork: self.state.enacted_hard_fork.clone(),
+                    enacted_committee: self.state.enacted_committee.clone(),
+                    enacted_constitution: self.state.enacted_constitution.clone(),
+                }))
             }
             25 => {
                 // Tag 25: GetDRepState

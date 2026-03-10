@@ -547,6 +547,45 @@ impl ConwayGenesis {
         let den = threshold.get("denominator")?.as_u64()?;
         Some((num, den))
     }
+
+    /// Extract committee members from Conway genesis.
+    ///
+    /// Returns a list of (credential_hash_bytes, expiration_epoch) pairs.
+    /// Keys in genesis are formatted as "scriptHash-<hex>" or "keyHash-<hex>".
+    pub fn committee_members(&self) -> Vec<([u8; 32], u64)> {
+        let committee = match self.committee.as_ref() {
+            Some(c) => c,
+            None => return Vec::new(),
+        };
+        let members = match committee.get("members").and_then(|m| m.as_object()) {
+            Some(m) => m,
+            None => return Vec::new(),
+        };
+
+        let mut result = Vec::new();
+        for (key, expiry) in members {
+            let expiration = match expiry.as_u64() {
+                Some(e) => e,
+                None => continue,
+            };
+            // Parse "scriptHash-<hex>" or "keyHash-<hex>" format
+            let hex_str = if let Some(h) = key.strip_prefix("scriptHash-") {
+                h
+            } else if let Some(h) = key.strip_prefix("keyHash-") {
+                h
+            } else {
+                continue;
+            };
+            if let Ok(bytes) = hex::decode(hex_str) {
+                // Committee credentials are 28 bytes; pad to 32 for our Hash32 representation
+                let mut hash = [0u8; 32];
+                let len = bytes.len().min(32);
+                hash[..len].copy_from_slice(&bytes[..len]);
+                result.push((hash, expiration));
+            }
+        }
+        result
+    }
 }
 
 /// Convert a float to a rational approximation
@@ -677,6 +716,65 @@ mod tests {
         // DRep voting thresholds
         assert_eq!(pp.dvt_constitution.numerator, 3);
         assert_eq!(pp.dvt_constitution.denominator, 4); // 0.75
+
+        // No committee section → empty members and no threshold
+        assert!(genesis.committee_threshold().is_none());
+        assert!(genesis.committee_members().is_empty());
+    }
+
+    #[test]
+    fn test_conway_genesis_committee_members() {
+        let json = r#"{
+            "poolVotingThresholds": {
+                "committeeNormal": 0.51, "committeeNoConfidence": 0.51,
+                "hardForkInitiation": 0.51, "motionNoConfidence": 0.51, "ppSecurityGroup": 0.51
+            },
+            "dRepVotingThresholds": {
+                "motionNoConfidence": 0.67, "committeeNormal": 0.67, "committeeNoConfidence": 0.6,
+                "updateToConstitution": 0.75, "hardForkInitiation": 0.6, "ppNetworkGroup": 0.67,
+                "ppEconomicGroup": 0.67, "ppTechnicalGroup": 0.67, "ppGovGroup": 0.75,
+                "treasuryWithdrawal": 0.67
+            },
+            "committeeMinSize": 1,
+            "committeeMaxTermLength": 146,
+            "govActionLifetime": 6,
+            "govActionDeposit": 100000000,
+            "dRepDeposit": 500000000,
+            "dRepActivity": 20,
+            "committee": {
+                "members": {
+                    "scriptHash-ff9babf23fef3f54ec29132c07a8e23807d7b395b143ecd8ff79f4c7": 1000,
+                    "keyHash-aabbccdd00112233445566778899aabbccddeeff00112233445566778899aabb": 500
+                },
+                "threshold": { "numerator": 2, "denominator": 3 }
+            }
+        }"#;
+
+        let genesis: ConwayGenesis = serde_json::from_str(json).unwrap();
+
+        // Threshold
+        let (num, den) = genesis.committee_threshold().unwrap();
+        assert_eq!(num, 2);
+        assert_eq!(den, 3);
+
+        // Members
+        let members = genesis.committee_members();
+        assert_eq!(members.len(), 2);
+
+        // Check the scriptHash member (28-byte credential padded to 32)
+        let script_hash_hex = "ff9babf23fef3f54ec29132c07a8e23807d7b395b143ecd8ff79f4c7";
+        let expected_bytes = hex::decode(script_hash_hex).unwrap();
+        let found = members.iter().any(|(hash, exp)| {
+            hash[..28] == expected_bytes[..] && hash[28..] == [0, 0, 0, 0] && *exp == 1000
+        });
+        assert!(found, "scriptHash member not found with correct expiration");
+
+        // Check keyHash member
+        let found_key = members.iter().any(|(_, exp)| *exp == 500);
+        assert!(
+            found_key,
+            "keyHash member not found with correct expiration"
+        );
     }
 
     #[test]

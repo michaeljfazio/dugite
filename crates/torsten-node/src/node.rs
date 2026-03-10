@@ -362,6 +362,7 @@ impl Node {
 
         // Load Conway genesis if configured
         let mut conway_committee_threshold: Option<(u64, u64)> = None;
+        let mut conway_committee_members: Vec<([u8; 32], u64)> = Vec::new();
         if let Some(ref genesis_path) = args.config.conway_genesis_file {
             let genesis_path = config_dir.join(genesis_path);
             match ConwayGenesis::load(&genesis_path) {
@@ -373,6 +374,7 @@ impl Node {
                         "Conway genesis loaded"
                     );
                     conway_committee_threshold = genesis.committee_threshold();
+                    conway_committee_members = genesis.committee_members();
                     genesis.apply_to_protocol_params(&mut protocol_params);
                 }
                 Err(e) => {
@@ -436,7 +438,7 @@ impl Node {
             }
             ledger
         };
-        // Apply Conway genesis committee threshold if not already set
+        // Apply Conway genesis committee threshold and members if not already set
         if let Some((num, den)) = conway_committee_threshold {
             if ledger.governance.committee_threshold.is_none() {
                 use torsten_primitives::transaction::Rational;
@@ -450,6 +452,22 @@ impl Node {
                     "Applied Conway genesis committee quorum threshold"
                 );
             }
+        }
+        // Seed initial committee members from Conway genesis if committee is empty
+        if ledger.governance.committee_expiration.is_empty() && !conway_committee_members.is_empty()
+        {
+            use torsten_primitives::hash::Hash32;
+            for (hash_bytes, expiration) in &conway_committee_members {
+                let cold_key = Hash32::from_bytes(*hash_bytes);
+                ledger
+                    .governance
+                    .committee_expiration
+                    .insert(cold_key, torsten_primitives::EpochNo(*expiration));
+            }
+            info!(
+                count = conway_committee_members.len(),
+                "Seeded initial committee members from Conway genesis"
+            );
         }
         let ledger_state = Arc::new(RwLock::new(ledger));
         info!("Ledger state initialized");
@@ -2335,6 +2353,26 @@ impl Node {
             stake_pools,
             drep_entries,
             governance_proposals,
+            enacted_pparam_update: ls
+                .governance
+                .enacted_pparam_update
+                .as_ref()
+                .map(|id| (id.transaction_id.as_ref().to_vec(), id.action_index)),
+            enacted_hard_fork: ls
+                .governance
+                .enacted_hard_fork
+                .as_ref()
+                .map(|id| (id.transaction_id.as_ref().to_vec(), id.action_index)),
+            enacted_committee: ls
+                .governance
+                .enacted_committee
+                .as_ref()
+                .map(|id| (id.transaction_id.as_ref().to_vec(), id.action_index)),
+            enacted_constitution: ls
+                .governance
+                .enacted_constitution
+                .as_ref()
+                .map(|id| (id.transaction_id.as_ref().to_vec(), id.action_index)),
             committee,
             constitution_url: ls
                 .governance
