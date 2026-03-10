@@ -10,8 +10,8 @@ use torsten_primitives::hash::{Hash28, Hash32};
 use torsten_primitives::protocol_params::ProtocolParameters;
 use torsten_primitives::time::{BlockNo, EpochNo, SlotNo};
 use torsten_primitives::transaction::{
-    Anchor, Certificate, Constitution, DRep, GovAction, GovActionId, ProposalProcedure,
-    ProtocolParamUpdate, Relay, Vote, Voter, VotingProcedure,
+    Anchor, Certificate, Constitution, DRep, GovAction, GovActionId, MIRSource, MIRTarget,
+    ProposalProcedure, ProtocolParamUpdate, Relay, Vote, Voter, VotingProcedure,
 };
 use torsten_primitives::value::Lovelace;
 use tracing::{debug, info, trace, warn};
@@ -770,6 +770,67 @@ impl LedgerState {
                 // Vote delegation
                 self.governance.vote_delegations.insert(key, drep.clone());
                 debug!("Reg+vote delegated to {:?}", drep);
+            }
+            Certificate::GenesisKeyDelegation {
+                genesis_hash,
+                genesis_delegate_hash,
+                vrf_keyhash,
+            } => {
+                // Genesis key delegation — update genesis delegate mapping
+                // These are rare (Shelley-era governance by genesis keys)
+                debug!(
+                    "Genesis key delegation: {} -> delegate={}, vrf={}",
+                    genesis_hash.to_hex(),
+                    genesis_delegate_hash.to_hex(),
+                    vrf_keyhash.to_hex()
+                );
+            }
+            Certificate::MoveInstantaneousRewards { source, target } => {
+                // MIR: transfer funds between reserves/treasury or distribute to stake credentials
+                match target {
+                    MIRTarget::StakeCredentials(creds) => {
+                        for (cred, amount) in creds {
+                            if *amount > 0 {
+                                let key = credential_to_hash(cred);
+                                let entry = self.reward_accounts.entry(key).or_insert(Lovelace(0));
+                                entry.0 += *amount as u64;
+                                debug!(
+                                    "MIR: distributed {} lovelace from {:?} to {}",
+                                    amount,
+                                    source,
+                                    key.to_hex()
+                                );
+                            }
+                        }
+                    }
+                    MIRTarget::OtherAccountingPot(coin) => {
+                        // Transfer between reserves and treasury
+                        match source {
+                            MIRSource::Reserves => {
+                                // Move from reserves to treasury
+                                if self.reserves.0 >= *coin {
+                                    self.reserves.0 -= *coin;
+                                    self.treasury.0 += *coin;
+                                    debug!(
+                                        "MIR: transferred {} lovelace from reserves to treasury",
+                                        coin
+                                    );
+                                }
+                            }
+                            MIRSource::Treasury => {
+                                // Move from treasury to reserves
+                                if self.treasury.0 >= *coin {
+                                    self.treasury.0 -= *coin;
+                                    self.reserves.0 += *coin;
+                                    debug!(
+                                        "MIR: transferred {} lovelace from treasury to reserves",
+                                        coin
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
             }
         }
     }
@@ -4774,5 +4835,58 @@ mod tests {
 
         state.process_withdrawal(&reward_account, Lovelace(5_000_000));
         assert_eq!(state.reward_accounts.get(&hash_key), Some(&Lovelace(0)));
+    }
+
+    #[test]
+    fn test_mir_stake_credential_distribution() {
+        let mut state = LedgerState::new(ProtocolParameters::mainnet_defaults());
+        let cred = Credential::VerificationKey(Hash28::from_bytes([0xaa; 28]));
+        let key = credential_to_hash(&cred);
+
+        // Register stake credential first
+        state.process_certificate(&Certificate::StakeRegistration(cred.clone()));
+        assert_eq!(state.reward_accounts.get(&key), Some(&Lovelace(0)));
+
+        // MIR: distribute 1_000_000 from reserves
+        state.process_certificate(&Certificate::MoveInstantaneousRewards {
+            source: MIRSource::Reserves,
+            target: MIRTarget::StakeCredentials(vec![(cred.clone(), 1_000_000)]),
+        });
+        assert_eq!(state.reward_accounts.get(&key), Some(&Lovelace(1_000_000)));
+    }
+
+    #[test]
+    fn test_mir_pot_transfer() {
+        let mut state = LedgerState::new(ProtocolParameters::mainnet_defaults());
+        state.reserves = Lovelace(10_000_000);
+        state.treasury = Lovelace(5_000_000);
+
+        // MIR: transfer 2M from reserves to treasury
+        state.process_certificate(&Certificate::MoveInstantaneousRewards {
+            source: MIRSource::Reserves,
+            target: MIRTarget::OtherAccountingPot(2_000_000),
+        });
+        assert_eq!(state.reserves, Lovelace(8_000_000));
+        assert_eq!(state.treasury, Lovelace(7_000_000));
+
+        // MIR: transfer 3M from treasury to reserves
+        state.process_certificate(&Certificate::MoveInstantaneousRewards {
+            source: MIRSource::Treasury,
+            target: MIRTarget::OtherAccountingPot(3_000_000),
+        });
+        assert_eq!(state.reserves, Lovelace(11_000_000));
+        assert_eq!(state.treasury, Lovelace(4_000_000));
+    }
+
+    #[test]
+    fn test_genesis_key_delegation() {
+        let mut state = LedgerState::new(ProtocolParameters::mainnet_defaults());
+        // GenesisKeyDelegation should not panic — just log
+        state.process_certificate(&Certificate::GenesisKeyDelegation {
+            genesis_hash: Hash32::from_bytes([0x11; 32]),
+            genesis_delegate_hash: Hash32::from_bytes([0x22; 32]),
+            vrf_keyhash: Hash32::from_bytes([0x33; 32]),
+        });
+        // No state change expected — just ensures it doesn't crash
     }
 }

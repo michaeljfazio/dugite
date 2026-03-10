@@ -481,6 +481,42 @@ pub fn encode_certificate(cert: &Certificate) -> Vec<u8> {
             buf.extend(encode_uint(deposit.0));
             buf
         }
+        Certificate::GenesisKeyDelegation {
+            genesis_hash,
+            genesis_delegate_hash,
+            vrf_keyhash,
+        } => {
+            let mut buf = encode_array_header(4);
+            buf.extend(encode_uint(5));
+            buf.extend(encode_hash32(genesis_hash));
+            buf.extend(encode_hash32(genesis_delegate_hash));
+            buf.extend(encode_hash32(vrf_keyhash));
+            buf
+        }
+        Certificate::MoveInstantaneousRewards { source, target } => {
+            let mut buf = encode_array_header(2);
+            buf.extend(encode_uint(6));
+            // MIR body: [source, target]
+            let mut mir_buf = encode_array_header(2);
+            mir_buf.extend(encode_uint(match source {
+                MIRSource::Reserves => 0,
+                MIRSource::Treasury => 1,
+            }));
+            match target {
+                MIRTarget::StakeCredentials(creds) => {
+                    mir_buf.extend(encode_map_header(creds.len()));
+                    for (cred, amount) in creds {
+                        mir_buf.extend(encode_credential(cred));
+                        mir_buf.extend(encode_int(*amount as i128));
+                    }
+                }
+                MIRTarget::OtherAccountingPot(coin) => {
+                    mir_buf.extend(encode_uint(*coin));
+                }
+            }
+            buf.extend(mir_buf);
+            buf
+        }
     }
 }
 

@@ -171,6 +171,36 @@ pub enum Certificate {
         drep: DRep,
         deposit: Lovelace,
     },
+    // Pre-Conway legacy certificates
+    /// Genesis key delegation (Shelley-era, cert tag 5)
+    GenesisKeyDelegation {
+        genesis_hash: Hash32,
+        genesis_delegate_hash: Hash32,
+        vrf_keyhash: Hash32,
+    },
+    /// Move instantaneous rewards (Shelley-era, cert tag 6)
+    MoveInstantaneousRewards {
+        /// Source: 0 = Reserves, 1 = Treasury
+        source: MIRSource,
+        /// Target: either per-credential amounts or transfer to other pot
+        target: MIRTarget,
+    },
+}
+
+/// MIR source pot
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum MIRSource {
+    Reserves,
+    Treasury,
+}
+
+/// MIR target
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum MIRTarget {
+    /// Distribute to specific stake credentials with amounts
+    StakeCredentials(Vec<(Credential, i64)>),
+    /// Transfer a coin amount to the other accounting pot
+    OtherAccountingPot(u64),
 }
 
 /// Delegated Representative

@@ -749,7 +749,33 @@ fn convert_alonzo_certificate(
             pool_hash: pallas_hash_to_torsten28(pool_hash),
             epoch: *epoch,
         }),
-        _ => None, // GenesisKeyDelegation, MoveInstantaneousRewards
+        AC::GenesisKeyDelegation(genesis_hash, delegate_hash, vrf_keyhash) => {
+            Some(Certificate::GenesisKeyDelegation {
+                genesis_hash: bytes_to_hash32(genesis_hash),
+                genesis_delegate_hash: bytes_to_hash32(delegate_hash),
+                vrf_keyhash: pallas_hash_to_torsten32(vrf_keyhash),
+            })
+        }
+        AC::MoveInstantaneousRewardsCert(mir) => {
+            use pallas_primitives::alonzo::{InstantaneousRewardSource, InstantaneousRewardTarget};
+            let source = match mir.source {
+                InstantaneousRewardSource::Reserves => MIRSource::Reserves,
+                InstantaneousRewardSource::Treasury => MIRSource::Treasury,
+            };
+            let target = match &mir.target {
+                InstantaneousRewardTarget::StakeCredentials(creds) => {
+                    let entries = creds
+                        .iter()
+                        .map(|(cred, amount)| (convert_pallas_stake_credential(cred), *amount))
+                        .collect();
+                    MIRTarget::StakeCredentials(entries)
+                }
+                InstantaneousRewardTarget::OtherAccountingPot(coin) => {
+                    MIRTarget::OtherAccountingPot(*coin)
+                }
+            };
+            Some(Certificate::MoveInstantaneousRewards { source, target })
+        }
     }
 }
 
