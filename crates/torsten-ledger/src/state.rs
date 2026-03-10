@@ -1218,9 +1218,11 @@ impl LedgerState {
                 );
             }
         }
-        // Clean up proposals targeting past epochs
+        // Clean up proposals targeting past epochs (already applied above).
+        // Keep proposals targeting new_epoch or later — they'll be applied at
+        // the NEXT epoch boundary (new_epoch → new_epoch+1).
         self.pending_pp_updates
-            .retain(|epoch, _| *epoch > new_epoch);
+            .retain(|epoch, _| *epoch >= new_epoch);
 
         // Ratify governance proposals that have met their voting thresholds
         self.ratify_proposals();
@@ -5239,6 +5241,52 @@ mod tests {
         state.process_epoch_transition(EpochNo(10));
 
         // All past proposals should be cleaned up
+        assert!(state.pending_pp_updates.is_empty());
+    }
+
+    #[test]
+    fn test_pre_conway_pp_update_survives_intermediate_epoch() {
+        // Regression test: proposals targeting epoch E must survive the
+        // (E-1) → E transition cleanup and be applied at the E → (E+1) boundary.
+        // This simulates the 7→8 transition on preview testnet where proposals
+        // targeting epoch 21 are submitted in epoch 20 and must survive the
+        // 20→21 cleanup to be applied at the 21→22 boundary.
+        let mut state = LedgerState::new(ProtocolParameters::mainnet_defaults());
+        state.update_quorum = 5;
+        state.epoch = EpochNo(20);
+        state.epoch_length = 100;
+
+        // 7 genesis delegates propose protocol_version=8.0 targeting epoch 21
+        let proposers: Vec<Hash32> = (0..7)
+            .map(|i| Hash32::from_bytes([i + 1; 32]))
+            .collect();
+        for hash in &proposers {
+            let update = ProtocolParamUpdate {
+                protocol_version_major: Some(8),
+                protocol_version_minor: Some(0),
+                ..Default::default()
+            };
+            state
+                .pending_pp_updates
+                .entry(EpochNo(21))
+                .or_default()
+                .push((*hash, update));
+        }
+
+        // Transition 20→21: proposals target epoch 21, should NOT be applied yet
+        // but must survive the cleanup
+        state.process_epoch_transition(EpochNo(21));
+        assert!(
+            !state.pending_pp_updates.is_empty(),
+            "proposals targeting epoch 21 should survive the 20→21 cleanup"
+        );
+        // Protocol version should still be the default (9 from mainnet_defaults)
+        assert_eq!(state.protocol_params.protocol_version_major, 9);
+
+        // Transition 21→22: proposals targeting epoch 21 should now be applied
+        state.process_epoch_transition(EpochNo(22));
+        assert_eq!(state.protocol_params.protocol_version_major, 8);
+        assert_eq!(state.protocol_params.protocol_version_minor, 0);
         assert!(state.pending_pp_updates.is_empty());
     }
 }

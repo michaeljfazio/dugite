@@ -386,7 +386,7 @@ impl Node {
                 Ok(mut state) => {
                     // Re-apply genesis config in case it changed
                     if let Some(ref genesis) = shelley_genesis {
-                        state.epoch_length = genesis.epoch_length;
+                        state.set_epoch_length(genesis.epoch_length, genesis.security_param);
                         state.set_slot_config(genesis.slot_config());
                         state.set_update_quorum(genesis.update_quorum);
                     }
