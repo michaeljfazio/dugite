@@ -2007,7 +2007,7 @@ impl LedgerState {
                     self.protocol_params.committee_min_size,
                     bootstrap,
                 );
-                info!(
+                debug!(
                     action_id = %action_id.transaction_id.to_hex(),
                     version = ?protocol_version,
                     bootstrap,

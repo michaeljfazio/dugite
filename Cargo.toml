@@ -10,6 +10,7 @@ members = [
     "crates/torsten-storage",
     "crates/torsten-node",
     "crates/torsten-cli",
+    "crates/torsten-integration-tests",
 ]
 resolver = "2"
 
