@@ -316,7 +316,8 @@ impl OuroborosPraos {
 
             // Verify VRF leader eligibility: the VRF output must satisfy the
             // Praos threshold for this pool's relative stake.
-            // Uses exact 34-digit fixed-point arithmetic matching Haskell's taylorExpCmp.
+            // Uses exact 34-digit fixed-point arithmetic (dashu IBig) matching
+            // Haskell's taylorExpCmp / pallas-math implementation.
             if header.vrf_result.output.len() == 64 {
                 let leader_value = crate::slot_leader::vrf_leader_value(&header.vrf_result.output);
                 if !torsten_crypto::vrf::check_leader_value(
@@ -325,18 +326,17 @@ impl OuroborosPraos {
                     self.active_slot_coeff,
                 ) {
                     if self.strict_verification {
+                        return Err(ConsensusError::InvalidBlock(format!(
+                            "VRF leader eligibility check failed: slot={}, relative_stake={}",
+                            header.slot.0, info.relative_stake
+                        )));
+                    } else {
                         warn!(
                             slot = header.slot.0,
                             relative_stake = info.relative_stake,
-                            "Praos: VRF output does not satisfy leader eligibility threshold"
+                            "Praos: VRF leader eligibility check failed (non-strict, skipping)"
                         );
-                        return Err(ConsensusError::NotSlotLeader);
                     }
-                    debug!(
-                        slot = header.slot.0,
-                        relative_stake = info.relative_stake,
-                        "Praos: VRF leader eligibility check failed (non-fatal during sync)"
-                    );
                 }
             }
         }

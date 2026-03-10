@@ -89,6 +89,9 @@ enum StakePoolSubcommand {
         /// Pool metadata URL
         #[arg(long)]
         metadata_url: Option<String>,
+        /// Use testnet network ID for reward account (default: mainnet)
+        #[arg(long)]
+        testnet: bool,
         /// Pool metadata hash (hex)
         #[arg(long)]
         metadata_hash: Option<String>,
@@ -294,14 +297,15 @@ impl StakePoolCmd {
                 pool_relay_ipv4,
                 single_host_pool_relay,
                 multi_host_pool_relay,
+                testnet,
                 metadata_url,
                 metadata_hash,
                 out_file,
             } => {
                 // Read pool operator (cold) vkey
                 let cold_vk = load_vkey_hash(&cold_verification_key_file)?;
-                // Read VRF vkey
-                let vrf_vk = load_vkey_hash(&vrf_verification_key_file)?;
+                // Read VRF vkey (blake2b-256 hash, 32 bytes — not blake2b-224)
+                let vrf_vk = load_vrf_vkey_hash(&vrf_verification_key_file)?;
                 // Read reward account key
                 let reward_vk = load_vkey_hash(&reward_account_verification_key_file)?;
                 // Read pool owner keys
@@ -366,8 +370,9 @@ impl StakePoolCmd {
                 enc.array(2)?;
                 enc.u64(margin_num)?;
                 enc.u64(margin_den)?;
-                // reward account (e1 prefix for stake key hash on mainnet)
-                let mut reward_account = vec![0xe1u8];
+                // reward account: e0 = testnet, e1 = mainnet
+                let network_byte = if testnet { 0xe0u8 } else { 0xe1u8 };
+                let mut reward_account = vec![network_byte];
                 reward_account.extend_from_slice(&reward_vk);
                 enc.bytes(&reward_account)?;
                 // pool owners
@@ -465,5 +470,23 @@ fn load_vkey_hash(path: &PathBuf) -> Result<Vec<u8>> {
         &cbor_bytes
     };
     let hash = torsten_primitives::hash::blake2b_224(key_bytes);
+    Ok(hash.as_bytes().to_vec())
+}
+
+/// Load a VRF verification key file and return the blake2b-256 hash (32 bytes).
+/// VRF keyhash in pool registration uses Hash<32>, not Hash<28>.
+fn load_vrf_vkey_hash(path: &PathBuf) -> Result<Vec<u8>> {
+    let content = std::fs::read_to_string(path)?;
+    let env: serde_json::Value = serde_json::from_str(&content)?;
+    let cbor_hex = env["cborHex"]
+        .as_str()
+        .ok_or_else(|| anyhow::anyhow!("Missing cborHex in {}", path.display()))?;
+    let cbor_bytes = hex::decode(cbor_hex)?;
+    let key_bytes = if cbor_bytes.len() > 2 {
+        &cbor_bytes[2..]
+    } else {
+        &cbor_bytes
+    };
+    let hash = torsten_primitives::hash::blake2b_256(key_bytes);
     Ok(hash.as_bytes().to_vec())
 }

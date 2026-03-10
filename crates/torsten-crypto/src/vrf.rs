@@ -108,223 +108,316 @@ pub fn check_leader_value_rational(
 
 /// Exact-precision VRF leader check matching Haskell's `checkLeaderNatValue`.
 ///
-/// Uses `num-bigint` for 34-digit fixed-point arithmetic, replicating:
+/// Uses `dashu-int` (IBig) for 34-digit fixed-point arithmetic, matching the
+/// exact same algorithm as pallas-math / Haskell's NonIntegral:
 /// - `Cardano.Protocol.TPraos.BHeader.checkLeaderNatValue`
 /// - `Cardano.Ledger.NonIntegral.taylorExpCmp` / `ln'` / `lncf`
 /// - `Cardano.Ledger.BaseTypes.FixedPoint` (10^34 resolution)
 mod leader_check {
-    use num_bigint::BigInt;
-    use num_traits::{One, Signed, Zero};
+    use dashu_base::{Abs, DivRem, Sign};
+    use dashu_int::IBig;
+    use std::sync::LazyLock;
 
-    /// Scale factor for 34-digit fixed-point arithmetic (matches Haskell's E34).
-    fn fp_scale() -> BigInt {
-        BigInt::from(10).pow(34)
-    }
+    /// Precision: 10^34 (matches Haskell's E34 / FixedPoint)
+    static PRECISION: LazyLock<IBig> = LazyLock::new(|| IBig::from(10).pow(34));
+    /// Epsilon for convergence: 10^(34-24) = 10^10
+    static EPS: LazyLock<IBig> = LazyLock::new(|| IBig::from(10).pow(10));
+    /// ONE in fixed-point = 1 * 10^34
+    static ONE: LazyLock<IBig> = LazyLock::new(|| IBig::from(1) * &*PRECISION);
+    /// ZERO
+    static ZERO: LazyLock<IBig> = LazyLock::new(|| IBig::from(0));
+    /// e = exp(1) in fixed-point
+    static E: LazyLock<IBig> = LazyLock::new(|| {
+        let mut e = IBig::from(0);
+        ref_exp(&mut e, &ONE);
+        e
+    });
 
     /// certNatMax = 2^256
-    fn cert_nat_max() -> BigInt {
-        BigInt::from(2).pow(256)
+    fn cert_nat_max() -> IBig {
+        IBig::from(2).pow(256)
     }
 
-    /// Convert a 32-byte VRF leader value to a big-endian BigInt.
-    fn bytes_to_natural(bytes: &[u8]) -> BigInt {
-        BigInt::from_bytes_be(num_bigint::Sign::Plus, bytes)
+    /// Fixed-point division: (x * PRECISION) / y, with proper quotient+remainder handling
+    /// matching pallas-math's `div` function exactly.
+    fn fp_div(rop: &mut IBig, x: &IBig, y: &IBig) {
+        let (temp_q, temp_r): (IBig, IBig) = x.div_rem(y);
+        let mut temp = &temp_q * &*PRECISION;
+        let scaled_r: IBig = &temp_r * &*PRECISION;
+        let (q2, _): (IBig, IBig) = scaled_r.div_rem(y);
+        temp += &q2;
+        *rop = temp;
     }
 
-    /// Fixed-point multiplication: (a * b) / scale
-    fn fp_mul(a: &BigInt, b: &BigInt, scale: &BigInt) -> BigInt {
-        (a * b) / scale
-    }
-
-    /// Fixed-point division: (a * scale) / b (truncates toward zero, matching Haskell Data.Fixed)
-    fn fp_div(a: &BigInt, b: &BigInt, scale: &BigInt) -> BigInt {
-        (a * scale) / b
-    }
-
-    /// Compute ln(1+x) using Euler's generalized continued fraction.
-    ///
-    /// Matches Haskell's `lncf` from `Cardano.Ledger.NonIntegral`:
-    ///
-    /// The continued fraction for ln(1+x) has coefficients:
-    ///   a_n: [x, 1²x, 1²x, 2²x, 2²x, 3²x, 3²x, ...]
-    ///   b_n: [1, 2, 3, 4, 5, 6, 7, ...]
-    ///
-    /// Converges for all x >= 0 (unlike the Taylor series which requires |x| < 1).
-    /// Uses the Wallis recurrence for evaluating the convergents.
-    /// Convergence criterion: |x_n - x_{n-1}| < 10^{-24} (matching Haskell's epsilon).
-    fn fp_lncf(x_fp: &BigInt, scale: &BigInt) -> BigInt {
-        if x_fp.is_zero() {
-            return BigInt::zero();
+    /// Fixed-point scale (truncate toward negative infinity for negative, toward zero for positive)
+    /// matching pallas-math's `scale` exactly.
+    fn fp_scale(rop: &mut IBig) {
+        let (a, remainder): (IBig, IBig) = (&*rop).div_rem(&*PRECISION);
+        if *rop < *ZERO && remainder != *ZERO {
+            *rop = a - IBig::from(1);
+        } else {
+            *rop = a;
         }
-
-        // Epsilon: 10^{-24} in fixed-point = 10^{34-24} = 10^{10}
-        let epsilon = BigInt::from(10).pow(10);
-        let max_n = 1000usize;
-
-        // Initial Wallis recurrence state (all in fixed-point):
-        // A_{-1} = 1.0, B_{-1} = 0, A_0 = 0 (b_0=0 implicit), B_0 = 1.0
-        let mut a_nm2 = scale.clone(); // A_{-1}
-        let mut b_nm2 = BigInt::zero(); // B_{-1}
-        let mut a_nm1 = BigInt::zero(); // A_0
-        let mut b_nm1 = scale.clone(); // B_0
-
-        let mut last_xn: Option<BigInt> = None;
-
-        for n in 0..max_n {
-            // a_n coefficient (fixed-point): coeff(n) * x
-            // Pattern: x, 1²x, 1²x, 2²x, 2²x, 3²x, 3²x, ...
-            let coeff: u64 = if n == 0 {
-                1
-            } else {
-                let k = (n as u64).div_ceil(2);
-                k * k
-            };
-            let an_fp = BigInt::from(coeff) * x_fp;
-
-            // b_n coefficient (fixed-point): (n+1) represented as fixed-point
-            let bn_fp = BigInt::from(n as u64 + 1) * scale;
-
-            // Wallis recurrence (fixed-point arithmetic):
-            // A_n = b_n * A_{n-1} + a_n * A_{n-2}
-            let a_n = fp_mul(&bn_fp, &a_nm1, scale) + fp_mul(&an_fp, &a_nm2, scale);
-            let b_n = fp_mul(&bn_fp, &b_nm1, scale) + fp_mul(&an_fp, &b_nm2, scale);
-
-            // Convergent: x_n = A_n / B_n (in fixed-point)
-            if !b_n.is_zero() {
-                let xn = fp_div(&a_n, &b_n, scale);
-
-                if let Some(ref prev) = last_xn {
-                    if (&xn - prev).abs() < epsilon {
-                        return xn;
-                    }
-                }
-                last_xn = Some(xn);
-            }
-
-            // Shift state
-            a_nm2 = a_nm1;
-            b_nm2 = b_nm1;
-            a_nm1 = a_n;
-            b_nm1 = b_n;
-        }
-
-        last_xn.unwrap_or_default()
     }
 
-    /// Compute ln(x) for positive x using argument reduction + continued fraction.
-    ///
-    /// Matches Haskell's `ln'` → `splitLn` → `findE` → `lncf` pipeline:
-    /// - For x < 1: ln(x) = -ln(1/x)
-    /// - For x >= 1: find n where e^n <= x < e^(n+1), then ln(x) = n + lncf(x/e^n - 1)
-    ///
-    /// `x_fp` is x in fixed-point. Returns ln(x) in fixed-point.
-    fn fp_ln(x_fp: &BigInt, scale: &BigInt) -> BigInt {
-        if x_fp <= &BigInt::zero() {
-            return BigInt::zero();
+    /// Integer power via repeated squaring, matching pallas-math's `ipow_` + `ipow`.
+    fn ipow(rop: &mut IBig, x: &IBig, n: i64) {
+        if n < 0 {
+            let mut temp = IBig::from(0);
+            ipow_inner(&mut temp, x, -n);
+            fp_div(rop, &ONE, &temp);
+        } else {
+            ipow_inner(rop, x, n);
         }
-        if x_fp == scale {
-            return BigInt::zero(); // ln(1) = 0
-        }
-
-        // For x < 1: ln(x) = -ln(1/x) (matches Haskell splitLn)
-        if x_fp < scale {
-            let recip = fp_div(scale, x_fp, scale); // 1/x in fixed-point
-            return -fp_ln(&recip, scale);
-        }
-
-        // x >= 1: find n such that e^n <= x < e^(n+1)
-        let e_fp = fp_exp_taylor(scale, scale); // e ≈ 2.718...
-
-        let mut e_power = scale.clone(); // e^0 = 1
-        let mut n: u64 = 0;
-
-        loop {
-            let next = fp_mul(&e_power, &e_fp, scale);
-            if &next > x_fp {
-                break;
-            }
-            e_power = next;
-            n += 1;
-            if n > 1000 {
-                break;
-            }
-        }
-
-        // r = x / e^n - 1 (value in [0, e-1) suitable for continued fraction)
-        let r = fp_div(x_fp, &e_power, scale) - scale;
-
-        // ln(x) = n + ln(1 + r)
-        let ln_1_plus_r = fp_lncf(&r, scale);
-        scale * BigInt::from(n) + ln_1_plus_r
     }
 
-    /// Compute exp(x) using Taylor series (for computing e = exp(1)).
-    /// Only used internally for argument reduction in ln.
-    fn fp_exp_taylor(x: &BigInt, scale: &BigInt) -> BigInt {
-        let mut result = scale.clone(); // 1.0
-        let mut term = x.clone(); // x^1/1!
-        for n in 1..100 {
-            result += &term;
-            term = fp_mul(&term, x, scale) / BigInt::from(n + 1);
-            if term.is_zero() {
-                break;
-            }
+    fn ipow_inner(rop: &mut IBig, x: &IBig, n: i64) {
+        if n == 0 {
+            rop.clone_from(&ONE);
+        } else if n % 2 == 0 {
+            let mut res = IBig::from(0);
+            ipow_inner(&mut res, x, n / 2);
+            *rop = &res * &res;
+            fp_scale(rop);
+        } else {
+            let mut res = IBig::from(0);
+            ipow_inner(&mut res, x, n - 1);
+            *rop = &res * x;
+            fp_scale(rop);
         }
-        result
     }
 
-    /// Result of comparing a value against exp(x) using Taylor series.
-    /// Matches Haskell's `CompareResult`.
-    #[derive(Debug)]
-    enum CompareResult {
-        Above,      // cmp > exp(x)
-        Below,      // cmp < exp(x)
-        MaxReached, // couldn't determine within max iterations
+    /// Ceiling division for positive x/y (used in exp scaling).
+    fn div_round_ceil(x: &IBig, y: &IBig) -> IBig {
+        let (q, r): (IBig, IBig) = x.div_rem(y);
+        if q.sign() == Sign::Positive && r != IBig::ZERO {
+            q + IBig::ONE
+        } else {
+            q
+        }
     }
 
-    /// Compare `cmp` against `exp(x)` using Taylor series expansion.
-    /// Matches Haskell's `taylorExpCmp` from NonIntegral.hs.
-    ///
-    /// All values are in fixed-point (scaled by `scale`).
-    /// `bound_x` is an upper bound on x (Haskell uses 3).
-    fn taylor_exp_cmp(bound_x: &BigInt, cmp: &BigInt, x: &BigInt, scale: &BigInt) -> CompareResult {
-        let max_n = 1000;
+    /// Taylor/Maclaurin series for exp(x) with convergence check.
+    /// Matches pallas-math's `mp_exp_taylor` exactly.
+    fn mp_exp_taylor(rop: &mut IBig, max_n: i32, x: &IBig, epsilon: &IBig) -> i32 {
+        let mut divisor = ONE.clone();
+        let mut last_x = ONE.clone();
+        rop.clone_from(&ONE);
         let mut n = 0;
-        let mut err = x.clone(); // current term = x (first-order)
-        let mut acc = scale.clone(); // partial sum starts at 1.0 (= scale)
-        let mut divisor = BigInt::one(); // factorial denominator
+        while n < max_n {
+            let mut next_x = x * &last_x;
+            fp_scale(&mut next_x);
+            let next_x2 = next_x.clone();
+            fp_div(&mut next_x, &next_x2, &divisor);
 
-        loop {
-            if n >= max_n {
-                return CompareResult::MaxReached;
+            if (&next_x).abs() < epsilon.abs() {
+                break;
             }
 
-            // acc' = acc + err (add current term)
-            let acc_prime = &acc + &err;
-
-            // Compute next term: err' = err * x / (divisor + 1)
-            divisor += BigInt::one();
-            let err_prime = fp_mul(&err, x, scale) / &divisor;
-
-            // Error bound on remaining series: |err' * bound_x|
-            let error_term = fp_mul(&err_prime, bound_x, scale).abs();
-
-            // Compare
-            if cmp >= &(&acc_prime + &error_term) {
-                return CompareResult::Above;
-            }
-            if cmp < &(&acc_prime - &error_term) {
-                return CompareResult::Below;
-            }
-
-            acc = acc_prime;
-            err = err_prime;
+            divisor += &*ONE;
+            *rop = &*rop + &next_x;
+            last_x.clone_from(&next_x);
             n += 1;
         }
+        n
+    }
+
+    /// Entry point for exp approximation. Scales x to [0,1] then uses Taylor series.
+    /// Matches pallas-math's `ref_exp` exactly.
+    fn ref_exp(rop: &mut IBig, x: &IBig) {
+        use std::cmp::Ordering;
+        match x.cmp(&ZERO) {
+            Ordering::Equal => {
+                rop.clone_from(&ONE);
+            }
+            Ordering::Less => {
+                let x_ = -x;
+                let mut temp = IBig::from(0);
+                ref_exp(&mut temp, &x_);
+                fp_div(rop, &ONE, &temp);
+            }
+            Ordering::Greater => {
+                let n_exponent = div_round_ceil(x, &PRECISION);
+                let x_ = x / &n_exponent;
+                mp_exp_taylor(rop, 1000, &x_, &EPS);
+                let n_i64: i64 = i64::try_from(&n_exponent).expect("n_exponent overflow");
+                ipow(rop, &rop.clone(), n_i64);
+            }
+        }
+    }
+
+    /// Continued fraction approximation for ln(1+x).
+    /// Matches pallas-math's `mp_ln_n` exactly.
+    fn mp_ln_n(rop: &mut IBig, max_n: i32, x: &IBig, epsilon: &IBig) {
+        let mut convergent = IBig::from(0);
+        let mut last = IBig::from(0);
+        let mut first = true;
+        let mut n = 1;
+
+        let b = ONE.clone();
+
+        let mut an_m2 = ONE.clone();
+        let mut bn_m2 = IBig::from(0);
+        let mut an_m1 = IBig::from(0);
+        let mut bn_m1 = ONE.clone();
+
+        let mut curr_a: i64 = 1;
+        let mut b_acc = b;
+
+        while n <= max_n + 2 {
+            let curr_a_2 = curr_a * curr_a;
+            let a = x * IBig::from(curr_a_2);
+            if n > 1 && n % 2 == 1 {
+                curr_a += 1;
+            }
+
+            let mut ba = &b_acc * &an_m1;
+            fp_scale(&mut ba);
+            let mut aa = &a * &an_m2;
+            fp_scale(&mut aa);
+            let a_ = &ba + &aa;
+
+            let mut bb = &b_acc * &bn_m1;
+            fp_scale(&mut bb);
+            let mut ab = &a * &bn_m2;
+            fp_scale(&mut ab);
+            let b_ = &bb + &ab;
+
+            fp_div(&mut convergent, &a_, &b_);
+
+            if first {
+                first = false;
+            } else {
+                let diff = &convergent - &last;
+                if diff.abs() < epsilon.abs() {
+                    break;
+                }
+            }
+
+            last.clone_from(&convergent);
+
+            n += 1;
+            an_m2.clone_from(&an_m1);
+            bn_m2.clone_from(&bn_m1);
+            an_m1.clone_from(&a_);
+            bn_m1.clone_from(&b_);
+
+            b_acc += &*ONE;
+        }
+
+        *rop = convergent;
+    }
+
+    /// Find n such that e^n <= x < e^(n+1).
+    /// Matches pallas-math's `find_e` exactly.
+    fn find_e(x: &IBig) -> i64 {
+        let mut x_ = IBig::from(0);
+        fp_div(&mut x_, &ONE, &E);
+        let mut x__ = E.clone();
+
+        let mut l: i64 = -1;
+        let mut u: i64 = 1;
+        while &x_ > x || &x__ < x {
+            let x_sq = &x_ * &x_;
+            let mut x_scaled = x_sq;
+            fp_scale(&mut x_scaled);
+            x_ = x_scaled;
+
+            let upper_sq = &x__ * &x__;
+            let mut upper_scaled = upper_sq;
+            fp_scale(&mut upper_scaled);
+            x__ = upper_scaled;
+
+            l *= 2;
+            u *= 2;
+        }
+
+        while l + 1 != u {
+            let mid = l + ((u - l) / 2);
+            ipow(&mut x_, &E, mid);
+            if x < &x_ {
+                u = mid;
+            } else {
+                l = mid;
+            }
+        }
+        l
+    }
+
+    /// Entry point for ln approximation.
+    /// Matches pallas-math's `ref_ln` exactly.
+    fn ref_ln(rop: &mut IBig, x: &IBig) -> bool {
+        if x <= &*ZERO {
+            return false;
+        }
+
+        let n = find_e(x);
+        *rop = IBig::from(n) * &*PRECISION;
+
+        let mut factor = IBig::from(0);
+        ref_exp(&mut factor, rop);
+
+        let mut x_ = IBig::from(0);
+        fp_div(&mut x_, x, &factor);
+        x_ = &x_ - &*ONE;
+
+        let x_2 = x_.clone();
+        mp_ln_n(&mut x_, 1000, &x_2, &EPS);
+        *rop = &*rop + &x_;
+        true
+    }
+
+    /// Compare `compare` against `exp(x)` using bounded Taylor series.
+    /// Matches pallas-math's `ref_exp_cmp` exactly.
+    ///
+    /// Returns: GT if compare > exp(x), LT if compare < exp(x), UNKNOWN if indeterminate.
+    fn ref_exp_cmp(max_n: u64, x: &IBig, bound_x: i64, compare: &IBig) -> ExpCmpResult {
+        let mut rop = ONE.clone();
+        let mut n = 0u64;
+        let mut divisor = ONE.clone();
+        let mut error = x.clone();
+
+        while n < max_n {
+            let next_x = error.clone();
+            if (&next_x).abs() < (&*EPS).abs() {
+                break;
+            }
+            divisor += &*ONE;
+
+            // Update error: error = error * x / divisor
+            error *= x;
+            fp_scale(&mut error);
+            let e2 = error.clone();
+            fp_div(&mut error, &e2, &divisor);
+
+            let error_term = &error * IBig::from(bound_x);
+            rop = &rop + &next_x;
+
+            // compare > upper bound → compare is above exp(x)
+            let upper = &rop + &error_term;
+            if compare > &upper {
+                return ExpCmpResult::GT;
+            }
+
+            // compare < lower bound → compare is below exp(x)
+            let lower = &rop - &error_term;
+            if compare < &lower {
+                return ExpCmpResult::LT;
+            }
+            n += 1;
+        }
+
+        ExpCmpResult::Unknown
+    }
+
+    #[derive(Debug, PartialEq)]
+    enum ExpCmpResult {
+        GT,      // compare > exp(x)
+        LT,      // compare < exp(x)
+        Unknown, // couldn't determine
     }
 
     /// Exact VRF leader eligibility check with f64 inputs.
-    /// Converts active_slot_coeff to nearest exact rational before computing.
     pub fn check_leader_value_exact(
         vrf_output: &[u8],
         relative_stake: f64,
@@ -337,13 +430,17 @@ mod leader_check {
             return true;
         }
 
-        // Convert active_slot_coeff to nearest rational with denominator up to 10000.
-        // Common values: 0.05 = 1/20, 0.1 = 1/10, etc.
         let (f_num, f_den) = f64_to_rational(active_slot_coeff);
         check_leader_value_with_rational_coeff(vrf_output, relative_stake, f_num, f_den)
     }
 
     /// Exact VRF leader eligibility check with rational active_slot_coeff.
+    ///
+    /// Implements the Haskell `checkLeaderNatValue` algorithm:
+    ///   p < 1 - (1-f)^sigma
+    /// where p = certNat / certNatMax.
+    ///
+    /// Rearranged: certNatMax / (certNatMax - certNat) < exp(sigma * |ln(1-f)|)
     pub fn check_leader_value_with_rational_coeff(
         vrf_output: &[u8],
         relative_stake: f64,
@@ -357,73 +454,69 @@ mod leader_check {
             return true;
         }
 
-        let scale = fp_scale();
         let cert_nat_max = cert_nat_max();
 
         // certNat = big-endian interpretation of the 32-byte VRF leader value
         let cert_nat = if vrf_output.len() >= 32 {
-            bytes_to_natural(&vrf_output[..32])
+            IBig::from(dashu_int::UBig::from_be_bytes(&vrf_output[..32]))
         } else {
-            bytes_to_natural(vrf_output)
+            IBig::from(dashu_int::UBig::from_be_bytes(vrf_output))
         };
 
         // q = certNatMax - certNat
         let q = &cert_nat_max - &cert_nat;
-        if q <= BigInt::zero() {
+        if q <= *ZERO {
             return false;
         }
 
         // recip_q = certNatMax / q  (in fixed-point)
-        let recip_q = fp_div(&cert_nat_max, &q, &scale);
+        let mut recip_q = IBig::from(0);
+        fp_div(&mut recip_q, &cert_nat_max, &q);
 
         // Compute (1-f) in exact fixed-point from rational:
         // 1 - f_num/f_den = (f_den - f_num) / f_den
-        // In fixed-point: (f_den - f_num) * scale / f_den
-        let one_minus_f_fp = BigInt::from(active_slot_coeff_den - active_slot_coeff_num) * &scale
-            / BigInt::from(active_slot_coeff_den);
+        let one_minus_f_fp = IBig::from(active_slot_coeff_den - active_slot_coeff_num)
+            * &*PRECISION
+            / IBig::from(active_slot_coeff_den);
 
         // c = |ln(1 - f)| (positive, since ln(1-f) < 0 for f in (0,1))
-        let ln_one_minus_f = fp_ln(&one_minus_f_fp, &scale); // negative
+        let mut ln_one_minus_f = IBig::from(0);
+        ref_ln(&mut ln_one_minus_f, &one_minus_f_fp);
         let c = -&ln_one_minus_f; // positive
 
-        // sigma in fixed-point
-        let sigma_fp = float_to_fixed(relative_stake, &scale);
+        // sigma in fixed-point from f64
+        let sigma_fp = float_to_fixed(relative_stake);
 
         // x = sigma * c (in fixed-point)
-        let x = fp_mul(&sigma_fp, &c, &scale);
-
-        // bound_x = 3 (in fixed-point)
-        let bound_x = &scale * BigInt::from(3);
+        let mut x = &sigma_fp * &c;
+        fp_scale(&mut x);
 
         // Check: recip_q < exp(x)?
-        match taylor_exp_cmp(&bound_x, &recip_q, &x, &scale) {
-            CompareResult::Below => true,       // recip_q < exp(x) → IS leader
-            CompareResult::Above => false,      // recip_q >= exp(x) → NOT leader
-            CompareResult::MaxReached => false, // conservative: not leader
+        // ref_exp_cmp returns GT if compare > exp(x), LT if compare < exp(x)
+        // We want: recip_q < exp(x) → leader elected
+        match ref_exp_cmp(1000, &x, 3, &recip_q) {
+            ExpCmpResult::LT => true,       // recip_q < exp(x) → IS leader
+            ExpCmpResult::GT => false,      // recip_q >= exp(x) → NOT leader
+            ExpCmpResult::Unknown => false, // conservative: not leader
         }
     }
 
     /// Convert an f64 to the nearest rational p/q with q <= 10000.
-    /// Handles common Cardano values like 0.05 = 1/20.
     fn f64_to_rational(value: f64) -> (u64, u64) {
-        // Try common denominators first (exact matches)
         for den in [1, 2, 4, 5, 10, 20, 25, 50, 100, 200, 1000, 10000] {
             let num = (value * den as f64).round() as u64;
             let reconstructed = num as f64 / den as f64;
             if (reconstructed - value).abs() < 1e-15 {
-                // Simplify with GCD
                 let g = gcd(num, den);
                 return (num / g, den / g);
             }
         }
-        // Fallback: use large denominator
         let den = 1_000_000u64;
         let num = (value * den as f64).round() as u64;
         let g = gcd(num, den);
         (num / g, den / g)
     }
 
-    /// Greatest common divisor
     fn gcd(mut a: u64, mut b: u64) -> u64 {
         while b != 0 {
             let t = b;
@@ -433,16 +526,16 @@ mod leader_check {
         a
     }
 
-    /// Convert an f64 value to fixed-point BigInt with 10^34 scale.
-    fn float_to_fixed(value: f64, scale: &BigInt) -> BigInt {
+    /// Convert an f64 value to fixed-point IBig with 10^34 scale.
+    fn float_to_fixed(value: f64) -> IBig {
         if value <= 0.0 {
-            return BigInt::zero();
+            return IBig::from(0);
         }
         if value >= 1.0 {
             let int_part = value as u64;
             let frac = value - int_part as f64;
-            let int_fp = scale * BigInt::from(int_part);
-            let frac_fp = float_to_fixed(frac, scale);
+            let int_fp = &*PRECISION * IBig::from(int_part);
+            let frac_fp = float_to_fixed(frac);
             return int_fp + frac_fp;
         }
 
@@ -453,9 +546,9 @@ mod leader_check {
 
         let shift = 52 - exponent;
         if shift >= 0 {
-            (BigInt::from(mantissa_bits) * scale) >> shift as u64
+            (IBig::from(mantissa_bits) * &*PRECISION) >> shift as usize
         } else {
-            (BigInt::from(mantissa_bits) * scale) << (-shift) as u64
+            (IBig::from(mantissa_bits) * &*PRECISION) << (-shift) as usize
         }
     }
 
@@ -463,20 +556,33 @@ mod leader_check {
     mod tests {
         use super::*;
 
-        #[test]
-        fn test_fp_ln_one() {
-            let scale = fp_scale();
-            let result = fp_ln(&scale, &scale);
-            assert!(result.is_zero(), "ln(1) should be 0, got {}", result);
+        fn ibig_to_f64(val: &IBig) -> f64 {
+            let is_negative = val < &*ZERO;
+            let abs_val = val.abs();
+            let s = abs_val.to_string();
+            let f: f64 = s.parse().unwrap_or(0.0);
+            let result = f / 1e34;
+            if is_negative {
+                -result
+            } else {
+                result
+            }
         }
 
         #[test]
-        fn test_fp_ln_095_exact() {
-            let scale = fp_scale();
+        fn test_ref_ln_one() {
+            let mut result = IBig::from(0);
+            ref_ln(&mut result, &ONE);
+            assert!(result == *ZERO, "ln(1) should be 0, got {}", result);
+        }
+
+        #[test]
+        fn test_ref_ln_095_exact() {
             // Compute ln(0.95) using exact rational: 0.95 = 19/20
-            let x = BigInt::from(19u64) * &scale / BigInt::from(20u64);
-            let result = fp_ln(&x, &scale);
-            let result_f64 = bigint_to_f64(&result, &scale);
+            let x = IBig::from(19) * &*PRECISION / IBig::from(20);
+            let mut result = IBig::from(0);
+            ref_ln(&mut result, &x);
+            let result_f64 = ibig_to_f64(&result);
             let expected = (0.95f64).ln();
             assert!(
                 (result_f64 - expected).abs() < 1e-15,
@@ -487,13 +593,11 @@ mod leader_check {
         }
 
         #[test]
-        fn test_fp_ln_2() {
-            let scale = fp_scale();
-            // ln(2) via argument reduction: n=0, r = 2/1 - 1 = 1.0
-            // This exercises the continued fraction with x=1 (where Taylor converges slowly)
-            let x = &scale * 2; // 2.0 in fixed-point
-            let result = fp_ln(&x, &scale);
-            let result_f64 = bigint_to_f64(&result, &scale);
+        fn test_ref_ln_2() {
+            let x = &*PRECISION * IBig::from(2); // 2.0 in fixed-point
+            let mut result = IBig::from(0);
+            ref_ln(&mut result, &x);
+            let result_f64 = ibig_to_f64(&result);
             let expected = 2.0f64.ln();
             assert!(
                 (result_f64 - expected).abs() < 1e-10,
@@ -504,12 +608,11 @@ mod leader_check {
         }
 
         #[test]
-        fn test_fp_ln_half() {
-            let scale = fp_scale();
-            // ln(0.5) = -ln(2) — tests the x<1 branch
-            let x = &scale / 2; // 0.5 in fixed-point
-            let result = fp_ln(&x, &scale);
-            let result_f64 = bigint_to_f64(&result, &scale);
+        fn test_ref_ln_half() {
+            let x = &*PRECISION / IBig::from(2); // 0.5 in fixed-point
+            let mut result = IBig::from(0);
+            ref_ln(&mut result, &x);
+            let result_f64 = ibig_to_f64(&result);
             let expected = 0.5f64.ln();
             assert!(
                 (result_f64 - expected).abs() < 1e-10,
@@ -564,8 +667,6 @@ mod leader_check {
 
         #[test]
         fn test_rational_coeff_matches() {
-            // check_leader_value_exact(f64) and check_leader_value_with_rational_coeff
-            // should give the same result for exact rationals
             let output = [0u8; 32];
             assert_eq!(
                 check_leader_value_exact(&output, 1.0, 0.05),
@@ -578,15 +679,255 @@ mod leader_check {
             );
         }
 
-        fn bigint_to_f64(val: &BigInt, _scale: &BigInt) -> f64 {
-            let (sign, digits) = val.to_bytes_be();
-            let abs_val: f64 = digits.iter().fold(0.0f64, |acc, &b| acc * 256.0 + b as f64);
-            let scale_f64: f64 = 1e34;
-            let result = abs_val / scale_f64;
-            if sign == num_bigint::Sign::Minus {
-                -result
-            } else {
-                result
+        #[test]
+        fn test_exp_cmp_basic() {
+            // exp(1) ≈ 2.718... — a value of 3 should be GT
+            let three = IBig::from(3) * &*PRECISION;
+            assert_eq!(ref_exp_cmp(1000, &ONE, 3, &three), ExpCmpResult::GT);
+
+            // exp(1) ≈ 2.718... — a value of 2 should be LT
+            let two = IBig::from(2) * &*PRECISION;
+            assert_eq!(ref_exp_cmp(1000, &ONE, 3, &two), ExpCmpResult::LT);
+        }
+
+        #[test]
+        fn test_ref_exp_one() {
+            // exp(0) = 1
+            let mut result = IBig::from(0);
+            ref_exp(&mut result, &ZERO);
+            assert_eq!(result, *ONE, "exp(0) should be 1");
+        }
+
+        #[test]
+        fn test_ref_exp_e() {
+            // exp(1) should equal E (our precomputed constant)
+            let mut result = IBig::from(0);
+            ref_exp(&mut result, &ONE);
+            // Allow tiny rounding difference
+            let diff = (&result - &*E).abs();
+            let tolerance = IBig::from(10).pow(5); // 10^5 tolerance in 10^34 scale
+            assert!(diff < tolerance, "exp(1) should equal E, diff = {}", diff);
+        }
+
+        #[test]
+        fn test_ref_exp_negative() {
+            // exp(-1) = 1/e ≈ 0.367879...
+            let neg_one = -&*ONE;
+            let mut result = IBig::from(0);
+            ref_exp(&mut result, &neg_one);
+            let result_f64 = ibig_to_f64(&result);
+            let expected = (-1.0f64).exp();
+            assert!(
+                (result_f64 - expected).abs() < 1e-10,
+                "exp(-1) should be ~{}, got {}",
+                expected,
+                result_f64
+            );
+        }
+
+        #[test]
+        fn test_ref_ln_e() {
+            // ln(e) = 1
+            let mut result = IBig::from(0);
+            ref_ln(&mut result, &E);
+            let diff = (&result - &*ONE).abs();
+            // Rounding error in arg reduction: ~10^{-25} precision = 10^{34-25} = 10^9
+            let tolerance = IBig::from(10).pow(10);
+            assert!(
+                diff < tolerance,
+                "ln(e) should be 1, got {} (diff {})",
+                ibig_to_f64(&result),
+                diff
+            );
+        }
+
+        #[test]
+        fn test_fp_div_exact() {
+            // 10 / 3 should be 3.333...
+            let ten = IBig::from(10) * &*PRECISION;
+            let three = IBig::from(3) * &*PRECISION;
+            let mut result = IBig::from(0);
+            fp_div(&mut result, &ten, &three);
+            let result_f64 = ibig_to_f64(&result);
+            assert!(
+                (result_f64 - 10.0 / 3.0).abs() < 1e-15,
+                "10/3 should be ~3.333, got {}",
+                result_f64
+            );
+        }
+
+        #[test]
+        fn test_float_to_fixed_precision() {
+            // Test that f64 → fixed-point conversion preserves 15+ digits
+            let values = [0.05, 0.001, 0.0001, 0.999999, 0.5, 0.123456789012345];
+            for v in values {
+                let fp = float_to_fixed(v);
+                let roundtrip = ibig_to_f64(&fp);
+                assert!(
+                    (roundtrip - v).abs() / v < 1e-14,
+                    "float_to_fixed({}) roundtrip = {} (rel err = {})",
+                    v,
+                    roundtrip,
+                    (roundtrip - v).abs() / v
+                );
+            }
+        }
+
+        #[test]
+        fn test_leader_check_small_stake() {
+            // This is the critical test case that was failing with num-bigint.
+            // A small pool (relative_stake ≈ 0.0009) should still be eligible
+            // for some slots. With f=0.05, p_elect ≈ 1-(1-0.05)^0.0009 ≈ 0.0000461
+            // So a VRF output near zero should definitely be elected.
+            let small_output = [0u8; 32]; // certNat = 0, smallest possible
+            assert!(
+                check_leader_value_exact(&small_output, 0.0009, 0.05),
+                "Pool with 0.09% stake should be leader with VRF output = 0"
+            );
+
+            // A slightly larger VRF output: first byte = 0x01
+            let mut medium_output = [0u8; 32];
+            medium_output[0] = 0x01;
+            // p_elect ≈ 0.0000461, threshold ≈ 0.0000461 * 2^256
+            // 0x01000...000 / 2^256 = 1/256 ≈ 0.0039 >> 0.0000461 → should NOT be leader
+            assert!(
+                !check_leader_value_exact(&medium_output, 0.0009, 0.05),
+                "Pool with 0.09% stake should NOT be leader with VRF output 0x01..."
+            );
+        }
+
+        #[test]
+        fn test_leader_check_boundary_stakes() {
+            // Test a range of relative stakes to ensure monotonicity:
+            // larger stake → more likely to be leader (lower VRF threshold needed)
+            let vrf_output = {
+                let mut out = [0u8; 32];
+                // Set VRF output to ~0.01 * 2^256 (very low, should be leader for most stakes)
+                out[0] = 0x02;
+                out
+            };
+
+            // With f=0.05:
+            // stake=0.001: p ≈ 0.0000513 → threshold at ~0.0000513*2^256 → 0x02 too high
+            // stake=0.01:  p ≈ 0.000513  → threshold higher
+            // stake=0.1:   p ≈ 0.00513   → threshold higher
+            // stake=0.5:   p ≈ 0.0253    → threshold at ~0.0253*2^256 → 0x02 ≈ 0.0078 → elected
+            // stake=1.0:   p ≈ 0.05      → definitely elected
+
+            // Lower stakes should be less likely to be elected
+            let results: Vec<bool> = [0.001, 0.01, 0.1, 0.5, 1.0]
+                .iter()
+                .map(|s| check_leader_value_exact(&vrf_output, *s, 0.05))
+                .collect();
+
+            // Verify monotonicity: if elected at stake s, should be elected at all stakes > s
+            for i in 0..results.len() {
+                for j in (i + 1)..results.len() {
+                    if results[i] {
+                        assert!(
+                            results[j],
+                            "Monotonicity violated: elected at stake {} but not at {}",
+                            [0.001, 0.01, 0.1, 0.5, 1.0][i],
+                            [0.001, 0.01, 0.1, 0.5, 1.0][j]
+                        );
+                    }
+                }
+            }
+        }
+
+        #[test]
+        fn test_leader_check_different_active_slot_coeffs() {
+            // Higher active_slot_coeff means more slots filled → higher probability
+            let vrf_output = [0x10u8; 32]; // ~6.3% of max
+            let stake = 0.5;
+
+            let result_005 = check_leader_value_exact(&vrf_output, stake, 0.05);
+            let result_010 = check_leader_value_exact(&vrf_output, stake, 0.1);
+
+            // With f=0.1, probability is higher than f=0.05
+            // If elected with f=0.05, definitely elected with f=0.1
+            if result_005 {
+                assert!(
+                    result_010,
+                    "Should be elected with f=0.1 if elected with f=0.05"
+                );
+            }
+        }
+
+        #[test]
+        fn test_leader_check_statistical_distribution() {
+            // Generate 1000 sequential "VRF outputs" and count elections for various stakes
+            // This validates the overall probability matches the expected formula
+            let f = 0.05;
+            let stake = 1.0;
+            // Expected: p = 1 - (1-f)^stake = 1 - 0.95 = 0.05
+
+            let mut elected = 0;
+            let trials = 1000;
+            for i in 0..trials {
+                let mut output = [0u8; 32];
+                // Spread outputs across the range
+                let val = (i as u64 * (u64::MAX / trials as u64)).to_be_bytes();
+                output[..8].copy_from_slice(&val);
+                if check_leader_value_exact(&output, stake, f) {
+                    elected += 1;
+                }
+            }
+
+            // Expected ~50 out of 1000 (5%), allow ±3%
+            let rate = elected as f64 / trials as f64;
+            assert!(
+                (rate - 0.05).abs() < 0.03,
+                "Election rate should be ~5%, got {:.1}% ({}/{})",
+                rate * 100.0,
+                elected,
+                trials
+            );
+        }
+
+        #[test]
+        fn test_exp_cmp_near_boundary() {
+            // Test exp_cmp distinguishes values sufficiently far from exp(x)
+            // exp(0.05) ≈ 1.05127...
+            let x = float_to_fixed(0.05);
+
+            // Value clearly above exp(0.05): 1.06 > 1.05127
+            let above = float_to_fixed(1.06);
+            assert_eq!(
+                ref_exp_cmp(1000, &x, 3, &above),
+                ExpCmpResult::GT,
+                "1.06 should be above exp(0.05)"
+            );
+
+            // Value clearly below exp(0.05): 1.04 < 1.05127
+            let below = float_to_fixed(1.04);
+            assert_eq!(
+                ref_exp_cmp(1000, &x, 3, &below),
+                ExpCmpResult::LT,
+                "1.04 should be below exp(0.05)"
+            );
+        }
+
+        #[test]
+        fn test_ln_exp_roundtrip() {
+            // ln(exp(x)) should equal x for various values
+            let test_values = [0.01, 0.05, 0.1, 0.5, 1.0, 2.0];
+            for v in test_values {
+                let x = float_to_fixed(v);
+                let mut exp_x = IBig::from(0);
+                ref_exp(&mut exp_x, &x);
+                let mut ln_exp_x = IBig::from(0);
+                ref_ln(&mut ln_exp_x, &exp_x);
+
+                let diff = (&ln_exp_x - &x).abs();
+                let tolerance = IBig::from(10).pow(10); // 10^{-24} precision
+                assert!(
+                    diff < tolerance,
+                    "ln(exp({})) should equal {}, diff = {}",
+                    v,
+                    v,
+                    ibig_to_f64(&diff)
+                );
             }
         }
     }

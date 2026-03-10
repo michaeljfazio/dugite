@@ -2,6 +2,7 @@ mod config;
 mod forge;
 mod genesis;
 mod metrics;
+#[cfg(feature = "rocksdb")]
 mod mithril;
 mod node;
 mod topology;
@@ -25,6 +26,7 @@ enum Command {
     /// Run the node
     Run(RunArgs),
     /// Import a Mithril snapshot for fast initial sync
+    #[cfg(feature = "rocksdb")]
     MithrilImport(MithrilImportArgs),
 }
 
@@ -90,10 +92,12 @@ async fn main() -> Result<()> {
 
     match cli.command {
         Command::Run(args) => run_node(args).await,
+        #[cfg(feature = "rocksdb")]
         Command::MithrilImport(args) => run_mithril_import(args).await,
     }
 }
 
+#[cfg(feature = "rocksdb")]
 #[derive(clap::Args, Debug)]
 struct MithrilImportArgs {
     /// Network magic value (764824073=mainnet, 2=preview, 1=preprod)
@@ -109,6 +113,7 @@ struct MithrilImportArgs {
     temp_dir: Option<PathBuf>,
 }
 
+#[cfg(feature = "rocksdb")]
 async fn run_mithril_import(args: MithrilImportArgs) -> Result<()> {
     info!(
         "Starting Mithril snapshot import for network magic {}",

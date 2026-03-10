@@ -397,13 +397,51 @@ impl Node {
                     if let Some(hash) = shelley_genesis_hash {
                         state.genesis_hash = hash;
                     }
-                    info!(
-                        epoch = state.epoch.0,
-                        utxo_count = state.utxo_set.len(),
-                        tip = %state.tip,
-                        "Ledger state restored from snapshot"
-                    );
-                    state
+                    // Validate snapshot tip exists in ChainDB. If the tip hash
+                    // is not in storage (e.g., DB was wiped, different chain, or
+                    // volatile blocks were lost), the snapshot is stale and must
+                    // be discarded to prevent "block does not connect" errors.
+                    let snapshot_valid = match state.tip.point {
+                        Point::Origin => true,
+                        Point::Specific(_, ref hash) => {
+                            let db = chain_db.blocking_read();
+                            let exists = db.has_block(hash);
+                            if !exists {
+                                let db_tip = db.get_tip();
+                                warn!(
+                                    snapshot_tip = %state.tip,
+                                    chain_db_tip = %db_tip,
+                                    "Ledger snapshot tip not found in ChainDB — snapshot is stale"
+                                );
+                            }
+                            exists
+                        }
+                    };
+
+                    if snapshot_valid {
+                        info!(
+                            epoch = state.epoch.0,
+                            utxo_count = state.utxo_set.len(),
+                            tip = %state.tip,
+                            "Ledger state restored from snapshot"
+                        );
+                        state
+                    } else {
+                        warn!("Discarding stale ledger snapshot — will replay from ChainDB");
+                        let mut ledger = LedgerState::new(protocol_params.clone());
+                        if let Some(ref genesis) = shelley_genesis {
+                            ledger.set_epoch_length(genesis.epoch_length, genesis.security_param);
+                            ledger.set_slot_config(genesis.slot_config());
+                            ledger.set_update_quorum(genesis.update_quorum);
+                        }
+                        if let Some(hash) = shelley_genesis_hash {
+                            ledger.set_genesis_hash(hash);
+                        }
+                        if !byron_genesis_utxos.is_empty() {
+                            ledger.seed_genesis_utxos(&byron_genesis_utxos);
+                        }
+                        ledger
+                    }
                 }
                 Err(e) => {
                     warn!("Failed to load ledger snapshot, starting fresh: {e}");
@@ -1095,6 +1133,11 @@ impl Node {
                                                 debug!("TxSubmission2 client error: {e}");
                                             }
                                         }
+                                        // Keep the client (and its AgentChannel) alive until
+                                        // the connection is closed. Dropping the channel would
+                                        // cause the demuxer to crash when the peer sends a
+                                        // delayed response on the TxSubmission2 protocol.
+                                        shutdown.changed().await.ok();
                                     }
                                     _ = shutdown.changed() => {
                                         debug!("TxSubmission2 client: shutdown");
@@ -1331,17 +1374,30 @@ impl Node {
         let chain_tip = self.chain_db.read().await.get_tip().point;
         let ledger_tip = self.ledger_state.read().await.tip.point.clone();
         let mut known_points = Vec::new();
-        // Use whichever tip is further ahead as primary intersection
-        if chain_tip != Point::Origin {
-            known_points.push(chain_tip.clone());
-        }
-        if ledger_tip != Point::Origin && ledger_tip != chain_tip {
-            known_points.push(ledger_tip.clone());
+        // Use whichever tip is further ahead as primary intersection.
+        // The peer returns the first matching point, so put the furthest-ahead
+        // tip first to avoid re-downloading blocks the ledger already has.
+        let ledger_slot = ledger_tip.slot().map(|s| s.0).unwrap_or(0);
+        let chain_slot = chain_tip.slot().map(|s| s.0).unwrap_or(0);
+        if ledger_slot >= chain_slot {
+            if ledger_tip != Point::Origin {
+                known_points.push(ledger_tip.clone());
+            }
+            if chain_tip != Point::Origin && chain_tip != ledger_tip {
+                known_points.push(chain_tip.clone());
+            }
+        } else {
+            if chain_tip != Point::Origin {
+                known_points.push(chain_tip.clone());
+            }
+            if ledger_tip != Point::Origin && ledger_tip != chain_tip {
+                known_points.push(ledger_tip.clone());
+            }
         }
         known_points.push(Point::Origin);
         if ledger_tip != chain_tip {
             info!(
-                "Ledger tip ({}) differs from ChainDB tip ({}), syncing from ChainDB tip",
+                "Ledger tip ({}) differs from ChainDB tip ({}), syncing from furthest-ahead tip",
                 ledger_tip, chain_tip
             );
         }
@@ -1383,6 +1439,7 @@ impl Node {
         }
 
         let mut blocks_received: u64 = 0;
+        let mut consecutive_apply_failures: u32 = 0;
         let mut last_snapshot_epoch: u64 = self.ledger_state.read().await.epoch.0;
         let mut last_log_time = std::time::Instant::now();
         let mut last_query_update = std::time::Instant::now();
@@ -1432,6 +1489,16 @@ impl Node {
                                         if headers.len() > 10 && pipeline_depth < max_pipeline_depth {
                                             pipeline_depth = max_pipeline_depth;
                                         }
+                                        if !headers.is_empty() {
+                                            debug!(
+                                                header_count = headers.len(),
+                                                first_slot = headers[0].slot,
+                                                first_block = headers[0].block_no,
+                                                last_slot = headers.last().unwrap().slot,
+                                                last_block = headers.last().unwrap().block_no,
+                                                "Headers received from pipelined client"
+                                            );
+                                        }
                                         let fetch_start = std::time::Instant::now();
                                         let header_count = headers.len() as u64;
                                         // Use fetch pool if available, otherwise primary peer
@@ -1452,7 +1519,21 @@ impl Node {
                                                 self.peer_manager.write().await.record_block_fetch(
                                                     &peer_addr, fetch_ms, header_count, 0,
                                                 );
-                                                self.process_forward_blocks(blocks, &tip, &mut blocks_received, &mut blocks_since_last_log, &mut last_snapshot_epoch, &mut last_log_time, &mut last_query_update).await;
+                                                let applied = self.process_forward_blocks(blocks, &tip, &mut blocks_received, &mut blocks_since_last_log, &mut last_snapshot_epoch, &mut last_log_time, &mut last_query_update).await;
+                                                if applied > 0 {
+                                                    consecutive_apply_failures = 0;
+                                                } else if header_count > 0 {
+                                                    consecutive_apply_failures += 1;
+                                                    if consecutive_apply_failures >= 5 {
+                                                        error!(
+                                                            consecutive_apply_failures,
+                                                            "Ledger state diverged from chain — \
+                                                             blocks do not connect. Triggering \
+                                                             reconnect to re-establish intersection."
+                                                        );
+                                                        break;
+                                                    }
+                                                }
                                             }
                                             Err(e) => { error!("Block fetch failed: {e}"); break; }
                                         }
@@ -1517,8 +1598,11 @@ impl Node {
                             Err(e) => { error!("Chain sync error: {e}"); break; }
                         }
                     }
-                    _ = forge_ticker.tick(), if self.block_producer.is_some() => {
-                        // Wall-clock slot ticker for block production
+                    _ = forge_ticker.tick(), if self.block_producer.is_some() && pipeline_depth <= 1 => {
+                        // Wall-clock slot ticker for block production.
+                        // Only enabled at tip (pipeline_depth <= 1) to avoid interrupting
+                        // the pipelined header fetch during bulk sync — dropping the header
+                        // future mid-read loses already-consumed ChainSync responses.
                         if let Some(wc) = self.current_wall_clock_slot() {
                             if wc.0 > last_forge_slot {
                                 last_forge_slot = wc.0;
@@ -1595,7 +1679,9 @@ impl Node {
         Ok(())
     }
 
-    /// Process a batch of forward blocks: store in ChainDB, apply to ledger, validate, log progress
+    /// Process a batch of forward blocks: store in ChainDB, apply to ledger, validate, log progress.
+    /// Returns the number of blocks successfully applied to the ledger (0 if the first block
+    /// failed connectivity, indicating a state divergence that the caller should handle).
     #[allow(clippy::too_many_arguments)]
     async fn process_forward_blocks(
         &mut self,
@@ -1606,9 +1692,9 @@ impl Node {
         last_snapshot_epoch: &mut u64,
         last_log_time: &mut std::time::Instant,
         last_query_update: &mut std::time::Instant,
-    ) {
+    ) -> u64 {
         if blocks.is_empty() {
-            return;
+            return 0;
         }
 
         // Validate ALL block headers BEFORE storing.
@@ -1683,7 +1769,7 @@ impl Node {
                             block_no = block.block_number().0,
                             "Consensus validation failed (strict): {e} — rejecting batch"
                         );
-                        return;
+                        return 0;
                     }
                     warn!(
                         slot = block.slot().0,
@@ -1719,13 +1805,84 @@ impl Node {
                 error!(
                     "FATAL: Failed to store block batch: {e} — halting to prevent state divergence"
                 );
-                return;
+                return 0;
             }
         }
 
         // Now apply blocks to ledger — storage is confirmed
+        let mut applied_count: u64 = 0;
         {
             let mut ls = self.ledger_state.write().await;
+            let ledger_slot = ls.tip.point.slot().map(|s| s.0).unwrap_or(0);
+            if !blocks.is_empty() {
+                debug!(
+                    batch_size = blocks.len(),
+                    ledger_slot,
+                    first_slot = blocks[0].slot().0,
+                    first_block = blocks[0].block_number().0,
+                    first_prev_hash = %blocks[0].prev_hash().to_hex(),
+                    ledger_tip_hash = %ls.tip.point.hash().map(|h| h.to_hex()).unwrap_or_default(),
+                    "Applying block batch to ledger"
+                );
+            }
+
+            // Gap bridging: if the first unskipped block doesn't connect to the
+            // ledger tip, try to replay intermediate blocks from ChainDB storage.
+            // This handles the case where ChainDB is ahead of the ledger (e.g.,
+            // after a crash mid-batch, or when blocks were stored but ledger
+            // apply failed in a previous iteration).
+            if let Some(first_new) = blocks.iter().find(|b| b.slot().0 > ledger_slot) {
+                let ledger_tip_hash = ls.tip.point.hash().cloned();
+                let first_prev = first_new.prev_hash();
+                if ledger_tip_hash.as_ref() != Some(first_prev) {
+                    info!(
+                        ledger_slot,
+                        first_block_slot = first_new.slot().0,
+                        "Gap detected between ledger and incoming blocks — \
+                         attempting to bridge from ChainDB"
+                    );
+                    let mut bridge_slot = ledger_slot;
+                    let target_slot = first_new.slot().0;
+                    let mut bridged = 0u64;
+                    loop {
+                        let block_data = {
+                            let db = self.chain_db.read().await;
+                            db.get_next_block_after_slot(torsten_primitives::time::SlotNo(
+                                bridge_slot,
+                            ))
+                        };
+                        match block_data {
+                            Ok(Some((next_slot, _hash, cbor))) => {
+                                if next_slot.0 >= target_slot {
+                                    break; // Reached the incoming batch
+                                }
+                                match torsten_serialization::multi_era::decode_block(&cbor) {
+                                    Ok(block) => {
+                                        if let Err(e) = ls.apply_block(&block) {
+                                            warn!(
+                                                slot = next_slot.0,
+                                                "Gap bridge apply failed: {e} — aborting bridge"
+                                            );
+                                            break;
+                                        }
+                                        bridged += 1;
+                                        bridge_slot = next_slot.0;
+                                    }
+                                    Err(e) => {
+                                        warn!(slot = next_slot.0, "Gap bridge decode failed: {e}");
+                                        bridge_slot = next_slot.0;
+                                    }
+                                }
+                            }
+                            _ => break,
+                        }
+                    }
+                    if bridged > 0 {
+                        info!(bridged, "Gap bridged from ChainDB storage");
+                    }
+                }
+            }
+
             let ledger_slot = ls.tip.point.slot().map(|s| s.0).unwrap_or(0);
             for block in &blocks {
                 // Skip blocks the ledger has already applied (e.g. replaying from origin)
@@ -1741,6 +1898,7 @@ impl Node {
                     );
                     break;
                 }
+                applied_count += 1;
             }
         }
 
@@ -1900,6 +2058,8 @@ impl Node {
                 *last_query_update = std::time::Instant::now();
             }
         }
+
+        applied_count
     }
 
     /// Update the query handler with the current ledger state

@@ -42,6 +42,9 @@ pub struct PipelinedPeerClient {
     bf_client: pallas_network::miniprotocols::blockfetch::Client,
     _keepalive: KeepAliveHandle,
     _plexer: RunningPlexer,
+    /// Keep PeerSharing channel alive so the demuxer doesn't crash when the
+    /// remote peer sends PeerSharing messages (~60s after connection).
+    _peersharing_channel: pallas_network::multiplexer::AgentChannel,
     remote_addr: SocketAddr,
     /// Number of outstanding (sent but not yet received) pipelined requests.
     in_flight: usize,
@@ -71,7 +74,7 @@ impl PipelinedPeerClient {
         let cs_channel = plexer.subscribe_client(PROTOCOL_N2N_CHAIN_SYNC);
         let bf_channel = plexer.subscribe_client(PROTOCOL_N2N_BLOCK_FETCH);
         let txsub_channel = plexer.subscribe_client(PROTOCOL_N2N_TX_SUBMISSION);
-        let _peersharing_channel = plexer.subscribe_client(PROTOCOL_N2N_PEER_SHARING);
+        let peersharing_channel = plexer.subscribe_client(PROTOCOL_N2N_PEER_SHARING);
         let ka_channel = plexer.subscribe_client(PROTOCOL_N2N_KEEP_ALIVE);
 
         let plexer = plexer.spawn();
@@ -109,6 +112,7 @@ impl PipelinedPeerClient {
             bf_client,
             _keepalive: keepalive,
             _plexer: plexer,
+            _peersharing_channel: peersharing_channel,
             remote_addr,
             in_flight: 0,
             stale: false,
@@ -169,6 +173,11 @@ impl PipelinedPeerClient {
     }
 
     /// Request headers with a configurable pipeline depth.
+    ///
+    /// Sends exactly `pipeline_depth` MsgRequestNext messages, then reads all
+    /// responses (up to `batch_size`). Does NOT refill the pipeline during
+    /// reading — this ensures in_flight reaches 0 before returning, preventing
+    /// channel buffer backpressure during the caller's block fetch phase.
     pub async fn request_headers_pipelined_with_depth(
         &mut self,
         batch_size: usize,
@@ -177,13 +186,14 @@ impl PipelinedPeerClient {
         let mut headers = Vec::with_capacity(batch_size);
         let mut latest_tip = None;
 
-        // Send initial pipeline of MsgRequestNext messages
+        // Send pipeline of MsgRequestNext messages
+        // Cap at batch_size to avoid requesting more than we'll consume
         let initial_send = pipeline_depth.min(batch_size);
         for _ in self.in_flight..initial_send {
             self.send_request_next().await?;
         }
 
-        // Read responses and refill the pipeline
+        // Read all responses without refilling — ensures in_flight → 0
         while headers.len() < batch_size {
             if self.in_flight == 0 {
                 break;
@@ -214,12 +224,6 @@ impl PipelinedPeerClient {
                                 "pipelined header decode: {e}"
                             )));
                         }
-                    }
-
-                    // Refill pipeline: send another MsgRequestNext if we need more
-                    let remaining = batch_size - headers.len();
-                    if remaining > 0 && self.in_flight < pipeline_depth {
-                        self.send_request_next().await?;
                     }
                 }
                 Message::RollBackward(point, tip) => {
