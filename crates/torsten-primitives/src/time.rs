@@ -50,6 +50,30 @@ impl SlotNo {
     }
 }
 
+impl SlotNo {
+    /// Compute the current slot number from wall-clock time.
+    ///
+    /// Returns the slot corresponding to `now` given the chain's system start
+    /// and slot length. Returns `None` if `now` is before system start.
+    pub fn from_wall_clock(
+        now: chrono::DateTime<chrono::Utc>,
+        system_start: &SystemStart,
+        slot_length: SlotLength,
+    ) -> Option<Self> {
+        let elapsed = now
+            .signed_duration_since(system_start.utc_time)
+            .num_milliseconds();
+        if elapsed < 0 {
+            return None;
+        }
+        let slot_ms = (slot_length.0 * 1000.0) as i64;
+        if slot_ms == 0 {
+            return None;
+        }
+        Some(SlotNo((elapsed / slot_ms) as u64))
+    }
+}
+
 impl BlockNo {
     pub fn next(self) -> Self {
         BlockNo(self.0 + 1)
@@ -148,6 +172,40 @@ mod tests {
         assert!(SlotNo(1) < SlotNo(2));
         assert!(EpochNo(0) < EpochNo(1));
         assert!(BlockNo(100) > BlockNo(99));
+    }
+
+    #[test]
+    fn test_from_wall_clock() {
+        use chrono::TimeZone;
+        let sys_start = SystemStart {
+            utc_time: chrono::Utc.with_ymd_and_hms(2022, 11, 1, 0, 0, 0).unwrap(),
+        };
+        let slot_len = SlotLength(1.0);
+
+        // Exactly at system start = slot 0
+        let now = sys_start.utc_time;
+        assert_eq!(
+            SlotNo::from_wall_clock(now, &sys_start, slot_len),
+            Some(SlotNo(0))
+        );
+
+        // 100 seconds after start = slot 100
+        let now = sys_start.utc_time + chrono::Duration::seconds(100);
+        assert_eq!(
+            SlotNo::from_wall_clock(now, &sys_start, slot_len),
+            Some(SlotNo(100))
+        );
+
+        // Before system start = None
+        let now = sys_start.utc_time - chrono::Duration::seconds(1);
+        assert_eq!(SlotNo::from_wall_clock(now, &sys_start, slot_len), None);
+
+        // Non-integer slot boundary (1.5 seconds in, 1-second slots) = slot 1
+        let now = sys_start.utc_time + chrono::Duration::milliseconds(1500);
+        assert_eq!(
+            SlotNo::from_wall_clock(now, &sys_start, slot_len),
+            Some(SlotNo(1))
+        );
     }
 
     #[test]

@@ -1288,6 +1288,18 @@ impl Node {
             .and_then(|v| v.parse().ok())
             .unwrap_or(if use_pipelined || use_pool { 500 } else { 100 });
 
+        // Slot ticker for block production: fires every slot_length seconds
+        let slot_length_secs = self
+            .shelley_genesis
+            .as_ref()
+            .map(|g| g.slot_length)
+            .unwrap_or(1);
+        let mut forge_ticker =
+            tokio::time::interval(tokio::time::Duration::from_secs(slot_length_secs));
+        forge_ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        // Track the last slot we checked for forging to avoid duplicate checks
+        let mut last_forge_slot: u64 = 0;
+
         loop {
             if *shutdown_rx.borrow() {
                 info!("Shutdown requested, stopping sync");
@@ -1400,6 +1412,15 @@ impl Node {
                             Err(e) => { error!("Chain sync error: {e}"); break; }
                         }
                     }
+                    _ = forge_ticker.tick(), if self.block_producer.is_some() => {
+                        // Wall-clock slot ticker for block production
+                        if let Some(wc) = self.current_wall_clock_slot() {
+                            if wc.0 > last_forge_slot {
+                                last_forge_slot = wc.0;
+                                self.try_forge_block().await;
+                            }
+                        }
+                    }
                     _ = shutdown_rx.changed() => {
                         info!("Shutdown requested during sync");
                         break;
@@ -1445,6 +1466,14 @@ impl Node {
                                 }
                             }
                             Err(e) => { error!("Chain sync error: {e}"); break; }
+                        }
+                    }
+                    _ = forge_ticker.tick(), if self.block_producer.is_some() => {
+                        if let Some(wc) = self.current_wall_clock_slot() {
+                            if wc.0 > last_forge_slot {
+                                last_forge_slot = wc.0;
+                                self.try_forge_block().await;
+                            }
                         }
                     }
                     _ = shutdown_rx.changed() => {
@@ -2452,18 +2481,43 @@ impl Node {
         self.notify_rollback(rollback_point).await;
     }
 
+    /// Compute the current slot number from wall-clock time using Shelley genesis parameters.
+    fn current_wall_clock_slot(&self) -> Option<torsten_primitives::time::SlotNo> {
+        let genesis = self.shelley_genesis.as_ref()?;
+        let system_start = torsten_primitives::time::SystemStart {
+            utc_time: chrono::DateTime::parse_from_rfc3339(&genesis.system_start)
+                .map(|dt| dt.with_timezone(&chrono::Utc))
+                .ok()?,
+        };
+        let slot_length = torsten_primitives::time::SlotLength(genesis.slot_length as f64);
+        torsten_primitives::time::SlotNo::from_wall_clock(
+            chrono::Utc::now(),
+            &system_start,
+            slot_length,
+        )
+    }
+
     /// Attempt to forge a block if we are in block producer mode and are the slot leader.
     ///
-    /// Called when the node is caught up to the chain tip.
+    /// Called every slot when the node is caught up to the chain tip.
     async fn try_forge_block(&mut self) {
         let creds = match &self.block_producer {
             Some(c) => c,
             None => return, // relay-only mode
         };
 
+        // Compute current slot from wall-clock time
+        let wall_clock_slot = self.current_wall_clock_slot();
+
         let ls = self.ledger_state.read().await;
-        let current_slot = ls.tip.point.slot().map(|s| s.0).unwrap_or(0);
-        let next_slot = torsten_primitives::time::SlotNo(current_slot + 1);
+        let tip_slot = ls.tip.point.slot().map(|s| s.0).unwrap_or(0);
+        let next_slot = match wall_clock_slot {
+            Some(wc) if wc.0 > tip_slot => wc,
+            _ => {
+                // No genesis or wall clock behind tip — skip forging
+                return;
+            }
+        };
         let epoch_nonce = ls.epoch_nonce;
         let block_number = torsten_primitives::time::BlockNo(ls.current_block_number().0 + 1);
         let prev_hash = ls
