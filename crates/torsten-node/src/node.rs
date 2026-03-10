@@ -1893,17 +1893,23 @@ impl Node {
 
         let ls = self.ledger_state.read().await;
 
-        // Build per-pool stake map from delegations for accurate reporting
+        // Build per-pool stake map from delegations for accurate reporting.
+        // Per Cardano spec, total stake = UTxO-delegated stake + reward account balance.
         let mut pool_stake_map: std::collections::HashMap<torsten_primitives::hash::Hash28, u64> =
             std::collections::HashMap::new();
         for (cred_hash, pool_id) in &ls.delegations {
-            let stake = ls
+            let utxo_stake = ls
                 .stake_distribution
                 .stake_map
                 .get(cred_hash)
                 .map(|l| l.0)
                 .unwrap_or(0);
-            *pool_stake_map.entry(*pool_id).or_default() += stake;
+            let reward_balance = ls
+                .reward_accounts
+                .get(cred_hash)
+                .map(|l| l.0)
+                .unwrap_or(0);
+            *pool_stake_map.entry(*pool_id).or_default() += utxo_stake + reward_balance;
         }
 
         // Build stake pool snapshots with actual per-pool stake
