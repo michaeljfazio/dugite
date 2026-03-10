@@ -1816,16 +1816,25 @@ impl LedgerState {
         }
     }
 
+    /// Whether we are in the Conway bootstrap phase (protocol version 9).
+    /// During bootstrap, all DRep voting thresholds are set to 0 (auto-pass)
+    /// per the Haskell `hardforkConwayBootstrapPhase` function.
+    fn is_bootstrap_phase(&self) -> bool {
+        self.protocol_params.protocol_version_major == 9
+    }
+
     /// Check whether a proposal has met its voting thresholds for ratification.
     ///
-    /// CIP-1694 voting thresholds (stake-weighted):
+    /// CIP-1694 voting thresholds (stake-weighted), matching Haskell cardano-ledger:
     /// - InfoAction: always ratified (no thresholds)
-    /// - ParameterChange: requires DRep vote ≥ dvt_pp_*_group (group-dependent) AND CC approval
-    /// - HardForkInitiation: requires DRep ≥ dvt_hard_fork AND SPO ≥ pvt_hard_fork
-    /// - NoConfidence: requires DRep ≥ dvt_no_confidence AND SPO ≥ pvt_motion_no_confidence
-    /// - UpdateCommittee: requires DRep ≥ dvt_committee AND SPO ≥ pvt_committee_normal
-    /// - NewConstitution: requires DRep ≥ dvt_constitution AND CC approval
-    /// - TreasuryWithdrawals: requires DRep ≥ dvt_treasury_withdrawal AND CC approval
+    /// - ParameterChange: DRep ≥ dvt_pp_*_group + SPO ≥ pvt_pp_security (if security) + CC
+    /// - HardForkInitiation: DRep ≥ dvt_hard_fork + SPO ≥ pvt_hard_fork + CC
+    /// - NoConfidence: DRep ≥ dvt_no_confidence + SPO ≥ pvt_motion_no_confidence (no CC)
+    /// - UpdateCommittee: DRep ≥ dvt_committee + SPO ≥ pvt_committee (no CC)
+    /// - NewConstitution: DRep ≥ dvt_constitution + CC (no SPO)
+    /// - TreasuryWithdrawals: DRep ≥ dvt_treasury_withdrawal + CC (no SPO)
+    ///
+    /// During Conway bootstrap phase (protocol version 9), all DRep thresholds are 0.
     fn check_ratification(
         &self,
         action_id: &GovActionId,
@@ -1837,6 +1846,8 @@ impl LedgerState {
         let (drep_yes, drep_total, spo_yes, spo_total, cc_yes, cc_total) =
             self.count_votes_by_type(action_id);
 
+        let bootstrap = self.is_bootstrap_phase();
+
         match &state.procedure.gov_action {
             GovAction::InfoAction => {
                 // InfoAction is always ratified (it's informational only)
@@ -1846,11 +1857,14 @@ impl LedgerState {
                 protocol_param_update,
                 ..
             } => {
-                // Per CIP-1694 / Haskell pparamsUpdateThreshold:
-                // DRep threshold = max of applicable DRep group thresholds
-                // SPO threshold = pvtPPSecurityGroup if any param is security-relevant, else no SPO vote
-                let drep_threshold =
-                    pp_change_drep_threshold(protocol_param_update, &self.protocol_params);
+                // DRep threshold = max of applicable DRep group thresholds (0 during bootstrap)
+                // SPO threshold = pvtPPSecurityGroup if any param is security-relevant
+                // CC approval required
+                let drep_threshold = if bootstrap {
+                    0.0
+                } else {
+                    pp_change_drep_threshold(protocol_param_update, &self.protocol_params)
+                };
                 let drep_met =
                     check_threshold(drep_yes, drep_total.max(total_drep_stake), drep_threshold);
                 let spo_met = if let Some(spo_threshold) =
@@ -1863,17 +1877,41 @@ impl LedgerState {
                 let cc_met = check_cc_approval(cc_yes, cc_total, &self.governance, self.epoch);
                 drep_met && spo_met && cc_met
             }
-            GovAction::HardForkInitiation { .. } => {
-                let drep_threshold = self.protocol_params.dvt_hard_fork.as_f64();
+            GovAction::HardForkInitiation {
+                protocol_version, ..
+            } => {
+                // DRep + SPO + CC all required
+                let drep_threshold = if bootstrap {
+                    0.0
+                } else {
+                    self.protocol_params.dvt_hard_fork.as_f64()
+                };
                 let spo_threshold = self.protocol_params.pvt_hard_fork.as_f64();
                 let drep_met =
                     check_threshold(drep_yes, drep_total.max(total_drep_stake), drep_threshold);
                 let spo_met =
                     check_threshold(spo_yes, spo_total.max(total_spo_stake), spo_threshold);
-                drep_met && spo_met
+                let cc_met = check_cc_approval(cc_yes, cc_total, &self.governance, self.epoch);
+                debug!(
+                    action_id = %action_id.transaction_id.to_hex(),
+                    version = ?protocol_version,
+                    bootstrap,
+                    drep_yes, drep_total = drep_total.max(total_drep_stake),
+                    drep_threshold, drep_met,
+                    spo_yes, spo_total = spo_total.max(total_spo_stake),
+                    spo_threshold, spo_met,
+                    cc_yes, cc_total, cc_met,
+                    "HardForkInitiation ratification check"
+                );
+                drep_met && spo_met && cc_met
             }
             GovAction::NoConfidence { .. } => {
-                let drep_threshold = self.protocol_params.dvt_no_confidence.as_f64();
+                // DRep + SPO, no CC (CC cannot vote on NoConfidence)
+                let drep_threshold = if bootstrap {
+                    0.0
+                } else {
+                    self.protocol_params.dvt_no_confidence.as_f64()
+                };
                 let spo_threshold = self.protocol_params.pvt_motion_no_confidence.as_f64();
                 let drep_met =
                     check_threshold(drep_yes, drep_total.max(total_drep_stake), drep_threshold);
@@ -1882,14 +1920,23 @@ impl LedgerState {
                 drep_met && spo_met
             }
             GovAction::UpdateCommittee { .. } => {
+                // DRep + SPO, no CC (CC cannot vote on UpdateCommittee)
                 let (drep_threshold, spo_threshold) = if self.governance.no_confidence {
                     (
-                        self.protocol_params.dvt_committee_no_confidence.as_f64(),
+                        if bootstrap {
+                            0.0
+                        } else {
+                            self.protocol_params.dvt_committee_no_confidence.as_f64()
+                        },
                         self.protocol_params.pvt_committee_no_confidence.as_f64(),
                     )
                 } else {
                     (
-                        self.protocol_params.dvt_committee_normal.as_f64(),
+                        if bootstrap {
+                            0.0
+                        } else {
+                            self.protocol_params.dvt_committee_normal.as_f64()
+                        },
                         self.protocol_params.pvt_committee_normal.as_f64(),
                     )
                 };
@@ -1900,14 +1947,24 @@ impl LedgerState {
                 drep_met && spo_met
             }
             GovAction::NewConstitution { .. } => {
-                let drep_threshold = self.protocol_params.dvt_constitution.as_f64();
+                // DRep + CC, no SPO
+                let drep_threshold = if bootstrap {
+                    0.0
+                } else {
+                    self.protocol_params.dvt_constitution.as_f64()
+                };
                 let drep_met =
                     check_threshold(drep_yes, drep_total.max(total_drep_stake), drep_threshold);
                 let cc_met = check_cc_approval(cc_yes, cc_total, &self.governance, self.epoch);
                 drep_met && cc_met
             }
             GovAction::TreasuryWithdrawals { .. } => {
-                let drep_threshold = self.protocol_params.dvt_treasury_withdrawal.as_f64();
+                // DRep + CC, no SPO
+                let drep_threshold = if bootstrap {
+                    0.0
+                } else {
+                    self.protocol_params.dvt_treasury_withdrawal.as_f64()
+                };
                 let drep_met =
                     check_threshold(drep_yes, drep_total.max(total_drep_stake), drep_threshold);
                 let cc_met = check_cc_approval(cc_yes, cc_total, &self.governance, self.epoch);
@@ -5257,9 +5314,7 @@ mod tests {
         state.epoch_length = 100;
 
         // 7 genesis delegates propose protocol_version=8.0 targeting epoch 21
-        let proposers: Vec<Hash32> = (0..7)
-            .map(|i| Hash32::from_bytes([i + 1; 32]))
-            .collect();
+        let proposers: Vec<Hash32> = (0..7).map(|i| Hash32::from_bytes([i + 1; 32])).collect();
         for hash in &proposers {
             let update = ProtocolParamUpdate {
                 protocol_version_major: Some(8),
