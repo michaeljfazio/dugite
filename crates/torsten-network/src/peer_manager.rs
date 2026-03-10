@@ -328,6 +328,11 @@ impl PeerManager {
 
     /// Add a peer discovered via peer sharing
     pub fn add_shared_peer(&mut self, addr: SocketAddr) {
+        // Filter non-routable addresses to prevent peer table poisoning
+        if !Self::is_routable(&addr.ip()) {
+            debug!(%addr, "Rejected non-routable shared peer");
+            return;
+        }
         if self.peers.contains_key(&addr) {
             return; // Already known
         }
@@ -338,6 +343,24 @@ impl PeerManager {
         self.cold_peers.insert(addr);
         self.peers.insert(addr, info);
         debug!(%addr, "Discovered peer via sharing");
+    }
+
+    /// Check if an IP address is globally routable (not loopback, private, multicast, etc.)
+    fn is_routable(ip: &std::net::IpAddr) -> bool {
+        match ip {
+            std::net::IpAddr::V4(v4) => {
+                !v4.is_loopback()
+                    && !v4.is_private()
+                    && !v4.is_link_local()
+                    && !v4.is_broadcast()
+                    && !v4.is_unspecified()
+                    && !v4.is_multicast()
+                    && !v4.is_documentation()
+            }
+            std::net::IpAddr::V6(v6) => {
+                !v6.is_loopback() && !v6.is_unspecified() && !v6.is_multicast()
+            }
+        }
     }
 
     /// Mark a peer as successfully connected (warm)

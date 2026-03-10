@@ -2499,6 +2499,10 @@ impl LedgerState {
     /// Format: [4-byte magic][32-byte blake2b checksum][bincode data]
     pub fn save_snapshot(&self, path: &Path) -> Result<(), LedgerError> {
         let tmp_path = path.with_extension("tmp");
+
+        // Serialize directly to a temp file with BufWriter to avoid double allocation.
+        // Format: "TRSN" magic (4 bytes) + blake2b checksum (32 bytes) + bincode data
+        // We write data first, then compute checksum, then prepend header via rewrite.
         let data = bincode::serialize(self).map_err(|e| {
             LedgerError::EpochTransition(format!("Failed to serialize ledger state: {e}"))
         })?;
@@ -2506,19 +2510,32 @@ impl LedgerState {
         // Compute checksum over the serialized data
         let checksum = torsten_primitives::hash::blake2b_256(&data);
 
-        // Write: magic + checksum + data
-        let mut output = Vec::with_capacity(4 + 32 + data.len());
-        output.extend_from_slice(b"TRSN"); // Torsten Snapshot magic bytes
-        output.extend_from_slice(checksum.as_bytes());
-        output.extend_from_slice(&data);
+        // Write header + data using a single buffered write
+        use std::io::Write;
+        let file = std::fs::File::create(&tmp_path)
+            .map_err(|e| LedgerError::EpochTransition(format!("Failed to create snapshot: {e}")))?;
+        let mut writer = std::io::BufWriter::with_capacity(1 << 20, file);
+        writer.write_all(b"TRSN").map_err(|e| {
+            LedgerError::EpochTransition(format!("Failed to write snapshot header: {e}"))
+        })?;
+        writer.write_all(checksum.as_bytes()).map_err(|e| {
+            LedgerError::EpochTransition(format!("Failed to write snapshot checksum: {e}"))
+        })?;
+        writer.write_all(&data).map_err(|e| {
+            LedgerError::EpochTransition(format!("Failed to write snapshot data: {e}"))
+        })?;
+        writer
+            .flush()
+            .map_err(|e| LedgerError::EpochTransition(format!("Failed to flush snapshot: {e}")))?;
+        drop(writer);
 
-        std::fs::write(&tmp_path, &output)
-            .map_err(|e| LedgerError::EpochTransition(format!("Failed to write snapshot: {e}")))?;
+        let total_bytes = 4 + 32 + data.len();
+
         std::fs::rename(&tmp_path, path)
             .map_err(|e| LedgerError::EpochTransition(format!("Failed to rename snapshot: {e}")))?;
         info!(
             path = %path.display(),
-            bytes = output.len(),
+            bytes = total_bytes,
             utxo_count = self.utxo_set.len(),
             epoch = self.epoch.0,
             slot = ?self.tip.point.slot().map(|s| s.0),
