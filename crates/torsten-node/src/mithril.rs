@@ -515,12 +515,10 @@ fn import_chunk_files(extract_dir: &Path, database_path: &Path) -> Result<()> {
     }
 
     // Open the database with bulk-import-optimized settings (deferred compaction)
-    let immutable_path = database_path.join("immutable");
-    let mut immutable_db =
-        torsten_storage::lsm::LsmImmutableDB::open_for_bulk_import(&immutable_path)?;
+    let mut chain_db = torsten_storage::ChainDB::open_for_bulk_import(database_path)?;
 
     // Check if we already have blocks (resume support)
-    let existing_tip = immutable_db.tip_slot();
+    let existing_tip = chain_db.tip_slot();
     if existing_tip > SlotNo(0) {
         info!(
             existing_tip_slot = existing_tip.0,
@@ -580,7 +578,7 @@ fn import_chunk_files(extract_dir: &Path, database_path: &Path) -> Result<()> {
             .map(|(slot, hash, block_no, cbor)| (*slot, hash, *block_no, cbor.as_slice()))
             .collect();
 
-        immutable_db.put_blocks_batch(&batch)?;
+        chain_db.put_blocks_batch(&batch)?;
         total_blocks_imported += batch.len() as u64;
 
         pb.inc(1);
@@ -599,14 +597,14 @@ fn import_chunk_files(extract_dir: &Path, database_path: &Path) -> Result<()> {
         total_blocks = total_blocks_imported,
         skipped_chunks,
         checksum_failures,
-        tip_slot = immutable_db.tip_slot().0,
+        tip_slot = chain_db.tip_slot().0,
         "Block import complete — persisting to disk"
     );
 
     // Persist all data to a durable snapshot before exiting.
     // cardano-lsm uses ephemeral writes; without this call, any data still in
     // the in-memory memtable would be lost when the process exits.
-    immutable_db
+    chain_db
         .persist()
         .context("Failed to persist imported blocks to disk")?;
 

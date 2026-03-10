@@ -3475,7 +3475,6 @@ dependencies = [
  "cardano-lsm",
  "crc32fast",
  "criterion",
- "parking_lot",
  "rand 0.8.5",
  "serde",
  "serde_json",

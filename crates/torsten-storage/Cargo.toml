@@ -2,7 +2,7 @@
 name = "torsten-storage"
 version.workspace = true
 edition.workspace = true
-description = "Block and chain storage for Torsten (ImmutableDB + VolatileDB)"
+description = "Block and chain storage for Torsten (unified LSM-tree with snapshot/rollback)"
 
 [features]
 default = []
@@ -16,7 +16,6 @@ cardano-lsm = { workspace = true }
 tokio = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
-parking_lot = { workspace = true }
 bytes = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

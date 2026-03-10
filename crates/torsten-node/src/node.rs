@@ -1196,15 +1196,12 @@ impl Node {
             }
         }
 
-        // Flush ChainDB and persist to disk BEFORE saving ledger snapshot
+        // Persist ChainDB to disk BEFORE saving ledger snapshot
         // (ensures ledger snapshot is consistent with persisted blocks)
         {
             let mut db = self.chain_db.write().await;
-            if let Err(e) = db.flush_volatile_to_immutable() {
-                error!("Failed to flush ChainDB on shutdown: {e}");
-            }
-            if let Err(e) = db.persist_immutable() {
-                error!("Failed to persist immutable DB on shutdown: {e}");
+            if let Err(e) = db.persist() {
+                error!("Failed to persist ChainDB on shutdown: {e}");
             }
         }
         self.save_ledger_snapshot().await;
@@ -1941,6 +1938,14 @@ impl Node {
 
         if let Some(last_block) = blocks.last() {
             self.consensus.update_tip(last_block.tip());
+        }
+
+        // Take a rollback snapshot after each successful batch.
+        // This allows the LSM tree to be atomically restored if a chain
+        // reorganization is required.
+        {
+            let mut db = self.chain_db.write().await;
+            db.take_rollback_snapshot();
         }
 
         let tx_count: u64 = blocks.iter().map(|b| b.transactions.len() as u64).sum();
