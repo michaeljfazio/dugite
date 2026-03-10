@@ -315,7 +315,8 @@ impl OuroborosPraos {
             }
 
             // Verify VRF leader eligibility: the VRF output must satisfy the
-            // Praos threshold for this pool's relative stake
+            // Praos threshold for this pool's relative stake.
+            // Uses exact 34-digit fixed-point arithmetic matching Haskell's taylorExpCmp.
             if header.vrf_result.output.len() == 64 {
                 let leader_value = crate::slot_leader::vrf_leader_value(&header.vrf_result.output);
                 if !torsten_crypto::vrf::check_leader_value(
