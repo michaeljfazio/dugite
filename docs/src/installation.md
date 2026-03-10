@@ -1,10 +1,60 @@
 # Installation
 
-Torsten is built from source using the standard Rust toolchain. Pre-built binaries are not yet distributed.
+Torsten can be installed from pre-built binaries, container images, or built from source.
 
-## Prerequisites
+## Pre-built Binaries
 
-### Rust Toolchain
+Download the latest release from [GitHub Releases](https://github.com/michaeljfazio/torsten/releases):
+
+| Platform | Architecture | Download |
+|----------|-------------|----------|
+| Linux | x86_64 | `torsten-x86_64-linux.tar.gz` |
+| Linux | aarch64 | `torsten-aarch64-linux.tar.gz` |
+| macOS | x86_64 (Intel) | `torsten-x86_64-macos.tar.gz` |
+| macOS | Apple Silicon | `torsten-aarch64-macos.tar.gz` |
+
+```bash
+# Example: download and extract for Linux x86_64
+curl -LO https://github.com/michaeljfazio/torsten/releases/latest/download/torsten-x86_64-linux.tar.gz
+tar xzf torsten-x86_64-linux.tar.gz
+sudo mv torsten-node torsten-cli /usr/local/bin/
+```
+
+Verify checksums:
+
+```bash
+curl -LO https://github.com/michaeljfazio/torsten/releases/latest/download/SHA256SUMS.txt
+sha256sum -c SHA256SUMS.txt
+```
+
+## Container Image
+
+Multi-architecture container images (amd64 and arm64) are published to GitHub Container Registry:
+
+```bash
+docker pull ghcr.io/michaeljfazio/torsten:latest
+```
+
+The image uses a [distroless](https://github.com/GoogleContainerTools/distroless) base (`gcr.io/distroless/cc-debian12:nonroot`) for minimal attack surface — no shell, no package manager, runs as nonroot (UID 65532).
+
+Run the node:
+
+```bash
+docker run -d \
+  --name torsten \
+  -p 3001:3001 \
+  -p 12798:12798 \
+  -v torsten-data:/opt/torsten/db \
+  ghcr.io/michaeljfazio/torsten:latest
+```
+
+See [Kubernetes Deployment](./running/kubernetes.md) for production container deployments.
+
+## Building from Source
+
+### Prerequisites
+
+#### Rust Toolchain
 
 Install the latest stable Rust toolchain via [rustup](https://rustup.rs/):
 
@@ -21,7 +71,7 @@ cargo --version
 
 Torsten requires **Rust 1.75 or later** (edition 2021).
 
-### System Dependencies
+#### System Dependencies
 
 Torsten uses RocksDB for persistent storage, which requires `libclang` for compilation.
 
@@ -56,7 +106,7 @@ sudo dnf install clang-devel
 sudo pacman -S clang
 ```
 
-## Building from Source
+### Build
 
 Clone the repository:
 
@@ -78,7 +128,7 @@ This produces two binaries in `target/release/`:
 | `torsten-node` | The Cardano node |
 | `torsten-cli` | The cardano-cli compatible command-line interface |
 
-### Install Binaries
+#### Install Binaries
 
 To install the binaries into your `$CARGO_HOME/bin` (typically `~/.cargo/bin/`):
 

@@ -15,6 +15,7 @@
 - [Mithril Snapshot Import](./running/mithril.md)
 - [Monitoring](./running/monitoring.md)
 - [Block Producer](./running/block-producer.md)
+- [Kubernetes Deployment](./running/kubernetes.md)
 
 # CLI Reference
 
