@@ -208,17 +208,18 @@ pub async fn import_snapshot(
     // redundant since replay reads from chunk files directly. Blocks will be imported
     // into ChainDB during normal sync after replay completes.
 
-    // Step 7: Move immutable chunk files to database path for fast replay.
-    // The node will read these sequentially during ledger replay (much faster
-    // than random LSM reads), then delete them when replay is complete.
+    // Step 7: Move immutable chunk files to permanent storage.
+    // These become the ImmutableDB — ChainDB reads historical blocks directly
+    // from chunk files (1x write amplification, sequential I/O). The directory
+    // is NOT deleted after replay; it serves as permanent immutable block storage.
     let immutable_dir = find_immutable_dir(&extract_dir);
-    let replay_dir = database_path.join("immutable-replay");
+    let dest_dir = database_path.join("immutable");
     if let Some(ref imm) = immutable_dir {
-        info!("Moving chunk files to database for fast ledger replay");
-        if let Err(e) = fs::rename(imm, &replay_dir) {
+        info!("Moving chunk files to permanent immutable storage");
+        if let Err(e) = fs::rename(imm, &dest_dir) {
             // rename may fail across filesystems, fall back to copy
             warn!(error = %e, "rename failed, falling back to copy");
-            copy_dir_recursive(imm, &replay_dir)?;
+            copy_dir_recursive(imm, &dest_dir)?;
         }
     }
 

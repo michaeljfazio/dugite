@@ -1366,19 +1366,48 @@ impl Node {
     /// 2. **LSM replay** (fallback): Reads blocks by block number from the LSM tree.
     ///    Slower due to random I/O but works when chunk files aren't available.
     async fn replay_ledger_from_storage(&self) {
-        // Check for chunk files FIRST — after the optimized Mithril import,
-        // ChainDB may be empty but chunk files are ready for replay.
-        let replay_dir = self.database_path.join("immutable-replay");
-        if replay_dir.is_dir() {
-            info!("Found immutable-replay directory, using fast chunk-file replay");
-            self.replay_from_chunk_files(&replay_dir).await;
-            // Clean up chunk files after successful replay
-            if let Err(e) = std::fs::remove_dir_all(&replay_dir) {
-                warn!(error = %e, "Failed to remove immutable-replay directory");
-            } else {
-                info!("Cleaned up immutable-replay directory");
+        // Migrate legacy immutable-replay/ to immutable/ (backwards compat)
+        let legacy_dir = self.database_path.join("immutable-replay");
+        let immutable_dir = self.database_path.join("immutable");
+        if legacy_dir.is_dir() && !immutable_dir.is_dir() {
+            info!("Migrating legacy immutable-replay/ to immutable/");
+            if let Err(e) = std::fs::rename(&legacy_dir, &immutable_dir) {
+                warn!(error = %e, "Failed to migrate, will use legacy path");
             }
-            return;
+        }
+
+        // Check for chunk files — ImmutableDB provides permanent historical
+        // block storage from Mithril. Chunk files are NOT deleted after replay.
+        let chunk_dir = if immutable_dir.is_dir() {
+            Some(immutable_dir)
+        } else if legacy_dir.is_dir() {
+            Some(legacy_dir)
+        } else {
+            None
+        };
+        if let Some(ref dir) = chunk_dir {
+            let ledger_slot = {
+                let ls = self.ledger_state.read().await;
+                ls.tip.point.slot().map(|s| s.0).unwrap_or(0)
+            };
+            // Only replay if the ledger hasn't caught up to the immutable tip
+            let imm_tip_slot = self
+                .chain_db
+                .read()
+                .await
+                .get_tip()
+                .point
+                .slot()
+                .map(|s| s.0)
+                .unwrap_or(0);
+            if ledger_slot < imm_tip_slot {
+                info!(
+                    ledger_slot,
+                    imm_tip_slot, "Ledger behind ImmutableDB — replaying from chunk files"
+                );
+                self.replay_from_chunk_files(dir).await;
+                return;
+            }
         }
 
         let db_tip = self.chain_db.read().await.get_tip();
@@ -1444,6 +1473,7 @@ impl Node {
         let ledger_state = self.ledger_state.clone();
         let snapshot_path = self.database_path.join("ledger-snapshot.bin");
         let replay_dir = replay_dir.to_path_buf();
+        let bel = self.byron_epoch_length;
 
         let result = tokio::task::spawn_blocking(move || {
             let start = std::time::Instant::now();
@@ -1461,7 +1491,9 @@ impl Node {
             }
 
             let result = crate::mithril::replay_from_chunk_files(&replay_dir, |cbor| {
-                match torsten_serialization::multi_era::decode_block(cbor) {
+                match torsten_serialization::multi_era::decode_block_with_byron_epoch_length(
+                    cbor, bel,
+                ) {
                     Ok(block) => {
                         let mut ls_guard = ledger_state.blocking_write();
                         if let Err(e) = ls_guard.apply_block(&block) {
@@ -1565,7 +1597,10 @@ impl Node {
 
             match block_data {
                 Ok(Some((slot, _hash, cbor))) => {
-                    match torsten_serialization::multi_era::decode_block(&cbor) {
+                    match torsten_serialization::multi_era::decode_block_with_byron_epoch_length(
+                        &cbor,
+                        self.byron_epoch_length,
+                    ) {
                         Ok(block) => {
                             let mut ls = self.ledger_state.write().await;
                             if let Err(e) = ls.apply_block(&block) {
@@ -2145,7 +2180,7 @@ impl Node {
                                 if next_slot.0 >= target_slot {
                                     break; // Reached the incoming batch
                                 }
-                                match torsten_serialization::multi_era::decode_block(&cbor) {
+                                match torsten_serialization::multi_era::decode_block_with_byron_epoch_length(&cbor, self.byron_epoch_length) {
                                     Ok(block) => {
                                         if let Err(e) = ls.apply_block(&block) {
                                             warn!(
@@ -3136,7 +3171,7 @@ impl Node {
                                 if next_slot.0 > rollback_slot {
                                     break;
                                 }
-                                match torsten_serialization::multi_era::decode_block(&cbor) {
+                                match torsten_serialization::multi_era::decode_block_with_byron_epoch_length(&cbor, self.byron_epoch_length) {
                                     Ok(block) => {
                                         if let Err(e) = ls.apply_block(&block) {
                                             error!(

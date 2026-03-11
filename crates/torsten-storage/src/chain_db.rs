@@ -12,6 +12,8 @@ use torsten_primitives::hash::{BlockHeaderHash, Hash32};
 use torsten_primitives::time::{BlockNo, SlotNo};
 use tracing::{debug, info, trace, warn};
 
+use crate::immutable_db::ImmutableDB;
+
 // ---------------------------------------------------------------------------
 // Errors
 // ---------------------------------------------------------------------------
@@ -26,6 +28,8 @@ pub enum ChainDBError {
     BlockNotFound(String),
     #[error("Corrupt tip metadata ({0} bytes, expected {TIP_METADATA_SIZE})")]
     CorruptTipMetadata(usize),
+    #[error("ImmutableDB error: {0}")]
+    Immutable(#[from] crate::immutable_db::ImmutableDBError),
 }
 
 // ---------------------------------------------------------------------------
@@ -191,6 +195,9 @@ pub struct ChainDB {
     /// In-memory snapshot for rollback support.
     /// Taken periodically so we can restore to a known-good state.
     rollback_snapshot: Option<RollbackSnapshot>,
+    /// Optional read-only chunk-file storage for historical blocks.
+    /// Present after Mithril snapshot import places chunk files in `immutable/`.
+    immutable: Option<ImmutableDB>,
 }
 
 /// A snapshot that can be rolled back to, along with the chain tip at
@@ -217,11 +224,34 @@ impl ChainDB {
             );
         }
 
+        // Open ImmutableDB if chunk files directory exists
+        let immutable_dir = db_path.join("immutable");
+        let immutable = if immutable_dir.is_dir() {
+            match ImmutableDB::open(&immutable_dir) {
+                Ok(imm) if imm.total_blocks() > 0 => {
+                    info!(
+                        blocks = imm.total_blocks(),
+                        tip_slot = imm.tip_slot(),
+                        "ImmutableDB available (chunk files)"
+                    );
+                    Some(imm)
+                }
+                Ok(_) => None,
+                Err(e) => {
+                    warn!(error = %e, "Failed to open ImmutableDB, continuing without it");
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
         let mut db = ChainDB {
             path: db_path.to_path_buf(),
             tree,
             tip,
             rollback_snapshot: None,
+            immutable,
         };
 
         // Take an initial snapshot for rollback support
@@ -249,6 +279,7 @@ impl ChainDB {
             tree,
             tip,
             rollback_snapshot: None,
+            immutable: None,
         })
     }
 
@@ -416,22 +447,50 @@ impl ChainDB {
 
     /// Get block CBOR by hash.
     pub fn get_block(&self, hash: &BlockHeaderHash) -> Result<Option<Vec<u8>>, ChainDBError> {
-        // Direct lookup: blk:{hash} -> CBOR (no slot collision possible)
-        Ok(self
-            .tree
-            .get(&make_blk_key(hash))?
-            .map(|v| v.as_ref().to_vec()))
+        // Try LSM first (recent/volatile blocks)
+        if let Some(v) = self.tree.get(&make_blk_key(hash))? {
+            return Ok(Some(v.as_ref().to_vec()));
+        }
+        // Fall back to ImmutableDB (historical blocks from chunk files)
+        if let Some(ref imm) = self.immutable {
+            if let Some(cbor) = imm.get_block(hash) {
+                return Ok(Some(cbor));
+            }
+        }
+        Ok(None)
     }
 
     /// Get the current chain tip.
+    ///
+    /// Returns the higher of the LSM tip (volatile/recent blocks) and
+    /// the ImmutableDB tip (historical chunk files).
     pub fn get_tip(&self) -> Tip {
-        if let Some(t) = self.tip {
-            Tip {
-                point: Point::Specific(t.slot, t.hash),
-                block_number: t.block_no,
+        let lsm_tip = self.tip.map(|t| Tip {
+            point: Point::Specific(t.slot, t.hash),
+            block_number: t.block_no,
+        });
+
+        let imm_tip = self.immutable.as_ref().and_then(|imm| {
+            if imm.total_blocks() > 0 {
+                Some(Tip {
+                    point: Point::Specific(SlotNo(imm.tip_slot()), imm.tip_hash()),
+                    block_number: BlockNo(imm.total_blocks()),
+                })
+            } else {
+                None
             }
-        } else {
-            Tip::origin()
+        });
+
+        match (lsm_tip, imm_tip) {
+            (Some(lsm), Some(imm)) => {
+                if lsm.point.slot().unwrap_or(SlotNo(0)) >= imm.point.slot().unwrap_or(SlotNo(0)) {
+                    lsm
+                } else {
+                    imm
+                }
+            }
+            (Some(t), None) | (None, Some(t)) => t,
+            (None, None) => Tip::origin(),
         }
     }
 
@@ -442,7 +501,13 @@ impl ChainDB {
 
     /// Check if a block exists by hash (bloom-filter accelerated, no CBOR read).
     pub fn has_block(&self, hash: &BlockHeaderHash) -> bool {
-        self.tree.get(&make_hash_key(hash)).ok().flatten().is_some()
+        if self.tree.get(&make_hash_key(hash)).ok().flatten().is_some() {
+            return true;
+        }
+        if let Some(ref imm) = self.immutable {
+            return imm.has_block(hash);
+        }
+        false
     }
 
     /// Get block CBOR by block number.
@@ -495,11 +560,17 @@ impl ChainDB {
         from_slot: SlotNo,
         to_slot: SlotNo,
     ) -> Result<Vec<Vec<u8>>, ChainDBError> {
-        // Two-hop lookup: iterate slot_hash: prefix to get hashes, then fetch CBOR via blk:
+        let mut blocks = Vec::new();
+
+        // Get from ImmutableDB first (historical blocks, lower slots)
+        if let Some(ref imm) = self.immutable {
+            blocks.extend(imm.get_blocks_in_slot_range(from_slot.0, to_slot.0));
+        }
+
+        // Get from LSM (recent/volatile blocks)
         let iter = self
             .tree
             .range(&make_slot_hash_key(from_slot), &make_slot_hash_key(to_slot));
-        let mut blocks = Vec::new();
         for (key, value) in iter {
             let kb: &[u8] = key.as_ref();
             if kb.len() == 18 && kb.starts_with(b"slot_hash:") {
@@ -522,29 +593,50 @@ impl ChainDB {
         &self,
         after_slot: SlotNo,
     ) -> Result<Option<(SlotNo, BlockHeaderHash, Vec<u8>)>, ChainDBError> {
-        // Two-hop: iterate slot_hash: to find next slot, then fetch CBOR via blk:
-        let start = make_slot_hash_key(SlotNo(after_slot.0.saturating_add(1)));
-        let end = make_slot_hash_key(SlotNo(u64::MAX));
+        // Try ImmutableDB first (historical blocks)
+        let imm_result = self.immutable.as_ref().and_then(|imm| {
+            imm.get_next_block_after_slot(after_slot.0)
+                .map(|(s, h, cbor)| (SlotNo(s), h, cbor))
+        });
 
-        for (key, value) in self.tree.range(&start, &end) {
-            let kb: &[u8] = key.as_ref();
-            if kb.len() != 18 || !kb.starts_with(b"slot_hash:") {
-                continue;
+        // Try LSM (recent/volatile blocks)
+        let lsm_result = {
+            let start = make_slot_hash_key(SlotNo(after_slot.0.saturating_add(1)));
+            let end = make_slot_hash_key(SlotNo(u64::MAX));
+            let mut found = None;
+            for (key, value) in self.tree.range(&start, &end) {
+                let kb: &[u8] = key.as_ref();
+                if kb.len() != 18 || !kb.starts_with(b"slot_hash:") {
+                    continue;
+                }
+                let slot = SlotNo(u64::from_be_bytes(kb[10..18].try_into().unwrap()));
+                let hb = value.as_ref();
+                if hb.len() != 32 {
+                    continue;
+                }
+                let mut h = [0u8; 32];
+                h.copy_from_slice(hb);
+                let hash = Hash32::from_bytes(h);
+                if let Some(cbor) = self.tree.get(&make_blk_key(&hash))? {
+                    found = Some((slot, hash, cbor.as_ref().to_vec()));
+                    break;
+                }
             }
-            let slot = SlotNo(u64::from_be_bytes(kb[10..18].try_into().unwrap()));
-            let hb = value.as_ref();
-            if hb.len() != 32 {
-                continue;
-            }
-            let mut h = [0u8; 32];
-            h.copy_from_slice(hb);
-            let hash = Hash32::from_bytes(h);
+            found
+        };
 
-            if let Some(cbor) = self.tree.get(&make_blk_key(&hash))? {
-                return Ok(Some((slot, hash, cbor.as_ref().to_vec())));
+        // Return whichever has the lower (earlier) slot
+        match (imm_result, lsm_result) {
+            (Some((is, ih, ic)), Some((ls, lh, lc))) => {
+                if is <= ls {
+                    Ok(Some((is, ih, ic)))
+                } else {
+                    Ok(Some((ls, lh, lc)))
+                }
             }
+            (Some(r), None) | (None, Some(r)) => Ok(Some(r)),
+            (None, None) => Ok(None),
         }
-        Ok(None)
     }
 
     // -- Rollback -----------------------------------------------------------
@@ -743,7 +835,19 @@ impl ChainDB {
 
     /// Current tip slot (convenience).
     pub fn tip_slot(&self) -> SlotNo {
-        self.tip.map_or(SlotNo(0), |t| t.slot)
+        let lsm_slot = self.tip.map_or(0, |t| t.slot.0);
+        let imm_slot = self.immutable.as_ref().map_or(0, |imm| imm.tip_slot());
+        SlotNo(lsm_slot.max(imm_slot))
+    }
+
+    /// Whether this ChainDB has an ImmutableDB with chunk files.
+    pub fn has_immutable(&self) -> bool {
+        self.immutable.is_some()
+    }
+
+    /// Get the ImmutableDB directory path, if available.
+    pub fn immutable_dir(&self) -> Option<&Path> {
+        self.immutable.as_ref().map(|imm| imm.dir())
     }
 }
 
