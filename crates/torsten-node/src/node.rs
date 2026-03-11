@@ -145,6 +145,21 @@ impl UtxoQueryProvider for LedgerUtxoProvider {
 
 /// Convert an f64 to a (numerator, denominator) rational approximation.
 /// Handles common Cardano genesis values like 0.05 → (1, 20).
+/// Return the number of Byron epochs before the Shelley hard fork for known
+/// Cardano networks, identified by network magic.
+///
+/// Based on CNCLI's `guess_shelley_transition_epoch`.
+fn shelley_transition_epoch_for_magic(network_magic: u64) -> u64 {
+    match network_magic {
+        764824073 => 208, // mainnet
+        1 => 4,           // preprod
+        2 => 0,           // preview (no Byron era)
+        4 => 0,           // sanchonet
+        141 => 2,         // guild
+        _ => 0,           // unknown — assume no Byron era (safest default)
+    }
+}
+
 fn float_to_rational(f: f64) -> (u64, u64) {
     if f == 0.0 {
         return (0, 1);
@@ -384,6 +399,15 @@ impl Node {
             }
         }
 
+        // Compute network magic early — needed for shelley transition epoch lookup
+        let network_magic = args.config.network_magic.unwrap_or_else(|| {
+            if let Some(ref sg) = shelley_genesis {
+                sg.network_magic
+            } else {
+                args.config.network.magic()
+            }
+        });
+
         // Try to load existing ledger snapshot
         let snapshot_path = args.database_path.join("ledger-snapshot.bin");
         let mut ledger = if snapshot_path.exists() {
@@ -395,6 +419,8 @@ impl Node {
                         state.set_slot_config(genesis.slot_config());
                         state.set_update_quorum(genesis.update_quorum);
                     }
+                    let ste = shelley_transition_epoch_for_magic(network_magic);
+                    state.set_shelley_transition(ste, byron_epoch_length);
                     if let Some(hash) = shelley_genesis_hash {
                         state.genesis_hash = hash;
                     }
@@ -443,6 +469,8 @@ impl Node {
                             shelley_genesis.as_ref(),
                             shelley_genesis_hash,
                             &byron_genesis_utxos,
+                            network_magic,
+                            byron_epoch_length,
                         )
                     }
                 }
@@ -453,6 +481,8 @@ impl Node {
                         shelley_genesis.as_ref(),
                         shelley_genesis_hash,
                         &byron_genesis_utxos,
+                        network_magic,
+                        byron_epoch_length,
                     )
                 }
             }
@@ -462,6 +492,8 @@ impl Node {
                 shelley_genesis.as_ref(),
                 shelley_genesis_hash,
                 &byron_genesis_utxos,
+                network_magic,
+                byron_epoch_length,
             )
         };
         // Apply Conway genesis committee threshold and members if not already set
@@ -524,14 +556,7 @@ impl Node {
         let socket_path = args.socket_path.clone();
         let listen_addr: std::net::SocketAddr =
             format!("{}:{}", args.host_addr, args.port).parse()?;
-        let network_magic = args.config.network_magic.unwrap_or_else(|| {
-            // Fall back to shelley genesis magic if available
-            if let Some(ref sg) = shelley_genesis {
-                sg.network_magic
-            } else {
-                args.config.network.magic()
-            }
-        });
+        // network_magic computed earlier (before ledger snapshot loading)
         let server_config = NodeServerConfig {
             listen_addr,
             socket_path: args.socket_path,
@@ -1230,6 +1255,8 @@ impl Node {
         shelley_genesis: Option<&ShelleyGenesis>,
         shelley_genesis_hash: Option<torsten_primitives::Hash32>,
         byron_genesis_utxos: &[(Vec<u8>, u64)],
+        network_magic: u64,
+        byron_epoch_length: u64,
     ) -> LedgerState {
         let mut ledger = LedgerState::new(protocol_params.clone());
         if let Some(genesis) = shelley_genesis {
@@ -1237,6 +1264,9 @@ impl Node {
             ledger.set_slot_config(genesis.slot_config());
             ledger.set_update_quorum(genesis.update_quorum);
         }
+        // Set Byron→Shelley transition boundary for correct HFC epoch numbering
+        let shelley_transition_epoch = shelley_transition_epoch_for_magic(network_magic);
+        ledger.set_shelley_transition(shelley_transition_epoch, byron_epoch_length);
         if let Some(hash) = shelley_genesis_hash {
             ledger.set_genesis_hash(hash);
         }

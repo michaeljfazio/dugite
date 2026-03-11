@@ -223,6 +223,37 @@ pub async fn import_snapshot(
         }
     }
 
+    // Step 7b: Preserve Haskell ledger state files for future use.
+    // The ledger/ directory contains the serialized NewEpochState from
+    // cardano-node (HFC-wrapped CBOR). We can't parse it yet but save it
+    // so a future release can extract the UTxO set and skip replay entirely.
+    let ledger_dir = find_ledger_dir(&extract_dir);
+    if let Some(ref ledger) = ledger_dir {
+        let dest_ledger = database_path.join("haskell-ledger");
+        info!("Preserving Haskell ledger state files");
+        if let Err(e) = fs::rename(ledger, &dest_ledger) {
+            warn!(error = %e, "rename failed, falling back to copy");
+            let _ = copy_dir_recursive(ledger, &dest_ledger);
+        }
+        // Extract metadata from ledger filenames (format: <slot>_<hash>)
+        if let Ok(entries) = fs::read_dir(&dest_ledger) {
+            for entry in entries.flatten() {
+                let name = entry.file_name();
+                let name_str = name.to_string_lossy();
+                if let Some(slot_str) = name_str.split('_').next() {
+                    if let Ok(slot) = slot_str.parse::<u64>() {
+                        info!(
+                            slot,
+                            file = %name_str,
+                            "Haskell ledger state at slot {slot} \
+                             (future: parse to skip replay)"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
     // Step 8: Cleanup
     info!("Cleaning up temporary files");
     if let Err(e) = fs::remove_file(&archive_path) {
@@ -462,6 +493,33 @@ fn extract_archive(archive_path: &Path, extract_dir: &Path) -> Result<()> {
     info!(entries = entry_count, "Archive extraction complete");
 
     Ok(())
+}
+
+/// Find the ledger/ directory within an extracted snapshot.
+/// Contains the Haskell node's serialized NewEpochState (HFC-wrapped CBOR).
+fn find_ledger_dir(extract_dir: &Path) -> Option<PathBuf> {
+    let candidates = [
+        extract_dir.join("ledger"),
+        extract_dir.join("db").join("ledger"),
+    ];
+    for candidate in &candidates {
+        if candidate.is_dir() {
+            return Some(candidate.clone());
+        }
+    }
+    // Search one level deeper
+    if let Ok(entries) = fs::read_dir(extract_dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                let ledger = path.join("ledger");
+                if ledger.is_dir() {
+                    return Some(ledger);
+                }
+            }
+        }
+    }
+    None
 }
 
 /// Find the immutable/ directory within an extracted snapshot

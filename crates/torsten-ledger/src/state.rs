@@ -117,8 +117,15 @@ pub struct LedgerState {
     pub era: Era,
     /// Current epoch
     pub epoch: EpochNo,
-    /// Epoch length in slots
+    /// Shelley epoch length in slots
     pub epoch_length: u64,
+    /// Number of Byron epochs before the Shelley hard fork.
+    /// Total Byron slots = byron_epoch_length * shelley_transition_epoch.
+    #[serde(default)]
+    pub shelley_transition_epoch: u64,
+    /// Byron epoch length in slots (10 * k). 0 = mainnet default (21600).
+    #[serde(default)]
+    pub byron_epoch_length: u64,
     /// Current protocol parameters
     pub protocol_params: ProtocolParameters,
     /// Stake distribution
@@ -330,7 +337,9 @@ impl LedgerState {
             tip: Tip::origin(),
             era: Era::Conway,
             epoch: EpochNo(0),
-            epoch_length: 432000, // mainnet default
+            epoch_length: 432000,          // mainnet default
+            shelley_transition_epoch: 208, // mainnet default
+            byron_epoch_length: 21600,     // mainnet default (10 * 2160)
             protocol_params: params,
             stake_distribution: StakeDistributionState::default(),
             treasury: Lovelace(0),
@@ -386,6 +395,59 @@ impl LedgerState {
             security_param,
             "Ledger: epoch length configured"
         );
+    }
+
+    /// Configure the Byron→Shelley hard fork boundary.
+    ///
+    /// `shelley_transition_epoch` is the number of Byron epochs before
+    /// Shelley starts (e.g. mainnet=208, guild=2, preview=0).
+    /// `byron_epoch_length` is 10*k in Byron slots.
+    pub fn set_shelley_transition(
+        &mut self,
+        shelley_transition_epoch: u64,
+        byron_epoch_length: u64,
+    ) {
+        self.shelley_transition_epoch = shelley_transition_epoch;
+        self.byron_epoch_length = byron_epoch_length;
+        info!(
+            shelley_transition_epoch,
+            byron_epoch_length,
+            byron_slots = byron_epoch_length * shelley_transition_epoch,
+            "Ledger: Shelley transition configured"
+        );
+    }
+
+    /// Compute the HFC epoch number for a given absolute slot.
+    ///
+    /// Uses the CNCLI formula: for slots in the Shelley era,
+    /// epoch = shelley_transition_epoch + (slot - byron_slots) / epoch_length
+    /// where byron_slots = byron_epoch_length * shelley_transition_epoch.
+    pub fn epoch_of_slot(&self, slot: u64) -> u64 {
+        let byron_slots = self.byron_epoch_length * self.shelley_transition_epoch;
+        if slot < byron_slots {
+            // Still in Byron era
+            if self.byron_epoch_length > 0 {
+                slot / self.byron_epoch_length
+            } else {
+                0
+            }
+        } else {
+            // Shelley era
+            let shelley_slots = slot - byron_slots;
+            self.shelley_transition_epoch + shelley_slots / self.epoch_length
+        }
+    }
+
+    /// Compute the first slot of the epoch that contains the given slot.
+    pub fn first_slot_of_epoch(&self, epoch: u64) -> u64 {
+        if epoch < self.shelley_transition_epoch {
+            // Byron epoch
+            epoch * self.byron_epoch_length
+        } else {
+            // Shelley epoch
+            let byron_slots = self.byron_epoch_length * self.shelley_transition_epoch;
+            byron_slots + (epoch - self.shelley_transition_epoch) * self.epoch_length
+        }
     }
 
     /// Set the Shelley genesis hash.
@@ -638,7 +700,7 @@ impl LedgerState {
         // When multiple epochs are skipped (e.g., after offline time or Mithril import),
         // process each intermediate epoch transition individually so that snapshots rotate
         // correctly, pending retirements fire at the right epoch, and rewards are distributed.
-        let block_epoch = EpochNo(block.slot().0 / self.epoch_length);
+        let block_epoch = EpochNo(self.epoch_of_slot(block.slot().0));
         if block_epoch > self.epoch {
             info!(
                 prev_epoch = self.epoch.0,
@@ -855,7 +917,7 @@ impl LedgerState {
 
             // Update candidate nonce only if NOT in the stabilisation window
             // (i.e., if slot + rsw < first_slot_of_next_epoch)
-            let first_slot_of_next_epoch = (self.epoch.0 + 1) * self.epoch_length;
+            let first_slot_of_next_epoch = self.first_slot_of_epoch(self.epoch.0 + 1);
             if block.slot().0 + self.randomness_stabilisation_window < first_slot_of_next_epoch {
                 self.candidate_nonce = self.evolving_nonce;
             }
@@ -3602,6 +3664,8 @@ mod tests {
         let params = ProtocolParameters::mainnet_defaults();
         let mut state = LedgerState::new(params);
         state.epoch_length = 100; // Small epochs for testing
+        state.shelley_transition_epoch = 0;
+        state.byron_epoch_length = 0;
 
         // Apply a block in epoch 0
         let block = make_test_block(50, 1, Hash32::ZERO, vec![]);
@@ -4011,6 +4075,8 @@ mod tests {
         let params = ProtocolParameters::mainnet_defaults();
         let mut state = LedgerState::new(params);
         state.epoch_length = 100;
+        state.shelley_transition_epoch = 0;
+        state.byron_epoch_length = 0;
         // randomness_stabilisation_window = 4k/f; use 40 for testing
         // (so slots 0-59 update candidate, slots 60-99 freeze candidate)
         state.randomness_stabilisation_window = 40;
@@ -6924,6 +6990,8 @@ mod tests {
         let params = ProtocolParameters::mainnet_defaults();
         let mut state = LedgerState::new(params);
         state.epoch_length = 100; // 100 slots per epoch for testing
+        state.shelley_transition_epoch = 0;
+        state.byron_epoch_length = 0;
 
         let pool_a = Hash28::from_bytes([0xA1; 28]);
         let pool_b = Hash28::from_bytes([0xA2; 28]);
@@ -6983,6 +7051,8 @@ mod tests {
         let params = ProtocolParameters::mainnet_defaults();
         let mut state = LedgerState::new(params);
         state.epoch_length = 100;
+        state.shelley_transition_epoch = 0;
+        state.byron_epoch_length = 0;
 
         let cred = Credential::VerificationKey(Hash28::from_bytes([0xDE; 28]));
         let pool_id = Hash28::from_bytes([0xDA; 28]);
