@@ -102,6 +102,15 @@ impl ProtocolParameters {
         self.active_slots_coeff
     }
 
+    /// Active slot coefficient as a rational (numerator, denominator).
+    ///
+    /// Converts the f64 `active_slots_coeff` to an exact rational by searching
+    /// for the smallest denominator that reconstructs the float exactly.
+    /// For mainnet (0.05) this returns (1, 20).
+    pub fn active_slot_coeff_rational(&self) -> (u64, u64) {
+        f64_to_rational(self.active_slots_coeff)
+    }
+
     /// Calculate minimum UTxO value (ada-only)
     /// Minimum UTxO for a simple ADA-only output (no multi-assets, no datum)
     pub fn min_utxo_value(&self) -> Lovelace {
@@ -240,5 +249,118 @@ impl ProtocolParameters {
             protocol_version_minor: 0,
             active_slots_coeff: 0.05,
         }
+    }
+}
+
+/// Convert an f64 to a rational numerator/denominator pair.
+///
+/// Searches for the smallest denominator (up to common Cardano denominators,
+/// then up to 1,000,000) that reconstructs the float exactly. For Cardano
+/// protocol parameters this always finds a clean fraction (e.g., 0.05 = 1/20).
+pub fn f64_to_rational(value: f64) -> (u64, u64) {
+    if value == 0.0 {
+        return (0, 1);
+    }
+    if value == 1.0 {
+        return (1, 1);
+    }
+    // Try common denominators first (covers all known Cardano active_slot_coeff values)
+    for den in [1, 2, 4, 5, 10, 20, 25, 50, 100, 200, 1000, 10000] {
+        let num = (value * den as f64).round() as u64;
+        let reconstructed = num as f64 / den as f64;
+        if (reconstructed - value).abs() < 1e-15 {
+            let g = gcd(num, den);
+            return (num / g, den / g);
+        }
+    }
+    // Fallback: use 1_000_000 as denominator
+    let den = 1_000_000u64;
+    let num = (value * den as f64).round() as u64;
+    let g = gcd(num, den);
+    (num / g, den / g)
+}
+
+fn gcd(mut a: u64, mut b: u64) -> u64 {
+    while b != 0 {
+        let t = b;
+        b = a % b;
+        a = t;
+    }
+    a
+}
+
+/// Compute `ceil(numerator * k / f)` using integer arithmetic, where `f = f_num / f_den`.
+///
+/// This computes `ceil(numerator * k * f_den / f_num)` without floating-point.
+/// Used for stability window (3k/f) and randomness stabilisation window (4k/f).
+pub fn ceiling_div_by_rational(multiplier: u64, k: u64, f_num: u64, f_den: u64) -> u64 {
+    assert!(f_num > 0, "active_slot_coeff numerator must be > 0");
+    let numerator = multiplier as u128 * k as u128 * f_den as u128;
+    let denominator = f_num as u128;
+    numerator.div_ceil(denominator) as u64
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_f64_to_rational_mainnet() {
+        // Mainnet: active_slot_coeff = 0.05 = 1/20
+        assert_eq!(f64_to_rational(0.05), (1, 20));
+    }
+
+    #[test]
+    fn test_f64_to_rational_common_values() {
+        assert_eq!(f64_to_rational(0.0), (0, 1));
+        assert_eq!(f64_to_rational(1.0), (1, 1));
+        assert_eq!(f64_to_rational(0.5), (1, 2));
+        assert_eq!(f64_to_rational(0.1), (1, 10));
+        assert_eq!(f64_to_rational(0.25), (1, 4));
+    }
+
+    #[test]
+    fn test_active_slot_coeff_rational() {
+        let params = ProtocolParameters::mainnet_defaults();
+        assert_eq!(params.active_slot_coeff_rational(), (1, 20));
+    }
+
+    #[test]
+    fn test_ceiling_div_by_rational_mainnet_randomness_window() {
+        // Mainnet: 4 * 2160 / 0.05 = 4 * 2160 * 20 / 1 = 172800
+        assert_eq!(ceiling_div_by_rational(4, 2160, 1, 20), 172800);
+    }
+
+    #[test]
+    fn test_ceiling_div_by_rational_mainnet_stability_window() {
+        // Mainnet: 3 * 2160 / 0.05 = 3 * 2160 * 20 / 1 = 129600
+        assert_eq!(ceiling_div_by_rational(3, 2160, 1, 20), 129600);
+    }
+
+    #[test]
+    fn test_ceiling_div_by_rational_preview() {
+        // Preview: k=432, f=0.05 → 4 * 432 / 0.05 = 34560
+        assert_eq!(ceiling_div_by_rational(4, 432, 1, 20), 34560);
+        // 3k/f = 3 * 432 / 0.05 = 25920
+        assert_eq!(ceiling_div_by_rational(3, 432, 1, 20), 25920);
+    }
+
+    #[test]
+    fn test_ceiling_div_rounds_up() {
+        // 4 * 1 / (1/3) = 12 exactly
+        assert_eq!(ceiling_div_by_rational(4, 1, 1, 3), 12);
+        // 4 * 1 / (2/3) = 6 exactly
+        assert_eq!(ceiling_div_by_rational(4, 1, 2, 3), 6);
+        // 4 * 1 / (1/7) = 28 exactly
+        assert_eq!(ceiling_div_by_rational(4, 1, 1, 7), 28);
+        // 3 * 1 / (2/5) = 7.5 → ceil = 8
+        assert_eq!(ceiling_div_by_rational(3, 1, 2, 5), 8);
+    }
+
+    #[test]
+    fn test_ceiling_div_exact_division() {
+        // When the result is exact, no rounding should occur
+        // 4 * 100 * 20 / 1 = 8000
+        assert_eq!(ceiling_div_by_rational(4, 100, 1, 20), 8000);
     }
 }

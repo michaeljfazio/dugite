@@ -754,9 +754,16 @@ impl OuroborosPraos {
         }
     }
 
-    /// The stability window: 3k/f slots
+    /// The stability window: 3k/f slots (using integer arithmetic for precision)
     pub fn stability_window(&self) -> u64 {
-        (3.0 * self.security_param as f64 / self.active_slot_coeff) as u64
+        let (f_num, f_den) =
+            torsten_primitives::protocol_params::f64_to_rational(self.active_slot_coeff);
+        torsten_primitives::protocol_params::ceiling_div_by_rational(
+            3,
+            self.security_param,
+            f_num,
+            f_den,
+        )
     }
 
     /// Calculate which epoch a slot belongs to
