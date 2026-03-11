@@ -1021,12 +1021,12 @@ fn handle_n2n_blockfetch(
                 .unwrap_or(false);
 
             if !from_exists || !to_exists {
-                // MsgNoBlocks: [2]
+                // MsgNoBlocks: [3]
                 let mut buf = Vec::new();
                 let mut enc = minicbor::Encoder::new(&mut buf);
                 enc.array(1)
                     .map_err(|e| N2NServerError::Protocol(e.to_string()))?;
-                enc.u32(2)
+                enc.u32(3)
                     .map_err(|e| N2NServerError::Protocol(e.to_string()))?;
                 segments.push(Segment {
                     transmission_time: 0,
@@ -1049,7 +1049,7 @@ fn handle_n2n_blockfetch(
                 let mut enc = minicbor::Encoder::new(&mut buf);
                 enc.array(1)
                     .map_err(|e| N2NServerError::Protocol(e.to_string()))?;
-                enc.u32(2)
+                enc.u32(3)
                     .map_err(|e| N2NServerError::Protocol(e.to_string()))?;
                 segments.push(Segment {
                     transmission_time: 0,
@@ -1133,13 +1133,13 @@ fn handle_n2n_blockfetch(
     }
 }
 
-/// Create a MsgBlock segment: [3, block_bytes]
+/// Create a MsgBlock segment: [4, block_bytes]
 fn make_block_segment(block_data: &[u8]) -> Result<Segment, N2NServerError> {
     let mut buf = Vec::new();
     let mut enc = minicbor::Encoder::new(&mut buf);
     enc.array(2)
         .map_err(|e| N2NServerError::Protocol(e.to_string()))?;
-    enc.u32(3)
+    enc.u32(4)
         .map_err(|e| N2NServerError::Protocol(e.to_string()))?;
     enc.bytes(block_data)
         .map_err(|e| N2NServerError::Protocol(e.to_string()))?;
@@ -1623,10 +1623,10 @@ mod tests {
         dec.array().unwrap();
         assert_eq!(dec.u32().unwrap(), 2);
 
-        // Middle segments are MsgBlock [3, block_bytes]
+        // Middle segments are MsgBlock [4, block_bytes]
         let mut dec = minicbor::Decoder::new(&segments[1].payload);
         dec.array().unwrap();
-        assert_eq!(dec.u32().unwrap(), 3);
+        assert_eq!(dec.u32().unwrap(), 4);
 
         // Last segment: MsgBatchDone [5]
         let mut dec = minicbor::Decoder::new(&segments[segments.len() - 1].payload);

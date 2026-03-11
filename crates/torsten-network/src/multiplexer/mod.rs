@@ -37,18 +37,37 @@ pub struct Segment {
 }
 
 impl Segment {
-    /// Encode a segment to bytes
+    /// Encode a segment to bytes.
+    ///
+    /// If the payload exceeds MAX_SEGMENT_PAYLOAD (65535 bytes), it is
+    /// automatically chunked into multiple consecutive wire segments per
+    /// the Ouroboros multiplexer specification.
     pub fn encode(&self) -> Vec<u8> {
-        let mut buf = Vec::with_capacity(SEGMENT_HEADER_SIZE + self.payload.len());
-        buf.extend_from_slice(&self.transmission_time.to_be_bytes());
-
         let mut protocol_word = self.protocol_id;
         if self.is_responder {
             protocol_word |= 0x8000;
         }
-        buf.extend_from_slice(&protocol_word.to_be_bytes());
-        buf.extend_from_slice(&(self.payload.len() as u16).to_be_bytes());
-        buf.extend_from_slice(&self.payload);
+        let proto_bytes = protocol_word.to_be_bytes();
+        let time_bytes = self.transmission_time.to_be_bytes();
+
+        if self.payload.len() <= MAX_SEGMENT_PAYLOAD {
+            let mut buf = Vec::with_capacity(SEGMENT_HEADER_SIZE + self.payload.len());
+            buf.extend_from_slice(&time_bytes);
+            buf.extend_from_slice(&proto_bytes);
+            buf.extend_from_slice(&(self.payload.len() as u16).to_be_bytes());
+            buf.extend_from_slice(&self.payload);
+            return buf;
+        }
+
+        // Chunk payload into multiple segments of at most MAX_SEGMENT_PAYLOAD bytes
+        let num_chunks = self.payload.len().div_ceil(MAX_SEGMENT_PAYLOAD);
+        let mut buf = Vec::with_capacity(num_chunks * SEGMENT_HEADER_SIZE + self.payload.len());
+        for chunk in self.payload.chunks(MAX_SEGMENT_PAYLOAD) {
+            buf.extend_from_slice(&time_bytes);
+            buf.extend_from_slice(&proto_bytes);
+            buf.extend_from_slice(&(chunk.len() as u16).to_be_bytes());
+            buf.extend_from_slice(chunk);
+        }
         buf
     }
 
@@ -144,5 +163,109 @@ mod tests {
         let (decoded, consumed) = Segment::decode(&encoded).unwrap();
         assert_eq!(consumed, SEGMENT_HEADER_SIZE);
         assert!(decoded.payload.is_empty());
+    }
+
+    #[test]
+    fn test_small_payload_no_chunking() {
+        let payload = vec![0xAB; 100];
+        let segment = Segment {
+            transmission_time: 42,
+            protocol_id: 2,
+            is_responder: true,
+            payload: payload.clone(),
+        };
+
+        let encoded = segment.encode();
+        // Single segment: 8-byte header + 100 bytes payload
+        assert_eq!(encoded.len(), SEGMENT_HEADER_SIZE + 100);
+
+        let (decoded, consumed) = Segment::decode(&encoded).unwrap();
+        assert_eq!(consumed, encoded.len());
+        assert_eq!(decoded.payload, payload);
+    }
+
+    #[test]
+    fn test_max_payload_no_chunking() {
+        let payload = vec![0xCD; MAX_SEGMENT_PAYLOAD];
+        let segment = Segment {
+            transmission_time: 0,
+            protocol_id: 3,
+            is_responder: false,
+            payload: payload.clone(),
+        };
+
+        let encoded = segment.encode();
+        // Single segment: 8-byte header + 65535 bytes
+        assert_eq!(encoded.len(), SEGMENT_HEADER_SIZE + MAX_SEGMENT_PAYLOAD);
+
+        let (decoded, consumed) = Segment::decode(&encoded).unwrap();
+        assert_eq!(consumed, encoded.len());
+        assert_eq!(decoded.payload, payload);
+    }
+
+    #[test]
+    fn test_oversized_payload_is_chunked() {
+        let payload_size = MAX_SEGMENT_PAYLOAD + 100;
+        let payload = vec![0xEF; payload_size];
+        let segment = Segment {
+            transmission_time: 7,
+            protocol_id: 5,
+            is_responder: true,
+            payload: payload.clone(),
+        };
+
+        let encoded = segment.encode();
+        // Should produce 2 chunks: 65535 + 100
+        let expected_len = 2 * SEGMENT_HEADER_SIZE + MAX_SEGMENT_PAYLOAD + 100;
+        assert_eq!(encoded.len(), expected_len);
+
+        // Decode first chunk
+        let (chunk1, consumed1) = Segment::decode(&encoded).unwrap();
+        assert_eq!(chunk1.payload.len(), MAX_SEGMENT_PAYLOAD);
+        assert_eq!(chunk1.protocol_id, 5);
+        assert!(chunk1.is_responder);
+        assert_eq!(chunk1.transmission_time, 7);
+
+        // Decode second chunk
+        let (chunk2, consumed2) = Segment::decode(&encoded[consumed1..]).unwrap();
+        assert_eq!(chunk2.payload.len(), 100);
+        assert_eq!(chunk2.protocol_id, 5);
+        assert!(chunk2.is_responder);
+
+        // Reassemble
+        let mut reassembled = chunk1.payload;
+        reassembled.extend_from_slice(&chunk2.payload);
+        assert_eq!(reassembled, payload);
+
+        assert_eq!(consumed1 + consumed2, encoded.len());
+    }
+
+    #[test]
+    fn test_exact_multiple_of_max_payload() {
+        let payload = vec![0x11; MAX_SEGMENT_PAYLOAD * 3];
+        let segment = Segment {
+            transmission_time: 0,
+            protocol_id: 2,
+            is_responder: false,
+            payload: payload.clone(),
+        };
+
+        let encoded = segment.encode();
+        assert_eq!(
+            encoded.len(),
+            3 * (SEGMENT_HEADER_SIZE + MAX_SEGMENT_PAYLOAD)
+        );
+
+        // Decode all 3 chunks and reassemble
+        let mut offset = 0;
+        let mut reassembled = Vec::new();
+        for i in 0..3 {
+            let (chunk, consumed) = Segment::decode(&encoded[offset..]).unwrap();
+            assert_eq!(chunk.payload.len(), MAX_SEGMENT_PAYLOAD, "chunk {i}");
+            reassembled.extend_from_slice(&chunk.payload);
+            offset += consumed;
+        }
+        assert_eq!(reassembled, payload);
+        assert_eq!(offset, encoded.len());
     }
 }

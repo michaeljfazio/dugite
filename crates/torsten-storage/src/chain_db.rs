@@ -82,12 +82,22 @@ fn bulk_import_config() -> LsmConfig {
 //
 // | Prefix        | Len  | Payload          | Value                   |
 // |---------------|------|------------------|-------------------------|
-// | slot:         | 13   | 8-byte BE slot   | Block CBOR              |
+// | blk:          | 36   | 32-byte hash     | Block CBOR (primary)    |
+// | slot:         | 13   | 8-byte BE slot   | Block CBOR (range scan) |
 // | hash:         | 37   | 32-byte hash     | 8-byte BE slot          |
 // | slot_hash:    | 18   | 8-byte BE slot   | 32-byte hash            |
 // | prev:         | 37   | 32-byte hash     | 32-byte prev_hash       |
 // | blkn:         | 13   | 8-byte BE blk_no | 8-byte BE slot          |
 // | meta:tip      |  8   | —                | TipMetadata (48 B)      |
+
+/// Primary CBOR storage key — indexed by block hash (no slot collisions).
+#[inline]
+fn make_blk_key(hash: &BlockHeaderHash) -> Key {
+    let mut buf = [0u8; 36];
+    buf[..4].copy_from_slice(b"blk:");
+    buf[4..].copy_from_slice(hash.as_bytes());
+    Key::from(buf.as_slice())
+}
 
 #[inline]
 fn make_slot_key(slot: SlotNo) -> Key {
@@ -272,7 +282,8 @@ impl ChainDB {
             "ChainDB: adding block"
         );
 
-        let mut batch = Vec::with_capacity(6);
+        let mut batch = Vec::with_capacity(7);
+        batch.push((make_blk_key(&hash), Value::from(cbor.as_slice())));
         batch.push((make_slot_key(slot), Value::from(cbor.as_slice())));
         batch.push((
             make_hash_key(&hash),
@@ -311,7 +322,7 @@ impl ChainDB {
             return Ok(());
         }
 
-        let mut batch: Vec<(Key, Value)> = Vec::with_capacity(blocks.len() * 5 + 1);
+        let mut batch: Vec<(Key, Value)> = Vec::with_capacity(blocks.len() * 6 + 1);
 
         for (hash, slot, block_no, prev_hash, cbor) in &blocks {
             // Skip blocks that already exist
@@ -324,6 +335,7 @@ impl ChainDB {
                 continue;
             }
 
+            batch.push((make_blk_key(hash), Value::from(cbor.as_slice())));
             batch.push((make_slot_key(*slot), Value::from(cbor.as_slice())));
             batch.push((
                 make_hash_key(hash),
@@ -370,10 +382,11 @@ impl ChainDB {
             return Ok(());
         }
 
-        let mut batch: Vec<(Key, Value)> = Vec::with_capacity(blocks.len() * 4 + 1);
+        let mut batch: Vec<(Key, Value)> = Vec::with_capacity(blocks.len() * 5 + 1);
         let mut new_tip: Option<TipMetadata> = None;
 
         for &(slot, hash, block_no, cbor) in blocks {
+            batch.push((make_blk_key(hash), Value::from(cbor)));
             batch.push((make_slot_key(slot), Value::from(cbor)));
             batch.push((
                 make_hash_key(hash),
@@ -415,19 +428,10 @@ impl ChainDB {
 
     /// Get block CBOR by hash.
     pub fn get_block(&self, hash: &BlockHeaderHash) -> Result<Option<Vec<u8>>, ChainDBError> {
-        // Two-hop lookup: hash -> slot -> CBOR
-        let slot_value = match self.tree.get(&make_hash_key(hash))? {
-            Some(v) => v,
-            None => return Ok(None),
-        };
-        let slot_bytes: &[u8] = slot_value.as_ref();
-        if slot_bytes.len() != 8 {
-            return Ok(None);
-        }
-        let slot = SlotNo(u64::from_be_bytes(slot_bytes.try_into().unwrap()));
+        // Direct lookup: blk:{hash} -> CBOR (no slot collision possible)
         Ok(self
             .tree
-            .get(&make_slot_key(slot))?
+            .get(&make_blk_key(hash))?
             .map(|v| v.as_ref().to_vec()))
     }
 
@@ -488,8 +492,8 @@ impl ChainDB {
             })
             .unwrap_or(Hash32::ZERO);
 
-        // slot -> CBOR
-        let cbor = match self.tree.get(&make_slot_key(slot))? {
+        // hash -> CBOR (via blk: key, immune to slot collision)
+        let cbor = match self.tree.get(&make_blk_key(&hash))? {
             Some(v) => v.as_ref().to_vec(),
             None => return Ok(None),
         };
@@ -665,6 +669,7 @@ impl ChainDB {
                         let _ = self.tree.delete(&make_slot_hash_key(slot));
                     }
                 }
+                let _ = self.tree.delete(&make_blk_key(hash));
                 let _ = self.tree.delete(&make_hash_key(hash));
                 let _ = self.tree.delete(&make_prev_hash_key(hash));
             }
@@ -710,10 +715,27 @@ impl ChainDB {
     // -- Lifecycle ----------------------------------------------------------
 
     /// Persist all in-memory data to a durable snapshot.
+    ///
+    /// Uses save-to-temp-then-rename to avoid data loss if the process
+    /// crashes between deleting the old snapshot and writing the new one.
     pub fn persist(&mut self) -> Result<(), ChainDBError> {
         info!("ChainDB: persisting snapshot");
-        let _ = self.tree.delete_snapshot("latest");
-        self.tree.save_snapshot("latest", "torsten")?;
+        // Save to a temporary name first
+        let _ = self.tree.delete_snapshot("latest_tmp");
+        self.tree.save_snapshot("latest_tmp", "torsten")?;
+
+        // Atomically replace the old "latest" with the new one via directory rename
+        let snapshots_dir = self.path.join("snapshots");
+        let latest_dir = snapshots_dir.join("latest");
+        let tmp_dir = snapshots_dir.join("latest_tmp");
+
+        if latest_dir.exists() {
+            // Remove old latest — if we crash here, latest_tmp is a valid recovery
+            std::fs::remove_dir_all(&latest_dir)?;
+        }
+        // Rename tmp → latest
+        std::fs::rename(&tmp_dir, &latest_dir)?;
+
         info!("ChainDB: snapshot persisted");
         Ok(())
     }
@@ -1112,5 +1134,62 @@ mod tests {
         assert!(db.has_block(&hash1));
         assert!(db.has_block(&hash2));
         assert_eq!(db.tip_slot(), SlotNo(200));
+    }
+
+    #[test]
+    fn test_slot_collision_returns_correct_block() {
+        // Two blocks at the same slot (from different forks) should
+        // both be retrievable by their hash via the blk: key.
+        let dir = tempfile::tempdir().unwrap();
+        let mut db = ChainDB::open(dir.path()).unwrap();
+
+        let hash_a = make_hash(1);
+        let hash_b = make_hash(2);
+        let same_slot = SlotNo(100);
+
+        db.add_block(
+            hash_a,
+            same_slot,
+            BlockNo(50),
+            Hash32::ZERO,
+            b"block_A".to_vec(),
+        )
+        .unwrap();
+        db.add_block(
+            hash_b,
+            same_slot,
+            BlockNo(51),
+            Hash32::ZERO,
+            b"block_B".to_vec(),
+        )
+        .unwrap();
+
+        // Both blocks should return their OWN data, not each other's
+        let a_data = db.get_block(&hash_a).unwrap().unwrap();
+        assert_eq!(a_data, b"block_A", "hash_a should return block_A data");
+
+        let b_data = db.get_block(&hash_b).unwrap().unwrap();
+        assert_eq!(b_data, b"block_B", "hash_b should return block_B data");
+    }
+
+    #[test]
+    fn test_get_block_by_number_uses_blk_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut db = ChainDB::open(dir.path()).unwrap();
+
+        let hash = make_hash(42);
+        db.add_block(
+            hash,
+            SlotNo(500),
+            BlockNo(100),
+            Hash32::ZERO,
+            b"my_block".to_vec(),
+        )
+        .unwrap();
+
+        let result = db.get_block_by_number(BlockNo(100)).unwrap().unwrap();
+        assert_eq!(result.0, SlotNo(500));
+        assert_eq!(result.1, hash);
+        assert_eq!(result.2, b"my_block");
     }
 }

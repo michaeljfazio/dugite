@@ -236,6 +236,14 @@ pub struct DRepRegistration {
     pub registered_epoch: EpochNo,
     /// Last epoch in which this DRep voted or updated (for activity tracking per CIP-1694)
     pub last_active_epoch: EpochNo,
+    /// Whether this DRep is currently active (per CIP-1694 activity tracking).
+    /// Inactive DReps remain registered but are excluded from voting power calculations.
+    #[serde(default = "default_drep_active")]
+    pub active: bool,
+}
+
+fn default_drep_active() -> bool {
+    true
 }
 
 /// State of a governance proposal
@@ -618,7 +626,10 @@ impl LedgerState {
             }
         }
 
-        // Check for epoch transition before processing the block
+        // Check for epoch transition before processing the block.
+        // When multiple epochs are skipped (e.g., after offline time or Mithril import),
+        // process each intermediate epoch transition individually so that snapshots rotate
+        // correctly, pending retirements fire at the right epoch, and rewards are distributed.
         let block_epoch = EpochNo(block.slot().0 / self.epoch_length);
         if block_epoch > self.epoch {
             info!(
@@ -627,7 +638,10 @@ impl LedgerState {
                 slot = block.slot().0,
                 "Ledger: epoch transition detected"
             );
-            self.process_epoch_transition(block_epoch);
+            while self.epoch < block_epoch {
+                let next_epoch = EpochNo(self.epoch.0 + 1);
+                self.process_epoch_transition(next_epoch);
+            }
         }
 
         // Block body size check — reject blocks exceeding max_block_body_size
@@ -688,9 +702,12 @@ impl LedgerState {
             // - Regular inputs/outputs/certificates are NOT applied
             // - If collateral_return is present, it becomes a new UTxO
             if !tx.is_valid {
+                // Sum up total collateral input value
+                let mut collateral_input_value: u64 = 0;
                 // Consume collateral inputs (update stake distribution)
                 for col_input in &tx.body.collateral {
                     if let Some(spent) = self.utxo_set.lookup(col_input) {
+                        collateral_input_value += spent.value.coin.0;
                         if let Some(cred) = stake_credential_hash(&spent.address) {
                             if let Some(stake) = self.stake_distribution.stake_map.get_mut(&cred) {
                                 stake.0 = stake.0.saturating_sub(spent.value.coin.0);
@@ -700,7 +717,7 @@ impl LedgerState {
                     self.utxo_set.remove(col_input);
                 }
                 // If there's a collateral return output, add it
-                if let Some(col_return) = &tx.body.collateral_return {
+                let collateral_return_value = if let Some(col_return) = &tx.body.collateral_return {
                     if let Some(cred) = stake_credential_hash(&col_return.address) {
                         *self
                             .stake_distribution
@@ -712,10 +729,20 @@ impl LedgerState {
                         transaction_id: tx.hash,
                         index: tx.body.outputs.len() as u32, // collateral return is after regular outputs
                     };
+                    let return_val = col_return.value.coin.0;
                     self.utxo_set.insert(return_input, col_return.clone());
-                }
-                // Fee from collateral is still collected
-                self.epoch_fees += tx.body.fee;
+                    return_val
+                } else {
+                    0
+                };
+                // Fee collected is the actual collateral forfeited, NOT the declared fee.
+                // If total_collateral is set, use it; otherwise compute from inputs - return.
+                let collateral_fee = if let Some(tc) = tx.body.total_collateral {
+                    tc
+                } else {
+                    Lovelace(collateral_input_value.saturating_sub(collateral_return_value))
+                };
+                self.epoch_fees += collateral_fee;
                 continue;
             }
 
@@ -867,10 +894,25 @@ impl LedgerState {
             }
             Certificate::StakeDeregistration(credential) => {
                 let key = credential_to_hash(credential);
-                self.stake_distribution.stake_map.remove(&key);
-                self.delegations.remove(&key);
-                self.reward_accounts.remove(&key);
-                debug!("Stake key deregistered: {}", key.to_hex());
+                // Per Shelley ledger spec: deregistration is only valid if reward balance is zero.
+                // If the reward account has a non-zero balance, skip deregistration.
+                let balance = self
+                    .reward_accounts
+                    .get(&key)
+                    .copied()
+                    .unwrap_or(Lovelace(0));
+                if balance.0 > 0 {
+                    warn!(
+                        key = %key.to_hex(),
+                        balance = balance.0,
+                        "Stake deregistration rejected: non-zero reward balance"
+                    );
+                } else {
+                    self.stake_distribution.stake_map.remove(&key);
+                    self.delegations.remove(&key);
+                    self.reward_accounts.remove(&key);
+                    debug!("Stake key deregistered: {}", key.to_hex());
+                }
             }
             Certificate::ConwayStakeRegistration {
                 credential,
@@ -889,7 +931,8 @@ impl LedgerState {
                 credential,
                 refund: _,
             } => {
-                // Conway cert tag 8: same behavior as StakeDeregistration
+                // Conway cert tag 8: deregistration returns remaining reward balance
+                // as part of the deposit refund, so unconditional removal is correct.
                 let key = credential_to_hash(credential);
                 self.stake_distribution.stake_map.remove(&key);
                 self.delegations.remove(&key);
@@ -918,7 +961,21 @@ impl LedgerState {
                     metadata_url: params.pool_metadata.as_ref().map(|m| m.url.clone()),
                     metadata_hash: params.pool_metadata.as_ref().map(|m| m.hash),
                 };
-                debug!("Pool registered: {}", params.operator.to_hex());
+                // If the pool is re-registering, cancel any pending retirement
+                if self.pool_params.contains_key(&params.operator) {
+                    for pools in self.pending_retirements.values_mut() {
+                        pools.retain(|id| id != &params.operator);
+                    }
+                    // Remove empty epoch entries
+                    self.pending_retirements
+                        .retain(|_, pools| !pools.is_empty());
+                    debug!(
+                        "Pool re-registered (pending retirement cancelled): {}",
+                        params.operator.to_hex()
+                    );
+                } else {
+                    debug!("Pool registered: {}", params.operator.to_hex());
+                }
                 self.pool_params.insert(params.operator, pool_reg);
             }
             Certificate::PoolRetirement { pool_hash, epoch } => {
@@ -971,6 +1028,7 @@ impl LedgerState {
                         anchor: anchor.clone(),
                         registered_epoch: self.epoch,
                         last_active_epoch: self.epoch,
+                        active: true,
                     },
                 );
                 self.governance.drep_registration_count += 1;
@@ -1094,11 +1152,14 @@ impl LedgerState {
                 // MIR: transfer funds between reserves/treasury or distribute to stake credentials
                 match target {
                     MIRTarget::StakeCredentials(creds) => {
+                        let mut total_distributed: u64 = 0;
                         for (cred, amount) in creds {
                             let key = credential_to_hash(cred);
                             let entry = self.reward_accounts.entry(key).or_insert(Lovelace(0));
                             if *amount >= 0 {
-                                entry.0 = entry.0.saturating_add(*amount as u64);
+                                let amt = *amount as u64;
+                                entry.0 = entry.0.saturating_add(amt);
+                                total_distributed += amt;
                             } else {
                                 entry.0 = entry.0.saturating_sub(amount.unsigned_abs());
                             }
@@ -1108,6 +1169,19 @@ impl LedgerState {
                                 source,
                                 key.to_hex()
                             );
+                        }
+                        // Debit the source pot for the total positive amount distributed
+                        if total_distributed > 0 {
+                            match source {
+                                MIRSource::Reserves => {
+                                    self.reserves.0 =
+                                        self.reserves.0.saturating_sub(total_distributed);
+                                }
+                                MIRSource::Treasury => {
+                                    self.treasury.0 =
+                                        self.treasury.0.saturating_sub(total_distributed);
+                                }
+                            }
                         }
                     }
                     MIRTarget::OtherAccountingPot(coin) => {
@@ -1373,34 +1447,29 @@ impl LedgerState {
             );
         }
 
-        // Expire inactive DReps per CIP-1694
+        // Mark inactive DReps per CIP-1694
         // DReps that haven't voted or updated within drep_activity epochs are marked inactive
-        // and excluded from voting power calculations
+        // and excluded from voting power calculations. They remain registered and keep their deposits.
         let drep_activity = self.protocol_params.drep_activity;
         if drep_activity > 0 {
-            let inactive_dreps: Vec<Hash32> = self
-                .governance
-                .dreps
-                .iter()
-                .filter(|(_, drep)| {
-                    new_epoch.0.saturating_sub(drep.last_active_epoch.0) > drep_activity
-                })
-                .map(|(hash, _)| *hash)
-                .collect();
-            if !inactive_dreps.is_empty() {
-                for hash in &inactive_dreps {
-                    // Refund DRep deposit to their reward account
-                    if let Some(drep) = self.governance.dreps.remove(hash) {
-                        if drep.deposit.0 > 0 {
-                            *self.reward_accounts.entry(*hash).or_insert(Lovelace(0)) +=
-                                drep.deposit;
-                        }
-                    }
+            let mut newly_inactive = 0u64;
+            let mut reactivated = 0u64;
+            for drep in self.governance.dreps.values_mut() {
+                let inactive = new_epoch.0.saturating_sub(drep.last_active_epoch.0) > drep_activity;
+                if inactive && drep.active {
+                    drep.active = false;
+                    newly_inactive += 1;
+                } else if !inactive && !drep.active {
+                    drep.active = true;
+                    reactivated += 1;
                 }
+            }
+            if newly_inactive > 0 || reactivated > 0 {
                 info!(
-                    "Expired {} inactive DReps at epoch {} (activity threshold: {} epochs, deposits refunded)",
-                    inactive_dreps.len(),
+                    "DRep activity update at epoch {}: {} newly inactive, {} reactivated (threshold: {} epochs)",
                     new_epoch.0,
+                    newly_inactive,
+                    reactivated,
                     drep_activity
                 );
             }
@@ -1906,7 +1975,7 @@ impl LedgerState {
         let total_drep_stake = self.compute_total_drep_stake();
         let total_spo_stake = self.compute_total_spo_stake();
         // Pre-compute DRep voting power once (O(delegations)) instead of per-DRep per-proposal
-        let drep_power_cache = self.build_drep_power_cache();
+        let (drep_power_cache, no_confidence_stake, _abstain_stake) = self.build_drep_power_cache();
 
         // Collect all proposals sorted by priority (lower = higher priority)
         let mut candidates: Vec<(GovActionId, GovAction, EpochNo)> = self
@@ -1954,6 +2023,7 @@ impl LedgerState {
                     total_drep_stake,
                     total_spo_stake,
                     &drep_power_cache,
+                    no_confidence_stake,
                 );
                 if met {
                     info!(
@@ -2046,13 +2116,22 @@ impl LedgerState {
         &self,
         action_id: &GovActionId,
         state: &ProposalState,
-        total_drep_stake: u64,
+        _total_drep_stake: u64,
         total_spo_stake: u64,
         drep_power_cache: &HashMap<Hash32, u64>,
+        no_confidence_stake: u64,
     ) -> bool {
         // Count votes by voter type (uses pre-computed DRep power cache)
-        let (drep_yes, drep_total, spo_yes, spo_total, _cc_yes, _cc_total) =
-            self.count_votes_by_type(action_id, drep_power_cache);
+        // Per CIP-1694:
+        // - DRep denominator = yes + no voted stake (abstain excluded)
+        // - SPO denominator = total active SPO stake (non-voting SPOs effectively vote No)
+        let (drep_yes, drep_total, spo_yes, _spo_voted, _cc_yes, _cc_total) = self
+            .count_votes_by_type(
+                action_id,
+                &state.procedure.gov_action,
+                drep_power_cache,
+                no_confidence_stake,
+            );
 
         let bootstrap = self.is_bootstrap_phase();
 
@@ -2077,12 +2156,11 @@ impl LedgerState {
                 } else {
                     pp_change_drep_threshold(protocol_param_update, &self.protocol_params)
                 };
-                let drep_met =
-                    check_threshold(drep_yes, drep_total.max(total_drep_stake), &drep_threshold);
+                let drep_met = check_threshold(drep_yes, drep_total, &drep_threshold);
                 let spo_met = if let Some(ref spo_threshold) =
                     pp_change_spo_threshold(protocol_param_update, &self.protocol_params)
                 {
-                    check_threshold(spo_yes, spo_total.max(total_spo_stake), spo_threshold)
+                    check_threshold(spo_yes, total_spo_stake, spo_threshold)
                 } else {
                     true // No SPO vote required for non-security params
                 };
@@ -2109,10 +2187,8 @@ impl LedgerState {
                     self.protocol_params.dvt_hard_fork.clone()
                 };
                 let spo_threshold = &self.protocol_params.pvt_hard_fork;
-                let drep_met =
-                    check_threshold(drep_yes, drep_total.max(total_drep_stake), &drep_threshold);
-                let spo_met =
-                    check_threshold(spo_yes, spo_total.max(total_spo_stake), spo_threshold);
+                let drep_met = check_threshold(drep_yes, drep_total, &drep_threshold);
+                let spo_met = check_threshold(spo_yes, total_spo_stake, spo_threshold);
                 let cc_met = check_cc_approval(
                     action_id,
                     &self.governance,
@@ -2124,9 +2200,9 @@ impl LedgerState {
                     action_id = %action_id.transaction_id.to_hex(),
                     version = ?protocol_version,
                     bootstrap,
-                    drep_yes, drep_total = drep_total.max(total_drep_stake),
+                    drep_yes, drep_total,
                     drep_threshold = drep_threshold.as_f64(), drep_met,
-                    spo_yes, spo_total = spo_total.max(total_spo_stake),
+                    spo_yes, total_spo_stake,
                     spo_threshold = spo_threshold.as_f64(), spo_met,
                     cc_met,
                     "HardForkInitiation ratification check"
@@ -2145,10 +2221,8 @@ impl LedgerState {
                     self.protocol_params.dvt_no_confidence.clone()
                 };
                 let spo_threshold = &self.protocol_params.pvt_motion_no_confidence;
-                let drep_met =
-                    check_threshold(drep_yes, drep_total.max(total_drep_stake), &drep_threshold);
-                let spo_met =
-                    check_threshold(spo_yes, spo_total.max(total_spo_stake), spo_threshold);
+                let drep_met = check_threshold(drep_yes, drep_total, &drep_threshold);
+                let spo_met = check_threshold(spo_yes, total_spo_stake, spo_threshold);
                 drep_met && spo_met
             }
             GovAction::UpdateCommittee { .. } => {
@@ -2176,10 +2250,8 @@ impl LedgerState {
                         &self.protocol_params.pvt_committee_normal,
                     )
                 };
-                let drep_met =
-                    check_threshold(drep_yes, drep_total.max(total_drep_stake), &drep_threshold);
-                let spo_met =
-                    check_threshold(spo_yes, spo_total.max(total_spo_stake), spo_threshold);
+                let drep_met = check_threshold(drep_yes, drep_total, &drep_threshold);
+                let spo_met = check_threshold(spo_yes, total_spo_stake, spo_threshold);
                 drep_met && spo_met
             }
             GovAction::NewConstitution { .. } => {
@@ -2193,8 +2265,7 @@ impl LedgerState {
                 } else {
                     self.protocol_params.dvt_constitution.clone()
                 };
-                let drep_met =
-                    check_threshold(drep_yes, drep_total.max(total_drep_stake), &drep_threshold);
+                let drep_met = check_threshold(drep_yes, drep_total, &drep_threshold);
                 let cc_met = check_cc_approval(
                     action_id,
                     &self.governance,
@@ -2215,8 +2286,7 @@ impl LedgerState {
                 } else {
                     self.protocol_params.dvt_treasury_withdrawal.clone()
                 };
-                let drep_met =
-                    check_threshold(drep_yes, drep_total.max(total_drep_stake), &drep_threshold);
+                let drep_met = check_threshold(drep_yes, drep_total, &drep_threshold);
                 let cc_met = check_cc_approval(
                     action_id,
                     &self.governance,
@@ -2231,17 +2301,21 @@ impl LedgerState {
 
     /// Count stake-weighted votes by voter type for a specific governance action.
     ///
-    /// Per CIP-1694, DRep and SPO votes are weighted by delegated stake:
-    /// - DRep voting power = sum of stake delegated to that DRep via VoteDelegation
-    /// - SPO voting power = pool's total active stake
-    /// - CC votes are unweighted (1 per member)
+    /// Per CIP-1694:
+    /// - DRep denominator = yes + no voted stake only (abstain excluded)
+    /// - SPO: returns explicit yes votes; total SPO stake used as denominator in check_ratification
+    /// - AlwaysNoConfidence stake counts as Yes for NoConfidence actions, No for others
+    /// - AlwaysAbstain stake is excluded from both numerator and denominator
+    /// - Inactive DReps are excluded (handled by drep_power_cache)
     fn count_votes_by_type(
         &self,
         action_id: &GovActionId,
+        action: &GovAction,
         drep_power_cache: &HashMap<Hash32, u64>,
+        no_confidence_stake: u64,
     ) -> (u64, u64, u64, u64, u64, u64) {
         let mut drep_yes = 0u64;
-        let mut drep_total = 0u64;
+        let mut drep_no = 0u64;
         let mut spo_yes = 0u64;
         let mut spo_total = 0u64;
         let mut cc_yes = 0u64;
@@ -2253,6 +2327,7 @@ impl LedgerState {
             .votes_by_action
             .get(action_id)
             .unwrap_or(&empty);
+
         for (voter, procedure) in action_votes {
             match voter {
                 Voter::DRep(cred) => {
@@ -2263,15 +2338,28 @@ impl LedgerState {
                             .copied()
                             .unwrap_or_else(|| {
                                 // Fallback for DReps not in cache (e.g., voted but not delegated to)
-                                if self.governance.dreps.contains_key(&drep_hash) {
+                                if self
+                                    .governance
+                                    .dreps
+                                    .get(&drep_hash)
+                                    .is_some_and(|d| d.active)
+                                {
                                     1
                                 } else {
                                     0
                                 }
                             });
-                    drep_total += voting_power;
-                    if procedure.vote == Vote::Yes {
-                        drep_yes += voting_power;
+                    // Only count yes and no votes in the denominator (abstain excluded)
+                    match procedure.vote {
+                        Vote::Yes => {
+                            drep_yes += voting_power;
+                        }
+                        Vote::No => {
+                            drep_no += voting_power;
+                        }
+                        Vote::Abstain => {
+                            // Excluded from both numerator and denominator
+                        }
                     }
                 }
                 Voter::StakePool(pool_hash) => {
@@ -2282,6 +2370,8 @@ impl LedgerState {
                         b
                     });
                     let pool_stake = self.compute_spo_voting_power(&pool_id);
+                    // SPO denominator = total active SPO stake, so only count yes here
+                    // Non-voting SPOs are implicitly No (in denominator but not numerator)
                     spo_total += pool_stake;
                     if procedure.vote == Vote::Yes {
                         spo_yes += pool_stake;
@@ -2295,6 +2385,20 @@ impl LedgerState {
                 }
             }
         }
+
+        // Handle AlwaysNoConfidence stake per CIP-1694:
+        // - For NoConfidence actions: counts as Yes
+        // - For all other actions: counts as No
+        let is_no_confidence = matches!(action, GovAction::NoConfidence { .. });
+        if no_confidence_stake > 0 {
+            if is_no_confidence {
+                drep_yes += no_confidence_stake;
+            } else {
+                drep_no += no_confidence_stake;
+            }
+        }
+
+        let drep_total = drep_yes + drep_no;
 
         (drep_yes, drep_total, spo_yes, spo_total, cc_yes, cc_total)
     }
@@ -2315,39 +2419,74 @@ impl LedgerState {
         utxo + reward
     }
 
-    /// Build a cache of DRep voting power (Hash32 → delegated stake).
+    /// Build a cache of DRep voting power (Hash32 -> delegated stake).
     /// Iterates vote_delegations once, O(n), instead of per-DRep O(n) lookups.
-    fn build_drep_power_cache(&self) -> HashMap<Hash32, u64> {
+    /// Only includes active DReps (inactive DReps are excluded from voting power).
+    /// Returns (drep_power_cache, always_no_confidence_stake, always_abstain_stake).
+    fn build_drep_power_cache(&self) -> (HashMap<Hash32, u64>, u64, u64) {
         let mut cache: HashMap<Hash32, u64> = HashMap::new();
+        let mut no_confidence_stake = 0u64;
+        let mut abstain_stake = 0u64;
         for (stake_cred, drep) in &self.governance.vote_delegations {
-            let drep_hash = match drep {
-                DRep::KeyHash(h) => *h,
+            let stake = self.credential_stake(stake_cred);
+            match drep {
+                DRep::KeyHash(h) => {
+                    // Only count stake for active DReps
+                    if self.governance.dreps.get(h).is_some_and(|d| d.active) {
+                        *cache.entry(*h).or_default() += stake;
+                    }
+                }
                 DRep::ScriptHash(h) => {
                     let mut padded = [0u8; 32];
                     padded[..28].copy_from_slice(h.as_bytes());
-                    Hash32::from_bytes(padded)
+                    let hash32 = Hash32::from_bytes(padded);
+                    if self.governance.dreps.get(&hash32).is_some_and(|d| d.active) {
+                        *cache.entry(hash32).or_default() += stake;
+                    }
                 }
-                DRep::Abstain | DRep::NoConfidence => continue,
-            };
-            let stake = self.credential_stake(stake_cred);
-            *cache.entry(drep_hash).or_default() += stake;
+                DRep::NoConfidence => {
+                    no_confidence_stake += stake;
+                }
+                DRep::Abstain => {
+                    abstain_stake += stake;
+                }
+            }
         }
-        // Ensure registered DReps with no delegated stake have minimum power of 1
-        for drep_hash in self.governance.dreps.keys() {
-            cache.entry(*drep_hash).or_insert(1);
+        // Ensure active registered DReps with no delegated stake have minimum power of 1
+        for (drep_hash, drep) in &self.governance.dreps {
+            if drep.active {
+                cache.entry(*drep_hash).or_insert(1);
+            }
         }
-        cache
+        (cache, no_confidence_stake, abstain_stake)
     }
 
     /// Compute total active DRep-delegated stake across all DReps.
-    /// All vote delegation types (KeyHash, ScriptHash, Abstain, NoConfidence) count.
+    /// Excludes stake delegated to inactive DReps.
+    /// Includes stake delegated to Abstain and NoConfidence (they are part of total DRep ecosystem).
     fn compute_total_drep_stake(&self) -> u64 {
-        let total: u64 = self
-            .governance
-            .vote_delegations
-            .keys()
-            .map(|stake_cred| self.credential_stake(stake_cred))
-            .sum();
+        let mut total = 0u64;
+        for (stake_cred, drep) in &self.governance.vote_delegations {
+            let stake = self.credential_stake(stake_cred);
+            match drep {
+                DRep::Abstain | DRep::NoConfidence => {
+                    total += stake;
+                }
+                DRep::KeyHash(h) => {
+                    if self.governance.dreps.get(h).is_some_and(|d| d.active) {
+                        total += stake;
+                    }
+                }
+                DRep::ScriptHash(h) => {
+                    let mut padded = [0u8; 32];
+                    padded[..28].copy_from_slice(h.as_bytes());
+                    let hash32 = Hash32::from_bytes(padded);
+                    if self.governance.dreps.get(&hash32).is_some_and(|d| d.active) {
+                        total += stake;
+                    }
+                }
+            }
+        }
         total.max(1) // Ensure non-zero to avoid division by zero
     }
 
@@ -4009,13 +4148,18 @@ mod tests {
         assert_eq!(state.governance.dreps[&key].last_active_epoch, EpochNo(3));
 
         // Epoch transition to epoch 7 — DRep last active at epoch 3, threshold is 5
-        // 7 - 3 = 4, which is not > 5, so DRep should remain
+        // 7 - 3 = 4, which is not > 5, so DRep should remain active
         state.process_epoch_transition(EpochNo(7));
         assert!(state.governance.dreps.contains_key(&key));
+        assert!(state.governance.dreps[&key].active);
 
-        // Epoch transition to epoch 9 — 9 - 3 = 6 > 5, so DRep should be expired
+        // Epoch transition to epoch 9 — 9 - 3 = 6 > 5, so DRep should be marked inactive
+        // Per CIP-1694: inactive DReps remain registered but are excluded from voting power
         state.process_epoch_transition(EpochNo(9));
-        assert!(!state.governance.dreps.contains_key(&key));
+        assert!(state.governance.dreps.contains_key(&key)); // Still registered
+        assert!(!state.governance.dreps[&key].active); // But inactive
+        assert_eq!(state.governance.dreps[&key].deposit, Lovelace(500_000_000));
+        // Deposit retained
     }
 
     #[test]
@@ -4078,7 +4222,7 @@ mod tests {
     }
 
     #[test]
-    fn test_drep_deposit_refund_on_expiry() {
+    fn test_drep_marked_inactive_on_expiry() {
         let mut params = ProtocolParameters::mainnet_defaults();
         params.drep_activity = 2;
         let mut state = LedgerState::new(params);
@@ -4093,19 +4237,16 @@ mod tests {
             anchor: None,
         });
         assert!(state.governance.dreps.contains_key(&key));
+        assert!(state.governance.dreps[&key].active);
 
-        // No reward account yet
-        assert!(!state.reward_accounts.contains_key(&key));
-
-        // Expire at epoch 3 (0 + 2 < 3, so inactive)
+        // At epoch 3 (0 + 2 < 3, so inactive): DRep should be marked inactive but NOT removed
         state.process_epoch_transition(EpochNo(3));
-        assert!(!state.governance.dreps.contains_key(&key));
+        assert!(state.governance.dreps.contains_key(&key)); // Still registered
+        assert!(!state.governance.dreps[&key].active); // But inactive
+        assert_eq!(state.governance.dreps[&key].deposit, Lovelace(500_000_000)); // Deposit retained
 
-        // Deposit should be refunded to reward account
-        assert_eq!(
-            state.reward_accounts.get(&key),
-            Some(&Lovelace(500_000_000))
-        );
+        // Deposit should NOT be refunded (DRep still registered)
+        assert!(!state.reward_accounts.contains_key(&key));
     }
 
     #[test]
@@ -4346,6 +4487,7 @@ mod tests {
                 anchor: None,
                 registered_epoch: EpochNo(0),
                 last_active_epoch: EpochNo(0),
+                active: true,
             },
         );
 
@@ -4479,6 +4621,7 @@ mod tests {
                     anchor: None,
                     registered_epoch: EpochNo(0),
                     last_active_epoch: EpochNo(0),
+                    active: true,
                 },
             );
         }
@@ -4565,6 +4708,7 @@ mod tests {
                     anchor: None,
                     registered_epoch: EpochNo(0),
                     last_active_epoch: EpochNo(0),
+                    active: true,
                 },
             );
             // Set up vote delegation and stake for each DRep
@@ -4650,6 +4794,7 @@ mod tests {
                     anchor: None,
                     registered_epoch: EpochNo(0),
                     last_active_epoch: EpochNo(0),
+                    active: true,
                 },
             );
         }
@@ -4725,6 +4870,7 @@ mod tests {
                     anchor: None,
                     registered_epoch: EpochNo(0),
                     last_active_epoch: EpochNo(0),
+                    active: true,
                 },
             );
         }
@@ -4831,6 +4977,7 @@ mod tests {
                     anchor: None,
                     registered_epoch: EpochNo(0),
                     last_active_epoch: EpochNo(0),
+                    active: true,
                 },
             );
         }
@@ -5882,6 +6029,7 @@ mod tests {
     #[test]
     fn test_mir_stake_credential_distribution() {
         let mut state = LedgerState::new(ProtocolParameters::mainnet_defaults());
+        state.reserves = Lovelace(10_000_000);
         let cred = Credential::VerificationKey(Hash28::from_bytes([0xaa; 28]));
         let key = credential_to_hash(&cred);
 
@@ -5895,6 +6043,8 @@ mod tests {
             target: MIRTarget::StakeCredentials(vec![(cred.clone(), 1_000_000)]),
         });
         assert_eq!(state.reward_accounts.get(&key), Some(&Lovelace(1_000_000)));
+        // Reserves should be debited
+        assert_eq!(state.reserves, Lovelace(9_000_000));
     }
 
     #[test]
@@ -6288,5 +6438,845 @@ mod tests {
             policy_hash: None,
         }));
         assert!(!is_delaying_action(&GovAction::InfoAction));
+    }
+
+    // ==================== Bug Fix Tests ====================
+
+    #[test]
+    fn test_invalid_tx_uses_collateral_for_fees_not_declared_fee() {
+        // Bug 1: Invalid tx should collect collateral as fee, not tx.body.fee
+        let params = ProtocolParameters::mainnet_defaults();
+        let mut state = LedgerState::new(params);
+        state.epoch_length = 1_000_000; // avoid epoch transition
+
+        // Create a collateral UTxO worth 5 ADA
+        let collateral_input = TransactionInput {
+            transaction_id: Hash32::from_bytes([10u8; 32]),
+            index: 0,
+        };
+        let collateral_output = TransactionOutput {
+            address: Address::Byron(ByronAddress {
+                payload: vec![0u8; 32],
+            }),
+            value: Value::lovelace(5_000_000), // 5 ADA collateral
+            datum: OutputDatum::None,
+            script_ref: None,
+            raw_cbor: None,
+        };
+        state
+            .utxo_set
+            .insert(collateral_input.clone(), collateral_output);
+
+        // Create an invalid tx with declared fee of 200_000 but collateral of 5_000_000
+        let tx = Transaction {
+            hash: Hash32::from_bytes([11u8; 32]),
+            body: TransactionBody {
+                inputs: vec![],
+                outputs: vec![],
+                fee: Lovelace(200_000), // declared fee (should NOT be used)
+                ttl: None,
+                certificates: vec![],
+                withdrawals: BTreeMap::new(),
+                auxiliary_data_hash: None,
+                validity_interval_start: None,
+                mint: BTreeMap::new(),
+                script_data_hash: None,
+                collateral: vec![collateral_input],
+                required_signers: vec![],
+                network_id: None,
+                collateral_return: None, // no return, so full 5 ADA is forfeited
+                total_collateral: None,
+                reference_inputs: vec![],
+                update: None,
+                voting_procedures: BTreeMap::new(),
+                proposal_procedures: vec![],
+                treasury_value: None,
+                donation: None,
+            },
+            witness_set: TransactionWitnessSet {
+                vkey_witnesses: vec![],
+                native_scripts: vec![],
+                bootstrap_witnesses: vec![],
+                plutus_v1_scripts: vec![],
+                plutus_v2_scripts: vec![],
+                plutus_v3_scripts: vec![],
+                plutus_data: vec![],
+                redeemers: vec![],
+            },
+            is_valid: false,
+            auxiliary_data: None,
+            raw_cbor: None,
+        };
+
+        let block = make_test_block(100, 1, Hash32::ZERO, vec![tx]);
+        state.apply_block(&block).unwrap();
+
+        // Fee should be the collateral amount (5 ADA), NOT the declared fee (0.2 ADA)
+        assert_eq!(state.epoch_fees, Lovelace(5_000_000));
+    }
+
+    #[test]
+    fn test_invalid_tx_collateral_with_return() {
+        // Bug 1 variant: collateral with return — fee = inputs - return
+        let params = ProtocolParameters::mainnet_defaults();
+        let mut state = LedgerState::new(params);
+        state.epoch_length = 1_000_000;
+
+        let collateral_input = TransactionInput {
+            transaction_id: Hash32::from_bytes([20u8; 32]),
+            index: 0,
+        };
+        let collateral_output = TransactionOutput {
+            address: Address::Byron(ByronAddress {
+                payload: vec![0u8; 32],
+            }),
+            value: Value::lovelace(10_000_000), // 10 ADA collateral input
+            datum: OutputDatum::None,
+            script_ref: None,
+            raw_cbor: None,
+        };
+        state
+            .utxo_set
+            .insert(collateral_input.clone(), collateral_output);
+
+        // Collateral return gives back 7 ADA, so only 3 ADA forfeited
+        let col_return = TransactionOutput {
+            address: Address::Byron(ByronAddress {
+                payload: vec![0u8; 32],
+            }),
+            value: Value::lovelace(7_000_000),
+            datum: OutputDatum::None,
+            script_ref: None,
+            raw_cbor: None,
+        };
+
+        let tx = Transaction {
+            hash: Hash32::from_bytes([21u8; 32]),
+            body: TransactionBody {
+                inputs: vec![],
+                outputs: vec![],
+                fee: Lovelace(500_000), // declared fee (should NOT be used)
+                ttl: None,
+                certificates: vec![],
+                withdrawals: BTreeMap::new(),
+                auxiliary_data_hash: None,
+                validity_interval_start: None,
+                mint: BTreeMap::new(),
+                script_data_hash: None,
+                collateral: vec![collateral_input],
+                required_signers: vec![],
+                network_id: None,
+                collateral_return: Some(col_return),
+                total_collateral: None,
+                reference_inputs: vec![],
+                update: None,
+                voting_procedures: BTreeMap::new(),
+                proposal_procedures: vec![],
+                treasury_value: None,
+                donation: None,
+            },
+            witness_set: TransactionWitnessSet {
+                vkey_witnesses: vec![],
+                native_scripts: vec![],
+                bootstrap_witnesses: vec![],
+                plutus_v1_scripts: vec![],
+                plutus_v2_scripts: vec![],
+                plutus_v3_scripts: vec![],
+                plutus_data: vec![],
+                redeemers: vec![],
+            },
+            is_valid: false,
+            auxiliary_data: None,
+            raw_cbor: None,
+        };
+
+        let block = make_test_block(100, 1, Hash32::ZERO, vec![tx]);
+        state.apply_block(&block).unwrap();
+
+        // Fee should be 10M - 7M = 3M (collateral forfeited), NOT 500_000 (declared fee)
+        assert_eq!(state.epoch_fees, Lovelace(3_000_000));
+    }
+
+    #[test]
+    fn test_invalid_tx_total_collateral_field() {
+        // Bug 1 variant: when total_collateral is explicitly set, use that
+        let params = ProtocolParameters::mainnet_defaults();
+        let mut state = LedgerState::new(params);
+        state.epoch_length = 1_000_000;
+
+        let collateral_input = TransactionInput {
+            transaction_id: Hash32::from_bytes([30u8; 32]),
+            index: 0,
+        };
+        let collateral_output = TransactionOutput {
+            address: Address::Byron(ByronAddress {
+                payload: vec![0u8; 32],
+            }),
+            value: Value::lovelace(8_000_000),
+            datum: OutputDatum::None,
+            script_ref: None,
+            raw_cbor: None,
+        };
+        state
+            .utxo_set
+            .insert(collateral_input.clone(), collateral_output);
+
+        let tx = Transaction {
+            hash: Hash32::from_bytes([31u8; 32]),
+            body: TransactionBody {
+                inputs: vec![],
+                outputs: vec![],
+                fee: Lovelace(300_000),
+                ttl: None,
+                certificates: vec![],
+                withdrawals: BTreeMap::new(),
+                auxiliary_data_hash: None,
+                validity_interval_start: None,
+                mint: BTreeMap::new(),
+                script_data_hash: None,
+                collateral: vec![collateral_input],
+                required_signers: vec![],
+                network_id: None,
+                collateral_return: None,
+                total_collateral: Some(Lovelace(2_500_000)), // explicit total_collateral
+                reference_inputs: vec![],
+                update: None,
+                voting_procedures: BTreeMap::new(),
+                proposal_procedures: vec![],
+                treasury_value: None,
+                donation: None,
+            },
+            witness_set: TransactionWitnessSet {
+                vkey_witnesses: vec![],
+                native_scripts: vec![],
+                bootstrap_witnesses: vec![],
+                plutus_v1_scripts: vec![],
+                plutus_v2_scripts: vec![],
+                plutus_v3_scripts: vec![],
+                plutus_data: vec![],
+                redeemers: vec![],
+            },
+            is_valid: false,
+            auxiliary_data: None,
+            raw_cbor: None,
+        };
+
+        let block = make_test_block(100, 1, Hash32::ZERO, vec![tx]);
+        state.apply_block(&block).unwrap();
+
+        // Fee should be the explicit total_collateral value
+        assert_eq!(state.epoch_fees, Lovelace(2_500_000));
+    }
+
+    #[test]
+    fn test_mir_stake_credentials_debits_reserves() {
+        // Bug 2: MIR to StakeCredentials should debit reserves
+        let mut state = LedgerState::new(ProtocolParameters::mainnet_defaults());
+        state.reserves = Lovelace(100_000_000);
+
+        let cred1 = Credential::VerificationKey(Hash28::from_bytes([0xbb; 28]));
+        let cred2 = Credential::VerificationKey(Hash28::from_bytes([0xcc; 28]));
+        let key1 = credential_to_hash(&cred1);
+        let key2 = credential_to_hash(&cred2);
+
+        state.process_certificate(&Certificate::StakeRegistration(cred1.clone()));
+        state.process_certificate(&Certificate::StakeRegistration(cred2.clone()));
+
+        // MIR: distribute 3M + 2M = 5M from reserves
+        state.process_certificate(&Certificate::MoveInstantaneousRewards {
+            source: MIRSource::Reserves,
+            target: MIRTarget::StakeCredentials(vec![
+                (cred1.clone(), 3_000_000),
+                (cred2.clone(), 2_000_000),
+            ]),
+        });
+
+        assert_eq!(state.reward_accounts[&key1], Lovelace(3_000_000));
+        assert_eq!(state.reward_accounts[&key2], Lovelace(2_000_000));
+        // Reserves should be debited by the total distributed (5M)
+        assert_eq!(state.reserves, Lovelace(95_000_000));
+    }
+
+    #[test]
+    fn test_mir_stake_credentials_debits_treasury() {
+        // Bug 2: MIR to StakeCredentials should debit treasury
+        let mut state = LedgerState::new(ProtocolParameters::mainnet_defaults());
+        state.treasury = Lovelace(50_000_000);
+
+        let cred = Credential::VerificationKey(Hash28::from_bytes([0xdd; 28]));
+        let key = credential_to_hash(&cred);
+
+        state.process_certificate(&Certificate::StakeRegistration(cred.clone()));
+
+        // MIR: distribute 7M from treasury
+        state.process_certificate(&Certificate::MoveInstantaneousRewards {
+            source: MIRSource::Treasury,
+            target: MIRTarget::StakeCredentials(vec![(cred.clone(), 7_000_000)]),
+        });
+
+        assert_eq!(state.reward_accounts[&key], Lovelace(7_000_000));
+        // Treasury should be debited
+        assert_eq!(state.treasury, Lovelace(43_000_000));
+    }
+
+    #[test]
+    fn test_pool_reregistration_cancels_pending_retirement() {
+        // Bug 3: re-registering a pool should cancel pending retirement
+        let params = ProtocolParameters::mainnet_defaults();
+        let mut state = LedgerState::new(params);
+        state.epoch_length = 432000;
+
+        let pool_id = Hash28::from_bytes([0xAA; 28]);
+        let pool_params_val = PoolParams {
+            operator: pool_id,
+            vrf_keyhash: Hash32::from_bytes([0xBB; 32]),
+            pledge: Lovelace(500_000_000),
+            cost: Lovelace(340_000_000),
+            margin: Rational {
+                numerator: 1,
+                denominator: 100,
+            },
+            reward_account: vec![0xe0; 29],
+            pool_owners: vec![pool_id],
+            relays: vec![],
+            pool_metadata: None,
+        };
+
+        // Register pool
+        state.process_certificate(&Certificate::PoolRegistration(pool_params_val.clone()));
+        assert!(state.pool_params.contains_key(&pool_id));
+
+        // Schedule retirement at epoch 5
+        state.process_certificate(&Certificate::PoolRetirement {
+            pool_hash: pool_id,
+            epoch: 5,
+        });
+        assert!(state.pending_retirements.contains_key(&EpochNo(5)));
+        assert!(state.pending_retirements[&EpochNo(5)].contains(&pool_id));
+
+        // Re-register the pool — should cancel the pending retirement
+        let updated_params = PoolParams {
+            pledge: Lovelace(1_000_000_000), // updated pledge
+            ..pool_params_val
+        };
+        state.process_certificate(&Certificate::PoolRegistration(updated_params));
+
+        // Pending retirement should be cancelled
+        assert!(
+            state.pending_retirements.is_empty()
+                || !state
+                    .pending_retirements
+                    .values()
+                    .any(|v| v.contains(&pool_id))
+        );
+        // Pool should still exist with updated params
+        assert!(state.pool_params.contains_key(&pool_id));
+        assert_eq!(state.pool_params[&pool_id].pledge, Lovelace(1_000_000_000));
+    }
+
+    #[test]
+    fn test_pool_reregistration_only_cancels_own_retirement() {
+        // Bug 3 variant: re-registering pool A should not cancel pool B's retirement
+        let params = ProtocolParameters::mainnet_defaults();
+        let mut state = LedgerState::new(params);
+        state.epoch_length = 432000;
+
+        let pool_a = Hash28::from_bytes([0xAA; 28]);
+        let pool_b = Hash28::from_bytes([0xBB; 28]);
+
+        let make_params = |id: Hash28| PoolParams {
+            operator: id,
+            vrf_keyhash: Hash32::from_bytes([0xCC; 32]),
+            pledge: Lovelace(100_000_000),
+            cost: Lovelace(340_000_000),
+            margin: Rational {
+                numerator: 1,
+                denominator: 100,
+            },
+            reward_account: vec![0xe0; 29],
+            pool_owners: vec![id],
+            relays: vec![],
+            pool_metadata: None,
+        };
+
+        // Register both pools
+        state.process_certificate(&Certificate::PoolRegistration(make_params(pool_a)));
+        state.process_certificate(&Certificate::PoolRegistration(make_params(pool_b)));
+
+        // Retire both at epoch 5
+        state.process_certificate(&Certificate::PoolRetirement {
+            pool_hash: pool_a,
+            epoch: 5,
+        });
+        state.process_certificate(&Certificate::PoolRetirement {
+            pool_hash: pool_b,
+            epoch: 5,
+        });
+        assert_eq!(state.pending_retirements[&EpochNo(5)].len(), 2);
+
+        // Re-register only pool A
+        state.process_certificate(&Certificate::PoolRegistration(make_params(pool_a)));
+
+        // Pool A's retirement should be cancelled, but pool B's should remain
+        let remaining: Vec<_> = state
+            .pending_retirements
+            .values()
+            .flatten()
+            .copied()
+            .collect();
+        assert!(!remaining.contains(&pool_a));
+        assert!(remaining.contains(&pool_b));
+    }
+
+    #[test]
+    fn test_stake_deregistration_rejected_with_nonzero_balance() {
+        // Bug 4: Shelley-era deregistration should fail if reward balance > 0
+        let params = ProtocolParameters::mainnet_defaults();
+        let mut state = LedgerState::new(params);
+
+        let cred = Credential::VerificationKey(Hash28::from_bytes([0xEE; 28]));
+        let key = credential_to_hash(&cred);
+
+        // Register stake
+        state.process_certificate(&Certificate::StakeRegistration(cred.clone()));
+        assert!(state.reward_accounts.contains_key(&key));
+
+        // Add some rewards
+        *state.reward_accounts.get_mut(&key).unwrap() = Lovelace(500_000);
+
+        // Try to deregister — should be rejected because balance > 0
+        state.process_certificate(&Certificate::StakeDeregistration(cred.clone()));
+
+        // Stake should still be registered
+        assert!(state.reward_accounts.contains_key(&key));
+        assert!(state.stake_distribution.stake_map.contains_key(&key));
+        assert_eq!(state.reward_accounts[&key], Lovelace(500_000));
+    }
+
+    #[test]
+    fn test_stake_deregistration_allowed_with_zero_balance() {
+        // Bug 4: Shelley-era deregistration should succeed if reward balance is zero
+        let params = ProtocolParameters::mainnet_defaults();
+        let mut state = LedgerState::new(params);
+
+        let cred = Credential::VerificationKey(Hash28::from_bytes([0xFF; 28]));
+        let key = credential_to_hash(&cred);
+
+        // Register stake
+        state.process_certificate(&Certificate::StakeRegistration(cred.clone()));
+        assert!(state.reward_accounts.contains_key(&key));
+        assert_eq!(state.reward_accounts[&key], Lovelace(0));
+
+        // Deregister with zero balance — should succeed
+        state.process_certificate(&Certificate::StakeDeregistration(cred));
+
+        assert!(!state.reward_accounts.contains_key(&key));
+        assert!(!state.stake_distribution.stake_map.contains_key(&key));
+    }
+
+    #[test]
+    fn test_conway_stake_deregistration_with_nonzero_balance() {
+        // Bug 4: Conway-era deregistration always succeeds (balance returned with refund)
+        let params = ProtocolParameters::mainnet_defaults();
+        let mut state = LedgerState::new(params);
+
+        let cred = Credential::VerificationKey(Hash28::from_bytes([0xAB; 28]));
+        let key = credential_to_hash(&cred);
+
+        // Register stake (Conway style)
+        state.process_certificate(&Certificate::ConwayStakeRegistration {
+            credential: cred.clone(),
+            deposit: Lovelace(2_000_000),
+        });
+        assert!(state.reward_accounts.contains_key(&key));
+
+        // Add rewards
+        *state.reward_accounts.get_mut(&key).unwrap() = Lovelace(1_000_000);
+
+        // Conway deregistration — should succeed even with non-zero balance
+        state.process_certificate(&Certificate::ConwayStakeDeregistration {
+            credential: cred,
+            refund: Lovelace(2_000_000),
+        });
+
+        // Should be removed
+        assert!(!state.reward_accounts.contains_key(&key));
+        assert!(!state.stake_distribution.stake_map.contains_key(&key));
+    }
+
+    #[test]
+    fn test_multi_epoch_skip_processes_each_epoch() {
+        // Bug 5: skipping multiple epochs should process each intermediate transition
+        let params = ProtocolParameters::mainnet_defaults();
+        let mut state = LedgerState::new(params);
+        state.epoch_length = 100; // 100 slots per epoch for testing
+
+        let pool_a = Hash28::from_bytes([0xA1; 28]);
+        let pool_b = Hash28::from_bytes([0xA2; 28]);
+
+        let make_pool = |id: Hash28| PoolParams {
+            operator: id,
+            vrf_keyhash: Hash32::from_bytes([0xCC; 32]),
+            pledge: Lovelace(100_000_000),
+            cost: Lovelace(340_000_000),
+            margin: Rational {
+                numerator: 1,
+                denominator: 100,
+            },
+            reward_account: vec![0xe0; 29],
+            pool_owners: vec![id],
+            relays: vec![],
+            pool_metadata: None,
+        };
+
+        // Register two pools
+        state.process_certificate(&Certificate::PoolRegistration(make_pool(pool_a)));
+        state.process_certificate(&Certificate::PoolRegistration(make_pool(pool_b)));
+
+        // Schedule retirements at different epochs
+        state.process_certificate(&Certificate::PoolRetirement {
+            pool_hash: pool_a,
+            epoch: 2,
+        });
+        state.process_certificate(&Certificate::PoolRetirement {
+            pool_hash: pool_b,
+            epoch: 4,
+        });
+
+        assert!(state.pool_params.contains_key(&pool_a));
+        assert!(state.pool_params.contains_key(&pool_b));
+
+        // Skip from epoch 0 directly to epoch 5 via a block at slot 500
+        let block = make_test_block(500, 1, Hash32::ZERO, vec![]);
+        state.apply_block(&block).unwrap();
+
+        // Both pools should be retired since we should have processed
+        // epochs 1, 2, 3, 4, and 5
+        assert_eq!(state.epoch, EpochNo(5));
+        assert!(
+            !state.pool_params.contains_key(&pool_a),
+            "Pool A should be retired at epoch 2"
+        );
+        assert!(
+            !state.pool_params.contains_key(&pool_b),
+            "Pool B should be retired at epoch 4"
+        );
+    }
+
+    #[test]
+    fn test_multi_epoch_skip_snapshot_rotation() {
+        // Bug 5: verify that snapshot rotation works correctly with multi-epoch skip
+        let params = ProtocolParameters::mainnet_defaults();
+        let mut state = LedgerState::new(params);
+        state.epoch_length = 100;
+
+        let cred = Credential::VerificationKey(Hash28::from_bytes([0xDE; 28]));
+        let pool_id = Hash28::from_bytes([0xDA; 28]);
+
+        state.process_certificate(&Certificate::StakeRegistration(cred.clone()));
+        add_stake_utxo(&mut state, &cred, 1_000_000);
+        state.process_certificate(&Certificate::PoolRegistration(PoolParams {
+            operator: pool_id,
+            vrf_keyhash: Hash32::from_bytes([2u8; 32]),
+            pledge: Lovelace(100),
+            cost: Lovelace(100),
+            margin: Rational {
+                numerator: 1,
+                denominator: 100,
+            },
+            reward_account: vec![0xe0; 29],
+            pool_owners: vec![pool_id],
+            relays: vec![],
+            pool_metadata: None,
+        }));
+        state.process_certificate(&Certificate::StakeDelegation {
+            credential: cred.clone(),
+            pool_hash: pool_id,
+        });
+
+        // Skip from epoch 0 directly to epoch 4 (4 transitions)
+        let block = make_test_block(400, 1, Hash32::ZERO, vec![]);
+        state.apply_block(&block).unwrap();
+
+        assert_eq!(state.epoch, EpochNo(4));
+        // After 4 transitions: mark, set, and go should all be populated
+        assert!(state.snapshots.mark.is_some());
+        assert!(state.snapshots.set.is_some());
+        assert!(state.snapshots.go.is_some());
+
+        // The epochs should be consecutive
+        assert_eq!(state.snapshots.go.as_ref().unwrap().epoch, EpochNo(2));
+        assert_eq!(state.snapshots.set.as_ref().unwrap().epoch, EpochNo(3));
+        assert_eq!(state.snapshots.mark.as_ref().unwrap().epoch, EpochNo(4));
+    }
+
+    // ======================================================================
+    // Bug fix tests: CIP-1694 governance voting
+    // ======================================================================
+
+    /// Helper: set up a LedgerState with DReps, vote delegations, and stake for governance tests.
+    fn setup_governance_state(
+        drep_count: u32,
+        stake_per_drep: u64,
+    ) -> (LedgerState, Vec<(Credential, Hash32)>) {
+        let mut params = ProtocolParameters::mainnet_defaults();
+        params.protocol_version_major = 10;
+        let mut state = LedgerState::new(params);
+        state.epoch_length = 100;
+        state.governance.committee_threshold = Some(Rational {
+            numerator: 0,
+            denominator: 1,
+        });
+
+        let mut dreps = Vec::new();
+        for i in 0..drep_count {
+            let cred = Credential::VerificationKey(Hash28::from_bytes([(i + 1) as u8; 28]));
+            let key = credential_to_hash(&cred);
+            state.governance.dreps.insert(
+                key,
+                DRepRegistration {
+                    credential: cred.clone(),
+                    deposit: Lovelace(500_000_000),
+                    anchor: None,
+                    registered_epoch: EpochNo(0),
+                    last_active_epoch: EpochNo(0),
+                    active: true,
+                },
+            );
+            let delegator_cred =
+                Credential::VerificationKey(Hash28::from_bytes([(i + 100) as u8; 28]));
+            let delegator_key = credential_to_hash(&delegator_cred);
+            state
+                .governance
+                .vote_delegations
+                .insert(delegator_key, DRep::KeyHash(key));
+            add_stake_utxo(&mut state, &delegator_cred, stake_per_drep);
+            state.rebuild_stake_distribution();
+            dreps.push((cred, key));
+        }
+        (state, dreps)
+    }
+
+    #[test]
+    fn test_drep_denominator_yes_no_only() {
+        let (mut state, dreps) = setup_governance_state(10, 1_000_000_000);
+        let tx_hash = Hash32::from_bytes([99u8; 32]);
+        let proposal = ProposalProcedure {
+            deposit: Lovelace(100_000_000_000),
+            return_addr: vec![0u8; 29],
+            gov_action: GovAction::TreasuryWithdrawals {
+                withdrawals: BTreeMap::new(),
+                policy_hash: None,
+            },
+            anchor: Anchor {
+                url: "https://example.com".to_string(),
+                data_hash: Hash32::ZERO,
+            },
+        };
+        state.process_proposal(&tx_hash, 0, &proposal);
+        let action_id = GovActionId {
+            transaction_id: tx_hash,
+            action_index: 0,
+        };
+
+        // 3 yes, 3 no, 4 abstain
+        for (cred, _) in dreps.iter().take(3) {
+            state.process_vote(
+                &Voter::DRep(cred.clone()),
+                &action_id,
+                &VotingProcedure {
+                    vote: Vote::Yes,
+                    anchor: None,
+                },
+            );
+        }
+        for (cred, _) in dreps.iter().skip(3).take(3) {
+            state.process_vote(
+                &Voter::DRep(cred.clone()),
+                &action_id,
+                &VotingProcedure {
+                    vote: Vote::No,
+                    anchor: None,
+                },
+            );
+        }
+        for (cred, _) in dreps.iter().skip(6) {
+            state.process_vote(
+                &Voter::DRep(cred.clone()),
+                &action_id,
+                &VotingProcedure {
+                    vote: Vote::Abstain,
+                    anchor: None,
+                },
+            );
+        }
+
+        let (drep_power_cache, no_confidence_stake, _) = state.build_drep_power_cache();
+        let (drep_yes, drep_total, _, _, _, _) = state.count_votes_by_type(
+            &action_id,
+            &GovAction::TreasuryWithdrawals {
+                withdrawals: BTreeMap::new(),
+                policy_hash: None,
+            },
+            &drep_power_cache,
+            no_confidence_stake,
+        );
+
+        assert_eq!(drep_yes, 3_000_000_000);
+        assert_eq!(drep_total, 6_000_000_000); // yes + no only
+    }
+
+    #[test]
+    fn test_always_no_confidence_counts_yes_for_no_confidence_action() {
+        let (mut state, _dreps) = setup_governance_state(5, 1_000_000_000);
+
+        for i in 0..3u32 {
+            let delegator_cred =
+                Credential::VerificationKey(Hash28::from_bytes([(i + 200) as u8; 28]));
+            let delegator_key = credential_to_hash(&delegator_cred);
+            state
+                .governance
+                .vote_delegations
+                .insert(delegator_key, DRep::NoConfidence);
+            add_stake_utxo(&mut state, &delegator_cred, 1_000_000_000);
+        }
+        state.rebuild_stake_distribution();
+
+        let tx_hash = Hash32::from_bytes([99u8; 32]);
+        let proposal = ProposalProcedure {
+            deposit: Lovelace(100_000_000_000),
+            return_addr: vec![0u8; 29],
+            gov_action: GovAction::NoConfidence {
+                prev_action_id: None,
+            },
+            anchor: Anchor {
+                url: "https://example.com".to_string(),
+                data_hash: Hash32::ZERO,
+            },
+        };
+        state.process_proposal(&tx_hash, 0, &proposal);
+        let action_id = GovActionId {
+            transaction_id: tx_hash,
+            action_index: 0,
+        };
+
+        let (drep_power_cache, no_confidence_stake, _) = state.build_drep_power_cache();
+        assert_eq!(no_confidence_stake, 3_000_000_000);
+
+        let (drep_yes, drep_total, _, _, _, _) = state.count_votes_by_type(
+            &action_id,
+            &GovAction::NoConfidence {
+                prev_action_id: None,
+            },
+            &drep_power_cache,
+            no_confidence_stake,
+        );
+
+        assert_eq!(drep_yes, 3_000_000_000);
+        assert_eq!(drep_total, 3_000_000_000);
+    }
+
+    #[test]
+    fn test_always_no_confidence_counts_no_for_other_actions() {
+        let (mut state, dreps) = setup_governance_state(5, 1_000_000_000);
+
+        for i in 0..3u32 {
+            let delegator_cred =
+                Credential::VerificationKey(Hash28::from_bytes([(i + 200) as u8; 28]));
+            let delegator_key = credential_to_hash(&delegator_cred);
+            state
+                .governance
+                .vote_delegations
+                .insert(delegator_key, DRep::NoConfidence);
+            add_stake_utxo(&mut state, &delegator_cred, 1_000_000_000);
+        }
+        state.rebuild_stake_distribution();
+
+        let tx_hash = Hash32::from_bytes([99u8; 32]);
+        let proposal = ProposalProcedure {
+            deposit: Lovelace(100_000_000_000),
+            return_addr: vec![0u8; 29],
+            gov_action: GovAction::TreasuryWithdrawals {
+                withdrawals: BTreeMap::new(),
+                policy_hash: None,
+            },
+            anchor: Anchor {
+                url: "https://example.com".to_string(),
+                data_hash: Hash32::ZERO,
+            },
+        };
+        state.process_proposal(&tx_hash, 0, &proposal);
+        let action_id = GovActionId {
+            transaction_id: tx_hash,
+            action_index: 0,
+        };
+
+        for (cred, _) in dreps.iter().take(2) {
+            state.process_vote(
+                &Voter::DRep(cred.clone()),
+                &action_id,
+                &VotingProcedure {
+                    vote: Vote::Yes,
+                    anchor: None,
+                },
+            );
+        }
+
+        let (drep_power_cache, no_confidence_stake, _) = state.build_drep_power_cache();
+        let (drep_yes, drep_total, _, _, _, _) = state.count_votes_by_type(
+            &action_id,
+            &GovAction::TreasuryWithdrawals {
+                withdrawals: BTreeMap::new(),
+                policy_hash: None,
+            },
+            &drep_power_cache,
+            no_confidence_stake,
+        );
+
+        // 2B yes, 3B no (AlwaysNoConfidence), total = 5B
+        assert_eq!(drep_yes, 2_000_000_000);
+        assert_eq!(drep_total, 5_000_000_000);
+    }
+
+    #[test]
+    fn test_inactive_drep_excluded_from_voting_power() {
+        let (mut state, dreps) = setup_governance_state(5, 1_000_000_000);
+        for (_, key) in dreps.iter().take(2) {
+            state.governance.dreps.get_mut(key).unwrap().active = false;
+        }
+        let (drep_power_cache, _, _) = state.build_drep_power_cache();
+        assert!(!drep_power_cache.contains_key(&dreps[0].1));
+        assert!(!drep_power_cache.contains_key(&dreps[1].1));
+        assert!(drep_power_cache.contains_key(&dreps[2].1));
+    }
+
+    #[test]
+    fn test_inactive_drep_remains_registered() {
+        let mut params = ProtocolParameters::mainnet_defaults();
+        params.drep_activity = 3;
+        let mut state = LedgerState::new(params);
+
+        let cred = Credential::VerificationKey(Hash28::from_bytes([50u8; 28]));
+        let key = credential_to_hash(&cred);
+        state.process_certificate(&Certificate::RegDRep {
+            credential: cred.clone(),
+            deposit: Lovelace(500_000_000),
+            anchor: None,
+        });
+        assert!(state.governance.dreps[&key].active);
+
+        state.process_epoch_transition(EpochNo(5));
+        assert!(state.governance.dreps.contains_key(&key));
+        assert!(!state.governance.dreps[&key].active);
+        assert_eq!(state.governance.dreps[&key].deposit, Lovelace(500_000_000));
+    }
+
+    #[test]
+    fn test_inactive_drep_stake_not_in_total() {
+        let (mut state, dreps) = setup_governance_state(5, 1_000_000_000);
+        state.governance.dreps.get_mut(&dreps[0].1).unwrap().active = false;
+        state.governance.dreps.get_mut(&dreps[1].1).unwrap().active = false;
+        let total = state.compute_total_drep_stake();
+        assert_eq!(total, 3_000_000_000);
     }
 }

@@ -211,10 +211,10 @@ pub fn encode_plutus_data(data: &PlutusData) -> Vec<u8> {
                 buf.push(0xd9); // tag (2-byte)
                 buf.extend_from_slice(&(cbor_tag as u16).to_be_bytes());
             } else {
-                buf.push(0xd9);
-                buf.push(0x01);
-                buf.push(0x02);
-                // Encode as alternative with tag value
+                // General form: tag 102 wrapping [constructor, fields]
+                buf.push(0xd8); // tag (1-byte)
+                buf.push(0x66); // tag 102
+                                // Encode as [constructor_index, [fields...]]
                 let mut inner = encode_array_header(2);
                 inner.extend(encode_uint(*tag));
                 inner.extend(encode_array_header(fields.len()));
@@ -472,5 +472,64 @@ mod tests {
         )]);
         let encoded = encode_metadatum(&meta);
         assert_eq!(encoded[0], 0xa1); // map of 1
+    }
+
+    #[test]
+    fn test_encode_plutus_constr_small() {
+        // Constructors 0-6 use CBOR tags 121-127
+        for tag in 0..7u64 {
+            let data = PlutusData::Constr(tag, vec![]);
+            let encoded = encode_plutus_data(&data);
+            assert_eq!(encoded[0], 0xd8);
+            assert_eq!(encoded[1], (121 + tag) as u8);
+            assert_eq!(encoded[2], 0x80); // empty array
+        }
+    }
+
+    #[test]
+    fn test_encode_plutus_constr_medium() {
+        // Constructors 7-127 use CBOR tags 1280+
+        let data = PlutusData::Constr(7, vec![PlutusData::Integer(1)]);
+        let encoded = encode_plutus_data(&data);
+        assert_eq!(encoded[0], 0xd9); // 2-byte tag
+        let tag_val = u16::from_be_bytes([encoded[1], encoded[2]]);
+        assert_eq!(tag_val, 1280); // 1280 + (7 - 7) = 1280
+    }
+
+    #[test]
+    fn test_encode_plutus_constr_large_uses_tag_102() {
+        // Constructors >= 128 must use CBOR tag 102 (NOT tag 258)
+        let data = PlutusData::Constr(128, vec![PlutusData::Integer(99)]);
+        let encoded = encode_plutus_data(&data);
+
+        // Tag 102 = 0xd8 0x66
+        assert_eq!(encoded[0], 0xd8, "should use 1-byte CBOR tag prefix");
+        assert_eq!(encoded[1], 0x66, "should use tag 102 (0x66)");
+
+        // After tag: array(2) with [constructor_index, fields_array]
+        assert_eq!(encoded[2], 0x82); // array of 2
+
+        // Constructor index 128 = 0x18 0x80
+        assert_eq!(encoded[3], 0x18);
+        assert_eq!(encoded[4], 128);
+
+        // Fields array(1) with integer 99
+        assert_eq!(encoded[5], 0x81);
+        assert_eq!(encoded[6], 0x18);
+        assert_eq!(encoded[7], 99);
+    }
+
+    #[test]
+    fn test_encode_plutus_constr_256_tag_102() {
+        let data = PlutusData::Constr(256, vec![]);
+        let encoded = encode_plutus_data(&data);
+        assert_eq!(encoded[0], 0xd8);
+        assert_eq!(encoded[1], 0x66); // tag 102
+        assert_eq!(encoded[2], 0x82); // array of 2
+                                      // Constructor 256 = 0x19 0x01 0x00
+        assert_eq!(encoded[3], 0x19);
+        assert_eq!(encoded[4], 0x01);
+        assert_eq!(encoded[5], 0x00);
+        assert_eq!(encoded[6], 0x80); // empty fields array
     }
 }

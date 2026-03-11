@@ -432,8 +432,21 @@ impl LsmImmutableDB {
     /// because cardano-lsm uses ephemeral writes.
     pub fn persist(&mut self) -> Result<(), LsmImmutableDBError> {
         info!("ImmutableDB: persisting snapshot");
-        let _ = self.tree.delete_snapshot("latest");
-        self.tree.save_snapshot("latest", "torsten")?;
+        // Save to temp name first to avoid data loss on crash
+        let _ = self.tree.delete_snapshot("latest_tmp");
+        self.tree.save_snapshot("latest_tmp", "torsten")?;
+
+        // Atomically replace old "latest" with new one
+        let snapshots_dir = self.path.join("snapshots");
+        let latest_dir = snapshots_dir.join("latest");
+        let tmp_dir = snapshots_dir.join("latest_tmp");
+        if latest_dir.exists() {
+            std::fs::remove_dir_all(&latest_dir)
+                .map_err(|e| LsmImmutableDBError::Lsm(cardano_lsm::Error::Io(e)))?;
+        }
+        std::fs::rename(&tmp_dir, &latest_dir)
+            .map_err(|e| LsmImmutableDBError::Lsm(cardano_lsm::Error::Io(e)))?;
+
         info!("ImmutableDB: snapshot persisted");
         Ok(())
     }

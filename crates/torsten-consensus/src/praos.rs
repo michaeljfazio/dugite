@@ -58,6 +58,13 @@ pub enum ConsensusError {
         minor: u64,
         max_major: u64,
     },
+    #[error("Body hash mismatch: header={header_hash}, computed={computed_hash}")]
+    BodyHashMismatch {
+        header_hash: Hash32,
+        computed_hash: Hash32,
+    },
+    #[error("Unregistered pool: pool {pool_id} not found in stake distribution")]
+    UnregisteredPool { pool_id: Hash28 },
 }
 
 /// Information about a registered pool needed for full block validation.
@@ -293,7 +300,25 @@ impl OuroborosPraos {
             });
         }
 
-        // 2. Pool-aware checks (only when issuer info is available)
+        // 2. Pool registration check — blocks from unregistered pools must be rejected
+        if issuer_info.is_none() {
+            let pool_id = torsten_primitives::hash::blake2b_224(&header.issuer_vkey);
+            if self.strict_verification {
+                warn!(
+                    slot = header.slot.0,
+                    pool = %pool_id,
+                    "Praos: block from unregistered pool — rejecting"
+                );
+                return Err(ConsensusError::UnregisteredPool { pool_id });
+            }
+            debug!(
+                slot = header.slot.0,
+                pool = %pool_id,
+                "Praos: pool not found in stake distribution (non-fatal during sync)"
+            );
+        }
+
+        // 3. Pool-aware checks (only when issuer info is available)
         if let Some(info) = issuer_info {
             // Verify VRF key binding: Blake2b-256(header.vrf_vkey) must match
             // the pool's registered VRF key hash
@@ -357,13 +382,13 @@ impl OuroborosPraos {
             }
         }
 
-        // 3. Opcert counter monotonicity check
+        // 4. Opcert counter monotonicity check
         self.check_opcert_counter(header)?;
 
-        // 4. KES period validation (always fatal)
+        // 5. KES period validation (always fatal)
         self.validate_kes_period(header)?;
 
-        // 5. Cryptographic verification (VRF proof, opcert signature, KES signature)
+        // 6. Cryptographic verification (VRF proof, opcert signature, KES signature)
         self.verify_vrf_proof(header)?;
         self.validate_operational_cert(header)?;
         self.verify_kes_signature(header)?;
@@ -374,6 +399,36 @@ impl OuroborosPraos {
             "Praos: full header validation passed"
         );
 
+        Ok(())
+    }
+
+    /// Validate that the block header's `body_hash` field matches the actual hash
+    /// of the block body CBOR.
+    ///
+    /// This prevents a malicious peer from sending a valid header with a substituted
+    /// body. The body hash is computed as Blake2b-256 of the CBOR-encoded block body.
+    ///
+    /// This check should be performed whenever the full block body is available
+    /// (not during header-only chain sync).
+    pub fn validate_block_body_hash(
+        &self,
+        header: &BlockHeader,
+        body_cbor: &[u8],
+    ) -> Result<(), ConsensusError> {
+        let computed_hash = blake2b_256(body_cbor);
+        if header.body_hash != computed_hash {
+            warn!(
+                slot = header.slot.0,
+                header_body_hash = %header.body_hash,
+                computed_body_hash = %computed_hash,
+                "Praos: block body hash mismatch"
+            );
+            return Err(ConsensusError::BodyHashMismatch {
+                header_hash: header.body_hash,
+                computed_hash,
+            });
+        }
+        trace!(slot = header.slot.0, "Praos: block body hash verified");
         Ok(())
     }
 
@@ -794,8 +849,23 @@ pub fn verify_leader_eligibility(
     }
 }
 
-/// Construct the VRF input for a given slot and epoch nonce.
-///
+/// Validate that a block header's `body_hash` matches the Blake2b-256 hash of the
+/// CBOR-encoded block body. Standalone version that does not require an `OuroborosPraos`
+/// instance.
+pub fn validate_block_body_hash(
+    header: &BlockHeader,
+    body_cbor: &[u8],
+) -> Result<(), ConsensusError> {
+    let computed_hash = blake2b_256(body_cbor);
+    if header.body_hash != computed_hash {
+        return Err(ConsensusError::BodyHashMismatch {
+            header_hash: header.body_hash,
+            computed_hash,
+        });
+    }
+    Ok(())
+}
+
 impl Default for OuroborosPraos {
     fn default() -> Self {
         Self::new()
@@ -807,6 +877,14 @@ mod tests {
     use super::*;
     use torsten_primitives::hash::Hash32;
     use torsten_primitives::time::{BlockNo, SlotNo};
+
+    /// Create a dummy BlockIssuerInfo for the given header's VRF key
+    fn make_issuer_info(header: &BlockHeader) -> BlockIssuerInfo {
+        BlockIssuerInfo {
+            vrf_keyhash: blake2b_256(&header.vrf_vkey),
+            relative_stake: 1.0,
+        }
+    }
 
     /// Create a valid test header at the given slot
     fn make_valid_header(slot: u64) -> BlockHeader {
@@ -1210,8 +1288,9 @@ mod tests {
         // First block with seq=5
         let mut header1 = make_valid_header(100);
         header1.operational_cert.sequence_number = 5;
+        let info1 = make_issuer_info(&header1);
         assert!(praos
-            .validate_header_full(&header1, SlotNo(200), None)
+            .validate_header_full(&header1, SlotNo(200), Some(&info1))
             .is_ok());
 
         // Enable strict mode
@@ -1220,7 +1299,8 @@ mod tests {
         // Block with seq=3 (regression) should fail in strict mode
         let mut header2 = make_valid_header(200);
         header2.operational_cert.sequence_number = 3;
-        let result = praos.validate_header_full(&header2, SlotNo(300), None);
+        let info2 = make_issuer_info(&header2);
+        let result = praos.validate_header_full(&header2, SlotNo(300), Some(&info2));
         assert!(
             matches!(
                 result,
@@ -1345,8 +1425,9 @@ mod tests {
 
         let mut header1 = make_valid_header(100);
         header1.operational_cert.sequence_number = 5;
+        let info1 = make_issuer_info(&header1);
         assert!(praos
-            .validate_header_full(&header1, SlotNo(200), None)
+            .validate_header_full(&header1, SlotNo(200), Some(&info1))
             .is_ok());
 
         praos.set_strict_verification(true);
@@ -1354,7 +1435,8 @@ mod tests {
         // Jump from 5 to 7 (over-increment, max allowed is +1)
         let mut header2 = make_valid_header(200);
         header2.operational_cert.sequence_number = 7;
-        let result = praos.validate_header_full(&header2, SlotNo(300), None);
+        let info2 = make_issuer_info(&header2);
+        let result = praos.validate_header_full(&header2, SlotNo(300), Some(&info2));
         assert!(
             matches!(
                 result,
@@ -1403,5 +1485,205 @@ mod tests {
             OuroborosPraos::with_genesis_params(0.05, 2160, EpochLength(432000), 86400, 46);
         assert_eq!(praos2.slots_per_kes_period, 86400);
         assert_eq!(praos2.max_kes_evolutions, 46);
+    }
+
+    // --- Tests for body hash validation (Bug fix) ---
+
+    #[test]
+    fn test_body_hash_valid() {
+        let praos = OuroborosPraos::new();
+        let body_cbor = b"some block body content in CBOR";
+        let body_hash = blake2b_256(body_cbor);
+
+        let mut header = make_valid_header(100);
+        header.body_hash = body_hash;
+
+        assert!(praos.validate_block_body_hash(&header, body_cbor).is_ok());
+    }
+
+    #[test]
+    fn test_body_hash_mismatch_rejected() {
+        let praos = OuroborosPraos::new();
+        let body_cbor = b"actual block body content";
+        let wrong_body_cbor = b"different block body content";
+        let wrong_hash = blake2b_256(wrong_body_cbor);
+
+        let mut header = make_valid_header(100);
+        header.body_hash = wrong_hash;
+
+        let result = praos.validate_block_body_hash(&header, body_cbor);
+        assert!(
+            matches!(result, Err(ConsensusError::BodyHashMismatch { .. })),
+            "Expected BodyHashMismatch, got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn test_body_hash_mismatch_contains_both_hashes() {
+        let praos = OuroborosPraos::new();
+        let body_cbor = b"real body";
+        let computed_hash = blake2b_256(body_cbor);
+
+        let mut header = make_valid_header(100);
+        // Set header body_hash to something different
+        header.body_hash = Hash32::from_bytes([0xAA; 32]);
+
+        let result = praos.validate_block_body_hash(&header, body_cbor);
+        match result {
+            Err(ConsensusError::BodyHashMismatch {
+                header_hash,
+                computed_hash: ch,
+            }) => {
+                assert_eq!(header_hash, Hash32::from_bytes([0xAA; 32]));
+                assert_eq!(ch, computed_hash);
+            }
+            other => panic!("Expected BodyHashMismatch, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_body_hash_empty_body() {
+        let praos = OuroborosPraos::new();
+        let empty_body = b"";
+        let empty_hash = blake2b_256(empty_body);
+
+        let mut header = make_valid_header(100);
+        header.body_hash = empty_hash;
+
+        assert!(praos.validate_block_body_hash(&header, empty_body).is_ok());
+    }
+
+    #[test]
+    fn test_body_hash_standalone_function() {
+        let body_cbor = b"block body data";
+        let body_hash = blake2b_256(body_cbor);
+
+        let mut header = make_valid_header(100);
+        header.body_hash = body_hash;
+
+        // Valid case
+        assert!(validate_block_body_hash(&header, body_cbor).is_ok());
+
+        // Invalid case
+        let wrong_body = b"wrong body data";
+        let result = validate_block_body_hash(&header, wrong_body);
+        assert!(matches!(
+            result,
+            Err(ConsensusError::BodyHashMismatch { .. })
+        ));
+    }
+
+    // --- Tests for unregistered pool rejection (Bug fix) ---
+
+    #[test]
+    fn test_unregistered_pool_rejected_strict() {
+        let mut praos = OuroborosPraos::new();
+        praos.set_strict_verification(true);
+
+        let header = make_valid_header(100);
+        let expected_pool_id = torsten_primitives::hash::blake2b_224(&header.issuer_vkey);
+
+        // No issuer info = unregistered pool
+        let result = praos.validate_header_full(&header, SlotNo(200), None);
+        match result {
+            Err(ConsensusError::UnregisteredPool { pool_id }) => {
+                assert_eq!(pool_id, expected_pool_id);
+            }
+            other => panic!("Expected UnregisteredPool, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_unregistered_pool_non_fatal_during_sync() {
+        // Non-strict mode: unregistered pool is non-fatal (allows sync from genesis
+        // before stake distribution is established)
+        let mut praos = OuroborosPraos::new();
+        assert!(!praos.strict_verification);
+
+        let header = make_valid_header(100);
+        let result = praos.validate_header_full(&header, SlotNo(200), None);
+        assert!(
+            result.is_ok(),
+            "Unregistered pool should be non-fatal during sync, got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn test_registered_pool_passes_with_correct_info() {
+        // Pool with correct VRF key should pass (non-strict for VRF proof check)
+        let mut praos = OuroborosPraos::new();
+
+        let header = make_valid_header(100);
+        let correct_hash = blake2b_256(&header.vrf_vkey);
+        let info = BlockIssuerInfo {
+            vrf_keyhash: correct_hash,
+            relative_stake: 0.5,
+        };
+
+        let result = praos.validate_header_full(&header, SlotNo(200), Some(&info));
+        assert!(
+            result.is_ok(),
+            "Registered pool with correct info should pass, got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn test_unregistered_pool_error_message() {
+        let mut praos = OuroborosPraos::new();
+        praos.set_strict_verification(true);
+
+        let header = make_valid_header(100);
+        let result = praos.validate_header_full(&header, SlotNo(200), None);
+        assert!(result.is_err());
+
+        let err_msg = format!("{}", result.unwrap_err());
+        assert!(
+            err_msg.contains("Unregistered pool"),
+            "Error message should mention 'Unregistered pool', got: {err_msg}"
+        );
+        assert!(
+            err_msg.contains("not found in stake distribution"),
+            "Error message should mention stake distribution, got: {err_msg}"
+        );
+    }
+
+    #[test]
+    fn test_body_hash_mismatch_error_message() {
+        let body_cbor = b"body content";
+        let mut header = make_valid_header(100);
+        header.body_hash = Hash32::from_bytes([0xFF; 32]);
+
+        let result = validate_block_body_hash(&header, body_cbor);
+        assert!(result.is_err());
+
+        let err_msg = format!("{}", result.unwrap_err());
+        assert!(
+            err_msg.contains("Body hash mismatch"),
+            "Error message should mention 'Body hash mismatch', got: {err_msg}"
+        );
+    }
+
+    #[test]
+    fn test_validate_header_full_strict_with_registered_pool() {
+        // In strict mode, a registered pool with matching VRF key should proceed
+        // past the pool registration check (may fail later on VRF proof with dummy data)
+        let mut praos = OuroborosPraos::new();
+        praos.set_strict_verification(true);
+
+        let header = make_valid_header(100);
+        let correct_hash = blake2b_256(&header.vrf_vkey);
+        let info = BlockIssuerInfo {
+            vrf_keyhash: correct_hash,
+            relative_stake: 1.0,
+        };
+
+        // With strict mode and dummy VRF data, VRF key binding check passes but
+        // later VRF proof check may fail. The important thing is that it does NOT
+        // fail with UnregisteredPool.
+        let result = praos.validate_header_full(&header, SlotNo(200), Some(&info));
+        if let Err(ConsensusError::UnregisteredPool { .. }) = &result {
+            panic!("Should not get UnregisteredPool when issuer_info is Some");
+        }
+        // Any other result is acceptable (may fail on VRF proof with dummy data)
     }
 }

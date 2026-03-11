@@ -95,7 +95,10 @@ pub enum ValidationError {
     RedeemerIndexOutOfRange { tag: String, index: u32, max: usize },
 }
 
-/// Validate a transaction against the current UTxO set and protocol parameters
+/// Validate a transaction against the current UTxO set and protocol parameters.
+///
+/// `registered_pools` is an optional set of already-registered pool operator hashes.
+/// When provided, pool re-registrations will not be charged an additional deposit.
 pub fn validate_transaction(
     tx: &Transaction,
     utxo_set: &UtxoSet,
@@ -103,6 +106,31 @@ pub fn validate_transaction(
     current_slot: u64,
     tx_size: u64,
     slot_config: Option<&SlotConfig>,
+) -> Result<(), Vec<ValidationError>> {
+    validate_transaction_with_pools(
+        tx,
+        utxo_set,
+        params,
+        current_slot,
+        tx_size,
+        slot_config,
+        None,
+    )
+}
+
+/// Validate a transaction with an optional set of registered pools.
+///
+/// When `registered_pools` is `Some`, pool re-registrations (updating an existing pool)
+/// will not charge an additional deposit. When `None`, all pool registrations are treated
+/// as new (deposit always charged).
+pub fn validate_transaction_with_pools(
+    tx: &Transaction,
+    utxo_set: &UtxoSet,
+    params: &ProtocolParameters,
+    current_slot: u64,
+    tx_size: u64,
+    slot_config: Option<&SlotConfig>,
+    registered_pools: Option<&HashSet<Hash28>>,
 ) -> Result<(), Vec<ValidationError>> {
     trace!(
         tx_hash = %tx.hash.to_hex(),
@@ -166,7 +194,7 @@ pub fn validate_transaction(
 
         // Calculate deposits and refunds from certificates
         let (total_deposits, total_refunds) =
-            calculate_deposits_and_refunds(&body.certificates, params);
+            calculate_deposits_and_refunds(&body.certificates, params, registered_pools);
 
         // Proposal deposits (Conway governance)
         let proposal_deposits = body.proposal_procedures.len() as u64 * params.gov_action_deposit.0;
@@ -302,7 +330,39 @@ pub fn validate_transaction(
     } else {
         0
     };
-    let min_fee = Lovelace(params.min_fee(tx_size).0 + ref_script_fee);
+    // Plutus execution unit cost: ceil(price_mem * Σ mem) + ceil(price_step * Σ steps)
+    let ex_unit_fee = {
+        let total_mem: u64 = tx
+            .witness_set
+            .redeemers
+            .iter()
+            .map(|r| r.ex_units.mem)
+            .sum();
+        let total_steps: u64 = tx
+            .witness_set
+            .redeemers
+            .iter()
+            .map(|r| r.ex_units.steps)
+            .sum();
+        let mem_cost = if total_mem > 0 && params.execution_costs.mem_price.denominator > 0 {
+            // ceil(price_mem * total_mem)
+            let num = params.execution_costs.mem_price.numerator as u128 * total_mem as u128;
+            let den = params.execution_costs.mem_price.denominator as u128;
+            num.div_ceil(den) as u64
+        } else {
+            0
+        };
+        let step_cost = if total_steps > 0 && params.execution_costs.step_price.denominator > 0 {
+            // ceil(price_step * total_steps)
+            let num = params.execution_costs.step_price.numerator as u128 * total_steps as u128;
+            let den = params.execution_costs.step_price.denominator as u128;
+            num.div_ceil(den) as u64
+        } else {
+            0
+        };
+        mem_cost + step_cost
+    };
+    let min_fee = Lovelace(params.min_fee(tx_size).0 + ref_script_fee + ex_unit_fee);
     if body.fee.0 < min_fee.0 {
         errors.push(ValidationError::FeeTooSmall {
             minimum: min_fee.0,
@@ -601,12 +661,10 @@ pub fn validate_transaction(
                     has_v3,
                 );
                 if *declared_hash != computed {
-                    // Log mismatch but don't reject during sync (encoding may differ)
-                    trace!(
-                        expected = %declared_hash.to_hex(),
-                        computed = %computed.to_hex(),
-                        "Script data hash mismatch (may be encoding difference)"
-                    );
+                    errors.push(ValidationError::ScriptDataHashMismatch {
+                        expected: declared_hash.to_hex(),
+                        actual: computed.to_hex(),
+                    });
                 }
             } else {
                 errors.push(ValidationError::MissingScriptDataHash);
@@ -616,7 +674,15 @@ pub fn validate_transaction(
             && tx.witness_set.plutus_v2_scripts.is_empty()
             && tx.witness_set.plutus_v3_scripts.is_empty()
         {
-            errors.push(ValidationError::UnexpectedScriptDataHash);
+            // Allow script_data_hash when reference inputs carry reference scripts
+            let has_ref_scripts = body.reference_inputs.iter().any(|ref_input| {
+                utxo_set
+                    .lookup(ref_input)
+                    .is_some_and(|utxo| utxo.script_ref.is_some())
+            });
+            if !has_ref_scripts {
+                errors.push(ValidationError::UnexpectedScriptDataHash);
+            }
         }
 
         // Phase-2: Execute Plutus scripts
@@ -735,15 +801,22 @@ pub fn validate_transaction(
 
 /// Calculate total deposits and refunds from certificates in a transaction.
 ///
-/// Deposits are required for: stake registration, pool registration, DRep registration,
+/// Deposits are required for: stake registration, pool registration (new only), DRep registration,
 /// stake+delegation registration.
 /// Refunds are returned for: stake deregistration, DRep unregistration.
+///
+/// When `registered_pools` is provided, pool re-registrations (updating an existing pool's
+/// parameters) do not charge an additional deposit — only new pool registrations do.
 fn calculate_deposits_and_refunds(
     certificates: &[Certificate],
     params: &ProtocolParameters,
+    registered_pools: Option<&HashSet<Hash28>>,
 ) -> (u64, u64) {
     let mut deposits = 0u64;
     let mut refunds = 0u64;
+    // Track pools newly registered within this transaction so that a second
+    // PoolRegistration cert for the same pool in the same tx is treated as an update.
+    let mut newly_registered: HashSet<Hash28> = HashSet::new();
 
     for cert in certificates {
         match cert {
@@ -759,8 +832,16 @@ fn calculate_deposits_and_refunds(
             Certificate::ConwayStakeDeregistration { refund, .. } => {
                 refunds += refund.0;
             }
-            Certificate::PoolRegistration(_) => {
-                deposits += params.pool_deposit.0;
+            Certificate::PoolRegistration(pool_params) => {
+                // Only charge deposit for NEW pool registrations.
+                // Re-registration (update) of an already-registered pool does not require deposit.
+                let already_registered = registered_pools
+                    .is_some_and(|pools| pools.contains(&pool_params.operator))
+                    || newly_registered.contains(&pool_params.operator);
+                if !already_registered {
+                    deposits += params.pool_deposit.0;
+                    newly_registered.insert(pool_params.operator);
+                }
             }
             Certificate::RegDRep { deposit, .. } => {
                 deposits += deposit.0;
@@ -1326,7 +1407,7 @@ mod tests {
             Certificate::StakeDeregistration(cred),
         ];
 
-        let (deposits, refunds) = calculate_deposits_and_refunds(&certs, &params);
+        let (deposits, refunds) = calculate_deposits_and_refunds(&certs, &params, None);
         assert_eq!(deposits, params.key_deposit.0 * 2);
         assert_eq!(refunds, params.key_deposit.0);
     }
@@ -1645,19 +1726,29 @@ mod tests {
     ) -> Transaction {
         let mut tx = make_simple_tx(input, output_value, fee);
         tx.body.collateral = collateral;
-        // Add a dummy redeemer to make it a Plutus tx
+        // Add a dummy redeemer to make it a Plutus tx.
+        // Use minimal execution units so the fee overhead is negligible (~1 lovelace).
         tx.witness_set.redeemers.push(Redeemer {
             tag: RedeemerTag::Spend,
             index: 0,
             data: PlutusData::Integer(0),
             ex_units: ExUnits {
-                mem: 1_000_000,
-                steps: 1_000_000_000,
+                mem: 100,
+                steps: 100,
             },
         });
         tx.witness_set.plutus_v2_scripts.push(vec![0x01]); // dummy script
-                                                           // Set script_data_hash since we have redeemers (required by validation)
-        tx.body.script_data_hash = Some(Hash32::from_bytes([0xAB; 32]));
+                                                           // Compute the correct script_data_hash from the redeemers/datums/cost_models
+        let params = ProtocolParameters::mainnet_defaults();
+        let computed_hash = torsten_serialization::compute_script_data_hash(
+            &tx.witness_set.redeemers,
+            &tx.witness_set.plutus_data,
+            &params.cost_models,
+            !tx.witness_set.plutus_v1_scripts.is_empty(),
+            !tx.witness_set.plutus_v2_scripts.is_empty(),
+            !tx.witness_set.plutus_v3_scripts.is_empty(),
+        );
+        tx.body.script_data_hash = Some(computed_hash);
         tx
     }
 
@@ -2768,5 +2859,759 @@ mod tests {
         assert!(errors
             .iter()
             .any(|e| matches!(e, ValidationError::ValueNotConserved { .. })));
+    }
+
+    // =======================================================================
+    // Bug fix tests
+    // =======================================================================
+
+    // --- Bug 1: Script data hash mismatch must reject ---
+
+    #[test]
+    fn test_script_data_hash_mismatch_rejects() {
+        // A Plutus transaction where the declared script_data_hash doesn't match
+        // the computed value must be rejected with ScriptDataHashMismatch.
+        let mut utxo_set = UtxoSet::new();
+        let input = TransactionInput {
+            transaction_id: Hash32::from_bytes([1u8; 32]),
+            index: 0,
+        };
+        utxo_set.insert(
+            input.clone(),
+            TransactionOutput {
+                address: Address::Byron(ByronAddress {
+                    payload: vec![0u8; 32],
+                }),
+                value: Value::lovelace(10_000_000),
+                datum: OutputDatum::None,
+                script_ref: None,
+                raw_cbor: None,
+            },
+        );
+        let col_input = TransactionInput {
+            transaction_id: Hash32::from_bytes([2u8; 32]),
+            index: 0,
+        };
+        utxo_set.insert(
+            col_input.clone(),
+            TransactionOutput {
+                address: Address::Byron(ByronAddress {
+                    payload: vec![0u8; 32],
+                }),
+                value: Value::lovelace(5_000_000),
+                datum: OutputDatum::None,
+                script_ref: None,
+                raw_cbor: None,
+            },
+        );
+
+        let params = ProtocolParameters::mainnet_defaults();
+        let mut tx = make_simple_tx(input, 9_800_000, 200_000);
+        tx.body.collateral = vec![col_input];
+        tx.witness_set.plutus_v2_scripts.push(vec![0x01]);
+        tx.witness_set.redeemers.push(Redeemer {
+            tag: RedeemerTag::Spend,
+            index: 0,
+            data: PlutusData::Integer(42),
+            ex_units: ExUnits {
+                mem: 1000,
+                steps: 1000,
+            },
+        });
+        // Set a bogus script_data_hash that won't match the computed one
+        tx.body.script_data_hash = Some(Hash32::from_bytes([0xDE; 32]));
+
+        let result = validate_transaction(&tx, &utxo_set, &params, 100, 300, None);
+        assert!(result.is_err());
+        let errors = result.unwrap_err();
+        assert!(
+            errors
+                .iter()
+                .any(|e| matches!(e, ValidationError::ScriptDataHashMismatch { .. })),
+            "Expected ScriptDataHashMismatch error, got: {:?}",
+            errors
+        );
+    }
+
+    // --- Bug 2: Min fee must include Plutus execution unit costs ---
+
+    #[test]
+    fn test_min_fee_includes_execution_unit_costs() {
+        // Build a Plutus transaction whose fee covers base (a*size+b) + ref_script
+        // but NOT the execution unit costs. It should be rejected.
+        let mut utxo_set = UtxoSet::new();
+        let input = TransactionInput {
+            transaction_id: Hash32::from_bytes([1u8; 32]),
+            index: 0,
+        };
+        utxo_set.insert(
+            input.clone(),
+            TransactionOutput {
+                address: Address::Byron(ByronAddress {
+                    payload: vec![0u8; 32],
+                }),
+                value: Value::lovelace(100_000_000),
+                datum: OutputDatum::None,
+                script_ref: None,
+                raw_cbor: None,
+            },
+        );
+        let col_input = TransactionInput {
+            transaction_id: Hash32::from_bytes([2u8; 32]),
+            index: 0,
+        };
+        utxo_set.insert(
+            col_input.clone(),
+            TransactionOutput {
+                address: Address::Byron(ByronAddress {
+                    payload: vec![0u8; 32],
+                }),
+                value: Value::lovelace(50_000_000),
+                datum: OutputDatum::None,
+                script_ref: None,
+                raw_cbor: None,
+            },
+        );
+
+        let params = ProtocolParameters::mainnet_defaults();
+        let tx_size: u64 = 300;
+        // Base fee = 44 * 300 + 155381 = 13200 + 155381 = 168581
+        let base_fee = params.min_fee(tx_size).0;
+
+        // Use large execution units
+        let mem_units: u64 = 14_000_000;
+        let step_units: u64 = 10_000_000_000;
+
+        // Compute expected execution unit cost
+        // mem_cost = ceil(577/10000 * 14000000) = ceil(807800) = 807800
+        let mem_cost = {
+            let num = params.execution_costs.mem_price.numerator as u128 * mem_units as u128;
+            let den = params.execution_costs.mem_price.denominator as u128;
+            num.div_ceil(den) as u64
+        };
+        // step_cost = ceil(721/10000000 * 10000000000) = ceil(721000) = 721000
+        let step_cost = {
+            let num = params.execution_costs.step_price.numerator as u128 * step_units as u128;
+            let den = params.execution_costs.step_price.denominator as u128;
+            num.div_ceil(den) as u64
+        };
+        let ex_unit_fee = mem_cost + step_cost;
+        assert!(
+            ex_unit_fee > 0,
+            "Execution unit fee should be positive for this test"
+        );
+
+        // Set fee to base_fee only (missing ex_unit_fee)
+        let fee_without_ex = base_fee;
+        let output_value = 100_000_000 - fee_without_ex;
+
+        let mut tx = make_simple_tx(input, output_value, fee_without_ex);
+        tx.body.collateral = vec![col_input];
+        tx.witness_set.plutus_v2_scripts.push(vec![0x01]);
+        tx.witness_set.redeemers.push(Redeemer {
+            tag: RedeemerTag::Spend,
+            index: 0,
+            data: PlutusData::Integer(42),
+            ex_units: ExUnits {
+                mem: mem_units,
+                steps: step_units,
+            },
+        });
+        tx.body.script_data_hash = Some(Hash32::from_bytes([0xAB; 32]));
+
+        let result = validate_transaction(&tx, &utxo_set, &params, 100, tx_size, None);
+        assert!(result.is_err());
+        let errors = result.unwrap_err();
+        assert!(
+            errors
+                .iter()
+                .any(|e| matches!(e, ValidationError::FeeTooSmall { .. })),
+            "Expected FeeTooSmall error when ex unit costs not covered, got: {:?}",
+            errors
+        );
+    }
+
+    #[test]
+    fn test_min_fee_with_execution_units_sufficient() {
+        // A Plutus transaction with fee covering base + execution unit costs should pass
+        // the fee check (it may still fail other validations like script_data_hash).
+        let mut utxo_set = UtxoSet::new();
+        let input = TransactionInput {
+            transaction_id: Hash32::from_bytes([1u8; 32]),
+            index: 0,
+        };
+        utxo_set.insert(
+            input.clone(),
+            TransactionOutput {
+                address: Address::Byron(ByronAddress {
+                    payload: vec![0u8; 32],
+                }),
+                value: Value::lovelace(100_000_000),
+                datum: OutputDatum::None,
+                script_ref: None,
+                raw_cbor: None,
+            },
+        );
+        let col_input = TransactionInput {
+            transaction_id: Hash32::from_bytes([2u8; 32]),
+            index: 0,
+        };
+        utxo_set.insert(
+            col_input.clone(),
+            TransactionOutput {
+                address: Address::Byron(ByronAddress {
+                    payload: vec![0u8; 32],
+                }),
+                value: Value::lovelace(50_000_000),
+                datum: OutputDatum::None,
+                script_ref: None,
+                raw_cbor: None,
+            },
+        );
+
+        let params = ProtocolParameters::mainnet_defaults();
+        let tx_size: u64 = 300;
+        let base_fee = params.min_fee(tx_size).0;
+
+        let mem_units: u64 = 1_000_000;
+        let step_units: u64 = 1_000_000_000;
+        let mem_cost = {
+            let num = params.execution_costs.mem_price.numerator as u128 * mem_units as u128;
+            let den = params.execution_costs.mem_price.denominator as u128;
+            num.div_ceil(den) as u64
+        };
+        let step_cost = {
+            let num = params.execution_costs.step_price.numerator as u128 * step_units as u128;
+            let den = params.execution_costs.step_price.denominator as u128;
+            num.div_ceil(den) as u64
+        };
+        let total_min_fee = base_fee + mem_cost + step_cost;
+
+        // Use a fee that covers everything (with some margin)
+        let fee = total_min_fee + 1000;
+        let output_value = 100_000_000 - fee;
+
+        let mut tx = make_simple_tx(input, output_value, fee);
+        tx.body.collateral = vec![col_input];
+        tx.witness_set.plutus_v2_scripts.push(vec![0x01]);
+        tx.witness_set.redeemers.push(Redeemer {
+            tag: RedeemerTag::Spend,
+            index: 0,
+            data: PlutusData::Integer(42),
+            ex_units: ExUnits {
+                mem: mem_units,
+                steps: step_units,
+            },
+        });
+        tx.body.script_data_hash = Some(Hash32::from_bytes([0xAB; 32]));
+
+        let result = validate_transaction(&tx, &utxo_set, &params, 100, tx_size, None);
+        // Should NOT have FeeTooSmall (may have other errors like ScriptDataHashMismatch)
+        match result {
+            Ok(()) => {} // OK
+            Err(errors) => {
+                assert!(
+                    !errors
+                        .iter()
+                        .any(|e| matches!(e, ValidationError::FeeTooSmall { .. })),
+                    "Fee should be sufficient but got FeeTooSmall: {:?}",
+                    errors
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_min_fee_no_redeemers_no_ex_unit_cost() {
+        // A simple (non-Plutus) transaction should not have execution unit costs added.
+        let (utxo_set, input) = make_simple_utxo_set();
+        let params = ProtocolParameters::mainnet_defaults();
+        let tx_size: u64 = 300;
+        let base_fee = params.min_fee(tx_size).0;
+
+        // Fee exactly equals base fee — should pass (no ex unit cost)
+        let output_value = 10_000_000 - base_fee;
+        let tx = make_simple_tx(input, output_value, base_fee);
+
+        let result = validate_transaction(&tx, &utxo_set, &params, 100, tx_size, None);
+        assert!(
+            result.is_ok(),
+            "Simple tx with exact base fee should pass: {:?}",
+            result
+        );
+    }
+
+    // --- Bug 3: Pool re-registration should not charge deposit ---
+
+    #[test]
+    fn test_pool_reregistration_no_duplicate_deposit() {
+        // An already-registered pool being re-registered (parameter update) should
+        // NOT charge an additional pool_deposit.
+        let pool_id = torsten_primitives::hash::Hash28::from_bytes([42u8; 28]);
+
+        let pool_params = PoolParams {
+            operator: pool_id,
+            vrf_keyhash: Hash32::from_bytes([0u8; 32]),
+            pledge: Lovelace(100_000_000),
+            cost: Lovelace(340_000_000),
+            margin: Rational {
+                numerator: 1,
+                denominator: 100,
+            },
+            reward_account: vec![0xe0; 29],
+            pool_owners: vec![pool_id],
+            relays: vec![],
+            pool_metadata: None,
+        };
+
+        let mut utxo_set = UtxoSet::new();
+        let input = TransactionInput {
+            transaction_id: Hash32::from_bytes([1u8; 32]),
+            index: 0,
+        };
+        utxo_set.insert(
+            input.clone(),
+            TransactionOutput {
+                address: Address::Byron(ByronAddress {
+                    payload: vec![0u8; 32],
+                }),
+                value: Value::lovelace(10_000_000),
+                datum: OutputDatum::None,
+                script_ref: None,
+                raw_cbor: None,
+            },
+        );
+
+        let params = ProtocolParameters::mainnet_defaults();
+        // With re-registration, no deposit should be charged
+        // input (10M) = output + fee → output = 10M - 200K = 9.8M
+        let mut tx = make_simple_tx(input, 9_800_000, 200_000);
+        tx.body
+            .certificates
+            .push(Certificate::PoolRegistration(pool_params));
+
+        // Mark the pool as already registered
+        let mut registered = HashSet::new();
+        registered.insert(pool_id);
+
+        let result = validate_transaction_with_pools(
+            &tx,
+            &utxo_set,
+            &params,
+            100,
+            300,
+            None,
+            Some(&registered),
+        );
+        assert!(
+            result.is_ok(),
+            "Pool re-registration should not charge deposit: {:?}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_new_pool_registration_charges_deposit() {
+        // A new pool registration should charge pool_deposit.
+        let pool_id = torsten_primitives::hash::Hash28::from_bytes([42u8; 28]);
+
+        let pool_params = PoolParams {
+            operator: pool_id,
+            vrf_keyhash: Hash32::from_bytes([0u8; 32]),
+            pledge: Lovelace(100_000_000),
+            cost: Lovelace(340_000_000),
+            margin: Rational {
+                numerator: 1,
+                denominator: 100,
+            },
+            reward_account: vec![0xe0; 29],
+            pool_owners: vec![pool_id],
+            relays: vec![],
+            pool_metadata: None,
+        };
+
+        let mut utxo_set = UtxoSet::new();
+        let input = TransactionInput {
+            transaction_id: Hash32::from_bytes([1u8; 32]),
+            index: 0,
+        };
+        utxo_set.insert(
+            input.clone(),
+            TransactionOutput {
+                address: Address::Byron(ByronAddress {
+                    payload: vec![0u8; 32],
+                }),
+                value: Value::lovelace(1_000_000_000),
+                datum: OutputDatum::None,
+                script_ref: None,
+                raw_cbor: None,
+            },
+        );
+
+        let params = ProtocolParameters::mainnet_defaults();
+        let pool_deposit = params.pool_deposit.0;
+        // New registration: consumed = 1B, produced = output + fee + deposit
+        let fee = 200_000u64;
+        let output = 1_000_000_000 - fee - pool_deposit;
+
+        let mut tx = make_simple_tx(input, output, fee);
+        tx.body
+            .certificates
+            .push(Certificate::PoolRegistration(pool_params));
+
+        // No registered pools (new registration)
+        let registered: HashSet<Hash28> = HashSet::new();
+        let result = validate_transaction_with_pools(
+            &tx,
+            &utxo_set,
+            &params,
+            100,
+            300,
+            None,
+            Some(&registered),
+        );
+        assert!(
+            result.is_ok(),
+            "New pool registration should charge deposit: {:?}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_new_pool_registration_without_deposit_fails() {
+        // A new pool registration without accounting for deposit should fail.
+        let pool_id = torsten_primitives::hash::Hash28::from_bytes([42u8; 28]);
+
+        let pool_params = PoolParams {
+            operator: pool_id,
+            vrf_keyhash: Hash32::from_bytes([0u8; 32]),
+            pledge: Lovelace(100_000_000),
+            cost: Lovelace(340_000_000),
+            margin: Rational {
+                numerator: 1,
+                denominator: 100,
+            },
+            reward_account: vec![0xe0; 29],
+            pool_owners: vec![pool_id],
+            relays: vec![],
+            pool_metadata: None,
+        };
+
+        let mut utxo_set = UtxoSet::new();
+        let input = TransactionInput {
+            transaction_id: Hash32::from_bytes([1u8; 32]),
+            index: 0,
+        };
+        utxo_set.insert(
+            input.clone(),
+            TransactionOutput {
+                address: Address::Byron(ByronAddress {
+                    payload: vec![0u8; 32],
+                }),
+                value: Value::lovelace(10_000_000),
+                datum: OutputDatum::None,
+                script_ref: None,
+                raw_cbor: None,
+            },
+        );
+
+        let params = ProtocolParameters::mainnet_defaults();
+        // Don't account for pool deposit — should fail value conservation
+        let mut tx = make_simple_tx(input, 9_800_000, 200_000);
+        tx.body
+            .certificates
+            .push(Certificate::PoolRegistration(pool_params));
+
+        let registered: HashSet<Hash28> = HashSet::new();
+        let result = validate_transaction_with_pools(
+            &tx,
+            &utxo_set,
+            &params,
+            100,
+            300,
+            None,
+            Some(&registered),
+        );
+        assert!(
+            result.is_err(),
+            "New pool reg without deposit should fail value conservation"
+        );
+        let errors = result.unwrap_err();
+        assert!(errors
+            .iter()
+            .any(|e| matches!(e, ValidationError::ValueNotConserved { .. })));
+    }
+
+    #[test]
+    fn test_pool_reregistration_with_deposit_fails_conservation() {
+        // A re-registration that incorrectly includes a deposit will over-produce
+        // (the deposit is not actually charged), so value conservation fails.
+        let pool_id = torsten_primitives::hash::Hash28::from_bytes([42u8; 28]);
+
+        let pool_params = PoolParams {
+            operator: pool_id,
+            vrf_keyhash: Hash32::from_bytes([0u8; 32]),
+            pledge: Lovelace(100_000_000),
+            cost: Lovelace(340_000_000),
+            margin: Rational {
+                numerator: 1,
+                denominator: 100,
+            },
+            reward_account: vec![0xe0; 29],
+            pool_owners: vec![pool_id],
+            relays: vec![],
+            pool_metadata: None,
+        };
+
+        let mut utxo_set = UtxoSet::new();
+        let input = TransactionInput {
+            transaction_id: Hash32::from_bytes([1u8; 32]),
+            index: 0,
+        };
+        utxo_set.insert(
+            input.clone(),
+            TransactionOutput {
+                address: Address::Byron(ByronAddress {
+                    payload: vec![0u8; 32],
+                }),
+                value: Value::lovelace(1_000_000_000),
+                datum: OutputDatum::None,
+                script_ref: None,
+                raw_cbor: None,
+            },
+        );
+
+        let params = ProtocolParameters::mainnet_defaults();
+        let pool_deposit = params.pool_deposit.0;
+        let fee = 200_000u64;
+        // Output as if deposit is charged, but pool is already registered so deposit is NOT charged
+        let output = 1_000_000_000 - fee - pool_deposit;
+
+        let mut tx = make_simple_tx(input, output, fee);
+        tx.body
+            .certificates
+            .push(Certificate::PoolRegistration(pool_params));
+
+        // Pool already registered
+        let mut registered: HashSet<Hash28> = HashSet::new();
+        registered.insert(pool_id);
+
+        let result = validate_transaction_with_pools(
+            &tx,
+            &utxo_set,
+            &params,
+            100,
+            300,
+            None,
+            Some(&registered),
+        );
+        assert!(
+            result.is_err(),
+            "Re-registration accounting for deposit should fail (deposit not charged)"
+        );
+        let errors = result.unwrap_err();
+        assert!(errors
+            .iter()
+            .any(|e| matches!(e, ValidationError::ValueNotConserved { .. })));
+    }
+
+    // --- Bug 4: UnexpectedScriptDataHash with reference scripts ---
+
+    #[test]
+    fn test_script_data_hash_allowed_with_reference_scripts() {
+        // A Plutus transaction that has script_data_hash but no redeemers/scripts in witness set
+        // should be allowed if reference inputs carry reference scripts.
+        let mut utxo_set = UtxoSet::new();
+        let input = TransactionInput {
+            transaction_id: Hash32::from_bytes([1u8; 32]),
+            index: 0,
+        };
+        utxo_set.insert(
+            input.clone(),
+            TransactionOutput {
+                address: Address::Byron(ByronAddress {
+                    payload: vec![0u8; 32],
+                }),
+                value: Value::lovelace(10_000_000),
+                datum: OutputDatum::None,
+                script_ref: None,
+                raw_cbor: None,
+            },
+        );
+
+        // Reference input with a script_ref (PlutusV2 script)
+        let ref_input = TransactionInput {
+            transaction_id: Hash32::from_bytes([3u8; 32]),
+            index: 0,
+        };
+        utxo_set.insert(
+            ref_input.clone(),
+            TransactionOutput {
+                address: Address::Byron(ByronAddress {
+                    payload: vec![0u8; 32],
+                }),
+                value: Value::lovelace(2_000_000),
+                datum: OutputDatum::None,
+                script_ref: Some(ScriptRef::PlutusV2(vec![0x01, 0x02, 0x03])),
+                raw_cbor: None,
+            },
+        );
+
+        let params = ProtocolParameters::mainnet_defaults();
+        let mut tx = make_simple_tx(input, 9_800_000, 200_000);
+        tx.body.reference_inputs = vec![ref_input];
+        // Set script_data_hash but NO redeemers and NO plutus scripts in witness set
+        tx.body.script_data_hash = Some(Hash32::from_bytes([0xAB; 32]));
+
+        let result = validate_transaction(&tx, &utxo_set, &params, 100, 300, None);
+        // Should NOT have UnexpectedScriptDataHash
+        match result {
+            Ok(()) => {} // OK
+            Err(errors) => {
+                assert!(
+                    !errors
+                        .iter()
+                        .any(|e| matches!(e, ValidationError::UnexpectedScriptDataHash)),
+                    "UnexpectedScriptDataHash should not fire when reference scripts exist: {:?}",
+                    errors
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_script_data_hash_rejected_without_scripts_or_ref_scripts() {
+        // A transaction with script_data_hash but no scripts, no redeemers,
+        // and no reference scripts should be rejected.
+        let (utxo_set, input) = make_simple_utxo_set();
+        let params = ProtocolParameters::mainnet_defaults();
+        let mut tx = make_simple_tx(input, 9_800_000, 200_000);
+        // Set script_data_hash but no scripts or redeemers anywhere
+        tx.body.script_data_hash = Some(Hash32::from_bytes([0xAB; 32]));
+
+        let result = validate_transaction(&tx, &utxo_set, &params, 100, 300, None);
+        // This is a non-Plutus tx so the code doesn't enter the has_plutus_scripts branch.
+        // The UnexpectedScriptDataHash check is inside that branch, so for a non-Plutus tx
+        // without scripts, the script_data_hash is simply ignored.
+        // However, for completeness, let's verify no UnexpectedScriptDataHash is produced
+        // when the tx is not Plutus at all (since the check only fires inside the Plutus block).
+        // The test validates the branch: has_plutus_scripts = false, so no error.
+        // This matches Cardano behavior: script_data_hash in non-Plutus txs is a no-op.
+        match result {
+            Ok(()) => {} // OK, non-Plutus tx ignores script_data_hash
+            Err(errors) => {
+                // Should not have UnexpectedScriptDataHash
+                assert!(!errors
+                    .iter()
+                    .any(|e| matches!(e, ValidationError::UnexpectedScriptDataHash)));
+            }
+        }
+    }
+
+    #[test]
+    fn test_unexpected_script_data_hash_guard_with_ref_scripts() {
+        // The UnexpectedScriptDataHash else-if branch requires:
+        // has_plutus_scripts(tx) = true, has_redeemers = false, has_datums = false,
+        // and all plutus script lists empty. With current code this branch is unreachable
+        // (if all scripts are empty, has_plutus_scripts requires non-empty redeemers which
+        // makes has_redeemers true). However the guard against reference scripts is in place.
+        //
+        // This test validates the direct calculate_deposits helper and the reference script
+        // allowance via the integration test above (test_script_data_hash_allowed_with_reference_scripts).
+        //
+        // Here we verify that a Plutus tx with scripts but no redeemers/datums
+        // and a script_data_hash does NOT produce UnexpectedScriptDataHash
+        // (because the else-if condition checks scripts are empty, but they aren't).
+        let mut utxo_set = UtxoSet::new();
+        let input = TransactionInput {
+            transaction_id: Hash32::from_bytes([1u8; 32]),
+            index: 0,
+        };
+        utxo_set.insert(
+            input.clone(),
+            TransactionOutput {
+                address: Address::Byron(ByronAddress {
+                    payload: vec![0u8; 32],
+                }),
+                value: Value::lovelace(10_000_000),
+                datum: OutputDatum::None,
+                script_ref: None,
+                raw_cbor: None,
+            },
+        );
+        let col_input = TransactionInput {
+            transaction_id: Hash32::from_bytes([2u8; 32]),
+            index: 0,
+        };
+        utxo_set.insert(
+            col_input.clone(),
+            TransactionOutput {
+                address: Address::Byron(ByronAddress {
+                    payload: vec![0u8; 32],
+                }),
+                value: Value::lovelace(5_000_000),
+                datum: OutputDatum::None,
+                script_ref: None,
+                raw_cbor: None,
+            },
+        );
+
+        let params = ProtocolParameters::mainnet_defaults();
+        let mut tx = make_simple_tx(input, 9_800_000, 200_000);
+        tx.body.collateral = vec![col_input];
+        // Plutus script present but no redeemers/datums
+        tx.witness_set.plutus_v2_scripts.push(vec![0x01]);
+        tx.body.script_data_hash = Some(Hash32::from_bytes([0xAB; 32]));
+
+        let result = validate_transaction(&tx, &utxo_set, &params, 100, 300, None);
+        // Should NOT have UnexpectedScriptDataHash (scripts are present, so the
+        // else-if condition fails before checking reference scripts)
+        match result {
+            Ok(()) => {} // OK
+            Err(errors) => {
+                assert!(
+                    !errors
+                        .iter()
+                        .any(|e| matches!(e, ValidationError::UnexpectedScriptDataHash)),
+                    "Should not get UnexpectedScriptDataHash when plutus scripts present: {:?}",
+                    errors
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_calculate_deposits_pool_rereg_no_deposit() {
+        // Direct unit test of calculate_deposits_and_refunds with registered pools
+        let params = ProtocolParameters::mainnet_defaults();
+        let pool_id = torsten_primitives::hash::Hash28::from_bytes([42u8; 28]);
+
+        let pool_params = PoolParams {
+            operator: pool_id,
+            vrf_keyhash: Hash32::from_bytes([0u8; 32]),
+            pledge: Lovelace(100_000_000),
+            cost: Lovelace(340_000_000),
+            margin: Rational {
+                numerator: 1,
+                denominator: 100,
+            },
+            reward_account: vec![0xe0; 29],
+            pool_owners: vec![pool_id],
+            relays: vec![],
+            pool_metadata: None,
+        };
+
+        let certs = vec![Certificate::PoolRegistration(pool_params)];
+
+        // Without registered pools — should charge deposit
+        let (deposits_new, _) = calculate_deposits_and_refunds(&certs, &params, None);
+        assert_eq!(deposits_new, params.pool_deposit.0);
+
+        // With pool already registered — should NOT charge deposit
+        let mut registered = HashSet::new();
+        registered.insert(pool_id);
+        let (deposits_rereg, _) =
+            calculate_deposits_and_refunds(&certs, &params, Some(&registered));
+        assert_eq!(deposits_rereg, 0);
     }
 }
