@@ -41,14 +41,25 @@ pub struct RollbackAnnouncement {
     pub tip_block_number: u64,
 }
 
+/// Typed representation of the current chain tip
+#[derive(Debug, Clone, Copy)]
+pub struct TipInfo {
+    /// Slot number of the tip block
+    pub slot: u64,
+    /// Header hash of the tip block
+    pub hash: [u8; 32],
+    /// Block number of the tip block
+    pub block_number: u64,
+}
+
 /// Callback trait for retrieving block data from storage
 pub trait BlockProvider: Send + Sync + 'static {
     /// Get raw CBOR block bytes by header hash
     fn get_block(&self, hash: &[u8; 32]) -> Option<Vec<u8>>;
     /// Check if a block exists
     fn has_block(&self, hash: &[u8; 32]) -> bool;
-    /// Get the current chain tip (slot, hash, block_number)
-    fn get_tip(&self) -> (u64, [u8; 32], u64);
+    /// Get the current chain tip
+    fn get_tip(&self) -> TipInfo;
     /// Get the next block after a given slot.
     /// Returns (slot, hash, cbor) of the first block with slot > after_slot.
     fn get_next_block_after_slot(&self, after_slot: u64) -> Option<(u64, [u8; 32], Vec<u8>)>;
@@ -812,11 +823,11 @@ async fn handle_n2n_chainsync(
     match msg_tag {
         // MsgRequestNext → check if there's a block beyond the peer's cursor
         0 => {
-            let (tip_slot, tip_hash, tip_block) = block_provider.get_tip();
+            let tip = block_provider.get_tip();
 
             // If no cursor set or cursor is at tip, await
             let cursor_slot = peer_state.chainsync_cursor_slot.unwrap_or(0);
-            if cursor_slot >= tip_slot {
+            if cursor_slot >= tip.slot {
                 // At tip — send MsgAwaitReply
                 let mut buf = Vec::new();
                 let mut enc = minicbor::Encoder::new(&mut buf);
@@ -842,8 +853,12 @@ async fn handle_n2n_chainsync(
                 peer_state.chainsync_cursor_hash = Some(next_hash);
 
                 // MsgRollForward: [2, [era_tag, tag(24) header_cbor], tip]
-                let buf =
-                    build_chainsync_roll_forward(&block_cbor, tip_slot, &tip_hash, tip_block)?;
+                let buf = build_chainsync_roll_forward(
+                    &block_cbor,
+                    tip.slot,
+                    &tip.hash,
+                    tip.block_number,
+                )?;
 
                 Ok(Some(Segment {
                     transmission_time: 0,
@@ -889,7 +904,7 @@ async fn handle_n2n_chainsync(
                 }
             }
 
-            let (tip_slot, tip_hash, tip_block) = block_provider.get_tip();
+            let tip = block_provider.get_tip();
             let mut buf = Vec::new();
             let mut enc = minicbor::Encoder::new(&mut buf);
 
@@ -907,14 +922,14 @@ async fn handle_n2n_chainsync(
                 // Intersection point
                 encode_point(&mut enc, int_slot, &int_hash)?;
                 // Tip
-                encode_tip(&mut enc, tip_slot, &tip_hash, tip_block)?;
+                encode_tip(&mut enc, tip.slot, &tip.hash, tip.block_number)?;
             } else {
                 // MsgIntersectNotFound: [6, tip]
                 enc.array(2)
                     .map_err(|e| N2NServerError::Protocol(e.to_string()))?;
                 enc.u32(6)
                     .map_err(|e| N2NServerError::Protocol(e.to_string()))?;
-                encode_tip(&mut enc, tip_slot, &tip_hash, tip_block)?;
+                encode_tip(&mut enc, tip.slot, &tip.hash, tip.block_number)?;
             }
 
             Ok(Some(Segment {
@@ -1625,8 +1640,12 @@ mod tests {
         fn has_block(&self, _hash: &[u8; 32]) -> bool {
             true
         }
-        fn get_tip(&self) -> (u64, [u8; 32], u64) {
-            (100, [0xAA; 32], 50)
+        fn get_tip(&self) -> TipInfo {
+            TipInfo {
+                slot: 100,
+                hash: [0xAA; 32],
+                block_number: 50,
+            }
         }
         fn get_next_block_after_slot(&self, after_slot: u64) -> Option<(u64, [u8; 32], Vec<u8>)> {
             if after_slot < 100 {
