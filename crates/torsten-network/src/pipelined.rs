@@ -48,10 +48,6 @@ pub struct PipelinedPeerClient {
     remote_addr: SocketAddr,
     /// Number of outstanding (sent but not yet received) pipelined requests.
     in_flight: usize,
-    /// True when the connection has stale in-flight requests that couldn't be
-    /// drained (e.g. after AwaitReply with many pending MsgRequestNext).
-    /// The caller should reconnect before using this client again.
-    stale: bool,
     /// TxSubmission2 channel (available for taking by a background tx fetcher)
     txsub_channel: Option<pallas_network::multiplexer::AgentChannel>,
     /// Byron epoch length in absolute slots (10 * k). Used for correct
@@ -119,7 +115,6 @@ impl PipelinedPeerClient {
             _peersharing_channel: peersharing_channel,
             remote_addr,
             in_flight: 0,
-            stale: false,
             txsub_channel: Some(txsub_channel),
             byron_epoch_length: 0,
         })
@@ -253,11 +248,9 @@ impl PipelinedPeerClient {
                 }
                 Message::AwaitReply => {
                     // Server is at tip, no more blocks available right now.
-                    // Drain remaining in-flight (they'll also be AwaitReply or
-                    // actual responses if blocks arrived while we were reading).
                     // After AwaitReply, the server enters MustReply state and
                     // will send RollForward/RollBackward when a block arrives.
-                    // We need to wait for that response.
+                    // We wait for that response — the connection stays open.
                     let wait_response: Message<HeaderContent> =
                         self.cs_buf
                             .recv_full_msg()
@@ -274,11 +267,14 @@ impl PipelinedPeerClient {
                             {
                                 headers.push(info);
                             }
-                            // Drain remaining in-flight
-                            self.drain_in_flight().await;
+                            // Do NOT drain remaining in-flight. The server will
+                            // respond to them one-by-one as new blocks arrive.
+                            // Subsequent calls with reduced depth will read from
+                            // the existing in-flight pipeline without sending new
+                            // requests (matching Haskell's transition from pipelined
+                            // to non-pipelined mode at tip).
                         }
                         Message::RollBackward(point, tip) => {
-                            self.drain_in_flight().await;
                             let torsten_tip = pallas_to_torsten_tip(&tip);
                             if !headers.is_empty() {
                                 return Ok(HeaderBatchResult::HeadersAndRollback {
@@ -299,7 +295,12 @@ impl PipelinedPeerClient {
                     if headers.is_empty() {
                         return Ok(HeaderBatchResult::Await);
                     }
-                    break;
+                    // We have headers AND the server sent AwaitReply — signal
+                    // the caller that we've caught up to the tip.
+                    let tip = latest_tip.ok_or_else(|| {
+                        ClientError::ChainSync("got headers at tip but no tip".into())
+                    })?;
+                    return Ok(HeaderBatchResult::HeadersAtTip(headers, tip));
                 }
                 _ => {
                     return Err(ClientError::ChainSync(format!(
@@ -327,43 +328,6 @@ impl PipelinedPeerClient {
         Ok(())
     }
 
-    /// Drain in-flight responses with a timeout.
-    ///
-    /// After AwaitReply, each remaining in-flight MsgRequestNext requires a new
-    /// block to be produced (~20s each). With 150 in-flight, this would block
-    /// for ~50 minutes. Instead, drain what we can within a short timeout and
-    /// mark the client as stale so the caller can reconnect.
-    async fn drain_in_flight(&mut self) {
-        let deadline = tokio::time::Instant::now() + Duration::from_millis(500);
-        while self.in_flight > 0 {
-            match tokio::time::timeout_at(
-                deadline,
-                self.cs_buf.recv_full_msg::<Message<HeaderContent>>(),
-            )
-            .await
-            {
-                Ok(Ok(_)) => {
-                    self.in_flight -= 1;
-                }
-                Ok(Err(e)) => {
-                    debug!("drain in-flight error (expected): {e}");
-                    self.in_flight = 0;
-                    break;
-                }
-                Err(_) => {
-                    // Timeout — remaining in-flight would block for too long
-                    debug!(
-                        remaining = self.in_flight,
-                        "drain in-flight timeout, marking client stale"
-                    );
-                    self.in_flight = 0;
-                    self.stale = true;
-                    break;
-                }
-            }
-        }
-    }
-
     /// Access the blockfetch client for fetching full blocks.
     pub fn blockfetch(&mut self) -> &mut pallas_network::miniprotocols::blockfetch::Client {
         &mut self.bf_client
@@ -372,12 +336,6 @@ impl PipelinedPeerClient {
     /// Remote address of this connection.
     pub fn remote_addr(&self) -> SocketAddr {
         self.remote_addr
-    }
-
-    /// Whether the connection has stale in-flight requests and should be
-    /// reconnected before further use.
-    pub fn is_stale(&self) -> bool {
-        self.stale
     }
 
     /// Set the Byron epoch length for correct slot computation on non-mainnet

@@ -1756,7 +1756,14 @@ impl Node {
         let result = tokio::task::spawn_blocking(move || {
             let start = std::time::Instant::now();
             let mut replayed = 0u64;
+            let mut skipped = 0u64;
             let mut last_log = std::time::Instant::now();
+
+            // Get ledger tip slot so we can skip blocks already applied.
+            let ledger_tip_slot = {
+                let ls = ledger_state.blocking_read();
+                ls.tip.point.slot().map(|s| s.0).unwrap_or(0)
+            };
 
             // Disable address index and full stake rebuild during replay.
             // Address index is never queried during replay, and the O(n)
@@ -1773,6 +1780,12 @@ impl Node {
                     cbor, bel,
                 ) {
                     Ok(block) => {
+                        // Skip blocks at or before the ledger snapshot position
+                        if block.slot().0 <= ledger_tip_slot {
+                            skipped += 1;
+                            return Ok(());
+                        }
+
                         let mut ls_guard = ledger_state.blocking_write();
                         if let Err(e) = ls_guard.apply_block(&block) {
                             warn!(slot = block.slot().0, "Ledger replay apply failed: {e}");
@@ -1808,12 +1821,14 @@ impl Node {
                 Ok(total) => {
                     let elapsed = start.elapsed().as_secs_f64();
                     let speed = if elapsed > 0.0 {
-                        *total as f64 / elapsed
+                        replayed as f64 / elapsed
                     } else {
                         0.0
                     };
                     info!(
                         total,
+                        skipped,
+                        replayed,
                         elapsed_secs = elapsed as u64,
                         speed = speed as u64,
                         "Chunk-file replay complete"
@@ -2178,6 +2193,46 @@ impl Node {
                                 break;
                             }
                         }
+                        Ok(HeaderBatchResult::HeadersAtTip(headers, tip)) => {
+                            // We got headers AND caught up to tip. Fetch the
+                            // blocks, send the batch, then signal AtTip.
+                            if !headers.is_empty() {
+                                debug!(
+                                    header_count = headers.len(),
+                                    first_slot = headers[0].slot,
+                                    last_slot = headers.last().expect("non-empty").slot,
+                                    "Pipeline: headers at tip"
+                                );
+                                let fetch_start = std::time::Instant::now();
+                                let header_count = headers.len() as u64;
+                                match fetch_pool.fetch_blocks_concurrent(&headers).await {
+                                    Ok(blocks) => {
+                                        let fetch_ms = fetch_start.elapsed().as_secs_f64() * 1000.0;
+                                        if block_tx
+                                            .send(PipelineMsg::Batch {
+                                                blocks,
+                                                tip,
+                                                fetch_ms,
+                                                header_count,
+                                            })
+                                            .await
+                                            .is_err()
+                                        {
+                                            break;
+                                        }
+                                    }
+                                    Err(e) => {
+                                        let _ = block_tx
+                                            .send(PipelineMsg::FetchError(format!("{e}")))
+                                            .await;
+                                        break;
+                                    }
+                                }
+                            }
+                            if block_tx.send(PipelineMsg::AtTip).await.is_err() {
+                                break;
+                            }
+                        }
                         Ok(HeaderBatchResult::Await) => {
                             // Depth reduction is signaled by the main loop via
                             // the watch channel when it processes AtTip.
@@ -2191,11 +2246,8 @@ impl Node {
                         }
                     }
 
-                    // Exit if pipelined client became stale (in-flight requests
-                    // that would block for minutes waiting for new blocks)
-                    if pc.is_stale() {
-                        break;
-                    }
+                    // Connection stays open at tip — remaining in-flight
+                    // requests drain naturally as new blocks arrive.
                 }
             });
 
@@ -2364,6 +2416,30 @@ impl Node {
                                             warn!("Rollback to {point}");
                                             self.handle_rollback(&point).await;
                                         }
+                                        HeaderBatchResult::HeadersAtTip(headers, tip) => {
+                                            // Got headers AND caught up to tip
+                                            if !headers.is_empty() {
+                                                let blocks_result = if fetch_pool.is_empty() {
+                                                    client.fetch_blocks_by_points(&headers).await
+                                                } else {
+                                                    match fetch_pool.fetch_blocks_concurrent(&headers).await {
+                                                        Ok(blocks) => Ok(blocks),
+                                                        Err(e) => {
+                                                            warn!("Pool fetch failed, falling back to primary peer: {e}");
+                                                            client.fetch_blocks_by_points(&headers).await
+                                                        }
+                                                    }
+                                                };
+                                                if let Ok(blocks) = blocks_result {
+                                                    self.process_forward_blocks(blocks, &tip, &mut blocks_received, &mut blocks_since_last_log, &mut last_snapshot_epoch, &mut last_log_time, &mut last_query_update).await;
+                                                }
+                                            }
+                                            info!(blocks_received, "Caught up to chain tip, awaiting new blocks");
+                                            self.enable_strict_verification().await;
+                                            self.update_query_state().await;
+                                            self.try_forge_block().await;
+                                            pipeline_depth = 1;
+                                        }
                                         HeaderBatchResult::Await => {
                                             info!(blocks_received, "Caught up to chain tip, awaiting new blocks");
                                             self.enable_strict_verification().await;
@@ -2372,29 +2448,8 @@ impl Node {
                                             pipeline_depth = 1;
                                         }
                                     }
-                                    if pipelined.as_ref().is_some_and(|pc| pc.is_stale()) {
-                                        pipeline_depth = 1;
-                                        self.enable_strict_verification().await;
-                                        let old = pipelined.take().expect("pipelined is Some (is_some_and guard)");
-                                        let addr = old.remote_addr();
-                                        old.abort().await;
-                                        match PipelinedPeerClient::connect(&addr.to_string() as &str, self.network_magic).await {
-                                            Ok(mut new_pc) => {
-                                                let tip = self.ledger_state.read().await.tip.point.clone();
-                                                let mut pts = Vec::new();
-                                                if tip != Point::Origin { pts.push(tip); }
-                                                pts.push(Point::Origin);
-                                                match new_pc.find_intersect(pts).await {
-                                                    Ok(_) => {
-                                                        info!("Reconnected pipelined client after tip sync");
-                                                        pipelined = Some(new_pc);
-                                                    }
-                                                    Err(e) => warn!("Pipelined reconnect intersect failed: {e}"),
-                                                }
-                                            }
-                                            Err(e) => warn!("Pipelined reconnect failed: {e}"),
-                                        }
-                                    }
+                                    // Connection stays open at tip — remaining in-flight
+                                    // requests drain naturally as new blocks arrive.
                                 }
                                 Err(e) => { error!("Chain sync error: {e}"); break; }
                             }

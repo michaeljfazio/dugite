@@ -586,8 +586,12 @@ pub enum HeaderBatchResult {
         rollback_point: Point,
         rollback_tip: Tip,
     },
-    /// Caught up to tip
+    /// Caught up to tip (no headers available)
     Await,
+    /// Got headers AND caught up to tip (server sent MsgAwaitReply after
+    /// delivering these headers). The caller should process the headers
+    /// then switch to tip-following mode.
+    HeadersAtTip(Vec<HeaderInfo>, Tip),
 }
 
 /// A pool of peer connections for concurrent block fetching.
