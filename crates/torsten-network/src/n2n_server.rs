@@ -12,7 +12,7 @@ use crate::miniprotocols::peersharing::{self, PeerAddress, PeerSharingMessage};
 use crate::multiplexer::Segment;
 use crate::peer_manager::PeerManager;
 use crate::query_handler::QueryHandler;
-use torsten_mempool::Mempool;
+use torsten_primitives::mempool::MempoolProvider;
 
 /// Notification sent when a new block is forged and should be announced to peers
 #[derive(Debug, Clone)]
@@ -202,7 +202,7 @@ pub struct N2NServer {
     /// Peer manager for sharing peers via PeerSharing protocol
     peer_manager: Option<Arc<RwLock<PeerManager>>>,
     /// Optional mempool for TxSubmission2 protocol
-    mempool: Option<Arc<Mempool>>,
+    mempool: Option<Arc<dyn MempoolProvider>>,
     /// Broadcast channel for block announcements to connected peers
     block_announcement_tx: broadcast::Sender<BlockAnnouncement>,
     /// Broadcast channel for rollback notifications to connected peers
@@ -262,7 +262,7 @@ impl N2NServer {
     }
 
     /// Set the mempool for TxSubmission2 protocol support
-    pub fn set_mempool(&mut self, mempool: Arc<Mempool>) {
+    pub fn set_mempool(&mut self, mempool: Arc<dyn MempoolProvider>) {
         self.mempool = Some(mempool);
     }
 
@@ -434,7 +434,7 @@ async fn handle_n2n_connection(
     initiator_and_responder: bool,
     peer_sharing_mode: PeerSharingMode,
     peer_manager: Option<Arc<RwLock<PeerManager>>>,
-    mempool: Option<Arc<Mempool>>,
+    mempool: Option<Arc<dyn MempoolProvider>>,
     mut announcement_rx: broadcast::Receiver<BlockAnnouncement>,
     mut rollback_rx: broadcast::Receiver<RollbackAnnouncement>,
 ) -> Result<(), N2NServerError> {
@@ -601,7 +601,7 @@ async fn process_n2n_segment(
     peer_sharing_mode: PeerSharingMode,
     peer_state: &mut PeerState,
     peer_manager: &Option<Arc<RwLock<PeerManager>>>,
-    mempool: &Option<Arc<Mempool>>,
+    mempool: &Option<Arc<dyn MempoolProvider>>,
 ) -> Result<Vec<Segment>, N2NServerError> {
     match segment.protocol_id {
         MINI_PROTOCOL_HANDSHAKE => {
@@ -1270,7 +1270,7 @@ fn handle_keepalive(payload: &[u8]) -> Result<Option<Segment>, N2NServerError> {
 fn handle_n2n_txsubmission(
     payload: &[u8],
     peer_state: &mut PeerState,
-    mempool: &Option<Arc<Mempool>>,
+    mempool: &Option<Arc<dyn MempoolProvider>>,
 ) -> Result<Option<Segment>, N2NServerError> {
     let mut decoder = minicbor::Decoder::new(payload);
     let _arr_len = decoder
@@ -1792,7 +1792,7 @@ mod tests {
         enc.array(1).unwrap();
         enc.u32(6).unwrap();
 
-        let no_mempool: Option<Arc<Mempool>> = None;
+        let no_mempool: Option<Arc<dyn MempoolProvider>> = None;
         let result = handle_n2n_txsubmission(&buf, &mut peer_state, &no_mempool).unwrap();
         assert!(result.is_some());
         let seg = result.unwrap();
@@ -1821,7 +1821,7 @@ mod tests {
         enc.u32(0).unwrap();
         enc.u32(1).unwrap();
 
-        let no_mempool: Option<Arc<Mempool>> = None;
+        let no_mempool: Option<Arc<dyn MempoolProvider>> = None;
         let result = handle_n2n_txsubmission(&buf, &mut peer_state, &no_mempool).unwrap();
         assert!(result.is_some());
         let seg = result.unwrap();
@@ -1852,7 +1852,7 @@ mod tests {
         enc.u32(1).unwrap(); // ack 1
         enc.u32(1).unwrap(); // request 1
 
-        let no_mempool: Option<Arc<Mempool>> = None;
+        let no_mempool: Option<Arc<dyn MempoolProvider>> = None;
         let _result = handle_n2n_txsubmission(&buf, &mut peer_state, &no_mempool).unwrap();
 
         // Should have removed one from inflight

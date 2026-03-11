@@ -1,7 +1,7 @@
 use std::sync::Arc;
 use tokio::sync::RwLock;
-use torsten_mempool::Mempool;
 use torsten_primitives::hash::Hash32;
+use torsten_primitives::mempool::MempoolProvider;
 use tracing::{debug, warn};
 
 use crate::multiplexer::Segment;
@@ -42,7 +42,7 @@ pub(crate) struct TxMonitorCursor {
 ///  10: MsgReplyGetSizes [10, [capacity, size, num_txs]]
 pub(crate) async fn handle_tx_monitor(
     payload: &[u8],
-    mempool: &Arc<Mempool>,
+    mempool: &Arc<dyn MempoolProvider>,
     query_handler: &Arc<RwLock<QueryHandler>>,
     cursor: &mut TxMonitorCursor,
 ) -> Result<Option<Segment>, N2CServerError> {

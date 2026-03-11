@@ -1,5 +1,5 @@
 use std::sync::Arc;
-use torsten_mempool::Mempool;
+use torsten_primitives::mempool::{MempoolAddResult, MempoolProvider};
 use tracing::{debug, info, warn};
 
 use crate::multiplexer::Segment;
@@ -19,7 +19,7 @@ use super::{N2CServerError, TxValidator, MINI_PROTOCOL_TX_SUBMISSION};
 ///   3: MsgDone     [3]
 pub(crate) fn handle_tx_submission(
     payload: &[u8],
-    mempool: &Arc<Mempool>,
+    mempool: &Arc<dyn MempoolProvider>,
     tx_validator: &Option<Arc<dyn TxValidator>>,
 ) -> Result<Option<Segment>, N2CServerError> {
     let mut decoder = minicbor::Decoder::new(payload);
@@ -65,11 +65,11 @@ pub(crate) fn handle_tx_submission(
                             let tx_hash = tx.hash;
 
                             match mempool.add_tx(tx_hash, tx, tx_size) {
-                                Ok(torsten_mempool::MempoolAddResult::Added) => {
+                                Ok(MempoolAddResult::Added) => {
                                     info!("Transaction accepted into mempool: {tx_hash}");
                                     encode_tx_accept()
                                 }
-                                Ok(torsten_mempool::MempoolAddResult::AlreadyExists) => {
+                                Ok(MempoolAddResult::AlreadyExists) => {
                                     debug!("Transaction already in mempool: {tx_hash}");
                                     encode_tx_accept()
                                 }
