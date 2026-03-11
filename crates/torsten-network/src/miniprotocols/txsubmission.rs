@@ -17,7 +17,7 @@ use tokio::time::{timeout, Duration};
 use torsten_primitives::hash::{Hash32, TransactionHash};
 use tracing::{debug, info, trace};
 
-use crate::n2c_server::TxValidator;
+use crate::n2c::TxValidator;
 use torsten_primitives::mempool::{MempoolAddResult, MempoolProvider};
 
 /// Maximum number of tx IDs to request per batch
