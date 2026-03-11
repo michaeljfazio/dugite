@@ -704,13 +704,14 @@ async fn handle_local_chainsync(
                 if cursor.has_intersection {
                     // Check for rollback: if client cursor is ahead of the chain tip,
                     // a rollback has occurred and we need to notify the client
-                    let (tip_slot, tip_hash, tip_block_no) = provider.get_tip();
-                    if cursor.cursor_slot > tip_slot {
+                    let tip = provider.get_tip();
+                    if cursor.cursor_slot > tip.slot {
                         debug!(
                             cursor_slot = cursor.cursor_slot,
-                            tip_slot, "LocalChainSync: MsgRollBackward (chain rolled back)"
+                            tip_slot = tip.slot,
+                            "LocalChainSync: MsgRollBackward (chain rolled back)"
                         );
-                        cursor.cursor_slot = tip_slot;
+                        cursor.cursor_slot = tip.slot;
 
                         let mut buf = Vec::new();
                         let mut enc = minicbor::Encoder::new(&mut buf);
@@ -719,9 +720,9 @@ async fn handle_local_chainsync(
                             .map_err(|e| N2CServerError::Protocol(e.to_string()))?;
                         enc.u32(3)
                             .map_err(|e| N2CServerError::Protocol(e.to_string()))?;
-                        let tip_h = Hash32::from_bytes(tip_hash);
-                        encode_point(&mut enc, tip_slot, &tip_h)?;
-                        encode_tip(&mut enc, tip_slot, &tip_h, tip_block_no)?;
+                        let tip_h = Hash32::from_bytes(tip.hash);
+                        encode_point(&mut enc, tip.slot, &tip_h)?;
+                        encode_tip(&mut enc, tip.slot, &tip_h, tip.block_number)?;
 
                         return Ok(Some(Segment {
                             transmission_time: 0,
@@ -738,7 +739,7 @@ async fn handle_local_chainsync(
                         debug!(slot, "LocalChainSync: MsgRollForward");
                         cursor.cursor_slot = slot;
 
-                        let (tip_slot, tip_hash, tip_block_no) = provider.get_tip();
+                        let tip = provider.get_tip();
 
                         // Extract era tag from block CBOR: [era_tag, ...]
                         let era_id = {
@@ -764,8 +765,8 @@ async fn handle_local_chainsync(
                         enc.bytes(&cbor)
                             .map_err(|e| N2CServerError::Protocol(e.to_string()))?;
                         // tip
-                        let tip_h = Hash32::from_bytes(tip_hash);
-                        encode_tip(&mut enc, tip_slot, &tip_h, tip_block_no)?;
+                        let tip_h = Hash32::from_bytes(tip.hash);
+                        encode_tip(&mut enc, tip.slot, &tip_h, tip.block_number)?;
 
                         return Ok(Some(Segment {
                             transmission_time: 0,
@@ -2909,7 +2910,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_handle_local_chainsync_block_delivery() {
-        use crate::n2n_server::BlockProvider;
+        use crate::n2n_server::{BlockProvider, TipInfo};
 
         struct MockBlockProvider;
 
@@ -2921,8 +2922,12 @@ mod tests {
                 // Only recognize our test hash
                 *hash == [0xbb; 32]
             }
-            fn get_tip(&self) -> (u64, [u8; 32], u64) {
-                (200, [0xcc; 32], 10)
+            fn get_tip(&self) -> TipInfo {
+                TipInfo {
+                    slot: 200,
+                    hash: [0xcc; 32],
+                    block_number: 10,
+                }
             }
             fn get_next_block_after_slot(
                 &self,
@@ -3013,7 +3018,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_handle_local_chainsync_rollback() {
-        use crate::n2n_server::BlockProvider;
+        use crate::n2n_server::{BlockProvider, TipInfo};
         use std::sync::atomic::{AtomicU64, Ordering};
 
         struct RollbackProvider {
@@ -3027,9 +3032,13 @@ mod tests {
             fn has_block(&self, hash: &[u8; 32]) -> bool {
                 *hash == [0xbb; 32]
             }
-            fn get_tip(&self) -> (u64, [u8; 32], u64) {
+            fn get_tip(&self) -> TipInfo {
                 let slot = self.tip_slot.load(Ordering::Relaxed);
-                (slot, [0xcc; 32], slot / 10)
+                TipInfo {
+                    slot,
+                    hash: [0xcc; 32],
+                    block_number: slot / 10,
+                }
             }
             fn get_next_block_after_slot(
                 &self,

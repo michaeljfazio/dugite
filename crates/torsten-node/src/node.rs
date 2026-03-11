@@ -14,7 +14,7 @@ use torsten_network::server::NodeServerConfig;
 use torsten_network::{
     BlockFetchPool, BlockProvider, ChainSyncEvent, DiffusionMode, HeaderBatchResult, N2CServer,
     NodeServer, NodeStateSnapshot, NodeToNodeClient, PeerManager, PeerManagerConfig,
-    PipelinedPeerClient, QueryHandler, TxValidator,
+    PipelinedPeerClient, QueryHandler, TipInfo, TxValidator,
 };
 use torsten_primitives::block::Point;
 use torsten_primitives::protocol_params::ProtocolParameters;
@@ -64,7 +64,7 @@ impl BlockProvider for ChainDBBlockProvider {
         db.has_block(&block_hash)
     }
 
-    fn get_tip(&self) -> (u64, [u8; 32], u64) {
+    fn get_tip(&self) -> TipInfo {
         let db = self.chain_db.blocking_read();
         let tip = db.get_tip();
         let slot = tip.point.slot().map(|s| s.0).unwrap_or(0);
@@ -79,7 +79,11 @@ impl BlockProvider for ChainDBBlockProvider {
             })
             .unwrap_or([0u8; 32]);
         let block_no = tip.block_number.0;
-        (slot, hash, block_no)
+        TipInfo {
+            slot,
+            hash,
+            block_number: block_no,
+        }
     }
 
     fn get_next_block_after_slot(&self, after_slot: u64) -> Option<(u64, [u8; 32], Vec<u8>)> {
@@ -674,6 +678,16 @@ impl Node {
             let port = self.metrics_port;
             tokio::spawn(async move {
                 crate::metrics::start_metrics_server(port, metrics).await;
+            });
+        }
+
+        // Start disk space monitor on the database volume
+        {
+            let db_path = self.database_path.clone();
+            let metrics = self.metrics.clone();
+            let disk_shutdown_rx = shutdown_rx.clone();
+            tokio::spawn(async move {
+                crate::disk_monitor::start_disk_monitor(db_path, metrics, disk_shutdown_rx).await;
             });
         }
 
