@@ -15,7 +15,7 @@ pub use miniprotocols::peersharing::{
     request_peers_from, PeerAddress, PeerSharingMessage, PeerSharingState,
 };
 pub use miniprotocols::txsubmission::{TxSubmissionClient, TxSubmissionError, TxSubmissionStats};
-pub use n2c::{N2CServer, TxValidator};
+pub use n2c::{N2CServer, TxValidationError, TxValidator};
 pub use n2c_client::N2CClient;
 pub use n2n_server::{BlockAnnouncement, BlockProvider, N2NServer, RollbackAnnouncement, TipInfo};
 pub use peer::PeerConnection;

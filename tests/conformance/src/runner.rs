@@ -11,6 +11,7 @@ use crate::schema::{
 };
 use std::path::Path;
 use torsten_ledger::validate_transaction;
+use torsten_ledger::validation::ValidationError;
 
 /// Load a test vector from a JSON file.
 pub fn load_vector(path: &Path) -> Result<ConformanceTestVector, String> {
@@ -73,6 +74,23 @@ pub fn run_all(vectors: &[(String, ConformanceTestVector)]) -> Vec<ConformanceTe
 // ---------------------------------------------------------------------------
 // UTXO rule runner
 // ---------------------------------------------------------------------------
+
+/// Returns `true` for validation errors that belong to the UTXOW rule
+/// (witness checking) rather than the UTXO rule. Conformance test vectors
+/// for the UTXO rule intentionally omit witness sets, so these errors are
+/// filtered out when comparing against expected results.
+fn is_witness_error(e: &ValidationError) -> bool {
+    matches!(
+        e,
+        ValidationError::MissingInputWitness(_)
+            | ValidationError::MissingScriptWitness(_)
+            | ValidationError::MissingWithdrawalWitness(_)
+            | ValidationError::MissingWithdrawalScriptWitness(_)
+            | ValidationError::MissingWitness(_)
+            | ValidationError::InvalidWitnessSignature(_)
+            | ValidationError::NativeScriptFailed
+    )
+}
 
 fn run_utxo_test(vector_path: &str, vector: &ConformanceTestVector) -> ConformanceTestResult {
     let base = ConformanceTestResult {
@@ -143,19 +161,20 @@ fn run_utxo_test(vector_path: &str, vector: &ConformanceTestVector) -> Conforman
     // Run Torsten validation
     let validation_result = validate_transaction(&tx, &utxo_set, &params, env.slot, tx_size, None);
 
-    // Filter out witness-related errors: conformance test vectors omit witness data
-    // (they test UTxO state transition rules, not witness verification).
+    // Filter out witness-related errors: UTXO conformance tests exercise the UTXO
+    // ledger rule which does not include witness checking (that is the UTXOW rule).
+    // The test vectors intentionally omit witness sets.
     let validation_result = match validation_result {
         Ok(()) => Ok(()),
         Err(errors) => {
-            let non_witness_errors: Vec<_> = errors
+            let non_witness: Vec<_> = errors
                 .into_iter()
                 .filter(|e| !is_witness_error(e))
                 .collect();
-            if non_witness_errors.is_empty() {
+            if non_witness.is_empty() {
                 Ok(())
             } else {
-                Err(non_witness_errors)
+                Err(non_witness)
             }
         }
     };
@@ -269,18 +288,6 @@ fn run_utxo_test(vector_path: &str, vector: &ConformanceTestVector) -> Conforman
             }
         }
     }
-}
-
-/// Returns `true` if the error is a witness-related error that should be
-/// filtered out during conformance testing (test vectors omit witness data).
-fn is_witness_error(error: &torsten_ledger::ValidationError) -> bool {
-    use torsten_ledger::ValidationError;
-    matches!(
-        error,
-        ValidationError::MissingInputWitness(_)
-            | ValidationError::MissingScriptWitness(_)
-            | ValidationError::MissingWithdrawalWitness(_)
-    )
 }
 
 /// Map a Torsten ValidationError to a category string that matches the
