@@ -121,7 +121,7 @@ jobs:
   # Create GitHub Release with binary assets
   # ──────────────────────────────────────────────
   create-release:
-    needs: [build-binaries, build-container]
+    needs: [build-binaries]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
