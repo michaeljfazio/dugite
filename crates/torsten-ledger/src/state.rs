@@ -391,8 +391,15 @@ impl LedgerState {
     pub fn set_epoch_length(&mut self, epoch_length: u64, security_param: u64) {
         self.epoch_length = epoch_length;
         // randomness_stabilisation_window = ceiling(4k/f) per Haskell StabilityWindow.hs
-        let f = self.protocol_params.active_slot_coeff();
-        self.randomness_stabilisation_window = (4.0 * security_param as f64 / f).ceil() as u64;
+        // Use integer arithmetic to avoid f64 precision issues in this consensus-critical calc
+        let (f_num, f_den) = self.protocol_params.active_slot_coeff_rational();
+        self.randomness_stabilisation_window =
+            torsten_primitives::protocol_params::ceiling_div_by_rational(
+                4,
+                security_param,
+                f_num,
+                f_den,
+            );
         info!(
             epoch_length,
             randomness_stabilisation_window = self.randomness_stabilisation_window,
@@ -7899,6 +7906,44 @@ mod tests {
         assert_eq!(total, 3_000_000_000);
     }
 
+    #[test]
+    fn test_randomness_stabilisation_window_mainnet() {
+        // Mainnet: k=2160, f=0.05 → ceil(4*2160/0.05) = 172800
+        let params = ProtocolParameters::mainnet_defaults();
+        let mut state = LedgerState::new(params);
+        state.set_epoch_length(432000, 2160);
+        assert_eq!(state.randomness_stabilisation_window, 172800);
+    }
+
+    #[test]
+    fn test_randomness_stabilisation_window_preview() {
+        // Preview: k=432, f=0.05 → ceil(4*432/0.05) = 34560
+        let mut params = ProtocolParameters::mainnet_defaults();
+        params.active_slots_coeff = 0.05;
+        let mut state = LedgerState::new(params);
+        state.set_epoch_length(86400, 432);
+        assert_eq!(state.randomness_stabilisation_window, 34560);
+    }
+
+    #[test]
+    fn test_randomness_stabilisation_window_exact_for_tenth() {
+        // f=0.1 = 1/10, k=100 → ceil(4*100/(1/10)) = 4000
+        let mut params = ProtocolParameters::mainnet_defaults();
+        params.active_slots_coeff = 0.1;
+        let mut state = LedgerState::new(params);
+        state.set_epoch_length(100000, 100);
+        assert_eq!(state.randomness_stabilisation_window, 4000);
+    }
+
+    #[test]
+    fn test_randomness_stabilisation_window_ceil_rounds_up() {
+        // f=0.25 = 1/4, k=3 → ceil(4*3*4/1) = 48 (exact)
+        let mut params = ProtocolParameters::mainnet_defaults();
+        params.active_slots_coeff = 0.25;
+        let mut state = LedgerState::new(params);
+        state.set_epoch_length(1000, 3);
+        assert_eq!(state.randomness_stabilisation_window, 48);
+    }
     /// Regression test for GitHub issue #13: slot + stabilisation_window u64 overflow.
     ///
     /// When a block has a slot near u64::MAX, the old code `block.slot().0 +
