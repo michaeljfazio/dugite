@@ -36,11 +36,7 @@ impl BlockProducerCredentials {
     /// The cold verification key is extracted from the opcert (which contains it
     /// as a second CBOR element), matching cardano-node behavior. The cold signing
     /// key is NOT needed at runtime.
-    pub fn load(
-        vrf_skey_path: &Path,
-        kes_skey_path: &Path,
-        opcert_path: &Path,
-    ) -> Result<Self> {
+    pub fn load(vrf_skey_path: &Path, kes_skey_path: &Path, opcert_path: &Path) -> Result<Self> {
         // Load VRF signing key
         let vrf_content = std::fs::read_to_string(vrf_skey_path)
             .with_context(|| format!("Failed to read VRF skey: {}", vrf_skey_path.display()))?;
