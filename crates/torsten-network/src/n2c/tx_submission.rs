@@ -55,7 +55,7 @@ pub(crate) fn handle_tx_submission(
                     if let Some(validator) = tx_validator {
                         if let Err(e) = validator.validate_tx(era_id, &tx_bytes) {
                             warn!("Transaction validation failed: {e}");
-                            return encode_tx_reject(&e);
+                            return encode_tx_reject(&e.to_string());
                         }
                     }
 
