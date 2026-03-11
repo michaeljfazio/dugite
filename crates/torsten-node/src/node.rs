@@ -504,10 +504,11 @@ impl Node {
         if let Some((num, den)) = conway_committee_threshold {
             if ledger.governance.committee_threshold.is_none() {
                 use torsten_primitives::transaction::Rational;
-                ledger.governance.committee_threshold = Some(Rational {
-                    numerator: num,
-                    denominator: den,
-                });
+                std::sync::Arc::make_mut(&mut ledger.governance).committee_threshold =
+                    Some(Rational {
+                        numerator: num,
+                        denominator: den,
+                    });
                 info!(
                     numerator = num,
                     denominator = den,
@@ -521,8 +522,7 @@ impl Node {
             use torsten_primitives::hash::Hash32;
             for (hash_bytes, expiration) in &conway_committee_members {
                 let cold_key = Hash32::from_bytes(*hash_bytes);
-                ledger
-                    .governance
+                std::sync::Arc::make_mut(&mut ledger.governance)
                     .committee_expiration
                     .insert(cold_key, torsten_primitives::EpochNo(*expiration));
             }
@@ -2491,7 +2491,7 @@ impl Node {
         // Per Cardano spec, total stake = UTxO-delegated stake + reward account balance.
         let mut pool_stake_map: std::collections::HashMap<torsten_primitives::hash::Hash28, u64> =
             std::collections::HashMap::new();
-        for (cred_hash, pool_id) in &ls.delegations {
+        for (cred_hash, pool_id) in ls.delegations.iter() {
             let utxo_stake = ls
                 .stake_distribution
                 .stake_map
