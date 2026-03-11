@@ -3393,7 +3393,6 @@ dependencies = [
  "tokio",
  "tokio-util",
  "torsten-crypto",
- "torsten-mempool",
  "torsten-primitives",
  "torsten-serialization",
  "tracing",

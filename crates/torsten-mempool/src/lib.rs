@@ -427,6 +427,90 @@ pub struct MempoolSnapshot {
     pub tx_hashes: Vec<TransactionHash>,
 }
 
+/// Implement `MempoolProvider` from `torsten-primitives` for the concrete `Mempool`.
+///
+/// This allows `torsten-network` (and any other crate) to depend on the trait
+/// abstraction rather than on this crate directly.
+impl torsten_primitives::mempool::MempoolProvider for Mempool {
+    fn add_tx(
+        &self,
+        tx_hash: TransactionHash,
+        tx: Transaction,
+        size_bytes: usize,
+    ) -> Result<
+        torsten_primitives::mempool::MempoolAddResult,
+        torsten_primitives::mempool::MempoolAddError,
+    > {
+        match Mempool::add_tx(self, tx_hash, tx, size_bytes) {
+            Ok(MempoolAddResult::Added) => Ok(torsten_primitives::mempool::MempoolAddResult::Added),
+            Ok(MempoolAddResult::AlreadyExists) => {
+                Ok(torsten_primitives::mempool::MempoolAddResult::AlreadyExists)
+            }
+            Err(e) => Err(torsten_primitives::mempool::MempoolAddError(e.to_string())),
+        }
+    }
+
+    fn add_tx_with_fee(
+        &self,
+        tx_hash: TransactionHash,
+        tx: Transaction,
+        size_bytes: usize,
+        fee: torsten_primitives::value::Lovelace,
+    ) -> Result<
+        torsten_primitives::mempool::MempoolAddResult,
+        torsten_primitives::mempool::MempoolAddError,
+    > {
+        match Mempool::add_tx_with_fee(self, tx_hash, tx, size_bytes, fee) {
+            Ok(MempoolAddResult::Added) => Ok(torsten_primitives::mempool::MempoolAddResult::Added),
+            Ok(MempoolAddResult::AlreadyExists) => {
+                Ok(torsten_primitives::mempool::MempoolAddResult::AlreadyExists)
+            }
+            Err(e) => Err(torsten_primitives::mempool::MempoolAddError(e.to_string())),
+        }
+    }
+
+    fn contains(&self, tx_hash: &TransactionHash) -> bool {
+        Mempool::contains(self, tx_hash)
+    }
+
+    fn get_tx(&self, tx_hash: &TransactionHash) -> Option<Transaction> {
+        Mempool::get_tx(self, tx_hash)
+    }
+
+    fn get_tx_size(&self, tx_hash: &TransactionHash) -> Option<usize> {
+        Mempool::get_tx_size(self, tx_hash)
+    }
+
+    fn get_tx_cbor(&self, tx_hash: &TransactionHash) -> Option<Vec<u8>> {
+        Mempool::get_tx_cbor(self, tx_hash)
+    }
+
+    fn tx_hashes_ordered(&self) -> Vec<TransactionHash> {
+        Mempool::tx_hashes_ordered(self)
+    }
+
+    fn len(&self) -> usize {
+        Mempool::len(self)
+    }
+
+    fn total_bytes(&self) -> usize {
+        Mempool::total_bytes(self)
+    }
+
+    fn capacity(&self) -> usize {
+        Mempool::capacity(self)
+    }
+
+    fn snapshot(&self) -> torsten_primitives::mempool::MempoolSnapshot {
+        let snap = Mempool::snapshot(self);
+        torsten_primitives::mempool::MempoolSnapshot {
+            tx_count: snap.tx_count,
+            total_bytes: snap.total_bytes,
+            tx_hashes: snap.tx_hashes,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -912,5 +996,116 @@ mod tests {
         // The huge-fee tx should come first (higher fee density)
         assert_eq!(txs[0].body.fee.0, huge_fee);
         assert_eq!(txs[1].body.fee.0, 200_000);
+    }
+
+    /// Verify that `Mempool` can be used as a `dyn MempoolProvider` trait object.
+    #[test]
+    fn test_mempool_provider_trait_object() {
+        use torsten_primitives::mempool::MempoolProvider;
+
+        let mempool = Mempool::new(MempoolConfig::default());
+        let provider: &dyn MempoolProvider = &mempool;
+
+        assert_eq!(provider.len(), 0);
+        assert!(provider.is_empty());
+        assert_eq!(provider.total_bytes(), 0);
+        assert_eq!(provider.capacity(), 16_384);
+
+        let hash = Hash32::from_bytes([1u8; 32]);
+        let tx = make_dummy_tx();
+        let result = provider.add_tx(hash, tx, 500).unwrap();
+        assert!(matches!(
+            result,
+            torsten_primitives::mempool::MempoolAddResult::Added
+        ));
+
+        assert_eq!(provider.len(), 1);
+        assert!(!provider.is_empty());
+        assert!(provider.contains(&hash));
+        assert!(provider.get_tx(&hash).is_some());
+        assert_eq!(provider.get_tx_size(&hash), Some(500));
+        assert_eq!(provider.total_bytes(), 500);
+
+        let hashes = provider.tx_hashes_ordered();
+        assert_eq!(hashes.len(), 1);
+        assert_eq!(hashes[0], hash);
+
+        let snap = provider.snapshot();
+        assert_eq!(snap.tx_count, 1);
+        assert_eq!(snap.total_bytes, 500);
+        assert_eq!(snap.tx_hashes.len(), 1);
+    }
+
+    /// Verify that `Arc<Mempool>` can be coerced to `Arc<dyn MempoolProvider>`.
+    #[test]
+    fn test_mempool_provider_arc_coercion() {
+        use std::sync::Arc;
+        use torsten_primitives::mempool::MempoolProvider;
+
+        let mempool = Arc::new(Mempool::new(MempoolConfig::default()));
+        let provider: Arc<dyn MempoolProvider> = mempool;
+
+        assert_eq!(provider.len(), 0);
+        assert_eq!(provider.capacity(), 16_384);
+
+        let hash = Hash32::from_bytes([1u8; 32]);
+        let tx = make_dummy_tx();
+        provider.add_tx(hash, tx, 300).unwrap();
+        assert_eq!(provider.len(), 1);
+        assert!(provider.contains(&hash));
+    }
+
+    /// Verify `add_tx_with_fee` through the trait.
+    #[test]
+    fn test_mempool_provider_add_with_fee() {
+        use torsten_primitives::mempool::MempoolProvider;
+
+        let mempool = Mempool::new(MempoolConfig::default());
+        let provider: &dyn MempoolProvider = &mempool;
+
+        let hash = Hash32::from_bytes([1u8; 32]);
+        let tx = make_dummy_tx();
+        let result = provider
+            .add_tx_with_fee(hash, tx, 1000, Lovelace(500_000))
+            .unwrap();
+        assert!(matches!(
+            result,
+            torsten_primitives::mempool::MempoolAddResult::Added
+        ));
+
+        // Adding again should return AlreadyExists
+        let result = provider
+            .add_tx_with_fee(hash, make_dummy_tx(), 1000, Lovelace(500_000))
+            .unwrap();
+        assert!(matches!(
+            result,
+            torsten_primitives::mempool::MempoolAddResult::AlreadyExists
+        ));
+    }
+
+    /// Verify that a full mempool returns an error through the trait.
+    #[test]
+    fn test_mempool_provider_full_error() {
+        use torsten_primitives::mempool::MempoolProvider;
+
+        let config = MempoolConfig {
+            max_transactions: 1,
+            max_bytes: 1024 * 1024,
+        };
+        let mempool = Mempool::new(config);
+        let provider: &dyn MempoolProvider = &mempool;
+
+        provider
+            .add_tx(Hash32::from_bytes([1u8; 32]), make_dummy_tx(), 100)
+            .unwrap();
+
+        let result = provider.add_tx(Hash32::from_bytes([2u8; 32]), make_dummy_tx(), 100);
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(
+            err.0.contains("full"),
+            "error should mention 'full': {}",
+            err.0
+        );
     }
 }

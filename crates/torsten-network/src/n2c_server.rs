@@ -4,8 +4,8 @@ use thiserror::Error;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UnixListener;
 use tokio::sync::RwLock;
-use torsten_mempool::Mempool;
 use torsten_primitives::hash::Hash32;
+use torsten_primitives::mempool::{MempoolAddResult, MempoolProvider};
 use tracing::{debug, error, info, warn};
 
 use crate::multiplexer::Segment;
@@ -39,13 +39,16 @@ const MINI_PROTOCOL_TX_MONITOR: u16 = 9;
 /// Node-to-Client server that listens on a Unix domain socket.
 pub struct N2CServer {
     query_handler: Arc<RwLock<QueryHandler>>,
-    mempool: Arc<Mempool>,
+    mempool: Arc<dyn MempoolProvider>,
     tx_validator: Option<Arc<dyn TxValidator>>,
     block_provider: Option<Arc<dyn BlockProvider>>,
 }
 
 impl N2CServer {
-    pub fn new(query_handler: Arc<RwLock<QueryHandler>>, mempool: Arc<Mempool>) -> Self {
+    pub fn new(
+        query_handler: Arc<RwLock<QueryHandler>>,
+        mempool: Arc<dyn MempoolProvider>,
+    ) -> Self {
         N2CServer {
             query_handler,
             mempool,
@@ -142,7 +145,7 @@ struct TxMonitorCursor {
 async fn handle_n2c_connection(
     mut stream: tokio::net::UnixStream,
     query_handler: Arc<RwLock<QueryHandler>>,
-    mempool: Arc<Mempool>,
+    mempool: Arc<dyn MempoolProvider>,
     tx_validator: Option<Arc<dyn TxValidator>>,
     block_provider: Option<Arc<dyn BlockProvider>>,
 ) -> Result<(), N2CServerError> {
@@ -212,7 +215,7 @@ async fn handle_n2c_connection(
 async fn process_segment(
     segment: &Segment,
     query_handler: &Arc<RwLock<QueryHandler>>,
-    mempool: &Arc<Mempool>,
+    mempool: &Arc<dyn MempoolProvider>,
     tx_validator: &Option<Arc<dyn TxValidator>>,
     block_provider: &Option<Arc<dyn BlockProvider>>,
     chainsync_cursor: &mut ChainSyncCursor,
@@ -377,7 +380,7 @@ fn parse_highest_version(payload: &[u8]) -> Option<(u16, u32)> {
 ///   3: MsgDone     [3]
 fn handle_tx_submission(
     payload: &[u8],
-    mempool: &Arc<Mempool>,
+    mempool: &Arc<dyn MempoolProvider>,
     tx_validator: &Option<Arc<dyn TxValidator>>,
 ) -> Result<Option<Segment>, N2CServerError> {
     let mut decoder = minicbor::Decoder::new(payload);
@@ -423,11 +426,11 @@ fn handle_tx_submission(
                             let tx_hash = tx.hash;
 
                             match mempool.add_tx(tx_hash, tx, tx_size) {
-                                Ok(torsten_mempool::MempoolAddResult::Added) => {
+                                Ok(MempoolAddResult::Added) => {
                                     info!("Transaction accepted into mempool: {tx_hash}");
                                     encode_tx_accept()
                                 }
-                                Ok(torsten_mempool::MempoolAddResult::AlreadyExists) => {
+                                Ok(MempoolAddResult::AlreadyExists) => {
                                     debug!("Transaction already in mempool: {tx_hash}");
                                     encode_tx_accept()
                                 }
@@ -484,7 +487,7 @@ fn handle_tx_submission(
 ///  10: MsgReplyGetSizes [10, [capacity, size, num_txs]]
 async fn handle_tx_monitor(
     payload: &[u8],
-    mempool: &Arc<Mempool>,
+    mempool: &Arc<dyn MempoolProvider>,
     query_handler: &Arc<RwLock<QueryHandler>>,
     cursor: &mut TxMonitorCursor,
 ) -> Result<Option<Segment>, N2CServerError> {
@@ -2179,6 +2182,142 @@ fn encode_query_result(result: &QueryResult) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::VecDeque;
+    use std::sync::Mutex;
+    use torsten_primitives::hash::TransactionHash;
+    use torsten_primitives::mempool::{MempoolAddError, MempoolSnapshot};
+    use torsten_primitives::transaction::Transaction;
+    use torsten_primitives::value::Lovelace;
+
+    /// A simple in-memory mock mempool for testing network protocol handlers.
+    struct MockMempool {
+        inner: Mutex<MockMempoolInner>,
+        max_transactions: usize,
+    }
+
+    struct MockMempoolInner {
+        txs: Vec<(TransactionHash, Transaction, usize, Lovelace)>,
+        order: VecDeque<TransactionHash>,
+        total_bytes: usize,
+    }
+
+    impl MockMempool {
+        fn new() -> Self {
+            MockMempool {
+                inner: Mutex::new(MockMempoolInner {
+                    txs: Vec::new(),
+                    order: VecDeque::new(),
+                    total_bytes: 0,
+                }),
+                max_transactions: 16_384,
+            }
+        }
+
+        fn with_max_transactions(max: usize) -> Self {
+            MockMempool {
+                inner: Mutex::new(MockMempoolInner {
+                    txs: Vec::new(),
+                    order: VecDeque::new(),
+                    total_bytes: 0,
+                }),
+                max_transactions: max,
+            }
+        }
+    }
+
+    impl MempoolProvider for MockMempool {
+        fn add_tx(
+            &self,
+            tx_hash: TransactionHash,
+            tx: Transaction,
+            size_bytes: usize,
+        ) -> Result<MempoolAddResult, MempoolAddError> {
+            self.add_tx_with_fee(tx_hash, tx, size_bytes, Lovelace(0))
+        }
+
+        fn add_tx_with_fee(
+            &self,
+            tx_hash: TransactionHash,
+            tx: Transaction,
+            size_bytes: usize,
+            fee: Lovelace,
+        ) -> Result<MempoolAddResult, MempoolAddError> {
+            let mut inner = self.inner.lock().unwrap();
+            if inner.txs.iter().any(|(h, _, _, _)| *h == tx_hash) {
+                return Ok(MempoolAddResult::AlreadyExists);
+            }
+            if inner.txs.len() >= self.max_transactions {
+                return Err(MempoolAddError(format!(
+                    "Mempool is full (max {} transactions)",
+                    self.max_transactions
+                )));
+            }
+            inner.total_bytes += size_bytes;
+            inner.order.push_back(tx_hash);
+            inner.txs.push((tx_hash, tx, size_bytes, fee));
+            Ok(MempoolAddResult::Added)
+        }
+
+        fn contains(&self, tx_hash: &TransactionHash) -> bool {
+            let inner = self.inner.lock().unwrap();
+            inner.txs.iter().any(|(h, _, _, _)| h == tx_hash)
+        }
+
+        fn get_tx(&self, tx_hash: &TransactionHash) -> Option<Transaction> {
+            let inner = self.inner.lock().unwrap();
+            inner
+                .txs
+                .iter()
+                .find(|(h, _, _, _)| h == tx_hash)
+                .map(|(_, tx, _, _)| tx.clone())
+        }
+
+        fn get_tx_size(&self, tx_hash: &TransactionHash) -> Option<usize> {
+            let inner = self.inner.lock().unwrap();
+            inner
+                .txs
+                .iter()
+                .find(|(h, _, _, _)| h == tx_hash)
+                .map(|(_, _, sz, _)| *sz)
+        }
+
+        fn get_tx_cbor(&self, tx_hash: &TransactionHash) -> Option<Vec<u8>> {
+            let inner = self.inner.lock().unwrap();
+            inner
+                .txs
+                .iter()
+                .find(|(h, _, _, _)| h == tx_hash)
+                .and_then(|(_, tx, _, _)| tx.raw_cbor.clone())
+        }
+
+        fn tx_hashes_ordered(&self) -> Vec<TransactionHash> {
+            let inner = self.inner.lock().unwrap();
+            inner.order.iter().copied().collect()
+        }
+
+        fn len(&self) -> usize {
+            let inner = self.inner.lock().unwrap();
+            inner.txs.len()
+        }
+
+        fn total_bytes(&self) -> usize {
+            let inner = self.inner.lock().unwrap();
+            inner.total_bytes
+        }
+
+        fn capacity(&self) -> usize {
+            self.max_transactions
+        }
+
+        fn snapshot(&self) -> MempoolSnapshot {
+            let inner = self.inner.lock().unwrap();
+            MempoolSnapshot {
+                tx_count: inner.txs.len(),
+                total_bytes: inner.total_bytes,
+                tx_hashes: inner.order.iter().copied().collect(),
+            }
+        }
+    }
 
     #[test]
     fn test_parse_highest_version_basic() {
@@ -2311,7 +2450,7 @@ mod tests {
 
     #[test]
     fn test_handle_tx_submission_accept() {
-        let mempool = Arc::new(Mempool::new(torsten_mempool::MempoolConfig::default()));
+        let mempool = Arc::new(MockMempool::new()) as Arc<dyn MempoolProvider>;
         let no_validator: Option<Arc<dyn TxValidator>> = None;
 
         let tx_bytes = build_test_tx_cbor(200_000);
@@ -2336,7 +2475,7 @@ mod tests {
 
     #[test]
     fn test_handle_tx_submission_duplicate() {
-        let mempool = Arc::new(Mempool::new(torsten_mempool::MempoolConfig::default()));
+        let mempool = Arc::new(MockMempool::new()) as Arc<dyn MempoolProvider>;
         let no_validator: Option<Arc<dyn TxValidator>> = None;
 
         let tx_bytes = build_test_tx_cbor(200_000);
@@ -2356,7 +2495,7 @@ mod tests {
 
     #[test]
     fn test_handle_tx_submission_invalid_cbor() {
-        let mempool = Arc::new(Mempool::new(torsten_mempool::MempoolConfig::default()));
+        let mempool = Arc::new(MockMempool::new()) as Arc<dyn MempoolProvider>;
         let no_validator: Option<Arc<dyn TxValidator>> = None;
 
         let tx_bytes = vec![0xa0u8]; // not a valid transaction
@@ -2374,11 +2513,7 @@ mod tests {
 
     #[test]
     fn test_handle_tx_submission_full_mempool() {
-        let config = torsten_mempool::MempoolConfig {
-            max_transactions: 1,
-            max_bytes: 1024 * 1024,
-        };
-        let mempool = Arc::new(Mempool::new(config));
+        let mempool = Arc::new(MockMempool::with_max_transactions(1)) as Arc<dyn MempoolProvider>;
         let no_validator: Option<Arc<dyn TxValidator>> = None;
 
         // Fill the mempool
@@ -2545,7 +2680,7 @@ mod tests {
 
     #[test]
     fn test_handle_tx_submission_done() {
-        let mempool = Arc::new(Mempool::new(torsten_mempool::MempoolConfig::default()));
+        let mempool = Arc::new(MockMempool::new()) as Arc<dyn MempoolProvider>;
         let no_validator: Option<Arc<dyn TxValidator>> = None;
 
         // Build MsgDone: [3]
@@ -2560,7 +2695,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_handle_tx_monitor_acquire() {
-        let mempool = Arc::new(Mempool::new(torsten_mempool::MempoolConfig::default()));
+        let mempool = Arc::new(MockMempool::new()) as Arc<dyn MempoolProvider>;
         let handler = Arc::new(RwLock::new(QueryHandler::new()));
         let mut cursor = TxMonitorCursor {
             snapshot: Vec::new(),
@@ -2592,7 +2727,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_handle_tx_monitor_has_tx() {
-        let mempool = Arc::new(Mempool::new(torsten_mempool::MempoolConfig::default()));
+        let mempool = Arc::new(MockMempool::new()) as Arc<dyn MempoolProvider>;
         let handler = Arc::new(RwLock::new(QueryHandler::new()));
         let mut cursor = TxMonitorCursor {
             snapshot: Vec::new(),
@@ -2624,7 +2759,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_handle_tx_monitor_has_tx_missing() {
-        let mempool = Arc::new(Mempool::new(torsten_mempool::MempoolConfig::default()));
+        let mempool = Arc::new(MockMempool::new()) as Arc<dyn MempoolProvider>;
         let handler = Arc::new(RwLock::new(QueryHandler::new()));
         let mut cursor = TxMonitorCursor {
             snapshot: Vec::new(),
@@ -2654,7 +2789,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_handle_tx_monitor_get_sizes() {
-        let mempool = Arc::new(Mempool::new(torsten_mempool::MempoolConfig::default()));
+        let mempool = Arc::new(MockMempool::new()) as Arc<dyn MempoolProvider>;
         let handler = Arc::new(RwLock::new(QueryHandler::new()));
         let mut cursor = TxMonitorCursor {
             snapshot: Vec::new(),
@@ -2691,7 +2826,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_handle_tx_monitor_next_tx() {
-        let mempool = Arc::new(Mempool::new(torsten_mempool::MempoolConfig::default()));
+        let mempool = Arc::new(MockMempool::new()) as Arc<dyn MempoolProvider>;
         let handler = Arc::new(RwLock::new(QueryHandler::new()));
         let mut cursor = TxMonitorCursor {
             snapshot: Vec::new(),
@@ -2719,7 +2854,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_handle_tx_monitor_cursor_iteration() {
-        let mempool = Arc::new(Mempool::new(torsten_mempool::MempoolConfig::default()));
+        let mempool = Arc::new(MockMempool::new()) as Arc<dyn MempoolProvider>;
         let handler = Arc::new(RwLock::new(QueryHandler::new()));
         let mut cursor = TxMonitorCursor {
             snapshot: Vec::new(),
@@ -2805,7 +2940,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_handle_tx_monitor_done() {
-        let mempool = Arc::new(Mempool::new(torsten_mempool::MempoolConfig::default()));
+        let mempool = Arc::new(MockMempool::new()) as Arc<dyn MempoolProvider>;
         let handler = Arc::new(RwLock::new(QueryHandler::new()));
         let mut cursor = TxMonitorCursor {
             snapshot: Vec::new(),

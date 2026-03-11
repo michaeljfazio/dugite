@@ -14,11 +14,11 @@ use pallas_network::multiplexer::{AgentChannel, MAX_SEGMENT_PAYLOAD_LENGTH};
 use std::collections::HashSet;
 use std::sync::Arc;
 use tokio::time::{timeout, Duration};
-use torsten_mempool::Mempool;
 use torsten_primitives::hash::{Hash32, TransactionHash};
 use tracing::{debug, info, trace};
 
 use crate::n2c_server::TxValidator;
+use torsten_primitives::mempool::{MempoolAddResult, MempoolProvider};
 
 /// Maximum number of tx IDs to request per batch
 const MAX_TX_IDS_REQUEST: u16 = 100;
@@ -88,7 +88,7 @@ impl TxSubmissionClient {
     /// Returns when the peer sends MsgDone or an error occurs.
     pub async fn run(
         &mut self,
-        mempool: Arc<Mempool>,
+        mempool: Arc<dyn MempoolProvider>,
         tx_validator: Option<Arc<dyn TxValidator>>,
     ) -> Result<TxSubmissionStats, TxSubmissionError> {
         let mut stats = TxSubmissionStats::default();
@@ -119,10 +119,10 @@ impl TxSubmissionClient {
                     break;
                 }
 
-                self.process_tx_ids(&tx_ids, &mempool, tx_validator.as_deref(), &mut stats)
+                self.process_tx_ids(&tx_ids, &*mempool, tx_validator.as_deref(), &mut stats)
                     .await?;
             } else {
-                self.process_tx_ids(&tx_ids, &mempool, tx_validator.as_deref(), &mut stats)
+                self.process_tx_ids(&tx_ids, &*mempool, tx_validator.as_deref(), &mut stats)
                     .await?;
             }
         }
@@ -134,7 +134,7 @@ impl TxSubmissionClient {
     async fn process_tx_ids(
         &mut self,
         tx_ids: &[(TransactionHash, u32)],
-        mempool: &Mempool,
+        mempool: &dyn MempoolProvider,
         tx_validator: Option<&dyn TxValidator>,
         stats: &mut TxSubmissionStats,
     ) -> Result<(), TxSubmissionError> {
@@ -190,7 +190,7 @@ impl TxSubmissionClient {
         &self,
         tx_hash: TransactionHash,
         tx_cbor: &[u8],
-        mempool: &Mempool,
+        mempool: &dyn MempoolProvider,
         tx_validator: Option<&dyn TxValidator>,
         stats: &mut TxSubmissionStats,
     ) -> bool {
@@ -213,11 +213,11 @@ impl TxSubmissionClient {
                     let tx_size = tx_cbor.len();
                     let fee = tx.body.fee;
                     match mempool.add_tx_with_fee(tx_hash, tx, tx_size, fee) {
-                        Ok(torsten_mempool::MempoolAddResult::Added) => {
+                        Ok(MempoolAddResult::Added) => {
                             info!(hash = %tx_hash, "TxSubmission2: tx added to mempool");
                             stats.accepted += 1;
                         }
-                        Ok(torsten_mempool::MempoolAddResult::AlreadyExists) => {
+                        Ok(MempoolAddResult::AlreadyExists) => {
                             trace!(hash = %tx_hash, "TxSubmission2: tx already in mempool");
                             stats.duplicate += 1;
                         }
