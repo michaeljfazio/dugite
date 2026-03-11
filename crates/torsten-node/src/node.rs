@@ -2286,8 +2286,10 @@ impl Node {
                                 self.handle_rollback(&point).await;
                             }
                             Some(PipelineMsg::AtTip) => {
-                                info!(blocks_received, "Caught up to chain tip, awaiting new blocks");
-                                self.enable_strict_verification().await;
+                                if !self.consensus.strict_verification() {
+                                    info!(blocks_received, "Caught up to chain tip, enabling strict verification");
+                                    self.enable_strict_verification().await;
+                                }
                                 self.update_query_state().await;
                                 self.try_forge_block().await;
                                 // Reduce pipeline depth to 1 at tip
@@ -2434,15 +2436,19 @@ impl Node {
                                                     self.process_forward_blocks(blocks, &tip, &mut blocks_received, &mut blocks_since_last_log, &mut last_snapshot_epoch, &mut last_log_time, &mut last_query_update).await;
                                                 }
                                             }
-                                            info!(blocks_received, "Caught up to chain tip, awaiting new blocks");
-                                            self.enable_strict_verification().await;
+                                            if !self.consensus.strict_verification() {
+                                                info!(blocks_received, "Caught up to chain tip, enabling strict verification");
+                                                self.enable_strict_verification().await;
+                                            }
                                             self.update_query_state().await;
                                             self.try_forge_block().await;
                                             pipeline_depth = 1;
                                         }
                                         HeaderBatchResult::Await => {
-                                            info!(blocks_received, "Caught up to chain tip, awaiting new blocks");
-                                            self.enable_strict_verification().await;
+                                            if !self.consensus.strict_verification() {
+                                                info!(blocks_received, "Caught up to chain tip, enabling strict verification");
+                                                self.enable_strict_verification().await;
+                                            }
                                             self.update_query_state().await;
                                             self.try_forge_block().await;
                                             pipeline_depth = 1;
@@ -2498,8 +2504,10 @@ impl Node {
                                                 self.handle_rollback(&point).await;
                                             }
                                             ChainSyncEvent::Await => {
-                                                info!(blocks_received, "Caught up to chain tip, awaiting new blocks");
-                                                self.enable_strict_verification().await;
+                                                if !self.consensus.strict_verification() {
+                                                    info!(blocks_received, "Caught up to chain tip, enabling strict verification");
+                                                    self.enable_strict_verification().await;
+                                                }
                                                 self.update_query_state().await;
                                             }
                                             ChainSyncEvent::RollForward(..) => unreachable!(),
