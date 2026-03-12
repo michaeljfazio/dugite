@@ -289,7 +289,9 @@ impl PipelinedPeerClient {
                                 torsten_tip,
                             ));
                         }
-                        _ => {}
+                        other => {
+                            debug!("Pipelined ChainSync: non-block response after AwaitReply: {other:?}");
+                        }
                     }
 
                     if headers.is_empty() {

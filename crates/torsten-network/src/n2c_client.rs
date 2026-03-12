@@ -120,7 +120,7 @@ impl N2CClient {
 
         match msg_tag {
             1 => {
-                let version = decoder.u32().unwrap_or(0);
+                let version = decoder.u32().unwrap_or(0); // version only for logging
                 debug!("N2C handshake accepted, version {version}");
                 Ok(())
             }
@@ -241,7 +241,9 @@ impl N2CClient {
         let resp = self.recv_segment().await?;
         let mut decoder = minicbor::Decoder::new(&resp.payload);
         let _ = decoder.array();
-        let tag = decoder.u32().unwrap_or(999);
+        let tag = decoder
+            .u32()
+            .map_err(|e| N2CClientError::Protocol(format!("bad MsgResult tag: {e}")))?;
         if tag != 4 {
             return Err(N2CClientError::Protocol(format!(
                 "expected MsgResult(4), got {tag}"
@@ -281,7 +283,9 @@ impl N2CClient {
         let mut decoder = minicbor::Decoder::new(&resp.payload);
         // MsgResult [4, result]
         let _ = decoder.array();
-        let tag = decoder.u32().unwrap_or(999);
+        let tag = decoder
+            .u32()
+            .map_err(|e| N2CClientError::Protocol(format!("bad MsgResult tag: {e}")))?;
         if tag != 4 {
             return Err(N2CClientError::Protocol(format!(
                 "expected MsgResult(4), got {tag}"
@@ -564,7 +568,9 @@ impl N2CClient {
                 "expected MsgAcquired(2), got {tag}"
             )));
         }
-        let slot = decoder.u64().unwrap_or(0);
+        let slot = decoder
+            .u64()
+            .map_err(|e| N2CClientError::Protocol(format!("bad mempool slot: {e}")))?;
         Ok(slot)
     }
 
@@ -631,9 +637,15 @@ impl N2CClient {
             )));
         }
         let _ = decoder.array();
-        let capacity = decoder.u32().unwrap_or(0);
-        let size = decoder.u32().unwrap_or(0);
-        let num_txs = decoder.u32().unwrap_or(0);
+        let capacity = decoder
+            .u32()
+            .map_err(|e| N2CClientError::Protocol(format!("bad mempool capacity: {e}")))?;
+        let size = decoder
+            .u32()
+            .map_err(|e| N2CClientError::Protocol(format!("bad mempool size: {e}")))?;
+        let num_txs = decoder
+            .u32()
+            .map_err(|e| N2CClientError::Protocol(format!("bad mempool num_txs: {e}")))?;
         Ok((capacity, size, num_txs))
     }
 
