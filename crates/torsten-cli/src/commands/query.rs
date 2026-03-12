@@ -152,6 +152,51 @@ enum QuerySubcommand {
 }
 
 /// Map era index to era name
+/// Parse a simple ISO-8601 UTC timestamp to Unix seconds.
+/// Supports "YYYY-MM-DDThh:mm:ssZ" format.
+fn parse_iso8601_to_unix(s: &str) -> Option<u64> {
+    let s = s.trim_end_matches('Z');
+    let (date, time) = s.split_once('T')?;
+    let parts: Vec<&str> = date.split('-').collect();
+    if parts.len() != 3 {
+        return None;
+    }
+    let year: u64 = parts[0].parse().ok()?;
+    let month: u64 = parts[1].parse().ok()?;
+    let day: u64 = parts[2].parse().ok()?;
+
+    let time_parts: Vec<&str> = time.split(':').collect();
+    if time_parts.len() != 3 {
+        return None;
+    }
+    let hours: u64 = time_parts[0].parse().ok()?;
+    let minutes: u64 = time_parts[1].parse().ok()?;
+    let seconds: u64 = time_parts[2].parse().ok()?;
+
+    // Days from year 1970 to start of given year
+    let mut days: u64 = 0;
+    for y in 1970..year {
+        days += if y % 4 == 0 && (y % 100 != 0 || y % 400 == 0) {
+            366
+        } else {
+            365
+        };
+    }
+    // Days from start of year to start of given month
+    let is_leap = year.is_multiple_of(4) && (!year.is_multiple_of(100) || year.is_multiple_of(400));
+    let days_in_months: [u64; 12] = if is_leap {
+        [31, 29, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31]
+    } else {
+        [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31]
+    };
+    for &d in &days_in_months[..(month - 1) as usize] {
+        days += d;
+    }
+    days += day - 1;
+
+    Some(days * 86400 + hours * 3600 + minutes * 60 + seconds)
+}
+
 fn era_name(era: u32) -> &'static str {
     match era {
         0 => "Byron",
@@ -232,25 +277,29 @@ impl QueryCmd {
                 let era = client.query_era().await.unwrap_or(6);
                 let block_no = client.query_block_no().await.unwrap_or(tip.block_no);
 
+                // Query system start time from the node for accurate sync progress
+                let system_start_str = client.query_system_start().await.ok();
+
                 release_and_done(&mut client).await;
 
                 let hash_hex = hex::encode(&tip.hash);
                 let era_str = era_name(era);
 
-                // Estimate sync progress based on slot vs current time
-                // Shelley mainnet started at Unix time 1596059091 (slot 4492800)
-                // Preview/testnet may differ, but this gives a reasonable estimate
+                // Calculate sync progress using the node's system start time
                 let now_secs = std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
                     .unwrap_or_default()
                     .as_secs();
-                let shelley_start_time = if testnet_magic.is_some() {
-                    1_666_656_000u64 // Preview genesis
-                } else {
-                    1_596_059_091u64 // Mainnet Shelley start
-                };
-                let elapsed_secs = now_secs.saturating_sub(shelley_start_time);
-                let expected_tip_slot = elapsed_secs; // 1 slot = 1 second
+                let genesis_unix = system_start_str
+                    .as_deref()
+                    .and_then(parse_iso8601_to_unix)
+                    .unwrap_or(match testnet_magic {
+                        Some(2) => 1_666_656_000u64, // Preview
+                        Some(1) => 1_654_041_600u64, // Preprod
+                        _ => 1_596_059_091u64,       // Mainnet Shelley
+                    });
+                let elapsed_secs = now_secs.saturating_sub(genesis_unix);
+                let expected_tip_slot = elapsed_secs; // 1 slot ≈ 1 second (Shelley+)
                 let sync_progress = if expected_tip_slot > 0 {
                     (tip.slot as f64 / expected_tip_slot as f64 * 100.0).min(100.0)
                 } else {

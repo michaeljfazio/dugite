@@ -253,6 +253,80 @@ impl N2CClient {
         Ok(era)
     }
 
+    /// Query the system start time (GetSystemStart - top-level query tag 1)
+    ///
+    /// Returns the system start time as an ISO-8601 UTC string, e.g. "2022-10-25T00:00:00Z"
+    pub async fn query_system_start(&mut self) -> Result<String, N2CClientError> {
+        // GetSystemStart is a top-level (non-era-wrapped) query
+        let mut payload = Vec::new();
+        let mut enc = minicbor::Encoder::new(&mut payload);
+        enc.array(2)
+            .map_err(|e| N2CClientError::Protocol(e.to_string()))?;
+        enc.u32(3)
+            .map_err(|e| N2CClientError::Protocol(e.to_string()))?; // MsgQuery
+        enc.array(1)
+            .map_err(|e| N2CClientError::Protocol(e.to_string()))?;
+        enc.u32(1)
+            .map_err(|e| N2CClientError::Protocol(e.to_string()))?; // GetSystemStart
+
+        let segment = Segment {
+            transmission_time: 0,
+            protocol_id: MINI_PROTOCOL_STATE_QUERY,
+            is_responder: false,
+            payload,
+        };
+        self.send_segment(&segment).await?;
+
+        let resp = self.recv_segment().await?;
+        let mut decoder = minicbor::Decoder::new(&resp.payload);
+        // MsgResult [4, result]
+        let _ = decoder.array();
+        let tag = decoder.u32().unwrap_or(999);
+        if tag != 4 {
+            return Err(N2CClientError::Protocol(format!(
+                "expected MsgResult(4), got {tag}"
+            )));
+        }
+        // SystemStart is encoded as UTCTime: [year, day_of_year, pico_of_day]
+        let _ = decoder.array(); // array(3)
+        let year = decoder
+            .u32()
+            .map_err(|e| N2CClientError::Protocol(format!("bad year: {e}")))?;
+        let day_of_year = decoder
+            .u32()
+            .map_err(|e| N2CClientError::Protocol(format!("bad day: {e}")))?;
+        let pico_of_day = decoder
+            .u64()
+            .map_err(|e| N2CClientError::Protocol(format!("bad pico: {e}")))?;
+
+        // Convert to ISO-8601 UTC timestamp
+        // day_of_year is 1-based, convert to month/day
+        let is_leap = (year % 4 == 0 && year % 100 != 0) || (year % 400 == 0);
+        let days_in_months: [u32; 12] = if is_leap {
+            [31, 29, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31]
+        } else {
+            [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31]
+        };
+        let mut remaining = day_of_year;
+        let mut month = 1u32;
+        for &days in &days_in_months {
+            if remaining <= days {
+                break;
+            }
+            remaining -= days;
+            month += 1;
+        }
+        let day = remaining;
+        let secs_of_day = (pico_of_day / 1_000_000_000_000) as u32;
+        let hours = secs_of_day / 3600;
+        let minutes = (secs_of_day % 3600) / 60;
+        let seconds = secs_of_day % 60;
+
+        Ok(format!(
+            "{year:04}-{month:02}-{day:02}T{hours:02}:{minutes:02}:{seconds:02}Z"
+        ))
+    }
+
     /// Query the chain block number (GetChainBlockNo - top-level query tag 2)
     pub async fn query_block_no(&mut self) -> Result<u64, N2CClientError> {
         // GetChainBlockNo is a top-level (non-era-wrapped) query
