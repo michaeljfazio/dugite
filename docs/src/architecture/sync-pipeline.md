@@ -86,11 +86,17 @@ When the ChainSync peer sends a `MsgRollBackward` message, the node:
 
 Only blocks in the VolatileDB (the last k=2160 blocks) can be rolled back. Blocks that have been flushed to the ImmutableDB are permanent.
 
+## Pipelined ChainSync
+
+Torsten uses pipelined ChainSync to avoid the round-trip latency bottleneck of serial header requests. Instead of waiting for each `MsgRollForward` before requesting the next header, the node sends up to 150 `MsgRequestNext` messages concurrently (configurable via `TORSTEN_PIPELINE_DEPTH`).
+
+This bypasses pallas' serial ChainSync state machine in favor of a custom implementation that manages the pipeline depth directly.
+
 ## Performance Characteristics
 
-- **Header collection** is serial per peer due to the ChainSync protocol design (~300ms per header request for network RTT)
-- **Block fetching** is parallelized across multiple peers
+- **Header collection** is pipelined per peer (up to 150 in-flight requests, configurable via `TORSTEN_PIPELINE_DEPTH`)
+- **Block fetching** is parallelized across up to 4 concurrent peers
 - **Block processing** is batched (500 blocks per batch) with single-lock acquisition
 - **Throughput** depends on network latency, peer count, and block sizes
 
-The primary bottleneck during initial sync is the serial header-by-header ChainSync protocol. Multi-peer ChainSync (fetching headers from multiple peers simultaneously) is planned for future optimization.
+On preview testnet, full sync from genesis completes in approximately 10 hours, with block replay (from Mithril snapshot) achieving ~10,600 blocks/second.
