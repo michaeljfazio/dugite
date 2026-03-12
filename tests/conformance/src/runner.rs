@@ -408,15 +408,38 @@ fn run_cert_test(vector_path: &str, vector: &ConformanceTestVector) -> Conforman
                 },
             }
         }
-        ConformanceExpectedOutput::Failure { errors } => {
-            // For CERT failures, we'd need to check preconditions. For now,
-            // mark as passed if we detect the certificate would fail.
-            ConformanceTestResult {
-                details: Some(format!(
-                    "CERT failure testing not fully implemented. Expected errors: {:?}",
-                    errors
-                )),
-                ..base
+        ConformanceExpectedOutput::Failure {
+            errors: expected_errors,
+        } => {
+            // Check CERT preconditions and collect violations
+            let actual_errors = check_cert_preconditions(&input_state, &test_cert, &_env);
+            if actual_errors.is_empty() {
+                return ConformanceTestResult {
+                    details: Some(format!(
+                        "Expected failure with errors {:?} but no precondition violations found",
+                        expected_errors
+                    )),
+                    ..base
+                };
+            }
+
+            let all_expected_found = expected_errors
+                .iter()
+                .all(|exp| actual_errors.iter().any(|act| act == exp));
+
+            if all_expected_found {
+                ConformanceTestResult {
+                    passed: true,
+                    ..base
+                }
+            } else {
+                ConformanceTestResult {
+                    details: Some(format!(
+                        "CERT error mismatch: expected={:?}, actual={:?}",
+                        expected_errors, actual_errors
+                    )),
+                    ..base
+                }
             }
         }
     }
@@ -678,6 +701,74 @@ fn simulate_gov_apply(state: &GovState, signal: &GovSignal, env: &GovEnvironment
     }
 
     result
+}
+
+/// Check CERT preconditions and return a list of error categories.
+///
+/// This mirrors the ledger's certificate precondition checks:
+/// - StakeKeyAlreadyRegistered: registering an already-registered credential
+/// - StakeKeyNotRegistered: deregistering/delegating with unregistered credential
+/// - PoolRetirementTooLate: retirement epoch exceeds e_max
+/// - DRepAlreadyRegistered: registering an existing DRep
+/// - DRepNotRegistered: deregistering a non-existent DRep
+fn check_cert_preconditions(
+    state: &CertState,
+    cert: &TestCertificate,
+    env: &CertEnvironment,
+) -> Vec<String> {
+    let mut errors = Vec::new();
+
+    match cert {
+        TestCertificate::StakeRegistration { credential }
+        | TestCertificate::ConwayStakeRegistration { credential, .. } => {
+            let key = credential_hash(credential);
+            if state.d_state.registrations.contains_key(&key) {
+                errors.push("StakeKeyAlreadyRegistered".to_string());
+            }
+        }
+        TestCertificate::StakeDeregistration { credential }
+        | TestCertificate::ConwayStakeDeregistration { credential, .. } => {
+            let key = credential_hash(credential);
+            if !state.d_state.registrations.contains_key(&key) {
+                errors.push("StakeKeyNotRegistered".to_string());
+            }
+        }
+        TestCertificate::StakeDelegation { credential, .. } => {
+            let key = credential_hash(credential);
+            if !state.d_state.registrations.contains_key(&key) {
+                errors.push("StakeKeyNotRegistered".to_string());
+            }
+        }
+        TestCertificate::PoolRetirement { epoch, .. } => {
+            let max_epoch = env.epoch + env.protocol_params.e_max;
+            if *epoch > max_epoch {
+                errors.push("PoolRetirementTooLate".to_string());
+            }
+        }
+        TestCertificate::RegDRep { credential, .. } => {
+            let key = credential_hash(credential);
+            if state.g_state.dreps.contains_key(&key) {
+                errors.push("DRepAlreadyRegistered".to_string());
+            }
+        }
+        TestCertificate::UnregDRep { credential, .. } => {
+            let key = credential_hash(credential);
+            if !state.g_state.dreps.contains_key(&key) {
+                errors.push("DRepNotRegistered".to_string());
+            }
+        }
+        TestCertificate::VoteDelegation { credential, .. } => {
+            let key = credential_hash(credential);
+            if !state.d_state.registrations.contains_key(&key) {
+                errors.push("StakeKeyNotRegistered".to_string());
+            }
+        }
+        TestCertificate::PoolRegistration { .. } => {
+            // Pool registration always succeeds (re-registration updates params)
+        }
+    }
+
+    errors
 }
 
 /// Extract the hash string from a test credential.
