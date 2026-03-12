@@ -1577,3 +1577,538 @@ fn encode_query_result_value(enc: &mut minicbor::Encoder<&mut Vec<u8>>, result: 
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::query_handler::*;
+
+    /// Helper: encode a QueryResult and return the raw CBOR bytes.
+    fn encode(result: &QueryResult) -> Vec<u8> {
+        encode_query_result(result)
+    }
+
+    /// Helper: decode and verify the MsgResult [4, ...] envelope.
+    /// Returns the decoder positioned after the envelope.
+    fn decode_msg_result(buf: &[u8]) -> minicbor::Decoder<'_> {
+        let mut dec = minicbor::Decoder::new(buf);
+        let arr = dec.array().unwrap().unwrap();
+        assert_eq!(arr, 2, "MsgResult outer array must be 2");
+        let tag = dec.u32().unwrap();
+        assert_eq!(tag, 4, "MsgResult tag must be 4");
+        dec
+    }
+
+    /// Helper: strip HFC EitherMismatch Right wrapper array(1).
+    fn strip_hfc(dec: &mut minicbor::Decoder<'_>) {
+        let arr = dec.array().unwrap().unwrap();
+        assert_eq!(arr, 1, "HFC success wrapper must be array(1)");
+    }
+
+    #[test]
+    fn test_encode_epoch_no() {
+        let buf = encode(&QueryResult::EpochNo(500));
+        let mut dec = decode_msg_result(&buf);
+        strip_hfc(&mut dec);
+        assert_eq!(dec.u64().unwrap(), 500);
+    }
+
+    #[test]
+    fn test_encode_chain_block_no() {
+        let buf = encode(&QueryResult::ChainBlockNo(12345));
+        let mut dec = decode_msg_result(&buf);
+        // No HFC wrapper for top-level queries
+        let arr = dec.array().unwrap().unwrap();
+        assert_eq!(arr, 2);
+        assert_eq!(dec.u8().unwrap(), 1); // At constructor
+        assert_eq!(dec.u64().unwrap(), 12345);
+    }
+
+    #[test]
+    fn test_encode_chain_point() {
+        let hash = vec![0xAB; 32];
+        let buf = encode(&QueryResult::ChainPoint {
+            slot: 42,
+            hash: hash.clone(),
+        });
+        let mut dec = decode_msg_result(&buf);
+        // No HFC wrapper
+        let arr = dec.array().unwrap().unwrap();
+        assert_eq!(arr, 2);
+        assert_eq!(dec.u64().unwrap(), 42);
+        assert_eq!(dec.bytes().unwrap(), &hash);
+    }
+
+    #[test]
+    fn test_encode_chain_point_origin() {
+        let buf = encode(&QueryResult::ChainPoint {
+            slot: 0,
+            hash: vec![],
+        });
+        let mut dec = decode_msg_result(&buf);
+        let arr = dec.array().unwrap().unwrap();
+        assert_eq!(arr, 0); // Origin = empty array
+    }
+
+    #[test]
+    fn test_encode_system_start() {
+        let buf = encode(&QueryResult::SystemStart(
+            "2022-10-25T00:00:00Z".to_string(),
+        ));
+        let mut dec = decode_msg_result(&buf);
+        // No HFC wrapper for SystemStart
+        let arr = dec.array().unwrap().unwrap();
+        assert_eq!(arr, 3);
+        let year = dec.u64().unwrap();
+        let day_of_year = dec.u64().unwrap();
+        let picos = dec.u64().unwrap();
+        assert_eq!(year, 2022);
+        assert_eq!(day_of_year, 298); // Oct 25 = day 298
+        assert_eq!(picos, 0);
+    }
+
+    #[test]
+    fn test_encode_current_era() {
+        let buf = encode(&QueryResult::CurrentEra(6));
+        let mut dec = decode_msg_result(&buf);
+        // No HFC wrapper for QueryAnytime
+        assert_eq!(dec.u32().unwrap(), 6);
+    }
+
+    #[test]
+    fn test_encode_constitution() {
+        let buf = encode(&QueryResult::Constitution {
+            url: "https://example.com/constitution".to_string(),
+            data_hash: vec![0xCC; 32],
+            script_hash: Some(vec![0xDD; 28]),
+        });
+        let mut dec = decode_msg_result(&buf);
+        strip_hfc(&mut dec);
+        // Constitution = array(2) [Anchor, StrictMaybe ScriptHash]
+        let arr = dec.array().unwrap().unwrap();
+        assert_eq!(arr, 2);
+        // Anchor = array(2) [url, hash]
+        let arr2 = dec.array().unwrap().unwrap();
+        assert_eq!(arr2, 2);
+        assert_eq!(dec.str().unwrap(), "https://example.com/constitution");
+        assert_eq!(dec.bytes().unwrap(), &[0xCC; 32]);
+        // StrictMaybe ScriptHash (bytes for Just)
+        assert_eq!(dec.bytes().unwrap(), &[0xDD; 28]);
+    }
+
+    #[test]
+    fn test_encode_constitution_no_script() {
+        let buf = encode(&QueryResult::Constitution {
+            url: "https://example.com".to_string(),
+            data_hash: vec![0xAA; 32],
+            script_hash: None,
+        });
+        let mut dec = decode_msg_result(&buf);
+        strip_hfc(&mut dec);
+        let arr = dec.array().unwrap().unwrap();
+        assert_eq!(arr, 2);
+        let _ = dec.array(); // anchor
+        let _ = dec.str(); // url
+        let _ = dec.bytes(); // hash
+                             // StrictMaybe Nothing = null
+        assert!(dec.null().is_ok());
+    }
+
+    #[test]
+    fn test_encode_account_state() {
+        let buf = encode(&QueryResult::AccountState {
+            treasury: 42_000_000_000,
+            reserves: 13_000_000_000_000,
+        });
+        let mut dec = decode_msg_result(&buf);
+        strip_hfc(&mut dec);
+        let arr = dec.array().unwrap().unwrap();
+        assert_eq!(arr, 2);
+        assert_eq!(dec.u64().unwrap(), 42_000_000_000);
+        assert_eq!(dec.u64().unwrap(), 13_000_000_000_000);
+    }
+
+    #[test]
+    fn test_encode_utxo_coin_only() {
+        let buf = encode(&QueryResult::UtxoByAddress(vec![UtxoSnapshot {
+            tx_hash: vec![0x11; 32],
+            output_index: 0,
+            address_bytes: vec![0x01; 57],
+            lovelace: 5_000_000,
+            multi_asset: vec![],
+            datum_hash: None,
+            raw_cbor: None,
+        }]));
+        let mut dec = decode_msg_result(&buf);
+        strip_hfc(&mut dec);
+        // Map with 1 entry
+        let map_len = dec.map().unwrap().unwrap();
+        assert_eq!(map_len, 1);
+        // Key: [tx_hash, index]
+        let _ = dec.array();
+        assert_eq!(dec.bytes().unwrap(), &[0x11; 32]);
+        assert_eq!(dec.u32().unwrap(), 0);
+        // Value: PostAlonzo output map
+        let fields = dec.map().unwrap().unwrap();
+        assert_eq!(fields, 2); // address + value (no datum)
+                               // field 0: address
+        assert_eq!(dec.u32().unwrap(), 0);
+        assert_eq!(dec.bytes().unwrap(), &[0x01; 57]);
+        // field 1: value (coin-only = plain integer)
+        assert_eq!(dec.u32().unwrap(), 1);
+        assert_eq!(dec.u64().unwrap(), 5_000_000);
+    }
+
+    #[test]
+    fn test_encode_utxo_multi_asset() {
+        let buf = encode(&QueryResult::UtxoByAddress(vec![UtxoSnapshot {
+            tx_hash: vec![0x22; 32],
+            output_index: 1,
+            address_bytes: vec![0x02; 57],
+            lovelace: 2_000_000,
+            multi_asset: vec![(vec![0xAA; 28], vec![("Token1".as_bytes().to_vec(), 100)])],
+            datum_hash: None,
+            raw_cbor: None,
+        }]));
+        let mut dec = decode_msg_result(&buf);
+        strip_hfc(&mut dec);
+        let _ = dec.map(); // 1 entry
+        let _ = dec.array(); // key
+        let _ = dec.bytes(); // tx_hash
+        let _ = dec.u32(); // index
+        let _ = dec.map(); // output fields
+        let _ = dec.u32(); // field 0
+        let _ = dec.bytes(); // address
+        assert_eq!(dec.u32().unwrap(), 1); // field 1 (value)
+                                           // Multi-asset: [coin, {policy -> {asset -> qty}}]
+        let arr = dec.array().unwrap().unwrap();
+        assert_eq!(arr, 2);
+        assert_eq!(dec.u64().unwrap(), 2_000_000);
+        let _ = dec.map(); // policy map
+        assert_eq!(dec.bytes().unwrap(), &[0xAA; 28]);
+        let _ = dec.map(); // asset map
+        assert_eq!(dec.bytes().unwrap(), "Token1".as_bytes());
+        assert_eq!(dec.u64().unwrap(), 100);
+    }
+
+    #[test]
+    fn test_encode_stake_distribution() {
+        let buf = encode(&QueryResult::StakeDistribution(vec![StakePoolSnapshot {
+            pool_id: vec![0x33; 28],
+            stake: 1_000_000,
+            total_active_stake: 10_000_000,
+            vrf_keyhash: vec![0x44; 32],
+        }]));
+        let mut dec = decode_msg_result(&buf);
+        strip_hfc(&mut dec);
+        let map_len = dec.map().unwrap().unwrap();
+        assert_eq!(map_len, 1);
+        assert_eq!(dec.bytes().unwrap(), &[0x33; 28]);
+        let arr = dec.array().unwrap().unwrap();
+        assert_eq!(arr, 2);
+        // Tagged rational
+        let tag = dec.tag().unwrap();
+        assert_eq!(tag.as_u64(), 30);
+        let _ = dec.array();
+        assert_eq!(dec.u64().unwrap(), 1_000_000);
+        assert_eq!(dec.u64().unwrap(), 10_000_000);
+        assert_eq!(dec.bytes().unwrap(), &[0x44; 32]);
+    }
+
+    #[test]
+    fn test_encode_stake_pools_sorted() {
+        let mut pool_a = vec![0x01; 28];
+        let mut pool_b = vec![0x02; 28];
+        // Put them in reverse order — encoding should sort
+        let buf = encode(&QueryResult::StakePools(vec![
+            pool_b.clone(),
+            pool_a.clone(),
+        ]));
+        let mut dec = decode_msg_result(&buf);
+        strip_hfc(&mut dec);
+        let tag = dec.tag().unwrap();
+        assert_eq!(tag.as_u64(), 258); // Set tag
+        let arr = dec.array().unwrap().unwrap();
+        assert_eq!(arr, 2);
+        // First should be pool_a (0x01...) since sorted
+        pool_a.sort();
+        pool_b.sort();
+        let first = dec.bytes().unwrap().to_vec();
+        let second = dec.bytes().unwrap().to_vec();
+        assert!(first < second, "CBOR Set elements must be sorted");
+    }
+
+    #[test]
+    fn test_encode_drep_state() {
+        let buf = encode(&QueryResult::DRepState(vec![DRepSnapshot {
+            credential_type: 0,
+            credential_hash: vec![0x55; 28],
+            expiry_epoch: 200,
+            deposit: 500_000_000,
+            anchor_url: Some("https://drep.example.com".to_string()),
+            anchor_hash: Some(vec![0x66; 32]),
+            delegator_hashes: vec![vec![0x77; 28]],
+        }]));
+        let mut dec = decode_msg_result(&buf);
+        strip_hfc(&mut dec);
+        let map_len = dec.map().unwrap().unwrap();
+        assert_eq!(map_len, 1);
+        // Key: Credential [0, hash]
+        let _ = dec.array();
+        assert_eq!(dec.u8().unwrap(), 0);
+        assert_eq!(dec.bytes().unwrap(), &[0x55; 28]);
+        // Value: DRepState array(4)
+        let arr = dec.array().unwrap().unwrap();
+        assert_eq!(arr, 4);
+        assert_eq!(dec.u64().unwrap(), 200); // expiry
+                                             // anchor: SJust
+        let sjust = dec.array().unwrap().unwrap();
+        assert_eq!(sjust, 1);
+        let _ = dec.array(); // Anchor
+        assert_eq!(dec.str().unwrap(), "https://drep.example.com");
+        assert_eq!(dec.bytes().unwrap(), &[0x66; 32]);
+        // deposit
+        assert_eq!(dec.u64().unwrap(), 500_000_000);
+        // delegators: tag(258) Set
+        let tag = dec.tag().unwrap();
+        assert_eq!(tag.as_u64(), 258);
+    }
+
+    #[test]
+    fn test_encode_committee_state() {
+        let buf = encode(&QueryResult::CommitteeState(CommitteeSnapshot {
+            members: vec![CommitteeMemberSnapshot {
+                cold_credential_type: 0,
+                cold_credential: vec![0x88; 28],
+                hot_status: 0, // Authorized
+                hot_credential: Some(vec![0x99; 28]),
+                member_status: 0, // Active
+                expiry_epoch: Some(300),
+            }],
+            threshold: Some((2, 3)),
+            current_epoch: 100,
+        }));
+        let mut dec = decode_msg_result(&buf);
+        strip_hfc(&mut dec);
+        // array(3) [members_map, maybe_threshold, epoch]
+        let arr = dec.array().unwrap().unwrap();
+        assert_eq!(arr, 3);
+        let map_len = dec.map().unwrap().unwrap();
+        assert_eq!(map_len, 1);
+        // Key: credential
+        let _ = dec.array();
+        assert_eq!(dec.u8().unwrap(), 0);
+        assert_eq!(dec.bytes().unwrap(), &[0x88; 28]);
+        // Value: CommitteeMemberState array(4)
+        let arr = dec.array().unwrap().unwrap();
+        assert_eq!(arr, 4);
+        // [0] HotCredAuthStatus: MemberAuthorized [0, credential]
+        let _ = dec.array();
+        assert_eq!(dec.u32().unwrap(), 0);
+        let _ = dec.array(); // credential
+        let _ = dec.u8(); // type
+        assert_eq!(dec.bytes().unwrap(), &[0x99; 28]);
+        // [1] status
+        assert_eq!(dec.u8().unwrap(), 0);
+        // [2] Maybe EpochNo: SJust
+        let sjust = dec.array().unwrap().unwrap();
+        assert_eq!(sjust, 1);
+        assert_eq!(dec.u64().unwrap(), 300);
+        // [3] NextEpochChange: [2] NoChangeExpected
+        let _ = dec.array();
+        assert_eq!(dec.u32().unwrap(), 2);
+        // Threshold: SJust
+        let sjust = dec.array().unwrap().unwrap();
+        assert_eq!(sjust, 1);
+        let tag = dec.tag().unwrap();
+        assert_eq!(tag.as_u64(), 30);
+        // Current epoch
+        let _ = dec.array();
+        let _ = dec.u64(); // num
+        let _ = dec.u64(); // den
+        assert_eq!(dec.u64().unwrap(), 100);
+    }
+
+    #[test]
+    fn test_encode_ratify_state() {
+        let buf = encode(&QueryResult::RatifyState {
+            enacted: Vec::new(),
+            expired: Vec::new(),
+            delayed: false,
+        });
+        let mut dec = decode_msg_result(&buf);
+        strip_hfc(&mut dec);
+        let arr = dec.array().unwrap().unwrap();
+        assert_eq!(arr, 4);
+        // enacted: Seq (array)
+        let enacted_len = dec.array().unwrap().unwrap();
+        assert_eq!(enacted_len, 0);
+        // expired: Seq (array)
+        let expired_len = dec.array().unwrap().unwrap();
+        assert_eq!(expired_len, 0);
+        // delayed
+        assert!(!dec.bool().unwrap());
+    }
+
+    #[test]
+    fn test_encode_stake_deleg_deposits() {
+        let buf = encode(&QueryResult::StakeDelegDeposits(vec![
+            StakeDelegDepositEntry {
+                credential_type: 0,
+                credential_hash: vec![0xAA; 28],
+                deposit: 2_000_000,
+            },
+        ]));
+        let mut dec = decode_msg_result(&buf);
+        strip_hfc(&mut dec);
+        let map_len = dec.map().unwrap().unwrap();
+        assert_eq!(map_len, 1);
+        let _ = dec.array();
+        assert_eq!(dec.u8().unwrap(), 0);
+        assert_eq!(dec.bytes().unwrap(), &[0xAA; 28]);
+        assert_eq!(dec.u64().unwrap(), 2_000_000);
+    }
+
+    #[test]
+    fn test_encode_drep_stake_distr() {
+        let buf = encode(&QueryResult::DRepStakeDistr(vec![
+            DRepStakeEntry {
+                drep_type: 0,
+                drep_hash: Some(vec![0xBB; 28]),
+                stake: 5_000_000,
+            },
+            DRepStakeEntry {
+                drep_type: 2, // AlwaysAbstain
+                drep_hash: None,
+                stake: 1_000_000,
+            },
+        ]));
+        let mut dec = decode_msg_result(&buf);
+        strip_hfc(&mut dec);
+        let map_len = dec.map().unwrap().unwrap();
+        assert_eq!(map_len, 2);
+        // Entry 1: [0, hash] -> 5M
+        let arr = dec.array().unwrap().unwrap();
+        assert_eq!(arr, 2);
+        assert_eq!(dec.u8().unwrap(), 0);
+        assert_eq!(dec.bytes().unwrap(), &[0xBB; 28]);
+        assert_eq!(dec.u64().unwrap(), 5_000_000);
+        // Entry 2: [2] -> 1M (AlwaysAbstain has no hash)
+        let arr = dec.array().unwrap().unwrap();
+        assert_eq!(arr, 1);
+        assert_eq!(dec.u8().unwrap(), 2);
+        assert_eq!(dec.u64().unwrap(), 1_000_000);
+    }
+
+    #[test]
+    fn test_encode_filtered_vote_delegatees() {
+        let buf = encode(&QueryResult::FilteredVoteDelegatees(vec![
+            VoteDelegateeEntry {
+                credential_type: 0,
+                credential_hash: vec![0xCC; 28],
+                drep_type: 0,
+                drep_hash: Some(vec![0xDD; 28]),
+            },
+        ]));
+        let mut dec = decode_msg_result(&buf);
+        strip_hfc(&mut dec);
+        let map_len = dec.map().unwrap().unwrap();
+        assert_eq!(map_len, 1);
+        // Key: Credential [0, hash]
+        let _ = dec.array();
+        assert_eq!(dec.u8().unwrap(), 0);
+        assert_eq!(dec.bytes().unwrap(), &[0xCC; 28]);
+        // Value: DRep [0, hash]
+        let arr = dec.array().unwrap().unwrap();
+        assert_eq!(arr, 2);
+        assert_eq!(dec.u8().unwrap(), 0);
+        assert_eq!(dec.bytes().unwrap(), &[0xDD; 28]);
+    }
+
+    #[test]
+    fn test_encode_hfc_wrapper_present_for_block_query() {
+        // BlockQuery results (like EpochNo) MUST have HFC wrapper
+        let buf = encode(&QueryResult::EpochNo(100));
+        let mut dec = minicbor::Decoder::new(&buf);
+        let _ = dec.array(); // outer [4, ...]
+        let _ = dec.u32(); // tag 4
+                           // Must be array(1) HFC wrapper
+        let arr = dec.array().unwrap().unwrap();
+        assert_eq!(arr, 1, "BlockQuery result must have HFC array(1) wrapper");
+    }
+
+    #[test]
+    fn test_encode_no_hfc_wrapper_for_system_start() {
+        // Top-level queries do NOT have HFC wrapper
+        let buf = encode(&QueryResult::SystemStart(
+            "2022-01-01T00:00:00Z".to_string(),
+        ));
+        let mut dec = minicbor::Decoder::new(&buf);
+        let _ = dec.array(); // outer [4, ...]
+        let _ = dec.u32(); // tag 4
+                           // Next element should be array(3) (UTCTime), NOT array(1) (HFC wrapper)
+        let arr = dec.array().unwrap().unwrap();
+        assert_eq!(arr, 3, "SystemStart should NOT have HFC wrapper");
+    }
+
+    #[test]
+    fn test_encode_no_hfc_wrapper_for_chain_block_no() {
+        let buf = encode(&QueryResult::ChainBlockNo(999));
+        let mut dec = minicbor::Decoder::new(&buf);
+        let _ = dec.array(); // outer [4, ...]
+        let _ = dec.u32(); // tag 4
+                           // Should be array(2) [1, blockNo], NOT array(1) HFC wrapper
+        let arr = dec.array().unwrap().unwrap();
+        assert_eq!(
+            arr, 2,
+            "ChainBlockNo should NOT have HFC wrapper, should be [1, blockNo]"
+        );
+    }
+
+    #[test]
+    fn test_encode_proposals() {
+        let buf = encode(&QueryResult::Proposals(vec![ProposalSnapshot {
+            tx_id: vec![0x11; 32],
+            action_index: 0,
+            action_type: "InfoAction".to_string(),
+            proposed_epoch: 100,
+            expires_epoch: 106,
+            yes_votes: 5,
+            no_votes: 1,
+            abstain_votes: 0,
+            deposit: 100_000_000_000,
+            return_addr: vec![0x00; 29],
+            anchor_url: "https://example.com".to_string(),
+            anchor_hash: vec![0xAA; 32],
+            committee_votes: vec![],
+            drep_votes: vec![],
+            spo_votes: vec![],
+        }]));
+        let mut dec = decode_msg_result(&buf);
+        strip_hfc(&mut dec);
+        // Proposals: array(n)
+        let arr = dec.array().unwrap().unwrap();
+        assert_eq!(arr, 1);
+        // GovActionState: array(7)
+        let gas_arr = dec.array().unwrap().unwrap();
+        assert_eq!(gas_arr, 7, "GovActionState must be array(7)");
+    }
+
+    #[test]
+    fn test_encode_pool_default_vote() {
+        let buf = encode(&QueryResult::StakePoolDefaultVote(vec![
+            PoolDefaultVoteEntry {
+                pool_id: vec![0xEE; 28],
+                default_vote: 1, // Abstain
+            },
+        ]));
+        let mut dec = decode_msg_result(&buf);
+        strip_hfc(&mut dec);
+        let map_len = dec.map().unwrap().unwrap();
+        assert_eq!(map_len, 1);
+        assert_eq!(dec.bytes().unwrap(), &[0xEE; 28]);
+        let arr = dec.array().unwrap().unwrap();
+        assert_eq!(arr, 1);
+        assert_eq!(dec.u32().unwrap(), 1); // Abstain
+    }
+}
