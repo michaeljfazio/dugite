@@ -4,7 +4,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UnixStream;
 use tracing::debug;
 
-use crate::multiplexer::Segment;
+use crate::multiplexer::{Segment, SEGMENT_HEADER_SIZE};
 
 #[derive(Error, Debug)]
 pub enum N2CClientError {
@@ -683,28 +683,63 @@ impl N2CClient {
         Ok(())
     }
 
-    /// Receive a multiplexer segment
+    /// Receive a complete multiplexer message, reassembling multiple wire segments.
+    ///
+    /// The Ouroboros multiplexer splits messages larger than 65535 bytes into
+    /// multiple wire segments. This method reads all consecutive segments for
+    /// the same protocol and concatenates their payloads into a single logical
+    /// Segment.
     async fn recv_segment(&mut self) -> Result<Segment, N2CClientError> {
-        let mut buf = vec![0u8; 65536];
-        let mut offset = 0;
+        // Initial buffer: enough for one max wire segment (header + 65535 payload)
+        let mut buf = vec![0u8; SEGMENT_HEADER_SIZE + 65535 + 4096];
+        let mut buf_offset = 0;
+
+        let mut combined_payload: Vec<u8> = Vec::new();
+        let mut first_segment: Option<Segment> = None;
 
         loop {
-            let n = self.stream.read(&mut buf[offset..]).await?;
-            if n == 0 {
-                return Err(N2CClientError::Protocol("connection closed".into()));
-            }
-            offset += n;
+            // Try to decode a wire segment from buffered data
+            match Segment::decode(&buf[..buf_offset]) {
+                Ok((segment, consumed)) => {
+                    // Accumulate payload
+                    combined_payload.extend_from_slice(&segment.payload);
 
-            // Try to decode a segment
-            match Segment::decode(&buf[..offset]) {
-                Ok((segment, _consumed)) => {
-                    return Ok(segment);
+                    if first_segment.is_none() {
+                        first_segment = Some(Segment {
+                            transmission_time: segment.transmission_time,
+                            protocol_id: segment.protocol_id,
+                            is_responder: segment.is_responder,
+                            payload: Vec::new(), // will be replaced
+                        });
+                    }
+
+                    // Shift remaining data to front of buffer
+                    let remaining = buf_offset - consumed;
+                    if remaining > 0 {
+                        buf.copy_within(consumed..buf_offset, 0);
+                    }
+                    buf_offset = remaining;
+
+                    // If the segment payload was less than max, this is the last chunk
+                    if segment.payload.len() < 65535 {
+                        let mut result = first_segment.unwrap();
+                        result.payload = combined_payload;
+                        return Ok(result);
+                    }
+                    // Otherwise, keep reading — more chunks expected
+                    continue;
                 }
                 Err(_) => {
-                    if offset >= buf.len() {
-                        return Err(N2CClientError::Protocol("response too large".into()));
+                    // Need more data from the network
+                    if buf_offset >= buf.len() {
+                        // Grow the buffer
+                        buf.resize(buf.len() + 65536, 0);
                     }
-                    continue; // Need more data
+                    let n = self.stream.read(&mut buf[buf_offset..]).await?;
+                    if n == 0 {
+                        return Err(N2CClientError::Protocol("connection closed".into()));
+                    }
+                    buf_offset += n;
                 }
             }
         }
@@ -1313,5 +1348,80 @@ mod tests {
         } else {
             panic!("expected array");
         }
+    }
+
+    /// Test that recv_segment correctly reassembles multi-segment messages.
+    ///
+    /// Large payloads (>65535 bytes) are chunked by Segment::encode() into
+    /// multiple wire segments. recv_segment must read all chunks and
+    /// concatenate them.
+    #[tokio::test]
+    async fn test_recv_segment_multi_chunk_reassembly() {
+        // Create a payload larger than MAX_SEGMENT_PAYLOAD (65535 bytes)
+        let large_payload: Vec<u8> = (0..100_000).map(|i| (i % 256) as u8).collect();
+        let segment = Segment {
+            transmission_time: 0,
+            protocol_id: MINI_PROTOCOL_STATE_QUERY,
+            is_responder: true,
+            payload: large_payload.clone(),
+        };
+
+        // encode() splits into multiple wire segments
+        let wire_bytes = segment.encode();
+        // Should be at least 2 wire segments (100KB > 65535)
+        assert!(
+            wire_bytes.len() > 65535 + SEGMENT_HEADER_SIZE,
+            "expected multi-segment encoding"
+        );
+
+        // Use a Unix socket pair for the test
+        let (sock_a, sock_b) = tokio::net::UnixStream::pair().unwrap();
+
+        // Spawn writer on one end
+        let writer = tokio::spawn(async move {
+            use tokio::io::AsyncWriteExt;
+            let mut writer_stream = sock_b;
+            writer_stream.write_all(&wire_bytes).await.unwrap();
+            writer_stream.shutdown().await.unwrap();
+        });
+
+        // Create an N2CClient using the other end
+        let mut client = N2CClient { stream: sock_a };
+
+        let result = client.recv_segment().await.unwrap();
+        assert_eq!(result.payload.len(), large_payload.len());
+        assert_eq!(result.payload, large_payload);
+        assert_eq!(result.protocol_id, MINI_PROTOCOL_STATE_QUERY);
+
+        writer.await.unwrap();
+    }
+
+    /// Test that recv_segment works for single-segment (small) messages.
+    #[tokio::test]
+    async fn test_recv_segment_single_chunk() {
+        let small_payload = vec![0x83, 0x01, 0x02, 0x03]; // 4 bytes
+        let segment = Segment {
+            transmission_time: 0,
+            protocol_id: MINI_PROTOCOL_STATE_QUERY,
+            is_responder: true,
+            payload: small_payload.clone(),
+        };
+
+        let wire_bytes = segment.encode();
+        let (sock_a, sock_b) = tokio::net::UnixStream::pair().unwrap();
+
+        let writer = tokio::spawn(async move {
+            use tokio::io::AsyncWriteExt;
+            let mut writer_stream = sock_b;
+            writer_stream.write_all(&wire_bytes).await.unwrap();
+            writer_stream.shutdown().await.unwrap();
+        });
+
+        let mut client = N2CClient { stream: sock_a };
+
+        let result = client.recv_segment().await.unwrap();
+        assert_eq!(result.payload, small_payload);
+
+        writer.await.unwrap();
     }
 }
