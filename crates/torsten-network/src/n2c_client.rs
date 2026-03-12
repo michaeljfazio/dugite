@@ -389,6 +389,12 @@ impl N2CClient {
         Ok(result)
     }
 
+    /// Query ratification state (GetRatifyState - Shelley query tag 32)
+    pub async fn query_ratify_state(&mut self) -> Result<Vec<u8>, N2CClientError> {
+        let result = self.send_query(32).await?;
+        Ok(result)
+    }
+
     /// Query DRep state (GetDRepState - Shelley query tag 25)
     pub async fn query_drep_state(&mut self) -> Result<Vec<u8>, N2CClientError> {
         let result = self.send_query(25).await?;

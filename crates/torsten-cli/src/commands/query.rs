@@ -128,6 +128,13 @@ enum QuerySubcommand {
         #[arg(long)]
         testnet_magic: Option<u64>,
     },
+    /// Query ratification state (enacted/expired proposals, delayed flag)
+    RatifyState {
+        #[arg(long, default_value = "node.sock")]
+        socket_path: PathBuf,
+        #[arg(long)]
+        testnet_magic: Option<u64>,
+    },
     /// Compute the leader schedule for a stake pool
     LeadershipSchedule {
         /// Path to the VRF signing key file
@@ -1426,6 +1433,95 @@ impl QueryCmd {
                 println!("URL:         {url}");
                 println!("Data Hash:   {data_hash}");
                 println!("Script Hash: {script_hash}");
+
+                Ok(())
+            }
+            QuerySubcommand::RatifyState {
+                socket_path,
+                testnet_magic,
+            } => {
+                let mut client = connect_and_acquire(&socket_path, testnet_magic).await?;
+
+                let raw = client
+                    .query_ratify_state()
+                    .await
+                    .map_err(|e| anyhow::anyhow!("Failed to query ratify state: {e}"))?;
+
+                release_and_done(&mut client).await;
+
+                // Parse MsgResult [4, ratify_state]
+                let mut decoder = minicbor::Decoder::new(&raw);
+                let _ = decoder.array();
+                let tag = decoder.u32().unwrap_or(999);
+                if tag != 4 {
+                    anyhow::bail!("Expected MsgResult(4), got {tag}");
+                }
+
+                // Strip HFC wrapper array(1)
+                let pos = decoder.position();
+                if let Ok(Some(1)) = decoder.array() {
+                    // HFC wrapper stripped
+                } else {
+                    decoder.set_position(pos);
+                }
+
+                // RatifyState = array(4) [enacted_seq, expired_seq, delayed_bool, future_pparam_update]
+                let mut enacted_count = 0u64;
+                let mut expired_count = 0u64;
+                let mut delayed = false;
+                let mut enacted_ids = Vec::new();
+                let mut expired_ids = Vec::new();
+
+                if let Ok(Some(4)) = decoder.array() {
+                    // enacted: array(n) of (GovActionState, GovActionId)
+                    if let Ok(Some(n)) = decoder.array() {
+                        enacted_count = n;
+                        for _ in 0..n {
+                            // array(2) [GovActionState, GovActionId]
+                            if let Ok(Some(2)) = decoder.array() {
+                                // Skip GovActionState (complex structure)
+                                decoder.skip().ok();
+                                // GovActionId = array(2) [tx_hash, index]
+                                if let Ok(Some(2)) = decoder.array() {
+                                    let tx_hash = hex::encode(decoder.bytes().unwrap_or(&[]));
+                                    let index = decoder.u32().unwrap_or(0);
+                                    enacted_ids.push(format!("{}#{}", tx_hash, index));
+                                }
+                            }
+                        }
+                    }
+
+                    // expired: array(n) of GovActionId
+                    if let Ok(Some(n)) = decoder.array() {
+                        expired_count = n;
+                        for _ in 0..n {
+                            // GovActionId = array(2) [tx_hash, index]
+                            if let Ok(Some(2)) = decoder.array() {
+                                let tx_hash = hex::encode(decoder.bytes().unwrap_or(&[]));
+                                let index = decoder.u32().unwrap_or(0);
+                                expired_ids.push(format!("{}#{}", tx_hash, index));
+                            }
+                        }
+                    }
+
+                    // delayed flag
+                    delayed = decoder.bool().unwrap_or(false);
+
+                    // future_pparam_update: skip
+                    decoder.skip().ok();
+                }
+
+                println!("Ratification State");
+                println!("==================");
+                println!("Enacted proposals: {enacted_count}");
+                for id in &enacted_ids {
+                    println!("  {id}");
+                }
+                println!("Expired proposals: {expired_count}");
+                for id in &expired_ids {
+                    println!("  {id}");
+                }
+                println!("Delayed:           {delayed}");
 
                 Ok(())
             }
