@@ -2522,6 +2522,51 @@ mod tests {
         // InfoAction should be ratified at epoch transition even with no votes
         state.process_epoch_transition(EpochNo(1));
         assert_eq!(state.governance.proposals.len(), 0); // removed after ratification
+
+        // Verify ratification tracking for GetRatifyState query
+        assert_eq!(state.governance.last_ratified.len(), 1);
+        assert_eq!(state.governance.last_ratified[0].0.transaction_id, tx_hash);
+        assert_eq!(state.governance.last_ratified[0].0.action_index, 0);
+        assert!(state.governance.last_expired.is_empty());
+        assert!(!state.governance.last_ratify_delayed);
+    }
+
+    #[test]
+    fn test_ratify_state_tracks_expired_proposals() {
+        let params = ProtocolParameters::mainnet_defaults();
+        let mut state = LedgerState::new(params);
+        state.epoch_length = 100;
+        state.protocol_params.gov_action_lifetime = 2; // Expires in 2 epochs
+
+        let tx_hash = Hash32::from_bytes([77u8; 32]);
+        let proposal = ProposalProcedure {
+            deposit: Lovelace(100_000_000_000),
+            return_addr: vec![0u8; 29],
+            gov_action: GovAction::NoConfidence {
+                prev_action_id: None,
+            },
+            anchor: Anchor {
+                url: "https://example.com".to_string(),
+                data_hash: Hash32::ZERO,
+            },
+        };
+
+        // Submit at epoch 0 — expires at epoch 2
+        state.process_proposal(&tx_hash, 0, &proposal);
+        assert_eq!(state.governance.proposals.len(), 1);
+
+        // Epoch 1: proposal still active, not expired, not ratified (no votes)
+        state.process_epoch_transition(EpochNo(1));
+        assert_eq!(state.governance.proposals.len(), 1);
+        assert!(state.governance.last_ratified.is_empty());
+        assert!(state.governance.last_expired.is_empty());
+
+        // Epoch 2: proposal expires (expires_epoch <= new_epoch)
+        state.process_epoch_transition(EpochNo(2));
+        assert_eq!(state.governance.proposals.len(), 0);
+        assert!(state.governance.last_ratified.is_empty());
+        assert_eq!(state.governance.last_expired.len(), 1);
+        assert_eq!(state.governance.last_expired[0].transaction_id, tx_hash);
     }
 
     #[test]
