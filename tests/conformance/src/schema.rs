@@ -443,6 +443,147 @@ pub enum TestCertificate {
 }
 
 // ---------------------------------------------------------------------------
+// GOV rule types
+// ---------------------------------------------------------------------------
+
+/// Environment for the GOV rule.
+///
+/// Maps to the Agda `GovEnv` record:
+///   record GovEnv : Set where
+///     txid       : TxId
+///     epoch      : Epoch
+///     pparams    : PParams
+///     ppolicy    : Maybe ScriptHash
+///     enactState : EnactState
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GovEnvironment {
+    /// Transaction hash that contains the proposal/vote.
+    pub tx_hash: String,
+    /// Current epoch.
+    pub epoch: u64,
+    /// Protocol parameters for governance.
+    pub protocol_params: GovProtocolParams,
+    /// Gov action lifetime (epochs).
+    pub gov_action_lifetime: u64,
+}
+
+/// Protocol parameters subset for GOV rule.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GovProtocolParams {
+    /// Governance action deposit (lovelace).
+    pub gov_action_deposit: u64,
+    /// DRep deposit (lovelace).
+    pub drep_deposit: u64,
+}
+
+/// Governance state for GOV conformance tests.
+///
+/// Contains active proposals, votes, and enacted roots.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GovState {
+    /// Active proposals: action_id_key -> proposal_state.
+    #[serde(default)]
+    pub proposals: BTreeMap<String, TestProposalState>,
+    /// Votes by action: action_id_key -> [(voter, vote)].
+    #[serde(default)]
+    pub votes: BTreeMap<String, Vec<TestVoteEntry>>,
+    /// Total proposals submitted.
+    #[serde(default)]
+    pub proposal_count: u64,
+}
+
+/// A governance proposal state in test vectors.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TestProposalState {
+    /// The governance action type.
+    pub action_type: String,
+    /// Deposit amount.
+    pub deposit: u64,
+    /// Return address (hex-encoded).
+    pub return_addr: String,
+    /// Proposed epoch.
+    pub proposed_epoch: u64,
+    /// Expiration epoch.
+    pub expires_epoch: u64,
+    /// Vote tallies.
+    #[serde(default)]
+    pub yes_votes: u64,
+    #[serde(default)]
+    pub no_votes: u64,
+    #[serde(default)]
+    pub abstain_votes: u64,
+}
+
+/// A vote entry in test vectors.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TestVoteEntry {
+    /// Voter type: "drep", "spo", "cc".
+    pub voter_type: String,
+    /// Voter credential hash (hex).
+    pub voter_hash: String,
+    /// Vote: "yes", "no", "abstain".
+    pub vote: String,
+}
+
+/// Signal for GOV rule: either a proposal or a vote.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type")]
+pub enum GovSignal {
+    /// Submit a governance proposal.
+    #[serde(rename = "proposal")]
+    Proposal {
+        action_index: u32,
+        deposit: u64,
+        return_addr: String,
+        action: TestGovAction,
+    },
+    /// Cast a vote on an existing proposal.
+    #[serde(rename = "vote")]
+    Vote {
+        /// Action ID: "tx_hash#index".
+        action_id: String,
+        voter: TestVoter,
+        vote: String,
+    },
+}
+
+/// Governance action for test vectors.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type")]
+pub enum TestGovAction {
+    #[serde(rename = "info_action")]
+    InfoAction,
+    #[serde(rename = "treasury_withdrawals")]
+    TreasuryWithdrawals { withdrawals: BTreeMap<String, u64> },
+    #[serde(rename = "no_confidence")]
+    NoConfidence { prev_action_id: Option<String> },
+    #[serde(rename = "hard_fork_initiation")]
+    HardForkInitiation {
+        prev_action_id: Option<String>,
+        protocol_version: [u64; 2],
+    },
+    #[serde(rename = "new_constitution")]
+    NewConstitution {
+        prev_action_id: Option<String>,
+        anchor_url: String,
+        anchor_hash: String,
+        script_hash: Option<String>,
+    },
+}
+
+/// Voter for test vectors.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type")]
+pub enum TestVoter {
+    #[serde(rename = "drep")]
+    DRep { hash: String },
+    #[serde(rename = "spo")]
+    StakePool { hash: String },
+    #[serde(rename = "cc")]
+    ConstitutionalCommittee { hash: String },
+}
+
+// ---------------------------------------------------------------------------
 // Test result types
 // ---------------------------------------------------------------------------
 

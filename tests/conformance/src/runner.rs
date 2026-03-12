@@ -7,7 +7,8 @@
 use crate::adapters;
 use crate::schema::{
     CertEnvironment, CertState, ConformanceExpectedOutput, ConformanceTestResult,
-    ConformanceTestVector, TestCertificate, TestTransaction, UtxoEnvironment, UtxoState,
+    ConformanceTestVector, GovEnvironment, GovSignal, GovState, TestCertificate, TestTransaction,
+    UtxoEnvironment, UtxoState,
 };
 use std::path::Path;
 use torsten_ledger::validate_transaction;
@@ -53,6 +54,7 @@ pub fn run_test(vector_path: &str, vector: &ConformanceTestVector) -> Conformanc
     match vector.rule.as_str() {
         "UTXO" => run_utxo_test(vector_path, vector),
         "CERT" => run_cert_test(vector_path, vector),
+        "GOV" => run_gov_test(vector_path, vector),
         rule => ConformanceTestResult {
             vector_path: vector_path.to_string(),
             rule: rule.to_string(),
@@ -494,6 +496,184 @@ fn simulate_cert_apply(state: &CertState, cert: &TestCertificate) -> CertState {
         TestCertificate::VoteDelegation { credential, drep } => {
             let key = credential_hash(credential);
             result.d_state.vote_delegations.insert(key, drep.clone());
+        }
+    }
+
+    result
+}
+
+// ---------------------------------------------------------------------------
+// GOV rule runner
+// ---------------------------------------------------------------------------
+
+fn run_gov_test(vector_path: &str, vector: &ConformanceTestVector) -> ConformanceTestResult {
+    let base = ConformanceTestResult {
+        vector_path: vector_path.to_string(),
+        rule: "GOV".to_string(),
+        description: vector.description.clone(),
+        passed: false,
+        details: None,
+    };
+
+    // Deserialize environment
+    let env: GovEnvironment = match serde_json::from_value(vector.environment.clone()) {
+        Ok(e) => e,
+        Err(e) => {
+            return ConformanceTestResult {
+                details: Some(format!("Failed to deserialize GOV environment: {}", e)),
+                ..base
+            };
+        }
+    };
+
+    // Deserialize input state
+    let input_state: GovState = match serde_json::from_value(vector.input_state.clone()) {
+        Ok(s) => s,
+        Err(e) => {
+            return ConformanceTestResult {
+                details: Some(format!("Failed to deserialize GOV input state: {}", e)),
+                ..base
+            };
+        }
+    };
+
+    // Deserialize signal
+    let signal: GovSignal = match serde_json::from_value(vector.signal.clone()) {
+        Ok(s) => s,
+        Err(e) => {
+            return ConformanceTestResult {
+                details: Some(format!("Failed to deserialize GOV signal: {}", e)),
+                ..base
+            };
+        }
+    };
+
+    // Apply the governance signal to the state
+    let actual_state = simulate_gov_apply(&input_state, &signal, &env);
+
+    match &vector.expected_output {
+        ConformanceExpectedOutput::Success { state } => {
+            let expected_state: GovState = match serde_json::from_value(state.clone()) {
+                Ok(s) => s,
+                Err(e) => {
+                    return ConformanceTestResult {
+                        details: Some(format!("Failed to deserialize expected GOV state: {}", e)),
+                        ..base
+                    };
+                }
+            };
+
+            match adapters::diff_gov_states(&expected_state, &actual_state) {
+                None => ConformanceTestResult {
+                    passed: true,
+                    ..base
+                },
+                Some(diff) => ConformanceTestResult {
+                    details: Some(format!("GOV state mismatch:\n  {}", diff)),
+                    ..base
+                },
+            }
+        }
+        ConformanceExpectedOutput::Failure { errors } => {
+            // For GOV failures, check preconditions
+            ConformanceTestResult {
+                details: Some(format!(
+                    "GOV failure testing not fully implemented. Expected errors: {:?}",
+                    errors
+                )),
+                ..base
+            }
+        }
+    }
+}
+
+/// Simulate applying a governance signal to the GovState.
+///
+/// This mirrors the logic in LedgerState::process_proposal and process_vote
+/// but operates on conformance test types directly.
+fn simulate_gov_apply(state: &GovState, signal: &GovSignal, env: &GovEnvironment) -> GovState {
+    use crate::schema::{TestProposalState, TestVoteEntry};
+
+    let mut result = state.clone();
+
+    match signal {
+        GovSignal::Proposal {
+            action_index,
+            deposit,
+            return_addr,
+            action,
+        } => {
+            let action_id_key = format!("{}#{}", env.tx_hash, action_index);
+            let expires_epoch = env.epoch.saturating_add(env.gov_action_lifetime);
+
+            let action_type = match action {
+                crate::schema::TestGovAction::InfoAction => "info_action".to_string(),
+                crate::schema::TestGovAction::TreasuryWithdrawals { .. } => {
+                    "treasury_withdrawals".to_string()
+                }
+                crate::schema::TestGovAction::NoConfidence { .. } => "no_confidence".to_string(),
+                crate::schema::TestGovAction::HardForkInitiation { .. } => {
+                    "hard_fork_initiation".to_string()
+                }
+                crate::schema::TestGovAction::NewConstitution { .. } => {
+                    "new_constitution".to_string()
+                }
+            };
+
+            let proposal = TestProposalState {
+                action_type,
+                deposit: *deposit,
+                return_addr: return_addr.clone(),
+                proposed_epoch: env.epoch,
+                expires_epoch,
+                yes_votes: 0,
+                no_votes: 0,
+                abstain_votes: 0,
+            };
+
+            result.proposals.insert(action_id_key, proposal);
+            result.proposal_count += 1;
+        }
+        GovSignal::Vote {
+            action_id,
+            voter,
+            vote,
+        } => {
+            // Update vote tally on the proposal
+            if let Some(proposal) = result.proposals.get_mut(action_id) {
+                match vote.as_str() {
+                    "yes" => proposal.yes_votes += 1,
+                    "no" => proposal.no_votes += 1,
+                    "abstain" => proposal.abstain_votes += 1,
+                    _ => {}
+                }
+            }
+
+            // Record the vote
+            let (voter_type, voter_hash) = match voter {
+                crate::schema::TestVoter::DRep { hash } => ("drep".to_string(), hash.clone()),
+                crate::schema::TestVoter::StakePool { hash } => ("spo".to_string(), hash.clone()),
+                crate::schema::TestVoter::ConstitutionalCommittee { hash } => {
+                    ("cc".to_string(), hash.clone())
+                }
+            };
+
+            let vote_entry = TestVoteEntry {
+                voter_type,
+                voter_hash: voter_hash.clone(),
+                vote: vote.clone(),
+            };
+
+            let action_votes = result.votes.entry(action_id.clone()).or_default();
+            // Replace existing vote from same voter, or add new
+            if let Some(existing) = action_votes
+                .iter_mut()
+                .find(|v| v.voter_hash == voter_hash && v.voter_type == vote_entry.voter_type)
+            {
+                existing.vote = vote.clone();
+            } else {
+                action_votes.push(vote_entry);
+            }
         }
     }
 

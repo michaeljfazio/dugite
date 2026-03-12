@@ -1,0 +1,78 @@
+{
+  "rule": "GOV",
+  "description": "SPO casts a No vote on a governance proposal",
+  "environment": {
+    "tx_hash": "eeee000000000000000000000000000000000000000000000000000000000005",
+    "epoch": 105,
+    "protocol_params": {
+      "gov_action_deposit": 100000000000,
+      "drep_deposit": 500000000
+    },
+    "gov_action_lifetime": 10
+  },
+  "input_state": {
+    "proposals": {
+      "cccc000000000000000000000000000000000000000000000000000000000003#0": {
+        "action_type": "no_confidence",
+        "deposit": 100000000000,
+        "return_addr": "e0008b47844d92812fc30d1f0ac9b6fbf38778ccba9db8312ad9079079",
+        "proposed_epoch": 50,
+        "expires_epoch": 70,
+        "yes_votes": 3,
+        "no_votes": 1,
+        "abstain_votes": 0
+      }
+    },
+    "votes": {
+      "cccc000000000000000000000000000000000000000000000000000000000003#0": [
+        {
+          "voter_type": "drep",
+          "voter_hash": "aabb112233445566778899aabb112233445566778899aabb11223344",
+          "vote": "yes"
+        }
+      ]
+    },
+    "proposal_count": 1
+  },
+  "signal": {
+    "type": "vote",
+    "action_id": "cccc000000000000000000000000000000000000000000000000000000000003#0",
+    "voter": {
+      "type": "spo",
+      "hash": "ff00ff00ff00ff00ff00ff00ff00ff00ff00ff00ff00ff00ff00ff00ff00ff00"
+    },
+    "vote": "no"
+  },
+  "expected_output": {
+    "type": "success",
+    "state": {
+      "proposals": {
+        "cccc000000000000000000000000000000000000000000000000000000000003#0": {
+          "action_type": "no_confidence",
+          "deposit": 100000000000,
+          "return_addr": "e0008b47844d92812fc30d1f0ac9b6fbf38778ccba9db8312ad9079079",
+          "proposed_epoch": 50,
+          "expires_epoch": 70,
+          "yes_votes": 3,
+          "no_votes": 2,
+          "abstain_votes": 0
+        }
+      },
+      "votes": {
+        "cccc000000000000000000000000000000000000000000000000000000000003#0": [
+          {
+            "voter_type": "drep",
+            "voter_hash": "aabb112233445566778899aabb112233445566778899aabb11223344",
+            "vote": "yes"
+          },
+          {
+            "voter_type": "spo",
+            "voter_hash": "ff00ff00ff00ff00ff00ff00ff00ff00ff00ff00ff00ff00ff00ff00ff00ff00",
+            "vote": "no"
+          }
+        ]
+      },
+      "proposal_count": 1
+    }
+  }
+}

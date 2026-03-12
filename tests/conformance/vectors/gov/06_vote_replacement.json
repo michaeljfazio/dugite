@@ -1,0 +1,73 @@
+{
+  "rule": "GOV",
+  "description": "DRep changes their vote from No to Yes (vote replacement)",
+  "environment": {
+    "tx_hash": "ffff000000000000000000000000000000000000000000000000000000000006",
+    "epoch": 106,
+    "protocol_params": {
+      "gov_action_deposit": 100000000000,
+      "drep_deposit": 500000000
+    },
+    "gov_action_lifetime": 10
+  },
+  "input_state": {
+    "proposals": {
+      "aaaa000000000000000000000000000000000000000000000000000000000001#0": {
+        "action_type": "info_action",
+        "deposit": 100000000000,
+        "return_addr": "e00d6a577e9441ad8ed9663931906e4d43ece8f82c712b1d0235affb06",
+        "proposed_epoch": 100,
+        "expires_epoch": 110,
+        "yes_votes": 2,
+        "no_votes": 1,
+        "abstain_votes": 0
+      }
+    },
+    "votes": {
+      "aaaa000000000000000000000000000000000000000000000000000000000001#0": [
+        {
+          "voter_type": "drep",
+          "voter_hash": "aabb112233445566778899aabb112233445566778899aabb11223344",
+          "vote": "no"
+        }
+      ]
+    },
+    "proposal_count": 1
+  },
+  "signal": {
+    "type": "vote",
+    "action_id": "aaaa000000000000000000000000000000000000000000000000000000000001#0",
+    "voter": {
+      "type": "drep",
+      "hash": "aabb112233445566778899aabb112233445566778899aabb11223344"
+    },
+    "vote": "yes"
+  },
+  "expected_output": {
+    "type": "success",
+    "state": {
+      "proposals": {
+        "aaaa000000000000000000000000000000000000000000000000000000000001#0": {
+          "action_type": "info_action",
+          "deposit": 100000000000,
+          "return_addr": "e00d6a577e9441ad8ed9663931906e4d43ece8f82c712b1d0235affb06",
+          "proposed_epoch": 100,
+          "expires_epoch": 110,
+          "yes_votes": 3,
+          "no_votes": 1,
+          "abstain_votes": 0
+        }
+      },
+      "votes": {
+        "aaaa000000000000000000000000000000000000000000000000000000000001#0": [
+          {
+            "voter_type": "drep",
+            "voter_hash": "aabb112233445566778899aabb112233445566778899aabb11223344",
+            "vote": "yes"
+          }
+        ]
+      },
+      "proposal_count": 1
+    }
+  }
+}

@@ -1,0 +1,47 @@
+{
+  "rule": "GOV",
+  "description": "Submit a NoConfidence governance proposal to dissolve the committee",
+  "environment": {
+    "tx_hash": "cccc000000000000000000000000000000000000000000000000000000000003",
+    "epoch": 50,
+    "protocol_params": {
+      "gov_action_deposit": 100000000000,
+      "drep_deposit": 500000000
+    },
+    "gov_action_lifetime": 20
+  },
+  "input_state": {
+    "proposals": {},
+    "votes": {},
+    "proposal_count": 0
+  },
+  "signal": {
+    "type": "proposal",
+    "action_index": 0,
+    "deposit": 100000000000,
+    "return_addr": "e0008b47844d92812fc30d1f0ac9b6fbf38778ccba9db8312ad9079079",
+    "action": {
+      "type": "no_confidence",
+      "prev_action_id": null
+    }
+  },
+  "expected_output": {
+    "type": "success",
+    "state": {
+      "proposals": {
+        "cccc000000000000000000000000000000000000000000000000000000000003#0": {
+          "action_type": "no_confidence",
+          "deposit": 100000000000,
+          "return_addr": "e0008b47844d92812fc30d1f0ac9b6fbf38778ccba9db8312ad9079079",
+          "proposed_epoch": 50,
+          "expires_epoch": 70,
+          "yes_votes": 0,
+          "no_votes": 0,
+          "abstain_votes": 0
+        }
+      },
+      "votes": {},
+      "proposal_count": 1
+    }
+  }
+}

@@ -858,6 +858,118 @@ pub fn diff_cert_states(expected: &CertState, actual: &CertState) -> Option<Stri
     }
 }
 
+/// Compare two GovState values and return a human-readable diff.
+pub fn diff_gov_states(
+    expected: &crate::schema::GovState,
+    actual: &crate::schema::GovState,
+) -> Option<String> {
+    let mut diffs = Vec::new();
+
+    if expected.proposal_count != actual.proposal_count {
+        diffs.push(format!(
+            "proposal_count: expected={}, actual={}",
+            expected.proposal_count, actual.proposal_count
+        ));
+    }
+
+    // Compare proposals
+    for (id, exp_proposal) in &expected.proposals {
+        match actual.proposals.get(id) {
+            None => {
+                diffs.push(format!("missing proposal: {}", id));
+            }
+            Some(act_proposal) => {
+                if exp_proposal.action_type != act_proposal.action_type {
+                    diffs.push(format!(
+                        "proposal {} action_type: expected={}, actual={}",
+                        id, exp_proposal.action_type, act_proposal.action_type
+                    ));
+                }
+                if exp_proposal.deposit != act_proposal.deposit {
+                    diffs.push(format!(
+                        "proposal {} deposit: expected={}, actual={}",
+                        id, exp_proposal.deposit, act_proposal.deposit
+                    ));
+                }
+                if exp_proposal.proposed_epoch != act_proposal.proposed_epoch {
+                    diffs.push(format!(
+                        "proposal {} proposed_epoch: expected={}, actual={}",
+                        id, exp_proposal.proposed_epoch, act_proposal.proposed_epoch
+                    ));
+                }
+                if exp_proposal.expires_epoch != act_proposal.expires_epoch {
+                    diffs.push(format!(
+                        "proposal {} expires_epoch: expected={}, actual={}",
+                        id, exp_proposal.expires_epoch, act_proposal.expires_epoch
+                    ));
+                }
+                if exp_proposal.yes_votes != act_proposal.yes_votes {
+                    diffs.push(format!(
+                        "proposal {} yes_votes: expected={}, actual={}",
+                        id, exp_proposal.yes_votes, act_proposal.yes_votes
+                    ));
+                }
+                if exp_proposal.no_votes != act_proposal.no_votes {
+                    diffs.push(format!(
+                        "proposal {} no_votes: expected={}, actual={}",
+                        id, exp_proposal.no_votes, act_proposal.no_votes
+                    ));
+                }
+                if exp_proposal.abstain_votes != act_proposal.abstain_votes {
+                    diffs.push(format!(
+                        "proposal {} abstain_votes: expected={}, actual={}",
+                        id, exp_proposal.abstain_votes, act_proposal.abstain_votes
+                    ));
+                }
+            }
+        }
+    }
+
+    for id in actual.proposals.keys() {
+        if !expected.proposals.contains_key(id) {
+            diffs.push(format!("extra proposal: {}", id));
+        }
+    }
+
+    // Compare votes
+    for (action_id, exp_votes) in &expected.votes {
+        match actual.votes.get(action_id) {
+            None => {
+                diffs.push(format!("missing votes for action: {}", action_id));
+            }
+            Some(act_votes) => {
+                if exp_votes.len() != act_votes.len() {
+                    diffs.push(format!(
+                        "votes for {}: expected {} entries, actual {}",
+                        action_id,
+                        exp_votes.len(),
+                        act_votes.len()
+                    ));
+                }
+                for exp_vote in exp_votes {
+                    let found = act_votes.iter().any(|av| {
+                        av.voter_type == exp_vote.voter_type
+                            && av.voter_hash == exp_vote.voter_hash
+                            && av.vote == exp_vote.vote
+                    });
+                    if !found {
+                        diffs.push(format!(
+                            "missing vote: {} {} {} on {}",
+                            exp_vote.voter_type, exp_vote.voter_hash, exp_vote.vote, action_id
+                        ));
+                    }
+                }
+            }
+        }
+    }
+
+    if diffs.is_empty() {
+        None
+    } else {
+        Some(diffs.join("\n  "))
+    }
+}
+
 /// Build a HashSet of registered pool IDs from a PoolSubState.
 pub fn registered_pool_set(p_state: &PoolSubState) -> Result<HashSet<Hash28>, AdapterError> {
     let mut set = HashSet::new();

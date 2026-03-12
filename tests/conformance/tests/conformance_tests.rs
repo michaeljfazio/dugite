@@ -52,6 +52,24 @@ fn conformance_cert_vectors() {
 }
 
 #[test]
+fn conformance_gov_vectors() {
+    let dir = vectors_dir().join("gov");
+    let vectors = runner::load_vectors(&dir).expect("Failed to load GOV test vectors");
+    assert!(!vectors.is_empty(), "No GOV test vectors found");
+
+    let results = runner::run_all(&vectors);
+    print_results(&results);
+
+    let failed: Vec<&ConformanceTestResult> = results.iter().filter(|r| !r.passed).collect();
+    assert!(
+        failed.is_empty(),
+        "{}/{} GOV conformance tests failed",
+        failed.len(),
+        results.len()
+    );
+}
+
+#[test]
 fn conformance_all_vectors() {
     let dir = vectors_dir();
     let vectors = runner::load_vectors(&dir).expect("Failed to load test vectors");
