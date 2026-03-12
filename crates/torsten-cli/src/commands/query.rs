@@ -1602,3 +1602,63 @@ impl QueryCmd {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_parse_iso8601_to_unix_epoch() {
+        // 1970-01-01T00:00:00Z = Unix epoch
+        assert_eq!(parse_iso8601_to_unix("1970-01-01T00:00:00Z"), Some(0));
+    }
+
+    #[test]
+    fn test_parse_iso8601_to_unix_known_date() {
+        // 2022-11-24T00:00:00Z = Preview testnet genesis (approximately)
+        let ts = parse_iso8601_to_unix("2022-11-24T00:00:00Z").unwrap();
+        // 2022-11-24 is day 328 of year 2022
+        // Expected: 1669248000
+        assert_eq!(ts, 1669248000);
+    }
+
+    #[test]
+    fn test_parse_iso8601_to_unix_with_time() {
+        let ts = parse_iso8601_to_unix("2020-06-01T21:44:51Z").unwrap();
+        // Manually computed
+        assert!(ts > 1590000000 && ts < 1600000000);
+        assert_eq!(ts, 1591047891);
+    }
+
+    #[test]
+    fn test_parse_iso8601_leap_year() {
+        // 2024 is a leap year — Feb 29 should be valid
+        let feb28 = parse_iso8601_to_unix("2024-02-28T00:00:00Z").unwrap();
+        let feb29 = parse_iso8601_to_unix("2024-02-29T00:00:00Z").unwrap();
+        assert_eq!(
+            feb29 - feb28,
+            86400,
+            "Feb 29 should be exactly 1 day after Feb 28"
+        );
+    }
+
+    #[test]
+    fn test_parse_iso8601_invalid() {
+        assert!(parse_iso8601_to_unix("not a date").is_none());
+        assert!(parse_iso8601_to_unix("2022-01-01").is_none()); // no time
+        assert!(parse_iso8601_to_unix("").is_none());
+    }
+
+    #[test]
+    fn test_era_name_all() {
+        assert_eq!(era_name(0), "Byron");
+        assert_eq!(era_name(1), "Shelley");
+        assert_eq!(era_name(2), "Allegra");
+        assert_eq!(era_name(3), "Mary");
+        assert_eq!(era_name(4), "Alonzo");
+        assert_eq!(era_name(5), "Babbage");
+        assert_eq!(era_name(6), "Conway");
+        assert_eq!(era_name(7), "Unknown");
+        assert_eq!(era_name(99), "Unknown");
+    }
+}
