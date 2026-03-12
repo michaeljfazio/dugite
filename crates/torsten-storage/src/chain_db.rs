@@ -897,9 +897,16 @@ fn open_tree(path: &Path, config: LsmConfig) -> Result<LsmTree, ChainDBError> {
         match LsmTree::open_snapshot(path, snapshot_name) {
             Ok(tree) => {
                 if *snapshot_name != "latest" {
+                    let latest_dir = snapshots_dir.join("latest");
+                    let reason = if latest_dir.exists() {
+                        "corrupted"
+                    } else {
+                        "missing"
+                    };
                     info!(
                         snapshot = snapshot_name,
-                        "Recovered from fallback snapshot (latest was corrupted)"
+                        latest = reason,
+                        "Recovered from fallback snapshot"
                     );
                 } else {
                     debug!("Restored from persisted snapshot");

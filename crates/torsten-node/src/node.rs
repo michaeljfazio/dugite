@@ -641,7 +641,7 @@ impl Node {
                     // be discarded to prevent "block does not connect" errors.
                     let snapshot_valid = match state.tip.point {
                         Point::Origin => true,
-                        Point::Specific(_, ref hash) => {
+                        Point::Specific(snapshot_slot, ref hash) => {
                             // Use try_read() since we're in a sync context within tokio.
                             // The lock was just created so this will always succeed.
                             match chain_db.try_read() {
@@ -649,10 +649,21 @@ impl Node {
                                     let exists = db.has_block(hash);
                                     if !exists {
                                         let db_tip = db.get_tip();
-                                        warn!(
-                                            "Ledger       snapshot is stale (snapshot={}, chaindb={})",
-                                            state.tip, db_tip,
-                                        );
+                                        let db_tip_slot =
+                                            db_tip.point.slot().map(|s| s.0).unwrap_or(0);
+                                        if snapshot_slot.0 > db_tip_slot {
+                                            warn!(
+                                                "Ledger snapshot is ahead of ChainDB (snapshot={}, chaindb={}); \
+                                                 node may have crashed before ChainDB persist — discarding snapshot, \
+                                                 will replay from storage",
+                                                state.tip, db_tip,
+                                            );
+                                        } else {
+                                            warn!(
+                                                "Ledger snapshot is stale (snapshot={}, chaindb={})",
+                                                state.tip, db_tip,
+                                            );
+                                        }
                                     }
                                     exists
                                 }
@@ -886,13 +897,34 @@ impl Node {
         // work immediately (before we reach chain tip or the periodic timer fires)
         self.update_query_state().await;
 
-        // Setup shutdown signal
+        // Setup shutdown signal (SIGINT + SIGTERM)
         let (shutdown_tx, mut shutdown_rx) = watch::channel(false);
-        tokio::spawn(async move {
-            signal::ctrl_c().await.ok();
-            info!("Shutdown signal received");
-            shutdown_tx.send(true).ok();
-        });
+        #[cfg(unix)]
+        {
+            let shutdown_tx_clone = shutdown_tx.clone();
+            tokio::spawn(async move {
+                let mut sigterm =
+                    signal::unix::signal(signal::unix::SignalKind::terminate()).unwrap();
+                tokio::select! {
+                    _ = signal::ctrl_c() => {
+                        info!("SIGINT received, shutting down");
+                    }
+                    _ = sigterm.recv() => {
+                        info!("SIGTERM received, shutting down");
+                    }
+                }
+                shutdown_tx_clone.send(true).ok();
+            });
+        }
+        #[cfg(not(unix))]
+        {
+            let shutdown_tx_clone = shutdown_tx.clone();
+            tokio::spawn(async move {
+                signal::ctrl_c().await.ok();
+                info!("Shutdown signal received");
+                shutdown_tx_clone.send(true).ok();
+            });
+        }
 
         // SIGHUP handler is set up after peer_manager initialization below
 
@@ -1740,6 +1772,11 @@ impl Node {
             // Get ledger tip slot so we can skip blocks already applied.
             let ledger_tip_slot = {
                 let ls = ledger_state.blocking_read();
+                info!(
+                    ledger_tip_slot = ls.tip.point.slot().map(|s| s.0).unwrap_or(0),
+                    utxos = ls.utxo_set.len(),
+                    "Chunk replay starting",
+                );
                 ls.tip.point.slot().map(|s| s.0).unwrap_or(0)
             };
 
@@ -2919,6 +2956,14 @@ impl Node {
                 self.epoch_transitions_observed = self
                     .epoch_transitions_observed
                     .saturating_add(epochs_crossed);
+
+                // Persist ChainDB before ledger snapshot to ensure consistency
+                {
+                    let mut db = self.chain_db.write().await;
+                    if let Err(e) = db.persist() {
+                        warn!(error = %e, "Failed to persist ChainDB at epoch transition");
+                    }
+                }
                 self.save_ledger_snapshot().await;
                 *last_snapshot_epoch = current_epoch;
 
