@@ -20,7 +20,7 @@ use pallas_traverse::MultiEraHeader;
 use std::net::SocketAddr;
 use std::time::Duration;
 use tokio::net::ToSocketAddrs;
-use tracing::{debug, info, trace, warn};
+use tracing::{debug, trace, warn};
 
 use crate::client::{ClientError, HeaderBatchResult, HeaderInfo};
 use torsten_primitives::block::{Point, Tip as TorstenTip};
@@ -61,7 +61,7 @@ impl PipelinedPeerClient {
         addr: impl ToSocketAddrs + std::fmt::Display + Copy,
         network_magic: u64,
     ) -> Result<Self, ClientError> {
-        info!("pipelined client: connecting to {addr}");
+        debug!("pipelined client: connecting to {addr}");
 
         let bearer = Bearer::connect_tcp(addr)
             .await
@@ -105,7 +105,7 @@ impl PipelinedPeerClient {
             .parse()
             .unwrap_or_else(|_| "0.0.0.0:0".parse().expect("valid constant SocketAddr"));
 
-        info!("pipelined client: connected to {remote_addr}");
+        debug!("pipelined client: connected to {remote_addr}");
 
         Ok(PipelinedPeerClient {
             cs_buf,

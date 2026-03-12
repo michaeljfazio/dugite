@@ -261,7 +261,7 @@ pub async fn start_metrics_server(port: u16, metrics: Arc<NodeMetrics>) {
     let addr = format!("0.0.0.0:{port}");
     let listener = match TcpListener::bind(&addr).await {
         Ok(l) => {
-            info!("Metrics server listening on http://{addr}/metrics");
+            info!("Metrics      http://{addr}/metrics");
             l
         }
         Err(e) => {

@@ -12,7 +12,7 @@ use torsten_primitives::block::{Block, Point, Tip};
 use torsten_primitives::hash::Hash32;
 use torsten_primitives::time::{BlockNo, SlotNo};
 use torsten_serialization::multi_era::decode_block_with_byron_epoch_length;
-use tracing::{debug, info, warn};
+use tracing::{debug, warn};
 
 #[derive(Error, Debug)]
 pub enum ClientError {
@@ -56,7 +56,7 @@ impl NodeToNodeClient {
         addr: impl ToSocketAddrs + std::fmt::Display + Copy,
         network_magic: u64,
     ) -> Result<Self, ClientError> {
-        info!("connecting to peer {addr}");
+        debug!("connecting to peer {addr}");
 
         let peer = PeerClient::connect(addr, network_magic)
             .await
@@ -67,7 +67,7 @@ impl NodeToNodeClient {
             .parse()
             .unwrap_or_else(|_| std::net::SocketAddr::from(([0, 0, 0, 0], 0)));
 
-        info!("connected to peer {remote_addr}");
+        debug!("connected to peer {remote_addr}");
 
         Ok(NodeToNodeClient {
             peer,
@@ -162,7 +162,7 @@ impl NodeToNodeClient {
                 Ok(ChainSyncEvent::RollBackward(torsten_point, torsten_tip))
             }
             NextResponse::Await => {
-                info!("caught up to chain tip, awaiting new blocks");
+                debug!("caught up to chain tip, awaiting new blocks");
                 Ok(ChainSyncEvent::Await)
             }
         }
@@ -559,7 +559,7 @@ impl NodeToNodeClient {
 
     /// Disconnect from the peer.
     pub async fn disconnect(self) {
-        info!("disconnecting from peer {}", self.remote_addr);
+        debug!("disconnecting from peer {}", self.remote_addr);
         self.peer.abort().await;
     }
 }

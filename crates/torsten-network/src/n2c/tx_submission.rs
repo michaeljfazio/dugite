@@ -1,6 +1,6 @@
 use std::sync::Arc;
 use torsten_primitives::mempool::{MempoolAddResult, MempoolProvider};
-use tracing::{debug, info, warn};
+use tracing::{debug, warn};
 
 use crate::multiplexer::Segment;
 
@@ -66,7 +66,7 @@ pub(crate) fn handle_tx_submission(
 
                             match mempool.add_tx(tx_hash, tx, tx_size) {
                                 Ok(MempoolAddResult::Added) => {
-                                    info!("Transaction accepted into mempool: {tx_hash}");
+                                    debug!("Transaction accepted into mempool: {tx_hash}");
                                     encode_tx_accept()
                                 }
                                 Ok(MempoolAddResult::AlreadyExists) => {

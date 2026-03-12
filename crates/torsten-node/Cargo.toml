@@ -7,6 +7,7 @@ description = "Torsten Cardano node - main entry point"
 [features]
 default = []
 io-uring = ["torsten-storage/io-uring"]
+journald = ["dep:tracing-journald"]
 
 [[bin]]
 name = "torsten-node"
@@ -29,6 +30,8 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
+tracing-appender = { workspace = true }
+tracing-journald = { workspace = true, optional = true }
 thiserror = { workspace = true }
 anyhow = { workspace = true }
 hex.workspace = true

@@ -3,7 +3,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use torsten_primitives::hash::{Hash28, Hash32};
 use torsten_primitives::value::Lovelace;
-use tracing::{debug, info, warn};
+use tracing::{debug, warn};
 
 /// Reduced rational number (i128 numerator/denominator with GCD reduction).
 /// Matches Haskell's Rational for reward calculations with rationalToCoinViaFloor.
@@ -344,7 +344,7 @@ impl LedgerState {
             self.treasury.0 = self.treasury.0.saturating_add(undistributed);
         }
 
-        info!(
+        debug!(
             "Rewards distributed: {} lovelace to accounts, {} to treasury (expansion: {}, fees: {})",
             total_distributed, treasury_cut + undistributed, expansion, self.epoch_fees.0
         );

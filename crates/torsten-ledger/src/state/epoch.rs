@@ -9,7 +9,7 @@ use tracing::{debug, info, warn};
 impl LedgerState {
     /// Process an epoch transition
     pub fn process_epoch_transition(&mut self, new_epoch: EpochNo) {
-        info!("Epoch transition: {} -> {}", self.epoch.0, new_epoch.0);
+        debug!("Epoch transition: {} -> {}", self.epoch.0, new_epoch.0);
 
         // Calculate and distribute rewards using the "go" snapshot (take ownership to avoid clone)
         if let Some(go_snapshot) = self.snapshots.go.take() {
@@ -62,7 +62,7 @@ impl LedgerState {
             .map(|l| l.0)
             .sum();
         let total_pool_stake: u64 = pool_stake.values().map(|l| l.0).sum();
-        info!(
+        debug!(
             epoch = new_epoch.0,
             credentials = self.stake_distribution.stake_map.len(),
             delegations = self.delegations.len(),
@@ -166,12 +166,16 @@ impl LedgerState {
                     || merged.protocol_version_minor.is_some()
                 {
                     info!(
-                        epoch = new_epoch.0,
-                        from_major = self.protocol_params.protocol_version_major,
-                        from_minor = self.protocol_params.protocol_version_minor,
-                        to_major = ?merged.protocol_version_major,
-                        to_minor = ?merged.protocol_version_minor,
-                        "Protocol version change via pre-Conway update"
+                        "Protocol     version change {}.{} -> {}.{} (epoch {})",
+                        self.protocol_params.protocol_version_major,
+                        self.protocol_params.protocol_version_minor,
+                        merged
+                            .protocol_version_major
+                            .unwrap_or(self.protocol_params.protocol_version_major),
+                        merged
+                            .protocol_version_minor
+                            .unwrap_or(self.protocol_params.protocol_version_minor),
+                        new_epoch.0,
                     );
                 }
                 if let Err(e) = self.apply_protocol_param_update(&merged) {
@@ -181,14 +185,9 @@ impl LedgerState {
                         "Pre-Conway protocol parameter update rejected"
                     );
                 } else {
-                    info!(
+                    debug!(
                         epoch = new_epoch.0,
                         proposers = distinct_proposers,
-                        protocol_version = format!(
-                            "{}.{}",
-                            self.protocol_params.protocol_version_major,
-                            self.protocol_params.protocol_version_minor
-                        ),
                         "Pre-Conway protocol parameter update applied"
                     );
                 }
@@ -273,7 +272,7 @@ impl LedgerState {
                 }
             }
             if newly_inactive > 0 || reactivated > 0 {
-                info!(
+                debug!(
                     "DRep activity update at epoch {}: {} newly inactive, {} reactivated (threshold: {} epochs)",
                     new_epoch.0,
                     newly_inactive,
@@ -300,7 +299,7 @@ impl LedgerState {
                     .committee_expiration
                     .remove(hash);
             }
-            info!(
+            debug!(
                 "Expired {} committee members at epoch {}",
                 expired_members.len(),
                 new_epoch.0
@@ -320,7 +319,7 @@ impl LedgerState {
         nonce_input.extend_from_slice(self.last_epoch_block_nonce.as_bytes());
         self.epoch_nonce = torsten_primitives::hash::blake2b_256(&nonce_input);
 
-        info!(
+        debug!(
             "New epoch nonce: {} (candidate {} \u{22c4} lab {}), prev: {}",
             self.epoch_nonce.to_hex(),
             self.candidate_nonce.to_hex(),
@@ -391,7 +390,7 @@ impl LedgerState {
                 }
                 let new_total: u64 = new_pool_stake.values().map(|s| s.0).sum();
                 if old_total != new_total {
-                    info!(
+                    debug!(
                         snapshot = name,
                         epoch = snap.epoch.0,
                         old_total_ada = old_total / 1_000_000,

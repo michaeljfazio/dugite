@@ -220,14 +220,14 @@ impl N2CServer {
         }
 
         let listener = UnixListener::bind(socket_path)?;
-        info!("N2C server listening on {}", socket_path.display());
+        info!("N2C          listening on {}", socket_path.display());
 
         loop {
             tokio::select! {
                 result = listener.accept() => {
                     match result {
                         Ok((stream, _addr)) => {
-                            info!("N2C client connected");
+                            debug!("N2C client connected");
                             let handler = self.query_handler.clone();
                             let mempool = self.mempool.clone();
                             let validator = self.tx_validator.clone();
@@ -253,7 +253,7 @@ impl N2CServer {
                     }
                 }
                 _ = shutdown_rx.changed() => {
-                    info!("N2C server shutting down");
+                    debug!("N2C server shutting down");
                     // Clean up socket file
                     let _ = std::fs::remove_file(socket_path);
                     return Ok(());

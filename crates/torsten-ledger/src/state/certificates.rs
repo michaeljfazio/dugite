@@ -30,10 +30,9 @@ impl LedgerState {
                     .copied()
                     .unwrap_or(Lovelace(0));
                 if balance.0 > 0 {
-                    warn!(
-                        key = %key.to_hex(),
-                        balance = balance.0,
-                        "Stake deregistration rejected: non-zero reward balance"
+                    debug!(
+                        "Stake deregistration rejected: non-zero reward balance (key={}, balance={})",
+                        key.to_hex(), balance.0,
                     );
                 } else {
                     self.stake_distribution.stake_map.remove(&key);

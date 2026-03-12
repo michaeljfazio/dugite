@@ -10,7 +10,7 @@ use thiserror::Error;
 use torsten_primitives::block::{Point, Tip};
 use torsten_primitives::hash::{BlockHeaderHash, Hash32};
 use torsten_primitives::time::{BlockNo, SlotNo};
-use tracing::{debug, info, trace, warn};
+use tracing::{debug, trace, warn};
 
 use crate::immutable_db::ImmutableDB;
 
@@ -218,14 +218,14 @@ struct RollbackSnapshot {
 impl ChainDB {
     /// Open or create a ChainDB at the given path.
     pub fn open(db_path: &Path) -> Result<Self, ChainDBError> {
-        info!(path = %db_path.display(), k = SECURITY_PARAM_K, "Opening ChainDB");
+        debug!(path = %db_path.display(), k = SECURITY_PARAM_K, "Opening ChainDB");
         std::fs::create_dir_all(db_path)?;
 
         let tree = open_tree(db_path, normal_config())?;
         let tip = recover_tip(&tree);
 
         if let Some(ref t) = tip {
-            info!(
+            debug!(
                 slot = t.slot.0,
                 block_no = t.block_no.0,
                 "ChainDB recovered tip"
@@ -237,7 +237,7 @@ impl ChainDB {
         let immutable = if immutable_dir.is_dir() {
             match ImmutableDB::open(&immutable_dir) {
                 Ok(imm) if imm.total_blocks() > 0 => {
-                    info!(
+                    debug!(
                         blocks = imm.total_blocks(),
                         tip_slot = imm.tip_slot(),
                         "ImmutableDB available (chunk files)"
@@ -265,23 +265,23 @@ impl ChainDB {
         // Take an initial snapshot for rollback support
         db.take_rollback_snapshot();
 
-        info!("ChainDB opened successfully");
+        debug!("ChainDB opened successfully");
         Ok(db)
     }
 
     /// Open with settings optimised for bulk import (e.g. Mithril snapshot).
     pub fn open_for_bulk_import(path: &Path) -> Result<Self, ChainDBError> {
-        info!(path = %path.display(), "Opening ChainDB for bulk import");
+        debug!(path = %path.display(), "Opening ChainDB for bulk import");
         std::fs::create_dir_all(path)?;
 
         let tree = LsmTree::open(path, bulk_import_config())?;
         let tip = recover_tip(&tree);
 
         if let Some(ref t) = tip {
-            info!(slot = t.slot.0, "ChainDB recovered tip (bulk import mode)");
+            debug!(slot = t.slot.0, "ChainDB recovered tip (bulk import mode)");
         }
 
-        info!("ChainDB opened for bulk import (compaction deferred)");
+        debug!("ChainDB opened for bulk import (compaction deferred)");
         Ok(ChainDB {
             path: path.to_path_buf(),
             tree,
@@ -744,7 +744,7 @@ impl ChainDB {
 
         // Restore from snapshot if available
         if let Some(rb) = self.rollback_snapshot.take() {
-            info!(
+            debug!(
                 blocks_removed = removed.len(),
                 "ChainDB: rolling back via LSM snapshot"
             );
@@ -799,7 +799,7 @@ impl ChainDB {
             self.take_rollback_snapshot();
         }
 
-        info!(
+        debug!(
             blocks_removed = removed.len(),
             new_tip_slot = self.tip.map_or(0, |t| t.slot.0),
             "ChainDB: rollback complete"
@@ -815,7 +815,7 @@ impl ChainDB {
     /// Uses save-to-temp-then-rename to avoid data loss if the process
     /// crashes between deleting the old snapshot and writing the new one.
     pub fn persist(&mut self) -> Result<(), ChainDBError> {
-        info!("ChainDB: persisting snapshot");
+        debug!("ChainDB: persisting snapshot");
         // Save to a temporary name first
         let _ = self.tree.delete_snapshot("latest_tmp");
         self.tree.save_snapshot("latest_tmp", "torsten")?;
@@ -832,7 +832,7 @@ impl ChainDB {
         // Rename tmp → latest
         std::fs::rename(&tmp_dir, &latest_dir)?;
 
-        info!("ChainDB: snapshot persisted");
+        debug!("ChainDB: snapshot persisted");
         Ok(())
     }
 
@@ -875,11 +875,18 @@ fn open_tree(path: &Path, config: LsmConfig) -> Result<LsmTree, ChainDBError> {
     if snapshot_dir.exists() {
         match LsmTree::open_snapshot(path, "latest") {
             Ok(tree) => {
-                info!("Restored from persisted snapshot");
+                debug!("Restored from persisted snapshot");
                 return Ok(tree);
             }
             Err(e) => {
-                warn!(error = %e, "Failed to open snapshot, removing and retrying");
+                // Show only the first line of the error to avoid multi-line noise
+                let first_line = e
+                    .to_string()
+                    .lines()
+                    .next()
+                    .unwrap_or("unknown")
+                    .to_string();
+                warn!("Failed to open snapshot, removing and retrying: {first_line}");
                 if let Err(rm_err) = std::fs::remove_dir_all(&snapshot_dir) {
                     warn!(error = %rm_err, "Failed to remove corrupted snapshot dir");
                 }

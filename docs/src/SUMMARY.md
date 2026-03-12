@@ -13,6 +13,7 @@
 - [Topology](./running/topology.md)
 - [Networks](./running/networks.md)
 - [Mithril Snapshot Import](./running/mithril.md)
+- [Logging](./running/logging.md)
 - [Monitoring](./running/monitoring.md)
 - [Relay Node](./running/relay.md)
 - [Block Producer](./running/block-producer.md)

@@ -21,7 +21,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use thiserror::Error;
 use torsten_primitives::hash::Hash32;
-use tracing::{info, warn};
+use tracing::{debug, warn};
 
 /// Secondary index entry size in bytes.
 const SECONDARY_ENTRY_SIZE: usize = 56;
@@ -80,7 +80,7 @@ impl ImmutableDB {
     /// hash index for O(1) block lookups. For preview (~4M blocks) this
     /// uses ~300 MB of memory; mainnet will need an on-disk index.
     pub fn open(dir: &Path) -> Result<Self, ImmutableDBError> {
-        info!(dir = %dir.display(), "Opening ImmutableDB");
+        debug!(dir = %dir.display(), "Opening ImmutableDB");
 
         let mut chunk_nums = Vec::new();
         for entry in fs::read_dir(dir)? {
@@ -96,7 +96,7 @@ impl ImmutableDB {
         chunk_nums.sort();
 
         if chunk_nums.is_empty() {
-            info!("ImmutableDB: no chunk files found");
+            debug!("ImmutableDB: no chunk files found");
             return Ok(ImmutableDB {
                 dir: dir.to_path_buf(),
                 chunks: Vec::new(),
@@ -220,7 +220,7 @@ impl ImmutableDB {
             total_blocks += entry_count as u64;
         }
 
-        info!(
+        debug!(
             chunks = chunks.len(),
             total_blocks,
             tip_slot,

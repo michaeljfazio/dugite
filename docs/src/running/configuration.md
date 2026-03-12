@@ -86,21 +86,20 @@ Genesis file paths are resolved relative to the directory containing the configu
 
 ## Log Level Control
 
-Torsten uses the `RUST_LOG` environment variable for fine-grained log control:
+The log level can be set via CLI flag or environment variable:
 
 ```bash
-# Default (info level)
-RUST_LOG=info torsten-node run ...
+# Via CLI flag
+torsten-node run --log-level debug ...
 
-# Debug level for all crates
-RUST_LOG=debug torsten-node run ...
+# Via environment variable (takes priority over --log-level)
+RUST_LOG=info torsten-node run ...
 
 # Debug only for specific crates
 RUST_LOG=torsten_network=debug,torsten_consensus=debug torsten-node run ...
-
-# Trace level for detailed diagnostics
-RUST_LOG=trace torsten-node run ...
 ```
+
+Torsten supports multiple log output targets (stdout, file, journald) and file rotation. See [Logging](./logging.md) for full details on output configuration.
 
 ## Minimal Configuration
 

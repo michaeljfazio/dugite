@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 use thiserror::Error;
 use torsten_primitives::hash::{BlockHeaderHash, Hash32};
 use torsten_primitives::time::{BlockNo, SlotNo};
-use tracing::{debug, info, trace, warn};
+use tracing::{debug, trace, warn};
 
 use cardano_lsm::{CompactionStrategy, Key, LsmConfig, LsmTree, Value};
 
@@ -191,21 +191,21 @@ impl LsmImmutableDB {
     /// If a `"latest"` snapshot exists (from a previous [`persist()`](Self::persist)
     /// call), the tree is restored from that snapshot.
     pub fn open(path: &Path) -> Result<Self, LsmImmutableDBError> {
-        info!(path = %path.display(), "Opening ImmutableDB (cardano-lsm)");
+        debug!(path = %path.display(), "Opening ImmutableDB (cardano-lsm)");
         std::fs::create_dir_all(path)?;
 
         let tree = open_tree(path, normal_config())?;
         let tip = recover_tip(&tree);
 
         if let Some(ref t) = tip {
-            info!(
+            debug!(
                 slot = t.slot.0,
                 block_no = t.block_no.0,
                 "ImmutableDB recovered tip"
             );
         }
 
-        info!("ImmutableDB opened successfully");
+        debug!("ImmutableDB opened successfully");
         Ok(LsmImmutableDB {
             path: path.to_path_buf(),
             tree,
@@ -219,20 +219,20 @@ impl LsmImmutableDB {
     /// buffer.  Call [`compact()`](Self::compact) once after the import
     /// finishes to consolidate all SSTables.
     pub fn open_for_bulk_import(path: &Path) -> Result<Self, LsmImmutableDBError> {
-        info!(path = %path.display(), "Opening ImmutableDB for bulk import");
+        debug!(path = %path.display(), "Opening ImmutableDB for bulk import");
         std::fs::create_dir_all(path)?;
 
         let tree = LsmTree::open(path, bulk_import_config())?;
         let tip = recover_tip(&tree);
 
         if let Some(ref t) = tip {
-            info!(
+            debug!(
                 slot = t.slot.0,
                 "ImmutableDB recovered tip (bulk import mode)"
             );
         }
 
-        info!("ImmutableDB opened for bulk import (compaction deferred)");
+        debug!("ImmutableDB opened for bulk import (compaction deferred)");
         Ok(LsmImmutableDB {
             path: path.to_path_buf(),
             tree,
@@ -442,7 +442,7 @@ impl LsmImmutableDB {
     /// Must be called before dropping the `LsmImmutableDB` to avoid data loss,
     /// because cardano-lsm uses ephemeral writes.
     pub fn persist(&mut self) -> Result<(), LsmImmutableDBError> {
-        info!("ImmutableDB: persisting snapshot");
+        debug!("ImmutableDB: persisting snapshot");
         // Save to temp name first to avoid data loss on crash
         let _ = self.tree.delete_snapshot("latest_tmp");
         self.tree.save_snapshot("latest_tmp", "torsten")?;
@@ -458,7 +458,7 @@ impl LsmImmutableDB {
         std::fs::rename(&tmp_dir, &latest_dir)
             .map_err(|e| LsmImmutableDBError::Lsm(cardano_lsm::Error::Io(e)))?;
 
-        info!("ImmutableDB: snapshot persisted");
+        debug!("ImmutableDB: snapshot persisted");
         Ok(())
     }
 
@@ -492,11 +492,18 @@ fn open_tree(path: &Path, config: LsmConfig) -> Result<LsmTree, LsmImmutableDBEr
     if snapshot_dir.exists() {
         match LsmTree::open_snapshot(path, "latest") {
             Ok(tree) => {
-                info!("Restored from persisted snapshot");
+                debug!("Restored from persisted snapshot");
                 return Ok(tree);
             }
             Err(e) => {
-                warn!(error = %e, "Failed to open snapshot, removing and retrying");
+                // Show only the first line of the error to avoid multi-line noise
+                let first_line = e
+                    .to_string()
+                    .lines()
+                    .next()
+                    .unwrap_or("unknown")
+                    .to_string();
+                warn!("Failed to open snapshot, removing and retrying: {first_line}");
                 if let Err(rm_err) = std::fs::remove_dir_all(&snapshot_dir) {
                     warn!(error = %rm_err, "Failed to remove corrupted snapshot dir");
                 }

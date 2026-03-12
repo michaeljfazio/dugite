@@ -213,7 +213,7 @@ impl LedgerState {
                     no_confidence_stake,
                 );
                 if met {
-                    info!(
+                    debug!(
                         action_id = %action_id.transaction_id.to_hex(),
                         action_type = ?std::mem::discriminant(action),
                         "Governance proposal ratified"
@@ -257,8 +257,8 @@ impl LedgerState {
                     .votes_by_action
                     .remove(action_id);
             }
-            info!(
-                "{} governance proposal(s) ratified and enacted",
+            debug!(
+                "Governance   {} proposal(s) ratified and enacted",
                 ratified.len()
             );
         }
@@ -729,7 +729,7 @@ impl LedgerState {
                         "Governance protocol parameter update rejected"
                     );
                 } else {
-                    info!("Protocol parameters updated via governance action");
+                    info!("Governance   protocol parameters updated");
                 }
             }
             GovAction::HardForkInitiation {
@@ -738,7 +738,7 @@ impl LedgerState {
                 self.protocol_params.protocol_version_major = protocol_version.0;
                 self.protocol_params.protocol_version_minor = protocol_version.1;
                 info!(
-                    "Hard fork initiated: protocol version {}.{}",
+                    "Governance   hard fork initiated (protocol version {}.{})",
                     protocol_version.0, protocol_version.1
                 );
             }
@@ -766,7 +766,7 @@ impl LedgerState {
                     }
                 }
                 info!(
-                    "Treasury withdrawal enacted: {} lovelace to {} accounts",
+                    "Governance   treasury withdrawal: {} lovelace to {} accounts",
                     total,
                     withdrawals.len()
                 );
@@ -777,7 +777,7 @@ impl LedgerState {
                 gov.committee_hot_keys.clear();
                 gov.committee_expiration.clear();
                 gov.no_confidence = true;
-                info!("No confidence motion enacted: committee disbanded");
+                info!("Governance   no confidence motion enacted, committee disbanded");
             }
             GovAction::UpdateCommittee {
                 members_to_remove,
@@ -811,7 +811,7 @@ impl LedgerState {
                 // UpdateCommittee restores confidence
                 Arc::make_mut(&mut self.governance).no_confidence = false;
                 info!(
-                    "Committee updated: {} removed, {} added, threshold={}/{}",
+                    "Governance   committee updated: {} removed, {} added, threshold={}/{}",
                     members_to_remove.len(),
                     members_to_add.len(),
                     threshold.numerator,
@@ -821,7 +821,7 @@ impl LedgerState {
             GovAction::NewConstitution { constitution, .. } => {
                 Arc::make_mut(&mut self.governance).constitution = Some(constitution.clone());
                 info!(
-                    "New constitution enacted (script_hash: {:?})",
+                    "Governance   new constitution enacted (script_hash: {:?})",
                     constitution.script_hash.as_ref().map(|h| h.to_hex())
                 );
             }

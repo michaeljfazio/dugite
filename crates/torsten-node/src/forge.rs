@@ -5,7 +5,7 @@ use torsten_primitives::era::Era;
 use torsten_primitives::hash::{blake2b_256, Hash28, Hash32};
 use torsten_primitives::time::{BlockNo, SlotNo};
 use torsten_primitives::transaction::Transaction;
-use tracing::{debug, info};
+use tracing::debug;
 
 /// Block producer credentials loaded from disk
 #[allow(dead_code)]
@@ -257,7 +257,7 @@ pub fn forge_block(
     let block_cbor = torsten_serialization::encode_block(&block, &kes_signature);
     block.raw_cbor = Some(block_cbor.clone());
 
-    info!(
+    debug!(
         slot = slot.0,
         block_number = block_number.0,
         tx_count = block.transactions.len(),

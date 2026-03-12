@@ -281,7 +281,7 @@ impl N2NServer {
         };
         // Ignore send errors (no receivers yet or all dropped)
         let _ = self.block_announcement_tx.send(announcement);
-        info!(slot, block_number, "Block announced to peers");
+        debug!(slot, block_number, "Block announced to peers");
     }
 
     /// Get a broadcast sender for block announcements.
@@ -302,7 +302,7 @@ impl N2NServer {
         mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
     ) -> Result<(), N2NServerError> {
         let listener = TcpListener::bind(self.listen_addr).await?;
-        info!("N2N server listening on {}", self.listen_addr);
+        info!("N2N          listening on {}", self.listen_addr);
 
         let active_connections = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         // Rate limiter: max 10 connections per IP per 60 seconds
@@ -349,7 +349,7 @@ impl N2NServer {
                     }
 
                     active_connections.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    info!(peer = %peer_addr, "N2N peer connected");
+                    debug!(peer = %peer_addr, "N2N peer connected");
 
                     let query_handler = self.query_handler.clone();
                     let block_provider = self.block_provider.clone();
@@ -381,7 +381,7 @@ impl N2NServer {
                             debug!(peer = %peer_addr, "N2N connection ended: {e}");
                         }
                         counter.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
-                        info!(peer = %peer_addr, "N2N peer disconnected");
+                        debug!(peer = %peer_addr, "N2N peer disconnected");
                     });
                 }
                 Err(e) => {
@@ -390,7 +390,7 @@ impl N2NServer {
             }
             }
             _ = shutdown_rx.changed() => {
-                info!("N2N server shutting down");
+                debug!("N2N server shutting down");
                 return Ok(());
             }
             }

@@ -3,7 +3,7 @@ use std::sync::Arc;
 
 use fs2::available_space;
 use tokio::sync::watch;
-use tracing::{error, info, warn};
+use tracing::{debug, error, warn};
 
 use crate::metrics::NodeMetrics;
 
@@ -83,7 +83,7 @@ pub async fn start_disk_monitor(
         tokio::select! {
             _ = interval.tick() => {}
             _ = shutdown_rx.changed() => {
-                info!("Disk monitor shutting down");
+                debug!("Disk monitor shutting down");
                 return;
             }
         }

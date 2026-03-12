@@ -141,7 +141,7 @@ pub async fn import_snapshot(
     temp_dir: Option<&Path>,
 ) -> Result<()> {
     let aggregator = aggregator_url(network_magic);
-    info!(aggregator, "Fetching latest Mithril snapshot info");
+    info!("Mithril      fetching latest snapshot from {}", aggregator);
 
     // Step 1: Get latest snapshot metadata
     let client = reqwest::Client::builder()
@@ -162,11 +162,10 @@ pub async fn import_snapshot(
         .context("No snapshots available from aggregator")?;
 
     info!(
-        digest = %latest.digest,
-        epoch = latest.beacon.epoch,
-        immutable_file_number = latest.beacon.immutable_file_number,
-        size_gb = latest.size / (1024 * 1024 * 1024),
-        "Latest snapshot found"
+        "Mithril      snapshot found (epoch={}, immutable={}, {:.1} GB)",
+        latest.beacon.epoch,
+        latest.beacon.immutable_file_number,
+        latest.size as f64 / (1024.0 * 1024.0 * 1024.0),
     );
 
     // Step 2: Get download locations
@@ -184,7 +183,7 @@ pub async fn import_snapshot(
         .first()
         .context("No download locations in snapshot")?;
 
-    info!(url = %download_url, "Downloading snapshot");
+    info!("Mithril      downloading snapshot...");
 
     // Step 3: Download snapshot to temp file
     let work_dir = temp_dir
@@ -197,10 +196,7 @@ pub async fn import_snapshot(
 
     // Step 4: Extract the archive
     let extract_dir = work_dir.join(format!("extract-{}", detail.digest));
-    info!(
-        path = %extract_dir.display(),
-        "Extracting snapshot archive"
-    );
+    info!("Mithril      extracting snapshot archive...");
     extract_archive(&archive_path, &extract_dir)?;
 
     // Step 5: Verify snapshot digest (Mithril digest over extracted immutable files)
@@ -219,7 +215,7 @@ pub async fn import_snapshot(
     let immutable_dir = find_immutable_dir(&extract_dir);
     let dest_dir = database_path.join("immutable");
     if let Some(ref imm) = immutable_dir {
-        info!("Moving chunk files to permanent immutable storage");
+        info!("Mithril      moving chunk files to permanent storage");
         if let Err(e) = fs::rename(imm, &dest_dir) {
             // rename may fail across filesystems, fall back to copy
             warn!(error = %e, "rename failed, falling back to copy");
@@ -230,7 +226,7 @@ pub async fn import_snapshot(
     // Ledger state is not imported — the node rebuilds it via block replay.
 
     // Step 8: Cleanup
-    info!("Cleaning up temporary files");
+    info!("Mithril      cleaning up temporary files");
     if let Err(e) = fs::remove_file(&archive_path) {
         warn!(error = %e, "Failed to remove archive file");
     }
@@ -238,7 +234,7 @@ pub async fn import_snapshot(
         warn!(error = %e, "Failed to remove extract directory");
     }
 
-    info!("Mithril snapshot import complete!");
+    info!("Mithril      import complete");
     Ok(())
 }
 
@@ -256,7 +252,7 @@ async fn download_snapshot(
     // If file already exists with the right size, skip download
     if let Ok(meta) = fs::metadata(dest) {
         if meta.len() == expected_size {
-            info!("Snapshot archive already downloaded, skipping");
+            info!("Mithril      snapshot archive already downloaded, skipping");
             return Ok(());
         }
     }
@@ -298,8 +294,8 @@ async fn download_snapshot(
 
     fs::rename(&temp_path, dest)?;
     info!(
-        size_gb = downloaded / (1024 * 1024 * 1024),
-        "Download complete"
+        "Mithril      download complete ({:.1} GB)",
+        downloaded as f64 / (1024.0 * 1024.0 * 1024.0),
     );
 
     Ok(())
@@ -317,7 +313,7 @@ fn verify_snapshot_digest(
     beacon: &SnapshotBeacon,
     expected_digest: &str,
 ) -> Result<()> {
-    info!("Verifying Mithril snapshot digest");
+    info!("Mithril      verifying snapshot digest...");
 
     let immutable_dir = find_immutable_dir(extract_dir)
         .context("Could not find immutable/ directory for digest verification")?;
@@ -412,10 +408,7 @@ fn verify_snapshot_digest(
         );
     }
 
-    info!(
-        files_verified = total_files,
-        "Mithril snapshot digest verified successfully"
-    );
+    info!("Mithril      digest verified ({} files)", total_files,);
     Ok(())
 }
 
@@ -429,7 +422,7 @@ fn extract_archive(archive_path: &Path, extract_dir: &Path) -> Result<()> {
     if extract_dir.exists() {
         let immutable_dir = find_immutable_dir(extract_dir);
         if immutable_dir.is_some() {
-            info!("Archive already extracted, skipping");
+            info!("Mithril      archive already extracted, skipping");
             return Ok(());
         }
     }
@@ -468,7 +461,7 @@ fn extract_archive(archive_path: &Path, extract_dir: &Path) -> Result<()> {
     }
 
     pb.finish_with_message(format!("{entry_count} entries extracted"));
-    info!(entries = entry_count, "Archive extraction complete");
+    info!("Mithril      extraction complete ({} entries)", entry_count);
 
     Ok(())
 }
@@ -686,10 +679,6 @@ where
     }
     chunk_numbers.sort();
 
-    let total_chunks = chunk_numbers.len() as u64;
-    let start = std::time::Instant::now();
-    let mut last_log = std::time::Instant::now();
-    let mut chunks_processed = 0u64;
     let mut total_blocks = 0u64;
 
     for chunk_num in &chunk_numbers {
@@ -701,19 +690,6 @@ where
             let count = replay_chunk_with_index(&chunk_path, &secondary_path, &mut on_block)?;
             if count > 0 {
                 total_blocks += count;
-                chunks_processed += 1;
-                if last_log.elapsed().as_secs() >= 5 {
-                    let elapsed = start.elapsed().as_secs_f64();
-                    let speed = total_blocks as f64 / elapsed;
-                    tracing::info!(
-                        chunks_processed,
-                        total_chunks,
-                        total_blocks,
-                        speed = speed as u64,
-                        "Chunk replay progress"
-                    );
-                    last_log = std::time::Instant::now();
-                }
                 continue;
             }
         }
@@ -721,7 +697,6 @@ where
         // Fallback: sequential CBOR probe for block boundaries (no pallas decode)
         let count = replay_chunk_sequential(&chunk_path, &mut on_block)?;
         total_blocks += count;
-        chunks_processed += 1;
     }
 
     Ok(total_blocks)

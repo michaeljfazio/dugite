@@ -69,7 +69,7 @@ The node will:
 3. Connect to preview testnet peers
 4. Sync remaining blocks to chain tip
 
-Progress is logged every 5 seconds, showing sync percentage, blocks-per-second throughput, UTxO count, and epoch number.
+Progress is logged every 5 seconds, showing sync percentage, blocks-per-second throughput, UTxO count, and epoch number. Logs go to stdout by default; add `--log-output file --log-dir /var/log/torsten` for file logging. See [Logging](./running/logging.md) for all options.
 
 ## 4. Query the Node
 

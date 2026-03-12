@@ -15,7 +15,7 @@ use std::collections::HashSet;
 use std::sync::Arc;
 use tokio::time::{timeout, Duration};
 use torsten_primitives::hash::{Hash32, TransactionHash};
-use tracing::{debug, info, trace};
+use tracing::{debug, trace};
 
 use crate::n2c::TxValidator;
 use torsten_primitives::mempool::{MempoolAddResult, MempoolProvider};
@@ -214,7 +214,7 @@ impl TxSubmissionClient {
                     let fee = tx.body.fee;
                     match mempool.add_tx_with_fee(tx_hash, tx, tx_size, fee) {
                         Ok(MempoolAddResult::Added) => {
-                            info!(hash = %tx_hash, "TxSubmission2: tx added to mempool");
+                            debug!(hash = %tx_hash, "TxSubmission2: tx added to mempool");
                             stats.accepted += 1;
                         }
                         Ok(MempoolAddResult::AlreadyExists) => {

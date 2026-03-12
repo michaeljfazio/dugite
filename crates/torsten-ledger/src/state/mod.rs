@@ -320,11 +320,9 @@ impl LedgerState {
     /// Set the slot configuration for Plutus time conversion
     pub fn set_slot_config(&mut self, slot_config: SlotConfig) {
         self.slot_config = slot_config;
-        info!(
-            zero_time = slot_config.zero_time,
-            zero_slot = slot_config.zero_slot,
-            slot_length = slot_config.slot_length,
-            "Ledger: slot config set for Plutus evaluation"
+        debug!(
+            "Ledger: slot config (zero_time={}, zero_slot={}, slot_length={})",
+            slot_config.zero_time, slot_config.zero_slot, slot_config.slot_length,
         );
     }
 
@@ -341,11 +339,9 @@ impl LedgerState {
                 f_num,
                 f_den,
             );
-        info!(
-            epoch_length,
-            randomness_stabilisation_window = self.randomness_stabilisation_window,
-            security_param,
-            "Ledger: epoch length configured"
+        debug!(
+            "Ledger: epoch length={}, stabilisation_window={}, k={}",
+            epoch_length, self.randomness_stabilisation_window, security_param,
         );
     }
 
@@ -361,11 +357,9 @@ impl LedgerState {
     ) {
         self.shelley_transition_epoch = shelley_transition_epoch;
         self.byron_epoch_length = byron_epoch_length;
-        info!(
-            shelley_transition_epoch,
-            byron_epoch_length,
-            byron_slots = byron_epoch_length * shelley_transition_epoch,
-            "Ledger: Shelley transition configured"
+        debug!(
+            "Ledger: Shelley transition at epoch {}, byron_epoch_len={}",
+            shelley_transition_epoch, byron_epoch_length,
         );
     }
 
@@ -419,16 +413,16 @@ impl LedgerState {
         // Initialize nonce state from genesis hash
         self.evolving_nonce = hash;
         self.candidate_nonce = hash;
-        info!(
-            genesis_hash = %hash.to_hex(),
-            "Ledger: nonce state initialized from genesis hash"
+        debug!(
+            "Ledger: nonce initialized from genesis hash {}",
+            hash.to_hex()
         );
     }
 
     /// Set the update quorum threshold (from Shelley genesis)
     pub fn set_update_quorum(&mut self, quorum: u64) {
         self.update_quorum = quorum;
-        info!(update_quorum = quorum, "Ledger: update quorum configured");
+        debug!("Ledger: update quorum={quorum}");
     }
 
     /// Seed the UTxO set with genesis UTxOs (from Byron genesis nonAvvmBalances).
@@ -476,11 +470,9 @@ impl LedgerState {
             total_lovelace += lovelace;
         }
 
-        info!(
-            seeded,
-            total_lovelace,
-            utxo_count = self.utxo_set.len(),
-            "Ledger: genesis UTxOs seeded"
+        debug!(
+            "Ledger: seeded {} genesis UTxOs ({} lovelace)",
+            seeded, total_lovelace
         );
     }
 
@@ -513,11 +505,11 @@ impl LedgerState {
         // correctly, pending retirements fire at the right epoch, and rewards are distributed.
         let block_epoch = EpochNo(self.epoch_of_slot(block.slot().0));
         if block_epoch > self.epoch {
-            info!(
-                prev_epoch = self.epoch.0,
-                new_epoch = block_epoch.0,
-                slot = block.slot().0,
-                "Ledger: epoch transition detected"
+            debug!(
+                "Ledger: epoch transition {} -> {} at slot {}",
+                self.epoch.0,
+                block_epoch.0,
+                block.slot().0,
             );
             while self.epoch < block_epoch {
                 let next_epoch = EpochNo(self.epoch.0.saturating_add(1));
@@ -695,7 +687,7 @@ impl LedgerState {
             // Collect pre-Conway protocol parameter update proposals
             if let Some(ref update) = tx.body.update {
                 for (genesis_hash, ppu) in &update.proposed_updates {
-                    info!(
+                    debug!(
                         genesis_hash = %genesis_hash.to_hex(),
                         target_epoch = update.epoch,
                         protocol_version = ?ppu.protocol_version_major.zip(ppu.protocol_version_minor),
@@ -811,13 +803,10 @@ impl LedgerState {
         std::fs::rename(&tmp_path, path)
             .map_err(|e| LedgerError::EpochTransition(format!("Failed to rename snapshot: {e}")))?;
         info!(
-            path = %path.display(),
-            bytes = total_bytes,
-            version = Self::SNAPSHOT_VERSION,
-            utxo_count = self.utxo_set.len(),
-            epoch = self.epoch.0,
-            slot = ?self.tip.point.slot().map(|s| s.0),
-            "Ledger snapshot saved"
+            "Snapshot     saved (epoch={}, {} UTxOs, {:.1} MB)",
+            self.epoch.0,
+            self.utxo_set.len(),
+            total_bytes as f64 / 1_048_576.0,
         );
         Ok(())
     }
@@ -852,7 +841,7 @@ impl LedgerState {
                         Self::SNAPSHOT_VERSION,
                     )));
                 }
-                info!(version, "Loading versioned snapshot");
+                debug!(version, "Loading versioned snapshot");
                 let stored_checksum = &raw[5..37];
                 let payload = &raw[37..];
                 let computed = torsten_primitives::hash::blake2b_256(payload);
@@ -916,13 +905,12 @@ impl LedgerState {
         state.recompute_snapshot_pool_stakes();
         // Keep needs_stake_rebuild=true so every live epoch boundary rebuilds.
         state.needs_stake_rebuild = true;
-        info!(
-            path = %path.display(),
-            bytes = raw.len(),
-            utxo_count = state.utxo_set.len(),
-            epoch = state.epoch.0,
-            slot = ?state.tip.point.slot().map(|s| s.0),
-            "Ledger snapshot loaded (stake distribution rebuilt)"
+        debug!(
+            "Snapshot loaded from {} ({:.1} MB, {} UTxOs, epoch {})",
+            path.display(),
+            raw.len() as f64 / 1_048_576.0,
+            state.utxo_set.len(),
+            state.epoch.0,
         );
         Ok(state)
     }

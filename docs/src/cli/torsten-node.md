@@ -24,6 +24,11 @@ torsten-node run [OPTIONS]
 | `--shelley-kes-key` | | Path to the KES signing key (enables block production) |
 | `--shelley-vrf-key` | | Path to the VRF signing key (enables block production) |
 | `--shelley-operational-certificate` | | Path to the operational certificate (enables block production) |
+| `--log-output` | `stdout` | Log output target: `stdout`, `file`, or `journald`. Can be specified multiple times. |
+| `--log-level` | `info` | Log level (`trace`, `debug`, `info`, `warn`, `error`). Overridden by `RUST_LOG`. |
+| `--log-dir` | `logs` | Directory for log files (used with `--log-output file`) |
+| `--log-file-rotation` | `daily` | Log file rotation strategy: `daily`, `hourly`, or `never` |
+| `--log-no-color` | `false` | Disable ANSI colors in stdout output |
 
 ### Relay Node (default)
 
@@ -65,7 +70,9 @@ If any of the three flags is missing, the node runs in relay-only mode.
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `TORSTEN_PIPELINE_DEPTH` | `150` | ChainSync pipeline depth (number of blocks requested ahead) |
-| `RUST_LOG` | `info` | Log level filter (e.g., `debug`, `info`, `warn`, `torsten_node=debug`) |
+| `RUST_LOG` | `info` | Log level filter (e.g., `debug`, `info`, `warn`, `torsten_node=debug`). Overrides `--log-level`. |
+
+See [Logging](../running/logging.md) for details on output targets, file rotation, and per-crate filtering.
 
 ### Configuration File
 
@@ -103,6 +110,11 @@ torsten-node mithril-import [OPTIONS]
 | `--network-magic` | `764824073` | Network magic value |
 | `--database-path` | `db` | Path to the database directory |
 | `--temp-dir` | | Temporary directory for download and extraction (uses system temp if omitted) |
+| `--log-output` | `stdout` | Log output target: `stdout`, `file`, or `journald`. Can be specified multiple times. |
+| `--log-level` | `info` | Log level (`trace`, `debug`, `info`, `warn`, `error`). Overridden by `RUST_LOG`. |
+| `--log-dir` | `logs` | Directory for log files (used with `--log-output file`) |
+| `--log-file-rotation` | `daily` | Log file rotation strategy: `daily`, `hourly`, or `never` |
+| `--log-no-color` | `false` | Disable ANSI colors in stdout output |
 
 ### Network Magic Values
 

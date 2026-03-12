@@ -2,6 +2,7 @@ mod config;
 mod disk_monitor;
 mod forge;
 mod genesis;
+mod logging;
 mod metrics;
 mod mithril;
 mod node;
@@ -11,7 +12,6 @@ use anyhow::Result;
 use clap::Parser;
 use std::path::PathBuf;
 use tracing::info;
-use tracing_subscriber::EnvFilter;
 
 /// Torsten - A Rust implementation of the Cardano node
 #[derive(Parser, Debug)]
@@ -27,6 +27,30 @@ enum Command {
     Run(RunArgs),
     /// Import a Mithril snapshot for fast initial sync
     MithrilImport(MithrilImportArgs),
+}
+
+/// Shared logging arguments for all subcommands
+#[derive(clap::Args, Debug, Clone)]
+struct LogArgs {
+    /// Log output targets: stdout, file, journald (can specify multiple)
+    #[arg(long = "log-output", default_value = "stdout")]
+    log_outputs: Vec<String>,
+
+    /// Log level (trace, debug, info, warn, error). Overridden by RUST_LOG env var.
+    #[arg(long)]
+    log_level: Option<String>,
+
+    /// Directory for log files (used with --log-output file)
+    #[arg(long, default_value = "logs")]
+    log_dir: PathBuf,
+
+    /// Log file rotation strategy: daily, hourly, never
+    #[arg(long, default_value = "daily")]
+    log_file_rotation: String,
+
+    /// Disable ANSI colors in stdout output
+    #[arg(long)]
+    log_no_color: bool,
 }
 
 #[derive(clap::Args, Debug)]
@@ -71,24 +95,9 @@ struct RunArgs {
     /// Path to the operational certificate file
     #[arg(long)]
     shelley_operational_certificate: Option<PathBuf>,
-}
 
-#[tokio::main]
-async fn main() -> Result<()> {
-    // Initialize logging
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
-        )
-        .with_target(true)
-        .init();
-
-    let cli = Cli::parse();
-
-    match cli.command {
-        Command::Run(args) => run_node(args).await,
-        Command::MithrilImport(args) => run_mithril_import(args).await,
-    }
+    #[command(flatten)]
+    log: LogArgs,
 }
 
 #[derive(clap::Args, Debug)]
@@ -104,6 +113,45 @@ struct MithrilImportArgs {
     /// Temporary directory for download and extraction
     #[arg(long)]
     temp_dir: Option<PathBuf>,
+
+    #[command(flatten)]
+    log: LogArgs,
+}
+
+fn build_logging_opts(log: &LogArgs) -> Result<logging::LoggingOpts> {
+    let outputs: Result<Vec<logging::LogOutput>, _> =
+        log.log_outputs.iter().map(|s| s.parse()).collect();
+    let outputs = outputs.map_err(|e| anyhow::anyhow!(e))?;
+
+    let rotation: logging::LogRotation = log
+        .log_file_rotation
+        .parse()
+        .map_err(|e: String| anyhow::anyhow!(e))?;
+
+    Ok(logging::LoggingOpts {
+        outputs,
+        level: log.log_level.clone().unwrap_or_else(|| "info".to_string()),
+        log_dir: log.log_dir.to_string_lossy().into_owned(),
+        rotation,
+        no_color: log.log_no_color,
+    })
+}
+
+#[tokio::main]
+async fn main() -> Result<()> {
+    let cli = Cli::parse();
+
+    // Extract log args and initialize logging before any work
+    let log_args = match &cli.command {
+        Command::Run(args) => &args.log,
+        Command::MithrilImport(args) => &args.log,
+    };
+    let _log_guard = logging::init(&build_logging_opts(log_args)?)?;
+
+    match cli.command {
+        Command::Run(args) => run_node(args).await,
+        Command::MithrilImport(args) => run_mithril_import(args).await,
+    }
 }
 
 async fn run_mithril_import(args: MithrilImportArgs) -> Result<()> {
@@ -120,29 +168,46 @@ async fn run_mithril_import(args: MithrilImportArgs) -> Result<()> {
 }
 
 async fn run_node(args: RunArgs) -> Result<()> {
+    info!("");
     info!(
-        "Starting Torsten Cardano Node v{}",
+        "             Torsten Cardano Node v{}",
         env!("CARGO_PKG_VERSION")
     );
-    info!("Config: {}", args.config.display());
-    info!("Database: {}", args.database_path.display());
-    info!("Socket: {}", args.socket_path.display());
-    info!("Listening on {}:{}", args.host_addr, args.port);
+    info!("");
 
     // Load configuration
     let node_config = config::NodeConfig::load(&args.config)?;
-    info!("Network: {:?}", node_config.network);
 
     // Load topology
     let topology = topology::Topology::load(&args.topology)?;
     let all_peers = topology.all_peers();
+
+    info!("Config       {}", args.config.display());
+    info!("Database     {}", args.database_path.display());
+    info!("Socket       {}", args.socket_path.display());
     info!(
-        "Topology: {} peers configured (producers={}, bootstrap={}, local_roots={}, public_roots={})",
+        "Network      {:?} (magic={})",
+        node_config.network,
+        node_config
+            .network_magic
+            .unwrap_or_else(|| node_config.network.magic())
+    );
+    info!("Listen       {}:{}", args.host_addr, args.port);
+    info!(
+        "Topology     {} peers (producers={}, bootstrap={}, local={}, public={})",
         all_peers.len(),
         topology.producers.len(),
         topology.bootstrap_peers.as_ref().map_or(0, |v| v.len()),
-        topology.local_roots.iter().map(|g| g.access_points.len()).sum::<usize>(),
-        topology.public_roots.iter().map(|r| r.access_points.len()).sum::<usize>(),
+        topology
+            .local_roots
+            .iter()
+            .map(|g| g.access_points.len())
+            .sum::<usize>(),
+        topology
+            .public_roots
+            .iter()
+            .map(|r| r.access_points.len())
+            .sum::<usize>(),
     );
 
     // Initialize the node
@@ -166,8 +231,7 @@ async fn run_node(args: RunArgs) -> Result<()> {
         metrics_port: args.metrics_port,
     })?;
 
-    // Run the node
-    info!("Node initialized, starting...");
+    info!("");
     node.run().await?;
 
     Ok(())

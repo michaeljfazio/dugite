@@ -218,11 +218,7 @@ In addition to the Prometheus endpoint, Torsten logs sync progress to the consol
 Example log line:
 
 ```
-INFO torsten_node::node: slot=142857392 block=11283746 epoch=512 utxo=15234892 sync=95.42% speed=312 blk/s
+12:34:56.789  INFO torsten_node::node               Sync         slot=142857392 block=11283746 epoch=512 utxo=15234892 sync=95.42% speed=312 blk/s
 ```
 
-Set the log level via the `RUST_LOG` environment variable:
-
-```bash
-RUST_LOG=info torsten-node run ...
-```
+Log output can be directed to stdout, file, or systemd journal. See [Logging](./logging.md) for full details on output targets, file rotation, and log level configuration.

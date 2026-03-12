@@ -6,7 +6,7 @@ use torsten_ledger::SlotConfig;
 use torsten_primitives::protocol_params::ProtocolParameters;
 use torsten_primitives::transaction::Rational;
 use torsten_primitives::value::Lovelace;
-use tracing::info;
+use tracing::debug;
 
 // ──────────────────────────────────────────────────────────────────────────
 // Byron genesis
@@ -99,7 +99,7 @@ impl ByronGenesis {
         let genesis: Self = serde_json::from_str(&content)
             .with_context(|| format!("Failed to parse Byron genesis: {}", path.display()))?;
         let hash = torsten_primitives::hash::blake2b_256(content.as_bytes());
-        info!(
+        debug!(
             genesis_hash = %hash.to_hex(),
             "Byron genesis hash computed"
         );
@@ -149,7 +149,7 @@ impl ByronGenesis {
             }
         }
 
-        info!(
+        debug!(
             count = entries.len(),
             total_lovelace = entries.iter().map(|e| e.lovelace).sum::<u64>(),
             "Byron genesis: extracted initial UTxOs"
@@ -224,7 +224,7 @@ impl ShelleyGenesis {
         let genesis: Self = serde_json::from_str(&content)
             .with_context(|| format!("Failed to parse Shelley genesis: {}", path.display()))?;
         let hash = torsten_primitives::hash::blake2b_256(content.as_bytes());
-        info!(
+        debug!(
             genesis_hash = %hash.to_hex(),
             "Shelley genesis hash computed"
         );
@@ -345,7 +345,7 @@ impl AlonzoGenesis {
 
     /// Apply Alonzo genesis parameters to protocol parameters
     pub fn apply_to_protocol_params(&self, params: &mut ProtocolParameters) {
-        info!(
+        debug!(
             max_tx_ex_mem = self.max_tx_ex_units.ex_units_mem,
             max_tx_ex_steps = self.max_tx_ex_units.ex_units_steps,
             max_val_size = self.max_value_size,
@@ -385,20 +385,20 @@ impl AlonzoGenesis {
         // Cost models
         if let Some(v1_value) = self.cost_models.get("PlutusV1") {
             if let Some(costs) = parse_cost_model(v1_value) {
-                info!(count = costs.len(), "Loaded PlutusV1 cost model");
+                debug!(count = costs.len(), "Loaded PlutusV1 cost model");
                 params.cost_models.plutus_v1 = Some(costs);
             }
         }
         if let Some(v2_value) = self.cost_models.get("PlutusV2") {
             if let Some(costs) = parse_cost_model(v2_value) {
-                info!(count = costs.len(), "Loaded PlutusV2 cost model");
+                debug!(count = costs.len(), "Loaded PlutusV2 cost model");
                 params.cost_models.plutus_v2 = Some(costs);
             }
         }
         // PlutusV3 may also appear in Alonzo genesis on newer testnets
         if let Some(v3_value) = self.cost_models.get("PlutusV3") {
             if let Some(costs) = parse_cost_model(v3_value) {
-                info!(
+                debug!(
                     count = costs.len(),
                     "Loaded PlutusV3 cost model from Alonzo genesis"
                 );
@@ -529,7 +529,7 @@ impl ConwayGenesis {
 
     /// Apply Conway genesis parameters to protocol parameters
     pub fn apply_to_protocol_params(&self, params: &mut ProtocolParameters) {
-        info!(
+        debug!(
             drep_deposit = self.d_rep_deposit,
             drep_activity = self.d_rep_activity,
             gov_action_deposit = self.gov_action_deposit,
@@ -565,7 +565,7 @@ impl ConwayGenesis {
 
         // PlutusV3 cost model from Conway genesis
         if let Some(v3) = &self.plutus_v3_cost_model {
-            info!(
+            debug!(
                 count = v3.len(),
                 "Loaded PlutusV3 cost model from Conway genesis"
             );

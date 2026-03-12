@@ -9,7 +9,7 @@
 use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::time::{Duration, Instant};
-use tracing::{debug, info};
+use tracing::debug;
 
 /// Diffusion mode matching cardano-node
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -376,7 +376,7 @@ impl PeerManager {
             if !is_initiator {
                 self.inbound_count += 1;
             }
-            info!(%addr, version, is_initiator, "Peer connected (warm)");
+            debug!(%addr, version, is_initiator, "Peer connected (warm)");
         }
     }
 
