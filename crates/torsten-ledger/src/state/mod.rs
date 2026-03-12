@@ -811,7 +811,9 @@ impl LedgerState {
     /// changes (new/removed/reordered fields) will cause deserialization failures
     /// for older snapshots. This is acceptable — snapshots are an optimization,
     /// not critical data. The node can always reconstruct state from the chain.
-    const SNAPSHOT_VERSION: u8 = 1;
+    /// Increment when GovernanceState/LedgerState fields change.
+    /// Bincode is positional — any field addition/reorder breaks old snapshots.
+    const SNAPSHOT_VERSION: u8 = 2;
 
     /// Save ledger state snapshot to disk using bincode serialization.
     /// Format: [4-byte magic "TRSN"][1-byte version][32-byte blake2b checksum][bincode data]
