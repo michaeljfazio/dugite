@@ -224,6 +224,108 @@ fn tier1_prometheus_metrics() {
     }
 }
 
+// ─── Pool and Delegation Queries ──────────────────────────────────────
+
+#[test]
+fn tier1_query_pool_params() {
+    let socket = require_socket();
+    // First get pool list, then query params for a specific pool
+    let pools_output = query(&socket, &["stake-pools"]);
+    let pools: Vec<&str> = pools_output
+        .lines()
+        .filter(|l| !l.trim().is_empty() && l.trim().len() == 56)
+        .collect();
+    if pools.is_empty() {
+        eprintln!("SKIP: No pools found");
+        return;
+    }
+    let pool_id = pools[0].trim();
+    let output = query(&socket, &["pool-params", "--stake-pool-id", pool_id]);
+    assert!(
+        !output.trim().is_empty(),
+        "Pool params for {pool_id} should return data"
+    );
+}
+
+#[test]
+fn tier1_query_protocol_parameters_content() {
+    let socket = require_socket();
+    let pp = query_json(&socket, &["protocol-parameters"]);
+
+    // Verify Conway-specific governance parameters are present
+    let conway_keys = [
+        "poolVotingThresholds",
+        "drepVotingThresholds",
+        "committeeMinSize",
+        "committeeMaxTermLength",
+        "govActionLifetime",
+        "govActionDeposit",
+        "dRepDeposit",
+        "dRepActivity",
+    ];
+    for key in conway_keys {
+        assert!(
+            pp.get(key).is_some(),
+            "Protocol parameters should contain Conway field '{key}'"
+        );
+    }
+
+    // Verify execution unit prices
+    assert!(
+        pp.get("executionUnitPrices").is_some(),
+        "Protocol parameters should contain 'executionUnitPrices'"
+    );
+    assert!(
+        pp.get("maxTxExecutionUnits").is_some(),
+        "Protocol parameters should contain 'maxTxExecutionUnits'"
+    );
+}
+
+#[test]
+fn tier1_query_gov_state_structure() {
+    let socket = require_socket();
+    let gov = query_json(&socket, &["gov-state"]);
+
+    // GovState should be an object with proposals, committee, constitution, etc.
+    // It may be printed as a JSON array/object depending on format
+    assert!(!gov.is_null(), "Gov state should return parseable JSON");
+}
+
+#[test]
+fn tier1_query_constitution_content() {
+    let socket = require_socket();
+    let output = query(&socket, &["constitution"]);
+    // Constitution should mention a URL or hash
+    assert!(
+        output.contains("url") || output.contains("hash") || output.contains("http"),
+        "Constitution should contain url or hash data, got: {}",
+        &output[..output.len().min(200)]
+    );
+}
+
+#[test]
+fn tier1_query_drep_state_non_empty() {
+    let socket = require_socket();
+    let output = query(&socket, &["drep-state"]);
+    // On preview testnet, there should be DReps registered
+    assert!(
+        output.len() > 10,
+        "DRep state should return substantial data on preview testnet"
+    );
+}
+
+#[test]
+fn tier1_query_treasury_values() {
+    let socket = require_socket();
+    let output = query(&socket, &["treasury"]);
+    // Treasury should contain numeric values
+    assert!(
+        output.contains("treasury") || output.chars().any(|c| c.is_ascii_digit()),
+        "Treasury should contain numeric values, got: {}",
+        &output[..output.len().min(200)]
+    );
+}
+
 // ─── Cross-Verification with Koios ────────────────────────────────────
 
 #[test]
