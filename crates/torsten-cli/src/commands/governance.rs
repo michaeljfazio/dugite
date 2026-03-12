@@ -980,13 +980,6 @@ fn encode_protocol_param_update(json: &serde_json::Value) -> Result<Vec<u8>> {
         .as_object()
         .ok_or_else(|| anyhow::anyhow!("Protocol param update must be a JSON object"))?;
 
-    let mut buf = Vec::new();
-    let mut enc = minicbor::Encoder::new(&mut buf);
-
-    // Count non-null fields
-    let field_count = obj.values().filter(|v| !v.is_null()).count();
-    enc.map(field_count as u64)?;
-
     // Map of JSON keys to CBOR field numbers
     let field_map: &[(&str, u32)] = &[
         ("txFeePerByte", 0),
@@ -1016,6 +1009,21 @@ fn encode_protocol_param_update(json: &serde_json::Value) -> Result<Vec<u8>> {
         ("govActionDeposit", 31),
         ("govActionLifetime", 32),
     ];
+
+    // Pre-compute the actual field count accounting for aliases and null values
+    let mut seen_keys = std::collections::HashSet::new();
+    let mut field_count = 0u64;
+    for (json_key, cbor_key) in field_map {
+        if let Some(value) = obj.get(*json_key) {
+            if !value.is_null() && seen_keys.insert(*cbor_key) {
+                field_count += 1;
+            }
+        }
+    }
+
+    let mut buf = Vec::new();
+    let mut enc = minicbor::Encoder::new(&mut buf);
+    enc.map(field_count)?;
 
     let mut written_keys = std::collections::HashSet::new();
     for (json_key, cbor_key) in field_map {
@@ -1109,5 +1117,140 @@ mod tests {
         // Same input should produce same hash
         let hash2 = torsten_primitives::hash::blake2b_256(data);
         assert_eq!(hash.as_bytes(), hash2.as_bytes());
+    }
+
+    #[test]
+    fn test_encode_protocol_param_update_empty() {
+        let json = serde_json::json!({});
+        let buf = encode_protocol_param_update(&json).unwrap();
+        let mut dec = minicbor::Decoder::new(&buf);
+        // Empty map
+        assert_eq!(dec.map().unwrap(), Some(0));
+    }
+
+    #[test]
+    fn test_encode_protocol_param_update_single_field() {
+        let json = serde_json::json!({ "txFeePerByte": 44 });
+        let buf = encode_protocol_param_update(&json).unwrap();
+        let mut dec = minicbor::Decoder::new(&buf);
+        assert_eq!(dec.map().unwrap(), Some(1));
+        assert_eq!(dec.u32().unwrap(), 0); // txFeePerByte = key 0
+        assert_eq!(dec.u64().unwrap(), 44);
+    }
+
+    #[test]
+    fn test_encode_protocol_param_update_multiple_fields() {
+        let json = serde_json::json!({
+            "txFeePerByte": 44,
+            "txFeeFixed": 155381,
+            "maxTxSize": 16384
+        });
+        let buf = encode_protocol_param_update(&json).unwrap();
+        let mut dec = minicbor::Decoder::new(&buf);
+        assert_eq!(dec.map().unwrap(), Some(3));
+
+        // Collect key-value pairs (order depends on HashMap iteration)
+        let mut pairs = Vec::new();
+        for _ in 0..3 {
+            let key = dec.u32().unwrap();
+            let val = dec.u64().unwrap();
+            pairs.push((key, val));
+        }
+        pairs.sort_by_key(|(k, _)| *k);
+
+        assert_eq!(pairs[0], (0, 44)); // txFeePerByte
+        assert_eq!(pairs[1], (1, 155381)); // txFeeFixed
+        assert_eq!(pairs[2], (3, 16384)); // maxTxSize
+    }
+
+    #[test]
+    fn test_encode_protocol_param_update_null_fields_skipped() {
+        let json = serde_json::json!({
+            "txFeePerByte": 44,
+            "maxTxSize": null
+        });
+        let buf = encode_protocol_param_update(&json).unwrap();
+        let mut dec = minicbor::Decoder::new(&buf);
+        // Only 1 field (null is skipped)
+        assert_eq!(dec.map().unwrap(), Some(1));
+        assert_eq!(dec.u32().unwrap(), 0);
+        assert_eq!(dec.u64().unwrap(), 44);
+    }
+
+    #[test]
+    fn test_encode_protocol_param_update_execution_units() {
+        let json = serde_json::json!({
+            "maxTxExecutionUnits": {
+                "memory": 14000000000u64,
+                "steps": 10000000000000u64
+            }
+        });
+        let buf = encode_protocol_param_update(&json).unwrap();
+        let mut dec = minicbor::Decoder::new(&buf);
+        assert_eq!(dec.map().unwrap(), Some(1));
+        assert_eq!(dec.u32().unwrap(), 20); // maxTxExecutionUnits = key 20
+        assert_eq!(dec.array().unwrap(), Some(2));
+        // Note: CBOR encodes [steps, memory] per Haskell ExUnits
+        assert_eq!(dec.u64().unwrap(), 10000000000000); // steps first
+        assert_eq!(dec.u64().unwrap(), 14000000000); // memory second
+    }
+
+    #[test]
+    fn test_encode_protocol_param_update_alias_dedup() {
+        // minFeeA and txFeePerByte both map to key 0 — should only encode once
+        let json = serde_json::json!({
+            "minFeeA": 44,
+            "txFeePerByte": 55
+        });
+        let buf = encode_protocol_param_update(&json).unwrap();
+        let mut dec = minicbor::Decoder::new(&buf);
+        // Only 1 entry (deduplicated by cbor_key)
+        assert_eq!(dec.map().unwrap(), Some(1));
+        assert_eq!(dec.u32().unwrap(), 0);
+        // First encountered wins
+        let val = dec.u64().unwrap();
+        assert!(val == 44 || val == 55); // JSON object iteration order is non-deterministic
+    }
+
+    #[test]
+    fn test_encode_protocol_param_update_conway_fields() {
+        let json = serde_json::json!({
+            "drepDeposit": 500000000,
+            "govActionDeposit": 100000000000u64,
+            "govActionLifetime": 6
+        });
+        let buf = encode_protocol_param_update(&json).unwrap();
+        let mut dec = minicbor::Decoder::new(&buf);
+        assert_eq!(dec.map().unwrap(), Some(3));
+
+        let mut pairs = Vec::new();
+        for _ in 0..3 {
+            let key = dec.u32().unwrap();
+            let val = dec.u64().unwrap();
+            pairs.push((key, val));
+        }
+        pairs.sort_by_key(|(k, _)| *k);
+
+        assert_eq!(pairs[0], (30, 500000000)); // drepDeposit
+        assert_eq!(pairs[1], (31, 100000000000)); // govActionDeposit
+        assert_eq!(pairs[2], (32, 6)); // govActionLifetime
+    }
+
+    #[test]
+    fn test_encode_protocol_param_update_not_object() {
+        let json = serde_json::json!("not an object");
+        let result = encode_protocol_param_update(&json);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("JSON object"));
+    }
+
+    #[test]
+    fn test_encode_prev_action_id_partial_args() {
+        // Only tx_id provided (no index) — should encode as null
+        let tx_id = Some("aa".repeat(32));
+        let mut buf = Vec::new();
+        let mut enc = minicbor::Encoder::new(&mut buf);
+        encode_prev_action_id(&mut enc, &tx_id, &None).unwrap();
+        assert_eq!(buf, vec![0xf6]); // CBOR null
     }
 }

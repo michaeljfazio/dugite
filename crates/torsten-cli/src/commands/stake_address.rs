@@ -378,4 +378,169 @@ mod tests {
         assert_eq!(0xe0u8 >> 4, 0x0e); // type 14 = reward address
         assert_eq!(0xe0u8 & 0x0f, 0); // network 0 = testnet
     }
+
+    #[test]
+    fn test_simple_cbor_wrap_small() {
+        let data = vec![0x01, 0x02, 0x03];
+        let wrapped = simple_cbor_wrap(&data);
+        // Major type 2 (byte string), length 3 → 0x43
+        assert_eq!(wrapped[0], 0x43);
+        assert_eq!(&wrapped[1..], &data);
+    }
+
+    #[test]
+    fn test_simple_cbor_wrap_24_bytes() {
+        let data = vec![0xab; 24];
+        let wrapped = simple_cbor_wrap(&data);
+        // Major type 2, one-byte length → 0x58, 24
+        assert_eq!(wrapped[0], 0x58);
+        assert_eq!(wrapped[1], 24);
+        assert_eq!(&wrapped[2..], &data[..]);
+    }
+
+    #[test]
+    fn test_simple_cbor_wrap_32_bytes() {
+        let data = vec![0xcd; 32];
+        let wrapped = simple_cbor_wrap(&data);
+        assert_eq!(wrapped[0], 0x58);
+        assert_eq!(wrapped[1], 32);
+        assert_eq!(wrapped.len(), 34);
+    }
+
+    #[test]
+    fn test_simple_cbor_wrap_256_bytes() {
+        let data = vec![0xef; 256];
+        let wrapped = simple_cbor_wrap(&data);
+        // Two-byte length → 0x59, big-endian u16
+        assert_eq!(wrapped[0], 0x59);
+        assert_eq!(&wrapped[1..3], &[0x01, 0x00]); // 256 in BE
+        assert_eq!(wrapped.len(), 259);
+    }
+
+    #[test]
+    fn test_simple_cbor_wrap_empty() {
+        let data = vec![];
+        let wrapped = simple_cbor_wrap(&data);
+        assert_eq!(wrapped, vec![0x40]); // byte string of length 0
+    }
+
+    #[test]
+    fn test_shelley_registration_cert_cbor() {
+        let key_hash = vec![0xab; 28];
+        let mut cert_cbor = Vec::new();
+        let mut enc = minicbor::Encoder::new(&mut cert_cbor);
+        // Shelley StakeRegistration: [0, credential]
+        enc.array(2).unwrap();
+        enc.u32(0).unwrap();
+        encode_stake_credential(&mut enc, &key_hash).unwrap();
+
+        let mut dec = minicbor::Decoder::new(&cert_cbor);
+        assert_eq!(dec.array().unwrap(), Some(2));
+        assert_eq!(dec.u32().unwrap(), 0); // cert type 0
+        assert_eq!(dec.array().unwrap(), Some(2));
+        assert_eq!(dec.u32().unwrap(), 0); // key credential
+        assert_eq!(dec.bytes().unwrap().len(), 28);
+    }
+
+    #[test]
+    fn test_conway_registration_cert_cbor() {
+        let key_hash = vec![0xab; 28];
+        let deposit = 2_000_000u64;
+        let mut cert_cbor = Vec::new();
+        let mut enc = minicbor::Encoder::new(&mut cert_cbor);
+        // Conway RegStake: [7, credential, deposit]
+        enc.array(3).unwrap();
+        enc.u32(7).unwrap();
+        encode_stake_credential(&mut enc, &key_hash).unwrap();
+        enc.u64(deposit).unwrap();
+
+        let mut dec = minicbor::Decoder::new(&cert_cbor);
+        assert_eq!(dec.array().unwrap(), Some(3));
+        assert_eq!(dec.u32().unwrap(), 7); // cert type 7
+        assert_eq!(dec.array().unwrap(), Some(2));
+        assert_eq!(dec.u32().unwrap(), 0); // key credential
+        assert_eq!(dec.bytes().unwrap().len(), 28);
+        assert_eq!(dec.u64().unwrap(), 2_000_000);
+    }
+
+    #[test]
+    fn test_deregistration_cert_cbor() {
+        let key_hash = vec![0xab; 28];
+        let mut cert_cbor = Vec::new();
+        let mut enc = minicbor::Encoder::new(&mut cert_cbor);
+        // Shelley StakeDeregistration: [1, credential]
+        enc.array(2).unwrap();
+        enc.u32(1).unwrap();
+        encode_stake_credential(&mut enc, &key_hash).unwrap();
+
+        let mut dec = minicbor::Decoder::new(&cert_cbor);
+        assert_eq!(dec.array().unwrap(), Some(2));
+        assert_eq!(dec.u32().unwrap(), 1); // cert type 1
+    }
+
+    #[test]
+    fn test_delegation_cert_cbor() {
+        let key_hash = vec![0xab; 28];
+        let pool_hash = vec![0xcd; 28];
+        let mut cert_cbor = Vec::new();
+        let mut enc = minicbor::Encoder::new(&mut cert_cbor);
+        // StakeDelegation: [2, credential, pool_hash]
+        enc.array(3).unwrap();
+        enc.u32(2).unwrap();
+        encode_stake_credential(&mut enc, &key_hash).unwrap();
+        enc.bytes(&pool_hash).unwrap();
+
+        let mut dec = minicbor::Decoder::new(&cert_cbor);
+        assert_eq!(dec.array().unwrap(), Some(3));
+        assert_eq!(dec.u32().unwrap(), 2); // cert type 2
+        assert_eq!(dec.array().unwrap(), Some(2)); // credential
+        assert_eq!(dec.u32().unwrap(), 0);
+        assert_eq!(dec.bytes().unwrap().len(), 28);
+        assert_eq!(dec.bytes().unwrap().len(), 28); // pool hash
+    }
+
+    #[test]
+    fn test_vote_delegation_abstain_cbor() {
+        let key_hash = vec![0xab; 28];
+        let mut cert_cbor = Vec::new();
+        let mut enc = minicbor::Encoder::new(&mut cert_cbor);
+        // VoteDelegation: [9, credential, drep]
+        enc.array(3).unwrap();
+        enc.u32(9).unwrap();
+        encode_stake_credential(&mut enc, &key_hash).unwrap();
+        // Abstain DRep: [2]
+        enc.array(1).unwrap();
+        enc.u32(2).unwrap();
+
+        let mut dec = minicbor::Decoder::new(&cert_cbor);
+        assert_eq!(dec.array().unwrap(), Some(3));
+        assert_eq!(dec.u32().unwrap(), 9); // cert type 9
+        assert_eq!(dec.array().unwrap(), Some(2)); // credential
+        dec.u32().unwrap();
+        dec.bytes().unwrap();
+        assert_eq!(dec.array().unwrap(), Some(1)); // drep
+        assert_eq!(dec.u32().unwrap(), 2); // abstain
+    }
+
+    #[test]
+    fn test_vote_delegation_no_confidence_cbor() {
+        let key_hash = vec![0xab; 28];
+        let mut cert_cbor = Vec::new();
+        let mut enc = minicbor::Encoder::new(&mut cert_cbor);
+        enc.array(3).unwrap();
+        enc.u32(9).unwrap();
+        encode_stake_credential(&mut enc, &key_hash).unwrap();
+        // NoConfidence DRep: [3]
+        enc.array(1).unwrap();
+        enc.u32(3).unwrap();
+
+        let mut dec = minicbor::Decoder::new(&cert_cbor);
+        assert_eq!(dec.array().unwrap(), Some(3));
+        assert_eq!(dec.u32().unwrap(), 9);
+        dec.array().unwrap();
+        dec.u32().unwrap();
+        dec.bytes().unwrap();
+        assert_eq!(dec.array().unwrap(), Some(1));
+        assert_eq!(dec.u32().unwrap(), 3); // no-confidence
+    }
 }
