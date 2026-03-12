@@ -1,0 +1,53 @@
+{
+  "rule": "EPOCH",
+  "description": "Governance proposal with future expiry survives epoch transition",
+  "environment": {
+    "current_epoch": 5,
+    "protocol_params": {
+      "pool_deposit": 500000000,
+      "gov_action_lifetime": 10,
+      "drep_activity": 20,
+      "key_deposit": 2000000,
+      "gov_action_deposit": 100000000000,
+      "e_max": 18
+    }
+  },
+  "input_state": {
+    "proposals": [
+      {
+        "tx_hash": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "action_index": 0,
+        "action_type": "ParameterChange",
+        "expires_epoch": 15,
+        "deposit": 100000000000,
+        "return_addr": "e011223344112233441122334411223344112233441122334411223344"
+      }
+    ],
+    "pending_retirements": [],
+    "dreps": [],
+    "reward_accounts": [],
+    "pools": []
+  },
+  "signal": {
+    "new_epoch": 6
+  },
+  "expected_output": {
+    "type": "success",
+    "state": {
+      "proposals": [
+        {
+          "tx_hash": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+          "action_index": 0,
+          "action_type": "ParameterChange",
+          "expires_epoch": 15,
+          "deposit": 100000000000,
+          "return_addr": "e011223344112233441122334411223344112233441122334411223344"
+        }
+      ],
+      "pending_retirements": [],
+      "dreps": [],
+      "reward_accounts": [],
+      "pools": []
+    }
+  }
+}

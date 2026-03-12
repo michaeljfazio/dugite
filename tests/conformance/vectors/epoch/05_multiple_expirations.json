@@ -1,0 +1,87 @@
+{
+  "rule": "EPOCH",
+  "description": "Multiple proposals expire simultaneously with deposit refunds to different accounts",
+  "environment": {
+    "current_epoch": 9,
+    "protocol_params": {
+      "pool_deposit": 500000000,
+      "gov_action_lifetime": 5,
+      "drep_activity": 20,
+      "key_deposit": 2000000,
+      "gov_action_deposit": 50000000000,
+      "e_max": 18
+    }
+  },
+  "input_state": {
+    "proposals": [
+      {
+        "tx_hash": "1111111111111111111111111111111111111111111111111111111111111111",
+        "action_index": 0,
+        "action_type": "InfoAction",
+        "expires_epoch": 10,
+        "deposit": 50000000000,
+        "return_addr": "e0aaaa11111111111111111111111111111111111111111111111111aa"
+      },
+      {
+        "tx_hash": "2222222222222222222222222222222222222222222222222222222222222222",
+        "action_index": 0,
+        "action_type": "TreasuryWithdrawals",
+        "expires_epoch": 10,
+        "deposit": 50000000000,
+        "return_addr": "e0bbbb22222222222222222222222222222222222222222222222222bb"
+      },
+      {
+        "tx_hash": "3333333333333333333333333333333333333333333333333333333333333333",
+        "action_index": 0,
+        "action_type": "HardForkInitiation",
+        "expires_epoch": 20,
+        "deposit": 50000000000,
+        "return_addr": "e0cccc33333333333333333333333333333333333333333333333333cc"
+      }
+    ],
+    "pending_retirements": [],
+    "dreps": [],
+    "reward_accounts": [
+      {
+        "credential_hash": "aaaa11111111111111111111111111111111111111111111111111aa",
+        "balance": 0
+      },
+      {
+        "credential_hash": "bbbb22222222222222222222222222222222222222222222222222bb",
+        "balance": 1000000
+      }
+    ],
+    "pools": []
+  },
+  "signal": {
+    "new_epoch": 10
+  },
+  "expected_output": {
+    "type": "success",
+    "state": {
+      "proposals": [
+        {
+          "tx_hash": "3333333333333333333333333333333333333333333333333333333333333333",
+          "action_index": 0,
+          "action_type": "HardForkInitiation",
+          "expires_epoch": 20,
+          "deposit": 50000000000,
+          "return_addr": "e0cccc33333333333333333333333333333333333333333333333333cc"
+        }
+      ],
+      "pending_retirements": [],
+      "dreps": [],
+      "reward_accounts": [
+        {
+          "credential_hash": "aaaa11111111111111111111111111111111111111111111111111aa",
+          "balance": 50000000000
+        },
+        {
+          "credential_hash": "bbbb22222222222222222222222222222222222222222222222222bb",
+          "balance": 50001000000
+        }
+      ],
+      "pools": []
+    }
+  }
+}

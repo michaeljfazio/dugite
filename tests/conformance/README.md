@@ -41,7 +41,8 @@ tests/conformance/
 ├── vectors/                # JSON test vectors
 │   ├── utxo/               # UTXO rule vectors
 │   ├── cert/               # CERT rule vectors
-│   └── gov/                # GOV rule vectors
+│   ├── gov/                # GOV rule vectors
+│   └── epoch/              # EPOCH rule vectors
 └── generator/              # Haskell test vector generator (TODO)
     ├── Main.hs             # Generator scaffold
     └── cabal.project       # Cabal project file
@@ -64,6 +65,9 @@ cargo test -p torsten-conformance conformance_cert
 
 # Run only GOV tests
 cargo test -p torsten-conformance conformance_gov
+
+# Run only EPOCH tests
+cargo test -p torsten-conformance conformance_epoch
 ```
 
 ## Supported Rules
@@ -73,7 +77,7 @@ cargo test -p torsten-conformance conformance_gov
 | UTXO   | 15 vectors   | Transaction validation against UTxO state (success + failure) |
 | CERT   | 14 vectors   | Certificate processing (delegation, registration, DRep, failure) |
 | GOV    | 8 vectors    | Governance proposal submission and voting (Conway era) |
-| EPOCH  | Planned      | Epoch boundary transitions |
+| EPOCH  | 6 vectors    | Epoch boundary transitions (proposal expiry, pool retirement, DRep inactivity) |
 
 ## Test Vector Schema
 

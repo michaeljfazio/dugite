@@ -7,8 +7,9 @@
 use crate::adapters;
 use crate::schema::{
     CertEnvironment, CertState, ConformanceExpectedOutput, ConformanceTestResult,
-    ConformanceTestVector, GovEnvironment, GovSignal, GovState, TestCertificate, TestTransaction,
-    UtxoEnvironment, UtxoState,
+    ConformanceTestVector, EpochEnvironment, EpochExpectedState, EpochSignal, EpochState,
+    GovEnvironment, GovSignal, GovState, TestCertificate, TestTransaction, UtxoEnvironment,
+    UtxoState,
 };
 use std::path::Path;
 use torsten_ledger::validate_transaction;
@@ -55,6 +56,7 @@ pub fn run_test(vector_path: &str, vector: &ConformanceTestVector) -> Conformanc
         "UTXO" => run_utxo_test(vector_path, vector),
         "CERT" => run_cert_test(vector_path, vector),
         "GOV" => run_gov_test(vector_path, vector),
+        "EPOCH" => run_epoch_test(vector_path, vector),
         rule => ConformanceTestResult {
             vector_path: vector_path.to_string(),
             rule: rule.to_string(),
@@ -776,6 +778,199 @@ fn credential_hash(cred: &crate::schema::TestCredential) -> String {
     match cred {
         crate::schema::TestCredential::VKey { hash } => hash.clone(),
         crate::schema::TestCredential::Script { hash } => hash.clone(),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// EPOCH rule runner
+// ---------------------------------------------------------------------------
+
+fn run_epoch_test(vector_path: &str, vector: &ConformanceTestVector) -> ConformanceTestResult {
+    let base = ConformanceTestResult {
+        vector_path: vector_path.to_string(),
+        rule: "EPOCH".to_string(),
+        description: vector.description.clone(),
+        passed: false,
+        details: None,
+    };
+
+    // Deserialize environment
+    let env: EpochEnvironment = match serde_json::from_value(vector.environment.clone()) {
+        Ok(e) => e,
+        Err(e) => {
+            return ConformanceTestResult {
+                details: Some(format!("Failed to deserialize EPOCH environment: {}", e)),
+                ..base
+            };
+        }
+    };
+
+    // Deserialize input state
+    let input_state: EpochState = match serde_json::from_value(vector.input_state.clone()) {
+        Ok(s) => s,
+        Err(e) => {
+            return ConformanceTestResult {
+                details: Some(format!("Failed to deserialize EPOCH input state: {}", e)),
+                ..base
+            };
+        }
+    };
+
+    // Deserialize signal
+    let signal: EpochSignal = match serde_json::from_value(vector.signal.clone()) {
+        Ok(s) => s,
+        Err(e) => {
+            return ConformanceTestResult {
+                details: Some(format!("Failed to deserialize EPOCH signal: {}", e)),
+                ..base
+            };
+        }
+    };
+
+    // Simulate the epoch transition
+    let actual_state = simulate_epoch_transition(&input_state, &signal, &env);
+
+    match &vector.expected_output {
+        ConformanceExpectedOutput::Success { state } => {
+            let expected_state: EpochExpectedState = match serde_json::from_value(state.clone()) {
+                Ok(s) => s,
+                Err(e) => {
+                    return ConformanceTestResult {
+                        details: Some(format!("Failed to deserialize expected EPOCH state: {}", e)),
+                        ..base
+                    };
+                }
+            };
+
+            match adapters::diff_epoch_states(&expected_state, &actual_state) {
+                None => ConformanceTestResult {
+                    passed: true,
+                    ..base
+                },
+                Some(diff) => ConformanceTestResult {
+                    details: Some(format!("EPOCH state mismatch:\n  {}", diff)),
+                    ..base
+                },
+            }
+        }
+        ConformanceExpectedOutput::Failure { errors } => ConformanceTestResult {
+            details: Some(format!(
+                "EPOCH failure testing not implemented. Expected errors: {:?}",
+                errors
+            )),
+            ..base
+        },
+    }
+}
+
+/// Simulate epoch transition effects on a simplified state.
+///
+/// This models the key observable behaviors of `process_epoch_transition`:
+/// 1. Expire governance proposals past their lifetime
+/// 2. Process pool retirements for this epoch
+/// 3. Mark DReps inactive based on activity period
+/// 4. Refund deposits to reward accounts
+fn simulate_epoch_transition(
+    input: &EpochState,
+    signal: &EpochSignal,
+    env: &EpochEnvironment,
+) -> EpochExpectedState {
+    let new_epoch = signal.new_epoch;
+
+    // Build mutable reward account map
+    let mut reward_map: std::collections::BTreeMap<String, u64> = input
+        .reward_accounts
+        .iter()
+        .map(|r| (r.credential_hash.clone(), r.balance))
+        .collect();
+
+    // 1. Expire governance proposals past their lifetime and refund deposits
+    let remaining_proposals: Vec<_> = input
+        .proposals
+        .iter()
+        .filter(|p| {
+            if p.expires_epoch <= new_epoch {
+                // Expired — refund deposit to return address
+                if p.deposit > 0 && p.return_addr.len() >= 58 {
+                    // Extract credential hash from return address (bytes 1-29 = hex chars 2-58)
+                    let cred_hash = &p.return_addr[2..58];
+                    *reward_map.entry(cred_hash.to_string()).or_default() += p.deposit;
+                }
+                false
+            } else {
+                true
+            }
+        })
+        .cloned()
+        .collect();
+
+    // 2. Process pool retirements for this epoch
+    let retiring_pools: std::collections::HashSet<String> = input
+        .pending_retirements
+        .iter()
+        .filter(|r| r.retirement_epoch == new_epoch)
+        .map(|r| r.pool_hash.clone())
+        .collect();
+
+    let remaining_pools: Vec<_> = input
+        .pools
+        .iter()
+        .filter(|p| {
+            if retiring_pools.contains(&p.pool_hash) {
+                // Refund pool deposit to operator's reward account
+                if p.reward_account.len() >= 58 {
+                    let cred_hash = &p.reward_account[2..58];
+                    *reward_map.entry(cred_hash.to_string()).or_default() +=
+                        env.protocol_params.pool_deposit;
+                }
+                false
+            } else {
+                true
+            }
+        })
+        .cloned()
+        .collect();
+
+    // Keep retirements for future epochs
+    let remaining_retirements: Vec<_> = input
+        .pending_retirements
+        .iter()
+        .filter(|r| r.retirement_epoch > new_epoch)
+        .cloned()
+        .collect();
+
+    // 3. Mark DReps inactive based on activity period
+    let dreps: Vec<_> = input
+        .dreps
+        .iter()
+        .map(|d| {
+            let inactive =
+                new_epoch.saturating_sub(d.last_active_epoch) > env.protocol_params.drep_activity;
+            crate::schema::EpochDRep {
+                credential_hash: d.credential_hash.clone(),
+                last_active_epoch: d.last_active_epoch,
+                active: !inactive,
+            }
+        })
+        .collect();
+
+    // 4. Build final reward accounts
+    let reward_accounts: Vec<_> = reward_map
+        .into_iter()
+        .map(
+            |(credential_hash, balance)| crate::schema::EpochRewardAccount {
+                credential_hash,
+                balance,
+            },
+        )
+        .collect();
+
+    EpochExpectedState {
+        proposals: remaining_proposals,
+        pending_retirements: remaining_retirements,
+        dreps,
+        reward_accounts,
+        pools: remaining_pools,
     }
 }
 

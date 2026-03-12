@@ -1,0 +1,94 @@
+{
+  "rule": "EPOCH",
+  "description": "Combined epoch transition: proposal expiry, pool retirement, and DRep inactivity",
+  "environment": {
+    "current_epoch": 49,
+    "protocol_params": {
+      "pool_deposit": 500000000,
+      "gov_action_lifetime": 10,
+      "drep_activity": 15,
+      "key_deposit": 2000000,
+      "gov_action_deposit": 100000000000,
+      "e_max": 18
+    }
+  },
+  "input_state": {
+    "proposals": [
+      {
+        "tx_hash": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+        "action_index": 0,
+        "action_type": "NoConfidence",
+        "expires_epoch": 50,
+        "deposit": 100000000000,
+        "return_addr": "e0aaaa11111111111111111111111111111111111111111111111111aa"
+      }
+    ],
+    "pending_retirements": [
+      {
+        "pool_hash": "ffff44444444444444444444444444444444444444444444444444ff",
+        "retirement_epoch": 50
+      }
+    ],
+    "dreps": [
+      {
+        "credential_hash": "dddd33333333333333333333333333333333333333333333333333dd",
+        "last_active_epoch": 30,
+        "active": true
+      },
+      {
+        "credential_hash": "eeee44444444444444444444444444444444444444444444444444ee",
+        "last_active_epoch": 48,
+        "active": true
+      }
+    ],
+    "reward_accounts": [
+      {
+        "credential_hash": "aaaa11111111111111111111111111111111111111111111111111aa",
+        "balance": 5000000
+      },
+      {
+        "credential_hash": "bbbb22222222222222222222222222222222222222222222222222bb",
+        "balance": 0
+      }
+    ],
+    "pools": [
+      {
+        "pool_hash": "ffff44444444444444444444444444444444444444444444444444ff",
+        "reward_account": "e0bbbb22222222222222222222222222222222222222222222222222bb"
+      }
+    ]
+  },
+  "signal": {
+    "new_epoch": 50
+  },
+  "expected_output": {
+    "type": "success",
+    "state": {
+      "proposals": [],
+      "pending_retirements": [],
+      "dreps": [
+        {
+          "credential_hash": "dddd33333333333333333333333333333333333333333333333333dd",
+          "last_active_epoch": 30,
+          "active": false
+        },
+        {
+          "credential_hash": "eeee44444444444444444444444444444444444444444444444444ee",
+          "last_active_epoch": 48,
+          "active": true
+        }
+      ],
+      "reward_accounts": [
+        {
+          "credential_hash": "aaaa11111111111111111111111111111111111111111111111111aa",
+          "balance": 100005000000
+        },
+        {
+          "credential_hash": "bbbb22222222222222222222222222222222222222222222222222bb",
+          "balance": 500000000
+        }
+      ],
+      "pools": []
+    }
+  }
+}

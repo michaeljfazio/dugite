@@ -1,0 +1,73 @@
+{
+  "rule": "EPOCH",
+  "description": "Pool retires at epoch boundary with deposit refund to operator",
+  "environment": {
+    "current_epoch": 99,
+    "protocol_params": {
+      "pool_deposit": 500000000,
+      "gov_action_lifetime": 5,
+      "drep_activity": 20,
+      "key_deposit": 2000000,
+      "gov_action_deposit": 100000000000,
+      "e_max": 18
+    }
+  },
+  "input_state": {
+    "proposals": [],
+    "pending_retirements": [
+      {
+        "pool_hash": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+        "retirement_epoch": 100
+      },
+      {
+        "pool_hash": "dddddddddddddddddddddddddddddddddddddddddddddddddddd",
+        "retirement_epoch": 105
+      }
+    ],
+    "dreps": [],
+    "reward_accounts": [
+      {
+        "credential_hash": "11111111111111111111111111111111111111111111111111111111",
+        "balance": 10000000
+      }
+    ],
+    "pools": [
+      {
+        "pool_hash": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+        "reward_account": "e011111111111111111111111111111111111111111111111111111111"
+      },
+      {
+        "pool_hash": "dddddddddddddddddddddddddddddddddddddddddddddddddddd",
+        "reward_account": "e022222222222222222222222222222222222222222222222222222222"
+      }
+    ]
+  },
+  "signal": {
+    "new_epoch": 100
+  },
+  "expected_output": {
+    "type": "success",
+    "state": {
+      "proposals": [],
+      "pending_retirements": [
+        {
+          "pool_hash": "dddddddddddddddddddddddddddddddddddddddddddddddddddd",
+          "retirement_epoch": 105
+        }
+      ],
+      "dreps": [],
+      "reward_accounts": [
+        {
+          "credential_hash": "11111111111111111111111111111111111111111111111111111111",
+          "balance": 510000000
+        }
+      ],
+      "pools": [
+        {
+          "pool_hash": "dddddddddddddddddddddddddddddddddddddddddddddddddddd",
+          "reward_account": "e022222222222222222222222222222222222222222222222222222222"
+        }
+      ]
+    }
+  }
+}

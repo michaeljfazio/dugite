@@ -1,0 +1,57 @@
+{
+  "rule": "EPOCH",
+  "description": "DRep marked inactive after exceeding activity period",
+  "environment": {
+    "current_epoch": 19,
+    "protocol_params": {
+      "pool_deposit": 500000000,
+      "gov_action_lifetime": 5,
+      "drep_activity": 10,
+      "key_deposit": 2000000,
+      "gov_action_deposit": 100000000000,
+      "e_max": 18
+    }
+  },
+  "input_state": {
+    "proposals": [],
+    "pending_retirements": [],
+    "dreps": [
+      {
+        "credential_hash": "aaaa11111111111111111111111111111111111111111111111111aa",
+        "last_active_epoch": 5,
+        "active": true
+      },
+      {
+        "credential_hash": "bbbb22222222222222222222222222222222222222222222222222bb",
+        "last_active_epoch": 15,
+        "active": true
+      }
+    ],
+    "reward_accounts": [],
+    "pools": []
+  },
+  "signal": {
+    "new_epoch": 20
+  },
+  "expected_output": {
+    "type": "success",
+    "state": {
+      "proposals": [],
+      "pending_retirements": [],
+      "dreps": [
+        {
+          "credential_hash": "aaaa11111111111111111111111111111111111111111111111111aa",
+          "last_active_epoch": 5,
+          "active": false
+        },
+        {
+          "credential_hash": "bbbb22222222222222222222222222222222222222222222222222bb",
+          "last_active_epoch": 15,
+          "active": true
+        }
+      ],
+      "reward_accounts": [],
+      "pools": []
+    }
+  }
+}

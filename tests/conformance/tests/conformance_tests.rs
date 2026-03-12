@@ -70,6 +70,24 @@ fn conformance_gov_vectors() {
 }
 
 #[test]
+fn conformance_epoch_vectors() {
+    let dir = vectors_dir().join("epoch");
+    let vectors = runner::load_vectors(&dir).expect("Failed to load EPOCH test vectors");
+    assert!(!vectors.is_empty(), "No EPOCH test vectors found");
+
+    let results = runner::run_all(&vectors);
+    print_results(&results);
+
+    let failed: Vec<&ConformanceTestResult> = results.iter().filter(|r| !r.passed).collect();
+    assert!(
+        failed.is_empty(),
+        "{}/{} EPOCH conformance tests failed",
+        failed.len(),
+        results.len()
+    );
+}
+
+#[test]
 fn conformance_all_vectors() {
     let dir = vectors_dir();
     let vectors = runner::load_vectors(&dir).expect("Failed to load test vectors");

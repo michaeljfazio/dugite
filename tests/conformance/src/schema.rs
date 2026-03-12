@@ -584,6 +584,128 @@ pub enum TestVoter {
 }
 
 // ---------------------------------------------------------------------------
+// EPOCH rule types
+// ---------------------------------------------------------------------------
+
+/// Environment for the EPOCH rule.
+///
+/// Maps to a simplified epoch transition environment. The EPOCH rule is not
+/// directly an Agda STS rule, but rather models the aggregate behavior of
+/// epoch boundary processing.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EpochEnvironment {
+    /// Current epoch (the epoch BEFORE the transition).
+    pub current_epoch: u64,
+    /// Protocol parameters affecting epoch transition behavior.
+    pub protocol_params: EpochProtocolParams,
+}
+
+/// Protocol parameters relevant to epoch transitions.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EpochProtocolParams {
+    /// Pool deposit (refunded on retirement).
+    pub pool_deposit: u64,
+    /// Governance action lifetime in epochs.
+    pub gov_action_lifetime: u64,
+    /// DRep activity period (epochs).
+    pub drep_activity: u64,
+    /// Key deposit (for stake registration).
+    pub key_deposit: u64,
+    /// Governance action deposit.
+    pub gov_action_deposit: u64,
+    /// Pool retirement maximum epoch offset.
+    pub e_max: u64,
+}
+
+/// Simplified ledger state for EPOCH rule testing.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EpochState {
+    /// Active governance proposals: [{tx_hash, action_index, action_type, expires_epoch}]
+    #[serde(default)]
+    pub proposals: Vec<EpochProposal>,
+    /// Pending pool retirements: [{pool_hash, retirement_epoch}]
+    #[serde(default)]
+    pub pending_retirements: Vec<EpochRetirement>,
+    /// Registered DReps: [{credential_hash, last_active_epoch, active}]
+    #[serde(default)]
+    pub dreps: Vec<EpochDRep>,
+    /// Reward accounts: [{credential_hash, balance}]
+    #[serde(default)]
+    pub reward_accounts: Vec<EpochRewardAccount>,
+    /// Registered pools (simplified): [{pool_hash, reward_account}]
+    #[serde(default)]
+    pub pools: Vec<EpochPool>,
+}
+
+/// A governance proposal in the epoch state.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EpochProposal {
+    pub tx_hash: String,
+    pub action_index: u32,
+    pub action_type: String,
+    pub expires_epoch: u64,
+    /// Deposit to be refunded on expiry/ratification.
+    pub deposit: u64,
+    /// Return address (hex).
+    pub return_addr: String,
+}
+
+/// A pending pool retirement.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EpochRetirement {
+    pub pool_hash: String,
+    pub retirement_epoch: u64,
+}
+
+/// A registered DRep.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EpochDRep {
+    pub credential_hash: String,
+    pub last_active_epoch: u64,
+    pub active: bool,
+}
+
+/// A reward account.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EpochRewardAccount {
+    pub credential_hash: String,
+    pub balance: u64,
+}
+
+/// A registered pool (simplified).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EpochPool {
+    pub pool_hash: String,
+    pub reward_account: String,
+}
+
+/// Signal for the EPOCH rule: the new epoch number.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EpochSignal {
+    pub new_epoch: u64,
+}
+
+/// Expected output state for EPOCH rule.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EpochExpectedState {
+    /// Remaining active proposals after ratification/expiry.
+    #[serde(default)]
+    pub proposals: Vec<EpochProposal>,
+    /// Remaining pending retirements after processing.
+    #[serde(default)]
+    pub pending_retirements: Vec<EpochRetirement>,
+    /// DRep states after activity check.
+    #[serde(default)]
+    pub dreps: Vec<EpochDRep>,
+    /// Reward accounts after deposit refunds.
+    #[serde(default)]
+    pub reward_accounts: Vec<EpochRewardAccount>,
+    /// Remaining registered pools after retirements.
+    #[serde(default)]
+    pub pools: Vec<EpochPool>,
+}
+
+// ---------------------------------------------------------------------------
 // Test result types
 // ---------------------------------------------------------------------------
 

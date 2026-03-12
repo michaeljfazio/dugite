@@ -979,6 +979,117 @@ pub fn registered_pool_set(p_state: &PoolSubState) -> Result<HashSet<Hash28>, Ad
     Ok(set)
 }
 
+/// Compare two EPOCH states and return a human-readable diff if they differ.
+pub fn diff_epoch_states(
+    expected: &crate::schema::EpochExpectedState,
+    actual: &crate::schema::EpochExpectedState,
+) -> Option<String> {
+    let mut diffs = Vec::new();
+
+    // Compare proposals
+    if expected.proposals.len() != actual.proposals.len() {
+        diffs.push(format!(
+            "proposals count: expected={}, actual={}",
+            expected.proposals.len(),
+            actual.proposals.len()
+        ));
+    }
+    for exp_p in &expected.proposals {
+        let key = format!("{}#{}", exp_p.tx_hash, exp_p.action_index);
+        let found = actual.proposals.iter().any(|p| {
+            p.tx_hash == exp_p.tx_hash
+                && p.action_index == exp_p.action_index
+                && p.expires_epoch == exp_p.expires_epoch
+        });
+        if !found {
+            diffs.push(format!("missing proposal: {}", key));
+        }
+    }
+
+    // Compare pending retirements
+    if expected.pending_retirements.len() != actual.pending_retirements.len() {
+        diffs.push(format!(
+            "pending_retirements count: expected={}, actual={}",
+            expected.pending_retirements.len(),
+            actual.pending_retirements.len()
+        ));
+    }
+    for exp_r in &expected.pending_retirements {
+        let found = actual.pending_retirements.iter().any(|r| {
+            r.pool_hash == exp_r.pool_hash && r.retirement_epoch == exp_r.retirement_epoch
+        });
+        if !found {
+            diffs.push(format!(
+                "missing retirement: {} at epoch {}",
+                exp_r.pool_hash, exp_r.retirement_epoch
+            ));
+        }
+    }
+
+    // Compare DReps
+    for exp_d in &expected.dreps {
+        match actual
+            .dreps
+            .iter()
+            .find(|d| d.credential_hash == exp_d.credential_hash)
+        {
+            None => {
+                diffs.push(format!("missing drep: {}", exp_d.credential_hash));
+            }
+            Some(act_d) => {
+                if exp_d.active != act_d.active {
+                    diffs.push(format!(
+                        "drep {} active: expected={}, actual={}",
+                        exp_d.credential_hash, exp_d.active, act_d.active
+                    ));
+                }
+            }
+        }
+    }
+
+    // Compare reward accounts
+    for exp_r in &expected.reward_accounts {
+        match actual
+            .reward_accounts
+            .iter()
+            .find(|r| r.credential_hash == exp_r.credential_hash)
+        {
+            None => {
+                diffs.push(format!("missing reward account: {}", exp_r.credential_hash));
+            }
+            Some(act_r) => {
+                if exp_r.balance != act_r.balance {
+                    diffs.push(format!(
+                        "reward account {} balance: expected={}, actual={}",
+                        exp_r.credential_hash, exp_r.balance, act_r.balance
+                    ));
+                }
+            }
+        }
+    }
+
+    // Compare pools
+    if expected.pools.len() != actual.pools.len() {
+        diffs.push(format!(
+            "pools count: expected={}, actual={}",
+            expected.pools.len(),
+            actual.pools.len()
+        ));
+    }
+    for exp_p in &expected.pools {
+        let found = actual.pools.iter().any(|p| p.pool_hash == exp_p.pool_hash);
+        if !found {
+            diffs.push(format!("missing pool: {}", exp_p.pool_hash));
+        }
+    }
+
+    if diffs.is_empty() {
+        None
+    } else {
+        Some(diffs.join("\n  "))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     #[test]

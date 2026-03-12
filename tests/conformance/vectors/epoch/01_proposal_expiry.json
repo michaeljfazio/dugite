@@ -1,0 +1,54 @@
+{
+  "rule": "EPOCH",
+  "description": "Governance proposal expires at epoch boundary and deposit is refunded",
+  "environment": {
+    "current_epoch": 9,
+    "protocol_params": {
+      "pool_deposit": 500000000,
+      "gov_action_lifetime": 5,
+      "drep_activity": 20,
+      "key_deposit": 2000000,
+      "gov_action_deposit": 100000000000,
+      "e_max": 18
+    }
+  },
+  "input_state": {
+    "proposals": [
+      {
+        "tx_hash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "action_index": 0,
+        "action_type": "NoConfidence",
+        "expires_epoch": 10,
+        "deposit": 100000000000,
+        "return_addr": "e0aabbccddaabbccddaabbccddaabbccddaabbccddaabbccddaabbccdd"
+      }
+    ],
+    "pending_retirements": [],
+    "dreps": [],
+    "reward_accounts": [
+      {
+        "credential_hash": "aabbccddaabbccddaabbccddaabbccddaabbccddaabbccddaabbccdd",
+        "balance": 5000000
+      }
+    ],
+    "pools": []
+  },
+  "signal": {
+    "new_epoch": 10
+  },
+  "expected_output": {
+    "type": "success",
+    "state": {
+      "proposals": [],
+      "pending_retirements": [],
+      "dreps": [],
+      "reward_accounts": [
+        {
+          "credential_hash": "aabbccddaabbccddaabbccddaabbccddaabbccddaabbccddaabbccdd",
+          "balance": 100005000000
+        }
+      ],
+      "pools": []
+    }
+  }
+}
