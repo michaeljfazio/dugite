@@ -49,7 +49,49 @@ pub enum QueryResult {
     FilteredVoteDelegatees(Vec<VoteDelegateeEntry>),
     /// Era history: list of era summaries for slot/time conversions
     EraHistory(Vec<EraSummary>),
+    /// GetCBOR (tag 9): wraps an inner query result as CBOR-in-CBOR (tag 24)
+    WrappedCbor(Box<QueryResult>),
+    /// DebugEpochState (tag 8): serialized epoch state (simplified)
+    DebugEpochState {
+        epoch: u64,
+        treasury: u64,
+        reserves: u64,
+        stake_pool_count: u64,
+        utxo_count: u64,
+    },
+    /// DebugNewEpochState (tag 12): new epoch state dump (simplified)
+    DebugNewEpochState {
+        epoch: u64,
+        block_number: u64,
+        slot: u64,
+    },
+    /// DebugChainDepState (tag 13): consensus chain dependent state
+    DebugChainDepState {
+        last_slot: u64,
+    },
+    /// GetRewardProvenance (tag 14): reward calculation provenance
+    RewardProvenance {
+        epoch: u64,
+        total_rewards_pot: u64,
+        treasury_tax: u64,
+        active_stake: u64,
+    },
+    /// GetRewardInfoPools (tag 18): per-pool reward info
+    RewardInfoPools(Vec<PoolRewardInfo>),
     Error(String),
+}
+
+/// Per-pool reward provenance info for GetRewardInfoPools (tag 18)
+#[derive(Debug, Clone)]
+pub struct PoolRewardInfo {
+    pub pool_id: Vec<u8>,
+    pub stake: u64,
+    pub owner_stake: u64,
+    pub pool_reward: u64,
+    pub leader_reward: u64,
+    pub member_reward: u64,
+    pub margin: (u64, u64),
+    pub cost: u64,
 }
 
 /// Summary of a single Cardano era for GetEraHistory responses

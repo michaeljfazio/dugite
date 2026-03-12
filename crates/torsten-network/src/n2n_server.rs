@@ -302,7 +302,7 @@ impl N2NServer {
         mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
     ) -> Result<(), N2NServerError> {
         let listener = TcpListener::bind(self.listen_addr).await?;
-        info!("N2N          listening on {}", self.listen_addr);
+        info!(addr = %self.listen_addr, "N2N server listening");
 
         let active_connections = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         // Rate limiter: max 10 connections per IP per 60 seconds

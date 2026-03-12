@@ -1181,6 +1181,78 @@ pub(crate) fn encode_query_result(result: &QueryResult) -> Vec<u8> {
                 enc.null().ok();
             }
         }
+        QueryResult::WrappedCbor(inner) => {
+            // GetCBOR (tag 9): encode the inner result as CBOR, then wrap it in tag(24)
+            // First, encode the inner result to get its CBOR bytes
+            let inner_buf = encode_query_result(inner);
+            // Wrap in CBOR tag 24 (encoded CBOR data item)
+            enc.tag(minicbor::data::Tag::new(24)).ok();
+            enc.bytes(&inner_buf).ok();
+        }
+        QueryResult::DebugEpochState {
+            epoch,
+            treasury,
+            reserves,
+            stake_pool_count,
+            utxo_count,
+        } => {
+            // Simplified epoch state: array(5) [epoch, treasury, reserves, pool_count, utxo_count]
+            enc.array(5).ok();
+            enc.u64(*epoch).ok();
+            enc.u64(*treasury).ok();
+            enc.u64(*reserves).ok();
+            enc.u64(*stake_pool_count).ok();
+            enc.u64(*utxo_count).ok();
+        }
+        QueryResult::DebugNewEpochState {
+            epoch,
+            block_number,
+            slot,
+        } => {
+            // Simplified new epoch state: array(3) [epoch, block_number, slot]
+            enc.array(3).ok();
+            enc.u64(*epoch).ok();
+            enc.u64(*block_number).ok();
+            enc.u64(*slot).ok();
+        }
+        QueryResult::DebugChainDepState { last_slot } => {
+            // Simplified chain dep state: array(1) [last_slot]
+            enc.array(1).ok();
+            enc.u64(*last_slot).ok();
+        }
+        QueryResult::RewardProvenance {
+            epoch,
+            total_rewards_pot,
+            treasury_tax,
+            active_stake,
+        } => {
+            // Reward provenance: array(4) [epoch, rewards_pot, treasury_tax, active_stake]
+            enc.array(4).ok();
+            enc.u64(*epoch).ok();
+            enc.u64(*total_rewards_pot).ok();
+            enc.u64(*treasury_tax).ok();
+            enc.u64(*active_stake).ok();
+        }
+        QueryResult::RewardInfoPools(pools) => {
+            // Map<pool_hash(28), PoolRewardInfo>
+            // PoolRewardInfo: array(7) [stake, owner_stake, pool_reward, leader_reward,
+            //                           member_reward, margin_rational, cost]
+            enc.map(pools.len() as u64).ok();
+            for pool in pools {
+                enc.bytes(&pool.pool_id).ok();
+                enc.array(7).ok();
+                enc.u64(pool.stake).ok();
+                enc.u64(pool.owner_stake).ok();
+                enc.u64(pool.pool_reward).ok();
+                enc.u64(pool.leader_reward).ok();
+                enc.u64(pool.member_reward).ok();
+                enc.tag(minicbor::data::Tag::new(30)).ok();
+                enc.array(2).ok();
+                enc.u64(pool.margin.0).ok();
+                enc.u64(pool.margin.1).ok();
+                enc.u64(pool.cost).ok();
+            }
+        }
         QueryResult::Error(msg) => {
             enc.str(msg).ok();
         }

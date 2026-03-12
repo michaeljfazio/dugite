@@ -1,6 +1,35 @@
 # Logging
 
-Torsten uses the [tracing](https://docs.rs/tracing) ecosystem for structured logging. It supports multiple output targets, log rotation for file output, and fine-grained level control.
+Torsten uses the [tracing](https://docs.rs/tracing) ecosystem for structured logging. It supports multiple output targets, structured and human-readable formats, log rotation for file output, and fine-grained level control.
+
+## Output Formats
+
+Torsten supports two log formats, selectable via the `--log-format` flag:
+
+### Text (default)
+
+Human-readable compact output with timestamps, level, target module, and structured fields:
+
+```bash
+torsten-node run --log-format text ...
+```
+
+```
+2026-03-12T12:34:56.789Z  INFO torsten_node::node: Syncing progress="95.42%" epoch=512 block=11283746 tip=11300000 remaining=16254 speed="312 blk/s" utxos=15234892
+2026-03-12T12:34:56.790Z  INFO torsten_node::node: Peer connected peer=1.2.3.4:3001 rtt_ms=42
+```
+
+### JSON
+
+Structured JSON output, one object per line. Ideal for log aggregation systems (ELK, Loki, Datadog):
+
+```bash
+torsten-node run --log-format json ...
+```
+
+```json
+{"timestamp":"2026-03-12T12:34:56.789Z","level":"INFO","target":"torsten_node::node","fields":{"message":"Syncing","progress":"95.42%","epoch":512,"block":11283746}}
+```
 
 ## Output Targets
 
@@ -102,24 +131,6 @@ RUST_LOG=torsten_storage=trace,debug torsten-node run ...
 RUST_LOG=info,torsten_network=warn torsten-node run ...
 ```
 
-## Log Format
-
-Torsten uses a fixed-width column format for readable, aligned output:
-
-```
-HH:MM:SS.mmm  LEVEL  target                          message
-```
-
-Example output:
-
-```
-12:34:56.789  INFO torsten_node::node              Sync         slot=142857392 block=11283746 epoch=512 utxo=15234892 sync=95.42% speed=312 blk/s
-12:34:56.790  INFO torsten_node::node              Peer         connected to 1.2.3.4:3001 (42ms)
-12:34:57.123 DEBUG torsten_ledger::state::epoch     Stake distribution rebuilt for epoch 512
-```
-
-The target column is fixed at 30 characters. Longer module paths are truncated from the left (keeping the most specific part). Colors are automatically enabled when stdout is a terminal.
-
 ## CLI Reference
 
 All logging flags are shared between the `run` and `mithril-import` subcommands:
@@ -127,6 +138,7 @@ All logging flags are shared between the `run` and `mithril-import` subcommands:
 | Flag | Default | Description |
 |------|---------|-------------|
 | `--log-output` | `stdout` | Log output target: `stdout`, `file`, or `journald`. Can be specified multiple times. |
+| `--log-format` | `text` | Log format: `text` (human-readable) or `json` (structured). |
 | `--log-level` | `info` | Log level: `trace`, `debug`, `info`, `warn`, `error`. Overridden by `RUST_LOG`. |
 | `--log-dir` | `logs` | Directory for log files (used with `--log-output file`) |
 | `--log-file-rotation` | `daily` | Log file rotation: `daily`, `hourly`, or `never` |
@@ -134,25 +146,31 @@ All logging flags are shared between the `run` and `mithril-import` subcommands:
 
 ## Production Recommendations
 
-For production deployments:
+For production deployments with log aggregation:
 
 ```bash
 torsten-node run \
   --log-output file \
   --log-output journald \
+  --log-format json \
   --log-dir /var/log/torsten \
   --log-file-rotation daily \
-  --log-no-color \
   ...
 ```
 
 This configuration:
-- Writes structured logs to systemd journal for `journalctl` integration
-- Writes rotated log files for archival and debugging
-- Disables ANSI colors (not needed for file/journal output, but harmless)
+- Writes structured JSON logs to systemd journal for `journalctl` integration
+- Writes rotated JSON log files for archival and ingestion by log aggregators
+- JSON format ensures all structured fields are machine-parseable
 
-For containerized deployments (Docker, Kubernetes), stdout is typically sufficient since the container runtime captures output:
+For human operators monitoring the console:
 
 ```bash
-torsten-node run --log-output stdout ...
+torsten-node run --log-output stdout --log-format text ...
+```
+
+For containerized deployments (Docker, Kubernetes), stdout with JSON is ideal since the container runtime captures output and log drivers can parse the structured format:
+
+```bash
+torsten-node run --log-output stdout --log-format json ...
 ```

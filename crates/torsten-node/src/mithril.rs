@@ -141,7 +141,7 @@ pub async fn import_snapshot(
     temp_dir: Option<&Path>,
 ) -> Result<()> {
     let aggregator = aggregator_url(network_magic);
-    info!("Mithril      fetching latest snapshot from {}", aggregator);
+    info!(aggregator = %aggregator, "Fetching latest Mithril snapshot");
 
     // Step 1: Get latest snapshot metadata
     let client = reqwest::Client::builder()
@@ -162,10 +162,10 @@ pub async fn import_snapshot(
         .context("No snapshots available from aggregator")?;
 
     info!(
-        "Mithril      snapshot found (epoch={}, immutable={}, {:.1} GB)",
-        latest.beacon.epoch,
-        latest.beacon.immutable_file_number,
-        latest.size as f64 / (1024.0 * 1024.0 * 1024.0),
+        epoch = latest.beacon.epoch,
+        immutable = latest.beacon.immutable_file_number,
+        size_gb = format_args!("{:.1}", latest.size as f64 / (1024.0 * 1024.0 * 1024.0)),
+        "Mithril snapshot found",
     );
 
     // Step 2: Get download locations
@@ -183,7 +183,7 @@ pub async fn import_snapshot(
         .first()
         .context("No download locations in snapshot")?;
 
-    info!("Mithril      downloading snapshot...");
+    info!("Downloading Mithril snapshot...");
 
     // Step 3: Download snapshot to temp file
     let work_dir = temp_dir
@@ -196,7 +196,7 @@ pub async fn import_snapshot(
 
     // Step 4: Extract the archive
     let extract_dir = work_dir.join(format!("extract-{}", detail.digest));
-    info!("Mithril      extracting snapshot archive...");
+    info!("Extracting Mithril snapshot archive...");
     extract_archive(&archive_path, &extract_dir)?;
 
     // Step 5: Verify snapshot digest (Mithril digest over extracted immutable files)
@@ -215,7 +215,7 @@ pub async fn import_snapshot(
     let immutable_dir = find_immutable_dir(&extract_dir);
     let dest_dir = database_path.join("immutable");
     if let Some(ref imm) = immutable_dir {
-        info!("Mithril      moving chunk files to permanent storage");
+        info!("Moving chunk files to permanent storage");
         if let Err(e) = fs::rename(imm, &dest_dir) {
             // rename may fail across filesystems, fall back to copy
             warn!(error = %e, "rename failed, falling back to copy");
@@ -226,7 +226,7 @@ pub async fn import_snapshot(
     // Ledger state is not imported — the node rebuilds it via block replay.
 
     // Step 8: Cleanup
-    info!("Mithril      cleaning up temporary files");
+    info!("Cleaning up temporary files");
     if let Err(e) = fs::remove_file(&archive_path) {
         warn!(error = %e, "Failed to remove archive file");
     }
@@ -234,7 +234,7 @@ pub async fn import_snapshot(
         warn!(error = %e, "Failed to remove extract directory");
     }
 
-    info!("Mithril      import complete");
+    info!("Mithril import complete");
     Ok(())
 }
 

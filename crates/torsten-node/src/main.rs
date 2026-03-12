@@ -44,6 +44,10 @@ struct LogArgs {
     #[arg(long, default_value = "logs")]
     log_dir: PathBuf,
 
+    /// Log output format: text (human-readable) or json (structured)
+    #[arg(long, default_value = "text")]
+    log_format: String,
+
     /// Log file rotation strategy: daily, hourly, never
     #[arg(long, default_value = "daily")]
     log_file_rotation: String,
@@ -123,6 +127,11 @@ fn build_logging_opts(log: &LogArgs) -> Result<logging::LoggingOpts> {
         log.log_outputs.iter().map(|s| s.parse()).collect();
     let outputs = outputs.map_err(|e| anyhow::anyhow!(e))?;
 
+    let format: logging::LogFormat = log
+        .log_format
+        .parse()
+        .map_err(|e: String| anyhow::anyhow!(e))?;
+
     let rotation: logging::LogRotation = log
         .log_file_rotation
         .parse()
@@ -130,6 +139,7 @@ fn build_logging_opts(log: &LogArgs) -> Result<logging::LoggingOpts> {
 
     Ok(logging::LoggingOpts {
         outputs,
+        format,
         level: log.log_level.clone().unwrap_or_else(|| "info".to_string()),
         log_dir: log.log_dir.to_string_lossy().into_owned(),
         rotation,
@@ -168,12 +178,10 @@ async fn run_mithril_import(args: MithrilImportArgs) -> Result<()> {
 }
 
 async fn run_node(args: RunArgs) -> Result<()> {
-    info!("");
     info!(
-        "             Torsten Cardano Node v{}",
-        env!("CARGO_PKG_VERSION")
+        version = env!("CARGO_PKG_VERSION"),
+        "Torsten Cardano Node starting"
     );
-    info!("");
 
     // Load configuration
     let node_config = config::NodeConfig::load(&args.config)?;
@@ -182,32 +190,30 @@ async fn run_node(args: RunArgs) -> Result<()> {
     let topology = topology::Topology::load(&args.topology)?;
     let all_peers = topology.all_peers();
 
-    info!("Config       {}", args.config.display());
-    info!("Database     {}", args.database_path.display());
-    info!("Socket       {}", args.socket_path.display());
+    info!(config = %args.config.display(), "Configuration");
+    info!(path = %args.database_path.display(), "Database");
+    info!(path = %args.socket_path.display(), "Socket");
     info!(
-        "Network      {:?} (magic={})",
-        node_config.network,
-        node_config
-            .network_magic
-            .unwrap_or_else(|| node_config.network.magic())
+        network = ?node_config.network,
+        magic = node_config.network_magic.unwrap_or_else(|| node_config.network.magic()),
+        "Network",
     );
-    info!("Listen       {}:{}", args.host_addr, args.port);
+    info!(host = %args.host_addr, port = args.port, "Listen");
     info!(
-        "Topology     {} peers (producers={}, bootstrap={}, local={}, public={})",
-        all_peers.len(),
-        topology.producers.len(),
-        topology.bootstrap_peers.as_ref().map_or(0, |v| v.len()),
-        topology
+        total = all_peers.len(),
+        producers = topology.producers.len(),
+        bootstrap = topology.bootstrap_peers.as_ref().map_or(0, |v| v.len()),
+        local = topology
             .local_roots
             .iter()
             .map(|g| g.access_points.len())
             .sum::<usize>(),
-        topology
+        public = topology
             .public_roots
             .iter()
             .map(|r| r.access_points.len())
             .sum::<usize>(),
+        "Topology",
     );
 
     // Initialize the node

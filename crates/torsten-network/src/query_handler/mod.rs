@@ -12,8 +12,8 @@ use tracing::debug;
 pub use types::{
     CommitteeMemberSnapshot, CommitteeSnapshot, DRepSnapshot, DRepStakeEntry, EraBound, EraSummary,
     GenesisConfigSnapshot, GovStateSnapshot, MultiAssetSnapshot, NodeStateSnapshot,
-    NonMyopicRewardEntry, PoolParamsSnapshot, PoolStakeSnapshotEntry, ProposalSnapshot,
-    ProtocolParamsSnapshot, QueryResult, RelaySnapshot, ShelleyPParamsSnapshot,
+    NonMyopicRewardEntry, PoolParamsSnapshot, PoolRewardInfo, PoolStakeSnapshotEntry,
+    ProposalSnapshot, ProtocolParamsSnapshot, QueryResult, RelaySnapshot, ShelleyPParamsSnapshot,
     StakeAddressSnapshot, StakeDelegDepositEntry, StakePoolSnapshot, StakeSnapshotsResult,
     UtxoQueryProvider, UtxoSnapshot, VoteDelegateeEntry,
 };
@@ -202,6 +202,26 @@ impl QueryHandler {
         }
     }
 
+    /// Handle GetCBOR (tag 9) — wraps an inner query and returns its result as raw CBOR bytes.
+    /// Wire format: tag(24) <cbor_bytes>
+    fn handle_get_cbor(&self, decoder: &mut minicbor::Decoder<'_>) -> QueryResult {
+        debug!("Query: GetCBOR");
+        // The argument is the inner query to execute
+        // Parse inner query tag
+        let inner_result = match decoder.array() {
+            Ok(_) => {
+                let inner_tag = decoder.u32().unwrap_or(999);
+                self.handle_shelley_query(inner_tag, decoder)
+            }
+            Err(_) => {
+                let inner_tag = decoder.u32().unwrap_or(999);
+                self.handle_shelley_query(inner_tag, decoder)
+            }
+        };
+        // Wrap the result to be encoded as CBOR-in-CBOR (tag 24)
+        QueryResult::WrappedCbor(Box::new(inner_result))
+    }
+
     /// Handle QueryHardFork queries (GetInterpreter = GetEraHistory)
     fn handle_hard_fork_query(&self, _decoder: &mut minicbor::Decoder<'_>) -> QueryResult {
         // QueryHardFork tag 2 contains GetInterpreter [1, 0]
@@ -244,17 +264,17 @@ impl QueryHandler {
             5 => protocol::handle_stake_distribution(&self.state),
             6 => utxo::handle_utxo_by_address(&self.state, &self.utxo_provider, decoder),
             7 => utxo::handle_utxo_whole(),
-            // Tag 8: DebugEpochState -- not implemented
-            // Tag 9: GetCBOR -- not implemented
+            8 => protocol::handle_debug_epoch_state(&self.state),
+            9 => self.handle_get_cbor(decoder),
             10 => stake::handle_filtered_delegations(&self.state, decoder),
             11 => protocol::handle_genesis_config(&self.state),
-            // Tag 12: DebugNewEpochState -- not implemented
-            // Tag 13: DebugChainDepState -- not implemented
-            // Tag 14: GetRewardProvenance -- not implemented
+            12 => protocol::handle_debug_new_epoch_state(&self.state),
+            13 => protocol::handle_debug_chain_dep_state(&self.state),
+            14 => protocol::handle_reward_provenance(&self.state),
             15 => utxo::handle_utxo_by_txin(&self.utxo_provider, decoder),
             16 => stake::handle_stake_pools(&self.state),
             17 => stake::handle_stake_pool_params(&self.state, decoder),
-            // Tag 18: GetRewardInfoPools -- not implemented (complex reward provenance data)
+            18 => stake::handle_reward_info_pools(&self.state),
             19 => stake::handle_pool_state(&self.state, decoder),
             20 => stake::handle_stake_snapshots(&self.state),
             21 => stake::handle_pool_distr(&self.state, decoder),
@@ -908,6 +928,148 @@ mod tests {
                 assert_eq!(delegatees[1].drep_type, 2);
             }
             other => panic!("Expected FilteredVoteDelegatees, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_query_handler_debug_epoch_state() {
+        let mut handler = QueryHandler::new();
+        handler.update_state(NodeStateSnapshot {
+            epoch: EpochNo(55),
+            treasury: 2_000_000,
+            reserves: 8_000_000,
+            pool_count: 5,
+            utxo_count: 100,
+            ..NodeStateSnapshot::default()
+        });
+        match query(&handler, 8) {
+            QueryResult::DebugEpochState {
+                epoch,
+                treasury,
+                reserves,
+                stake_pool_count,
+                utxo_count,
+            } => {
+                assert_eq!(epoch, 55);
+                assert_eq!(treasury, 2_000_000);
+                assert_eq!(reserves, 8_000_000);
+                assert_eq!(stake_pool_count, 5);
+                assert_eq!(utxo_count, 100);
+            }
+            other => panic!("Expected DebugEpochState, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_query_handler_get_cbor_wraps_inner() {
+        let handler = QueryHandler::new();
+        // Build CBOR for inner query: [1] (GetEpochNo)
+        let mut buf = Vec::new();
+        let mut enc = minicbor::Encoder::new(&mut buf);
+        enc.array(1).unwrap();
+        enc.u32(1).unwrap(); // GetEpochNo
+        let mut decoder = minicbor::Decoder::new(&buf);
+        let result = handler.handle_shelley_query(9, &mut decoder);
+        match result {
+            QueryResult::WrappedCbor(inner) => match *inner {
+                QueryResult::EpochNo(epoch) => {
+                    assert_eq!(epoch, 0); // default state epoch
+                }
+                other => panic!("Expected EpochNo inside WrappedCbor, got {other:?}"),
+            },
+            other => panic!("Expected WrappedCbor, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_query_handler_debug_new_epoch_state() {
+        let mut handler = QueryHandler::new();
+        handler.update_state(NodeStateSnapshot {
+            epoch: EpochNo(10),
+            block_number: BlockNo(500),
+            tip: Tip {
+                point: torsten_primitives::block::Point::Specific(
+                    SlotNo(12345),
+                    Hash32::from_bytes([0xAA; 32]),
+                ),
+                block_number: BlockNo(500),
+            },
+            ..NodeStateSnapshot::default()
+        });
+        match query(&handler, 12) {
+            QueryResult::DebugNewEpochState {
+                epoch,
+                block_number,
+                slot,
+            } => {
+                assert_eq!(epoch, 10);
+                assert_eq!(block_number, 500);
+                assert_eq!(slot, 12345);
+            }
+            other => panic!("Expected DebugNewEpochState, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_query_handler_debug_chain_dep_state() {
+        let mut handler = QueryHandler::new();
+        handler.update_state(NodeStateSnapshot {
+            tip: Tip {
+                point: torsten_primitives::block::Point::Specific(
+                    SlotNo(99999),
+                    Hash32::from_bytes([0xBB; 32]),
+                ),
+                block_number: BlockNo(100),
+            },
+            ..NodeStateSnapshot::default()
+        });
+        match query(&handler, 13) {
+            QueryResult::DebugChainDepState { last_slot } => {
+                assert_eq!(last_slot, 99999);
+            }
+            other => panic!("Expected DebugChainDepState, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_query_handler_reward_provenance() {
+        let mut handler = QueryHandler::new();
+        handler.update_state(NodeStateSnapshot {
+            epoch: EpochNo(42),
+            reserves: 10_000_000,
+            protocol_params: ProtocolParamsSnapshot {
+                rho_num: 3,
+                rho_den: 1000,
+                tau_num: 2,
+                tau_den: 10,
+                ..ProtocolParamsSnapshot::default()
+            },
+            ..NodeStateSnapshot::default()
+        });
+        match query(&handler, 14) {
+            QueryResult::RewardProvenance {
+                epoch,
+                total_rewards_pot,
+                treasury_tax,
+                ..
+            } => {
+                assert_eq!(epoch, 42);
+                assert_eq!(total_rewards_pot, 30_000); // 10M * 3/1000
+                assert_eq!(treasury_tax, 6_000); // 30K * 2/10
+            }
+            other => panic!("Expected RewardProvenance, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_query_handler_reward_info_pools() {
+        let handler = QueryHandler::new();
+        // Default state has no pools, should return empty
+        match query(&handler, 18) {
+            QueryResult::RewardInfoPools(pools) => {
+                assert!(pools.is_empty());
+            }
+            other => panic!("Expected RewardInfoPools, got {other:?}"),
         }
     }
 

@@ -220,7 +220,7 @@ impl N2CServer {
         }
 
         let listener = UnixListener::bind(socket_path)?;
-        info!("N2C          listening on {}", socket_path.display());
+        info!(path = %socket_path.display(), "N2C server listening");
 
         loop {
             tokio::select! {
@@ -722,6 +722,111 @@ mod tests {
         };
         let cbor = encode_query_result(&result);
         assert!(!cbor.is_empty());
+    }
+
+    #[test]
+    fn test_encode_debug_epoch_state() {
+        let result = QueryResult::DebugEpochState {
+            epoch: 42,
+            treasury: 1_000_000,
+            reserves: 5_000_000,
+            stake_pool_count: 10,
+            utxo_count: 5000,
+        };
+        let cbor = encode_query_result(&result);
+        assert!(!cbor.is_empty());
+        // Verify it's valid CBOR by decoding
+        let mut dec = minicbor::Decoder::new(&cbor);
+        // [4, inner]
+        assert_eq!(dec.array().unwrap(), Some(2));
+        assert_eq!(dec.u32().unwrap(), 4); // MsgResult tag
+    }
+
+    #[test]
+    fn test_encode_debug_new_epoch_state() {
+        let result = QueryResult::DebugNewEpochState {
+            epoch: 100,
+            block_number: 12345,
+            slot: 67890,
+        };
+        let cbor = encode_query_result(&result);
+        assert!(!cbor.is_empty());
+        let mut dec = minicbor::Decoder::new(&cbor);
+        assert_eq!(dec.array().unwrap(), Some(2));
+        assert_eq!(dec.u32().unwrap(), 4);
+    }
+
+    #[test]
+    fn test_encode_debug_chain_dep_state() {
+        let result = QueryResult::DebugChainDepState { last_slot: 999 };
+        let cbor = encode_query_result(&result);
+        assert!(!cbor.is_empty());
+        let mut dec = minicbor::Decoder::new(&cbor);
+        assert_eq!(dec.array().unwrap(), Some(2));
+        assert_eq!(dec.u32().unwrap(), 4);
+    }
+
+    #[test]
+    fn test_encode_reward_provenance() {
+        let result = QueryResult::RewardProvenance {
+            epoch: 42,
+            total_rewards_pot: 30_000_000,
+            treasury_tax: 6_000_000,
+            active_stake: 1_000_000_000,
+        };
+        let cbor = encode_query_result(&result);
+        assert!(!cbor.is_empty());
+        let mut dec = minicbor::Decoder::new(&cbor);
+        assert_eq!(dec.array().unwrap(), Some(2));
+        assert_eq!(dec.u32().unwrap(), 4);
+    }
+
+    #[test]
+    fn test_encode_reward_info_pools() {
+        use crate::query_handler::PoolRewardInfo;
+        let result = QueryResult::RewardInfoPools(vec![PoolRewardInfo {
+            pool_id: vec![1u8; 28],
+            stake: 500_000_000,
+            owner_stake: 100_000_000,
+            pool_reward: 10_000_000,
+            leader_reward: 4_000_000,
+            member_reward: 6_000_000,
+            margin: (5, 100),
+            cost: 340_000_000,
+        }]);
+        let cbor = encode_query_result(&result);
+        assert!(!cbor.is_empty());
+        let mut dec = minicbor::Decoder::new(&cbor);
+        assert_eq!(dec.array().unwrap(), Some(2));
+        assert_eq!(dec.u32().unwrap(), 4);
+    }
+
+    #[test]
+    fn test_encode_reward_info_pools_empty() {
+        let result = QueryResult::RewardInfoPools(vec![]);
+        let cbor = encode_query_result(&result);
+        assert!(!cbor.is_empty());
+    }
+
+    #[test]
+    fn test_encode_wrapped_cbor() {
+        // GetCBOR wraps an inner result in tag(24)
+        let inner = QueryResult::EpochNo(42);
+        let result = QueryResult::WrappedCbor(Box::new(inner));
+        let cbor = encode_query_result(&result);
+        assert!(!cbor.is_empty());
+        // Decode outer: [4, tag(24) <bytes>]
+        let mut dec = minicbor::Decoder::new(&cbor);
+        assert_eq!(dec.array().unwrap(), Some(2));
+        assert_eq!(dec.u32().unwrap(), 4); // MsgResult tag
+                                           // HFC wrapper array(1)
+        assert_eq!(dec.array().unwrap(), Some(1));
+        // tag(24)
+        let tag = dec.tag().unwrap();
+        assert_eq!(tag.as_u64(), 24);
+        // Inner CBOR bytes
+        let inner_bytes = dec.bytes().unwrap();
+        assert!(!inner_bytes.is_empty());
     }
 
     /// Build a minimal valid Conway transaction CBOR for testing.

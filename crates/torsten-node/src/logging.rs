@@ -1,13 +1,6 @@
-use std::fmt;
-use tracing_subscriber::fmt::format::Writer;
-use tracing_subscriber::fmt::{FmtContext, FormatEvent, FormatFields};
 use tracing_subscriber::layer::SubscriberExt;
-use tracing_subscriber::registry::LookupSpan;
 use tracing_subscriber::util::SubscriberInitExt;
 use tracing_subscriber::{EnvFilter, Layer, Registry};
-
-/// Fixed-width target column width. Targets longer than this are truncated.
-const TARGET_WIDTH: usize = 30;
 
 /// Log output target.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -27,6 +20,27 @@ impl std::str::FromStr for LogOutput {
             other => Err(format!(
                 "unknown log output '{other}' (valid: stdout, file, journald)"
             )),
+        }
+    }
+}
+
+/// Log output format.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum LogFormat {
+    /// Human-readable text output
+    #[default]
+    Text,
+    /// Structured JSON output (one JSON object per line)
+    Json,
+}
+
+impl std::str::FromStr for LogFormat {
+    type Err = String;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.to_lowercase().as_str() {
+            "text" | "plain" => Ok(Self::Text),
+            "json" => Ok(Self::Json),
+            other => Err(format!("unknown log format '{other}' (valid: text, json)")),
         }
     }
 }
@@ -57,6 +71,7 @@ impl std::str::FromStr for LogRotation {
 /// Options for initializing the logging system.
 pub struct LoggingOpts {
     pub outputs: Vec<LogOutput>,
+    pub format: LogFormat,
     pub level: String,
     pub log_dir: String,
     pub rotation: LogRotation,
@@ -75,8 +90,6 @@ pub struct LogGuard {
 /// buffered output (file logs) is flushed.
 pub fn init(opts: &LoggingOpts) -> anyhow::Result<LogGuard> {
     let mut guards: Vec<tracing_appender::non_blocking::WorkerGuard> = Vec::new();
-
-    // Use type-erased boxed layers so we can compose dynamically
     let mut layers: Vec<Box<dyn Layer<Registry> + Send + Sync>> = Vec::new();
 
     let outputs = if opts.outputs.is_empty() {
@@ -89,11 +102,25 @@ pub fn init(opts: &LoggingOpts) -> anyhow::Result<LogGuard> {
         match output {
             LogOutput::Stdout => {
                 let ansi = !opts.no_color && atty_stdout();
-                let layer = tracing_subscriber::fmt::layer()
-                    .event_format(AlignedFormatter { ansi })
-                    .with_ansi(ansi)
-                    .with_filter(build_filter(&opts.level));
-                layers.push(Box::new(layer));
+                let filter = build_filter(&opts.level);
+                match opts.format {
+                    LogFormat::Text => {
+                        let layer = tracing_subscriber::fmt::layer()
+                            .compact()
+                            .with_target(true)
+                            .with_ansi(ansi)
+                            .with_filter(filter);
+                        layers.push(Box::new(layer));
+                    }
+                    LogFormat::Json => {
+                        let layer = tracing_subscriber::fmt::layer()
+                            .json()
+                            .with_target(true)
+                            .with_ansi(false)
+                            .with_filter(filter);
+                        layers.push(Box::new(layer));
+                    }
+                }
             }
             LogOutput::File => {
                 std::fs::create_dir_all(&opts.log_dir)?;
@@ -111,12 +138,27 @@ pub fn init(opts: &LoggingOpts) -> anyhow::Result<LogGuard> {
                 let (non_blocking, guard) = tracing_appender::non_blocking(file_appender);
                 guards.push(guard);
 
-                let layer = tracing_subscriber::fmt::layer()
-                    .event_format(AlignedFormatter { ansi: false })
-                    .with_ansi(false)
-                    .with_writer(non_blocking)
-                    .with_filter(build_filter(&opts.level));
-                layers.push(Box::new(layer));
+                let filter = build_filter(&opts.level);
+                match opts.format {
+                    LogFormat::Text => {
+                        let layer = tracing_subscriber::fmt::layer()
+                            .compact()
+                            .with_target(true)
+                            .with_ansi(false)
+                            .with_writer(non_blocking)
+                            .with_filter(filter);
+                        layers.push(Box::new(layer));
+                    }
+                    LogFormat::Json => {
+                        let layer = tracing_subscriber::fmt::layer()
+                            .json()
+                            .with_target(true)
+                            .with_ansi(false)
+                            .with_writer(non_blocking)
+                            .with_filter(filter);
+                        layers.push(Box::new(layer));
+                    }
+                }
             }
             LogOutput::Journald => {
                 #[cfg(feature = "journald")]
@@ -153,77 +195,6 @@ fn atty_stdout() -> bool {
 }
 
 // ---------------------------------------------------------------------------
-// Aligned formatter
-// ---------------------------------------------------------------------------
-
-/// Custom log event formatter with fixed-width columns:
-///   `HH:MM:SS.mmm  LEVEL  target<30>  message`
-struct AlignedFormatter {
-    ansi: bool,
-}
-
-impl<S, N> FormatEvent<S, N> for AlignedFormatter
-where
-    S: tracing::Subscriber + for<'a> LookupSpan<'a>,
-    N: for<'a> FormatFields<'a> + 'static,
-{
-    fn format_event(
-        &self,
-        ctx: &FmtContext<'_, S, N>,
-        mut writer: Writer<'_>,
-        event: &tracing::Event<'_>,
-    ) -> fmt::Result {
-        // Timestamp
-        let now = chrono::Local::now();
-        let timestamp = now.format("%H:%M:%S%.3f");
-
-        // Level with color
-        let level = *event.metadata().level();
-        let level_str = if self.ansi {
-            match level {
-                tracing::Level::ERROR => "\x1b[31mERROR\x1b[0m",
-                tracing::Level::WARN => "\x1b[33m WARN\x1b[0m",
-                tracing::Level::INFO => "\x1b[32m INFO\x1b[0m",
-                tracing::Level::DEBUG => "\x1b[34mDEBUG\x1b[0m",
-                tracing::Level::TRACE => "\x1b[35mTRACE\x1b[0m",
-            }
-        } else {
-            match level {
-                tracing::Level::ERROR => "ERROR",
-                tracing::Level::WARN => " WARN",
-                tracing::Level::INFO => " INFO",
-                tracing::Level::DEBUG => "DEBUG",
-                tracing::Level::TRACE => "TRACE",
-            }
-        };
-
-        // Target with fixed width
-        let target = event.metadata().target();
-        let target_display: String = if target.len() <= TARGET_WIDTH {
-            format!("{target:<TARGET_WIDTH$}")
-        } else {
-            // Truncate from the left (keep the most specific part)
-            let truncated = &target[target.len() - (TARGET_WIDTH - 2)..];
-            format!("..{truncated}")
-        };
-
-        // Dim the target if ANSI is enabled
-        if self.ansi {
-            write!(
-                writer,
-                "{timestamp} {level_str} \x1b[2m{target_display}\x1b[0m "
-            )?;
-        } else {
-            write!(writer, "{timestamp} {level_str} {target_display} ")?;
-        }
-
-        // Message fields
-        ctx.field_format().format_fields(writer.by_ref(), event)?;
-        writeln!(writer)
-    }
-}
-
-// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -243,6 +214,15 @@ mod tests {
         assert_eq!("systemd".parse::<LogOutput>().unwrap(), LogOutput::Journald);
         assert_eq!("STDOUT".parse::<LogOutput>().unwrap(), LogOutput::Stdout);
         assert!("invalid".parse::<LogOutput>().is_err());
+    }
+
+    #[test]
+    fn test_log_format_from_str() {
+        assert_eq!("text".parse::<LogFormat>().unwrap(), LogFormat::Text);
+        assert_eq!("plain".parse::<LogFormat>().unwrap(), LogFormat::Text);
+        assert_eq!("json".parse::<LogFormat>().unwrap(), LogFormat::Json);
+        assert_eq!("JSON".parse::<LogFormat>().unwrap(), LogFormat::Json);
+        assert!("invalid".parse::<LogFormat>().is_err());
     }
 
     #[test]

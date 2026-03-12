@@ -25,6 +25,7 @@ torsten-node run [OPTIONS]
 | `--shelley-vrf-key` | | Path to the VRF signing key (enables block production) |
 | `--shelley-operational-certificate` | | Path to the operational certificate (enables block production) |
 | `--log-output` | `stdout` | Log output target: `stdout`, `file`, or `journald`. Can be specified multiple times. |
+| `--log-format` | `text` | Log format: `text` (human-readable) or `json` (structured). |
 | `--log-level` | `info` | Log level (`trace`, `debug`, `info`, `warn`, `error`). Overridden by `RUST_LOG`. |
 | `--log-dir` | `logs` | Directory for log files (used with `--log-output file`) |
 | `--log-file-rotation` | `daily` | Log file rotation strategy: `daily`, `hourly`, or `never` |
@@ -111,6 +112,7 @@ torsten-node mithril-import [OPTIONS]
 | `--database-path` | `db` | Path to the database directory |
 | `--temp-dir` | | Temporary directory for download and extraction (uses system temp if omitted) |
 | `--log-output` | `stdout` | Log output target: `stdout`, `file`, or `journald`. Can be specified multiple times. |
+| `--log-format` | `text` | Log format: `text` (human-readable) or `json` (structured). |
 | `--log-level` | `info` | Log level (`trace`, `debug`, `info`, `warn`, `error`). Overridden by `RUST_LOG`. |
 | `--log-dir` | `logs` | Directory for log files (used with `--log-output file`) |
 | `--log-file-rotation` | `daily` | Log file rotation strategy: `daily`, `hourly`, or `never` |

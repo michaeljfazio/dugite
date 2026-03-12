@@ -511,11 +511,11 @@ impl Node {
                         let k = genesis.security_param();
                         byron_epoch_length = 10 * k;
                         info!(
-                            "Genesis      Byron (magic={}, k={}, epoch_len={}, utxos={})",
-                            genesis.protocol_magic(),
+                            magic = genesis.protocol_magic(),
                             k,
-                            byron_epoch_length,
-                            utxos.len()
+                            epoch_len = byron_epoch_length,
+                            utxos = utxos.len(),
+                            "Byron genesis loaded",
                         );
                         byron_genesis_file_hash = Some(hash);
                         utxos.into_iter().map(|e| (e.address, e.lovelace)).collect()
@@ -536,8 +536,10 @@ impl Node {
                 match ShelleyGenesis::load_with_hash(&genesis_path) {
                     Ok((genesis, hash)) => {
                         info!(
-                            "Genesis      Shelley (magic={}, start={}, epoch_len={})",
-                            genesis.network_magic, genesis.system_start, genesis.epoch_length
+                            magic = genesis.network_magic,
+                            start = %genesis.system_start,
+                            epoch_len = genesis.epoch_length,
+                            "Shelley genesis loaded",
                         );
                         genesis.apply_to_protocol_params(&mut protocol_params);
                         (Some(genesis), Some(hash))
@@ -557,8 +559,9 @@ impl Node {
             match AlonzoGenesis::load(&genesis_path) {
                 Ok(genesis) => {
                     info!(
-                        "Genesis      Alonzo (max_val_size={}, collateral={}%)",
-                        genesis.max_value_size, genesis.collateral_percentage,
+                        max_val_size = genesis.max_value_size,
+                        collateral_pct = genesis.collateral_percentage,
+                        "Alonzo genesis loaded",
                     );
                     genesis.apply_to_protocol_params(&mut protocol_params);
                 }
@@ -576,10 +579,10 @@ impl Node {
             match ConwayGenesis::load(&genesis_path) {
                 Ok(genesis) => {
                     info!(
-                        "Genesis      Conway (drep_deposit={}, gov_deposit={}, committee_min={})",
-                        genesis.d_rep_deposit,
-                        genesis.gov_action_deposit,
-                        genesis.committee_min_size,
+                        drep_deposit = genesis.d_rep_deposit,
+                        gov_deposit = genesis.gov_action_deposit,
+                        committee_min = genesis.committee_min_size,
+                        "Conway genesis loaded",
                     );
                     conway_committee_threshold = genesis.committee_threshold();
                     conway_committee_members = genesis.committee_members();
@@ -638,7 +641,7 @@ impl Node {
                                     exists
                                 }
                                 Err(_) => {
-                                    warn!("Ledger       could not acquire ChainDB lock for snapshot validation, assuming valid");
+                                    warn!("Could not acquire ChainDB lock for snapshot validation, assuming valid");
                                     true
                                 }
                             }
@@ -647,14 +650,14 @@ impl Node {
 
                     if snapshot_valid {
                         info!(
-                            "Ledger       restored from snapshot (epoch={}, utxos={}, tip={})",
-                            state.epoch.0,
-                            state.utxo_set.len(),
-                            state.tip,
+                            epoch = state.epoch.0,
+                            utxos = state.utxo_set.len(),
+                            tip = %state.tip,
+                            "Ledger restored from snapshot",
                         );
                         state
                     } else {
-                        warn!("Ledger       discarding stale snapshot, will replay from ChainDB");
+                        warn!("Discarding stale ledger snapshot, will replay from ChainDB");
                         Self::init_fresh_ledger(
                             &protocol_params,
                             shelley_genesis.as_ref(),
@@ -730,12 +733,12 @@ impl Node {
             OuroborosPraos::new()
         };
         info!(
-            "Consensus    Praos (epoch_len={}, k={}, f={}, kes_period={}, max_kes={})",
-            consensus.epoch_length.0,
-            consensus.security_param,
-            consensus.active_slot_coeff,
-            consensus.slots_per_kes_period,
-            consensus.max_kes_evolutions,
+            epoch_len = consensus.epoch_length.0,
+            k = consensus.security_param,
+            f = consensus.active_slot_coeff,
+            kes_period = consensus.slots_per_kes_period,
+            max_kes = consensus.max_kes_evolutions,
+            "Consensus: Praos",
         );
 
         let mempool = Arc::new(Mempool::new(MempoolConfig::default()));
@@ -769,8 +772,10 @@ impl Node {
                 {
                     Ok(creds) => {
                         info!(
-                            "Mode         block producer (pool={}, opcert_seq={}, kes_period={})",
-                            creds.pool_id, creds.opcert_sequence, creds.opcert_kes_period,
+                            pool = %creds.pool_id,
+                            opcert_seq = creds.opcert_sequence,
+                            kes_period = creds.opcert_kes_period,
+                            "Block producer mode",
                         );
                         Some(creds)
                     }
@@ -781,7 +786,7 @@ impl Node {
                 }
             }
             _ => {
-                info!("Mode         relay-only (no block producer keys)");
+                info!("Relay-only mode (no block producer keys)");
                 None
             }
         };
@@ -849,10 +854,10 @@ impl Node {
         {
             let ls = self.ledger_state.read().await;
             info!(
-                "Chain tip    {} ({} UTxOs, {} mempool txs)",
-                tip,
-                ls.utxo_set.len(),
-                self.mempool.len()
+                tip = %tip,
+                utxos = ls.utxo_set.len(),
+                mempool_txs = self.mempool.len(),
+                "Chain tip",
             );
         }
 
@@ -869,7 +874,7 @@ impl Node {
         let (shutdown_tx, mut shutdown_rx) = watch::channel(false);
         tokio::spawn(async move {
             signal::ctrl_c().await.ok();
-            info!("Shutdown     signal received");
+            info!("Shutdown signal received");
             shutdown_tx.send(true).ok();
         });
 
@@ -951,9 +956,9 @@ impl Node {
             }
             let stats = pm.stats();
             info!(
-                "Peers        {} known, mode={:?}",
-                stats.known_peers,
-                pm.diffusion_mode()
+                known = stats.known_peers,
+                mode = ?pm.diffusion_mode(),
+                "Peers",
             );
         }
         let peers = self.topology.all_peers();
@@ -1188,7 +1193,7 @@ impl Node {
                             pm.record_handshake_rtt(addr, rtt_ms);
                             pm.promote_to_hot(addr);
                             drop(pm);
-                            info!("Peer         connected to {target} ({rtt_ms:.0}ms)");
+                            info!(peer = %target, rtt_ms = format_args!("{rtt_ms:.0}"), "Peer connected");
                             client = Some((c, *addr));
                             break;
                         }
@@ -1206,7 +1211,7 @@ impl Node {
                     match NodeToNodeClient::connect(&*target, network_magic).await {
                         Ok(mut c) => {
                             c.set_byron_epoch_length(self.byron_epoch_length);
-                            info!("Peer         connected to {target}");
+                            info!(peer = %target, "Peer connected");
                             let sock_addr = c.remote_addr().to_owned();
                             client = Some((c, sock_addr));
                             break;
@@ -1329,7 +1334,7 @@ impl Node {
                         }
                     }
                 }
-                info!("Sync         {} block fetcher(s) ready", fetch_pool.len());
+                info!(fetchers = fetch_pool.len(), "Block fetchers ready");
             }
 
             // Create pipelined ChainSync connection to same peer for high-throughput headers
@@ -1406,7 +1411,7 @@ impl Node {
                     if *shutdown_rx.borrow() {
                         break;
                     }
-                    info!("Sync         peer disconnected, reconnecting...");
+                    info!("Peer disconnected, reconnecting...");
                 }
                 Err(e) => {
                     peer_manager.write().await.peer_disconnected(&peer_addr);
@@ -1430,7 +1435,7 @@ impl Node {
             }
         }
         self.save_ledger_snapshot().await;
-        info!("Shutdown     complete");
+        info!("Shutdown complete");
         Ok(())
     }
 
@@ -1643,8 +1648,9 @@ impl Node {
                 .unwrap_or(0);
             if ledger_slot < imm_tip_slot {
                 info!(
-                    "Replay       ledger at slot {} -> ImmutableDB tip at slot {}",
-                    ledger_slot, imm_tip_slot,
+                    ledger_slot,
+                    immutable_tip_slot = imm_tip_slot,
+                    "Replaying ledger from chunk files",
                 );
                 self.replay_from_chunk_files(dir).await;
                 return;
@@ -1687,14 +1693,14 @@ impl Node {
 
         if blocks_behind > 100_000 {
             info!(
-                "Replay       {} blocks to catch up (snapshots every 500k blocks)",
                 blocks_behind,
+                "Replaying blocks (snapshots every 500k blocks)",
             );
         }
 
         info!(
-            "Replay       ledger at slot {} -> ChainDB tip at slot {} ({} blocks behind, LSM mode)",
-            ledger_slot, db_tip_slot, blocks_behind,
+            ledger_slot,
+            db_tip_slot, blocks_behind, "Replaying ledger from ChainDB (LSM mode)",
         );
         self.replay_from_lsm(db_tip).await;
     }
@@ -1744,7 +1750,7 @@ impl Node {
 
                         let mut ls_guard = ledger_state.blocking_write();
                         if let Err(e) = ls_guard.apply_block(&block) {
-                            warn!("Replay       ledger apply failed at slot {}: {e}", block.slot().0);
+                            warn!(slot = block.slot().0, error = %e, "Ledger apply failed during replay");
                         }
                         replayed += 1;
 
@@ -1754,7 +1760,11 @@ impl Node {
                             let slot = ls_guard.tip.point.slot().map(|s| s.0).unwrap_or(0);
                             let utxos = ls_guard.utxo_set.len();
                             info!(
-                                "Replay       {replayed} blocks applied  slot={slot}  {speed:.0} blk/s  {utxos} UTxOs"
+                                blocks = replayed,
+                                slot,
+                                speed = format_args!("{speed:.0} blk/s"),
+                                utxos,
+                                "Replay",
                             );
                             last_log = std::time::Instant::now();
                         }
@@ -1866,8 +1876,13 @@ impl Node {
                                     0.0
                                 };
                                 info!(
-                                    "Replay       {:>6.2}%  block {}/{} slot={}  {:.0} blk/s  {} UTxOs",
-                                    pct, block_no, end_block_no, slot.0, speed, ls.utxo_set.len(),
+                                    progress = format_args!("{pct:>6.2}%"),
+                                    block = block_no,
+                                    total = end_block_no,
+                                    slot = slot.0,
+                                    speed = format_args!("{speed:.0} blk/s"),
+                                    utxos = ls.utxo_set.len(),
+                                    "Replay",
                                 );
                                 last_log = std::time::Instant::now();
                             }
@@ -1901,8 +1916,10 @@ impl Node {
             0.0
         };
         info!(
-            "Replay       complete ({} blocks in {}s, {} blk/s)",
-            replayed, elapsed as u64, speed as u64,
+            blocks = replayed,
+            elapsed_secs = elapsed as u64,
+            speed = format_args!("{} blk/s", speed as u64),
+            "Replay complete",
         );
 
         // Re-enable address indexing and rebuild after replay
@@ -2009,10 +2026,10 @@ impl Node {
         };
 
         match &intersect {
-            Some(point) => info!("Sync         intersection at {point}"),
-            None => info!("Sync         starting from Origin"),
+            Some(point) => info!(point = %point, "Sync intersection found"),
+            None => info!("Sync starting from Origin"),
         }
-        info!("Sync         remote tip: {remote_tip}");
+        info!(remote_tip = %remote_tip, "Remote tip");
 
         let use_pool = !fetch_pool.is_empty();
         let use_pipelined = pipelined.is_some();
@@ -2027,12 +2044,12 @@ impl Node {
         let mut pipeline_depth = max_pipeline_depth;
         if use_pipelined {
             info!(
-                "Sync         pipelined (depth={}, fetchers={})",
-                max_pipeline_depth,
-                fetch_pool.len()
+                depth = max_pipeline_depth,
+                fetchers = fetch_pool.len(),
+                "Sync mode: pipelined",
             );
         } else if use_pool {
-            info!("Sync         multi-peer (fetchers={})", fetch_pool.len());
+            info!(fetchers = fetch_pool.len(), "Sync mode: multi-peer");
         }
 
         let mut blocks_received: u64 = 0;
@@ -2267,7 +2284,7 @@ impl Node {
                             }
                             Some(PipelineMsg::AtTip) => {
                                 if !self.consensus.strict_verification() {
-                                    info!("Sync         caught up to chain tip ({blocks_received} blocks applied)");
+                                    info!(blocks_applied = blocks_received, "Caught up to chain tip");
                                     self.enable_strict_verification().await;
                                 }
                                 self.update_query_state().await;
@@ -2295,7 +2312,7 @@ impl Node {
                         }
                     }
                     _ = shutdown_rx.changed() => {
-                        info!("Shutdown     stopping sync");
+                        info!("Shutdown: stopping sync");
                         break;
                     }
                 }
@@ -2308,7 +2325,7 @@ impl Node {
             // Sequential mode: no pipeline decoupling (single peer or no fetch pool)
             loop {
                 if *shutdown_rx.borrow() {
-                    info!("Shutdown     stopping sync");
+                    info!("Shutdown: stopping sync");
                     break;
                 }
 
@@ -2417,7 +2434,7 @@ impl Node {
                                                 }
                                             }
                                             if !self.consensus.strict_verification() {
-                                                info!("Sync         caught up to chain tip ({blocks_received} blocks applied)");
+                                                info!(blocks_applied = blocks_received, "Caught up to chain tip");
                                                 self.enable_strict_verification().await;
                                             }
                                             self.update_query_state().await;
@@ -2426,7 +2443,7 @@ impl Node {
                                         }
                                         HeaderBatchResult::Await => {
                                             if !self.consensus.strict_verification() {
-                                                info!("Sync         caught up to chain tip ({blocks_received} blocks applied)");
+                                                info!(blocks_applied = blocks_received, "Caught up to chain tip");
                                                 self.enable_strict_verification().await;
                                             }
                                             self.update_query_state().await;
@@ -2449,7 +2466,7 @@ impl Node {
                             }
                         }
                         _ = shutdown_rx.changed() => {
-                            info!("Shutdown     stopping sync");
+                            info!("Shutdown: stopping sync");
                             break;
                         }
                     }
@@ -2485,7 +2502,7 @@ impl Node {
                                             }
                                             ChainSyncEvent::Await => {
                                                 if !self.consensus.strict_verification() {
-                                                    info!("Sync         caught up to chain tip ({blocks_received} blocks applied)");
+                                                    info!(blocks_applied = blocks_received, "Caught up to chain tip");
                                                     self.enable_strict_verification().await;
                                                 }
                                                 self.update_query_state().await;
@@ -2506,7 +2523,7 @@ impl Node {
                             }
                         }
                         _ = shutdown_rx.changed() => {
-                            info!("Shutdown     stopping sync");
+                            info!("Shutdown: stopping sync");
                             break;
                         }
                     }
@@ -2744,7 +2761,7 @@ impl Node {
                                         bridge_slot = next_slot.0;
                                     }
                                     Err(e) => {
-                                        warn!("Sync         gap bridge decode failed at slot {}: {e}", next_slot.0);
+                                        warn!(slot = next_slot.0, error = %e, "Gap bridge decode failed");
                                         bridge_slot = next_slot.0;
                                     }
                                 }
@@ -2844,17 +2861,32 @@ impl Node {
         self.metrics.set_block_number(block_no);
 
         // Log each new block when following the tip (individual blocks matter at tip)
+        // and announce to connected downstream peers so they receive new blocks
         if strict {
             for block in &blocks {
                 let hash_hex = block.hash().to_hex();
                 info!(
-                    "Block        {} slot={} block={} txs={} hash={}",
-                    block.era,
-                    block.slot().0,
-                    block.block_number().0,
-                    block.transactions.len(),
-                    hash_hex,
+                    era = %block.era,
+                    slot = block.slot().0,
+                    block = block.block_number().0,
+                    txs = block.transactions.len(),
+                    hash = %hash_hex,
+                    "New block",
                 );
+            }
+
+            // Announce the latest block to all connected N2N peers
+            // This enables relay behavior: downstream peers waiting at tip (MsgAwaitReply)
+            // will receive MsgRollForward for blocks we synced from upstream
+            if let Some(ref tx) = self.block_announcement_tx {
+                let mut hash_bytes = [0u8; 32];
+                hash_bytes.copy_from_slice(last_block.hash().as_ref());
+                tx.send(torsten_network::BlockAnnouncement {
+                    slot,
+                    hash: hash_bytes,
+                    block_number: block_no,
+                })
+                .ok();
             }
         }
 
@@ -2864,10 +2896,9 @@ impl Node {
                 // Count ALL epoch transitions (batches may span multiple epochs)
                 let epochs_crossed = (current_epoch - *last_snapshot_epoch) as u32;
                 info!(
-                    "Epoch        {} (crossed {} epoch boundary{})",
-                    current_epoch,
-                    epochs_crossed,
-                    if epochs_crossed > 1 { "ies" } else { "" },
+                    epoch = current_epoch,
+                    crossed = epochs_crossed,
+                    "Epoch transition",
                 );
                 self.epoch_transitions_observed = self
                     .epoch_transitions_observed
@@ -2954,14 +2985,14 @@ impl Node {
                 // Only show sync progress when catching up, not when following the tip
                 if blocks_remaining > 0 {
                     info!(
-                        "Syncing      {:>6.2}%  epoch {:<5}  block {}/{} ({} remaining)  {} blk/s  {} UTxOs",
-                        progress,
-                        ls.epoch.0,
-                        block_no,
-                        tip_block,
-                        blocks_remaining,
-                        blocks_per_sec as u64,
-                        ls.utxo_set.len(),
+                        progress = format_args!("{progress:.2}%"),
+                        epoch = ls.epoch.0,
+                        block = block_no,
+                        tip = tip_block,
+                        remaining = blocks_remaining,
+                        speed = format_args!("{} blk/s", blocks_per_sec as u64),
+                        utxos = ls.utxo_set.len(),
+                        "Syncing",
                     );
                 }
             }
@@ -3892,8 +3923,9 @@ impl Node {
         }
 
         info!(
-            "Leader       elected for slot {} (stake={:.6})",
-            next_slot.0, relative_stake,
+            slot = next_slot.0,
+            stake = format_args!("{relative_stake:.6}"),
+            "Leader elected",
         );
 
         // Collect transactions from mempool using protocol params limits
@@ -3964,10 +3996,10 @@ impl Node {
                     .blocks_forged
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 info!(
-                    "Forged       block={} slot={} txs={}",
-                    block_number.0,
-                    next_slot.0,
-                    block.transactions.len(),
+                    block = block_number.0,
+                    slot = next_slot.0,
+                    txs = block.transactions.len(),
+                    "Block forged",
                 );
 
                 // Announce the new block to all connected peers

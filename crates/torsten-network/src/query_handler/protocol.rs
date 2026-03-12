@@ -1,4 +1,4 @@
-//! Protocol parameter, genesis, and reward query handlers (tags 2, 3, 4, 5, 11, 29).
+//! Protocol parameter, genesis, and reward query handlers (tags 2, 3, 4, 5, 8, 11, 12, 13, 14, 29).
 
 use tracing::debug;
 
@@ -143,5 +143,200 @@ pub(crate) fn handle_account_state(state: &NodeStateSnapshot) -> QueryResult {
     QueryResult::AccountState {
         treasury: state.treasury,
         reserves: state.reserves,
+    }
+}
+
+/// Handle DebugEpochState (tag 8) — epoch state summary.
+///
+/// In the Haskell node this returns the full serialized EpochState.
+/// We return the key fields that tools typically inspect.
+pub(crate) fn handle_debug_epoch_state(state: &NodeStateSnapshot) -> QueryResult {
+    debug!("Query: DebugEpochState");
+    QueryResult::DebugEpochState {
+        epoch: state.epoch.0,
+        treasury: state.treasury,
+        reserves: state.reserves,
+        stake_pool_count: state.pool_count as u64,
+        utxo_count: state.utxo_count as u64,
+    }
+}
+
+/// Handle DebugNewEpochState (tag 12) — new epoch state summary.
+///
+/// In the Haskell node this returns the full serialized NewEpochState.
+/// We return the key tracking fields.
+pub(crate) fn handle_debug_new_epoch_state(state: &NodeStateSnapshot) -> QueryResult {
+    debug!("Query: DebugNewEpochState");
+    let slot = state.tip.point.slot().map(|s| s.0).unwrap_or(0);
+    QueryResult::DebugNewEpochState {
+        epoch: state.epoch.0,
+        block_number: state.block_number.0,
+        slot,
+    }
+}
+
+/// Handle DebugChainDepState (tag 13) — consensus chain-dependent state.
+///
+/// In the Haskell node this returns the Praos ChainDepState (nonce, etc).
+/// We return the last applied slot.
+pub(crate) fn handle_debug_chain_dep_state(state: &NodeStateSnapshot) -> QueryResult {
+    debug!("Query: DebugChainDepState");
+    let last_slot = state.tip.point.slot().map(|s| s.0).unwrap_or(0);
+    QueryResult::DebugChainDepState { last_slot }
+}
+
+/// Handle GetRewardProvenance (tag 14) — reward calculation provenance.
+///
+/// Returns aggregate reward provenance data: total rewards pot, treasury tax,
+/// and total active stake for the current epoch.
+pub(crate) fn handle_reward_provenance(state: &NodeStateSnapshot) -> QueryResult {
+    debug!("Query: GetRewardProvenance");
+    let total_active_stake: u64 = state.stake_pools.iter().map(|p| p.stake).sum();
+    // Reward pot = reserves * rho (monetary expansion)
+    let rho_num = state.protocol_params.rho_num;
+    let rho_den = state.protocol_params.rho_den.max(1);
+    let total_rewards_pot = (state.reserves as u128 * rho_num as u128 / rho_den as u128) as u64;
+    // Treasury tax = reward_pot * tau
+    let tau_num = state.protocol_params.tau_num;
+    let tau_den = state.protocol_params.tau_den.max(1);
+    let treasury_tax = (total_rewards_pot as u128 * tau_num as u128 / tau_den as u128) as u64;
+    QueryResult::RewardProvenance {
+        epoch: state.epoch.0,
+        total_rewards_pot,
+        treasury_tax,
+        active_stake: total_active_stake,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::query_handler::types::{
+        NodeStateSnapshot, ProtocolParamsSnapshot, StakePoolSnapshot,
+    };
+
+    fn make_state() -> NodeStateSnapshot {
+        NodeStateSnapshot {
+            epoch: torsten_primitives::time::EpochNo(42),
+            treasury: 1_000_000_000,
+            reserves: 10_000_000_000,
+            pool_count: 3,
+            utxo_count: 5000,
+            block_number: torsten_primitives::time::BlockNo(999),
+            protocol_params: ProtocolParamsSnapshot {
+                rho_num: 3,
+                rho_den: 1000,
+                tau_num: 2,
+                tau_den: 10,
+                ..ProtocolParamsSnapshot::default()
+            },
+            stake_pools: vec![
+                StakePoolSnapshot {
+                    pool_id: vec![1u8; 28],
+                    stake: 500_000_000,
+                    vrf_keyhash: vec![0u8; 32],
+                    total_active_stake: 1_000_000_000,
+                },
+                StakePoolSnapshot {
+                    pool_id: vec![2u8; 28],
+                    stake: 500_000_000,
+                    vrf_keyhash: vec![0u8; 32],
+                    total_active_stake: 1_000_000_000,
+                },
+            ],
+            ..NodeStateSnapshot::default()
+        }
+    }
+
+    #[test]
+    fn test_debug_epoch_state() {
+        let state = make_state();
+        let result = handle_debug_epoch_state(&state);
+        match result {
+            QueryResult::DebugEpochState {
+                epoch,
+                treasury,
+                reserves,
+                stake_pool_count,
+                utxo_count,
+            } => {
+                assert_eq!(epoch, 42);
+                assert_eq!(treasury, 1_000_000_000);
+                assert_eq!(reserves, 10_000_000_000);
+                assert_eq!(stake_pool_count, 3);
+                assert_eq!(utxo_count, 5000);
+            }
+            _ => panic!("Expected DebugEpochState"),
+        }
+    }
+
+    #[test]
+    fn test_debug_new_epoch_state() {
+        let state = make_state();
+        let result = handle_debug_new_epoch_state(&state);
+        match result {
+            QueryResult::DebugNewEpochState {
+                epoch,
+                block_number,
+                slot,
+            } => {
+                assert_eq!(epoch, 42);
+                assert_eq!(block_number, 999);
+                assert_eq!(slot, 0); // origin tip
+            }
+            _ => panic!("Expected DebugNewEpochState"),
+        }
+    }
+
+    #[test]
+    fn test_debug_chain_dep_state() {
+        let state = make_state();
+        let result = handle_debug_chain_dep_state(&state);
+        match result {
+            QueryResult::DebugChainDepState { last_slot } => {
+                assert_eq!(last_slot, 0); // origin tip
+            }
+            _ => panic!("Expected DebugChainDepState"),
+        }
+    }
+
+    #[test]
+    fn test_reward_provenance() {
+        let state = make_state();
+        let result = handle_reward_provenance(&state);
+        match result {
+            QueryResult::RewardProvenance {
+                epoch,
+                total_rewards_pot,
+                treasury_tax,
+                active_stake,
+            } => {
+                assert_eq!(epoch, 42);
+                // reserves=10B, rho=3/1000 => pot=30M
+                assert_eq!(total_rewards_pot, 30_000_000);
+                // pot=30M, tau=2/10 => tax=6M
+                assert_eq!(treasury_tax, 6_000_000);
+                assert_eq!(active_stake, 1_000_000_000);
+            }
+            _ => panic!("Expected RewardProvenance"),
+        }
+    }
+
+    #[test]
+    fn test_reward_provenance_zero_reserves() {
+        let mut state = make_state();
+        state.reserves = 0;
+        let result = handle_reward_provenance(&state);
+        match result {
+            QueryResult::RewardProvenance {
+                total_rewards_pot,
+                treasury_tax,
+                ..
+            } => {
+                assert_eq!(total_rewards_pot, 0);
+                assert_eq!(treasury_tax, 0);
+            }
+            _ => panic!("Expected RewardProvenance"),
+        }
     }
 }
