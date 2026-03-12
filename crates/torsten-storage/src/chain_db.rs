@@ -822,6 +822,12 @@ impl ChainDB {
     /// whichever of `latest`, `previous`, or `latest_tmp` is still valid.
     pub fn persist(&mut self) -> Result<(), ChainDBError> {
         debug!("ChainDB: persisting snapshot");
+        // Compact all SSTables before saving to ensure the snapshot is
+        // self-contained. Without this, save_snapshot may produce a partial
+        // snapshot referencing SSTable runs from the original data directory
+        // that aren't included in the snapshot directory.
+        self.tree.compact_all()?;
+
         // Phase 1: Write new snapshot to temporary name
         let _ = self.tree.delete_snapshot("latest_tmp");
         self.tree.save_snapshot("latest_tmp", "torsten")?;

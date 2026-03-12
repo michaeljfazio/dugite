@@ -443,6 +443,10 @@ impl LsmImmutableDB {
     /// because cardano-lsm uses ephemeral writes.
     pub fn persist(&mut self) -> Result<(), LsmImmutableDBError> {
         debug!("ImmutableDB: persisting snapshot");
+        // Compact all SSTables before saving to ensure the snapshot is
+        // self-contained (not referencing SSTable runs from original dir).
+        self.tree.compact_all()?;
+
         // Phase 1: Write new snapshot to temporary name
         let _ = self.tree.delete_snapshot("latest_tmp");
         self.tree.save_snapshot("latest_tmp", "torsten")?;

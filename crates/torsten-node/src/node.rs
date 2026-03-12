@@ -2960,8 +2960,14 @@ impl Node {
                 // Persist ChainDB before ledger snapshot to ensure consistency
                 {
                     let mut db = self.chain_db.write().await;
-                    if let Err(e) = db.persist() {
-                        warn!(error = %e, "Failed to persist ChainDB at epoch transition");
+                    match db.persist() {
+                        Ok(()) => info!(
+                            epoch = current_epoch,
+                            "ChainDB persisted at epoch transition"
+                        ),
+                        Err(e) => {
+                            warn!(error = %e, "Failed to persist ChainDB at epoch transition")
+                        }
                     }
                 }
                 self.save_ledger_snapshot().await;
