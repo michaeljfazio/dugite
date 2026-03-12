@@ -265,4 +265,307 @@ mod tests {
             _ => panic!("Expected RatifyState"),
         }
     }
+
+    #[test]
+    fn test_constitution() {
+        let state = NodeStateSnapshot {
+            constitution_url: "https://example.com/constitution".to_string(),
+            constitution_hash: vec![0xAB; 32],
+            constitution_script: Some(vec![0xCD; 28]),
+            ..NodeStateSnapshot::default()
+        };
+        let result = handle_constitution(&state);
+        match result {
+            QueryResult::Constitution {
+                url,
+                data_hash,
+                script_hash,
+            } => {
+                assert_eq!(url, "https://example.com/constitution");
+                assert_eq!(data_hash, vec![0xAB; 32]);
+                assert_eq!(script_hash, Some(vec![0xCD; 28]));
+            }
+            _ => panic!("Expected Constitution"),
+        }
+    }
+
+    #[test]
+    fn test_constitution_no_script() {
+        let state = NodeStateSnapshot {
+            constitution_url: "https://example.com/c".to_string(),
+            constitution_hash: vec![0xAB; 32],
+            constitution_script: None,
+            ..NodeStateSnapshot::default()
+        };
+        let result = handle_constitution(&state);
+        match result {
+            QueryResult::Constitution { script_hash, .. } => {
+                assert!(script_hash.is_none());
+            }
+            _ => panic!("Expected Constitution"),
+        }
+    }
+
+    #[test]
+    fn test_gov_state() {
+        let state = make_state_with_proposals();
+        let result = handle_gov_state(&state);
+        match result {
+            QueryResult::GovState(gs) => {
+                assert_eq!(gs.proposals.len(), 2);
+                assert_eq!(gs.constitution_url, "");
+                // cur_pparams and prev_pparams should both be defaults
+                assert_eq!(gs.cur_pparams.min_fee_a, gs.prev_pparams.min_fee_a);
+            }
+            _ => panic!("Expected GovState"),
+        }
+    }
+
+    #[test]
+    fn test_gov_state_with_enacted_roots() {
+        let state = NodeStateSnapshot {
+            enacted_pparam_update: Some((vec![0xAA; 32], 0)),
+            enacted_hard_fork: Some((vec![0xBB; 32], 1)),
+            ..NodeStateSnapshot::default()
+        };
+        let result = handle_gov_state(&state);
+        match result {
+            QueryResult::GovState(gs) => {
+                assert_eq!(gs.enacted_pparam_update, Some((vec![0xAA; 32], 0)));
+                assert_eq!(gs.enacted_hard_fork, Some((vec![0xBB; 32], 1)));
+                assert!(gs.enacted_committee.is_none());
+                assert!(gs.enacted_constitution.is_none());
+            }
+            _ => panic!("Expected GovState"),
+        }
+    }
+
+    #[test]
+    fn test_drep_state_no_filter() {
+        use crate::query_handler::types::DRepSnapshot;
+        let state = NodeStateSnapshot {
+            drep_entries: vec![
+                DRepSnapshot {
+                    credential_hash: vec![0xAA; 28],
+                    credential_type: 0,
+                    deposit: 500_000_000,
+                    anchor_url: Some("https://example.com".to_string()),
+                    anchor_hash: Some(vec![0xBB; 32]),
+                    expiry_epoch: 200,
+                    delegator_hashes: vec![],
+                },
+                DRepSnapshot {
+                    credential_hash: vec![0xCC; 28],
+                    credential_type: 1,
+                    deposit: 500_000_000,
+                    anchor_url: None,
+                    anchor_hash: None,
+                    expiry_epoch: 300,
+                    delegator_hashes: vec![vec![0xDD; 28]],
+                },
+            ],
+            ..NodeStateSnapshot::default()
+        };
+        // Empty filter = return all
+        let cbor = {
+            let mut buf = Vec::new();
+            let mut enc = minicbor::Encoder::new(&mut buf);
+            enc.tag(minicbor::data::Tag::new(258)).ok();
+            enc.array(0).ok();
+            buf
+        };
+        let mut dec = minicbor::Decoder::new(&cbor);
+        let result = handle_drep_state(&state, &mut dec);
+        match result {
+            QueryResult::DRepState(dreps) => {
+                assert_eq!(dreps.len(), 2);
+            }
+            _ => panic!("Expected DRepState"),
+        }
+    }
+
+    #[test]
+    fn test_drep_state_filtered() {
+        use crate::query_handler::types::DRepSnapshot;
+        let state = NodeStateSnapshot {
+            drep_entries: vec![
+                DRepSnapshot {
+                    credential_hash: vec![0xAA; 28],
+                    credential_type: 0,
+                    deposit: 500_000_000,
+                    anchor_url: None,
+                    anchor_hash: None,
+                    expiry_epoch: 200,
+                    delegator_hashes: vec![],
+                },
+                DRepSnapshot {
+                    credential_hash: vec![0xCC; 28],
+                    credential_type: 0,
+                    deposit: 500_000_000,
+                    anchor_url: None,
+                    anchor_hash: None,
+                    expiry_epoch: 300,
+                    delegator_hashes: vec![],
+                },
+            ],
+            ..NodeStateSnapshot::default()
+        };
+        // Filter for credential 0xAA only
+        let cbor = {
+            let mut buf = Vec::new();
+            let mut enc = minicbor::Encoder::new(&mut buf);
+            enc.tag(minicbor::data::Tag::new(258)).ok();
+            enc.array(1).ok();
+            enc.array(2).ok();
+            enc.u8(0).ok(); // KeyHash
+            enc.bytes(&[0xAA; 28]).ok();
+            buf
+        };
+        let mut dec = minicbor::Decoder::new(&cbor);
+        let result = handle_drep_state(&state, &mut dec);
+        match result {
+            QueryResult::DRepState(dreps) => {
+                assert_eq!(dreps.len(), 1);
+                assert_eq!(dreps[0].credential_hash, vec![0xAA; 28]);
+            }
+            _ => panic!("Expected DRepState"),
+        }
+    }
+
+    #[test]
+    fn test_committee_state() {
+        use crate::query_handler::types::{CommitteeMemberSnapshot, CommitteeSnapshot};
+        let state = NodeStateSnapshot {
+            committee: CommitteeSnapshot {
+                members: vec![CommitteeMemberSnapshot {
+                    cold_credential: vec![0xAA; 28],
+                    cold_credential_type: 0,
+                    hot_status: 0,
+                    hot_credential: Some(vec![0xBB; 28]),
+                    member_status: 0,
+                    expiry_epoch: Some(500),
+                }],
+                threshold: Some((2, 3)),
+                current_epoch: 42,
+            },
+            ..NodeStateSnapshot::default()
+        };
+        let result = handle_committee_state(&state);
+        match result {
+            QueryResult::CommitteeState(committee) => {
+                assert_eq!(committee.members.len(), 1);
+                assert_eq!(committee.threshold, Some((2, 3)));
+                assert_eq!(committee.current_epoch, 42);
+            }
+            _ => panic!("Expected CommitteeState"),
+        }
+    }
+
+    #[test]
+    fn test_drep_stake_distr() {
+        use crate::query_handler::types::DRepStakeEntry;
+        let state = NodeStateSnapshot {
+            drep_stake_distr: vec![
+                DRepStakeEntry {
+                    drep_type: 0,
+                    drep_hash: Some(vec![0xAA; 28]),
+                    stake: 1_000_000_000,
+                },
+                DRepStakeEntry {
+                    drep_type: 2, // AlwaysAbstain
+                    drep_hash: None,
+                    stake: 500_000_000,
+                },
+            ],
+            ..NodeStateSnapshot::default()
+        };
+        let result = handle_drep_stake_distr(&state);
+        match result {
+            QueryResult::DRepStakeDistr(entries) => {
+                assert_eq!(entries.len(), 2);
+                assert_eq!(entries[0].stake, 1_000_000_000);
+                assert_eq!(entries[1].drep_type, 2);
+            }
+            _ => panic!("Expected DRepStakeDistr"),
+        }
+    }
+
+    #[test]
+    fn test_filtered_vote_delegatees_no_filter() {
+        use crate::query_handler::types::VoteDelegateeEntry;
+        let state = NodeStateSnapshot {
+            vote_delegatees: vec![
+                VoteDelegateeEntry {
+                    credential_hash: vec![0xAA; 28],
+                    credential_type: 0,
+                    drep_type: 0,
+                    drep_hash: Some(vec![0xBB; 28]),
+                },
+                VoteDelegateeEntry {
+                    credential_hash: vec![0xCC; 28],
+                    credential_type: 0,
+                    drep_type: 2, // AlwaysAbstain
+                    drep_hash: None,
+                },
+            ],
+            ..NodeStateSnapshot::default()
+        };
+        let cbor = {
+            let mut buf = Vec::new();
+            let mut enc = minicbor::Encoder::new(&mut buf);
+            enc.tag(minicbor::data::Tag::new(258)).ok();
+            enc.array(0).ok();
+            buf
+        };
+        let mut dec = minicbor::Decoder::new(&cbor);
+        let result = handle_filtered_vote_delegatees(&state, &mut dec);
+        match result {
+            QueryResult::FilteredVoteDelegatees(entries) => {
+                assert_eq!(entries.len(), 2);
+            }
+            _ => panic!("Expected FilteredVoteDelegatees"),
+        }
+    }
+
+    #[test]
+    fn test_filtered_vote_delegatees_filtered() {
+        use crate::query_handler::types::VoteDelegateeEntry;
+        let state = NodeStateSnapshot {
+            vote_delegatees: vec![
+                VoteDelegateeEntry {
+                    credential_hash: vec![0xAA; 28],
+                    credential_type: 0,
+                    drep_type: 0,
+                    drep_hash: Some(vec![0xBB; 28]),
+                },
+                VoteDelegateeEntry {
+                    credential_hash: vec![0xCC; 28],
+                    credential_type: 0,
+                    drep_type: 2,
+                    drep_hash: None,
+                },
+            ],
+            ..NodeStateSnapshot::default()
+        };
+        let cbor = {
+            let mut buf = Vec::new();
+            let mut enc = minicbor::Encoder::new(&mut buf);
+            enc.tag(minicbor::data::Tag::new(258)).ok();
+            enc.array(1).ok();
+            enc.array(2).ok();
+            enc.u8(0).ok();
+            enc.bytes(&[0xCC; 28]).ok();
+            buf
+        };
+        let mut dec = minicbor::Decoder::new(&cbor);
+        let result = handle_filtered_vote_delegatees(&state, &mut dec);
+        match result {
+            QueryResult::FilteredVoteDelegatees(entries) => {
+                assert_eq!(entries.len(), 1);
+                assert_eq!(entries[0].credential_hash, vec![0xCC; 28]);
+                assert_eq!(entries[0].drep_type, 2);
+            }
+            _ => panic!("Expected FilteredVoteDelegatees"),
+        }
+    }
 }

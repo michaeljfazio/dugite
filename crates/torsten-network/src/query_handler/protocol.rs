@@ -339,4 +339,212 @@ mod tests {
             _ => panic!("Expected RewardProvenance"),
         }
     }
+
+    #[test]
+    fn test_current_pparams() {
+        let state = make_state();
+        let result = handle_current_pparams(&state);
+        match result {
+            QueryResult::ProtocolParams(pp) => {
+                assert_eq!(pp.rho_num, 3);
+                assert_eq!(pp.rho_den, 1000);
+            }
+            _ => panic!("Expected ProtocolParams"),
+        }
+    }
+
+    #[test]
+    fn test_proposed_pparams_updates() {
+        let result = handle_proposed_pparams_updates();
+        assert!(matches!(result, QueryResult::ProposedPParamsUpdates));
+    }
+
+    #[test]
+    fn test_stake_distribution() {
+        let state = make_state();
+        let result = handle_stake_distribution(&state);
+        match result {
+            QueryResult::StakeDistribution(pools) => {
+                assert_eq!(pools.len(), 2);
+                assert_eq!(pools[0].stake, 500_000_000);
+            }
+            _ => panic!("Expected StakeDistribution"),
+        }
+    }
+
+    #[test]
+    fn test_account_state() {
+        let state = make_state();
+        let result = handle_account_state(&state);
+        match result {
+            QueryResult::AccountState { treasury, reserves } => {
+                assert_eq!(treasury, 1_000_000_000);
+                assert_eq!(reserves, 10_000_000_000);
+            }
+            _ => panic!("Expected AccountState"),
+        }
+    }
+
+    #[test]
+    fn test_genesis_config_from_snapshot() {
+        use crate::query_handler::types::GenesisConfigSnapshot;
+        let state = NodeStateSnapshot {
+            genesis_config: Some(GenesisConfigSnapshot {
+                system_start: "2022-04-01T00:00:00Z".to_string(),
+                network_magic: 2,
+                network_id: 0,
+                active_slots_coeff_num: 1,
+                active_slots_coeff_den: 20,
+                security_param: 2160,
+                epoch_length: 86400,
+                slots_per_kes_period: 129600,
+                max_kes_evolutions: 62,
+                slot_length_micros: 1_000_000,
+                update_quorum: 5,
+                max_lovelace_supply: 45_000_000_000_000_000,
+                protocol_params: crate::query_handler::types::ShelleyPParamsSnapshot {
+                    min_fee_a: 44,
+                    min_fee_b: 155381,
+                    max_block_body_size: 90112,
+                    max_tx_size: 16384,
+                    max_block_header_size: 1100,
+                    key_deposit: 2_000_000,
+                    pool_deposit: 500_000_000,
+                    e_max: 18,
+                    n_opt: 500,
+                    a0_num: 3,
+                    a0_den: 10,
+                    rho_num: 3,
+                    rho_den: 1000,
+                    tau_num: 2,
+                    tau_den: 10,
+                    d_num: 0,
+                    d_den: 1,
+                    protocol_version_major: 9,
+                    protocol_version_minor: 0,
+                    min_utxo_value: 0,
+                    min_pool_cost: 170_000_000,
+                },
+                gen_delegs: Vec::new(),
+            }),
+            ..NodeStateSnapshot::default()
+        };
+        let result = handle_genesis_config(&state);
+        match result {
+            QueryResult::GenesisConfig(gc) => {
+                assert_eq!(gc.network_magic, 2);
+                assert_eq!(gc.network_id, 0);
+                assert_eq!(gc.epoch_length, 86400);
+            }
+            _ => panic!("Expected GenesisConfig"),
+        }
+    }
+
+    #[test]
+    fn test_genesis_config_fallback() {
+        // No genesis_config set — should use fallback from state fields
+        let state = NodeStateSnapshot {
+            system_start: "2022-04-01T00:00:00Z".to_string(),
+            network_magic: 2,
+            epoch_length: 86400,
+            security_param: 2160,
+            ..NodeStateSnapshot::default()
+        };
+        let result = handle_genesis_config(&state);
+        match result {
+            QueryResult::GenesisConfig(gc) => {
+                assert_eq!(gc.network_magic, 2);
+                assert_eq!(gc.network_id, 0); // non-mainnet magic → testnet
+                assert_eq!(gc.epoch_length, 86400);
+            }
+            _ => panic!("Expected GenesisConfig"),
+        }
+    }
+
+    #[test]
+    fn test_genesis_config_mainnet_network_id() {
+        let state = NodeStateSnapshot {
+            network_magic: 764824073, // mainnet
+            ..NodeStateSnapshot::default()
+        };
+        let result = handle_genesis_config(&state);
+        match result {
+            QueryResult::GenesisConfig(gc) => {
+                assert_eq!(gc.network_id, 1); // mainnet = 1
+            }
+            _ => panic!("Expected GenesisConfig"),
+        }
+    }
+
+    #[test]
+    fn test_non_myopic_rewards() {
+        use crate::query_handler::types::PoolParamsSnapshot;
+        let state = NodeStateSnapshot {
+            reserves: 10_000_000_000,
+            stake_pools: vec![
+                StakePoolSnapshot {
+                    pool_id: vec![1u8; 28],
+                    stake: 500_000_000,
+                    vrf_keyhash: vec![0u8; 32],
+                    total_active_stake: 1_000_000_000,
+                },
+                StakePoolSnapshot {
+                    pool_id: vec![2u8; 28],
+                    stake: 500_000_000,
+                    vrf_keyhash: vec![0u8; 32],
+                    total_active_stake: 1_000_000_000,
+                },
+            ],
+            pool_params_entries: vec![PoolParamsSnapshot {
+                pool_id: vec![1u8; 28],
+                vrf_keyhash: vec![0u8; 32],
+                pledge: 100_000_000,
+                cost: 340_000_000,
+                margin_num: 1,
+                margin_den: 100,
+                reward_account: vec![0u8; 29],
+                owners: vec![],
+                relays: vec![],
+                metadata_url: None,
+                metadata_hash: None,
+            }],
+            protocol_params: ProtocolParamsSnapshot::default(),
+            ..NodeStateSnapshot::default()
+        };
+        // Encode amounts array
+        let mut buf = Vec::new();
+        let mut enc = minicbor::Encoder::new(&mut buf);
+        enc.array(1).ok();
+        enc.u64(1_000_000_000).ok();
+        let mut dec = minicbor::Decoder::new(&buf);
+
+        let result = handle_non_myopic_rewards(&state, &mut dec);
+        match result {
+            QueryResult::NonMyopicMemberRewards(entries) => {
+                assert_eq!(entries.len(), 1);
+                assert_eq!(entries[0].stake_amount, 1_000_000_000);
+                assert!(!entries[0].pool_rewards.is_empty());
+            }
+            _ => panic!("Expected NonMyopicMemberRewards"),
+        }
+    }
+
+    #[test]
+    fn test_non_myopic_rewards_empty_amounts_uses_default() {
+        let state = make_state();
+        // Empty amounts array
+        let mut buf = Vec::new();
+        minicbor::Encoder::new(&mut buf).array(0).ok();
+        let mut dec = minicbor::Decoder::new(&buf);
+
+        let result = handle_non_myopic_rewards(&state, &mut dec);
+        match result {
+            QueryResult::NonMyopicMemberRewards(entries) => {
+                assert_eq!(entries.len(), 1);
+                // Default stake amount is 1 trillion lovelace
+                assert_eq!(entries[0].stake_amount, 1_000_000_000_000);
+            }
+            _ => panic!("Expected NonMyopicMemberRewards"),
+        }
+    }
 }
