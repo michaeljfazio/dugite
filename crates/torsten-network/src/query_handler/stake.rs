@@ -60,8 +60,9 @@ pub(crate) fn handle_stake_pool_params(
     }
 }
 
-/// Handle GetPoolState (tag 19) -- returns pool params (same data as tag 17).
+/// Handle GetPoolState (tag 19) -- returns QueryPoolStateResult.
 ///
+/// Wire format: array(4) [poolParams_map, futurePoolParams_map, retiring_map, deposits_map]
 /// Argument: tag(258) Set<KeyHash StakePool>
 pub(crate) fn handle_pool_state(
     state: &NodeStateSnapshot,
@@ -69,16 +70,39 @@ pub(crate) fn handle_pool_state(
 ) -> QueryResult {
     debug!("Query: GetPoolState");
     let filter_pools = parse_pool_id_set(decoder);
-    if filter_pools.is_empty() {
-        QueryResult::PoolParams(state.pool_params_entries.clone())
+
+    let pool_params = if filter_pools.is_empty() {
+        state.pool_params_entries.clone()
     } else {
-        let filtered = state
+        state
             .pool_params_entries
             .iter()
             .filter(|p| filter_pools.iter().any(|h| h == &p.pool_id))
             .cloned()
-            .collect();
-        QueryResult::PoolParams(filtered)
+            .collect()
+    };
+
+    // Build retiring map: flatten pending_retirements into (pool_id, epoch) pairs
+    let mut retiring = Vec::new();
+    for (epoch, pools) in &state.pending_retirements {
+        for pool_id in pools {
+            if filter_pools.is_empty() || filter_pools.iter().any(|h| h == pool_id) {
+                retiring.push((pool_id.clone(), *epoch));
+            }
+        }
+    }
+
+    // Build deposits map: each registered pool has pool_deposit
+    let deposits: Vec<(Vec<u8>, u64)> = pool_params
+        .iter()
+        .map(|p| (p.pool_id.clone(), state.pool_deposit))
+        .collect();
+
+    QueryResult::PoolState {
+        pool_params,
+        future_pool_params: Vec::new(), // No future params tracking yet
+        retiring,
+        deposits,
     }
 }
 

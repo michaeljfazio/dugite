@@ -923,13 +923,22 @@ mod tests {
             ..Default::default()
         });
 
-        // Tag 19: GetPoolState returns same format as PoolParams
+        // Tag 19: GetPoolState returns QueryPoolStateResult (4 parallel maps)
         match query(&handler, 19) {
-            QueryResult::PoolParams(params) => {
-                assert_eq!(params.len(), 1);
-                assert_eq!(params[0].pool_id, vec![0xcc; 28]);
+            QueryResult::PoolState {
+                pool_params,
+                future_pool_params,
+                retiring,
+                deposits,
+            } => {
+                assert_eq!(pool_params.len(), 1);
+                assert_eq!(pool_params[0].pool_id, vec![0xcc; 28]);
+                assert!(future_pool_params.is_empty());
+                assert!(retiring.is_empty());
+                assert_eq!(deposits.len(), 1);
+                assert_eq!(deposits[0].0, vec![0xcc; 28]);
             }
-            other => panic!("Expected PoolParams, got {other:?}"),
+            other => panic!("Expected PoolState, got {other:?}"),
         }
     }
 

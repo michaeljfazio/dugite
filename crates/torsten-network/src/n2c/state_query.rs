@@ -475,6 +475,49 @@ fn encode_relay_cbor(
     }
 }
 
+/// Encode a Map<pool_hash(28), PoolParams> for pool state queries.
+fn encode_pool_params_map(
+    enc: &mut minicbor::Encoder<&mut Vec<u8>>,
+    params: &[crate::query_handler::PoolParamsSnapshot],
+) {
+    enc.map(params.len() as u64).ok();
+    for pool in params {
+        enc.bytes(&pool.pool_id).ok();
+        enc.array(9).ok();
+        enc.bytes(&pool.pool_id).ok(); // operator
+        enc.bytes(&pool.vrf_keyhash).ok();
+        enc.u64(pool.pledge).ok();
+        enc.u64(pool.cost).ok();
+        encode_tagged_rational(enc, pool.margin_num, pool.margin_den);
+        enc.bytes(&pool.reward_account).ok();
+        // owners as tag(258) set — sorted for canonical CBOR
+        let mut sorted_owners = pool.owners.clone();
+        sorted_owners.sort();
+        enc.tag(minicbor::data::Tag::new(258)).ok();
+        enc.array(sorted_owners.len() as u64).ok();
+        for owner in &sorted_owners {
+            enc.bytes(owner).ok();
+        }
+        // relays
+        enc.array(pool.relays.len() as u64).ok();
+        for relay in &pool.relays {
+            encode_relay_cbor(enc, relay);
+        }
+        // metadata
+        if let Some(url) = &pool.metadata_url {
+            enc.array(2).ok();
+            enc.str(url).ok();
+            if let Some(hash) = &pool.metadata_hash {
+                enc.bytes(hash).ok();
+            } else {
+                enc.bytes(&[0u8; 32]).ok();
+            }
+        } else {
+            enc.null().ok();
+        }
+    }
+}
+
 /// Parse an ISO-8601 UTC timestamp to (year, dayOfYear, picosecondsOfDay).
 /// Input format: "2022-04-01T00:00:00Z" or similar.
 fn parse_utctime(s: &str) -> (u64, u64, u64) {
@@ -974,53 +1017,31 @@ fn encode_query_result_value(enc: &mut minicbor::Encoder<&mut Vec<u8>>, result: 
             }
         }
         QueryResult::PoolParams(params) => {
-            // Wire format: Map<pool_hash(28), PoolParams>
-            // PoolParams is a CDDL record (positional fields, no array wrapper):
-            //   operator(hash28), vrf_keyhash(hash32), pledge(coin), cost(coin),
-            //   margin(unit_interval), reward_account(bytes), owners(set<hash28>),
-            //   relays([*relay]), metadata(nullable [url, hash])
-            enc.map(params.len() as u64).ok();
-            for pool in params {
-                // Key: pool hash
-                enc.bytes(&pool.pool_id).ok();
-                // Value: positional PoolParams fields (9 items, NOT wrapped in array)
-                // Per CDDL: pool_params = (operator, vrf_keyhash, pledge, cost, margin,
-                //            reward_account, pool_owners, relays, pool_metadata)
-                // When used as a map value in GetStakePoolParams result, each value
-                // is encoded as a 9-element array.
-                enc.array(9).ok();
-                enc.bytes(&pool.pool_id).ok(); // operator
-                enc.bytes(&pool.vrf_keyhash).ok();
-                enc.u64(pool.pledge).ok();
-                enc.u64(pool.cost).ok();
-                // margin as tagged rational
-                encode_tagged_rational(enc, pool.margin_num, pool.margin_den);
-                enc.bytes(&pool.reward_account).ok();
-                // owners as set (tag 258) — must be sorted for canonical CBOR
-                let mut sorted_owners = pool.owners.clone();
-                sorted_owners.sort();
-                enc.tag(minicbor::data::Tag::new(258)).ok();
-                enc.array(sorted_owners.len() as u64).ok();
-                for owner in &sorted_owners {
-                    enc.bytes(owner).ok();
-                }
-                // relays
-                enc.array(pool.relays.len() as u64).ok();
-                for relay in &pool.relays {
-                    encode_relay_cbor(enc, relay);
-                }
-                // metadata
-                if let Some(url) = &pool.metadata_url {
-                    enc.array(2).ok();
-                    enc.str(url).ok();
-                    if let Some(hash) = &pool.metadata_hash {
-                        enc.bytes(hash).ok();
-                    } else {
-                        enc.bytes(&[0u8; 32]).ok();
-                    }
-                } else {
-                    enc.null().ok();
-                }
+            encode_pool_params_map(enc, params);
+        }
+        QueryResult::PoolState {
+            pool_params,
+            future_pool_params,
+            retiring,
+            deposits,
+        } => {
+            // QueryPoolStateResult: array(4) [poolParams, futurePoolParams, retiring, deposits]
+            enc.array(4).ok();
+            // Map 0: current pool params
+            encode_pool_params_map(enc, pool_params);
+            // Map 1: future pool params
+            encode_pool_params_map(enc, future_pool_params);
+            // Map 2: retiring pools -> epoch
+            enc.map(retiring.len() as u64).ok();
+            for (pool_id, epoch) in retiring {
+                enc.bytes(pool_id).ok();
+                enc.u64(*epoch).ok();
+            }
+            // Map 3: deposits
+            enc.map(deposits.len() as u64).ok();
+            for (pool_id, coin) in deposits {
+                enc.bytes(pool_id).ok();
+                enc.u64(*coin).ok();
             }
         }
         QueryResult::AccountState { treasury, reserves } => {

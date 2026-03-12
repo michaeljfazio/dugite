@@ -85,6 +85,18 @@ pub enum QueryResult {
     },
     /// GetRewardInfoPools (tag 18): per-pool reward info
     RewardInfoPools(Vec<PoolRewardInfo>),
+    /// GetPoolState (tag 19): QueryPoolStateResult
+    /// array(4) [poolParams_map, futurePoolParams_map, retiring_map, deposits_map]
+    PoolState {
+        /// Current pool params: Map<pool_hash, PoolParams>
+        pool_params: Vec<PoolParamsSnapshot>,
+        /// Future pool params (pending re-registration): Map<pool_hash, PoolParams>
+        future_pool_params: Vec<PoolParamsSnapshot>,
+        /// Retiring pools: Map<pool_hash, EpochNo>
+        retiring: Vec<(Vec<u8>, u64)>,
+        /// Pool deposits: Map<pool_hash, Coin>
+        deposits: Vec<(Vec<u8>, u64)>,
+    },
     /// GetProposals (tag 31): returns empty Seq for now
     EmptyProposals,
     /// GetRatifyState (tag 32): stub
@@ -607,6 +619,10 @@ pub struct NodeStateSnapshot {
     pub stake_snapshots: StakeSnapshotsResult,
     /// Pool parameters for pool-params queries
     pub pool_params_entries: Vec<PoolParamsSnapshot>,
+    /// Pending pool retirements: Map<EpochNo, Vec<pool_hash>>
+    pub pending_retirements: Vec<(u64, Vec<Vec<u8>>)>,
+    /// Pool deposit amount (protocol parameter)
+    pub pool_deposit: u64,
     /// Epoch length in slots (for era history query)
     pub epoch_length: u64,
     /// Slot length in seconds (for era history query)
@@ -668,6 +684,8 @@ impl Default for NodeStateSnapshot {
             stake_addresses: Vec::new(),
             stake_snapshots: StakeSnapshotsResult::default(),
             pool_params_entries: Vec::new(),
+            pending_retirements: Vec::new(),
+            pool_deposit: 500_000_000,
             epoch_length: 432000,     // Mainnet default
             slot_length_secs: 1,      // Shelley slot length
             network_magic: 764824073, // Mainnet magic

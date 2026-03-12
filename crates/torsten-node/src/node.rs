@@ -3525,6 +3525,14 @@ impl Node {
             stake_addresses,
             stake_snapshots,
             pool_params_entries,
+            pending_retirements: ls
+                .pending_retirements
+                .iter()
+                .map(|(epoch, pools)| {
+                    (epoch.0, pools.iter().map(|h| h.as_ref().to_vec()).collect())
+                })
+                .collect(),
+            pool_deposit: ls.protocol_params.pool_deposit.0,
             epoch_length: ls.epoch_length,
             slot_length_secs: self.shelley_genesis.as_ref().map_or(1, |g| g.slot_length),
             network_magic: self.network_magic as u32,
