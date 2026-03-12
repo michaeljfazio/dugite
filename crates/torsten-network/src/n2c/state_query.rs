@@ -1988,6 +1988,70 @@ mod tests {
     }
 
     #[test]
+    fn test_encode_ratify_state_with_data() {
+        let enacted_proposal = ProposalSnapshot {
+            tx_id: vec![0x11; 32],
+            action_index: 0,
+            action_type: "InfoAction".to_string(),
+            proposed_epoch: 100,
+            expires_epoch: 106,
+            yes_votes: 5,
+            no_votes: 1,
+            abstain_votes: 0,
+            deposit: 100_000_000_000,
+            return_addr: vec![0x00; 29],
+            anchor_url: "https://example.com".to_string(),
+            anchor_hash: vec![0xAA; 32],
+            committee_votes: vec![],
+            drep_votes: vec![],
+            spo_votes: vec![],
+        };
+        let enacted_id = GovActionId {
+            tx_id: vec![0x11; 32],
+            action_index: 0,
+        };
+        let expired_id = GovActionId {
+            tx_id: vec![0x22; 32],
+            action_index: 3,
+        };
+        let buf = encode(&QueryResult::RatifyState {
+            enacted: vec![(enacted_proposal, enacted_id)],
+            expired: vec![expired_id],
+            delayed: true,
+        });
+        let mut dec = decode_msg_result(&buf);
+        strip_hfc(&mut dec);
+        let arr = dec.array().unwrap().unwrap();
+        assert_eq!(arr, 4, "RatifyState must be array(4)");
+        // enacted: array(1) of (GovActionState, GovActionId)
+        let enacted_len = dec.array().unwrap().unwrap();
+        assert_eq!(enacted_len, 1);
+        // Each entry is array(2) [GovActionState, GovActionId]
+        let pair = dec.array().unwrap().unwrap();
+        assert_eq!(pair, 2);
+        // Skip GovActionState (complex)
+        dec.skip().unwrap();
+        // GovActionId = array(2) [tx_hash, index]
+        let gaid = dec.array().unwrap().unwrap();
+        assert_eq!(gaid, 2);
+        assert_eq!(dec.bytes().unwrap(), &[0x11; 32]);
+        assert_eq!(dec.u32().unwrap(), 0);
+        // expired: array(1) of GovActionId
+        let expired_len = dec.array().unwrap().unwrap();
+        assert_eq!(expired_len, 1);
+        let gaid2 = dec.array().unwrap().unwrap();
+        assert_eq!(gaid2, 2);
+        assert_eq!(dec.bytes().unwrap(), &[0x22; 32]);
+        assert_eq!(dec.u32().unwrap(), 3);
+        // delayed = true
+        assert!(dec.bool().unwrap());
+        // future_pparams: NoPParamsUpdate [0]
+        let fp = dec.array().unwrap().unwrap();
+        assert_eq!(fp, 1);
+        assert_eq!(dec.u32().unwrap(), 0);
+    }
+
+    #[test]
     fn test_encode_stake_deleg_deposits() {
         let buf = encode(&QueryResult::StakeDelegDeposits(vec![
             StakeDelegDepositEntry {
@@ -2129,6 +2193,75 @@ mod tests {
         // GovActionState: array(7)
         let gas_arr = dec.array().unwrap().unwrap();
         assert_eq!(gas_arr, 7, "GovActionState must be array(7)");
+    }
+
+    #[test]
+    fn test_encode_pool_distr2() {
+        let buf = encode(&QueryResult::PoolDistr2 {
+            pools: vec![StakePoolSnapshot {
+                pool_id: vec![0xAA; 28],
+                stake: 500_000_000,
+                vrf_keyhash: vec![0xBB; 32],
+                total_active_stake: 1_000_000_000,
+            }],
+            total_active_stake: 1_000_000_000,
+        });
+        let mut dec = decode_msg_result(&buf);
+        strip_hfc(&mut dec);
+        // SL.PoolDistr: array(2) [pool_map, total_active_stake]
+        let arr = dec.array().unwrap().unwrap();
+        assert_eq!(arr, 2);
+        let map_len = dec.map().unwrap().unwrap();
+        assert_eq!(map_len, 1);
+        // pool_id
+        assert_eq!(dec.bytes().unwrap(), &[0xAA; 28]);
+        // IndividualPoolStake: array(3) [rational, compact_lovelace, vrf_hash]
+        let pool_arr = dec.array().unwrap().unwrap();
+        assert_eq!(pool_arr, 3);
+        // rational (tagged)
+        dec.skip().unwrap();
+        // compact lovelace
+        assert_eq!(dec.u64().unwrap(), 500_000_000);
+        // VRF hash
+        assert_eq!(dec.bytes().unwrap(), &[0xBB; 32]);
+        // total_active_stake
+        assert_eq!(dec.u64().unwrap(), 1_000_000_000);
+    }
+
+    #[test]
+    fn test_encode_max_major_protocol_version() {
+        let buf = encode(&QueryResult::MaxMajorProtocolVersion(10));
+        let mut dec = decode_msg_result(&buf);
+        strip_hfc(&mut dec);
+        assert_eq!(dec.u32().unwrap(), 10);
+    }
+
+    #[test]
+    fn test_encode_ledger_peer_snapshot_empty() {
+        let buf = encode(&QueryResult::LedgerPeerSnapshot(vec![]));
+        let mut dec = decode_msg_result(&buf);
+        strip_hfc(&mut dec);
+        // LedgerPeerSnapshot: array(2) [version, array(2) [WithOrigin, pools]]
+        let arr = dec.array().unwrap().unwrap();
+        assert_eq!(arr, 2);
+        assert_eq!(dec.u32().unwrap(), 1); // version 1
+        let inner = dec.array().unwrap().unwrap();
+        assert_eq!(inner, 2);
+        // WithOrigin: Origin = [0]
+        let wo = dec.array().unwrap().unwrap();
+        assert_eq!(wo, 1);
+        assert_eq!(dec.u32().unwrap(), 0);
+    }
+
+    #[test]
+    fn test_encode_no_future_pparams() {
+        let buf = encode(&QueryResult::NoFuturePParams);
+        let mut dec = decode_msg_result(&buf);
+        strip_hfc(&mut dec);
+        // Maybe PParams = Nothing = [0]
+        let arr = dec.array().unwrap().unwrap();
+        assert_eq!(arr, 1);
+        assert_eq!(dec.u8().unwrap(), 0);
     }
 
     #[test]
