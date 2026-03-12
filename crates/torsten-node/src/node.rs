@@ -2638,7 +2638,10 @@ impl Node {
                                                 }
                                                 self.update_query_state().await;
                                             }
-                                            ChainSyncEvent::RollForward(..) => unreachable!(),
+                                            ChainSyncEvent::RollForward(..) => {
+                                                warn!("Unexpected RollForward in other_events, skipping");
+                                                continue;
+                                            }
                                         }
                                     }
                                 }

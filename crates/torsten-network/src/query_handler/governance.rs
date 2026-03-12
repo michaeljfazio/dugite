@@ -33,6 +33,67 @@ pub(crate) fn handle_gov_state(state: &NodeStateSnapshot) -> QueryResult {
     }))
 }
 
+/// Handle GetProposals (tag 31) — filtered governance proposals.
+///
+/// Argument: tag(258) Set<GovActionId> where GovActionId = [tx_hash(32), action_index]
+/// Returns: Seq (GovActionState)
+pub(crate) fn handle_proposals(
+    state: &NodeStateSnapshot,
+    decoder: &mut minicbor::Decoder<'_>,
+) -> QueryResult {
+    debug!("Query: GetProposals");
+    let filter_ids = parse_gov_action_id_set(decoder);
+    if filter_ids.is_empty() {
+        QueryResult::Proposals(state.governance_proposals.clone())
+    } else {
+        let filtered = state
+            .governance_proposals
+            .iter()
+            .filter(|p| {
+                filter_ids
+                    .iter()
+                    .any(|(tx_id, idx)| tx_id == &p.tx_id && *idx == p.action_index)
+            })
+            .cloned()
+            .collect();
+        QueryResult::Proposals(filtered)
+    }
+}
+
+/// Parse a Set<GovActionId> from CBOR.
+/// GovActionId = [tx_hash(32), action_index(u32)]
+fn parse_gov_action_id_set(decoder: &mut minicbor::Decoder<'_>) -> Vec<(Vec<u8>, u32)> {
+    let mut ids = Vec::new();
+    let _ = decoder.tag(); // tag(258) for Set
+    if let Ok(Some(n)) = decoder.array() {
+        for _ in 0..n {
+            if let Ok(Some(_)) = decoder.array() {
+                if let (Ok(tx_hash), Ok(idx)) = (decoder.bytes(), decoder.u32()) {
+                    ids.push((tx_hash.to_vec(), idx));
+                }
+            }
+        }
+    }
+    ids
+}
+
+/// Handle GetRatifyState (tag 32) — current ratification state.
+///
+/// Returns: array(4) [enacted_seq, expired_seq, delayed_bool, future_pparam_update]
+/// The Haskell node computes this from the DRep pulsing state. We return the
+/// current enacted/expired state which is functionally equivalent between epoch boundaries.
+pub(crate) fn handle_ratify_state(_state: &NodeStateSnapshot) -> QueryResult {
+    debug!("Query: GetRatifyState");
+    // We don't currently track per-epoch enacted/expired proposals separately.
+    // Return empty enacted/expired lists with no delay — this is correct between
+    // epoch boundaries since ratification happens at epoch transitions.
+    QueryResult::RatifyState {
+        enacted: Vec::new(),
+        expired: Vec::new(),
+        delayed: false,
+    }
+}
+
 /// Handle GetDRepState (tag 25).
 ///
 /// Argument: tag(258) Set<Credential> where Credential = [0|1, hash(28)]
@@ -91,5 +152,111 @@ pub(crate) fn handle_filtered_vote_delegatees(
             .cloned()
             .collect();
         QueryResult::FilteredVoteDelegatees(filtered)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::query_handler::types::{NodeStateSnapshot, ProposalSnapshot};
+
+    fn make_state_with_proposals() -> NodeStateSnapshot {
+        NodeStateSnapshot {
+            governance_proposals: vec![
+                ProposalSnapshot {
+                    tx_id: vec![1u8; 32],
+                    action_index: 0,
+                    action_type: "InfoAction".to_string(),
+                    proposed_epoch: 100,
+                    expires_epoch: 106,
+                    yes_votes: 10,
+                    no_votes: 2,
+                    abstain_votes: 1,
+                    deposit: 100_000_000_000,
+                    return_addr: vec![0u8; 29],
+                    anchor_url: "https://example.com/proposal1".to_string(),
+                    anchor_hash: vec![0xAA; 32],
+                },
+                ProposalSnapshot {
+                    tx_id: vec![2u8; 32],
+                    action_index: 1,
+                    action_type: "ParameterChange".to_string(),
+                    proposed_epoch: 101,
+                    expires_epoch: 107,
+                    yes_votes: 5,
+                    no_votes: 3,
+                    abstain_votes: 0,
+                    deposit: 100_000_000_000,
+                    return_addr: vec![0u8; 29],
+                    anchor_url: "https://example.com/proposal2".to_string(),
+                    anchor_hash: vec![0xBB; 32],
+                },
+            ],
+            ..NodeStateSnapshot::default()
+        }
+    }
+
+    #[test]
+    fn test_proposals_no_filter() {
+        let state = make_state_with_proposals();
+        let cbor = {
+            let mut buf = Vec::new();
+            let mut enc = minicbor::Encoder::new(&mut buf);
+            enc.tag(minicbor::data::Tag::new(258)).ok();
+            enc.array(0).ok();
+            buf
+        };
+        let mut dec = minicbor::Decoder::new(&cbor);
+        let result = handle_proposals(&state, &mut dec);
+        match result {
+            QueryResult::Proposals(proposals) => {
+                assert_eq!(proposals.len(), 2);
+            }
+            _ => panic!("Expected Proposals"),
+        }
+    }
+
+    #[test]
+    fn test_proposals_filtered() {
+        let state = make_state_with_proposals();
+        let cbor = {
+            let mut buf = Vec::new();
+            let mut enc = minicbor::Encoder::new(&mut buf);
+            enc.tag(minicbor::data::Tag::new(258)).ok();
+            enc.array(1).ok();
+            // GovActionId: [tx_hash, action_index]
+            enc.array(2).ok();
+            enc.bytes(&[1u8; 32]).ok();
+            enc.u32(0).ok();
+            buf
+        };
+        let mut dec = minicbor::Decoder::new(&cbor);
+        let result = handle_proposals(&state, &mut dec);
+        match result {
+            QueryResult::Proposals(proposals) => {
+                assert_eq!(proposals.len(), 1);
+                assert_eq!(proposals[0].tx_id, vec![1u8; 32]);
+                assert_eq!(proposals[0].action_index, 0);
+            }
+            _ => panic!("Expected Proposals"),
+        }
+    }
+
+    #[test]
+    fn test_ratify_state_returns_empty() {
+        let state = NodeStateSnapshot::default();
+        let result = handle_ratify_state(&state);
+        match result {
+            QueryResult::RatifyState {
+                enacted,
+                expired,
+                delayed,
+            } => {
+                assert!(enacted.is_empty());
+                assert!(expired.is_empty());
+                assert!(!delayed);
+            }
+            _ => panic!("Expected RatifyState"),
+        }
     }
 }

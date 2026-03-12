@@ -358,6 +358,80 @@ fn encode_tagged_rational(enc: &mut minicbor::Encoder<&mut Vec<u8>>, num: u64, d
     enc.u64(den).ok();
 }
 
+/// Encode a relay access point for LedgerPeerSnapshot.
+/// RelayAccessPoint is a sum type:
+///   [0, ip_addr, port]  — RelayAccessAddress
+///   [1, dns_name, port] — RelayAccessDomain
+fn encode_relay_access_point(
+    enc: &mut minicbor::Encoder<&mut Vec<u8>>,
+    relay: &crate::query_handler::RelaySnapshot,
+) {
+    match relay {
+        crate::query_handler::RelaySnapshot::SingleHostAddr { port, ipv4, ipv6 } => {
+            // RelayAccessAddress: [0, ip_bytes, port]
+            enc.array(3).ok();
+            enc.u32(0).ok();
+            if let Some(ip4) = ipv4 {
+                enc.bytes(ip4).ok();
+            } else if let Some(ip6) = ipv6 {
+                enc.bytes(ip6).ok();
+            } else {
+                enc.bytes(&[0u8; 4]).ok(); // fallback
+            }
+            enc.u16(port.unwrap_or(3001)).ok();
+        }
+        crate::query_handler::RelaySnapshot::SingleHostName { port, dns_name } => {
+            // RelayAccessDomain: [1, dns_name, port]
+            enc.array(3).ok();
+            enc.u32(1).ok();
+            enc.str(dns_name).ok();
+            enc.u16(port.unwrap_or(3001)).ok();
+        }
+        crate::query_handler::RelaySnapshot::MultiHostName { dns_name } => {
+            // RelayAccessDomain: [1, dns_name, port=3001]
+            enc.array(3).ok();
+            enc.u32(1).ok();
+            enc.str(dns_name).ok();
+            enc.u16(3001).ok();
+        }
+    }
+}
+
+/// Encode a single GovActionState as CBOR array(7).
+fn encode_gov_action_state(
+    enc: &mut minicbor::Encoder<&mut Vec<u8>>,
+    p: &crate::query_handler::ProposalSnapshot,
+) {
+    // GovActionState = array(7)
+    //   [0] gasId, [1] committeeVotes, [2] drepVotes,
+    //   [3] spoVotes, [4] procedure, [5] proposedIn, [6] expiresAfter
+    enc.array(7).ok();
+    // [0] GovActionId = array(2) [tx_hash, action_index]
+    enc.array(2).ok();
+    enc.bytes(&p.tx_id).ok();
+    enc.u32(p.action_index).ok();
+    // [1] committeeVotes = Map<Credential, Vote> (empty for now)
+    enc.map(0).ok();
+    // [2] drepVotes = Map<Credential, Vote> (empty for now)
+    enc.map(0).ok();
+    // [3] spoVotes = Map<Credential, Vote> (empty for now)
+    enc.map(0).ok();
+    // [4] ProposalProcedure = array(4) [deposit, return_addr, gov_action, anchor]
+    enc.array(4).ok();
+    enc.u64(p.deposit).ok();
+    enc.bytes(&p.return_addr).ok();
+    // gov_action = sum type tagged by action type
+    encode_gov_action_tag(enc, &p.action_type);
+    // anchor = array(2) [url, hash]
+    enc.array(2).ok();
+    enc.str(&p.anchor_url).ok();
+    enc.bytes(&p.anchor_hash).ok();
+    // [5] proposedIn (EpochNo)
+    enc.u64(p.proposed_epoch).ok();
+    // [6] expiresAfter (EpochNo)
+    enc.u64(p.expires_epoch).ok();
+}
+
 /// Encode a GovAction as a CBOR sum type tag.
 /// We encode a simplified version since we only have the action type string.
 fn encode_gov_action_tag(enc: &mut minicbor::Encoder<&mut Vec<u8>>, action_type: &str) {
@@ -746,34 +820,7 @@ fn encode_query_result_value(enc: &mut minicbor::Encoder<&mut Vec<u8>>, result: 
             // values = array(n) of GovActionState
             enc.array(gov.proposals.len() as u64).ok();
             for p in &gov.proposals {
-                // GovActionState = array(7)
-                //   [0] gasId, [1] committeeVotes, [2] drepVotes,
-                //   [3] spoVotes, [4] procedure, [5] proposedIn, [6] expiresAfter
-                enc.array(7).ok();
-                // [0] GovActionId = array(2) [tx_hash, action_index]
-                enc.array(2).ok();
-                enc.bytes(&p.tx_id).ok();
-                enc.u32(p.action_index).ok();
-                // [1] committeeVotes = Map<Credential, Vote> (empty for now)
-                enc.map(0).ok();
-                // [2] drepVotes = Map<Credential, Vote> (empty for now)
-                enc.map(0).ok();
-                // [3] spoVotes = Map<Credential, Vote> (empty for now)
-                enc.map(0).ok();
-                // [4] ProposalProcedure = array(4) [deposit, return_addr, gov_action, anchor]
-                enc.array(4).ok();
-                enc.u64(p.deposit).ok();
-                enc.bytes(&p.return_addr).ok();
-                // gov_action = sum type tagged by action type
-                encode_gov_action_tag(enc, &p.action_type);
-                // anchor = array(2) [url, hash]
-                enc.array(2).ok();
-                enc.str(&p.anchor_url).ok();
-                enc.bytes(&p.anchor_hash).ok();
-                // [5] proposedIn (EpochNo)
-                enc.u64(p.proposed_epoch).ok();
-                // [6] expiresAfter (EpochNo)
-                enc.u64(p.expires_epoch).ok();
+                encode_gov_action_state(enc, p);
             }
 
             // [1] Committee = StrictMaybe(array(2) [Map<ColdCred,EpochNo>, UnitInterval])
@@ -1347,18 +1394,39 @@ fn encode_query_result_value(enc: &mut minicbor::Encoder<&mut Vec<u8>>, result: 
             // QueryHardFork GetCurrentEra result: EraIndex as raw word8
             enc.u8(*era as u8).ok();
         }
-        QueryResult::EmptyProposals => {
-            // GetProposals result: Seq (GovActionState) = empty array
-            enc.array(0).ok();
+        QueryResult::Proposals(proposals) => {
+            // GetProposals result: Seq (GovActionState) = OSet of GovActionState
+            enc.array(proposals.len() as u64).ok();
+            for p in proposals {
+                encode_gov_action_state(enc, p);
+            }
         }
-        QueryResult::EmptyRatifyState => {
-            // GetRatifyState stub: simplified empty ratify state
-            // RatifyState = (enacted_seq, expired_seq, bool_delayed)
+        QueryResult::RatifyState {
+            enacted,
+            expired,
+            delayed,
+        } => {
+            // RatifyState = array(4) [enacted_seq, expired_seq, delayed_bool, future_pparam_update]
             enc.array(4).ok();
-            enc.array(0).ok(); // enacted: Seq
-            enc.array(0).ok(); // expired: Seq
-            enc.bool(false).ok(); // delayed
-                                  // future pparams: NoPParamsUpdate [0]
+            // enacted: Seq of (GovActionState, GovActionId)
+            enc.array(enacted.len() as u64).ok();
+            for (proposal, action_id) in enacted {
+                enc.array(2).ok();
+                encode_gov_action_state(enc, proposal);
+                enc.array(2).ok();
+                enc.bytes(&action_id.tx_id).ok();
+                enc.u32(action_id.action_index).ok();
+            }
+            // expired: Seq of GovActionId
+            enc.array(expired.len() as u64).ok();
+            for action_id in expired {
+                enc.array(2).ok();
+                enc.bytes(&action_id.tx_id).ok();
+                enc.u32(action_id.action_index).ok();
+            }
+            // delayed
+            enc.bool(*delayed).ok();
+            // future pparams: NoPParamsUpdate [0]
             enc.array(1).ok();
             enc.u32(0).ok();
         }
@@ -1398,17 +1466,38 @@ fn encode_query_result_value(enc: &mut minicbor::Encoder<&mut Vec<u8>>, result: 
             // Plain integer
             enc.u32(*v).ok();
         }
-        QueryResult::LedgerPeerSnapshot => {
-            // Stub: empty snapshot — encode as empty structure
-            // LedgerPeerSnapshot uses CBOR: map with version + peers
+        QueryResult::LedgerPeerSnapshot(peers) => {
+            // LedgerPeerSnapshot = array(2) [version, pool_relay_list]
+            // Haskell: LedgerPeerSnapshot (version, [(accStake, (poolStake, NonEmpty relay))])
             enc.array(2).ok();
             enc.u32(1).ok(); // version
-            enc.array(0).ok(); // empty peer list
+                             // peers: array of (accumulatedStake, (poolStake, relays))
+            enc.array(peers.len() as u64).ok();
+            let mut acc_stake: u64 = 0;
+            for peer in peers {
+                acc_stake = acc_stake.saturating_add(peer.stake);
+                enc.array(2).ok();
+                // accumulated stake
+                enc.u64(acc_stake).ok();
+                // (poolStake, relays)
+                enc.array(2).ok();
+                enc.u64(peer.stake).ok();
+                // relays: array of RelayAccessPoint
+                enc.array(peer.relays.len() as u64).ok();
+                for relay in &peer.relays {
+                    encode_relay_access_point(enc, relay);
+                }
+            }
         }
-        QueryResult::StakePoolDefaultVote => {
-            // DefaultVote: NoVote = [2] (constructor index for abstain)
-            enc.array(1).ok();
-            enc.u32(2).ok();
+        QueryResult::StakePoolDefaultVote(entries) => {
+            // Map<PoolId, DefaultVote>
+            // DefaultVote: [0]=NoConfidence, [1]=Abstain, [2]=DRepVote
+            enc.map(entries.len() as u64).ok();
+            for entry in entries {
+                enc.bytes(&entry.pool_id).ok();
+                enc.array(1).ok();
+                enc.u32(entry.default_vote as u32).ok();
+            }
         }
         QueryResult::Error(msg) => {
             enc.str(msg).ok();

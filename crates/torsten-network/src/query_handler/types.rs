@@ -105,14 +105,24 @@ pub enum QueryResult {
     },
     /// GetMaxMajorProtocolVersion (tag 38): plain integer
     MaxMajorProtocolVersion(u32),
-    /// GetLedgerPeerSnapshot (tag 34): stub
-    LedgerPeerSnapshot,
-    /// QueryStakePoolDefaultVote (tag 35): stub
-    StakePoolDefaultVote,
-    /// GetProposals (tag 31): returns empty Seq for now
-    EmptyProposals,
-    /// GetRatifyState (tag 32): stub
-    EmptyRatifyState,
+    /// GetLedgerPeerSnapshot (tag 34): ledger peer snapshot
+    /// Versioned snapshot: array(2) [version, peers]
+    LedgerPeerSnapshot(Vec<LedgerPeerEntry>),
+    /// QueryStakePoolDefaultVote (tag 35): per-pool default vote
+    /// Map<PoolId, DefaultVote> where DefaultVote = NoConfidence(0) | Abstain(1) | DRepVote(2)
+    StakePoolDefaultVote(Vec<PoolDefaultVoteEntry>),
+    /// GetProposals (tag 31): returns Seq of GovActionState
+    Proposals(Vec<ProposalSnapshot>),
+    /// GetRatifyState (tag 32): ratification state
+    /// array(4) [enacted_seq, expired_seq, delayed_bool, future_pparam_update]
+    RatifyState {
+        /// Enacted GovActionStates (recently ratified)
+        enacted: Vec<(ProposalSnapshot, GovActionId)>,
+        /// Expired GovActionIds
+        expired: Vec<GovActionId>,
+        /// Whether ratification is delayed (a "delaying action" was ratified)
+        delayed: bool,
+    },
     /// GetFuturePParams (tag 33): returns Nothing (no future params)
     NoFuturePParams,
     Error(String),
@@ -549,6 +559,33 @@ pub struct ProposalSnapshot {
     pub anchor_url: String,
     /// Anchor data hash (32 bytes)
     pub anchor_hash: Vec<u8>,
+}
+
+/// Default vote entry for QueryStakePoolDefaultVote (tag 35)
+#[derive(Debug, Clone)]
+pub struct PoolDefaultVoteEntry {
+    /// Pool ID (28 bytes)
+    pub pool_id: Vec<u8>,
+    /// Default vote: 0=NoConfidence, 1=Abstain, 2=DRepVote
+    pub default_vote: u8,
+}
+
+/// Ledger peer entry for GetLedgerPeerSnapshot (tag 34)
+#[derive(Debug, Clone)]
+pub struct LedgerPeerEntry {
+    /// Pool ID (28 bytes)
+    pub pool_id: Vec<u8>,
+    /// Pool stake in lovelace
+    pub stake: u64,
+    /// Relay addresses from pool registration
+    pub relays: Vec<RelaySnapshot>,
+}
+
+/// GovActionId for query results
+#[derive(Debug, Clone)]
+pub struct GovActionId {
+    pub tx_id: Vec<u8>,
+    pub action_index: u32,
 }
 
 /// Snapshot of a stake address for query results

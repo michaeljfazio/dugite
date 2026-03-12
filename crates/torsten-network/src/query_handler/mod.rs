@@ -11,11 +11,11 @@ use tracing::{debug, warn};
 // Re-export all public types for backwards compatibility
 pub use types::{
     CommitteeMemberSnapshot, CommitteeSnapshot, DRepSnapshot, DRepStakeEntry, EraBound, EraSummary,
-    GenesisConfigSnapshot, GovStateSnapshot, MultiAssetSnapshot, NodeStateSnapshot,
-    NonMyopicRewardEntry, PoolParamsSnapshot, PoolRewardInfo, PoolStakeSnapshotEntry,
-    ProposalSnapshot, ProtocolParamsSnapshot, QueryResult, RelaySnapshot, ShelleyPParamsSnapshot,
-    StakeAddressSnapshot, StakeDelegDepositEntry, StakePoolSnapshot, StakeSnapshotsResult,
-    UtxoQueryProvider, UtxoSnapshot, VoteDelegateeEntry,
+    GenesisConfigSnapshot, GovActionId, GovStateSnapshot, LedgerPeerEntry, MultiAssetSnapshot,
+    NodeStateSnapshot, NonMyopicRewardEntry, PoolDefaultVoteEntry, PoolParamsSnapshot,
+    PoolRewardInfo, PoolStakeSnapshotEntry, ProposalSnapshot, ProtocolParamsSnapshot, QueryResult,
+    RelaySnapshot, ShelleyPParamsSnapshot, StakeAddressSnapshot, StakeDelegDepositEntry,
+    StakePoolSnapshot, StakeSnapshotsResult, UtxoQueryProvider, UtxoSnapshot, VoteDelegateeEntry,
 };
 
 /// Handler for local state queries.
@@ -390,19 +390,16 @@ impl QueryHandler {
             28 => governance::handle_filtered_vote_delegatees(&self.state, decoder),
             29 => protocol::handle_account_state(&self.state),
             30 => {
-                // Tag 30: GetSPOStakeDistr — SPO stake distribution
-                debug!("Query: GetSPOStakeDistr (stub)");
-                QueryResult::StakeDistribution(vec![])
+                // Tag 30: GetSPOStakeDistr — filtered SPO stake distribution
+                stake::handle_spo_stake_distr(&self.state, decoder)
             }
             31 => {
-                // Tag 31: GetProposals — returns governance proposals
-                debug!("Query: GetProposals (stub)");
-                QueryResult::EmptyProposals
+                // Tag 31: GetProposals — filtered governance proposals
+                governance::handle_proposals(&self.state, decoder)
             }
             32 => {
-                // Tag 32: GetRatifyState
-                debug!("Query: GetRatifyState (stub)");
-                QueryResult::EmptyRatifyState
+                // Tag 32: GetRatifyState — ratification state
+                governance::handle_ratify_state(&self.state)
             }
             33 => {
                 // Tag 33: GetFuturePParams — returns Maybe PParams (Nothing)
@@ -411,13 +408,11 @@ impl QueryHandler {
             }
             34 => {
                 // Tag 34: GetLedgerPeerSnapshot (V19+)
-                debug!("Query: GetLedgerPeerSnapshot (stub)");
-                QueryResult::LedgerPeerSnapshot
+                stake::handle_ledger_peer_snapshot(&self.state)
             }
             35 => {
                 // Tag 35: QueryStakePoolDefaultVote (V20+)
-                debug!("Query: QueryStakePoolDefaultVote (stub)");
-                QueryResult::StakePoolDefaultVote
+                stake::handle_pool_default_vote(&self.state, decoder)
             }
             36 => {
                 // Tag 36: GetPoolDistr2 (V21+) — new format with total active stake

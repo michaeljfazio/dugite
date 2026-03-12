@@ -791,7 +791,18 @@ impl LedgerState {
     }
 
     /// Current snapshot format version.
-    /// Increment this when the serialized LedgerState layout changes.
+    ///
+    /// **Migration policy:** Increment this when the serialized LedgerState layout
+    /// changes (adding, removing, or reordering fields). When bumped:
+    /// 1. Add a `migrate_vN_to_vM()` function that transforms the old data
+    /// 2. Update `load_snapshot()` to dispatch to the migration chain
+    /// 3. If bincode-level migration is infeasible (field layout changed too much),
+    ///    the old snapshot will fail to deserialize and the node re-syncs from chain
+    ///
+    /// Since bincode is field-order-dependent and not self-describing, structural
+    /// changes (new/removed/reordered fields) will cause deserialization failures
+    /// for older snapshots. This is acceptable — snapshots are an optimization,
+    /// not critical data. The node can always reconstruct state from the chain.
     const SNAPSHOT_VERSION: u8 = 1;
 
     /// Save ledger state snapshot to disk using bincode serialization.
@@ -869,9 +880,21 @@ impl LedgerState {
                 let version = fifth_byte;
                 if version > Self::SNAPSHOT_VERSION {
                     return Err(LedgerError::EpochTransition(format!(
-                        "Unsupported snapshot version {version} (max supported: {})",
+                        "Unsupported snapshot version {version} (max supported: {}). \
+                         Delete the snapshot to re-sync from chain.",
                         Self::SNAPSHOT_VERSION,
                     )));
+                }
+                if version < Self::SNAPSHOT_VERSION {
+                    // Older version — attempt migration chain. For bincode-based
+                    // snapshots, structural changes make cross-version deserialization
+                    // impossible. Log clearly so the user knows to re-sync.
+                    warn!(
+                        snapshot_version = version,
+                        current_version = Self::SNAPSHOT_VERSION,
+                        "Snapshot version mismatch — snapshot may fail to load. \
+                         Delete the snapshot file to re-sync from chain if this fails."
+                    );
                 }
                 debug!(version, "Loading versioned snapshot");
                 let stored_checksum = &raw[5..37];
