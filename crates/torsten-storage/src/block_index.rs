@@ -19,7 +19,7 @@ use crate::config::ImmutableConfig;
 
 /// Location of a block within a chunk file.
 #[derive(Debug, Clone, Copy)]
-pub(crate) struct BlockLocation {
+pub struct BlockLocation {
     pub chunk_num: u64,
     pub block_offset: u64,
     pub block_end: u64,
@@ -29,7 +29,7 @@ pub(crate) struct BlockLocation {
 // BlockIndex enum (dispatch without vtable)
 // ---------------------------------------------------------------------------
 
-pub(crate) enum BlockIndex {
+pub enum BlockIndex {
     InMemory(InMemoryBlockIndex),
     Mmap(MmapBlockIndex),
 }
@@ -76,6 +76,10 @@ impl BlockIndex {
         }
     }
 
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
     /// Persist the mmap index to disk. No-op for in-memory.
     pub fn persist(&self) -> Result<(), std::io::Error> {
         match self {
@@ -89,7 +93,7 @@ impl BlockIndex {
 // InMemoryBlockIndex
 // ---------------------------------------------------------------------------
 
-pub(crate) struct InMemoryBlockIndex {
+pub struct InMemoryBlockIndex {
     map: HashMap<Hash32, BlockLocation>,
 }
 
@@ -121,6 +125,16 @@ impl InMemoryBlockIndex {
     pub fn len(&self) -> usize {
         self.map.len()
     }
+
+    pub fn is_empty(&self) -> bool {
+        self.map.is_empty()
+    }
+}
+
+impl Default for InMemoryBlockIndex {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -140,7 +154,7 @@ const ENTRY_SIZE: usize = 56;
 /// Minimum capacity to avoid degenerate small tables.
 const MIN_CAPACITY: u64 = 1024;
 
-pub(crate) struct MmapBlockIndex {
+pub struct MmapBlockIndex {
     /// Memory-mapped file (header + entries).
     mmap: MmapMut,
     /// Path to the index file.
@@ -396,6 +410,10 @@ impl MmapBlockIndex {
 
     pub fn len(&self) -> usize {
         self.count as usize + self.overflow.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.count == 0 && self.overflow.is_empty()
     }
 
     /// Flush the mmap to disk.

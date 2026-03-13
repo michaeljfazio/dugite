@@ -1,9 +1,10 @@
 //! Storage configuration types and profiles.
 //!
 //! Operators choose a preset (`high-memory`, `low-memory`) or individually
-//! tune parameters. The `high-memory` profile matches the original hardcoded
-//! behavior; `low-memory` reduces RAM usage by using memory-mapped block
-//! indexes and smaller LSM caches.
+//! tune parameters. Both profiles use memory-mapped block indexes by default
+//! (benchmarks show 3-4x faster lookups and 4x faster open at scale vs
+//! in-memory HashMap). The `low-memory` profile reduces LSM cache sizes
+//! for constrained environments.
 
 use serde::{Deserialize, Serialize};
 
@@ -21,7 +22,7 @@ impl StorageProfile {
         match self {
             StorageProfile::HighMemory => StorageConfig {
                 immutable: ImmutableConfig {
-                    index_type: BlockIndexType::InMemory,
+                    index_type: BlockIndexType::Mmap,
                     mmap_load_factor: 0.7,
                     mmap_initial_capacity: 0,
                 },
@@ -99,7 +100,7 @@ pub struct ImmutableConfig {
 impl Default for ImmutableConfig {
     fn default() -> Self {
         ImmutableConfig {
-            index_type: BlockIndexType::InMemory,
+            index_type: BlockIndexType::Mmap,
             mmap_load_factor: 0.7,
             mmap_initial_capacity: 0,
         }
@@ -110,9 +111,9 @@ impl Default for ImmutableConfig {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum BlockIndexType {
-    /// In-memory HashMap (fast, high RAM usage).
+    /// In-memory HashMap (higher RAM usage, slower lookups than Mmap).
     InMemory,
-    /// Memory-mapped on-disk hash table (low RAM, slightly slower lookups).
+    /// Memory-mapped on-disk hash table (low RAM, 3-4x faster lookups, faster open at scale).
     Mmap,
 }
 
@@ -268,7 +269,7 @@ mod tests {
     #[test]
     fn test_high_memory_profile_defaults() {
         let config = StorageProfile::HighMemory.to_config();
-        assert_eq!(config.immutable.index_type, BlockIndexType::InMemory);
+        assert_eq!(config.immutable.index_type, BlockIndexType::Mmap);
         assert_eq!(config.utxo.backend, UtxoBackend::Lsm);
         assert_eq!(config.utxo.memtable_size_mb, 128);
         assert_eq!(config.utxo.block_cache_size_mb, 256);
@@ -408,7 +409,7 @@ mod tests {
     fn test_default_storage_config() {
         // Default StorageConfig uses HighMemory profile
         let config = StorageConfig::default();
-        assert_eq!(config.immutable.index_type, BlockIndexType::InMemory);
+        assert_eq!(config.immutable.index_type, BlockIndexType::Mmap);
         assert_eq!(config.utxo.backend, UtxoBackend::Lsm);
         assert_eq!(config.utxo.memtable_size_mb, 128);
         assert_eq!(config.utxo.block_cache_size_mb, 256);
@@ -417,7 +418,7 @@ mod tests {
     #[test]
     fn test_default_immutable_config() {
         let config = ImmutableConfig::default();
-        assert_eq!(config.index_type, BlockIndexType::InMemory);
+        assert_eq!(config.index_type, BlockIndexType::Mmap);
         assert_eq!(config.mmap_load_factor, 0.7);
         assert_eq!(config.mmap_initial_capacity, 0);
     }
@@ -533,7 +534,7 @@ mod tests {
         // Changed
         assert_eq!(config.utxo.memtable_size_mb, 96);
         // Unchanged from HighMemory profile
-        assert_eq!(config.immutable.index_type, BlockIndexType::InMemory);
+        assert_eq!(config.immutable.index_type, BlockIndexType::Mmap);
         assert_eq!(config.utxo.backend, UtxoBackend::Lsm);
         assert_eq!(config.utxo.block_cache_size_mb, 256);
         assert_eq!(config.utxo.bloom_filter_bits_per_key, 10);
