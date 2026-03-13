@@ -21,3 +21,8 @@ minicbor = { workspace = true }
 [dev-dependencies]
 serde_json = { workspace = true }
 proptest = { workspace = true }
+criterion = { workspace = true }
+
+[[bench]]
+name = "hash_bench"
+harness = false
