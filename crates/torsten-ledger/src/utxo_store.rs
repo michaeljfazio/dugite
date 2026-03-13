@@ -7,7 +7,7 @@
 //! Key encoding: TransactionInput → 36 bytes (32-byte tx_hash + 4-byte index BE)
 //! Value encoding: TransactionOutput → bincode serialization
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use cardano_lsm::{Key, LsmConfig, LsmTree, Value};
@@ -30,7 +30,9 @@ pub struct UtxoStore {
     count: usize,
     /// Secondary index: address → set of TransactionInputs at that address.
     /// Kept in-memory, rebuilt from LSM scan on startup.
-    address_index: HashMap<Address, Vec<TransactionInput>>,
+    /// Uses HashSet for O(1) insert and remove (Vec::retain was O(n) per remove,
+    /// causing quadratic degradation on addresses with many UTxOs).
+    address_index: HashMap<Address, HashSet<TransactionInput>>,
     /// When false, address index operations are skipped (for fast replay).
     indexing_enabled: bool,
 }
@@ -200,7 +202,7 @@ impl UtxoStore {
             self.address_index
                 .entry(output.address.clone())
                 .or_default()
-                .push(input);
+                .insert(input);
         }
         self.count += 1;
     }
@@ -222,7 +224,7 @@ impl UtxoStore {
             if self.indexing_enabled {
                 if let Some(ref out) = output {
                     if let Some(inputs) = self.address_index.get_mut(&out.address) {
-                        inputs.retain(|i| i != input);
+                        inputs.remove(input); // O(1) HashSet remove, was O(n) Vec::retain
                         if inputs.is_empty() {
                             self.address_index.remove(&out.address);
                         }
@@ -346,7 +348,7 @@ impl UtxoStore {
             self.address_index
                 .entry(output.address.clone())
                 .or_default()
-                .push(input);
+                .insert(input);
         }
         info!(
             "Address index rebuilt: {} addresses, {} UTxOs",
