@@ -38,6 +38,7 @@
 - [Storage](./architecture/storage.md)
 - [Consensus](./architecture/consensus.md)
 - [Networking](./architecture/networking.md)
+- [Genesis Support](./architecture/genesis-support.md)
 
 # Reference
 

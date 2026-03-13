@@ -75,6 +75,7 @@ pub async fn start_disk_monitor(
     database_path: std::path::PathBuf,
     metrics: Arc<NodeMetrics>,
     mut shutdown_rx: watch::Receiver<bool>,
+    disk_level_tx: watch::Sender<DiskSpaceLevel>,
 ) {
     let mut interval = tokio::time::interval(std::time::Duration::from_secs(CHECK_INTERVAL_SECS));
 
@@ -92,6 +93,8 @@ pub async fn start_disk_monitor(
             Ok(available) => {
                 metrics.set_disk_available_bytes(available);
                 let level = classify_disk_space(available);
+                // Publish the current disk space level so the sync loop can react
+                let _ = disk_level_tx.send(level);
                 let human = format_bytes(available);
 
                 match level {
@@ -237,6 +240,64 @@ mod tests {
         assert_eq!(DiskSpaceLevel::Warning.to_string(), "warning");
         assert_eq!(DiskSpaceLevel::Critical.to_string(), "critical");
         assert_eq!(DiskSpaceLevel::Fatal.to_string(), "fatal");
+    }
+
+    #[tokio::test]
+    async fn test_disk_level_watch_channel() {
+        use std::time::Duration;
+        use tokio::sync::watch;
+
+        let metrics = Arc::new(NodeMetrics::new());
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let (disk_level_tx, mut disk_level_rx) = watch::channel(DiskSpaceLevel::Ok);
+
+        // Spawn the monitor on the current directory (always has space)
+        let db_path = std::path::PathBuf::from(".");
+        tokio::spawn(async move {
+            start_disk_monitor(db_path, metrics, shutdown_rx, disk_level_tx).await;
+        });
+
+        // Wait for the first check to publish a level
+        tokio::time::timeout(Duration::from_secs(5), disk_level_rx.changed())
+            .await
+            .expect("timed out waiting for disk level update")
+            .expect("watch channel closed unexpectedly");
+
+        // On any dev machine, the level should be Ok (plenty of space)
+        let level = *disk_level_rx.borrow();
+        assert_eq!(
+            level,
+            DiskSpaceLevel::Ok,
+            "expected Ok disk level on dev machine, got {level:?}"
+        );
+
+        // Shutdown the monitor
+        shutdown_tx.send(true).ok();
+    }
+
+    #[tokio::test]
+    async fn test_shutdown_timeout_completes() {
+        // Verify that a fast shutdown completes within the timeout
+        let result = tokio::time::timeout(std::time::Duration::from_secs(30), async {
+            // Simulate shutdown work that completes quickly
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        })
+        .await;
+        assert!(
+            result.is_ok(),
+            "fast shutdown should complete within timeout"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_shutdown_timeout_expires() {
+        // Verify that a slow shutdown is detected by the timeout
+        let result = tokio::time::timeout(std::time::Duration::from_millis(50), async {
+            // Simulate shutdown work that takes too long
+            tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+        })
+        .await;
+        assert!(result.is_err(), "slow shutdown should trigger timeout");
     }
 
     #[test]

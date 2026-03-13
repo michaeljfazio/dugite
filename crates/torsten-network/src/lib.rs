@@ -1,4 +1,6 @@
+pub mod bandwidth;
 pub mod client;
+pub mod dns;
 pub mod governor;
 pub mod miniprotocols;
 pub mod multiplexer;
@@ -10,8 +12,11 @@ pub mod peer_manager;
 pub mod pipelined;
 pub mod query_handler;
 pub mod server;
+pub mod tcp;
 
+pub use bandwidth::TokenBucketRateLimiter;
 pub use client::{BlockFetchPool, ChainSyncEvent, HeaderBatchResult, HeaderInfo, NodeToNodeClient};
+pub use dns::DnsResolver;
 pub use miniprotocols::peersharing::{
     request_peers_from, PeerAddress, PeerSharingMessage, PeerSharingState,
 };
@@ -25,11 +30,12 @@ pub use n2n_server::{
 };
 pub use peer::PeerConnection;
 pub use peer_manager::{
-    DiffusionMode, PeerCategory, PeerManager, PeerManagerConfig, PeerPerformance,
+    CircuitState, DiffusionMode, PeerCategory, PeerManager, PeerManagerConfig, PeerPerformance,
 };
 pub use pipelined::PipelinedPeerClient;
 pub use query_handler::{NodeStateSnapshot, QueryHandler, QueryResult};
 pub use server::NodeServer;
+pub use tcp::{configure_tcp_keepalive, TimeoutConfig};
 pub use torsten_primitives::mempool::{
     MempoolAddError, MempoolAddResult, MempoolProvider, MempoolSnapshot,
 };

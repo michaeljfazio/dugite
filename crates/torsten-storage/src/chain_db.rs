@@ -98,11 +98,24 @@ impl ChainDB {
             );
         }
 
-        debug!("ChainDB opened successfully");
+        // Open VolatileDB with WAL for crash recovery
+        let volatile_dir = db_path.join("volatile");
+        let volatile = match VolatileDB::open(&volatile_dir) {
+            Ok(v) => v,
+            Err(e) => {
+                warn!(error = %e, "Failed to open VolatileDB with WAL, falling back to in-memory");
+                VolatileDB::new()
+            }
+        };
+
+        debug!(
+            volatile_blocks = volatile.len(),
+            "ChainDB opened successfully"
+        );
         Ok(ChainDB {
             path: db_path.to_path_buf(),
             immutable,
-            volatile: VolatileDB::new(),
+            volatile,
             immutable_tip,
         })
     }
@@ -195,6 +208,11 @@ impl ChainDB {
             return Ok(Some(cbor));
         }
         Ok(None)
+    }
+
+    /// Number of blocks currently in the volatile (in-memory) database.
+    pub fn volatile_block_count(&self) -> usize {
+        self.volatile.len()
     }
 
     /// Get the current chain tip (higher of volatile and immutable).

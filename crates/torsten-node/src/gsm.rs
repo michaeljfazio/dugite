@@ -8,6 +8,29 @@
 //! The GSM runs as a background task, monitoring peer counts and tip age
 //! to drive state transitions. It also enforces the Limit on Eagerness (LoE)
 //! and runs the Genesis Density Disconnector (GDD).
+//!
+//! ## Current Limitations
+//!
+//! The GSM implementation provides basic state tracking and peer density
+//! comparison but does not yet include:
+//!
+//! - **Lightweight checkpointing**: The Ouroboros Genesis specification calls
+//!   for lightweight checkpoints to speed up initial sync by providing trusted
+//!   anchor points. This is not yet implemented.
+//!
+//! - **Genesis-specific peer selection**: Full Genesis requires a dedicated
+//!   peer selection policy that prioritizes big ledger peers (BLPs) during
+//!   the PreSyncing and Syncing phases. Currently, peer selection uses the
+//!   standard P2P governor policy for all states.
+//!
+//! - **LoE enforcement in block application**: The `loe_limit()` method
+//!   computes the constraint but it is not yet wired into the block
+//!   application pipeline to actually limit immutable tip advancement.
+//!
+//! These limitations do not affect normal operation. The Genesis protocol
+//! features are future-proofing for the Ouroboros Genesis hard fork, which
+//! will enable trustless bootstrap from an empty database without relying
+//! on Mithril snapshots.
 
 use std::collections::HashMap;
 use std::net::SocketAddr;

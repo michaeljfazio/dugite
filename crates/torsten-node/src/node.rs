@@ -419,6 +419,20 @@ fn convert_validation_error(e: torsten_ledger::validation::ValidationError) -> T
             TxValidationError::MissingWithdrawalScriptWitness { credential }
         }
         VE::ValueOverflow => TxValidationError::ValueOverflow,
+        VE::EraGatingViolation {
+            certificate_type,
+            required_era,
+            current_era,
+        } => TxValidationError::ScriptFailed {
+            reason: format!(
+                "Era gating violation: {certificate_type} requires {required_era}, current era is {current_era}"
+            ),
+        },
+        VE::GovernancePreConway { current_version } => TxValidationError::ScriptFailed {
+            reason: format!(
+                "Governance features not available pre-Conway (current protocol version: {current_version})"
+            ),
+        },
     }
 }
 
@@ -670,6 +684,8 @@ pub struct Node {
     consensus_mode: String,
     /// Force full Phase-2 Plutus validation on all blocks
     validate_all_blocks: bool,
+    /// Watch receiver for current disk space level, updated by disk monitor
+    disk_space_rx: watch::Receiver<crate::disk_monitor::DiskSpaceLevel>,
 }
 
 impl Node {
@@ -1028,9 +1044,18 @@ impl Node {
                 missing.join(", "),
             ));
         } else {
-            let vrf_path = args.shelley_vrf_key.as_ref().unwrap();
-            let kes_path = args.shelley_kes_key.as_ref().unwrap();
-            let opcert_path = args.shelley_operational_certificate.as_ref().unwrap();
+            let vrf_path = args.shelley_vrf_key.as_ref().ok_or_else(|| {
+                anyhow::anyhow!("VRF signing key path required for block production")
+            })?;
+            let kes_path = args.shelley_kes_key.as_ref().ok_or_else(|| {
+                anyhow::anyhow!("KES signing key path required for block production")
+            })?;
+            let opcert_path = args
+                .shelley_operational_certificate
+                .as_ref()
+                .ok_or_else(|| {
+                    anyhow::anyhow!("Operational certificate path required for block production")
+                })?;
             let creds =
                 crate::forge::BlockProducerCredentials::load(vrf_path, kes_path, opcert_path)
                     .map_err(|e| {
@@ -1109,6 +1134,7 @@ impl Node {
             epoch_transitions_observed: 0,
             consensus_mode: args.consensus_mode,
             validate_all_blocks: args.validate_all_blocks,
+            disk_space_rx: watch::channel(crate::disk_monitor::DiskSpaceLevel::Ok).1,
         })
     }
 
@@ -1145,8 +1171,10 @@ impl Node {
         {
             let shutdown_tx_clone = shutdown_tx.clone();
             tokio::spawn(async move {
-                let mut sigterm =
-                    signal::unix::signal(signal::unix::SignalKind::terminate()).unwrap();
+                // Startup-time panic is acceptable — if we can't register signal
+                // handlers, the node cannot shut down gracefully.
+                let mut sigterm = signal::unix::signal(signal::unix::SignalKind::terminate())
+                    .expect("failed to register SIGTERM handler");
                 tokio::select! {
                     _ = signal::ctrl_c() => {
                         info!("SIGINT received, shutting down");
@@ -1184,11 +1212,20 @@ impl Node {
 
         // Start disk space monitor on the database volume
         {
+            let (disk_level_tx, disk_level_rx) =
+                watch::channel(crate::disk_monitor::DiskSpaceLevel::Ok);
+            self.disk_space_rx = disk_level_rx;
             let db_path = self.database_path.clone();
             let metrics = self.metrics.clone();
             let disk_shutdown_rx = shutdown_rx.clone();
             tokio::spawn(async move {
-                crate::disk_monitor::start_disk_monitor(db_path, metrics, disk_shutdown_rx).await;
+                crate::disk_monitor::start_disk_monitor(
+                    db_path,
+                    metrics,
+                    disk_shutdown_rx,
+                    disk_level_tx,
+                )
+                .await;
             });
         }
 
@@ -1490,7 +1527,9 @@ impl Node {
         if genesis_enabled {
             info!(
                 state = %gsm.blocking_read().state(),
-                "Genesis mode enabled"
+                "Genesis mode enabled — note: lightweight checkpointing and Genesis-specific \
+                 peer selection are not yet implemented. The GSM provides basic state tracking \
+                 (PreSyncing/Syncing/CaughtUp) and density-based peer disconnection."
             );
         }
 
@@ -1882,22 +1921,33 @@ impl Node {
             }
         }
 
-        // Flush all volatile blocks to ImmutableDB, then persist.
-        // This ensures the ledger snapshot (at the volatile tip) is consistent
-        // with the ImmutableDB tip on restart, avoiding a full replay.
-        {
-            let mut db = self.chain_db.write().await;
-            match db.flush_all_to_immutable() {
-                Ok(n) if n > 0 => info!(blocks = n, "Flushed volatile blocks to ImmutableDB"),
-                Ok(_) => {}
-                Err(e) => error!("Failed to flush volatile blocks on shutdown: {e}"),
+        // Flush volatile blocks, persist ChainDB, and save ledger snapshot,
+        // with a timeout to prevent hanging on shutdown.
+        let shutdown_result = tokio::time::timeout(std::time::Duration::from_secs(30), async {
+            {
+                let mut db = self.chain_db.write().await;
+                match db.flush_all_to_immutable() {
+                    Ok(n) if n > 0 => {
+                        info!(blocks = n, "Flushed volatile blocks to ImmutableDB")
+                    }
+                    Ok(_) => {}
+                    Err(e) => error!("Failed to flush volatile blocks on shutdown: {e}"),
+                }
+                if let Err(e) = db.persist() {
+                    error!("Failed to persist ChainDB on shutdown: {e}");
+                }
             }
-            if let Err(e) = db.persist() {
-                error!("Failed to persist ChainDB on shutdown: {e}");
+            self.save_ledger_snapshot().await;
+        })
+        .await;
+
+        match shutdown_result {
+            Ok(()) => info!("Shutdown complete"),
+            Err(_) => {
+                error!("Graceful shutdown timed out after 30s, forcing exit");
+                std::process::exit(1);
             }
         }
-        self.save_ledger_snapshot().await;
-        info!("Shutdown complete");
         Ok(())
     }
 
@@ -3211,6 +3261,16 @@ impl Node {
             })
             .collect();
 
+        // Refuse new blocks when disk space is fatally low to protect data integrity.
+        // The node stays alive so it can still serve queries.
+        if *self.disk_space_rx.borrow() == crate::disk_monitor::DiskSpaceLevel::Fatal {
+            error!(
+                "Disk space critically low — refusing to store {} blocks to protect data integrity",
+                blocks.len()
+            );
+            return 0;
+        }
+
         // Store blocks to ChainDB FIRST, then apply to ledger.
         // This ordering ensures the ledger never advances past what's persisted in storage,
         // preventing state divergence if storage fails.
@@ -3385,6 +3445,7 @@ impl Node {
         *blocks_since_last_log += batch_count;
         self.snapshot_policy.record_blocks(batch_count);
         self.metrics.add_blocks_received(batch_count);
+        self.metrics.record_block_received();
         self.metrics.add_blocks_applied(batch_count);
         self.metrics
             .transactions_received
@@ -4706,8 +4767,39 @@ impl Node {
             }
         }
 
-        // 4. Clear mempool — UTxO set has changed, existing txs may be invalid
-        self.mempool.clear();
+        // 4. Re-validate mempool transactions against the rolled-back ledger state.
+        // Drain all pending txs, then re-validate each against the updated UTxO set.
+        let pending_txs = self.mempool.drain_all();
+        let pending_count = pending_txs.len();
+        if pending_count > 0 {
+            let ledger = self.ledger_state.read().await;
+            let current_slot = ledger.tip.point.slot().map(|s| s.0).unwrap_or(0);
+            let slot_config = ledger.slot_config;
+            let mut revalidated = 0u64;
+            for tx in pending_txs {
+                let tx_size = tx.raw_cbor.as_ref().map(|b| b.len() as u64).unwrap_or(0);
+                if torsten_ledger::validation::validate_transaction(
+                    &tx,
+                    &ledger.utxo_set,
+                    &ledger.protocol_params,
+                    current_slot,
+                    tx_size,
+                    Some(&slot_config),
+                )
+                .is_ok()
+                {
+                    let hash = tx.hash;
+                    let size = tx.raw_cbor.as_ref().map(|b| b.len()).unwrap_or(0);
+                    let fee = tx.body.fee;
+                    let _ = self.mempool.add_tx_with_fee(hash, tx, size, fee);
+                    revalidated += 1;
+                }
+            }
+            info!(
+                total = pending_count,
+                revalidated, "Re-validated mempool txs after rollback"
+            );
+        }
 
         // 5. Notify peers
         self.notify_rollback(rollback_point).await;

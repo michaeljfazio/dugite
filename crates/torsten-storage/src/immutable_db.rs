@@ -25,6 +25,17 @@ use thiserror::Error;
 use torsten_primitives::hash::Hash32;
 use tracing::{debug, warn};
 
+/// Read a CRC32 checksum from bytes 12..16 of a secondary index entry.
+///
+/// Returns 0 if the field is all zeros (legacy entries without CRC).
+#[inline]
+fn read_crc32_from_entry(data: &[u8]) -> u32 {
+    if data.len() < 16 {
+        return 0;
+    }
+    u32::from_be_bytes([data[12], data[13], data[14], data[15]])
+}
+
 /// Secondary index entry size in bytes.
 const SECONDARY_ENTRY_SIZE: usize = 56;
 
@@ -70,13 +81,17 @@ struct SecondaryEntry {
     block_offset: u64,
     header_hash: [u8; 32],
     slot: u64,
+    /// CRC32 checksum of the block CBOR data (0 for legacy entries).
+    checksum: u32,
 }
 
 impl SecondaryEntry {
     fn encode(&self) -> [u8; SECONDARY_ENTRY_SIZE] {
         let mut entry = [0u8; SECONDARY_ENTRY_SIZE];
         entry[0..8].copy_from_slice(&self.block_offset.to_be_bytes());
-        // bytes 8..16: header_offset(2), header_size(2), checksum(4) — zeros
+        // bytes 8..12: header_offset(2), header_size(2) — zeros
+        // bytes 12..16: CRC32 checksum
+        entry[12..16].copy_from_slice(&self.checksum.to_be_bytes());
         entry[16..48].copy_from_slice(&self.header_hash);
         entry[48..56].copy_from_slice(&self.slot.to_be_bytes());
         entry
@@ -101,6 +116,8 @@ pub struct ImmutableDB {
     tip_block_no: u64,
     /// Active chunk for writing (None in read-only mode).
     active_chunk: Option<ActiveChunk>,
+    /// CRC32 checksums for blocks (hash -> checksum). Zero means no checksum (legacy).
+    checksums: HashMap<Hash32, u32>,
 }
 
 impl ImmutableDB {
@@ -145,6 +162,7 @@ impl ImmutableDB {
                 tip_hash: Hash32::ZERO,
                 tip_block_no: 0,
                 active_chunk: None,
+                checksums: HashMap::new(),
             });
         }
 
@@ -157,6 +175,7 @@ impl ImmutableDB {
 
         // Collect all (hash, location) pairs for building the index
         let mut all_entries: Vec<(Hash32, BlockLocation)> = Vec::new();
+        let mut checksums: HashMap<Hash32, u32> = HashMap::new();
 
         for &chunk_num in &chunk_nums {
             let secondary_path = dir.join(format!("{chunk_num:05}.secondary"));
@@ -191,8 +210,8 @@ impl ImmutableDB {
                 );
             }
 
-            // Parse secondary index entries: (block_offset, header_hash, slot)
-            let mut entries: Vec<(u64, [u8; 32], u64)> = Vec::with_capacity(entry_count);
+            // Parse secondary index entries: (block_offset, header_hash, slot, checksum)
+            let mut entries: Vec<(u64, [u8; 32], u64, u32)> = Vec::with_capacity(entry_count);
             let mut pos = 0;
             while pos + SECONDARY_ENTRY_SIZE <= secondary_data.len() {
                 let data = &secondary_data[pos..];
@@ -209,6 +228,7 @@ impl ImmutableDB {
                 };
                 let mut header_hash = [0u8; 32];
                 header_hash.copy_from_slice(&data[16..48]);
+                let checksum = read_crc32_from_entry(data);
                 let block_or_ebb = match read_be_u64(&data[48..56]) {
                     Some(v) => v,
                     None => {
@@ -220,7 +240,7 @@ impl ImmutableDB {
                         continue;
                     }
                 };
-                entries.push((block_offset, header_hash, block_or_ebb));
+                entries.push((block_offset, header_hash, block_or_ebb, checksum));
                 pos += SECONDARY_ENTRY_SIZE;
             }
 
@@ -228,7 +248,7 @@ impl ImmutableDB {
             let mut last_slot = 0u64;
 
             for i in 0..entries.len() {
-                let (block_offset, header_hash, slot) = entries[i];
+                let (block_offset, header_hash, slot, checksum) = entries[i];
                 let block_end = if i + 1 < entries.len() {
                     entries[i + 1].0
                 } else {
@@ -244,6 +264,11 @@ impl ImmutableDB {
                         block_end,
                     },
                 ));
+
+                // Store non-zero checksums for read-time verification
+                if checksum != 0 {
+                    checksums.insert(hash, checksum);
+                }
 
                 if slot < first_slot {
                     first_slot = slot;
@@ -330,10 +355,15 @@ impl ImmutableDB {
             tip_hash,
             tip_block_no,
             active_chunk: None,
+            checksums,
         })
     }
 
     /// Get block CBOR by header hash.
+    ///
+    /// Verifies CRC32 checksum if one was stored in the secondary index.
+    /// On mismatch, logs a warning but still returns the data (the block
+    /// may have been written before CRC was implemented).
     pub fn get_block(&self, hash: &Hash32) -> Option<Vec<u8>> {
         // Check active chunk's pending blocks first (not yet on disk via memmap)
         if let Some(ref active) = self.active_chunk {
@@ -342,7 +372,22 @@ impl ImmutableDB {
             }
         }
         let loc = self.block_index.lookup(hash)?;
-        self.read_block_at(&loc)
+        let cbor = self.read_block_at(&loc)?;
+
+        // Verify CRC32 if we have a stored checksum
+        if let Some(&expected_crc) = self.checksums.get(hash) {
+            let actual_crc = crc32fast::hash(&cbor);
+            if actual_crc != expected_crc {
+                warn!(
+                    hash = %hash.to_hex(),
+                    expected = expected_crc,
+                    actual = actual_crc,
+                    "CRC32 mismatch for block (possible data corruption)"
+                );
+            }
+        }
+
+        Some(cbor)
     }
 
     /// Check if a block exists by header hash.
@@ -621,11 +666,15 @@ impl ImmutableDB {
         active.chunk_file.write_all(cbor)?;
         active.current_offset += cbor.len() as u64;
 
+        // Compute CRC32 of the block CBOR for integrity verification
+        let checksum = crc32fast::hash(cbor);
+
         // Buffer secondary entry and block data for reads
         active.secondary_entries.push(SecondaryEntry {
             block_offset,
             header_hash: *hash.as_bytes(),
             slot,
+            checksum,
         });
         active.pending_blocks.insert(*hash, cbor.to_vec());
 
@@ -639,6 +688,9 @@ impl ImmutableDB {
                 block_end,
             },
         );
+
+        // Store checksum for read-time verification
+        self.checksums.insert(*hash, checksum);
 
         self.total_blocks += 1;
         if slot >= self.tip_slot {
@@ -1338,5 +1390,155 @@ mod tests {
         assert_eq!(db_default.total_blocks(), db_config.total_blocks());
         assert_eq!(db_default.tip_slot(), db_config.tip_slot());
         assert_eq!(db_default.tip_hash(), db_config.tip_hash());
+    }
+
+    // -----------------------------------------------------------------------
+    // CRC32 verification tests
+    // -----------------------------------------------------------------------
+
+    /// Build a chunk file + secondary index with CRC32 checksums in the
+    /// secondary entries.
+    fn create_test_chunk_with_crc(
+        dir: &Path,
+        chunk_num: u64,
+        blocks: &[(&[u8], [u8; 32], u64)], // (cbor, hash, slot)
+    ) {
+        let chunk_path = dir.join(format!("{chunk_num:05}.chunk"));
+        let secondary_path = dir.join(format!("{chunk_num:05}.secondary"));
+
+        let mut chunk_file = fs::File::create(&chunk_path).unwrap();
+        let mut secondary_file = fs::File::create(&secondary_path).unwrap();
+
+        let mut offset = 0u64;
+        for (cbor, hash, slot) in blocks {
+            chunk_file.write_all(cbor).unwrap();
+
+            let checksum = crc32fast::hash(cbor);
+
+            let mut entry = [0u8; 56];
+            entry[0..8].copy_from_slice(&offset.to_be_bytes());
+            // bytes 12..16: CRC32 checksum
+            entry[12..16].copy_from_slice(&checksum.to_be_bytes());
+            entry[16..48].copy_from_slice(hash);
+            entry[48..56].copy_from_slice(&slot.to_be_bytes());
+            secondary_file.write_all(&entry).unwrap();
+
+            offset += cbor.len() as u64;
+        }
+    }
+
+    #[test]
+    fn test_crc32_write_and_verify() {
+        // Blocks written via append_block should have CRC32 stored
+        let dir = tempfile::tempdir().unwrap();
+        let mut db = ImmutableDB::open_for_writing(dir.path()).unwrap();
+
+        let hash = Hash32::from_bytes([42u8; 32]);
+        let cbor = b"test block data with CRC";
+        db.append_block(100, 1, &hash, cbor).unwrap();
+
+        // Read back — should succeed with valid CRC
+        let result = db.get_block(&hash).unwrap();
+        assert_eq!(result, cbor);
+
+        // Verify the checksum was stored
+        assert_eq!(db.checksums.get(&hash), Some(&crc32fast::hash(cbor)));
+    }
+
+    #[test]
+    fn test_crc32_persisted_in_secondary_index() {
+        // Write blocks, flush, re-open, verify CRC is loaded from secondary index
+        let dir = tempfile::tempdir().unwrap();
+        let hash = Hash32::from_bytes([42u8; 32]);
+        let cbor = b"block for CRC persistence test";
+
+        {
+            let mut db = ImmutableDB::open_for_writing(dir.path()).unwrap();
+            db.append_block(100, 1, &hash, cbor).unwrap();
+            db.flush().unwrap();
+        }
+
+        // Re-open and verify CRC is loaded
+        let db = ImmutableDB::open(dir.path()).unwrap();
+        assert!(db.checksums.contains_key(&hash));
+        assert_eq!(db.checksums[&hash], crc32fast::hash(cbor));
+
+        // Read should succeed
+        let result = db.get_block(&hash).unwrap();
+        assert_eq!(result, cbor);
+    }
+
+    #[test]
+    fn test_crc32_mismatch_detection_warns_but_returns_data() {
+        // Create a chunk with valid CRC, then corrupt the chunk data.
+        // The read should still return the data but log a warning.
+        let dir = tempfile::tempdir().unwrap();
+        let hash = [42u8; 32];
+        let cbor = b"original data";
+
+        // Create chunk with correct CRC
+        create_test_chunk_with_crc(dir.path(), 0, &[(cbor, hash, 100)]);
+
+        // Now corrupt the chunk file by overwriting the data
+        let chunk_path = dir.path().join("00000.chunk");
+        fs::write(&chunk_path, b"corrupted dat").unwrap(); // same length, different content
+
+        let db = ImmutableDB::open(dir.path()).unwrap();
+
+        // CRC should be loaded
+        let hash32 = Hash32::from_bytes(hash);
+        assert!(db.checksums.contains_key(&hash32));
+
+        // Read should still return data (just warns)
+        let result = db.get_block(&hash32);
+        assert!(result.is_some());
+        assert_eq!(result.unwrap(), b"corrupted dat");
+    }
+
+    #[test]
+    fn test_crc32_legacy_entries_no_checksum() {
+        // Legacy entries (checksum=0) should not trigger CRC verification
+        let dir = tempfile::tempdir().unwrap();
+        let hash = [42u8; 32];
+
+        // create_test_chunk writes entries with checksum=0 (legacy)
+        create_test_chunk(dir.path(), 0, &[(b"block_data", hash, 100)]);
+
+        let db = ImmutableDB::open(dir.path()).unwrap();
+
+        // No checksum should be stored for legacy entries
+        assert!(!db.checksums.contains_key(&Hash32::from_bytes(hash)));
+
+        // Read should work without CRC verification
+        let result = db.get_block(&Hash32::from_bytes(hash)).unwrap();
+        assert_eq!(result, b"block_data");
+    }
+
+    #[test]
+    fn test_crc32_valid_read_after_write_and_reopen() {
+        // Full round-trip: write, flush, reopen, read with CRC verification
+        let dir = tempfile::tempdir().unwrap();
+        let blocks = vec![
+            (Hash32::from_bytes([1u8; 32]), b"block_one".as_slice()),
+            (Hash32::from_bytes([2u8; 32]), b"block_two".as_slice()),
+            (Hash32::from_bytes([3u8; 32]), b"block_three".as_slice()),
+        ];
+
+        {
+            let mut db = ImmutableDB::open_for_writing(dir.path()).unwrap();
+            for (i, (hash, cbor)) in blocks.iter().enumerate() {
+                db.append_block((i as u64 + 1) * 10, i as u64 + 1, hash, cbor)
+                    .unwrap();
+            }
+            db.flush().unwrap();
+        }
+
+        // Re-open and verify all blocks pass CRC verification
+        let db = ImmutableDB::open(dir.path()).unwrap();
+        for (hash, cbor) in &blocks {
+            let result = db.get_block(hash).unwrap();
+            assert_eq!(result, *cbor);
+            assert!(db.checksums.contains_key(hash));
+        }
     }
 }

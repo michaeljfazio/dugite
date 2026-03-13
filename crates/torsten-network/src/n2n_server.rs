@@ -1,7 +1,11 @@
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
+use std::sync::atomic::AtomicU64;
 use std::sync::Arc;
 use std::time::Instant;
+
+/// Global counter for assigning unique connection IDs to N2N peers.
+static N2N_CONNECTION_ID_COUNTER: AtomicU64 = AtomicU64::new(1);
 use thiserror::Error;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
@@ -387,11 +391,17 @@ impl N2NServer {
                         continue;
                     }
 
+                    // Configure TCP keepalive for dead connection detection
+                    if let Err(e) = crate::tcp::configure_tcp_keepalive(&stream) {
+                        warn!(peer = %peer_addr, "Failed to set TCP keepalive: {e}");
+                    }
+
                     active_connections.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     if let Some(ref m) = self.connection_metrics {
                         m.on_connect();
                     }
-                    debug!(peer = %peer_addr, "N2N peer connected");
+                    let conn_id = N2N_CONNECTION_ID_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    debug!(conn_id, peer = %peer_addr, "N2N peer connected");
 
                     let query_handler = self.query_handler.clone();
                     let block_provider = self.block_provider.clone();

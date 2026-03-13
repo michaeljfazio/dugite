@@ -9,7 +9,7 @@
 use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::time::{Duration, Instant};
-use tracing::debug;
+use tracing::{debug, trace};
 
 /// Diffusion mode matching cardano-node
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -63,6 +63,37 @@ pub enum PeerCategory {
     Bootstrap,
 }
 
+/// Circuit breaker state for peer connections.
+///
+/// Prevents repeated connection attempts to consistently failing peers.
+/// After a threshold of consecutive failures, the circuit opens and blocks
+/// connection attempts for a cooldown period. After the cooldown, one
+/// probe attempt is allowed (half-open). If the probe succeeds the circuit
+/// closes; if it fails the circuit opens again with a doubled cooldown.
+#[derive(Debug, Clone)]
+pub enum CircuitState {
+    /// Normal operation: connections are allowed.
+    Closed,
+    /// Circuit is open: connections are blocked until the cooldown expires.
+    Open {
+        /// When the circuit opened (or last re-opened).
+        opened_at: Instant,
+        /// Current cooldown duration (doubles on repeated failures, max 5 min).
+        cooldown: Duration,
+    },
+    /// Cooldown expired: exactly one probe connection is allowed.
+    HalfOpen,
+}
+
+/// Number of consecutive failures before the circuit opens.
+const CIRCUIT_BREAKER_THRESHOLD: u32 = 5;
+
+/// Initial cooldown duration when the circuit first opens.
+const CIRCUIT_BREAKER_INITIAL_COOLDOWN: Duration = Duration::from_secs(60);
+
+/// Maximum cooldown duration (5 minutes).
+const CIRCUIT_BREAKER_MAX_COOLDOWN: Duration = Duration::from_secs(300);
+
 /// Tracked peer state
 #[derive(Debug, Clone)]
 pub struct PeerInfo {
@@ -84,6 +115,10 @@ pub struct PeerInfo {
     pub is_initiator: Option<bool>,
     /// Performance metrics for adaptive peer selection
     pub performance: PeerPerformance,
+    /// Circuit breaker state
+    pub circuit_state: CircuitState,
+    /// Consecutive failures (resets on success)
+    pub consecutive_failures: u32,
 }
 
 /// Performance metrics tracked per peer for adaptive selection
@@ -212,6 +247,8 @@ impl PeerInfo {
             remote_tip_slot: None,
             is_initiator: None,
             performance: PeerPerformance::default(),
+            circuit_state: CircuitState::Closed,
+            consecutive_failures: 0,
         }
     }
 
@@ -476,12 +513,16 @@ impl PeerManager {
         }
     }
 
-    /// Mark a peer as successfully connected (warm)
+    /// Mark a peer as successfully connected (warm).
+    ///
+    /// Resets the circuit breaker to Closed and clears consecutive failures.
     pub fn peer_connected(&mut self, addr: &SocketAddr, version: u32, is_initiator: bool) {
         if let Some(info) = self.peers.get_mut(addr) {
             info.temperature = PeerTemperature::Warm;
             info.last_connected = Some(Instant::now());
             info.failure_count = 0;
+            info.consecutive_failures = 0;
+            info.circuit_state = CircuitState::Closed;
             info.version = Some(version);
             info.is_initiator = Some(is_initiator);
             self.cold_peers.remove(addr);
@@ -532,17 +573,90 @@ impl PeerManager {
         }
     }
 
-    /// Mark a peer as failed (connection attempt failed)
+    /// Mark a peer as failed (connection attempt failed).
+    ///
+    /// Manages the circuit breaker: increments consecutive failures and
+    /// transitions to Open after reaching the threshold. If already HalfOpen
+    /// and the probe fails, doubles the cooldown.
     pub fn peer_failed(&mut self, addr: &SocketAddr) {
         if let Some(info) = self.peers.get_mut(addr) {
             info.last_failed = Some(Instant::now());
             info.failure_count += 1;
+            info.consecutive_failures += 1;
             info.temperature = PeerTemperature::Cold;
             info.version = None;
             info.is_initiator = None;
             self.hot_peers.remove(addr);
             self.warm_peers.remove(addr);
             self.cold_peers.insert(*addr);
+
+            // Circuit breaker logic
+            match &info.circuit_state {
+                CircuitState::Closed => {
+                    if info.consecutive_failures >= CIRCUIT_BREAKER_THRESHOLD {
+                        trace!(
+                            %addr,
+                            failures = info.consecutive_failures,
+                            "Circuit breaker opened"
+                        );
+                        info.circuit_state = CircuitState::Open {
+                            opened_at: Instant::now(),
+                            cooldown: CIRCUIT_BREAKER_INITIAL_COOLDOWN,
+                        };
+                    }
+                }
+                CircuitState::HalfOpen => {
+                    // Probe failed: reopen with doubled cooldown
+                    trace!(
+                        %addr,
+                        "Circuit breaker half-open probe failed, reopening with doubled cooldown"
+                    );
+                    info.circuit_state = CircuitState::Open {
+                        opened_at: Instant::now(),
+                        cooldown: CIRCUIT_BREAKER_INITIAL_COOLDOWN
+                            .saturating_mul(2)
+                            .min(CIRCUIT_BREAKER_MAX_COOLDOWN),
+                    };
+                }
+                CircuitState::Open { cooldown, .. } => {
+                    // Already open: reopen with doubled cooldown
+                    let new_cooldown = cooldown.saturating_mul(2).min(CIRCUIT_BREAKER_MAX_COOLDOWN);
+                    info.circuit_state = CircuitState::Open {
+                        opened_at: Instant::now(),
+                        cooldown: new_cooldown,
+                    };
+                }
+            }
+        }
+    }
+
+    /// Check whether a connection attempt should be made to the given address,
+    /// taking the circuit breaker state into account.
+    ///
+    /// Returns `true` if the circuit is Closed or HalfOpen (probe allowed).
+    /// Returns `false` if the circuit is Open and the cooldown has not expired.
+    /// Transitions Open to HalfOpen when the cooldown expires.
+    pub fn should_attempt_connection(&mut self, addr: &SocketAddr) -> bool {
+        let info = match self.peers.get_mut(addr) {
+            Some(i) => i,
+            None => return true, // Unknown peer, allow
+        };
+
+        match &info.circuit_state {
+            CircuitState::Closed => true,
+            CircuitState::HalfOpen => true,
+            CircuitState::Open {
+                opened_at,
+                cooldown,
+            } => {
+                if opened_at.elapsed() >= *cooldown {
+                    trace!(%addr, "Circuit breaker cooldown expired, transitioning to half-open");
+                    info.circuit_state = CircuitState::HalfOpen;
+                    true
+                } else {
+                    false
+                }
+            }
         }
     }
 
@@ -1420,5 +1534,150 @@ mod tests {
         let shared = pm.peers_for_sharing(10);
         assert_eq!(shared.len(), 1, "Only the routable peer should be shared");
         assert_eq!(shared[0], routable);
+    }
+
+    #[test]
+    fn test_circuit_breaker_starts_closed() {
+        let mut pm = PeerManager::new(PeerManagerConfig::default());
+        let addr = test_addr(3001);
+        pm.add_config_peer(addr, false, false);
+        assert!(matches!(
+            pm.peers[&addr].circuit_state,
+            CircuitState::Closed
+        ));
+        assert!(pm.should_attempt_connection(&addr));
+    }
+
+    #[test]
+    fn test_circuit_breaker_opens_after_threshold() {
+        let mut pm = PeerManager::new(PeerManagerConfig::default());
+        let addr = test_addr(3001);
+        pm.add_config_peer(addr, false, false);
+
+        // Fail CIRCUIT_BREAKER_THRESHOLD times
+        for _ in 0..CIRCUIT_BREAKER_THRESHOLD {
+            pm.peer_failed(&addr);
+        }
+
+        assert!(matches!(
+            pm.peers[&addr].circuit_state,
+            CircuitState::Open { .. }
+        ));
+        assert!(!pm.should_attempt_connection(&addr));
+    }
+
+    #[test]
+    fn test_circuit_breaker_below_threshold_stays_closed() {
+        let mut pm = PeerManager::new(PeerManagerConfig::default());
+        let addr = test_addr(3001);
+        pm.add_config_peer(addr, false, false);
+
+        // Fail just below threshold
+        for _ in 0..(CIRCUIT_BREAKER_THRESHOLD - 1) {
+            pm.peer_failed(&addr);
+        }
+
+        assert!(matches!(
+            pm.peers[&addr].circuit_state,
+            CircuitState::Closed
+        ));
+        assert!(pm.should_attempt_connection(&addr));
+    }
+
+    #[test]
+    fn test_circuit_breaker_half_open_after_cooldown() {
+        let mut pm = PeerManager::new(PeerManagerConfig::default());
+        let addr = test_addr(3001);
+        pm.add_config_peer(addr, false, false);
+
+        // Open the circuit
+        for _ in 0..CIRCUIT_BREAKER_THRESHOLD {
+            pm.peer_failed(&addr);
+        }
+        assert!(!pm.should_attempt_connection(&addr));
+
+        // Manually set opened_at to the past to simulate cooldown expiry
+        if let Some(info) = pm.peers.get_mut(&addr) {
+            info.circuit_state = CircuitState::Open {
+                opened_at: Instant::now() - Duration::from_secs(120),
+                cooldown: CIRCUIT_BREAKER_INITIAL_COOLDOWN,
+            };
+        }
+
+        // Now should_attempt_connection transitions to HalfOpen
+        assert!(pm.should_attempt_connection(&addr));
+        assert!(matches!(
+            pm.peers[&addr].circuit_state,
+            CircuitState::HalfOpen
+        ));
+    }
+
+    #[test]
+    fn test_circuit_breaker_half_open_success_closes() {
+        let mut pm = PeerManager::new(PeerManagerConfig::default());
+        let addr = test_addr(3001);
+        pm.add_config_peer(addr, false, false);
+
+        // Set to HalfOpen state
+        if let Some(info) = pm.peers.get_mut(&addr) {
+            info.circuit_state = CircuitState::HalfOpen;
+            info.consecutive_failures = CIRCUIT_BREAKER_THRESHOLD;
+        }
+
+        // Successful connection should close the circuit
+        pm.peer_connected(&addr, 14, true);
+        assert!(matches!(
+            pm.peers[&addr].circuit_state,
+            CircuitState::Closed
+        ));
+        assert_eq!(pm.peers[&addr].consecutive_failures, 0);
+    }
+
+    #[test]
+    fn test_circuit_breaker_half_open_failure_reopens() {
+        let mut pm = PeerManager::new(PeerManagerConfig::default());
+        let addr = test_addr(3001);
+        pm.add_config_peer(addr, false, false);
+
+        // Set to HalfOpen state
+        if let Some(info) = pm.peers.get_mut(&addr) {
+            info.circuit_state = CircuitState::HalfOpen;
+        }
+
+        // Failure from HalfOpen should reopen with doubled cooldown
+        pm.peer_failed(&addr);
+        match &pm.peers[&addr].circuit_state {
+            CircuitState::Open { cooldown, .. } => {
+                assert_eq!(
+                    *cooldown,
+                    CIRCUIT_BREAKER_INITIAL_COOLDOWN.saturating_mul(2)
+                );
+            }
+            other => panic!("Expected Open, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_circuit_breaker_max_cooldown() {
+        let mut pm = PeerManager::new(PeerManagerConfig::default());
+        let addr = test_addr(3001);
+        pm.add_config_peer(addr, false, false);
+
+        // Set to Open with max cooldown, then fail again from HalfOpen
+        if let Some(info) = pm.peers.get_mut(&addr) {
+            info.circuit_state = CircuitState::Open {
+                opened_at: Instant::now(),
+                cooldown: CIRCUIT_BREAKER_MAX_COOLDOWN,
+            };
+        }
+
+        // Fail again — cooldown should not exceed max
+        pm.peer_failed(&addr);
+        match &pm.peers[&addr].circuit_state {
+            CircuitState::Open { cooldown, .. } => {
+                assert_eq!(*cooldown, CIRCUIT_BREAKER_MAX_COOLDOWN);
+            }
+            other => panic!("Expected Open, got {other:?}"),
+        }
     }
 }

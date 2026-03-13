@@ -5,6 +5,13 @@ use tokio::io::AsyncWriteExt;
 use tokio::net::TcpListener;
 use tracing::{error, info};
 
+/// Duration in seconds after which the node is considered "stalled" if no blocks received
+/// and sync progress is below 99%.
+const STALLED_THRESHOLD_SECS: u64 = 300; // 5 minutes
+
+/// Sync progress threshold (as percentage * 100) at or above which the node is "healthy".
+const SYNCED_THRESHOLD: u64 = 9990; // 99.9% (stored as pct * 100)
+
 /// Fixed histogram bucket boundaries (in milliseconds) for latency tracking.
 const LATENCY_BUCKETS_MS: &[f64] = &[
     1.0, 5.0, 10.0, 25.0, 50.0, 100.0, 250.0, 500.0, 1000.0, 2500.0, 5000.0, 10000.0,
@@ -81,6 +88,42 @@ impl Histogram {
     }
 }
 
+/// Get the current resident set size (RSS) of this process in bytes.
+fn get_resident_memory_bytes() -> u64 {
+    get_resident_memory_bytes_impl()
+}
+
+#[cfg(target_os = "linux")]
+fn get_resident_memory_bytes_impl() -> u64 {
+    std::fs::read_to_string("/proc/self/status")
+        .ok()
+        .and_then(|s| {
+            s.lines()
+                .find(|l| l.starts_with("VmRSS:"))
+                .and_then(|l| l.split_whitespace().nth(1))
+                .and_then(|v| v.parse::<u64>().ok())
+        })
+        .map(|kb| kb * 1024)
+        .unwrap_or(0)
+}
+
+#[cfg(target_os = "macos")]
+fn get_resident_memory_bytes_impl() -> u64 {
+    std::process::Command::new("ps")
+        .args(["-o", "rss=", "-p", &std::process::id().to_string()])
+        .output()
+        .ok()
+        .and_then(|out| String::from_utf8(out.stdout).ok())
+        .and_then(|s| s.trim().parse::<u64>().ok())
+        .map(|kb| kb * 1024)
+        .unwrap_or(0)
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn get_resident_memory_bytes_impl() -> u64 {
+    0
+}
+
 /// Node metrics for monitoring
 pub struct NodeMetrics {
     pub blocks_received: AtomicU64,
@@ -127,6 +170,17 @@ pub struct NodeMetrics {
     startup_instant: std::time::Instant,
     /// Per-validation-error-type rejection counts (label → count).
     validation_errors: std::sync::Mutex<HashMap<String, u64>>,
+    /// Epoch milliseconds when the last block was received (0 = never)
+    pub last_block_received_at: AtomicU64,
+    /// Epoch millis of last RollForward event (for chainsync_idle calculation)
+    #[allow(dead_code)]
+    pub last_roll_forward_at: AtomicU64,
+    /// Duration of last ledger replay in seconds (stored as f64 bits)
+    pub replay_duration_secs: AtomicU64,
+    /// Tip age in seconds (wall_clock - slot_to_time(tip_slot))
+    pub tip_age_secs: AtomicU64,
+    /// Seconds since last RollForward event
+    pub chainsync_idle_secs: AtomicU64,
 }
 
 impl NodeMetrics {
@@ -169,6 +223,11 @@ impl NodeMetrics {
             peer_block_fetch_ms: Histogram::new(),
             startup_instant: std::time::Instant::now(),
             validation_errors: std::sync::Mutex::new(HashMap::new()),
+            last_block_received_at: AtomicU64::new(0),
+            last_roll_forward_at: AtomicU64::new(0),
+            replay_duration_secs: AtomicU64::new(0),
+            tip_age_secs: AtomicU64::new(0),
+            chainsync_idle_secs: AtomicU64::new(0),
         }
     }
 
@@ -231,6 +290,105 @@ impl NodeMetrics {
 
     pub fn set_disk_available_bytes(&self, bytes: u64) {
         self.disk_available_bytes.store(bytes, Ordering::Relaxed);
+    }
+
+    /// Record that a block was just received (updates timestamp to now).
+    pub fn record_block_received(&self) {
+        let now_millis = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
+        self.last_block_received_at
+            .store(now_millis, Ordering::Relaxed);
+    }
+
+    /// Returns the node health status: "healthy", "syncing", or "stalled".
+    ///
+    /// - "healthy": sync_progress >= 99.9%
+    /// - "stalled": last block received > 5 minutes ago AND sync_progress < 99%
+    /// - "syncing": everything else (actively catching up)
+    pub fn health_status(&self) -> &'static str {
+        let sync_pct = self.sync_progress_pct.load(Ordering::Relaxed);
+
+        // Fully synced
+        if sync_pct >= SYNCED_THRESHOLD {
+            return "healthy";
+        }
+
+        // Check for stalled condition
+        let last_block_ms = self.last_block_received_at.load(Ordering::Relaxed);
+        if last_block_ms > 0 && sync_pct < 9900 {
+            let now_ms = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis() as u64;
+            let elapsed_secs = now_ms.saturating_sub(last_block_ms) / 1000;
+            if elapsed_secs > STALLED_THRESHOLD_SECS {
+                return "stalled";
+            }
+        }
+
+        "syncing"
+    }
+
+    /// Returns the ISO 8601 timestamp of the last block received, or None if no block received yet.
+    pub fn last_block_received_iso(&self) -> Option<String> {
+        let ms = self.last_block_received_at.load(Ordering::Relaxed);
+        if ms == 0 {
+            return None;
+        }
+        let secs = (ms / 1000) as i64;
+        let nanos = ((ms % 1000) * 1_000_000) as u32;
+        let dt = chrono::DateTime::from_timestamp(secs, nanos)?;
+        Some(dt.to_rfc3339_opts(chrono::SecondsFormat::Millis, true))
+    }
+
+    /// Returns uptime in seconds since node startup.
+    pub fn uptime_seconds(&self) -> u64 {
+        self.startup_instant.elapsed().as_secs()
+    }
+
+    /// Check if the node is ready (sync_progress >= 99.9%).
+    /// Used for Kubernetes readiness probes.
+    pub fn is_ready(&self) -> bool {
+        self.sync_progress_pct.load(Ordering::Relaxed) >= SYNCED_THRESHOLD
+    }
+
+    /// Record a RollForward event timestamp for chainsync_idle tracking.
+    #[allow(dead_code)]
+    pub fn record_roll_forward(&self) {
+        let now_millis = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
+        self.last_roll_forward_at
+            .store(now_millis, Ordering::Relaxed);
+    }
+
+    /// Set the tip age in seconds.
+    #[allow(dead_code)]
+    pub fn set_tip_age_secs(&self, secs: u64) {
+        self.tip_age_secs.store(secs, Ordering::Relaxed);
+    }
+
+    /// Set the replay duration in seconds.
+    #[allow(dead_code)]
+    pub fn set_replay_duration_secs(&self, secs: u64) {
+        self.replay_duration_secs.store(secs, Ordering::Relaxed);
+    }
+
+    /// Compute and store the chainsync idle time.
+    #[allow(dead_code)]
+    pub fn update_chainsync_idle(&self) {
+        let last_rf = self.last_roll_forward_at.load(Ordering::Relaxed);
+        if last_rf > 0 {
+            let now_ms = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis() as u64;
+            let idle_secs = now_ms.saturating_sub(last_rf) / 1000;
+            self.chainsync_idle_secs.store(idle_secs, Ordering::Relaxed);
+        }
     }
 
     /// Format metrics as Prometheus exposition format
@@ -403,6 +561,21 @@ impl NodeMetrics {
                 "Currently active N2C connections",
                 &self.n2c_connections_active,
             ),
+            (
+                "torsten_tip_age_seconds",
+                "Seconds since the tip slot time",
+                &self.tip_age_secs,
+            ),
+            (
+                "torsten_chainsync_idle_seconds",
+                "Seconds since last ChainSync RollForward event",
+                &self.chainsync_idle_secs,
+            ),
+            (
+                "torsten_ledger_replay_duration_seconds",
+                "Duration of last ledger replay in seconds",
+                &self.replay_duration_secs,
+            ),
         ];
 
         for (name, help, value) in counters {
@@ -423,6 +596,12 @@ impl NodeMetrics {
         let uptime_secs = self.startup_instant.elapsed().as_secs();
         out.push_str(&format!(
             "# HELP torsten_uptime_seconds Time since node startup\n# TYPE torsten_uptime_seconds gauge\ntorsten_uptime_seconds {uptime_secs}\n"
+        ));
+
+        // Resident memory gauge
+        let rss = get_resident_memory_bytes();
+        out.push_str(&format!(
+            "# HELP torsten_mem_resident_bytes Resident set size in bytes\n# TYPE torsten_mem_resident_bytes gauge\ntorsten_mem_resident_bytes {rss}\n"
         ));
 
         // Validation error breakdown
@@ -513,15 +692,39 @@ pub async fn start_metrics_server(
             .unwrap_or(0);
         let request = std::str::from_utf8(&buf[..n]).unwrap_or("");
 
-        let response = if request.starts_with("GET /health") {
-            let uptime = metrics.startup_instant.elapsed().as_secs();
+        let response = if request.starts_with("GET /ready") {
+            // Kubernetes readiness probe: 200 if synced, 503 if not
+            if metrics.is_ready() {
+                let body = r#"{"ready":true}"#;
+                format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                )
+            } else {
+                let sync_pct = metrics.sync_progress_pct.load(Ordering::Relaxed) as f64 / 100.0;
+                let body = format!("{{\"ready\":false,\"sync_progress\":{sync_pct:.2}}}");
+                format!(
+                    "HTTP/1.1 503 Service Unavailable\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                )
+            }
+        } else if request.starts_with("GET /health") {
+            let status = metrics.health_status();
+            let uptime = metrics.uptime_seconds();
             let slot = metrics.slot_number.load(Ordering::Relaxed);
             let block = metrics.block_number.load(Ordering::Relaxed);
             let epoch = metrics.epoch_number.load(Ordering::Relaxed);
             let sync_pct = metrics.sync_progress_pct.load(Ordering::Relaxed) as f64 / 100.0;
             let peers = metrics.peers_connected.load(Ordering::Relaxed);
+            let last_block_ts = metrics.last_block_received_iso();
+            let last_block_json = match &last_block_ts {
+                Some(ts) => format!("\"{}\"", ts),
+                None => "null".to_string(),
+            };
             let body = format!(
-                "{{\"status\":\"ok\",\"uptime_secs\":{uptime},\"slot\":{slot},\"block\":{block},\"epoch\":{epoch},\"sync_progress\":{sync_pct:.2},\"peers\":{peers}}}"
+                "{{\"status\":\"{status}\",\"uptime_seconds\":{uptime},\"slot_number\":{slot},\"block_number\":{block},\"epoch_number\":{epoch},\"sync_progress\":{sync_pct:.2},\"peers_connected\":{peers},\"last_block_received_at\":{last_block_json}}}"
             );
             format!(
                 "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
@@ -627,5 +830,110 @@ mod tests {
         assert!(output.contains("torsten_peer_handshake_rtt_ms_bucket"));
         assert!(output.contains("torsten_peer_block_fetch_ms_bucket"));
         assert!(output.contains("torsten_uptime_seconds"));
+    }
+
+    #[test]
+    fn test_health_status_healthy() {
+        let metrics = NodeMetrics::new();
+        // 99.9% = 9990 (stored as pct * 100)
+        metrics.sync_progress_pct.store(9990, Ordering::Relaxed);
+        assert_eq!(metrics.health_status(), "healthy");
+
+        // Above threshold is also healthy
+        metrics.sync_progress_pct.store(10000, Ordering::Relaxed);
+        assert_eq!(metrics.health_status(), "healthy");
+    }
+
+    #[test]
+    fn test_health_status_syncing() {
+        let metrics = NodeMetrics::new();
+        // 50% sync, recently received a block
+        metrics.sync_progress_pct.store(5000, Ordering::Relaxed);
+        metrics.record_block_received();
+        assert_eq!(metrics.health_status(), "syncing");
+    }
+
+    #[test]
+    fn test_health_status_stalled() {
+        let metrics = NodeMetrics::new();
+        // Below 99% and last block was > 5 minutes ago
+        metrics.sync_progress_pct.store(5000, Ordering::Relaxed);
+        let five_min_ago_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64
+            - (STALLED_THRESHOLD_SECS + 10) * 1000;
+        metrics
+            .last_block_received_at
+            .store(five_min_ago_ms, Ordering::Relaxed);
+        assert_eq!(metrics.health_status(), "stalled");
+    }
+
+    #[test]
+    fn test_health_status_not_stalled_when_synced() {
+        let metrics = NodeMetrics::new();
+        // Even if last block was long ago, if we're synced we're healthy
+        metrics.sync_progress_pct.store(9990, Ordering::Relaxed);
+        let old_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64
+            - 600_000; // 10 minutes ago
+        metrics
+            .last_block_received_at
+            .store(old_ms, Ordering::Relaxed);
+        assert_eq!(metrics.health_status(), "healthy");
+    }
+
+    #[test]
+    fn test_readiness_check() {
+        let metrics = NodeMetrics::new();
+
+        // Not ready at 0%
+        assert!(!metrics.is_ready());
+
+        // Not ready at 99%
+        metrics.sync_progress_pct.store(9900, Ordering::Relaxed);
+        assert!(!metrics.is_ready());
+
+        // Ready at 99.9%
+        metrics.sync_progress_pct.store(9990, Ordering::Relaxed);
+        assert!(metrics.is_ready());
+
+        // Ready at 100%
+        metrics.sync_progress_pct.store(10000, Ordering::Relaxed);
+        assert!(metrics.is_ready());
+    }
+
+    #[test]
+    fn test_last_block_received_iso() {
+        let metrics = NodeMetrics::new();
+
+        // No block received yet
+        assert!(metrics.last_block_received_iso().is_none());
+
+        // Record a block
+        metrics.record_block_received();
+        let iso = metrics.last_block_received_iso();
+        assert!(iso.is_some());
+        let ts = iso.unwrap();
+        // Should be a valid ISO 8601 string containing 'T' and 'Z'
+        assert!(ts.contains('T'));
+        assert!(ts.contains('Z'));
+    }
+
+    #[test]
+    fn test_record_block_received_updates_timestamp() {
+        let metrics = NodeMetrics::new();
+        assert_eq!(metrics.last_block_received_at.load(Ordering::Relaxed), 0);
+        metrics.record_block_received();
+        let ts = metrics.last_block_received_at.load(Ordering::Relaxed);
+        assert!(ts > 0);
+        // Should be within the last second
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+        assert!(now_ms - ts < 1000);
     }
 }

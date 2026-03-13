@@ -1,11 +1,181 @@
-//! In-memory volatile block storage.
+//! In-memory volatile block storage with optional write-ahead log.
 //!
-//! Stores the last k blocks (and any forks) in memory. Lost on crash —
-//! re-fetched from peers in seconds. This is the simplest possible
-//! implementation matching Haskell cardano-node's VolatileDB semantics.
+//! Stores the last k blocks (and any forks) in memory. The optional WAL
+//! persists volatile blocks to disk so they survive crashes — on restart
+//! the WAL is replayed to rebuild the in-memory state.
+//!
+//! Use `VolatileDB::new()` for a pure in-memory store (backward compatible)
+//! or `VolatileDB::open(path)` to enable crash recovery via WAL.
 
 use std::collections::{BTreeMap, HashMap};
+use std::fs::{self, File, OpenOptions};
+use std::io::{self, BufWriter, Write};
+use std::path::{Path, PathBuf};
 use torsten_primitives::hash::Hash32;
+use tracing::{debug, warn};
+
+/// WAL entry magic bytes: "TWAL"
+const WAL_MAGIC: [u8; 4] = *b"TWAL";
+
+/// Size of a WAL entry header (magic + slot + block_no + hash + cbor_len).
+const WAL_HEADER_SIZE: usize = 4 + 8 + 8 + 32 + 4; // 56 bytes
+
+/// WAL file name within the volatile directory.
+const WAL_FILENAME: &str = "volatile-wal.bin";
+
+/// Manages the write-ahead log file for crash recovery.
+struct WalWriter {
+    file: BufWriter<File>,
+    path: PathBuf,
+}
+
+impl WalWriter {
+    /// Open or create a WAL file at the given path in append mode.
+    fn open(path: &Path) -> io::Result<Self> {
+        let file = OpenOptions::new().create(true).append(true).open(path)?;
+        Ok(WalWriter {
+            file: BufWriter::new(file),
+            path: path.to_path_buf(),
+        })
+    }
+
+    /// Append a WAL entry and sync to disk.
+    fn append(&mut self, slot: u64, block_no: u64, hash: &Hash32, cbor: &[u8]) -> io::Result<()> {
+        self.file.write_all(&WAL_MAGIC)?;
+        self.file.write_all(&slot.to_be_bytes())?;
+        self.file.write_all(&block_no.to_be_bytes())?;
+        self.file.write_all(hash.as_bytes())?;
+        self.file.write_all(&(cbor.len() as u32).to_be_bytes())?;
+        self.file.write_all(cbor)?;
+        self.file.flush()?;
+        self.file.get_ref().sync_data()?;
+        Ok(())
+    }
+
+    /// Truncate the WAL file to zero bytes.
+    fn truncate(&mut self) -> io::Result<()> {
+        // Re-open the file in truncate mode
+        let file = OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .open(&self.path)?;
+        file.sync_data()?;
+        // Re-open in append mode
+        let file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&self.path)?;
+        self.file = BufWriter::new(file);
+        Ok(())
+    }
+
+    /// Rewrite the WAL with only the given entries (used after flush).
+    fn rewrite(
+        &mut self,
+        entries: &[(u64, u64, Hash32, Vec<u8>)], // (slot, block_no, hash, cbor)
+    ) -> io::Result<()> {
+        // Write to a temp file, then rename for atomicity
+        let tmp_path = self.path.with_extension("tmp");
+        {
+            let file = File::create(&tmp_path)?;
+            let mut writer = BufWriter::new(file);
+            for (slot, block_no, hash, cbor) in entries {
+                writer.write_all(&WAL_MAGIC)?;
+                writer.write_all(&slot.to_be_bytes())?;
+                writer.write_all(&block_no.to_be_bytes())?;
+                writer.write_all(hash.as_bytes())?;
+                writer.write_all(&(cbor.len() as u32).to_be_bytes())?;
+                writer.write_all(cbor)?;
+            }
+            writer.flush()?;
+            writer.get_ref().sync_data()?;
+        }
+        fs::rename(&tmp_path, &self.path)?;
+        // Re-open in append mode
+        let file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&self.path)?;
+        self.file = BufWriter::new(file);
+        Ok(())
+    }
+}
+
+/// Parsed WAL entry for replay.
+struct WalEntry {
+    slot: u64,
+    block_no: u64,
+    hash: Hash32,
+    cbor: Vec<u8>,
+}
+
+/// Replay WAL entries from the given file path.
+///
+/// Validates magic bytes for each entry and stops on corrupted/truncated data.
+fn replay_wal(path: &Path) -> io::Result<Vec<WalEntry>> {
+    let mut entries = Vec::new();
+
+    let data = match fs::read(path) {
+        Ok(d) => d,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(entries),
+        Err(e) => return Err(e),
+    };
+
+    if data.is_empty() {
+        return Ok(entries);
+    }
+
+    let mut pos = 0;
+    while pos < data.len() {
+        // Check if we have enough bytes for the header
+        if pos + WAL_HEADER_SIZE > data.len() {
+            warn!(
+                pos,
+                remaining = data.len() - pos,
+                "WAL: truncated entry header, stopping replay"
+            );
+            break;
+        }
+
+        // Validate magic
+        if data[pos..pos + 4] != WAL_MAGIC {
+            warn!(pos, "WAL: invalid magic bytes, stopping replay");
+            break;
+        }
+
+        let slot = u64::from_be_bytes(data[pos + 4..pos + 12].try_into().unwrap());
+        let block_no = u64::from_be_bytes(data[pos + 12..pos + 20].try_into().unwrap());
+        let mut hash_bytes = [0u8; 32];
+        hash_bytes.copy_from_slice(&data[pos + 20..pos + 52]);
+        let cbor_len = u32::from_be_bytes(data[pos + 52..pos + 56].try_into().unwrap()) as usize;
+
+        let cbor_start = pos + WAL_HEADER_SIZE;
+        let cbor_end = cbor_start + cbor_len;
+
+        // Check if we have enough bytes for the CBOR data
+        if cbor_end > data.len() {
+            warn!(
+                pos,
+                cbor_len,
+                available = data.len() - cbor_start,
+                "WAL: truncated CBOR data, stopping replay"
+            );
+            break;
+        }
+
+        entries.push(WalEntry {
+            slot,
+            block_no,
+            hash: Hash32::from_bytes(hash_bytes),
+            cbor: data[cbor_start..cbor_end].to_vec(),
+        });
+
+        pos = cbor_end;
+    }
+
+    Ok(entries)
+}
 
 /// A block stored in the volatile DB.
 #[derive(Debug, Clone)]
@@ -19,16 +189,19 @@ pub struct VolatileBlock {
 /// In-memory store for recent (volatile) blocks.
 ///
 /// These blocks are within k of the tip and not yet finalized to
-/// the ImmutableDB. On crash, they are re-fetched from peers.
+/// the ImmutableDB. With WAL enabled (`open()`), blocks survive crashes.
+/// Without WAL (`new()`), they are re-fetched from peers on crash.
 pub struct VolatileDB {
     blocks: HashMap<Hash32, VolatileBlock>,
     slot_index: BTreeMap<u64, Vec<Hash32>>,
     block_no_index: BTreeMap<u64, Hash32>,
     successors: HashMap<Hash32, Vec<Hash32>>,
     tip: Option<(u64, Hash32, u64)>, // (slot, hash, block_no)
+    wal: Option<WalWriter>,
 }
 
 impl VolatileDB {
+    /// Create a new in-memory-only VolatileDB (no WAL, no crash recovery).
     pub fn new() -> Self {
         VolatileDB {
             blocks: HashMap::new(),
@@ -36,11 +209,80 @@ impl VolatileDB {
             block_no_index: BTreeMap::new(),
             successors: HashMap::new(),
             tip: None,
+            wal: None,
         }
     }
 
+    /// Open a VolatileDB with WAL-based crash recovery.
+    ///
+    /// Opens/creates the WAL file at `path/volatile-wal.bin` and replays
+    /// any existing entries to rebuild the in-memory state.
+    pub fn open(path: &Path) -> io::Result<Self> {
+        fs::create_dir_all(path)?;
+        let wal_path = path.join(WAL_FILENAME);
+
+        // Replay existing WAL entries
+        let entries = replay_wal(&wal_path)?;
+        let replayed = entries.len();
+
+        let mut db = VolatileDB {
+            blocks: HashMap::new(),
+            slot_index: BTreeMap::new(),
+            block_no_index: BTreeMap::new(),
+            successors: HashMap::new(),
+            tip: None,
+            wal: None,
+        };
+
+        // Rebuild in-memory state from WAL
+        for entry in entries {
+            // WAL doesn't store prev_hash, use ZERO as placeholder.
+            // The prev_hash is only used for successor tracking which is
+            // an optimization; it will be rebuilt correctly as new blocks arrive.
+            db.insert_block_internal(
+                entry.hash,
+                entry.slot,
+                entry.block_no,
+                Hash32::ZERO,
+                entry.cbor,
+            );
+        }
+
+        // Open WAL writer for new entries
+        let wal = WalWriter::open(&wal_path)?;
+        db.wal = Some(wal);
+
+        if replayed > 0 {
+            debug!(replayed, "VolatileDB: replayed WAL entries");
+        }
+
+        Ok(db)
+    }
+
     /// Add a block to the volatile store.
+    ///
+    /// If WAL is enabled, the block is appended to the WAL before being
+    /// inserted into the in-memory state.
     pub fn add_block(
+        &mut self,
+        hash: Hash32,
+        slot: u64,
+        block_no: u64,
+        prev_hash: Hash32,
+        cbor: Vec<u8>,
+    ) {
+        // Write to WAL first (if enabled)
+        if let Some(ref mut wal) = self.wal {
+            if let Err(e) = wal.append(slot, block_no, &hash, &cbor) {
+                warn!(error = %e, "WAL: failed to append entry");
+            }
+        }
+
+        self.insert_block_internal(hash, slot, block_no, prev_hash, cbor);
+    }
+
+    /// Internal block insertion (no WAL write).
+    fn insert_block_internal(
         &mut self,
         hash: Hash32,
         slot: u64,
@@ -134,6 +376,8 @@ impl VolatileDB {
 
     /// Remove all blocks at or below a given slot.
     /// Returns the hashes of removed blocks.
+    ///
+    /// If WAL is enabled, rewrites the WAL with only the remaining entries.
     pub fn remove_blocks_up_to_slot(&mut self, slot: u64) -> Vec<Hash32> {
         let slots_to_remove: Vec<u64> = self.slot_index.range(..=slot).map(|(&s, _)| s).collect();
 
@@ -154,6 +398,19 @@ impl VolatileDB {
                 }
             }
         }
+
+        // Rewrite WAL with remaining entries
+        if let Some(ref mut wal) = self.wal {
+            let remaining: Vec<(u64, u64, Hash32, Vec<u8>)> = self
+                .blocks
+                .iter()
+                .map(|(h, b)| (b.slot, b.block_no, *h, b.cbor.clone()))
+                .collect();
+            if let Err(e) = wal.rewrite(&remaining) {
+                warn!(error = %e, "WAL: failed to rewrite after flush");
+            }
+        }
+
         removed
     }
 
@@ -208,16 +465,37 @@ impl VolatileDB {
 
         // Recompute tip
         self.recompute_tip();
+
+        // Rewrite WAL with remaining entries
+        if let Some(ref mut wal) = self.wal {
+            let remaining: Vec<(u64, u64, Hash32, Vec<u8>)> = self
+                .blocks
+                .iter()
+                .map(|(h, b)| (b.slot, b.block_no, *h, b.cbor.clone()))
+                .collect();
+            if let Err(e) = wal.rewrite(&remaining) {
+                warn!(error = %e, "WAL: failed to rewrite after rollback");
+            }
+        }
+
         removed
     }
 
     /// Clear all blocks.
+    ///
+    /// If WAL is enabled, truncates the WAL file to zero.
     pub fn clear(&mut self) {
         self.blocks.clear();
         self.slot_index.clear();
         self.block_no_index.clear();
         self.successors.clear();
         self.tip = None;
+
+        if let Some(ref mut wal) = self.wal {
+            if let Err(e) = wal.truncate() {
+                warn!(error = %e, "WAL: failed to truncate on clear");
+            }
+        }
     }
 
     /// Get the current tip.
@@ -376,5 +654,265 @@ mod tests {
 
         let blocks = db.get_blocks_in_slot_range(100, 200);
         assert_eq!(blocks.len(), 2);
+    }
+
+    // -----------------------------------------------------------------------
+    // WAL tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_wal_creation_and_replay() {
+        let dir = tempfile::tempdir().unwrap();
+        let wal_dir = dir.path().join("volatile");
+
+        // Create DB with WAL and add blocks
+        {
+            let mut db = VolatileDB::open(&wal_dir).unwrap();
+            db.add_block(h(1), 100, 10, h(0), b"block1".to_vec());
+            db.add_block(h(2), 200, 20, h(1), b"block2".to_vec());
+            db.add_block(h(3), 300, 30, h(2), b"block3".to_vec());
+
+            assert_eq!(db.len(), 3);
+            assert!(db.has_block(&h(1)));
+            assert!(db.has_block(&h(2)));
+            assert!(db.has_block(&h(3)));
+        }
+
+        // Re-open: should replay WAL and recover all blocks
+        {
+            let db = VolatileDB::open(&wal_dir).unwrap();
+            assert_eq!(db.len(), 3);
+            assert!(db.has_block(&h(1)));
+            assert!(db.has_block(&h(2)));
+            assert!(db.has_block(&h(3)));
+            assert_eq!(db.get_block_cbor(&h(1)).unwrap(), b"block1");
+            assert_eq!(db.get_block_cbor(&h(2)).unwrap(), b"block2");
+            assert_eq!(db.get_block_cbor(&h(3)).unwrap(), b"block3");
+            assert_eq!(db.get_tip(), Some((300, h(3), 30)));
+        }
+    }
+
+    #[test]
+    fn test_wal_truncation_on_flush() {
+        let dir = tempfile::tempdir().unwrap();
+        let wal_dir = dir.path().join("volatile");
+
+        // Create DB, add blocks, then remove some (simulating flush)
+        {
+            let mut db = VolatileDB::open(&wal_dir).unwrap();
+            db.add_block(h(1), 100, 10, h(0), b"b1".to_vec());
+            db.add_block(h(2), 200, 20, h(1), b"b2".to_vec());
+            db.add_block(h(3), 300, 30, h(2), b"b3".to_vec());
+
+            // Simulate flush: remove blocks up to slot 200
+            db.remove_blocks_up_to_slot(200);
+            assert_eq!(db.len(), 1);
+            assert!(db.has_block(&h(3)));
+        }
+
+        // Re-open: WAL should only contain block 3
+        {
+            let db = VolatileDB::open(&wal_dir).unwrap();
+            assert_eq!(db.len(), 1);
+            assert!(!db.has_block(&h(1)));
+            assert!(!db.has_block(&h(2)));
+            assert!(db.has_block(&h(3)));
+            assert_eq!(db.get_block_cbor(&h(3)).unwrap(), b"b3");
+        }
+    }
+
+    #[test]
+    fn test_wal_corrupted_recovery_partial_write() {
+        let dir = tempfile::tempdir().unwrap();
+        let wal_dir = dir.path().join("volatile");
+        fs::create_dir_all(&wal_dir).unwrap();
+        let wal_path = wal_dir.join(WAL_FILENAME);
+
+        // Write one valid entry followed by a truncated entry
+        {
+            let mut file = File::create(&wal_path).unwrap();
+
+            // Valid entry: slot=100, block_no=10, hash=h(1), cbor="block1"
+            let cbor = b"block1";
+            file.write_all(&WAL_MAGIC).unwrap();
+            file.write_all(&100u64.to_be_bytes()).unwrap();
+            file.write_all(&10u64.to_be_bytes()).unwrap();
+            file.write_all(h(1).as_bytes()).unwrap();
+            file.write_all(&(cbor.len() as u32).to_be_bytes()).unwrap();
+            file.write_all(cbor).unwrap();
+
+            // Truncated entry: only magic + partial slot
+            file.write_all(&WAL_MAGIC).unwrap();
+            file.write_all(&[0u8; 3]).unwrap(); // Incomplete slot
+        }
+
+        // Open should recover the first valid entry and skip the truncated one
+        let db = VolatileDB::open(&wal_dir).unwrap();
+        assert_eq!(db.len(), 1);
+        assert!(db.has_block(&h(1)));
+        assert_eq!(db.get_block_cbor(&h(1)).unwrap(), b"block1");
+    }
+
+    #[test]
+    fn test_wal_corrupted_recovery_bad_magic() {
+        let dir = tempfile::tempdir().unwrap();
+        let wal_dir = dir.path().join("volatile");
+        fs::create_dir_all(&wal_dir).unwrap();
+        let wal_path = wal_dir.join(WAL_FILENAME);
+
+        // Write one valid entry followed by garbage
+        {
+            let mut file = File::create(&wal_path).unwrap();
+
+            let cbor = b"block1";
+            file.write_all(&WAL_MAGIC).unwrap();
+            file.write_all(&100u64.to_be_bytes()).unwrap();
+            file.write_all(&10u64.to_be_bytes()).unwrap();
+            file.write_all(h(1).as_bytes()).unwrap();
+            file.write_all(&(cbor.len() as u32).to_be_bytes()).unwrap();
+            file.write_all(cbor).unwrap();
+
+            // Invalid magic followed by garbage
+            file.write_all(b"JUNK").unwrap();
+            file.write_all(&[0xAB; 100]).unwrap();
+        }
+
+        let db = VolatileDB::open(&wal_dir).unwrap();
+        assert_eq!(db.len(), 1);
+        assert!(db.has_block(&h(1)));
+    }
+
+    #[test]
+    fn test_wal_corrupted_recovery_truncated_cbor() {
+        let dir = tempfile::tempdir().unwrap();
+        let wal_dir = dir.path().join("volatile");
+        fs::create_dir_all(&wal_dir).unwrap();
+        let wal_path = wal_dir.join(WAL_FILENAME);
+
+        // Write one valid entry followed by an entry with truncated CBOR
+        {
+            let mut file = File::create(&wal_path).unwrap();
+
+            // Valid entry
+            let cbor = b"ok";
+            file.write_all(&WAL_MAGIC).unwrap();
+            file.write_all(&100u64.to_be_bytes()).unwrap();
+            file.write_all(&10u64.to_be_bytes()).unwrap();
+            file.write_all(h(1).as_bytes()).unwrap();
+            file.write_all(&(cbor.len() as u32).to_be_bytes()).unwrap();
+            file.write_all(cbor).unwrap();
+
+            // Entry with valid header but cbor_len says 1000 bytes, only 5 written
+            file.write_all(&WAL_MAGIC).unwrap();
+            file.write_all(&200u64.to_be_bytes()).unwrap();
+            file.write_all(&20u64.to_be_bytes()).unwrap();
+            file.write_all(h(2).as_bytes()).unwrap();
+            file.write_all(&1000u32.to_be_bytes()).unwrap();
+            file.write_all(&[0u8; 5]).unwrap(); // Only 5 of 1000 bytes
+        }
+
+        let db = VolatileDB::open(&wal_dir).unwrap();
+        assert_eq!(db.len(), 1);
+        assert!(db.has_block(&h(1)));
+        assert!(!db.has_block(&h(2)));
+    }
+
+    #[test]
+    fn test_wal_empty_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let wal_dir = dir.path().join("volatile");
+        fs::create_dir_all(&wal_dir).unwrap();
+        let wal_path = wal_dir.join(WAL_FILENAME);
+
+        // Create empty WAL file
+        File::create(&wal_path).unwrap();
+
+        let db = VolatileDB::open(&wal_dir).unwrap();
+        assert_eq!(db.len(), 0);
+        assert!(db.is_empty());
+        assert_eq!(db.get_tip(), None);
+    }
+
+    #[test]
+    fn test_wal_no_existing_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let wal_dir = dir.path().join("volatile");
+
+        // No WAL file exists yet
+        let db = VolatileDB::open(&wal_dir).unwrap();
+        assert_eq!(db.len(), 0);
+        assert!(db.is_empty());
+    }
+
+    #[test]
+    fn test_wal_clear_truncates() {
+        let dir = tempfile::tempdir().unwrap();
+        let wal_dir = dir.path().join("volatile");
+
+        {
+            let mut db = VolatileDB::open(&wal_dir).unwrap();
+            db.add_block(h(1), 100, 10, h(0), b"b1".to_vec());
+            db.add_block(h(2), 200, 20, h(1), b"b2".to_vec());
+            db.clear();
+        }
+
+        // Re-open: WAL should be empty
+        let db = VolatileDB::open(&wal_dir).unwrap();
+        assert_eq!(db.len(), 0);
+        assert!(db.is_empty());
+    }
+
+    #[test]
+    fn test_wal_rollback_rewrites() {
+        let dir = tempfile::tempdir().unwrap();
+        let wal_dir = dir.path().join("volatile");
+
+        {
+            let mut db = VolatileDB::open(&wal_dir).unwrap();
+            db.add_block(h(1), 100, 10, h(0), b"b1".to_vec());
+            db.add_block(h(2), 200, 20, h(1), b"b2".to_vec());
+            db.add_block(h(3), 300, 30, h(2), b"b3".to_vec());
+
+            // Rollback to block 1
+            db.rollback_to_point(100, Some(&h(1)));
+            assert_eq!(db.len(), 1);
+        }
+
+        // Re-open: only block 1 should be recovered
+        let db = VolatileDB::open(&wal_dir).unwrap();
+        assert_eq!(db.len(), 1);
+        assert!(db.has_block(&h(1)));
+        assert!(!db.has_block(&h(2)));
+        assert!(!db.has_block(&h(3)));
+    }
+
+    #[test]
+    fn test_wal_multiple_sessions() {
+        let dir = tempfile::tempdir().unwrap();
+        let wal_dir = dir.path().join("volatile");
+
+        // Session 1: add blocks 1-2
+        {
+            let mut db = VolatileDB::open(&wal_dir).unwrap();
+            db.add_block(h(1), 100, 10, h(0), b"b1".to_vec());
+            db.add_block(h(2), 200, 20, h(1), b"b2".to_vec());
+        }
+
+        // Session 2: recover, add block 3
+        {
+            let mut db = VolatileDB::open(&wal_dir).unwrap();
+            assert_eq!(db.len(), 2);
+            db.add_block(h(3), 300, 30, h(2), b"b3".to_vec());
+            assert_eq!(db.len(), 3);
+        }
+
+        // Session 3: recover all 3 blocks
+        {
+            let db = VolatileDB::open(&wal_dir).unwrap();
+            assert_eq!(db.len(), 3);
+            assert!(db.has_block(&h(1)));
+            assert!(db.has_block(&h(2)));
+            assert!(db.has_block(&h(3)));
+        }
     }
 }

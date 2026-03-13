@@ -108,6 +108,14 @@ pub enum ValidationError {
     MissingWithdrawalScriptWitness(String),
     #[error("Value overflow in transaction accounting")]
     ValueOverflow,
+    #[error("Era gating violation: {certificate_type} requires {required_era}, current era is {current_era}")]
+    EraGatingViolation {
+        certificate_type: String,
+        required_era: String,
+        current_era: String,
+    },
+    #[error("Governance feature requires Conway era (protocol >= 9), current protocol version is {current_version}")]
+    GovernancePreConway { current_version: u64 },
 }
 
 /// Validate a transaction against the current UTxO set and protocol parameters.
@@ -184,6 +192,43 @@ pub fn validate_transaction_with_pools(
             errors.push(ValidationError::AuxiliaryDataWithoutHash);
         }
         _ => {} // Both present or both absent — OK
+    }
+
+    // Rule 1d: Era gating — Conway-specific certificates require protocol version >= 9
+    {
+        let proto_major = params.protocol_version_major;
+        let current_era_name = if proto_major >= 9 {
+            "Conway"
+        } else if proto_major >= 7 {
+            "Babbage"
+        } else if proto_major >= 6 {
+            "Alonzo"
+        } else if proto_major >= 4 {
+            "Mary"
+        } else {
+            "Shelley"
+        };
+        if proto_major < 9 {
+            for cert in &body.certificates {
+                if let Some(cert_name) = conway_only_certificate_name(cert) {
+                    errors.push(ValidationError::EraGatingViolation {
+                        certificate_type: cert_name.to_string(),
+                        required_era: "Conway (protocol >= 9)".to_string(),
+                        current_era: format!("{} (protocol {})", current_era_name, proto_major),
+                    });
+                }
+            }
+            if !body.voting_procedures.is_empty() {
+                errors.push(ValidationError::GovernancePreConway {
+                    current_version: proto_major,
+                });
+            }
+            if !body.proposal_procedures.is_empty() {
+                errors.push(ValidationError::GovernancePreConway {
+                    current_version: proto_major,
+                });
+            }
+        }
     }
 
     // Rule 2: All inputs must exist in UTxO set
@@ -940,6 +985,33 @@ fn verify_witness_signatures<W: HasWitnessFields>(
 }
 
 /// stake+delegation registration.
+/// Returns the certificate type name if the certificate is Conway-only (requires protocol >= 9).
+/// Returns None for pre-Conway certificates.
+fn conway_only_certificate_name(cert: &Certificate) -> Option<&'static str> {
+    match cert {
+        Certificate::RegDRep { .. } => Some("RegDRep"),
+        Certificate::UnregDRep { .. } => Some("UnregDRep"),
+        Certificate::UpdateDRep { .. } => Some("UpdateDRep"),
+        Certificate::VoteDelegation { .. } => Some("VoteDelegation"),
+        Certificate::StakeVoteDelegation { .. } => Some("StakeVoteDelegation"),
+        Certificate::CommitteeHotAuth { .. } => Some("CommitteeHotAuth"),
+        Certificate::CommitteeColdResign { .. } => Some("CommitteeColdResign"),
+        Certificate::RegStakeVoteDeleg { .. } => Some("RegStakeVoteDeleg"),
+        Certificate::VoteRegDeleg { .. } => Some("VoteRegDeleg"),
+        Certificate::ConwayStakeRegistration { .. } => Some("ConwayStakeRegistration"),
+        Certificate::ConwayStakeDeregistration { .. } => Some("ConwayStakeDeregistration"),
+        Certificate::RegStakeDeleg { .. } => Some("RegStakeDeleg"),
+        // Pre-Conway certificates
+        Certificate::StakeRegistration(_)
+        | Certificate::StakeDeregistration(_)
+        | Certificate::StakeDelegation { .. }
+        | Certificate::PoolRegistration(_)
+        | Certificate::PoolRetirement { .. }
+        | Certificate::GenesisKeyDelegation { .. }
+        | Certificate::MoveInstantaneousRewards { .. } => None,
+    }
+}
+
 /// Refunds are returned for: stake deregistration, DRep unregistration.
 ///
 /// When `registered_pools` is provided, pool re-registrations (updating an existing pool's
@@ -5176,6 +5248,209 @@ mod tests {
                     "Byron + witnessed Shelley should pass, got: {errors:?}"
                 );
             }
+        }
+    }
+
+    // =========================================================================
+    // Era-Specific Validation Gating Tests (Phase-1)
+    // =========================================================================
+
+    #[test]
+    fn test_era_gating_conway_cert_in_pre_conway_tx_rejected() {
+        let (utxo_set, input) = make_simple_utxo_set();
+        let mut params = ProtocolParameters::mainnet_defaults();
+        params.protocol_version_major = 8; // Babbage
+        params.key_deposit = Lovelace(0); // avoid deposit mismatch
+
+        let mut tx = make_simple_tx(input, 9_800_000, 200_000);
+        tx.body.certificates.push(Certificate::RegDRep {
+            credential: Credential::VerificationKey(Hash28::from_bytes([0xAAu8; 28])),
+            deposit: Lovelace(0),
+            anchor: None,
+        });
+
+        let result = validate_transaction(&tx, &utxo_set, &params, 100, 300, None);
+        assert!(result.is_err(), "Should reject Conway cert in Babbage era");
+        let errors = result.unwrap_err();
+        assert!(
+            errors
+                .iter()
+                .any(|e| matches!(e, ValidationError::EraGatingViolation { .. })),
+            "Should contain EraGatingViolation error, got: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn test_era_gating_conway_cert_in_conway_tx_accepted() {
+        let (utxo_set, input) = make_simple_utxo_set();
+        let mut params = ProtocolParameters::mainnet_defaults();
+        params.protocol_version_major = 9; // Conway
+        params.key_deposit = Lovelace(0);
+
+        let mut tx = make_simple_tx(input, 9_800_000, 200_000);
+        tx.body.certificates.push(Certificate::RegDRep {
+            credential: Credential::VerificationKey(Hash28::from_bytes([0xAAu8; 28])),
+            deposit: Lovelace(0),
+            anchor: None,
+        });
+
+        let result = validate_transaction(&tx, &utxo_set, &params, 100, 300, None);
+        // Should not have era gating errors (may have other errors like missing witnesses)
+        if let Err(errors) = &result {
+            assert!(
+                !errors
+                    .iter()
+                    .any(|e| matches!(e, ValidationError::EraGatingViolation { .. })),
+                "Should NOT have EraGatingViolation in Conway era, got: {errors:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_era_gating_voting_procedures_pre_conway_rejected() {
+        let (utxo_set, input) = make_simple_utxo_set();
+        let mut params = ProtocolParameters::mainnet_defaults();
+        params.protocol_version_major = 7; // Babbage
+
+        let mut tx = make_simple_tx(input, 9_800_000, 200_000);
+
+        // Add a voting procedure
+        let voter = Voter::DRep(Credential::VerificationKey(Hash28::from_bytes(
+            [0xBBu8; 28],
+        )));
+        let action_id = GovActionId {
+            transaction_id: Hash32::from_bytes([0xCCu8; 32]),
+            action_index: 0,
+        };
+        let mut action_votes = BTreeMap::new();
+        action_votes.insert(
+            action_id,
+            VotingProcedure {
+                vote: Vote::Yes,
+                anchor: None,
+            },
+        );
+        tx.body.voting_procedures.insert(voter, action_votes);
+
+        let result = validate_transaction(&tx, &utxo_set, &params, 100, 300, None);
+        assert!(
+            result.is_err(),
+            "Should reject voting procedures in pre-Conway era"
+        );
+        let errors = result.unwrap_err();
+        assert!(
+            errors
+                .iter()
+                .any(|e| matches!(e, ValidationError::GovernancePreConway { .. })),
+            "Should contain GovernancePreConway error, got: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn test_era_gating_proposal_procedures_pre_conway_rejected() {
+        let (utxo_set, input) = make_simple_utxo_set();
+        let mut params = ProtocolParameters::mainnet_defaults();
+        params.protocol_version_major = 8; // Babbage
+
+        let mut tx = make_simple_tx(input, 9_800_000, 200_000);
+        tx.body.proposal_procedures.push(ProposalProcedure {
+            deposit: Lovelace(100_000_000),
+            return_addr: vec![0xE0; 29],
+            gov_action: GovAction::InfoAction,
+            anchor: Anchor {
+                url: "https://example.com".to_string(),
+                data_hash: Hash32::from_bytes([0xAA; 32]),
+            },
+        });
+
+        let result = validate_transaction(&tx, &utxo_set, &params, 100, 300, None);
+        assert!(
+            result.is_err(),
+            "Should reject proposal procedures in pre-Conway era"
+        );
+        let errors = result.unwrap_err();
+        assert!(
+            errors
+                .iter()
+                .any(|e| matches!(e, ValidationError::GovernancePreConway { .. })),
+            "Should contain GovernancePreConway error, got: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn test_era_gating_pre_conway_certs_always_accepted() {
+        let (utxo_set, input) = make_simple_utxo_set();
+        let mut params = ProtocolParameters::mainnet_defaults();
+        params.protocol_version_major = 4; // Mary
+
+        let mut tx = make_simple_tx(input, 9_800_000 - 2_000_000, 200_000);
+        tx.body
+            .certificates
+            .push(Certificate::StakeRegistration(Credential::VerificationKey(
+                Hash28::from_bytes([0xEEu8; 28]),
+            )));
+
+        let result = validate_transaction(&tx, &utxo_set, &params, 100, 300, None);
+        if let Err(errors) = &result {
+            assert!(
+                !errors
+                    .iter()
+                    .any(|e| matches!(e, ValidationError::EraGatingViolation { .. })),
+                "Pre-Conway certificates should not trigger EraGatingViolation, got: {errors:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_conway_only_certificate_name_classification() {
+        // Verify that the classification function correctly identifies Conway-only certs
+        let conway_certs = vec![
+            Certificate::RegDRep {
+                credential: Credential::VerificationKey(Hash28::from_bytes([0u8; 28])),
+                deposit: Lovelace(0),
+                anchor: None,
+            },
+            Certificate::UnregDRep {
+                credential: Credential::VerificationKey(Hash28::from_bytes([0u8; 28])),
+                refund: Lovelace(0),
+            },
+            Certificate::VoteDelegation {
+                credential: Credential::VerificationKey(Hash28::from_bytes([0u8; 28])),
+                drep: DRep::Abstain,
+            },
+            Certificate::CommitteeHotAuth {
+                cold_credential: Credential::VerificationKey(Hash28::from_bytes([0u8; 28])),
+                hot_credential: Credential::VerificationKey(Hash28::from_bytes([1u8; 28])),
+            },
+            Certificate::CommitteeColdResign {
+                cold_credential: Credential::VerificationKey(Hash28::from_bytes([0u8; 28])),
+                anchor: None,
+            },
+        ];
+        for cert in &conway_certs {
+            assert!(
+                conway_only_certificate_name(cert).is_some(),
+                "Should be classified as Conway-only: {cert:?}"
+            );
+        }
+
+        let pre_conway_certs = vec![
+            Certificate::StakeRegistration(Credential::VerificationKey(Hash28::from_bytes(
+                [0u8; 28],
+            ))),
+            Certificate::StakeDeregistration(Credential::VerificationKey(Hash28::from_bytes(
+                [0u8; 28],
+            ))),
+            Certificate::PoolRetirement {
+                pool_hash: Hash28::from_bytes([0u8; 28]),
+                epoch: 100,
+            },
+        ];
+        for cert in &pre_conway_certs {
+            assert!(
+                conway_only_certificate_name(cert).is_none(),
+                "Should NOT be classified as Conway-only: {cert:?}"
+            );
         }
     }
 }

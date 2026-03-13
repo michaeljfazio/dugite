@@ -28,6 +28,31 @@ enum Command {
     Run(Box<RunArgs>),
     /// Import a Mithril snapshot for fast initial sync
     MithrilImport(MithrilImportArgs),
+    /// Database inspection and maintenance tools
+    Db(DbArgs),
+}
+
+#[derive(clap::Args, Debug)]
+struct DbArgs {
+    #[command(subcommand)]
+    command: DbCommand,
+}
+
+#[derive(clap::Subcommand, Debug)]
+enum DbCommand {
+    /// Show database size and block count information
+    Info(DbInfoArgs),
+}
+
+#[derive(clap::Args, Debug)]
+struct DbInfoArgs {
+    /// Path to the database directory
+    #[arg(long, default_value = "db")]
+    database_path: PathBuf,
+
+    /// Storage profile: ultra-memory, high-memory (default), low-memory, or minimal
+    #[arg(long, default_value = "high-memory")]
+    storage_profile: String,
 }
 
 /// Shared logging arguments for all subcommands
@@ -56,6 +81,10 @@ struct LogArgs {
     /// Disable ANSI colors in stdout output
     #[arg(long)]
     log_no_color: bool,
+
+    /// Number of days to retain log files (default: 7)
+    #[arg(long, default_value = "7")]
+    log_retention_days: u64,
 }
 
 #[derive(clap::Args, Debug)]
@@ -198,6 +227,7 @@ fn build_logging_opts(log: &LogArgs) -> Result<logging::LoggingOpts> {
         log_dir: log.log_dir.to_string_lossy().into_owned(),
         rotation,
         no_color: log.log_no_color,
+        log_retention_days: log.log_retention_days,
     })
 }
 
@@ -207,14 +237,128 @@ async fn main() -> Result<()> {
 
     // Extract log args and initialize logging before any work
     let log_args = match &cli.command {
-        Command::Run(ref args) => &args.log,
-        Command::MithrilImport(ref args) => &args.log,
+        Command::Run(ref args) => Some(&args.log),
+        Command::MithrilImport(ref args) => Some(&args.log),
+        Command::Db(_) => None,
     };
-    let _log_guard = logging::init(&build_logging_opts(log_args)?)?;
+    let _log_guard = if let Some(log_args) = log_args {
+        Some(logging::init(&build_logging_opts(log_args)?)?)
+    } else {
+        None
+    };
 
     match cli.command {
         Command::Run(args) => run_node(*args).await,
         Command::MithrilImport(args) => run_mithril_import(args).await,
+        Command::Db(args) => run_db_command(args).await,
+    }
+}
+
+async fn run_db_command(args: DbArgs) -> Result<()> {
+    match args.command {
+        DbCommand::Info(info_args) => run_db_info(info_args).await,
+    }
+}
+
+async fn run_db_info(args: DbInfoArgs) -> Result<()> {
+    let db_path = &args.database_path;
+    if !db_path.exists() {
+        anyhow::bail!("Database path does not exist: {}", db_path.display());
+    }
+
+    let storage_profile: torsten_storage::StorageProfile = args
+        .storage_profile
+        .parse()
+        .map_err(|e: String| anyhow::anyhow!(e))?;
+    let storage_config = torsten_storage::config::resolve_storage_config(
+        storage_profile,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+    )
+    .map_err(|e| anyhow::anyhow!(e))?;
+
+    // Open the ChainDB read-only
+    let chain_db = torsten_storage::ChainDB::open_with_config(db_path, &storage_config.immutable)?;
+
+    // Immutable DB info
+    let immutable_dir = db_path.join("immutable");
+    let (chunk_count, immutable_size) = if immutable_dir.exists() {
+        let mut count = 0u64;
+        let mut total_size = 0u64;
+        for entry in std::fs::read_dir(&immutable_dir)? {
+            let entry = entry?;
+            let name = entry.file_name();
+            let name_str = name.to_string_lossy();
+            if name_str.ends_with(".chunk") {
+                count += 1;
+            }
+            total_size += entry.metadata().map(|m| m.len()).unwrap_or(0);
+        }
+        (count, total_size)
+    } else {
+        (0, 0)
+    };
+
+    // VolatileDB block count (from ChainDB tip info)
+    let volatile_count = chain_db.volatile_block_count();
+
+    // Ledger snapshot info
+    let snapshot_dir = db_path.join("snapshots");
+    let (snapshot_count, snapshot_size) = if snapshot_dir.exists() {
+        let mut count = 0u64;
+        let mut total_size = 0u64;
+        for entry in std::fs::read_dir(&snapshot_dir)? {
+            let entry = entry?;
+            count += 1;
+            total_size += entry.metadata().map(|m| m.len()).unwrap_or(0);
+        }
+        (count, total_size)
+    } else {
+        (0, 0)
+    };
+
+    let tip = chain_db.get_tip();
+
+    println!("Torsten Database Info");
+    println!("=====================");
+    println!("  Database path:      {}", db_path.display());
+    println!(
+        "  Chain tip slot:     {}",
+        tip.point.slot().map(|s| s.0).unwrap_or(0)
+    );
+    println!("  Chain tip block:    {}", tip.block_number.0);
+    println!();
+    println!("ImmutableDB:");
+    println!("  Chunk files:        {chunk_count}");
+    println!("  Total size:         {}", format_size(immutable_size));
+    println!();
+    println!("VolatileDB:");
+    println!("  Block count:        {volatile_count}");
+    println!();
+    println!("Ledger Snapshots:");
+    println!("  Snapshot count:     {snapshot_count}");
+    println!("  Total size:         {}", format_size(snapshot_size));
+
+    Ok(())
+}
+
+fn format_size(bytes: u64) -> String {
+    const GB: f64 = 1024.0 * 1024.0 * 1024.0;
+    const MB: f64 = 1024.0 * 1024.0;
+    const KB: f64 = 1024.0;
+    let b = bytes as f64;
+    if b >= GB {
+        format!("{:.2} GB ({bytes} bytes)", b / GB)
+    } else if b >= MB {
+        format!("{:.2} MB ({bytes} bytes)", b / MB)
+    } else if b >= KB {
+        format!("{:.2} KB ({bytes} bytes)", b / KB)
+    } else {
+        format!("{bytes} bytes")
     }
 }
 

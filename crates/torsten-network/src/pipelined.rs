@@ -63,9 +63,15 @@ impl PipelinedPeerClient {
     ) -> Result<Self, ClientError> {
         debug!("pipelined client: connecting to {addr}");
 
-        let bearer = Bearer::connect_tcp(addr)
+        // Connect manually so we can configure TCP keepalive before handing
+        // the stream to the pallas Bearer.
+        let stream = tokio::net::TcpStream::connect(addr)
             .await
             .map_err(|e| ClientError::Connection(format!("pipelined connect: {e}")))?;
+        if let Err(e) = crate::tcp::configure_tcp_keepalive(&stream) {
+            warn!("pipelined client: failed to set TCP keepalive: {e}");
+        }
+        let bearer = Bearer::Tcp(stream);
 
         let mut plexer = Plexer::new(bearer);
 

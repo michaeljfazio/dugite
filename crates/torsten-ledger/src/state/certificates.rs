@@ -5,9 +5,37 @@ use torsten_primitives::transaction::{Certificate, MIRSource, MIRTarget};
 use torsten_primitives::value::Lovelace;
 use tracing::{debug, warn};
 
+/// Returns true if the certificate is Conway-only and requires protocol version >= 9.
+pub(crate) fn is_conway_only_certificate(cert: &Certificate) -> bool {
+    matches!(
+        cert,
+        Certificate::RegDRep { .. }
+            | Certificate::UnregDRep { .. }
+            | Certificate::UpdateDRep { .. }
+            | Certificate::VoteDelegation { .. }
+            | Certificate::StakeVoteDelegation { .. }
+            | Certificate::CommitteeHotAuth { .. }
+            | Certificate::CommitteeColdResign { .. }
+            | Certificate::RegStakeVoteDeleg { .. }
+            | Certificate::VoteRegDeleg { .. }
+            | Certificate::ConwayStakeRegistration { .. }
+            | Certificate::ConwayStakeDeregistration { .. }
+            | Certificate::RegStakeDeleg { .. }
+    )
+}
+
 impl LedgerState {
-    /// Process a certificate and update the ledger state accordingly
+    /// Process a certificate and update the ledger state accordingly.
+    /// Conway-specific certificates are silently skipped if the protocol version is < 9.
     pub(crate) fn process_certificate(&mut self, cert: &Certificate) {
+        if is_conway_only_certificate(cert) && self.protocol_params.protocol_version_major < 9 {
+            warn!(
+                "Ignoring Conway-only certificate {:?} in pre-Conway era (protocol version {})",
+                std::mem::discriminant(cert),
+                self.protocol_params.protocol_version_major,
+            );
+            return;
+        }
         match cert {
             Certificate::StakeRegistration(credential) => {
                 let key = credential_to_hash(credential);

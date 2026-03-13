@@ -76,6 +76,10 @@ pub struct LoggingOpts {
     pub log_dir: String,
     pub rotation: LogRotation,
     pub no_color: bool,
+    /// Number of days to retain log files (default: 7). Files older than this are deleted.
+    /// Used by [`start_log_cleanup_task`] when the caller passes this value.
+    #[allow(dead_code)]
+    pub log_retention_days: u64,
 }
 
 /// Guard that must be held for the lifetime of the program.
@@ -183,6 +187,62 @@ pub fn init(opts: &LoggingOpts) -> anyhow::Result<LogGuard> {
     Ok(LogGuard { _guards: guards })
 }
 
+/// Delete `.log` files in `log_dir` that are older than `retention_days`.
+///
+/// Scans only immediate children of the directory (not recursive). Files that
+/// cannot be inspected (e.g. permission errors) are silently skipped.
+#[allow(dead_code)]
+pub fn cleanup_old_logs(log_dir: &std::path::Path, retention_days: u64) {
+    let cutoff =
+        std::time::SystemTime::now() - std::time::Duration::from_secs(retention_days * 86400);
+
+    let entries = match std::fs::read_dir(log_dir) {
+        Ok(entries) => entries,
+        Err(_) => return,
+    };
+
+    for entry in entries.flatten() {
+        let path = entry.path();
+        // Only consider files with .log extension
+        if path.extension().and_then(|e| e.to_str()) != Some("log") {
+            continue;
+        }
+        let modified = match entry.metadata().and_then(|m| m.modified()) {
+            Ok(t) => t,
+            Err(_) => continue,
+        };
+        if modified < cutoff {
+            if let Err(e) = std::fs::remove_file(&path) {
+                tracing::warn!(path = %path.display(), "Failed to remove old log file: {e}");
+            } else {
+                tracing::info!(path = %path.display(), "Removed old log file");
+            }
+        }
+    }
+}
+
+/// Spawn a background task that periodically cleans up old log files.
+/// Runs every hour alongside the disk monitor.
+#[allow(dead_code)]
+pub async fn start_log_cleanup_task(
+    log_dir: std::path::PathBuf,
+    retention_days: u64,
+    mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
+) {
+    let mut interval = tokio::time::interval(std::time::Duration::from_secs(3600));
+
+    loop {
+        tokio::select! {
+            _ = interval.tick() => {}
+            _ = shutdown_rx.changed() => {
+                tracing::debug!("Log cleanup task shutting down");
+                return;
+            }
+        }
+        cleanup_old_logs(&log_dir, retention_days);
+    }
+}
+
 /// Build an `EnvFilter` from the given level string.
 /// `RUST_LOG` env var takes priority if set.
 fn build_filter(level: &str) -> EnvFilter {
@@ -244,5 +304,45 @@ mod tests {
             LogRotation::Never
         ));
         assert!("invalid".parse::<LogRotation>().is_err());
+    }
+
+    #[test]
+    fn test_cleanup_old_logs_removes_expired() {
+        let dir = std::env::temp_dir().join("torsten_log_cleanup_test");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // Create a .log file and backdate its modification time
+        let old_file = dir.join("torsten.2020-01-01.log");
+        std::fs::write(&old_file, "old log data").unwrap();
+        // Set modification time to 30 days ago
+        let old_time = std::time::SystemTime::now() - std::time::Duration::from_secs(30 * 86400);
+        let f = std::fs::File::options()
+            .write(true)
+            .open(&old_file)
+            .unwrap();
+        f.set_modified(old_time).unwrap_or_default();
+
+        // Create a recent .log file
+        let new_file = dir.join("torsten.2026-03-14.log");
+        std::fs::write(&new_file, "new log data").unwrap();
+
+        // Create a non-log file (should not be deleted)
+        let txt_file = dir.join("notes.txt");
+        std::fs::write(&txt_file, "keep me").unwrap();
+
+        cleanup_old_logs(&dir, 7);
+
+        assert!(!old_file.exists(), "Old log file should have been deleted");
+        assert!(new_file.exists(), "Recent log file should be kept");
+        assert!(txt_file.exists(), "Non-log file should not be touched");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_cleanup_old_logs_nonexistent_dir() {
+        // Should not panic on non-existent directory
+        cleanup_old_logs(std::path::Path::new("/nonexistent/dir"), 7);
     }
 }

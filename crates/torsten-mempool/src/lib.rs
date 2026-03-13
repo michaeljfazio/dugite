@@ -681,6 +681,31 @@ impl Mempool {
         removed
     }
 
+    /// Remove and return all transactions from the mempool.
+    ///
+    /// This is used during chain rollback to save pending transactions before
+    /// the UTxO set changes, allowing them to be re-validated and re-added.
+    pub fn drain_all(&self) -> Vec<Transaction> {
+        let count = self.tx_count.swap(0, Ordering::Relaxed);
+        let mut txs = Vec::with_capacity(count);
+        // Collect transactions in FIFO order
+        let order: Vec<TransactionHash> = self.order.write().drain(..).collect();
+        for hash in &order {
+            if let Some((_, entry)) = self.txs.remove(hash) {
+                txs.push(entry.tx);
+            }
+        }
+        self.fee_index.write().clear();
+        *self.total_bytes.write() = 0;
+        self.total_ex_mem.store(0, Ordering::Relaxed);
+        self.total_ex_steps.store(0, Ordering::Relaxed);
+        self.total_ref_scripts_bytes.store(0, Ordering::Relaxed);
+        if !txs.is_empty() {
+            info!(drained = txs.len(), "Mempool: drained all transactions");
+        }
+        txs
+    }
+
     /// Clear all transactions
     pub fn clear(&self) {
         let count = self.tx_count.swap(0, Ordering::Relaxed);
@@ -2293,5 +2318,94 @@ mod tests {
         assert_eq!(mempool.total_ex_mem(), 500);
         assert_eq!(mempool.total_ex_steps(), 1000);
         assert_eq!(mempool.total_ref_scripts_bytes(), 100);
+    }
+
+    #[test]
+    fn test_drain_all_returns_transactions() {
+        let mempool = Mempool::new(default_config());
+
+        for i in 1..=3u8 {
+            mempool
+                .add_tx(Hash32::from_bytes([i; 32]), make_dummy_tx(), 200)
+                .unwrap();
+        }
+        assert_eq!(mempool.len(), 3);
+
+        let drained = mempool.drain_all();
+        assert_eq!(drained.len(), 3);
+        assert!(mempool.is_empty());
+        assert_eq!(mempool.total_bytes(), 0);
+        assert_eq!(mempool.total_ex_mem(), 0);
+        assert_eq!(mempool.total_ex_steps(), 0);
+        assert_eq!(mempool.total_ref_scripts_bytes(), 0);
+        assert!(mempool.fee_index.read().is_empty());
+    }
+
+    #[test]
+    fn test_drain_all_empty_mempool() {
+        let mempool = Mempool::new(default_config());
+        let drained = mempool.drain_all();
+        assert!(drained.is_empty());
+        assert!(mempool.is_empty());
+    }
+
+    #[test]
+    fn test_drain_all_preserves_fifo_order() {
+        let mempool = Mempool::new(default_config());
+
+        let hashes: Vec<Hash32> = (1..=5u8).map(|i| Hash32::from_bytes([i; 32])).collect();
+
+        for hash in &hashes {
+            mempool.add_tx(*hash, make_dummy_tx(), 100).unwrap();
+        }
+
+        let drained = mempool.drain_all();
+        assert_eq!(drained.len(), 5);
+        // After drain, mempool should be usable again
+        assert!(mempool.is_empty());
+        mempool
+            .add_tx(Hash32::from_bytes([10u8; 32]), make_dummy_tx(), 100)
+            .unwrap();
+        assert_eq!(mempool.len(), 1);
+    }
+
+    #[test]
+    fn test_drain_all_size_tracking() {
+        let mempool = Mempool::new(default_config());
+
+        mempool
+            .add_tx_full(
+                Hash32::from_bytes([1u8; 32]),
+                make_tx_with_fee(100),
+                500,
+                Lovelace(100),
+                1000,
+                2000,
+                50,
+                TxOrigin::Local,
+            )
+            .unwrap();
+        mempool
+            .add_tx_full(
+                Hash32::from_bytes([2u8; 32]),
+                make_tx_with_fee(200),
+                600,
+                Lovelace(200),
+                500,
+                1000,
+                100,
+                TxOrigin::Local,
+            )
+            .unwrap();
+
+        assert_eq!(mempool.total_bytes(), 1100);
+        assert_eq!(mempool.total_ex_mem(), 1500);
+
+        let drained = mempool.drain_all();
+        assert_eq!(drained.len(), 2);
+        assert_eq!(mempool.total_bytes(), 0);
+        assert_eq!(mempool.total_ex_mem(), 0);
+        assert_eq!(mempool.total_ex_steps(), 0);
+        assert_eq!(mempool.total_ref_scripts_bytes(), 0);
     }
 }

@@ -4,7 +4,11 @@ mod tx_monitor;
 mod tx_submission;
 
 use std::path::Path;
+use std::sync::atomic::AtomicU64;
 use std::sync::Arc;
+
+/// Global counter for assigning unique connection IDs to N2C clients.
+static N2C_CONNECTION_ID_COUNTER: AtomicU64 = AtomicU64::new(1);
 use thiserror::Error;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UnixListener;
@@ -239,7 +243,8 @@ impl N2CServer {
                             if let Some(ref m) = self.connection_metrics {
                                 m.on_connect();
                             }
-                            debug!("N2C client connected");
+                            let conn_id = N2C_CONNECTION_ID_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            debug!(conn_id, "N2C client connected");
                             let handler = self.query_handler.clone();
                             let mempool = self.mempool.clone();
                             let validator = self.tx_validator.clone();
