@@ -254,16 +254,12 @@ fn bench_immutabledb_open(c: &mut Criterion) {
         let dir = tempfile::tempdir().unwrap();
         create_chunk_file(dir.path(), 0, size);
 
-        group.bench_with_input(
-            BenchmarkId::new("in_memory", size),
-            &size,
-            |b, _| {
-                b.iter(|| {
-                    let db = ImmutableDB::open(dir.path()).unwrap();
-                    black_box(db.total_blocks());
-                });
-            },
-        );
+        group.bench_with_input(BenchmarkId::new("in_memory", size), &size, |b, _| {
+            b.iter(|| {
+                let db = ImmutableDB::open(dir.path()).unwrap();
+                black_box(db.total_blocks());
+            });
+        });
 
         let mmap_config = ImmutableConfig {
             index_type: BlockIndexType::Mmap,
@@ -276,16 +272,12 @@ fn bench_immutabledb_open(c: &mut Criterion) {
             let _ = ImmutableDB::open_with_config(dir.path(), &mmap_config).unwrap();
         }
 
-        group.bench_with_input(
-            BenchmarkId::new("mmap_cached", size),
-            &size,
-            |b, _| {
-                b.iter(|| {
-                    let db = ImmutableDB::open_with_config(dir.path(), &mmap_config).unwrap();
-                    black_box(db.total_blocks());
-                });
-            },
-        );
+        group.bench_with_input(BenchmarkId::new("mmap_cached", size), &size, |b, _| {
+            b.iter(|| {
+                let db = ImmutableDB::open_with_config(dir.path(), &mmap_config).unwrap();
+                black_box(db.total_blocks());
+            });
+        });
 
         // Benchmark cold mmap open (delete hash_index.dat each time to force rebuild)
         group.bench_with_input(
@@ -406,62 +398,52 @@ fn bench_block_index_insert(c: &mut Criterion) {
     for &size in BLOCK_INDEX_SIZES {
         let hashes: Vec<Hash32> = (0..size).map(make_hash).collect();
 
-        group.bench_with_input(
-            BenchmarkId::new("in_memory", size),
-            &size,
-            |b, _| {
-                b.iter(|| {
-                    let config = ImmutableConfig {
-                        index_type: BlockIndexType::InMemory,
-                        ..ImmutableConfig::default()
-                    };
-                    let dir = tempfile::tempdir().unwrap();
-                    let mut idx =
-                        torsten_storage::block_index::BlockIndex::new(&config, dir.path())
-                            .unwrap();
-                    for (i, hash) in hashes.iter().enumerate() {
-                        idx.insert(
-                            *hash,
-                            torsten_storage::block_index::BlockLocation {
-                                chunk_num: 0,
-                                block_offset: i as u64 * 1024,
-                                block_end: (i as u64 + 1) * 1024,
-                            },
-                        );
-                    }
-                    black_box(idx.len());
-                });
-            },
-        );
+        group.bench_with_input(BenchmarkId::new("in_memory", size), &size, |b, _| {
+            b.iter(|| {
+                let config = ImmutableConfig {
+                    index_type: BlockIndexType::InMemory,
+                    ..ImmutableConfig::default()
+                };
+                let dir = tempfile::tempdir().unwrap();
+                let mut idx =
+                    torsten_storage::block_index::BlockIndex::new(&config, dir.path()).unwrap();
+                for (i, hash) in hashes.iter().enumerate() {
+                    idx.insert(
+                        *hash,
+                        torsten_storage::block_index::BlockLocation {
+                            chunk_num: 0,
+                            block_offset: i as u64 * 1024,
+                            block_end: (i as u64 + 1) * 1024,
+                        },
+                    );
+                }
+                black_box(idx.len());
+            });
+        });
 
-        group.bench_with_input(
-            BenchmarkId::new("mmap", size),
-            &size,
-            |b, _| {
-                b.iter(|| {
-                    let config = ImmutableConfig {
-                        index_type: BlockIndexType::Mmap,
-                        mmap_load_factor: 0.7,
-                        mmap_initial_capacity: 0,
-                    };
-                    let dir = tempfile::tempdir().unwrap();
-                    let mut idx =
-                        torsten_storage::block_index::BlockIndex::new(&config, dir.path())
-                            .unwrap();
-                    for (i, hash) in hashes.iter().enumerate() {
-                        idx.insert(
-                            *hash,
-                            torsten_storage::block_index::BlockLocation {
-                                chunk_num: 0,
-                                block_offset: i as u64 * 1024,
-                                block_end: (i as u64 + 1) * 1024,
-                            },
-                        );
-                    }
-                    black_box(idx.len());
-                });
-            },
-        );
+        group.bench_with_input(BenchmarkId::new("mmap", size), &size, |b, _| {
+            b.iter(|| {
+                let config = ImmutableConfig {
+                    index_type: BlockIndexType::Mmap,
+                    mmap_load_factor: 0.7,
+                    mmap_initial_capacity: 0,
+                };
+                let dir = tempfile::tempdir().unwrap();
+                let mut idx =
+                    torsten_storage::block_index::BlockIndex::new(&config, dir.path()).unwrap();
+                for (i, hash) in hashes.iter().enumerate() {
+                    idx.insert(
+                        *hash,
+                        torsten_storage::block_index::BlockLocation {
+                            chunk_num: 0,
+                            block_offset: i as u64 * 1024,
+                            block_end: (i as u64 + 1) * 1024,
+                        },
+                    );
+                }
+                black_box(idx.len());
+            });
+        });
     }
 
     group.finish();
@@ -499,17 +481,13 @@ fn bench_block_index_lookup(c: &mut Criterion) {
             );
         }
 
-        group.bench_with_input(
-            BenchmarkId::new("in_memory", size),
-            &size,
-            |b, _| {
-                b.iter(|| {
-                    for hash in &lookup_hashes {
-                        black_box(idx_inmem.lookup(hash));
-                    }
-                });
-            },
-        );
+        group.bench_with_input(BenchmarkId::new("in_memory", size), &size, |b, _| {
+            b.iter(|| {
+                for hash in &lookup_hashes {
+                    black_box(idx_inmem.lookup(hash));
+                }
+            });
+        });
 
         // Mmap
         let dir_mmap = tempfile::tempdir().unwrap();
@@ -531,17 +509,13 @@ fn bench_block_index_lookup(c: &mut Criterion) {
             );
         }
 
-        group.bench_with_input(
-            BenchmarkId::new("mmap", size),
-            &size,
-            |b, _| {
-                b.iter(|| {
-                    for hash in &lookup_hashes {
-                        black_box(idx_mmap.lookup(hash));
-                    }
-                });
-            },
-        );
+        group.bench_with_input(BenchmarkId::new("mmap", size), &size, |b, _| {
+            b.iter(|| {
+                for hash in &lookup_hashes {
+                    black_box(idx_mmap.lookup(hash));
+                }
+            });
+        });
 
         let _ = lookup_indices;
     }
@@ -786,62 +760,52 @@ fn bench_block_index_scaling_insert(c: &mut Criterion) {
     for &size in SCALING_SIZES {
         let hashes: Vec<Hash32> = (0..size).map(make_hash).collect();
 
-        group.bench_with_input(
-            BenchmarkId::new("in_memory", size),
-            &size,
-            |b, _| {
-                b.iter(|| {
-                    let config = ImmutableConfig {
-                        index_type: BlockIndexType::InMemory,
-                        ..ImmutableConfig::default()
-                    };
-                    let dir = tempfile::tempdir().unwrap();
-                    let mut idx =
-                        torsten_storage::block_index::BlockIndex::new(&config, dir.path())
-                            .unwrap();
-                    for (i, hash) in hashes.iter().enumerate() {
-                        idx.insert(
-                            *hash,
-                            torsten_storage::block_index::BlockLocation {
-                                chunk_num: 0,
-                                block_offset: i as u64 * 1024,
-                                block_end: (i as u64 + 1) * 1024,
-                            },
-                        );
-                    }
-                    black_box(idx.len());
-                });
-            },
-        );
+        group.bench_with_input(BenchmarkId::new("in_memory", size), &size, |b, _| {
+            b.iter(|| {
+                let config = ImmutableConfig {
+                    index_type: BlockIndexType::InMemory,
+                    ..ImmutableConfig::default()
+                };
+                let dir = tempfile::tempdir().unwrap();
+                let mut idx =
+                    torsten_storage::block_index::BlockIndex::new(&config, dir.path()).unwrap();
+                for (i, hash) in hashes.iter().enumerate() {
+                    idx.insert(
+                        *hash,
+                        torsten_storage::block_index::BlockLocation {
+                            chunk_num: 0,
+                            block_offset: i as u64 * 1024,
+                            block_end: (i as u64 + 1) * 1024,
+                        },
+                    );
+                }
+                black_box(idx.len());
+            });
+        });
 
-        group.bench_with_input(
-            BenchmarkId::new("mmap", size),
-            &size,
-            |b, _| {
-                b.iter(|| {
-                    let config = ImmutableConfig {
-                        index_type: BlockIndexType::Mmap,
-                        mmap_load_factor: 0.7,
-                        mmap_initial_capacity: 0,
-                    };
-                    let dir = tempfile::tempdir().unwrap();
-                    let mut idx =
-                        torsten_storage::block_index::BlockIndex::new(&config, dir.path())
-                            .unwrap();
-                    for (i, hash) in hashes.iter().enumerate() {
-                        idx.insert(
-                            *hash,
-                            torsten_storage::block_index::BlockLocation {
-                                chunk_num: 0,
-                                block_offset: i as u64 * 1024,
-                                block_end: (i as u64 + 1) * 1024,
-                            },
-                        );
-                    }
-                    black_box(idx.len());
-                });
-            },
-        );
+        group.bench_with_input(BenchmarkId::new("mmap", size), &size, |b, _| {
+            b.iter(|| {
+                let config = ImmutableConfig {
+                    index_type: BlockIndexType::Mmap,
+                    mmap_load_factor: 0.7,
+                    mmap_initial_capacity: 0,
+                };
+                let dir = tempfile::tempdir().unwrap();
+                let mut idx =
+                    torsten_storage::block_index::BlockIndex::new(&config, dir.path()).unwrap();
+                for (i, hash) in hashes.iter().enumerate() {
+                    idx.insert(
+                        *hash,
+                        torsten_storage::block_index::BlockLocation {
+                            chunk_num: 0,
+                            block_offset: i as u64 * 1024,
+                            block_end: (i as u64 + 1) * 1024,
+                        },
+                    );
+                }
+                black_box(idx.len());
+            });
+        });
     }
 
     group.finish();
@@ -876,17 +840,13 @@ fn bench_block_index_scaling_lookup(c: &mut Criterion) {
             );
         }
 
-        group.bench_with_input(
-            BenchmarkId::new("in_memory", size),
-            &size,
-            |b, _| {
-                b.iter(|| {
-                    for hash in &lookup_hashes {
-                        black_box(idx_inmem.lookup(hash));
-                    }
-                });
-            },
-        );
+        group.bench_with_input(BenchmarkId::new("in_memory", size), &size, |b, _| {
+            b.iter(|| {
+                for hash in &lookup_hashes {
+                    black_box(idx_inmem.lookup(hash));
+                }
+            });
+        });
 
         // Mmap
         let dir_mmap = tempfile::tempdir().unwrap();
@@ -908,17 +868,13 @@ fn bench_block_index_scaling_lookup(c: &mut Criterion) {
             );
         }
 
-        group.bench_with_input(
-            BenchmarkId::new("mmap", size),
-            &size,
-            |b, _| {
-                b.iter(|| {
-                    for hash in &lookup_hashes {
-                        black_box(idx_mmap.lookup(hash));
-                    }
-                });
-            },
-        );
+        group.bench_with_input(BenchmarkId::new("mmap", size), &size, |b, _| {
+            b.iter(|| {
+                for hash in &lookup_hashes {
+                    black_box(idx_mmap.lookup(hash));
+                }
+            });
+        });
     }
 
     group.finish();
@@ -934,16 +890,12 @@ fn bench_immutabledb_scaling_open(c: &mut Criterion) {
         let dir = tempfile::tempdir().unwrap();
         create_chunk_file(dir.path(), 0, size);
 
-        group.bench_with_input(
-            BenchmarkId::new("in_memory", size),
-            &size,
-            |b, _| {
-                b.iter(|| {
-                    let db = ImmutableDB::open(dir.path()).unwrap();
-                    black_box(db.total_blocks());
-                });
-            },
-        );
+        group.bench_with_input(BenchmarkId::new("in_memory", size), &size, |b, _| {
+            b.iter(|| {
+                let db = ImmutableDB::open(dir.path()).unwrap();
+                black_box(db.total_blocks());
+            });
+        });
 
         let mmap_config = ImmutableConfig {
             index_type: BlockIndexType::Mmap,
@@ -951,18 +903,16 @@ fn bench_immutabledb_scaling_open(c: &mut Criterion) {
             mmap_initial_capacity: 0,
         };
         // Pre-build mmap file
-        { let _ = ImmutableDB::open_with_config(dir.path(), &mmap_config).unwrap(); }
+        {
+            let _ = ImmutableDB::open_with_config(dir.path(), &mmap_config).unwrap();
+        }
 
-        group.bench_with_input(
-            BenchmarkId::new("mmap_cached", size),
-            &size,
-            |b, _| {
-                b.iter(|| {
-                    let db = ImmutableDB::open_with_config(dir.path(), &mmap_config).unwrap();
-                    black_box(db.total_blocks());
-                });
-            },
-        );
+        group.bench_with_input(BenchmarkId::new("mmap_cached", size), &size, |b, _| {
+            b.iter(|| {
+                let db = ImmutableDB::open_with_config(dir.path(), &mmap_config).unwrap();
+                black_box(db.total_blocks());
+            });
+        });
     }
 
     group.finish();
@@ -975,19 +925,15 @@ fn bench_chaindb_scaling_insert(c: &mut Criterion) {
     let chaindb_sizes: &[u64] = &[1_000, 5_000, 10_000, 25_000];
 
     for &size in chaindb_sizes {
-        group.bench_with_input(
-            BenchmarkId::new("default", size),
-            &size,
-            |b, &size| {
-                b.iter_batched(
-                    || tempfile::tempdir().unwrap(),
-                    |dir| {
-                        populate_chaindb(dir.path(), size);
-                    },
-                    BatchSize::PerIteration,
-                );
-            },
-        );
+        group.bench_with_input(BenchmarkId::new("default", size), &size, |b, &size| {
+            b.iter_batched(
+                || tempfile::tempdir().unwrap(),
+                |dir| {
+                    populate_chaindb(dir.path(), size);
+                },
+                BatchSize::PerIteration,
+            );
+        });
     }
 
     group.finish();
@@ -1031,4 +977,9 @@ criterion_group!(
     bench_chaindb_scaling_insert,
 );
 
-criterion_main!(chaindb_benches, immutabledb_benches, block_index_benches, scaling_benches);
+criterion_main!(
+    chaindb_benches,
+    immutabledb_benches,
+    block_index_benches,
+    scaling_benches
+);

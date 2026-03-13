@@ -1,4 +1,4 @@
-pub(crate) mod block_index;
+pub mod block_index;
 pub mod chain_db;
 pub(crate) mod chunk_reader;
 pub mod config;

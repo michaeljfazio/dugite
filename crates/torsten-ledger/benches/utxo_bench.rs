@@ -366,8 +366,7 @@ fn bench_utxo_rebuild_index(c: &mut Criterion) {
                         store.save_snapshot("bench").unwrap();
                     }
                     // Reopen from snapshot — address index is empty and needs rebuild
-                    let store =
-                        UtxoStore::open_from_snapshot(&utxo_path, "bench").unwrap();
+                    let store = UtxoStore::open_from_snapshot(&utxo_path, "bench").unwrap();
                     (dir, store)
                 },
                 |(_dir, mut store)| {
