@@ -1,3 +1,5 @@
+#[cfg(not(target_arch = "x86_64"))]
+use blake2::Digest;
 use std::fmt;
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -106,7 +108,10 @@ impl<const N: usize> TryFrom<&[u8]> for Hash<N> {
     }
 }
 
-/// Blake2b-256 hash (SIMD-accelerated via blake2b_simd)
+/// Blake2b-256 hash.
+/// On x86_64: uses `blake2b_simd` with SSE2/SSE4.1/AVX2 intrinsics.
+/// On ARM/AArch64: uses `blake2` (RustCrypto) which LLVM auto-vectorizes well for NEON.
+#[cfg(target_arch = "x86_64")]
 pub fn blake2b_256(data: &[u8]) -> Hash32 {
     let hash = blake2b_simd::Params::new().hash_length(32).hash(data);
     let mut out = [0u8; 32];
@@ -114,11 +119,34 @@ pub fn blake2b_256(data: &[u8]) -> Hash32 {
     Hash(out)
 }
 
-/// Blake2b-224 hash (SIMD-accelerated, used for addresses, key hashes)
+#[cfg(not(target_arch = "x86_64"))]
+pub fn blake2b_256(data: &[u8]) -> Hash32 {
+    let mut hasher = blake2::Blake2b::<blake2::digest::consts::U32>::new();
+    hasher.update(data);
+    let result = hasher.finalize();
+    let mut out = [0u8; 32];
+    out.copy_from_slice(&result);
+    Hash(out)
+}
+
+/// Blake2b-224 hash (used for addresses, key hashes).
+/// On x86_64: uses `blake2b_simd` with SSE2/SSE4.1/AVX2 intrinsics.
+/// On ARM/AArch64: uses `blake2` (RustCrypto) which LLVM auto-vectorizes well for NEON.
+#[cfg(target_arch = "x86_64")]
 pub fn blake2b_224(data: &[u8]) -> Hash28 {
     let hash = blake2b_simd::Params::new().hash_length(28).hash(data);
     let mut out = [0u8; 28];
     out.copy_from_slice(hash.as_bytes());
+    Hash(out)
+}
+
+#[cfg(not(target_arch = "x86_64"))]
+pub fn blake2b_224(data: &[u8]) -> Hash28 {
+    let mut hasher = blake2::Blake2b::<blake2::digest::consts::U28>::new();
+    hasher.update(data);
+    let result = hasher.finalize();
+    let mut out = [0u8; 28];
+    out.copy_from_slice(&result);
     Hash(out)
 }
 
