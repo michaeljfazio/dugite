@@ -107,7 +107,7 @@ struct RunArgs {
     #[arg(long, default_value = "360")]
     snapshot_bulk_min_secs: u64,
 
-    /// Storage profile: high-memory (default) or low-memory
+    /// Storage profile: ultra-memory (32GB), high-memory (16GB, default), low-memory (8GB), or minimal (4GB)
     #[arg(long, default_value = "high-memory")]
     storage_profile: String,
 

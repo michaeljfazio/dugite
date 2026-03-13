@@ -3,8 +3,16 @@
 //! Operators choose a preset (`high-memory`, `low-memory`) or individually
 //! tune parameters. Both profiles use memory-mapped block indexes by default
 //! (benchmarks show 3-4x faster lookups and 4x faster open at scale vs
-//! in-memory HashMap). The `low-memory` profile reduces LSM cache sizes
-//! for constrained environments.
+//! in-memory HashMap).
+//!
+//! Four profiles are available, sized to maximize available memory:
+//!
+//! | Profile | Target | Memtable | Cache | Expected RSS |
+//! |---------|--------|----------|-------|-------------|
+//! | `minimal` | 4GB | 256MB | 2GB | ~3GB |
+//! | `low-memory` | 8GB | 512MB | 5GB | ~6.5GB |
+//! | `high-memory` | 16GB | 1GB | 12GB | ~14GB |
+//! | `ultra-memory` | 32GB | 2GB | 24GB | ~27GB |
 
 use serde::{Deserialize, Serialize};
 
@@ -12,41 +20,51 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum StorageProfile {
+    /// 32GB+ systems: 2GB memtable, 24GB cache (~27GB RSS)
+    UltraMemory,
+    /// 16GB systems (default): 1GB memtable, 12GB cache (~14GB RSS)
     HighMemory,
+    /// 8GB systems: 512MB memtable, 5GB cache (~6.5GB RSS)
     LowMemory,
+    /// 4GB systems: 256MB memtable, 2GB cache (~3GB RSS)
+    Minimal,
 }
 
 impl StorageProfile {
     /// Produce the base configuration for this profile.
     pub fn to_config(self) -> StorageConfig {
-        match self {
-            StorageProfile::HighMemory => StorageConfig {
-                immutable: ImmutableConfig {
-                    index_type: BlockIndexType::Mmap,
-                    mmap_load_factor: 0.7,
-                    mmap_initial_capacity: 0,
-                },
-                utxo: UtxoConfig {
-                    backend: UtxoBackend::Lsm,
-                    memtable_size_mb: 128,
-                    block_cache_size_mb: 256,
-                    bloom_filter_bits_per_key: 10,
-                },
+        let immutable = ImmutableConfig {
+            index_type: BlockIndexType::Mmap,
+            mmap_load_factor: 0.7,
+            mmap_initial_capacity: 0,
+        };
+        let utxo = match self {
+            StorageProfile::UltraMemory => UtxoConfig {
+                backend: UtxoBackend::Lsm,
+                memtable_size_mb: 2048,
+                block_cache_size_mb: 24576,
+                bloom_filter_bits_per_key: 10,
             },
-            StorageProfile::LowMemory => StorageConfig {
-                immutable: ImmutableConfig {
-                    index_type: BlockIndexType::Mmap,
-                    mmap_load_factor: 0.7,
-                    mmap_initial_capacity: 0,
-                },
-                utxo: UtxoConfig {
-                    backend: UtxoBackend::Lsm,
-                    memtable_size_mb: 64,
-                    block_cache_size_mb: 128,
-                    bloom_filter_bits_per_key: 10,
-                },
+            StorageProfile::HighMemory => UtxoConfig {
+                backend: UtxoBackend::Lsm,
+                memtable_size_mb: 1024,
+                block_cache_size_mb: 12288,
+                bloom_filter_bits_per_key: 10,
             },
-        }
+            StorageProfile::LowMemory => UtxoConfig {
+                backend: UtxoBackend::Lsm,
+                memtable_size_mb: 512,
+                block_cache_size_mb: 5120,
+                bloom_filter_bits_per_key: 10,
+            },
+            StorageProfile::Minimal => UtxoConfig {
+                backend: UtxoBackend::Lsm,
+                memtable_size_mb: 256,
+                block_cache_size_mb: 2048,
+                bloom_filter_bits_per_key: 10,
+            },
+        };
+        StorageConfig { immutable, utxo }
     }
 }
 
@@ -55,10 +73,12 @@ impl std::str::FromStr for StorageProfile {
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s {
+            "ultra-memory" => Ok(StorageProfile::UltraMemory),
             "high-memory" => Ok(StorageProfile::HighMemory),
             "low-memory" => Ok(StorageProfile::LowMemory),
+            "minimal" => Ok(StorageProfile::Minimal),
             other => Err(format!(
-                "unknown storage profile '{other}', expected 'high-memory' or 'low-memory'"
+                "unknown storage profile '{other}', expected 'ultra-memory', 'high-memory', 'low-memory', or 'minimal'"
             )),
         }
     }
@@ -67,8 +87,10 @@ impl std::str::FromStr for StorageProfile {
 impl std::fmt::Display for StorageProfile {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            StorageProfile::UltraMemory => write!(f, "ultra-memory"),
             StorageProfile::HighMemory => write!(f, "high-memory"),
             StorageProfile::LowMemory => write!(f, "low-memory"),
+            StorageProfile::Minimal => write!(f, "minimal"),
         }
     }
 }
@@ -146,10 +168,11 @@ pub struct UtxoConfig {
 
 impl Default for UtxoConfig {
     fn default() -> Self {
+        // Standalone default matches low-memory profile (safe for most systems)
         UtxoConfig {
             backend: UtxoBackend::InMemory,
-            memtable_size_mb: 128,
-            block_cache_size_mb: 256,
+            memtable_size_mb: 512,
+            block_cache_size_mb: 5120,
             bloom_filter_bits_per_key: 10,
         }
     }
@@ -267,12 +290,22 @@ mod tests {
     use super::*;
 
     #[test]
+    fn test_ultra_memory_profile_defaults() {
+        let config = StorageProfile::UltraMemory.to_config();
+        assert_eq!(config.immutable.index_type, BlockIndexType::Mmap);
+        assert_eq!(config.utxo.backend, UtxoBackend::Lsm);
+        assert_eq!(config.utxo.memtable_size_mb, 2048);
+        assert_eq!(config.utxo.block_cache_size_mb, 24576);
+        assert_eq!(config.utxo.bloom_filter_bits_per_key, 10);
+    }
+
+    #[test]
     fn test_high_memory_profile_defaults() {
         let config = StorageProfile::HighMemory.to_config();
         assert_eq!(config.immutable.index_type, BlockIndexType::Mmap);
         assert_eq!(config.utxo.backend, UtxoBackend::Lsm);
-        assert_eq!(config.utxo.memtable_size_mb, 128);
-        assert_eq!(config.utxo.block_cache_size_mb, 256);
+        assert_eq!(config.utxo.memtable_size_mb, 1024);
+        assert_eq!(config.utxo.block_cache_size_mb, 12288);
         assert_eq!(config.utxo.bloom_filter_bits_per_key, 10);
     }
 
@@ -281,12 +314,25 @@ mod tests {
         let config = StorageProfile::LowMemory.to_config();
         assert_eq!(config.immutable.index_type, BlockIndexType::Mmap);
         assert_eq!(config.utxo.backend, UtxoBackend::Lsm);
-        assert_eq!(config.utxo.memtable_size_mb, 64);
-        assert_eq!(config.utxo.block_cache_size_mb, 128);
+        assert_eq!(config.utxo.memtable_size_mb, 512);
+        assert_eq!(config.utxo.block_cache_size_mb, 5120);
+    }
+
+    #[test]
+    fn test_minimal_profile_defaults() {
+        let config = StorageProfile::Minimal.to_config();
+        assert_eq!(config.immutable.index_type, BlockIndexType::Mmap);
+        assert_eq!(config.utxo.backend, UtxoBackend::Lsm);
+        assert_eq!(config.utxo.memtable_size_mb, 256);
+        assert_eq!(config.utxo.block_cache_size_mb, 2048);
     }
 
     #[test]
     fn test_profile_from_str() {
+        assert_eq!(
+            "ultra-memory".parse::<StorageProfile>().unwrap(),
+            StorageProfile::UltraMemory
+        );
         assert_eq!(
             "high-memory".parse::<StorageProfile>().unwrap(),
             StorageProfile::HighMemory
@@ -294,6 +340,10 @@ mod tests {
         assert_eq!(
             "low-memory".parse::<StorageProfile>().unwrap(),
             StorageProfile::LowMemory
+        );
+        assert_eq!(
+            "minimal".parse::<StorageProfile>().unwrap(),
+            StorageProfile::Minimal
         );
         assert!("unknown".parse::<StorageProfile>().is_err());
     }
@@ -366,12 +416,12 @@ mod tests {
         assert_eq!(config.immutable.index_type, BlockIndexType::Mmap);
         assert_eq!(config.utxo.memtable_size_mb, 96);
         // Unchanged from profile
-        assert_eq!(config.utxo.block_cache_size_mb, 256);
+        assert_eq!(config.utxo.block_cache_size_mb, 12288);
     }
 
     #[test]
     fn test_resolution_order_profile_config_cli() {
-        // Profile: high-memory (memtable=128)
+        // Profile: high-memory (memtable=1024)
         // Config: memtable=96
         // CLI: memtable=32
         let json = StorageConfigJson {
@@ -411,8 +461,8 @@ mod tests {
         let config = StorageConfig::default();
         assert_eq!(config.immutable.index_type, BlockIndexType::Mmap);
         assert_eq!(config.utxo.backend, UtxoBackend::Lsm);
-        assert_eq!(config.utxo.memtable_size_mb, 128);
-        assert_eq!(config.utxo.block_cache_size_mb, 256);
+        assert_eq!(config.utxo.memtable_size_mb, 1024);
+        assert_eq!(config.utxo.block_cache_size_mb, 12288);
     }
 
     #[test]
@@ -425,17 +475,20 @@ mod tests {
 
     #[test]
     fn test_default_utxo_config() {
+        // UtxoConfig::default() matches low-memory profile values
         let config = UtxoConfig::default();
         assert_eq!(config.backend, UtxoBackend::InMemory);
-        assert_eq!(config.memtable_size_mb, 128);
-        assert_eq!(config.block_cache_size_mb, 256);
+        assert_eq!(config.memtable_size_mb, 512);
+        assert_eq!(config.block_cache_size_mb, 5120);
         assert_eq!(config.bloom_filter_bits_per_key, 10);
     }
 
     #[test]
     fn test_profile_display() {
+        assert_eq!(StorageProfile::UltraMemory.to_string(), "ultra-memory");
         assert_eq!(StorageProfile::HighMemory.to_string(), "high-memory");
         assert_eq!(StorageProfile::LowMemory.to_string(), "low-memory");
+        assert_eq!(StorageProfile::Minimal.to_string(), "minimal");
     }
 
     #[test]
@@ -452,8 +505,8 @@ mod tests {
         )
         .unwrap();
         assert_eq!(config.immutable.index_type, BlockIndexType::Mmap);
-        assert_eq!(config.utxo.memtable_size_mb, 64);
-        assert_eq!(config.utxo.block_cache_size_mb, 128);
+        assert_eq!(config.utxo.memtable_size_mb, 512);
+        assert_eq!(config.utxo.block_cache_size_mb, 5120);
     }
 
     #[test]
@@ -536,7 +589,7 @@ mod tests {
         // Unchanged from HighMemory profile
         assert_eq!(config.immutable.index_type, BlockIndexType::Mmap);
         assert_eq!(config.utxo.backend, UtxoBackend::Lsm);
-        assert_eq!(config.utxo.block_cache_size_mb, 256);
+        assert_eq!(config.utxo.block_cache_size_mb, 12288);
         assert_eq!(config.utxo.bloom_filter_bits_per_key, 10);
     }
 

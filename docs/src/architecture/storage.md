@@ -32,6 +32,7 @@ Properties:
 - **No LSM tree** -- plain chunk files, no compaction or memtable overhead
 - **Sequential access** -- optimized for the append-heavy, read-sequential block storage workload
 - **Secondary indexes** -- slot-to-offset and hash-to-slot mappings for efficient lookups
+- **Memory-mapped block index** -- on-disk open-addressing hash table (`hash_index.dat`) provides 3-5x faster lookups than in-memory HashMap while using near-zero RSS
 
 ### VolatileDB (In-Memory HashMap)
 
@@ -75,11 +76,16 @@ The `UtxoStore` (in `torsten-ledger`) wraps a cardano-lsm `LsmTree` and provides
 - **Batch writes** -- UTxO inserts and deletes are batched per block
 - **Snapshots** -- periodic snapshots for crash recovery
 
-cardano-lsm configuration:
-- 128MB write buffer (memtable)
-- 256MB block cache
-- 10 bits per key bloom filter
-- Hybrid compaction: tiered L0 (size ratio 4.0), leveled L1+ (size ratio 10.0)
+cardano-lsm is configured via storage profiles that maximize available system memory:
+
+| Profile | Target System | Memtable | Block Cache | Expected RSS |
+|---------|--------------|----------|-------------|-------------|
+| `ultra-memory` | 32GB | 2GB | 24GB | ~27GB |
+| `high-memory` (default) | 16GB | 1GB | 12GB | ~14GB |
+| `low-memory` | 8GB | 512MB | 5GB | ~6.5GB |
+| `minimal` | 4GB | 256MB | 2GB | ~3GB |
+
+All profiles use 10 bits per key bloom filters and hybrid compaction (tiered L0, leveled L1+).
 
 ### DiffSeq (Rollback Support)
 
@@ -125,7 +131,8 @@ database-path/
   immutable/          # Append-only block chunk files
     chunks/           # Block data files
     index/            # Secondary indexes (slot, hash)
-  utxo/               # cardano-lsm database (UTxO set)
+    hash_index.dat    # Mmap block index (open-addressing hash table)
+  utxo-store/         # cardano-lsm database (UTxO set)
     active/           # Current SSTables
     snapshots/        # Durable snapshots
   ledger/             # Ledger state snapshots
@@ -138,10 +145,41 @@ database-path/
 - **Memory usage** -- the VolatileDB holds approximately k blocks in memory (typically a few hundred MB). The UTxO set lives on disk, significantly reducing memory pressure compared to an all-in-memory approach
 - **Batch size** -- the flush batch size balances memory usage against write efficiency
 
+## Storage Profiles
+
+Torsten provides four storage profiles sized to maximize available system memory:
+
+```bash
+# Select a profile via CLI
+./torsten-node run --storage-profile high-memory ...
+
+# Override individual parameters
+./torsten-node run --storage-profile low-memory --utxo-block-cache-size-mb 4096 ...
+```
+
+Profiles can also be set in the node configuration file:
+
+```json
+{
+  "storage": {
+    "profile": "high-memory",
+    "utxoBlockCacheSizeMb": 8192
+  }
+}
+```
+
+Resolution order: profile defaults < config file overrides < CLI overrides.
+
 ## Benchmarks
 
 Run storage benchmarks with:
 
 ```bash
-cargo bench -p torsten-storage
+# Storage benchmarks (block index, ImmutableDB, ChainDB, scaling to 1M entries)
+cargo bench -p torsten-storage --bench storage_bench
+
+# UTxO store benchmarks (insert, lookup, apply_tx, LSM configs, scaling to 1M entries)
+cargo bench -p torsten-ledger --bench utxo_bench
 ```
+
+Results are saved to `target/criterion/` with HTML reports. Baseline results are tracked in `benches/results/`.
