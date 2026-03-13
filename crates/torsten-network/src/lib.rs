@@ -18,7 +18,9 @@ pub use miniprotocols::txsubmission::{TxSubmissionClient, TxSubmissionError, TxS
 pub use n2c::{N2CServer, TxValidationError, TxValidator};
 pub use n2c_client::N2CClient;
 // Re-export mempool trait and types from torsten-primitives for convenience
-pub use n2n_server::{BlockAnnouncement, BlockProvider, N2NServer, RollbackAnnouncement, TipInfo};
+pub use n2n_server::{
+    BlockAnnouncement, BlockProvider, N2NRateLimitConfig, N2NServer, RollbackAnnouncement, TipInfo,
+};
 pub use peer::PeerConnection;
 pub use peer_manager::{DiffusionMode, PeerManager, PeerManagerConfig, PeerPerformance};
 pub use pipelined::PipelinedPeerClient;

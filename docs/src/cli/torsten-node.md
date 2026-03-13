@@ -30,6 +30,11 @@ torsten-node run [OPTIONS]
 | `--log-dir` | `logs` | Directory for log files (used with `--log-output file`) |
 | `--log-file-rotation` | `daily` | Log file rotation strategy: `daily`, `hourly`, or `never` |
 | `--log-no-color` | `false` | Disable ANSI colors in stdout output |
+| `--mempool-max-tx` | `16384` | Maximum number of transactions in the mempool |
+| `--mempool-max-bytes` | `536870912` | Maximum mempool size in bytes (default 512 MB) |
+| `--snapshot-max-retained` | `2` | Maximum number of ledger snapshots to retain on disk |
+| `--snapshot-bulk-min-blocks` | `50000` | Minimum blocks between bulk-sync snapshots |
+| `--snapshot-bulk-min-secs` | `360` | Minimum seconds between bulk-sync snapshots |
 
 ### Relay Node (default)
 

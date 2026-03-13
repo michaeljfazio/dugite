@@ -116,6 +116,15 @@ impl ByronGenesis {
         self.protocol_consts.k
     }
 
+    /// Get the Byron slot duration in milliseconds from genesis config.
+    /// Falls back to 20000ms (20s) if not specified or unparseable.
+    pub fn slot_duration_ms(&self) -> u64 {
+        self.block_version_data
+            .slot_duration
+            .parse::<u64>()
+            .unwrap_or(20_000)
+    }
+
     /// Extract the initial UTxO set from both nonAvvmBalances and avvmDistr.
     ///
     /// Returns decoded address bytes and lovelace amounts for all non-zero balances.

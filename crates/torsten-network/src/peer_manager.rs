@@ -478,8 +478,39 @@ impl PeerManager {
             && self.inbound_count < self.config.max_inbound_peers
     }
 
+    /// Extract /24 subnet key for IPv4, /48 prefix for IPv6.
+    fn subnet_key(addr: &SocketAddr) -> u64 {
+        match addr.ip() {
+            std::net::IpAddr::V4(v4) => {
+                let octets = v4.octets();
+                // /24 prefix
+                u64::from(octets[0]) << 16 | u64::from(octets[1]) << 8 | u64::from(octets[2])
+            }
+            std::net::IpAddr::V6(v6) => {
+                let segments = v6.segments();
+                // /48 prefix (first 3 segments)
+                (u64::from(segments[0]) << 32)
+                    | (u64::from(segments[1]) << 16)
+                    | u64::from(segments[2])
+            }
+        }
+    }
+
+    /// Build a map of subnet → count for currently connected peers.
+    fn connected_subnet_counts(&self) -> HashMap<u64, usize> {
+        let mut counts = HashMap::new();
+        for addr in self.hot_peers.iter().chain(self.warm_peers.iter()) {
+            *counts.entry(Self::subnet_key(addr)).or_insert(0) += 1;
+        }
+        counts
+    }
+
+    /// Maximum connected peers per /24 (IPv4) or /48 (IPv6) subnet before
+    /// a diversity penalty is applied. Keeps connections spread across networks.
+    const MAX_PEERS_PER_SUBNET: usize = 3;
+
     /// Get peers that should be connected to (cold peers that need promotion),
-    /// ranked by selection score (highest first).
+    /// ranked by selection score with subnet diversity bias (highest first).
     pub fn peers_to_connect(&self) -> Vec<SocketAddr> {
         let connected = self.hot_peers.len() + self.warm_peers.len();
         let target = self.config.target_hot_peers + self.config.target_warm_peers;
@@ -488,13 +519,22 @@ impl PeerManager {
         }
 
         let needed = target - connected;
+        let subnet_counts = self.connected_subnet_counts();
+
         let mut candidates: Vec<_> = self
             .cold_peers
             .iter()
             .filter_map(|addr| {
                 self.peers.get(addr).and_then(|p| {
                     if p.should_retry() {
-                        Some((*addr, p.selection_score()))
+                        let mut score = p.selection_score();
+                        // Apply diversity penalty if this subnet is already well-represented
+                        let subnet = Self::subnet_key(addr);
+                        let count = subnet_counts.get(&subnet).copied().unwrap_or(0);
+                        if count >= Self::MAX_PEERS_PER_SUBNET {
+                            score -= 0.2 * (count - Self::MAX_PEERS_PER_SUBNET + 1) as f64;
+                        }
+                        Some((*addr, score))
                     } else {
                         None
                     }
@@ -673,6 +713,8 @@ impl PeerManager {
             .filter_map(|p| p.performance.avg_block_fetch_ms)
             .min_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
 
+        let unique_subnets = self.connected_subnet_counts().len();
+
         PeerManagerStats {
             known_peers: self.peers.len(),
             cold_peers: self.cold_peers.len(),
@@ -681,6 +723,7 @@ impl PeerManager {
             inbound_count: self.inbound_count,
             avg_hot_reputation,
             best_fetch_latency_ms,
+            unique_subnets,
         }
     }
 }
@@ -697,6 +740,8 @@ pub struct PeerManagerStats {
     pub avg_hot_reputation: f64,
     /// Best block fetch latency across hot peers (ms)
     pub best_fetch_latency_ms: Option<f64>,
+    /// Number of unique /24 (IPv4) or /48 (IPv6) subnets among connected peers
+    pub unique_subnets: usize,
 }
 
 impl std::fmt::Display for PeerManagerStats {
@@ -714,6 +759,7 @@ impl std::fmt::Display for PeerManagerStats {
         if let Some(lat) = self.best_fetch_latency_ms {
             write!(f, ", best_fetch={lat:.0}ms")?;
         }
+        write!(f, ", subnets={}", self.unique_subnets)?;
         Ok(())
     }
 }
@@ -1192,5 +1238,72 @@ mod tests {
         assert_eq!(pm.peers.len(), 2);
         assert!(!pm.peers.contains_key(&test_addr(3002)));
         assert!(pm.peers.contains_key(&routable_addr));
+    }
+
+    fn routable_addr(a: u8, b: u8, c: u8, d: u8, port: u16) -> SocketAddr {
+        format!("{a}.{b}.{c}.{d}:{port}").parse().unwrap()
+    }
+
+    #[test]
+    fn test_subnet_key_ipv4() {
+        // Same /24 → same key
+        let a1 = routable_addr(10, 20, 30, 1, 3001);
+        let a2 = routable_addr(10, 20, 30, 2, 3002);
+        assert_eq!(PeerManager::subnet_key(&a1), PeerManager::subnet_key(&a2));
+
+        // Different /24 → different key
+        let a3 = routable_addr(10, 20, 31, 1, 3001);
+        assert_ne!(PeerManager::subnet_key(&a1), PeerManager::subnet_key(&a3));
+    }
+
+    #[test]
+    fn test_subnet_diversity_penalty() {
+        let config = PeerManagerConfig {
+            target_hot_peers: 2,
+            target_warm_peers: 4,
+            target_known_peers: 100,
+            ..PeerManagerConfig::default()
+        };
+        let mut pm = PeerManager::new(config);
+
+        // Add 4 peers from the same /24 subnet (8.8.8.x)
+        for i in 1..=4 {
+            pm.add_config_peer(routable_addr(8, 8, 8, i, 3000 + i as u16), false, false);
+        }
+        // Add 1 peer from a different subnet (1.2.3.x)
+        pm.add_config_peer(routable_addr(1, 2, 3, 1, 4001), false, false);
+
+        // Connect 3 from the same subnet (exceeds MAX_PEERS_PER_SUBNET)
+        pm.peer_connected(&routable_addr(8, 8, 8, 1, 3001), 14, true);
+        pm.peer_connected(&routable_addr(8, 8, 8, 2, 3002), 14, true);
+        pm.peer_connected(&routable_addr(8, 8, 8, 3, 3003), 14, true);
+
+        // Now get peers to connect — the diverse peer should rank higher
+        // than the 4th peer from the same subnet
+        let to_connect = pm.peers_to_connect();
+        assert!(!to_connect.is_empty());
+        // The diverse-subnet peer should be preferred
+        assert_eq!(
+            to_connect[0],
+            routable_addr(1, 2, 3, 1, 4001),
+            "Diverse-subnet peer should be preferred over concentrated subnet"
+        );
+    }
+
+    #[test]
+    fn test_unique_subnets_in_stats() {
+        let mut pm = PeerManager::new(PeerManagerConfig::default());
+        let a1 = routable_addr(8, 8, 8, 1, 3001);
+        let a2 = routable_addr(8, 8, 8, 2, 3002);
+        let a3 = routable_addr(1, 2, 3, 1, 3003);
+        pm.add_config_peer(a1, false, false);
+        pm.add_config_peer(a2, false, false);
+        pm.add_config_peer(a3, false, false);
+        pm.peer_connected(&a1, 14, true);
+        pm.peer_connected(&a2, 14, true);
+        pm.peer_connected(&a3, 14, true);
+
+        let stats = pm.stats();
+        assert_eq!(stats.unique_subnets, 2, "Should have 2 unique /24 subnets");
     }
 }

@@ -42,6 +42,16 @@ pub struct NodeArgs {
     pub shelley_operational_certificate: Option<PathBuf>,
     /// Prometheus metrics port (0 to disable)
     pub metrics_port: u16,
+    /// Maximum number of transactions in the mempool
+    pub mempool_max_tx: usize,
+    /// Maximum mempool size in bytes
+    pub mempool_max_bytes: usize,
+    /// Maximum snapshots to retain on disk
+    pub snapshot_max_retained: usize,
+    /// Minimum blocks between bulk-sync snapshots
+    pub snapshot_bulk_min_blocks: u64,
+    /// Minimum seconds between bulk-sync snapshots
+    pub snapshot_bulk_min_secs: u64,
 }
 
 /// Provides block data from ChainDB for the N2N server
@@ -262,6 +272,7 @@ fn utxo_to_snapshot(
 struct LedgerTxValidator {
     ledger: Arc<RwLock<LedgerState>>,
     slot_config: torsten_ledger::plutus::SlotConfig,
+    metrics: Arc<crate::metrics::NodeMetrics>,
 }
 
 impl TxValidator for LedgerTxValidator {
@@ -288,6 +299,9 @@ impl TxValidator for LedgerTxValidator {
             Some(&self.slot_config),
         )
         .map_err(|errors| {
+            for err in &errors {
+                self.metrics.record_validation_error(&format!("{:?}", err));
+            }
             let mut mapped: Vec<TxValidationError> =
                 errors.into_iter().map(convert_validation_error).collect();
             if mapped.len() == 1 {
@@ -512,6 +526,23 @@ impl SnapshotPolicy {
         }
     }
 
+    /// Create with custom parameters (from CLI flags).
+    fn with_params(
+        security_param_k: u64,
+        max_snapshots: usize,
+        bulk_min_blocks: u64,
+        bulk_min_secs: u64,
+    ) -> Self {
+        SnapshotPolicy {
+            normal_interval: std::time::Duration::from_secs(security_param_k * 2),
+            bulk_min_blocks,
+            bulk_min_interval: std::time::Duration::from_secs(bulk_min_secs),
+            max_snapshots,
+            last_snapshot_time: std::time::Instant::now(),
+            blocks_since_snapshot: 0,
+        }
+    }
+
     /// Record that blocks have been applied.
     fn record_blocks(&mut self, count: u64) {
         self.blocks_since_snapshot += count;
@@ -553,6 +584,8 @@ pub struct Node {
     /// Byron epoch length in absolute slots (10 * k). For correct slot
     /// computation on non-mainnet networks.
     byron_epoch_length: u64,
+    /// Byron slot duration in milliseconds (from genesis, default 20000).
+    byron_slot_duration_ms: u64,
     shelley_genesis: Option<ShelleyGenesis>,
     topology_path: PathBuf,
     metrics: Arc<crate::metrics::NodeMetrics>,
@@ -590,6 +623,7 @@ impl Node {
         // Load Byron genesis if configured
         let config_dir = args.config_dir.clone();
         let mut byron_epoch_length: u64 = 0; // 0 = use pallas defaults (mainnet)
+        let mut byron_slot_duration_ms: u64 = 20_000; // default 20s, overridden by genesis
         let mut byron_genesis_file_hash: Option<torsten_primitives::hash::Hash32> = None;
         let byron_genesis_utxos: Vec<(Vec<u8>, u64)> =
             if let Some(ref genesis_path) = args.config.byron_genesis_file {
@@ -599,10 +633,12 @@ impl Node {
                         let utxos = genesis.initial_utxos();
                         let k = genesis.security_param();
                         byron_epoch_length = 10 * k;
+                        byron_slot_duration_ms = genesis.slot_duration_ms();
                         info!(
                             magic = genesis.protocol_magic(),
                             k,
                             epoch_len = byron_epoch_length,
+                            slot_duration_ms = byron_slot_duration_ms,
                             utxos = utxos.len(),
                             "Byron genesis loaded",
                         );
@@ -841,7 +877,10 @@ impl Node {
             "Consensus: Praos",
         );
 
-        let mempool = Arc::new(Mempool::new(MempoolConfig::default()));
+        let mempool = Arc::new(Mempool::new(MempoolConfig {
+            max_transactions: args.mempool_max_tx,
+            max_bytes: args.mempool_max_bytes,
+        }));
 
         let socket_path = args.socket_path.clone();
         let listen_addr: std::net::SocketAddr =
@@ -953,11 +992,15 @@ impl Node {
             listen_addr,
             network_magic,
             byron_epoch_length,
-            snapshot_policy: SnapshotPolicy::new(
+            byron_slot_duration_ms,
+            snapshot_policy: SnapshotPolicy::with_params(
                 shelley_genesis
                     .as_ref()
                     .map(|g| g.security_param)
                     .unwrap_or(2160),
+                args.snapshot_max_retained,
+                args.snapshot_bulk_min_blocks,
+                args.snapshot_bulk_min_secs,
             ),
             shelley_genesis,
             topology_path: args.topology_path,
@@ -1059,6 +1102,7 @@ impl Node {
         n2c_server.set_tx_validator(Arc::new(LedgerTxValidator {
             ledger: self.ledger_state.clone(),
             slot_config,
+            metrics: self.metrics.clone(),
         }));
         n2c_server.set_block_provider(Arc::new(ChainDBBlockProvider {
             chain_db: self.chain_db.clone(),
@@ -1352,13 +1396,21 @@ impl Node {
             let mut client = None;
             if !targets.is_empty() {
                 for addr in &targets {
+                    if *shutdown_rx.borrow() {
+                        break;
+                    }
                     let target = addr.to_string();
                     debug!("Connecting to peer {target}...");
                     let connect_start = std::time::Instant::now();
-                    match NodeToNodeClient::connect(&*target, network_magic).await {
+                    let connect_result = tokio::select! {
+                        r = NodeToNodeClient::connect(&*target, network_magic) => r,
+                        _ = shutdown_rx.changed() => break,
+                    };
+                    match connect_result {
                         Ok(mut c) => {
                             c.set_byron_epoch_length(self.byron_epoch_length);
                             let rtt_ms = connect_start.elapsed().as_secs_f64() * 1000.0;
+                            self.metrics.record_handshake_rtt(rtt_ms);
                             let mut pm = peer_manager.write().await;
                             pm.peer_connected(addr, 14, true);
                             pm.record_handshake_rtt(addr, rtt_ms);
@@ -1377,9 +1429,16 @@ impl Node {
             } else {
                 // Fallback: try topology peers directly
                 for (addr, port) in &peers {
+                    if *shutdown_rx.borrow() {
+                        break;
+                    }
                     let target = format!("{addr}:{port}");
                     debug!("Connecting to peer {target}...");
-                    match NodeToNodeClient::connect(&*target, network_magic).await {
+                    let connect_result = tokio::select! {
+                        r = NodeToNodeClient::connect(&*target, network_magic) => r,
+                        _ = shutdown_rx.changed() => break,
+                    };
+                    match connect_result {
                         Ok(mut c) => {
                             c.set_byron_epoch_length(self.byron_epoch_length);
                             info!(peer = %target, "Peer connected");
@@ -1470,12 +1529,20 @@ impl Node {
                 drop(pm);
 
                 for addr in &additional_peers {
+                    if *shutdown_rx.borrow() {
+                        break;
+                    }
                     let target = addr.to_string();
                     let connect_start = std::time::Instant::now();
-                    match NodeToNodeClient::connect(&*target, network_magic).await {
+                    let connect_result = tokio::select! {
+                        r = NodeToNodeClient::connect(&*target, network_magic) => r,
+                        _ = shutdown_rx.changed() => break,
+                    };
+                    match connect_result {
                         Ok(mut c) => {
                             c.set_byron_epoch_length(self.byron_epoch_length);
                             let rtt_ms = connect_start.elapsed().as_secs_f64() * 1000.0;
+                            self.metrics.record_handshake_rtt(rtt_ms);
                             let mut pm = peer_manager.write().await;
                             pm.peer_connected(addr, 14, true);
                             pm.record_handshake_rtt(addr, rtt_ms);
@@ -1492,9 +1559,16 @@ impl Node {
                 // If no fetchers connected, add a dedicated fetcher to the primary peer.
                 // This is necessary because the primary client connection is used for
                 // pipelined ChainSync headers and can't simultaneously fetch blocks.
-                if fetch_pool.is_empty() {
+                if fetch_pool.is_empty() && !*shutdown_rx.borrow() {
                     let target = peer_addr.to_string();
-                    match NodeToNodeClient::connect(&*target, network_magic).await {
+                    let connect_result = tokio::select! {
+                        r = NodeToNodeClient::connect(&*target, network_magic) => r,
+                        _ = shutdown_rx.changed() => {
+                            info!(fetchers = 0, "Block fetchers ready");
+                            continue;
+                        }
+                    };
+                    match connect_result {
                         Ok(mut c) => {
                             c.set_byron_epoch_length(self.byron_epoch_length);
                             debug!("Connected dedicated block fetcher to primary peer {target}");
@@ -1509,9 +1583,16 @@ impl Node {
             }
 
             // Create pipelined ChainSync connection to same peer for high-throughput headers
+            if *shutdown_rx.borrow() {
+                break;
+            }
             let pipelined_client = {
                 let target = peer_addr.to_string();
-                match PipelinedPeerClient::connect(&*target, network_magic).await {
+                let connect_result = tokio::select! {
+                    r = PipelinedPeerClient::connect(&*target, network_magic) => r,
+                    _ = shutdown_rx.changed() => { break; }
+                };
+                match connect_result {
                     Ok(mut pc) => {
                         pc.set_byron_epoch_length(self.byron_epoch_length);
                         debug!("Pipelined ChainSync client connected to {target}");
@@ -1521,11 +1602,13 @@ impl Node {
                             let ledger = self.ledger_state.clone();
                             let slot_config = self.ledger_state.read().await.slot_config;
                             let shutdown = shutdown_rx.clone();
+                            let txsub_metrics = self.metrics.clone();
                             tokio::spawn(async move {
                                 let validator: Option<Arc<dyn TxValidator>> =
                                     Some(Arc::new(LedgerTxValidator {
                                         ledger,
                                         slot_config,
+                                        metrics: txsub_metrics,
                                     }));
                                 let mut client =
                                     torsten_network::TxSubmissionClient::new(txsub_channel);
@@ -2444,6 +2527,9 @@ impl Node {
                     msg = block_rx.recv() => {
                         match msg {
                             Some(PipelineMsg::Batch { blocks, tip, fetch_ms, header_count }) => {
+                                if header_count > 0 {
+                                    self.metrics.record_block_fetch_latency(fetch_ms / header_count as f64);
+                                }
                                 self.peer_manager.write().await.record_block_fetch(
                                     &peer_addr, fetch_ms, header_count, 0,
                                 );
@@ -2482,7 +2568,7 @@ impl Node {
                                 let _ = depth_tx.send(1);
                             }
                             Some(PipelineMsg::FetchError(e)) => {
-                                error!("Block fetch pipeline error: {e}");
+                                warn!("Block fetch pipeline error: {e}");
                                 break;
                             }
                             None => {
@@ -2566,6 +2652,9 @@ impl Node {
                                             match blocks_result {
                                                 Ok(blocks) => {
                                                     let fetch_ms = fetch_start.elapsed().as_secs_f64() * 1000.0;
+                                                    if header_count > 0 {
+                                                        self.metrics.record_block_fetch_latency(fetch_ms / header_count as f64);
+                                                    }
                                                     self.peer_manager.write().await.record_block_fetch(
                                                         &peer_addr, fetch_ms, header_count, 0,
                                                     );
@@ -3968,7 +4057,7 @@ impl Node {
 
         let is_mainnet = self.network_magic == 764824073;
 
-        // Byron params: epoch length from genesis, slot length always 20s
+        // Byron params: epoch length and slot duration from genesis
         let byron_epoch_len: u64 = if self.byron_epoch_length > 0 {
             self.byron_epoch_length
         } else if is_mainnet {
@@ -3976,7 +4065,7 @@ impl Node {
         } else {
             4320
         };
-        let byron_slot_len_ms: u64 = 20000; // 20 seconds for all networks
+        let byron_slot_len_ms: u64 = self.byron_slot_duration_ms;
         let byron_safe_zone = k * 2; // Byron safe zone = 2k (864 for preview, matches Haskell)
         let byron_genesis_window = k * 2;
 

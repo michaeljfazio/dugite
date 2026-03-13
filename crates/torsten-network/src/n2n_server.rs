@@ -96,6 +96,27 @@ pub enum PeerSharingMode {
 /// Prevents unbounded HashMap growth from attackers connecting from many IPs.
 const MAX_TRACKED_IPS: usize = 100_000;
 
+/// Configurable rate-limiting and connection parameters for the N2N server.
+#[derive(Debug, Clone)]
+pub struct N2NRateLimitConfig {
+    /// Maximum connections allowed per IP within the time window.
+    pub max_connections_per_ip: usize,
+    /// Time window for per-IP rate limiting (seconds).
+    pub rate_limit_window_secs: u64,
+    /// Maximum blocks per BlockFetch request range (DoS protection).
+    pub max_blockfetch_range: u64,
+}
+
+impl Default for N2NRateLimitConfig {
+    fn default() -> Self {
+        N2NRateLimitConfig {
+            max_connections_per_ip: 10,
+            rate_limit_window_secs: 60,
+            max_blockfetch_range: 2000,
+        }
+    }
+}
+
 /// Run inline cleanup every N insertions to evict stale entries.
 const CLEANUP_EVERY_N_INSERTIONS: usize = 1_000;
 
@@ -207,6 +228,8 @@ pub struct N2NServer {
     block_announcement_tx: broadcast::Sender<BlockAnnouncement>,
     /// Broadcast channel for rollback notifications to connected peers
     rollback_announcement_tx: broadcast::Sender<RollbackAnnouncement>,
+    /// Rate limiting and connection parameters
+    rate_limit_config: N2NRateLimitConfig,
 }
 
 impl N2NServer {
@@ -231,6 +254,7 @@ impl N2NServer {
             mempool: None,
             block_announcement_tx,
             rollback_announcement_tx,
+            rate_limit_config: N2NRateLimitConfig::default(),
         }
     }
 
@@ -258,7 +282,13 @@ impl N2NServer {
             mempool: None,
             block_announcement_tx,
             rollback_announcement_tx,
+            rate_limit_config: N2NRateLimitConfig::default(),
         }
+    }
+
+    /// Set custom rate limiting configuration.
+    pub fn set_rate_limit_config(&mut self, config: N2NRateLimitConfig) {
+        self.rate_limit_config = config;
     }
 
     /// Set the mempool for TxSubmission2 protocol support
@@ -305,11 +335,11 @@ impl N2NServer {
         info!(addr = %self.listen_addr, "N2N server listening");
 
         let active_connections = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        // Rate limiter: max 10 connections per IP per 60 seconds
         let rate_limiter = Arc::new(ConnectionRateLimiter::new(
-            10,
-            std::time::Duration::from_secs(60),
+            self.rate_limit_config.max_connections_per_ip,
+            std::time::Duration::from_secs(self.rate_limit_config.rate_limit_window_secs),
         ));
+        let max_blockfetch_range = self.rate_limit_config.max_blockfetch_range;
 
         // Periodic cleanup of stale rate limiter entries
         let rl_cleanup = rate_limiter.clone();
@@ -361,6 +391,7 @@ impl N2NServer {
                     let mempool = self.mempool.clone();
                     let announcement_rx = self.block_announcement_tx.subscribe();
                     let rollback_rx = self.rollback_announcement_tx.subscribe();
+                    let bf_range = max_blockfetch_range;
 
                     tokio::spawn(async move {
                         if let Err(e) = handle_n2n_connection(
@@ -375,6 +406,7 @@ impl N2NServer {
                             mempool,
                             announcement_rx,
                             rollback_rx,
+                            bf_range,
                         )
                         .await
                         {
@@ -437,6 +469,7 @@ async fn handle_n2n_connection(
     mempool: Option<Arc<dyn MempoolProvider>>,
     mut announcement_rx: broadcast::Receiver<BlockAnnouncement>,
     mut rollback_rx: broadcast::Receiver<RollbackAnnouncement>,
+    max_blockfetch_range: u64,
 ) -> Result<(), N2NServerError> {
     let mut buf = vec![0u8; 65536];
     let mut partial = Vec::new();
@@ -476,6 +509,7 @@ async fn handle_n2n_connection(
                                 &mut peer_state,
                                 &peer_manager,
                                 &mempool,
+                                max_blockfetch_range,
                             )
                             .await?;
 
@@ -602,6 +636,7 @@ async fn process_n2n_segment(
     peer_state: &mut PeerState,
     peer_manager: &Option<Arc<RwLock<PeerManager>>>,
     mempool: &Option<Arc<dyn MempoolProvider>>,
+    max_blockfetch_range: u64,
 ) -> Result<Vec<Segment>, N2NServerError> {
     match segment.protocol_id {
         MINI_PROTOCOL_HANDSHAKE => {
@@ -620,7 +655,8 @@ async fn process_n2n_segment(
             Ok(resp.into_iter().collect())
         }
         MINI_PROTOCOL_BLOCKFETCH => {
-            let resp = handle_n2n_blockfetch(&segment.payload, block_provider)?;
+            let resp =
+                handle_n2n_blockfetch(&segment.payload, block_provider, max_blockfetch_range)?;
             Ok(resp)
         }
         MINI_PROTOCOL_TXSUBMISSION => {
@@ -1054,6 +1090,7 @@ fn encode_tip(
 fn handle_n2n_blockfetch(
     payload: &[u8],
     block_provider: &Arc<dyn BlockProvider>,
+    max_blockfetch_range: u64,
 ) -> Result<Vec<Segment>, N2NServerError> {
     let mut decoder = minicbor::Decoder::new(payload);
     let _arr_len = decoder
@@ -1116,9 +1153,8 @@ fn handle_n2n_blockfetch(
                 }
             };
 
-            // Limit range to prevent DoS — max 2000 blocks per request
-            const MAX_BLOCKFETCH_RANGE: u64 = 2000;
-            if to_slot > from_slot + MAX_BLOCKFETCH_RANGE {
+            // Limit range to prevent DoS
+            if to_slot > from_slot + max_blockfetch_range {
                 warn!(from_slot, to_slot, "BlockFetch: range too large, rejecting");
                 let mut buf = Vec::new();
                 let mut enc = minicbor::Encoder::new(&mut buf);
@@ -1743,7 +1779,7 @@ mod tests {
         enc.u64(20).unwrap();
         enc.bytes(&[0xCC; 32]).unwrap();
 
-        let segments = handle_n2n_blockfetch(&buf, &provider).unwrap();
+        let segments = handle_n2n_blockfetch(&buf, &provider, 2000).unwrap();
         // Should have: MsgStartBatch + from_block + 10 range blocks (slots 11-20) + MsgBatchDone = 13
         assert_eq!(segments.len(), 13);
 
@@ -1842,7 +1878,7 @@ mod tests {
         enc.array(1).unwrap();
         enc.u32(1).unwrap(); // MsgClientDone
 
-        let segments = handle_n2n_blockfetch(&buf, &provider).unwrap();
+        let segments = handle_n2n_blockfetch(&buf, &provider, 2000).unwrap();
         assert!(segments.is_empty());
     }
 

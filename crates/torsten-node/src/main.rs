@@ -87,6 +87,26 @@ struct RunArgs {
     #[arg(long, default_value = "12798")]
     metrics_port: u16,
 
+    /// Maximum number of transactions in the mempool
+    #[arg(long, default_value = "16384")]
+    mempool_max_tx: usize,
+
+    /// Maximum mempool size in bytes
+    #[arg(long, default_value = "536870912")]
+    mempool_max_bytes: usize,
+
+    /// Maximum number of ledger snapshots to retain on disk
+    #[arg(long, default_value = "2")]
+    snapshot_max_retained: usize,
+
+    /// Minimum blocks between bulk-sync snapshots
+    #[arg(long, default_value = "50000")]
+    snapshot_bulk_min_blocks: u64,
+
+    /// Minimum seconds between bulk-sync snapshots
+    #[arg(long, default_value = "360")]
+    snapshot_bulk_min_secs: u64,
+
     // Block producer options (optional — enables block production mode)
     /// Path to the KES signing key file
     #[arg(long)]
@@ -236,6 +256,11 @@ async fn run_node(args: RunArgs) -> Result<()> {
         shelley_vrf_key: args.shelley_vrf_key,
         shelley_operational_certificate: args.shelley_operational_certificate,
         metrics_port: args.metrics_port,
+        mempool_max_tx: args.mempool_max_tx,
+        mempool_max_bytes: args.mempool_max_bytes,
+        snapshot_max_retained: args.snapshot_max_retained,
+        snapshot_bulk_min_blocks: args.snapshot_bulk_min_blocks,
+        snapshot_bulk_min_secs: args.snapshot_bulk_min_secs,
     })?;
 
     info!("");

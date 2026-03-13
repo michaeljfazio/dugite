@@ -50,33 +50,74 @@ torsten_mempool_tx_count 42
 torsten_peers_connected 8
 ```
 
+## Health Endpoint
+
+The metrics server also exposes a `/health` endpoint for load balancer and Kubernetes liveness/readiness probes:
+
+```
+GET http://localhost:12798/health
+```
+
+Returns JSON:
+
+```json
+{
+  "status": "ok",
+  "uptime_seconds": 3421,
+  "slot": 142857392,
+  "block": 11283746,
+  "epoch": 512,
+  "sync_progress": 95.42,
+  "peers": 8
+}
+```
+
 ## Available Metrics
 
-| Metric | Type | Description |
-|--------|------|-------------|
-| `torsten_blocks_received_total` | counter | Total blocks received from peers |
-| `torsten_blocks_applied_total` | counter | Total blocks successfully applied to the ledger |
-| `torsten_transactions_received_total` | counter | Total transactions received |
-| `torsten_transactions_validated_total` | counter | Total transactions validated |
-| `torsten_transactions_rejected_total` | counter | Total transactions rejected |
-| `torsten_peers_connected` | gauge | Number of connected peers |
-| `torsten_peers_cold` | gauge | Number of cold (known but unconnected) peers |
-| `torsten_peers_warm` | gauge | Number of warm (connected, not syncing) peers |
-| `torsten_peers_hot` | gauge | Number of hot (actively syncing) peers |
-| `torsten_sync_progress_percent` | gauge | Chain sync progress (0-10000; divide by 100 for percentage) |
-| `torsten_slot_number` | gauge | Current slot number |
-| `torsten_block_number` | gauge | Current block number |
-| `torsten_epoch_number` | gauge | Current epoch number |
-| `torsten_utxo_count` | gauge | Number of entries in the UTxO set |
-| `torsten_mempool_tx_count` | gauge | Number of transactions in the mempool |
-| `torsten_mempool_bytes` | gauge | Size of the mempool in bytes |
-| `torsten_rollback_count_total` | counter | Total number of chain rollbacks |
-| `torsten_blocks_forged_total` | counter | Total blocks forged by this node |
-| `torsten_delegation_count` | gauge | Number of active stake delegations |
-| `torsten_treasury_lovelace` | gauge | Total lovelace in the treasury |
-| `torsten_drep_count` | gauge | Number of registered DReps |
-| `torsten_proposal_count` | gauge | Number of active governance proposals |
-| `torsten_pool_count` | gauge | Number of registered stake pools |
+### Counters
+
+| Metric | Description |
+|--------|-------------|
+| `torsten_blocks_received_total` | Total blocks received from peers |
+| `torsten_blocks_applied_total` | Total blocks successfully applied to the ledger |
+| `torsten_transactions_received_total` | Total transactions received |
+| `torsten_transactions_validated_total` | Total transactions validated |
+| `torsten_transactions_rejected_total` | Total transactions rejected |
+| `torsten_rollback_count_total` | Total number of chain rollbacks |
+| `torsten_blocks_forged_total` | Total blocks forged by this node |
+| `torsten_validation_errors_total{error="..."}` | Transaction validation errors, broken down by error type |
+
+### Gauges
+
+| Metric | Description |
+|--------|-------------|
+| `torsten_peers_connected` | Number of connected peers |
+| `torsten_peers_cold` | Number of cold (known but unconnected) peers |
+| `torsten_peers_warm` | Number of warm (connected, not syncing) peers |
+| `torsten_peers_hot` | Number of hot (actively syncing) peers |
+| `torsten_sync_progress_percent` | Chain sync progress (0-10000; divide by 100 for percentage) |
+| `torsten_slot_number` | Current slot number |
+| `torsten_block_number` | Current block number |
+| `torsten_epoch_number` | Current epoch number |
+| `torsten_utxo_count` | Number of entries in the UTxO set |
+| `torsten_mempool_tx_count` | Number of transactions in the mempool |
+| `torsten_mempool_bytes` | Size of the mempool in bytes |
+| `torsten_delegation_count` | Number of active stake delegations |
+| `torsten_treasury_lovelace` | Total lovelace in the treasury |
+| `torsten_drep_count` | Number of registered DReps |
+| `torsten_proposal_count` | Number of active governance proposals |
+| `torsten_pool_count` | Number of registered stake pools |
+| `torsten_uptime_seconds` | Seconds since node startup |
+| `torsten_disk_available_bytes` | Available disk space on the database volume |
+
+### Histograms
+
+| Metric | Buckets (ms) | Description |
+|--------|-------------|-------------|
+| `torsten_peer_handshake_rtt_ms` | 1, 5, 10, 25, 50, 100, 250, 500, 1000, 2500, 5000, 10000 | Peer N2N handshake round-trip time |
+| `torsten_peer_block_fetch_ms` | (same) | Per-block fetch latency |
+
+Histograms expose `_bucket`, `_count`, and `_sum` suffixes for standard Prometheus histogram queries.
 
 ## Prometheus Configuration
 
@@ -95,15 +136,46 @@ scrape_configs:
 
 ## Grafana Dashboard
 
-Torsten ships with a pre-built Grafana dashboard at `config/grafana-dashboard.json`. The dashboard covers all node metrics organized into six sections:
+Torsten ships with a pre-built Grafana dashboard at `config/grafana-dashboard.json`. The dashboard covers all node metrics organized into nine sections:
 
 - **Overview** -- Sync progress gauge, block height, epoch, slot, connected peers, blocks forged
+- **Node Health** -- Uptime, disk available (stat + time series)
 - **Sync & Throughput** -- Sync progress over time, block apply/receive rate (blk/s), block height, rollbacks
 - **Peers** -- Connected peer count over time, peer state breakdown (hot/warm/cold stacked)
 - **Mempool & Transactions** -- Mempool tx count, mempool size (bytes), transaction rate (received/validated/rejected)
 - **Ledger State** -- UTxO set size, stake delegations, treasury balance (ADA), registered stake pools
 - **Governance** -- Registered DReps, active governance proposals
 - **Block Production** -- Total blocks forged, block forge rate (blk/h)
+- **Network Latency** -- Handshake RTT and block fetch latency percentiles (p50/p95/p99), request counts
+- **Validation Errors** -- Error breakdown by type (stacked bars), error totals (bar chart)
+
+### Quick Start (Docker)
+
+The fastest way to start a local monitoring stack is with the included script:
+
+```bash
+# Start Prometheus + Grafana
+./scripts/start-monitoring.sh
+
+# Open the dashboard (admin/admin)
+open http://localhost:3000/d/torsten-node/torsten-node
+
+# Check status
+./scripts/start-monitoring.sh status
+
+# Stop
+./scripts/start-monitoring.sh stop
+```
+
+The script starts Prometheus (port 9090) and Grafana (port 3000) as Docker containers, auto-configures the Prometheus datasource, and imports the Torsten dashboard. Prometheus data is persisted in `.monitoring-data/` so metrics survive restarts.
+
+Environment variables for port customization:
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `PROMETHEUS_PORT` | 9090 | Prometheus web UI port |
+| `GRAFANA_PORT` | 3000 | Grafana web UI port |
+| `TORSTEN_METRICS_PORT` | 12798 | Port where Torsten exposes metrics |
 
 ### Importing the Dashboard
 
@@ -204,6 +276,10 @@ brew services stop prometheus grafana
 | Transaction rejection rate | `rate(torsten_transactions_rejected_total[5m])` |
 | Treasury balance (ADA) | `torsten_treasury_lovelace / 1e6` |
 | Block forge rate (per hour) | `rate(torsten_blocks_forged_total[1h]) * 3600` |
+| Handshake RTT p95 | `histogram_quantile(0.95, rate(torsten_peer_handshake_rtt_ms_bucket[5m]))` |
+| Block fetch latency p95 | `histogram_quantile(0.95, rate(torsten_peer_block_fetch_ms_bucket[5m]))` |
+| Validation errors by type | `rate(torsten_validation_errors_total[5m])` |
+| Disk available | `torsten_disk_available_bytes` |
 
 ## Console Logging
 
