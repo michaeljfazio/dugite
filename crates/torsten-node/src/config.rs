@@ -182,6 +182,52 @@ impl NodeConfig {
     pub fn network_magic(&self) -> u64 {
         self.network_magic.unwrap_or_else(|| self.network.magic())
     }
+
+    /// Validate configuration at startup: check genesis file existence and hash formats.
+    /// `config_dir` is the directory containing the config file, used to resolve
+    /// relative genesis file paths.
+    pub fn validate(&self, config_dir: &Path) -> Result<()> {
+        let genesis_files: &[(&str, &Option<String>, &Option<String>)] = &[
+            ("Byron", &self.byron_genesis_file, &self.byron_genesis_hash),
+            (
+                "Shelley",
+                &self.shelley_genesis_file,
+                &self.shelley_genesis_hash,
+            ),
+            (
+                "Alonzo",
+                &self.alonzo_genesis_file,
+                &self.alonzo_genesis_hash,
+            ),
+            (
+                "Conway",
+                &self.conway_genesis_file,
+                &self.conway_genesis_hash,
+            ),
+        ];
+
+        for (era, file_opt, hash_opt) in genesis_files {
+            if let Some(ref file_path) = file_opt {
+                let resolved = config_dir.join(file_path);
+                if !resolved.exists() {
+                    anyhow::bail!(
+                        "{era} genesis file not found: {} (resolved from config dir {})",
+                        resolved.display(),
+                        config_dir.display()
+                    );
+                }
+            }
+            if let Some(ref hash_hex) = hash_opt {
+                if hash_hex.len() != 64 || !hash_hex.chars().all(|c| c.is_ascii_hexdigit()) {
+                    anyhow::bail!(
+                        "{era} genesis hash is not a valid 64-character hex string: {hash_hex}"
+                    );
+                }
+            }
+        }
+
+        Ok(())
+    }
 }
 
 impl Default for NodeConfig {
@@ -227,5 +273,54 @@ mod tests {
             ..NodeConfig::default()
         };
         assert_eq!(config.network_magic(), 42);
+    }
+
+    #[test]
+    fn test_validate_default_config_passes() {
+        let config = NodeConfig::default();
+        assert!(config.validate(Path::new(".")).is_ok());
+    }
+
+    #[test]
+    fn test_validate_missing_genesis_file() {
+        let config = NodeConfig {
+            shelley_genesis_file: Some("nonexistent-genesis.json".to_string()),
+            ..NodeConfig::default()
+        };
+        let err = config.validate(Path::new(".")).unwrap_err();
+        assert!(err.to_string().contains("Shelley genesis file not found"));
+    }
+
+    #[test]
+    fn test_validate_invalid_genesis_hash_too_short() {
+        let config = NodeConfig {
+            byron_genesis_hash: Some("abcdef".to_string()),
+            ..NodeConfig::default()
+        };
+        let err = config.validate(Path::new(".")).unwrap_err();
+        assert!(err.to_string().contains("not a valid 64-character hex"));
+    }
+
+    #[test]
+    fn test_validate_invalid_genesis_hash_non_hex() {
+        let config = NodeConfig {
+            alonzo_genesis_hash: Some(
+                "zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz".to_string(),
+            ),
+            ..NodeConfig::default()
+        };
+        let err = config.validate(Path::new(".")).unwrap_err();
+        assert!(err.to_string().contains("Alonzo genesis hash"));
+    }
+
+    #[test]
+    fn test_validate_valid_genesis_hash() {
+        let config = NodeConfig {
+            shelley_genesis_hash: Some(
+                "363498d1024f84bb39d3fa9593ce391483cb40d479b87233f868d6e57c3a400d".to_string(),
+            ),
+            ..NodeConfig::default()
+        };
+        assert!(config.validate(Path::new(".")).is_ok());
     }
 }

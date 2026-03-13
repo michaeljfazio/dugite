@@ -317,8 +317,8 @@ impl PeerManager {
         if self.peers.contains_key(&addr) {
             return; // Already known
         }
-        if self.peers.len() >= self.config.target_known_peers {
-            return; // At capacity
+        if self.peers.len() >= self.config.target_known_peers && !self.try_evict_cold_peer() {
+            return; // At capacity and no evictable peer
         }
         let info = PeerInfo::new(addr, PeerSource::Ledger);
         self.cold_peers.insert(addr);
@@ -336,13 +336,45 @@ impl PeerManager {
         if self.peers.contains_key(&addr) {
             return; // Already known
         }
-        if self.peers.len() >= self.config.target_known_peers {
-            return; // At capacity
+        if self.peers.len() >= self.config.target_known_peers && !self.try_evict_cold_peer() {
+            return; // At capacity and no evictable peer
         }
         let info = PeerInfo::new(addr, PeerSource::PeerSharing);
         self.cold_peers.insert(addr);
         self.peers.insert(addr, info);
         debug!(%addr, "Discovered peer via sharing");
+    }
+
+    /// Minimum reputation threshold for cold peer eviction.
+    /// Peers below this are candidates for replacement by newly discovered peers.
+    const EVICTION_REPUTATION_THRESHOLD: f64 = 0.3;
+
+    /// Try to evict the lowest-reputation non-config cold peer.
+    /// Returns true if a peer was evicted, false if no suitable candidate exists.
+    fn try_evict_cold_peer(&mut self) -> bool {
+        // Find the lowest-reputation cold peer that isn't from config
+        let worst = self
+            .cold_peers
+            .iter()
+            .filter_map(|addr| {
+                let info = self.peers.get(addr)?;
+                // Never evict config peers (topology file entries)
+                if info.source == PeerSource::Config {
+                    return None;
+                }
+                Some((*addr, info.performance.reputation))
+            })
+            .min_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
+
+        if let Some((addr, reputation)) = worst {
+            if reputation < Self::EVICTION_REPUTATION_THRESHOLD {
+                self.cold_peers.remove(&addr);
+                self.peers.remove(&addr);
+                debug!(%addr, reputation, "Evicted low-reputation cold peer");
+                return true;
+            }
+        }
+        false
     }
 
     /// Check if an IP address is globally routable (not loopback, private, multicast, etc.)
@@ -1067,5 +1099,98 @@ mod tests {
         let stats = pm.stats();
         assert!(stats.avg_hot_reputation > 0.0);
         assert!(stats.best_fetch_latency_ms.is_some());
+    }
+
+    #[test]
+    fn test_evict_low_reputation_cold_peer() {
+        let config = PeerManagerConfig {
+            target_known_peers: 2,
+            ..PeerManagerConfig::default()
+        };
+        let mut pm = PeerManager::new(config);
+        // Add two ledger peers to fill capacity
+        pm.add_ledger_peer(test_addr(3001));
+        pm.add_ledger_peer(test_addr(3002));
+        assert_eq!(pm.peers.len(), 2);
+
+        // Lower one peer's reputation below eviction threshold
+        pm.peers
+            .get_mut(&test_addr(3001))
+            .unwrap()
+            .performance
+            .reputation = 0.1;
+
+        // Adding a new ledger peer should evict the low-reputation one
+        pm.add_ledger_peer(test_addr(3003));
+        assert_eq!(pm.peers.len(), 2);
+        assert!(!pm.peers.contains_key(&test_addr(3001))); // Evicted
+        assert!(pm.peers.contains_key(&test_addr(3003))); // New peer added
+    }
+
+    #[test]
+    fn test_no_eviction_of_config_peers() {
+        let config = PeerManagerConfig {
+            target_known_peers: 2,
+            ..PeerManagerConfig::default()
+        };
+        let mut pm = PeerManager::new(config);
+        // Fill with config peers (should never be evicted)
+        pm.add_config_peer(test_addr(3001), false, false);
+        pm.add_config_peer(test_addr(3002), false, false);
+
+        // Lower reputation
+        pm.peers
+            .get_mut(&test_addr(3001))
+            .unwrap()
+            .performance
+            .reputation = 0.0;
+
+        // Should not evict config peers even at capacity
+        pm.add_ledger_peer(test_addr(3003));
+        assert_eq!(pm.peers.len(), 2);
+        assert!(pm.peers.contains_key(&test_addr(3001))); // Config peer preserved
+        assert!(!pm.peers.contains_key(&test_addr(3003))); // New peer rejected
+    }
+
+    #[test]
+    fn test_no_eviction_above_threshold() {
+        let config = PeerManagerConfig {
+            target_known_peers: 2,
+            ..PeerManagerConfig::default()
+        };
+        let mut pm = PeerManager::new(config);
+        pm.add_ledger_peer(test_addr(3001));
+        pm.add_ledger_peer(test_addr(3002));
+
+        // Both peers have default reputation (0.5) — above threshold
+        pm.add_shared_peer(test_addr(3003));
+        assert_eq!(pm.peers.len(), 2);
+        assert!(!pm.peers.contains_key(&test_addr(3003))); // Rejected, nobody to evict
+    }
+
+    #[test]
+    fn test_shared_peer_eviction() {
+        let config = PeerManagerConfig {
+            target_known_peers: 2,
+            ..PeerManagerConfig::default()
+        };
+        let mut pm = PeerManager::new(config);
+        pm.add_ledger_peer(test_addr(3001));
+        pm.add_ledger_peer(test_addr(3002));
+
+        // Lower one peer's reputation
+        pm.peers
+            .get_mut(&test_addr(3002))
+            .unwrap()
+            .performance
+            .reputation = 0.2;
+
+        // Shared peer should trigger eviction of low-reputation peer
+        // Use a routable address (not localhost)
+        let routable_addr: SocketAddr = "8.8.8.8:3003".parse().unwrap();
+        pm.add_shared_peer(routable_addr);
+        assert_eq!(pm.peers.len(), 2);
+        assert!(!pm.peers.contains_key(&test_addr(3002)));
+        assert!(pm.peers.contains_key(&routable_addr));
     }
 }

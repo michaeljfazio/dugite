@@ -1,0 +1,26 @@
+[package]
+name = "torsten-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+torsten-serialization = { path = "../crates/torsten-serialization" }
+
+# Prevent this from interfering with workspaces
+[workspace]
+members = ["."]
+
+[[bin]]
+name = "fuzz_decode_block"
+path = "fuzz_targets/decode_block.rs"
+doc = false
+
+[[bin]]
+name = "fuzz_decode_transaction"
+path = "fuzz_targets/decode_transaction.rs"
+doc = false

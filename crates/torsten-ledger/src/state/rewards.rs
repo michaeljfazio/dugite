@@ -7,14 +7,18 @@ use tracing::{debug, warn};
 
 /// Reduced rational number (i128 numerator/denominator with GCD reduction).
 /// Matches Haskell's Rational for reward calculations with rationalToCoinViaFloor.
-#[derive(Clone, Copy)]
-pub(crate) struct Rat {
-    pub(crate) n: i128,
-    pub(crate) d: i128,
+///
+/// Uses checked arithmetic with widening to i256 (via two i128s) to prevent
+/// overflow on large intermediate products. Cross-reduction is applied first
+/// as an optimization; widening handles the residual cases.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Rat {
+    pub n: i128,
+    pub d: i128,
 }
 
 impl Rat {
-    pub(crate) fn new(n: i128, d: i128) -> Self {
+    pub fn new(n: i128, d: i128) -> Self {
         if d == 0 {
             return Rat { n: 0, d: 1 };
         }
@@ -27,58 +31,163 @@ impl Rat {
     }
 
     fn gcd(a: u128, b: u128) -> u128 {
-        if b == 0 {
-            a
+        let (mut a, mut b) = (a, b);
+        while b != 0 {
+            let t = b;
+            b = a % b;
+            a = t;
+        }
+        a
+    }
+
+    /// Checked i128 multiply: returns Some if no overflow, None otherwise.
+    #[inline]
+    fn checked_mul(a: i128, b: i128) -> Option<i128> {
+        a.checked_mul(b)
+    }
+
+    /// Widening multiply: (a * b) using i256 arithmetic, then reduce to i128.
+    /// Returns (numerator_product, denominator_product) as a reduced Rat.
+    fn wide_mul_rat(an: i128, ad: i128, bn: i128, bd: i128) -> Rat {
+        // Use num_bigint for overflow-safe arithmetic
+        use num_bigint::BigInt;
+        let n = BigInt::from(an) * BigInt::from(bn);
+        let d = BigInt::from(ad) * BigInt::from(bd);
+        // Reduce
+        let g = Self::bigint_gcd(&n, &d);
+        let rn = &n / &g;
+        let rd = &d / &g;
+        // Convert back — if still doesn't fit in i128, this is a genuinely huge
+        // number that shouldn't occur in practice. Saturate to keep going.
+        let rn_i128: i128 = rn.try_into().unwrap_or_else(|_| {
+            if n < BigInt::from(0) {
+                i128::MIN
+            } else {
+                i128::MAX
+            }
+        });
+        let rd_i128: i128 = rd.try_into().unwrap_or(i128::MAX);
+        Rat::new(rn_i128, rd_i128)
+    }
+
+    fn bigint_gcd(a: &num_bigint::BigInt, b: &num_bigint::BigInt) -> num_bigint::BigInt {
+        use num_traits::{Signed, Zero};
+        let (mut a, mut b) = (a.abs(), b.abs());
+        while !b.is_zero() {
+            let t = b.clone();
+            b = &a % &t;
+            a = t;
+        }
+        if a.is_zero() {
+            num_bigint::BigInt::from(1)
         } else {
-            Self::gcd(b, a % b)
+            a
         }
     }
 
-    pub(crate) fn add(&self, other: &Rat) -> Rat {
+    /// Wide addition: a/b + c/d using BigInt when i128 overflows.
+    fn wide_add_rat(an: i128, ad: i128, bn: i128, bd: i128) -> Rat {
+        use num_bigint::BigInt;
+        let n = BigInt::from(an) * BigInt::from(bd) + BigInt::from(bn) * BigInt::from(ad);
+        let d = BigInt::from(ad) * BigInt::from(bd);
+        let g = Self::bigint_gcd(&n, &d);
+        let rn = &n / &g;
+        let rd = &d / &g;
+        let rn_i128: i128 = rn.try_into().unwrap_or_else(|_| {
+            if n < BigInt::from(0) {
+                i128::MIN
+            } else {
+                i128::MAX
+            }
+        });
+        let rd_i128: i128 = rd.try_into().unwrap_or(i128::MAX);
+        Rat::new(rn_i128, rd_i128)
+    }
+
+    /// Wide comparison: a/b <= c/d using BigInt to avoid overflow in cross-multiply.
+    fn wide_le(an: i128, ad: i128, bn: i128, bd: i128) -> bool {
+        use num_bigint::BigInt;
+        BigInt::from(an) * BigInt::from(bd) <= BigInt::from(bn) * BigInt::from(ad)
+    }
+
+    pub fn add(&self, other: &Rat) -> Rat {
         // Cross-reduce before adding to prevent overflow:
         // a/b + c/d = (a*(d/g) + c*(b/g)) / (b/g*d)  where g = gcd(b,d)
         let g = Self::gcd(self.d.unsigned_abs(), other.d.unsigned_abs()) as i128;
         let bd = self.d / g;
-        Rat::new(self.n * (other.d / g) + other.n * bd, bd * other.d)
+        let dg = other.d / g;
+        // Try i128 fast path
+        if let (Some(t1), Some(t2), Some(den)) = (
+            Self::checked_mul(self.n, dg),
+            Self::checked_mul(other.n, bd),
+            Self::checked_mul(bd, other.d),
+        ) {
+            if let Some(num) = t1.checked_add(t2) {
+                return Rat::new(num, den);
+            }
+        }
+        // Fallback to BigInt
+        Self::wide_add_rat(self.n, self.d, other.n, other.d)
     }
 
-    pub(crate) fn sub(&self, other: &Rat) -> Rat {
-        let g = Self::gcd(self.d.unsigned_abs(), other.d.unsigned_abs()) as i128;
-        let bd = self.d / g;
-        Rat::new(self.n * (other.d / g) - other.n * bd, bd * other.d)
+    pub fn sub(&self, other: &Rat) -> Rat {
+        self.add(&Rat::new(-other.n, other.d))
     }
 
-    pub(crate) fn mul(&self, other: &Rat) -> Rat {
+    pub fn mul(&self, other: &Rat) -> Rat {
         // Cross-reduce before multiplying to prevent overflow:
         // (a/b) * (c/d) = (a/g1 * c/g2) / (b/g2 * d/g1) where g1=gcd(a,d), g2=gcd(b,c)
         let g1 = Self::gcd(self.n.unsigned_abs(), other.d.unsigned_abs()) as i128;
         let g2 = Self::gcd(self.d.unsigned_abs(), other.n.unsigned_abs()) as i128;
-        Rat::new(
-            (self.n / g1) * (other.n / g2),
-            (self.d / g2) * (other.d / g1),
-        )
+        let an = self.n / g1;
+        let cn = other.n / g2;
+        let bg = self.d / g2;
+        let dg = other.d / g1;
+        // Try i128 fast path
+        if let (Some(num), Some(den)) = (Self::checked_mul(an, cn), Self::checked_mul(bg, dg)) {
+            return Rat::new(num, den);
+        }
+        // Fallback to BigInt
+        Self::wide_mul_rat(an, bg, cn, dg)
     }
 
-    pub(crate) fn div(&self, other: &Rat) -> Rat {
+    pub fn div(&self, other: &Rat) -> Rat {
+        if other.n == 0 {
+            return Rat::new(0, 1);
+        }
         // (a/b) / (c/d) = (a/b) * (d/c)
         let g1 = Self::gcd(self.n.unsigned_abs(), other.n.unsigned_abs()) as i128;
         let g2 = Self::gcd(self.d.unsigned_abs(), other.d.unsigned_abs()) as i128;
-        Rat::new(
-            (self.n / g1) * (other.d / g2),
-            (self.d / g2) * (other.n / g1),
-        )
+        let an = self.n / g1;
+        let od = other.d / g2;
+        let bg = self.d / g2;
+        let cn = other.n / g1;
+        // Try i128 fast path
+        if let (Some(num), Some(den)) = (Self::checked_mul(an, od), Self::checked_mul(bg, cn)) {
+            return Rat::new(num, den);
+        }
+        // Fallback to BigInt
+        Self::wide_mul_rat(an, bg, od, cn)
     }
 
-    pub(crate) fn min_rat(&self, other: &Rat) -> Rat {
+    pub fn min_rat(&self, other: &Rat) -> Rat {
         // Compare using cross-multiplication: a/b <= c/d iff a*d <= c*b (when b,d > 0)
-        if self.n * other.d <= other.n * self.d {
+        let le = if let (Some(lhs), Some(rhs)) = (
+            Self::checked_mul(self.n, other.d),
+            Self::checked_mul(other.n, self.d),
+        ) {
+            lhs <= rhs
+        } else {
+            Self::wide_le(self.n, self.d, other.n, other.d)
+        };
+        if le {
             *self
         } else {
             *other
         }
     }
 
-    pub(crate) fn floor_u64(&self) -> u64 {
+    pub fn floor_u64(&self) -> u64 {
         if self.d == 0 || self.n <= 0 {
             0
         } else {

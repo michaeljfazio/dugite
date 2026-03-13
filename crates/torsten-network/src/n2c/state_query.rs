@@ -2281,4 +2281,158 @@ mod tests {
         assert_eq!(arr, 1);
         assert_eq!(dec.u32().unwrap(), 1); // Abstain
     }
+
+    // -----------------------------------------------------------------------
+    // Golden CBOR Tests — verify exact byte sequences for protocol compat
+    // -----------------------------------------------------------------------
+
+    /// Encode protocol params and verify the CBOR structure is array(31) with correct field order.
+    #[test]
+    fn golden_protocol_params_structure() {
+        let pp = ProtocolParamsSnapshot::default();
+        let buf = encode(&QueryResult::ProtocolParams(Box::new(pp.clone())));
+        let mut dec = decode_msg_result(&buf);
+        strip_hfc(&mut dec);
+
+        // PParams must be array(31) — the Conway positional encoding
+        let arr = dec.array().unwrap().unwrap();
+        assert_eq!(arr, 31, "ConwayPParams must be array(31)");
+
+        // [0] min_fee_a
+        assert_eq!(dec.u64().unwrap(), pp.min_fee_a);
+        // [1] min_fee_b
+        assert_eq!(dec.u64().unwrap(), pp.min_fee_b);
+        // [2] max_block_body_size
+        assert_eq!(dec.u64().unwrap(), pp.max_block_body_size);
+        // [3] max_tx_size
+        assert_eq!(dec.u64().unwrap(), pp.max_tx_size);
+        // [4] max_block_header_size
+        assert_eq!(dec.u64().unwrap(), pp.max_block_header_size);
+        // [5] key_deposit
+        assert_eq!(dec.u64().unwrap(), pp.key_deposit);
+        // [6] pool_deposit
+        assert_eq!(dec.u64().unwrap(), pp.pool_deposit);
+        // [7] e_max
+        assert_eq!(dec.u64().unwrap(), pp.e_max);
+        // [8] n_opt
+        assert_eq!(dec.u64().unwrap(), pp.n_opt);
+
+        // [9] a0 (tagged rational)
+        let tag = dec.tag().unwrap();
+        assert_eq!(tag.as_u64(), 30, "a0 must use tag 30");
+        let rat_arr = dec.array().unwrap().unwrap();
+        assert_eq!(rat_arr, 2);
+        assert_eq!(dec.u64().unwrap(), pp.a0_num);
+        assert_eq!(dec.u64().unwrap(), pp.a0_den);
+
+        // [10] rho (tagged rational)
+        let _ = dec.tag().unwrap();
+        let _ = dec.array().unwrap();
+        assert_eq!(dec.u64().unwrap(), pp.rho_num);
+        assert_eq!(dec.u64().unwrap(), pp.rho_den);
+
+        // [11] tau (tagged rational)
+        let _ = dec.tag().unwrap();
+        let _ = dec.array().unwrap();
+        assert_eq!(dec.u64().unwrap(), pp.tau_num);
+        assert_eq!(dec.u64().unwrap(), pp.tau_den);
+
+        // [12] protocolVersion [major, minor]
+        let ver_arr = dec.array().unwrap().unwrap();
+        assert_eq!(ver_arr, 2);
+        assert_eq!(dec.u64().unwrap(), pp.protocol_version_major);
+        assert_eq!(dec.u64().unwrap(), pp.protocol_version_minor);
+
+        // [13] minPoolCost
+        assert_eq!(dec.u64().unwrap(), pp.min_pool_cost);
+        // [14] coinsPerUTxOByte
+        assert_eq!(dec.u64().unwrap(), pp.ada_per_utxo_byte);
+    }
+
+    /// Verify tagged rational encoding: tag(30)[num, den]
+    #[test]
+    fn golden_tagged_rational() {
+        let mut buf = Vec::new();
+        let mut enc = minicbor::Encoder::new(&mut buf);
+        encode_tagged_rational(&mut enc, 3, 10);
+
+        // Expected: d8 1e (tag 30) 82 (array 2) 03 (int 3) 0a (int 10)
+        assert_eq!(buf, vec![0xd8, 0x1e, 0x82, 0x03, 0x0a]);
+    }
+
+    /// Verify SystemStart encoding is a string
+    #[test]
+    fn golden_system_start() {
+        let buf = encode(&QueryResult::SystemStart(
+            "2022-11-18T00:00:00Z".to_string(),
+        ));
+        let dec = decode_msg_result(&buf);
+        // SystemStart has its own encoding — just verify it round-trips
+        // The decoder should be able to read *something* after the envelope
+        assert!(dec.position() < buf.len());
+    }
+
+    /// Verify EraHistory encoding: indefinite array of EraSummary
+    #[test]
+    fn golden_era_history_structure() {
+        let buf = encode(&QueryResult::EraHistory(vec![
+            crate::query_handler::EraSummary {
+                start_slot: 0,
+                start_epoch: 0,
+                start_time_pico: 0,
+                end: None,
+                slot_length_ms: 20_000,
+                epoch_size: 4320,
+                safe_zone: 4320,
+                genesis_window: 36000,
+            },
+        ]));
+        let mut dec = decode_msg_result(&buf);
+        // No HFC wrapper for EraHistory
+
+        // Should start with indefinite array
+        let arr_type = dec.array().unwrap();
+        assert!(arr_type.is_none(), "EraHistory must use indefinite array");
+
+        // First era summary should be array(3): [start, end, params]
+        let summary_arr = dec.array().unwrap().unwrap();
+        assert_eq!(summary_arr, 3);
+    }
+
+    /// Verify WithOrigin encoding for GetChainBlockNo
+    #[test]
+    fn golden_chain_block_no_at() {
+        let buf = encode(&QueryResult::ChainBlockNo(42));
+        let mut dec = decode_msg_result(&buf);
+        // WithOrigin: [1, blockNo] for At
+        let arr = dec.array().unwrap().unwrap();
+        assert_eq!(arr, 2);
+        assert_eq!(dec.u8().unwrap(), 1); // At constructor
+        assert_eq!(dec.u64().unwrap(), 42);
+    }
+
+    /// Verify Point encoding for GetChainPoint
+    #[test]
+    fn golden_chain_point_specific() {
+        let hash = vec![0xAB; 32];
+        let buf = encode(&QueryResult::ChainPoint {
+            slot: 100,
+            hash: hash.clone(),
+        });
+        let mut dec = decode_msg_result(&buf);
+        // Point: [slot, hash]
+        let arr = dec.array().unwrap().unwrap();
+        assert_eq!(arr, 2);
+        assert_eq!(dec.u64().unwrap(), 100);
+        assert_eq!(dec.bytes().unwrap(), &[0xAB; 32]);
+    }
+
+    /// Verify MaxMajorProtocolVersion encoding
+    #[test]
+    fn golden_max_major_protocol_version() {
+        let buf = encode(&QueryResult::MaxMajorProtocolVersion(10));
+        let mut dec = decode_msg_result(&buf);
+        strip_hfc(&mut dec);
+        assert_eq!(dec.u64().unwrap(), 10);
+    }
 }

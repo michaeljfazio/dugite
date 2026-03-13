@@ -257,7 +257,11 @@ impl Default for NodeMetrics {
 
 /// Start an HTTP metrics server on the given port.
 /// Responds to any request with Prometheus-format metrics.
-pub async fn start_metrics_server(port: u16, metrics: Arc<NodeMetrics>) {
+/// Returns `Err` if the port cannot be bound (e.g. address already in use).
+pub async fn start_metrics_server(
+    port: u16,
+    metrics: Arc<NodeMetrics>,
+) -> Result<(), std::io::Error> {
     let addr = format!("0.0.0.0:{port}");
     let listener = match TcpListener::bind(&addr).await {
         Ok(l) => {
@@ -269,7 +273,7 @@ pub async fn start_metrics_server(port: u16, metrics: Arc<NodeMetrics>) {
         }
         Err(e) => {
             error!("Failed to start metrics server on {addr}: {e}");
-            return;
+            return Err(e);
         }
     };
 

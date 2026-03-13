@@ -80,22 +80,55 @@ impl BlockProducerCredentials {
         let opcert_cbor = hex::decode(opcert_cbor_hex)?;
 
         let mut decoder = minicbor::Decoder::new(&opcert_cbor);
-        // Outer array: [ocert_group, cold_vkey]
+        // Opcert CBOR from cardano-cli: array(2) [ array(4)[kes_vkey, seq, kes_period, sigma], cold_vkey ]
+        // The outer array wraps the OCert (itself array(4)) and the cold verification key.
         let outer_len = decoder.array()?;
-        // OCert is a CBOR group (4 elements encoded inline in the outer array)
-        let kes_vkey_bytes = decoder.bytes()?.to_vec();
-        let opcert_sequence = decoder.u64()?;
-        let opcert_kes_period = decoder.u64()?;
-        let opcert_sigma = decoder.bytes()?.to_vec();
-        // Cold verification key is the 5th element (after the 4-element OCert group)
-        let cold_vkey = decoder.bytes()?.to_vec();
+        let (kes_vkey_bytes, opcert_sequence, opcert_kes_period, opcert_sigma, cold_vkey) =
+            if outer_len == Some(2) {
+                // Standard cardano-cli format: array(2)[array(4)[...], cold_vkey]
+                let inner_len = decoder.array()?;
+                if inner_len != Some(4) {
+                    anyhow::bail!("Expected inner OCert array(4), got array({:?})", inner_len,);
+                }
+                let kes_vkey = decoder.bytes()?.to_vec();
+                let seq = decoder.u64()?;
+                let kes_period = decoder.u64()?;
+                let sigma = decoder.bytes()?.to_vec();
+                let cold = decoder.bytes()?.to_vec();
+                (kes_vkey, seq, kes_period, sigma, cold)
+            } else {
+                // Legacy flat format: array(4 or 5) [kes_vkey, seq, kes_period, sigma, ?cold_vkey]
+                let kes_vkey = decoder.bytes()?.to_vec();
+                let seq = decoder.u64()?;
+                let kes_period = decoder.u64()?;
+                let sigma = decoder.bytes()?.to_vec();
+                let cold = if outer_len == Some(5) {
+                    decoder.bytes()?.to_vec()
+                } else {
+                    // No cold_vkey in opcert; load from cold.vkey in same directory
+                    let opcert_dir = opcert_path.parent().unwrap_or(Path::new("."));
+                    let cold_vkey_path = opcert_dir.join("cold.vkey");
+                    let cold_content =
+                        std::fs::read_to_string(&cold_vkey_path).with_context(|| {
+                            format!(
+                                "Opcert has no cold_vkey; failed to load {}",
+                                cold_vkey_path.display()
+                            )
+                        })?;
+                    let cold_env: serde_json::Value = serde_json::from_str(&cold_content)?;
+                    let cold_cbor_hex = cold_env["cborHex"]
+                        .as_str()
+                        .ok_or_else(|| anyhow::anyhow!("Missing cborHex in cold.vkey"))?;
+                    let cold_cbor = hex::decode(cold_cbor_hex)?;
+                    unwrap_cbor(&cold_cbor).to_vec()
+                };
+                (kes_vkey, seq, kes_period, sigma, cold)
+            };
 
         if cold_vkey.len() != 32 {
             anyhow::bail!(
-                "Cold verification key in opcert must be 32 bytes, got {} \
-                 (outer_len={:?}, opcert may be in unexpected format)",
+                "Cold verification key must be 32 bytes, got {}",
                 cold_vkey.len(),
-                outer_len,
             );
         }
 
@@ -116,14 +149,22 @@ impl BlockProducerCredentials {
     }
 }
 
-/// Strip CBOR byte string wrapper (0x58 0x20 prefix or short form)
+/// Strip CBOR byte string wrapper.
+/// Handles major type 2 (byte string) in all length forms:
+///   - 0x40-0x57: short form (length in low 5 bits, 1 byte header)
+///   - 0x58: 1-byte length follows (2 byte header)
+///   - 0x59: 2-byte length follows (3 byte header)
+///   - 0x5a: 4-byte length follows (5 byte header)
 fn unwrap_cbor(data: &[u8]) -> &[u8] {
-    if data.len() > 2 && data[0] == 0x58 {
-        &data[2..]
-    } else if data.len() > 1 && (data[0] & 0xe0) == 0x40 {
-        &data[1..]
-    } else {
-        data
+    if data.is_empty() {
+        return data;
+    }
+    match data[0] {
+        0x58 if data.len() > 2 => &data[2..],
+        0x59 if data.len() > 3 => &data[3..],
+        0x5a if data.len() > 5 => &data[5..],
+        b if (b & 0xe0) == 0x40 && data.len() > 1 => &data[1..],
+        _ => data,
     }
 }
 

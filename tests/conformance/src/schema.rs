@@ -242,6 +242,13 @@ pub struct TestTransaction {
     pub proposal_procedures: Vec<serde_json::Value>,
     /// Treasury donation (Conway).
     pub donation: Option<u64>,
+    /// Network ID (0 = testnet, 1 = mainnet). When set, outputs must match.
+    pub network_id: Option<u8>,
+    /// Auxiliary data hash (hex-encoded 32 bytes). When set without auxiliary_data, triggers error.
+    pub auxiliary_data_hash: Option<String>,
+    /// Whether auxiliary data is present (simulated).
+    #[serde(default)]
+    pub has_auxiliary_data: bool,
 }
 
 fn default_true() -> bool {

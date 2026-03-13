@@ -317,6 +317,18 @@ fn categorize_validation_error(error: &torsten_ledger::ValidationError) -> Strin
         ValidationError::DuplicateInput(_) => "DuplicateInput".to_string(),
         ValidationError::OutputValueTooLarge { .. } => "OutputValueTooLarge".to_string(),
         ValidationError::NetworkMismatch { .. } => "NetworkMismatch".to_string(),
+        ValidationError::AuxiliaryDataHashWithoutData => "AuxiliaryDataHashWithoutData".to_string(),
+        ValidationError::AuxiliaryDataWithoutHash => "AuxiliaryDataWithoutHash".to_string(),
+        ValidationError::ReferenceInputOverlapsInput(_) => {
+            "ReferenceInputOverlapsInput".to_string()
+        }
+        ValidationError::ReferenceInputNotFound(_) => "ReferenceInputNotFound".to_string(),
+        ValidationError::ExUnitsExceeded => "ExUnitsExceeded".to_string(),
+        ValidationError::MissingSpendRedeemer { .. } => "MissingSpendRedeemer".to_string(),
+        ValidationError::RedeemerIndexOutOfRange { .. } => "RedeemerIndexOutOfRange".to_string(),
+        ValidationError::MissingWithdrawalScriptWitness(_) => {
+            "MissingWithdrawalScriptWitness".to_string()
+        }
         _ => format!("{:?}", error)
             .split('(')
             .next()

@@ -185,6 +185,12 @@ async fn run_node(args: RunArgs) -> Result<()> {
 
     // Load configuration
     let node_config = config::NodeConfig::load(&args.config)?;
+    let config_dir = args
+        .config
+        .parent()
+        .unwrap_or_else(|| std::path::Path::new("."))
+        .to_path_buf();
+    node_config.validate(&config_dir)?;
 
     // Load topology
     let topology = topology::Topology::load(&args.topology)?;
@@ -217,11 +223,6 @@ async fn run_node(args: RunArgs) -> Result<()> {
     );
 
     // Initialize the node
-    let config_dir = args
-        .config
-        .parent()
-        .unwrap_or_else(|| std::path::Path::new("."))
-        .to_path_buf();
     let mut node = node::Node::new(node::NodeArgs {
         config: node_config,
         topology,

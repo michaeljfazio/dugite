@@ -52,49 +52,57 @@ struct ChainDBBlockProvider {
 impl BlockProvider for ChainDBBlockProvider {
     fn get_block(&self, hash: &[u8; 32]) -> Option<Vec<u8>> {
         let block_hash = torsten_primitives::hash::Hash32::from_bytes(*hash);
-        let db = self.chain_db.blocking_read();
-        db.get_block(&block_hash).ok().flatten()
+        tokio::task::block_in_place(|| {
+            let db = self.chain_db.blocking_read();
+            db.get_block(&block_hash).ok().flatten()
+        })
     }
 
     fn has_block(&self, hash: &[u8; 32]) -> bool {
         let block_hash = torsten_primitives::hash::Hash32::from_bytes(*hash);
-        let db = self.chain_db.blocking_read();
-        db.has_block(&block_hash)
+        tokio::task::block_in_place(|| {
+            let db = self.chain_db.blocking_read();
+            db.has_block(&block_hash)
+        })
     }
 
     fn get_tip(&self) -> TipInfo {
-        let db = self.chain_db.blocking_read();
-        let tip = db.get_tip();
-        let slot = tip.point.slot().map(|s| s.0).unwrap_or(0);
-        let hash = tip
-            .point
-            .hash()
-            .map(|h| {
-                let bytes: &[u8] = h.as_ref();
-                let mut arr = [0u8; 32];
-                arr.copy_from_slice(bytes);
-                arr
-            })
-            .unwrap_or([0u8; 32]);
-        let block_no = tip.block_number.0;
-        TipInfo {
-            slot,
-            hash,
-            block_number: block_no,
-        }
+        tokio::task::block_in_place(|| {
+            let db = self.chain_db.blocking_read();
+            let tip = db.get_tip();
+            let slot = tip.point.slot().map(|s| s.0).unwrap_or(0);
+            let hash = tip
+                .point
+                .hash()
+                .map(|h| {
+                    let bytes: &[u8] = h.as_ref();
+                    let mut arr = [0u8; 32];
+                    arr.copy_from_slice(bytes);
+                    arr
+                })
+                .unwrap_or([0u8; 32]);
+            let block_no = tip.block_number.0;
+            TipInfo {
+                slot,
+                hash,
+                block_number: block_no,
+            }
+        })
     }
 
     fn get_next_block_after_slot(&self, after_slot: u64) -> Option<(u64, [u8; 32], Vec<u8>)> {
-        let db = self.chain_db.blocking_read();
-        let slot = torsten_primitives::time::SlotNo(after_slot);
-        match db.get_next_block_after_slot(slot) {
-            Ok(Some((s, hash, cbor))) => {
-                let mut hash_arr = [0u8; 32];
-                hash_arr.copy_from_slice(hash.as_bytes());
-                Some((s.0, hash_arr, cbor))
+        tokio::task::block_in_place(|| {
+            let db = self.chain_db.blocking_read();
+            let slot = torsten_primitives::time::SlotNo(after_slot);
+            match db.get_next_block_after_slot(slot) {
+                Ok(Some((s, hash, cbor))) => {
+                    let mut hash_arr = [0u8; 32];
+                    hash_arr.copy_from_slice(hash.as_bytes());
+                    Some((s.0, hash_arr, cbor))
+                }
+                _ => None,
             }
-            _ => None,
-        }
+        })
     }
 }
 
@@ -115,49 +123,45 @@ impl UtxoQueryProvider for LedgerUtxoProvider {
                 return vec![];
             }
         };
-        // Use try_read to avoid blocking — return empty if locked
-        let ledger = match self.ledger.try_read() {
-            Ok(l) => l,
-            Err(_) => {
-                tracing::debug!("UTxO query: ledger lock held, returning empty");
-                return vec![];
-            }
-        };
-        let results: Vec<_> = ledger
-            .utxo_set
-            .utxos_at_address(&addr)
-            .into_iter()
-            .map(|(input, output)| utxo_to_snapshot(&input, &output))
-            .collect();
-        tracing::debug!(
-            addr_type = ?std::mem::discriminant(&addr),
-            index_size = ledger.utxo_set.address_index_size(),
-            utxos_found = results.len(),
-            "UTxO query by address"
-        );
-        results
+        // Use block_in_place + blocking_read so this works correctly even when
+        // called from within a tokio async runtime (avoids "cannot block" panic).
+        tokio::task::block_in_place(|| {
+            let ledger = self.ledger.blocking_read();
+            let results: Vec<_> = ledger
+                .utxo_set
+                .utxos_at_address(&addr)
+                .into_iter()
+                .map(|(input, output)| utxo_to_snapshot(&input, &output))
+                .collect();
+            tracing::debug!(
+                addr_type = ?std::mem::discriminant(&addr),
+                index_size = ledger.utxo_set.address_index_size(),
+                utxos_found = results.len(),
+                "UTxO query by address"
+            );
+            results
+        })
     }
 
     fn utxos_by_tx_inputs(&self, inputs: &[(Vec<u8>, u32)]) -> Vec<UtxoSnapshot> {
-        let ledger = match self.ledger.try_read() {
-            Ok(l) => l,
-            Err(_) => return vec![],
-        };
-        let mut results = Vec::new();
-        for (tx_hash_bytes, idx) in inputs {
-            if tx_hash_bytes.len() == 32 {
-                let mut hash_arr = [0u8; 32];
-                hash_arr.copy_from_slice(tx_hash_bytes);
-                let tx_input = torsten_primitives::transaction::TransactionInput {
-                    transaction_id: torsten_primitives::hash::Hash32::from_bytes(hash_arr),
-                    index: *idx,
-                };
-                if let Some(output) = ledger.utxo_set.lookup(&tx_input) {
-                    results.push(utxo_to_snapshot(&tx_input, &output));
+        tokio::task::block_in_place(|| {
+            let ledger = self.ledger.blocking_read();
+            let mut results = Vec::new();
+            for (tx_hash_bytes, idx) in inputs {
+                if tx_hash_bytes.len() == 32 {
+                    let mut hash_arr = [0u8; 32];
+                    hash_arr.copy_from_slice(tx_hash_bytes);
+                    let tx_input = torsten_primitives::transaction::TransactionInput {
+                        transaction_id: torsten_primitives::hash::Hash32::from_bytes(hash_arr),
+                        index: *idx,
+                    };
+                    if let Some(output) = ledger.utxo_set.lookup(&tx_input) {
+                        results.push(utxo_to_snapshot(&tx_input, &output));
+                    }
                 }
             }
-        }
-        results
+            results
+        })
     }
 }
 
@@ -284,10 +288,10 @@ impl TxValidator for LedgerTxValidator {
             Some(&self.slot_config),
         )
         .map_err(|errors| {
-            let mapped: Vec<TxValidationError> =
+            let mut mapped: Vec<TxValidationError> =
                 errors.into_iter().map(convert_validation_error).collect();
             if mapped.len() == 1 {
-                mapped.into_iter().next().unwrap()
+                mapped.pop().expect("vec has exactly one element")
             } else {
                 TxValidationError::Multiple(mapped)
             }
@@ -857,34 +861,58 @@ impl Node {
         }));
         let query_handler = Arc::new(RwLock::new(qh));
 
-        // Load block producer credentials if all key paths are provided
-        let block_producer = match (
-            &args.shelley_vrf_key,
-            &args.shelley_kes_key,
-            &args.shelley_operational_certificate,
-        ) {
-            (Some(vrf_path), Some(kes_path), Some(opcert_path)) => {
-                match crate::forge::BlockProducerCredentials::load(vrf_path, kes_path, opcert_path)
-                {
-                    Ok(creds) => {
-                        info!(
-                            pool = %creds.pool_id,
-                            opcert_seq = creds.opcert_sequence,
-                            kes_period = creds.opcert_kes_period,
-                            "Block producer mode",
-                        );
-                        Some(creds)
-                    }
-                    Err(e) => {
-                        warn!("Failed to load block producer credentials: {e}");
-                        None
-                    }
-                }
-            }
-            _ => {
-                info!("Relay-only mode (no block producer keys)");
-                None
-            }
+        // Load block producer credentials if key paths are provided.
+        // If ANY block production flag is set, ALL three must be present — a partial
+        // configuration is an error, not a silent fallback to relay mode.
+        let bp_flags = [
+            ("--shelley-vrf-key", &args.shelley_vrf_key),
+            ("--shelley-kes-key", &args.shelley_kes_key),
+            (
+                "--shelley-operational-certificate",
+                &args.shelley_operational_certificate,
+            ),
+        ];
+        let provided: Vec<&str> = bp_flags
+            .iter()
+            .filter(|(_, v)| v.is_some())
+            .map(|(name, _)| *name)
+            .collect();
+        let missing: Vec<&str> = bp_flags
+            .iter()
+            .filter(|(_, v)| v.is_none())
+            .map(|(name, _)| *name)
+            .collect();
+
+        let block_producer = if provided.is_empty() {
+            info!("Relay-only mode (no block producer keys)");
+            None
+        } else if !missing.is_empty() {
+            return Err(anyhow::anyhow!(
+                "Incomplete block producer configuration: provided {} but missing {}. \
+                 All three flags (--shelley-kes-key, --shelley-vrf-key, \
+                 --shelley-operational-certificate) are required for block production.",
+                provided.join(", "),
+                missing.join(", "),
+            ));
+        } else {
+            let vrf_path = args.shelley_vrf_key.as_ref().unwrap();
+            let kes_path = args.shelley_kes_key.as_ref().unwrap();
+            let opcert_path = args.shelley_operational_certificate.as_ref().unwrap();
+            let creds =
+                crate::forge::BlockProducerCredentials::load(vrf_path, kes_path, opcert_path)
+                    .map_err(|e| {
+                        anyhow::anyhow!(
+                            "Failed to load block producer credentials: {e}. \
+                     Check that the key files and operational certificate are valid."
+                        )
+                    })?;
+            info!(
+                pool = %creds.pool_id,
+                opcert_seq = creds.opcert_sequence,
+                kes_period = creds.opcert_kes_period,
+                "Block producer mode",
+            );
+            Some(creds)
         };
 
         // Determine expected genesis hashes for genesis block validation.
@@ -1007,8 +1035,11 @@ impl Node {
         if self.metrics_port > 0 {
             let metrics = self.metrics.clone();
             let port = self.metrics_port;
+            let metrics_shutdown_tx = shutdown_tx.clone();
             tokio::spawn(async move {
-                crate::metrics::start_metrics_server(port, metrics).await;
+                if let Err(_e) = crate::metrics::start_metrics_server(port, metrics).await {
+                    metrics_shutdown_tx.send(true).ok();
+                }
             });
         }
 
@@ -1035,9 +1066,11 @@ impl Node {
         debug!("N2C server: Plutus tx validation and block delivery enabled");
         let n2c_socket_path = self.socket_path.clone();
         let n2c_shutdown_rx = shutdown_rx.clone();
+        let n2c_shutdown_tx = shutdown_tx.clone();
         tokio::spawn(async move {
             if let Err(e) = n2c_server.listen(&n2c_socket_path, n2c_shutdown_rx).await {
                 error!("N2C server error: {e}");
+                n2c_shutdown_tx.send(true).ok();
             }
         });
 
@@ -1059,13 +1092,14 @@ impl Node {
             return Ok(());
         }
         {
-            let mut pm = peer_manager.write().await;
+            // Resolve all DNS addresses BEFORE acquiring the write lock to avoid
+            // holding the lock during potentially slow DNS lookups.
+            let mut resolved_peers = Vec::new();
             for peer in &detailed_peers {
-                // Resolve address to SocketAddr — register ALL resolved IPs
                 match tokio::net::lookup_host(format!("{}:{}", peer.address, peer.port)).await {
                     Ok(addrs) => {
                         for socket_addr in addrs {
-                            pm.add_config_peer(socket_addr, peer.trustable, peer.advertise);
+                            resolved_peers.push((socket_addr, peer.trustable, peer.advertise));
                         }
                     }
                     Err(e) => {
@@ -1076,6 +1110,10 @@ impl Node {
                         );
                     }
                 }
+            }
+            let mut pm = peer_manager.write().await;
+            for (socket_addr, trustable, advertise) in resolved_peers {
+                pm.add_config_peer(socket_addr, trustable, advertise);
             }
             let stats = pm.stats();
             info!(
@@ -1108,8 +1146,8 @@ impl Node {
                     match Topology::load(&topology_path) {
                         Ok(new_topology) => {
                             let new_peers = new_topology.detailed_peers();
-                            let mut pm = pm_for_sighup.write().await;
-                            let mut added = 0usize;
+                            // Resolve DNS before acquiring the write lock
+                            let mut resolved = Vec::new();
                             for peer in &new_peers {
                                 match tokio::net::lookup_host(format!(
                                     "{}:{}",
@@ -1119,12 +1157,11 @@ impl Node {
                                 {
                                     Ok(addrs) => {
                                         for socket_addr in addrs {
-                                            pm.add_config_peer(
+                                            resolved.push((
                                                 socket_addr,
                                                 peer.trustable,
                                                 peer.advertise,
-                                            );
-                                            added += 1;
+                                            ));
                                         }
                                     }
                                     Err(e) => {
@@ -1135,6 +1172,11 @@ impl Node {
                                         );
                                     }
                                 }
+                            }
+                            let mut pm = pm_for_sighup.write().await;
+                            let added = resolved.len();
+                            for (socket_addr, trustable, advertise) in resolved {
+                                pm.add_config_peer(socket_addr, trustable, advertise);
                             }
                             info!(
                                 "Topology reloaded: {added} peers registered, {}",
@@ -1171,9 +1213,12 @@ impl Node {
             self.peer_manager.read().await.diffusion_mode()
         );
         let n2n_shutdown_rx = shutdown_rx.clone();
+        let n2n_shutdown_tx = shutdown_tx.clone();
         tokio::spawn(async move {
             if let Err(e) = n2n_server.listen(n2n_shutdown_rx).await {
                 error!("N2N server error: {e}");
+                // Fatal: trigger node shutdown on bind failure (e.g. address already in use)
+                n2n_shutdown_tx.send(true).ok();
             }
         });
 
@@ -1258,24 +1303,27 @@ impl Node {
                         .take(sample_size)
                         .collect();
 
-                    let mut added = 0u32;
+                    // Resolve all DNS addresses before acquiring the write lock
+                    let mut resolved_addrs = Vec::new();
                     for (host, port) in sample {
                         if let Ok(mut addrs) =
                             tokio::net::lookup_host(format!("{host}:{port}")).await
                         {
                             if let Some(socket_addr) = addrs.next() {
-                                let mut pm_w = pm.write().await;
-                                pm_w.add_ledger_peer(socket_addr);
-                                added += 1;
+                                resolved_addrs.push(socket_addr);
                             }
                         }
                     }
-                    if added > 0 {
-                        let pm_r = pm.read().await;
+                    if !resolved_addrs.is_empty() {
+                        let mut pm_w = pm.write().await;
+                        for socket_addr in &resolved_addrs {
+                            pm_w.add_ledger_peer(*socket_addr);
+                        }
+                        let added = resolved_addrs.len();
                         debug!(
                             "Ledger peer discovery: +{added} peers from {} relays, {}",
                             relays.len(),
-                            pm_r.stats()
+                            pm_w.stats()
                         );
                     }
                 }
@@ -4725,5 +4773,47 @@ mod tests {
         assert!(config.shelley_genesis_hash.is_none());
         assert!(config.alonzo_genesis_hash.is_none());
         assert!(config.conway_genesis_hash.is_none());
+    }
+
+    /// Regression test: BlockProvider methods must not panic when called
+    /// from within a tokio async runtime. Previously, bare `blocking_read()`
+    /// would panic with "Cannot block the current thread from within a runtime".
+    /// The fix wraps them in `tokio::task::block_in_place`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_block_provider_works_inside_async_runtime() {
+        use torsten_network::n2n_server::BlockProvider;
+        use torsten_storage::ChainDB;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let db = ChainDB::open(tmp.path()).unwrap();
+        let provider = ChainDBBlockProvider {
+            chain_db: Arc::new(RwLock::new(db)),
+        };
+
+        // These would panic before the block_in_place fix
+        let tip = provider.get_tip();
+        assert_eq!(tip.block_number, 0);
+
+        let result = provider.get_block(&[0u8; 32]);
+        assert!(result.is_none());
+
+        let result = provider.has_block(&[0u8; 32]);
+        assert!(!result);
+
+        let result = provider.get_next_block_after_slot(0);
+        assert!(result.is_none());
+    }
+
+    /// Regression test: tokio RwLock blocking_read inside block_in_place
+    /// must not panic in a multi-threaded async runtime. This covers the
+    /// pattern used by both LedgerUtxoProvider and ChainDBBlockProvider.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_blocking_read_via_block_in_place_does_not_panic() {
+        let lock = Arc::new(RwLock::new(42u64));
+        let value = tokio::task::block_in_place(|| {
+            let guard = lock.blocking_read();
+            *guard
+        });
+        assert_eq!(value, 42);
     }
 }

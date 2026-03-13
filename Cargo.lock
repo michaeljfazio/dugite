@@ -3392,6 +3392,7 @@ dependencies = [
  "num-rational",
  "num-traits",
  "parking_lot",
+ "proptest",
  "serde",
  "serde_json",
  "tempfile",

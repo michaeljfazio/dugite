@@ -410,13 +410,16 @@ fn to_transaction_inner(tx: &TestTransaction) -> Result<Transaction, AdapterErro
         ttl: tx.ttl.map(torsten_primitives::time::SlotNo),
         certificates,
         withdrawals,
-        auxiliary_data_hash: None,
+        auxiliary_data_hash: tx
+            .auxiliary_data_hash
+            .as_ref()
+            .and_then(|h| parse_hash32(h).ok()),
         validity_interval_start: tx.validity_start.map(torsten_primitives::time::SlotNo),
         mint,
         script_data_hash: None,
         collateral,
         required_signers,
-        network_id: None,
+        network_id: tx.network_id,
         collateral_return,
         total_collateral: tx.total_collateral.map(Lovelace),
         reference_inputs,
@@ -441,7 +444,17 @@ fn to_transaction_inner(tx: &TestTransaction) -> Result<Transaction, AdapterErro
             redeemers: Vec::new(),
         },
         is_valid: tx.is_valid,
-        auxiliary_data: None,
+        auxiliary_data: if tx.has_auxiliary_data {
+            Some(torsten_primitives::transaction::AuxiliaryData {
+                metadata: BTreeMap::new(),
+                native_scripts: Vec::new(),
+                plutus_v1_scripts: Vec::new(),
+                plutus_v2_scripts: Vec::new(),
+                plutus_v3_scripts: Vec::new(),
+            })
+        } else {
+            None
+        },
         raw_cbor: None,
     })
 }

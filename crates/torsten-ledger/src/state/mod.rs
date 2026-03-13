@@ -11,8 +11,8 @@ pub(crate) use governance::{
     modified_pp_groups, pp_change_drep_all_groups_met, pp_change_drep_threshold,
     pp_change_spo_threshold, prev_action_as_expected, DRepPPGroup, StakePoolPPGroup,
 };
-#[cfg(test)]
-pub(crate) use rewards::Rat;
+#[doc(hidden)]
+pub use rewards::Rat;
 
 use crate::plutus::SlotConfig;
 use crate::utxo::UtxoSet;

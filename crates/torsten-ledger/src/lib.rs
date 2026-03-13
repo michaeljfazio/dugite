@@ -9,6 +9,8 @@ pub mod validation;
 
 pub use plutus::{evaluate_plutus_scripts, PlutusError, SlotConfig};
 pub use state::LedgerState;
+#[doc(hidden)]
+pub use state::Rat;
 pub use utxo::UtxoSet;
 pub use utxo_diff::{DiffSeq, UtxoDiff};
 pub use utxo_store::UtxoStore;
