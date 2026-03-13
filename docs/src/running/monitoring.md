@@ -85,7 +85,14 @@ Returns JSON:
 | `torsten_transactions_rejected_total` | Total transactions rejected |
 | `torsten_rollback_count_total` | Total number of chain rollbacks |
 | `torsten_blocks_forged_total` | Total blocks forged by this node |
+| `torsten_leader_checks_total` | Total VRF leader checks performed |
+| `torsten_leader_checks_not_elected_total` | Leader checks where node was not elected |
+| `torsten_forge_failures_total` | Block forge attempts that failed |
+| `torsten_blocks_announced_total` | Blocks successfully announced to peers |
+| `torsten_n2n_connections_total` | Total N2N (peer-to-peer) connections accepted |
+| `torsten_n2c_connections_total` | Total N2C (client) connections accepted |
 | `torsten_validation_errors_total{error="..."}` | Transaction validation errors, broken down by error type |
+| `torsten_protocol_errors_total{error="..."}` | Protocol-level errors by type (e.g. handshake failures, connection errors) |
 
 ### Gauges
 
@@ -109,6 +116,8 @@ Returns JSON:
 | `torsten_pool_count` | Number of registered stake pools |
 | `torsten_uptime_seconds` | Seconds since node startup |
 | `torsten_disk_available_bytes` | Available disk space on the database volume |
+| `torsten_n2n_connections_active` | Currently active N2N connections |
+| `torsten_n2c_connections_active` | Currently active N2C connections |
 
 ### Histograms
 
@@ -279,6 +288,9 @@ brew services stop prometheus grafana
 | Handshake RTT p95 | `histogram_quantile(0.95, rate(torsten_peer_handshake_rtt_ms_bucket[5m]))` |
 | Block fetch latency p95 | `histogram_quantile(0.95, rate(torsten_peer_block_fetch_ms_bucket[5m]))` |
 | Validation errors by type | `rate(torsten_validation_errors_total[5m])` |
+| Protocol errors by type | `rate(torsten_protocol_errors_total[5m])` |
+| Leader election rate | `rate(torsten_leader_checks_total[5m])` |
+| Active N2N connections | `torsten_n2n_connections_active` |
 | Disk available | `torsten_disk_available_bytes` |
 
 ## Console Logging

@@ -230,6 +230,8 @@ pub struct N2NServer {
     rollback_announcement_tx: broadcast::Sender<RollbackAnnouncement>,
     /// Rate limiting and connection parameters
     rate_limit_config: N2NRateLimitConfig,
+    /// Optional connection metrics callbacks
+    connection_metrics: Option<Arc<dyn crate::ConnectionMetrics>>,
 }
 
 impl N2NServer {
@@ -255,6 +257,7 @@ impl N2NServer {
             block_announcement_tx,
             rollback_announcement_tx,
             rate_limit_config: N2NRateLimitConfig::default(),
+            connection_metrics: None,
         }
     }
 
@@ -283,12 +286,18 @@ impl N2NServer {
             block_announcement_tx,
             rollback_announcement_tx,
             rate_limit_config: N2NRateLimitConfig::default(),
+            connection_metrics: None,
         }
     }
 
     /// Set custom rate limiting configuration.
     pub fn set_rate_limit_config(&mut self, config: N2NRateLimitConfig) {
         self.rate_limit_config = config;
+    }
+
+    /// Set connection metrics callbacks for tracking connection counts and errors.
+    pub fn set_connection_metrics(&mut self, metrics: Arc<dyn crate::ConnectionMetrics>) {
+        self.connection_metrics = Some(metrics);
     }
 
     /// Set the mempool for TxSubmission2 protocol support
@@ -379,6 +388,9 @@ impl N2NServer {
                     }
 
                     active_connections.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    if let Some(ref m) = self.connection_metrics {
+                        m.on_connect();
+                    }
                     debug!(peer = %peer_addr, "N2N peer connected");
 
                     let query_handler = self.query_handler.clone();
@@ -392,6 +404,7 @@ impl N2NServer {
                     let announcement_rx = self.block_announcement_tx.subscribe();
                     let rollback_rx = self.rollback_announcement_tx.subscribe();
                     let bf_range = max_blockfetch_range;
+                    let conn_metrics = self.connection_metrics.clone();
 
                     tokio::spawn(async move {
                         if let Err(e) = handle_n2n_connection(
@@ -410,7 +423,13 @@ impl N2NServer {
                         )
                         .await
                         {
+                            if let Some(ref m) = conn_metrics {
+                                m.on_error("n2n_connection_error");
+                            }
                             debug!(peer = %peer_addr, "N2N connection ended: {e}");
+                        }
+                        if let Some(ref m) = conn_metrics {
+                            m.on_disconnect();
                         }
                         counter.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
                         debug!(peer = %peer_addr, "N2N peer disconnected");

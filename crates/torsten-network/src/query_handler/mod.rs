@@ -23,14 +23,14 @@ pub use types::{
 /// This provides a clean interface for answering LocalStateQuery protocol
 /// queries from the current ledger state.
 pub struct QueryHandler {
-    state: NodeStateSnapshot,
+    state: Arc<NodeStateSnapshot>,
     utxo_provider: Option<Arc<dyn UtxoQueryProvider>>,
 }
 
 impl QueryHandler {
     pub fn new() -> Self {
         QueryHandler {
-            state: NodeStateSnapshot::default(),
+            state: Arc::new(NodeStateSnapshot::default()),
             utxo_provider: None,
         }
     }
@@ -40,9 +40,10 @@ impl QueryHandler {
         self.utxo_provider = Some(provider);
     }
 
-    /// Update the snapshot from the current node state
+    /// Update the snapshot from the current node state.
+    /// This is a cheap Arc pointer swap — no deep cloning of the snapshot data.
     pub fn update_state(&mut self, snapshot: NodeStateSnapshot) {
-        self.state = snapshot;
+        self.state = Arc::new(snapshot);
     }
 
     /// Get a reference to the current node state snapshot

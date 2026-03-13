@@ -107,6 +107,18 @@ pub struct NodeMetrics {
     pub proposal_count: AtomicU64,
     pub pool_count: AtomicU64,
     pub disk_available_bytes: AtomicU64,
+    // Block production metrics
+    pub leader_checks_total: AtomicU64,
+    pub leader_checks_not_elected: AtomicU64,
+    pub forge_failures: AtomicU64,
+    pub blocks_announced: AtomicU64,
+    // Protocol error metrics
+    pub n2n_connections_total: AtomicU64,
+    pub n2c_connections_total: AtomicU64,
+    pub n2n_connections_active: AtomicU64,
+    pub n2c_connections_active: AtomicU64,
+    /// Per-protocol-error-type counts (label → count).
+    protocol_errors: std::sync::Mutex<HashMap<String, u64>>,
     /// Peer handshake RTT histogram (milliseconds)
     pub peer_handshake_rtt_ms: Histogram,
     /// Block fetch latency histogram (milliseconds per block)
@@ -144,6 +156,15 @@ impl NodeMetrics {
             proposal_count: AtomicU64::new(0),
             pool_count: AtomicU64::new(0),
             disk_available_bytes: AtomicU64::new(0),
+            leader_checks_total: AtomicU64::new(0),
+            leader_checks_not_elected: AtomicU64::new(0),
+            forge_failures: AtomicU64::new(0),
+            blocks_announced: AtomicU64::new(0),
+            n2n_connections_total: AtomicU64::new(0),
+            n2c_connections_total: AtomicU64::new(0),
+            n2n_connections_active: AtomicU64::new(0),
+            n2c_connections_active: AtomicU64::new(0),
+            protocol_errors: std::sync::Mutex::new(HashMap::new()),
             peer_handshake_rtt_ms: Histogram::new(),
             peer_block_fetch_ms: Histogram::new(),
             startup_instant: std::time::Instant::now(),
@@ -155,6 +176,13 @@ impl NodeMetrics {
     pub fn record_validation_error(&self, error_type: &str) {
         if let Ok(mut map) = self.validation_errors.lock() {
             *map.entry(error_type.to_string()).or_insert(0) += 1;
+        }
+    }
+
+    /// Record a protocol-level error by label (e.g. "n2n_handshake_failed").
+    pub fn record_protocol_error(&self, label: &str) {
+        if let Ok(mut map) = self.protocol_errors.lock() {
+            *map.entry(label.to_string()).or_insert(0) += 1;
         }
     }
 
@@ -246,6 +274,36 @@ impl NodeMetrics {
                 "Total blocks forged by this node",
                 &self.blocks_forged,
             ),
+            (
+                "torsten_leader_checks_total",
+                "Total VRF leader checks performed",
+                &self.leader_checks_total,
+            ),
+            (
+                "torsten_leader_checks_not_elected_total",
+                "Leader checks where node was not elected",
+                &self.leader_checks_not_elected,
+            ),
+            (
+                "torsten_forge_failures_total",
+                "Block forge attempts that failed",
+                &self.forge_failures,
+            ),
+            (
+                "torsten_blocks_announced_total",
+                "Blocks successfully announced to peers",
+                &self.blocks_announced,
+            ),
+            (
+                "torsten_n2n_connections_total",
+                "Total N2N connections accepted",
+                &self.n2n_connections_total,
+            ),
+            (
+                "torsten_n2c_connections_total",
+                "Total N2C connections accepted",
+                &self.n2c_connections_total,
+            ),
         ];
 
         // Gauges (can go up and down)
@@ -335,6 +393,16 @@ impl NodeMetrics {
                 "Available disk space in bytes on the database volume",
                 &self.disk_available_bytes,
             ),
+            (
+                "torsten_n2n_connections_active",
+                "Currently active N2N connections",
+                &self.n2n_connections_active,
+            ),
+            (
+                "torsten_n2c_connections_active",
+                "Currently active N2C connections",
+                &self.n2c_connections_active,
+            ),
         ];
 
         for (name, help, value) in counters {
@@ -367,6 +435,21 @@ impl NodeMetrics {
                 for (error_type, count) in sorted {
                     out.push_str(&format!(
                         "torsten_validation_errors_total{{error=\"{error_type}\"}} {count}\n"
+                    ));
+                }
+            }
+        }
+
+        // Protocol error breakdown
+        if let Ok(errors) = self.protocol_errors.lock() {
+            if !errors.is_empty() {
+                out.push_str("# HELP torsten_protocol_errors_total Protocol errors by type\n");
+                out.push_str("# TYPE torsten_protocol_errors_total counter\n");
+                let mut sorted: Vec<_> = errors.iter().collect();
+                sorted.sort_by_key(|(k, _)| (*k).clone());
+                for (error_type, count) in sorted {
+                    out.push_str(&format!(
+                        "torsten_protocol_errors_total{{error=\"{error_type}\"}} {count}\n"
                     ));
                 }
             }

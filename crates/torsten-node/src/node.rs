@@ -416,6 +416,54 @@ fn convert_validation_error(e: torsten_ledger::validation::ValidationError) -> T
     }
 }
 
+/// Bridges N2N server connection events to the node metrics system.
+struct N2NConnectionMetrics {
+    metrics: Arc<crate::metrics::NodeMetrics>,
+}
+
+impl torsten_network::ConnectionMetrics for N2NConnectionMetrics {
+    fn on_connect(&self) {
+        self.metrics
+            .n2n_connections_total
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.metrics
+            .n2n_connections_active
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+    fn on_disconnect(&self) {
+        self.metrics
+            .n2n_connections_active
+            .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+    }
+    fn on_error(&self, label: &str) {
+        self.metrics.record_protocol_error(label);
+    }
+}
+
+/// Bridges N2C server connection events to the node metrics system.
+struct N2CConnectionMetrics {
+    metrics: Arc<crate::metrics::NodeMetrics>,
+}
+
+impl torsten_network::ConnectionMetrics for N2CConnectionMetrics {
+    fn on_connect(&self) {
+        self.metrics
+            .n2c_connections_total
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.metrics
+            .n2c_connections_active
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+    fn on_disconnect(&self) {
+        self.metrics
+            .n2c_connections_active
+            .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+    }
+    fn on_error(&self, label: &str) {
+        self.metrics.record_protocol_error(label);
+    }
+}
+
 /// Validate genesis blocks against expected hashes from the configuration.
 ///
 /// When syncing from genesis (Origin), the first blocks received are the genesis
@@ -1107,6 +1155,9 @@ impl Node {
         n2c_server.set_block_provider(Arc::new(ChainDBBlockProvider {
             chain_db: self.chain_db.clone(),
         }));
+        n2c_server.set_connection_metrics(Arc::new(N2CConnectionMetrics {
+            metrics: self.metrics.clone(),
+        }));
         debug!("N2C server: Plutus tx validation and block delivery enabled");
         let n2c_socket_path = self.socket_path.clone();
         let n2c_shutdown_rx = shutdown_rx.clone();
@@ -1249,6 +1300,9 @@ impl Node {
         );
         n2n_server.set_mempool(self.mempool.clone());
         n2n_server.set_peer_manager(self.peer_manager.clone());
+        n2n_server.set_connection_metrics(Arc::new(N2NConnectionMetrics {
+            metrics: self.metrics.clone(),
+        }));
         // Get the broadcast senders before spawning the server
         self.block_announcement_tx = Some(n2n_server.block_announcement_sender());
         self.rollback_announcement_tx = Some(n2n_server.rollback_announcement_sender());
@@ -4510,6 +4564,9 @@ impl Node {
         }
 
         // Check if we are the slot leader
+        self.metrics
+            .leader_checks_total
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let is_leader = crate::forge::check_slot_leadership(
             creds,
             next_slot,
@@ -4519,6 +4576,9 @@ impl Node {
         );
 
         if !is_leader {
+            self.metrics
+                .leader_checks_not_elected
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             // Log periodically so operators can confirm the VRF check is running
             if next_slot.0 % 20 == 0 {
                 info!(
@@ -4622,9 +4682,15 @@ impl Node {
                         block_number: block_number.0,
                     })
                     .ok();
+                    self.metrics
+                        .blocks_announced
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 }
             }
             Err(e) => {
+                self.metrics
+                    .forge_failures
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 error!("Block forging failed: {e}");
             }
         }

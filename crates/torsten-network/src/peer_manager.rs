@@ -680,7 +680,11 @@ impl PeerManager {
         }
         self.peers
             .iter()
-            .filter(|(_, info)| info.advertise && info.temperature != PeerTemperature::Cold)
+            .filter(|(addr, info)| {
+                info.advertise
+                    && info.temperature != PeerTemperature::Cold
+                    && Self::is_routable(&addr.ip())
+            })
             .map(|(addr, _)| *addr)
             .take(max_count)
             .collect()
@@ -882,8 +886,9 @@ mod tests {
     #[test]
     fn test_peer_sharing() {
         let mut pm = PeerManager::new(PeerManagerConfig::default());
-        let a1 = test_addr(3001);
-        let a2 = test_addr(3002);
+        // Use routable addresses so they pass the routability filter
+        let a1 = routable_addr(8, 8, 8, 8, 3001);
+        let a2 = routable_addr(1, 1, 1, 1, 3002);
         pm.add_config_peer(a1, false, true); // advertise=true
         pm.add_config_peer(a2, false, false); // advertise=false
         pm.peer_connected(&a1, 14, true);
@@ -1305,5 +1310,34 @@ mod tests {
 
         let stats = pm.stats();
         assert_eq!(stats.unique_subnets, 2, "Should have 2 unique /24 subnets");
+    }
+
+    #[test]
+    fn test_peers_for_sharing_filters_non_routable() {
+        let config = PeerManagerConfig {
+            peer_sharing_enabled: true,
+            ..PeerManagerConfig::default()
+        };
+        let mut pm = PeerManager::new(config);
+
+        // Add a mix of routable and non-routable peers, all set to advertise
+        let routable = routable_addr(8, 8, 8, 8, 3001);
+        let loopback: SocketAddr = "127.0.0.1:3001".parse().unwrap();
+        let private: SocketAddr = "10.0.0.1:3001".parse().unwrap();
+        let link_local: SocketAddr = "169.254.1.1:3001".parse().unwrap();
+
+        pm.add_config_peer(routable, false, true);
+        pm.add_config_peer(loopback, false, true);
+        pm.add_config_peer(private, false, true);
+        pm.add_config_peer(link_local, false, true);
+
+        // Connect and promote to warm so they pass the temperature filter
+        for addr in &[routable, loopback, private, link_local] {
+            pm.peer_connected(addr, 14, true);
+        }
+
+        let shared = pm.peers_for_sharing(10);
+        assert_eq!(shared.len(), 1, "Only the routable peer should be shared");
+        assert_eq!(shared[0], routable);
     }
 }

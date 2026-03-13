@@ -184,6 +184,7 @@ pub struct N2CServer {
     mempool: Arc<dyn MempoolProvider>,
     tx_validator: Option<Arc<dyn TxValidator>>,
     block_provider: Option<Arc<dyn BlockProvider>>,
+    connection_metrics: Option<Arc<dyn crate::ConnectionMetrics>>,
 }
 
 impl N2CServer {
@@ -196,12 +197,18 @@ impl N2CServer {
             mempool,
             tx_validator: None,
             block_provider: None,
+            connection_metrics: None,
         }
     }
 
     /// Set a transaction validator for Phase-1/Phase-2 validation before mempool admission
     pub fn set_tx_validator(&mut self, validator: Arc<dyn TxValidator>) {
         self.tx_validator = Some(validator);
+    }
+
+    /// Set connection metrics callbacks for tracking connection counts and errors.
+    pub fn set_connection_metrics(&mut self, metrics: Arc<dyn crate::ConnectionMetrics>) {
+        self.connection_metrics = Some(metrics);
     }
 
     /// Set a block provider for LocalChainSync block delivery
@@ -229,11 +236,15 @@ impl N2CServer {
                 result = listener.accept() => {
                     match result {
                         Ok((stream, _addr)) => {
+                            if let Some(ref m) = self.connection_metrics {
+                                m.on_connect();
+                            }
                             debug!("N2C client connected");
                             let handler = self.query_handler.clone();
                             let mempool = self.mempool.clone();
                             let validator = self.tx_validator.clone();
                             let block_provider = self.block_provider.clone();
+                            let conn_metrics = self.connection_metrics.clone();
                             tokio::spawn(async move {
                                 if let Err(e) = handle_n2c_connection(
                                     stream,
@@ -244,7 +255,13 @@ impl N2CServer {
                                 )
                                 .await
                                 {
+                                    if let Some(ref m) = conn_metrics {
+                                        m.on_error("n2c_connection_error");
+                                    }
                                     warn!("N2C connection error: {e}");
+                                }
+                                if let Some(ref m) = conn_metrics {
+                                    m.on_disconnect();
                                 }
                                 debug!("N2C client disconnected");
                             });

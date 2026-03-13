@@ -29,3 +29,11 @@ pub use server::NodeServer;
 pub use torsten_primitives::mempool::{
     MempoolAddError, MempoolAddResult, MempoolProvider, MempoolSnapshot,
 };
+
+/// Optional metrics callbacks for connection tracking.
+/// Implemented by the node layer to bridge protocol-level events to the metrics system.
+pub trait ConnectionMetrics: Send + Sync + 'static {
+    fn on_connect(&self);
+    fn on_disconnect(&self);
+    fn on_error(&self, label: &str);
+}
