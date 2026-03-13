@@ -292,17 +292,23 @@ Results are saved to `target/criterion/` with HTML reports at `target/criterion/
 Torsten supports configurable storage profiles via `--storage-profile`:
 
 ```bash
-# Default: mmap block index, 128MB memtable, 256MB cache
+# 32GB systems: 2GB memtable, 24GB cache (~27GB RSS)
+./target/release/torsten-node run --storage-profile ultra-memory ...
+
+# 16GB systems (default): 1GB memtable, 12GB cache (~14GB RSS)
 ./target/release/torsten-node run --storage-profile high-memory ...
 
-# Constrained environments: mmap, 64MB memtable, 128MB cache
+# 8GB systems: 512MB memtable, 5GB cache (~6.5GB RSS)
 ./target/release/torsten-node run --storage-profile low-memory ...
+
+# 4GB systems: 256MB memtable, 2GB cache (~3GB RSS)
+./target/release/torsten-node run --storage-profile minimal ...
 
 # Individual parameter overrides
 ./target/release/torsten-node run \
-  --storage-profile high-memory \
+  --storage-profile low-memory \
   --utxo-memtable-size-mb 256 \
-  --utxo-block-cache-size-mb 512 ...
+  --utxo-block-cache-size-mb 1024 ...
 ```
 
 ## License

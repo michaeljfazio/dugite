@@ -3360,6 +3360,7 @@ dependencies = [
 name = "torsten-crypto"
 version = "0.1.0"
 dependencies = [
+ "criterion",
  "curve25519-dalek 3.2.0 (git+https://github.com/iquerejeta/curve25519-dalek?branch=ietf03_vrf_compat_ell2)",
  "dashu-base",
  "dashu-int",
@@ -3506,6 +3507,7 @@ dependencies = [
  "blake2b_simd",
  "bytes",
  "chrono",
+ "criterion",
  "derive_more",
  "hex",
  "minicbor 0.25.1",

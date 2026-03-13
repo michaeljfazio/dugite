@@ -16,17 +16,22 @@ use torsten_primitives::value::Value as TxValue;
 // Constants
 // ---------------------------------------------------------------------------
 
-const SMALL_SET: usize = 1_000;
-const MEDIUM_SET: usize = 10_000;
-const LOOKUP_COUNT: usize = 500;
+const SMALL_SET: usize = 10_000;
+const MEDIUM_SET: usize = 100_000;
+const LOOKUP_COUNT: usize = 1_000;
 
 /// LSM configurations to benchmark: (label, memtable_mb, cache_mb, bloom_bits)
+///
+/// Sized for real-world node memory budgets:
+/// - low_mem: 8GB system (~5GB available for LSM)
+/// - default: 16GB system (~12GB available)
+/// - high_mem: 32GB system (~28GB available)
 const LSM_CONFIGS: &[(&str, u64, u64, u32)] = &[
-    ("default", 128, 256, 10),
-    ("low_mem", 64, 128, 10),
-    ("tiny", 32, 64, 5),
-    ("large_cache", 128, 512, 10),
-    ("high_bloom", 128, 256, 15),
+    ("low_8gb", 256, 2048, 10),
+    ("mid_16gb", 512, 4096, 10),
+    ("high_32gb", 512, 8192, 10),
+    ("high_bloom_16gb", 512, 4096, 15),
+    ("legacy_small", 128, 256, 10),
 ];
 
 // ---------------------------------------------------------------------------
@@ -385,8 +390,8 @@ fn bench_utxo_rebuild_index(c: &mut Criterion) {
 // 10. Dataset scaling — measure how performance degrades as UTxO set grows
 // ---------------------------------------------------------------------------
 
-/// Scaling sizes for growth assessment
-const SCALING_SIZES: &[usize] = &[1_000, 5_000, 10_000, 25_000, 50_000, 100_000];
+/// Scaling sizes for growth assessment — up to 1M entries to model real-world UTxO sets
+const SCALING_SIZES: &[usize] = &[10_000, 50_000, 100_000, 250_000, 500_000, 1_000_000];
 
 fn bench_utxo_scaling_insert(c: &mut Criterion) {
     let mut group = c.benchmark_group("utxo_scaling/insert");
@@ -443,7 +448,7 @@ fn bench_utxo_scaling_apply_tx(c: &mut Criterion) {
     group.sample_size(10);
 
     // Measure apply_transaction at different base UTxO set sizes
-    for &size in &[1_000usize, 5_000, 10_000, 25_000, 50_000] {
+    for &size in &[10_000usize, 50_000, 100_000, 250_000, 500_000] {
         group.bench_with_input(BenchmarkId::new("batch_50", size), &size, |b, &size| {
             b.iter_batched(
                 || {
