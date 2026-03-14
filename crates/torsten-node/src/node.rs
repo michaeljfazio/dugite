@@ -1156,16 +1156,8 @@ impl Node {
             );
         }
 
-        // Replay blocks from ChainDB if the ledger is behind storage.
-        // This happens after a Mithril snapshot import — blocks are in storage
-        // but the ledger hasn't processed them yet.
-        self.replay_ledger_from_storage().await;
-
-        // Initialize query state from current ledger so N2C queries
-        // work immediately (before we reach chain tip or the periodic timer fires)
-        self.update_query_state().await;
-
-        // Setup shutdown signal (SIGINT + SIGTERM)
+        // Setup shutdown signal (SIGINT + SIGTERM) early so the node can be
+        // gracefully stopped during replay (which can take 30+ minutes).
         let (shutdown_tx, mut shutdown_rx) = watch::channel(false);
         #[cfg(unix)]
         {
@@ -1196,19 +1188,31 @@ impl Node {
             });
         }
 
-        // SIGHUP handler is set up after peer_manager initialization below
-
-        // Start Prometheus metrics server
+        // Start Prometheus metrics server before replay so /health, /ready,
+        // and /metrics are available during the (potentially long) replay window.
         if self.metrics_port > 0 {
             let metrics = self.metrics.clone();
             let port = self.metrics_port;
-            let metrics_shutdown_tx = shutdown_tx.clone();
             tokio::spawn(async move {
-                if let Err(_e) = crate::metrics::start_metrics_server(port, metrics).await {
-                    metrics_shutdown_tx.send(true).ok();
+                if let Err(e) = crate::metrics::start_metrics_server(port, metrics).await {
+                    error!(
+                        port,
+                        "Metrics server failed to start: {e} — node will continue without metrics"
+                    );
                 }
             });
         }
+
+        // Replay blocks from ChainDB if the ledger is behind storage.
+        // This happens after a Mithril snapshot import — blocks are in storage
+        // but the ledger hasn't processed them yet.
+        self.replay_ledger_from_storage().await;
+
+        // Initialize query state from current ledger so N2C queries
+        // work immediately (before we reach chain tip or the periodic timer fires)
+        self.update_query_state().await;
+
+        // SIGHUP handler is set up after peer_manager initialization below
 
         // Start disk space monitor on the database volume
         {
