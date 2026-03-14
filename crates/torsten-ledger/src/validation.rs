@@ -910,6 +910,18 @@ pub fn validate_transaction_with_pools(
                     }
                 }
 
+                // Debug: log when intersection fails
+                if !has_v1 && !has_v2 && !has_v3 && has_redeemers && !scripts_needed.is_empty() {
+                    tracing::debug!(
+                        tx_hash = %tx.hash.to_hex(),
+                        needed_count = scripts_needed.len(),
+                        provided_count = scripts_provided.len(),
+                        needed = ?scripts_needed.iter().map(|h| h.to_hex()).collect::<Vec<_>>(),
+                        provided = ?scripts_provided.keys().map(|h| h.to_hex()).collect::<Vec<_>>(),
+                        "scriptsNeeded/Provided intersection empty — falling back to ref input scan"
+                    );
+                }
+
                 // Fallback: if we have redeemers but no languages detected
                 // (script hash matching failed), scan reference inputs directly.
                 // This handles edge cases where our script hash computation
