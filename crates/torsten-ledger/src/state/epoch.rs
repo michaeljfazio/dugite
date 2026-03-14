@@ -216,7 +216,9 @@ impl LedgerState {
             .governance
             .proposals
             .iter()
-            .filter(|(_, state)| state.expires_epoch <= new_epoch)
+            // Per Haskell: `gasExpiresAfter < reCurrentEpoch` — proposals are active
+            // through their expires_epoch and expire at the NEXT epoch boundary.
+            .filter(|(_, state)| state.expires_epoch < new_epoch)
             .map(|(id, _)| id.clone())
             .collect();
         if !expired.is_empty() {

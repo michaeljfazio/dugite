@@ -1218,6 +1218,74 @@ mod tests {
         }
     }
 
+    /// Register DReps with proper vote delegations and stake.
+    /// Each DRep gets `stake_per_drep` lovelace of delegated stake.
+    /// DRep credentials use `Hash28::from_bytes([i as u8; 28])`.
+    /// Stake keys use `Hash32::from_bytes([200 + i as u8; 32])`.
+    /// Disables `needs_stake_rebuild` so epoch transitions don't wipe manual stake.
+    fn setup_dreps_with_stake(state: &mut LedgerState, count: usize, stake_per_drep: u64) {
+        for i in 0..count {
+            let cred = Credential::VerificationKey(Hash28::from_bytes([i as u8; 28]));
+            let key = credential_to_hash(&cred);
+            Arc::make_mut(&mut state.governance).dreps.insert(
+                key,
+                DRepRegistration {
+                    credential: cred,
+                    deposit: Lovelace(500_000_000),
+                    anchor: None,
+                    registered_epoch: EpochNo(0),
+                    last_active_epoch: EpochNo(0),
+                    active: true,
+                },
+            );
+            // Set up vote delegation and stake
+            let stake_key = Hash32::from_bytes([200 + i as u8; 32]);
+            Arc::make_mut(&mut state.governance)
+                .vote_delegations
+                .insert(stake_key, DRep::KeyHash(key));
+            state
+                .stake_distribution
+                .stake_map
+                .insert(stake_key, Lovelace(stake_per_drep));
+        }
+        // Prevent epoch transitions from clearing manually-set stake
+        state.needs_stake_rebuild = false;
+    }
+
+    /// Register SPOs with proper delegations and stake.
+    /// Pool IDs use `Hash28::from_bytes([100 + i as u8; 28])`.
+    /// Disables `needs_stake_rebuild` so epoch transitions don't wipe manual stake.
+    fn setup_spos_with_stake(state: &mut LedgerState, count: usize, stake_per_spo: u64) {
+        for i in 0..count {
+            let pool_id = Hash28::from_bytes([100 + i as u8; 28]);
+            Arc::make_mut(&mut state.pool_params).insert(
+                pool_id,
+                PoolRegistration {
+                    pool_id,
+                    vrf_keyhash: Hash32::ZERO,
+                    pledge: Lovelace(1_000_000),
+                    cost: Lovelace(340_000_000),
+                    margin_numerator: 1,
+                    margin_denominator: 100,
+                    reward_account: vec![],
+                    owners: vec![],
+                    relays: vec![],
+                    metadata_url: None,
+                    metadata_hash: None,
+                },
+            );
+            // Add delegation and stake
+            let stake_key = Hash32::from_bytes([150 + i as u8; 32]);
+            Arc::make_mut(&mut state.delegations).insert(stake_key, pool_id);
+            state
+                .stake_distribution
+                .stake_map
+                .insert(stake_key, Lovelace(stake_per_spo));
+        }
+        // Prevent epoch transitions from clearing manually-set stake
+        state.needs_stake_rebuild = false;
+    }
+
     #[test]
     fn test_new_ledger_state() {
         let params = ProtocolParameters::mainnet_defaults();
@@ -2565,14 +2633,16 @@ mod tests {
         state.process_proposal(&tx_hash, 0, &proposal);
         assert_eq!(state.governance.proposals.len(), 1);
 
-        // Advance to epoch 5 — should still be active (no votes, not ratified)
-        for e in 1..=5 {
+        // Advance to epoch 6 — should still be active (expires_epoch = 6, active through epoch 6)
+        // Per Haskell: `gasExpiresAfter < reCurrentEpoch` — proposals are active
+        // through their expiresAfter epoch.
+        for e in 1..=6 {
             state.process_epoch_transition(EpochNo(e));
         }
         assert_eq!(state.governance.proposals.len(), 1);
 
-        // Advance to epoch 6 — should expire
-        state.process_epoch_transition(EpochNo(6));
+        // Advance to epoch 7 — should expire (6 < 7)
+        state.process_epoch_transition(EpochNo(7));
         assert_eq!(state.governance.proposals.len(), 0);
     }
 
@@ -2706,8 +2776,15 @@ mod tests {
         assert!(state.governance.last_ratified.is_empty());
         assert!(state.governance.last_expired.is_empty());
 
-        // Epoch 2: proposal expires (expires_epoch <= new_epoch)
+        // Epoch 2: still active (expires_epoch = 2, active through epoch 2)
+        // Per Haskell: `gasExpiresAfter < reCurrentEpoch` — 2 < 2 is false
         state.process_epoch_transition(EpochNo(2));
+        assert_eq!(state.governance.proposals.len(), 1);
+        assert!(state.governance.last_ratified.is_empty());
+        assert!(state.governance.last_expired.is_empty());
+
+        // Epoch 3: proposal expires (2 < 3)
+        state.process_epoch_transition(EpochNo(3));
         assert_eq!(state.governance.proposals.len(), 0);
         assert!(state.governance.last_ratified.is_empty());
         assert_eq!(state.governance.last_expired.len(), 1);
@@ -2725,23 +2802,8 @@ mod tests {
             denominator: 1,
         });
 
-        // Register enough DReps and have them vote yes to meet threshold (67%)
-        let drep_count = 10;
-        for i in 0..drep_count {
-            let cred = Credential::VerificationKey(Hash28::from_bytes([i as u8; 28]));
-            let key = credential_to_hash(&cred);
-            Arc::make_mut(&mut state.governance).dreps.insert(
-                key,
-                DRepRegistration {
-                    credential: cred,
-                    deposit: Lovelace(500_000_000),
-                    anchor: None,
-                    registered_epoch: EpochNo(0),
-                    last_active_epoch: EpochNo(0),
-                    active: true,
-                },
-            );
-        }
+        // Register 10 DReps with equal stake (1B each)
+        setup_dreps_with_stake(&mut state, 10, 1_000_000_000);
 
         // Submit a parameter change proposal to update n_opt (TechnicalGroup, no SPO vote needed)
         let update = torsten_primitives::transaction::ProtocolParamUpdate {
@@ -2899,22 +2961,8 @@ mod tests {
             denominator: 1,
         });
 
-        // Register DReps
-        for i in 0..10 {
-            let cred = Credential::VerificationKey(Hash28::from_bytes([i as u8; 28]));
-            let key = credential_to_hash(&cred);
-            Arc::make_mut(&mut state.governance).dreps.insert(
-                key,
-                DRepRegistration {
-                    credential: cred,
-                    deposit: Lovelace(500_000_000),
-                    anchor: None,
-                    registered_epoch: EpochNo(0),
-                    last_active_epoch: EpochNo(0),
-                    active: true,
-                },
-            );
-        }
+        // Register DReps with stake
+        setup_dreps_with_stake(&mut state, 10, 1_000_000_000);
 
         let mut withdrawals = BTreeMap::new();
         withdrawals.insert(vec![0u8; 29], Lovelace(5_000_000_000));
@@ -2975,43 +3023,9 @@ mod tests {
         });
         assert_eq!(state.governance.committee_hot_keys.len(), 1);
 
-        // Register DReps
-        for i in 0..10 {
-            let cred = Credential::VerificationKey(Hash28::from_bytes([i as u8; 28]));
-            let key = credential_to_hash(&cred);
-            Arc::make_mut(&mut state.governance).dreps.insert(
-                key,
-                DRepRegistration {
-                    credential: cred,
-                    deposit: Lovelace(500_000_000),
-                    anchor: None,
-                    registered_epoch: EpochNo(0),
-                    last_active_epoch: EpochNo(0),
-                    active: true,
-                },
-            );
-        }
-
-        // Register some SPOs
-        for i in 0..10 {
-            let pool_id = Hash28::from_bytes([100 + i as u8; 28]);
-            Arc::make_mut(&mut state.pool_params).insert(
-                pool_id,
-                PoolRegistration {
-                    pool_id,
-                    vrf_keyhash: Hash32::ZERO,
-                    pledge: Lovelace(1_000_000),
-                    cost: Lovelace(340_000_000),
-                    margin_numerator: 1,
-                    margin_denominator: 100,
-                    reward_account: vec![],
-                    owners: vec![],
-                    relays: vec![],
-                    metadata_url: None,
-                    metadata_hash: None,
-                },
-            );
-        }
+        // Register DReps and SPOs with stake
+        setup_dreps_with_stake(&mut state, 10, 1_000_000_000);
+        setup_spos_with_stake(&mut state, 10, 1_000_000_000);
 
         let tx_hash = Hash32::from_bytes([99u8; 32]);
         let proposal = ProposalProcedure {
@@ -3078,22 +3092,9 @@ mod tests {
             denominator: 1,
         });
 
-        // Register DReps
-        for i in 0..10 {
-            let cred = Credential::VerificationKey(Hash28::from_bytes([i as u8; 28]));
-            let key = credential_to_hash(&cred);
-            Arc::make_mut(&mut state.governance).dreps.insert(
-                key,
-                DRepRegistration {
-                    credential: cred,
-                    deposit: Lovelace(500_000_000),
-                    anchor: None,
-                    registered_epoch: EpochNo(0),
-                    last_active_epoch: EpochNo(0),
-                    active: true,
-                },
-            );
-        }
+        // Register DReps and SPOs with stake
+        setup_dreps_with_stake(&mut state, 10, 1_000_000_000);
+        setup_spos_with_stake(&mut state, 10, 1_000_000_000);
 
         let tx_hash = Hash32::from_bytes([99u8; 32]);
         let proposal = ProposalProcedure {
@@ -3132,7 +3133,8 @@ mod tests {
 
         // 6/10 SPOs vote yes (60% > 51% pvt_hard_fork)
         for i in 0..6 {
-            let voter = Voter::StakePool(Hash32::from_bytes([100 + i as u8; 32]));
+            let pool_hash = Hash28::from_bytes([100 + i as u8; 28]).to_hash32_padded();
+            let voter = Voter::StakePool(pool_hash);
             state.process_vote(
                 &voter,
                 &action_id,
@@ -5902,8 +5904,11 @@ mod tests {
             no_confidence_stake,
         );
 
+        // NoConfidence stake = 3B (counts as Yes for NoConfidence actions)
+        // DRep active stake = 5B (all implicit No since no DRep votes cast)
+        // Total = 5B + 3B = 8B; Yes = 3B
         assert_eq!(drep_yes, 3_000_000_000);
-        assert_eq!(drep_total, 3_000_000_000);
+        assert_eq!(drep_total, 8_000_000_000);
     }
 
     #[test]
@@ -5962,9 +5967,10 @@ mod tests {
             no_confidence_stake,
         );
 
-        // 2B yes, 3B no (AlwaysNoConfidence), total = 5B
+        // 2B yes (voted), 3B no (AlwaysNoConfidence), 3B implicit no (non-voting DReps)
+        // Total = 5B (DRep) + 3B (NoConfidence) = 8B
         assert_eq!(drep_yes, 2_000_000_000);
-        assert_eq!(drep_total, 5_000_000_000);
+        assert_eq!(drep_total, 8_000_000_000);
     }
 
     #[test]
@@ -8054,13 +8060,17 @@ mod tests {
             let pool_id = Hash28::from_bytes([100 + i as u8; 28]);
             pool_stake.insert(pool_id, Lovelace(2_000_000_000_000));
         }
-        state.snapshots.set = Some(StakeSnapshot {
+        // Put in mark so after epoch transition rotation (mark→set), it's available
+        state.snapshots.mark = Some(StakeSnapshot {
             epoch: EpochNo(0),
             delegations: Arc::new(HashMap::new()),
             pool_stake,
             pool_params: Arc::clone(&state.pool_params),
             stake_distribution: Arc::new(HashMap::new()),
         });
+
+        // Prevent epoch transitions from clearing manually-set stake
+        state.needs_stake_rebuild = false;
 
         state
     }
