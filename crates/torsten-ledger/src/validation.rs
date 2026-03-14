@@ -841,8 +841,33 @@ pub fn validate_transaction_with_pools(
                         }
                     }
                 }
+                // Minting: policy IDs are script hashes
                 for policy_id in body.mint.keys() {
                     scripts_needed.insert(*policy_id);
+                }
+                // Withdrawals: script credential hashes
+                for reward_addr in body.withdrawals.keys() {
+                    if reward_addr.len() >= 29 {
+                        let header = reward_addr[0];
+                        // Reward address type: 0xF0 = script (testnet), 0xF1 = script (mainnet)
+                        if (header & 0x10) != 0 {
+                            if let Ok(h) = Hash28::try_from(&reward_addr[1..29]) {
+                                scripts_needed.insert(h);
+                            }
+                        }
+                    }
+                }
+                // Certificates: extract script credential hashes
+                use torsten_primitives::credentials::Credential as Cred;
+                for cert in &body.certificates {
+                    let cred = match cert {
+                        Certificate::StakeDeregistration(c) => Some(c),
+                        Certificate::StakeDelegation { credential: c, .. } => Some(c),
+                        _ => None,
+                    };
+                    if let Some(Cred::Script(h)) = cred {
+                        scripts_needed.insert(*h);
+                    }
                 }
 
                 // 2. Collect provided scripts with version
