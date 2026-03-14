@@ -150,6 +150,16 @@ pub fn blake2b_224(data: &[u8]) -> Hash28 {
     Hash(out)
 }
 
+/// Hash `[tag_byte] || data` with Blake2b-224.
+/// Used for Plutus script hashing where the tag byte indicates the script version:
+/// 0 = NativeScript, 1 = PlutusV1, 2 = PlutusV2, 3 = PlutusV3.
+pub fn blake2b_224_tagged(tag: u8, data: &[u8]) -> Hash28 {
+    let mut buf = Vec::with_capacity(1 + data.len());
+    buf.push(tag);
+    buf.extend_from_slice(data);
+    blake2b_224(&buf)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
