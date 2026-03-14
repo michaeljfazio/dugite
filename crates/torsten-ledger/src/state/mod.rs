@@ -6574,17 +6574,17 @@ mod tests {
         );
 
         // Test with values that would overflow naive i128 multiplication
-        // u64::MAX * 45e15 * 21600 > i128::MAX
-        let rho2 = Rat::new(u64::MAX as i128, 1);
-        let reserves2 = Rat::new(MAX_LOVELACE_SUPPLY as i128, 1);
-        let eta2 = Rat::new(21600, u64::MAX as i128);
-        // = u64::MAX * 45e15 * 21600 / u64::MAX = 45e15 * 21600 = 9.72e17
+        // u64::MAX * 45e15 * 21600 / u64::MAX = 45e15 * 21600 = 9.72e17
+        // This exceeds u64::MAX, so floor_u64 clamps to u64::MAX.
+        let rho2 = Rat::new(u64::MAX as i128, 1i128);
+        let reserves2 = Rat::new(MAX_LOVELACE_SUPPLY as i128, 1i128);
+        let eta2 = Rat::new(21600i128, u64::MAX as i128);
         let result2 = rho2.mul(&reserves2).mul(&eta2);
-        let expected = MAX_LOVELACE_SUPPLY as u128 * 21600;
+        // Result = 45e15 * 21600 = 972e15 > u64::MAX, so clamped
         assert_eq!(
             result2.floor_u64(),
-            expected as u64,
-            "Large numerator cross-reduced with large denominator"
+            u64::MAX,
+            "Result exceeding u64::MAX should clamp"
         );
     }
 
