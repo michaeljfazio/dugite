@@ -815,16 +815,89 @@ pub fn validate_transaction_with_pools(
                 let mut has_v2 = !tx.witness_set.plutus_v2_scripts.is_empty();
                 let mut has_v3 = !tx.witness_set.plutus_v3_scripts.is_empty();
 
-                // Check reference inputs for script_ref (reference scripts).
-                // Only checking reference_inputs (not spending inputs) to avoid
-                // picking up scripts that are carried but not used as validators.
-                for ref_input in &body.reference_inputs {
-                    if let Some(utxo) = utxo_set.lookup(ref_input) {
-                        match &utxo.script_ref {
-                            Some(ScriptRef::PlutusV1(_)) => has_v1 = true,
-                            Some(ScriptRef::PlutusV2(_)) => has_v2 = true,
-                            Some(ScriptRef::PlutusV3(_)) => has_v3 = true,
+                // Per Haskell mkScriptIntegrity: determine languages by
+                // intersecting scriptsProvided with scriptsNeeded.
+                //
+                // scriptsNeeded: script hashes from spending input address
+                //   credentials + minting policy IDs
+                // scriptsProvided: scripts from witness set + reference scripts
+                //   from UTxOs at (inputs ∪ reference_inputs)
+                // Only scripts in the intersection determine languages.
+
+                // 1. Collect needed script hashes
+                let mut scripts_needed: std::collections::HashSet<Hash28> =
+                    std::collections::HashSet::new();
+                for input in &body.inputs {
+                    if let Some(utxo) = utxo_set.lookup(input) {
+                        let ab = utxo.address.to_bytes();
+                        if !ab.is_empty() {
+                            let t = (ab[0] >> 4) & 0x0F;
+                            // Script address types: 1,3,5,7 (bit 4 of header = 1)
+                            if matches!(t, 1 | 3 | 5 | 7) && ab.len() >= 29 {
+                                if let Ok(h) = Hash28::try_from(&ab[1..29]) {
+                                    scripts_needed.insert(h);
+                                }
+                            }
+                        }
+                    }
+                }
+                for policy_id in body.mint.keys() {
+                    scripts_needed.insert(*policy_id);
+                }
+
+                // 2. Collect provided scripts with version
+                let mut scripts_provided: std::collections::HashMap<Hash28, u8> =
+                    std::collections::HashMap::new();
+                for s in &tx.witness_set.plutus_v1_scripts {
+                    let h = torsten_primitives::hash::blake2b_224_tagged(1, s);
+                    scripts_provided.insert(h, 1);
+                }
+                for s in &tx.witness_set.plutus_v2_scripts {
+                    let h = torsten_primitives::hash::blake2b_224_tagged(2, s);
+                    scripts_provided.insert(h, 2);
+                }
+                for s in &tx.witness_set.plutus_v3_scripts {
+                    let h = torsten_primitives::hash::blake2b_224_tagged(3, s);
+                    scripts_provided.insert(h, 3);
+                }
+                for input in body.inputs.iter().chain(body.reference_inputs.iter()) {
+                    if let Some(utxo) = utxo_set.lookup(input) {
+                        let (tag, bytes) = match &utxo.script_ref {
+                            Some(ScriptRef::PlutusV1(s)) => (1u8, s.as_slice()),
+                            Some(ScriptRef::PlutusV2(s)) => (2, s.as_slice()),
+                            Some(ScriptRef::PlutusV3(s)) => (3, s.as_slice()),
+                            _ => continue,
+                        };
+                        let h = torsten_primitives::hash::blake2b_224_tagged(tag, bytes);
+                        scripts_provided.insert(h, tag);
+                    }
+                }
+
+                // 3. Intersect: only USED scripts determine languages
+                for (hash, version) in &scripts_provided {
+                    if scripts_needed.contains(hash) {
+                        match version {
+                            1 => has_v1 = true,
+                            2 => has_v2 = true,
+                            3 => has_v3 = true,
                             _ => {}
+                        }
+                    }
+                }
+
+                // Fallback: if we have redeemers but no languages detected
+                // (script hash matching failed), scan reference inputs directly.
+                // This handles edge cases where our script hash computation
+                // differs from the address hash (e.g., double-encoded scripts).
+                if !has_v1 && !has_v2 && !has_v3 && has_redeemers {
+                    for ref_input in &body.reference_inputs {
+                        if let Some(utxo) = utxo_set.lookup(ref_input) {
+                            match &utxo.script_ref {
+                                Some(ScriptRef::PlutusV1(_)) => has_v1 = true,
+                                Some(ScriptRef::PlutusV2(_)) => has_v2 = true,
+                                Some(ScriptRef::PlutusV3(_)) => has_v3 = true,
+                                _ => {}
+                            }
                         }
                     }
                 }

@@ -150,12 +150,32 @@ pub fn blake2b_224(data: &[u8]) -> Hash28 {
     Hash(out)
 }
 
-/// Hash `[tag_byte] || data` with Blake2b-224.
-/// Used for Plutus script hashing where the tag byte indicates the script version:
+/// Hash `[tag_byte] || cbor_encode(data)` with Blake2b-224.
+///
+/// Matches Haskell's `hashScript` which hashes `tag <> originalBytes script`
+/// where `originalBytes` is the CBOR-encoded form of the script.
+/// The tag byte indicates the script version:
 /// 0 = NativeScript, 1 = PlutusV1, 2 = PlutusV2, 3 = PlutusV3.
+///
+/// For Plutus scripts, `data` is the raw script bytes (decoded from CBOR bstr).
+/// This function re-wraps them in CBOR bstr encoding before hashing.
 pub fn blake2b_224_tagged(tag: u8, data: &[u8]) -> Hash28 {
-    let mut buf = Vec::with_capacity(1 + data.len());
+    let mut buf = Vec::with_capacity(1 + 5 + data.len());
     buf.push(tag);
+    // CBOR-encode the data as a byte string (bstr)
+    let len = data.len();
+    if len < 24 {
+        buf.push(0x40 | len as u8);
+    } else if len < 256 {
+        buf.push(0x58);
+        buf.push(len as u8);
+    } else if len < 65536 {
+        buf.push(0x59);
+        buf.extend_from_slice(&(len as u16).to_be_bytes());
+    } else {
+        buf.push(0x5a);
+        buf.extend_from_slice(&(len as u32).to_be_bytes());
+    }
     buf.extend_from_slice(data);
     blake2b_224(&buf)
 }
