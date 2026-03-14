@@ -648,15 +648,22 @@ pub fn validate_transaction_with_pools(
             }
 
             let mut collateral_value = 0u64;
+            let mut collateral_multi_asset: BTreeMap<PolicyId, BTreeMap<AssetName, i128>> =
+                BTreeMap::new();
             for col_input in &body.collateral {
                 match utxo_set.lookup(col_input) {
                     Some(output) => {
-                        // Collateral inputs must be pure ADA (no multi-assets)
-                        if !output.value.multi_asset.is_empty() {
-                            errors
-                                .push(ValidationError::CollateralHasTokens(col_input.to_string()));
-                        }
                         collateral_value = collateral_value.saturating_add(output.value.coin.0);
+                        // Accumulate multi-asset from collateral inputs
+                        for (policy, assets) in &output.value.multi_asset {
+                            for (name, qty) in assets {
+                                *collateral_multi_asset
+                                    .entry(*policy)
+                                    .or_default()
+                                    .entry(name.clone())
+                                    .or_insert(0) += *qty as i128;
+                            }
+                        }
                     }
                     None => {
                         errors.push(ValidationError::CollateralNotFound(col_input.to_string()));
@@ -665,10 +672,30 @@ pub fn validate_transaction_with_pools(
             }
             // Account for collateral return output (Babbage+)
             let effective_collateral = if let Some(col_return) = &body.collateral_return {
+                // Subtract collateral_return multi-asset from net balance
+                for (policy, assets) in &col_return.value.multi_asset {
+                    for (name, qty) in assets {
+                        *collateral_multi_asset
+                            .entry(*policy)
+                            .or_default()
+                            .entry(name.clone())
+                            .or_insert(0) -= *qty as i128;
+                    }
+                }
                 collateral_value.saturating_sub(col_return.value.coin.0)
             } else {
                 collateral_value
             };
+
+            // Net collateral (inputs minus return) must be pure ADA
+            let has_net_tokens = collateral_multi_asset
+                .values()
+                .any(|assets| assets.values().any(|qty| *qty > 0));
+            if has_net_tokens {
+                errors.push(ValidationError::CollateralHasTokens(
+                    "net collateral has non-ADA tokens after collateral_return".to_string(),
+                ));
+            }
 
             // If total_collateral is specified, it must match effective collateral
             if let Some(total_col) = body.total_collateral {
@@ -781,10 +808,25 @@ pub fn validate_transaction_with_pools(
         let has_datums = !tx.witness_set.plutus_data.is_empty();
         if has_redeemers || has_datums {
             if let Some(declared_hash) = &body.script_data_hash {
-                // Verify the script data hash matches the computed value
-                let has_v1 = !tx.witness_set.plutus_v1_scripts.is_empty();
-                let has_v2 = !tx.witness_set.plutus_v2_scripts.is_empty();
-                let has_v3 = !tx.witness_set.plutus_v3_scripts.is_empty();
+                // Determine which Plutus language versions are used.
+                // Check both witness-embedded scripts AND reference scripts from UTxO set,
+                // since transactions can use reference scripts exclusively.
+                let mut has_v1 = !tx.witness_set.plutus_v1_scripts.is_empty();
+                let mut has_v2 = !tx.witness_set.plutus_v2_scripts.is_empty();
+                let mut has_v3 = !tx.witness_set.plutus_v3_scripts.is_empty();
+
+                // Also check reference inputs for script_ref (reference scripts)
+                for ref_input in &body.reference_inputs {
+                    if let Some(utxo) = utxo_set.lookup(ref_input) {
+                        match &utxo.script_ref {
+                            Some(ScriptRef::PlutusV1(_)) => has_v1 = true,
+                            Some(ScriptRef::PlutusV2(_)) => has_v2 = true,
+                            Some(ScriptRef::PlutusV3(_)) => has_v3 = true,
+                            _ => {}
+                        }
+                    }
+                }
+
                 let computed = torsten_serialization::compute_script_data_hash(
                     &tx.witness_set.redeemers,
                     &tx.witness_set.plutus_data,
