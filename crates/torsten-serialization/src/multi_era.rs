@@ -195,16 +195,7 @@ fn decode_block_header(
 
 fn decode_transaction_from_pallas(tx: &PallasTx) -> Result<Transaction, SerializationError> {
     let tx_hash = pallas_hash_to_torsten32(&tx.hash());
-    // Use the pallas MintedTx's KeepRaw encoding which preserves the
-    // original CBOR through the KeepRaw wrapper on the witness set.
-    // This is needed for correct script_data_hash computation.
-    let raw_cbor = if let Some(conway) = tx.as_conway() {
-        // For Conway: the transaction_witness_set is KeepRaw<WitnessSet>,
-        // so encoding the whole MintedTx preserves the witness CBOR.
-        Some(pallas_codec::minicbor::to_vec(conway).unwrap_or_default())
-    } else {
-        Some(tx.encode())
-    };
+    let raw_cbor = Some(tx.encode());
     let inputs = tx.inputs().iter().map(convert_input).collect();
 
     let outputs = tx

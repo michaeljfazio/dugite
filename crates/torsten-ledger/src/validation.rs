@@ -827,19 +827,31 @@ pub fn validate_transaction_with_pools(
                     }
                 }
 
-                // For blocks from the network (which have raw_cbor), the
-                // script_data_hash was already verified by the block producer.
-                // We trust it because perfectly reproducing the original CBOR
-                // encoding (map vs array redeemers, indefinite-length datums,
-                // etc.) is not possible without preserving every encoding detail.
-                //
-                // For locally-submitted transactions (no raw_cbor), we compute
-                // and verify the hash ourselves using our canonical encoding.
-                let computed = if tx.raw_cbor.is_some() {
-                    // Block from network: trust the declared hash
-                    *declared_hash
+                // Compute script_data_hash using pallas KeepRaw when raw tx
+                // CBOR is available (preserves exact original encoding of
+                // redeemers and datums). Falls back to our re-encoding
+                // for locally-constructed transactions.
+                let computed = if let Some(raw) = tx.raw_cbor.as_ref() {
+                    torsten_serialization::compute_script_data_hash_from_cbor(
+                        raw,
+                        &params.cost_models,
+                        has_v1,
+                        has_v2,
+                        has_v3,
+                    )
+                    .unwrap_or_else(|| {
+                        torsten_serialization::compute_script_data_hash(
+                            &tx.witness_set.redeemers,
+                            &tx.witness_set.plutus_data,
+                            &params.cost_models,
+                            has_v1,
+                            has_v2,
+                            has_v3,
+                            tx.witness_set.raw_redeemers_cbor.as_deref(),
+                            tx.witness_set.raw_plutus_data_cbor.as_deref(),
+                        )
+                    })
                 } else {
-                    // Local submission: verify with our encoding
                     torsten_serialization::compute_script_data_hash(
                         &tx.witness_set.redeemers,
                         &tx.witness_set.plutus_data,

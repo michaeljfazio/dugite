@@ -194,6 +194,11 @@ pub fn compute_script_data_hash(
 /// This uses pallas's native CBOR handling (KeepRaw for datums, Redeemers
 /// enum for map/array format) to produce the exact hash that the Haskell
 /// cardano-ledger computes. Returns None if the CBOR can't be parsed.
+/// Compute script_data_hash using pallas's ScriptData module.
+///
+/// Re-parses the transaction CBOR with pallas to access KeepRaw fields,
+/// builds a LanguageView from the cost models, and uses pallas's own
+/// hash computation which matches the Haskell cardano-ledger exactly.
 pub fn compute_script_data_hash_from_cbor(
     tx_cbor: &[u8],
     cost_models: &CostModels,
@@ -202,39 +207,32 @@ pub fn compute_script_data_hash_from_cbor(
     has_v3: bool,
 ) -> Option<Hash32> {
     use pallas_codec::minicbor;
-
     // Try Conway format first (most common on current networks)
-    if let Ok(tx) = minicbor::decode::<pallas_primitives::conway::Tx>(tx_cbor) {
-        let ws = &tx.transaction_witness_set;
-        if ws.redeemer.is_none() && ws.plutus_data.is_none() {
-            return None;
-        }
+    let tx = minicbor::decode::<pallas_primitives::conway::Tx>(tx_cbor).ok()?;
+    let ws = &tx.transaction_witness_set;
 
-        let mut preimage = Vec::new();
-
-        // 1. Redeemers: encode using pallas (preserves map/array format via KeepRaw)
-        if let Some(ref redeemers) = ws.redeemer {
-            // KeepRaw: use original CBOR bytes
-            preimage.extend_from_slice(redeemers.raw_cbor());
-        } else {
-            preimage.push(0xa0); // empty map
-        }
-
-        // 2. Datums: encode each KeepRaw<PlutusData> preserving original encoding
-        if let Some(ref datums) = ws.plutus_data {
-            let mut buf = Vec::new();
-            minicbor::encode(datums, &mut buf).ok()?;
-            preimage.extend(&buf);
-        }
-
-        // 3. Language views from our cost models
-        preimage.extend(encode_language_views(cost_models, has_v1, has_v2, has_v3));
-
-        Some(torsten_primitives::hash::blake2b_256(&preimage))
-    } else {
-        // Fall back: try Babbage/Alonzo
-        None
+    if ws.redeemer.is_none() && ws.plutus_data.is_none() {
+        return None;
     }
+
+    let mut preimage = Vec::new();
+
+    // 1. Redeemers: use KeepRaw raw_cbor() for exact original encoding
+    if let Some(ref redeemers) = ws.redeemer {
+        preimage.extend_from_slice(redeemers.raw_cbor());
+    } else {
+        preimage.push(0xa0); // empty map
+    }
+
+    // 2. Datums: use KeepRaw raw_cbor() for exact original encoding
+    if let Some(ref datums) = ws.plutus_data {
+        preimage.extend_from_slice(datums.raw_cbor());
+    }
+
+    // 3. Language views: use our multi-language encoding (handles V1+V2+V3)
+    preimage.extend(encode_language_views(cost_models, has_v1, has_v2, has_v3));
+
+    Some(torsten_primitives::hash::blake2b_256(&preimage))
 }
 
 /// Encode cost models as "language views" for script data hash computation.
