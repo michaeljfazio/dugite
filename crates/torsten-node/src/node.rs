@@ -2253,7 +2253,8 @@ impl Node {
             .unwrap_or(2160);
         let imm_tip_slot = self
             .chain_db
-            .blocking_read()
+            .read()
+            .await
             .get_tip()
             .point
             .slot()
