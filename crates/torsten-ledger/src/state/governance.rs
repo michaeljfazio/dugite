@@ -179,7 +179,7 @@ impl LedgerState {
             .collect();
         candidates.sort_by_key(|(_, action, _)| gov_action_priority(action));
 
-        info!(
+        debug!(
             epoch = self.epoch.0,
             active_proposals = candidates.len(),
             total_drep_stake,
@@ -269,7 +269,7 @@ impl LedgerState {
                         delayed = true;
                     }
                 } else if !matches!(action, GovAction::InfoAction) {
-                    info!(
+                    debug!(
                         action_id = %action_id.transaction_id.to_hex(),
                         action_type = ?std::mem::discriminant(action),
                         drep_yes, drep_total, spo_yes, total_spo_stake,

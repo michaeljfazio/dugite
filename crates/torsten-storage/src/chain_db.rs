@@ -215,6 +215,13 @@ impl ChainDB {
         self.volatile.len()
     }
 
+    /// Clear all volatile blocks. Used when the volatile DB has blocks from
+    /// a fork that no longer connects to the ledger tip (e.g., after crash
+    /// or restart with a different chain).
+    pub fn clear_volatile(&mut self) {
+        self.volatile.clear();
+    }
+
     /// Get the current chain tip (higher of volatile and immutable).
     pub fn get_tip(&self) -> Tip {
         let vol_tip = self.volatile.get_tip().map(|(slot, hash, block_no)| Tip {

@@ -886,6 +886,8 @@ impl LedgerState {
     /// Requires mutable access because LsmTree::save_snapshot is &mut self.
     pub fn save_utxo_snapshot(&mut self) -> Result<(), LedgerError> {
         if let Some(store) = self.utxo_set.store_mut() {
+            // Delete any existing snapshot first to avoid "already exists" error
+            let _ = store.delete_snapshot("ledger");
             store.save_snapshot("ledger").map_err(|e| {
                 LedgerError::EpochTransition(format!("Failed to save UTxO store snapshot: {e}"))
             })?;

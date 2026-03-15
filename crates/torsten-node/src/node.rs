@@ -2251,6 +2251,14 @@ impl Node {
             .as_ref()
             .map(|g| g.security_param)
             .unwrap_or(2160);
+        let imm_tip_slot = self
+            .chain_db
+            .blocking_read()
+            .get_tip()
+            .point
+            .slot()
+            .map(|s| s.0)
+            .unwrap_or(0);
         let result = tokio::task::spawn_blocking(move || {
             let start = std::time::Instant::now();
             let mut replayed = 0u64;
@@ -2308,7 +2316,13 @@ impl Node {
                             let speed = replayed as f64 / elapsed;
                             let slot = ls_guard.tip.point.slot().map(|s| s.0).unwrap_or(0);
                             let utxos = ls_guard.utxo_set.len();
+                            let pct = if imm_tip_slot > 0 {
+                                slot as f64 / imm_tip_slot as f64 * 100.0
+                            } else {
+                                0.0
+                            };
                             info!(
+                                progress = format_args!("{pct:>6.2}%"),
                                 blocks = replayed,
                                 slot,
                                 speed = format_args!("{speed:.0} blk/s"),
@@ -3352,6 +3366,7 @@ impl Node {
                     let mut bridge_slot = ledger_slot;
                     let target_slot = first_new.slot().0;
                     let mut bridged = 0u64;
+                    let mut bridge_failed = false;
                     loop {
                         let block_data = {
                             let db = self.chain_db.read().await;
@@ -3369,8 +3384,10 @@ impl Node {
                                         if let Err(e) = ls.apply_block(&block, BlockValidationMode::ApplyOnly) {
                                             warn!(
                                                 slot = next_slot.0,
-                                                "Gap bridge apply failed: {e} — aborting bridge"
+                                                "Gap bridge apply failed: {e} — \
+                                                 ChainDB may have blocks from a different fork"
                                             );
+                                            bridge_failed = true;
                                             break;
                                         }
                                         bridged += 1;
@@ -3387,6 +3404,22 @@ impl Node {
                     }
                     if bridged > 0 {
                         debug!("Bridged {bridged} blocks from ChainDB storage");
+                    }
+                    if bridge_failed {
+                        // ChainDB has blocks from a different fork that don't connect
+                        // to the ledger. Clear volatile blocks and let the network
+                        // re-sync from the ledger tip.
+                        warn!(
+                            "Gap bridge failed due to fork divergence. \
+                             Clearing stale volatile blocks and re-syncing from ledger tip."
+                        );
+                        {
+                            let mut db = self.chain_db.write().await;
+                            db.clear_volatile();
+                        }
+                        // Return 0 to signal that no blocks were applied from this batch.
+                        // The caller will reconnect with a fresh intersection.
+                        return 0;
                     }
                 }
             }
