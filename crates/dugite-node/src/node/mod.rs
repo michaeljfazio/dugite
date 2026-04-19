@@ -26,7 +26,7 @@ use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::signal;
 use tokio::sync::{mpsc, watch, RwLock};
 use tokio::task::JoinHandle;
@@ -288,6 +288,13 @@ pub struct Node {
     /// Triggers at epoch boundaries, every N blocks, and on graceful
     /// shutdown.  Matches Haskell's snapshot policy in Background.hs.
     pub(crate) bg_snapshot_scheduler: SnapshotScheduler,
+
+    /// Instant of last `update_query_state()` call.
+    ///
+    /// Rate-limits the per-block N2C snapshot rebuild to at most once per
+    /// second. Without this guard the O(n²) DRep delegator scan (8k DReps ×
+    /// 38k reward accounts) stalls the apply loop for every single block.
+    last_query_state_update: Instant,
 }
 
 // ─── GsmActorParts ──────────────────────────────────────────────────────────
@@ -1480,6 +1487,7 @@ impl Node {
             copy_to_immutable: CopyToImmutable::new(consensus_security_param as usize),
             gc_scheduler: GcScheduler::new(),
             bg_snapshot_scheduler: SnapshotScheduler::new(),
+            last_query_state_update: Instant::now(),
         })
     }
 
@@ -3463,10 +3471,16 @@ impl Node {
             std::sync::atomic::Ordering::Relaxed,
         );
 
-        // Refresh the N2C query handler snapshot so LocalStateQuery clients
-        // (e.g. `dugite-cli query tip`) see the latest ledger state immediately
-        // after each block rather than waiting for the 30-second periodic refresh.
-        self.update_query_state().await;
+        // Refresh the N2C query handler snapshot at most once per second.
+        // `update_query_state()` does an O(n²) DRep delegator scan (8k DReps ×
+        // 38k reward accounts) and held the ledger read lock for the full
+        // duration, stalling the apply loop on every block. Capping at 1 Hz
+        // keeps N2C query data fresh for interactive clients while removing
+        // the per-block stall.
+        if self.last_query_state_update.elapsed() >= Duration::from_secs(1) {
+            self.update_query_state().await;
+            self.last_query_state_update = Instant::now();
+        }
 
         // Run background maintenance (copy-to-immutable, GC, snapshot).
         // This matches the pattern from the old sync loop where these
