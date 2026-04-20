@@ -319,6 +319,61 @@ impl LsmTree {
         snapshot::delete_snapshot(&snapshots_dir, name)
     }
 
+    /// Restore this already-open tree to the state recorded in a named snapshot.
+    ///
+    /// Unlike `open_snapshot`, this operates on the existing open instance and
+    /// does NOT acquire a new lock — the caller already holds the session lock.
+    /// This is the correct path for in-place rollback when the tree is already
+    /// open: calling `open_snapshot` on the same path would fail with a lock
+    /// conflict because the process already owns the lock file.
+    ///
+    /// Steps:
+    ///   1. Flush and discard the current memtable.
+    ///   2. Clear the active directory, removing all current run files.
+    ///   3. Hard-link (or copy) the snapshot's run files into active/.
+    ///   4. Rebuild `runs`, `levels`, and `next_run_id` from snapshot metadata.
+    ///   5. Clear the block cache.
+    pub fn restore_from_snapshot(&mut self, name: &str) -> Result<()> {
+        let snapshots_dir = snapshot::snapshot_dir(&self.db_path);
+
+        // Discard the memtable — snapshot state is authoritative.
+        self.memtable = MemTable::new();
+
+        // Clear existing run files from the active directory.
+        for run_id in self.runs.keys().copied().collect::<Vec<_>>() {
+            for suffix in &[".data", ".bloom", ".index"] {
+                let path = self.active_dir.join(format!("{run_id:020}{suffix}"));
+                if path.exists() {
+                    let _ = fs::remove_file(&path);
+                }
+            }
+        }
+        self.runs.clear();
+        self.levels.clear();
+
+        // Restore snapshot files into the active directory and load metadata.
+        let metadata = snapshot::open_snapshot(&snapshots_dir, &self.active_dir, name)?;
+
+        // Reconstruct levels and runs from the restored metadata.
+        for &(level_num, run_id) in &metadata.runs {
+            while self.levels.len() <= level_num {
+                self.levels.push(Level::new(self.levels.len()));
+            }
+            self.levels[level_num].add_run(run_id);
+            let run = Run::open(&self.active_dir, run_id, self.config.page_size)?;
+            self.runs.insert(run_id, run);
+        }
+        if self.levels.is_empty() {
+            self.levels.push(Level::new(0));
+        }
+        self.next_run_id = metadata.next_run_id;
+
+        // Invalidate the block cache — entries from the old state are stale.
+        *self.cache.lock() = BlockCache::new(self.config.cache_capacity());
+
+        Ok(())
+    }
+
     /// Apply a batch of inserts and deletes atomically.
     ///
     /// Writes a single WAL entry per batch (or no WAL entry when WAL is

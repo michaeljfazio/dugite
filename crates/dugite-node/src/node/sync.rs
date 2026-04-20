@@ -551,67 +551,49 @@ impl Node {
                         // a full genesis replay — expensive but correct.
                         // ─────────────────────────────────────────────────────
                         let utxo_store_path = self.database_path.join("utxo-store");
-                        let restored_utxo_store = if utxo_store_path.exists() {
-                            // Try to open the UTxO store from the saved "ledger" LSM snapshot.
-                            // This snapshot reflects the exact UTxO set at snapshot_slot.
-                            match dugite_ledger::utxo_store::UtxoStore::open_from_snapshot(
-                                &utxo_store_path,
-                                "ledger",
-                            ) {
-                                Ok(mut store) => {
-                                    // Rebuild the address index and count from the restored snapshot.
-                                    store.count_entries();
-                                    store.set_indexing_enabled(true);
-                                    store.rebuild_address_index();
-                                    info!(
-                                        snapshot_slot,
-                                        utxos = store.len(),
-                                        "UTxO store restored from LSM snapshot for rollback"
-                                    );
-                                    Some(store)
-                                }
-                                Err(e) => {
-                                    // The live LSM store is still open (e.g. the process
-                                    // holds its lock file).  Opening a second instance at
-                                    // the same path is not possible.  Fall back to the
-                                    // in-memory path: detach the live store and rely on
-                                    // the bincode snapshot's in-memory UTxO set, then
-                                    // replay snapshot_slot → rollback_slot incrementally.
-                                    // This is safe for small rollbacks (1-k blocks at tip)
-                                    // and avoids an expensive full genesis reset.
-                                    warn!(
-                                        "Failed to open UTxO store from snapshot for rollback \
-                                         (likely lock conflict — will use in-memory fallback): {e}"
-                                    );
-                                    None
-                                }
-                            }
-                        } else {
-                            None // No on-disk UTxO store; in-memory mode uses bincode snapshot
-                        };
 
                         let mut ls = self.ledger_state.write().await;
 
-                        if let Some(store) = restored_utxo_store {
-                            // LSM mode: replace ledger state and attach the correct UTxO store.
-                            *ls = snapshot_state;
-                            ls.attach_utxo_store(store);
+                        // Restore the UTxO store using the live, already-open handle.
+                        // Calling open_from_snapshot on the same path would fail with a
+                        // lock conflict because this process already owns the session lock.
+                        // restore_from_snapshot operates in-place without re-acquiring the
+                        // lock, replacing the active runs with the named snapshot's files.
+                        let has_store = utxo_store_path.exists()
+                            && ls.utxo.utxo_set.has_store();
+                        if has_store {
+                            match ls.utxo.utxo_set.store_mut()
+                                .unwrap()
+                                .restore_from_snapshot("ledger")
+                            {
+                                Ok(()) => {
+                                    ls.utxo.utxo_set.store_mut().unwrap().count_entries();
+                                    ls.utxo.utxo_set.store_mut().unwrap().set_indexing_enabled(true);
+                                    ls.utxo.utxo_set.store_mut().unwrap().rebuild_address_index();
+                                    let utxos = ls.utxo.utxo_set.store().unwrap().len();
+                                    // Replace all non-UTxO ledger state from the snapshot,
+                                    // then re-attach the already-restored store.
+                                    let store = ls.utxo.utxo_set.detach_store().unwrap();
+                                    *ls = snapshot_state;
+                                    ls.attach_utxo_store(store);
+                                    info!(
+                                        snapshot_slot,
+                                        utxos,
+                                        "UTxO store restored in-place from LSM snapshot for rollback"
+                                    );
+                                }
+                                Err(e) => {
+                                    warn!(
+                                        "restore_from_snapshot failed, falling back to in-memory: {e}"
+                                    );
+                                    let _ = ls.utxo.utxo_set.detach_store();
+                                    *ls = snapshot_state;
+                                }
+                            }
                         } else {
-                            // In-memory fallback (covers both no-on-disk-store and lock-conflict
-                            // cases): detach the live LSM store, load the full UTxO set from
-                            // the bincode snapshot, and replay incremental blocks below.
-                            // The node continues in memory-mapped UTxO mode until the next
-                            // snapshot save re-attaches the LSM store.
+                            // No live LSM store — use bincode snapshot's in-memory UTxO set.
                             let _ = ls.utxo.utxo_set.detach_store();
                             *ls = snapshot_state;
-                            if utxo_store_path.exists() {
-                                info!(
-                                    rollback_slot,
-                                    snapshot_slot,
-                                    "Rollback using in-memory UTxOs from bincode snapshot \
-                                     (LSM store remains open; will re-attach on next snapshot save)"
-                                );
-                            }
                         }
 
                         let replay_from = snapshot_slot;

@@ -634,6 +634,22 @@ impl UtxoStore {
         Ok(())
     }
 
+    /// Restore this already-open store in-place from a named LSM snapshot.
+    ///
+    /// Unlike `open_from_snapshot`, this does not acquire a new lock — the
+    /// store is already open and locked.  Use this during rollback when the
+    /// live store must be reset to a previously saved snapshot without
+    /// releasing and re-acquiring the exclusive session lock.
+    ///
+    /// After restoration, `count_entries()` and `rebuild_address_index()` must
+    /// be called by the caller to refresh the in-memory metadata.
+    pub fn restore_from_snapshot(&mut self, name: &str) -> Result<(), UtxoStoreError> {
+        self.tree.restore_from_snapshot(name)?;
+        self.count = 0;
+        self.address_index.clear();
+        Ok(())
+    }
+
     /// Get the path to the UTxO store directory.
     pub fn path(&self) -> &Path {
         &self.path
