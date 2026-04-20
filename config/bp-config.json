@@ -7,12 +7,12 @@
   "MinSeverity": "Info",
   "Network": "Testnet",
   "NetworkMagic": 2,
-  "PeerSharing": false,
+  "PeerSharing": true,
   "ShelleyGenesisFile": "preview-shelley-genesis.json",
   "ShelleyGenesisHash": "363498d1024f84bb39d3fa9593ce391483cb40d479b87233f868d6e57c3a400d",
-  "TargetNumberOfActivePeers": 1,
-  "TargetNumberOfEstablishedPeers": 1,
-  "TargetNumberOfKnownPeers": 1,
-  "TargetNumberOfRootPeers": 1,
-  "MetricsPort": 12799
+  "TargetNumberOfActivePeers": 20,
+  "TargetNumberOfEstablishedPeers": 40,
+  "TargetNumberOfKnownPeers": 100,
+  "TargetNumberOfRootPeers": 50,
+  "MetricsPort": 12798
 }
