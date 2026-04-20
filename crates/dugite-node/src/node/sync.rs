@@ -402,16 +402,68 @@ impl Node {
             .rollback_count
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
-        // If the rollback point is at or beyond our ledger tip, it's a no-op.
-        // This commonly happens after reconnection when the server confirms
-        // the intersection by sending a RollBackward to the same point.
+        // Classify the rollback event relative to the current ledger tip.
         {
             let ls = self.ledger_state.read().await;
             let ledger_slot = ls.tip.point.slot().map(|s| s.0).unwrap_or(0);
-            if rollback_slot >= ledger_slot {
+
+            if rollback_slot == ledger_slot {
+                // Already at the rollback point — genuine no-op.
                 debug!(
                     rollback_slot,
-                    ledger_slot, "Rollback point is at or ahead of ledger tip, skipping"
+                    ledger_slot, "Rollback point equals ledger tip, skipping"
+                );
+                return;
+            }
+
+            if rollback_slot > ledger_slot {
+                // The rollback target is AHEAD of the ledger. This happens on
+                // restart when the chunk replay couldn't apply VolatileDB-only
+                // intermediate blocks: the ledger sits at the last successful
+                // ImmutableDB block while ChainSync finds an intersection further
+                // along the chain. We need to advance (not roll back) the ledger
+                // by replaying blocks from ChainDB up to the rollback point.
+                drop(ls);
+                let db = self.chain_db.read().await;
+                let mut current_slot = ledger_slot;
+                let mut replayed = 0u64;
+                let mut ls = self.ledger_state.write().await;
+                while current_slot < rollback_slot {
+                    match db
+                        .get_next_block_after_slot(dugite_primitives::time::SlotNo(current_slot))
+                    {
+                        Ok(Some((next_slot, _hash, cbor))) => {
+                            if next_slot.0 > rollback_slot {
+                                break;
+                            }
+                            match dugite_serialization::multi_era::decode_block_minimal_with_byron_epoch_length(&cbor, self.byron_epoch_length) {
+                                Ok(block) => {
+                                    if let Err(e) = ls.apply_block(&block, BlockValidationMode::ApplyOnly) {
+                                        warn!(
+                                            slot = next_slot.0,
+                                            "Gap-bridge: ledger apply failed: {e} — stopping advance"
+                                        );
+                                        break;
+                                    }
+                                    replayed += 1;
+                                    current_slot = next_slot.0;
+                                }
+                                Err(e) => {
+                                    warn!("Gap-bridge: failed to decode block at slot {}: {e}", next_slot.0);
+                                    break;
+                                }
+                            }
+                        }
+                        Ok(None) => break,
+                        Err(e) => {
+                            warn!("Gap-bridge: ChainDB read error: {e}");
+                            break;
+                        }
+                    }
+                }
+                info!(
+                    ledger_slot,
+                    rollback_slot, replayed, "Gap-bridge: advanced ledger to meet rollback target"
                 );
                 return;
             }
