@@ -4380,13 +4380,146 @@ impl Node {
                             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                         false
                     }
-                    Some(dugite_storage::AddBlockResult::TriggeredFork { .. }) => {
-                        warn!(
-                            slot = next_slot.0,
-                            forged = %block.hash().to_hex(),
-                            "Forge triggered unexpected fork switch"
-                        );
-                        false
+                    Some(dugite_storage::AddBlockResult::TriggeredFork {
+                        intersection_hash,
+                        intersection_slot,
+                        rollback,
+                        apply,
+                    }) => {
+                        // Chain selection switched to a strictly-longer competing
+                        // fork that ends with our forged block. Submitting the
+                        // block caused the switch, so VolatileDB has already
+                        // committed the new `selected_chain`. The ledger is still
+                        // on the pre-fork chain and MUST be rolled back to the
+                        // intersection and re-applied along the new fork. The
+                        // last block in `apply` is validated+applied by the
+                        // normal own-block path immediately after this branch,
+                        // preserving `ValidateAll` semantics for own forges.
+                        //
+                        // If the last `apply` hash is NOT our forged block, then
+                        // the switch was triggered onto a chain that does not
+                        // include our block — this is a genuine race-lost case.
+                        if apply.last() != Some(block.hash()) {
+                            warn!(
+                                slot = next_slot.0,
+                                forged = %block.hash().to_hex(),
+                                actual_tip = apply.last().map(|h| h.to_hex()).unwrap_or_default(),
+                                "Forge triggered fork switch but our block is not at new tip — race lost"
+                            );
+                            self.metrics
+                                .forge_race_lost
+                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            false
+                        } else {
+                            info!(
+                                intersection = %intersection_hash.to_hex(),
+                                intersection_slot = intersection_slot.0,
+                                rollback_count = rollback.len(),
+                                apply_count = apply.len(),
+                                forged = %block.hash().to_hex(),
+                                "Forge triggered fork switch — our block is new tip; \
+                                 rolling back ledger and replaying fork"
+                            );
+                            self.metrics
+                                .rollback_count
+                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+
+                            let rollback_point =
+                                Point::Specific(*intersection_slot, *intersection_hash);
+                            self.handle_rollback(&rollback_point).await;
+
+                            // Replay every block in `apply` EXCEPT the last one
+                            // (our forged block). The caller below runs the
+                            // normal own-block apply + announce path for the
+                            // last element, so we must not double-apply it here.
+                            let validation_mode = if self.validate_all_blocks {
+                                BlockValidationMode::ValidateAll
+                            } else {
+                                BlockValidationMode::ApplyOnly
+                            };
+                            let intermediate = &apply[..apply.len() - 1];
+                            let mut replay_failed = false;
+                            for fork_hash in intermediate {
+                                let cbor_opt = {
+                                    let db = self.chain_db.read().await;
+                                    db.get_block(fork_hash).unwrap_or(None)
+                                };
+                                let Some(cbor) = cbor_opt else {
+                                    warn!(
+                                        hash = %fork_hash.to_hex(),
+                                        "Forge fork replay: block hash in apply list not found in ChainDB"
+                                    );
+                                    replay_failed = true;
+                                    break;
+                                };
+                                let fork_block = match dugite_serialization::multi_era::decode_block_minimal_with_byron_epoch_length(
+                                    &cbor,
+                                    self.byron_epoch_length,
+                                ) {
+                                    Ok(b) => b,
+                                    Err(e) => {
+                                        warn!(
+                                            hash = %fork_hash.to_hex(),
+                                            "Forge fork replay: failed to decode block: {e}"
+                                        );
+                                        replay_failed = true;
+                                        break;
+                                    }
+                                };
+                                let fork_slot = fork_block.slot();
+                                let fork_block_no = fork_block.block_number();
+                                {
+                                    let mut ls = self.ledger_state.write().await;
+                                    if let Err(e) = ls.apply_block(&fork_block, validation_mode) {
+                                        warn!(
+                                            slot = fork_slot.0,
+                                            block = fork_block_no.0,
+                                            "Forge fork replay: ledger apply failed: {e} — \
+                                             clearing volatile and aborting forge"
+                                        );
+                                        drop(ls);
+                                        let mut db = self.chain_db.write().await;
+                                        db.clear_volatile();
+                                        replay_failed = true;
+                                        break;
+                                    }
+                                    if let Some((prev_era, new_era, epoch)) =
+                                        ls.pending_era_transition.take()
+                                    {
+                                        drop(ls);
+                                        let mut eh = self.era_history.write().await;
+                                        if eh.current_era() < new_era {
+                                            eh.record_era_transition(new_era, epoch.0);
+                                            info!(
+                                                prev = %prev_era,
+                                                new = %new_era,
+                                                epoch = epoch.0,
+                                                "Era transition recorded in HFC era history (forge fork replay)",
+                                            );
+                                        }
+                                    }
+                                }
+                                {
+                                    let mut fragment = self.chain_fragment.write().await;
+                                    fragment.push(fork_block.header.clone());
+                                }
+                                self.consensus.update_tip(fork_block.tip());
+                                self.metrics
+                                    .blocks_applied
+                                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                if let Some(ref tx) = self.block_announcement_tx {
+                                    let mut hash_bytes = [0u8; 32];
+                                    hash_bytes
+                                        .copy_from_slice(fork_block.header.header_hash.as_ref());
+                                    let _ = tx.send(dugite_network::BlockAnnouncement {
+                                        slot: fork_slot.0,
+                                        hash: hash_bytes,
+                                        block_number: fork_block_no.0,
+                                    });
+                                }
+                            }
+                            !replay_failed
+                        }
                     }
                     Some(dugite_storage::AddBlockResult::Invalid(reason)) => {
                         error!(
