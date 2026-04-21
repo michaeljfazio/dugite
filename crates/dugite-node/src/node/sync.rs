@@ -395,6 +395,26 @@ impl Node {
     ///   * (TODO) The MsgRollBackward handler in `chainsync_client_task` via
     ///     a shared rollback channel.
     pub async fn handle_rollback(&self, rollback_point: &Point) {
+        self.handle_rollback_inner(rollback_point, true).await
+    }
+
+    /// Roll back LEDGER state only — the caller has already committed the
+    /// VolatileDB chain switch via `ChainSelQueue::switch_chain()` and just
+    /// needs the ledger/fragment/mempool to be realigned to the intersection.
+    ///
+    /// This is the correct entry point for the `TriggeredFork` verdict from
+    /// `ChainSelQueue`.  Using `handle_rollback` there would call
+    /// `ChainDB::rollback_to_point`, which truncates `selected_chain` back to
+    /// the intersection and undoes the fork switch — leaving the VolatileDB
+    /// tip stuck at the intersection slot.  That produces an O(N) per-block
+    /// cascade: every subsequent block arrives with a `prev_hash` that no
+    /// longer matches the stuck tip, is stored as a fork, and re-triggers the
+    /// same fork switch with an ever-growing `apply` list.
+    pub async fn handle_ledger_rollback(&self, rollback_point: &Point) {
+        self.handle_rollback_inner(rollback_point, false).await
+    }
+
+    async fn handle_rollback_inner(&self, rollback_point: &Point, rewind_chain_db: bool) {
         let rollback_slot = rollback_point.slot().map(|s| s.0).unwrap_or(0);
 
         // Count every rollback event for observability, even no-ops.
@@ -496,7 +516,12 @@ impl Node {
         }
 
         // 1. Roll back ChainDB (removes volatile blocks after the rollback point).
-        {
+        //
+        // Skipped when the caller has already committed a VolatileDB chain
+        // switch via `ChainSelQueue::switch_chain()` — doing it here would
+        // undo that switch and leave the volatile tip stuck at the
+        // intersection (see `handle_ledger_rollback`).
+        if rewind_chain_db {
             let mut db = self.chain_db.write().await;
             if let Err(e) = db.rollback_to_point(rollback_point) {
                 error!("ChainDB rollback failed: {e}");
@@ -1066,7 +1091,10 @@ impl Node {
                                 intersection_slot,
                                 intersection_hash,
                             );
-                            self.handle_rollback(&rollback_point).await;
+                            // VolatileDB's selected_chain has already been
+                            // switched to the new fork by ChainSelQueue; use
+                            // the ledger-only path so we don't undo the switch.
+                            self.handle_ledger_rollback(&rollback_point).await;
                             // Block is stored; ledger is rolled back; the
                             // gap-bridging path further down will apply the
                             // new fork blocks in order.
