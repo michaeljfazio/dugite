@@ -3254,17 +3254,24 @@ pub async fn chainsync_client_task(
                             }
                         }
 
-                        // Forward the rollback point to the main run loop so it
-                        // can call handle_rollback() and advance the ledger.
-                        // The main run loop is the only task that holds a mutable
-                        // reference to Node, so we must use a channel rather than
-                        // calling handle_rollback() directly here.
-                        // handle_rollback is idempotent — duplicate events from
-                        // multiple peers are no-ops when the ledger is already
-                        // at or before the rollback point.
-                        if let Err(e) = rollback_event_tx.try_send(prim_point.clone()) {
-                            debug!(%peer_addr, rollback_slot, "Rollback event dropped: {e}");
-                        }
+                        // Do NOT forward this peer's rollback to a global
+                        // handle_rollback().  MsgRollBackward from a single peer
+                        // only means that peer trimmed its candidate fragment —
+                        // it does not imply our preferred chain has changed.
+                        // Matches Haskell `ChainSync.Client::rollBackward`:
+                        // only `theirFrag` (per-peer candidate) is trimmed;
+                        // chain selection decides whether to actually switch.
+                        //
+                        // Our ledger is rolled back only via the TriggeredFork
+                        // verdict from ChainSelQueue (see apply_fetched_block
+                        // in node/mod.rs), which fires when a competing fork
+                        // fetched from BlockFetch is strictly preferred by
+                        // chain density.  A blanket rollback here caused
+                        // unwarranted ~1500-block ledger regressions when any
+                        // single peer fell behind and reconnected offering
+                        // an old intersection point.
+                        let _ = &rollback_event_tx; // keep handle alive for now
+                        let _ = &prim_point;
 
                         // Refill pipeline after rollback.
                         if !at_tip && outstanding <= low_mark {
