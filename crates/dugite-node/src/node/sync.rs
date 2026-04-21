@@ -402,6 +402,32 @@ impl Node {
             .rollback_count
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
+        // Guard: reject rollback targets older than our ImmutableDB tip.
+        //
+        // A rollback beyond the immutable tip is protocol-impossible on the
+        // honest chain (Ouroboros k-block finality). Such an event is produced
+        // by a stale peer advertising an old chain tip, or by a divergent
+        // peer on a different network. Acting on it would be a no-op at best
+        // and state-corrupting at worst — ignoring preserves node state and
+        // lets the offending ChainSync session tear down on its next mismatch
+        // (connection_lifecycle will drop the peer automatically, no operator
+        // restart required).
+        {
+            let db = self.chain_db.read().await;
+            if let Some(imm_point) = db.get_immutable_tip_point() {
+                let imm_slot = imm_point.slot().map(|s| s.0).unwrap_or(0);
+                if rollback_slot < imm_slot {
+                    warn!(
+                        rollback_slot,
+                        immutable_slot = imm_slot,
+                        "Ignoring rollback to point older than immutable tip; \
+                         peer is stale or on a divergent chain. Node state preserved."
+                    );
+                    return;
+                }
+            }
+        }
+
         // Classify the rollback event relative to the current ledger tip.
         {
             let ls = self.ledger_state.read().await;
@@ -559,17 +585,27 @@ impl Node {
                         // lock conflict because this process already owns the session lock.
                         // restore_from_snapshot operates in-place without re-acquiring the
                         // lock, replacing the active runs with the named snapshot's files.
-                        let has_store = utxo_store_path.exists()
-                            && ls.utxo.utxo_set.has_store();
+                        let has_store = utxo_store_path.exists() && ls.utxo.utxo_set.has_store();
                         if has_store {
-                            match ls.utxo.utxo_set.store_mut()
+                            match ls
+                                .utxo
+                                .utxo_set
+                                .store_mut()
                                 .unwrap()
                                 .restore_from_snapshot("ledger")
                             {
                                 Ok(()) => {
                                     ls.utxo.utxo_set.store_mut().unwrap().count_entries();
-                                    ls.utxo.utxo_set.store_mut().unwrap().set_indexing_enabled(true);
-                                    ls.utxo.utxo_set.store_mut().unwrap().rebuild_address_index();
+                                    ls.utxo
+                                        .utxo_set
+                                        .store_mut()
+                                        .unwrap()
+                                        .set_indexing_enabled(true);
+                                    ls.utxo
+                                        .utxo_set
+                                        .store_mut()
+                                        .unwrap()
+                                        .rebuild_address_index();
                                     let utxos = ls.utxo.utxo_set.store().unwrap().len();
                                     // Replace all non-UTxO ledger state from the snapshot,
                                     // then re-attach the already-restored store.
@@ -655,31 +691,21 @@ impl Node {
                     }
                 }
             } else {
-                // No suitable ledger snapshot found for rollback.
+                // No canonical ledger snapshot found at or before the rollback
+                // target.  The early immutable-tip guard above ensures this
+                // branch is only reachable for targets at or beyond the
+                // immutable tip — so the only way to reach here is when all
+                // retained epoch snapshots are on a fork chain (Fix 1 did not
+                // catch it at startup) or when no snapshots exist yet.
                 //
-                // Per Ouroboros, a rollback of more than k=2160 blocks should never
-                // happen in normal operation.  Calling reset_ledger_and_replay() is
-                // dangerous when the UTxO store on disk is from a fork chain — doing
-                // so re-attaches the stale fork store (now fixed in Fix 2) but also
-                // triggers a multi-hour genesis replay that masks the root cause.
-                //
-                // When no canonical snapshot exists before the rollback target, the
-                // most likely cause is that ALL retained epoch snapshots were saved on
-                // a fork chain (RC4 in the cascade analysis).  In this case:
-                //   1. Fix 1 (fork snapshot detection at startup) should have prevented
-                //      the fork snapshot from loading in the first place.
-                //   2. Fix 3 (ImmutableDB tip as intersection candidate) should have
-                //      prevented the 97K-slot rollback from occurring at all.
-                //
-                // If we somehow reach here without a canonical snapshot, warn loudly
-                // and return without corrupting state.  The ChainSync task will
-                // disconnect; on reconnect, the corrected intersection logic (Fix 3)
-                // will negotiate from the ImmutableDB tip instead.
-                //
-                // Note: reset_ledger_and_replay() itself is now safer (Fix 2) but
-                // a full genesis replay is still extremely expensive and masks bugs.
-                // Prefer the "warn and disconnect" path here so the operator can
-                // diagnose the root cause (usually: restart the node to trigger Fix 1).
+                // Auto-recover rather than demand an operator restart.
+                // `reset_ledger_and_replay` is safe post-Fix-2: it drops the
+                // stale (possibly fork) UTxO store, resets in-memory ledger
+                // state, and replays ImmutableDB blocks from genesis up to
+                // `rollback_slot`.  The replay is expensive (minutes-to-hours
+                // on preview) but preserves correctness and needs no operator
+                // intervention.  On completion, a fresh canonical snapshot is
+                // written so subsequent rollbacks take the fast snapshot path.
                 let ledger_slot = self
                     .ledger_state
                     .read()
@@ -692,13 +718,11 @@ impl Node {
                 warn!(
                     rollback_slot,
                     ledger_slot,
-                    "Deep rollback: no canonical snapshot found before rollback target. \
-                     Refusing genesis reset to prevent state corruption. \
-                     This node likely started with a fork snapshot — restart the node \
-                     to trigger fork-snapshot detection and canonical replay. \
-                     ChainSync will disconnect and retry from the ImmutableDB tip."
+                    "Deep rollback: no canonical snapshot available; \
+                     auto-recovering via genesis replay to rollback target \
+                     (this may take several minutes)."
                 );
-                // Do NOT call reset_ledger_and_replay here.
+                self.reset_ledger_and_replay(rollback_slot).await;
                 return;
             }
         }
