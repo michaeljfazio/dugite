@@ -3128,7 +3128,12 @@ impl Node {
                         intersection_slot,
                         intersection_hash,
                     );
-                    self.handle_rollback(&rollback_point).await;
+                    // VolatileDB's selected_chain has already been switched to
+                    // the new fork by ChainSelQueue::switch_chain().  Use the
+                    // ledger-only rollback so we don't truncate selected_chain
+                    // back to the intersection (which would leave the volatile
+                    // tip stuck and cause an O(N) per-block cascade).
+                    self.handle_ledger_rollback(&rollback_point).await;
 
                     // Replay the new fork's blocks from VolatileDB onto the ledger,
                     // matching Haskell's `forkerCommit` behaviour.  The `apply` list
@@ -4426,7 +4431,10 @@ impl Node {
 
                             let rollback_point =
                                 Point::Specific(*intersection_slot, *intersection_hash);
-                            self.handle_rollback(&rollback_point).await;
+                            // VolatileDB already switched to the fork that
+                            // ends with our forged block.  Use the ledger-only
+                            // rollback so we don't undo the switch.
+                            self.handle_ledger_rollback(&rollback_point).await;
 
                             // Replay every block in `apply` EXCEPT the last one
                             // (our forged block). The caller below runs the
