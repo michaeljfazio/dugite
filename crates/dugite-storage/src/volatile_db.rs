@@ -1352,14 +1352,34 @@ impl VolatileDB {
         let tips = self.get_leaf_tips();
         let mut best_chain: Vec<Hash32> = Vec::new();
         let mut best_block_no: u64 = 0;
+        let mut best_tip_hash: Option<Hash32> = None;
         for (tip_hash, _, tip_block_no) in &tips {
-            if *tip_block_no >= best_block_no {
+            // Primary key: highest block_no tip wins (Ouroboros chain selection:
+            // the preferred chain is the one with the most blocks).
+            //
+            // Do NOT compare chain walk lengths as the primary comparator.
+            // A dead fork whose full ancestry is stored in the WAL can appear
+            // "longer" (more ancestry entries) than a canonical chain whose
+            // WAL root block is missing — e.g. when the BP forged a block that
+            // raced with the canonical block_no N, got stored, then the canonical
+            // chain continued at block_no N+1 but its ancestor at N was never
+            // written to the WAL.  Using block_no as the primary key means the
+            // canonical tip at block_no 4_211_461 always beats a stale fork tip
+            // at block_no 4_211_059 regardless of walk depth.
+            //
+            // Tiebreaker (same block_no): prefer deeper walk (more WAL ancestry),
+            // then tip hash for determinism.
+            if *tip_block_no > best_block_no {
+                best_chain = self.walk_chain_back(tip_hash);
+                best_block_no = *tip_block_no;
+                best_tip_hash = Some(*tip_hash);
+            } else if *tip_block_no == best_block_no {
                 let chain = self.walk_chain_back(tip_hash);
                 if chain.len() > best_chain.len()
-                    || (chain.len() == best_chain.len() && *tip_block_no > best_block_no)
+                    || (chain.len() == best_chain.len() && Some(tip_hash) > best_tip_hash.as_ref())
                 {
                     best_chain = chain;
-                    best_block_no = *tip_block_no;
+                    best_tip_hash = Some(*tip_hash);
                 }
             }
         }
@@ -2555,6 +2575,59 @@ mod tests {
         // B is longer: h(1)→h(3)→h(4)→h(5)
         assert_eq!(db.selected_chain_len(), 4);
         assert_eq!(db.get_tip(), Some((400, h(5), 40)));
+    }
+
+    /// Regression test for the BP-forged-fork scenario:
+    ///
+    /// The BP forges a block at block_no N (stored in the WAL with full ancestry
+    /// from an earlier ImmutableDB-anchored chain). The network adopts a competing
+    /// block at the same height N — but its PREDECESSOR (block_no N's canonical
+    /// version) is never written to the WAL. The canonical chain continuation
+    /// (block_no N+1 onward) is stored in the WAL as a disconnected island.
+    ///
+    /// Old bug: `rebuild_selected_chain` compared chain walk *lengths* rather than
+    /// tip *block_no*. The fork chain appeared "longer" (had more WAL ancestors)
+    /// than the canonical chain (whose root was missing), so the fork was
+    /// (non-deterministically) selected. This caused the node to offer the dead
+    /// fork hash as a ChainSync intersection candidate, which blocked recovery.
+    ///
+    /// Fix: use `tip_block_no` as the primary key — highest block_no always wins.
+    #[test]
+    fn test_rebuild_selected_chain_prefers_highest_block_no_over_walk_length() {
+        // Segment A: long chain of historical blocks (h1…h5), all connected.
+        // This simulates blocks that were synced before the fork event.
+        let mut db = VolatileDB::new();
+        db.add_block(h(1), 100, 1, h(0), b"a1".to_vec()); // prev=h(0): ImmDB anchor
+        db.add_block(h(2), 200, 2, h(1), b"a2".to_vec());
+        db.add_block(h(3), 300, 3, h(2), b"a3".to_vec());
+        db.add_block(h(4), 400, 4, h(3), b"a4".to_vec());
+        db.add_block(h(5), 500, 5, h(4), b"a5".to_vec()); // the fork point predecessor
+
+        // Fork block: BP forged at block_no=6, prev=h(5). This extends Segment A.
+        db.add_block(h(6), 510, 6, h(5), b"fork".to_vec());
+
+        // Canonical chain: missing link h(99) at block_no=6 is NOT in the WAL.
+        // The canonical continuation at block_no=7..11 has prev=h(99) as root.
+        // This is the "disconnected island" that the network produced.
+        db.insert_block_internal(h(7), 600, 7, h(99), b"c7".to_vec()); // prev=h(99) NOT in WAL
+        db.add_block(h(8), 700, 8, h(7), b"c8".to_vec());
+        db.add_block(h(9), 800, 9, h(8), b"c9".to_vec());
+        db.add_block(h(10), 900, 10, h(9), b"c10".to_vec());
+        db.add_block(h(11), 1000, 11, h(10), b"c11".to_vec()); // canonical tip, block_no=11
+
+        // After adding in this order:
+        // - selected chain from add_block: h1→h2→h3→h4→h5→h6 (fork, 6 deep)
+        // - h7..h11 don't connect to h6, stored as orphans
+        db.rebuild_selected_chain();
+
+        // Canonical tip (h11, block_no=11) must beat fork tip (h6, block_no=6)
+        // even though the canonical walk-back length is only 5 (h11..h7, stops at h99)
+        // while the fork walk-back is 6 (h6..h1).
+        assert_eq!(
+            db.get_tip(),
+            Some((1000, h(11), 11)),
+            "canonical chain with higher block_no must be selected even with shorter WAL walk"
+        );
     }
 
     // -----------------------------------------------------------------------
