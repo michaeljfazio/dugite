@@ -269,11 +269,11 @@ pub fn check_header_preconditions(
 
 /// A discovered snapshot file together with the ledger slot encoded in its
 /// header (read without full deserialisation where possible).
-struct SnapshotCandidate {
-    path: PathBuf,
+pub(crate) struct SnapshotCandidate {
+    pub(crate) path: PathBuf,
     /// Slot encoded in the snapshot's ledger tip. Used to select the best
     /// snapshot at or below the immutable tip.
-    ledger_slot: u64,
+    pub(crate) ledger_slot: u64,
 }
 
 /// Enumerate all `ledger-snapshot-epoch*.bin` files in `db_path` and return
@@ -282,7 +282,7 @@ struct SnapshotCandidate {
 /// Each candidate requires loading the snapshot to check its exact ledger tip.
 /// We accept this cost during startup — it is bounded by the number of retained
 /// snapshots (≤ 2 by default) and happens only once per start.
-fn enumerate_snapshots(db_path: &Path) -> Vec<SnapshotCandidate> {
+pub(crate) fn enumerate_snapshots(db_path: &Path) -> Vec<SnapshotCandidate> {
     let mut candidates: Vec<SnapshotCandidate> = Vec::new();
 
     let Ok(entries) = std::fs::read_dir(db_path) else {
