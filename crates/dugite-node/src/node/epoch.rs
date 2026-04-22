@@ -303,17 +303,35 @@ impl Node {
 
 // ─── Snapshot canonicality helper ────────────────────────────────────────────
 
-/// Verify that a ledger snapshot tip is on the canonical ImmutableDB chain.
+/// Verify that a ledger snapshot tip is on the canonical ChainDB chain.
 ///
 /// Returns `true` when:
 ///   - `snap_slot` is 0 (origin — always canonical)
 ///   - `chain_db` is `None` (no DB to check against — assume canonical)
-///   - The snapshot slot is beyond the ImmutableDB tip (volatile region —
-///     can't verify until more blocks are finalized; accept provisionally)
-///   - The ImmutableDB has the same hash at `snap_slot` as the snapshot tip
+///   - The snapshot slot is strictly beyond the overall ChainDB tip (ImmutableDB +
+///     VolatileDB selected chain) — genuinely ahead, e.g. after a Mithril import
+///     where the ledger was fast-forwarded ahead of synced blocks
+///   - The canonical chain (ImmutableDB or VolatileDB selected chain) has the
+///     same block hash at `snap_slot`
 ///
-/// Returns `false` when the ImmutableDB has a *different* block at `snap_slot`,
-/// which proves the snapshot tip is on a fork that was never finalized.
+/// Returns `false` when the canonical chain has a *different* block at
+/// `snap_slot` (or no block at that exact slot, meaning it was an empty slot
+/// in the canonical chain and the snapshot block is a fork block).
+///
+/// **Volatile-range fix**: the previous implementation used only the
+/// ImmutableDB tip as the upper bound, provisionally accepting any snapshot
+/// whose slot was above the ImmutableDB tip — including forged-but-not-adopted
+/// blocks that sit in the gap between the ImmutableDB tip and the VolatileDB
+/// canonical tip.  This caused BP forks at epoch boundary (or mid-epoch) to
+/// survive node restart: the forged block's slot was above the ImmutableDB
+/// tip, so the check returned `true` without verifying it against the
+/// VolatileDB selected chain.
+///
+/// Fix: use the overall ChainDB tip (max of ImmutableDB + VolatileDB) as the
+/// provisional-accept boundary.  For slots within the volatile region but
+/// known to ChainDB, `get_block_at_or_after_slot` queries the VolatileDB
+/// *selected chain* (canonical path only, not orphaned forks) and correctly
+/// detects hash mismatches caused by forged-but-rejected blocks.
 ///
 /// Called by `find_best_snapshot_for_rollback` and the startup snapshot loader
 /// to prevent fork snapshots from being used as ledger base states.
@@ -334,25 +352,32 @@ pub(crate) fn is_snapshot_canonical(
         None => return true, // No ChainDB available — skip check
     };
 
-    // Determine the ImmutableDB tip slot.
-    let imm_tip_slot = db
-        .get_immutable_tip()
-        .point
-        .slot()
-        .map(|s| s.0)
-        .unwrap_or(0);
+    // Use the overall ChainDB tip (max of ImmutableDB tip and VolatileDB
+    // selected chain tip) as the accept-provisionally boundary.
+    //
+    // The previous code used only `imm_tip_slot` here, which meant that any
+    // snapshot whose slot was above the ImmutableDB tip (but within the
+    // VolatileDB range) was unconditionally accepted.  That allowed a
+    // forged-but-not-adopted block to survive as a "canonical" snapshot tip
+    // across node restarts, because the forged slot was above the ImmutableDB
+    // tip but the VolatileDB selected chain already had the canonical block.
+    let db_tip_slot = db.get_tip().point.slot().map(|s| s.0).unwrap_or(0);
 
-    if snap_slot > imm_tip_slot {
-        // Snapshot is in the volatile region — cannot verify canonicality
-        // yet, so provisionally accept it.
+    if snap_slot > db_tip_slot {
+        // Snapshot is genuinely ahead of all known ChainDB data.
+        // This is the expected state after a Mithril import — the ledger was
+        // fast-forwarded to a slot for which we have not yet synced blocks.
+        // Accept provisionally; the missing blocks will be fetched from peers.
         return true;
     }
 
-    // Snapshot slot is within the finalized ImmutableDB range.
-    // Check what hash the canonical chain has at this slot.
+    // Snapshot slot is within the range covered by ChainDB (ImmutableDB or
+    // VolatileDB selected chain).  `get_block_at_or_after_slot` queries both
+    // stores, returning only blocks on the VolatileDB *selected* chain —
+    // orphaned/fork blocks are excluded even if they're still in the WAL.
     match db.get_block_at_or_after_slot(dugite_primitives::time::SlotNo(snap_slot)) {
         Ok(Some((found_slot, found_hash, _))) if found_slot.0 == snap_slot => {
-            // Block found at exactly snap_slot — compare hashes.
+            // Canonical chain has a block at exactly snap_slot — compare hashes.
             if found_hash == snap_hash {
                 true
             } else {
@@ -366,10 +391,10 @@ pub(crate) fn is_snapshot_canonical(
             }
         }
         Ok(Some((found_slot, _, _))) => {
-            // ImmutableDB has no block at the exact snapshot slot (empty slot),
-            // but has a block at found_slot > snap_slot.  This means snap_slot
-            // was an empty slot in the canonical chain — a block at snap_slot
-            // would be a fork block.  Treat as non-canonical.
+            // The canonical chain has no block at the exact snapshot slot
+            // (empty slot), but has a block at found_slot > snap_slot.
+            // A canonical empty slot cannot contain a block — any block at
+            // snap_slot must be a fork block.  Treat as non-canonical.
             debug!(
                 snap_slot,
                 found_slot = found_slot.0,
@@ -378,8 +403,9 @@ pub(crate) fn is_snapshot_canonical(
             false
         }
         Ok(None) => {
-            // No blocks at or after snap_slot in ImmutableDB, but snap_slot <=
-            // imm_tip_slot.  This shouldn't normally happen; assume canonical.
+            // No canonical blocks at or after snap_slot, but snap_slot <=
+            // db_tip_slot.  This shouldn't normally happen (implies a gap in
+            // ChainDB); assume canonical to avoid spurious genesis replay.
             true
         }
         Err(_) => {
@@ -569,5 +595,91 @@ mod tests {
 
         let point = Point::Specific(SlotNo(0), Hash32::from_bytes([0u8; 32]));
         assert!(is_snapshot_canonical(0, &point, Some(&chain_db)));
+    }
+
+    /// Regression: BP forges a block at slot S (not adopted by network).
+    ///
+    /// On restart the VolatileDB WAL has the canonical chain continuing ABOVE
+    /// slot S (from a different block at slot S).  The snapshot tip is at slot
+    /// S with the FORK hash.  The forged block's slot is above the ImmutableDB
+    /// tip (imm_tip < S < volatile_tip).
+    ///
+    /// Old bug: `is_snapshot_canonical` returned `true` early because
+    /// `snap_slot > imm_tip_slot` — it never checked the VolatileDB selected
+    /// chain, so the fork snapshot was accepted as canonical.
+    ///
+    /// Fix: use the overall ChainDB tip (max of ImmutableDB + VolatileDB) as
+    /// the provisional-accept boundary.  For slots within the volatile range,
+    /// `get_block_at_or_after_slot` queries only the VolatileDB *selected*
+    /// chain — the fork block (not on selected chain) is correctly rejected.
+    #[test]
+    fn test_is_snapshot_canonical_volatile_fork_detected() {
+        use dugite_primitives::hash::Hash32;
+        use dugite_primitives::time::{BlockNo, SlotNo};
+        use dugite_storage::ChainDB;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let mut chain_db = ChainDB::open(tmp.path()).unwrap();
+
+        // Build a canonical chain in VolatileDB:
+        //   genesis anchor (slot 0, block 0)  ← ImmutableDB tip (empty)
+        //   canonical_100 (slot 100, block 1)
+        //   canonical_200 (slot 200, block 2)   ← volatile tip
+        //
+        // The snapshot claims to be at slot 100 with a DIFFERENT hash
+        // (fork_hash), simulating a block the BP forged that was not adopted.
+        let genesis_hash = Hash32::from_bytes([0u8; 32]);
+        let canonical_100 = Hash32::from_bytes([0x11u8; 32]);
+        let canonical_200 = Hash32::from_bytes([0x22u8; 32]);
+        let fork_hash = Hash32::from_bytes([0xFFu8; 32]); // forged, not in ChainDB
+
+        // Add canonical blocks to VolatileDB.
+        chain_db
+            .add_block(
+                canonical_100,
+                SlotNo(100),
+                BlockNo(1),
+                genesis_hash,
+                b"cbor1".to_vec(),
+            )
+            .unwrap();
+        chain_db
+            .add_block(
+                canonical_200,
+                SlotNo(200),
+                BlockNo(2),
+                canonical_100,
+                b"cbor2".to_vec(),
+            )
+            .unwrap();
+
+        // Sanity: ChainDB tip should now be at slot 200 (volatile).
+        let tip_slot = chain_db.get_tip().point.slot().map(|s| s.0).unwrap_or(0);
+        assert_eq!(tip_slot, 200, "ChainDB tip should be slot 200");
+
+        // ImmutableDB is empty → imm_tip_slot = 0.
+        // snap_slot(100) > imm_tip_slot(0) — OLD code would return true here.
+        // NEW code: snap_slot(100) <= db_tip_slot(200), so we check VolatileDB.
+        let fork_point = Point::Specific(SlotNo(100), fork_hash);
+        assert!(
+            !is_snapshot_canonical(100, &fork_point, Some(&chain_db)),
+            "fork block (not on selected VolatileDB chain) must be rejected"
+        );
+
+        // The canonical block at slot 100 should still be accepted.
+        let canonical_point = Point::Specific(SlotNo(100), canonical_100);
+        assert!(
+            is_snapshot_canonical(100, &canonical_point, Some(&chain_db)),
+            "canonical block at slot 100 must be accepted"
+        );
+
+        // A snapshot ahead of the volatile tip (slot 300) must be accepted
+        // provisionally (no data to verify against).
+        let future_hash = Hash32::from_bytes([0x33u8; 32]);
+        let future_point = Point::Specific(SlotNo(300), future_hash);
+        assert!(
+            is_snapshot_canonical(300, &future_point, Some(&chain_db)),
+            "snapshot ahead of all ChainDB data must be accepted provisionally"
+        );
     }
 }
