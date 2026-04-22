@@ -588,161 +588,194 @@ impl Node {
                     // Mithril ancillary import now provides correct protocol version.
 
                     {
-                        // Validate snapshot tip canonicality.
+                        // ── Snapshot canonicality check ───────────────────────
                         //
                         // A snapshot whose tip is *within the ImmutableDB slot range*
-                        // must match the canonical hash at that slot.  If it does not,
+                        // must match the canonical block at that slot.  If it does not,
                         // the snapshot was saved on a fork chain and must be discarded.
                         //
-                        // Root cause context: Dugite snapshots at the volatile ledger
-                        // tip, which can be a fork block.  Haskell only snapshots at
-                        // the ImmutableDB-confirmed anchor, so fork snapshots cannot
-                        // occur there.  This check aligns our behaviour with Haskell.
+                        // This situation arises when the BP forges a block that is NOT
+                        // adopted by the network.  The forged block enters the VolatileDB
+                        // and the ledger is advanced to it; when a snapshot fires the
+                        // fork tip is persisted.  On the next restart the VolatileDB WAL
+                        // is empty (the fork block was never written to ImmutableDB) so
+                        // `has_block` returns false.  Meanwhile the ImmutableDB canonical
+                        // chain has a different (or absent) block at the fork slot.
                         //
-                        // If the snapshot tip is *ahead* of the ImmutableDB tip (in
-                        // the volatile region), we cannot verify canonicality yet —
-                        // accept it and let the normal startup path handle divergence.
-                        let snapshot_valid = match state.tip.point {
-                            Point::Origin => true,
-                            Point::Specific(snapshot_slot, ref hash) => {
-                                match chain_db.try_read() {
-                                    Ok(db) => {
-                                        let exists = db.has_block(hash);
-                                        if exists {
-                                            // Hash found in ChainDB (volatile or ImmutableDB) — canonical.
-                                            true
-                                        } else {
-                                            let imm_tip = db.get_immutable_tip();
-                                            let imm_tip_slot =
-                                                imm_tip.point.slot().map(|s| s.0).unwrap_or(0);
-                                            let db_tip = db.get_tip();
-                                            let db_tip_slot =
-                                                db_tip.point.slot().map(|s| s.0).unwrap_or(0);
+                        // Haskell's `LedgerDB.Init.initLedgerDB` handles this by
+                        // rolling back the ledger to the youngest snapshot whose tip IS
+                        // on the current chain fragment.  We replicate that behaviour:
+                        //
+                        //   1. Check if the primary snapshot tip is canonical.
+                        //   2. If not, walk older epoch snapshots (newest-first) and
+                        //      pick the first canonical one.
+                        //   3. If none qualify, fall back to genesis + full replay.
+                        //
+                        // The canonicality check is delegated to `epoch::is_snapshot_canonical`
+                        // which correctly handles:
+                        //   - hash present in ChainDB → canonical
+                        //   - hash absent, slot in immutable range, slot occupied by a
+                        //     different block → fork
+                        //   - hash absent, slot in immutable range, slot empty (no block
+                        //     at that exact slot) → fork (BP filled a slot the canonical
+                        //     chain left empty)
+                        //   - slot in volatile range → provisionally accepted
+                        //
+                        // `snapshot_valid = Some(state)` on success, `None` on fork.
 
-                                            if snapshot_slot.0 > db_tip_slot {
-                                                // Snapshot is ahead of ChainDB storage.
-                                                //
-                                                // This legitimately occurs after a Mithril import:
-                                                // the Haskell ExtLedgerState from the ancillary
-                                                // archive is at the snapshot epoch boundary which
-                                                // can be a few blocks ahead of the last complete
-                                                // immutable chunk.  The missing blocks will be
-                                                // fetched from peers on first sync.
-                                                //
-                                                // A crash-before-ChainDB-persist scenario cannot
-                                                // produce snapshot > ChainDB because the invariant
-                                                // is ChainDB write → ledger apply → snapshot save.
-                                                // So we always accept this case.
-                                                warn!(
-                                                    "Ledger snapshot is ahead of ChainDB \
-                                                     (snapshot={}, chaindb={}); this is expected \
-                                                     after a Mithril import — accepting snapshot, \
-                                                     missing blocks will be fetched from peers",
-                                                    state.tip, db_tip,
-                                                );
-                                                true
-                                            } else if snapshot_slot.0 <= imm_tip_slot {
-                                                // Snapshot slot is within the finalized ImmutableDB
-                                                // range, but the hash is not in ChainDB.  This means
-                                                // the snapshot tip is on a fork chain that was never
-                                                // written to the ImmutableDB canonical chain.
-                                                //
-                                                // Verify by checking what hash the ImmutableDB
-                                                // actually has at this slot.  If it differs, the
-                                                // snapshot is a fork snapshot and must be rejected
-                                                // to prevent replay with a corrupted base state.
-                                                let canonical_at_slot = db
-                                                    .get_immutable_tip_point()
-                                                    .and_then(|p| match p {
-                                                        Point::Specific(s, h)
-                                                            if s.0 == snapshot_slot.0 =>
-                                                        {
-                                                            Some(h)
-                                                        }
-                                                        _ => None,
-                                                    });
-                                                let is_fork = match canonical_at_slot {
-                                                    Some(canonical_hash) => canonical_hash != *hash,
-                                                    // Can't verify exact slot — use block-at-or-after
-                                                    None => {
-                                                        match db.get_block_at_or_after_slot(
-                                                            snapshot_slot,
-                                                        ) {
-                                                            Ok(Some((
-                                                                found_slot,
-                                                                found_hash,
-                                                                _,
-                                                            ))) if found_slot.0
-                                                                == snapshot_slot.0 =>
-                                                            {
-                                                                found_hash != *hash
-                                                            }
-                                                            // No block at that slot (empty slot or
-                                                            // slot beyond what can be verified) —
-                                                            // can't confirm fork, accept with warning.
-                                                            _ => false,
-                                                        }
+                        // Fast path: if ChainDB has the block the check is free.
+                        let snapshot_state: Option<LedgerState> = {
+                            let db_guard = chain_db.try_read();
+                            let db: Option<&dugite_storage::ChainDB> = match db_guard.as_ref() {
+                                Ok(db) => Some(&**db),
+                                Err(_) => {
+                                    warn!("Could not acquire ChainDB lock for snapshot validation, assuming valid");
+                                    None
+                                }
+                            };
+
+                            let snap_slot = state.tip.point.slot().map(|s| s.0).unwrap_or(0);
+                            let db_tip_slot = db
+                                .map(|db| db.get_tip().point.slot().map(|s| s.0).unwrap_or(0))
+                                .unwrap_or(0);
+
+                            // Special-case: snapshot is AHEAD of ChainDB (Mithril import).
+                            // The missing blocks will be fetched from peers; accept as-is.
+                            let ahead_of_chaindb = snap_slot > db_tip_slot && db_tip_slot > 0;
+                            if ahead_of_chaindb {
+                                let db_tip_display =
+                                    db.map(|db| db.get_tip().to_string()).unwrap_or_default();
+                                warn!(
+                                    "Ledger snapshot is ahead of ChainDB \
+                                     (snapshot={}, chaindb={}); this is expected \
+                                     after a Mithril import — accepting snapshot, \
+                                     missing blocks will be fetched from peers",
+                                    state.tip, db_tip_display,
+                                );
+                                Some(state)
+                            } else if epoch::is_snapshot_canonical(snap_slot, &state.tip.point, db)
+                            {
+                                // Primary snapshot is on the canonical chain — use it.
+                                Some(state)
+                            } else {
+                                // Primary snapshot is on a fork.
+                                //
+                                // Walk all epoch snapshots (newest → oldest) and find
+                                // the most recent one that IS on the canonical chain.
+                                // This matches Haskell's `LedgerDB.Init.initLedgerDB`
+                                // which rolls back to the youngest on-chain snapshot.
+                                warn!(
+                                    snapshot_slot = snap_slot,
+                                    fork_hash = %state.tip.point.hash().map(|h| h.to_hex()).unwrap_or_default(),
+                                    "Ledger snapshot tip is on a dead fork — rolling back to \
+                                     the most recent canonical snapshot (Haskell: initLedgerDB)"
+                                );
+                                let db_path = &args.database_path;
+                                let mut recovered: Option<LedgerState> = None;
+                                let candidates = crate::startup::enumerate_snapshots(db_path);
+                                for candidate in &candidates {
+                                    // Skip the primary snapshot (already known fork).
+                                    if candidate.ledger_slot == snap_slot {
+                                        continue;
+                                    }
+                                    match LedgerState::load_snapshot(&candidate.path) {
+                                        Ok(mut alt) => {
+                                            let alt_slot =
+                                                alt.tip.point.slot().map(|s| s.0).unwrap_or(0);
+                                            if epoch::is_snapshot_canonical(
+                                                alt_slot,
+                                                &alt.tip.point,
+                                                db,
+                                            ) {
+                                                // Apply the same genesis-config fixups that were
+                                                // applied to the primary snapshot above, so the
+                                                // recovered state has correct epoch_length, slot
+                                                // config, shelley transition, and genesis_hash.
+                                                if let Some(ref genesis) = shelley_genesis {
+                                                    alt.set_epoch_length(
+                                                        genesis.epoch_length,
+                                                        genesis.security_param,
+                                                    );
+                                                    alt.set_slot_config(genesis.slot_config());
+                                                    alt.set_update_quorum(genesis.update_quorum);
+                                                    let gen_deleg_entries =
+                                                        genesis.gen_delegs_entries();
+                                                    if !gen_deleg_entries.is_empty() {
+                                                        alt.set_genesis_delegates(
+                                                            &gen_deleg_entries,
+                                                        );
                                                     }
-                                                };
-
-                                                if is_fork {
-                                                    warn!(
-                                                        snapshot_slot = snapshot_slot.0,
-                                                        imm_tip_slot,
-                                                        "Ledger snapshot tip is on a fork (hash not \
-                                                         in canonical ImmutableDB chain at slot {}). \
-                                                         Discarding fork snapshot to prevent UTxO \
-                                                         corruption — will replay from genesis.",
-                                                        snapshot_slot.0,
-                                                    );
-                                                    false
-                                                } else {
-                                                    // Hash mismatch but can't confirm fork — could be
-                                                    // hash computation difference (pallas vs cardano-node).
-                                                    // Accept and let the chunk replay handle the gap.
-                                                    warn!(
-                                                        "Ledger snapshot hash not found in ChainDB \
-                                                         but slot {} <= ImmutableDB tip {} — \
-                                                         accepting snapshot (hash mismatch may be \
-                                                         due to hash computation difference)",
-                                                        snapshot_slot.0, imm_tip_slot,
-                                                    );
-                                                    true
                                                 }
-                                            } else {
-                                                // snapshot_slot is in the volatile range (between
-                                                // imm_tip and db_tip).  Hash is not in VolatileDB
-                                                // (WAL may have been empty on restart).  Accept —
-                                                // the chunk replay will catch up to the correct point.
-                                                debug!(
-                                                    snapshot_slot = snapshot_slot.0,
-                                                    imm_tip_slot,
-                                                    db_tip_slot,
-                                                    "Snapshot tip in volatile range, hash not in WAL \
-                                                     — accepting (will replay from chunk files)"
+                                                let ste = epoch::shelley_transition_epoch_for_magic(
+                                                    network_magic,
                                                 );
-                                                true
+                                                alt.set_shelley_transition(ste, byron_epoch_length);
+                                                if let Some(hash) = shelley_genesis_hash {
+                                                    alt.genesis_hash = hash;
+                                                }
+                                                if alt.tip.point != Point::Origin {
+                                                    let tip_slot = alt
+                                                        .tip
+                                                        .point
+                                                        .slot()
+                                                        .map(|s| s.0)
+                                                        .unwrap_or(0);
+                                                    let correct_epoch = alt.epoch_of_slot(tip_slot);
+                                                    if correct_epoch != alt.epoch.0 {
+                                                        alt.epoch =
+                                                            dugite_primitives::time::EpochNo(
+                                                                correct_epoch,
+                                                            );
+                                                    }
+                                                }
+                                                info!(
+                                                    recovered_slot = alt_slot,
+                                                    recovered_tip = %alt.tip,
+                                                    "Ledger fork-rollback: recovered from \
+                                                     canonical snapshot at slot {}",
+                                                    alt_slot,
+                                                );
+                                                recovered = Some(alt);
+                                                break;
+                                            } else {
+                                                warn!(
+                                                    candidate_slot = candidate.ledger_slot,
+                                                    "Fork-rollback candidate is also on a fork — skipping"
+                                                );
                                             }
                                         }
-                                    }
-                                    Err(_) => {
-                                        warn!("Could not acquire ChainDB lock for snapshot validation, assuming valid");
-                                        true
+                                        Err(e) => {
+                                            warn!(
+                                                path = %candidate.path.display(),
+                                                "Fork-rollback: failed to load candidate snapshot: {e}"
+                                            );
+                                        }
                                     }
                                 }
+                                if recovered.is_none() {
+                                    error!(
+                                        "Fork-rollback: no canonical snapshot found in {}. \
+                                         All snapshots are on forks. \
+                                         The node will replay from genesis — this will be slow. \
+                                         To avoid this in future runs, delete the database and \
+                                         re-import via `dugite-node mithril-import`.",
+                                        db_path.display()
+                                    );
+                                }
+                                recovered
                             }
                         };
 
-                        if snapshot_valid {
+                        if let Some(recovered) = snapshot_state {
                             info!(
-                                epoch = state.epoch.0,
-                                utxos = state.utxo.utxo_set.len(),
-                                tip = %state.tip,
+                                epoch = recovered.epoch.0,
+                                utxos = recovered.utxo.utxo_set.len(),
+                                tip = %recovered.tip,
                                 "Ledger restored from snapshot",
                             );
-                            state
+                            recovered
                         } else {
-                            warn!("Discarding stale ledger snapshot, will replay from ChainDB");
+                            warn!("No canonical snapshot found — replaying from genesis");
                             Self::init_fresh_ledger(
                                 &protocol_params,
                                 shelley_genesis.as_ref(),
@@ -752,7 +785,7 @@ impl Node {
                                 byron_epoch_length,
                             )
                         }
-                    } // end else (snapshot not stale)
+                    } // end canonicality check
                 }
                 Err(e) => {
                     warn!("Failed to load ledger snapshot, starting fresh: {e}");
