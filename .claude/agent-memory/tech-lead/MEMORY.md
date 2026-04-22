@@ -1,7 +1,9 @@
 # Tech Lead Agent Memory
 
 ## Critical Invariants & Bug Patterns
+- [ChainSync at_tip rollback stall](chainsync-at-tip-rollback-stall.md) — at_tip not reset on MsgRollBackward → pipeline freeze → bearer closed; fix: at_tip=false in MsgRollBackward arm (5abaf2687)
 - [Fork snapshot stall cascade](fork-snapshot-stall-fix.md) — 6-bug cascade: fork snapshot → bad intersection → deep rollback → UTxO corruption; all fixed (1ff9cbce)
+- [Live-tip fork stall fix](node-fork-stall-fix.md) — TriggeredFork doesn't apply blocks + MsgRollBackward not propagated + LSM lock; 3 commits (85f1d53, 040cb13, c364c59)
 - [Cascade failure invariant](ledger-cascade-failure-invariant.md) — Never hard-return on confirmed blocks; log+self-correct for ledger-state-divergence checks
 - [Forge body size bug](forge-body-size-bug.md) — body_size miscalculation + epoch nonce not updated + KES expiry off-by-one
 - [RUPD snapshot position fix](ledger-rupd-snapshot-fix.md) — Use `set` snapshot (not `go`) in calculate_rewards(); stale treasury diagnostics
@@ -43,6 +45,8 @@
 ## Storage
 - [LSM perf baselines](storage-lsm-perf-baselines.md) — Mainnet-scale test runtimes on M-series (1M insert ~25s, total ~27.5s)
 - [Large tests feature](storage-large-tests-feature.md) — Feature flag design, key/value sizing, deterministic PRNG
+- [ImmutableDB stale fork repair](storage-immutabledb-fork-repair.md) — Delete stale chunk files + rewrite tip.meta (48-byte BE: slot/hash/block_no) to fix gap-bridge loop after fork flush
+- [Fork snapshot recovery (2026-04-22)](node-fork-snapshot-recovery.md) — BP forged un-adopted block → volatile-range snapshot on fork → replay stuck; fix in replay_from_lsm (ff8f43e44)
 
 ## Serialization
 - [Serialization test coverage](crypto-serialization-tests.md) — 133 tests, public API patterns, PPU extraction for integration tests
