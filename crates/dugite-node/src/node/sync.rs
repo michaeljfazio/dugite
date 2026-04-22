@@ -2295,6 +2295,188 @@ impl Node {
         let mut last_log = std::time::Instant::now();
         let snapshot_path = self.database_path.join("ledger-snapshot.bin");
 
+        // ── Fork-snapshot detection and recovery ──────────────────────────
+        //
+        // The ledger snapshot loaded at startup may be on a dead fork.  This
+        // happens when the BP forged a block (which entered VolatileDB and
+        // triggered a snapshot) but the network did NOT adopt the block.  On
+        // the next restart:
+        //   - The forged block is no longer in VolatileDB (WAL empty).
+        //   - The snapshot tip is in the "volatile region" (above ImmutableDB tip),
+        //     so the startup canonicality check provisionally accepts it.
+        //   - When replay tries to apply the NEXT canonical block, it fails with
+        //     "does not connect to tip: expected <fork_hash>, got <canonical_hash>".
+        //
+        // Haskell's `LedgerDB.Init.initLedgerDB` handles this by rolling back to
+        // the youngest snapshot whose tip IS on the current chain fragment.  We
+        // replicate that: BEFORE starting the replay loop, check if the ledger's
+        // current tip hash is the expected predecessor of the next canonical block
+        // in ChainDB.  If not, roll back to the best canonical snapshot and update
+        // start_slot accordingly.
+        //
+        // The check is: look up the canonical block at or after start_slot.  Its
+        // prev_hash should equal the ledger's current tip hash.  If it doesn't,
+        // the ledger is on a fork and we must roll back.
+        let ledger_on_fork = {
+            let ls = self.ledger_state.read().await;
+            let ledger_tip_hash = ls.tip.point.hash().copied();
+            let ledger_tip_slot = ls.tip.point.slot().map(|s| s.0).unwrap_or(0);
+            drop(ls);
+
+            if ledger_tip_slot == 0 {
+                // At genesis — always canonical, no check needed.
+                false
+            } else {
+                let db = self.chain_db.read().await;
+                let next_block =
+                    db.get_next_block_after_slot(dugite_primitives::time::SlotNo(ledger_tip_slot));
+                drop(db);
+
+                match (next_block, ledger_tip_hash) {
+                    (Ok(Some((_slot, _hash, cbor))), Some(expected_prev)) => {
+                        // Decode just enough to get prev_hash.
+                        match dugite_serialization::multi_era::decode_block_minimal_with_byron_epoch_length(
+                            &cbor,
+                            self.byron_epoch_length,
+                        ) {
+                            Ok(block) => {
+                                let actual_prev = *block.prev_hash();
+                                if actual_prev != expected_prev {
+                                    warn!(
+                                        ledger_tip_slot,
+                                        ledger_tip_hash = %expected_prev.to_hex(),
+                                        next_block_prev_hash = %actual_prev.to_hex(),
+                                        "LSM replay: ledger is on a dead fork — \
+                                         rolling back to last canonical snapshot \
+                                         (Haskell: initLedgerDB)"
+                                    );
+                                    true
+                                } else {
+                                    false
+                                }
+                            }
+                            Err(_) => false, // Can't decode; proceed and let apply_block handle it
+                        }
+                    }
+                    _ => false, // No next block or no ledger tip hash — can't detect fork
+                }
+            }
+        };
+
+        if ledger_on_fork {
+            // Roll back to the last canonical snapshot.  Use the existing
+            // `find_best_snapshot_for_rollback` path (same as handle_rollback)
+            // which correctly verifies canonicality before selecting a snapshot.
+            let ledger_tip_slot = {
+                self.ledger_state
+                    .read()
+                    .await
+                    .tip
+                    .point
+                    .slot()
+                    .map(|s| s.0)
+                    .unwrap_or(0)
+            };
+            // Pass `ledger_tip_slot - 1` as the rollback target so that the
+            // fork snapshot itself (at ledger_tip_slot) is excluded by the
+            // `snap_slot <= rollback_slot` filter in find_best_snapshot_for_rollback.
+            // This guarantees we pick an *earlier* snapshot whose slot is strictly
+            // before the fork point.  Any such snapshot is either in the ImmutableDB
+            // range (definitely canonical) or it too will fail the canonicality
+            // check and be skipped.
+            let rollback_target = ledger_tip_slot.saturating_sub(1);
+            let best_snapshot = {
+                let db = self.chain_db.read().await;
+                self.find_best_snapshot_for_rollback(rollback_target, Some(&*db))
+            };
+
+            match best_snapshot {
+                Some(snapshot_path_local) => {
+                    match dugite_ledger::LedgerState::load_snapshot(&snapshot_path_local) {
+                        Ok(snapshot_state) => {
+                            let snapshot_slot =
+                                snapshot_state.tip.point.slot().map(|s| s.0).unwrap_or(0);
+
+                            // Restore UTxO store from the matching LSM snapshot.
+                            let utxo_store_path = self.database_path.join("utxo-store");
+                            let mut ls = self.ledger_state.write().await;
+                            let has_store =
+                                utxo_store_path.exists() && ls.utxo.utxo_set.has_store();
+                            if has_store {
+                                match ls
+                                    .utxo
+                                    .utxo_set
+                                    .store_mut()
+                                    .unwrap()
+                                    .restore_from_snapshot("ledger")
+                                {
+                                    Ok(()) => {
+                                        ls.utxo.utxo_set.store_mut().unwrap().count_entries();
+                                        ls.utxo
+                                            .utxo_set
+                                            .store_mut()
+                                            .unwrap()
+                                            .set_indexing_enabled(true);
+                                        ls.utxo
+                                            .utxo_set
+                                            .store_mut()
+                                            .unwrap()
+                                            .rebuild_address_index();
+                                        let utxos = ls.utxo.utxo_set.store().unwrap().len();
+                                        let store = ls.utxo.utxo_set.detach_store().unwrap();
+                                        *ls = snapshot_state;
+                                        ls.attach_utxo_store(store);
+                                        info!(
+                                            fork_slot = ledger_tip_slot,
+                                            recovered_slot = snapshot_slot,
+                                            utxos,
+                                            "LSM replay: fork-rollback complete, \
+                                             UTxO store restored from LSM snapshot"
+                                        );
+                                    }
+                                    Err(e) => {
+                                        warn!(
+                                            "LSM replay: UTxO restore_from_snapshot failed \
+                                             during fork-rollback: {e} — using in-memory state"
+                                        );
+                                        let _ = ls.utxo.utxo_set.detach_store();
+                                        *ls = snapshot_state;
+                                        info!(
+                                            fork_slot = ledger_tip_slot,
+                                            recovered_slot = snapshot_slot,
+                                            "LSM replay: fork-rollback complete (in-memory)"
+                                        );
+                                    }
+                                }
+                            } else {
+                                let _ = ls.utxo.utxo_set.detach_store();
+                                *ls = snapshot_state;
+                                info!(
+                                    fork_slot = ledger_tip_slot,
+                                    recovered_slot = snapshot_slot,
+                                    "LSM replay: fork-rollback complete (no LSM store)"
+                                );
+                            }
+                        }
+                        Err(e) => {
+                            error!(
+                                "LSM replay: fork-rollback failed to load snapshot: {e}. \
+                                 Replay will likely fail. \
+                                 Consider deleting the database and re-importing via mithril-import."
+                            );
+                        }
+                    }
+                }
+                None => {
+                    error!(
+                        "LSM replay: ledger is on a dead fork but no canonical snapshot found. \
+                         Replay will likely fail with hash-mismatch errors. \
+                         Consider deleting the database and re-importing via mithril-import."
+                    );
+                }
+            }
+        }
+
         // Determine the slot range to replay: from the current ledger tip to
         // the ChainDB tip.  Use slots rather than block numbers — block numbers
         // are only indexed in the VolatileDB (which is empty after restart),
