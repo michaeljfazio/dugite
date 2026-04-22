@@ -30,7 +30,7 @@ use std::time::{Duration, Instant};
 use tokio::signal;
 use tokio::sync::{mpsc, watch, RwLock};
 use tokio::task::JoinHandle;
-use tracing::{debug, error, info, warn};
+use tracing::{debug, error, info, trace, warn};
 
 use crate::node::block_fetch_logic::BlockFetchLogicTask;
 use crate::node::connection_lifecycle::{
@@ -2585,130 +2585,55 @@ impl Node {
         let mut forge_ticker = tokio::time::interval(Duration::from_secs(1));
         forge_ticker.tick().await; // skip first immediate tick
 
-        // Buffer for out-of-order blocks, keyed by prev_hash.
-        // When a block is applied, we check the buffer for the next block
-        // that connects to the new tip.
-        let mut pending_blocks: std::collections::HashMap<
-            dugite_primitives::hash::Hash32,
-            FetchedBlock,
-        > = std::collections::HashMap::new();
-
         info!("Main run loop entered");
         loop {
             tokio::select! {
                 // ── Process fetched blocks from BlockFetch workers ───────
                 //
-                // Blocks may arrive out of order from multiple peers.
-                // We attempt to apply each block directly; if it doesn't
-                // connect to the ledger tip, we buffer it. After each
-                // successful apply, we drain buffered blocks that now connect.
+                // Every fetched block is unconditionally routed to
+                // `apply_fetched_block`, which submits it to the
+                // `ChainSelQueue`.  The queue handles:
+                //   • Duplicate filtering (`AlreadyKnown` on hash match)
+                //   • Storing fork / orphan blocks in VolatileDB
+                //   • Running chain selection on every add, so a
+                //     competing fork triggers `TriggeredFork` once its
+                //     density exceeds the selected chain's.
+                //   • Driving the ledger rollback + replay for that fork
+                //
+                // Previously this loop gated on `block_no > tip.block_no`
+                // and on `prev_hash == tip.hash`, then buffered orphans
+                // in a local `pending_blocks` HashMap.  Both gates were
+                // unsound: the block_no guard silently dropped legitimate
+                // fork blocks whose number equalled our tip, and the
+                // hash gate prevented ChainSelQueue from ever seeing
+                // out-of-order fork blocks — so the fork's density
+                // could never be evaluated.  That combination produced
+                // permanent live-tip stalls after any competing-fork
+                // announcement (BlockFetch cycles every peer for the
+                // same slot, no Chain extended fires).
+                //
+                // This matches Haskell `ChainDB.addBlock`: every block
+                // reaches ChainDB unconditionally; chain selection owns
+                // all routing decisions.
                 Some(fetched) = fetched_blocks_rx.recv() => {
-                    // Skip blocks the ledger has already processed.
-                    // This happens when ChainDB is behind the ledger
-                    // (e.g. after snapshot restore) and ChainSync re-sends
-                    // old blocks from the ChainDB intersection.
-                    {
-                        let ls = self.ledger_state.read().await;
-                        if fetched.block.block_number().0 <= ls.tip.block_number.0 {
-                            continue;
-                        }
-                    }
-                    let prev_hash = *fetched.block.prev_hash();
-                    let block_hash = *fetched.block.hash();
-                    debug!(
-                        slot = fetched.block.slot().0,
-                        block = fetched.block.block_number().0,
-                        peer = %fetched.peer,
-                        prev_hash = %prev_hash.to_hex(),
-                        "Run loop: received fetched block",
-                    );
-                    let connects = {
-                        let ls = self.ledger_state.read().await;
-                        let tip_hash = ls.tip.point.hash().cloned();
-                        let tip_block = ls.tip.block_number.0;
-                        let block_no = fetched.block.block_number().0;
-
-                        let hash_connects = match tip_hash.as_ref() {
-                            Some(tip_hash) => prev_hash == *tip_hash,
-                            None => true,
-                        };
-
-                        // If hash doesn't match but block number is the immediate
-                        // successor, accept it. This handles the case where the
-                        // ledger tip hash was computed from chunk file replay
-                        // bytes that differ from BlockFetch wire format bytes
-                        // (same block, different CBOR serialization → different
-                        // header hash). Once the first network block is applied,
-                        // subsequent blocks connect normally via hash.
-                        let seq_connects = !hash_connects && block_no == tip_block + 1;
-
-                        if seq_connects {
-                            debug!(
-                                block_no,
-                                tip_block,
-                                "Block connects by sequence number (hash mismatch — \
-                                 likely replay vs network serialization difference)",
-                            );
-                        }
-
-                        hash_connects || seq_connects
-                    };
-
-                    if connects {
-                        debug!(slot = fetched.block.slot().0, "RUN LOOP: block connects, applying to ledger");
-                        self.apply_fetched_block(fetched).await;
-                        // Drain buffered blocks that now connect.
-                        let mut current_hash = block_hash;
-                        while let Some(next) = pending_blocks.remove(&current_hash) {
-                            let next_hash = *next.block.hash();
-                            self.apply_fetched_block(next).await;
-                            current_hash = next_hash;
-                        }
-                    } else {
-                        // Buffer for later — store keyed by prev_hash
-                        // so we can find the next block when the tip advances.
-                        debug!(
-                            slot = fetched.block.slot().0,
-                            block = fetched.block.block_number().0,
-                            prev_hash = %prev_hash.to_hex(),
-                            pending_count = pending_blocks.len(),
-                            "Run loop: block does NOT connect, buffering",
-                        );
-                        pending_blocks.insert(prev_hash, fetched);
-                    }
-
-                    // Prune stale entries (blocks far behind ledger tip).
-                    if pending_blocks.len() > 10_000 {
-                        let tip_slot = self.ledger_state.read().await
-                            .tip.point.slot().map(|s| s.0).unwrap_or(0);
-                        pending_blocks.retain(|_, fb| fb.block.slot().0 > tip_slot.saturating_sub(1000));
-                    }
+                    self.apply_fetched_block(fetched).await;
                 }
 
                 // ── Rollback events from ChainSync client tasks ──────────
                 //
-                // When a peer sends MsgRollBackward, its ChainSync task
-                // forwards the rollback point here.  handle_rollback() is
-                // idempotent: duplicate events from multiple peers for the
-                // same slot are no-ops.
-                //
-                // After rolling the ledger back, the pending_blocks buffer is
-                // cleared of any entries that are no longer valid: buffered
-                // blocks whose prev_hash was on the old chain will never
-                // connect to the new tip.  They will be re-fetched by the
-                // BlockFetch decision task once ChainSync sends the new
-                // fork's headers.
+                // Legacy path: this channel used to receive peer
+                // MsgRollBackward events and call `handle_rollback` to
+                // regress the global ledger.  That was replaced by
+                // ChainSelQueue::TriggeredFork (see sync.rs) which now
+                // owns the rollback decision.  Leave the handler in
+                // place as a safety net — it is effectively dead today
+                // since nothing sends to `rollback_event_tx`, but an
+                // operator-initiated or future-plumbed sender would
+                // still be handled correctly here.
                 Some(rollback_point) = rollback_event_rx.recv() => {
                     let rb_slot = rollback_point.slot().map(|s| s.0).unwrap_or(0);
-                    debug!(rollback_slot = rb_slot, "Run loop: processing rollback event from ChainSync");
+                    debug!(rollback_slot = rb_slot, "Run loop: processing rollback event");
                     self.handle_rollback(&rollback_point).await;
-                    // Clear buffered blocks from the old fork; they cannot
-                    // connect to the new ledger tip after rollback.
-                    pending_blocks.clear();
-                    // After gap-bridging inside handle_rollback the ledger
-                    // tip may be anywhere from the rollback point up to the
-                    // ImmutableDB tip.  Log the resulting state so operators
-                    // can track fork-switch progress.
                     let new_slot = self.ledger_state.read().await
                         .tip.point.slot().map(|s| s.0).unwrap_or(0);
                     debug!(
@@ -3067,10 +2992,12 @@ impl Node {
         let block_number = block.block_number();
         let block_hash = *block.hash();
 
-        debug!(
+        trace!(
             peer = %fetched.peer,
             slot = block_slot.0,
             block = block_number.0,
+            hash = %block_hash.to_hex(),
+            prev = %block.prev_hash().to_hex(),
             "Applying fetched block",
         );
 

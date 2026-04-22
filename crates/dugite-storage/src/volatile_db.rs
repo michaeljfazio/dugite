@@ -1201,19 +1201,23 @@ impl VolatileDB {
     /// Returns a `SwitchPlan` with blocks to rollback/apply.
     ///
     /// Haskell invariant (from `ouroboros-consensus` `ChainSel.hs` and
-    /// `Paths.hs::isReachable`): a fork is only "reachable" if its common
-    /// ancestor with the current chain is WITHIN the VolatileDB.  If
-    /// `isReachable` returns `Nothing`, the block is stored but chain selection
-    /// does NOT attempt the switch — it emits `StoreButDontChange`.  Dugite
-    /// mirrors this: when the intersection cannot be located within the volatile
-    /// window (i.e. no common ancestor exists between `new_chain` and the
-    /// currently-selected chain that is also present in `self.blocks`), we
-    /// return `None` rather than inventing an anchor from `prev_hash` — doing
-    /// so would ask the ledger to roll back past the immutable tip, which
-    /// Haskell's `validateCandidate` explicitly declares impossible (`line
-    /// ~1273`: "impossible: we asked the LedgerDB to roll back past the
-    /// immutable tip…").
-    pub fn switch_chain(&mut self, new_tip_hash: &Hash32) -> Option<SwitchPlan> {
+    /// `Paths.hs::isReachable`): a fork is "reachable" when its ancestry
+    /// intersects either the current selected chain OR the current chain's
+    /// anchor (== immutable tip).  The `AF.Empty anchor` match in
+    /// `isReachable::go` handles the second case: when the walk through
+    /// VolatileDB reaches a block whose `prev_hash` is not in the VolatileDB
+    /// and that `prev_hash` matches the immutable-tip hash, the fork shares
+    /// the immutable tip as a common ancestor and a full-volatile rollback
+    /// (of up to `k` blocks) is allowed.
+    ///
+    /// `immutable_anchor` = `(hash, slot)` of the current ImmutableDB tip, or
+    /// `None` if the ImmutableDB is empty.  When `None`, only VolatileDB
+    /// intersections count.
+    pub fn switch_chain(
+        &mut self,
+        new_tip_hash: &Hash32,
+        immutable_anchor: Option<(Hash32, u64)>,
+    ) -> Option<SwitchPlan> {
         let new_chain = self.walk_chain_back(new_tip_hash);
         if new_chain.is_empty() {
             return None;
@@ -1254,20 +1258,54 @@ impl VolatileDB {
                 (intersection_hash, intersection_slot, rollback, apply)
             }
             None => {
-                // No block of the new chain appears anywhere in our selected
-                // chain.  Per Haskell `isReachable`, this means the fork is
-                // unreachable from our volatile window — the block is stored
-                // but chain selection does NOT switch.  Returning None leaves
-                // `self.selected_chain` untouched; the block sits inert in
-                // VolatileDB until (if ever) its ancestry becomes complete.
-                debug!(
-                    new_tip = %new_tip_hash,
-                    selected_len = self.selected_chain.len(),
-                    new_chain_len = new_chain.len(),
-                    "VolatileDB: fork unreachable from current selected_chain — \
-                     store but don't change (Haskell: isReachable = Nothing)"
-                );
-                return None;
+                // No volatile block of the new chain appears in our selected
+                // chain.  Per Haskell `isReachable` (`Paths.hs`), the fork
+                // may still be reachable if its ancestry terminates at the
+                // *immutable tip* — i.e., the oldest volatile block on the
+                // fork has a `prev_hash` equal to the immutable-tip hash.
+                // This is the `AF.Empty anchor` match in Haskell: the
+                // volatile fragment is fully consumed and the reverse walk's
+                // stopping hash matches the anchor (immutable tip).  In that
+                // case, the common ancestor IS the immutable tip, rollback
+                // is the entire selected_chain (≤ k by construction), and
+                // apply is the entire new_chain.
+                let new_root_prev = new_chain
+                    .first()
+                    .and_then(|h| self.blocks.get(h))
+                    .map(|b| b.prev_hash);
+                match (immutable_anchor, new_root_prev) {
+                    (Some((anchor_hash, anchor_slot)), Some(prev)) if anchor_hash == prev => {
+                        let rollback: Vec<Hash32> =
+                            self.selected_chain.iter().rev().copied().collect();
+                        let apply: Vec<Hash32> = new_chain.clone();
+                        debug!(
+                            new_tip = %new_tip_hash,
+                            anchor = %anchor_hash,
+                            anchor_slot,
+                            rollback_count = rollback.len(),
+                            apply_count = apply.len(),
+                            "VolatileDB: fork anchors at immutable tip — \
+                             switching via full-volatile rollback"
+                        );
+                        (anchor_hash, anchor_slot, rollback, apply)
+                    }
+                    _ => {
+                        // Truly unreachable: the fork's ancestry does not connect
+                        // to our current volatile chain or its anchor.  Leave
+                        // `selected_chain` untouched; the block stays in
+                        // VolatileDB inert.
+                        debug!(
+                            new_tip = %new_tip_hash,
+                            selected_len = self.selected_chain.len(),
+                            new_chain_len = new_chain.len(),
+                            new_root_prev = ?new_root_prev,
+                            immutable_anchor = ?immutable_anchor.map(|(h, _)| h),
+                            "VolatileDB: fork unreachable — no common anchor \
+                             (Haskell: isReachable = Nothing)"
+                        );
+                        return None;
+                    }
+                }
             }
         };
 
@@ -2309,7 +2347,7 @@ mod tests {
         db.add_block(h(6), 400, 40, h(5), b"b6".to_vec());
 
         // Switch to the longer fork.
-        db.switch_chain(&h(6));
+        db.switch_chain(&h(6), None);
 
         // After the switch, selected_chain = [h1, h4, h5, h6].
         // h3 has no successors and is NOT on selected_chain → fork tip.
@@ -2347,7 +2385,7 @@ mod tests {
         db.add_block(h(6), 400, 40, h(5), b"b6".to_vec());
 
         assert_eq!(db.get_tip(), Some((300, h(3), 30)));
-        let plan = db.switch_chain(&h(6)).unwrap();
+        let plan = db.switch_chain(&h(6), None).unwrap();
         assert_eq!(plan.intersection, h(1));
         assert_eq!(plan.rollback, vec![h(3), h(2)]);
         assert_eq!(plan.apply, vec![h(4), h(5), h(6)]);
@@ -2380,7 +2418,7 @@ mod tests {
         db.add_block(h(99), 400, 40, h(98), b"detached1".to_vec());
         db.add_block(h(100), 500, 50, h(99), b"detached2".to_vec());
 
-        let plan = db.switch_chain(&h(100));
+        let plan = db.switch_chain(&h(100), None);
         assert!(
             plan.is_none(),
             "switch_chain must return None when the fork is unreachable \
@@ -2405,6 +2443,52 @@ mod tests {
         assert!(db.has_block(&h(100)));
     }
 
+    /// When both the selected chain and the fork anchor their oldest
+    /// VolatileDB block at the same pre-VolatileDB hash (== immutable tip),
+    /// `switch_chain` must consider the fork reachable and build a plan that
+    /// rolls back the entire selected_chain and applies the entire new_chain.
+    ///
+    /// Matches Haskell `isReachable` `Paths.hs::go`'s `AF.Empty anchor` case:
+    /// when the reverse path's terminal hash equals the chain fragment's
+    /// anchor hash (the immutable tip), the common ancestor IS the anchor.
+    #[test]
+    fn test_switch_chain_reachable_via_immutable_anchor() {
+        let mut db = VolatileDB::new();
+        // Anchor (immutable tip) is h(0) at slot 50 — NOT in VolatileDB.
+        // Selected chain: h(1) → h(2), both children of h(0).
+        db.add_block(h(1), 100, 10, h(0), b"s1".to_vec());
+        db.add_block(h(2), 200, 20, h(1), b"s2".to_vec());
+        // Fork chain: h(10) → h(11), both also descendants of h(0) but on
+        // a different branch (share only the immutable anchor).
+        db.add_block(h(10), 150, 11, h(0), b"f1".to_vec());
+        db.add_block(h(11), 250, 21, h(10), b"f2".to_vec());
+        db.add_block(h(12), 350, 22, h(11), b"f3".to_vec());
+
+        // Without immutable_anchor the fork is unreachable (current behaviour).
+        assert!(
+            db.switch_chain(&h(12), None).is_none(),
+            "without knowing the immutable anchor, fork stays unreachable"
+        );
+
+        // Passing the immutable anchor (h(0) at slot 50) allows the switch.
+        let plan = db
+            .switch_chain(&h(12), Some((h(0), 50)))
+            .expect("fork is reachable via immutable-tip anchor");
+        assert_eq!(plan.intersection, h(0), "intersection is the immutable tip");
+        assert_eq!(plan.intersection_slot, 50);
+        assert_eq!(
+            plan.rollback,
+            vec![h(2), h(1)],
+            "rollback is entire selected chain, newest first"
+        );
+        assert_eq!(
+            plan.apply,
+            vec![h(10), h(11), h(12)],
+            "apply is entire new chain, oldest first"
+        );
+        assert_eq!(db.get_tip(), Some((350, h(12), 22)));
+    }
+
     /// A `SwitchPlan` returned by `switch_chain` must carry the intersection
     /// slot — not just the hash — so callers can build a `Point::Specific(slot,
     /// hash)` for ledger rollback without a second lookup that could miss the
@@ -2420,7 +2504,7 @@ mod tests {
         db.add_block(h(5), 333, 30, h(4), b"b-chain".to_vec());
         db.add_block(h(6), 444, 40, h(5), b"b-chain-tip".to_vec());
 
-        let plan = db.switch_chain(&h(6)).expect("reachable fork");
+        let plan = db.switch_chain(&h(6), None).expect("reachable fork");
         assert_eq!(plan.intersection, h(1));
         assert_eq!(
             plan.intersection_slot, 111,
@@ -2439,7 +2523,7 @@ mod tests {
         assert!(db.has_block(&h(2)));
         assert!(db.has_block(&h(3)));
 
-        let plan = db.switch_chain(&h(3)).unwrap();
+        let plan = db.switch_chain(&h(3), None).unwrap();
         assert_eq!(plan.apply, vec![h(3)]);
         assert_eq!(db.get_tip(), Some((100, h(3), 10)));
         assert_eq!(db.len(), 3);
@@ -2697,7 +2781,7 @@ mod tests {
         );
 
         // Attempt switch — must return None (unreachable fork).
-        let plan = db.switch_chain(&fork_tip);
+        let plan = db.switch_chain(&fork_tip, None);
         assert!(
             plan.is_none(),
             "switch_chain must return None for a deep detached fork \

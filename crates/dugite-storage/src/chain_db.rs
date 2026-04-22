@@ -648,11 +648,18 @@ impl ChainDB {
     }
 
     /// Switch the selected chain to a new tip.
+    ///
+    /// Passes the current ImmutableDB tip to VolatileDB so that forks whose
+    /// ancestry terminates at the immutable tip can be identified as reachable
+    /// via the `AF.Empty anchor` case in Haskell's `isReachable`.
     pub fn switch_to_fork(
         &mut self,
         new_tip_hash: &BlockHeaderHash,
     ) -> Option<crate::volatile_db::SwitchPlan> {
-        self.volatile.switch_chain(new_tip_hash)
+        let immutable_anchor = self
+            .immutable_tip
+            .map(|(slot, hash, _block_no)| (hash, slot.0));
+        self.volatile.switch_chain(new_tip_hash, immutable_anchor)
     }
 
     /// GC orphaned fork blocks from volatile. Returns count removed.
