@@ -96,6 +96,32 @@ pub struct PendingHeader {
     pub header_cbor: Vec<u8>,
 }
 
+/// Select pending headers that still need to be fetched from a peer.
+///
+/// Filters by **hash**, not slot, so that fork blocks whose slot is ≤ the
+/// current applied tip slot are still scheduled for download. This matches
+/// the Haskell `Ouroboros.Network.BlockFetch.Decision` behaviour: every
+/// header on `theirFrag` that is not on `curChain` (i.e. not already known
+/// to ChainDB) is a fetch candidate, regardless of slot ordering.
+///
+/// A previous implementation used `h.slot > applied_slot` as the predicate
+/// which silently dropped legitimate fork blocks after a `MsgRollBackward`,
+/// stranding the candidate fragment and stalling chain selection.
+pub(crate) fn select_headers_to_fetch<F>(
+    pending: &[PendingHeader],
+    is_known_in_chain_db: F,
+    fetched_hashes: &std::collections::HashSet<[u8; 32]>,
+) -> Vec<PendingHeader>
+where
+    F: Fn(&[u8; 32]) -> bool,
+{
+    pending
+        .iter()
+        .filter(|h| !is_known_in_chain_db(&h.hash) && !fetched_hashes.contains(&h.hash))
+        .cloned()
+        .collect()
+}
+
 /// A block fetched by a BlockFetch task, ready for ledger application.
 ///
 /// Sent from per-peer BlockFetch tasks to the main run loop via an `mpsc`
@@ -1001,13 +1027,11 @@ impl ConnectionLifecycleManager {
                                 let cdb = chain_db.read().await;
                                 use dugite_primitives::hash::Hash32;
                                 if let Some(state) = chains.get(&addr) {
-                                    let filtered: Vec<_> = state.pending_headers.iter()
-                                        .filter(|h| {
-                                            !cdb.has_block(&Hash32::from_bytes(h.hash))
-                                                && !fetched_hashes.contains(&h.hash)
-                                        })
-                                        .cloned()
-                                        .collect();
+                                    let filtered = select_headers_to_fetch(
+                                        &state.pending_headers,
+                                        |h| cdb.has_block(&Hash32::from_bytes(*h)),
+                                        &fetched_hashes,
+                                    );
                                     if filtered.is_empty() {
                                         active_fetcher.store(0, std::sync::atomic::Ordering::SeqCst);
                                     }
@@ -1652,6 +1676,90 @@ mod tests {
         assert_eq!(cloned.tip_block_number, 100);
         assert_eq!(cloned.pending_headers.len(), 1);
         assert_eq!(cloned.pending_headers[0].slot, 12345);
+    }
+
+    /// Regression: fork headers whose slot is ≤ the applied tip must still
+    /// be selected for fetch as long as their hash is not yet in ChainDB.
+    ///
+    /// Before this fix, BlockFetch decision filtered by `slot > applied_slot`,
+    /// which dropped legitimate fork blocks after `MsgRollBackward` and
+    /// stalled chain selection because the candidate fragment was missing
+    /// blocks needed by `walk_chain_back`.
+    #[test]
+    fn select_headers_to_fetch_keeps_fork_headers_below_applied_slot() {
+        use std::collections::HashSet;
+        let known: HashSet<[u8; 32]> = HashSet::from([[0x01; 32]]); // already in ChainDB
+        let fetched: HashSet<[u8; 32]> = HashSet::new();
+        let applied_slot = 100u64;
+
+        let pending = vec![
+            // Fork block at slot=99 (below applied_slot) — must be fetched.
+            PendingHeader {
+                slot: 99,
+                hash: [0x02; 32],
+                header_cbor: vec![],
+            },
+            // Already in ChainDB — must be skipped.
+            PendingHeader {
+                slot: 50,
+                hash: [0x01; 32],
+                header_cbor: vec![],
+            },
+            // Above applied_slot — must be fetched.
+            PendingHeader {
+                slot: 101,
+                hash: [0x03; 32],
+                header_cbor: vec![],
+            },
+        ];
+        let _ = applied_slot; // documents the scenario; not used in filter
+
+        let out = select_headers_to_fetch(&pending, |h| known.contains(h), &fetched);
+
+        let hashes: Vec<[u8; 32]> = out.iter().map(|h| h.hash).collect();
+        assert_eq!(
+            hashes.len(),
+            2,
+            "expected fork header at slot 99 to be retained"
+        );
+        assert!(
+            hashes.contains(&[0x02; 32]),
+            "fork block below applied_slot dropped"
+        );
+        assert!(
+            hashes.contains(&[0x03; 32]),
+            "block above applied_slot dropped"
+        );
+        assert!(
+            !hashes.contains(&[0x01; 32]),
+            "already-known block was selected"
+        );
+    }
+
+    /// `fetched_hashes` shadows ChainDB: a header that is currently being
+    /// downloaded by another fetcher in the same worker is skipped.
+    #[test]
+    fn select_headers_to_fetch_skips_in_flight_hashes() {
+        use std::collections::HashSet;
+        let known: HashSet<[u8; 32]> = HashSet::new();
+        let fetched: HashSet<[u8; 32]> = HashSet::from([[0xAA; 32]]);
+
+        let pending = vec![
+            PendingHeader {
+                slot: 10,
+                hash: [0xAA; 32],
+                header_cbor: vec![],
+            }, // in-flight
+            PendingHeader {
+                slot: 11,
+                hash: [0xBB; 32],
+                header_cbor: vec![],
+            }, // new
+        ];
+
+        let out = select_headers_to_fetch(&pending, |h| known.contains(h), &fetched);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].hash, [0xBB; 32]);
     }
 
     /// Verify FetchedBlock can be constructed.
