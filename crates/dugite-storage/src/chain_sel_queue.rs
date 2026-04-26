@@ -33,7 +33,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use tokio::sync::{mpsc, oneshot, RwLock};
-use tracing::{debug, trace, warn};
+use tracing::{debug, info, trace, warn};
 
 use dugite_primitives::hash::BlockHeaderHash;
 use dugite_primitives::time::{BlockNo, SlotNo};
@@ -416,7 +416,7 @@ async fn process_add_block(
 
         if let Some((fork_hash, fork_bn, fork_slot)) = best_fork {
             // A strictly-preferred fork exists — switch to it.
-            debug!(
+            info!(
                 fork_hash = %fork_hash.to_hex(),
                 fork_block_no = fork_bn.0,
                 fork_slot = fork_slot.0,
@@ -439,8 +439,11 @@ async fn process_add_block(
             // no chain selection occurs.  We fall through so the caller does
             // NOT attempt a ledger rollback; the block will re-enter chain
             // selection later if its ancestry becomes complete.
-            debug!(
+            warn!(
                 fork_hash = %fork_hash.to_hex(),
+                fork_block_no = fork_bn.0,
+                fork_slot = fork_slot.0,
+                current_tip_block_no,
                 "chain_sel: fork unreachable — StoreButDontChange"
             );
         }

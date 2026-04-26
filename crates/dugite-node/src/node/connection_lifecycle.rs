@@ -887,7 +887,7 @@ impl ConnectionLifecycleManager {
     fn make_blockfetch_task(&self, addr: SocketAddr) -> ProtocolTaskFn {
         let fetched_blocks_tx = self.fetched_blocks_tx.clone();
         let candidate_chains = self.candidate_chains.clone();
-        let ledger_state_for_fetch = self.ledger_state.clone();
+        let chain_db = self.chain_db.clone();
         let bel = self.byron_epoch_length;
         // Shared flag: only ONE BlockFetch worker is active at a time.
         // Matches Haskell's bfcMaxConcurrencyBulkSync = 1.
@@ -967,32 +967,43 @@ impl ConnectionLifecycleManager {
                             // a mid-fetch connection drop.  Instead we skip any
                             // header whose hash is already in `fetched_hashes`
                             // (downloaded by this worker in an earlier iteration)
-                            // or whose slot is <= max_fetched_slot (downloaded by
-                            // another peer's worker).  This prevents both re-fetch
-                            // loops and stalls caused by lost headers.
+                            // or whose hash is already in the ChainDB (already
+                            // stored, possibly on a divergent fork).
                             //
-                            // Use LEDGER tip slot to filter — NOT ChainDB tip slot.
+                            // FILTER BY HASH, NOT SLOT.
                             //
-                            // ChainDB tip includes volatile blocks that may be on a
-                            // divergent fork (e.g. after a restart when the volatile
-                            // chain doesn't connect to the ledger snapshot). Using the
-                            // ChainDB tip would skip re-fetching those gap blocks,
-                            // causing the node to stall forever: fetched blocks connect
-                            // to the divergent ChainDB tip but not the ledger tip, so
-                            // they buffer indefinitely and never get applied.
+                            // A slot-based filter (`h.slot > applied_slot`) is unsound
+                            // for fork blocks delivered after `MsgRollBackward`.  When
+                            // a peer rolls back to slot R (R < applied_slot) and
+                            // begins streaming a competing fork, the fork's earliest
+                            // blocks may carry slots in the range (R, applied_slot].
+                            // Those headers MUST be fetched so `walk_chain_back` from
+                            // the fork's tip can reconstruct the ancestry through
+                            // VolatileDB and intersect either the selected chain or
+                            // the immutable anchor; otherwise chain_sel reports
+                            // `fork unreachable — StoreButDontChange` for every new
+                            // fork tip and the BP stalls on the abandoned fork
+                            // (observed live on preview 2026-04-26: peer rolled back
+                            // 1 block and grew a 9+ block fork; only the latest
+                            // headers passed the slot filter, leaving the parent gap
+                            // unfetched).
                             //
-                            // The ledger tip only advances when blocks are actually
-                            // applied in order, so gap blocks are never filtered out.
-                            let applied_slot = {
-                                let ls = ledger_state_for_fetch.read().await;
-                                ls.tip.point.slot().map(|s| s.0).unwrap_or(0)
-                            };
+                            // Hash-based filtering (`!chain_db.has_block(h.hash)`)
+                            // matches Haskell `BlockFetch.Decision`: it fetches
+                            // every block on `theirFrag` not on `curChain`, regardless
+                            // of slot ordering.  Headers above the volatile-window
+                            // boundary are stored in VolatileDB on first fetch and
+                            // skipped afterwards by the per-worker `fetched_hashes`
+                            // set; headers that have already been flushed to
+                            // ImmutableDB are skipped by `has_block`.
                             let headers_to_fetch = {
                                 let chains = candidate_chains.read().await;
+                                let cdb = chain_db.read().await;
+                                use dugite_primitives::hash::Hash32;
                                 if let Some(state) = chains.get(&addr) {
                                     let filtered: Vec<_> = state.pending_headers.iter()
                                         .filter(|h| {
-                                            h.slot > applied_slot
+                                            !cdb.has_block(&Hash32::from_bytes(h.hash))
                                                 && !fetched_hashes.contains(&h.hash)
                                         })
                                         .cloned()
