@@ -2802,6 +2802,33 @@ fn from_codec_point(p: &CodecPoint) -> Point {
     }
 }
 
+/// Drop pending headers whose block is already stored in the local ChainDB.
+///
+/// Use **hash equality** rather than slot comparison: after a peer issues
+/// `MsgRollBackward` at the live tip and switches to a competing fork, the new
+/// fork's headers may carry slots that are at or below our current ledger tip
+/// but with **different** hashes.  A slot-based filter (`h.slot > applied_slot`)
+/// drops those fork headers, leaving BlockFetch unable to assemble the parent
+/// chain — `walk_chain_back` from the new fork's tip terminates inside an
+/// unreachable orphan island, chain selection silently never fires
+/// `TriggeredFork`, and the node remains stuck on the abandoned fork until
+/// restart (which then sees no canonical snapshot and falls back to genesis
+/// replay).  Observed in production on 2026-04-26.
+///
+/// This matches Haskell `ouroboros-consensus`: `theirFrag` retains every header
+/// on the candidate fragment (anchored at the rollback / intersection point);
+/// BlockFetch fetches every block on `theirFrag` not on `curChain`, regardless
+/// of block number ordering.  Chain selection fires per-block via
+/// `chainSelectionForBlock` once `preferCandidate` (block-number ordering)
+/// favours the new fork.
+pub(crate) fn prune_already_known_pending_headers(
+    headers: &mut Vec<PendingHeader>,
+    chain_db: &dugite_storage::ChainDB,
+) {
+    use dugite_primitives::hash::Hash32;
+    headers.retain(|h| !chain_db.has_block(&Hash32::from_bytes(h.hash)));
+}
+
 /// Per-peer ChainSync client task.
 ///
 /// Runs on a single MuxChannel, receives headers, and updates shared
@@ -3242,22 +3269,35 @@ pub async fn chainsync_client_task(
                                 header_cbor: header,
                             });
 
-                            // Prune headers that the ledger has already applied.
+                            // Prune headers we've already fetched and stored.
                             //
-                            // We only drop headers whose slot is at or below the
-                            // ledger tip — these have already been fetched and applied.
-                            // Headers above the ledger tip are retained even if there
-                            // are thousands, because BlockFetch needs them to bridge
-                            // the gap (e.g. after fork divergence on restart when the
-                            // volatile chain doesn't connect to the ledger snapshot).
+                            // CORRECT FILTER (hash-based):
+                            // Drop only headers whose hash is already present in the
+                            // ChainDB (volatile or immutable).  A slot-based filter
+                            // (`h.slot > applied_slot`) is unsound: after a peer
+                            // rolls back BELOW our applied tip and switches to a
+                            // competing fork, the new fork's headers may carry slots
+                            // ≤ applied_slot but DIFFERENT hashes.  Dropping them
+                            // breaks the parent chain that BlockFetch needs to walk
+                            // back from the new fork's tip → walk_chain_back
+                            // terminates inside an unreachable orphan island and
+                            // chain selection silently leaves the node stuck on the
+                            // abandoned fork (observed in production 2026-04-26).
+                            //
+                            // Matches Haskell: `theirFrag` retains every header on
+                            // the candidate fragment (anchored at the rollback /
+                            // intersection point); BlockFetch fetches everything not
+                            // in `curChain`.
                             //
                             // Hard cap at 10_000 as an absolute safety valve against
                             // unbounded growth during very long catch-ups.
-                            let applied_slot = {
-                                let ls = ledger_state.read().await;
-                                ls.tip.point.slot().map(|s| s.0).unwrap_or(0)
-                            };
-                            entry.pending_headers.retain(|h| h.slot > applied_slot);
+                            {
+                                let cdb = chain_db.read().await;
+                                prune_already_known_pending_headers(
+                                    &mut entry.pending_headers,
+                                    &cdb,
+                                );
+                            }
                             const HARD_CAP: usize = 10_000;
                             if entry.pending_headers.len() > HARD_CAP {
                                 let excess = entry.pending_headers.len() - HARD_CAP;
@@ -3614,6 +3654,88 @@ mod chainsync_task_tests {
             dugite_primitives::hash::Hash32::from_bytes([0xAB; 32]),
         );
         assert_eq!(from_codec_point(&to_codec_point(&specific)), specific);
+    }
+
+    /// Regression test for the ChainSel fork-switch stall bug (2026-04-26):
+    /// `prune_already_known_pending_headers` MUST keep fork headers whose
+    /// hash differs from anything in the ChainDB, even when their slot is
+    /// at or below the local ledger / chain tip.  The previous slot-based
+    /// filter dropped them and stranded the node on the abandoned fork
+    /// after a single-peer `MsgRollBackward` at the live tip.
+    #[test]
+    fn test_prune_keeps_fork_headers_at_or_below_applied_slot() {
+        use dugite_primitives::hash::Hash32;
+        use dugite_primitives::time::{BlockNo, SlotNo};
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut chain_db = dugite_storage::ChainDB::open(dir.path()).unwrap();
+
+        // Populate the local chain with three blocks ending at slot 200.
+        let hash = |seed: u8| {
+            let mut bytes = [0u8; 32];
+            bytes[31] = seed;
+            Hash32::from_bytes(bytes)
+        };
+        let h_a = hash(1);
+        let h_b = hash(2);
+        let h_c = hash(3);
+        chain_db
+            .add_block(h_a, SlotNo(100), BlockNo(50), Hash32::ZERO, b"a".to_vec())
+            .unwrap();
+        chain_db
+            .add_block(h_b, SlotNo(150), BlockNo(51), h_a, b"b".to_vec())
+            .unwrap();
+        chain_db
+            .add_block(h_c, SlotNo(200), BlockNo(52), h_b, b"c".to_vec())
+            .unwrap();
+
+        // Pending headers from a peer that rolled back to slot 150 (h_b)
+        // and is now extending a competing fork:
+        //   - fork-N at slot 175 (NEW hash, slot < applied tip 200)
+        //   - fork-N+1 at slot 220 (NEW hash, slot > applied tip)
+        //   - h_b (already in chain_db) — should be dropped
+        let fork_root = [0xAAu8; 32];
+        let fork_child = [0xBBu8; 32];
+        let mut h_b_arr = [0u8; 32];
+        h_b_arr.copy_from_slice(h_b.as_ref());
+        let mut headers: Vec<PendingHeader> = vec![
+            PendingHeader {
+                slot: 175,
+                hash: fork_root,
+                header_cbor: vec![0xF6],
+            },
+            PendingHeader {
+                slot: 220,
+                hash: fork_child,
+                header_cbor: vec![0xF6],
+            },
+            PendingHeader {
+                slot: 150,
+                hash: h_b_arr,
+                header_cbor: vec![0xF6],
+            },
+        ];
+
+        prune_already_known_pending_headers(&mut headers, &chain_db);
+
+        // h_b is in chain_db → dropped.  The two fork headers must remain
+        // even though the first one (slot 175) is BELOW our applied tip
+        // (slot 200).  This is exactly the case that broke the prior
+        // `h.slot > applied_slot` filter.
+        let kept_hashes: Vec<[u8; 32]> = headers.iter().map(|h| h.hash).collect();
+        assert!(
+            kept_hashes.contains(&fork_root),
+            "fork header at slot 175 (≤ applied tip) must be retained: kept={kept_hashes:?}"
+        );
+        assert!(
+            kept_hashes.contains(&fork_child),
+            "fork header at slot 220 must be retained"
+        );
+        assert!(
+            !kept_hashes.contains(&h_b_arr),
+            "header for block already in chain_db must be dropped"
+        );
+        assert_eq!(headers.len(), 2);
     }
 
     /// Verify that extract_slot_from_wrapped_header correctly parses a
