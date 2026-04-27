@@ -4121,6 +4121,41 @@ impl Node {
             );
             return;
         };
+
+        // Safe-to-forge guard: refuse to forge when our chain tip is too far
+        // behind wall-clock time. If we forge while behind, we extend a stale
+        // parent and produce a fork-block whose block_no is identical to (or
+        // less than) the network's tip block_no — the network has already
+        // moved on, so our block is on a doomed fork that no peer will adopt.
+        //
+        // Without this guard, a transient upstream-peer outage (relay loses
+        // its peers) can cause the BP to forge dozens of doomed fork-blocks
+        // in succession, none of which propagate. The Haskell node assumes a
+        // BP-relay topology where the relay is always at the network tip;
+        // this guard makes the failure mode safe rather than silent.
+        //
+        // Threshold rationale:
+        // - active_slot_coeff f ≈ 0.05 → mean inter-block gap ≈ 20s
+        // - If our tip is more than 60 slots (≈ 60s on f=1 networks) behind
+        //   wall-clock, we have likely missed at least one block from the
+        //   network's chain and would forge a doomed fork.
+        // - This is conservative enough to allow normal fluctuation while
+        //   blocking the failure mode that caused block c777daed... to be
+        //   rejected by the preview network on 2026-04-27.
+        const MAX_FORGE_LAG_SLOTS: u64 = 60;
+        let lag = next_slot.0.saturating_sub(tip_slot);
+        if lag > MAX_FORGE_LAG_SLOTS {
+            drop(ls);
+            warn!(
+                wall_clock = next_slot.0,
+                tip_slot,
+                lag_slots = lag,
+                max_lag_slots = MAX_FORGE_LAG_SLOTS,
+                "Forge: chain tip too far behind wall-clock — skipping forge \
+                 to avoid producing a doomed fork. Check upstream peer connectivity."
+            );
+            return;
+        }
         // Use epoch_nonce_for_slot to handle first slot of new epoch correctly.
         // At epoch boundaries, the TICKN transition hasn't been applied yet, so
         // ls.consensus.epoch_nonce still holds the previous epoch's nonce. epoch_nonce_for_slot
@@ -4216,11 +4251,17 @@ impl Node {
         let max_block_ex_steps = ls.epochs.protocol_params.max_block_ex_units.steps;
         let current_era = ls.era;
         drop(ls);
-        let transactions = self.mempool.get_txs_for_block_with_ex_units(
+        // Pass `next_slot` so the mempool excludes TTL-expired txs from the
+        // forged block. Including a tx with `ttl < forge_slot` produces a
+        // block that fails Phase-1 validation on every conforming peer (this
+        // was the proximate cause of forged block c777daed... being rejected
+        // by the preview network on 2026-04-27).
+        let transactions = self.mempool.get_txs_for_block_with_ex_units_at(
             500,
             max_block_body_size as usize,
             max_block_ex_mem,
             max_block_ex_steps,
+            Some(next_slot),
         );
         let config = crate::forge::BlockProducerConfig {
             // Node software capability version from config, NOT the on-chain ledger version.
