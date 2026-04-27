@@ -771,6 +771,35 @@ impl Mempool {
         max_block_ex_mem: u64,
         max_block_ex_steps: u64,
     ) -> Vec<Transaction> {
+        // Backwards-compatible wrapper: no TTL filtering. Prefer
+        // `get_txs_for_block_with_ex_units_at` from the forge path so that
+        // TTL-expired txs are excluded relative to the forge slot.
+        self.get_txs_for_block_with_ex_units_at(
+            max_count,
+            max_size,
+            max_block_ex_mem,
+            max_block_ex_steps,
+            None,
+        )
+    }
+
+    /// Same as `get_txs_for_block_with_ex_units` but additionally filters out
+    /// transactions whose `ttl` has expired relative to `forge_slot`.
+    ///
+    /// In Cardano Phase-1 validation a tx with `ttl < current_slot` is
+    /// invalid; including such a tx in a forged block produces a block that
+    /// any conforming peer will reject. The mempool itself is purged
+    /// asynchronously by the TTL sweeper, but a tx may still be present
+    /// between expiration and the next sweep — so the forge path must filter
+    /// at selection time.
+    pub fn get_txs_for_block_with_ex_units_at(
+        &self,
+        max_count: usize,
+        max_size: usize,
+        max_block_ex_mem: u64,
+        max_block_ex_steps: u64,
+        forge_slot: Option<dugite_primitives::time::SlotNo>,
+    ) -> Vec<Transaction> {
         let order = self.order.read();
         let tombstones = self.order_tombstones.read();
         let mut result = Vec::new();
@@ -790,6 +819,16 @@ impl Mempool {
                 continue;
             }
             if let Some(entry) = self.txs.get(tx_hash) {
+                // TTL guard at forge-slot. If ttl is set and ttl < forge_slot,
+                // including this tx would produce a block that fails Phase-1
+                // validation on every conforming peer — skip it. We do NOT
+                // `break` because later txs in the FIFO may have larger TTLs
+                // (TTL is set client-side, not monotonic with arrival order).
+                if let (Some(slot), Some(tx_ttl)) = (forge_slot, entry.tx.body.ttl) {
+                    if tx_ttl.0 < slot.0 {
+                        continue;
+                    }
+                }
                 if total_size + entry.size_bytes > max_size {
                     // Block is full by size — stop (strict prefix, no skipping)
                     break;
@@ -1351,8 +1390,109 @@ mod tests {
         }
     }
 
+    /// Like `make_dummy_tx` but sets `body.ttl` and gives the tx a unique
+    /// `hash` (the dedup key in the mempool order list) so multiple test
+    /// fixtures can coexist.
+    fn make_dummy_tx_with_ttl(ttl_slot: u64) -> Transaction {
+        use std::sync::atomic::{AtomicU32, Ordering as AOrdering};
+        static HCTR: AtomicU32 = AtomicU32::new(0);
+        let mut tx = make_dummy_tx();
+        tx.body.ttl = Some(dugite_primitives::time::SlotNo(ttl_slot));
+        let mut h = [0u8; 32];
+        let n = HCTR.fetch_add(1, AOrdering::Relaxed);
+        h[28..32].copy_from_slice(&n.to_be_bytes());
+        // Disambiguate from `make_dummy_tx`'s input-id space.
+        h[0] = 0xAA;
+        tx.hash = Hash32::from_bytes(h);
+        tx
+    }
+
     fn default_config() -> MempoolConfig {
         MempoolConfig::default()
+    }
+
+    /// Forge-time TTL filter: a tx whose `ttl < forge_slot` must NOT be
+    /// selected. Including such a tx in a forged block produces a Phase-1
+    /// validation failure on every conforming peer (this was the proximate
+    /// cause of forged block c777daed... being rejected by the preview
+    /// network on 2026-04-27).
+    #[test]
+    fn get_txs_for_block_excludes_ttl_expired_at_forge_slot() {
+        let mempool = Mempool::new(default_config());
+        let tx_expired = make_dummy_tx_with_ttl(100); // ttl < forge_slot
+        let tx_fresh = make_dummy_tx_with_ttl(200); // ttl > forge_slot
+        mempool
+            .add_tx(tx_expired.hash, tx_expired.clone(), 200)
+            .unwrap();
+        mempool
+            .add_tx(tx_fresh.hash, tx_fresh.clone(), 200)
+            .unwrap();
+
+        let forge_slot = Some(dugite_primitives::time::SlotNo(150));
+        let selected = mempool.get_txs_for_block_with_ex_units_at(
+            500,
+            16_000_000,
+            u64::MAX,
+            u64::MAX,
+            forge_slot,
+        );
+
+        assert_eq!(selected.len(), 1, "TTL-expired tx must be excluded");
+        assert_eq!(
+            selected[0].body.inputs[0].index, tx_fresh.body.inputs[0].index,
+            "the surviving tx must be the one with ttl > forge_slot"
+        );
+    }
+
+    /// Without a `forge_slot` argument the legacy selection path returns all
+    /// txs regardless of TTL — used by non-forge code paths (e.g. metrics,
+    /// test fixtures) that should not depend on wallclock semantics.
+    #[test]
+    fn get_txs_for_block_without_forge_slot_keeps_ttl_expired() {
+        let mempool = Mempool::new(default_config());
+        let tx_expired = make_dummy_tx_with_ttl(100);
+        let tx_fresh = make_dummy_tx_with_ttl(200);
+        mempool
+            .add_tx(tx_expired.hash, tx_expired.clone(), 200)
+            .unwrap();
+        mempool
+            .add_tx(tx_fresh.hash, tx_fresh.clone(), 200)
+            .unwrap();
+
+        let selected = mempool.get_txs_for_block_with_ex_units(500, 16_000_000, u64::MAX, u64::MAX);
+        assert_eq!(selected.len(), 2);
+    }
+
+    /// TTL filtering must NOT terminate iteration early. A tx with a smaller
+    /// TTL may sit ahead of a tx with a larger TTL in the FIFO order; the
+    /// expired one must be skipped, not break the loop.
+    #[test]
+    fn get_txs_for_block_skips_expired_tx_without_terminating_iteration() {
+        let mempool = Mempool::new(default_config());
+        let tx_expired = make_dummy_tx_with_ttl(100);
+        let tx_fresh1 = make_dummy_tx_with_ttl(300);
+        let tx_fresh2 = make_dummy_tx_with_ttl(400);
+        // FIFO: expired arrives first, but two fresh txs follow.
+        mempool
+            .add_tx(tx_expired.hash, tx_expired.clone(), 200)
+            .unwrap();
+        mempool
+            .add_tx(tx_fresh1.hash, tx_fresh1.clone(), 200)
+            .unwrap();
+        mempool
+            .add_tx(tx_fresh2.hash, tx_fresh2.clone(), 200)
+            .unwrap();
+
+        let forge_slot = Some(dugite_primitives::time::SlotNo(200));
+        let selected = mempool.get_txs_for_block_with_ex_units_at(
+            500,
+            16_000_000,
+            u64::MAX,
+            u64::MAX,
+            forge_slot,
+        );
+
+        assert_eq!(selected.len(), 2, "both fresh txs must be selected");
     }
 
     #[test]
