@@ -2127,6 +2127,20 @@ impl Node {
                 }
             };
 
+            // Snapshot of non-public IPs explicitly authorised by the static
+            // topology (e.g. a co-located cardano-node relay at 127.0.0.1).
+            // Non-public-IP inbound peers NOT in this set are rejected, so
+            // an adversarial peer cannot trick us into accepting connections
+            // that appear to come from internal/intranet hosts.
+            let static_non_public_ips: std::collections::HashSet<std::net::IpAddr> = self
+                .peer_manager
+                .read()
+                .await
+                .static_topology_ips()
+                .into_iter()
+                .filter(|ip| crate::node::networking::is_non_public_ip(*ip))
+                .collect();
+
             let n2n_inbound_tx = inbound_accept_tx.clone();
             tokio::spawn(async move {
                 let mut shutdown = n2n_shutdown_rx;
@@ -2135,11 +2149,24 @@ impl Node {
                         accept_result = tcp_listener.accept() => {
                             match accept_result {
                                 Ok((stream, peer_addr)) => {
-                                    // Reject loopback connections — these are always
-                                    // self-connections (our own outbound to 127.0.0.1:P
-                                    // arriving at our own listener).
-                                    if peer_addr.ip().is_loopback() {
-                                        debug!(%peer_addr, "N2N inbound rejected: loopback self-connection");
+                                    // Non-public IPs (loopback, RFC1918, link-local,
+                                    // multicast, …) are only permitted when explicitly
+                                    // listed in the static topology. This allows
+                                    // co-located BP+relay over 127.0.0.1 while
+                                    // rejecting any other internal-IP connection that
+                                    // could only come from misconfiguration or abuse.
+                                    // Public IPs are always accepted; outbound self-
+                                    // connection is already prevented by
+                                    // NodePeerManager::is_self_addr. Matches Haskell
+                                    // ouroboros-network's PeerSharing IP-class filter
+                                    // combined with localRoots overrides.
+                                    if crate::node::networking::is_non_public_ip(peer_addr.ip())
+                                        && !static_non_public_ips.contains(&peer_addr.ip())
+                                    {
+                                        debug!(
+                                            %peer_addr,
+                                            "N2N inbound rejected: non-public IP not in static topology"
+                                        );
                                         drop(stream);
                                         continue;
                                     }
@@ -2411,6 +2438,19 @@ impl Node {
             rollback_event_tx,
             peer_manager.clone(),
         );
+        // NOTE: outbound source-port pairing (bind-to-listen-port) is wired
+        // but disabled by default. Enabling it in the lifecycle manager
+        // requires platform-specific REUSEPORT semantics that work for
+        // bind-on-already-listening port (Linux supports this with
+        // SO_REUSEPORT on both the listener and outbound socket; macOS does
+        // not by default and falls back to ephemeral source port). Without
+        // a working duplex-source bind, two connections to the same logical
+        // peer arrive on dugite's accept path with colliding keys, which the
+        // current connection-manager design cannot represent. A follow-up
+        // refactor needs to track connections by ConnectionId
+        // (localAddr, remoteAddr) tuples so inbound and outbound to the
+        // same remote can coexist — matching Haskell's
+        // `Ouroboros.Network.ConnectionManager`.
         self.connection_lifecycle = Some(lifecycle);
         self.fetched_blocks_rx = Some(fetched_blocks_rx);
         self.peer_failure_rx = Some(peer_failure_rx);

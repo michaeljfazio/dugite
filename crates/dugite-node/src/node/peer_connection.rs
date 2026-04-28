@@ -200,11 +200,21 @@ impl PeerConnection {
         initiator_only: bool,
         peer_sharing: bool,
         timeout: Option<Duration>,
+        local_listen_addr: Option<SocketAddr>,
     ) -> Result<Self, PeerConnectionError> {
         let connect_timeout = timeout.unwrap_or(DEFAULT_CONNECT_TIMEOUT);
 
-        // TCP connect with timeout.
-        let bearer = tokio::time::timeout(connect_timeout, TcpBearer::connect(addr))
+        // TCP connect with timeout. When the caller provides our N2N listen
+        // address, we bind the outbound source port to it so remote peers see
+        // a duplex-paired connection from (our_ip, our_listen_port) — matching
+        // Haskell ouroboros-network's `configureOutboundSocket` convention.
+        let bearer_fut = async {
+            match local_listen_addr {
+                Some(local) => TcpBearer::connect_from(addr, local).await,
+                None => TcpBearer::connect(addr).await,
+            }
+        };
+        let bearer = tokio::time::timeout(connect_timeout, bearer_fut)
             .await
             .map_err(|_| PeerConnectionError::ConnectTimeout(addr))?
             .map_err(|e| PeerConnectionError::Connect(addr, e.to_string()))?;
