@@ -78,6 +78,49 @@ impl TcpBearer {
         Self::new(stream)
     }
 
+    /// Connect to a remote address with the source port bound to `local_addr`.
+    ///
+    /// This is the duplex-pairing convention used by Haskell ouroboros-network
+    /// (`Ouroboros.Network.Server2.Sock` `configureOutboundSocket`): outbound
+    /// sockets bind their local port to the node's listen port using
+    /// SO_REUSEADDR + SO_REUSEPORT, so a remote peer accepting our connection
+    /// sees the source address `(our_ip, our_listen_port)`. When both peers
+    /// already exchange a duplex connection in this form, neither needs to
+    /// open a second outbound — preventing the "two TCP connections to one
+    /// logical peer" race that breaks ChainSync ServerHasAgency timeouts.
+    ///
+    /// Falls back to `connect()` (ephemeral source port) if the bind fails for
+    /// any reason — non-fatal, the caller still gets a working TCP bearer.
+    pub async fn connect_from(
+        addr: std::net::SocketAddr,
+        local_addr: std::net::SocketAddr,
+    ) -> Result<Self, BearerError> {
+        let socket = match local_addr {
+            std::net::SocketAddr::V4(_) => tokio::net::TcpSocket::new_v4(),
+            std::net::SocketAddr::V6(_) => tokio::net::TcpSocket::new_v6(),
+        }
+        .map_err(BearerError::Io)?;
+
+        // SO_REUSEADDR allows binding to a port that already has a listener
+        // on it; SO_REUSEPORT additionally allows two sockets on the same
+        // (addr, port) — required when our N2N listener and our outbound
+        // both bind to the same local port. Failure on either is non-fatal.
+        let _ = socket.set_reuseaddr(true);
+        #[cfg(unix)]
+        let _ = socket.set_reuseport(true);
+
+        if socket.bind(local_addr).is_err() {
+            // Bind to listen-port may fail (already in use without REUSEPORT
+            // support, or port already exhausted). Fall back to ephemeral
+            // source port — the connection still works, just without
+            // duplex-pairing benefits.
+            return Self::connect(addr).await;
+        }
+
+        let stream = socket.connect(addr).await.map_err(BearerError::Io)?;
+        Self::new(stream)
+    }
+
     /// Consume this bearer and return the underlying `TcpStream`.
     pub fn into_stream(self) -> TcpStream {
         self.stream

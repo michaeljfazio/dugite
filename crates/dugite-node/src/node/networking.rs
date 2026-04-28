@@ -22,8 +22,51 @@
 //! ```
 
 use std::collections::HashMap;
-use std::net::SocketAddr;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::time::Duration;
+
+/// Returns true for IPs that should NEVER be accepted from P2P peer-sharing
+/// or ledger-published relay records: loopback, unspecified (0.0.0.0/::),
+/// link-local, private RFC1918 ranges, multicast, IPv4 broadcast, IPv6
+/// unique-local (fc00::/7) and documentation ranges.
+///
+/// Such addresses on a public diffusion topology indicate either a
+/// misconfigured operator or an adversarial attempt to redirect peers to
+/// internal/intranet hosts. Static topology entries can still reference
+/// them (e.g. a co-located BP+relay over 127.0.0.1) but they must never
+/// be propagated as candidate peers.
+pub fn is_non_public_ip(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v4) => is_non_public_ipv4(v4),
+        IpAddr::V6(v6) => is_non_public_ipv6(v6),
+    }
+}
+
+fn is_non_public_ipv4(ip: Ipv4Addr) -> bool {
+    ip.is_loopback()
+        || ip.is_unspecified()
+        || ip.is_private()
+        || ip.is_link_local()
+        || ip.is_multicast()
+        || ip.is_broadcast()
+        || ip.is_documentation()
+        // 100.64.0.0/10 — Carrier-grade NAT (RFC 6598)
+        || (ip.octets()[0] == 100 && (ip.octets()[1] & 0xc0) == 64)
+        // 0.0.0.0/8 — "this network"
+        || ip.octets()[0] == 0
+}
+
+fn is_non_public_ipv6(ip: Ipv6Addr) -> bool {
+    ip.is_loopback()
+        || ip.is_unspecified()
+        || ip.is_multicast()
+        // fe80::/10 — link-local
+        || (ip.segments()[0] & 0xffc0) == 0xfe80
+        // fc00::/7 — unique-local
+        || (ip.segments()[0] & 0xfe00) == 0xfc00
+        // 2001:db8::/32 — documentation
+        || (ip.segments()[0] == 0x2001 && ip.segments()[1] == 0x0db8)
+}
 
 use dugite_network::connection::state::{
     ConnectionManagerCounters, ConnectionState, DataFlow, Provenance,
@@ -345,21 +388,50 @@ impl NodePeerManager {
         &self.local_root_groups
     }
 
+    /// Snapshot of all IPs explicitly listed in the static topology
+    /// (local root groups). Used by the N2N inbound accept handler to
+    /// decide whether a non-public-IP peer is permitted: only IPs an
+    /// operator put in the topology file are allowed to connect from
+    /// loopback / RFC1918 / link-local addresses; everything else is
+    /// rejected to prevent peer-sharing- or routing-based abuse.
+    pub fn static_topology_ips(&self) -> std::collections::HashSet<IpAddr> {
+        self.local_root_groups
+            .iter()
+            .flat_map(|g| g.addrs.iter().map(|s| s.ip()))
+            .collect()
+    }
+
     /// Add a peer discovered from ledger state.
+    ///
+    /// Pool-registered relay addresses on the public network must be
+    /// publicly routable. Reject any non-public IP (loopback, RFC1918,
+    /// link-local, etc.) — accepting them would let a misconfigured or
+    /// adversarial pool registration redirect us to internal hosts.
     pub fn add_ledger_peer(&mut self, addr: SocketAddr) {
         if self.is_self_addr(addr) {
+            return;
+        }
+        if is_non_public_ip(addr.ip()) {
             return;
         }
         self.inner.add_peer(addr, PeerSource::Ledger);
     }
 
     /// Add a peer received via PeerSharing.
+    ///
+    /// Peer-sharing publishes candidate peers across the public diffusion
+    /// network. Non-public IPs (loopback, RFC1918, link-local, multicast,
+    /// CGNAT, etc.) MUST NEVER be accepted from this source — an
+    /// adversarial peer could otherwise advertise internal addresses to
+    /// redirect honest nodes onto local intranet hosts. Static-topology
+    /// loopback peers (co-located BP+relay) are added via
+    /// [`add_local_root_group`] and are not subject to this filter.
     #[allow(dead_code)] // used by networking rewrite
     pub fn add_shared_peer(&mut self, addr: SocketAddr) {
         if self.is_self_addr(addr) {
             return;
         }
-        if addr.ip().is_loopback() || addr.ip().is_unspecified() {
+        if is_non_public_ip(addr.ip()) {
             return;
         }
         self.inner.add_peer(addr, PeerSource::PeerSharing);
@@ -869,5 +941,93 @@ mod tests {
         pm.add_ledger_peer("127.0.0.1:3001".parse().unwrap());
         // Should not be added — it's us.
         assert_eq!(pm.inner.count_by_state(PeerState::Cold), 0);
+    }
+
+    #[test]
+    fn test_is_non_public_ip_v4_classes() {
+        // Non-public — must reject from peer-sharing / ledger sources.
+        assert!(is_non_public_ip("127.0.0.1".parse().unwrap()));
+        assert!(is_non_public_ip("0.0.0.0".parse().unwrap()));
+        assert!(is_non_public_ip("10.0.0.1".parse().unwrap()));
+        assert!(is_non_public_ip("172.16.5.5".parse().unwrap()));
+        assert!(is_non_public_ip("192.168.1.1".parse().unwrap()));
+        assert!(is_non_public_ip("169.254.1.1".parse().unwrap())); // link-local
+        assert!(is_non_public_ip("224.0.0.1".parse().unwrap())); // multicast
+        assert!(is_non_public_ip("255.255.255.255".parse().unwrap())); // broadcast
+        assert!(is_non_public_ip("100.64.0.1".parse().unwrap())); // CGNAT
+        assert!(is_non_public_ip("192.0.2.1".parse().unwrap())); // doc TEST-NET-1
+
+        // Public — must accept.
+        assert!(!is_non_public_ip("8.8.8.8".parse().unwrap()));
+        assert!(!is_non_public_ip("1.1.1.1".parse().unwrap()));
+        assert!(!is_non_public_ip("220.240.140.41".parse().unwrap()));
+    }
+
+    #[test]
+    fn test_is_non_public_ip_v6_classes() {
+        assert!(is_non_public_ip("::1".parse().unwrap()));
+        assert!(is_non_public_ip("::".parse().unwrap()));
+        assert!(is_non_public_ip("fe80::1".parse().unwrap())); // link-local
+        assert!(is_non_public_ip("fc00::1".parse().unwrap())); // unique-local
+        assert!(is_non_public_ip("ff02::1".parse().unwrap())); // multicast
+        assert!(is_non_public_ip("2001:db8::1".parse().unwrap())); // documentation
+
+        assert!(!is_non_public_ip("2606:4700:4700::1111".parse().unwrap())); // public
+    }
+
+    #[test]
+    fn test_add_shared_peer_rejects_non_public() {
+        let mut pm = NodePeerManager::new(PeerManagerConfig::default());
+        // None of these should be admitted as peer-sharing candidates.
+        pm.add_shared_peer("127.0.0.1:3001".parse().unwrap());
+        pm.add_shared_peer("10.0.0.1:3001".parse().unwrap());
+        pm.add_shared_peer("192.168.1.1:3001".parse().unwrap());
+        pm.add_shared_peer("169.254.1.1:3001".parse().unwrap());
+        pm.add_shared_peer("[fe80::1]:3001".parse().unwrap());
+        assert_eq!(pm.inner.count_by_state(PeerState::Cold), 0);
+
+        // A public IP IS admitted.
+        pm.add_shared_peer("8.8.8.8:3001".parse().unwrap());
+        assert_eq!(pm.inner.count_by_state(PeerState::Cold), 1);
+    }
+
+    #[test]
+    fn test_add_ledger_peer_rejects_non_public() {
+        let mut pm = NodePeerManager::new(PeerManagerConfig::default());
+        pm.set_local_addr("0.0.0.0:3001".parse().unwrap());
+        pm.add_ledger_peer("10.0.0.1:3001".parse().unwrap());
+        pm.add_ledger_peer("192.168.1.1:3001".parse().unwrap());
+        assert_eq!(pm.inner.count_by_state(PeerState::Cold), 0);
+
+        pm.add_ledger_peer("8.8.8.8:3001".parse().unwrap());
+        assert_eq!(pm.inner.count_by_state(PeerState::Cold), 1);
+    }
+
+    #[test]
+    fn test_static_topology_ips_collects_local_roots() {
+        let mut pm = NodePeerManager::new(PeerManagerConfig::default());
+        pm.add_local_root_group(LocalRootGroupInfo {
+            name: "co-located-relay".into(),
+            addrs: vec!["127.0.0.1:3002".parse().unwrap()],
+            hot_valency: 1,
+            warm_valency: 1,
+            diffusion_mode: None,
+            behind_firewall: false,
+            advertise: false,
+        });
+        pm.add_local_root_group(LocalRootGroupInfo {
+            name: "external".into(),
+            addrs: vec!["8.8.8.8:3001".parse().unwrap()],
+            hot_valency: 1,
+            warm_valency: 1,
+            diffusion_mode: None,
+            behind_firewall: false,
+            advertise: true,
+        });
+
+        let ips = pm.static_topology_ips();
+        assert!(ips.contains(&"127.0.0.1".parse::<IpAddr>().unwrap()));
+        assert!(ips.contains(&"8.8.8.8".parse::<IpAddr>().unwrap()));
+        assert_eq!(ips.len(), 2);
     }
 }

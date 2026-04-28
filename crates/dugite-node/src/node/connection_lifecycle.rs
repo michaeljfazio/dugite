@@ -272,6 +272,12 @@ pub struct ConnectionLifecycleManager {
 
     /// Shared peer manager for PeerSharing server to query connected peers.
     peer_manager_for_servers: Arc<RwLock<NodePeerManager>>,
+
+    /// Our N2N listen address. When set, outbound connections bind their
+    /// source port to it (SO_REUSEADDR + SO_REUSEPORT) so a remote peer
+    /// observes the connection as duplex-paired from our listen port —
+    /// matching Haskell ouroboros-network's `configureOutboundSocket`.
+    local_listen_addr: Option<SocketAddr>,
 }
 
 /// Errors from lifecycle management operations.
@@ -375,7 +381,14 @@ impl ConnectionLifecycleManager {
             rollback_announcement_tx,
             rollback_event_tx,
             peer_manager_for_servers,
+            local_listen_addr: None,
         }
+    }
+
+    /// Set our N2N listen address used by outbound connections for
+    /// duplex-paired source-port binding. Call once after construction.
+    pub fn set_local_listen_addr(&mut self, addr: SocketAddr) {
+        self.local_listen_addr = Some(addr);
     }
 
     // ─── Temperature Transitions ────────────────────────────────────────────
@@ -424,6 +437,7 @@ impl ConnectionLifecycleManager {
             initiator_only,
             self.peer_sharing,
             Some(self.connect_timeout),
+            self.local_listen_addr,
         )
         .await?;
 
@@ -468,6 +482,7 @@ impl ConnectionLifecycleManager {
         let network_magic = self.network_magic;
         let peer_sharing = self.peer_sharing;
         let connect_timeout = self.connect_timeout;
+        let local_listen_addr = self.local_listen_addr;
         let metrics = Arc::clone(&self.metrics);
 
         tokio::spawn(async move {
@@ -478,6 +493,7 @@ impl ConnectionLifecycleManager {
                 initiator_only,
                 peer_sharing,
                 Some(connect_timeout),
+                local_listen_addr,
             )
             .await
             {
@@ -1392,6 +1408,7 @@ impl ConnectionLifecycleManager {
                     pm.connected_peer_addrs()
                         .into_iter()
                         .filter(|a| pm.is_advertisable(a))
+                        .filter(|a| !crate::node::networking::is_non_public_ip(a.ip()))
                         .collect()
                 };
                 tokio::select! {
