@@ -2808,61 +2808,23 @@ mod tests {
         tx
     }
 
-    #[test]
-    fn test_pv10_withdrawal_must_be_delegated() {
-        // PV=10, undelegated key-hash withdrawal -> error
-        let rules = ConwayRules::new();
-        let mut params = ProtocolParameters::mainnet_defaults();
-        params.protocol_version_major = 10;
-        let ctx = make_conway_ctx(&params);
-
-        let cred = [0xAA; 28];
-        let reward_addr = make_key_reward_address(cred);
-        let cred_hash = key_cred_hash(cred);
-
-        // Set up a reward account with some balance.
-        let mut certs = make_cert_sub();
-        Arc::make_mut(&mut certs.reward_accounts).insert(cred_hash, Lovelace(1_000_000));
-
-        // No vote delegation for this credential.
-        let mut gov = make_gov_sub();
-        // governance.vote_delegations is empty.
-
-        let mut epochs = make_epoch_sub();
-
-        let input = make_input(0x01, 0);
-        let addr = make_enterprise_address(Hash28::from_bytes([0x01; 28]));
-        let output = make_output(addr.clone(), 10_000_000);
-        let mut utxo = make_utxo_sub(vec![(input.clone(), output)]);
-
-        let mut withdrawals = BTreeMap::new();
-        withdrawals.insert(reward_addr, Lovelace(1_000_000));
-
-        let tx = make_tx_with_withdrawals(
-            0x10,
-            withdrawals,
-            vec![input],
-            vec![make_output(addr, 9_000_000)],
-            1_000_000,
-        );
-
-        let result = rules.apply_valid_tx(
-            &tx,
-            BlockValidationMode::ApplyOnly,
-            &ctx,
-            &mut utxo,
-            &mut certs,
-            &mut gov,
-            &mut epochs,
-        );
-
-        assert!(result.is_err(), "Expected WithdrawalNotDelegated error");
-        let err_msg = format!("{}", result.unwrap_err());
-        assert!(
-            err_msg.contains("WithdrawalNotDelegated"),
-            "Error should mention WithdrawalNotDelegated, got: {err_msg}"
-        );
-    }
+    // NOTE: PV10 `validateWithdrawalsDelegated` and
+    // `testIncompleteAndMissingWithdrawals` are Phase-1 mempool / tx-validation
+    // checks in the Haskell spec — they live in `crates/dugite-ledger/src/
+    // validation/` and run during `TxValidator::validate_tx` before mempool
+    // admission, NOT during block apply. The previous tests
+    // `test_pv10_withdrawal_must_be_delegated` and
+    // `test_pv10_withdrawal_amount_must_match_balance` asserted these checks
+    // ran inside `ConwayRules::apply_valid_tx`, which was the original
+    // (incorrect) placement; that path was removed in 9a631979e ("fix(ledger):
+    // remove PV10 withdrawal checks from block application path") to fix
+    // false WithdrawalAmountMismatch rejections caused by reward-balance
+    // discrepancy with Haskell at the PV10 boundary on preview testnet.
+    // The success-path tests below (`test_pv10_withdrawal_delegated_succeeds`,
+    // `test_pv10_withdrawal_amount_match_succeeds`,
+    // `test_pv10_script_withdrawal_not_checked`,
+    // `test_pv9_no_withdrawal_check`) verify that block-apply does NOT
+    // enforce these checks.
 
     #[test]
     fn test_pv10_withdrawal_delegated_succeeds() {
@@ -2970,63 +2932,10 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_pv10_withdrawal_amount_must_match_balance() {
-        // PV=10, withdrawal amount != balance -> error
-        let rules = ConwayRules::new();
-        let mut params = ProtocolParameters::mainnet_defaults();
-        params.protocol_version_major = 10;
-        let ctx = make_conway_ctx(&params);
-
-        let cred = [0xDD; 28];
-        let reward_addr = make_key_reward_address(cred);
-        let cred_hash = key_cred_hash(cred);
-
-        // Balance is 1_000_000 but withdrawal asks for 500_000.
-        let mut certs = make_cert_sub();
-        Arc::make_mut(&mut certs.reward_accounts).insert(cred_hash, Lovelace(1_000_000));
-
-        // Must be delegated to pass step 3.
-        let mut gov = make_gov_sub();
-        Arc::make_mut(&mut gov.governance)
-            .vote_delegations
-            .insert(cred_hash, DRep::Abstain);
-
-        let mut epochs = make_epoch_sub();
-
-        let input = make_input(0x04, 0);
-        let addr = make_enterprise_address(Hash28::from_bytes([0x04; 28]));
-        let output = make_output(addr.clone(), 10_000_000);
-        let mut utxo = make_utxo_sub(vec![(input.clone(), output)]);
-
-        let mut withdrawals = BTreeMap::new();
-        withdrawals.insert(reward_addr, Lovelace(500_000)); // mismatch!
-
-        let tx = make_tx_with_withdrawals(
-            0x13,
-            withdrawals,
-            vec![input],
-            vec![make_output(addr, 9_500_000)],
-            1_000_000,
-        );
-
-        let result = rules.apply_valid_tx(
-            &tx,
-            BlockValidationMode::ApplyOnly,
-            &ctx,
-            &mut utxo,
-            &mut certs,
-            &mut gov,
-            &mut epochs,
-        );
-
-        assert!(result.is_err(), "Expected WithdrawalAmountMismatch error");
-        let err_msg = format!("{}", result.unwrap_err());
-        assert!(
-            err_msg.contains("WithdrawalAmountMismatch"),
-            "Error should mention WithdrawalAmountMismatch, got: {err_msg}"
-        );
-    }
+    // `test_pv10_withdrawal_amount_must_match_balance` removed — see the
+    // module-level note above `test_pv10_withdrawal_delegated_succeeds`.
+    // The amount-mismatch check (`testIncompleteAndMissingWithdrawals`) is a
+    // Phase-1 mempool check, not a block-apply check.
 
     #[test]
     fn test_pv10_script_withdrawal_not_checked() {
