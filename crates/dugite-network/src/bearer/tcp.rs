@@ -78,6 +78,17 @@ impl TcpBearer {
         Self::new(stream)
     }
 
+    /// Local socket address (`(local_ip, local_port)`) of this bearer's stream.
+    ///
+    /// This is the source endpoint chosen by the OS (or by an explicit `bind`
+    /// in `connect_from`). Together with the peer address it forms the
+    /// `ConnectionId` used by the lifecycle manager to distinguish concurrent
+    /// connections to the same remote — matching Haskell ouroboros-network's
+    /// `ConnectionId { localAddress, remoteAddress }` keying.
+    pub fn local_addr(&self) -> std::io::Result<std::net::SocketAddr> {
+        self.stream.local_addr()
+    }
+
     /// Connect to a remote address with the source port bound to `local_addr`.
     ///
     /// This is the duplex-pairing convention used by Haskell ouroboros-network

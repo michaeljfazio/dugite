@@ -1,6 +1,6 @@
 ---
 name: DuplexPeerConnection implementation
-description: Phase 1+2 of full-duplex N2N connections for issue #187 (mempool tx propagation)
+description: Full-duplex N2N: ConnectionId tuple keying + simultaneous-open Overwritten + bind-to-listen-port (2026-04-29)
 type: project
 ---
 
@@ -10,7 +10,7 @@ type: project
 
 **What was built:** `crates/dugite-network/src/duplex.rs` — `DuplexPeerConnection` (Phase 1) and `serve_tx_submission` (Phase 2).
 
-**How to apply:** Phase 3 (not yet done) wires `DuplexPeerConnection` into the sync loop in place of `PipelinedPeerClient` for active/hot peers.
+**Phase 3 (2026-04-29):** `ConnectionLifecycleManager` now keys connections by `ConnectionId { local, remote }` matching Haskell `Ouroboros.Network.ConnectionId`. Outbound + inbound to the same remote coexist when their (local, remote) tuples differ, and same-CID collisions follow Haskell's `Overwritten` rule (inbound wins, outbound yields). `set_local_listen_addr` is wired in `mod.rs` for InitiatorAndResponder mode and the N2N listener now binds with `SO_REUSEADDR + SO_REUSEPORT` (`bind_n2n_listener`) so outbound `connect_from(listen_addr)` can succeed on Linux/macOS. With this, a co-located cardano-node relay's REUSEPORT outbound to dugite at `127.0.0.1:listen` produces an inbound that does NOT collide with our outbound (different local ports) — block diffusion path is fully duplex symmetric.
 
 ## Key implementation details
 

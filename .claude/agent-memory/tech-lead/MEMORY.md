@@ -20,6 +20,7 @@
 - [ChainSync server direction bug](network-chainsync-direction-bug.md) — InitiatorAndResponder role confusion; TxSubmission2 deadlock (server sends MsgRequestTxIds first)
 - [Duplex connection architecture](network-duplex-connection.md) — Phase 1+2 implementation; pallas plexer semantics; Phase 3 pending
 - [Duplex Phase 3 integration](node-duplex-phase3.md) — into_pipelined() conversion; TxSubmission2 responder JoinHandle
+- [ConnectionId tuple keying 2026-04-29](connection-id-tuple-keying.md) — connections keyed by `(local, remote)`; Overwritten simultaneous-open; `SO_REUSEPORT` listener; unblocks co-located BP+relay diffusion
 
 ## Consensus
 - [LoE enforcement](consensus-loe-enforcement.md) — flush_to_immutable_loe() gating in block pipeline; GSM integration
@@ -46,7 +47,7 @@
 - [LSM perf baselines](storage-lsm-perf-baselines.md) — Mainnet-scale test runtimes on M-series (1M insert ~25s, total ~27.5s)
 - [Large tests feature](storage-large-tests-feature.md) — Feature flag design, key/value sizing, deterministic PRNG
 - [ImmutableDB stale fork repair](storage-immutabledb-fork-repair.md) — Delete stale chunk files + rewrite tip.meta (48-byte BE: slot/hash/block_no) to fix gap-bridge loop after fork flush
-- [Fork snapshot recovery (2026-04-22)](node-fork-snapshot-recovery.md) — BP forged un-adopted block → volatile-range snapshot on fork → replay stuck; fix in replay_from_lsm (ff8f43e44)
+- [Fork snapshot recovery (2026-04-22)](node-fork-snapshot-recovery.md) — BP forged un-adopted block → volatile-range blind spot in is_snapshot_canonical + replay_from_lsm; 3-layer fix: 059c131+ff8f43e+abb370fe
 
 ## Serialization
 - [Serialization test coverage](crypto-serialization-tests.md) — 133 tests, public API patterns, PPU extraction for integration tests
