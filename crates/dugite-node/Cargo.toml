@@ -56,6 +56,7 @@ pallas-traverse = { workspace = true }
 sha2 = { workspace = true }
 ed25519-dalek = { workspace = true }
 memmap2 = { workspace = true }
+socket2 = { workspace = true }
 crc32fast = { workspace = true }
 fs2 = { workspace = true }
 rayon = { workspace = true }

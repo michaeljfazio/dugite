@@ -89,6 +89,25 @@ pub struct PeerConnection {
     /// Remote peer address.
     pub addr: SocketAddr,
 
+    /// Local socket address (source endpoint of this connection).
+    ///
+    /// Together with `addr`, this forms the `ConnectionId` used by the
+    /// lifecycle manager to distinguish concurrent connections to the same
+    /// remote. For outbound connections this is the OS-chosen ephemeral
+    /// source (or a bound listen-port when [`PeerConnection::connect`] was
+    /// given a `local_listen_addr`). For inbound connections this is our
+    /// listen address. Matches Haskell ouroboros-network's
+    /// `ConnectionId { localAddress, remoteAddress }`.
+    pub local_addr: SocketAddr,
+
+    /// Whether we initiated this TCP connection (outbound) or accepted it (inbound).
+    ///
+    /// Determines which connection in a duplex pair runs initiator-side hot
+    /// protocols (ChainSync client / BlockFetch client / TxSubmission2 client).
+    /// In Haskell, the outbound side runs the client bundle; the inbound side
+    /// only runs the responder bundle (servers).
+    pub direction: PeerConnectionDirection,
+
     /// Negotiated N2N protocol version (14 or 15).
     pub version: u16,
 
@@ -157,6 +176,20 @@ pub struct PeerConnection {
     server_tasks: Vec<(JoinHandle<()>, CancellationToken)>,
 }
 
+/// Direction of a peer connection at the TCP level.
+///
+/// Mirrors `Ouroboros.Network.ConnectionManager.Types.Provenance` and is used
+/// by the lifecycle manager to pick the correct connection for client-side
+/// hot-protocol promotion when both an outbound and an inbound connection
+/// exist to the same remote (duplex peer).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PeerConnectionDirection {
+    /// We dialed the peer (TCP `connect`).
+    Outbound,
+    /// The peer dialed us (TCP `accept`).
+    Inbound,
+}
+
 /// A boxed future type for protocol task factories.
 ///
 /// Protocol task factories are async closures that receive a `MuxChannel`
@@ -219,7 +252,15 @@ impl PeerConnection {
             .map_err(|_| PeerConnectionError::ConnectTimeout(addr))?
             .map_err(|e| PeerConnectionError::Connect(addr, e.to_string()))?;
 
-        info!(%addr, "TCP connected, starting mux + handshake");
+        // Capture the OS-assigned (or REUSEPORT-bound) local source address
+        // before the bearer moves into the mux. Used to build `ConnectionId`
+        // — matches Haskell `Ouroboros.Network.ConnectionId` keying.
+        let local_addr = bearer.local_addr().unwrap_or_else(|_| match addr {
+            SocketAddr::V4(_) => "0.0.0.0:0".parse().unwrap(),
+            SocketAddr::V6(_) => "[::]:0".parse().unwrap(),
+        });
+
+        info!(%addr, %local_addr, "TCP connected, starting mux + handshake");
 
         // Create mux (we are initiator).
         let mut mux = Mux::new(bearer, true);
@@ -310,6 +351,8 @@ impl PeerConnection {
 
         Ok(Self {
             addr,
+            local_addr,
+            direction: PeerConnectionDirection::Outbound,
             version,
             network_magic,
             chainsync_client_channel: Some(chainsync_client_ch),
@@ -351,10 +394,19 @@ impl PeerConnection {
         initiator_only: bool,
         peer_sharing: bool,
     ) -> Result<Self, PeerConnectionError> {
+        // Capture the local (listen-side) address from the accepted socket
+        // before it moves into the bearer. Pairs with `addr` (peer) to form
+        // the `ConnectionId`. Matches Haskell `Ouroboros.Network.Server.Sock`
+        // which records `localAddress` from the accepted socket.
+        let local_addr = stream.local_addr().unwrap_or_else(|_| match addr {
+            SocketAddr::V4(_) => "0.0.0.0:0".parse().unwrap(),
+            SocketAddr::V6(_) => "[::]:0".parse().unwrap(),
+        });
+
         let bearer = TcpBearer::new(stream)
             .map_err(|e| PeerConnectionError::Connect(addr, e.to_string()))?;
 
-        info!(%addr, "accepted inbound connection, starting mux + handshake");
+        info!(%addr, %local_addr, "accepted inbound connection, starting mux + handshake");
 
         // Create mux (we are responder).
         let mut mux = Mux::new(bearer, false);
@@ -446,6 +498,8 @@ impl PeerConnection {
 
         Ok(Self {
             addr,
+            local_addr,
+            direction: PeerConnectionDirection::Inbound,
             version,
             network_magic,
             chainsync_client_channel: cs_cli,
@@ -802,9 +856,26 @@ impl PeerConnection {
     /// channels are `None`, and all task lists are empty.  The instance
     /// must be created inside a tokio runtime context (e.g. `#[tokio::test]`).
     pub(crate) fn fake_for_test(addr: SocketAddr) -> Self {
+        let local_addr: SocketAddr = match addr {
+            SocketAddr::V4(_) => "127.0.0.1:0".parse().unwrap(),
+            SocketAddr::V6(_) => "[::1]:0".parse().unwrap(),
+        };
+        Self::fake_for_test_with_local(addr, local_addr, PeerConnectionDirection::Outbound)
+    }
+
+    /// Variant of [`fake_for_test`] that also pins the `local_addr` and
+    /// direction so tests can build distinct `ConnectionId`s for the same
+    /// remote (e.g. an outbound + inbound duplex pair).
+    pub(crate) fn fake_for_test_with_local(
+        addr: SocketAddr,
+        local_addr: SocketAddr,
+        direction: PeerConnectionDirection,
+    ) -> Self {
         let mux_handle = tokio::spawn(async { Ok::<(), MuxError>(()) });
         Self {
             addr,
+            local_addr,
+            direction,
             version: 0,
             network_magic: 0,
             chainsync_client_channel: None,

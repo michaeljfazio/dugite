@@ -56,6 +56,32 @@ use crate::genesis::{AlonzoGenesis, ByronGenesis, ConwayGenesis, ShelleyGenesis}
 use crate::metrics::GovernanceSnapshot;
 use crate::topology::Topology;
 
+/// Bind the N2N listener with `SO_REUSEADDR` + `SO_REUSEPORT` (Unix) so
+/// outbound connections from this node can share the listen port via
+/// [`dugite_network::TcpBearer::connect_from`]. Matches Haskell
+/// ouroboros-network `configureSocket` behaviour. Returns a tokio
+/// `TcpListener` ready for `accept()`.
+fn bind_n2n_listener(addr: SocketAddr) -> std::io::Result<tokio::net::TcpListener> {
+    use socket2::{Domain, Protocol, Socket, Type};
+
+    let domain = match addr {
+        SocketAddr::V4(_) => Domain::IPV4,
+        SocketAddr::V6(_) => Domain::IPV6,
+    };
+    let socket = Socket::new(domain, Type::STREAM, Some(Protocol::TCP))?;
+    socket.set_reuse_address(true)?;
+    #[cfg(unix)]
+    {
+        // Best-effort — REUSEPORT may be unavailable on some Unixes.
+        let _ = socket.set_reuse_port(true);
+    }
+    socket.set_nonblocking(true)?;
+    socket.bind(&addr.into())?;
+    socket.listen(128)?;
+    let std_listener: std::net::TcpListener = socket.into();
+    tokio::net::TcpListener::from_std(std_listener)
+}
+
 /// Flatten a `LedgerState` into the primitive [`GovernanceSnapshot`] consumed
 /// by [`crate::metrics::NodeMetrics::set_governance_snapshot`].
 ///
@@ -2119,7 +2145,13 @@ impl Node {
                 "N2N server listening"
             );
 
-            let tcp_listener = match tokio::net::TcpListener::bind(n2n_listen_addr).await {
+            // Bind the N2N listener with SO_REUSEADDR + SO_REUSEPORT (on Unix)
+            // so that outbound connections from this same node — which pin
+            // their source port to `n2n_listen_addr` via `TcpBearer::connect_from`
+            // — can share the listen port. Matches Haskell ouroboros-network
+            // `configureSocket` which sets these options on both inbound and
+            // outbound sockets so duplex-paired connections are possible.
+            let tcp_listener = match bind_n2n_listener(n2n_listen_addr) {
                 Ok(l) => l,
                 Err(e) => {
                     error!("Failed to bind N2N TCP listener on {n2n_listen_addr}: {e}");
@@ -2406,7 +2438,7 @@ impl Node {
             .as_ref()
             .map(|g| g.active_slots_coeff)
             .unwrap_or(0.05);
-        let lifecycle = ConnectionLifecycleManager::new(
+        let mut lifecycle = ConnectionLifecycleManager::new(
             self.network_magic,
             self.config
                 .effective_peer_sharing(self.block_producer.is_some()),
@@ -2438,19 +2470,19 @@ impl Node {
             rollback_event_tx,
             peer_manager.clone(),
         );
-        // NOTE: outbound source-port pairing (bind-to-listen-port) is wired
-        // but disabled by default. Enabling it in the lifecycle manager
-        // requires platform-specific REUSEPORT semantics that work for
-        // bind-on-already-listening port (Linux supports this with
-        // SO_REUSEPORT on both the listener and outbound socket; macOS does
-        // not by default and falls back to ephemeral source port). Without
-        // a working duplex-source bind, two connections to the same logical
-        // peer arrive on dugite's accept path with colliding keys, which the
-        // current connection-manager design cannot represent. A follow-up
-        // refactor needs to track connections by ConnectionId
-        // (localAddr, remoteAddr) tuples so inbound and outbound to the
-        // same remote can coexist — matching Haskell's
-        // `Ouroboros.Network.ConnectionManager`.
+        // Enable outbound source-port pairing only when this node is also
+        // running as a responder (it has a listen socket to share). When
+        // diffusion mode is InitiatorOnly there is no listen port to pair
+        // against, so we leave outbound on ephemeral source ports.
+        // `connect_from` falls back to ephemeral on bind failure, so this is
+        // safe on platforms without working SO_REUSEPORT semantics.
+        if self.config.diffusion_mode == crate::config::DiffusionMode::InitiatorAndResponder {
+            lifecycle.set_local_listen_addr(self.listen_addr);
+            info!(
+                listen = %self.listen_addr,
+                "outbound source-port pairing enabled (matches Haskell configureOutboundSocket)"
+            );
+        }
         self.connection_lifecycle = Some(lifecycle);
         self.fetched_blocks_rx = Some(fetched_blocks_rx);
         self.peer_failure_rx = Some(peer_failure_rx);
@@ -2880,7 +2912,7 @@ impl Node {
                         Ok((addr, conn, rtt_ms)) => {
                             if let Some(ref mut lifecycle) = self.connection_lifecycle {
                                 let mut pm = peer_manager.write().await;
-                                match lifecycle.register_inbound_connection(addr, conn, rtt_ms, &mut pm) {
+                                match lifecycle.register_inbound_connection(addr, conn, rtt_ms, &mut pm).await {
                                     Ok(()) => {
                                         info!(%addr, rtt_ms = format_args!("{rtt_ms:.0}"), "inbound connection registered");
                                         // Update all peer metrics (including n2n_connections_active)
