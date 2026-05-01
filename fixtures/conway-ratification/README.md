@@ -1,9 +1,34 @@
 # Conway ratification fixtures
 
 Offline JSON fixtures consumed by
-`crates/dugite-ledger/tests/conway_ratification.rs`. Captured once via
-`target/debug/capture-ratification-fixture` against the public preview Koios
-endpoint and committed. **No live network access at test time.**
+`crates/dugite-ledger/tests/conway_ratification.rs`. Two committed fixtures
+are real preview captures (`preview-pparam-1096.json` and
+`preview-pparam-dropped-1216.json`); the test file also embeds two
+synthetic correctness-gate fixtures inline. **No live network access at
+test time.**
+
+## Fixture schema
+
+The schema is a faithful projection of the Haskell `RatifyEnv` /
+`RatifyState` inputs onto JSON, defined in
+`crates/dugite-ledger/tests/common/ratification_fixture.rs`:
+
+| Field | Maps to (Haskell) | Notes |
+|---|---|---|
+| `proposal` | `GovActionState.gasProposalProcedure` | `action` is the Koios `proposal_description` blob, fed through a fail-closed reconstructor. |
+| `votes` | `Voter -> VotingProcedure` | One entry per voter; the loader builds `votes_by_action`. |
+| `drep_power` | `RatifyEnv.reDRepDistr` (DRepCredential keys) | Map of typed-Hash32 hex (28-byte hash + `0x00`/`0x01` discriminator + 3 zero pad) → lovelace. |
+| `drep_no_confidence` | `RatifyEnv.reDRepDistr[DRepAlwaysNoConfidence]` | Aggregate. |
+| `drep_abstain` | `RatifyEnv.reDRepDistr[DRepAlwaysAbstain]` | Aggregate. |
+| `spo_stake` | `RatifyEnv.reStakePoolDistr.unPoolDistr` | Map of raw 28-byte pool hex → `individualTotalPoolStake`. |
+| `pool_reward_accounts` | `RatifyEnv.reStakePools` | Pool ID hex → 29-byte reward account hex. Required for `defaultStakePoolVote`. |
+| `vote_delegations` | `RatifyEnv.reAccounts.dRepDelegationAccountStateL` | Stake credential typed-Hash32 hex → DRep variant. |
+| `no_confidence` | `EnactState.no_confidence` (live) | Read live by the `UpdateCommittee` branch (NOT from snapshot). |
+| `committee` | `RatifyEnv.reCommitteeState` + `EnactState.ensCommittee.committeeThreshold` | Cold/hot keys are typed-Hash32 hex; threshold is a `{numerator, denominator}` rational. |
+| `pparams` | Subset of `EnactState.ensCurPParams` actually read by RATIFY | Every `dvt_*` and `pvt_*` threshold, plus `protocol_version_major`, `committee_min_size`, `committee_max_term_length`. |
+| `parent_enacted` | `EnactState.ensPrevGovActionIds` | Four optional roots (PParamUpdate / HardFork / Committee / Constitution). |
+| `expected_outcome` | RATIFY result | Drives test assertions. |
+| `provenance` | n/a | Capture metadata; not consumed by the loader. |
 
 ## Capturing a new fixture
 
@@ -15,34 +40,76 @@ cargo build -p dugite-cli --bin capture-ratification-fixture
     --output fixtures/conway-ratification/<name>.json
 ```
 
-The helper queries `proposal_list`, `proposal_voting_summary`,
-`proposal_votes`, `pool_voting_power_history`, `committee_info`, and
-`epoch_params`, then transforms the raw Koios responses into the canonical
-`RatificationFixture` JSON shape that the test loader consumes.
+The capture binary queries (in order):
+`proposal_list`, `proposal_votes`, `epoch_params`,
+`pool_voting_power_history`, `pool_info` (per voting pool, for the reward
+account), `committee_info`, `drep_list`, `drep_voting_power_history`
+(per registered DRep, with bounded concurrency + retry), and
+`drep_delegators` (for the always-abstain / always-no-confidence pseudo-
+DReps). It transforms each response into the canonical schema above and
+writes a single JSON file.
+
+The DRep snapshot is the dominant cost — capturing all preview DReps
+takes a few minutes against the public Koios free tier. Pass
+`--skip-drep-snapshot` to omit it for bootstrap-era fixtures (PV=9
+auto-passes all DRep thresholds, so the snapshot is unread).
 
 After capture, add a `#[test]` in
-`crates/dugite-ledger/tests/conway_ratification.rs` that loads the new file.
+`crates/dugite-ledger/tests/conway_ratification.rs` that loads the new
+file and asserts the expected outcome.
 
-## Stubbed snapshot fields
+## Synthetic correctness gates
 
-The capture helper leaves several fields as zero/empty placeholders.  The
-positive test (`ratifies_first_positive_preview_proposal`) bypasses them by
-running in Conway bootstrap phase (protocol version 9 → DRep thresholds
-auto-pass) with the SPO Security-group threshold zeroed in the loader:
+Two synthetic fixtures live inline in
+`crates/dugite-ledger/tests/conway_ratification.rs`:
 
-- `drep_power`, `drep_no_confidence`, `drep_abstain`, `total_drep_stake`
-  — ignored in bootstrap phase
-- `spo_stake`, `total_spo_stake` — ignored because the loader zeros
-  `pvt_pp_security_group`
-- `pparams` — left as `{}`; `ratify_proposals` reads thresholds from
-  `LedgerState::protocol_params`, not the fixture blob
+* `ratifies_post_bootstrap_with_abstain_delegated_pools` — exercises the
+  Haskell `defaultStakePoolVote` rule. 1 voting pool (Yes), 4 non-voting
+  pools whose reward accounts delegate to `DRepAlwaysAbstain`. Ratifies
+  iff non-voters resolve to `DefaultVote::Abstain` and are excluded from
+  the SPO denominator. A broken implementation that returns
+  `DefaultVote::No` causes the SPO ratio to collapse to 1/5 and the test
+  fails.
 
-The **committee members** and **parent_enacted.PParamUpdate** fields must be
-filled in manually after capture (the helper can't derive them from the
-Koios `proposal_list` row alone):
+* `ratifies_bootstrap_with_non_voting_pools_as_abstain` — exercises the
+  bootstrap (PV=9) non-voter rule for non-HardFork actions. Same setup
+  as above but no `vote_delegations`. Ratifies iff bootstrap non-voters
+  count as Abstain. A broken implementation that counts them as No
+  fails the SPO ratio.
 
-- `committee.members[].hot_key` is the 28-byte CC hot credential hash with a
-  type byte suffix (`01` for script, `00` for key-hash) padded to 32 bytes —
-  matches `Credential::to_typed_hash32`
-- `parent_enacted.PParamUpdate` must equal the proposal's own
-  `prev_action_id` so `prev_action_as_expected` threads correctly
+These tests are intentionally asymmetric — the rule under test is the
+only thing that distinguishes pass from fail, so a regression that
+touches either path is caught immediately.
+
+## Coverage gates
+
+`crates/dugite-ledger/tests/common/ratification_fixture.rs` includes:
+
+* `full_ppu_decoder_covers_every_known_field` — asserts that every PPU
+  JSON key emitted by Koios is decoded into a `Some(_)` field on
+  `ProtocolParamUpdate`. Acts as a regression test against silent PPU
+  coverage gaps.
+* `unknown_ppu_field_is_fail_closed` — asserts that an unrecognized PPU
+  key panics rather than being silently ignored. Critical to prevent
+  new ledger fields from quietly producing wrong group classification.
+
+When a new PPU field is added in cardano-ledger, both
+`koios_protocol_param_update` and `KNOWN_PPU_FIELDS` in the loader
+must be extended; the second test will fail until the first is updated.
+
+## Hash encodings — quick reference
+
+Two byte-formats appear repeatedly:
+
+* **Typed Hash32** (used for credentials — DRep, CC, stake): 28-byte
+  Blake2b-224 hash, followed by `0x00` (key) or `0x01` (script), followed
+  by 3 zero bytes. 64 hex characters total. Matches
+  `Credential::to_typed_hash32`. Used for `drep_power` keys, all
+  `committee.*` keys, and `vote_delegations` keys.
+* **Raw Hash28** (used for pool IDs): 28-byte Blake2b-224 hash, no
+  discriminator. 56 hex characters total. Used for `spo_stake` keys and
+  `pool_reward_accounts` keys.
+
+The capture binary handles all encoding internally; hand-edited fixtures
+must follow the same convention or the loader will silently miss the
+lookup (e.g. CC votes appear to be from members nobody recognizes).

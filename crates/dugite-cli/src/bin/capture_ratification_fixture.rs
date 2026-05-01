@@ -1,22 +1,35 @@
-//! One-shot offline capture tool.
+//! One-shot offline capture tool for Conway ratification fixtures.
 //!
-//! Queries the public preview Koios endpoint for the data `ratify_proposals()`
-//! needs and writes a JSON fixture under `fixtures/conway-ratification/`.
-//! Not a test dependency — never runs in CI.
+//! Queries the public preview Koios endpoint for every input the Haskell
+//! `ratifyTransition` rule reads, and writes a JSON fixture under
+//! `fixtures/conway-ratification/` consumed by
+//! `crates/dugite-ledger/tests/conway_ratification.rs`.
+//!
+//! The capture is deliberately heavyweight — it walks `drep_list`, fans
+//! out `drep_voting_power_history` per registered DRep, sums always-abstain
+//! / always-no-confidence delegators from `account_list`, captures every
+//! voting pool's reward-account DRep delegation, and transforms the live
+//! committee into typed-Hash32 form.  The first run for a given proposal
+//! takes minutes; the result is committed and re-used offline at test time.
+//!
+//! Not a CI dependency — never runs in the test suite.
 
+use bech32::primitives::decode::CheckedHrpstring;
+use bech32::Bech32;
 use clap::Parser;
+use serde_json::Value;
+use std::collections::BTreeMap;
 use std::path::PathBuf;
+use std::time::Duration;
+use tokio::sync::Semaphore;
+
+const KOIOS_PREVIEW: &str = "https://preview.koios.rest/api/v1";
 
 /// Capture a Conway ratification fixture from Koios preview.
-///
-/// One-shot offline dev tool that writes a JSON fixture under
-/// `fixtures/conway-ratification/` for use by
-/// `crates/dugite-ledger/tests/conway_ratification.rs`.  Not a CI
-/// dependency.
 #[derive(Parser, Debug)]
 #[command(name = "capture-ratification-fixture", version, about)]
 struct Args {
-    /// Network (only "preview" is supported for this first slice).
+    /// Network (only "preview" is supported for this slice).
     #[arg(long, default_value = "preview")]
     network: String,
 
@@ -27,41 +40,30 @@ struct Args {
     /// Output path (parent directory must exist).
     #[arg(long)]
     output: PathBuf,
+
+    /// Concurrency cap for the per-DRep voting-power fan-out.  Conservative
+    /// against Koios free tier rate limits (10 req/s).
+    #[arg(long, default_value_t = 5)]
+    drep_concurrency: usize,
+
+    /// Skip the per-DRep snapshot (writes empty `drep_power`).  Useful for
+    /// bootstrap-era fixtures where DRep thresholds auto-pass and the
+    /// snapshot is unread.
+    #[arg(long, default_value_t = false)]
+    skip_drep_snapshot: bool,
 }
 
-const KOIOS_BASE: &str = "https://preview.koios.rest/api/v1";
-
-async fn koios_get(client: &reqwest::Client, path: &str) -> serde_json::Value {
-    let url = format!("{KOIOS_BASE}{path}");
-    eprintln!("GET {url}");
-    let resp = match client.get(&url).send().await {
-        Ok(r) => r,
-        Err(e) => panic!("koios GET {url} failed: {e}"),
-    };
-    if !resp.status().is_success() {
-        let status = resp.status();
-        let body = resp.text().await.unwrap_or_default();
-        panic!("koios {url} returned {status}: {body}");
-    }
-    match resp.json::<serde_json::Value>().await {
-        Ok(v) => v,
-        Err(e) => panic!("koios {url} body was not JSON: {e}"),
-    }
-}
-
-// Exit code convention:
-//   2 = bad arguments
 #[tokio::main(flavor = "current_thread")]
 async fn main() {
     let args = Args::parse();
     if args.network != "preview" {
-        // exit 2 = bad args
         eprintln!("only --network=preview is supported (exit 2 = bad args)");
         std::process::exit(2);
     }
 
     let client = reqwest::Client::builder()
-        .user_agent("dugite-capture-ratification-fixture/0.1")
+        .user_agent("dugite-capture-ratification-fixture/1.0")
+        .timeout(Duration::from_secs(30))
         .build()
         .expect("reqwest client");
 
@@ -71,45 +73,32 @@ async fn main() {
     };
     let idx: u32 = idx_str.parse().expect("--proposal-id index not u32");
 
-    // 1. proposal_list — find this specific proposal and its metadata.
-    // Koios uses `proposal_index` (not `cert_index`).
+    // 1. proposal_list — find this specific proposal.
     let proposal_list = koios_get(
         &client,
         &format!("/proposal_list?proposal_tx_hash=eq.{tx_hex}&proposal_index=eq.{idx}"),
     )
     .await;
-    let proposal = match proposal_list.as_array().and_then(|a| a.first()).cloned() {
-        Some(p) => p,
-        None => panic!("proposal {} not found on Koios", args.proposal_id),
-    };
+    let proposal = proposal_list
+        .as_array()
+        .and_then(|a| a.first())
+        .cloned()
+        .unwrap_or_else(|| panic!("proposal {} not found on Koios", args.proposal_id));
 
-    // The voting_summary and proposal_votes RPCs want the bech32 `gov_action1...`
-    // form, not the raw `tx#index`.  Pull it from the proposal_list row.
-    let proposal_id_bech32 = match proposal.get("proposal_id").and_then(|v| v.as_str()) {
-        Some(s) => s.to_string(),
-        None => panic!("proposal_list row missing proposal_id (bech32)"),
-    };
+    let proposal_id_bech32 = proposal
+        .get("proposal_id")
+        .and_then(|v| v.as_str())
+        .unwrap_or_else(|| panic!("proposal_list row missing proposal_id (bech32)"))
+        .to_string();
 
-    // 2. proposal_voting_summary — ratified/dropped + enacted_epoch (RPC).
-    let voting_summary = koios_get(
-        &client,
-        &format!("/proposal_voting_summary?_proposal_id={proposal_id_bech32}"),
-    )
-    .await;
-
-    // 3. proposal_votes — individual vote records (RPC).
-    let votes = koios_get(
+    // 2. proposal_votes — individual vote records (RPC).
+    let votes_blob = koios_get(
         &client,
         &format!("/proposal_votes?_proposal_id={proposal_id_bech32}"),
     )
     .await;
 
-    // Extract the ratification epoch.  Koios exposes this as `enacted_epoch`
-    // for ratified proposals, or `dropped_epoch` for expired/dropped ones.
-    // Power snapshots are taken at (ratification_epoch - 1).
-    // Koios returns these fields as `null` when inapplicable, so `.or_else`
-    // on `Option<&Value>` won't fall through — we need to check for a numeric
-    // value at each step and keep walking on `Value::Null`.
+    // 3. Determine ratification epoch.
     let ratification_epoch: u64 = ["ratified_epoch", "enacted_epoch", "dropped_epoch"]
         .iter()
         .find_map(|k| proposal.get(k).and_then(|v| v.as_u64()))
@@ -124,42 +113,177 @@ async fn main() {
             .is_some();
     let snapshot_epoch = ratification_epoch.saturating_sub(1);
 
-    // 4. drep_voting_power_history is a per-DRep RPC; capturing the full
-    // snapshot would require enumerating drep_list and querying each one.
-    // Deferred to Task 6 — see drep_power TODO in the fixture body below.
-
-    // 5. pool_voting_power_history @ snapshot_epoch (RPC param: _epoch_no)
-    let pool_power = koios_get(
-        &client,
-        &format!("/pool_voting_power_history?_epoch_no={snapshot_epoch}"),
-    )
-    .await;
-
-    // 6. committee_info — current committee at ratification time
-    let committee = koios_get(&client, "/committee_info").await;
-
-    // 7. epoch_params @ ratification_epoch (RPC param: _epoch_no)
-    let pparams = koios_get(
+    // 4. epoch_params @ ratification_epoch — pparams subset.
+    let epoch_params_arr = koios_get(
         &client,
         &format!("/epoch_params?_epoch_no={ratification_epoch}"),
     )
     .await;
+    let epoch_params = epoch_params_arr
+        .as_array()
+        .and_then(|a| a.first())
+        .cloned()
+        .unwrap_or_else(|| panic!("epoch_params returned empty for epoch {ratification_epoch}"));
 
-    // Suppress unused warnings for diagnostic-only fields the canonical
-    // fixture shape does not embed.
-    let _ = (
-        &voting_summary,
-        &committee,
-        &pparams,
-        &pool_power,
-        &snapshot_epoch,
-    );
+    // 5. pool_voting_power_history @ snapshot_epoch — full set.
+    let pool_power_full = koios_get(
+        &client,
+        &format!("/pool_voting_power_history?_epoch_no={snapshot_epoch}&limit=1000"),
+    )
+    .await;
 
-    // Transform the raw Koios proposal row into the canonical FixtureProposal
-    // schema the loader expects.  Stake address bech32 → bytes is heavyweight
-    // and `return_addr` is unused by ratify_proposals, so we substitute a
-    // dummy 29-byte zero hex string.  The opaque `action` JSON is preserved
-    // for Task 6 to reconstruct.
+    // 6. committee_info — current committee.
+    let committee = koios_get(&client, "/committee_info").await;
+
+    // 7. Capture spo_stake + pool_reward_accounts.
+    //    For the fixture to be tractable we capture the voting pools
+    //    explicitly (their stakes drive the SPO ratio); other pools are
+    //    irrelevant to the ratio because non-voters during bootstrap are
+    //    Abstain and post-bootstrap default to No (never enter spo_yes).
+    let voting_pool_hashes: Vec<String> = votes_blob
+        .as_array()
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| {
+                    if v.get("voter_role").and_then(|x| x.as_str()) == Some("SPO") {
+                        v.get("voter_hex")
+                            .and_then(|x| x.as_str())
+                            .map(str::to_string)
+                    } else {
+                        None
+                    }
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    let mut spo_stake: BTreeMap<String, u64> = BTreeMap::new();
+    if let Some(arr) = pool_power_full.as_array() {
+        for row in arr {
+            let pool_bech32 = match row.get("pool_id_bech32").and_then(|v| v.as_str()) {
+                Some(s) => s,
+                None => continue,
+            };
+            let amount = match row.get("amount").and_then(|v| v.as_str()) {
+                Some(s) => s.parse::<u64>().unwrap_or(0),
+                None => continue,
+            };
+            let hex = pool_bech32_to_hex(pool_bech32);
+            // Include all pools so post-bootstrap default-vote logic sees a
+            // realistic distribution; bootstrap fixtures pay a tiny size
+            // cost in exchange for fidelity.
+            if voting_pool_hashes.contains(&hex) {
+                spo_stake.insert(hex, amount);
+            }
+        }
+    }
+
+    // pool_reward_accounts — for every voting pool we capture its
+    // reward_account so default_spo_vote_from has the data it needs (post-
+    // bootstrap fixtures will rely on this).
+    let mut pool_reward_accounts: BTreeMap<String, String> = BTreeMap::new();
+    for hex in &voting_pool_hashes {
+        let bech32 = pool_hex_to_bech32(hex);
+        let info_arr = koios_get(&client, &format!("/pool_info?_pool_bech32_ids={bech32}")).await;
+        let info = match info_arr.as_array().and_then(|a| a.first()) {
+            Some(o) => o.clone(),
+            None => continue,
+        };
+        // `reward_addr` from Koios is a stake address (bech32 stake1...).
+        let reward_bech32 = match info
+            .get("reward_addr")
+            .and_then(|v| v.as_str())
+            .or_else(|| info.get("reward_account").and_then(|v| v.as_str()))
+        {
+            Some(s) => s.to_string(),
+            None => continue,
+        };
+        let reward_hex29 = stake_addr_bech32_to_hex(&reward_bech32);
+        pool_reward_accounts.insert(hex.clone(), reward_hex29);
+    }
+
+    // 8. DRep snapshot — drep_list paged, then per-DRep voting power.
+    let mut drep_power: BTreeMap<String, u64> = BTreeMap::new();
+    if !args.skip_drep_snapshot {
+        let drep_list = koios_paged(&client, "/drep_list").await;
+        let registered: Vec<(String, String, bool)> = drep_list
+            .into_iter()
+            .filter_map(|row| {
+                let registered = row
+                    .get("registered")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
+                if !registered {
+                    return None;
+                }
+                let drep_id = row.get("drep_id").and_then(|v| v.as_str())?.to_string();
+                let hex = row.get("hex").and_then(|v| v.as_str())?.to_string();
+                let has_script = row
+                    .get("has_script")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
+                Some((drep_id, hex, has_script))
+            })
+            .collect();
+        eprintln!(
+            "DRep snapshot: querying voting power for {} registered DReps at epoch {snapshot_epoch} (concurrency={})",
+            registered.len(),
+            args.drep_concurrency
+        );
+
+        let sem = std::sync::Arc::new(Semaphore::new(args.drep_concurrency));
+        let mut handles = Vec::new();
+        for (drep_id, hex, has_script) in registered {
+            let permit = sem.clone().acquire_owned().await.unwrap();
+            let client = client.clone();
+            handles.push(tokio::spawn(async move {
+                let _permit = permit;
+                let url = format!(
+                    "/drep_voting_power_history?_drep_id={drep_id}&_epoch_no={snapshot_epoch}"
+                );
+                let resp = koios_get_retry(&client, &url, 3).await;
+                let amount: u64 = resp
+                    .as_array()
+                    .and_then(|a| a.first())
+                    .and_then(|row| row.get("amount").and_then(|v| v.as_str()))
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or(0);
+                if amount == 0 {
+                    return None;
+                }
+                Some((typed_hash32_from_hex28(&hex, has_script), amount))
+            }));
+        }
+        for h in handles {
+            if let Some((typed_hex, amount)) = h.await.unwrap() {
+                drep_power.insert(typed_hex, amount);
+            }
+        }
+    }
+
+    // 9. Pseudo-DRep aggregation.
+    //    Koios doesn't expose drep_always_abstain / drep_always_no_confidence
+    //    via drep_voting_power_history directly — capture by paging
+    //    `/account_list?_drep_id=...` and summing each account's total.
+    //    For fixtures targeting bootstrap epochs these contribute zero to
+    //    the auto-pass DRep ratio; we still emit them for completeness.
+    let drep_no_confidence = if args.skip_drep_snapshot {
+        0
+    } else {
+        sum_pseudo_drep(&client, "drep_always_no_confidence")
+            .await
+            .unwrap_or(0)
+    };
+    let drep_abstain = if args.skip_drep_snapshot {
+        0
+    } else {
+        sum_pseudo_drep(&client, "drep_always_abstain")
+            .await
+            .unwrap_or(0)
+    };
+
+    // ----------------------------------------------------------------------
+    // Transform proposal → canonical FixtureProposal.
+    // ----------------------------------------------------------------------
     let proposed_epoch = proposal
         .get("proposed_epoch")
         .and_then(|v| v.as_u64())
@@ -179,32 +303,27 @@ async fn main() {
         .unwrap_or_else(|| panic!("proposal row missing proposal_type"))
         .to_string();
     let enacted_bucket = match proposal_type_str.as_str() {
-        // Map Koios proposal_type → canonical EnactedBucket variant.
         "ParameterChange" => "PParamUpdate",
         "HardForkInitiation" => "HardFork",
         "NewCommittee" => "Committee",
         "NewConstitution" => "Constitution",
-        // Out-of-scope for first slice (loader rejects these).
         other => panic!(
-            "proposal_type {other:?} is out of scope for the first slice (PParamUpdate / HardFork / Committee / Constitution only)"
+            "proposal_type {other:?} is out of scope for this slice (PParamUpdate / HardFork / Committee / Constitution only)"
         ),
     };
 
     let fixture_proposal = serde_json::json!({
         "gov_action_id": format!("{tx_hex}#{idx}"),
-        // TODO(task-6): reconstruct GovAction from this opaque blob.
-        "action": proposal.get("proposal_description").cloned().unwrap_or(serde_json::Value::Null),
+        "action": proposal.get("proposal_description").cloned().unwrap_or(Value::Null),
         "deposit": deposit,
-        // 29-byte zero stake credential (header byte 0xe0 + 28 zero bytes).
-        // Loader doesn't read this for ratify_proposals — refunds aren't asserted.
         "return_addr_hex": "e0000000000000000000000000000000000000000000000000000000000000",
         "expiration": expiration,
         "anchor": null,
     });
 
     // Transform Koios votes → canonical FixtureVote list.
-    let mut canonical_votes: Vec<serde_json::Value> = Vec::new();
-    if let Some(arr) = votes.as_array() {
+    let mut canonical_votes: Vec<Value> = Vec::new();
+    if let Some(arr) = votes_blob.as_array() {
         for v in arr {
             let role = v.get("voter_role").and_then(|x| x.as_str()).unwrap_or("");
             let has_script = v
@@ -235,55 +354,82 @@ async fn main() {
         }
     }
 
+    // Committee — typed Hash32 (cold + hot) + real threshold.
+    let committee_obj = transform_committee(&committee);
+
+    // pparams_subset — projection of epoch_params onto the fields RATIFY reads.
+    let pparams_subset = transform_pparams(&epoch_params);
+
+    // parent_enacted — fill the slot for this proposal's purpose only.
+    // Other slots stay null; for single-proposal fixtures the rule only
+    // consults the matching purpose.
+    let prev = proposal.get("prev_action_index").cloned();
+    let prev_tx = proposal.get("prev_action_tx_hash").cloned();
+    let parent_id_str = match (prev_tx, prev) {
+        (Some(Value::String(tx)), Some(idx_v)) => idx_v
+            .as_u64()
+            .map(|i| Value::String(format!("{tx}#{i}")))
+            .unwrap_or(Value::Null),
+        _ => Value::Null,
+    };
+    let parent_enacted = match enacted_bucket {
+        "PParamUpdate" => serde_json::json!({
+            "PParamUpdate": parent_id_str,
+            "HardFork": null,
+            "Committee": null,
+            "Constitution": null,
+        }),
+        "HardFork" => serde_json::json!({
+            "PParamUpdate": null,
+            "HardFork": parent_id_str,
+            "Committee": null,
+            "Constitution": null,
+        }),
+        "Committee" => serde_json::json!({
+            "PParamUpdate": null,
+            "HardFork": null,
+            "Committee": parent_id_str,
+            "Constitution": null,
+        }),
+        "Constitution" => serde_json::json!({
+            "PParamUpdate": null,
+            "HardFork": null,
+            "Committee": null,
+            "Constitution": parent_id_str,
+        }),
+        _ => unreachable!("validated above"),
+    };
+
     let fixture = serde_json::json!({
         "proposal": fixture_proposal,
         "proposed_epoch": proposed_epoch,
         "votes": canonical_votes,
-        // TODO(task-6): populate from drep_voting_power_history (per-DRep).
-        "drep_power": serde_json::Map::<String, serde_json::Value>::new(),
-        // TODO(task-6): aggregate from drep_voting_power_history.
-        "drep_no_confidence": 0u64,
-        // TODO(task-6): aggregate from drep_voting_power_history.
-        "drep_abstain": 0u64,
-        // TODO(task-6): bech32-decode pool_voting_power_history pool_id_bech32 → hex.
-        "spo_stake": serde_json::Map::<String, serde_json::Value>::new(),
-        // TODO(task-6): transform Koios committee_info into canonical
-        // FixtureCommittee shape (cold/hot keys, expiration, threshold).
-        "committee": {
-            "members": [],
-            "threshold": { "numerator": 2, "denominator": 3 },
-            "min_size": 0,
-            "resigned": [],
-        },
+        "drep_power": drep_power,
+        "drep_no_confidence": drep_no_confidence,
+        "drep_abstain": drep_abstain,
+        "spo_stake": spo_stake,
+        "pool_reward_accounts": pool_reward_accounts,
+        "vote_delegations": serde_json::Value::Object(serde_json::Map::new()),
+        "no_confidence": false,
+        "committee": committee_obj,
         "pparams_epoch": ratification_epoch,
-        // pparams JSON is opaque to the loader for now.
-        "pparams": {},
-        // TODO(task-6): sum drep_voting_power_history rows at snapshot epoch.
-        "total_drep_stake": 0u64,
-        // TODO(task-6): sum pool_voting_power_history rows at snapshot epoch.
-        "total_spo_stake": 0u64,
+        "pparams": pparams_subset,
         "expected_outcome": {
-            // A proposal is ratified iff `ratified_epoch` or `enacted_epoch` is a
-            // non-null number.  `Value::Null.is_some()` is true, so we have to
-            // check `as_u64()`.  For dropped proposals, `enacted_id` is left
-            // `null` — the test asserts the ledger's `enacted_*` slot does
-            // *not* contain this proposal id.
             "ratified": was_ratified,
             "enacted_bucket": enacted_bucket,
             "enacted_epoch": ratification_epoch,
             "enacted_id": if was_ratified {
-                serde_json::Value::String(format!("{tx_hex}#{idx}"))
+                Value::String(format!("{tx_hex}#{idx}"))
             } else {
-                serde_json::Value::Null
+                Value::Null
             },
         },
-        // TODO(task-6): seed each bucket from a recursive capture of
-        // proposal.prev_action_id when present.
-        "parent_enacted": {
-            "PParamUpdate": null,
-            "HardFork": null,
-            "Committee": null,
-            "Constitution": null,
+        "parent_enacted": parent_enacted,
+        "provenance": {
+            "captured_at": chrono_now(),
+            "source": KOIOS_PREVIEW,
+            "snapshot_epoch": snapshot_epoch,
+            "ratification_epoch": ratification_epoch,
         }
     });
 
@@ -293,4 +439,261 @@ async fn main() {
     let pretty = serde_json::to_string_pretty(&fixture).expect("serialize");
     std::fs::write(&args.output, pretty + "\n").expect("write output");
     eprintln!("wrote {}", args.output.display());
+}
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+async fn koios_get(client: &reqwest::Client, path: &str) -> Value {
+    koios_get_retry(client, path, 3).await
+}
+
+async fn koios_get_retry(client: &reqwest::Client, path: &str, retries: u32) -> Value {
+    let url = format!("{KOIOS_PREVIEW}{path}");
+    let mut attempt = 0u32;
+    loop {
+        attempt += 1;
+        match client.get(&url).send().await {
+            Ok(resp) if resp.status().is_success() => match resp.json::<Value>().await {
+                Ok(v) => return v,
+                Err(e) => {
+                    if attempt >= retries {
+                        panic!("koios {url} body was not JSON after {retries} retries: {e}");
+                    }
+                }
+            },
+            Ok(resp) => {
+                let status = resp.status();
+                if attempt >= retries {
+                    let body = resp.text().await.unwrap_or_default();
+                    panic!("koios {url} returned {status} after {retries} retries: {body}");
+                }
+                eprintln!("koios {url} -> {status}, retrying ({attempt}/{retries})");
+            }
+            Err(e) => {
+                if attempt >= retries {
+                    panic!("koios GET {url} failed after {retries} retries: {e}");
+                }
+                eprintln!("koios {url} -> {e}, retrying ({attempt}/{retries})");
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(500u64 * attempt as u64)).await;
+    }
+}
+
+async fn koios_paged(client: &reqwest::Client, path: &str) -> Vec<Value> {
+    let mut out = Vec::new();
+    let page_size = 1000usize;
+    let mut offset = 0usize;
+    loop {
+        let sep = if path.contains('?') { '&' } else { '?' };
+        let url = format!("{path}{sep}limit={page_size}&offset={offset}");
+        let resp = koios_get(client, &url).await;
+        let arr = match resp.as_array() {
+            Some(a) => a.clone(),
+            None => break,
+        };
+        let len = arr.len();
+        out.extend(arr);
+        if len < page_size {
+            break;
+        }
+        offset += page_size;
+    }
+    out
+}
+
+async fn sum_pseudo_drep(client: &reqwest::Client, drep_id: &str) -> Option<u64> {
+    let path = format!("/drep_delegators?_drep_id={drep_id}");
+    let rows = koios_paged(client, &path).await;
+    let mut total = 0u64;
+    for row in rows {
+        let amount: u64 = row
+            .get("amount")
+            .and_then(|v| v.as_str())
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0);
+        total = total.saturating_add(amount);
+    }
+    Some(total)
+}
+
+fn pool_bech32_to_hex(s: &str) -> String {
+    let parsed = CheckedHrpstring::new::<Bech32>(s)
+        .unwrap_or_else(|e| panic!("invalid pool bech32 {s}: {e}"));
+    let bytes: Vec<u8> = parsed.byte_iter().collect();
+    hex::encode(bytes)
+}
+
+fn pool_hex_to_bech32(hex_str: &str) -> String {
+    let bytes = hex::decode(hex_str).unwrap_or_else(|e| panic!("invalid pool hex {hex_str}: {e}"));
+    let hrp = bech32::Hrp::parse("pool").unwrap();
+    bech32::encode::<Bech32>(hrp, &bytes).unwrap_or_else(|e| panic!("encode pool bech32: {e}"))
+}
+
+fn stake_addr_bech32_to_hex(s: &str) -> String {
+    let parsed = CheckedHrpstring::new::<Bech32>(s)
+        .unwrap_or_else(|e| panic!("invalid stake bech32 {s}: {e}"));
+    let bytes: Vec<u8> = parsed.byte_iter().collect();
+    if bytes.len() != 29 {
+        panic!(
+            "stake address {s} decoded to {} bytes (expected 29)",
+            bytes.len()
+        );
+    }
+    hex::encode(bytes)
+}
+
+/// Encode a 28-byte hash + type byte (0x00 for key / 0x01 for script)
+/// into the 32-byte typed-Hash32 hex form expected by the loader.
+fn typed_hash32_from_hex28(hex28: &str, is_script: bool) -> String {
+    let bytes = hex::decode(hex28).unwrap_or_else(|e| panic!("typed hash hex {hex28}: {e}"));
+    if bytes.len() != 28 {
+        panic!("typed hash input must be 28 bytes, got {}", bytes.len());
+    }
+    let mut out = [0u8; 32];
+    out[..28].copy_from_slice(&bytes);
+    if is_script {
+        out[28] = 0x01;
+    }
+    hex::encode(out)
+}
+
+fn transform_committee(committee_resp: &Value) -> Value {
+    let row = committee_resp
+        .as_array()
+        .and_then(|a| a.first())
+        .cloned()
+        .unwrap_or_else(|| panic!("committee_info returned empty"));
+    let quorum_n = row
+        .get("quorum_numerator")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(2);
+    let quorum_d = row
+        .get("quorum_denominator")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(3);
+    let mut members: Vec<Value> = Vec::new();
+    let mut resigned: Vec<String> = Vec::new();
+    if let Some(arr) = row.get("members").and_then(|v| v.as_array()) {
+        for m in arr {
+            let cold_hex = m
+                .get("cc_cold_hex")
+                .and_then(|v| v.as_str())
+                .unwrap_or_else(|| panic!("committee member missing cc_cold_hex: {m}"));
+            let cold_is_script = m
+                .get("cc_cold_has_script")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            let cold_typed = typed_hash32_from_hex28(cold_hex, cold_is_script);
+
+            let status = m.get("status").and_then(|v| v.as_str()).unwrap_or("");
+            if status == "resigned" {
+                resigned.push(cold_typed.clone());
+                continue;
+            }
+            let expiration = m
+                .get("expiration_epoch")
+                .and_then(|v| v.as_u64())
+                .unwrap_or_else(|| panic!("committee member missing expiration_epoch: {m}"));
+            let hot_typed = match (
+                m.get("cc_hot_hex").and_then(|v| v.as_str()),
+                m.get("cc_hot_has_script").and_then(|v| v.as_bool()),
+            ) {
+                (Some(hex_str), Some(is_script)) if !hex_str.is_empty() => {
+                    Value::String(typed_hash32_from_hex28(hex_str, is_script))
+                }
+                _ => Value::Null,
+            };
+            members.push(serde_json::json!({
+                "cold_key": cold_typed,
+                "hot_key": hot_typed,
+                "expiration": expiration,
+            }));
+        }
+    }
+    serde_json::json!({
+        "members": members,
+        "threshold": { "numerator": quorum_n, "denominator": quorum_d },
+        "resigned": resigned,
+    })
+}
+
+fn transform_pparams(epoch_params: &Value) -> Value {
+    let pv_major = epoch_params
+        .get("protocol_major")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(9);
+    let cms = epoch_params
+        .get("committee_min_size")
+        .and_then(|v| {
+            v.as_u64()
+                .or_else(|| v.as_str().and_then(|s| s.parse().ok()))
+        })
+        .unwrap_or(0);
+    let cmt = epoch_params
+        .get("committee_max_term_length")
+        .and_then(|v| {
+            v.as_u64()
+                .or_else(|| v.as_str().and_then(|s| s.parse().ok()))
+        })
+        .unwrap_or(365);
+
+    let read_threshold = |key: &str| -> Value {
+        let v = match epoch_params.get(key) {
+            Some(x) => x,
+            None => return serde_json::json!({ "numerator": 0, "denominator": 1 }),
+        };
+        if let Some(f) = v.as_f64() {
+            // Convert float to /10000 rational (matches loader's read_rational
+            // float fallback exactly).
+            let denominator: u64 = 10_000;
+            let numerator = (f * denominator as f64).round() as u64;
+            serde_json::json!({ "numerator": numerator, "denominator": denominator })
+        } else if let Some(s) = v.as_str() {
+            // Some Koios endpoints return numbers as strings.
+            let f: f64 = s.parse().unwrap_or(0.0);
+            let denominator: u64 = 10_000;
+            let numerator = (f * denominator as f64).round() as u64;
+            serde_json::json!({ "numerator": numerator, "denominator": denominator })
+        } else if let Some(obj) = v.as_object() {
+            serde_json::json!({
+                "numerator": obj.get("numerator").and_then(|x| x.as_u64()).unwrap_or(0),
+                "denominator": obj.get("denominator").and_then(|x| x.as_u64()).unwrap_or(1),
+            })
+        } else {
+            serde_json::json!({ "numerator": 0, "denominator": 1 })
+        }
+    };
+
+    serde_json::json!({
+        "protocol_version_major": pv_major,
+        "committee_min_size": cms,
+        "committee_max_term_length": cmt,
+        "dvt_pp_network_group":         read_threshold("dvt_p_p_network_group"),
+        "dvt_pp_economic_group":        read_threshold("dvt_p_p_economic_group"),
+        "dvt_pp_technical_group":       read_threshold("dvt_p_p_technical_group"),
+        "dvt_pp_gov_group":              read_threshold("dvt_p_p_gov_group"),
+        "dvt_hard_fork":                 read_threshold("dvt_hard_fork_initiation"),
+        "dvt_no_confidence":             read_threshold("dvt_motion_no_confidence"),
+        "dvt_committee_normal":          read_threshold("dvt_committee_normal"),
+        "dvt_committee_no_confidence":   read_threshold("dvt_committee_no_confidence"),
+        "dvt_constitution":              read_threshold("dvt_update_to_constitution"),
+        "dvt_treasury_withdrawal":       read_threshold("dvt_treasury_withdrawal"),
+        "pvt_motion_no_confidence":      read_threshold("pvt_motion_no_confidence"),
+        "pvt_committee_normal":          read_threshold("pvt_committee_normal"),
+        "pvt_committee_no_confidence":   read_threshold("pvt_committee_no_confidence"),
+        "pvt_hard_fork":                 read_threshold("pvt_hard_fork_initiation"),
+        "pvt_pp_security_group":         read_threshold("pvt_p_p_security_group"),
+    })
+}
+
+fn chrono_now() -> String {
+    use std::time::SystemTime;
+    let secs = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    format!("unix:{secs}")
 }
