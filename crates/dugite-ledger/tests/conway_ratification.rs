@@ -98,6 +98,36 @@ fn ratifies_post_bootstrap_with_abstain_delegated_pools() {
     assert_ratified(&ledger, expected_bucket, &expected_id);
 }
 
+/// Gate B3 — script-DRep keying.
+///
+/// Setup: PV=10 (post-bootstrap, so DRep thresholds are real), with one
+/// script-credential DRep that holds 100% of voting power and votes Yes.
+/// SPO + CC paths trivially pass (single Yes voter each).
+///
+/// If `DRep::credential_hash32` correctly produces the script-typed
+/// (`0x01` discriminator) Hash32 form, the snapshot lookup matches the
+/// voter's `credential_to_hash` and the DRep ratio is 1/1 = 1.0 ≥ 0.67
+/// → ratified.  If the bug returns (script DRep keyed without
+/// discriminator), the snapshot map and the voter map use different
+/// keys, the lookup misses, drep_total = 0 → DRep check fails the
+/// non-zero threshold → not ratified.
+#[test]
+fn ratifies_with_script_drep_voter() {
+    let fixture: RatificationFixture =
+        serde_json::from_str(SCRIPT_DREP_FIXTURE).expect("synthetic B3 fixture must parse");
+    let expected_id = parse_gov_action_id(
+        fixture
+            .expected_outcome
+            .enacted_id
+            .as_deref()
+            .expect("synthetic B3 fixture must carry enacted_id"),
+    );
+    let expected_bucket = fixture.expected_outcome.enacted_bucket;
+    let mut ledger = fixture.into_ledger_state();
+    ledger.ratify_proposals();
+    assert_ratified(&ledger, expected_bucket, &expected_id);
+}
+
 /// Gate B2 — bootstrap SPO non-voter rule.
 ///
 /// Setup: 1 voting pool (Yes), 4 non-voting pools at PV=9 with no
@@ -214,6 +244,87 @@ const POST_BOOTSTRAP_DEFAULT_VOTE_FIXTURE: &str = r#"{
     "enacted_bucket": "PParamUpdate",
     "enacted_epoch": 100,
     "enacted_id": "0000000000000000000000000000000000000000000000000000000000000001#0"
+  },
+  "parent_enacted": {
+    "PParamUpdate": null,
+    "HardFork": null,
+    "Committee": null,
+    "Constitution": null
+  }
+}"#;
+
+// Script DRep credential bytes: 28 × 0x7c.
+// Script-typed Hash32 = "7c" * 28 + "01" + "000000".
+const SCRIPT_DREP_FIXTURE: &str = r#"{
+  "proposal": {
+    "gov_action_id": "0000000000000000000000000000000000000000000000000000000000000003#0",
+    "action": {
+      "tag": "ParameterChange",
+      "contents": [
+        null,
+        { "maxBlockBodySize": 90112 },
+        null
+      ]
+    },
+    "deposit": 100000000000,
+    "return_addr_hex": "e0000000000000000000000000000000000000000000000000000000000000",
+    "expiration": 999999,
+    "anchor": null
+  },
+  "proposed_epoch": 99,
+  "votes": [
+    { "voter_type": "DRepScriptHash",                    "voter_id": "7c7c7c7c7c7c7c7c7c7c7c7c7c7c7c7c7c7c7c7c7c7c7c7c7c7c7c7c", "vote": "Yes" },
+    { "voter_type": "StakePoolKeyHash",                  "voter_id": "10101010101010101010101010101010101010101010101010101010", "vote": "Yes" },
+    { "voter_type": "ConstitutionalCommitteeHotKeyHash", "voter_id": "cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd", "vote": "Yes" }
+  ],
+  "drep_power": {
+    "7c7c7c7c7c7c7c7c7c7c7c7c7c7c7c7c7c7c7c7c7c7c7c7c7c7c7c7c01000000": 1000000000000
+  },
+  "drep_no_confidence": 0,
+  "drep_abstain": 0,
+  "spo_stake": {
+    "10101010101010101010101010101010101010101010101010101010": 1000000000000
+  },
+  "pool_reward_accounts": {},
+  "vote_delegations": {},
+  "no_confidence": false,
+  "committee": {
+    "members": [
+      {
+        "cold_key": "ababababababababababababababababababababababababababababab000000",
+        "hot_key":  "cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd00000000",
+        "expiration": 999999
+      }
+    ],
+    "threshold": { "numerator": 1, "denominator": 2 },
+    "resigned": []
+  },
+  "pparams_epoch": 100,
+  "pparams": {
+    "protocol_version_major": 10,
+    "committee_min_size": 1,
+    "committee_max_term_length": 365,
+    "dvt_pp_network_group":       { "numerator": 67, "denominator": 100 },
+    "dvt_pp_economic_group":      { "numerator": 67, "denominator": 100 },
+    "dvt_pp_technical_group":     { "numerator": 67, "denominator": 100 },
+    "dvt_pp_gov_group":           { "numerator": 75, "denominator": 100 },
+    "dvt_hard_fork":              { "numerator": 60, "denominator": 100 },
+    "dvt_no_confidence":          { "numerator": 67, "denominator": 100 },
+    "dvt_committee_normal":       { "numerator": 67, "denominator": 100 },
+    "dvt_committee_no_confidence":{ "numerator": 60, "denominator": 100 },
+    "dvt_constitution":           { "numerator": 75, "denominator": 100 },
+    "dvt_treasury_withdrawal":    { "numerator": 67, "denominator": 100 },
+    "pvt_motion_no_confidence":   { "numerator": 51, "denominator": 100 },
+    "pvt_committee_normal":       { "numerator": 51, "denominator": 100 },
+    "pvt_committee_no_confidence":{ "numerator": 51, "denominator": 100 },
+    "pvt_hard_fork":              { "numerator": 51, "denominator": 100 },
+    "pvt_pp_security_group":      { "numerator": 51, "denominator": 100 }
+  },
+  "expected_outcome": {
+    "ratified": true,
+    "enacted_bucket": "PParamUpdate",
+    "enacted_epoch": 100,
+    "enacted_id": "0000000000000000000000000000000000000000000000000000000000000003#0"
   },
   "parent_enacted": {
     "PParamUpdate": null,

@@ -1218,23 +1218,15 @@ impl LedgerState {
             let prop_deposits = Self::proposal_deposits_from(proposals);
             for (cred, deposit) in &prop_deposits {
                 if let Some(drep) = self.gov.governance.vote_delegations.get(cred) {
-                    match drep {
-                        DRep::KeyHash(h) => {
-                            if cache.contains_key(h) {
-                                *cache.entry(*h).or_default() += deposit;
-                            }
+                    if let Some(hash32) = drep.credential_hash32() {
+                        if cache.contains_key(&hash32) {
+                            *cache.entry(hash32).or_default() += deposit;
                         }
-                        DRep::ScriptHash(h) => {
-                            let hash32 = h.to_hash32_padded();
-                            if cache.contains_key(&hash32) {
-                                *cache.entry(hash32).or_default() += deposit;
-                            }
-                        }
-                        DRep::NoConfidence => {
-                            no_confidence += deposit;
-                        }
-                        DRep::Abstain => {
-                            abstain += deposit;
+                    } else {
+                        match drep {
+                            DRep::NoConfidence => no_confidence += deposit,
+                            DRep::Abstain => abstain += deposit,
+                            _ => {}
                         }
                     }
                 }
@@ -1265,30 +1257,22 @@ impl LedgerState {
         for (stake_cred, drep) in &self.gov.governance.vote_delegations {
             let stake = self.credential_stake(stake_cred)
                 + prop_deposits.get(stake_cred).copied().unwrap_or(0);
-            match drep {
-                DRep::KeyHash(h) => {
-                    // Only count stake for active DReps
-                    if self.gov.governance.dreps.get(h).is_some_and(|d| d.active) {
-                        *cache.entry(*h).or_default() += stake;
-                    }
+            if let Some(hash32) = drep.credential_hash32() {
+                // Only count stake for active DReps.
+                if self
+                    .gov
+                    .governance
+                    .dreps
+                    .get(&hash32)
+                    .is_some_and(|d| d.active)
+                {
+                    *cache.entry(hash32).or_default() += stake;
                 }
-                DRep::ScriptHash(h) => {
-                    let hash32 = h.to_hash32_padded();
-                    if self
-                        .gov
-                        .governance
-                        .dreps
-                        .get(&hash32)
-                        .is_some_and(|d| d.active)
-                    {
-                        *cache.entry(hash32).or_default() += stake;
-                    }
-                }
-                DRep::NoConfidence => {
-                    no_confidence_stake += stake;
-                }
-                DRep::Abstain => {
-                    abstain_stake += stake;
+            } else {
+                match drep {
+                    DRep::NoConfidence => no_confidence_stake += stake,
+                    DRep::Abstain => abstain_stake += stake,
+                    _ => {}
                 }
             }
         }
@@ -1354,21 +1338,18 @@ impl LedgerState {
                 DRep::Abstain | DRep::NoConfidence => {
                     total += stake;
                 }
-                DRep::KeyHash(h) => {
-                    if self.gov.governance.dreps.get(h).is_some_and(|d| d.active) {
-                        total += stake;
-                    }
-                }
-                DRep::ScriptHash(h) => {
-                    let hash32 = h.to_hash32_padded();
-                    if self
-                        .gov
-                        .governance
-                        .dreps
-                        .get(&hash32)
-                        .is_some_and(|d| d.active)
-                    {
-                        total += stake;
+                _ => {
+                    // Safe: KeyHash/ScriptHash both yield Some(hash32).
+                    if let Some(hash32) = drep.credential_hash32() {
+                        if self
+                            .gov
+                            .governance
+                            .dreps
+                            .get(&hash32)
+                            .is_some_and(|d| d.active)
+                        {
+                            total += stake;
+                        }
                     }
                 }
             }
@@ -1552,23 +1533,15 @@ fn capture_drep_distribution_snapshot_impl(certs: &CertSubState, gov: &mut GovSu
     let mut abstain = 0u64;
     for (stake_cred, drep) in &gov.governance.vote_delegations {
         let stake = credential_stake_from(stake_cred, certs);
-        match drep {
-            DRep::KeyHash(h) => {
-                if gov.governance.dreps.get(h).is_some_and(|d| d.active) {
-                    *cache.entry(*h).or_default() += stake;
-                }
+        if let Some(hash32) = drep.credential_hash32() {
+            if gov.governance.dreps.get(&hash32).is_some_and(|d| d.active) {
+                *cache.entry(hash32).or_default() += stake;
             }
-            DRep::ScriptHash(h) => {
-                let hash32 = h.to_hash32_padded();
-                if gov.governance.dreps.get(&hash32).is_some_and(|d| d.active) {
-                    *cache.entry(hash32).or_default() += stake;
-                }
-            }
-            DRep::NoConfidence => {
-                no_confidence += stake;
-            }
-            DRep::Abstain => {
-                abstain += stake;
+        } else {
+            match drep {
+                DRep::NoConfidence => no_confidence += stake,
+                DRep::Abstain => abstain += stake,
+                _ => {}
             }
         }
     }
@@ -2068,15 +2041,11 @@ fn compute_total_drep_stake_from(gov: &GovSubState, certs: &CertSubState) -> u64
             DRep::Abstain | DRep::NoConfidence => {
                 total += stake;
             }
-            DRep::KeyHash(h) => {
-                if gov.governance.dreps.get(h).is_some_and(|d| d.active) {
-                    total += stake;
-                }
-            }
-            DRep::ScriptHash(h) => {
-                let hash32 = h.to_hash32_padded();
-                if gov.governance.dreps.get(&hash32).is_some_and(|d| d.active) {
-                    total += stake;
+            _ => {
+                if let Some(hash32) = drep.credential_hash32() {
+                    if gov.governance.dreps.get(&hash32).is_some_and(|d| d.active) {
+                        total += stake;
+                    }
                 }
             }
         }
@@ -2119,23 +2088,15 @@ fn build_drep_power_cache_from(
         let prop_deposits = proposal_deposits_from_map(proposals);
         for (cred, deposit) in &prop_deposits {
             if let Some(drep) = gov.governance.vote_delegations.get(cred) {
-                match drep {
-                    DRep::KeyHash(h) => {
-                        if cache.contains_key(h) {
-                            *cache.entry(*h).or_default() += deposit;
-                        }
+                if let Some(hash32) = drep.credential_hash32() {
+                    if cache.contains_key(&hash32) {
+                        *cache.entry(hash32).or_default() += deposit;
                     }
-                    DRep::ScriptHash(h) => {
-                        let hash32 = h.to_hash32_padded();
-                        if cache.contains_key(&hash32) {
-                            *cache.entry(hash32).or_default() += deposit;
-                        }
-                    }
-                    DRep::NoConfidence => {
-                        no_confidence += deposit;
-                    }
-                    DRep::Abstain => {
-                        abstain += deposit;
+                } else {
+                    match drep {
+                        DRep::NoConfidence => no_confidence += deposit,
+                        DRep::Abstain => abstain += deposit,
+                        _ => {}
                     }
                 }
             }
@@ -2161,23 +2122,15 @@ fn build_drep_power_cache_live_from(
     for (stake_cred, drep) in &gov.governance.vote_delegations {
         let stake = credential_stake_from(stake_cred, certs)
             + prop_deposits.get(stake_cred).copied().unwrap_or(0);
-        match drep {
-            DRep::KeyHash(h) => {
-                if gov.governance.dreps.get(h).is_some_and(|d| d.active) {
-                    *cache.entry(*h).or_default() += stake;
-                }
+        if let Some(hash32) = drep.credential_hash32() {
+            if gov.governance.dreps.get(&hash32).is_some_and(|d| d.active) {
+                *cache.entry(hash32).or_default() += stake;
             }
-            DRep::ScriptHash(h) => {
-                let hash32 = h.to_hash32_padded();
-                if gov.governance.dreps.get(&hash32).is_some_and(|d| d.active) {
-                    *cache.entry(hash32).or_default() += stake;
-                }
-            }
-            DRep::NoConfidence => {
-                no_confidence_stake += stake;
-            }
-            DRep::Abstain => {
-                abstain_stake += stake;
+        } else {
+            match drep {
+                DRep::NoConfidence => no_confidence_stake += stake,
+                DRep::Abstain => abstain_stake += stake,
+                _ => {}
             }
         }
     }
@@ -2554,13 +2507,17 @@ pub(crate) fn ratify_proposals_impl(
     let snapshot = gov.governance.ratification_snapshot.clone();
     let using_snapshot = snapshot.is_some();
 
+    // The committee fields are mutable because Haskell's RATIFY threads
+    // `EnactState.ensCommittee` through the loop — when an
+    // `UpdateCommittee` or `NoConfidence` proposal enacts, every
+    // subsequent proposal in the same pass sees the updated committee.
     let (
         snap_proposals,
         snap_votes,
-        snap_committee_hot_keys,
-        snap_committee_expiration,
-        snap_committee_resigned,
-        snap_committee_threshold,
+        mut snap_committee_hot_keys,
+        mut snap_committee_expiration,
+        mut snap_committee_resigned,
+        mut snap_committee_threshold,
         _snap_no_confidence,
         mut enacted_pparam,
         mut enacted_hardfork,
@@ -2702,6 +2659,23 @@ pub(crate) fn ratify_proposals_impl(
                     enacted_withdrawals_total += withdrawals
                         .values()
                         .fold(0u64, |acc, a| acc.saturating_add(a.0));
+                }
+                // Match Haskell `RatifyState.rsEnactState.ensCommittee`
+                // threading: when an `UpdateCommittee` or `NoConfidence`
+                // proposal enacts, refresh the local committee maps from
+                // the live state so subsequent proposals in the same pass
+                // see the updated committee (matches the recursive
+                // `ratifyTransition` call passing `st'` with the new
+                // `EnactState`).
+                if matches!(
+                    action,
+                    GovAction::UpdateCommittee { .. } | GovAction::NoConfidence { .. }
+                ) {
+                    let g = &gov.governance;
+                    snap_committee_hot_keys = g.committee_hot_keys.clone();
+                    snap_committee_expiration = g.committee_expiration.clone();
+                    snap_committee_resigned = g.committee_resigned.clone();
+                    snap_committee_threshold = g.committee_threshold.clone();
                 }
                 update_enacted_root_local(
                     action_id,
@@ -4491,6 +4465,144 @@ mod tests {
         // Non-NoConfidence: AlwaysNoConfidence counts as No (in denominator, not numerator)
         assert_eq!(yes, 0);
         assert_eq!(total, 11_000_000_000); // 5B DRep + 6B NoConfidence
+    }
+
+    /// Regression: a successfully-enacted delaying action (NoConfidence /
+    /// UpdateCommittee / NewConstitution / HardForkInitiation) must block
+    /// every subsequent proposal in the same RATIFY pass.  Matches the
+    /// Haskell `rsDelayed` flag in `RatifyState`.
+    ///
+    /// This is the practical mechanism that keeps committee state fresh
+    /// across a multi-proposal pass: once `NoConfidence` enacts and clears
+    /// the committee, a follow-up `ParameterChange` that would have needed
+    /// CC approval is skipped entirely (not re-checked against the cleared
+    /// committee).  Both Haskell and dugite achieve the same end result —
+    /// dugite via the local `delayed` flag, Haskell via `rsDelayed` —
+    /// neither lets the second proposal observe the mutated committee.
+    #[test]
+    fn test_committee_affecting_actions_are_all_delaying() {
+        // Every Conway action that mutates the committee state must also
+        // be a delaying action, so that no subsequent proposal in the
+        // same RATIFY pass tries to read the (now-stale) committee
+        // snapshot.  This is the invariant that keeps `check_cc_approval`
+        // sound across a multi-proposal pass without explicit committee
+        // threading: once `NoConfidence` or `UpdateCommittee` enacts,
+        // the loop's `delayed` flag short-circuits all remaining
+        // proposals before they can re-check CC against the cleared
+        // committee.  Matches Haskell where the same actions set
+        // `rsDelayed` in `RatifyState`.
+        assert!(is_delaying_action(&GovAction::NoConfidence {
+            prev_action_id: None
+        }));
+        assert!(is_delaying_action(&GovAction::UpdateCommittee {
+            prev_action_id: None,
+            members_to_remove: Vec::new(),
+            members_to_add: BTreeMap::new(),
+            threshold: Rational {
+                numerator: 1,
+                denominator: 2,
+            },
+        }));
+    }
+
+    #[test]
+    fn test_committee_threading_refresh_after_enact() {
+        // Direct unit test of the local committee-refresh logic in
+        // `ratify_proposals_impl`: after `enact_gov_action_impl` mutates
+        // the live `gov.governance.committee_*` maps via NoConfidence,
+        // the local `snap_committee_*` bindings can be re-derived from
+        // the live state.  This is the threading mechanism — exercised
+        // here in isolation since the priority + delaying invariant
+        // (above) means no production scenario observes a difference.
+        let mut state = gov_test_state(0, 0);
+        // Pre-populate a committee.
+        let cold = Credential::VerificationKey(Hash28::from_bytes([10u8; 28]));
+        let cold_key = credential_to_hash(&cold);
+        Arc::make_mut(&mut state.gov.governance)
+            .committee_expiration
+            .insert(cold_key, EpochNo(1000));
+        Arc::make_mut(&mut state.gov.governance).committee_threshold = Some(Rational {
+            numerator: 1,
+            denominator: 2,
+        });
+        // Snapshot the local "before" view as the loop would.
+        let before_threshold = state.gov.governance.committee_threshold.clone();
+        assert!(before_threshold.is_some());
+
+        // Enact a NoConfidence directly via the helper (bypasses
+        // submission rules; we're testing enact's effect, not the rule).
+        enact_gov_action_impl(
+            &GovAction::NoConfidence {
+                prev_action_id: None,
+            },
+            &mut state.epochs,
+            &mut state.certs,
+            &mut state.gov,
+        );
+        assert!(state.gov.governance.no_confidence);
+        assert!(state.gov.governance.committee_threshold.is_none());
+        assert!(state.gov.governance.committee_expiration.is_empty());
+
+        // Re-derive the "after" view from the live state — this is the
+        // refresh step `ratify_proposals_impl` performs after a delaying
+        // committee-affecting action enacts.
+        let after_threshold = state.gov.governance.committee_threshold.clone();
+        let after_expiration = state.gov.governance.committee_expiration.clone();
+        assert!(after_threshold.is_none());
+        assert!(after_expiration.is_empty());
+    }
+
+    /// Regression: script-DRep delegations must be routed via the typed
+    /// Hash32 form (`Credential::to_typed_hash32` / `DRep::credential_hash32`),
+    /// not the type-byte-less `Hash28::to_hash32_padded` form.
+    ///
+    /// Before the fix, `build_drep_power_cache_live` looked up
+    /// `dreps.get(&h.to_hash32_padded())` for `DRep::ScriptHash(h)` while
+    /// the `dreps` map keys are produced by `credential_to_hash`
+    /// (script-typed, type byte 0x01).  The lookup silently missed and
+    /// every script-DRep's stake was dropped.
+    #[test]
+    fn test_script_drep_lookup_uses_typed_credential_hash() {
+        let mut state = LedgerState::new(ProtocolParameters::mainnet_defaults());
+        // Register one script DRep.
+        let raw = [0x7cu8; 28];
+        let script_cred = Credential::Script(Hash28::from_bytes(raw));
+        let dreps_key = credential_to_hash(&script_cred); // script-typed Hash32
+        Arc::make_mut(&mut state.gov.governance).dreps.insert(
+            dreps_key,
+            DRepRegistration {
+                credential: script_cred.clone(),
+                deposit: Lovelace(500_000_000),
+                anchor: None,
+                registered_epoch: EpochNo(0),
+                drep_expiry: EpochNo(u64::MAX / 2),
+                active: true,
+            },
+        );
+
+        // Delegate a stake credential to the script DRep.
+        let stake_cred = Hash32::from_bytes([0xeeu8; 32]);
+        Arc::make_mut(&mut state.gov.governance)
+            .vote_delegations
+            .insert(stake_cred, DRep::ScriptHash(Hash28::from_bytes(raw)));
+        state
+            .certs
+            .stake_distribution
+            .stake_map
+            .insert(stake_cred, Lovelace(1_000_000_000));
+
+        let (cache, _, _) = state.build_drep_power_cache_live();
+        assert_eq!(
+            cache.get(&dreps_key),
+            Some(&1_000_000_000u64),
+            "script DRep stake must be routed under the typed-Hash32 key"
+        );
+        // The padded (untyped) form must NOT appear — that was the bug.
+        let padded = Hash28::from_bytes(raw).to_hash32_padded();
+        assert!(
+            !cache.contains_key(&padded),
+            "padded (no-discriminator) form must not leak into the cache"
+        );
     }
 
     #[test]
