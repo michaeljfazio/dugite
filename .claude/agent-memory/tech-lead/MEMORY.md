@@ -26,6 +26,7 @@
 - [LoE enforcement](consensus-loe-enforcement.md) — flush_to_immutable_loe() gating in block pipeline; GSM integration
 - [Forge pipeline depth](consensus-forge-pipeline-depth.md) — Forge disabled during sync (pipeline_depth > 1); metric interpretation
 - [Preview pool expected rates](consensus-preview-pool-rates.md) — SAND pool: ~0.155 blocks/hour, 1-block expected after 6.5+ hours at tip
+- [Forge loop Haskell alignment](forge-loop-haskell-alignment.md) — MAX_FORGE_LAG_SLOTS=60 removed; TraceNoLedgerView gate (129600 slots) + full Haskell trace sequence added
 
 ## Ledger
 - [Reward formula validation](ledger-reward-formula-validation.md) — Koios cross-validation methodology; 1-epoch RUPD timing difference vs Haskell
