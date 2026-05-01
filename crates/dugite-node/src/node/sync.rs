@@ -163,177 +163,6 @@ impl Node {
         }
     }
 
-    /// Reset the ledger state to genesis and replay ImmutableDB blocks up to
-    /// `target_slot`.  Used when no suitable snapshot is available for
-    /// rollback (or the snapshot failed to load).
-    ///
-    /// Uses sequential chunk iteration (same as startup replay) for high
-    /// throughput — `get_next_block_after_slot()` is too slow for millions
-    /// of blocks because it scans chunk metadata on every call.
-    ///
-    /// # Deprecation
-    ///
-    /// This function represents the "genesis replay" path that the Haskell
-    /// architecture explicitly avoids.  In the new architecture (Subsystems
-    /// 1–6), rollback is handled by `LedgerSeq::rollback()` which is O(k)
-    /// and never requires replaying from genesis.  This function will be
-    /// removed once `startup::recover_ledger_seq()` is fully wired in as the
-    /// primary recovery path.
-    ///
-    /// TODO(subsystem-4): Replace callers with `LedgerSeq::rollback()` via
-    /// the new startup recovery sequence.  Track in the migration plan under
-    /// "Phase 5: Remove old fork recovery".
-    ///
-    /// Tracked in: https://github.com/dugite-project/dugite/issues/TODO
-    #[allow(deprecated, dead_code)] // retained for networking rewrite
-    async fn reset_ledger_and_replay(&self, target_slot: u64) {
-        {
-            let mut ls = self.ledger_state.write().await;
-            // Drop the stale fork UTxO store — do NOT re-attach it.
-            //
-            // When called after a deep rollback or fork-snapshot recovery, the
-            // UTxO store was built against a fork chain.  Re-attaching it
-            // permanently corrupts state: genesis-replayed UTxOs coexist with
-            // stale fork UTxOs, causing every subsequent apply_block to fail
-            // silently (inputs not found, duplicate outputs, 0 blocks applied
-            // forever).
-            //
-            // The genesis replay that follows builds a correct in-memory UTxO
-            // set from scratch.  A fresh LSM snapshot is saved after replay
-            // completes so subsequent restarts can use the canonical store.
-            let _stale_store = ls.utxo.utxo_set.detach_store(); // drops the stale fork store
-            *ls = dugite_ledger::LedgerState::new(ls.epochs.protocol_params.clone());
-            // No re-attach: replay proceeds with a clean in-memory UTxO set only.
-        }
-
-        // Replay ImmutableDB blocks from genesis up to target_slot so the
-        // ledger tip matches the rollback/intersection point.  Without this
-        // replay, the ledger stays at genesis and incoming blocks from the
-        // peer won't connect.
-        if target_slot > 0 {
-            let immutable_dir = self.database_path.join("immutable");
-            if !immutable_dir.is_dir() {
-                warn!("Rollback: no immutable directory found for replay");
-                return;
-            }
-
-            // Run the replay on a blocking thread to avoid starving the
-            // async runtime — chunk I/O is synchronous and CPU-bound.
-            let ledger_state = self.ledger_state.clone();
-            let bel = self.byron_epoch_length;
-            let database_path = self.database_path.clone();
-            let result = tokio::task::spawn_blocking(move || {
-                let replay_start = std::time::Instant::now();
-                let mut replayed = 0u64;
-                let mut last_log = std::time::Instant::now();
-
-                // Disable address index during replay for speed (rebuilt on
-                // reattach after we're done).
-                {
-                    let mut ls = ledger_state.blocking_write();
-                    ls.utxo.utxo_set.set_indexing_enabled(false);
-                    ls.utxo.utxo_set.set_wal_enabled(false);
-                }
-
-                let result = crate::mithril::replay_from_chunk_files(
-                    &immutable_dir,
-                    |cbor| {
-                        match dugite_serialization::multi_era::decode_block_minimal_with_byron_epoch_length(
-                            cbor, bel,
-                        ) {
-                            Ok(block) => {
-                                // Stop once we've passed the target slot.
-                                if block.slot().0 > target_slot {
-                                    return Err(anyhow::anyhow!("reached target slot"));
-                                }
-                                let mut ls = ledger_state.blocking_write();
-                                if let Err(e) =
-                                    ls.apply_block(&block, BlockValidationMode::ApplyOnly)
-                                {
-                                    // Non-fatal: some early blocks may not connect
-                                    // when the UTxO store is from a later state.
-                                    tracing::warn!(
-                                        slot = block.slot().0,
-                                        "Rollback: replay apply skipped: {e}"
-                                    );
-                                }
-                                replayed += 1;
-                                if last_log.elapsed().as_secs() >= 5 {
-                                    let elapsed = replay_start.elapsed().as_secs();
-                                    let speed = replayed.checked_div(elapsed).unwrap_or(replayed);
-                                    tracing::info!(
-                                        replayed,
-                                        slot = block.slot().0,
-                                        target_slot,
-                                        speed = format_args!("{speed} blk/s"),
-                                        "Rollback: replay progress",
-                                    );
-                                    last_log = std::time::Instant::now();
-                                }
-                                Ok(())
-                            }
-                            Err(e) => {
-                                tracing::warn!("Rollback: replay decode error: {e}");
-                                Ok(()) // skip bad block, continue
-                            }
-                        }
-                    },
-                );
-
-                // Re-enable indexing.
-                {
-                    let mut ls = ledger_state.blocking_write();
-                    ls.utxo.utxo_set.set_indexing_enabled(true);
-                    ls.utxo.utxo_set.set_wal_enabled(true);
-                }
-
-                // Save a fresh canonical snapshot so the next restart can load
-                // it instead of re-running genesis replay again.  This is
-                // especially important because we just dropped the stale fork
-                // UTxO store — without saving here the LSM store on disk still
-                // reflects the fork chain, and the next restart would have to
-                // do another full genesis replay.
-                {
-                    let mut ls = ledger_state.blocking_write();
-                    let snapshot_path = database_path.join("ledger-snapshot.bin");
-                    let snap_slot = ls.tip.point.slot().map(|s| s.0).unwrap_or(0);
-                    if let Err(e) = ls.save_utxo_snapshot() {
-                        tracing::warn!(snap_slot, "reset_ledger_and_replay: failed to save UTxO snapshot: {e}");
-                    }
-                    if let Err(e) = ls.save_snapshot(&snapshot_path) {
-                        tracing::warn!(snap_slot, "reset_ledger_and_replay: failed to save ledger snapshot: {e}");
-                    } else {
-                        tracing::info!(
-                            snap_slot,
-                            "reset_ledger_and_replay: post-reset snapshot saved — next restart \
-                             will skip genesis replay"
-                        );
-                    }
-                }
-
-                let elapsed = replay_start.elapsed().as_secs_f64();
-                tracing::info!(
-                    replayed,
-                    target_slot,
-                    elapsed_secs = format!("{elapsed:.1}"),
-                    "Rollback: replay complete"
-                );
-
-                // The "reached target slot" error is expected and not a real failure.
-                match result {
-                    Ok(_) => Ok(replayed),
-                    Err(e) if e.to_string().contains("reached target slot") => Ok(replayed),
-                    Err(e) => Err(e),
-                }
-            })
-            .await;
-
-            if let Err(e) = result {
-                error!("Rollback: replay task failed: {e}");
-            }
-        }
-    }
-
     /// Handle a chain rollback: roll back ChainDB and restore ledger state
     /// to the rollback point.
     ///
@@ -610,9 +439,10 @@ impl Node {
                         // at the same time as each ledger snapshot, so they are always
                         // in sync.
                         //
-                        // If no UTxO snapshot exists (e.g., in-memory mode or very
-                        // first run), fall back to reset_ledger_and_replay which does
-                        // a full genesis replay — expensive but correct.
+                        // If no UTxO snapshot exists (e.g., in-memory mode or
+                        // very first run), the bincode snapshot's in-memory
+                        // UTxO set is used as a degraded fallback (see the
+                        // else branch below).
                         // ─────────────────────────────────────────────────────
                         let utxo_store_path = self.database_path.join("utxo-store");
 
@@ -724,26 +554,38 @@ impl Node {
                         );
                     }
                     Err(e) => {
-                        error!("Failed to load ledger snapshot for rollback: {e}");
-                        self.reset_ledger_and_replay(rollback_slot).await;
+                        // Snapshot file present but unreadable (corruption,
+                        // truncation, version skew).  Pre-Subsystem-4 we
+                        // fell through to a genesis replay; that path was a
+                        // multi-hour silent recovery that masked real disk
+                        // integrity issues.  Now we surface the failure
+                        // immediately — the operator should investigate the
+                        // snapshot file (corrupted file is recoverable; a
+                        // failing disk is not).
+                        error!(
+                            rollback_slot,
+                            snapshot = %snapshot_path.display(),
+                            "Failed to load ledger snapshot for rollback: {e}. \
+                             Aborting rollback; ledger state preserved.  \
+                             Operator should inspect the snapshot file or \
+                             restart from a known-good Mithril import."
+                        );
+                        return;
                     }
                 }
             } else {
                 // No canonical ledger snapshot found at or before the rollback
-                // target.  The early immutable-tip guard above ensures this
-                // branch is only reachable for targets at or beyond the
-                // immutable tip — so the only way to reach here is when all
-                // retained epoch snapshots are on a fork chain (Fix 1 did not
-                // catch it at startup) or when no snapshots exist yet.
+                // target.  Reachable only when:
+                //   * No snapshots have been written yet (very early in a
+                //     fresh sync), AND
+                //   * The rollback target is outside the LedgerSeq volatile
+                //     window (the seq fast path above didn't match).
                 //
-                // Auto-recover rather than demand an operator restart.
-                // `reset_ledger_and_replay` is safe post-Fix-2: it drops the
-                // stale (possibly fork) UTxO store, resets in-memory ledger
-                // state, and replays ImmutableDB blocks from genesis up to
-                // `rollback_slot`.  The replay is expensive (minutes-to-hours
-                // on preview) but preserves correctness and needs no operator
-                // intervention.  On completion, a fresh canonical snapshot is
-                // written so subsequent rollbacks take the fast snapshot path.
+                // Both conditions together imply ChainDB integrity violation
+                // or a peer advertising an off-chain target — neither is
+                // recoverable by genesis replay (which historically masked
+                // these conditions for hours).  Surface the error and let
+                // the operator restart from a known-good Mithril import.
                 let ledger_slot = self
                     .ledger_state
                     .read()
@@ -753,14 +595,14 @@ impl Node {
                     .slot()
                     .map(|s| s.0)
                     .unwrap_or(0);
-                warn!(
+                error!(
                     rollback_slot,
                     ledger_slot,
-                    "Deep rollback: no canonical snapshot available; \
-                     auto-recovering via genesis replay to rollback target \
-                     (this may take several minutes)."
+                    "Rollback target outside LedgerSeq volatile window AND no \
+                     canonical snapshot available.  Aborting rollback; ledger \
+                     state preserved.  Operator should restart from a Mithril \
+                     import."
                 );
-                self.reset_ledger_and_replay(rollback_slot).await;
                 return;
             }
         }
