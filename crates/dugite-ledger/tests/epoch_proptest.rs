@@ -1,4 +1,3 @@
-#![allow(deprecated)]
 //! Property-based tests for epoch transition invariants.
 //!
 //! All 7 properties use 256 test cases each and are cross-validated against the

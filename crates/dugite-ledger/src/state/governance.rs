@@ -3690,7 +3690,6 @@ pub(crate) fn is_delaying_action(action: &GovAction) -> bool {
 }
 
 #[cfg(test)]
-#[allow(deprecated)]
 mod tests {
     use super::*;
     use crate::state::{

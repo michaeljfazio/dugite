@@ -1,8 +1,3 @@
-// Suppress deprecation warnings for the deprecated `process_epoch_transition`
-// method which is still exercised here for test compatibility (a separate
-// migration tracks its removal).  The other deprecated rollback APIs that
-// previously required this allow were removed by Subsystem 4.
-#![allow(deprecated)]
 use super::*;
 use dugite_primitives::address::{Address, BaseAddress, ByronAddress};
 use dugite_primitives::hash::Hash28;
