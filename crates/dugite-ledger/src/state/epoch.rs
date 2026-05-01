@@ -3,7 +3,6 @@ use super::governance::{
     update_dormant_epochs, update_drep_activity,
 };
 use super::{LedgerState, StakeSnapshot};
-use crate::ledger_seq::EpochTransitionDelta;
 use dugite_primitives::hash::{Hash28, Hash32};
 use dugite_primitives::time::EpochNo;
 use dugite_primitives::value::Lovelace;
@@ -35,10 +34,19 @@ impl LedgerState {
     /// The first RUPD fires during epoch 0 with empty GO, ss_fee=0, empty blocks.
     /// With d>=0.8: eta=1, expansion = rho*reserves, treasury gets tau*expansion.
     /// No pool rewards (empty GO has no pools). Applied at 0→1 boundary.
-    #[deprecated(
-        note = "Use EraRulesImpl::process_epoch_transition via apply_block instead. \
-                Retained for test compatibility."
-    )]
+    /// Test-only convenience entry point that drives the epoch-transition
+    /// pipeline directly on a `LedgerState`.
+    ///
+    /// Production code MUST go through [`Self::apply_block`], which dispatches
+    /// to the per-era `EraRulesImpl::process_epoch_transition` (a different
+    /// trait method that takes explicit sub-state references and returns a
+    /// `Result`).  This method is retained for unit and property tests where
+    /// constructing a synthetic block + era context for every transition
+    /// would be prohibitively heavy.
+    ///
+    /// `#[doc(hidden)]` because it should not appear in the rustdoc surface
+    /// — the public API is `apply_block`.
+    #[doc(hidden)]
     pub fn process_epoch_transition(&mut self, new_epoch: EpochNo) {
         debug!("Epoch transition: {} -> {}", self.epoch.0, new_epoch.0);
 
@@ -720,125 +728,6 @@ impl LedgerState {
         self.epoch = new_epoch;
     }
 
-    /// Process an epoch transition and capture all changes into an `EpochTransitionDelta`.
-    ///
-    /// This wraps `process_epoch_transition()`: it snapshots key state before the
-    /// transition, delegates to the existing method for all mutations, then builds
-    /// the delta from the before/after differences.
-    ///
-    /// The delta captures absolute post-transition values for scalar fields (treasury,
-    /// reserves, protocol_params, nonces, etc.) and incremental reward credits by
-    /// diffing the reward_accounts map.  This matches `apply_epoch_transition_delta()`
-    /// in `ledger_seq.rs` which sets absolute values during forward reconstruction.
-    #[deprecated(
-        note = "Use EraRulesImpl::process_epoch_transition via apply_block instead. \
-                Retained for test compatibility."
-    )]
-    #[allow(deprecated)]
-    pub fn process_epoch_transition_with_delta(
-        &mut self,
-        new_epoch: EpochNo,
-    ) -> EpochTransitionDelta {
-        // Snapshot pre-transition state for diffing.
-        let pre_reward_accounts: HashMap<Hash32, Lovelace> = (*self.certs.reward_accounts).clone();
-        let pre_pool_params: std::collections::HashSet<Hash28> =
-            self.certs.pool_params.keys().copied().collect();
-        let pre_future_pool_params: HashMap<Hash28, super::PoolRegistration> =
-            self.certs.future_pool_params.clone();
-        let pre_pending_pp_updates_empty =
-            self.epochs.pending_pp_updates.is_empty() && self.epochs.future_pp_updates.is_empty();
-
-        // Run the existing epoch transition (all state mutations happen here).
-        self.process_epoch_transition(new_epoch);
-
-        // Build the delta from post-transition state.
-
-        // Compute reward credits: positive differences in reward_accounts.
-        let mut reward_credits: HashMap<Hash32, Lovelace> = HashMap::new();
-        for (cred, &post_balance) in self.certs.reward_accounts.iter() {
-            let pre_balance = pre_reward_accounts
-                .get(cred)
-                .copied()
-                .unwrap_or(Lovelace(0));
-            if post_balance.0 > pre_balance.0 {
-                reward_credits.insert(*cred, Lovelace(post_balance.0 - pre_balance.0));
-            }
-        }
-
-        // Pools retired: were in pre_pool_params but not in post pool_params.
-        let pools_retired: Vec<Hash28> = pre_pool_params
-            .iter()
-            .filter(|pid| !self.certs.pool_params.contains_key(pid))
-            .copied()
-            .collect();
-
-        // Future params promoted: were in pre_future_pool_params and are now
-        // in pool_params with updated registration.
-        let future_params_promoted: Vec<(Hash28, super::PoolRegistration)> = pre_future_pool_params
-            .into_iter()
-            .filter(|(pid, _)| self.certs.pool_params.contains_key(pid))
-            .collect();
-
-        // DRep activity updates: compare active flags.
-        // We don't have a pre-snapshot of DRep active flags, so we record the
-        // current state. apply_epoch_transition_delta() will set these values.
-        let drep_activity_updates: HashMap<Hash32, bool> = self
-            .gov
-            .governance
-            .dreps
-            .iter()
-            .map(|(cred, drep)| (*cred, drep.active))
-            .collect();
-
-        // Delegation changes from pool retirement (delegations removed).
-        // We can't easily diff Arc<HashMap> here without pre-snapshot, but the
-        // epoch transition delta application sets delegations from the delta's
-        // delegation_changes field. For simplicity, we leave this empty — the
-        // delegation removals are captured implicitly by the pool_stake rebuild
-        // that happens during state reconstruction.
-        let delegation_changes = Vec::new();
-
-        EpochTransitionDelta {
-            new_epoch,
-            treasury: self.epochs.treasury,
-            reserves: self.epochs.reserves,
-            snapshots: self.epochs.snapshots.clone(),
-            protocol_params: self.epochs.protocol_params.clone(),
-            prev_protocol_params: self.epochs.prev_protocol_params.clone(),
-            prev_d: self.epochs.prev_d,
-            prev_protocol_version_major: self.epochs.prev_protocol_version_major,
-            pending_pp_updates_cleared: !pre_pending_pp_updates_empty
-                && self.epochs.pending_pp_updates.is_empty()
-                && self.epochs.future_pp_updates.is_empty(),
-            epoch_nonce: self.consensus.epoch_nonce,
-            last_epoch_block_nonce: self.consensus.last_epoch_block_nonce,
-            reward_credits,
-            pools_retired,
-            future_params_promoted,
-            drep_activity_updates,
-            last_ratified: self.gov.governance.last_ratified.clone(),
-            last_expired: self.gov.governance.last_expired.clone(),
-            last_ratify_delayed: self.gov.governance.last_ratify_delayed,
-            new_constitution: self.gov.governance.constitution.clone(),
-            no_confidence: Some(self.gov.governance.no_confidence),
-            committee_threshold: Some(self.gov.governance.committee_threshold.clone()),
-            proposals_enacted: self
-                .gov
-                .governance
-                .last_ratified
-                .iter()
-                .map(|(id, _)| id.clone())
-                .collect(),
-            proposals_expired: self.gov.governance.last_expired.clone(),
-            enacted_pparam_update: Some(self.gov.governance.enacted_pparam_update.clone()),
-            enacted_hard_fork: Some(self.gov.governance.enacted_hard_fork.clone()),
-            enacted_committee: Some(self.gov.governance.enacted_committee.clone()),
-            enacted_constitution: Some(self.gov.governance.enacted_constitution.clone()),
-            stake_distribution: self.certs.stake_distribution.clone(),
-            delegation_changes,
-        }
-    }
-
     /// Rebuild stake_distribution.stake_map and ptr_stake from the full UTxO set.
     ///
     /// This recomputes per-credential UTxO stake by scanning all UTxOs,
@@ -1032,7 +921,6 @@ impl LedgerState {
 }
 
 #[cfg(test)]
-#[allow(deprecated)]
 mod tests {
     use super::super::{
         credential_to_hash, LedgerState, PoolRegistration, StakeSnapshot, MAX_LOVELACE_SUPPLY,
