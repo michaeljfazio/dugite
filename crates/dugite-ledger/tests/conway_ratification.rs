@@ -156,6 +156,57 @@ fn ratifies_bootstrap_with_non_voting_pools_as_abstain() {
     assert_ratified(&ledger, expected_bucket, &expected_id);
 }
 
+/// Gate B4 — aggregate-mode DRep snapshot.
+///
+/// Setup: PV=10 with `drep_aggregates` populated instead of `drep_power`.
+/// The aggregates encode a 70/30 Yes/No vote split, no abstain, with no
+/// always-no-confidence or always-abstain delegates and no registered
+/// non-voting DReps.  The loader synthesizes a 4-entry
+/// `drep_distribution_snapshot` (Yes/No/Abstain/NoVote credentials)
+/// plus 3 synthetic votes (Yes + No + Abstain credentials; the NoVote
+/// credential is registered but does not vote, counting as No).
+///
+/// Threshold: `dvt_pp_network_group = 67/100`.  With a 70/30 split:
+///   drep_yes = 700, drep_total = 1000 (yes + no, abstain excluded)
+///   ratio = 0.7 ≥ 0.67 → ratified.
+///
+/// If aggregate-mode synthesis is wired correctly, the proposal ratifies.
+/// If the synthesizer mis-maps the aggregates (e.g. swaps yes/no, or
+/// drops the NoVote synth that contributes to drep_total), the ratio
+/// shifts and the test fails.
+#[test]
+fn ratifies_post_bootstrap_with_aggregate_drep_snapshot() {
+    let fixture: RatificationFixture =
+        serde_json::from_str(AGGREGATE_DREP_FIXTURE).expect("synthetic B4 fixture must parse");
+    let expected_id = parse_gov_action_id(
+        fixture
+            .expected_outcome
+            .enacted_id
+            .as_deref()
+            .expect("synthetic B4 fixture must carry enacted_id"),
+    );
+    let expected_bucket = fixture.expected_outcome.enacted_bucket;
+    let mut ledger = fixture.into_ledger_state();
+    ledger.ratify_proposals();
+    assert_ratified(&ledger, expected_bucket, &expected_id);
+}
+
+/// Gate B4-neg — aggregate mode below threshold must NOT ratify.
+///
+/// Same shape as B4 but with a 60/40 split: drep_yes/drep_total = 0.60
+/// which is below the 67/100 threshold.  The proposal must NOT
+/// ratify — proves the aggregate path correctly contributes the No
+/// stake to the denominator (rather than swallowing it).
+#[test]
+fn rejects_post_bootstrap_aggregate_below_threshold() {
+    let fixture: RatificationFixture = serde_json::from_str(AGGREGATE_DREP_FIXTURE_BELOW_THRESHOLD)
+        .expect("synthetic B4-neg fixture must parse");
+    let proposal_id = parse_gov_action_id(&fixture.proposal.gov_action_id);
+    let mut ledger = fixture.into_ledger_state();
+    ledger.ratify_proposals();
+    assert_not_ratified(&ledger, &proposal_id);
+}
+
 // ---------------------------------------------------------------------------
 // Synthetic fixture data
 // ---------------------------------------------------------------------------
@@ -405,6 +456,168 @@ const BOOTSTRAP_NON_VOTER_ABSTAIN_FIXTURE: &str = r#"{
     "enacted_bucket": "PParamUpdate",
     "enacted_epoch": 100,
     "enacted_id": "0000000000000000000000000000000000000000000000000000000000000002#0"
+  },
+  "parent_enacted": {
+    "PParamUpdate": null,
+    "HardFork": null,
+    "Committee": null,
+    "Constitution": null
+  }
+}"#;
+
+const AGGREGATE_DREP_FIXTURE: &str = r#"{
+  "proposal": {
+    "gov_action_id": "0000000000000000000000000000000000000000000000000000000000000004#0",
+    "action": {
+      "tag": "ParameterChange",
+      "contents": [
+        null,
+        { "maxBlockBodySize": 90112 },
+        null
+      ]
+    },
+    "deposit": 100000000000,
+    "return_addr_hex": "e0000000000000000000000000000000000000000000000000000000000000",
+    "expiration": 999999,
+    "anchor": null
+  },
+  "proposed_epoch": 99,
+  "votes": [
+    { "voter_type": "StakePoolKeyHash",                  "voter_id": "10101010101010101010101010101010101010101010101010101010", "vote": "Yes" },
+    { "voter_type": "ConstitutionalCommitteeHotKeyHash", "voter_id": "cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd", "vote": "Yes" }
+  ],
+  "drep_aggregates": {
+    "yes_stake":              700000000,
+    "no_stake":               300000000,
+    "abstain_stake":                  0,
+    "no_vote_stake":                  0,
+    "always_no_confidence_stake":     0,
+    "always_abstain_stake":           0
+  },
+  "spo_stake": {
+    "10101010101010101010101010101010101010101010101010101010": 1000000000000
+  },
+  "pool_reward_accounts": {},
+  "vote_delegations": {},
+  "no_confidence": false,
+  "committee": {
+    "members": [
+      {
+        "cold_key": "ababababababababababababababababababababababababababababab000000",
+        "hot_key":  "cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd00000000",
+        "expiration": 999999
+      }
+    ],
+    "threshold": { "numerator": 1, "denominator": 2 },
+    "resigned": []
+  },
+  "pparams_epoch": 100,
+  "pparams": {
+    "protocol_version_major": 10,
+    "committee_min_size": 1,
+    "committee_max_term_length": 365,
+    "dvt_pp_network_group":       { "numerator": 67, "denominator": 100 },
+    "dvt_pp_economic_group":      { "numerator": 67, "denominator": 100 },
+    "dvt_pp_technical_group":     { "numerator": 67, "denominator": 100 },
+    "dvt_pp_gov_group":           { "numerator": 75, "denominator": 100 },
+    "dvt_hard_fork":              { "numerator": 60, "denominator": 100 },
+    "dvt_no_confidence":          { "numerator": 67, "denominator": 100 },
+    "dvt_committee_normal":       { "numerator": 67, "denominator": 100 },
+    "dvt_committee_no_confidence":{ "numerator": 60, "denominator": 100 },
+    "dvt_constitution":           { "numerator": 75, "denominator": 100 },
+    "dvt_treasury_withdrawal":    { "numerator": 67, "denominator": 100 },
+    "pvt_motion_no_confidence":   { "numerator": 51, "denominator": 100 },
+    "pvt_committee_normal":       { "numerator": 51, "denominator": 100 },
+    "pvt_committee_no_confidence":{ "numerator": 51, "denominator": 100 },
+    "pvt_hard_fork":              { "numerator": 51, "denominator": 100 },
+    "pvt_pp_security_group":      { "numerator": 51, "denominator": 100 }
+  },
+  "expected_outcome": {
+    "ratified": true,
+    "enacted_bucket": "PParamUpdate",
+    "enacted_epoch": 100,
+    "enacted_id": "0000000000000000000000000000000000000000000000000000000000000004#0"
+  },
+  "parent_enacted": {
+    "PParamUpdate": null,
+    "HardFork": null,
+    "Committee": null,
+    "Constitution": null
+  }
+}"#;
+
+const AGGREGATE_DREP_FIXTURE_BELOW_THRESHOLD: &str = r#"{
+  "proposal": {
+    "gov_action_id": "0000000000000000000000000000000000000000000000000000000000000005#0",
+    "action": {
+      "tag": "ParameterChange",
+      "contents": [
+        null,
+        { "maxBlockBodySize": 90112 },
+        null
+      ]
+    },
+    "deposit": 100000000000,
+    "return_addr_hex": "e0000000000000000000000000000000000000000000000000000000000000",
+    "expiration": 999999,
+    "anchor": null
+  },
+  "proposed_epoch": 99,
+  "votes": [
+    { "voter_type": "StakePoolKeyHash",                  "voter_id": "10101010101010101010101010101010101010101010101010101010", "vote": "Yes" },
+    { "voter_type": "ConstitutionalCommitteeHotKeyHash", "voter_id": "cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd", "vote": "Yes" }
+  ],
+  "drep_aggregates": {
+    "yes_stake":              600000000,
+    "no_stake":               400000000,
+    "abstain_stake":                  0,
+    "no_vote_stake":                  0,
+    "always_no_confidence_stake":     0,
+    "always_abstain_stake":           0
+  },
+  "spo_stake": {
+    "10101010101010101010101010101010101010101010101010101010": 1000000000000
+  },
+  "pool_reward_accounts": {},
+  "vote_delegations": {},
+  "no_confidence": false,
+  "committee": {
+    "members": [
+      {
+        "cold_key": "ababababababababababababababababababababababababababababab000000",
+        "hot_key":  "cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd00000000",
+        "expiration": 999999
+      }
+    ],
+    "threshold": { "numerator": 1, "denominator": 2 },
+    "resigned": []
+  },
+  "pparams_epoch": 100,
+  "pparams": {
+    "protocol_version_major": 10,
+    "committee_min_size": 1,
+    "committee_max_term_length": 365,
+    "dvt_pp_network_group":       { "numerator": 67, "denominator": 100 },
+    "dvt_pp_economic_group":      { "numerator": 67, "denominator": 100 },
+    "dvt_pp_technical_group":     { "numerator": 67, "denominator": 100 },
+    "dvt_pp_gov_group":           { "numerator": 75, "denominator": 100 },
+    "dvt_hard_fork":              { "numerator": 60, "denominator": 100 },
+    "dvt_no_confidence":          { "numerator": 67, "denominator": 100 },
+    "dvt_committee_normal":       { "numerator": 67, "denominator": 100 },
+    "dvt_committee_no_confidence":{ "numerator": 60, "denominator": 100 },
+    "dvt_constitution":           { "numerator": 75, "denominator": 100 },
+    "dvt_treasury_withdrawal":    { "numerator": 67, "denominator": 100 },
+    "pvt_motion_no_confidence":   { "numerator": 51, "denominator": 100 },
+    "pvt_committee_normal":       { "numerator": 51, "denominator": 100 },
+    "pvt_committee_no_confidence":{ "numerator": 51, "denominator": 100 },
+    "pvt_hard_fork":              { "numerator": 51, "denominator": 100 },
+    "pvt_pp_security_group":      { "numerator": 51, "denominator": 100 }
+  },
+  "expected_outcome": {
+    "ratified": false,
+    "enacted_bucket": "PParamUpdate",
+    "enacted_epoch": 100,
+    "enacted_id": null
   },
   "parent_enacted": {
     "PParamUpdate": null,

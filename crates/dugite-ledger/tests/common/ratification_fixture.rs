@@ -48,6 +48,11 @@ pub struct RatificationFixture {
     /// DRep voting power snapshot, keyed by typed Hash32 credential hex
     /// (28-byte credential + `0x00` for key / `0x01` for script + 3 zero bytes).
     /// Matches the encoding produced by `Credential::to_typed_hash32`.
+    ///
+    /// Mutually exclusive with [`Self::drep_aggregates`]: per-DRep mode
+    /// captures one entry per registered DRep with their actual stake;
+    /// aggregate mode synthesizes a 3-entry snapshot from the proposal's
+    /// voting summary.
     #[serde(default)]
     pub drep_power: BTreeMap<String, u64>,
     /// Aggregated stake delegated to the `DRepAlwaysNoConfidence` pseudo-DRep.
@@ -56,6 +61,26 @@ pub struct RatificationFixture {
     /// Aggregated stake delegated to the `DRepAlwaysAbstain` pseudo-DRep.
     #[serde(default)]
     pub drep_abstain: u64,
+
+    /// Aggregate-mode DRep snapshot: a single Koios `proposal_voting_summary`
+    /// call collapses 8800+ per-DRep queries into one request, returning
+    /// the total Yes / No / Abstain DRep stake for this specific proposal.
+    /// The loader synthesizes a 3-entry `drep_distribution_snapshot` plus
+    /// 2 synthetic votes (Yes + Abstain credentials; the No credential is
+    /// registered but does not vote, which `count_votes_by_type_impl`
+    /// correctly counts as No).
+    ///
+    /// The synthesized values reproduce the exact `drep_yes / drep_total`
+    /// ratio the real per-DRep iteration would compute — so the
+    /// ratification outcome is identical, while the capture path uses
+    /// O(1) Koios requests instead of O(N).  Used for post-bootstrap
+    /// (PV ≥ 10) fixtures where the per-DRep path exceeds Koios's
+    /// 5000 req/day free-tier cap.
+    ///
+    /// When `Some`, `drep_power` / `drep_no_confidence` / `drep_abstain`
+    /// fields are ignored — the loader uses the aggregates instead.
+    #[serde(default)]
+    pub drep_aggregates: Option<DRepAggregates>,
 
     /// SPO voting power snapshot, keyed by raw 28-byte pool ID hex.
     #[serde(default)]
@@ -94,6 +119,52 @@ pub struct RatificationFixture {
     #[serde(default)]
     #[allow(dead_code)]
     pub provenance: Option<serde_json::Value>,
+}
+
+/// Aggregate DRep voting power for a specific proposal, captured via
+/// `proposal_voting_summary` instead of per-DRep `drep_voting_power_history`.
+///
+/// All values are absolute lovelace stake.  See `RatificationFixture::drep_aggregates`.
+#[derive(Debug, Clone, Deserialize)]
+pub struct DRepAggregates {
+    /// Total stake of registered DReps that voted Yes on this proposal.
+    pub yes_stake: u64,
+    /// Total stake of registered DReps that voted No.
+    pub no_stake: u64,
+    /// Total stake of registered DReps that voted Abstain.
+    pub abstain_stake: u64,
+    /// Total stake of registered DReps that did NOT vote on this proposal —
+    /// counted as No per Haskell's `dRepAcceptedRatio` ("registered
+    /// non-voting DRep counts as No").
+    #[serde(default)]
+    pub no_vote_stake: u64,
+    /// Stake delegated to the `DRepAlwaysNoConfidence` pseudo-DRep.
+    #[serde(default)]
+    pub always_no_confidence_stake: u64,
+    /// Stake delegated to the `DRepAlwaysAbstain` pseudo-DRep.
+    #[serde(default)]
+    pub always_abstain_stake: u64,
+}
+
+/// Reserved synthetic credential hashes used by aggregate-mode capture.
+/// These bytes are deliberately distinct from any real on-chain credential
+/// (real credentials are Blake2b-224 hashes; these all start with sentinel
+/// nibbles 0xAA/0xBB/0xCC/0xDD).
+const AGG_YES_CRED: [u8; 28] = [0xAA; 28];
+const AGG_NO_CRED: [u8; 28] = [0xBB; 28];
+const AGG_ABSTAIN_CRED: [u8; 28] = [0xCC; 28];
+const AGG_NO_VOTE_CRED: [u8; 28] = [0xDD; 28];
+
+/// Build the typed-Hash32 form of a 28-byte key credential for the
+/// aggregate-mode synthesis path.  Equivalent to
+/// `Credential::VerificationKey(Hash28::from_bytes(*bytes)).to_typed_hash32()`,
+/// inlined here because the synth path runs in two places (snapshot map
+/// keys and voter construction).
+fn typed_hash32_for_key(bytes: &[u8; 28]) -> Hash32 {
+    let mut out = [0u8; 32];
+    out[..28].copy_from_slice(bytes);
+    // Type byte 28 is 0x00 for VerificationKey credentials.
+    Hash32::from_bytes(out)
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -1066,9 +1137,78 @@ impl RatificationFixture {
 
         // Stash drep power BEFORE the Arc::make_mut block (the borrow checker
         // forbids `&self.drep_power` while `gov_state` is borrowed mutably).
-        let drep_power = self.drep_power;
-        let drep_no_confidence = self.drep_no_confidence;
-        let drep_abstain = self.drep_abstain;
+        // When `drep_aggregates` is present, synthesize a 3-entry DRep
+        // snapshot from the aggregates (matches `proposal_voting_summary`
+        // capture mode).  Otherwise use the per-DRep `drep_power` map.
+        let (drep_power, drep_no_confidence, drep_abstain, extra_action_votes) =
+            if let Some(agg) = self.drep_aggregates.clone() {
+                let mut synth: BTreeMap<Hash32, u64> = BTreeMap::new();
+                // Yes-aggregate cred (will receive a synthetic Yes vote below).
+                synth.insert(typed_hash32_for_key(&AGG_YES_CRED), agg.yes_stake);
+                // No-aggregate cred — registered DRep that explicitly voted No.
+                synth.insert(typed_hash32_for_key(&AGG_NO_CRED), agg.no_stake);
+                // Abstain-aggregate cred (will receive a synthetic Abstain vote).
+                synth.insert(typed_hash32_for_key(&AGG_ABSTAIN_CRED), agg.abstain_stake);
+                // No-vote-aggregate cred — registered DRep that did NOT vote on
+                // this proposal.  Per `count_votes_by_type_impl`'s
+                // `Some(Vote::No) | None => {}` branch, an entry in the cache
+                // with no matching voter contributes to `drep_total` but not
+                // `drep_yes` / `drep_abstain` — i.e. counts as No, exactly
+                // matching Haskell's `dRepAcceptedRatio` rule for non-voting
+                // registered DReps.
+                synth.insert(typed_hash32_for_key(&AGG_NO_VOTE_CRED), agg.no_vote_stake);
+
+                // Synthetic votes for the Yes/No/Abstain aggregates.  The
+                // No-vote aggregate is intentionally absent — it counts as No
+                // by being present in the snapshot but missing from
+                // `votes_by_action`.
+                let mk_voter = |bytes: &[u8; 28]| {
+                    Voter::DRep(Credential::VerificationKey(Hash28::from_bytes(*bytes)))
+                };
+                let extras: Vec<(Voter, VotingProcedure)> = vec![
+                    (
+                        mk_voter(&AGG_YES_CRED),
+                        VotingProcedure {
+                            vote: Vote::Yes,
+                            anchor: None,
+                        },
+                    ),
+                    (
+                        mk_voter(&AGG_NO_CRED),
+                        VotingProcedure {
+                            vote: Vote::No,
+                            anchor: None,
+                        },
+                    ),
+                    (
+                        mk_voter(&AGG_ABSTAIN_CRED),
+                        VotingProcedure {
+                            vote: Vote::Abstain,
+                            anchor: None,
+                        },
+                    ),
+                ];
+                // Convert the synth Hash32 keys to the wire form the existing
+                // population loop expects (typed-Hash32 hex string keys).
+                let mut wire_synth: BTreeMap<String, u64> = BTreeMap::new();
+                for (k, v) in synth {
+                    wire_synth.insert(k.to_hex(), v);
+                }
+                (
+                    wire_synth,
+                    agg.always_no_confidence_stake,
+                    agg.always_abstain_stake,
+                    extras,
+                )
+            } else {
+                (
+                    self.drep_power,
+                    self.drep_no_confidence,
+                    self.drep_abstain,
+                    Vec::new(),
+                )
+            };
+
         let no_confidence_flag = self.no_confidence;
         let vote_delegations = self.vote_delegations;
         let committee = self.committee;
@@ -1079,8 +1219,13 @@ impl RatificationFixture {
         {
             let gov: &mut GovernanceState = Arc::make_mut(&mut ledger.gov.governance);
 
+            // Append the aggregate-mode synthetic Yes/No/Abstain DRep votes
+            // (empty in per-DRep mode).
+            let mut all_votes = votes_vec;
+            all_votes.extend(extra_action_votes);
+
             gov.proposals.insert(action_id.clone(), proposal_state);
-            gov.votes_by_action.insert(action_id.clone(), votes_vec);
+            gov.votes_by_action.insert(action_id.clone(), all_votes);
 
             // Committee state — keys are typed Hash32 (cold for membership maps,
             // hot for the lookup map's values).
