@@ -32,6 +32,45 @@ The schema is a faithful projection of the Haskell `RatifyEnv` /
 
 ## Capturing a new fixture
 
+> ### Koios free-tier daily cap (read this first)
+>
+> The default capture flow fans out one `drep_voting_power_history` request
+> per registered DRep — ~8800 calls on preview as of epoch 1283.  The
+> public Koios endpoint (`https://preview.koios.rest`) enforces a **5000
+> request / 24-hour daily tier limit** in addition to a short-window burst
+> limit.  A full post-bootstrap (PV ≥ 10) capture exhausts the daily cap
+> before completing the DRep snapshot and panics with
+> `Exceeded Tier Limit, count was N` on the first 429 that fails 8 retries.
+>
+> Workarounds:
+>
+> 1. **Bootstrap-era fixtures (PV = 9):** pass `--skip-drep-snapshot`.
+>    Bootstrap auto-passes every DRep threshold so the snapshot is unread
+>    by `ratify_proposals`; the capture completes in ~1 minute and only
+>    burns ~10 requests.  This is what `preview-pparam-1096.json` and
+>    `preview-pparam-dropped-1216.json` use.
+>
+> 2. **Post-bootstrap fixtures (planned, not yet wired):** swap the per-DRep
+>    fan-out for a single `proposal_voting_summary` call that returns the
+>    aggregate yes/no/abstain DRep stake for the proposal.  The loader will
+>    synthesize an equivalent `drep_distribution_snapshot` (one Yes-cred,
+>    one No-cred, one Abstain-cred + the always-no-confidence /
+>    always-abstain pseudo-DRep aggregates) that produces the same
+>    `drep_yes / drep_total` ratio as the real per-DRep iteration.  The
+>    fixture loses per-DRep granularity but preserves the ratification
+>    outcome — and uses **one** Koios request instead of thousands.
+>
+> 3. **Authenticated Koios tier:** with a paid Koios API key the daily cap
+>    is lifted; the capture binary's existing per-DRep flow then runs to
+>    completion in ~20 minutes.  No code changes needed; just point the
+>    binary at an authenticated endpoint via `KOIOS_BASE` (env override
+>    not yet wired — easy follow-up).
+>
+> The capture binary's existing throttling defaults (`--drep-concurrency 2
+> --inter-request-ms 250`) keep us under the **burst** limit but cannot
+> escape the **daily** cap; this is a Koios-side constraint, not a binary
+> bug.
+
 ```bash
 cargo build -p dugite-cli --bin capture-ratification-fixture
 ./target/debug/capture-ratification-fixture \
