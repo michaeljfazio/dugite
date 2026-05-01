@@ -42,9 +42,18 @@ struct Args {
     output: PathBuf,
 
     /// Concurrency cap for the per-DRep voting-power fan-out.  Conservative
-    /// against Koios free tier rate limits (10 req/s).
-    #[arg(long, default_value_t = 5)]
+    /// default against Koios free tier rate limits — the free endpoint
+    /// enforces a short-window burst budget that 5+ concurrent workers
+    /// reliably exceed; 2 keeps us well below.
+    #[arg(long, default_value_t = 2)]
     drep_concurrency: usize,
+
+    /// Inter-request delay (milliseconds) per DRep fan-out worker.  Combined
+    /// with `--drep-concurrency`, the effective Koios request rate is
+    /// `concurrency * 1000 / inter_request_ms`.  Default 250ms × 2 workers
+    /// ≈ 8 req/s, comfortably under the free-tier ceiling.
+    #[arg(long, default_value_t = 250)]
+    inter_request_ms: u64,
 
     /// Skip the per-DRep snapshot (writes empty `drep_power`).  Useful for
     /// bootstrap-era fixtures where DRep thresholds auto-pass and the
@@ -231,8 +240,11 @@ async fn main() {
         );
 
         let sem = std::sync::Arc::new(Semaphore::new(args.drep_concurrency));
+        let inter_request = args.inter_request_ms;
+        let total = registered.len();
+        let progress_interval = (total / 20).max(50); // log every ~5%
         let mut handles = Vec::new();
-        for (drep_id, hex, has_script) in registered {
+        for (idx, (drep_id, hex, has_script)) in registered.into_iter().enumerate() {
             let permit = sem.clone().acquire_owned().await.unwrap();
             let client = client.clone();
             handles.push(tokio::spawn(async move {
@@ -240,7 +252,13 @@ async fn main() {
                 let url = format!(
                     "/drep_voting_power_history?_drep_id={drep_id}&_epoch_no={snapshot_epoch}"
                 );
-                let resp = koios_get_retry(&client, &url, 3).await;
+                let resp = koios_get(&client, &url).await;
+                // Per-task throttle to keep the aggregate request rate well
+                // under Koios's burst budget — applied AFTER the request so
+                // the inter-arrival gap for the same worker is honoured.
+                if inter_request > 0 {
+                    tokio::time::sleep(Duration::from_millis(inter_request)).await;
+                }
                 let amount: u64 = resp
                     .as_array()
                     .and_then(|a| a.first())
@@ -248,13 +266,25 @@ async fn main() {
                     .and_then(|s| s.parse().ok())
                     .unwrap_or(0);
                 if amount == 0 {
-                    return None;
+                    return (idx, None);
                 }
-                Some((typed_hash32_from_hex28(&hex, has_script), amount))
+                (
+                    idx,
+                    Some((typed_hash32_from_hex28(&hex, has_script), amount)),
+                )
             }));
         }
         for h in handles {
-            if let Some((typed_hex, amount)) = h.await.unwrap() {
+            let (idx, payload) = h.await.unwrap();
+            if (idx + 1).is_multiple_of(progress_interval) || idx + 1 == total {
+                eprintln!(
+                    "DRep snapshot: {}/{} ({:.0}%)",
+                    idx + 1,
+                    total,
+                    100.0 * (idx + 1) as f64 / total as f64
+                );
+            }
+            if let Some((typed_hex, amount)) = payload {
                 drep_power.insert(typed_hex, amount);
             }
         }
@@ -446,39 +476,63 @@ async fn main() {
 // ---------------------------------------------------------------------------
 
 async fn koios_get(client: &reqwest::Client, path: &str) -> Value {
-    koios_get_retry(client, path, 3).await
+    koios_get_retry(client, path, 8).await
 }
 
+/// Retry with exponential backoff, with extra patience on 429 (Koios burst
+/// rate limits).  The free tier enforces both a per-second rate limit and a
+/// short-window burst limit; 429 responses commonly arrive in clusters when
+/// concurrent fan-out (per-DRep voting power) exceeds the burst budget.
+///
+/// Backoff strategy: base 500ms exponential, but on 429 we wait the full
+/// backoff window — 0.5s, 1s, 2s, 4s, 8s, 16s, 32s, 60s — to give the
+/// burst counter time to drain.
 async fn koios_get_retry(client: &reqwest::Client, path: &str, retries: u32) -> Value {
     let url = format!("{KOIOS_PREVIEW}{path}");
     let mut attempt = 0u32;
     loop {
         attempt += 1;
-        match client.get(&url).send().await {
+        let outcome: Result<Result<Value, String>, String> = match client.get(&url).send().await {
             Ok(resp) if resp.status().is_success() => match resp.json::<Value>().await {
                 Ok(v) => return v,
-                Err(e) => {
-                    if attempt >= retries {
-                        panic!("koios {url} body was not JSON after {retries} retries: {e}");
-                    }
-                }
+                Err(e) => Ok(Err(format!("body not JSON: {e}"))),
             },
             Ok(resp) => {
                 let status = resp.status();
-                if attempt >= retries {
-                    let body = resp.text().await.unwrap_or_default();
-                    panic!("koios {url} returned {status} after {retries} retries: {body}");
+                let is_rate_limited = status.as_u16() == 429;
+                let body = resp.text().await.unwrap_or_default();
+                if is_rate_limited {
+                    Err(format!("rate-limited (429): {body}"))
+                } else {
+                    Ok(Err(format!("status {status}: {body}")))
                 }
-                eprintln!("koios {url} -> {status}, retrying ({attempt}/{retries})");
             }
-            Err(e) => {
+            Err(e) => Ok(Err(format!("transport error: {e}"))),
+        };
+        match outcome {
+            Err(rate_limit_msg) => {
                 if attempt >= retries {
-                    panic!("koios GET {url} failed after {retries} retries: {e}");
+                    panic!("koios {url} rate-limited after {retries} retries: {rate_limit_msg}");
                 }
-                eprintln!("koios {url} -> {e}, retrying ({attempt}/{retries})");
+                // Aggressive backoff on 429: 0.5s × 2^(attempt-1), capped at 60s.
+                let wait_ms = (500u64 << attempt.min(7)).min(60_000);
+                eprintln!(
+                    "koios {url} -> 429, backing off {wait_ms}ms (attempt {attempt}/{retries})"
+                );
+                tokio::time::sleep(Duration::from_millis(wait_ms)).await;
             }
+            Ok(Err(other_err)) => {
+                if attempt >= retries {
+                    panic!("koios {url} failed after {retries} retries: {other_err}");
+                }
+                let wait_ms = 500u64 * attempt as u64;
+                eprintln!(
+                    "koios {url} -> {other_err}, retrying in {wait_ms}ms ({attempt}/{retries})"
+                );
+                tokio::time::sleep(Duration::from_millis(wait_ms)).await;
+            }
+            Ok(Ok(_)) => unreachable!("success returns from match arm"),
         }
-        tokio::time::sleep(Duration::from_millis(500u64 * attempt as u64)).await;
     }
 }
 
