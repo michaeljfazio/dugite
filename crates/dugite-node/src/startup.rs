@@ -577,20 +577,15 @@ pub fn recover_ledger_seq(
                 reason: e.to_string(),
             })?;
 
-        // Apply with delta tracking. LedgerState::apply_block_with_delta produces
-        // the LedgerDelta needed by LedgerSeq::push. Until that API lands we use
-        // apply_block (which mutates state) followed by a manual delta extraction.
+        // Apply each volatile block to a scratch copy of the seq's tip state
+        // and capture a `LedgerDelta` via `apply_block_with_delta`.  The delta
+        // records UTxO changes, per-block scalar fields, and epoch transition
+        // state — enabling `LedgerSeq` to reconstruct any volatile state
+        // point from the anchor + deltas alone.
         //
-        // IMPORTANT: this is the replay path — we use Skip validation because
-        // these blocks are already part of the volatile WAL and were validated
-        // when first admitted. Re-validation would be redundant and slow.
-        //
-        // TODO(subsystem-4): Replace with apply_block_with_delta when available.
-        // Currently we use apply_block (mutates state) + manual delta extraction.
-        // Apply the block to a scratch copy and produce a real LedgerDelta.
-        // The delta captures UTxO changes, per-block scalar fields, and epoch
-        // transition state — enabling LedgerSeq to reconstruct any volatile
-        // state point from the anchor + deltas alone.
+        // This is the replay path: we use `ApplyOnly` validation because
+        // these blocks are already part of the volatile WAL and were
+        // validated when first admitted.  Re-validation would be redundant.
         let mut scratch = seq.tip_state();
         let delta = scratch
             .apply_block_with_delta(&block, BlockValidationMode::ApplyOnly)

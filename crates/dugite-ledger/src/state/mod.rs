@@ -1580,6 +1580,91 @@ impl LedgerState {
         }
         rolled
     }
+
+    /// Roll back the entire ledger state to a chain point using the
+    /// in-memory [`LedgerSeq`] as the source of truth for non-UTxO state.
+    ///
+    /// This is the primary rollback path for in-volatile-window targets
+    /// (Subsystem 4 — supersedes the snapshot-reload-and-replay approach
+    /// for any target whose hash matches a delta in the seq's volatile
+    /// window).  It is O(n) where `n` is the rollback distance — never
+    /// triggers a full ledger replay.
+    ///
+    /// # Steps
+    ///
+    /// 1. Compute `n` from the target point via [`LedgerSeq::find_rollback_n`].
+    ///    Returns `None` if the point is outside the volatile window — the
+    ///    caller must fall back to snapshot-driven recovery.
+    /// 2. Reverse-apply the trailing `n` UTxO diffs to the live UTxO set
+    ///    (both the in-memory map and the LSM-backed store stay in sync
+    ///    via the `UtxoSet::insert/remove` write-through).
+    /// 3. Truncate the live `DiffSeq` by the same `n` entries.
+    /// 4. Roll back the [`LedgerSeq`] (drops trailing deltas + invalidates
+    ///    checkpoints that pointed into the removed range).
+    /// 5. Replace every non-UTxO field on `self` with the seq's
+    ///    reconstructed tip state — and copy `epoch_fees` /
+    ///    `pending_donations` (the two UTxO-adjacent scalars the seq
+    ///    tracks via `BlockFieldsDelta`).
+    ///
+    /// The LSM UTxO store stays attached the whole time: the `UtxoSet`
+    /// already write-throughs to the LSM store on `insert`/`remove`, so
+    /// the reverse-apply at step 2 leaves the on-disk store in the
+    /// rolled-back state without a detach/re-attach dance (which would
+    /// risk re-migrating reconstruction-window UTxOs over correct LSM
+    /// entries via [`Self::attach_utxo_store`]).
+    ///
+    /// Static configuration fields (`epoch_length`, `slot_config`,
+    /// `byron_epoch_length`, etc.) are unchanged by rollback and are
+    /// left untouched on `self`.
+    ///
+    /// # Returns
+    ///
+    /// The number of blocks rolled back (`Some(n)`), or `None` if the
+    /// target was outside the volatile window.
+    ///
+    /// Matches Haskell's `LedgerDB.V2.LedgerSeq.rollbackToPoint` followed
+    /// by a single in-memory commit.
+    pub fn rollback_via_seq(
+        &mut self,
+        seq: &mut crate::ledger_seq::LedgerSeq,
+        target_point: &Point,
+    ) -> Option<usize> {
+        let n = seq.find_rollback_n(target_point)?;
+        if n == 0 {
+            return Some(0);
+        }
+
+        // Step 1+2: pop the trailing n UTxO diffs and invert each one on the
+        // live store.  `DiffSeq::rollback` removes them from the seq; the
+        // returned `Vec` is consumed here for the reverse-apply.
+        let diffs = self.utxo.diff_seq.rollback(n);
+        for (_slot, _hash, diff) in &diffs {
+            for (input, _output) in &diff.inserts {
+                self.utxo.utxo_set.remove(input);
+            }
+            for (input, output) in &diff.deletes {
+                self.utxo.utxo_set.insert(input.clone(), output.clone());
+            }
+        }
+
+        // Step 3: roll back the seq.
+        seq.rollback(n);
+
+        // Step 4: replace non-UTxO state from the seq's reconstructed tip.
+        let new_state = seq.tip_state();
+        self.certs = new_state.certs;
+        self.gov = new_state.gov;
+        self.consensus = new_state.consensus;
+        self.epochs = new_state.epochs;
+        self.tip = new_state.tip;
+        self.era = new_state.era;
+        self.epoch = new_state.epoch;
+        self.pending_era_transition = new_state.pending_era_transition;
+        self.utxo.epoch_fees = new_state.utxo.epoch_fees;
+        self.utxo.pending_donations = new_state.utxo.pending_donations;
+
+        Some(n)
+    }
 }
 
 // ── Haskell snapshot conversion helpers ─────────��────────────────────────────
