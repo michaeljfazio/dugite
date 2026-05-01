@@ -1,112 +1,104 @@
 {
+  "proposal": {
+    "gov_action_id": "69c948cde90c6b9d7d61595e8534c106ec44132cb049ab2558399db1260c1f69#0",
+    "action": {
+      "tag": "ParameterChange",
+      "contents": [
+        {
+          "txId": "602d8572263929bdb0aba911d45ecf4bf0a2430e2f263f89df7114d168985f57",
+          "govActionIx": 0
+        },
+        {
+          "maxBlockExecutionUnits": { "memory": 72000000, "steps": 20000000000 },
+          "maxTxExecutionUnits": { "memory": 16500000, "steps": 10000000000 }
+        },
+        "fa24fb305126805cf2164c161d852a0e7330cf988f1fe558cf7d4a64"
+      ]
+    },
+    "deposit": 100000000000,
+    "return_addr_hex": "e0000000000000000000000000000000000000000000000000000000000000",
+    "expiration": 1119,
+    "anchor": null
+  },
+  "proposed_epoch": 1088,
+  "votes": [
+    { "voter_type": "DRepKeyHash",                          "voter_id": "79b4b2ef99a7030c4441c8ba525055354752d003e08aa51261c06482", "vote": "Yes" },
+    { "voter_type": "StakePoolKeyHash",                     "voter_id": "5107766450180dfea7b74bd56ea8fdaf62032308b13f6e558092227a", "vote": "Yes" },
+    { "voter_type": "StakePoolKeyHash",                     "voter_id": "2afbef2f8a3a624f6f4492260fe2053f6daebd8c5ff13f6f14574417", "vote": "Yes" },
+    { "voter_type": "StakePoolKeyHash",                     "voter_id": "e283fd58d5263defcc9d0cd9925ac19c9fe4ef1e0b75a4f6af4b0d1b", "vote": "Yes" },
+    { "voter_type": "ConstitutionalCommitteeHotScriptHash", "voter_id": "a11f594d3004a2a40b8837872493a54379e8898dfa3b9847d115e20a", "vote": "Yes" },
+    { "voter_type": "ConstitutionalCommitteeHotScriptHash", "voter_id": "b996abb93b739c70cb17142000c1b999d5204e3b14afe0d20e24daac", "vote": "Yes" },
+    { "voter_type": "ConstitutionalCommitteeHotScriptHash", "voter_id": "3ecd2ec198f40aeb3348cdd7b6cc4986b893e99d4098663768f92f76", "vote": "Yes" }
+  ],
+  "drep_power": {},
+  "drep_no_confidence": 0,
+  "drep_abstain": 0,
+  "spo_stake": {
+    "5107766450180dfea7b74bd56ea8fdaf62032308b13f6e558092227a": 1747841319505,
+    "2afbef2f8a3a624f6f4492260fe2053f6daebd8c5ff13f6f14574417": 2687077038518,
+    "e283fd58d5263defcc9d0cd9925ac19c9fe4ef1e0b75a4f6af4b0d1b": 1761725661702
+  },
+  "pool_reward_accounts": {},
+  "vote_delegations": {},
+  "no_confidence": false,
   "committee": {
     "members": [
       {
-        "cold_key": "0101010101010101010101010101010101010101010101010101010101010101",
-        "hot_key": "a11f594d3004a2a40b8837872493a54379e8898dfa3b9847d115e20a01000000",
-        "expiration": 9999
+        "cold_key": "886659e5bd42b14c8c909c2178837f0e612fec1c3469368acba4e33101000000",
+        "hot_key":  "a11f594d3004a2a40b8837872493a54379e8898dfa3b9847d115e20a01000000",
+        "expiration": 1356
       },
       {
-        "cold_key": "0202020202020202020202020202020202020202020202020202020202020202",
-        "hot_key": "b996abb93b739c70cb17142000c1b999d5204e3b14afe0d20e24daac01000000",
-        "expiration": 9999
+        "cold_key": "be4d67a5dd8de49543cc489aca920a377ea7a7e9855c8934d33e576501000000",
+        "hot_key":  "b996abb93b739c70cb17142000c1b999d5204e3b14afe0d20e24daac01000000",
+        "expiration": 1356
       },
       {
-        "cold_key": "0303030303030303030303030303030303030303030303030303030303030303",
-        "hot_key": "3ecd2ec198f40aeb3348cdd7b6cc4986b893e99d4098663768f92f7601000000",
-        "expiration": 9999
+        "cold_key": "6a0cd9563908692460413e08bef26eda0265ec23868fd1560d5cd42f01000000",
+        "hot_key":  "3ecd2ec198f40aeb3348cdd7b6cc4986b893e99d4098663768f92f7601000000",
+        "expiration": 1356
       }
     ],
-    "min_size": 0,
-    "resigned": [],
-    "threshold": {
-      "denominator": 3,
-      "numerator": 2
-    }
+    "threshold": { "numerator": 2, "denominator": 3 },
+    "resigned": []
   },
-  "drep_abstain": 0,
-  "drep_no_confidence": 0,
-  "drep_power": {},
+  "pparams_epoch": 1095,
+  "pparams": {
+    "protocol_version_major": 9,
+    "committee_min_size": 0,
+    "committee_max_term_length": 365,
+    "dvt_pp_network_group":       { "numerator": 67, "denominator": 100 },
+    "dvt_pp_economic_group":      { "numerator": 67, "denominator": 100 },
+    "dvt_pp_technical_group":     { "numerator": 67, "denominator": 100 },
+    "dvt_pp_gov_group":           { "numerator": 75, "denominator": 100 },
+    "dvt_hard_fork":              { "numerator": 60, "denominator": 100 },
+    "dvt_no_confidence":          { "numerator": 67, "denominator": 100 },
+    "dvt_committee_normal":       { "numerator": 67, "denominator": 100 },
+    "dvt_committee_no_confidence":{ "numerator": 60, "denominator": 100 },
+    "dvt_constitution":           { "numerator": 75, "denominator": 100 },
+    "dvt_treasury_withdrawal":    { "numerator": 67, "denominator": 100 },
+    "pvt_motion_no_confidence":   { "numerator": 51, "denominator": 100 },
+    "pvt_committee_normal":       { "numerator": 51, "denominator": 100 },
+    "pvt_committee_no_confidence":{ "numerator": 51, "denominator": 100 },
+    "pvt_hard_fork":              { "numerator": 51, "denominator": 100 },
+    "pvt_pp_security_group":      { "numerator": 51, "denominator": 100 }
+  },
   "expected_outcome": {
+    "ratified": true,
     "enacted_bucket": "PParamUpdate",
     "enacted_epoch": 1095,
-    "enacted_id": "69c948cde90c6b9d7d61595e8534c106ec44132cb049ab2558399db1260c1f69#0",
-    "ratified": true
+    "enacted_id": "69c948cde90c6b9d7d61595e8534c106ec44132cb049ab2558399db1260c1f69#0"
   },
   "parent_enacted": {
-    "Committee": null,
-    "Constitution": null,
+    "PParamUpdate": "602d8572263929bdb0aba911d45ecf4bf0a2430e2f263f89df7114d168985f57#0",
     "HardFork": null,
-    "PParamUpdate": "602d8572263929bdb0aba911d45ecf4bf0a2430e2f263f89df7114d168985f57#0"
+    "Committee": null,
+    "Constitution": null
   },
-  "pparams": {},
-  "pparams_epoch": 1095,
-  "proposal": {
-    "action": {
-      "contents": [
-        {
-          "govActionIx": 0,
-          "txId": "602d8572263929bdb0aba911d45ecf4bf0a2430e2f263f89df7114d168985f57"
-        },
-        {
-          "maxBlockExecutionUnits": {
-            "memory": 72000000,
-            "steps": 20000000000
-          },
-          "maxTxExecutionUnits": {
-            "memory": 16500000,
-            "steps": 10000000000
-          }
-        },
-        "fa24fb305126805cf2164c161d852a0e7330cf988f1fe558cf7d4a64"
-      ],
-      "tag": "ParameterChange"
-    },
-    "anchor": null,
-    "deposit": 100000000000,
-    "expiration": 1119,
-    "gov_action_id": "69c948cde90c6b9d7d61595e8534c106ec44132cb049ab2558399db1260c1f69#0",
-    "return_addr_hex": "e0000000000000000000000000000000000000000000000000000000000000"
-  },
-  "proposed_epoch": 1088,
-  "spo_stake": {},
-  "total_drep_stake": 0,
-  "total_spo_stake": 0,
-  "votes": [
-    {
-      "vote": "Yes",
-      "voter_id": "79b4b2ef99a7030c4441c8ba525055354752d003e08aa51261c06482",
-      "voter_type": "DRepKeyHash"
-    },
-    {
-      "vote": "Yes",
-      "voter_id": "5107766450180dfea7b74bd56ea8fdaf62032308b13f6e558092227a",
-      "voter_type": "StakePoolKeyHash"
-    },
-    {
-      "vote": "Yes",
-      "voter_id": "2afbef2f8a3a624f6f4492260fe2053f6daebd8c5ff13f6f14574417",
-      "voter_type": "StakePoolKeyHash"
-    },
-    {
-      "vote": "Yes",
-      "voter_id": "e283fd58d5263defcc9d0cd9925ac19c9fe4ef1e0b75a4f6af4b0d1b",
-      "voter_type": "StakePoolKeyHash"
-    },
-    {
-      "vote": "Yes",
-      "voter_id": "a11f594d3004a2a40b8837872493a54379e8898dfa3b9847d115e20a",
-      "voter_type": "ConstitutionalCommitteeHotScriptHash"
-    },
-    {
-      "vote": "Yes",
-      "voter_id": "b996abb93b739c70cb17142000c1b999d5204e3b14afe0d20e24daac",
-      "voter_type": "ConstitutionalCommitteeHotScriptHash"
-    },
-    {
-      "vote": "Yes",
-      "voter_id": "3ecd2ec198f40aeb3348cdd7b6cc4986b893e99d4098663768f92f76",
-      "voter_type": "ConstitutionalCommitteeHotScriptHash"
-    }
-  ]
+  "provenance": {
+    "captured_at": "2026-05-01",
+    "source": "preview.koios.rest",
+    "snapshot_epoch": 1094,
+    "notes": "Real preview ParameterChange enacted at epoch 1095. SPO stake values are real preview pool stakes captured from /pool_voting_power_history?_epoch_no=1094. Cold/hot keys are real preview committee credentials (script type) padded to 32-byte typed Hash32. PV=9 (bootstrap) so DRep thresholds auto-pass; SPO ratio is real (3/3 yes pools, no non-voters in the spo_stake map)."
+  }
 }
