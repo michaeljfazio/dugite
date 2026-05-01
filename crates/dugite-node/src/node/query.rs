@@ -226,13 +226,12 @@ impl Node {
                     .governance
                     .vote_delegations
                     .iter()
-                    .filter(|(_, d)| match d {
-                        dugite_primitives::transaction::DRep::KeyHash(h) => h == hash,
-                        dugite_primitives::transaction::DRep::ScriptHash(h) => {
-                            h.to_hash32_padded() == *hash
-                        }
-                        _ => false,
-                    })
+                    // Compare against the typed `Hash32` form `dreps` is keyed by
+                    // (`credential_to_hash` for both Key and Script credentials).
+                    // `Hash28::to_hash32_padded` lacks the script discriminator
+                    // and silently mis-matches script-DRep delegators — use
+                    // `DRep::credential_hash32` instead.
+                    .filter(|(_, d)| d.credential_hash32().is_some_and(|h32| h32 == *hash))
                     // stake_cred is a Hash32 padded from a 28-byte key hash;
                     // truncate to 28 bytes for N2C wire format.
                     .map(|(stake_cred, _)| hash32_padded_to_28_bytes(stake_cred))

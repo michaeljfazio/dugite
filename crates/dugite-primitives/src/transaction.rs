@@ -256,6 +256,37 @@ pub enum DRep {
     NoConfidence,
 }
 
+impl DRep {
+    /// Typed-Hash32 credential key for `KeyHash`/`ScriptHash` variants,
+    /// matching the encoding produced by `Credential::to_typed_hash32`:
+    ///   `[28-byte hash | 0x00 (key) or 0x01 (script) | 0x00 0x00 0x00]`
+    ///
+    /// All voter lookups against governance state (`drep_distribution_snapshot`,
+    /// the live `dreps` map keyed by `credential_to_hash`, the per-action
+    /// vote cache) compare against this typed form.  Use this method instead
+    /// of `Hash28::to_hash32_padded` for `ScriptHash` — the latter zero-pads
+    /// without the discriminator and silently mis-routes script DRep keys.
+    ///
+    /// Returns `None` for the two pseudo-DReps (`Abstain`/`NoConfidence`),
+    /// which are aggregated into separate counters rather than a per-DRep
+    /// map.
+    pub fn credential_hash32(&self) -> Option<crate::hash::Hash32> {
+        match self {
+            // DRep::KeyHash already stores the 32-byte form (constructed via
+            // `Hash28::to_hash32_padded` at every site — the type byte is 0x00
+            // by zero-padding, which matches the key discriminator).
+            DRep::KeyHash(h) => Some(*h),
+            DRep::ScriptHash(h) => {
+                let mut bytes = [0u8; 32];
+                bytes[..28].copy_from_slice(h.as_bytes());
+                bytes[28] = 0x01;
+                Some(crate::hash::Hash::<32>(bytes))
+            }
+            DRep::Abstain | DRep::NoConfidence => None,
+        }
+    }
+}
+
 /// URL + hash for off-chain metadata
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Anchor {
@@ -1080,6 +1111,47 @@ mod tests {
         let map_len = dec.map().unwrap().unwrap();
         assert_eq!(map_len, 1);
         assert_eq!(dec.u32().unwrap(), 2); // key for v3
+    }
+
+    // ========== DRep::credential_hash32 ==========
+
+    #[test]
+    fn drep_credential_hash32_keyhash_matches_credential_typed_form() {
+        use crate::credentials::Credential;
+        let raw = [0xaau8; 28];
+        let cred = Credential::VerificationKey(crate::hash::Hash28::from_bytes(raw));
+        let typed = cred.to_typed_hash32();
+        let drep = DRep::KeyHash(crate::hash::Hash28::from_bytes(raw).to_hash32_padded());
+        assert_eq!(drep.credential_hash32(), Some(typed));
+    }
+
+    #[test]
+    fn drep_credential_hash32_scripthash_matches_credential_typed_form() {
+        use crate::credentials::Credential;
+        let raw = [0xbbu8; 28];
+        let cred = Credential::Script(crate::hash::Hash28::from_bytes(raw));
+        let typed = cred.to_typed_hash32();
+        let drep = DRep::ScriptHash(crate::hash::Hash28::from_bytes(raw));
+        // The exact mismatch the bug introduced: padded form omits the
+        // discriminator byte.  credential_hash32 must include it.
+        let padded = crate::hash::Hash28::from_bytes(raw).to_hash32_padded();
+        assert_ne!(typed, padded, "typed and padded must differ for script");
+        assert_eq!(drep.credential_hash32(), Some(typed));
+        assert_ne!(drep.credential_hash32(), Some(padded));
+    }
+
+    #[test]
+    fn drep_credential_hash32_distinguishes_key_from_script_with_same_hash() {
+        let raw = [0xccu8; 28];
+        let key = DRep::KeyHash(crate::hash::Hash28::from_bytes(raw).to_hash32_padded());
+        let script = DRep::ScriptHash(crate::hash::Hash28::from_bytes(raw));
+        assert_ne!(key.credential_hash32(), script.credential_hash32());
+    }
+
+    #[test]
+    fn drep_credential_hash32_pseudo_dreps_return_none() {
+        assert_eq!(DRep::Abstain.credential_hash32(), None);
+        assert_eq!(DRep::NoConfidence.credential_hash32(), None);
     }
 
     // ========== Transaction::empty_with_hash ==========
