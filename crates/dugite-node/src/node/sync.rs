@@ -334,39 +334,24 @@ impl Node {
         }
     }
 
-    /// Handle a chain rollback: roll back ChainDB and restore ledger UTxO state
+    /// Handle a chain rollback: roll back ChainDB and restore ledger state
     /// to the rollback point.
     ///
-    /// # Future direction (Phase 4 migration)
+    /// # Strategy (Subsystem 4)
     ///
-    /// Once `LedgerSeq` is fully integrated as the authoritative ledger state
-    /// store, rollback will be delegated to `LedgerSeq::rollback(n)`.  That
-    /// path is O(k) by design and never triggers a genesis replay.  The
-    /// current DiffSeq fast path is the precursor to that design.
+    /// 1. Roll back ChainDB to remove volatile blocks after the rollback
+    ///    point (skipped when the caller already committed a chain switch
+    ///    via `ChainSelQueue::switch_chain()` — see `handle_ledger_rollback`).
+    /// 2. Try the [`LedgerState::rollback_via_seq`] fast path: if the
+    ///    rollback target is in the live `LedgerSeq` volatile window,
+    ///    restore the entire ledger in O(n) by reverse-applying the
+    ///    trailing UTxO diffs and replacing non-UTxO state from the seq.
+    /// 3. Otherwise, fall back to snapshot reload + replay (handles deep
+    ///    rollbacks past the volatile window and post-restart cases where
+    ///    the seq is empty).
     ///
-    /// TODO(subsystem-4): Delegate to `LedgerSeq::rollback()` once the seq is
-    /// maintained as the primary ledger state representation.
-    ///
-    /// The current fast-path (DiffSeq) is the precursor to this. When LedgerSeq
-    /// is the authoritative state store, replace the diff-based rollback with:
-    ///   seq.rollback(rollback_slot)
-    ///
-    /// Tracked in: https://github.com/dugite-project/dugite/issues/TODO
-    ///
-    /// # Fast path — diff-based rollback
-    ///
-    /// When the rollback target is within the in-memory `DiffSeq` window (i.e.
-    /// the rolled-back blocks were applied during this session and their per-block
-    /// UTxO diffs are still held in memory), the ledger is restored by unapplying
-    /// the diffs directly:
-    ///
-    ///   1. Identify which blocks in the DiffSeq are *after* the rollback point.
-    ///   2. Call `rollback_blocks_to_point(n, new_tip)` to invert their UTxO
-    ///      changes (remove inserted UTxOs, re-insert deleted UTxOs).
-    ///   3. Update the ledger tip to the rollback point.
-    ///
-    /// This is O(txs in rolled-back blocks) and requires no I/O, making it
-    /// ideal for the common micro-fork case (1-block chain reorganisation).
+    /// Matches Haskell's `LedgerDB.V2` rollback flow: try the in-memory
+    /// `LedgerSeq` first, fall back to snapshot-driven recovery.
     ///
     /// # Slow path — snapshot reload + replay
     ///
@@ -529,21 +514,49 @@ impl Node {
             }
         }
 
-        // 2. Full-state rollback via snapshot + replay.
+        // 2. LedgerSeq fast path (Subsystem 4).
         //
-        // The previous fast-path (DiffSeq) only restored UTxO changes — nonce
-        // accumulators, delegation state, reward accounts, governance, and other
-        // LedgerState fields were NOT rolled back.  This caused incorrect epoch
-        // nonces and VRF leader check failures after any rollback.
+        // If the rollback target is in the live `LedgerSeq` volatile window,
+        // restore the entire ledger state in O(n) by reverse-applying the
+        // trailing UTxO diffs and replacing non-UTxO state with
+        // `seq.tip_state()`.  No snapshot reload, no replay — matches
+        // Haskell `LedgerDB.V2.LedgerSeq.rollbackToPoint`.
         //
-        // Issue #308: We now always use the full-state restoration path:
-        // find the best snapshot before the rollback point, load it, and replay
-        // blocks forward.  This is O(snapshot_interval) but guarantees ALL
-        // state fields are correctly restored.
+        // Lock order: ledger_state before ledger_seq (per Node docs).
+        {
+            let mut ls = self.ledger_state.write().await;
+            let mut seq = self.ledger_seq.write().await;
+            if let Some(n) = ls.rollback_via_seq(&mut seq, rollback_point) {
+                info!(
+                    rollback_slot,
+                    rolled_back_blocks = n,
+                    new_tip_slot = ls.tip.point.slot().map(|s| s.0).unwrap_or(0),
+                    "LedgerSeq rollback: restored ledger via in-memory volatile window"
+                );
+                // Stale fork-tracking ratchet: if we just rolled past where the
+                // mempool/forge tip thought we were, the live tip is now correct
+                // and downstream callers (mempool TTL sweep, BlockFetch decision)
+                // will pick up the new tip on their next iteration.
+                return;
+            }
+            // Else: fall through to the snapshot-reload slow path.  This
+            // happens when:
+            //   * The target is older than the seq's anchor (deep rollback
+            //     beyond k blocks — protocol-impossible on the honest chain
+            //     but already guarded above).
+            //   * The seq was just rebuilt from a snapshot at startup and
+            //     hasn't accumulated deltas yet (volatile window empty).
+            //   * The target hash isn't in the seq (peer is on a divergent
+            //     chain — caller's chain selection should reject it).
+        }
+
+        // 3. Full-state rollback via snapshot + replay (slow path).
         //
-        // When LedgerSeq is fully wired as the authoritative state store,
-        // rollback will be delegated to LedgerSeq::rollback(n) + tip_state()
-        // which is O(checkpoint_interval) by design and restores all fields.
+        // Used when the LedgerSeq fast path can't satisfy the rollback (target
+        // outside the volatile window).  Restores ALL state fields — nonce
+        // accumulators, delegations, rewards, governance, etc. — by loading
+        // the best snapshot at or before the rollback point and replaying
+        // forward.  O(snapshot_interval).
         {
             // 3. Slow path: reload from snapshot and replay to rollback point.
             //

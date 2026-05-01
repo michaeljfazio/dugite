@@ -826,3 +826,354 @@ fn large_window_k_432_maintains_correct_tip() {
     // epoch_fees = running = (k+50) * 1_000_000.
     assert_eq!(seq.tip_state().utxo.epoch_fees.0, (k + 50) * 1_000_000);
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// find_rollback_n / rollback_to_point — Subsystem 4 chain-point API
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[test]
+fn find_rollback_n_matches_anchor_returns_full_window() {
+    let mut seq = LedgerSeq::with_defaults(make_anchor(), 100);
+    push_n_fee_deltas(&mut seq, 5);
+
+    // Anchor is at Origin (genesis).
+    let n = seq.find_rollback_n(&Point::Origin).expect("anchor matches");
+    assert_eq!(n, 5, "matching the anchor must drop every delta");
+}
+
+#[test]
+fn find_rollback_n_matches_tip_returns_zero() {
+    let mut seq = LedgerSeq::with_defaults(make_anchor(), 100);
+    push_n_fee_deltas(&mut seq, 5);
+
+    // The tip delta is at slot=5, hash=h(5).
+    let tip = Point::Specific(SlotNo(5), h(5));
+    let n = seq.find_rollback_n(&tip).expect("tip matches");
+    assert_eq!(n, 0, "matching the tip must roll back zero blocks");
+}
+
+#[test]
+fn find_rollback_n_matches_mid_window() {
+    let mut seq = LedgerSeq::with_defaults(make_anchor(), 100);
+    push_n_fee_deltas(&mut seq, 10);
+
+    // Slot 3 is delta index 2 (0-indexed), so we drop 10 - 2 - 1 = 7 deltas.
+    let mid = Point::Specific(SlotNo(3), h(3));
+    let n = seq.find_rollback_n(&mid).expect("mid matches");
+    assert_eq!(n, 7);
+}
+
+#[test]
+fn find_rollback_n_unknown_point_returns_none() {
+    let mut seq = LedgerSeq::with_defaults(make_anchor(), 100);
+    push_n_fee_deltas(&mut seq, 5);
+
+    // Slot 99 with arbitrary hash is not in the window.
+    let bogus = Point::Specific(SlotNo(99), h(0xee));
+    assert!(seq.find_rollback_n(&bogus).is_none());
+}
+
+#[test]
+fn find_rollback_n_correct_hash_wrong_slot_is_none() {
+    let mut seq = LedgerSeq::with_defaults(make_anchor(), 100);
+    push_n_fee_deltas(&mut seq, 5);
+
+    // Hash matches a delta but slot doesn't: must not match (Point equality
+    // requires both — a defensive check against rollback target hash collision).
+    let mismatch = Point::Specific(SlotNo(99), h(3));
+    assert!(seq.find_rollback_n(&mismatch).is_none());
+}
+
+#[test]
+fn rollback_to_point_drops_correct_deltas() {
+    let mut seq = LedgerSeq::with_defaults(make_anchor(), 100);
+    push_n_fee_deltas(&mut seq, 10);
+
+    // Roll back to the delta at slot 6.
+    let target = Point::Specific(SlotNo(6), h(6));
+    let n = seq.rollback_to_point(&target).expect("target in window");
+    assert_eq!(n, 4);
+    assert_eq!(seq.len(), 6);
+    // The new tip is slot 6.
+    assert!(matches!(seq.tip_point(), Point::Specific(s, _) if s == SlotNo(6)));
+}
+
+#[test]
+fn rollback_to_point_to_anchor_clears_window() {
+    let mut seq = LedgerSeq::with_defaults(make_anchor(), 100);
+    push_n_fee_deltas(&mut seq, 10);
+
+    let n = seq
+        .rollback_to_point(&Point::Origin)
+        .expect("anchor matches");
+    assert_eq!(n, 10);
+    assert!(seq.is_empty());
+    assert!(matches!(seq.tip_point(), Point::Origin));
+}
+
+#[test]
+fn rollback_to_point_unknown_returns_none_and_no_op() {
+    let mut seq = LedgerSeq::with_defaults(make_anchor(), 100);
+    push_n_fee_deltas(&mut seq, 5);
+
+    let bogus = Point::Specific(SlotNo(99), h(0xee));
+    assert!(seq.rollback_to_point(&bogus).is_none());
+    // Window untouched.
+    assert_eq!(seq.len(), 5);
+    assert!(matches!(seq.tip_point(), Point::Specific(s, _) if s == SlotNo(5)));
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// LedgerState::rollback_via_seq — combined UTxO + non-UTxO rollback
+// ─────────────────────────────────────────────────────────────────────────────
+//
+// These exercise the full Subsystem 4 wiring: a live LedgerState with
+// applied UTxO diffs in its DiffSeq, a parallel LedgerSeq, and a single
+// `rollback_via_seq` call that must restore both halves to the same point.
+
+use dugite_ledger::utxo_diff::UtxoDiff;
+use dugite_primitives::transaction::{TransactionInput, TransactionOutput};
+use dugite_primitives::value::Value;
+
+fn input(tx_byte: u8, index: u32) -> TransactionInput {
+    TransactionInput {
+        transaction_id: Hash32::from_bytes([tx_byte; 32]),
+        index,
+    }
+}
+
+fn output(addr_byte: u8, lovelace: u64) -> TransactionOutput {
+    TransactionOutput {
+        address: dugite_primitives::address::Address::Byron(
+            dugite_primitives::address::ByronAddress {
+                payload: vec![addr_byte; 29],
+            },
+        ),
+        value: Value::lovelace(lovelace),
+        datum: dugite_primitives::transaction::OutputDatum::None,
+        script_ref: None,
+        is_legacy: false,
+        raw_cbor: None,
+    }
+}
+
+/// Build a delta + apply its UTxO inserts to the live ledger state's
+/// DiffSeq + UTxO set, simulating what `apply_block_with_delta` does on
+/// the live side.  The seq receives the same delta via `push`.
+fn apply_block_with_inserts(
+    ls: &mut LedgerState,
+    seq: &mut LedgerSeq,
+    slot: u64,
+    hash_byte: u8,
+    block_no: u64,
+    inserts: Vec<(TransactionInput, TransactionOutput)>,
+    deletes: Vec<(TransactionInput, TransactionOutput)>,
+) {
+    let mut diff = UtxoDiff::new();
+    for (i, o) in &inserts {
+        diff.inserts.push((i.clone(), o.clone()));
+        ls.utxo.utxo_set.insert(i.clone(), o.clone());
+    }
+    for (i, o) in &deletes {
+        diff.deletes.push((i.clone(), o.clone()));
+        ls.utxo.utxo_set.remove(i);
+    }
+    ls.utxo
+        .diff_seq
+        .diffs
+        .push_back((SlotNo(slot), h(hash_byte), diff.clone()));
+
+    let mut delta = LedgerDelta::new(SlotNo(slot), h(hash_byte), BlockNo(block_no));
+    delta.utxo_diff = diff;
+    delta.block_fields = BlockFieldsDelta {
+        fees_collected: Lovelace(0),
+        epoch_fees: Lovelace(0),
+        epoch_block_count: block_no,
+        evolving_nonce: h(hash_byte),
+        candidate_nonce: h(hash_byte),
+        lab_nonce: h(hash_byte),
+        pool_block_increment: None,
+    };
+    // Mirror the tip update apply_delta_to_state would do.
+    ls.tip = dugite_primitives::block::Tip {
+        point: Point::Specific(SlotNo(slot), h(hash_byte)),
+        block_number: BlockNo(block_no),
+    };
+    seq.push(delta);
+}
+
+#[test]
+fn rollback_via_seq_restores_utxo_set_to_target() {
+    let mut ls = make_anchor();
+    let mut seq = LedgerSeq::with_defaults(ls.clone_without_utxos(), 100);
+
+    // Block 1: insert U1.
+    let u1_in = input(0xa1, 0);
+    let u1_out = output(0xa1, 1_000_000);
+    apply_block_with_inserts(
+        &mut ls,
+        &mut seq,
+        1,
+        1,
+        1,
+        vec![(u1_in.clone(), u1_out.clone())],
+        Vec::new(),
+    );
+    // Block 2: insert U2, delete U1.
+    let u2_in = input(0xa2, 0);
+    let u2_out = output(0xa2, 2_000_000);
+    apply_block_with_inserts(
+        &mut ls,
+        &mut seq,
+        2,
+        2,
+        2,
+        vec![(u2_in.clone(), u2_out.clone())],
+        vec![(u1_in.clone(), u1_out.clone())],
+    );
+    // Block 3: insert U3.
+    let u3_in = input(0xa3, 0);
+    let u3_out = output(0xa3, 3_000_000);
+    apply_block_with_inserts(
+        &mut ls,
+        &mut seq,
+        3,
+        3,
+        3,
+        vec![(u3_in.clone(), u3_out.clone())],
+        Vec::new(),
+    );
+
+    // Sanity: live tip has U2 + U3, U1 was consumed.
+    assert!(ls.utxo.utxo_set.lookup(&u1_in).is_none());
+    assert!(ls.utxo.utxo_set.lookup(&u2_in).is_some());
+    assert!(ls.utxo.utxo_set.lookup(&u3_in).is_some());
+
+    // Roll back to slot 1: should drop U2 + U3 and re-insert U1.
+    let target = Point::Specific(SlotNo(1), h(1));
+    let n = ls
+        .rollback_via_seq(&mut seq, &target)
+        .expect("target in window");
+    assert_eq!(n, 2);
+
+    // After rollback: U1 restored, U2 and U3 gone.
+    assert!(
+        ls.utxo.utxo_set.lookup(&u1_in).is_some(),
+        "U1 must be restored"
+    );
+    assert!(
+        ls.utxo.utxo_set.lookup(&u2_in).is_none(),
+        "U2 must be removed"
+    );
+    assert!(
+        ls.utxo.utxo_set.lookup(&u3_in).is_none(),
+        "U3 must be removed"
+    );
+
+    // Tip must be at the rollback point.
+    assert!(matches!(ls.tip.point, Point::Specific(s, _) if s == SlotNo(1)));
+
+    // DiffSeq should be trimmed to one entry (the surviving block 1 diff).
+    assert_eq!(ls.utxo.diff_seq.diffs.len(), 1);
+
+    // Seq is also rolled back.
+    assert_eq!(seq.len(), 1);
+    assert!(matches!(seq.tip_point(), Point::Specific(s, _) if s == SlotNo(1)));
+}
+
+#[test]
+fn rollback_via_seq_to_anchor_clears_everything() {
+    let mut ls = make_anchor();
+    let mut seq = LedgerSeq::with_defaults(ls.clone_without_utxos(), 100);
+
+    let u1_in = input(0xb1, 0);
+    let u1_out = output(0xb1, 1_000_000);
+    apply_block_with_inserts(
+        &mut ls,
+        &mut seq,
+        1,
+        1,
+        1,
+        vec![(u1_in.clone(), u1_out.clone())],
+        Vec::new(),
+    );
+    let u2_in = input(0xb2, 0);
+    let u2_out = output(0xb2, 2_000_000);
+    apply_block_with_inserts(
+        &mut ls,
+        &mut seq,
+        2,
+        2,
+        2,
+        vec![(u2_in.clone(), u2_out.clone())],
+        Vec::new(),
+    );
+
+    // Roll back to anchor (Origin).
+    let n = ls
+        .rollback_via_seq(&mut seq, &Point::Origin)
+        .expect("anchor matches");
+    assert_eq!(n, 2);
+
+    // Both UTxOs gone; seq + diff_seq empty.
+    assert!(ls.utxo.utxo_set.lookup(&u1_in).is_none());
+    assert!(ls.utxo.utxo_set.lookup(&u2_in).is_none());
+    assert!(seq.is_empty());
+    assert_eq!(ls.utxo.diff_seq.diffs.len(), 0);
+    assert!(matches!(ls.tip.point, Point::Origin));
+}
+
+#[test]
+fn rollback_via_seq_no_op_when_target_is_tip() {
+    let mut ls = make_anchor();
+    let mut seq = LedgerSeq::with_defaults(ls.clone_without_utxos(), 100);
+
+    let u1_in = input(0xc1, 0);
+    let u1_out = output(0xc1, 1_000_000);
+    apply_block_with_inserts(
+        &mut ls,
+        &mut seq,
+        1,
+        1,
+        1,
+        vec![(u1_in.clone(), u1_out.clone())],
+        Vec::new(),
+    );
+
+    // Tip == target.
+    let n = ls
+        .rollback_via_seq(&mut seq, &Point::Specific(SlotNo(1), h(1)))
+        .expect("tip matches");
+    assert_eq!(n, 0, "no rollback needed");
+
+    // State untouched: U1 still present, single delta still in seq.
+    assert!(ls.utxo.utxo_set.lookup(&u1_in).is_some());
+    assert_eq!(seq.len(), 1);
+}
+
+#[test]
+fn rollback_via_seq_returns_none_for_unknown_target() {
+    let mut ls = make_anchor();
+    let mut seq = LedgerSeq::with_defaults(ls.clone_without_utxos(), 100);
+
+    let u1_in = input(0xd1, 0);
+    let u1_out = output(0xd1, 1_000_000);
+    apply_block_with_inserts(
+        &mut ls,
+        &mut seq,
+        1,
+        1,
+        1,
+        vec![(u1_in.clone(), u1_out.clone())],
+        Vec::new(),
+    );
+
+    // Bogus target — outside window.
+    let bogus = Point::Specific(SlotNo(99), h(0xee));
+    assert!(ls.rollback_via_seq(&mut seq, &bogus).is_none());
+
+    // Untouched: caller is expected to fall back to snapshot reload.
+    assert!(ls.utxo.utxo_set.lookup(&u1_in).is_some());
+    assert_eq!(seq.len(), 1);
+    assert_eq!(ls.utxo.diff_seq.diffs.len(), 1);
+}

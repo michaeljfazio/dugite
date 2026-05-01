@@ -622,6 +622,47 @@ impl LedgerSeq {
         self.checkpoints.retain(|&idx, _| idx < new_len);
     }
 
+    /// Number of deltas to drop to reach `target_point`, or `None` if the
+    /// point is not in the volatile window or is not the anchor.
+    ///
+    /// Used by callers that want to translate a `MsgRollBackward` chain
+    /// point into a counted rollback for [`Self::rollback`].
+    ///
+    /// Matches Haskell's `LedgerDB.V2.rollbackToPoint`, which returns the
+    /// number of blocks rolled back when the point is on the volatile
+    /// chain and `Nothing` otherwise (the caller then falls back to a
+    /// snapshot-driven recovery).
+    ///
+    /// # Cases
+    ///
+    /// - `target_point == anchor_point` → `Some(deltas.len())` (full rewind
+    ///   to the immutable tip).
+    /// - `target_point` matches some `deltas[i]` → `Some(deltas.len() - i - 1)`.
+    /// - Otherwise → `None`.
+    pub fn find_rollback_n(&self, target_point: &Point) -> Option<usize> {
+        if &self.anchor_point == target_point {
+            return Some(self.deltas.len());
+        }
+        for (i, delta) in self.deltas.iter().enumerate().rev() {
+            let p = Point::Specific(delta.slot, delta.hash);
+            if &p == target_point {
+                return Some(self.deltas.len() - i - 1);
+            }
+        }
+        None
+    }
+
+    /// Roll back to a specific chain point.  Returns the number of blocks
+    /// rolled back, or `None` if the point is not in the volatile window
+    /// (caller must fall back to snapshot-driven recovery).
+    ///
+    /// Cost: O(n) where `n` is the rollback distance.
+    pub fn rollback_to_point(&mut self, target_point: &Point) -> Option<usize> {
+        let n = self.find_rollback_n(target_point)?;
+        self.rollback(n);
+        Some(n)
+    }
+
     /// Advance the anchor: apply the oldest delta to the anchor state, pop
     /// it from the deque, and re-index the remaining checkpoints.
     ///
