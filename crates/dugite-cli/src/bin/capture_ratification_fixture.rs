@@ -60,6 +60,21 @@ struct Args {
     /// snapshot is unread.
     #[arg(long, default_value_t = false)]
     skip_drep_snapshot: bool,
+
+    /// Use aggregate-mode DRep capture: a single `proposal_voting_summary`
+    /// call returns the aggregate Yes / No / Abstain DRep stake for this
+    /// proposal.  The fixture's `drep_aggregates` field is populated
+    /// instead of `drep_power`, and the loader synthesizes an equivalent
+    /// snapshot (one Yes-cred, one No-cred, one Abstain-cred + a
+    /// no-vote-cred for non-voting registered DReps) that reproduces the
+    /// same `drep_yes / drep_total` ratio.  One Koios request instead of
+    /// thousands — required for post-bootstrap (PV ≥ 10) captures that
+    /// would otherwise exhaust Koios's 5000 req/day free-tier cap.
+    ///
+    /// Mutually exclusive with `--skip-drep-snapshot` (skip wins if both
+    /// set, since aggregate mode still needs one network call).
+    #[arg(long, default_value_t = false)]
+    aggregate_drep: bool,
 }
 
 #[tokio::main(flavor = "current_thread")]
@@ -210,9 +225,52 @@ async fn main() {
         pool_reward_accounts.insert(hex.clone(), reward_hex29);
     }
 
-    // 8. DRep snapshot — drep_list paged, then per-DRep voting power.
+    // 8. DRep snapshot — three modes:
+    //   * --skip-drep-snapshot: empty drep_power (bootstrap fixtures only)
+    //   * --aggregate-drep:     1 call to proposal_voting_summary, populates
+    //                            drep_aggregates instead of per-DRep map
+    //   * default:              ~8800 per-DRep drep_voting_power_history calls
     let mut drep_power: BTreeMap<String, u64> = BTreeMap::new();
-    if !args.skip_drep_snapshot {
+    let mut drep_aggregates_blob: Option<Value> = None;
+    if args.aggregate_drep && !args.skip_drep_snapshot {
+        eprintln!("DRep snapshot: aggregate mode (1 Koios request)");
+        let summary_resp = koios_get(
+            &client,
+            &format!("/proposal_voting_summary?_proposal_id={proposal_id_bech32}"),
+        )
+        .await;
+        let row = summary_resp
+            .as_array()
+            .and_then(|a| a.first())
+            .cloned()
+            .unwrap_or_else(|| panic!("proposal_voting_summary returned empty"));
+        // Koios fields (lovelace, returned as numeric strings):
+        //   drep_yes_votes_assigned_power, drep_no_votes_assigned_power,
+        //   drep_abstain_votes_assigned_power,
+        //   drep_active_no_vote_power,
+        //   drep_always_no_confidence_vote_power,
+        //   drep_always_abstain_vote_power
+        let read_amount = |key: &str| -> u64 {
+            row.get(key)
+                .and_then(|v| v.as_str())
+                .and_then(|s| s.parse::<u64>().ok())
+                .unwrap_or_else(|| row.get(key).and_then(|v| v.as_u64()).unwrap_or(0))
+        };
+        drep_aggregates_blob = Some(serde_json::json!({
+            "yes_stake":                read_amount("drep_yes_votes_assigned_power"),
+            "no_stake":                 read_amount("drep_no_votes_assigned_power"),
+            "abstain_stake":            read_amount("drep_abstain_votes_assigned_power"),
+            "no_vote_stake":            read_amount("drep_active_no_vote_power"),
+            "always_no_confidence_stake": read_amount("drep_always_no_confidence_vote_power"),
+            "always_abstain_stake":     read_amount("drep_always_abstain_vote_power"),
+        }));
+        eprintln!(
+            "DRep snapshot: aggregates captured (yes={}, no={}, abstain={})",
+            read_amount("drep_yes_votes_assigned_power"),
+            read_amount("drep_no_votes_assigned_power"),
+            read_amount("drep_abstain_votes_assigned_power")
+        );
+    } else if !args.skip_drep_snapshot {
         let drep_list = koios_paged(&client, "/drep_list").await;
         let registered: Vec<(String, String, bool)> = drep_list
             .into_iter()
@@ -290,20 +348,24 @@ async fn main() {
         }
     }
 
-    // 9. Pseudo-DRep aggregation.
+    // 9. Pseudo-DRep aggregation (per-DRep mode only).
     //    Koios doesn't expose drep_always_abstain / drep_always_no_confidence
     //    via drep_voting_power_history directly — capture by paging
     //    `/account_list?_drep_id=...` and summing each account's total.
-    //    For fixtures targeting bootstrap epochs these contribute zero to
-    //    the auto-pass DRep ratio; we still emit them for completeness.
-    let drep_no_confidence = if args.skip_drep_snapshot {
+    //
+    //    In aggregate mode, the always-* totals already come back from the
+    //    single proposal_voting_summary call, so we skip the extra paged
+    //    queries and leave the top-level scalar fields at zero (the loader
+    //    reads from `drep_aggregates` instead).
+    let in_aggregate_mode = drep_aggregates_blob.is_some();
+    let drep_no_confidence = if args.skip_drep_snapshot || in_aggregate_mode {
         0
     } else {
         sum_pseudo_drep(&client, "drep_always_no_confidence")
             .await
             .unwrap_or(0)
     };
-    let drep_abstain = if args.skip_drep_snapshot {
+    let drep_abstain = if args.skip_drep_snapshot || in_aggregate_mode {
         0
     } else {
         sum_pseudo_drep(&client, "drep_always_abstain")
@@ -430,7 +492,7 @@ async fn main() {
         _ => unreachable!("validated above"),
     };
 
-    let fixture = serde_json::json!({
+    let mut fixture = serde_json::json!({
         "proposal": fixture_proposal,
         "proposed_epoch": proposed_epoch,
         "votes": canonical_votes,
@@ -460,8 +522,23 @@ async fn main() {
             "source": KOIOS_PREVIEW,
             "snapshot_epoch": snapshot_epoch,
             "ratification_epoch": ratification_epoch,
+            "drep_mode": if in_aggregate_mode {
+                "aggregate"
+            } else if args.skip_drep_snapshot {
+                "skip"
+            } else {
+                "per-drep"
+            },
         }
     });
+    // Splice `drep_aggregates` into the top-level object only when
+    // aggregate mode produced one — keeping per-DRep captures unchanged.
+    if let Some(blob) = drep_aggregates_blob {
+        fixture
+            .as_object_mut()
+            .expect("fixture is an object")
+            .insert("drep_aggregates".to_string(), blob);
+    }
 
     if let Some(parent) = args.output.parent() {
         std::fs::create_dir_all(parent).expect("create output parent dir");
