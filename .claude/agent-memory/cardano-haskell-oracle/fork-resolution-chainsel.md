@@ -1,6 +1,6 @@
 ---
 name: fork-resolution-chainsel
-description: Complete chain selection and mini-fork resolution algorithm in ouroboros-consensus
+description: Complete ChainSel algorithm: addBlock flow, preferAnchoredCandidate, Praos tiebreaker, rollback, tentative follower, candidate storage. Updated with fork-switch commit mechanics (cdbChain single-write, LedgerDB forker decoupling).
 type: reference
 ---
 
@@ -178,3 +178,36 @@ In `rollBackward`:
 - Blocks older than the immutable tip are silently ignored (`olderThanImmTip`).
 - Invalid blocks cached in `cdbInvalid` (fingerprinted map) — subsequent arrivals of same block immediately ignored.
 - `switchTo` atomically updates `cdbChain` TVar, commits the LedgerDB forker, notifies all followers via `fhSwitchFork`.
+
+## Fork Switch Commit Mechanics (Critical for Dugite)
+
+**cdbChain is written exactly ONCE per fork switch, directly to the new tip — never to the intersection.**
+
+In `switchTo` (~line 893):
+```haskell
+atomically $ do
+  InternalChain curChain _ <- readTVar cdbChain
+  case Diff.apply curChain chainDiff of
+    Just newChain -> do
+      writeTVar cdbChain $ InternalChain newChain newChainWithTime   -- single write to new tip
+      closeOrphanedStates <- forkerCommit forker                      -- LedgerDB also committed here
+      when (getRollback chainDiff > 0) $
+        forM_ followerHandles $ \hdl -> fhSwitchFork hdl oldSuffix   -- notify followers
+      return (...)
+```
+
+**LedgerDB rollback is completely decoupled from cdbChain.** It happens inside `validateFork` → `Forker.validate` → `switch`:
+- `withForkerAtFromTip numRollbacks` opens a Forker positioned at (volatile_tip - numRollbacks). This is a private cursor — cdbChain is untouched.
+- The forker replays the apply-list on that private cursor.
+- Only on full success does `applySuccessForkerAction onSuccess fo` call `switchTo`'s closure with the forker.
+- `forkerCommit` inside `switchTo`'s STM transaction promotes the private forker state to the new LedgerDB volatile tip.
+
+**Followers are notified via fhSwitchFork** (STM, inside switchTo's transaction), which sets their cursor to `RollBackTo intersection` without touching cdbChain. They serve `MsgRollBackward` lazily on next `followerInstruction` call.
+
+**Upstream MsgRollBackward is a completely separate path** — it only updates the ChainSync client's local `theirFrag` cursor; it never touches cdbChain or the LedgerDB.
+
+**Dugite TriggeredFork fix is aligned with Haskell:**
+- After switch_chain() commits the new selected_chain, do NOT re-rewind VolatileDB.
+- Roll the LedgerDB back to intersection + replay apply list (mirrors forker mechanism).
+- Notify downstream followers via MsgRollBackward (mirrors fhSwitchFork).
+- The regular ChainSync upstream MsgRollBackward path (full ChainDB rewind) is correctly a separate code path.

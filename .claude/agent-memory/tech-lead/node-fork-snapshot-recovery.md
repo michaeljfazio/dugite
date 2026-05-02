@@ -52,6 +52,39 @@ Made `epoch::is_snapshot_canonical` `pub(crate)` and `startup::enumerate_snapsho
 `SnapshotCandidate` `pub(crate)` for reuse. The mod.rs snapshot validation now uses
 `is_snapshot_canonical` directly instead of a buggy custom re-implementation.
 
+## Third layer fix — volatile-range blind spot (commit abb370fe3, 2026-04-22)
+
+The startup `is_snapshot_canonical` in epoch.rs had its OWN volatile-range blind spot:
+
+```rust
+// OLD (bug):
+if snap_slot > imm_tip_slot { return true; }   // accepts ALL volatile-range slots
+
+// NEW (fix):
+let db_tip_slot = db.get_tip().point.slot()...;
+if snap_slot > db_tip_slot { return true; }    // only accept when genuinely ahead of ChainDB
+```
+
+The forged block at slot 110176139 was:
+- above ImmutableDB tip (110164590) → old code returned true immediately
+- below VolatileDB canonical chain tip (110182746) → new code proceeds to check VolatileDB
+
+`get_block_at_or_after_slot` already checks VolatileDB selected chain only (not orphaned forks).
+So the existing hash-comparison logic correctly detects the mismatch.
+
+Added regression test: `test_is_snapshot_canonical_volatile_fork_detected` (VolatileDB has
+canonical chain at slots 100/200, snapshot claims different hash at slot 100 with empty ImmutableDB).
+
+## Recovery observed after all three layers
+
+On restart after abb370fe3:
+1. Startup detects fork snapshot `a5ac5afc` at slot 110176139 (via VolatileDB selected chain check)
+2. Rolls back to epoch 1274 snapshot at slot 110157845 (canonical)
+3. Chunk replay to ImmutableDB tip 110164590 (`ee749a9c`)
+4. LSM replay detects secondary fork (missing canonical block `8ba27efa` between ImmutableDB and VolatileDB)
+5. Rolls back to slot 110094773 (oldest epoch snapshot), replays 2623 blocks
+6. Node at live tip block 4211513 within 5 minutes — no operator intervention
+
 ## Follow-up needed
 
 The ROOT CAUSE is that the BP saves a snapshot when its forged block is in VolatileDB but
