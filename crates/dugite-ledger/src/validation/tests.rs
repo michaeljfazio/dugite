@@ -13101,4 +13101,156 @@ mod tests {
              reported under VotersDoNotExist; got: {errors:?}"
         );
     }
+
+    // -------------------------------------------------------------------------
+    // ProposalReturnAccountDoesNotExist integration tests for
+    // `validate_transaction_with_context`
+    //
+    // Per Haskell `processProposal` in `Cardano.Ledger.Conway.Rules.Gov`, every
+    // proposal procedure's `pProcReturnAddr` credential must be registered.
+    // The check is **skipped during Conway bootstrap** (`pvMajor == 9`) and
+    // runs from PV >= 10 onwards.  The lenient default (`reward_accounts =
+    // None`) skips the check.
+    // -------------------------------------------------------------------------
+
+    /// Build a 29-byte reward address (header `0xe0` for key-credential) over
+    /// the given 28-byte credential hash.  Mirrors the helper in conway.rs's
+    /// unit-test module so the integration tests speak the same shape.
+    fn return_addr_29_key(cred_byte: u8) -> Vec<u8> {
+        let mut bytes = Vec::with_capacity(29);
+        bytes.push(0xe0);
+        bytes.extend_from_slice(&[cred_byte; 28]);
+        bytes
+    }
+
+    /// Build an InfoAction proposal procedure with the given return_addr
+    /// bytes.  InfoAction is used so no DisallowedVoters / authority check
+    /// can interfere with the test.
+    fn info_proposal_with_return_addr(return_addr: Vec<u8>) -> ProposalProcedure {
+        ProposalProcedure {
+            deposit: Lovelace(1_000_000_000),
+            return_addr,
+            gov_action: GovAction::InfoAction,
+            anchor: Anchor {
+                url: String::new(),
+                data_hash: Hash32::from_bytes([0u8; 32]),
+            },
+        }
+    }
+
+    /// A Conway PV=10 transaction submits a proposal whose return_addr
+    /// credential is not in `reward_accounts`.  The validator must surface
+    /// a `ProposalReturnAccountDoesNotExist` error whose `bad_addrs` payload
+    /// contains the proposal's hex-encoded return address.
+    #[test]
+    fn test_validate_transaction_rejects_proposal_with_unregistered_return_addr_post_bootstrap() {
+        let params = conway_pparams_pv10();
+        let utxo_set = UtxoSet::new();
+
+        let proposal = info_proposal_with_return_addr(return_addr_29_key(0x88));
+        let expected_hex: String = proposal.return_addr.iter().fold(String::new(), |mut s, b| {
+            use std::fmt::Write;
+            let _ = write!(s, "{b:02x}");
+            s
+        });
+        let tx = make_gov_tx(vec![proposal], BTreeMap::new());
+
+        // Reward-accounts map carries an unrelated credential; the proposal's
+        // [0x88; 28] credential is definitely not registered.
+        let mut accounts: HashMap<Hash32, Lovelace> = HashMap::new();
+        accounts.insert(
+            Hash28::from_bytes([0x11; 28]).to_hash32_padded(),
+            Lovelace(0),
+        );
+        let context = ValidationContext::new().with_reward_accounts(accounts);
+        let result =
+            validate_transaction_with_context(&tx, &utxo_set, &params, 100, 500, None, context);
+
+        let errors =
+            result.expect_err("expected ProposalReturnAccountDoesNotExist predicate to fire");
+        let bad_addrs = errors
+            .iter()
+            .find_map(|e| match e {
+                ValidationError::ProposalReturnAccountDoesNotExist { bad_addrs } => Some(bad_addrs),
+                _ => None,
+            })
+            .unwrap_or_else(|| {
+                panic!("ProposalReturnAccountDoesNotExist not in error set: {errors:?}")
+            });
+        assert_eq!(
+            bad_addrs.len(),
+            1,
+            "expected exactly one bad return-addr, got: {bad_addrs:?}"
+        );
+        assert_eq!(
+            bad_addrs[0], expected_hex,
+            "bad_addrs payload must be the proposal's hex-encoded return_addr"
+        );
+    }
+
+    /// At PV=9 (Conway bootstrap), the predicate is skipped, so a proposal
+    /// whose return_addr credential is unregistered must NOT produce
+    /// `ProposalReturnAccountDoesNotExist`.  The Phase-1 layer is still
+    /// expected to reject the tx (NoInputs etc.), but the GOV-bootstrap
+    /// predicate must be quiet.
+    #[test]
+    fn test_validate_transaction_skips_proposal_return_addr_check_in_bootstrap() {
+        let mut params = ProtocolParameters::mainnet_defaults();
+        params.protocol_version_major = 9; // Conway bootstrap.
+        let utxo_set = UtxoSet::new();
+
+        let proposal = info_proposal_with_return_addr(return_addr_29_key(0x88));
+        let tx = make_gov_tx(vec![proposal], BTreeMap::new());
+
+        // Empty reward-accounts — the credential is unregistered, but the
+        // bootstrap-phase skip must short-circuit the check.
+        let context = ValidationContext::new().with_reward_accounts(HashMap::new());
+        let result =
+            validate_transaction_with_context(&tx, &utxo_set, &params, 100, 500, None, context);
+
+        if let Err(errors) = result {
+            assert!(
+                !errors.iter().any(|e| matches!(
+                    e,
+                    ValidationError::ProposalReturnAccountDoesNotExist { .. }
+                )),
+                "ProposalReturnAccountDoesNotExist must not fire at PV=9 (bootstrap); \
+                 got: {errors:?}"
+            );
+        }
+    }
+
+    /// At PV=10 with a properly registered return-addr credential, the
+    /// predicate must NOT produce `ProposalReturnAccountDoesNotExist`.
+    /// Other Phase-1 errors (NoInputs etc.) may still be present — we only
+    /// assert this specific predicate is absent.
+    #[test]
+    fn test_validate_transaction_proposal_with_registered_return_addr_accepted() {
+        let params = conway_pparams_pv10();
+        let utxo_set = UtxoSet::new();
+
+        let proposal = info_proposal_with_return_addr(return_addr_29_key(0x88));
+
+        // Compute the canonical lookup key the predicate will use, then seed
+        // reward_accounts with exactly that key so the credential is registered.
+        let key = crate::state::LedgerState::reward_account_to_hash(&proposal.return_addr);
+        let mut accounts: HashMap<Hash32, Lovelace> = HashMap::new();
+        accounts.insert(key, Lovelace(0));
+
+        let tx = make_gov_tx(vec![proposal], BTreeMap::new());
+        let context = ValidationContext::new().with_reward_accounts(accounts);
+        let result =
+            validate_transaction_with_context(&tx, &utxo_set, &params, 100, 500, None, context);
+
+        if let Err(errors) = result {
+            assert!(
+                !errors.iter().any(|e| matches!(
+                    e,
+                    ValidationError::ProposalReturnAccountDoesNotExist { .. }
+                )),
+                "ProposalReturnAccountDoesNotExist must not fire when the return-addr \
+                 credential is registered; got: {errors:?}"
+            );
+        }
+    }
 }

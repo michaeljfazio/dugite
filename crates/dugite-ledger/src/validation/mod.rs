@@ -490,6 +490,30 @@ pub enum ValidationError {
     VotingOnExpiredGovAction {
         expired_votes: Vec<(Voter, GovActionId, u64, u64)>,
     },
+    /// Conway GOV rule: one or more proposal procedures have a return address
+    /// whose stake credential is not registered in the reward-accounts map.
+    ///
+    /// Per Haskell `processProposal` in
+    /// `eras/conway/impl/src/Cardano/Ledger/Conway/Rules/Gov.hs`, every proposal
+    /// procedure's `pProcReturnAddr` credential must be present in the on-chain
+    /// `accounts` map (i.e. the stake credential is currently registered) so the
+    /// proposal deposit can be refunded at expiry/enactment.  The check is
+    /// **skipped during Conway bootstrap** (`pvMajor == 9`) per
+    /// `hardforkConwayBootstrapPhase`, and runs from PV ≥ 10 onwards.
+    ///
+    /// This predicate is silently skipped if `ValidationContext::reward_accounts`
+    /// is `None` (lenient default for callers that haven't plumbed in the
+    /// reward-accounts state — same convention used by the other GOV predicates).
+    ///
+    /// Every offending proposal's raw `return_addr` (hex-encoded) is aggregated
+    /// into a single predicate failure, mirroring Haskell's `NonEmpty`
+    /// predicate-failure shape.
+    #[error("ProposalReturnAccountDoesNotExist: {bad_addrs:?}")]
+    ProposalReturnAccountDoesNotExist {
+        /// Hex-encoded raw `return_addr` bytes (header + 28-byte credential)
+        /// for every proposal whose return-address credential is unregistered.
+        bad_addrs: Vec<String>,
+    },
     /// Alonzo UTXOW rule: a redeemer in the witness set has no matching
     /// script purpose (spending input, minting policy, withdrawal, cert, vote).
     ///
@@ -1049,6 +1073,43 @@ pub fn validate_transaction_with_context(
         }
         if !expired_votes.is_empty() {
             extra_errors.push(ValidationError::VotingOnExpiredGovAction { expired_votes });
+        }
+    }
+
+    // -------------------------------------------------------------------
+    // ProposalReturnAccountDoesNotExist: every proposal procedure's
+    // `return_addr` must reference a registered stake credential so the
+    // deposit can be refunded.  Per Haskell `processProposal` in
+    // `Conway.Rules.Gov`, this check is **skipped during Conway bootstrap**
+    // (`pvMajor == 9`) — bootstrap gating is inside the predicate, so the
+    // wiring just iterates and aggregates.
+    //
+    // Runs only when the transaction submits at least one proposal.  This
+    // mirrors `Conway.Rules.Gov.processProposal`, which is invoked once per
+    // proposal in `tx.body.proposal_procedures` (and so does nothing for
+    // a tx with no proposals).
+    // -------------------------------------------------------------------
+    if params.protocol_version_major >= 9 && !tx.body.proposal_procedures.is_empty() {
+        let mut bad_addrs: Vec<String> = Vec::new();
+        for proposal in &tx.body.proposal_procedures {
+            if conway::is_proposal_return_account_unregistered(proposal, params, &context) {
+                // Hex-encode the raw return_addr bytes for the diagnostic.
+                // Matches the fold-based encoding used for withdrawal account
+                // hex strings above so error formatting stays consistent
+                // across this module without adding a new dependency.
+                let addr_hex = proposal.return_addr.iter().fold(
+                    String::with_capacity(proposal.return_addr.len() * 2),
+                    |mut s, b| {
+                        use std::fmt::Write;
+                        let _ = write!(s, "{b:02x}");
+                        s
+                    },
+                );
+                bad_addrs.push(addr_hex);
+            }
+        }
+        if !bad_addrs.is_empty() {
+            extra_errors.push(ValidationError::ProposalReturnAccountDoesNotExist { bad_addrs });
         }
     }
 

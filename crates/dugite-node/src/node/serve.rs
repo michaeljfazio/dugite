@@ -609,6 +609,9 @@ pub(crate) fn convert_validation_error(
         VE::VotingOnExpiredGovAction { expired_votes } => TxValidationError::ScriptFailed {
             reason: format!("VotingOnExpiredGovAction: {expired_votes:?}"),
         },
+        VE::ProposalReturnAccountDoesNotExist { bad_addrs } => TxValidationError::ScriptFailed {
+            reason: format!("ProposalReturnAccountDoesNotExist: {bad_addrs:?}"),
+        },
         VE::ExtraRedeemer { tag, index } => TxValidationError::ScriptFailed {
             reason: format!(
                 "Extra redeemer with no matching script purpose: tag={tag}, index={index}"

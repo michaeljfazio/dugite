@@ -11,7 +11,9 @@ use std::collections::{HashMap, HashSet};
 
 use dugite_primitives::hash::{Hash28, Hash32};
 use dugite_primitives::protocol_params::ProtocolParameters;
-use dugite_primitives::transaction::{Certificate, GovAction, TransactionBody, Voter};
+use dugite_primitives::transaction::{
+    Certificate, GovAction, ProposalProcedure, TransactionBody, Voter,
+};
 use dugite_primitives::value::Lovelace;
 
 use super::{ValidationContext, ValidationError};
@@ -436,6 +438,68 @@ pub(super) fn is_vote_on_expired_action(
     };
     // Boundary inclusive: rejected only when current_epoch > expires_after.
     current_epoch > proposal.expires_after_epoch.0
+}
+
+/// Returns `true` when the proposal's `return_addr` references a stake
+/// credential that is not registered in `ctx.reward_accounts`.
+///
+/// Per Haskell `processProposal` in
+/// `eras/conway/impl/src/Cardano/Ledger/Conway/Rules/Gov.hs`, every
+/// proposal procedure's `pProcReturnAddr` must point to a registered stake
+/// credential (so the proposal deposit can be refunded at expiry/enactment).
+///
+/// The check is **skipped during Conway bootstrap** (`pvMajor == 9`) per
+/// `hardforkConwayBootstrapPhase`, returning `false` regardless of the
+/// reward-accounts contents.  It activates from PV ≥ 10 onwards.
+///
+/// This predicate returns `false` (proposal accepted) when:
+///   - `params.protocol_version_major == 9` — bootstrap skip.
+///   - `ctx.reward_accounts` is `None` — lenient default, mirroring the
+///     same convention used by [`is_voter_unknown`] and
+///     [`is_vote_on_expired_action`] when the caller has not plumbed in
+///     the relevant ledger state.
+///   - `proposal.return_addr` is shorter than 29 bytes — malformed
+///     reward addresses are caught by a different predicate
+///     (`ProposalProcedureNetworkIdMismatch` / decoder); this rule must
+///     not double-fire on shape errors.
+///
+/// The lookup uses [`crate::state::LedgerState::reward_account_to_hash`]
+/// to mirror the canonical key derivation used by the withdrawal-amount
+/// check earlier in `validate_transaction_with_pools` (and by the on-chain
+/// reward-accounts map populated in `state/certificates.rs`).  Byte 28 of
+/// the resulting `Hash32` carries the credential type (`0x00` = key,
+/// `0x01` = script), so key and script credentials with the same 28-byte
+/// hash are distinguished — matching Haskell's
+/// `KeyHashObj` / `ScriptHashObj`.
+///
+/// The caller (in `validation/mod.rs`) aggregates every offending proposal's
+/// raw `return_addr` (hex-encoded) into a single
+/// [`ValidationError::ProposalReturnAccountDoesNotExist`], matching
+/// Haskell's `NonEmpty` predicate-failure shape.
+///
+/// Reference: Haskell `ProposalReturnAccountDoesNotExist` in
+/// `eras/conway/impl/src/Cardano/Ledger/Conway/Rules/Gov.hs`,
+/// inside `processProposal`.
+pub(super) fn is_proposal_return_account_unregistered(
+    proposal: &ProposalProcedure,
+    params: &ProtocolParameters,
+    ctx: &ValidationContext,
+) -> bool {
+    // Bootstrap skip — pv == 9 disables the check entirely.
+    if params.protocol_version_major == 9 {
+        return false;
+    }
+    // Lenient default when reward_accounts state is not plumbed in.
+    let Some(accounts) = ctx.reward_accounts.as_ref() else {
+        return false;
+    };
+    // Malformed reward addresses (< 29 bytes) are not this predicate's
+    // concern; treat as accepted here.
+    if proposal.return_addr.len() < 29 {
+        return false;
+    }
+    let key = crate::state::LedgerState::reward_account_to_hash(&proposal.return_addr);
+    !accounts.contains_key(&key)
 }
 
 #[cfg(test)]
@@ -1501,6 +1565,132 @@ mod tests {
         assert!(
             !is_vote_on_expired_action(&action_id, &ctx),
             "Predicate must skip (return false) when active_proposals is None"
+        );
+    }
+
+    // ---------------------------------------------------------------------------
+    // is_proposal_return_account_unregistered — ProposalReturnAccountDoesNotExist
+    //                                            (Conway GOV)
+    //
+    // Per Haskell `processProposal`, every proposal procedure's
+    // `pProcReturnAddr` credential must be present in `accounts`.  The check
+    // is **skipped during Conway bootstrap** (`pvMajor == 9`) and runs from
+    // PV >= 10 onwards.  When `ctx.reward_accounts` is `None`, the predicate
+    // returns false (lenient default) — matching the convention used by the
+    // other GOV predicates.
+    // ---------------------------------------------------------------------------
+
+    /// Build a `ProtocolParameters` pinned to the given protocol-version
+    /// major number.  The other parameter values are irrelevant to this
+    /// predicate.
+    fn pparams_at_pv(pv_major: u64) -> ProtocolParameters {
+        let mut p = ProtocolParameters::mainnet_defaults();
+        p.protocol_version_major = pv_major;
+        p
+    }
+
+    /// Build a 29-byte stake/reward address: `header || credential_hash[28]`.
+    /// `is_script` flips bit 4 of the header (`0xe0` key vs `0xf0` script),
+    /// matching the Cardano reward-address layout used by
+    /// `reward_account_to_hash` for the credential-type tag in byte 28 of
+    /// the resulting Hash32.
+    fn return_addr_29(cred_byte: u8, is_script: bool) -> Vec<u8> {
+        let header: u8 = if is_script { 0xf0 } else { 0xe0 };
+        let mut bytes = Vec::with_capacity(29);
+        bytes.push(header);
+        bytes.extend_from_slice(&[cred_byte; 28]);
+        bytes
+    }
+
+    /// Build a `ProposalProcedure` whose `return_addr` is the given 29-byte
+    /// reward-address payload.  Only `return_addr` matters for this
+    /// predicate; the other fields carry no-op values.
+    fn proposal_with_return_addr(return_addr: Vec<u8>) -> ProposalProcedure {
+        ProposalProcedure {
+            deposit: Lovelace(1_000_000_000),
+            return_addr,
+            gov_action: GovAction::InfoAction,
+            anchor: Anchor {
+                url: String::new(),
+                data_hash: Hash32::from_bytes([0u8; 32]),
+            },
+        }
+    }
+
+    #[test]
+    fn test_proposal_return_account_unregistered_post_bootstrap_rejected() {
+        // PV=10 (post-bootstrap), reward_accounts present but does NOT contain
+        // the proposal's return-address credential -> predicate returns true.
+        let params = pparams_at_pv(10);
+        let proposal = proposal_with_return_addr(return_addr_29(0x88, false));
+
+        // Reward-accounts map carries some other credential — definitely not
+        // the [0x88; 28] credential the proposal references.
+        let mut accounts: HashMap<Hash32, Lovelace> = HashMap::new();
+        accounts.insert(
+            Hash28::from_bytes([0x11; 28]).to_hash32_padded(),
+            Lovelace(0),
+        );
+        let ctx = ValidationContext::new().with_reward_accounts(accounts);
+
+        assert!(
+            is_proposal_return_account_unregistered(&proposal, &params, &ctx),
+            "Unregistered return-addr credential at PV=10 must be rejected"
+        );
+    }
+
+    #[test]
+    fn test_proposal_return_account_check_skipped_during_bootstrap() {
+        // PV=9 (Conway bootstrap), unregistered credential -> predicate must
+        // return false regardless (bootstrap-phase skip per
+        // hardforkConwayBootstrapPhase).
+        let params = pparams_at_pv(9);
+        let proposal = proposal_with_return_addr(return_addr_29(0x88, false));
+
+        // Empty reward_accounts — the credential is definitely not registered,
+        // but the bootstrap skip must short-circuit the check.
+        let ctx = ValidationContext::new().with_reward_accounts(HashMap::new());
+
+        assert!(
+            !is_proposal_return_account_unregistered(&proposal, &params, &ctx),
+            "Bootstrap (PV=9) must skip the return-account check entirely"
+        );
+    }
+
+    #[test]
+    fn test_proposal_return_account_registered_passes() {
+        // PV=10 with a registered credential matching the proposal's
+        // return_addr -> predicate returns false (accepted).
+        let params = pparams_at_pv(10);
+        let proposal = proposal_with_return_addr(return_addr_29(0x88, false));
+
+        // Compute the same key the predicate will compute via
+        // `reward_account_to_hash`, so the registered set actually matches.
+        let key = crate::state::LedgerState::reward_account_to_hash(&proposal.return_addr);
+        let mut accounts: HashMap<Hash32, Lovelace> = HashMap::new();
+        accounts.insert(key, Lovelace(0));
+        let ctx = ValidationContext::new().with_reward_accounts(accounts);
+
+        assert!(
+            !is_proposal_return_account_unregistered(&proposal, &params, &ctx),
+            "Registered return-addr credential must be accepted"
+        );
+    }
+
+    #[test]
+    fn test_proposal_return_account_skipped_when_reward_accounts_none() {
+        // PV=10 but ctx.reward_accounts = None -> lenient default (false).
+        // This mirrors `is_voter_unknown` / `is_vote_on_expired_action`
+        // behaviour when the caller hasn't plumbed in the relevant state.
+        let params = pparams_at_pv(10);
+        let proposal = proposal_with_return_addr(return_addr_29(0x88, false));
+
+        let ctx = ValidationContext::new();
+        assert!(ctx.reward_accounts.is_none());
+
+        assert!(
+            !is_proposal_return_account_unregistered(&proposal, &params, &ctx),
+            "Predicate must skip (return false) when reward_accounts is None"
         );
     }
 }
