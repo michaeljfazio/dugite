@@ -13663,4 +13663,100 @@ mod tests {
             );
         }
     }
+
+    // -------------------------------------------------------------------------
+    // ConflictingCommitteeUpdate integration tests for
+    // `validate_transaction_with_context`
+    //
+    // Per Haskell `processProposal` (UpdateCommittee branch), the
+    // intersection of the add-set keys and the remove-set must be empty.
+    // **Always enforced** — no Conway-bootstrap skip.
+    // -------------------------------------------------------------------------
+
+    /// Build an `UpdateCommittee` proposal with the given add and remove
+    /// sets.  Threshold is 1/2.  `return_addr` mainnet so the network-id
+    /// check passes.
+    fn update_committee_proposal_for_test(
+        members_to_add: BTreeMap<dugite_primitives::credentials::Credential, u64>,
+        members_to_remove: Vec<dugite_primitives::credentials::Credential>,
+    ) -> ProposalProcedure {
+        ProposalProcedure {
+            deposit: Lovelace(1_000_000_000),
+            return_addr: reward_addr_29(1, 0xCC),
+            gov_action: GovAction::UpdateCommittee {
+                prev_action_id: None,
+                members_to_remove,
+                members_to_add,
+                threshold: Rational {
+                    numerator: 1,
+                    denominator: 2,
+                },
+            },
+            anchor: anchor_stub(),
+        }
+    }
+
+    /// Post-bootstrap: an `UpdateCommittee` proposal both adds and removes
+    /// the same credential; validator must surface
+    /// `ConflictingCommitteeUpdate` whose `conflicts` carries the typed
+    /// hash hex of the conflicting credential.
+    #[test]
+    fn test_validate_transaction_rejects_conflicting_committee_update_post_bootstrap() {
+        use dugite_primitives::credentials::Credential;
+
+        let params = conway_pparams_pv10();
+        let utxo_set = UtxoSet::new();
+
+        let cred = Credential::VerificationKey(Hash28::from_bytes([0x44; 28]));
+        let mut adds: BTreeMap<Credential, u64> = BTreeMap::new();
+        adds.insert(cred.clone(), 100);
+        let proposal = update_committee_proposal_for_test(adds, vec![cred.clone()]);
+        let tx = make_gov_tx(vec![proposal], BTreeMap::new());
+
+        let context =
+            ValidationContext::new().with_network(dugite_primitives::network::NetworkId::Mainnet);
+        let result =
+            validate_transaction_with_context(&tx, &utxo_set, &params, 100, 500, None, context);
+
+        let errors = result.expect_err("expected ConflictingCommitteeUpdate predicate to fire");
+        let conflicts = errors
+            .iter()
+            .find_map(|e| match e {
+                ValidationError::ConflictingCommitteeUpdate { conflicts } => Some(conflicts),
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("ConflictingCommitteeUpdate not in error set: {errors:?}"));
+        assert_eq!(conflicts.len(), 1);
+        assert_eq!(conflicts[0], cred.to_typed_hash32().to_hex());
+    }
+
+    /// At PV=9 (Conway bootstrap) the conflicting-update check is **still
+    /// enforced** — there is no bootstrap skip for this rule.
+    #[test]
+    fn test_validate_transaction_rejects_conflicting_committee_update_in_bootstrap() {
+        use dugite_primitives::credentials::Credential;
+
+        let mut params = ProtocolParameters::mainnet_defaults();
+        params.protocol_version_major = 9; // Conway bootstrap.
+        let utxo_set = UtxoSet::new();
+
+        let cred = Credential::VerificationKey(Hash28::from_bytes([0x55; 28]));
+        let mut adds: BTreeMap<Credential, u64> = BTreeMap::new();
+        adds.insert(cred.clone(), 100);
+        let proposal = update_committee_proposal_for_test(adds, vec![cred]);
+        let tx = make_gov_tx(vec![proposal], BTreeMap::new());
+
+        let context =
+            ValidationContext::new().with_network(dugite_primitives::network::NetworkId::Mainnet);
+        let result =
+            validate_transaction_with_context(&tx, &utxo_set, &params, 100, 500, None, context);
+
+        let errors = result.expect_err("expected ConflictingCommitteeUpdate even at PV=9");
+        assert!(
+            errors
+                .iter()
+                .any(|e| matches!(e, ValidationError::ConflictingCommitteeUpdate { .. })),
+            "ConflictingCommitteeUpdate MUST fire at PV=9 (no bootstrap skip); got: {errors:?}"
+        );
+    }
 }

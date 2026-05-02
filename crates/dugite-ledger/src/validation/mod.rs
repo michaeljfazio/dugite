@@ -600,6 +600,33 @@ pub enum ValidationError {
         /// offending TreasuryWithdrawals proposal in the transaction.
         offending_proposals: Vec<String>,
     },
+    /// Conway GOV rule: one or more `UpdateCommittee` proposals whose
+    /// add-set keys intersect the remove-set — the proposal both adds and
+    /// removes the same Constitutional Committee credential.
+    ///
+    /// Per Haskell `processProposal` in
+    /// `eras/conway/impl/src/Cardano/Ledger/Conway/Rules/Gov.hs`
+    /// (`UpdateCommittee` branch):
+    ///
+    /// ```haskell
+    /// let conflicting = Set.intersection (Map.keysSet membersToAdd) membersToRemove
+    /// in unless (Set.null conflicting) (failBecause $ ConflictingCommitteeUpdate conflicting)
+    /// ```
+    ///
+    /// This check is **always enforced** — there is no Conway-bootstrap
+    /// skip; the conflict is a structural property of the action payload.
+    ///
+    /// Conflicting credentials across all `UpdateCommittee` proposals in
+    /// the transaction are aggregated into a single predicate failure.
+    /// Each entry is the typed-hash32 hex (byte 28 = `0x01` for scripts,
+    /// `0x00` for keys) so callers can distinguish key- from script-
+    /// credential conflicts — matching Haskell's `Credential` type.
+    #[error("ConflictingCommitteeUpdate: {conflicts:?}")]
+    ConflictingCommitteeUpdate {
+        /// Hex-encoded typed-hash32 of every conflicting credential
+        /// across all UpdateCommittee proposals in the transaction.
+        conflicts: Vec<String>,
+    },
     /// Alonzo UTXOW rule: a redeemer in the witness set has no matching
     /// script purpose (spending input, minting policy, withdrawal, cert, vote).
     ///
@@ -1306,6 +1333,26 @@ pub fn validate_transaction_with_context(
             extra_errors.push(ValidationError::ZeroTreasuryWithdrawals {
                 offending_proposals: offending,
             });
+        }
+    }
+
+    // -------------------------------------------------------------------
+    // ConflictingCommitteeUpdate: every `UpdateCommittee` proposal must
+    // have an empty intersection between its add-set keys and its
+    // remove-set.  Per Haskell `processProposal` in `Conway.Rules.Gov`,
+    // this check is **always enforced** (no Conway-bootstrap skip — the
+    // add/remove conflict is a structural property of the action payload).
+    //
+    // Runs only when the transaction submits at least one proposal,
+    // mirroring `processProposal`'s per-proposal invocation.
+    // -------------------------------------------------------------------
+    if params.protocol_version_major >= 9 && !tx.body.proposal_procedures.is_empty() {
+        let mut conflicts: Vec<String> = Vec::new();
+        for proposal in &tx.body.proposal_procedures {
+            conflicts.extend(conway::committee_update_conflicts(proposal));
+        }
+        if !conflicts.is_empty() {
+            extra_errors.push(ValidationError::ConflictingCommitteeUpdate { conflicts });
         }
     }
 

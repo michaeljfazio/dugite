@@ -633,6 +633,9 @@ pub(crate) fn convert_validation_error(
         } => TxValidationError::ScriptFailed {
             reason: format!("ZeroTreasuryWithdrawals: {offending_proposals:?}"),
         },
+        VE::ConflictingCommitteeUpdate { conflicts } => TxValidationError::ScriptFailed {
+            reason: format!("ConflictingCommitteeUpdate: {conflicts:?}"),
+        },
         VE::ExtraRedeemer { tag, index } => TxValidationError::ScriptFailed {
             reason: format!(
                 "Extra redeemer with no matching script purpose: tag={tag}, index={index}"
