@@ -365,7 +365,11 @@ pub(super) fn is_voter_unknown(voter: &Voter, ctx: &ValidationContext) -> bool {
     match voter {
         Voter::DRep(credential) => match ctx.registered_dreps.as_ref() {
             Some(dreps) => {
-                let key = credential.to_hash().to_hash32_padded();
+                // Use `to_typed_hash32` so byte 28 carries the credential kind
+                // (0x00 key, 0x01 script). The producer side
+                // (`state::credential_to_hash`) keys the DRep map the same way,
+                // matching Haskell's `Map (Credential 'DRepRole) DRepState`.
+                let key = credential.to_typed_hash32();
                 !dreps.contains(&key)
             }
             None => false,
@@ -386,7 +390,9 @@ pub(super) fn is_voter_unknown(voter: &Voter, ctx: &ValidationContext) -> bool {
         Voter::ConstitutionalCommittee(hot_credential) => {
             match ctx.committee_authorized_hot_keys.as_ref() {
                 Some(hot_keys) => {
-                    let key = hot_credential.to_hash().to_hash32_padded();
+                    // Same key/script disambiguation as DRep above —
+                    // `Credential 'HotCommitteeRole` carries the kind tag.
+                    let key = hot_credential.to_typed_hash32();
                     !hot_keys.contains(&key)
                 }
                 None => false,
@@ -1621,8 +1627,11 @@ mod tests {
     // ---------------------------------------------------------------------------
 
     /// Build a 28-byte hash with all bytes equal to `b`, padded to Hash32 form
-    /// (last 4 bytes zero) — the canonical key shape used by registered_dreps,
-    /// committee_authorized_hot_keys, etc.
+    /// matching the canonical kind-tagged shape (`to_typed_hash32`) used by
+    /// registered_dreps, committee_authorized_hot_keys, etc.  For key
+    /// credentials byte 28 is 0x00, which is identical to plain
+    /// `to_hash32_padded`, so this helper is interchangeable for the
+    /// VerificationKey case (which is what the call-sites use).
     fn padded_key_hash(b: u8) -> Hash32 {
         Hash28::from_bytes([b; 28]).to_hash32_padded()
     }
@@ -1707,12 +1716,45 @@ mod tests {
         let voter = Voter::DRep(cred.clone());
 
         let mut dreps: HashSet<Hash32> = HashSet::new();
-        dreps.insert(cred.to_hash().to_hash32_padded());
+        dreps.insert(cred.to_typed_hash32());
 
         let ctx = ValidationContext::new().with_dreps(dreps);
         assert!(
             !is_voter_unknown(&voter, &ctx),
             "Registered DRep voter must NOT be reported as unknown"
+        );
+    }
+
+    #[test]
+    fn test_voter_known_registered_drep_script_credential() {
+        // Regression: a script-credential DRep voter whose credential IS in
+        // registered_dreps must NOT be reported as unknown.  This exercises
+        // the kind-tag (byte 28 = 0x01) path of `to_typed_hash32` — a previous
+        // bug looked up using `to_hash32_padded` (which drops the kind tag),
+        // causing every script-credential DRep voter to be falsely rejected
+        // even when registered.  Mirrors Haskell's `Map.member` lookup over a
+        // `Credential 'DRepRole`-keyed map (`vsDReps`).
+        let same_hash = Hash28::from_bytes([0xD4; 28]);
+        let key_cred = Credential::VerificationKey(same_hash);
+        let script_cred = Credential::Script(same_hash);
+
+        // Register both: same 28-byte hash, distinct kinds → distinct entries.
+        let mut dreps: HashSet<Hash32> = HashSet::new();
+        dreps.insert(key_cred.to_typed_hash32());
+        dreps.insert(script_cred.to_typed_hash32());
+        assert_eq!(dreps.len(), 2, "key and script DReps must hash distinctly");
+
+        let ctx = ValidationContext::new().with_dreps(dreps);
+
+        let key_voter = Voter::DRep(key_cred);
+        let script_voter = Voter::DRep(script_cred);
+        assert!(
+            !is_voter_unknown(&key_voter, &ctx),
+            "Registered key-credential DRep voter must NOT be reported as unknown"
+        );
+        assert!(
+            !is_voter_unknown(&script_voter, &ctx),
+            "Registered script-credential DRep voter must NOT be reported as unknown"
         );
     }
 
@@ -1741,12 +1783,37 @@ mod tests {
         let voter = Voter::ConstitutionalCommittee(hot.clone());
 
         let mut hot_keys: HashSet<Hash32> = HashSet::new();
-        hot_keys.insert(hot.to_hash().to_hash32_padded());
+        hot_keys.insert(hot.to_typed_hash32());
 
         let ctx = ValidationContext::new().with_committee_authorized_hot_keys(hot_keys);
         assert!(
             !is_voter_unknown(&voter, &ctx),
             "Authorised committee hot key voter must NOT be reported as unknown"
+        );
+    }
+
+    #[test]
+    fn test_voter_known_authorized_committee_hot_key_script_credential() {
+        // Regression: a script-credential committee voter whose hot
+        // credential IS in committee_authorized_hot_keys must NOT be reported
+        // as unknown — matches the script-cred DRep regression above.
+        let same_hash = Hash28::from_bytes([0xC4; 28]);
+        let key_hot = Credential::VerificationKey(same_hash);
+        let script_hot = Credential::Script(same_hash);
+
+        let mut hot_keys: HashSet<Hash32> = HashSet::new();
+        hot_keys.insert(key_hot.to_typed_hash32());
+        hot_keys.insert(script_hot.to_typed_hash32());
+        assert_eq!(hot_keys.len(), 2);
+
+        let ctx = ValidationContext::new().with_committee_authorized_hot_keys(hot_keys);
+        assert!(
+            !is_voter_unknown(&Voter::ConstitutionalCommittee(key_hot), &ctx),
+            "Authorised key-credential committee hot key voter must NOT be reported as unknown"
+        );
+        assert!(
+            !is_voter_unknown(&Voter::ConstitutionalCommittee(script_hot), &ctx),
+            "Authorised script-credential committee hot key voter must NOT be reported as unknown"
         );
     }
 
