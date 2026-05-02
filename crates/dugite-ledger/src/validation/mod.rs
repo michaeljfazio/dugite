@@ -88,6 +88,12 @@ pub struct ValidationContext {
     pub current_treasury: Option<u64>,
     pub reward_accounts: Option<HashMap<Hash32, Lovelace>>,
     pub current_epoch: Option<u64>,
+    // TODO: this set conflates DRep key-credential hashes and DRep script-credential
+    // hashes (both are stored as the same `Hash32` value by `to_hash32_padded`).
+    // Haskell separates them via `Credential 'DRepRole`. Disambiguating is a
+    // preexisting limitation that affects every consumer of `registered_dreps`
+    // (not just the new GOV predicates) — track separately if/when DRep script
+    // membership becomes meaningful.
     pub registered_dreps: Option<HashSet<Hash32>>,
     pub registered_vrf_keys: Option<HashMap<Hash32, Hash28>>,
     pub node_network: Option<NetworkId>,
@@ -467,6 +473,23 @@ pub enum ValidationError {
     /// (mirroring Haskell's `NonEmpty` shape).
     #[error("VotersDoNotExist: {voters:?}")]
     VotersDoNotExist { voters: Vec<Voter> },
+    /// A voter is voting against a governance action whose `expires_after_epoch`
+    /// is strictly less than the current epoch.
+    ///
+    /// Reference: Haskell `VotingOnExpiredGovAction` in
+    /// `eras/conway/impl/src/Cardano/Ledger/Conway/Rules/Gov.hs`,
+    /// function `checkVotesAreNotForExpiredActions`. Vote is allowed
+    /// when `current_epoch <= gasExpiresAfter` (boundary inclusive).
+    ///
+    /// This predicate is silently skipped if `ValidationContext::active_proposals`
+    /// is `None` (lenient default for callers that don't yet plumb in the
+    /// active-proposal map).
+    ///
+    /// Tuple shape: `(voter, gov_action_id, expires_after_epoch, current_epoch)`.
+    #[error("VotingOnExpiredGovAction: {expired_votes:?}")]
+    VotingOnExpiredGovAction {
+        expired_votes: Vec<(Voter, GovActionId, u64, u64)>,
+    },
     /// Alonzo UTXOW rule: a redeemer in the witness set has no matching
     /// script purpose (spending input, minting policy, withdrawal, cert, vote).
     ///
@@ -888,6 +911,12 @@ pub fn validate_transaction_with_context(
         // and an empty inner map is unreachable in practice (CBOR decoders
         // reject it).
         // -------------------------------------------------------------------
+        // Two collections, one purpose: `unknown_voters` preserves the order
+        // of voters as they appear in `voting_procedures` so the resulting
+        // `VotersDoNotExist` payload is deterministic; `unknown_voter_set`
+        // gives O(1) skip-membership lookup for the precedence loops below
+        // (DisallowedVoters / VotingOnExpiredGovAction must not double-fire
+        // on a voter that's already in `VotersDoNotExist`).
         let mut unknown_voters: Vec<Voter> = Vec::new();
         let mut unknown_voter_set: HashSet<Voter> = HashSet::new();
         for (voter, vp_map) in tx.body.voting_procedures.iter() {
@@ -961,6 +990,65 @@ pub fn validate_transaction_with_context(
         }
         if !violations.is_empty() {
             extra_errors.push(ValidationError::DisallowedVoters { violations });
+        }
+
+        // -------------------------------------------------------------------
+        // VotingOnExpiredGovAction: a vote against an action whose
+        // `expires_after_epoch` is strictly less than `current_epoch` is
+        // rejected.  Boundary case (`current_epoch == expires_after_epoch`)
+        // is allowed — Haskell `checkVotesAreNotForExpiredActions`.
+        //
+        // Precedence (Haskell `internVoter` partitions unknown voters out
+        // first; the authority and expiry checks then apply only to known
+        // voters):
+        //
+        //   VotersDoNotExist  >  DisallowedVoters
+        //                     >  VotingOnExpiredGovAction
+        //
+        // Concretely: we skip voters already in `unknown_voter_set` so a
+        // single voter is never reported under multiple predicates here.
+        //
+        // Same-tx proposals (`local_proposals`) are skipped because a
+        // proposal that was just submitted in this tx cannot have expired.
+        // This matches Haskell's `proposals` look-up: only the on-chain
+        // active-proposal map carries an `expiresAfter` field.
+        // -------------------------------------------------------------------
+        let mut expired_votes: Vec<(Voter, GovActionId, u64, u64)> = Vec::new();
+        if let Some(current_epoch) = context.current_epoch {
+            for (voter, votes) in &tx.body.voting_procedures {
+                if unknown_voter_set.contains(voter) {
+                    continue;
+                }
+                for action_id in votes.keys() {
+                    // Same-tx proposals are never expired (they were just
+                    // submitted), so skip them here.  This also prevents
+                    // double-firing when a proposal happens to share a
+                    // GovActionId with an active one (impossible in practice
+                    // but the local-tx branch wins).
+                    if local_proposals.contains_key(action_id) {
+                        continue;
+                    }
+                    if conway::is_vote_on_expired_action(action_id, &context) {
+                        // SAFETY: is_vote_on_expired_action returned true, so
+                        // both `active_proposals` and the action_id entry exist.
+                        let expires = context
+                            .active_proposals
+                            .as_ref()
+                            .and_then(|m| m.get(action_id))
+                            .map(|p| p.expires_after_epoch.0)
+                            .expect("predicate true implies active proposal exists");
+                        expired_votes.push((
+                            voter.clone(),
+                            action_id.clone(),
+                            expires,
+                            current_epoch,
+                        ));
+                    }
+                }
+            }
+        }
+        if !expired_votes.is_empty() {
+            extra_errors.push(ValidationError::VotingOnExpiredGovAction { expired_votes });
         }
     }
 

@@ -606,6 +606,9 @@ pub(crate) fn convert_validation_error(
         VE::VotersDoNotExist { voters } => TxValidationError::ScriptFailed {
             reason: format!("VotersDoNotExist: {voters:?}"),
         },
+        VE::VotingOnExpiredGovAction { expired_votes } => TxValidationError::ScriptFailed {
+            reason: format!("VotingOnExpiredGovAction: {expired_votes:?}"),
+        },
         VE::ExtraRedeemer { tag, index } => TxValidationError::ScriptFailed {
             reason: format!(
                 "Extra redeemer with no matching script purpose: tag={tag}, index={index}"

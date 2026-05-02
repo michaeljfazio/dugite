@@ -393,6 +393,51 @@ pub(super) fn is_voter_unknown(voter: &Voter, ctx: &ValidationContext) -> bool {
     }
 }
 
+/// Returns `true` when a vote against the governance action identified by
+/// `gov_action_id` is rejected because the action has already expired.
+///
+/// Per Haskell `checkVotesAreNotForExpiredActions` in
+/// `Cardano.Ledger.Conway.Rules.Gov`, a vote is allowed when
+/// `current_epoch <= gasExpiresAfter` (boundary inclusive); it is rejected
+/// only when `current_epoch > gasExpiresAfter`.
+///
+/// The action's expiry epoch is looked up from
+/// `ctx.active_proposals[gov_action_id].expires_after_epoch`.
+///
+/// This predicate returns `false` (vote allowed) when:
+///   - `ctx.active_proposals` is `None` — lenient default, mirroring the
+///     same convention used by [`is_voter_disallowed`] when the caller has
+///     not plumbed in proposal state.
+///   - `ctx.current_epoch` is `None` — without a current epoch we can't
+///     compare, so we accept the vote.
+///   - `gov_action_id` is not present in the active-proposal map — that's a
+///     different predicate failure (`GovActionsDoNotExist`), handled
+///     elsewhere; this rule must not double-fire on it.
+///
+/// The caller (in `validation/mod.rs`) aggregates every expired
+/// `(voter, gov_action_id)` pair into a single
+/// [`ValidationError::VotingOnExpiredGovAction`], matching Haskell's
+/// `NonEmpty` predicate-failure shape.
+///
+/// Reference: Haskell `checkVotesAreNotForExpiredActions` in
+/// `eras/conway/impl/src/Cardano/Ledger/Conway/Rules/Gov.hs`.
+pub(super) fn is_vote_on_expired_action(
+    gov_action_id: &dugite_primitives::transaction::GovActionId,
+    ctx: &ValidationContext,
+) -> bool {
+    let Some(active) = ctx.active_proposals.as_ref() else {
+        return false;
+    };
+    let Some(current_epoch) = ctx.current_epoch else {
+        return false;
+    };
+    let Some(proposal) = active.get(gov_action_id) else {
+        return false;
+    };
+    // Boundary inclusive: rejected only when current_epoch > expires_after.
+    current_epoch > proposal.expires_after_epoch.0
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::{BTreeMap, HashMap, HashSet};
@@ -400,6 +445,7 @@ mod tests {
     use dugite_primitives::credentials::Credential;
     use dugite_primitives::hash::{Hash28, Hash32};
     use dugite_primitives::protocol_params::ProtocolParameters;
+    use dugite_primitives::time::EpochNo;
     use dugite_primitives::transaction::{
         Anchor, Certificate, DRep, GovAction, GovActionId, PoolParams, ProposalProcedure, Rational,
         TransactionBody, Voter, VotingProcedure,
@@ -407,6 +453,7 @@ mod tests {
     use dugite_primitives::value::Lovelace;
 
     use super::*;
+    use crate::validation::ActiveProposal;
 
     // ---------------------------------------------------------------------------
     // Helpers
@@ -1365,6 +1412,95 @@ mod tests {
         assert!(
             !is_voter_unknown(&cc_voter_unset, &ctx),
             "Committee voter must default to known when committee_authorized_hot_keys is None"
+        );
+    }
+
+    // ---------------------------------------------------------------------------
+    // is_vote_on_expired_action — VotingOnExpiredGovAction predicate (Conway GOV)
+    //
+    // Per Haskell `checkVotesAreNotForExpiredActions`, a vote is rejected only
+    // when `current_epoch > gasExpiresAfter`.  The boundary case
+    // (`current_epoch == gasExpiresAfter`) is allowed.
+    // ---------------------------------------------------------------------------
+
+    /// Build a `(GovActionId, ValidationContext)` pair where `current_epoch =
+    /// current` and the proposal at `gov_action_id` has the given
+    /// `expires_after_epoch`.
+    fn ctx_with_proposal(
+        action_id: &GovActionId,
+        current: u64,
+        expires_after: u64,
+    ) -> ValidationContext {
+        let proposal = ActiveProposal {
+            gov_action: GovAction::InfoAction,
+            return_addr: vec![0xe0; 29],
+            deposit: Lovelace(0),
+            expires_after_epoch: EpochNo(expires_after),
+            // proposed_in_epoch is unused by this predicate; pick something sane.
+            proposed_in_epoch: EpochNo(expires_after.saturating_sub(6)),
+        };
+        let mut active: HashMap<GovActionId, ActiveProposal> = HashMap::new();
+        active.insert(action_id.clone(), proposal);
+        ValidationContext::new()
+            .with_active_proposals(active)
+            .with_epoch(current)
+    }
+
+    #[test]
+    fn test_voting_on_expired_gov_action_rejected_strict_greater() {
+        // current_epoch = 20, expires_after = 10 -> rejected (strictly past).
+        let action_id = GovActionId {
+            transaction_id: Hash32::from_bytes([0x77; 32]),
+            action_index: 0,
+        };
+        let ctx = ctx_with_proposal(&action_id, 20, 10);
+        assert!(
+            is_vote_on_expired_action(&action_id, &ctx),
+            "current=20, expires_after=10 must be rejected"
+        );
+    }
+
+    #[test]
+    fn test_voting_on_action_at_expiry_boundary_allowed() {
+        // current_epoch == expires_after -> allowed (boundary inclusive).
+        let action_id = GovActionId {
+            transaction_id: Hash32::from_bytes([0x77; 32]),
+            action_index: 1,
+        };
+        let ctx = ctx_with_proposal(&action_id, 10, 10);
+        assert!(
+            !is_vote_on_expired_action(&action_id, &ctx),
+            "current=10, expires_after=10 is the boundary and must be allowed \
+             (Haskell: current_epoch <= gasExpiresAfter)"
+        );
+    }
+
+    #[test]
+    fn test_voting_on_future_action_allowed() {
+        // current_epoch < expires_after -> trivially allowed.
+        let action_id = GovActionId {
+            transaction_id: Hash32::from_bytes([0x77; 32]),
+            action_index: 2,
+        };
+        let ctx = ctx_with_proposal(&action_id, 5, 10);
+        assert!(
+            !is_vote_on_expired_action(&action_id, &ctx),
+            "current=5, expires_after=10 must be allowed"
+        );
+    }
+
+    #[test]
+    fn test_voting_on_action_skipped_when_active_proposals_none() {
+        // ctx.active_proposals = None -> lenient default, predicate returns false.
+        let action_id = GovActionId {
+            transaction_id: Hash32::from_bytes([0x77; 32]),
+            action_index: 3,
+        };
+        // Set current_epoch but leave active_proposals = None.
+        let ctx = ValidationContext::new().with_epoch(9999);
+        assert!(
+            !is_vote_on_expired_action(&action_id, &ctx),
+            "Predicate must skip (return false) when active_proposals is None"
         );
     }
 }

@@ -12887,4 +12887,218 @@ mod tests {
             );
         }
     }
+
+    // -------------------------------------------------------------------------
+    // VotingOnExpiredGovAction integration tests for `validate_transaction_with_context`
+    //
+    // Per Haskell `checkVotesAreNotForExpiredActions` in
+    // `Cardano.Ledger.Conway.Rules.Gov`, votes against an action whose
+    // `gasExpiresAfter` is strictly less than the current epoch are rejected.
+    // Boundary case (`current_epoch == gasExpiresAfter`) is allowed.
+    //
+    // Same-tx proposals are skipped because they were just submitted and
+    // cannot be expired.  Precedence: VotersDoNotExist > VotingOnExpiredGovAction.
+    // -------------------------------------------------------------------------
+
+    /// A registered DRep votes Yes on an active on-chain InfoAction proposal
+    /// whose `expires_after_epoch < current_epoch`.  The validator must
+    /// surface a `VotingOnExpiredGovAction` error with one entry for the
+    /// (voter, action_id, expires_after, current_epoch) tuple.
+    #[test]
+    fn test_validate_transaction_rejects_vote_on_expired_action() {
+        let params = conway_pparams_pv10();
+        let utxo_set = UtxoSet::new();
+
+        let active_id = GovActionId {
+            transaction_id: Hash32::from_bytes([0x77; 32]),
+            action_index: 0,
+        };
+        let active_proposal = ActiveProposal {
+            gov_action: GovAction::InfoAction,
+            return_addr: vec![0xe0; 29],
+            deposit: Lovelace(1_000_000_000),
+            expires_after_epoch: EpochNo(10),
+            proposed_in_epoch: EpochNo(4),
+        };
+        let mut active_proposals: HashMap<GovActionId, ActiveProposal> = HashMap::new();
+        active_proposals.insert(active_id.clone(), active_proposal);
+
+        // DRep voter (registered) votes on the expired action.
+        let drep_voter = drep_voter_for_test();
+        let drep_credential_hash = match &drep_voter {
+            Voter::DRep(cred) => cred.to_hash().to_hash32_padded(),
+            _ => unreachable!("drep_voter_for_test returns Voter::DRep"),
+        };
+        let mut registered_dreps: HashSet<Hash32> = HashSet::new();
+        registered_dreps.insert(drep_credential_hash);
+
+        let mut votes = BTreeMap::new();
+        votes.insert(active_id.clone(), yes_vote());
+        let mut voting_procedures = BTreeMap::new();
+        voting_procedures.insert(drep_voter, votes);
+
+        let tx = make_gov_tx(vec![], voting_procedures);
+
+        // current_epoch = 20, expires_after = 10 -> rejected.
+        let context = ValidationContext::new()
+            .with_active_proposals(active_proposals)
+            .with_dreps(registered_dreps)
+            .with_epoch(20);
+        let result =
+            validate_transaction_with_context(&tx, &utxo_set, &params, 100, 500, None, context);
+
+        let errors = result.expect_err("expected VotingOnExpiredGovAction predicate to fire");
+        let expired = errors
+            .iter()
+            .find_map(|e| match e {
+                ValidationError::VotingOnExpiredGovAction { expired_votes } => Some(expired_votes),
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("VotingOnExpiredGovAction not in error set: {errors:?}"));
+        assert_eq!(
+            expired.len(),
+            1,
+            "expected exactly one expired-vote tuple, got: {expired:?}"
+        );
+        let (voter, vid, expires_after, current_epoch) = &expired[0];
+        assert!(
+            matches!(voter, Voter::DRep(_)),
+            "voter must be DRep, got: {voter:?}"
+        );
+        assert_eq!(vid, &active_id, "action id must match active proposal");
+        assert_eq!(*expires_after, 10, "expires_after must be from proposal");
+        assert_eq!(*current_epoch, 20, "current_epoch must be from context");
+    }
+
+    /// A registered DRep votes Yes on a proposal submitted in the SAME tx.
+    /// Same-tx proposals are always considered current (they were just
+    /// submitted), so `VotingOnExpiredGovAction` must NOT fire — even though
+    /// the active-proposals map (irrelevant in this case) and a generous
+    /// `current_epoch` would otherwise put it in the past.
+    #[test]
+    fn test_validate_transaction_skips_expiry_check_for_same_tx_proposal() {
+        let params = conway_pparams_pv10();
+        let utxo_set = UtxoSet::new();
+
+        // Local proposal — id is (tx.hash, 0).
+        let local_id = GovActionId {
+            transaction_id: Hash32::from_bytes([0xAB; 32]),
+            action_index: 0,
+        };
+
+        // DRep voter (registered) votes on the local proposal.
+        let drep_voter = drep_voter_for_test();
+        let drep_credential_hash = match &drep_voter {
+            Voter::DRep(cred) => cred.to_hash().to_hash32_padded(),
+            _ => unreachable!("drep_voter_for_test returns Voter::DRep"),
+        };
+        let mut registered_dreps: HashSet<Hash32> = HashSet::new();
+        registered_dreps.insert(drep_credential_hash);
+
+        let mut votes = BTreeMap::new();
+        votes.insert(local_id.clone(), yes_vote());
+        let mut voting_procedures = BTreeMap::new();
+        voting_procedures.insert(drep_voter, votes);
+
+        let tx = make_gov_tx(vec![info_proposal()], voting_procedures);
+        debug_assert_eq!(
+            tx.hash, local_id.transaction_id,
+            "make_gov_tx must use the local action_id's transaction_id"
+        );
+
+        // current_epoch = 9999 — would obviously be past any expiry, but the
+        // local-proposal branch must be skipped entirely.  An empty
+        // active_proposals map is provided so the predicate's wiring runs.
+        let active_proposals: HashMap<GovActionId, ActiveProposal> = HashMap::new();
+        let context = ValidationContext::new()
+            .with_active_proposals(active_proposals)
+            .with_dreps(registered_dreps)
+            .with_epoch(9999);
+        let result =
+            validate_transaction_with_context(&tx, &utxo_set, &params, 100, 500, None, context);
+
+        // The tx will fail Phase-1 (NoInputs etc.) but
+        // VotingOnExpiredGovAction must not be among the errors.
+        if let Err(errors) = result {
+            assert!(
+                !errors
+                    .iter()
+                    .any(|e| matches!(e, ValidationError::VotingOnExpiredGovAction { .. })),
+                "VotingOnExpiredGovAction must not fire for same-tx proposal; got: {errors:?}"
+            );
+        }
+    }
+
+    /// An UNREGISTERED DRep votes on an expired active proposal.  Two
+    /// predicates could fire here (VotersDoNotExist and
+    /// VotingOnExpiredGovAction).  Per the precedence chain, only
+    /// `VotersDoNotExist` must fire; `VotingOnExpiredGovAction` must NOT
+    /// fire for the same voter (Haskell partitions unknown voters out
+    /// before any further per-voter check).
+    #[test]
+    fn test_validate_transaction_voters_do_not_exist_takes_precedence_over_voting_on_expired() {
+        let params = conway_pparams_pv10();
+        let utxo_set = UtxoSet::new();
+
+        // Active on-chain proposal that has expired.
+        let active_id = GovActionId {
+            transaction_id: Hash32::from_bytes([0x77; 32]),
+            action_index: 0,
+        };
+        let active_proposal = ActiveProposal {
+            gov_action: GovAction::InfoAction,
+            return_addr: vec![0xe0; 29],
+            deposit: Lovelace(1_000_000_000),
+            expires_after_epoch: EpochNo(10),
+            proposed_in_epoch: EpochNo(4),
+        };
+        let mut active_proposals: HashMap<GovActionId, ActiveProposal> = HashMap::new();
+        active_proposals.insert(active_id.clone(), active_proposal);
+
+        // DRep voter is NOT in registered_dreps.
+        let drep_voter = drep_voter_for_test();
+        let mut votes = BTreeMap::new();
+        votes.insert(active_id.clone(), yes_vote());
+        let mut voting_procedures = BTreeMap::new();
+        voting_procedures.insert(drep_voter, votes);
+
+        let tx = make_gov_tx(vec![], voting_procedures);
+
+        // current_epoch=20 with expires_after=10 would make
+        // VotingOnExpiredGovAction fire, but the unregistered DRep must be
+        // partitioned out first.  Empty registered_dreps explicitly enables
+        // the unknown-voter branch (None defaults to "treat as known").
+        let context = ValidationContext::new()
+            .with_active_proposals(active_proposals)
+            .with_dreps(HashSet::new())
+            .with_epoch(20);
+        let result =
+            validate_transaction_with_context(&tx, &utxo_set, &params, 100, 500, None, context);
+
+        let errors = result.expect_err("expected VotersDoNotExist predicate to fire");
+
+        // Direction 1: VotersDoNotExist DOES fire and contains the DRep voter.
+        let unknown_voters = errors
+            .iter()
+            .find_map(|e| match e {
+                ValidationError::VotersDoNotExist { voters } => Some(voters),
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("VotersDoNotExist not in error set: {errors:?}"));
+        assert!(
+            unknown_voters.iter().any(|v| matches!(v, Voter::DRep(_))),
+            "VotersDoNotExist must contain the unregistered DRep, got: {unknown_voters:?}"
+        );
+
+        // Direction 2: VotingOnExpiredGovAction must NOT fire for the
+        // same voter — Haskell partitions unknown voters out before further
+        // per-voter checks.
+        assert!(
+            !errors
+                .iter()
+                .any(|e| matches!(e, ValidationError::VotingOnExpiredGovAction { .. })),
+            "VotingOnExpiredGovAction must not fire when the only voter is already \
+             reported under VotersDoNotExist; got: {errors:?}"
+        );
+    }
 }
