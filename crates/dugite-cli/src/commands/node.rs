@@ -317,16 +317,10 @@ pub fn issue_op_cert(
     let _ = decoder.array();
     let counter_value = decoder.u64().unwrap_or(0);
 
-    // Build the operational certificate body to sign:
-    // [hot_vkey, sequence_number, kes_period]
-    let mut cert_body = Vec::new();
-    let mut enc = minicbor::Encoder::new(&mut cert_body);
-    enc.array(3)?;
-    enc.bytes(kes_vkey)?;
-    enc.u64(counter_value)?;
-    enc.u64(kes_period)?;
-
-    // Sign with the cold key
+    // Build OCertSignable and sign with the cold key. The byte layout
+    // (kes_vkey(32) || seqNo(8 BE) || kesPeriod(8 BE), no CBOR) lives in
+    // dugite_crypto::ocert so the verifier and signer share one definition.
+    let cert_body = dugite_crypto::ocert::ocert_signable_bytes(kes_vkey, counter_value, kes_period);
     let signature = cold_sk.sign(&cert_body);
 
     // Build the full operational certificate matching Haskell's OperationalCertificate:

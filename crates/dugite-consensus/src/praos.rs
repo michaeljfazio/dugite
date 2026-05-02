@@ -1506,14 +1506,11 @@ pub fn verify_opcert_signature(
     kes_period: u64,
     signature: &[u8],
 ) -> Result<(), ConsensusError> {
-    // Construct the signed message: raw bytes per Haskell OCertSignable
-    // ocertSigKES(32 bytes) || ocertN(8 bytes BE) || ocertKESPeriod(8 bytes BE)
-    let mut signable = Vec::with_capacity(48);
-    signable.extend_from_slice(hot_vkey);
-    signable.extend_from_slice(&sequence_number.to_be_bytes());
-    signable.extend_from_slice(&kes_period.to_be_bytes());
+    // Construct the signed message via the shared helper so signer and
+    // verifier never drift apart.
+    let signable =
+        dugite_crypto::ocert::ocert_signable_bytes(hot_vkey, sequence_number, kes_period);
 
-    // Verify the Ed25519 signature
     let vk = PaymentVerificationKey::from_bytes(cold_vkey_bytes)
         .map_err(|_| ConsensusError::InvalidOperationalCert)?;
 
