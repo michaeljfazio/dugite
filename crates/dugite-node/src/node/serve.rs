@@ -656,6 +656,45 @@ pub(crate) fn convert_validation_error(
         VE::OutputBootAddrAttrsTooBig { oversized_outputs } => TxValidationError::ScriptFailed {
             reason: format!("OutputBootAddrAttrsTooBig: {oversized_outputs:?}"),
         },
+        VE::MIRCertificateTooLateInEpoch {
+            current_slot,
+            deadline,
+        } => TxValidationError::ScriptFailed {
+            reason: format!(
+                "MIRCertificateTooLateInEpoch: current_slot={current_slot}, deadline={deadline}"
+            ),
+        },
+        VE::InsufficientForInstantaneousRewards {
+            pot,
+            required,
+            available,
+        } => TxValidationError::ScriptFailed {
+            reason: format!(
+                "InsufficientForInstantaneousRewards: pot={pot:?}, required={required}, available={available}"
+            ),
+        },
+        VE::MIRTransferNotCurrentlyAllowed => TxValidationError::ScriptFailed {
+            reason: "MIRTransferNotCurrentlyAllowed (pre-Alonzo MIR pot-to-pot transfer)"
+                .to_string(),
+        },
+        VE::MIRNegativesNotCurrentlyAllowed => TxValidationError::ScriptFailed {
+            reason: "MIRNegativesNotCurrentlyAllowed (pre-Alonzo negative MIR delta)".to_string(),
+        },
+        VE::MIRProducesNegativeUpdate { credentials } => TxValidationError::ScriptFailed {
+            reason: format!("MIRProducesNegativeUpdate: credentials={credentials:?}"),
+        },
+        VE::InsufficientForTransferDELEG {
+            pot,
+            requested,
+            available,
+        } => TxValidationError::ScriptFailed {
+            reason: format!(
+                "InsufficientForTransferDELEG: pot={pot:?}, requested={requested}, available={available}"
+            ),
+        },
+        VE::MIRNegativeTransfer { pot, amount } => TxValidationError::ScriptFailed {
+            reason: format!("MIRNegativeTransfer: pot={pot:?}, amount={amount}"),
+        },
     }
 }
 

@@ -16,6 +16,7 @@
 mod collateral;
 mod conway;
 mod datum;
+pub mod mir;
 mod phase1;
 mod scripts;
 
@@ -134,6 +135,41 @@ pub struct ValidationContext {
     /// committee voter is treated as known.  This mirrors the lenient default
     /// used by `active_proposals`.
     pub committee_authorized_hot_keys: Option<HashSet<Hash32>>,
+    // ---------------------------------------------------------------------
+    // MIR (Move Instantaneous Rewards) — Shelley–Babbage only.
+    //
+    // All four fields are optional so the lenient-default convention used
+    // by every other context field (return false / no error when None) is
+    // preserved.  See `validation/mir.rs` for the predicates.
+    // ---------------------------------------------------------------------
+    /// Treasury pot balance (in lovelace).  Used by the MIR predicates
+    /// `InsufficientForInstantaneousRewards` /
+    /// `InsufficientForTransferDELEG` when the source is `Treasury`.
+    pub treasury: Option<Lovelace>,
+    /// Reserves pot balance (in lovelace).  Used by the MIR predicates
+    /// `InsufficientForInstantaneousRewards` /
+    /// `InsufficientForTransferDELEG` when the source is `Reserves`.
+    pub reserves: Option<Lovelace>,
+    /// Number of slots per epoch (e.g. 432_000 for mainnet).  Required by
+    /// the MIR `MIRCertificateTooLateInEpoch` predicate to compute the
+    /// first slot of the next epoch.
+    pub epoch_length: Option<u64>,
+    /// Praos security parameter `k` (e.g. 2160 for mainnet, 432 for
+    /// preview).  Used together with `active_slots_coeff` (already on
+    /// `ProtocolParameters`) to compute `stabilityWindow = ceil(3k / f)`
+    /// for the MIR `MIRCertificateTooLateInEpoch` predicate.
+    pub security_param: Option<u64>,
+    /// Snapshot of the per-credential accumulated MIR rewards for the
+    /// current epoch (Haskell `dsIRewards`).  Used by the Alonzo+ MIR
+    /// `MIRProducesNegativeUpdate` predicate to detect a delta that
+    /// would push a recipient's balance below zero.
+    ///
+    /// Keys are credential hashes padded to `Hash32` (zero-extended) for
+    /// symmetry with `reward_accounts` and `registered_dreps`.  When
+    /// `None` the predicate is silently skipped (lenient default —
+    /// callers without `dsIRewards` plumbing must accept this partial
+    /// limitation).
+    pub accumulated_mir_balances: Option<HashMap<Hash32, i64>>,
 }
 
 impl ValidationContext {
@@ -211,6 +247,28 @@ impl ValidationContext {
 
     pub fn with_committee_authorized_hot_keys(mut self, hot_keys: HashSet<Hash32>) -> Self {
         self.committee_authorized_hot_keys = Some(hot_keys);
+        self
+    }
+
+    /// Set the Treasury and Reserves pot balances used by MIR predicates.
+    pub fn with_pots(mut self, treasury: Lovelace, reserves: Lovelace) -> Self {
+        self.treasury = Some(treasury);
+        self.reserves = Some(reserves);
+        self
+    }
+
+    /// Set the epoch length (slots per epoch) and Praos security parameter
+    /// `k` used by the MIR `MIRCertificateTooLateInEpoch` predicate.
+    pub fn with_epoch_geometry(mut self, epoch_length: u64, security_param: u64) -> Self {
+        self.epoch_length = Some(epoch_length);
+        self.security_param = Some(security_param);
+        self
+    }
+
+    /// Set the per-credential accumulated MIR rewards snapshot used by
+    /// the Alonzo+ MIR `MIRProducesNegativeUpdate` predicate.
+    pub fn with_accumulated_mir_balances(mut self, balances: HashMap<Hash32, i64>) -> Self {
+        self.accumulated_mir_balances = Some(balances);
         self
     }
 
@@ -1010,6 +1068,129 @@ pub enum ValidationError {
         /// whose serialized attributes exceed 64 bytes.
         oversized_outputs: Vec<usize>,
     },
+    // ---------------------------------------------------------------------
+    // MIR (Move Instantaneous Rewards) predicate failures.
+    //
+    // Reference: `eras/shelley/impl/src/Cardano/Ledger/Shelley/Rules/Deleg.hs`.
+    //
+    // MIR certificates exist only in Shelley–Babbage (`AtMostEra "Babbage"`).
+    // Conway has removed `MIRCert` entirely. All MIR predicates short-circuit
+    // (no-op) at PV >= 9 (Conway). Several sub-rules are further gated by
+    // `hardforkAlonzoAllowMIRTransfer = pvMajor pv > 4`.
+    // ---------------------------------------------------------------------
+    /// Shelley DELEG rule `MIRCertificateTooLateInEpoch`: MIR certificates
+    /// submitted within `stabilityWindow` slots of the next epoch boundary
+    /// are rejected — applying them mid-window risks the rewards landing in
+    /// an epoch the proposer didn't intend.
+    ///
+    /// `tooLate = firstSlotOfNextEpoch - stabilityWindow` and
+    /// `stabilityWindow = ceil(3 * k / f)` where `k = securityParam` and
+    /// `f = activeSlotCoeff`.  Reject when `currentSlot >= tooLate`
+    /// (boundary inclusive — Haskell uses `>=`).
+    ///
+    /// Reference: Haskell `checkSlotNotTooLate` in `Shelley.Rules.Deleg`.
+    #[error("MIRCertificateTooLateInEpoch: current_slot={current_slot}, deadline={deadline}")]
+    MIRCertificateTooLateInEpoch {
+        /// The transaction's current slot.
+        current_slot: u64,
+        /// `firstSlotOfNextEpoch - stabilityWindow` — the earliest slot
+        /// at which an MIR cert is too late.
+        deadline: u64,
+    },
+    /// Shelley DELEG rule `InsufficientForInstantaneousRewards`: the sum of
+    /// all delta values in a `StakeAddressesMIR` certificate exceeds the
+    /// available pot balance (Reserves or Treasury).
+    ///
+    /// In Alonzo+ Haskell uses `availableAfterMIR` which considers existing
+    /// `dsIRewards` accumulated during the same epoch; dugite uses the
+    /// simpler `sum(deltas) > pot_balance` check (documented limitation —
+    /// see `validation/mir.rs` doc comment).
+    ///
+    /// Reference: Haskell `checkStakeAddressesMIR` /
+    /// `availableAfterMIR` in `Shelley.Rules.Deleg`.
+    #[error(
+        "InsufficientForInstantaneousRewards: pot={pot:?}, required={required}, \
+         available={available}"
+    )]
+    InsufficientForInstantaneousRewards {
+        /// The MIR source pot.
+        pot: dugite_primitives::transaction::MIRSource,
+        /// Sum of delta values requested.
+        required: u64,
+        /// Pot balance available.
+        available: u64,
+    },
+    /// Shelley DELEG rule `MIRTransferNotCurrentlyAllowed`: pre-Alonzo
+    /// (`pvMajor <= 4`), `OtherAccountingPot` (pot-to-pot transfer) MIR
+    /// certificates are not allowed.  Only `StakeCredentials` distributions
+    /// are accepted before Alonzo enables `hardforkAlonzoAllowMIRTransfer`.
+    ///
+    /// Reference: Haskell `checkSendToOppositePotMIR` (pre-Alonzo branch)
+    /// in `Shelley.Rules.Deleg`.
+    #[error("MIRTransferNotCurrentlyAllowed (pre-Alonzo MIR pot-to-pot transfer)")]
+    MIRTransferNotCurrentlyAllowed,
+    /// Shelley DELEG rule `MIRNegativesNotCurrentlyAllowed`: pre-Alonzo
+    /// (`pvMajor <= 4`), every delta in a `StakeAddressesMIR` certificate
+    /// must be non-negative.  Negative deltas (claw-back) are only allowed
+    /// from Alonzo onward (`hardforkAlonzoAllowMIRTransfer`).
+    ///
+    /// Reference: Haskell `checkStakeAddressesMIR` (pre-Alonzo branch)
+    /// in `Shelley.Rules.Deleg`.
+    #[error("MIRNegativesNotCurrentlyAllowed (pre-Alonzo negative MIR delta)")]
+    MIRNegativesNotCurrentlyAllowed,
+    /// Shelley DELEG rule `MIRProducesNegativeUpdate`: in Alonzo+, after
+    /// aggregating an MIR cert's deltas with the existing `dsIRewards`
+    /// accumulator, no recipient may end up with a negative balance.
+    ///
+    /// Dugite implements this conservatively when an
+    /// `accumulated_mir_balances` snapshot is supplied by the caller; when
+    /// the snapshot is `None`, the check is silently skipped (documented
+    /// limitation — full simulation requires `dsIRewards` plumbing).
+    ///
+    /// Reference: Haskell `checkStakeAddressesMIR` (Alonzo+ branch) in
+    /// `Shelley.Rules.Deleg`.
+    #[error("MIRProducesNegativeUpdate: credentials={credentials:?}")]
+    MIRProducesNegativeUpdate {
+        /// Hex-encoded credential hashes whose accumulated balance would
+        /// become negative if the MIR cert were applied.
+        credentials: Vec<String>,
+    },
+    /// Shelley DELEG rule `InsufficientForTransferDELEG`: in Alonzo+, an
+    /// `OtherAccountingPot(coin)` transfer requests more lovelace than the
+    /// source pot currently holds.
+    ///
+    /// Reference: Haskell `checkSendToOppositePotMIR` (Alonzo+ branch) in
+    /// `Shelley.Rules.Deleg`.
+    #[error(
+        "InsufficientForTransferDELEG: pot={pot:?}, requested={requested}, \
+         available={available}"
+    )]
+    InsufficientForTransferDELEG {
+        /// The MIR source pot.
+        pot: dugite_primitives::transaction::MIRSource,
+        /// Lovelace requested in the transfer.
+        requested: u64,
+        /// Pot balance available.
+        available: u64,
+    },
+    /// Shelley DELEG rule `MIRNegativeTransfer`: in Alonzo+, the `coin`
+    /// field of an `OtherAccountingPot` transfer must be non-negative.
+    ///
+    /// In dugite, `MIRTarget::OtherAccountingPot(u64)` is structurally
+    /// non-negative, so this predicate is unreachable via the public type
+    /// system but kept for parity-completeness with Haskell's
+    /// `DeltaCoin`-typed payload (which can encode negatives at the
+    /// CBOR level on alternate decode paths).
+    ///
+    /// Reference: Haskell `checkSendToOppositePotMIR` (Alonzo+ branch) in
+    /// `Shelley.Rules.Deleg`.
+    #[error("MIRNegativeTransfer: pot={pot:?}, amount={amount}")]
+    MIRNegativeTransfer {
+        /// The MIR source pot.
+        pot: dugite_primitives::transaction::MIRSource,
+        /// Negative transfer amount.
+        amount: i64,
+    },
 }
 
 // ---------------------------------------------------------------------------
@@ -1460,6 +1641,24 @@ pub fn validate_transaction_with_context(
         }
         if !invalid_members.is_empty() {
             extra_errors.push(ValidationError::ExpirationEpochTooSmall { invalid_members });
+        }
+    }
+
+    // -------------------------------------------------------------------
+    // MIR (Move Instantaneous Rewards) — Shelley–Babbage only.
+    //
+    // Each MIR certificate in `tx.body.certificates` is validated against
+    // the 7 predicates in `validation::mir`.  At PV >= 9 (Conway) the
+    // entry point is a no-op so the wiring layer also short-circuits to
+    // avoid an unnecessary scan of the cert vec.
+    //
+    // Reference: `eras/shelley/impl/src/Cardano/Ledger/Shelley/Rules/Deleg.hs`.
+    // -------------------------------------------------------------------
+    if params.protocol_version_major < 9 {
+        for cert in &tx.body.certificates {
+            if let Err(errs) = mir::validate_mir_cert(cert, params, current_slot, &context) {
+                extra_errors.extend(errs);
+            }
         }
     }
 

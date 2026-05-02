@@ -13838,4 +13838,161 @@ mod tests {
             "ExpirationEpochTooSmall MUST fire at PV=9 (no bootstrap skip); got: {errors:?}"
         );
     }
+
+    // -------------------------------------------------------------------
+    // MIR (Move Instantaneous Rewards) — integration tests via
+    // `validate_transaction_with_context`.  Unit tests for each individual
+    // predicate live in `validation/mir/tests.rs`; these tests verify the
+    // wiring through the full validation pipeline (cert iteration, era
+    // gating, error aggregation).
+    // -------------------------------------------------------------------
+
+    fn make_mir_tx(input: TransactionInput, source: MIRSource, target: MIRTarget) -> Transaction {
+        let mut tx = make_simple_tx(input, 9_800_000, 200_000);
+        tx.body
+            .certificates
+            .push(Certificate::MoveInstantaneousRewards { source, target });
+        tx
+    }
+
+    /// Pre-Alonzo (PV=4): MIR pot-to-pot transfer must be rejected with
+    /// `MIRTransferNotCurrentlyAllowed` via the validation pipeline.
+    #[test]
+    fn test_validate_transaction_rejects_pre_alonzo_mir_transfer() {
+        let (utxo_set, input) = make_simple_utxo_set();
+        let mut params = ProtocolParameters::mainnet_defaults();
+        params.protocol_version_major = 4;
+        let tx = make_mir_tx(
+            input,
+            MIRSource::Reserves,
+            MIRTarget::OtherAccountingPot(100),
+        );
+
+        let context = ValidationContext::new()
+            .with_pots(Lovelace(1_000_000), Lovelace(1_000_000))
+            .with_epoch_geometry(432_000, 432);
+        let result =
+            validate_transaction_with_context(&tx, &utxo_set, &params, 100, 500, None, context);
+        let errors = result.expect_err("pre-Alonzo MIR transfer must be rejected");
+        assert!(
+            errors
+                .iter()
+                .any(|e| matches!(e, ValidationError::MIRTransferNotCurrentlyAllowed)),
+            "expected MIRTransferNotCurrentlyAllowed; got: {errors:?}"
+        );
+    }
+
+    /// Alonzo+ (PV=5): an MIR cert requesting more than the pot balance
+    /// must be rejected with `InsufficientForInstantaneousRewards` via the
+    /// validation pipeline.
+    #[test]
+    fn test_validate_transaction_rejects_insufficient_for_mir() {
+        use dugite_primitives::credentials::Credential;
+        let (utxo_set, input) = make_simple_utxo_set();
+        let mut params = ProtocolParameters::mainnet_defaults();
+        params.protocol_version_major = 5;
+        let cred = Credential::VerificationKey(Hash28::from_bytes([0xAA; 28]));
+        let tx = make_mir_tx(
+            input,
+            MIRSource::Reserves,
+            MIRTarget::StakeCredentials(vec![(cred, 1_000_000_000)]),
+        );
+
+        let context = ValidationContext::new()
+            .with_pots(Lovelace(1_000_000), Lovelace(100)) // reserves=100
+            .with_epoch_geometry(432_000, 432);
+        let result =
+            validate_transaction_with_context(&tx, &utxo_set, &params, 100, 500, None, context);
+        let errors = result.expect_err("MIR over pot balance must be rejected");
+        assert!(
+            errors.iter().any(|e| matches!(
+                e,
+                ValidationError::InsufficientForInstantaneousRewards { .. }
+            )),
+            "expected InsufficientForInstantaneousRewards; got: {errors:?}"
+        );
+    }
+
+    /// Alonzo+ (PV=5): an MIR cert near the next-epoch boundary must be
+    /// rejected with `MIRCertificateTooLateInEpoch`.
+    #[test]
+    fn test_validate_transaction_rejects_mir_cert_too_late() {
+        let (utxo_set, input) = make_simple_utxo_set();
+        let mut params = ProtocolParameters::mainnet_defaults();
+        params.protocol_version_major = 5;
+        params.active_slots_coeff = 0.05;
+        let tx = make_mir_tx(
+            input,
+            MIRSource::Reserves,
+            MIRTarget::StakeCredentials(vec![]),
+        );
+
+        // k=432, f=1/20 → stability_window = ceil(3*432*20/1) = 25_920.
+        // first_slot_next_epoch (current_epoch=0) = 432_000.
+        // deadline = 432_000 - 25_920 = 406_080.
+        let context = ValidationContext::new()
+            .with_pots(Lovelace(1_000_000), Lovelace(1_000_000))
+            .with_epoch_geometry(432_000, 432)
+            .with_epoch(0);
+        let result = validate_transaction_with_context(
+            &tx, &utxo_set, &params, 406_080, // == deadline → reject
+            500, None, context,
+        );
+        let errors = result.expect_err("MIR cert at deadline must be rejected");
+        assert!(
+            errors
+                .iter()
+                .any(|e| matches!(e, ValidationError::MIRCertificateTooLateInEpoch { .. })),
+            "expected MIRCertificateTooLateInEpoch; got: {errors:?}"
+        );
+    }
+
+    /// Conway (PV>=9): MIR predicates short-circuit even for malformed
+    /// certs.  The MIR cert itself will be rejected by Conway era gating
+    /// (Conway certs are a closed set), but no MIR-specific error variant
+    /// must appear.
+    #[test]
+    fn test_validate_transaction_skips_mir_check_in_conway() {
+        use dugite_primitives::credentials::Credential;
+        let (utxo_set, input) = make_simple_utxo_set();
+        let params = ProtocolParameters::mainnet_defaults(); // PV=9
+        let cred = Credential::VerificationKey(Hash28::from_bytes([0xBB; 28]));
+        let tx = make_mir_tx(
+            input,
+            MIRSource::Reserves,
+            MIRTarget::StakeCredentials(vec![(cred, 1_000_000_000)]),
+        );
+
+        let context = ValidationContext::new()
+            .with_pots(Lovelace(1_000_000), Lovelace(0)) // reserves=0 → would trigger Insufficient pre-Conway
+            .with_epoch_geometry(432_000, 432);
+        let result = validate_transaction_with_context(
+            &tx,
+            &utxo_set,
+            &params,
+            999_999_999, // would trigger MIRCertificateTooLateInEpoch pre-Conway
+            500,
+            None,
+            context,
+        );
+        // The transaction may or may not pass overall (other Conway checks
+        // could fire), but no MIR-flavoured error must be present.
+        if let Err(errors) = result {
+            for e in &errors {
+                assert!(
+                    !matches!(
+                        e,
+                        ValidationError::MIRCertificateTooLateInEpoch { .. }
+                            | ValidationError::InsufficientForInstantaneousRewards { .. }
+                            | ValidationError::MIRTransferNotCurrentlyAllowed
+                            | ValidationError::MIRNegativesNotCurrentlyAllowed
+                            | ValidationError::MIRProducesNegativeUpdate { .. }
+                            | ValidationError::InsufficientForTransferDELEG { .. }
+                            | ValidationError::MIRNegativeTransfer { .. }
+                    ),
+                    "MIR predicates must be no-ops at PV>=9; got: {e:?}"
+                );
+            }
+        }
+    }
 }
