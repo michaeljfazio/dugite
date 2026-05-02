@@ -290,6 +290,61 @@ impl ValidationContext {
         self
     }
 
+    /// Populate `accumulated_mir_balances` from a [`crate::state::LedgerState`]
+    /// snapshot.
+    ///
+    /// In Haskell, `dsIRewards` is the per-credential pending MIR delta map
+    /// stored on `DState` for both Reserves and Treasury pots — it tracks
+    /// MIR-cert deltas that have been *announced* but not yet credited (the
+    /// drain happens at the epoch boundary).  Dugite does not yet maintain a
+    /// separate pending-delta map: MIR distributions update
+    /// `certs.reward_accounts` immediately on cert apply.
+    ///
+    /// This helper takes a *post-distribution* snapshot of `reward_accounts`
+    /// and exposes it as `accumulated_mir_balances`, so the Alonzo+
+    /// `MIRProducesNegativeUpdate` predicate can fire when a fresh negative
+    /// delta would push a credential's recorded balance below zero.
+    ///
+    /// ## Bounded fidelity
+    ///
+    /// This is **not** a faithful Haskell `dsIRewards` reconstruction — it is
+    /// the post-credit reward-accounts view, which is suitable for catching
+    /// obvious negative updates in pre-Conway replay tests but **not** for
+    /// exact byte-for-byte parity with Haskell on the Shelley–Babbage history.
+    /// Use it for fixture-driven tests, not for live replay assertions that
+    /// require strict parity.
+    ///
+    /// ## Mainnet impact: zero
+    ///
+    /// Mainnet has been Conway (PV ≥ 9) since September 2024.  MIR certs were
+    /// removed at the era boundary; [`mir::validate_mir_cert`] short-circuits
+    /// `Ok(())` for `pv >= 9`, so this helper is exercised only by pre-Conway
+    /// fixtures and replay paths.  The Conway short-circuit here returns an
+    /// empty accumulator, mirroring the live behaviour.
+    pub fn with_accumulated_mir_balances_from_ledger(
+        mut self,
+        ledger: &crate::state::LedgerState,
+    ) -> Self {
+        // Conway+ has no MIR certs — accumulator is structurally empty.
+        if ledger.epochs.protocol_params.protocol_version_major >= 9 {
+            self.accumulated_mir_balances = Some(HashMap::new());
+            return self;
+        }
+        // Pre-Conway: snapshot reward_accounts as best-effort i64 deltas.
+        // Lovelace is u64; clamp to i64::MAX on the (impossible-in-practice)
+        // overflow so the predicate's signed arithmetic stays well-defined.
+        let snapshot: HashMap<Hash32, i64> = ledger
+            .certs
+            .reward_accounts
+            .iter()
+            .map(|(cred_hash, lovelace)| {
+                (*cred_hash, i64::try_from(lovelace.0).unwrap_or(i64::MAX))
+            })
+            .collect();
+        self.accumulated_mir_balances = Some(snapshot);
+        self
+    }
+
     /// Set the set of registered genesis-delegate key hashes used by
     /// the Shelley PPUP `NonGenesisUpdatePPUP` predicate.
     pub fn with_genesis_delegates(mut self, keys: HashSet<Hash28>) -> Self {

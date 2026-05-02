@@ -318,3 +318,81 @@ fn test_validate_mir_cert_non_mir_is_ok() {
     let cert = Certificate::StakeRegistration(cred([1u8; 28]));
     assert!(validate_mir_cert(&cert, &params, 0, &ctx).is_ok());
 }
+
+// ---------------------------------------------------------------------------
+// with_accumulated_mir_balances_from_ledger — populates from LedgerState
+// ---------------------------------------------------------------------------
+
+/// Build a minimal `LedgerState` for accumulator-helper tests.  The PV and
+/// the reward_accounts map are the only fields that matter for the helper.
+fn ledger_for_accumulator_test(
+    pv: u64,
+    reward_accounts: Vec<(dugite_primitives::hash::Hash32, u64)>,
+) -> crate::state::LedgerState {
+    use std::sync::Arc;
+    let mut params = ProtocolParameters::mainnet_defaults();
+    params.protocol_version_major = pv;
+    let mut state = crate::state::LedgerState::new(params);
+    let map: std::collections::HashMap<dugite_primitives::hash::Hash32, Lovelace> = reward_accounts
+        .into_iter()
+        .map(|(k, v)| (k, Lovelace(v)))
+        .collect();
+    state.certs.reward_accounts = Arc::new(map);
+    state
+}
+
+#[test]
+fn test_with_accumulated_mir_balances_from_ledger_populates_field() {
+    let credential = cred([1u8; 28]);
+    let key = credential.to_hash().to_hash32_padded();
+    let ledger = ledger_for_accumulator_test(5, vec![(key, 50_000)]);
+
+    let ctx = ValidationContext::new().with_accumulated_mir_balances_from_ledger(&ledger);
+    let map = ctx
+        .accumulated_mir_balances
+        .as_ref()
+        .expect("accumulator must be populated");
+    assert_eq!(map.len(), 1);
+    assert_eq!(*map.get(&key).expect("cred must be in map"), 50_000i64);
+}
+
+#[test]
+fn test_with_accumulated_mir_balances_in_conway_returns_empty() {
+    // Even with a non-empty reward_accounts map, Conway+ short-circuits to
+    // an empty accumulator (MIR was removed at the Conway era boundary).
+    let credential = cred([1u8; 28]);
+    let key = credential.to_hash().to_hash32_padded();
+    let ledger = ledger_for_accumulator_test(9, vec![(key, 50_000)]);
+
+    let ctx = ValidationContext::new().with_accumulated_mir_balances_from_ledger(&ledger);
+    let map = ctx
+        .accumulated_mir_balances
+        .as_ref()
+        .expect("accumulator must be set (Some)");
+    assert!(map.is_empty(), "Conway accumulator must be empty");
+}
+
+#[test]
+fn test_mir_produces_negative_update_fires_with_populated_accumulator() {
+    // Set up: cred has 50_000 in reward_accounts, MIR cert applies a
+    // -100_000 delta.  After populating the accumulator from the ledger,
+    // MIRProducesNegativeUpdate must fire (50_000 + (-100_000) = -50_000).
+    let params = params_with_pv(5); // Alonzo
+    let credential = cred([1u8; 28]);
+    let key = credential.to_hash().to_hash32_padded();
+    let ledger = ledger_for_accumulator_test(5, vec![(key, 50_000)]);
+
+    let ctx = ValidationContext::default()
+        .with_pots(Lovelace(1_000_000), Lovelace(1_000_000))
+        .with_epoch_geometry(432_000, 432)
+        .with_accumulated_mir_balances_from_ledger(&ledger);
+
+    let cert = mir_cert_distribute(MIRSource::Reserves, vec![(credential, -100_000)]);
+    let errors = validate_mir_cert(&cert, &params, 0, &ctx).unwrap_err();
+    assert!(
+        errors
+            .iter()
+            .any(|e| matches!(e, ValidationError::MIRProducesNegativeUpdate { .. })),
+        "expected MIRProducesNegativeUpdate, got {errors:?}"
+    );
+}

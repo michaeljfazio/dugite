@@ -19,10 +19,23 @@
 //!
 //! ## Known partial limitations
 //!
+//! Mainnet has been Conway (PV ≥ 9) since September 2024 and MIR certs were
+//! removed at the era boundary, so the limitations below have **zero impact
+//! on live mainnet tx flow** (`validate_mir_cert` short-circuits `Ok(())`
+//! for `pv >= 9`).  They matter only for pre-Conway replay correctness and
+//! for tier-0 test fidelity that exercises MIR predicates directly.
+//!
 //! 1. `MIRProducesNegativeUpdate` requires the per-credential accumulated
 //!    MIR rewards snapshot (Haskell `dsIRewards`).  When the caller does not
 //!    supply `ValidationContext::accumulated_mir_balances`, the predicate
-//!    is silently skipped — full simulation needs `dsIRewards` plumbing.
+//!    is silently skipped.  Tests and replay tooling can populate the field
+//!    via [`ValidationContext::with_accumulated_mir_balances`] (raw map) or
+//!    [`ValidationContext::with_accumulated_mir_balances_from_ledger`]
+//!    (snapshot from a `LedgerState`).  The latter is a *bounded-fidelity*
+//!    approximation: dugite credits MIR distributions immediately to
+//!    `reward_accounts` (no separate pending-delta map), so the snapshot is
+//!    the post-distribution view — sufficient for catching obvious negative
+//!    updates but not byte-for-byte equivalent to Haskell `dsIRewards`.
 //!
 //! 2. `InsufficientForInstantaneousRewards` in Alonzo+ uses Haskell's
 //!    `availableAfterMIR` semantics (existing balance + deltas).  Dugite
@@ -143,7 +156,10 @@ pub(crate) fn check_slot_not_too_late(
 /// - Always: `sum(deltas) <= pot_balance` (`InsufficientForInstantaneousRewards`).
 /// - Alonzo+ (`pv >= 5`): for any cred whose `delta + accumulated < 0`,
 ///   raise `MIRProducesNegativeUpdate`.  Skipped silently when
-///   `accumulated_mir_balances` is `None`.
+///   `accumulated_mir_balances` is `None`.  Tests and pre-Conway replay can
+///   populate the accumulator via
+///   [`ValidationContext::with_accumulated_mir_balances_from_ledger`] (a
+///   bounded-fidelity snapshot of `LedgerState.certs.reward_accounts`).
 ///
 /// Reference: Haskell `checkStakeAddressesMIR` in
 /// `eras/shelley/impl/src/Cardano/Ledger/Shelley/Rules/Deleg.hs`.
