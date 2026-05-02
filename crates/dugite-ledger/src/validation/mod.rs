@@ -806,13 +806,6 @@ pub enum ValidationError {
     /// Haskell `wdrlNotZero`: withdrawals with a zero amount are rejected.
     #[error("Zero withdrawal amount for reward account: {account}")]
     ZeroWithdrawal { account: String },
-    /// Withdrawal amount does not match the on-chain reward balance for the account.
-    #[error("Incorrect withdrawal amount for {account}: declared={declared}, actual={actual}")]
-    IncorrectWithdrawalAmount {
-        account: String,
-        declared: u64,
-        actual: u64,
-    },
     /// Combined CERTS-rule withdrawal failure (PV ≤ 10).
     ///
     /// Reference: Haskell `WithdrawalsNotInRewardsCERTS` in
@@ -2236,31 +2229,8 @@ pub fn validate_transaction_with_pools(
         // now valid (used for DRep activity / reward account touching).
         if amount.0 == 0 && !conway_or_later {
             errors.push(ValidationError::ZeroWithdrawal {
-                account: account_hex.clone(),
+                account: account_hex,
             });
-        }
-        if let Some(accounts) = reward_accounts {
-            let key = crate::state::LedgerState::reward_account_to_hash(reward_account_bytes);
-            match accounts.get(&key) {
-                Some(balance) => {
-                    if amount.0 != balance.0 {
-                        errors.push(ValidationError::IncorrectWithdrawalAmount {
-                            account: account_hex,
-                            declared: amount.0,
-                            actual: balance.0,
-                        });
-                    }
-                }
-                None => {
-                    // Unregistered reward account — the withdrawal amount cannot
-                    // match any balance, so report as incorrect (actual = 0).
-                    errors.push(ValidationError::IncorrectWithdrawalAmount {
-                        account: account_hex,
-                        declared: amount.0,
-                        actual: 0,
-                    });
-                }
-            }
         }
     }
 
@@ -2277,9 +2247,7 @@ pub fn validate_transaction_with_pools(
     //   after `hardforkConwayMoveWithdrawalsAndDRepChecksToLedgerRule`.
     //
     // Only enforced when both `node_network` and `reward_accounts` are
-    // available (block-application context). This emits structured
-    // predicates alongside the legacy `IncorrectWithdrawalAmount` for
-    // backwards-compatibility with existing callers.
+    // available (block-application context).
     // ------------------------------------------------------------------
     if let (Some(net), Some(accounts)) = (node_network, reward_accounts) {
         if let Some(split) = withdrawals::withdrawals_that_do_not_drain_accounts(
