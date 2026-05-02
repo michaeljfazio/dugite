@@ -16,8 +16,11 @@
 mod collateral;
 mod conway;
 mod datum;
+pub mod mir;
 mod phase1;
+pub mod ppup;
 mod scripts;
+pub mod withdrawals;
 
 #[cfg(test)]
 mod tests;
@@ -47,12 +50,40 @@ use std::collections::{HashMap, HashSet};
 use dugite_primitives::hash::{Hash28, Hash32};
 use dugite_primitives::network::NetworkId;
 use dugite_primitives::protocol_params::ProtocolParameters;
-use dugite_primitives::transaction::{GovAction, Transaction};
+use dugite_primitives::time::EpochNo;
+use dugite_primitives::transaction::{GovAction, GovActionId, Transaction, Voter};
 use dugite_primitives::value::Lovelace;
 use tracing::{debug, trace, warn};
 
 use crate::plutus::{evaluate_plutus_scripts, SlotConfig};
 use crate::utxo::UtxoLookup;
+
+/// On-chain governance proposal record used by validation rules that need
+/// access to a proposal's full state (not just the action itself).
+///
+/// This is the value type stored in [`ValidationContext::active_proposals`].
+/// Future Conway GOV predicates need different fields:
+/// - `DisallowedVoters` (Task 2): only `gov_action`.
+/// - `VotingOnExpiredGovAction` (Task 4): `expires_after_epoch`.
+/// - `ProposalReturnAccountDoesNotExist` (Task 5): `return_addr`.
+///
+/// `return_addr` is stored as raw bytes (`Vec<u8>`) to mirror the on-chain
+/// `ProposalProcedure.return_addr` shape from `dugite-primitives`. Callers
+/// performing the address-credential check must decode it themselves.
+#[derive(Debug, Clone)]
+pub struct ActiveProposal {
+    /// The governance action being proposed.
+    pub gov_action: GovAction,
+    /// The reward address that receives the proposal deposit refund.
+    /// Raw `ProposalProcedure.return_addr` bytes (header + 28-byte credential).
+    pub return_addr: Vec<u8>,
+    /// The proposal deposit (frozen at submission time).
+    pub deposit: Lovelace,
+    /// The last epoch in which votes are accepted (inclusive).
+    pub expires_after_epoch: EpochNo,
+    /// The epoch in which the proposal was submitted.
+    pub proposed_in_epoch: EpochNo,
+}
 
 #[derive(Default)]
 pub struct ValidationContext {
@@ -60,6 +91,12 @@ pub struct ValidationContext {
     pub current_treasury: Option<u64>,
     pub reward_accounts: Option<HashMap<Hash32, Lovelace>>,
     pub current_epoch: Option<u64>,
+    // TODO: this set conflates DRep key-credential hashes and DRep script-credential
+    // hashes (both are stored as the same `Hash32` value by `to_hash32_padded`).
+    // Haskell separates them via `Credential 'DRepRole`. Disambiguating is a
+    // preexisting limitation that affects every consumer of `registered_dreps`
+    // (not just the new GOV predicates) — track separately if/when DRep script
+    // membership becomes meaningful.
     pub registered_dreps: Option<HashSet<Hash32>>,
     pub registered_vrf_keys: Option<HashMap<Hash32, Hash28>>,
     pub node_network: Option<NetworkId>,
@@ -75,6 +112,82 @@ pub struct ValidationContext {
     /// DRep vote delegations — keys are stake credential hashes of accounts
     /// that have delegated to any DRep (including AlwaysAbstain / AlwaysNoConfidence).
     pub vote_delegations: Option<HashSet<Hash32>>,
+    /// Map of currently active on-chain governance proposals, keyed by
+    /// `GovActionId`.  When supplied, the validator uses this map to look up
+    /// the [`ActiveProposal`] record for each `(voter, gov_action_id)` vote
+    /// in `voting_procedures`, so that the `DisallowedVoters` predicate
+    /// (Conway GOV) can reject votes whose voter type is not authorised for
+    /// the action's type.  When `None`, only proposals submitted in the same
+    /// transaction (`tx.body.proposal_procedures`) are checked.
+    ///
+    /// The value is an [`ActiveProposal`] (not a bare `GovAction`) because
+    /// later GOV predicates (e.g. `VotingOnExpiredGovAction`,
+    /// `ProposalReturnAccountDoesNotExist`) need the proposal's expiry
+    /// epoch and return address, not just the action.
+    pub active_proposals: Option<HashMap<GovActionId, ActiveProposal>>,
+    /// Hot credential hashes currently authorised by Constitutional Committee
+    /// members (mirrors Haskell `authorizedHotCommitteeCredentials`).  Keys are
+    /// stored as `credential.to_hash().to_hash32_padded()` for symmetry with the
+    /// other credential-keyed sets in this struct (`registered_dreps`,
+    /// `committee_members`).
+    ///
+    /// When `Some`, the `VotersDoNotExist` predicate (Conway GOV) rejects
+    /// committee-voter votes whose hot credential is not in this set.  When
+    /// `None`, the committee-hot-key membership check is skipped — i.e. a
+    /// committee voter is treated as known.  This mirrors the lenient default
+    /// used by `active_proposals`.
+    pub committee_authorized_hot_keys: Option<HashSet<Hash32>>,
+    // ---------------------------------------------------------------------
+    // MIR (Move Instantaneous Rewards) — Shelley–Babbage only.
+    //
+    // All four fields are optional so the lenient-default convention used
+    // by every other context field (return false / no error when None) is
+    // preserved.  See `validation/mir.rs` for the predicates.
+    // ---------------------------------------------------------------------
+    /// Treasury pot balance (in lovelace).  Used by the MIR predicates
+    /// `InsufficientForInstantaneousRewards` /
+    /// `InsufficientForTransferDELEG` when the source is `Treasury`.
+    pub treasury: Option<Lovelace>,
+    /// Reserves pot balance (in lovelace).  Used by the MIR predicates
+    /// `InsufficientForInstantaneousRewards` /
+    /// `InsufficientForTransferDELEG` when the source is `Reserves`.
+    pub reserves: Option<Lovelace>,
+    /// Number of slots per epoch (e.g. 432_000 for mainnet).  Required by
+    /// the MIR `MIRCertificateTooLateInEpoch` predicate to compute the
+    /// first slot of the next epoch.
+    pub epoch_length: Option<u64>,
+    /// Praos security parameter `k` (e.g. 2160 for mainnet, 432 for
+    /// preview).  Used together with `active_slots_coeff` (already on
+    /// `ProtocolParameters`) to compute `stabilityWindow = ceil(3k / f)`
+    /// for the MIR `MIRCertificateTooLateInEpoch` predicate.
+    pub security_param: Option<u64>,
+    /// Snapshot of the per-credential accumulated MIR rewards for the
+    /// current epoch (Haskell `dsIRewards`).  Used by the Alonzo+ MIR
+    /// `MIRProducesNegativeUpdate` predicate to detect a delta that
+    /// would push a recipient's balance below zero.
+    ///
+    /// Keys are credential hashes padded to `Hash32` (zero-extended) for
+    /// symmetry with `reward_accounts` and `registered_dreps`.  When
+    /// `None` the predicate is silently skipped (lenient default —
+    /// callers without `dsIRewards` plumbing must accept this partial
+    /// limitation).
+    pub accumulated_mir_balances: Option<HashMap<Hash32, i64>>,
+    /// Set of currently registered genesis-delegate keys (`keysSet
+    /// GenDelegs` in Haskell).  Used by the Shelley PPUP predicate
+    /// `NonGenesisUpdatePPUP` to verify that every key in a pre-Conway
+    /// `UpdateProposal.proposed_updates` map is a registered genesis
+    /// delegate.
+    ///
+    /// In Haskell, `GenDelegs` maps `KeyHash 'Genesis -> (KeyHash
+    /// 'GenesisDelegate, Hash VRF)`; here we only need the key set, so we
+    /// store a `HashSet<Hash28>` of the genesis-key hashes.  When `None`,
+    /// the `NonGenesisUpdatePPUP` predicate is silently skipped (lenient
+    /// default — callers without genesis-delegate plumbing have no way to
+    /// distinguish proposed-vs-genesis keys).
+    ///
+    /// Reference: Haskell `NonGenesisUpdatePPUP` in
+    /// `eras/shelley/impl/src/Cardano/Ledger/Shelley/Rules/Ppup.hs`.
+    pub genesis_delegates: Option<HashSet<Hash28>>,
 }
 
 impl ValidationContext {
@@ -139,6 +252,103 @@ impl ValidationContext {
 
     pub fn with_vote_delegations(mut self, delegations: HashSet<Hash32>) -> Self {
         self.vote_delegations = Some(delegations);
+        self
+    }
+
+    pub fn with_active_proposals(
+        mut self,
+        proposals: HashMap<GovActionId, ActiveProposal>,
+    ) -> Self {
+        self.active_proposals = Some(proposals);
+        self
+    }
+
+    pub fn with_committee_authorized_hot_keys(mut self, hot_keys: HashSet<Hash32>) -> Self {
+        self.committee_authorized_hot_keys = Some(hot_keys);
+        self
+    }
+
+    /// Set the Treasury and Reserves pot balances used by MIR predicates.
+    pub fn with_pots(mut self, treasury: Lovelace, reserves: Lovelace) -> Self {
+        self.treasury = Some(treasury);
+        self.reserves = Some(reserves);
+        self
+    }
+
+    /// Set the epoch length (slots per epoch) and Praos security parameter
+    /// `k` used by the MIR `MIRCertificateTooLateInEpoch` predicate.
+    pub fn with_epoch_geometry(mut self, epoch_length: u64, security_param: u64) -> Self {
+        self.epoch_length = Some(epoch_length);
+        self.security_param = Some(security_param);
+        self
+    }
+
+    /// Set the per-credential accumulated MIR rewards snapshot used by
+    /// the Alonzo+ MIR `MIRProducesNegativeUpdate` predicate.
+    pub fn with_accumulated_mir_balances(mut self, balances: HashMap<Hash32, i64>) -> Self {
+        self.accumulated_mir_balances = Some(balances);
+        self
+    }
+
+    /// Populate `accumulated_mir_balances` from a [`crate::state::LedgerState`]
+    /// snapshot.
+    ///
+    /// In Haskell, `dsIRewards` is the per-credential pending MIR delta map
+    /// stored on `DState` for both Reserves and Treasury pots — it tracks
+    /// MIR-cert deltas that have been *announced* but not yet credited (the
+    /// drain happens at the epoch boundary).  Dugite does not yet maintain a
+    /// separate pending-delta map: MIR distributions update
+    /// `certs.reward_accounts` immediately on cert apply.
+    ///
+    /// This helper takes a *post-distribution* snapshot of `reward_accounts`
+    /// and exposes it as `accumulated_mir_balances`, so the Alonzo+
+    /// `MIRProducesNegativeUpdate` predicate can fire when a fresh negative
+    /// delta would push a credential's recorded balance below zero.
+    ///
+    /// ## Bounded fidelity
+    ///
+    /// This is **not** a faithful Haskell `dsIRewards` reconstruction — it is
+    /// the post-credit reward-accounts view, which is suitable for catching
+    /// obvious negative updates in pre-Conway replay tests but **not** for
+    /// exact byte-for-byte parity with Haskell on the Shelley–Babbage history.
+    /// Use it for fixture-driven tests, not for live replay assertions that
+    /// require strict parity.
+    ///
+    /// ## Mainnet impact: zero
+    ///
+    /// Mainnet has been Conway (PV ≥ 9) since September 2024.  MIR certs were
+    /// removed at the era boundary; [`mir::validate_mir_cert`] short-circuits
+    /// `Ok(())` for `pv >= 9`, so this helper is exercised only by pre-Conway
+    /// fixtures and replay paths.  The Conway short-circuit here returns an
+    /// empty accumulator, mirroring the live behaviour.
+    pub fn with_accumulated_mir_balances_from_ledger(
+        mut self,
+        ledger: &crate::state::LedgerState,
+    ) -> Self {
+        // Conway+ has no MIR certs — accumulator is structurally empty.
+        if ledger.epochs.protocol_params.protocol_version_major >= 9 {
+            self.accumulated_mir_balances = Some(HashMap::new());
+            return self;
+        }
+        // Pre-Conway: snapshot reward_accounts as best-effort i64 deltas.
+        // Lovelace is u64; clamp to i64::MAX on the (impossible-in-practice)
+        // overflow so the predicate's signed arithmetic stays well-defined.
+        let snapshot: HashMap<Hash32, i64> = ledger
+            .certs
+            .reward_accounts
+            .iter()
+            .map(|(cred_hash, lovelace)| {
+                (*cred_hash, i64::try_from(lovelace.0).unwrap_or(i64::MAX))
+            })
+            .collect();
+        self.accumulated_mir_balances = Some(snapshot);
+        self
+    }
+
+    /// Set the set of registered genesis-delegate key hashes used by
+    /// the Shelley PPUP `NonGenesisUpdatePPUP` predicate.
+    pub fn with_genesis_delegates(mut self, keys: HashSet<Hash28>) -> Self {
+        self.genesis_delegates = Some(keys);
         self
     }
 
@@ -361,6 +571,235 @@ pub enum ValidationError {
     /// `cardano-ledger-conway:Cardano.Ledger.Conway.Rules.Gov`.
     #[error("Governance proposal rejected: malformed PParamsUpdate ({reason})")]
     MalformedProposal { reason: String },
+    /// Conway GOV rule: a voter is not authorised to vote on this governance
+    /// action type.
+    ///
+    /// Reference: Haskell `DisallowedVoters` in
+    /// `eras/conway/impl/src/Cardano/Ledger/Conway/Rules/Gov.hs`.
+    /// The voter × action authority matrix:
+    ///   - `NoConfidence`: SPO yes, DRep yes, CC NO
+    ///   - `UpdateCommittee`: SPO yes, DRep yes, CC NO
+    ///   - `NewConstitution`: SPO NO, DRep yes, CC yes
+    ///   - `HardForkInitiation`: SPO yes, DRep yes, CC yes
+    ///   - `ParameterChange`: SPO only when SecurityGroup params, DRep yes, CC yes
+    ///   - `TreasuryWithdrawals`: SPO NO, DRep yes, CC yes
+    ///   - `InfoAction`: all yes (NoVotingThreshold)
+    ///
+    /// The payload aggregates **every** disallowed `(voter, gov_action_id)`
+    /// pair in the transaction into a single error (mirroring Haskell's
+    /// `NonEmpty` predicate-failure shape).
+    #[error("DisallowedVoters: {violations:?}")]
+    DisallowedVoters {
+        violations: Vec<(Voter, GovActionId)>,
+    },
+    /// Conway GOV rule: one or more voters in the transaction's
+    /// `voting_procedures` are not registered / authorised, and therefore
+    /// cannot vote on any governance action:
+    ///   - `DRepVoter` whose credential is not in `vsDReps`.
+    ///   - `StakePoolVoter` whose pool ID is not in `psStakePools`.
+    ///   - `CommitteeVoter` whose hot credential is not in
+    ///     `authorizedHotCommitteeCredentials`.
+    ///
+    /// This predicate fires **before** [`ValidationError::DisallowedVoters`]
+    /// (Haskell `internVoter` partitions unknown voters out of the voting set
+    /// before the authority matrix is applied), so a single voter is never
+    /// reported under both predicates.
+    ///
+    /// Reference: Haskell `VotersDoNotExist` /
+    /// `internVoter` in `eras/conway/impl/src/Cardano/Ledger/Conway/Rules/Gov.hs`.
+    /// All unknown voters are aggregated into a single predicate failure
+    /// (mirroring Haskell's `NonEmpty` shape).
+    #[error("VotersDoNotExist: {voters:?}")]
+    VotersDoNotExist { voters: Vec<Voter> },
+    /// A voter is voting against a governance action whose `expires_after_epoch`
+    /// is strictly less than the current epoch.
+    ///
+    /// Reference: Haskell `VotingOnExpiredGovAction` in
+    /// `eras/conway/impl/src/Cardano/Ledger/Conway/Rules/Gov.hs`,
+    /// function `checkVotesAreNotForExpiredActions`. Vote is allowed
+    /// when `current_epoch <= gasExpiresAfter` (boundary inclusive).
+    ///
+    /// This predicate is silently skipped if `ValidationContext::active_proposals`
+    /// is `None` (lenient default for callers that don't yet plumb in the
+    /// active-proposal map).
+    ///
+    /// Tuple shape: `(voter, gov_action_id, expires_after_epoch, current_epoch)`.
+    #[error("VotingOnExpiredGovAction: {expired_votes:?}")]
+    VotingOnExpiredGovAction {
+        expired_votes: Vec<(Voter, GovActionId, u64, u64)>,
+    },
+    /// Conway GOV rule: one or more proposal procedures have a return address
+    /// whose stake credential is not registered in the reward-accounts map.
+    ///
+    /// Per Haskell `processProposal` in
+    /// `eras/conway/impl/src/Cardano/Ledger/Conway/Rules/Gov.hs`, every proposal
+    /// procedure's `pProcReturnAddr` credential must be present in the on-chain
+    /// `accounts` map (i.e. the stake credential is currently registered) so the
+    /// proposal deposit can be refunded at expiry/enactment.  The check is
+    /// **skipped during Conway bootstrap** (`pvMajor == 9`) per
+    /// `hardforkConwayBootstrapPhase`, and runs from PV ≥ 10 onwards.
+    ///
+    /// This predicate is silently skipped if `ValidationContext::reward_accounts`
+    /// is `None` (lenient default for callers that haven't plumbed in the
+    /// reward-accounts state — same convention used by the other GOV predicates).
+    ///
+    /// Every offending proposal's raw `return_addr` (hex-encoded) is aggregated
+    /// into a single predicate failure, mirroring Haskell's `NonEmpty`
+    /// predicate-failure shape.
+    #[error("ProposalReturnAccountDoesNotExist: {bad_addrs:?}")]
+    ProposalReturnAccountDoesNotExist {
+        /// Hex-encoded raw `return_addr` bytes (header + 28-byte credential)
+        /// for every proposal whose return-address credential is unregistered.
+        bad_addrs: Vec<String>,
+    },
+    /// Conway GOV rule: one or more proposal procedures have a return-address
+    /// network id that does not match the node's configured network.
+    ///
+    /// Per Haskell `processProposal` in
+    /// `eras/conway/impl/src/Cardano/Ledger/Conway/Rules/Gov.hs`, every
+    /// proposal procedure's `pProcReturnAddr` must be on the same network as
+    /// the node.  Bit 0 of the reward-account header byte encodes the network
+    /// (`0` = testnet, `1` = mainnet).  Unlike
+    /// [`ValidationError::ProposalReturnAccountDoesNotExist`], this check is
+    /// **always enforced** — there is no Conway-bootstrap skip; the network
+    /// id is a structural property of the proposal payload, not a
+    /// post-bootstrap state lookup.
+    ///
+    /// This predicate is silently skipped if `ValidationContext::node_network`
+    /// is `None` (lenient default for callers that haven't plumbed in the
+    /// node network — same convention used by the other GOV predicates).
+    ///
+    /// Every offending proposal's raw `return_addr` (hex-encoded) and the
+    /// actual mismatched network id (`0` testnet / `1` mainnet) are
+    /// aggregated into a single predicate failure, mirroring Haskell's
+    /// `NonEmpty` predicate-failure shape.
+    #[error("ProposalProcedureNetworkIdMismatch: expected={expected}, mismatched={mismatched:?}")]
+    ProposalProcedureNetworkIdMismatch {
+        /// Expected network id (`0` testnet / `1` mainnet) — the node's
+        /// configured network.
+        expected: u8,
+        /// `(hex-encoded return_addr, actual_network_id)` for every proposal
+        /// whose return-address network does not match `expected`.
+        mismatched: Vec<(String, u8)>,
+    },
+    /// Conway GOV rule: one or more `TreasuryWithdrawals` proposals carry a
+    /// destination reward-address whose network id does not match the node's
+    /// configured network.
+    ///
+    /// Per Haskell `processProposal` in
+    /// `eras/conway/impl/src/Cardano/Ledger/Conway/Rules/Gov.hs`
+    /// (`TreasuryWithdrawals` branch), every key in the withdrawals map is a
+    /// reward address whose network id (bit 0 of the header byte;
+    /// `0` = testnet, `1` = mainnet) must match the node's network.  Like
+    /// [`ValidationError::ProposalProcedureNetworkIdMismatch`], this check is
+    /// **always enforced** — there is no Conway-bootstrap skip; the network
+    /// id is a structural property of the proposal payload.
+    ///
+    /// This predicate is silently skipped if `ValidationContext::node_network`
+    /// is `None` (lenient default for callers that haven't plumbed in the
+    /// node network — same convention used by the other GOV predicates).
+    ///
+    /// All mismatched destinations across all `TreasuryWithdrawals` proposals
+    /// in the transaction are aggregated into a single predicate failure,
+    /// mirroring Haskell's `NonEmpty` predicate-failure shape.
+    #[error(
+        "TreasuryWithdrawalsNetworkIdMismatch: expected={expected}, mismatched={mismatched:?}"
+    )]
+    TreasuryWithdrawalsNetworkIdMismatch {
+        /// Expected network id (`0` testnet / `1` mainnet) — the node's
+        /// configured network.
+        expected: u8,
+        /// `(hex-encoded reward_addr, actual_network_id)` for every TW
+        /// destination address whose network id does not match `expected`.
+        mismatched: Vec<(String, u8)>,
+    },
+    /// Conway GOV rule: one or more `TreasuryWithdrawals` proposals carry a
+    /// total amount of zero (including the all-zero-entries case).
+    ///
+    /// Per Haskell `processProposal` in
+    /// `eras/conway/impl/src/Cardano/Ledger/Conway/Rules/Gov.hs`
+    /// (`TreasuryWithdrawals` branch), the sum of every withdrawal entry's
+    /// `Coin` must be strictly positive — degenerate zero-sum proposals are
+    /// rejected.
+    ///
+    /// This check is **skipped during Conway bootstrap** (`pvMajor == 9`)
+    /// per `hardforkConwayBootstrapPhase`; it activates from PV ≥ 10.
+    ///
+    /// Every offending proposal is identified by a string descriptor
+    /// (currently the proposal's hex-encoded `return_addr` to keep the
+    /// payload stable) — the Haskell side aggregates the full `GovAction`
+    /// payloads, but a list of identifiers is sufficient for diagnostics.
+    /// All offending proposals across the transaction aggregate into a
+    /// single predicate failure, mirroring Haskell's `NonEmpty`
+    /// predicate-failure shape.
+    #[error("ZeroTreasuryWithdrawals: {offending_proposals:?}")]
+    ZeroTreasuryWithdrawals {
+        /// Hex-encoded `return_addr` (or other stable identifier) of every
+        /// offending TreasuryWithdrawals proposal in the transaction.
+        offending_proposals: Vec<String>,
+    },
+    /// Conway GOV rule: one or more `UpdateCommittee` proposals whose
+    /// add-set keys intersect the remove-set — the proposal both adds and
+    /// removes the same Constitutional Committee credential.
+    ///
+    /// Per Haskell `processProposal` in
+    /// `eras/conway/impl/src/Cardano/Ledger/Conway/Rules/Gov.hs`
+    /// (`UpdateCommittee` branch):
+    ///
+    /// ```haskell
+    /// let conflicting = Set.intersection (Map.keysSet membersToAdd) membersToRemove
+    /// in unless (Set.null conflicting) (failBecause $ ConflictingCommitteeUpdate conflicting)
+    /// ```
+    ///
+    /// This check is **always enforced** — there is no Conway-bootstrap
+    /// skip; the conflict is a structural property of the action payload.
+    ///
+    /// Conflicting credentials across all `UpdateCommittee` proposals in
+    /// the transaction are aggregated into a single predicate failure.
+    /// Each entry is the typed-hash32 hex (byte 28 = `0x01` for scripts,
+    /// `0x00` for keys) so callers can distinguish key- from script-
+    /// credential conflicts — matching Haskell's `Credential` type.
+    #[error("ConflictingCommitteeUpdate: {conflicts:?}")]
+    ConflictingCommitteeUpdate {
+        /// Hex-encoded typed-hash32 of every conflicting credential
+        /// across all UpdateCommittee proposals in the transaction.
+        conflicts: Vec<String>,
+    },
+    /// Conway GOV rule: one or more new members in an `UpdateCommittee`
+    /// proposal carry a `validUntil` epoch that is not strictly greater
+    /// than the current epoch — the member would expire on or before
+    /// taking office.
+    ///
+    /// Per Haskell `processProposal` in
+    /// `eras/conway/impl/src/Cardano/Ledger/Conway/Rules/Gov.hs`
+    /// (`UpdateCommittee` branch):
+    ///
+    /// ```haskell
+    /// let invalidMembers = Map.filter (<= currentEpoch) membersToAdd
+    /// in unless (Map.null invalidMembers) (failBecause $ ExpirationEpochTooSmall invalidMembers)
+    /// ```
+    ///
+    /// This check is **always enforced** — there is no Conway-bootstrap
+    /// skip; the expiry-vs-current-epoch comparison is a structural
+    /// property of the proposal payload combined with the live epoch.
+    ///
+    /// This predicate is silently skipped if `ValidationContext::current_epoch`
+    /// is `None` (lenient default for callers that have not plumbed in
+    /// epoch context — same convention used by other epoch-dependent GOV
+    /// predicates).
+    ///
+    /// Every offending `(credential, validUntil)` pair across all
+    /// `UpdateCommittee` proposals in the transaction is aggregated into
+    /// a single predicate failure, mirroring Haskell's `NonEmpty`
+    /// predicate-failure shape.  Each credential is the typed-hash32 hex
+    /// (byte 28 = `0x01` for scripts, `0x00` for keys).
+    #[error("ExpirationEpochTooSmall: {invalid_members:?}")]
+    ExpirationEpochTooSmall {
+        /// `(typed-hash32 hex of credential, bad validUntil epoch)` for
+        /// every offending new member across all UpdateCommittee
+        /// proposals in the transaction.
+        invalid_members: Vec<(String, u64)>,
+    },
     /// Alonzo UTXOW rule: a redeemer in the witness set has no matching
     /// script purpose (spending input, minting policy, withdrawal, cert, vote).
     ///
@@ -422,12 +861,41 @@ pub enum ValidationError {
     /// Haskell `wdrlNotZero`: withdrawals with a zero amount are rejected.
     #[error("Zero withdrawal amount for reward account: {account}")]
     ZeroWithdrawal { account: String },
-    /// Withdrawal amount does not match the on-chain reward balance for the account.
-    #[error("Incorrect withdrawal amount for {account}: declared={declared}, actual={actual}")]
-    IncorrectWithdrawalAmount {
-        account: String,
-        declared: u64,
-        actual: u64,
+    /// Combined CERTS-rule withdrawal failure (PV ≤ 10).
+    ///
+    /// Reference: Haskell `WithdrawalsNotInRewardsCERTS` in
+    /// `eras/conway/impl/src/Cardano/Ledger/Conway/Rules/Certs.hs`.
+    /// Bundles missing accounts (unregistered or wrong-network) AND
+    /// incomplete withdrawals (amount ≠ balance) per the helper
+    /// `withdrawalsThatDoNotDrainAccounts`. Active in Conway prior to
+    /// the move-checks-to-LEDGER-rule hard fork (PV ≤ 10).
+    #[error("WithdrawalsNotInRewardsCERTS: {bad:?}")]
+    WithdrawalsNotInRewardsCERTS {
+        /// `(addr_hex, supplied_amount)` pairs for every withdrawal whose
+        /// reward account is missing OR whose amount mismatches the balance.
+        bad: Vec<(String, u64)>,
+    },
+    /// Withdrawal references an unregistered or wrong-network reward account
+    /// (PV ≥ 11).
+    ///
+    /// Reference: Haskell `ConwayWithdrawalsMissingAccounts` in
+    /// `eras/conway/impl/src/Cardano/Ledger/Conway/Rules/Ledger.hs`,
+    /// active after `hardforkConwayMoveWithdrawalsAndDRepChecksToLedgerRule`.
+    #[error("ConwayWithdrawalsMissingAccounts: {missing:?}")]
+    ConwayWithdrawalsMissingAccounts {
+        /// `(addr_hex, supplied_amount)` per missing-account withdrawal.
+        missing: Vec<(String, u64)>,
+    },
+    /// Withdrawal amount does not match the registered account balance
+    /// (PV ≥ 11).
+    ///
+    /// Reference: Haskell `ConwayIncompleteWithdrawals` in
+    /// `eras/conway/impl/src/Cardano/Ledger/Conway/Rules/Ledger.hs`.
+    #[error("ConwayIncompleteWithdrawals: {incomplete:?}")]
+    ConwayIncompleteWithdrawals {
+        /// `(addr_hex, supplied_amount, expected_balance)` per mismatched
+        /// withdrawal.
+        incomplete: Vec<(String, u64, u64)>,
     },
     /// Haskell `StakeKeyHasNonZeroAccountBalanceDELEG`: a stake deregistration
     /// is rejected when the reward account holds a non-zero balance.
@@ -661,6 +1129,271 @@ pub enum ValidationError {
         /// Hex-encoded provided policy hash, or "None" if absent.
         actual: String,
     },
+    /// Pool metadata hash exceeds the 32-byte (Blake2b-256) cap.
+    ///
+    /// Reference: Haskell `PoolMedataHashTooBig` in
+    /// `eras/shelley/impl/src/Cardano/Ledger/Shelley/Rules/Pool.hs`:
+    ///
+    /// ```haskell
+    /// when (SoftForks.restrictPoolMetadataHash pv) $
+    ///   forM_ sppMetadata $ \pmd ->
+    ///     let s = sizeofByteArray $ pmHash pmd
+    ///      in s <= fromIntegral (hashSize ([] @HASH))
+    ///           ?! injectFailure (PoolMedataHashTooBig sppId s)
+    /// ```
+    ///
+    /// Active since Alonzo (`pvMajor > 4`) per
+    /// `SoftForks.restrictPoolMetadataHash`. `HASH = Blake2b_256`, so the
+    /// cap is 32 bytes.
+    ///
+    /// In dugite, `PoolMetadata.hash` is structurally a `Hash32` (fixed
+    /// 32 bytes), so this predicate is defensive against future
+    /// wire-decode paths that might surface oversized values via a
+    /// byte-slice route.
+    #[error("PoolMedataHashTooBig: pool={pool}, hash_size={hash_size}")]
+    PoolMedataHashTooBig {
+        /// Hex-encoded 28-byte pool operator key hash.
+        pool: String,
+        /// Reported metadata hash size in bytes (> 32).
+        hash_size: usize,
+    },
+    /// One or more transaction outputs use a Byron/bootstrap address whose
+    /// serialized attributes exceed the 64-byte cap.
+    ///
+    /// Reference: Haskell `OutputBootAddrAttrsTooBig` /
+    /// `validateOutputBootAddrAttrsTooBig` in
+    /// `eras/shelley/impl/src/Cardano/Ledger/Shelley/Rules/Utxo.hs`:
+    ///
+    /// ```text
+    /// ∀ ( _ ↦ (a,_)) ∈ txoutstxb, a ∈ Addrbootstrap → bootstrapAttrsSize a ≤ 64
+    /// ```
+    ///
+    /// Applies to all outputs in all eras Shelley+. Every offending output
+    /// in the transaction aggregates into a single predicate failure with
+    /// its zero-based index, mirroring Haskell's aggregation.
+    #[error("OutputBootAddrAttrsTooBig: {oversized_outputs:?}")]
+    OutputBootAddrAttrsTooBig {
+        /// Zero-based output indices for every Byron/bootstrap output
+        /// whose serialized attributes exceed 64 bytes.
+        oversized_outputs: Vec<usize>,
+    },
+    // ---------------------------------------------------------------------
+    // MIR (Move Instantaneous Rewards) predicate failures.
+    //
+    // Reference: `eras/shelley/impl/src/Cardano/Ledger/Shelley/Rules/Deleg.hs`.
+    //
+    // MIR certificates exist only in Shelley–Babbage (`AtMostEra "Babbage"`).
+    // Conway has removed `MIRCert` entirely. All MIR predicates short-circuit
+    // (no-op) at PV >= 9 (Conway). Several sub-rules are further gated by
+    // `hardforkAlonzoAllowMIRTransfer = pvMajor pv > 4`.
+    // ---------------------------------------------------------------------
+    /// Shelley DELEG rule `MIRCertificateTooLateInEpoch`: MIR certificates
+    /// submitted within `stabilityWindow` slots of the next epoch boundary
+    /// are rejected — applying them mid-window risks the rewards landing in
+    /// an epoch the proposer didn't intend.
+    ///
+    /// `tooLate = firstSlotOfNextEpoch - stabilityWindow` and
+    /// `stabilityWindow = ceil(3 * k / f)` where `k = securityParam` and
+    /// `f = activeSlotCoeff`.  Reject when `currentSlot >= tooLate`
+    /// (boundary inclusive — Haskell uses `>=`).
+    ///
+    /// Reference: Haskell `checkSlotNotTooLate` in `Shelley.Rules.Deleg`.
+    #[error("MIRCertificateTooLateInEpoch: current_slot={current_slot}, deadline={deadline}")]
+    MIRCertificateTooLateInEpoch {
+        /// The transaction's current slot.
+        current_slot: u64,
+        /// `firstSlotOfNextEpoch - stabilityWindow` — the earliest slot
+        /// at which an MIR cert is too late.
+        deadline: u64,
+    },
+    /// Shelley DELEG rule `InsufficientForInstantaneousRewards`: the sum of
+    /// all delta values in a `StakeAddressesMIR` certificate exceeds the
+    /// available pot balance (Reserves or Treasury).
+    ///
+    /// In Alonzo+ Haskell uses `availableAfterMIR` which considers existing
+    /// `dsIRewards` accumulated during the same epoch; dugite uses the
+    /// simpler `sum(deltas) > pot_balance` check (documented limitation —
+    /// see `validation/mir.rs` doc comment).
+    ///
+    /// Reference: Haskell `checkStakeAddressesMIR` /
+    /// `availableAfterMIR` in `Shelley.Rules.Deleg`.
+    #[error(
+        "InsufficientForInstantaneousRewards: pot={pot:?}, required={required}, \
+         available={available}"
+    )]
+    InsufficientForInstantaneousRewards {
+        /// The MIR source pot.
+        pot: dugite_primitives::transaction::MIRSource,
+        /// Sum of delta values requested.
+        required: u64,
+        /// Pot balance available.
+        available: u64,
+    },
+    /// Shelley DELEG rule `MIRTransferNotCurrentlyAllowed`: pre-Alonzo
+    /// (`pvMajor <= 4`), `OtherAccountingPot` (pot-to-pot transfer) MIR
+    /// certificates are not allowed.  Only `StakeCredentials` distributions
+    /// are accepted before Alonzo enables `hardforkAlonzoAllowMIRTransfer`.
+    ///
+    /// Reference: Haskell `checkSendToOppositePotMIR` (pre-Alonzo branch)
+    /// in `Shelley.Rules.Deleg`.
+    #[error("MIRTransferNotCurrentlyAllowed (pre-Alonzo MIR pot-to-pot transfer)")]
+    MIRTransferNotCurrentlyAllowed,
+    /// Shelley DELEG rule `MIRNegativesNotCurrentlyAllowed`: pre-Alonzo
+    /// (`pvMajor <= 4`), every delta in a `StakeAddressesMIR` certificate
+    /// must be non-negative.  Negative deltas (claw-back) are only allowed
+    /// from Alonzo onward (`hardforkAlonzoAllowMIRTransfer`).
+    ///
+    /// Reference: Haskell `checkStakeAddressesMIR` (pre-Alonzo branch)
+    /// in `Shelley.Rules.Deleg`.
+    #[error("MIRNegativesNotCurrentlyAllowed (pre-Alonzo negative MIR delta)")]
+    MIRNegativesNotCurrentlyAllowed,
+    /// Shelley DELEG rule `MIRProducesNegativeUpdate`: in Alonzo+, after
+    /// aggregating an MIR cert's deltas with the existing `dsIRewards`
+    /// accumulator, no recipient may end up with a negative balance.
+    ///
+    /// Dugite implements this conservatively when an
+    /// `accumulated_mir_balances` snapshot is supplied by the caller; when
+    /// the snapshot is `None`, the check is silently skipped (documented
+    /// limitation — full simulation requires `dsIRewards` plumbing).
+    ///
+    /// Reference: Haskell `checkStakeAddressesMIR` (Alonzo+ branch) in
+    /// `Shelley.Rules.Deleg`.
+    #[error("MIRProducesNegativeUpdate: credentials={credentials:?}")]
+    MIRProducesNegativeUpdate {
+        /// Hex-encoded credential hashes whose accumulated balance would
+        /// become negative if the MIR cert were applied.
+        credentials: Vec<String>,
+    },
+    /// Shelley DELEG rule `InsufficientForTransferDELEG`: in Alonzo+, an
+    /// `OtherAccountingPot(coin)` transfer requests more lovelace than the
+    /// source pot currently holds.
+    ///
+    /// Reference: Haskell `checkSendToOppositePotMIR` (Alonzo+ branch) in
+    /// `Shelley.Rules.Deleg`.
+    #[error(
+        "InsufficientForTransferDELEG: pot={pot:?}, requested={requested}, \
+         available={available}"
+    )]
+    InsufficientForTransferDELEG {
+        /// The MIR source pot.
+        pot: dugite_primitives::transaction::MIRSource,
+        /// Lovelace requested in the transfer.
+        requested: u64,
+        /// Pot balance available.
+        available: u64,
+    },
+    /// Shelley DELEG rule `MIRNegativeTransfer`: in Alonzo+, the `coin`
+    /// field of an `OtherAccountingPot` transfer must be non-negative.
+    ///
+    /// In dugite, `MIRTarget::OtherAccountingPot(u64)` is structurally
+    /// non-negative, so this predicate is unreachable via the public type
+    /// system but kept for parity-completeness with Haskell's
+    /// `DeltaCoin`-typed payload (which can encode negatives at the
+    /// CBOR level on alternate decode paths).
+    ///
+    /// Reference: Haskell `checkSendToOppositePotMIR` (Alonzo+ branch) in
+    /// `Shelley.Rules.Deleg`.
+    #[error("MIRNegativeTransfer: pot={pot:?}, amount={amount}")]
+    MIRNegativeTransfer {
+        /// The MIR source pot.
+        pot: dugite_primitives::transaction::MIRSource,
+        /// Negative transfer amount.
+        amount: i64,
+    },
+    // ---------------------------------------------------------------------
+    // PPUP (pre-Conway protocol-parameter update) predicate failures.
+    //
+    // Reference: `eras/shelley/impl/src/Cardano/Ledger/Shelley/Rules/Ppup.hs`.
+    //
+    // PPUP is active in Shelley–Babbage (`AtMostEra "Babbage" era`).  Conway
+    // replaces this rule with on-chain governance (CIP-1694).  All three
+    // PPUP predicates short-circuit (no-op) at PV >= 9.
+    // ---------------------------------------------------------------------
+    /// Shelley PPUP rule `NonGenesisUpdatePPUP`: every key in the proposed
+    /// update map must be a registered genesis-delegate key (i.e. a member
+    /// of `keysSet GenDelegs`).
+    ///
+    /// Reference: Haskell `NonGenesisUpdatePPUP` in
+    /// `eras/shelley/impl/src/Cardano/Ledger/Shelley/Rules/Ppup.hs`.
+    /// Active in Shelley–Babbage (`AtMostEra "Babbage" era`); Conway+
+    /// replaces this rule with on-chain governance (CIP-1694).
+    ///
+    /// Skipped silently (lenient default) when
+    /// [`ValidationContext::genesis_delegates`] is `None` — callers that
+    /// haven't plumbed in the genesis-delegate set have no way to tell
+    /// proposed-vs-genesis apart.
+    #[error(
+        "NonGenesisUpdatePPUP: proposed_keys not subset of genesis_delegates \
+         ({proposed:?} ∉ {genesis:?})"
+    )]
+    NonGenesisUpdatePPUP {
+        /// Hex-encoded proposed update keys that are not registered genesis
+        /// delegates.
+        proposed: Vec<String>,
+        /// Hex-encoded set of currently registered genesis delegate keys
+        /// (for diagnostic visibility).
+        genesis: Vec<String>,
+    },
+    /// Shelley PPUP rule `PPUpdateWrongEpoch`: an update proposal targets an
+    /// epoch that is incompatible with the current slot's "voting period".
+    ///
+    /// `tooLate = firstSlotOfNextEpoch - 2 * stabilityWindow`.
+    /// - When `current_slot < tooLate` ([`VotingPeriod::ForThisEpoch`]) the
+    ///   target epoch must equal `current_epoch`.
+    /// - When `current_slot >= tooLate` ([`VotingPeriod::ForNextEpoch`]) the
+    ///   target epoch must equal `current_epoch + 1`.
+    ///
+    /// Reference: Haskell `PPUpdateWrongEpoch` in
+    /// `eras/shelley/impl/src/Cardano/Ledger/Shelley/Rules/Ppup.hs`.
+    ///
+    /// Skipped silently when `epoch_length` or `security_param` are not
+    /// supplied on the context (the predicate cannot fire without them —
+    /// same lenient-default convention as the MIR predicates).
+    #[error("PPUpdateWrongEpoch: current={current}, target={target}, period={period:?}")]
+    PPUpdateWrongEpoch {
+        /// Current epoch (derived from `current_slot`/`epoch_length` if not
+        /// supplied directly).
+        current: u64,
+        /// The proposal's declared target epoch.
+        target: u64,
+        /// Whether the current slot is in the for-this-epoch or
+        /// for-next-epoch voting period.
+        period: VotingPeriod,
+    },
+    /// Shelley PPUP rule `PVCannotFollowPPUP`: the proposed protocol version
+    /// does not validly follow the current one.  Only minor (`(major,
+    /// minor+1)`) and major (`(major+1, 0)`) bumps are allowed; skipping
+    /// versions or regressing is rejected.
+    ///
+    /// Reference: Haskell `PVCannotFollowPPUP` in
+    /// `eras/shelley/impl/src/Cardano/Ledger/Shelley/Rules/Ppup.hs`.
+    #[error("PVCannotFollowPPUP: bad_pv={bad_pv:?}")]
+    PVCannotFollowPPUP {
+        /// `(major, minor)` of the proposed protocol version that fails the
+        /// `pvCanFollow` check.
+        bad_pv: (u32, u32),
+    },
+}
+
+// ---------------------------------------------------------------------------
+// PPUP supporting types
+// ---------------------------------------------------------------------------
+
+/// Voting period for a pre-Conway protocol-parameter update proposal.
+///
+/// Mirrors Haskell's `VotingPeriod` in
+/// `eras/shelley/impl/src/Cardano/Ledger/Shelley/Rules/Ppup.hs`:
+///
+/// - [`VotingPeriod::ForThisEpoch`] — `current_slot < tooLate`; the
+///   proposal's target must equal the current epoch.
+/// - [`VotingPeriod::ForNextEpoch`] — `current_slot >= tooLate`; the
+///   proposal's target must equal the next epoch.
+///
+/// Where `tooLate = firstSlotOfNextEpoch - 2 * stabilityWindow`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VotingPeriod {
+    ForThisEpoch,
+    ForNextEpoch,
 }
 
 // ---------------------------------------------------------------------------
@@ -742,7 +1475,7 @@ pub fn validate_transaction_with_context(
     slot_config: Option<&SlotConfig>,
     context: ValidationContext,
 ) -> Result<(), Vec<ValidationError>> {
-    validate_transaction_with_pools(
+    let pools_result = validate_transaction_with_pools(
         tx,
         utxo_set,
         params,
@@ -761,7 +1494,404 @@ pub fn validate_transaction_with_context(
         context.stake_key_deposits.as_ref(),
         context.constitution_script_hash,
         context.vote_delegations.as_ref(),
-    )
+    );
+
+    // Conway GOV `VotersDoNotExist` and `DisallowedVoters` predicates.
+    //
+    // Both are PV >= 9 only and operate on `tx.body.voting_procedures`.
+    //
+    // Per Haskell `conwayGovTransition` (`internVoter`), unknown voters are
+    // partitioned out of the voting set BEFORE the authority check runs — i.e.
+    // `VotersDoNotExist` takes precedence over `DisallowedVoters`, and a single
+    // voter is never reported under both.  We implement this by collecting the
+    // unknown voters first into a `HashSet` and skipping them when the
+    // `DisallowedVoters` loop iterates.
+    let mut extra_errors: Vec<ValidationError> = Vec::new();
+    if params.protocol_version_major >= 9 && !tx.body.voting_procedures.is_empty() {
+        // -------------------------------------------------------------------
+        // VotersDoNotExist: every voter whose credential / pool ID is not in
+        // the corresponding registry.  Empty `vp_map`s are skipped — Haskell
+        // does the same partition over the keys of the voting-procedures map,
+        // and an empty inner map is unreachable in practice (CBOR decoders
+        // reject it).
+        // -------------------------------------------------------------------
+        // Two collections, one purpose: `unknown_voters` preserves the order
+        // of voters as they appear in `voting_procedures` so the resulting
+        // `VotersDoNotExist` payload is deterministic; `unknown_voter_set`
+        // gives O(1) skip-membership lookup for the precedence loops below
+        // (DisallowedVoters / VotingOnExpiredGovAction must not double-fire
+        // on a voter that's already in `VotersDoNotExist`).
+        let mut unknown_voters: Vec<Voter> = Vec::new();
+        let mut unknown_voter_set: HashSet<Voter> = HashSet::new();
+        for (voter, vp_map) in tx.body.voting_procedures.iter() {
+            if !vp_map.is_empty() && conway::is_voter_unknown(voter, &context) {
+                unknown_voters.push(voter.clone());
+                unknown_voter_set.insert(voter.clone());
+            }
+        }
+        if !unknown_voters.is_empty() {
+            extra_errors.push(ValidationError::VotersDoNotExist {
+                voters: unknown_voters,
+            });
+        }
+
+        // -------------------------------------------------------------------
+        // DisallowedVoters: voter type is not authorised for the action type.
+        //
+        // For every (voter, gov_action_id) pair in `voting_procedures`, look up
+        // the referenced GovAction and reject the vote if the voter type is
+        // not authorised for that action type (Haskell `checkVotersAreValid` /
+        // `is{Committee,DRep,StakePool}VotingAllowed`).
+        //
+        // The GovAction is looked up first against proposals submitted in the
+        // same transaction, then against the optional `active_proposals` map
+        // provided by the caller (typically the on-chain governance state).
+        // Votes that do not resolve to any known action are ignored here —
+        // that's a different predicate (`GovActionsDoNotExist`) handled
+        // elsewhere.
+        //
+        // Voters already in `unknown_voter_set` are skipped so they don't
+        // appear in BOTH `VotersDoNotExist` and `DisallowedVoters` (Haskell
+        // partitions unknowns out before the authority check).
+        // -------------------------------------------------------------------
+        let mut local_proposals: HashMap<GovActionId, &GovAction> = HashMap::new();
+        for (idx, proposal) in tx.body.proposal_procedures.iter().enumerate() {
+            let id = GovActionId {
+                transaction_id: tx.hash,
+                action_index: idx as u32,
+            };
+            local_proposals.insert(id, &proposal.gov_action);
+        }
+
+        // Aggregate every disallowed (voter, action_id) pair into one error,
+        // mirroring Haskell's NonEmpty predicate-failure shape.
+        let mut violations: Vec<(Voter, GovActionId)> = Vec::new();
+        for (voter, votes) in &tx.body.voting_procedures {
+            if unknown_voter_set.contains(voter) {
+                continue;
+            }
+            for action_id in votes.keys() {
+                let action: Option<&GovAction> =
+                    local_proposals.get(action_id).copied().or_else(|| {
+                        context
+                            .active_proposals
+                            .as_ref()
+                            .and_then(|m| m.get(action_id))
+                            .map(|ap| &ap.gov_action)
+                    });
+
+                let Some(action) = action else {
+                    // Vote references an unknown GovAction; this is a
+                    // different predicate failure (GovActionsDoNotExist),
+                    // not DisallowedVoters.  Skip silently here.
+                    continue;
+                };
+
+                if conway::is_voter_disallowed(voter, action) {
+                    violations.push((voter.clone(), action_id.clone()));
+                }
+            }
+        }
+        if !violations.is_empty() {
+            extra_errors.push(ValidationError::DisallowedVoters { violations });
+        }
+
+        // -------------------------------------------------------------------
+        // VotingOnExpiredGovAction: a vote against an action whose
+        // `expires_after_epoch` is strictly less than `current_epoch` is
+        // rejected.  Boundary case (`current_epoch == expires_after_epoch`)
+        // is allowed — Haskell `checkVotesAreNotForExpiredActions`.
+        //
+        // Precedence (Haskell `internVoter` partitions unknown voters out
+        // first; the authority and expiry checks then apply only to known
+        // voters):
+        //
+        //   VotersDoNotExist  >  DisallowedVoters
+        //                     >  VotingOnExpiredGovAction
+        //
+        // Concretely: we skip voters already in `unknown_voter_set` so a
+        // single voter is never reported under multiple predicates here.
+        //
+        // Same-tx proposals (`local_proposals`) are skipped because a
+        // proposal that was just submitted in this tx cannot have expired.
+        // This matches Haskell's `proposals` look-up: only the on-chain
+        // active-proposal map carries an `expiresAfter` field.
+        // -------------------------------------------------------------------
+        let mut expired_votes: Vec<(Voter, GovActionId, u64, u64)> = Vec::new();
+        if let Some(current_epoch) = context.current_epoch {
+            for (voter, votes) in &tx.body.voting_procedures {
+                if unknown_voter_set.contains(voter) {
+                    continue;
+                }
+                for action_id in votes.keys() {
+                    // Same-tx proposals are never expired (they were just
+                    // submitted), so skip them here.  This also prevents
+                    // double-firing when a proposal happens to share a
+                    // GovActionId with an active one (impossible in practice
+                    // but the local-tx branch wins).
+                    if local_proposals.contains_key(action_id) {
+                        continue;
+                    }
+                    if conway::is_vote_on_expired_action(action_id, &context) {
+                        // SAFETY: is_vote_on_expired_action returned true, so
+                        // both `active_proposals` and the action_id entry exist.
+                        let expires = context
+                            .active_proposals
+                            .as_ref()
+                            .and_then(|m| m.get(action_id))
+                            .map(|p| p.expires_after_epoch.0)
+                            .expect("predicate true implies active proposal exists");
+                        expired_votes.push((
+                            voter.clone(),
+                            action_id.clone(),
+                            expires,
+                            current_epoch,
+                        ));
+                    }
+                }
+            }
+        }
+        if !expired_votes.is_empty() {
+            extra_errors.push(ValidationError::VotingOnExpiredGovAction { expired_votes });
+        }
+    }
+
+    // -------------------------------------------------------------------
+    // ProposalReturnAccountDoesNotExist: every proposal procedure's
+    // `return_addr` must reference a registered stake credential so the
+    // deposit can be refunded.  Per Haskell `processProposal` in
+    // `Conway.Rules.Gov`, this check is **skipped during Conway bootstrap**
+    // (`pvMajor == 9`) — bootstrap gating is inside the predicate, so the
+    // wiring just iterates and aggregates.
+    //
+    // Runs only when the transaction submits at least one proposal.  This
+    // mirrors `Conway.Rules.Gov.processProposal`, which is invoked once per
+    // proposal in `tx.body.proposal_procedures` (and so does nothing for
+    // a tx with no proposals).
+    // -------------------------------------------------------------------
+    if params.protocol_version_major >= 9 && !tx.body.proposal_procedures.is_empty() {
+        let mut bad_addrs: Vec<String> = Vec::new();
+        for proposal in &tx.body.proposal_procedures {
+            if conway::is_proposal_return_account_unregistered(proposal, params, &context) {
+                // Hex-encode the raw return_addr bytes for the diagnostic.
+                // Matches the fold-based encoding used for withdrawal account
+                // hex strings above so error formatting stays consistent
+                // across this module without adding a new dependency.
+                let addr_hex = proposal.return_addr.iter().fold(
+                    String::with_capacity(proposal.return_addr.len() * 2),
+                    |mut s, b| {
+                        use std::fmt::Write;
+                        let _ = write!(s, "{b:02x}");
+                        s
+                    },
+                );
+                bad_addrs.push(addr_hex);
+            }
+        }
+        if !bad_addrs.is_empty() {
+            extra_errors.push(ValidationError::ProposalReturnAccountDoesNotExist { bad_addrs });
+        }
+    }
+
+    // -------------------------------------------------------------------
+    // ProposalProcedureNetworkIdMismatch: every proposal procedure's
+    // `return_addr` must be on the same network as the node.  Per Haskell
+    // `processProposal` in `Conway.Rules.Gov`, this check is **always
+    // enforced** (no Conway-bootstrap skip — the network id is a
+    // structural property of the proposal, not a post-bootstrap state
+    // lookup).
+    //
+    // Runs only when the transaction submits at least one proposal,
+    // mirroring `processProposal`'s per-proposal invocation.
+    // -------------------------------------------------------------------
+    if params.protocol_version_major >= 9 && !tx.body.proposal_procedures.is_empty() {
+        let mut mismatched: Vec<(String, u8)> = Vec::new();
+        for proposal in &tx.body.proposal_procedures {
+            if let Some(actual_net) =
+                conway::is_proposal_return_addr_wrong_network(proposal, &context)
+            {
+                let addr_hex = proposal.return_addr.iter().fold(
+                    String::with_capacity(proposal.return_addr.len() * 2),
+                    |mut s, b| {
+                        use std::fmt::Write;
+                        let _ = write!(s, "{b:02x}");
+                        s
+                    },
+                );
+                mismatched.push((addr_hex, actual_net));
+            }
+        }
+        if !mismatched.is_empty() {
+            // SAFETY: predicate fired -> ctx.node_network must be Some
+            // (the predicate returns None when node_network is None).
+            let expected = context
+                .node_network
+                .expect("predicate fired implies node_network is Some")
+                .to_u8();
+            extra_errors.push(ValidationError::ProposalProcedureNetworkIdMismatch {
+                expected,
+                mismatched,
+            });
+        }
+    }
+
+    // -------------------------------------------------------------------
+    // TreasuryWithdrawalsNetworkIdMismatch: every destination reward
+    // address in a `TreasuryWithdrawals` proposal must be on the same
+    // network as the node.  Per Haskell `processProposal` in
+    // `Conway.Rules.Gov` (`TreasuryWithdrawals` branch), this check is
+    // **always enforced** (no Conway-bootstrap skip — the network id is a
+    // structural property of the proposal, not a post-bootstrap state
+    // lookup).  All mismatched destinations across all TreasuryWithdrawals
+    // proposals are aggregated into a single error, mirroring Haskell's
+    // `NonEmpty` predicate-failure shape.
+    //
+    // Runs only when the transaction submits at least one proposal,
+    // mirroring `processProposal`'s per-proposal invocation.
+    // -------------------------------------------------------------------
+    if params.protocol_version_major >= 9 && !tx.body.proposal_procedures.is_empty() {
+        let mut mismatched: Vec<(String, u8)> = Vec::new();
+        for proposal in &tx.body.proposal_procedures {
+            mismatched.extend(conway::treasury_withdrawal_network_mismatches(
+                proposal, &context,
+            ));
+        }
+        if !mismatched.is_empty() {
+            // SAFETY: predicate fired -> ctx.node_network must be Some
+            // (the predicate returns an empty vec when node_network is None).
+            let expected = context
+                .node_network
+                .expect("predicate fired implies node_network is Some")
+                .to_u8();
+            extra_errors.push(ValidationError::TreasuryWithdrawalsNetworkIdMismatch {
+                expected,
+                mismatched,
+            });
+        }
+    }
+
+    // -------------------------------------------------------------------
+    // ZeroTreasuryWithdrawals: every `TreasuryWithdrawals` proposal must
+    // carry a strictly positive total amount.  Per Haskell `processProposal`
+    // in `Conway.Rules.Gov` this check is **skipped during Conway
+    // bootstrap** (PV == 9) per `hardforkConwayBootstrapPhase`.
+    //
+    // Runs only when the transaction submits at least one proposal,
+    // mirroring `processProposal`'s per-proposal invocation.  The bootstrap
+    // gate is encoded inside the predicate itself (`is_treasury_withdrawals_zero_sum`),
+    // so the wiring here is straightforward.
+    // -------------------------------------------------------------------
+    if params.protocol_version_major >= 9 && !tx.body.proposal_procedures.is_empty() {
+        let mut offending: Vec<String> = Vec::new();
+        for proposal in &tx.body.proposal_procedures {
+            if conway::is_treasury_withdrawals_zero_sum(proposal, params) {
+                let id_hex = proposal.return_addr.iter().fold(
+                    String::with_capacity(proposal.return_addr.len() * 2),
+                    |mut s, b| {
+                        use std::fmt::Write;
+                        let _ = write!(s, "{b:02x}");
+                        s
+                    },
+                );
+                offending.push(id_hex);
+            }
+        }
+        if !offending.is_empty() {
+            extra_errors.push(ValidationError::ZeroTreasuryWithdrawals {
+                offending_proposals: offending,
+            });
+        }
+    }
+
+    // -------------------------------------------------------------------
+    // ConflictingCommitteeUpdate: every `UpdateCommittee` proposal must
+    // have an empty intersection between its add-set keys and its
+    // remove-set.  Per Haskell `processProposal` in `Conway.Rules.Gov`,
+    // this check is **always enforced** (no Conway-bootstrap skip — the
+    // add/remove conflict is a structural property of the action payload).
+    //
+    // Runs only when the transaction submits at least one proposal,
+    // mirroring `processProposal`'s per-proposal invocation.
+    // -------------------------------------------------------------------
+    if params.protocol_version_major >= 9 && !tx.body.proposal_procedures.is_empty() {
+        let mut conflicts: Vec<String> = Vec::new();
+        for proposal in &tx.body.proposal_procedures {
+            conflicts.extend(conway::committee_update_conflicts(proposal));
+        }
+        if !conflicts.is_empty() {
+            extra_errors.push(ValidationError::ConflictingCommitteeUpdate { conflicts });
+        }
+    }
+
+    // -------------------------------------------------------------------
+    // ExpirationEpochTooSmall: every new committee member added by an
+    // `UpdateCommittee` proposal must have a `validUntil` epoch strictly
+    // greater than the current epoch.  Per Haskell `processProposal` in
+    // `Conway.Rules.Gov`, this check is **always enforced** (no
+    // Conway-bootstrap skip).  When `ctx.current_epoch` is `None`, the
+    // predicate is silently lenient (returns the empty vec) so callers
+    // that have not plumbed in epoch context don't get spurious failures.
+    //
+    // Runs only when the transaction submits at least one proposal,
+    // mirroring `processProposal`'s per-proposal invocation.
+    // -------------------------------------------------------------------
+    if params.protocol_version_major >= 9 && !tx.body.proposal_procedures.is_empty() {
+        let mut invalid_members: Vec<(String, u64)> = Vec::new();
+        for proposal in &tx.body.proposal_procedures {
+            invalid_members.extend(conway::committee_update_invalid_expiries(
+                proposal, &context,
+            ));
+        }
+        if !invalid_members.is_empty() {
+            extra_errors.push(ValidationError::ExpirationEpochTooSmall { invalid_members });
+        }
+    }
+
+    // -------------------------------------------------------------------
+    // MIR (Move Instantaneous Rewards) — Shelley–Babbage only.
+    //
+    // Each MIR certificate in `tx.body.certificates` is validated against
+    // the 7 predicates in `validation::mir`.  At PV >= 9 (Conway) the
+    // entry point is a no-op so the wiring layer also short-circuits to
+    // avoid an unnecessary scan of the cert vec.
+    //
+    // Reference: `eras/shelley/impl/src/Cardano/Ledger/Shelley/Rules/Deleg.hs`.
+    // -------------------------------------------------------------------
+    if params.protocol_version_major < 9 {
+        for cert in &tx.body.certificates {
+            if let Err(errs) = mir::validate_mir_cert(cert, params, current_slot, &context) {
+                extra_errors.extend(errs);
+            }
+        }
+    }
+
+    // -------------------------------------------------------------------
+    // PPUP — pre-Conway protocol-parameter update proposal.
+    //
+    // Active in Shelley–Babbage (`AtMostEra "Babbage" era`); Conway
+    // replaces this rule with on-chain governance.  The entry point is a
+    // no-op at PV >= 9 so the wiring layer also short-circuits to avoid
+    // touching `tx.body.update` at all in the Conway-only path.
+    //
+    // Reference: `eras/shelley/impl/src/Cardano/Ledger/Shelley/Rules/Ppup.hs`.
+    // -------------------------------------------------------------------
+    if params.protocol_version_major < 9 {
+        if let Err(errs) =
+            ppup::validate_ppup(tx.body.update.as_ref(), params, current_slot, &context)
+        {
+            extra_errors.extend(errs);
+        }
+    }
+
+    match (pools_result, extra_errors.is_empty()) {
+        (Ok(()), true) => Ok(()),
+        (Ok(()), false) => Err(extra_errors),
+        (Err(errs), true) => Err(errs),
+        (Err(mut errs), false) => {
+            errs.append(&mut extra_errors);
+            Err(errs)
+        }
+    }
 }
 
 /// Validate a transaction with an optional set of registered pools.
@@ -1154,28 +2284,45 @@ pub fn validate_transaction_with_pools(
         // now valid (used for DRep activity / reward account touching).
         if amount.0 == 0 && !conway_or_later {
             errors.push(ValidationError::ZeroWithdrawal {
-                account: account_hex.clone(),
+                account: account_hex,
             });
         }
-        if let Some(accounts) = reward_accounts {
-            let key = crate::state::LedgerState::reward_account_to_hash(reward_account_bytes);
-            match accounts.get(&key) {
-                Some(balance) => {
-                    if amount.0 != balance.0 {
-                        errors.push(ValidationError::IncorrectWithdrawalAmount {
-                            account: account_hex,
-                            declared: amount.0,
-                            actual: balance.0,
-                        });
-                    }
+    }
+
+    // ------------------------------------------------------------------
+    // Conway `WithdrawalsNotInRewardsCERTS` (PV ≤ 10) — split into
+    // `ConwayWithdrawalsMissingAccounts` + `ConwayIncompleteWithdrawals`
+    // for PV ≥ 11.
+    //
+    // Reference (PV ≤ 10): Haskell
+    //   `Cardano.Ledger.Conway.Rules.Certs.conwayCertsTransition` /
+    //   `withdrawalsThatDoNotDrainAccounts`.
+    // Reference (PV ≥ 11): Haskell
+    //   `Cardano.Ledger.Conway.Rules.Ledger.testIncompleteAndMissingWithdrawals`
+    //   after `hardforkConwayMoveWithdrawalsAndDRepChecksToLedgerRule`.
+    //
+    // Only enforced when both `node_network` and `reward_accounts` are
+    // available (block-application context).
+    // ------------------------------------------------------------------
+    if let (Some(net), Some(accounts)) = (node_network, reward_accounts) {
+        if let Some(split) = withdrawals::withdrawals_that_do_not_drain_accounts(
+            &tx.body.withdrawals,
+            net.to_u8(),
+            accounts,
+        ) {
+            if params.protocol_version_major <= 10 {
+                let mut bad = split.missing.clone();
+                bad.extend(split.incomplete.iter().map(|(a, v, _)| (a.clone(), *v)));
+                errors.push(ValidationError::WithdrawalsNotInRewardsCERTS { bad });
+            } else {
+                if !split.missing.is_empty() {
+                    errors.push(ValidationError::ConwayWithdrawalsMissingAccounts {
+                        missing: split.missing,
+                    });
                 }
-                None => {
-                    // Unregistered reward account — the withdrawal amount cannot
-                    // match any balance, so report as incorrect (actual = 0).
-                    errors.push(ValidationError::IncorrectWithdrawalAmount {
-                        account: account_hex,
-                        declared: amount.0,
-                        actual: 0,
+                if !split.incomplete.is_empty() {
+                    errors.push(ValidationError::ConwayIncompleteWithdrawals {
+                        incomplete: split.incomplete,
                     });
                 }
             }

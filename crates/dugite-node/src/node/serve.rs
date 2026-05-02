@@ -241,6 +241,57 @@ impl UtxoQueryProvider for LedgerUtxoProvider {
 
 // ─── LedgerTxValidator ───────────────────────────────────────────────────────
 
+/// Project the live `LedgerState`'s Conway governance fields into the shapes
+/// expected by [`dugite_ledger::validation::ValidationContext`]:
+///
+/// * `active_proposals`: every active on-chain governance proposal keyed by
+///   its `GovActionId`, carrying enough state for the cross-tx voting
+///   predicates (`DisallowedVoters`, `VotingOnExpiredGovAction`,
+///   `ProposalReturnAccountDoesNotExist`).
+/// * `committee_authorized_hot_keys`: the set of hot credentials that have
+///   been authorised by Constitutional Committee members.  Used by
+///   `VotersDoNotExist` to reject votes from a CC voter whose hot
+///   credential is unknown to the ledger.
+///
+/// Mirrors Haskell's `GovEnv` exposing both `proposals` and
+/// `authorizedHotCommitteeCredentials` to the GOV rule.
+fn build_governance_validation_state(
+    ledger: &LedgerState,
+) -> (
+    std::collections::HashMap<
+        dugite_primitives::transaction::GovActionId,
+        dugite_ledger::validation::ActiveProposal,
+    >,
+    std::collections::HashSet<dugite_primitives::hash::Hash32>,
+) {
+    let active_proposals = ledger
+        .gov
+        .governance
+        .proposals
+        .iter()
+        .map(|(id, state)| {
+            (
+                id.clone(),
+                dugite_ledger::validation::ActiveProposal {
+                    gov_action: state.procedure.gov_action.clone(),
+                    return_addr: state.procedure.return_addr.clone(),
+                    deposit: state.procedure.deposit,
+                    expires_after_epoch: state.expires_epoch,
+                    proposed_in_epoch: state.proposed_epoch,
+                },
+            )
+        })
+        .collect();
+    let committee_hot_keys = ledger
+        .gov
+        .governance
+        .committee_hot_keys
+        .values()
+        .copied()
+        .collect();
+    (active_proposals, committee_hot_keys)
+}
+
 /// Validates transactions against the live ledger state (Phase-1 + Phase-2 Plutus).
 ///
 /// When `mempool` is provided, validation uses a `CompositeUtxoView` that
@@ -284,25 +335,28 @@ impl TxValidator for LedgerTxValidator {
         let registered_pool_ids: std::collections::HashSet<dugite_primitives::hash::Hash28> =
             ledger.certs.pool_params.keys().copied().collect();
 
-        dugite_ledger::validation::validate_transaction_with_pools(
+        // Plumb the on-chain Conway governance state into the validator so the
+        // cross-tx voting predicates (`DisallowedVoters`, `VotersDoNotExist`,
+        // `VotingOnExpiredGovAction`) can reject votes against active on-chain
+        // proposals — not just proposals submitted in the same transaction.
+        //
+        // Mirrors Haskell's GovEnv exposing both `proposals` and
+        // `authorizedHotCommitteeCredentials` to the GOV rule.
+        let (active_proposals, committee_hot_keys) = build_governance_validation_state(&ledger);
+
+        let context = dugite_ledger::validation::ValidationContext::new()
+            .with_pools(registered_pool_ids)
+            .with_active_proposals(active_proposals)
+            .with_committee_authorized_hot_keys(committee_hot_keys);
+
+        dugite_ledger::validation::validate_transaction_with_context(
             &tx,
             &utxo_view,
             &ledger.epochs.protocol_params,
             current_slot,
             tx_size,
             Some(&self.slot_config),
-            Some(&registered_pool_ids),
-            None, // current_treasury
-            None, // reward_accounts
-            None, // current_epoch
-            None, // registered_dreps
-            None, // registered_vrf_keys
-            None, // node_network
-            None, // committee_members
-            None, // committee_resigned
-            None, // stake_key_deposits
-            None, // constitution_script_hash
-            None, // governance_proposals
+            context,
         )
         .map_err(|errors| {
             // Increment the rejection counter so the TUI and Prometheus show it.
@@ -466,14 +520,14 @@ pub(crate) fn convert_validation_error(
         VE::ZeroWithdrawal { account } => TxValidationError::ScriptFailed {
             reason: format!("Zero withdrawal amount for reward account: {account}"),
         },
-        VE::IncorrectWithdrawalAmount {
-            account,
-            declared,
-            actual,
-        } => TxValidationError::ScriptFailed {
-            reason: format!(
-                "Incorrect withdrawal amount for {account}: declared={declared}, actual={actual}"
-            ),
+        VE::WithdrawalsNotInRewardsCERTS { bad } => TxValidationError::ScriptFailed {
+            reason: format!("WithdrawalsNotInRewardsCERTS: {bad:?}"),
+        },
+        VE::ConwayWithdrawalsMissingAccounts { missing } => TxValidationError::ScriptFailed {
+            reason: format!("ConwayWithdrawalsMissingAccounts: {missing:?}"),
+        },
+        VE::ConwayIncompleteWithdrawals { incomplete } => TxValidationError::ScriptFailed {
+            reason: format!("ConwayIncompleteWithdrawals: {incomplete:?}"),
         },
         VE::PoolRetirementTooLate {
             retirement_epoch,
@@ -600,6 +654,45 @@ pub(crate) fn convert_validation_error(
         VE::MalformedProposal { reason } => TxValidationError::ScriptFailed {
             reason: format!("Governance proposal rejected: malformed PParamsUpdate ({reason})"),
         },
+        VE::DisallowedVoters { violations } => TxValidationError::ScriptFailed {
+            reason: format!("DisallowedVoters: {violations:?}"),
+        },
+        VE::VotersDoNotExist { voters } => TxValidationError::ScriptFailed {
+            reason: format!("VotersDoNotExist: {voters:?}"),
+        },
+        VE::VotingOnExpiredGovAction { expired_votes } => TxValidationError::ScriptFailed {
+            reason: format!("VotingOnExpiredGovAction: {expired_votes:?}"),
+        },
+        VE::ProposalReturnAccountDoesNotExist { bad_addrs } => TxValidationError::ScriptFailed {
+            reason: format!("ProposalReturnAccountDoesNotExist: {bad_addrs:?}"),
+        },
+        VE::ProposalProcedureNetworkIdMismatch {
+            expected,
+            mismatched,
+        } => TxValidationError::ScriptFailed {
+            reason: format!(
+                "ProposalProcedureNetworkIdMismatch: expected={expected}, mismatched={mismatched:?}"
+            ),
+        },
+        VE::TreasuryWithdrawalsNetworkIdMismatch {
+            expected,
+            mismatched,
+        } => TxValidationError::ScriptFailed {
+            reason: format!(
+                "TreasuryWithdrawalsNetworkIdMismatch: expected={expected}, mismatched={mismatched:?}"
+            ),
+        },
+        VE::ZeroTreasuryWithdrawals {
+            offending_proposals,
+        } => TxValidationError::ScriptFailed {
+            reason: format!("ZeroTreasuryWithdrawals: {offending_proposals:?}"),
+        },
+        VE::ConflictingCommitteeUpdate { conflicts } => TxValidationError::ScriptFailed {
+            reason: format!("ConflictingCommitteeUpdate: {conflicts:?}"),
+        },
+        VE::ExpirationEpochTooSmall { invalid_members } => TxValidationError::ScriptFailed {
+            reason: format!("ExpirationEpochTooSmall: {invalid_members:?}"),
+        },
         VE::ExtraRedeemer { tag, index } => TxValidationError::ScriptFailed {
             reason: format!(
                 "Extra redeemer with no matching script purpose: tag={tag}, index={index}"
@@ -610,6 +703,69 @@ pub(crate) fn convert_validation_error(
         },
         VE::ExtraneousScriptWitness { hashes } => TxValidationError::ScriptFailed {
             reason: format!("Extraneous script witness(es) not needed by transaction: {hashes:?}"),
+        },
+        VE::PoolMedataHashTooBig { pool, hash_size } => TxValidationError::ScriptFailed {
+            reason: format!("PoolMedataHashTooBig: pool={pool}, hash_size={hash_size}"),
+        },
+        VE::OutputBootAddrAttrsTooBig { oversized_outputs } => TxValidationError::ScriptFailed {
+            reason: format!("OutputBootAddrAttrsTooBig: {oversized_outputs:?}"),
+        },
+        VE::MIRCertificateTooLateInEpoch {
+            current_slot,
+            deadline,
+        } => TxValidationError::ScriptFailed {
+            reason: format!(
+                "MIRCertificateTooLateInEpoch: current_slot={current_slot}, deadline={deadline}"
+            ),
+        },
+        VE::InsufficientForInstantaneousRewards {
+            pot,
+            required,
+            available,
+        } => TxValidationError::ScriptFailed {
+            reason: format!(
+                "InsufficientForInstantaneousRewards: pot={pot:?}, required={required}, available={available}"
+            ),
+        },
+        VE::MIRTransferNotCurrentlyAllowed => TxValidationError::ScriptFailed {
+            reason: "MIRTransferNotCurrentlyAllowed (pre-Alonzo MIR pot-to-pot transfer)"
+                .to_string(),
+        },
+        VE::MIRNegativesNotCurrentlyAllowed => TxValidationError::ScriptFailed {
+            reason: "MIRNegativesNotCurrentlyAllowed (pre-Alonzo negative MIR delta)".to_string(),
+        },
+        VE::MIRProducesNegativeUpdate { credentials } => TxValidationError::ScriptFailed {
+            reason: format!("MIRProducesNegativeUpdate: credentials={credentials:?}"),
+        },
+        VE::InsufficientForTransferDELEG {
+            pot,
+            requested,
+            available,
+        } => TxValidationError::ScriptFailed {
+            reason: format!(
+                "InsufficientForTransferDELEG: pot={pot:?}, requested={requested}, available={available}"
+            ),
+        },
+        VE::MIRNegativeTransfer { pot, amount } => TxValidationError::ScriptFailed {
+            reason: format!("MIRNegativeTransfer: pot={pot:?}, amount={amount}"),
+        },
+        VE::NonGenesisUpdatePPUP { proposed, genesis } => TxValidationError::ScriptFailed {
+            reason: format!(
+                "NonGenesisUpdatePPUP: proposed_keys not subset of genesis_delegates \
+                 ({proposed:?} ∉ {genesis:?})"
+            ),
+        },
+        VE::PPUpdateWrongEpoch {
+            current,
+            target,
+            period,
+        } => TxValidationError::ScriptFailed {
+            reason: format!(
+                "PPUpdateWrongEpoch: current={current}, target={target}, period={period:?}"
+            ),
+        },
+        VE::PVCannotFollowPPUP { bad_pv } => TxValidationError::ScriptFailed {
+            reason: format!("PVCannotFollowPPUP: bad_pv={bad_pv:?}"),
         },
     }
 }
@@ -698,5 +854,87 @@ pub(crate) fn utxo_to_snapshot(
         multi_asset,
         datum_hash,
         raw_cbor: output.raw_cbor.clone(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use dugite_ledger::state::ProposalState;
+    use dugite_primitives::hash::Hash32;
+    use dugite_primitives::protocol_params::ProtocolParameters;
+    use dugite_primitives::time::EpochNo;
+    use dugite_primitives::transaction::{Anchor, GovAction, GovActionId, ProposalProcedure};
+    use dugite_primitives::value::Lovelace;
+
+    /// Verifies that `build_governance_validation_state` projects the live
+    /// `LedgerState` Conway governance fields into the shapes expected by
+    /// `ValidationContext`.  This is the production wiring used by the N2C
+    /// tx-submission path; getting the projection wrong would silently
+    /// disable the cross-tx voting predicates (`DisallowedVoters` etc.).
+    #[test]
+    fn build_governance_validation_state_projects_proposals_and_hot_keys() {
+        let mut ledger = LedgerState::new(ProtocolParameters::mainnet_defaults());
+
+        // Seed one active proposal and one committee hot-key authorisation.
+        let action_id = GovActionId {
+            transaction_id: Hash32::from_bytes([0xAA; 32]),
+            action_index: 7,
+        };
+        let proposal_state = ProposalState {
+            procedure: ProposalProcedure {
+                deposit: Lovelace(123_456_789),
+                return_addr: vec![0xe0; 29],
+                gov_action: GovAction::InfoAction,
+                anchor: Anchor {
+                    url: String::new(),
+                    data_hash: Hash32::ZERO,
+                },
+            },
+            proposed_epoch: EpochNo(40),
+            expires_epoch: EpochNo(50),
+            yes_votes: 0,
+            no_votes: 0,
+            abstain_votes: 0,
+        };
+        let cold_cred = Hash32::from_bytes([0xC0; 32]);
+        let hot_cred = Hash32::from_bytes([0x77; 32]);
+
+        {
+            let gov = Arc::make_mut(&mut ledger.gov.governance);
+            gov.proposals.insert(action_id.clone(), proposal_state);
+            gov.committee_hot_keys.insert(cold_cred, hot_cred);
+        }
+
+        let (active, hot_keys) = build_governance_validation_state(&ledger);
+
+        // Proposal projection: every ActiveProposal field must mirror the
+        // ProposalState/ProposalProcedure source.
+        assert_eq!(active.len(), 1);
+        let ap = active.get(&action_id).expect("proposal must be projected");
+        assert!(matches!(ap.gov_action, GovAction::InfoAction));
+        assert_eq!(ap.return_addr, vec![0xe0; 29]);
+        assert_eq!(ap.deposit.0, 123_456_789);
+        assert_eq!(ap.expires_after_epoch.0, 50);
+        assert_eq!(ap.proposed_in_epoch.0, 40);
+
+        // Committee hot-key projection: only the values (hot creds), not
+        // the cold-cred keys, are exposed to the validator (matches
+        // Haskell `authorizedHotCommitteeCredentials`).
+        assert_eq!(hot_keys.len(), 1);
+        assert!(hot_keys.contains(&hot_cred));
+        assert!(!hot_keys.contains(&cold_cred));
+    }
+
+    /// On a freshly-constructed `LedgerState` (no on-chain proposals or
+    /// committee authorisations) the projection must yield empty maps —
+    /// i.e. the cross-tx predicates default to no-op, matching the
+    /// pre-task behaviour for chains that haven't entered Conway.
+    #[test]
+    fn build_governance_validation_state_empty_for_fresh_ledger() {
+        let ledger = LedgerState::new(ProtocolParameters::mainnet_defaults());
+        let (active, hot_keys) = build_governance_validation_state(&ledger);
+        assert!(active.is_empty());
+        assert!(hot_keys.is_empty());
     }
 }

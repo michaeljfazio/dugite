@@ -12452,4 +12452,1722 @@ mod tests {
             );
         }
     }
+
+    // -------------------------------------------------------------------------
+    // DisallowedVoters integration tests for `validate_transaction_with_context`
+    //
+    // These tests exercise the wiring path end-to-end: a Conway transaction
+    // contains votes that target either a locally-submitted proposal (same tx)
+    // or an active on-chain proposal (`context.active_proposals`), and the
+    // validator must surface a single aggregated `DisallowedVoters` error
+    // whose `violations` vec carries every (Voter, GovActionId) pair that
+    // breaks the authority matrix.
+    // -------------------------------------------------------------------------
+
+    use std::collections::HashMap;
+
+    use super::super::{validate_transaction_with_context, ActiveProposal, ValidationContext};
+    use dugite_primitives::time::EpochNo;
+
+    /// Build a Conway-era pv=10 ProtocolParameters for the integration tests.
+    /// Uses post-bootstrap so the predicate is exercised on the live path.
+    fn conway_pparams_pv10() -> ProtocolParameters {
+        let mut p = ProtocolParameters::mainnet_defaults();
+        p.protocol_version_major = 10;
+        p
+    }
+
+    /// Build a Conway transaction whose body contains the given proposals and
+    /// voting procedures but no inputs/outputs. This deliberately produces a
+    /// `NoInputs` Phase-1 error so the predicate is exercised even if the
+    /// caller's UTxO set is empty — we filter for `DisallowedVoters` only.
+    fn make_gov_tx(
+        proposals: Vec<ProposalProcedure>,
+        voting_procedures: BTreeMap<Voter, BTreeMap<GovActionId, VotingProcedure>>,
+    ) -> Transaction {
+        Transaction {
+            era: dugite_primitives::era::Era::Conway,
+            hash: Hash32::from_bytes([0xAB; 32]),
+            body: TransactionBody {
+                inputs: vec![],
+                outputs: vec![],
+                fee: Lovelace(0),
+                ttl: None,
+                certificates: vec![],
+                withdrawals: BTreeMap::new(),
+                auxiliary_data_hash: None,
+                validity_interval_start: None,
+                mint: BTreeMap::new(),
+                script_data_hash: None,
+                collateral: vec![],
+                required_signers: vec![],
+                network_id: None,
+                collateral_return: None,
+                total_collateral: None,
+                reference_inputs: vec![],
+                update: None,
+                voting_procedures,
+                proposal_procedures: proposals,
+                treasury_value: None,
+                donation: None,
+            },
+            witness_set: TransactionWitnessSet {
+                vkey_witnesses: vec![],
+                native_scripts: vec![],
+                bootstrap_witnesses: vec![],
+                plutus_v1_scripts: vec![],
+                plutus_v2_scripts: vec![],
+                plutus_v3_scripts: vec![],
+                plutus_data: vec![],
+                redeemers: vec![],
+                raw_redeemers_cbor: None,
+                raw_plutus_data_cbor: None,
+                pallas_script_data_hash: None,
+            },
+            is_valid: true,
+            auxiliary_data: None,
+            raw_cbor: None,
+            raw_body_cbor: None,
+            raw_witness_cbor: None,
+        }
+    }
+
+    fn anchor_stub() -> Anchor {
+        Anchor {
+            url: String::new(),
+            data_hash: Hash32::from_bytes([0u8; 32]),
+        }
+    }
+
+    fn new_constitution_action() -> GovAction {
+        GovAction::NewConstitution {
+            prev_action_id: None,
+            constitution: Constitution {
+                anchor: anchor_stub(),
+                script_hash: None,
+            },
+        }
+    }
+
+    fn new_constitution_proposal() -> ProposalProcedure {
+        ProposalProcedure {
+            deposit: Lovelace(1_000_000_000),
+            return_addr: vec![0xe0; 29],
+            gov_action: new_constitution_action(),
+            anchor: anchor_stub(),
+        }
+    }
+
+    fn spo_voter_for_test() -> Voter {
+        Voter::StakePool(Hash32::from_bytes([0x55; 32]))
+    }
+
+    fn yes_vote() -> VotingProcedure {
+        VotingProcedure {
+            vote: Vote::Yes,
+            anchor: None,
+        }
+    }
+
+    /// Test 1: SPO votes Yes on a `NewConstitution` proposal submitted in the
+    /// SAME transaction. The validator must surface a `DisallowedVoters`
+    /// error with exactly one (Voter::StakePool, GovActionId) violation.
+    #[test]
+    fn test_validate_transaction_rejects_spo_voting_on_local_new_constitution() {
+        let params = conway_pparams_pv10();
+        let utxo_set = UtxoSet::new();
+
+        // The validator computes per-tx GovActionIds as (tx.hash, idx).
+        // `make_gov_tx` always sets `tx.hash = [0xAB; 32]`, so we can pin the
+        // expected action_id up front.
+        let action_id = GovActionId {
+            transaction_id: Hash32::from_bytes([0xAB; 32]),
+            action_index: 0,
+        };
+        let mut votes = BTreeMap::new();
+        votes.insert(action_id.clone(), yes_vote());
+        let mut voting_procedures = BTreeMap::new();
+        voting_procedures.insert(spo_voter_for_test(), votes);
+
+        let tx = make_gov_tx(vec![new_constitution_proposal()], voting_procedures);
+        debug_assert_eq!(
+            tx.hash, action_id.transaction_id,
+            "make_gov_tx must use the action_id's transaction_id"
+        );
+
+        let context = ValidationContext::new();
+        let result =
+            validate_transaction_with_context(&tx, &utxo_set, &params, 100, 500, None, context);
+
+        let errors = result.expect_err("expected DisallowedVoters predicate to fire");
+        let dv = errors
+            .iter()
+            .find_map(|e| match e {
+                ValidationError::DisallowedVoters { violations } => Some(violations),
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("DisallowedVoters not in error set: {errors:?}"));
+        assert_eq!(
+            dv.len(),
+            1,
+            "expected exactly one (voter, action_id) violation, got: {dv:?}"
+        );
+        let (voter, vid) = &dv[0];
+        assert!(
+            matches!(voter, Voter::StakePool(_)),
+            "voter must be StakePool, got: {voter:?}"
+        );
+        assert_eq!(
+            vid, &action_id,
+            "violation action_id must match the local proposal"
+        );
+    }
+
+    /// Test 2: SPO votes on a `NewConstitution` proposal already on-chain
+    /// (passed via `context.active_proposals`). Must produce
+    /// `DisallowedVoters` with the corresponding active GovActionId.
+    #[test]
+    fn test_validate_transaction_rejects_spo_voting_on_active_proposal() {
+        let params = conway_pparams_pv10();
+        let utxo_set = UtxoSet::new();
+
+        // Active proposal lives in context, not in the tx body.
+        let active_id = GovActionId {
+            transaction_id: Hash32::from_bytes([0x77; 32]),
+            action_index: 3,
+        };
+        let active_proposal = ActiveProposal {
+            gov_action: new_constitution_action(),
+            return_addr: vec![0xe0; 29],
+            deposit: Lovelace(1_000_000_000),
+            expires_after_epoch: EpochNo(500),
+            proposed_in_epoch: EpochNo(490),
+        };
+
+        let mut active_proposals: HashMap<GovActionId, ActiveProposal> = HashMap::new();
+        active_proposals.insert(active_id.clone(), active_proposal);
+
+        let mut votes = BTreeMap::new();
+        votes.insert(active_id.clone(), yes_vote());
+        let mut voting_procedures = BTreeMap::new();
+        voting_procedures.insert(spo_voter_for_test(), votes);
+
+        let tx = make_gov_tx(vec![], voting_procedures);
+
+        let context = ValidationContext::new().with_active_proposals(active_proposals);
+        let result =
+            validate_transaction_with_context(&tx, &utxo_set, &params, 100, 500, None, context);
+
+        let errors = result.expect_err("expected DisallowedVoters predicate to fire");
+        let dv = errors
+            .iter()
+            .find_map(|e| match e {
+                ValidationError::DisallowedVoters { violations } => Some(violations),
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("DisallowedVoters not in error set: {errors:?}"));
+        assert_eq!(dv.len(), 1, "expected exactly one violation, got: {dv:?}");
+        let (voter, vid) = &dv[0];
+        assert!(
+            matches!(voter, Voter::StakePool(_)),
+            "voter must be StakePool, got: {voter:?}"
+        );
+        assert_eq!(
+            vid, &active_id,
+            "violation action_id must match the active proposal id"
+        );
+    }
+
+    /// Test 3: Voter targets a GovActionId that exists in NEITHER the local
+    /// proposals nor `active_proposals`. The unknown-action case is handled
+    /// by `GovActionsDoNotExist` (a different predicate, out of scope for
+    /// this task). `DisallowedVoters` must not fire.
+    #[test]
+    fn test_validate_transaction_skips_unknown_gov_action() {
+        let params = conway_pparams_pv10();
+        let utxo_set = UtxoSet::new();
+
+        let unknown_id = GovActionId {
+            transaction_id: Hash32::from_bytes([0xEE; 32]),
+            action_index: 0,
+        };
+        let mut votes = BTreeMap::new();
+        votes.insert(unknown_id, yes_vote());
+        let mut voting_procedures = BTreeMap::new();
+        // Even an SPO voting Yes on an unknown action must not trigger
+        // DisallowedVoters here — the action's type is unknown to this rule.
+        voting_procedures.insert(spo_voter_for_test(), votes);
+
+        let tx = make_gov_tx(vec![], voting_procedures);
+
+        let context = ValidationContext::new();
+        let result =
+            validate_transaction_with_context(&tx, &utxo_set, &params, 100, 500, None, context);
+
+        // The tx will fail Phase-1 (NoInputs etc.) but DisallowedVoters must
+        // not be among the errors.
+        if let Err(errors) = result {
+            assert!(
+                !errors
+                    .iter()
+                    .any(|e| matches!(e, ValidationError::DisallowedVoters { .. })),
+                "DisallowedVoters must not fire for unknown gov action; got: {errors:?}"
+            );
+        }
+    }
+
+    // -------------------------------------------------------------------------
+    // VotersDoNotExist integration tests for `validate_transaction_with_context`
+    //
+    // These tests exercise the wiring path end-to-end: a Conway transaction
+    // contains votes from a DRep / SPO / committee voter whose credential is
+    // NOT registered in the corresponding registry, and the validator must
+    // surface a `VotersDoNotExist` error aggregating every unknown voter.
+    //
+    // Critical ordering property: VotersDoNotExist takes precedence over
+    // DisallowedVoters — when a voter is unknown, it must NOT also appear in
+    // a DisallowedVoters error (Haskell `internVoter` partitions unknowns out
+    // before the authority check).
+    // -------------------------------------------------------------------------
+
+    fn drep_voter_for_test() -> Voter {
+        use dugite_primitives::credentials::Credential;
+        Voter::DRep(Credential::VerificationKey(Hash28::from_bytes([0xDD; 28])))
+    }
+
+    fn info_proposal() -> ProposalProcedure {
+        ProposalProcedure {
+            deposit: Lovelace(1_000_000_000),
+            return_addr: vec![0xe0; 29],
+            gov_action: GovAction::InfoAction,
+            anchor: anchor_stub(),
+        }
+    }
+
+    /// Test 1: A DRep votes on an InfoAction proposal in the same tx, but the
+    /// DRep's credential is not in `registered_dreps`. Expect
+    /// `VotersDoNotExist` whose `voters` list contains exactly that DRep.
+    /// (InfoAction is used so `DisallowedVoters` cannot fire for any voter
+    /// type, isolating the VotersDoNotExist wiring.)
+    #[test]
+    fn test_validate_transaction_rejects_vote_from_unregistered_drep() {
+        let params = conway_pparams_pv10();
+        let utxo_set = UtxoSet::new();
+
+        let action_id = GovActionId {
+            transaction_id: Hash32::from_bytes([0xAB; 32]),
+            action_index: 0,
+        };
+        let mut votes = BTreeMap::new();
+        votes.insert(action_id.clone(), yes_vote());
+        let mut voting_procedures = BTreeMap::new();
+        voting_procedures.insert(drep_voter_for_test(), votes);
+
+        let tx = make_gov_tx(vec![info_proposal()], voting_procedures);
+
+        // Empty registered_dreps — the voter's credential is not registered.
+        let context = ValidationContext::new().with_dreps(HashSet::new());
+        let result =
+            validate_transaction_with_context(&tx, &utxo_set, &params, 100, 500, None, context);
+
+        let errors = result.expect_err("expected VotersDoNotExist predicate to fire");
+        let unknown_voters = errors
+            .iter()
+            .find_map(|e| match e {
+                ValidationError::VotersDoNotExist { voters } => Some(voters),
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("VotersDoNotExist not in error set: {errors:?}"));
+        assert_eq!(
+            unknown_voters.len(),
+            1,
+            "expected exactly one unknown voter, got: {unknown_voters:?}"
+        );
+        assert!(
+            matches!(&unknown_voters[0], Voter::DRep(_)),
+            "unknown voter must be a DRep, got: {:?}",
+            unknown_voters[0]
+        );
+    }
+
+    /// Test 2: An SPO votes Yes on a `NewConstitution` proposal AND the SPO is
+    /// not in `registered_pools`. Two predicates could fire here:
+    ///   - VotersDoNotExist (pool unregistered)
+    ///   - DisallowedVoters (SPO not allowed on NewConstitution)
+    ///
+    /// Per Haskell `internVoter`, only `VotersDoNotExist` must fire because
+    /// unknown voters are partitioned out before the authority check runs.
+    #[test]
+    fn test_validate_transaction_voters_do_not_exist_takes_precedence_over_disallowed_voters() {
+        let params = conway_pparams_pv10();
+        let utxo_set = UtxoSet::new();
+
+        let action_id = GovActionId {
+            transaction_id: Hash32::from_bytes([0xAB; 32]),
+            action_index: 0,
+        };
+        let mut votes = BTreeMap::new();
+        votes.insert(action_id.clone(), yes_vote());
+        let mut voting_procedures = BTreeMap::new();
+        // SPO is forbidden on NewConstitution AND unregistered.
+        voting_procedures.insert(spo_voter_for_test(), votes);
+
+        let tx = make_gov_tx(vec![new_constitution_proposal()], voting_procedures);
+
+        // Empty registered_pools — the SPO is not registered.  Per
+        // `is_voter_unknown`'s lenient default, an absent (None) registry is
+        // treated as "voter known", so we MUST pass an empty set explicitly to
+        // exercise the unknown branch.
+        let context = ValidationContext::new().with_pools(HashSet::new());
+        let result =
+            validate_transaction_with_context(&tx, &utxo_set, &params, 100, 500, None, context);
+
+        let errors = result.expect_err("expected VotersDoNotExist predicate to fire");
+
+        // VotersDoNotExist must fire and contain the SPO.
+        let unknown_voters = errors
+            .iter()
+            .find_map(|e| match e {
+                ValidationError::VotersDoNotExist { voters } => Some(voters),
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("VotersDoNotExist not in error set: {errors:?}"));
+        assert!(
+            unknown_voters
+                .iter()
+                .any(|v| matches!(v, Voter::StakePool(_))),
+            "VotersDoNotExist must contain the unregistered SPO, got: {unknown_voters:?}"
+        );
+
+        // DisallowedVoters must NOT fire for this voter — Haskell partitions
+        // unknown voters out before the authority check.  No DisallowedVoters
+        // error should be present at all (the SPO is the only voter).
+        assert!(
+            !errors
+                .iter()
+                .any(|e| matches!(e, ValidationError::DisallowedVoters { .. })),
+            "DisallowedVoters must not fire when the only voter is already \
+             reported under VotersDoNotExist; got: {errors:?}"
+        );
+    }
+
+    /// Test 3: At PV=8 (pre-Conway), the VotersDoNotExist check is gated off,
+    /// so even an unregistered DRep voting must not produce VotersDoNotExist.
+    /// (The era-gating layer surfaces a separate `GovernancePreConway` error
+    /// for the same input, but that's not what we're testing here.)
+    #[test]
+    fn test_validate_transaction_skips_voter_check_when_pv_below_9() {
+        let mut params = ProtocolParameters::mainnet_defaults();
+        params.protocol_version_major = 8;
+        let utxo_set = UtxoSet::new();
+
+        let action_id = GovActionId {
+            transaction_id: Hash32::from_bytes([0xAB; 32]),
+            action_index: 0,
+        };
+        let mut votes = BTreeMap::new();
+        votes.insert(action_id, yes_vote());
+        let mut voting_procedures = BTreeMap::new();
+        voting_procedures.insert(drep_voter_for_test(), votes);
+
+        let tx = make_gov_tx(vec![info_proposal()], voting_procedures);
+
+        let context = ValidationContext::new().with_dreps(HashSet::new());
+        let result =
+            validate_transaction_with_context(&tx, &utxo_set, &params, 100, 500, None, context);
+
+        // The tx will fail Phase-1 (NoInputs, GovernancePreConway, etc.) but
+        // VotersDoNotExist must not fire at PV=8.
+        if let Err(errors) = result {
+            assert!(
+                !errors
+                    .iter()
+                    .any(|e| matches!(e, ValidationError::VotersDoNotExist { .. })),
+                "VotersDoNotExist must not fire pre-Conway; got: {errors:?}"
+            );
+        }
+    }
+
+    // -------------------------------------------------------------------------
+    // VotingOnExpiredGovAction integration tests for `validate_transaction_with_context`
+    //
+    // Per Haskell `checkVotesAreNotForExpiredActions` in
+    // `Cardano.Ledger.Conway.Rules.Gov`, votes against an action whose
+    // `gasExpiresAfter` is strictly less than the current epoch are rejected.
+    // Boundary case (`current_epoch == gasExpiresAfter`) is allowed.
+    //
+    // Same-tx proposals are skipped because they were just submitted and
+    // cannot be expired.  Precedence: VotersDoNotExist > VotingOnExpiredGovAction.
+    // -------------------------------------------------------------------------
+
+    /// A registered DRep votes Yes on an active on-chain InfoAction proposal
+    /// whose `expires_after_epoch < current_epoch`.  The validator must
+    /// surface a `VotingOnExpiredGovAction` error with one entry for the
+    /// (voter, action_id, expires_after, current_epoch) tuple.
+    #[test]
+    fn test_validate_transaction_rejects_vote_on_expired_action() {
+        let params = conway_pparams_pv10();
+        let utxo_set = UtxoSet::new();
+
+        let active_id = GovActionId {
+            transaction_id: Hash32::from_bytes([0x77; 32]),
+            action_index: 0,
+        };
+        let active_proposal = ActiveProposal {
+            gov_action: GovAction::InfoAction,
+            return_addr: vec![0xe0; 29],
+            deposit: Lovelace(1_000_000_000),
+            expires_after_epoch: EpochNo(10),
+            proposed_in_epoch: EpochNo(4),
+        };
+        let mut active_proposals: HashMap<GovActionId, ActiveProposal> = HashMap::new();
+        active_proposals.insert(active_id.clone(), active_proposal);
+
+        // DRep voter (registered) votes on the expired action.
+        let drep_voter = drep_voter_for_test();
+        let drep_credential_hash = match &drep_voter {
+            Voter::DRep(cred) => cred.to_hash().to_hash32_padded(),
+            _ => unreachable!("drep_voter_for_test returns Voter::DRep"),
+        };
+        let mut registered_dreps: HashSet<Hash32> = HashSet::new();
+        registered_dreps.insert(drep_credential_hash);
+
+        let mut votes = BTreeMap::new();
+        votes.insert(active_id.clone(), yes_vote());
+        let mut voting_procedures = BTreeMap::new();
+        voting_procedures.insert(drep_voter, votes);
+
+        let tx = make_gov_tx(vec![], voting_procedures);
+
+        // current_epoch = 20, expires_after = 10 -> rejected.
+        let context = ValidationContext::new()
+            .with_active_proposals(active_proposals)
+            .with_dreps(registered_dreps)
+            .with_epoch(20);
+        let result =
+            validate_transaction_with_context(&tx, &utxo_set, &params, 100, 500, None, context);
+
+        let errors = result.expect_err("expected VotingOnExpiredGovAction predicate to fire");
+        let expired = errors
+            .iter()
+            .find_map(|e| match e {
+                ValidationError::VotingOnExpiredGovAction { expired_votes } => Some(expired_votes),
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("VotingOnExpiredGovAction not in error set: {errors:?}"));
+        assert_eq!(
+            expired.len(),
+            1,
+            "expected exactly one expired-vote tuple, got: {expired:?}"
+        );
+        let (voter, vid, expires_after, current_epoch) = &expired[0];
+        assert!(
+            matches!(voter, Voter::DRep(_)),
+            "voter must be DRep, got: {voter:?}"
+        );
+        assert_eq!(vid, &active_id, "action id must match active proposal");
+        assert_eq!(*expires_after, 10, "expires_after must be from proposal");
+        assert_eq!(*current_epoch, 20, "current_epoch must be from context");
+    }
+
+    /// A registered DRep votes Yes on a proposal submitted in the SAME tx.
+    /// Same-tx proposals are always considered current (they were just
+    /// submitted), so `VotingOnExpiredGovAction` must NOT fire — even though
+    /// the active-proposals map (irrelevant in this case) and a generous
+    /// `current_epoch` would otherwise put it in the past.
+    #[test]
+    fn test_validate_transaction_skips_expiry_check_for_same_tx_proposal() {
+        let params = conway_pparams_pv10();
+        let utxo_set = UtxoSet::new();
+
+        // Local proposal — id is (tx.hash, 0).
+        let local_id = GovActionId {
+            transaction_id: Hash32::from_bytes([0xAB; 32]),
+            action_index: 0,
+        };
+
+        // DRep voter (registered) votes on the local proposal.
+        let drep_voter = drep_voter_for_test();
+        let drep_credential_hash = match &drep_voter {
+            Voter::DRep(cred) => cred.to_hash().to_hash32_padded(),
+            _ => unreachable!("drep_voter_for_test returns Voter::DRep"),
+        };
+        let mut registered_dreps: HashSet<Hash32> = HashSet::new();
+        registered_dreps.insert(drep_credential_hash);
+
+        let mut votes = BTreeMap::new();
+        votes.insert(local_id.clone(), yes_vote());
+        let mut voting_procedures = BTreeMap::new();
+        voting_procedures.insert(drep_voter, votes);
+
+        let tx = make_gov_tx(vec![info_proposal()], voting_procedures);
+        debug_assert_eq!(
+            tx.hash, local_id.transaction_id,
+            "make_gov_tx must use the local action_id's transaction_id"
+        );
+
+        // current_epoch = 9999 — would obviously be past any expiry, but the
+        // local-proposal branch must be skipped entirely.  An empty
+        // active_proposals map is provided so the predicate's wiring runs.
+        let active_proposals: HashMap<GovActionId, ActiveProposal> = HashMap::new();
+        let context = ValidationContext::new()
+            .with_active_proposals(active_proposals)
+            .with_dreps(registered_dreps)
+            .with_epoch(9999);
+        let result =
+            validate_transaction_with_context(&tx, &utxo_set, &params, 100, 500, None, context);
+
+        // The tx will fail Phase-1 (NoInputs etc.) but
+        // VotingOnExpiredGovAction must not be among the errors.
+        if let Err(errors) = result {
+            assert!(
+                !errors
+                    .iter()
+                    .any(|e| matches!(e, ValidationError::VotingOnExpiredGovAction { .. })),
+                "VotingOnExpiredGovAction must not fire for same-tx proposal; got: {errors:?}"
+            );
+        }
+    }
+
+    /// An UNREGISTERED DRep votes on an expired active proposal.  Two
+    /// predicates could fire here (VotersDoNotExist and
+    /// VotingOnExpiredGovAction).  Per the precedence chain, only
+    /// `VotersDoNotExist` must fire; `VotingOnExpiredGovAction` must NOT
+    /// fire for the same voter (Haskell partitions unknown voters out
+    /// before any further per-voter check).
+    #[test]
+    fn test_validate_transaction_voters_do_not_exist_takes_precedence_over_voting_on_expired() {
+        let params = conway_pparams_pv10();
+        let utxo_set = UtxoSet::new();
+
+        // Active on-chain proposal that has expired.
+        let active_id = GovActionId {
+            transaction_id: Hash32::from_bytes([0x77; 32]),
+            action_index: 0,
+        };
+        let active_proposal = ActiveProposal {
+            gov_action: GovAction::InfoAction,
+            return_addr: vec![0xe0; 29],
+            deposit: Lovelace(1_000_000_000),
+            expires_after_epoch: EpochNo(10),
+            proposed_in_epoch: EpochNo(4),
+        };
+        let mut active_proposals: HashMap<GovActionId, ActiveProposal> = HashMap::new();
+        active_proposals.insert(active_id.clone(), active_proposal);
+
+        // DRep voter is NOT in registered_dreps.
+        let drep_voter = drep_voter_for_test();
+        let mut votes = BTreeMap::new();
+        votes.insert(active_id.clone(), yes_vote());
+        let mut voting_procedures = BTreeMap::new();
+        voting_procedures.insert(drep_voter, votes);
+
+        let tx = make_gov_tx(vec![], voting_procedures);
+
+        // current_epoch=20 with expires_after=10 would make
+        // VotingOnExpiredGovAction fire, but the unregistered DRep must be
+        // partitioned out first.  Empty registered_dreps explicitly enables
+        // the unknown-voter branch (None defaults to "treat as known").
+        let context = ValidationContext::new()
+            .with_active_proposals(active_proposals)
+            .with_dreps(HashSet::new())
+            .with_epoch(20);
+        let result =
+            validate_transaction_with_context(&tx, &utxo_set, &params, 100, 500, None, context);
+
+        let errors = result.expect_err("expected VotersDoNotExist predicate to fire");
+
+        // Direction 1: VotersDoNotExist DOES fire and contains the DRep voter.
+        let unknown_voters = errors
+            .iter()
+            .find_map(|e| match e {
+                ValidationError::VotersDoNotExist { voters } => Some(voters),
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("VotersDoNotExist not in error set: {errors:?}"));
+        assert!(
+            unknown_voters.iter().any(|v| matches!(v, Voter::DRep(_))),
+            "VotersDoNotExist must contain the unregistered DRep, got: {unknown_voters:?}"
+        );
+
+        // Direction 2: VotingOnExpiredGovAction must NOT fire for the
+        // same voter — Haskell partitions unknown voters out before further
+        // per-voter checks.
+        assert!(
+            !errors
+                .iter()
+                .any(|e| matches!(e, ValidationError::VotingOnExpiredGovAction { .. })),
+            "VotingOnExpiredGovAction must not fire when the only voter is already \
+             reported under VotersDoNotExist; got: {errors:?}"
+        );
+    }
+
+    // -------------------------------------------------------------------------
+    // ProposalReturnAccountDoesNotExist integration tests for
+    // `validate_transaction_with_context`
+    //
+    // Per Haskell `processProposal` in `Cardano.Ledger.Conway.Rules.Gov`, every
+    // proposal procedure's `pProcReturnAddr` credential must be registered.
+    // The check is **skipped during Conway bootstrap** (`pvMajor == 9`) and
+    // runs from PV >= 10 onwards.  The lenient default (`reward_accounts =
+    // None`) skips the check.
+    // -------------------------------------------------------------------------
+
+    /// Build a 29-byte reward address (header `0xe0` for key-credential) over
+    /// the given 28-byte credential hash.  Mirrors the helper in conway.rs's
+    /// unit-test module so the integration tests speak the same shape.
+    fn return_addr_29_key(cred_byte: u8) -> Vec<u8> {
+        let mut bytes = Vec::with_capacity(29);
+        bytes.push(0xe0);
+        bytes.extend_from_slice(&[cred_byte; 28]);
+        bytes
+    }
+
+    /// Build an InfoAction proposal procedure with the given return_addr
+    /// bytes.  InfoAction is used so no DisallowedVoters / authority check
+    /// can interfere with the test.
+    fn info_proposal_with_return_addr(return_addr: Vec<u8>) -> ProposalProcedure {
+        ProposalProcedure {
+            deposit: Lovelace(1_000_000_000),
+            return_addr,
+            gov_action: GovAction::InfoAction,
+            anchor: Anchor {
+                url: String::new(),
+                data_hash: Hash32::from_bytes([0u8; 32]),
+            },
+        }
+    }
+
+    /// A Conway PV=10 transaction submits a proposal whose return_addr
+    /// credential is not in `reward_accounts`.  The validator must surface
+    /// a `ProposalReturnAccountDoesNotExist` error whose `bad_addrs` payload
+    /// contains the proposal's hex-encoded return address.
+    #[test]
+    fn test_validate_transaction_rejects_proposal_with_unregistered_return_addr_post_bootstrap() {
+        let params = conway_pparams_pv10();
+        let utxo_set = UtxoSet::new();
+
+        let proposal = info_proposal_with_return_addr(return_addr_29_key(0x88));
+        let expected_hex: String = proposal.return_addr.iter().fold(String::new(), |mut s, b| {
+            use std::fmt::Write;
+            let _ = write!(s, "{b:02x}");
+            s
+        });
+        let tx = make_gov_tx(vec![proposal], BTreeMap::new());
+
+        // Reward-accounts map carries an unrelated credential; the proposal's
+        // [0x88; 28] credential is definitely not registered.
+        let mut accounts: HashMap<Hash32, Lovelace> = HashMap::new();
+        accounts.insert(
+            Hash28::from_bytes([0x11; 28]).to_hash32_padded(),
+            Lovelace(0),
+        );
+        let context = ValidationContext::new().with_reward_accounts(accounts);
+        let result =
+            validate_transaction_with_context(&tx, &utxo_set, &params, 100, 500, None, context);
+
+        let errors =
+            result.expect_err("expected ProposalReturnAccountDoesNotExist predicate to fire");
+        let bad_addrs = errors
+            .iter()
+            .find_map(|e| match e {
+                ValidationError::ProposalReturnAccountDoesNotExist { bad_addrs } => Some(bad_addrs),
+                _ => None,
+            })
+            .unwrap_or_else(|| {
+                panic!("ProposalReturnAccountDoesNotExist not in error set: {errors:?}")
+            });
+        assert_eq!(
+            bad_addrs.len(),
+            1,
+            "expected exactly one bad return-addr, got: {bad_addrs:?}"
+        );
+        assert_eq!(
+            bad_addrs[0], expected_hex,
+            "bad_addrs payload must be the proposal's hex-encoded return_addr"
+        );
+    }
+
+    /// At PV=9 (Conway bootstrap), the predicate is skipped, so a proposal
+    /// whose return_addr credential is unregistered must NOT produce
+    /// `ProposalReturnAccountDoesNotExist`.  The Phase-1 layer is still
+    /// expected to reject the tx (NoInputs etc.), but the GOV-bootstrap
+    /// predicate must be quiet.
+    #[test]
+    fn test_validate_transaction_skips_proposal_return_addr_check_in_bootstrap() {
+        let mut params = ProtocolParameters::mainnet_defaults();
+        params.protocol_version_major = 9; // Conway bootstrap.
+        let utxo_set = UtxoSet::new();
+
+        let proposal = info_proposal_with_return_addr(return_addr_29_key(0x88));
+        let tx = make_gov_tx(vec![proposal], BTreeMap::new());
+
+        // Empty reward-accounts — the credential is unregistered, but the
+        // bootstrap-phase skip must short-circuit the check.
+        let context = ValidationContext::new().with_reward_accounts(HashMap::new());
+        let result =
+            validate_transaction_with_context(&tx, &utxo_set, &params, 100, 500, None, context);
+
+        if let Err(errors) = result {
+            assert!(
+                !errors.iter().any(|e| matches!(
+                    e,
+                    ValidationError::ProposalReturnAccountDoesNotExist { .. }
+                )),
+                "ProposalReturnAccountDoesNotExist must not fire at PV=9 (bootstrap); \
+                 got: {errors:?}"
+            );
+        }
+    }
+
+    /// At PV=10 with a properly registered return-addr credential, the
+    /// predicate must NOT produce `ProposalReturnAccountDoesNotExist`.
+    /// Other Phase-1 errors (NoInputs etc.) may still be present — we only
+    /// assert this specific predicate is absent.
+    #[test]
+    fn test_validate_transaction_proposal_with_registered_return_addr_accepted() {
+        let params = conway_pparams_pv10();
+        let utxo_set = UtxoSet::new();
+
+        let proposal = info_proposal_with_return_addr(return_addr_29_key(0x88));
+
+        // Compute the canonical lookup key the predicate will use, then seed
+        // reward_accounts with exactly that key so the credential is registered.
+        let key = crate::state::LedgerState::reward_account_to_hash(&proposal.return_addr);
+        let mut accounts: HashMap<Hash32, Lovelace> = HashMap::new();
+        accounts.insert(key, Lovelace(0));
+
+        let tx = make_gov_tx(vec![proposal], BTreeMap::new());
+        let context = ValidationContext::new().with_reward_accounts(accounts);
+        let result =
+            validate_transaction_with_context(&tx, &utxo_set, &params, 100, 500, None, context);
+
+        if let Err(errors) = result {
+            assert!(
+                !errors.iter().any(|e| matches!(
+                    e,
+                    ValidationError::ProposalReturnAccountDoesNotExist { .. }
+                )),
+                "ProposalReturnAccountDoesNotExist must not fire when the return-addr \
+                 credential is registered; got: {errors:?}"
+            );
+        }
+    }
+
+    // -------------------------------------------------------------------------
+    // ProposalProcedureNetworkIdMismatch integration tests for
+    // `validate_transaction_with_context`
+    //
+    // Per Haskell `processProposal` in `Cardano.Ledger.Conway.Rules.Gov`, every
+    // proposal procedure's `pProcReturnAddr` must be on the same network as
+    // the node.  Bit 0 of the reward-account header byte encodes the network
+    // (`0` = testnet, `1` = mainnet).  This check is **always enforced** —
+    // there is NO Conway-bootstrap skip (unlike
+    // `ProposalReturnAccountDoesNotExist`).  The lenient default
+    // (`node_network = None`) skips the check.
+    // -------------------------------------------------------------------------
+
+    /// Build a 29-byte reward address whose header network bit is the given
+    /// value (0 = testnet, 1 = mainnet).  Header high nibble `0xe0` (key
+    /// credential, stake/reward address); low bit flipped accordingly.
+    fn return_addr_29_for_network(network_bit: u8) -> Vec<u8> {
+        let header: u8 = 0xe0 | (network_bit & 0x01);
+        let mut bytes = Vec::with_capacity(29);
+        bytes.push(header);
+        bytes.extend_from_slice(&[0x88u8; 28]);
+        bytes
+    }
+
+    /// A Conway PV=10 transaction submits a proposal whose return_addr
+    /// network does not match the node's configured network.  The
+    /// validator must surface a `ProposalProcedureNetworkIdMismatch` error
+    /// whose `mismatched` payload carries the proposal's hex-encoded
+    /// return_addr and the actual mismatched network value.
+    #[test]
+    fn test_validate_transaction_rejects_proposal_with_wrong_network_return_addr() {
+        let params = conway_pparams_pv10();
+        let utxo_set = UtxoSet::new();
+
+        // Node is mainnet; proposal's return_addr is testnet.
+        let return_addr = return_addr_29_for_network(0);
+        let expected_hex: String = return_addr.iter().fold(String::new(), |mut s, b| {
+            use std::fmt::Write;
+            let _ = write!(s, "{b:02x}");
+            s
+        });
+        let proposal = info_proposal_with_return_addr(return_addr);
+        let tx = make_gov_tx(vec![proposal], BTreeMap::new());
+
+        let context =
+            ValidationContext::new().with_network(dugite_primitives::network::NetworkId::Mainnet);
+        let result =
+            validate_transaction_with_context(&tx, &utxo_set, &params, 100, 500, None, context);
+
+        let errors =
+            result.expect_err("expected ProposalProcedureNetworkIdMismatch predicate to fire");
+        let (expected, mismatched) = errors
+            .iter()
+            .find_map(|e| match e {
+                ValidationError::ProposalProcedureNetworkIdMismatch {
+                    expected,
+                    mismatched,
+                } => Some((*expected, mismatched)),
+                _ => None,
+            })
+            .unwrap_or_else(|| {
+                panic!("ProposalProcedureNetworkIdMismatch not in error set: {errors:?}")
+            });
+        assert_eq!(expected, 1, "node is mainnet -> expected = 1");
+        assert_eq!(
+            mismatched.len(),
+            1,
+            "expected exactly one mismatched return-addr, got: {mismatched:?}"
+        );
+        assert_eq!(
+            mismatched[0].0, expected_hex,
+            "mismatched payload must carry the proposal's hex-encoded return_addr"
+        );
+        assert_eq!(
+            mismatched[0].1, 0,
+            "mismatched payload must carry the actual network bit (0 = testnet)"
+        );
+    }
+
+    /// At PV=9 (Conway bootstrap), the predicate is **still enforced** —
+    /// unlike `ProposalReturnAccountDoesNotExist`, there is no
+    /// bootstrap-phase skip for the network-id check.  This test proves
+    /// the validator surfaces `ProposalProcedureNetworkIdMismatch` even at
+    /// PV=9.
+    #[test]
+    fn test_validate_transaction_rejects_proposal_wrong_network_in_bootstrap() {
+        let mut params = ProtocolParameters::mainnet_defaults();
+        params.protocol_version_major = 9; // Conway bootstrap.
+        let utxo_set = UtxoSet::new();
+
+        // Node is mainnet; proposal is testnet.
+        let proposal = info_proposal_with_return_addr(return_addr_29_for_network(0));
+        let tx = make_gov_tx(vec![proposal], BTreeMap::new());
+
+        let context =
+            ValidationContext::new().with_network(dugite_primitives::network::NetworkId::Mainnet);
+        let result =
+            validate_transaction_with_context(&tx, &utxo_set, &params, 100, 500, None, context);
+
+        let errors = result.expect_err("expected ProposalProcedureNetworkIdMismatch even at PV=9");
+        assert!(
+            errors.iter().any(|e| matches!(
+                e,
+                ValidationError::ProposalProcedureNetworkIdMismatch { .. }
+            )),
+            "ProposalProcedureNetworkIdMismatch MUST fire at PV=9 (no bootstrap skip); \
+             got: {errors:?}"
+        );
+    }
+
+    /// At PV=10 with a return_addr whose network matches the node, the
+    /// predicate must NOT produce `ProposalProcedureNetworkIdMismatch`.
+    /// Other Phase-1 errors (NoInputs etc.) may still be present — we only
+    /// assert this specific predicate is absent.
+    #[test]
+    fn test_validate_transaction_proposal_correct_network_accepted() {
+        let params = conway_pparams_pv10();
+        let utxo_set = UtxoSet::new();
+
+        // Node is mainnet; proposal's return_addr is also mainnet.
+        let proposal = info_proposal_with_return_addr(return_addr_29_for_network(1));
+        let tx = make_gov_tx(vec![proposal], BTreeMap::new());
+
+        let context =
+            ValidationContext::new().with_network(dugite_primitives::network::NetworkId::Mainnet);
+        let result =
+            validate_transaction_with_context(&tx, &utxo_set, &params, 100, 500, None, context);
+
+        if let Err(errors) = result {
+            assert!(
+                !errors.iter().any(|e| matches!(
+                    e,
+                    ValidationError::ProposalProcedureNetworkIdMismatch { .. }
+                )),
+                "ProposalProcedureNetworkIdMismatch must not fire when the return-addr \
+                 network matches the node; got: {errors:?}"
+            );
+        }
+    }
+
+    // -------------------------------------------------------------------------
+    // TreasuryWithdrawalsNetworkIdMismatch integration tests for
+    // `validate_transaction_with_context`
+    //
+    // Per Haskell `processProposal` in `Cardano.Ledger.Conway.Rules.Gov`
+    // (TreasuryWithdrawals branch), every destination address in the
+    // withdrawals map must be on the same network as the node.  Bit 0 of the
+    // reward-account header byte encodes the network (`0` = testnet,
+    // `1` = mainnet).  This check is **always enforced** — there is NO
+    // Conway-bootstrap skip.  All mismatched destinations across all TW
+    // proposals are aggregated into a single error.
+    // -------------------------------------------------------------------------
+
+    /// Build a 29-byte reward address whose header network bit is the given
+    /// value (0 = testnet, 1 = mainnet) and whose 28-byte credential is
+    /// `[cred_byte; 28]`.
+    fn reward_addr_29(network_bit: u8, cred_byte: u8) -> Vec<u8> {
+        let header: u8 = 0xe0 | (network_bit & 0x01);
+        let mut bytes = Vec::with_capacity(29);
+        bytes.push(header);
+        bytes.extend_from_slice(&[cred_byte; 28]);
+        bytes
+    }
+
+    /// Build a `TreasuryWithdrawals` proposal whose destinations are the
+    /// given `(reward_addr_bytes, lovelace)` entries.  `return_addr` is set
+    /// to mainnet so the proposal's *own* network-id check is satisfied;
+    /// only the withdrawal-destinations check is exercised.
+    fn treasury_withdrawals_proposal_for_test(
+        entries: Vec<(Vec<u8>, Lovelace)>,
+    ) -> ProposalProcedure {
+        let withdrawals: BTreeMap<Vec<u8>, Lovelace> = entries.into_iter().collect();
+        ProposalProcedure {
+            deposit: Lovelace(1_000_000_000),
+            return_addr: reward_addr_29(1, 0xCC),
+            gov_action: GovAction::TreasuryWithdrawals {
+                withdrawals,
+                policy_hash: None,
+            },
+            anchor: anchor_stub(),
+        }
+    }
+
+    /// Post-bootstrap: a TreasuryWithdrawals proposal carries a destination
+    /// whose network does not match the node.  The validator must surface
+    /// `TreasuryWithdrawalsNetworkIdMismatch` whose `mismatched` payload
+    /// contains the offending hex address and `actual = 0` (testnet).
+    #[test]
+    fn test_validate_transaction_rejects_tw_wrong_network_post_bootstrap() {
+        let params = conway_pparams_pv10();
+        let utxo_set = UtxoSet::new();
+
+        // Node = mainnet; one entry on testnet.
+        let bad = reward_addr_29(0, 0x11);
+        let bad_hex: String = bad.iter().fold(String::new(), |mut s, b| {
+            use std::fmt::Write;
+            let _ = write!(s, "{b:02x}");
+            s
+        });
+        let proposal = treasury_withdrawals_proposal_for_test(vec![(bad, Lovelace(42))]);
+        let tx = make_gov_tx(vec![proposal], BTreeMap::new());
+
+        let context =
+            ValidationContext::new().with_network(dugite_primitives::network::NetworkId::Mainnet);
+        let result =
+            validate_transaction_with_context(&tx, &utxo_set, &params, 100, 500, None, context);
+
+        let errors =
+            result.expect_err("expected TreasuryWithdrawalsNetworkIdMismatch predicate to fire");
+        let (expected, mismatched) = errors
+            .iter()
+            .find_map(|e| match e {
+                ValidationError::TreasuryWithdrawalsNetworkIdMismatch {
+                    expected,
+                    mismatched,
+                } => Some((*expected, mismatched)),
+                _ => None,
+            })
+            .unwrap_or_else(|| {
+                panic!("TreasuryWithdrawalsNetworkIdMismatch not in error set: {errors:?}")
+            });
+        assert_eq!(expected, 1, "node is mainnet -> expected = 1");
+        assert_eq!(mismatched.len(), 1, "exactly one mismatched destination");
+        assert_eq!(mismatched[0].0, bad_hex);
+        assert_eq!(mismatched[0].1, 0, "actual must be 0 (testnet)");
+    }
+
+    /// At PV=9 (Conway bootstrap) the TreasuryWithdrawals network-id check
+    /// is **still enforced** — there is no bootstrap skip for this rule.
+    #[test]
+    fn test_validate_transaction_rejects_tw_wrong_network_in_bootstrap() {
+        let mut params = ProtocolParameters::mainnet_defaults();
+        params.protocol_version_major = 9; // Conway bootstrap.
+        let utxo_set = UtxoSet::new();
+
+        // Node = mainnet; destination on testnet.
+        let bad = reward_addr_29(0, 0x22);
+        let proposal = treasury_withdrawals_proposal_for_test(vec![(bad, Lovelace(7))]);
+        let tx = make_gov_tx(vec![proposal], BTreeMap::new());
+
+        let context =
+            ValidationContext::new().with_network(dugite_primitives::network::NetworkId::Mainnet);
+        let result =
+            validate_transaction_with_context(&tx, &utxo_set, &params, 100, 500, None, context);
+
+        let errors =
+            result.expect_err("expected TreasuryWithdrawalsNetworkIdMismatch even at PV=9");
+        assert!(
+            errors.iter().any(|e| matches!(
+                e,
+                ValidationError::TreasuryWithdrawalsNetworkIdMismatch { .. }
+            )),
+            "TreasuryWithdrawalsNetworkIdMismatch MUST fire at PV=9 (no bootstrap skip); \
+             got: {errors:?}"
+        );
+    }
+
+    /// Multiple TreasuryWithdrawals proposals each with mismatched
+    /// destinations are aggregated into a SINGLE
+    /// `TreasuryWithdrawalsNetworkIdMismatch` error whose `mismatched`
+    /// payload covers every offending entry across all proposals.
+    #[test]
+    fn test_validate_transaction_aggregates_tw_mismatches_into_single_error() {
+        let params = conway_pparams_pv10();
+        let utxo_set = UtxoSet::new();
+
+        // Node = mainnet.  Two TW proposals, each with two testnet
+        // destinations -> 4 mismatches total in one error.
+        let p1 = treasury_withdrawals_proposal_for_test(vec![
+            (reward_addr_29(0, 0xAA), Lovelace(1)),
+            (reward_addr_29(0, 0xBB), Lovelace(2)),
+        ]);
+        let p2 = treasury_withdrawals_proposal_for_test(vec![
+            (reward_addr_29(0, 0xCC), Lovelace(3)),
+            (reward_addr_29(0, 0xDD), Lovelace(4)),
+        ]);
+        let tx = make_gov_tx(vec![p1, p2], BTreeMap::new());
+
+        let context =
+            ValidationContext::new().with_network(dugite_primitives::network::NetworkId::Mainnet);
+        let result =
+            validate_transaction_with_context(&tx, &utxo_set, &params, 100, 500, None, context);
+
+        let errors =
+            result.expect_err("expected TreasuryWithdrawalsNetworkIdMismatch predicate to fire");
+        let count = errors
+            .iter()
+            .filter(|e| {
+                matches!(
+                    e,
+                    ValidationError::TreasuryWithdrawalsNetworkIdMismatch { .. }
+                )
+            })
+            .count();
+        assert_eq!(
+            count, 1,
+            "All TW destination mismatches must aggregate into ONE error"
+        );
+        let mismatched = errors
+            .iter()
+            .find_map(|e| match e {
+                ValidationError::TreasuryWithdrawalsNetworkIdMismatch { mismatched, .. } => {
+                    Some(mismatched)
+                }
+                _ => None,
+            })
+            .expect("variant present");
+        assert_eq!(
+            mismatched.len(),
+            4,
+            "all 4 mismatches surfaced; got: {mismatched:?}"
+        );
+    }
+
+    // -------------------------------------------------------------------------
+    // ZeroTreasuryWithdrawals integration tests for
+    // `validate_transaction_with_context`
+    //
+    // Per Haskell `processProposal` (TreasuryWithdrawals branch), the sum of
+    // every withdrawal entry's `Coin` must be strictly positive.  The check
+    // is **skipped during Conway bootstrap** (PV == 9).
+    // -------------------------------------------------------------------------
+
+    /// Build a TreasuryWithdrawals proposal whose entries all match the
+    /// node's network (so the network-id check is satisfied) and whose
+    /// `return_addr` is mainnet (so the proposal-procedure network check
+    /// is also satisfied).  All entries are zero-Coin so `sum == 0`.
+    fn tw_proposal_mainnet_zero_sum() -> ProposalProcedure {
+        let mut a = vec![0xe1u8];
+        a.extend_from_slice(&[0xAAu8; 28]);
+        let mut b = vec![0xe1u8];
+        b.extend_from_slice(&[0xBBu8; 28]);
+        let mut withdrawals: BTreeMap<Vec<u8>, Lovelace> = BTreeMap::new();
+        withdrawals.insert(a, Lovelace(0));
+        withdrawals.insert(b, Lovelace(0));
+        ProposalProcedure {
+            deposit: Lovelace(1_000_000_000),
+            return_addr: reward_addr_29(1, 0xCC),
+            gov_action: GovAction::TreasuryWithdrawals {
+                withdrawals,
+                policy_hash: None,
+            },
+            anchor: anchor_stub(),
+        }
+    }
+
+    /// Post-bootstrap (PV=10): a TreasuryWithdrawals proposal whose total
+    /// amount is zero must surface `ZeroTreasuryWithdrawals` whose
+    /// `offending_proposals` carries the proposal's hex `return_addr`.
+    #[test]
+    fn test_validate_transaction_rejects_zero_tw_post_bootstrap() {
+        let params = conway_pparams_pv10();
+        let utxo_set = UtxoSet::new();
+
+        let proposal = tw_proposal_mainnet_zero_sum();
+        let expected_id_hex: String =
+            proposal.return_addr.iter().fold(String::new(), |mut s, b| {
+                use std::fmt::Write;
+                let _ = write!(s, "{b:02x}");
+                s
+            });
+        let tx = make_gov_tx(vec![proposal], BTreeMap::new());
+
+        let context =
+            ValidationContext::new().with_network(dugite_primitives::network::NetworkId::Mainnet);
+        let result =
+            validate_transaction_with_context(&tx, &utxo_set, &params, 100, 500, None, context);
+
+        let errors = result.expect_err("expected ZeroTreasuryWithdrawals predicate to fire");
+        let offending = errors
+            .iter()
+            .find_map(|e| match e {
+                ValidationError::ZeroTreasuryWithdrawals {
+                    offending_proposals,
+                } => Some(offending_proposals),
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("ZeroTreasuryWithdrawals not in error set: {errors:?}"));
+        assert_eq!(offending.len(), 1, "exactly one offending proposal");
+        assert_eq!(offending[0], expected_id_hex);
+    }
+
+    /// At PV=9 (Conway bootstrap) the zero-sum check is skipped, so the
+    /// validator must NOT produce `ZeroTreasuryWithdrawals` even for a
+    /// zero-sum TreasuryWithdrawals proposal.  Other Phase-1 errors may
+    /// still be present.
+    #[test]
+    fn test_validate_transaction_skips_zero_tw_in_bootstrap() {
+        let mut params = ProtocolParameters::mainnet_defaults();
+        params.protocol_version_major = 9; // Conway bootstrap.
+        let utxo_set = UtxoSet::new();
+
+        let proposal = tw_proposal_mainnet_zero_sum();
+        let tx = make_gov_tx(vec![proposal], BTreeMap::new());
+
+        let context =
+            ValidationContext::new().with_network(dugite_primitives::network::NetworkId::Mainnet);
+        let result =
+            validate_transaction_with_context(&tx, &utxo_set, &params, 100, 500, None, context);
+
+        if let Err(errors) = result {
+            assert!(
+                !errors
+                    .iter()
+                    .any(|e| matches!(e, ValidationError::ZeroTreasuryWithdrawals { .. })),
+                "ZeroTreasuryWithdrawals must not fire at PV=9 (bootstrap); got: {errors:?}"
+            );
+        }
+    }
+
+    // -------------------------------------------------------------------------
+    // ConflictingCommitteeUpdate integration tests for
+    // `validate_transaction_with_context`
+    //
+    // Per Haskell `processProposal` (UpdateCommittee branch), the
+    // intersection of the add-set keys and the remove-set must be empty.
+    // **Always enforced** — no Conway-bootstrap skip.
+    // -------------------------------------------------------------------------
+
+    /// Build an `UpdateCommittee` proposal with the given add and remove
+    /// sets.  Threshold is 1/2.  `return_addr` mainnet so the network-id
+    /// check passes.
+    fn update_committee_proposal_for_test(
+        members_to_add: BTreeMap<dugite_primitives::credentials::Credential, u64>,
+        members_to_remove: Vec<dugite_primitives::credentials::Credential>,
+    ) -> ProposalProcedure {
+        ProposalProcedure {
+            deposit: Lovelace(1_000_000_000),
+            return_addr: reward_addr_29(1, 0xCC),
+            gov_action: GovAction::UpdateCommittee {
+                prev_action_id: None,
+                members_to_remove,
+                members_to_add,
+                threshold: Rational {
+                    numerator: 1,
+                    denominator: 2,
+                },
+            },
+            anchor: anchor_stub(),
+        }
+    }
+
+    /// Post-bootstrap: an `UpdateCommittee` proposal both adds and removes
+    /// the same credential; validator must surface
+    /// `ConflictingCommitteeUpdate` whose `conflicts` carries the typed
+    /// hash hex of the conflicting credential.
+    #[test]
+    fn test_validate_transaction_rejects_conflicting_committee_update_post_bootstrap() {
+        use dugite_primitives::credentials::Credential;
+
+        let params = conway_pparams_pv10();
+        let utxo_set = UtxoSet::new();
+
+        let cred = Credential::VerificationKey(Hash28::from_bytes([0x44; 28]));
+        let mut adds: BTreeMap<Credential, u64> = BTreeMap::new();
+        adds.insert(cred.clone(), 100);
+        let proposal = update_committee_proposal_for_test(adds, vec![cred.clone()]);
+        let tx = make_gov_tx(vec![proposal], BTreeMap::new());
+
+        let context =
+            ValidationContext::new().with_network(dugite_primitives::network::NetworkId::Mainnet);
+        let result =
+            validate_transaction_with_context(&tx, &utxo_set, &params, 100, 500, None, context);
+
+        let errors = result.expect_err("expected ConflictingCommitteeUpdate predicate to fire");
+        let conflicts = errors
+            .iter()
+            .find_map(|e| match e {
+                ValidationError::ConflictingCommitteeUpdate { conflicts } => Some(conflicts),
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("ConflictingCommitteeUpdate not in error set: {errors:?}"));
+        assert_eq!(conflicts.len(), 1);
+        assert_eq!(conflicts[0], cred.to_typed_hash32().to_hex());
+    }
+
+    /// At PV=9 (Conway bootstrap) the conflicting-update check is **still
+    /// enforced** — there is no bootstrap skip for this rule.
+    #[test]
+    fn test_validate_transaction_rejects_conflicting_committee_update_in_bootstrap() {
+        use dugite_primitives::credentials::Credential;
+
+        let mut params = ProtocolParameters::mainnet_defaults();
+        params.protocol_version_major = 9; // Conway bootstrap.
+        let utxo_set = UtxoSet::new();
+
+        let cred = Credential::VerificationKey(Hash28::from_bytes([0x55; 28]));
+        let mut adds: BTreeMap<Credential, u64> = BTreeMap::new();
+        adds.insert(cred.clone(), 100);
+        let proposal = update_committee_proposal_for_test(adds, vec![cred]);
+        let tx = make_gov_tx(vec![proposal], BTreeMap::new());
+
+        let context =
+            ValidationContext::new().with_network(dugite_primitives::network::NetworkId::Mainnet);
+        let result =
+            validate_transaction_with_context(&tx, &utxo_set, &params, 100, 500, None, context);
+
+        let errors = result.expect_err("expected ConflictingCommitteeUpdate even at PV=9");
+        assert!(
+            errors
+                .iter()
+                .any(|e| matches!(e, ValidationError::ConflictingCommitteeUpdate { .. })),
+            "ConflictingCommitteeUpdate MUST fire at PV=9 (no bootstrap skip); got: {errors:?}"
+        );
+    }
+
+    // -------------------------------------------------------------------------
+    // ExpirationEpochTooSmall integration tests for
+    // `validate_transaction_with_context`
+    //
+    // Per Haskell `processProposal` (UpdateCommittee branch), every new
+    // member's `validUntil` epoch must be strictly greater than the
+    // current epoch (i.e. boundary `validUntil == currentEpoch` is
+    // rejected).  **Always enforced** — no Conway-bootstrap skip.
+    // -------------------------------------------------------------------------
+
+    /// Post-bootstrap (PV=10): a new committee member with `validUntil <=
+    /// currentEpoch` must surface `ExpirationEpochTooSmall` whose
+    /// `invalid_members` payload carries the offending credential's typed
+    /// hash and bad expiry.
+    #[test]
+    fn test_validate_transaction_rejects_expiration_too_small_post_bootstrap() {
+        use dugite_primitives::credentials::Credential;
+
+        let params = conway_pparams_pv10();
+        let utxo_set = UtxoSet::new();
+
+        let cred = Credential::VerificationKey(Hash28::from_bytes([0x66; 28]));
+        let mut adds: BTreeMap<Credential, u64> = BTreeMap::new();
+        adds.insert(cred.clone(), 100); // expiry == current_epoch (boundary)
+        let proposal = update_committee_proposal_for_test(adds, vec![]);
+        let tx = make_gov_tx(vec![proposal], BTreeMap::new());
+
+        let context = ValidationContext::new()
+            .with_network(dugite_primitives::network::NetworkId::Mainnet)
+            .with_epoch(100);
+        let result =
+            validate_transaction_with_context(&tx, &utxo_set, &params, 100, 500, None, context);
+
+        let errors = result.expect_err("expected ExpirationEpochTooSmall predicate to fire");
+        let invalid = errors
+            .iter()
+            .find_map(|e| match e {
+                ValidationError::ExpirationEpochTooSmall { invalid_members } => {
+                    Some(invalid_members)
+                }
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("ExpirationEpochTooSmall not in error set: {errors:?}"));
+        assert_eq!(invalid.len(), 1, "exactly one offending member");
+        assert_eq!(invalid[0].0, cred.to_typed_hash32().to_hex());
+        assert_eq!(invalid[0].1, 100, "boundary expiry must be reported");
+    }
+
+    /// At PV=9 (Conway bootstrap) the expiration check is **still
+    /// enforced** — no bootstrap skip for this rule.
+    #[test]
+    fn test_validate_transaction_rejects_expiration_too_small_in_bootstrap() {
+        use dugite_primitives::credentials::Credential;
+
+        let mut params = ProtocolParameters::mainnet_defaults();
+        params.protocol_version_major = 9; // Conway bootstrap.
+        let utxo_set = UtxoSet::new();
+
+        let cred = Credential::VerificationKey(Hash28::from_bytes([0x77; 28]));
+        let mut adds: BTreeMap<Credential, u64> = BTreeMap::new();
+        adds.insert(cred, 50); // expiry well below current_epoch
+        let proposal = update_committee_proposal_for_test(adds, vec![]);
+        let tx = make_gov_tx(vec![proposal], BTreeMap::new());
+
+        let context = ValidationContext::new()
+            .with_network(dugite_primitives::network::NetworkId::Mainnet)
+            .with_epoch(100);
+        let result =
+            validate_transaction_with_context(&tx, &utxo_set, &params, 100, 500, None, context);
+
+        let errors = result.expect_err("expected ExpirationEpochTooSmall even at PV=9");
+        assert!(
+            errors
+                .iter()
+                .any(|e| matches!(e, ValidationError::ExpirationEpochTooSmall { .. })),
+            "ExpirationEpochTooSmall MUST fire at PV=9 (no bootstrap skip); got: {errors:?}"
+        );
+    }
+
+    // -------------------------------------------------------------------
+    // MIR (Move Instantaneous Rewards) — integration tests via
+    // `validate_transaction_with_context`.  Unit tests for each individual
+    // predicate live in `validation/mir/tests.rs`; these tests verify the
+    // wiring through the full validation pipeline (cert iteration, era
+    // gating, error aggregation).
+    // -------------------------------------------------------------------
+
+    fn make_mir_tx(input: TransactionInput, source: MIRSource, target: MIRTarget) -> Transaction {
+        let mut tx = make_simple_tx(input, 9_800_000, 200_000);
+        tx.body
+            .certificates
+            .push(Certificate::MoveInstantaneousRewards { source, target });
+        tx
+    }
+
+    /// Pre-Alonzo (PV=4): MIR pot-to-pot transfer must be rejected with
+    /// `MIRTransferNotCurrentlyAllowed` via the validation pipeline.
+    #[test]
+    fn test_validate_transaction_rejects_pre_alonzo_mir_transfer() {
+        let (utxo_set, input) = make_simple_utxo_set();
+        let mut params = ProtocolParameters::mainnet_defaults();
+        params.protocol_version_major = 4;
+        let tx = make_mir_tx(
+            input,
+            MIRSource::Reserves,
+            MIRTarget::OtherAccountingPot(100),
+        );
+
+        let context = ValidationContext::new()
+            .with_pots(Lovelace(1_000_000), Lovelace(1_000_000))
+            .with_epoch_geometry(432_000, 432);
+        let result =
+            validate_transaction_with_context(&tx, &utxo_set, &params, 100, 500, None, context);
+        let errors = result.expect_err("pre-Alonzo MIR transfer must be rejected");
+        assert!(
+            errors
+                .iter()
+                .any(|e| matches!(e, ValidationError::MIRTransferNotCurrentlyAllowed)),
+            "expected MIRTransferNotCurrentlyAllowed; got: {errors:?}"
+        );
+    }
+
+    /// Alonzo+ (PV=5): an MIR cert requesting more than the pot balance
+    /// must be rejected with `InsufficientForInstantaneousRewards` via the
+    /// validation pipeline.
+    #[test]
+    fn test_validate_transaction_rejects_insufficient_for_mir() {
+        use dugite_primitives::credentials::Credential;
+        let (utxo_set, input) = make_simple_utxo_set();
+        let mut params = ProtocolParameters::mainnet_defaults();
+        params.protocol_version_major = 5;
+        let cred = Credential::VerificationKey(Hash28::from_bytes([0xAA; 28]));
+        let tx = make_mir_tx(
+            input,
+            MIRSource::Reserves,
+            MIRTarget::StakeCredentials(vec![(cred, 1_000_000_000)]),
+        );
+
+        let context = ValidationContext::new()
+            .with_pots(Lovelace(1_000_000), Lovelace(100)) // reserves=100
+            .with_epoch_geometry(432_000, 432);
+        let result =
+            validate_transaction_with_context(&tx, &utxo_set, &params, 100, 500, None, context);
+        let errors = result.expect_err("MIR over pot balance must be rejected");
+        assert!(
+            errors.iter().any(|e| matches!(
+                e,
+                ValidationError::InsufficientForInstantaneousRewards { .. }
+            )),
+            "expected InsufficientForInstantaneousRewards; got: {errors:?}"
+        );
+    }
+
+    /// Alonzo+ (PV=5): an MIR cert near the next-epoch boundary must be
+    /// rejected with `MIRCertificateTooLateInEpoch`.
+    #[test]
+    fn test_validate_transaction_rejects_mir_cert_too_late() {
+        let (utxo_set, input) = make_simple_utxo_set();
+        let mut params = ProtocolParameters::mainnet_defaults();
+        params.protocol_version_major = 5;
+        params.active_slots_coeff = 0.05;
+        let tx = make_mir_tx(
+            input,
+            MIRSource::Reserves,
+            MIRTarget::StakeCredentials(vec![]),
+        );
+
+        // k=432, f=1/20 → stability_window = ceil(3*432*20/1) = 25_920.
+        // first_slot_next_epoch (current_epoch=0) = 432_000.
+        // deadline = 432_000 - 25_920 = 406_080.
+        let context = ValidationContext::new()
+            .with_pots(Lovelace(1_000_000), Lovelace(1_000_000))
+            .with_epoch_geometry(432_000, 432)
+            .with_epoch(0);
+        let result = validate_transaction_with_context(
+            &tx, &utxo_set, &params, 406_080, // == deadline → reject
+            500, None, context,
+        );
+        let errors = result.expect_err("MIR cert at deadline must be rejected");
+        assert!(
+            errors
+                .iter()
+                .any(|e| matches!(e, ValidationError::MIRCertificateTooLateInEpoch { .. })),
+            "expected MIRCertificateTooLateInEpoch; got: {errors:?}"
+        );
+    }
+
+    /// Conway (PV>=9): MIR predicates short-circuit even for malformed
+    /// certs.  The MIR cert itself will be rejected by Conway era gating
+    /// (Conway certs are a closed set), but no MIR-specific error variant
+    /// must appear.
+    #[test]
+    fn test_validate_transaction_skips_mir_check_in_conway() {
+        use dugite_primitives::credentials::Credential;
+        let (utxo_set, input) = make_simple_utxo_set();
+        let params = ProtocolParameters::mainnet_defaults(); // PV=9
+        let cred = Credential::VerificationKey(Hash28::from_bytes([0xBB; 28]));
+        let tx = make_mir_tx(
+            input,
+            MIRSource::Reserves,
+            MIRTarget::StakeCredentials(vec![(cred, 1_000_000_000)]),
+        );
+
+        let context = ValidationContext::new()
+            .with_pots(Lovelace(1_000_000), Lovelace(0)) // reserves=0 → would trigger Insufficient pre-Conway
+            .with_epoch_geometry(432_000, 432);
+        let result = validate_transaction_with_context(
+            &tx,
+            &utxo_set,
+            &params,
+            999_999_999, // would trigger MIRCertificateTooLateInEpoch pre-Conway
+            500,
+            None,
+            context,
+        );
+        // The transaction may or may not pass overall (other Conway checks
+        // could fire), but no MIR-flavoured error must be present.
+        if let Err(errors) = result {
+            for e in &errors {
+                assert!(
+                    !matches!(
+                        e,
+                        ValidationError::MIRCertificateTooLateInEpoch { .. }
+                            | ValidationError::InsufficientForInstantaneousRewards { .. }
+                            | ValidationError::MIRTransferNotCurrentlyAllowed
+                            | ValidationError::MIRNegativesNotCurrentlyAllowed
+                            | ValidationError::MIRProducesNegativeUpdate { .. }
+                            | ValidationError::InsufficientForTransferDELEG { .. }
+                            | ValidationError::MIRNegativeTransfer { .. }
+                    ),
+                    "MIR predicates must be no-ops at PV>=9; got: {e:?}"
+                );
+            }
+        }
+    }
+
+    // ---------------------------------------------------------------------
+    // WithdrawalsNotInRewardsCERTS / ConwayWithdrawalsMissingAccounts /
+    // ConwayIncompleteWithdrawals — integration tests.
+    //
+    // Reference: Haskell `Cardano.Ledger.Conway.Rules.Certs.conwayCertsTransition`
+    // (PV ≤ 10) and `Cardano.Ledger.Conway.Rules.Ledger.testIncompleteAndMissingWithdrawals`
+    // (PV ≥ 11 after the move-checks-to-LEDGER hard fork).
+    // ---------------------------------------------------------------------
+
+    #[test]
+    fn test_validate_transaction_pv10_combined_withdrawals_error() {
+        use dugite_primitives::network::NetworkId;
+        // PV = 10 → predicate uses combined `WithdrawalsNotInRewardsCERTS`.
+        let (utxo_set, input) = make_simple_utxo_set();
+        let mut params = ProtocolParameters::mainnet_defaults();
+        params.protocol_version_major = 10;
+
+        // Two withdrawals: one mismatched amount, one unregistered account.
+        let kh_a = Hash28::from_bytes([0xAAu8; 28]);
+        let kh_b = Hash28::from_bytes([0xBBu8; 28]);
+        let addr_a = make_reward_account_vkey(kh_a); // 0xe0 (testnet)
+        let addr_b = make_reward_account_vkey(kh_b);
+
+        let mut tx = make_simple_tx(input, 9_000_000, 1_000_000);
+        tx.body.withdrawals.insert(addr_a.clone(), Lovelace(50));
+        tx.body.withdrawals.insert(addr_b.clone(), Lovelace(75));
+
+        // Reward accounts: addr_a registered at 100 (mismatch), addr_b absent.
+        let mut accounts: HashMap<Hash32, Lovelace> = HashMap::new();
+        accounts.insert(
+            crate::state::LedgerState::reward_account_to_hash(&addr_a),
+            Lovelace(100),
+        );
+
+        let context = ValidationContext::default()
+            .with_reward_accounts(accounts)
+            .with_network(NetworkId::Testnet);
+
+        let result =
+            validate_transaction_with_context(&tx, &utxo_set, &params, 100, 300, None, context);
+        let errs = result.expect_err("expected withdrawal failure");
+
+        let combined = errs.iter().find_map(|e| match e {
+            ValidationError::WithdrawalsNotInRewardsCERTS { bad } => Some(bad.clone()),
+            _ => None,
+        });
+        let combined =
+            combined.unwrap_or_else(|| panic!("missing WithdrawalsNotInRewardsCERTS in {errs:?}"));
+        assert_eq!(
+            combined.len(),
+            2,
+            "expected 2 entries (1 missing + 1 incomplete) at PV ≤ 10, got {combined:?}"
+        );
+
+        // No PV ≥ 11 split errors should be present at PV = 10.
+        for e in &errs {
+            assert!(
+                !matches!(
+                    e,
+                    ValidationError::ConwayWithdrawalsMissingAccounts { .. }
+                        | ValidationError::ConwayIncompleteWithdrawals { .. }
+                ),
+                "PV ≤ 10 must not emit split predicates: {e:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_validate_transaction_pv11_split_withdrawals_errors() {
+        use dugite_primitives::network::NetworkId;
+        // PV = 11 → predicate splits into MissingAccounts + IncompleteWithdrawals.
+        let (utxo_set, input) = make_simple_utxo_set();
+        let mut params = ProtocolParameters::mainnet_defaults();
+        params.protocol_version_major = 11;
+
+        let kh_a = Hash28::from_bytes([0xAAu8; 28]);
+        let kh_b = Hash28::from_bytes([0xBBu8; 28]);
+        let addr_a = make_reward_account_vkey(kh_a);
+        let addr_b = make_reward_account_vkey(kh_b);
+
+        let mut tx = make_simple_tx(input, 9_000_000, 1_000_000);
+        tx.body.withdrawals.insert(addr_a.clone(), Lovelace(50));
+        tx.body.withdrawals.insert(addr_b.clone(), Lovelace(75));
+
+        // addr_a registered at 100 (mismatch → incomplete);
+        // addr_b unregistered (→ missing).
+        let mut accounts: HashMap<Hash32, Lovelace> = HashMap::new();
+        accounts.insert(
+            crate::state::LedgerState::reward_account_to_hash(&addr_a),
+            Lovelace(100),
+        );
+
+        let context = ValidationContext::default()
+            .with_reward_accounts(accounts)
+            .with_network(NetworkId::Testnet);
+
+        let result =
+            validate_transaction_with_context(&tx, &utxo_set, &params, 100, 300, None, context);
+        let errs = result.expect_err("expected withdrawal failure");
+
+        let has_missing = errs.iter().any(|e| {
+            matches!(
+                e,
+                ValidationError::ConwayWithdrawalsMissingAccounts { missing }
+                    if missing.len() == 1
+            )
+        });
+        let has_incomplete = errs.iter().any(|e| {
+            matches!(
+                e,
+                ValidationError::ConwayIncompleteWithdrawals { incomplete }
+                    if incomplete.len() == 1
+            )
+        });
+        assert!(
+            has_missing,
+            "expected ConwayWithdrawalsMissingAccounts in {errs:?}"
+        );
+        assert!(
+            has_incomplete,
+            "expected ConwayIncompleteWithdrawals in {errs:?}"
+        );
+
+        // PV ≥ 11 must not also emit the combined PV ≤ 10 variant.
+        for e in &errs {
+            assert!(
+                !matches!(e, ValidationError::WithdrawalsNotInRewardsCERTS { .. }),
+                "PV ≥ 11 must not emit combined CERTS predicate: {e:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_validate_transaction_correct_withdrawals_pass() {
+        use dugite_primitives::network::NetworkId;
+        // Withdrawals on the right network, registered, and amount-matches:
+        // none of the new predicates should fire.
+        let (utxo_set, input) = make_simple_utxo_set();
+        let mut params = ProtocolParameters::mainnet_defaults();
+        params.protocol_version_major = 11;
+
+        let kh = Hash28::from_bytes([0xCCu8; 28]);
+        let addr = make_reward_account_vkey(kh); // 0xe0 testnet
+        let mut tx = make_simple_tx(input, 9_000_000, 1_000_000);
+        tx.body.withdrawals.insert(addr.clone(), Lovelace(42));
+
+        let mut accounts: HashMap<Hash32, Lovelace> = HashMap::new();
+        accounts.insert(
+            crate::state::LedgerState::reward_account_to_hash(&addr),
+            Lovelace(42),
+        );
+
+        let context = ValidationContext::default()
+            .with_reward_accounts(accounts)
+            .with_network(NetworkId::Testnet);
+
+        let result =
+            validate_transaction_with_context(&tx, &utxo_set, &params, 100, 300, None, context);
+        // Other unrelated checks may or may not pass; assert only that none
+        // of the new withdrawal predicates appear.
+        if let Err(errors) = result {
+            for e in &errors {
+                assert!(
+                    !matches!(
+                        e,
+                        ValidationError::WithdrawalsNotInRewardsCERTS { .. }
+                            | ValidationError::ConwayWithdrawalsMissingAccounts { .. }
+                            | ValidationError::ConwayIncompleteWithdrawals { .. }
+                    ),
+                    "well-formed withdrawal must not trigger CERTS/LEDGER predicates: {e:?}"
+                );
+            }
+        }
+    }
 }
