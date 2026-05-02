@@ -244,11 +244,20 @@ async fn main() {
             .and_then(|a| a.first())
             .cloned()
             .unwrap_or_else(|| panic!("proposal_voting_summary returned empty"));
-        // Koios fields (lovelace, returned as numeric strings):
-        //   drep_yes_votes_assigned_power, drep_no_votes_assigned_power,
-        //   drep_abstain_votes_assigned_power,
-        //   drep_active_no_vote_power,
-        //   drep_always_no_confidence_vote_power,
+        // Koios `proposal_voting_summary` actual response fields (verified
+        // against preview live API 2026-05-02; lovelace returned as numeric
+        // strings):
+        //   drep_yes_vote_power               — total Yes power (active voters)
+        //   drep_active_no_vote_power         — total No power (active voters
+        //                                       only; excludes always-NC and
+        //                                       passive non-voting)
+        //   drep_active_abstain_vote_power    — explicit Abstain power
+        //   drep_no_vote_power                — total power counting as No
+        //                                       (active_no + always_NC +
+        //                                       passive non-voters); we
+        //                                       subtract to recover the
+        //                                       passive bucket
+        //   drep_always_no_confidence_vote_power
         //   drep_always_abstain_vote_power
         let read_amount = |key: &str| -> u64 {
             row.get(key)
@@ -256,19 +265,28 @@ async fn main() {
                 .and_then(|s| s.parse::<u64>().ok())
                 .unwrap_or_else(|| row.get(key).and_then(|v| v.as_u64()).unwrap_or(0))
         };
+        let yes = read_amount("drep_yes_vote_power");
+        let active_no = read_amount("drep_active_no_vote_power");
+        let active_abstain = read_amount("drep_active_abstain_vote_power");
+        let total_no_bucket = read_amount("drep_no_vote_power");
+        let always_nc = read_amount("drep_always_no_confidence_vote_power");
+        let always_abs = read_amount("drep_always_abstain_vote_power");
+        // Passive non-voters = total No - active No - always-NC.  These
+        // are registered DReps that didn't vote on this proposal; per
+        // Haskell `dRepAcceptedRatio` they count as No.
+        let passive_no_vote = total_no_bucket
+            .saturating_sub(active_no)
+            .saturating_sub(always_nc);
         drep_aggregates_blob = Some(serde_json::json!({
-            "yes_stake":                read_amount("drep_yes_votes_assigned_power"),
-            "no_stake":                 read_amount("drep_no_votes_assigned_power"),
-            "abstain_stake":            read_amount("drep_abstain_votes_assigned_power"),
-            "no_vote_stake":            read_amount("drep_active_no_vote_power"),
-            "always_no_confidence_stake": read_amount("drep_always_no_confidence_vote_power"),
-            "always_abstain_stake":     read_amount("drep_always_abstain_vote_power"),
+            "yes_stake":                  yes,
+            "no_stake":                   active_no,
+            "abstain_stake":              active_abstain,
+            "no_vote_stake":              passive_no_vote,
+            "always_no_confidence_stake": always_nc,
+            "always_abstain_stake":       always_abs,
         }));
         eprintln!(
-            "DRep snapshot: aggregates captured (yes={}, no={}, abstain={})",
-            read_amount("drep_yes_votes_assigned_power"),
-            read_amount("drep_no_votes_assigned_power"),
-            read_amount("drep_abstain_votes_assigned_power")
+            "DRep snapshot: aggregates captured (yes={yes}, active_no={active_no}, abstain={active_abstain}, no_vote={passive_no_vote}, always_nc={always_nc}, always_abs={always_abs})"
         );
     } else if !args.skip_drep_snapshot {
         let drep_list = koios_paged(&client, "/drep_list").await;
