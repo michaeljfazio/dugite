@@ -91,12 +91,13 @@ pub struct ValidationContext {
     pub current_treasury: Option<u64>,
     pub reward_accounts: Option<HashMap<Hash32, Lovelace>>,
     pub current_epoch: Option<u64>,
-    // TODO: this set conflates DRep key-credential hashes and DRep script-credential
-    // hashes (both are stored as the same `Hash32` value by `to_hash32_padded`).
-    // Haskell separates them via `Credential 'DRepRole`. Disambiguating is a
-    // preexisting limitation that affects every consumer of `registered_dreps`
-    // (not just the new GOV predicates) — track separately if/when DRep script
-    // membership becomes meaningful.
+    /// Set of registered DRep credentials, keyed by
+    /// [`Credential::to_typed_hash32`].  Byte 28 of the key encodes the
+    /// credential kind (`0x00` for `VerificationKey`, `0x01` for `Script`),
+    /// mirroring Haskell's `Map (Credential 'DRepRole) DRepState` — a key
+    /// credential and a script credential with the same 28-byte hash are
+    /// treated as distinct DReps, matching the Haskell `KeyHashObj` /
+    /// `ScriptHashObj` discrimination.
     pub registered_dreps: Option<HashSet<Hash32>>,
     pub registered_vrf_keys: Option<HashMap<Hash32, Hash28>>,
     pub node_network: Option<NetworkId>,
@@ -127,9 +128,11 @@ pub struct ValidationContext {
     pub active_proposals: Option<HashMap<GovActionId, ActiveProposal>>,
     /// Hot credential hashes currently authorised by Constitutional Committee
     /// members (mirrors Haskell `authorizedHotCommitteeCredentials`).  Keys are
-    /// stored as `credential.to_hash().to_hash32_padded()` for symmetry with the
+    /// stored as `credential.to_typed_hash32()` for symmetry with the
     /// other credential-keyed sets in this struct (`registered_dreps`,
-    /// `committee_members`).
+    /// `committee_members`) — byte 28 disambiguates key (`0x00`) vs
+    /// script (`0x01`) credentials, matching Haskell's
+    /// `Credential 'HotCommitteeRole`.
     ///
     /// When `Some`, the `VotersDoNotExist` predicate (Conway GOV) rejects
     /// committee-voter votes whose hot credential is not in this set.  When
@@ -2009,10 +2012,11 @@ pub fn validate_transaction_with_pools(
                 _ => None,
             };
             if let Some(credential) = opt_credential {
-                // Replicate the Hash28 → Hash32 zero-padding used in
-                // state/certificates.rs `credential_to_hash()` so the lookup
-                // key matches the key stored in `self.reward_accounts`.
-                let key = credential.to_hash().to_hash32_padded();
+                // Match the producer-side keying in `state::credential_to_hash`,
+                // which uses `Credential::to_typed_hash32` so script and key
+                // credentials with the same 28-byte hash do not collide
+                // (Haskell `Credential 'Staking`).
+                let key = credential.to_typed_hash32();
                 if let Some(balance) = accounts.get(&key) {
                     if balance.0 > 0 {
                         errors.push(ValidationError::StakeKeyHasNonZeroBalance {
@@ -2067,9 +2071,9 @@ pub fn validate_transaction_with_pools(
                 _ => None,
             };
             if let Some(credential) = opt_cred {
-                // Use the same Hash28 → Hash32 zero-padding as the reward
-                // account map key (mirrors `credential_to_hash` in state/mod.rs).
-                let key = credential.to_hash().to_hash32_padded();
+                // Mirror `state::credential_to_hash` — `to_typed_hash32` so the
+                // lookup key matches the kind-tagged storage form.
+                let key = credential.to_typed_hash32();
                 if accounts.contains_key(&key) {
                     errors.push(ValidationError::StakeKeyAlreadyRegistered {
                         credential_hash: key.to_hex(),
@@ -2140,7 +2144,10 @@ pub fn validate_transaction_with_pools(
                 if let dugite_primitives::transaction::Certificate::RegDRep { credential, .. } =
                     cert
                 {
-                    let key = credential.to_hash().to_hash32_padded();
+                    // `to_typed_hash32` matches the kind-tagged keys used by
+                    // the DRep registry — without this, a script DRep with the
+                    // same 28-byte hash as a key DRep would falsely collide.
+                    let key = credential.to_typed_hash32();
                     if dreps.contains(&key) {
                         errors.push(ValidationError::DRepAlreadyRegistered {
                             credential_hash: key.to_hex(),
@@ -2236,7 +2243,9 @@ pub fn validate_transaction_with_pools(
                 ..
             } = cert
             {
-                let cold_key = cold_credential.to_hash().to_hash32_padded();
+                // Match the producer-side keying for `committee_expiration` /
+                // `committee_resigned`, which use `Credential::to_typed_hash32`.
+                let cold_key = cold_credential.to_typed_hash32();
 
                 // Check 1: cold credential must be a current CC member.
                 if let Some(members) = committee_members {
@@ -2460,20 +2469,15 @@ pub fn validate_transaction_with_pools(
         // ------------------------------------------------------------------
         // Phase-2: Execute Plutus scripts when redeemers are present.
         //
-        // Both `raw_cbor` and `slot_config` are required for Plutus evaluation.
-        // A missing `raw_cbor` means the transaction was constructed locally
-        // without being round-tripped through CBOR — that is a programming
-        // error and must be surfaced. Silent bypass is not allowed.
+        // `slot_config` is required (Plutus time conversion needs the
+        // network's epoch zero anchors).  `raw_cbor` is preferred but no
+        // longer required: `evaluate_plutus_scripts` falls back to a
+        // deterministic re-encoding of the in-memory `Transaction` for
+        // locally-built txs (see `plutus::evaluate_plutus_scripts`).  The
+        // caller therefore only fails fast on a missing slot config.
         // ------------------------------------------------------------------
         let has_redeemers = !tx.witness_set.redeemers.is_empty();
         if errors.is_empty() && has_redeemers {
-            if tx.raw_cbor.is_none() {
-                debug!(
-                    tx_hash = %tx.hash.to_hex(),
-                    "Plutus transaction missing raw CBOR for script evaluation"
-                );
-                errors.push(ValidationError::MissingRawCbor);
-            }
             if slot_config.is_none() {
                 debug!(
                     tx_hash = %tx.hash.to_hex(),
@@ -2481,7 +2485,7 @@ pub fn validate_transaction_with_pools(
                 );
                 errors.push(ValidationError::MissingSlotConfig);
             }
-            if let (Some(ref _raw), Some(sc)) = (&tx.raw_cbor, slot_config) {
+            if let Some(sc) = slot_config {
                 let cost_models_cbor = params.cost_models.to_cbor();
                 // uplc::tx::eval_phase_two_raw expects initial_budget as (cpu_steps, mem_units).
                 // Our ExUnits struct uses { mem, steps } where mem=memory_units and steps=cpu_steps.

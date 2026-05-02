@@ -207,7 +207,12 @@ pub(crate) fn check_stake_addresses_mir(
             // sums implicitly; the wire format permits duplicates).
             let mut combined: HashMap<Hash32, i128> = HashMap::new();
             for (cred, delta) in deltas {
-                let key = cred.to_hash().to_hash32_padded();
+                // `accumulated_mir_balances` mirrors the post-distribution
+                // reward-accounts view, which is keyed by
+                // `Credential::to_typed_hash32` (kind-tagged).  Use the same
+                // form here so key and script stake credentials with
+                // colliding 28-byte hashes do not merge.
+                let key = cred.to_typed_hash32();
                 *combined.entry(key).or_insert(0) += *delta as i128;
             }
             let mut bad: Vec<String> = Vec::new();

@@ -7,6 +7,11 @@ use tracing::{debug, trace};
 
 #[derive(Debug, thiserror::Error)]
 pub enum PlutusError {
+    /// Retained for compatibility with existing call-sites.  The evaluator no
+    /// longer fails on missing `tx.raw_cbor` — it re-encodes the in-memory
+    /// `Transaction` deterministically (sorted-set inputs, Conway map-format
+    /// redeemers) — but the variant is left in place so callers that
+    /// explicitly match on it continue to compile.
     #[error("Missing raw CBOR for transaction")]
     MissingTxCbor,
     #[error("Missing raw CBOR for UTxO output: {0}")]
@@ -109,7 +114,37 @@ pub fn evaluate_plutus_scripts(
     max_tx_ex_units: (u64, u64),
     slot_config: &SlotConfig,
 ) -> Result<(), PlutusError> {
-    let tx_cbor = tx.raw_cbor.as_ref().ok_or(PlutusError::MissingTxCbor)?;
+    // Use the original wire bytes when available — that path preserves the
+    // exact TxId of network-submitted transactions (which is the hash of the
+    // bytes we received, not of any re-encoding).
+    //
+    // For locally-built transactions (mempool, tests, anything that hasn't
+    // round-tripped through CBOR yet) we re-encode deterministically here.
+    // This is safe because:
+    //   - `eval_phase_two_raw` only uses the raw bytes to *decode* into a
+    //     `MintedTx`; it does not hash them itself.
+    //   - The `TxInfo.id` field that Plutus scripts observe is
+    //     `KeepRaw::original_hash()` of the body bytes, which becomes the
+    //     hash of our re-encoding — matching whatever the caller will treat
+    //     as this tx's hash, since they have not yet committed to one.
+    //   - `encode_transaction_body_for_era` sorts set fields lexicographically
+    //     (Conway tag 258), so redeemer pointer indices into `inputs`,
+    //     `mint`, etc. resolve to the same positions the evaluator computes.
+    //   - `encode_witness_set_for_era` emits Conway map-format redeemers,
+    //     matching `compute_script_data_hash` so script integrity stays
+    //     consistent.
+    //
+    // Reference: see `pallas` `KeepRaw<TransactionBody>` and Haskell
+    // `MemoBytes`/`SafeHash` — both capture original CBOR on decode and hash
+    // those exact bytes for the TxId.
+    let owned_cbor: Vec<u8>;
+    let tx_cbor: &[u8] = match tx.raw_cbor.as_ref() {
+        Some(bytes) => bytes.as_slice(),
+        None => {
+            owned_cbor = dugite_serialization::encode_transaction(tx);
+            &owned_cbor
+        }
+    };
 
     // Build resolved UTxO pairs (input CBOR, output CBOR)
     let mut utxo_pairs: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
@@ -316,14 +351,22 @@ mod tests {
     }
 
     #[test]
-    fn test_evaluate_missing_cbor() {
+    fn test_evaluate_missing_cbor_falls_back_to_re_encoding() {
+        // Locally-built tx (raw_cbor = None) with no redeemers must succeed:
+        // the evaluator re-encodes the in-memory `Transaction` deterministically
+        // and the empty witness set produces zero redeemers to evaluate.
         let tx = Transaction::empty_with_hash(Hash32::ZERO);
+        assert!(tx.raw_cbor.is_none(), "precondition: locally-built tx");
         let utxo_set = UtxoSet::new();
         let slot_config = SlotConfig::default();
 
         let result =
             evaluate_plutus_scripts(&tx, &utxo_set, None, (10_000_000, 10_000_000), &slot_config);
-        assert!(matches!(result, Err(PlutusError::MissingTxCbor)));
+        assert!(
+            result.is_ok(),
+            "Evaluator must accept a locally-built tx via the re-encode fallback: {:?}",
+            result.err()
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -1050,7 +1093,10 @@ mod tests {
 
     // -----------------------------------------------------------------------
     // Test 5: Script context construction — verify that inputs in the UTxO
-    //         set that are NOT referenced by the transaction are NOT resolved.
+    //         set that are NOT referenced by the transaction are NOT resolved,
+    //         AND verify that evaluate_plutus_scripts succeeds for a locally-
+    //         built (no raw_cbor) transaction with no redeemers — exercising
+    //         the deterministic re-encoding fallback.
     //
     // This tests that `evaluate_plutus_scripts` only passes input/output CBOR
     // pairs for inputs that appear in the transaction body (inputs +
@@ -1082,17 +1128,20 @@ mod tests {
             utxo_set.insert(extra_input, extra_output);
         }
 
-        // Tx with no raw_cbor → should fail with MissingTxCbor,
-        // which means we never reached the UTxO-resolution loop.
-        // This implicitly verifies that resolution does not happen
-        // eagerly before CBOR is available.
+        // Locally-built transaction with no raw_cbor and no redeemers:
+        // evaluate_plutus_scripts must (a) re-encode the tx via the
+        // deterministic fallback rather than failing, and (b) succeed
+        // without resolving any of the unrelated UTxOs above (the tx body
+        // has no inputs, so the resolution loop iterates zero times).
         let tx = Transaction::empty_with_hash(Hash32::ZERO);
+        assert!(tx.raw_cbor.is_none(), "precondition: locally-built tx");
         let slot_config = SlotConfig::default();
         let result =
             evaluate_plutus_scripts(&tx, &utxo_set, None, (10_000_000, 10_000_000), &slot_config);
         assert!(
-            matches!(result, Err(PlutusError::MissingTxCbor)),
-            "Missing raw_cbor should fail early with MissingTxCbor"
+            result.is_ok(),
+            "Locally-built tx with no redeemers must succeed via the re-encode fallback: {:?}",
+            result.err()
         );
     }
 
