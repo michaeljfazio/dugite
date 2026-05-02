@@ -937,4 +937,311 @@ mod tests {
         assert!(active.is_empty());
         assert!(hot_keys.is_empty());
     }
+
+    // ─── convert_validation_error ────────────────────────────────────────────
+    //
+    // The N2C tx-submission path calls `convert_validation_error` on every
+    // ledger rejection.  cardano-cli surfaces the resulting `TxValidationError`
+    // discriminant to operators and to scripts that match on it, so the
+    // ledger→network mapping is part of our wire contract.  A regression here
+    // would silently rebrand "fee too small" rejections as generic script
+    // failures (etc.) — exactly the class of bug that bites operators in
+    // production.
+
+    #[test]
+    fn convert_validation_error_preserves_known_variants() {
+        use dugite_ledger::validation::ValidationError as VE;
+
+        // Structural pass-throughs: discriminant + payload must be preserved.
+        let e = convert_validation_error(VE::FeeTooSmall {
+            minimum: 100,
+            actual: 50,
+        });
+        assert!(matches!(
+            e,
+            TxValidationError::FeeTooSmall {
+                minimum: 100,
+                actual: 50
+            }
+        ));
+
+        let e = convert_validation_error(VE::TxTooLarge {
+            maximum: 16384,
+            actual: 20000,
+        });
+        assert!(matches!(
+            e,
+            TxValidationError::TxTooLarge {
+                maximum: 16384,
+                actual: 20000
+            }
+        ));
+
+        let e = convert_validation_error(VE::ValueNotConserved {
+            inputs: 10,
+            outputs: 9,
+            fee: 0,
+        });
+        assert!(matches!(
+            e,
+            TxValidationError::ValueNotConserved {
+                inputs: 10,
+                outputs: 9,
+                fee: 0
+            }
+        ));
+
+        let e = convert_validation_error(VE::InsufficientCollateral);
+        assert!(matches!(e, TxValidationError::InsufficientCollateral));
+
+        let e = convert_validation_error(VE::NoInputs);
+        assert!(matches!(e, TxValidationError::NoInputs));
+
+        let e = convert_validation_error(VE::ValueOverflow);
+        assert!(matches!(e, TxValidationError::ValueOverflow));
+    }
+
+    #[test]
+    fn convert_validation_error_collapses_conway_predicates_to_script_failed() {
+        use dugite_ledger::validation::ValidationError as VE;
+
+        // Many Conway-only predicates have no dedicated network-side variant
+        // and intentionally fold into `ScriptFailed { reason }` so cardano-cli
+        // shows a stable rejection class.  Verify a few representatives so
+        // refactoring the convert table doesn't quietly drop these branches.
+        let cases: Vec<VE> = vec![
+            VE::ZeroWithdrawal {
+                account: "stake_test1abc".to_string(),
+            },
+            VE::DRepIncorrectDeposit {
+                declared: 1,
+                expected: 500_000_000,
+            },
+            VE::ProposalDepositIncorrect {
+                declared: 1,
+                expected: 100_000_000_000,
+            },
+            VE::DisallowedVoters { violations: vec![] },
+            VE::VotersDoNotExist { voters: vec![] },
+            VE::VotingOnExpiredGovAction {
+                expired_votes: vec![],
+            },
+            VE::ExtraRedeemer {
+                tag: "Spend".to_string(),
+                index: 0,
+            },
+        ];
+        for v in cases {
+            let mapped = convert_validation_error(v);
+            assert!(
+                matches!(mapped, TxValidationError::ScriptFailed { .. }),
+                "Conway predicate did not collapse to ScriptFailed: {mapped:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn convert_validation_error_maps_size_predicates_to_size_variants() {
+        use dugite_ledger::validation::ValidationError as VE;
+
+        // `TxRefScriptSizeTooLarge` is intentionally remapped to `TxTooLarge`
+        // because that is the closest semantic match — exercised here so
+        // future refactors keep the mapping intentional rather than accidental.
+        let e = convert_validation_error(VE::TxRefScriptSizeTooLarge {
+            actual: 2048,
+            limit: 1024,
+        });
+        assert!(matches!(
+            e,
+            TxValidationError::TxTooLarge {
+                maximum: 1024,
+                actual: 2048
+            }
+        ));
+
+        let e = convert_validation_error(VE::OutputValueTooLarge {
+            maximum: 5000,
+            actual: 6000,
+        });
+        assert!(matches!(
+            e,
+            TxValidationError::OutputValueTooLarge {
+                maximum: 5000,
+                actual: 6000
+            }
+        ));
+    }
+
+    // ─── utxo_to_snapshot ────────────────────────────────────────────────────
+
+    fn enterprise_addr_bytes() -> Vec<u8> {
+        // Type-6 (Enterprise, key-hash payment) on mainnet: header = 0b0110_0001
+        // followed by a 28-byte payment key hash.
+        let mut bytes = vec![0b0110_0001];
+        bytes.extend_from_slice(&[0x11; 28]);
+        bytes
+    }
+
+    #[test]
+    fn utxo_to_snapshot_lovelace_only() {
+        use dugite_primitives::address::Address;
+        use dugite_primitives::transaction::{OutputDatum, TransactionInput, TransactionOutput};
+        use dugite_primitives::value::Value;
+
+        let addr_bytes = enterprise_addr_bytes();
+        let address = Address::from_bytes(&addr_bytes).expect("decode enterprise addr");
+
+        let input = TransactionInput {
+            transaction_id: Hash32::from_bytes([0x42; 32]),
+            index: 1,
+        };
+        let output = TransactionOutput {
+            address,
+            value: Value::lovelace(7_654_321),
+            datum: OutputDatum::None,
+            script_ref: None,
+            is_legacy: false,
+            raw_cbor: None,
+        };
+
+        let snap = utxo_to_snapshot(&input, &output);
+        assert_eq!(snap.tx_hash, [0x42u8; 32]);
+        assert_eq!(snap.output_index, 1);
+        assert_eq!(snap.address_bytes, addr_bytes);
+        assert_eq!(snap.lovelace, 7_654_321);
+        assert!(snap.multi_asset.is_empty());
+        assert!(snap.datum_hash.is_none());
+        assert!(snap.raw_cbor.is_none());
+    }
+
+    #[test]
+    fn utxo_to_snapshot_propagates_datum_hash_and_raw_cbor() {
+        use dugite_primitives::address::Address;
+        use dugite_primitives::hash::DatumHash;
+        use dugite_primitives::transaction::{OutputDatum, TransactionInput, TransactionOutput};
+        use dugite_primitives::value::Value;
+
+        let addr_bytes = enterprise_addr_bytes();
+        let address = Address::from_bytes(&addr_bytes).unwrap();
+        let datum_hash = DatumHash::from_bytes([0xCD; 32]);
+        let raw = vec![0xDE, 0xAD, 0xBE, 0xEF];
+        let output = TransactionOutput {
+            address,
+            value: Value::lovelace(1_000_000),
+            datum: OutputDatum::DatumHash(datum_hash),
+            script_ref: None,
+            is_legacy: false,
+            raw_cbor: Some(raw.clone()),
+        };
+        let input = TransactionInput {
+            transaction_id: Hash32::from_bytes([0x01; 32]),
+            index: 0,
+        };
+
+        let snap = utxo_to_snapshot(&input, &output);
+        assert_eq!(snap.datum_hash.as_deref(), Some(&[0xCDu8; 32][..]));
+        assert_eq!(snap.raw_cbor.as_deref(), Some(raw.as_slice()));
+    }
+
+    #[test]
+    fn utxo_to_snapshot_inline_datum_does_not_set_datum_hash() {
+        use dugite_primitives::address::Address;
+        use dugite_primitives::transaction::{
+            OutputDatum, PlutusData, TransactionInput, TransactionOutput,
+        };
+        use dugite_primitives::value::Value;
+
+        // Only `OutputDatum::DatumHash` populates `snap.datum_hash`; inline
+        // datums travel via `raw_cbor` instead.  Locking that in prevents
+        // accidental hash leakage from inline-datum outputs.
+        let addr = Address::from_bytes(&enterprise_addr_bytes()).unwrap();
+        let output = TransactionOutput {
+            address: addr,
+            value: Value::lovelace(1),
+            datum: OutputDatum::InlineDatum {
+                data: PlutusData::Integer(42i128),
+                raw_cbor: Some(vec![0x18, 0x2A]),
+            },
+            script_ref: None,
+            is_legacy: false,
+            raw_cbor: None,
+        };
+        let input = TransactionInput {
+            transaction_id: Hash32::from_bytes([0; 32]),
+            index: 0,
+        };
+        let snap = utxo_to_snapshot(&input, &output);
+        assert!(snap.datum_hash.is_none());
+    }
+
+    // ─── Connection metric bridges ───────────────────────────────────────────
+
+    #[test]
+    fn n2n_connection_metrics_increments_total_only() {
+        use dugite_network::ConnectionMetrics as _;
+        use std::sync::atomic::Ordering::Relaxed;
+
+        // The active gauge is intentionally NOT bumped here — it is sourced
+        // from `ConnectionLifecycleManager` to avoid drift.  This test pins
+        // that contract: see the inline comment in `N2NConnectionMetrics`.
+        let metrics = Arc::new(crate::metrics::NodeMetrics::new());
+        let bridge = N2NConnectionMetrics {
+            metrics: metrics.clone(),
+        };
+        bridge.on_connect();
+        bridge.on_connect();
+        assert_eq!(metrics.n2n_connections_total.load(Relaxed), 2);
+        assert_eq!(metrics.n2n_connections_active.load(Relaxed), 0);
+        bridge.on_disconnect();
+        // disconnect must not decrement either counter.
+        assert_eq!(metrics.n2n_connections_total.load(Relaxed), 2);
+        assert_eq!(metrics.n2n_connections_active.load(Relaxed), 0);
+    }
+
+    #[test]
+    fn n2c_connection_metrics_tracks_active_gauge() {
+        use dugite_network::ConnectionMetrics as _;
+        use std::sync::atomic::Ordering::Relaxed;
+
+        // N2C connections are short-lived (one per cardano-cli invocation) and
+        // self-contained, so the bridge maintains the active gauge directly.
+        let metrics = Arc::new(crate::metrics::NodeMetrics::new());
+        let bridge = N2CConnectionMetrics {
+            metrics: metrics.clone(),
+        };
+        bridge.on_connect();
+        bridge.on_connect();
+        assert_eq!(metrics.n2c_connections_total.load(Relaxed), 2);
+        assert_eq!(metrics.n2c_connections_active.load(Relaxed), 2);
+        bridge.on_disconnect();
+        assert_eq!(metrics.n2c_connections_active.load(Relaxed), 1);
+        bridge.on_disconnect();
+        assert_eq!(metrics.n2c_connections_active.load(Relaxed), 0);
+        // total is monotonic — disconnects must not roll it back.
+        assert_eq!(metrics.n2c_connections_total.load(Relaxed), 2);
+    }
+
+    #[test]
+    fn connection_metrics_record_protocol_error() {
+        use dugite_network::ConnectionMetrics as _;
+
+        let metrics = Arc::new(crate::metrics::NodeMetrics::new());
+        let bridge = N2NConnectionMetrics {
+            metrics: metrics.clone(),
+        };
+        bridge.on_error("handshake_refused");
+        bridge.on_error("handshake_refused");
+        bridge.on_error("decode_failed");
+        // Sanity-check that distinct labels accumulate independently in the
+        // protocol-error map exposed via Prometheus.
+        let prometheus = metrics.to_prometheus();
+        assert!(
+            prometheus.contains("handshake_refused\"} 2"),
+            "expected handshake_refused=2 in:\n{prometheus}"
+        );
+        assert!(
+            prometheus.contains("decode_failed\"} 1"),
+            "expected decode_failed=1 in:\n{prometheus}"
+        );
+    }
 }
