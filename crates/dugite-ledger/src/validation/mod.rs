@@ -544,6 +544,37 @@ pub enum ValidationError {
         /// whose return-address network does not match `expected`.
         mismatched: Vec<(String, u8)>,
     },
+    /// Conway GOV rule: one or more `TreasuryWithdrawals` proposals carry a
+    /// destination reward-address whose network id does not match the node's
+    /// configured network.
+    ///
+    /// Per Haskell `processProposal` in
+    /// `eras/conway/impl/src/Cardano/Ledger/Conway/Rules/Gov.hs`
+    /// (`TreasuryWithdrawals` branch), every key in the withdrawals map is a
+    /// reward address whose network id (bit 0 of the header byte;
+    /// `0` = testnet, `1` = mainnet) must match the node's network.  Like
+    /// [`ValidationError::ProposalProcedureNetworkIdMismatch`], this check is
+    /// **always enforced** — there is no Conway-bootstrap skip; the network
+    /// id is a structural property of the proposal payload.
+    ///
+    /// This predicate is silently skipped if `ValidationContext::node_network`
+    /// is `None` (lenient default for callers that haven't plumbed in the
+    /// node network — same convention used by the other GOV predicates).
+    ///
+    /// All mismatched destinations across all `TreasuryWithdrawals` proposals
+    /// in the transaction are aggregated into a single predicate failure,
+    /// mirroring Haskell's `NonEmpty` predicate-failure shape.
+    #[error(
+        "TreasuryWithdrawalsNetworkIdMismatch: expected={expected}, mismatched={mismatched:?}"
+    )]
+    TreasuryWithdrawalsNetworkIdMismatch {
+        /// Expected network id (`0` testnet / `1` mainnet) — the node's
+        /// configured network.
+        expected: u8,
+        /// `(hex-encoded reward_addr, actual_network_id)` for every TW
+        /// destination address whose network id does not match `expected`.
+        mismatched: Vec<(String, u8)>,
+    },
     /// Alonzo UTXOW rule: a redeemer in the witness set has no matching
     /// script purpose (spending input, minting policy, withdrawal, cert, vote).
     ///
@@ -1179,6 +1210,41 @@ pub fn validate_transaction_with_context(
                 .expect("predicate fired implies node_network is Some")
                 .to_u8();
             extra_errors.push(ValidationError::ProposalProcedureNetworkIdMismatch {
+                expected,
+                mismatched,
+            });
+        }
+    }
+
+    // -------------------------------------------------------------------
+    // TreasuryWithdrawalsNetworkIdMismatch: every destination reward
+    // address in a `TreasuryWithdrawals` proposal must be on the same
+    // network as the node.  Per Haskell `processProposal` in
+    // `Conway.Rules.Gov` (`TreasuryWithdrawals` branch), this check is
+    // **always enforced** (no Conway-bootstrap skip — the network id is a
+    // structural property of the proposal, not a post-bootstrap state
+    // lookup).  All mismatched destinations across all TreasuryWithdrawals
+    // proposals are aggregated into a single error, mirroring Haskell's
+    // `NonEmpty` predicate-failure shape.
+    //
+    // Runs only when the transaction submits at least one proposal,
+    // mirroring `processProposal`'s per-proposal invocation.
+    // -------------------------------------------------------------------
+    if params.protocol_version_major >= 9 && !tx.body.proposal_procedures.is_empty() {
+        let mut mismatched: Vec<(String, u8)> = Vec::new();
+        for proposal in &tx.body.proposal_procedures {
+            mismatched.extend(conway::treasury_withdrawal_network_mismatches(
+                proposal, &context,
+            ));
+        }
+        if !mismatched.is_empty() {
+            // SAFETY: predicate fired -> ctx.node_network must be Some
+            // (the predicate returns an empty vec when node_network is None).
+            let expected = context
+                .node_network
+                .expect("predicate fired implies node_network is Some")
+                .to_u8();
+            extra_errors.push(ValidationError::TreasuryWithdrawalsNetworkIdMismatch {
                 expected,
                 mismatched,
             });

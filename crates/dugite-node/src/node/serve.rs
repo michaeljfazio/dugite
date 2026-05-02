@@ -620,6 +620,14 @@ pub(crate) fn convert_validation_error(
                 "ProposalProcedureNetworkIdMismatch: expected={expected}, mismatched={mismatched:?}"
             ),
         },
+        VE::TreasuryWithdrawalsNetworkIdMismatch {
+            expected,
+            mismatched,
+        } => TxValidationError::ScriptFailed {
+            reason: format!(
+                "TreasuryWithdrawalsNetworkIdMismatch: expected={expected}, mismatched={mismatched:?}"
+            ),
+        },
         VE::ExtraRedeemer { tag, index } => TxValidationError::ScriptFailed {
             reason: format!(
                 "Extra redeemer with no matching script purpose: tag={tag}, index={index}"

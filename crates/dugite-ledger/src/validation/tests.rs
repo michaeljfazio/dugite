@@ -13393,4 +13393,178 @@ mod tests {
             );
         }
     }
+
+    // -------------------------------------------------------------------------
+    // TreasuryWithdrawalsNetworkIdMismatch integration tests for
+    // `validate_transaction_with_context`
+    //
+    // Per Haskell `processProposal` in `Cardano.Ledger.Conway.Rules.Gov`
+    // (TreasuryWithdrawals branch), every destination address in the
+    // withdrawals map must be on the same network as the node.  Bit 0 of the
+    // reward-account header byte encodes the network (`0` = testnet,
+    // `1` = mainnet).  This check is **always enforced** — there is NO
+    // Conway-bootstrap skip.  All mismatched destinations across all TW
+    // proposals are aggregated into a single error.
+    // -------------------------------------------------------------------------
+
+    /// Build a 29-byte reward address whose header network bit is the given
+    /// value (0 = testnet, 1 = mainnet) and whose 28-byte credential is
+    /// `[cred_byte; 28]`.
+    fn reward_addr_29(network_bit: u8, cred_byte: u8) -> Vec<u8> {
+        let header: u8 = 0xe0 | (network_bit & 0x01);
+        let mut bytes = Vec::with_capacity(29);
+        bytes.push(header);
+        bytes.extend_from_slice(&[cred_byte; 28]);
+        bytes
+    }
+
+    /// Build a `TreasuryWithdrawals` proposal whose destinations are the
+    /// given `(reward_addr_bytes, lovelace)` entries.  `return_addr` is set
+    /// to mainnet so the proposal's *own* network-id check is satisfied;
+    /// only the withdrawal-destinations check is exercised.
+    fn treasury_withdrawals_proposal_for_test(
+        entries: Vec<(Vec<u8>, Lovelace)>,
+    ) -> ProposalProcedure {
+        let withdrawals: BTreeMap<Vec<u8>, Lovelace> = entries.into_iter().collect();
+        ProposalProcedure {
+            deposit: Lovelace(1_000_000_000),
+            return_addr: reward_addr_29(1, 0xCC),
+            gov_action: GovAction::TreasuryWithdrawals {
+                withdrawals,
+                policy_hash: None,
+            },
+            anchor: anchor_stub(),
+        }
+    }
+
+    /// Post-bootstrap: a TreasuryWithdrawals proposal carries a destination
+    /// whose network does not match the node.  The validator must surface
+    /// `TreasuryWithdrawalsNetworkIdMismatch` whose `mismatched` payload
+    /// contains the offending hex address and `actual = 0` (testnet).
+    #[test]
+    fn test_validate_transaction_rejects_tw_wrong_network_post_bootstrap() {
+        let params = conway_pparams_pv10();
+        let utxo_set = UtxoSet::new();
+
+        // Node = mainnet; one entry on testnet.
+        let bad = reward_addr_29(0, 0x11);
+        let bad_hex: String = bad.iter().fold(String::new(), |mut s, b| {
+            use std::fmt::Write;
+            let _ = write!(s, "{b:02x}");
+            s
+        });
+        let proposal = treasury_withdrawals_proposal_for_test(vec![(bad, Lovelace(42))]);
+        let tx = make_gov_tx(vec![proposal], BTreeMap::new());
+
+        let context =
+            ValidationContext::new().with_network(dugite_primitives::network::NetworkId::Mainnet);
+        let result =
+            validate_transaction_with_context(&tx, &utxo_set, &params, 100, 500, None, context);
+
+        let errors =
+            result.expect_err("expected TreasuryWithdrawalsNetworkIdMismatch predicate to fire");
+        let (expected, mismatched) = errors
+            .iter()
+            .find_map(|e| match e {
+                ValidationError::TreasuryWithdrawalsNetworkIdMismatch {
+                    expected,
+                    mismatched,
+                } => Some((*expected, mismatched)),
+                _ => None,
+            })
+            .unwrap_or_else(|| {
+                panic!("TreasuryWithdrawalsNetworkIdMismatch not in error set: {errors:?}")
+            });
+        assert_eq!(expected, 1, "node is mainnet -> expected = 1");
+        assert_eq!(mismatched.len(), 1, "exactly one mismatched destination");
+        assert_eq!(mismatched[0].0, bad_hex);
+        assert_eq!(mismatched[0].1, 0, "actual must be 0 (testnet)");
+    }
+
+    /// At PV=9 (Conway bootstrap) the TreasuryWithdrawals network-id check
+    /// is **still enforced** — there is no bootstrap skip for this rule.
+    #[test]
+    fn test_validate_transaction_rejects_tw_wrong_network_in_bootstrap() {
+        let mut params = ProtocolParameters::mainnet_defaults();
+        params.protocol_version_major = 9; // Conway bootstrap.
+        let utxo_set = UtxoSet::new();
+
+        // Node = mainnet; destination on testnet.
+        let bad = reward_addr_29(0, 0x22);
+        let proposal = treasury_withdrawals_proposal_for_test(vec![(bad, Lovelace(7))]);
+        let tx = make_gov_tx(vec![proposal], BTreeMap::new());
+
+        let context =
+            ValidationContext::new().with_network(dugite_primitives::network::NetworkId::Mainnet);
+        let result =
+            validate_transaction_with_context(&tx, &utxo_set, &params, 100, 500, None, context);
+
+        let errors =
+            result.expect_err("expected TreasuryWithdrawalsNetworkIdMismatch even at PV=9");
+        assert!(
+            errors.iter().any(|e| matches!(
+                e,
+                ValidationError::TreasuryWithdrawalsNetworkIdMismatch { .. }
+            )),
+            "TreasuryWithdrawalsNetworkIdMismatch MUST fire at PV=9 (no bootstrap skip); \
+             got: {errors:?}"
+        );
+    }
+
+    /// Multiple TreasuryWithdrawals proposals each with mismatched
+    /// destinations are aggregated into a SINGLE
+    /// `TreasuryWithdrawalsNetworkIdMismatch` error whose `mismatched`
+    /// payload covers every offending entry across all proposals.
+    #[test]
+    fn test_validate_transaction_aggregates_tw_mismatches_into_single_error() {
+        let params = conway_pparams_pv10();
+        let utxo_set = UtxoSet::new();
+
+        // Node = mainnet.  Two TW proposals, each with two testnet
+        // destinations -> 4 mismatches total in one error.
+        let p1 = treasury_withdrawals_proposal_for_test(vec![
+            (reward_addr_29(0, 0xAA), Lovelace(1)),
+            (reward_addr_29(0, 0xBB), Lovelace(2)),
+        ]);
+        let p2 = treasury_withdrawals_proposal_for_test(vec![
+            (reward_addr_29(0, 0xCC), Lovelace(3)),
+            (reward_addr_29(0, 0xDD), Lovelace(4)),
+        ]);
+        let tx = make_gov_tx(vec![p1, p2], BTreeMap::new());
+
+        let context =
+            ValidationContext::new().with_network(dugite_primitives::network::NetworkId::Mainnet);
+        let result =
+            validate_transaction_with_context(&tx, &utxo_set, &params, 100, 500, None, context);
+
+        let errors =
+            result.expect_err("expected TreasuryWithdrawalsNetworkIdMismatch predicate to fire");
+        let count = errors
+            .iter()
+            .filter(|e| {
+                matches!(
+                    e,
+                    ValidationError::TreasuryWithdrawalsNetworkIdMismatch { .. }
+                )
+            })
+            .count();
+        assert_eq!(
+            count, 1,
+            "All TW destination mismatches must aggregate into ONE error"
+        );
+        let mismatched = errors
+            .iter()
+            .find_map(|e| match e {
+                ValidationError::TreasuryWithdrawalsNetworkIdMismatch { mismatched, .. } => {
+                    Some(mismatched)
+                }
+                _ => None,
+            })
+            .expect("variant present");
+        assert_eq!(
+            mismatched.len(),
+            4,
+            "all 4 mismatches surfaced; got: {mismatched:?}"
+        );
+    }
 }

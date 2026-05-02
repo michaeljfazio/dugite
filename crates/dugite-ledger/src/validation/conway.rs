@@ -552,6 +552,78 @@ pub(super) fn is_proposal_return_addr_wrong_network(
     }
 }
 
+/// Returns the list of `(hex_addr, actual_network_id)` mismatches between a
+/// `TreasuryWithdrawals` proposal's destination addresses and the node's
+/// configured network.
+///
+/// Per Haskell `processProposal` in
+/// `eras/conway/impl/src/Cardano/Ledger/Conway/Rules/Gov.hs`, when the
+/// proposal action is `TreasuryWithdrawals` every key in the withdrawals
+/// map is a reward address whose network id must match the node's network.
+/// Bit 0 of the reward-account header byte encodes the network
+/// (`0` = testnet, `1` = mainnet) — same encoding as
+/// [`is_proposal_return_addr_wrong_network`] and `WrongNetworkWithdrawal`
+/// in `phase1.rs`.
+///
+/// Like the proposal-procedure network check, this predicate is **always
+/// enforced** — there is no Conway-bootstrap skip; the network id is a
+/// structural property of the proposal payload, not a post-bootstrap
+/// state lookup.
+///
+/// The predicate returns an empty `Vec` (proposal accepted) when:
+///   - `proposal.gov_action` is not [`GovAction::TreasuryWithdrawals`] —
+///     this rule applies only to TW proposals, mirroring Haskell's
+///     branch-specific check.
+///   - `ctx.node_network` is `None` — lenient default, mirroring the
+///     convention used by the other GOV predicates when the caller has
+///     not plumbed in the relevant context.
+///   - All entries' header network bits match `ctx.node_network`.
+///
+/// The shape (`Vec<(String, u8)>`) is intentional — every mismatched entry
+/// in a single TreasuryWithdrawals proposal is surfaced, and the caller in
+/// `validation/mod.rs` flattens these across all proposals into a single
+/// [`ValidationError::TreasuryWithdrawalsNetworkIdMismatch`], mirroring
+/// Haskell's `NonEmpty` predicate-failure shape.
+///
+/// Reference: Haskell `TreasuryWithdrawalsNetworkIdMismatch` in
+/// `eras/conway/impl/src/Cardano/Ledger/Conway/Rules/Gov.hs`,
+/// inside `processProposal`'s `TreasuryWithdrawals` branch.  Always
+/// enforced (no bootstrap skip).
+pub(super) fn treasury_withdrawal_network_mismatches(
+    proposal: &ProposalProcedure,
+    ctx: &ValidationContext,
+) -> Vec<(String, u8)> {
+    // Only TreasuryWithdrawals proposals are subject to this rule.
+    let GovAction::TreasuryWithdrawals { withdrawals, .. } = &proposal.gov_action else {
+        return Vec::new();
+    };
+    // Lenient default — skip when the node network isn't plumbed in.
+    let Some(expected_net) = ctx.node_network else {
+        return Vec::new();
+    };
+    let expected = expected_net.to_u8();
+    let mut out: Vec<(String, u8)> = Vec::new();
+    for (addr, _coin) in withdrawals.iter() {
+        // Empty address → skip (decoder-shape error, not this predicate's
+        // concern; mirrors `is_proposal_return_addr_wrong_network`).
+        let Some(&header) = addr.first() else {
+            continue;
+        };
+        let actual = header & 0x01;
+        if actual != expected {
+            let addr_hex = addr
+                .iter()
+                .fold(String::with_capacity(addr.len() * 2), |mut s, b| {
+                    use std::fmt::Write;
+                    let _ = write!(s, "{b:02x}");
+                    s
+                });
+            out.push((addr_hex, actual));
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::{BTreeMap, HashMap, HashSet};
@@ -1850,6 +1922,117 @@ mod tests {
             is_proposal_return_addr_wrong_network(&proposal, &ctx),
             None,
             "Empty return_addr must short-circuit (None)"
+        );
+    }
+
+    // ---------------------------------------------------------------------------
+    // treasury_withdrawal_network_mismatches —
+    //   TreasuryWithdrawalsNetworkIdMismatch (Conway GOV)
+    //
+    // Per Haskell `processProposal`, every destination address in a
+    // TreasuryWithdrawals proposal's `withdrawals` map must be on the same
+    // network as the node.  Bit 0 of the reward-account header byte encodes
+    // the network (0 = testnet, 1 = mainnet).  This check is **always
+    // enforced** — there is NO Conway-bootstrap skip (same as
+    // `ProposalProcedureNetworkIdMismatch`).  When `ctx.node_network` is
+    // `None`, the predicate returns an empty vec (lenient default).
+    // ---------------------------------------------------------------------------
+
+    /// Build a `TreasuryWithdrawals` proposal whose `withdrawals` map is
+    /// the given list of `(reward_addr_bytes, coin)` entries.  No
+    /// `policy_hash` (constitution check is irrelevant to this predicate).
+    fn treasury_withdrawals_proposal(entries: Vec<(Vec<u8>, Lovelace)>) -> ProposalProcedure {
+        let withdrawals: BTreeMap<Vec<u8>, Lovelace> = entries.into_iter().collect();
+        ProposalProcedure {
+            deposit: Lovelace(1_000_000_000),
+            return_addr: return_addr_29_with_network(1), // node network — irrelevant here
+            gov_action: GovAction::TreasuryWithdrawals {
+                withdrawals,
+                policy_hash: None,
+            },
+            anchor: Anchor {
+                url: String::new(),
+                data_hash: Hash32::from_bytes([0u8; 32]),
+            },
+        }
+    }
+
+    #[test]
+    fn test_treasury_withdrawals_network_mismatch_collects_all() {
+        // node = mainnet (1).  Two testnet entries + one mainnet entry → only
+        // the testnet entries are surfaced.
+        let mut testnet_a = vec![0xe0u8];
+        testnet_a.extend_from_slice(&[0x11u8; 28]);
+        let mut testnet_b = vec![0xe0u8];
+        testnet_b.extend_from_slice(&[0x22u8; 28]);
+        let mut mainnet_ok = vec![0xe1u8];
+        mainnet_ok.extend_from_slice(&[0x33u8; 28]);
+
+        let proposal = treasury_withdrawals_proposal(vec![
+            (testnet_a.clone(), Lovelace(1)),
+            (testnet_b.clone(), Lovelace(2)),
+            (mainnet_ok.clone(), Lovelace(3)),
+        ]);
+        let ctx = ValidationContext::new().with_network(NetworkId::Mainnet);
+
+        let mismatches = treasury_withdrawal_network_mismatches(&proposal, &ctx);
+        assert_eq!(
+            mismatches.len(),
+            2,
+            "must surface both testnet entries; got: {mismatches:?}"
+        );
+        for (_, actual) in &mismatches {
+            assert_eq!(
+                *actual, 0,
+                "mismatched entries must report actual=0 (testnet)"
+            );
+        }
+    }
+
+    #[test]
+    fn test_treasury_withdrawals_network_match_returns_empty() {
+        // All entries' network bit matches the node → empty vec.
+        let mut a = vec![0xe1u8];
+        a.extend_from_slice(&[0x11u8; 28]);
+        let mut b = vec![0xe1u8];
+        b.extend_from_slice(&[0x22u8; 28]);
+
+        let proposal = treasury_withdrawals_proposal(vec![(a, Lovelace(1)), (b, Lovelace(2))]);
+        let ctx = ValidationContext::new().with_network(NetworkId::Mainnet);
+
+        assert!(
+            treasury_withdrawal_network_mismatches(&proposal, &ctx).is_empty(),
+            "All-match TreasuryWithdrawals must produce no mismatches"
+        );
+    }
+
+    #[test]
+    fn test_treasury_withdrawals_network_check_skips_non_tw_proposal() {
+        // A non-TreasuryWithdrawals proposal must produce no mismatches even
+        // if `return_addr` is on the wrong network — that's a different
+        // predicate (`ProposalProcedureNetworkIdMismatch`).
+        let proposal = proposal_with_addr(return_addr_29_with_network(0));
+        let ctx = ValidationContext::new().with_network(NetworkId::Mainnet);
+
+        assert!(
+            treasury_withdrawal_network_mismatches(&proposal, &ctx).is_empty(),
+            "Non-TreasuryWithdrawals proposals must short-circuit (empty vec)"
+        );
+    }
+
+    #[test]
+    fn test_treasury_withdrawals_network_check_skipped_when_network_none() {
+        // ctx.node_network = None → lenient default (empty vec) regardless
+        // of the entries' network bits.
+        let mut testnet = vec![0xe0u8];
+        testnet.extend_from_slice(&[0x11u8; 28]);
+        let proposal = treasury_withdrawals_proposal(vec![(testnet, Lovelace(1))]);
+        let ctx = ValidationContext::new();
+        assert!(ctx.node_network.is_none());
+
+        assert!(
+            treasury_withdrawal_network_mismatches(&proposal, &ctx).is_empty(),
+            "Predicate must skip (empty vec) when node_network is None"
         );
     }
 }
