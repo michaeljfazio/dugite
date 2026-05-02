@@ -13567,4 +13567,100 @@ mod tests {
             "all 4 mismatches surfaced; got: {mismatched:?}"
         );
     }
+
+    // -------------------------------------------------------------------------
+    // ZeroTreasuryWithdrawals integration tests for
+    // `validate_transaction_with_context`
+    //
+    // Per Haskell `processProposal` (TreasuryWithdrawals branch), the sum of
+    // every withdrawal entry's `Coin` must be strictly positive.  The check
+    // is **skipped during Conway bootstrap** (PV == 9).
+    // -------------------------------------------------------------------------
+
+    /// Build a TreasuryWithdrawals proposal whose entries all match the
+    /// node's network (so the network-id check is satisfied) and whose
+    /// `return_addr` is mainnet (so the proposal-procedure network check
+    /// is also satisfied).  All entries are zero-Coin so `sum == 0`.
+    fn tw_proposal_mainnet_zero_sum() -> ProposalProcedure {
+        let mut a = vec![0xe1u8];
+        a.extend_from_slice(&[0xAAu8; 28]);
+        let mut b = vec![0xe1u8];
+        b.extend_from_slice(&[0xBBu8; 28]);
+        let mut withdrawals: BTreeMap<Vec<u8>, Lovelace> = BTreeMap::new();
+        withdrawals.insert(a, Lovelace(0));
+        withdrawals.insert(b, Lovelace(0));
+        ProposalProcedure {
+            deposit: Lovelace(1_000_000_000),
+            return_addr: reward_addr_29(1, 0xCC),
+            gov_action: GovAction::TreasuryWithdrawals {
+                withdrawals,
+                policy_hash: None,
+            },
+            anchor: anchor_stub(),
+        }
+    }
+
+    /// Post-bootstrap (PV=10): a TreasuryWithdrawals proposal whose total
+    /// amount is zero must surface `ZeroTreasuryWithdrawals` whose
+    /// `offending_proposals` carries the proposal's hex `return_addr`.
+    #[test]
+    fn test_validate_transaction_rejects_zero_tw_post_bootstrap() {
+        let params = conway_pparams_pv10();
+        let utxo_set = UtxoSet::new();
+
+        let proposal = tw_proposal_mainnet_zero_sum();
+        let expected_id_hex: String =
+            proposal.return_addr.iter().fold(String::new(), |mut s, b| {
+                use std::fmt::Write;
+                let _ = write!(s, "{b:02x}");
+                s
+            });
+        let tx = make_gov_tx(vec![proposal], BTreeMap::new());
+
+        let context =
+            ValidationContext::new().with_network(dugite_primitives::network::NetworkId::Mainnet);
+        let result =
+            validate_transaction_with_context(&tx, &utxo_set, &params, 100, 500, None, context);
+
+        let errors = result.expect_err("expected ZeroTreasuryWithdrawals predicate to fire");
+        let offending = errors
+            .iter()
+            .find_map(|e| match e {
+                ValidationError::ZeroTreasuryWithdrawals {
+                    offending_proposals,
+                } => Some(offending_proposals),
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("ZeroTreasuryWithdrawals not in error set: {errors:?}"));
+        assert_eq!(offending.len(), 1, "exactly one offending proposal");
+        assert_eq!(offending[0], expected_id_hex);
+    }
+
+    /// At PV=9 (Conway bootstrap) the zero-sum check is skipped, so the
+    /// validator must NOT produce `ZeroTreasuryWithdrawals` even for a
+    /// zero-sum TreasuryWithdrawals proposal.  Other Phase-1 errors may
+    /// still be present.
+    #[test]
+    fn test_validate_transaction_skips_zero_tw_in_bootstrap() {
+        let mut params = ProtocolParameters::mainnet_defaults();
+        params.protocol_version_major = 9; // Conway bootstrap.
+        let utxo_set = UtxoSet::new();
+
+        let proposal = tw_proposal_mainnet_zero_sum();
+        let tx = make_gov_tx(vec![proposal], BTreeMap::new());
+
+        let context =
+            ValidationContext::new().with_network(dugite_primitives::network::NetworkId::Mainnet);
+        let result =
+            validate_transaction_with_context(&tx, &utxo_set, &params, 100, 500, None, context);
+
+        if let Err(errors) = result {
+            assert!(
+                !errors
+                    .iter()
+                    .any(|e| matches!(e, ValidationError::ZeroTreasuryWithdrawals { .. })),
+                "ZeroTreasuryWithdrawals must not fire at PV=9 (bootstrap); got: {errors:?}"
+            );
+        }
+    }
 }

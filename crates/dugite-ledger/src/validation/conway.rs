@@ -624,6 +624,54 @@ pub(super) fn treasury_withdrawal_network_mismatches(
     out
 }
 
+/// Returns `true` when the proposal is a `TreasuryWithdrawals` action whose
+/// total amount is exactly zero — including the all-zero-entries case and
+/// the empty-map case.
+///
+/// Per Haskell `processProposal` in
+/// `eras/conway/impl/src/Cardano/Ledger/Conway/Rules/Gov.hs`
+/// (`TreasuryWithdrawals` branch), the sum of every entry's `Coin` must be
+/// strictly positive.  This guards against degenerate proposals that lock
+/// up a deposit without actually moving any treasury value.
+///
+/// The check is **skipped during Conway bootstrap** (`pvMajor == 9`) per
+/// `hardforkConwayBootstrapPhase`, returning `false` regardless of the
+/// withdrawals contents.  It activates from PV ≥ 10 onwards.
+///
+/// The predicate returns `false` (proposal accepted) when:
+///   - `params.protocol_version_major == 9` — bootstrap skip.
+///   - `proposal.gov_action` is not [`GovAction::TreasuryWithdrawals`] —
+///     this rule applies only to TW proposals, mirroring Haskell's
+///     branch-specific check.
+///   - The sum of withdrawal `Coin` values is non-zero.
+///
+/// The caller (in `validation/mod.rs`) collects every offending TW
+/// proposal's descriptor (or hex of its `return_addr`) into a single
+/// [`ValidationError::ZeroTreasuryWithdrawals`], mirroring Haskell's
+/// `NonEmpty` predicate-failure shape.
+///
+/// Reference: Haskell `ZeroTreasuryWithdrawals` in
+/// `eras/conway/impl/src/Cardano/Ledger/Conway/Rules/Gov.hs`,
+/// inside `processProposal`'s `TreasuryWithdrawals` branch.  Skipped
+/// during Conway bootstrap (PV == 9).
+pub(super) fn is_treasury_withdrawals_zero_sum(
+    proposal: &ProposalProcedure,
+    params: &ProtocolParameters,
+) -> bool {
+    // Bootstrap skip — pv == 9 disables the check entirely.
+    if params.protocol_version_major == 9 {
+        return false;
+    }
+    let GovAction::TreasuryWithdrawals { withdrawals, .. } = &proposal.gov_action else {
+        return false;
+    };
+    // Saturating sum: even an absurdly long all-u64::MAX list cannot wrap
+    // around to zero — `0` is reachable only when every entry is `0` (or
+    // the map is empty).
+    let total: u128 = withdrawals.values().map(|c| c.0 as u128).sum();
+    total == 0
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::{BTreeMap, HashMap, HashSet};
@@ -2033,6 +2081,73 @@ mod tests {
         assert!(
             treasury_withdrawal_network_mismatches(&proposal, &ctx).is_empty(),
             "Predicate must skip (empty vec) when node_network is None"
+        );
+    }
+
+    // ---------------------------------------------------------------------------
+    // is_treasury_withdrawals_zero_sum — ZeroTreasuryWithdrawals (Conway GOV)
+    //
+    // Per Haskell `processProposal` (TreasuryWithdrawals branch), a TW proposal
+    // whose total amount is zero (including the all-zero-entries case and
+    // empty-map case) is rejected.  This check is **skipped during Conway
+    // bootstrap** (PV == 9) per `hardforkConwayBootstrapPhase`.
+    // ---------------------------------------------------------------------------
+
+    #[test]
+    fn test_treasury_withdrawals_zero_sum_post_bootstrap_rejected() {
+        // PV=10, sum == 0 → predicate fires.
+        let params = pparams_at_pv(10);
+        let mut a = vec![0xe0u8];
+        a.extend_from_slice(&[0x11u8; 28]);
+        let mut b = vec![0xe0u8];
+        b.extend_from_slice(&[0x22u8; 28]);
+        let proposal = treasury_withdrawals_proposal(vec![(a, Lovelace(0)), (b, Lovelace(0))]);
+
+        assert!(
+            is_treasury_withdrawals_zero_sum(&proposal, &params),
+            "All-zero TreasuryWithdrawals must fire post-bootstrap"
+        );
+    }
+
+    #[test]
+    fn test_treasury_withdrawals_zero_sum_at_pv9_skipped() {
+        // PV=9 (Conway bootstrap) — predicate is silenced even with sum==0.
+        let params = pparams_at_pv(9);
+        let mut a = vec![0xe0u8];
+        a.extend_from_slice(&[0x11u8; 28]);
+        let proposal = treasury_withdrawals_proposal(vec![(a, Lovelace(0))]);
+
+        assert!(
+            !is_treasury_withdrawals_zero_sum(&proposal, &params),
+            "Bootstrap (PV=9) must skip the zero-sum check entirely"
+        );
+    }
+
+    #[test]
+    fn test_treasury_withdrawals_nonzero_sum_accepted() {
+        // PV=10, any non-zero entry → sum != 0 → predicate does not fire.
+        let params = pparams_at_pv(10);
+        let mut a = vec![0xe0u8];
+        a.extend_from_slice(&[0x11u8; 28]);
+        let mut b = vec![0xe0u8];
+        b.extend_from_slice(&[0x22u8; 28]);
+        let proposal = treasury_withdrawals_proposal(vec![(a, Lovelace(0)), (b, Lovelace(1))]);
+
+        assert!(
+            !is_treasury_withdrawals_zero_sum(&proposal, &params),
+            "Non-zero total must accept the proposal"
+        );
+    }
+
+    #[test]
+    fn test_treasury_withdrawals_zero_sum_skips_non_tw_proposal() {
+        // A non-TreasuryWithdrawals proposal must always return false,
+        // independent of any other state.
+        let params = pparams_at_pv(10);
+        let proposal = proposal_with_addr(return_addr_29_with_network(1));
+        assert!(
+            !is_treasury_withdrawals_zero_sum(&proposal, &params),
+            "Non-TreasuryWithdrawals proposals must short-circuit (false)"
         );
     }
 }

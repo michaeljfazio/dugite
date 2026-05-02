@@ -575,6 +575,31 @@ pub enum ValidationError {
         /// destination address whose network id does not match `expected`.
         mismatched: Vec<(String, u8)>,
     },
+    /// Conway GOV rule: one or more `TreasuryWithdrawals` proposals carry a
+    /// total amount of zero (including the all-zero-entries case).
+    ///
+    /// Per Haskell `processProposal` in
+    /// `eras/conway/impl/src/Cardano/Ledger/Conway/Rules/Gov.hs`
+    /// (`TreasuryWithdrawals` branch), the sum of every withdrawal entry's
+    /// `Coin` must be strictly positive — degenerate zero-sum proposals are
+    /// rejected.
+    ///
+    /// This check is **skipped during Conway bootstrap** (`pvMajor == 9`)
+    /// per `hardforkConwayBootstrapPhase`; it activates from PV ≥ 10.
+    ///
+    /// Every offending proposal is identified by a string descriptor
+    /// (currently the proposal's hex-encoded `return_addr` to keep the
+    /// payload stable) — the Haskell side aggregates the full `GovAction`
+    /// payloads, but a list of identifiers is sufficient for diagnostics.
+    /// All offending proposals across the transaction aggregate into a
+    /// single predicate failure, mirroring Haskell's `NonEmpty`
+    /// predicate-failure shape.
+    #[error("ZeroTreasuryWithdrawals: {offending_proposals:?}")]
+    ZeroTreasuryWithdrawals {
+        /// Hex-encoded `return_addr` (or other stable identifier) of every
+        /// offending TreasuryWithdrawals proposal in the transaction.
+        offending_proposals: Vec<String>,
+    },
     /// Alonzo UTXOW rule: a redeemer in the witness set has no matching
     /// script purpose (spending input, minting policy, withdrawal, cert, vote).
     ///
@@ -1247,6 +1272,39 @@ pub fn validate_transaction_with_context(
             extra_errors.push(ValidationError::TreasuryWithdrawalsNetworkIdMismatch {
                 expected,
                 mismatched,
+            });
+        }
+    }
+
+    // -------------------------------------------------------------------
+    // ZeroTreasuryWithdrawals: every `TreasuryWithdrawals` proposal must
+    // carry a strictly positive total amount.  Per Haskell `processProposal`
+    // in `Conway.Rules.Gov` this check is **skipped during Conway
+    // bootstrap** (PV == 9) per `hardforkConwayBootstrapPhase`.
+    //
+    // Runs only when the transaction submits at least one proposal,
+    // mirroring `processProposal`'s per-proposal invocation.  The bootstrap
+    // gate is encoded inside the predicate itself (`is_treasury_withdrawals_zero_sum`),
+    // so the wiring here is straightforward.
+    // -------------------------------------------------------------------
+    if params.protocol_version_major >= 9 && !tx.body.proposal_procedures.is_empty() {
+        let mut offending: Vec<String> = Vec::new();
+        for proposal in &tx.body.proposal_procedures {
+            if conway::is_treasury_withdrawals_zero_sum(proposal, params) {
+                let id_hex = proposal.return_addr.iter().fold(
+                    String::with_capacity(proposal.return_addr.len() * 2),
+                    |mut s, b| {
+                        use std::fmt::Write;
+                        let _ = write!(s, "{b:02x}");
+                        s
+                    },
+                );
+                offending.push(id_hex);
+            }
+        }
+        if !offending.is_empty() {
+            extra_errors.push(ValidationError::ZeroTreasuryWithdrawals {
+                offending_proposals: offending,
             });
         }
     }

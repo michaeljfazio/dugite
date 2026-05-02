@@ -628,6 +628,11 @@ pub(crate) fn convert_validation_error(
                 "TreasuryWithdrawalsNetworkIdMismatch: expected={expected}, mismatched={mismatched:?}"
             ),
         },
+        VE::ZeroTreasuryWithdrawals {
+            offending_proposals,
+        } => TxValidationError::ScriptFailed {
+            reason: format!("ZeroTreasuryWithdrawals: {offending_proposals:?}"),
+        },
         VE::ExtraRedeemer { tag, index } => TxValidationError::ScriptFailed {
             reason: format!(
                 "Extra redeemer with no matching script purpose: tag={tag}, index={index}"
