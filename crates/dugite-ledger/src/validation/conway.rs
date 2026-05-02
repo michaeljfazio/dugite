@@ -11,7 +11,7 @@ use std::collections::{HashMap, HashSet};
 
 use dugite_primitives::hash::{Hash28, Hash32};
 use dugite_primitives::protocol_params::ProtocolParameters;
-use dugite_primitives::transaction::{Certificate, GovAction, TransactionBody};
+use dugite_primitives::transaction::{Certificate, GovAction, TransactionBody, Voter};
 use dugite_primitives::value::Lovelace;
 
 use super::ValidationError;
@@ -295,6 +295,46 @@ pub(super) fn check_pparam_update_well_formed(
                 });
             }
         }
+    }
+}
+
+/// Returns `true` when a (voter, action) combination is disallowed by the
+/// Conway voter × gov-action authority matrix.
+///
+/// | GovAction           | StakePool | Committee | DRep |
+/// |---------------------|-----------|-----------|------|
+/// | `NoConfidence`      | yes       | **NO**    | yes  |
+/// | `UpdateCommittee`   | yes       | **NO**    | yes  |
+/// | `NewConstitution`   | **NO**    | yes       | yes  |
+/// | `HardForkInitiation`| yes       | yes       | yes  |
+/// | `ParameterChange`   | yes\*     | yes       | yes  |
+/// | `TreasuryWithdrawals`| **NO**   | yes       | yes  |
+/// | `InfoAction`        | yes       | yes       | yes  |
+///
+/// \* SPO authorisation on `ParameterChange` is enforced at this Phase-1 level;
+/// the per-group threshold (`NoVotingAllowed` for non–security-group changes)
+/// is checked later at ratification time.
+///
+/// This is a pure predicate. The caller (in `validation/mod.rs`) accumulates
+/// every disallowed `(voter, gov_action_id)` pair across the transaction and
+/// emits a single [`ValidationError::DisallowedVoters`] holding the full list,
+/// matching Haskell's `NonEmpty` predicate-failure shape.
+///
+/// Reference: Haskell `checkVotersAreValid` /
+/// `is{Committee,DRep,StakePool}VotingAllowed` in
+/// `Cardano.Ledger.Conway.Governance.Internal`.
+pub(super) fn is_voter_disallowed(voter: &Voter, action: &GovAction) -> bool {
+    match (voter, action) {
+        // InfoAction: every voter type is allowed (NoVotingThreshold).
+        (_, GovAction::InfoAction) => false,
+        // SPO is forbidden on NewConstitution and TreasuryWithdrawals.
+        (Voter::StakePool(_), GovAction::NewConstitution { .. }) => true,
+        (Voter::StakePool(_), GovAction::TreasuryWithdrawals { .. }) => true,
+        // Constitutional Committee is forbidden on NoConfidence and UpdateCommittee.
+        (Voter::ConstitutionalCommittee(_), GovAction::NoConfidence { .. }) => true,
+        (Voter::ConstitutionalCommittee(_), GovAction::UpdateCommittee { .. }) => true,
+        // All other (voter, action) combinations are permitted at this layer.
+        _ => false,
     }
 }
 
@@ -929,5 +969,180 @@ mod tests {
              ({original_deposit}) not the current key_deposit ({})",
             params.key_deposit.0
         );
+    }
+
+    // ---------------------------------------------------------------------------
+    // check_voter_authority — DisallowedVoters predicate (Conway GOV)
+    //
+    // Voter × action authority matrix (Haskell `checkVotersAreValid`):
+    //   NoConfidence:        SPO yes, DRep yes, CC NO
+    //   UpdateCommittee:     SPO yes, DRep yes, CC NO
+    //   NewConstitution:     SPO NO,  DRep yes, CC yes
+    //   HardForkInitiation:  SPO yes, DRep yes, CC yes
+    //   ParameterChange:     SPO yes (per-group threshold check at ratification),
+    //                        DRep yes, CC yes
+    //   TreasuryWithdrawals: SPO NO,  DRep yes, CC yes
+    //   InfoAction:          all yes
+    // ---------------------------------------------------------------------------
+
+    fn cc_voter() -> Voter {
+        Voter::ConstitutionalCommittee(test_credential(0xCC))
+    }
+
+    fn drep_voter() -> Voter {
+        Voter::DRep(test_credential(0xDD))
+    }
+
+    fn spo_voter() -> Voter {
+        Voter::StakePool(Hash32::from_bytes([0xAA; 32]))
+    }
+
+    fn anchor_stub() -> Anchor {
+        Anchor {
+            url: String::new(),
+            data_hash: Hash32::from_bytes([0u8; 32]),
+        }
+    }
+
+    #[test]
+    fn test_disallowed_voters_spo_voting_on_new_constitution() {
+        let action = GovAction::NewConstitution {
+            prev_action_id: None,
+            constitution: dugite_primitives::transaction::Constitution {
+                anchor: anchor_stub(),
+                script_hash: None,
+            },
+        };
+        assert!(is_voter_disallowed(&spo_voter(), &action));
+    }
+
+    #[test]
+    fn test_disallowed_voters_spo_voting_on_treasury_withdrawals() {
+        let action = GovAction::TreasuryWithdrawals {
+            withdrawals: BTreeMap::new(),
+            policy_hash: None,
+        };
+        assert!(is_voter_disallowed(&spo_voter(), &action));
+    }
+
+    #[test]
+    fn test_disallowed_voters_committee_voting_on_no_confidence() {
+        let action = GovAction::NoConfidence {
+            prev_action_id: None,
+        };
+        assert!(is_voter_disallowed(&cc_voter(), &action));
+    }
+
+    #[test]
+    fn test_disallowed_voters_committee_voting_on_update_committee() {
+        let action = GovAction::UpdateCommittee {
+            prev_action_id: None,
+            members_to_remove: vec![],
+            members_to_add: BTreeMap::new(),
+            threshold: Rational {
+                numerator: 1,
+                denominator: 2,
+            },
+        };
+        assert!(is_voter_disallowed(&cc_voter(), &action));
+    }
+
+    #[test]
+    fn test_voter_authority_spo_on_hard_fork_initiation_allowed() {
+        let action = GovAction::HardForkInitiation {
+            prev_action_id: None,
+            protocol_version: (10, 0),
+        };
+        assert!(!is_voter_disallowed(&spo_voter(), &action));
+    }
+
+    #[test]
+    fn test_voter_authority_info_action_allows_all() {
+        let action = GovAction::InfoAction;
+        assert!(!is_voter_disallowed(&spo_voter(), &action));
+        assert!(!is_voter_disallowed(&drep_voter(), &action));
+        assert!(!is_voter_disallowed(&cc_voter(), &action));
+    }
+
+    #[test]
+    fn test_voter_authority_drep_can_vote_on_no_confidence() {
+        let action = GovAction::NoConfidence {
+            prev_action_id: None,
+        };
+        assert!(!is_voter_disallowed(&drep_voter(), &action));
+    }
+
+    #[test]
+    fn test_voter_authority_drep_can_vote_on_all_actions() {
+        // DRep is authorised on every action type.
+        let actions: Vec<GovAction> = vec![
+            GovAction::NoConfidence {
+                prev_action_id: None,
+            },
+            GovAction::UpdateCommittee {
+                prev_action_id: None,
+                members_to_remove: vec![],
+                members_to_add: BTreeMap::new(),
+                threshold: Rational {
+                    numerator: 1,
+                    denominator: 2,
+                },
+            },
+            GovAction::NewConstitution {
+                prev_action_id: None,
+                constitution: dugite_primitives::transaction::Constitution {
+                    anchor: anchor_stub(),
+                    script_hash: None,
+                },
+            },
+            GovAction::HardForkInitiation {
+                prev_action_id: None,
+                protocol_version: (10, 0),
+            },
+            GovAction::TreasuryWithdrawals {
+                withdrawals: BTreeMap::new(),
+                policy_hash: None,
+            },
+            GovAction::InfoAction,
+        ];
+        for action in &actions {
+            assert!(
+                !is_voter_disallowed(&drep_voter(), action),
+                "DRep must be allowed on action: {action:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_voter_authority_committee_allowed_on_constitution_and_hard_fork() {
+        // CC is allowed on NewConstitution and HardForkInitiation
+        // (it's only forbidden on NoConfidence and UpdateCommittee).
+        let new_const = GovAction::NewConstitution {
+            prev_action_id: None,
+            constitution: dugite_primitives::transaction::Constitution {
+                anchor: anchor_stub(),
+                script_hash: None,
+            },
+        };
+        assert!(!is_voter_disallowed(&cc_voter(), &new_const));
+
+        let hf = GovAction::HardForkInitiation {
+            prev_action_id: None,
+            protocol_version: (10, 0),
+        };
+        assert!(!is_voter_disallowed(&cc_voter(), &hf));
+    }
+
+    #[test]
+    fn test_voter_authority_spo_on_parameter_change_allowed_at_phase1() {
+        // ParameterChange voter-authority pre-check allows SPO. The per-group
+        // threshold check at ratification time will set NoVotingAllowed for
+        // non-security-group changes — that is a separate concern.
+        let action = GovAction::ParameterChange {
+            prev_action_id: None,
+            protocol_param_update: Box::default(),
+            policy_hash: None,
+        };
+        assert!(!is_voter_disallowed(&spo_voter(), &action));
     }
 }

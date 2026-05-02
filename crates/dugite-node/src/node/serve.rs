@@ -600,6 +600,9 @@ pub(crate) fn convert_validation_error(
         VE::MalformedProposal { reason } => TxValidationError::ScriptFailed {
             reason: format!("Governance proposal rejected: malformed PParamsUpdate ({reason})"),
         },
+        VE::DisallowedVoters { violations } => TxValidationError::ScriptFailed {
+            reason: format!("DisallowedVoters: {violations:?}"),
+        },
         VE::ExtraRedeemer { tag, index } => TxValidationError::ScriptFailed {
             reason: format!(
                 "Extra redeemer with no matching script purpose: tag={tag}, index={index}"

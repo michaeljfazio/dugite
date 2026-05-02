@@ -47,12 +47,40 @@ use std::collections::{HashMap, HashSet};
 use dugite_primitives::hash::{Hash28, Hash32};
 use dugite_primitives::network::NetworkId;
 use dugite_primitives::protocol_params::ProtocolParameters;
-use dugite_primitives::transaction::{GovAction, Transaction};
+use dugite_primitives::time::EpochNo;
+use dugite_primitives::transaction::{GovAction, GovActionId, Transaction, Voter};
 use dugite_primitives::value::Lovelace;
 use tracing::{debug, trace, warn};
 
 use crate::plutus::{evaluate_plutus_scripts, SlotConfig};
 use crate::utxo::UtxoLookup;
+
+/// On-chain governance proposal record used by validation rules that need
+/// access to a proposal's full state (not just the action itself).
+///
+/// This is the value type stored in [`ValidationContext::active_proposals`].
+/// Future Conway GOV predicates need different fields:
+/// - `DisallowedVoters` (Task 2): only `gov_action`.
+/// - `VotingOnExpiredGovAction` (Task 4): `expires_after_epoch`.
+/// - `ProposalReturnAccountDoesNotExist` (Task 5): `return_addr`.
+///
+/// `return_addr` is stored as raw bytes (`Vec<u8>`) to mirror the on-chain
+/// `ProposalProcedure.return_addr` shape from `dugite-primitives`. Callers
+/// performing the address-credential check must decode it themselves.
+#[derive(Debug, Clone)]
+pub struct ActiveProposal {
+    /// The governance action being proposed.
+    pub gov_action: GovAction,
+    /// The reward address that receives the proposal deposit refund.
+    /// Raw `ProposalProcedure.return_addr` bytes (header + 28-byte credential).
+    pub return_addr: Vec<u8>,
+    /// The proposal deposit (frozen at submission time).
+    pub deposit: Lovelace,
+    /// The last epoch in which votes are accepted (inclusive).
+    pub expires_after_epoch: EpochNo,
+    /// The epoch in which the proposal was submitted.
+    pub proposed_in_epoch: EpochNo,
+}
 
 #[derive(Default)]
 pub struct ValidationContext {
@@ -75,6 +103,19 @@ pub struct ValidationContext {
     /// DRep vote delegations — keys are stake credential hashes of accounts
     /// that have delegated to any DRep (including AlwaysAbstain / AlwaysNoConfidence).
     pub vote_delegations: Option<HashSet<Hash32>>,
+    /// Map of currently active on-chain governance proposals, keyed by
+    /// `GovActionId`.  When supplied, the validator uses this map to look up
+    /// the [`ActiveProposal`] record for each `(voter, gov_action_id)` vote
+    /// in `voting_procedures`, so that the `DisallowedVoters` predicate
+    /// (Conway GOV) can reject votes whose voter type is not authorised for
+    /// the action's type.  When `None`, only proposals submitted in the same
+    /// transaction (`tx.body.proposal_procedures`) are checked.
+    ///
+    /// The value is an [`ActiveProposal`] (not a bare `GovAction`) because
+    /// later GOV predicates (e.g. `VotingOnExpiredGovAction`,
+    /// `ProposalReturnAccountDoesNotExist`) need the proposal's expiry
+    /// epoch and return address, not just the action.
+    pub active_proposals: Option<HashMap<GovActionId, ActiveProposal>>,
 }
 
 impl ValidationContext {
@@ -139,6 +180,14 @@ impl ValidationContext {
 
     pub fn with_vote_delegations(mut self, delegations: HashSet<Hash32>) -> Self {
         self.vote_delegations = Some(delegations);
+        self
+    }
+
+    pub fn with_active_proposals(
+        mut self,
+        proposals: HashMap<GovActionId, ActiveProposal>,
+    ) -> Self {
+        self.active_proposals = Some(proposals);
         self
     }
 
@@ -361,6 +410,27 @@ pub enum ValidationError {
     /// `cardano-ledger-conway:Cardano.Ledger.Conway.Rules.Gov`.
     #[error("Governance proposal rejected: malformed PParamsUpdate ({reason})")]
     MalformedProposal { reason: String },
+    /// Conway GOV rule: a voter is not authorised to vote on this governance
+    /// action type.
+    ///
+    /// Reference: Haskell `DisallowedVoters` in
+    /// `eras/conway/impl/src/Cardano/Ledger/Conway/Rules/Gov.hs`.
+    /// The voter × action authority matrix:
+    ///   - `NoConfidence`: SPO yes, DRep yes, CC NO
+    ///   - `UpdateCommittee`: SPO yes, DRep yes, CC NO
+    ///   - `NewConstitution`: SPO NO, DRep yes, CC yes
+    ///   - `HardForkInitiation`: SPO yes, DRep yes, CC yes
+    ///   - `ParameterChange`: SPO only when SecurityGroup params, DRep yes, CC yes
+    ///   - `TreasuryWithdrawals`: SPO NO, DRep yes, CC yes
+    ///   - `InfoAction`: all yes (NoVotingThreshold)
+    ///
+    /// The payload aggregates **every** disallowed `(voter, gov_action_id)`
+    /// pair in the transaction into a single error (mirroring Haskell's
+    /// `NonEmpty` predicate-failure shape).
+    #[error("DisallowedVoters: {violations:?}")]
+    DisallowedVoters {
+        violations: Vec<(Voter, GovActionId)>,
+    },
     /// Alonzo UTXOW rule: a redeemer in the witness set has no matching
     /// script purpose (spending input, minting policy, withdrawal, cert, vote).
     ///
@@ -742,7 +812,7 @@ pub fn validate_transaction_with_context(
     slot_config: Option<&SlotConfig>,
     context: ValidationContext,
 ) -> Result<(), Vec<ValidationError>> {
-    validate_transaction_with_pools(
+    let pools_result = validate_transaction_with_pools(
         tx,
         utxo_set,
         params,
@@ -761,7 +831,75 @@ pub fn validate_transaction_with_context(
         context.stake_key_deposits.as_ref(),
         context.constitution_script_hash,
         context.vote_delegations.as_ref(),
-    )
+    );
+
+    // Conway GOV `DisallowedVoters` predicate.
+    //
+    // For every (voter, gov_action_id) pair in `voting_procedures`, look up the
+    // referenced GovAction and reject the vote if the voter type is not
+    // authorised for that action type (Haskell `checkVotersAreValid` /
+    // `is{Committee,DRep,StakePool}VotingAllowed`).
+    //
+    // The GovAction is looked up first against proposals submitted in the same
+    // transaction, then against the optional `active_proposals` map provided by
+    // the caller (typically the on-chain governance state).  Votes that do not
+    // resolve to any known action are ignored here — that's a different
+    // predicate (`GovActionsDoNotExist`) handled elsewhere.
+    let mut extra_errors: Vec<ValidationError> = Vec::new();
+    if params.protocol_version_major >= 9 && !tx.body.voting_procedures.is_empty() {
+        // Build a lookup index of GovActionId -> GovAction:
+        //   1. Proposals submitted in this same tx (their action_id is the
+        //      tx hash + the proposal's index).
+        //   2. Proposals already on-chain (passed via `context.active_proposals`).
+        let mut local_proposals: HashMap<GovActionId, &GovAction> = HashMap::new();
+        for (idx, proposal) in tx.body.proposal_procedures.iter().enumerate() {
+            let id = GovActionId {
+                transaction_id: tx.hash,
+                action_index: idx as u32,
+            };
+            local_proposals.insert(id, &proposal.gov_action);
+        }
+
+        // Aggregate every disallowed (voter, action_id) pair into one error,
+        // mirroring Haskell's NonEmpty predicate-failure shape.
+        let mut violations: Vec<(Voter, GovActionId)> = Vec::new();
+        for (voter, votes) in &tx.body.voting_procedures {
+            for action_id in votes.keys() {
+                let action: Option<&GovAction> =
+                    local_proposals.get(action_id).copied().or_else(|| {
+                        context
+                            .active_proposals
+                            .as_ref()
+                            .and_then(|m| m.get(action_id))
+                            .map(|ap| &ap.gov_action)
+                    });
+
+                let Some(action) = action else {
+                    // Vote references an unknown GovAction; this is a
+                    // different predicate failure (GovActionsDoNotExist),
+                    // not DisallowedVoters.  Skip silently here.
+                    continue;
+                };
+
+                if conway::is_voter_disallowed(voter, action) {
+                    violations.push((voter.clone(), action_id.clone()));
+                }
+            }
+        }
+        if !violations.is_empty() {
+            extra_errors.push(ValidationError::DisallowedVoters { violations });
+        }
+    }
+
+    match (pools_result, extra_errors.is_empty()) {
+        (Ok(()), true) => Ok(()),
+        (Ok(()), false) => Err(extra_errors),
+        (Err(errs), true) => Err(errs),
+        (Err(mut errs), false) => {
+            errs.append(&mut extra_errors);
+            Err(errs)
+        }
+    }
 }
 
 /// Validate a transaction with an optional set of registered pools.

@@ -12452,4 +12452,267 @@ mod tests {
             );
         }
     }
+
+    // -------------------------------------------------------------------------
+    // DisallowedVoters integration tests for `validate_transaction_with_context`
+    //
+    // These tests exercise the wiring path end-to-end: a Conway transaction
+    // contains votes that target either a locally-submitted proposal (same tx)
+    // or an active on-chain proposal (`context.active_proposals`), and the
+    // validator must surface a single aggregated `DisallowedVoters` error
+    // whose `violations` vec carries every (Voter, GovActionId) pair that
+    // breaks the authority matrix.
+    // -------------------------------------------------------------------------
+
+    use std::collections::HashMap;
+
+    use super::super::{validate_transaction_with_context, ActiveProposal, ValidationContext};
+    use dugite_primitives::time::EpochNo;
+
+    /// Build a Conway-era pv=10 ProtocolParameters for the integration tests.
+    /// Uses post-bootstrap so the predicate is exercised on the live path.
+    fn conway_pparams_pv10() -> ProtocolParameters {
+        let mut p = ProtocolParameters::mainnet_defaults();
+        p.protocol_version_major = 10;
+        p
+    }
+
+    /// Build a Conway transaction whose body contains the given proposals and
+    /// voting procedures but no inputs/outputs. This deliberately produces a
+    /// `NoInputs` Phase-1 error so the predicate is exercised even if the
+    /// caller's UTxO set is empty — we filter for `DisallowedVoters` only.
+    fn make_gov_tx(
+        proposals: Vec<ProposalProcedure>,
+        voting_procedures: BTreeMap<Voter, BTreeMap<GovActionId, VotingProcedure>>,
+    ) -> Transaction {
+        Transaction {
+            era: dugite_primitives::era::Era::Conway,
+            hash: Hash32::from_bytes([0xAB; 32]),
+            body: TransactionBody {
+                inputs: vec![],
+                outputs: vec![],
+                fee: Lovelace(0),
+                ttl: None,
+                certificates: vec![],
+                withdrawals: BTreeMap::new(),
+                auxiliary_data_hash: None,
+                validity_interval_start: None,
+                mint: BTreeMap::new(),
+                script_data_hash: None,
+                collateral: vec![],
+                required_signers: vec![],
+                network_id: None,
+                collateral_return: None,
+                total_collateral: None,
+                reference_inputs: vec![],
+                update: None,
+                voting_procedures,
+                proposal_procedures: proposals,
+                treasury_value: None,
+                donation: None,
+            },
+            witness_set: TransactionWitnessSet {
+                vkey_witnesses: vec![],
+                native_scripts: vec![],
+                bootstrap_witnesses: vec![],
+                plutus_v1_scripts: vec![],
+                plutus_v2_scripts: vec![],
+                plutus_v3_scripts: vec![],
+                plutus_data: vec![],
+                redeemers: vec![],
+                raw_redeemers_cbor: None,
+                raw_plutus_data_cbor: None,
+                pallas_script_data_hash: None,
+            },
+            is_valid: true,
+            auxiliary_data: None,
+            raw_cbor: None,
+            raw_body_cbor: None,
+            raw_witness_cbor: None,
+        }
+    }
+
+    fn anchor_stub() -> Anchor {
+        Anchor {
+            url: String::new(),
+            data_hash: Hash32::from_bytes([0u8; 32]),
+        }
+    }
+
+    fn new_constitution_action() -> GovAction {
+        GovAction::NewConstitution {
+            prev_action_id: None,
+            constitution: Constitution {
+                anchor: anchor_stub(),
+                script_hash: None,
+            },
+        }
+    }
+
+    fn new_constitution_proposal() -> ProposalProcedure {
+        ProposalProcedure {
+            deposit: Lovelace(1_000_000_000),
+            return_addr: vec![0xe0; 29],
+            gov_action: new_constitution_action(),
+            anchor: anchor_stub(),
+        }
+    }
+
+    fn spo_voter_for_test() -> Voter {
+        Voter::StakePool(Hash32::from_bytes([0x55; 32]))
+    }
+
+    fn yes_vote() -> VotingProcedure {
+        VotingProcedure {
+            vote: Vote::Yes,
+            anchor: None,
+        }
+    }
+
+    /// Test 1: SPO votes Yes on a `NewConstitution` proposal submitted in the
+    /// SAME transaction. The validator must surface a `DisallowedVoters`
+    /// error with exactly one (Voter::StakePool, GovActionId) violation.
+    #[test]
+    fn test_validate_transaction_rejects_spo_voting_on_local_new_constitution() {
+        let params = conway_pparams_pv10();
+        let utxo_set = UtxoSet::new();
+
+        // The validator computes per-tx GovActionIds as (tx.hash, idx).
+        // `make_gov_tx` always sets `tx.hash = [0xAB; 32]`, so we can pin the
+        // expected action_id up front.
+        let action_id = GovActionId {
+            transaction_id: Hash32::from_bytes([0xAB; 32]),
+            action_index: 0,
+        };
+        let mut votes = BTreeMap::new();
+        votes.insert(action_id.clone(), yes_vote());
+        let mut voting_procedures = BTreeMap::new();
+        voting_procedures.insert(spo_voter_for_test(), votes);
+
+        let tx = make_gov_tx(vec![new_constitution_proposal()], voting_procedures);
+        debug_assert_eq!(
+            tx.hash, action_id.transaction_id,
+            "make_gov_tx must use the action_id's transaction_id"
+        );
+
+        let context = ValidationContext::new();
+        let result =
+            validate_transaction_with_context(&tx, &utxo_set, &params, 100, 500, None, context);
+
+        let errors = result.expect_err("expected DisallowedVoters predicate to fire");
+        let dv = errors
+            .iter()
+            .find_map(|e| match e {
+                ValidationError::DisallowedVoters { violations } => Some(violations),
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("DisallowedVoters not in error set: {errors:?}"));
+        assert_eq!(
+            dv.len(),
+            1,
+            "expected exactly one (voter, action_id) violation, got: {dv:?}"
+        );
+        let (voter, vid) = &dv[0];
+        assert!(
+            matches!(voter, Voter::StakePool(_)),
+            "voter must be StakePool, got: {voter:?}"
+        );
+        assert_eq!(
+            vid, &action_id,
+            "violation action_id must match the local proposal"
+        );
+    }
+
+    /// Test 2: SPO votes on a `NewConstitution` proposal already on-chain
+    /// (passed via `context.active_proposals`). Must produce
+    /// `DisallowedVoters` with the corresponding active GovActionId.
+    #[test]
+    fn test_validate_transaction_rejects_spo_voting_on_active_proposal() {
+        let params = conway_pparams_pv10();
+        let utxo_set = UtxoSet::new();
+
+        // Active proposal lives in context, not in the tx body.
+        let active_id = GovActionId {
+            transaction_id: Hash32::from_bytes([0x77; 32]),
+            action_index: 3,
+        };
+        let active_proposal = ActiveProposal {
+            gov_action: new_constitution_action(),
+            return_addr: vec![0xe0; 29],
+            deposit: Lovelace(1_000_000_000),
+            expires_after_epoch: EpochNo(500),
+            proposed_in_epoch: EpochNo(490),
+        };
+
+        let mut active_proposals: HashMap<GovActionId, ActiveProposal> = HashMap::new();
+        active_proposals.insert(active_id.clone(), active_proposal);
+
+        let mut votes = BTreeMap::new();
+        votes.insert(active_id.clone(), yes_vote());
+        let mut voting_procedures = BTreeMap::new();
+        voting_procedures.insert(spo_voter_for_test(), votes);
+
+        let tx = make_gov_tx(vec![], voting_procedures);
+
+        let context = ValidationContext::new().with_active_proposals(active_proposals);
+        let result =
+            validate_transaction_with_context(&tx, &utxo_set, &params, 100, 500, None, context);
+
+        let errors = result.expect_err("expected DisallowedVoters predicate to fire");
+        let dv = errors
+            .iter()
+            .find_map(|e| match e {
+                ValidationError::DisallowedVoters { violations } => Some(violations),
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("DisallowedVoters not in error set: {errors:?}"));
+        assert_eq!(dv.len(), 1, "expected exactly one violation, got: {dv:?}");
+        let (voter, vid) = &dv[0];
+        assert!(
+            matches!(voter, Voter::StakePool(_)),
+            "voter must be StakePool, got: {voter:?}"
+        );
+        assert_eq!(
+            vid, &active_id,
+            "violation action_id must match the active proposal id"
+        );
+    }
+
+    /// Test 3: Voter targets a GovActionId that exists in NEITHER the local
+    /// proposals nor `active_proposals`. The unknown-action case is handled
+    /// by `GovActionsDoNotExist` (a different predicate, out of scope for
+    /// this task). `DisallowedVoters` must not fire.
+    #[test]
+    fn test_validate_transaction_skips_unknown_gov_action() {
+        let params = conway_pparams_pv10();
+        let utxo_set = UtxoSet::new();
+
+        let unknown_id = GovActionId {
+            transaction_id: Hash32::from_bytes([0xEE; 32]),
+            action_index: 0,
+        };
+        let mut votes = BTreeMap::new();
+        votes.insert(unknown_id, yes_vote());
+        let mut voting_procedures = BTreeMap::new();
+        // Even an SPO voting Yes on an unknown action must not trigger
+        // DisallowedVoters here — the action's type is unknown to this rule.
+        voting_procedures.insert(spo_voter_for_test(), votes);
+
+        let tx = make_gov_tx(vec![], voting_procedures);
+
+        let context = ValidationContext::new();
+        let result =
+            validate_transaction_with_context(&tx, &utxo_set, &params, 100, 500, None, context);
+
+        // The tx will fail Phase-1 (NoInputs etc.) but DisallowedVoters must
+        // not be among the errors.
+        if let Err(errors) = result {
+            assert!(
+                !errors
+                    .iter()
+                    .any(|e| matches!(e, ValidationError::DisallowedVoters { .. })),
+                "DisallowedVoters must not fire for unknown gov action; got: {errors:?}"
+            );
+        }
+    }
 }
