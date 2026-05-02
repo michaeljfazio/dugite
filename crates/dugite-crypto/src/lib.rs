@@ -2,6 +2,7 @@
 
 pub mod kes;
 pub mod keys;
+pub mod ocert;
 pub mod signing;
 pub mod vrf;
 

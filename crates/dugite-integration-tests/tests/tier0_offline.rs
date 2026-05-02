@@ -869,6 +869,75 @@ fn tier0_issue_opcert_via_stake_pool() {
     read_envelope(&opcert);
 }
 
+/// CRITICAL regression test: a freshly-issued opcert MUST verify against the
+/// consensus verifier. The 2026-05-01 soak surfaced an `InvalidSignatureOCERT`
+/// failure caused by `issue_op_cert` signing a CBOR-encoded array(3) while
+/// the verifier reconstructed the raw 48-byte `OCertSignable` layout
+/// (kes_vkey || seqNo_be64 || kesPeriod_be64). Every dugite-forged block was
+/// rejected by cardano-node. This test asserts the end-to-end roundtrip:
+/// issue → parse the on-disk envelope → verify_opcert_signature must succeed.
+#[test]
+fn tier0_issue_opcert_signature_verifies_against_consensus_verifier() {
+    let node_keys = TempNodeKeys::new();
+    let kes_keys = TempKesKeys::new();
+    let opcert_path = node_keys.dir.path().join("node.opcert");
+    let opcert_file = opcert_path.display().to_string();
+
+    let kes_period = 840u64; // matches the value seen in the soak failure
+
+    run_cli_ok(&[
+        "node",
+        "issue-op-cert",
+        "--kes-verification-key-file",
+        &kes_keys.kes_vkey,
+        "--cold-signing-key-file",
+        &node_keys.cold_skey,
+        "--operational-certificate-counter-file",
+        &node_keys.counter_file,
+        "--kes-period",
+        &kes_period.to_string(),
+        "--out-file",
+        &opcert_file,
+    ]);
+
+    // Parse the on-disk text envelope: cborHex = array(2)[array(4)[kes_vkey,
+    // seq, kes_period, sigma], cold_vkey].
+    let env: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&opcert_file).unwrap()).unwrap();
+    let cbor_hex = env["cborHex"].as_str().unwrap();
+    let cbor = hex::decode(cbor_hex).unwrap();
+    let mut decoder = minicbor::Decoder::new(&cbor);
+    assert_eq!(decoder.array().unwrap(), Some(2));
+    assert_eq!(decoder.array().unwrap(), Some(4));
+    let kes_vkey = decoder.bytes().unwrap().to_vec();
+    let seq = decoder.u64().unwrap();
+    let cert_kes_period = decoder.u64().unwrap();
+    let sigma = decoder.bytes().unwrap().to_vec();
+    let cold_vkey = decoder.bytes().unwrap().to_vec();
+
+    assert_eq!(cert_kes_period, kes_period, "kes_period roundtrip");
+    assert_eq!(sigma.len(), 64, "Ed25519 signature must be 64 bytes");
+    assert_eq!(cold_vkey.len(), 32, "cold vkey must be 32 bytes");
+    assert_eq!(kes_vkey.len(), 32, "KES vkey must be 32 bytes");
+
+    // The actual regression assertion: the consensus verifier reconstructs the
+    // OCertSignable from header fields and runs Ed25519. If signing and
+    // verification disagree on the 48-byte layout, this fails — exactly what
+    // the soak surfaced.
+    dugite_consensus::praos::verify_opcert_signature(
+        &cold_vkey,
+        &kes_vkey,
+        seq,
+        cert_kes_period,
+        &sigma,
+    )
+    .expect(
+        "issued opcert sigma must verify against the consensus OCertSignable layout — \
+         if this fails, signing and verification have drifted apart and BP forge will \
+         be rejected by cardano-node with InvalidSignatureOCERT",
+    );
+}
+
 // ─── Governance Actions ───────────────────────────────────────────────
 
 /// Helper to generate a valid testnet enterprise address for governance tests.

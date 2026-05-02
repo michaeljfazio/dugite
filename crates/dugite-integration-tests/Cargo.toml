@@ -13,3 +13,5 @@ tempfile = { workspace = true }
 reqwest = { workspace = true }
 tokio = { workspace = true }
 anyhow = { workspace = true }
+minicbor = { workspace = true }
+dugite-consensus = { path = "../dugite-consensus" }
