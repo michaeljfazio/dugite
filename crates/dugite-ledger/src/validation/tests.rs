@@ -13759,4 +13759,83 @@ mod tests {
             "ConflictingCommitteeUpdate MUST fire at PV=9 (no bootstrap skip); got: {errors:?}"
         );
     }
+
+    // -------------------------------------------------------------------------
+    // ExpirationEpochTooSmall integration tests for
+    // `validate_transaction_with_context`
+    //
+    // Per Haskell `processProposal` (UpdateCommittee branch), every new
+    // member's `validUntil` epoch must be strictly greater than the
+    // current epoch (i.e. boundary `validUntil == currentEpoch` is
+    // rejected).  **Always enforced** — no Conway-bootstrap skip.
+    // -------------------------------------------------------------------------
+
+    /// Post-bootstrap (PV=10): a new committee member with `validUntil <=
+    /// currentEpoch` must surface `ExpirationEpochTooSmall` whose
+    /// `invalid_members` payload carries the offending credential's typed
+    /// hash and bad expiry.
+    #[test]
+    fn test_validate_transaction_rejects_expiration_too_small_post_bootstrap() {
+        use dugite_primitives::credentials::Credential;
+
+        let params = conway_pparams_pv10();
+        let utxo_set = UtxoSet::new();
+
+        let cred = Credential::VerificationKey(Hash28::from_bytes([0x66; 28]));
+        let mut adds: BTreeMap<Credential, u64> = BTreeMap::new();
+        adds.insert(cred.clone(), 100); // expiry == current_epoch (boundary)
+        let proposal = update_committee_proposal_for_test(adds, vec![]);
+        let tx = make_gov_tx(vec![proposal], BTreeMap::new());
+
+        let context = ValidationContext::new()
+            .with_network(dugite_primitives::network::NetworkId::Mainnet)
+            .with_epoch(100);
+        let result =
+            validate_transaction_with_context(&tx, &utxo_set, &params, 100, 500, None, context);
+
+        let errors = result.expect_err("expected ExpirationEpochTooSmall predicate to fire");
+        let invalid = errors
+            .iter()
+            .find_map(|e| match e {
+                ValidationError::ExpirationEpochTooSmall { invalid_members } => {
+                    Some(invalid_members)
+                }
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("ExpirationEpochTooSmall not in error set: {errors:?}"));
+        assert_eq!(invalid.len(), 1, "exactly one offending member");
+        assert_eq!(invalid[0].0, cred.to_typed_hash32().to_hex());
+        assert_eq!(invalid[0].1, 100, "boundary expiry must be reported");
+    }
+
+    /// At PV=9 (Conway bootstrap) the expiration check is **still
+    /// enforced** — no bootstrap skip for this rule.
+    #[test]
+    fn test_validate_transaction_rejects_expiration_too_small_in_bootstrap() {
+        use dugite_primitives::credentials::Credential;
+
+        let mut params = ProtocolParameters::mainnet_defaults();
+        params.protocol_version_major = 9; // Conway bootstrap.
+        let utxo_set = UtxoSet::new();
+
+        let cred = Credential::VerificationKey(Hash28::from_bytes([0x77; 28]));
+        let mut adds: BTreeMap<Credential, u64> = BTreeMap::new();
+        adds.insert(cred, 50); // expiry well below current_epoch
+        let proposal = update_committee_proposal_for_test(adds, vec![]);
+        let tx = make_gov_tx(vec![proposal], BTreeMap::new());
+
+        let context = ValidationContext::new()
+            .with_network(dugite_primitives::network::NetworkId::Mainnet)
+            .with_epoch(100);
+        let result =
+            validate_transaction_with_context(&tx, &utxo_set, &params, 100, 500, None, context);
+
+        let errors = result.expect_err("expected ExpirationEpochTooSmall even at PV=9");
+        assert!(
+            errors
+                .iter()
+                .any(|e| matches!(e, ValidationError::ExpirationEpochTooSmall { .. })),
+            "ExpirationEpochTooSmall MUST fire at PV=9 (no bootstrap skip); got: {errors:?}"
+        );
+    }
 }

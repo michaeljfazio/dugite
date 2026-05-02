@@ -740,6 +740,63 @@ pub(super) fn committee_update_conflicts(proposal: &ProposalProcedure) -> Vec<St
     conflicts
 }
 
+/// Returns the list of `(typed_hash_hex, expiry_epoch)` pairs for new
+/// committee members in an `UpdateCommittee` proposal whose `validUntil`
+/// epoch is **not strictly greater than** the current epoch — i.e. the
+/// member would expire on or before they enter office.
+///
+/// Per Haskell `processProposal` in
+/// `eras/conway/impl/src/Cardano/Ledger/Conway/Rules/Gov.hs`
+/// (`UpdateCommittee` branch):
+///
+/// ```haskell
+/// let invalidMembers = Map.filter (<= currentEpoch) membersToAdd
+/// in unless (Map.null invalidMembers) (failBecause $ ExpirationEpochTooSmall invalidMembers)
+/// ```
+///
+/// This check is **always enforced** — there is no Conway-bootstrap skip;
+/// the expiry-vs-current-epoch comparison is a structural property of the
+/// proposal payload combined with the live epoch.  When `current_epoch`
+/// is `None` the predicate is silently lenient (returns the empty vec) so
+/// callers that have not plumbed in epoch context don't get spurious
+/// failures.
+///
+/// The credential identity uses [`Credential::to_typed_hash32`] (byte 28
+/// = `0x01` for scripts, `0x00` for keys), matching the convention used
+/// by [`committee_update_conflicts`] and by the credential-keyed
+/// `ValidationContext` sets — so callers can distinguish key- from
+/// script-credential entries.
+///
+/// The shape (`Vec<(String, u64)>`) is intentional — every offending
+/// member across all `UpdateCommittee` proposals in the transaction is
+/// surfaced, and the caller in `validation/mod.rs` aggregates these
+/// into a single [`ValidationError::ExpirationEpochTooSmall`], mirroring
+/// Haskell's `NonEmpty` predicate-failure shape.
+///
+/// Reference: Haskell `ExpirationEpochTooSmall` in
+/// `eras/conway/impl/src/Cardano/Ledger/Conway/Rules/Gov.hs`,
+/// inside `processProposal`'s `UpdateCommittee` branch.  Always enforced
+/// (no bootstrap skip).
+pub(super) fn committee_update_invalid_expiries(
+    proposal: &ProposalProcedure,
+    ctx: &ValidationContext,
+) -> Vec<(String, u64)> {
+    let GovAction::UpdateCommittee { members_to_add, .. } = &proposal.gov_action else {
+        return Vec::new();
+    };
+    // Lenient default — skip when current_epoch isn't plumbed in.
+    let Some(current_epoch) = ctx.current_epoch else {
+        return Vec::new();
+    };
+    let mut invalid: Vec<(String, u64)> = Vec::new();
+    for (cred, expiry) in members_to_add.iter() {
+        if *expiry <= current_epoch {
+            invalid.push((cred.to_typed_hash32().to_hex(), *expiry));
+        }
+    }
+    invalid
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::{BTreeMap, HashMap, HashSet};
@@ -2318,6 +2375,78 @@ mod tests {
         assert!(
             committee_update_conflicts(&proposal).is_empty(),
             "Non-UpdateCommittee proposals must short-circuit (empty vec)"
+        );
+    }
+
+    // ---------------------------------------------------------------------------
+    // committee_update_invalid_expiries — ExpirationEpochTooSmall (Conway GOV)
+    //
+    // Per Haskell `processProposal` (UpdateCommittee branch), every entry in
+    // `members_to_add`'s `(credential, validUntil)` pairs must satisfy
+    // `validUntil > currentEpoch`.  Boundary `validUntil == currentEpoch`
+    // is rejected (the Haskell filter is `<= currentEpoch`).  Always
+    // enforced (no Conway-bootstrap skip).  When `ctx.current_epoch` is
+    // `None`, the predicate returns an empty vec (lenient default).
+    // ---------------------------------------------------------------------------
+
+    #[test]
+    fn test_committee_update_expiry_equal_current_rejected() {
+        // expiry == current_epoch (boundary) -> rejected per Haskell `<=`.
+        let cred = cred_key(0x71);
+        let mut adds: BTreeMap<Credential, u64> = BTreeMap::new();
+        adds.insert(cred.clone(), 100);
+        let proposal = update_committee_proposal(adds, vec![]);
+        let ctx = ValidationContext::new().with_epoch(100);
+
+        let invalid = committee_update_invalid_expiries(&proposal, &ctx);
+        assert_eq!(invalid.len(), 1, "boundary expiry must be invalid");
+        assert_eq!(invalid[0].0, cred.to_typed_hash32().to_hex());
+        assert_eq!(invalid[0].1, 100);
+    }
+
+    #[test]
+    fn test_committee_update_expiry_below_current_rejected() {
+        // expiry < current_epoch -> rejected.
+        let cred = cred_key(0x72);
+        let mut adds: BTreeMap<Credential, u64> = BTreeMap::new();
+        adds.insert(cred.clone(), 50);
+        let proposal = update_committee_proposal(adds, vec![]);
+        let ctx = ValidationContext::new().with_epoch(100);
+
+        let invalid = committee_update_invalid_expiries(&proposal, &ctx);
+        assert_eq!(invalid.len(), 1, "expiry below current must be invalid");
+        assert_eq!(invalid[0].1, 50);
+    }
+
+    #[test]
+    fn test_committee_update_expiry_above_current_accepted() {
+        // expiry > current_epoch -> accepted (no entries surfaced).
+        let cred = cred_key(0x73);
+        let mut adds: BTreeMap<Credential, u64> = BTreeMap::new();
+        adds.insert(cred, 200);
+        let proposal = update_committee_proposal(adds, vec![]);
+        let ctx = ValidationContext::new().with_epoch(100);
+
+        assert!(
+            committee_update_invalid_expiries(&proposal, &ctx).is_empty(),
+            "expiry strictly greater than current_epoch must be accepted"
+        );
+    }
+
+    #[test]
+    fn test_committee_update_expiry_skipped_when_epoch_none() {
+        // ctx.current_epoch = None -> lenient default (empty vec) regardless
+        // of the expiry values.
+        let cred = cred_key(0x74);
+        let mut adds: BTreeMap<Credential, u64> = BTreeMap::new();
+        adds.insert(cred, 0); // would be invalid if epoch were known
+        let proposal = update_committee_proposal(adds, vec![]);
+        let ctx = ValidationContext::new();
+        assert!(ctx.current_epoch.is_none());
+
+        assert!(
+            committee_update_invalid_expiries(&proposal, &ctx).is_empty(),
+            "Predicate must skip (empty vec) when current_epoch is None"
         );
     }
 }

@@ -636,6 +636,9 @@ pub(crate) fn convert_validation_error(
         VE::ConflictingCommitteeUpdate { conflicts } => TxValidationError::ScriptFailed {
             reason: format!("ConflictingCommitteeUpdate: {conflicts:?}"),
         },
+        VE::ExpirationEpochTooSmall { invalid_members } => TxValidationError::ScriptFailed {
+            reason: format!("ExpirationEpochTooSmall: {invalid_members:?}"),
+        },
         VE::ExtraRedeemer { tag, index } => TxValidationError::ScriptFailed {
             reason: format!(
                 "Extra redeemer with no matching script purpose: tag={tag}, index={index}"

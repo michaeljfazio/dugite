@@ -627,6 +627,41 @@ pub enum ValidationError {
         /// across all UpdateCommittee proposals in the transaction.
         conflicts: Vec<String>,
     },
+    /// Conway GOV rule: one or more new members in an `UpdateCommittee`
+    /// proposal carry a `validUntil` epoch that is not strictly greater
+    /// than the current epoch — the member would expire on or before
+    /// taking office.
+    ///
+    /// Per Haskell `processProposal` in
+    /// `eras/conway/impl/src/Cardano/Ledger/Conway/Rules/Gov.hs`
+    /// (`UpdateCommittee` branch):
+    ///
+    /// ```haskell
+    /// let invalidMembers = Map.filter (<= currentEpoch) membersToAdd
+    /// in unless (Map.null invalidMembers) (failBecause $ ExpirationEpochTooSmall invalidMembers)
+    /// ```
+    ///
+    /// This check is **always enforced** — there is no Conway-bootstrap
+    /// skip; the expiry-vs-current-epoch comparison is a structural
+    /// property of the proposal payload combined with the live epoch.
+    ///
+    /// This predicate is silently skipped if `ValidationContext::current_epoch`
+    /// is `None` (lenient default for callers that have not plumbed in
+    /// epoch context — same convention used by other epoch-dependent GOV
+    /// predicates).
+    ///
+    /// Every offending `(credential, validUntil)` pair across all
+    /// `UpdateCommittee` proposals in the transaction is aggregated into
+    /// a single predicate failure, mirroring Haskell's `NonEmpty`
+    /// predicate-failure shape.  Each credential is the typed-hash32 hex
+    /// (byte 28 = `0x01` for scripts, `0x00` for keys).
+    #[error("ExpirationEpochTooSmall: {invalid_members:?}")]
+    ExpirationEpochTooSmall {
+        /// `(typed-hash32 hex of credential, bad validUntil epoch)` for
+        /// every offending new member across all UpdateCommittee
+        /// proposals in the transaction.
+        invalid_members: Vec<(String, u64)>,
+    },
     /// Alonzo UTXOW rule: a redeemer in the witness set has no matching
     /// script purpose (spending input, minting policy, withdrawal, cert, vote).
     ///
@@ -1353,6 +1388,30 @@ pub fn validate_transaction_with_context(
         }
         if !conflicts.is_empty() {
             extra_errors.push(ValidationError::ConflictingCommitteeUpdate { conflicts });
+        }
+    }
+
+    // -------------------------------------------------------------------
+    // ExpirationEpochTooSmall: every new committee member added by an
+    // `UpdateCommittee` proposal must have a `validUntil` epoch strictly
+    // greater than the current epoch.  Per Haskell `processProposal` in
+    // `Conway.Rules.Gov`, this check is **always enforced** (no
+    // Conway-bootstrap skip).  When `ctx.current_epoch` is `None`, the
+    // predicate is silently lenient (returns the empty vec) so callers
+    // that have not plumbed in epoch context don't get spurious failures.
+    //
+    // Runs only when the transaction submits at least one proposal,
+    // mirroring `processProposal`'s per-proposal invocation.
+    // -------------------------------------------------------------------
+    if params.protocol_version_major >= 9 && !tx.body.proposal_procedures.is_empty() {
+        let mut invalid_members: Vec<(String, u64)> = Vec::new();
+        for proposal in &tx.body.proposal_procedures {
+            invalid_members.extend(conway::committee_update_invalid_expiries(
+                proposal, &context,
+            ));
+        }
+        if !invalid_members.is_empty() {
+            extra_errors.push(ValidationError::ExpirationEpochTooSmall { invalid_members });
         }
     }
 
