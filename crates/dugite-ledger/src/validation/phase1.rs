@@ -177,6 +177,34 @@ pub(super) fn has_multi_assets_in_tx(tx: &Transaction, utxo_set: &dyn UtxoLookup
 }
 
 // ---------------------------------------------------------------------------
+// Helper: pool metadata hash size cap (Haskell `PoolMedataHashTooBig`)
+// ---------------------------------------------------------------------------
+
+/// Return `true` when the pool metadata hash byte length exceeds the
+/// 32-byte (Blake2b-256) cap, gated by the Alonzo-onwards (`pvMajor > 4`)
+/// soft fork — mirroring Haskell `restrictPoolMetadataHash`.
+///
+/// Reference: Haskell `PoolMedataHashTooBig` in
+/// `eras/shelley/impl/src/Cardano/Ledger/Shelley/Rules/Pool.hs`:
+///
+/// ```haskell
+/// when (SoftForks.restrictPoolMetadataHash pv) $
+///   forM_ sppMetadata $ \pmd ->
+///     let s = sizeofByteArray $ pmHash pmd
+///      in s <= fromIntegral (hashSize ([] @HASH))
+///           ?! injectFailure (PoolMedataHashTooBig sppId s)
+/// ```
+///
+/// In dugite, `PoolMetadata.hash` is structurally a `Hash32` (fixed
+/// 32 bytes), so the predicate evaluates to `false` for any value
+/// reachable via the typed API.  This helper is kept defensive against
+/// future wire-decode paths that could surface oversized values via a
+/// raw byte slice, and is exercised directly by unit tests.
+pub(super) fn is_pool_metadata_hash_too_big(metadata_hash_bytes: &[u8], pv_major: u64) -> bool {
+    pv_major > 4 && metadata_hash_bytes.len() > 32
+}
+
+// ---------------------------------------------------------------------------
 // Witness signature verification (Rule 14)
 // ---------------------------------------------------------------------------
 
@@ -439,6 +467,37 @@ pub(super) fn run_phase1_rules(
                     actual: pool_params.cost.0,
                     minimum: params.min_pool_cost.0,
                 });
+            }
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // Rule 1h2: Pool metadata hash must not exceed 32 bytes
+    //          (Haskell `PoolMedataHashTooBig`, Alonzo+)
+    //
+    // Per Haskell `Cardano.Ledger.Shelley.Rules.Pool`,
+    // `restrictPoolMetadataHash pv = pvMajor pv > 4` activates the cap
+    // from the Alonzo era onwards. The cap is the size of `Blake2b_256`
+    // (32 bytes).
+    //
+    // In dugite the metadata hash is structurally `Hash32`, so this
+    // predicate is defensive — it only fires if a future wire-decode
+    // path produces an oversized byte representation. The helper is
+    // exercised directly by unit tests.
+    //
+    // Reference: Haskell `PoolMedataHashTooBig` in
+    // `eras/shelley/impl/src/Cardano/Ledger/Shelley/Rules/Pool.hs`.
+    // ------------------------------------------------------------------
+    for cert in &body.certificates {
+        if let Certificate::PoolRegistration(pool_params) = cert {
+            if let Some(meta) = &pool_params.pool_metadata {
+                let bytes = meta.hash.as_bytes();
+                if is_pool_metadata_hash_too_big(bytes, params.protocol_version_major) {
+                    errors.push(ValidationError::PoolMedataHashTooBig {
+                        pool: pool_params.operator.to_hex(),
+                        hash_size: bytes.len(),
+                    });
+                }
             }
         }
     }
@@ -1666,6 +1725,87 @@ mod tests {
                 .iter()
                 .any(|e| matches!(e, ValidationError::InvalidWitnessSignature(_))),
             "expected InvalidWitnessSignature, got {errors:?}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Tests — `PoolMedataHashTooBig` predicate (Haskell, Alonzo+)
+    //
+    // These tests exercise `is_pool_metadata_hash_too_big` directly via a
+    // raw byte slice — in dugite the typed `PoolMetadata.hash` field is
+    // already a fixed `Hash32`, so the predicate is structurally
+    // unreachable through the typed API. The helper is kept defensive
+    // against future wire-decode paths that surface oversized values.
+    // -----------------------------------------------------------------------
+    #[test]
+    fn test_pool_medata_hash_too_big_rejected_post_alonzo() {
+        // pv_major = 5 (Alonzo), 33-byte hash → predicate fires.
+        let oversized = vec![0u8; 33];
+        assert!(super::is_pool_metadata_hash_too_big(&oversized, 5));
+    }
+
+    #[test]
+    fn test_pool_medata_hash_too_big_skipped_pre_alonzo() {
+        // pv_major = 4 (Mary), 33-byte hash → predicate inactive.
+        let oversized = vec![0u8; 33];
+        assert!(!super::is_pool_metadata_hash_too_big(&oversized, 4));
+    }
+
+    #[test]
+    fn test_pool_medata_hash_at_32_bytes_accepted() {
+        // pv_major = 5, exactly 32 bytes → passes.
+        let exact = vec![0u8; 32];
+        assert!(!super::is_pool_metadata_hash_too_big(&exact, 5));
+    }
+
+    #[test]
+    fn test_pool_medata_no_metadata_passes() {
+        // The aggregate validator skips the check when `pool_metadata`
+        // is `None`. Build a registration without metadata and confirm
+        // no `PoolMedataHashTooBig` error is produced.
+        use dugite_primitives::transaction::{Certificate, PoolParams, Rational};
+
+        let (mut utxo_set, mut tx, _) = make_valid_tx();
+        // Reuse the existing baseline — it has no certificates. Add one
+        // pool registration without metadata.
+        let pool_params = PoolParams {
+            operator: Hash28::from_bytes([0x11u8; 28]),
+            vrf_keyhash: Hash32::from_bytes([0x22u8; 32]),
+            pledge: Lovelace(0),
+            cost: Lovelace(340_000_000),
+            margin: Rational {
+                numerator: 1,
+                denominator: 100,
+            },
+            // Reward account on testnet (header byte 0xE0).
+            reward_account: {
+                let mut acct = vec![0xE0];
+                acct.extend_from_slice(&[0x33u8; 28]);
+                acct
+            },
+            pool_owners: vec![],
+            relays: vec![],
+            pool_metadata: None,
+        };
+        tx.body
+            .certificates
+            .push(Certificate::PoolRegistration(pool_params));
+
+        // Top up inputs so the (now larger) pool deposit balances; the
+        // pool deposit is 500 ADA on mainnet defaults. Rather than
+        // reshape the fixture, we just inspect the error list and
+        // assert the predicate did not fire — other balance/witness
+        // errors are tolerated.
+        let _ = &mut utxo_set; // silence unused-mut warning under cfg branches
+        let params = ProtocolParameters::mainnet_defaults();
+        let errors = validate_transaction(&tx, &utxo_set, &params, 100, 300, None)
+            .err()
+            .unwrap_or_default();
+        assert!(
+            !errors
+                .iter()
+                .any(|e| matches!(e, ValidationError::PoolMedataHashTooBig { .. })),
+            "expected no PoolMedataHashTooBig, got {errors:?}"
         );
     }
 }

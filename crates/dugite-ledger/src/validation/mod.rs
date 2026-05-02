@@ -962,6 +962,34 @@ pub enum ValidationError {
         /// Hex-encoded provided policy hash, or "None" if absent.
         actual: String,
     },
+    /// Pool metadata hash exceeds the 32-byte (Blake2b-256) cap.
+    ///
+    /// Reference: Haskell `PoolMedataHashTooBig` in
+    /// `eras/shelley/impl/src/Cardano/Ledger/Shelley/Rules/Pool.hs`:
+    ///
+    /// ```haskell
+    /// when (SoftForks.restrictPoolMetadataHash pv) $
+    ///   forM_ sppMetadata $ \pmd ->
+    ///     let s = sizeofByteArray $ pmHash pmd
+    ///      in s <= fromIntegral (hashSize ([] @HASH))
+    ///           ?! injectFailure (PoolMedataHashTooBig sppId s)
+    /// ```
+    ///
+    /// Active since Alonzo (`pvMajor > 4`) per
+    /// `SoftForks.restrictPoolMetadataHash`. `HASH = Blake2b_256`, so the
+    /// cap is 32 bytes.
+    ///
+    /// In dugite, `PoolMetadata.hash` is structurally a `Hash32` (fixed
+    /// 32 bytes), so this predicate is defensive against future
+    /// wire-decode paths that might surface oversized values via a
+    /// byte-slice route.
+    #[error("PoolMedataHashTooBig: pool={pool}, hash_size={hash_size}")]
+    PoolMedataHashTooBig {
+        /// Hex-encoded 28-byte pool operator key hash.
+        pool: String,
+        /// Reported metadata hash size in bytes (> 32).
+        hash_size: usize,
+    },
 }
 
 // ---------------------------------------------------------------------------

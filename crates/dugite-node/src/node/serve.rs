@@ -650,6 +650,9 @@ pub(crate) fn convert_validation_error(
         VE::ExtraneousScriptWitness { hashes } => TxValidationError::ScriptFailed {
             reason: format!("Extraneous script witness(es) not needed by transaction: {hashes:?}"),
         },
+        VE::PoolMedataHashTooBig { pool, hash_size } => TxValidationError::ScriptFailed {
+            reason: format!("PoolMedataHashTooBig: pool={pool}, hash_size={hash_size}"),
+        },
     }
 }
 
