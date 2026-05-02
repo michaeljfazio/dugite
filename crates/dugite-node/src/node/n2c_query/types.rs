@@ -979,3 +979,186 @@ pub type MultiAssetSnapshot = Vec<(Vec<u8>, Vec<(Vec<u8>, u64)>)>;
 // Re-export UtxoSnapshot and UtxoQueryProvider from the network crate.
 // These are the canonical definitions — no duplication.
 pub use dugite_network::{UtxoQueryProvider, UtxoSnapshot};
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ─── Default impls ───────────────────────────────────────────────────────
+    //
+    // The `Default` impls drive the *initial* response shape that N2C clients
+    // see before the first `update_query_state()` runs (i.e. before any block
+    // has been applied).  Operators on a fresh node — and integration tests
+    // that issue queries during early sync — depend on these defaults being
+    // sensible (mainnet-typical pparams, empty governance state, valid hash
+    // sizes).  The tests here pin a representative subset; full enumeration
+    // of every default is unnecessary churn.
+
+    #[test]
+    fn protocol_params_snapshot_default_matches_mainnet_typicals() {
+        // Spot-check the parameters that other code paths assume specific
+        // values for.  `min_fee_a` and `min_fee_b` feed cardano-cli's
+        // `transaction calculate-min-fee`, so an accidental change would
+        // produce off-by-one fee mistakes for any client that issues a
+        // pparams query before the node has ever applied a block.
+        let pp = ProtocolParamsSnapshot::default();
+        assert_eq!(pp.min_fee_a, 44);
+        assert_eq!(pp.min_fee_b, 155381);
+        assert_eq!(pp.max_tx_size, 16384);
+        assert_eq!(pp.key_deposit, 2_000_000);
+        assert_eq!(pp.pool_deposit, 500_000_000);
+        assert_eq!(pp.min_pool_cost, 170_000_000);
+
+        // Conway governance defaults must be non-zero — otherwise the first
+        // pparams query during early sync would silently report a
+        // "no-deposit, instant-vote" governance configuration.
+        assert!(pp.drep_deposit > 0);
+        assert!(pp.gov_action_deposit > 0);
+        assert!(pp.committee_min_size > 0);
+
+        // All voting-threshold rationals must have non-zero denominators —
+        // a bad default here would make any threshold check divide by zero
+        // when a client queries pparams before block apply.
+        let rats: [(u64, u64); 18] = [
+            (pp.dvt_pp_network_group_num, pp.dvt_pp_network_group_den),
+            (pp.dvt_pp_economic_group_num, pp.dvt_pp_economic_group_den),
+            (pp.dvt_pp_technical_group_num, pp.dvt_pp_technical_group_den),
+            (pp.dvt_pp_gov_group_num, pp.dvt_pp_gov_group_den),
+            (pp.dvt_hard_fork_num, pp.dvt_hard_fork_den),
+            (pp.dvt_no_confidence_num, pp.dvt_no_confidence_den),
+            (pp.dvt_committee_normal_num, pp.dvt_committee_normal_den),
+            (
+                pp.dvt_committee_no_confidence_num,
+                pp.dvt_committee_no_confidence_den,
+            ),
+            (pp.dvt_constitution_num, pp.dvt_constitution_den),
+            (
+                pp.dvt_treasury_withdrawal_num,
+                pp.dvt_treasury_withdrawal_den,
+            ),
+            (
+                pp.pvt_motion_no_confidence_num,
+                pp.pvt_motion_no_confidence_den,
+            ),
+            (pp.pvt_committee_normal_num, pp.pvt_committee_normal_den),
+            (
+                pp.pvt_committee_no_confidence_num,
+                pp.pvt_committee_no_confidence_den,
+            ),
+            (pp.pvt_hard_fork_num, pp.pvt_hard_fork_den),
+            (pp.pvt_pp_security_group_num, pp.pvt_pp_security_group_den),
+            (pp.a0_num, pp.a0_den),
+            (pp.rho_num, pp.rho_den),
+            (pp.tau_num, pp.tau_den),
+        ];
+        for (n, d) in rats {
+            assert!(d > 0, "rational denominator must be > 0 (n={n}, d={d})");
+        }
+    }
+
+    #[test]
+    fn node_state_snapshot_default_is_self_consistent() {
+        let s = NodeStateSnapshot::default();
+        // Origin tip must be paired with block_number 0 — the wire-format
+        // encoder for GetTip and GetChainBlockNo treats these as a unit.
+        assert_eq!(s.block_number.0, 0);
+        assert_eq!(s.epoch.0, 0);
+        // Era 6 is Conway — the default era assumed before the node has
+        // observed an era transition, matching the era we ship in.
+        assert_eq!(s.era, 6);
+        // Counts and balances must default to zero on an empty ledger.
+        assert_eq!(s.utxo_count, 0);
+        assert_eq!(s.delegations_count, 0);
+        assert_eq!(s.pool_count, 0);
+        assert_eq!(s.treasury, 0);
+        assert_eq!(s.reserves, 0);
+        assert_eq!(s.drep_count, 0);
+        assert_eq!(s.proposal_count, 0);
+        // Constitution hash must be exactly 32 bytes — clients deserialize
+        // it as a Hash32 and any other length panics in the decoder.
+        assert_eq!(s.constitution_hash.len(), 32);
+        // Each chain-dep nonce slot is a 32-byte Blake2b-256 hash — a
+        // truncated default would break DebugChainDepState consumers.
+        assert_eq!(s.epoch_nonce.len(), 32);
+        assert_eq!(s.evolving_nonce.len(), 32);
+        assert_eq!(s.candidate_nonce.len(), 32);
+        assert_eq!(s.lab_nonce.len(), 32);
+        // Mainnet defaults are stable wire-contract values.
+        assert_eq!(s.network_magic, 764824073);
+        assert_eq!(s.security_param, 2160);
+        assert_eq!(s.epoch_length, 432_000);
+        assert_eq!(s.max_lovelace_supply, 45_000_000_000_000_000);
+    }
+
+    #[test]
+    fn empty_aggregate_defaults_are_empty() {
+        let cs = CommitteeSnapshot::default();
+        assert!(cs.members.is_empty());
+        assert_eq!(cs.threshold, None);
+        assert_eq!(cs.current_epoch, 0);
+
+        let ssr = StakeSnapshotsResult::default();
+        assert!(ssr.pools.is_empty());
+        assert_eq!(ssr.total_mark_stake, 0);
+        assert_eq!(ssr.total_set_stake, 0);
+        assert_eq!(ssr.total_go_stake, 0);
+
+        let ssd = SnapshotStakeData::default();
+        assert!(ssd.stake_entries.is_empty());
+        assert!(ssd.delegation_entries.is_empty());
+        assert!(ssd.pool_params.is_empty());
+
+        let gs = GovStateSnapshot::default();
+        assert!(gs.proposals.is_empty());
+        assert!(gs.constitution_url.is_empty());
+        assert!(gs.enacted_pparam_update.is_none());
+        assert!(gs.enacted_hard_fork.is_none());
+        assert!(gs.enacted_committee.is_none());
+        assert!(gs.enacted_constitution.is_none());
+        assert_eq!(gs.treasury, 0);
+        // GovStateSnapshot embeds a default ProtocolParamsSnapshot for both
+        // cur/prev — verify the boxed defaults survive round-trip.
+        assert_eq!(gs.cur_pparams.min_fee_a, 44);
+        assert_eq!(gs.prev_pparams.min_fee_a, 44);
+    }
+
+    // ─── Clone preserves fields that are easy to silently corrupt ────────────
+
+    #[test]
+    fn protocol_params_snapshot_clone_preserves_all_fields() {
+        // PartialEq isn't derived (Vec<i64> Option is, but the struct isn't),
+        // so we round-trip through Debug to assert identical state.
+        let pp = ProtocolParamsSnapshot {
+            cost_models_v1: Some(vec![1, 2, 3]),
+            cost_models_v3: Some(vec![]),
+            protocol_version_major: 11,
+            protocol_version_minor: 7,
+            ..ProtocolParamsSnapshot::default()
+        };
+        let cloned = pp.clone();
+        assert_eq!(format!("{pp:?}"), format!("{cloned:?}"));
+    }
+
+    #[test]
+    fn relay_snapshot_variants_clone_independently() {
+        // Sanity-check that the three Relay variants survive clone without
+        // collapsing to a single shape (a regression that bit us once when
+        // an enum got accidentally re-derived without `Clone`).
+        let v1 = RelaySnapshot::SingleHostAddr {
+            port: Some(3001),
+            ipv4: Some([10, 0, 0, 1]),
+            ipv6: None,
+        };
+        let v2 = RelaySnapshot::SingleHostName {
+            port: None,
+            dns_name: "relay.example".to_string(),
+        };
+        let v3 = RelaySnapshot::MultiHostName {
+            dns_name: "_cardano._tcp.example.org".to_string(),
+        };
+        for v in [&v1, &v2, &v3] {
+            let cloned = v.clone();
+            assert_eq!(format!("{v:?}"), format!("{cloned:?}"));
+        }
+    }
+}

@@ -992,7 +992,9 @@ impl Node {
 // ─── Private helpers ──────────────────────────────────────────────────────────
 
 /// Return the canonical action-type string for a `GovAction`.
-fn gov_action_type_str(action: &dugite_primitives::transaction::GovAction) -> &'static str {
+pub(crate) fn gov_action_type_str(
+    action: &dugite_primitives::transaction::GovAction,
+) -> &'static str {
     use dugite_primitives::transaction::GovAction;
     match action {
         GovAction::ParameterChange { .. } => "ParameterChange",
@@ -1007,7 +1009,7 @@ fn gov_action_type_str(action: &dugite_primitives::transaction::GovAction) -> &'
 
 /// Build per-credential committee/DRep/SPO vote vectors for a governance action.
 #[allow(clippy::type_complexity)]
-fn build_vote_maps(
+pub(crate) fn build_vote_maps(
     ls: &dugite_ledger::LedgerState,
     action_id: &dugite_primitives::transaction::GovActionId,
 ) -> (
@@ -1042,4 +1044,226 @@ fn build_vote_maps(
         }
     }
     (committee_votes, drep_votes, spo_votes)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use dugite_ledger::LedgerState;
+    use dugite_primitives::credentials::Credential;
+    use dugite_primitives::hash::{Hash28, Hash32};
+    use dugite_primitives::protocol_params::ProtocolParameters;
+    use dugite_primitives::transaction::{
+        Anchor, Constitution, GovAction, GovActionId, Rational, Vote, Voter, VotingProcedure,
+    };
+    use std::sync::Arc;
+
+    // ─── float_to_rational ───────────────────────────────────────────────────
+    //
+    // The genesis files store activeSlotsCoeff / a0 / rho / tau as decimals.
+    // The N2C genesis-config response and several pparam fields require these
+    // as `(num, den)` integer rationals — `float_to_rational` is the bridge.
+    // Getting the bridge wrong silently changes pparams clients see.
+
+    #[test]
+    fn float_to_rational_handles_common_genesis_values() {
+        // The exact values that ship in mainnet/preview shelley-genesis.json.
+        assert_eq!(float_to_rational(0.0), (0, 1));
+        assert_eq!(float_to_rational(1.0), (1, 1));
+        assert_eq!(float_to_rational(0.05), (1, 20)); // active_slots_coeff
+        assert_eq!(float_to_rational(0.3), (3, 10)); // a0
+        assert_eq!(float_to_rational(0.003), (3, 1000)); // rho
+        assert_eq!(float_to_rational(0.2), (1, 5)); // tau (simplified)
+        assert_eq!(float_to_rational(0.5), (1, 2));
+    }
+
+    #[test]
+    fn float_to_rational_simplifies_via_gcd() {
+        // 0.4 = 4/10 → simplified to 2/5 (gcd = 2).
+        assert_eq!(float_to_rational(0.4), (2, 5));
+        // 0.25 = 25/100 → 1/4 (the search loop hits den=4 first).
+        assert_eq!(float_to_rational(0.25), (1, 4));
+    }
+
+    #[test]
+    fn float_to_rational_falls_back_for_unrepresentable_floats() {
+        // A value with no exact small-denominator representation should still
+        // produce a valid rational (the 1e6-denominator fallback path).
+        // We don't assert exact (num, den) — the contract is: numeric value
+        // matches the input, and denominator is non-zero.
+        let (n, d) = float_to_rational(std::f64::consts::PI);
+        assert!(d > 0);
+        let approx = n as f64 / d as f64;
+        assert!((approx - std::f64::consts::PI).abs() < 1e-3);
+    }
+
+    // ─── credential_to_bytes ─────────────────────────────────────────────────
+    //
+    // Distinguishes key-hash (type=0) from script-hash (type=1) credentials in
+    // the wire format used by GetGovState vote maps.  A flipped discriminator
+    // would silently mis-categorize all script DReps in cardano-cli output.
+
+    #[test]
+    fn credential_to_bytes_discriminates_key_vs_script() {
+        let key_hash = Hash28::from_bytes([0xAB; 28]);
+        let cred = Credential::VerificationKey(key_hash);
+        let (ty, bytes) = credential_to_bytes(&cred);
+        assert_eq!(ty, 0);
+        assert_eq!(bytes, vec![0xAB; 28]);
+
+        let script_hash = Hash28::from_bytes([0xCD; 28]);
+        let cred = Credential::Script(script_hash);
+        let (ty, bytes) = credential_to_bytes(&cred);
+        assert_eq!(ty, 1);
+        assert_eq!(bytes, vec![0xCD; 28]);
+    }
+
+    // ─── gov_action_type_str ─────────────────────────────────────────────────
+    //
+    // String labels exposed via GetGovState — clients may match on these in
+    // logs/dashboards, so the labels are part of our user-facing surface.
+
+    #[test]
+    fn gov_action_type_str_maps_each_variant() {
+        let zero = Hash32::ZERO;
+        // Construct one representative of each GovAction variant and pin its label.
+        let cases: Vec<(GovAction, &str)> = vec![
+            (
+                GovAction::ParameterChange {
+                    prev_action_id: None,
+                    protocol_param_update: Box::default(),
+                    policy_hash: None,
+                },
+                "ParameterChange",
+            ),
+            (
+                GovAction::HardForkInitiation {
+                    prev_action_id: None,
+                    protocol_version: (10, 0),
+                },
+                "HardForkInitiation",
+            ),
+            (
+                GovAction::TreasuryWithdrawals {
+                    withdrawals: Default::default(),
+                    policy_hash: None,
+                },
+                "TreasuryWithdrawals",
+            ),
+            (
+                GovAction::NoConfidence {
+                    prev_action_id: None,
+                },
+                "NoConfidence",
+            ),
+            (
+                GovAction::UpdateCommittee {
+                    prev_action_id: None,
+                    members_to_remove: Default::default(),
+                    members_to_add: Default::default(),
+                    threshold: Rational {
+                        numerator: 2,
+                        denominator: 3,
+                    },
+                },
+                "UpdateCommittee",
+            ),
+            (
+                GovAction::NewConstitution {
+                    prev_action_id: None,
+                    constitution: Constitution {
+                        anchor: Anchor {
+                            url: String::new(),
+                            data_hash: zero,
+                        },
+                        script_hash: None,
+                    },
+                },
+                "NewConstitution",
+            ),
+            (GovAction::InfoAction, "InfoAction"),
+        ];
+        for (action, expected) in cases {
+            assert_eq!(gov_action_type_str(&action), expected, "{action:?}");
+        }
+    }
+
+    // ─── build_vote_maps ─────────────────────────────────────────────────────
+    //
+    // build_vote_maps is the projection from the ledger's `votes_by_action`
+    // map to the per-voter wire vectors consumed by GetGovState/GetRatifyState.
+    // The function decides three things that are easy to get wrong:
+    //  1. Voter type discrimination (CC vs DRep vs SPO)
+    //  2. Vote-encoding (No=0, Yes=1, Abstain=2 — note the Yes/No swap)
+    //  3. Hash truncation: SPO's StakePool(Hash32) is truncated to 28 bytes.
+    // A single-action sentinel test catches silent breakage of any of those.
+
+    #[test]
+    fn build_vote_maps_classifies_voters_and_votes() {
+        let mut ledger = LedgerState::new(ProtocolParameters::mainnet_defaults());
+        let action_id = GovActionId {
+            transaction_id: Hash32::from_bytes([0x11; 32]),
+            action_index: 3,
+        };
+
+        let cc_cred = Credential::VerificationKey(Hash28::from_bytes([0xC0; 28]));
+        let drep_cred = Credential::Script(Hash28::from_bytes([0xD1; 28]));
+        // SPO uses bare Hash32 (not a Credential).  We seed all 32 bytes with a
+        // distinguishable pattern so the truncation assertion is meaningful.
+        let mut spo_bytes = [0u8; 32];
+        spo_bytes[..28].copy_from_slice(&[0xE2; 28]);
+        spo_bytes[28..].copy_from_slice(&[0xFF; 4]); // padding bytes that must be discarded
+        let spo_id = Hash32::from_bytes(spo_bytes);
+
+        let v_yes = VotingProcedure {
+            vote: Vote::Yes,
+            anchor: None,
+        };
+        let v_no = VotingProcedure {
+            vote: Vote::No,
+            anchor: None,
+        };
+        let v_abstain = VotingProcedure {
+            vote: Vote::Abstain,
+            anchor: None,
+        };
+
+        {
+            let gov = Arc::make_mut(&mut ledger.gov.governance);
+            gov.votes_by_action.insert(
+                action_id.clone(),
+                vec![
+                    (Voter::ConstitutionalCommittee(cc_cred.clone()), v_yes),
+                    (Voter::DRep(drep_cred.clone()), v_no),
+                    (Voter::StakePool(spo_id), v_abstain),
+                ],
+            );
+        }
+
+        let (cc, drep, spo) = build_vote_maps(&ledger, &action_id);
+
+        assert_eq!(cc.len(), 1);
+        assert_eq!(cc[0], (vec![0xC0; 28], 0u8, 1u8)); // VKey CC, Yes
+        assert_eq!(drep.len(), 1);
+        assert_eq!(drep[0], (vec![0xD1; 28], 1u8, 0u8)); // Script DRep, No
+        assert_eq!(spo.len(), 1);
+        // SPO hash is truncated to 28 bytes — the trailing 0xFF padding is
+        // stripped, matching the Cardano wire format for StakePool key hashes.
+        assert_eq!(spo[0], (vec![0xE2; 28], 2u8));
+    }
+
+    #[test]
+    fn build_vote_maps_returns_empty_for_unknown_action() {
+        // Sanity guard: an action id with no recorded votes must produce
+        // empty vectors rather than panicking on the lookup.
+        let ledger = LedgerState::new(ProtocolParameters::mainnet_defaults());
+        let unknown = GovActionId {
+            transaction_id: Hash32::from_bytes([0x99; 32]),
+            action_index: 0,
+        };
+        let (cc, drep, spo) = build_vote_maps(&ledger, &unknown);
+        assert!(cc.is_empty());
+        assert!(drep.is_empty());
+        assert!(spo.is_empty());
+    }
 }
