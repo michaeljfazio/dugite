@@ -13995,4 +13995,179 @@ mod tests {
             }
         }
     }
+
+    // ---------------------------------------------------------------------
+    // WithdrawalsNotInRewardsCERTS / ConwayWithdrawalsMissingAccounts /
+    // ConwayIncompleteWithdrawals — integration tests.
+    //
+    // Reference: Haskell `Cardano.Ledger.Conway.Rules.Certs.conwayCertsTransition`
+    // (PV ≤ 10) and `Cardano.Ledger.Conway.Rules.Ledger.testIncompleteAndMissingWithdrawals`
+    // (PV ≥ 11 after the move-checks-to-LEDGER hard fork).
+    // ---------------------------------------------------------------------
+
+    #[test]
+    fn test_validate_transaction_pv10_combined_withdrawals_error() {
+        use dugite_primitives::network::NetworkId;
+        // PV = 10 → predicate uses combined `WithdrawalsNotInRewardsCERTS`.
+        let (utxo_set, input) = make_simple_utxo_set();
+        let mut params = ProtocolParameters::mainnet_defaults();
+        params.protocol_version_major = 10;
+
+        // Two withdrawals: one mismatched amount, one unregistered account.
+        let kh_a = Hash28::from_bytes([0xAAu8; 28]);
+        let kh_b = Hash28::from_bytes([0xBBu8; 28]);
+        let addr_a = make_reward_account_vkey(kh_a); // 0xe0 (testnet)
+        let addr_b = make_reward_account_vkey(kh_b);
+
+        let mut tx = make_simple_tx(input, 9_000_000, 1_000_000);
+        tx.body.withdrawals.insert(addr_a.clone(), Lovelace(50));
+        tx.body.withdrawals.insert(addr_b.clone(), Lovelace(75));
+
+        // Reward accounts: addr_a registered at 100 (mismatch), addr_b absent.
+        let mut accounts: HashMap<Hash32, Lovelace> = HashMap::new();
+        accounts.insert(
+            crate::state::LedgerState::reward_account_to_hash(&addr_a),
+            Lovelace(100),
+        );
+
+        let context = ValidationContext::default()
+            .with_reward_accounts(accounts)
+            .with_network(NetworkId::Testnet);
+
+        let result =
+            validate_transaction_with_context(&tx, &utxo_set, &params, 100, 300, None, context);
+        let errs = result.expect_err("expected withdrawal failure");
+
+        let combined = errs.iter().find_map(|e| match e {
+            ValidationError::WithdrawalsNotInRewardsCERTS { bad } => Some(bad.clone()),
+            _ => None,
+        });
+        let combined =
+            combined.unwrap_or_else(|| panic!("missing WithdrawalsNotInRewardsCERTS in {errs:?}"));
+        assert_eq!(
+            combined.len(),
+            2,
+            "expected 2 entries (1 missing + 1 incomplete) at PV ≤ 10, got {combined:?}"
+        );
+
+        // No PV ≥ 11 split errors should be present at PV = 10.
+        for e in &errs {
+            assert!(
+                !matches!(
+                    e,
+                    ValidationError::ConwayWithdrawalsMissingAccounts { .. }
+                        | ValidationError::ConwayIncompleteWithdrawals { .. }
+                ),
+                "PV ≤ 10 must not emit split predicates: {e:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_validate_transaction_pv11_split_withdrawals_errors() {
+        use dugite_primitives::network::NetworkId;
+        // PV = 11 → predicate splits into MissingAccounts + IncompleteWithdrawals.
+        let (utxo_set, input) = make_simple_utxo_set();
+        let mut params = ProtocolParameters::mainnet_defaults();
+        params.protocol_version_major = 11;
+
+        let kh_a = Hash28::from_bytes([0xAAu8; 28]);
+        let kh_b = Hash28::from_bytes([0xBBu8; 28]);
+        let addr_a = make_reward_account_vkey(kh_a);
+        let addr_b = make_reward_account_vkey(kh_b);
+
+        let mut tx = make_simple_tx(input, 9_000_000, 1_000_000);
+        tx.body.withdrawals.insert(addr_a.clone(), Lovelace(50));
+        tx.body.withdrawals.insert(addr_b.clone(), Lovelace(75));
+
+        // addr_a registered at 100 (mismatch → incomplete);
+        // addr_b unregistered (→ missing).
+        let mut accounts: HashMap<Hash32, Lovelace> = HashMap::new();
+        accounts.insert(
+            crate::state::LedgerState::reward_account_to_hash(&addr_a),
+            Lovelace(100),
+        );
+
+        let context = ValidationContext::default()
+            .with_reward_accounts(accounts)
+            .with_network(NetworkId::Testnet);
+
+        let result =
+            validate_transaction_with_context(&tx, &utxo_set, &params, 100, 300, None, context);
+        let errs = result.expect_err("expected withdrawal failure");
+
+        let has_missing = errs.iter().any(|e| {
+            matches!(
+                e,
+                ValidationError::ConwayWithdrawalsMissingAccounts { missing }
+                    if missing.len() == 1
+            )
+        });
+        let has_incomplete = errs.iter().any(|e| {
+            matches!(
+                e,
+                ValidationError::ConwayIncompleteWithdrawals { incomplete }
+                    if incomplete.len() == 1
+            )
+        });
+        assert!(
+            has_missing,
+            "expected ConwayWithdrawalsMissingAccounts in {errs:?}"
+        );
+        assert!(
+            has_incomplete,
+            "expected ConwayIncompleteWithdrawals in {errs:?}"
+        );
+
+        // PV ≥ 11 must not also emit the combined PV ≤ 10 variant.
+        for e in &errs {
+            assert!(
+                !matches!(e, ValidationError::WithdrawalsNotInRewardsCERTS { .. }),
+                "PV ≥ 11 must not emit combined CERTS predicate: {e:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_validate_transaction_correct_withdrawals_pass() {
+        use dugite_primitives::network::NetworkId;
+        // Withdrawals on the right network, registered, and amount-matches:
+        // none of the new predicates should fire.
+        let (utxo_set, input) = make_simple_utxo_set();
+        let mut params = ProtocolParameters::mainnet_defaults();
+        params.protocol_version_major = 11;
+
+        let kh = Hash28::from_bytes([0xCCu8; 28]);
+        let addr = make_reward_account_vkey(kh); // 0xe0 testnet
+        let mut tx = make_simple_tx(input, 9_000_000, 1_000_000);
+        tx.body.withdrawals.insert(addr.clone(), Lovelace(42));
+
+        let mut accounts: HashMap<Hash32, Lovelace> = HashMap::new();
+        accounts.insert(
+            crate::state::LedgerState::reward_account_to_hash(&addr),
+            Lovelace(42),
+        );
+
+        let context = ValidationContext::default()
+            .with_reward_accounts(accounts)
+            .with_network(NetworkId::Testnet);
+
+        let result =
+            validate_transaction_with_context(&tx, &utxo_set, &params, 100, 300, None, context);
+        // Other unrelated checks may or may not pass; assert only that none
+        // of the new withdrawal predicates appear.
+        if let Err(errors) = result {
+            for e in &errors {
+                assert!(
+                    !matches!(
+                        e,
+                        ValidationError::WithdrawalsNotInRewardsCERTS { .. }
+                            | ValidationError::ConwayWithdrawalsMissingAccounts { .. }
+                            | ValidationError::ConwayIncompleteWithdrawals { .. }
+                    ),
+                    "well-formed withdrawal must not trigger CERTS/LEDGER predicates: {e:?}"
+                );
+            }
+        }
+    }
 }

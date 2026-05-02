@@ -20,6 +20,7 @@ pub mod mir;
 mod phase1;
 pub mod ppup;
 mod scripts;
+pub mod withdrawals;
 
 #[cfg(test)]
 mod tests;
@@ -811,6 +812,42 @@ pub enum ValidationError {
         account: String,
         declared: u64,
         actual: u64,
+    },
+    /// Combined CERTS-rule withdrawal failure (PV ≤ 10).
+    ///
+    /// Reference: Haskell `WithdrawalsNotInRewardsCERTS` in
+    /// `eras/conway/impl/src/Cardano/Ledger/Conway/Rules/Certs.hs`.
+    /// Bundles missing accounts (unregistered or wrong-network) AND
+    /// incomplete withdrawals (amount ≠ balance) per the helper
+    /// `withdrawalsThatDoNotDrainAccounts`. Active in Conway prior to
+    /// the move-checks-to-LEDGER-rule hard fork (PV ≤ 10).
+    #[error("WithdrawalsNotInRewardsCERTS: {bad:?}")]
+    WithdrawalsNotInRewardsCERTS {
+        /// `(addr_hex, supplied_amount)` pairs for every withdrawal whose
+        /// reward account is missing OR whose amount mismatches the balance.
+        bad: Vec<(String, u64)>,
+    },
+    /// Withdrawal references an unregistered or wrong-network reward account
+    /// (PV ≥ 11).
+    ///
+    /// Reference: Haskell `ConwayWithdrawalsMissingAccounts` in
+    /// `eras/conway/impl/src/Cardano/Ledger/Conway/Rules/Ledger.hs`,
+    /// active after `hardforkConwayMoveWithdrawalsAndDRepChecksToLedgerRule`.
+    #[error("ConwayWithdrawalsMissingAccounts: {missing:?}")]
+    ConwayWithdrawalsMissingAccounts {
+        /// `(addr_hex, supplied_amount)` per missing-account withdrawal.
+        missing: Vec<(String, u64)>,
+    },
+    /// Withdrawal amount does not match the registered account balance
+    /// (PV ≥ 11).
+    ///
+    /// Reference: Haskell `ConwayIncompleteWithdrawals` in
+    /// `eras/conway/impl/src/Cardano/Ledger/Conway/Rules/Ledger.hs`.
+    #[error("ConwayIncompleteWithdrawals: {incomplete:?}")]
+    ConwayIncompleteWithdrawals {
+        /// `(addr_hex, supplied_amount, expected_balance)` per mismatched
+        /// withdrawal.
+        incomplete: Vec<(String, u64, u64)>,
     },
     /// Haskell `StakeKeyHasNonZeroAccountBalanceDELEG`: a stake deregistration
     /// is rejected when the reward account holds a non-zero balance.
@@ -2221,6 +2258,48 @@ pub fn validate_transaction_with_pools(
                         account: account_hex,
                         declared: amount.0,
                         actual: 0,
+                    });
+                }
+            }
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // Conway `WithdrawalsNotInRewardsCERTS` (PV ≤ 10) — split into
+    // `ConwayWithdrawalsMissingAccounts` + `ConwayIncompleteWithdrawals`
+    // for PV ≥ 11.
+    //
+    // Reference (PV ≤ 10): Haskell
+    //   `Cardano.Ledger.Conway.Rules.Certs.conwayCertsTransition` /
+    //   `withdrawalsThatDoNotDrainAccounts`.
+    // Reference (PV ≥ 11): Haskell
+    //   `Cardano.Ledger.Conway.Rules.Ledger.testIncompleteAndMissingWithdrawals`
+    //   after `hardforkConwayMoveWithdrawalsAndDRepChecksToLedgerRule`.
+    //
+    // Only enforced when both `node_network` and `reward_accounts` are
+    // available (block-application context). This emits structured
+    // predicates alongside the legacy `IncorrectWithdrawalAmount` for
+    // backwards-compatibility with existing callers.
+    // ------------------------------------------------------------------
+    if let (Some(net), Some(accounts)) = (node_network, reward_accounts) {
+        if let Some(split) = withdrawals::withdrawals_that_do_not_drain_accounts(
+            &tx.body.withdrawals,
+            net.to_u8(),
+            accounts,
+        ) {
+            if params.protocol_version_major <= 10 {
+                let mut bad = split.missing.clone();
+                bad.extend(split.incomplete.iter().map(|(a, v, _)| (a.clone(), *v)));
+                errors.push(ValidationError::WithdrawalsNotInRewardsCERTS { bad });
+            } else {
+                if !split.missing.is_empty() {
+                    errors.push(ValidationError::ConwayWithdrawalsMissingAccounts {
+                        missing: split.missing,
+                    });
+                }
+                if !split.incomplete.is_empty() {
+                    errors.push(ValidationError::ConwayIncompleteWithdrawals {
+                        incomplete: split.incomplete,
                     });
                 }
             }

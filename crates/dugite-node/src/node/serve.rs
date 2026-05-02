@@ -475,6 +475,15 @@ pub(crate) fn convert_validation_error(
                 "Incorrect withdrawal amount for {account}: declared={declared}, actual={actual}"
             ),
         },
+        VE::WithdrawalsNotInRewardsCERTS { bad } => TxValidationError::ScriptFailed {
+            reason: format!("WithdrawalsNotInRewardsCERTS: {bad:?}"),
+        },
+        VE::ConwayWithdrawalsMissingAccounts { missing } => TxValidationError::ScriptFailed {
+            reason: format!("ConwayWithdrawalsMissingAccounts: {missing:?}"),
+        },
+        VE::ConwayIncompleteWithdrawals { incomplete } => TxValidationError::ScriptFailed {
+            reason: format!("ConwayIncompleteWithdrawals: {incomplete:?}"),
+        },
         VE::PoolRetirementTooLate {
             retirement_epoch,
             current_epoch,
