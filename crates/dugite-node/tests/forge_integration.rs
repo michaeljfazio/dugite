@@ -424,6 +424,7 @@ fn test_opcert_counter_tracking() {
             None,
             ValidationMode::Replay,
             Some(9),
+            None, // ledger_tip_slot
         )
     };
 
