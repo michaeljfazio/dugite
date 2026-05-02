@@ -832,6 +832,7 @@ impl Node {
                     overlay_ctx.as_ref(),
                     mode,
                     Some(ls.epochs.protocol_params.protocol_version_major),
+                    ls.tip.point.slot(),
                 ) {
                     if strict {
                         error!(

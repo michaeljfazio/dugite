@@ -95,6 +95,8 @@ pub enum ConsensusError {
     UnknownGenesisKey(Hash28),
     #[error("Genesis delegate VRF key mismatch: expected {expected}, got {got}")]
     GenesisVrfKeyMismatch { expected: Hash32, got: Hash32 },
+    #[error("OutsideForecastRange: {0}")]
+    OutsideForecast(#[from] crate::forecast::OutsideForecastRange),
 }
 
 /// Information about a registered pool needed for full block validation.
@@ -470,6 +472,7 @@ impl OuroborosPraos {
     /// - `ValidationMode::Replay`: skip all crypto verification, only perform structural
     ///   checks and update chain-dependent state (nonces, opcert counters). Used for blocks
     ///   replayed from local storage (Haskell's `reupdateChainDepState`).
+    #[allow(clippy::too_many_arguments)]
     pub fn validate_header_full(
         &mut self,
         header: &BlockHeader,
@@ -478,6 +481,7 @@ impl OuroborosPraos {
         overlay_ctx: Option<&OverlayContext>,
         mode: ValidationMode,
         ledger_pv_major: Option<u64>,
+        ledger_tip_slot: Option<SlotNo>,
     ) -> Result<(), ConsensusError> {
         // 1. Structural checks (always fatal)
         if header.slot > current_slot {
@@ -523,6 +527,16 @@ impl OuroborosPraos {
                     });
                 }
             }
+        }
+
+        // 1bb. Forecast horizon check (Haskell `Ouroboros.Consensus.Forecast`).
+        // Reject headers whose slot lies beyond `tip + 1 + stability_window`,
+        // matching `forecastFor` semantics. Skipped when `ledger_tip_slot` is
+        // None (e.g. unit tests, or origin where the caller has no tip yet).
+        if let Some(tip) = ledger_tip_slot {
+            let stability_window =
+                crate::stability_window_slots(self.security_param, self.active_slot_coeff);
+            crate::forecast::forecast_for(Some(tip), stability_window, header.slot)?;
         }
 
         // 1c. BFT overlay schedule check (Haskell's OVERLAY rule).
@@ -1903,7 +1917,8 @@ mod tests {
                 None,
                 None,
                 ValidationMode::Full,
-                Some(9)
+                Some(9),
+                None, // ledger_tip_slot
             )
             .is_ok());
     }
@@ -1929,6 +1944,7 @@ mod tests {
             None,
             ValidationMode::Full,
             Some(9),
+            None, // ledger_tip_slot
         );
         assert!(
             matches!(result, Err(ConsensusError::VrfKeyMismatch)),
@@ -1955,7 +1971,8 @@ mod tests {
                 Some(&info),
                 None,
                 ValidationMode::Full,
-                Some(9)
+                Some(9),
+                None, // ledger_tip_slot
             )
             .is_ok());
     }
@@ -1986,7 +2003,8 @@ mod tests {
                 Some(&info),
                 None,
                 ValidationMode::Full,
-                Some(9)
+                Some(9),
+                None, // ledger_tip_slot
             )
             .is_ok());
     }
@@ -2005,7 +2023,8 @@ mod tests {
                 None,
                 None,
                 ValidationMode::Full,
-                Some(9)
+                Some(9),
+                None, // ledger_tip_slot
             )
             .is_ok());
 
@@ -2019,7 +2038,8 @@ mod tests {
                 None,
                 None,
                 ValidationMode::Full,
-                Some(9)
+                Some(9),
+                None, // ledger_tip_slot
             )
             .is_ok());
 
@@ -2033,7 +2053,8 @@ mod tests {
                 None,
                 None,
                 ValidationMode::Full,
-                Some(9)
+                Some(9),
+                None, // ledger_tip_slot
             )
             .is_ok());
     }
@@ -2053,7 +2074,8 @@ mod tests {
                 Some(&info1),
                 None,
                 ValidationMode::Full,
-                Some(9)
+                Some(9),
+                None, // ledger_tip_slot
             )
             .is_ok());
 
@@ -2071,6 +2093,7 @@ mod tests {
             None,
             ValidationMode::Full,
             Some(9),
+            None, // ledger_tip_slot
         );
         assert!(
             matches!(
@@ -2099,7 +2122,8 @@ mod tests {
                 None,
                 None,
                 ValidationMode::Full,
-                Some(9)
+                Some(9),
+                None, // ledger_tip_slot
             )
             .is_ok());
 
@@ -2113,7 +2137,8 @@ mod tests {
                 None,
                 None,
                 ValidationMode::Full,
-                Some(9)
+                Some(9),
+                None, // ledger_tip_slot
             )
             .is_ok());
 
@@ -2138,7 +2163,8 @@ mod tests {
                 None,
                 None,
                 ValidationMode::Full,
-                Some(9)
+                Some(9),
+                None, // ledger_tip_slot
             )
             .is_ok());
 
@@ -2153,7 +2179,8 @@ mod tests {
                 None,
                 None,
                 ValidationMode::Full,
-                Some(9)
+                Some(9),
+                None, // ledger_tip_slot
             )
             .is_ok());
 
@@ -2192,7 +2219,8 @@ mod tests {
                 Some(&info),
                 None,
                 ValidationMode::Full,
-                Some(9)
+                Some(9),
+                None, // ledger_tip_slot
             )
             .is_ok());
     }
@@ -2222,7 +2250,8 @@ mod tests {
                 None,
                 None,
                 ValidationMode::Full,
-                Some(9)
+                Some(9),
+                None, // ledger_tip_slot
             )
             .is_ok());
 
@@ -2236,7 +2265,8 @@ mod tests {
                 None,
                 None,
                 ValidationMode::Full,
-                Some(9)
+                Some(9),
+                None, // ledger_tip_slot
             )
             .is_ok());
     }
@@ -2255,7 +2285,8 @@ mod tests {
                 Some(&info1),
                 None,
                 ValidationMode::Full,
-                Some(9)
+                Some(9),
+                None, // ledger_tip_slot
             )
             .is_ok());
 
@@ -2272,6 +2303,7 @@ mod tests {
             None,
             ValidationMode::Full,
             Some(9),
+            None, // ledger_tip_slot
         );
         assert!(
             matches!(
@@ -2302,7 +2334,8 @@ mod tests {
                 None,
                 None,
                 ValidationMode::Full,
-                Some(9)
+                Some(9),
+                None, // ledger_tip_slot
             )
             .is_ok());
 
@@ -2315,7 +2348,8 @@ mod tests {
                 None,
                 None,
                 ValidationMode::Full,
-                Some(9)
+                Some(9),
+                None, // ledger_tip_slot
             )
             .is_ok());
 
@@ -2349,6 +2383,7 @@ mod tests {
             None,
             ValidationMode::Replay,
             Some(9),
+            None, // ledger_tip_slot
         );
         assert!(
             result.is_ok(),
@@ -2381,6 +2416,7 @@ mod tests {
             None,
             ValidationMode::Replay,
             Some(9),
+            None, // ledger_tip_slot
         );
         assert!(
             result.is_ok(),
@@ -2407,6 +2443,7 @@ mod tests {
             None,
             ValidationMode::Replay,
             Some(9),
+            None, // ledger_tip_slot
         );
         assert!(
             matches!(
@@ -2438,6 +2475,7 @@ mod tests {
             None,
             ValidationMode::Full,
             Some(9),
+            None, // ledger_tip_slot
         );
         assert!(
             result.is_ok(),
@@ -2464,6 +2502,7 @@ mod tests {
             None,
             ValidationMode::Full,
             Some(9),
+            None, // ledger_tip_slot
         );
         assert!(
             result.is_ok(),
@@ -2494,7 +2533,8 @@ mod tests {
                     Some(&info0),
                     None,
                     ValidationMode::Replay,
-                    Some(9)
+                    Some(9),
+                    None, // ledger_tip_slot
                 )
                 .is_ok(),
             "Establishing counter=0 (first-seen) should succeed"
@@ -2514,6 +2554,7 @@ mod tests {
                         None,
                         ValidationMode::Replay,
                         Some(9),
+                        None, // ledger_tip_slot
                     )
                     .is_ok(),
                 "Counter increment to {seq} should succeed"
@@ -2531,6 +2572,7 @@ mod tests {
             None,
             ValidationMode::Replay,
             Some(9),
+            None, // ledger_tip_slot
         );
         assert!(
             result.is_ok(),
@@ -2559,7 +2601,8 @@ mod tests {
                     Some(&info0),
                     None,
                     ValidationMode::Replay,
-                    Some(9)
+                    Some(9),
+                    None, // ledger_tip_slot
                 )
                 .is_ok(),
             "Establishing counter=0 (first-seen) should succeed"
@@ -2579,6 +2622,7 @@ mod tests {
                         None,
                         ValidationMode::Replay,
                         Some(9),
+                        None, // ledger_tip_slot
                     )
                     .is_ok(),
                 "Counter increment to {seq} should succeed"
@@ -2596,6 +2640,7 @@ mod tests {
             None,
             ValidationMode::Replay,
             Some(9),
+            None, // ledger_tip_slot
         );
         assert!(
             matches!(
@@ -2727,6 +2772,7 @@ mod tests {
             None,
             ValidationMode::Full,
             Some(9),
+            None, // ledger_tip_slot
         );
         match result {
             Err(ConsensusError::UnregisteredPool { pool_id }) => {
@@ -2751,6 +2797,7 @@ mod tests {
             None,
             ValidationMode::Full,
             Some(9),
+            None, // ledger_tip_slot
         );
         assert!(
             result.is_ok(),
@@ -2778,6 +2825,7 @@ mod tests {
             None,
             ValidationMode::Full,
             Some(9),
+            None, // ledger_tip_slot
         );
         assert!(
             result.is_ok(),
@@ -2798,6 +2846,7 @@ mod tests {
             None,
             ValidationMode::Full,
             Some(9),
+            None, // ledger_tip_slot
         );
         assert!(result.is_err());
 
@@ -2853,6 +2902,7 @@ mod tests {
             None,
             ValidationMode::Full,
             Some(9),
+            None, // ledger_tip_slot
         );
         if let Err(ConsensusError::UnregisteredPool { .. }) = &result {
             panic!("Should not get UnregisteredPool when issuer_info is Some");
@@ -3852,6 +3902,89 @@ mod tests {
         assert!(
             praos.verify_nonce_vrf_proof(&header).is_ok(),
             "Non-fatal in non-strict mode"
+        );
+    }
+
+    /// Header beyond the forecast horizon (`tip + 1 + stability_window`) must
+    /// be rejected with `ConsensusError::OutsideForecast`. Mirrors the Haskell
+    /// `Ouroboros.Consensus.Forecast.OutsideForecastRange` check now wired
+    /// into `validate_header_full`.
+    #[test]
+    fn test_validate_header_full_rejects_beyond_forecast_horizon() {
+        let mut praos = OuroborosPraos::new();
+        // Default: k=2160, f=0.05 → stability_window = 129_600.
+        let stability_window =
+            crate::stability_window_slots(praos.security_param, praos.active_slot_coeff);
+        assert_eq!(stability_window, 129_600);
+
+        let tip_slot = SlotNo(1_000);
+        // max_for = tip + 1 + sw = 130_601. Slot 130_601 is the first beyond.
+        let bad_slot = tip_slot.0 + 1 + stability_window;
+
+        let header = make_valid_header(bad_slot);
+        let result = praos.validate_header_full(
+            &header,
+            SlotNo(bad_slot + 1), // current_slot ≥ header.slot so structural check passes
+            None,
+            None,
+            ValidationMode::Replay,
+            Some(9),
+            Some(tip_slot),
+        );
+        assert!(
+            matches!(result, Err(ConsensusError::OutsideForecast(_))),
+            "Expected OutsideForecast, got: {result:?}"
+        );
+    }
+
+    /// At the boundary `tip + 1 + stability_window - 1` the header is still
+    /// inside the forecast window and should pass the forecast check.
+    #[test]
+    fn test_validate_header_full_within_forecast_horizon_ok() {
+        let mut praos = OuroborosPraos::new();
+        let stability_window =
+            crate::stability_window_slots(praos.security_param, praos.active_slot_coeff);
+        let tip_slot = SlotNo(1_000);
+        // Highest slot still inside the window (max_for is exclusive).
+        let ok_slot = tip_slot.0 + stability_window; // = succ(tip) + sw - 1
+
+        let header = make_valid_header(ok_slot);
+        let result = praos.validate_header_full(
+            &header,
+            SlotNo(ok_slot + 1),
+            None,
+            None,
+            ValidationMode::Replay,
+            Some(9),
+            Some(tip_slot),
+        );
+        // Either Ok, or a *different* error class — must NOT be OutsideForecast.
+        assert!(
+            !matches!(result, Err(ConsensusError::OutsideForecast(_))),
+            "Slot at the inclusive upper bound must not trip the forecast check, \
+             got: {result:?}"
+        );
+    }
+
+    /// When `ledger_tip_slot` is `None` the forecast check is skipped, so even
+    /// a far-future header passes (other checks permitting). This preserves the
+    /// historic behaviour for callers that don't have a tip handy (e.g. tests).
+    #[test]
+    fn test_validate_header_full_no_tip_skips_forecast() {
+        let mut praos = OuroborosPraos::new();
+        let header = make_valid_header(10_000_000);
+        let result = praos.validate_header_full(
+            &header,
+            SlotNo(10_000_001),
+            None,
+            None,
+            ValidationMode::Replay,
+            Some(9),
+            None,
+        );
+        assert!(
+            !matches!(result, Err(ConsensusError::OutsideForecast(_))),
+            "ledger_tip_slot=None must skip the forecast check, got: {result:?}"
         );
     }
 }

@@ -62,6 +62,51 @@ pub struct ByronAddress {
     pub payload: Vec<u8>,
 }
 
+impl ByronAddress {
+    /// Return the serialized byte size of the address-attributes map embedded
+    /// in this Byron/bootstrap address, or `None` if the payload cannot be
+    /// decoded as a well-formed Byron CBOR address.
+    ///
+    /// Mirrors the Haskell function `bootstrapAttrsSize` used by the Shelley
+    /// `OutputBootAddrAttrsTooBig` predicate. The Byron address is encoded as
+    /// a 2-element CBOR array: `[ tag(24, bytes(payload_cbor)), crc32 ]`.
+    /// Inside the inner `payload_cbor` is a 3-element array
+    /// `[ root, attrs, addr_type ]`. This method measures the serialized
+    /// length of the `attrs` element by walking the inner CBOR with minicbor
+    /// and recording byte offsets — no reallocation/round-trip is required.
+    pub fn attributes_byte_size(&self) -> Option<usize> {
+        // The on-the-wire format always begins with CBOR array(2) (`0x82`).
+        // The N2C/N2N decoders sometimes hand us a payload that has been
+        // pre-stripped down to the inner bytes (legacy fixtures); accept
+        // either shape by sniffing the first byte.
+        let inner_bytes: &[u8] = if self.payload.first() == Some(&0x82) {
+            // Outer array(2): [ tag24(payload_cbor), crc32 ]
+            let mut d = minicbor::Decoder::new(&self.payload);
+            d.array().ok()?;
+            // tag(24) + bytes(payload_cbor)
+            let tag = d.tag().ok()?;
+            // Tag::Cbor (24) — minicbor exposes the raw u64.
+            if tag.as_u64() != 24 {
+                return None;
+            }
+            d.bytes().ok()?
+        } else {
+            &self.payload
+        };
+
+        // Inner payload: [ root (bytes), attrs (map), addr_type (int) ]
+        let mut d = minicbor::Decoder::new(inner_bytes);
+        d.array().ok()?;
+        // Skip `root` (a 28-byte ByteString).
+        d.bytes().ok()?;
+        // Record attrs span by reading start/end positions on the decoder.
+        let attrs_start = d.position();
+        d.skip().ok()?;
+        let attrs_end = d.position();
+        Some(attrs_end - attrs_start)
+    }
+}
+
 impl Address {
     /// Decode an address from raw bytes (Shelley or Byron format)
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, AddressError> {
@@ -660,5 +705,87 @@ mod tests {
             }
             other => panic!("Expected Pointer, got {other:?}"),
         }
+    }
+
+    // ---------------------------------------------------------------------
+    // Byron `attributes_byte_size` — used by `OutputBootAddrAttrsTooBig`.
+    //
+    // Build a synthetic Byron address with a controllable `attrs` map size
+    // and confirm we measure the same number of bytes the Haskell side
+    // would count via `bootstrapAttrsSize`.
+    // ---------------------------------------------------------------------
+
+    /// Encode a synthetic Byron address whose `attrs` map carries a single
+    /// attribute (key `0x01`, "DerivationPath") with a payload of
+    /// `attr_payload_len` arbitrary bytes. Returns the full
+    /// outer-CBOR-encoded address bytes.
+    fn synth_byron_addr(attr_payload_len: usize) -> Vec<u8> {
+        // Inner payload: [ root(28-byte bs), { 1 => bs(payload) }, addr_type=0 ]
+        let mut inner = Vec::new();
+        let mut e = minicbor::Encoder::new(&mut inner);
+        e.array(3).unwrap();
+        e.bytes(&[0u8; 28]).unwrap();
+        e.map(1).unwrap();
+        e.u8(1).unwrap();
+        let attr_payload = vec![0xAAu8; attr_payload_len];
+        e.bytes(&attr_payload).unwrap();
+        e.u8(0).unwrap(); // AddrType::PubKey
+
+        // Outer: [ tag(24, bytes(inner_cbor)), crc32_u32 ]
+        let mut outer = Vec::new();
+        let mut oe = minicbor::Encoder::new(&mut outer);
+        oe.array(2).unwrap();
+        oe.tag(minicbor::data::Tag::new(24)).unwrap();
+        oe.bytes(&inner).unwrap();
+        oe.u32(0xDEAD_BEEF).unwrap(); // crc32 placeholder, value irrelevant
+        outer
+    }
+
+    #[test]
+    fn test_byron_attributes_byte_size_basic() {
+        // A 10-byte attribute payload encodes as: map(1) | u8(1) | bytes(10)
+        // CBOR: 0xA1 (map with 1 pair)
+        //       0x01 (u8 key)
+        //       0x4A (bytes header for length 10)
+        //       <10 bytes>
+        // Total = 1 + 1 + 1 + 10 = 13.
+        let addr_bytes = synth_byron_addr(10);
+        let addr = ByronAddress {
+            payload: addr_bytes,
+        };
+        assert_eq!(addr.attributes_byte_size(), Some(13));
+    }
+
+    #[test]
+    fn test_byron_attributes_byte_size_oversized() {
+        // 100-byte payload: map(1) | u8 | bytes header(2 bytes for 100) | 100
+        // CBOR length-100 byte string header is 0x58 0x64 (2 bytes).
+        // Total = 1 + 1 + 2 + 100 = 104.
+        let addr_bytes = synth_byron_addr(100);
+        let addr = ByronAddress {
+            payload: addr_bytes,
+        };
+        assert_eq!(addr.attributes_byte_size(), Some(104));
+    }
+
+    #[test]
+    fn test_byron_attributes_byte_size_empty() {
+        // Empty attrs map encodes as 0xA0 (1 byte total).
+        let mut inner = Vec::new();
+        let mut e = minicbor::Encoder::new(&mut inner);
+        e.array(3).unwrap();
+        e.bytes(&[0u8; 28]).unwrap();
+        e.map(0).unwrap();
+        e.u8(0).unwrap();
+
+        let mut outer = Vec::new();
+        let mut oe = minicbor::Encoder::new(&mut outer);
+        oe.array(2).unwrap();
+        oe.tag(minicbor::data::Tag::new(24)).unwrap();
+        oe.bytes(&inner).unwrap();
+        oe.u32(0).unwrap();
+
+        let addr = ByronAddress { payload: outer };
+        assert_eq!(addr.attributes_byte_size(), Some(1));
     }
 }

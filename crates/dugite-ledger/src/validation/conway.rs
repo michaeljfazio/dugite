@@ -11,10 +11,12 @@ use std::collections::{HashMap, HashSet};
 
 use dugite_primitives::hash::{Hash28, Hash32};
 use dugite_primitives::protocol_params::ProtocolParameters;
-use dugite_primitives::transaction::{Certificate, GovAction, TransactionBody};
+use dugite_primitives::transaction::{
+    Certificate, GovAction, ProposalProcedure, TransactionBody, Voter,
+};
 use dugite_primitives::value::Lovelace;
 
-use super::ValidationError;
+use super::{ValidationContext, ValidationError};
 
 /// Return the human-readable certificate type name when the certificate is
 /// Conway-only (requires protocol version >= 9). Returns `None` for
@@ -298,6 +300,503 @@ pub(super) fn check_pparam_update_well_formed(
     }
 }
 
+/// Returns `true` when a (voter, action) combination is disallowed by the
+/// Conway voter × gov-action authority matrix.
+///
+/// | GovAction           | StakePool | Committee | DRep |
+/// |---------------------|-----------|-----------|------|
+/// | `NoConfidence`      | yes       | **NO**    | yes  |
+/// | `UpdateCommittee`   | yes       | **NO**    | yes  |
+/// | `NewConstitution`   | **NO**    | yes       | yes  |
+/// | `HardForkInitiation`| yes       | yes       | yes  |
+/// | `ParameterChange`   | yes\*     | yes       | yes  |
+/// | `TreasuryWithdrawals`| **NO**   | yes       | yes  |
+/// | `InfoAction`        | yes       | yes       | yes  |
+///
+/// \* SPO authorisation on `ParameterChange` is enforced at this Phase-1 level;
+/// the per-group threshold (`NoVotingAllowed` for non–security-group changes)
+/// is checked later at ratification time.
+///
+/// This is a pure predicate. The caller (in `validation/mod.rs`) accumulates
+/// every disallowed `(voter, gov_action_id)` pair across the transaction and
+/// emits a single [`ValidationError::DisallowedVoters`] holding the full list,
+/// matching Haskell's `NonEmpty` predicate-failure shape.
+///
+/// Reference: Haskell `checkVotersAreValid` /
+/// `is{Committee,DRep,StakePool}VotingAllowed` in
+/// `Cardano.Ledger.Conway.Governance.Internal`.
+pub(super) fn is_voter_disallowed(voter: &Voter, action: &GovAction) -> bool {
+    match (voter, action) {
+        // InfoAction: every voter type is allowed (NoVotingThreshold).
+        (_, GovAction::InfoAction) => false,
+        // SPO is forbidden on NewConstitution and TreasuryWithdrawals.
+        (Voter::StakePool(_), GovAction::NewConstitution { .. }) => true,
+        (Voter::StakePool(_), GovAction::TreasuryWithdrawals { .. }) => true,
+        // Constitutional Committee is forbidden on NoConfidence and UpdateCommittee.
+        (Voter::ConstitutionalCommittee(_), GovAction::NoConfidence { .. }) => true,
+        (Voter::ConstitutionalCommittee(_), GovAction::UpdateCommittee { .. }) => true,
+        // All other (voter, action) combinations are permitted at this layer.
+        _ => false,
+    }
+}
+
+/// Returns `true` when the given voter is unknown to the ledger, i.e. its
+/// credential / pool ID is not present in the corresponding registry:
+///
+///   - `DRepVoter`        — credential not in `registered_dreps`.
+///   - `StakePoolVoter`   — pool ID not in `registered_pools`.
+///   - `CommitteeVoter`   — hot credential not in
+///     `committee_authorized_hot_keys`.
+///
+/// When the relevant context field is `None` (not provided by the caller),
+/// this returns `false` (voter treated as known) — matching the lenient
+/// default used elsewhere (see [`ValidationContext::active_proposals`] for
+/// the same convention).  This avoids false-positive rejections when the
+/// caller hasn't yet plumbed in the relevant ledger state.
+///
+/// This is a pure predicate.  The caller (in `validation/mod.rs`) accumulates
+/// every unknown voter across the transaction's `voting_procedures` and emits
+/// a single [`ValidationError::VotersDoNotExist`] holding the full list,
+/// matching Haskell's `NonEmpty` predicate-failure shape.
+///
+/// Reference: Haskell `internVoter` in
+/// `eras/conway/impl/src/Cardano/Ledger/Conway/Rules/Gov.hs`.
+pub(super) fn is_voter_unknown(voter: &Voter, ctx: &ValidationContext) -> bool {
+    match voter {
+        Voter::DRep(credential) => match ctx.registered_dreps.as_ref() {
+            Some(dreps) => {
+                let key = credential.to_hash().to_hash32_padded();
+                !dreps.contains(&key)
+            }
+            None => false,
+        },
+        Voter::StakePool(pool_hash32) => match ctx.registered_pools.as_ref() {
+            Some(pools) => {
+                // Voter::StakePool wraps a Hash32 produced by zero-padding the
+                // 28-byte pool key hash (see decoder in
+                // dugite-serialization::multi_era).  registered_pools stores
+                // the canonical 28-byte form, so truncate here.
+                let mut bytes28 = [0u8; 28];
+                bytes28.copy_from_slice(&pool_hash32.as_bytes()[..28]);
+                let pool_id = Hash28::from_bytes(bytes28);
+                !pools.contains(&pool_id)
+            }
+            None => false,
+        },
+        Voter::ConstitutionalCommittee(hot_credential) => {
+            match ctx.committee_authorized_hot_keys.as_ref() {
+                Some(hot_keys) => {
+                    let key = hot_credential.to_hash().to_hash32_padded();
+                    !hot_keys.contains(&key)
+                }
+                None => false,
+            }
+        }
+    }
+}
+
+/// Returns `true` when a vote against the governance action identified by
+/// `gov_action_id` is rejected because the action has already expired.
+///
+/// Per Haskell `checkVotesAreNotForExpiredActions` in
+/// `Cardano.Ledger.Conway.Rules.Gov`, a vote is allowed when
+/// `current_epoch <= gasExpiresAfter` (boundary inclusive); it is rejected
+/// only when `current_epoch > gasExpiresAfter`.
+///
+/// The action's expiry epoch is looked up from
+/// `ctx.active_proposals[gov_action_id].expires_after_epoch`.
+///
+/// This predicate returns `false` (vote allowed) when:
+///   - `ctx.active_proposals` is `None` — lenient default, mirroring the
+///     same convention used by [`is_voter_disallowed`] when the caller has
+///     not plumbed in proposal state.
+///   - `ctx.current_epoch` is `None` — without a current epoch we can't
+///     compare, so we accept the vote.
+///   - `gov_action_id` is not present in the active-proposal map — that's a
+///     different predicate failure (`GovActionsDoNotExist`), handled
+///     elsewhere; this rule must not double-fire on it.
+///
+/// The caller (in `validation/mod.rs`) aggregates every expired
+/// `(voter, gov_action_id)` pair into a single
+/// [`ValidationError::VotingOnExpiredGovAction`], matching Haskell's
+/// `NonEmpty` predicate-failure shape.
+///
+/// Reference: Haskell `checkVotesAreNotForExpiredActions` in
+/// `eras/conway/impl/src/Cardano/Ledger/Conway/Rules/Gov.hs`.
+pub(super) fn is_vote_on_expired_action(
+    gov_action_id: &dugite_primitives::transaction::GovActionId,
+    ctx: &ValidationContext,
+) -> bool {
+    let Some(active) = ctx.active_proposals.as_ref() else {
+        return false;
+    };
+    let Some(current_epoch) = ctx.current_epoch else {
+        return false;
+    };
+    let Some(proposal) = active.get(gov_action_id) else {
+        return false;
+    };
+    // Boundary inclusive: rejected only when current_epoch > expires_after.
+    current_epoch > proposal.expires_after_epoch.0
+}
+
+/// Returns `true` when the proposal's `return_addr` references a stake
+/// credential that is not registered in `ctx.reward_accounts`.
+///
+/// Per Haskell `processProposal` in
+/// `eras/conway/impl/src/Cardano/Ledger/Conway/Rules/Gov.hs`, every
+/// proposal procedure's `pProcReturnAddr` must point to a registered stake
+/// credential (so the proposal deposit can be refunded at expiry/enactment).
+///
+/// The check is **skipped during Conway bootstrap** (`pvMajor == 9`) per
+/// `hardforkConwayBootstrapPhase`, returning `false` regardless of the
+/// reward-accounts contents.  It activates from PV ≥ 10 onwards.
+///
+/// This predicate returns `false` (proposal accepted) when:
+///   - `params.protocol_version_major == 9` — bootstrap skip.
+///   - `ctx.reward_accounts` is `None` — lenient default, mirroring the
+///     same convention used by [`is_voter_unknown`] and
+///     [`is_vote_on_expired_action`] when the caller has not plumbed in
+///     the relevant ledger state.
+///   - `proposal.return_addr` is shorter than 29 bytes — malformed
+///     reward addresses are caught by a different predicate
+///     (`ProposalProcedureNetworkIdMismatch` / decoder); this rule must
+///     not double-fire on shape errors.
+///
+/// The lookup uses [`crate::state::LedgerState::reward_account_to_hash`]
+/// to mirror the canonical key derivation used by the withdrawal-amount
+/// check earlier in `validate_transaction_with_pools` (and by the on-chain
+/// reward-accounts map populated in `state/certificates.rs`).  Byte 28 of
+/// the resulting `Hash32` carries the credential type (`0x00` = key,
+/// `0x01` = script), so key and script credentials with the same 28-byte
+/// hash are distinguished — matching Haskell's
+/// `KeyHashObj` / `ScriptHashObj`.
+///
+/// The caller (in `validation/mod.rs`) aggregates every offending proposal's
+/// raw `return_addr` (hex-encoded) into a single
+/// [`ValidationError::ProposalReturnAccountDoesNotExist`], matching
+/// Haskell's `NonEmpty` predicate-failure shape.
+///
+/// Reference: Haskell `ProposalReturnAccountDoesNotExist` in
+/// `eras/conway/impl/src/Cardano/Ledger/Conway/Rules/Gov.hs`,
+/// inside `processProposal`.
+pub(super) fn is_proposal_return_account_unregistered(
+    proposal: &ProposalProcedure,
+    params: &ProtocolParameters,
+    ctx: &ValidationContext,
+) -> bool {
+    // Bootstrap skip — pv == 9 disables the check entirely.
+    if params.protocol_version_major == 9 {
+        return false;
+    }
+    // Lenient default when reward_accounts state is not plumbed in.
+    let Some(accounts) = ctx.reward_accounts.as_ref() else {
+        return false;
+    };
+    // Malformed reward addresses (< 29 bytes) are not this predicate's
+    // concern; treat as accepted here.
+    if proposal.return_addr.len() < 29 {
+        return false;
+    }
+    let key = crate::state::LedgerState::reward_account_to_hash(&proposal.return_addr);
+    !accounts.contains_key(&key)
+}
+
+/// Returns `Some(actual_network)` when the proposal's `return_addr` network
+/// id does not match `ctx.node_network`, otherwise `None`.
+///
+/// Per Haskell `processProposal` in
+/// `eras/conway/impl/src/Cardano/Ledger/Conway/Rules/Gov.hs`, every
+/// proposal procedure's `pProcReturnAddr` must be on the same network as
+/// the node.  Bit 0 of the reward-account header byte encodes the network
+/// (`0` = testnet, `1` = mainnet) — the same encoding used by
+/// `WrongNetworkWithdrawal` (see `phase1.rs`).
+///
+/// Unlike [`is_proposal_return_account_unregistered`] this predicate is
+/// **always enforced** (there is no Conway-bootstrap skip): the network id
+/// is a structural property of the proposal payload, not a post-bootstrap
+/// state lookup.
+///
+/// The predicate returns `None` (proposal accepted) when:
+///   - `ctx.node_network` is `None` — lenient default, mirroring the
+///     convention used by the other GOV predicates when the caller has
+///     not plumbed in the relevant context.
+///   - `proposal.return_addr` is empty — malformed reward addresses are
+///     caught by a different predicate (decoder); this rule must not
+///     double-fire on shape errors.
+///   - The header network bit matches `ctx.node_network`.
+///
+/// The shape (`Option<u8>` rather than `bool`) is intentional — the
+/// `ProposalProcedureNetworkIdMismatch` error payload aggregates the
+/// **actual** mismatched network values, so the caller needs to surface
+/// them.
+///
+/// Reference: Haskell `ProposalProcedureNetworkIdMismatch` in
+/// `eras/conway/impl/src/Cardano/Ledger/Conway/Rules/Gov.hs`,
+/// inside `processProposal`.  Always enforced (no bootstrap skip).
+pub(super) fn is_proposal_return_addr_wrong_network(
+    proposal: &ProposalProcedure,
+    ctx: &ValidationContext,
+) -> Option<u8> {
+    // Lenient default — skip when the node network isn't plumbed in.
+    let expected_net = ctx.node_network?;
+    // Malformed reward addresses are not this predicate's concern.
+    let header = *proposal.return_addr.first()?;
+    // Bit 0 of the header byte: 0 = testnet, 1 = mainnet (matches the
+    // encoding used by `WrongNetworkWithdrawal` in phase1.rs).
+    let actual = header & 0x01;
+    if actual != expected_net.to_u8() {
+        Some(actual)
+    } else {
+        None
+    }
+}
+
+/// Returns the list of `(hex_addr, actual_network_id)` mismatches between a
+/// `TreasuryWithdrawals` proposal's destination addresses and the node's
+/// configured network.
+///
+/// Per Haskell `processProposal` in
+/// `eras/conway/impl/src/Cardano/Ledger/Conway/Rules/Gov.hs`, when the
+/// proposal action is `TreasuryWithdrawals` every key in the withdrawals
+/// map is a reward address whose network id must match the node's network.
+/// Bit 0 of the reward-account header byte encodes the network
+/// (`0` = testnet, `1` = mainnet) — same encoding as
+/// [`is_proposal_return_addr_wrong_network`] and `WrongNetworkWithdrawal`
+/// in `phase1.rs`.
+///
+/// Like the proposal-procedure network check, this predicate is **always
+/// enforced** — there is no Conway-bootstrap skip; the network id is a
+/// structural property of the proposal payload, not a post-bootstrap
+/// state lookup.
+///
+/// The predicate returns an empty `Vec` (proposal accepted) when:
+///   - `proposal.gov_action` is not [`GovAction::TreasuryWithdrawals`] —
+///     this rule applies only to TW proposals, mirroring Haskell's
+///     branch-specific check.
+///   - `ctx.node_network` is `None` — lenient default, mirroring the
+///     convention used by the other GOV predicates when the caller has
+///     not plumbed in the relevant context.
+///   - All entries' header network bits match `ctx.node_network`.
+///
+/// The shape (`Vec<(String, u8)>`) is intentional — every mismatched entry
+/// in a single TreasuryWithdrawals proposal is surfaced, and the caller in
+/// `validation/mod.rs` flattens these across all proposals into a single
+/// [`ValidationError::TreasuryWithdrawalsNetworkIdMismatch`], mirroring
+/// Haskell's `NonEmpty` predicate-failure shape.
+///
+/// Reference: Haskell `TreasuryWithdrawalsNetworkIdMismatch` in
+/// `eras/conway/impl/src/Cardano/Ledger/Conway/Rules/Gov.hs`,
+/// inside `processProposal`'s `TreasuryWithdrawals` branch.  Always
+/// enforced (no bootstrap skip).
+pub(super) fn treasury_withdrawal_network_mismatches(
+    proposal: &ProposalProcedure,
+    ctx: &ValidationContext,
+) -> Vec<(String, u8)> {
+    // Only TreasuryWithdrawals proposals are subject to this rule.
+    let GovAction::TreasuryWithdrawals { withdrawals, .. } = &proposal.gov_action else {
+        return Vec::new();
+    };
+    // Lenient default — skip when the node network isn't plumbed in.
+    let Some(expected_net) = ctx.node_network else {
+        return Vec::new();
+    };
+    let expected = expected_net.to_u8();
+    let mut out: Vec<(String, u8)> = Vec::new();
+    for (addr, _coin) in withdrawals.iter() {
+        // Empty address → skip (decoder-shape error, not this predicate's
+        // concern; mirrors `is_proposal_return_addr_wrong_network`).
+        let Some(&header) = addr.first() else {
+            continue;
+        };
+        let actual = header & 0x01;
+        if actual != expected {
+            let addr_hex = addr
+                .iter()
+                .fold(String::with_capacity(addr.len() * 2), |mut s, b| {
+                    use std::fmt::Write;
+                    let _ = write!(s, "{b:02x}");
+                    s
+                });
+            out.push((addr_hex, actual));
+        }
+    }
+    out
+}
+
+/// Returns `true` when the proposal is a `TreasuryWithdrawals` action whose
+/// total amount is exactly zero — including the all-zero-entries case and
+/// the empty-map case.
+///
+/// Per Haskell `processProposal` in
+/// `eras/conway/impl/src/Cardano/Ledger/Conway/Rules/Gov.hs`
+/// (`TreasuryWithdrawals` branch), the sum of every entry's `Coin` must be
+/// strictly positive.  This guards against degenerate proposals that lock
+/// up a deposit without actually moving any treasury value.
+///
+/// The check is **skipped during Conway bootstrap** (`pvMajor == 9`) per
+/// `hardforkConwayBootstrapPhase`, returning `false` regardless of the
+/// withdrawals contents.  It activates from PV ≥ 10 onwards.
+///
+/// The predicate returns `false` (proposal accepted) when:
+///   - `params.protocol_version_major == 9` — bootstrap skip.
+///   - `proposal.gov_action` is not [`GovAction::TreasuryWithdrawals`] —
+///     this rule applies only to TW proposals, mirroring Haskell's
+///     branch-specific check.
+///   - The sum of withdrawal `Coin` values is non-zero.
+///
+/// The caller (in `validation/mod.rs`) collects every offending TW
+/// proposal's descriptor (or hex of its `return_addr`) into a single
+/// [`ValidationError::ZeroTreasuryWithdrawals`], mirroring Haskell's
+/// `NonEmpty` predicate-failure shape.
+///
+/// Reference: Haskell `ZeroTreasuryWithdrawals` in
+/// `eras/conway/impl/src/Cardano/Ledger/Conway/Rules/Gov.hs`,
+/// inside `processProposal`'s `TreasuryWithdrawals` branch.  Skipped
+/// during Conway bootstrap (PV == 9).
+pub(super) fn is_treasury_withdrawals_zero_sum(
+    proposal: &ProposalProcedure,
+    params: &ProtocolParameters,
+) -> bool {
+    // Bootstrap skip — pv == 9 disables the check entirely.
+    if params.protocol_version_major == 9 {
+        return false;
+    }
+    let GovAction::TreasuryWithdrawals { withdrawals, .. } = &proposal.gov_action else {
+        return false;
+    };
+    // Saturating sum: even an absurdly long all-u64::MAX list cannot wrap
+    // around to zero — `0` is reachable only when every entry is `0` (or
+    // the map is empty).
+    let total: u128 = withdrawals.values().map(|c| c.0 as u128).sum();
+    total == 0
+}
+
+/// Returns the list of hex-encoded credential hashes that appear both in
+/// `members_to_add` (as a key) and in `members_to_remove` for an
+/// `UpdateCommittee` proposal — i.e. credentials the proposal both adds
+/// and removes in the same action.
+///
+/// Per Haskell `processProposal` in
+/// `eras/conway/impl/src/Cardano/Ledger/Conway/Rules/Gov.hs`
+/// (`UpdateCommittee` branch), the intersection of the add-set keys and
+/// the remove-set must be empty:
+///
+/// ```haskell
+/// let conflicting = Set.intersection (Map.keysSet membersToAdd) membersToRemove
+/// in unless (Set.null conflicting) (failBecause $ ConflictingCommitteeUpdate conflicting)
+/// ```
+///
+/// This check is **always enforced** (no Conway-bootstrap skip): the
+/// add/remove conflict is a structural property of the action payload,
+/// not a post-bootstrap state lookup.
+///
+/// The predicate returns an empty `Vec` (proposal accepted) when:
+///   - `proposal.gov_action` is not [`GovAction::UpdateCommittee`] —
+///     this rule applies only to UpdateCommittee proposals, mirroring
+///     Haskell's branch-specific check.
+///   - The intersection of add-set keys and remove-set is empty.
+///
+/// The credential identity used for the intersection mirrors Haskell's
+/// `Credential 'ColdCommitteeRole`: a key-credential and a script-credential
+/// with the same 28-byte hash are *distinct* members.  We use
+/// [`Credential::to_typed_hash32`] (byte 28 = `0x01` for scripts, `0x00`
+/// for keys) so the intersection respects this distinction — exactly the
+/// same convention used by the other GOV credential-keyed sets in
+/// `ValidationContext`.
+///
+/// The shape (`Vec<String>`) is intentional — the
+/// `ConflictingCommitteeUpdate` error payload aggregates every conflicting
+/// credential across all `UpdateCommittee` proposals in the transaction
+/// into a single failure, mirroring Haskell's `NonEmpty` predicate-failure
+/// shape.
+///
+/// Reference: Haskell `ConflictingCommitteeUpdate` in
+/// `eras/conway/impl/src/Cardano/Ledger/Conway/Rules/Gov.hs`,
+/// inside `processProposal`'s `UpdateCommittee` branch.  Always enforced
+/// (no bootstrap skip).
+pub(super) fn committee_update_conflicts(proposal: &ProposalProcedure) -> Vec<String> {
+    let GovAction::UpdateCommittee {
+        members_to_remove,
+        members_to_add,
+        ..
+    } = &proposal.gov_action
+    else {
+        return Vec::new();
+    };
+    // Build the remove set keyed by the typed-hash32 representation so the
+    // intersection respects the key-vs-script credential distinction.
+    let remove_keys: HashSet<Hash32> = members_to_remove
+        .iter()
+        .map(|c| c.to_typed_hash32())
+        .collect();
+    let mut conflicts: Vec<String> = Vec::new();
+    for cred in members_to_add.keys() {
+        let key = cred.to_typed_hash32();
+        if remove_keys.contains(&key) {
+            conflicts.push(key.to_hex());
+        }
+    }
+    conflicts
+}
+
+/// Returns the list of `(typed_hash_hex, expiry_epoch)` pairs for new
+/// committee members in an `UpdateCommittee` proposal whose `validUntil`
+/// epoch is **not strictly greater than** the current epoch — i.e. the
+/// member would expire on or before they enter office.
+///
+/// Per Haskell `processProposal` in
+/// `eras/conway/impl/src/Cardano/Ledger/Conway/Rules/Gov.hs`
+/// (`UpdateCommittee` branch):
+///
+/// ```haskell
+/// let invalidMembers = Map.filter (<= currentEpoch) membersToAdd
+/// in unless (Map.null invalidMembers) (failBecause $ ExpirationEpochTooSmall invalidMembers)
+/// ```
+///
+/// This check is **always enforced** — there is no Conway-bootstrap skip;
+/// the expiry-vs-current-epoch comparison is a structural property of the
+/// proposal payload combined with the live epoch.  When `current_epoch`
+/// is `None` the predicate is silently lenient (returns the empty vec) so
+/// callers that have not plumbed in epoch context don't get spurious
+/// failures.
+///
+/// The credential identity uses [`Credential::to_typed_hash32`] (byte 28
+/// = `0x01` for scripts, `0x00` for keys), matching the convention used
+/// by [`committee_update_conflicts`] and by the credential-keyed
+/// `ValidationContext` sets — so callers can distinguish key- from
+/// script-credential entries.
+///
+/// The shape (`Vec<(String, u64)>`) is intentional — every offending
+/// member across all `UpdateCommittee` proposals in the transaction is
+/// surfaced, and the caller in `validation/mod.rs` aggregates these
+/// into a single [`ValidationError::ExpirationEpochTooSmall`], mirroring
+/// Haskell's `NonEmpty` predicate-failure shape.
+///
+/// Reference: Haskell `ExpirationEpochTooSmall` in
+/// `eras/conway/impl/src/Cardano/Ledger/Conway/Rules/Gov.hs`,
+/// inside `processProposal`'s `UpdateCommittee` branch.  Always enforced
+/// (no bootstrap skip).
+pub(super) fn committee_update_invalid_expiries(
+    proposal: &ProposalProcedure,
+    ctx: &ValidationContext,
+) -> Vec<(String, u64)> {
+    let GovAction::UpdateCommittee { members_to_add, .. } = &proposal.gov_action else {
+        return Vec::new();
+    };
+    // Lenient default — skip when current_epoch isn't plumbed in.
+    let Some(current_epoch) = ctx.current_epoch else {
+        return Vec::new();
+    };
+    let mut invalid: Vec<(String, u64)> = Vec::new();
+    for (cred, expiry) in members_to_add.iter() {
+        if *expiry <= current_epoch {
+            invalid.push((cred.to_typed_hash32().to_hex(), *expiry));
+        }
+    }
+    invalid
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::{BTreeMap, HashMap, HashSet};
@@ -305,6 +804,7 @@ mod tests {
     use dugite_primitives::credentials::Credential;
     use dugite_primitives::hash::{Hash28, Hash32};
     use dugite_primitives::protocol_params::ProtocolParameters;
+    use dugite_primitives::time::EpochNo;
     use dugite_primitives::transaction::{
         Anchor, Certificate, DRep, GovAction, GovActionId, PoolParams, ProposalProcedure, Rational,
         TransactionBody, Voter, VotingProcedure,
@@ -312,6 +812,7 @@ mod tests {
     use dugite_primitives::value::Lovelace;
 
     use super::*;
+    use crate::validation::ActiveProposal;
 
     // ---------------------------------------------------------------------------
     // Helpers
@@ -928,6 +1429,1024 @@ mod tests {
             "StakeDeregistration refund must use the stored deposit map entry \
              ({original_deposit}) not the current key_deposit ({})",
             params.key_deposit.0
+        );
+    }
+
+    // ---------------------------------------------------------------------------
+    // check_voter_authority — DisallowedVoters predicate (Conway GOV)
+    //
+    // Voter × action authority matrix (Haskell `checkVotersAreValid`):
+    //   NoConfidence:        SPO yes, DRep yes, CC NO
+    //   UpdateCommittee:     SPO yes, DRep yes, CC NO
+    //   NewConstitution:     SPO NO,  DRep yes, CC yes
+    //   HardForkInitiation:  SPO yes, DRep yes, CC yes
+    //   ParameterChange:     SPO yes (per-group threshold check at ratification),
+    //                        DRep yes, CC yes
+    //   TreasuryWithdrawals: SPO NO,  DRep yes, CC yes
+    //   InfoAction:          all yes
+    // ---------------------------------------------------------------------------
+
+    fn cc_voter() -> Voter {
+        Voter::ConstitutionalCommittee(test_credential(0xCC))
+    }
+
+    fn drep_voter() -> Voter {
+        Voter::DRep(test_credential(0xDD))
+    }
+
+    fn spo_voter() -> Voter {
+        Voter::StakePool(Hash32::from_bytes([0xAA; 32]))
+    }
+
+    fn anchor_stub() -> Anchor {
+        Anchor {
+            url: String::new(),
+            data_hash: Hash32::from_bytes([0u8; 32]),
+        }
+    }
+
+    #[test]
+    fn test_disallowed_voters_spo_voting_on_new_constitution() {
+        let action = GovAction::NewConstitution {
+            prev_action_id: None,
+            constitution: dugite_primitives::transaction::Constitution {
+                anchor: anchor_stub(),
+                script_hash: None,
+            },
+        };
+        assert!(is_voter_disallowed(&spo_voter(), &action));
+    }
+
+    #[test]
+    fn test_disallowed_voters_spo_voting_on_treasury_withdrawals() {
+        let action = GovAction::TreasuryWithdrawals {
+            withdrawals: BTreeMap::new(),
+            policy_hash: None,
+        };
+        assert!(is_voter_disallowed(&spo_voter(), &action));
+    }
+
+    #[test]
+    fn test_disallowed_voters_committee_voting_on_no_confidence() {
+        let action = GovAction::NoConfidence {
+            prev_action_id: None,
+        };
+        assert!(is_voter_disallowed(&cc_voter(), &action));
+    }
+
+    #[test]
+    fn test_disallowed_voters_committee_voting_on_update_committee() {
+        let action = GovAction::UpdateCommittee {
+            prev_action_id: None,
+            members_to_remove: vec![],
+            members_to_add: BTreeMap::new(),
+            threshold: Rational {
+                numerator: 1,
+                denominator: 2,
+            },
+        };
+        assert!(is_voter_disallowed(&cc_voter(), &action));
+    }
+
+    #[test]
+    fn test_voter_authority_spo_on_hard_fork_initiation_allowed() {
+        let action = GovAction::HardForkInitiation {
+            prev_action_id: None,
+            protocol_version: (10, 0),
+        };
+        assert!(!is_voter_disallowed(&spo_voter(), &action));
+    }
+
+    #[test]
+    fn test_voter_authority_info_action_allows_all() {
+        let action = GovAction::InfoAction;
+        assert!(!is_voter_disallowed(&spo_voter(), &action));
+        assert!(!is_voter_disallowed(&drep_voter(), &action));
+        assert!(!is_voter_disallowed(&cc_voter(), &action));
+    }
+
+    #[test]
+    fn test_voter_authority_drep_can_vote_on_no_confidence() {
+        let action = GovAction::NoConfidence {
+            prev_action_id: None,
+        };
+        assert!(!is_voter_disallowed(&drep_voter(), &action));
+    }
+
+    #[test]
+    fn test_voter_authority_drep_can_vote_on_all_actions() {
+        // DRep is authorised on every action type.
+        let actions: Vec<GovAction> = vec![
+            GovAction::NoConfidence {
+                prev_action_id: None,
+            },
+            GovAction::UpdateCommittee {
+                prev_action_id: None,
+                members_to_remove: vec![],
+                members_to_add: BTreeMap::new(),
+                threshold: Rational {
+                    numerator: 1,
+                    denominator: 2,
+                },
+            },
+            GovAction::NewConstitution {
+                prev_action_id: None,
+                constitution: dugite_primitives::transaction::Constitution {
+                    anchor: anchor_stub(),
+                    script_hash: None,
+                },
+            },
+            GovAction::HardForkInitiation {
+                prev_action_id: None,
+                protocol_version: (10, 0),
+            },
+            GovAction::TreasuryWithdrawals {
+                withdrawals: BTreeMap::new(),
+                policy_hash: None,
+            },
+            GovAction::InfoAction,
+        ];
+        for action in &actions {
+            assert!(
+                !is_voter_disallowed(&drep_voter(), action),
+                "DRep must be allowed on action: {action:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_voter_authority_committee_allowed_on_constitution_and_hard_fork() {
+        // CC is allowed on NewConstitution and HardForkInitiation
+        // (it's only forbidden on NoConfidence and UpdateCommittee).
+        let new_const = GovAction::NewConstitution {
+            prev_action_id: None,
+            constitution: dugite_primitives::transaction::Constitution {
+                anchor: anchor_stub(),
+                script_hash: None,
+            },
+        };
+        assert!(!is_voter_disallowed(&cc_voter(), &new_const));
+
+        let hf = GovAction::HardForkInitiation {
+            prev_action_id: None,
+            protocol_version: (10, 0),
+        };
+        assert!(!is_voter_disallowed(&cc_voter(), &hf));
+    }
+
+    #[test]
+    fn test_voter_authority_spo_on_parameter_change_allowed_at_phase1() {
+        // ParameterChange voter-authority pre-check allows SPO. The per-group
+        // threshold check at ratification time will set NoVotingAllowed for
+        // non-security-group changes — that is a separate concern.
+        let action = GovAction::ParameterChange {
+            prev_action_id: None,
+            protocol_param_update: Box::default(),
+            policy_hash: None,
+        };
+        assert!(!is_voter_disallowed(&spo_voter(), &action));
+    }
+
+    // ---------------------------------------------------------------------------
+    // is_voter_unknown — VotersDoNotExist predicate (Conway GOV)
+    //
+    // A voter is "unknown" when its credential / pool ID is not present in the
+    // corresponding registry passed via `ValidationContext`:
+    //   - DRepVoter: not in `registered_dreps`
+    //   - StakePoolVoter: not in `registered_pools`
+    //   - CommitteeVoter: hot credential not in `committee_authorized_hot_keys`
+    //
+    // When the corresponding context field is `None`, the voter is treated as
+    // known (lenient default — see is_voter_unknown doc comment).
+    // ---------------------------------------------------------------------------
+
+    /// Build a 28-byte hash with all bytes equal to `b`, padded to Hash32 form
+    /// (last 4 bytes zero) — the canonical key shape used by registered_dreps,
+    /// committee_authorized_hot_keys, etc.
+    fn padded_key_hash(b: u8) -> Hash32 {
+        Hash28::from_bytes([b; 28]).to_hash32_padded()
+    }
+
+    #[test]
+    fn test_voters_do_not_exist_unregistered_drep() {
+        // A DRep key-hash voter whose credential is not in registered_dreps
+        // is reported as unknown.
+        let unregistered = test_credential(0xD0);
+        let voter = Voter::DRep(unregistered);
+
+        // The set contains some other DRep, not the voter's credential.
+        let mut dreps: HashSet<Hash32> = HashSet::new();
+        dreps.insert(padded_key_hash(0xEE));
+
+        let ctx = ValidationContext::new().with_dreps(dreps);
+        assert!(
+            is_voter_unknown(&voter, &ctx),
+            "DRep voter not in registered_dreps must be reported as unknown"
+        );
+    }
+
+    #[test]
+    fn test_voters_do_not_exist_unregistered_drep_script() {
+        // A DRep script-hash voter whose credential is not in registered_dreps
+        // is reported as unknown.  Mirrors the script-credential variant of
+        // Haskell's `Credential 'DRepRole`.
+        let unregistered = Credential::Script(Hash28::from_bytes([0xD1; 28]));
+        let voter = Voter::DRep(unregistered);
+
+        let dreps: HashSet<Hash32> = HashSet::new();
+        let ctx = ValidationContext::new().with_dreps(dreps);
+
+        assert!(
+            is_voter_unknown(&voter, &ctx),
+            "Script-credential DRep voter not in registered_dreps must be reported as unknown"
+        );
+    }
+
+    #[test]
+    fn test_voters_do_not_exist_unregistered_pool() {
+        // A StakePool voter whose pool ID is not in registered_pools is
+        // reported as unknown.  Voter::StakePool wraps a Hash32 (28 raw bytes
+        // zero-padded), but registered_pools stores Hash28; the predicate
+        // truncates and matches.
+        let unregistered_id = Hash28::from_bytes([0xAA; 28]);
+        let voter = Voter::StakePool(unregistered_id.to_hash32_padded());
+
+        let mut pools: HashSet<Hash28> = HashSet::new();
+        pools.insert(Hash28::from_bytes([0xBB; 28])); // some other pool
+
+        let ctx = ValidationContext::new().with_pools(pools);
+        assert!(
+            is_voter_unknown(&voter, &ctx),
+            "StakePool voter not in registered_pools must be reported as unknown"
+        );
+    }
+
+    #[test]
+    fn test_voters_do_not_exist_unauthorized_committee_hot_key() {
+        // A ConstitutionalCommittee voter whose hot credential is not in
+        // committee_authorized_hot_keys is reported as unknown.
+        let unauthorized_hot = test_credential(0xCC);
+        let voter = Voter::ConstitutionalCommittee(unauthorized_hot);
+
+        let mut hot_keys: HashSet<Hash32> = HashSet::new();
+        hot_keys.insert(padded_key_hash(0x77)); // a different authorised hot key
+
+        let ctx = ValidationContext::new().with_committee_authorized_hot_keys(hot_keys);
+        assert!(
+            is_voter_unknown(&voter, &ctx),
+            "Committee voter whose hot credential is not in \
+             committee_authorized_hot_keys must be reported as unknown"
+        );
+    }
+
+    #[test]
+    fn test_voter_known_registered_drep() {
+        // Positive case: a DRep voter whose credential IS in registered_dreps
+        // is NOT reported as unknown.
+        let cred = test_credential(0xD2);
+        let voter = Voter::DRep(cred.clone());
+
+        let mut dreps: HashSet<Hash32> = HashSet::new();
+        dreps.insert(cred.to_hash().to_hash32_padded());
+
+        let ctx = ValidationContext::new().with_dreps(dreps);
+        assert!(
+            !is_voter_unknown(&voter, &ctx),
+            "Registered DRep voter must NOT be reported as unknown"
+        );
+    }
+
+    #[test]
+    fn test_voter_known_registered_pool() {
+        // Positive case: a StakePool voter whose pool ID IS in registered_pools
+        // is NOT reported as unknown.
+        let pool_id = Hash28::from_bytes([0xA1; 28]);
+        let voter = Voter::StakePool(pool_id.to_hash32_padded());
+
+        let mut pools: HashSet<Hash28> = HashSet::new();
+        pools.insert(pool_id);
+
+        let ctx = ValidationContext::new().with_pools(pools);
+        assert!(
+            !is_voter_unknown(&voter, &ctx),
+            "Registered pool voter must NOT be reported as unknown"
+        );
+    }
+
+    #[test]
+    fn test_voter_known_authorized_committee_hot_key() {
+        // Positive case: a Committee voter whose hot credential IS in
+        // committee_authorized_hot_keys is NOT reported as unknown.
+        let hot = test_credential(0xC1);
+        let voter = Voter::ConstitutionalCommittee(hot.clone());
+
+        let mut hot_keys: HashSet<Hash32> = HashSet::new();
+        hot_keys.insert(hot.to_hash().to_hash32_padded());
+
+        let ctx = ValidationContext::new().with_committee_authorized_hot_keys(hot_keys);
+        assert!(
+            !is_voter_unknown(&voter, &ctx),
+            "Authorised committee hot key voter must NOT be reported as unknown"
+        );
+    }
+
+    #[test]
+    fn test_voter_unknown_lenient_default_when_context_missing() {
+        // When the relevant context field is `None`, the predicate must return
+        // `false` (voter treated as known) — same lenient default as
+        // `active_proposals` for `DisallowedVoters` (Task 2).
+        let drep_voter_unset = Voter::DRep(test_credential(0xD3));
+        let pool_voter_unset = Voter::StakePool(Hash28::from_bytes([0xA3; 28]).to_hash32_padded());
+        let cc_voter_unset = Voter::ConstitutionalCommittee(test_credential(0xC3));
+
+        let ctx = ValidationContext::new(); // all None
+        assert!(
+            !is_voter_unknown(&drep_voter_unset, &ctx),
+            "DRep voter must default to known when registered_dreps is None"
+        );
+        assert!(
+            !is_voter_unknown(&pool_voter_unset, &ctx),
+            "Pool voter must default to known when registered_pools is None"
+        );
+        assert!(
+            !is_voter_unknown(&cc_voter_unset, &ctx),
+            "Committee voter must default to known when committee_authorized_hot_keys is None"
+        );
+    }
+
+    // ---------------------------------------------------------------------------
+    // is_vote_on_expired_action — VotingOnExpiredGovAction predicate (Conway GOV)
+    //
+    // Per Haskell `checkVotesAreNotForExpiredActions`, a vote is rejected only
+    // when `current_epoch > gasExpiresAfter`.  The boundary case
+    // (`current_epoch == gasExpiresAfter`) is allowed.
+    // ---------------------------------------------------------------------------
+
+    /// Build a `(GovActionId, ValidationContext)` pair where `current_epoch =
+    /// current` and the proposal at `gov_action_id` has the given
+    /// `expires_after_epoch`.
+    fn ctx_with_proposal(
+        action_id: &GovActionId,
+        current: u64,
+        expires_after: u64,
+    ) -> ValidationContext {
+        let proposal = ActiveProposal {
+            gov_action: GovAction::InfoAction,
+            return_addr: vec![0xe0; 29],
+            deposit: Lovelace(0),
+            expires_after_epoch: EpochNo(expires_after),
+            // proposed_in_epoch is unused by this predicate; pick something sane.
+            proposed_in_epoch: EpochNo(expires_after.saturating_sub(6)),
+        };
+        let mut active: HashMap<GovActionId, ActiveProposal> = HashMap::new();
+        active.insert(action_id.clone(), proposal);
+        ValidationContext::new()
+            .with_active_proposals(active)
+            .with_epoch(current)
+    }
+
+    #[test]
+    fn test_voting_on_expired_gov_action_rejected_strict_greater() {
+        // current_epoch = 20, expires_after = 10 -> rejected (strictly past).
+        let action_id = GovActionId {
+            transaction_id: Hash32::from_bytes([0x77; 32]),
+            action_index: 0,
+        };
+        let ctx = ctx_with_proposal(&action_id, 20, 10);
+        assert!(
+            is_vote_on_expired_action(&action_id, &ctx),
+            "current=20, expires_after=10 must be rejected"
+        );
+    }
+
+    #[test]
+    fn test_voting_on_action_at_expiry_boundary_allowed() {
+        // current_epoch == expires_after -> allowed (boundary inclusive).
+        let action_id = GovActionId {
+            transaction_id: Hash32::from_bytes([0x77; 32]),
+            action_index: 1,
+        };
+        let ctx = ctx_with_proposal(&action_id, 10, 10);
+        assert!(
+            !is_vote_on_expired_action(&action_id, &ctx),
+            "current=10, expires_after=10 is the boundary and must be allowed \
+             (Haskell: current_epoch <= gasExpiresAfter)"
+        );
+    }
+
+    #[test]
+    fn test_voting_on_future_action_allowed() {
+        // current_epoch < expires_after -> trivially allowed.
+        let action_id = GovActionId {
+            transaction_id: Hash32::from_bytes([0x77; 32]),
+            action_index: 2,
+        };
+        let ctx = ctx_with_proposal(&action_id, 5, 10);
+        assert!(
+            !is_vote_on_expired_action(&action_id, &ctx),
+            "current=5, expires_after=10 must be allowed"
+        );
+    }
+
+    #[test]
+    fn test_voting_on_action_skipped_when_active_proposals_none() {
+        // ctx.active_proposals = None -> lenient default, predicate returns false.
+        let action_id = GovActionId {
+            transaction_id: Hash32::from_bytes([0x77; 32]),
+            action_index: 3,
+        };
+        // Set current_epoch but leave active_proposals = None.
+        let ctx = ValidationContext::new().with_epoch(9999);
+        assert!(
+            !is_vote_on_expired_action(&action_id, &ctx),
+            "Predicate must skip (return false) when active_proposals is None"
+        );
+    }
+
+    // ---------------------------------------------------------------------------
+    // is_proposal_return_account_unregistered — ProposalReturnAccountDoesNotExist
+    //                                            (Conway GOV)
+    //
+    // Per Haskell `processProposal`, every proposal procedure's
+    // `pProcReturnAddr` credential must be present in `accounts`.  The check
+    // is **skipped during Conway bootstrap** (`pvMajor == 9`) and runs from
+    // PV >= 10 onwards.  When `ctx.reward_accounts` is `None`, the predicate
+    // returns false (lenient default) — matching the convention used by the
+    // other GOV predicates.
+    // ---------------------------------------------------------------------------
+
+    /// Build a `ProtocolParameters` pinned to the given protocol-version
+    /// major number.  The other parameter values are irrelevant to this
+    /// predicate.
+    fn pparams_at_pv(pv_major: u64) -> ProtocolParameters {
+        let mut p = ProtocolParameters::mainnet_defaults();
+        p.protocol_version_major = pv_major;
+        p
+    }
+
+    /// Build a 29-byte stake/reward address: `header || credential_hash[28]`.
+    /// `is_script` flips bit 4 of the header (`0xe0` key vs `0xf0` script),
+    /// matching the Cardano reward-address layout used by
+    /// `reward_account_to_hash` for the credential-type tag in byte 28 of
+    /// the resulting Hash32.
+    fn return_addr_29(cred_byte: u8, is_script: bool) -> Vec<u8> {
+        let header: u8 = if is_script { 0xf0 } else { 0xe0 };
+        let mut bytes = Vec::with_capacity(29);
+        bytes.push(header);
+        bytes.extend_from_slice(&[cred_byte; 28]);
+        bytes
+    }
+
+    /// Build a `ProposalProcedure` whose `return_addr` is the given 29-byte
+    /// reward-address payload.  Only `return_addr` matters for this
+    /// predicate; the other fields carry no-op values.
+    fn proposal_with_return_addr(return_addr: Vec<u8>) -> ProposalProcedure {
+        ProposalProcedure {
+            deposit: Lovelace(1_000_000_000),
+            return_addr,
+            gov_action: GovAction::InfoAction,
+            anchor: Anchor {
+                url: String::new(),
+                data_hash: Hash32::from_bytes([0u8; 32]),
+            },
+        }
+    }
+
+    #[test]
+    fn test_proposal_return_account_unregistered_post_bootstrap_rejected() {
+        // PV=10 (post-bootstrap), reward_accounts present but does NOT contain
+        // the proposal's return-address credential -> predicate returns true.
+        let params = pparams_at_pv(10);
+        let proposal = proposal_with_return_addr(return_addr_29(0x88, false));
+
+        // Reward-accounts map carries some other credential — definitely not
+        // the [0x88; 28] credential the proposal references.
+        let mut accounts: HashMap<Hash32, Lovelace> = HashMap::new();
+        accounts.insert(
+            Hash28::from_bytes([0x11; 28]).to_hash32_padded(),
+            Lovelace(0),
+        );
+        let ctx = ValidationContext::new().with_reward_accounts(accounts);
+
+        assert!(
+            is_proposal_return_account_unregistered(&proposal, &params, &ctx),
+            "Unregistered return-addr credential at PV=10 must be rejected"
+        );
+    }
+
+    #[test]
+    fn test_proposal_return_account_check_skipped_during_bootstrap() {
+        // PV=9 (Conway bootstrap), unregistered credential -> predicate must
+        // return false regardless (bootstrap-phase skip per
+        // hardforkConwayBootstrapPhase).
+        let params = pparams_at_pv(9);
+        let proposal = proposal_with_return_addr(return_addr_29(0x88, false));
+
+        // Empty reward_accounts — the credential is definitely not registered,
+        // but the bootstrap skip must short-circuit the check.
+        let ctx = ValidationContext::new().with_reward_accounts(HashMap::new());
+
+        assert!(
+            !is_proposal_return_account_unregistered(&proposal, &params, &ctx),
+            "Bootstrap (PV=9) must skip the return-account check entirely"
+        );
+    }
+
+    #[test]
+    fn test_proposal_return_account_registered_passes() {
+        // PV=10 with a registered credential matching the proposal's
+        // return_addr -> predicate returns false (accepted).
+        let params = pparams_at_pv(10);
+        let proposal = proposal_with_return_addr(return_addr_29(0x88, false));
+
+        // Compute the same key the predicate will compute via
+        // `reward_account_to_hash`, so the registered set actually matches.
+        let key = crate::state::LedgerState::reward_account_to_hash(&proposal.return_addr);
+        let mut accounts: HashMap<Hash32, Lovelace> = HashMap::new();
+        accounts.insert(key, Lovelace(0));
+        let ctx = ValidationContext::new().with_reward_accounts(accounts);
+
+        assert!(
+            !is_proposal_return_account_unregistered(&proposal, &params, &ctx),
+            "Registered return-addr credential must be accepted"
+        );
+    }
+
+    #[test]
+    fn test_proposal_return_account_skipped_when_reward_accounts_none() {
+        // PV=10 but ctx.reward_accounts = None -> lenient default (false).
+        // This mirrors `is_voter_unknown` / `is_vote_on_expired_action`
+        // behaviour when the caller hasn't plumbed in the relevant state.
+        let params = pparams_at_pv(10);
+        let proposal = proposal_with_return_addr(return_addr_29(0x88, false));
+
+        let ctx = ValidationContext::new();
+        assert!(ctx.reward_accounts.is_none());
+
+        assert!(
+            !is_proposal_return_account_unregistered(&proposal, &params, &ctx),
+            "Predicate must skip (return false) when reward_accounts is None"
+        );
+    }
+
+    // ---------------------------------------------------------------------------
+    // is_proposal_return_addr_wrong_network — ProposalProcedureNetworkIdMismatch
+    //                                          (Conway GOV)
+    //
+    // Per Haskell `processProposal`, every proposal procedure's
+    // `pProcReturnAddr` must be on the same network as the node.  Bit 0 of
+    // the reward-account header byte encodes the network (0 = testnet,
+    // 1 = mainnet).  This check is **always enforced** — there is NO
+    // Conway-bootstrap skip (the network id is a structural property, not
+    // a post-bootstrap state lookup).  When `ctx.node_network` is `None`,
+    // the predicate returns `None` (lenient default).
+    // ---------------------------------------------------------------------------
+
+    use dugite_primitives::network::NetworkId;
+
+    /// Build a 29-byte reward address whose header network bit matches
+    /// `network` (0 = testnet, 1 = mainnet).  The high nibble is set to
+    /// `0xe0` (key-credential, stake/reward address) and the low bit is
+    /// flipped accordingly.
+    fn return_addr_29_with_network(network_bit: u8) -> Vec<u8> {
+        // 0xe0 has bit 0 = 0 (testnet); 0xe1 has bit 0 = 1 (mainnet).
+        let header: u8 = 0xe0 | (network_bit & 0x01);
+        let mut bytes = Vec::with_capacity(29);
+        bytes.push(header);
+        bytes.extend_from_slice(&[0x88u8; 28]);
+        bytes
+    }
+
+    fn proposal_with_addr(addr: Vec<u8>) -> ProposalProcedure {
+        ProposalProcedure {
+            deposit: Lovelace(1_000_000_000),
+            return_addr: addr,
+            gov_action: GovAction::InfoAction,
+            anchor: Anchor {
+                url: String::new(),
+                data_hash: Hash32::from_bytes([0u8; 32]),
+            },
+        }
+    }
+
+    #[test]
+    fn test_proposal_return_addr_wrong_network_returns_actual() {
+        // node = mainnet (1), proposal = testnet (0) -> Some(0)
+        let proposal = proposal_with_addr(return_addr_29_with_network(0));
+        let ctx = ValidationContext::new().with_network(NetworkId::Mainnet);
+        assert_eq!(
+            is_proposal_return_addr_wrong_network(&proposal, &ctx),
+            Some(0),
+            "Mismatched network must return the actual mismatched value"
+        );
+    }
+
+    #[test]
+    fn test_proposal_return_addr_correct_network_returns_none() {
+        // node = mainnet (1), proposal = mainnet (1) -> None
+        let proposal = proposal_with_addr(return_addr_29_with_network(1));
+        let ctx = ValidationContext::new().with_network(NetworkId::Mainnet);
+        assert_eq!(
+            is_proposal_return_addr_wrong_network(&proposal, &ctx),
+            None,
+            "Matching network must return None"
+        );
+    }
+
+    #[test]
+    fn test_proposal_return_addr_check_skipped_when_network_id_none() {
+        // ctx.node_network = None -> lenient default (None), regardless of
+        // the proposal's network bit.
+        let proposal = proposal_with_addr(return_addr_29_with_network(0));
+        let ctx = ValidationContext::new();
+        assert!(ctx.node_network.is_none());
+        assert_eq!(
+            is_proposal_return_addr_wrong_network(&proposal, &ctx),
+            None,
+            "Predicate must skip (return None) when node_network is None"
+        );
+    }
+
+    #[test]
+    fn test_proposal_return_addr_network_check_runs_in_bootstrap() {
+        // PV=9 (Conway bootstrap) is irrelevant here — the network-id check
+        // is always enforced.  This test proves the predicate fires for a
+        // mismatch even when the surrounding context represents bootstrap.
+        // Note: this predicate doesn't even take `params` (no PV gating).
+        let proposal = proposal_with_addr(return_addr_29_with_network(0));
+        let ctx = ValidationContext::new().with_network(NetworkId::Mainnet);
+        // The presence of a hypothetical PV=9 ProtocolParameters cannot
+        // suppress the predicate — it has no PV input.
+        assert_eq!(
+            is_proposal_return_addr_wrong_network(&proposal, &ctx),
+            Some(0),
+            "Network-id check must fire even in (hypothetical) bootstrap; \
+             unlike ProposalReturnAccountDoesNotExist, there is no PV=9 skip"
+        );
+    }
+
+    #[test]
+    fn test_proposal_return_addr_empty_addr_returns_none() {
+        // Malformed (empty) return_addr is handled by a different predicate;
+        // this rule must not double-fire on shape errors.
+        let proposal = proposal_with_addr(Vec::new());
+        let ctx = ValidationContext::new().with_network(NetworkId::Mainnet);
+        assert_eq!(
+            is_proposal_return_addr_wrong_network(&proposal, &ctx),
+            None,
+            "Empty return_addr must short-circuit (None)"
+        );
+    }
+
+    // ---------------------------------------------------------------------------
+    // treasury_withdrawal_network_mismatches —
+    //   TreasuryWithdrawalsNetworkIdMismatch (Conway GOV)
+    //
+    // Per Haskell `processProposal`, every destination address in a
+    // TreasuryWithdrawals proposal's `withdrawals` map must be on the same
+    // network as the node.  Bit 0 of the reward-account header byte encodes
+    // the network (0 = testnet, 1 = mainnet).  This check is **always
+    // enforced** — there is NO Conway-bootstrap skip (same as
+    // `ProposalProcedureNetworkIdMismatch`).  When `ctx.node_network` is
+    // `None`, the predicate returns an empty vec (lenient default).
+    // ---------------------------------------------------------------------------
+
+    /// Build a `TreasuryWithdrawals` proposal whose `withdrawals` map is
+    /// the given list of `(reward_addr_bytes, coin)` entries.  No
+    /// `policy_hash` (constitution check is irrelevant to this predicate).
+    fn treasury_withdrawals_proposal(entries: Vec<(Vec<u8>, Lovelace)>) -> ProposalProcedure {
+        let withdrawals: BTreeMap<Vec<u8>, Lovelace> = entries.into_iter().collect();
+        ProposalProcedure {
+            deposit: Lovelace(1_000_000_000),
+            return_addr: return_addr_29_with_network(1), // node network — irrelevant here
+            gov_action: GovAction::TreasuryWithdrawals {
+                withdrawals,
+                policy_hash: None,
+            },
+            anchor: Anchor {
+                url: String::new(),
+                data_hash: Hash32::from_bytes([0u8; 32]),
+            },
+        }
+    }
+
+    #[test]
+    fn test_treasury_withdrawals_network_mismatch_collects_all() {
+        // node = mainnet (1).  Two testnet entries + one mainnet entry → only
+        // the testnet entries are surfaced.
+        let mut testnet_a = vec![0xe0u8];
+        testnet_a.extend_from_slice(&[0x11u8; 28]);
+        let mut testnet_b = vec![0xe0u8];
+        testnet_b.extend_from_slice(&[0x22u8; 28]);
+        let mut mainnet_ok = vec![0xe1u8];
+        mainnet_ok.extend_from_slice(&[0x33u8; 28]);
+
+        let proposal = treasury_withdrawals_proposal(vec![
+            (testnet_a.clone(), Lovelace(1)),
+            (testnet_b.clone(), Lovelace(2)),
+            (mainnet_ok.clone(), Lovelace(3)),
+        ]);
+        let ctx = ValidationContext::new().with_network(NetworkId::Mainnet);
+
+        let mismatches = treasury_withdrawal_network_mismatches(&proposal, &ctx);
+        assert_eq!(
+            mismatches.len(),
+            2,
+            "must surface both testnet entries; got: {mismatches:?}"
+        );
+        for (_, actual) in &mismatches {
+            assert_eq!(
+                *actual, 0,
+                "mismatched entries must report actual=0 (testnet)"
+            );
+        }
+    }
+
+    #[test]
+    fn test_treasury_withdrawals_network_match_returns_empty() {
+        // All entries' network bit matches the node → empty vec.
+        let mut a = vec![0xe1u8];
+        a.extend_from_slice(&[0x11u8; 28]);
+        let mut b = vec![0xe1u8];
+        b.extend_from_slice(&[0x22u8; 28]);
+
+        let proposal = treasury_withdrawals_proposal(vec![(a, Lovelace(1)), (b, Lovelace(2))]);
+        let ctx = ValidationContext::new().with_network(NetworkId::Mainnet);
+
+        assert!(
+            treasury_withdrawal_network_mismatches(&proposal, &ctx).is_empty(),
+            "All-match TreasuryWithdrawals must produce no mismatches"
+        );
+    }
+
+    #[test]
+    fn test_treasury_withdrawals_network_check_skips_non_tw_proposal() {
+        // A non-TreasuryWithdrawals proposal must produce no mismatches even
+        // if `return_addr` is on the wrong network — that's a different
+        // predicate (`ProposalProcedureNetworkIdMismatch`).
+        let proposal = proposal_with_addr(return_addr_29_with_network(0));
+        let ctx = ValidationContext::new().with_network(NetworkId::Mainnet);
+
+        assert!(
+            treasury_withdrawal_network_mismatches(&proposal, &ctx).is_empty(),
+            "Non-TreasuryWithdrawals proposals must short-circuit (empty vec)"
+        );
+    }
+
+    #[test]
+    fn test_treasury_withdrawals_network_check_skipped_when_network_none() {
+        // ctx.node_network = None → lenient default (empty vec) regardless
+        // of the entries' network bits.
+        let mut testnet = vec![0xe0u8];
+        testnet.extend_from_slice(&[0x11u8; 28]);
+        let proposal = treasury_withdrawals_proposal(vec![(testnet, Lovelace(1))]);
+        let ctx = ValidationContext::new();
+        assert!(ctx.node_network.is_none());
+
+        assert!(
+            treasury_withdrawal_network_mismatches(&proposal, &ctx).is_empty(),
+            "Predicate must skip (empty vec) when node_network is None"
+        );
+    }
+
+    // ---------------------------------------------------------------------------
+    // is_treasury_withdrawals_zero_sum — ZeroTreasuryWithdrawals (Conway GOV)
+    //
+    // Per Haskell `processProposal` (TreasuryWithdrawals branch), a TW proposal
+    // whose total amount is zero (including the all-zero-entries case and
+    // empty-map case) is rejected.  This check is **skipped during Conway
+    // bootstrap** (PV == 9) per `hardforkConwayBootstrapPhase`.
+    // ---------------------------------------------------------------------------
+
+    #[test]
+    fn test_treasury_withdrawals_zero_sum_post_bootstrap_rejected() {
+        // PV=10, sum == 0 → predicate fires.
+        let params = pparams_at_pv(10);
+        let mut a = vec![0xe0u8];
+        a.extend_from_slice(&[0x11u8; 28]);
+        let mut b = vec![0xe0u8];
+        b.extend_from_slice(&[0x22u8; 28]);
+        let proposal = treasury_withdrawals_proposal(vec![(a, Lovelace(0)), (b, Lovelace(0))]);
+
+        assert!(
+            is_treasury_withdrawals_zero_sum(&proposal, &params),
+            "All-zero TreasuryWithdrawals must fire post-bootstrap"
+        );
+    }
+
+    #[test]
+    fn test_treasury_withdrawals_zero_sum_at_pv9_skipped() {
+        // PV=9 (Conway bootstrap) — predicate is silenced even with sum==0.
+        let params = pparams_at_pv(9);
+        let mut a = vec![0xe0u8];
+        a.extend_from_slice(&[0x11u8; 28]);
+        let proposal = treasury_withdrawals_proposal(vec![(a, Lovelace(0))]);
+
+        assert!(
+            !is_treasury_withdrawals_zero_sum(&proposal, &params),
+            "Bootstrap (PV=9) must skip the zero-sum check entirely"
+        );
+    }
+
+    #[test]
+    fn test_treasury_withdrawals_nonzero_sum_accepted() {
+        // PV=10, any non-zero entry → sum != 0 → predicate does not fire.
+        let params = pparams_at_pv(10);
+        let mut a = vec![0xe0u8];
+        a.extend_from_slice(&[0x11u8; 28]);
+        let mut b = vec![0xe0u8];
+        b.extend_from_slice(&[0x22u8; 28]);
+        let proposal = treasury_withdrawals_proposal(vec![(a, Lovelace(0)), (b, Lovelace(1))]);
+
+        assert!(
+            !is_treasury_withdrawals_zero_sum(&proposal, &params),
+            "Non-zero total must accept the proposal"
+        );
+    }
+
+    #[test]
+    fn test_treasury_withdrawals_zero_sum_skips_non_tw_proposal() {
+        // A non-TreasuryWithdrawals proposal must always return false,
+        // independent of any other state.
+        let params = pparams_at_pv(10);
+        let proposal = proposal_with_addr(return_addr_29_with_network(1));
+        assert!(
+            !is_treasury_withdrawals_zero_sum(&proposal, &params),
+            "Non-TreasuryWithdrawals proposals must short-circuit (false)"
+        );
+    }
+
+    // ---------------------------------------------------------------------------
+    // committee_update_conflicts — ConflictingCommitteeUpdate (Conway GOV)
+    //
+    // Per Haskell `processProposal` (UpdateCommittee branch), the
+    // intersection of `members_to_add`'s keys and `members_to_remove` must
+    // be empty — a member cannot be both added and removed in the same
+    // action.  Always enforced (no Conway-bootstrap skip).  When the
+    // proposal action is not `UpdateCommittee`, the predicate returns the
+    // empty vec.
+    // ---------------------------------------------------------------------------
+
+    /// Helper: build a key-credential `Credential` from a single byte
+    /// pattern.
+    fn cred_key(b: u8) -> Credential {
+        Credential::VerificationKey(Hash28::from_bytes([b; 28]))
+    }
+
+    /// Helper: build a script-credential `Credential` from a single byte
+    /// pattern.
+    fn cred_script(b: u8) -> Credential {
+        Credential::Script(Hash28::from_bytes([b; 28]))
+    }
+
+    /// Build an `UpdateCommittee` proposal with the given add and remove
+    /// sets.  Threshold/return_addr/anchor are stubs.
+    fn update_committee_proposal(
+        members_to_add: BTreeMap<Credential, u64>,
+        members_to_remove: Vec<Credential>,
+    ) -> ProposalProcedure {
+        ProposalProcedure {
+            deposit: Lovelace(1_000_000_000),
+            return_addr: return_addr_29_with_network(1),
+            gov_action: GovAction::UpdateCommittee {
+                prev_action_id: None,
+                members_to_remove,
+                members_to_add,
+                threshold: Rational {
+                    numerator: 1,
+                    denominator: 2,
+                },
+            },
+            anchor: Anchor {
+                url: String::new(),
+                data_hash: Hash32::from_bytes([0u8; 32]),
+            },
+        }
+    }
+
+    #[test]
+    fn test_committee_update_conflict_found() {
+        // Same key-credential appears in both add-set and remove-set ->
+        // surfaced as a conflict.  An additional non-conflicting add and a
+        // non-conflicting remove must NOT appear in the conflict list.
+        let mut adds: BTreeMap<Credential, u64> = BTreeMap::new();
+        adds.insert(cred_key(0x11), 100);
+        adds.insert(cred_key(0x22), 100);
+        let removes = vec![cred_key(0x11), cred_key(0x33)];
+        let proposal = update_committee_proposal(adds, removes);
+
+        let conflicts = committee_update_conflicts(&proposal);
+        assert_eq!(
+            conflicts.len(),
+            1,
+            "exactly one conflicting credential, got: {conflicts:?}"
+        );
+        let expected = cred_key(0x11).to_typed_hash32().to_hex();
+        assert_eq!(conflicts[0], expected);
+    }
+
+    #[test]
+    fn test_committee_update_no_conflict_returns_empty() {
+        // Disjoint add and remove sets -> no conflicts.  Also covers the
+        // key-vs-script distinction: same 28-byte hash, different
+        // credential type -> NOT a conflict (mirrors Haskell `Credential`).
+        let mut adds: BTreeMap<Credential, u64> = BTreeMap::new();
+        adds.insert(cred_key(0x11), 100);
+        // Same 28-byte hash as the add but as a Script credential.
+        adds.insert(cred_script(0x11), 100);
+        // Remove a key with the same 28 bytes but treated as Script:
+        // the typed-hash representation must distinguish, so this is a
+        // conflict only with the Script add (intentional).  We instead
+        // use a totally unrelated credential to keep this test purely
+        // about disjoint sets.
+        let removes = vec![cred_key(0x99), cred_script(0x88)];
+        let proposal = update_committee_proposal(adds, removes);
+
+        assert!(
+            committee_update_conflicts(&proposal).is_empty(),
+            "Disjoint add/remove sets must produce no conflicts"
+        );
+    }
+
+    #[test]
+    fn test_committee_update_conflicts_skips_non_update_committee() {
+        // A non-UpdateCommittee proposal must always produce no conflicts.
+        let proposal = proposal_with_addr(return_addr_29_with_network(1));
+        assert!(
+            committee_update_conflicts(&proposal).is_empty(),
+            "Non-UpdateCommittee proposals must short-circuit (empty vec)"
+        );
+    }
+
+    // ---------------------------------------------------------------------------
+    // committee_update_invalid_expiries — ExpirationEpochTooSmall (Conway GOV)
+    //
+    // Per Haskell `processProposal` (UpdateCommittee branch), every entry in
+    // `members_to_add`'s `(credential, validUntil)` pairs must satisfy
+    // `validUntil > currentEpoch`.  Boundary `validUntil == currentEpoch`
+    // is rejected (the Haskell filter is `<= currentEpoch`).  Always
+    // enforced (no Conway-bootstrap skip).  When `ctx.current_epoch` is
+    // `None`, the predicate returns an empty vec (lenient default).
+    // ---------------------------------------------------------------------------
+
+    #[test]
+    fn test_committee_update_expiry_equal_current_rejected() {
+        // expiry == current_epoch (boundary) -> rejected per Haskell `<=`.
+        let cred = cred_key(0x71);
+        let mut adds: BTreeMap<Credential, u64> = BTreeMap::new();
+        adds.insert(cred.clone(), 100);
+        let proposal = update_committee_proposal(adds, vec![]);
+        let ctx = ValidationContext::new().with_epoch(100);
+
+        let invalid = committee_update_invalid_expiries(&proposal, &ctx);
+        assert_eq!(invalid.len(), 1, "boundary expiry must be invalid");
+        assert_eq!(invalid[0].0, cred.to_typed_hash32().to_hex());
+        assert_eq!(invalid[0].1, 100);
+    }
+
+    #[test]
+    fn test_committee_update_expiry_below_current_rejected() {
+        // expiry < current_epoch -> rejected.
+        let cred = cred_key(0x72);
+        let mut adds: BTreeMap<Credential, u64> = BTreeMap::new();
+        adds.insert(cred.clone(), 50);
+        let proposal = update_committee_proposal(adds, vec![]);
+        let ctx = ValidationContext::new().with_epoch(100);
+
+        let invalid = committee_update_invalid_expiries(&proposal, &ctx);
+        assert_eq!(invalid.len(), 1, "expiry below current must be invalid");
+        assert_eq!(invalid[0].1, 50);
+    }
+
+    #[test]
+    fn test_committee_update_expiry_above_current_accepted() {
+        // expiry > current_epoch -> accepted (no entries surfaced).
+        let cred = cred_key(0x73);
+        let mut adds: BTreeMap<Credential, u64> = BTreeMap::new();
+        adds.insert(cred, 200);
+        let proposal = update_committee_proposal(adds, vec![]);
+        let ctx = ValidationContext::new().with_epoch(100);
+
+        assert!(
+            committee_update_invalid_expiries(&proposal, &ctx).is_empty(),
+            "expiry strictly greater than current_epoch must be accepted"
+        );
+    }
+
+    #[test]
+    fn test_committee_update_expiry_skipped_when_epoch_none() {
+        // ctx.current_epoch = None -> lenient default (empty vec) regardless
+        // of the expiry values.
+        let cred = cred_key(0x74);
+        let mut adds: BTreeMap<Credential, u64> = BTreeMap::new();
+        adds.insert(cred, 0); // would be invalid if epoch were known
+        let proposal = update_committee_proposal(adds, vec![]);
+        let ctx = ValidationContext::new();
+        assert!(ctx.current_epoch.is_none());
+
+        assert!(
+            committee_update_invalid_expiries(&proposal, &ctx).is_empty(),
+            "Predicate must skip (empty vec) when current_epoch is None"
         );
     }
 }
