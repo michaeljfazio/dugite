@@ -59,6 +59,61 @@ fn drops_preview_pparam_change_1216() {
     assert_not_ratified(&ledger, &proposal_id);
 }
 
+/// Real preview ParameterChange enacted at epoch 1270 — first
+/// **post-bootstrap** (PV = 10) capture in the suite.  Exercises the
+/// aggregate-mode DRep snapshot end-to-end against real Koios data.
+///
+/// Captured via `--aggregate-drep`: one `proposal_voting_summary` call
+/// instead of ~8800 per-DRep `drep_voting_power_history` calls,
+/// avoiding the Koios free-tier 5000 req/day cap.  The loader
+/// synthesizes a 4-credential `drep_distribution_snapshot` that
+/// reproduces the real `drep_yes / drep_total` ratio.
+///
+/// Real numbers (verified against Koios `proposal_voting_summary`
+/// `drep_yes_pct = 82.51`):
+///   yes_stake               = 18,410,000,000,000
+///   no_stake (active)       = 0
+///   abstain_stake           = 0
+///   no_vote_stake (passive) = 79,049,111,530
+///   always_no_confidence    = 3,822,881,797,310
+///   always_abstain          = 89,985,083,309,594
+///
+/// drep_total = yes + active_no + no_vote + always_nc
+///            = 18,410,000,000,000 + 0 + 79,049,111,530 + 3,822,881,797,310
+///            = 22,311,930,908,840
+/// ratio      = 18,410,000,000,000 / 22,311,930,908,840 = 82.51% ≥ 67%
+///              (`dvt_pp_technical_group` for the costModels PPU)
+///
+/// Committee: 8 captured members; only the 3 with expiration 1356 are
+/// active at epoch 1269 (the others expired at 1000/1007).  All 3
+/// active members voted Yes → 3/3 ≥ 2/3 threshold.
+/// SPO: PPU touches `costModels` only (Technical, NoVote group), so
+/// SPOs cannot vote — auto-pass.
+///
+/// `parent_enacted.PParamUpdate` was hand-set to the prior 69c948
+/// PParamChange (the 1096 fixture's gov_action_id) — Koios does not
+/// expose `prev_action_id` on `proposal_list` rows, so the capture
+/// binary writes `null` and the chain root is patched in.
+#[test]
+fn ratifies_post_bootstrap_preview_proposal_1270() {
+    let path = format!(
+        "{}/../../fixtures/conway-ratification/preview-pparam-1270.json",
+        env!("CARGO_MANIFEST_DIR")
+    );
+    let fixture = RatificationFixture::load(&path);
+    let expected_bucket = fixture.expected_outcome.enacted_bucket;
+    let expected_id = parse_gov_action_id(
+        fixture
+            .expected_outcome
+            .enacted_id
+            .as_deref()
+            .expect("positive fixture must carry enacted_id"),
+    );
+    let mut ledger = fixture.into_ledger_state();
+    ledger.ratify_proposals();
+    assert_ratified(&ledger, expected_bucket, &expected_id);
+}
+
 // ---------------------------------------------------------------------------
 // Synthetic correctness gates
 // ---------------------------------------------------------------------------
