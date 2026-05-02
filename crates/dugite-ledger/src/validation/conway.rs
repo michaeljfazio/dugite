@@ -14,7 +14,7 @@ use dugite_primitives::protocol_params::ProtocolParameters;
 use dugite_primitives::transaction::{Certificate, GovAction, TransactionBody, Voter};
 use dugite_primitives::value::Lovelace;
 
-use super::ValidationError;
+use super::{ValidationContext, ValidationError};
 
 /// Return the human-readable certificate type name when the certificate is
 /// Conway-only (requires protocol version >= 9). Returns `None` for
@@ -335,6 +335,61 @@ pub(super) fn is_voter_disallowed(voter: &Voter, action: &GovAction) -> bool {
         (Voter::ConstitutionalCommittee(_), GovAction::UpdateCommittee { .. }) => true,
         // All other (voter, action) combinations are permitted at this layer.
         _ => false,
+    }
+}
+
+/// Returns `true` when the given voter is unknown to the ledger, i.e. its
+/// credential / pool ID is not present in the corresponding registry:
+///
+///   - `DRepVoter`        — credential not in `registered_dreps`.
+///   - `StakePoolVoter`   — pool ID not in `registered_pools`.
+///   - `CommitteeVoter`   — hot credential not in
+///     `committee_authorized_hot_keys`.
+///
+/// When the relevant context field is `None` (not provided by the caller),
+/// this returns `false` (voter treated as known) — matching the lenient
+/// default used elsewhere (see [`ValidationContext::active_proposals`] for
+/// the same convention).  This avoids false-positive rejections when the
+/// caller hasn't yet plumbed in the relevant ledger state.
+///
+/// This is a pure predicate.  The caller (in `validation/mod.rs`) accumulates
+/// every unknown voter across the transaction's `voting_procedures` and emits
+/// a single [`ValidationError::VotersDoNotExist`] holding the full list,
+/// matching Haskell's `NonEmpty` predicate-failure shape.
+///
+/// Reference: Haskell `internVoter` in
+/// `eras/conway/impl/src/Cardano/Ledger/Conway/Rules/Gov.hs`.
+pub(super) fn is_voter_unknown(voter: &Voter, ctx: &ValidationContext) -> bool {
+    match voter {
+        Voter::DRep(credential) => match ctx.registered_dreps.as_ref() {
+            Some(dreps) => {
+                let key = credential.to_hash().to_hash32_padded();
+                !dreps.contains(&key)
+            }
+            None => false,
+        },
+        Voter::StakePool(pool_hash32) => match ctx.registered_pools.as_ref() {
+            Some(pools) => {
+                // Voter::StakePool wraps a Hash32 produced by zero-padding the
+                // 28-byte pool key hash (see decoder in
+                // dugite-serialization::multi_era).  registered_pools stores
+                // the canonical 28-byte form, so truncate here.
+                let mut bytes28 = [0u8; 28];
+                bytes28.copy_from_slice(&pool_hash32.as_bytes()[..28]);
+                let pool_id = Hash28::from_bytes(bytes28);
+                !pools.contains(&pool_id)
+            }
+            None => false,
+        },
+        Voter::ConstitutionalCommittee(hot_credential) => {
+            match ctx.committee_authorized_hot_keys.as_ref() {
+                Some(hot_keys) => {
+                    let key = hot_credential.to_hash().to_hash32_padded();
+                    !hot_keys.contains(&key)
+                }
+                None => false,
+            }
+        }
     }
 }
 
@@ -1144,5 +1199,172 @@ mod tests {
             policy_hash: None,
         };
         assert!(!is_voter_disallowed(&spo_voter(), &action));
+    }
+
+    // ---------------------------------------------------------------------------
+    // is_voter_unknown — VotersDoNotExist predicate (Conway GOV)
+    //
+    // A voter is "unknown" when its credential / pool ID is not present in the
+    // corresponding registry passed via `ValidationContext`:
+    //   - DRepVoter: not in `registered_dreps`
+    //   - StakePoolVoter: not in `registered_pools`
+    //   - CommitteeVoter: hot credential not in `committee_authorized_hot_keys`
+    //
+    // When the corresponding context field is `None`, the voter is treated as
+    // known (lenient default — see is_voter_unknown doc comment).
+    // ---------------------------------------------------------------------------
+
+    /// Build a 28-byte hash with all bytes equal to `b`, padded to Hash32 form
+    /// (last 4 bytes zero) — the canonical key shape used by registered_dreps,
+    /// committee_authorized_hot_keys, etc.
+    fn padded_key_hash(b: u8) -> Hash32 {
+        Hash28::from_bytes([b; 28]).to_hash32_padded()
+    }
+
+    #[test]
+    fn test_voters_do_not_exist_unregistered_drep() {
+        // A DRep key-hash voter whose credential is not in registered_dreps
+        // is reported as unknown.
+        let unregistered = test_credential(0xD0);
+        let voter = Voter::DRep(unregistered);
+
+        // The set contains some other DRep, not the voter's credential.
+        let mut dreps: HashSet<Hash32> = HashSet::new();
+        dreps.insert(padded_key_hash(0xEE));
+
+        let ctx = ValidationContext::new().with_dreps(dreps);
+        assert!(
+            is_voter_unknown(&voter, &ctx),
+            "DRep voter not in registered_dreps must be reported as unknown"
+        );
+    }
+
+    #[test]
+    fn test_voters_do_not_exist_unregistered_drep_script() {
+        // A DRep script-hash voter whose credential is not in registered_dreps
+        // is reported as unknown.  Mirrors the script-credential variant of
+        // Haskell's `Credential 'DRepRole`.
+        let unregistered = Credential::Script(Hash28::from_bytes([0xD1; 28]));
+        let voter = Voter::DRep(unregistered);
+
+        let dreps: HashSet<Hash32> = HashSet::new();
+        let ctx = ValidationContext::new().with_dreps(dreps);
+
+        assert!(
+            is_voter_unknown(&voter, &ctx),
+            "Script-credential DRep voter not in registered_dreps must be reported as unknown"
+        );
+    }
+
+    #[test]
+    fn test_voters_do_not_exist_unregistered_pool() {
+        // A StakePool voter whose pool ID is not in registered_pools is
+        // reported as unknown.  Voter::StakePool wraps a Hash32 (28 raw bytes
+        // zero-padded), but registered_pools stores Hash28; the predicate
+        // truncates and matches.
+        let unregistered_id = Hash28::from_bytes([0xAA; 28]);
+        let voter = Voter::StakePool(unregistered_id.to_hash32_padded());
+
+        let mut pools: HashSet<Hash28> = HashSet::new();
+        pools.insert(Hash28::from_bytes([0xBB; 28])); // some other pool
+
+        let ctx = ValidationContext::new().with_pools(pools);
+        assert!(
+            is_voter_unknown(&voter, &ctx),
+            "StakePool voter not in registered_pools must be reported as unknown"
+        );
+    }
+
+    #[test]
+    fn test_voters_do_not_exist_unauthorized_committee_hot_key() {
+        // A ConstitutionalCommittee voter whose hot credential is not in
+        // committee_authorized_hot_keys is reported as unknown.
+        let unauthorized_hot = test_credential(0xCC);
+        let voter = Voter::ConstitutionalCommittee(unauthorized_hot);
+
+        let mut hot_keys: HashSet<Hash32> = HashSet::new();
+        hot_keys.insert(padded_key_hash(0x77)); // a different authorised hot key
+
+        let ctx = ValidationContext::new().with_committee_authorized_hot_keys(hot_keys);
+        assert!(
+            is_voter_unknown(&voter, &ctx),
+            "Committee voter whose hot credential is not in \
+             committee_authorized_hot_keys must be reported as unknown"
+        );
+    }
+
+    #[test]
+    fn test_voter_known_registered_drep() {
+        // Positive case: a DRep voter whose credential IS in registered_dreps
+        // is NOT reported as unknown.
+        let cred = test_credential(0xD2);
+        let voter = Voter::DRep(cred.clone());
+
+        let mut dreps: HashSet<Hash32> = HashSet::new();
+        dreps.insert(cred.to_hash().to_hash32_padded());
+
+        let ctx = ValidationContext::new().with_dreps(dreps);
+        assert!(
+            !is_voter_unknown(&voter, &ctx),
+            "Registered DRep voter must NOT be reported as unknown"
+        );
+    }
+
+    #[test]
+    fn test_voter_known_registered_pool() {
+        // Positive case: a StakePool voter whose pool ID IS in registered_pools
+        // is NOT reported as unknown.
+        let pool_id = Hash28::from_bytes([0xA1; 28]);
+        let voter = Voter::StakePool(pool_id.to_hash32_padded());
+
+        let mut pools: HashSet<Hash28> = HashSet::new();
+        pools.insert(pool_id);
+
+        let ctx = ValidationContext::new().with_pools(pools);
+        assert!(
+            !is_voter_unknown(&voter, &ctx),
+            "Registered pool voter must NOT be reported as unknown"
+        );
+    }
+
+    #[test]
+    fn test_voter_known_authorized_committee_hot_key() {
+        // Positive case: a Committee voter whose hot credential IS in
+        // committee_authorized_hot_keys is NOT reported as unknown.
+        let hot = test_credential(0xC1);
+        let voter = Voter::ConstitutionalCommittee(hot.clone());
+
+        let mut hot_keys: HashSet<Hash32> = HashSet::new();
+        hot_keys.insert(hot.to_hash().to_hash32_padded());
+
+        let ctx = ValidationContext::new().with_committee_authorized_hot_keys(hot_keys);
+        assert!(
+            !is_voter_unknown(&voter, &ctx),
+            "Authorised committee hot key voter must NOT be reported as unknown"
+        );
+    }
+
+    #[test]
+    fn test_voter_unknown_lenient_default_when_context_missing() {
+        // When the relevant context field is `None`, the predicate must return
+        // `false` (voter treated as known) — same lenient default as
+        // `active_proposals` for `DisallowedVoters` (Task 2).
+        let drep_voter_unset = Voter::DRep(test_credential(0xD3));
+        let pool_voter_unset = Voter::StakePool(Hash28::from_bytes([0xA3; 28]).to_hash32_padded());
+        let cc_voter_unset = Voter::ConstitutionalCommittee(test_credential(0xC3));
+
+        let ctx = ValidationContext::new(); // all None
+        assert!(
+            !is_voter_unknown(&drep_voter_unset, &ctx),
+            "DRep voter must default to known when registered_dreps is None"
+        );
+        assert!(
+            !is_voter_unknown(&pool_voter_unset, &ctx),
+            "Pool voter must default to known when registered_pools is None"
+        );
+        assert!(
+            !is_voter_unknown(&cc_voter_unset, &ctx),
+            "Committee voter must default to known when committee_authorized_hot_keys is None"
+        );
     }
 }

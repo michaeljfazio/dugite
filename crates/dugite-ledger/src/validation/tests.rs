@@ -12715,4 +12715,176 @@ mod tests {
             );
         }
     }
+
+    // -------------------------------------------------------------------------
+    // VotersDoNotExist integration tests for `validate_transaction_with_context`
+    //
+    // These tests exercise the wiring path end-to-end: a Conway transaction
+    // contains votes from a DRep / SPO / committee voter whose credential is
+    // NOT registered in the corresponding registry, and the validator must
+    // surface a `VotersDoNotExist` error aggregating every unknown voter.
+    //
+    // Critical ordering property: VotersDoNotExist takes precedence over
+    // DisallowedVoters — when a voter is unknown, it must NOT also appear in
+    // a DisallowedVoters error (Haskell `internVoter` partitions unknowns out
+    // before the authority check).
+    // -------------------------------------------------------------------------
+
+    fn drep_voter_for_test() -> Voter {
+        use dugite_primitives::credentials::Credential;
+        Voter::DRep(Credential::VerificationKey(Hash28::from_bytes([0xDD; 28])))
+    }
+
+    fn info_proposal() -> ProposalProcedure {
+        ProposalProcedure {
+            deposit: Lovelace(1_000_000_000),
+            return_addr: vec![0xe0; 29],
+            gov_action: GovAction::InfoAction,
+            anchor: anchor_stub(),
+        }
+    }
+
+    /// Test 1: A DRep votes on an InfoAction proposal in the same tx, but the
+    /// DRep's credential is not in `registered_dreps`. Expect
+    /// `VotersDoNotExist` whose `voters` list contains exactly that DRep.
+    /// (InfoAction is used so `DisallowedVoters` cannot fire for any voter
+    /// type, isolating the VotersDoNotExist wiring.)
+    #[test]
+    fn test_validate_transaction_rejects_vote_from_unregistered_drep() {
+        let params = conway_pparams_pv10();
+        let utxo_set = UtxoSet::new();
+
+        let action_id = GovActionId {
+            transaction_id: Hash32::from_bytes([0xAB; 32]),
+            action_index: 0,
+        };
+        let mut votes = BTreeMap::new();
+        votes.insert(action_id.clone(), yes_vote());
+        let mut voting_procedures = BTreeMap::new();
+        voting_procedures.insert(drep_voter_for_test(), votes);
+
+        let tx = make_gov_tx(vec![info_proposal()], voting_procedures);
+
+        // Empty registered_dreps — the voter's credential is not registered.
+        let context = ValidationContext::new().with_dreps(HashSet::new());
+        let result =
+            validate_transaction_with_context(&tx, &utxo_set, &params, 100, 500, None, context);
+
+        let errors = result.expect_err("expected VotersDoNotExist predicate to fire");
+        let unknown_voters = errors
+            .iter()
+            .find_map(|e| match e {
+                ValidationError::VotersDoNotExist { voters } => Some(voters),
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("VotersDoNotExist not in error set: {errors:?}"));
+        assert_eq!(
+            unknown_voters.len(),
+            1,
+            "expected exactly one unknown voter, got: {unknown_voters:?}"
+        );
+        assert!(
+            matches!(&unknown_voters[0], Voter::DRep(_)),
+            "unknown voter must be a DRep, got: {:?}",
+            unknown_voters[0]
+        );
+    }
+
+    /// Test 2: An SPO votes Yes on a `NewConstitution` proposal AND the SPO is
+    /// not in `registered_pools`. Two predicates could fire here:
+    ///   - VotersDoNotExist (pool unregistered)
+    ///   - DisallowedVoters (SPO not allowed on NewConstitution)
+    ///
+    /// Per Haskell `internVoter`, only `VotersDoNotExist` must fire because
+    /// unknown voters are partitioned out before the authority check runs.
+    #[test]
+    fn test_validate_transaction_voters_do_not_exist_takes_precedence_over_disallowed_voters() {
+        let params = conway_pparams_pv10();
+        let utxo_set = UtxoSet::new();
+
+        let action_id = GovActionId {
+            transaction_id: Hash32::from_bytes([0xAB; 32]),
+            action_index: 0,
+        };
+        let mut votes = BTreeMap::new();
+        votes.insert(action_id.clone(), yes_vote());
+        let mut voting_procedures = BTreeMap::new();
+        // SPO is forbidden on NewConstitution AND unregistered.
+        voting_procedures.insert(spo_voter_for_test(), votes);
+
+        let tx = make_gov_tx(vec![new_constitution_proposal()], voting_procedures);
+
+        // Empty registered_pools — the SPO is not registered.  Per
+        // `is_voter_unknown`'s lenient default, an absent (None) registry is
+        // treated as "voter known", so we MUST pass an empty set explicitly to
+        // exercise the unknown branch.
+        let context = ValidationContext::new().with_pools(HashSet::new());
+        let result =
+            validate_transaction_with_context(&tx, &utxo_set, &params, 100, 500, None, context);
+
+        let errors = result.expect_err("expected VotersDoNotExist predicate to fire");
+
+        // VotersDoNotExist must fire and contain the SPO.
+        let unknown_voters = errors
+            .iter()
+            .find_map(|e| match e {
+                ValidationError::VotersDoNotExist { voters } => Some(voters),
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("VotersDoNotExist not in error set: {errors:?}"));
+        assert!(
+            unknown_voters
+                .iter()
+                .any(|v| matches!(v, Voter::StakePool(_))),
+            "VotersDoNotExist must contain the unregistered SPO, got: {unknown_voters:?}"
+        );
+
+        // DisallowedVoters must NOT fire for this voter — Haskell partitions
+        // unknown voters out before the authority check.  No DisallowedVoters
+        // error should be present at all (the SPO is the only voter).
+        assert!(
+            !errors
+                .iter()
+                .any(|e| matches!(e, ValidationError::DisallowedVoters { .. })),
+            "DisallowedVoters must not fire when the only voter is already \
+             reported under VotersDoNotExist; got: {errors:?}"
+        );
+    }
+
+    /// Test 3: At PV=8 (pre-Conway), the VotersDoNotExist check is gated off,
+    /// so even an unregistered DRep voting must not produce VotersDoNotExist.
+    /// (The era-gating layer surfaces a separate `GovernancePreConway` error
+    /// for the same input, but that's not what we're testing here.)
+    #[test]
+    fn test_validate_transaction_skips_voter_check_when_pv_below_9() {
+        let mut params = ProtocolParameters::mainnet_defaults();
+        params.protocol_version_major = 8;
+        let utxo_set = UtxoSet::new();
+
+        let action_id = GovActionId {
+            transaction_id: Hash32::from_bytes([0xAB; 32]),
+            action_index: 0,
+        };
+        let mut votes = BTreeMap::new();
+        votes.insert(action_id, yes_vote());
+        let mut voting_procedures = BTreeMap::new();
+        voting_procedures.insert(drep_voter_for_test(), votes);
+
+        let tx = make_gov_tx(vec![info_proposal()], voting_procedures);
+
+        let context = ValidationContext::new().with_dreps(HashSet::new());
+        let result =
+            validate_transaction_with_context(&tx, &utxo_set, &params, 100, 500, None, context);
+
+        // The tx will fail Phase-1 (NoInputs, GovernancePreConway, etc.) but
+        // VotersDoNotExist must not fire at PV=8.
+        if let Err(errors) = result {
+            assert!(
+                !errors
+                    .iter()
+                    .any(|e| matches!(e, ValidationError::VotersDoNotExist { .. })),
+                "VotersDoNotExist must not fire pre-Conway; got: {errors:?}"
+            );
+        }
+    }
 }

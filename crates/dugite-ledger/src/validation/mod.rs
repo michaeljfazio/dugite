@@ -116,6 +116,18 @@ pub struct ValidationContext {
     /// `ProposalReturnAccountDoesNotExist`) need the proposal's expiry
     /// epoch and return address, not just the action.
     pub active_proposals: Option<HashMap<GovActionId, ActiveProposal>>,
+    /// Hot credential hashes currently authorised by Constitutional Committee
+    /// members (mirrors Haskell `authorizedHotCommitteeCredentials`).  Keys are
+    /// stored as `credential.to_hash().to_hash32_padded()` for symmetry with the
+    /// other credential-keyed sets in this struct (`registered_dreps`,
+    /// `committee_members`).
+    ///
+    /// When `Some`, the `VotersDoNotExist` predicate (Conway GOV) rejects
+    /// committee-voter votes whose hot credential is not in this set.  When
+    /// `None`, the committee-hot-key membership check is skipped — i.e. a
+    /// committee voter is treated as known.  This mirrors the lenient default
+    /// used by `active_proposals`.
+    pub committee_authorized_hot_keys: Option<HashSet<Hash32>>,
 }
 
 impl ValidationContext {
@@ -188,6 +200,11 @@ impl ValidationContext {
         proposals: HashMap<GovActionId, ActiveProposal>,
     ) -> Self {
         self.active_proposals = Some(proposals);
+        self
+    }
+
+    pub fn with_committee_authorized_hot_keys(mut self, hot_keys: HashSet<Hash32>) -> Self {
+        self.committee_authorized_hot_keys = Some(hot_keys);
         self
     }
 
@@ -431,6 +448,25 @@ pub enum ValidationError {
     DisallowedVoters {
         violations: Vec<(Voter, GovActionId)>,
     },
+    /// Conway GOV rule: one or more voters in the transaction's
+    /// `voting_procedures` are not registered / authorised, and therefore
+    /// cannot vote on any governance action:
+    ///   - `DRepVoter` whose credential is not in `vsDReps`.
+    ///   - `StakePoolVoter` whose pool ID is not in `psStakePools`.
+    ///   - `CommitteeVoter` whose hot credential is not in
+    ///     `authorizedHotCommitteeCredentials`.
+    ///
+    /// This predicate fires **before** [`ValidationError::DisallowedVoters`]
+    /// (Haskell `internVoter` partitions unknown voters out of the voting set
+    /// before the authority matrix is applied), so a single voter is never
+    /// reported under both predicates.
+    ///
+    /// Reference: Haskell `VotersDoNotExist` /
+    /// `internVoter` in `eras/conway/impl/src/Cardano/Ledger/Conway/Rules/Gov.hs`.
+    /// All unknown voters are aggregated into a single predicate failure
+    /// (mirroring Haskell's `NonEmpty` shape).
+    #[error("VotersDoNotExist: {voters:?}")]
+    VotersDoNotExist { voters: Vec<Voter> },
     /// Alonzo UTXOW rule: a redeemer in the witness set has no matching
     /// script purpose (spending input, minting policy, withdrawal, cert, vote).
     ///
@@ -833,24 +869,58 @@ pub fn validate_transaction_with_context(
         context.vote_delegations.as_ref(),
     );
 
-    // Conway GOV `DisallowedVoters` predicate.
+    // Conway GOV `VotersDoNotExist` and `DisallowedVoters` predicates.
     //
-    // For every (voter, gov_action_id) pair in `voting_procedures`, look up the
-    // referenced GovAction and reject the vote if the voter type is not
-    // authorised for that action type (Haskell `checkVotersAreValid` /
-    // `is{Committee,DRep,StakePool}VotingAllowed`).
+    // Both are PV >= 9 only and operate on `tx.body.voting_procedures`.
     //
-    // The GovAction is looked up first against proposals submitted in the same
-    // transaction, then against the optional `active_proposals` map provided by
-    // the caller (typically the on-chain governance state).  Votes that do not
-    // resolve to any known action are ignored here — that's a different
-    // predicate (`GovActionsDoNotExist`) handled elsewhere.
+    // Per Haskell `conwayGovTransition` (`internVoter`), unknown voters are
+    // partitioned out of the voting set BEFORE the authority check runs — i.e.
+    // `VotersDoNotExist` takes precedence over `DisallowedVoters`, and a single
+    // voter is never reported under both.  We implement this by collecting the
+    // unknown voters first into a `HashSet` and skipping them when the
+    // `DisallowedVoters` loop iterates.
     let mut extra_errors: Vec<ValidationError> = Vec::new();
     if params.protocol_version_major >= 9 && !tx.body.voting_procedures.is_empty() {
-        // Build a lookup index of GovActionId -> GovAction:
-        //   1. Proposals submitted in this same tx (their action_id is the
-        //      tx hash + the proposal's index).
-        //   2. Proposals already on-chain (passed via `context.active_proposals`).
+        // -------------------------------------------------------------------
+        // VotersDoNotExist: every voter whose credential / pool ID is not in
+        // the corresponding registry.  Empty `vp_map`s are skipped — Haskell
+        // does the same partition over the keys of the voting-procedures map,
+        // and an empty inner map is unreachable in practice (CBOR decoders
+        // reject it).
+        // -------------------------------------------------------------------
+        let mut unknown_voters: Vec<Voter> = Vec::new();
+        let mut unknown_voter_set: HashSet<Voter> = HashSet::new();
+        for (voter, vp_map) in tx.body.voting_procedures.iter() {
+            if !vp_map.is_empty() && conway::is_voter_unknown(voter, &context) {
+                unknown_voters.push(voter.clone());
+                unknown_voter_set.insert(voter.clone());
+            }
+        }
+        if !unknown_voters.is_empty() {
+            extra_errors.push(ValidationError::VotersDoNotExist {
+                voters: unknown_voters,
+            });
+        }
+
+        // -------------------------------------------------------------------
+        // DisallowedVoters: voter type is not authorised for the action type.
+        //
+        // For every (voter, gov_action_id) pair in `voting_procedures`, look up
+        // the referenced GovAction and reject the vote if the voter type is
+        // not authorised for that action type (Haskell `checkVotersAreValid` /
+        // `is{Committee,DRep,StakePool}VotingAllowed`).
+        //
+        // The GovAction is looked up first against proposals submitted in the
+        // same transaction, then against the optional `active_proposals` map
+        // provided by the caller (typically the on-chain governance state).
+        // Votes that do not resolve to any known action are ignored here —
+        // that's a different predicate (`GovActionsDoNotExist`) handled
+        // elsewhere.
+        //
+        // Voters already in `unknown_voter_set` are skipped so they don't
+        // appear in BOTH `VotersDoNotExist` and `DisallowedVoters` (Haskell
+        // partitions unknowns out before the authority check).
+        // -------------------------------------------------------------------
         let mut local_proposals: HashMap<GovActionId, &GovAction> = HashMap::new();
         for (idx, proposal) in tx.body.proposal_procedures.iter().enumerate() {
             let id = GovActionId {
@@ -864,6 +934,9 @@ pub fn validate_transaction_with_context(
         // mirroring Haskell's NonEmpty predicate-failure shape.
         let mut violations: Vec<(Voter, GovActionId)> = Vec::new();
         for (voter, votes) in &tx.body.voting_procedures {
+            if unknown_voter_set.contains(voter) {
+                continue;
+            }
             for action_id in votes.keys() {
                 let action: Option<&GovAction> =
                     local_proposals.get(action_id).copied().or_else(|| {

@@ -603,6 +603,9 @@ pub(crate) fn convert_validation_error(
         VE::DisallowedVoters { violations } => TxValidationError::ScriptFailed {
             reason: format!("DisallowedVoters: {violations:?}"),
         },
+        VE::VotersDoNotExist { voters } => TxValidationError::ScriptFailed {
+            reason: format!("VotersDoNotExist: {voters:?}"),
+        },
         VE::ExtraRedeemer { tag, index } => TxValidationError::ScriptFailed {
             reason: format!(
                 "Extra redeemer with no matching script purpose: tag={tag}, index={index}"
