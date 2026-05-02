@@ -514,6 +514,36 @@ pub enum ValidationError {
         /// for every proposal whose return-address credential is unregistered.
         bad_addrs: Vec<String>,
     },
+    /// Conway GOV rule: one or more proposal procedures have a return-address
+    /// network id that does not match the node's configured network.
+    ///
+    /// Per Haskell `processProposal` in
+    /// `eras/conway/impl/src/Cardano/Ledger/Conway/Rules/Gov.hs`, every
+    /// proposal procedure's `pProcReturnAddr` must be on the same network as
+    /// the node.  Bit 0 of the reward-account header byte encodes the network
+    /// (`0` = testnet, `1` = mainnet).  Unlike
+    /// [`ValidationError::ProposalReturnAccountDoesNotExist`], this check is
+    /// **always enforced** — there is no Conway-bootstrap skip; the network
+    /// id is a structural property of the proposal payload, not a
+    /// post-bootstrap state lookup.
+    ///
+    /// This predicate is silently skipped if `ValidationContext::node_network`
+    /// is `None` (lenient default for callers that haven't plumbed in the
+    /// node network — same convention used by the other GOV predicates).
+    ///
+    /// Every offending proposal's raw `return_addr` (hex-encoded) and the
+    /// actual mismatched network id (`0` testnet / `1` mainnet) are
+    /// aggregated into a single predicate failure, mirroring Haskell's
+    /// `NonEmpty` predicate-failure shape.
+    #[error("ProposalProcedureNetworkIdMismatch: expected={expected}, mismatched={mismatched:?}")]
+    ProposalProcedureNetworkIdMismatch {
+        /// Expected network id (`0` testnet / `1` mainnet) — the node's
+        /// configured network.
+        expected: u8,
+        /// `(hex-encoded return_addr, actual_network_id)` for every proposal
+        /// whose return-address network does not match `expected`.
+        mismatched: Vec<(String, u8)>,
+    },
     /// Alonzo UTXOW rule: a redeemer in the witness set has no matching
     /// script purpose (spending input, minting policy, withdrawal, cert, vote).
     ///
@@ -1110,6 +1140,48 @@ pub fn validate_transaction_with_context(
         }
         if !bad_addrs.is_empty() {
             extra_errors.push(ValidationError::ProposalReturnAccountDoesNotExist { bad_addrs });
+        }
+    }
+
+    // -------------------------------------------------------------------
+    // ProposalProcedureNetworkIdMismatch: every proposal procedure's
+    // `return_addr` must be on the same network as the node.  Per Haskell
+    // `processProposal` in `Conway.Rules.Gov`, this check is **always
+    // enforced** (no Conway-bootstrap skip — the network id is a
+    // structural property of the proposal, not a post-bootstrap state
+    // lookup).
+    //
+    // Runs only when the transaction submits at least one proposal,
+    // mirroring `processProposal`'s per-proposal invocation.
+    // -------------------------------------------------------------------
+    if params.protocol_version_major >= 9 && !tx.body.proposal_procedures.is_empty() {
+        let mut mismatched: Vec<(String, u8)> = Vec::new();
+        for proposal in &tx.body.proposal_procedures {
+            if let Some(actual_net) =
+                conway::is_proposal_return_addr_wrong_network(proposal, &context)
+            {
+                let addr_hex = proposal.return_addr.iter().fold(
+                    String::with_capacity(proposal.return_addr.len() * 2),
+                    |mut s, b| {
+                        use std::fmt::Write;
+                        let _ = write!(s, "{b:02x}");
+                        s
+                    },
+                );
+                mismatched.push((addr_hex, actual_net));
+            }
+        }
+        if !mismatched.is_empty() {
+            // SAFETY: predicate fired -> ctx.node_network must be Some
+            // (the predicate returns None when node_network is None).
+            let expected = context
+                .node_network
+                .expect("predicate fired implies node_network is Some")
+                .to_u8();
+            extra_errors.push(ValidationError::ProposalProcedureNetworkIdMismatch {
+                expected,
+                mismatched,
+            });
         }
     }
 

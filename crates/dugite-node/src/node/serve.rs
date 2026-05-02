@@ -612,6 +612,14 @@ pub(crate) fn convert_validation_error(
         VE::ProposalReturnAccountDoesNotExist { bad_addrs } => TxValidationError::ScriptFailed {
             reason: format!("ProposalReturnAccountDoesNotExist: {bad_addrs:?}"),
         },
+        VE::ProposalProcedureNetworkIdMismatch {
+            expected,
+            mismatched,
+        } => TxValidationError::ScriptFailed {
+            reason: format!(
+                "ProposalProcedureNetworkIdMismatch: expected={expected}, mismatched={mismatched:?}"
+            ),
+        },
         VE::ExtraRedeemer { tag, index } => TxValidationError::ScriptFailed {
             reason: format!(
                 "Extra redeemer with no matching script purpose: tag={tag}, index={index}"

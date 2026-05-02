@@ -502,6 +502,56 @@ pub(super) fn is_proposal_return_account_unregistered(
     !accounts.contains_key(&key)
 }
 
+/// Returns `Some(actual_network)` when the proposal's `return_addr` network
+/// id does not match `ctx.node_network`, otherwise `None`.
+///
+/// Per Haskell `processProposal` in
+/// `eras/conway/impl/src/Cardano/Ledger/Conway/Rules/Gov.hs`, every
+/// proposal procedure's `pProcReturnAddr` must be on the same network as
+/// the node.  Bit 0 of the reward-account header byte encodes the network
+/// (`0` = testnet, `1` = mainnet) — the same encoding used by
+/// `WrongNetworkWithdrawal` (see `phase1.rs`).
+///
+/// Unlike [`is_proposal_return_account_unregistered`] this predicate is
+/// **always enforced** (there is no Conway-bootstrap skip): the network id
+/// is a structural property of the proposal payload, not a post-bootstrap
+/// state lookup.
+///
+/// The predicate returns `None` (proposal accepted) when:
+///   - `ctx.node_network` is `None` — lenient default, mirroring the
+///     convention used by the other GOV predicates when the caller has
+///     not plumbed in the relevant context.
+///   - `proposal.return_addr` is empty — malformed reward addresses are
+///     caught by a different predicate (decoder); this rule must not
+///     double-fire on shape errors.
+///   - The header network bit matches `ctx.node_network`.
+///
+/// The shape (`Option<u8>` rather than `bool`) is intentional — the
+/// `ProposalProcedureNetworkIdMismatch` error payload aggregates the
+/// **actual** mismatched network values, so the caller needs to surface
+/// them.
+///
+/// Reference: Haskell `ProposalProcedureNetworkIdMismatch` in
+/// `eras/conway/impl/src/Cardano/Ledger/Conway/Rules/Gov.hs`,
+/// inside `processProposal`.  Always enforced (no bootstrap skip).
+pub(super) fn is_proposal_return_addr_wrong_network(
+    proposal: &ProposalProcedure,
+    ctx: &ValidationContext,
+) -> Option<u8> {
+    // Lenient default — skip when the node network isn't plumbed in.
+    let expected_net = ctx.node_network?;
+    // Malformed reward addresses are not this predicate's concern.
+    let header = *proposal.return_addr.first()?;
+    // Bit 0 of the header byte: 0 = testnet, 1 = mainnet (matches the
+    // encoding used by `WrongNetworkWithdrawal` in phase1.rs).
+    let actual = header & 0x01;
+    if actual != expected_net.to_u8() {
+        Some(actual)
+    } else {
+        None
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::{BTreeMap, HashMap, HashSet};
@@ -1691,6 +1741,115 @@ mod tests {
         assert!(
             !is_proposal_return_account_unregistered(&proposal, &params, &ctx),
             "Predicate must skip (return false) when reward_accounts is None"
+        );
+    }
+
+    // ---------------------------------------------------------------------------
+    // is_proposal_return_addr_wrong_network — ProposalProcedureNetworkIdMismatch
+    //                                          (Conway GOV)
+    //
+    // Per Haskell `processProposal`, every proposal procedure's
+    // `pProcReturnAddr` must be on the same network as the node.  Bit 0 of
+    // the reward-account header byte encodes the network (0 = testnet,
+    // 1 = mainnet).  This check is **always enforced** — there is NO
+    // Conway-bootstrap skip (the network id is a structural property, not
+    // a post-bootstrap state lookup).  When `ctx.node_network` is `None`,
+    // the predicate returns `None` (lenient default).
+    // ---------------------------------------------------------------------------
+
+    use dugite_primitives::network::NetworkId;
+
+    /// Build a 29-byte reward address whose header network bit matches
+    /// `network` (0 = testnet, 1 = mainnet).  The high nibble is set to
+    /// `0xe0` (key-credential, stake/reward address) and the low bit is
+    /// flipped accordingly.
+    fn return_addr_29_with_network(network_bit: u8) -> Vec<u8> {
+        // 0xe0 has bit 0 = 0 (testnet); 0xe1 has bit 0 = 1 (mainnet).
+        let header: u8 = 0xe0 | (network_bit & 0x01);
+        let mut bytes = Vec::with_capacity(29);
+        bytes.push(header);
+        bytes.extend_from_slice(&[0x88u8; 28]);
+        bytes
+    }
+
+    fn proposal_with_addr(addr: Vec<u8>) -> ProposalProcedure {
+        ProposalProcedure {
+            deposit: Lovelace(1_000_000_000),
+            return_addr: addr,
+            gov_action: GovAction::InfoAction,
+            anchor: Anchor {
+                url: String::new(),
+                data_hash: Hash32::from_bytes([0u8; 32]),
+            },
+        }
+    }
+
+    #[test]
+    fn test_proposal_return_addr_wrong_network_returns_actual() {
+        // node = mainnet (1), proposal = testnet (0) -> Some(0)
+        let proposal = proposal_with_addr(return_addr_29_with_network(0));
+        let ctx = ValidationContext::new().with_network(NetworkId::Mainnet);
+        assert_eq!(
+            is_proposal_return_addr_wrong_network(&proposal, &ctx),
+            Some(0),
+            "Mismatched network must return the actual mismatched value"
+        );
+    }
+
+    #[test]
+    fn test_proposal_return_addr_correct_network_returns_none() {
+        // node = mainnet (1), proposal = mainnet (1) -> None
+        let proposal = proposal_with_addr(return_addr_29_with_network(1));
+        let ctx = ValidationContext::new().with_network(NetworkId::Mainnet);
+        assert_eq!(
+            is_proposal_return_addr_wrong_network(&proposal, &ctx),
+            None,
+            "Matching network must return None"
+        );
+    }
+
+    #[test]
+    fn test_proposal_return_addr_check_skipped_when_network_id_none() {
+        // ctx.node_network = None -> lenient default (None), regardless of
+        // the proposal's network bit.
+        let proposal = proposal_with_addr(return_addr_29_with_network(0));
+        let ctx = ValidationContext::new();
+        assert!(ctx.node_network.is_none());
+        assert_eq!(
+            is_proposal_return_addr_wrong_network(&proposal, &ctx),
+            None,
+            "Predicate must skip (return None) when node_network is None"
+        );
+    }
+
+    #[test]
+    fn test_proposal_return_addr_network_check_runs_in_bootstrap() {
+        // PV=9 (Conway bootstrap) is irrelevant here — the network-id check
+        // is always enforced.  This test proves the predicate fires for a
+        // mismatch even when the surrounding context represents bootstrap.
+        // Note: this predicate doesn't even take `params` (no PV gating).
+        let proposal = proposal_with_addr(return_addr_29_with_network(0));
+        let ctx = ValidationContext::new().with_network(NetworkId::Mainnet);
+        // The presence of a hypothetical PV=9 ProtocolParameters cannot
+        // suppress the predicate — it has no PV input.
+        assert_eq!(
+            is_proposal_return_addr_wrong_network(&proposal, &ctx),
+            Some(0),
+            "Network-id check must fire even in (hypothetical) bootstrap; \
+             unlike ProposalReturnAccountDoesNotExist, there is no PV=9 skip"
+        );
+    }
+
+    #[test]
+    fn test_proposal_return_addr_empty_addr_returns_none() {
+        // Malformed (empty) return_addr is handled by a different predicate;
+        // this rule must not double-fire on shape errors.
+        let proposal = proposal_with_addr(Vec::new());
+        let ctx = ValidationContext::new().with_network(NetworkId::Mainnet);
+        assert_eq!(
+            is_proposal_return_addr_wrong_network(&proposal, &ctx),
+            None,
+            "Empty return_addr must short-circuit (None)"
         );
     }
 }

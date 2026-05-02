@@ -13253,4 +13253,144 @@ mod tests {
             );
         }
     }
+
+    // -------------------------------------------------------------------------
+    // ProposalProcedureNetworkIdMismatch integration tests for
+    // `validate_transaction_with_context`
+    //
+    // Per Haskell `processProposal` in `Cardano.Ledger.Conway.Rules.Gov`, every
+    // proposal procedure's `pProcReturnAddr` must be on the same network as
+    // the node.  Bit 0 of the reward-account header byte encodes the network
+    // (`0` = testnet, `1` = mainnet).  This check is **always enforced** —
+    // there is NO Conway-bootstrap skip (unlike
+    // `ProposalReturnAccountDoesNotExist`).  The lenient default
+    // (`node_network = None`) skips the check.
+    // -------------------------------------------------------------------------
+
+    /// Build a 29-byte reward address whose header network bit is the given
+    /// value (0 = testnet, 1 = mainnet).  Header high nibble `0xe0` (key
+    /// credential, stake/reward address); low bit flipped accordingly.
+    fn return_addr_29_for_network(network_bit: u8) -> Vec<u8> {
+        let header: u8 = 0xe0 | (network_bit & 0x01);
+        let mut bytes = Vec::with_capacity(29);
+        bytes.push(header);
+        bytes.extend_from_slice(&[0x88u8; 28]);
+        bytes
+    }
+
+    /// A Conway PV=10 transaction submits a proposal whose return_addr
+    /// network does not match the node's configured network.  The
+    /// validator must surface a `ProposalProcedureNetworkIdMismatch` error
+    /// whose `mismatched` payload carries the proposal's hex-encoded
+    /// return_addr and the actual mismatched network value.
+    #[test]
+    fn test_validate_transaction_rejects_proposal_with_wrong_network_return_addr() {
+        let params = conway_pparams_pv10();
+        let utxo_set = UtxoSet::new();
+
+        // Node is mainnet; proposal's return_addr is testnet.
+        let return_addr = return_addr_29_for_network(0);
+        let expected_hex: String = return_addr.iter().fold(String::new(), |mut s, b| {
+            use std::fmt::Write;
+            let _ = write!(s, "{b:02x}");
+            s
+        });
+        let proposal = info_proposal_with_return_addr(return_addr);
+        let tx = make_gov_tx(vec![proposal], BTreeMap::new());
+
+        let context =
+            ValidationContext::new().with_network(dugite_primitives::network::NetworkId::Mainnet);
+        let result =
+            validate_transaction_with_context(&tx, &utxo_set, &params, 100, 500, None, context);
+
+        let errors =
+            result.expect_err("expected ProposalProcedureNetworkIdMismatch predicate to fire");
+        let (expected, mismatched) = errors
+            .iter()
+            .find_map(|e| match e {
+                ValidationError::ProposalProcedureNetworkIdMismatch {
+                    expected,
+                    mismatched,
+                } => Some((*expected, mismatched)),
+                _ => None,
+            })
+            .unwrap_or_else(|| {
+                panic!("ProposalProcedureNetworkIdMismatch not in error set: {errors:?}")
+            });
+        assert_eq!(expected, 1, "node is mainnet -> expected = 1");
+        assert_eq!(
+            mismatched.len(),
+            1,
+            "expected exactly one mismatched return-addr, got: {mismatched:?}"
+        );
+        assert_eq!(
+            mismatched[0].0, expected_hex,
+            "mismatched payload must carry the proposal's hex-encoded return_addr"
+        );
+        assert_eq!(
+            mismatched[0].1, 0,
+            "mismatched payload must carry the actual network bit (0 = testnet)"
+        );
+    }
+
+    /// At PV=9 (Conway bootstrap), the predicate is **still enforced** —
+    /// unlike `ProposalReturnAccountDoesNotExist`, there is no
+    /// bootstrap-phase skip for the network-id check.  This test proves
+    /// the validator surfaces `ProposalProcedureNetworkIdMismatch` even at
+    /// PV=9.
+    #[test]
+    fn test_validate_transaction_rejects_proposal_wrong_network_in_bootstrap() {
+        let mut params = ProtocolParameters::mainnet_defaults();
+        params.protocol_version_major = 9; // Conway bootstrap.
+        let utxo_set = UtxoSet::new();
+
+        // Node is mainnet; proposal is testnet.
+        let proposal = info_proposal_with_return_addr(return_addr_29_for_network(0));
+        let tx = make_gov_tx(vec![proposal], BTreeMap::new());
+
+        let context =
+            ValidationContext::new().with_network(dugite_primitives::network::NetworkId::Mainnet);
+        let result =
+            validate_transaction_with_context(&tx, &utxo_set, &params, 100, 500, None, context);
+
+        let errors = result.expect_err("expected ProposalProcedureNetworkIdMismatch even at PV=9");
+        assert!(
+            errors.iter().any(|e| matches!(
+                e,
+                ValidationError::ProposalProcedureNetworkIdMismatch { .. }
+            )),
+            "ProposalProcedureNetworkIdMismatch MUST fire at PV=9 (no bootstrap skip); \
+             got: {errors:?}"
+        );
+    }
+
+    /// At PV=10 with a return_addr whose network matches the node, the
+    /// predicate must NOT produce `ProposalProcedureNetworkIdMismatch`.
+    /// Other Phase-1 errors (NoInputs etc.) may still be present — we only
+    /// assert this specific predicate is absent.
+    #[test]
+    fn test_validate_transaction_proposal_correct_network_accepted() {
+        let params = conway_pparams_pv10();
+        let utxo_set = UtxoSet::new();
+
+        // Node is mainnet; proposal's return_addr is also mainnet.
+        let proposal = info_proposal_with_return_addr(return_addr_29_for_network(1));
+        let tx = make_gov_tx(vec![proposal], BTreeMap::new());
+
+        let context =
+            ValidationContext::new().with_network(dugite_primitives::network::NetworkId::Mainnet);
+        let result =
+            validate_transaction_with_context(&tx, &utxo_set, &params, 100, 500, None, context);
+
+        if let Err(errors) = result {
+            assert!(
+                !errors.iter().any(|e| matches!(
+                    e,
+                    ValidationError::ProposalProcedureNetworkIdMismatch { .. }
+                )),
+                "ProposalProcedureNetworkIdMismatch must not fire when the return-addr \
+                 network matches the node; got: {errors:?}"
+            );
+        }
+    }
 }
