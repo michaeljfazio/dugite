@@ -653,6 +653,9 @@ pub(crate) fn convert_validation_error(
         VE::PoolMedataHashTooBig { pool, hash_size } => TxValidationError::ScriptFailed {
             reason: format!("PoolMedataHashTooBig: pool={pool}, hash_size={hash_size}"),
         },
+        VE::OutputBootAddrAttrsTooBig { oversized_outputs } => TxValidationError::ScriptFailed {
+            reason: format!("OutputBootAddrAttrsTooBig: {oversized_outputs:?}"),
+        },
     }
 }
 

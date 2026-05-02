@@ -205,6 +205,42 @@ pub(super) fn is_pool_metadata_hash_too_big(metadata_hash_bytes: &[u8], pv_major
 }
 
 // ---------------------------------------------------------------------------
+// Helper: Byron output attribute size cap (Haskell `OutputBootAddrAttrsTooBig`)
+// ---------------------------------------------------------------------------
+
+/// Return the zero-based indices of every output whose address is a
+/// Byron/bootstrap address with serialized attributes exceeding the
+/// 64-byte cap.
+///
+/// Reference: Haskell `validateOutputBootAddrAttrsTooBig` in
+/// `eras/shelley/impl/src/Cardano/Ledger/Shelley/Rules/Utxo.hs`:
+///
+/// ```text
+/// ∀ ( _ ↦ (a,_)) ∈ txoutstxb, a ∈ Addrbootstrap → bootstrapAttrsSize a ≤ 64
+/// ```
+///
+/// Applies to all eras Shelley+. Non-Byron outputs and Byron outputs whose
+/// attribute size cannot be measured (malformed payload) are silently
+/// passed — failing-open keeps this predicate conservative against legacy
+/// fixtures and aligns with the Haskell rule which only fires when the
+/// size is decodable and strictly above the cap.
+pub(super) fn output_boot_addr_attrs_too_big_indices(
+    outputs: &[dugite_primitives::transaction::TransactionOutput],
+) -> Vec<usize> {
+    let mut bad = Vec::new();
+    for (idx, output) in outputs.iter().enumerate() {
+        if let dugite_primitives::address::Address::Byron(byron) = &output.address {
+            if let Some(size) = byron.attributes_byte_size() {
+                if size > 64 {
+                    bad.push(idx);
+                }
+            }
+        }
+    }
+    bad
+}
+
+// ---------------------------------------------------------------------------
 // Witness signature verification (Rule 14)
 // ---------------------------------------------------------------------------
 
@@ -770,6 +806,28 @@ pub(super) fn run_phase1_rules(
                     });
                 }
             }
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // Rule 5a2: Byron-output attribute size <= 64 bytes
+    //          (Haskell `OutputBootAddrAttrsTooBig`, Shelley+)
+    //
+    // Per Haskell `validateOutputBootAddrAttrsTooBig` every output whose
+    // address is a Byron/bootstrap address must encode its attribute map
+    // in 64 bytes or fewer. Non-Byron outputs are not checked. Every
+    // offending output across the transaction aggregates into a single
+    // predicate failure carrying the zero-based output indices.
+    //
+    // Reference: Haskell `OutputBootAddrAttrsTooBig` in
+    // `eras/shelley/impl/src/Cardano/Ledger/Shelley/Rules/Utxo.hs`.
+    // ------------------------------------------------------------------
+    {
+        let oversized = output_boot_addr_attrs_too_big_indices(&body.outputs);
+        if !oversized.is_empty() {
+            errors.push(ValidationError::OutputBootAddrAttrsTooBig {
+                oversized_outputs: oversized,
+            });
         }
     }
 
@@ -1756,6 +1814,136 @@ mod tests {
         // pv_major = 5, exactly 32 bytes → passes.
         let exact = vec![0u8; 32];
         assert!(!super::is_pool_metadata_hash_too_big(&exact, 5));
+    }
+
+    // -----------------------------------------------------------------------
+    // Tests — `OutputBootAddrAttrsTooBig` predicate (Haskell, Shelley+)
+    //
+    // Helper builds Byron addresses with a controllable inner attribute
+    // payload size. Per Haskell `validateOutputBootAddrAttrsTooBig` the
+    // attribute map (`{ key => bytes(payload) }`) must serialize to <= 64
+    // bytes; outputs that exceed the cap are aggregated by their indices
+    // into a single `OutputBootAddrAttrsTooBig` error.
+    // -----------------------------------------------------------------------
+
+    /// Encode a Byron address with a single attribute carrying `attr_payload_len`
+    /// arbitrary bytes — same shape used by the
+    /// `dugite_primitives::address::tests::synth_byron_addr` helper.
+    fn synth_byron_address_bytes(attr_payload_len: usize) -> Vec<u8> {
+        let mut inner = Vec::new();
+        let mut e = minicbor::Encoder::new(&mut inner);
+        e.array(3).unwrap();
+        e.bytes(&[0u8; 28]).unwrap();
+        e.map(1).unwrap();
+        e.u8(1).unwrap();
+        let attr_payload = vec![0xAAu8; attr_payload_len];
+        e.bytes(&attr_payload).unwrap();
+        e.u8(0).unwrap();
+
+        let mut outer = Vec::new();
+        let mut oe = minicbor::Encoder::new(&mut outer);
+        oe.array(2).unwrap();
+        oe.tag(minicbor::data::Tag::new(24)).unwrap();
+        oe.bytes(&inner).unwrap();
+        oe.u32(0).unwrap();
+        outer
+    }
+
+    fn byron_output_with_attr_payload(attr_payload_len: usize) -> TransactionOutput {
+        TransactionOutput {
+            address: dugite_primitives::address::Address::Byron(
+                dugite_primitives::address::ByronAddress {
+                    payload: synth_byron_address_bytes(attr_payload_len),
+                },
+            ),
+            value: Value::lovelace(2_000_000),
+            datum: OutputDatum::None,
+            script_ref: None,
+            is_legacy: false,
+            raw_cbor: None,
+        }
+    }
+
+    #[test]
+    fn test_output_boot_addr_attrs_too_big_rejected() {
+        // 65-byte attribute payload → attrs map = 1 (map header) + 1 (key)
+        //                              + 2 (bytes header for len 65) + 65
+        //                              = 69 bytes > 64 → fires.
+        let outputs = vec![byron_output_with_attr_payload(65)];
+        let bad = super::output_boot_addr_attrs_too_big_indices(&outputs);
+        assert_eq!(bad, vec![0]);
+    }
+
+    #[test]
+    fn test_output_boot_addr_attrs_at_64_bytes_accepted() {
+        // 60-byte payload → 1 + 1 + 2 + 60 = 64 → exactly at cap → accepted.
+        let outputs = vec![byron_output_with_attr_payload(60)];
+        let bad = super::output_boot_addr_attrs_too_big_indices(&outputs);
+        assert!(bad.is_empty(), "expected empty, got {bad:?}");
+    }
+
+    #[test]
+    fn test_output_shelley_addr_not_checked() {
+        // A Shelley enterprise output is not a Byron address → predicate skips it.
+        let shelley_out = TransactionOutput {
+            address: dugite_primitives::address::Address::Enterprise(
+                dugite_primitives::address::EnterpriseAddress {
+                    network: NetworkId::Mainnet,
+                    payment: dugite_primitives::credentials::Credential::VerificationKey(
+                        Hash28::from_bytes([0u8; 28]),
+                    ),
+                },
+            ),
+            value: Value::lovelace(2_000_000),
+            datum: OutputDatum::None,
+            script_ref: None,
+            is_legacy: false,
+            raw_cbor: None,
+        };
+        let outputs = vec![shelley_out];
+        let bad = super::output_boot_addr_attrs_too_big_indices(&outputs);
+        assert!(bad.is_empty());
+    }
+
+    #[test]
+    fn test_output_no_outputs_passes() {
+        let outputs: Vec<TransactionOutput> = vec![];
+        let bad = super::output_boot_addr_attrs_too_big_indices(&outputs);
+        assert!(bad.is_empty());
+    }
+
+    #[test]
+    fn test_output_boot_addr_attrs_too_big_aggregates_indices() {
+        // One good Byron output, one bad → only index 1 reported.
+        let outputs = vec![
+            byron_output_with_attr_payload(10),
+            byron_output_with_attr_payload(100),
+        ];
+        let bad = super::output_boot_addr_attrs_too_big_indices(&outputs);
+        assert_eq!(bad, vec![1]);
+    }
+
+    #[test]
+    fn test_output_boot_addr_attrs_too_big_integration_via_validate_tx() {
+        // Drive the predicate through the full Phase-1 validator: build a
+        // tx whose only output is a Byron address with a 100-byte attr
+        // payload. The error list must contain `OutputBootAddrAttrsTooBig`
+        // with the offending index (0).
+        let (mut utxo_set, mut tx, _) = make_valid_tx();
+        tx.body.outputs[0] = byron_output_with_attr_payload(100);
+        let _ = &mut utxo_set;
+        let params = ProtocolParameters::mainnet_defaults();
+        let errors = validate_transaction(&tx, &utxo_set, &params, 100, 300, None)
+            .err()
+            .unwrap_or_default();
+        let found = errors.iter().any(|e| matches!(
+            e,
+            ValidationError::OutputBootAddrAttrsTooBig { oversized_outputs } if oversized_outputs == &vec![0]
+        ));
+        assert!(
+            found,
+            "expected OutputBootAddrAttrsTooBig with [0], got {errors:?}"
+        );
     }
 
     #[test]

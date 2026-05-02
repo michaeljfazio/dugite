@@ -990,6 +990,26 @@ pub enum ValidationError {
         /// Reported metadata hash size in bytes (> 32).
         hash_size: usize,
     },
+    /// One or more transaction outputs use a Byron/bootstrap address whose
+    /// serialized attributes exceed the 64-byte cap.
+    ///
+    /// Reference: Haskell `OutputBootAddrAttrsTooBig` /
+    /// `validateOutputBootAddrAttrsTooBig` in
+    /// `eras/shelley/impl/src/Cardano/Ledger/Shelley/Rules/Utxo.hs`:
+    ///
+    /// ```text
+    /// ∀ ( _ ↦ (a,_)) ∈ txoutstxb, a ∈ Addrbootstrap → bootstrapAttrsSize a ≤ 64
+    /// ```
+    ///
+    /// Applies to all outputs in all eras Shelley+. Every offending output
+    /// in the transaction aggregates into a single predicate failure with
+    /// its zero-based index, mirroring Haskell's aggregation.
+    #[error("OutputBootAddrAttrsTooBig: {oversized_outputs:?}")]
+    OutputBootAddrAttrsTooBig {
+        /// Zero-based output indices for every Byron/bootstrap output
+        /// whose serialized attributes exceed 64 bytes.
+        oversized_outputs: Vec<usize>,
+    },
 }
 
 // ---------------------------------------------------------------------------
