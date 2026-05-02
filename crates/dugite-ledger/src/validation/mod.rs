@@ -18,6 +18,7 @@ mod conway;
 mod datum;
 pub mod mir;
 mod phase1;
+pub mod ppup;
 mod scripts;
 
 #[cfg(test)]
@@ -170,6 +171,22 @@ pub struct ValidationContext {
     /// callers without `dsIRewards` plumbing must accept this partial
     /// limitation).
     pub accumulated_mir_balances: Option<HashMap<Hash32, i64>>,
+    /// Set of currently registered genesis-delegate keys (`keysSet
+    /// GenDelegs` in Haskell).  Used by the Shelley PPUP predicate
+    /// `NonGenesisUpdatePPUP` to verify that every key in a pre-Conway
+    /// `UpdateProposal.proposed_updates` map is a registered genesis
+    /// delegate.
+    ///
+    /// In Haskell, `GenDelegs` maps `KeyHash 'Genesis -> (KeyHash
+    /// 'GenesisDelegate, Hash VRF)`; here we only need the key set, so we
+    /// store a `HashSet<Hash28>` of the genesis-key hashes.  When `None`,
+    /// the `NonGenesisUpdatePPUP` predicate is silently skipped (lenient
+    /// default — callers without genesis-delegate plumbing have no way to
+    /// distinguish proposed-vs-genesis keys).
+    ///
+    /// Reference: Haskell `NonGenesisUpdatePPUP` in
+    /// `eras/shelley/impl/src/Cardano/Ledger/Shelley/Rules/Ppup.hs`.
+    pub genesis_delegates: Option<HashSet<Hash28>>,
 }
 
 impl ValidationContext {
@@ -269,6 +286,13 @@ impl ValidationContext {
     /// the Alonzo+ MIR `MIRProducesNegativeUpdate` predicate.
     pub fn with_accumulated_mir_balances(mut self, balances: HashMap<Hash32, i64>) -> Self {
         self.accumulated_mir_balances = Some(balances);
+        self
+    }
+
+    /// Set the set of registered genesis-delegate key hashes used by
+    /// the Shelley PPUP `NonGenesisUpdatePPUP` predicate.
+    pub fn with_genesis_delegates(mut self, keys: HashSet<Hash28>) -> Self {
+        self.genesis_delegates = Some(keys);
         self
     }
 
@@ -1191,6 +1215,100 @@ pub enum ValidationError {
         /// Negative transfer amount.
         amount: i64,
     },
+    // ---------------------------------------------------------------------
+    // PPUP (pre-Conway protocol-parameter update) predicate failures.
+    //
+    // Reference: `eras/shelley/impl/src/Cardano/Ledger/Shelley/Rules/Ppup.hs`.
+    //
+    // PPUP is active in Shelley–Babbage (`AtMostEra "Babbage" era`).  Conway
+    // replaces this rule with on-chain governance (CIP-1694).  All three
+    // PPUP predicates short-circuit (no-op) at PV >= 9.
+    // ---------------------------------------------------------------------
+    /// Shelley PPUP rule `NonGenesisUpdatePPUP`: every key in the proposed
+    /// update map must be a registered genesis-delegate key (i.e. a member
+    /// of `keysSet GenDelegs`).
+    ///
+    /// Reference: Haskell `NonGenesisUpdatePPUP` in
+    /// `eras/shelley/impl/src/Cardano/Ledger/Shelley/Rules/Ppup.hs`.
+    /// Active in Shelley–Babbage (`AtMostEra "Babbage" era`); Conway+
+    /// replaces this rule with on-chain governance (CIP-1694).
+    ///
+    /// Skipped silently (lenient default) when
+    /// [`ValidationContext::genesis_delegates`] is `None` — callers that
+    /// haven't plumbed in the genesis-delegate set have no way to tell
+    /// proposed-vs-genesis apart.
+    #[error(
+        "NonGenesisUpdatePPUP: proposed_keys not subset of genesis_delegates \
+         ({proposed:?} ∉ {genesis:?})"
+    )]
+    NonGenesisUpdatePPUP {
+        /// Hex-encoded proposed update keys that are not registered genesis
+        /// delegates.
+        proposed: Vec<String>,
+        /// Hex-encoded set of currently registered genesis delegate keys
+        /// (for diagnostic visibility).
+        genesis: Vec<String>,
+    },
+    /// Shelley PPUP rule `PPUpdateWrongEpoch`: an update proposal targets an
+    /// epoch that is incompatible with the current slot's "voting period".
+    ///
+    /// `tooLate = firstSlotOfNextEpoch - 2 * stabilityWindow`.
+    /// - When `current_slot < tooLate` ([`VotingPeriod::ForThisEpoch`]) the
+    ///   target epoch must equal `current_epoch`.
+    /// - When `current_slot >= tooLate` ([`VotingPeriod::ForNextEpoch`]) the
+    ///   target epoch must equal `current_epoch + 1`.
+    ///
+    /// Reference: Haskell `PPUpdateWrongEpoch` in
+    /// `eras/shelley/impl/src/Cardano/Ledger/Shelley/Rules/Ppup.hs`.
+    ///
+    /// Skipped silently when `epoch_length` or `security_param` are not
+    /// supplied on the context (the predicate cannot fire without them —
+    /// same lenient-default convention as the MIR predicates).
+    #[error("PPUpdateWrongEpoch: current={current}, target={target}, period={period:?}")]
+    PPUpdateWrongEpoch {
+        /// Current epoch (derived from `current_slot`/`epoch_length` if not
+        /// supplied directly).
+        current: u64,
+        /// The proposal's declared target epoch.
+        target: u64,
+        /// Whether the current slot is in the for-this-epoch or
+        /// for-next-epoch voting period.
+        period: VotingPeriod,
+    },
+    /// Shelley PPUP rule `PVCannotFollowPPUP`: the proposed protocol version
+    /// does not validly follow the current one.  Only minor (`(major,
+    /// minor+1)`) and major (`(major+1, 0)`) bumps are allowed; skipping
+    /// versions or regressing is rejected.
+    ///
+    /// Reference: Haskell `PVCannotFollowPPUP` in
+    /// `eras/shelley/impl/src/Cardano/Ledger/Shelley/Rules/Ppup.hs`.
+    #[error("PVCannotFollowPPUP: bad_pv={bad_pv:?}")]
+    PVCannotFollowPPUP {
+        /// `(major, minor)` of the proposed protocol version that fails the
+        /// `pvCanFollow` check.
+        bad_pv: (u32, u32),
+    },
+}
+
+// ---------------------------------------------------------------------------
+// PPUP supporting types
+// ---------------------------------------------------------------------------
+
+/// Voting period for a pre-Conway protocol-parameter update proposal.
+///
+/// Mirrors Haskell's `VotingPeriod` in
+/// `eras/shelley/impl/src/Cardano/Ledger/Shelley/Rules/Ppup.hs`:
+///
+/// - [`VotingPeriod::ForThisEpoch`] — `current_slot < tooLate`; the
+///   proposal's target must equal the current epoch.
+/// - [`VotingPeriod::ForNextEpoch`] — `current_slot >= tooLate`; the
+///   proposal's target must equal the next epoch.
+///
+/// Where `tooLate = firstSlotOfNextEpoch - 2 * stabilityWindow`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VotingPeriod {
+    ForThisEpoch,
+    ForNextEpoch,
 }
 
 // ---------------------------------------------------------------------------
@@ -1659,6 +1777,24 @@ pub fn validate_transaction_with_context(
             if let Err(errs) = mir::validate_mir_cert(cert, params, current_slot, &context) {
                 extra_errors.extend(errs);
             }
+        }
+    }
+
+    // -------------------------------------------------------------------
+    // PPUP — pre-Conway protocol-parameter update proposal.
+    //
+    // Active in Shelley–Babbage (`AtMostEra "Babbage" era`); Conway
+    // replaces this rule with on-chain governance.  The entry point is a
+    // no-op at PV >= 9 so the wiring layer also short-circuits to avoid
+    // touching `tx.body.update` at all in the Conway-only path.
+    //
+    // Reference: `eras/shelley/impl/src/Cardano/Ledger/Shelley/Rules/Ppup.hs`.
+    // -------------------------------------------------------------------
+    if params.protocol_version_major < 9 {
+        if let Err(errs) =
+            ppup::validate_ppup(tx.body.update.as_ref(), params, current_slot, &context)
+        {
+            extra_errors.extend(errs);
         }
     }
 

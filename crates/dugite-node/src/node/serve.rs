@@ -695,6 +695,24 @@ pub(crate) fn convert_validation_error(
         VE::MIRNegativeTransfer { pot, amount } => TxValidationError::ScriptFailed {
             reason: format!("MIRNegativeTransfer: pot={pot:?}, amount={amount}"),
         },
+        VE::NonGenesisUpdatePPUP { proposed, genesis } => TxValidationError::ScriptFailed {
+            reason: format!(
+                "NonGenesisUpdatePPUP: proposed_keys not subset of genesis_delegates \
+                 ({proposed:?} ∉ {genesis:?})"
+            ),
+        },
+        VE::PPUpdateWrongEpoch {
+            current,
+            target,
+            period,
+        } => TxValidationError::ScriptFailed {
+            reason: format!(
+                "PPUpdateWrongEpoch: current={current}, target={target}, period={period:?}"
+            ),
+        },
+        VE::PVCannotFollowPPUP { bad_pv } => TxValidationError::ScriptFailed {
+            reason: format!("PVCannotFollowPPUP: bad_pv={bad_pv:?}"),
+        },
     }
 }
 
