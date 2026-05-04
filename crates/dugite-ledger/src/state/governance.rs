@@ -2190,27 +2190,41 @@ pub(crate) fn enact_gov_action_impl(
             );
         }
         GovAction::TreasuryWithdrawals { withdrawals, .. } => {
-            let total: u64 = withdrawals
-                .values()
-                .fold(0u64, |acc, a| acc.saturating_add(a.0));
-            if total > epochs.treasury.0 {
-                warn!(
-                    "Treasury withdrawal exceeds balance: requested {} but only {} available",
-                    total, epochs.treasury.0
-                );
-            }
-            epochs.treasury.0 = epochs.treasury.0.saturating_sub(total);
+            // Match Haskell `applyEnactedWithdrawals` (Conway/Rules/Epoch.hs):
+            // withdrawals to unregistered reward accounts are silently dropped —
+            // the lovelace remains in the treasury. Only the successfully
+            // disbursed total is deducted, and only registered accounts are
+            // credited. Do NOT silently register the account here; doing so
+            // would also cause the proposal-deposit refund check below to
+            // spuriously match a return_addr equal to a withdrawal_addr.
+            let mut disbursed: u64 = 0;
             for (reward_addr, amount) in withdrawals {
-                if amount.0 > 0 && reward_addr.len() >= 29 {
-                    let key = LedgerState::reward_account_to_hash(reward_addr);
+                if amount.0 == 0 || reward_addr.len() < 29 {
+                    continue;
+                }
+                let key = LedgerState::reward_account_to_hash(reward_addr);
+                if certs.reward_accounts.contains_key(&key) {
                     *Arc::make_mut(&mut certs.reward_accounts)
                         .entry(key)
                         .or_insert(Lovelace(0)) += *amount;
+                    disbursed = disbursed.saturating_add(amount.0);
+                } else {
+                    debug!(
+                        "Treasury withdrawal to unregistered reward account dropped: {} lovelace",
+                        amount.0
+                    );
                 }
             }
+            if disbursed > epochs.treasury.0 {
+                warn!(
+                    "Treasury withdrawal exceeds balance: disbursed {} but only {} available",
+                    disbursed, epochs.treasury.0
+                );
+            }
+            epochs.treasury.0 = epochs.treasury.0.saturating_sub(disbursed);
             debug!(
-                "Governance   treasury withdrawal: {} lovelace to {} accounts",
-                total,
+                "Governance   treasury withdrawal: {} lovelace disbursed to {} accounts",
+                disbursed,
                 withdrawals.len()
             );
         }
@@ -4950,6 +4964,12 @@ mod tests {
         let mut state = gov_test_state(10, 10);
         state.epochs.treasury = Lovelace(10_000_000_000);
 
+        // Register the withdrawal target so the disbursement actually credits.
+        // Per Haskell `applyEnactedWithdrawals`, withdrawals to unregistered
+        // reward accounts are silently dropped.
+        let withdrawal_key = LedgerState::reward_account_to_hash(&[0u8; 29]);
+        Arc::make_mut(&mut state.certs.reward_accounts).insert(withdrawal_key, Lovelace(0));
+
         let mut withdrawals = BTreeMap::new();
         withdrawals.insert(vec![0u8; 29], Lovelace(5_000_000_000));
 
@@ -5035,6 +5055,17 @@ mod tests {
         // treasury balance.
         let mut state = gov_test_state(10, 0);
         state.epochs.treasury = Lovelace(600_000_000); // 600M
+
+        // Pre-register withdrawal/refund addresses so the disbursements and
+        // deposit refunds actually credit reward_accounts (otherwise both
+        // are silently dropped/forfeited per Haskell `applyEnactedWithdrawals`
+        // and `returnProposalDeposits`).
+        for addr_byte in 0u8..2 {
+            let mut addr = vec![0u8; 29];
+            addr[0] = addr_byte;
+            let key = LedgerState::reward_account_to_hash(&addr);
+            Arc::make_mut(&mut state.certs.reward_accounts).insert(key, Lovelace(0));
+        }
 
         // Two withdrawal proposals: 400M each (total 800M > 600M treasury)
         for proposal_idx in 0u8..2 {
@@ -5561,6 +5592,15 @@ mod tests {
         let mut state = gov_test_state(5, 0);
         state.epochs.treasury = Lovelace(10_000_000_000);
 
+        // Both withdrawal addresses must already be registered in the
+        // reward map for the disbursement to count — matches Haskell
+        // `applyEnactedWithdrawals`, which silently drops unregistered
+        // entries (the lovelace remains in the treasury).
+        let key_a = LedgerState::reward_account_to_hash(&[0u8; 29]);
+        let key_b = LedgerState::reward_account_to_hash(&[1u8; 29]);
+        Arc::make_mut(&mut state.certs.reward_accounts).insert(key_a, Lovelace(0));
+        Arc::make_mut(&mut state.certs.reward_accounts).insert(key_b, Lovelace(0));
+
         let mut withdrawals = BTreeMap::new();
         withdrawals.insert(vec![0u8; 29], Lovelace(3_000_000_000));
         withdrawals.insert(vec![1u8; 29], Lovelace(2_000_000_000));
@@ -5571,6 +5611,47 @@ mod tests {
         });
 
         assert_eq!(state.epochs.treasury, Lovelace(5_000_000_000));
+        assert_eq!(
+            state.certs.reward_accounts.get(&key_a),
+            Some(&Lovelace(3_000_000_000))
+        );
+        assert_eq!(
+            state.certs.reward_accounts.get(&key_b),
+            Some(&Lovelace(2_000_000_000))
+        );
+    }
+
+    /// Regression: withdrawals to UNREGISTERED reward accounts must be
+    /// silently dropped (lovelace stays in treasury). Previously the
+    /// implementation used `.entry().or_insert()`, which silently created
+    /// the account, both crediting unregistered addresses AND causing the
+    /// proposal-deposit refund check below to spuriously match a
+    /// `return_addr` equal to a `withdrawal_addr`.
+    #[test]
+    fn test_enact_treasury_withdrawal_to_unregistered_is_dropped() {
+        let mut state = gov_test_state(5, 0);
+        state.epochs.treasury = Lovelace(10_000_000_000);
+
+        let registered_key = LedgerState::reward_account_to_hash(&[2u8; 29]);
+        Arc::make_mut(&mut state.certs.reward_accounts).insert(registered_key, Lovelace(0));
+
+        let mut withdrawals = BTreeMap::new();
+        // Registered: should be credited, treasury debited.
+        withdrawals.insert(vec![2u8; 29], Lovelace(1_000_000_000));
+        // Not registered: should be silently dropped, treasury unchanged.
+        withdrawals.insert(vec![9u8; 29], Lovelace(4_000_000_000));
+
+        state.enact_gov_action(&GovAction::TreasuryWithdrawals {
+            withdrawals,
+            policy_hash: None,
+        });
+
+        assert_eq!(state.epochs.treasury, Lovelace(9_000_000_000));
+        let dropped_key = LedgerState::reward_account_to_hash(&[9u8; 29]);
+        assert!(
+            !state.certs.reward_accounts.contains_key(&dropped_key),
+            "unregistered withdrawal address must NOT be silently created"
+        );
     }
 
     #[test]
@@ -6916,6 +6997,10 @@ mod tests {
         let mut state = gov_test_state(10, 10); // 10 SPOs registered but won't vote
         state.epochs.treasury = Lovelace(10_000_000_000);
 
+        // Register the withdrawal target so the disbursement actually credits.
+        let withdrawal_key = LedgerState::reward_account_to_hash(&[0u8; 29]);
+        Arc::make_mut(&mut state.certs.reward_accounts).insert(withdrawal_key, Lovelace(0));
+
         let mut withdrawals = BTreeMap::new();
         withdrawals.insert(vec![0u8; 29], Lovelace(1_000_000_000));
 
@@ -7431,6 +7516,12 @@ mod tests {
         // Length = 29 bytes, satisfies the `reward_addr.len() >= 29` gate in enact_gov_action_impl.
         let mut script_reward_addr = vec![0xF1u8]; // mainnet script reward addr header
         script_reward_addr.extend_from_slice(&[0xABu8; 28]);
+
+        // Pre-register the script reward address so the withdrawal disbursement
+        // and deposit refund both credit it (per Haskell, unregistered targets
+        // are silently dropped / forfeited to treasury).
+        let script_key = LedgerState::reward_account_to_hash(&script_reward_addr);
+        Arc::make_mut(&mut state.certs.reward_accounts).insert(script_key, Lovelace(0));
 
         let withdrawal_amount = Lovelace(1_000_000_000);
         let mut withdrawals = BTreeMap::new();
