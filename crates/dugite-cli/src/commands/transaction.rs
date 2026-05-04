@@ -5403,4 +5403,106 @@ mod tests {
         assert!(with_both > with_datum, "both should exceed datum-only");
         assert!(with_both > with_script, "both should exceed script-only");
     }
+
+    // ── parse_indexed_arg: additional edge cases ─────────────────────────────
+
+    #[test]
+    fn test_parse_indexed_arg_no_prefix_returns_zero() {
+        // A value with no colon prefix defaults to index 0
+        let (idx, val) = parse_indexed_arg("some_value").unwrap();
+        assert_eq!(idx, 0);
+        assert_eq!(val, "some_value");
+    }
+
+    #[test]
+    fn test_parse_indexed_arg_json_colon_not_index() {
+        // JSON values with non-integer colon prefix must default to index 0
+        let (idx, val) = parse_indexed_arg("{\"int\":42}").unwrap();
+        assert_eq!(idx, 0);
+        assert_eq!(val, "{\"int\":42}");
+    }
+
+    // ── parse_execution_units: edge cases not yet covered ────────────────────
+
+    #[test]
+    fn test_parse_execution_units_zero_values() {
+        let eu = parse_execution_units("0,0").unwrap();
+        assert_eq!(eu.mem, 0);
+        assert_eq!(eu.steps, 0);
+    }
+
+    #[test]
+    fn test_parse_execution_units_empty_steps() {
+        // Trailing comma with empty steps must fail
+        assert!(parse_execution_units("1000000,").is_err());
+    }
+
+    // ── encode_plutus_data_to_cbor: constructor tags not yet covered ──────────
+
+    #[test]
+    fn test_encode_plutus_data_constr_tag6() {
+        // Constructor 6: CBOR tag 127 (= 121 + 6)
+        let cbor = encode_plutus_data_to_cbor(&PlutusData::Constr(6, vec![]));
+        let mut dec = minicbor::Decoder::new(&cbor);
+        let tag = dec.tag().unwrap();
+        assert_eq!(tag.as_u64(), 127);
+    }
+
+    #[test]
+    fn test_encode_plutus_data_constr_general_form() {
+        // Constructor >= 128: CBOR tag 102, then array(2)[constructor, fields_array]
+        let cbor = encode_plutus_data_to_cbor(&PlutusData::Constr(200, vec![]));
+        let mut dec = minicbor::Decoder::new(&cbor);
+        let tag = dec.tag().unwrap();
+        assert_eq!(tag.as_u64(), 102);
+        assert_eq!(dec.array().unwrap(), Some(2));
+        assert_eq!(dec.u64().unwrap(), 200);
+        assert_eq!(dec.array().unwrap(), Some(0)); // empty fields array
+    }
+
+    // ── cbor_unwrap_bytes: tagged bytestring ─────────────────────────────────
+
+    #[test]
+    fn test_cbor_unwrap_bytes_tagged_bytestring() {
+        // tag(24) + bytestring — cbor_unwrap_bytes should strip the tag
+        let mut buf = Vec::new();
+        let mut enc = minicbor::Encoder::new(&mut buf);
+        enc.tag(minicbor::data::Tag::new(24)).unwrap();
+        enc.bytes(&[0x01, 0x02]).unwrap();
+        let result = cbor_unwrap_bytes(&buf).unwrap();
+        assert_eq!(result, vec![0x01, 0x02]);
+    }
+
+    // ── parse_tx_input: boundary cases ──────────────────────────────────────
+
+    #[test]
+    fn test_parse_tx_input_max_index() {
+        let hash_hex = "ab".repeat(32);
+        let input = format!("{hash_hex}#4294967295"); // u32::MAX
+        let (_, index) = parse_tx_input(&input).unwrap();
+        assert_eq!(index, u32::MAX);
+    }
+
+    #[test]
+    fn test_parse_tx_input_wrong_hash_length() {
+        // 31 bytes (62 hex chars) must be rejected
+        let short_hash = "ab".repeat(31);
+        assert!(parse_tx_input(&format!("{short_hash}#0")).is_err());
+    }
+
+    #[test]
+    fn test_parse_tx_input_non_hex_hash() {
+        let non_hex = "zz".repeat(32);
+        assert!(parse_tx_input(&format!("{non_hex}#0")).is_err());
+    }
+
+    // ── parse_tx_output: policy length validation ─────────────────────────────
+
+    #[test]
+    fn test_parse_tx_output_short_policy_rejected() {
+        // Policy ID must be exactly 56 hex chars (28 bytes)
+        let short_policy = "aabb"; // only 4 chars
+        let s = format!("addr_test1abc+5000000+\"{short_policy}.deadbeef 100\"");
+        assert!(parse_tx_output(&s).is_err());
+    }
 }
