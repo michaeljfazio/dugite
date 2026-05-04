@@ -19,6 +19,7 @@ Dugite is organized as a 14-crate Cargo workspace. Each crate has a focused resp
 | `dugite-cli` | cardano-cli compatible CLI (38+ subcommands) |
 | `dugite-monitor` | Terminal monitoring dashboard (ratatui-based, real-time metrics via Prometheus polling) |
 | `dugite-config` | Interactive TUI configuration editor with tree navigation, inline editing, type validation, and diff view |
+| `dugite-integration-tests` | End-to-end integration tests across the workspace |
 
 ## Crate Dependency Graph
 
