@@ -2899,4 +2899,143 @@ mod tests {
         assert_eq!(info.pool_stake, 5_000_000_000);
         assert_eq!(info.total_active_stake, 100_000_000_000);
     }
+
+    // ── is_leap_year ─────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_is_leap_year_divisible_by_4() {
+        // Divisible by 4, not by 100 → leap
+        assert!(is_leap_year(2024));
+        assert!(is_leap_year(2000)); // divisible by 400 → leap
+        assert!(!is_leap_year(1900)); // divisible by 100 but not 400 → not leap
+        assert!(!is_leap_year(2023));
+        assert!(!is_leap_year(1970));
+        assert!(is_leap_year(1600)); // divisible by 400 → leap
+    }
+
+    // ── f64_to_rational_approx ───────────────────────────────────────────────
+
+    #[test]
+    fn test_f64_to_rational_0_05() {
+        let (num, den) = f64_to_rational_approx(0.05);
+        assert_eq!((num, den), (1, 20));
+    }
+
+    #[test]
+    fn test_f64_to_rational_0_5() {
+        let (num, den) = f64_to_rational_approx(0.5);
+        assert_eq!((num, den), (1, 2));
+    }
+
+    #[test]
+    fn test_f64_to_rational_1_0() {
+        let (num, den) = f64_to_rational_approx(1.0);
+        assert_eq!((num, den), (1, 1));
+    }
+
+    #[test]
+    fn test_f64_to_rational_lowest_terms() {
+        // Any result must be in lowest terms (gcd = 1)
+        for v in [0.25f64, 0.1, 0.2, 0.04, 0.05, 0.5] {
+            let (num, den) = f64_to_rational_approx(v);
+            assert_eq!(
+                gcd_u64(num, den),
+                1,
+                "{v} → ({num},{den}) is not lowest terms"
+            );
+        }
+    }
+
+    // ── slot_to_utc (additional coverage) ────────────────────────────────────
+
+    #[test]
+    fn test_slot_to_utc_epoch_boundary() {
+        // Slot 0 at Unix epoch → "1970-01-01T00:00:00Z"
+        assert_eq!(slot_to_utc(0, 0, 1), "1970-01-01T00:00:00Z");
+    }
+
+    #[test]
+    fn test_slot_to_utc_leap_year_day() {
+        // Verify Feb 29 2024 renders correctly.
+        // 2024-02-29T00:00:00Z Unix = 1709164800 (precomputed)
+        let ts = 1_709_164_800u64;
+        let result = slot_to_utc(0, ts, 1);
+        assert_eq!(result, "2024-02-29T00:00:00Z");
+    }
+
+    #[test]
+    fn test_slot_to_utc_time_components() {
+        // system_start=0, slot_length=1, slot=3661 → 1h 1m 1s → 01:01:01
+        let result = slot_to_utc(3661, 0, 1);
+        assert!(result.contains("01:01:01"), "got: {result}");
+    }
+
+    // ── parse_iso8601_to_unix extra coverage ──────────────────────────────────
+
+    #[test]
+    fn test_parse_iso8601_no_z_suffix() {
+        // Without Z: the parser strips trailing 'Z' so this should still work
+        let ts = parse_iso8601_to_unix("2022-11-24T00:00:00");
+        assert!(ts.is_some());
+        assert_eq!(ts.unwrap(), 1669248000);
+    }
+
+    #[test]
+    fn test_parse_iso8601_wrong_date_format() {
+        // No 'T' separator → no time component → None
+        assert!(parse_iso8601_to_unix("2022-11-24 00:00:00Z").is_none());
+        // Totally garbled
+        assert!(parse_iso8601_to_unix("not-a-date").is_none());
+    }
+
+    // ── decode_map_entries ────────────────────────────────────────────────────
+
+    #[test]
+    fn test_decode_map_entries_definite() {
+        // Build a definite-length CBOR map: {1: 10, 2: 20}
+        let mut buf = Vec::new();
+        let mut enc = minicbor::Encoder::new(&mut buf);
+        enc.map(2).unwrap();
+        enc.u32(1).unwrap();
+        enc.u64(10).unwrap();
+        enc.u32(2).unwrap();
+        enc.u64(20).unwrap();
+
+        let mut dec = minicbor::Decoder::new(&buf);
+        let mut keys = Vec::new();
+        let mut vals = Vec::new();
+        decode_map_entries(&mut dec, |d| {
+            keys.push(d.u32().unwrap());
+            vals.push(d.u64().unwrap());
+            Ok(())
+        })
+        .unwrap();
+
+        assert_eq!(keys, vec![1, 2]);
+        assert_eq!(vals, vec![10, 20]);
+    }
+
+    #[test]
+    fn test_decode_map_entries_empty() {
+        // Empty map: map(0) = 0xa0
+        let buf = [0xa0u8];
+        let mut dec = minicbor::Decoder::new(&buf);
+        let mut count = 0usize;
+        decode_map_entries(&mut dec, |_d| {
+            count += 1;
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(count, 0);
+    }
+
+    // ── era_name additional coverage ─────────────────────────────────────────
+
+    #[test]
+    fn test_era_name_unknown_values() {
+        // Any value >= 7 must return "Unknown"
+        for era in [7u32, 8, 100, u32::MAX] {
+            assert_eq!(era_name(era), "Unknown", "era {era} should be Unknown");
+        }
+    }
 }

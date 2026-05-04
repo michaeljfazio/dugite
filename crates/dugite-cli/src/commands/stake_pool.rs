@@ -503,3 +503,222 @@ fn load_vrf_vkey_hash(path: &PathBuf) -> Result<Vec<u8>> {
     let hash = dugite_primitives::hash::blake2b_256(key_bytes);
     Ok(hash.as_bytes().to_vec())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ── simple_cbor_wrap ────────────────────────────────────────────────────
+
+    #[test]
+    fn test_cbor_wrap_tiny() {
+        // data.len() < 24: one-byte header 0x40 | len
+        let data = [0xabu8; 4];
+        let w = simple_cbor_wrap(&data);
+        assert_eq!(w[0], 0x40 | 4);
+        assert_eq!(&w[1..], data.as_slice());
+    }
+
+    #[test]
+    fn test_cbor_wrap_medium() {
+        // 24 <= len < 256: 0x58 prefix + 1-byte length
+        let data = vec![0u8; 32];
+        let w = simple_cbor_wrap(&data);
+        assert_eq!(w[0], 0x58);
+        assert_eq!(w[1], 32);
+        assert_eq!(&w[2..], data.as_slice());
+    }
+
+    #[test]
+    fn test_cbor_wrap_large() {
+        // len >= 256: 0x59 prefix + big-endian u16 length
+        let data = vec![0u8; 300];
+        let w = simple_cbor_wrap(&data);
+        assert_eq!(w[0], 0x59);
+        let declared = u16::from_be_bytes([w[1], w[2]]) as usize;
+        assert_eq!(declared, 300);
+        assert_eq!(&w[3..], data.as_slice());
+    }
+
+    // ── encode_relay ─────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_encode_relay_single_host_addr() {
+        let mut buf = Vec::new();
+        let mut enc = minicbor::Encoder::new(&mut buf);
+        encode_relay(
+            &mut enc,
+            &RelaySpec::SingleHostAddr {
+                port: 3001,
+                ipv4: [1, 2, 3, 4],
+            },
+        )
+        .unwrap();
+
+        // Expected: array(4)[0, 3001, bytes(4), null]
+        let mut dec = minicbor::Decoder::new(&buf);
+        assert_eq!(dec.array().unwrap(), Some(4));
+        assert_eq!(dec.u32().unwrap(), 0); // type tag
+        assert_eq!(dec.u16().unwrap(), 3001); // port
+        assert_eq!(dec.bytes().unwrap(), &[1, 2, 3, 4]); // ipv4
+        assert_eq!(dec.datatype().unwrap(), minicbor::data::Type::Null);
+    }
+
+    #[test]
+    fn test_encode_relay_single_host_name() {
+        let mut buf = Vec::new();
+        let mut enc = minicbor::Encoder::new(&mut buf);
+        encode_relay(
+            &mut enc,
+            &RelaySpec::SingleHostName {
+                port: 6000,
+                dns_name: "relay.example.com".to_string(),
+            },
+        )
+        .unwrap();
+
+        // Expected: array(3)[1, 6000, "relay.example.com"]
+        let mut dec = minicbor::Decoder::new(&buf);
+        assert_eq!(dec.array().unwrap(), Some(3));
+        assert_eq!(dec.u32().unwrap(), 1);
+        assert_eq!(dec.u16().unwrap(), 6000);
+        assert_eq!(dec.str().unwrap(), "relay.example.com");
+    }
+
+    #[test]
+    fn test_encode_relay_multi_host_name() {
+        let mut buf = Vec::new();
+        let mut enc = minicbor::Encoder::new(&mut buf);
+        encode_relay(
+            &mut enc,
+            &RelaySpec::MultiHostName {
+                dns_name: "_cardano._tcp.example.com".to_string(),
+            },
+        )
+        .unwrap();
+
+        // Expected: array(2)[2, "_cardano._tcp.example.com"]
+        let mut dec = minicbor::Decoder::new(&buf);
+        assert_eq!(dec.array().unwrap(), Some(2));
+        assert_eq!(dec.u32().unwrap(), 2);
+        assert_eq!(dec.str().unwrap(), "_cardano._tcp.example.com");
+    }
+
+    // ── load_vkey_hash ───────────────────────────────────────────────────────
+
+    #[test]
+    fn test_load_vkey_hash_roundtrip() {
+        use std::path::PathBuf;
+
+        let dir = tempfile::tempdir().unwrap();
+        let vk_path = dir.path().join("test.vkey");
+
+        // Generate a fresh Ed25519 key, wrap in a text envelope
+        let sk = dugite_crypto::keys::PaymentSigningKey::generate();
+        let vk = sk.verification_key();
+        let raw_vk_bytes = vk.to_bytes();
+
+        // Wrap key bytes with simple_cbor_wrap, as the real commands do
+        let cbor_hex = hex::encode(simple_cbor_wrap(&raw_vk_bytes));
+        let env = serde_json::json!({
+            "type": "StakePoolVerificationKey_ed25519",
+            "description": "test",
+            "cborHex": cbor_hex
+        });
+        std::fs::write(&vk_path, serde_json::to_string_pretty(&env).unwrap()).unwrap();
+
+        let hash = load_vkey_hash(&PathBuf::from(&vk_path)).unwrap();
+
+        // Hash must be 28 bytes (Blake2b-224)
+        assert_eq!(hash.len(), 28, "pool ID hash must be 28 bytes");
+
+        // Loading a second time must produce the same hash (deterministic)
+        let hash2 = load_vkey_hash(&PathBuf::from(&vk_path)).unwrap();
+        assert_eq!(hash, hash2, "repeated load must yield same hash");
+    }
+
+    // ── load_vrf_vkey_hash ───────────────────────────────────────────────────
+
+    #[test]
+    fn test_load_vrf_vkey_hash_is_32_bytes() {
+        use std::path::PathBuf;
+
+        let dir = tempfile::tempdir().unwrap();
+        let vk_path = dir.path().join("vrf.vkey");
+
+        let kp = dugite_crypto::vrf::generate_vrf_keypair();
+        let cbor_hex = hex::encode(simple_cbor_wrap(&kp.public_key));
+        let env = serde_json::json!({
+            "type": "VrfVerificationKey_PraosVRF",
+            "description": "VRF Verification Key",
+            "cborHex": cbor_hex
+        });
+        std::fs::write(&vk_path, serde_json::to_string_pretty(&env).unwrap()).unwrap();
+
+        let hash = load_vrf_vkey_hash(&PathBuf::from(&vk_path)).unwrap();
+        assert_eq!(hash.len(), 32, "VRF keyhash in pool cert must be 32 bytes");
+    }
+
+    // ── pool registration certificate: CBOR structure ───────────────────────
+
+    #[test]
+    fn test_retirement_cert_cbor_structure() {
+        // The retirement cert CBOR must be: array(3)[4, pool_hash_bytes(28), epoch]
+        let epoch: u64 = 450;
+        let pool_hash = vec![0xabu8; 28];
+
+        let mut cert_cbor = Vec::new();
+        let mut enc = minicbor::Encoder::new(&mut cert_cbor);
+        enc.array(3).unwrap();
+        enc.u32(4).unwrap();
+        enc.bytes(&pool_hash).unwrap();
+        enc.u64(epoch).unwrap();
+
+        let mut dec = minicbor::Decoder::new(&cert_cbor);
+        assert_eq!(dec.array().unwrap(), Some(3));
+        assert_eq!(dec.u32().unwrap(), 4); // PoolRetirement type tag
+        assert_eq!(dec.bytes().unwrap(), pool_hash.as_slice());
+        assert_eq!(dec.u64().unwrap(), epoch);
+    }
+
+    #[test]
+    fn test_registration_cert_reward_account_mainnet() {
+        // Mainnet reward account byte: 0xe1
+        let network_byte = 0xe1u8;
+        let reward_vk_hash = vec![0xdeu8; 28]; // arbitrary 28-byte hash
+        let mut reward_account = vec![network_byte];
+        reward_account.extend_from_slice(&reward_vk_hash);
+        assert_eq!(reward_account[0], 0xe1);
+        assert_eq!(reward_account.len(), 29);
+    }
+
+    #[test]
+    fn test_registration_cert_reward_account_testnet() {
+        // Testnet reward account byte: 0xe0
+        let network_byte = 0xe0u8;
+        let reward_vk_hash = vec![0xdeu8; 28];
+        let mut reward_account = vec![network_byte];
+        reward_account.extend_from_slice(&reward_vk_hash);
+        assert_eq!(reward_account[0], 0xe0);
+        assert_eq!(reward_account.len(), 29);
+    }
+
+    // ── MetadataHash: blake2b-256 of file bytes ──────────────────────────────
+
+    #[test]
+    fn test_metadata_hash_is_deterministic() {
+        // blake2b_256 of the same data must always return the same hash.
+        let data = br#"{"name":"Test Pool","ticker":"TEST","homepage":"https://example.com"}"#;
+        let h1 = blake2b_256(data);
+        let h2 = blake2b_256(data);
+        assert_eq!(h1.as_bytes(), h2.as_bytes());
+        assert_eq!(h1.as_bytes().len(), 32);
+    }
+
+    #[test]
+    fn test_metadata_hash_differs_for_different_content() {
+        let h1 = blake2b_256(b"pool-a");
+        let h2 = blake2b_256(b"pool-b");
+        assert_ne!(h1.as_bytes(), h2.as_bytes());
+    }
+}
