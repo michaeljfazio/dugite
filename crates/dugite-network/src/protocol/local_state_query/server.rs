@@ -471,4 +471,357 @@ mod tests {
         ingress_tx.send(Bytes::from(encode_done())).await.unwrap();
         handle.await.unwrap().unwrap();
     }
+
+    /// Verify that MsgDone in StIdle (before acquire) causes a clean exit.
+    #[tokio::test]
+    async fn msg_done_before_acquire_exits_cleanly() {
+        let (mut channel, _egress_rx, ingress_tx) = make_test_channel();
+        let handler = MockQueryHandler;
+
+        let handle =
+            tokio::spawn(
+                async move { LocalStateQueryServer::run(&mut channel, &handler, 16).await },
+            );
+
+        // Send MsgDone without acquiring first.
+        ingress_tx.send(Bytes::from(encode_done())).await.unwrap();
+
+        let result = handle.await.unwrap();
+        assert!(
+            result.is_ok(),
+            "MsgDone in StIdle should exit Ok: {result:?}"
+        );
+    }
+
+    /// Verify that MsgQuery before acquiring returns a StateViolation error.
+    #[tokio::test]
+    async fn query_without_acquire_returns_state_violation() {
+        let (mut channel, _egress_rx, ingress_tx) = make_test_channel();
+        let handler = MockQueryHandler;
+
+        let handle =
+            tokio::spawn(
+                async move { LocalStateQueryServer::run(&mut channel, &handler, 16).await },
+            );
+
+        // Send MsgQuery without acquiring first.
+        ingress_tx
+            .send(Bytes::from(encode_block_query(0)))
+            .await
+            .unwrap();
+
+        let result = handle.await.unwrap();
+        assert!(
+            matches!(
+                result,
+                Err(crate::error::ProtocolError::StateViolation { .. })
+            ),
+            "expected StateViolation for query without acquire, got: {result:?}"
+        );
+    }
+
+    /// Verify that MsgRelease in StAcquired drops the acquired state.
+    /// A subsequent MsgQuery (without re-acquiring) must fail with StateViolation.
+    #[tokio::test]
+    async fn release_clears_acquired_state() {
+        let (mut channel, mut egress_rx, ingress_tx) = make_test_channel();
+        let handler = MockQueryHandler;
+
+        let handle =
+            tokio::spawn(
+                async move { LocalStateQueryServer::run(&mut channel, &handler, 16).await },
+            );
+
+        // Acquire.
+        ingress_tx
+            .send(Bytes::from(encode_acquire_volatile()))
+            .await
+            .unwrap();
+        let _ = egress_rx.recv().await.unwrap(); // MsgAcquired
+
+        // Release.
+        ingress_tx
+            .send(Bytes::from(encode_release()))
+            .await
+            .unwrap();
+
+        // Attempt query without re-acquiring.
+        ingress_tx
+            .send(Bytes::from(encode_block_query(0)))
+            .await
+            .unwrap();
+
+        let result = handle.await.unwrap();
+        assert!(
+            matches!(
+                result,
+                Err(crate::error::ProtocolError::StateViolation { .. })
+            ),
+            "expected StateViolation after release + query, got: {result:?}"
+        );
+    }
+
+    /// Verify acquire of ImmutableTip ([10]) succeeds and sets acquired state.
+    #[tokio::test]
+    async fn acquire_immutable_tip_succeeds() {
+        let (mut channel, mut egress_rx, ingress_tx) = make_test_channel();
+        let handler = MockQueryHandler;
+
+        let handle =
+            tokio::spawn(
+                async move { LocalStateQueryServer::run(&mut channel, &handler, 16).await },
+            );
+
+        // MsgAcquire ImmutableTip = [10]
+        let mut buf = Vec::new();
+        let mut enc = Encoder::new(&mut buf);
+        enc.array(1).expect("infallible");
+        enc.u64(TAG_ACQUIRE_IMMUTABLE).expect("infallible");
+        ingress_tx.send(Bytes::from(buf)).await.unwrap();
+
+        // Should get MsgAcquired.
+        let (_, _, resp) = egress_rx.recv().await.unwrap();
+        let mut dec = Decoder::new(&resp);
+        dec.array().unwrap();
+        assert_eq!(
+            dec.u64().unwrap(),
+            TAG_ACQUIRED,
+            "ImmutableTip acquire should return MsgAcquired"
+        );
+
+        ingress_tx.send(Bytes::from(encode_done())).await.unwrap();
+        handle.await.unwrap().unwrap();
+    }
+
+    /// Verify acquire of a specific point that fails PointNotOnChain returns MsgFailure.
+    #[tokio::test]
+    async fn acquire_specific_point_not_on_chain_returns_failure() {
+        let (mut channel, mut egress_rx, ingress_tx) = make_test_channel();
+        let handler = MockQueryHandler; // slot > 1000 → PointNotOnChain
+
+        let handle =
+            tokio::spawn(
+                async move { LocalStateQueryServer::run(&mut channel, &handler, 16).await },
+            );
+
+        // MsgAcquire specific point at slot 9999 (> 1000 → PointNotOnChain).
+        // Point::Specific wire format (codec::encode_point): [slot, hash_bytes]
+        let mut buf = Vec::new();
+        {
+            let mut enc = Encoder::new(&mut buf);
+            enc.array(2).expect("infallible");
+            enc.u64(TAG_ACQUIRE_SPECIFIC).expect("infallible");
+            // Point::Specific(9999, hash) → [9999, hash_bytes]
+            enc.array(2).expect("infallible");
+            enc.u64(9999).expect("infallible");
+            enc.bytes(&[0xFFu8; 32]).expect("infallible");
+        }
+        ingress_tx.send(Bytes::from(buf)).await.unwrap();
+
+        // Should get MsgFailure.
+        let (_, _, resp) = egress_rx.recv().await.unwrap();
+        let mut dec = Decoder::new(&resp);
+        dec.array().unwrap();
+        let tag = dec.u64().unwrap();
+        assert_eq!(
+            tag, TAG_FAILURE,
+            "out-of-chain point should return MsgFailure"
+        );
+
+        ingress_tx.send(Bytes::from(encode_done())).await.unwrap();
+        handle.await.unwrap().unwrap();
+    }
+
+    /// Verify MsgReAcquire in StAcquired succeeds (replaces previous acquire).
+    #[tokio::test]
+    async fn reacquire_volatile_tip_succeeds() {
+        let (mut channel, mut egress_rx, ingress_tx) = make_test_channel();
+        let handler = MockQueryHandler;
+
+        let handle =
+            tokio::spawn(
+                async move { LocalStateQueryServer::run(&mut channel, &handler, 16).await },
+            );
+
+        // First acquire.
+        ingress_tx
+            .send(Bytes::from(encode_acquire_volatile()))
+            .await
+            .unwrap();
+        let _ = egress_rx.recv().await.unwrap(); // MsgAcquired
+
+        // ReAcquire VolatileTip = [9].
+        let mut buf = Vec::new();
+        let mut enc = Encoder::new(&mut buf);
+        enc.array(1).expect("infallible");
+        enc.u64(TAG_REACQUIRE_VOLATILE).expect("infallible");
+        ingress_tx.send(Bytes::from(buf)).await.unwrap();
+
+        // Should get MsgAcquired again.
+        let (_, _, resp) = egress_rx.recv().await.unwrap();
+        let mut dec = Decoder::new(&resp);
+        dec.array().unwrap();
+        assert_eq!(
+            dec.u64().unwrap(),
+            TAG_ACQUIRED,
+            "ReAcquire should return MsgAcquired"
+        );
+
+        ingress_tx.send(Bytes::from(encode_done())).await.unwrap();
+        handle.await.unwrap().unwrap();
+    }
+
+    /// Verify multiple queries in a single acquire session are all answered.
+    #[tokio::test]
+    async fn multiple_queries_in_one_acquire_session() {
+        let (mut channel, mut egress_rx, ingress_tx) = make_test_channel();
+        let handler = MockQueryHandler;
+
+        let handle =
+            tokio::spawn(
+                async move { LocalStateQueryServer::run(&mut channel, &handler, 16).await },
+            );
+
+        ingress_tx
+            .send(Bytes::from(encode_acquire_volatile()))
+            .await
+            .unwrap();
+        let _ = egress_rx.recv().await.unwrap(); // MsgAcquired
+
+        // Issue 3 queries.
+        for shelley_tag in [0u64, 5, 14] {
+            ingress_tx
+                .send(Bytes::from(encode_block_query(shelley_tag)))
+                .await
+                .unwrap();
+            let (_, _, result) = egress_rx.recv().await.unwrap();
+            let mut dec = Decoder::new(&result);
+            dec.array().unwrap();
+            let result_tag = dec.u64().unwrap();
+            assert_eq!(
+                result_tag, TAG_RESULT,
+                "query {shelley_tag} should get MsgResult"
+            );
+        }
+
+        ingress_tx
+            .send(Bytes::from(encode_release()))
+            .await
+            .unwrap();
+        ingress_tx.send(Bytes::from(encode_done())).await.unwrap();
+        handle.await.unwrap().unwrap();
+    }
+
+    /// Verify that an unexpected message tag returns an error.
+    #[tokio::test]
+    async fn unknown_message_tag_returns_error() {
+        let (mut channel, _egress_rx, ingress_tx) = make_test_channel();
+        let handler = MockQueryHandler;
+
+        let handle =
+            tokio::spawn(
+                async move { LocalStateQueryServer::run(&mut channel, &handler, 16).await },
+            );
+
+        // Send a message with tag 99 (not a valid LSQ tag).
+        let mut buf = Vec::new();
+        let mut enc = Encoder::new(&mut buf);
+        enc.array(1).expect("infallible");
+        enc.u64(99).expect("infallible");
+        ingress_tx.send(Bytes::from(buf)).await.unwrap();
+
+        let result = handle.await.unwrap();
+        assert!(
+            matches!(
+                result,
+                Err(crate::error::ProtocolError::InvalidMessage { .. })
+            ),
+            "unknown tag should return InvalidMessage, got: {result:?}"
+        );
+    }
+
+    /// Verify acquire/query/release/acquire cycle works correctly.
+    ///
+    /// This exercises the full state machine: StIdle → StAcquiring → StAcquired →
+    /// StQuerying → StAcquired → StIdle → StAcquiring → StAcquired → StDone.
+    #[tokio::test]
+    async fn acquire_query_release_reacquire_cycle() {
+        let (mut channel, mut egress_rx, ingress_tx) = make_test_channel();
+        let handler = MockQueryHandler;
+
+        let handle =
+            tokio::spawn(
+                async move { LocalStateQueryServer::run(&mut channel, &handler, 16).await },
+            );
+
+        // First acquire.
+        ingress_tx
+            .send(Bytes::from(encode_acquire_volatile()))
+            .await
+            .unwrap();
+        let _ = egress_rx.recv().await.unwrap(); // MsgAcquired
+
+        // Query.
+        ingress_tx
+            .send(Bytes::from(encode_block_query(1)))
+            .await
+            .unwrap();
+        let _ = egress_rx.recv().await.unwrap(); // MsgResult
+
+        // Release.
+        ingress_tx
+            .send(Bytes::from(encode_release()))
+            .await
+            .unwrap();
+
+        // Second acquire.
+        ingress_tx
+            .send(Bytes::from(encode_acquire_volatile()))
+            .await
+            .unwrap();
+        let (_, _, resp) = egress_rx.recv().await.unwrap();
+        let mut dec = Decoder::new(&resp);
+        dec.array().unwrap();
+        assert_eq!(
+            dec.u64().unwrap(),
+            TAG_ACQUIRED,
+            "second acquire should succeed"
+        );
+
+        // Done.
+        ingress_tx.send(Bytes::from(encode_done())).await.unwrap();
+        handle.await.unwrap().unwrap();
+    }
+
+    /// Verify acquire of SpecificPoint at Origin always succeeds.
+    #[tokio::test]
+    async fn acquire_specific_point_origin_succeeds() {
+        let (mut channel, mut egress_rx, ingress_tx) = make_test_channel();
+        let handler = MockQueryHandler;
+
+        let handle =
+            tokio::spawn(
+                async move { LocalStateQueryServer::run(&mut channel, &handler, 16).await },
+            );
+
+        // MsgAcquire SpecificPoint at Origin.
+        // Point::Origin wire format (codec::encode_point): []  (empty array, length 0)
+        let mut buf = Vec::new();
+        {
+            let mut enc = Encoder::new(&mut buf);
+            enc.array(2).expect("infallible");
+            enc.u64(TAG_ACQUIRE_SPECIFIC).expect("infallible");
+            // Point::Origin → [] (empty array)
+            enc.array(0).expect("infallible");
+        }
+        ingress_tx.send(Bytes::from(buf)).await.unwrap();
+
+        let (_, _, resp) = egress_rx.recv().await.unwrap();
+        let mut dec = Decoder::new(&resp);
+        dec.array().unwrap();
+        assert_eq!(dec.u64().unwrap(), TAG_ACQUIRED);
+
+        ingress_tx.send(Bytes::from(encode_done())).await.unwrap();
+        handle.await.unwrap().unwrap();
+    }
 }
