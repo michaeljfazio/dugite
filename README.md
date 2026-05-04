@@ -23,13 +23,6 @@ Built by [Sandstone Pool](https://www.sandstone.io/)
 > **Dugite is in early development and is NOT recommended for production use.**
 > APIs, storage formats, and on-chain behavior may change without notice. Ledger validation is incomplete and may accept invalid transactions or reject valid ones. **Do not use this software to operate a stake pool, manage real funds, or participate in mainnet governance.** Use at your own risk on testnets only.
 
-## Recent Milestones
-
-- **2026-05-04 — Block forging end-to-end on preview**: A dugite-forged block was accepted by a `cardano-node` 10.6.2 relay with no header errors. The OpCert signature path is fixed and verified on-chain; the block was orphaned only by an honest slot-battle, not a dugite bug.
-- **2026-04-29 — Block diffusion fix**: ConnectionId tuple keying, `Overwritten` simultaneous-open handling, and `SO_REUSEPORT` listener landed. `PromotedToHotRemote` + `InboundIdleSt` Duplex confirmed on a loopback BP+relay pair.
-- **2026-04-22 — Immutable-tip-anchor fork switch fix**: `switch_chain` now accepts a fork whose ancestry terminates at the immutable tip, eliminating long stalls after forks below VolatileDB.
-- **2026-04-21 — Peer rollback cascade fix**: `MsgRollBackward` no longer regresses the global ledger; only `TriggeredFork` does.
-
 For project status, capability matrix, and known issues see the [Developer Wiki](https://github.com/michaeljfazio/dugite/wiki).
 
 ## Quick Start
