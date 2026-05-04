@@ -18,6 +18,7 @@ jobs:
       fail-fast: false
       matrix:
         target:
+          # Existing — wire-format and high-level state targets
           - decode_block
           - decode_transaction
           - nonce_update
@@ -33,6 +34,31 @@ jobs:
           - lsm_operations
           - mempool_admission
           - epoch_transition
+          # Phase 1 — wire-protocol coverage (mux + every mini-protocol)
+          - mux_demux
+          - n2c_query
+          - n2c_tx_submission
+          - block_fetch_msg
+          - tx_submission2_msg
+          - keepalive_msg
+          - peer_sharing_msg
+          # Phase 2 — consensus primitives
+          - vrf_verify
+          - kes_verify
+          - opcert_verify
+          - ed25519_verify
+          - blake2b_hash
+          - chain_select
+          # Phase 3 — storage layer (Mithril skipped — HTTP-coupled, no byte API)
+          - immutable_chunk_parse
+          - volatile_recovery
+          - chaindb_rollback
+          # Phase 4 — Plutus / Phase-2
+          # NOTE: plutus_script_decode is intentionally OMITTED — upstream uplc
+          # and pallas-codec panic on malformed input (see top-doc in that file
+          # and the catch_unwind guard in dugite-ledger/src/plutus.rs).
+          - plutus_data_decode
+          - cost_model_eval
     steps:
       - uses: actions/checkout@v6
 

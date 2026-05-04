@@ -39,6 +39,11 @@ const TAG_SHARE_REQUEST: u64 = 0;
 const TAG_SHARE_PEERS: u64 = 1;
 const TAG_DONE: u64 = 2;
 
+/// Upper bound on peer addresses per MsgSharePeers. The protocol's request
+/// `amount` is u8, so a reply with more than 255 addresses is malformed —
+/// reject early to prevent unbounded `Vec::reserve` from a hostile peer.
+const MAX_SHARED_ADDRS: u64 = u8::MAX as u64;
+
 /// Encode a PeerSharing message as CBOR.
 pub fn encode_message(msg: &PeerSharingMessage) -> Vec<u8> {
     let mut buf = Vec::new();
@@ -96,6 +101,11 @@ pub fn decode_message(data: &[u8]) -> Result<PeerSharingMessage, String> {
                         .array()
                         .map_err(|e| e.to_string())?
                         .ok_or("expected definite array length")?;
+                    if len > MAX_SHARED_ADDRS {
+                        return Err(format!(
+                            "MsgSharePeers: array length {len} exceeds max {MAX_SHARED_ADDRS}"
+                        ));
+                    }
                     addrs.reserve(len as usize);
                     for _ in 0..len {
                         addrs.push(decode_address(&mut dec)?);

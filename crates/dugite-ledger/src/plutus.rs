@@ -20,6 +20,20 @@ pub enum PlutusError {
     EvalFailed(String),
 }
 
+/// Recover a printable message from a `catch_unwind` panic payload. The payload
+/// is a `Box<dyn Any + Send>` whose concrete type is `&'static str` for `panic!`
+/// with a string literal, `String` for `panic!` with a formatted message, or
+/// otherwise opaque.
+fn panic_payload_to_string(payload: &Box<dyn std::any::Any + Send>) -> String {
+    if let Some(s) = payload.downcast_ref::<&'static str>() {
+        (*s).to_string()
+    } else if let Some(s) = payload.downcast_ref::<String>() {
+        s.clone()
+    } else {
+        "<non-string panic payload>".to_string()
+    }
+}
+
 /// Slot configuration for Plutus time conversion
 #[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize)]
 pub struct SlotConfig {
@@ -216,15 +230,39 @@ pub fn evaluate_plutus_scripts(
     // valid V1/V2 scripts that return non-Unit in mixed-version transactions.
     let redeemer_version_map = redeemer_script_version_map(tx, utxo_set, &version_map);
 
-    match uplc::tx::eval_phase_two_raw(
-        tx_cbor,
-        &utxo_pairs,
-        cost_models_cbor,
-        max_tx_ex_units,
-        sc,
-        false, // don't run phase one (we already do our own phase 1 validation)
-        |_redeemer| {},
-    ) {
+    // SECURITY: wrap the third-party uplc / pallas-codec call in catch_unwind.
+    // Both crates have known panics on malformed input (pallas-codec flat
+    // decoder unwrap, uplc tx.rs:194 unwrap on Err(EndOfInput)). Without this
+    // guard, an adversary can craft a transaction whose witness-set Plutus
+    // script crashes the node — a remote DoS over TxSubmission2 / N2C.
+    // Treat any panic as a hard script-validation failure → tx is rejected,
+    // node keeps running. Requires panic = "unwind" in the release profile.
+    let eval_outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        uplc::tx::eval_phase_two_raw(
+            tx_cbor,
+            &utxo_pairs,
+            cost_models_cbor,
+            max_tx_ex_units,
+            sc,
+            false, // don't run phase one (we already do our own phase 1 validation)
+            |_redeemer| {},
+        )
+    }));
+    let eval_result = match eval_outcome {
+        Ok(r) => r,
+        Err(payload) => {
+            let msg = panic_payload_to_string(&payload);
+            debug!(
+                tx_hash = %tx.hash.to_hex(),
+                panic = %msg,
+                "Plutus evaluator panicked on adversarial input — rejecting tx"
+            );
+            return Err(PlutusError::EvalFailed(format!(
+                "uplc/pallas-codec panic on malformed script: {msg}"
+            )));
+        }
+    };
+    match eval_result {
         Ok(results) => {
             for (redeemer_bytes, eval_result) in &results {
                 let cost = eval_result.cost();

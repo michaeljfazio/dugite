@@ -135,7 +135,13 @@ opt-level = 3
 lto = "thin"
 codegen-units = 1
 strip = true
-panic = "abort"
+# panic = "unwind" (the default) is REQUIRED so we can catch panics from
+# third-party untrusted-input parsers (notably pallas-codec's flat decoder
+# and uplc, both of which panic on malformed Plutus scripts that an adversary
+# can deliver via the witness set of a gossiped transaction). See the
+# catch_unwind guard around eval_phase_two_raw in dugite-ledger/src/plutus.rs.
+# Do NOT change to "abort" without a corresponding upstream fix.
+panic = "unwind"
 
 [profile.dev]
 opt-level = 0
