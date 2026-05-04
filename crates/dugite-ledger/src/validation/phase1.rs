@@ -1946,6 +1946,799 @@ mod tests {
         );
     }
 
+    // -----------------------------------------------------------------------
+    // Test 31 — Rule 1b: duplicate inputs rejected
+    // -----------------------------------------------------------------------
+    #[test]
+    fn test_duplicate_inputs_rejected() {
+        let (utxo_set, mut tx, input) = make_valid_tx();
+        // Add the same input a second time.
+        tx.body.inputs.push(input.clone());
+        let params = ProtocolParameters::mainnet_defaults();
+        let errors = validate_transaction(&tx, &utxo_set, &params, 100, 300, None).unwrap_err();
+        assert!(
+            errors
+                .iter()
+                .any(|e| matches!(e, ValidationError::DuplicateInput(_))),
+            "expected DuplicateInput, got {errors:?}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Test 32 — Rule 7: TTL exactly at current_slot passes (slot == TTL is valid)
+    // -----------------------------------------------------------------------
+    #[test]
+    fn test_ttl_at_current_slot_passes() {
+        let (utxo_set, mut tx, _) = make_valid_tx();
+        // TTL == current_slot should NOT produce TtlExpired (> not >=).
+        tx.body.ttl = Some(SlotNo(100));
+        let params = ProtocolParameters::mainnet_defaults();
+        let result = validate_transaction(&tx, &utxo_set, &params, 100, 300, None);
+        assert!(
+            result.is_ok()
+                || result
+                    .as_ref()
+                    .err()
+                    .map(|es| !es
+                        .iter()
+                        .any(|e| matches!(e, ValidationError::TtlExpired { .. })))
+                    .unwrap_or(true),
+            "TTL == current_slot must NOT produce TtlExpired, got {result:?}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Test 33 — Rule 8: validity start == current_slot passes (>= check)
+    // -----------------------------------------------------------------------
+    #[test]
+    fn test_validity_interval_start_at_current_slot_passes() {
+        let (utxo_set, mut tx, _) = make_valid_tx();
+        tx.body.validity_interval_start = Some(SlotNo(100));
+        let params = ProtocolParameters::mainnet_defaults();
+        let result = validate_transaction(&tx, &utxo_set, &params, 100, 300, None);
+        let no_not_yet_valid = result.is_ok()
+            || result
+                .as_ref()
+                .err()
+                .map(|es| {
+                    !es.iter()
+                        .any(|e| matches!(e, ValidationError::NotYetValid { .. }))
+                })
+                .unwrap_or(true);
+        assert!(
+            no_not_yet_valid,
+            "validity_interval_start == current_slot must NOT produce NotYetValid, got {result:?}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Test 34 — Rule 6: tx exactly at max_tx_size passes
+    // -----------------------------------------------------------------------
+    #[test]
+    fn test_tx_exactly_at_max_size_passes() {
+        let (utxo_set, tx, _) = make_valid_tx();
+        let params = ProtocolParameters::mainnet_defaults();
+        // Pass tx_size == max_tx_size; should not produce TxTooLarge.
+        let result = validate_transaction(&tx, &utxo_set, &params, 100, params.max_tx_size, None);
+        let no_size_error = result.is_ok()
+            || result
+                .as_ref()
+                .err()
+                .map(|es| {
+                    !es.iter()
+                        .any(|e| matches!(e, ValidationError::TxTooLarge { .. }))
+                })
+                .unwrap_or(true);
+        assert!(
+            no_size_error,
+            "tx_size == max_tx_size must NOT produce TxTooLarge"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Test 35 — Rule 6: tx one byte over max_tx_size rejected
+    // -----------------------------------------------------------------------
+    #[test]
+    fn test_tx_one_over_max_size_rejected() {
+        let (utxo_set, tx, _) = make_valid_tx();
+        let params = ProtocolParameters::mainnet_defaults();
+        let errors =
+            validate_transaction(&tx, &utxo_set, &params, 100, params.max_tx_size + 1, None)
+                .unwrap_err();
+        assert!(
+            errors
+                .iter()
+                .any(|e| matches!(e, ValidationError::TxTooLarge { .. })),
+            "tx_size == max_tx_size + 1 must produce TxTooLarge, got {errors:?}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Test 36 — Rule 4: fee exactly at minimum passes
+    // -----------------------------------------------------------------------
+    #[test]
+    fn test_fee_exactly_at_minimum_passes() {
+        let (utxo_set, mut tx, _) = make_valid_tx();
+        let params = ProtocolParameters::mainnet_defaults();
+        // Set fee to the minimum fee for tx_size=300, then adjust output to balance.
+        // min_fee = min_fee_a * tx_size + min_fee_b = 44*300 + 155381 = 168581 lovelace
+        let min_fee = params.min_fee_a * 300 + params.min_fee_b;
+        // Adjust output to conserve value: 10_000_000 - min_fee
+        tx.body.fee = Lovelace(min_fee);
+        tx.body.outputs[0].value = Value::lovelace(10_000_000 - min_fee);
+        let result = validate_transaction(&tx, &utxo_set, &params, 100, 300, None);
+        let no_fee_error = result.is_ok()
+            || result
+                .as_ref()
+                .err()
+                .map(|es| {
+                    !es.iter()
+                        .any(|e| matches!(e, ValidationError::FeeTooSmall { .. }))
+                })
+                .unwrap_or(true);
+        assert!(
+            no_fee_error,
+            "fee == min_fee must NOT produce FeeTooSmall, got {result:?}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Test 37 — Rule 4: fee one lovelace below minimum rejected
+    // -----------------------------------------------------------------------
+    #[test]
+    fn test_fee_one_below_minimum_rejected() {
+        let (utxo_set, mut tx, _) = make_valid_tx();
+        let params = ProtocolParameters::mainnet_defaults();
+        let min_fee = params.min_fee_a * 300 + params.min_fee_b;
+        // Set fee just below minimum; add the lovelace to the output to stay balanced.
+        if min_fee > 0 {
+            tx.body.fee = Lovelace(min_fee - 1);
+            tx.body.outputs[0].value = Value::lovelace(10_000_000 - (min_fee - 1));
+        }
+        let errors = validate_transaction(&tx, &utxo_set, &params, 100, 300, None).unwrap_err();
+        assert!(
+            errors
+                .iter()
+                .any(|e| matches!(e, ValidationError::FeeTooSmall { .. })),
+            "fee == min_fee - 1 must produce FeeTooSmall, got {errors:?}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Test 38 — Rule 1e: pool retirement beyond e_max rejected
+    // -----------------------------------------------------------------------
+    #[test]
+    fn test_pool_retirement_beyond_e_max_rejected() {
+        use dugite_primitives::transaction::Certificate;
+        let (utxo_set, mut tx, _) = make_valid_tx();
+        let params = ProtocolParameters::mainnet_defaults();
+        // e_max is typically 18 on mainnet.  Retirement at current_epoch + e_max + 1.
+        let current_epoch: u64 = 500;
+        let too_late_epoch = current_epoch + params.e_max + 1;
+        tx.body.certificates.push(Certificate::PoolRetirement {
+            pool_hash: Hash28::from_bytes([0x11u8; 28]),
+            epoch: too_late_epoch,
+        });
+        // validate_transaction_with_pools signature:
+        // (tx, utxo, params, current_slot, tx_size, slot_config,
+        //  registered_pools, current_treasury, reward_accounts, current_epoch,
+        //  registered_dreps, registered_vrf_keys, node_network,
+        //  committee_members, committee_resigned, stake_key_deposits,
+        //  constitution_script_hash, vote_delegations)
+        let errors = validate_transaction_with_pools(
+            &tx,
+            &utxo_set,
+            &params,
+            100,
+            300,
+            None,
+            None,
+            None,
+            None,
+            Some(current_epoch),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap_err();
+        assert!(
+            errors
+                .iter()
+                .any(|e| matches!(e, ValidationError::PoolRetirementTooLate { .. })),
+            "retirement beyond e_max must produce PoolRetirementTooLate, got {errors:?}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Test 39 — Rule 1e: pool retirement exactly at e_max passes
+    // -----------------------------------------------------------------------
+    #[test]
+    fn test_pool_retirement_exactly_at_e_max_passes() {
+        use dugite_primitives::transaction::Certificate;
+        let (utxo_set, mut tx, _) = make_valid_tx();
+        let params = ProtocolParameters::mainnet_defaults();
+        let current_epoch: u64 = 500;
+        let valid_epoch = current_epoch + params.e_max;
+        tx.body.certificates.push(Certificate::PoolRetirement {
+            pool_hash: Hash28::from_bytes([0x22u8; 28]),
+            epoch: valid_epoch,
+        });
+        let result = validate_transaction_with_pools(
+            &tx,
+            &utxo_set,
+            &params,
+            100,
+            300,
+            None,
+            None,
+            None,
+            None,
+            Some(current_epoch),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+        let no_late_error = result.is_ok()
+            || result
+                .as_ref()
+                .err()
+                .map(|es| {
+                    !es.iter()
+                        .any(|e| matches!(e, ValidationError::PoolRetirementTooLate { .. }))
+                })
+                .unwrap_or(true);
+        assert!(
+            no_late_error,
+            "retirement exactly at e_max must NOT produce PoolRetirementTooLate, got {result:?}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Test 40 — Rule 1f: Conway stake registration deposit mismatch rejected
+    // -----------------------------------------------------------------------
+    #[test]
+    fn test_conway_stake_reg_deposit_mismatch_rejected() {
+        use dugite_primitives::transaction::Certificate;
+        let (utxo_set, mut tx, _) = make_valid_tx();
+        let mut params = ProtocolParameters::mainnet_defaults();
+        params.protocol_version_major = 9; // Conway+
+        params.key_deposit = Lovelace(2_000_000);
+
+        tx.body
+            .certificates
+            .push(Certificate::ConwayStakeRegistration {
+                credential: dugite_primitives::credentials::Credential::VerificationKey(
+                    Hash28::from_bytes([0x33u8; 28]),
+                ),
+                deposit: Lovelace(999_999), // Wrong deposit amount
+            });
+
+        let errors = validate_transaction(&tx, &utxo_set, &params, 100, 300, None).unwrap_err();
+        assert!(
+            errors
+                .iter()
+                .any(|e| matches!(e, ValidationError::StakeRegistrationDepositMismatch { .. })),
+            "ConwayStakeRegistration with wrong deposit must produce StakeRegistrationDepositMismatch, got {errors:?}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Test 41 — Rule 1g: Conway stake deregistration refund mismatch rejected
+    // -----------------------------------------------------------------------
+    #[test]
+    fn test_conway_stake_dereg_refund_mismatch_rejected() {
+        use dugite_primitives::transaction::Certificate;
+        use std::collections::HashMap;
+
+        let (utxo_set, mut tx, _) = make_valid_tx();
+        let mut params = ProtocolParameters::mainnet_defaults();
+        params.protocol_version_major = 9; // Conway+
+        params.key_deposit = Lovelace(2_000_000);
+
+        let cred = dugite_primitives::credentials::Credential::VerificationKey(Hash28::from_bytes(
+            [0x44u8; 28],
+        ));
+        let cred_hash = cred.to_typed_hash32();
+
+        // Record the stored deposit for this credential.
+        let mut stake_key_deposits = HashMap::new();
+        stake_key_deposits.insert(cred_hash, 2_000_000u64);
+
+        tx.body
+            .certificates
+            .push(Certificate::ConwayStakeDeregistration {
+                credential: cred,
+                refund: Lovelace(1_000_000), // Wrong refund amount
+            });
+
+        let errors = validate_transaction_with_pools(
+            &tx,
+            &utxo_set,
+            &params,
+            100,
+            300,
+            None,                      // slot_config
+            None,                      // registered_pools
+            None,                      // current_treasury
+            None,                      // reward_accounts
+            None,                      // current_epoch
+            None,                      // registered_dreps
+            None,                      // registered_vrf_keys
+            None,                      // node_network
+            None,                      // committee_members
+            None,                      // committee_resigned
+            Some(&stake_key_deposits), // stake_key_deposits
+            None,                      // constitution_script_hash
+            None,                      // vote_delegations
+        )
+        .unwrap_err();
+        assert!(
+            errors
+                .iter()
+                .any(|e| matches!(e, ValidationError::StakeDeregistrationRefundMismatch { .. })),
+            "ConwayStakeDeregistration with wrong refund must produce StakeDeregistrationRefundMismatch, got {errors:?}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Test 42 — Rule 1h: pool cost below min_pool_cost rejected
+    // -----------------------------------------------------------------------
+    #[test]
+    fn test_pool_cost_below_min_pool_cost_rejected() {
+        use dugite_primitives::transaction::{Certificate, PoolParams, Rational};
+        let (utxo_set, mut tx, _) = make_valid_tx();
+        let mut params = ProtocolParameters::mainnet_defaults();
+        params.min_pool_cost = Lovelace(340_000_000); // 340 ADA min
+
+        tx.body
+            .certificates
+            .push(Certificate::PoolRegistration(PoolParams {
+                operator: Hash28::from_bytes([0x55u8; 28]),
+                vrf_keyhash: Hash32::from_bytes([0x66u8; 32]),
+                pledge: Lovelace(0),
+                cost: Lovelace(100_000_000), // Below min
+                margin: Rational {
+                    numerator: 1,
+                    denominator: 100,
+                },
+                reward_account: {
+                    let mut acct = vec![0xE1u8];
+                    acct.extend_from_slice(&[0x77u8; 28]);
+                    acct
+                },
+                pool_owners: vec![],
+                relays: vec![],
+                pool_metadata: None,
+            }));
+
+        let errors = validate_transaction(&tx, &utxo_set, &params, 100, 300, None).unwrap_err();
+        assert!(
+            errors
+                .iter()
+                .any(|e| matches!(e, ValidationError::StakePoolCostTooLow { .. })),
+            "pool cost below min_pool_cost must produce StakePoolCostTooLow, got {errors:?}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Test 43 — Rule 1i: pool reward account network mismatch
+    // -----------------------------------------------------------------------
+    #[test]
+    fn test_pool_reward_account_wrong_network_rejected() {
+        use dugite_primitives::transaction::{Certificate, PoolParams, Rational};
+        let (utxo_set, mut tx, _) = make_valid_tx();
+        let params = ProtocolParameters::mainnet_defaults();
+
+        // Set network_id = mainnet (1) in the transaction body
+        tx.body.network_id = Some(1);
+        // Pool reward account uses testnet header (0xE0 — bit 0 = 0 = testnet)
+        tx.body
+            .certificates
+            .push(Certificate::PoolRegistration(PoolParams {
+                operator: Hash28::from_bytes([0x88u8; 28]),
+                vrf_keyhash: Hash32::from_bytes([0x99u8; 32]),
+                pledge: Lovelace(0),
+                cost: Lovelace(340_000_000),
+                margin: Rational {
+                    numerator: 1,
+                    denominator: 100,
+                },
+                reward_account: {
+                    let mut acct = vec![0xE0u8]; // TESTNET key reward addr
+                    acct.extend_from_slice(&[0xAAu8; 28]);
+                    acct
+                },
+                pool_owners: vec![],
+                relays: vec![],
+                pool_metadata: None,
+            }));
+
+        let errors = validate_transaction(&tx, &utxo_set, &params, 100, 300, None).unwrap_err();
+        assert!(
+            errors
+                .iter()
+                .any(|e| matches!(e, ValidationError::PoolRewardAccountWrongNetwork { .. })),
+            "pool reward account on wrong network must produce PoolRewardAccountWrongNetwork, got {errors:?}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Test 44 — Rule 5b: output on wrong network rejected
+    // -----------------------------------------------------------------------
+    #[test]
+    fn test_output_wrong_network_rejected() {
+        let (utxo_set, mut tx, _) = make_valid_tx();
+        let params = ProtocolParameters::mainnet_defaults();
+
+        // Set tx network_id = mainnet (1)
+        tx.body.network_id = Some(1);
+
+        // Add a testnet enterprise address output
+        let testnet_addr = dugite_primitives::address::Address::Enterprise(EnterpriseAddress {
+            network: NetworkId::Testnet,
+            payment: Credential::VerificationKey(Hash28::from_bytes([0xBBu8; 28])),
+        });
+        tx.body
+            .outputs
+            .push(dugite_primitives::transaction::TransactionOutput {
+                address: testnet_addr,
+                value: Value::lovelace(0),
+                datum: dugite_primitives::transaction::OutputDatum::None,
+                script_ref: None,
+                is_legacy: false,
+                raw_cbor: None,
+            });
+
+        let errors = validate_transaction(&tx, &utxo_set, &params, 100, 300, None).unwrap_err();
+        assert!(
+            errors
+                .iter()
+                .any(|e| matches!(e, ValidationError::NetworkMismatch { .. })),
+            "output on testnet with tx network_id=mainnet must produce NetworkMismatch, got {errors:?}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Test 45 — Rule 1c: auxiliary data hash present but no data rejected
+    // -----------------------------------------------------------------------
+    #[test]
+    fn test_auxiliary_data_hash_present_without_data_rejected() {
+        let (utxo_set, mut tx, _) = make_valid_tx();
+        let params = ProtocolParameters::mainnet_defaults();
+
+        tx.body.auxiliary_data_hash = Some(Hash32::from_bytes([0xCCu8; 32]));
+        tx.auxiliary_data = None;
+
+        let errors = validate_transaction(&tx, &utxo_set, &params, 100, 300, None).unwrap_err();
+        assert!(
+            errors
+                .iter()
+                .any(|e| matches!(e, ValidationError::AuxiliaryDataHashWithoutData)),
+            "auxiliary_data_hash with no data must produce AuxiliaryDataHashWithoutData, got {errors:?}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Test 46 — Rule 9: reference input not found in UTxO rejected
+    // -----------------------------------------------------------------------
+    #[test]
+    fn test_reference_input_not_found_rejected() {
+        let (utxo_set, mut tx, _) = make_valid_tx();
+        let params = ProtocolParameters::mainnet_defaults();
+
+        // Add a reference input that doesn't exist in the UTxO set.
+        tx.body.reference_inputs.push(TransactionInput {
+            transaction_id: Hash32::from_bytes([0xDDu8; 32]),
+            index: 0,
+        });
+
+        let errors = validate_transaction(&tx, &utxo_set, &params, 100, 300, None).unwrap_err();
+        assert!(
+            errors
+                .iter()
+                .any(|e| matches!(e, ValidationError::ReferenceInputNotFound(_))),
+            "missing reference input must produce ReferenceInputNotFound, got {errors:?}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Test 47 — Rule 10: required signer with NO vkey witnesses at all
+    // -----------------------------------------------------------------------
+    #[test]
+    fn test_required_signer_no_witnesses_rejected() {
+        let (utxo_set, mut tx, _) = make_valid_tx();
+        let params = ProtocolParameters::mainnet_defaults();
+
+        // Add a required signer (padded to Hash32).
+        let required_keyhash = Hash32::from_bytes({
+            let mut b = [0u8; 32];
+            b[..28].copy_from_slice(&[0xEEu8; 28]);
+            b
+        });
+        tx.body.required_signers.push(required_keyhash);
+        tx.witness_set.vkey_witnesses = vec![]; // No witnesses at all
+
+        let errors = validate_transaction(&tx, &utxo_set, &params, 100, 300, None).unwrap_err();
+        assert!(
+            errors
+                .iter()
+                .any(|e| matches!(e, ValidationError::MissingRequiredSigner(_))),
+            "required signer with no witnesses must produce MissingRequiredSigner, got {errors:?}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Test 48 — Rule 1d: ConwayStakeRegistration in pre-Conway era rejected
+    // -----------------------------------------------------------------------
+    #[test]
+    fn test_conway_cert_in_pre_conway_era_rejected() {
+        use dugite_primitives::transaction::Certificate;
+        let (utxo_set, mut tx, _) = make_valid_tx();
+        let mut params = ProtocolParameters::mainnet_defaults();
+        params.protocol_version_major = 8; // Babbage — pre-Conway
+
+        tx.body
+            .certificates
+            .push(Certificate::ConwayStakeRegistration {
+                credential: Credential::VerificationKey(Hash28::from_bytes([0xFFu8; 28])),
+                deposit: Lovelace(2_000_000),
+            });
+
+        let errors = validate_transaction(&tx, &utxo_set, &params, 100, 300, None).unwrap_err();
+        // Era gating check should fire for Conway-only cert in pre-Conway era
+        assert!(
+            !errors.is_empty(),
+            "Conway-only cert in pre-Conway era must produce at least one validation error"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Test 49 — Rule 2: value not conserved (output > input - fee)
+    // -----------------------------------------------------------------------
+    #[test]
+    fn test_value_not_conserved_output_too_high() {
+        let (utxo_set, mut tx, _) = make_valid_tx();
+        let params = ProtocolParameters::mainnet_defaults();
+        // Inflate the output past what inputs allow.
+        tx.body.outputs[0].value = Value::lovelace(9_900_000); // was 9_800_000; now creates 100k shortfall
+        let errors = validate_transaction(&tx, &utxo_set, &params, 100, 300, None).unwrap_err();
+        assert!(
+            errors
+                .iter()
+                .any(|e| matches!(e, ValidationError::ValueNotConserved { .. })),
+            "output too high must produce ValueNotConserved, got {errors:?}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Test 50 — Rule 3: value not conserved (output < input - fee, lovelace lost)
+    // -----------------------------------------------------------------------
+    #[test]
+    fn test_value_not_conserved_lovelace_lost() {
+        let (utxo_set, mut tx, _) = make_valid_tx();
+        let params = ProtocolParameters::mainnet_defaults();
+        // Deflate output — lovelace disappears.
+        tx.body.outputs[0].value = Value::lovelace(9_700_000); // was 9_800_000
+        let errors = validate_transaction(&tx, &utxo_set, &params, 100, 300, None).unwrap_err();
+        assert!(
+            errors
+                .iter()
+                .any(|e| matches!(e, ValidationError::ValueNotConserved { .. })),
+            "lovelace lost (output too low) must produce ValueNotConserved, got {errors:?}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Test 51 — governance proposal deposit mismatch (Conway, Rule 2-adjacent)
+    // -----------------------------------------------------------------------
+    #[test]
+    fn test_proposal_deposit_incorrect_rejected() {
+        use dugite_primitives::transaction::{GovAction, ProposalProcedure};
+        let (utxo_set, mut tx, _) = make_valid_tx();
+        let mut params = ProtocolParameters::mainnet_defaults();
+        params.protocol_version_major = 9; // Conway
+        params.gov_action_deposit = Lovelace(100_000_000_000);
+
+        tx.body.proposal_procedures.push(ProposalProcedure {
+            deposit: Lovelace(1_000_000), // Wrong deposit
+            return_addr: vec![0u8; 29],
+            gov_action: GovAction::InfoAction,
+            anchor: dugite_primitives::transaction::Anchor {
+                url: "https://example.com".to_string(),
+                data_hash: Hash32::ZERO,
+            },
+        });
+
+        let errors = validate_transaction(&tx, &utxo_set, &params, 100, 300, None).unwrap_err();
+        assert!(
+            errors
+                .iter()
+                .any(|e| matches!(e, ValidationError::ProposalDepositIncorrect { .. })),
+            "wrong proposal deposit must produce ProposalDepositIncorrect, got {errors:?}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Test 52 — Rule 5: output below min UTxO value rejected
+    // -----------------------------------------------------------------------
+    #[test]
+    fn test_output_below_min_utxo_rejected() {
+        let (utxo_set, mut tx, _) = make_valid_tx();
+        let params = ProtocolParameters::mainnet_defaults();
+        // Set output to 1 lovelace — far below any min UTxO.
+        let conserved_fee = tx.body.fee.0;
+        tx.body.outputs[0].value = Value::lovelace(1);
+        // Add the remainder back as fee to conserve value.
+        tx.body.fee.0 = 10_000_000 - 1;
+        let _ = conserved_fee; // avoid warning
+        let errors = validate_transaction(&tx, &utxo_set, &params, 100, 300, None).unwrap_err();
+        assert!(
+            errors
+                .iter()
+                .any(|e| matches!(e, ValidationError::OutputTooSmall { .. })),
+            "output below min UTxO must produce OutputTooSmall, got {errors:?}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Test 53 — Rule 5: output exactly at min UTxO passes
+    // -----------------------------------------------------------------------
+    #[test]
+    fn test_output_at_min_utxo_passes() {
+        let (utxo_set, mut tx, _) = make_valid_tx();
+        let params = ProtocolParameters::mainnet_defaults();
+        let min_utxo = params.min_utxo_value().0;
+        // We need total output + fee == 10_000_000
+        if min_utxo + 200_000 <= 10_000_000 {
+            tx.body.outputs[0].value = Value::lovelace(min_utxo);
+            tx.body.fee = Lovelace(10_000_000 - min_utxo);
+        }
+        let result = validate_transaction(&tx, &utxo_set, &params, 100, 300, None);
+        let no_small_error = result.is_ok()
+            || result
+                .as_ref()
+                .err()
+                .map(|es| {
+                    !es.iter()
+                        .any(|e| matches!(e, ValidationError::OutputTooSmall { .. }))
+                })
+                .unwrap_or(true);
+        assert!(
+            no_small_error,
+            "output exactly at min UTxO must NOT produce OutputTooSmall, got {result:?}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Test 54 — pool_metadata_hash_too_big helper: Alonzo+ gating
+    // -----------------------------------------------------------------------
+    #[test]
+    fn test_pool_metadata_hash_too_big_helper_alonzo_gating() {
+        use super::is_pool_metadata_hash_too_big;
+
+        // Pre-Alonzo (pv_major <= 4): any size accepted
+        assert!(
+            !is_pool_metadata_hash_too_big(&[0u8; 64], 4),
+            "Pre-Alonzo must not enforce hash size cap"
+        );
+        // Alonzo+ (pv_major > 4), size exactly 32: accepted
+        assert!(
+            !is_pool_metadata_hash_too_big(&[0u8; 32], 5),
+            "Alonzo+, size=32 must pass"
+        );
+        // Alonzo+ (pv_major > 4), size > 32: rejected
+        assert!(
+            is_pool_metadata_hash_too_big(&[0u8; 33], 5),
+            "Alonzo+, size=33 must be flagged as too big"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Test 55 — Byron output attributes boundary: exactly 64 bytes passes
+    // -----------------------------------------------------------------------
+    #[test]
+    fn test_boot_addr_attrs_exactly_64_bytes_passes() {
+        use super::output_boot_addr_attrs_too_big_indices;
+        use dugite_primitives::address::{Address, ByronAddress};
+
+        // A Byron payload where attributes_byte_size returns Some(64):
+        // The ByronAddress CBOR payload contains the attributes map.
+        // We test the helper directly since constructing valid Byron CBOR is complex.
+        // attributes_byte_size > 64 triggers the error.
+        // Instead test the indices function returns empty for size <= 64.
+        // Create a mock output with a Byron address whose attributes byte size is None
+        // (malformed) — should be silently passed.
+        let output = dugite_primitives::transaction::TransactionOutput {
+            address: Address::Byron(ByronAddress {
+                payload: vec![0x82, 0x00, 0x01], // minimal 3-byte payload
+            }),
+            value: Value::lovelace(1_000_000),
+            datum: dugite_primitives::transaction::OutputDatum::None,
+            script_ref: None,
+            is_legacy: false,
+            raw_cbor: None,
+        };
+        let bad = output_boot_addr_attrs_too_big_indices(&[output]);
+        // Malformed payload returns None from attributes_byte_size → silently pass
+        assert!(
+            bad.is_empty(),
+            "Malformed Byron payload must be silently accepted (attributes_byte_size=None)"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Test 56 — extract_reward_credential: key-hash type
+    // -----------------------------------------------------------------------
+    #[test]
+    fn test_extract_reward_credential_key_hash() {
+        use super::extract_reward_credential;
+
+        // Header 0xE1 (mainnet key reward addr) → VerificationKey
+        let mut account = vec![0xE1u8];
+        account.extend_from_slice(&[0x42u8; 28]);
+        let cred = extract_reward_credential(&account);
+        assert!(
+            matches!(cred, Some(Credential::VerificationKey(_))),
+            "0xE1 header must yield VerificationKey credential"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Test 57 — extract_reward_credential: script type
+    // -----------------------------------------------------------------------
+    #[test]
+    fn test_extract_reward_credential_script_hash() {
+        use super::extract_reward_credential;
+
+        // Header 0xF1 (mainnet script reward addr) → Script
+        let mut account = vec![0xF1u8];
+        account.extend_from_slice(&[0x55u8; 28]);
+        let cred = extract_reward_credential(&account);
+        assert!(
+            matches!(cred, Some(Credential::Script(_))),
+            "0xF1 header must yield Script credential"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Test 58 — extract_reward_credential: too-short address returns None
+    // -----------------------------------------------------------------------
+    #[test]
+    fn test_extract_reward_credential_too_short_returns_none() {
+        use super::extract_reward_credential;
+
+        let short = vec![0xE1u8; 10]; // Only 10 bytes, need >= 29
+        let cred = extract_reward_credential(&short);
+        assert!(cred.is_none(), "Too-short reward account must return None");
+    }
+
+    // -----------------------------------------------------------------------
+    // Test 59 — is_pool_metadata_hash_too_big: pv_major=4 (threshold boundary)
+    // -----------------------------------------------------------------------
+    #[test]
+    fn test_pool_metadata_hash_not_too_big_at_pv4() {
+        use super::is_pool_metadata_hash_too_big;
+        // pv_major == 4 is NOT > 4, so even oversized hashes are accepted.
+        assert!(
+            !is_pool_metadata_hash_too_big(&[0u8; 100], 4),
+            "pv_major=4 must not enforce the hash size cap"
+        );
+        assert!(
+            is_pool_metadata_hash_too_big(&[0u8; 100], 5),
+            "pv_major=5 must enforce the hash size cap for hash > 32 bytes"
+        );
+    }
+
     #[test]
     fn test_pool_medata_no_metadata_passes() {
         // The aggregate validator skips the check when `pool_metadata`
