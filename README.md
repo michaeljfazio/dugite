@@ -23,6 +23,14 @@ Built by [Sandstone Pool](https://www.sandstone.io/)
 > **Dugite is in early development and is NOT recommended for production use.**
 > APIs, storage formats, and on-chain behavior may change without notice. Ledger validation is incomplete and may accept invalid transactions or reject valid ones. **Do not use this software to operate a stake pool, manage real funds, or participate in mainnet governance.** Use at your own risk on testnets only.
 
+## Recent Milestones
+
+- **2026-05-04 — Block forging end-to-end on preview**: A dugite-forged block was accepted by a `cardano-node` 10.6.2 relay with no header errors. The OpCert signature path is fixed and verified on-chain; the block was orphaned only by an honest slot-battle, not a dugite bug.
+- **2026-04-29 — Block diffusion fix**: ConnectionId tuple keying, `Overwritten` simultaneous-open handling, and `SO_REUSEPORT` listener landed. `PromotedToHotRemote` + `InboundIdleSt` Duplex confirmed on a loopback BP+relay pair.
+- **2026-04-22 — Immutable-tip-anchor fork switch fix**: `switch_chain` now accepts a fork whose ancestry terminates at the immutable tip, eliminating long stalls after forks below VolatileDB.
+- **2026-04-21 — Peer rollback cascade fix**: `MsgRollBackward` no longer regresses the global ledger; only `TriggeredFork` does.
+- **mdBook docs**: Architecture, CLI reference, and benchmark notes now publish automatically to [GitHub Pages](https://michaeljfazio.github.io/dugite/).
+
 ## Quick Start
 
 ```bash
@@ -48,7 +56,7 @@ See the [full documentation](https://michaeljfazio.github.io/dugite/) for detail
 
 ## Architecture
 
-Dugite is organized as a 14-crate Cargo workspace:
+Dugite is organized as a 14-crate Cargo workspace built on [pallas](https://github.com/txpipe/pallas) 1.0.0-alpha.5 for Cardano wire-format compatibility:
 
 | Crate | Description |
 |-------|-------------|
@@ -156,11 +164,12 @@ graph TD
 - **Peer sharing (gossip)**: protocol for decentralized peer discovery
 
 ### Block Production
+- **End-to-end verified on preview testnet (2026-05-04)**: dugite-forged block accepted by a cardano-node 10.6.2 relay with no header validation errors
 - **VRF proof generation**: ECVRF-ED25519-SHA512-Elligator2 via vrf_dalek
 - **Block forging**: `forge_block()` with mempool transaction selection
 - **KES signing**: Sum6Kes key loading, period validation, block signing
 - **Operational certificates**: raw-bytes signable format, counter tracking for replay protection
-- **Block announcement**: forged + synced blocks broadcast to downstream N2N peers
+- **Block announcement**: forged + synced blocks broadcast to downstream N2N peers via the diffusion path (ConnectionId tuple keying, `Overwritten` simultaneous-open handling, `SO_REUSEPORT` listener)
 
 ### Storage
 - **ImmutableDB**: append-only chunk files with sequential I/O, secondary index (56-byte entries, big-endian, CRC32), memory-mapped I/O (memmap2)
@@ -207,7 +216,7 @@ Dugite has been validated on the **Cardano preview testnet** (network magic=2):
 | Epoch transitions | 1,251+ (including all protocol version changes) |
 | Pools | 650+ registered |
 | DReps | 8,700+ registered |
-| Block production | Active soak testing via Sandstone Pool [SAND] |
+| Block production | Forged block accepted by cardano-node 10.6.2 relay (2026-05-04); active soak testing via Sandstone Pool [SAND] |
 
 ## Production Readiness
 
@@ -235,13 +244,13 @@ Dugite can function as a **testnet relay node** with the following capabilities:
 
 ### Block Producer
 
-The block production pipeline is **actively soak-tested** on the Cardano preview testnet via **Sandstone Pool [SAND]** (pool ID `ff9f5e5a5102c86fca0de6300b322b555172dd206f4771e5297527d5`):
+The block production pipeline is **actively soak-tested** on the Cardano preview testnet via **Sandstone Pool [SAND]** (pool ID `6954ec11cf7097a693721104139b96c54e7f3e2a8f9e7577630f7856`). On **2026-05-04**, a dugite-forged block was accepted by a cardano-node 10.6.2 relay with no header errors (orphaned only by an honest slot-battle):
 
 - VRF proof generation and slot leader election (exact 34-digit fixed-point arithmetic matching Haskell)
 - KES key loading, evolution, and block signing (Sum6Kes)
-- Operational certificate parsing and period validation
+- Operational certificate parsing and period validation (signature path verified on-chain)
 - Block forging with mempool transaction selection
-- Block announcement to connected peers
+- Block announcement to connected peers (diffusion verified via `PromotedToHotRemote`+`InboundIdleSt` Duplex)
 - Automated restart cycles with snapshot recovery verification
 - Koios cross-validation of UTxO counts, pool stake, and governance state
 
@@ -249,6 +258,7 @@ The block production pipeline is **actively soak-tested** on the Cardano preview
 - Mainnet block production has not been tested
 - KES key rotation across multiple KES periods not tested in production
 - Mempool transaction ordering and priority not optimized
+- Pool stake on preview is small (σ ≈ 0.0000247, ~0.1 blocks/epoch) so confidence in long-run stability requires hundreds of soak hours
 
 ## Performance
 
@@ -351,8 +361,7 @@ Dugite is actively soak-tested on the **Cardano preview testnet** via **Sandston
 
 | Field | Value |
 |-------|-------|
-| Pool ID | `ff9f5e5a5102c86fca0de6300b322b555172dd206f4771e5297527d5` |
-| Bech32 | `pool1l704ukj3qtyxljsduccqkv3t24gh9hfqdarhreffw5na2uknf5k` |
+| Pool ID | `6954ec11cf7097a693721104139b96c54e7f3e2a8f9e7577630f7856` |
 | Ticker | SAND |
 | Homepage | [https://sandstone.io](https://sandstone.io) |
 | Pledge | 1,000 ADA |

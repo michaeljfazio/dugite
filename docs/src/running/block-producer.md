@@ -6,6 +6,8 @@ Dugite can operate as a block-producing node (stake pool). This requires KES key
 
 A block producer is never directly exposed to the public internet. Instead, it sits behind one or more [relay nodes](./relay.md) that handle all external network connectivity. The relays forward blocks and transactions to the BP over a private network, and the BP announces forged blocks back through the relays.
 
+> **Status (2026-05-04):** Dugite block forging is operational and on-chain verified. A dugite-forged block has been accepted by an upstream `cardano-node` 10.6.2 relay (no header errors); the only loss observed was an unrelated slot-battle orphan. Dugite is currently in soak testing on the preview testnet via Sandstone Pool ([SAND], pool ID `6954ec11cf7097a693721104139b96c54e7f3e2a8f9e7577630f7856`).
+
 See the [Complete Deployment](#complete-deployment) section at the bottom of this page for the full architecture diagram and setup checklist.
 
 ## Overview
