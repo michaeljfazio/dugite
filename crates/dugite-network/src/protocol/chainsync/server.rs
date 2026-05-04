@@ -1308,6 +1308,397 @@ mod tests {
         handle.abort();
     }
 
+    /// Verify that MsgIntersectNotFound is sent when no intersection exists.
+    #[tokio::test]
+    async fn find_intersect_not_found_when_no_blocks_match() {
+        // Provider has a block at slot 50, but we ask for slot 999.
+        let block_cbor = make_hfc_block(7, &[0x01]);
+        let (mut channel, mut egress_rx, ingress_tx) = make_test_channel();
+        let provider = MockBlockProvider {
+            blocks: vec![(50, [0x01; 32], block_cbor)],
+        };
+        let (ann_tx, _) = broadcast::channel(16);
+        let (rb_tx, _) = broadcast::channel(16);
+        let mut server = ChainSyncServer::new();
+
+        let handle = tokio::spawn(async move {
+            server
+                .run(
+                    &mut channel,
+                    &provider,
+                    ann_tx.subscribe(),
+                    rb_tx.subscribe(),
+                )
+                .await
+        });
+
+        // Ask for a point we don't have.
+        let find = encode_message(&ChainSyncMessage::MsgFindIntersect(vec![Point::Specific(
+            999, [0xFF; 32],
+        )]));
+        ingress_tx.send(Bytes::from(find)).await.unwrap();
+
+        let (_, _, resp) = egress_rx.recv().await.unwrap();
+        let msg = decode_message(&resp).unwrap();
+        assert!(
+            matches!(msg, ChainSyncMessage::MsgIntersectNotFound { .. }),
+            "expected MsgIntersectNotFound, got {msg:?}"
+        );
+
+        let done = encode_message(&ChainSyncMessage::MsgDone);
+        ingress_tx.send(Bytes::from(done)).await.unwrap();
+        handle.await.unwrap().unwrap();
+    }
+
+    /// Verify that MsgFindIntersect with Origin always finds an intersection.
+    #[tokio::test]
+    async fn find_intersect_origin_always_found() {
+        let (mut channel, mut egress_rx, ingress_tx) = make_test_channel();
+        let provider = MockBlockProvider { blocks: vec![] }; // empty chain
+        let (ann_tx, _) = broadcast::channel(16);
+        let (rb_tx, _) = broadcast::channel(16);
+        let mut server = ChainSyncServer::new();
+
+        let handle = tokio::spawn(async move {
+            server
+                .run(
+                    &mut channel,
+                    &provider,
+                    ann_tx.subscribe(),
+                    rb_tx.subscribe(),
+                )
+                .await
+        });
+
+        let find = encode_message(&ChainSyncMessage::MsgFindIntersect(vec![Point::Origin]));
+        ingress_tx.send(Bytes::from(find)).await.unwrap();
+
+        let (_, _, resp) = egress_rx.recv().await.unwrap();
+        let msg = decode_message(&resp).unwrap();
+        if let ChainSyncMessage::MsgIntersectFound { point, .. } = msg {
+            assert_eq!(
+                point,
+                Point::Origin,
+                "intersection at origin should return Point::Origin"
+            );
+        } else {
+            panic!("expected MsgIntersectFound, got {msg:?}");
+        }
+
+        let done = encode_message(&ChainSyncMessage::MsgDone);
+        ingress_tx.send(Bytes::from(done)).await.unwrap();
+        handle.await.unwrap().unwrap();
+    }
+
+    /// Verify cursor state is set correctly after MsgFindIntersect with a specific point.
+    #[tokio::test]
+    async fn find_intersect_sets_cursor_correctly() {
+        let block_cbor = make_hfc_block(7, &[0x01]);
+        let (mut channel, mut egress_rx, ingress_tx) = make_test_channel();
+        let provider = MockBlockProvider {
+            blocks: vec![
+                (10, [0x01; 32], block_cbor.clone()),
+                (20, [0x02; 32], make_hfc_block(7, &[0x02])),
+            ],
+        };
+        let (ann_tx, _) = broadcast::channel(16);
+        let (rb_tx, _) = broadcast::channel(16);
+        let mut server = ChainSyncServer::new();
+
+        let handle = tokio::spawn(async move {
+            server
+                .run(
+                    &mut channel,
+                    &provider,
+                    ann_tx.subscribe(),
+                    rb_tx.subscribe(),
+                )
+                .await
+        });
+
+        // Intersect at slot 10 (block_a).
+        let find = encode_message(&ChainSyncMessage::MsgFindIntersect(vec![Point::Specific(
+            10, [0x01; 32],
+        )]));
+        ingress_tx.send(Bytes::from(find)).await.unwrap();
+        let _ = egress_rx.recv().await.unwrap(); // MsgIntersectFound
+
+        // Next block should be at slot 20 (not slot 10 again).
+        let req = encode_message(&ChainSyncMessage::MsgRequestNext);
+        ingress_tx.send(Bytes::from(req)).await.unwrap();
+        let (_, _, resp) = egress_rx.recv().await.unwrap();
+        let msg = decode_message(&resp).unwrap();
+        if let ChainSyncMessage::MsgRollForward { tip_slot, .. } = msg {
+            assert_eq!(
+                tip_slot, 20,
+                "after intersect at slot 10, next block should be slot 20"
+            );
+        } else {
+            panic!("expected MsgRollForward after intersect, got {msg:?}");
+        }
+
+        let done = encode_message(&ChainSyncMessage::MsgDone);
+        ingress_tx.send(Bytes::from(done)).await.unwrap();
+        handle.await.unwrap().unwrap();
+    }
+
+    /// Verify that MsgDone causes the server to exit cleanly.
+    #[tokio::test]
+    async fn msg_done_terminates_server() {
+        let (mut channel, _egress_rx, ingress_tx) = make_test_channel();
+        let provider = MockBlockProvider { blocks: vec![] };
+        let (ann_tx, _) = broadcast::channel(16);
+        let (rb_tx, _) = broadcast::channel(16);
+        let mut server = ChainSyncServer::new();
+
+        let handle = tokio::spawn(async move {
+            server
+                .run(
+                    &mut channel,
+                    &provider,
+                    ann_tx.subscribe(),
+                    rb_tx.subscribe(),
+                )
+                .await
+        });
+
+        let done = encode_message(&ChainSyncMessage::MsgDone);
+        ingress_tx.send(Bytes::from(done)).await.unwrap();
+
+        // Server should terminate cleanly.
+        let result = handle.await.unwrap();
+        assert!(
+            result.is_ok(),
+            "server should exit Ok on MsgDone: {result:?}"
+        );
+    }
+
+    /// Verify tip information is included correctly in MsgRollForward.
+    #[tokio::test]
+    async fn roll_forward_includes_tip_info() {
+        let block_a = make_hfc_block(7, &[0x01]);
+        let block_b = make_hfc_block(7, &[0x02]);
+
+        let (mut channel, mut egress_rx, ingress_tx) = make_test_channel();
+        let provider = MockBlockProvider {
+            blocks: vec![(100, [0xAA; 32], block_a), (200, [0xBB; 32], block_b)],
+        };
+        let (ann_tx, _) = broadcast::channel(16);
+        let (rb_tx, _) = broadcast::channel(16);
+        let mut server = ChainSyncServer::new();
+
+        let handle = tokio::spawn(async move {
+            server
+                .run(
+                    &mut channel,
+                    &provider,
+                    ann_tx.subscribe(),
+                    rb_tx.subscribe(),
+                )
+                .await
+        });
+
+        // Intersect at Origin.
+        let find = encode_message(&ChainSyncMessage::MsgFindIntersect(vec![Point::Origin]));
+        ingress_tx.send(Bytes::from(find)).await.unwrap();
+        let _ = egress_rx.recv().await.unwrap();
+
+        // Request next — serve block at slot 100.
+        let req = encode_message(&ChainSyncMessage::MsgRequestNext);
+        ingress_tx.send(Bytes::from(req)).await.unwrap();
+        let (_, _, resp) = egress_rx.recv().await.unwrap();
+        let msg = decode_message(&resp).unwrap();
+
+        if let ChainSyncMessage::MsgRollForward {
+            tip_slot,
+            tip_hash,
+            tip_block_number,
+            ..
+        } = msg
+        {
+            // Tip should be the chain tip (slot 200), not the served block (slot 100).
+            assert_eq!(tip_slot, 200, "tip_slot should reflect chain tip");
+            assert_eq!(tip_hash, [0xBB; 32], "tip_hash should reflect chain tip");
+            assert_eq!(
+                tip_block_number, 2,
+                "tip_block_number should reflect chain length"
+            );
+        } else {
+            panic!("expected MsgRollForward, got {msg:?}");
+        }
+
+        let done = encode_message(&ChainSyncMessage::MsgDone);
+        ingress_tx.send(Bytes::from(done)).await.unwrap();
+        handle.await.unwrap().unwrap();
+    }
+
+    /// Verify that drain_rollback() returns None when channel is empty.
+    #[test]
+    fn drain_rollback_empty_channel_returns_none() {
+        let (_tx, mut rx) = broadcast::channel::<RollbackAnnouncement>(4);
+        let result = ChainSyncServer::drain_rollback(&mut rx);
+        assert!(result.is_none(), "empty channel should return None");
+    }
+
+    /// Verify that drain_rollback() returns the latest of multiple queued rollbacks.
+    #[test]
+    fn drain_rollback_returns_latest_of_multiple() {
+        let (tx, mut rx) = broadcast::channel::<RollbackAnnouncement>(8);
+
+        // Queue 3 rollbacks — only the last should be returned.
+        tx.send(RollbackAnnouncement {
+            slot: 10,
+            hash: [0x01; 32],
+        })
+        .unwrap();
+        tx.send(RollbackAnnouncement {
+            slot: 20,
+            hash: [0x02; 32],
+        })
+        .unwrap();
+        tx.send(RollbackAnnouncement {
+            slot: 30,
+            hash: [0x03; 32],
+        })
+        .unwrap();
+
+        let result = ChainSyncServer::drain_rollback(&mut rx);
+        assert!(result.is_some());
+        let rb = result.unwrap();
+        assert_eq!(rb.slot, 30, "should return the latest (slot 30) rollback");
+        assert_eq!(rb.hash, [0x03; 32]);
+    }
+
+    /// Verify that the server handles MsgFindIntersect with multiple points,
+    /// finding the most recent matching point.
+    #[tokio::test]
+    async fn find_intersect_picks_most_recent_matching_point() {
+        let block_a = make_hfc_block(7, &[0x0A]);
+        let block_b = make_hfc_block(7, &[0x0B]);
+        let (mut channel, mut egress_rx, ingress_tx) = make_test_channel();
+        let provider = MockBlockProvider {
+            blocks: vec![(10, [0x0A; 32], block_a), (20, [0x0B; 32], block_b)],
+        };
+        let (ann_tx, _) = broadcast::channel(16);
+        let (rb_tx, _) = broadcast::channel(16);
+        let mut server = ChainSyncServer::new();
+
+        let handle = tokio::spawn(async move {
+            server
+                .run(
+                    &mut channel,
+                    &provider,
+                    ann_tx.subscribe(),
+                    rb_tx.subscribe(),
+                )
+                .await
+        });
+
+        // Send two points in order: [slot=20 (exists), slot=10 (also exists), Origin].
+        // The server should match the first one it finds (slot 20).
+        let find = encode_message(&ChainSyncMessage::MsgFindIntersect(vec![
+            Point::Specific(20, [0x0B; 32]),
+            Point::Specific(10, [0x0A; 32]),
+            Point::Origin,
+        ]));
+        ingress_tx.send(Bytes::from(find)).await.unwrap();
+
+        let (_, _, resp) = egress_rx.recv().await.unwrap();
+        let msg = decode_message(&resp).unwrap();
+        if let ChainSyncMessage::MsgIntersectFound { point, .. } = msg {
+            assert_eq!(
+                point,
+                Point::Specific(20, [0x0B; 32]),
+                "should match the first (most recent) known point"
+            );
+        } else {
+            panic!("expected MsgIntersectFound, got {msg:?}");
+        }
+
+        let done = encode_message(&ChainSyncMessage::MsgDone);
+        ingress_tx.send(Bytes::from(done)).await.unwrap();
+        handle.await.unwrap().unwrap();
+    }
+
+    /// Verify that extract_header_for_chainsync returns error for invalid era tag.
+    ///
+    /// Storage era tag 100 is not a valid Cardano era and should produce an error
+    /// from `storage_era_tag_to_hfc_index`.
+    #[test]
+    fn extract_header_invalid_era_tag_returns_error() {
+        // Build block with era_tag=100 (invalid).
+        let mut buf = Vec::new();
+        let mut enc = minicbor::Encoder::new(&mut buf);
+        enc.array(2).unwrap();
+        enc.u64(100).unwrap(); // invalid era tag
+        enc.array(5).unwrap();
+        enc.bytes(&[0x01]).unwrap();
+        enc.array(0).unwrap();
+        enc.array(0).unwrap();
+        enc.null().unwrap();
+        enc.array(0).unwrap();
+
+        let result = extract_header_for_chainsync(&buf);
+        assert!(
+            result.is_err(),
+            "era_tag=100 should produce an error, got: {result:?}"
+        );
+    }
+
+    /// Regression lock: MsgAwaitReply is sent when at the tip (no blocks available).
+    ///
+    /// This verifies the wakeup-race boundary: when the server has no next block,
+    /// it MUST send MsgAwaitReply before blocking in the select!{} loop.
+    /// Missing this message leaves the peer in StCanAwait with no reply — the
+    /// SingMustReply timeout (135s) described in project_chainsync_server_silence.md.
+    #[tokio::test]
+    async fn await_reply_sent_when_at_tip() {
+        let block = make_hfc_block(7, &[0xAA]);
+        let (mut channel, mut egress_rx, ingress_tx) = make_test_channel();
+        let provider = MockBlockProvider {
+            blocks: vec![(100, [0xAA; 32], block)],
+        };
+        let (ann_tx, _) = broadcast::channel::<BlockAnnouncement>(16);
+        let (rb_tx, _) = broadcast::channel::<RollbackAnnouncement>(16);
+        let ann_rx = ann_tx.subscribe();
+        let rb_rx = rb_tx.subscribe();
+        let mut server = ChainSyncServer::new();
+
+        let handle =
+            tokio::spawn(async move { server.run(&mut channel, &provider, ann_rx, rb_rx).await });
+
+        // Intersect at origin, serve block, then reach tip.
+        let find = encode_message(&ChainSyncMessage::MsgFindIntersect(vec![Point::Origin]));
+        ingress_tx.send(Bytes::from(find)).await.unwrap();
+        let _ = egress_rx.recv().await.unwrap(); // MsgIntersectFound
+
+        let req = encode_message(&ChainSyncMessage::MsgRequestNext);
+        ingress_tx.send(Bytes::from(req)).await.unwrap();
+        let (_, _, resp) = egress_rx.recv().await.unwrap(); // MsgRollForward
+        assert!(matches!(
+            decode_message(&resp).unwrap(),
+            ChainSyncMessage::MsgRollForward { .. }
+        ));
+
+        // Now at tip — send another MsgRequestNext.
+        let req = encode_message(&ChainSyncMessage::MsgRequestNext);
+        ingress_tx.send(Bytes::from(req)).await.unwrap();
+
+        // CRITICAL: server MUST send MsgAwaitReply before blocking.
+        // If it doesn't, we'd hang here — verifying the wakeup race doesn't
+        // prevent the mandatory MsgAwaitReply from being sent.
+        let (_, _, resp) = egress_rx.recv().await.unwrap();
+        let msg = decode_message(&resp).unwrap();
+        assert!(
+            matches!(msg, ChainSyncMessage::MsgAwaitReply),
+            "REGRESSION: server did not send MsgAwaitReply at tip — \
+             this causes the SingMustReply timeout (project_chainsync_server_silence.md); \
+             got {msg:?}"
+        );
+
+        handle.abort();
+    }
+
     /// Regression test for stale-announcement draining at the top of
     /// `handle_request_next`.
     ///

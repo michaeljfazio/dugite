@@ -496,4 +496,289 @@ mod tests {
         let empty = provider.get_blocks_in_range(100, 200, 100);
         assert_eq!(empty.len(), 0, "no blocks in range should return empty vec");
     }
+
+    /// Verify that MsgClientDone terminates the server cleanly.
+    #[tokio::test]
+    async fn client_done_terminates_server() {
+        let (mut channel, _egress_rx, ingress_tx) = make_test_channel();
+        let provider = MockBlockProvider { blocks: vec![] };
+
+        let handle =
+            tokio::spawn(async move { BlockFetchServer::run(&mut channel, &provider).await });
+
+        let client_done = encode_message(&BlockFetchMessage::MsgClientDone);
+        ingress_tx.send(Bytes::from(client_done)).await.unwrap();
+
+        let result = handle.await.unwrap();
+        assert!(
+            result.is_ok(),
+            "MsgClientDone should terminate server cleanly: {result:?}"
+        );
+    }
+
+    /// Verify that inverted range (to < from) returns MsgNoBlocks.
+    #[tokio::test]
+    async fn inverted_range_returns_no_blocks() {
+        let block = make_storage_block(7, &[0x01]);
+        let (mut channel, mut egress_rx, ingress_tx) = make_test_channel();
+        let provider = MockBlockProvider {
+            blocks: vec![(100, [0x01; 32], block)],
+        };
+
+        let handle =
+            tokio::spawn(async move { BlockFetchServer::run(&mut channel, &provider).await });
+
+        // to_slot (50) < from_slot (100) → invalid range.
+        let req = encode_message(&BlockFetchMessage::MsgRequestRange {
+            from: Point::Specific(100, [0x01; 32]),
+            to: Point::Specific(50, [0x99; 32]),
+        });
+        ingress_tx.send(Bytes::from(req)).await.unwrap();
+
+        let (_, _, resp) = egress_rx.recv().await.unwrap();
+        assert!(
+            matches!(
+                decode_message(&resp).unwrap(),
+                BlockFetchMessage::MsgNoBlocks
+            ),
+            "inverted range should return MsgNoBlocks"
+        );
+
+        let client_done = encode_message(&BlockFetchMessage::MsgClientDone);
+        ingress_tx.send(Bytes::from(client_done)).await.unwrap();
+        handle.await.unwrap().unwrap();
+    }
+
+    /// Verify that requesting from a hash we don't have returns MsgNoBlocks.
+    #[tokio::test]
+    async fn unknown_from_hash_returns_no_blocks() {
+        let block = make_storage_block(7, &[0x01]);
+        let (mut channel, mut egress_rx, ingress_tx) = make_test_channel();
+        let provider = MockBlockProvider {
+            blocks: vec![(100, [0x01; 32], block)],
+        };
+
+        let handle =
+            tokio::spawn(async move { BlockFetchServer::run(&mut channel, &provider).await });
+
+        // from_hash = [0xAB; 32] — not in the provider.
+        let req = encode_message(&BlockFetchMessage::MsgRequestRange {
+            from: Point::Specific(100, [0xAB; 32]),
+            to: Point::Specific(200, [0xAB; 32]),
+        });
+        ingress_tx.send(Bytes::from(req)).await.unwrap();
+
+        let (_, _, resp) = egress_rx.recv().await.unwrap();
+        assert!(
+            matches!(
+                decode_message(&resp).unwrap(),
+                BlockFetchMessage::MsgNoBlocks
+            ),
+            "unknown from-hash should return MsgNoBlocks"
+        );
+
+        let client_done = encode_message(&BlockFetchMessage::MsgClientDone);
+        ingress_tx.send(Bytes::from(client_done)).await.unwrap();
+        handle.await.unwrap().unwrap();
+    }
+
+    /// Verify that a single-block range (from == to) returns exactly one MsgBlock.
+    #[tokio::test]
+    async fn single_block_range_returns_one_msg_block() {
+        let block = make_storage_block(7, &[0xAA, 0xBB]);
+        let (mut channel, mut egress_rx, ingress_tx) = make_test_channel();
+        let provider = MockBlockProvider {
+            blocks: vec![(50, [0x01; 32], block)],
+        };
+
+        let handle =
+            tokio::spawn(async move { BlockFetchServer::run(&mut channel, &provider).await });
+
+        let req = encode_message(&BlockFetchMessage::MsgRequestRange {
+            from: Point::Specific(50, [0x01; 32]),
+            to: Point::Specific(50, [0x01; 32]),
+        });
+        ingress_tx.send(Bytes::from(req)).await.unwrap();
+
+        // MsgStartBatch.
+        let (_, _, start) = egress_rx.recv().await.unwrap();
+        assert!(matches!(
+            decode_message(&start).unwrap(),
+            BlockFetchMessage::MsgStartBatch
+        ));
+
+        // Exactly one MsgBlock.
+        let (_, _, block_msg) = egress_rx.recv().await.unwrap();
+        assert!(matches!(
+            decode_message(&block_msg).unwrap(),
+            BlockFetchMessage::MsgBlock(_)
+        ));
+
+        // MsgBatchDone.
+        let (_, _, done_msg) = egress_rx.recv().await.unwrap();
+        assert!(matches!(
+            decode_message(&done_msg).unwrap(),
+            BlockFetchMessage::MsgBatchDone
+        ));
+
+        let client_done = encode_message(&BlockFetchMessage::MsgClientDone);
+        ingress_tx.send(Bytes::from(client_done)).await.unwrap();
+        handle.await.unwrap().unwrap();
+    }
+
+    /// Verify that MsgBlock payloads are retrievable across multiple batch requests.
+    #[tokio::test]
+    async fn multiple_sequential_range_requests() {
+        let block_a = make_storage_block(7, &[0x0A]);
+        let block_b = make_storage_block(7, &[0x0B]);
+        let block_c = make_storage_block(7, &[0x0C]);
+
+        let (mut channel, mut egress_rx, ingress_tx) = make_test_channel();
+        let provider = MockBlockProvider {
+            blocks: vec![
+                (10, [0x01; 32], block_a),
+                (20, [0x02; 32], block_b),
+                (30, [0x03; 32], block_c),
+            ],
+        };
+
+        let handle =
+            tokio::spawn(async move { BlockFetchServer::run(&mut channel, &provider).await });
+
+        // First request: range [10, 10] → 1 block.
+        let req1 = encode_message(&BlockFetchMessage::MsgRequestRange {
+            from: Point::Specific(10, [0x01; 32]),
+            to: Point::Specific(10, [0x01; 32]),
+        });
+        ingress_tx.send(Bytes::from(req1)).await.unwrap();
+        egress_rx.recv().await.unwrap(); // MsgStartBatch
+        egress_rx.recv().await.unwrap(); // MsgBlock
+        egress_rx.recv().await.unwrap(); // MsgBatchDone
+
+        // Second request: range [20, 30] → 2 blocks.
+        let req2 = encode_message(&BlockFetchMessage::MsgRequestRange {
+            from: Point::Specific(20, [0x02; 32]),
+            to: Point::Specific(30, [0x03; 32]),
+        });
+        ingress_tx.send(Bytes::from(req2)).await.unwrap();
+
+        let (_, _, start) = egress_rx.recv().await.unwrap();
+        assert!(matches!(
+            decode_message(&start).unwrap(),
+            BlockFetchMessage::MsgStartBatch
+        ));
+        let (_, _, b1) = egress_rx.recv().await.unwrap();
+        assert!(matches!(
+            decode_message(&b1).unwrap(),
+            BlockFetchMessage::MsgBlock(_)
+        ));
+        let (_, _, b2) = egress_rx.recv().await.unwrap();
+        assert!(matches!(
+            decode_message(&b2).unwrap(),
+            BlockFetchMessage::MsgBlock(_)
+        ));
+        let (_, _, done) = egress_rx.recv().await.unwrap();
+        assert!(matches!(
+            decode_message(&done).unwrap(),
+            BlockFetchMessage::MsgBatchDone
+        ));
+
+        let client_done = encode_message(&BlockFetchMessage::MsgClientDone);
+        ingress_tx.send(Bytes::from(client_done)).await.unwrap();
+        handle.await.unwrap().unwrap();
+    }
+
+    /// Verify that the stored block CBOR is preserved verbatim inside tag(24).
+    ///
+    /// This is a wire-format regression lock: the Haskell BlockFetch decoder
+    /// expects tag(24) bstr(stored_cbor) where stored_cbor is the exact on-disk
+    /// format [era_word, block_body], NOT an HFC-wrapped [era_index, ...] format.
+    #[test]
+    fn encode_hfc_msg_block_preserves_stored_cbor_verbatim() {
+        let stored_cbor = make_storage_block(5, &[0x11, 0x22, 0x33]); // Alonzo era_tag=5
+        let wire = BlockFetchServer::encode_hfc_msg_block(&stored_cbor).unwrap();
+
+        let mut dec = Decoder::new(&wire);
+        assert_eq!(dec.array().unwrap(), Some(2));
+        assert_eq!(dec.u64().unwrap(), TAG_BLOCK); // tag 4
+        let tag = dec.tag().unwrap();
+        assert_eq!(tag.as_u64(), 24, "must be tag(24)");
+        let payload = dec.bytes().unwrap();
+
+        // The stored CBOR must be preserved VERBATIM inside tag(24).
+        assert_eq!(
+            payload,
+            stored_cbor.as_slice(),
+            "stored CBOR must be verbatim inside tag(24) — no structural transformation"
+        );
+
+        // Confirm the inner CBOR starts with [era_word=5, ...].
+        let mut inner_dec = Decoder::new(payload);
+        assert_eq!(
+            inner_dec.array().unwrap(),
+            Some(2),
+            "inner CBOR must be array(2)"
+        );
+        assert_eq!(
+            inner_dec.u64().unwrap(),
+            5,
+            "inner era tag must be 5 (Alonzo)"
+        );
+    }
+
+    /// Regression lock: MAX_BLOCKS_PER_BATCH must be large enough for dense chain regions.
+    ///
+    /// Haskell BlockFetch clients issue batch requests that can span up to ~500 blocks
+    /// during rapid syncing. Setting this too low causes BlockFetchProtocolFailureTooFewBlocks.
+    /// Verified at compile time.
+    const _: () = assert!(
+        MAX_BLOCKS_PER_BATCH >= 500,
+        "MAX_BLOCKS_PER_BATCH must be >= 500 to handle dense chain regions without TooFewBlocks"
+    );
+
+    /// Verify that range [from=Origin, to=slot_X] is handled: Origin maps to slot 0
+    /// and has_block() always returns true for Origin, so the server proceeds to
+    /// collect blocks starting from slot 0. Uses a positive-slot block because the
+    /// default `get_block_at_or_after_slot(0)` delegates to `get_next_block_after_slot(0)`
+    /// (strict `>` comparison), which finds the first block with slot > 0.
+    #[tokio::test]
+    async fn range_from_origin_to_specific_slot() {
+        let block_a = make_storage_block(7, &[0x01]);
+        let (mut channel, mut egress_rx, ingress_tx) = make_test_channel();
+        let provider = MockBlockProvider {
+            // Block at slot 5 — reachable via get_next_block_after_slot(0) (slot > 0).
+            blocks: vec![(5, [0x01; 32], block_a)],
+        };
+
+        let handle =
+            tokio::spawn(async move { BlockFetchServer::run(&mut channel, &provider).await });
+
+        // Range from Origin (slot=0) to Specific(5).
+        // `from=Origin` → have_from=true; `get_blocks_in_range(0, 5, ...)` finds slot 5.
+        let req = encode_message(&BlockFetchMessage::MsgRequestRange {
+            from: Point::Origin,
+            to: Point::Specific(5, [0x01; 32]),
+        });
+        ingress_tx.send(Bytes::from(req)).await.unwrap();
+
+        let (_, _, start) = egress_rx.recv().await.unwrap();
+        assert!(matches!(
+            decode_message(&start).unwrap(),
+            BlockFetchMessage::MsgStartBatch
+        ));
+        let (_, _, block_msg) = egress_rx.recv().await.unwrap();
+        assert!(matches!(
+            decode_message(&block_msg).unwrap(),
+            BlockFetchMessage::MsgBlock(_)
+        ));
+        let (_, _, done_msg) = egress_rx.recv().await.unwrap();
+        assert!(matches!(
+            decode_message(&done_msg).unwrap(),
+            BlockFetchMessage::MsgBatchDone
+        ));
+
+        let client_done = encode_message(&BlockFetchMessage::MsgClientDone);
+        ingress_tx.send(Bytes::from(client_done)).await.unwrap();
+        handle.await.unwrap().unwrap();
+    }
 }
