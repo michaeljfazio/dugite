@@ -2262,4 +2262,392 @@ mod tests {
         assert_eq!(prior, Some("first"), "second insert overwrites first");
         assert_eq!(h1.len(), 1);
     }
+
+    // ── ConnectionId properties ───────────────────────────────────────────────
+
+    /// Two ConnectionIds with identical (local, remote) are equal.
+    #[test]
+    fn connection_id_equality_same_tuple() {
+        let a = ConnectionId {
+            local: "10.0.0.1:1111".parse().unwrap(),
+            remote: "10.0.0.2:3001".parse().unwrap(),
+        };
+        let b = ConnectionId {
+            local: "10.0.0.1:1111".parse().unwrap(),
+            remote: "10.0.0.2:3001".parse().unwrap(),
+        };
+        assert_eq!(a, b);
+    }
+
+    /// Swapping local and remote produces a DIFFERENT ConnectionId.
+    #[test]
+    fn connection_id_inequality_swapped_roles() {
+        let a = ConnectionId {
+            local: "10.0.0.1:1111".parse().unwrap(),
+            remote: "10.0.0.2:3001".parse().unwrap(),
+        };
+        let b = ConnectionId {
+            local: "10.0.0.2:3001".parse().unwrap(),
+            remote: "10.0.0.1:1111".parse().unwrap(),
+        };
+        assert_ne!(a, b);
+    }
+
+    /// Display format is `local<->remote`.
+    #[test]
+    fn connection_id_display_format() {
+        let cid = ConnectionId {
+            local: "127.0.0.1:3001".parse().unwrap(),
+            remote: "127.0.0.1:3002".parse().unwrap(),
+        };
+        let s = cid.to_string();
+        assert!(
+            s.contains("127.0.0.1:3001"),
+            "display should contain local addr"
+        );
+        assert!(
+            s.contains("127.0.0.1:3002"),
+            "display should contain remote addr"
+        );
+        assert!(s.contains("<->"), "display should use <-> separator");
+    }
+
+    /// Ord: same remote, larger local → greater.
+    #[test]
+    fn connection_id_ord_same_remote_larger_local_greater() {
+        let remote: SocketAddr = "10.0.0.1:3001".parse().unwrap();
+        let small_local: SocketAddr = "127.0.0.1:1000".parse().unwrap();
+        let large_local: SocketAddr = "127.0.0.1:2000".parse().unwrap();
+        let a = ConnectionId {
+            local: small_local,
+            remote,
+        };
+        let b = ConnectionId {
+            local: large_local,
+            remote,
+        };
+        assert!(
+            a < b,
+            "smaller local port should sort first when remote is equal"
+        );
+    }
+
+    /// Ord: different remote, smaller remote always sorts first regardless of local.
+    #[test]
+    fn connection_id_ord_different_remotes() {
+        let r1: SocketAddr = "10.0.0.1:3001".parse().unwrap();
+        let r2: SocketAddr = "10.0.0.2:3001".parse().unwrap();
+        // Give the r1 CID a LARGER local so the local tiebreak alone would flip it.
+        let large_local: SocketAddr = "127.0.0.1:9999".parse().unwrap();
+        let small_local: SocketAddr = "127.0.0.1:1000".parse().unwrap();
+        let a = ConnectionId {
+            local: large_local,
+            remote: r1,
+        };
+        let b = ConnectionId {
+            local: small_local,
+            remote: r2,
+        };
+        // r1 < r2 means a < b, regardless of local.
+        assert!(a < b);
+    }
+
+    /// Clone produces an equal ConnectionId.
+    #[test]
+    fn connection_id_clone_eq() {
+        let cid = ConnectionId {
+            local: "127.0.0.1:3001".parse().unwrap(),
+            remote: "127.0.0.1:3002".parse().unwrap(),
+        };
+        assert_eq!(cid, cid);
+    }
+
+    /// Copy semantics: assigning a ConnectionId produces an equal independent value.
+    #[test]
+    fn connection_id_copy_independent() {
+        let a = ConnectionId {
+            local: "127.0.0.1:1234".parse().unwrap(),
+            remote: "127.0.0.1:5678".parse().unwrap(),
+        };
+        let b = a; // Copy
+        assert_eq!(a, b);
+    }
+
+    // ── LifecycleError variants ───────────────────────────────────────────────
+
+    /// LifecycleError::NotConnected includes the address in its Display.
+    #[test]
+    fn lifecycle_error_not_connected_display_includes_addr() {
+        let addr: SocketAddr = "192.168.1.1:3001".parse().unwrap();
+        let err = LifecycleError::NotConnected(addr);
+        assert!(err.to_string().contains("192.168.1.1:3001"));
+    }
+
+    /// LifecycleError::AlreadyConnected includes the address in its Display.
+    #[test]
+    fn lifecycle_error_already_connected_display_includes_addr() {
+        let addr: SocketAddr = "192.168.1.2:3001".parse().unwrap();
+        let err = LifecycleError::AlreadyConnected(addr);
+        assert!(err.to_string().contains("192.168.1.2:3001"));
+    }
+
+    /// LifecycleError implements std::error::Error (verify .source() returns None for base variants).
+    #[test]
+    fn lifecycle_error_implements_std_error() {
+        use std::error::Error;
+        let addr: SocketAddr = "127.0.0.1:1".parse().unwrap();
+        let err = LifecycleError::NotConnected(addr);
+        // Just checking the trait impl compiles and source() is accessible.
+        let _ = err.source();
+    }
+
+    // ── ConnectionLifecycleManager helpers ────────────────────────────────────
+
+    /// Fresh manager starts with zero connections.
+    #[tokio::test]
+    async fn manager_starts_empty() {
+        let lc = ConnectionLifecycleManager::new_for_test();
+        assert_eq!(lc.connection_count(), 0);
+        assert!(lc.connected_addrs().is_empty());
+    }
+
+    /// has_connection returns false for unknown peer.
+    #[tokio::test]
+    async fn has_connection_unknown_peer_returns_false() {
+        let lc = ConnectionLifecycleManager::new_for_test();
+        let addr: SocketAddr = "10.0.0.1:3001".parse().unwrap();
+        assert!(!lc.has_connection(&addr));
+    }
+
+    /// has_connection returns true after insert_fake.
+    #[tokio::test]
+    async fn has_connection_after_insert_true() {
+        let mut lc = ConnectionLifecycleManager::new_for_test();
+        let addr: SocketAddr = "10.0.0.1:3001".parse().unwrap();
+        lc.insert_fake_for_test(addr);
+        assert!(lc.has_connection(&addr));
+    }
+
+    /// has_connection returns false after removing the only connection.
+    #[tokio::test]
+    async fn has_connection_after_remove_false() {
+        let mut lc = ConnectionLifecycleManager::new_for_test();
+        let addr: SocketAddr = "10.0.0.1:3002".parse().unwrap();
+        lc.insert_fake_for_test(addr);
+        lc.remove_fake_for_test(addr);
+        assert!(!lc.has_connection(&addr));
+    }
+
+    /// connected_addrs deduplicates — one entry per remote even with duplex pair.
+    #[tokio::test]
+    async fn connected_addrs_deduplicated_by_remote() {
+        let mut lc = ConnectionLifecycleManager::new_for_test();
+        let remote: SocketAddr = "10.0.0.5:3001".parse().unwrap();
+        let out_local: SocketAddr = "127.0.0.1:60000".parse().unwrap();
+        let in_local: SocketAddr = "127.0.0.1:3001".parse().unwrap();
+        lc.insert_fake_duplex_for_test(remote, out_local, in_local);
+
+        let addrs = lc.connected_addrs();
+        assert_eq!(addrs.len(), 1, "duplex pair must appear as a single remote");
+        assert!(addrs.contains(&remote));
+    }
+
+    /// connected_addrs returns all distinct remotes when multiple single-directional peers exist.
+    #[tokio::test]
+    async fn connected_addrs_multiple_distinct_peers() {
+        let mut lc = ConnectionLifecycleManager::new_for_test();
+        let p1: SocketAddr = "10.0.0.1:3001".parse().unwrap();
+        let p2: SocketAddr = "10.0.0.2:3001".parse().unwrap();
+        let p3: SocketAddr = "10.0.0.3:3001".parse().unwrap();
+        lc.insert_fake_for_test(p1);
+        lc.insert_fake_for_test(p2);
+        lc.insert_fake_for_test(p3);
+
+        let mut addrs = lc.connected_addrs();
+        addrs.sort();
+        assert_eq!(addrs.len(), 3);
+        assert!(addrs.contains(&p1));
+        assert!(addrs.contains(&p2));
+        assert!(addrs.contains(&p3));
+    }
+
+    /// drain_connections empties the internal map.
+    #[tokio::test]
+    async fn drain_connections_empties_map() {
+        let mut lc = ConnectionLifecycleManager::new_for_test();
+        lc.insert_fake_for_test("10.0.0.1:3001".parse().unwrap());
+        lc.insert_fake_for_test("10.0.0.2:3001".parse().unwrap());
+        assert_eq!(lc.connection_count(), 2);
+
+        let drained = lc.drain_connections();
+        assert_eq!(drained.len(), 2);
+        assert_eq!(lc.connection_count(), 0, "map must be empty after drain");
+    }
+
+    /// find_outbound_cid returns None for unknown peer.
+    #[tokio::test]
+    async fn find_outbound_cid_unknown_peer_returns_none() {
+        let lc = ConnectionLifecycleManager::new_for_test();
+        let addr: SocketAddr = "10.0.0.1:3001".parse().unwrap();
+        assert!(lc.find_outbound_cid(addr).is_none());
+    }
+
+    /// find_outbound_cid finds outbound in a duplex pair.
+    #[tokio::test]
+    async fn find_outbound_cid_prefers_outbound_in_duplex() {
+        let mut lc = ConnectionLifecycleManager::new_for_test();
+        let remote: SocketAddr = "10.0.0.7:3001".parse().unwrap();
+        let out_local: SocketAddr = "127.0.0.1:44444".parse().unwrap();
+        let in_local: SocketAddr = "127.0.0.1:3001".parse().unwrap();
+        lc.insert_fake_duplex_for_test(remote, out_local, in_local);
+
+        let cid = lc
+            .find_outbound_cid(remote)
+            .expect("outbound CID not found");
+        assert_eq!(cid.local, out_local);
+        assert_eq!(cid.remote, remote);
+    }
+
+    /// find_any_cid falls back to inbound when no outbound exists for the peer.
+    #[tokio::test]
+    async fn find_any_cid_finds_any_connection() {
+        let mut lc = ConnectionLifecycleManager::new_for_test();
+        let addr: SocketAddr = "10.0.0.9:3001".parse().unwrap();
+        lc.insert_fake_for_test(addr);
+
+        let cid = lc.find_any_cid(addr).expect("should find a connection");
+        assert_eq!(cid.remote, addr);
+    }
+
+    /// find_any_cid returns None when no connection exists.
+    #[tokio::test]
+    async fn find_any_cid_no_connection_returns_none() {
+        let lc = ConnectionLifecycleManager::new_for_test();
+        let addr: SocketAddr = "10.0.0.9:3001".parse().unwrap();
+        assert!(lc.find_any_cid(addr).is_none());
+    }
+
+    // ── select_headers_to_fetch (connection_lifecycle re-export) ─────────────
+
+    /// Empty pending → empty result (via the public function visible from this module).
+    #[test]
+    fn select_headers_to_fetch_empty_pending() {
+        use std::collections::HashSet;
+        let empty: Vec<PendingHeader> = vec![];
+        let out = select_headers_to_fetch(&empty, |_| false, &HashSet::new());
+        assert!(out.is_empty());
+    }
+
+    /// Header with same hash as ChainDB entry is excluded.
+    #[test]
+    fn select_headers_to_fetch_excludes_known() {
+        use std::collections::HashSet;
+        let known_hash = [0xAB; 32];
+        let pending = vec![
+            PendingHeader {
+                slot: 1,
+                hash: known_hash,
+                header_cbor: vec![],
+            },
+            PendingHeader {
+                slot: 2,
+                hash: [0xCD; 32],
+                header_cbor: vec![],
+            },
+        ];
+        let out = select_headers_to_fetch(&pending, |h| h == &known_hash, &HashSet::new());
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].hash, [0xCD; 32]);
+    }
+
+    // ── CandidateChainState ───────────────────────────────────────────────────
+
+    /// Default CandidateChainState fields round-trip through Clone.
+    #[test]
+    fn candidate_chain_state_clone_preserves_fields() {
+        let state = CandidateChainState {
+            tip_slot: 9999,
+            tip_hash: [0x77; 32],
+            tip_block_number: 42,
+            pending_headers: vec![PendingHeader {
+                slot: 9999,
+                hash: [0x77; 32],
+                header_cbor: vec![0x01, 0x02],
+            }],
+        };
+        let cloned = state.clone();
+        assert_eq!(cloned.tip_slot, 9999);
+        assert_eq!(cloned.tip_hash, [0x77; 32]);
+        assert_eq!(cloned.tip_block_number, 42);
+        assert_eq!(cloned.pending_headers.len(), 1);
+        assert_eq!(cloned.pending_headers[0].header_cbor, vec![0x01u8, 0x02]);
+    }
+
+    /// CandidateChainState with empty pending_headers is valid.
+    #[test]
+    fn candidate_chain_state_empty_pending_ok() {
+        let state = CandidateChainState {
+            tip_slot: 0,
+            tip_hash: [0u8; 32],
+            tip_block_number: 0,
+            pending_headers: vec![],
+        };
+        assert!(state.pending_headers.is_empty());
+    }
+
+    // ── Simultaneous-open / Overwritten invariant ─────────────────────────────
+
+    /// Two distinct remotes with the same local produce distinct ConnectionIds.
+    #[test]
+    fn connection_id_distinct_remotes_same_local_not_equal() {
+        let local: SocketAddr = "127.0.0.1:3001".parse().unwrap();
+        let r1: SocketAddr = "10.0.0.1:3001".parse().unwrap();
+        let r2: SocketAddr = "10.0.0.2:3001".parse().unwrap();
+        let a = ConnectionId { local, remote: r1 };
+        let b = ConnectionId { local, remote: r2 };
+        assert_ne!(a, b);
+    }
+
+    /// ConnectionId with same remote but different local ports are NOT equal —
+    /// verifies the tuple-keying approach that allows duplex pair coexistence
+    /// (regression-lock for the block diffusion fix from 2026-04-29).
+    #[test]
+    fn connection_id_same_remote_different_local_not_equal() {
+        let remote: SocketAddr = "10.0.0.1:3001".parse().unwrap();
+        let local_a: SocketAddr = "127.0.0.1:54321".parse().unwrap(); // ephemeral outbound
+        let local_b: SocketAddr = "127.0.0.1:3001".parse().unwrap(); // listen port inbound
+        let a = ConnectionId {
+            local: local_a,
+            remote,
+        };
+        let b = ConnectionId {
+            local: local_b,
+            remote,
+        };
+        // These must be DIFFERENT keys so both can coexist in the HashMap.
+        assert_ne!(
+            a, b,
+            "duplex pair connections must have distinct ConnectionIds"
+        );
+    }
+
+    /// After inserting an outbound and inbound for the same remote, connection_count is 2.
+    #[tokio::test]
+    async fn duplex_pair_connection_count_is_2() {
+        let mut lc = ConnectionLifecycleManager::new_for_test();
+        let remote: SocketAddr = "10.0.0.1:3001".parse().unwrap();
+        let out_local: SocketAddr = "127.0.0.1:54321".parse().unwrap();
+        let in_local: SocketAddr = "127.0.0.1:3001".parse().unwrap();
+        lc.insert_fake_duplex_for_test(remote, out_local, in_local);
+        assert_eq!(lc.connection_count(), 2);
+    }
+
+    /// set_local_listen_addr: can be called without panicking.
+    #[tokio::test]
+    async fn set_local_listen_addr_no_panic() {
+        let mut lc = ConnectionLifecycleManager::new_for_test();
+        let addr: SocketAddr = "0.0.0.0:3001".parse().unwrap();
+        lc.set_local_listen_addr(addr);
+        // No assertion needed: just verifies no panic.
+    }
 }

@@ -3699,3 +3699,598 @@ mod chainsync_task_tests {
         assert!(!rollback_exceeds_k_limit(10_000, 6_001, 2160));
     }
 }
+
+// ─── Additional unit tests ────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod additional_sync_tests {
+    use super::*;
+    use crate::node::connection_lifecycle::select_headers_to_fetch;
+    use dugite_primitives::block::{
+        Block, BlockHeader, OperationalCert, ProtocolVersion, VrfOutput,
+    };
+    use dugite_primitives::era::Era;
+    use dugite_primitives::hash::Hash32;
+    use dugite_primitives::time::{BlockNo, SlotNo};
+
+    // ── Helper: build a minimal Block for genesis-validation tests ────────────
+
+    fn make_block(
+        era: Era,
+        block_number: u64,
+        slot: u64,
+        header_hash: Hash32,
+        prev_hash: Hash32,
+    ) -> Block {
+        Block {
+            header: BlockHeader {
+                header_hash,
+                prev_hash,
+                issuer_vkey: vec![],
+                vrf_vkey: vec![],
+                vrf_result: VrfOutput {
+                    output: vec![],
+                    proof: vec![],
+                },
+                block_number: BlockNo(block_number),
+                slot: SlotNo(slot),
+                epoch_nonce: Hash32::from_bytes([0u8; 32]),
+                body_size: 0,
+                body_hash: Hash32::from_bytes([0u8; 32]),
+                operational_cert: OperationalCert {
+                    hot_vkey: vec![],
+                    sequence_number: 0,
+                    kes_period: 0,
+                    sigma: vec![],
+                },
+                protocol_version: ProtocolVersion { major: 9, minor: 0 },
+                kes_signature: vec![],
+                nonce_vrf_output: vec![],
+                nonce_vrf_proof: vec![],
+            },
+            transactions: vec![],
+            era,
+            raw_cbor: None,
+        }
+    }
+
+    // ── validate_genesis_blocks ───────────────────────────────────────────────
+
+    /// Empty slice must always succeed regardless of configured hashes.
+    #[test]
+    fn validate_genesis_empty_slice_ok() {
+        let expected = Hash32::from_bytes([0xAB; 32]);
+        assert!(validate_genesis_blocks(&[], Some(&expected), Some(&expected)).is_ok());
+        assert!(validate_genesis_blocks(&[], None, None).is_ok());
+    }
+
+    /// Non-genesis first block (block_number > 0) must skip validation and succeed.
+    #[test]
+    fn validate_genesis_non_genesis_block_skipped() {
+        let wrong_hash = Hash32::from_bytes([0xFF; 32]);
+        let block = make_block(
+            Era::Byron,
+            1, // block_number=1, not genesis
+            0,
+            Hash32::from_bytes([0xAA; 32]),
+            Hash32::ZERO,
+        );
+        // Even if expected hash is wrong, non-genesis blocks skip validation.
+        assert!(validate_genesis_blocks(&[block], Some(&wrong_hash), None).is_ok());
+    }
+
+    /// Byron EBB at block_number=0 with correct hash must pass.
+    #[test]
+    fn validate_genesis_byron_correct_hash_ok() {
+        let hash = Hash32::from_bytes([0x11; 32]);
+        let block = make_block(Era::Byron, 0, 0, hash, Hash32::ZERO);
+        // The hash() method on Block returns &header.header_hash.
+        // We pass the same value as the expected — must succeed.
+        let result =
+            validate_genesis_blocks(std::slice::from_ref(&block), Some(block.hash()), None);
+        assert!(
+            result.is_ok(),
+            "correct Byron genesis hash must pass: {result:?}"
+        );
+    }
+
+    /// Byron EBB at block_number=0 with wrong expected hash must fail.
+    #[test]
+    fn validate_genesis_byron_wrong_hash_fails() {
+        let actual_hash = Hash32::from_bytes([0x11; 32]);
+        let expected_hash = Hash32::from_bytes([0x22; 32]);
+        let block = make_block(Era::Byron, 0, 0, actual_hash, Hash32::ZERO);
+        let result = validate_genesis_blocks(&[block], Some(&expected_hash), None);
+        assert!(
+            result.is_err(),
+            "mismatched Byron genesis hash must return Err"
+        );
+        let msg = result.unwrap_err().to_string();
+        assert!(
+            msg.contains("Byron genesis block hash mismatch"),
+            "error message should mention mismatch; got: {msg}"
+        );
+    }
+
+    /// Byron EBB with no expected hash configured must succeed (just a warning).
+    #[test]
+    fn validate_genesis_byron_no_expected_hash_ok() {
+        let block = make_block(
+            Era::Byron,
+            0,
+            0,
+            Hash32::from_bytes([0x11; 32]),
+            Hash32::ZERO,
+        );
+        assert!(validate_genesis_blocks(&[block], None, None).is_ok());
+    }
+
+    /// Shelley-first chain (block_number=0, era=Shelley): correct prev_hash passes.
+    #[test]
+    fn validate_genesis_shelley_correct_prev_hash_ok() {
+        let shelley_genesis_hash = Hash32::from_bytes([0x33; 32]);
+        let block = make_block(
+            Era::Shelley,
+            0,
+            0,
+            Hash32::from_bytes([0xAA; 32]),
+            shelley_genesis_hash, // prev_hash == shelley genesis hash
+        );
+        let result = validate_genesis_blocks(&[block], None, Some(&shelley_genesis_hash));
+        assert!(
+            result.is_ok(),
+            "correct Shelley genesis prev_hash must pass: {result:?}"
+        );
+    }
+
+    /// Shelley-first chain (block_number=0): wrong prev_hash must fail.
+    #[test]
+    fn validate_genesis_shelley_wrong_prev_hash_fails() {
+        let shelley_genesis_hash = Hash32::from_bytes([0x33; 32]);
+        let wrong_prev = Hash32::from_bytes([0x44; 32]);
+        let block = make_block(
+            Era::Shelley,
+            0,
+            0,
+            Hash32::from_bytes([0xAA; 32]),
+            wrong_prev, // wrong prev_hash
+        );
+        let result = validate_genesis_blocks(&[block], None, Some(&shelley_genesis_hash));
+        assert!(
+            result.is_err(),
+            "mismatched Shelley genesis hash must return Err"
+        );
+        let msg = result.unwrap_err().to_string();
+        assert!(
+            msg.contains("Shelley genesis hash mismatch"),
+            "error should mention Shelley mismatch; got: {msg}"
+        );
+    }
+
+    /// Shelley-first chain with no expected Shelley hash: must succeed (just a warning).
+    #[test]
+    fn validate_genesis_shelley_no_expected_hash_ok() {
+        let block = make_block(
+            Era::Shelley,
+            0,
+            0,
+            Hash32::from_bytes([0xAA; 32]),
+            Hash32::from_bytes([0x99; 32]),
+        );
+        assert!(validate_genesis_blocks(&[block], None, None).is_ok());
+    }
+
+    // ── unwrap_hfc_header ─────────────────────────────────────────────────────
+
+    /// Build a minimal valid HFC-wrapped header and verify unwrapping works.
+    #[test]
+    fn unwrap_hfc_header_valid_returns_inner_bytes() {
+        use minicbor::Encoder;
+        let inner_bytes = b"fake_inner_header";
+        let mut buf = Vec::new();
+        let mut enc = Encoder::new(&mut buf);
+        enc.array(2).unwrap();
+        enc.u64(2).unwrap(); // era_tag=2 (Shelley)
+        enc.tag(minicbor::data::Tag::new(24)).unwrap();
+        enc.bytes(inner_bytes).unwrap();
+
+        let result = unwrap_hfc_header(&buf);
+        assert_eq!(result, Some(inner_bytes.as_ref()));
+    }
+
+    /// CBOR that is NOT an array(2) returns None (not HFC format).
+    #[test]
+    fn unwrap_hfc_header_not_array2_returns_none() {
+        use minicbor::Encoder;
+        // array(3) is not HFC
+        let mut buf = Vec::new();
+        let mut enc = Encoder::new(&mut buf);
+        enc.array(3).unwrap();
+        enc.u64(1).unwrap();
+        enc.u64(2).unwrap();
+        enc.u64(3).unwrap();
+        assert_eq!(unwrap_hfc_header(&buf), None);
+    }
+
+    /// Empty CBOR returns None.
+    #[test]
+    fn unwrap_hfc_header_empty_returns_none() {
+        assert_eq!(unwrap_hfc_header(&[]), None);
+    }
+
+    /// Array with wrong tag (not tag 24) returns None.
+    #[test]
+    fn unwrap_hfc_header_wrong_tag_returns_none() {
+        use minicbor::Encoder;
+        let mut buf = Vec::new();
+        let mut enc = Encoder::new(&mut buf);
+        enc.array(2).unwrap();
+        enc.u64(1).unwrap(); // era_tag
+        enc.tag(minicbor::data::Tag::new(6)).unwrap(); // wrong tag
+        enc.bytes(b"foo").unwrap();
+        assert_eq!(unwrap_hfc_header(&buf), None);
+    }
+
+    // ── extract_hash_from_header ──────────────────────────────────────────────
+
+    /// Hash is deterministic: same input always produces the same 32 bytes.
+    #[test]
+    fn extract_hash_from_header_deterministic() {
+        let header = b"test_header_bytes";
+        let h1 = extract_hash_from_header(header);
+        let h2 = extract_hash_from_header(header);
+        assert_eq!(h1, h2);
+        assert_eq!(h1.len(), 32);
+    }
+
+    /// Different inputs produce different hashes.
+    #[test]
+    fn extract_hash_from_header_distinct_inputs_distinct_outputs() {
+        let h1 = extract_hash_from_header(b"input_a");
+        let h2 = extract_hash_from_header(b"input_b");
+        assert_ne!(h1, h2);
+    }
+
+    /// HFC-wrapped header: hash is computed from INNER bytes, not the wrapper.
+    #[test]
+    fn extract_hash_from_header_uses_inner_bytes_not_wrapper() {
+        use minicbor::Encoder;
+        let inner_bytes = b"real_inner_header_data";
+
+        // Build HFC wrapper
+        let mut wrapped = Vec::new();
+        let mut enc = Encoder::new(&mut wrapped);
+        enc.array(2).unwrap();
+        enc.u64(3).unwrap(); // era_tag
+        enc.tag(minicbor::data::Tag::new(24)).unwrap();
+        enc.bytes(inner_bytes).unwrap();
+
+        // Hash of the wrapped form (as if unwrapping failed)
+        let hash_of_wrapper = extract_hash_from_header(&wrapped);
+        // Hash of the raw inner bytes (what the function should compute)
+        let hash_of_inner = dugite_primitives::hash::blake2b_256(inner_bytes.as_ref());
+        let mut expected = [0u8; 32];
+        expected.copy_from_slice(hash_of_inner.as_ref());
+
+        // The function should use inner bytes.
+        assert_eq!(
+            hash_of_wrapper, expected,
+            "extract_hash_from_header must hash the INNER (unwrapped) bytes"
+        );
+    }
+
+    // ── to_codec_point / from_codec_point ─────────────────────────────────────
+
+    /// Origin round-trips through both conversion functions.
+    #[test]
+    fn point_roundtrip_origin() {
+        let p = Point::Origin;
+        assert_eq!(from_codec_point(&to_codec_point(&p)), p);
+    }
+
+    /// Specific point round-trips preserving slot and hash.
+    #[test]
+    fn point_roundtrip_specific_preserves_slot_and_hash() {
+        let hash = Hash32::from_bytes([0xDE; 32]);
+        let p = Point::Specific(SlotNo(99999), hash);
+        let rt = from_codec_point(&to_codec_point(&p));
+        assert_eq!(rt, p);
+    }
+
+    /// Slot=0 with non-zero hash round-trips correctly.
+    #[test]
+    fn point_roundtrip_slot_zero() {
+        let hash = Hash32::from_bytes([0x01; 32]);
+        let p = Point::Specific(SlotNo(0), hash);
+        assert_eq!(from_codec_point(&to_codec_point(&p)), p);
+    }
+
+    /// to_codec_point(Origin) → CodecPoint::Origin.
+    #[test]
+    fn to_codec_point_origin() {
+        assert!(matches!(to_codec_point(&Point::Origin), CodecPoint::Origin));
+    }
+
+    /// to_codec_point(Specific) → CodecPoint::Specific with correct (slot, hash).
+    #[test]
+    fn to_codec_point_specific_fields() {
+        let hash = Hash32::from_bytes([0xAB; 32]);
+        let p = Point::Specific(SlotNo(42), hash);
+        match to_codec_point(&p) {
+            CodecPoint::Specific(slot, arr) => {
+                assert_eq!(slot, 42);
+                assert_eq!(arr, [0xABu8; 32]);
+            }
+            other => panic!("expected Specific, got {other:?}"),
+        }
+    }
+
+    // ── prune_already_known_pending_headers ───────────────────────────────────
+
+    /// Empty pending list stays empty after pruning.
+    #[test]
+    fn prune_empty_headers_noop() {
+        let dir = tempfile::tempdir().unwrap();
+        let chain_db = dugite_storage::ChainDB::open(dir.path()).unwrap();
+        let mut headers: Vec<PendingHeader> = vec![];
+        prune_already_known_pending_headers(&mut headers, &chain_db);
+        assert!(headers.is_empty());
+    }
+
+    /// Headers whose hashes are not in the ChainDB are all retained.
+    #[test]
+    fn prune_unknown_headers_all_retained() {
+        let dir = tempfile::tempdir().unwrap();
+        let chain_db = dugite_storage::ChainDB::open(dir.path()).unwrap();
+        let headers = vec![
+            PendingHeader {
+                slot: 10,
+                hash: [0x01; 32],
+                header_cbor: vec![],
+            },
+            PendingHeader {
+                slot: 20,
+                hash: [0x02; 32],
+                header_cbor: vec![],
+            },
+        ];
+        let mut headers = headers;
+        prune_already_known_pending_headers(&mut headers, &chain_db);
+        assert_eq!(headers.len(), 2);
+    }
+
+    /// Headers whose hashes are in the ChainDB are dropped.
+    #[test]
+    fn prune_known_headers_removed() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut chain_db = dugite_storage::ChainDB::open(dir.path()).unwrap();
+
+        let h1 = Hash32::from_bytes([0xAA; 32]);
+        let h2 = Hash32::from_bytes([0xBB; 32]);
+        chain_db
+            .add_block(
+                h1,
+                SlotNo(100),
+                BlockNo(1),
+                Hash32::ZERO,
+                b"block1".to_vec(),
+            )
+            .unwrap();
+
+        let mut pending = vec![
+            PendingHeader {
+                slot: 100,
+                hash: [0xAAu8; 32], // in ChainDB
+                header_cbor: vec![],
+            },
+            PendingHeader {
+                slot: 200,
+                hash: {
+                    let mut arr = [0u8; 32];
+                    arr.copy_from_slice(h2.as_ref());
+                    arr
+                }, // NOT in ChainDB
+                header_cbor: vec![],
+            },
+        ];
+
+        prune_already_known_pending_headers(&mut pending, &chain_db);
+        assert_eq!(pending.len(), 1, "only unknown header should remain");
+        assert_eq!(pending[0].hash, {
+            let mut arr = [0u8; 32];
+            arr.copy_from_slice(h2.as_ref());
+            arr
+        });
+    }
+
+    /// All headers known → list becomes empty.
+    #[test]
+    fn prune_all_known_headers_empty_result() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut chain_db = dugite_storage::ChainDB::open(dir.path()).unwrap();
+
+        let h1 = Hash32::from_bytes([0xCC; 32]);
+        let h2 = Hash32::from_bytes([0xDD; 32]);
+        chain_db
+            .add_block(h1, SlotNo(1), BlockNo(1), Hash32::ZERO, b"a".to_vec())
+            .unwrap();
+        chain_db
+            .add_block(h2, SlotNo(2), BlockNo(2), h1, b"b".to_vec())
+            .unwrap();
+
+        let mut arr1 = [0u8; 32];
+        arr1.copy_from_slice(h1.as_ref());
+        let mut arr2 = [0u8; 32];
+        arr2.copy_from_slice(h2.as_ref());
+
+        let mut pending = vec![
+            PendingHeader {
+                slot: 1,
+                hash: arr1,
+                header_cbor: vec![],
+            },
+            PendingHeader {
+                slot: 2,
+                hash: arr2,
+                header_cbor: vec![],
+            },
+        ];
+        prune_already_known_pending_headers(&mut pending, &chain_db);
+        assert!(pending.is_empty(), "all known headers must be removed");
+    }
+
+    // ── select_headers_to_fetch ───────────────────────────────────────────────
+
+    /// Empty pending list produces empty output.
+    #[test]
+    fn select_headers_empty_pending_empty_result() {
+        use std::collections::HashSet;
+        let pending: Vec<PendingHeader> = vec![];
+        let out = select_headers_to_fetch(&pending, |_| false, &HashSet::new());
+        assert!(out.is_empty());
+    }
+
+    /// All headers unknown in ChainDB and not in-flight → all selected.
+    #[test]
+    fn select_headers_all_unknown_all_selected() {
+        use std::collections::HashSet;
+        let pending = vec![
+            PendingHeader {
+                slot: 1,
+                hash: [0x01; 32],
+                header_cbor: vec![],
+            },
+            PendingHeader {
+                slot: 2,
+                hash: [0x02; 32],
+                header_cbor: vec![],
+            },
+        ];
+        let out = select_headers_to_fetch(&pending, |_| false, &HashSet::new());
+        assert_eq!(out.len(), 2);
+    }
+
+    /// Header known in ChainDB is filtered out; unknown header is kept.
+    #[test]
+    fn select_headers_known_in_chain_db_filtered() {
+        use std::collections::HashSet;
+        let known: [[u8; 32]; 1] = [[0x01; 32]];
+        let pending = vec![
+            PendingHeader {
+                slot: 1,
+                hash: [0x01; 32], // known
+                header_cbor: vec![],
+            },
+            PendingHeader {
+                slot: 2,
+                hash: [0x02; 32], // unknown
+                header_cbor: vec![],
+            },
+        ];
+        let out = select_headers_to_fetch(&pending, |h| known.contains(h), &HashSet::new());
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].hash, [0x02; 32]);
+    }
+
+    /// Header in fetched_hashes (in-flight) is skipped even if not in ChainDB.
+    #[test]
+    fn select_headers_in_flight_skipped() {
+        use std::collections::HashSet;
+        let fetched: HashSet<[u8; 32]> = [[0xAA; 32]].into_iter().collect();
+        let pending = vec![
+            PendingHeader {
+                slot: 10,
+                hash: [0xAA; 32], // in-flight
+                header_cbor: vec![],
+            },
+            PendingHeader {
+                slot: 11,
+                hash: [0xBB; 32], // available
+                header_cbor: vec![],
+            },
+        ];
+        let out = select_headers_to_fetch(&pending, |_| false, &fetched);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].hash, [0xBB; 32]);
+    }
+
+    /// Fork blocks whose slot is below the applied tip must still be selected
+    /// (regression: old slot-based filter dropped them, stalling the fork switch).
+    #[test]
+    fn select_headers_fork_blocks_below_applied_slot_selected() {
+        use std::collections::HashSet;
+        // Applied tip is at slot 200.  Fork block is at slot 150 with a new hash.
+        let pending = vec![PendingHeader {
+            slot: 150, // below applied tip
+            hash: [0xFE; 32],
+            header_cbor: vec![],
+        }];
+        let out = select_headers_to_fetch(&pending, |_| false, &HashSet::new());
+        assert_eq!(
+            out.len(),
+            1,
+            "fork block below applied slot must still be fetched"
+        );
+    }
+
+    // ── extract_slot_from_wrapped_header ─────────────────────────────────────
+
+    /// Raw (unwrapped) Shelley header: slot extracted correctly.
+    #[test]
+    fn extract_slot_raw_shelley_header_ok() {
+        use minicbor::Encoder;
+        let mut buf = Vec::new();
+        let mut enc = Encoder::new(&mut buf);
+        enc.array(2).unwrap(); // [header_body, signature]
+        enc.array(3).unwrap(); // header_body: [block_number, slot, prev_hash]
+        enc.u64(42).unwrap(); // block_number
+        enc.u64(77777).unwrap(); // slot
+        enc.bytes(&[0u8; 32]).unwrap(); // prev_hash
+
+        // signature
+        enc.bytes(&[0u8; 64]).unwrap();
+
+        assert_eq!(extract_slot_from_wrapped_header(&buf), Some(77777));
+    }
+
+    /// HFC-wrapped Shelley header: slot extracted from inner bytes.
+    #[test]
+    fn extract_slot_hfc_wrapped_shelley_header_ok() {
+        use minicbor::Encoder;
+
+        // Build inner bytes first
+        let mut inner = Vec::new();
+        let mut enc = Encoder::new(&mut inner);
+        enc.array(2).unwrap(); // [header_body, signature]
+        enc.array(3).unwrap(); // header_body
+        enc.u64(1).unwrap(); // block_number
+        enc.u64(54321).unwrap(); // slot
+        enc.bytes(&[0u8; 32]).unwrap(); // prev_hash
+        enc.bytes(&[0u8; 64]).unwrap(); // signature
+
+        // Wrap as [era_tag, tag24(inner)]
+        let mut outer = Vec::new();
+        let mut enc2 = Encoder::new(&mut outer);
+        enc2.array(2).unwrap();
+        enc2.u64(1).unwrap(); // era_tag = Shelley
+        enc2.tag(minicbor::data::Tag::new(24)).unwrap();
+        enc2.bytes(&inner).unwrap();
+
+        assert_eq!(extract_slot_from_wrapped_header(&outer), Some(54321));
+    }
+
+    /// Empty input returns None (no panic).
+    #[test]
+    fn extract_slot_empty_returns_none() {
+        assert_eq!(extract_slot_from_wrapped_header(&[]), None);
+    }
+
+    /// Random garbage returns None (no panic).
+    #[test]
+    fn extract_slot_garbage_returns_none() {
+        assert_eq!(
+            extract_slot_from_wrapped_header(&[0xDE, 0xAD, 0xBE, 0xEF]),
+            None
+        );
+    }
+}
