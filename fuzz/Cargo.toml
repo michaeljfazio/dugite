@@ -17,6 +17,12 @@ dugite-primitives = { path = "../crates/dugite-primitives" }
 dugite-ledger = { path = "../crates/dugite-ledger" }
 dugite-mempool = { path = "../crates/dugite-mempool" }
 dugite-lsm = { path = "../crates/dugite-lsm" }
+dugite-crypto = { path = "../crates/dugite-crypto" }
+dugite-consensus = { path = "../crates/dugite-consensus" }
+dugite-storage = { path = "../crates/dugite-storage" }
+# Direct uplc dep surfaces eval_phase_two_raw, Program::from_cbor/from_flat,
+# uplc::plutus_data, and apply_params_to_script for Plutus Phase-4 fuzz targets.
+uplc = { git = "https://github.com/aiken-lang/aiken.git", rev = "6806d52211fbb469ae13aa0e0290aeb6b9b3e8cf" }
 tempfile = "3"
 tokio = { version = "1", features = ["rt"] }
 
@@ -97,4 +103,99 @@ doc = false
 [[bin]]
 name = "fuzz_epoch_transition"
 path = "fuzz_targets/epoch_transition.rs"
+doc = false
+
+[[bin]]
+name = "fuzz_mux_demux"
+path = "fuzz_targets/mux_demux.rs"
+doc = false
+
+[[bin]]
+name = "fuzz_n2c_query"
+path = "fuzz_targets/n2c_query.rs"
+doc = false
+
+[[bin]]
+name = "fuzz_n2c_tx_submission"
+path = "fuzz_targets/n2c_tx_submission.rs"
+doc = false
+
+[[bin]]
+name = "fuzz_block_fetch_msg"
+path = "fuzz_targets/block_fetch_msg.rs"
+doc = false
+
+[[bin]]
+name = "fuzz_tx_submission2_msg"
+path = "fuzz_targets/tx_submission2_msg.rs"
+doc = false
+
+[[bin]]
+name = "fuzz_keepalive_msg"
+path = "fuzz_targets/keepalive_msg.rs"
+doc = false
+
+[[bin]]
+name = "fuzz_peer_sharing_msg"
+path = "fuzz_targets/peer_sharing_msg.rs"
+doc = false
+
+[[bin]]
+name = "fuzz_vrf_verify"
+path = "fuzz_targets/vrf_verify.rs"
+doc = false
+
+[[bin]]
+name = "fuzz_kes_verify"
+path = "fuzz_targets/kes_verify.rs"
+doc = false
+
+[[bin]]
+name = "fuzz_opcert_verify"
+path = "fuzz_targets/opcert_verify.rs"
+doc = false
+
+[[bin]]
+name = "fuzz_ed25519_verify"
+path = "fuzz_targets/ed25519_verify.rs"
+doc = false
+
+[[bin]]
+name = "fuzz_blake2b_hash"
+path = "fuzz_targets/blake2b_hash.rs"
+doc = false
+
+[[bin]]
+name = "fuzz_chain_select"
+path = "fuzz_targets/chain_select.rs"
+doc = false
+
+[[bin]]
+name = "fuzz_immutable_chunk_parse"
+path = "fuzz_targets/immutable_chunk_parse.rs"
+doc = false
+
+[[bin]]
+name = "fuzz_volatile_recovery"
+path = "fuzz_targets/volatile_recovery.rs"
+doc = false
+
+[[bin]]
+name = "fuzz_chaindb_rollback"
+path = "fuzz_targets/chaindb_rollback.rs"
+doc = false
+
+[[bin]]
+name = "fuzz_plutus_script_decode"
+path = "fuzz_targets/plutus_script_decode.rs"
+doc = false
+
+[[bin]]
+name = "fuzz_plutus_data_decode"
+path = "fuzz_targets/plutus_data_decode.rs"
+doc = false
+
+[[bin]]
+name = "fuzz_cost_model_eval"
+path = "fuzz_targets/cost_model_eval.rs"
 doc = false

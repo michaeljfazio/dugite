@@ -88,6 +88,11 @@ const TAG_REPLY_TXS: u64 = 3;
 const TAG_DONE: u64 = 4;
 const TAG_INIT: u64 = 6;
 
+/// Upper bound on inflight tx ids/txs per message. The protocol's req_count and
+/// ack_count are u16, so a peer claiming more than `u16::MAX` entries is malformed
+/// and would otherwise let an adversary trigger an unbounded `Vec::reserve`.
+const MAX_INFLIGHT: u64 = u16::MAX as u64;
+
 /// Encode a TxSubmission2 message as CBOR.
 pub fn encode_message(msg: &TxSubmissionMessage) -> Vec<u8> {
     let mut buf = Vec::new();
@@ -226,6 +231,11 @@ pub fn decode_message(data: &[u8]) -> Result<TxSubmissionMessage, String> {
                         .array()
                         .map_err(|e| e.to_string())?
                         .ok_or("expected definite array length")?;
+                    if len > MAX_INFLIGHT {
+                        return Err(format!(
+                            "MsgReplyTxIds: array length {len} exceeds max {MAX_INFLIGHT}"
+                        ));
+                    }
                     ids.reserve(len as usize);
                     for _ in 0..len {
                         // Outer entry: [GenTxId, size]
@@ -285,6 +295,11 @@ pub fn decode_message(data: &[u8]) -> Result<TxSubmissionMessage, String> {
                         .array()
                         .map_err(|e| e.to_string())?
                         .ok_or("expected definite array length")?;
+                    if len > MAX_INFLIGHT {
+                        return Err(format!(
+                            "MsgRequestTxs: array length {len} exceeds max {MAX_INFLIGHT}"
+                        ));
+                    }
                     ids.reserve(len as usize);
                     for _ in 0..len {
                         // GenTxId = [era_id, txid_bytes]
@@ -331,6 +346,11 @@ pub fn decode_message(data: &[u8]) -> Result<TxSubmissionMessage, String> {
                         .array()
                         .map_err(|e| e.to_string())?
                         .ok_or("expected definite array length")?;
+                    if len > MAX_INFLIGHT {
+                        return Err(format!(
+                            "MsgReplyTxs: array length {len} exceeds max {MAX_INFLIGHT}"
+                        ));
+                    }
                     txs.reserve(len as usize);
                     for _ in 0..len {
                         // GenTx = [era_id, tag(24)(tx_cbor)]

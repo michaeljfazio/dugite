@@ -569,13 +569,13 @@ impl ImmutableDB {
             let mut hash_bytes = [0u8; 32];
             hash_bytes.copy_from_slice(&data[16..48]);
 
-            // Determine block end: start of next entry's block_offset, or chunk_len
-            let next_offset = if pos + SECONDARY_ENTRY_SIZE < secondary_data.len() {
-                let next_data = &secondary_data[pos + SECONDARY_ENTRY_SIZE..];
-                read_be_u64(&next_data[0..8]).unwrap_or(chunk_len)
-            } else {
-                chunk_len
-            };
+            // Determine block end: start of next entry's block_offset, or chunk_len.
+            // The trailing bytes after the last full entry may be shorter than 8 bytes
+            // on a corrupt/truncated index; guard with `get` to avoid a slice panic.
+            let next_offset = secondary_data
+                .get(pos + SECONDARY_ENTRY_SIZE..pos + SECONDARY_ENTRY_SIZE + 8)
+                .and_then(read_be_u64)
+                .unwrap_or(chunk_len);
 
             entries_meta.push((block_offset, next_offset, hash_bytes, checksum));
             pos += SECONDARY_ENTRY_SIZE;
