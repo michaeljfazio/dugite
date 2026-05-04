@@ -278,4 +278,259 @@ mod tests {
         assert!(protocol_ids.contains(&2));
         assert!(protocol_ids.contains(&3));
     }
+
+    /// Verify that egress exits cleanly (Ok(())) when the channel is closed with no messages.
+    #[tokio::test]
+    async fn empty_channel_returns_ok() {
+        let (tx, rx) = mpsc::channel(64);
+        let task = EgressTask::new(rx, 12288, 131072);
+
+        // Close the channel immediately — no messages ever queued.
+        drop(tx);
+
+        let result = task
+            .run(move |_data: &[u8]| Box::pin(async move { Ok(()) }))
+            .await;
+
+        assert!(result.is_ok(), "empty channel should return Ok: {result:?}");
+    }
+
+    /// Verify that exact SDU-boundary messages produce exactly one SDU frame.
+    #[tokio::test]
+    async fn message_exactly_sdu_size_produces_one_frame() {
+        let sdu_size = 10;
+        let msg = vec![0xAB; sdu_size]; // exactly 10 bytes
+        let captured =
+            run_egress_capturing(sdu_size, vec![(2, Direction::InitiatorDir, msg.clone())]).await;
+
+        // Should be exactly one SDU: header + 10 bytes
+        assert_eq!(captured.len(), HEADER_SIZE + sdu_size);
+        let header = decode_header(captured[..8].try_into().unwrap());
+        assert_eq!(header.payload_length as usize, sdu_size);
+        assert_eq!(&captured[8..], msg.as_slice());
+    }
+
+    /// Verify that an empty message body produces a zero-length SDU.
+    #[tokio::test]
+    async fn zero_length_message_produces_zero_payload_sdu() {
+        let captured =
+            run_egress_capturing(12288, vec![(2, Direction::InitiatorDir, vec![])]).await;
+
+        // Should be one SDU: header + 0 bytes
+        assert_eq!(captured.len(), HEADER_SIZE);
+        let header = decode_header(captured[..8].try_into().unwrap());
+        assert_eq!(header.payload_length, 0);
+    }
+
+    /// Verify that every SDU in a segmented message carries the same protocol_id and direction.
+    #[tokio::test]
+    async fn all_segments_carry_correct_protocol_and_direction() {
+        // 20-byte message, SDU=5 → 4 segments.
+        let msg = (0u8..20u8).collect::<Vec<_>>();
+        let captured =
+            run_egress_capturing(5, vec![(7, Direction::ResponderDir, msg.clone())]).await;
+
+        let mut offset = 0;
+        let mut segment_count = 0;
+        let mut reassembled = Vec::new();
+        while offset < captured.len() {
+            let header = decode_header(captured[offset..offset + 8].try_into().unwrap());
+            assert_eq!(
+                header.protocol_id, 7,
+                "segment {segment_count}: wrong protocol_id"
+            );
+            assert_eq!(
+                header.direction,
+                Direction::ResponderDir,
+                "segment {segment_count}: wrong direction"
+            );
+            let end = offset + HEADER_SIZE + header.payload_length as usize;
+            reassembled.extend_from_slice(&captured[offset + HEADER_SIZE..end]);
+            offset = end;
+            segment_count += 1;
+        }
+
+        assert_eq!(
+            segment_count, 4,
+            "20-byte message / SDU=5 should produce 4 segments"
+        );
+        assert_eq!(
+            reassembled, msg,
+            "reassembled payload should match original"
+        );
+    }
+
+    /// Verify that the egress write_fn error propagates as MuxError::Bearer.
+    #[tokio::test]
+    async fn write_error_propagates() {
+        use crate::error::BearerError;
+
+        let (tx, rx) = mpsc::channel(64);
+        let task = EgressTask::new(rx, 12288, 131072);
+
+        tx.send((
+            2,
+            Direction::InitiatorDir,
+            bytes::Bytes::from(vec![0x81, 0x01]),
+        ))
+        .await
+        .unwrap();
+        drop(tx);
+
+        let result = task
+            .run(move |_data: &[u8]| Box::pin(async move { Err(BearerError::ConnectionReset) }))
+            .await;
+
+        assert!(
+            matches!(result, Err(MuxError::Bearer(BearerError::ConnectionReset))),
+            "expected Bearer(ConnectionReset) error, got: {result:?}"
+        );
+    }
+
+    /// Verify that messages on different (protocol_id, direction) pairs are kept separate.
+    ///
+    /// This is the regression lock for the ConnectionId tuple keying fix — two connections
+    /// using the same protocol_id but different directions must not overwrite each other's
+    /// queues in the egress HashMap.
+    #[tokio::test]
+    async fn different_direction_same_protocol_kept_separate() {
+        // Protocol 8 (KeepAlive) on both InitiatorDir and ResponderDir.
+        let msg_init = vec![0x11; 3];
+        let msg_resp = vec![0x22; 3];
+        let captured = run_egress_capturing(
+            12288,
+            vec![
+                (8, Direction::InitiatorDir, msg_init.clone()),
+                (8, Direction::ResponderDir, msg_resp.clone()),
+            ],
+        )
+        .await;
+
+        let mut offset = 0;
+        let mut init_payloads: Vec<Vec<u8>> = Vec::new();
+        let mut resp_payloads: Vec<Vec<u8>> = Vec::new();
+
+        while offset < captured.len() {
+            let header = decode_header(captured[offset..offset + 8].try_into().unwrap());
+            let payload_start = offset + HEADER_SIZE;
+            let payload_end = payload_start + header.payload_length as usize;
+            let payload = captured[payload_start..payload_end].to_vec();
+            match header.direction {
+                Direction::InitiatorDir => init_payloads.push(payload),
+                Direction::ResponderDir => resp_payloads.push(payload),
+            }
+            offset = payload_end;
+        }
+
+        // Both messages should have been emitted independently.
+        let all_init: Vec<u8> = init_payloads.into_iter().flatten().collect();
+        let all_resp: Vec<u8> = resp_payloads.into_iter().flatten().collect();
+        assert_eq!(all_init, msg_init, "InitiatorDir payload corrupted");
+        assert_eq!(all_resp, msg_resp, "ResponderDir payload corrupted");
+    }
+
+    /// Verify batching: two small messages sent back-to-back may be coalesced
+    /// into a single write call (batch_size larger than their combined size).
+    #[tokio::test]
+    async fn small_messages_may_be_batched() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let (tx, rx) = mpsc::channel(64);
+        let task = EgressTask::new(rx, 12288, 131072);
+
+        let write_count = Arc::new(AtomicUsize::new(0));
+        let write_count2 = write_count.clone();
+        let captured = Arc::new(Mutex::new(Vec::new()));
+        let cap2 = captured.clone();
+
+        // Send two tiny messages before closing.
+        tx.send((
+            2,
+            Direction::InitiatorDir,
+            bytes::Bytes::from(vec![0x81, 0x01]),
+        ))
+        .await
+        .unwrap();
+        tx.send((
+            3,
+            Direction::InitiatorDir,
+            bytes::Bytes::from(vec![0x81, 0x02]),
+        ))
+        .await
+        .unwrap();
+        drop(tx);
+
+        task.run(move |data: &[u8]| {
+            write_count2.fetch_add(1, Ordering::SeqCst);
+            cap2.lock().unwrap().extend_from_slice(data);
+            Box::pin(async move { Ok(()) })
+        })
+        .await
+        .unwrap();
+
+        let total = captured.lock().unwrap().len();
+        // Each message is HEADER_SIZE + 2 bytes = 10 bytes; two messages = 20 bytes.
+        assert_eq!(total, 2 * (HEADER_SIZE + 2));
+        // The two messages may be coalesced into 1 or 2 writes — either is fine.
+        // We only assert that at least one write happened.
+        assert!(write_count.load(Ordering::SeqCst) >= 1);
+    }
+
+    /// Verify three-SDU segmentation: (sdu_size, remainder1, remainder2) for 3-chunk messages.
+    #[tokio::test]
+    async fn three_chunk_segmentation() {
+        // sdu_size=4, message=9 bytes → chunks: [4, 4, 1]
+        let msg: Vec<u8> = (1u8..=9u8).collect();
+        let captured =
+            run_egress_capturing(4, vec![(2, Direction::InitiatorDir, msg.clone())]).await;
+
+        let mut offset = 0;
+        let mut chunk_sizes = Vec::new();
+        let mut reassembled = Vec::new();
+        while offset < captured.len() {
+            let header = decode_header(captured[offset..offset + 8].try_into().unwrap());
+            let len = header.payload_length as usize;
+            chunk_sizes.push(len);
+            reassembled
+                .extend_from_slice(&captured[offset + HEADER_SIZE..offset + HEADER_SIZE + len]);
+            offset += HEADER_SIZE + len;
+        }
+
+        assert_eq!(
+            chunk_sizes,
+            vec![4, 4, 1],
+            "9-byte message / SDU=4 should produce [4,4,1] chunks"
+        );
+        assert_eq!(reassembled, msg);
+    }
+
+    /// Verify egress handles a single very large message spanning many SDUs correctly.
+    #[tokio::test]
+    async fn large_message_full_reconstruction() {
+        // 1000-byte message with sdu_size=100 → 10 segments of 100 bytes each.
+        let msg: Vec<u8> = (0u8..=255u8).cycle().take(1000).collect();
+        let captured =
+            run_egress_capturing(100, vec![(2, Direction::InitiatorDir, msg.clone())]).await;
+
+        let mut offset = 0;
+        let mut count = 0;
+        let mut reassembled = Vec::new();
+        while offset < captured.len() {
+            let header = decode_header(captured[offset..offset + 8].try_into().unwrap());
+            let len = header.payload_length as usize;
+            reassembled
+                .extend_from_slice(&captured[offset + HEADER_SIZE..offset + HEADER_SIZE + len]);
+            offset += HEADER_SIZE + len;
+            count += 1;
+        }
+
+        assert_eq!(
+            count, 10,
+            "1000-byte message / SDU=100 should produce 10 segments"
+        );
+        assert_eq!(
+            reassembled, msg,
+            "full reconstruction should match original"
+        );
+    }
 }
