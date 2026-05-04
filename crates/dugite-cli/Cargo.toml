@@ -30,3 +30,6 @@ minicbor = { workspace = true }
 rand = { workspace = true }
 blake2 = { workspace = true }
 reqwest = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

@@ -371,3 +371,210 @@ pub fn issue_op_cert(
     println!("Counter: {counter_value} -> {new_counter}");
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ── simple_cbor_wrap ────────────────────────────────────────────────────
+
+    #[test]
+    fn test_cbor_wrap_tiny() {
+        // data.len() < 24 → one-byte header 0x40 | len
+        let data = [0u8; 4];
+        let wrapped = simple_cbor_wrap(&data);
+        assert_eq!(wrapped[0], 0x40 | 4);
+        assert_eq!(&wrapped[1..], data.as_slice());
+        assert_eq!(wrapped.len(), 5);
+    }
+
+    #[test]
+    fn test_cbor_wrap_medium() {
+        // 24 <= len < 256 → 0x58 prefix + 1-byte length
+        let data = vec![0xabu8; 32]; // 32 bytes, a common key length
+        let wrapped = simple_cbor_wrap(&data);
+        assert_eq!(wrapped[0], 0x58);
+        assert_eq!(wrapped[1], 32);
+        assert_eq!(&wrapped[2..], data.as_slice());
+        assert_eq!(wrapped.len(), 34);
+    }
+
+    #[test]
+    fn test_cbor_wrap_large() {
+        // len >= 256 → 0x59 prefix + 2-byte big-endian length
+        let data = vec![0x00u8; 300];
+        let wrapped = simple_cbor_wrap(&data);
+        assert_eq!(wrapped[0], 0x59);
+        let declared_len = u16::from_be_bytes([wrapped[1], wrapped[2]]) as usize;
+        assert_eq!(declared_len, 300);
+        assert_eq!(&wrapped[3..], data.as_slice());
+    }
+
+    #[test]
+    fn test_cbor_wrap_empty() {
+        // Empty payload: header 0x40, no further bytes
+        let wrapped = simple_cbor_wrap(&[]);
+        assert_eq!(wrapped, vec![0x40]);
+    }
+
+    #[test]
+    fn test_cbor_wrap_boundary_23() {
+        // Exactly 23 bytes → still tiny path
+        let data = vec![0xffu8; 23];
+        let wrapped = simple_cbor_wrap(&data);
+        assert_eq!(wrapped[0], 0x40 | 23);
+        assert_eq!(wrapped.len(), 24);
+    }
+
+    #[test]
+    fn test_cbor_wrap_boundary_24() {
+        // Exactly 24 bytes → medium path (0x58 prefix)
+        let data = vec![0xffu8; 24];
+        let wrapped = simple_cbor_wrap(&data);
+        assert_eq!(wrapped[0], 0x58);
+        assert_eq!(wrapped[1], 24);
+        assert_eq!(wrapped.len(), 26);
+    }
+
+    // ── issue_op_cert via temp files ─────────────────────────────────────────
+
+    /// Generate a cold key pair and return JSON text-envelope strings.
+    fn make_cold_key_pair() -> (String, String) {
+        let sk = dugite_crypto::keys::PaymentSigningKey::generate();
+        let vk = sk.verification_key();
+        let sk_json = serde_json::json!({
+            "type": "StakePoolSigningKey_ed25519",
+            "description": "Stake Pool Operator Signing Key",
+            "cborHex": hex::encode(simple_cbor_wrap(&sk.to_bytes()))
+        });
+        let vk_json = serde_json::json!({
+            "type": "StakePoolVerificationKey_ed25519",
+            "description": "Stake Pool Operator Verification Key",
+            "cborHex": hex::encode(simple_cbor_wrap(&vk.to_bytes()))
+        });
+        (
+            serde_json::to_string_pretty(&sk_json).unwrap(),
+            serde_json::to_string_pretty(&vk_json).unwrap(),
+        )
+    }
+
+    /// Generate a KES key pair and return (sk_json, vk_json, pk_bytes).
+    fn make_kes_key_pair() -> (String, String, [u8; 32]) {
+        use rand::RngCore;
+        let mut seed = [0u8; 32];
+        rand::rng().fill_bytes(&mut seed);
+        let (sk_bytes, pk_bytes) = dugite_crypto::kes::kes_keygen(&seed).unwrap();
+        let sk_json = serde_json::json!({
+            "type": "KesSigningKey_ed25519_kes_2^6",
+            "description": "KES Signing Key",
+            "cborHex": hex::encode(simple_cbor_wrap(&sk_bytes))
+        });
+        let vk_json = serde_json::json!({
+            "type": "KesVerificationKey_ed25519_kes_2^6",
+            "description": "KES Period Verification Key",
+            "cborHex": hex::encode(simple_cbor_wrap(&pk_bytes))
+        });
+        (
+            serde_json::to_string_pretty(&sk_json).unwrap(),
+            serde_json::to_string_pretty(&vk_json).unwrap(),
+            pk_bytes,
+        )
+    }
+
+    #[test]
+    fn test_issue_op_cert_produces_valid_envelope() {
+        let dir = tempfile::tempdir().unwrap();
+        let cold_sk_path = dir.path().join("cold.skey");
+        let cold_vk_path = dir.path().join("cold.vkey");
+        let kes_vk_path = dir.path().join("kes.vkey");
+        let counter_path = dir.path().join("counter.json");
+        let opcert_path = dir.path().join("opcert.json");
+
+        let (cold_sk, _cold_vk) = make_cold_key_pair();
+        let (_kes_sk, kes_vk, _kes_pk_bytes) = make_kes_key_pair();
+
+        std::fs::write(&cold_sk_path, &cold_sk).unwrap();
+        std::fs::write(&kes_vk_path, &kes_vk).unwrap();
+        std::fs::write(&cold_vk_path, &_cold_vk).unwrap();
+
+        // Build a minimal counter file with counter=0 (array(2)[0, bytes(vkey_cbor)])
+        // The real issue_op_cert reads: array() → u64 counter → (ignores the rest).
+        // We include a placeholder vkey cbor bytes to match the format.
+        let placeholder_vkey_cbor = simple_cbor_wrap(&[0u8; 32]);
+        let mut counter_cbor = Vec::new();
+        let mut enc = minicbor::Encoder::new(&mut counter_cbor);
+        enc.array(2).unwrap();
+        enc.u64(0).unwrap();
+        enc.bytes(&placeholder_vkey_cbor).unwrap();
+        let cold_vk_env = serde_json::json!({
+            "type": "NodeOperationalCertificateIssueCounter",
+            "description": "Next certificate issue number: 0",
+            "cborHex": hex::encode(&counter_cbor)
+        });
+        std::fs::write(
+            &counter_path,
+            serde_json::to_string_pretty(&cold_vk_env).unwrap(),
+        )
+        .unwrap();
+
+        let result = issue_op_cert(&kes_vk_path, &cold_sk_path, &counter_path, 0, &opcert_path);
+        assert!(result.is_ok(), "issue_op_cert failed: {:?}", result.err());
+
+        // Verify the output file is valid JSON with the right type
+        let content = std::fs::read_to_string(&opcert_path).unwrap();
+        let env: serde_json::Value = serde_json::from_str(&content).unwrap();
+        assert_eq!(env["type"].as_str().unwrap(), "NodeOperationalCertificate");
+        assert!(env["cborHex"].as_str().is_some());
+
+        // Verify counter was incremented
+        let counter_content = std::fs::read_to_string(&counter_path).unwrap();
+        let counter_env: serde_json::Value = serde_json::from_str(&counter_content).unwrap();
+        let desc = counter_env["description"].as_str().unwrap();
+        assert!(
+            desc.contains('1'),
+            "counter must be incremented to 1, got: {desc}"
+        );
+    }
+
+    #[test]
+    fn test_issue_op_cert_counter_increments() {
+        let dir = tempfile::tempdir().unwrap();
+        let cold_sk_path = dir.path().join("cold.skey");
+        let kes_vk_path = dir.path().join("kes.vkey");
+        let counter_path = dir.path().join("counter.json");
+        let opcert_path = dir.path().join("opcert.json");
+
+        let (cold_sk, _) = make_cold_key_pair();
+        let (_, kes_vk, _) = make_kes_key_pair();
+
+        std::fs::write(&cold_sk_path, &cold_sk).unwrap();
+        std::fs::write(&kes_vk_path, &kes_vk).unwrap();
+
+        // Counter starts at 5 — same format as issue_op_cert expects
+        let placeholder_vkey_cbor = simple_cbor_wrap(&[0u8; 32]);
+        let mut counter_cbor = Vec::new();
+        let mut enc = minicbor::Encoder::new(&mut counter_cbor);
+        enc.array(2).unwrap();
+        enc.u64(5).unwrap();
+        enc.bytes(&placeholder_vkey_cbor).unwrap();
+        let counter_env = serde_json::json!({
+            "type": "NodeOperationalCertificateIssueCounter",
+            "description": "Next certificate issue number: 5",
+            "cborHex": hex::encode(&counter_cbor)
+        });
+        std::fs::write(
+            &counter_path,
+            serde_json::to_string_pretty(&counter_env).unwrap(),
+        )
+        .unwrap();
+
+        issue_op_cert(&kes_vk_path, &cold_sk_path, &counter_path, 42, &opcert_path).unwrap();
+
+        let counter_content = std::fs::read_to_string(&counter_path).unwrap();
+        let updated: serde_json::Value = serde_json::from_str(&counter_content).unwrap();
+        assert!(
+            updated["description"].as_str().unwrap().contains('6'),
+            "counter must advance from 5 to 6"
+        );
+    }
+}
