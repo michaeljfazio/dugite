@@ -354,6 +354,121 @@ mod tests {
         let _ = result;
     }
 
+    /// Verify is_initiator() reflects the value passed to Mux::new().
+    #[test]
+    fn mux_is_initiator_flag() {
+        let bearer = MockBearer::new(vec![], 12288, 131072);
+        let mux = Mux::new(bearer, true);
+        assert!(mux.is_initiator());
+
+        let bearer2 = MockBearer::new(vec![], 12288, 131072);
+        let mux2 = Mux::new(bearer2, false);
+        assert!(!mux2.is_initiator());
+    }
+
+    /// Verify that multiple subscriptions with different (protocol_id, direction) pairs
+    /// can coexist without overwriting each other (regression lock for HashMap keying).
+    #[test]
+    fn subscribe_multiple_protocols_distinct_keys() {
+        let bearer = MockBearer::new(vec![], 12288, 131072);
+        let mut mux = Mux::new(bearer, true);
+
+        let ch2_init = mux.subscribe(2, Direction::InitiatorDir, 65536);
+        let ch2_resp = mux.subscribe(2, Direction::ResponderDir, 65536);
+        let ch3_init = mux.subscribe(3, Direction::InitiatorDir, 65536);
+
+        // Verify each channel reports the correct binding.
+        assert_eq!(ch2_init.protocol_id(), 2);
+        assert_eq!(ch2_init.direction(), Direction::InitiatorDir);
+        assert_eq!(ch2_resp.protocol_id(), 2);
+        assert_eq!(ch2_resp.direction(), Direction::ResponderDir);
+        assert_eq!(ch3_init.protocol_id(), 3);
+        assert_eq!(ch3_init.direction(), Direction::InitiatorDir);
+    }
+
+    /// Verify that two subscriptions with the same (protocol_id, direction) key cause
+    /// the ingress_routes HashMap to hold only the LATEST entry (last-writer-wins).
+    ///
+    /// This documents current behavior — in production, each unique (pid, dir) pair
+    /// must be subscribed at most once, matching the connection architecture where
+    /// client=InitiatorDir and server=ResponderDir per protocol.
+    #[test]
+    fn subscribe_duplicate_key_replaces_previous_route() {
+        let bearer = MockBearer::new(vec![], 12288, 131072);
+        let mut mux = Mux::new(bearer, true);
+
+        // First subscription for (2, InitiatorDir).
+        let _ch1 = mux.subscribe(2, Direction::InitiatorDir, 65536);
+        // Second subscription replaces it (same key).
+        let _ch2 = mux.subscribe(2, Direction::InitiatorDir, 65536);
+
+        // We only verify this doesn't panic — the HashMap has 1 entry for this key.
+        assert_eq!(mux.ingress_routes.len(), 1);
+    }
+
+    /// Verify that ingress SDU with a direction other than what was subscribed is ignored
+    /// (different key after flip, routes to unknown-protocol path).
+    ///
+    /// Wire: remote sends protocol 2 as ResponderDir → after flip → InitiatorDir.
+    /// We subscribed (2, ResponderDir) — so InitiatorDir won't match.
+    /// The data should be silently dropped (no panic, no blocking).
+    #[tokio::test]
+    async fn ingress_sdu_wrong_direction_silently_dropped() {
+        // Subscribe (2, ResponderDir) — listens for remote's InitiatorDir (after flip).
+        // Send remote's ResponderDir → after flip → InitiatorDir → no match.
+        let bearer = build_mock_bearer_with_sdus(vec![
+            (2, Direction::ResponderDir, vec![0x81, 0x01]), // will flip to InitiatorDir
+        ]);
+
+        let mut mux = Mux::new(bearer, false);
+        // Subscribe (2, ResponderDir) — expects flip from InitiatorDir.
+        let mut ch = mux.subscribe(2, Direction::ResponderDir, 65536);
+
+        let mux_handle = tokio::spawn(async move { mux.run().await });
+
+        // The mux should terminate (EOF) without delivering any data to ch.
+        let _ = mux_handle.await.unwrap();
+
+        // Channel should be closed / empty — try_recv returns None or BearerClosed.
+        let result = ch.try_recv();
+        // Either None (nothing delivered) or Err(BearerClosed) is acceptable.
+        match result {
+            Ok(None) => {}                                  // Nothing in buffer — correct
+            Err(crate::error::MuxError::BearerClosed) => {} // Channel dropped — correct
+            other => panic!("expected Ok(None) or Err(BearerClosed), got {other:?}"),
+        }
+    }
+
+    /// Verify that two sequential SDUs for the same protocol are both delivered.
+    #[tokio::test]
+    async fn two_sequential_sdus_both_delivered() {
+        let bearer = build_mock_bearer_with_sdus(vec![
+            (2, Direction::InitiatorDir, vec![0x81, 0x01]),
+            (2, Direction::InitiatorDir, vec![0x81, 0x02]),
+        ]);
+
+        let mut mux = Mux::new(bearer, false); // responder
+        let mut ch = mux.subscribe(2, Direction::ResponderDir, 65536);
+
+        tokio::spawn(async move { mux.run().await });
+
+        let msg1 = ch.recv().await.unwrap();
+        assert_eq!(msg1, vec![0x81, 0x01]);
+
+        let msg2 = ch.recv().await.unwrap();
+        assert_eq!(msg2, vec![0x81, 0x02]);
+    }
+
+    /// Regression lock: INGRESS_CHANNEL_CAPACITY must exceed the default pipeline depth (300).
+    ///
+    /// Verified at compile time: if the constant is lowered below 300,
+    /// ChainSync pipelining will stall the ingress task.
+    const _: () = assert!(
+        INGRESS_CHANNEL_CAPACITY > 300,
+        "INGRESS_CHANNEL_CAPACITY must exceed default pipeline depth 300 \
+         to prevent ingress stall under pipelining"
+    );
+
     /// Duplex KeepAlive integration test.
     ///
     /// Exercises a real TCP loopback connection with a full Mux instance on each

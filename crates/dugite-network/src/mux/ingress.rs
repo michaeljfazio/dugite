@@ -404,6 +404,347 @@ mod tests {
         );
     }
 
+    /// Verify that ingress gracefully handles EOF on header read (connection closed cleanly).
+    #[tokio::test]
+    async fn clean_eof_on_header_returns_ok() {
+        let routes = HashMap::new();
+        let task = IngressTask::new(routes);
+
+        // read_fn immediately signals ConnectionReset (clean EOF)
+        let result = task
+            .run(|_n: usize| Box::pin(async move { Err(BearerError::ConnectionReset) }))
+            .await;
+
+        assert!(
+            result.is_ok(),
+            "ConnectionReset on header read should be treated as clean EOF: {result:?}"
+        );
+    }
+
+    /// Verify direction flip: remote InitiatorDir → local ResponderDir routing.
+    #[tokio::test]
+    async fn direction_flip_routes_to_correct_channel() {
+        // Subscribe (5, ResponderDir) — that's what we should see after flipping
+        // the remote's (5, InitiatorDir).
+        let (tx, mut rx) = mpsc::channel(32);
+        let mut routes = HashMap::new();
+        routes.insert(
+            (5, Direction::ResponderDir),
+            IngressRoute {
+                tx,
+                limit: 65536,
+                bytes_in_flight: Arc::new(AtomicUsize::new(0)),
+            },
+        );
+
+        let task = IngressTask::new(routes);
+
+        // Remote sends on protocol 5 with InitiatorDir → wire shows InitiatorDir.
+        let wire = std::sync::Arc::new(std::sync::Mutex::new(build_sdu(
+            5,
+            Direction::InitiatorDir,
+            &[0x01],
+        )));
+        let offset = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let wire2 = wire.clone();
+        let off2 = offset.clone();
+        task.run(move |n: usize| {
+            let w = wire2.clone();
+            let o = off2.clone();
+            Box::pin(async move {
+                let data = w.lock().unwrap();
+                let off = o.load(std::sync::atomic::Ordering::SeqCst);
+                if off + n > data.len() {
+                    return Err(BearerError::ConnectionReset);
+                }
+                let r = data[off..off + n].to_vec();
+                o.store(off + n, std::sync::atomic::Ordering::SeqCst);
+                Ok(r)
+            })
+        })
+        .await
+        .unwrap();
+
+        let chunk = rx.recv().await.unwrap();
+        assert_eq!(chunk.as_ref(), &[0x01]);
+    }
+
+    /// Verify direction flip: remote ResponderDir → local InitiatorDir routing.
+    #[tokio::test]
+    async fn direction_flip_responder_to_initiator() {
+        let (tx, mut rx) = mpsc::channel(32);
+        let mut routes = HashMap::new();
+        routes.insert(
+            (5, Direction::InitiatorDir),
+            IngressRoute {
+                tx,
+                limit: 65536,
+                bytes_in_flight: Arc::new(AtomicUsize::new(0)),
+            },
+        );
+
+        let task = IngressTask::new(routes);
+
+        let wire = build_sdu(5, Direction::ResponderDir, &[0x02, 0x03]);
+        let wire = std::sync::Arc::new(std::sync::Mutex::new(wire));
+        let offset = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let wire2 = wire.clone();
+        let off2 = offset.clone();
+        task.run(move |n: usize| {
+            let w = wire2.clone();
+            let o = off2.clone();
+            Box::pin(async move {
+                let data = w.lock().unwrap();
+                let off = o.load(std::sync::atomic::Ordering::SeqCst);
+                if off + n > data.len() {
+                    return Err(BearerError::ConnectionReset);
+                }
+                let r = data[off..off + n].to_vec();
+                o.store(off + n, std::sync::atomic::Ordering::SeqCst);
+                Ok(r)
+            })
+        })
+        .await
+        .unwrap();
+
+        let chunk = rx.recv().await.unwrap();
+        assert_eq!(chunk.as_ref(), &[0x02, 0x03]);
+    }
+
+    /// Verify that an unknown protocol ID is silently dropped (no panic, no error).
+    #[tokio::test]
+    async fn unknown_protocol_silently_dropped() {
+        // No routes registered. Protocol 99 should be silently dropped.
+        let routes = HashMap::new();
+        let task = IngressTask::new(routes);
+
+        let wire = build_sdu(99, Direction::InitiatorDir, &[0xDE, 0xAD]);
+        let wire = std::sync::Arc::new(std::sync::Mutex::new(wire));
+        let offset = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let wire2 = wire.clone();
+        let off2 = offset.clone();
+        let result = task
+            .run(move |n: usize| {
+                let w = wire2.clone();
+                let o = off2.clone();
+                Box::pin(async move {
+                    let data = w.lock().unwrap();
+                    let off = o.load(std::sync::atomic::Ordering::SeqCst);
+                    if off + n > data.len() {
+                        return Err(BearerError::ConnectionReset);
+                    }
+                    let r = data[off..off + n].to_vec();
+                    o.store(off + n, std::sync::atomic::Ordering::SeqCst);
+                    Ok(r)
+                })
+            })
+            .await;
+
+        // Should return Ok — unknown protocol is not a fatal error.
+        assert!(
+            result.is_ok(),
+            "unknown protocol should not be fatal: {result:?}"
+        );
+    }
+
+    /// Verify that an overrun (bytes exceed channel limit) returns IngressQueueOverrun.
+    #[tokio::test]
+    async fn ingress_queue_overrun_returned_when_limit_exceeded() {
+        let (tx, _rx) = mpsc::channel(32);
+        let mut routes = HashMap::new();
+        routes.insert(
+            (2, Direction::ResponderDir),
+            IngressRoute {
+                tx,
+                limit: 2, // very small limit: 2 bytes
+                bytes_in_flight: Arc::new(AtomicUsize::new(0)),
+            },
+        );
+
+        let task = IngressTask::new(routes);
+
+        // Send a 10-byte payload — exceeds the 2-byte limit.
+        let wire = build_sdu(2, Direction::InitiatorDir, &[0u8; 10]);
+        let wire = std::sync::Arc::new(std::sync::Mutex::new(wire));
+        let offset = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let wire2 = wire.clone();
+        let off2 = offset.clone();
+        let result = task
+            .run(move |n: usize| {
+                let w = wire2.clone();
+                let o = off2.clone();
+                Box::pin(async move {
+                    let data = w.lock().unwrap();
+                    let off = o.load(std::sync::atomic::Ordering::SeqCst);
+                    if off + n > data.len() {
+                        return Err(BearerError::ConnectionReset);
+                    }
+                    let r = data[off..off + n].to_vec();
+                    o.store(off + n, std::sync::atomic::Ordering::SeqCst);
+                    Ok(r)
+                })
+            })
+            .await;
+
+        assert!(
+            matches!(
+                result,
+                Err(MuxError::IngressQueueOverrun { protocol_id: 2, .. })
+            ),
+            "expected IngressQueueOverrun for protocol 2, got: {result:?}"
+        );
+    }
+
+    /// Verify that reserved protocol 1 with zero-length payload is silently dropped.
+    #[tokio::test]
+    async fn reserved_protocol_id_zero_length_payload_discarded() {
+        let (tx2, mut rx2) = mpsc::channel(32);
+        let mut routes = HashMap::new();
+        routes.insert(
+            (2, Direction::ResponderDir),
+            IngressRoute {
+                tx: tx2,
+                limit: 65536,
+                bytes_in_flight: Arc::new(AtomicUsize::new(0)),
+            },
+        );
+
+        let task = IngressTask::new(routes);
+
+        // Zero-length payload for reserved protocol 1, then protocol 2 message.
+        let mut wire = build_sdu(RESERVED_PROTOCOL_ID, Direction::InitiatorDir, &[]);
+        wire.extend_from_slice(&build_sdu(2, Direction::InitiatorDir, &[0xAB]));
+
+        let wire = std::sync::Arc::new(std::sync::Mutex::new(wire));
+        let offset = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let wire2 = wire.clone();
+        let off2 = offset.clone();
+        task.run(move |n: usize| {
+            let w = wire2.clone();
+            let o = off2.clone();
+            Box::pin(async move {
+                let data = w.lock().unwrap();
+                let off = o.load(std::sync::atomic::Ordering::SeqCst);
+                if off + n > data.len() {
+                    return Err(BearerError::ConnectionReset);
+                }
+                let r = data[off..off + n].to_vec();
+                o.store(off + n, std::sync::atomic::Ordering::SeqCst);
+                Ok(r)
+            })
+        })
+        .await
+        .unwrap();
+
+        // Protocol 2 should have been delivered.
+        let chunk = rx2.recv().await.unwrap();
+        assert_eq!(chunk.as_ref(), &[0xAB]);
+    }
+
+    /// Verify bytes_in_flight counter is correctly incremented for delivered payloads.
+    #[tokio::test]
+    async fn bytes_in_flight_counter_incremented_on_delivery() {
+        let (tx, mut rx) = mpsc::channel(32);
+        let bytes_in_flight = Arc::new(AtomicUsize::new(0));
+        let mut routes = HashMap::new();
+        routes.insert(
+            (2, Direction::ResponderDir),
+            IngressRoute {
+                tx,
+                limit: 65536,
+                bytes_in_flight: bytes_in_flight.clone(),
+            },
+        );
+
+        let task = IngressTask::new(routes);
+
+        let payload = vec![0x01, 0x02, 0x03, 0x04, 0x05]; // 5 bytes
+        let wire = build_sdu(2, Direction::InitiatorDir, &payload);
+        let wire = std::sync::Arc::new(std::sync::Mutex::new(wire));
+        let offset = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let wire2 = wire.clone();
+        let off2 = offset.clone();
+        task.run(move |n: usize| {
+            let w = wire2.clone();
+            let o = off2.clone();
+            Box::pin(async move {
+                let data = w.lock().unwrap();
+                let off = o.load(std::sync::atomic::Ordering::SeqCst);
+                if off + n > data.len() {
+                    return Err(BearerError::ConnectionReset);
+                }
+                let r = data[off..off + n].to_vec();
+                o.store(off + n, std::sync::atomic::Ordering::SeqCst);
+                Ok(r)
+            })
+        })
+        .await
+        .unwrap();
+
+        // bytes_in_flight should reflect the 5 bytes queued in the channel
+        // (not yet consumed by the receiver).
+        assert_eq!(
+            bytes_in_flight.load(std::sync::atomic::Ordering::Relaxed),
+            5,
+            "bytes_in_flight should equal the payload size after delivery"
+        );
+
+        // Consuming the chunk decrements bytes_in_flight via MuxChannel::recv(),
+        // but here we drive it manually via the raw mpsc receiver — so counter
+        // stays at 5 until a MuxChannel consumer calls fetch_sub.
+        let chunk = rx.recv().await.unwrap();
+        assert_eq!(chunk.len(), 5);
+    }
+
+    /// Verify that multiple sequential SDUs for the same protocol are all delivered
+    /// in order.
+    #[tokio::test]
+    async fn multiple_sdus_same_protocol_delivered_in_order() {
+        let (tx, mut rx) = mpsc::channel(32);
+        let mut routes = HashMap::new();
+        routes.insert(
+            (2, Direction::ResponderDir),
+            IngressRoute {
+                tx,
+                limit: 65536,
+                bytes_in_flight: Arc::new(AtomicUsize::new(0)),
+            },
+        );
+
+        let task = IngressTask::new(routes);
+
+        let mut wire = Vec::new();
+        for i in 0u8..5 {
+            wire.extend_from_slice(&build_sdu(2, Direction::InitiatorDir, &[i]));
+        }
+
+        let wire = std::sync::Arc::new(std::sync::Mutex::new(wire));
+        let offset = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let wire2 = wire.clone();
+        let off2 = offset.clone();
+        task.run(move |n: usize| {
+            let w = wire2.clone();
+            let o = off2.clone();
+            Box::pin(async move {
+                let data = w.lock().unwrap();
+                let off = o.load(std::sync::atomic::Ordering::SeqCst);
+                if off + n > data.len() {
+                    return Err(BearerError::ConnectionReset);
+                }
+                let r = data[off..off + n].to_vec();
+                o.store(off + n, std::sync::atomic::Ordering::SeqCst);
+                Ok(r)
+            })
+        })
+        .await
+        .unwrap();
+
+        for i in 0u8..5 {
+            let chunk = rx.recv().await.unwrap();
+            assert_eq!(chunk.as_ref(), &[i], "SDU {i} delivered out of order");
+        }
+    }
+
     /// Verify that a stalled payload (header arrived, payload stalled)
     /// triggers SduReadTimeout.
     #[tokio::test(start_paused = true)]
