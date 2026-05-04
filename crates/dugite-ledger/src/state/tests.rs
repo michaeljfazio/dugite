@@ -1551,6 +1551,11 @@ fn test_treasury_withdrawal_credits_reward_account() {
 
     let reward_key = Hash28::from_bytes([55u8; 28]).to_hash32_padded();
 
+    // Per Haskell `applyEnactedWithdrawals`, withdrawals to unregistered
+    // reward accounts are silently dropped — pre-register so the disbursement
+    // actually credits.
+    std::sync::Arc::make_mut(&mut state.certs.reward_accounts).insert(reward_key, Lovelace(0));
+
     let mut withdrawals = std::collections::BTreeMap::new();
     withdrawals.insert(reward_addr, Lovelace(50_000_000_000));
 
@@ -2275,6 +2280,11 @@ fn test_treasury_withdrawal_ratification() {
 
     // Register DReps with stake
     setup_dreps_with_stake(&mut state, 10, 1_000_000_000);
+
+    // Pre-register withdrawal target so disbursement actually fires
+    // (Haskell silently drops withdrawals to unregistered reward accounts).
+    let withdrawal_key = LedgerState::reward_account_to_hash(&[0u8; 29]);
+    Arc::make_mut(&mut state.certs.reward_accounts).insert(withdrawal_key, Lovelace(0));
 
     let mut withdrawals = BTreeMap::new();
     withdrawals.insert(vec![0u8; 29], Lovelace(5_000_000_000));
