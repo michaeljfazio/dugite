@@ -2986,13 +2986,13 @@ impl Node {
                                         self.update_peer_metrics(&pm);
                                     }
                                     Err(e) => {
-                                        debug!(%addr, "inbound registration failed: {e}");
+                                        warn!(%addr, "inbound registration failed: {e}");
                                     }
                                 }
                             }
                         }
                         Err((addr, reason)) => {
-                            debug!(%addr, "inbound handshake failed: {reason}");
+                            warn!(%addr, "inbound handshake failed: {reason}");
                         }
                     }
                 }
