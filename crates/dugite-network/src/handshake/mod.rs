@@ -341,9 +341,22 @@ fn decode_propose_versions_n2n(
         let version = dec
             .u16()
             .map_err(|e| HandshakeError::DecodeError(e.to_string()))?;
-        let version_data = N2NVersionData::decode(&mut dec)
-            .map_err(|e| HandshakeError::DecodeError(e.to_string()))?;
-        versions.insert(version, version_data);
+        // Cardano-node sends ALL the versions it supports in the proposal
+        // map, including older ones like N2N v13 whose `version_data` has a
+        // different CBOR shape (array(3) instead of array(4) — no `query`).
+        // Decode only versions we know how to negotiate; skip the rest by
+        // consuming whatever CBOR item follows the version key.  This mirrors
+        // the Haskell handshake which uses `acceptableVersion` after the
+        // proposal is fully decoded — unknown versions are filtered, not
+        // rejected.
+        if n2n::N2N_VERSIONS.contains(&version) {
+            let version_data = N2NVersionData::decode(&mut dec)
+                .map_err(|e| HandshakeError::DecodeError(e.to_string()))?;
+            versions.insert(version, version_data);
+        } else {
+            dec.skip()
+                .map_err(|e| HandshakeError::DecodeError(e.to_string()))?;
+        }
     }
     Ok(versions)
 }
@@ -376,9 +389,17 @@ fn decode_propose_versions_n2c(
             .u16()
             .map_err(|e| HandshakeError::DecodeError(e.to_string()))?;
         let logical_version = n2c::decode_n2c_version(wire_version);
-        let version_data = N2CVersionData::decode(&mut dec)
-            .map_err(|e| HandshakeError::DecodeError(e.to_string()))?;
-        versions.insert(logical_version, version_data);
+        // Skip versions we don't support so a peer offering an older
+        // version_data shape doesn't break the decode of versions we DO
+        // support. Mirrors the n2n decoder behaviour.
+        if n2c::N2C_VERSIONS.contains(&logical_version) {
+            let version_data = N2CVersionData::decode(&mut dec)
+                .map_err(|e| HandshakeError::DecodeError(e.to_string()))?;
+            versions.insert(logical_version, version_data);
+        } else {
+            dec.skip()
+                .map_err(|e| HandshakeError::DecodeError(e.to_string()))?;
+        }
     }
     Ok(versions)
 }
