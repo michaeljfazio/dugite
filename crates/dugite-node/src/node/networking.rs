@@ -442,6 +442,15 @@ impl NodePeerManager {
         self.big_ledger_peers.insert(addr);
     }
 
+    /// Read-only view of all known big-ledger peers.
+    ///
+    /// Consumed by the governor to enforce
+    /// `target_warm_big_ledger`/`target_hot_big_ledger` minimums separately
+    /// from the aggregate peer targets.
+    pub fn big_ledger_peers(&self) -> &std::collections::HashSet<SocketAddr> {
+        &self.big_ledger_peers
+    }
+
     /// Mark a peer as connected.
     ///
     /// Sets the connection state to `OutboundIdle(Duplex)` or

@@ -896,30 +896,102 @@ pub fn identify_big_ledger_peers(pool_stakes: &[(Vec<u8>, u64)]) -> (Vec<Vec<u8>
 
 // ── Peer snapshot loader ────────────────────────────────────────────────────
 
-/// Load peer snapshot from a JSON file.
-///
-/// Format: `[{"addr": "1.2.3.4", "port": 3001}, ...]`
-#[allow(dead_code)] // future use: Genesis ledger peer snapshot loading
-pub fn load_peer_snapshot(path: &std::path::Path) -> Result<Vec<SocketAddr>, String> {
-    let content = std::fs::read_to_string(path)
-        .map_err(|e| format!("Failed to read peer snapshot file: {e}"))?;
+/// One peer-relay candidate parsed from a snapshot file.
+#[derive(Debug, Clone)]
+pub struct PeerSnapshotEntry {
+    /// DNS name or stringified IP. May need DNS resolution.
+    pub host: String,
+    /// TCP port.
+    pub port: u16,
+    /// True if this entry is a Big Ledger Peer (top-90% stake) per the
+    /// snapshot's classification. The IOG-distributed
+    /// `peer-snapshot.json` lists only big-ledger pools, so every entry
+    /// derived from `bigLedgerPools` is a BLP.
+    pub is_big_ledger: bool,
+}
 
-    let entries: Vec<serde_json::Value> = serde_json::from_str(&content)
+/// Load a peer snapshot from a JSON file.
+///
+/// Supports two formats:
+///
+/// 1. **IOG cardano-node format** (top-level object with `bigLedgerPools`):
+///    ```json
+///    { "NetworkMagic": 2, "Point": {...},
+///      "bigLedgerPools": [
+///        { "accumulatedStake": 0.05, "relativeStake": 0.05,
+///          "relays": [
+///            { "address": "node.example.com", "port": 6501 }, ...
+///          ]
+///        }, ...
+///      ]
+///    }
+///    ```
+///    Each relay becomes one `PeerSnapshotEntry` with `is_big_ledger=true`.
+///
+/// 2. **Legacy flat format** (array of `{addr,port}` objects):
+///    ```json
+///    [ { "addr": "1.2.3.4", "port": 3001 }, ... ]
+///    ```
+///    Used for tests and pre-fetched peer lists. Entries are marked
+///    `is_big_ledger=true` (legacy format is assumed to be BLPs since that's
+///    what the field is for).
+///
+/// Returns the list of relay endpoints in declaration order. Hostnames are
+/// kept as-is — DNS resolution happens later in the discovery loop.
+pub fn load_peer_snapshot(path: &std::path::Path) -> Result<Vec<PeerSnapshotEntry>, String> {
+    let content = std::fs::read_to_string(path)
+        .map_err(|e| format!("Failed to read peer snapshot file {}: {e}", path.display()))?;
+
+    let value: serde_json::Value = serde_json::from_str(&content)
         .map_err(|e| format!("Failed to parse peer snapshot JSON: {e}"))?;
 
-    let mut peers = Vec::new();
-    for entry in entries {
-        if let (Some(addr), Some(port)) = (
-            entry.get("addr").and_then(|v| v.as_str()),
-            entry.get("port").and_then(|v| v.as_u64()),
-        ) {
-            if let Ok(socket_addr) = format!("{addr}:{port}").parse::<SocketAddr>() {
-                peers.push(socket_addr);
+    // Format 1: IOG cardano-node 10.x format with `bigLedgerPools`.
+    if let Some(pools) = value.get("bigLedgerPools").and_then(|v| v.as_array()) {
+        let mut peers = Vec::new();
+        for pool in pools {
+            let Some(relays) = pool.get("relays").and_then(|v| v.as_array()) else {
+                continue;
+            };
+            for relay in relays {
+                let host = relay.get("address").and_then(|v| v.as_str());
+                let port = relay.get("port").and_then(|v| v.as_u64());
+                if let (Some(host), Some(port)) = (host, port) {
+                    if let Ok(port_u16) = u16::try_from(port) {
+                        peers.push(PeerSnapshotEntry {
+                            host: host.to_string(),
+                            port: port_u16,
+                            is_big_ledger: true,
+                        });
+                    }
+                }
             }
         }
+        return Ok(peers);
     }
 
-    Ok(peers)
+    // Format 2: legacy flat array of `{addr,port}` objects.
+    if let Some(entries) = value.as_array() {
+        let mut peers = Vec::new();
+        for entry in entries {
+            let host = entry.get("addr").and_then(|v| v.as_str());
+            let port = entry.get("port").and_then(|v| v.as_u64());
+            if let (Some(host), Some(port)) = (host, port) {
+                if let Ok(port_u16) = u16::try_from(port) {
+                    peers.push(PeerSnapshotEntry {
+                        host: host.to_string(),
+                        port: port_u16,
+                        is_big_ledger: true,
+                    });
+                }
+            }
+        }
+        return Ok(peers);
+    }
+
+    Err(format!(
+        "peer snapshot {} is neither a `bigLedgerPools` object nor a legacy array",
+        path.display()
+    ))
 }
 
 // ── Tests ───────────────────────────────────────────────────────────────────
@@ -1624,9 +1696,71 @@ mod tests {
 
         let peers = load_peer_snapshot(&path).unwrap();
         assert_eq!(peers.len(), 2);
-        assert_eq!(peers[0].to_string(), "1.2.3.4:3001");
-        assert_eq!(peers[1].to_string(), "5.6.7.8:3002");
+        assert_eq!(peers[0].host, "1.2.3.4");
+        assert_eq!(peers[0].port, 3001);
+        assert!(peers[0].is_big_ledger);
+        assert_eq!(peers[1].host, "5.6.7.8");
+        assert_eq!(peers[1].port, 3002);
+        assert!(peers[1].is_big_ledger);
 
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn test_load_peer_snapshot_iog_format() {
+        // Mirrors the structure of IOG's official peer-snapshot.json
+        // distributed at book.world.dev.cardano.org/environments/preview.
+        let dir = std::env::temp_dir();
+        let path = dir.join("test_peer_snapshot_iog.json");
+        std::fs::write(
+            &path,
+            r#"{
+              "NetworkMagic": 2,
+              "NodeToClientVersion": 23,
+              "Point": { "blockPointHash": "deadbeef", "blockPointSlot": 100 },
+              "bigLedgerPools": [
+                {
+                  "accumulatedStake": 0.05,
+                  "relativeStake": 0.05,
+                  "relays": [
+                    { "address": "node1.example.com", "port": 6501 },
+                    { "address": "node2.example.com", "port": 6502 }
+                  ]
+                },
+                {
+                  "accumulatedStake": 0.10,
+                  "relativeStake": 0.05,
+                  "relays": [
+                    { "address": "10.0.0.1", "port": 3001 }
+                  ]
+                }
+              ]
+            }"#,
+        )
+        .unwrap();
+
+        let peers = load_peer_snapshot(&path).unwrap();
+        assert_eq!(peers.len(), 3);
+        assert_eq!(peers[0].host, "node1.example.com");
+        assert_eq!(peers[0].port, 6501);
+        assert!(peers[0].is_big_ledger);
+        assert_eq!(peers[1].host, "node2.example.com");
+        assert_eq!(peers[1].port, 6502);
+        assert_eq!(peers[2].host, "10.0.0.1");
+        assert_eq!(peers[2].port, 3001);
+        assert!(peers[2].is_big_ledger);
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn test_load_peer_snapshot_unrecognised_format_errors() {
+        let dir = std::env::temp_dir();
+        let path = dir.join("test_peer_snapshot_bad.json");
+        // Object without bigLedgerPools — must not silently return empty
+        std::fs::write(&path, r#"{ "NetworkMagic": 2 }"#).unwrap();
+        let result = load_peer_snapshot(&path);
+        assert!(result.is_err(), "unrecognised format must return an error");
         let _ = std::fs::remove_file(&path);
     }
 }

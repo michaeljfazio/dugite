@@ -23,7 +23,7 @@ pub(crate) mod sync;
 
 use anyhow::Result;
 use std::collections::HashMap;
-use std::net::SocketAddr;
+use std::net::{SocketAddr, ToSocketAddrs};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -2017,6 +2017,63 @@ impl Node {
                     advertise: rg.advertise,
                 });
             }
+
+            // ── peerSnapshotFile: pre-seed big-ledger candidates ─────────────
+            //
+            // The cardano-node 10.x topology can reference a peer snapshot
+            // file (typically distributed by IOG) that lists the current
+            // top-90%-stake "Big Ledger Pools" with their relays. Loading it
+            // at startup gives us a populated big-ledger candidate pool
+            // before the live ledger has caught up far enough for the
+            // periodic ledger-peer discovery loop to populate them via
+            // useLedgerAfterSlot.
+            //
+            // Path resolution: relative to the topology file's directory
+            // (matching cardano-node behaviour). DNS hostnames are kept
+            // as-is and resolved when the peer is dialed.
+            if let Some(snapshot_filename) = self.topology.peer_snapshot_file.as_deref() {
+                let topology_dir = self
+                    .topology_path
+                    .parent()
+                    .unwrap_or_else(|| std::path::Path::new("."));
+                let snapshot_path = topology_dir.join(snapshot_filename);
+                match crate::gsm::load_peer_snapshot(&snapshot_path) {
+                    Ok(entries) => {
+                        let mut blp_count = 0usize;
+                        let mut total_resolved = 0usize;
+                        for entry in &entries {
+                            // Resolve DNS synchronously here at startup.
+                            // This is bounded by the snapshot size and only
+                            // runs once.
+                            let host_port = format!("{}:{}", entry.host, entry.port);
+                            if let Ok(addrs) = host_port.to_socket_addrs() {
+                                for socket_addr in addrs {
+                                    pm.add_ledger_peer(socket_addr);
+                                    if entry.is_big_ledger {
+                                        pm.add_big_ledger_peer(socket_addr);
+                                        blp_count += 1;
+                                    }
+                                    total_resolved += 1;
+                                }
+                            }
+                        }
+                        info!(
+                            snapshot = %snapshot_path.display(),
+                            entries = entries.len(),
+                            resolved = total_resolved,
+                            big_ledger = blp_count,
+                            "Loaded peer snapshot",
+                        );
+                    }
+                    Err(e) => {
+                        // Non-fatal: log and continue. The periodic
+                        // ledger-peer discovery loop will populate peers
+                        // once the chain catches up.
+                        warn!(snapshot = %snapshot_path.display(), error = %e, "Failed to load peer snapshot");
+                    }
+                }
+            }
+
             let stats = pm.stats();
             info!(
                 known = stats.cold + stats.warm + stats.hot,
@@ -2272,8 +2329,19 @@ impl Node {
 
                     // Extract relay addresses from registered pools and
                     // identify Big Ledger Peers (top 90% of active stake).
-                    type RelayList = Vec<(String, u16)>;
-                    let (relays, blp_relays): (RelayList, RelayList) = {
+                    //
+                    // Each entry carries the BLP classification of the pool
+                    // it came from, so DNS-resolved addresses inherit it
+                    // unambiguously. The previous port-only match between
+                    // resolved addresses and BLP relays mis-tagged peers
+                    // whenever any BLP and any non-BLP shared a port.
+                    #[derive(Clone)]
+                    struct LedgerRelay {
+                        host: String,
+                        port: u16,
+                        is_blp: bool,
+                    }
+                    let relays: Vec<LedgerRelay> = {
                         let ls = ledger.read().await;
 
                         // Build pool_id -> stake map for BLP classification
@@ -2298,7 +2366,6 @@ impl Node {
                             big_pool_ids.into_iter().collect();
 
                         let mut relays = Vec::new();
-                        let mut blp_relays = Vec::new();
                         for (pool_id, pool_reg) in ls.certs.pool_params.iter() {
                             let is_blp = big_pool_set.contains(pool_id.as_bytes().as_slice());
                             for relay in &pool_reg.relays {
@@ -2309,14 +2376,15 @@ impl Node {
                                         ..
                                     } => {
                                         if let (Some(port), Some(ipv4)) = (port, ipv4) {
-                                            let addr = format!(
+                                            let host = format!(
                                                 "{}.{}.{}.{}",
                                                 ipv4[0], ipv4[1], ipv4[2], ipv4[3]
                                             );
-                                            relays.push((addr.clone(), *port));
-                                            if is_blp {
-                                                blp_relays.push((addr, *port));
-                                            }
+                                            relays.push(LedgerRelay {
+                                                host,
+                                                port: *port,
+                                                is_blp,
+                                            });
                                         }
                                     }
                                     dugite_primitives::transaction::Relay::SingleHostName {
@@ -2324,24 +2392,26 @@ impl Node {
                                         dns_name,
                                     } => {
                                         if let Some(port) = port {
-                                            relays.push((dns_name.clone(), *port));
-                                            if is_blp {
-                                                blp_relays.push((dns_name.clone(), *port));
-                                            }
+                                            relays.push(LedgerRelay {
+                                                host: dns_name.clone(),
+                                                port: *port,
+                                                is_blp,
+                                            });
                                         }
                                     }
                                     dugite_primitives::transaction::Relay::MultiHostName {
                                         dns_name,
                                     } => {
-                                        relays.push((dns_name.clone(), 3001));
-                                        if is_blp {
-                                            blp_relays.push((dns_name.clone(), 3001));
-                                        }
+                                        relays.push(LedgerRelay {
+                                            host: dns_name.clone(),
+                                            port: 3001,
+                                            is_blp,
+                                        });
                                     }
                                 }
                             }
                         }
-                        (relays, blp_relays)
+                        relays
                     };
 
                     if relays.is_empty() {
@@ -2353,49 +2423,38 @@ impl Node {
                     let sample_size = 20.min(relays.len());
                     let step = relays.len() / sample_size;
                     let offset = (current_slot as usize) % step.max(1);
-                    let sample: Vec<_> = relays
+                    let sample: Vec<LedgerRelay> = relays
                         .iter()
                         .skip(offset)
                         .step_by(step.max(1))
                         .take(sample_size)
+                        .cloned()
                         .collect();
 
-                    // Resolve all DNS addresses before acquiring the write lock
-                    let mut resolved_addrs = Vec::new();
-                    for (host, port) in sample {
+                    // Resolve each sampled relay's DNS / IP, preserving its
+                    // BLP classification per resolved socket address.
+                    let mut resolved: Vec<(SocketAddr, bool)> = Vec::new();
+                    for r in &sample {
                         if let Ok(mut addrs) =
-                            tokio::net::lookup_host(format!("{host}:{port}")).await
+                            tokio::net::lookup_host(format!("{}:{}", r.host, r.port)).await
                         {
                             if let Some(socket_addr) = addrs.next() {
-                                resolved_addrs.push(socket_addr);
+                                resolved.push((socket_addr, r.is_blp));
                             }
-                        }
-                    }
-                    // Also resolve BLP relay addresses
-                    let blp_set: std::collections::HashSet<String> =
-                        blp_relays.iter().map(|(h, p)| format!("{h}:{p}")).collect();
-                    let mut blp_resolved = std::collections::HashSet::new();
-                    for addr in &resolved_addrs {
-                        // Check if this resolved address came from a BLP relay
-                        // (approximate: check if any BLP relay resolves to this addr)
-                        if blp_set
-                            .iter()
-                            .any(|blp_hp| blp_hp.ends_with(&format!(":{}", addr.port())))
-                        {
-                            blp_resolved.insert(*addr);
                         }
                     }
 
-                    if !resolved_addrs.is_empty() {
+                    if !resolved.is_empty() {
                         let mut pm_w = pm.write().await;
-                        for socket_addr in &resolved_addrs {
+                        let mut blp_count = 0usize;
+                        for (socket_addr, is_blp) in &resolved {
                             pm_w.add_ledger_peer(*socket_addr);
-                            if blp_resolved.contains(socket_addr) {
+                            if *is_blp {
                                 pm_w.add_big_ledger_peer(*socket_addr);
+                                blp_count += 1;
                             }
                         }
-                        let added = resolved_addrs.len();
-                        let blp_count = blp_resolved.len();
+                        let added = resolved.len();
                         debug!(
                             "Ledger peer discovery: +{added} peers ({blp_count} BLPs) from {} relays, {}",
                             relays.len(),
@@ -2638,6 +2697,8 @@ impl Node {
                     target_warm: cfg.target_number_of_established_peers,
                     target_hot: cfg.target_number_of_active_peers,
                     max_cold: cfg.target_number_of_known_peers,
+                    target_warm_big_ledger: cfg.target_number_of_established_big_ledger_peers,
+                    target_hot_big_ledger: cfg.target_number_of_active_big_ledger_peers,
                 },
                 ..Default::default()
             }
@@ -2765,7 +2826,12 @@ impl Node {
                                 hot_valency: g.hot_valency,
                             })
                             .collect();
-                        governor.compute_actions(&pm.inner, &local_root_targets)
+                        let big_ledger = pm.big_ledger_peers().clone();
+                        governor.compute_actions_with_blp(
+                            &pm.inner,
+                            &local_root_targets,
+                            &big_ledger,
+                        )
                     };
 
                     if !actions.is_empty() {
