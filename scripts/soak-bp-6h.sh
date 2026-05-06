@@ -359,7 +359,12 @@ while [[ $(date +%s) -lt $END ]]; do
         if ! pgrep -f "dugite-node run" > /dev/null 2>&1; then
             emit "FATAL — dugite-node process is DEAD (will be restarted on next cycle)"
         fi
-        if ! pgrep -f "cardano-node run" > /dev/null 2>&1; then
+        # cardano-node is optional: only required when dugite is behind a
+        # relay. In bare-BP mode we run dugite directly on the public
+        # network and this check would spam FATAL forever. Set
+        # SOAK_REQUIRE_CARDANO_NODE=1 to re-enable.
+        if [[ "${SOAK_REQUIRE_CARDANO_NODE:-0}" == "1" ]] \
+            && ! pgrep -f "cardano-node run" > /dev/null 2>&1; then
             emit "FATAL — cardano-node process is DEAD"
         fi
     fi
