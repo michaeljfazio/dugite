@@ -18,6 +18,14 @@ use super::selection::{
 };
 
 /// Target peer counts for the governor.
+///
+/// Aggregate targets (`target_warm`, `target_hot`, `max_cold`) apply to ALL
+/// peers regardless of category. Big-ledger targets enforce a MINIMUM number
+/// of warm/hot connections to "Big Ledger Peers" (the top-90% of stake — see
+/// `gsm::identify_big_ledger_peers`). Big-ledger peers count toward the
+/// aggregate targets too, so `target_hot_big_ledger <= target_hot` should
+/// hold (typically 5 BLPs out of 20 total hot, matching cardano-node's
+/// `TargetNumberOfActiveBigLedgerPeers` default).
 #[derive(Debug, Clone)]
 pub struct PeerTargets {
     /// Target number of warm peers (TCP connected, keepalive).
@@ -26,6 +34,12 @@ pub struct PeerTargets {
     pub target_hot: usize,
     /// Maximum number of cold peers to track.
     pub max_cold: usize,
+    /// Target number of BLPs that must be warm or hot.
+    /// Default 0 disables the BLP-specific minimum.
+    pub target_warm_big_ledger: usize,
+    /// Target number of BLPs that must be hot.
+    /// Default 0 disables the BLP-specific minimum.
+    pub target_hot_big_ledger: usize,
 }
 
 impl Default for PeerTargets {
@@ -34,6 +48,8 @@ impl Default for PeerTargets {
             target_warm: 10,
             target_hot: 5,
             max_cold: 100,
+            target_warm_big_ledger: 0,
+            target_hot_big_ledger: 0,
         }
     }
 }
@@ -162,10 +178,33 @@ impl Governor {
     /// This is the main decision function, called periodically by the
     /// connection manager. It evaluates target-driven promotions/demotions
     /// first, then three independent churn timers, then peer discovery.
+    ///
+    /// Backwards-compatible wrapper that calls [`compute_actions_with_blp`]
+    /// with an empty big-ledger set. Existing callers (and unit tests) that
+    /// don't track BLPs separately can keep using this entry point.
     pub fn compute_actions(
         &mut self,
         peer_manager: &PeerManager,
         local_root_groups: &[LocalRootGroupTarget],
+    ) -> Vec<GovernorAction> {
+        let empty: HashSet<SocketAddr> = HashSet::new();
+        self.compute_actions_with_blp(peer_manager, local_root_groups, &empty)
+    }
+
+    /// Like [`compute_actions`] but with explicit knowledge of which peers
+    /// are Big Ledger Peers (BLPs) — top-90%-stake pools per
+    /// `gsm::identify_big_ledger_peers`. The governor enforces
+    /// `target_warm_big_ledger` / `target_hot_big_ledger` minimums against
+    /// this set after local-root targets and before aggregate targets.
+    ///
+    /// BLP minimums apply IN ADDITION to aggregate targets. A peer that's
+    /// both a BLP and a local-root member is handled by the local-root pass
+    /// first (highest priority), then the BLP pass tops up if needed.
+    pub fn compute_actions_with_blp(
+        &mut self,
+        peer_manager: &PeerManager,
+        local_root_groups: &[LocalRootGroupTarget],
+        big_ledger_peers: &HashSet<SocketAddr>,
     ) -> Vec<GovernorAction> {
         use rand::seq::IndexedRandom;
 
@@ -264,6 +303,90 @@ impl Governor {
                             promoted += 1;
                         }
                     }
+                }
+            }
+        }
+
+        // ── Big-ledger peer targets (belowTargetBigLedger) ─────────────────
+        //
+        // Enforce minimums on connections to Big Ledger Peers (BLPs — the
+        // top-90%-stake pools per `gsm::identify_big_ledger_peers`). These
+        // run AFTER local-root targets but BEFORE aggregate targets so that
+        // BLP minimums are honoured even when the aggregate hot/warm count
+        // is at its limit; they then count toward the aggregate too.
+        //
+        // Matches Haskell's `belowTarget` for big ledger peers in
+        // `Ouroboros.Network.PeerSelection.Governor.{Established,Active}Peers`.
+        if !big_ledger_peers.is_empty() {
+            // BLP warm target: ensure at least target_warm_big_ledger BLPs
+            // are warm or hot.
+            let blp_warm_or_hot = big_ledger_peers
+                .iter()
+                .filter(|addr| {
+                    peer_manager
+                        .get_peer(addr)
+                        .map(|p| p.state == PeerState::Warm || p.state == PeerState::Hot)
+                        .unwrap_or(false)
+                })
+                .count();
+            if blp_warm_or_hot < self.config.targets.target_warm_big_ledger {
+                let needed = self.config.targets.target_warm_big_ledger - blp_warm_or_hot;
+                let mut promoted = 0usize;
+                let eligible_blps: Vec<SocketAddr> = peer_manager
+                    .peers_eligible_to_connect()
+                    .into_iter()
+                    .filter(|a| big_ledger_peers.contains(a))
+                    .collect();
+                for addr in eligible_blps {
+                    if promoted >= needed {
+                        break;
+                    }
+                    if already_promoted.contains(&addr) {
+                        continue;
+                    }
+                    if self.in_progress_promote_cold.contains(&addr) {
+                        continue;
+                    }
+                    actions.push(GovernorAction::PromoteToWarm(addr));
+                    self.in_progress_promote_cold.insert(addr);
+                    already_promoted.insert(addr);
+                    promoted += 1;
+                }
+            }
+
+            // BLP hot target: ensure at least target_hot_big_ledger BLPs
+            // are hot.
+            let blp_hot = big_ledger_peers
+                .iter()
+                .filter(|addr| {
+                    peer_manager
+                        .get_peer(addr)
+                        .map(|p| p.state == PeerState::Hot)
+                        .unwrap_or(false)
+                })
+                .count();
+            if blp_hot < self.config.targets.target_hot_big_ledger {
+                let needed = self.config.targets.target_hot_big_ledger - blp_hot;
+                let mut promoted = 0usize;
+                let warm_blps: Vec<SocketAddr> = peer_manager
+                    .peers_in_state(PeerState::Warm)
+                    .into_iter()
+                    .filter(|a| big_ledger_peers.contains(a))
+                    .collect();
+                for addr in warm_blps {
+                    if promoted >= needed {
+                        break;
+                    }
+                    if already_promoted.contains(&addr) {
+                        continue;
+                    }
+                    if self.in_progress_promote_warm.contains(&addr) {
+                        continue;
+                    }
+                    actions.push(GovernorAction::PromoteToHot(addr));
+                    self.in_progress_promote_warm.insert(addr);
+                    already_promoted.insert(addr);
+                    promoted += 1;
                 }
             }
         }
@@ -491,6 +614,7 @@ mod tests {
                 target_warm: 3,
                 target_hot: 1,
                 max_cold: 100,
+                ..Default::default()
             },
             hot_churn_interval: Duration::from_secs(3600),
             cold_churn_interval: Duration::from_secs(3600),
@@ -519,6 +643,7 @@ mod tests {
                 target_warm: 5,
                 target_hot: 2,
                 max_cold: 100,
+                ..Default::default()
             },
             hot_churn_interval: Duration::from_secs(3600),
             cold_churn_interval: Duration::from_secs(3600),
@@ -543,6 +668,7 @@ mod tests {
                 target_warm: 3,
                 target_hot: 1,
                 max_cold: 100,
+                ..Default::default()
             },
             hot_churn_interval: Duration::from_secs(3600),
             cold_churn_interval: Duration::from_secs(3600),
@@ -578,6 +704,7 @@ mod tests {
                 target_warm: 10,
                 target_hot: 5,
                 max_cold: 50,
+                ..Default::default()
             },
             hot_churn_interval: Duration::from_secs(3600),
             // Trigger cold churn immediately.
@@ -625,6 +752,7 @@ mod tests {
                 target_warm: 10,
                 target_hot: 5,
                 max_cold: 100,
+                ..Default::default()
             },
             hot_churn_interval: Duration::from_secs(3600),
             cold_churn_interval: Duration::from_secs(3600),
@@ -662,6 +790,7 @@ mod tests {
                 target_warm: 10,
                 target_hot: 5,
                 max_cold: 100,
+                ..Default::default()
             },
             hot_churn_interval: Duration::from_secs(3600),
             cold_churn_interval: Duration::from_secs(3600),
@@ -694,6 +823,7 @@ mod tests {
                 target_warm: 1,
                 target_hot: 0,
                 max_cold: 100,
+                ..Default::default()
             },
             hot_churn_interval: Duration::from_secs(3600),
             cold_churn_interval: Duration::from_secs(3600),
@@ -724,6 +854,7 @@ mod tests {
                 target_warm: 1,
                 target_hot: 0,
                 max_cold: 100,
+                ..Default::default()
             },
             hot_churn_interval: Duration::from_secs(3600),
             cold_churn_interval: Duration::from_secs(3600),
@@ -765,6 +896,7 @@ mod tests {
                 target_warm: 10,
                 target_hot: 5,
                 max_cold: 100,
+                ..Default::default()
             },
             // Trigger hot churn immediately.
             hot_churn_interval: Duration::ZERO,
@@ -817,6 +949,7 @@ mod tests {
                 target_warm: 10,
                 target_hot: 2,
                 max_cold: 100,
+                ..Default::default()
             },
             hot_churn_interval: Duration::from_secs(3600),
             cold_churn_interval: Duration::from_secs(3600),
@@ -859,6 +992,7 @@ mod tests {
                 target_warm: 10,
                 target_hot: 1,
                 max_cold: 100,
+                ..Default::default()
             },
             hot_churn_interval: Duration::from_secs(3600),
             cold_churn_interval: Duration::from_secs(3600),
@@ -896,6 +1030,7 @@ mod tests {
                 target_warm: 5,
                 target_hot: 0,
                 max_cold: 100,
+                ..Default::default()
             },
             hot_churn_interval: Duration::from_secs(3600),
             cold_churn_interval: Duration::from_secs(3600),
@@ -953,6 +1088,7 @@ mod tests {
                 target_warm: 0,
                 target_hot: 0,
                 max_cold: 100,
+                ..Default::default()
             },
             hot_churn_interval: Duration::from_secs(3600),
             cold_churn_interval: Duration::from_secs(3600),
@@ -1005,6 +1141,7 @@ mod tests {
                 target_warm: 0,
                 target_hot: 0,
                 max_cold: 100,
+                ..Default::default()
             },
             hot_churn_interval: Duration::from_secs(3600),
             cold_churn_interval: Duration::from_secs(3600),
@@ -1064,6 +1201,7 @@ mod tests {
                 target_warm: 3,
                 target_hot: 0,
                 max_cold: 100,
+                ..Default::default()
             },
             hot_churn_interval: Duration::from_secs(3600),
             cold_churn_interval: Duration::from_secs(3600),
@@ -1115,6 +1253,7 @@ mod tests {
                 target_warm: 2,
                 target_hot: 0,
                 max_cold: 100,
+                ..Default::default()
             },
             hot_churn_interval: Duration::from_secs(3600),
             cold_churn_interval: Duration::from_secs(3600),
@@ -1183,6 +1322,7 @@ mod tests {
                 target_warm: 2,
                 target_hot: 2,
                 max_cold: 100,
+                ..Default::default()
             },
             hot_churn_interval: Duration::from_secs(3600),
             cold_churn_interval: Duration::from_secs(3600),
@@ -1265,6 +1405,7 @@ mod tests {
                 target_warm: 10,
                 target_hot: 10,
                 max_cold: 100,
+                ..Default::default()
             },
             hot_churn_interval: Duration::from_secs(3600),
             cold_churn_interval: Duration::from_secs(3600),
@@ -1291,6 +1432,141 @@ mod tests {
         assert!(
             !demoted.contains(&good_addr),
             "better-scoring topology peer must be retained"
+        );
+    }
+
+    /// Big-ledger peer minimum is honoured even when the aggregate target
+    /// has been satisfied by non-BLP peers.
+    #[test]
+    fn blp_warm_target_promotes_blp_cold_peers() {
+        let mut pm = PeerManager::new();
+
+        // 3 non-BLP cold peers (already enough to satisfy aggregate warm=3)
+        // — but the BLP minimum demands 2 BLP warm too.
+        for i in 0..3u16 {
+            pm.add_peer(test_addr(3000 + i), PeerSource::Ledger);
+            pm.promote_to_warm(&test_addr(3000 + i));
+        }
+
+        // 4 BLP cold peers, none warm yet.
+        let blp_addrs: Vec<SocketAddr> = (0..4u16).map(|i| test_addr(4000 + i)).collect();
+        for &addr in &blp_addrs {
+            pm.add_peer(addr, PeerSource::Ledger);
+        }
+
+        let config = GovernorConfig {
+            targets: PeerTargets {
+                target_warm: 3,
+                target_hot: 0,
+                max_cold: 100,
+                target_warm_big_ledger: 2,
+                target_hot_big_ledger: 0,
+            },
+            hot_churn_interval: Duration::from_secs(3600),
+            cold_churn_interval: Duration::from_secs(3600),
+            warm_churn_interval: Duration::from_secs(3600),
+        };
+        let mut gov = Governor::new(config);
+        let blp_set: HashSet<SocketAddr> = blp_addrs.iter().copied().collect();
+        let actions = gov.compute_actions_with_blp(&pm, &[], &blp_set);
+
+        let promoted_warm: Vec<SocketAddr> = actions
+            .iter()
+            .filter_map(|a| match a {
+                GovernorAction::PromoteToWarm(addr) => Some(*addr),
+                _ => None,
+            })
+            .collect();
+
+        // The BLP minimum forces 2 promotions even though aggregate warm
+        // (already 3) is at target_warm. Promotions must target BLPs.
+        assert_eq!(promoted_warm.len(), 2, "BLP minimum should promote 2 BLPs");
+        for addr in &promoted_warm {
+            assert!(
+                blp_set.contains(addr),
+                "BLP-target promotions must select BLP candidates only"
+            );
+        }
+    }
+
+    /// Big-ledger HOT target promotes warm BLPs to hot until the minimum is met.
+    #[test]
+    fn blp_hot_target_promotes_warm_blps() {
+        let mut pm = PeerManager::new();
+
+        // 3 warm BLP peers, none hot yet.
+        let blp_addrs: Vec<SocketAddr> = (0..3u16).map(|i| test_addr(5000 + i)).collect();
+        for &addr in &blp_addrs {
+            pm.add_peer(addr, PeerSource::Ledger);
+            pm.promote_to_warm(&addr);
+        }
+
+        let config = GovernorConfig {
+            targets: PeerTargets {
+                target_warm: 10,
+                target_hot: 0, // aggregate hot disabled
+                max_cold: 100,
+                target_warm_big_ledger: 0,
+                target_hot_big_ledger: 2,
+            },
+            hot_churn_interval: Duration::from_secs(3600),
+            cold_churn_interval: Duration::from_secs(3600),
+            warm_churn_interval: Duration::from_secs(3600),
+        };
+        let mut gov = Governor::new(config);
+        let blp_set: HashSet<SocketAddr> = blp_addrs.iter().copied().collect();
+        let actions = gov.compute_actions_with_blp(&pm, &[], &blp_set);
+
+        let promoted_hot: Vec<SocketAddr> = actions
+            .iter()
+            .filter_map(|a| match a {
+                GovernorAction::PromoteToHot(addr) => Some(*addr),
+                _ => None,
+            })
+            .collect();
+
+        assert_eq!(promoted_hot.len(), 2, "BLP hot minimum should promote 2");
+        for addr in &promoted_hot {
+            assert!(
+                blp_set.contains(addr),
+                "BLP-target promotions must target BLPs"
+            );
+        }
+    }
+
+    /// Empty BLP set must be a no-op — the governor must behave exactly as
+    /// the legacy `compute_actions` entry point.
+    #[test]
+    fn blp_empty_set_behaves_like_legacy_compute_actions() {
+        let mut pm = PeerManager::new();
+        for i in 0..3u16 {
+            pm.add_peer(test_addr(6000 + i), PeerSource::Ledger);
+        }
+
+        let config = GovernorConfig {
+            targets: PeerTargets {
+                target_warm: 2,
+                target_hot: 0,
+                max_cold: 100,
+                target_warm_big_ledger: 5, // would be active if BLPs known
+                target_hot_big_ledger: 5,
+            },
+            hot_churn_interval: Duration::from_secs(3600),
+            cold_churn_interval: Duration::from_secs(3600),
+            warm_churn_interval: Duration::from_secs(3600),
+        };
+        let mut gov = Governor::new(config);
+        let actions = gov.compute_actions_with_blp(&pm, &[], &HashSet::new());
+
+        let promoted_warm = actions
+            .iter()
+            .filter(|a| matches!(a, GovernorAction::PromoteToWarm(_)))
+            .count();
+
+        // Should respect target_warm=2 only (no BLP-driven promotions).
+        assert_eq!(
+            promoted_warm, 2,
+            "empty BLP set must not trigger BLP promotions"
         );
     }
 }
