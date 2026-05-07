@@ -235,12 +235,13 @@ pub struct BlockProducerConfig {
 impl Default for BlockProducerConfig {
     fn default() -> Self {
         BlockProducerConfig {
-            // Default: cardano-node 10.7.x (ExperimentalHardForksEnabled=false).
+            // Default: cardano-node Conway mainnet (ExperimentalHardForksEnabled=false).
             // The actual forging path uses NodeConfig.node_protocol_version() which
-            // respects the ExperimentalHardForksEnabled config flag.
+            // respects the ExperimentalHardForksEnabled config flag (Dijkstra=12 on
+            // preview testnet from 2026-05-07).
             protocol_version: ProtocolVersion {
-                major: 10,
-                minor: 8,
+                major: 11,
+                minor: 0,
             },
             _max_block_body_size: 90112,
             _max_txs_per_block: 500,
