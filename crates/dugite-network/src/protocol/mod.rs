@@ -31,15 +31,16 @@ pub(crate) const CBOR_TAG_EMBEDDED: u64 = 24;
 /// Convert a pallas/ImmutableDB block storage era tag to the HFC NS index used
 /// in the N2N wire format.
 ///
-/// | Era     | Storage tag (pallas) | HFC NS index |
-/// |---------|----------------------|--------------|
-/// | Byron   | 0 or 1               | 0            |
-/// | Shelley | 2                    | 1            |
-/// | Allegra | 3                    | 2            |
-/// | Mary    | 4                    | 3            |
-/// | Alonzo  | 5                    | 4            |
-/// | Babbage | 6                    | 5            |
-/// | Conway  | 7                    | 6            |
+/// | Era      | Storage tag (pallas) | HFC NS index |
+/// |----------|----------------------|--------------|
+/// | Byron    | 0 or 1               | 0            |
+/// | Shelley  | 2                    | 1            |
+/// | Allegra  | 3                    | 2            |
+/// | Mary     | 4                    | 3            |
+/// | Alonzo   | 5                    | 4            |
+/// | Babbage  | 6                    | 5            |
+/// | Conway   | 7                    | 6            |
+/// | Dijkstra | 8                    | 7            |
 pub(crate) fn storage_era_tag_to_hfc_index(storage_era_tag: u64) -> Result<u8, String> {
     match storage_era_tag {
         // Byron: pallas uses both 0 and 1 depending on context; both map to HFC index 0.
@@ -50,6 +51,7 @@ pub(crate) fn storage_era_tag_to_hfc_index(storage_era_tag: u64) -> Result<u8, S
         5 => Ok(4), // Alonzo
         6 => Ok(5), // Babbage
         7 => Ok(6), // Conway
+        8 => Ok(7), // Dijkstra (protocol version 12+, preview testnet activated 2026-05-07)
         other => Err(format!(
             "unknown storage era tag {other}: cannot convert to HFC index"
         )),
