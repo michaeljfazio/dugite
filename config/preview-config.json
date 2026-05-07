@@ -15,5 +15,6 @@
   "TargetNumberOfEstablishedPeers": 100,
   "TargetNumberOfKnownBigLedgerPeers": 25,
   "TargetNumberOfKnownPeers": 250,
-  "TargetNumberOfRootPeers": 100
+  "TargetNumberOfRootPeers": 100,
+  "ExperimentalHardForksEnabled": true
 }

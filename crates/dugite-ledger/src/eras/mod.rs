@@ -185,7 +185,9 @@ impl EraRulesImpl {
             Era::Shelley | Era::Allegra | Era::Mary => Self::Shelley(shelley::ShelleyRules),
             Era::Alonzo => Self::Alonzo(alonzo::AlonzoRules),
             Era::Babbage => Self::Babbage(babbage::BabbageRules),
-            Era::Conway => Self::Conway(conway::ConwayRules),
+            // Dijkstra uses Conway-compatible ledger rules; full Dijkstra rules
+            // will be added when pallas gains native Dijkstra support.
+            Era::Conway | Era::Dijkstra => Self::Conway(conway::ConwayRules),
         }
     }
 }

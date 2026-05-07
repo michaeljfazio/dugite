@@ -100,6 +100,7 @@ pub fn encode_block(block: &Block, kes_signature: &[u8]) -> Vec<u8> {
         dugite_primitives::era::Era::Alonzo => 5,
         dugite_primitives::era::Era::Babbage => 6,
         dugite_primitives::era::Era::Conway => 7,
+        dugite_primitives::era::Era::Dijkstra => 8,
     };
 
     // Outer array: [era_tag, block_content]

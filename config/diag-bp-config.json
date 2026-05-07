@@ -14,5 +14,6 @@
   "TargetNumberOfEstablishedPeers": 1,
   "TargetNumberOfKnownPeers": 1,
   "TargetNumberOfRootPeers": 1,
-  "MetricsPort": 12799
+  "MetricsPort": 12799,
+  "ExperimentalHardForksEnabled": true
 }

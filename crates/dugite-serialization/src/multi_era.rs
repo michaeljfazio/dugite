@@ -66,7 +66,8 @@ pub enum DecodeMode {
 /// Decode a transaction from raw CBOR bytes.
 ///
 /// The `era_id` corresponds to the Cardano era encoding:
-/// 0 = Byron, 1 = Shelley, 2 = Allegra, 3 = Mary, 4 = Alonzo, 5 = Babbage, 6 = Conway
+/// 0 = Byron, 1 = Shelley, 2 = Allegra, 3 = Mary, 4 = Alonzo, 5 = Babbage,
+/// 6 = Conway, 7 = Dijkstra (Conway-compatible, pallas decodes as Conway)
 pub fn decode_transaction(era_id: u16, tx_cbor: &[u8]) -> Result<Transaction, SerializationError> {
     use pallas_traverse::Era as PallasEra;
 
@@ -77,7 +78,8 @@ pub fn decode_transaction(era_id: u16, tx_cbor: &[u8]) -> Result<Transaction, Se
         3 => PallasEra::Mary,
         4 => PallasEra::Alonzo,
         5 => PallasEra::Babbage,
-        6 => PallasEra::Conway,
+        // Dijkstra (7) uses the same tx format as Conway; decode as Conway.
+        6 | 7 => PallasEra::Conway,
         _ => {
             return Err(SerializationError::CborDecode(format!(
                 "unknown era id: {era_id}"
@@ -232,10 +234,32 @@ fn decode_block_inner(
     byron_epoch_length: u64,
     mode: DecodeMode,
 ) -> Result<Block, SerializationError> {
-    let pallas_block = PallasBlock::decode(cbor)
+    // Dijkstra (era_tag=8) is structurally identical to Conway (era_tag=7) —
+    // same Praos header format and same block body layout.  Pallas 1.0.0-alpha.5
+    // does not yet have a Dijkstra variant; its probe returns `Inconclusive` for
+    // tag 8 and `PallasBlock::decode` returns an error.
+    //
+    // Work-around: if the block starts with the Dijkstra era tag, temporarily
+    // rewrite it to 7 (Conway) in a local copy, decode via pallas, then restore
+    // the true era in the returned `Block`.  The original raw CBOR (with tag=8)
+    // is preserved in `raw_cbor` so ChainDB stores and serves it correctly.
+    let (decode_cbor, dijkstra) = if cbor.len() >= 2 && cbor[0] == 0x82 && cbor[1] == 0x08 {
+        // array(2)[u8(8), ...] → array(2)[u8(7), ...]
+        let mut patched = cbor.to_vec();
+        patched[1] = 0x07;
+        (patched, true)
+    } else {
+        (cbor.to_vec(), false)
+    };
+
+    let pallas_block = PallasBlock::decode(&decode_cbor)
         .map_err(|e| SerializationError::CborDecode(format!("block decode: {e}")))?;
 
-    let era = convert_era(pallas_block.era());
+    let era = if dijkstra {
+        Era::Dijkstra
+    } else {
+        convert_era(pallas_block.era())
+    };
     let header = decode_block_header(&pallas_block, byron_epoch_length)?;
     let transactions = pallas_block
         .txs()

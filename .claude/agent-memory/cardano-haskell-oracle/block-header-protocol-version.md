@@ -12,12 +12,13 @@ Single hardcoded line in cardano-node:
 **`cardano-node/src/Cardano/Node/Protocol/Cardano.hs`**
 
 ```haskell
+-- CURRENT master (verified 2026-05-07):
 , Consensus.cardanoProtocolVersion = if npcExperimentalHardForksEnabled
-                                     then ProtVer (natVersion @11) 0
-                                     else ProtVer (natVersion @10) 8
+                                     then ProtVer (natVersion @12) 0
+                                     else ProtVer (natVersion @11) 0
 ```
 
-(master branch, as of 2026-04-06; latest release 10.6.3 uses 10,7 — see table below)
+Also adds `npcTestDijkstraHardForkAtEpoch` for testing.
 
 ## Per-Release Values (Normal Mode, `ExperimentalHardForksEnabled: false`)
 
@@ -34,12 +35,14 @@ Single hardcoded line in cardano-node:
 | 10.5.4    | 10, 6                  |                            |
 | 10.6.0    | 10, 3                  | (reverted; odd)            |
 | 10.6.1    | 10, 7                  |                            |
-| 10.6.2    | 10, 7                  | Experimental branch added  |
+| 10.6.2    | 10, 7                  | Experimental branch added (11,0) |
 | 10.6.3    | 10, 7                  |                            |
 | 10.7.0    | 10, 8                  |                            |
-| master    | 10, 8                  |                            |
+| master    | 11, 0                  | changed at Dijkstra prep   |
 
-Experimental mode (`ExperimentalHardForksEnabled: true`): always `ProtVer 11 0` from 10.6.2 onward.
+Experimental mode (`ExperimentalHardForksEnabled: true`):
+- 10.6.2–10.6.3: `ProtVer 11 0`
+- 10.7.0+/master: `ProtVer 12 0` (Dijkstra, preview testnet 2026-05-07)
 
 ## Config-Based Override
 

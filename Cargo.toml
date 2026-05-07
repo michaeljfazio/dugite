@@ -146,3 +146,14 @@ panic = "unwind"
 [profile.dev]
 opt-level = 0
 debug = true
+
+# Profiling-friendly release: same codegen as release, but keeps debug info
+# so `sample`/Instruments/flamegraphs attribute hot stacks back to Rust
+# functions. Build with `cargo build --profile release-prof -p dugite-node`.
+# Output goes to target/release-prof/ so the regular release artifact stays
+# untouched.
+[profile.release-prof]
+inherits = "release"
+debug = "line-tables-only"
+strip = "none"
+split-debuginfo = "packed"

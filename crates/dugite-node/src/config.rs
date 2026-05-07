@@ -572,18 +572,26 @@ impl NodeConfig {
     /// It tells the network the maximum protocol version this node supports.
     ///
     /// Matches cardano-node's `cardanoProtocolVersion` in `Cardano.Node.Protocol.Cardano.hs`:
-    /// - `ExperimentalHardForksEnabled = false` → `ProtVer 10 8`
-    /// - `ExperimentalHardForksEnabled = true`  → `ProtVer 11 0`
+    /// - `ExperimentalHardForksEnabled = false` → `ProtVer 11 0`  (signals Conway readiness)
+    /// - `ExperimentalHardForksEnabled = true`  → `ProtVer 12 0`  (Dijkstra, preview testnet)
+    ///
+    /// Values from current master branch (2026-05-07):
+    ///   if npcExperimentalHardForksEnabled then ProtVer (natVersion @12) 0
+    ///                                      else ProtVer (natVersion @11) 0
+    ///
+    /// `maxMajorProtVer` is derived from this: nodes that claim ProtVer 11 will accept
+    /// blocks with on-chain ProtVer <= 11; those claiming ProtVer 12 accept <= 12.
+    /// For preview testnet (Dijkstra active, ProtVer 12), set ExperimentalHardForksEnabled=true.
     pub fn node_protocol_version(&self) -> ProtocolVersion {
         if self.experimental_hard_forks_enabled {
             ProtocolVersion {
-                major: 11,
+                major: 12,
                 minor: 0,
             }
         } else {
             ProtocolVersion {
-                major: 10,
-                minor: 8,
+                major: 11,
+                minor: 0,
             }
         }
     }

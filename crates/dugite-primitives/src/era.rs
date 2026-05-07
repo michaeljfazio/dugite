@@ -17,6 +17,8 @@ pub enum Era {
     Babbage,
     /// Conway era (on-chain governance, CIP-1694)
     Conway,
+    /// Dijkstra era (protocol version 12, storage era tag 8, HFC index 7)
+    Dijkstra,
 }
 
 impl Era {
@@ -25,35 +27,41 @@ impl Era {
     }
 
     pub fn supports_native_assets(&self) -> bool {
-        matches!(self, Era::Mary | Era::Alonzo | Era::Babbage | Era::Conway)
+        matches!(
+            self,
+            Era::Mary | Era::Alonzo | Era::Babbage | Era::Conway | Era::Dijkstra
+        )
     }
 
     pub fn supports_plutus(&self) -> bool {
-        matches!(self, Era::Alonzo | Era::Babbage | Era::Conway)
+        matches!(
+            self,
+            Era::Alonzo | Era::Babbage | Era::Conway | Era::Dijkstra
+        )
     }
 
     pub fn supports_plutus_v2(&self) -> bool {
-        matches!(self, Era::Babbage | Era::Conway)
+        matches!(self, Era::Babbage | Era::Conway | Era::Dijkstra)
     }
 
     pub fn supports_plutus_v3(&self) -> bool {
-        matches!(self, Era::Conway)
+        matches!(self, Era::Conway | Era::Dijkstra)
     }
 
     pub fn supports_governance(&self) -> bool {
-        matches!(self, Era::Conway)
+        matches!(self, Era::Conway | Era::Dijkstra)
     }
 
     pub fn supports_reference_inputs(&self) -> bool {
-        matches!(self, Era::Babbage | Era::Conway)
+        matches!(self, Era::Babbage | Era::Conway | Era::Dijkstra)
     }
 
     pub fn supports_inline_datums(&self) -> bool {
-        matches!(self, Era::Babbage | Era::Conway)
+        matches!(self, Era::Babbage | Era::Conway | Era::Dijkstra)
     }
 
     pub fn supports_reference_scripts(&self) -> bool {
-        matches!(self, Era::Babbage | Era::Conway)
+        matches!(self, Era::Babbage | Era::Conway | Era::Dijkstra)
     }
 
     /// Derive the era from the on-chain protocol version major number.
@@ -65,7 +73,8 @@ impl Era {
     /// - Mary: major 4
     /// - Alonzo: major 5-6
     /// - Babbage: major 7-8
-    /// - Conway: major 9+
+    /// - Conway: major 9-11
+    /// - Dijkstra: major 12+
     pub fn from_protocol_major(major: u64) -> Era {
         match major {
             0..=1 => Era::Byron,
@@ -74,7 +83,8 @@ impl Era {
             4 => Era::Mary,
             5..=6 => Era::Alonzo,
             7..=8 => Era::Babbage,
-            _ => Era::Conway, // 9+ = Conway (future eras will extend this)
+            9..=11 => Era::Conway,
+            _ => Era::Dijkstra, // 12+ = Dijkstra
         }
     }
 
@@ -88,6 +98,7 @@ impl Era {
             Era::Alonzo => 4,
             Era::Babbage => 5,
             Era::Conway => 6,
+            Era::Dijkstra => 7,
         }
     }
 }
@@ -102,6 +113,7 @@ impl std::fmt::Display for Era {
             Era::Alonzo => write!(f, "Alonzo"),
             Era::Babbage => write!(f, "Babbage"),
             Era::Conway => write!(f, "Conway"),
+            Era::Dijkstra => write!(f, "Dijkstra"),
         }
     }
 }
@@ -166,6 +178,7 @@ mod tests {
         assert_eq!(Era::Alonzo.to_era_index(), 4);
         assert_eq!(Era::Babbage.to_era_index(), 5);
         assert_eq!(Era::Conway.to_era_index(), 6);
+        assert_eq!(Era::Dijkstra.to_era_index(), 7);
     }
 
     #[test]
@@ -181,13 +194,16 @@ mod tests {
         assert_eq!(Era::from_protocol_major(8), Era::Babbage);
         assert_eq!(Era::from_protocol_major(9), Era::Conway);
         assert_eq!(Era::from_protocol_major(10), Era::Conway);
-        assert_eq!(Era::from_protocol_major(100), Era::Conway);
+        assert_eq!(Era::from_protocol_major(11), Era::Conway);
+        assert_eq!(Era::from_protocol_major(12), Era::Dijkstra);
+        assert_eq!(Era::from_protocol_major(100), Era::Dijkstra);
     }
 
     #[test]
     fn test_display() {
         assert_eq!(format!("{}", Era::Byron), "Byron");
         assert_eq!(format!("{}", Era::Conway), "Conway");
+        assert_eq!(format!("{}", Era::Dijkstra), "Dijkstra");
     }
 
     #[test]
@@ -195,5 +211,6 @@ mod tests {
         assert!(Era::Byron < Era::Shelley);
         assert!(Era::Shelley < Era::Conway);
         assert!(Era::Alonzo < Era::Babbage);
+        assert!(Era::Conway < Era::Dijkstra);
     }
 }

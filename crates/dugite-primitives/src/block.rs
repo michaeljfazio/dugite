@@ -135,7 +135,8 @@ impl ProtocolVersion {
             4 => Era::Mary,
             5 | 6 => Era::Alonzo,
             7 | 8 => Era::Babbage,
-            9.. => Era::Conway,
+            9..=11 => Era::Conway,
+            _ => Era::Dijkstra, // 12+ = Dijkstra (preview testnet activated 2026-05-07)
         }
     }
 }
@@ -393,11 +394,31 @@ mod tests {
         );
         assert_eq!(
             ProtocolVersion {
-                major: 100,
+                major: 11,
                 minor: 0
             }
             .era(),
             Era::Conway
+        );
+    }
+
+    #[test]
+    fn test_protocol_version_era_dijkstra() {
+        assert_eq!(
+            ProtocolVersion {
+                major: 12,
+                minor: 0
+            }
+            .era(),
+            Era::Dijkstra
+        );
+        assert_eq!(
+            ProtocolVersion {
+                major: 100,
+                minor: 0
+            }
+            .era(),
+            Era::Dijkstra
         );
     }
 
