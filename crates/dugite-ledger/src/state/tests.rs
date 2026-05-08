@@ -9213,6 +9213,140 @@ fn test_evolving_nonce_all_zeros_input() {
 /// epoch_nonce_for_slot returns epoch_nonce unchanged for a slot in the
 /// current epoch.
 #[test]
+fn pool_distribution_for_slot_same_epoch_reads_set() {
+    use dugite_primitives::hash::Hash28;
+    use dugite_primitives::value::Lovelace;
+
+    let params = ProtocolParameters::mainnet_defaults();
+    let mut state = LedgerState::new(params);
+    state.epoch = EpochNo(10);
+    state.epoch_length = 100;
+    state.shelley_transition_epoch = 0;
+    state.byron_epoch_length = 0;
+
+    let our_pool = Hash28::from_bytes([0xAA; 28]);
+    let other_pool = Hash28::from_bytes([0xBB; 28]);
+
+    // `set` snapshot — the active leader-distribution for epoch 10.
+    let mut set_pool_stake = std::collections::HashMap::new();
+    set_pool_stake.insert(our_pool, Lovelace(1_000_000));
+    set_pool_stake.insert(other_pool, Lovelace(4_000_000));
+    state.epochs.snapshots.set = Some(StakeSnapshot {
+        epoch: EpochNo(9),
+        delegations: std::sync::Arc::new(std::collections::HashMap::new()),
+        pool_stake: set_pool_stake,
+        pool_params: std::sync::Arc::new(std::collections::HashMap::new()),
+        stake_distribution: std::sync::Arc::new(std::collections::HashMap::new()),
+        epoch_fees: Lovelace(0),
+        epoch_block_count: 0,
+        epoch_blocks_by_pool: std::sync::Arc::new(std::collections::HashMap::new()),
+    });
+    // `mark` snapshot has DIFFERENT values — the test verifies we read
+    // `set`, not `mark`, when the slot is in the current epoch.
+    let mut mark_pool_stake = std::collections::HashMap::new();
+    mark_pool_stake.insert(our_pool, Lovelace(9_999_999));
+    state.epochs.snapshots.mark = Some(StakeSnapshot {
+        epoch: EpochNo(10),
+        delegations: std::sync::Arc::new(std::collections::HashMap::new()),
+        pool_stake: mark_pool_stake,
+        pool_params: std::sync::Arc::new(std::collections::HashMap::new()),
+        stake_distribution: std::sync::Arc::new(std::collections::HashMap::new()),
+        epoch_fees: Lovelace(0),
+        epoch_block_count: 0,
+        epoch_blocks_by_pool: std::sync::Arc::new(std::collections::HashMap::new()),
+    });
+
+    // Slot squarely inside epoch 10.
+    let slot_in_epoch_10 = 1050u64;
+    assert_eq!(state.epoch_of_slot(slot_in_epoch_10), 10);
+    let (pool, total) = state.pool_distribution_for_slot(slot_in_epoch_10, &our_pool);
+    assert_eq!(
+        pool, 1_000_000,
+        "same-epoch slot must read pool stake from `set` (1M), not `mark` (9.99M)"
+    );
+    assert_eq!(total, 5_000_000, "same-epoch total must come from `set`");
+}
+
+#[test]
+fn pool_distribution_for_slot_next_epoch_reads_mark() {
+    use dugite_primitives::hash::Hash28;
+    use dugite_primitives::value::Lovelace;
+
+    // This is the case the applyChainTick fix specifically addresses:
+    // wall-clock slot is in `ls.epoch + 1` but no peer block of the new
+    // epoch has been applied yet, so `process_epoch_transition` has NOT
+    // run. `snapshots.set` still holds the previous epoch's distribution.
+    // Haskell's `forecastFor` (via TICKF) computes the new `nesPd` from
+    // the pre-NEWEPOCH `mark` — we must do the same.
+    let params = ProtocolParameters::mainnet_defaults();
+    let mut state = LedgerState::new(params);
+    state.epoch = EpochNo(10);
+    state.epoch_length = 100;
+    state.shelley_transition_epoch = 0;
+    state.byron_epoch_length = 0;
+
+    let our_pool = Hash28::from_bytes([0xAA; 28]);
+
+    // `set` snapshot — STALE for the forecast (would be epoch 11's wrong answer).
+    let mut set_pool_stake = std::collections::HashMap::new();
+    set_pool_stake.insert(our_pool, Lovelace(100));
+    state.epochs.snapshots.set = Some(StakeSnapshot {
+        epoch: EpochNo(9),
+        delegations: std::sync::Arc::new(std::collections::HashMap::new()),
+        pool_stake: set_pool_stake,
+        pool_params: std::sync::Arc::new(std::collections::HashMap::new()),
+        stake_distribution: std::sync::Arc::new(std::collections::HashMap::new()),
+        epoch_fees: Lovelace(0),
+        epoch_block_count: 0,
+        epoch_blocks_by_pool: std::sync::Arc::new(std::collections::HashMap::new()),
+    });
+    // `mark` snapshot — the value that becomes `nesPd` for epoch 11
+    // after NEWEPOCH runs. The forecast must read this.
+    let mut mark_pool_stake = std::collections::HashMap::new();
+    mark_pool_stake.insert(our_pool, Lovelace(7_777_777));
+    state.epochs.snapshots.mark = Some(StakeSnapshot {
+        epoch: EpochNo(10),
+        delegations: std::sync::Arc::new(std::collections::HashMap::new()),
+        pool_stake: mark_pool_stake,
+        pool_params: std::sync::Arc::new(std::collections::HashMap::new()),
+        stake_distribution: std::sync::Arc::new(std::collections::HashMap::new()),
+        epoch_fees: Lovelace(0),
+        epoch_block_count: 0,
+        epoch_blocks_by_pool: std::sync::Arc::new(std::collections::HashMap::new()),
+    });
+
+    // Slot in epoch 11 (first slot after the boundary).
+    let slot_in_epoch_11 = 1100u64;
+    assert_eq!(state.epoch_of_slot(slot_in_epoch_11), 11);
+    let (pool, total) = state.pool_distribution_for_slot(slot_in_epoch_11, &our_pool);
+    assert_eq!(
+        pool, 7_777_777,
+        "epoch-boundary forecast must read `mark` (= post-rotation `set` = new \
+         `nesPd`), NOT the pre-rotation `set` which still holds epoch 10's data"
+    );
+    assert_eq!(total, 7_777_777);
+}
+
+#[test]
+fn pool_distribution_for_slot_missing_snapshots_returns_zero() {
+    use dugite_primitives::hash::Hash28;
+
+    let params = ProtocolParameters::mainnet_defaults();
+    let mut state = LedgerState::new(params);
+    state.epoch = EpochNo(0);
+    state.epoch_length = 100;
+    state.shelley_transition_epoch = 0;
+    state.byron_epoch_length = 0;
+    // Genesis bootstrap before any snapshot has been written.
+    state.epochs.snapshots.set = None;
+    state.epochs.snapshots.mark = None;
+
+    let pool = Hash28::from_bytes([0xAA; 28]);
+    let (p, t) = state.pool_distribution_for_slot(50, &pool);
+    assert_eq!((p, t), (0, 0), "missing snapshot → no leader eligibility");
+}
+
+#[test]
 fn test_epoch_nonce_for_slot_same_epoch() {
     let params = ProtocolParameters::mainnet_defaults();
     let mut state = LedgerState::new(params);
