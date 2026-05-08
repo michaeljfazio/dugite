@@ -4520,25 +4520,30 @@ impl Node {
         };
         let slots_per_kes_period = self.consensus.slots_per_kes_period;
 
-        // Calculate stake from the "set" snapshot (used for leader election).
-        // Keep as raw u64 values to use exact rational arithmetic in the VRF check.
-        let (pool_stake, total_active_stake) = if let Some(set_snapshot) = &ls.epochs.snapshots.set
-        {
-            let total_stake: u64 = set_snapshot.pool_stake.values().map(|s| s.0).sum();
-            let pool_stake = set_snapshot
-                .pool_stake
-                .get(&creds.pool_id)
-                .map(|s| s.0)
-                .unwrap_or(0);
-            (pool_stake, total_stake)
-        } else {
+        // Pool distribution for the leader VRF check, forecast to the forge
+        // slot. `pool_distribution_for_slot` mirrors Haskell's
+        // `protocolLedgerView` over a TICKF-forecast ledger:
+        //   - Same epoch as ledger → reads `snapshots.set` (post-rotation,
+        //     = current `nesPd`).
+        //   - Epoch boundary (slot is in `ls.epoch + 1` but ledger has not
+        //     yet ticked) → reads `snapshots.mark`, which is the value that
+        //     becomes the new `set` and thus the new `nesPd` after NEWEPOCH.
+        //
+        // Without this forecast we would use 2-epoch-old stake when forging
+        // the very first block of a new epoch (the case where no peer's
+        // epoch-N block has applied yet), producing a leader-check result
+        // computed over the wrong stake distribution.
+        let (pool_stake, total_active_stake) =
+            ls.pool_distribution_for_slot(next_slot.0, &creds.pool_id);
+        if pool_stake == 0 && total_active_stake == 0 {
             debug!(
                 target: "forge",
                 pool_id = %creds.pool_id,
-                "Forge: skipping — no 'set' snapshot available"
+                forge_epoch = ls.epoch_of_slot(next_slot.0),
+                ledger_epoch = ls.epoch.0,
+                "Forge: skipping — no usable stake snapshot available for forge slot"
             );
-            (0, 0)
-        };
+        }
         drop(ls);
 
         if pool_stake == 0 || total_active_stake == 0 {

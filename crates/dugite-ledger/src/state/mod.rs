@@ -1160,6 +1160,63 @@ impl LedgerState {
     /// should not occur at tip), `self.epoch_nonce` is returned as a fallback
     /// (VRF verification will fail non-fatally in non-strict mode, or produce
     /// an informative error in strict mode).
+    /// Forecast the pool distribution `(pool_stake, total_active_stake)` for
+    /// the leader VRF check at the given slot, mirroring Haskell's
+    /// `protocolLedgerView` over a possibly-ticked ledger state
+    /// (`Tickf.hs:nesPd = ssStakeMarkPoolDistr nes.esSnapshots`).
+    ///
+    /// At a normal forge — `slot`'s epoch == `self.epoch` — this returns the
+    /// values from `snapshots.set` exactly as before. The "set" snapshot was
+    /// rotated from "mark" at the most recent NEWEPOCH and is the canonical
+    /// pool distribution for leader checks in the current epoch.
+    ///
+    /// At an epoch-boundary forge — `slot`'s epoch == `self.epoch + 1`, the
+    /// case where our wall-clock slot has crossed into a new epoch but no
+    /// peer block of the new epoch has applied yet — `snapshots.set` still
+    /// holds the *previous* epoch's pool distribution (it has not been
+    /// rotated yet because `process_epoch_transition` only fires on apply).
+    /// Haskell handles this via a `forecastFor` / TICKF that effectively
+    /// performs the rotation on the fly: the new `nesPd` is taken from
+    /// `ssStakeMarkPoolDistr` of the pre-NEWEPOCH state — which is exactly
+    /// `snapshots.mark` in dugite's data model. That is the value that would
+    /// become the new `set` after NEWEPOCH runs.
+    ///
+    /// Returns `(0, 0)` when the requested snapshot is unavailable (e.g.
+    /// genesis bootstrap before any snapshot has been computed) — the
+    /// caller treats that as "no stake, can't be leader" which matches the
+    /// Haskell behaviour in the same boundary case.
+    ///
+    /// Forecasting more than one epoch ahead is unsupported (the intermediate
+    /// epoch's mark would itself depend on a future NEWEPOCH that hasn't
+    /// run); we return the current-epoch values as a fallback, which the
+    /// stability-window gate (`TraceNoLedgerView`) will normally have caught
+    /// before this point.
+    pub fn pool_distribution_for_slot(
+        &self,
+        slot: u64,
+        pool_id: &dugite_primitives::hash::Hash28,
+    ) -> (u64, u64) {
+        let block_epoch = self.epoch_of_slot(slot);
+        let cur_epoch = self.epoch.0;
+        let snapshot = if block_epoch == cur_epoch.saturating_add(1) {
+            // Epoch-boundary forecast: read pre-rotation `mark`, which becomes
+            // the new `set` (= new `nesPd`) after NEWEPOCH.
+            self.epochs.snapshots.mark.as_ref()
+        } else {
+            // Same epoch (or behind, which should not happen at tip): the
+            // post-rotation `set` is the active pool distribution.
+            self.epochs.snapshots.set.as_ref()
+        };
+        match snapshot {
+            Some(s) => {
+                let total: u64 = s.pool_stake.values().map(|stake| stake.0).sum();
+                let pool = s.pool_stake.get(pool_id).map(|stake| stake.0).unwrap_or(0);
+                (pool, total)
+            }
+            None => (0, 0),
+        }
+    }
+
     pub fn epoch_nonce_for_slot(&self, slot: u64) -> Hash32 {
         let block_epoch = self.epoch_of_slot(slot);
         if block_epoch <= self.epoch.0 {
