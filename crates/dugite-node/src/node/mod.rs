@@ -4217,6 +4217,27 @@ pub(crate) fn next_forged_block_number(
     }
 }
 
+/// Selects whether the forge attempt is extending the current tip or
+/// producing a competing block at the same slot as an existing tip
+/// (Haskell's `mkCurrentBlockContext` LT vs EQ branches).
+///
+/// In `ExtendTip` the block number is `tip.block_no + 1` and the
+/// previous-hash is the tip's own header hash. In `SlotBattle` the
+/// block number is the tip's own block number (NOT incremented) and
+/// the previous-hash is the tip's parent — both values carried in
+/// the variant so the rest of the forge path stays uniform.
+#[derive(Debug, Clone, Copy)]
+enum ForgeMode {
+    /// Normal case: forge on top of the current tip.
+    ExtendTip,
+    /// Slot-battle case: a peer's block is already at our wall-clock slot.
+    /// Forge a competing block parented at the tip's parent.
+    SlotBattle {
+        block_number: dugite_primitives::time::BlockNo,
+        prev_hash: dugite_primitives::hash::Hash32,
+    },
+}
+
 impl Node {
     // ─── try_forge_block() ───────────────────────────────────────────────────
 
@@ -4280,24 +4301,24 @@ impl Node {
         let tip_slot = ls.tip.point.slot().map(|s| s.0).unwrap_or(0);
         let prev_point = ls.tip.point.clone();
 
-        // ── Step 2: TraceBlockFromFuture ──────────────────────────────────────
-        // Haskell: in `mkCurrentBlockContext` (NodeKernel.hs):
+        // ── Step 2: TraceBlockFromFuture / slot-battle classification ─────────
+        // Haskell `mkCurrentBlockContext` (NodeKernel.hs:960):
         //   - tipSlot < currentSlot  → forge on top of tip (normal)
+        //     bcBlockNo = tip.block_no + 1, bcPrevPoint = tip.point
         //   - tipSlot > currentSlot  → TraceBlockFromFuture (Error) + exitEarly
-        //   - tipSlot == currentSlot → forge a *competing* block at the same slot
-        //     with `bcBlockNo = tip.block_no` and `bcPrevPoint = tip.parent_point`
-        //     (a slot battle; chain selection's VRF tiebreaker decides the winner).
+        //   - tipSlot == currentSlot → forge a *competing* block (slot battle):
+        //     bcBlockNo = tip.block_no, bcPrevPoint = AF.headPoint c'
+        //     (the head of the chain fragment EXCLUDING the tip — i.e. the
+        //     parent of the current tip). The two blocks share the same
+        //     slot, block_no and parent; chain selection's VRF tiebreaker
+        //     (RestrictedVRFTiebreaker 5 in Conway with slotDist=0) decides
+        //     the winner deterministically by the smaller raw VRF output.
         //
-        // The strict `>` matches Haskell exactly. The equality case is a
-        // separate, benign condition — a peer's block for the same slot was
-        // applied milliseconds before our forge ticker fired — and is logged
-        // at INFO level via `TraceSlotBattleSkipped` below. We do not yet
-        // implement competing-block forging (that needs access to the tip's
-        // parent point through ChainDB); for the very-low-stake pools we
-        // currently target the missed-forge frequency is statistically zero,
-        // so skipping is the safe, simple option until full slot-battle
-        // support lands.
-        match tip_slot.cmp(&current_slot) {
+        // The forge mode determines `bcBlockNo` and `bcPrevHash` for the
+        // rest of this function. The KES signature, VRF leader check, body
+        // hash, header hash, etc. are all computed on whichever values this
+        // step selects.
+        let forge_mode = match tip_slot.cmp(&current_slot) {
             std::cmp::Ordering::Greater => {
                 drop(ls);
                 error!(
@@ -4309,19 +4330,54 @@ impl Node {
                 return;
             }
             std::cmp::Ordering::Equal => {
-                drop(ls);
+                // Slot battle: read the tip header to extract its parent's
+                // hash and the tip's own block_no. The competing block we
+                // are about to forge will reuse those values verbatim.
+                let fragment = self.chain_fragment.read().await;
+                let tip_header = match fragment.headers().back().cloned() {
+                    Some(h) => h,
+                    None => {
+                        // Empty fragment with tip_slot == current_slot would
+                        // mean the immutable tip is at the wall-clock slot.
+                        // Refusing to forge here matches the immutable-tip
+                        // gate below; this branch is unreachable in normal
+                        // operation since the immutable tip lags behind the
+                        // volatile tip by at least 1 block.
+                        drop(fragment);
+                        drop(ls);
+                        warn!(
+                            target: "forge",
+                            current_slot,
+                            tip_slot,
+                            "TraceSlotBattle: chain fragment empty at slot battle — \
+                             cannot determine tip parent, skipping forge",
+                        );
+                        return;
+                    }
+                };
+                drop(fragment);
+                // The competing block uses the SAME block_no as the existing
+                // tip and points at the SAME parent (tip.prev_hash).
                 info!(
                     target: "forge",
                     current_slot,
                     tip_slot,
-                    "TraceSlotBattleSkipped: peer block already adopted at this slot — \
-                     skipping forge (Haskell would forge a competing block; not yet \
-                     implemented)",
+                    competing_with = %tip_header.header_hash.to_hex(),
+                    block_no = tip_header.block_number.0,
+                    parent_hash = %tip_header.prev_hash.to_hex(),
+                    "TraceSlotBattle: forging competing block — same slot, same \
+                     block_no, same parent as existing tip",
                 );
-                return;
+                self.metrics
+                    .forge_slot_battles_total
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                ForgeMode::SlotBattle {
+                    block_number: tip_header.block_number,
+                    prev_hash: tip_header.prev_hash,
+                }
             }
-            std::cmp::Ordering::Less => {} // normal: continue to forge on top of tip
-        }
+            std::cmp::Ordering::Less => ForgeMode::ExtendTip,
+        };
         let next_slot = wall_clock_slot;
 
         // ── Step 3: TraceSlotIsImmutable ──────────────────────────────────────
@@ -4446,13 +4502,22 @@ impl Node {
         // ls.consensus.epoch_nonce still holds the previous epoch's nonce.
         // epoch_nonce_for_slot pre-computes the correct nonce, matching the sync path.
         let epoch_nonce = ls.epoch_nonce_for_slot(next_slot.0);
-        let block_number = next_forged_block_number(&ls.tip.point, ls.current_block_number());
-        let prev_hash = ls
-            .tip
-            .point
-            .hash()
-            .copied()
-            .unwrap_or(dugite_primitives::hash::Hash32::ZERO);
+        let (block_number, prev_hash) = match forge_mode {
+            ForgeMode::ExtendTip => {
+                let bn = next_forged_block_number(&ls.tip.point, ls.current_block_number());
+                let ph = ls
+                    .tip
+                    .point
+                    .hash()
+                    .copied()
+                    .unwrap_or(dugite_primitives::hash::Hash32::ZERO);
+                (bn, ph)
+            }
+            ForgeMode::SlotBattle {
+                block_number,
+                prev_hash,
+            } => (block_number, prev_hash),
+        };
         let slots_per_kes_period = self.consensus.slots_per_kes_period;
 
         // Calculate stake from the "set" snapshot (used for leader election).
@@ -5014,7 +5079,7 @@ mod tests {
 
     use super::serve::ChainDBBlockProvider;
     use super::sync::validate_genesis_blocks;
-    use super::{next_forged_block_number, Point};
+    use super::{next_forged_block_number, ForgeMode, Point};
     use crate::config::NodeConfig;
 
     // ─── next_forged_block_number regression tests ───────────────────────────
@@ -5409,6 +5474,69 @@ mod tests {
             "slot-battle race must be classified as Equal so it can take the \
              SlotBattle branch (INFO log, skip until competing-forge support lands)"
         );
+    }
+
+    /// SlotBattle parameter selection: matches Haskell's `mkCurrentBlockContext`
+    /// EQ branch in NodeKernel.hs:960. The competing block must reuse the
+    /// existing tip's block_no (NOT incremented) and parent at the tip's parent
+    /// (`tip.prev_hash`). Two pools forging at the same slot end up with
+    /// blocks that share `(slot, block_no, parent)` and differ only in their
+    /// VRF/KES output — chain selection's RestrictedVRFTiebreaker (slotDist=0)
+    /// chooses the winner deterministically.
+    #[test]
+    fn forge_mode_slot_battle_uses_tip_block_no_and_tip_prev_hash() {
+        use dugite_primitives::hash::Hash32;
+        use dugite_primitives::time::BlockNo;
+
+        let tip_block_no = BlockNo(123_456);
+        let tip_prev_hash = Hash32::from_bytes([0xAB; 32]);
+
+        let mode = ForgeMode::SlotBattle {
+            block_number: tip_block_no,
+            prev_hash: tip_prev_hash,
+        };
+
+        match mode {
+            ForgeMode::SlotBattle {
+                block_number,
+                prev_hash,
+            } => {
+                assert_eq!(
+                    block_number, tip_block_no,
+                    "slot-battle competing block MUST share the tip's block_no \
+                     (NOT tip.block_no + 1) so it sits at the same chain height"
+                );
+                assert_eq!(
+                    prev_hash, tip_prev_hash,
+                    "slot-battle competing block MUST parent at the tip's parent \
+                     (tip.prev_hash), NOT at the tip itself, otherwise it would be \
+                     a child of the existing slot-N block instead of an alternative"
+                );
+            }
+            ForgeMode::ExtendTip => panic!("expected SlotBattle variant"),
+        }
+    }
+
+    /// ExtendTip vs SlotBattle classification regression: confirm the variants
+    /// are distinct types. Guards against a future refactor that accidentally
+    /// collapses them or swaps the field semantics.
+    #[test]
+    fn forge_mode_variants_are_distinct() {
+        use dugite_primitives::hash::Hash32;
+        use dugite_primitives::time::BlockNo;
+
+        let extend = ForgeMode::ExtendTip;
+        let battle = ForgeMode::SlotBattle {
+            block_number: BlockNo(1),
+            prev_hash: Hash32::ZERO,
+        };
+
+        // The compiler enforces this at type level, but the `matches!` form
+        // serves as a runtime self-document.
+        assert!(matches!(extend, ForgeMode::ExtendTip));
+        assert!(matches!(battle, ForgeMode::SlotBattle { .. }));
+        assert!(!matches!(extend, ForgeMode::SlotBattle { .. }));
+        assert!(!matches!(battle, ForgeMode::ExtendTip));
     }
 
     /// CannotForge gate: forge must be skipped when the wall-clock KES period

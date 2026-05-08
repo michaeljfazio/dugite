@@ -458,6 +458,32 @@ fn render_node_panel(frame: &mut Frame, app: &App, theme: &Theme, area: Rect) {
         col_w,
     ));
 
+    // Slot-battle counter — only meaningful for block producers. A slot battle
+    // is when our wall-clock slot equalled the ledger tip's slot at forge time
+    // (a peer's block for the same slot was applied moments before our forge
+    // ticker fired). Each one is a competing block whose adoption is decided
+    // by chain selection's VRF tiebreaker. Showing this lets the operator see
+    // at a glance how often we are racing peers for the same slot — a healthy
+    // BP sees a small but non-zero count over time.
+    if app.is_block_producer() {
+        let slot_battles = app.metrics.get_u64("dugite_forge_slot_battles_total");
+        lines.push(kv_aligned(
+            "Slot Battles",
+            if no_data {
+                "--".to_string()
+            } else {
+                App::format_number(slot_battles)
+            },
+            if slot_battles > 0 {
+                theme.warning
+            } else {
+                theme.muted
+            },
+            theme,
+            col_w,
+        ));
+    }
+
     lines.truncate(inner.height as usize);
     frame.render_widget(Paragraph::new(lines), inner);
 }

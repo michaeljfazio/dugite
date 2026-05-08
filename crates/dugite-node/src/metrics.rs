@@ -518,6 +518,14 @@ pub struct NodeMetrics {
     /// 1 when peer sharing mini-protocol is enabled, 0 when disabled.
     /// Set once at startup based on config and block producer status.
     pub peer_sharing_enabled: AtomicU64,
+    /// Number of slot-battle forge attempts (i.e. forges where our
+    /// wall-clock slot equalled the ledger tip's slot at forge time —
+    /// a peer's block for the same slot was applied milliseconds before
+    /// our forge ticker fired). Each is a competing block parented at
+    /// the tip's parent; chain selection's VRF tiebreaker decides which
+    /// of the two ends up on the canonical chain. Mirrors Haskell's
+    /// `mkCurrentBlockContext` EQ branch in NodeKernel.hs.
+    pub forge_slot_battles_total: AtomicU64,
 }
 
 /// Plain-data view of the governance-related ledger state and Conway
@@ -648,6 +656,7 @@ impl NodeMetrics {
             compat_metrics: std::sync::atomic::AtomicBool::new(false),
             diffusion_mode: AtomicU64::new(0),
             peer_sharing_enabled: AtomicU64::new(1),
+            forge_slot_battles_total: AtomicU64::new(0),
         }
     }
 
@@ -1074,6 +1083,13 @@ impl NodeMetrics {
                 "dugite_forge_announce_no_subscribers_total",
                 "Forge announcements sent with zero broadcast subscribers (propagation failures)",
                 &self.forge_announce_no_subscribers,
+            ),
+            (
+                "dugite_forge_slot_battles_total",
+                "Forge attempts where wall-clock slot equalled the ledger tip slot \
+                 (a peer forged at our slot first); each is a competing block whose \
+                 fate is decided by chain selection's VRF tiebreaker",
+                &self.forge_slot_battles_total,
             ),
             (
                 "dugite_n2n_connections_total",

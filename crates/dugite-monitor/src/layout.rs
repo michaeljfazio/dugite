@@ -44,8 +44,11 @@ use ratatui::layout::{Constraint, Layout, Rect};
 // Fixed panel heights (lines including borders)
 // ---------------------------------------------------------------------------
 
-/// Node panel: Role + Network + Version + Era + Uptime + Peers + Forged = 7 content rows + sync bar (1) + 2 borders = 10
-pub const PANEL_NODE_H: u16 = 10;
+/// Node panel: Role + Pool (BP) + Forge (BP) + Network + Version + Uptime +
+/// Blocks Forged + Slot Battles (BP) = up to 8 content rows + 2 borders.
+/// Sized for the BP case (more rows); relays show fewer rows but the panel
+/// height stays uniform.
+pub const PANEL_NODE_H: u16 = 11;
 /// Chain panel: epoch bar (1) + 8 data rows + mempool gauge (1) + 2 borders = 12.
 /// The epoch progress bar lives here (not in the header).
 pub const PANEL_CHAIN_H: u16 = 12;
