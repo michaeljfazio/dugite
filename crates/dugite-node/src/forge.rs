@@ -274,12 +274,26 @@ pub fn forge_block(
     let body_hash = dugite_serialization::compute_block_body_hash(&transactions);
     let body_size = compute_body_size(&transactions);
 
-    // Compute the nonce VRF contribution for Babbage/Conway (Praos era).
-    // nonce_vrf_output = blake2b_256("N" || vrf_output.0)
-    // This matches pallas's HeaderBody::nonce_vrf_output() derivation and
-    // Haskell's vrfNonceValue for the Praos era.  When this forged block is
-    // applied to the ledger, update_evolving_nonce() will incorporate it into
-    // the evolving nonce without any additional hashing.
+    // Compute the nonce VRF contribution stamped on the header for Praos
+    // (Babbage/Conway/Dijkstra). On the wire this field carries:
+    //
+    //     eta = blake2b_256("N" || vrf_output_bytes)
+    //
+    // This matches pallas's `HeaderBody::nonce_vrf_output()` for Babbage+
+    // (which performs the same single Blake2b over the "N"-prefixed raw VRF
+    // output), so any node decoding our forged block reads back the same eta
+    // we produced here.
+    //
+    // Haskell's `vrfNonceValue` (Praos/VRF.hs) is a *double* Blake2b:
+    //   Nonce(Blake2b_256(Blake2b_256("N" || vrf_output_bytes)))
+    //
+    // The first hash happens HERE at forge time and is what we serialise into
+    // the block. The second hash happens later when the block is applied:
+    // `dugite_ledger::eras::common::compute_shelley_nonce` does
+    // `eta_hash = blake2b_256(header.nonce_vrf_output)` before mixing the
+    // result into the evolving nonce — so the on-chain evolving-nonce update
+    // ends up incorporating the same `Blake2b_256(Blake2b_256(...))` value
+    // that Haskell's `vrfNonceValue` produces. Do NOT remove either hash.
     let nonce_vrf_output = {
         let mut tagged = Vec::with_capacity(1 + vrf_output.len());
         tagged.push(b'N');

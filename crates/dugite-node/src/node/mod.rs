@@ -4248,10 +4248,12 @@ impl Node {
     /// 4. TraceBlockContext / TraceNoLedgerState (ledger state for prev-point)
     /// 5. TraceLedgerState
     /// 6. TraceNoLedgerView / TraceLedgerView (stability-window gate)
-    /// 7. VRF leader election: TraceNodeNotLeader / TraceNodeIsLeader
-    /// 8. TraceForgeTickedLedgerState / TraceForgingMempoolSnapshot
-    /// 9. TraceForgedBlock / TraceAdoptedBlock / TraceDidntAdoptBlock /
-    ///    TraceForgedInvalidBlock
+    /// 7. TraceNodeCannotForge (PraosCannotForgeKeyNotUsableYet:
+    ///    wall-clock KES period < opcert start period)
+    /// 8. VRF leader election: TraceNodeNotLeader / TraceNodeIsLeader
+    /// 9. TraceForgeTickedLedgerState / TraceForgingMempoolSnapshot
+    /// 10. TraceForgedBlock / TraceAdoptedBlock / TraceDidntAdoptBlock /
+    ///     TraceForgedInvalidBlock
     pub(crate) async fn try_forge_block_at(
         &mut self,
         wall_clock_slot: dugite_primitives::time::SlotNo,
@@ -4409,6 +4411,34 @@ impl Node {
             stability_window,
             "TraceLedgerView",
         );
+
+        // ── Step 5b: TraceNodeCannotForge (PraosCannotForgeKeyNotUsableYet) ───
+        // Haskell `praosCheckCanForge` (Protocol/Praos.hs) emits this before the
+        // VRF leader check whenever the wall-clock KES period is *earlier* than
+        // the operational certificate's `c0` (start period). The KES key is
+        // valid but not yet usable — most commonly because a freshly issued
+        // OCert was published with `c0` set to the next period to support
+        // graceful key rotation.
+        //
+        // Forging in this state would produce a KES signature with relative
+        // evolution clamped to 0, which the Haskell verifier *also* clamps
+        // to 0 — but that is a wire-format coincidence; semantically the
+        // certificate has not begun yet and the block must not be produced.
+        // Skipping here matches `checkShouldForge` returning `CannotForge`
+        // (Praos/Block/Forging.hs:200).
+        let current_slot_kes_period = current_slot / self.consensus.slots_per_kes_period;
+        if current_slot_kes_period < creds.opcert_kes_period {
+            info!(
+                target: "forge",
+                current_slot,
+                wall_clock_kes_period = current_slot_kes_period,
+                opcert_kes_period = creds.opcert_kes_period,
+                pool_id = %creds.pool_id,
+                "TraceNodeCannotForge: PraosCannotForgeKeyNotUsableYet — \
+                 wall-clock KES period precedes operational certificate start period",
+            );
+            return;
+        }
 
         // ── Extract ledger values needed for the forge attempt ────────────────
         // Use epoch_nonce_for_slot to handle first slot of new epoch correctly.
@@ -5378,6 +5408,53 @@ mod tests {
             matches!(cmp, std::cmp::Ordering::Equal),
             "slot-battle race must be classified as Equal so it can take the \
              SlotBattle branch (INFO log, skip until competing-forge support lands)"
+        );
+    }
+
+    /// CannotForge gate: forge must be skipped when the wall-clock KES period
+    /// is earlier than the operational certificate's start period
+    /// (`c0`/`opcert_kes_period`). Matches Haskell's
+    /// `PraosCannotForgeKeyNotUsableYet` from
+    /// `ouroboros-consensus-protocol/.../Praos.hs:praosCheckCanForge`.
+    ///
+    /// This guards against forging with a freshly issued operational
+    /// certificate whose start period is in the future (a common scenario
+    /// during graceful KES rotation): a block produced in this state would
+    /// carry a KES signature at relative evolution 0 that the verifier
+    /// ALSO clamps to 0, which is a wire-format coincidence rather than
+    /// semantic correctness.
+    #[test]
+    fn forge_gate_cannot_forge_key_not_usable_yet() {
+        let slots_per_kes_period: u64 = 129_600;
+
+        // Wall-clock slot 100, opcert KES period 1 → wall-clock KES period 0
+        // < opcert KES period 1 → gate fires.
+        let current_slot: u64 = 100;
+        let opcert_kes_period: u64 = 1;
+        let wall_clock_kes_period = current_slot / slots_per_kes_period;
+        assert!(
+            wall_clock_kes_period < opcert_kes_period,
+            "TraceNodeCannotForge gate must fire when wall-clock period < opcert start period"
+        );
+
+        // Wall-clock slot 200_000, opcert KES period 1 → wall-clock KES period 1
+        // == opcert KES period → gate does NOT fire (key just became usable).
+        let current_slot: u64 = 200_000;
+        let opcert_kes_period: u64 = 1;
+        let wall_clock_kes_period = current_slot / slots_per_kes_period;
+        assert!(
+            wall_clock_kes_period >= opcert_kes_period,
+            "TraceNodeCannotForge gate must NOT fire at the exact start period boundary"
+        );
+
+        // Wall-clock slot 1_000_000, opcert KES period 5 → wall-clock KES period 7
+        // > opcert KES period 5 → gate does NOT fire (normal forge condition).
+        let current_slot: u64 = 1_000_000;
+        let opcert_kes_period: u64 = 5;
+        let wall_clock_kes_period = current_slot / slots_per_kes_period;
+        assert!(
+            wall_clock_kes_period >= opcert_kes_period,
+            "TraceNodeCannotForge gate must NOT fire when wall-clock period > opcert start"
         );
     }
 
