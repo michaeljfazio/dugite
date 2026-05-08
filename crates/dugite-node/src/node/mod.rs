@@ -4271,7 +4271,10 @@ impl Node {
     /// 6. TraceNoLedgerView / TraceLedgerView (stability-window gate)
     /// 7. TraceNodeCannotForge (PraosCannotForgeKeyNotUsableYet:
     ///    wall-clock KES period < opcert start period)
-    /// 8. VRF leader election: TraceNodeNotLeader / TraceNodeIsLeader
+    /// 8. VRF leader election: TraceNodeNotLeader / TraceNodeIsLeader.
+    ///    Post-IsLeader: increment `dugite_forge_slot_battles_total` if
+    ///    forge_mode is SlotBattle (Haskell has no equivalent metric —
+    ///    operators infer slot battles from logs).
     /// 9. TraceForgeTickedLedgerState / TraceForgingMempoolSnapshot
     /// 10. TraceForgedBlock / TraceAdoptedBlock / TraceDidntAdoptBlock /
     ///     TraceForgedInvalidBlock
@@ -4358,6 +4361,14 @@ impl Node {
                 drop(fragment);
                 // The competing block uses the SAME block_no as the existing
                 // tip and points at the SAME parent (tip.prev_hash).
+                //
+                // Note: the `dugite_forge_slot_battles_total` counter is
+                // incremented LATER, after the VRF leader check passes (see
+                // post-TraceNodeIsLeader gate below). Incrementing here
+                // would over-count by an order of magnitude — on a healthy
+                // chain a peer's block lands at our wall-clock on most
+                // slots, but we only "battle" when we are also elected
+                // leader for that same slot.
                 info!(
                     target: "forge",
                     current_slot,
@@ -4368,9 +4379,6 @@ impl Node {
                     "TraceSlotBattle: forging competing block — same slot, same \
                      block_no, same parent as existing tip",
                 );
-                self.metrics
-                    .forge_slot_battles_total
-                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 ForgeMode::SlotBattle {
                     block_number: tip_header.block_number,
                     prev_hash: tip_header.prev_hash,
@@ -4605,6 +4613,19 @@ impl Node {
             stake = format_args!("{relative_stake_display:.6}"),
             "TraceNodeIsLeader",
         );
+
+        // Slot-battle counter: increment only when we (a) passed the VRF
+        // leader check AND (b) classified the forge as a slot battle in
+        // mkCurrentBlockContext. This is the operationally-meaningful
+        // semantic — "slots where I was elected leader AND a peer had
+        // already filled my slot." Haskell does not expose a corresponding
+        // metric (operators infer slot battles from logs), but exposing it
+        // here gives us direct visibility into the rare event.
+        if matches!(forge_mode, ForgeMode::SlotBattle { .. }) {
+            self.metrics
+                .forge_slot_battles_total
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
 
         // ── Step 8: applyChainTick + mempool snapshot ─────────────────────────
         // Haskell: applyChainTick → TraceForgeTickedLedgerState (Debug).
