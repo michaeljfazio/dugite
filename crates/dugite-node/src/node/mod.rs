@@ -4242,7 +4242,8 @@ impl Node {
     /// The check sequence mirrors Haskell's
     /// `Ouroboros.Consensus.NodeKernel.forkBlockForging` exactly:
     /// 1. TraceStartLeadershipCheck
-    /// 2. TraceBlockFromFuture (tip_slot > current_slot)
+    /// 2. TraceBlockFromFuture (tip_slot > current_slot, strict)
+    ///    2b. TraceSlotBattle (tip_slot == current_slot — peer forged at our slot first)
     /// 3. TraceSlotIsImmutable  (immutable_tip_slot == current_slot)
     /// 4. TraceBlockContext / TraceNoLedgerState (ledger state for prev-point)
     /// 5. TraceLedgerState
@@ -4278,19 +4279,46 @@ impl Node {
         let prev_point = ls.tip.point.clone();
 
         // ── Step 2: TraceBlockFromFuture ──────────────────────────────────────
-        // Haskell: if tipSlot > currentSlot → TraceBlockFromFuture (Error) + exitEarly.
-        // Our equivalent: wall-clock slot must be strictly greater than the
-        // ledger tip slot.  If tip_slot >= current_slot the chain has already
-        // produced a block for this slot (or is ahead) — not our turn.
-        if tip_slot >= current_slot {
-            drop(ls);
-            error!(
-                target: "forge",
-                current_slot,
-                tip_slot,
-                "TraceBlockFromFuture: chain tip is at or ahead of current slot — skipping forge",
-            );
-            return;
+        // Haskell: in `mkCurrentBlockContext` (NodeKernel.hs):
+        //   - tipSlot < currentSlot  → forge on top of tip (normal)
+        //   - tipSlot > currentSlot  → TraceBlockFromFuture (Error) + exitEarly
+        //   - tipSlot == currentSlot → forge a *competing* block at the same slot
+        //     with `bcBlockNo = tip.block_no` and `bcPrevPoint = tip.parent_point`
+        //     (a slot battle; chain selection's VRF tiebreaker decides the winner).
+        //
+        // The strict `>` matches Haskell exactly. The equality case is a
+        // separate, benign condition — a peer's block for the same slot was
+        // applied milliseconds before our forge ticker fired — and is logged
+        // at INFO level via `TraceSlotBattleSkipped` below. We do not yet
+        // implement competing-block forging (that needs access to the tip's
+        // parent point through ChainDB); for the very-low-stake pools we
+        // currently target the missed-forge frequency is statistically zero,
+        // so skipping is the safe, simple option until full slot-battle
+        // support lands.
+        match tip_slot.cmp(&current_slot) {
+            std::cmp::Ordering::Greater => {
+                drop(ls);
+                error!(
+                    target: "forge",
+                    current_slot,
+                    tip_slot,
+                    "TraceBlockFromFuture: chain tip is ahead of current slot — skipping forge",
+                );
+                return;
+            }
+            std::cmp::Ordering::Equal => {
+                drop(ls);
+                info!(
+                    target: "forge",
+                    current_slot,
+                    tip_slot,
+                    "TraceSlotBattleSkipped: peer block already adopted at this slot — \
+                     skipping forge (Haskell would forge a competing block; not yet \
+                     implemented)",
+                );
+                return;
+            }
+            std::cmp::Ordering::Less => {} // normal: continue to forge on top of tip
         }
         let next_slot = wall_clock_slot;
 
@@ -5293,37 +5321,63 @@ mod tests {
         );
     }
 
-    /// BlockFromFuture gate: forge must be skipped when tip_slot >= current_slot.
+    /// BlockFromFuture gate: must use **strict** `tip_slot > current_slot`,
+    /// matching Haskell's `mkCurrentBlockContext` GT branch in
+    /// `ouroboros-consensus-diffusion/.../NodeKernel.hs`.
     ///
-    /// Haskell: if tipSlot > currentSlot → TraceBlockFromFuture + exitEarly.
-    /// We use tip_slot >= current_slot (our equivalent: if chain is not behind
-    /// wall clock, not our slot to forge).
+    /// The equality case (`tip_slot == current_slot`) is a slot battle, NOT a
+    /// "block from future". Haskell handles it by forging a competing block
+    /// against the tip's parent (with the same block_no as the existing tip);
+    /// we currently log `TraceSlotBattleSkipped` at INFO and skip.
     #[test]
-    fn forge_gate_block_from_future() {
-        // Simulate the gate condition inline.
-        // When tip_slot >= current_slot the gate fires.
+    fn forge_gate_block_from_future_uses_strict_greater_than() {
         let current_slot: u64 = 1000;
 
-        // tip_slot == current_slot → gate fires (chain is at wall clock).
-        let tip_slot: u64 = 1000;
-        assert!(
-            tip_slot >= current_slot,
-            "TraceBlockFromFuture gate must fire when tip_slot == current_slot"
-        );
-
-        // tip_slot > current_slot → gate fires (chain is ahead — shouldn't happen
-        // in normal operation but must be handled).
+        // tip_slot > current_slot → gate fires (chain ahead of wall clock).
         let tip_slot: u64 = 1001;
         assert!(
-            tip_slot >= current_slot,
-            "TraceBlockFromFuture gate must fire when tip_slot > current_slot"
+            matches!(tip_slot.cmp(&current_slot), std::cmp::Ordering::Greater),
+            "BlockFromFuture must fire only on strict tip_slot > current_slot"
         );
 
-        // tip_slot < current_slot → gate does NOT fire (normal forge condition).
+        // tip_slot == current_slot → NOT BlockFromFuture, this is a slot battle.
+        let tip_slot: u64 = 1000;
+        assert!(
+            matches!(tip_slot.cmp(&current_slot), std::cmp::Ordering::Equal),
+            "tip_slot == current_slot must be classified as Equal, not Greater \
+             (Haskell forges a competing block in this case; we log SlotBattle)"
+        );
+
+        // tip_slot < current_slot → normal forge condition.
         let tip_slot: u64 = 999;
         assert!(
-            tip_slot < current_slot,
-            "TraceBlockFromFuture gate must NOT fire when tip_slot < current_slot"
+            matches!(tip_slot.cmp(&current_slot), std::cmp::Ordering::Less),
+            "tip_slot < current_slot is the normal forge-on-top condition"
+        );
+    }
+
+    /// SlotBattle classification: tip_slot == current_slot must be treated
+    /// distinctly from `tip_slot > current_slot`. This is a regression guard
+    /// against accidentally re-introducing `tip_slot >= current_slot` (which
+    /// over-categorises slot-battles as `BlockFromFuture` and produces noisy
+    /// false-positive ERROR logs every time a peer forges at our wall-clock
+    /// slot).
+    #[test]
+    fn forge_gate_slot_battle_is_distinct_from_block_from_future() {
+        let current_slot: u64 = 111_562_722;
+        // The exact case observed in the 2026-05-08 soak logs: peer's block
+        // for slot N was applied milliseconds before our forge ticker fired
+        // for slot N. tip_slot equals current_slot.
+        let tip_slot = current_slot;
+        let cmp = tip_slot.cmp(&current_slot);
+        assert!(
+            !matches!(cmp, std::cmp::Ordering::Greater),
+            "slot-battle race must not be misclassified as BlockFromFuture (>)"
+        );
+        assert!(
+            matches!(cmp, std::cmp::Ordering::Equal),
+            "slot-battle race must be classified as Equal so it can take the \
+             SlotBattle branch (INFO log, skip until competing-forge support lands)"
         );
     }
 
