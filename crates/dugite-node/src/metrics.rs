@@ -462,6 +462,18 @@ pub struct NodeMetrics {
     pub peer_rtt_min_ms: AtomicU64,
     /// Current maximum RTT across connected peers (milliseconds, gauge).
     pub peer_rtt_max_ms: AtomicU64,
+    /// Number of currently-connected peers with EWMA RTT in [0, 50) ms.
+    /// Gauge — refreshed on every KeepAlive pong.
+    pub peer_rtt_band_0_50: AtomicU64,
+    /// Number of currently-connected peers with EWMA RTT in [50, 100) ms.
+    pub peer_rtt_band_50_100: AtomicU64,
+    /// Number of currently-connected peers with EWMA RTT in [100, 200) ms.
+    pub peer_rtt_band_100_200: AtomicU64,
+    /// Number of currently-connected peers with EWMA RTT >= 200 ms.
+    pub peer_rtt_band_200_plus: AtomicU64,
+    /// Total number of currently-connected peers contributing to RTT bands
+    /// (i.e. warm/hot peers with at least one keepalive measurement).
+    pub peer_rtt_samples: AtomicU64,
     /// Node uptime in seconds
     startup_instant: std::time::Instant,
     /// Per-validation-error-type rejection counts (label → count).
@@ -615,6 +627,11 @@ impl NodeMetrics {
             peer_rtt_avg_ms: AtomicU64::new(0),
             peer_rtt_min_ms: AtomicU64::new(0),
             peer_rtt_max_ms: AtomicU64::new(0),
+            peer_rtt_band_0_50: AtomicU64::new(0),
+            peer_rtt_band_50_100: AtomicU64::new(0),
+            peer_rtt_band_100_200: AtomicU64::new(0),
+            peer_rtt_band_200_plus: AtomicU64::new(0),
+            peer_rtt_samples: AtomicU64::new(0),
             startup_instant: std::time::Instant::now(),
             validation_errors: std::sync::Mutex::new(HashMap::new()),
             last_block_received_at: AtomicU64::new(0),
@@ -669,12 +686,44 @@ impl NodeMetrics {
         self.peer_block_fetch_ms.observe(ms_per_block);
     }
 
-    /// Update the current peer RTT gauge metrics from PeerManager EWMA values.
+    /// Update the current peer RTT gauges from PeerManager EWMA values.
     ///
-    /// Called from the main run loop after processing KeepAlive RTT reports.
-    /// `latencies` is the set of EWMA latency values (ms) for all connected
-    /// peers that have at least one measurement.
+    /// `latencies` must be the set of EWMA latency values (ms) for all
+    /// currently-connected peers (warm or hot) that have at least one
+    /// keepalive measurement. The Haskell node aggregates an analogous
+    /// `Map peer PeerGSV` by snapshot on each metric read; we refresh
+    /// these gauges on every KeepAlive pong.
+    ///
+    /// All gauges (min/avg/max + per-band counts + sample total) are
+    /// recomputed from scratch — when a peer disconnects its entry is
+    /// dropped from `connected_peer_latencies()` and its contribution
+    /// to the bands disappears on the next refresh.
     pub fn update_peer_rtt_gauges(&self, latencies: &[f64]) {
+        let mut band_0_50: u64 = 0;
+        let mut band_50_100: u64 = 0;
+        let mut band_100_200: u64 = 0;
+        let mut band_200_plus: u64 = 0;
+        for &ms in latencies {
+            if ms < 50.0 {
+                band_0_50 += 1;
+            } else if ms < 100.0 {
+                band_50_100 += 1;
+            } else if ms < 200.0 {
+                band_100_200 += 1;
+            } else {
+                band_200_plus += 1;
+            }
+        }
+        self.peer_rtt_band_0_50.store(band_0_50, Ordering::Relaxed);
+        self.peer_rtt_band_50_100
+            .store(band_50_100, Ordering::Relaxed);
+        self.peer_rtt_band_100_200
+            .store(band_100_200, Ordering::Relaxed);
+        self.peer_rtt_band_200_plus
+            .store(band_200_plus, Ordering::Relaxed);
+        self.peer_rtt_samples
+            .store(latencies.len() as u64, Ordering::Relaxed);
+
         if latencies.is_empty() {
             self.peer_rtt_avg_ms.store(0, Ordering::Relaxed);
             self.peer_rtt_min_ms.store(0, Ordering::Relaxed);
@@ -683,7 +732,6 @@ impl NodeMetrics {
         }
         let sum: f64 = latencies.iter().sum();
         let avg = sum / latencies.len() as f64;
-        // unwrap safe: latencies is non-empty
         let min = latencies.iter().cloned().fold(f64::INFINITY, f64::min);
         let max = latencies.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
         self.peer_rtt_avg_ms
@@ -1477,6 +1525,38 @@ impl NodeMetrics {
         out.push_str("# TYPE dugite_peer_rtt_max_ms gauge\n");
         out.push_str(&format!("dugite_peer_rtt_max_ms {rtt_max:.1}\n"));
 
+        // Per-band RTT gauges — counts of currently-connected peers (warm/hot
+        // with a KeepAlive measurement) bucketed by EWMA RTT.  Refreshed on
+        // every KeepAlive pong; peers that disconnect drop out automatically.
+        let band_0_50 = self.peer_rtt_band_0_50.load(Ordering::Relaxed);
+        let band_50_100 = self.peer_rtt_band_50_100.load(Ordering::Relaxed);
+        let band_100_200 = self.peer_rtt_band_100_200.load(Ordering::Relaxed);
+        let band_200_plus = self.peer_rtt_band_200_plus.load(Ordering::Relaxed);
+        let rtt_samples = self.peer_rtt_samples.load(Ordering::Relaxed);
+        out.push_str("# HELP dugite_peer_rtt_band_0_50 Connected peers with EWMA RTT < 50ms\n");
+        out.push_str("# TYPE dugite_peer_rtt_band_0_50 gauge\n");
+        out.push_str(&format!("dugite_peer_rtt_band_0_50 {band_0_50}\n"));
+        out.push_str(
+            "# HELP dugite_peer_rtt_band_50_100 Connected peers with EWMA RTT in [50,100)ms\n",
+        );
+        out.push_str("# TYPE dugite_peer_rtt_band_50_100 gauge\n");
+        out.push_str(&format!("dugite_peer_rtt_band_50_100 {band_50_100}\n"));
+        out.push_str(
+            "# HELP dugite_peer_rtt_band_100_200 Connected peers with EWMA RTT in [100,200)ms\n",
+        );
+        out.push_str("# TYPE dugite_peer_rtt_band_100_200 gauge\n");
+        out.push_str(&format!("dugite_peer_rtt_band_100_200 {band_100_200}\n"));
+        out.push_str(
+            "# HELP dugite_peer_rtt_band_200_plus Connected peers with EWMA RTT >= 200ms\n",
+        );
+        out.push_str("# TYPE dugite_peer_rtt_band_200_plus gauge\n");
+        out.push_str(&format!("dugite_peer_rtt_band_200_plus {band_200_plus}\n"));
+        out.push_str(
+            "# HELP dugite_peer_rtt_samples Number of connected peers with at least one RTT sample\n",
+        );
+        out.push_str("# TYPE dugite_peer_rtt_samples gauge\n");
+        out.push_str(&format!("dugite_peer_rtt_samples {rtt_samples}\n"));
+
         // cardano-node compatibility aliases.
         //
         // When --compat-metrics is set, emit a second set of metric lines using
@@ -2117,6 +2197,11 @@ mod tests {
         assert!(output.contains("dugite_peer_rtt_avg_ms 0.0"));
         assert!(output.contains("dugite_peer_rtt_min_ms 0.0"));
         assert!(output.contains("dugite_peer_rtt_max_ms 0.0"));
+        assert!(output.contains("dugite_peer_rtt_band_0_50 0\n"));
+        assert!(output.contains("dugite_peer_rtt_band_50_100 0\n"));
+        assert!(output.contains("dugite_peer_rtt_band_100_200 0\n"));
+        assert!(output.contains("dugite_peer_rtt_band_200_plus 0\n"));
+        assert!(output.contains("dugite_peer_rtt_samples 0\n"));
 
         // Two peers with different latencies.
         metrics.update_peer_rtt_gauges(&[40.0, 120.0]);
@@ -2125,5 +2210,27 @@ mod tests {
         assert!(output.contains("dugite_peer_rtt_avg_ms 80.0"));
         assert!(output.contains("dugite_peer_rtt_min_ms 40.0"));
         assert!(output.contains("dugite_peer_rtt_max_ms 120.0"));
+        // 40ms → band_0_50; 120ms → band_100_200
+        assert!(output.contains("dugite_peer_rtt_band_0_50 1\n"));
+        assert!(output.contains("dugite_peer_rtt_band_50_100 0\n"));
+        assert!(output.contains("dugite_peer_rtt_band_100_200 1\n"));
+        assert!(output.contains("dugite_peer_rtt_band_200_plus 0\n"));
+        assert!(output.contains("dugite_peer_rtt_samples 2\n"));
+
+        // Verify bands shrink when peers disconnect (no carry-over).
+        metrics.update_peer_rtt_gauges(&[40.0]);
+        let output = metrics.to_prometheus();
+        assert!(output.contains("dugite_peer_rtt_band_0_50 1\n"));
+        assert!(output.contains("dugite_peer_rtt_band_100_200 0\n"));
+        assert!(output.contains("dugite_peer_rtt_samples 1\n"));
+
+        // Boundary: exactly 50ms goes into [50,100), exactly 200ms into [200,inf).
+        metrics.update_peer_rtt_gauges(&[49.999, 50.0, 99.999, 100.0, 199.999, 200.0]);
+        let output = metrics.to_prometheus();
+        assert!(output.contains("dugite_peer_rtt_band_0_50 1\n"));
+        assert!(output.contains("dugite_peer_rtt_band_50_100 2\n"));
+        assert!(output.contains("dugite_peer_rtt_band_100_200 2\n"));
+        assert!(output.contains("dugite_peer_rtt_band_200_plus 1\n"));
+        assert!(output.contains("dugite_peer_rtt_samples 6\n"));
     }
 }
