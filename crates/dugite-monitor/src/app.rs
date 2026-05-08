@@ -137,9 +137,15 @@ impl Network {
     }
 }
 
-/// RTT histogram buckets derived from the `dugite_peer_handshake_rtt_ms` histogram.
+/// RTT distribution across currently-connected peers.
 ///
-/// Buckets are cumulative (standard Prometheus histogram); we convert to per-band counts.
+/// The bands report how many peers (warm/hot, with at least one KeepAlive
+/// measurement) currently fall into each EWMA-RTT bucket. They are populated
+/// from the `dugite_peer_rtt_band_*` gauges when available — those are
+/// refreshed on every KeepAlive pong so peers that disconnect drop out
+/// automatically. For older nodes that don't expose those gauges we fall
+/// back to the cumulative `dugite_peer_handshake_rtt_ms` histogram, which
+/// reflects lifetime handshake samples (used to be the only data source).
 #[derive(Debug, Clone, Default)]
 pub struct RttBands {
     /// Peers with RTT 0–50 ms.
@@ -163,18 +169,13 @@ pub struct RttBands {
 }
 
 impl RttBands {
-    /// Parse RTT band counts from the raw Prometheus histogram metrics.
+    /// Parse RTT band counts from the metrics snapshot.
     ///
-    /// The Prometheus histogram for `dugite_peer_handshake_rtt_ms` exposes:
-    ///   - `dugite_peer_handshake_rtt_ms_bucket_le_50`  (cumulative count ≤ 50 ms)
-    ///   - `dugite_peer_handshake_rtt_ms_bucket_le_100` (cumulative count ≤ 100 ms)
-    ///   - `dugite_peer_handshake_rtt_ms_bucket_le_200` (cumulative count ≤ 200 ms)
-    ///   - `dugite_peer_handshake_rtt_ms_count`         (total count)
-    ///   - `dugite_peer_handshake_rtt_ms_sum`           (total sum ms)
-    ///
-    /// Note: the histogram parser in `metrics.rs` uses synthetic metric names
-    /// (with label suffix stripped) for buckets emitted with `{le="..."}` labels.
-    /// We rely on the labeled bucket values stored under the `histogram_buckets` map.
+    /// Prefers the live `dugite_peer_rtt_band_*` gauges (refreshed every
+    /// KeepAlive pong) which describe the *currently-connected* peer set.
+    /// Falls back to the cumulative `dugite_peer_handshake_rtt_ms` histogram
+    /// (lifetime handshake samples) only when the gauges are absent — i.e.
+    /// when scraping an older node that predates the live-band gauges.
     pub fn from_snapshot(snap: &MetricsSnapshot) -> Self {
         // Cumulative counts from histogram buckets (stored with le-label suffix).
         let le50 = snap
@@ -332,6 +333,23 @@ impl RttBands {
                 .copied()
                 .or(max_approx),
         };
+
+        // Prefer the live per-band gauges (count of currently-connected peers
+        // per RTT bucket, refreshed on every KeepAlive pong) over the cumulative
+        // handshake histogram, which keeps lifetime samples and never decays.
+        // The presence of `dugite_peer_rtt_samples` is the signal that the node
+        // exposes the gauge bands; older nodes fall through to the histogram path.
+        let (band_0_50, band_50_100, band_100_200, band_200_plus) =
+            if snap.values.contains_key("dugite_peer_rtt_samples") {
+                (
+                    snap.get_u64("dugite_peer_rtt_band_0_50"),
+                    snap.get_u64("dugite_peer_rtt_band_50_100"),
+                    snap.get_u64("dugite_peer_rtt_band_100_200"),
+                    snap.get_u64("dugite_peer_rtt_band_200_plus"),
+                )
+            } else {
+                (band_0_50, band_50_100, band_100_200, band_200_plus)
+            };
 
         RttBands {
             band_0_50,
@@ -775,6 +793,86 @@ mod tests {
             connected: true,
             error: None,
         }
+    }
+
+    fn make_snapshot_with_buckets(
+        values: Vec<(&str, f64)>,
+        buckets: Vec<(&str, &str, f64)>,
+    ) -> MetricsSnapshot {
+        let mut hist: HashMap<String, HashMap<String, f64>> = HashMap::new();
+        for (name, le, count) in buckets {
+            hist.entry(name.to_string())
+                .or_default()
+                .insert(le.to_string(), count);
+        }
+        MetricsSnapshot {
+            values: values
+                .into_iter()
+                .map(|(k, v)| (k.to_string(), v))
+                .collect(),
+            histogram_buckets: hist,
+            string_labels: HashMap::new(),
+            connected: true,
+            error: None,
+        }
+    }
+
+    /// When the node exposes the live `dugite_peer_rtt_band_*` gauges, those
+    /// must take precedence over the cumulative handshake histogram (which
+    /// would otherwise carry lifetime samples from disconnected peers).
+    #[test]
+    fn rtt_bands_prefer_live_gauges_over_histogram() {
+        let snap = make_snapshot_with_buckets(
+            vec![
+                // Histogram totals from a long-running soak (all-time samples).
+                ("dugite_peer_handshake_rtt_ms_count", 3600.0),
+                ("dugite_peer_handshake_rtt_ms_sum", 1_200_000.0),
+                // Live gauges describing currently-connected peers.
+                ("dugite_peer_rtt_samples", 7.0),
+                ("dugite_peer_rtt_band_0_50", 4.0),
+                ("dugite_peer_rtt_band_50_100", 2.0),
+                ("dugite_peer_rtt_band_100_200", 1.0),
+                ("dugite_peer_rtt_band_200_plus", 0.0),
+            ],
+            vec![
+                // Histogram says hundreds of peers across all bands.
+                ("dugite_peer_handshake_rtt_ms", "50", 935.0),
+                ("dugite_peer_handshake_rtt_ms", "100", 938.0),
+                ("dugite_peer_handshake_rtt_ms", "200", 938.0),
+                ("dugite_peer_handshake_rtt_ms", "500", 1500.0),
+                ("dugite_peer_handshake_rtt_ms", "1000", 3000.0),
+            ],
+        );
+        let bands = RttBands::from_snapshot(&snap);
+        assert_eq!(bands.band_0_50, 4, "should reflect live gauge, not 935");
+        assert_eq!(bands.band_50_100, 2);
+        assert_eq!(bands.band_100_200, 1);
+        assert_eq!(
+            bands.band_200_plus, 0,
+            "should reflect live gauge, not 2664"
+        );
+    }
+
+    /// Older nodes that don't expose `dugite_peer_rtt_samples` fall through
+    /// to the legacy cumulative-histogram path so the panel stays useful.
+    #[test]
+    fn rtt_bands_fall_back_to_histogram_when_gauges_absent() {
+        let snap = make_snapshot_with_buckets(
+            vec![
+                ("dugite_peer_handshake_rtt_ms_count", 10.0),
+                ("dugite_peer_handshake_rtt_ms_sum", 1500.0),
+            ],
+            vec![
+                ("dugite_peer_handshake_rtt_ms", "50", 3.0),
+                ("dugite_peer_handshake_rtt_ms", "100", 7.0),
+                ("dugite_peer_handshake_rtt_ms", "200", 9.0),
+            ],
+        );
+        let bands = RttBands::from_snapshot(&snap);
+        assert_eq!(bands.band_0_50, 3);
+        assert_eq!(bands.band_50_100, 4);
+        assert_eq!(bands.band_100_200, 2);
+        assert_eq!(bands.band_200_plus, 1);
     }
 
     #[test]
