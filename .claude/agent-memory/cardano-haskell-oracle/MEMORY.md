@@ -167,5 +167,14 @@
 ## Mithril Snapshot & Ledger Initialization
 - [mithril-snapshot-ledger-init.md](mithril-snapshot-ledger-init.md) — Two-archive system (immutables vs ancillary), ledger snapshot dir layout, initialize() replay logic, tickThenReapply vs tickThenApply, protocol params source, snapshot policy, Dugite gap (no ancillary download)
 
+## Inbound Connection Rate-Limiting
+- [inbound-connection-rate-limiting.md](inbound-connection-rate-limiting.md) — AcceptedConnectionsLimit (hard=512, soft=384, delay=5s), no per-IP cap, no token bucket, linear delay above soft limit, HardLimit blocks accept loop, double-check in includeInboundConnectionImpl, prunePolicy sorts inbound-first by random score, trace events, N2C uses maxBound (unlimited), ConnectionTable is legacy not P2P
+
 ## Ledger Types, Crypto, and Wire Format
 - See [cardano-ledger-types-wire-format.md](cardano-ledger-types-wire-format.md) — COMPLETE reference: all hash types (ADDRHASH=28B/Blake2b-224, HASH=32B/Blake2b-256), key types (Ed25519 VKey, VRF, KES), address binary format (header byte truth table), MaryValue CBOR (uint vs array(2)), script prefix tags (0x00-0x04), Datum/BinaryData (tag24), PParams array(31) positional index table, PParamsUpdate sparse map (keys 0-33), PoolVotingThresholds array(5), DRepVotingThresholds array(10), Rational tag(30), ShelleyGenesis/AlonzoGenesis/ConwayGenesis structures, Withdrawals map encoding, Credential array(2) encoding
+
+## Complete Forge Pipeline
+- [forge-pipeline-complete.md](forge-pipeline-complete.md) — Full source citations: forkBlockForging, checkShouldForge, forgeShelleyBlock, mkHeader, HFC dispatch, KES evolution, VRF, body hash, pool distr source (nesPd=set snapshot), cardanoProtocolVersion=11.0 normal, VRF tiebreaker RestrictedVRFTiebreaker 5
+
+## applyChainTick Mutations (Forge Path)
+- [apply-chain-tick-forge-mutations.md](apply-chain-tick-forge-mutations.md) — Exact fields mutated by TICK/NEWEPOCH visible to forge: intra-epoch (only nesRu+cgsFuturePParams solidification), epoch boundary (nesPd from OLD mark distr, curPParams via nextEpochPParams, only if ParameterChange/HardForkInitiation enacted); UTxO/treasury/rewards invisible to forge; ConwayTICKF as canonical minimal-mutation reference; tickedPP==untickedPP when no PP update enacted
