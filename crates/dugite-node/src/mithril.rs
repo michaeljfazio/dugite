@@ -561,21 +561,25 @@ async fn download_snapshot(
     );
 
     let temp_path = dest.with_extension("tmp");
-    let mut file = fs::File::create(&temp_path)?;
+    let file = tokio::fs::File::create(&temp_path).await?;
+    let mut writer = tokio::io::BufWriter::with_capacity(8 * 1024 * 1024, file);
 
     use futures_util::StreamExt;
+    use tokio::io::AsyncWriteExt;
     let mut stream = response.bytes_stream();
     let mut downloaded: u64 = 0;
 
     while let Some(chunk) = stream.next().await {
         let chunk = chunk.context("Error reading download stream")?;
-        std::io::Write::write_all(&mut file, &chunk)?;
+        writer.write_all(&chunk).await?;
         downloaded += chunk.len() as u64;
         pb.set_position(downloaded);
     }
 
+    writer.flush().await?;
+    drop(writer);
+
     pb.finish_with_message("Download complete");
-    drop(file);
 
     fs::rename(&temp_path, dest)?;
     info!(
