@@ -2685,6 +2685,58 @@ pub(crate) fn prune_already_known_pending_headers(
     headers.retain(|h| !chain_db.has_block(&Hash32::from_bytes(h.hash)));
 }
 
+/// Pause refilling the ChainSync pipeline when this many unfetched headers
+/// are queued in `pending_headers`.
+///
+/// During bulk sync from origin, ChainSync receives headers at network speed
+/// (pipelined, header-sized) while BlockFetch (single-active, serial,
+/// block-sized) fetches the corresponding bodies far slower.  Without a gate,
+/// `pending_headers` would grow without bound until either OOM or — as
+/// previously coded with a silent `drain(..)` cap — the oldest unfetched
+/// headers were silently dropped.  Silent drops created permanent chain
+/// gaps that `chain_sel` could never bridge: every reconnecting peer's
+/// fragment also got drained, so no peer ever held the full sequence.
+/// Observed live on preprod 2026-05-10: sync stalled at block 904108 and
+/// every subsequent fork tip reported `fork unreachable — StoreButDontChange`
+/// for ≥1.7 hours with no recovery path.
+///
+/// The fix is wire-level backpressure: when at the pause threshold, we stop
+/// sending `MsgRequestNext`, the pipeline drains naturally, the peer pauses,
+/// BlockFetch catches up, and refilling resumes once we cross
+/// `PENDING_HEADERS_RESUME`.
+pub(crate) const PENDING_HEADERS_PAUSE: usize = 10_000;
+
+/// Resume refilling once `pending_headers` drops below this.  The gap
+/// between PAUSE and RESUME is hysteresis — without it, the pipeline
+/// would thrash on every fetched block.
+pub(crate) const PENDING_HEADERS_RESUME: usize = 6_000;
+
+/// Decide whether the ChainSync pipeline should send more `MsgRequestNext`.
+///
+/// Returns `true` only when:
+///   - we are not at the peer's tip,
+///   - the in-flight pipeline has drained to/below `low_mark`,
+///   - the candidate fragment has room (hysteresis-gated by `*throttled`).
+///
+/// `*throttled` is updated as a side effect to track the hysteresis state:
+///   - `pending_count >= PENDING_HEADERS_PAUSE`  → `*throttled = true`
+///   - `pending_count <  PENDING_HEADERS_RESUME` → `*throttled = false`
+///   - between the two thresholds, the previous state is preserved.
+pub(crate) fn should_refill_pipeline(
+    at_tip: bool,
+    outstanding: usize,
+    low_mark: usize,
+    pending_count: usize,
+    throttled: &mut bool,
+) -> bool {
+    if pending_count >= PENDING_HEADERS_PAUSE {
+        *throttled = true;
+    } else if pending_count < PENDING_HEADERS_RESUME {
+        *throttled = false;
+    }
+    !at_tip && outstanding <= low_mark && !*throttled
+}
+
 /// Per-peer ChainSync client task.
 ///
 /// Runs on a single MuxChannel, receives headers, and updates shared
@@ -3048,6 +3100,21 @@ pub async fn chainsync_client_task(
     // behavior — the server rolls the client back to the agreed intersection
     // point before sending new headers. Skip the depth check for it.
     let mut initial_rollback = true;
+    // Hysteresis flag for `should_refill_pipeline`.  Set to true when
+    // `pending_headers` reaches `PENDING_HEADERS_PAUSE`, cleared when it
+    // drops below `PENDING_HEADERS_RESUME`.  Provides wire-level backpressure
+    // so the candidate fragment cannot grow without bound when BlockFetch
+    // is slower than ChainSync.
+    let mut throttled = false;
+    // Wake up periodically to re-prune the candidate fragment (BlockFetch
+    // may have stored blocks while no MsgRollForward arrived) and to refill
+    // the pipeline if the throttle has cleared.  Without this ticker, an
+    // `outstanding == 0` state combined with `throttled == true` would
+    // deadlock — no responses arrive to drive the message-based refill, and
+    // pending_headers would never shrink below RESUME from this task's
+    // perspective.
+    let mut refill_ticker = tokio::time::interval(std::time::Duration::from_millis(100));
+    refill_ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
     // Send initial pipeline burst.
     for _ in 0..high_mark {
@@ -3075,6 +3142,62 @@ pub async fn chainsync_client_task(
             _ = cancel.cancelled() => {
                 debug!(%peer_addr, "ChainSync task cancelled");
                 break;
+            }
+
+            // Periodic wakeup ONLY exists to break the deadlock when
+            // `throttled=true` paused the pipeline, `outstanding` drained to
+            // 0, and BlockFetch has been making progress (storing blocks)
+            // while no MsgRollForward arrived to drive prune/refill from the
+            // message path.  In all other cases — boot, normal sync, at-tip,
+            // pre-throttle — the message-driven refill arms handle pipeline
+            // maintenance.  The pre-check below ensures the ticker takes NO
+            // locks in normal operation; without it, every-peer 100ms write
+            // locks on `candidate_chains` starve BlockFetch's read lock and
+            // sync stops making progress at boot.
+            _ = refill_ticker.tick() => {
+                if !throttled {
+                    continue;
+                }
+                let pending_count = {
+                    let mut chains = candidate_chains.write().await;
+                    match chains.get_mut(&peer_addr) {
+                        Some(entry) => {
+                            let cdb = chain_db.read().await;
+                            prune_already_known_pending_headers(
+                                &mut entry.pending_headers,
+                                &cdb,
+                            );
+                            entry.pending_headers.len()
+                        }
+                        None => continue,
+                    }
+                };
+
+                if should_refill_pipeline(
+                    at_tip,
+                    outstanding,
+                    low_mark,
+                    pending_count,
+                    &mut throttled,
+                ) {
+                    let to_send = high_mark - outstanding;
+                    debug!(
+                        %peer_addr,
+                        outstanding,
+                        pending_count,
+                        to_send,
+                        "ChainSync ticker refill",
+                    );
+                    for _ in 0..to_send {
+                        let req = cs_encode(&ChainSyncMessage::MsgRequestNext);
+                        channel.send(req).await.map_err(|e| {
+                            anyhow::anyhow!(
+                                "ChainSync ticker pipeline refill failed: {e}"
+                            )
+                        })?;
+                        outstanding += 1;
+                    }
+                }
             }
 
             result = channel.recv() => {
@@ -3106,7 +3229,11 @@ pub async fn chainsync_client_task(
                             .unwrap_or(tip_slot);
 
                         // Update candidate chain state.
-                        {
+                        //
+                        // The captured `pending_count` (post-prune) feeds
+                        // `should_refill_pipeline` below — we MUST NOT silently
+                        // drop unfetched headers here.  See `PENDING_HEADERS_PAUSE`.
+                        let pending_count = {
                             let mut chains = candidate_chains.write().await;
                             let entry = chains.entry(peer_addr).or_insert_with(|| {
                                 CandidateChainState {
@@ -3127,26 +3254,19 @@ pub async fn chainsync_client_task(
 
                             // Prune headers we've already fetched and stored.
                             //
-                            // CORRECT FILTER (hash-based):
-                            // Drop only headers whose hash is already present in the
-                            // ChainDB (volatile or immutable).  A slot-based filter
-                            // (`h.slot > applied_slot`) is unsound: after a peer
-                            // rolls back BELOW our applied tip and switches to a
-                            // competing fork, the new fork's headers may carry slots
-                            // ≤ applied_slot but DIFFERENT hashes.  Dropping them
-                            // breaks the parent chain that BlockFetch needs to walk
-                            // back from the new fork's tip → walk_chain_back
-                            // terminates inside an unreachable orphan island and
-                            // chain selection silently leaves the node stuck on the
-                            // abandoned fork (observed in production 2026-04-26).
+                            // Hash-based filter: drop only headers whose hash is
+                            // already present in the ChainDB.  A slot-based filter
+                            // is unsound after a peer rolls back below our applied
+                            // tip and switches to a competing fork — the new fork's
+                            // earliest headers may carry slots ≤ applied tip but
+                            // DIFFERENT hashes; dropping them breaks the parent
+                            // chain BlockFetch needs to walk back from the fork's
+                            // tip (regression observed 2026-04-26).
                             //
                             // Matches Haskell: `theirFrag` retains every header on
                             // the candidate fragment (anchored at the rollback /
-                            // intersection point); BlockFetch fetches everything not
-                            // in `curChain`.
-                            //
-                            // Hard cap at 10_000 as an absolute safety valve against
-                            // unbounded growth during very long catch-ups.
+                            // intersection point); BlockFetch fetches everything
+                            // not in `curChain`.
                             {
                                 let cdb = chain_db.read().await;
                                 prune_already_known_pending_headers(
@@ -3154,12 +3274,8 @@ pub async fn chainsync_client_task(
                                     &cdb,
                                 );
                             }
-                            const HARD_CAP: usize = 10_000;
-                            if entry.pending_headers.len() > HARD_CAP {
-                                let excess = entry.pending_headers.len() - HARD_CAP;
-                                entry.pending_headers.drain(..excess);
-                            }
-                        }
+                            entry.pending_headers.len()
+                        };
 
                         // Emit GSM events: BlockReceived, PeerTipUpdated, PeerActive.
                         // All use try_send — if the channel is full, the event is
@@ -3195,8 +3311,17 @@ pub async fn chainsync_client_task(
                             );
                         }
 
-                        // Refill pipeline when outstanding drops below low_mark.
-                        if !at_tip && outstanding <= low_mark {
+                        // Refill pipeline when outstanding drops below low_mark
+                        // AND the candidate fragment has room (gates wire-level
+                        // backpressure to prevent unbounded `pending_headers`
+                        // growth during bulk sync — see `should_refill_pipeline`).
+                        if should_refill_pipeline(
+                            at_tip,
+                            outstanding,
+                            low_mark,
+                            pending_count,
+                            &mut throttled,
+                        ) {
                             let to_send = high_mark - outstanding;
                             for _ in 0..to_send {
                                 let req = cs_encode(&ChainSyncMessage::MsgRequestNext);
@@ -3321,16 +3446,20 @@ pub async fn chainsync_client_task(
                                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                         }
 
-                        // Remove headers after the rollback point.
-                        {
+                        // Remove headers after the rollback point and read the
+                        // post-trim length so refill can be hysteresis-gated.
+                        let pending_count = {
                             let mut chains = candidate_chains.write().await;
                             if let Some(entry) = chains.get_mut(&peer_addr) {
                                 entry.pending_headers.retain(|h| h.slot <= rollback_slot);
                                 entry.tip_slot = tip_slot;
                                 entry.tip_hash = tip_hash;
                                 entry.tip_block_number = tip_block_number;
+                                entry.pending_headers.len()
+                            } else {
+                                0
                             }
-                        }
+                        };
 
                         // Do NOT forward this peer's rollback to a global
                         // handle_rollback().  MsgRollBackward from a single peer
@@ -3351,8 +3480,14 @@ pub async fn chainsync_client_task(
                         let _ = &rollback_event_tx; // keep handle alive for now
                         let _ = &prim_point;
 
-                        // Refill pipeline after rollback.
-                        if !at_tip && outstanding <= low_mark {
+                        // Refill pipeline after rollback (hysteresis-gated).
+                        if should_refill_pipeline(
+                            at_tip,
+                            outstanding,
+                            low_mark,
+                            pending_count,
+                            &mut throttled,
+                        ) {
                             let to_send = high_mark - outstanding;
                             debug!(
                                 %peer_addr,
@@ -3370,15 +3505,14 @@ pub async fn chainsync_client_task(
                             }
                             debug!(%peer_addr, outstanding, "ChainSync pipeline refilled");
                         } else {
-                            // outstanding > low_mark: enough requests are still
-                            // in flight; the peer will answer them with
-                            // MsgRollForward for the fork blocks and the normal
-                            // refill logic in that arm will keep the pipeline full.
                             debug!(
                                 %peer_addr,
                                 outstanding,
                                 low_mark,
-                                "ChainSync post-rollback: pipeline still full, not refilling",
+                                pending_count,
+                                throttled,
+                                "ChainSync post-rollback: not refilling \
+                                 (pipeline full or candidate throttled)",
                             );
                         }
                     }
@@ -3497,6 +3631,109 @@ mod chainsync_task_tests {
     fn test_extract_slot_invalid_cbor() {
         assert_eq!(extract_slot_from_wrapped_header(&[]), None);
         assert_eq!(extract_slot_from_wrapped_header(&[0x00]), None);
+    }
+
+    /// Verifies `should_refill_pipeline` enforces hysteresis-gated
+    /// wire-level backpressure on the ChainSync pipeline.
+    ///
+    /// Regression test for the preprod 2026-05-10 stall: when the previous
+    /// silent `drain(..)` cap on `pending_headers` removed unfetched headers
+    /// to keep the buffer at 10_000, the dropped headers created permanent
+    /// chain gaps that `chain_sel` could never bridge — every reconnecting
+    /// peer's fragment was drained too, so no peer ever held the full
+    /// sequence.  The fix replaces silent drops with refusal-to-refill at
+    /// `PENDING_HEADERS_PAUSE`, with hysteresis at `PENDING_HEADERS_RESUME`
+    /// preventing per-block thrashing once the throttle clears.
+    #[test]
+    fn test_should_refill_pipeline_hysteresis() {
+        let high_mark = 300;
+        let low_mark = high_mark * 2 / 3; // 200
+        let mut throttled = false;
+
+        // Fresh state, well under PAUSE, in-flight low → refill.
+        assert!(should_refill_pipeline(
+            false,
+            100,
+            low_mark,
+            100,
+            &mut throttled
+        ));
+        assert!(!throttled);
+
+        // Pipeline still full (outstanding > low_mark) → don't refill.
+        assert!(!should_refill_pipeline(
+            false,
+            250,
+            low_mark,
+            100,
+            &mut throttled
+        ));
+        assert!(!throttled);
+
+        // At tip → don't refill regardless of room.
+        assert!(!should_refill_pipeline(
+            true,
+            0,
+            low_mark,
+            0,
+            &mut throttled
+        ));
+        assert!(!throttled);
+
+        // In hysteresis band, not yet throttled → still refill.
+        assert!(should_refill_pipeline(
+            false,
+            100,
+            low_mark,
+            (PENDING_HEADERS_RESUME + PENDING_HEADERS_PAUSE) / 2,
+            &mut throttled,
+        ));
+        assert!(!throttled);
+
+        // Hits PAUSE → throttle on, no refill.
+        assert!(!should_refill_pipeline(
+            false,
+            100,
+            low_mark,
+            PENDING_HEADERS_PAUSE,
+            &mut throttled,
+        ));
+        assert!(throttled);
+
+        // Drops back into hysteresis band → throttle stays on (sticky).
+        assert!(!should_refill_pipeline(
+            false,
+            100,
+            low_mark,
+            (PENDING_HEADERS_RESUME + PENDING_HEADERS_PAUSE) / 2,
+            &mut throttled,
+        ));
+        assert!(throttled);
+
+        // Drops below RESUME → throttle clears, refill resumes.
+        assert!(should_refill_pipeline(
+            false,
+            100,
+            low_mark,
+            PENDING_HEADERS_RESUME - 1,
+            &mut throttled,
+        ));
+        assert!(!throttled);
+
+        // PAUSE > RESUME (compile-time sanity — hysteresis only works
+        // with strictly ordered thresholds).
+        const _: () = assert!(PENDING_HEADERS_PAUSE > PENDING_HEADERS_RESUME);
+    }
+
+    /// Sanity: the helper never refills above `low_mark` even at zero
+    /// pending — the pipeline gate is independent of the buffer gate.
+    #[test]
+    fn test_should_refill_pipeline_respects_low_mark() {
+        let mut throttled = false;
+        // outstanding == low_mark → refill.
+        assert!(should_refill_pipeline(false, 200, 200, 0, &mut throttled));
+        // outstanding > low_mark → no refill.
+        assert!(!should_refill_pipeline(false, 201, 200, 0, &mut throttled));
     }
 
     /// Verify to_codec_point / from_codec_point round-trip.
