@@ -344,6 +344,27 @@ fn get_total_memory_bytes_impl() -> u64 {
     0
 }
 
+/// Compute sync progress as a percentage in `[0, 100]`.
+///
+/// `applied_slot` is our local tip's slot number.  `peer_tip_slot` is the
+/// maximum tip slot reported by any peer (the network tip, as best we know
+/// it).  When `applied_slot >= peer_tip_slot` we are at or ahead of the
+/// known tip → 100%.  When `peer_tip_slot == 0` no peer has reported a
+/// tip yet — return 0% to make health checks correctly report "not
+/// synced" until a real measurement is available; this also avoids the
+/// pre-fix bug where `set_sync_progress(100.0)` was called unconditionally
+/// in block-apply paths, making dugite-monitor display 100% while the node
+/// was at <20% of the chain.
+pub fn compute_sync_progress(applied_slot: u64, peer_tip_slot: u64) -> f64 {
+    if peer_tip_slot == 0 {
+        return 0.0;
+    }
+    if applied_slot >= peer_tip_slot {
+        return 100.0;
+    }
+    (applied_slot as f64 / peer_tip_slot as f64) * 100.0
+}
+
 /// Node metrics for monitoring
 pub struct NodeMetrics {
     pub blocks_received: AtomicU64,
@@ -366,6 +387,11 @@ pub struct NodeMetrics {
     pub conn_outbound: AtomicU64,
     pub conn_terminating: AtomicU64,
     pub sync_progress_pct: AtomicU64,
+    /// Maximum tip slot reported by any peer via ChainSync (`MsgRollForward`
+    /// / `MsgRollBackward` tip field).  Acts as the denominator for sync
+    /// progress so we don't have to read `candidate_chains` from every
+    /// block-apply site.  Monotonic via `fetch_max`.
+    pub max_peer_tip_slot: AtomicU64,
     pub slot_number: AtomicU64,
     pub block_number: AtomicU64,
     pub epoch_number: AtomicU64,
@@ -582,6 +608,7 @@ impl NodeMetrics {
             conn_outbound: AtomicU64::new(0),
             conn_terminating: AtomicU64::new(0),
             sync_progress_pct: AtomicU64::new(0),
+            max_peer_tip_slot: AtomicU64::new(0),
             slot_number: AtomicU64::new(0),
             block_number: AtomicU64::new(0),
             epoch_number: AtomicU64::new(0),
@@ -774,6 +801,29 @@ impl NodeMetrics {
     pub fn set_sync_progress(&self, pct: f64) {
         self.sync_progress_pct
             .store((pct * 100.0) as u64, Ordering::Relaxed);
+    }
+
+    /// Update the maximum peer-reported tip slot.  Monotonic: only grows.
+    /// Called from ChainSync on every `MsgRollForward` / `MsgRollBackward`
+    /// using the message's `tip_slot` field (the peer's current tip,
+    /// independent of how far we've fetched from it).
+    pub fn update_peer_tip(&self, tip_slot: u64) {
+        self.max_peer_tip_slot
+            .fetch_max(tip_slot, Ordering::Relaxed);
+    }
+
+    /// Read the current maximum peer-reported tip slot.
+    pub fn get_peer_tip(&self) -> u64 {
+        self.max_peer_tip_slot.load(Ordering::Relaxed)
+    }
+
+    /// Recompute and store sync progress from our applied tip slot and the
+    /// peer-reported tip slot.  Use this instead of `set_sync_progress(100.0)`
+    /// in any block-apply path during sync — only the actual tip-following
+    /// case should report 100%.
+    pub fn refresh_sync_progress(&self, applied_slot: u64) {
+        let peer_tip = self.get_peer_tip();
+        self.set_sync_progress(compute_sync_progress(applied_slot, peer_tip));
     }
 
     pub fn set_utxo_count(&self, count: u64) {
@@ -1174,6 +1224,11 @@ impl NodeMetrics {
                 "dugite_sync_progress_percent",
                 "Chain sync progress (0-10000, divide by 100 for %)",
                 &self.sync_progress_pct,
+            ),
+            (
+                "dugite_max_peer_tip_slot",
+                "Maximum tip slot reported by any peer via ChainSync (denominator for sync_progress_percent)",
+                &self.max_peer_tip_slot,
             ),
             (
                 "dugite_slot_number",
@@ -1828,6 +1883,65 @@ async fn handle_metrics_connection(mut stream: tokio::net::TcpStream, metrics: A
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Regression test for the preprod 2026-05-11 100%-sync display bug.
+    /// Block-apply paths used to call `set_sync_progress(100.0)`
+    /// unconditionally, making dugite-monitor display 100% while the node
+    /// was at <20% of the chain.  The fix routes all block-apply paths
+    /// through `refresh_sync_progress` → `compute_sync_progress`.
+    #[test]
+    fn test_compute_sync_progress_during_bulk_sync() {
+        // Mid bulk sync: applied 25M / peer tip 122M → ~20.4%.
+        let pct = compute_sync_progress(25_462_569, 122_773_031);
+        assert!((20.0..21.0).contains(&pct), "expected ~20.7%, got {pct}");
+    }
+
+    #[test]
+    fn test_compute_sync_progress_at_or_past_tip() {
+        // Equal slots → 100%.
+        assert_eq!(compute_sync_progress(100, 100), 100.0);
+        // Past tip (we just forged) → 100%.
+        assert_eq!(compute_sync_progress(105, 100), 100.0);
+    }
+
+    #[test]
+    fn test_compute_sync_progress_pre_peer_state() {
+        // No peer tip known yet → 0% (not 100%, which would falsely
+        // report "healthy" before the first ChainSync intersection).
+        assert_eq!(compute_sync_progress(0, 0), 0.0);
+        assert_eq!(compute_sync_progress(12345, 0), 0.0);
+    }
+
+    #[test]
+    fn test_update_peer_tip_is_monotonic() {
+        let metrics = NodeMetrics::new();
+        assert_eq!(metrics.get_peer_tip(), 0);
+        metrics.update_peer_tip(1_000);
+        assert_eq!(metrics.get_peer_tip(), 1_000);
+        // Later peer reports a smaller tip → ignored (monotonic).
+        metrics.update_peer_tip(500);
+        assert_eq!(metrics.get_peer_tip(), 1_000);
+        // Larger tip wins.
+        metrics.update_peer_tip(2_500);
+        assert_eq!(metrics.get_peer_tip(), 2_500);
+    }
+
+    #[test]
+    fn test_refresh_sync_progress_during_bulk_sync() {
+        let metrics = NodeMetrics::new();
+        metrics.update_peer_tip(100);
+        metrics.refresh_sync_progress(25);
+        // 25/100 = 25% → stored as 2500 in the centi-percent gauge.
+        assert_eq!(metrics.sync_progress_pct.load(Ordering::Relaxed), 2500);
+    }
+
+    #[test]
+    fn test_refresh_sync_progress_at_tip() {
+        let metrics = NodeMetrics::new();
+        metrics.update_peer_tip(100);
+        metrics.refresh_sync_progress(100);
+        assert_eq!(metrics.sync_progress_pct.load(Ordering::Relaxed), 10_000);
+    }
 
     #[test]
     fn test_metrics() {
