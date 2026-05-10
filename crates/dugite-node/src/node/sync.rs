@@ -3246,6 +3246,7 @@ pub async fn chainsync_client_task(
                             entry.tip_slot = tip_slot;
                             entry.tip_hash = tip_hash;
                             entry.tip_block_number = tip_block_number;
+                            metrics.update_peer_tip(tip_slot);
                             entry.pending_headers.push(PendingHeader {
                                 slot,
                                 hash,
@@ -3448,6 +3449,7 @@ pub async fn chainsync_client_task(
 
                         // Remove headers after the rollback point and read the
                         // post-trim length so refill can be hysteresis-gated.
+                        metrics.update_peer_tip(tip_slot);
                         let pending_count = {
                             let mut chains = candidate_chains.write().await;
                             if let Some(entry) = chains.get_mut(&peer_addr) {

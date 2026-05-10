@@ -1577,18 +1577,16 @@ impl Node {
             self.metrics.set_mempool_max(self.mempool.capacity() as u64);
             self.metrics
                 .set_governance_snapshot(&governance_snapshot_from_ledger(&ls));
-            // Set slot/block from tip and compute sync progress
+            // Set slot/block from tip.  Do NOT pre-set sync_progress to 100%
+            // here — we have not heard from a peer yet, so the network tip
+            // is unknown.  `refresh_sync_progress` will produce 0% until
+            // the first `MsgRollForward`/`MsgRollBackward` populates
+            // `max_peer_tip_slot`; thereafter every block-apply path
+            // recomputes progress as `applied / peer_tip`.
             if let Some(slot) = tip.point.slot() {
                 self.metrics.set_slot(slot.0);
                 self.metrics.set_block_number(tip.block_number.0);
-                // Compute initial sync progress from tip slot
-                let tip_slot = slot.0;
-                if tip_slot > 0 {
-                    // At startup with a snapshot, we're close to or at the tip.
-                    // A more accurate progress would need the network tip, but
-                    // 100% is a reasonable initial estimate for a loaded snapshot.
-                    self.metrics.set_sync_progress(100.0);
-                }
+                self.metrics.refresh_sync_progress(slot.0);
                 // Initialize tip slot time for tip_age_seconds computation
                 let sc = &ls.slot_config;
                 let slot_time_ms =
@@ -3324,7 +3322,7 @@ impl Node {
                                             self.metrics.set_tip_slot_time_ms(slot_time_ms);
                                             self.metrics.set_epoch(ls.epoch.0);
                                         }
-                                        self.metrics.set_sync_progress(100.0);
+                                        self.metrics.refresh_sync_progress(fork_slot.0);
                                         // Announce each fork block to downstream peers.
                                         if let Some(ref tx) = self.block_announcement_tx {
                                             let mut hash_bytes = [0u8; 32];
@@ -3495,9 +3493,12 @@ impl Node {
             self.metrics.set_tip_slot_time_ms(slot_time_ms);
             self.metrics.set_epoch(ls.epoch.0);
         }
-        // Block arrived via live BlockFetch — node is following the chain tip.
-        // Set progress to 100% so health_status() reports "healthy".
-        self.metrics.set_sync_progress(100.0);
+        // Recompute progress from peer tip — during bulk sync this path
+        // fires for every fetched block long before we reach the chain
+        // tip, so we cannot unconditionally claim 100%.  Once our applied
+        // slot catches the peer tip slot, `compute_sync_progress` returns
+        // 100.0 and `health_status()` reports "healthy".
+        self.metrics.refresh_sync_progress(block_slot.0);
 
         // Announce to downstream peers.
         if let Some(ref tx) = self.block_announcement_tx {
