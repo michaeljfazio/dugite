@@ -310,14 +310,6 @@ pub struct ConnectionLifecycleManager {
     /// Broadcast sender for rollback announcements to ChainSync servers.
     rollback_announcement_tx: broadcast::Sender<RollbackAnnouncement>,
 
-    /// Channel for ChainSync client tasks to forward `MsgRollBackward` events
-    /// to the main run loop.  The run loop calls `handle_rollback()` on receipt,
-    /// which rolls the ledger back to the given point and triggers gap-bridging.
-    ///
-    /// Multiple peers may send duplicate rollback events for the same point;
-    /// `handle_rollback` is idempotent (no-op when point >= ledger tip).
-    rollback_event_tx: mpsc::Sender<dugite_primitives::block::Point>,
-
     /// Shared peer manager for PeerSharing server to query connected peers.
     peer_manager_for_servers: Arc<RwLock<NodePeerManager>>,
 
@@ -402,7 +394,6 @@ impl ConnectionLifecycleManager {
         gsm_event_tx: tokio::sync::mpsc::Sender<crate::gsm::GsmEvent>,
         block_provider: Arc<ChainDBBlockProvider>,
         rollback_announcement_tx: broadcast::Sender<RollbackAnnouncement>,
-        rollback_event_tx: mpsc::Sender<dugite_primitives::block::Point>,
         peer_manager_for_servers: Arc<RwLock<NodePeerManager>>,
     ) -> Self {
         Self {
@@ -427,7 +418,6 @@ impl ConnectionLifecycleManager {
             gsm_event_tx,
             block_provider,
             rollback_announcement_tx,
-            rollback_event_tx,
             peer_manager_for_servers,
             local_listen_addr: None,
         }
@@ -1061,7 +1051,6 @@ impl ConnectionLifecycleManager {
         let active_slots_coeff = self.active_slots_coeff;
         let metrics = self.metrics.clone();
         let gsm_event_tx = self.gsm_event_tx.clone();
-        let rollback_event_tx = self.rollback_event_tx.clone();
 
         Box::new(move |channel, cancel| {
             Box::pin(async move {
@@ -1078,7 +1067,6 @@ impl ConnectionLifecycleManager {
                     metrics,
                     cancel,
                     gsm_event_tx,
-                    rollback_event_tx,
                 )
                 .await
                 {
@@ -1835,8 +1823,6 @@ impl ConnectionLifecycleManager {
         let tmp2 = tempfile::tempdir().expect("tempdir2");
         let chain_db2 = dugite_storage::ChainDB::open(tmp2.path()).expect("ChainDB::open2 in test");
 
-        let (rollback_event_tx, _rollback_event_rx) =
-            tokio::sync::mpsc::channel::<dugite_primitives::block::Point>(8);
         Self::new(
             764_824_073, // mainnet magic — arbitrary for tests
             false,
@@ -1858,7 +1844,6 @@ impl ConnectionLifecycleManager {
             gsm_event_tx,
             block_provider,
             rollback_announcement_tx,
-            rollback_event_tx,
             peer_manager_for_servers,
         )
     }

@@ -66,7 +66,7 @@ impl Default for UtxoDiff {
 #[derive(Debug, Clone)]
 pub struct DiffSeq {
     /// Per-block diffs in chronological order (oldest at front, newest at back).
-    /// Made `pub(crate)` so that `handle_rollback` in `dugite-node` can inspect
+    /// Made `pub(crate)` so that `handle_ledger_rollback` in `dugite-node` can inspect
     /// slot/hash entries to determine the new tip after a fast diff-based rollback
     /// without needing to go through a higher-level API that would require the
     /// full `LedgerState` write lock to be held for complex computations.

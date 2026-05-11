@@ -163,72 +163,39 @@ impl Node {
         }
     }
 
-    /// Handle a chain rollback: roll back ChainDB and restore ledger state
-    /// to the rollback point.
+    /// Roll back LEDGER state to the rollback point.
+    ///
+    /// The caller must have already committed the VolatileDB chain switch via
+    /// `ChainSelQueue::switch_chain()`; this function only realigns the ledger,
+    /// fragment, and mempool to the intersection. It does NOT rewind ChainDB —
+    /// doing so would undo the fork switch and leave the volatile tip stuck at
+    /// the intersection slot, producing an O(N) per-block cascade.
     ///
     /// # Strategy (Subsystem 4)
     ///
-    /// 1. Roll back ChainDB to remove volatile blocks after the rollback
-    ///    point (skipped when the caller already committed a chain switch
-    ///    via `ChainSelQueue::switch_chain()` — see `handle_ledger_rollback`).
-    /// 2. Try the [`LedgerState::rollback_via_seq`] fast path: if the
-    ///    rollback target is in the live `LedgerSeq` volatile window,
-    ///    restore the entire ledger in O(n) by reverse-applying the
-    ///    trailing UTxO diffs and replacing non-UTxO state from the seq.
-    /// 3. Otherwise, fall back to snapshot reload + replay (handles deep
-    ///    rollbacks past the volatile window and post-restart cases where
-    ///    the seq is empty).
+    /// 1. Try the [`LedgerState::rollback_via_seq`] fast path: if the rollback
+    ///    target is in the live `LedgerSeq` volatile window, restore the
+    ///    entire ledger in O(n) by reverse-applying the trailing UTxO diffs
+    ///    and replacing non-UTxO state from the seq.
+    /// 2. Otherwise, fall back to snapshot reload + replay (handles deep
+    ///    rollbacks past the volatile window and post-restart cases where the
+    ///    seq is empty).
     ///
     /// Matches Haskell's `LedgerDB.V2` rollback flow: try the in-memory
     /// `LedgerSeq` first, fall back to snapshot-driven recovery.
     ///
-    /// # Slow path — snapshot reload + replay
+    /// # Architecture note — peer rollbacks
     ///
-    /// When the target is outside the diff window (e.g. after a node restart
-    /// that cleared the in-memory diffs, or a deep rollback beyond k blocks),
-    /// the ledger is rebuilt from the best available snapshot followed by
-    /// replaying ImmutableDB blocks up to the rollback point.
-    /// # Architecture note — live rollback path
-    ///
-    /// At tip, rollbacks are driven by peer ChainSync messages.  The flow is:
-    ///
-    /// 1. A peer sends `MsgRollBackward` to our `chainsync_client_task`.
-    /// 2. The client trims the `candidate_chains` pending-header list.
-    /// 3. The peer then re-sends the fork blocks via `MsgRollForward`.
-    /// 4. `process_forward_blocks` (called from `apply_fetched_block`) applies
-    ///    them; if they don't connect to the ledger tip the mismatch is detected
-    ///    and this function is called to realign.
-    ///
-    /// This function is also called after `TriggeredFork` is returned from
-    /// `ChainSelQueue` when the VolatileDB chain has diverged from the ledger.
-    ///
-    /// Now called from two places:
-    ///   * The TriggeredFork branch of the ChainSelQueue verdict in
-    ///     `process_forward_blocks` (this function), when the selected chain
-    ///     has diverged from the ledger after a fork switch.
-    ///   * (TODO) The MsgRollBackward handler in `chainsync_client_task` via
-    ///     a shared rollback channel.
-    pub async fn handle_rollback(&self, rollback_point: &Point) {
-        self.handle_rollback_inner(rollback_point, true).await
-    }
-
-    /// Roll back LEDGER state only — the caller has already committed the
-    /// VolatileDB chain switch via `ChainSelQueue::switch_chain()` and just
-    /// needs the ledger/fragment/mempool to be realigned to the intersection.
-    ///
-    /// This is the correct entry point for the `TriggeredFork` verdict from
-    /// `ChainSelQueue`.  Using `handle_rollback` there would call
-    /// `ChainDB::rollback_to_point`, which truncates `selected_chain` back to
-    /// the intersection and undoes the fork switch — leaving the VolatileDB
-    /// tip stuck at the intersection slot.  That produces an O(N) per-block
-    /// cascade: every subsequent block arrives with a `prev_hash` that no
-    /// longer matches the stuck tip, is stored as a fork, and re-triggers the
-    /// same fork switch with an ever-growing `apply` list.
+    /// Peer `MsgRollBackward` does NOT call this function. A single peer's
+    /// rollback only means that peer trimmed its candidate fragment; chain
+    /// selection (`ChainSelQueue::TriggeredFork`) owns the global ledger
+    /// rollback decision (Haskell parity with `ChainSync.Client::rollBackward`).
+    /// See the 2026-04-21 fix for the original cascade bug this guards against.
     pub async fn handle_ledger_rollback(&self, rollback_point: &Point) {
-        self.handle_rollback_inner(rollback_point, false).await
+        self.handle_rollback_inner(rollback_point).await
     }
 
-    async fn handle_rollback_inner(&self, rollback_point: &Point, rewind_chain_db: bool) {
+    async fn handle_rollback_inner(&self, rollback_point: &Point) {
         let rollback_slot = rollback_point.slot().map(|s| s.0).unwrap_or(0);
 
         // Count every rollback event for observability, even no-ops.
@@ -329,21 +296,7 @@ impl Node {
             }
         }
 
-        // 1. Roll back ChainDB (removes volatile blocks after the rollback point).
-        //
-        // Skipped when the caller has already committed a VolatileDB chain
-        // switch via `ChainSelQueue::switch_chain()` — doing it here would
-        // undo that switch and leave the volatile tip stuck at the
-        // intersection (see `handle_ledger_rollback`).
-        if rewind_chain_db {
-            let mut db = self.chain_db.write().await;
-            if let Err(e) = db.rollback_to_point(rollback_point) {
-                error!("ChainDB rollback failed: {e}");
-                return;
-            }
-        }
-
-        // 2. LedgerSeq fast path (Subsystem 4).
+        // 1. LedgerSeq fast path (Subsystem 4).
         //
         // If the rollback target is in the live `LedgerSeq` volatile window,
         // restore the entire ledger state in O(n) by reverse-applying the
@@ -379,7 +332,7 @@ impl Node {
             //     chain — caller's chain selection should reject it).
         }
 
-        // 3. Full-state rollback via snapshot + replay (slow path).
+        // 2. Full-state rollback via snapshot + replay (slow path).
         //
         // Used when the LedgerSeq fast path can't satisfy the rollback (target
         // outside the volatile window).  Restores ALL state fields — nonce
@@ -607,7 +560,7 @@ impl Node {
             }
         }
 
-        // ── Phase 4: Update chain fragment on rollback ───────────────────────
+        // ── Phase 3: Update chain fragment on rollback ───────────────────────
         //
         // Roll back the chain fragment to the rollback point so that the
         // fragment stays in sync with the ChainDB.  Downstream ChainSync peers
@@ -620,7 +573,7 @@ impl Node {
             fragment.rollback_to(rollback_point);
         }
 
-        // 4. Re-validate mempool transactions against the rolled-back ledger state.
+        // 3. Re-validate mempool transactions against the rolled-back ledger state.
         // Drain all pending txs, then re-validate each against the updated UTxO set.
         let pending_txs = self.mempool.drain_all();
         let pending_count = pending_txs.len();
@@ -654,7 +607,7 @@ impl Node {
             );
         }
 
-        // 5. Notify peers
+        // 4. Notify peers
         self.notify_rollback(rollback_point).await;
     }
 
@@ -923,7 +876,7 @@ impl Node {
                             // a second lookup (previously this fell back to
                             // `Point::Origin` when the intersection wasn't in
                             // volatile, which triggered the "refuse genesis
-                            // reset" safety in `handle_rollback` and left the
+                            // reset" safety in `handle_ledger_rollback` and left the
                             // ledger stuck at the orphan tip — see #439).
                             //
                             // Haskell invariant (`Paths.hs::isReachable`): the
@@ -2221,7 +2174,7 @@ impl Node {
 
         if ledger_on_fork {
             // Roll back to the last canonical snapshot.  Use the existing
-            // `find_best_snapshot_for_rollback` path (same as handle_rollback)
+            // `find_best_snapshot_for_rollback` path (same as handle_ledger_rollback)
             // which correctly verifies canonicality before selecting a snapshot.
             let ledger_tip_slot = {
                 self.ledger_state
@@ -2787,11 +2740,6 @@ pub async fn chainsync_client_task(
     // GSM event sender — emits PeerRegistered, BlockReceived, PeerTipUpdated,
     // PeerActive, PeerIdling events to the GSM actor. Uses try_send (non-blocking).
     gsm_event_tx: tokio::sync::mpsc::Sender<crate::gsm::GsmEvent>,
-    // Rollback event sender — forwards MsgRollBackward points to the main run
-    // loop so it can call handle_rollback() and advance the ledger.  Uses
-    // try_send (non-blocking); the channel is large enough that drops are
-    // rare and handle_rollback is idempotent for duplicate events.
-    rollback_event_tx: tokio::sync::mpsc::Sender<dugite_primitives::block::Point>,
 ) -> Result<()> {
     // ═══════════════════════════════════════════════════════════════════════
     // Phase 1: Build known points for intersection
@@ -3463,9 +3411,9 @@ pub async fn chainsync_client_task(
                             }
                         };
 
-                        // Do NOT forward this peer's rollback to a global
-                        // handle_rollback().  MsgRollBackward from a single peer
-                        // only means that peer trimmed its candidate fragment —
+                        // MsgRollBackward is deliberately NOT forwarded to a
+                        // global rollback handler.  A single peer's rollback
+                        // only means that peer trimmed its candidate fragment;
                         // it does not imply our preferred chain has changed.
                         // Matches Haskell `ChainSync.Client::rollBackward`:
                         // only `theirFrag` (per-peer candidate) is trimmed;
@@ -3478,8 +3426,7 @@ pub async fn chainsync_client_task(
                         // chain density.  A blanket rollback here caused
                         // unwarranted ~1500-block ledger regressions when any
                         // single peer fell behind and reconnected offering
-                        // an old intersection point.
-                        let _ = &rollback_event_tx; // keep handle alive for now
+                        // an old intersection point (see 2026-04-21 fix).
                         let _ = &prim_point;
 
                         // Refill pipeline after rollback (hysteresis-gated).
