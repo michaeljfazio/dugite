@@ -4218,6 +4218,37 @@ pub(crate) fn next_forged_block_number(
     }
 }
 
+/// Catch-up gate for the forge loop.
+///
+/// Returns `true` when the per-slot leadership check should be skipped
+/// silently because we are still catching up to the network.  Suppresses
+/// the `TraceStartLeadershipCheck` + `TraceNoLedgerView` log pair that
+/// would otherwise spam at 2 lines per second during a multi-day bulk
+/// sync (the existing `TraceNoLedgerView` gate also short-circuits the
+/// actual forge, but this one runs earlier and silently).
+///
+/// `peer_tip` is the maximum tip slot reported by any peer via ChainSync
+/// (monotonic, 0 before the first intersection).  When available it is
+/// the accurate "caught up?" signal.  Before any peer has reported
+/// (`peer_tip == 0`) we fall back to `wall_clock_slot`, matching the
+/// behaviour of the spec gate from a fresh-boot perspective.
+///
+/// `stability_window` is `ceil(3 * k / f)` — once `tip_slot` is within
+/// that window of the reference tip we resume per-slot checks.
+pub(crate) fn should_skip_forge_for_catch_up(
+    tip_slot: u64,
+    peer_tip: u64,
+    wall_clock_slot: u64,
+    stability_window: u64,
+) -> bool {
+    let reference_tip = if peer_tip > 0 {
+        peer_tip
+    } else {
+        wall_clock_slot
+    };
+    reference_tip.saturating_sub(tip_slot) > stability_window
+}
+
 /// Selects whether the forge attempt is extending the current tip or
 /// producing a competing block at the same slot as an existing tip
 /// (Haskell's `mkCurrentBlockContext` LT vs EQ branches).
@@ -4290,20 +4321,48 @@ impl Node {
 
         let current_slot = wall_clock_slot.0;
 
+        // ── Snapshot ledger tip and immutable tip ────────────────────────────
+        let ls = self.ledger_state.read().await;
+        let tip_slot = ls.tip.point.slot().map(|s| s.0).unwrap_or(0);
+        let prev_point = ls.tip.point.clone();
+
+        // ── Catch-up gate (silent) ────────────────────────────────────────────
+        // Skip the leadership check entirely while we are still catching up
+        // to the network.  The TraceNoLedgerView gate at step 5 below would
+        // also short-circuit the forge, but logging
+        // TraceStartLeadershipCheck + TraceNoLedgerView every second during
+        // a multi-day bulk sync is noisy and wastes lock acquisitions.
+        //
+        // Use the peer-reported network tip when available (the accurate
+        // "caught up?" signal); fall back to wall clock before the first
+        // ChainSync intersection populates `max_peer_tip_slot`.  The
+        // threshold is the same `stability_window` Haskell's
+        // `forecastFor` uses — once `tip_slot` is within that window of
+        // the network tip we resume per-slot leadership checks.
+        let stability_window = dugite_consensus::stability_window_slots(
+            self.consensus.security_param,
+            self.consensus.active_slot_coeff,
+        );
+        if should_skip_forge_for_catch_up(
+            tip_slot,
+            self.metrics.get_peer_tip(),
+            current_slot,
+            stability_window,
+        ) {
+            drop(ls);
+            return;
+        }
+
         // ── Step 1: TraceStartLeadershipCheck ────────────────────────────────
         // Haskell emits this Info trace at the start of every slot tick,
-        // before any early-exit checks.
+        // before any early-exit checks (we only suppress it during catch-up
+        // to avoid log spam — see the gate above).
         info!(
             target: "forge",
             current_slot,
             pool_id = %creds.pool_id,
             "TraceStartLeadershipCheck",
         );
-
-        // ── Snapshot ledger tip and immutable tip ────────────────────────────
-        let ls = self.ledger_state.read().await;
-        let tip_slot = ls.tip.point.slot().map(|s| s.0).unwrap_or(0);
-        let prev_point = ls.tip.point.clone();
 
         // ── Step 2: TraceBlockFromFuture / slot-battle classification ─────────
         // Haskell `mkCurrentBlockContext` (NodeKernel.hs:960):
@@ -5429,6 +5488,92 @@ mod tests {
     // These tests exercise the gate predicates extracted from `try_forge_block_at`
     // without requiring a full Node.  They verify the logic that replaces the
     // old `MAX_FORGE_LAG_SLOTS = 60` guard.
+
+    /// Catch-up gate: during bulk sync, far behind the peer-reported network
+    /// tip → silently skip the leadership check (no TraceStartLeadershipCheck
+    /// log, no lock acquisition past the gate).  Reported on preprod
+    /// 2026-05-11 as "BP performing leadership checks every 1s unnecessarily
+    /// while resynchronising the chain".
+    #[test]
+    fn forge_catch_up_gate_skips_when_far_behind_peer_tip() {
+        let stability = dugite_consensus::stability_window_slots(2160, 0.05);
+        // tip_slot 25M, peer_tip 122M → ~97M slot lag, far above 129 600.
+        assert!(super::should_skip_forge_for_catch_up(
+            25_000_000,
+            122_000_000,
+            122_000_000,
+            stability,
+        ));
+    }
+
+    /// Catch-up gate: within the stability window of the network tip → run
+    /// the leadership check normally.
+    #[test]
+    fn forge_catch_up_gate_passes_when_within_stability_window() {
+        let stability = dugite_consensus::stability_window_slots(2160, 0.05);
+        // tip just barely inside the window — should NOT skip.
+        let peer_tip = 1_000_000;
+        let tip_slot = peer_tip - stability; // exactly at the boundary.
+        assert!(!super::should_skip_forge_for_catch_up(
+            tip_slot, peer_tip, peer_tip, stability,
+        ));
+        // tip one slot inside the window — should NOT skip.
+        assert!(!super::should_skip_forge_for_catch_up(
+            tip_slot + 1,
+            peer_tip,
+            peer_tip,
+            stability,
+        ));
+    }
+
+    /// Catch-up gate: one slot past the stability window edge → skip.
+    #[test]
+    fn forge_catch_up_gate_fires_one_slot_past_window() {
+        let stability = dugite_consensus::stability_window_slots(2160, 0.05);
+        let peer_tip = 1_000_000;
+        let tip_slot = peer_tip - stability - 1; // one slot beyond the window.
+        assert!(super::should_skip_forge_for_catch_up(
+            tip_slot, peer_tip, peer_tip, stability,
+        ));
+    }
+
+    /// Catch-up gate: at or past the network tip → never skip (we are
+    /// caught up and could be forging on top of the chain).
+    #[test]
+    fn forge_catch_up_gate_passes_at_or_past_peer_tip() {
+        let stability = dugite_consensus::stability_window_slots(2160, 0.05);
+        assert!(!super::should_skip_forge_for_catch_up(
+            100, 100, 100, stability,
+        ));
+        // Forged ahead — peer_tip lags our tip until the next ChainSync update.
+        assert!(!super::should_skip_forge_for_catch_up(
+            105, 100, 105, stability,
+        ));
+    }
+
+    /// Catch-up gate: before any ChainSync intersection (`peer_tip == 0`)
+    /// fall back to wall clock so a fresh-boot, behind-tip BP still skips.
+    /// Without this fallback, the gate would let the first second of forge
+    /// attempts pass through during boot.
+    #[test]
+    fn forge_catch_up_gate_falls_back_to_wall_clock_when_no_peer_tip() {
+        let stability = dugite_consensus::stability_window_slots(2160, 0.05);
+        // tip at origin, wall clock at preprod-tip — must skip.
+        assert!(super::should_skip_forge_for_catch_up(
+            0,
+            0, // no peer tip yet
+            122_000_000,
+            stability,
+        ));
+        // tip near wall clock, no peer info — must pass (rare but valid:
+        // e.g. running on an isolated/offline relay).
+        assert!(!super::should_skip_forge_for_catch_up(
+            122_000_000 - 100,
+            0,
+            122_000_000,
+            stability,
+        ));
+    }
 
     /// stability_window_slots(k=2160, f=0.05) must equal 129 600.
     ///
