@@ -39,3 +39,7 @@ cstreamer-reference/
 *.signed
 *.raw
 .idea/
+
+# Locally-captured Mithril ledger fixtures (multi-GB per epoch; see
+# crates/dugite-ledger/tests/fixtures/README.md for capture procedure)
+crates/dugite-ledger/tests/fixtures/*.cbor

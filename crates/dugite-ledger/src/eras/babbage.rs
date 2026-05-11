@@ -545,7 +545,10 @@ mod tests {
         ));
     }
 
-    /// validate_block_body always succeeds for Babbage (budget check not yet implemented).
+    /// validate_block_body returns Ok for an empty Babbage block (zero redeemers,
+    /// so total ExUnits is 0 and the per-block budget check trivially passes).
+    /// The budget enforcement itself is exercised by `common::validate_block_ex_units`
+    /// tests.
     #[test]
     fn test_validate_block_body_succeeds() {
         let rules = BabbageRules::new();

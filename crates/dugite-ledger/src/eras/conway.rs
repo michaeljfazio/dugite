@@ -1644,7 +1644,10 @@ mod tests {
         ));
     }
 
-    /// validate_block_body always succeeds for Conway (budget check not yet implemented).
+    /// validate_block_body returns Ok for an empty Conway block (zero redeemers,
+    /// so total ExUnits is 0 and the per-block budget + ref-script-size checks
+    /// trivially pass). The budget enforcement itself is exercised by
+    /// `common::validate_block_ex_units` tests.
     #[test]
     fn test_validate_block_body_succeeds() {
         let rules = ConwayRules::new();

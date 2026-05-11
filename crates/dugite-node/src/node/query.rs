@@ -344,7 +344,13 @@ impl Node {
                             }
                             _ => 0,
                         },
-                        member_status: 0, // Active (simplified)
+                        // MemberStatus: 0=Active, 1=Expired, 2=Unrecognized.
+                        // Expiry is inclusive — member is active through their
+                        // expiry epoch (matches `expire_committee_members` and
+                        // ratification's `currentEpoch > validUntil` rule).
+                        // Unrecognized doesn't apply here because we iterate the
+                        // canonical committee_expiration map.
+                        member_status: if ls.epoch.0 > _expiry.0 { 1 } else { 0 },
                         expiry_epoch: Some(_expiry.0),
                     }
                 })
@@ -831,7 +837,7 @@ impl Node {
             snap_mark,
             snap_set,
             snap_go,
-            snap_fee: 0, // Haskell tracks accumulated unclaimed fees; we use 0 as approximation
+            snap_fee: ls.epochs.snapshots.ss_fee.0,
             epoch_blocks_by_pool,
             pool_params_entries,
             pending_retirements: ls
