@@ -581,12 +581,11 @@ fn render_chain_panel(frame: &mut Frame, app: &App, theme: &Theme, area: Rect) {
     let col_w = inner.width.saturating_sub(2) as usize;
 
     // Tip age with indicator icon (<20s green check, 20-60s warning, >60s red X).
+    // Humanised to days/hours/minutes/seconds (matches the header-bar
+    // tip-diff indicator) so a multi-day bulk sync doesn't display as a
+    // six-figure raw-seconds count.
     let (tip_icon, tip_age_col) = tip_age_indicator(theme, tip_age);
-    let tip_str = if tip_age == 0 {
-        format!("{} --", tip_icon)
-    } else {
-        format!("{} {}s", tip_icon, App::format_number(tip_age))
-    };
+    let tip_str = format!("{} {}", tip_icon, format_tip_age(tip_age));
 
     // Compute how many text rows we can fit before the mempool gauge row.
     // The gauge needs 1 row; the remaining height goes to text rows.
@@ -1724,15 +1723,38 @@ fn tip_age_indicator(theme: &Theme, tip_age_secs: u64) -> (&'static str, Color) 
 }
 
 /// Format tip age with a compact unit suffix.
+/// Humanise a tip-age (in seconds) for display.
+///
+/// Picks the two largest non-zero units so the string stays compact:
+///   - 0           → "--"
+///   - < 60s       → "{s}s"
+///   - < 1h        → "{m}m {s}s"
+///   - < 1d        → "{h}h {m}m"
+///   - ≥ 1d        → "{d}d {h}h {m}m"
+///
+/// Used by both the header-bar tip-diff indicator and the node-panel
+/// "Tip Diff" row.  Previously these displayed different formats (the
+/// header was humanised but capped at hours; the panel showed raw
+/// seconds), which was confusing during multi-day bulk sync.
 fn format_tip_age(secs: u64) -> String {
+    const MIN: u64 = 60;
+    const HOUR: u64 = 60 * MIN;
+    const DAY: u64 = 24 * HOUR;
     if secs == 0 {
         "--".to_string()
-    } else if secs < 60 {
+    } else if secs < MIN {
         format!("{}s", secs)
-    } else if secs < 3600 {
-        format!("{}m {}s", secs / 60, secs % 60)
+    } else if secs < HOUR {
+        format!("{}m {}s", secs / MIN, secs % MIN)
+    } else if secs < DAY {
+        format!("{}h {}m", secs / HOUR, (secs % HOUR) / MIN)
     } else {
-        format!("{}h {}m", secs / 3600, (secs % 3600) / 60)
+        format!(
+            "{}d {}h {}m",
+            secs / DAY,
+            (secs % DAY) / HOUR,
+            (secs % HOUR) / MIN,
+        )
     }
 }
 
@@ -1804,10 +1826,33 @@ mod tests {
 
     #[test]
     fn test_format_tip_age() {
+        // Sentinel for "no tip data".
         assert_eq!(format_tip_age(0), "--");
+        // Sub-minute → seconds only.
+        assert_eq!(format_tip_age(1), "1s");
         assert_eq!(format_tip_age(5), "5s");
+        assert_eq!(format_tip_age(59), "59s");
+        // Sub-hour → minutes + seconds.
+        assert_eq!(format_tip_age(60), "1m 0s");
         assert_eq!(format_tip_age(65), "1m 5s");
+        assert_eq!(format_tip_age(3599), "59m 59s");
+        // Sub-day → hours + minutes (seconds dropped to keep the string
+        // compact in the panel).
+        assert_eq!(format_tip_age(3600), "1h 0m");
         assert_eq!(format_tip_age(3661), "1h 1m");
+        assert_eq!(format_tip_age(86_399), "23h 59m");
+        // ≥ 1 day → days + hours + minutes (regression test for the
+        // 2026-05-11 fix that previously displayed 6-figure raw seconds in
+        // the panel and capped at hours in the header during multi-day
+        // bulk sync).
+        assert_eq!(format_tip_age(86_400), "1d 0h 0m");
+        assert_eq!(format_tip_age(90_061), "1d 1h 1m");
+        assert_eq!(
+            format_tip_age(2 * 86_400 + 3 * 3600 + 4 * 60 + 5),
+            "2d 3h 4m"
+        );
+        // Big number sanity (~5.7 days during early preprod bulk sync).
+        assert_eq!(format_tip_age(493_200), "5d 17h 0m");
     }
 
     #[test]
