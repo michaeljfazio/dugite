@@ -175,11 +175,7 @@ pub(crate) fn encode_query_result_value(
             }
         }
         QueryResult::GovState(gov) => {
-            let start = enc.writer().len();
             encode_gov_state(enc, gov);
-            let bytes = &enc.writer()[start..];
-            let _ = std::fs::write("/tmp/govstate-debug.cbor", bytes);
-            tracing::info!("DEBUG: wrote gov-state CBOR bytes={} to /tmp/govstate-debug.cbor", bytes.len());
         }
         QueryResult::DRepState(dreps) => {
             encode_drep_state(enc, dreps);
@@ -3614,22 +3610,19 @@ mod tests {
         assert_eq!(dec.array().unwrap(), None, "relays must be indef-length");
     }
 
-    // ─── Issue #336: V21+ PParams positional order ──────────────────────────
+    // ─── Issue #434: Conway PParams positional order ────────────────────────
     //
-    // Regression test for the cardano-cli `transaction build` decoder, which
-    // requires Conway PParams as a 31-element array with `protocolVersion` at
-    // index 30 (LAST), not at index 12. The previous encoding placed
-    // `protocolVersion` at index 12, which made cardano-cli read the
-    // `protocolVersion[major,minor]` array(2) as if it were `minPoolCost`,
-    // shifted every subsequent field, and ultimately surfaced as a CBOR
-    // element-count mismatch downstream in the response stream.
+    // Conway PParams encodes as a 31-element positional array where the order
+    // is determined by `eraPParams @ConwayEra` in
+    // `cardano-ledger/eras/conway/impl/src/Cardano/Ledger/Conway/PParams.hs`.
+    // Per current ledger master, `ppGovProtocolVersion` sits at index **12**
+    // (right after `tau` and before `ppMinPoolCost`) — NOT at the end.
     //
-    // Golden field-position assertions cross-validated against
-    // `cardano-ledger/eras/conway/impl/src/Cardano/Ledger/Conway/PParams.hs`
-    // (`cppHKDLensMap`, `ppGovProtocolVersion`) and the oracle file at
-    // `.claude/agent-memory/cardano-haskell-oracle/cardano-ledger-types-wire-format.md`.
+    // An earlier note in this file claimed protocolVersion was last; that was
+    // based on an outdated oracle snapshot and broke `gov-state` decoding in
+    // cardano-cli 10.15 against the ConwayEra schema. See issue #434.
     #[test]
-    fn test_pparams_v21_positional_order_issue_336() {
+    fn test_pparams_conway_positional_order_issue_434() {
         let mut pp = ProtocolParamsSnapshot {
             // Use small distinct sentinel values so a slot mismatch is obvious.
             min_fee_a: 0xA0,
@@ -3683,16 +3676,21 @@ mod tests {
             let _ = dec.u64().unwrap();
         }
 
-        // [12] minPoolCost (NOT protocolVersion — issue #336)
+        // [12] protocolVersion = array(2)[major, minor] (issue #434)
         assert_eq!(
-            dec.u64().unwrap(),
-            0xC1,
-            "index 12 must be minPoolCost; if this is array(2), protocolVersion is misplaced"
+            dec.array().unwrap(),
+            Some(2),
+            "index 12 must be protocolVersion as array(2); if this is a uint, protocolVersion is misplaced"
         );
-        // [13] coinsPerUTxOByte
+        assert_eq!(dec.u64().unwrap(), 11);
+        assert_eq!(dec.u64().unwrap(), 0);
+
+        // [13] minPoolCost
+        assert_eq!(dec.u64().unwrap(), 0xC1);
+        // [14] coinsPerUTxOByte
         assert_eq!(dec.u64().unwrap(), 0xC2);
 
-        // [14] costModels map
+        // [15] costModels map
         assert_eq!(dec.map().unwrap(), Some(1));
         assert_eq!(dec.u32().unwrap(), 2); // PlutusV3 = 2
         assert_eq!(dec.array().unwrap(), Some(3));
@@ -3700,7 +3698,7 @@ mod tests {
             let _ = dec.i64().unwrap();
         }
 
-        // [15] prices [tag30, tag30]
+        // [16] prices [tag30, tag30]
         assert_eq!(dec.array().unwrap(), Some(2));
         for _ in 0..2 {
             let _ = dec.tag().unwrap();
@@ -3709,22 +3707,22 @@ mod tests {
             let _ = dec.u64().unwrap();
         }
 
-        // [16] maxTxExUnits [mem, steps]
+        // [17] maxTxExUnits [mem, steps]
         assert_eq!(dec.array().unwrap(), Some(2));
         let _ = dec.u64().unwrap();
         let _ = dec.u64().unwrap();
 
-        // [17] maxBlockExUnits [mem, steps]
+        // [18] maxBlockExUnits [mem, steps]
         assert_eq!(dec.array().unwrap(), Some(2));
         let _ = dec.u64().unwrap();
         let _ = dec.u64().unwrap();
 
-        // [18..=20] flat uints
+        // [19..=21] flat uints
         let _ = dec.u64().unwrap(); // maxValSize
         let _ = dec.u64().unwrap(); // collateralPct
         let _ = dec.u64().unwrap(); // maxCollateralInputs
 
-        // [21] poolVotingThresholds array(5) of tag30
+        // [22] poolVotingThresholds array(5) of tag30
         assert_eq!(dec.array().unwrap(), Some(5));
         for _ in 0..5 {
             let _ = dec.tag().unwrap();
@@ -3733,7 +3731,7 @@ mod tests {
             let _ = dec.u64().unwrap();
         }
 
-        // [22] drepVotingThresholds array(10) of tag30
+        // [23] drepVotingThresholds array(10) of tag30
         assert_eq!(dec.array().unwrap(), Some(10));
         for _ in 0..10 {
             let _ = dec.tag().unwrap();
@@ -3742,24 +3740,15 @@ mod tests {
             let _ = dec.u64().unwrap();
         }
 
-        // [23..=28] flat uints (committee + gov action + drep)
+        // [24..=29] flat uints (committee + gov action + drep)
         for _ in 0..6 {
             let _ = dec.u64().unwrap();
         }
 
-        // [29] minFeeRefScriptCostPerByte (tag30)
+        // [30] minFeeRefScriptCostPerByte (tag30) — last per current ledger master
         let _ = dec.tag().unwrap();
         assert_eq!(dec.array().unwrap(), Some(2));
         let _ = dec.u64().unwrap();
         let _ = dec.u64().unwrap();
-
-        // [30] protocolVersion = array(2)[major, minor] — MUST be LAST
-        assert_eq!(
-            dec.array().unwrap(),
-            Some(2),
-            "index 30 must be protocolVersion as array(2)"
-        );
-        assert_eq!(dec.u64().unwrap(), 11);
-        assert_eq!(dec.u64().unwrap(), 0);
     }
 }

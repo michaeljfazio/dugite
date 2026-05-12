@@ -257,11 +257,102 @@ impl Node {
         // in governance.proposals by process_proposal().  We faithfully convert every
         // one of them here, carrying the full GovAction enum so the CBOR encoder can
         // reproduce the complete action body on the wire (fixes issue #172).
-        let governance_proposals: Vec<ProposalSnapshot> = ls
-            .gov
-            .governance
-            .proposals
-            .iter()
+        // Haskell `mkProposals` rebuilds the proposal forest by folding over the
+        // OMap in insertion order: every child's `prev_action_id` must already
+        // be either an enacted root or an ancestor present in the iteration so
+        // far. Dugite stores proposals in a `BTreeMap<GovActionId, ...>` keyed
+        // by tx-hash, which gives a deterministic but arbitrary order that
+        // routinely violates this invariant — causing Haskell's decoder to
+        // bail with `mkProposals: Could not add a proposal …` on the first
+        // out-of-order child.
+        //
+        // Emit proposals sorted by `(proposed_epoch, action_id)` so children
+        // always appear after their parents while keeping the result
+        // deterministic. Within an epoch, proposals are independent w.r.t.
+        // each other (a proposal cannot reference one created in the same
+        // ledger transition), so the secondary sort by action-id is purely a
+        // canonical tiebreaker.
+        let mut sorted_proposals: Vec<(
+            &dugite_primitives::transaction::GovActionId,
+            &dugite_ledger::state::ProposalState,
+        )> = ls.gov.governance.proposals.iter().collect();
+        sorted_proposals.sort_by(|(a_id, a), (b_id, b)| {
+            a.proposed_epoch
+                .0
+                .cmp(&b.proposed_epoch.0)
+                .then_with(|| {
+                    a_id.transaction_id
+                        .as_ref()
+                        .cmp(b_id.transaction_id.as_ref())
+                })
+                .then_with(|| a_id.action_index.cmp(&b_id.action_index))
+        });
+
+        // Haskell's `mkProposals` invokes `proposalsAddAction` for every
+        // GovActionState in the decoded OMap, and the fold bails the moment a
+        // proposal's `prev_action_id` does not resolve to either:
+        //   * the current enacted root for that purpose, or
+        //   * an ancestor already inserted in this fold.
+        //
+        // Dugite's `apply_block` path inserts proposals into the BTreeMap but
+        // does not always prune stale siblings when a sibling of the same
+        // purpose enacts — historical state from earlier epochs can outlive
+        // the root-update event, leaving proposals whose `prev_action_id`
+        // points at a now-superseded root. Sending those raw to cardano-cli
+        // surfaces as `mkProposals: Could not add a proposal …` and aborts
+        // the entire `gov-state` decode.
+        //
+        // To keep the query response decodable we replay the same admission
+        // check here in `query.rs` and silently drop unresolvable proposals.
+        // This makes the wire response self-consistent for `cardano-cli`
+        // while the underlying source-of-truth bug (the sibling-cleanup gap
+        // on enactment) is tracked separately.
+        use dugite_primitives::transaction::GovAction;
+        let g = &ls.gov.governance;
+        let enacted_roots: std::collections::HashSet<&dugite_primitives::transaction::GovActionId> =
+            [
+                g.enacted_pparam_update.as_ref(),
+                g.enacted_hard_fork.as_ref(),
+                g.enacted_committee.as_ref(),
+                g.enacted_constitution.as_ref(),
+            ]
+            .into_iter()
+            .flatten()
+            .collect();
+        let extract_prev = |a: &GovAction| -> Option<dugite_primitives::transaction::GovActionId> {
+            match a {
+                GovAction::ParameterChange { prev_action_id, .. }
+                | GovAction::HardForkInitiation { prev_action_id, .. }
+                | GovAction::NoConfidence { prev_action_id, .. }
+                | GovAction::UpdateCommittee { prev_action_id, .. }
+                | GovAction::NewConstitution { prev_action_id, .. } => prev_action_id.clone(),
+                GovAction::TreasuryWithdrawals { .. } | GovAction::InfoAction => None,
+            }
+        };
+        let mut admitted_ids: std::collections::HashSet<
+            dugite_primitives::transaction::GovActionId,
+        > = std::collections::HashSet::new();
+        sorted_proposals.retain(|(action_id, state)| {
+            let prev = extract_prev(&state.procedure.gov_action);
+            let ok = match prev {
+                None => true, // Treasury/Info/root proposals always admitted.
+                Some(ref p) => admitted_ids.contains(p) || enacted_roots.contains(p),
+            };
+            if ok {
+                admitted_ids.insert((*action_id).clone());
+            } else {
+                tracing::debug!(
+                    action_id = %action_id.transaction_id.to_hex(),
+                    idx = action_id.action_index,
+                    prev = %prev.map(|p| p.transaction_id.to_hex()).unwrap_or_default(),
+                    "gov-state: dropping proposal with unresolved prev_action_id (stale sibling after root enactment)"
+                );
+            }
+            ok
+        });
+
+        let governance_proposals: Vec<ProposalSnapshot> = sorted_proposals
+            .into_iter()
             .map(|(action_id, state)| {
                 let action_type = gov_action_type_str(&state.procedure.gov_action);
                 // Build per-credential vote maps from votes_by_action
@@ -1044,9 +1135,22 @@ pub(crate) fn build_vote_maps(
     Vec<(Vec<u8>, u8)>,
 ) {
     use dugite_primitives::transaction::Voter;
-    let mut committee_votes = Vec::new();
-    let mut drep_votes = Vec::new();
-    let mut spo_votes = Vec::new();
+    use std::collections::BTreeMap;
+    // Haskell semantics: `proposalsAddVote` calls `Map.insert k vote`,
+    // i.e. the latest vote from a given voter overwrites any prior vote
+    // on the same governance action. Dugite stores votes as an append-only
+    // `Vec<(Voter, VotingProcedure)>` in `votes_by_action`, so we must
+    // collapse duplicates here before emitting the per-credential maps.
+    //
+    // Without this dedup, the wire encoder writes a CBOR map header of N
+    // (raw entry count) followed by N (k, v) pairs that contain duplicate
+    // keys. Haskell's `decodeMapEnforceNoDuplicates` then fails with
+    // "Final number of elements: <unique> does not match the total count
+    // that was decoded: <raw>" and the entire gov-state response is
+    // rejected — surfacing to the user as "Active proposals: 0".
+    let mut committee_map: BTreeMap<(Vec<u8>, u8), u8> = BTreeMap::new();
+    let mut drep_map: BTreeMap<(Vec<u8>, u8), u8> = BTreeMap::new();
+    let mut spo_map: BTreeMap<Vec<u8>, u8> = BTreeMap::new();
     if let Some(votes) = ls.gov.governance.votes_by_action.get(action_id) {
         for (voter, procedure) in votes {
             let vote_u8 = match procedure.vote {
@@ -1057,18 +1161,27 @@ pub(crate) fn build_vote_maps(
             match voter {
                 Voter::ConstitutionalCommittee(cred) => {
                     let (cred_type, hash) = credential_to_bytes(cred);
-                    committee_votes.push((hash, cred_type, vote_u8));
+                    committee_map.insert((hash, cred_type), vote_u8);
                 }
                 Voter::DRep(cred) => {
                     let (cred_type, hash) = credential_to_bytes(cred);
-                    drep_votes.push((hash, cred_type, vote_u8));
+                    drep_map.insert((hash, cred_type), vote_u8);
                 }
                 Voter::StakePool(pool_hash) => {
-                    spo_votes.push((pool_hash.as_ref()[..28].to_vec(), vote_u8));
+                    spo_map.insert(pool_hash.as_ref()[..28].to_vec(), vote_u8);
                 }
             }
         }
     }
+    let committee_votes = committee_map
+        .into_iter()
+        .map(|((hash, ct), v)| (hash, ct, v))
+        .collect();
+    let drep_votes = drep_map
+        .into_iter()
+        .map(|((hash, ct), v)| (hash, ct, v))
+        .collect();
+    let spo_votes = spo_map.into_iter().collect();
     (committee_votes, drep_votes, spo_votes)
 }
 
@@ -1276,6 +1389,79 @@ mod tests {
         // SPO hash is truncated to 28 bytes — the trailing 0xFF padding is
         // stripped, matching the Cardano wire format for StakePool key hashes.
         assert_eq!(spo[0], (vec![0xE2; 28], 2u8));
+    }
+
+    /// Regression test for issue #434.
+    ///
+    /// `votes_by_action` stores votes as an append-only `Vec`, so a single
+    /// voter can appear multiple times if they re-vote on the same proposal.
+    /// Haskell's `proposalsAddVote` uses `Map.insert` (last-wins), and its
+    /// CBOR decoder enforces no duplicate keys in the `gasDRepVotes` /
+    /// `gasCommitteeVotes` / `gasStakePoolVotes` maps. Emitting duplicates on
+    /// the wire causes cardano-cli to abort the whole `gov-state` response
+    /// with `Final number of elements: <unique> does not match the total
+    /// count that was decoded: <raw>`, surfacing as "0 active proposals".
+    ///
+    /// Verify that `build_vote_maps` collapses repeated voters to the last
+    /// observed vote.
+    #[test]
+    fn build_vote_maps_dedupes_repeat_voters_last_wins() {
+        let mut ledger = LedgerState::new(ProtocolParameters::mainnet_defaults());
+        let action_id = GovActionId {
+            transaction_id: Hash32::from_bytes([0x55; 32]),
+            action_index: 0,
+        };
+        let drep_cred = Credential::VerificationKey(Hash28::from_bytes([0xAA; 28]));
+        let cc_cred = Credential::VerificationKey(Hash28::from_bytes([0xBB; 28]));
+        let mut spo_bytes = [0u8; 32];
+        spo_bytes[..28].copy_from_slice(&[0xCC; 28]);
+        let spo_id = Hash32::from_bytes(spo_bytes);
+        let v_no = VotingProcedure {
+            vote: Vote::No,
+            anchor: None,
+        };
+        let v_yes = VotingProcedure {
+            vote: Vote::Yes,
+            anchor: None,
+        };
+        let v_abstain = VotingProcedure {
+            vote: Vote::Abstain,
+            anchor: None,
+        };
+        {
+            let gov = Arc::make_mut(&mut ledger.gov.governance);
+            gov.votes_by_action.insert(
+                action_id.clone(),
+                vec![
+                    // Same DRep votes twice — second vote wins.
+                    (Voter::DRep(drep_cred.clone()), v_no.clone()),
+                    (Voter::DRep(drep_cred.clone()), v_yes.clone()),
+                    // CC member votes three times — last wins.
+                    (
+                        Voter::ConstitutionalCommittee(cc_cred.clone()),
+                        v_yes.clone(),
+                    ),
+                    (
+                        Voter::ConstitutionalCommittee(cc_cred.clone()),
+                        v_no.clone(),
+                    ),
+                    (
+                        Voter::ConstitutionalCommittee(cc_cred.clone()),
+                        v_abstain.clone(),
+                    ),
+                    // SPO votes twice — last wins.
+                    (Voter::StakePool(spo_id), v_yes.clone()),
+                    (Voter::StakePool(spo_id), v_no.clone()),
+                ],
+            );
+        }
+        let (cc, drep, spo) = build_vote_maps(&ledger, &action_id);
+        assert_eq!(drep.len(), 1, "drep duplicates must collapse to 1 entry");
+        assert_eq!(drep[0], (vec![0xAA; 28], 0u8, 1u8), "last DRep vote=Yes");
+        assert_eq!(cc.len(), 1, "cc duplicates must collapse to 1 entry");
+        assert_eq!(cc[0], (vec![0xBB; 28], 0u8, 2u8), "last CC vote=Abstain");
+        assert_eq!(spo.len(), 1, "spo duplicates must collapse to 1 entry");
+        assert_eq!(spo[0], (vec![0xCC; 28], 0u8), "last SPO vote=No");
     }
 
     #[test]
