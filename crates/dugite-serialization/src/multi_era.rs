@@ -234,15 +234,27 @@ fn decode_block_inner(
     byron_epoch_length: u64,
     mode: DecodeMode,
 ) -> Result<Block, SerializationError> {
-    // Dijkstra (era_tag=8) is structurally identical to Conway (era_tag=7) —
-    // same Praos header format and same block body layout.  Pallas 1.0.0-alpha.5
-    // does not yet have a Dijkstra variant; its probe returns `Inconclusive` for
-    // tag 8 and `PallasBlock::decode` returns an error.
+    // Dijkstra (era_tag=8) is currently treated as structurally identical to
+    // Conway (era_tag=7): same Praos header and same block body layout.
+    //
+    // LOAD-BEARING SHIM — TODO(#466): remove when pallas exposes Era::Dijkstra.
+    // Pallas 1.0.0-alpha.6 (workspace pin 2026-05-12) still lacks the variant;
+    // `PallasBlock::decode` returns an error for tag 8.  File an upstream
+    // issue at <https://github.com/txpipe/pallas/issues> if this shim is still
+    // in place when Dijkstra activates on mainnet.
     //
     // Work-around: if the block starts with the Dijkstra era tag, temporarily
     // rewrite it to 7 (Conway) in a local copy, decode via pallas, then restore
     // the true era in the returned `Block`.  The original raw CBOR (with tag=8)
     // is preserved in `raw_cbor` so ChainDB stores and serves it correctly.
+    //
+    // Risk: if a future cardano-node ships a Dijkstra block whose body diverges
+    // from Conway (per cardano-haskell-oracle the likely additions are
+    // `peras_certificate` in the block body and new TxBody keys 14/23/25/26),
+    // Conway decode will either fail outright (loud) or silently truncate
+    // (silent). The sanity check below catches the silent case by comparing
+    // the header's claimed body_size against the byte size we measure from
+    // the raw CBOR; a mismatch indicates the shim is no longer safe.
     let (decode_cbor, dijkstra) = if cbor.len() >= 2 && cbor[0] == 0x82 && cbor[1] == 0x08 {
         // array(2)[u8(8), ...] → array(2)[u8(7), ...]
         let mut patched = cbor.to_vec();
@@ -254,6 +266,31 @@ fn decode_block_inner(
 
     let pallas_block = PallasBlock::decode(&decode_cbor)
         .map_err(|e| SerializationError::CborDecode(format!("block decode: {e}")))?;
+
+    // Defensive sanity check for the Dijkstra shim. If a future Dijkstra block
+    // ships body fields that Conway decode silently drops, the header's
+    // claimed body_size will diverge from the byte size we measure from the
+    // raw CBOR. We log loudly but do NOT fail — the ledger catches real
+    // semantic drift via header-hash and BBODY checks downstream.
+    if dijkstra {
+        let claimed = pallas_block
+            .header()
+            .as_babbage()
+            .map(|h| h.header_body.block_body_size);
+        if let (Some(c), Some(m)) = (claimed, compute_block_body_size_from_cbor(cbor)) {
+            if c != m {
+                tracing::warn!(
+                    target: "dugite::serialization::dijkstra_shim",
+                    claimed_body_size = c,
+                    measured_body_size = m,
+                    tx_count = pallas_block.txs().len(),
+                    "Dijkstra block body-size mismatch under Conway decode — \
+                     structural divergence likely; shim is no longer safe. \
+                     Bump pallas and switch to native Era::Dijkstra dispatch."
+                );
+            }
+        }
+    }
 
     let era = if dijkstra {
         Era::Dijkstra
