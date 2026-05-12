@@ -82,6 +82,61 @@ fn bind_n2n_listener(addr: SocketAddr) -> std::io::Result<tokio::net::TcpListene
     tokio::net::TcpListener::from_std(std_listener)
 }
 
+/// Refresh all peer / connection-manager gauges from the current peer-manager
+/// state.
+///
+/// Centralises the gauge writes so every connection-lifecycle transition
+/// (inbound register, outbound register, peer-failed, peer-disconnected) can
+/// drive the same set of Prometheus gauges without each call-site duplicating
+/// the field list. The active-connection count comes from the lifecycle map
+/// rather than the peer-manager — keep them passed in separately so callers
+/// without lifecycle access (tests, future internal probes) can still use this.
+///
+/// Regression context (GitHub #437): prior to this refactor `update_peer_metrics`
+/// only wrote `peers_*` and `n2n_connections_active`. The `conn_*` family of
+/// gauges (matching Haskell's `ConnectionManagerCounters`) was only refreshed by
+/// the block-arrival logging path in `sync.rs`, so a node at chain tip with
+/// inbound peers reported `conn_inbound = 0` until the next block landed.
+pub(crate) fn apply_peer_metrics(
+    metrics: &crate::metrics::NodeMetrics,
+    pm: &crate::node::networking::NodePeerManager,
+    active_connection_count: usize,
+) {
+    use std::sync::atomic::Ordering::Relaxed;
+
+    metrics
+        .peers_connected
+        .store((pm.warm_peer_count() + pm.hot_peer_count()) as u64, Relaxed);
+    metrics.peers_cold.store(pm.cold_peer_count() as u64, Relaxed);
+    metrics.peers_warm.store(pm.warm_peer_count() as u64, Relaxed);
+    metrics.peers_hot.store(pm.hot_peer_count() as u64, Relaxed);
+    metrics
+        .peers_outbound
+        .store(pm.outbound_peer_count() as u64, Relaxed);
+    metrics
+        .peers_inbound
+        .store(pm.inbound_peer_count() as u64, Relaxed);
+    metrics
+        .peers_duplex
+        .store(pm.duplex_peer_count() as u64, Relaxed);
+
+    // Connection-manager counters (Haskell ConnectionManagerCounters compat).
+    let cm = pm.connection_manager_counters();
+    metrics.conn_full_duplex.store(cm.full_duplex, Relaxed);
+    metrics.conn_duplex.store(cm.duplex, Relaxed);
+    metrics.conn_unidirectional.store(cm.unidirectional, Relaxed);
+    metrics.conn_inbound.store(cm.inbound, Relaxed);
+    metrics.conn_outbound.store(cm.outbound, Relaxed);
+    metrics.conn_terminating.store(cm.terminating, Relaxed);
+
+    // n2n_connections_active is derived from the lifecycle's connections HashMap
+    // (the authoritative source) rather than a fetch_add/fetch_sub counter that
+    // can drift. Invariant: gauge == connections.len() after every call.
+    metrics
+        .n2n_connections_active
+        .store(active_connection_count as u64, Relaxed);
+}
+
 /// Flatten a `LedgerState` into the primitive [`GovernanceSnapshot`] consumed
 /// by [`crate::metrics::NodeMetrics::set_governance_snapshot`].
 ///
@@ -2907,6 +2962,7 @@ impl Node {
                                     Err(e) => {
                                         warn!(%addr, "register_warm_connection failed: {e}");
                                         pm.peer_failed(&addr);
+                                        self.update_peer_metrics(&pm);
                                     }
                                 }
                             }
@@ -2919,6 +2975,7 @@ impl Node {
                             debug!(%addr, "background cold->warm failed: {error}");
                             let mut pm = peer_manager.write().await;
                             pm.peer_failed(&addr);
+                            self.update_peer_metrics(&pm);
                         }
                     }
                 }
@@ -2962,6 +3019,7 @@ impl Node {
                     let mut pm = peer_manager.write().await;
                     warn!(%failed_addr, "peer reported as failed by protocol task");
                     pm.peer_failed(&failed_addr);
+                    self.update_peer_metrics(&pm);
                 }
 
                 // ── KeepAlive RTT reports ──────────────────────────────
@@ -3061,42 +3119,11 @@ impl Node {
     /// dead connection cleanup) so Prometheus counters reflect reality
     /// without waiting for the periodic sync loop poll.
     fn update_peer_metrics(&self, pm: &crate::node::networking::NodePeerManager) {
-        use std::sync::atomic::Ordering::Relaxed;
-        self.metrics
-            .peers_connected
-            .store((pm.warm_peer_count() + pm.hot_peer_count()) as u64, Relaxed);
-        self.metrics
-            .peers_cold
-            .store(pm.cold_peer_count() as u64, Relaxed);
-        self.metrics
-            .peers_warm
-            .store(pm.warm_peer_count() as u64, Relaxed);
-        self.metrics
-            .peers_hot
-            .store(pm.hot_peer_count() as u64, Relaxed);
-        self.metrics
-            .peers_outbound
-            .store(pm.outbound_peer_count() as u64, Relaxed);
-        self.metrics
-            .peers_inbound
-            .store(pm.inbound_peer_count() as u64, Relaxed);
-        self.metrics
-            .peers_duplex
-            .store(pm.duplex_peer_count() as u64, Relaxed);
-
-        // Derive n2n_connections_active from the authoritative connections HashMap
-        // rather than maintaining it via ad-hoc fetch_add/fetch_sub calls that drift.
-        //
-        // The invariant is strict: gauge == connections.len() after every call.
-        // Matches Haskell ouroboros-network where peer-count metrics are sourced
-        // from PeerManagerState rather than parallel counters.
         let active = self
             .connection_lifecycle
             .as_ref()
             .map_or(0, |lc| lc.connection_count());
-        self.metrics
-            .n2n_connections_active
-            .store(active as u64, Relaxed);
+        apply_peer_metrics(&self.metrics, pm, active);
     }
 
     // ─── apply_fetched_block() ──────────────────────────────────────────────
@@ -5874,5 +5901,65 @@ mod tests {
         let tmp = tempfile::tempdir().expect("tempdir");
         std::fs::create_dir_all(tmp.path().join("tables")).expect("mkdir tables");
         assert!(resolve_inmemory_tables_path(tmp.path()).is_none());
+    }
+
+    // ─── apply_peer_metrics gauge update (GitHub #437 regression) ────────────
+
+    /// Inbound connection registration must drive `peers_inbound`,
+    /// `conn_inbound`, and `n2n_connections_active` in lock-step. Before this
+    /// fix, only `peers_inbound` and `n2n_connections_active` were updated by
+    /// `update_peer_metrics`; `conn_inbound` only moved on block arrival,
+    /// leaving Prometheus and dugite-monitor reporting zero inbound
+    /// connections for nodes at chain tip.
+    #[test]
+    fn apply_peer_metrics_inbound_drives_all_three_gauges() {
+        use crate::metrics::NodeMetrics;
+        use crate::node::apply_peer_metrics;
+        use crate::node::networking::{
+            ConnectionDirection, NodePeerManager, PeerManagerConfig,
+        };
+        use std::net::SocketAddr;
+        use std::sync::atomic::Ordering::Relaxed;
+
+        let metrics = NodeMetrics::default();
+        let mut pm = NodePeerManager::new(PeerManagerConfig::default());
+        let addr: SocketAddr = "198.51.100.7:3001".parse().unwrap();
+
+        // Baseline: every gauge starts at zero.
+        assert_eq!(metrics.peers_inbound.load(Relaxed), 0);
+        assert_eq!(metrics.conn_inbound.load(Relaxed), 0);
+        assert_eq!(metrics.n2n_connections_active.load(Relaxed), 0);
+
+        // Simulate the inbound-register path: peer-manager records the inbound,
+        // then the run loop refreshes all metrics via apply_peer_metrics.
+        pm.peer_connected(&addr, ConnectionDirection::Inbound);
+        apply_peer_metrics(&metrics, &pm, /*active_connection_count=*/ 1);
+
+        assert_eq!(
+            metrics.peers_inbound.load(Relaxed),
+            1,
+            "peers_inbound must reflect the registered inbound peer"
+        );
+        assert_eq!(
+            metrics.conn_inbound.load(Relaxed),
+            1,
+            "conn_inbound must move on inbound register, not only on block arrival"
+        );
+        assert_eq!(
+            metrics.n2n_connections_active.load(Relaxed),
+            1,
+            "n2n_connections_active must mirror the lifecycle map length"
+        );
+        // The Duplex DataFlow bucket also has to fire: InboundIdle(Duplex)
+        // contributes to both `inbound` and `duplex` per Haskell semantics.
+        assert_eq!(metrics.conn_duplex.load(Relaxed), 1);
+
+        // Disconnect: every inbound gauge has to return to zero.
+        pm.peer_disconnected(&addr);
+        apply_peer_metrics(&metrics, &pm, /*active_connection_count=*/ 0);
+
+        assert_eq!(metrics.peers_inbound.load(Relaxed), 0);
+        assert_eq!(metrics.conn_inbound.load(Relaxed), 0);
+        assert_eq!(metrics.n2n_connections_active.load(Relaxed), 0);
     }
 }
