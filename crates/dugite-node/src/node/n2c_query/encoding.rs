@@ -6,8 +6,8 @@
 //! `mod.rs` stays thin.
 
 use crate::node::n2c_query::types::{
-    DRepDelegationEntry, GovActionId, ProposalSnapshot, ProtocolParamsSnapshot, QueryResult,
-    RelaySnapshot, ShelleyPParamsSnapshot, SnapshotStakeData, UtxoSnapshot,
+    DRepDelegationGroup, DRepKey, GovActionId, ProposalSnapshot, ProtocolParamsSnapshot,
+    QueryResult, RelaySnapshot, ShelleyPParamsSnapshot, SnapshotStakeData, UtxoSnapshot,
 };
 
 // ─── Top-level result encoder ────────────────────────────────────────────────
@@ -917,39 +917,54 @@ fn encode_filtered_vote_delegatees(
 
 /// Encode `GetDRepDelegations` (tag 39, V23+) response.
 ///
-/// Wire format: `Map<Credential, DRep>`
-///   Key: `array(2) [credential_type(0|1), hash(28)]`
-///   Value: `array(2) [0|1, hash(28)]`  for KeyHash/ScriptHash DRep
-///          `array(1) [2|3]`            for AlwaysAbstain / AlwaysNoConfidence
+/// Wire format per Haskell `ouroboros-consensus-cardano`
+/// `Shelley/Ledger/Query.hs`:
 ///
-/// The encoding is identical to `GetFilteredVoteDelegatees` (tag 28), defined
-/// as a separate function to keep the two query paths independent.
+/// ```text
+/// Map<DRep, Set<Credential Staking>>
+///   key   DRep        = array(2) [0|1, bstr(28)]
+///                     | array(1) [2|3]                  (AlwaysAbstain / AlwaysNoConfidence)
+///   value Set<Cred>   = tag(258) array(n) [Credential...]
+///   Credential        = array(2) [0|1, bstr(28)]
+/// ```
+///
+/// This is the OPPOSITE orientation of `GetFilteredVoteDelegatees` (tag 28),
+/// which is keyed by stake credential.
 fn encode_drep_delegations(
     enc: &mut minicbor::Encoder<&mut Vec<u8>>,
-    delegations: &[DRepDelegationEntry],
+    groups: &[DRepDelegationGroup],
 ) {
-    // Map<Credential, DRep>
-    enc.map(delegations.len() as u64).ok();
-    for entry in delegations {
-        // Key: Credential = array(2) [type, hash(28)]
-        enc.array(2).ok();
-        enc.u8(entry.credential_type).ok();
-        enc.bytes(&entry.credential_hash).ok();
-        // Value: DRep
-        match entry.drep_type {
-            0 | 1 => {
-                // KeyHash or ScriptHash DRep: array(2) [type, hash(28)]
-                enc.array(2).ok();
-                enc.u8(entry.drep_type).ok();
-                if let Some(ref h) = entry.drep_hash {
-                    enc.bytes(h).ok();
-                }
+    enc.map(groups.len() as u64).ok();
+    for group in groups {
+        // Key: DRep
+        encode_drep_key(enc, &group.drep);
+        // Value: Set<Credential> = tag(258) array(n) [array(2) [type, hash], ...]
+        enc.tag(minicbor::data::Tag::new(258)).ok();
+        enc.array(group.credentials.len() as u64).ok();
+        for (cred_type, cred_hash) in &group.credentials {
+            enc.array(2).ok();
+            enc.u8(*cred_type).ok();
+            enc.bytes(cred_hash).ok();
+        }
+    }
+}
+
+/// Encode a wire-format DRep value (used as the map key for tag 39).
+fn encode_drep_key(enc: &mut minicbor::Encoder<&mut Vec<u8>>, drep: &DRepKey) {
+    match drep.drep_type {
+        0 | 1 => {
+            enc.array(2).ok();
+            enc.u8(drep.drep_type).ok();
+            if let Some(ref h) = drep.drep_hash {
+                enc.bytes(h).ok();
+            } else {
+                // Defensive: a KeyHash/ScriptHash DRep with no hash is malformed.
+                enc.bytes(&[]).ok();
             }
-            _ => {
-                // AlwaysAbstain (2) or AlwaysNoConfidence (3): array(1) [type]
-                enc.array(1).ok();
-                enc.u8(entry.drep_type).ok();
-            }
+        }
+        _ => {
+            enc.array(1).ok();
+            enc.u8(drep.drep_type).ok();
         }
     }
 }
@@ -2286,7 +2301,7 @@ fn encode_ledger_peer_snapshot(
 mod tests {
     use super::*;
     use crate::node::n2c_query::types::{
-        CommitteeMemberSnapshot, CommitteeSnapshot, DRepDelegationEntry, DRepSnapshot,
+        CommitteeMemberSnapshot, CommitteeSnapshot, DRepDelegationGroup, DRepKey, DRepSnapshot,
         DRepStakeEntry, PoolParamsSnapshot, PoolStakeSnapshotEntry, StakeAddressSnapshot,
         StakeDelegDepositEntry, StakePoolSnapshot, StakeSnapshotsResult, VoteDelegateeEntry,
     };
@@ -2886,55 +2901,65 @@ mod tests {
         assert_eq!(dec.u64().unwrap(), 2_000_000);
     }
 
-    // ─── DRep delegations (tag 39, V23+) — Map<Credential, DRep> ────────
+    // ─── DRep delegations (tag 39, V23+) — Map<DRep, Set<Credential>> ───
 
-    /// GetDRepDelegations with a KeyHash credential delegating to a KeyHash DRep.
-    /// Verifies credential and DRep hashes are 28 bytes on the wire, and that the
-    /// overall CBOR structure is `map { array(2)[type, hash] => array(2)[type, hash] }`.
+    /// Helper: decode one Set<Credential> = tag(258) array(n) [array(2) [type, hash(28)], ...].
+    fn decode_credential_set(dec: &mut Decoder) -> Vec<(u8, Vec<u8>)> {
+        let tag = dec.tag().expect("set tag");
+        assert_eq!(tag.as_u64(), 258, "credential-set must be tagged 258");
+        let n = dec.array().unwrap().unwrap();
+        let mut out = Vec::with_capacity(n as usize);
+        for _ in 0..n {
+            let inner_len = dec.array().unwrap().unwrap();
+            assert_eq!(inner_len, 2, "Credential is array(2) [type, hash]");
+            let ct = dec.u8().unwrap();
+            let h = dec.bytes().unwrap().to_vec();
+            assert_eq!(h.len(), 28, "Credential hash must be 28 bytes");
+            out.push((ct, h));
+        }
+        out
+    }
+
+    /// KeyHash DRep mapped to a single KeyHash staking credential.
+    /// Verifies the corrected outer shape `Map<DRep, Set<Credential>>`.
     #[test]
-    fn test_drep_delegations_keyhash_credential_and_drep() {
-        let result = QueryResult::DRepDelegations(vec![DRepDelegationEntry {
-            credential_hash: vec![0xAA; 28],
-            credential_type: 0, // KeyHash
-            drep_type: 0,       // KeyHash DRep
-            drep_hash: Some(vec![0xBB; 28]),
+    fn test_drep_delegations_keyhash_drep_with_one_delegator() {
+        let result = QueryResult::DRepDelegations(vec![DRepDelegationGroup {
+            drep: DRepKey {
+                drep_type: 0,
+                drep_hash: Some(vec![0xBB; 28]),
+            },
+            credentials: vec![(0, vec![0xAA; 28])],
         }]);
         let encoded = encode_query_result(&result);
         let inner = strip_wrappers(&encoded);
 
-        // Map(1) { Credential => DRep }
         let mut dec = Decoder::new(&inner);
         let map_len = dec.map().unwrap().unwrap();
         assert_eq!(map_len, 1, "Expected exactly one map entry");
 
-        // Key: Credential = array(2) [0, hash(28)]
-        let cred_len = dec.array().unwrap().unwrap();
-        assert_eq!(cred_len, 2);
-        assert_eq!(
-            dec.u8().unwrap(),
-            0,
-            "Credential type should be 0 (KeyHash)"
-        );
-        let cred_hash = dec.bytes().unwrap();
-        assert_eq!(cred_hash.len(), 28, "Credential hash must be 28 bytes");
-
-        // Value: DRep = array(2) [0, hash(28)]
+        // Key: DRep = array(2) [0, hash(28)]
         let drep_len = dec.array().unwrap().unwrap();
         assert_eq!(drep_len, 2);
         assert_eq!(dec.u8().unwrap(), 0, "DRep type should be 0 (KeyHash)");
         let drep_hash = dec.bytes().unwrap();
         assert_eq!(drep_hash.len(), 28, "DRep hash must be 28 bytes");
+        assert_eq!(drep_hash, &[0xBB; 28]);
+
+        // Value: Set<Credential>
+        let creds = decode_credential_set(&mut dec);
+        assert_eq!(creds, vec![(0u8, vec![0xAA; 28])]);
     }
 
-    /// GetDRepDelegations with an AlwaysAbstain DRep.
-    /// Verifies AlwaysAbstain (type 2) encodes as `array(1) [2]` with no hash.
+    /// ScriptHash DRep with two delegators (mixed KeyHash / ScriptHash creds).
     #[test]
-    fn test_drep_delegations_always_abstain() {
-        let result = QueryResult::DRepDelegations(vec![DRepDelegationEntry {
-            credential_hash: vec![0xCC; 28],
-            credential_type: 0, // KeyHash
-            drep_type: 2,       // AlwaysAbstain
-            drep_hash: None,
+    fn test_drep_delegations_scripthash_drep_multi_delegators() {
+        let result = QueryResult::DRepDelegations(vec![DRepDelegationGroup {
+            drep: DRepKey {
+                drep_type: 1,
+                drep_hash: Some(vec![0x55; 28]),
+            },
+            credentials: vec![(0, vec![0x11; 28]), (1, vec![0x22; 28])],
         }]);
         let encoded = encode_query_result(&result);
         let inner = strip_wrappers(&encoded);
@@ -2942,28 +2967,55 @@ mod tests {
         let mut dec = Decoder::new(&inner);
         dec.map().unwrap();
 
-        // Key: Credential
-        dec.array().unwrap();
-        dec.u8().unwrap(); // type
-        dec.bytes().unwrap(); // hash
+        let drep_len = dec.array().unwrap().unwrap();
+        assert_eq!(drep_len, 2);
+        assert_eq!(dec.u8().unwrap(), 1, "DRep type should be 1 (ScriptHash)");
+        assert_eq!(dec.bytes().unwrap(), &[0x55; 28]);
 
-        // Value: DRep = array(1) [2]
+        let creds = decode_credential_set(&mut dec);
+        assert_eq!(creds.len(), 2);
+        assert_eq!(creds[0], (0u8, vec![0x11; 28]));
+        assert_eq!(creds[1], (1u8, vec![0x22; 28]));
+    }
+
+    /// AlwaysAbstain (type 2) DRep — `array(1) [2]` key with one delegator.
+    #[test]
+    fn test_drep_delegations_always_abstain() {
+        let result = QueryResult::DRepDelegations(vec![DRepDelegationGroup {
+            drep: DRepKey {
+                drep_type: 2,
+                drep_hash: None,
+            },
+            credentials: vec![(0, vec![0xCC; 28])],
+        }]);
+        let encoded = encode_query_result(&result);
+        let inner = strip_wrappers(&encoded);
+
+        let mut dec = Decoder::new(&inner);
+        dec.map().unwrap();
+
+        // Key: DRep = array(1) [2]
         let drep_arr_len = dec.array().unwrap().unwrap();
         assert_eq!(
             drep_arr_len, 1,
             "AlwaysAbstain DRep should encode as array(1)"
         );
         assert_eq!(dec.u8().unwrap(), 2, "AlwaysAbstain DRep type should be 2");
+
+        // Value: Set<Credential>
+        let creds = decode_credential_set(&mut dec);
+        assert_eq!(creds, vec![(0u8, vec![0xCC; 28])]);
     }
 
-    /// GetDRepDelegations with an AlwaysNoConfidence DRep (type 3).
+    /// AlwaysNoConfidence (type 3) DRep with a ScriptHash delegator.
     #[test]
     fn test_drep_delegations_always_no_confidence() {
-        let result = QueryResult::DRepDelegations(vec![DRepDelegationEntry {
-            credential_hash: vec![0xDD; 28],
-            credential_type: 1, // ScriptHash credential
-            drep_type: 3,       // AlwaysNoConfidence
-            drep_hash: None,
+        let result = QueryResult::DRepDelegations(vec![DRepDelegationGroup {
+            drep: DRepKey {
+                drep_type: 3,
+                drep_hash: None,
+            },
+            credentials: vec![(1, vec![0xDD; 28])],
         }]);
         let encoded = encode_query_result(&result);
         let inner = strip_wrappers(&encoded);
@@ -2971,16 +3023,6 @@ mod tests {
         let mut dec = Decoder::new(&inner);
         dec.map().unwrap();
 
-        // Key: Credential array(2) [1, hash(28)]
-        dec.array().unwrap();
-        assert_eq!(
-            dec.u8().unwrap(),
-            1,
-            "Credential type should be 1 (ScriptHash)"
-        );
-        dec.bytes().unwrap();
-
-        // Value: DRep = array(1) [3]
         let drep_arr_len = dec.array().unwrap().unwrap();
         assert_eq!(
             drep_arr_len, 1,
@@ -2991,29 +3033,43 @@ mod tests {
             3,
             "AlwaysNoConfidence DRep type should be 3"
         );
+
+        let creds = decode_credential_set(&mut dec);
+        assert_eq!(creds, vec![(1u8, vec![0xDD; 28])]);
     }
 
-    /// GetDRepDelegations with multiple entries covering different DRep types.
+    /// Multiple DRep groups covering each variant (KeyHash, ScriptHash,
+    /// AlwaysAbstain, AlwaysNoConfidence) plus an empty-credential-set group.
     #[test]
-    fn test_drep_delegations_multi_entry_map_length() {
+    fn test_drep_delegations_multi_group_all_variants() {
         let result = QueryResult::DRepDelegations(vec![
-            DRepDelegationEntry {
-                credential_hash: vec![0x11; 28],
-                credential_type: 0,
-                drep_type: 0,
-                drep_hash: Some(vec![0x22; 28]),
+            DRepDelegationGroup {
+                drep: DRepKey {
+                    drep_type: 0,
+                    drep_hash: Some(vec![0x10; 28]),
+                },
+                credentials: vec![(0, vec![0x11; 28])],
             },
-            DRepDelegationEntry {
-                credential_hash: vec![0x33; 28],
-                credential_type: 0,
-                drep_type: 2, // AlwaysAbstain
-                drep_hash: None,
+            DRepDelegationGroup {
+                drep: DRepKey {
+                    drep_type: 1,
+                    drep_hash: Some(vec![0x20; 28]),
+                },
+                credentials: vec![],
             },
-            DRepDelegationEntry {
-                credential_hash: vec![0x44; 28],
-                credential_type: 1, // ScriptHash
-                drep_type: 1,       // ScriptHash DRep
-                drep_hash: Some(vec![0x55; 28]),
+            DRepDelegationGroup {
+                drep: DRepKey {
+                    drep_type: 2,
+                    drep_hash: None,
+                },
+                credentials: vec![(0, vec![0x33; 28]), (1, vec![0x34; 28])],
+            },
+            DRepDelegationGroup {
+                drep: DRepKey {
+                    drep_type: 3,
+                    drep_hash: None,
+                },
+                credentials: vec![(0, vec![0x44; 28])],
             },
         ]);
         let encoded = encode_query_result(&result);
@@ -3021,10 +3077,32 @@ mod tests {
 
         let mut dec = Decoder::new(&inner);
         let map_len = dec.map().unwrap().unwrap();
-        assert_eq!(map_len, 3, "Three entries should produce map(3)");
+        assert_eq!(map_len, 4, "Four groups should produce map(4)");
+
+        // group 0: KeyHash DRep, 1 cred
+        assert_eq!(dec.array().unwrap().unwrap(), 2);
+        assert_eq!(dec.u8().unwrap(), 0);
+        assert_eq!(dec.bytes().unwrap(), &[0x10; 28]);
+        assert_eq!(decode_credential_set(&mut dec).len(), 1);
+
+        // group 1: ScriptHash DRep, empty cred set
+        assert_eq!(dec.array().unwrap().unwrap(), 2);
+        assert_eq!(dec.u8().unwrap(), 1);
+        assert_eq!(dec.bytes().unwrap(), &[0x20; 28]);
+        assert!(decode_credential_set(&mut dec).is_empty());
+
+        // group 2: AlwaysAbstain DRep, 2 creds
+        assert_eq!(dec.array().unwrap().unwrap(), 1);
+        assert_eq!(dec.u8().unwrap(), 2);
+        assert_eq!(decode_credential_set(&mut dec).len(), 2);
+
+        // group 3: AlwaysNoConfidence DRep, 1 cred
+        assert_eq!(dec.array().unwrap().unwrap(), 1);
+        assert_eq!(dec.u8().unwrap(), 3);
+        assert_eq!(decode_credential_set(&mut dec).len(), 1);
     }
 
-    /// GetDRepDelegations empty result encodes as empty map.
+    /// Empty result encodes as `map(0)`.
     #[test]
     fn test_drep_delegations_empty_is_empty_map() {
         let result = QueryResult::DRepDelegations(vec![]);
@@ -3034,6 +3112,63 @@ mod tests {
         let mut dec = Decoder::new(&inner);
         let map_len = dec.map().unwrap().unwrap();
         assert_eq!(map_len, 0, "Empty DRepDelegations should encode as map(0)");
+    }
+
+    /// Roundtrip: encode → decode → re-encode and ensure byte-equality.
+    /// This is a structural roundtrip (we re-build the same `DRepDelegationGroup`
+    /// values from the decoded CBOR and compare).
+    #[test]
+    fn test_drep_delegations_roundtrip() {
+        let original = vec![
+            DRepDelegationGroup {
+                drep: DRepKey {
+                    drep_type: 0,
+                    drep_hash: Some(vec![0x77; 28]),
+                },
+                credentials: vec![(0, vec![0x01; 28]), (1, vec![0x02; 28])],
+            },
+            DRepDelegationGroup {
+                drep: DRepKey {
+                    drep_type: 2,
+                    drep_hash: None,
+                },
+                credentials: vec![(0, vec![0x03; 28])],
+            },
+        ];
+        let result = QueryResult::DRepDelegations(original.clone());
+        let encoded = encode_query_result(&result);
+        let inner = strip_wrappers(&encoded);
+
+        // Decode back into Vec<DRepDelegationGroup>.
+        let mut dec = Decoder::new(&inner);
+        let map_len = dec.map().unwrap().unwrap();
+        let mut decoded: Vec<DRepDelegationGroup> = Vec::with_capacity(map_len as usize);
+        for _ in 0..map_len {
+            let arr_len = dec.array().unwrap().unwrap();
+            let drep_type = dec.u8().unwrap();
+            let drep_hash = if arr_len == 2 {
+                Some(dec.bytes().unwrap().to_vec())
+            } else {
+                None
+            };
+            let credentials = decode_credential_set(&mut dec);
+            decoded.push(DRepDelegationGroup {
+                drep: DRepKey {
+                    drep_type,
+                    drep_hash,
+                },
+                credentials,
+            });
+        }
+        assert_eq!(decoded.len(), original.len());
+        for (a, b) in decoded.iter().zip(original.iter()) {
+            assert_eq!(a.drep, b.drep);
+            assert_eq!(a.credentials, b.credentials);
+        }
+
+        // Re-encode and confirm byte-identical CBOR (canonical roundtrip).
+        let re_encoded = encode_query_result(&QueryResult::DRepDelegations(decoded));
+        assert_eq!(re_encoded, encoded, "roundtrip must be byte-identical");
     }
 
     // ── N2C protocol wire-format regression tests (Haskell compatibility) ─────
