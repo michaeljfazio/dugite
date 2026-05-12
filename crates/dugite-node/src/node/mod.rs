@@ -1050,7 +1050,7 @@ impl Node {
                 args.config.max_major_protocol_version(),
             )
         } else {
-            OuroborosPraos::new()
+            OuroborosPraos::new(args.config.max_major_protocol_version())
         };
         // Capture security_param before consensus is moved into the Node struct.
         let consensus_security_param = consensus.security_param;
@@ -1197,7 +1197,7 @@ impl Node {
         // Server tasks are spawned in run() and live for the node's lifetime.
 
         // Wire up live UTxO provider before wrapping in lock
-        let mut qh = QueryHandler::new();
+        let mut qh = QueryHandler::new(args.config.max_major_protocol_version() as u32);
         qh.set_utxo_provider(Arc::new(serve::LedgerUtxoProvider {
             ledger: ledger_state.clone(),
         }));

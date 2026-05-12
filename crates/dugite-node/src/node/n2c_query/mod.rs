@@ -50,15 +50,33 @@ pub struct QueryHandler {
     /// Negotiated N2C protocol version for the current query (set per-dispatch).
     /// Used to gate deprecated queries. 0 = no gating (tests, internal use).
     n2c_version: std::sync::atomic::AtomicU16,
+    /// Highest major protocol version this node software supports. Returned by
+    /// the N2C `GetMaxMajorProtocolVersion` query (tag 38, V21+).
+    /// Plumbed from `NodeConfig::max_major_protocol_version()` so the response
+    /// reflects the running configuration (PV11 by default, PV12 when
+    /// `experimental_hard_forks_enabled` is set) rather than a stale constant.
+    max_major_prot_ver: u32,
 }
 
 impl QueryHandler {
-    pub fn new() -> Self {
+    /// Construct a `QueryHandler` with the supplied max major protocol version.
+    ///
+    /// Production callers MUST source this from
+    /// `NodeConfig::max_major_protocol_version()` (see issue #463). Tests may
+    /// pass any value that matches the era they are exercising.
+    pub fn new(max_major_prot_ver: u32) -> Self {
         QueryHandler {
             state: Arc::new(NodeStateSnapshot::default()),
             utxo_provider: None,
             n2c_version: std::sync::atomic::AtomicU16::new(0),
+            max_major_prot_ver,
         }
+    }
+
+    /// Returns the configured max major protocol version. Exposed for tests.
+    #[allow(dead_code)]
+    pub fn max_major_prot_ver(&self) -> u32 {
+        self.max_major_prot_ver
     }
 
     /// Set the UTxO query provider for on-demand UTxO lookups
@@ -528,12 +546,15 @@ impl QueryHandler {
             }
             38 => {
                 // Tag 38: GetMaxMajorProtocolVersion (V21+)
-                // Derived from the same node-level constant as OuroborosPraos.max_major_prot_ver
-                // and the forged block header protocol version.
-                debug!("Query: GetMaxMajorProtocolVersion");
-                QueryResult::MaxMajorProtocolVersion(
-                    dugite_consensus::NODE_PROTOCOL_VERSION.0 as u32,
-                )
+                // Returns the highest major protocol version this node software
+                // supports. Sourced from NodeConfig::max_major_protocol_version()
+                // at QueryHandler construction time so the response tracks
+                // experimental_hard_forks_enabled (PV11 default, PV12 experimental).
+                debug!(
+                    max_major_prot_ver = self.max_major_prot_ver,
+                    "Query: GetMaxMajorProtocolVersion"
+                );
+                QueryResult::MaxMajorProtocolVersion(self.max_major_prot_ver)
             }
             39 => {
                 // Tag 39: GetDRepDelegations (V23+)
@@ -545,12 +566,6 @@ impl QueryHandler {
                 QueryResult::Error(format!("Unsupported query: tag {query_tag}"))
             }
         }
-    }
-}
-
-impl Default for QueryHandler {
-    fn default() -> Self {
-        Self::new()
     }
 }
 
@@ -662,16 +677,77 @@ mod tests {
 
     #[test]
     fn test_query_handler_default_state() {
-        let handler = QueryHandler::new();
+        let handler = QueryHandler::new(11);
         match query(&handler, 1) {
             QueryResult::EpochNo(e) => assert_eq!(e, 0),
             other => panic!("Expected EpochNo, got {other:?}"),
         }
     }
 
+    /// Regression for issue #463: tag 38 (`GetMaxMajorProtocolVersion`) must
+    /// return the value plumbed in at construction, NOT a stale module-level
+    /// constant. With `experimental_hard_forks_enabled = false` the node
+    /// configuration resolves to PV11.
+    #[test]
+    fn test_get_max_major_protocol_version_pv11() {
+        let handler = QueryHandler::new(11);
+        match query(&handler, 38) {
+            QueryResult::MaxMajorProtocolVersion(v) => assert_eq!(
+                v, 11,
+                "tag 38 must return 11 when configured for the default \
+                 (non-experimental) hard forks path",
+            ),
+            other => panic!("Expected MaxMajorProtocolVersion, got {other:?}"),
+        }
+    }
+
+    /// Regression for issue #463: with `experimental_hard_forks_enabled = true`
+    /// the node advertises support for PV12 (Dijkstra) and tag 38 must
+    /// reflect that.
+    #[test]
+    fn test_get_max_major_protocol_version_pv12_experimental() {
+        let handler = QueryHandler::new(12);
+        match query(&handler, 38) {
+            QueryResult::MaxMajorProtocolVersion(v) => assert_eq!(
+                v, 12,
+                "tag 38 must return 12 when experimental_hard_forks_enabled \
+                 is set (Dijkstra-ready)",
+            ),
+            other => panic!("Expected MaxMajorProtocolVersion, got {other:?}"),
+        }
+    }
+
+    /// Regression for issue #463: end-to-end plumbing — when constructed from
+    /// `NodeConfig::max_major_protocol_version()`, the handler must echo the
+    /// resolved version. Exercises both branches of
+    /// `experimental_hard_forks_enabled`.
+    #[test]
+    fn test_get_max_major_protocol_version_from_node_config() {
+        let mut cfg = crate::config::NodeConfig {
+            experimental_hard_forks_enabled: false,
+            ..Default::default()
+        };
+        let h_default = QueryHandler::new(cfg.max_major_protocol_version() as u32);
+        match query(&h_default, 38) {
+            QueryResult::MaxMajorProtocolVersion(v) => {
+                assert_eq!(v, 11, "config(experimental=false) → tag 38 must return 11",)
+            }
+            other => panic!("Expected MaxMajorProtocolVersion, got {other:?}"),
+        }
+
+        cfg.experimental_hard_forks_enabled = true;
+        let h_exp = QueryHandler::new(cfg.max_major_protocol_version() as u32);
+        match query(&h_exp, 38) {
+            QueryResult::MaxMajorProtocolVersion(v) => {
+                assert_eq!(v, 12, "config(experimental=true) → tag 38 must return 12",)
+            }
+            other => panic!("Expected MaxMajorProtocolVersion, got {other:?}"),
+        }
+    }
+
     #[test]
     fn test_query_handler_epoch() {
-        let mut handler = QueryHandler::new();
+        let mut handler = QueryHandler::new(11);
         handler.update_state(NodeStateSnapshot {
             epoch: EpochNo(500),
             ..Default::default()
@@ -686,7 +762,7 @@ mod tests {
     #[test]
     fn test_query_handler_ledger_tip() {
         let hash = Hash32::from_bytes([0xab; 32]);
-        let mut handler = QueryHandler::new();
+        let mut handler = QueryHandler::new(11);
         handler.update_state(NodeStateSnapshot {
             tip: Tip {
                 point: Point::Specific(SlotNo(12345), hash),
@@ -707,7 +783,7 @@ mod tests {
 
     #[test]
     fn test_query_handler_current_era() {
-        let handler = QueryHandler::new();
+        let handler = QueryHandler::new(11);
         match query(&handler, 999) {
             QueryResult::Error(_) => {} // Expected for unknown query
             other => panic!("Expected Error, got {other:?}"),
@@ -716,7 +792,7 @@ mod tests {
 
     #[test]
     fn test_query_handler_block_no() {
-        let mut handler = QueryHandler::new();
+        let mut handler = QueryHandler::new(11);
         handler.update_state(NodeStateSnapshot {
             block_number: BlockNo(42000),
             ..Default::default()
@@ -738,7 +814,7 @@ mod tests {
 
     #[test]
     fn test_query_handler_system_start() {
-        let handler = QueryHandler::new();
+        let handler = QueryHandler::new(11);
         match query(&handler, 999) {
             QueryResult::Error(_) => {}
             _ => panic!("Expected error for unknown query"),
@@ -758,7 +834,7 @@ mod tests {
         enc.array(1).unwrap();
         enc.u32(1).unwrap(); // inner: GetEpochNo
 
-        let handler = QueryHandler::new();
+        let handler = QueryHandler::new(11);
         let result = handler.handle_query_cbor(&buf);
         match result {
             QueryResult::EpochNo(e) => assert_eq!(e, 0),
@@ -768,7 +844,7 @@ mod tests {
 
     #[test]
     fn test_query_handler_stake_distribution() {
-        let mut handler = QueryHandler::new();
+        let mut handler = QueryHandler::new(11);
         handler.update_state(NodeStateSnapshot {
             stake_pools: vec![
                 StakePoolSnapshot {
@@ -800,7 +876,7 @@ mod tests {
 
     #[test]
     fn test_query_handler_protocol_params() {
-        let mut handler = QueryHandler::new();
+        let mut handler = QueryHandler::new(11);
         handler.update_state(NodeStateSnapshot {
             protocol_params: ProtocolParamsSnapshot {
                 min_fee_a: 44,
@@ -821,7 +897,7 @@ mod tests {
 
     #[test]
     fn test_query_handler_gov_state() {
-        let mut handler = QueryHandler::new();
+        let mut handler = QueryHandler::new(11);
         handler.update_state(NodeStateSnapshot {
             drep_count: 5,
             treasury: 1_000_000_000_000,
@@ -871,7 +947,7 @@ mod tests {
 
     #[test]
     fn test_query_handler_drep_state() {
-        let mut handler = QueryHandler::new();
+        let mut handler = QueryHandler::new(11);
         handler.update_state(NodeStateSnapshot {
             drep_entries: vec![DRepSnapshot {
                 credential_hash: vec![0xdd; 28],
@@ -902,7 +978,7 @@ mod tests {
 
     #[test]
     fn test_query_handler_committee_state() {
-        let mut handler = QueryHandler::new();
+        let mut handler = QueryHandler::new(11);
         handler.update_state(NodeStateSnapshot {
             committee: CommitteeSnapshot {
                 members: vec![
@@ -944,7 +1020,7 @@ mod tests {
 
     #[test]
     fn test_query_handler_stake_address_info() {
-        let mut handler = QueryHandler::new();
+        let mut handler = QueryHandler::new(11);
         handler.update_state(NodeStateSnapshot {
             stake_addresses: vec![
                 StakeAddressSnapshot {
@@ -975,7 +1051,7 @@ mod tests {
 
     #[test]
     fn test_query_handler_utxo_by_address_no_provider() {
-        let handler = QueryHandler::new();
+        let handler = QueryHandler::new(11);
         // Without a UtxoQueryProvider, should return empty
         let addr_bytes = vec![0x01; 57]; // fake address bytes
         let mut decoder = minicbor::Decoder::new(&addr_bytes);
@@ -1004,7 +1080,7 @@ mod tests {
             }
         }
 
-        let mut handler = QueryHandler::new();
+        let mut handler = QueryHandler::new(11);
         handler.set_utxo_provider(Arc::new(MockProvider));
 
         let addr_bytes = vec![0x01; 57];
@@ -1021,7 +1097,7 @@ mod tests {
 
     #[test]
     fn test_query_handler_gov_state_empty() {
-        let handler = QueryHandler::new();
+        let handler = QueryHandler::new(11);
         match query(&handler, 24) {
             QueryResult::GovState(gov) => {
                 assert_eq!(gov.proposals.len(), 0);
@@ -1033,7 +1109,7 @@ mod tests {
 
     #[test]
     fn test_query_handler_stake_snapshots() {
-        let mut handler = QueryHandler::new();
+        let mut handler = QueryHandler::new(11);
         handler.update_state(NodeStateSnapshot {
             stake_snapshots: StakeSnapshotsResult {
                 pools: vec![PoolStakeSnapshotEntry {
@@ -1063,7 +1139,7 @@ mod tests {
 
     #[test]
     fn test_query_handler_pool_params() {
-        let mut handler = QueryHandler::new();
+        let mut handler = QueryHandler::new(11);
         handler.update_state(NodeStateSnapshot {
             pool_params_entries: vec![PoolParamsSnapshot {
                 pool_id: vec![0xbb; 28],
@@ -1099,7 +1175,7 @@ mod tests {
 
     #[test]
     fn test_query_handler_pool_state() {
-        let mut handler = QueryHandler::new();
+        let mut handler = QueryHandler::new(11);
         handler.update_state(NodeStateSnapshot {
             pool_params_entries: vec![PoolParamsSnapshot {
                 pool_id: vec![0xcc; 28],
@@ -1138,7 +1214,7 @@ mod tests {
 
     #[test]
     fn test_query_handler_pool_distr() {
-        let mut handler = QueryHandler::new();
+        let mut handler = QueryHandler::new(11);
         handler.update_state(NodeStateSnapshot {
             stake_pools: vec![
                 StakePoolSnapshot {
@@ -1168,7 +1244,7 @@ mod tests {
 
     #[test]
     fn test_query_handler_stake_deleg_deposits() {
-        let mut handler = QueryHandler::new();
+        let mut handler = QueryHandler::new(11);
         handler.update_state(NodeStateSnapshot {
             stake_deleg_deposits: vec![
                 StakeDelegDepositEntry {
@@ -1197,7 +1273,7 @@ mod tests {
 
     #[test]
     fn test_query_handler_drep_stake_distr() {
-        let mut handler = QueryHandler::new();
+        let mut handler = QueryHandler::new(11);
         handler.update_state(NodeStateSnapshot {
             drep_stake_distr: vec![
                 DRepStakeEntry {
@@ -1226,7 +1302,7 @@ mod tests {
 
     #[test]
     fn test_query_handler_filtered_vote_delegatees() {
-        let mut handler = QueryHandler::new();
+        let mut handler = QueryHandler::new(11);
         handler.update_state(NodeStateSnapshot {
             vote_delegatees: vec![
                 VoteDelegateeEntry {
@@ -1258,7 +1334,7 @@ mod tests {
 
     #[test]
     fn test_query_handler_debug_epoch_state() {
-        let mut handler = QueryHandler::new();
+        let mut handler = QueryHandler::new(11);
         handler.update_state(NodeStateSnapshot {
             epoch: EpochNo(55),
             treasury: 2_000_000,
@@ -1281,7 +1357,7 @@ mod tests {
 
     #[test]
     fn test_query_handler_get_cbor_wraps_inner() {
-        let handler = QueryHandler::new();
+        let handler = QueryHandler::new(11);
         // Build CBOR for inner query: [1] (GetEpochNo)
         let mut buf = Vec::new();
         let mut enc = minicbor::Encoder::new(&mut buf);
@@ -1302,7 +1378,7 @@ mod tests {
 
     #[test]
     fn test_query_handler_debug_new_epoch_state() {
-        let mut handler = QueryHandler::new();
+        let mut handler = QueryHandler::new(11);
         handler.update_state(NodeStateSnapshot {
             epoch: EpochNo(10),
             block_number: BlockNo(500),
@@ -1334,7 +1410,7 @@ mod tests {
 
     #[test]
     fn test_query_handler_debug_chain_dep_state() {
-        let mut handler = QueryHandler::new();
+        let mut handler = QueryHandler::new(11);
         handler.update_state(NodeStateSnapshot {
             tip: Tip {
                 point: dugite_primitives::block::Point::Specific(
@@ -1368,7 +1444,7 @@ mod tests {
 
     #[test]
     fn test_query_handler_reward_provenance() {
-        let mut handler = QueryHandler::new();
+        let mut handler = QueryHandler::new(11);
         handler.update_state(NodeStateSnapshot {
             epoch: EpochNo(42),
             reserves: 10_000_000,
@@ -1398,7 +1474,7 @@ mod tests {
 
     #[test]
     fn test_query_handler_reward_info_pools() {
-        let handler = QueryHandler::new();
+        let handler = QueryHandler::new(11);
         // Default state has no pools, should return empty
         match query(&handler, 18) {
             QueryResult::RewardInfoPools(pools) => {
@@ -1410,7 +1486,7 @@ mod tests {
 
     #[test]
     fn test_query_handler_unsupported_tag() {
-        let handler = QueryHandler::new();
+        let handler = QueryHandler::new(11);
         match query(&handler, 99) {
             QueryResult::Error(msg) => {
                 assert!(msg.contains("99"));
@@ -1436,7 +1512,7 @@ mod tests {
     /// the GenesisConfig result for version-gated CompactGenesis encoding.
     #[test]
     fn test_genesis_config_version_threaded_v16() {
-        let handler = QueryHandler::new();
+        let handler = QueryHandler::new(11);
         let cbor = encode_genesis_config_query();
         let result = handler.handle_query_cbor_versioned(&cbor, 16);
         match result {
@@ -1452,7 +1528,7 @@ mod tests {
 
     #[test]
     fn test_genesis_config_version_threaded_v21() {
-        let handler = QueryHandler::new();
+        let handler = QueryHandler::new(11);
         let cbor = encode_genesis_config_query();
         let result = handler.handle_query_cbor_versioned(&cbor, 21);
         match result {
@@ -1470,7 +1546,7 @@ mod tests {
     /// passes version 0, selecting the fallback (legacy) encoding.
     #[test]
     fn test_genesis_config_version_unversioned_uses_zero() {
-        let handler = QueryHandler::new();
+        let handler = QueryHandler::new(11);
         let cbor = encode_genesis_config_query();
         let result = handler.handle_query_cbor(&cbor);
         match result {
@@ -1486,7 +1562,7 @@ mod tests {
     fn test_trait_handle_block_query() {
         use dugite_network::QueryHandler as TraitQueryHandler;
 
-        let handler = super::QueryHandler::new();
+        let handler = super::QueryHandler::new(11);
         // Tag 1 = GetEpochNo (no params needed)
         let result = handler.handle_block_query(1, &[]);
         assert!(result.is_ok());
@@ -1500,7 +1576,7 @@ mod tests {
     fn test_trait_handle_query_hard_fork() {
         use dugite_network::QueryHandler as TraitQueryHandler;
 
-        let handler = super::QueryHandler::new();
+        let handler = super::QueryHandler::new(11);
         // Sub-tag 1 = GetCurrentEra, encoded as [1]
         let mut buf = Vec::new();
         let mut enc = minicbor::Encoder::new(&mut buf);

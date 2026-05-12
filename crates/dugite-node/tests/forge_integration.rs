@@ -410,7 +410,7 @@ fn test_opcert_counter_tracking() {
     // Build a praos engine in strict mode.
     // snapshots_established = false: VRF leader eligibility is non-fatal
     // (we don't have real stake snapshots — only the counter matters here).
-    let mut praos = OuroborosPraos::new();
+    let mut praos = OuroborosPraos::new(11);
     praos.set_strict_verification(true);
     praos.snapshots_established = false; // keeps leader eligibility non-fatal
 
