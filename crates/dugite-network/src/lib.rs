@@ -264,6 +264,27 @@ pub enum TxValidationError {
         credential: String,
     },
     ValueOverflow,
+    /// Conway PV >= 11 `ConwayWithdrawalsMissingAccounts` (Ledger tag 8).
+    ///
+    /// One or more withdrawals reference a reward account that is not
+    /// registered (or is on the wrong network). Payload mirrors the Haskell
+    /// `Withdrawals` newtype, a map from reward-account-bytes (hex) to the
+    /// supplied coin amount.
+    WithdrawalsMissingAccounts {
+        /// `(reward_account_hex, supplied_coin)` per missing account.
+        missing: Vec<(String, u64)>,
+    },
+    /// Conway PV >= 11 `ConwayIncompleteWithdrawals` (Ledger tag 9).
+    ///
+    /// Withdrawals exist but their supplied amount does not equal the
+    /// registered reward-account balance. Payload mirrors the Haskell
+    /// `NonEmptyMap RewardAccount (Mismatch 'RelEQ Coin)` where each
+    /// mismatch encodes on the wire as `[supplied, expected]`.
+    IncompleteWithdrawals {
+        /// `(reward_account_hex, supplied_coin, expected_balance)` per
+        /// mismatched withdrawal.
+        mismatches: Vec<(String, u64, u64)>,
+    },
     /// Multiple validation errors collected.
     Multiple(Vec<TxValidationError>),
     /// Catch-all for other validation failures.

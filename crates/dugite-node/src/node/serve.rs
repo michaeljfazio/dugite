@@ -526,12 +526,16 @@ pub(crate) fn convert_validation_error(
         VE::WithdrawalsNotInRewardsCERTS { bad } => TxValidationError::ScriptFailed {
             reason: format!("WithdrawalsNotInRewardsCERTS: {bad:?}"),
         },
-        VE::ConwayWithdrawalsMissingAccounts { missing } => TxValidationError::ScriptFailed {
-            reason: format!("ConwayWithdrawalsMissingAccounts: {missing:?}"),
-        },
-        VE::ConwayIncompleteWithdrawals { incomplete } => TxValidationError::ScriptFailed {
-            reason: format!("ConwayIncompleteWithdrawals: {incomplete:?}"),
-        },
+        VE::ConwayWithdrawalsMissingAccounts { missing } => {
+            TxValidationError::WithdrawalsMissingAccounts {
+                missing: missing.clone(),
+            }
+        }
+        VE::ConwayIncompleteWithdrawals { incomplete } => {
+            TxValidationError::IncompleteWithdrawals {
+                mismatches: incomplete.clone(),
+            }
+        }
         VE::PoolRetirementTooLate {
             retirement_epoch,
             current_epoch,

@@ -362,6 +362,43 @@ fn encode_conway_ledger_pred_failure(enc: &mut Encoder<&mut Vec<u8>>, err: &TxVa
         // Note: This variant currently maps to ScriptFailed in serve.rs, so it won't
         // reach here. But if TxValidationError is extended, this handles it.
 
+        // Ledger tag 8: ConwayWithdrawalsMissingAccounts(Withdrawals)
+        // Wire shape: array(2)[8, { reward_account_bytes => coin, ... }]
+        // `Withdrawals` is a newtype around `Map RewardAccount Coin`, which
+        // EncCBOR encodes as a definite-length CBOR map.
+        TxValidationError::WithdrawalsMissingAccounts { missing } => {
+            enc.array(2).expect("infallible");
+            enc.u8(8).expect("infallible");
+            enc.map(missing.len() as u64).expect("infallible");
+            for (addr_hex, coin) in missing {
+                match parse_hex_bytes(addr_hex) {
+                    Some(bytes) => enc.bytes(&bytes).expect("infallible"),
+                    None => enc.bytes(addr_hex.as_bytes()).expect("infallible"),
+                };
+                enc.u64(*coin).expect("infallible");
+            }
+        }
+
+        // Ledger tag 9: ConwayIncompleteWithdrawals(NonEmptyMap RewardAccount (Mismatch 'RelEQ Coin))
+        // Wire shape: array(2)[9, { reward_account_bytes => [supplied_coin, expected_coin], ... }]
+        // `Mismatch` EncCBOR encodes as `array(2)[supplied, expected]` (NOT
+        // swapped — the field-swap on tag 5 ConwayTreasuryValueMismatch is a
+        // separate Haskell-level bug in how the constructor is wired).
+        TxValidationError::IncompleteWithdrawals { mismatches } => {
+            enc.array(2).expect("infallible");
+            enc.u8(9).expect("infallible");
+            enc.map(mismatches.len() as u64).expect("infallible");
+            for (addr_hex, supplied, expected) in mismatches {
+                match parse_hex_bytes(addr_hex) {
+                    Some(bytes) => enc.bytes(&bytes).expect("infallible"),
+                    None => enc.bytes(addr_hex.as_bytes()).expect("infallible"),
+                };
+                enc.array(2).expect("infallible");
+                enc.u64(*supplied).expect("infallible");
+                enc.u64(*expected).expect("infallible");
+            }
+        }
+
         // ── Fallback for all unmapped variants ──
         // ConwayMempoolFailure (Ledger tag 7): [7, "descriptive text"]
         _ => {
@@ -1105,5 +1142,134 @@ mod tests {
         let actual_fee = dec.u64().unwrap();
         assert_eq!(min_fee, 200_000);
         assert_eq!(actual_fee, 170_000);
+    }
+
+    // ── Issue #457: Conway Ledger pred failure tags 8 / 9 ──
+
+    /// CBOR golden: `ConwayWithdrawalsMissingAccounts` (Ledger tag 8).
+    ///
+    /// Wire shape: `array(2)[8, { reward_account_bytes => coin, ... }]`
+    /// wrapped in the standard `array(1)[ array(2)[era_id, [failure]] ]`
+    /// HFC envelope.
+    #[test]
+    fn test_encode_withdrawals_missing_accounts_golden() {
+        // 29-byte reward account: header 0xe0 (stake key, mainnet) + 28-byte hash 0x11..
+        let addr_bytes: Vec<u8> = std::iter::once(0xe0)
+            .chain(std::iter::repeat_n(0x11, 28))
+            .collect();
+        let addr_hex = hex::encode(&addr_bytes);
+        let err = TxValidationError::WithdrawalsMissingAccounts {
+            missing: vec![(addr_hex.clone(), 1_000_000)],
+        };
+        let bytes = encode_apply_tx_err(&err, 6);
+
+        let (era, n) = decode_outer(&bytes);
+        assert_eq!(era, 6);
+        assert_eq!(n, 1);
+
+        let mut dec = Decoder::new(&bytes);
+        let _ = dec.array().unwrap();
+        let _ = dec.array().unwrap();
+        let _ = dec.u16().unwrap();
+        let _ = dec.array().unwrap();
+
+        let ledger_tag = decode_ledger_tag(&mut dec);
+        assert_eq!(ledger_tag, 8, "expected ConwayWithdrawalsMissingAccounts");
+
+        let map_len = dec.map().unwrap().unwrap();
+        assert_eq!(map_len, 1);
+        let addr = dec.bytes().unwrap();
+        assert_eq!(addr, addr_bytes.as_slice());
+        let coin = dec.u64().unwrap();
+        assert_eq!(coin, 1_000_000);
+    }
+
+    /// CBOR golden: `ConwayIncompleteWithdrawals` (Ledger tag 9).
+    ///
+    /// Wire shape: `array(2)[9, { reward_account_bytes => array(2)[supplied, expected], ... }]`.
+    /// Field order on the wire for `Mismatch 'RelEQ Coin` is `[supplied, expected]`
+    /// per `EncCBOR` instance in `cardano-ledger-core:Cardano.Ledger.BaseTypes`.
+    #[test]
+    fn test_encode_incomplete_withdrawals_golden() {
+        let addr_bytes: Vec<u8> = std::iter::once(0xe0)
+            .chain(std::iter::repeat_n(0x22, 28))
+            .collect();
+        let addr_hex = hex::encode(&addr_bytes);
+        let err = TxValidationError::IncompleteWithdrawals {
+            mismatches: vec![(addr_hex.clone(), 500_000, 750_000)],
+        };
+        let bytes = encode_apply_tx_err(&err, 6);
+
+        let mut dec = Decoder::new(&bytes);
+        let _ = dec.array().unwrap();
+        let _ = dec.array().unwrap();
+        let _ = dec.u16().unwrap();
+        let _ = dec.array().unwrap();
+
+        let ledger_tag = decode_ledger_tag(&mut dec);
+        assert_eq!(ledger_tag, 9, "expected ConwayIncompleteWithdrawals");
+
+        let map_len = dec.map().unwrap().unwrap();
+        assert_eq!(map_len, 1);
+        let addr = dec.bytes().unwrap();
+        assert_eq!(addr, addr_bytes.as_slice());
+        let _ = dec.array().unwrap();
+        let supplied = dec.u64().unwrap();
+        let expected = dec.u64().unwrap();
+        assert_eq!(supplied, 500_000, "Mismatch wire order: supplied first");
+        assert_eq!(expected, 750_000, "Mismatch wire order: expected second");
+    }
+
+    /// Round-trip: encode tag 8 → decode via the n2c_client decoder used
+    /// by `cardano-cli`. The decoded reason must name the variant and
+    /// include the missing account bytes.
+    #[test]
+    fn test_roundtrip_tag8_through_n2c_decoder() {
+        let addr_bytes: Vec<u8> = std::iter::once(0xe0)
+            .chain(std::iter::repeat_n(0x33, 28))
+            .collect();
+        let addr_hex = hex::encode(&addr_bytes);
+        let err = TxValidationError::WithdrawalsMissingAccounts {
+            missing: vec![(addr_hex.clone(), 42)],
+        };
+        let bytes = encode_apply_tx_err(&err, 6);
+
+        let mut dec = Decoder::new(&bytes);
+        let reason = crate::n2c_client::decode_reject_reason(&mut dec).unwrap();
+        assert!(
+            reason.contains("ConwayWithdrawalsMissingAccounts"),
+            "decoded reason should name variant, got: {reason}"
+        );
+        assert!(reason.contains(&addr_hex), "should include addr: {reason}");
+        assert!(reason.contains("42"), "should include coin: {reason}");
+    }
+
+    /// Round-trip: encode tag 9 → decode via n2c_client. Decoded reason
+    /// must include `supplied=` and `expected=` in the correct order.
+    #[test]
+    fn test_roundtrip_tag9_through_n2c_decoder() {
+        let addr_bytes: Vec<u8> = std::iter::once(0xe0)
+            .chain(std::iter::repeat_n(0x44, 28))
+            .collect();
+        let addr_hex = hex::encode(&addr_bytes);
+        let err = TxValidationError::IncompleteWithdrawals {
+            mismatches: vec![(addr_hex.clone(), 111, 222)],
+        };
+        let bytes = encode_apply_tx_err(&err, 6);
+
+        let mut dec = Decoder::new(&bytes);
+        let reason = crate::n2c_client::decode_reject_reason(&mut dec).unwrap();
+        assert!(
+            reason.contains("ConwayIncompleteWithdrawals"),
+            "decoded reason should name variant, got: {reason}"
+        );
+        assert!(
+            reason.contains("supplied=111"),
+            "supplied not 111: {reason}"
+        );
+        assert!(
+            reason.contains("expected=222"),
+            "expected not 222: {reason}"
+        );
     }
 }
