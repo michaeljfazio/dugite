@@ -1008,6 +1008,38 @@ mod tests {
         assert_eq!(rupd.delta_reserves, 0);
     }
 
+    /// Regression scaffold for GitHub issue #438 (preview epoch 1268 leader
+    /// reward 3,505 lovelace too high).
+    ///
+    /// Koios oracle (preview, account
+    /// stake_test1uz7xx6hy2xnnrmz0av0xl7qn9vdkhage7myf0nd49e7mvcg6z0smn,
+    /// pool14rn9dq87dgj2z8g3lp4n0a78fewxff3gkgjkmz72ew44ym79xpp):
+    ///
+    ///   earned_epoch=1268 spendable_epoch=1270 leader_reward = 352_901_742
+    ///
+    /// Dugite at that boundary computed 352_905_247 (diff = +3505). This
+    /// scaffold pins the known leader reward; a follow-up patch must load a
+    /// real GO snapshot + bprev counts for epoch 1268 and feed them through
+    /// `compute_reward_update` to assert byte-equality. Marked `#[ignore]`
+    /// because the snapshot file is not yet checked into the repo.
+    #[test]
+    #[ignore = "needs preview epoch 1268 GO snapshot fixture — see #438"]
+    fn test_koios_preview_epoch_1268_leader_reward_issue_438() {
+        // Canonical Koios oracle values for the regression target.
+        let expected_leader_reward: u64 = 352_901_742;
+        let cost: u64 = 340_000_000; // pool14rn9dq... fixed cost
+        let margin_num: i128 = 1; // 5%
+        let margin_den: i128 = 20;
+
+        // Placeholder — to be loaded from a checked-in snapshot fixture.
+        // Once the fixture exists, the test should:
+        //   1. Load GO snapshot + bprev_blocks_by_pool from epoch 1267.
+        //   2. Load prev_protocol_params and prev_d from end of epoch 1267.
+        //   3. Call compute_reward_update(...).
+        //   4. Assert rupd.rewards[owner_cred] == expected_leader_reward.
+        let _ = (expected_leader_reward, cost, margin_num, margin_den);
+    }
+
     #[test]
     fn test_sigma_uses_circulation_not_active_stake() {
         let pool_stake: u64 = 4_733_011_000_060;
