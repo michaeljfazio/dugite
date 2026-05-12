@@ -240,6 +240,49 @@ pub(super) fn check_pparam_update_well_formed(
             if params.protocol_version_major >= 11 && ppu.n_opt == Some(0) {
                 reasons.push("nOpt=0");
             }
+
+            // Strict CostModels structural validation — PV >= 11.
+            //
+            // Mirrors Haskell `validateCostModelsParamsUpdate` (cardano-ledger
+            // 10.7 / pallas-validate PR #755): under PV >= 11 every present
+            // language's cost vector must have at least the language's
+            // minimum parameter count. Pre-PV11 behaviour is unchanged so
+            // historical mainnet/preview blocks replay cleanly.
+            //
+            // Per-language minimums (per Plutus core builtinCostModel.json
+            // and `Plutus.Core.CostModelInterface`):
+            //   PlutusV1: 166
+            //   PlutusV2: 175
+            //   PlutusV3: 251  (mainnet PV11 currently ships 297 — the
+            //                  strict rule is a *minimum*, not equality, so
+            //                  future builtin extensions remain accepted.)
+            //
+            // Plutus cost-model entries are encoded as `i64` in our
+            // primitives, so the "all entries must be Int" Haskell check is
+            // intrinsic to the type system here; only length is enforced.
+            if params.protocol_version_major >= 11 {
+                if let Some(ref cm) = ppu.cost_models {
+                    const V1_MIN: usize = 166;
+                    const V2_MIN: usize = 175;
+                    const V3_MIN: usize = 251;
+                    if let Some(v1) = &cm.plutus_v1 {
+                        if v1.len() < V1_MIN {
+                            reasons.push("cost_models[PlutusV1] too short");
+                        }
+                    }
+                    if let Some(v2) = &cm.plutus_v2 {
+                        if v2.len() < V2_MIN {
+                            reasons.push("cost_models[PlutusV2] too short");
+                        }
+                    }
+                    if let Some(v3) = &cm.plutus_v3 {
+                        if v3.len() < V3_MIN {
+                            reasons.push("cost_models[PlutusV3] too short");
+                        }
+                    }
+                }
+            }
+
             // Empty update check — all Option fields are None
             let is_empty = ppu.min_fee_a.is_none()
                 && ppu.min_fee_b.is_none()
@@ -1395,6 +1438,132 @@ mod tests {
             errors.is_empty(),
             "Non-ParameterChange proposals should not trigger ppuWellFormed check, got: {:?}",
             errors
+        );
+    }
+
+    // ---------------------------------------------------------------------------
+    // check_pparam_update_well_formed — strict CostModels validation (PV >= 11,
+    // issue #464 / Haskell `validateCostModelsParamsUpdate`).
+    // ---------------------------------------------------------------------------
+
+    fn cost_models_proposal_body(
+        cm: dugite_primitives::transaction::CostModels,
+    ) -> TransactionBody {
+        make_body_full(
+            vec![],
+            BTreeMap::new(),
+            vec![ProposalProcedure {
+                deposit: Lovelace(0),
+                return_addr: vec![0xe0; 29],
+                gov_action: GovAction::ParameterChange {
+                    prev_action_id: None,
+                    protocol_param_update: Box::new(
+                        dugite_primitives::transaction::ProtocolParamUpdate {
+                            cost_models: Some(cm),
+                            ..Default::default()
+                        },
+                    ),
+                    policy_hash: None,
+                },
+                anchor: Anchor {
+                    url: String::new(),
+                    data_hash: Hash32::from_bytes([0u8; 32]),
+                },
+            }],
+        )
+    }
+
+    #[test]
+    fn test_cost_models_pv10_accepts_loose_update() {
+        // Pre-PV11: strict structural validation must NOT apply — a tiny
+        // 5-entry V2 vector is benign at PV10 to preserve historical-block
+        // replay compatibility.
+        let mut params = ProtocolParameters::mainnet_defaults();
+        params.protocol_version_major = 10;
+        let body = cost_models_proposal_body(dugite_primitives::transaction::CostModels {
+            plutus_v1: None,
+            plutus_v2: Some(vec![100; 5]),
+            plutus_v3: None,
+        });
+        let mut errors = Vec::new();
+        check_pparam_update_well_formed(&params, &body, &mut errors);
+        assert!(
+            errors.is_empty(),
+            "PV10 must accept loose cost_models update, got: {errors:?}",
+        );
+    }
+
+    #[test]
+    fn test_cost_models_pv11_rejects_short_v1() {
+        let mut params = ProtocolParameters::mainnet_defaults();
+        params.protocol_version_major = 11;
+        let body = cost_models_proposal_body(dugite_primitives::transaction::CostModels {
+            plutus_v1: Some(vec![100; 1]),
+            plutus_v2: None,
+            plutus_v3: None,
+        });
+        let mut errors = Vec::new();
+        check_pparam_update_well_formed(&params, &body, &mut errors);
+        assert_eq!(errors.len(), 1);
+        assert!(
+            matches!(&errors[0], ValidationError::MalformedProposal { reason }
+                if reason.contains("cost_models[PlutusV1] too short")),
+            "PV11 must reject short V1 vector, got: {errors:?}",
+        );
+    }
+
+    #[test]
+    fn test_cost_models_pv11_rejects_short_v2() {
+        let mut params = ProtocolParameters::mainnet_defaults();
+        params.protocol_version_major = 11;
+        let body = cost_models_proposal_body(dugite_primitives::transaction::CostModels {
+            plutus_v1: None,
+            plutus_v2: Some(vec![100; 100]),
+            plutus_v3: None,
+        });
+        let mut errors = Vec::new();
+        check_pparam_update_well_formed(&params, &body, &mut errors);
+        assert_eq!(errors.len(), 1);
+        assert!(
+            matches!(&errors[0], ValidationError::MalformedProposal { reason }
+                if reason.contains("cost_models[PlutusV2] too short")),
+            "PV11 must reject short V2 vector, got: {errors:?}",
+        );
+    }
+
+    #[test]
+    fn test_cost_models_pv11_rejects_short_v3() {
+        let mut params = ProtocolParameters::mainnet_defaults();
+        params.protocol_version_major = 11;
+        let body = cost_models_proposal_body(dugite_primitives::transaction::CostModels {
+            plutus_v1: None,
+            plutus_v2: None,
+            plutus_v3: Some(vec![100; 250]),
+        });
+        let mut errors = Vec::new();
+        check_pparam_update_well_formed(&params, &body, &mut errors);
+        assert_eq!(errors.len(), 1);
+        assert!(
+            matches!(&errors[0], ValidationError::MalformedProposal { reason }
+                if reason.contains("cost_models[PlutusV3] too short")),
+            "PV11 must reject short V3 vector, got: {errors:?}",
+        );
+    }
+
+    #[test]
+    fn test_cost_models_pv11_accepts_correct_lengths() {
+        let mut params = ProtocolParameters::mainnet_defaults();
+        params.protocol_version_major = 11;
+        let body = cost_models_proposal_body(dugite_primitives::transaction::CostModels {
+            plutus_v1: Some(vec![100; 166]),
+            plutus_v2: Some(vec![100; 175]),
+            plutus_v3: Some(vec![100; 297]),
+        });
+        let mut errors = Vec::new();
+        check_pparam_update_well_formed(&params, &body, &mut errors);
+        assert!(
+            errors.is_empty(),
+            "PV11 must accept correctly sized cost_models update, got: {errors:?}",
         );
     }
 
