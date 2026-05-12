@@ -16242,3 +16242,56 @@ fn test_clone_without_utxos_preserves_scalar_fees() {
     assert_eq!(cloned.utxo.epoch_fees, Lovelace(5_000_000));
     assert_eq!(cloned.utxo.pending_donations, Lovelace(100));
 }
+
+// ────────────────────────────────────────────────────────────────────────────
+// Issue #335 regression: Mithril ancillary snapshot import must restore the
+// live protocol parameters (protocol_version_major, min_pool_cost, …) into
+// the resulting LedgerState.  Without this guarantee, `query
+// protocol-parameters` returns Conway-genesis defaults instead of the values
+// in force at the imported tip.
+// ────────────────────────────────────────────────────────────────────────────
+#[test]
+fn test_from_haskell_snapshot_restores_live_pparams_issue_335() {
+    // Build a synthetic Haskell snapshot whose `cur_pparams` carry the
+    // post-genesis values for protocol_version and min_pool_cost (the two
+    // fields explicitly called out by issue #335 on preview).
+    let mut cur = ProtocolParameters::mainnet_defaults();
+    cur.protocol_version_major = 10;
+    cur.protocol_version_minor = 0;
+    cur.min_pool_cost = Lovelace(170_000_000);
+    cur.min_fee_a = 44;
+    cur.min_fee_b = 155_381;
+
+    let mut prev = ProtocolParameters::mainnet_defaults();
+    prev.protocol_version_major = 9;
+    prev.min_pool_cost = Lovelace(340_000_000);
+
+    let hs = dugite_serialization::haskell_snapshot::minimal_haskell_state_for_test(
+        cur.clone(),
+        prev.clone(),
+    );
+
+    let state = LedgerState::from_haskell_snapshot(&hs);
+
+    // Live PParams must be the ones from the imported snapshot — NOT genesis
+    // defaults (which would be protocol 6 / min_pool_cost 340M on preview).
+    assert_eq!(
+        state.epochs.protocol_params.protocol_version_major, 10,
+        "protocol_version_major must come from Haskell snapshot, not genesis"
+    );
+    assert_eq!(
+        state.epochs.protocol_params.min_pool_cost,
+        Lovelace(170_000_000),
+        "min_pool_cost must come from Haskell snapshot, not genesis"
+    );
+    assert_eq!(state.epochs.protocol_params.min_fee_a, 44);
+    assert_eq!(state.epochs.protocol_params.min_fee_b, 155_381);
+
+    // Previous PParams round-trip too (used by RUPD and governance ratification).
+    assert_eq!(state.epochs.prev_protocol_params.protocol_version_major, 9);
+    assert_eq!(state.epochs.prev_protocol_version_major, 9);
+    assert_eq!(
+        state.epochs.prev_protocol_params.min_pool_cost,
+        Lovelace(340_000_000)
+    );
+}

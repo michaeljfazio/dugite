@@ -204,6 +204,7 @@ pub async fn import_snapshot(
     temp_dir: Option<&Path>,
     genesis_vkey_override: Option<&str>,
     skip_verification: bool,
+    allow_stale_pparams: bool,
 ) -> Result<()> {
     let aggregator = aggregator_url(network_magic);
     info!(aggregator = %aggregator, "Fetching latest Mithril snapshot");
@@ -475,11 +476,28 @@ pub async fn import_snapshot(
             }
         }
         Err(e) => {
-            // Non-fatal: the node can still sync from genesis, just slower.
-            warn!(
-                error = %e,
-                "Ancillary download failed — node will fall back to full block replay"
-            );
+            // Without the ancillary archive there is no live ledger state to
+            // restore, which means the node would fall back to genesis-default
+            // protocol parameters at the imported tip (issue #335: stale
+            // protocol_version_major, min_pool_cost, …).  Surface this as a
+            // hard error unless the caller opted in to the stale-PParams path.
+            if allow_stale_pparams {
+                warn!(
+                    error = %e,
+                    "Ancillary download failed — proceeding with genesis-default \
+                     protocol parameters because --allow-stale-pparams was set. \
+                     Querying protocol-parameters will return stale values until \
+                     the chain is replayed from genesis."
+                );
+            } else {
+                return Err(anyhow::anyhow!(
+                    "Ancillary download failed: {e:#}. Without the ancillary \
+                     archive the imported ledger state would use genesis-default \
+                     protocol parameters (issue #335). Re-run with \
+                     --allow-stale-pparams to override (NOT recommended for \
+                     production)."
+                ));
+            }
         }
     }
 
