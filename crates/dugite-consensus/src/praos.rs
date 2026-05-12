@@ -206,7 +206,16 @@ pub struct OuroborosPraos {
 }
 
 impl OuroborosPraos {
-    pub fn new() -> Self {
+    /// Construct a Praos engine with mainnet defaults except for the protocol
+    /// envelope, which the caller must supply.
+    ///
+    /// The `max_major_prot_ver` argument is the highest on-chain major protocol
+    /// version this node will accept in block headers (Haskell's
+    /// `MaxMajorProtVer`). It must be derived from the running node's
+    /// configuration — there is intentionally no default, because letting the
+    /// envelope drift behind the active era silently caps validation at a stale
+    /// protocol version (see issue #463).
+    pub fn new(max_major_prot_ver: u64) -> Self {
         let rational = dugite_primitives::protocol_params::f64_to_rational(ACTIVE_SLOT_COEFF);
         OuroborosPraos {
             active_slot_coeff: ACTIVE_SLOT_COEFF,
@@ -219,7 +228,7 @@ impl OuroborosPraos {
             strict_verification: false,
             snapshots_established: false,
             checkpoints: HashMap::new(),
-            max_major_prot_ver: crate::NODE_PROTOCOL_VERSION.0,
+            max_major_prot_ver,
             opcert_counters: HashMap::new(),
         }
     }
@@ -1570,18 +1579,36 @@ pub fn validate_block_body_hash(
     Ok(())
 }
 
-impl Default for OuroborosPraos {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use dugite_primitives::block::Point;
     use dugite_primitives::hash::Hash32;
     use dugite_primitives::time::{BlockNo, SlotNo};
+
+    /// Regression for issue #463: `OuroborosPraos::new()` must accept the
+    /// max-major-protocol-version explicitly and store the exact value the
+    /// caller passed. Prior to the fix, the constructor read a stale
+    /// `NODE_PROTOCOL_VERSION` constant (10) regardless of what the running
+    /// configuration declared, capping header validation at PV10.
+    #[test]
+    fn new_records_caller_supplied_max_major_prot_ver_pv11() {
+        let praos = OuroborosPraos::new(11);
+        assert_eq!(
+            praos.max_major_prot_ver, 11,
+            "OuroborosPraos::new(11) must store max_major_prot_ver=11",
+        );
+    }
+
+    #[test]
+    fn new_records_caller_supplied_max_major_prot_ver_pv12() {
+        let praos = OuroborosPraos::new(12);
+        assert_eq!(
+            praos.max_major_prot_ver, 12,
+            "OuroborosPraos::new(12) must store max_major_prot_ver=12 \
+             (experimental_hard_forks_enabled path)",
+        );
+    }
 
     /// Create a dummy BlockIssuerInfo for the given header's VRF key
     fn make_issuer_info(header: &BlockHeader) -> BlockIssuerInfo {
@@ -1623,7 +1650,7 @@ mod tests {
 
     #[test]
     fn test_new_praos() {
-        let praos = OuroborosPraos::new();
+        let praos = OuroborosPraos::new(11);
         assert_eq!(praos.tip, Tip::origin());
         assert!((praos.active_slot_coeff - 0.05).abs() < f64::EPSILON);
         assert_eq!(praos.security_param, 2160);
@@ -1631,14 +1658,14 @@ mod tests {
 
     #[test]
     fn test_stability_window() {
-        let praos = OuroborosPraos::new();
+        let praos = OuroborosPraos::new(11);
         // 3 * 2160 / 0.05 = 129600
         assert_eq!(praos.stability_window(), 129600);
     }
 
     #[test]
     fn test_slot_to_epoch() {
-        let praos = OuroborosPraos::new();
+        let praos = OuroborosPraos::new(11);
         assert_eq!(praos.slot_to_epoch(SlotNo(0)), EpochNo(0));
         assert_eq!(praos.slot_to_epoch(SlotNo(431999)), EpochNo(0));
         assert_eq!(praos.slot_to_epoch(SlotNo(432000)), EpochNo(1));
@@ -1647,14 +1674,14 @@ mod tests {
 
     #[test]
     fn test_epoch_first_slot() {
-        let praos = OuroborosPraos::new();
+        let praos = OuroborosPraos::new(11);
         assert_eq!(praos.epoch_first_slot(EpochNo(0)), SlotNo(0));
         assert_eq!(praos.epoch_first_slot(EpochNo(1)), SlotNo(432000));
     }
 
     #[test]
     fn test_epoch_boundary() {
-        let praos = OuroborosPraos::new();
+        let praos = OuroborosPraos::new(11);
         assert!(praos.is_epoch_boundary(SlotNo(0)));
         assert!(praos.is_epoch_boundary(SlotNo(432000)));
         assert!(!praos.is_epoch_boundary(SlotNo(1)));
@@ -1662,13 +1689,13 @@ mod tests {
 
     #[test]
     fn test_max_rollback() {
-        let praos = OuroborosPraos::new();
+        let praos = OuroborosPraos::new(11);
         assert_eq!(praos.max_rollback(), 2160);
     }
 
     #[test]
     fn test_future_block_rejected() {
-        let praos = OuroborosPraos::new();
+        let praos = OuroborosPraos::new(11);
         let header = make_valid_header(200);
         let result = praos.validate_header(&header, SlotNo(100), ValidationMode::Full, Some(9));
         assert!(matches!(result, Err(ConsensusError::FutureBlock { .. })));
@@ -1676,7 +1703,7 @@ mod tests {
 
     #[test]
     fn test_valid_header() {
-        let praos = OuroborosPraos::new();
+        let praos = OuroborosPraos::new(11);
         let header = make_valid_header(100);
         let result = praos.validate_header(&header, SlotNo(200), ValidationMode::Full, Some(9));
         assert!(result.is_ok());
@@ -1684,7 +1711,7 @@ mod tests {
 
     #[test]
     fn test_empty_issuer_vkey_rejected() {
-        let praos = OuroborosPraos::new();
+        let praos = OuroborosPraos::new(11);
         let mut header = make_valid_header(100);
         header.issuer_vkey = vec![];
         let result = praos.validate_header(&header, SlotNo(200), ValidationMode::Full, Some(9));
@@ -1693,7 +1720,7 @@ mod tests {
 
     #[test]
     fn test_empty_vrf_key_rejected() {
-        let praos = OuroborosPraos::new();
+        let praos = OuroborosPraos::new(11);
         let mut header = make_valid_header(100);
         header.vrf_vkey = vec![];
         let result = praos.validate_header(&header, SlotNo(200), ValidationMode::Full, Some(9));
@@ -1704,7 +1731,7 @@ mod tests {
     fn test_vrf_verification_non_fatal() {
         // VRF verification with dummy data should not reject during sync
         // (it's non-fatal since we may not have the correct epoch nonce)
-        let praos = OuroborosPraos::new();
+        let praos = OuroborosPraos::new(11);
         let header = make_valid_header(100);
         // With dummy VRF key/proof, verification should pass (non-fatal mode)
         let result = praos.validate_header(&header, SlotNo(200), ValidationMode::Full, Some(9));
@@ -1713,7 +1740,7 @@ mod tests {
 
     #[test]
     fn test_kes_period_validation() {
-        let praos = OuroborosPraos::new();
+        let praos = OuroborosPraos::new(11);
         // Block at slot 200,000 is in KES period 1 (200000 / 129600 = 1)
         let mut header = make_valid_header(200_000);
         // Set cert KES period to 1 (matches)
@@ -1725,7 +1752,7 @@ mod tests {
 
     #[test]
     fn test_kes_period_before_cert_rejected() {
-        let praos = OuroborosPraos::new();
+        let praos = OuroborosPraos::new(11);
         let mut header = make_valid_header(100);
         // Block at slot 100 is in KES period 0, but cert says period 5
         header.operational_cert.kes_period = 5;
@@ -1738,7 +1765,7 @@ mod tests {
 
     #[test]
     fn test_kes_expired_rejected() {
-        let praos = OuroborosPraos::new();
+        let praos = OuroborosPraos::new(11);
         // Block at slot 129600 * 63 = 8,164,800 (KES period 63)
         let slot = KES_PERIOD_SLOTS * 63;
         let mut header = make_valid_header(slot);
@@ -1751,7 +1778,7 @@ mod tests {
 
     #[test]
     fn test_kes_at_max_evolution_ok() {
-        let praos = OuroborosPraos::new();
+        let praos = OuroborosPraos::new(11);
         // 61 evolutions (0..61) should be OK (< MAX_KES_EVOLUTIONS which is 62)
         let slot = KES_PERIOD_SLOTS * 61;
         let mut header = make_valid_header(slot);
@@ -1763,7 +1790,7 @@ mod tests {
 
     #[test]
     fn test_empty_opcert_hot_vkey_rejected() {
-        let praos = OuroborosPraos::new();
+        let praos = OuroborosPraos::new(11);
         let mut header = make_valid_header(100);
         header.operational_cert.hot_vkey = vec![];
         let result = praos.validate_header(&header, SlotNo(200), ValidationMode::Full, Some(9));
@@ -1775,7 +1802,7 @@ mod tests {
 
     #[test]
     fn test_empty_opcert_sigma_rejected() {
-        let praos = OuroborosPraos::new();
+        let praos = OuroborosPraos::new(11);
         let mut header = make_valid_header(100);
         header.operational_cert.sigma = vec![];
         let result = praos.validate_header(&header, SlotNo(200), ValidationMode::Full, Some(9));
@@ -1787,7 +1814,7 @@ mod tests {
 
     #[test]
     fn test_64_byte_vrf_output_valid() {
-        let praos = OuroborosPraos::new();
+        let praos = OuroborosPraos::new(11);
         let mut header = make_valid_header(100);
         header.vrf_result.output = vec![0u8; 64]; // TPraos compatibility
         assert!(praos
@@ -1877,7 +1904,7 @@ mod tests {
 
     #[test]
     fn test_strict_verification_mode() {
-        let mut praos = OuroborosPraos::new();
+        let mut praos = OuroborosPraos::new(11);
         assert!(!praos.strict_verification);
 
         // In non-strict mode, dummy VRF should pass (non-fatal)
@@ -1908,7 +1935,7 @@ mod tests {
     fn test_validate_header_full_without_issuer_info() {
         // Without issuer info, validate_header_full behaves like validate_header
         // plus opcert counter tracking
-        let mut praos = OuroborosPraos::new();
+        let mut praos = OuroborosPraos::new(11);
         let header = make_valid_header(100);
         assert!(praos
             .validate_header_full(
@@ -1925,7 +1952,7 @@ mod tests {
 
     #[test]
     fn test_vrf_key_binding_mismatch_strict() {
-        let mut praos = OuroborosPraos::new();
+        let mut praos = OuroborosPraos::new(11);
         praos.set_strict_verification(true);
 
         let header = make_valid_header(100);
@@ -1954,7 +1981,7 @@ mod tests {
 
     #[test]
     fn test_vrf_key_binding_mismatch_non_strict() {
-        let mut praos = OuroborosPraos::new();
+        let mut praos = OuroborosPraos::new(11);
         // Non-strict: VRF key mismatch should be non-fatal
         let header = make_valid_header(100);
         let wrong_hash = Hash32::from_bytes([99u8; 32]);
@@ -1979,7 +2006,7 @@ mod tests {
 
     #[test]
     fn test_vrf_key_binding_correct() {
-        let mut praos = OuroborosPraos::new();
+        let mut praos = OuroborosPraos::new(11);
         praos.set_strict_verification(true);
 
         let header = make_valid_header(100);
@@ -2011,7 +2038,7 @@ mod tests {
 
     #[test]
     fn test_opcert_counter_tracking() {
-        let mut praos = OuroborosPraos::new();
+        let mut praos = OuroborosPraos::new(11);
 
         // First block from pool A with seq=5
         let mut header1 = make_valid_header(100);
@@ -2061,7 +2088,7 @@ mod tests {
 
     #[test]
     fn test_opcert_counter_regression_strict() {
-        let mut praos = OuroborosPraos::new();
+        let mut praos = OuroborosPraos::new(11);
 
         // First block with seq=5
         let mut header1 = make_valid_header(100);
@@ -2110,7 +2137,7 @@ mod tests {
     #[test]
     fn test_opcert_counter_same_value_ok() {
         // Non-strict mode: opcert counter is still tracked, VRF proof failures are non-fatal
-        let mut praos = OuroborosPraos::new();
+        let mut praos = OuroborosPraos::new(11);
 
         // First block with seq=5
         let mut header1 = make_valid_header(100);
@@ -2150,7 +2177,7 @@ mod tests {
     #[test]
     fn test_opcert_counter_different_pools() {
         // Non-strict mode for VRF, but opcert counters are tracked per pool
-        let mut praos = OuroborosPraos::new();
+        let mut praos = OuroborosPraos::new(11);
 
         // Pool A with seq=5
         let mut header_a = make_valid_header(100);
@@ -2193,7 +2220,7 @@ mod tests {
 
     #[test]
     fn test_leader_eligibility_with_zero_stake_strict() {
-        let mut praos = OuroborosPraos::new();
+        let mut praos = OuroborosPraos::new(11);
         praos.set_strict_verification(true);
 
         // Header with 64-byte VRF output (needed for leader check)
@@ -2239,7 +2266,7 @@ mod tests {
     #[test]
     fn test_opcert_counter_over_increment_non_strict() {
         // Non-strict: over-increment is non-fatal
-        let mut praos = OuroborosPraos::new();
+        let mut praos = OuroborosPraos::new(11);
 
         let mut header1 = make_valid_header(100);
         header1.operational_cert.sequence_number = 5;
@@ -2273,7 +2300,7 @@ mod tests {
 
     #[test]
     fn test_opcert_counter_over_increment_strict() {
-        let mut praos = OuroborosPraos::new();
+        let mut praos = OuroborosPraos::new(11);
 
         let mut header1 = make_valid_header(100);
         header1.operational_cert.sequence_number = 5;
@@ -2320,7 +2347,7 @@ mod tests {
     #[test]
     fn test_opcert_counter_increment_by_one_ok() {
         // Exactly +1 should always be fine
-        let mut praos = OuroborosPraos::new();
+        let mut praos = OuroborosPraos::new(11);
         praos.set_strict_verification(true);
 
         // Can't test strict with dummy VRF, so just test non-strict increment tracking
@@ -2369,7 +2396,7 @@ mod tests {
         // Pool in stake distribution, first block with counter=0 → accepted.
         // Haskell initializes currentIssueNo = Just 0, so 0 <= 0 <= 0+1 passes.
         // Use Replay mode to bypass dummy-data crypto failures and isolate counter logic.
-        let mut praos = OuroborosPraos::new();
+        let mut praos = OuroborosPraos::new(11);
         praos.set_strict_verification(true);
 
         let mut header = make_valid_header(100);
@@ -2402,7 +2429,7 @@ mod tests {
         // Pool in stake distribution, first block with counter=1 → accepted.
         // Haskell: 0 <= 1 <= 0+1 passes (rotate on first appearance is valid).
         // Use Replay mode to bypass dummy-data crypto failures and isolate counter logic.
-        let mut praos = OuroborosPraos::new();
+        let mut praos = OuroborosPraos::new(11);
         praos.set_strict_verification(true);
 
         let mut header = make_valid_header(100);
@@ -2429,7 +2456,7 @@ mod tests {
         // Pool in stake distribution, first block with counter=50 → rejected in strict mode.
         // Haskell: currentIssueNo initialized to Just 0, so 50 > 0+1 is an over-increment.
         // Use Replay mode to bypass dummy-data crypto failures and isolate counter logic.
-        let mut praos = OuroborosPraos::new();
+        let mut praos = OuroborosPraos::new(11);
         praos.set_strict_verification(true);
 
         let mut header = make_valid_header(100);
@@ -2461,7 +2488,7 @@ mod tests {
     fn test_first_seen_pool_counter_large_nonfatal_sync() {
         // Pool in stake distribution, first block with counter=50 → non-fatal during sync.
         // During bulk sync (strict_verification=false), over-increment is only logged.
-        let mut praos = OuroborosPraos::new();
+        let mut praos = OuroborosPraos::new(11);
         // Default: strict_verification=false
 
         let mut header = make_valid_header(100);
@@ -2488,7 +2515,7 @@ mod tests {
         // Pool NOT in stake distribution (issuer_info=None), any counter → accepted during sync.
         // During bulk sync, we do not yet have the stake distribution so we cannot enforce
         // the Haskell first-seen initialization rule.
-        let mut praos = OuroborosPraos::new();
+        let mut praos = OuroborosPraos::new(11);
         // Default: strict_verification=false
 
         let mut header = make_valid_header(100);
@@ -2518,7 +2545,7 @@ mod tests {
         //
         // We build the counter up from 0 (valid first-seen value) to 5 by accepting
         // a sequence of +1 increments, then verify that 5→6 still works.
-        let mut praos = OuroborosPraos::new();
+        let mut praos = OuroborosPraos::new(11);
         praos.set_strict_verification(true);
 
         // Establish counter=0 as the first-seen block (valid: 0 <= 0 <= 0+1).
@@ -2586,7 +2613,7 @@ mod tests {
         // Use Replay mode to bypass dummy-data crypto and isolate counter logic.
         //
         // Build up counter to 5 via valid increments, then verify regression is rejected.
-        let mut praos = OuroborosPraos::new();
+        let mut praos = OuroborosPraos::new(11);
         praos.set_strict_verification(true);
 
         // First-seen block: counter=0.
@@ -2672,7 +2699,7 @@ mod tests {
 
     #[test]
     fn test_body_hash_valid() {
-        let praos = OuroborosPraos::new();
+        let praos = OuroborosPraos::new(11);
         let body_cbor = b"some block body content in CBOR";
         let body_hash = blake2b_256(body_cbor);
 
@@ -2684,7 +2711,7 @@ mod tests {
 
     #[test]
     fn test_body_hash_mismatch_rejected() {
-        let praos = OuroborosPraos::new();
+        let praos = OuroborosPraos::new(11);
         let body_cbor = b"actual block body content";
         let wrong_body_cbor = b"different block body content";
         let wrong_hash = blake2b_256(wrong_body_cbor);
@@ -2701,7 +2728,7 @@ mod tests {
 
     #[test]
     fn test_body_hash_mismatch_contains_both_hashes() {
-        let praos = OuroborosPraos::new();
+        let praos = OuroborosPraos::new(11);
         let body_cbor = b"real body";
         let computed_hash = blake2b_256(body_cbor);
 
@@ -2724,7 +2751,7 @@ mod tests {
 
     #[test]
     fn test_body_hash_empty_body() {
-        let praos = OuroborosPraos::new();
+        let praos = OuroborosPraos::new(11);
         let empty_body = b"";
         let empty_hash = blake2b_256(empty_body);
 
@@ -2758,7 +2785,7 @@ mod tests {
 
     #[test]
     fn test_unregistered_pool_rejected_strict() {
-        let mut praos = OuroborosPraos::new();
+        let mut praos = OuroborosPraos::new(11);
         praos.set_strict_verification(true);
 
         let header = make_valid_header(100);
@@ -2786,7 +2813,7 @@ mod tests {
     fn test_unregistered_pool_non_fatal_during_sync() {
         // Non-strict mode: unregistered pool is non-fatal (allows sync from genesis
         // before stake distribution is established)
-        let mut praos = OuroborosPraos::new();
+        let mut praos = OuroborosPraos::new(11);
         assert!(!praos.strict_verification);
 
         let header = make_valid_header(100);
@@ -2808,7 +2835,7 @@ mod tests {
     #[test]
     fn test_registered_pool_passes_with_correct_info() {
         // Pool with correct VRF key should pass (non-strict for VRF proof check)
-        let mut praos = OuroborosPraos::new();
+        let mut praos = OuroborosPraos::new(11);
 
         let header = make_valid_header(100);
         let correct_hash = blake2b_256(&header.vrf_vkey);
@@ -2835,7 +2862,7 @@ mod tests {
 
     #[test]
     fn test_unregistered_pool_error_message() {
-        let mut praos = OuroborosPraos::new();
+        let mut praos = OuroborosPraos::new(11);
         praos.set_strict_verification(true);
 
         let header = make_valid_header(100);
@@ -2881,7 +2908,7 @@ mod tests {
     fn test_validate_header_full_strict_with_registered_pool() {
         // In strict mode, a registered pool with matching VRF key should proceed
         // past the pool registration check (may fail later on VRF proof with dummy data)
-        let mut praos = OuroborosPraos::new();
+        let mut praos = OuroborosPraos::new(11);
         praos.set_strict_verification(true);
 
         let header = make_valid_header(100);
@@ -2914,7 +2941,7 @@ mod tests {
     fn test_kes_period_offset_u32_overflow_rejected() {
         // When the KES period offset exceeds u32::MAX, verify_kes_signature should
         // return an InvalidBlock error instead of silently truncating via `as u32`.
-        let mut praos = OuroborosPraos::new();
+        let mut praos = OuroborosPraos::new(11);
         praos.set_strict_verification(true);
 
         // Set slots_per_kes_period to 1 so that block_kes_period = slot value directly.
@@ -2957,7 +2984,7 @@ mod tests {
 
     #[test]
     fn test_stability_window_at_origin() {
-        let praos = OuroborosPraos::new();
+        let praos = OuroborosPraos::new(11);
         // At origin, everything is in the stability window
         assert!(praos.is_in_stability_window(SlotNo(0)));
         assert!(praos.is_in_stability_window(SlotNo(999_999)));
@@ -2965,7 +2992,7 @@ mod tests {
 
     #[test]
     fn test_stability_window_recent_slot() {
-        let mut praos = OuroborosPraos::new();
+        let mut praos = OuroborosPraos::new(11);
         // k=2160, f=0.05 → stability_window = 3*2160/0.05 = 129600
         praos.update_tip(Tip {
             point: Point::Specific(SlotNo(200_000), Hash32::ZERO),
@@ -2983,7 +3010,7 @@ mod tests {
 
     #[test]
     fn test_stability_window_small_slot() {
-        let mut praos = OuroborosPraos::new();
+        let mut praos = OuroborosPraos::new(11);
         // Tip slot < stability_window → saturating_sub returns 0 → all slots in window
         praos.update_tip(Tip {
             point: Point::Specific(SlotNo(100), Hash32::ZERO),
@@ -2999,7 +3026,7 @@ mod tests {
 
     #[test]
     fn test_prune_opcert_counters_removes_retired() {
-        let mut praos = OuroborosPraos::new();
+        let mut praos = OuroborosPraos::new(11);
         let pool_a = Hash28::from_bytes([0xAA; 28]);
         let pool_b = Hash28::from_bytes([0xBB; 28]);
         let pool_c = Hash28::from_bytes([0xCC; 28]);
@@ -3021,7 +3048,7 @@ mod tests {
 
     #[test]
     fn test_prune_opcert_counters_empty_active_set() {
-        let mut praos = OuroborosPraos::new();
+        let mut praos = OuroborosPraos::new(11);
         praos
             .opcert_counters
             .insert(Hash28::from_bytes([0xAA; 28]), 5);
@@ -3036,7 +3063,7 @@ mod tests {
 
     #[test]
     fn test_prune_opcert_counters_all_active() {
-        let mut praos = OuroborosPraos::new();
+        let mut praos = OuroborosPraos::new(11);
         let pool_a = Hash28::from_bytes([0xAA; 28]);
         let pool_b = Hash28::from_bytes([0xBB; 28]);
         praos.opcert_counters.insert(pool_a, 5);
@@ -3050,7 +3077,7 @@ mod tests {
 
     #[test]
     fn test_prune_opcert_counters_no_counters() {
-        let mut praos = OuroborosPraos::new();
+        let mut praos = OuroborosPraos::new(11);
         assert!(praos.opcert_counters.is_empty());
 
         // Pruning empty map is a no-op
@@ -3061,7 +3088,7 @@ mod tests {
 
     #[test]
     fn test_opcert_counter_hard_cap() {
-        let mut praos = OuroborosPraos::new();
+        let mut praos = OuroborosPraos::new(11);
 
         // Insert 50,000 unique pool entries (the hard cap)
         for i in 0..50_000u32 {
@@ -3101,7 +3128,7 @@ mod tests {
 
     #[test]
     fn test_update_tip_from_origin() {
-        let mut praos = OuroborosPraos::new();
+        let mut praos = OuroborosPraos::new(11);
         assert_eq!(praos.tip, Tip::origin());
 
         let new_tip = Tip {
@@ -3114,7 +3141,7 @@ mod tests {
 
     #[test]
     fn test_update_tip_advances() {
-        let mut praos = OuroborosPraos::new();
+        let mut praos = OuroborosPraos::new(11);
 
         let tip1 = Tip {
             point: Point::Specific(SlotNo(100), Hash32::from_bytes([0x01; 32])),
@@ -3134,7 +3161,7 @@ mod tests {
 
     #[test]
     fn test_update_tip_rollback() {
-        let mut praos = OuroborosPraos::new();
+        let mut praos = OuroborosPraos::new(11);
 
         praos.update_tip(Tip {
             point: Point::Specific(SlotNo(500), Hash32::from_bytes([0x01; 32])),
@@ -3221,7 +3248,7 @@ mod tests {
     #[test]
     fn test_stability_window_calculation() {
         // k=2160, f=0.05 → 3*2160/0.05 = 129600
-        let praos = OuroborosPraos::new();
+        let praos = OuroborosPraos::new(11);
         assert_eq!(praos.stability_window(), 129600);
 
         // k=500, f=0.1 → 3*500/0.1 = 15000
@@ -3231,7 +3258,7 @@ mod tests {
 
     #[test]
     fn test_kes_size_mismatch_rejected_strict() {
-        let mut praos = OuroborosPraos::new();
+        let mut praos = OuroborosPraos::new(11);
         praos.set_strict_verification(true);
 
         let mut header = make_valid_header(100);
@@ -3249,7 +3276,7 @@ mod tests {
 
     #[test]
     fn test_kes_size_mismatch_ok_non_strict() {
-        let praos = OuroborosPraos::new();
+        let praos = OuroborosPraos::new(11);
 
         let mut header = make_valid_header(100);
         // Set a non-empty but wrong-size KES signature
@@ -3265,7 +3292,7 @@ mod tests {
 
     #[test]
     fn test_vrf_strict_mode_with_invalid_proof() {
-        let mut praos = OuroborosPraos::new();
+        let mut praos = OuroborosPraos::new(11);
         praos.set_strict_verification(true);
 
         let mut header = make_valid_header(100);
@@ -3285,7 +3312,7 @@ mod tests {
 
     #[test]
     fn test_checkpoint_match_passes() {
-        let mut praos = OuroborosPraos::new();
+        let mut praos = OuroborosPraos::new(11);
         let expected_hash = Hash32::from_bytes([0xAA; 32]);
         praos.checkpoints.insert(1000, expected_hash);
 
@@ -3299,7 +3326,7 @@ mod tests {
 
     #[test]
     fn test_checkpoint_mismatch_rejected() {
-        let mut praos = OuroborosPraos::new();
+        let mut praos = OuroborosPraos::new(11);
         praos
             .checkpoints
             .insert(1000, Hash32::from_bytes([0xAA; 32]));
@@ -3318,7 +3345,7 @@ mod tests {
 
     #[test]
     fn test_no_checkpoint_at_block_passes() {
-        let mut praos = OuroborosPraos::new();
+        let mut praos = OuroborosPraos::new(11);
         praos
             .checkpoints
             .insert(2000, Hash32::from_bytes([0xAA; 32]));
@@ -3332,7 +3359,7 @@ mod tests {
 
     #[test]
     fn test_empty_checkpoints_no_effect() {
-        let praos = OuroborosPraos::new();
+        let praos = OuroborosPraos::new(11);
         assert!(praos.checkpoints.is_empty());
 
         let header = make_valid_header(5000);
@@ -3347,7 +3374,7 @@ mod tests {
     #[test]
     fn test_envelope_body_size_within_limit_passes() {
         // body_size exactly at the limit should pass.
-        let praos = OuroborosPraos::new();
+        let praos = OuroborosPraos::new(11);
         let result = praos.validate_envelope(
             SlotNo(100),
             90112, // exactly max_block_body_size
@@ -3364,7 +3391,7 @@ mod tests {
     #[test]
     fn test_envelope_body_size_exceeds_limit_rejected() {
         // body_size one byte over the limit must be rejected.
-        let praos = OuroborosPraos::new();
+        let praos = OuroborosPraos::new(11);
         let result = praos.validate_envelope(
             SlotNo(100),
             90113, // one byte over max_block_body_size
@@ -3387,7 +3414,7 @@ mod tests {
     #[test]
     fn test_envelope_body_size_zero_passes() {
         // An empty body (body_size=0) is always within any non-zero limit.
-        let praos = OuroborosPraos::new();
+        let praos = OuroborosPraos::new(11);
         let result = praos.validate_envelope(SlotNo(1), 0, None, 90112, 1100);
         assert!(result.is_ok(), "body_size=0 should pass, got: {result:?}");
     }
@@ -3395,7 +3422,7 @@ mod tests {
     #[test]
     fn test_envelope_header_size_within_limit_passes() {
         // header_cbor_size exactly at the limit should pass.
-        let praos = OuroborosPraos::new();
+        let praos = OuroborosPraos::new(11);
         let result = praos.validate_envelope(SlotNo(100), 0, Some(1100), 90112, 1100);
         assert!(
             result.is_ok(),
@@ -3406,7 +3433,7 @@ mod tests {
     #[test]
     fn test_envelope_header_size_exceeds_limit_rejected() {
         // header_cbor_size one byte over the limit must be rejected.
-        let praos = OuroborosPraos::new();
+        let praos = OuroborosPraos::new(11);
         let result = praos.validate_envelope(SlotNo(100), 0, Some(1101), 90112, 1100);
         assert!(
             matches!(
@@ -3425,7 +3452,7 @@ mod tests {
         // When header_cbor_size is None, the header size check is skipped even
         // if the limit would be exceeded. This reflects that ChainSync processes
         // headers without their raw CBOR bytes available.
-        let praos = OuroborosPraos::new();
+        let praos = OuroborosPraos::new(11);
         // max_block_header_size=0 would reject any real header, but None skips it.
         let result = praos.validate_envelope(SlotNo(100), 0, None, 90112, 0);
         assert!(
@@ -3438,7 +3465,7 @@ mod tests {
     fn test_envelope_body_check_runs_before_header_check() {
         // When both body and header are oversized, BlockBodyTooLarge is returned
         // (body is checked first, matching left-to-right evaluation order).
-        let praos = OuroborosPraos::new();
+        let praos = OuroborosPraos::new(11);
         let result = praos.validate_envelope(
             SlotNo(100),
             99_999,      // body too large
@@ -3455,7 +3482,7 @@ mod tests {
     #[test]
     fn test_envelope_body_size_large_body_with_ok_header() {
         // Oversized body with a valid header size should still fail on the body check.
-        let praos = OuroborosPraos::new();
+        let praos = OuroborosPraos::new(11);
         let result = praos.validate_envelope(
             SlotNo(500),
             200_000,   // well above the 90112 limit
@@ -3477,7 +3504,7 @@ mod tests {
 
     #[test]
     fn test_kes_period_boundary() {
-        let praos = OuroborosPraos::new();
+        let praos = OuroborosPraos::new(11);
 
         // Block at slot 129599 is in KES period 0 (129600 slots per period)
         let mut header = make_valid_header(129599);
@@ -3506,7 +3533,7 @@ mod tests {
 
     #[test]
     fn test_kes_period_certs_start_later() {
-        let praos = OuroborosPraos::new();
+        let praos = OuroborosPraos::new(11);
 
         // Block in period 5 but cert started at period 3 should be valid
         // (cert was valid for periods 3,4,5,6... with 3 evolutions)
@@ -3556,7 +3583,7 @@ mod tests {
 
     #[test]
     fn test_obsolete_node_check() {
-        let praos = OuroborosPraos::new(); // max_major_prot_ver = 10
+        let praos = OuroborosPraos::new(10); // max_major_prot_ver = 10
         let header = make_valid_header(100);
 
         // Ledger PV 10 (== node max) → accepted
@@ -3585,7 +3612,7 @@ mod tests {
 
     #[test]
     fn test_header_prot_ver_too_high() {
-        let praos = OuroborosPraos::new();
+        let praos = OuroborosPraos::new(11);
         let header = make_valid_header(100);
         let ledger_pv = Some(9);
 
@@ -3629,7 +3656,7 @@ mod tests {
 
     #[test]
     fn test_checkpoint_mismatch_detection() {
-        let praos = OuroborosPraos::new();
+        let praos = OuroborosPraos::new(11);
         let header = make_valid_header(100);
 
         // Valid header should have zero hash
@@ -3648,7 +3675,7 @@ mod tests {
 
     #[test]
     fn test_epoch_transition_stability_window() {
-        let praos = OuroborosPraos::new();
+        let praos = OuroborosPraos::new(11);
 
         // Stability window = 3 * k / f = 3 * 2160 / 0.05 = 129600 slots
         let sw = praos.stability_window();
@@ -3701,14 +3728,14 @@ mod tests {
 
     #[test]
     fn test_max_rollback_calculation() {
-        let praos = OuroborosPraos::new();
+        let praos = OuroborosPraos::new(11);
         assert_eq!(praos.max_rollback(), praos.security_param);
         assert_eq!(praos.max_rollback(), 2160);
     }
 
     #[test]
     fn test_active_slot_coefficient() {
-        let praos = OuroborosPraos::new();
+        let praos = OuroborosPraos::new(11);
         assert!((praos.active_slot_coeff - 0.05).abs() < f64::EPSILON);
 
         // Create with custom coefficient
@@ -3723,7 +3750,7 @@ mod tests {
 
     #[test]
     fn test_vrf_output_size_variants() {
-        let praos = OuroborosPraos::new();
+        let praos = OuroborosPraos::new(11);
 
         // 32-byte VRF output (legacy)
         let mut header_32 = make_valid_header(100);
@@ -3752,7 +3779,7 @@ mod tests {
     #[test]
     fn test_opcert_counters_restored_rejects_replay() {
         // Simulate: pool A had counter 5, restore from snapshot, verify state
-        let mut praos = OuroborosPraos::new();
+        let mut praos = OuroborosPraos::new(11);
         let pool_id = Hash28::from_bytes([0xAA; 28]);
 
         // Seed counters as if loaded from snapshot
@@ -3767,7 +3794,7 @@ mod tests {
 
     #[test]
     fn test_set_opcert_counters_replaces_all() {
-        let mut praos = OuroborosPraos::new();
+        let mut praos = OuroborosPraos::new(11);
         let pool_a = Hash28::from_bytes([0xAA; 28]);
         let pool_b = Hash28::from_bytes([0xBB; 28]);
 
@@ -3788,7 +3815,7 @@ mod tests {
     fn test_opcert_counters_fresh_start_empty() {
         // Fresh start (no snapshot) → counters are empty → first block from
         // any pool accepted via the m=0 first-seen path
-        let praos = OuroborosPraos::new();
+        let praos = OuroborosPraos::new(11);
         assert!(praos.opcert_counters().is_empty());
     }
 
@@ -3846,7 +3873,7 @@ mod tests {
         header.nonce_vrf_proof = proof.to_vec();
         header.nonce_vrf_output = output.to_vec();
 
-        let mut praos = OuroborosPraos::new();
+        let mut praos = OuroborosPraos::new(11);
         praos.strict_verification = true;
 
         assert!(
@@ -3862,7 +3889,7 @@ mod tests {
         header.nonce_vrf_proof = vec![0xFFu8; 80]; // invalid proof
         header.nonce_vrf_output = vec![0u8; 64];
 
-        let mut praos = OuroborosPraos::new();
+        let mut praos = OuroborosPraos::new(11);
         praos.strict_verification = true;
 
         let result = praos.verify_nonce_vrf_proof(&header);
@@ -3880,7 +3907,7 @@ mod tests {
         header.protocol_version = ProtocolVersion { major: 9, minor: 0 };
         header.nonce_vrf_proof = vec![0xFFu8; 80]; // would be invalid
 
-        let mut praos = OuroborosPraos::new();
+        let mut praos = OuroborosPraos::new(11);
         praos.strict_verification = true;
 
         assert!(
@@ -3896,7 +3923,7 @@ mod tests {
         header.nonce_vrf_proof = vec![0xFFu8; 80];
         header.nonce_vrf_output = vec![0u8; 64];
 
-        let mut praos = OuroborosPraos::new();
+        let mut praos = OuroborosPraos::new(11);
         praos.strict_verification = false;
 
         assert!(
@@ -3911,7 +3938,7 @@ mod tests {
     /// into `validate_header_full`.
     #[test]
     fn test_validate_header_full_rejects_beyond_forecast_horizon() {
-        let mut praos = OuroborosPraos::new();
+        let mut praos = OuroborosPraos::new(11);
         // Default: k=2160, f=0.05 → stability_window = 129_600.
         let stability_window =
             crate::stability_window_slots(praos.security_param, praos.active_slot_coeff);
@@ -3941,7 +3968,7 @@ mod tests {
     /// inside the forecast window and should pass the forecast check.
     #[test]
     fn test_validate_header_full_within_forecast_horizon_ok() {
-        let mut praos = OuroborosPraos::new();
+        let mut praos = OuroborosPraos::new(11);
         let stability_window =
             crate::stability_window_slots(praos.security_param, praos.active_slot_coeff);
         let tip_slot = SlotNo(1_000);
@@ -3971,7 +3998,7 @@ mod tests {
     /// historic behaviour for callers that don't have a tip handy (e.g. tests).
     #[test]
     fn test_validate_header_full_no_tip_skips_forecast() {
-        let mut praos = OuroborosPraos::new();
+        let mut praos = OuroborosPraos::new(11);
         let header = make_valid_header(10_000_000);
         let result = praos.validate_header_full(
             &header,
