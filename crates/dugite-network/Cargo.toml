@@ -28,3 +28,8 @@ parking_lot = { workspace = true }
 tempfile = { workspace = true }
 tokio = { workspace = true, features = ["test-util"] }
 proptest = { workspace = true }
+criterion = { workspace = true }
+
+[[bench]]
+name = "network_bench"
+harness = false

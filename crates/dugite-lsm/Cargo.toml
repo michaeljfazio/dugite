@@ -22,6 +22,6 @@ tempfile = { workspace = true }
 proptest = { workspace = true }
 criterion = { workspace = true }
 
-# [[bench]]
-# name = "lsm_bench"
-# harness = false
+[[bench]]
+name = "lsm_bench"
+harness = false
