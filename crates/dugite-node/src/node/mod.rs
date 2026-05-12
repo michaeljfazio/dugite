@@ -5824,4 +5824,55 @@ mod tests {
         // to suppress an "unused variable" warning in hypothetical future moves.
         let _ = tip_slot;
     }
+
+    // InMemory tables path resolution (issue #460):
+    //
+    // Verifies that `resolve_inmemory_tables_path` accepts both the new
+    // ouroboros-consensus 1.0.0.0+ layout (flat `<snap>/tables` file) and the
+    // legacy `<snap>/tables/tvar` layout, prefers the new layout, and returns
+    // `None` when neither exists.
+
+    #[test]
+    fn resolve_tables_path_prefers_new_flat_layout() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let snap = tmp.path();
+        std::fs::write(snap.join("tables"), b"flat-blob").expect("write flat tables");
+        let resolved = resolve_inmemory_tables_path(snap).expect("resolved path");
+        assert_eq!(resolved, snap.join("tables"));
+        assert_eq!(
+            std::fs::read(&resolved).unwrap(),
+            b"flat-blob",
+            "resolved path must point at the v11 flat blob"
+        );
+    }
+
+    #[test]
+    fn resolve_tables_path_falls_back_to_legacy_nested_tvar() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let snap = tmp.path();
+        std::fs::create_dir_all(snap.join("tables")).expect("mkdir tables");
+        std::fs::write(snap.join("tables").join("tvar"), b"nested-blob")
+            .expect("write nested tvar");
+        let resolved = resolve_inmemory_tables_path(snap).expect("resolved path");
+        assert_eq!(resolved, snap.join("tables").join("tvar"));
+        assert_eq!(std::fs::read(&resolved).unwrap(), b"nested-blob");
+    }
+
+    #[test]
+    fn resolve_tables_path_returns_none_when_missing() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        // Empty snapshot dir: neither layout present.
+        assert!(resolve_inmemory_tables_path(tmp.path()).is_none());
+    }
+
+    #[test]
+    fn resolve_tables_path_ignores_tables_as_directory_without_tvar() {
+        // If `<snap>/tables` exists but is an empty directory (no `tvar`
+        // child), neither layout is satisfied and we must return `None`
+        // rather than handing the importer a directory it would then try
+        // to `std::fs::read` as a file.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(tmp.path().join("tables")).expect("mkdir tables");
+        assert!(resolve_inmemory_tables_path(tmp.path()).is_none());
+    }
 }

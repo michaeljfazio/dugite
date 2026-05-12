@@ -1,6 +1,17 @@
-//! MemPack UTxO decoder for Haskell ledger state `tables/tvar` files.
+//! MemPack UTxO decoder for Haskell ledger state InMemory tables blobs.
 //!
-//! The `tvar` file in a Mithril ancillary archive contains the UTxO set serialised as:
+//! Mithril ancillary archives ship the InMemory backend's UTxO set as a single
+//! MemPack-encoded blob. The on-disk location depends on the
+//! `ouroboros-consensus` version that produced the snapshot:
+//!
+//! * `< 1.0.0.0` (cardano-node `<= 10.6.x`): `<snap>/tables/tvar`
+//! * `>= 1.0.0.0` (cardano-node `>= 11.0.1`): `<snap>/tables` (flat file)
+//!
+//! The decoder itself is agnostic to which path the bytes came from. Path
+//! resolution is handled by the importer (see
+//! `dugite_node::node::resolve_inmemory_tables_path`). See issue #460.
+//!
+//! The blob contents are serialised as:
 //!
 //! ```text
 //! array(1) [
