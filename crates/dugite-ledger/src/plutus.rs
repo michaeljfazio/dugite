@@ -972,6 +972,88 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
+    // Regression test for #450: adversarial malformed Plutus witness scripts.
+    //
+    // Both pallas-codec's flat decoder and aiken-lang/uplc have known panics
+    // on malformed input (pallas-codec/src/flat/decode/decoder.rs unwrap,
+    // uplc/src/tx.rs:194 unwrap on Err(EndOfInput)). Without the catch_unwind
+    // guard added in `evaluate_plutus_scripts`, a peer-supplied script bundled
+    // in a gossiped transaction could panic the node — a remote DoS over
+    // TxSubmission2 / N2C.
+    //
+    // This test feeds each of the three saved fuzz crash artifacts
+    // (`fuzz/artifacts/fuzz_plutus_script_decode/crash-*`) as the witness-set
+    // Plutus V2 script bytes and asserts that the call returns an `Err` —
+    // crucially WITHOUT panicking. Any future regression in the catch_unwind
+    // guard (e.g. an accidental switch back to `panic = "abort"` or removal
+    // of `std::panic::catch_unwind` in plutus.rs) will surface here as a
+    // process abort during `cargo test`.
+    // -----------------------------------------------------------------------
+    #[test]
+    fn test_evaluate_rejects_malformed_witness_script_without_panic() {
+        // Inline copies of the fuzz crash artifacts. Keeping them inline (vs.
+        // reading the files at test time) makes the regression self-contained
+        // and survives pruning of the fuzz/ artifacts directory.
+        let adversarial_scripts: &[&[u8]] = &[
+            // crash-289a373b…  (2 bytes)
+            &[0xd6, 0xec],
+            // crash-9daa5ea5…  (2 bytes)
+            &[0x0a, 0x79],
+            // crash-82fab4ff…  (14 bytes)
+            &[
+                0x21, 0x06, 0x00, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+            ],
+            // crash-a4a22152…  (12 bytes)
+            &[
+                0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+            ],
+        ];
+
+        let slot_config = SlotConfig::preview();
+
+        for (i, malformed) in adversarial_scripts.iter().enumerate() {
+            let script_cbor = malformed.to_vec();
+            let script_hash = script_hash_v2(&script_cbor);
+            let tx_input_hash = [(0xa0 + i as u8); 32];
+
+            // The tx body references this script via the spending UTxO. The
+            // tx_cbor produced by build_conway_tx_cbor embeds the malformed
+            // bytes verbatim in the witness set (key 3 = plutus_v2_script),
+            // which is exactly the path through `eval_phase_two_raw` →
+            // `Program::<DeBruijn>::from_cbor` → pallas-codec flat decoder
+            // that historically panicked.
+            let tx_cbor = build_conway_tx_cbor(&tx_input_hash, &script_cbor, 14_000_000, 2_000_000);
+            let (utxo_set, input) = build_script_utxo_set(&tx_input_hash, &script_hash);
+
+            let mut tx = Transaction::empty_with_hash(Hash32::ZERO);
+            tx.raw_cbor = Some(tx_cbor);
+            tx.body.inputs = vec![input];
+            tx.witness_set.plutus_v2_scripts = vec![script_cbor];
+
+            // The expectation is "does not panic AND returns Err". We do not
+            // pin the exact PlutusError variant because malformed input may
+            // surface as either:
+            //   - EvalFailed       (panic intercepted by catch_unwind)
+            //   - MissingScriptData / ScriptDecode / CborDecode (caught earlier
+            //     by our own phase-1 plumbing before reaching the evaluator)
+            let result = evaluate_plutus_scripts(
+                &tx,
+                &utxo_set,
+                None,
+                (14_000_000, 2_000_000),
+                &slot_config,
+            );
+
+            assert!(
+                result.is_err(),
+                "Adversarial script #{i} ({} bytes) must be rejected, got Ok: {:?}",
+                malformed.len(),
+                result
+            );
+        }
+    }
+
+    // -----------------------------------------------------------------------
     // Test 4: Always-succeeds Plutus V1 spending validator
     //
     // PlutusV1 scripts follow the same success rule as V2: any non-error
