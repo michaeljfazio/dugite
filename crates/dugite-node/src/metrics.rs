@@ -523,6 +523,10 @@ pub struct NodeMetrics {
     peak_mem_bytes: AtomicU64,
     /// Network magic number (764824073=mainnet, 2=preview, 1=preprod).
     pub network_magic: AtomicU64,
+    /// Liveness threshold in seconds — `/live` returns 503 when no block has
+    /// been applied within this window (and the node is not freshly started).
+    /// Default 600s (10 minutes). 0 disables the threshold (always 200).
+    pub liveness_threshold_secs: AtomicU64,
     /// 1 when running as a block producer (forge credentials loaded), 0 for relay.
     ///
     /// Exposed as `dugite_is_block_producer` gauge so the TUI can show the
@@ -678,6 +682,7 @@ impl NodeMetrics {
             cpu_tracker: std::sync::Mutex::new(CpuTracker::new()),
             peak_mem_bytes: AtomicU64::new(0),
             network_magic: AtomicU64::new(0),
+            liveness_threshold_secs: AtomicU64::new(600),
             is_block_producer: AtomicU64::new(0),
             pool_id_hex: std::sync::Mutex::new(String::new()),
             compat_metrics: std::sync::atomic::AtomicBool::new(false),
@@ -910,6 +915,70 @@ impl NodeMetrics {
     /// Used for Kubernetes readiness probes.
     pub fn is_ready(&self) -> bool {
         self.sync_progress_pct.load(Ordering::Relaxed) >= SYNCED_THRESHOLD
+    }
+
+    /// Liveness probe: returns true if the node has applied a block within
+    /// `liveness_threshold_secs`, or if no block has yet been received but the
+    /// node has been up for less than the threshold (warm-up grace period).
+    ///
+    /// Used by Kubernetes liveness probes — returns 503 from `/live` only when
+    /// the event loop appears wedged (no recent progress, past warm-up).
+    /// A threshold of 0 disables the check (always alive).
+    pub fn is_alive(&self) -> bool {
+        let threshold = self.liveness_threshold_secs.load(Ordering::Relaxed);
+        if threshold == 0 {
+            return true;
+        }
+        let last_block_ms = self.last_block_received_at.load(Ordering::Relaxed);
+        if last_block_ms == 0 {
+            // No block yet — grant a warm-up grace equal to the threshold.
+            return self.uptime_seconds() < threshold;
+        }
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
+        let elapsed_secs = now_ms.saturating_sub(last_block_ms) / 1000;
+        elapsed_secs <= threshold
+    }
+
+    /// Render metrics in cardano-node's EKG (System.Remote.Monitoring) JSON
+    /// shape so that existing dashboards polling `:12788/` continue to work.
+    ///
+    /// EKG groups metrics under a nested object tree where each leaf is
+    /// `{"type": "c", "val": N}` (counter) or `{"type": "g", "val": N}` (gauge).
+    /// The `cardano.node.metrics.*` namespace mirrors what cardano-node exposes.
+    pub fn to_ekg_json(&self) -> String {
+        use std::sync::atomic::Ordering::Relaxed;
+        let g = |v: u64| format!(r#"{{"type":"g","val":{v}}}"#);
+        let c = |v: u64| format!(r#"{{"type":"c","val":{v}}}"#);
+
+        let slot = self.slot_number.load(Relaxed);
+        let block = self.block_number.load(Relaxed);
+        let epoch = self.epoch_number.load(Relaxed);
+        let density = self.sync_progress_pct.load(Relaxed) as f64 / 10000.0;
+        let mempool_tx = self.mempool_tx_count.load(Relaxed);
+        let mempool_bytes = self.mempool_bytes.load(Relaxed);
+        let utxo = self.utxo_count.load(Relaxed);
+        let peers = self.peers_connected.load(Relaxed);
+        let blocks_applied = self.blocks_applied.load(Relaxed);
+        let blocks_forged = self.blocks_forged.load(Relaxed);
+        let txs_processed = self.transactions_validated.load(Relaxed);
+
+        format!(
+            r#"{{"cardano":{{"node":{{"metrics":{{"slotNum_int":{slot_g},"blockNum_int":{block_g},"epoch_int":{epoch_g},"density_real":{{"type":"g","val":{density:.6}}},"txsInMempool_int":{mtx_g},"mempoolBytes_int":{mb_g},"utxoSize_int":{utxo_g},"connectedPeers_int":{peers_g},"blocksForgedNum_int":{forged_c},"served":{{"block":{{"count_int":{served_c}}}}},"txsProcessedNum_int":{txp_c},"Forge":{{"forge_adopted_int":{forged_c}}}}}}}}},"rts":{{"gc":{{"current_bytes_used":{used_g}}}}}}}"#,
+            slot_g = g(slot),
+            block_g = g(block),
+            epoch_g = g(epoch),
+            mtx_g = g(mempool_tx),
+            mb_g = g(mempool_bytes),
+            utxo_g = g(utxo),
+            peers_g = g(peers),
+            forged_c = c(blocks_forged),
+            served_c = c(blocks_applied),
+            txp_c = c(txs_processed),
+            used_g = g(self.peak_mem_bytes.load(Relaxed)),
+        )
     }
 
     /// Record a RollForward event timestamp for chainsync_idle tracking.
@@ -1829,7 +1898,53 @@ async fn handle_metrics_connection(mut stream: tokio::net::TcpStream, metrics: A
     };
     let request = std::str::from_utf8(&buf[..n]).unwrap_or("");
 
-    let response = if request.starts_with("GET /ready") {
+    let response = route_request(request, &metrics);
+
+    let _ = stream.write_all(response.as_bytes()).await;
+}
+
+/// Build an HTTP response string for a given raw request line.
+///
+/// Extracted so unit tests can exercise the routing logic without binding
+/// a TCP socket.
+pub fn route_request(request: &str, metrics: &NodeMetrics) -> String {
+    if request.starts_with("GET /live") {
+        // Kubernetes liveness probe: 200 if event loop is making progress
+        // (recent block applied OR within warm-up grace), 503 if wedged.
+        let threshold = metrics.liveness_threshold_secs.load(Ordering::Relaxed);
+        if metrics.is_alive() {
+            let body = format!(r#"{{"alive":true,"threshold_secs":{threshold}}}"#);
+            format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            )
+        } else {
+            let last_block_ts = metrics.last_block_received_iso();
+            let last_block_json = match &last_block_ts {
+                Some(ts) => format!("\"{}\"", ts),
+                None => "null".to_string(),
+            };
+            let body = format!(
+                r#"{{"alive":false,"threshold_secs":{threshold},"last_block_received_at":{last_block_json}}}"#
+            );
+            format!(
+                "HTTP/1.1 503 Service Unavailable\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            )
+        }
+    } else if request.starts_with("GET /ekg") {
+        // cardano-node EKG (System.Remote.Monitoring) compatibility endpoint.
+        // Returns the nested-object JSON layout that legacy gLiveView / CNTools
+        // dashboards expect when polling port 12788.
+        let body = metrics.to_ekg_json();
+        format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            body.len(),
+            body
+        )
+    } else if request.starts_with("GET /ready") {
         // Kubernetes readiness probe: 200 if synced, 503 if not
         if metrics.is_ready() {
             let body = r#"{"ready":true}"#;
@@ -1875,9 +1990,7 @@ async fn handle_metrics_connection(mut stream: tokio::net::TcpStream, metrics: A
             body.len(),
             body
         )
-    };
-
-    let _ = stream.write_all(response.as_bytes()).await;
+    }
 }
 
 #[cfg(test)]
@@ -1972,6 +2085,142 @@ mod tests {
         assert!(output.contains("# TYPE dugite_slot_number gauge"));
         assert!(output.contains("# TYPE dugite_rollback_count_total counter"));
         assert!(output.contains("# TYPE dugite_peers_connected gauge"));
+    }
+
+    // --- Liveness probe tests ---
+
+    #[test]
+    fn test_is_alive_warmup_grace_when_no_block_received() {
+        // Fresh node, no block yet → alive (within warm-up grace window).
+        let metrics = NodeMetrics::new();
+        metrics
+            .liveness_threshold_secs
+            .store(600, Ordering::Relaxed);
+        assert!(metrics.is_alive());
+    }
+
+    #[test]
+    fn test_is_alive_disabled_with_zero_threshold() {
+        let metrics = NodeMetrics::new();
+        metrics.liveness_threshold_secs.store(0, Ordering::Relaxed);
+        // Even with a very stale "last block" timestamp, threshold=0 → always alive.
+        metrics.last_block_received_at.store(1, Ordering::Relaxed);
+        assert!(metrics.is_alive());
+    }
+
+    #[test]
+    fn test_is_alive_recent_block() {
+        let metrics = NodeMetrics::new();
+        metrics
+            .liveness_threshold_secs
+            .store(600, Ordering::Relaxed);
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+        metrics
+            .last_block_received_at
+            .store(now_ms, Ordering::Relaxed);
+        assert!(metrics.is_alive());
+    }
+
+    #[test]
+    fn test_is_alive_stale_block_after_threshold() {
+        let metrics = NodeMetrics::new();
+        metrics.liveness_threshold_secs.store(60, Ordering::Relaxed);
+        // Pretend last block arrived 10 minutes ago.
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+        let ten_min_ago = now_ms.saturating_sub(600_000);
+        metrics
+            .last_block_received_at
+            .store(ten_min_ago, Ordering::Relaxed);
+        assert!(!metrics.is_alive());
+    }
+
+    #[test]
+    fn test_live_route_returns_200_when_alive() {
+        let metrics = NodeMetrics::new();
+        metrics
+            .liveness_threshold_secs
+            .store(600, Ordering::Relaxed);
+        let resp = route_request("GET /live HTTP/1.1\r\n\r\n", &metrics);
+        assert!(resp.starts_with("HTTP/1.1 200 OK"), "got: {resp}");
+        assert!(resp.contains("\"alive\":true"));
+        assert!(resp.contains("\"threshold_secs\":600"));
+    }
+
+    #[test]
+    fn test_live_route_returns_503_when_stale() {
+        let metrics = NodeMetrics::new();
+        metrics.liveness_threshold_secs.store(60, Ordering::Relaxed);
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+        metrics
+            .last_block_received_at
+            .store(now_ms.saturating_sub(600_000), Ordering::Relaxed);
+        let resp = route_request("GET /live HTTP/1.1\r\n\r\n", &metrics);
+        assert!(
+            resp.starts_with("HTTP/1.1 503 Service Unavailable"),
+            "got: {resp}"
+        );
+        assert!(resp.contains("\"alive\":false"));
+    }
+
+    // --- EKG endpoint tests ---
+
+    #[test]
+    fn test_ekg_route_returns_expected_keys() {
+        let metrics = NodeMetrics::new();
+        metrics.set_slot(12345);
+        metrics.set_block_number(678);
+        metrics.set_epoch(9);
+        metrics.mempool_tx_count.store(7, Ordering::Relaxed);
+        metrics.blocks_forged.store(3, Ordering::Relaxed);
+        metrics.utxo_count.store(42, Ordering::Relaxed);
+        metrics.peers_connected.store(5, Ordering::Relaxed);
+
+        let resp = route_request("GET /ekg HTTP/1.1\r\n\r\n", &metrics);
+        assert!(resp.starts_with("HTTP/1.1 200 OK"));
+        assert!(resp.contains("application/json"));
+        // EKG namespace + key metrics from issue #322
+        assert!(resp.contains("\"cardano\""), "missing cardano root");
+        assert!(resp.contains("\"slotNum_int\""), "missing slot");
+        assert!(resp.contains("\"blockNum_int\""), "missing blockNum");
+        assert!(
+            resp.contains("\"blocksForgedNum_int\""),
+            "missing blocksForgedNum"
+        );
+        assert!(
+            resp.contains("\"txsInMempool_int\""),
+            "missing txsInMempool"
+        );
+        assert!(resp.contains("\"density_real\""), "missing density");
+        assert!(resp.contains("\"epoch_int\""), "missing epoch");
+        // EKG counter/gauge wrapping
+        assert!(
+            resp.contains("\"type\":\"g\"") && resp.contains("\"type\":\"c\""),
+            "missing EKG type/val wrapping"
+        );
+        // Values surface (gauge)
+        assert!(resp.contains("\"val\":12345"));
+        assert!(resp.contains("\"val\":7"));
+    }
+
+    #[test]
+    fn test_ekg_json_parses_as_valid_json() {
+        let metrics = NodeMetrics::new();
+        metrics.set_slot(1);
+        let body = metrics.to_ekg_json();
+        let v: serde_json::Value =
+            serde_json::from_str(&body).expect("EKG output must be valid JSON");
+        // Navigate to the canonical EKG path used by gLiveView dashboards.
+        let slot = &v["cardano"]["node"]["metrics"]["slotNum_int"]["val"];
+        assert_eq!(slot.as_u64(), Some(1));
     }
 
     #[test]

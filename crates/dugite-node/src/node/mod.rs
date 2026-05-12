@@ -236,6 +236,8 @@ pub struct NodeArgs {
     pub metrics_port: u16,
     /// Emit `cardano_node_metrics_*` compatibility aliases alongside native metrics
     pub compat_metrics: bool,
+    /// Liveness threshold for the `/live` HTTP endpoint (seconds; 0 disables).
+    pub liveness_threshold_secs: u64,
     /// Maximum number of transactions in the mempool
     pub mempool_max_tx: usize,
     /// Maximum mempool size in bytes
@@ -1465,6 +1467,10 @@ impl Node {
             let m = crate::metrics::NodeMetrics::new();
             m.set_network_magic(network_magic);
             m.set_compat_metrics(args.compat_metrics);
+            m.liveness_threshold_secs.store(
+                args.liveness_threshold_secs,
+                std::sync::atomic::Ordering::Relaxed,
+            );
             // Advertise block producer mode so the TUI shows the correct role and
             // displays the abbreviated pool ID in the Node panel.
             let is_bp = block_producer.is_some();

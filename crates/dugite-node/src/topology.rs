@@ -556,6 +556,65 @@ mod tests {
         );
     }
 
+    /// Simulates the SIGHUP reload path (issue #322): write topology to disk,
+    /// load it, mutate the on-disk file to add a new peer, reload, and verify
+    /// the new peer appears in `all_peers()` / `detailed_peers()`.
+    ///
+    /// The actual SIGHUP signal hook lives in `node::Node::run` and re-invokes
+    /// `Topology::load()` exactly like this test does.  Covering the reload
+    /// here exercises the same code path without requiring a full node
+    /// instance or a real Unix signal.
+    #[test]
+    fn test_sighup_reload_picks_up_new_peers() {
+        let dir =
+            std::env::temp_dir().join(format!("dugite-topology-reload-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("topology.json");
+
+        // Initial topology with one local-root peer.
+        let v1 = r#"{
+            "bootstrapPeers": [],
+            "localRoots": [{
+                "accessPoints": [{ "address": "10.0.0.1", "port": 3001 }],
+                "advertise": false,
+                "trustable": true,
+                "valency": 1
+            }],
+            "publicRoots": [],
+            "useLedgerAfterSlot": -1
+        }"#;
+        std::fs::write(&path, v1).unwrap();
+        let topo1 = Topology::load(&path).unwrap();
+        assert_eq!(topo1.all_peers().len(), 1);
+        assert_eq!(topo1.all_peers()[0].0, "10.0.0.1");
+
+        // Mutate file: add a second peer (mimicking an operator edit before SIGHUP).
+        let v2 = r#"{
+            "bootstrapPeers": [],
+            "localRoots": [{
+                "accessPoints": [
+                    { "address": "10.0.0.1", "port": 3001 },
+                    { "address": "10.0.0.2", "port": 3001 }
+                ],
+                "advertise": false,
+                "trustable": true,
+                "valency": 1
+            }],
+            "publicRoots": [],
+            "useLedgerAfterSlot": -1
+        }"#;
+        std::fs::write(&path, v2).unwrap();
+
+        // Reload — this is exactly what the SIGHUP handler in node/mod.rs does.
+        let topo2 = Topology::load(&path).unwrap();
+        let peers = topo2.all_peers();
+        assert_eq!(peers.len(), 2, "reload should pick up the new peer");
+        assert!(peers.iter().any(|(a, _)| a == "10.0.0.2"));
+
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_dir(&dir);
+    }
+
     #[test]
     fn test_full_topology_with_all_fields() {
         let json = r#"{
