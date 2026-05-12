@@ -1403,11 +1403,11 @@ fn decode_conway_utxow_failure(decoder: &mut minicbor::Decoder<'_>) -> Option<St
             let _ = decoder.skip();
             Some("MissingScriptWitnessesUTXOW: missing script witness(es)".to_string())
         }
-        // Tag 13: PPViewHashesDontMatch — [supplied_maybe, expected_maybe]
+        // Tag 13: ScriptIntegrityHashMismatch (formerly PPViewHashesDontMatch pre-PV11) — [supplied_maybe, expected_maybe]
         13 => {
             let _ = decoder.skip(); // supplied StrictMaybe
             let _ = decoder.skip(); // expected StrictMaybe
-            Some("PPViewHashesDontMatch: script data hash mismatch".to_string())
+            Some("ScriptIntegrityHashMismatch: script data hash mismatch".to_string())
         }
         other => {
             let _ = decoder.skip();

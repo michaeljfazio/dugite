@@ -315,7 +315,7 @@ fn encode_conway_ledger_pred_failure(enc: &mut Encoder<&mut Vec<u8>>, err: &TxVa
             );
         }
 
-        // Utxow tag 13: PPViewHashesDontMatch — [supplied_hash_or_null, expected_hash_or_null]
+        // Utxow tag 13: ScriptIntegrityHashMismatch (formerly PPViewHashesDontMatch pre-PV11) — [supplied_hash_or_null, expected_hash_or_null]
         TxValidationError::ScriptDataHashMismatch { expected, actual } => {
             encode_utxow_failure(enc, 13, |enc| {
                 // supplied (actual from tx) — StrictMaybe encoding
@@ -335,7 +335,7 @@ fn encode_conway_ledger_pred_failure(enc: &mut Encoder<&mut Vec<u8>>, err: &TxVa
             });
         }
 
-        // Utxow tag 13: PPViewHashesDontMatch — unexpected hash present
+        // Utxow tag 13: ScriptIntegrityHashMismatch — unexpected hash present
         TxValidationError::UnexpectedScriptDataHash => {
             encode_utxow_failure(enc, 13, |enc| {
                 // supplied = SJust (some hash, but we don't have it — encode as present-but-unknown)
@@ -346,7 +346,7 @@ fn encode_conway_ledger_pred_failure(enc: &mut Encoder<&mut Vec<u8>>, err: &TxVa
             });
         }
 
-        // Utxow tag 13: PPViewHashesDontMatch — required hash missing
+        // Utxow tag 13: ScriptIntegrityHashMismatch — required hash missing
         TxValidationError::MissingScriptDataHash => {
             encode_utxow_failure(enc, 13, |enc| {
                 // supplied = SNothing (tx didn't include hash)
@@ -946,11 +946,11 @@ mod tests {
         dec.array().unwrap();
         assert_eq!(decode_ledger_tag(&mut dec), 1);
 
-        // Utxow tag 13: PPViewHashesDontMatch
+        // Utxow tag 13: ScriptIntegrityHashMismatch (formerly PPViewHashesDontMatch pre-PV11)
         let arr_len = dec.array().unwrap().unwrap();
         assert_eq!(arr_len, 3);
         let utxow_tag = dec.u8().unwrap();
-        assert_eq!(utxow_tag, 13, "PPViewHashesDontMatch");
+        assert_eq!(utxow_tag, 13, "ScriptIntegrityHashMismatch");
 
         // supplied (actual): SJust(hash)
         let s_len = dec.array().unwrap().unwrap();
