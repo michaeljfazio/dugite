@@ -431,6 +431,41 @@ pub(crate) fn handle_ledger_peer_snapshot(state: &NodeStateSnapshot) -> QueryRes
     QueryResult::LedgerPeerSnapshot(entries)
 }
 
+/// Handle GetLedgerPeerSnapshot (tag 34) for N2C V23+.
+///
+/// `big = true`  → `LedgerBigPeerSnapshotV23` (outer discriminator `uint(2)`);
+/// `big = false` → `LedgerAllPeerSnapshotV23` (outer discriminator `uint(3)`).
+///
+/// Both variants prepend `Point RawBlockHash` and `NetworkMagic` to the pool
+/// list. The Big variant retains the per-pool `AccPoolStake`; the All variant
+/// omits it.
+pub(crate) fn handle_ledger_peer_snapshot_v23(state: &NodeStateSnapshot, big: bool) -> QueryResult {
+    debug!(big, "Query: GetLedgerPeerSnapshot (V23+)");
+    let stake_map: std::collections::HashMap<&[u8], u64> = state
+        .stake_pools
+        .iter()
+        .map(|p| (p.pool_id.as_slice(), p.stake))
+        .collect();
+
+    let peers: Vec<LedgerPeerEntry> = state
+        .pool_params_entries
+        .iter()
+        .filter(|pp| !pp.relays.is_empty())
+        .map(|pp| LedgerPeerEntry {
+            pool_id: pp.pool_id.clone(),
+            stake: stake_map.get(pp.pool_id.as_slice()).copied().unwrap_or(0),
+            relays: pp.relays.clone(),
+        })
+        .collect();
+
+    QueryResult::LedgerPeerSnapshotV23 {
+        big,
+        anchor: state.tip.point.clone(),
+        network_magic: state.network_magic,
+        peers,
+    }
+}
+
 /// Parse a set of pool ID hashes from CBOR.
 /// Handles: tag(258) [pool_hash_bytes, ...] or plain array of bytes.
 fn parse_pool_id_set(decoder: &mut minicbor::Decoder<'_>) -> Vec<Vec<u8>> {
@@ -666,6 +701,46 @@ mod tests {
                 assert!(peers.is_empty());
             }
             _ => panic!("Expected LedgerPeerSnapshot"),
+        }
+    }
+
+    #[test]
+    fn test_ledger_peer_snapshot_v23_big_carries_anchor_and_magic() {
+        use crate::node::n2c_query::types::RelaySnapshot;
+        use dugite_primitives::block::Point;
+        let mut state = make_state_with_pools();
+        state.network_magic = 2;
+        state.tip.point = Point::Origin;
+        state.pool_params_entries[0].relays = vec![RelaySnapshot::SingleHostName {
+            port: Some(3001),
+            dns_name: "relay1.example.com".to_string(),
+        }];
+        let result = handle_ledger_peer_snapshot_v23(&state, true);
+        match result {
+            QueryResult::LedgerPeerSnapshotV23 {
+                big,
+                anchor,
+                network_magic,
+                peers,
+            } => {
+                assert!(big);
+                assert_eq!(network_magic, 2);
+                assert!(matches!(anchor, Point::Origin));
+                assert_eq!(peers.len(), 1);
+            }
+            _ => panic!("Expected LedgerPeerSnapshotV23"),
+        }
+    }
+
+    #[test]
+    fn test_ledger_peer_snapshot_v23_all_variant() {
+        let state = make_state_with_pools();
+        let result = handle_ledger_peer_snapshot_v23(&state, false);
+        match result {
+            QueryResult::LedgerPeerSnapshotV23 { big, .. } => {
+                assert!(!big, "All variant must have big=false");
+            }
+            _ => panic!("Expected LedgerPeerSnapshotV23"),
         }
     }
 

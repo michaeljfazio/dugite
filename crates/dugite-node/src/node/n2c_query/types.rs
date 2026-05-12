@@ -198,6 +198,22 @@ pub enum QueryResult {
     /// GetLedgerPeerSnapshot (tag 34): ledger peer snapshot
     /// Versioned snapshot: array(2) [version, peers]
     LedgerPeerSnapshot(Vec<LedgerPeerEntry>),
+    /// GetLedgerPeerSnapshot (tag 34, V23+): new constructors keyed on the
+    /// outer discriminator `uint(2)` (Big) or `uint(3)` (All).  Each variant
+    /// prepends a `Point RawBlockHash` and `NetworkMagic uint32` before the
+    /// indefinite pool list.  See issue #456 and `Ouroboros.Network.
+    /// PeerSelection.LedgerPeers.Type` for the source-verified wire format.
+    LedgerPeerSnapshotV23 {
+        /// `true` → BigPeers (tag 2, includes AccPoolStake); `false` → AllPeers
+        /// (tag 3, omits AccPoolStake).
+        big: bool,
+        /// Snapshot anchor — currently the ledger tip at query time.
+        anchor: dugite_primitives::block::Point,
+        /// NetworkMagic — plumbed from `NodeStateSnapshot::network_magic`.
+        network_magic: u32,
+        /// Peer entries (sorted/filtered by the handler).
+        peers: Vec<LedgerPeerEntry>,
+    },
     /// QueryStakePoolDefaultVote (tag 35): single pool default vote
     /// Haskell returns a bare word8: 0=DefaultNo, 1=DefaultAbstain, 2=DefaultNoConfidence
     StakePoolDefaultVote(u8),
