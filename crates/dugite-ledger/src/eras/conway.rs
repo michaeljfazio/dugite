@@ -698,17 +698,18 @@ impl EraRules for ConwayRules {
     ) -> Result<(), LedgerError> {
         // Guard: this rule implements the Babbage -> Conway TranslateEra only.
         //
-        // `crates/dugite-ledger/src/eras/mod.rs` currently aliases Dijkstra to
-        // `ConwayRules` (full Dijkstra rules are pending), so this method is
-        // also dispatched for the Conway -> Dijkstra boundary. Re-running the
-        // Babbage->Conway init steps in that case is destructive:
-        //   - re-seeds DReps that may have been unregistered since Conway,
-        //   - overwrites committee_expiration / committee_threshold / constitution
-        //     with the original ConwayGenesis values,
-        //   - zeroes any in-flight `pending_donations`.
+        // Historically (pre-issue #462) Dijkstra was aliased to `ConwayRules`
+        // in `crates/dugite-ledger/src/eras/mod.rs`, so this method was also
+        // dispatched for the Conway -> Dijkstra boundary; re-running the
+        // Babbage->Conway init steps there would have been destructive
+        // (re-seeded DReps, overwritten committee/threshold/constitution,
+        // zeroed in-flight donations).
         //
-        // Issue #467. Once a real `DijkstraRules` exists this guard becomes
-        // belt-and-braces, but we keep it as defense-in-depth.
+        // The alias is now removed and Dijkstra has its own `DijkstraRules`
+        // with an explicit identity translation (issue #462), so this guard
+        // is belt-and-braces. We keep it as defense-in-depth in case a
+        // future orchestrator bug routes a non-Babbage from_era here
+        // (issue #467 regression).
         if from_era != Era::Babbage {
             debug!(
                 "Conway::on_era_transition called with from_era={:?}; skipping \
