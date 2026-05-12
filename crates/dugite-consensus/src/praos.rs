@@ -4014,6 +4014,157 @@ mod tests {
             "ledger_tip_slot=None must skip the forecast check, got: {result:?}"
         );
     }
+
+    // -----------------------------------------------------------------------
+    // Envelope check boundary matrix — issue #468
+    //
+    // Covers `validate_header` (path A) and `validate_header_full` (path B).
+    // Both share identical envelope logic; testing both paths independently
+    // catches regressions in either copy.
+    //
+    // Matrix (max_major_prot_ver | ledger_pv | header pv | expected):
+    //   11 | 11 | 11 → Ok
+    //   11 | 11 | 12 → Ok  (header may propose pv+1)
+    //   11 | 11 | 13 → Err(HeaderProtVerTooHigh)
+    //   11 | 12 | 12 → Err(ObsoleteNode)
+    //   10 | 11 | 11 → Err(ObsoleteNode)
+    //   12 | 12 | 12 → Ok  (PV12 experimental_hard_forks_enabled)
+    //   12 | 12 | 13 → Ok  (PV+1 proposal under PV12 config)
+    //   12 | 12 | 14 → Err(HeaderProtVerTooHigh)
+    //   12 | 13 | 13 → Err(ObsoleteNode)
+    // -----------------------------------------------------------------------
+
+    fn make_header_with_pv(slot: u64, pv_major: u64) -> BlockHeader {
+        let mut h = make_valid_header(slot);
+        h.protocol_version.major = pv_major;
+        h
+    }
+
+    // Helper: run path A (validate_header) and path B (validate_header_full)
+    // with the given envelope parameters and return both results.
+    fn run_envelope(
+        max_node_pv: u64,
+        ledger_pv: u64,
+        header_pv: u64,
+    ) -> (Result<(), ConsensusError>, Result<(), ConsensusError>) {
+        let praos_a = OuroborosPraos::new(max_node_pv);
+        let mut praos_b = OuroborosPraos::new(max_node_pv);
+        let header = make_header_with_pv(1000, header_pv);
+        let current = SlotNo(2000);
+        let res_a = praos_a.validate_header(&header, current, ValidationMode::Replay, Some(ledger_pv));
+        let res_b = praos_b.validate_header_full(
+            &header,
+            current,
+            None,
+            None,
+            ValidationMode::Replay,
+            Some(ledger_pv),
+            None,
+        );
+        (res_a, res_b)
+    }
+
+    // Row 1: (11, 11, 11) → Ok  [default PV11 config, PV11 chain, PV11 header]
+    #[test]
+    fn envelope_pv11_config_ledger11_header11_ok() {
+        let (a, b) = run_envelope(11, 11, 11);
+        assert!(a.is_ok(), "path A: expected Ok, got {a:?}");
+        assert!(b.is_ok(), "path B: expected Ok, got {b:?}");
+    }
+
+    // Row 2: (11, 11, 12) → Ok  [header proposes pv+1 — valid HF proposal]
+    #[test]
+    fn envelope_pv11_config_ledger11_header12_ok() {
+        let (a, b) = run_envelope(11, 11, 12);
+        assert!(a.is_ok(), "path A: expected Ok, got {a:?}");
+        assert!(b.is_ok(), "path B: expected Ok, got {b:?}");
+    }
+
+    // Row 3: (11, 11, 13) → Err(HeaderProtVerTooHigh)  [header skips pv, invalid]
+    #[test]
+    fn envelope_pv11_config_ledger11_header13_too_high() {
+        let (a, b) = run_envelope(11, 11, 13);
+        assert!(
+            matches!(a, Err(ConsensusError::HeaderProtVerTooHigh { .. })),
+            "path A: expected HeaderProtVerTooHigh, got {a:?}"
+        );
+        assert!(
+            matches!(b, Err(ConsensusError::HeaderProtVerTooHigh { .. })),
+            "path B: expected HeaderProtVerTooHigh, got {b:?}"
+        );
+    }
+
+    // Row 4: (11, 12, 12) → Err(ObsoleteNode)  [chain is already PV12, node capped at 11]
+    #[test]
+    fn envelope_pv11_config_ledger12_obsolete_node() {
+        let (a, b) = run_envelope(11, 12, 12);
+        assert!(
+            matches!(a, Err(ConsensusError::ObsoleteNode { .. })),
+            "path A: expected ObsoleteNode, got {a:?}"
+        );
+        assert!(
+            matches!(b, Err(ConsensusError::ObsoleteNode { .. })),
+            "path B: expected ObsoleteNode, got {b:?}"
+        );
+    }
+
+    // Row 5: (10, 11, 11) → Err(ObsoleteNode)  [regression: stale default cap]
+    #[test]
+    fn envelope_pv10_config_ledger11_obsolete_node() {
+        let (a, b) = run_envelope(10, 11, 11);
+        assert!(
+            matches!(a, Err(ConsensusError::ObsoleteNode { .. })),
+            "path A: expected ObsoleteNode, got {a:?}"
+        );
+        assert!(
+            matches!(b, Err(ConsensusError::ObsoleteNode { .. })),
+            "path B: expected ObsoleteNode, got {b:?}"
+        );
+    }
+
+    // Row 6: (12, 12, 12) → Ok  [experimental_hard_forks_enabled=true, PV12 chain]
+    #[test]
+    fn envelope_pv12_config_ledger12_header12_ok() {
+        let (a, b) = run_envelope(12, 12, 12);
+        assert!(a.is_ok(), "path A: expected Ok, got {a:?}");
+        assert!(b.is_ok(), "path B: expected Ok, got {b:?}");
+    }
+
+    // Row 7: (12, 12, 13) → Ok  [PV12 chain, header proposes pv+1=13]
+    #[test]
+    fn envelope_pv12_config_ledger12_header13_ok() {
+        let (a, b) = run_envelope(12, 12, 13);
+        assert!(a.is_ok(), "path A: expected Ok, got {a:?}");
+        assert!(b.is_ok(), "path B: expected Ok, got {b:?}");
+    }
+
+    // Row 8: (12, 12, 14) → Err(HeaderProtVerTooHigh)  [header skips two versions]
+    #[test]
+    fn envelope_pv12_config_ledger12_header14_too_high() {
+        let (a, b) = run_envelope(12, 12, 14);
+        assert!(
+            matches!(a, Err(ConsensusError::HeaderProtVerTooHigh { .. })),
+            "path A: expected HeaderProtVerTooHigh, got {a:?}"
+        );
+        assert!(
+            matches!(b, Err(ConsensusError::HeaderProtVerTooHigh { .. })),
+            "path B: expected HeaderProtVerTooHigh, got {b:?}"
+        );
+    }
+
+    // Row 9: (12, 13, 13) → Err(ObsoleteNode)  [chain at PV13, node max is 12]
+    #[test]
+    fn envelope_pv12_config_ledger13_obsolete_node() {
+        let (a, b) = run_envelope(12, 13, 13);
+        assert!(
+            matches!(a, Err(ConsensusError::ObsoleteNode { .. })),
+            "path A: expected ObsoleteNode, got {a:?}"
+        );
+        assert!(
+            matches!(b, Err(ConsensusError::ObsoleteNode { .. })),
+            "path B: expected ObsoleteNode, got {b:?}"
+        );
+    }
 }
 
 // Checkpoint loader lives in dugite-node (has serde_json/hex deps).
