@@ -527,8 +527,22 @@ impl QueryHandler {
                 QueryResult::NoFuturePParams
             }
             34 => {
-                // Tag 34: GetLedgerPeerSnapshot (V19+)
-                stake::handle_ledger_peer_snapshot(&self.state)
+                // Tag 34: GetLedgerPeerSnapshot
+                //
+                // Wire shape varies by N2C version (issue #456):
+                //   V19-V22 request: `array(1)[34]`           → V2 response (tag 1)
+                //   V23+    request: `array(2)[34, peerKind]` → V23 response
+                //                    peerKind = 0 (All, tag 3) or 1 (Big, tag 2)
+                //
+                // We detect the V23 path by peeking for an extra `peerKind`
+                // byte left on the decoder by `dispatch_era_query`. If the
+                // decoder is empty, fall back to the legacy V2 response.
+                let peer_kind = decoder.u8().ok();
+                match peer_kind {
+                    Some(0) => stake::handle_ledger_peer_snapshot_v23(&self.state, false),
+                    Some(_) => stake::handle_ledger_peer_snapshot_v23(&self.state, true),
+                    None => stake::handle_ledger_peer_snapshot(&self.state),
+                }
             }
             35 => {
                 // Tag 35: QueryStakePoolDefaultVote (V20+)
@@ -681,6 +695,36 @@ mod tests {
         match query(&handler, 1) {
             QueryResult::EpochNo(e) => assert_eq!(e, 0),
             other => panic!("Expected EpochNo, got {other:?}"),
+        }
+    }
+
+    /// Regression for issue #456: tag 34 dispatch must select V2 vs V23
+    /// based on whether the request carries a trailing `peerKind` byte.
+    /// V22 path: empty decoder → legacy `LedgerPeerSnapshot`.
+    /// V23 path: `peerKind=0` → All; `peerKind=1` (or any non-zero) → Big.
+    #[test]
+    fn test_ledger_peer_snapshot_request_routing() {
+        let handler = QueryHandler::new(11);
+        // V22 request: no extra byte left on the decoder
+        let empty = [0u8; 0];
+        let mut dec = minicbor::Decoder::new(&empty);
+        match handler.handle_shelley_query(34, &mut dec) {
+            QueryResult::LedgerPeerSnapshot(_) => {}
+            other => panic!("V22 path must return legacy LedgerPeerSnapshot, got {other:?}"),
+        }
+        // V23 request, peerKind=1 (Big)
+        let big_cbor = [0x01u8];
+        let mut dec = minicbor::Decoder::new(&big_cbor);
+        match handler.handle_shelley_query(34, &mut dec) {
+            QueryResult::LedgerPeerSnapshotV23 { big: true, .. } => {}
+            other => panic!("peerKind=1 must yield Big V23 variant, got {other:?}"),
+        }
+        // V23 request, peerKind=0 (All)
+        let all_cbor = [0x00u8];
+        let mut dec = minicbor::Decoder::new(&all_cbor);
+        match handler.handle_shelley_query(34, &mut dec) {
+            QueryResult::LedgerPeerSnapshotV23 { big: false, .. } => {}
+            other => panic!("peerKind=0 must yield All V23 variant, got {other:?}"),
         }
     }
 

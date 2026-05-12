@@ -401,6 +401,18 @@ pub(crate) fn encode_query_result_value(
         QueryResult::LedgerPeerSnapshot(peers) => {
             encode_ledger_peer_snapshot(enc, peers);
         }
+        QueryResult::LedgerPeerSnapshotV23 {
+            big,
+            anchor,
+            network_magic,
+            peers,
+        } => {
+            if *big {
+                encode_ledger_peer_snapshot_v23_big(enc, anchor, *network_magic, peers);
+            } else {
+                encode_ledger_peer_snapshot_v23_all(enc, anchor, *network_magic, peers);
+            }
+        }
         QueryResult::StakePoolDefaultVote(vote) => {
             // Bare word8: 0=DefaultNo, 1=DefaultAbstain, 2=DefaultNoConfidence
             enc.u8(*vote).ok();
@@ -2286,6 +2298,132 @@ fn encode_ledger_peer_snapshot(
     enc.end().ok(); // end pool list
 }
 
+// ─── V23 LedgerPeerSnapshot encoders (issue #456) ────────────────────────────
+
+/// Encode a `Point RawBlockHash` for the V23 ledger-peer snapshot.
+///
+/// Haskell wire layout (ouroboros-network `Ouroboros.Network.Block`):
+///   * `Origin`           → `array(1)[0]`
+///   * `Block slot hash`  → `array(3)[1, slot, bstr(32)]`
+fn encode_point_raw_block_hash(
+    enc: &mut minicbor::Encoder<&mut Vec<u8>>,
+    point: &dugite_primitives::block::Point,
+) {
+    use dugite_primitives::block::Point;
+    match point {
+        Point::Origin => {
+            enc.array(1).ok();
+            enc.u32(0).ok();
+        }
+        Point::Specific(slot, hash) => {
+            enc.array(3).ok();
+            enc.u32(1).ok();
+            enc.u64(slot.0).ok();
+            enc.bytes(hash.as_ref()).ok();
+        }
+    }
+}
+
+/// Filter `peers` to the "big ledger peers" set (top pools controlling 90% of
+/// stake) and return them along with the total stake (denominator for the
+/// rational shares).
+fn select_big_peers(
+    peers: &[crate::node::n2c_query::types::LedgerPeerEntry],
+) -> (Vec<&crate::node::n2c_query::types::LedgerPeerEntry>, u64) {
+    let mut sorted: Vec<_> = peers.iter().filter(|p| p.stake > 0).collect();
+    sorted.sort_by_key(|r| std::cmp::Reverse(r.stake));
+    let total: u64 = sorted.iter().map(|p| p.stake).sum();
+    let cutoff = total * 9 / 10;
+    let mut acc: u64 = 0;
+    let mut out = Vec::new();
+    for peer in sorted {
+        out.push(peer);
+        acc += peer.stake;
+        if acc >= cutoff {
+            break;
+        }
+    }
+    (out, total)
+}
+
+/// V23 BigLedgerPeers (outer discriminator `uint(2)`).
+///
+/// `array(2)[ uint(2), array(3)[Point, NetworkMagic, pools_indef] ]`
+/// where each pool is `array(3)[AccPoolStake_rat, PoolStake_rat, relays_indef]`.
+pub(crate) fn encode_ledger_peer_snapshot_v23_big(
+    enc: &mut minicbor::Encoder<&mut Vec<u8>>,
+    anchor: &dugite_primitives::block::Point,
+    network_magic: u32,
+    peers: &[crate::node::n2c_query::types::LedgerPeerEntry],
+) {
+    let (big_peers, total_stake) = select_big_peers(peers);
+    let denom = total_stake.max(1);
+
+    enc.array(2).ok();
+    enc.u32(2).ok(); // V23 Big discriminator
+    enc.array(3).ok();
+    encode_point_raw_block_hash(enc, anchor);
+    enc.u32(network_magic).ok();
+    enc.begin_array().ok();
+    let mut acc_num: u64 = 0;
+    for peer in &big_peers {
+        acc_num += peer.stake;
+        enc.array(3).ok();
+        // AccPoolStake (running cumulative share)
+        enc.array(2).ok();
+        enc.u64(acc_num).ok();
+        enc.u64(denom).ok();
+        // PoolStake (individual share)
+        enc.array(2).ok();
+        enc.u64(peer.stake).ok();
+        enc.u64(denom).ok();
+        // Relays (NonEmpty, indefinite list)
+        enc.begin_array().ok();
+        for relay in &peer.relays {
+            encode_ledger_relay(enc, relay);
+        }
+        enc.end().ok();
+    }
+    enc.end().ok();
+}
+
+/// V23 AllLedgerPeers (outer discriminator `uint(3)`).
+///
+/// `array(2)[ uint(3), array(3)[Point, NetworkMagic, pools_indef] ]`
+/// where each pool is `array(2)[PoolStake_rat, relays_indef]`.  Note no
+/// `AccPoolStake` field (the All variant lists every pool, not just the
+/// 90%-stake-weighted prefix).
+pub(crate) fn encode_ledger_peer_snapshot_v23_all(
+    enc: &mut minicbor::Encoder<&mut Vec<u8>>,
+    anchor: &dugite_primitives::block::Point,
+    network_magic: u32,
+    peers: &[crate::node::n2c_query::types::LedgerPeerEntry],
+) {
+    let mut sorted: Vec<_> = peers.iter().filter(|p| p.stake > 0).collect();
+    sorted.sort_by_key(|r| std::cmp::Reverse(r.stake));
+    let total_stake: u64 = sorted.iter().map(|p| p.stake).sum();
+    let denom = total_stake.max(1);
+
+    enc.array(2).ok();
+    enc.u32(3).ok(); // V23 All discriminator
+    enc.array(3).ok();
+    encode_point_raw_block_hash(enc, anchor);
+    enc.u32(network_magic).ok();
+    enc.begin_array().ok();
+    for peer in &sorted {
+        enc.array(2).ok();
+        enc.array(2).ok();
+        enc.u64(peer.stake).ok();
+        enc.u64(denom).ok();
+        enc.begin_array().ok();
+        for relay in &peer.relays {
+            encode_ledger_relay(enc, relay);
+        }
+        enc.end().ok();
+    }
+    enc.end().ok();
+}
+
 // ─── Hash-size regression tests ───────────────────────────────────────────────
 //
 // These tests verify that all credential/pool-ID/DRep hashes are encoded as
@@ -3357,5 +3495,97 @@ mod tests {
             era, 6,
             "CurrentEra must be a bare word(6) with no HFC wrapper"
         );
+    }
+
+    // ── V23 LedgerPeerSnapshot golden tests (issue #456) ─────────────────────
+
+    /// V23 BigLedgerPeers outer discriminator must be `uint(2)` and the
+    /// payload must be `array(3)[Point, NetworkMagic, indef pools]`.
+    #[test]
+    fn test_ledger_peer_snapshot_v23_big_golden() {
+        use crate::node::n2c_query::types::{LedgerPeerEntry, RelaySnapshot};
+        use dugite_primitives::block::Point;
+        let peers = vec![LedgerPeerEntry {
+            pool_id: vec![1u8; 28],
+            stake: 1_000_000,
+            relays: vec![RelaySnapshot::SingleHostName {
+                port: Some(3001),
+                dns_name: "r.example".to_string(),
+            }],
+        }];
+        let result = QueryResult::LedgerPeerSnapshotV23 {
+            big: true,
+            anchor: Point::Origin,
+            network_magic: 2,
+            peers,
+        };
+        let encoded = encode_query_result(&result);
+        let payload = strip_wrappers(&encoded);
+
+        let mut dec = Decoder::new(&payload);
+        assert_eq!(dec.array().unwrap(), Some(2));
+        assert_eq!(dec.u32().unwrap(), 2, "Big variant discriminator must be 2");
+        assert_eq!(dec.array().unwrap(), Some(3));
+        // Point: Origin → array(1)[0]
+        assert_eq!(dec.array().unwrap(), Some(1));
+        assert_eq!(dec.u32().unwrap(), 0);
+        // NetworkMagic
+        assert_eq!(dec.u32().unwrap(), 2);
+        // Pools (indefinite array)
+        assert_eq!(dec.array().unwrap(), None, "pools must be indef-length");
+    }
+
+    /// V23 AllLedgerPeers outer discriminator must be `uint(3)`, each pool entry
+    /// must be `array(2)[PoolStake_rat, relays]` (no AccPoolStake), and the
+    /// Block-point case must encode as `array(3)[1, slot, bstr(32)]`.
+    #[test]
+    fn test_ledger_peer_snapshot_v23_all_golden_with_block_point() {
+        use crate::node::n2c_query::types::{LedgerPeerEntry, RelaySnapshot};
+        use dugite_primitives::block::Point;
+        use dugite_primitives::hash::Hash;
+        use dugite_primitives::time::SlotNo;
+        let anchor = Point::Specific(SlotNo(12345), Hash::<32>([7u8; 32]));
+        let peers = vec![LedgerPeerEntry {
+            pool_id: vec![1u8; 28],
+            stake: 1_000_000,
+            relays: vec![RelaySnapshot::SingleHostName {
+                port: Some(3001),
+                dns_name: "r.example".to_string(),
+            }],
+        }];
+        let result = QueryResult::LedgerPeerSnapshotV23 {
+            big: false,
+            anchor,
+            network_magic: 764824073,
+            peers,
+        };
+        let encoded = encode_query_result(&result);
+        let payload = strip_wrappers(&encoded);
+
+        let mut dec = Decoder::new(&payload);
+        assert_eq!(dec.array().unwrap(), Some(2));
+        assert_eq!(dec.u32().unwrap(), 3, "All variant discriminator must be 3");
+        assert_eq!(dec.array().unwrap(), Some(3));
+        // Point: Block → array(3)[1, slot, hash]
+        assert_eq!(dec.array().unwrap(), Some(3));
+        assert_eq!(dec.u32().unwrap(), 1);
+        assert_eq!(dec.u64().unwrap(), 12345);
+        let hash = dec.bytes().unwrap();
+        assert_eq!(hash.len(), 32);
+        assert_eq!(hash, &[7u8; 32]);
+        // NetworkMagic
+        assert_eq!(dec.u32().unwrap(), 764824073);
+        // Pools indef
+        assert_eq!(dec.array().unwrap(), None);
+        // First pool: array(2)[PoolStake_rat, relays_indef] — no AccPoolStake
+        assert_eq!(
+            dec.array().unwrap(),
+            Some(2),
+            "All variant pool entry must be array(2), not array(3)"
+        );
+        assert_eq!(dec.array().unwrap(), Some(2)); // rational
+        let _num = dec.u64().unwrap();
+        let _den = dec.u64().unwrap();
+        assert_eq!(dec.array().unwrap(), None, "relays must be indef-length");
     }
 }
