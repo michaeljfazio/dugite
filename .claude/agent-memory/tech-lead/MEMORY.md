@@ -1,5 +1,8 @@
 # Tech Lead Agent Memory
 
+## Era Rules
+- [Dijkstra era rules dispatch (#462)](issue-462-dijkstra-era-rules.md) — Conway alias removed; DijkstraRules delegates to Conway plus identity translateEraDijkstra
+
 ## Critical Invariants & Bug Patterns
 - [ChainSync at_tip rollback stall](chainsync-at-tip-rollback-stall.md) — at_tip not reset on MsgRollBackward → pipeline freeze → bearer closed; fix: at_tip=false in MsgRollBackward arm (5abaf2687)
 - [Fork snapshot stall cascade](fork-snapshot-stall-fix.md) — 6-bug cascade: fork snapshot → bad intersection → deep rollback → UTxO corruption; all fixed (1ff9cbce)

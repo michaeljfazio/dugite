@@ -9,6 +9,7 @@ pub mod babbage;
 pub mod byron;
 pub mod common;
 pub mod conway;
+pub mod dijkstra;
 pub mod shelley;
 
 use std::collections::{HashMap, HashSet};
@@ -171,6 +172,7 @@ pub enum EraRulesImpl {
     Alonzo(alonzo::AlonzoRules),
     Babbage(babbage::BabbageRules),
     Conway(conway::ConwayRules),
+    Dijkstra(dijkstra::DijkstraRules),
 }
 
 impl EraRulesImpl {
@@ -185,9 +187,13 @@ impl EraRulesImpl {
             Era::Shelley | Era::Allegra | Era::Mary => Self::Shelley(shelley::ShelleyRules),
             Era::Alonzo => Self::Alonzo(alonzo::AlonzoRules),
             Era::Babbage => Self::Babbage(babbage::BabbageRules),
-            // Dijkstra uses Conway-compatible ledger rules; full Dijkstra rules
-            // will be added when pallas gains native Dijkstra support.
-            Era::Conway | Era::Dijkstra => Self::Conway(conway::ConwayRules),
+            Era::Conway => Self::Conway(conway::ConwayRules),
+            // Dijkstra ledger rules delegate most logic to Conway (state
+            // machine is unchanged) but implement Conway -> Dijkstra
+            // translation explicitly and reserve hooks for sub-transactions,
+            // direct_deposits, account_balance_intervals, credential guards,
+            // PlutusV4, and PParams 34-37 — see issue #462.
+            Era::Dijkstra => Self::Dijkstra(dijkstra::DijkstraRules),
         }
     }
 }
@@ -205,6 +211,7 @@ impl EraRules for EraRulesImpl {
             Self::Alonzo(r) => r.validate_block_body(block, ctx, utxo),
             Self::Babbage(r) => r.validate_block_body(block, ctx, utxo),
             Self::Conway(r) => r.validate_block_body(block, ctx, utxo),
+            Self::Dijkstra(r) => r.validate_block_body(block, ctx, utxo),
         }
     }
 
@@ -224,6 +231,7 @@ impl EraRules for EraRulesImpl {
             Self::Alonzo(r) => r.apply_valid_tx(tx, mode, ctx, utxo, certs, gov, epochs),
             Self::Babbage(r) => r.apply_valid_tx(tx, mode, ctx, utxo, certs, gov, epochs),
             Self::Conway(r) => r.apply_valid_tx(tx, mode, ctx, utxo, certs, gov, epochs),
+            Self::Dijkstra(r) => r.apply_valid_tx(tx, mode, ctx, utxo, certs, gov, epochs),
         }
     }
 
@@ -242,6 +250,7 @@ impl EraRules for EraRulesImpl {
             Self::Alonzo(r) => r.apply_invalid_tx(tx, mode, ctx, utxo, certs, epochs),
             Self::Babbage(r) => r.apply_invalid_tx(tx, mode, ctx, utxo, certs, epochs),
             Self::Conway(r) => r.apply_invalid_tx(tx, mode, ctx, utxo, certs, epochs),
+            Self::Dijkstra(r) => r.apply_invalid_tx(tx, mode, ctx, utxo, certs, epochs),
         }
     }
 
@@ -271,6 +280,9 @@ impl EraRules for EraRulesImpl {
             Self::Conway(r) => {
                 r.process_epoch_transition(new_epoch, ctx, utxo, certs, gov, epochs, consensus)
             }
+            Self::Dijkstra(r) => {
+                r.process_epoch_transition(new_epoch, ctx, utxo, certs, gov, epochs, consensus)
+            }
         }
     }
 
@@ -286,6 +298,7 @@ impl EraRules for EraRulesImpl {
             Self::Alonzo(r) => r.evolve_nonce(header, ctx, consensus),
             Self::Babbage(r) => r.evolve_nonce(header, ctx, consensus),
             Self::Conway(r) => r.evolve_nonce(header, ctx, consensus),
+            Self::Dijkstra(r) => r.evolve_nonce(header, ctx, consensus),
         }
     }
 
@@ -296,6 +309,7 @@ impl EraRules for EraRulesImpl {
             Self::Alonzo(r) => r.min_fee(tx, ctx, utxo),
             Self::Babbage(r) => r.min_fee(tx, ctx, utxo),
             Self::Conway(r) => r.min_fee(tx, ctx, utxo),
+            Self::Dijkstra(r) => r.min_fee(tx, ctx, utxo),
         }
     }
 
@@ -325,6 +339,9 @@ impl EraRules for EraRulesImpl {
             Self::Conway(r) => {
                 r.on_era_transition(from_era, ctx, utxo, certs, gov, consensus, epochs)
             }
+            Self::Dijkstra(r) => {
+                r.on_era_transition(from_era, ctx, utxo, certs, gov, consensus, epochs)
+            }
         }
     }
 
@@ -342,6 +359,7 @@ impl EraRules for EraRulesImpl {
             Self::Alonzo(r) => r.required_witnesses(tx, ctx, utxo, certs, gov),
             Self::Babbage(r) => r.required_witnesses(tx, ctx, utxo, certs, gov),
             Self::Conway(r) => r.required_witnesses(tx, ctx, utxo, certs, gov),
+            Self::Dijkstra(r) => r.required_witnesses(tx, ctx, utxo, certs, gov),
         }
     }
 }
