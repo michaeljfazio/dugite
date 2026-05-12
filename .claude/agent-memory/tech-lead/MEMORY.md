@@ -12,7 +12,8 @@
 - [Deferred pointer stake (sisPtrStake)](ledger-ptr-stake-deferred.md) — ptr_stake field + StakeRouting enum; resolves at SNAP time not insertion; 603 epoch mismatches from epoch 647
 
 ## N2C Protocol Compliance
-- [Conway PParams protocolVersion position](n2c-pparams-protover-position.md) — protocolVersion is index 30 (LAST), not 12; issue #336 cardano-cli `transaction build` decode break (FIXED 2026-05-12)
+- [Conway PParams protocolVersion position](n2c-pparams-protover-position.md) — protocolVersion sits at index 12 (between tau and minPoolCost), NOT 30; the prior "index 30" entry was the inverted bug fixed by issue #434 (2026-05-12)
+- [Issue #434 gov-state decode failure](issue-434-gov-state-decode.md) — 3 stacked bugs all surfacing as "0 active proposals": PParams positional order, vote-map dedup, OMap forest insertion order
 - [Hash32 padding convention](n2c-hash32-padding.md) — 28→32 byte padding/truncation rules for N2C wire output
 - [Credential type discrimination](n2c-credential-type-discrimination.md) — Track KeyHash vs Script via HashSets; DRep stores full Credential
 - [Committee state encoding bugs](n2c-committee-state-bugs.md) — Open issues: wrong source map, hardcoded hot credential type
