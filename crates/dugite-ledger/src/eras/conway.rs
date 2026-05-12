@@ -696,6 +696,28 @@ impl EraRules for ConwayRules {
         _consensus: &mut ConsensusSubState,
         epochs: &mut EpochSubState,
     ) -> Result<(), LedgerError> {
+        // Guard: this rule implements the Babbage -> Conway TranslateEra only.
+        //
+        // `crates/dugite-ledger/src/eras/mod.rs` currently aliases Dijkstra to
+        // `ConwayRules` (full Dijkstra rules are pending), so this method is
+        // also dispatched for the Conway -> Dijkstra boundary. Re-running the
+        // Babbage->Conway init steps in that case is destructive:
+        //   - re-seeds DReps that may have been unregistered since Conway,
+        //   - overwrites committee_expiration / committee_threshold / constitution
+        //     with the original ConwayGenesis values,
+        //   - zeroes any in-flight `pending_donations`.
+        //
+        // Issue #467. Once a real `DijkstraRules` exists this guard becomes
+        // belt-and-braces, but we keep it as defense-in-depth.
+        if from_era != Era::Babbage {
+            debug!(
+                "Conway::on_era_transition called with from_era={:?}; skipping \
+                 (only Babbage->Conway runs init logic; see issue #467)",
+                from_era
+            );
+            return Ok(());
+        }
+
         debug!(
             "{:?} -> Conway era transition: excluding pointer stake, resetting donations",
             from_era
@@ -2689,6 +2711,161 @@ mod tests {
         // But steps 1 and 5 should still apply.
         assert!(epochs.ptr_stake_excluded);
         assert_eq!(utxo.pending_donations.0, 0);
+    }
+
+    /// Issue #467 regression: when `ConwayRules` is dispatched for the
+    /// Conway -> Dijkstra boundary (because Dijkstra is aliased to ConwayRules
+    /// in `eras/mod.rs`), the Babbage->Conway init steps must NOT run.
+    /// Governance state (DReps, committee, constitution, threshold) and
+    /// in-flight donations must be preserved verbatim.
+    #[test]
+    fn test_on_era_transition_conway_to_dijkstra_preserves_state() {
+        use crate::eras::ConwayGenesisInit;
+        use dugite_primitives::transaction::Constitution;
+
+        let rules = ConwayRules::new();
+        let params = ProtocolParameters::mainnet_defaults();
+
+        // Provide a non-empty ConwayGenesis so that, if the guard were missing,
+        // the Babbage->Conway re-seeding would overwrite our mutated state and
+        // the assertions below would fail loudly.
+        let genesis = ConwayGenesisInit {
+            initial_dreps: vec![(Hash28::from_bytes([0xAA; 28]), 12_345_000)],
+            committee_members: vec![([0xBB; 32], 99)],
+            committee_threshold: Some((1, 7)),
+            constitution: Some(Constitution {
+                anchor: Anchor {
+                    url: "https://genesis-constitution.example".to_string(),
+                    data_hash: Hash32::from_bytes([0xEE; 32]),
+                },
+                script_hash: None,
+            }),
+        };
+        let delegates = Box::leak(Box::new(HashMap::new()));
+        let ctx = RuleContext {
+            params: &params,
+            current_slot: 1_000_000,
+            current_epoch: EpochNo(500),
+            era: Era::Dijkstra,
+            slot_config: None,
+            node_network: None,
+            genesis_delegates: delegates,
+            update_quorum: 5,
+            epoch_length: 432000,
+            shelley_transition_epoch: 0,
+            byron_epoch_length: 21600,
+            stability_window: 129600,
+            stability_window_3kf: 129600,
+            randomness_stabilisation_window: 129600,
+            tx_index: 0,
+            conway_genesis: Some(&genesis),
+        };
+
+        // Build a Conway-era ledger sub-state with governance that diverges
+        // from the ConwayGenesis values above.
+        let mut utxo = make_utxo_sub(vec![]);
+        utxo.pending_donations = Lovelace(7_777_777);
+        let mut certs = make_cert_sub();
+        let mut gov = make_gov_sub();
+        let mut consensus = make_consensus_sub();
+        let mut epochs = make_epoch_sub();
+        epochs.ptr_stake_excluded = true;
+
+        // Mutated DRep (different hash + deposit + expiry than genesis).
+        let live_drep_hash = Hash28::from_bytes([0x11; 28]);
+        let live_drep_key = Hash32::from_bytes({
+            let mut buf = [0u8; 32];
+            buf[..28].copy_from_slice(live_drep_hash.as_bytes());
+            buf
+        });
+        {
+            let governance = Arc::make_mut(&mut gov.governance);
+            governance.dreps.insert(
+                live_drep_key,
+                DRepRegistration {
+                    credential: Credential::VerificationKey(live_drep_hash),
+                    deposit: Lovelace(999_000_000),
+                    drep_expiry: EpochNo(550),
+                    anchor: None,
+                    registered_epoch: EpochNo(450),
+                    active: true,
+                },
+            );
+            // Mutated committee (different cred + expiry than genesis).
+            governance
+                .committee_expiration
+                .insert(Hash32::from_bytes([0x22; 32]), EpochNo(600));
+            // Mutated threshold (1/2 != genesis 1/7).
+            governance.committee_threshold = Some(dugite_primitives::transaction::Rational {
+                numerator: 1,
+                denominator: 2,
+            });
+            // Mutated constitution (different URL than genesis).
+            governance.constitution = Some(Constitution {
+                anchor: Anchor {
+                    url: "https://post-conway-ratified.example".to_string(),
+                    data_hash: Hash32::from_bytes([0x33; 32]),
+                },
+                script_hash: None,
+            });
+        }
+
+        // Fire transition with from_era = Conway (target dispatched as ConwayRules
+        // because Dijkstra is currently aliased).
+        rules
+            .on_era_transition(
+                Era::Conway,
+                &ctx,
+                &mut utxo,
+                &mut certs,
+                &mut gov,
+                &mut consensus,
+                &mut epochs,
+            )
+            .expect("Conway->Dijkstra transition should be a no-op and succeed");
+
+        // Assertions: every piece of mutated state survives intact.
+        assert_eq!(gov.governance.dreps.len(), 1, "DReps must not be re-seeded");
+        let drep = gov
+            .governance
+            .dreps
+            .get(&live_drep_key)
+            .expect("live DRep must still be present");
+        assert_eq!(drep.deposit.0, 999_000_000);
+        assert_eq!(drep.drep_expiry, EpochNo(550));
+
+        assert_eq!(
+            gov.governance.committee_expiration.len(),
+            1,
+            "committee must not be re-seeded from genesis"
+        );
+        assert_eq!(
+            gov.governance
+                .committee_expiration
+                .get(&Hash32::from_bytes([0x22; 32])),
+            Some(&EpochNo(600))
+        );
+
+        let threshold = gov
+            .governance
+            .committee_threshold
+            .as_ref()
+            .expect("threshold must still be set");
+        assert_eq!(threshold.numerator, 1);
+        assert_eq!(threshold.denominator, 2);
+
+        let constitution = gov
+            .governance
+            .constitution
+            .as_ref()
+            .expect("constitution must still be set");
+        assert_eq!(
+            constitution.anchor.url,
+            "https://post-conway-ratified.example"
+        );
+
+        // In-flight donations must NOT be zeroed.
+        assert_eq!(utxo.pending_donations.0, 7_777_777);
     }
 
     /// Verify that `process_epoch_transition` calls `ratify_proposals_impl`
