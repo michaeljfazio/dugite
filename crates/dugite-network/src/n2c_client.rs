@@ -324,6 +324,34 @@ impl N2CClient {
         self.send_shelley_query(5).await
     }
 
+    /// Query non-myopic member rewards
+    /// (`GetNonMyopicMemberRewards` -- Shelley query tag 2).
+    ///
+    /// `stake_amounts` is the list of hypothetical delegator stakes (lovelace)
+    /// to evaluate against every registered pool.  The server returns a map
+    /// `stake_amount -> map<pool_id, expected_reward_lovelace>` matching
+    /// Haskell's `getNonMyopicMemberRewards` from
+    /// cardano-ledger-shelley/Rules/NewEpoch.hs.
+    ///
+    /// Returns raw MsgResult CBOR payload for the CLI to parse.
+    pub async fn query_non_myopic_member_rewards(
+        &mut self,
+        stake_amounts: &[u64],
+    ) -> Result<Vec<u8>, NetworkError> {
+        // Inner: array(2)[2, array(N) [amount...]]
+        let mut inner = Vec::new();
+        let mut enc = minicbor::Encoder::new(&mut inner);
+        enc.array(2).map_err(cbor_err)?;
+        enc.u32(2).map_err(cbor_err)?; // GetNonMyopicMemberRewards
+        enc.array(stake_amounts.len() as u64).map_err(cbor_err)?;
+        for amount in stake_amounts {
+            enc.u64(*amount).map_err(cbor_err)?;
+        }
+        let buf = encode_conway_block_query(&inner)?;
+        self.send_query(buf).await?;
+        self.recv_query().await
+    }
+
     /// Query UTxOs by specific transaction inputs (`GetUTxOByTxIn` -- Shelley query tag 15).
     ///
     /// Each input is a `(tx_hash_bytes, output_index)` pair.

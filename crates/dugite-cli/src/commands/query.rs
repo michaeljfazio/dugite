@@ -105,6 +105,25 @@ enum QuerySubcommand {
         #[arg(long)]
         testnet_magic: Option<u64>,
     },
+    /// Query expected (non-myopic) member rewards for hypothetical delegator stakes.
+    ///
+    /// Matches `cardano-cli query non-myopic-member-rewards`.  Returns the
+    /// expected lovelace reward for each requested stake amount against every
+    /// registered pool, assuming ideal performance.  Useful as input to the
+    /// cardano-wallet pool ranking advisor.
+    #[command(name = "non-myopic-member-rewards")]
+    NonMyopicMemberRewards {
+        #[arg(long, default_value = "node.sock")]
+        socket_path: PathBuf,
+        #[arg(long)]
+        testnet_magic: Option<u64>,
+        /// One or more hypothetical delegator stake values, in lovelace.
+        /// May be repeated.  Defaults to 1 ADA (1_000_000_000_000 lovelace)
+        /// when no value is supplied — matches the server-side default and
+        /// produces a generic pool ranking.
+        #[arg(long = "stake", value_name = "LOVELACE")]
+        stakes: Vec<u64>,
+    },
     /// Query stake snapshots (mark/set/go)
     StakeSnapshot {
         #[arg(long, default_value = "node.sock")]
@@ -1741,6 +1760,89 @@ impl QueryCmd {
                     println!("{:<58} {:>11.6}%", p.pool_id, stake_frac * 100.0);
                 }
                 println!("\nTotal pools: {}", pools.len());
+                Ok(())
+            }
+            QuerySubcommand::NonMyopicMemberRewards {
+                socket_path,
+                testnet_magic,
+                stakes,
+            } => {
+                let mut client = connect_and_acquire(&socket_path, testnet_magic).await?;
+
+                let stake_amounts = if stakes.is_empty() {
+                    // Default matches the server-side default (1 ADA in lovelace,
+                    // sentinel for "rank pools without specifying a stake").
+                    vec![1_000_000_000_000]
+                } else {
+                    stakes
+                };
+
+                let raw = client
+                    .query_non_myopic_member_rewards(&stake_amounts)
+                    .await
+                    .map_err(|e| {
+                        anyhow::anyhow!("Failed to query non-myopic-member-rewards: {e}")
+                    })?;
+
+                release_and_done(&mut client).await;
+
+                // Parse MsgResult [4, [...result...]] with HFC wrapper.
+                let mut decoder = minicbor::Decoder::new(&raw);
+                let _ = decoder.array();
+                let tag = decoder.u32().unwrap_or(999);
+                if tag != 4 {
+                    anyhow::bail!("Expected MsgResult tag 4, got {tag}");
+                }
+                // Strip HFC wrapper (array(1) [result] OR array(2) [1, result]).
+                let pos = decoder.position();
+                if let Ok(Some(2)) = decoder.array() {
+                    let _ = decoder.u64();
+                } else {
+                    decoder.set_position(pos);
+                    let _ = decoder.array();
+                }
+
+                // Result layout: map<stake_amount, map<pool_id_bytes, reward>>.
+                let mut json_entries = Vec::new();
+                let outer_len = decoder.map().unwrap_or(Some(0)).unwrap_or(0);
+                for _ in 0..outer_len {
+                    let stake_amount = decoder.u64().unwrap_or(0);
+                    let mut pool_rewards: Vec<(String, u64)> = Vec::new();
+                    let inner_len = decoder.map().unwrap_or(Some(0)).unwrap_or(0);
+                    for _ in 0..inner_len {
+                        let pool_id = hex::encode(decoder.bytes().unwrap_or(&[]));
+                        let reward = decoder.u64().unwrap_or(0);
+                        pool_rewards.push((pool_id, reward));
+                    }
+                    pool_rewards.sort_by_key(|p| std::cmp::Reverse(p.1));
+                    json_entries.push((stake_amount, pool_rewards));
+                }
+
+                // Emit JSON compatible with cardano-cli's output shape:
+                //   { "<stake_amount>": { "<pool_id>": <reward>, ... }, ... }
+                let mut out = String::from("{\n");
+                for (i, (stake_amount, pool_rewards)) in json_entries.iter().enumerate() {
+                    out.push_str(&format!("  \"{stake_amount}\": {{"));
+                    if pool_rewards.is_empty() {
+                        out.push('}');
+                    } else {
+                        out.push('\n');
+                        for (j, (pool_id, reward)) in pool_rewards.iter().enumerate() {
+                            out.push_str(&format!("    \"{pool_id}\": {reward}"));
+                            if j + 1 < pool_rewards.len() {
+                                out.push(',');
+                            }
+                            out.push('\n');
+                        }
+                        out.push_str("  }");
+                    }
+                    if i + 1 < json_entries.len() {
+                        out.push(',');
+                    }
+                    out.push('\n');
+                }
+                out.push('}');
+                println!("{out}");
                 Ok(())
             }
             QuerySubcommand::StakeSnapshot {

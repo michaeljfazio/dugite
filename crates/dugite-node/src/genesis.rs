@@ -618,9 +618,22 @@ impl AlonzoGenesis {
 
         // UTxO cost
         if let Some(lovelace_per_word) = self.lovelace_per_u_tx_o_word {
-            // Convert lovelacePerUTxOWord to adaPerUTxOByte
-            // 1 word = 8 bytes, so per-byte cost = per-word / 8
-            // But Babbage uses adaPerUTxOByte directly; for Alonzo era we approximate
+            // Convert lovelacePerUTxOWord -> adaPerUTxOByte using the exact
+            // formula from cardano-ledger's Babbage translation:
+            //
+            //   coinsPerUTxOWordToCoinsPerUTxOByte (CoinPerWord (Coin c)) =
+            //       CoinPerByte (CompactCoin (fromIntegral (c `div` 8)))
+            //
+            // ref: eras/babbage/impl/src/Cardano/Ledger/Babbage/PParams.hs
+            //      (function `coinsPerUTxOWordToCoinsPerUTxOByte`)
+            //
+            // This is the canonical Haskell-side conversion, not an
+            // approximation — the Alonzo genesis value is denominated in
+            // lovelace per 8-byte word and Babbage exposes the per-byte rate
+            // by integer division.  Babbage+ chains override this via a
+            // protocol-parameter update before any UTxO costs are checked
+            // against it, so the (rare, single-lovelace) rounding loss from
+            // integer division is unobservable at consensus level.
             params.ada_per_utxo_byte = Lovelace(lovelace_per_word / 8);
         }
 
