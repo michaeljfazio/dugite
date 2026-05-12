@@ -1302,7 +1302,7 @@ fn parse_protocol_params_cbor(payload: &[u8]) -> Result<String, NetworkError> {
 // ── Transaction rejection decoding ───────────────────────────────────────
 
 /// Decode the nested `MsgRejectTx` reason from CBOR wire format.
-fn decode_reject_reason(decoder: &mut minicbor::Decoder<'_>) -> Option<String> {
+pub(crate) fn decode_reject_reason(decoder: &mut minicbor::Decoder<'_>) -> Option<String> {
     let _ = decoder.array().ok()?;
     let _ = decoder.array().ok()?;
     let _era_idx = decoder.u8().ok()?;
@@ -1472,12 +1472,112 @@ fn decode_conway_utxo_pred_failure(decoder: &mut minicbor::Decoder<'_>) -> Optio
                 "IncorrectTotalCollateralField: delta {delta}, declared {declared} lovelace"
             ))
         }
+        // Tag 0: UtxosFailure — wraps ConwayUtxosPredFailure
+        //   ValidationTagMismatch(0) | CollectErrors(1)
+        // We decode CollectErrors → BadTranslation → ConwayContextError tag 15
+        // (`ReferenceInputsNotDisjointFromInputs`) explicitly; everything else
+        // is summarised generically.
+        0 => decode_conway_utxos_pred_failure(decoder),
         // Tag 22: BabbageNonDisjointRefInputs — set of overlapping TxIn
         22 => {
             let _ = decoder.skip();
             Some("BabbageNonDisjointRefInputs: reference inputs overlap regular inputs".to_string())
         }
         other => Some(format!("ConwayUtxoPredFailure(tag={other})")),
+    }
+}
+
+/// Decode `ConwayUtxosPredFailure` = `[tag, ...]`:
+///   tag 0 → `ValidationTagMismatch`
+///   tag 1 → `CollectErrors NonEmpty(CollectError)`
+///
+/// `CollectError` = `[tag, payload]`:
+///   tag 0 → `NoRedeemer`
+///   tag 1 → `NoWitness`
+///   tag 2 → `NoCostModel`
+///   tag 3 → `BadTranslation ContextError`
+///
+/// For Conway, `ContextError` = `ConwayContextError = [tag, ...]` and tag 15
+/// is `ReferenceInputsNotDisjointFromInputs (NonEmpty TxIn)` — introduced at
+/// PV >= 11 by cardano-ledger PR #5011 to relocate the
+/// `BabbageNonDisjointRefInputs` rule into PlutusV3 TxInfo translation.
+fn decode_conway_utxos_pred_failure(decoder: &mut minicbor::Decoder<'_>) -> Option<String> {
+    let _ = decoder.array().ok()?;
+    let tag = decoder.u8().ok()?;
+    match tag {
+        0 => {
+            let _ = decoder.skip();
+            let _ = decoder.skip();
+            Some("ValidationTagMismatch: script validity tag mismatch".to_string())
+        }
+        1 => {
+            // CollectErrors NonEmpty(CollectError)
+            let n = decoder.array().ok().flatten().unwrap_or(0);
+            let mut parts: Vec<String> = Vec::new();
+            for _ in 0..n {
+                if let Some(s) = decode_collect_error(decoder) {
+                    parts.push(s);
+                } else {
+                    let _ = decoder.skip();
+                }
+            }
+            if parts.is_empty() {
+                Some("CollectErrors: <unparsed>".to_string())
+            } else {
+                Some(format!("CollectErrors: [{}]", parts.join(", ")))
+            }
+        }
+        other => Some(format!("ConwayUtxosPredFailure(tag={other})")),
+    }
+}
+
+/// Decode `CollectError` and surface `BadTranslation` carrying
+/// `ConwayContextError::ReferenceInputsNotDisjointFromInputs` (tag 15) with
+/// the offending TxIn list.
+fn decode_collect_error(decoder: &mut minicbor::Decoder<'_>) -> Option<String> {
+    let _ = decoder.array().ok()?;
+    let tag = decoder.u8().ok()?;
+    match tag {
+        0 => {
+            let _ = decoder.skip();
+            Some("NoRedeemer".to_string())
+        }
+        1 => {
+            let _ = decoder.skip();
+            Some("NoWitness".to_string())
+        }
+        2 => {
+            let _ = decoder.skip();
+            Some("NoCostModel".to_string())
+        }
+        3 => decode_conway_context_error(decoder),
+        other => Some(format!("CollectError(tag={other})")),
+    }
+}
+
+/// Decode `ConwayContextError` = `[tag, ...]`.
+/// We surface tag 15 (`ReferenceInputsNotDisjointFromInputs`) explicitly;
+/// everything else is summarised generically.
+fn decode_conway_context_error(decoder: &mut minicbor::Decoder<'_>) -> Option<String> {
+    let _ = decoder.array().ok()?;
+    let tag = decoder.u8().ok()?;
+    if tag == 15 {
+        let n = decoder.array().ok().flatten().unwrap_or(0);
+        let mut inputs: Vec<String> = Vec::new();
+        for _ in 0..n {
+            if let Some(s) = decode_txin(decoder) {
+                inputs.push(s);
+            } else {
+                let _ = decoder.skip();
+            }
+        }
+        Some(format!(
+            "ReferenceInputsNotDisjointFromInputs: [{}]",
+            inputs.join(", ")
+        ))
+    } else {
+        let _ = decoder.skip();
+        Some(format!("ConwayContextError(tag={tag})"))
     }
 }
 

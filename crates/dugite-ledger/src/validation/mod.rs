@@ -423,6 +423,13 @@ pub enum ValidationError {
     ReferenceInputNotFound(String),
     #[error("Reference input overlaps with regular input: {0}")]
     ReferenceInputOverlapsInput(String),
+    /// Phase-2 PlutusV3 `TxInfo` translation failure: `inputs ∩ reference_inputs`
+    /// is non-empty.  Introduced by Haskell `cardano-ledger` PR #5011 at PV >= 11.
+    /// Surfaces on the wire as a `BadTranslation` carrying
+    /// `ConwayContextError::ReferenceInputsNotDisjointFromInputs` (CBOR tag 15).
+    /// The payload lists the offending `TxIn`s in deterministic (sorted) order.
+    #[error("PlutusV3 TxInfo translation: reference inputs not disjoint from inputs: {0:?}")]
+    ReferenceInputsNotDisjointFromInputs(Vec<String>),
     #[error("Multi-asset not conserved for policy {policy}: inputs+mint={input_side}, outputs={output_side}")]
     MultiAssetNotConserved {
         policy: String,
@@ -2477,6 +2484,56 @@ pub fn validate_transaction_with_pools(
         // caller therefore only fails fast on a missing slot config.
         // ------------------------------------------------------------------
         let has_redeemers = !tx.witness_set.redeemers.is_empty();
+
+        // Phase-2 V3 TxInfo translation check (Haskell PR #5011):
+        //
+        // At PV >= 11, the phase-1 `BabbageNonDisjointRefInputs` check is
+        // relaxed (see phase1.rs Rule 9).  An equivalent check is moved
+        // into PlutusV3 `TxInfo` construction: if any redeemer executes a
+        // V3 script AND `inputs ∩ reference_inputs` is non-empty, the
+        // translation fails with
+        // `ConwayContextError::ReferenceInputsNotDisjointFromInputs`.
+        //
+        // V1/V2/native scripts (and txs with NO V3 redeemer) are accepted
+        // with overlap — this is the intended relaxation.
+        //
+        // This check is independent of other phase-1 errors (it is a pure
+        // structural property of `inputs` vs `reference_inputs`), so we run
+        // it before the `errors.is_empty()` gate that guards the uplc
+        // evaluator (which depends on a clean phase-1 state).
+        if has_redeemers
+            && params.protocol_version_major >= 11
+            && !tx.body.reference_inputs.is_empty()
+        {
+            let version_map = crate::validation::plutus_script_version_map(tx, utxo_set);
+            let redeemer_versions =
+                crate::validation::redeemer_script_version_map(tx, utxo_set, &version_map);
+            let any_v3_executed = redeemer_versions.values().any(|&v| v == 3);
+            if any_v3_executed {
+                let input_set: std::collections::HashSet<_> = tx.body.inputs.iter().collect();
+                let mut common: Vec<&dugite_primitives::transaction::TransactionInput> = tx
+                    .body
+                    .reference_inputs
+                    .iter()
+                    .filter(|r| input_set.contains(*r))
+                    .collect();
+                if !common.is_empty() {
+                    // Deterministic order for the surfaced TxIn list:
+                    // sort by (transaction_id, index) — matches the Haskell
+                    // `Set.intersection` traversal order.
+                    common.sort_by(|a, b| {
+                        a.transaction_id
+                            .cmp(&b.transaction_id)
+                            .then(a.index.cmp(&b.index))
+                    });
+                    let offenders: Vec<String> = common.iter().map(|i| i.to_string()).collect();
+                    errors.push(ValidationError::ReferenceInputsNotDisjointFromInputs(
+                        offenders,
+                    ));
+                }
+            }
+        }
+
         if errors.is_empty() && has_redeemers {
             if slot_config.is_none() {
                 debug!(
@@ -2485,16 +2542,22 @@ pub fn validate_transaction_with_pools(
                 );
                 errors.push(ValidationError::MissingSlotConfig);
             }
-            if let Some(sc) = slot_config {
-                let cost_models_cbor = params.cost_models.to_cbor();
-                // uplc::tx::eval_phase_two_raw expects initial_budget as (cpu_steps, mem_units).
-                // Our ExUnits struct uses { mem, steps } where mem=memory_units and steps=cpu_steps.
-                // Swap the fields to match the uplc convention: (steps, mem) = (cpu, mem).
-                let max_ex = (params.max_tx_ex_units.steps, params.max_tx_ex_units.mem);
-                if let Err(e) =
-                    evaluate_plutus_scripts(tx, utxo_set, cost_models_cbor.as_deref(), max_ex, sc)
-                {
-                    errors.push(ValidationError::ScriptFailed(e.to_string()));
+            if errors.is_empty() {
+                if let Some(sc) = slot_config {
+                    let cost_models_cbor = params.cost_models.to_cbor();
+                    // uplc::tx::eval_phase_two_raw expects initial_budget as (cpu_steps, mem_units).
+                    // Our ExUnits struct uses { mem, steps } where mem=memory_units and steps=cpu_steps.
+                    // Swap the fields to match the uplc convention: (steps, mem) = (cpu, mem).
+                    let max_ex = (params.max_tx_ex_units.steps, params.max_tx_ex_units.mem);
+                    if let Err(e) = evaluate_plutus_scripts(
+                        tx,
+                        utxo_set,
+                        cost_models_cbor.as_deref(),
+                        max_ex,
+                        sc,
+                    ) {
+                        errors.push(ValidationError::ScriptFailed(e.to_string()));
+                    }
                 }
             }
         }

@@ -196,6 +196,44 @@ fn encode_conway_ledger_pred_failure(enc: &mut Encoder<&mut Vec<u8>>, err: &TxVa
         // Note: We can't distinguish "no collateral" from "collateral not found" in
         // the current TxValidationError enum. CollateralNotFound falls through to mempool.
 
+        // Conway phase-2 V3 TxInfo translation failure:
+        //   Ledger(1) → Utxow(0) → Utxo(0) → Utxos(1) → CollectErrors
+        //     [ BadTranslation(3) → ConwayContextError tag 15 (NonEmpty TxIn) ]
+        //
+        // Introduced by Haskell cardano-ledger PR #5011 at PV >= 11.
+        // See `eras/conway/impl/src/Cardano/Ledger/Conway/TxInfo.hs`:
+        //   `ReferenceInputsNotDisjointFromInputs common ->`
+        //   `  encode $ Sum ReferenceInputsNotDisjointFromInputs 15 !> To common`
+        TxValidationError::ReferenceInputsNotDisjointFromInputs { inputs } => {
+            let parsed: Vec<([u8; 32], u32)> =
+                inputs.iter().filter_map(|s| parse_tx_input(s)).collect();
+            if parsed.is_empty() {
+                encode_mempool_fallback(enc, &format!("{err:?}"));
+            } else {
+                encode_utxo_failure(enc, 0, |enc| {
+                    // ConwayUtxosPredFailure: [1, CollectErrors-payload]
+                    enc.array(2).expect("infallible");
+                    enc.u8(1).expect("infallible");
+                    // NonEmpty (CollectError era) → CBOR list of CollectError
+                    enc.array(1).expect("infallible");
+                    // CollectError::BadTranslation = [3, ContextError]
+                    enc.array(2).expect("infallible");
+                    enc.u8(3).expect("infallible");
+                    // ConwayContextError::ReferenceInputsNotDisjointFromInputs
+                    //   = [15, NonEmpty TxIn]
+                    enc.array(2).expect("infallible");
+                    enc.u8(15).expect("infallible");
+                    // NonEmpty TxIn encoded as definite-length CBOR list of [hash, ix].
+                    enc.array(parsed.len() as u64).expect("infallible");
+                    for (hash, ix) in &parsed {
+                        enc.array(2).expect("infallible");
+                        enc.bytes(hash).expect("infallible");
+                        enc.u32(*ix).expect("infallible");
+                    }
+                });
+            }
+        }
+
         // Tag 22: BabbageNonDisjointRefInputs
         TxValidationError::ReferenceInputOverlapsInput { input } => {
             if let Some((tx_hash, tx_ix)) = parse_tx_input(input) {
@@ -937,6 +975,92 @@ mod tests {
         assert_eq!(arr_len, 2);
         let tag = dec.u8().unwrap();
         assert_eq!(tag, 22, "BabbageNonDisjointRefInputs");
+    }
+
+    /// dugite #470 wire test: round-trip
+    /// `ReferenceInputsNotDisjointFromInputs` through the N2C encoder and
+    /// verify the produced CBOR has the full nested tag path expected by
+    /// Haskell cardano-ledger:
+    ///   Ledger(1) → Utxow(0) → Utxo(0=UtxosFailure) →
+    ///   Utxos(1=CollectErrors) → NonEmpty[ CollectError(3=BadTranslation) →
+    ///   ConwayContextError(15) → NonEmpty TxIn ].
+    #[test]
+    fn test_encode_conway_context_error_tag_15() {
+        let hash_hex = "ab".repeat(32);
+        let input = format!("{hash_hex}#3");
+        let err = TxValidationError::ReferenceInputsNotDisjointFromInputs {
+            inputs: vec![input],
+        };
+        let bytes = encode_apply_tx_err(&err, 6);
+
+        // Walk the CBOR explicitly to assert every nested tag matches the
+        // Haskell wire layout.
+        let mut dec = Decoder::new(&bytes);
+        // Outer HFC wrapper array(1)
+        assert_eq!(dec.array().unwrap(), Some(1));
+        // [era_id, failures]
+        assert_eq!(dec.array().unwrap(), Some(2));
+        let _era = dec.u16().unwrap();
+        // failure list of length 1
+        assert_eq!(dec.array().unwrap(), Some(1));
+        // ConwayLedgerPredFailure: [1, ...]
+        assert_eq!(dec.array().unwrap(), Some(2));
+        assert_eq!(dec.u8().unwrap(), 1, "Ledger tag = ConwayUtxowFailure");
+        // ConwayUtxowPredFailure: [0, ...]
+        assert_eq!(dec.array().unwrap(), Some(2));
+        assert_eq!(dec.u8().unwrap(), 0, "Utxow tag = UtxoFailure");
+        // ConwayUtxoPredFailure: array(2) [0=UtxosFailure, payload]
+        assert_eq!(dec.array().unwrap(), Some(2));
+        assert_eq!(dec.u8().unwrap(), 0, "Utxo tag = UtxosFailure");
+        // ConwayUtxosPredFailure: [1=CollectErrors, NonEmpty(CollectError)]
+        assert_eq!(dec.array().unwrap(), Some(2));
+        assert_eq!(dec.u8().unwrap(), 1, "Utxos tag = CollectErrors");
+        // NonEmpty list of CollectError, length 1
+        assert_eq!(dec.array().unwrap(), Some(1));
+        // CollectError = [3=BadTranslation, ContextError]
+        assert_eq!(dec.array().unwrap(), Some(2));
+        assert_eq!(dec.u8().unwrap(), 3, "CollectError tag = BadTranslation");
+        // ConwayContextError = [15, NonEmpty TxIn]
+        assert_eq!(dec.array().unwrap(), Some(2));
+        assert_eq!(
+            dec.u8().unwrap(),
+            15,
+            "ConwayContextError tag = ReferenceInputsNotDisjointFromInputs"
+        );
+        // NonEmpty TxIn: array(1) [ [hash, ix] ]
+        assert_eq!(dec.array().unwrap(), Some(1));
+        assert_eq!(dec.array().unwrap(), Some(2));
+        let hash_bytes = dec.bytes().unwrap();
+        assert_eq!(hash_bytes, &[0xABu8; 32][..]);
+        assert_eq!(dec.u32().unwrap(), 3);
+    }
+
+    /// dugite #470: encoder↔decoder round-trip — the produced bytes must
+    /// be parsed by the n2c_client decoder and surface
+    /// `ReferenceInputsNotDisjointFromInputs` (with the offending TxIn).
+    #[test]
+    fn test_roundtrip_conway_context_error_tag_15() {
+        use crate::n2c_client::decode_reject_reason;
+
+        let hash_hex = "cd".repeat(32);
+        let input = format!("{hash_hex}#7");
+        let err = TxValidationError::ReferenceInputsNotDisjointFromInputs {
+            inputs: vec![input.clone()],
+        };
+        let bytes = encode_apply_tx_err(&err, 6);
+
+        // `decode_reject_reason` expects to read the ApplyTxErr payload
+        // directly (outer array(1) wrapper).
+        let mut dec = Decoder::new(&bytes);
+        let reason = decode_reject_reason(&mut dec).expect("decoder must return a reason string");
+        assert!(
+            reason.contains("ReferenceInputsNotDisjointFromInputs"),
+            "decoded reason should name the variant, got: {reason}"
+        );
+        assert!(
+            reason.contains(&hash_hex) || reason.contains("cdcdcd"),
+            "decoded reason should include the offending TxIn, got: {reason}"
+        );
     }
 
     /// Test that the encoder output can be decoded by the existing client decoder.
