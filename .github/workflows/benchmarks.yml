@@ -58,6 +58,21 @@ jobs:
           cargo bench -p dugite-ledger --bench utxo_bench 2>&1 | tee utxo_bench.txt || true
           cargo bench -p dugite-ledger --bench utxo_bench -- --save-baseline nightly 2>/dev/null || true
 
+      - name: Run network benchmarks
+        run: |
+          cargo bench -p dugite-network --bench network_bench 2>&1 | tee network_bench.txt || true
+          cargo bench -p dugite-network --bench network_bench -- --save-baseline nightly 2>/dev/null || true
+
+      - name: Run consensus benchmarks
+        run: |
+          cargo bench -p dugite-consensus --bench consensus_bench 2>&1 | tee consensus_bench.txt || true
+          cargo bench -p dugite-consensus --bench consensus_bench -- --save-baseline nightly 2>/dev/null || true
+
+      - name: Run LSM benchmarks
+        run: |
+          cargo bench -p dugite-lsm --bench lsm_bench 2>&1 | tee lsm_bench.txt || true
+          cargo bench -p dugite-lsm --bench lsm_bench -- --save-baseline nightly 2>/dev/null || true
+
       - name: Run LSM large-scale stress tests
         run: |
           cargo test -p dugite-lsm --features large-tests --release -- mainnet_scale 2>&1 | tee lsm_stress.txt || true
@@ -80,6 +95,21 @@ jobs:
           echo "## UTxO Benchmarks" >> "$REPORT"
           echo '```' >> "$REPORT"
           cat utxo_bench.txt >> "$REPORT" 2>/dev/null || echo "No results" >> "$REPORT"
+          echo '```' >> "$REPORT"
+          echo "" >> "$REPORT"
+          echo "## Network Benchmarks" >> "$REPORT"
+          echo '```' >> "$REPORT"
+          cat network_bench.txt >> "$REPORT" 2>/dev/null || echo "No results" >> "$REPORT"
+          echo '```' >> "$REPORT"
+          echo "" >> "$REPORT"
+          echo "## Consensus Benchmarks" >> "$REPORT"
+          echo '```' >> "$REPORT"
+          cat consensus_bench.txt >> "$REPORT" 2>/dev/null || echo "No results" >> "$REPORT"
+          echo '```' >> "$REPORT"
+          echo "" >> "$REPORT"
+          echo "## LSM Benchmarks" >> "$REPORT"
+          echo '```' >> "$REPORT"
+          cat lsm_bench.txt >> "$REPORT" 2>/dev/null || echo "No results" >> "$REPORT"
           echo '```' >> "$REPORT"
           echo "" >> "$REPORT"
           echo "## LSM Stress Tests" >> "$REPORT"
