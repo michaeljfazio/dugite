@@ -2232,6 +2232,9 @@ pub(crate) fn enact_gov_action_impl(
             let gov_state = Arc::make_mut(&mut gov.governance);
             gov_state.committee_hot_keys.clear();
             gov_state.committee_expiration.clear();
+            gov_state.committee_resigned.clear();
+            gov_state.script_committee_credentials.clear();
+            gov_state.script_committee_hot_credentials.clear();
             gov_state.committee_threshold = None;
             gov_state.no_confidence = true;
             debug!("Governance   no confidence motion enacted, committee disbanded");
@@ -2253,12 +2256,33 @@ pub(crate) fn enact_gov_action_impl(
                 Arc::make_mut(&mut gov.governance)
                     .committee_resigned
                     .remove(&key);
+                Arc::make_mut(&mut gov.governance)
+                    .script_committee_credentials
+                    .remove(&key);
+                Arc::make_mut(&mut gov.governance)
+                    .script_committee_hot_credentials
+                    .remove(&key);
             }
             for (cred, expiration_epoch) in members_to_add {
                 let key = credential_to_hash(cred);
                 Arc::make_mut(&mut gov.governance)
                     .committee_expiration
                     .insert(key, EpochNo(*expiration_epoch));
+                // Track script-typed cold credentials so the N2C committee-state
+                // query reports the correct credential type (key=0, script=1).
+                // Without this, members added via UpdateCommittee with script
+                // cold credentials are mislabeled as KeyHash.
+                if matches!(cred, dugite_primitives::credentials::Credential::Script(_)) {
+                    Arc::make_mut(&mut gov.governance)
+                        .script_committee_credentials
+                        .insert(key);
+                } else {
+                    // Defensive: if re-adding the same cold credential with a
+                    // different type, drop the stale script tracking.
+                    Arc::make_mut(&mut gov.governance)
+                        .script_committee_credentials
+                        .remove(&key);
+                }
             }
             Arc::make_mut(&mut gov.governance).committee_threshold = Some(threshold.clone());
             Arc::make_mut(&mut gov.governance).no_confidence = false;
@@ -5571,6 +5595,106 @@ mod tests {
                 denominator: 3,
             })
         );
+    }
+
+    /// Regression test for issue #433.
+    ///
+    /// When an UpdateCommittee adds a member with a Script cold credential,
+    /// the `script_committee_credentials` set must also be updated so the
+    /// N2C committee-state query reports the correct credential type. Prior
+    /// to the fix, only `committee_expiration` was updated and the query
+    /// mislabeled all enacted-script members as KeyHash.
+    ///
+    /// Also verifies that removing a member clears all associated tracking
+    /// sets and that NoConfidence clears the script credential set as well.
+    #[test]
+    fn test_enact_update_committee_tracks_script_credentials() {
+        let mut state = gov_test_state(5, 0);
+
+        let key_member = Credential::VerificationKey(Hash28::from_bytes([7u8; 28]));
+        let script_member = Credential::Script(Hash28::from_bytes([8u8; 28]));
+        let script_key = script_member.to_typed_hash32();
+        let key_key = key_member.to_typed_hash32();
+
+        let mut members = BTreeMap::new();
+        members.insert(key_member.clone(), 500u64);
+        members.insert(script_member.clone(), 600u64);
+
+        state.enact_gov_action(&GovAction::UpdateCommittee {
+            prev_action_id: None,
+            members_to_remove: vec![],
+            members_to_add: members,
+            threshold: Rational {
+                numerator: 2,
+                denominator: 3,
+            },
+        });
+
+        // Both newly added members present in expiration map. (gov_test_state
+        // seeds an existing committee so we only assert membership of the new
+        // entries rather than a fixed length.)
+        assert!(state
+            .gov
+            .governance
+            .committee_expiration
+            .contains_key(&key_key));
+        assert!(state
+            .gov
+            .governance
+            .committee_expiration
+            .contains_key(&script_key));
+
+        // Only the script-typed member should be tracked as script.
+        assert!(
+            state
+                .gov
+                .governance
+                .script_committee_credentials
+                .contains(&script_key),
+            "script cold credential must be tracked in script_committee_credentials"
+        );
+        assert!(
+            !state
+                .gov
+                .governance
+                .script_committee_credentials
+                .contains(&key_key),
+            "key cold credential must not be tracked as script"
+        );
+
+        // Now remove the script member — script tracking must be cleared too.
+        state.enact_gov_action(&GovAction::UpdateCommittee {
+            prev_action_id: None,
+            members_to_remove: vec![script_member.clone()],
+            members_to_add: BTreeMap::new(),
+            threshold: Rational {
+                numerator: 2,
+                denominator: 3,
+            },
+        });
+        assert!(!state
+            .gov
+            .governance
+            .committee_expiration
+            .contains_key(&script_key));
+        assert!(!state
+            .gov
+            .governance
+            .script_committee_credentials
+            .contains(&script_key));
+
+        // NoConfidence must wipe all committee tracking sets.
+        state.enact_gov_action(&GovAction::NoConfidence {
+            prev_action_id: None,
+        });
+        assert!(state.gov.governance.committee_expiration.is_empty());
+        assert!(state.gov.governance.script_committee_credentials.is_empty());
+        assert!(state
+            .gov
+            .governance
+            .script_committee_hot_credentials
+            .is_empty());
+        assert!(state.gov.governance.committee_resigned.is_empty());
     }
 
     #[test]
