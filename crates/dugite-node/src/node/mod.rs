@@ -61,6 +61,35 @@ use crate::topology::Topology;
 /// [`dugite_network::TcpBearer::connect_from`]. Matches Haskell
 /// ouroboros-network `configureSocket` behaviour. Returns a tokio
 /// `TcpListener` ready for `accept()`.
+/// Resolve the on-disk path of an InMemory ledger snapshot's `tables` blob.
+///
+/// Mithril aggregator + ouroboros-consensus snapshot layouts have evolved:
+///
+/// - **New (ouroboros-consensus 1.0.0.0+):** the tables blob lives at the flat
+///   path `<snap>/tables` (a file, not a directory).
+/// - **Legacy:** the tables blob lived at the nested path `<snap>/tables/tvar`
+///   where `<snap>/tables` was a directory.
+///
+/// Prefer the new layout if both happen to be present. Return `None` when
+/// neither layout is satisfied — in particular, when `<snap>/tables` is a
+/// directory without a `tvar` child, the importer must NOT treat the directory
+/// as a blob.
+///
+/// Used by the Mithril InMemory snapshot importer. Issue #460.
+#[allow(dead_code)] // currently driven only by tests; importer call-site lands with the WIP InMemory rewrite
+pub(crate) fn resolve_inmemory_tables_path(snap: &std::path::Path) -> Option<PathBuf> {
+    let flat = snap.join("tables");
+    let nested = flat.join("tvar");
+    // Prefer the new flat layout: `<snap>/tables` as a regular file.
+    if flat.is_file() {
+        return Some(flat);
+    }
+    if nested.is_file() {
+        return Some(nested);
+    }
+    None
+}
+
 fn bind_n2n_listener(addr: SocketAddr) -> std::io::Result<tokio::net::TcpListener> {
     use socket2::{Domain, Protocol, Socket, Type};
 
@@ -107,8 +136,12 @@ pub(crate) fn apply_peer_metrics(
     metrics
         .peers_connected
         .store((pm.warm_peer_count() + pm.hot_peer_count()) as u64, Relaxed);
-    metrics.peers_cold.store(pm.cold_peer_count() as u64, Relaxed);
-    metrics.peers_warm.store(pm.warm_peer_count() as u64, Relaxed);
+    metrics
+        .peers_cold
+        .store(pm.cold_peer_count() as u64, Relaxed);
+    metrics
+        .peers_warm
+        .store(pm.warm_peer_count() as u64, Relaxed);
     metrics.peers_hot.store(pm.hot_peer_count() as u64, Relaxed);
     metrics
         .peers_outbound
@@ -124,7 +157,9 @@ pub(crate) fn apply_peer_metrics(
     let cm = pm.connection_manager_counters();
     metrics.conn_full_duplex.store(cm.full_duplex, Relaxed);
     metrics.conn_duplex.store(cm.duplex, Relaxed);
-    metrics.conn_unidirectional.store(cm.unidirectional, Relaxed);
+    metrics
+        .conn_unidirectional
+        .store(cm.unidirectional, Relaxed);
     metrics.conn_inbound.store(cm.inbound, Relaxed);
     metrics.conn_outbound.store(cm.outbound, Relaxed);
     metrics.conn_terminating.store(cm.terminating, Relaxed);
@@ -1179,53 +1214,17 @@ impl Node {
             // NOTE: snapshot_era was extracted before wrapping ledger in Arc<RwLock>
             // to avoid blocking_read() panic inside the tokio runtime.
             {
+                // Reconstruct past era transitions for the loaded snapshot era
+                // using the per-network HFC era table. Only record transitions
+                // whose target era is ≤ the snapshot's current era — i.e. eras
+                // already crossed on-chain. Issue #465: preview's Dijkstra
+                // entry lives in the table so a Dijkstra-era snapshot recovers
+                // `EraHistory::current_era() == Dijkstra` immediately, before
+                // the first Dijkstra block applies through the sync pipeline.
                 let current_era = snapshot_era;
-                let is_mainnet = network_magic == 764824073;
-
-                if is_mainnet {
-                    // Mainnet era transitions at known epochs.
-                    // Shelley→Babbage: epoch 365, Babbage→Conway: epoch 517.
-                    // (Shelley covers Shelley/Allegra/Mary/Alonzo per Haskell HFC type list)
-                    if current_era >= dugite_primitives::era::Era::Babbage {
-                        eh.record_era_transition(dugite_primitives::era::Era::Babbage, 365);
-                    }
-                    if current_era >= dugite_primitives::era::Era::Conway {
-                        eh.record_era_transition(dugite_primitives::era::Era::Conway, 517);
-                    }
-                } else {
-                    // Testnets: Byron/Shelley/Allegra/Mary at epoch 0 (instant HF),
-                    // then Alonzo→Babbage, Babbage→Conway at testnet-specific epochs.
-                    // For preview: Alonzo 0→3, Babbage 3→646, Conway 646+.
-                    let eras_and_epochs: &[(dugite_primitives::era::Era, u64)] = match network_magic
-                    {
-                        2 => &[
-                            (dugite_primitives::era::Era::Allegra, 0),
-                            (dugite_primitives::era::Era::Mary, 0),
-                            (dugite_primitives::era::Era::Alonzo, 0),
-                            (dugite_primitives::era::Era::Babbage, 3),
-                            (dugite_primitives::era::Era::Conway, 646),
-                        ],
-                        1 => &[
-                            // Preprod
-                            (dugite_primitives::era::Era::Allegra, 0),
-                            (dugite_primitives::era::Era::Mary, 0),
-                            (dugite_primitives::era::Era::Alonzo, 0),
-                            (dugite_primitives::era::Era::Babbage, 4),
-                            (dugite_primitives::era::Era::Conway, 186),
-                        ],
-                        _ => &[
-                            // Generic testnet: assume instant transitions
-                            (dugite_primitives::era::Era::Allegra, 0),
-                            (dugite_primitives::era::Era::Mary, 0),
-                            (dugite_primitives::era::Era::Alonzo, 0),
-                            (dugite_primitives::era::Era::Babbage, 0),
-                            (dugite_primitives::era::Era::Conway, 0),
-                        ],
-                    };
-                    for &(era, epoch) in eras_and_epochs {
-                        if current_era >= era && eh.current_era() < era {
-                            eh.record_era_transition(era, epoch);
-                        }
+                for (era, epoch) in epoch::era_transitions_for_magic(network_magic) {
+                    if current_era >= era && eh.current_era() < era {
+                        eh.record_era_transition(era, epoch);
                     }
                 }
             }
@@ -5150,7 +5149,7 @@ mod tests {
 
     use super::serve::ChainDBBlockProvider;
     use super::sync::validate_genesis_blocks;
-    use super::{next_forged_block_number, ForgeMode, Point};
+    use super::{next_forged_block_number, resolve_inmemory_tables_path, ForgeMode, Point};
     use crate::config::NodeConfig;
 
     // ─── next_forged_block_number regression tests ───────────────────────────
@@ -5915,9 +5914,7 @@ mod tests {
     fn apply_peer_metrics_inbound_drives_all_three_gauges() {
         use crate::metrics::NodeMetrics;
         use crate::node::apply_peer_metrics;
-        use crate::node::networking::{
-            ConnectionDirection, NodePeerManager, PeerManagerConfig,
-        };
+        use crate::node::networking::{ConnectionDirection, NodePeerManager, PeerManagerConfig};
         use std::net::SocketAddr;
         use std::sync::atomic::Ordering::Relaxed;
 

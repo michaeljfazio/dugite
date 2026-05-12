@@ -25,6 +25,77 @@ pub fn shelley_transition_epoch_for_magic(network_magic: u64) -> u64 {
     }
 }
 
+// ─── Per-network HFC era transition table ────────────────────────────────────
+
+/// Placeholder transition epoch for the preview Dijkstra HFI (PV 12).
+///
+/// As of 2026-05-12 the preview Dijkstra HardForkInitiation governance action
+/// has not been ratified; latest preview block is PV 11 / Conway at epoch 1295
+/// (Koios `epoch_block_protocols`). We forward-declare the Dijkstra entry at a
+/// clearly-sentinel future epoch so that ledger snapshots already in the
+/// Dijkstra era (e.g. a future Mithril snapshot, or a dugite-forged
+/// Dijkstra-era snapshot) replay a Conway→Dijkstra transition during HFC
+/// era-history reconstruction. `record_era_transition` is also called for
+/// real on a per-block basis (`mod.rs` block-apply path) and self-corrects
+/// the in-memory state machine on the first observed Dijkstra-era block.
+///
+/// Chosen value: `9_999_999`. Far beyond any realistic preview epoch
+/// (preview epoch_length ≈ 86400 slots ≈ 1 day, so 9.99M epochs ≈ 27,000
+/// years), but small enough that `epochs_in_era * epoch_size` cannot overflow
+/// `u64` inside `EraHistory::compute_end_bound`. Patch this constant to the
+/// observed activation epoch once the HFI ratifies on preview.
+pub const PREVIEW_DIJKSTRA_EPOCH_PLACEHOLDER: u64 = 9_999_999;
+
+/// Per-network table of post-Shelley era transitions, in HFC order.
+///
+/// Each entry is `(target_era, transition_epoch)`. The caller replays only
+/// those entries whose target era is `<= snapshot_era`, reconstructing the
+/// HFC era history when cold-starting from a ledger snapshot.
+///
+/// Sources:
+/// - Mainnet (764824073): on-chain history — Babbage 365 (Vasil), Conway 517
+///   (Chang). Pre-Babbage transitions are folded into the Shelley entry
+///   created by `EraHistory::from_genesis`.
+/// - Preprod (1): testnet eras collapse to epoch 0; Babbage 4, Conway 186.
+/// - Preview (2): instant Allegra/Mary/Alonzo; Babbage 3, Conway 646, Dijkstra
+///   at `PREVIEW_DIJKSTRA_EPOCH_PLACEHOLDER` (HFI pending). Issue #465.
+pub fn era_transitions_for_magic(network_magic: u64) -> Vec<(dugite_primitives::era::Era, u64)> {
+    use dugite_primitives::era::Era;
+    match network_magic {
+        764824073 => vec![
+            (Era::Babbage, 365),
+            (Era::Conway, 517),
+            // Dijkstra on mainnet: not yet proposed.
+        ],
+        1 => vec![
+            // Preprod
+            (Era::Allegra, 0),
+            (Era::Mary, 0),
+            (Era::Alonzo, 0),
+            (Era::Babbage, 4),
+            (Era::Conway, 186),
+            // Dijkstra on preprod: not yet proposed.
+        ],
+        2 => vec![
+            // Preview
+            (Era::Allegra, 0),
+            (Era::Mary, 0),
+            (Era::Alonzo, 0),
+            (Era::Babbage, 3),
+            (Era::Conway, 646),
+            (Era::Dijkstra, PREVIEW_DIJKSTRA_EPOCH_PLACEHOLDER),
+        ],
+        _ => vec![
+            // Generic testnet: assume instant transitions through Conway.
+            (Era::Allegra, 0),
+            (Era::Mary, 0),
+            (Era::Alonzo, 0),
+            (Era::Babbage, 0),
+            (Era::Conway, 0),
+        ],
+    }
+}
+
 // ─── Snapshot policy ─────────────────────────────────────────────────────────
 
 /// Snapshot policy matching Haskell cardano-node's `SnapshotPolicy`.
@@ -442,6 +513,136 @@ mod tests {
     #[test]
     fn test_shelley_transition_unknown_defaults_to_zero() {
         assert_eq!(shelley_transition_epoch_for_magic(999999), 0);
+    }
+
+    // ── era_transitions_for_magic — #465 regression coverage ──────────────────
+
+    /// Preview (magic 2) must include a Dijkstra entry so that ledger snapshots
+    /// taken in the Dijkstra era reconstruct the HFC era history correctly on
+    /// cold-start. Issue #465.
+    #[test]
+    fn test_era_transitions_preview_includes_dijkstra() {
+        use dugite_primitives::era::Era;
+        let table = era_transitions_for_magic(2);
+        let eras: Vec<Era> = table.iter().map(|(e, _)| *e).collect();
+        assert!(
+            eras.contains(&Era::Dijkstra),
+            "preview era table must include Dijkstra (#465): {:?}",
+            eras
+        );
+    }
+
+    /// Preview Babbage/Conway epochs match the Koios-observed boundaries
+    /// (Babbage at epoch 3 — Vasil HF on preview; Conway at epoch 646 — Chang
+    /// HF on preview, cross-checked via Koios `epoch_block_protocols`).
+    #[test]
+    fn test_era_transitions_preview_bound_epochs_match_koios() {
+        use dugite_primitives::era::Era;
+        let table = era_transitions_for_magic(2);
+        let babbage = table
+            .iter()
+            .find(|(e, _)| *e == Era::Babbage)
+            .expect("Babbage entry present");
+        let conway = table
+            .iter()
+            .find(|(e, _)| *e == Era::Conway)
+            .expect("Conway entry present");
+        assert_eq!(
+            babbage.1, 3,
+            "preview Babbage starts at epoch 3 (Vasil HF on preview)"
+        );
+        assert_eq!(
+            conway.1, 646,
+            "preview Conway starts at epoch 646 (Chang HF on preview)"
+        );
+    }
+
+    /// HFC ordering: each transition's target era must be strictly greater
+    /// than the previous one. Regression for #465 (Dijkstra placement after
+    /// Conway).
+    #[test]
+    fn test_era_transitions_preview_hfc_ordered() {
+        let table = era_transitions_for_magic(2);
+        for w in table.windows(2) {
+            assert!(
+                w[0].0 < w[1].0,
+                "HFC era table must be strictly ascending: {:?} → {:?}",
+                w[0],
+                w[1]
+            );
+        }
+    }
+
+    /// Replaying the preview table against a Dijkstra-era snapshot must leave
+    /// `EraHistory::current_era() == Dijkstra` immediately, before any block
+    /// applies. This is the issue-#465 acceptance check.
+    #[test]
+    fn test_dijkstra_preview_snapshot_recovers_current_era() {
+        use dugite_consensus::era_history::{EraHistory, EraParams};
+        use dugite_primitives::era::Era;
+
+        let params = EraParams {
+            epoch_size: 86400,
+            slot_length_ms: 1000,
+            safe_zone: 129600,
+        };
+        let mut eh = EraHistory::from_genesis(params.clone(), params, 0, 4320);
+
+        let snapshot_era = Era::Dijkstra;
+        for (era, epoch) in era_transitions_for_magic(2) {
+            if snapshot_era >= era && eh.current_era() < era {
+                eh.record_era_transition(era, epoch);
+            }
+        }
+
+        assert_eq!(
+            eh.current_era(),
+            Era::Dijkstra,
+            "snapshot_era=Dijkstra must produce EraHistory::current_era()=Dijkstra"
+        );
+        // Byron + Shelley + Allegra + Mary + Alonzo + Babbage + Conway + Dijkstra = 8
+        assert_eq!(eh.len(), 8, "all eras through Dijkstra must be present");
+    }
+
+    /// Sanity: a Conway-era snapshot on preview must NOT pull in Dijkstra,
+    /// even though Dijkstra is in the table.
+    #[test]
+    fn test_conway_preview_snapshot_does_not_record_dijkstra() {
+        use dugite_consensus::era_history::{EraHistory, EraParams};
+        use dugite_primitives::era::Era;
+
+        let params = EraParams {
+            epoch_size: 86400,
+            slot_length_ms: 1000,
+            safe_zone: 129600,
+        };
+        let mut eh = EraHistory::from_genesis(params.clone(), params, 0, 4320);
+
+        let snapshot_era = Era::Conway;
+        for (era, epoch) in era_transitions_for_magic(2) {
+            if snapshot_era >= era && eh.current_era() < era {
+                eh.record_era_transition(era, epoch);
+            }
+        }
+
+        assert_eq!(eh.current_era(), Era::Conway);
+        assert!(
+            !eh.entries().iter().any(|e| e.era == Era::Dijkstra),
+            "Conway-era snapshot must not record a Dijkstra transition"
+        );
+    }
+
+    /// Mainnet table must include Babbage 365 and Conway 517 (on-chain bounds).
+    /// No Dijkstra on mainnet yet.
+    #[test]
+    fn test_era_transitions_mainnet_bounds() {
+        use dugite_primitives::era::Era;
+        let table = era_transitions_for_magic(764824073);
+        assert_eq!(
+            table,
+            vec![(Era::Babbage, 365), (Era::Conway, 517)],
+            "mainnet table must match on-chain HF history; Dijkstra not yet proposed"
+        );
     }
 
     #[test]
