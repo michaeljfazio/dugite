@@ -79,6 +79,56 @@ fn test_decode_mempack_txin_txix_large() {
     assert_eq!(txin.txix, 255);
 }
 
+/// Regression test for issue #461: the Haskell `MemPack Word16` instance
+/// (derived for `newtype TxIx = TxIx Word16`) uses `writeWord8ArrayAsWord16#`,
+/// which is platform-native endianness. On all supported targets (x86_64,
+/// aarch64) that is **little-endian**.
+///
+/// The ouroboros-consensus 1.0.0.0 "flip TxIx serialization" change cited in
+/// the issue does NOT exist in the current upstream changelog (latest is
+/// 0.28.x as of 2026-05). Haskell's on-disk MemPack TxIx therefore remains
+/// host-LE, and dugite's LE decode matches Haskell byte-for-byte.
+///
+/// This test pins that invariant so a future endianness flip cannot regress
+/// silently — TxIx values >= 256 round-trip only when LE is used.
+#[test]
+fn test_mempack_txix_endianness_pinned_le_v11() {
+    // TxIx = 0x0102 = 258. LE bytes = [0x02, 0x01], BE bytes would be [0x01, 0x02].
+    let mut key = [0u8; 34];
+    key[32] = 0x02;
+    key[33] = 0x01;
+    let txin = decode_mempack_txin(&key).unwrap();
+    assert_eq!(
+        txin.txix, 258,
+        "TxIx must decode as little-endian Word16 to match Haskell MemPack"
+    );
+
+    // Sweep [0, 1000]: every value must round-trip via LE.
+    for ix in 0u16..=1000 {
+        let mut k = [0u8; 34];
+        let le = ix.to_le_bytes();
+        k[32] = le[0];
+        k[33] = le[1];
+        let decoded = decode_mempack_txin(&k).unwrap();
+        assert_eq!(decoded.txix, ix, "LE round-trip failed at ix={ix}");
+    }
+
+    // Lexicographic byte ordering of MemPack keys for the same TxId does NOT
+    // match numeric TxIx ordering when the encoding is LE. Document this
+    // explicitly: for a fixed TxId, key(0x0100=256) sorts BEFORE key(0x00FF=255)
+    // bytewise because LE puts the low byte first.
+    let mut k_255 = [0u8; 34];
+    k_255[32..34].copy_from_slice(&255u16.to_le_bytes()); // [0xFF, 0x00]
+    let mut k_256 = [0u8; 34];
+    k_256[32..34].copy_from_slice(&256u16.to_le_bytes()); // [0x00, 0x01]
+    assert!(
+        k_256.as_slice() < k_255.as_slice(),
+        "LE encoding: bytewise sort intentionally diverges from numeric TxIx \
+         order across the 256 boundary — Haskell behaves identically because \
+         MemPack Word16 is host-native LE on x86_64/aarch64"
+    );
+}
+
 #[test]
 fn test_decode_mempack_txout_tag0() {
     // Real tag-0 entry from preview tvar, cross-checked against Koios:
