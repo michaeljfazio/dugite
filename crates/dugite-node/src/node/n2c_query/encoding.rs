@@ -175,7 +175,11 @@ pub(crate) fn encode_query_result_value(
             }
         }
         QueryResult::GovState(gov) => {
+            let start = enc.writer().len();
             encode_gov_state(enc, gov);
+            let bytes = &enc.writer()[start..];
+            let _ = std::fs::write("/tmp/govstate-debug.cbor", bytes);
+            tracing::info!("DEBUG: wrote gov-state CBOR bytes={} to /tmp/govstate-debug.cbor", bytes.len());
         }
         QueryResult::DRepState(dreps) => {
             encode_drep_state(enc, dreps);
@@ -499,18 +503,27 @@ fn encode_utxo_by_address(enc: &mut minicbor::Encoder<&mut Vec<u8>>, utxos: &[Ut
 
 /// Encode protocol parameters as a positional CBOR array(31) per Haskell ConwayPParams.
 ///
-/// The Haskell reference uses `encCBOR` which encodes PParams as a flat positional array,
-/// NOT a map. Field order matches `eraPParams @ConwayEra`:
-///   [0] txFeePerByte, [1] txFeeFixed, [2] maxBBSize, [3] maxTxSize,
-///   [4] maxBHSize, [5] keyDeposit, [6] poolDeposit, [7] eMax, [8] nOpt,
-///   [9] a0, [10] rho, [11] tau, [12] protocolVersion,
-///   [13] minPoolCost, [14] coinsPerUTxOByte, [15] costModels,
-///   [16] prices, [17] maxTxExUnits, [18] maxBlockExUnits,
-///   [19] maxValSize, [20] collateralPercentage, [21] maxCollateralInputs,
-///   [22] poolVotingThresholds(5), [23] drepVotingThresholds(10),
-///   [24] committeeMinSize, [25] committeeMaxTermLength, [26] govActionLifetime,
-///   [27] govActionDeposit, [28] drepDeposit, [29] drepActivity,
-///   [30] minFeeRefScriptCostPerByte
+/// The Haskell reference uses `encCBOR` derived from `eraPParams @ConwayEra`
+/// (cardano-ledger eras/conway/impl/src/Cardano/Ledger/Conway/PParams.hs), which
+/// emits one entry per `PParam` lens in the order they are declared in the
+/// `cppHKDLensMap`. The protocolVersion is appended LAST via
+/// `ppGovProtocolVersion` since Conway moved it out of the updatable map.
+///
+/// V21+ field order (matches cardano-cli 10.15 decoder, see issue #336):
+///   [0] txFeePerByte,    [1] txFeeFixed,      [2] maxBBSize,
+///   [3] maxTxSize,       [4] maxBHSize,       [5] keyDeposit,
+///   [6] poolDeposit,     [7] eMax,            [8] nOpt,
+///   [9] a0,              [10] rho,            [11] tau,
+///   [12] minPoolCost,    [13] coinsPerUTxOByte, [14] costModels,
+///   [15] prices,         [16] maxTxExUnits,   [17] maxBlockExUnits,
+///   [18] maxValSize,     [19] collateralPct,  [20] maxCollateralInputs,
+///   [21] poolVotingThresholds(5),
+///   [22] drepVotingThresholds(10),
+///   [23] committeeMinSize, [24] committeeMaxTermLength,
+///   [25] govActionLifetime, [26] govActionDeposit,
+///   [27] drepDeposit,    [28] drepActivity,
+///   [29] minFeeRefScriptCostPerByte,
+///   [30] protocolVersion = array(2)[major, minor]   (LAST — see oracle)
 pub(crate) fn encode_protocol_params_cbor(
     enc: &mut minicbor::Encoder<&mut Vec<u8>>,
     pp: &ProtocolParamsSnapshot,
@@ -543,14 +556,17 @@ pub(crate) fn encode_protocol_params_cbor(
     // [11] tau
     encode_tagged_rational(enc, pp.tau_num, pp.tau_den);
 
-    // [12] protocolVersion [major, minor]
+    // [12] protocolVersion = array(2)[major, minor]
+    // Per Haskell's `eraPParams @ConwayEra`, `ppGovProtocolVersion` sits at
+    // position 12 (between tau and minPoolCost). It is a `HKDNoUpdate`
+    // field — present in PParams but not in PParamsUpdate.
     enc.array(2).ok();
     enc.u64(pp.protocol_version_major).ok();
     enc.u64(pp.protocol_version_minor).ok();
 
     // [13] minPoolCost
     enc.u64(pp.min_pool_cost).ok();
-    // [14] coinsPerUTxOByte
+    // [14] coinsPerUTxOByte (utxoCostPerByte)
     enc.u64(pp.ada_per_utxo_byte).ok();
 
     // [15] costModels (map: {0: [v1], 1: [v2], 2: [v3]})
@@ -682,7 +698,7 @@ pub(crate) fn encode_protocol_params_cbor(
     // [29] drepActivity
     enc.u64(pp.drep_activity).ok();
 
-    // [30] minFeeRefScriptCostPerByte
+    // [30] minFeeRefScriptCostPerByte (NonNegativeInterval, tagged rational)
     encode_tagged_rational(enc, pp.min_fee_ref_script_cost_per_byte, 1);
 }
 
@@ -3596,5 +3612,154 @@ mod tests {
         let _num = dec.u64().unwrap();
         let _den = dec.u64().unwrap();
         assert_eq!(dec.array().unwrap(), None, "relays must be indef-length");
+    }
+
+    // ─── Issue #336: V21+ PParams positional order ──────────────────────────
+    //
+    // Regression test for the cardano-cli `transaction build` decoder, which
+    // requires Conway PParams as a 31-element array with `protocolVersion` at
+    // index 30 (LAST), not at index 12. The previous encoding placed
+    // `protocolVersion` at index 12, which made cardano-cli read the
+    // `protocolVersion[major,minor]` array(2) as if it were `minPoolCost`,
+    // shifted every subsequent field, and ultimately surfaced as a CBOR
+    // element-count mismatch downstream in the response stream.
+    //
+    // Golden field-position assertions cross-validated against
+    // `cardano-ledger/eras/conway/impl/src/Cardano/Ledger/Conway/PParams.hs`
+    // (`cppHKDLensMap`, `ppGovProtocolVersion`) and the oracle file at
+    // `.claude/agent-memory/cardano-haskell-oracle/cardano-ledger-types-wire-format.md`.
+    #[test]
+    fn test_pparams_v21_positional_order_issue_336() {
+        let mut pp = ProtocolParamsSnapshot {
+            // Use small distinct sentinel values so a slot mismatch is obvious.
+            min_fee_a: 0xA0,
+            min_fee_b: 0xA1,
+            max_block_body_size: 0xA2,
+            max_tx_size: 0xA3,
+            max_block_header_size: 0xA4,
+            key_deposit: 0xA5,
+            pool_deposit: 0xA6,
+            e_max: 0xA7,
+            n_opt: 0xA8,
+            min_pool_cost: 0xC1,
+            ada_per_utxo_byte: 0xC2,
+            cost_models_v3: Some(vec![100, 200, 300]),
+            protocol_version_major: 11,
+            protocol_version_minor: 0,
+            ..Default::default()
+        };
+        // Drop V1/V2 to keep the cost-model map deterministic.
+        pp.cost_models_v1 = None;
+        pp.cost_models_v2 = None;
+
+        let result = QueryResult::ProtocolParams(Box::new(pp));
+        let encoded = encode_query_result(&result);
+        let payload = strip_wrappers(&encoded);
+
+        let mut dec = Decoder::new(&payload);
+        assert_eq!(
+            dec.array().unwrap(),
+            Some(31),
+            "Conway PParams must be a 31-element positional array"
+        );
+
+        // [0..=8] flat uints
+        assert_eq!(dec.u64().unwrap(), 0xA0); // txFeePerByte
+        assert_eq!(dec.u64().unwrap(), 0xA1); // txFeeFixed
+        assert_eq!(dec.u64().unwrap(), 0xA2); // maxBBSize
+        assert_eq!(dec.u64().unwrap(), 0xA3); // maxTxSize
+        assert_eq!(dec.u64().unwrap(), 0xA4); // maxBHSize
+        assert_eq!(dec.u64().unwrap(), 0xA5); // keyDeposit
+        assert_eq!(dec.u64().unwrap(), 0xA6); // poolDeposit
+        assert_eq!(dec.u64().unwrap(), 0xA7); // eMax
+        assert_eq!(dec.u64().unwrap(), 0xA8); // nOpt
+
+        // [9..=11] tagged rationals
+        for _ in 0..3 {
+            let tag = dec.tag().unwrap();
+            assert_eq!(tag, minicbor::data::Tag::new(30));
+            assert_eq!(dec.array().unwrap(), Some(2));
+            let _ = dec.u64().unwrap();
+            let _ = dec.u64().unwrap();
+        }
+
+        // [12] minPoolCost (NOT protocolVersion — issue #336)
+        assert_eq!(
+            dec.u64().unwrap(),
+            0xC1,
+            "index 12 must be minPoolCost; if this is array(2), protocolVersion is misplaced"
+        );
+        // [13] coinsPerUTxOByte
+        assert_eq!(dec.u64().unwrap(), 0xC2);
+
+        // [14] costModels map
+        assert_eq!(dec.map().unwrap(), Some(1));
+        assert_eq!(dec.u32().unwrap(), 2); // PlutusV3 = 2
+        assert_eq!(dec.array().unwrap(), Some(3));
+        for _ in 0..3 {
+            let _ = dec.i64().unwrap();
+        }
+
+        // [15] prices [tag30, tag30]
+        assert_eq!(dec.array().unwrap(), Some(2));
+        for _ in 0..2 {
+            let _ = dec.tag().unwrap();
+            assert_eq!(dec.array().unwrap(), Some(2));
+            let _ = dec.u64().unwrap();
+            let _ = dec.u64().unwrap();
+        }
+
+        // [16] maxTxExUnits [mem, steps]
+        assert_eq!(dec.array().unwrap(), Some(2));
+        let _ = dec.u64().unwrap();
+        let _ = dec.u64().unwrap();
+
+        // [17] maxBlockExUnits [mem, steps]
+        assert_eq!(dec.array().unwrap(), Some(2));
+        let _ = dec.u64().unwrap();
+        let _ = dec.u64().unwrap();
+
+        // [18..=20] flat uints
+        let _ = dec.u64().unwrap(); // maxValSize
+        let _ = dec.u64().unwrap(); // collateralPct
+        let _ = dec.u64().unwrap(); // maxCollateralInputs
+
+        // [21] poolVotingThresholds array(5) of tag30
+        assert_eq!(dec.array().unwrap(), Some(5));
+        for _ in 0..5 {
+            let _ = dec.tag().unwrap();
+            assert_eq!(dec.array().unwrap(), Some(2));
+            let _ = dec.u64().unwrap();
+            let _ = dec.u64().unwrap();
+        }
+
+        // [22] drepVotingThresholds array(10) of tag30
+        assert_eq!(dec.array().unwrap(), Some(10));
+        for _ in 0..10 {
+            let _ = dec.tag().unwrap();
+            assert_eq!(dec.array().unwrap(), Some(2));
+            let _ = dec.u64().unwrap();
+            let _ = dec.u64().unwrap();
+        }
+
+        // [23..=28] flat uints (committee + gov action + drep)
+        for _ in 0..6 {
+            let _ = dec.u64().unwrap();
+        }
+
+        // [29] minFeeRefScriptCostPerByte (tag30)
+        let _ = dec.tag().unwrap();
+        assert_eq!(dec.array().unwrap(), Some(2));
+        let _ = dec.u64().unwrap();
+        let _ = dec.u64().unwrap();
+
+        // [30] protocolVersion = array(2)[major, minor] — MUST be LAST
+        assert_eq!(
+            dec.array().unwrap(),
+            Some(2),
+            "index 30 must be protocolVersion as array(2)"
+        );
+        assert_eq!(dec.u64().unwrap(), 11);
+        assert_eq!(dec.u64().unwrap(), 0);
     }
 }

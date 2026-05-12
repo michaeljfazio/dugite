@@ -531,3 +531,96 @@ fn decode_pool_distr(
 
 #[cfg(test)]
 mod tests;
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// Test helpers (exposed for downstream crate tests)
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Construct a minimal [`HaskellLedgerState`] with the supplied current and
+/// previous protocol parameters, all other fields zero/empty.
+///
+/// Intended for downstream crate tests that need to validate
+/// `LedgerState::from_haskell_snapshot()` propagation of PParams without
+/// committing a large CBOR fixture.  See dugite issue #335.
+pub fn minimal_haskell_state_for_test(
+    cur_pparams: dugite_primitives::protocol_params::ProtocolParameters,
+    prev_pparams: dugite_primitives::protocol_params::ProtocolParameters,
+) -> HaskellLedgerState {
+    let empty_snap = || HaskellSnapShot {
+        stake: HashMap::new(),
+        delegations: HashMap::new(),
+        pool_params: HashMap::new(),
+    };
+    let snapshots = HaskellSnapShots {
+        mark: empty_snap(),
+        set: empty_snap(),
+        go: empty_snap(),
+        fee: 0,
+    };
+    let gov_state = HaskellGovState {
+        proposals_raw: Vec::new(),
+        committee_raw: None,
+        constitution: None,
+        cur_pparams: cur_pparams.clone(),
+        prev_pparams: prev_pparams.clone(),
+        future_pparams_tag: 0,
+        future_pparams: None,
+        drep_pulsing_raw: Vec::new(),
+    };
+    let cert_state = HaskellCertState {
+        vstate: HaskellVState {
+            dreps: HashMap::new(),
+            committee_state: HashMap::new(),
+            dormant_epochs: 0,
+        },
+        pstate: HaskellPState {
+            vrf_key_hashes: HashMap::new(),
+            stake_pools: HashMap::new(),
+            future_pool_params: HashMap::new(),
+            retirements: HashMap::new(),
+        },
+        dstate: HaskellDState {
+            accounts: HashMap::new(),
+            genesis_delegates: HashMap::new(),
+            i_rewards_reserves: HashMap::new(),
+            i_rewards_treasury: HashMap::new(),
+            delta_reserves: 0,
+            delta_treasury: 0,
+        },
+    };
+    let new_epoch_state = HaskellNewEpochState {
+        epoch: EpochNo(0),
+        blocks_made_prev: HashMap::new(),
+        blocks_made_cur: HashMap::new(),
+        treasury: 0,
+        reserves: 0,
+        cur_pparams,
+        prev_pparams,
+        deposited: 0,
+        fees: 0,
+        donation: 0,
+        cert_state,
+        snapshots,
+        pool_distr: HashMap::new(),
+        pool_distr_total_stake: 0,
+        gov_state,
+        instant_stake: HashMap::new(),
+    };
+    let praos_state = HaskellPraosState {
+        last_slot: None,
+        opcert_counters: HashMap::new(),
+        evolving_nonce: Hash32::ZERO,
+        candidate_nonce: Hash32::ZERO,
+        epoch_nonce: Hash32::ZERO,
+        lab_nonce: Hash32::ZERO,
+        last_epoch_block_nonce: Hash32::ZERO,
+    };
+    HaskellLedgerState {
+        tip_slot: SlotNo(0),
+        tip_block_no: 0,
+        tip_hash: Hash32::ZERO,
+        epoch: EpochNo(0),
+        new_epoch_state,
+        praos_state,
+    }
+}

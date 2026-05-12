@@ -241,6 +241,13 @@ struct MithrilImportArgs {
     #[arg(long)]
     skip_certificate_verification: bool,
 
+    /// Continue the import even if the ancillary archive (Haskell ledger state)
+    /// cannot be downloaded.  Without ancillary, the imported ledger state
+    /// falls back to genesis-default protocol parameters at the imported tip
+    /// (issue #335).  NOT recommended for production.
+    #[arg(long)]
+    allow_stale_pparams: bool,
+
     #[command(flatten)]
     log: LogArgs,
 }
@@ -1290,6 +1297,7 @@ async fn run_mithril_import(args: MithrilImportArgs) -> Result<()> {
         args.temp_dir.as_deref(),
         args.mithril_genesis_vkey.as_deref(),
         args.skip_certificate_verification,
+        args.allow_stale_pparams,
     )
     .await
 }

@@ -12,7 +12,12 @@
 - CostModels: `cardano-ledger/libs/cardano-ledger-core/src/Cardano/Ledger/Plutus/CostModels.hs`
 - ExUnits/Prices: `cardano-ledger/libs/cardano-ledger-core/src/Cardano/Ledger/Plutus/ExUnits.hs`
 
-## PParams Array Order (31 fields)
+## PParams Array Order (31 fields) — V21+ corrected (issue #336, 2026-05-12)
+
+**CORRECTED**: `protocolVersion` is at index **30 (LAST)** in Conway, not index 12.
+Conway moved it out of the updatable PParamsUpdate map and appends it via
+`ppGovProtocolVersion` in the eraPParams lens list.
+
 | Idx | Field | CBOR Type | ppuTag (map key) |
 |-----|-------|-----------|------------------|
 | 0 | txFeePerByte | uint | 0 |
@@ -27,25 +32,25 @@
 | 9 | a0 | Tag(30)[num,den] | 9 |
 | 10 | rho | Tag(30)[num,den] | 10 |
 | 11 | tau | Tag(30)[num,den] | 11 |
-| 12 | protocolVersion | [major,minor] | N/A (no update in Conway) |
-| 13 | minPoolCost | uint | 16 |
-| 14 | coinsPerUTxOByte | uint | 17 |
-| 15 | costModels | map{0:[i64],1:[i64],2:[i64]} | 18 |
-| 16 | prices | [Tag30,Tag30] | 19 |
-| 17 | maxTxExUnits | [mem,steps] | 20 |
-| 18 | maxBlockExUnits | [mem,steps] | 21 |
-| 19 | maxValSize | uint | 22 |
-| 20 | collateralPercentage | uint | 23 |
-| 21 | maxCollateralInputs | uint | 24 |
-| 22 | poolVotingThresholds | array(5) of Tag30 | 25 |
-| 23 | drepVotingThresholds | array(10) of Tag30 | 26 |
-| 24 | committeeMinSize | uint | 27 |
-| 25 | committeeMaxTermLength | uint | 28 |
-| 26 | govActionLifetime | uint | 29 |
-| 27 | govActionDeposit | uint | 30 |
-| 28 | drepDeposit | uint | 31 |
-| 29 | drepActivity | uint | 32 |
-| 30 | minFeeRefScriptCostPerByte | Tag(30)[num,den] | 33 |
+| 12 | minPoolCost | uint | 16 |
+| 13 | coinsPerUTxOByte | uint | 17 |
+| 14 | costModels | map{0:[i64],1:[i64],2:[i64]} | 18 |
+| 15 | prices | [Tag30,Tag30] | 19 |
+| 16 | maxTxExUnits | [mem,steps] | 20 |
+| 17 | maxBlockExUnits | [mem,steps] | 21 |
+| 18 | maxValSize | uint | 22 |
+| 19 | collateralPercentage | uint | 23 |
+| 20 | maxCollateralInputs | uint | 24 |
+| 21 | poolVotingThresholds | array(5) of Tag30 | 25 |
+| 22 | drepVotingThresholds | array(10) of Tag30 | 26 |
+| 23 | committeeMinSize | uint | 27 |
+| 24 | committeeMaxTermLength | uint | 28 |
+| 25 | govActionLifetime | uint | 29 |
+| 26 | govActionDeposit | uint | 30 |
+| 27 | drepDeposit | uint | 31 |
+| 28 | drepActivity | uint | 32 |
+| 29 | minFeeRefScriptCostPerByte | Tag(30)[num,den] | 33 |
+| 30 | protocolVersion | array(2)[major,minor] | N/A (no update in Conway) |
 
 ## Note: Array index != ppuTag
 Keys 12-15 were Shelley's ppD/extraEntropy/protVer/minUTxOValue.
@@ -62,6 +67,7 @@ but ppuTag numbers in PParamsUpdate map stayed the same.
 - **DRepVotingThresholds**: array(10) Tag30 rationals: [motionNoConfidence, committeeNormal, committeeNoConfidence, updateConstitution, hardForkInitiation, ppNetworkGroup, ppEconomicGroup, ppTechnicalGroup, ppGovGroup, treasuryWithdrawal]
 
 ## Known Dugite Bugs (as of 2026-03-09)
-1. encode_protocol_params_cbor uses map encoding, should be array(31)
-2. DRep voting thresholds reuse dvt_p_param_change for all 4 PP group thresholds
-3. ProtocolParamsSnapshot missing separate dvt_pp_network/economic/technical/governance fields
+1. ~~encode_protocol_params_cbor uses map encoding, should be array(31)~~ FIXED
+2. ~~DRep voting thresholds reuse dvt_p_param_change for all 4 PP group thresholds~~ FIXED
+3. ~~ProtocolParamsSnapshot missing separate dvt_pp_network/economic/technical/governance fields~~ FIXED
+4. ~~protocolVersion encoded at index 12, must be at index 30 (LAST)~~ FIXED 2026-05-12 (issue #336)
