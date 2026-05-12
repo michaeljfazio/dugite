@@ -4051,7 +4051,8 @@ mod tests {
         let mut praos_b = OuroborosPraos::new(max_node_pv);
         let header = make_header_with_pv(1000, header_pv);
         let current = SlotNo(2000);
-        let res_a = praos_a.validate_header(&header, current, ValidationMode::Replay, Some(ledger_pv));
+        let res_a =
+            praos_a.validate_header(&header, current, ValidationMode::Replay, Some(ledger_pv));
         let res_b = praos_b.validate_header_full(
             &header,
             current,
