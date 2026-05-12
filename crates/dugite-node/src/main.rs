@@ -142,6 +142,14 @@ struct RunArgs {
     #[arg(long)]
     compat_metrics: bool,
 
+    /// Liveness threshold in seconds for the `/live` HTTP endpoint.
+    ///
+    /// `/live` returns 503 when no block has been applied within this window
+    /// (intended for Kubernetes liveness probes — pod gets restarted when
+    /// wedged).  Default 600s.  Set to 0 to disable (always 200).
+    #[arg(long, default_value = "600")]
+    liveness_threshold_secs: u64,
+
     /// Maximum number of transactions in the mempool
     #[arg(long, default_value = "16384")]
     mempool_max_tx: usize,
@@ -475,6 +483,16 @@ async fn run_dump_snapshot(args: DumpSnapshotArgs) -> Result<()> {
             std::sync::Arc::make_mut(&mut ledger.gov.governance)
                 .committee_expiration
                 .insert(cold_key, dugite_primitives::EpochNo(*expiration));
+            // Genesis encodes credential type in byte 28 (0x01 = script).
+            // Seed script_committee_credentials so the N2C committee-state
+            // query reports the correct cold_credential_type for genesis
+            // members (without this, all genesis script members are reported
+            // as KeyHash).
+            if hash_bytes[28] == 0x01 {
+                std::sync::Arc::make_mut(&mut ledger.gov.governance)
+                    .script_committee_credentials
+                    .insert(cold_key);
+            }
         }
     }
 
@@ -1405,6 +1423,7 @@ async fn run_node(args: RunArgs) -> Result<()> {
         _shelley_cold_key: args.shelley_cold_key,
         metrics_port: effective_metrics_port,
         compat_metrics: args.compat_metrics,
+        liveness_threshold_secs: args.liveness_threshold_secs,
         mempool_max_tx: args.mempool_max_tx,
         mempool_max_bytes: args.mempool_max_bytes,
         snapshot_max_retained: args.snapshot_max_retained,
