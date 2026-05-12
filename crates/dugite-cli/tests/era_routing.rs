@@ -12,10 +12,21 @@ use std::process::Command;
 const BIN: &str = env!("CARGO_BIN_EXE_dugite-cli");
 
 fn run(args: &[&str]) -> std::process::Output {
-    Command::new(BIN)
-        .args(args)
-        .output()
-        .expect("failed to invoke dugite-cli")
+    // Retry on spawn failure: under heavy concurrent test load
+    // (e.g. nextest running 200+ binaries in parallel), `fork()` can
+    // transiently fail with EAGAIN. A short retry loop makes these
+    // tests robust without changing semantics.
+    let mut last_err = None;
+    for _ in 0..5 {
+        match Command::new(BIN).args(args).output() {
+            Ok(o) => return o,
+            Err(e) => {
+                last_err = Some(e);
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
+        }
+    }
+    panic!("failed to invoke dugite-cli: {:?}", last_err.unwrap());
 }
 
 fn assert_help_ok(args: &[&str]) {
@@ -83,7 +94,20 @@ fn era_prefix_help_matches_flat_help() {
     // subcommand list — same commands, same descriptions.
     let flat = run(&["transaction", "--help"]);
     let latest = run(&["latest", "transaction", "--help"]);
-    assert!(flat.status.success() && latest.status.success());
+    assert!(
+        flat.status.success(),
+        "flat help failed: status={:?} stdout={:?} stderr={:?}",
+        flat.status,
+        String::from_utf8_lossy(&flat.stdout),
+        String::from_utf8_lossy(&flat.stderr),
+    );
+    assert!(
+        latest.status.success(),
+        "latest help failed: status={:?} stdout={:?} stderr={:?}",
+        latest.status,
+        String::from_utf8_lossy(&latest.stdout),
+        String::from_utf8_lossy(&latest.stderr),
+    );
 
     // Strip the `Usage:` line (which contains the differing prefix path)
     // and compare the rest of the body.
