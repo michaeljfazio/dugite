@@ -168,7 +168,7 @@ impl Node {
     /// on-chain state.
     pub async fn update_query_state(&self) {
         use super::n2c_query::{
-            CommitteeMemberSnapshot, CommitteeSnapshot, DRepDelegationEntry, DRepSnapshot,
+            CommitteeMemberSnapshot, CommitteeSnapshot, DRepDelegationGroup, DRepKey, DRepSnapshot,
             DRepStakeEntry, GenesisConfigSnapshot, PoolParamsSnapshot, PoolStakeSnapshotEntry,
             ProposalSnapshot, ShelleyPParamsSnapshot, StakeAddressSnapshot, StakeDelegDepositEntry,
             StakePoolSnapshot, StakeSnapshotsResult, VoteDelegateeEntry,
@@ -698,28 +698,48 @@ impl Node {
                 .collect()
         };
 
-        // Build DRep delegation entries for GetDRepDelegations (tag 39, V23+).
-        // Uses the same source as vote_delegatees (ls.gov.governance.vote_delegations) but
-        // produces DRepDelegationEntry values, keeping the two query types independent.
-        let drep_delegations: Vec<DRepDelegationEntry> = {
+        // Build DRep delegation groups for GetDRepDelegations (tag 39, V23+).
+        //
+        // Wire shape is Map<DRep, Set<Credential Staking>> — the OPPOSITE
+        // orientation of FilteredVoteDelegatees (tag 28).  We invert the
+        // ledger's stake-cred → DRep map into a DRep → [stake-cred] grouping
+        // and produce one DRepDelegationGroup per DRep that has at least one
+        // delegator.  Per-DRep credential lists are deterministically sorted
+        // (type, hash) for canonical CBOR.
+        let drep_delegations: Vec<DRepDelegationGroup> = {
             use dugite_primitives::transaction::DRep;
-            ls.gov
-                .governance
-                .vote_delegations
-                .iter()
-                .map(|(stake_cred, drep)| {
-                    let (drep_type, drep_hash) = match drep {
-                        DRep::KeyHash(h) => (0u8, Some(h.as_ref()[..28].to_vec())),
-                        DRep::ScriptHash(h) => (1u8, Some(h.as_ref().to_vec())),
-                        DRep::Abstain => (2u8, None),
-                        DRep::NoConfidence => (3u8, None),
-                    };
-                    DRepDelegationEntry {
-                        credential_hash: hash32_padded_to_28_bytes(stake_cred),
-                        credential_type: ls.certs.script_stake_credentials.contains(stake_cred)
-                            as u8,
-                        drep_type,
-                        drep_hash,
+            use std::collections::BTreeMap;
+            // Key DRepKey by (drep_type, drep_hash) so all four DRep variants
+            // share one ordering and BTreeMap iteration is deterministic.
+            // Key = (drep_type, optional 28-byte drep hash); Value = Vec<(cred_type, cred_hash)>
+            type DRepKeyTuple = (u8, Option<Vec<u8>>);
+            type CredEntry = (u8, Vec<u8>);
+            let mut by_drep: BTreeMap<DRepKeyTuple, Vec<CredEntry>> = BTreeMap::new();
+            for (stake_cred, drep) in &ls.gov.governance.vote_delegations {
+                let (drep_type, drep_hash) = match drep {
+                    DRep::KeyHash(h) => (0u8, Some(h.as_ref()[..28].to_vec())),
+                    DRep::ScriptHash(h) => (1u8, Some(h.as_ref().to_vec())),
+                    DRep::Abstain => (2u8, None),
+                    DRep::NoConfidence => (3u8, None),
+                };
+                let cred_type = ls.certs.script_stake_credentials.contains(stake_cred) as u8;
+                let cred_hash = hash32_padded_to_28_bytes(stake_cred);
+                by_drep
+                    .entry((drep_type, drep_hash))
+                    .or_default()
+                    .push((cred_type, cred_hash));
+            }
+            by_drep
+                .into_iter()
+                .map(|((drep_type, drep_hash), mut creds)| {
+                    // Sort credentials deterministically by (type, hash).
+                    creds.sort();
+                    DRepDelegationGroup {
+                        drep: DRepKey {
+                            drep_type,
+                            drep_hash,
+                        },
+                        credentials: creds,
                     }
                 })
                 .collect()

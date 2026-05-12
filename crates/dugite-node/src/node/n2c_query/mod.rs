@@ -28,13 +28,13 @@ use tracing::{debug, warn};
 // downstream consumers that previously imported from dugite_network::query_handler.
 #[allow(unused_imports)]
 pub use types::{
-    CommitteeMemberSnapshot, CommitteeSnapshot, DRepDelegationEntry, DRepSnapshot, DRepStakeEntry,
-    EraBound, EraSummary, GenesisConfigSnapshot, GovActionId, GovStateSnapshot, LedgerPeerEntry,
-    MultiAssetSnapshot, NodeStateSnapshot, NonMyopicRewardEntry, PoolParamsSnapshot,
-    PoolRewardInfo, PoolStakeSnapshotEntry, ProposalSnapshot, ProtocolParamsSnapshot, QueryResult,
-    RelaySnapshot, ShelleyPParamsSnapshot, SnapshotStakeData, StakeAddressSnapshot,
-    StakeDelegDepositEntry, StakePoolSnapshot, StakeSnapshotsResult, UtxoQueryProvider,
-    UtxoSnapshot, VoteDelegateeEntry,
+    CommitteeMemberSnapshot, CommitteeSnapshot, DRepDelegationGroup, DRepKey, DRepSnapshot,
+    DRepStakeEntry, EraBound, EraSummary, GenesisConfigSnapshot, GovActionId, GovStateSnapshot,
+    LedgerPeerEntry, MultiAssetSnapshot, NodeStateSnapshot, NonMyopicRewardEntry,
+    PoolParamsSnapshot, PoolRewardInfo, PoolStakeSnapshotEntry, ProposalSnapshot,
+    ProtocolParamsSnapshot, QueryResult, RelaySnapshot, ShelleyPParamsSnapshot, SnapshotStakeData,
+    StakeAddressSnapshot, StakeDelegDepositEntry, StakePoolSnapshot, StakeSnapshotsResult,
+    UtxoQueryProvider, UtxoSnapshot, VoteDelegateeEntry,
 };
 
 #[allow(unused_imports)]
