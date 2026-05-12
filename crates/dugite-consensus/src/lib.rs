@@ -7,6 +7,7 @@ pub mod epoch;
 pub mod era_history;
 pub mod forecast;
 pub mod overlay;
+pub mod peras_wire;
 pub mod praos;
 pub mod slot_leader;
 
@@ -14,6 +15,10 @@ pub use chain_selection::{ChainPreference, ChainSelection, DensityWindow};
 pub use era_history::{Bound, EraHistory, EraParams, EraSummaryEntry, PastHorizonError};
 pub use forecast::{forecast_for, OutsideForecastRange};
 pub use overlay::{OBftSlot, OverlayContext};
+pub use peras_wire::{
+    decode_bound, decode_era_params, encode_bound, encode_era_params, BoundWire, EraParamsWire,
+    PerasWireError,
+};
 pub use praos::{CryptoVerificationParams, OuroborosPraos, ValidationMode};
 pub use slot_leader::{compute_leader_schedule, LeaderSlot};
 

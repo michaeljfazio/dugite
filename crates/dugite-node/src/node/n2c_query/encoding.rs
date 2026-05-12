@@ -2126,6 +2126,15 @@ fn encode_era_history(
     // EraParams = array(4) [epoch_size, slot_length_ms, safe_zone, genesis_window]
     // SafeZone: StandardSafeZone(n) = array(3) [0, n, array(1)[0]]
     //           UnsafeIndefiniteSafeZone = array(1) [1]
+    //
+    // Peras (issue #459): Haskell ouroboros-consensus 1.0.0.0 extends `Bound`
+    // and the flat `EraParams` projection with an optional `peras_round` /
+    // `peras_round_length` field, encoded by varying the array length
+    // (3→4 and 4→5 respectively). dugite stays on the pre-Peras forms below
+    // until Peras activates on a network; see
+    // `dugite_consensus::peras_wire::{encode_bound, encode_era_params}` for
+    // the variable-length helpers and `decode_bound` / `decode_era_params`
+    // for the symmetric decoders.
     enc.begin_array().ok(); // indefinite-length array (0x9f)
     for (i, summary) in summaries.iter().enumerate() {
         enc.array(3).ok();
