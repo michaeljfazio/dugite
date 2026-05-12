@@ -423,6 +423,9 @@ pub(crate) fn convert_validation_error(
         VE::ReferenceInputOverlapsInput(input) => {
             TxValidationError::ReferenceInputOverlapsInput { input }
         }
+        VE::ReferenceInputsNotDisjointFromInputs(inputs) => {
+            TxValidationError::ReferenceInputsNotDisjointFromInputs { inputs }
+        }
         VE::MultiAssetNotConserved {
             policy,
             input_side,

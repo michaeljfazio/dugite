@@ -950,8 +950,19 @@ pub(super) fn run_phase1_rules(
 
     // ------------------------------------------------------------------
     // Rule 9: Reference inputs must exist and not overlap with regular inputs
+    //
+    // Disjointness (`inputs ∩ reference_inputs = ∅`) is enforced at phase-1
+    // only for PV < 11. At PV >= 11, Haskell `cardano-ledger` PR #5011
+    // (commit 44de8edcc1005ec0fe3442898b59ee57060ff72c) RELAXED this rule:
+    // V1/V2/native txs are accepted with overlap, and the equivalent check
+    // moves into PlutusV3 `TxInfo` translation as
+    // `ConwayContextError::ReferenceInputsNotDisjointFromInputs` (tag 15),
+    // surfaced as a phase-2 `BadTranslation`. See dugite issue #470.
+    //
+    // The `ReferenceInputNotFound` check is stable across all PVs.
     // ------------------------------------------------------------------
     if !body.reference_inputs.is_empty() {
+        let pv_major = params.protocol_version_major;
         let input_set: HashSet<_> = body.inputs.iter().collect();
         for ref_input in &body.reference_inputs {
             if utxo_set.lookup(ref_input).is_none() {
@@ -959,7 +970,7 @@ pub(super) fn run_phase1_rules(
                     ref_input.to_string(),
                 ));
             }
-            if input_set.contains(ref_input) {
+            if pv_major < 11 && input_set.contains(ref_input) {
                 errors.push(ValidationError::ReferenceInputOverlapsInput(
                     ref_input.to_string(),
                 ));
@@ -1616,20 +1627,101 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // Test 14 — Rule 9: reference input overlaps with regular input
+    // Test 14 — Rule 9 (PV gating, dugite #470):
+    //   PV <= 10 → phase-1 rejects with `ReferenceInputOverlapsInput`
+    //              (`BabbageNonDisjointRefInputs`).
+    //   PV >= 11 → phase-1 accepts the overlap (Haskell cardano-ledger
+    //              PR #5011 relaxed the rule for V1/V2/native; the equivalent
+    //              check moved into PlutusV3 TxInfo translation as a phase-2
+    //              `BadTranslation`).
     // -----------------------------------------------------------------------
     #[test]
     fn test_ref_inputs_must_be_disjoint() {
+        // PV 10 (pre-relaxation): overlap must be rejected at phase-1.
         let (utxo_set, mut tx, input) = make_valid_tx();
-        // Put the same input in both the spending set and the reference set.
         tx.body.reference_inputs.push(input.clone());
-        let params = ProtocolParameters::mainnet_defaults();
+        let mut params = ProtocolParameters::mainnet_defaults();
+        params.protocol_version_major = 10;
         let errors = validate_transaction(&tx, &utxo_set, &params, 100, 300, None).unwrap_err();
         assert!(
             errors
                 .iter()
                 .any(|e| matches!(e, ValidationError::ReferenceInputOverlapsInput(_))),
-            "expected ReferenceInputOverlapsInput, got {errors:?}"
+            "PV 10: expected ReferenceInputOverlapsInput, got {errors:?}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Test 14a — PV 11 with native-only tx and overlap: ACCEPT (no V3 → no
+    // phase-2 BadTranslation either).
+    // -----------------------------------------------------------------------
+    #[test]
+    fn test_ref_inputs_overlap_accepted_at_pv11_native() {
+        let (utxo_set, mut tx, input) = make_valid_tx();
+        tx.body.reference_inputs.push(input.clone());
+        let mut params = ProtocolParameters::mainnet_defaults();
+        params.protocol_version_major = 11;
+        let result = validate_transaction(&tx, &utxo_set, &params, 100, 300, None);
+        assert!(
+            result.is_ok(),
+            "PV 11 native tx with overlap should be accepted, got errors: {:?}",
+            result.err()
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Test 14b — PV 11 with no overlap: ACCEPT.
+    // -----------------------------------------------------------------------
+    #[test]
+    fn test_ref_inputs_no_overlap_at_pv11_accepted() {
+        // Construct a tx with a reference input that *does* exist in the UTxO
+        // set but is not in `body.inputs` — no overlap.
+        let (mut utxo_set, mut tx, _) = make_valid_tx();
+        let ref_input = TransactionInput {
+            transaction_id: Hash32::from_bytes([0x77u8; 32]),
+            index: 0,
+        };
+        let ref_output = TransactionOutput {
+            address: Address::Byron(dugite_primitives::address::ByronAddress {
+                payload: vec![0x82, 0x00, 0x01],
+            }),
+            value: Value::lovelace(5_000_000),
+            datum: OutputDatum::None,
+            script_ref: None,
+            is_legacy: false,
+            raw_cbor: None,
+        };
+        utxo_set.insert(ref_input.clone(), ref_output);
+        tx.body.reference_inputs.push(ref_input);
+        let mut params = ProtocolParameters::mainnet_defaults();
+        params.protocol_version_major = 11;
+        let result = validate_transaction(&tx, &utxo_set, &params, 100, 300, None);
+        assert!(
+            result.is_ok(),
+            "PV 11 tx with non-overlapping ref input should be accepted, got: {:?}",
+            result.err()
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Test 14c — PV 11 with reference input NOT in UTxO: still
+    // `ReferenceInputNotFound` (this rule is stable across all PVs).
+    // -----------------------------------------------------------------------
+    #[test]
+    fn test_ref_inputs_not_found_at_pv11() {
+        let (utxo_set, mut tx, _) = make_valid_tx();
+        tx.body.reference_inputs.push(TransactionInput {
+            transaction_id: Hash32::from_bytes([0xDEu8; 32]),
+            index: 0,
+        });
+        let mut params = ProtocolParameters::mainnet_defaults();
+        params.protocol_version_major = 11;
+        let errors = validate_transaction(&tx, &utxo_set, &params, 100, 300, None).unwrap_err();
+        assert!(
+            errors
+                .iter()
+                .any(|e| matches!(e, ValidationError::ReferenceInputNotFound(_))),
+            "PV 11: expected ReferenceInputNotFound, got {errors:?}"
         );
     }
 

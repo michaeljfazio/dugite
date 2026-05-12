@@ -14179,4 +14179,189 @@ mod tests {
             }
         }
     }
+
+    // ===================================================================
+    // dugite #470 — PV11 reference-input disjointness relaxation tests.
+    //
+    // Phase-1 disjointness was relaxed by Haskell cardano-ledger PR #5011
+    // (commit 44de8edcc1005ec0fe3442898b59ee57060ff72c).  V1/V2/native txs
+    // with `inputs ∩ reference_inputs ≠ ∅` are accepted at PV >= 11; the
+    // equivalent check moves to PlutusV3 TxInfo translation
+    // (`ConwayContextError::ReferenceInputsNotDisjointFromInputs`, tag 15).
+    //
+    // The 7-row test matrix from issue #470 is split across phase1.rs
+    // (PV gating: tests 14, 14a, 14b, 14c) and these tests here (V1/V2
+    // script and V3 script with overlap).
+    // ===================================================================
+
+    /// Helper: build a transaction whose only input is at a Script address.
+    /// The script-credential hash is `script_hash`.  The input is at txin
+    /// `(tx_id, 0)` with 10 ADA. Returns (utxo_set, input).
+    fn build_script_input(
+        tx_id: [u8; 32],
+        script_hash: Hash28,
+    ) -> (UtxoSet, TransactionInput, TransactionInput) {
+        use dugite_primitives::address::EnterpriseAddress;
+        use dugite_primitives::credentials::Credential;
+        use dugite_primitives::network::NetworkId;
+
+        let mut utxo_set = UtxoSet::new();
+        let input = TransactionInput {
+            transaction_id: Hash32::from_bytes(tx_id),
+            index: 0,
+        };
+        let address = Address::Enterprise(EnterpriseAddress {
+            network: NetworkId::Mainnet,
+            payment: Credential::Script(script_hash),
+        });
+        let output = TransactionOutput {
+            address,
+            value: Value::lovelace(10_000_000),
+            datum: OutputDatum::None,
+            script_ref: None,
+            is_legacy: false,
+            raw_cbor: None,
+        };
+        utxo_set.insert(input.clone(), output);
+        // Pure-ADA collateral input at a Byron address (no witness needed).
+        let collateral = TransactionInput {
+            transaction_id: Hash32::from_bytes([0x99u8; 32]),
+            index: 0,
+        };
+        utxo_set.insert(
+            collateral.clone(),
+            TransactionOutput {
+                address: Address::Byron(ByronAddress {
+                    payload: vec![0u8; 32],
+                }),
+                value: Value::lovelace(5_000_000),
+                datum: OutputDatum::None,
+                script_ref: None,
+                is_legacy: false,
+                raw_cbor: None,
+            },
+        );
+        (utxo_set, input, collateral)
+    }
+
+    /// Build a tx that spends `input` (script-locked) with a single Spend
+    /// redeemer at index 0.  The witness set contains exactly one Plutus
+    /// script of language version `lang` (1=V1, 2=V2, 3=V3) whose hash
+    /// matches the input's address script credential.
+    fn build_plutus_script_tx(
+        input: TransactionInput,
+        script_bytes: Vec<u8>,
+        lang: u8,
+    ) -> Transaction {
+        let mut tx = make_simple_tx(input, 9_000_000, 1_000_000);
+        // Plug in a redeemer for Spend at index 0 with non-zero ex-units to
+        // ensure phase-2 collateral checks see it.  ex-units are placeholder.
+        tx.witness_set.redeemers = vec![Redeemer {
+            tag: RedeemerTag::Spend,
+            index: 0,
+            data: dugite_primitives::transaction::PlutusData::Integer(0),
+            ex_units: ExUnits {
+                mem: 1_000_000,
+                steps: 1_000_000,
+            },
+        }];
+        match lang {
+            1 => tx.witness_set.plutus_v1_scripts = vec![script_bytes],
+            2 => tx.witness_set.plutus_v2_scripts = vec![script_bytes],
+            3 => tx.witness_set.plutus_v3_scripts = vec![script_bytes],
+            _ => unreachable!("invalid lang"),
+        }
+        tx
+    }
+
+    /// PV11 + V1 script + overlap → ACCEPT (rule relaxed for V1/V2/native).
+    /// We assert that the new `ReferenceInputsNotDisjointFromInputs` is NOT
+    /// raised; other phase-1/phase-2 failures may still appear (we ignore
+    /// them — this test only guards the relaxation).
+    #[test]
+    fn test_pv11_v1_overlap_no_disjointness_error() {
+        let script_bytes = vec![0x49u8, 0x48, 0x01, 0x00, 0x00, 0x21, 0x20, 0x01];
+        let script_hash = dugite_primitives::hash::blake2b_224_tagged(1, &script_bytes);
+        let (utxo_set, input, collateral) = build_script_input([0x33; 32], script_hash);
+        let mut tx = build_plutus_script_tx(input.clone(), script_bytes, 1);
+        tx.body.reference_inputs.push(input);
+        tx.body.collateral = vec![collateral];
+
+        let mut params = ProtocolParameters::mainnet_defaults();
+        params.protocol_version_major = 11;
+
+        let result = validate_transaction(&tx, &utxo_set, &params, 100, 300, None);
+        if let Err(errors) = result {
+            for e in &errors {
+                assert!(
+                    !matches!(
+                        e,
+                        ValidationError::ReferenceInputsNotDisjointFromInputs(_)
+                            | ValidationError::ReferenceInputOverlapsInput(_)
+                    ),
+                    "PV11 V1 overlap must not raise disjointness errors: {e:?}",
+                );
+            }
+        }
+    }
+
+    /// PV11 + V2 script + overlap → ACCEPT.  Same shape as the V1 test.
+    #[test]
+    fn test_pv11_v2_overlap_no_disjointness_error() {
+        let script_bytes = vec![0x49u8, 0x48, 0x01, 0x00, 0x00, 0x21, 0x20, 0x01];
+        let script_hash = dugite_primitives::hash::blake2b_224_tagged(2, &script_bytes);
+        let (utxo_set, input, collateral) = build_script_input([0x44; 32], script_hash);
+        let mut tx = build_plutus_script_tx(input.clone(), script_bytes, 2);
+        tx.body.reference_inputs.push(input);
+        tx.body.collateral = vec![collateral];
+
+        let mut params = ProtocolParameters::mainnet_defaults();
+        params.protocol_version_major = 11;
+
+        let result = validate_transaction(&tx, &utxo_set, &params, 100, 300, None);
+        if let Err(errors) = result {
+            for e in &errors {
+                assert!(
+                    !matches!(
+                        e,
+                        ValidationError::ReferenceInputsNotDisjointFromInputs(_)
+                            | ValidationError::ReferenceInputOverlapsInput(_)
+                    ),
+                    "PV11 V2 overlap must not raise disjointness errors: {e:?}",
+                );
+            }
+        }
+    }
+
+    /// PV11 + V3 script + overlap → REJECT with
+    /// `ReferenceInputsNotDisjointFromInputs` (Haskell phase-2
+    /// `ConwayContextError` tag 15, surfaced as `BadTranslation`).
+    #[test]
+    fn test_pv11_v3_overlap_rejected_with_disjointness_error() {
+        let script_bytes = vec![0x49u8, 0x48, 0x01, 0x00, 0x00, 0x21, 0x20, 0x01];
+        let script_hash = dugite_primitives::hash::blake2b_224_tagged(3, &script_bytes);
+        let (utxo_set, input, collateral) = build_script_input([0x55; 32], script_hash);
+        let mut tx = build_plutus_script_tx(input.clone(), script_bytes, 3);
+        tx.body.reference_inputs.push(input.clone());
+        tx.body.collateral = vec![collateral];
+
+        let mut params = ProtocolParameters::mainnet_defaults();
+        params.protocol_version_major = 11;
+
+        let errors = validate_transaction(&tx, &utxo_set, &params, 100, 300, None)
+            .expect_err("V3 overlap at PV11 must be rejected");
+        assert!(
+            errors
+                .iter()
+                .any(|e| matches!(e, ValidationError::ReferenceInputsNotDisjointFromInputs(_))),
+            "expected ReferenceInputsNotDisjointFromInputs at PV11+V3, got {errors:?}"
+        );
+        // And the legacy phase-1 variant must NOT fire.
+        assert!(
+            !errors
+                .iter()
+                .any(|e| matches!(e, ValidationError::ReferenceInputOverlapsInput(_))),
+            "phase-1 ReferenceInputOverlapsInput must not fire at PV11, got {errors:?}"
+        );
+    }
 }

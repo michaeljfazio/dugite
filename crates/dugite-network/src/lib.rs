@@ -196,6 +196,13 @@ pub enum TxValidationError {
     ReferenceInputOverlapsInput {
         input: String,
     },
+    /// Phase-2 PlutusV3 `TxInfo` translation: `inputs ∩ reference_inputs ≠ ∅`.
+    /// Wire shape: `ConwayContextError::ReferenceInputsNotDisjointFromInputs`
+    /// (CBOR tag 15) surfaced as a `BadTranslation` collect-error.  Introduced
+    /// by Haskell `cardano-ledger` PR #5011 at PV >= 11 for V3-only txs.
+    ReferenceInputsNotDisjointFromInputs {
+        inputs: Vec<String>,
+    },
     MultiAssetNotConserved {
         policy: String,
         input_side: i128,
