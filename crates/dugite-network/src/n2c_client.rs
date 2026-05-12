@@ -1333,6 +1333,41 @@ fn decode_conway_pred_failure(decoder: &mut minicbor::Decoder<'_>) -> Option<Str
             let text = decoder.str().ok()?;
             Some(text.to_string())
         }
+        8 => {
+            // ConwayWithdrawalsMissingAccounts(Withdrawals)
+            // Wire: { reward_account_bytes => coin, ... }
+            let len = decoder.map().ok()?.unwrap_or(0);
+            let mut entries: Vec<String> = Vec::new();
+            for _ in 0..len {
+                let addr = decoder.bytes().ok()?;
+                let coin = decoder.u64().ok()?;
+                entries.push(format!("{}=>{coin}", hex::encode(addr)));
+            }
+            Some(format!(
+                "ConwayWithdrawalsMissingAccounts({})",
+                entries.join(",")
+            ))
+        }
+        9 => {
+            // ConwayIncompleteWithdrawals(NonEmptyMap RewardAccount (Mismatch 'RelEQ Coin))
+            // Wire: { reward_account_bytes => [supplied, expected], ... }
+            let len = decoder.map().ok()?.unwrap_or(0);
+            let mut entries: Vec<String> = Vec::new();
+            for _ in 0..len {
+                let addr = decoder.bytes().ok()?;
+                let _ = decoder.array().ok()?;
+                let supplied = decoder.u64().ok()?;
+                let expected = decoder.u64().ok()?;
+                entries.push(format!(
+                    "{}=>supplied={supplied},expected={expected}",
+                    hex::encode(addr)
+                ));
+            }
+            Some(format!(
+                "ConwayIncompleteWithdrawals({})",
+                entries.join(",")
+            ))
+        }
         other => {
             let _ = decoder.skip();
             Some(format!("ConwayLedgerPredFailure(tag={other})"))
