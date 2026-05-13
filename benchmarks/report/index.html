@@ -178,6 +178,47 @@
             </ul>
             <li><a href="../chaindb_slot_range_100/report/index.html">chaindb/slot_range_100</a></li>
             <li><a href="../chaindb_tip_query/report/index.html">chaindb/tip_query</a></li>
+            <li><a href="../consensus_chain_selection/report/index.html">consensus/chain_selection</a></li>
+            
+            <ul>
+                <li><a href="../consensus_chain_selection/equal_length_tiebreak/report/index.html">equal_length_tiebreak</a></li>
+                <li><a href="../consensus_chain_selection/longer_fork_100/report/index.html">longer_fork_100</a></li>
+                <li><a href="../consensus_chain_selection/prefer_simple/report/index.html">prefer_simple</a></li>
+            </ul>
+            <li>consensus/validate_header</li>
+            
+            <ul>
+                <li><a href="../consensus_validate_header/replay_mode/report/index.html">replay_mode</a></li>
+            </ul>
+            <li><a href="../consensus_vrf_leader_check/report/index.html">consensus/vrf_leader_check</a></li>
+            
+            <ul>
+                <li>
+                    <table>
+                        <tr>
+                            <th></th>
+                            <th>batch</th>
+                            <th><a href="../consensus_vrf_leader_check/single/report/index.html">single</a></th>
+                        </tr>
+                        <tr>
+                            <th>21600</th>
+                            <td><a href="../consensus_vrf_leader_check/batch/21600/report/index.html">consensus/vrf_leader_check/batch/21600</a></td>
+                        </tr>
+                        <tr>
+                            <th>sigma=0.0000247</th>
+                            <td><a href="../consensus_vrf_leader_check/single/sigma=0.0000247/report/index.html">consensus/vrf_leader_check/single/sigma=0.0000247</a></td>
+                        </tr>
+                        <tr>
+                            <th>sigma=0.001</th>
+                            <td><a href="../consensus_vrf_leader_check/single/sigma=0.001/report/index.html">consensus/vrf_leader_check/single/sigma=0.001</a></td>
+                        </tr>
+                        <tr>
+                            <th>sigma=0.01</th>
+                            <td><a href="../consensus_vrf_leader_check/single/sigma=0.01/report/index.html">consensus/vrf_leader_check/single/sigma=0.01</a></td>
+                        </tr>
+                    </table>
+                </li>
+            </ul>
             <li><a href="../immutabledb_append/report/index.html">immutabledb/append</a></li>
             
             <ul>
@@ -267,6 +308,163 @@
                         </tr>
                     </table>
                 </li>
+            </ul>
+            <li>lsm/apply_batch</li>
+            
+            <ul>
+                <li>
+                    <table>
+                        <tr>
+                            <th></th>
+                            <th>inserts_10k_deletes_2.5k</th>
+                        </tr>
+                        <tr>
+                            <th>10000</th>
+                            <td><a href="../lsm_apply_batch/inserts_10k_deletes_2.5k/10000/report/index.html">lsm/apply_batch/inserts_10k_deletes_2.5k/10000</a></td>
+                        </tr>
+                    </table>
+                </li>
+            </ul>
+            <li>lsm/insert</li>
+            
+            <ul>
+                <li>
+                    <table>
+                        <tr>
+                            <th></th>
+                            <th>random_keys</th>
+                        </tr>
+                        <tr>
+                            <th>10000</th>
+                            <td><a href="../lsm_insert/random_keys/10000/report/index.html">lsm/insert/random_keys/10000</a></td>
+                        </tr>
+                    </table>
+                </li>
+            </ul>
+            <li><a href="../lsm_point_lookup/report/index.html">lsm/point_lookup</a></li>
+            
+            <ul>
+                <li>
+                    <table>
+                        <tr>
+                            <th></th>
+                            <th>hit_random</th>
+                            <th>miss_random</th>
+                        </tr>
+                        <tr>
+                            <th><a href="../lsm_point_lookup/10000/report/index.html">10000</a></th>
+                            <td><a href="../lsm_point_lookup/hit_random/10000/report/index.html">lsm/point_lookup/hit_random/10000</a></td>
+                            <td><a href="../lsm_point_lookup/miss_random/10000/report/index.html">lsm/point_lookup/miss_random/10000</a></td>
+                        </tr>
+                    </table>
+                </li>
+            </ul>
+            <li><a href="../lsm_range_scan/report/index.html">lsm/range_scan</a></li>
+            
+            <ul>
+                <li>
+                    <table>
+                        <tr>
+                            <th></th>
+                            <th>full_scan</th>
+                            <th>window_100_of_10k</th>
+                        </tr>
+                        <tr>
+                            <th><a href="../lsm_range_scan/10000/report/index.html">10000</a></th>
+                            <td><a href="../lsm_range_scan/full_scan/10000/report/index.html">lsm/range_scan/full_scan/10000</a></td>
+                            <td><a href="../lsm_range_scan/window_100_of_10k/10000/report/index.html">lsm/range_scan/window_100_of_10k/10000</a></td>
+                        </tr>
+                    </table>
+                </li>
+            </ul>
+            <li><a href="../lsm_snapshot/report/index.html">lsm/snapshot</a></li>
+            
+            <ul>
+                <li><a href="../lsm_snapshot/load_10k/report/index.html">load_10k</a></li>
+                <li><a href="../lsm_snapshot/save_10k/report/index.html">save_10k</a></li>
+            </ul>
+            <li><a href="../network_blockfetch_msg_block/report/index.html">network/blockfetch/msg_block</a></li>
+            
+            <ul>
+                <li>
+                    <table>
+                        <tr>
+                            <th></th>
+                            <th><a href="../network_blockfetch_msg_block/decode/report/index.html">decode</a></th>
+                            <th><a href="../network_blockfetch_msg_block/encode/report/index.html">encode</a></th>
+                        </tr>
+                        <tr>
+                            <th><a href="../network_blockfetch_msg_block/2048/report/index.html">2048</a></th>
+                            <td><a href="../network_blockfetch_msg_block/decode/2048/report/index.html">network/blockfetch/msg_block/decode/2048</a></td>
+                            <td><a href="../network_blockfetch_msg_block/encode/2048/report/index.html">network/blockfetch/msg_block/encode/2048</a></td>
+                        </tr>
+                        <tr>
+                            <th><a href="../network_blockfetch_msg_block/20480/report/index.html">20480</a></th>
+                            <td><a href="../network_blockfetch_msg_block/decode/20480/report/index.html">network/blockfetch/msg_block/decode/20480</a></td>
+                            <td><a href="../network_blockfetch_msg_block/encode/20480/report/index.html">network/blockfetch/msg_block/encode/20480</a></td>
+                        </tr>
+                        <tr>
+                            <th><a href="../network_blockfetch_msg_block/90000/report/index.html">90000</a></th>
+                            <td><a href="../network_blockfetch_msg_block/decode/90000/report/index.html">network/blockfetch/msg_block/decode/90000</a></td>
+                            <td><a href="../network_blockfetch_msg_block/encode/90000/report/index.html">network/blockfetch/msg_block/encode/90000</a></td>
+                        </tr>
+                    </table>
+                </li>
+            </ul>
+            <li><a href="../network_blockfetch_request_range/report/index.html">network/blockfetch/request_range</a></li>
+            
+            <ul>
+                <li><a href="../network_blockfetch_request_range/decode/report/index.html">decode</a></li>
+                <li><a href="../network_blockfetch_request_range/encode/report/index.html">encode</a></li>
+            </ul>
+            <li><a href="../network_chainsync_roll_backward/report/index.html">network/chainsync/roll_backward</a></li>
+            
+            <ul>
+                <li><a href="../network_chainsync_roll_backward/decode/report/index.html">decode</a></li>
+                <li><a href="../network_chainsync_roll_backward/encode/report/index.html">encode</a></li>
+            </ul>
+            <li><a href="../network_chainsync_roll_forward/report/index.html">network/chainsync/roll_forward</a></li>
+            
+            <ul>
+                <li>
+                    <table>
+                        <tr>
+                            <th></th>
+                            <th><a href="../network_chainsync_roll_forward/decode/report/index.html">decode</a></th>
+                            <th><a href="../network_chainsync_roll_forward/encode/report/index.html">encode</a></th>
+                        </tr>
+                        <tr>
+                            <th><a href="../network_chainsync_roll_forward/256/report/index.html">256</a></th>
+                            <td><a href="../network_chainsync_roll_forward/decode/256/report/index.html">network/chainsync/roll_forward/decode/256</a></td>
+                            <td><a href="../network_chainsync_roll_forward/encode/256/report/index.html">network/chainsync/roll_forward/encode/256</a></td>
+                        </tr>
+                        <tr>
+                            <th><a href="../network_chainsync_roll_forward/1024/report/index.html">1024</a></th>
+                            <td><a href="../network_chainsync_roll_forward/decode/1024/report/index.html">network/chainsync/roll_forward/decode/1024</a></td>
+                            <td><a href="../network_chainsync_roll_forward/encode/1024/report/index.html">network/chainsync/roll_forward/encode/1024</a></td>
+                        </tr>
+                        <tr>
+                            <th><a href="../network_chainsync_roll_forward/4096/report/index.html">4096</a></th>
+                            <td><a href="../network_chainsync_roll_forward/decode/4096/report/index.html">network/chainsync/roll_forward/decode/4096</a></td>
+                            <td><a href="../network_chainsync_roll_forward/encode/4096/report/index.html">network/chainsync/roll_forward/encode/4096</a></td>
+                        </tr>
+                    </table>
+                </li>
+            </ul>
+            <li><a href="../network_handshake_encode/report/index.html">network/handshake_encode</a></li>
+            
+            <ul>
+                <li><a href="../network_handshake_encode/n2c_version_data/report/index.html">n2c_version_data</a></li>
+                <li><a href="../network_handshake_encode/n2n_version_data/report/index.html">n2n_version_data</a></li>
+            </ul>
+            <li><a href="../network_n2c_query_encode/report/index.html">network/n2c_query_encode</a></li>
+            
+            <ul>
+                <li><a href="../network_n2c_query_encode/era_mismatch/report/index.html">era_mismatch</a></li>
+                <li><a href="../network_n2c_query_encode/govstate_hfc_success/report/index.html">govstate/hfc_success</a></li>
+                <li><a href="../network_n2c_query_encode/govstate_tag24/report/index.html">govstate/tag24</a></li>
+                <li><a href="../network_n2c_query_encode/pparams_hfc_success/report/index.html">pparams/hfc_success</a></li>
+                <li><a href="../network_n2c_query_encode/pparams_tag24/report/index.html">pparams/tag24</a></li>
             </ul>
             <li><a href="../scaling_block_index_insert/report/index.html">scaling/block_index_insert</a></li>
             
