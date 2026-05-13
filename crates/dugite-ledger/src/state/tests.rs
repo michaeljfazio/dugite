@@ -1375,20 +1375,29 @@ fn test_committee_expiration_during_epoch_transition() {
         .committee_expiration
         .insert(cold2, EpochNo(10));
 
-    // At epoch 5, cold1 should be expired
+    // At epoch 5, cold1 is past its expiry (validUntil=5, < new_epoch). Per
+    // Haskell ledger and issue #433, expired members are RETAINED in the map
+    // (surfaced as MemberStatus=Expired at query time) — not pruned. Both the
+    // hot-key authorization and the expiration entry must survive.
     state.process_epoch_transition(EpochNo(5));
-    assert!(!state.gov.governance.committee_hot_keys.contains_key(&cold1));
-    assert!(!state
+    // cold1 retained with hot key auth (status=Expired surfaced via query)
+    assert!(state.gov.governance.committee_hot_keys.contains_key(&cold1));
+    assert!(state
         .gov
         .governance
         .committee_expiration
         .contains_key(&cold1));
-    // cold2 should remain
+    // cold2 also remains (not yet expired)
     assert!(state.gov.governance.committee_hot_keys.contains_key(&cold2));
 
-    // At epoch 10, cold2 should be expired
+    // At epoch 10, cold2 reaches its expiry. Still retained (Expired status).
     state.process_epoch_transition(EpochNo(10));
-    assert!(!state.gov.governance.committee_hot_keys.contains_key(&cold2));
+    assert!(state.gov.governance.committee_hot_keys.contains_key(&cold2));
+    assert!(state
+        .gov
+        .governance
+        .committee_expiration
+        .contains_key(&cold2));
 }
 
 #[test]

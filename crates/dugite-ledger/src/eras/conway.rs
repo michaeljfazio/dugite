@@ -2115,12 +2115,18 @@ mod tests {
         // Epoch fees reset.
         assert_eq!(utxo.epoch_fees.0, 0);
 
-        // Expired CC member pruned.
-        assert!(!gov
-            .governance
-            .committee_expiration
-            .contains_key(&expired_cc));
-        assert!(!gov.governance.committee_hot_keys.contains_key(&expired_cc));
+        // Expired CC member RETAINED in the map (issue #433): Haskell ledger
+        // keeps the entry and surfaces it as `MemberStatus=Expired` at query
+        // time; physical removal would (a) make the CC state query undercount,
+        // and (b) drop authorization context if the same cold credential is
+        // later re-elected with a fresh `validUntil`. Ratification filters
+        // expired members in-place, so retention does not affect voting weight.
+        assert!(
+            gov.governance
+                .committee_expiration
+                .contains_key(&expired_cc),
+            "expired CC member must be retained for status=Expired surfacing"
+        );
     }
 
     /// Conway epoch transition handles pool retirement.

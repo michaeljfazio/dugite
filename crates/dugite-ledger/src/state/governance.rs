@@ -1481,28 +1481,36 @@ pub(crate) fn update_drep_activity(
     }
 }
 
-/// Expire committee members that have passed their expiration epoch.
+/// Observe committee members whose expiry epoch has passed.
+///
+/// Matches Haskell `cardano-ledger` (`Cardano.Ledger.Conway.Rules.Epoch`):
+/// the expiry epoch transition does NOT physically remove expired members
+/// from the committee map. Membership is retained verbatim; the
+/// `MemberStatus = Expired` projection is computed dynamically at query
+/// time (see `Cardano.Ledger.Conway.Governance.Committee.committeeMemberStateF`
+/// and dugite's analogue in `crates/dugite-node/src/node/query.rs`).
+///
+/// Retaining expired entries is required for two reasons:
+///   * The CC state query must surface them with `Expired` status (#433).
+///   * Subsequent `UpdateCommittee` actions can re-elect the same cold
+///     credential with a fresh `validUntil`; if we had dropped the entry
+///     we would lose the prior authorization context observable from queries.
+///
+/// Ratification already filters expired members in-place by comparing the
+/// current epoch against the stored `validUntil` (see `check_cc_approval`
+/// and `count_cc_votes_quorum`), so leaving stale entries in the map does
+/// not affect voting weight.
 pub(crate) fn expire_committee_members(new_epoch: EpochNo, gov: &mut GovSubState) {
-    let expired_members: Vec<Hash32> = gov
+    let expired_count = gov
         .governance
         .committee_expiration
         .iter()
-        .filter(|(_, exp_epoch)| **exp_epoch <= new_epoch)
-        .map(|(hash, _)| *hash)
-        .collect();
-    if !expired_members.is_empty() {
-        for hash in &expired_members {
-            Arc::make_mut(&mut gov.governance)
-                .committee_hot_keys
-                .remove(hash);
-            Arc::make_mut(&mut gov.governance)
-                .committee_expiration
-                .remove(hash);
-        }
+        .filter(|(_, exp_epoch)| **exp_epoch < new_epoch)
+        .count();
+    if expired_count > 0 {
         debug!(
-            "Expired {} committee members at epoch {}",
-            expired_members.len(),
-            new_epoch.0
+            "Observed {} expired committee members at epoch {} (retained in map; surfaced as MemberStatus=Expired in queries)",
+            expired_count, new_epoch.0
         );
     }
 }
@@ -4587,6 +4595,69 @@ mod tests {
         let after_expiration = state.gov.governance.committee_expiration.clone();
         assert!(after_threshold.is_none());
         assert!(after_expiration.is_empty());
+    }
+
+    /// Regression for issue #433: `expire_committee_members` must NOT
+    /// physically remove members whose expiry epoch has passed. Matches
+    /// Haskell `cardano-ledger`, where the committee map retains all elected
+    /// members verbatim and `MemberStatus = Expired` is computed at query
+    /// time. Physically deleting the entry would (a) make the CC state query
+    /// undercount, and (b) lose the prior authorization context if the same
+    /// cold credential is re-elected with a fresh `validUntil`.
+    #[test]
+    fn test_expired_committee_members_retained_in_map() {
+        let mut state = gov_test_state(0, 0);
+        let cold = Credential::VerificationKey(Hash28::from_bytes([42u8; 28]));
+        let cold_key = credential_to_hash(&cold);
+        // Member elected with `validUntil = 10`.
+        Arc::make_mut(&mut state.gov.governance)
+            .committee_expiration
+            .insert(cold_key, EpochNo(10));
+        // Authorise a hot key — this must survive expiry so the query can
+        // still report the prior authorization (matches Haskell behaviour).
+        let hot = Credential::VerificationKey(Hash28::from_bytes([99u8; 28]));
+        let hot_key = credential_to_hash(&hot);
+        Arc::make_mut(&mut state.gov.governance)
+            .committee_hot_keys
+            .insert(cold_key, hot_key);
+
+        // Advance past expiry — well beyond `validUntil = 10`.
+        expire_committee_members(EpochNo(50), &mut state.gov);
+
+        assert!(
+            state
+                .gov
+                .governance
+                .committee_expiration
+                .contains_key(&cold_key),
+            "expired CC member must remain in committee_expiration; Haskell parity (#433)"
+        );
+        assert_eq!(
+            state.gov.governance.committee_expiration.get(&cold_key),
+            Some(&EpochNo(10)),
+            "validUntil must be preserved verbatim after expiry"
+        );
+        assert!(
+            state
+                .gov
+                .governance
+                .committee_hot_keys
+                .contains_key(&cold_key),
+            "hot-key authorization must survive expiry; query must still surface it"
+        );
+
+        // Query-time MemberStatus projection (mirrors query.rs:444):
+        // `currentEpoch > validUntil` ⇒ Expired.
+        let current = EpochNo(50);
+        let expiry = state
+            .gov
+            .governance
+            .committee_expiration
+            .get(&cold_key)
+            .copied()
+            .expect("retained");
+        let member_status: u8 = if current.0 > expiry.0 { 1 } else { 0 };
+        assert_eq!(member_status, 1, "MemberStatus must be Expired (1)");
     }
 
     /// Regression: script-DRep delegations must be routed via the typed
