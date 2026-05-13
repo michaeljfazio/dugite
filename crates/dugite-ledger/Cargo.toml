@@ -11,6 +11,7 @@ dugite-serialization = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 serde = { workspace = true }
+serde_json = { workspace = true, optional = true }
 num-bigint = { workspace = true }
 num-rational = { workspace = true }
 num-traits = { workspace = true }
@@ -24,6 +25,13 @@ rayon = { workspace = true, optional = true }
 [features]
 default = ["parallel-verification"]
 parallel-verification = ["rayon"]
+# Compile in the per-epoch-boundary reward-debug dumper.
+# When this feature is enabled, setting `DUGITE_REWARD_DEBUG_DUMP=<dir>` at
+# runtime writes per-boundary JSON snapshots of every active pool's GO
+# snapshot, reward-account balances, and computed RUPD credits.  Used to
+# bisect path-dependent reward divergences (see issue #438 / #471).
+# Off by default — production builds incur zero overhead.
+reward-debug-dump = ["dep:serde_json"]
 
 [dev-dependencies]
 serde_json = { workspace = true }

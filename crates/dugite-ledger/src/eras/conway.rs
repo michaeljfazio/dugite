@@ -374,6 +374,26 @@ impl EraRules for ConwayRules {
                     ctx.shelley_transition_epoch,
                 );
 
+                // Issue #438/#471: per-boundary reward-debug dump.  No-op
+                // unless the crate is built with `--features
+                // reward-debug-dump` AND `DUGITE_REWARD_DEBUG_DUMP=<dir>` is
+                // set at runtime.
+                #[cfg(feature = "reward-debug-dump")]
+                crate::state::reward_debug::maybe_dump(
+                    ctx.current_epoch.0,
+                    new_epoch.0,
+                    ctx.params,
+                    epochs.prev_d,
+                    epochs.prev_protocol_version_major,
+                    epochs.reserves,
+                    epochs.treasury,
+                    epochs.snapshots.ss_fee,
+                    go,
+                    &epochs.snapshots.bprev_blocks_by_pool,
+                    &certs.reward_accounts,
+                    &rupd,
+                );
+
                 // Apply RUPD: adjust reserves and treasury
                 epochs.reserves.0 = epochs.reserves.0.saturating_sub(rupd.delta_reserves);
                 epochs.treasury.0 = epochs.treasury.0.saturating_add(rupd.delta_treasury);
