@@ -35,6 +35,8 @@
 
 ## Ledger
 - [Reward formula validation](ledger-reward-formula-validation.md) — Koios cross-validation methodology; 1-epoch RUPD timing difference vs Haskell
+- [Issue 438 Koios oracle decomposition](issue-438-koios-oracle-decomposition.md) — pool_fees vs deleg_rewards vs account_reward_history; decompose properly for single-owner pools
+- [Issue 438 formula cleared 2026-05-13](issue-438-formula-cleared.md) — synthetic test pins Haskell `leaderRew` byte-exact at owner_stake=511_912_077; bug is snapshot inflation (~22.98 ADA on owner)
 - [Blueprint divergences](ledger-blueprint-divergences.md) — Ref script fee ceiling/floor, totalRefScriptSize check, chain selection tiebreaker
 - [DRep count fix](ledger-drep-count-fix.md) — Use active_drep_count() not dreps.len()
 - [Plutus test coverage](ledger-plutus-test-coverage.md) — is_valid=false UTxO, treasury Phase-1, per-redeemer V3 Unit tests
