@@ -3,6 +3,8 @@ mod certificates;
 mod epoch;
 pub(crate) mod governance;
 mod protocol_params;
+#[cfg(feature = "reward-debug-dump")]
+pub mod reward_debug;
 mod rewards;
 mod snapshot;
 pub mod snapshot_format;
