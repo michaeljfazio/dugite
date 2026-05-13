@@ -1138,6 +1138,122 @@ mod tests {
         );
     }
 
+    /// Issue #438 static-audit Suspect 1: withdrawal-on-tx-rollback restoration.
+    ///
+    /// Claim under audit: "If a block containing a withdrawal is rolled back,
+    /// the reward balance may be over-restored — e.g., the withdrawal is
+    /// re-added even though the tx was marked `is_valid: false`."
+    ///
+    /// Result: EXONERATED by construction.
+    ///
+    /// `ledger_seq.rs` uses a delta-based reconstruction model (see module
+    /// header comment at line 5 and the explicit note at line 725:
+    /// "It is NOT used during rollback (rollback simply discards deltas).").
+    /// `Self::rollback(n)` (line 613) is implemented as
+    /// `self.deltas.truncate(new_len)` — pure truncation, no inverse-apply.
+    /// There is no asymmetric "restore withdrawal" code path, therefore no
+    /// way to over-restore.
+    ///
+    /// This test pins the invariant in source so a future refactor that
+    /// introduces an inverse-apply path will be caught here.
+    #[test]
+    fn test_issue_438_rollback_is_pure_delta_truncation_not_inverse_apply() {
+        // The audit reduces to a textual invariant: ledger_seq::rollback must
+        // not call any "undo withdrawal" code. We assert by re-reading the
+        // module and checking the truncate-based implementation is intact.
+        let src = include_str!("../ledger_seq.rs");
+        assert!(
+            src.contains("self.deltas.truncate(new_len)"),
+            "ledger_seq::rollback must remain a pure truncate (delta discard); \
+             any inverse-apply path would reopen issue #438 suspect 1"
+        );
+        assert!(
+            src.contains("NOT used during rollback (rollback simply discards deltas)"),
+            "the invariant doc-comment in ledger_seq.rs (around line 725) must \
+             remain — it is the static contract behind issue #438 suspect 1's \
+             exoneration"
+        );
+        // Forward reconstruction reapplies every RewardChange::Withdraw uniformly,
+        // so an `is_valid: false` tx that never produced a withdrawal delta in
+        // the first place cannot be "restored" — there is nothing to restore.
+        assert!(
+            src.contains("RewardChange::Withdraw"),
+            "forward delta application must include RewardChange::Withdraw — \
+             this is the only path that mutates reward balances on a withdrawal"
+        );
+    }
+
+    /// Issue #438 static-audit Suspect 2: pending-RUPD + fresh-RUPD double-credit.
+    ///
+    /// Claim under audit: "At PV9→PV10 cutover, dugite may apply BOTH an
+    /// in-flight `pending_reward_update` AND a freshly-computed RUPD to
+    /// reward_accounts in the same epoch boundary, double-crediting the
+    /// owner credential."
+    ///
+    /// Result: EXONERATED. `pending_reward_update` is never written to
+    /// `Some(_)` anywhere in the current source. It is only ever initialised
+    /// to `None` (see all era init sites) and read once at each boundary
+    /// (Conway line 342 / Shelley line 182 / state/epoch.rs line 70). On a
+    /// preview run starting from any current snapshot the field is `None`,
+    /// so `.take()` returns `None` and the legacy branch is a no-op — the
+    /// fresh RUPD branch is the SOLE crediting path.
+    ///
+    /// This test scans the source tree to confirm no writer exists. A future
+    /// patch that adds `pending_reward_update = Some(...)` (e.g. re-introducing
+    /// the deferred RUPD pattern) must update the Conway/Shelley boundary
+    /// code to avoid double-credit, and this test will fail-loud to flag it.
+    #[test]
+    fn test_issue_438_no_writer_for_pending_reward_update() {
+        // Walk every Rust source file in dugite-ledger/src and assert that
+        // no file (outside snapshot_format.rs, which clones an Option field)
+        // contains a write `pending_reward_update = Some` or
+        // `pending_reward_update: Some`.
+        fn scan(dir: &std::path::Path, hits: &mut Vec<(std::path::PathBuf, String)>) {
+            for entry in std::fs::read_dir(dir).unwrap().flatten() {
+                let p = entry.path();
+                if p.is_dir() {
+                    scan(&p, hits);
+                } else if p.extension().and_then(|e| e.to_str()) == Some("rs") {
+                    let s = std::fs::read_to_string(&p).unwrap();
+                    for line in s.lines() {
+                        let l = line.trim_start();
+                        if l.starts_with("//") || l.starts_with("///") || l.starts_with("*") {
+                            continue;
+                        }
+                        // Skip lines that mention the pattern only inside a
+                        // string literal (e.g. this test's own scanner).
+                        if line.contains("contains(\"pending_reward_update") {
+                            continue;
+                        }
+                        if line.contains("pending_reward_update = Some")
+                            || line.contains("pending_reward_update: Some")
+                        {
+                            hits.push((p.clone(), line.to_string()));
+                        }
+                    }
+                }
+            }
+        }
+        let crate_src = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut hits = Vec::new();
+        scan(&crate_src, &mut hits);
+        // Filter snapshot_format.rs (pass-through clone of an Option field
+        // for backward-compat snapshot loading) — that is NOT a writer of
+        // a fresh Some, it's structural.
+        let real: Vec<_> = hits
+            .into_iter()
+            .filter(|(p, _)| !p.ends_with("snapshot_format.rs"))
+            .collect();
+        assert!(
+            real.is_empty(),
+            "issue #438 suspect 2 invariant violated: a writer of \
+             pending_reward_update appeared in source. Each hit MUST be \
+             paired with audit of Conway/Shelley epoch transition to prevent \
+             double-credit:\n{:#?}",
+            real
+        );
+    }
+
     #[test]
     fn test_sigma_uses_circulation_not_active_stake() {
         let pool_stake: u64 = 4_733_011_000_060;
