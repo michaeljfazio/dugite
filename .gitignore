@@ -43,3 +43,4 @@ cstreamer-reference/
 # Locally-captured Mithril ledger fixtures (multi-GB per epoch; see
 # crates/dugite-ledger/tests/fixtures/README.md for capture procedure)
 crates/dugite-ledger/tests/fixtures/*.cbor
+reward-dumps-issue-438/
