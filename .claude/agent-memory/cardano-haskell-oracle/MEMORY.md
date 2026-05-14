@@ -176,5 +176,8 @@
 ## Complete Forge Pipeline
 - [forge-pipeline-complete.md](forge-pipeline-complete.md) — Full source citations: forkBlockForging, checkShouldForge, forgeShelleyBlock, mkHeader, HFC dispatch, KES evolution, VRF, body hash, pool distr source (nesPd=set snapshot), cardanoProtocolVersion=11.0 normal, VRF tiebreaker RestrictedVRFTiebreaker 5
 
+## Epoch 0 RUPD ssFee Semantics (Boundary 0→1 / 1→2)
+- [epoch0-rupd-ssfee-semantics.md](epoch0-rupd-ssfee-semantics.md) — ssFee in startStep comes from SnapShots.ssFee (=0 at genesis), NOT utxosFees; SNAP sets it at boundary; dugite bug applies epoch-0 fees at wrong boundary (+87558 treasury excess)
+
 ## applyChainTick Mutations (Forge Path)
 - [apply-chain-tick-forge-mutations.md](apply-chain-tick-forge-mutations.md) — Exact fields mutated by TICK/NEWEPOCH visible to forge: intra-epoch (only nesRu+cgsFuturePParams solidification), epoch boundary (nesPd from OLD mark distr, curPParams via nextEpochPParams, only if ParameterChange/HardForkInitiation enacted); UTxO/treasury/rewards invisible to forge; ConwayTICKF as canonical minimal-mutation reference; tickedPP==untickedPP when no PP update enacted

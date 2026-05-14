@@ -359,15 +359,18 @@ impl EraRules for ConwayRules {
         // Same logic as Shelley/Babbage — monetary expansion and per-pool reward
         // distribution using the GO snapshot captured two epochs ago.
         //
-        // Issue #438 fix: fire RUPD unconditionally once rupd_ready (= after
-        // the first SNAP rotation), even when GO is empty.  Haskell's
-        // pulser drains expansion and routes the tau cut to treasury at
-        // every boundary regardless of GO contents — only the per-pool
-        // distribution is skipped when GO has no pools.  Skipping the
-        // entire RUPD on `go.is_none()` was the source of the +27M ADA
-        // reserves drift accumulated by epoch 11 (= 3 missing early RUPDs
-        // at boundaries 1→2, 2→3, and the era-transition equivalent).
-        if epochs.snapshots.rupd_ready {
+        // Issue #438: fire RUPD unconditionally at every boundary, even at
+        // boundary 0→1 when GO/bprev/ss_fee are still empty.  Haskell's
+        // `startStep` runs mid-epoch starting in epoch 0 and produces a
+        // `RewardUpdate` with `ssFee = 0` (from `emptySnapShots`); that
+        // update is applied at boundary 0→1, draining the genesis monetary
+        // expansion's tau cut from reserves to treasury (~9M ADA on
+        // preview).  Previously gating on `rupd_ready` left dugite with
+        // that 9M ADA in reserves instead of treasury, compounding into
+        // +4.887M ADA reserves excess by preview epoch 1269 and a
+        // +25K-lovelace per-pool reward overshoot at every subsequent
+        // boundary.
+        {
             let go_ref = epochs.snapshots.go.as_ref();
             let rupd = crate::compute_reward_update(
                 ctx.params,
