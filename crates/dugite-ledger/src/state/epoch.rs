@@ -1172,22 +1172,11 @@ mod tests {
         let mut state = new_state();
         // new() sets reserves = MAX_LOVELACE_SUPPLY, so total_stake = 0.
         // With prev_d = 1.0 (>= 0.8): eta = 1, expansion = floor(rho * reserves).
-        // rho = 3/1000, reserves = 45_000_000_000_000_000:
-        //   expansion = floor(3/1000 * 45_000_000_000_000_000) = 135_000_000_000_000.
-        // epoch_fees = 0 (no blocks yet), so total_rewards_available = 135_000_000_000_000.
-        // treasury_cut = floor(2/10 * 135_000_000_000_000) = 27_000_000_000_000.
-        // reward_pot = 135_000_000_000_000 - 27_000_000_000_000 = 108_000_000_000_000.
-        // No pools (total_stake == 0 path) → undistributed = reward_pot = 108_000_000_000_000.
-        //
-        // Correct Haskell accounting (applyRUpd):
-        //   delta_treasury = treasury_cut + undistributed = 135_000_000_000_000 (full expansion)
-        //   delta_reserves = expansion = 135_000_000_000_000
-        //
-        // The full expansion moves from reserves to treasury when there are no
-        // pools to distribute to.
-        let expansion = 135_000_000_000_000u64;
-        let expected_treasury_increase = expansion; // tau cut + full undistributed reward_pot
-        let expected_delta_reserves = expansion;
+        // rho = 3/1000, so expansion = floor(3/1000 * 45_000_000_000_000_000) = 135_000_000_000_000.
+        // treasury_cut = floor(tau * expansion) = floor(2/10 * 135_000_000_000_000) = 27_000_000_000_000.
+        // delta_reserves = treasury_cut - epoch_fees = 27_000_000_000_000 (total_stake==0 path).
+        let expected_treasury_cut = 27_000_000_000_000u64;
+        let expected_delta_reserves = 27_000_000_000_000u64;
 
         let treasury_before = state.epochs.treasury;
         let reserves_before = state.epochs.reserves;
@@ -1196,13 +1185,13 @@ mod tests {
 
         assert_eq!(
             state.epochs.treasury.0,
-            treasury_before.0 + expected_treasury_increase,
-            "treasury should increase by full expansion when no pools (tau cut + unclaimed reward_pot)"
+            treasury_before.0 + expected_treasury_cut,
+            "treasury should increase by tau * expansion"
         );
         assert_eq!(
             state.epochs.reserves.0,
             reserves_before.0 - expected_delta_reserves,
-            "reserves should decrease by expansion"
+            "reserves should decrease by the net expansion"
         );
     }
 
