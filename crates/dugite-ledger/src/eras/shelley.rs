@@ -196,27 +196,35 @@ impl EraRules for ShelleyRules {
         }
 
         // Step 2: Compute and apply RUPD using GO snapshot + bprev + ss_fee.
+        //
+        // Issue #438 fix: fire RUPD unconditionally once rupd_ready (= after
+        // the first SNAP rotation), even when GO is empty.  Haskell's
+        // pulser drains expansion and routes the tau cut to treasury at
+        // every boundary regardless of GO contents — only the per-pool
+        // distribution is skipped when GO has no pools.  See the matching
+        // comment in conway.rs for the full rationale.
         if epochs.snapshots.rupd_ready {
-            if let Some(ref go) = epochs.snapshots.go {
-                let rupd = crate::compute_reward_update(
-                    ctx.params,
-                    epochs.prev_d,
-                    epochs.prev_protocol_version_major,
-                    Some(go),
-                    &epochs.snapshots.bprev_blocks_by_pool,
-                    epochs.snapshots.ss_fee,
-                    epochs.reserves,
-                    epochs.treasury,
-                    &certs.reward_accounts,
-                    ctx.epoch_length,
-                    ctx.shelley_transition_epoch,
-                );
+            let go_ref = epochs.snapshots.go.as_ref();
+            let rupd = crate::compute_reward_update(
+                ctx.params,
+                epochs.prev_d,
+                epochs.prev_protocol_version_major,
+                go_ref,
+                &epochs.snapshots.bprev_blocks_by_pool,
+                epochs.snapshots.ss_fee,
+                epochs.reserves,
+                epochs.treasury,
+                &certs.reward_accounts,
+                ctx.epoch_length,
+                ctx.shelley_transition_epoch,
+            );
 
-                // Issue #438/#471: per-boundary reward-debug dump.  No-op
-                // unless the crate is built with `--features
-                // reward-debug-dump` AND `DUGITE_REWARD_DEBUG_DUMP=<dir>` is
-                // set at runtime.
-                #[cfg(feature = "reward-debug-dump")]
+            // Issue #438/#471: per-boundary reward-debug dump.  No-op
+            // unless the crate is built with `--features
+            // reward-debug-dump` AND `DUGITE_REWARD_DEBUG_DUMP=<dir>` is
+            // set at runtime.  Only fires when GO is non-empty.
+            #[cfg(feature = "reward-debug-dump")]
+            if let Some(go) = go_ref {
                 crate::state::reward_debug::maybe_dump(
                     ctx.current_epoch.0,
                     new_epoch.0,
@@ -231,21 +239,21 @@ impl EraRules for ShelleyRules {
                     &certs.reward_accounts,
                     &rupd,
                 );
+            }
 
-                // Apply RUPD: adjust reserves and treasury
-                epochs.reserves.0 = epochs.reserves.0.saturating_sub(rupd.delta_reserves);
-                epochs.treasury.0 = epochs.treasury.0.saturating_add(rupd.delta_treasury);
+            // Apply RUPD: adjust reserves and treasury
+            epochs.reserves.0 = epochs.reserves.0.saturating_sub(rupd.delta_reserves);
+            epochs.treasury.0 = epochs.treasury.0.saturating_add(rupd.delta_treasury);
 
-                // Distribute rewards to registered accounts; unregistered → treasury
-                for (cred_hash, reward) in &rupd.rewards {
-                    if reward.0 > 0 {
-                        if certs.reward_accounts.contains_key(cred_hash) {
-                            *Arc::make_mut(&mut certs.reward_accounts)
-                                .entry(*cred_hash)
-                                .or_insert(Lovelace(0)) += *reward;
-                        } else {
-                            epochs.treasury.0 = epochs.treasury.0.saturating_add(reward.0);
-                        }
+            // Distribute rewards to registered accounts; unregistered → treasury
+            for (cred_hash, reward) in &rupd.rewards {
+                if reward.0 > 0 {
+                    if certs.reward_accounts.contains_key(cred_hash) {
+                        *Arc::make_mut(&mut certs.reward_accounts)
+                            .entry(*cred_hash)
+                            .or_insert(Lovelace(0)) += *reward;
+                    } else {
+                        epochs.treasury.0 = epochs.treasury.0.saturating_add(reward.0);
                     }
                 }
             }

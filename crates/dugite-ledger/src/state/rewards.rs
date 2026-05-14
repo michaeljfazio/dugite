@@ -146,10 +146,20 @@ pub fn compute_reward_update(
     epoch_length: u64,
     _shelley_transition_epoch: u64,
 ) -> PendingRewardUpdate {
-    let go = match go_snapshot {
-        Some(s) => s,
-        None => return PendingRewardUpdate::default(),
-    };
+    // Issue #438 fix: compute expansion + treasury_cut BEFORE checking go.
+    //
+    // Haskell `Cardano.Ledger.Shelley.LedgerState.PulsingReward.startStep`
+    // unconditionally drains `min(1,eta) × rho × reserves` from reserves and
+    // routes the tau cut to treasury, even when ssStakeGo is empty (early
+    // epochs before the first SNAP rotation has populated GO).  Returning
+    // `PendingRewardUpdate::default()` on `go=None` here was the source of
+    // the systematic ~0.27% per-boundary `pool_reward` overshoot tracked in
+    // #438: dugite skipped 3 early-epoch RUPDs (boundaries 1→2, 2→3, plus
+    // the missing one at the era transition) that Haskell's pulser fires
+    // unconditionally, leaving dugite with +27M ADA more reserves and -27M
+    // ADA less treasury than Haskell from epoch 4 onward.  That excess
+    // reserve makes σ = pool_stake / (MAX − reserves) ~0.27% larger every
+    // subsequent boundary, inflating max_pool by the same ratio.
 
     let pp = params;
     let rho_num = pp.rho.numerator as i128;
@@ -215,6 +225,23 @@ pub fn compute_reward_update(
             rewards: HashMap::new(),
         };
     }
+
+    // Issue #438 fix (continued): If the GO snapshot is empty (early epochs
+    // before the first SNAP rotation has populated it, or genesis-like
+    // conditions), Haskell's pulser still drains expansion and routes the
+    // tau cut to treasury — only the per-pool distribution loop is skipped
+    // because there are no pools to distribute to.  Match that behaviour.
+    let go = match go_snapshot {
+        Some(s) => s,
+        None => {
+            let net = treasury_cut.saturating_sub(epoch_fees);
+            return PendingRewardUpdate {
+                delta_reserves: net,
+                delta_treasury: treasury_cut,
+                rewards: HashMap::new(),
+            };
+        }
+    };
 
     let total_active_stake: u64 = go
         .pool_stake
