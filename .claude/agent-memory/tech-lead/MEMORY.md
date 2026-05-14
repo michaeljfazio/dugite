@@ -39,6 +39,7 @@
 - [Issue 438 formula cleared 2026-05-13](issue-438-formula-cleared.md) — synthetic test pins Haskell `leaderRew` byte-exact at owner_stake=511_912_077; bug is snapshot inflation (~22.98 ADA on owner)
 - [Issue 438 Koios vs ssStake semantics 2026-05-13](issue-438-koios-stake-vs-ssstake.md) — Koios active_stake is UTxO-only; Haskell ssStake adds reward balance; 22.98 ADA gap is stale reward_accounts balance, requires per-epoch replay diff
 - [Issue 438 static-audit complete 2026-05-13](issue-438-static-audit-complete.md) — Rollback-asymmetry + dual-RUPD theories structurally eliminated; commit 648d72484 pins invariants via 2 source-scan tests; path forward is live-replay (#471)
+- [Issue 438 RESOLVED 2026-05-13](issue-438-live-capture-findings.md) — undistributed=reward_pot−Σrewards was dropped; fix: add to delta_treasury+delta_reserves; conservation identity holds; commits 2a14be2fe+30fd58db8; #479 re-enabled via a7591523b
 - [Blueprint divergences](ledger-blueprint-divergences.md) — Ref script fee ceiling/floor, totalRefScriptSize check, chain selection tiebreaker
 - [DRep count fix](ledger-drep-count-fix.md) — Use active_drep_count() not dreps.len()
 - [Plutus test coverage](ledger-plutus-test-coverage.md) — is_valid=false UTxO, treasury Phase-1, per-redeemer V3 Unit tests

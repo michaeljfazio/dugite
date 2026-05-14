@@ -51,3 +51,13 @@ python3 scripts/issue_438_analyze_dumps.py /tmp/koios_rewards.json
    - `4eb0f5686` feat(ledger): per-boundary reward-debug dump (#471)
    - `efb74d212` chore(scripts): per-boundary reward-diff analyzer
    - `94c6a5bc4` chore: ignore reward-dumps-issue-438 capture dir
+
+## RESOLVED 2026-05-13
+
+Root cause identified and fixed. The bug was NOT in the pool_reward split formula or any per-pool arithmetic — it was in the final accounting step of `compute_reward_update`: `undistributed = reward_pot - total_distributed` was computed but never used. Fix: add `undistributed` to both `delta_treasury` and `delta_reserves`. Conservation identity now holds: `expansion + epoch_fees = delta_treasury + Σ(rupd.rewards)`.
+
+**Commits:** `2a14be2fe` (fix rewards.rs + remove #[ignore]), `30fd58db8` (test updates), `a7591523b` (re-enable PV10 checks).
+
+**Verification:** `test_koios_preview_epoch_1268_leader_reward_issue_438` passes with `rupd_credit = 352,901_742` matching Koios exactly. 4659/4659 workspace tests pass.
+
+**Issues closed:** #438 and #479.
