@@ -50,6 +50,19 @@ pub struct Scalars {
     pub total_rupd_credits: u64,
     pub prev_d: f64,
     pub prev_protocol_version_major: u64,
+    /// Epoch label of the GO snapshot used in this RUPD calculation.
+    /// Diagnostic field for issue #438 — confirms which past epoch's stake
+    /// data dugite is feeding into `compute_reward_update`.  Per the
+    /// snapshot model, this should equal `epoch_to - 2` (Haskell's
+    /// `ssStakeGo` semantics).  If it differs, dugite has a snapshot
+    /// rotation off-by-one.
+    #[serde(default)]
+    pub go_snapshot_epoch: u64,
+    /// Sum of all pool_stake values in the GO snapshot, filtered to
+    /// pools with registered params.  This is what dugite passes as
+    /// `total_active_stake` to the per-pool perf calculation.
+    #[serde(default)]
+    pub go_total_active_stake: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -186,6 +199,11 @@ pub fn capture(
 
     let bprev_total_blocks: u64 = bprev_blocks_by_pool.values().sum();
     let total_rupd_credits: u64 = rupd.rewards.values().map(|l| l.0).sum();
+    let go_total_active_stake: u64 = go
+        .pool_stake
+        .iter()
+        .filter(|(pool_id, _)| go.pool_params.contains_key(pool_id))
+        .fold(0u64, |acc, (_, s)| acc.saturating_add(s.0));
 
     let mut pools = Vec::with_capacity(go.pool_params.len());
 
@@ -275,6 +293,8 @@ pub fn capture(
             total_rupd_credits,
             prev_d,
             prev_protocol_version_major,
+            go_snapshot_epoch: go.epoch.0,
+            go_total_active_stake,
         },
         prev_protocol_params: ProtocolParamsDump {
             protocol_version_major: params_used.protocol_version_major,
