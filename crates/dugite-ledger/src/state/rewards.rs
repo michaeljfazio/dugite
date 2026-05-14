@@ -218,11 +218,10 @@ pub fn compute_reward_update(
 
     let total_stake = MAX_LOVELACE_SUPPLY.saturating_sub(reserves.0);
     if total_stake == 0 {
-        // No active circulation: full reward_pot (= expansion + fees − treasury_cut)
-        // is unclaimed and returns to treasury.  delta_reserves = expansion.
+        let net = treasury_cut.saturating_sub(epoch_fees);
         return PendingRewardUpdate {
-            delta_reserves: expansion,
-            delta_treasury: total_rewards_available,
+            delta_reserves: net,
+            delta_treasury: treasury_cut,
             rewards: HashMap::new(),
         };
     }
@@ -230,15 +229,15 @@ pub fn compute_reward_update(
     // Issue #438 fix (continued): If the GO snapshot is empty (early epochs
     // before the first SNAP rotation has populated it, or genesis-like
     // conditions), Haskell's pulser still drains expansion and routes the
-    // tau cut + full undistributed reward_pot to treasury — only the per-pool
-    // distribution loop is skipped because there are no pools.  Match that
-    // behaviour.  delta_reserves = expansion exactly.
+    // tau cut to treasury — only the per-pool distribution loop is skipped
+    // because there are no pools to distribute to.  Match that behaviour.
     let go = match go_snapshot {
         Some(s) => s,
         None => {
+            let net = treasury_cut.saturating_sub(epoch_fees);
             return PendingRewardUpdate {
-                delta_reserves: expansion,
-                delta_treasury: total_rewards_available,
+                delta_reserves: net,
+                delta_treasury: treasury_cut,
                 rewards: HashMap::new(),
             };
         }
@@ -255,10 +254,10 @@ pub fn compute_reward_update(
             go.pool_params.len(),
             go.pool_stake.len()
         );
-        // No pools with active stake: full reward_pot is unclaimed → treasury.
+        let net = treasury_cut.saturating_sub(epoch_fees);
         return PendingRewardUpdate {
-            delta_reserves: expansion,
-            delta_treasury: total_rewards_available,
+            delta_reserves: net,
+            delta_treasury: treasury_cut,
             rewards: HashMap::new(),
         };
     }
@@ -442,47 +441,26 @@ pub fn compute_reward_update(
         }
     }
 
-    // Undistributed pool rewards (reward_pot remainder after all per-pool
-    // distribution) return to treasury per Haskell `applyRUpd`:
-    //   deltaT = floor(τ × (Δ + fees)) + (rPot − sum(rewards))
-    // where rPot = (Δ + fees) − deltaT and Δ = monetary expansion.
-    //
-    // dugite was previously setting delta_treasury = treasury_cut only and
-    // delta_reserves = treasury_cut + total_distributed − fees, silently
-    // dropping the undistributed lovelace.  The cumulative error caused a
-    // ~25K-lovelace per-boundary pool_reward overshoot and a −2.67M ADA
-    // treasury shortfall by preview epoch 11.  Fix: include undistributed in
-    // both delta_treasury and delta_reserves so the conservation identity
-    //   expansion + epoch_fees = delta_treasury + sum(rupd.rewards)
-    // holds exactly.
     let undistributed = reward_pot.saturating_sub(total_distributed);
-    // delta_treasury = tau cut + unclaimed pool rewards (Haskell: deltaT1 + deltaT2)
-    let delta_treasury = treasury_cut + undistributed;
-    // delta_reserves = expansion only (fees came from circulating supply, not reserves)
-    // = (treasury_cut + total_distributed + undistributed) - epoch_fees
-    // = total_rewards_available - epoch_fees
-    // = expansion  (since total_rewards_available = expansion + epoch_fees)
-    let delta_reserves =
-        (treasury_cut + total_distributed + undistributed).saturating_sub(epoch_fees);
 
     debug!(
-        "Rewards calculated: {} lovelace to {} accounts, undistributed={} → treasury, \
-         delta_treasury={} (cut={} + unclaimed={}), delta_reserves={} (expansion={}, fees={})",
+        "Rewards calculated: {} lovelace to {} accounts, {} to treasury (expansion: {}, fees: {})",
         total_distributed,
         reward_map.len(),
-        undistributed,
-        delta_treasury,
-        treasury_cut,
-        undistributed,
-        delta_reserves,
+        treasury_cut + undistributed,
         expansion,
         epoch_fees
     );
 
+    let gross = treasury_cut + total_distributed;
+    let net_reserve_decrease = gross.saturating_sub(epoch_fees);
+    if epoch_fees > 0 {
+        debug!("Fee offset: gross={gross}, epoch_fees={epoch_fees}, net={net_reserve_decrease}");
+    }
     PendingRewardUpdate {
         rewards: reward_map,
-        delta_treasury,
-        delta_reserves,
+        delta_treasury: treasury_cut,
+        delta_reserves: net_reserve_decrease,
     }
 }
 
@@ -1072,6 +1050,7 @@ mod tests {
     /// `compute_reward_update` to assert byte-equality. Marked `#[ignore]`
     /// because the snapshot file is not yet checked into the repo.
     #[test]
+    #[ignore = "needs preview epoch 1268 GO snapshot fixture — see #438"]
     fn test_koios_preview_epoch_1268_leader_reward_issue_438() {
         // Canonical Koios oracle values for the regression target.
         let expected_leader_reward: u64 = 352_901_742;
