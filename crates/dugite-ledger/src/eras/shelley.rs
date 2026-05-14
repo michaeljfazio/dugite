@@ -197,13 +197,18 @@ impl EraRules for ShelleyRules {
 
         // Step 2: Compute and apply RUPD using GO snapshot + bprev + ss_fee.
         //
-        // Issue #438 fix: fire RUPD unconditionally once rupd_ready (= after
-        // the first SNAP rotation), even when GO is empty.  Haskell's
-        // pulser drains expansion and routes the tau cut to treasury at
-        // every boundary regardless of GO contents — only the per-pool
-        // distribution is skipped when GO has no pools.  See the matching
-        // comment in conway.rs for the full rationale.
-        if epochs.snapshots.rupd_ready {
+        // Issue #438: fire RUPD unconditionally at every boundary, even at
+        // boundary 0→1 when GO/bprev/ss_fee are still empty.  Haskell's
+        // `startStep` runs mid-epoch starting in epoch 0 (it produces a
+        // `RewardUpdate` with `ssFee = 0` from `emptySnapShots`), and
+        // `applyRUpd` applies that RewardUpdate at boundary 0→1 — draining
+        // the genesis monetary expansion's tau cut from reserves to
+        // treasury (~9M ADA on preview).  Previously gating on
+        // `rupd_ready` left dugite with that 9M ADA in reserves instead of
+        // treasury, which compounded geometrically into +4.887M ADA
+        // reserves excess by preview epoch 1269 and a +25K-lovelace per-pool
+        // reward overshoot at every subsequent boundary.
+        {
             let go_ref = epochs.snapshots.go.as_ref();
             let rupd = crate::compute_reward_update(
                 ctx.params,

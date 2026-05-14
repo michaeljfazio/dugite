@@ -525,10 +525,11 @@ pub struct EpochSnapshots {
     pub bprev_block_count: u64,
     #[serde(default)]
     pub bprev_blocks_by_pool: Arc<HashMap<Hash28, u64>>,
-    /// Whether bprev/ss_fee have been populated by a prior snapshot rotation.
-    /// False at genesis; set to true after the first rotation captures epoch
-    /// data. Matches Haskell's initial `nesRu = SNothing` (no reward update
-    /// to apply at the first boundary).
+    /// Legacy field — RUPD now fires unconditionally at every epoch
+    /// boundary (Issue #438: Haskell's `applyRUpd` runs at boundary 0→1
+    /// with `ssFee = 0` from `emptySnapShots`, draining the genesis
+    /// monetary-expansion tau cut from reserves to treasury).  Kept for
+    /// snapshot wire-format compatibility.
     #[serde(default)]
     pub rupd_ready: bool,
 }
