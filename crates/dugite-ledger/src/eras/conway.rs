@@ -372,8 +372,19 @@ impl EraRules for ConwayRules {
         // boundary.
         {
             let go_ref = epochs.snapshots.go.as_ref();
+            // Issue #438: RUPD uses Haskell's `prevPParams` (= the protocol
+            // parameters that were active in the PREVIOUS epoch), NOT
+            // `curPParams`.  When `n_opt`, `a0`, `rho`, `tau`, `asc`, or
+            // `protocolVersion` changes via PPUP/governance, the change
+            // takes effect at this boundary as `curPParams` but Haskell's
+            // pulser already ran during the just-ending epoch with the
+            // pre-change values.  Cross-validated against cardano-node
+            // `cardano-cli debug log-epoch-state` at preview boundary 9→10
+            // where n_opt change 150→500 caused dugite max_pool to shrink
+            // by ratio 0.728, missing 60.679K ADA per boundary.
+            let rupd_pp = &epochs.prev_protocol_params;
             let rupd = crate::compute_reward_update(
-                ctx.params,
+                rupd_pp,
                 epochs.prev_d,
                 epochs.prev_protocol_version_major,
                 go_ref,
@@ -396,7 +407,7 @@ impl EraRules for ConwayRules {
                 crate::state::reward_debug::maybe_dump(
                     ctx.current_epoch.0,
                     new_epoch.0,
-                    ctx.params,
+                    rupd_pp,
                     epochs.prev_d,
                     epochs.prev_protocol_version_major,
                     epochs.reserves,
