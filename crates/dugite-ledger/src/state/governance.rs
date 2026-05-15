@@ -7055,6 +7055,181 @@ mod tests {
         assert_eq!(roots.pparam.root, None);
     }
 
+    /// Reproduces issue #481: at preview boundary 735→736, three sibling
+    /// ParameterChange proposals existed with prev_action_id = None.  One was
+    /// ratified+enacted; the other two should have been dropped with their
+    /// 100K-ADA deposits refunded to their return addresses (treasury if
+    /// unregistered).  Koios shows Haskell did refund all three; dugite
+    /// missed one of the sibling refunds.
+    ///
+    /// This test wires up exactly that scenario with three return addresses:
+    ///   - enacted's return_addr: REGISTERED   → reward_account += 100K
+    ///   - sibling 1 return_addr: UNREGISTERED → treasury        += 100K
+    ///   - sibling 2 return_addr: REGISTERED   → reward_account += 100K
+    #[test]
+    fn test_param_change_sibling_drops_refund_all_three() {
+        let mut state = gov_test_state(10, 10);
+
+        // Set up three distinct 29-byte reward accounts (1 header + 28 hash).
+        // The 0xe0 header marks a key-credential mainnet reward address.
+        // Differing the second byte makes each address unique.
+        let mut ret_enacted = vec![0xe0u8];
+        ret_enacted.extend_from_slice(&[0x11u8; 28]);
+        let mut ret_sibling_unreg = vec![0xe0u8];
+        ret_sibling_unreg.extend_from_slice(&[0x22u8; 28]);
+        let mut ret_sibling_reg = vec![0xe0u8];
+        ret_sibling_reg.extend_from_slice(&[0x33u8; 28]);
+
+        let key_enacted = LedgerState::reward_account_to_hash(&ret_enacted);
+        let key_sibling_unreg = LedgerState::reward_account_to_hash(&ret_sibling_unreg);
+        let key_sibling_reg = LedgerState::reward_account_to_hash(&ret_sibling_reg);
+
+        // Register two of the three accounts.  The middle one stays UNregistered
+        // so its refund must flow to treasury (mirroring B_ret on preview at
+        // boundary 735→736, which had no Registration certificate before e784).
+        Arc::make_mut(&mut state.certs.reward_accounts).insert(key_enacted, Lovelace(0));
+        Arc::make_mut(&mut state.certs.reward_accounts).insert(key_sibling_reg, Lovelace(0));
+
+        let initial_treasury = state.epochs.treasury.0;
+        let deposit = 100_000_000_000u64; // 100K ADA
+
+        // Submit three ParameterChange proposals with prev_action_id = None.
+        // Only the first one is the one we'll vote to enact; the other two
+        // exist purely as siblings to be dropped at the boundary.
+        let tx_a = Hash32::from_bytes([0xa0u8; 32]);
+        let tx_b = Hash32::from_bytes([0xb0u8; 32]);
+        let tx_c = Hash32::from_bytes([0xc0u8; 32]);
+
+        state.process_proposal(
+            &tx_a,
+            0,
+            &ProposalProcedure {
+                deposit: Lovelace(deposit),
+                return_addr: ret_enacted.clone(),
+                gov_action: GovAction::ParameterChange {
+                    prev_action_id: None,
+                    protocol_param_update: Box::new(ProtocolParamUpdate {
+                        max_tx_ex_units: Some(ExUnits {
+                            mem: 16_500_000,
+                            steps: 10_000_000_000,
+                        }),
+                        ..Default::default()
+                    }),
+                    policy_hash: None,
+                },
+                anchor: make_anchor(),
+            },
+        );
+        state.process_proposal(
+            &tx_b,
+            0,
+            &ProposalProcedure {
+                deposit: Lovelace(deposit),
+                return_addr: ret_sibling_unreg.clone(),
+                gov_action: GovAction::ParameterChange {
+                    prev_action_id: None,
+                    protocol_param_update: Box::new(ProtocolParamUpdate {
+                        max_tx_ex_units: Some(ExUnits {
+                            mem: 17_000_000,
+                            steps: 10_000_000_000,
+                        }),
+                        ..Default::default()
+                    }),
+                    policy_hash: None,
+                },
+                anchor: make_anchor(),
+            },
+        );
+        state.process_proposal(
+            &tx_c,
+            0,
+            &ProposalProcedure {
+                deposit: Lovelace(deposit),
+                return_addr: ret_sibling_reg.clone(),
+                gov_action: GovAction::ParameterChange {
+                    prev_action_id: None,
+                    protocol_param_update: Box::new(ProtocolParamUpdate {
+                        max_tx_ex_units: Some(ExUnits {
+                            mem: 18_000_000,
+                            steps: 10_000_000_000,
+                        }),
+                        ..Default::default()
+                    }),
+                    policy_hash: None,
+                },
+                anchor: make_anchor(),
+            },
+        );
+
+        let enacted_id = GovActionId {
+            transaction_id: tx_a,
+            action_index: 0,
+        };
+
+        // Vote ONLY the enacted proposal through.
+        for i in 0..8 {
+            drep_vote(&mut state, i, &enacted_id, Vote::Yes);
+        }
+        for i in 0..6 {
+            spo_vote(&mut state, i, &enacted_id, Vote::Yes);
+        }
+        cc_vote_yes(&mut state, &enacted_id);
+
+        // Trigger the boundary.
+        state.process_epoch_transition(EpochNo(1));
+
+        // ── ASSERTIONS ──
+        // All three proposals must be removed from the proposal pool.
+        assert!(
+            state.gov.governance.proposals.is_empty(),
+            "All 3 proposals (1 enacted + 2 sibling-dropped) must be removed, \
+             but {} remain",
+            state.gov.governance.proposals.len()
+        );
+
+        // Treasury should have received exactly the unregistered sibling's
+        // 100K ADA refund (no RUPD on a zero-reserves state).
+        let treasury_delta = state.epochs.treasury.0.saturating_sub(initial_treasury);
+        assert_eq!(
+            treasury_delta, deposit,
+            "Treasury must gain exactly 100K ADA from the unregistered \
+             sibling's deposit refund — got delta = {treasury_delta}",
+        );
+
+        // The two REGISTERED return addresses must each have +100K credited.
+        let enacted_balance = state
+            .certs
+            .reward_accounts
+            .get(&key_enacted)
+            .copied()
+            .unwrap_or(Lovelace(0))
+            .0;
+        let sibling_reg_balance = state
+            .certs
+            .reward_accounts
+            .get(&key_sibling_reg)
+            .copied()
+            .unwrap_or(Lovelace(0))
+            .0;
+        assert_eq!(
+            enacted_balance, deposit,
+            "Enacted proposal's deposit must be refunded to its registered \
+             reward account (got {enacted_balance})",
+        );
+        assert_eq!(
+            sibling_reg_balance, deposit,
+            "Dropped registered-sibling's deposit must be refunded to its \
+             reward account (got {sibling_reg_balance})",
+        );
+
+        // The unregistered sibling MUST NOT have a phantom reward_accounts entry.
+        assert!(
+            !state.certs.reward_accounts.contains_key(&key_sibling_unreg),
+            "Unregistered sibling's return_addr must NOT have been silently \
+             created in reward_accounts",
+        );
+    }
+
     // ========================================================================
     // Additional ratification threshold tests (gap coverage)
     // ========================================================================
