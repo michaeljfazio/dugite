@@ -1383,6 +1383,16 @@ impl Node {
             );
         }
 
+        // Refresh governance gauges (proposal_count, drep_count, …) on every
+        // block apply so Prometheus reflects the current ledger state immediately,
+        // not on the periodic 5-second log-interval gate.  set_governance_snapshot
+        // is a series of atomic stores — negligible cost even at bulk-sync rates.
+        {
+            let ls = self.ledger_state.read().await;
+            self.metrics
+                .set_governance_snapshot(&super::governance_snapshot_from_ledger(&ls));
+        }
+
         if let Some(last_block) = blocks.last() {
             self.consensus.update_tip(last_block.tip());
         }

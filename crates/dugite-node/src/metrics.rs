@@ -1351,7 +1351,7 @@ impl NodeMetrics {
             ),
             (
                 "dugite_drep_count",
-                "Total currently-registered DReps (matches cardano-cli drep-state)",
+                "Total number of registered DReps in ledger state (active + inactive). For DReps with delegated voting power use Koios drep_epoch_summary.dreps.",
                 &self.drep_count,
             ),
             (
@@ -2611,5 +2611,77 @@ mod tests {
         assert!(output.contains("dugite_peer_rtt_band_100_200 2\n"));
         assert!(output.contains("dugite_peer_rtt_band_200_plus 1\n"));
         assert!(output.contains("dugite_peer_rtt_samples 6\n"));
+    }
+
+    // D3/D4: governance gauges must reflect the snapshot immediately —
+    // no 5-second delay.  set_governance_snapshot is called unconditionally
+    // per block; this test confirms the stored values are visible right away.
+    #[test]
+    fn test_governance_snapshot_immediate() {
+        let metrics = NodeMetrics::new();
+
+        // Verify initial state is zero.
+        assert_eq!(metrics.proposal_count.load(Ordering::Relaxed), 0);
+        assert_eq!(metrics.drep_count.load(Ordering::Relaxed), 0);
+        assert_eq!(metrics.drep_active.load(Ordering::Relaxed), 0);
+
+        // Simulate the snapshot arriving from a block that added proposals and
+        // DRep registrations.
+        let snap = GovernanceSnapshot {
+            delegation_count: 1000,
+            treasury_lovelace: 500_000_000,
+            reserves_lovelace: 200_000_000,
+            pool_count: 3000,
+            drep_total: 8920,
+            drep_active: 7500,
+            drep_registrations_total: 9100,
+            vote_delegation_count: 450_000,
+            proposal_count: 22,
+            committee_hot_count: 7,
+            committee_total_count: 8,
+            committee_resigned_count: 0,
+            committee_no_confidence: false,
+            committee_threshold_bps: 6700,
+            gov_dormant_epochs: 0,
+            constitution_present: true,
+            pparam_drep_deposit_lovelace: 500_000_000,
+            pparam_drep_activity_epochs: 20,
+            pparam_gov_action_deposit_lovelace: 100_000_000_000,
+            pparam_gov_action_lifetime_epochs: 6,
+            pparam_committee_min_size: 7,
+            pparam_committee_max_term_length: 146,
+        };
+        metrics.set_governance_snapshot(&snap);
+
+        // Gauges must be visible immediately — no delay gate.
+        assert_eq!(metrics.proposal_count.load(Ordering::Relaxed), 22);
+        assert_eq!(metrics.drep_count.load(Ordering::Relaxed), 8920);
+        assert_eq!(metrics.drep_active.load(Ordering::Relaxed), 7500);
+
+        // Prometheus text output must carry the updated values.
+        let output = metrics.to_prometheus();
+        assert!(output.contains("dugite_proposal_count 22\n"));
+        assert!(output.contains("dugite_drep_count 8920\n"));
+        assert!(output.contains("dugite_drep_active 7500\n"));
+    }
+
+    // D5: dugite_drep_count HELP text must document the active+inactive
+    // semantics and point to Koios for DReps-with-delegated-stake.
+    #[test]
+    fn test_drep_count_help_text() {
+        let metrics = NodeMetrics::new();
+        let output = metrics.to_prometheus();
+        assert!(
+            output.contains("active + inactive"),
+            "HELP text must mention 'active + inactive' — got: {}",
+            output
+                .lines()
+                .find(|l| l.contains("dugite_drep_count"))
+                .unwrap_or("<not found>")
+        );
+        assert!(
+            output.contains("Koios drep_epoch_summary"),
+            "HELP text must reference Koios drep_epoch_summary"
+        );
     }
 }
