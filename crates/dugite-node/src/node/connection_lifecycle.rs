@@ -1686,6 +1686,34 @@ impl ConnectionLifecycleManager {
 
 // ─── MempoolTxSource ─────────────────────────────────────────────────────────
 
+/// Internal abstraction over the mempool query surface used by `MempoolTxSource`.
+/// Parameterised so tests can inject a mock without touching the public `TxSource` API.
+trait MempoolQuerySource: Send + Sync {
+    fn query_tx_size(&self, hash: &dugite_primitives::hash::Hash32) -> Option<usize>;
+    fn query_tx_hashes_ordered(&self) -> Vec<dugite_primitives::hash::Hash32>;
+    fn query_tx_cbor(&self, hash: &dugite_primitives::hash::Hash32) -> Option<Vec<u8>>;
+    fn query_is_empty(&self) -> bool;
+    fn query_tx_notify(&self) -> Option<std::sync::Arc<tokio::sync::Notify>>;
+}
+
+impl MempoolQuerySource for Arc<Mempool> {
+    fn query_tx_size(&self, hash: &dugite_primitives::hash::Hash32) -> Option<usize> {
+        self.get_tx_size(hash)
+    }
+    fn query_tx_hashes_ordered(&self) -> Vec<dugite_primitives::hash::Hash32> {
+        self.tx_hashes_ordered()
+    }
+    fn query_tx_cbor(&self, hash: &dugite_primitives::hash::Hash32) -> Option<Vec<u8>> {
+        self.get_tx_cbor(hash)
+    }
+    fn query_is_empty(&self) -> bool {
+        self.is_empty()
+    }
+    fn query_tx_notify(&self) -> Option<std::sync::Arc<tokio::sync::Notify>> {
+        Some(self.tx_notify())
+    }
+}
+
 /// Adapts `Mempool` to the `TxSource` trait for TxSubmission2 tx relay.
 ///
 /// Tracks which tx IDs have been yielded to the remote peer via an internal
@@ -1695,10 +1723,13 @@ impl ConnectionLifecycleManager {
 /// Interior mutability via `Mutex` is used because `TxSource::get_tx_ids`
 /// takes `&self` but we need to update the outstanding queue. The mutex is
 /// uncontended — only the single TxSubmission2 client task accesses it.
-struct MempoolTxSource {
-    mempool: Arc<Mempool>,
-    /// Tx hashes that have been yielded but not yet acknowledged by the peer.
+struct MempoolTxSource<Q = Arc<Mempool>> {
+    mempool: Q,
+    /// Tx hashes yielded but not yet acknowledged by the peer.
     outstanding: std::sync::Mutex<std::collections::VecDeque<dugite_primitives::hash::Hash32>>,
+    /// Per-peer dedup: hashes ever yielded to this peer that are still in the mempool.
+    /// Prevents re-announcing acked txs at TCP-RTT speed when the mempool is non-empty.
+    ever_yielded: std::sync::Mutex<std::collections::HashSet<dugite_primitives::hash::Hash32>>,
 }
 
 impl MempoolTxSource {
@@ -1706,41 +1737,41 @@ impl MempoolTxSource {
         Self {
             mempool,
             outstanding: std::sync::Mutex::new(std::collections::VecDeque::new()),
+            ever_yielded: std::sync::Mutex::new(std::collections::HashSet::new()),
         }
     }
 }
 
-impl TxSource for MempoolTxSource {
+impl<Q: MempoolQuerySource> TxSource for MempoolTxSource<Q> {
     fn get_tx_ids(&self, ack_count: u16, max_count: u16) -> Vec<TxIdAndSize> {
         let mut outstanding = self.outstanding.lock().unwrap();
+        let mut ever_yielded = self.ever_yielded.lock().unwrap();
 
         // Acknowledge previously yielded tx IDs.
         for _ in 0..ack_count {
             outstanding.pop_front();
         }
 
-        // Prune outstanding entries for txs no longer in the mempool
-        // (included in a block or expired).  Without this, txs that
-        // leave the mempool stay in `outstanding` permanently, blocking
-        // re-announcement if the same tx is resubmitted.
-        outstanding.retain(|h| self.mempool.get_tx_size(h).is_some());
-
-        // Collect the set of already-outstanding hashes for dedup.
-        let already_sent: std::collections::HashSet<dugite_primitives::hash::Hash32> =
-            outstanding.iter().copied().collect();
+        // Prune entries for txs no longer in the mempool (block confirmed / expired).
+        // This also drops them from `ever_yielded` so they can be re-announced if
+        // the same tx re-enters the mempool (e.g. after a rollback).
+        outstanding.retain(|h| self.mempool.query_tx_size(h).is_some());
+        ever_yielded.retain(|h| self.mempool.query_tx_size(h).is_some());
 
         // Get ordered tx hashes from mempool and yield new ones.
-        let all_hashes = self.mempool.tx_hashes_ordered();
+        let all_hashes = self.mempool.query_tx_hashes_ordered();
         let mut result = Vec::new();
         for hash in all_hashes {
             if result.len() >= max_count as usize {
                 break;
             }
-            if already_sent.contains(&hash) {
+            // Skip if already yielded to this peer (acked or still outstanding).
+            if ever_yielded.contains(&hash) {
                 continue;
             }
-            if let Some(size) = self.mempool.get_tx_size(&hash) {
+            if let Some(size) = self.mempool.query_tx_size(&hash) {
                 outstanding.push_back(hash);
+                ever_yielded.insert(hash);
                 // Compute the full GenTx wire size including HFC envelope:
                 //   array(2)[1] + era_id[1] + tag(24)[2] + bytes_header[1-3] + cbor_data[N]
                 // bytes_header: 1 byte for size < 24, 2 bytes for < 256, 3 bytes for < 65536
@@ -1767,17 +1798,19 @@ impl TxSource for MempoolTxSource {
             .iter()
             .filter_map(|(era_id, id)| {
                 let hash = dugite_primitives::hash::Hash32::from_bytes(*id);
-                self.mempool.get_tx_cbor(&hash).map(|cbor| (*era_id, cbor))
+                self.mempool
+                    .query_tx_cbor(&hash)
+                    .map(|cbor| (*era_id, cbor))
             })
             .collect()
     }
 
     fn has_pending(&self) -> bool {
-        !self.mempool.is_empty()
+        !self.mempool.query_is_empty()
     }
 
     fn tx_notify(&self) -> Option<std::sync::Arc<tokio::sync::Notify>> {
-        Some(self.mempool.tx_notify())
+        self.mempool.query_tx_notify()
     }
 }
 
@@ -2634,5 +2667,122 @@ mod tests {
         let addr: SocketAddr = "0.0.0.0:3001".parse().unwrap();
         lc.set_local_listen_addr(addr);
         // No assertion needed: just verifies no panic.
+    }
+
+    // ── MempoolTxSource ever-yielded dedup ───────────────────────────────────
+
+    /// Mock mempool for `MempoolTxSource` unit tests.
+    struct MockMempool {
+        txs: std::sync::Mutex<std::collections::BTreeMap<dugite_primitives::hash::Hash32, usize>>,
+    }
+
+    impl MockMempool {
+        fn new() -> Self {
+            Self {
+                txs: std::sync::Mutex::new(std::collections::BTreeMap::new()),
+            }
+        }
+        fn insert(&self, hash: dugite_primitives::hash::Hash32, size: usize) {
+            self.txs.lock().unwrap().insert(hash, size);
+        }
+        fn remove(&self, hash: &dugite_primitives::hash::Hash32) {
+            self.txs.lock().unwrap().remove(hash);
+        }
+    }
+
+    impl MempoolQuerySource for std::sync::Arc<MockMempool> {
+        fn query_tx_size(&self, hash: &dugite_primitives::hash::Hash32) -> Option<usize> {
+            self.txs.lock().unwrap().get(hash).copied()
+        }
+        fn query_tx_hashes_ordered(&self) -> Vec<dugite_primitives::hash::Hash32> {
+            self.txs.lock().unwrap().keys().copied().collect()
+        }
+        fn query_tx_cbor(&self, _hash: &dugite_primitives::hash::Hash32) -> Option<Vec<u8>> {
+            None
+        }
+        fn query_is_empty(&self) -> bool {
+            self.txs.lock().unwrap().is_empty()
+        }
+        fn query_tx_notify(&self) -> Option<std::sync::Arc<tokio::sync::Notify>> {
+            None
+        }
+    }
+
+    fn make_hash(byte: u8) -> dugite_primitives::hash::Hash32 {
+        dugite_primitives::hash::Hash32::from_bytes([byte; 32])
+    }
+
+    fn tx_ids_from(
+        source: &MempoolTxSource<std::sync::Arc<MockMempool>>,
+        ack: u16,
+        req: u16,
+    ) -> Vec<[u8; 32]> {
+        source
+            .get_tx_ids(ack, req)
+            .into_iter()
+            .map(|t| t.tx_id)
+            .collect()
+    }
+
+    /// TxSubmission2 ever-yielded dedup: once a tx is acked, it must NOT be
+    /// re-yielded to the same peer on the next request, even while it remains
+    /// in the mempool. The tx is only re-yielded if it first leaves the mempool
+    /// and then re-enters (e.g. after a rollback).
+    ///
+    /// Protocol cycle exercised:
+    ///   1. First request (ack=0): all three txs A, B, C are new → yielded.
+    ///   2. Peer acks all 3 (ack=3): re-iteration must return nothing.
+    ///   3. A leaves mempool; next request (ack=0) must still return nothing
+    ///      (B and C are still ever-yielded).
+    ///   4. B leaves; A re-enters: next request must return only A
+    ///      (A was pruned from ever_yielded when it left).
+    #[test]
+    fn mempool_tx_source_ever_yielded_no_reannounce() {
+        let pool = std::sync::Arc::new(MockMempool::new());
+        let hash_a = make_hash(0xAA);
+        let hash_b = make_hash(0xBB);
+        let hash_c = make_hash(0xCC);
+
+        pool.insert(hash_a, 100);
+        pool.insert(hash_b, 100);
+        pool.insert(hash_c, 100);
+
+        let source = MempoolTxSource {
+            mempool: pool.clone(),
+            outstanding: std::sync::Mutex::new(std::collections::VecDeque::new()),
+            ever_yielded: std::sync::Mutex::new(std::collections::HashSet::new()),
+        };
+
+        // Step 1: first request yields all three txs.
+        let ids = tx_ids_from(&source, 0, 10);
+        assert_eq!(ids.len(), 3, "first request must yield A, B, C");
+        assert!(ids.contains(hash_a.as_bytes()));
+        assert!(ids.contains(hash_b.as_bytes()));
+        assert!(ids.contains(hash_c.as_bytes()));
+
+        // Step 2: peer acks all 3; re-iteration must return nothing.
+        let ids = tx_ids_from(&source, 3, 10);
+        assert!(
+            ids.is_empty(),
+            "after full ack, same txs must not be re-yielded (was: {ids:?})"
+        );
+
+        // Step 3: A leaves the mempool; B and C are still ever-yielded → still nothing.
+        pool.remove(&hash_a);
+        let ids = tx_ids_from(&source, 0, 10);
+        assert!(
+            ids.is_empty(),
+            "B and C still ever-yielded; nothing to announce (was: {ids:?})"
+        );
+
+        // Step 4: B leaves; A re-enters → only A is new.
+        pool.remove(&hash_b);
+        pool.insert(hash_a, 100);
+        let ids = tx_ids_from(&source, 0, 10);
+        assert_eq!(ids.len(), 1, "only re-entered A should be yielded");
+        assert!(
+            ids.contains(hash_a.as_bytes()),
+            "A must be re-announced after re-entering the mempool"
+        );
     }
 }
