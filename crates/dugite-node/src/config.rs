@@ -191,6 +191,20 @@ pub struct NodeConfig {
     #[serde(default = "default_min_severity")]
     pub min_severity: String,
 
+    /// Tracing filter directive in `tracing_subscriber::EnvFilter` syntax
+    /// (e.g. `"info,dugite_network=trace,dugite_consensus=debug"`).
+    ///
+    /// If set, this overrides the global level on **SIGHUP reload** (#473) —
+    /// operators can edit the config file at runtime, send `SIGHUP`, and the
+    /// per-subsystem trace verbosity is reloaded without a process restart.
+    ///
+    /// If absent, the initial `--log-level` CLI flag value remains in effect.
+    /// The initial process startup does not yet read this field; only SIGHUP
+    /// applies it. (Operators wanting startup-time effect can pass the same
+    /// directive via the `RUST_LOG` env var, which is honoured by `--log-level`.)
+    #[serde(default)]
+    pub log_directive: Option<String>,
+
     /// Prometheus metrics port.
     ///
     /// When set to 0 the metrics server is disabled.  The CLI flag
@@ -742,6 +756,7 @@ impl Default for NodeConfig {
             target_number_of_known_big_ledger_peers: 15,
             trace_options: TraceOptions::default(),
             min_severity: "Info".to_string(),
+            log_directive: None,
             metrics_port: None,
             storage: None,
             churn_interval_normal_secs: default_churn_interval_normal_secs(),

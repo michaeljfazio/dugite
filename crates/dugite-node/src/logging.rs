@@ -1,4 +1,6 @@
+use std::sync::Arc;
 use tracing_subscriber::layer::SubscriberExt;
+use tracing_subscriber::reload;
 use tracing_subscriber::util::SubscriberInitExt;
 use tracing_subscriber::{EnvFilter, Layer, Registry};
 
@@ -81,19 +83,52 @@ pub struct LoggingOpts {
     pub _log_retention_days: u64,
 }
 
-/// Guard that must be held for the lifetime of the program.
-/// Dropping this flushes any buffered log output (e.g., file writer).
-pub struct LogGuard {
+/// Handle to the live tracing subscriber.
+///
+/// Holds the file-writer worker guards (dropping flushes buffered output) and
+/// the `reload::Handle` for each per-output `EnvFilter`, exposing
+/// [`LogHandle::reload`] for runtime trace-verbosity changes (issue #473).
+///
+/// Cheaply clonable; cloned handles share the same underlying reload state.
+#[derive(Clone)]
+pub struct LogHandle {
+    inner: Arc<LogHandleInner>,
+}
+
+struct LogHandleInner {
+    reload_handles: Vec<reload::Handle<EnvFilter, Registry>>,
     _guards: Vec<tracing_appender::non_blocking::WorkerGuard>,
+}
+
+impl LogHandle {
+    /// Re-parse the given EnvFilter directive (e.g., `"info,dugite_network=trace"`)
+    /// and apply it to every output's filter without restarting the process.
+    ///
+    /// Returns an error if the directive fails to parse — in that case no
+    /// handles are touched, so the previous filter remains in effect.
+    pub fn reload(&self, directive: &str) -> anyhow::Result<()> {
+        // Parse once up front to validate; bail before touching any handle so
+        // we never end up in a half-applied state.
+        EnvFilter::try_new(directive)
+            .map_err(|e| anyhow::anyhow!("Invalid log directive '{directive}': {e}"))?;
+        for handle in &self.inner.reload_handles {
+            handle
+                .reload(EnvFilter::new(directive))
+                .map_err(|e| anyhow::anyhow!("Failed to reload log filter: {e}"))?;
+        }
+        Ok(())
+    }
 }
 
 /// Initialize the logging system with the given options.
 ///
-/// Returns a [`LogGuard`] that must be held until program exit to ensure
-/// buffered output (file logs) is flushed.
-pub fn init(opts: &LoggingOpts) -> anyhow::Result<LogGuard> {
+/// Returns a [`LogHandle`] that must be held until program exit to ensure
+/// buffered output (file logs) is flushed.  The handle also exposes
+/// [`LogHandle::reload`] for runtime filter changes (issue #473).
+pub fn init(opts: &LoggingOpts) -> anyhow::Result<LogHandle> {
     let mut guards: Vec<tracing_appender::non_blocking::WorkerGuard> = Vec::new();
     let mut layers: Vec<Box<dyn Layer<Registry> + Send + Sync>> = Vec::new();
+    let mut reload_handles: Vec<reload::Handle<EnvFilter, Registry>> = Vec::new();
 
     let outputs = if opts.outputs.is_empty() {
         vec![LogOutput::Stdout]
@@ -105,7 +140,8 @@ pub fn init(opts: &LoggingOpts) -> anyhow::Result<LogGuard> {
         match output {
             LogOutput::Stdout => {
                 let ansi = !opts.no_color && atty_stdout();
-                let filter = build_filter(&opts.level);
+                let (filter, handle) = reload::Layer::new(build_filter(&opts.level));
+                reload_handles.push(handle);
                 match opts.format {
                     LogFormat::Text => {
                         let layer = tracing_subscriber::fmt::layer()
@@ -141,7 +177,8 @@ pub fn init(opts: &LoggingOpts) -> anyhow::Result<LogGuard> {
                 let (non_blocking, guard) = tracing_appender::non_blocking(file_appender);
                 guards.push(guard);
 
-                let filter = build_filter(&opts.level);
+                let (filter, handle) = reload::Layer::new(build_filter(&opts.level));
+                reload_handles.push(handle);
                 match opts.format {
                     LogFormat::Text => {
                         let layer = tracing_subscriber::fmt::layer()
@@ -166,9 +203,11 @@ pub fn init(opts: &LoggingOpts) -> anyhow::Result<LogGuard> {
             LogOutput::Journald => {
                 #[cfg(feature = "journald")]
                 {
+                    let (filter, handle) = reload::Layer::new(build_filter(&opts.level));
+                    reload_handles.push(handle);
                     let layer = tracing_journald::layer()
                         .map_err(|e| anyhow::anyhow!("Failed to connect to journald: {e}"))?
-                        .with_filter(build_filter(&opts.level));
+                        .with_filter(filter);
                     layers.push(Box::new(layer));
                 }
                 #[cfg(not(feature = "journald"))]
@@ -183,7 +222,12 @@ pub fn init(opts: &LoggingOpts) -> anyhow::Result<LogGuard> {
 
     Registry::default().with(layers).init();
 
-    Ok(LogGuard { _guards: guards })
+    Ok(LogHandle {
+        inner: Arc::new(LogHandleInner {
+            reload_handles,
+            _guards: guards,
+        }),
+    })
 }
 
 /// Delete `.log` files in `log_dir` that are older than `retention_days`.
@@ -333,5 +377,82 @@ mod tests {
     fn test_cleanup_old_logs_nonexistent_dir() {
         // Should not panic on non-existent directory
         cleanup_old_logs(std::path::Path::new("/nonexistent/dir"), 7);
+    }
+
+    /// Regression test for #473: `reload::Handle` must swap the EnvFilter
+    /// live, so events that were below the previous filter threshold start
+    /// firing after `handle.reload(...)`.
+    ///
+    /// Uses a local `with_default` subscriber to keep the test self-contained
+    /// (the global subscriber is initialized once at process startup).
+    #[test]
+    fn test_reload_filter_swaps_live() {
+        use std::sync::Mutex;
+        use tracing::Subscriber;
+        use tracing_subscriber::layer::{Context, SubscriberExt};
+
+        // Custom layer that records every event that survives its filter,
+        // tagged by level so we can distinguish before/after reload.
+        struct CaptureLayer(Arc<Mutex<Vec<String>>>);
+        impl<S: Subscriber> Layer<S> for CaptureLayer {
+            fn on_event(&self, event: &tracing::Event<'_>, _: Context<'_, S>) {
+                if event.metadata().target() == "issue_473_test" {
+                    self.0
+                        .lock()
+                        .unwrap()
+                        .push(event.metadata().level().to_string());
+                }
+            }
+        }
+
+        let captured = Arc::new(Mutex::new(Vec::<String>::new()));
+        let capture = CaptureLayer(Arc::clone(&captured));
+
+        // Start at info — debug events should be filtered out.
+        let (reload_layer, handle) = reload::Layer::new(EnvFilter::new("info"));
+        let subscriber = Registry::default().with(capture.with_filter(reload_layer));
+
+        tracing::subscriber::with_default(subscriber, || {
+            tracing::info!(target: "issue_473_test", "info_before");
+            tracing::debug!(target: "issue_473_test", "debug_filtered");
+
+            // Hot-swap to debug; verify the new filter is in effect.
+            handle
+                .reload(EnvFilter::new("debug"))
+                .expect("reload should succeed for valid directive");
+
+            tracing::info!(target: "issue_473_test", "info_after");
+            tracing::debug!(target: "issue_473_test", "debug_after");
+        });
+
+        let events = captured.lock().unwrap();
+        assert_eq!(
+            events.len(),
+            3,
+            "expected 3 events (info_before, info_after, debug_after) — got {events:?}"
+        );
+        assert_eq!(events[0], "INFO", "first event was info_before");
+        assert_eq!(events[1], "INFO", "second event was info_after");
+        assert_eq!(events[2], "DEBUG", "third event was debug_after");
+    }
+
+    /// Invalid directives must return an error and leave the previous filter intact.
+    #[test]
+    fn test_reload_rejects_invalid_directive() {
+        let (_layer, handle) = reload::Layer::<EnvFilter, Registry>::new(EnvFilter::new("info"));
+        let log_handle = LogHandle {
+            inner: Arc::new(LogHandleInner {
+                reload_handles: vec![handle],
+                _guards: Vec::new(),
+            }),
+        };
+        // Garbage directive: EnvFilter rejects mismatched braces / illegal syntax.
+        let err = log_handle
+            .reload("this is not =====:::: a valid directive")
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("Invalid log directive"),
+            "expected 'Invalid log directive' wrapper, got: {err}"
+        );
     }
 }

@@ -218,6 +218,9 @@ pub struct NodeArgs {
     pub config: NodeConfig,
     pub topology: Topology,
     pub topology_path: PathBuf,
+    /// Path to the node config JSON. Re-read on SIGHUP to pick up new
+    /// `LogDirective` values for runtime trace-verbosity reload (#473).
+    pub config_path: PathBuf,
     pub database_path: PathBuf,
     pub socket_path: PathBuf,
     pub host_addr: String,
@@ -254,6 +257,11 @@ pub struct NodeArgs {
     pub consensus_mode: String,
     /// Force ValidateAll mode on every block (paranoid/auditing mode)
     pub validate_all_blocks: bool,
+    /// Handle to the live tracing subscriber.  When present, the SIGHUP handler
+    /// re-reads the node config's `LogDirective` and applies it via
+    /// `LogHandle::reload`, enabling per-subsystem trace verbosity changes
+    /// without a process restart (#473).
+    pub log_handle: Option<crate::logging::LogHandle>,
 }
 
 // ─── Node struct ─────────────────────────────────────────────────────────────
@@ -304,6 +312,10 @@ pub struct Node {
     /// era transitions are detected in the block stream.
     pub(crate) era_history: Arc<RwLock<dugite_consensus::EraHistory>>,
     pub(crate) topology_path: PathBuf,
+    /// Path to the node config JSON; re-read on SIGHUP for `LogDirective` reload (#473).
+    pub(crate) config_path: PathBuf,
+    /// Handle to the live tracing subscriber for runtime filter reload (#473).
+    pub(crate) log_handle: Option<crate::logging::LogHandle>,
     pub(crate) metrics: Arc<crate::metrics::NodeMetrics>,
     /// Block producer credentials (None = relay-only mode)
     pub(crate) block_producer: Option<crate::forge::BlockProducerCredentials>,
@@ -1573,6 +1585,8 @@ impl Node {
             shelley_genesis,
             era_history,
             topology_path: args.topology_path,
+            config_path: args.config_path,
+            log_handle: args.log_handle,
             metrics: node_metrics,
             block_producer,
             block_announcement_tx: None,
@@ -2136,10 +2150,12 @@ impl Node {
         }
         let _peers = self.topology.all_peers();
 
-        // Setup SIGHUP handler for topology reload
+        // Setup SIGHUP handler for topology + log-directive reload (#322, #473)
         #[cfg(unix)]
         {
             let topology_path = self.topology_path.clone();
+            let config_path = self.config_path.clone();
+            let log_handle = self.log_handle.clone();
             let pm_for_sighup = peer_manager.clone();
             let mut hup_shutdown_rx = shutdown_rx.clone();
             tokio::spawn(async move {
@@ -2195,6 +2211,32 @@ impl Node {
                                 }
                                 Err(e) => {
                                     error!("Failed to reload topology: {e}");
+                                }
+                            }
+
+                            // Reload tracing filter from the config JSON's
+                            // LogDirective field (#473).  Failures here are
+                            // non-fatal and do not affect topology reload.
+                            if let Some(handle) = log_handle.as_ref() {
+                                match NodeConfig::load(&config_path) {
+                                    Ok(new_config) => {
+                                        if let Some(directive) = new_config.log_directive.as_deref() {
+                                            match handle.reload(directive) {
+                                                Ok(()) => info!(
+                                                    "Log directive reloaded: '{directive}'"
+                                                ),
+                                                Err(e) => warn!(
+                                                    "Failed to reload log directive '{directive}': {e}"
+                                                ),
+                                            }
+                                        }
+                                    }
+                                    Err(e) => {
+                                        warn!(
+                                            "Could not re-read {} for LogDirective: {e}",
+                                            config_path.display()
+                                        );
+                                    }
                                 }
                             }
                         }
