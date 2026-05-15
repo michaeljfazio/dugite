@@ -806,6 +806,29 @@ impl EraRules for ConwayRules {
             from_era
         );
 
+        // Step 0 (issue #481): Bump the on-chain protocol version to (9, 0).
+        //
+        // In cardano-node the Babbage→Conway era boundary is a hard fork.
+        // `translateEra @ConwayEra @BabbageEra` for `PParams` copies the old
+        // `ProtVer` across unchanged (`cppProtocolVersion = toNoUpdate
+        // bppProtocolVersion`); the actual bump to PV9 is performed by the
+        // consensus Hard Fork Combinator in the era-crossing tick.
+        //
+        // Dugite has no separate HFC layer — era transitions are dispatched
+        // entirely in the ledger crate via `block.era`.  So we replicate the
+        // HFC's PV write here at the Babbage→Conway boundary.  Without this,
+        // dugite enters Conway with `curPParams.protocol_version_major = 8`
+        // and the Conway-bootstrap branch (gated on `pv == 9`) never fires,
+        // causing the ratification of any preview-era ParameterChange that
+        // relies on bootstrap thresholds (typically a single CC vote with
+        // no DRep/SPO support) to silently fail.  Observed downstream effect
+        // on preview: at boundary 735→736 three sibling ParameterChange
+        // proposals stayed in the proposal pool unrefunded, leaving
+        // dugite -100K ADA in treasury and -100K ADA in the GO-snapshot
+        // active stake versus Koios — the residual drift tracked in #481.
+        epochs.protocol_params.protocol_version_major = 9;
+        epochs.protocol_params.protocol_version_minor = 0;
+
         // Step 1: Purge pointer-based stake from stake distribution.
         // Setting ptr_stake_excluded = true causes stake_routing() in common.rs
         // to return StakeRouting::None for pointer addresses, effectively
@@ -1945,6 +1968,91 @@ mod tests {
         assert!(epochs.ptr_stake_excluded);
         // Donations should be reset.
         assert_eq!(utxo.pending_donations.0, 0);
+    }
+
+    /// Issue #481: the Babbage→Conway hard fork bumps protocol_version to (9,0).
+    ///
+    /// In cardano-node this bump is driven by the consensus HFC (the ledger
+    /// translation itself just copies the old PV across), but in dugite the
+    /// ledger owns era transitions, so it has to write the new PV here.
+    /// Without this, dugite stays at PV8 forever (no governance HardForkInitiation
+    /// before PV10) → the bootstrap branch (`pv == 9`) never fires, so any
+    /// preview-era ParameterChange ratified with only a CC vote (which is the
+    /// only thing that should pass in bootstrap) is silently dropped, leaving
+    /// 100K-ADA proposal deposits unrefunded at every such boundary.
+    ///
+    /// Concrete observed symptom: at preview boundary 735→736 a ParameterChange
+    /// ratified with only a CC vote (DRep+SPO=0) was enacted in Haskell, with
+    /// its and its two siblings' 100K-ADA deposits refunded.  Dugite never
+    /// enacted any of the three because it was stuck on PV8 → treasury and
+    /// stake-snapshot drift versus Koios beginning at e736 and e738
+    /// respectively.
+    #[test]
+    fn test_on_era_transition_babbage_to_conway_sets_pv9() {
+        let rules = ConwayRules::new();
+        let mut params = ProtocolParameters::mainnet_defaults();
+        params.protocol_version_major = 8;
+        params.protocol_version_minor = 0;
+        let ctx = make_conway_ctx(&params);
+        let mut utxo = make_utxo_sub(vec![]);
+        let mut certs = make_cert_sub();
+        let mut gov = make_gov_sub();
+        let mut consensus = make_consensus_sub();
+        let mut epochs = make_epoch_sub();
+        epochs.protocol_params.protocol_version_major = 8;
+        epochs.protocol_params.protocol_version_minor = 0;
+
+        let result = rules.on_era_transition(
+            Era::Babbage,
+            &ctx,
+            &mut utxo,
+            &mut certs,
+            &mut gov,
+            &mut consensus,
+            &mut epochs,
+        );
+        assert!(result.is_ok());
+        assert_eq!(
+            epochs.protocol_params.protocol_version_major, 9,
+            "Babbage→Conway translation must bump protocol_version_major to 9 \
+             so the Conway-bootstrap governance branch can fire (issue #481)",
+        );
+        assert_eq!(
+            epochs.protocol_params.protocol_version_minor, 0,
+            "Babbage→Conway translation sets protocol_version_minor to 0",
+        );
+    }
+
+    /// Defensive: a non-Babbage from_era must NOT bump the protocol version
+    /// (we already guard against re-running init logic; this confirms the new
+    /// PV write is similarly gated).
+    #[test]
+    fn test_on_era_transition_non_babbage_does_not_set_pv9() {
+        let rules = ConwayRules::new();
+        let params = ProtocolParameters::mainnet_defaults();
+        let ctx = make_conway_ctx(&params);
+        let mut utxo = make_utxo_sub(vec![]);
+        let mut certs = make_cert_sub();
+        let mut gov = make_gov_sub();
+        let mut consensus = make_consensus_sub();
+        let mut epochs = make_epoch_sub();
+        epochs.protocol_params.protocol_version_major = 10;
+        epochs.protocol_params.protocol_version_minor = 0;
+
+        let result = rules.on_era_transition(
+            Era::Shelley,
+            &ctx,
+            &mut utxo,
+            &mut certs,
+            &mut gov,
+            &mut consensus,
+            &mut epochs,
+        );
+        assert!(result.is_ok());
+        assert_eq!(
+            epochs.protocol_params.protocol_version_major, 10,
+            "non-Babbage from_era must not clobber the protocol version",
+        );
     }
 
     /// Process Conway DRep registration certificate.
