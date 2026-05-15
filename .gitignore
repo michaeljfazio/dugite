@@ -44,3 +44,4 @@ cstreamer-reference/
 # crates/dugite-ledger/tests/fixtures/README.md for capture procedure)
 crates/dugite-ledger/tests/fixtures/*.cbor
 reward-dumps-issue-438/
+reward-dumps-issue-481/
