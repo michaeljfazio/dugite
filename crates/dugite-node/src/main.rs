@@ -350,14 +350,14 @@ async fn main() -> Result<()> {
         Command::DumpSnapshot(ref args) => Some(&args.log),
         Command::Db(_) => None,
     };
-    let _log_guard = if let Some(log_args) = log_args {
+    let log_handle = if let Some(log_args) = log_args {
         Some(logging::init(&build_logging_opts(log_args)?)?)
     } else {
         None
     };
 
     match cli.command {
-        Command::Run(args) => run_node(*args).await,
+        Command::Run(args) => run_node(*args, log_handle).await,
         Command::MithrilImport(args) => run_mithril_import(args).await,
         Command::DumpSnapshot(args) => run_dump_snapshot(args).await,
         Command::Db(args) => run_db_command(args).await,
@@ -1320,7 +1320,7 @@ async fn run_mithril_import(args: MithrilImportArgs) -> Result<()> {
     .await
 }
 
-async fn run_node(args: RunArgs) -> Result<()> {
+async fn run_node(args: RunArgs, log_handle: Option<logging::LogHandle>) -> Result<()> {
     info!(
         version = env!("CARGO_PKG_VERSION"),
         "Dugite Cardano Node starting"
@@ -1412,6 +1412,7 @@ async fn run_node(args: RunArgs) -> Result<()> {
         config: node_config,
         topology,
         topology_path: args.topology.clone(),
+        config_path: args.config.clone(),
         database_path: args.database_path,
         socket_path: args.socket_path,
         host_addr: args.host_addr,
@@ -1432,6 +1433,7 @@ async fn run_node(args: RunArgs) -> Result<()> {
         storage_config,
         consensus_mode: args.consensus_mode,
         validate_all_blocks: args.validate_all_blocks,
+        log_handle,
     })?;
 
     info!("");
