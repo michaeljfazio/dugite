@@ -1,0 +1,11 @@
+{
+  "timestamp": "20260516T160815Z",
+  "duration_seconds": 1800,
+  "magic": 42,
+  "ports": { "relay": 3002, "dugite_bp": 3001, "cardano_bp": 3003 },
+  "cardano_node_version": "11.0.1",
+  "cardano_cli_version": "11.0.0.0",
+  "dugite_node_git": "94c4c8e5f7d5b39bc2b3ad06d6cf69529d5c47ae",
+  "genesis_hash_shelley": "eab944ad4d33aa2d041efd2695a77da6295b8a6fbe68b32d13e5685661c728cc",
+  "genesis_hash_conway":  "c046a5e5d22ff7459a477e79dcec8f6d67f384075f3c3295960f74220eee7887"
+}
