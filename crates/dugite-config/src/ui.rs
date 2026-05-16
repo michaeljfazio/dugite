@@ -425,11 +425,24 @@ fn render_item_row(
     // Key label (2-space indent, without indicator — indicator is a separate span).
     let key_label = format!("  {}", entry.key);
 
+    // Entries surfaced from the schema but absent from the file are rendered
+    // muted with a "(default)" tag so the operator can tell at a glance which
+    // values are pinned in the file vs. inherited from the schema default.
+    // Once the user edits a synthetic entry, `modified` takes precedence.
+    let is_default_only = !entry.present_in_file && !entry.modified;
+    let raw_value = if is_default_only {
+        format!("{display_value} (default)")
+    } else {
+        display_value.to_string()
+    };
+
     // Value colour depends on type and state.
     let value_color = if is_typing {
         C_WARNING
     } else if entry.modified {
         C_MODIFIED
+    } else if is_default_only {
+        C_MUTED
     } else {
         value_color_for(def, display_value)
     };
@@ -452,12 +465,12 @@ fn render_item_row(
     let max_val_len = available
         .saturating_sub(key_display.len())
         .saturating_sub(reserved);
-    let value_display = if display_value.len() > max_val_len && max_val_len > 3 {
-        format!("{}...", &display_value[..max_val_len.saturating_sub(3)])
-    } else if display_value.len() > max_val_len {
-        display_value[..max_val_len].to_string()
+    let value_display = if raw_value.len() > max_val_len && max_val_len > 3 {
+        format!("{}...", &raw_value[..max_val_len.saturating_sub(3)])
+    } else if raw_value.len() > max_val_len {
+        raw_value[..max_val_len].to_string()
     } else {
-        display_value.to_string()
+        raw_value.clone()
     };
 
     // Spacing between key and value.

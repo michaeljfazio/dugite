@@ -594,26 +594,53 @@ fn run_get(key: &str, path: &Path, verbose: bool) -> Result<()> {
 // ---------------------------------------------------------------------------
 
 /// Update the value of a single parameter in a config file.
+///
+/// If the key is in the schema but missing from the file, a new entry is
+/// appended (typed from the schema default so `apply_edit` coerces correctly).
+/// If the key is in neither the file nor the schema, the call is rejected.
 fn run_set(key: &str, value: &str, path: &Path) -> Result<()> {
     let mut loaded =
         load_config(path).with_context(|| format!("loading config file '{}'", path.display()))?;
 
-    // Validate the value against the schema if the key is known.
     let lookup = build_lookup();
-    if let Some(def) = lookup.get(key) {
+    let def = lookup.get(key).copied();
+
+    // Validate the value against the schema if the key is known.
+    if let Some(def) = def {
         def.param_type
             .validate(value)
             .map_err(|msg| anyhow::anyhow!("invalid value for '{}': {}", key, msg))?;
     }
 
-    // Find and update the entry.
-    let entry = loaded
-        .entries
-        .iter_mut()
-        .find(|e| e.key == key)
-        .with_context(|| format!("key '{}' not found in '{}'", key, path.display()))?;
+    let existing_pos = loaded.entries.iter().position(|e| e.key == key);
+    let entry_pos = match existing_pos {
+        Some(pos) => pos,
+        None => {
+            let def = def.with_context(|| {
+                format!(
+                    "key '{}' not found in '{}' and not present in the schema",
+                    key,
+                    path.display()
+                )
+            })?;
+            // Seed the new entry with the typed schema default so `apply_edit`
+            // coerces the user's value to the right JSON type (bool, number,
+            // string, ...). For schema entries without a representable default,
+            // fall back to a JSON string.
+            let seed_value = def
+                .default_as_json()
+                .unwrap_or_else(|| serde_json::Value::String(String::new()));
+            loaded.entries.push(config::ConfigEntry {
+                key: key.to_string(),
+                value: seed_value,
+                modified: false,
+                present_in_file: true,
+            });
+            loaded.entries.len() - 1
+        }
+    };
 
-    entry
+    loaded.entries[entry_pos]
         .apply_edit(value)
         .with_context(|| format!("applying value '{}' to key '{}'", value, key))?;
 
