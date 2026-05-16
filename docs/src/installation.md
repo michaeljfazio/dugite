@@ -69,7 +69,7 @@ rustc --version
 cargo --version
 ```
 
-Dugite requires **Rust 1.75 or later** (edition 2021).
+Dugite requires the **latest stable Rust** toolchain (edition 2021). Use `rustup update stable` to stay current.
 
 #### System Dependencies
 
@@ -118,10 +118,16 @@ cargo install --path crates/dugite-config
 
 ## Running Tests
 
-Verify everything is working:
+Verify everything is working (requires [cargo-nextest](https://nexte.st/)):
 
 ```bash
-cargo test --all
+cargo nextest run --workspace
+```
+
+Or with the built-in test runner:
+
+```bash
+cargo test --workspace
 ```
 
 The project enforces a zero-warning policy. You can run the full CI check locally:
@@ -129,7 +135,7 @@ The project enforces a zero-warning policy. You can run the full CI check locall
 ```bash
 cargo fmt --all -- --check
 cargo clippy --all-targets -- -D warnings
-cargo test --all
+cargo nextest run --workspace
 ```
 
 ## Development Build

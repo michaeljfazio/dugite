@@ -34,7 +34,7 @@ The Cardano ecosystem benefits from client diversity. Running multiple independe
 
 Dugite is under active development. It can sync against both the Cardano mainnet and preview/preprod testnets. The node implements the full N2N and N2C protocol stacks, ledger validation, epoch transitions with stake snapshots and reward distribution, and Conway-era governance.
 
-See the [Feature Status](https://github.com/michaeljfazio/dugite#feature-status) section in the repository README for a detailed checklist of implemented and pending features.
+For a detailed checklist of implemented and pending features, see the [Developer Wiki](https://github.com/michaeljfazio/dugite/wiki).
 
 ## License
 

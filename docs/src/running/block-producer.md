@@ -6,7 +6,7 @@ Dugite can operate as a block-producing node (stake pool). This requires KES key
 
 A block producer is never directly exposed to the public internet. Instead, it sits behind one or more [relay nodes](./relay.md) that handle all external network connectivity. The relays forward blocks and transactions to the BP over a private network, and the BP announces forged blocks back through the relays.
 
-> **Status (2026-05-04):** Dugite block forging is operational and on-chain verified. A dugite-forged block has been accepted by an upstream `cardano-node` 10.6.2 relay (no header errors); the only loss observed was an unrelated slot-battle orphan. Dugite is currently in soak testing on the preview testnet via Sandstone Pool ([SAND], pool ID `6954ec11cf7097a693721104139b96c54e7f3e2a8f9e7577630f7856`).
+> **Status (2026-05-09):** Dugite block forging is operational and on-chain verified. Block 4265661 at slot 111661041 was forged by Dugite, accepted by the network, and confirmed on the canonical chain (Conway era, 1 tx, built upon by a subsequent block). Ongoing soak testing continues on the preview testnet via Sandstone Pool ([SAND], pool ID `6954ec11cf7097a693721104139b96c54e7f3e2a8f9e7577630f7856`).
 
 See the [Complete Deployment](#complete-deployment) section at the bottom of this page for the full architecture diagram and setup checklist.
 
@@ -287,6 +287,23 @@ If your pool is registered on-chain but the node never logs any forge attempts:
 2. **Check the "set" snapshot availability:** If you see `Block producer: no 'set' snapshot available — leader election disabled until epoch transition`, the node has not yet completed enough epoch transitions. Wait for at least 2 epoch boundaries.
 3. **Verify key files:** Ensure `--shelley-kes-key`, `--shelley-vrf-key`, and `--shelley-operational-certificate` are all provided and point to valid files. Without all three, the node runs in relay-only mode.
 4. **Check KES period:** If the KES key has expired (current KES period exceeds the operational certificate's start period plus `maxKESEvolutions`), rotate the KES key and issue a new operational certificate.
+
+### macOS App Nap (macOS only)
+
+macOS can suspend background processes via "App Nap" to save power. A suspended node misses every leader slot during the freeze window. Wrap the node in `caffeinate` to prevent this:
+
+```bash
+caffeinate -dimsu dugite-node run \
+  --config config.json \
+  --topology topology.json \
+  --database-path ./db \
+  --socket-path ./node.sock \
+  --shelley-kes-key kes.skey \
+  --shelley-vrf-key vrf.skey \
+  --shelley-operational-certificate opcert.cert
+```
+
+The `-dimsu` flags prevent disk-idle, display, idle, system, and user-idle sleep from suspending the process. Required for reliable block production on macOS development machines.
 
 ## Complete Deployment
 
