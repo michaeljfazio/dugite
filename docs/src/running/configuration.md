@@ -90,6 +90,7 @@ These parameters control the P2P peer governor's target counts, matching the car
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
 | `MinSeverity` | string | `"Info"` | Minimum log severity level |
+| `LogDirective` | string | none | `RUST_LOG`-style filter directive applied on SIGHUP. Set at runtime to change per-subsystem verbosity without restarting |
 | `TraceOptions.TraceBlockFetchClient` | boolean | `false` | Trace block fetch client activity |
 | `TraceOptions.TraceBlockFetchServer` | boolean | `false` | Trace block fetch server activity |
 | `TraceOptions.TraceChainDb` | boolean | `false` | Trace ChainDB operations |

@@ -174,16 +174,30 @@ dugite-node run --log-output file --log-dir /var/log/dugite ...
 
 Log files are rotated daily by default. See [Logging](../running/logging.md) for rotation options and multi-target output.
 
-## SIGHUP Topology Reload
+## SIGHUP: Topology Reload and Log Verbosity
 
-To update topology without restarting:
+Sending `SIGHUP` to the node triggers two live reloads without a restart:
 
-```bash
-# Edit topology.json
-kill -HUP $(pidof dugite-node)
-```
+1. **Topology reload** — The node re-reads the topology file and updates the peer manager:
 
-The node will log that the topology was reloaded and update the peer manager with the new configuration.
+   ```bash
+   # Edit topology.json, then:
+   kill -HUP $(pidof dugite-node)
+   ```
+
+2. **Log verbosity reload** — If `LogDirective` is set in the config file, the per-subsystem log filter is reloaded:
+
+   ```bash
+   # Add/update in your config JSON:
+   # "LogDirective": "info,dugite_network=trace"
+   #
+   # Then send SIGHUP:
+   kill -HUP $(pidof dugite-node)
+   ```
+
+   This is useful for enabling trace logging for a specific subsystem while the node is running, without disrupting sync or block production.
+
+See [Logging](../running/logging.md#runtime-log-verbosity-reload-sighup) for full details.
 
 ## Block Producer Issues
 
