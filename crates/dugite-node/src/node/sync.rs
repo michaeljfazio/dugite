@@ -3108,14 +3108,11 @@ pub async fn chainsync_client_task(
             // while no MsgRollForward arrived to drive prune/refill from the
             // message path.  In all other cases — boot, normal sync, at-tip,
             // pre-throttle — the message-driven refill arms handle pipeline
-            // maintenance.  The pre-check below ensures the ticker takes NO
-            // locks in normal operation; without it, every-peer 100ms write
-            // locks on `candidate_chains` starve BlockFetch's read lock and
-            // sync stops making progress at boot.
-            _ = refill_ticker.tick() => {
-                if !throttled {
-                    continue;
-                }
+            // maintenance.  Gating the arm with `if throttled` (vs. an
+            // inside-body `continue`) means tokio doesn't poll the timer
+            // future at all while throttled is false, so a 50-hot-peer node
+            // at-tip saves 500 wakeups/sec.
+            _ = refill_ticker.tick(), if throttled => {
                 let pending_count = {
                     let mut chains = candidate_chains.write().await;
                     match chains.get_mut(&peer_addr) {

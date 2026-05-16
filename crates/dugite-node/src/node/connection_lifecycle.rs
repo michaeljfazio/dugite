@@ -1120,7 +1120,11 @@ impl ConnectionLifecycleManager {
 
                 info!(%addr, "blockfetch worker started (waiting for turn)");
 
-                let mut poll_ticker = tokio::time::interval(std::time::Duration::from_millis(500));
+                // Liveness fallback only; real fetch dispatch is event-driven
+                // via the `fetch_senders` mpsc.  500ms × 50 hot peers was ~100
+                // wakeups/sec of CAS-and-park work.  2s makes that 25/sec with
+                // no impact on active fetch latency.
+                let mut poll_ticker = tokio::time::interval(std::time::Duration::from_millis(2000));
                 poll_ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
                 loop {
