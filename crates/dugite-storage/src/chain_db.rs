@@ -463,6 +463,86 @@ impl ChainDB {
         self.volatile.has_block(hash) || self.immutable.has_block(hash)
     }
 
+    /// Check if a block hash is on the current canonical chain.
+    ///
+    /// The canonical chain is:
+    ///   * every block on the volatile `selected_chain` (the active chain
+    ///     within the rollback window), AND
+    ///   * every block in the ImmutableDB (k-deep blocks are finalised).
+    ///
+    /// A fork block that exists in `self.blocks` but has been displaced by
+    /// a chain switch returns `false`.
+    ///
+    /// Used by the ChainSync server to detect when its cursor's block has
+    /// been rolled back off the active chain and to trigger a downstream
+    /// `MsgRollBackward` before serving any further `MsgRollForward`.
+    pub fn is_on_chain(&self, hash: &BlockHeaderHash) -> bool {
+        self.volatile.is_on_selected_chain(hash) || self.immutable.has_block(hash)
+    }
+
+    /// Find the most recent ancestor of `start_hash` that is on the current
+    /// canonical chain.  Returns `Some((slot, hash, block_no))` for that
+    /// ancestor, or `None` when no ancestor on the active chain can be
+    /// located.
+    ///
+    /// Designed for the ChainSync server's cursor-revalidation flow: callers
+    /// invoke this after observing `!is_on_chain(cursor_hash)`, i.e.
+    /// `start_hash` is a fork block in VolatileDB (or not present at all).
+    ///
+    /// Resolution order:
+    ///   1. `start_hash` is on the volatile `selected_chain` → return it.
+    ///   2. `start_hash` is the immutable tip → return it.
+    ///   3. Walk `prev_hash` through volatile, find the first hash on the
+    ///      selected chain → return it.
+    ///   4. Walk halted at the volatile/immutable boundary; if the halt
+    ///      point's `prev_hash` matches the immutable tip → return the
+    ///      immutable tip.
+    ///   5. Otherwise → `None`.
+    ///
+    /// This is the Rust equivalent of the cursor revalidation Haskell's
+    /// `Ouroboros.Consensus.Storage.ChainDB.Follower` performs after a
+    /// chain switch: rewind to the most recent ancestor still on chain
+    /// (anchor of the new fragment, which is always the immutable tip or
+    /// a more recent block).
+    pub fn find_chain_ancestor(
+        &self,
+        start_hash: &BlockHeaderHash,
+    ) -> Option<(SlotNo, BlockHeaderHash, BlockNo)> {
+        // 1. start_hash on volatile selected chain → return it.
+        if self.volatile.is_on_selected_chain(start_hash) {
+            let block = self.volatile.get_block(start_hash)?;
+            return Some((SlotNo(block.slot), *start_hash, BlockNo(block.block_no)));
+        }
+
+        // 2. start_hash IS the immutable tip → return it.
+        if let Some((slot, hash, block_no)) = self.immutable_tip {
+            if &hash == start_hash {
+                return Some((slot, hash, block_no));
+            }
+        }
+
+        // 3. Walk volatile prev_hash chain back to selected_chain.
+        if let Some((slot, hash, block_no)) = self.volatile.find_selected_chain_ancestor(start_hash)
+        {
+            return Some((SlotNo(slot), hash, BlockNo(block_no)));
+        }
+
+        // 4. Walk halted; check if the root's prev_hash matches the immutable tip.
+        let chain = self.volatile.walk_chain_back(start_hash);
+        if let Some(root) = chain.first() {
+            if let Some(root_block) = self.volatile.get_block(root) {
+                if let Some((slot, hash, block_no)) = self.immutable_tip {
+                    if hash == root_block.prev_hash {
+                        return Some((slot, hash, block_no));
+                    }
+                }
+            }
+        }
+
+        // 5. Unreachable.
+        None
+    }
+
     /// Get block CBOR by block number.
     pub fn get_block_by_number(
         &self,

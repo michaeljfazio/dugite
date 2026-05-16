@@ -1091,6 +1091,43 @@ impl VolatileDB {
         self.selected_chain.len()
     }
 
+    /// Return `true` iff `hash` appears on the current `selected_chain`.
+    ///
+    /// Fork blocks present in `self.blocks` but displaced from the chain
+    /// by a rollback return `false`.  Used by the ChainSync server to
+    /// detect a stale follower cursor after a fork switch.
+    ///
+    /// O(n) in the length of the volatile chain (≤ k).
+    pub fn is_on_selected_chain(&self, hash: &Hash32) -> bool {
+        self.selected_chain.iter().any(|h| h == hash)
+    }
+
+    /// Walk backwards via `prev_hash` from `start_hash` looking for the first
+    /// block whose hash appears on `selected_chain`.  Returns
+    /// `Some((slot, hash, block_no))` for the first hit, or `None` if no
+    /// volatile ancestor lies on the selected chain (caller should consult
+    /// the immutable layer).
+    ///
+    /// Walks only blocks present in `self.blocks` — i.e. it cannot cross
+    /// the volatile/immutable boundary.  The cycle guard mirrors
+    /// `walk_chain_back`.
+    pub fn find_selected_chain_ancestor(&self, start_hash: &Hash32) -> Option<(u64, Hash32, u64)> {
+        let selected_set: HashSet<&Hash32> = self.selected_chain.iter().collect();
+        let mut visited = HashSet::new();
+        let mut current = *start_hash;
+        loop {
+            if !visited.insert(current) {
+                return None;
+            }
+            if selected_set.contains(&current) {
+                let block = self.blocks.get(&current)?;
+                return Some((block.slot, current, block.block_no));
+            }
+            let block = self.blocks.get(&current)?;
+            current = block.prev_hash;
+        }
+    }
+
     /// Compact the WAL by rewriting it with only the current volatile blocks.
     ///
     /// The WAL is an append-only log — every block ever added is present until
@@ -1340,14 +1377,36 @@ impl VolatileDB {
                         // to our current volatile chain or its anchor.  Leave
                         // `selected_chain` untouched; the block stays in
                         // VolatileDB inert.
-                        debug!(
+                        //
+                        // Diagnostic instrumentation (Bug J, 2026-05-16): log the
+                        // full shape of both chains and the anchor.  This lets us
+                        // distinguish the three plausible failure modes:
+                        //   1. walk_chain_back stopped at a too-shallow block
+                        //      (its first prev_hash is some peer block already
+                        //      flushed to immutable, not the immutable tip).
+                        //   2. selected_chain is shorter than expected because
+                        //      our own forges drifted past the volatile window.
+                        //   3. immutable_anchor is None when it shouldn't be
+                        //      (e.g., we never flushed but should have).
+                        warn!(
                             new_tip = %new_tip_hash,
-                            selected_len = self.selected_chain.len(),
+                            new_tip_slot = self.blocks.get(new_tip_hash).map(|b| b.slot).unwrap_or(0),
+                            new_tip_block_no = self.blocks.get(new_tip_hash).map(|b| b.block_no).unwrap_or(0),
                             new_chain_len = new_chain.len(),
-                            new_root_prev = ?new_root_prev,
-                            immutable_anchor = ?immutable_anchor.map(|(h, _)| h),
-                            "VolatileDB: fork unreachable — no common anchor \
-                             (Haskell: isReachable = Nothing)"
+                            new_chain_first = ?new_chain.first().map(|h| h.to_hex()),
+                            new_chain_first_slot = ?new_chain.first().and_then(|h| self.blocks.get(h)).map(|b| b.slot),
+                            new_chain_first_block_no = ?new_chain.first().and_then(|h| self.blocks.get(h)).map(|b| b.block_no),
+                            new_root_prev = ?new_root_prev.map(|h| h.to_hex()),
+                            selected_len = self.selected_chain.len(),
+                            selected_first = ?self.selected_chain.first().map(|h| h.to_hex()),
+                            selected_first_slot = ?self.selected_chain.first().and_then(|h| self.blocks.get(h)).map(|b| b.slot),
+                            selected_first_block_no = ?self.selected_chain.first().and_then(|h| self.blocks.get(h)).map(|b| b.block_no),
+                            selected_last = ?self.selected_chain.last().map(|h| h.to_hex()),
+                            selected_last_slot = ?self.selected_chain.last().and_then(|h| self.blocks.get(h)).map(|b| b.slot),
+                            selected_last_block_no = ?self.selected_chain.last().and_then(|h| self.blocks.get(h)).map(|b| b.block_no),
+                            immutable_anchor_hash = ?immutable_anchor.map(|(h, _)| h.to_hex()),
+                            immutable_anchor_slot = ?immutable_anchor.map(|(_, s)| s),
+                            "VolatileDB: fork unreachable — no common anchor (Haskell: isReachable = Nothing)"
                         );
                         return None;
                     }
