@@ -70,7 +70,7 @@ spec:
             - --database-path
             - /data/db
             - --socket-path
-            - /ipc/node.sock
+            - {{ .Values.socketPath | default "/ipc/node.sock" | quote }}
             - --host-addr
             - {{ .Values.network.hostAddr | quote }}
             - --port
@@ -110,13 +110,13 @@ spec:
               containerPort: {{ .Values.metrics.port }}
               protocol: TCP
             {{- end }}
-          {{- with .Values.livenessProbe }}
+          {{- if and .Values.metrics.enabled .Values.livenessProbe }}
           livenessProbe:
-            {{- toYaml . | nindent 12 }}
+            {{- toYaml .Values.livenessProbe | nindent 12 }}
           {{- end }}
-          {{- with .Values.readinessProbe }}
+          {{- if and .Values.metrics.enabled .Values.readinessProbe }}
           readinessProbe:
-            {{- toYaml . | nindent 12 }}
+            {{- toYaml .Values.readinessProbe | nindent 12 }}
           {{- end }}
           resources:
             {{- toYaml .Values.resources | nindent 12 }}
@@ -125,6 +125,8 @@ spec:
               mountPath: /data/db
             - name: ipc
               mountPath: /ipc
+            - name: tmp
+              mountPath: /tmp
             - name: topology
               mountPath: /etc/dugite/topology.json
               subPath: topology.json
