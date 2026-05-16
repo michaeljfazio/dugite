@@ -3019,26 +3019,58 @@ pub async fn chainsync_client_task(
         }
     }
 
-    // Bug A fix: disconnect when intersection lands at Origin with non-Origin
-    // local ledger tip. An Origin anchor is degenerate for VolatileDB-based
-    // chain selection: `switch_chain` requires a shared volatile block (Haskell
-    // `isReachable` invariant), and Origin is not in volatile storage. The
-    // result is `StoreButDontChange` for every peer block, leaving the node
-    // permanently stuck on its own fork. Mirrors Haskell `terminateAfterDrain`
-    // / `NoLongerIntersects`. The peer manager will reconnect after backoff;
-    // by then the peer has typically advanced and offers a real intersection.
+    // Bug A fix (refined 2026-05-16): disconnect when intersection lands at
+    // Origin with non-Origin local ledger tip AND the local chain has grown
+    // beyond the security window (`k = security_param` blocks). An Origin
+    // anchor requires VolatileDB::switch_chain to roll back the entire
+    // selected chain back to genesis (or to the immutable anchor). If the
+    // local chain is within `k` blocks of genesis, the rollback fits the
+    // volatile window — accept Origin and let the RollForward stream feed us
+    // the peer's blocks; `process_add_block` (with the Bug B LedgerSeq fix
+    // and Bug D Praos tiebreaker) will adopt the peer's chain when it
+    // exceeds ours. If the local chain is beyond `k`, rollback exceeds the
+    // window and we'd hit `StoreButDontChange` for every peer block — so
+    // disconnect per the original Bug A semantics; the peer manager will
+    // reconnect after backoff and by then the peer has typically advanced.
+    //
+    // For the local-devnet startup race (relay accepts inbound from a
+    // freshly-started dbp whose tip is still Origin): local chain has at
+    // most ~k blocks, gap is small, we accept Origin and dbp's chain
+    // diffuses correctly. Pre-refinement, the unconditional disconnect
+    // killed the relay→dbp chainsync session at second 1 of every soak,
+    // and the peer manager had no path to re-promote (inbound connection
+    // already up), causing permanent divergence (Bug E).
+    //
     // See: docs/superpowers/specs/2026-05-16-bug-a-stale-intersection-fix.md
     if matches!(intersection, Some(CodecPoint::Origin)) && ledger_tip != Point::Origin {
-        warn!(
+        let local_block_no = {
+            let db = chain_db.read().await;
+            db.get_tip_info().map(|(_, _, bn)| bn.0).unwrap_or(0)
+        };
+        if local_block_no > security_param {
+            warn!(
+                %peer_addr,
+                local_ledger_tip = %ledger_tip,
+                local_block_no,
+                security_param,
+                "ChainSync intersection at Origin with non-Origin local chain \
+                 beyond k blocks — disconnecting to retry after peer catches up"
+            );
+            return Err(anyhow::anyhow!(
+                "Peer {peer_addr} intersection at Origin with non-Origin local \
+                 ledger tip (block_no={local_block_no} > k={security_param}); \
+                 disconnecting to retry after peer catches up"
+            ));
+        }
+        info!(
             %peer_addr,
             local_ledger_tip = %ledger_tip,
+            local_block_no,
+            security_param,
             "ChainSync intersection at Origin with non-Origin local chain — \
-             disconnecting to retry after peer catches up"
+             accepting because local chain is within k blocks of genesis \
+             (volatile window can absorb full rollback if peer's chain wins)"
         );
-        return Err(anyhow::anyhow!(
-            "Peer {peer_addr} intersection at Origin with non-Origin local \
-             ledger tip; disconnecting to retry after peer catches up"
-        ));
     }
 
     // Forge gate: signal that at least one peer has established a valid
