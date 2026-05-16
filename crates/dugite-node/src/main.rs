@@ -1,5 +1,6 @@
 // config and forge are declared in lib.rs and re-used here via the crate root
 use dugite_node::config;
+use dugite_node::config_reload;
 use dugite_node::forge;
 mod disk_monitor;
 mod genesis;
