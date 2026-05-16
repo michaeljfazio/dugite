@@ -17,9 +17,16 @@ LD_MAGIC=42
 LD_RELAY_PORT=30000
 LD_DUGITE_BP_PORT=30001
 LD_CARDANO_BP_PORT=30003
-LD_RELAY_SOCK="$LD_STATE/dugite-relay.sock"
-LD_DUGITE_BP_SOCK="$LD_STATE/dugite-bp.sock"
-LD_CARDANO_BP_SOCK="$LD_STATE/cardano-bp.sock"
+# Unix-domain socket paths.
+#
+# macOS imposes a 104-byte SUN_LEN limit on sun_path; both the worktree path
+# and the default $TMPDIR (a long `/var/folders/...` path on macOS) blow past
+# that. Place sockets under /tmp/ld-<uid>/ which is short and per-user.
+LD_SOCK_DIR="/tmp/ld-$(id -u)"
+mkdir -p "$LD_SOCK_DIR" 2>/dev/null || true
+LD_RELAY_SOCK="$LD_SOCK_DIR/relay.sock"
+LD_DUGITE_BP_SOCK="$LD_SOCK_DIR/dbp.sock"
+LD_CARDANO_BP_SOCK="$LD_SOCK_DIR/cbp.sock"
 
 # Dugite binary discovered relative to repo root (LD_ROOT/../..)
 LD_REPO_ROOT="$(cd "$LD_ROOT/../.." && pwd)"
