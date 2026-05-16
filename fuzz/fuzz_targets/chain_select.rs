@@ -51,6 +51,10 @@ fn make_header(slot: SlotNo, block_no: BlockNo, era: Era) -> BlockHeader {
         Era::Alonzo => 5,
         Era::Babbage => 7,
         Era::Conway => 9,
+        // TODO(dijkstra): expand fuzz coverage once Dijkstra ledger support lands.
+        // The era selector below only emits Byron/Shelley/Conway, so this arm is
+        // currently unreachable — it exists to satisfy match exhaustiveness.
+        Era::Dijkstra => 12,
     };
     BlockHeader {
         header_hash: Hash32::ZERO,
