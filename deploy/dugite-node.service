@@ -1,5 +1,22 @@
+# dugite-node.service — passive relay / observer node
+#
+# Install:
+#   sudo cp /path/to/dugite-node /usr/local/bin/dugite-node
+#   sudo mkdir -p /etc/dugite /var/lib/dugite /run/dugite
+#   sudo chown dugite:dugite /var/lib/dugite /run/dugite
+#   sudo cp deploy/dugite-node.service /etc/systemd/system/
+#   sudo systemctl daemon-reload && sudo systemctl enable --now dugite-node
+#
+# Optional env overrides → /etc/dugite/env  (file is silently skipped if absent)
+#   DUGITE_PIPELINE_DEPTH=300
+#   RUST_LOG=info
+#   RUST_BACKTRACE=1
+#
+# For block-producer deployments use dugite-bp.service instead.
+
 [Unit]
-Description=Dugite Cardano Node
+Description=Dugite Cardano Node (relay)
+Documentation=https://github.com/your-org/dugite
 After=network-online.target
 Wants=network-online.target
 
@@ -7,20 +24,58 @@ Wants=network-online.target
 Type=simple
 User=dugite
 Group=dugite
+
+# Optional environment overrides (file is not required to exist)
+EnvironmentFile=-/etc/dugite/env
+
 ExecStart=/usr/local/bin/dugite-node run \
     --config /etc/dugite/config.json \
     --topology /etc/dugite/topology.json \
     --database-path /var/lib/dugite/db \
     --socket-path /run/dugite/node.sock \
-    --host-addr 0.0.0.0 --port 3001
+    --host-addr 0.0.0.0 \
+    --port 3001
+
+# Reload re-reads per-subsystem trace verbosity without restarting the node
+# (commit 1f34ac81c / PR #473 — SIGHUP handler in dugite-node).
 ExecReload=/bin/kill -HUP $MAINPID
+
 Restart=on-failure
 RestartSec=10
+
+# Give ChainDB time to flush volatile→immutable before systemd SIGKILL
+TimeoutStopSec=60
+
+# Many concurrent N2N sockets — keep headroom well above the 1024 default
 LimitNOFILE=65536
+
+# Runtime directory (/run/dugite) created automatically by systemd; cleaned on stop
+RuntimeDirectory=dugite
+RuntimeDirectoryMode=0750
+
+# Allow writes to DB and socket; everything else is read-only from the service's view
 ProtectSystem=strict
 ReadWritePaths=/var/lib/dugite /run/dugite
+
+ProtectHome=true
 PrivateTmp=true
+PrivateDevices=true
 NoNewPrivileges=true
+RestrictSUIDSGID=true
+LockPersonality=true
+
+# WASM/Plutus script execution requires a writable + executable mapping.
+# Do NOT set MemoryDenyWriteExecute=true here.
+MemoryDenyWriteExecute=false
+
+# Deny syscall groups that a Cardano node has no business calling.
+# @privileged covers CAP_SYS_ADMIN-gated calls; @mount/@raw-io/@reboot/@swap
+# are obvious; @debug covers ptrace; @clock/@cpu-emulation/@obsolete/@resources
+# cover less obvious attack surface. @keyring is excluded to keep it simple —
+# the node never touches the kernel keyring.
+SystemCallFilter=~@privileged @debug @mount @raw-io @reboot @swap @clock @cpu-emulation @obsolete @resources @keyring
+
+RestrictNamespaces=true
 
 [Install]
 WantedBy=multi-user.target
