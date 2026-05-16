@@ -157,6 +157,18 @@ impl Governor {
         }
     }
 
+    /// Replace the governor's peer targets with new values from a live config
+    /// update (e.g. delivered via a `tokio::sync::watch` channel on SIGHUP).
+    ///
+    /// Only the target fields (`target_warm`, `target_hot`, `max_cold`,
+    /// `target_warm_big_ledger`, `target_hot_big_ledger`) are updated; churn
+    /// intervals remain unchanged by this call. The updated targets take effect
+    /// on the *next* call to [`compute_actions_with_blp`] — there is no
+    /// retroactive effect on in-flight promotions.
+    pub fn update_targets(&mut self, new_targets: PeerTargets) {
+        self.config.targets = new_targets;
+    }
+
     /// Signal that a cold→warm promotion has completed (succeeded or failed).
     ///
     /// The caller — typically the connection orchestrator — must invoke this
