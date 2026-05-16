@@ -34,6 +34,9 @@
   "ShelleyKesKeyFile": "@@KEYS_DIR@@/pool2/kes.skey",
   "ShelleyVrfKeyFile": "@@KEYS_DIR@@/pool2/vrf.skey",
   "ShelleyOperationalCertificateFile": "@@KEYS_DIR@@/pool2/opcert.cert",
+  "TurnOnLogging": true,
+  "TurnOnLogMetrics": true,
+  "UseTraceDispatcher": true,
   "TraceOptions": {
     "": {
       "backends": ["Stdout MachineFormat"],
