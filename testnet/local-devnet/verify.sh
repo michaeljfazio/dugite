@@ -79,7 +79,59 @@ p2_per_bp_attribution() {
         PREDICATE_FAIL+=("p2:per-bp-attribution (pool1=$p1_forges pool2=$p2_forges; need >=3 each)")
     fi
 }
-p3_tx_inclusion()      { :; }   # Filled in by Task 21
+# Predicate 3: every submitted tx with submit_rc=0 must appear in all 3 nodes' UTxO
+# at the change_addr. (Self-test: just verifies all submit_rc are 0.)
+p3_tx_inclusion() {
+    local txs="$1"
+    local evd="$2"
+    [ -s "$txs" ] || { PREDICATE_FAIL+=("p3:no-data"); return; }
+
+    local non_zero
+    non_zero=$(awk -F, 'NR>1 && $5!=0 && $5!="" {print}' "$txs" | wc -l | tr -d ' ')
+    local total
+    total=$(awk -F, 'NR>1 {print}' "$txs" | wc -l | tr -d ' ')
+
+    if [ "$non_zero" -gt 0 ]; then
+        PREDICATE_FAIL+=("p3:tx-inclusion ($non_zero/$total had submit_rc!=0)")
+        return
+    fi
+
+    # If running on real evidence (not a fixture) AND devnet is up, also verify
+    # each txid appears in all three nodes' UTxO sets at the genesis payment addr.
+    local missing=0 examples=""
+    if [ -S "$LD_RELAY_SOCK" ] && [ -f "$LD_KEYS/utxo/payment.addr" ]; then
+        local addr
+        addr=$(cat "$LD_KEYS/utxo/payment.addr")
+        local utxo_relay utxo_dbp utxo_cbp
+        utxo_relay=$(cardano-cli conway query utxo --testnet-magic "$LD_MAGIC" \
+                      --socket-path "$LD_RELAY_SOCK" --address "$addr" \
+                      --output-json 2>/dev/null || echo "{}")
+        utxo_dbp=$(cardano-cli conway query utxo --testnet-magic "$LD_MAGIC" \
+                      --socket-path "$LD_DUGITE_BP_SOCK" --address "$addr" \
+                      --output-json 2>/dev/null || echo "{}")
+        utxo_cbp=$(cardano-cli conway query utxo --testnet-magic "$LD_MAGIC" \
+                      --socket-path "$LD_CARDANO_BP_SOCK" --address "$addr" \
+                      --output-json 2>/dev/null || echo "{}")
+        while IFS=, read -r ts target wave txid rc; do
+            [ "$ts" = "ts" ] && continue
+            [ -z "$txid" ] && continue
+            local in_r in_d in_c
+            in_r=$(echo "$utxo_relay" | jq --arg t "$txid" 'keys | map(select(startswith($t))) | length')
+            in_d=$(echo "$utxo_dbp"   | jq --arg t "$txid" 'keys | map(select(startswith($t))) | length')
+            in_c=$(echo "$utxo_cbp"   | jq --arg t "$txid" 'keys | map(select(startswith($t))) | length')
+            if [ "$in_r" -lt 1 ] || [ "$in_d" -lt 1 ] || [ "$in_c" -lt 1 ]; then
+                missing=$((missing + 1))
+                [ -z "$examples" ] && examples="$txid (r=$in_r d=$in_d c=$in_c)"
+            fi
+        done < "$txs"
+    fi
+
+    if [ "$missing" -eq 0 ]; then
+        PREDICATE_PASS+=("p3:tx-inclusion ($total txs, all submit_rc=0, all visible in 3 UTxO sets if live)")
+    else
+        PREDICATE_FAIL+=("p3:tx-inclusion ($missing/$total txs not in all 3 UTxO sets; example: $examples)")
+    fi
+}
 p4_tip_parity()        { :; }   # Filled in by Task 22
 
 generate_report() { :; }        # Filled in by Task 23
@@ -125,6 +177,27 @@ self_test() {
     LD_KEYS="$saved_ld_keys"
     # Clean up artifact written by p2 on the good fixture
     rm -f "$fix/forge-attribution.tsv"
+
+    # For p3 self-test: force socket-check to skip the live UTxO query branch
+    # by pointing LD_RELAY_SOCK at a non-existent path.
+    local saved_relay_sock="$LD_RELAY_SOCK"
+    LD_RELAY_SOCK="$fix/_nonexistent.sock"
+
+    log_info "p3 - good fixture (expect PASS)"
+    PREDICATE_PASS=(); PREDICATE_FAIL=()
+    p3_tx_inclusion "$fix/predicate-3-good.csv" "$fix"
+    [ ${#PREDICATE_PASS[@]} -gt 0 ] && [ ${#PREDICATE_FAIL[@]} -eq 0 ] \
+        || { LD_RELAY_SOCK="$saved_relay_sock"; die "p3 self-test good: expected PASS, got ${PREDICATE_FAIL[*]:-}"; }
+    log_info "  OK"
+
+    log_info "p3 - bad fixture (expect FAIL)"
+    PREDICATE_PASS=(); PREDICATE_FAIL=()
+    p3_tx_inclusion "$fix/predicate-3-bad.csv" "$fix"
+    [ ${#PREDICATE_FAIL[@]} -gt 0 ] && [ ${#PREDICATE_PASS[@]} -eq 0 ] \
+        || { LD_RELAY_SOCK="$saved_relay_sock"; die "p3 self-test bad: expected FAIL, got ${PREDICATE_PASS[*]:-}"; }
+    log_info "  OK"
+
+    LD_RELAY_SOCK="$saved_relay_sock"
 
     PREDICATE_PASS=("${saved_pass[@]:+${saved_pass[@]}}"); PREDICATE_FAIL=("${saved_fail[@]:+${saved_fail[@]}}")
     log_info "Self-test complete."
