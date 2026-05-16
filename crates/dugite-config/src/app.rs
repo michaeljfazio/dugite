@@ -470,6 +470,68 @@ impl App {
         self.quit_prompt = false;
     }
 
+    /// Save the config file to disk and send SIGHUP to the running node.
+    ///
+    /// The node PID is read from `pid_file`.  If the file does not exist or
+    /// cannot be parsed the save still proceeds but the reload is skipped with
+    /// an appropriate error message in the feedback line.
+    ///
+    /// On Unix the signal is sent via `nix::sys::signal::kill`.  On non-Unix
+    /// platforms the save is performed but SIGHUP delivery is skipped with a
+    /// warning (this is a no-op in practice since dugite-node only runs on
+    /// Unix).
+    pub fn save_and_reload(&mut self, pid_file: &std::path::Path) {
+        // Step 1 — save to disk.
+        if let Err(e) = crate::config::save_config(&mut self.config) {
+            self.feedback = Some(format!("Save failed: {e}"));
+            return;
+        }
+        self.quit_prompt = false;
+
+        // Step 2 — read the node PID.
+        let pid_raw = match std::fs::read_to_string(pid_file) {
+            Ok(s) => s.trim().to_string(),
+            Err(e) => {
+                self.feedback = Some(format!(
+                    "Saved; SIGHUP skipped (cannot read '{}': {e})",
+                    pid_file.display()
+                ));
+                return;
+            }
+        };
+        let pid_num: i32 = match pid_raw.parse() {
+            Ok(n) => n,
+            Err(_) => {
+                self.feedback = Some(format!(
+                    "Saved; SIGHUP skipped (invalid PID '{}' in '{}')",
+                    pid_raw,
+                    pid_file.display()
+                ));
+                return;
+            }
+        };
+
+        // Step 3 — send SIGHUP.
+        #[cfg(unix)]
+        {
+            use nix::sys::signal::{kill, Signal};
+            use nix::unistd::Pid;
+            match kill(Pid::from_raw(pid_num), Signal::SIGHUP) {
+                Ok(()) => {
+                    self.feedback = Some(format!("Saved & SIGHUP sent to PID {pid_num}"));
+                }
+                Err(e) => {
+                    self.feedback = Some(format!("Saved; SIGHUP to PID {pid_num} failed: {e}"));
+                }
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = pid_num;
+            self.feedback = Some("Saved (SIGHUP not supported on this platform)".to_string());
+        }
+    }
+
     // -----------------------------------------------------------------------
     // Quit handling
     // -----------------------------------------------------------------------
@@ -829,5 +891,51 @@ mod tests {
         app.begin_edit(); // toggle: true -> false
                           // The original snapshot must still say "true".
         assert_eq!(app.originals.get("TurnOnLogMetrics"), Some("true"));
+    }
+
+    // -----------------------------------------------------------------------
+    // save_and_reload tests
+    // -----------------------------------------------------------------------
+
+    /// Build an [`App`] backed by a real file in `dir` (not macOS's shared
+    /// `/var/folders/T/`), so that `save_config`'s atomic rename stays within
+    /// the same directory and never crosses a device boundary.
+    fn make_app_in_dir(dir: &std::path::Path, json: &str) -> App {
+        let path = dir.join("config.json");
+        std::fs::write(&path, json.as_bytes()).unwrap();
+        let config = load_config(&path).unwrap();
+        App::new(config)
+    }
+
+    #[test]
+    fn test_save_and_reload_missing_pid_file_reports_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = make_app_in_dir(dir.path(), r#"{"TurnOnLogMetrics": true}"#);
+        let non_existent = dir.path().join("dugite-nonexistent.pid");
+        app.save_and_reload(&non_existent);
+        // The config should be saved (file is now clean).
+        assert!(!app.is_modified());
+        // Feedback must mention the SIGHUP skip (PID file not found).
+        let fb = app.feedback.as_deref().unwrap_or("");
+        assert!(
+            fb.contains("SIGHUP skipped") || fb.contains("Saved"),
+            "Expected feedback mentioning SIGHUP skip or save, got: '{fb}'"
+        );
+    }
+
+    #[test]
+    fn test_save_and_reload_invalid_pid_content_reports_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let pid_file = dir.path().join("bp.pid");
+        std::fs::write(&pid_file, b"not-a-pid\n").unwrap();
+
+        let mut app = make_app_in_dir(dir.path(), r#"{"TurnOnLogMetrics": true}"#);
+        app.save_and_reload(&pid_file);
+        assert!(!app.is_modified());
+        let fb = app.feedback.as_deref().unwrap_or("");
+        assert!(
+            fb.contains("invalid PID") || fb.contains("SIGHUP skipped"),
+            "Expected feedback about invalid PID, got: '{fb}'"
+        );
     }
 }

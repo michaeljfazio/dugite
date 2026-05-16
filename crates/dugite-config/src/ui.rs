@@ -44,7 +44,7 @@ use ratatui::{
 use crate::app::{App, Section};
 use crate::config::ConfigEntry;
 use crate::diff::DiffEntry;
-use crate::schema::{ParamDef, ParamType, SECTION_UNKNOWN};
+use crate::schema::{ParamDef, ParamType, Reloadability, SECTION_UNKNOWN};
 use crate::search::highlight_ranges;
 
 // ---------------------------------------------------------------------------
@@ -67,6 +67,8 @@ const C_SEARCH_BAR: Color = Color::Rgb(60, 60, 80); // dark highlight for search
 const C_SEARCH_MATCH: Color = Color::Rgb(255, 220, 80); // amber for highlighted match text
 const C_DIFF_ORIG: Color = Color::Rgb(255, 100, 100); // red for removed/original value
 const C_DIFF_NEW: Color = Color::Rgb(80, 220, 100); // green for new/current value
+const C_RELOAD_HOT: Color = Color::Rgb(80, 220, 100); // green — hot-reloadable [H]
+const C_RELOAD_RESTART: Color = Color::Rgb(255, 165, 80); // orange — restart-required [R]
 
 /// Minimum terminal width to show the right (description) panel.
 const MIN_WIDTH_TWO_PANEL: u16 = 80;
@@ -408,7 +410,19 @@ fn render_item_row(
     key_ranges: &[(usize, usize)],
     width: usize,
 ) -> ListItem<'static> {
-    // Key label (2-space indent).
+    // Reloadability indicator prefix (e.g. "[H] " or "[R] ", empty for unknown).
+    // We store the owned string so the &str slice lives long enough.
+    let reload_indicator_owned: String = def
+        .map(|d| format!("{} ", d.reloadability.indicator()))
+        .unwrap_or_default();
+    let reload_color = match def.map(|d| d.reloadability) {
+        Some(Reloadability::Hot) => C_RELOAD_HOT,
+        Some(Reloadability::Restart) => C_RELOAD_RESTART,
+        None => C_MUTED,
+    };
+    let reload_indicator: &str = &reload_indicator_owned;
+
+    // Key label (2-space indent, without indicator — indicator is a separate span).
     let key_label = format!("  {}", entry.key);
 
     // Value colour depends on type and state.
@@ -423,9 +437,11 @@ fn render_item_row(
     // Modified indicator.
     let mod_indicator = if entry.modified { "*" } else { " " };
 
-    // Reserve space for " * " suffix.
+    // Reserve space for " * " suffix and the indicator prefix.
     let reserved = 3usize;
-    let key_len = key_label.len().min(width.saturating_sub(reserved + 1));
+    let indicator_len = reload_indicator.len();
+    let available = width.saturating_sub(indicator_len);
+    let key_len = key_label.len().min(available.saturating_sub(reserved + 1));
     let key_display = if key_label.len() > key_len {
         format!("{:.key_len$}", key_label)
     } else {
@@ -433,7 +449,7 @@ fn render_item_row(
     };
 
     // Truncate value so row fits.
-    let max_val_len = width
+    let max_val_len = available
         .saturating_sub(key_display.len())
         .saturating_sub(reserved);
     let value_display = if display_value.len() > max_val_len && max_val_len > 3 {
@@ -445,7 +461,7 @@ fn render_item_row(
     };
 
     // Spacing between key and value.
-    let gap = width
+    let gap = available
         .saturating_sub(key_display.len())
         .saturating_sub(value_display.len())
         .saturating_sub(2);
@@ -460,13 +476,15 @@ fn render_item_row(
     // on the cursor row, we split the key into highlighted / non-highlighted
     // spans.  On the cursor row a single solid span is used.
     let line = if is_cursor || key_ranges.is_empty() {
-        // Simple two-span line: key (muted) + value (colored).
+        // Simple two-span line: indicator + key (muted) + value (colored).
         let key_part = format!("{key_display}{:gap$}", "");
         let val_part = format!("{value_display} {mod_indicator}");
 
         if is_cursor {
+            // On the cursor row the whole line is one solid highlight —
+            // indicator and all content share the same inverted style.
             Line::from(Span::styled(
-                format!("{key_part}{val_part}"),
+                format!("{reload_indicator}{key_part}{val_part}"),
                 Style::default()
                     .fg(fg_key)
                     .bg(bg)
@@ -474,6 +492,10 @@ fn render_item_row(
             ))
         } else {
             Line::from(vec![
+                Span::styled(
+                    reload_indicator.to_string(),
+                    Style::default().fg(reload_color).bg(bg),
+                ),
                 Span::styled(key_part, Style::default().fg(fg_key).bg(bg)),
                 Span::styled(
                     val_part,
@@ -494,6 +516,15 @@ fn render_item_row(
         // relative to `entry.key` (no indent), so offset by 2.
         let indent_offset = 2usize; // "  " prefix length
         let mut spans: Vec<Span<'static>> = Vec::new();
+
+        // Prepend reloadability indicator before the key spans.
+        if !reload_indicator.is_empty() {
+            spans.push(Span::styled(
+                reload_indicator.to_string(),
+                Style::default().fg(reload_color).bg(bg),
+            ));
+        }
+
         let key_bytes = key_display.as_bytes();
         let mut cursor_pos: usize = 0;
 
@@ -657,6 +688,27 @@ fn build_description_content(app: &App) -> Vec<Line<'static>> {
             ]));
         }
 
+        // Reloadability indicator.
+        let (reload_label, reload_col, reload_desc) = match def.reloadability {
+            Reloadability::Hot => (
+                "[H] Hot-reloadable",
+                C_RELOAD_HOT,
+                "SIGHUP applies this change without restart",
+            ),
+            Reloadability::Restart => (
+                "[R] Restart required",
+                C_RELOAD_RESTART,
+                "Node must be restarted for this change to take effect",
+            ),
+        };
+        lines.push(Line::from(vec![
+            Span::styled(
+                reload_label,
+                Style::default().fg(reload_col).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(format!(" — {reload_desc}"), Style::default().fg(C_MUTED)),
+        ]));
+
         // Separator.
         lines.push(Line::from(""));
 
@@ -774,6 +826,7 @@ fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
             key_hint("/", "Search"),
             key_hint("^D", "Diff"),
             key_hint("^S", "Save"),
+            key_hint("^R", "Save&Reload"),
             key_hint("q", "Quit"),
             modified_hint,
         ])
