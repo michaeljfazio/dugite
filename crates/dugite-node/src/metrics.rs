@@ -556,6 +556,17 @@ pub struct NodeMetrics {
     /// of the two ends up on the canonical chain. Mirrors Haskell's
     /// `mkCurrentBlockContext` EQ branch in NodeKernel.hs.
     pub forge_slot_battles_total: AtomicU64,
+    /// `dugite_config_reload_total{result="applied"}` — SIGHUP reloads that
+    /// updated at least one hot-reloadable field and applied the change live.
+    ///
+    /// # HELP dugite_config_reload_total Count of SIGHUP-triggered config reloads by result
+    pub config_reload_applied: AtomicU64,
+    /// `dugite_config_reload_total{result="ignored"}` — SIGHUP reloads where
+    /// every changed field requires a restart; the live config was not altered.
+    pub config_reload_ignored: AtomicU64,
+    /// `dugite_config_reload_total{result="rejected"}` — SIGHUP reloads where
+    /// the config file failed to parse; the live config was not altered.
+    pub config_reload_rejected: AtomicU64,
 }
 
 /// Plain-data view of the governance-related ledger state and Conway
@@ -689,6 +700,9 @@ impl NodeMetrics {
             diffusion_mode: AtomicU64::new(0),
             peer_sharing_enabled: AtomicU64::new(1),
             forge_slot_battles_total: AtomicU64::new(0),
+            config_reload_applied: AtomicU64::new(0),
+            config_reload_ignored: AtomicU64::new(0),
+            config_reload_rejected: AtomicU64::new(0),
         }
     }
 
@@ -1633,6 +1647,30 @@ impl NodeMetrics {
                     ));
                 }
             }
+        }
+
+        // Config reload counter — labeled by result (applied/ignored/rejected).
+        //
+        // Emitted unconditionally (even when all counts are zero) so that
+        // Prometheus alert rules can use `absent()` / `increase()` without
+        // needing a "metric not found" guard.
+        {
+            let applied = self.config_reload_applied.load(Ordering::Relaxed);
+            let ignored = self.config_reload_ignored.load(Ordering::Relaxed);
+            let rejected = self.config_reload_rejected.load(Ordering::Relaxed);
+            out.push_str(
+                "# HELP dugite_config_reload_total Count of SIGHUP-triggered config reloads by result\n",
+            );
+            out.push_str("# TYPE dugite_config_reload_total counter\n");
+            out.push_str(&format!(
+                "dugite_config_reload_total{{result=\"applied\"}} {applied}\n"
+            ));
+            out.push_str(&format!(
+                "dugite_config_reload_total{{result=\"ignored\"}} {ignored}\n"
+            ));
+            out.push_str(&format!(
+                "dugite_config_reload_total{{result=\"rejected\"}} {rejected}\n"
+            ));
         }
 
         // Histograms

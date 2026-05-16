@@ -18,6 +18,9 @@ serde_json = { workspace = true }
 clap = { workspace = true }
 anyhow = { workspace = true }
 
+[target.'cfg(unix)'.dependencies]
+nix = { version = "0.30", features = ["signal"] }
+
 [dev-dependencies]
 tempfile = { workspace = true }
 dugite-node = { workspace = true }
