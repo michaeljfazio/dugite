@@ -4583,6 +4583,28 @@ pub(crate) fn should_skip_forge_for_catch_up(
     wall_clock_slot: u64,
     stability_window: u64,
 ) -> bool {
+    // Boot-time anchor check (Bug G fix, 2026-05-16): if a peer reports a
+    // non-Origin tip and our local chain is still at Origin, the BlockFetch
+    // pipeline has not yet adopted any of that peer's blocks.  Forging now
+    // would create a self-forged block_no=0 on Origin that diverges from
+    // every peer's chain at the very first block — a fork that, because
+    // both chains anchor at genesis (the only common ancestor), cannot be
+    // reconciled by `VolatileDB::switch_chain` once either chain grows past
+    // `k`.  Skip until BlockFetch adopts at least one peer block.
+    //
+    // Compared to the original `reference_tip - tip_slot > stability_window`
+    // check below: that test allows the boot scenario through (gap of, say,
+    // 5 < 150), letting the BP forge before BlockFetch has caught up.
+    // Cardano-node naturally avoids this because its first ChainSync round
+    // populates the chain BEFORE the slot-leader timer fires; dugite's slot
+    // timer fires on the wall clock, often before the (asynchronous)
+    // BlockFetch worker has had a chance to download anything.
+    //
+    // This check is a no-op on a network where the BP genuinely is the
+    // first node to produce a block (peer_tip == 0).
+    if peer_tip > 0 && tip_slot == 0 {
+        return true;
+    }
     let reference_tip = if peer_tip > 0 {
         peer_tip
     } else {
@@ -6010,6 +6032,49 @@ mod tests {
         // Forged ahead — peer_tip lags our tip until the next ChainSync update.
         assert!(!super::should_skip_forge_for_catch_up(
             105, 100, 105, stability,
+        ));
+    }
+
+    /// Bug G regression (2026-05-16): when our chain is still at Origin
+    /// (tip_slot=0) but a peer has any non-Origin chain (peer_tip>0), the
+    /// gate MUST skip the forge regardless of stability_window.  Otherwise
+    /// the BP would forge block_no=0 on top of Origin, creating a fork that
+    /// can never reconcile with the peer's chain because the only common
+    /// ancestor is genesis — beyond the volatile + ledger-seq window
+    /// (`VolatileDB::switch_chain` returns `None` with "fork unreachable"
+    /// for any subsequent attempt to adopt the peer's chain).
+    ///
+    /// Before this guard:
+    ///   reference_tip(5) - tip_slot(0) > stability_window(150) → false → DON'T SKIP
+    /// allowed the BP to fork from Origin at the very first slot.
+    #[test]
+    fn forge_catch_up_gate_skips_boot_when_peer_has_chain_and_we_have_origin() {
+        let stability = dugite_consensus::stability_window_slots(10, 0.2); // local-devnet
+                                                                           // dbp empty (tip_slot=0), peer (cbp via relay) at slot 5: must skip.
+        assert!(super::should_skip_forge_for_catch_up(
+            0, // tip_slot — our chain is at Origin
+            5, // peer_tip — peer has 5 slots of chain
+            7, // wall_clock_slot — we're at slot 7
+            stability,
+        ));
+        // Even a 1-slot peer chain must trigger skip.
+        assert!(super::should_skip_forge_for_catch_up(
+            0, 1, // bare minimum peer chain
+            10, stability,
+        ));
+    }
+
+    /// Bug G regression (2026-05-16): the boot guard does NOT fire on a
+    /// genuinely empty network where peer_tip is also 0.  Both BPs start
+    /// from Origin and resolve via Praos VRF tiebreaker (slot battle).
+    #[test]
+    fn forge_catch_up_gate_does_not_skip_boot_when_both_empty() {
+        let stability = dugite_consensus::stability_window_slots(10, 0.2);
+        assert!(!super::should_skip_forge_for_catch_up(
+            0, // tip_slot
+            0, // peer_tip (no peer chain)
+            3, // wall_clock_slot small
+            stability,
         ));
     }
 
