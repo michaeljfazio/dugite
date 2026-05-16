@@ -26,7 +26,9 @@ use std::collections::HashMap;
 
 use crate::config::{ConfigEntry, LoadedConfig};
 use crate::diff::OriginalValues;
-use crate::schema::{build_lookup, section_priority, ParamDef, ParamType, SECTION_UNKNOWN};
+use crate::schema::{
+    build_lookup, section_priority, ParamDef, ParamType, KNOWN_PARAMS, SECTION_UNKNOWN,
+};
 
 // ---------------------------------------------------------------------------
 // Section / item model
@@ -122,10 +124,13 @@ impl App {
     /// All sections start expanded.  The cursor starts at section 0, item 0.
     /// The [`OriginalValues`] snapshot is captured immediately so that diffs
     /// remain accurate even after multiple edits.
-    pub fn new(config: LoadedConfig) -> Self {
+    pub fn new(mut config: LoadedConfig) -> Self {
+        // Snapshot originals from the file BEFORE injecting schema defaults so
+        // the diff view only highlights keys the user actually edited.
+        let originals = OriginalValues::from_entries(&config.entries);
+        config.inject_schema_defaults();
         let lookup = build_lookup();
         let sections = build_sections(&config, &lookup);
-        let originals = OriginalValues::from_entries(&config.entries);
 
         App {
             config,
@@ -481,14 +486,12 @@ impl App {
     /// warning (this is a no-op in practice since dugite-node only runs on
     /// Unix).
     pub fn save_and_reload(&mut self, pid_file: &std::path::Path) {
-        // Step 1 — save to disk.
-        if let Err(e) = crate::config::save_config(&mut self.config) {
-            self.feedback = Some(format!("Save failed: {e}"));
+        // Save first; if save fails, no point trying to signal.
+        if !self.save_for_reload() {
             return;
         }
-        self.quit_prompt = false;
 
-        // Step 2 — read the node PID.
+        // Read the node PID from the file.
         let pid_raw = match std::fs::read_to_string(pid_file) {
             Ok(s) => s.trim().to_string(),
             Err(e) => {
@@ -511,7 +514,33 @@ impl App {
             }
         };
 
-        // Step 3 — send SIGHUP.
+        self.send_sighup(pid_num);
+    }
+
+    /// Save to disk and send SIGHUP directly to a known PID (used by the
+    /// discovery path, where the PID came from `sysinfo` rather than a file).
+    pub fn save_and_signal_pid(&mut self, pid: u32) {
+        if !self.save_for_reload() {
+            return;
+        }
+        self.send_sighup(pid as i32);
+    }
+
+    /// Persist the current config to disk; report success via `feedback`.
+    /// Returns `true` if the save succeeded (so the caller can proceed to
+    /// signalling the node).
+    fn save_for_reload(&mut self) -> bool {
+        if let Err(e) = crate::config::save_config(&mut self.config) {
+            self.feedback = Some(format!("Save failed: {e}"));
+            return false;
+        }
+        self.quit_prompt = false;
+        true
+    }
+
+    /// Send SIGHUP to `pid_num`; on non-Unix platforms, report a no-op.
+    /// Sets `feedback` to describe the outcome regardless.
+    fn send_sighup(&mut self, pid_num: i32) {
         #[cfg(unix)]
         {
             use nix::sys::signal::{kill, Signal};
@@ -620,7 +649,7 @@ fn build_sections(
     config: &LoadedConfig,
     lookup: &HashMap<&'static str, &'static ParamDef>,
 ) -> Vec<Section> {
-    // Map section name -> list of items (in file order).
+    // Map section name -> list of items (collected unordered, sorted below).
     let mut section_map: HashMap<String, Vec<Item>> = HashMap::new();
 
     for (entry_idx, entry) in config.entries.iter().enumerate() {
@@ -633,6 +662,25 @@ fn build_sections(
             .entry(section_name)
             .or_default()
             .push(Item { entry_idx, def });
+    }
+
+    // Sort items within each section by their position in `KNOWN_PARAMS`.
+    // This keeps the in-TUI order stable regardless of where the key appeared
+    // in the source file or whether the entry is synthetic. Unknown keys (no
+    // schema entry) sort after all known ones, keyed alphabetically.
+    let schema_order: HashMap<&str, usize> = KNOWN_PARAMS
+        .iter()
+        .enumerate()
+        .map(|(i, d)| (d.key, i))
+        .collect();
+    for items in section_map.values_mut() {
+        items.sort_by(|a, b| {
+            let key_a = config.entries[a.entry_idx].key.as_str();
+            let key_b = config.entries[b.entry_idx].key.as_str();
+            let pa = schema_order.get(key_a).copied().unwrap_or(usize::MAX);
+            let pb = schema_order.get(key_b).copied().unwrap_or(usize::MAX);
+            pa.cmp(&pb).then(key_a.cmp(key_b))
+        });
     }
 
     // Sort sections by priority, then alphabetically within the same priority.
@@ -674,6 +722,21 @@ mod tests {
         App::new(config)
     }
 
+    /// Position the cursor on the row for the given key.
+    /// Panics if the key is not present in any section.
+    fn move_cursor_to_key(app: &mut App, key: &str) {
+        for (sec_idx, section) in app.sections.iter().enumerate() {
+            for (item_idx, item) in section.items.iter().enumerate() {
+                if app.config.entries[item.entry_idx].key == key {
+                    app.cursor_section = sec_idx;
+                    app.cursor_item = item_idx;
+                    return;
+                }
+            }
+        }
+        panic!("key '{key}' not found in any section");
+    }
+
     #[test]
     fn test_cursor_down_up() {
         let mut app =
@@ -707,7 +770,7 @@ mod tests {
     #[test]
     fn test_begin_edit_bool_toggles_immediately() {
         let mut app = make_app(r#"{"TurnOnLogMetrics": true}"#);
-        // Find TurnOnLogMetrics.
+        move_cursor_to_key(&mut app, "TurnOnLogMetrics");
         app.begin_edit();
         // The edit should have completed immediately (bool toggle).
         assert_eq!(app.edit_mode, EditMode::None);
@@ -720,6 +783,7 @@ mod tests {
     fn test_begin_edit_string_opens_buffer() {
         // ShelleyGenesisFile is a Path type, so begin_edit should open the typing buffer.
         let mut app = make_app(r#"{"ShelleyGenesisFile": "shelley-genesis.json"}"#);
+        move_cursor_to_key(&mut app, "ShelleyGenesisFile");
         app.begin_edit();
         assert!(app.is_typing());
         assert_eq!(app.typing_buffer(), "shelley-genesis.json");
@@ -728,6 +792,7 @@ mod tests {
     #[test]
     fn test_type_and_confirm_string() {
         let mut app = make_app(r#"{"ShelleyGenesisFile": "old.json"}"#);
+        move_cursor_to_key(&mut app, "ShelleyGenesisFile");
         app.begin_edit(); // Path type — opens buffer.
         assert!(app.is_typing());
         // Clear buffer and type new value.
@@ -740,6 +805,7 @@ mod tests {
     #[test]
     fn test_cancel_edit() {
         let mut app = make_app(r#"{"ShelleyGenesisFile": "old.json"}"#);
+        move_cursor_to_key(&mut app, "ShelleyGenesisFile");
         app.begin_edit();
         assert!(app.is_typing());
         app.cancel_edit();
@@ -859,6 +925,7 @@ mod tests {
     #[test]
     fn test_diff_captures_change() {
         let mut app = make_app(r#"{"TurnOnLogMetrics": true}"#);
+        move_cursor_to_key(&mut app, "TurnOnLogMetrics");
         app.begin_edit(); // toggle bool: true -> false
         let diff = app.diff_entries();
         assert_eq!(diff.len(), 1);

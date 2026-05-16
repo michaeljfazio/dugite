@@ -227,25 +227,52 @@ fn decode_snapshot_new(
     })
 }
 
-/// Decode a `SnapShotPool` array.
+/// Decode the per-pool entry within `ssStakePoolsSnapShot`.
 ///
-/// The Haskell `SnapShotPool` encodes both the pool identity key and pool
-/// parameters together in a single array:
+/// The Haskell wire format **changed between cardano-node 10.6.2 and 11.0.1**
+/// (cardano-ledger commits `f914065`/`ef97b72`, 2026-02-18/2026-03-04).  We
+/// disambiguate the two layouts by peeking at field [1]: in the legacy
+/// `StakePoolParams` CBORGroup [1] is the VRF hash (`bytes(32)`, major 2); in
+/// the new `StakePoolSnapShot` [1] is `spssStakeRatio` (`tag(30) array(2)`,
+/// major 6).
+///
+/// ## Legacy `StakePoolParams` (cardano-node ≤ 10.6.2)
 ///
 /// ```text
-/// SnapShotPool = array(9 | 10) [
-///   [0] pool_id:        bytes(28)          -- pool key hash (same as map key — skipped)
+/// array(9 | 10) [
+///   [0] pool_id:        bytes(28)       -- same as outer map key, skipped
 ///   [1] vrf_hash:       bytes(32)
 ///   [2] pledge:         uint
 ///   [3] cost:           uint
 ///   [4] margin:         tag(30)? [num, den]
-///   [5] reward_account: bytes(29)          -- raw reward address bytes
+///   [5] reward_account: bytes(29)
 ///   [6] owners:         tag(258)? array([bytes(28)])
 ///   [7] relays:         array([relay])
 ///   [8] metadata:       null | array(2)[url, hash32]
-///   [9] (optional)      extra field — skipped for forward compatibility
+///   [9] (optional)      extra field — skipped
 /// ]
 /// ```
+///
+/// ## New `StakePoolSnapShot` (cardano-node ≥ 11.0.1)
+///
+/// ```text
+/// array(10) [
+///   [0] spssStake:                    uint
+///   [1] spssStakeRatio:               tag(30) array(2)[int, int]
+///   [2] spssSelfDelegatedOwners:      tag(258)? array([bytes(28)])
+///   [3] spssSelfDelegatedOwnersStake: uint
+///   [4] spssVrf:                      bytes(32)
+///   [5] spssPledge:                   uint
+///   [6] spssCost:                     uint
+///   [7] spssMargin:                   tag(30) array(2)
+///   [8] spssNumDelegators:            uint
+///   [9] spssAccountId:                array(2)[uint(0|1), bytes(28)]
+/// ]
+/// ```
+///
+/// In the new layout, owners/relays/metadata are NOT carried in the snapshot
+/// (they live in `PState.psStakePools`).  We return empty Vecs/None for those
+/// fields — downstream stake math only uses vrf/pledge/cost/margin/reward.
 ///
 /// Returns `(pool, bytes_consumed)`.
 fn decode_snapshot_pool(data: &[u8]) -> Result<(HaskellSnapShotPool, usize), SerializationError> {
@@ -259,10 +286,31 @@ fn decode_snapshot_pool(data: &[u8]) -> Result<(HaskellSnapShotPool, usize), Ser
         )));
     }
 
-    // [0] pool_id: bytes(28) — identical to the outer map key; skip it.
+    // Skip field [0] in both layouts (legacy: pool_id bytes(28) duplicating
+    // the map key; new: spssStake uint).
     let n = skip_cbor_value(&data[off..])?;
     off += n;
 
+    // Disambiguate by major type of field [1]:
+    //   bytes (major 2) → legacy StakePoolParams
+    //   tag   (major 6) → new StakePoolSnapShot
+    let next_major = data.get(off).map(|b| b >> 5).ok_or_else(|| {
+        SerializationError::CborDecode("SnapShotPool: unexpected EOF at field [1]".into())
+    })?;
+
+    if next_major == 6 {
+        decode_new_snapshot_pool(data, off, arr_len)
+    } else {
+        decode_legacy_snapshot_pool(data, off, arr_len)
+    }
+}
+
+/// Legacy `StakePoolParams` CBORGroup layout (cardano-node ≤ 10.6.2).
+fn decode_legacy_snapshot_pool(
+    data: &[u8],
+    mut off: usize,
+    arr_len: usize,
+) -> Result<(HaskellSnapShotPool, usize), SerializationError> {
     // [1] vrf_hash: bytes(32)
     let (vrf_hash, n) = decode_hash32(&data[off..])?;
     off += n;
@@ -285,9 +333,6 @@ fn decode_snapshot_pool(data: &[u8]) -> Result<(HaskellSnapShotPool, usize), Ser
     let reward_account = reward_bytes.to_vec();
 
     // [6] owners: CBOR set tag(258)? array([bytes(28)])
-    //
-    // The owners field may be wrapped in CBOR set tag 258 (0xd9 0x01 0x02).
-    // Skip the tag if present, then decode the array.
     let n = skip_set_tag(&data[off..])?;
     off += n;
     let (owners_len, n) = decode_array_len(&data[off..])?;
@@ -330,6 +375,78 @@ fn decode_snapshot_pool(data: &[u8]) -> Result<(HaskellSnapShotPool, usize), Ser
             owners,
             relays,
             metadata,
+        },
+        off,
+    ))
+}
+
+/// New `StakePoolSnapShot` 10-field layout (cardano-node ≥ 11.0.1).
+fn decode_new_snapshot_pool(
+    data: &[u8],
+    mut off: usize,
+    arr_len: usize,
+) -> Result<(HaskellSnapShotPool, usize), SerializationError> {
+    if arr_len != 10 {
+        return Err(SerializationError::CborDecode(format!(
+            "StakePoolSnapShot: expected array(10), got array({arr_len})"
+        )));
+    }
+
+    // [1] spssStakeRatio: tag(30) array(2)[int, int] — skip, not needed
+    let n = skip_cbor_value(&data[off..])?;
+    off += n;
+
+    // [2] spssSelfDelegatedOwners: tag(258)? array([bytes(28)]) — skip
+    let n = skip_cbor_value(&data[off..])?;
+    off += n;
+
+    // [3] spssSelfDelegatedOwnersStake: uint — skip
+    let n = skip_cbor_value(&data[off..])?;
+    off += n;
+
+    // [4] spssVrf: bytes(32)
+    let (vrf_hash, n) = decode_hash32(&data[off..])?;
+    off += n;
+
+    // [5] spssPledge: uint
+    let (pledge, n) = decode_uint(&data[off..])?;
+    off += n;
+
+    // [6] spssCost: uint
+    let (cost, n) = decode_uint(&data[off..])?;
+    off += n;
+
+    // [7] spssMargin: tag(30) array(2)[num, den]
+    let ((margin_num, margin_den), n) = decode_rational(&data[off..])?;
+    off += n;
+
+    // [8] spssNumDelegators: uint — skip
+    let n = skip_cbor_value(&data[off..])?;
+    off += n;
+
+    // [9] spssAccountId: Credential = array(2)[uint(0|1), bytes(28)].  Synthesise
+    // the legacy 29-byte representation (0xE0/0xF0 + hash28) so downstream
+    // consumers that take bytes [1..29] keep working.  Network nibble is
+    // discarded by the consumer.
+    let ((cred_tag, hash), n) = decode_credential(&data[off..])?;
+    off += n;
+    let mut reward_account = Vec::with_capacity(29);
+    reward_account.push(if cred_tag == 0 { 0xE0 } else { 0xF0 });
+    reward_account.extend_from_slice(hash.as_bytes());
+
+    Ok((
+        HaskellSnapShotPool {
+            vrf_hash,
+            pledge,
+            cost,
+            margin_num,
+            margin_den,
+            reward_account,
+            // StakePoolSnapShot intentionally omits these — they live in
+            // `PState.psStakePools` and are decoded in certstate.rs.
+            owners: Vec::new(),
+            relays: Vec::new(),
+            metadata: None,
         },
         off,
     ))

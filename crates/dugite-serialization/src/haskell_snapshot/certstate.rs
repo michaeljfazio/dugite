@@ -302,10 +302,50 @@ fn decode_stake_pool_state(
     let ((margin_num, margin_den), n) = decode_rational(&data[off..])?;
     off += n;
 
-    // [4] reward_account: bytes(29) — raw reward address
-    let (reward_bytes, n) = decode_bytes(&data[off..])?;
-    off += n;
-    let reward_account = reward_bytes.to_vec();
+    // [4] reward_account
+    //
+    // cardano-node ≤ 10.6.2 (`StakePoolState.spsAccountAddress :: AccountAddress`):
+    //     bytes(29) = 1-byte header (network ID + cred-type nibble) + bytes(28) hash
+    //
+    // cardano-node ≥ 11.0.1 (`StakePoolState.spsAccountId :: AccountId = Credential Staking`,
+    // cardano-ledger commit 71b57dd6 2026-02-19): the network ID is dropped and
+    // the value is encoded as `array(2)[uint(0|1), bytes(28)]`.
+    //
+    // We dispatch on the next byte's CBOR major type and synthesise the legacy
+    // 29-byte representation so downstream consumers (which take bytes [1..29]
+    // as the credential hash) keep working.  The synthesised header byte uses
+    // `0xE0`/`0xF0` with network id 0 — the network nibble is discarded by the
+    // consumer anyway, so this is information-equivalent.
+    let reward_account = match data.get(off).map(|b| b >> 5) {
+        Some(2) => {
+            // Legacy bytes(29).
+            let (reward_bytes, n) = decode_bytes(&data[off..])?;
+            off += n;
+            reward_bytes.to_vec()
+        }
+        Some(4) => {
+            // 11.0.1+ `AccountId = Credential Staking` = array(2)[tag, hash28].
+            let ((cred_tag, hash), n) = decode_credential(&data[off..])?;
+            off += n;
+            let mut buf = Vec::with_capacity(29);
+            // Synthesise the legacy header byte: 0xE0 for KeyHash, 0xF0 for ScriptHash.
+            buf.push(if cred_tag == 0 { 0xE0 } else { 0xF0 });
+            buf.extend_from_slice(hash.as_bytes());
+            buf
+        }
+        Some(major) => {
+            return Err(SerializationError::CborDecode(format!(
+                "StakePoolState[4] reward_account: expected bytes(29) or array(2), \
+                 got major type {major} at byte {:#04x}",
+                data.get(off).copied().unwrap_or(0)
+            )));
+        }
+        None => {
+            return Err(SerializationError::CborDecode(
+                "StakePoolState[4] reward_account: unexpected EOF".into(),
+            ));
+        }
+    };
 
     // [5] owners: set (tag 258) or plain array of bytes(28)
     let n_owners = skip_set_tag(&data[off..])?;

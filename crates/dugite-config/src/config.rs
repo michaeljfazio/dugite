@@ -15,28 +15,38 @@
 //! Saved files use 4-space indentation and a trailing newline, matching the
 //! format used by the official Cardano config files.
 
+use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use serde_json::Value;
 
+use crate::schema::KNOWN_PARAMS;
+
 // ---------------------------------------------------------------------------
 // Flat key-value entry (the TUI's working unit)
 // ---------------------------------------------------------------------------
 
-/// A single key-value pair extracted from the top-level JSON object.
+/// A single key-value pair extracted from the top-level JSON object, or
+/// synthesised from the schema's default for a key the file does not pin.
 ///
 /// The TUI works exclusively with this type — it never manipulates the raw
 /// JSON `Value` tree directly after the initial parse.
 #[derive(Debug, Clone)]
 pub struct ConfigEntry {
-    /// The JSON key exactly as found in the file.
+    /// The JSON key exactly as found in the file (or the schema key for
+    /// synthetic entries).
     pub key: String,
     /// Current value as a JSON `Value`.
     pub value: Value,
     /// Whether this entry has been modified since the file was loaded.
     pub modified: bool,
+    /// True if this entry came from the file on disk; false if it was
+    /// synthesised from the schema's default because the key was absent.
+    /// Synthetic entries are only persisted when their value differs from
+    /// the schema default.
+    pub present_in_file: bool,
 }
 
 impl ConfigEntry {
@@ -150,6 +160,31 @@ impl LoadedConfig {
             entry.modified = false;
         }
     }
+
+    /// Append a synthetic entry for every schema parameter not already present
+    /// in the file, using the schema's documented default value. Synthetic
+    /// entries carry `present_in_file: false` so [`save_config`] can omit them
+    /// when their value matches the default — preserving minimal file diffs
+    /// while letting the TUI surface every parameter for editing.
+    ///
+    /// Parameters whose schema default cannot be represented (no default
+    /// available for the parameter's type) are skipped.
+    pub fn inject_schema_defaults(&mut self) {
+        let present: HashSet<String> = self.entries.iter().map(|e| e.key.clone()).collect();
+        for def in KNOWN_PARAMS {
+            if present.contains(def.key) {
+                continue;
+            }
+            if let Some(value) = def.default_as_json() {
+                self.entries.push(ConfigEntry {
+                    key: def.key.to_string(),
+                    value,
+                    modified: false,
+                    present_in_file: false,
+                });
+            }
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -183,6 +218,7 @@ pub fn load_config(path: &Path) -> Result<LoadedConfig> {
             key: k.clone(),
             value: v.clone(),
             modified: false,
+            present_in_file: true,
         })
         .collect();
 
@@ -211,9 +247,21 @@ pub fn save_config(config: &mut LoadedConfig) -> Result<()> {
     // Step 1 — backup.
     backup_file(&path)?;
 
-    // Step 2 — rebuild JSON object in entry order.
+    // Step 2 — rebuild JSON object in entry order, skipping synthetic entries
+    // that still hold the schema default (keeps the file's diff minimal).
+    let schema_defaults: std::collections::HashMap<&str, Value> = KNOWN_PARAMS
+        .iter()
+        .filter_map(|d| d.default_as_json().map(|v| (d.key, v)))
+        .collect();
     let mut obj = serde_json::Map::new();
     for entry in &config.entries {
+        if !entry.present_in_file {
+            if let Some(default) = schema_defaults.get(entry.key.as_str()) {
+                if &entry.value == default {
+                    continue;
+                }
+            }
+        }
         obj.insert(entry.key.clone(), entry.value.clone());
     }
     let json = Value::Object(obj);
@@ -297,6 +345,7 @@ mod tests {
             key: "k".into(),
             value: Value::Bool(true),
             modified: false,
+            present_in_file: true,
         };
         assert_eq!(entry.display_value(), "true");
 
@@ -313,6 +362,7 @@ mod tests {
             key: "k".into(),
             value: Value::Bool(true),
             modified: false,
+            present_in_file: true,
         };
         entry.apply_edit("false").unwrap();
         assert_eq!(entry.value, Value::Bool(false));
@@ -325,6 +375,7 @@ mod tests {
             key: "k".into(),
             value: Value::Number(1.into()),
             modified: false,
+            present_in_file: true,
         };
         entry.apply_edit("99").unwrap();
         assert_eq!(entry.value, Value::Number(99.into()));
@@ -337,6 +388,7 @@ mod tests {
             key: "k".into(),
             value: Value::String("old".into()),
             modified: false,
+            present_in_file: true,
         };
         entry.apply_edit("new").unwrap();
         assert_eq!(entry.value, Value::String("new".into()));
@@ -349,6 +401,7 @@ mod tests {
             key: "k".into(),
             value: Value::Bool(false),
             modified: false,
+            present_in_file: true,
         };
         entry.toggle_bool().unwrap();
         assert_eq!(entry.value, Value::Bool(true));
@@ -361,6 +414,7 @@ mod tests {
             key: "k".into(),
             value: Value::Number(1.into()),
             modified: false,
+            present_in_file: true,
         };
         assert!(entry.toggle_bool().is_err());
     }
@@ -372,6 +426,7 @@ mod tests {
             key: "k".into(),
             value: Value::String("A".into()),
             modified: false,
+            present_in_file: true,
         };
         entry.cycle_enum(&choices);
         assert_eq!(entry.display_value(), "B");
@@ -414,6 +469,129 @@ mod tests {
         assert!(bak.exists());
 
         // Cleanup.
+        let _ = std::fs::remove_file(&bak);
+        drop(persist);
+    }
+
+    #[test]
+    fn test_inject_schema_defaults_adds_missing_keys() {
+        // Minimal file with only one key; injection should add many schema keys.
+        let f = write_temp(r#"{"MinSeverity": "Info"}"#);
+        let mut config = load_config(f.path()).unwrap();
+        let original_len = config.entries.len();
+        assert_eq!(original_len, 1);
+
+        config.inject_schema_defaults();
+        assert!(
+            config.entries.len() > original_len,
+            "injection should add synthetic entries"
+        );
+
+        // The file-loaded entry retains its provenance.
+        let min_sev = config
+            .entries
+            .iter()
+            .find(|e| e.key == "MinSeverity")
+            .unwrap();
+        assert!(min_sev.present_in_file);
+        assert!(!min_sev.modified);
+
+        // A synthetic entry takes the schema default and is flagged not-present.
+        let protocol = config.entries.iter().find(|e| e.key == "Protocol").unwrap();
+        assert!(!protocol.present_in_file);
+        assert!(!protocol.modified);
+        assert_eq!(protocol.value, Value::String("Cardano".into()));
+    }
+
+    #[test]
+    fn test_inject_schema_defaults_is_idempotent() {
+        let f = write_temp(r#"{"MinSeverity": "Info"}"#);
+        let mut config = load_config(f.path()).unwrap();
+        config.inject_schema_defaults();
+        let after_first = config.entries.len();
+        config.inject_schema_defaults();
+        assert_eq!(after_first, config.entries.len());
+    }
+
+    #[test]
+    fn test_save_skips_unmodified_synthetic_entries() {
+        // Pre-injection file has only MinSeverity; after injection many synthetic
+        // entries exist but none have been touched. Save must not bloat the file.
+        let f = write_temp(r#"{"MinSeverity": "Info"}"#);
+        let path = f.path().to_path_buf();
+        let persist = f.into_temp_path();
+
+        let mut config = load_config(&path).unwrap();
+        config.inject_schema_defaults();
+        save_config(&mut config).unwrap();
+
+        // Reload from disk and confirm only the original key persists.
+        let reloaded = load_config(&path).unwrap();
+        assert_eq!(reloaded.entries.len(), 1);
+        assert_eq!(reloaded.entries[0].key, "MinSeverity");
+
+        let bak = PathBuf::from(format!("{}.bak", path.display()));
+        let _ = std::fs::remove_file(&bak);
+        drop(persist);
+    }
+
+    #[test]
+    fn test_save_persists_synthetic_entry_when_value_diverges() {
+        let f = write_temp(r#"{"MinSeverity": "Info"}"#);
+        let path = f.path().to_path_buf();
+        let persist = f.into_temp_path();
+
+        let mut config = load_config(&path).unwrap();
+        config.inject_schema_defaults();
+
+        // Mutate a synthetic entry away from its default.
+        let protocol = config
+            .entries
+            .iter_mut()
+            .find(|e| e.key == "Protocol")
+            .unwrap();
+        assert!(!protocol.present_in_file);
+        protocol.apply_edit("TPraos").unwrap();
+
+        save_config(&mut config).unwrap();
+
+        let reloaded = load_config(&path).unwrap();
+        let protocol_on_disk = reloaded.entries.iter().find(|e| e.key == "Protocol");
+        assert!(protocol_on_disk.is_some(), "drifted entry should be saved");
+        assert_eq!(
+            protocol_on_disk.unwrap().value,
+            Value::String("TPraos".into())
+        );
+
+        let bak = PathBuf::from(format!("{}.bak", path.display()));
+        let _ = std::fs::remove_file(&bak);
+        drop(persist);
+    }
+
+    #[test]
+    fn test_save_drops_synthetic_entry_reverted_to_default() {
+        // Touching a synthetic entry but landing back on the default value must
+        // not bloat the file — the "minimal diff" guarantee.
+        let f = write_temp(r#"{"MinSeverity": "Info"}"#);
+        let path = f.path().to_path_buf();
+        let persist = f.into_temp_path();
+
+        let mut config = load_config(&path).unwrap();
+        config.inject_schema_defaults();
+
+        let protocol = config
+            .entries
+            .iter_mut()
+            .find(|e| e.key == "Protocol")
+            .unwrap();
+        protocol.apply_edit("TPraos").unwrap();
+        protocol.apply_edit("Cardano").unwrap(); // back to default
+
+        save_config(&mut config).unwrap();
+        let reloaded = load_config(&path).unwrap();
+        assert!(reloaded.entries.iter().all(|e| e.key != "Protocol"));
+
+        let bak = PathBuf::from(format!("{}.bak", path.display()));
         let _ = std::fs::remove_file(&bak);
         drop(persist);
     }

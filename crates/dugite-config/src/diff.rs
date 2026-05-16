@@ -98,6 +98,7 @@ mod tests {
             key: key.to_string(),
             value,
             modified,
+            present_in_file: true,
         }
     }
 
