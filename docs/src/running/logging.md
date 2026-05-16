@@ -144,6 +144,40 @@ All logging flags are shared between the `run` and `mithril-import` subcommands:
 | `--log-file-rotation` | `daily` | Log file rotation: `daily`, `hourly`, or `never` |
 | `--log-no-color` | `false` | Disable ANSI colors in stdout output |
 
+## Runtime Log Verbosity Reload (SIGHUP)
+
+Dugite supports changing per-subsystem log verbosity at runtime without restarting the node. This is useful for debugging a specific issue (for example, enabling trace logging for the network layer) without disrupting ongoing block production or sync.
+
+**Workflow:**
+
+1. Edit the node configuration file and add (or update) the `LogDirective` field:
+
+   ```json
+   {
+     "LogDirective": "info,dugite_network=trace,dugite_consensus=debug"
+   }
+   ```
+
+   The value accepts any `RUST_LOG`-compatible directive, including `*=debug`, `trace`, or per-module overrides like `dugite_ledger=warn`.
+
+2. Send `SIGHUP` to the running node:
+
+   ```bash
+   kill -HUP $(pidof dugite-node)
+   ```
+
+   The node re-reads the config file. If `LogDirective` is present and valid, the filter is reloaded immediately and logged:
+
+   ```
+   INFO dugite_node: Reloaded log directive: "info,dugite_network=trace"
+   ```
+
+   If the directive string is invalid, the previous filter is left intact.
+
+3. To restore the original level, remove `LogDirective` from the config and send SIGHUP again, or set it back to `"info"`.
+
+> **Note:** `LogDirective` is only applied via SIGHUP. The initial startup level is controlled by `--log-level` / `RUST_LOG` as before.
+
 ## Production Recommendations
 
 For production deployments with log aggregation:
