@@ -85,6 +85,11 @@ fuzz_target!(|data: &[u8]| {
                 dugite_primitives::era::Era::Alonzo => 4,
                 dugite_primitives::era::Era::Babbage => 5,
                 dugite_primitives::era::Era::Conway => 6,
+                // TODO(dijkstra): re-encode/round-trip Dijkstra transactions once
+                // a proper Dijkstra encoder exists. Until then the multi-era
+                // decoder treats Dijkstra blocks via the Conway shim, so re-encoding
+                // and round-tripping is not meaningful — skip these blocks.
+                dugite_primitives::era::Era::Dijkstra => continue,
             };
             if let Ok(re_decoded) = decode_transaction(era_id, &encoded) {
                 assert_eq!(
