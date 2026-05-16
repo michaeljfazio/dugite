@@ -37,6 +37,7 @@ use dugite_network::protocol::blockfetch::decision::{
     BlockFetchDecision, FetchRange, PeerFetchState,
 };
 use dugite_network::{BlockFetchClient, MuxChannel};
+use dugite_storage::ChainDB;
 
 use super::connection_lifecycle::{CandidateChainState, FetchedBlock, PendingHeader};
 
@@ -103,9 +104,22 @@ pub struct BlockFetchLogicTask {
 
     /// Current chain tip slot from the ledger.
     ///
-    /// Used to skip headers for blocks we already have (slot <= current_tip_slot).
-    /// Updated by the run loop as blocks are applied.
+    /// Kept for compatibility (e.g. logging) but NO LONGER used to filter
+    /// pending headers — see the comment above the (removed) slot check in
+    /// `pump_decisions`.  Bug I (2026-05-16): the old `slot <= tip_slot`
+    /// filter silently dropped peer headers at earlier slots when local +
+    /// peer chains had diverged, so the fork was never fetched and
+    /// `chain_sel_queue::process_add_block` saw it as "fork unreachable"
+    /// every time a new peer block arrived.
     current_tip_slot: u64,
+
+    /// Read-only access to the local ChainDB.
+    ///
+    /// Used to skip pending headers for blocks we already have (by hash),
+    /// regardless of slot.  Without this, divergent forks at slots ≤ our
+    /// tip would never be fetched and chain selection would permanently
+    /// reject the peer's longer chain.
+    chain_db: Option<Arc<RwLock<ChainDB>>>,
 
     /// Decision interval — how often the task evaluates fetch decisions.
     ///
@@ -166,9 +180,34 @@ impl BlockFetchLogicTask {
         byron_epoch_length: u64,
         cancel: CancellationToken,
     ) -> Self {
+        Self::new_with_chain_db(
+            candidate_chains,
+            fetched_blocks_tx,
+            byron_epoch_length,
+            cancel,
+            None,
+        )
+    }
+
+    /// Variant of [`new`] that also threads a read handle to the local
+    /// ChainDB so the decision task can skip headers for blocks we already
+    /// have (by hash, regardless of slot).  Bug I (2026-05-16): without
+    /// this, divergent forks at slots ≤ our tip would never be fetched
+    /// because the legacy `slot <= current_tip_slot` filter dropped them.
+    /// Production callers should always pass `Some(chain_db)`; the legacy
+    /// `new()` is kept for the existing unit tests that don't construct
+    /// a real ChainDB.
+    pub fn new_with_chain_db(
+        candidate_chains: Arc<RwLock<HashMap<SocketAddr, CandidateChainState>>>,
+        fetched_blocks_tx: mpsc::Sender<FetchedBlock>,
+        byron_epoch_length: u64,
+        cancel: CancellationToken,
+        chain_db: Option<Arc<RwLock<ChainDB>>>,
+    ) -> Self {
         Self {
             candidate_chains,
             current_tip_slot: 0,
+            chain_db,
             decision_interval: PRAOS_DECISION_INTERVAL,
             fetch_senders: HashMap::new(),
             fetched_blocks_tx,
@@ -292,6 +331,19 @@ impl BlockFetchLogicTask {
         // Read candidate chain state from all peers.
         let chains = self.candidate_chains.read().await;
 
+        // Snapshot the local block-presence check.  Bug I fix (2026-05-16):
+        // the previous filter used `header.slot <= current_tip_slot`, which
+        // wrongly dropped peer headers at earlier slots when local and peer
+        // chains had diverged (same slot, different hash).  Replace with a
+        // hash-based check via ChainDB: skip ONLY if we already have this
+        // exact block.  ChainDB::has_block consults both VolatileDB and
+        // ImmutableDB and is O(1).
+        let chain_db_guard = if let Some(db) = self.chain_db.as_ref() {
+            Some(db.read().await)
+        } else {
+            None
+        };
+
         // Collect new pending headers from all peers, filtering out already-fetched
         // and already-in-flight blocks.
         let mut new_headers: Vec<(SocketAddr, PendingHeader)> = Vec::new();
@@ -303,8 +355,21 @@ impl BlockFetchLogicTask {
             }
 
             for header in &state.pending_headers {
-                // Skip blocks we already have (at or before our tip).
-                if header.slot <= self.current_tip_slot {
+                // Skip blocks we already have (by hash, regardless of slot).
+                //
+                // When chain_db is available (production), use the hash-based
+                // check so divergent forks at slots ≤ our tip are correctly
+                // identified as not-yet-fetched.  When chain_db is not
+                // available (legacy unit tests), fall back to the original
+                // slot-based check to preserve test semantics.
+                let already_have = match chain_db_guard.as_ref() {
+                    Some(db) => {
+                        let hash = dugite_primitives::hash::Hash32::from_bytes(header.hash);
+                        db.has_block(&hash)
+                    }
+                    None => header.slot <= self.current_tip_slot,
+                };
+                if already_have {
                     continue;
                 }
 
@@ -317,7 +382,8 @@ impl BlockFetchLogicTask {
             }
         }
 
-        // Release the read lock before doing I/O.
+        // Release the read locks before doing I/O.
+        drop(chain_db_guard);
         drop(chains);
 
         if new_headers.is_empty() {
