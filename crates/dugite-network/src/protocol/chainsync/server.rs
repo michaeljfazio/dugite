@@ -324,7 +324,14 @@ impl ChainSyncServer {
         // Haskell uses a timeout range of 135–911 seconds; we use 135s as the lower bound.
         let timeout = Duration::from_secs(135);
 
+        // Bug J fix (2026-05-16): biased select so rollback_rx is always
+        // checked first when both arms are ready.  Combined with the cursor
+        // revalidation in `try_serve_next_block`, this eliminates the race
+        // where an announcement arriving simultaneously with a rollback
+        // would advance the cursor past the new chain's earlier blocks.
         tokio::select! {
+            biased;
+
             // ── Rollback received while waiting at tip ──────────────────────
             // This is the critical path for issue #299: a follower in
             // MsgAwaitReply (StMustReply) must receive MsgRollBackward when
@@ -340,30 +347,10 @@ impl ChainSyncServer {
                         {
                             self.send_rollback(channel, block_provider, &rb).await
                         } else {
-                            // Cursor is behind the rollback point — the new fork blocks
-                            // will be served naturally.  Try to serve the next block now.
-                            let tip = block_provider.get_tip();
-                            if let Some(block_cbor) = block_provider.get_block(&tip.hash) {
-                                let hfc_header = extract_header_for_chainsync(&block_cbor)
-                                    .map_err(|reason| ProtocolError::CborDecode {
-                                        protocol: "ChainSync",
-                                        reason: format!(
-                                            "header extraction failed for post-rollback block \
-                                             at slot {}: {reason}",
-                                            tip.slot
-                                        ),
-                                    })?;
-                                let response = encode_message(&ChainSyncMessage::MsgRollForward {
-                                    header: hfc_header,
-                                    tip_slot: tip.slot,
-                                    tip_hash: tip.hash,
-                                    tip_block_number: tip.block_number,
-                                });
-                                channel.send(response).await.map_err(ProtocolError::from)?;
-                                self.cursor_slot = tip.slot;
-                                self.cursor_hash = tip.hash;
-                                self.cursor_at_origin = false;
-                            }
+                            // Cursor is behind the rollback point — route through
+                            // `try_serve_next_block` so cursor revalidation (Bug J)
+                            // still applies on the post-rollback chain.
+                            self.try_serve_next_block(channel, block_provider).await?;
                             Ok(())
                         }
                     }
@@ -392,6 +379,20 @@ impl ChainSyncServer {
                         // = false` transition and causes the next
                         // MsgRequestNext to re-serve the first block, which
                         // Haskell rejects with `UnexpectedBlockNo`.
+                        //
+                        // Bug J fix (2026-05-16): defence-in-depth — drain any
+                        // queued rollback first so the announcement-first race
+                        // is closed even if `try_serve_next_block`'s cursor
+                        // revalidation somehow missed (e.g., the cursor was
+                        // still on the old chain but the rollback queue had a
+                        // pending event).
+                        if let Some(rb) = Self::drain_rollback(rollback_rx) {
+                            if self.cursor_slot > rb.slot
+                                || (self.cursor_slot == rb.slot && self.cursor_hash != rb.hash)
+                            {
+                                return self.send_rollback(channel, block_provider, &rb).await;
+                            }
+                        }
                         self.try_serve_next_block(channel, block_provider).await?;
                         Ok(())
                     }
@@ -400,29 +401,9 @@ impl ChainSyncServer {
                             n,
                             "chainsync server: announcement channel lagged; catching up from tip"
                         );
-                        // Try to catch up from the current tip.
-                        let tip = block_provider.get_tip();
-                        if let Some(block_cbor) = block_provider.get_block(&tip.hash) {
-                            let hfc_header = extract_header_for_chainsync(&block_cbor)
-                                .map_err(|reason| ProtocolError::CborDecode {
-                                    protocol: "ChainSync",
-                                    reason: format!(
-                                        "header extraction failed for tip block \
-                                         at slot {}: {reason}",
-                                        tip.slot
-                                    ),
-                                })?;
-                            let response = encode_message(&ChainSyncMessage::MsgRollForward {
-                                header: hfc_header,
-                                tip_slot: tip.slot,
-                                tip_hash: tip.hash,
-                                tip_block_number: tip.block_number,
-                            });
-                            channel.send(response).await.map_err(ProtocolError::from)?;
-                            self.cursor_slot = tip.slot;
-                            self.cursor_hash = tip.hash;
-                            self.cursor_at_origin = false;
-                        }
+                        // Route through `try_serve_next_block` so cursor
+                        // revalidation still applies after the lag.
+                        self.try_serve_next_block(channel, block_provider).await?;
                         Ok(())
                     }
                     Err(broadcast::error::RecvError::Closed) => {
@@ -450,13 +431,51 @@ impl ChainSyncServer {
     /// and it unconditionally clears `cursor_at_origin` after a successful
     /// serve.
     ///
-    /// Returns `Ok(true)` if a block was sent and the cursor advanced,
-    /// `Ok(false)` if there is no next block (caller should continue waiting).
+    /// # Cursor revalidation (Bug J fix, 2026-05-16)
+    ///
+    /// Before serving, validate that the cursor's block is still on the
+    /// canonical chain.  If a fork switch has displaced it, send
+    /// `MsgRollBackward` to the most recent ancestor still on chain
+    /// instead of `MsgRollForward`.  This matches the Haskell ChainSync
+    /// server's behaviour: the follower's cursor anchor must always be
+    /// on the chain that the server is currently serving.
+    ///
+    /// Without this check, `get_next_block_after_slot(cursor_slot)`
+    /// silently skips any new-chain blocks whose slots fall ≤ `cursor_slot`
+    /// after a chain switch — the empirical Bug J failure mode.
+    ///
+    /// Returns `Ok(true)` if a message was sent (either `MsgRollForward` or
+    /// `MsgRollBackward`), `Ok(false)` if there is no next block to serve
+    /// (caller should continue waiting at the tip).
     async fn try_serve_next_block<B: BlockProvider>(
         &mut self,
         channel: &mut MuxChannel,
         block_provider: &B,
     ) -> Result<bool, ProtocolError> {
+        // ── Cursor revalidation (Bug J) ─────────────────────────────────────
+        // Skip when the cursor is at Origin — the all-zero hash is by design
+        // not a stored block, so `is_on_chain` would always be false and we'd
+        // emit a redundant Origin → Origin rollback.
+        if !self.cursor_at_origin && !block_provider.is_on_chain(&self.cursor_hash) {
+            let rb = match block_provider.find_chain_ancestor(&self.cursor_hash) {
+                Some((slot, hash, _bn)) => RollbackAnnouncement { slot, hash },
+                // No ancestor reachable on chain — rewind all the way to
+                // Origin and let the peer resync from genesis.
+                None => RollbackAnnouncement {
+                    slot: 0,
+                    hash: [0u8; 32],
+                },
+            };
+            tracing::info!(
+                cursor_slot = self.cursor_slot,
+                rewind_slot = rb.slot,
+                "chainsync server: cursor rolled off chain; \
+                 sending MsgRollBackward to ancestor"
+            );
+            self.send_rollback(channel, block_provider, &rb).await?;
+            return Ok(true);
+        }
+
         // When cursor_at_origin is true, use the inclusive `>=` lookup so that
         // a block at slot 0 is not skipped.  The strict `>` lookup would miss
         // it since cursor_slot is 0.
@@ -1201,6 +1220,301 @@ mod tests {
         );
 
         // Clean up.
+        let done = encode_message(&ChainSyncMessage::MsgDone);
+        ingress_tx.send(Bytes::from(done)).await.unwrap();
+        handle.await.unwrap().unwrap();
+    }
+
+    // ─── Bug J: cursor revalidation after fork switch (2026-05-16) ───────────
+
+    /// Fork-aware mock that distinguishes blocks on the *canonical chain*
+    /// from blocks merely stored as forks.  This is required to exercise
+    /// the Bug J fix in the ChainSync server: `try_serve_next_block` must
+    /// detect when the cursor's block has been displaced by a fork switch
+    /// (off-chain) and send `MsgRollBackward` rather than skipping over
+    /// the new chain's earlier-slot blocks.
+    type StoredBlock = (u64, u64, [u8; 32], Vec<u8>); // (slot, block_no, prev_hash, cbor)
+
+    struct ForkAwareMockProvider {
+        /// Hashes on the current canonical chain, oldest → newest.
+        chain: std::sync::Arc<std::sync::Mutex<Vec<[u8; 32]>>>,
+        /// Every stored block keyed by hash.
+        store: std::sync::Arc<std::sync::Mutex<std::collections::HashMap<[u8; 32], StoredBlock>>>,
+    }
+
+    impl ForkAwareMockProvider {
+        fn new() -> Self {
+            Self {
+                chain: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+                store: std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            }
+        }
+
+        /// Append a block to the canonical chain.
+        fn push_on_chain(
+            &self,
+            slot: u64,
+            hash: [u8; 32],
+            prev_hash: [u8; 32],
+            block_no: u64,
+            cbor: Vec<u8>,
+        ) {
+            self.store
+                .lock()
+                .unwrap()
+                .insert(hash, (slot, block_no, prev_hash, cbor));
+            self.chain.lock().unwrap().push(hash);
+        }
+
+        /// Store a block as a fork (not on canonical chain).
+        fn put_fork(
+            &self,
+            slot: u64,
+            hash: [u8; 32],
+            prev_hash: [u8; 32],
+            block_no: u64,
+            cbor: Vec<u8>,
+        ) {
+            self.store
+                .lock()
+                .unwrap()
+                .insert(hash, (slot, block_no, prev_hash, cbor));
+        }
+
+        /// Replace the canonical chain wholesale (simulates a fork switch).
+        /// All previously-on-chain blocks not in `new_chain` become forks.
+        fn replace_chain(&self, new_chain: Vec<[u8; 32]>) {
+            *self.chain.lock().unwrap() = new_chain;
+        }
+    }
+
+    impl BlockProvider for ForkAwareMockProvider {
+        fn get_block(&self, hash: &[u8; 32]) -> Option<Vec<u8>> {
+            self.store
+                .lock()
+                .unwrap()
+                .get(hash)
+                .map(|(_, _, _, cbor)| cbor.clone())
+        }
+
+        fn has_block(&self, hash: &[u8; 32]) -> bool {
+            self.store.lock().unwrap().contains_key(hash)
+        }
+
+        fn get_tip(&self) -> TipInfo {
+            let chain = self.chain.lock().unwrap();
+            let store = self.store.lock().unwrap();
+            if let Some(tip_hash) = chain.last() {
+                if let Some((slot, block_no, _, _)) = store.get(tip_hash) {
+                    return TipInfo {
+                        slot: *slot,
+                        hash: *tip_hash,
+                        block_number: *block_no,
+                    };
+                }
+            }
+            TipInfo {
+                slot: 0,
+                hash: [0; 32],
+                block_number: 0,
+            }
+        }
+
+        fn get_next_block_after_slot(&self, after_slot: u64) -> Option<(u64, [u8; 32], Vec<u8>)> {
+            // Walk the canonical chain in order looking for the first block
+            // with slot > after_slot.  Mirrors VolatileDB's behaviour.
+            let chain = self.chain.lock().unwrap();
+            let store = self.store.lock().unwrap();
+            for hash in chain.iter() {
+                if let Some((slot, _, _, cbor)) = store.get(hash) {
+                    if *slot > after_slot {
+                        return Some((*slot, *hash, cbor.clone()));
+                    }
+                }
+            }
+            None
+        }
+
+        fn get_block_at_or_after_slot(&self, slot: u64) -> Option<(u64, [u8; 32], Vec<u8>)> {
+            let chain = self.chain.lock().unwrap();
+            let store = self.store.lock().unwrap();
+            for hash in chain.iter() {
+                if let Some((s, _, _, cbor)) = store.get(hash) {
+                    if *s >= slot {
+                        return Some((*s, *hash, cbor.clone()));
+                    }
+                }
+            }
+            None
+        }
+
+        fn is_on_chain(&self, hash: &[u8; 32]) -> bool {
+            self.chain.lock().unwrap().iter().any(|h| h == hash)
+        }
+
+        fn find_chain_ancestor(&self, start_hash: &[u8; 32]) -> Option<(u64, [u8; 32], u64)> {
+            let chain: std::collections::HashSet<[u8; 32]> =
+                self.chain.lock().unwrap().iter().copied().collect();
+            let store = self.store.lock().unwrap();
+            let mut current = *start_hash;
+            let mut visited = std::collections::HashSet::new();
+            loop {
+                if !visited.insert(current) {
+                    return None;
+                }
+                if chain.contains(&current) {
+                    let (slot, block_no, _, _) = store.get(&current)?;
+                    return Some((*slot, current, *block_no));
+                }
+                let (_, _, prev_hash, _) = store.get(&current)?;
+                current = *prev_hash;
+            }
+        }
+    }
+
+    /// **Bug J regression** (issue #500, 2026-05-16):
+    ///
+    /// Before this fix, the ChainSync server's `try_serve_next_block` used
+    /// only `get_next_block_after_slot(cursor_slot)` to pick the next block
+    /// to forward — slot-based, with no validation that the cursor's block
+    /// was still on the canonical chain.  After a fork switch that replaced
+    /// the in-flight chain with a competitor whose blocks are at *lower*
+    /// slots than the cursor (typical for two BPs forging on diverged
+    /// chains for several blocks before merging), this lookup silently
+    /// skipped every new-chain block at or below the cursor's slot, and
+    /// the downstream peer never received the bodies needed to reach the
+    /// new tip.  Empirically: dugite-bp's volatile DB had no record of
+    /// the relay-side competing chain's blocks 10..16 even though the
+    /// relay had selected them after a fork switch.
+    ///
+    /// Fixed behaviour: when `cursor_hash` is not on the canonical chain,
+    /// the server rewinds the cursor to the most recent on-chain ancestor
+    /// by sending `MsgRollBackward` BEFORE serving any further blocks.
+    /// Subsequent `MsgRequestNext`s then deliver the new chain's blocks
+    /// in slot order — including those at slots ≤ the old cursor slot.
+    #[tokio::test]
+    async fn fork_switch_to_lower_slot_chain_sends_rollback_then_serves_new_blocks() {
+        // Phase 1: build a 4-block chain A → B → C → D and serve it to the
+        // client.  Hash bytes encode the block_no in the first byte.
+        let provider = ForkAwareMockProvider::new();
+        let genesis = [0u8; 32];
+        let a_hash = [0x0A; 32];
+        let b_hash = [0x0B; 32];
+        let c_hash = [0x0C; 32];
+        let d_hash = [0x0D; 32];
+
+        // Original chain: A@slot10 → B@slot20 → C@slot30 → D@slot40
+        provider.push_on_chain(10, a_hash, genesis, 1, make_hfc_block(7, &[0xA1]));
+        provider.push_on_chain(20, b_hash, a_hash, 2, make_hfc_block(7, &[0xB1]));
+        provider.push_on_chain(30, c_hash, b_hash, 3, make_hfc_block(7, &[0xC1]));
+        provider.push_on_chain(40, d_hash, c_hash, 4, make_hfc_block(7, &[0xD1]));
+
+        let (mut channel, mut egress_rx, ingress_tx) = make_test_channel();
+        let (ann_tx, _) = broadcast::channel::<BlockAnnouncement>(16);
+        let (rb_tx, _) = broadcast::channel::<RollbackAnnouncement>(16);
+        let ann_rx = ann_tx.subscribe();
+        let rb_rx = rb_tx.subscribe();
+
+        let mut server = ChainSyncServer::new();
+        let handle = {
+            let provider_handle = ForkAwareMockProvider {
+                chain: provider.chain.clone(),
+                store: provider.store.clone(),
+            };
+            tokio::spawn(async move {
+                server
+                    .run(&mut channel, &provider_handle, ann_rx, rb_rx)
+                    .await
+            })
+        };
+
+        // Intersect at origin and serve A, B, C, D.
+        let find = encode_message(&ChainSyncMessage::MsgFindIntersect(vec![Point::Origin]));
+        ingress_tx.send(Bytes::from(find)).await.unwrap();
+        let _ = egress_rx.recv().await.unwrap();
+
+        for _ in 0..4 {
+            let req = encode_message(&ChainSyncMessage::MsgRequestNext);
+            ingress_tx.send(Bytes::from(req)).await.unwrap();
+            let (_, _, resp) = egress_rx.recv().await.unwrap();
+            assert!(matches!(
+                decode_message(&resp).unwrap(),
+                ChainSyncMessage::MsgRollForward { .. }
+            ));
+        }
+        // Cursor now at D@slot40.
+
+        // Phase 2: simulate the fork-switch on the relay side.  Build a new
+        // chain A → X (slot15) → Y (slot25) → Z (slot35) → W (slot50).
+        // The new chain's intermediate blocks (X, Y, Z) sit at slots BELOW
+        // the cursor (40) — these are the blocks that the buggy code lost.
+        let x_hash = [0x1A; 32];
+        let y_hash = [0x2A; 32];
+        let z_hash = [0x3A; 32];
+        let w_hash = [0x4A; 32];
+        provider.put_fork(15, x_hash, a_hash, 2, make_hfc_block(7, &[0xAA]));
+        provider.put_fork(25, y_hash, x_hash, 3, make_hfc_block(7, &[0xBB]));
+        provider.put_fork(35, z_hash, y_hash, 4, make_hfc_block(7, &[0xCC]));
+        provider.put_fork(50, w_hash, z_hash, 5, make_hfc_block(7, &[0xDD]));
+        provider.replace_chain(vec![a_hash, x_hash, y_hash, z_hash, w_hash]);
+
+        // The cursor's block (D@slot40) is now a fork, no longer on chain.
+        // Announce the new tip — server wakes, sees cursor off-chain via
+        // `is_on_chain`, walks `find_chain_ancestor` back to A, and sends
+        // MsgRollBackward(A@slot10).
+        ann_tx
+            .send(BlockAnnouncement {
+                slot: 50,
+                hash: w_hash,
+                block_number: 5,
+            })
+            .unwrap();
+
+        let req = encode_message(&ChainSyncMessage::MsgRequestNext);
+        ingress_tx.send(Bytes::from(req)).await.unwrap();
+        let (_, _, resp) = egress_rx.recv().await.unwrap();
+        let msg = decode_message(&resp).unwrap();
+        match msg {
+            ChainSyncMessage::MsgRollBackward { point, .. } => {
+                assert_eq!(
+                    point,
+                    Point::Specific(10, a_hash),
+                    "must rewind to most recent on-chain ancestor"
+                );
+            }
+            other => panic!(
+                "Bug J regression: expected MsgRollBackward to A@10, got {other:?}.  \
+                 The cursor was at D@40 which is no longer on the chain; \
+                 serving any MsgRollForward here would skip the new chain's \
+                 blocks at slots ≤ 40."
+            ),
+        }
+
+        // Now the client (representing dbp) requests next blocks; the server
+        // MUST deliver the entire new chain past A in slot order, including
+        // X@15, Y@25, Z@35 — all of which are BELOW the original cursor
+        // slot of 40.  Pre-fix, these would have been silently skipped.
+        let expected_slots = [15u64, 25, 35, 50];
+        for expected_slot in expected_slots {
+            let req = encode_message(&ChainSyncMessage::MsgRequestNext);
+            ingress_tx.send(Bytes::from(req)).await.unwrap();
+            let (_, _, resp) = egress_rx.recv().await.unwrap();
+            let msg = decode_message(&resp).unwrap();
+            match msg {
+                ChainSyncMessage::MsgRollForward { tip_slot, .. } => {
+                    // The MsgRollForward payload doesn't expose the served
+                    // block's slot directly (only the tip), but the cursor
+                    // advances through the chain in order.  Verify the tip
+                    // slot is 50 throughout (since the chain hasn't grown
+                    // further), and that we received all four expected
+                    // forwards.
+                    assert_eq!(tip_slot, 50);
+                    let _ = expected_slot;
+                }
+                other => panic!("expected MsgRollForward at slot {expected_slot}, got {other:?}"),
+            }
+        }
+
         let done = encode_message(&ChainSyncMessage::MsgDone);
         ingress_tx.send(Bytes::from(done)).await.unwrap();
         handle.await.unwrap().unwrap();

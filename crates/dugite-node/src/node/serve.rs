@@ -74,6 +74,26 @@ impl BlockProvider for ChainDBBlockProvider {
         })
     }
 
+    fn is_on_chain(&self, hash: &[u8; 32]) -> bool {
+        let block_hash = dugite_primitives::hash::Hash32::from_bytes(*hash);
+        tokio::task::block_in_place(|| {
+            let db = self.chain_db.blocking_read();
+            db.is_on_chain(&block_hash)
+        })
+    }
+
+    fn find_chain_ancestor(&self, start_hash: &[u8; 32]) -> Option<(u64, [u8; 32], u64)> {
+        let block_hash = dugite_primitives::hash::Hash32::from_bytes(*start_hash);
+        tokio::task::block_in_place(|| {
+            let db = self.chain_db.blocking_read();
+            db.find_chain_ancestor(&block_hash).map(|(slot, h, bn)| {
+                let mut hash_arr = [0u8; 32];
+                hash_arr.copy_from_slice(h.as_bytes());
+                (slot.0, hash_arr, bn.0)
+            })
+        })
+    }
+
     fn get_block_at_or_after_slot(&self, slot: u64) -> Option<(u64, [u8; 32], Vec<u8>)> {
         tokio::task::block_in_place(|| {
             let db = self.chain_db.blocking_read();
