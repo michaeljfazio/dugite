@@ -23,6 +23,7 @@
 //! | /            | Enter search mode (fuzzy filter)               |
 //! | Ctrl+D       | Show diff overlay (original vs. current)       |
 //! | Ctrl+S       | Save config to disk (creates .bak backup)      |
+//! | Ctrl+R       | Save & send SIGHUP to running node (live reload)|
 //! | q            | Quit (prompts if there are unsaved changes)    |
 //!
 //! # Two-panel layout (>=80 columns)
@@ -79,6 +80,14 @@ enum Commands {
     Edit {
         /// Path to the Cardano node configuration JSON file.
         config_file: PathBuf,
+
+        /// Path to a file containing the running dugite-node PID.
+        ///
+        /// Used by Ctrl+R ("Save & Reload") to send SIGHUP to the live node.
+        /// If this file does not exist when Ctrl+R is pressed, the config is
+        /// still saved but the SIGHUP is skipped with a clear error message.
+        #[arg(long, default_value = "./logs/bp-pair/bp.pid")]
+        node_pid_file: PathBuf,
     },
 
     /// Generate a default configuration file for the given network.
@@ -145,8 +154,11 @@ fn main() -> Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
-        Commands::Edit { config_file } => {
-            run_editor(&config_file)?;
+        Commands::Edit {
+            config_file,
+            node_pid_file,
+        } => {
+            run_editor(&config_file, &node_pid_file)?;
         }
         Commands::Init { network, out } => {
             run_init(&network, out.as_deref())?;
@@ -174,7 +186,7 @@ fn main() -> Result<()> {
 // ---------------------------------------------------------------------------
 
 /// Load `path`, set up the terminal, run the event loop, restore terminal.
-fn run_editor(path: &Path) -> Result<()> {
+fn run_editor(path: &Path, pid_file: &Path) -> Result<()> {
     let config =
         load_config(path).with_context(|| format!("loading config file '{}'", path.display()))?;
 
@@ -187,7 +199,7 @@ fn run_editor(path: &Path) -> Result<()> {
     let mut terminal = Terminal::new(backend)?;
     terminal.clear()?;
 
-    let result = run_loop(&mut terminal, &mut app);
+    let result = run_loop(&mut terminal, &mut app, pid_file);
 
     // Restore terminal unconditionally, even on error.
     let _ = disable_raw_mode();
@@ -200,7 +212,11 @@ fn run_editor(path: &Path) -> Result<()> {
 ///
 /// Renders a frame on every iteration, then waits up to 100 ms for a key
 /// event.  Returns when `app.should_quit` is set.
-fn run_loop(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App) -> Result<()> {
+fn run_loop(
+    terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
+    app: &mut App,
+    pid_file: &Path,
+) -> Result<()> {
     loop {
         // Render current state.
         terminal.draw(|frame| ui::draw(frame, app))?;
@@ -219,7 +235,7 @@ fn run_loop(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App
                 if key.kind != KeyEventKind::Press {
                     continue;
                 }
-                handle_key(app, key.code, key.modifiers);
+                handle_key(app, key.code, key.modifiers, pid_file);
             }
         }
     }
@@ -230,10 +246,16 @@ fn run_loop(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App
 // ---------------------------------------------------------------------------
 
 /// Dispatch a key press to the appropriate [`App`] action.
-fn handle_key(app: &mut App, code: KeyCode, modifiers: KeyModifiers) {
+fn handle_key(app: &mut App, code: KeyCode, modifiers: KeyModifiers, pid_file: &Path) {
     // Ctrl+S saves in any mode.
     if code == KeyCode::Char('s') && modifiers.contains(KeyModifiers::CONTROL) {
         app.save();
+        return;
+    }
+
+    // Ctrl+R saves and sends SIGHUP to the running node (live reload).
+    if code == KeyCode::Char('r') && modifiers.contains(KeyModifiers::CONTROL) {
+        app.save_and_reload(pid_file);
         return;
     }
 
