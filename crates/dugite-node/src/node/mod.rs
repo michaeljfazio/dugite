@@ -3918,6 +3918,43 @@ impl Node {
             self.update_query_state().await;
             self.last_query_state_update = std::time::Instant::now();
         }
+
+        // 4. Ledger snapshot scheduler (Bug F fix, 2026-05-16).
+        //
+        // Previously snapshots were only written by `process_forward_blocks`
+        // (the bulk-sync code path) and by graceful shutdown.  The live-tip
+        // path NEVER drove the scheduler, so on a node that came up clean
+        // (no bulk sync) and then ran at-tip indefinitely, no snapshot was
+        // ever written until shutdown.  When a deep fork-switch then needed
+        // to roll back beyond the k-block LedgerSeq window, the rollback
+        // aborted with "Rollback target outside LedgerSeq volatile window
+        // AND no canonical snapshot available" and the chain stayed stuck
+        // on its current selection until restart.
+        //
+        // The local-devnet 30-min soak hit this within ~5 minutes once the
+        // first fork that diverged > k blocks tried to switch in.
+        //
+        // The fix: drive the scheduler from this shared post-apply helper
+        // so every code path that adopts a block (live-tip apply, forge
+        // adopt, TriggeredFork replay) also gets a chance to snapshot.
+        // The scheduler's own `maybe_snapshot_check` rate-limits — most
+        // calls just bump the counter and return false.  The first call
+        // after boot (last_snapshot_epoch == None) returns true, so we
+        // always have at least an epoch-0 snapshot covering subsequent
+        // rollbacks back to that point.
+        //
+        // Lock order: this runs after the ledger_state write lock for the
+        // apply has already been released by the caller, and the save
+        // re-acquires it via `save_ledger_snapshot`.  No new contention.
+        let current_epoch = self.ledger_state.read().await.epoch;
+        let should_snapshot = self
+            .bg_snapshot_scheduler
+            .maybe_snapshot_check(current_epoch, block_number);
+        if should_snapshot {
+            self.save_ledger_snapshot().await;
+            self.bg_snapshot_scheduler
+                .record_snapshot_taken(current_epoch);
+        }
     }
 
     // ─── handle_n2c_connection() ─────────────────────────────────────────────
