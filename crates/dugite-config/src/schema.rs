@@ -641,12 +641,23 @@ pub static KNOWN_PARAMS: &[ParamDef] = &[
         param_type: ParamType::String,
         default: "",
         description: "Per-subsystem trace filter directive in tracing_subscriber EnvFilter \
-                      syntax. Example: 'info,dugite_network=trace,dugite_consensus=debug'. \
+                      syntax. Levels (low to high verbosity): error, warn, info, debug, trace \
+                      (lowercase — distinct from MinSeverity's syslog-style 'Info'/'Warning'). \
+                      A directive is a comma-separated list of '<target>=<level>' pairs, where \
+                      a bare level acts as the global default for all targets. \
+                      Examples: \
+                      'info' (global INFO); \
+                      'debug,hyper=warn' (DEBUG globally, quiet hyper); \
+                      'info,dugite_network=trace,dugite_consensus=debug' (per-subsystem); \
+                      'warn,dugite_network::chainsync=trace' (per-module within a crate); \
+                      'off,dugite_ledger=info' (silence everything except the ledger). \
                       Applied on SIGHUP without a process restart (commit 1f34ac81c). \
                       If absent, the --log-level CLI flag value remains in effect. \
                       Equivalent to the RUST_LOG environment variable for startup.",
         tuning_hint: "Edit this field and send SIGHUP to reload log verbosity at runtime \
                       without restarting the node. Useful for diagnosing live issues. \
+                      Start broad ('debug') then narrow to the noisy subsystem \
+                      ('info,dugite_network=trace') once you've located it. \
                       Leave empty to use the startup --log-level value.",
         reloadability: Reloadability::Hot,
     },
