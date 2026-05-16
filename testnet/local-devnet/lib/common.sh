@@ -4,7 +4,10 @@
 set -euo pipefail
 
 # ---- Paths ----
-LD_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+# BASH_SOURCE may be unset under zsh or when interactively sourced; fall back
+# to $0 (caller's script path) in that case. Both targets resolve to .../lib/common.sh.
+_LD_SELF="${BASH_SOURCE[0]:-$0}"
+LD_ROOT="$(cd "$(dirname "$_LD_SELF")/.." && pwd)"
 LD_STATE="$LD_ROOT/state"
 LD_LOGS="$LD_ROOT/logs"
 LD_KEYS="$LD_ROOT/keys"
