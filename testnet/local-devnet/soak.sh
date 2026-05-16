@@ -58,7 +58,31 @@ cleanup() {
 }
 trap cleanup EXIT INT TERM
 
-# Tasks 15-17 add: tip-sampler, block-recorder, tx-injector
+# ---- Tip sampler ----
+sample_tips() {
+    local out="$1"
+    while true; do
+        local now
+        now="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+        for entry in "relay:$LD_RELAY_SOCK" "dugite-bp:$LD_DUGITE_BP_SOCK" "cardano-bp:$LD_CARDANO_BP_SOCK"; do
+            name="${entry%%:*}"
+            sock="${entry##*:}"
+            line="$(query_tip_oneline "$sock" 2>/dev/null || printf '?\t?\t?\t?')"
+            slot="$(echo "$line" | awk -F'\t' '{print ($1=="" ? "?" : $1)}')"
+            blk="$(echo "$line"  | awk -F'\t' '{print ($2=="" ? "?" : $2)}')"
+            hash="$(echo "$line" | awk -F'\t' '{print ($3=="" ? "?" : $3)}')"
+            era="$(echo "$line"  | awk -F'\t' '{print ($4=="" ? "?" : $4)}')"
+            printf '%s,%s,%s,%s,%s,%s\n' "$now" "$name" "$slot" "$blk" "$hash" "$era" >> "$out"
+        done
+        sleep 5
+    done
+}
+sample_tips "$EVD/tip-samples.csv" &
+SAMPLER_PIDS+=($!)
+log_info "tip-sampler PID $!"
+
+# Task 16 adds: block-recorder
+# Task 17 adds: tx-injector
 
 END_EPOCH=$(($(date +%s) + DURATION))
 log_info "Soak end at epoch $END_EPOCH ($(date -u -r $END_EPOCH 2>/dev/null || date -u -d @$END_EPOCH))"
