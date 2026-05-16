@@ -1,0 +1,56 @@
+groups:
+  - name: dugite_node
+    rules:
+      - alert: DugiteProcessDown
+        expr: up{job=~".*dugite.*"} == 0
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Dugite node is down"
+          description: "Instance {{ $labels.instance }} has been unreachable for more than 2 minutes."
+
+      - alert: DugiteTipStale
+        expr: dugite_tip_age_seconds > 120
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Dugite tip is stale"
+          description: "Instance {{ $labels.instance }} tip age is {{ $value }}s (>120s) for >5m — node may be stalled."
+
+      - alert: DugiteHighRollbackRate
+        expr: rate(dugite_rollback_count_total[10m]) > 0.5
+        for: 0m
+        labels:
+          severity: warning
+        annotations:
+          summary: "High rollback rate on Dugite node"
+          description: "Instance {{ $labels.instance }} is rolling back at {{ $value | humanize }} rollbacks/s over the last 10m."
+
+      - alert: DugiteForgeFailureBurst
+        expr: increase(dugite_forge_failures_total[1h]) > 0
+        for: 0m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Dugite block forge failure detected"
+          description: "Instance {{ $labels.instance }} had {{ $value }} forge failure(s) in the last hour."
+
+      - alert: DugitePeersLow
+        expr: dugite_peers_hot < 3
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Dugite has fewer than 3 hot peers"
+          description: "Instance {{ $labels.instance }} has only {{ $value }} hot peer(s) for >5m — check topology and connectivity."
+
+      - alert: DugiteMemoryHigh
+        expr: dugite_mem_resident_bytes > 6 * 1024 * 1024 * 1024
+        for: 30m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Dugite process memory is high"
+          description: "Instance {{ $labels.instance }} RSS is {{ $value | humanize1024 }}B (>6 GiB) for >30m."
