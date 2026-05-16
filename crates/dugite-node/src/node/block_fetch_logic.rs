@@ -329,62 +329,58 @@ impl BlockFetchLogicTask {
         }
 
         // Read candidate chain state from all peers.
-        let chains = self.candidate_chains.read().await;
-
-        // Snapshot the local block-presence check.  Bug I fix (2026-05-16):
-        // the previous filter used `header.slot <= current_tip_slot`, which
-        // wrongly dropped peer headers at earlier slots when local and peer
-        // chains had diverged (same slot, different hash).  Replace with a
-        // hash-based check via ChainDB: skip ONLY if we already have this
-        // exact block.  ChainDB::has_block consults both VolatileDB and
-        // ImmutableDB and is O(1).
-        let chain_db_guard = if let Some(db) = self.chain_db.as_ref() {
-            Some(db.read().await)
-        } else {
-            None
+        // Snapshot all pending headers BEFORE acquiring the chain_db lock so
+        // we minimise lock contention on the hot apply-block path.
+        let raw_pending: Vec<(SocketAddr, PendingHeader)> = {
+            let chains = self.candidate_chains.read().await;
+            chains
+                .iter()
+                .filter(|(addr, _)| self.fetch_senders.contains_key(addr))
+                .flat_map(|(addr, state)| {
+                    state
+                        .pending_headers
+                        .iter()
+                        .map(move |h| (*addr, h.clone()))
+                })
+                .collect()
         };
 
-        // Collect new pending headers from all peers, filtering out already-fetched
-        // and already-in-flight blocks.
+        // Bug I (2026-05-16): use a hash-based has_block check, not the old
+        // `slot <= current_tip_slot` filter.  The slot filter wrongly dropped
+        // peer headers at earlier slots when local and peer chains had
+        // diverged (same slot, different hash), so divergent forks were
+        // never fetched and chain selection saw "fork unreachable" forever.
+        //
+        // We acquire the chain_db read lock for the briefest possible window:
+        // a single `has_block` call per pending header, then release.  No I/O
+        // inside the critical section.
         let mut new_headers: Vec<(SocketAddr, PendingHeader)> = Vec::new();
-
-        for (addr, state) in chains.iter() {
-            // Only consider peers we have a fetch channel for.
-            if !self.fetch_senders.contains_key(addr) {
-                continue;
-            }
-
-            for header in &state.pending_headers {
-                // Skip blocks we already have (by hash, regardless of slot).
-                //
-                // When chain_db is available (production), use the hash-based
-                // check so divergent forks at slots ≤ our tip are correctly
-                // identified as not-yet-fetched.  When chain_db is not
-                // available (legacy unit tests), fall back to the original
-                // slot-based check to preserve test semantics.
-                let already_have = match chain_db_guard.as_ref() {
-                    Some(db) => {
-                        let hash = dugite_primitives::hash::Hash32::from_bytes(header.hash);
-                        db.has_block(&hash)
-                    }
-                    None => header.slot <= self.current_tip_slot,
-                };
-                if already_have {
+        if let Some(db_handle) = self.chain_db.as_ref() {
+            let db = db_handle.read().await;
+            for (addr, header) in raw_pending {
+                let hash = dugite_primitives::hash::Hash32::from_bytes(header.hash);
+                if db.has_block(&hash) {
                     continue;
                 }
-
-                // Skip blocks already in-flight.
                 if self.in_flight.contains_key(&header.hash) {
                     continue;
                 }
-
-                new_headers.push((*addr, header.clone()));
+                new_headers.push((addr, header));
+            }
+            // Lock dropped at end of scope.
+        } else {
+            // Legacy unit-test path (no ChainDB available): fall back to the
+            // slot-based check that preserved the original test fixtures.
+            for (addr, header) in raw_pending {
+                if header.slot <= self.current_tip_slot {
+                    continue;
+                }
+                if self.in_flight.contains_key(&header.hash) {
+                    continue;
+                }
+                new_headers.push((addr, header));
             }
         }
-
-        // Release the read locks before doing I/O.
-        drop(chain_db_guard);
-        drop(chains);
 
         if new_headers.is_empty() {
             return;
