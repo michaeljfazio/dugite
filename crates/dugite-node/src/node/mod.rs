@@ -3467,6 +3467,14 @@ impl Node {
                     } else {
                         BlockValidationMode::ApplyOnly
                     };
+                    // Captures the last successfully-applied fork block so we
+                    // can refresh post-apply state (N2C snapshot etc.) once
+                    // after the loop without re-reading + re-decoding the CBOR.
+                    let mut last_applied: Option<(
+                        dugite_primitives::block::Block,
+                        dugite_primitives::time::SlotNo,
+                        dugite_primitives::time::BlockNo,
+                    )> = None;
                     for fork_hash in &apply {
                         let cbor_opt = {
                             let db = self.chain_db.read().await;
@@ -3578,6 +3586,11 @@ impl Node {
                                                 block_number: fork_block_no.0,
                                             });
                                         }
+                                        // Stash this block as the most recent
+                                        // successful apply.  Subsequent
+                                        // iterations overwrite; only the
+                                        // final value is consumed below.
+                                        last_applied = Some((fork_block, fork_slot, fork_block_no));
                                     }
                                     Err(e) => {
                                         warn!(
@@ -3602,24 +3615,15 @@ impl Node {
                     // Prometheus reflecting intermediate progress; this call
                     // ensures the N2C NodeStateSnapshot also refreshes (which
                     // the loop did NOT do).
-                    if let Some(last_hash) = apply.last() {
-                        let last_cbor = {
-                            let db = self.chain_db.read().await;
-                            db.get_block(last_hash).unwrap_or(None)
-                        };
-                        if let Some(cbor) = last_cbor {
-                            if let Ok(last_block) =
-                                dugite_serialization::multi_era::decode_block_minimal_with_byron_epoch_length(
-                                    &cbor,
-                                    self.byron_epoch_length,
-                                )
-                            {
-                                let last_slot = last_block.slot();
-                                let last_bn = last_block.block_number();
-                                self.post_block_apply_updates(&last_block, last_slot, last_bn)
-                                    .await;
-                            }
-                        }
+                    //
+                    // Calling `post_block_apply_updates` once per replay (NOT
+                    // inside the loop) keeps the helper's 1 Hz rate limiter
+                    // on `update_query_state` effective — repeated calls
+                    // inside the loop would each see `elapsed() >= 1s` after
+                    // the second iteration and storm the snapshot rebuild.
+                    if let Some((last_block, last_slot, last_bn)) = last_applied.take() {
+                        self.post_block_apply_updates(&last_block, last_slot, last_bn)
+                            .await;
                     }
                     fork_replayed = true;
                     true
