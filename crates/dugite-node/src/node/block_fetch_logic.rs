@@ -40,11 +40,20 @@ use dugite_network::{BlockFetchClient, MuxChannel};
 
 use super::connection_lifecycle::{CandidateChainState, FetchedBlock, PendingHeader};
 
-/// Default decision interval for Praos consensus (10ms).
+/// Default decision interval for Praos consensus (100ms).
+///
+/// Haskell's `blockFetchDecisionLoopInterval` is STM-reactive — it wakes on
+/// candidate-chain state changes and the 10ms constant there is just a poll
+/// floor.  Our implementation is purely timer-driven; running it at 10ms
+/// burns ~5-10% CPU on a 50-hot-peer at-tip node just acquiring the
+/// candidate-chains read lock and iterating empty `pending_headers`.  100ms
+/// is well below any realistic per-peer fetch latency and has no observable
+/// throughput impact during bulk sync (RTT to public preview peers
+/// dominates).
 ///
 /// Matches Haskell's `blockFetchDecisionLoopInterval` for Praos.
 /// Genesis mode uses 40ms instead.
-const PRAOS_DECISION_INTERVAL: Duration = Duration::from_millis(10);
+const PRAOS_DECISION_INTERVAL: Duration = Duration::from_millis(100);
 
 /// Default decision interval for Genesis consensus (40ms).
 ///

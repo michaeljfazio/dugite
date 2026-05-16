@@ -9,12 +9,13 @@
   "NetworkMagic": 2,
   "ShelleyGenesisFile": "preview-shelley-genesis.json",
   "ShelleyGenesisHash": "363498d1024f84bb39d3fa9593ce391483cb40d479b87233f868d6e57c3a400d",
-  "TargetNumberOfActiveBigLedgerPeers": 10,
-  "TargetNumberOfActivePeers": 50,
-  "TargetNumberOfEstablishedBigLedgerPeers": 15,
-  "TargetNumberOfEstablishedPeers": 100,
-  "TargetNumberOfKnownBigLedgerPeers": 25,
-  "TargetNumberOfKnownPeers": 250,
-  "TargetNumberOfRootPeers": 100,
-  "ExperimentalHardForksEnabled": true
+  "TargetNumberOfActiveBigLedgerPeers": 5,
+  "TargetNumberOfActivePeers": 15,
+  "TargetNumberOfEstablishedBigLedgerPeers": 10,
+  "TargetNumberOfEstablishedPeers": 30,
+  "TargetNumberOfKnownBigLedgerPeers": 15,
+  "TargetNumberOfKnownPeers": 85,
+  "TargetNumberOfRootPeers": 60,
+  "ExperimentalHardForksEnabled": true,
+  "LogDirective": "info"
 }
