@@ -168,11 +168,17 @@ p4_tip_parity() {
     local tips="$1"
     [ -s "$tips" ] || { PREDICATE_FAIL+=("p4:no-data"); return; }
 
-    # Compute per-tick parity using awk over (relay, cardano-bp) only.
+    # Compute per-tick parity using awk across ALL three observers.
+    #
+    # NOTE: Prior to the 2026-05-16 tip-query staleness fix
+    # (docs/superpowers/specs/2026-05-16-tip-query-staleness-fix.md), this
+    # predicate excluded dugite-bp because its `cardano-cli query tip`
+    # snapshot was frozen at the last peer-adopted block — never advancing
+    # on own-forge.  That bug is fixed; the exclusion is removed.  All three
+    # observers must agree within 2 blocks per tick.
     local result
     result=$(awk -F, '
         NR == 1 { next }   # skip header
-        $2 == "dugite-bp" { next }   # exclude dugite-bp (pre-existing N2C bug)
         $4 == "?" || $4 == "" { next }   # skip rows lacking block_no
         {
             block[$1, $2] = $4 + 0
@@ -181,11 +187,17 @@ p4_tip_parity() {
         END {
             for (t in seen) {
                 if ((t SUBSEP "relay") in block \
-                 && (t SUBSEP "cardano-bp") in block) {
+                 && (t SUBSEP "cardano-bp") in block \
+                 && (t SUBSEP "dugite-bp") in block) {
                     r = block[t, "relay"]
                     c = block[t, "cardano-bp"]
-                    mn = (r < c ? r : c)
-                    mx = (r > c ? r : c)
+                    d = block[t, "dugite-bp"]
+                    mn = r
+                    if (c < mn) mn = c
+                    if (d < mn) mn = d
+                    mx = r
+                    if (c > mx) mx = c
+                    if (d > mx) mx = d
                     total++
                     if (mx - mn <= 2) in_parity++
                 }
@@ -205,7 +217,7 @@ p4_tip_parity() {
     fi
 
     local pct=$(( in_parity * 100 / total ))
-    local note="(excluding dugite-bp due to pre-existing N2C bug; relay+cardano-bp $in_parity/$total in-parity = ${pct}%)"
+    local note="($in_parity/$total ticks in-parity = ${pct}% across all 3 observers)"
     if [ "$pct" -ge 95 ]; then
         PREDICATE_PASS+=("p4:tip-parity $note")
     else
