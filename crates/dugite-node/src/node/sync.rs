@@ -2999,6 +2999,28 @@ pub async fn chainsync_client_task(
         }
     }
 
+    // Bug A fix: disconnect when intersection lands at Origin with non-Origin
+    // local ledger tip. An Origin anchor is degenerate for VolatileDB-based
+    // chain selection: `switch_chain` requires a shared volatile block (Haskell
+    // `isReachable` invariant), and Origin is not in volatile storage. The
+    // result is `StoreButDontChange` for every peer block, leaving the node
+    // permanently stuck on its own fork. Mirrors Haskell `terminateAfterDrain`
+    // / `NoLongerIntersects`. The peer manager will reconnect after backoff;
+    // by then the peer has typically advanced and offers a real intersection.
+    // See: docs/superpowers/specs/2026-05-16-bug-a-stale-intersection-fix.md
+    if matches!(intersection, Some(CodecPoint::Origin)) && ledger_tip != Point::Origin {
+        warn!(
+            %peer_addr,
+            local_ledger_tip = %ledger_tip,
+            "ChainSync intersection at Origin with non-Origin local chain — \
+             disconnecting to retry after peer catches up"
+        );
+        return Err(anyhow::anyhow!(
+            "Peer {peer_addr} intersection at Origin with non-Origin local \
+             ledger tip; disconnecting to retry after peer catches up"
+        ));
+    }
+
     // Initialize candidate chain state for this peer.
     let intersection_slot = intersection
         .as_ref()
