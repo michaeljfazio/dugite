@@ -46,7 +46,39 @@ p1_forge_cross_check() {
         PREDICATE_FAIL+=("p1:forge-cross-check ($fails/$total blocks missing observers; example: $fail_examples)")
     fi
 }
-p2_per_bp_attribution() { :; }  # Filled in by Task 20
+# Predicate 2: both pools must have forged >=3 blocks
+p2_per_bp_attribution() {
+    local blocks="$1"
+    [ -s "$blocks" ] || { PREDICATE_FAIL+=("p2:no-data"); return; }
+
+    local pool1_vkey="" pool2_vkey=""
+    if [ -f "$LD_KEYS/pool1/cold.vkey" ]; then
+        pool1_vkey=$(jq -r '.cborHex' "$LD_KEYS/pool1/cold.vkey" 2>/dev/null \
+            | tail -c +5 | head -c 64 || echo "")
+    fi
+    if [ -f "$LD_KEYS/pool2/cold.vkey" ]; then
+        pool2_vkey=$(jq -r '.cborHex' "$LD_KEYS/pool2/cold.vkey" 2>/dev/null \
+            | tail -c +5 | head -c 64 || echo "")
+    fi
+
+    # If we don't have keys (running on test fixtures), match against literal POOL1/POOL2 strings
+    if [ -z "$pool1_vkey" ]; then pool1_vkey="POOL1"; fi
+    if [ -z "$pool2_vkey" ]; then pool2_vkey="POOL2"; fi
+
+    local p1_forges p2_forges
+    p1_forges=$(awk -F, -v k="$pool1_vkey" '$3=="forge" && $6==k' "$blocks" | wc -l | tr -d ' ')
+    p2_forges=$(awk -F, -v k="$pool2_vkey" '$3=="forge" && $6==k' "$blocks" | wc -l | tr -d ' ')
+
+    if [ "$p1_forges" -ge 3 ] && [ "$p2_forges" -ge 3 ]; then
+        PREDICATE_PASS+=("p2:per-bp-attribution (pool1=$p1_forges pool2=$p2_forges)")
+        {
+            printf 'pool1_forges\t%s\n' "$p1_forges"
+            printf 'pool2_forges\t%s\n' "$p2_forges"
+        } > "$(dirname "$blocks")/forge-attribution.tsv"
+    else
+        PREDICATE_FAIL+=("p2:per-bp-attribution (pool1=$p1_forges pool2=$p2_forges; need >=3 each)")
+    fi
+}
 p3_tx_inclusion()      { :; }   # Filled in by Task 21
 p4_tip_parity()        { :; }   # Filled in by Task 22
 
@@ -70,6 +102,29 @@ self_test() {
     [ ${#PREDICATE_FAIL[@]} -gt 0 ] && [ ${#PREDICATE_PASS[@]} -eq 0 ] \
         || die "p1 self-test on bad fixture: expected FAIL, got ${PREDICATE_PASS[*]:-}"
     log_info "  OK"
+
+    # For p2 self-test: force vkey fallback to literal POOL1/POOL2 by pointing
+    # LD_KEYS at a non-existent path so cold.vkey lookups fail.
+    local saved_ld_keys="$LD_KEYS"
+    LD_KEYS="$fix/_nonexistent_keys"
+
+    log_info "p2 - good fixture (expect PASS)"
+    PREDICATE_PASS=(); PREDICATE_FAIL=()
+    p2_per_bp_attribution "$fix/predicate-2-good.csv"
+    [ ${#PREDICATE_PASS[@]} -gt 0 ] && [ ${#PREDICATE_FAIL[@]} -eq 0 ] \
+        || { LD_KEYS="$saved_ld_keys"; die "p2 self-test good: expected PASS, got ${PREDICATE_FAIL[*]:-}"; }
+    log_info "  OK"
+
+    log_info "p2 - bad fixture (expect FAIL)"
+    PREDICATE_PASS=(); PREDICATE_FAIL=()
+    p2_per_bp_attribution "$fix/predicate-2-bad.csv"
+    [ ${#PREDICATE_FAIL[@]} -gt 0 ] && [ ${#PREDICATE_PASS[@]} -eq 0 ] \
+        || { LD_KEYS="$saved_ld_keys"; die "p2 self-test bad: expected FAIL, got ${PREDICATE_PASS[*]:-}"; }
+    log_info "  OK"
+
+    LD_KEYS="$saved_ld_keys"
+    # Clean up artifact written by p2 on the good fixture
+    rm -f "$fix/forge-attribution.tsv"
 
     PREDICATE_PASS=("${saved_pass[@]:+${saved_pass[@]}}"); PREDICATE_FAIL=("${saved_fail[@]:+${saved_fail[@]}}")
     log_info "Self-test complete."
