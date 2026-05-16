@@ -151,3 +151,21 @@ This alternative is slightly simpler — no signature change to `try_find_inters
 - **Masking real issues:** If a peer is permanently at genesis (misconfigured, bad DB), we will repeatedly reconnect. The peer manager's failure-count decay and reputation scoring will demote such a peer to cold after ~5-10 failures, matching normal Haskell handling of non-responsive peers.
 - **Local testnet edge case (both BPs at genesis):** In the very first seconds of a fresh local testnet, BOTH nodes may be at genesis simultaneously. The guard fires on both sides, both disconnect, then both retry. This is a brief ordering race (seconds) and self-resolves once either node receives a block. Not a correctness issue.
 - **Mithril import:** After a Mithril snapshot import, the local ledger tip is far ahead of origin. If the sync peer happens to be behind the Mithril tip on first connection, the guard fires, peer disconnects, and on reconnect the peer has typically advanced. This is the intended behavior and matches what Haskell does on restart with a dense ImmutableDB.
+
+---
+
+## Refinement: Bug E (commit `94f85b781`, 2026-05-16)
+
+The original Bug A fix assumed the peer manager would automatically reconnect after the disconnect (per the "Why This Is Minimal and Correct" section above). That assumption held for OUTBOUND connections but **not for inbound-only connections**: when the relay accepts an inbound socket from a freshly-started dugite-bp and the relay's chainsync-to-dbp task dies via the Bug A guard at second 1 of the soak, no supervisor re-spawns the chainsync task. The inbound socket stays up, dbp continues to pull blocks from the relay's chainsync server, but the relay never sees a single header from dbp for the rest of the run.
+
+This was Bug E. It only surfaced on the new local-devnet because that's the first dugite test setup in which a relay accepts a Bug A-triggering inbound connection.
+
+The refinement (`crates/dugite-node/src/node/sync.rs`, line ~3022 after the patch): the guard now disconnects only when `local_block_no > security_param`. For chains within `k` blocks of genesis, the volatile window can absorb a full-genesis rollback if the peer's chain eventually wins — so accepting Origin and letting `process_add_block` adopt the peer's blocks via Bug D's Praos tiebreaker is the correct behavior. For chains beyond `k` (mainnet post-sync, a Mithril-imported relay, etc.), the disconnect-and-retry semantics are preserved.
+
+This is the architecturally correct fix because:
+
+- The original Bug A scenario was a symptom of Bug B (LedgerSeq empty → rollback fails → clear_volatile cascade). With Bug B fixed (`59a5fc64d`) and Bug D's Praos tiebreaker landed (`92052eb6c`), the "accept Origin and let RollForward proceed" path is now safe at small chain depths.
+- The `k = security_param` threshold maps directly to the VolatileDB's volatile window: any required rollback fits if and only if local depth ≤ k.
+- All 674 dugite-node tests pass after the change; no regression on the Bug A unit test (it was never written — the spec's test-strategy was aspirational; the local-devnet soak now exercises both branches of the refined guard).
+
+The Risks section above is unchanged in scope: the "Reconnect storm" / "Masking real issues" / "Mithril import" cases still apply when the guard fires (i.e., when `local_block_no > k`). The new behavior — accepting Origin within `k` — is strictly safer than the previous always-disconnect rule and brings dugite closer to Haskell's actual chain-sync semantics (Haskell never disconnects on Origin; it just rolls forward).
