@@ -45,9 +45,10 @@ rm -f "$LD_STATE"/*.pid "$LD_STATE"/*.sock
 # intersection lands at a real point.
 
 # ---- dugite-relay ----
-# Note: --no-metrics on both dugite processes — otherwise they both try to bind
-# the default Prometheus port (12798) and the second one fails to start.
-log_info "Starting dugite-relay on port $LD_RELAY_PORT"
+# Both dugite processes export Prometheus metrics. The BP uses the default port
+# 12798 (so dugite-monitor's default endpoint works without overrides); the
+# relay gets 12799 to avoid the listener collision.
+log_info "Starting dugite-relay on port $LD_RELAY_PORT (metrics $LD_DUGITE_RELAY_METRICS_PORT)"
 caffeinate_if_macos "$DUGITE_BIN" run \
     --config        "$LD_CONFIG/dugite-relay.config.json" \
     --topology      "$LD_CONFIG/dugite-relay.topology.json" \
@@ -55,7 +56,7 @@ caffeinate_if_macos "$DUGITE_BIN" run \
     --socket-path   "$LD_RELAY_SOCK" \
     --host-addr     127.0.0.1 \
     --port          "$LD_RELAY_PORT" \
-    --no-metrics \
+    --metrics-port  "$LD_DUGITE_RELAY_METRICS_PORT" \
     > "$LD_LOGS/dugite-relay.log" 2>&1 &
 echo $! > "$LD_STATE/dugite-relay.pid"
 log_info "dugite-relay PID $(cat "$LD_STATE/dugite-relay.pid")"
@@ -110,7 +111,8 @@ if [ "$i" -ge "$STAGGER_TIMEOUT" ]; then
 fi
 
 # ---- dugite-bp ----
-log_info "Starting dugite-bp on port $LD_DUGITE_BP_PORT (pool1)"
+# Metrics on default port 12798 so `dugite-monitor` works without overrides.
+log_info "Starting dugite-bp on port $LD_DUGITE_BP_PORT (pool1, metrics $LD_DUGITE_BP_METRICS_PORT)"
 caffeinate_if_macos "$DUGITE_BIN" run \
     --config        "$LD_CONFIG/dugite-bp.config.json" \
     --topology      "$LD_CONFIG/dugite-bp.topology.json" \
@@ -118,7 +120,7 @@ caffeinate_if_macos "$DUGITE_BIN" run \
     --socket-path   "$LD_DUGITE_BP_SOCK" \
     --host-addr     127.0.0.1 \
     --port          "$LD_DUGITE_BP_PORT" \
-    --no-metrics \
+    --metrics-port  "$LD_DUGITE_BP_METRICS_PORT" \
     --shelley-kes-key                 "$LD_KEYS/pool1/kes.skey" \
     --shelley-vrf-key                 "$LD_KEYS/pool1/vrf.skey" \
     --shelley-operational-certificate "$LD_KEYS/pool1/opcert.cert" \

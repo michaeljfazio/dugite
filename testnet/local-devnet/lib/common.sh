@@ -17,9 +17,17 @@ LD_EVIDENCE="$LD_ROOT/evidence"
 
 # ---- Constants ----
 LD_MAGIC=42
-LD_RELAY_PORT=30000
-LD_DUGITE_BP_PORT=30001
-LD_CARDANO_BP_PORT=30003
+# N2N ports — single-digit-incremented from the standard Cardano BP port so
+# they are easy to remember. dugite-bp keeps 3001 (Cardano default) so that
+# `dugite-monitor` and `cardano-cli` connect without overrides.
+LD_DUGITE_BP_PORT=3001
+LD_RELAY_PORT=3002
+LD_CARDANO_BP_PORT=3003
+# Prometheus metrics ports — single-digit-incremented from 12798 (the
+# dugite-monitor default). dugite-bp keeps 12798. The relay gets 12799 to
+# avoid the two dugite processes fighting for the same listener.
+LD_DUGITE_BP_METRICS_PORT=12798
+LD_DUGITE_RELAY_METRICS_PORT=12799
 # Unix-domain socket paths.
 #
 # macOS imposes a 104-byte SUN_LEN limit on sun_path; both the worktree path
