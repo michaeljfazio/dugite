@@ -14,6 +14,10 @@ fullnameOverride: ""
 # -- Number of replicas (typically 1 per node)
 replicaCount: 1
 
+# -- Unix socket path for N2C (local client) connections.
+# Exposed inside the pod via the /ipc emptyDir volume.
+socketPath: /ipc/node.sock
+
 # -- Cardano network configuration
 network:
   # -- Network name: mainnet, preview, or preprod
@@ -123,15 +127,19 @@ persistence:
   # -- Storage class (use "-" for default)
   storageClass: ""
   accessMode: ReadWriteOnce
+  # -- Preview snapshot: ~16 GiB; preprod: ~50 GiB; mainnet: 150+ GiB.
+  # Resize before deploying to mainnet — 100 GiB is a safe mainnet minimum.
   size: 100Gi
   # -- Existing PVC to use
   existingClaim: ""
 
-# -- Resource requests and limits
+# -- Resource requests and limits.
+# Soak-test RSS on preview testnet: ~2.6 GiB.  Mainnet steady-state: ~8-10 GiB.
+# Increase requests/limits accordingly when deploying to mainnet.
 resources:
   requests:
     cpu: "1"
-    memory: 4Gi
+    memory: 3Gi
   limits:
     cpu: "4"
     memory: 16Gi
@@ -162,6 +170,14 @@ securityContext:
     drop:
       - ALL
 
+# -- NetworkPolicy for the block producer.
+# When enabled (producer role only), restricts inbound N2N connections to
+# pods labelled app.kubernetes.io/component=relay in the same namespace.
+# Egress is left unrestricted so the BP can reach its relay(s).
+# Set to false if your cluster does not run a NetworkPolicy controller.
+networkPolicy:
+  enabled: true
+
 # -- Service configuration
 service:
   type: ClusterIP
@@ -180,20 +196,25 @@ podAnnotations: {}
 # -- Pod labels
 podLabels: {}
 
-# -- Liveness probe
+# -- Liveness probe.
+# Uses the dedicated /live endpoint (separate from /metrics).
+# /live returns 503 when no block has been applied within liveness_threshold_secs (default 600s).
+# Probes are automatically disabled when metrics.enabled=false.
 livenessProbe:
   httpGet:
-    path: /metrics
+    path: /live
     port: metrics
-  initialDelaySeconds: 60
+  initialDelaySeconds: 120
   periodSeconds: 30
   timeoutSeconds: 5
   failureThreshold: 5
 
-# -- Readiness probe
+# -- Readiness probe.
+# Uses /health — returns 200 once the node is past initial startup.
+# Probes are automatically disabled when metrics.enabled=false.
 readinessProbe:
   httpGet:
-    path: /metrics
+    path: /health
     port: metrics
   initialDelaySeconds: 30
   periodSeconds: 10

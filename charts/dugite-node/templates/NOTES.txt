@@ -28,7 +28,9 @@ Dugite Node deployed as {{ .Values.role }} on {{ .Values.network.name }}!
 {{- end }}
 
   Get the node status:
-    kubectl exec -it deploy/{{ include "dugite-node.fullname" . }} -- dugite-cli query tip --testnet-magic {{ include "dugite-node.networkMagic" . }}
+    kubectl exec -it deploy/{{ include "dugite-node.fullname" . }} -- dugite-cli query tip \
+      {{ if eq .Values.network.name "mainnet" }}--mainnet{{ else }}--testnet-magic {{ include "dugite-node.networkMagic" . }}{{ end }} \
+      --socket-path {{ .Values.socketPath | default "/ipc/node.sock" }}
 
   View logs:
     kubectl logs -f deploy/{{ include "dugite-node.fullname" . }}
