@@ -16304,3 +16304,159 @@ fn test_from_haskell_snapshot_restores_live_pparams_issue_335() {
         Lovelace(340_000_000)
     );
 }
+
+// ────────────────────────────────────────────────────────────────────────────
+// Issue #485 P0 — Constitutional Committee membership must be loaded from the
+// Haskell ledger snapshot's `cgsCommittee` field, not just the genesis seeds.
+//
+// On a Mithril-imported preview node, `cardano-cli query committee-state`
+// returned 1 of 8 elected members because the snapshot loader parsed the
+// committee bytes into `HaskellGovState::committee_raw` but never decoded
+// them into `gov.committee_expiration` / `gov.committee_threshold`.  This
+// test injects a synthetic committee blob (2 members, threshold 2/3) and
+// verifies the loader populates both the canonical membership map and the
+// threshold from the snapshot rather than leaving them empty.
+// ────────────────────────────────────────────────────────────────────────────
+#[test]
+fn test_from_haskell_snapshot_populates_committee_expiration_issue_485() {
+    use dugite_primitives::transaction::Rational;
+
+    // Synthetic Committee CBOR: 1 KeyHash + 1 ScriptHash, threshold 2/3.
+    let mut committee_raw: Vec<u8> = Vec::new();
+    committee_raw.push(0x82); // array(2)
+    committee_raw.push(0xa2); // map(2)
+                              // member 1: array(2)[0 (KeyHash), bytes(28)=0xa1..]
+    committee_raw.extend_from_slice(&[0x82, 0x00, 0x58, 0x1c]);
+    committee_raw.extend(std::iter::repeat_n(0xa1u8, 28));
+    committee_raw.extend_from_slice(&[0x19, 0x03, 0xef]); // expiry 1007
+                                                          // member 2: array(2)[1 (ScriptHash), bytes(28)=0xb2..]
+    committee_raw.extend_from_slice(&[0x82, 0x01, 0x58, 0x1c]);
+    committee_raw.extend(std::iter::repeat_n(0xb2u8, 28));
+    committee_raw.extend_from_slice(&[0x19, 0x05, 0x4c]); // expiry 1356
+                                                          // threshold: tag(30) array(2) [2, 3]
+    committee_raw.extend_from_slice(&[0xd8, 0x1e, 0x82, 0x02, 0x03]);
+
+    let cur = ProtocolParameters::mainnet_defaults();
+    let prev = ProtocolParameters::mainnet_defaults();
+    let mut hs = dugite_serialization::haskell_snapshot::minimal_haskell_state_for_test(
+        cur.clone(),
+        prev.clone(),
+    );
+    hs.new_epoch_state.gov_state.committee_raw = Some(committee_raw);
+
+    let state = LedgerState::from_haskell_snapshot(&hs);
+    let gov = &state.gov.governance;
+
+    // Canonical membership map — the field that backs `query committee-state`.
+    assert_eq!(
+        gov.committee_expiration.len(),
+        2,
+        "committee_expiration must be populated from snapshot's committee_raw, \
+         not left empty"
+    );
+
+    // Threshold must come from the snapshot, not stay at the dugite default.
+    assert_eq!(
+        gov.committee_threshold.as_ref(),
+        Some(&Rational {
+            numerator: 2,
+            denominator: 3,
+        }),
+        "committee_threshold must be populated from snapshot"
+    );
+
+    // Script-typed cold credential must be tracked so the N2C query reports
+    // the correct credential type for the ScriptHash member.
+    assert_eq!(
+        gov.script_committee_credentials.len(),
+        1,
+        "exactly one cold credential is script-typed in the fixture"
+    );
+}
+
+// ────────────────────────────────────────────────────────────────────────────
+// Issue #485 P0 — live verification: load a real preview Mithril
+// ExtLedgerState (~16 MB) through the full `from_haskell_snapshot`
+// pipeline and assert all 8 elected committee members land in
+// `committee_expiration` with the correct threshold.
+//
+// This is the highest-fidelity test we have short of running a node:
+// the file is real cardano-node 11.0.1 binary output, decoded by the
+// real `decode_state_file` → `from_haskell_snapshot` path the production
+// node uses on Mithril import.
+//
+// `#[ignore]` because it requires a ~16 MB file that is not committed
+// to git.  Capture by doing one Mithril import and copying
+// `db-preview-*/haskell-ledger/<slot>/state` to a path of your choosing,
+// then run:
+//
+//     DUGITE_PREVIEW_LEDGER_STATE=/tmp/preview_state_fresh.bin \
+//       cargo nextest run -p dugite-ledger \
+//       -E 'test(test_from_haskell_snapshot_live_preview_committee_issue_485)' \
+//       --run-ignored only
+// ────────────────────────────────────────────────────────────────────────────
+#[test]
+#[ignore = "requires preview Mithril ExtLedgerState file — set DUGITE_PREVIEW_LEDGER_STATE"]
+fn test_from_haskell_snapshot_live_preview_committee_issue_485() {
+    let Ok(path) = std::env::var("DUGITE_PREVIEW_LEDGER_STATE") else {
+        panic!(
+            "DUGITE_PREVIEW_LEDGER_STATE env var must point at a preview \
+             Mithril-imported ExtLedgerState binary"
+        );
+    };
+    let data = std::fs::read(&path).expect("read preview ExtLedgerState fixture");
+    let hs = dugite_serialization::haskell_snapshot::decode_state_file(&data)
+        .expect("decode ExtLedgerState");
+    let state = LedgerState::from_haskell_snapshot(&hs);
+
+    eprintln!(
+        "loaded epoch={} tip_slot={:?} committee_expiration.len()={} threshold={:?} \
+         script_committee_credentials.len()={}",
+        state.epoch.0,
+        state.tip.point.slot().map(|s| s.0),
+        state.gov.governance.committee_expiration.len(),
+        state.gov.governance.committee_threshold,
+        state.gov.governance.script_committee_credentials.len(),
+    );
+
+    // 8 committee members elected on preview (UpdateCommittee tx ac99…dd4
+    // proposed epoch 1011, enacted by epoch 1042).  Without the #485 fix,
+    // only the Conway-genesis seed (1 member) was loaded.
+    assert_eq!(
+        state.gov.governance.committee_expiration.len(),
+        8,
+        "preview ExtLedgerState must land all 8 committee members"
+    );
+
+    let threshold = state
+        .gov
+        .governance
+        .committee_threshold
+        .as_ref()
+        .expect("committee_threshold must be Some after snapshot load");
+    assert_eq!(
+        (threshold.numerator, threshold.denominator),
+        (2, 3),
+        "preview committee threshold is 2/3"
+    );
+
+    // All 8 preview cold credentials are script-typed (cc_cold_has_script=true).
+    assert_eq!(
+        state.gov.governance.script_committee_credentials.len(),
+        8,
+        "all 8 preview cold credentials are script-typed"
+    );
+
+    // Specifically: the genesis script member's expiry must survive.
+    let genesis_cold = Hash28::from_hex("ff9babf23fef3f54ec29132c07a8e23807d7b395b143ecd8ff79f4c7")
+        .expect("valid hex");
+    let genesis_h32 = haskell_credential_to_hash32(1, &genesis_cold);
+    assert!(
+        state
+            .gov
+            .governance
+            .committee_expiration
+            .contains_key(&genesis_h32),
+        "genesis member ff9babf2… must remain in committee_expiration"
+    );
+}

@@ -1,7 +1,7 @@
 use super::cbor_utils::*;
 use super::certstate::decode_certstate;
 use super::decode_state_file;
-use super::govstate::decode_govstate;
+use super::govstate::{decode_committee, decode_govstate};
 use super::pparams::decode_pparams;
 use super::praos::decode_praos_state;
 use super::snapshots::decode_snapshots;
@@ -812,6 +812,60 @@ fn test_decode_govstate() {
         "committee_raw must be non-empty"
     );
 
+    // ── decode committee_raw and cross-check against Koios ──────────────────
+    // Every value asserted here is cross-verified against Koios
+    // `committee_info` for preview at epoch 1259 (gov_action14jvny… enacted
+    // in epoch 1011-1042; no further UpdateCommittee actions between then
+    // and the fixture epoch).  This is the end-to-end byte-level regression
+    // for issue #485 (P0).
+    let committee_bytes = gov.committee_raw.as_ref().unwrap();
+    let (committee, consumed) = decode_committee(committee_bytes)
+        .expect("decode_committee must succeed on real preview snapshot bytes");
+    assert_eq!(
+        consumed,
+        committee_bytes.len(),
+        "decode_committee must consume the entire committee_raw blob"
+    );
+    assert_eq!(
+        committee.members.len(),
+        8,
+        "preview epoch 1259 has 8 committee members per Koios committee_info"
+    );
+    assert_eq!(
+        committee.threshold,
+        (2, 3),
+        "preview committee threshold is 2/3"
+    );
+    // Spot-check three expected cold credentials (all script-typed per Koios:
+    // cc_cold_has_script=true for all 8 members).  Sorted lookup so the test
+    // is robust to CBOR map iteration order.
+    let by_hash: std::collections::HashMap<_, _> = committee
+        .members
+        .iter()
+        .map(|((tag, hash), expiry)| (hex::encode(hash.as_bytes()), (*tag, *expiry)))
+        .collect();
+    assert_eq!(
+        by_hash
+            .get("ff9babf23fef3f54ec29132c07a8e23807d7b395b143ecd8ff79f4c7")
+            .copied(),
+        Some((1, 1000)),
+        "genesis member ff9babf2… is ScriptHash, expiry epoch 1000"
+    );
+    assert_eq!(
+        by_hash
+            .get("01a3c5b09f4b915a2f7f865daa1b601cd2b7c55c33fa616d11a9a9d2")
+            .copied(),
+        Some((1, 1007)),
+        "added member 01a3c5b0… is ScriptHash, expiry epoch 1007"
+    );
+    assert_eq!(
+        by_hash
+            .get("6a0cd9563908692460413e08bef26eda0265ec23868fd1560d5cd42f")
+            .copied(),
+        Some((1, 1356)),
+        "added member 6a0cd956… is ScriptHash, expiry epoch 1356"
+    );
+
     // ── constitution ─────────────────────────────────────────────────────────
     let constitution = gov
         .constitution
@@ -850,6 +904,35 @@ fn test_decode_govstate() {
         gov.future_pparams.is_none(),
         "futurePParams value must be None (SNothing)"
     );
+}
+
+// ── decode_state_file diagnostic ─────────────────────────────────────────────
+
+/// Diagnostic: decode an arbitrary on-disk ExtLedgerState pointed to by the
+/// `DUGITE_DIAG_STATE_FILE` env var and report whether the decoder accepts
+/// it.  Used during investigation of decode_state_file failures on the
+/// current preview snapshot format.
+#[test]
+#[ignore = "diagnostic — set DUGITE_DIAG_STATE_FILE to an on-disk state binary"]
+fn test_diag_decode_state_file() {
+    let Ok(path) = std::env::var("DUGITE_DIAG_STATE_FILE") else {
+        panic!("DUGITE_DIAG_STATE_FILE env var must be set");
+    };
+    let data = std::fs::read(&path).expect("read state file");
+    eprintln!(
+        "DIAG file_size={} first_bytes={:02x?}",
+        data.len(),
+        &data[..32]
+    );
+    match decode_state_file(&data) {
+        Ok(s) => {
+            eprintln!(
+                "DIAG decoded OK epoch={} tip_slot={} tip_block_no={}",
+                s.epoch.0, s.tip_slot.0, s.tip_block_no
+            );
+        }
+        Err(e) => panic!("DIAG decode failed: {}", e),
+    }
 }
 
 // ── decode_state_file (full ExtLedgerState) ───────────────────────────────────
@@ -1026,4 +1109,51 @@ fn test_decode_full_state_file() {
     assert!(state.new_epoch_state.deposited > 0, "deposited must be > 0");
     // fees can be zero at epoch boundary, but deposited should always be > 0
     // on an active testnet.
+}
+
+// ── decode_committee ──────────────────────────────────────────────────────────
+
+/// Decodes a hand-built `Committee era` value containing two members and a
+/// 2/3 threshold.  This isolates the decoder's structural correctness without
+/// depending on a full snapshot fixture.
+///
+/// Wire format:
+///   array(2) [
+///     map(2) {
+///       array(2)[0, bytes(28) = 0xa1*28] => uint(1007),
+///       array(2)[1, bytes(28) = 0xb2*28] => uint(1356),
+///     },
+///     tag(30) array(2) [2, 3],
+///   ]
+#[test]
+fn test_decode_committee_two_members_and_threshold() {
+    // outer array(2), map(2), then member 1: array(2)[0 KeyHash, bytes(28)]
+    let mut data: Vec<u8> = vec![0x82, 0xa2, 0x82, 0x00, 0x58, 0x1c];
+    data.extend(std::iter::repeat_n(0xa1u8, 28));
+    // expiry 1007 = 0x19 0x03 0xef (2-byte uint)
+    data.extend_from_slice(&[0x19, 0x03, 0xef]);
+    // member 2: array(2)[1 ScriptHash, bytes(28)]
+    data.extend_from_slice(&[0x82, 0x01, 0x58, 0x1c]);
+    data.extend(std::iter::repeat_n(0xb2u8, 28));
+    // expiry 1356 = 0x19 0x05 0x4c
+    data.extend_from_slice(&[0x19, 0x05, 0x4c]);
+    // threshold: tag(30) array(2) [2, 3]
+    data.extend_from_slice(&[0xd8, 0x1e, 0x82, 0x02, 0x03]);
+
+    let (committee, consumed) = decode_committee(&data).expect("decode_committee must succeed");
+
+    assert_eq!(consumed, data.len(), "all bytes must be consumed");
+    assert_eq!(committee.members.len(), 2, "exactly 2 members");
+
+    let (cred0, expiry0) = &committee.members[0];
+    assert_eq!(cred0.0, 0, "first member is KeyHash (tag 0)");
+    assert_eq!(cred0.1.as_bytes(), &[0xa1u8; 28], "first member hash");
+    assert_eq!(*expiry0, 1007, "first member expiry");
+
+    let (cred1, expiry1) = &committee.members[1];
+    assert_eq!(cred1.0, 1, "second member is ScriptHash (tag 1)");
+    assert_eq!(cred1.1.as_bytes(), &[0xb2u8; 28], "second member hash");
+    assert_eq!(*expiry1, 1356, "second member expiry");
+
+    assert_eq!(committee.threshold, (2, 3), "threshold is 2/3");
 }

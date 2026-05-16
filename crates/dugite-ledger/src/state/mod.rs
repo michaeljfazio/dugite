@@ -897,6 +897,45 @@ impl LedgerState {
             }
         }
 
+        // Constitutional Committee membership + threshold.  The Haskell
+        // snapshot stores the canonical `Committee` value (members map +
+        // voting threshold) inside `cgsCommittee` in the gov-state CBOR;
+        // upstream parsing captures it verbatim as `committee_raw` bytes.
+        // Without decoding it here, `committee_expiration` would contain
+        // only the Conway-genesis seeds — so any UpdateCommittee action
+        // enacted before the snapshot anchor (e.g. preview tx ac99…
+        // enacted at epoch 1011 adding 7 of 8 current members) would be
+        // invisible to `query committee-state` and to CC quorum logic.
+        // See issue #485 (P0).
+        if let Some(raw) = &hs.new_epoch_state.gov_state.committee_raw {
+            match dugite_serialization::haskell_snapshot::govstate::decode_committee(raw) {
+                Ok((committee, _consumed)) => {
+                    use dugite_primitives::transaction::Rational;
+                    for ((cold_tag, cold_hash28), expiry) in &committee.members {
+                        let cold = haskell_credential_to_hash32(*cold_tag, cold_hash28);
+                        gov.committee_expiration.insert(cold, EpochNo(*expiry));
+                        if *cold_tag == 1 {
+                            gov.script_committee_credentials.insert(cold);
+                        }
+                    }
+                    let (num, den) = committee.threshold;
+                    gov.committee_threshold = Some(Rational {
+                        numerator: num,
+                        denominator: den,
+                    });
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        error = %e,
+                        "Failed to decode committee_raw from Haskell snapshot; \
+                         committee_expiration left empty (governance queries \
+                         and CC quorum checks will be incorrect until next \
+                         from-genesis sync)"
+                    );
+                }
+            }
+        }
+
         // Dormant epochs
         gov.num_dormant_epochs = hs.new_epoch_state.cert_state.vstate.dormant_epochs;
 
