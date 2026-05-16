@@ -34,7 +34,8 @@ use dugite_primitives::hash::Hash28;
 use dugite_primitives::protocol_params::ProtocolParameters;
 
 use super::cbor_utils::{
-    decode_array_len, decode_bytes, decode_hash32, decode_text, decode_uint, skip_cbor_value,
+    decode_array_len, decode_bytes, decode_credential, decode_hash32, decode_map_len,
+    decode_rational, decode_text, decode_uint, skip_cbor_value,
 };
 use super::pparams::decode_pparams;
 use super::types::{HaskellConstitution, HaskellGovState};
@@ -304,4 +305,87 @@ fn decode_future_pparams(
             "FuturePParams: unexpected array({arr_len}) tag {tag}"
         ))),
     }
+}
+
+/// One decoded Constitutional Committee member: cold credential and expiry epoch.
+///
+/// `cold_tag` is the Haskell credential discriminator: `0` = KeyHash, `1` = ScriptHash.
+/// `cold_hash` is the 28-byte Blake2b-224 cold credential hash.
+/// `expiry` is the epoch at which this member's seat expires (inclusive).
+pub type CommitteeMember = ((u8, Hash28), u64);
+
+/// Decoded `Committee era` from a Haskell ledger snapshot.
+///
+/// Returned by [`decode_committee`].  The loader uses `members` to populate
+/// `committee_expiration` (the canonical member list) and `threshold` to
+/// populate `committee_threshold` on the dugite ledger state.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HaskellCommittee {
+    /// Cold credential → expiry epoch.  Preserves CBOR map iteration order
+    /// for deterministic equality in tests; downstream callers iterate as a
+    /// set so ordering is not load-bearing.
+    pub members: Vec<CommitteeMember>,
+    /// Voting threshold encoded as a `UnitInterval` rational `(num, den)`.
+    pub threshold: (u64, u64),
+}
+
+/// Decode the `Committee era` value previously captured as raw CBOR bytes in
+/// `HaskellGovState::committee_raw`.  The StrictMaybe wrapper has already been
+/// stripped by [`decode_strict_maybe_raw`] — input here is the inner
+/// `Committee` value.
+///
+/// Wire format (verified against IntersectMBO/cardano-ledger
+/// `Conway/Governance/Procedures.hs:560-595` for Conway / PV10 / PV11 / PV12):
+///
+/// ```text
+/// Committee era = array(2) [
+///   committeeMembers   = map(N) { array(2) [uint(0|1), bytes(28)] => uint },
+///   committeeThreshold = tag(30) array(2) [uint, uint]   -- UnitInterval (num, den)
+/// ]
+/// ```
+///
+/// Credential tag `0` = `KeyHashObj`, `1` = `ScriptHashObj`.  `EpochNo` is a
+/// plain unsigned int.  `UnitInterval` is the standard tag-30 rational shared
+/// with all other ratio fields in the ledger.
+///
+/// Returns `(HaskellCommittee, bytes_consumed)` so callers that decode within
+/// a larger CBOR stream can advance their cursor; production callers consume
+/// the whole `committee_raw` slice and ignore the length.
+pub fn decode_committee(data: &[u8]) -> Result<(HaskellCommittee, usize), SerializationError> {
+    let mut off = 0;
+
+    // outer array(2)
+    let (arr_len, n) = decode_array_len(&data[off..])?;
+    off += n;
+    if arr_len != 2 {
+        return Err(SerializationError::CborDecode(format!(
+            "Committee: expected array(2), got array({arr_len})"
+        )));
+    }
+
+    // [0] committeeMembers — definite-length map
+    let (map_len, n) = decode_map_len(&data[off..])?;
+    off += n;
+    let map_len = map_len.ok_or_else(|| {
+        SerializationError::CborDecode(
+            "Committee.members: expected definite-length map, got indefinite".into(),
+        )
+    })?;
+
+    let mut members: Vec<CommitteeMember> = Vec::with_capacity(map_len);
+    for _ in 0..map_len {
+        let (cred, n) = decode_credential(&data[off..])?;
+        off += n;
+        let (expiry, n) = decode_uint(&data[off..])?;
+        off += n;
+        members.push((cred, expiry));
+    }
+
+    // [1] committeeThreshold — tag(30) array(2) [uint, uint].  `decode_rational`
+    // accepts both tagged and untagged forms; Conway's `Committee` always tags
+    // it but we tolerate either for forward-compat.
+    let (threshold, n) = decode_rational(&data[off..])?;
+    off += n;
+
+    Ok((HaskellCommittee { members, threshold }, off))
 }
