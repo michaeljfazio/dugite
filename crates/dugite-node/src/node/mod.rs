@@ -4605,6 +4605,30 @@ pub(crate) fn should_skip_forge_for_catch_up(
     if peer_tip > 0 && tip_slot == 0 {
         return true;
     }
+
+    // Tight catch-up check (Bug H, 2026-05-16): always skip if the peer's
+    // tip is more than `short_catch_up_lag` slots ahead of ours.  Without
+    // this, a BP that briefly falls behind during a slot-battle resolution
+    // (e.g., its forge raced and lost) would forge its next block on its
+    // own (stale) tip, creating a sibling fork on every subsequent leader
+    // slot.  Praos's k-stability prevents the BP from later switching back
+    // to the canonical chain (intersection beyond `k` is unreachable in
+    // `VolatileDB::switch_chain`), so each such miss is permanent.
+    //
+    // The threshold scales with the security parameter: derived as
+    // `stability_window / 30` (and floored at 5 slots) which yields:
+    //   * k=10, f=0.2     → stability_window=150       → 5 slots
+    //   * k=2160, f=0.05  → stability_window=129_600   → 4320 slots (~72 min)
+    // both reasonable for their respective scales.
+    //
+    // The original `> stability_window` rule below is preserved as a final
+    // fallback (relevant when no peer tip is reported yet — cold boot
+    // before the first ChainSync round).
+    let short_catch_up_lag = (stability_window / 30).max(5);
+    if peer_tip > 0 && peer_tip.saturating_sub(tip_slot) > short_catch_up_lag {
+        return true;
+    }
+
     let reference_tip = if peer_tip > 0 {
         peer_tip
     } else {
@@ -5990,18 +6014,25 @@ mod tests {
         ));
     }
 
-    /// Catch-up gate: within the stability window of the network tip → run
-    /// the leadership check normally.
+    /// Catch-up gate: within the **short** catch-up lag (Bug H) of the
+    /// network tip → run the leadership check normally.  Updated 2026-05-16
+    /// from the prior `within stability_window` semantics: the gate now
+    /// requires being within `max(5, stability_window / 30)` slots of the
+    /// peer tip, not just within the full stability window.  This tighter
+    /// rule prevents a BP that briefly fell behind from forging on a stale
+    /// tip — under the old loose rule the BP could create a sibling fork
+    /// that Praos's k-stability then refused to reconcile.
     #[test]
-    fn forge_catch_up_gate_passes_when_within_stability_window() {
+    fn forge_catch_up_gate_passes_when_within_short_catch_up_lag() {
         let stability = dugite_consensus::stability_window_slots(2160, 0.05);
-        // tip just barely inside the window — should NOT skip.
+        let short_catch_up_lag = (stability / 30).max(5);
         let peer_tip = 1_000_000;
-        let tip_slot = peer_tip - stability; // exactly at the boundary.
+        // Tip exactly at the short-catch-up-lag boundary — should NOT skip.
+        let tip_slot = peer_tip - short_catch_up_lag;
         assert!(!super::should_skip_forge_for_catch_up(
             tip_slot, peer_tip, peer_tip, stability,
         ));
-        // tip one slot inside the window — should NOT skip.
+        // Tip one slot inside the lag — should NOT skip.
         assert!(!super::should_skip_forge_for_catch_up(
             tip_slot + 1,
             peer_tip,
@@ -6010,9 +6041,28 @@ mod tests {
         ));
     }
 
-    /// Catch-up gate: one slot past the stability window edge → skip.
+    /// Catch-up gate: one slot past the **short** catch-up lag → skip.
+    /// Replaces the old `forge_catch_up_gate_fires_one_slot_past_window`
+    /// (which tested the full `stability_window` boundary; that boundary
+    /// is now superseded by the tighter short-catch-up-lag check).
     #[test]
-    fn forge_catch_up_gate_fires_one_slot_past_window() {
+    fn forge_catch_up_gate_fires_one_slot_past_short_catch_up_lag() {
+        let stability = dugite_consensus::stability_window_slots(2160, 0.05);
+        let short_catch_up_lag = (stability / 30).max(5);
+        let peer_tip = 1_000_000;
+        let tip_slot = peer_tip - short_catch_up_lag - 1;
+        assert!(super::should_skip_forge_for_catch_up(
+            tip_slot, peer_tip, peer_tip, stability,
+        ));
+    }
+
+    /// Catch-up gate: at the stability_window boundary (way past the
+    /// short-catch-up-lag) → skip.  Originally
+    /// `forge_catch_up_gate_fires_one_slot_past_window` — the new
+    /// short-catch-up-lag check fires long before the stability_window
+    /// boundary is reached.
+    #[test]
+    fn forge_catch_up_gate_fires_at_stability_window_boundary() {
         let stability = dugite_consensus::stability_window_slots(2160, 0.05);
         let peer_tip = 1_000_000;
         let tip_slot = peer_tip - stability - 1; // one slot beyond the window.
