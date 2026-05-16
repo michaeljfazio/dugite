@@ -3595,6 +3595,32 @@ impl Node {
                             }
                         }
                     }
+                    // After the replay loop: if at least one block was
+                    // replayed, refresh metrics + snapshot for the final tip
+                    // (same housekeeping as the non-fork path).  The
+                    // per-iteration metric updates inside the loop keep
+                    // Prometheus reflecting intermediate progress; this call
+                    // ensures the N2C NodeStateSnapshot also refreshes (which
+                    // the loop did NOT do).
+                    if let Some(last_hash) = apply.last() {
+                        let last_cbor = {
+                            let db = self.chain_db.read().await;
+                            db.get_block(last_hash).unwrap_or(None)
+                        };
+                        if let Some(cbor) = last_cbor {
+                            if let Ok(last_block) =
+                                dugite_serialization::multi_era::decode_block_minimal_with_byron_epoch_length(
+                                    &cbor,
+                                    self.byron_epoch_length,
+                                )
+                            {
+                                let last_slot = last_block.slot();
+                                let last_bn = last_block.block_number();
+                                self.post_block_apply_updates(&last_block, last_slot, last_bn)
+                                    .await;
+                            }
+                        }
+                    }
                     fork_replayed = true;
                     true
                 }
@@ -3753,23 +3779,11 @@ impl Node {
         self.metrics
             .blocks_applied
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        self.metrics.set_slot(block_slot.0);
-        self.metrics.set_block_number(block_number.0);
-        // Update tip slot time so tip_age_seconds stays fresh
-        {
-            let ls = self.ledger_state.read().await;
-            let sc = &ls.slot_config;
-            let slot_time_ms =
-                sc.zero_time + block_slot.0.saturating_sub(sc.zero_slot) * sc.slot_length as u64;
-            self.metrics.set_tip_slot_time_ms(slot_time_ms);
-            self.metrics.set_epoch(ls.epoch.0);
-        }
-        // Recompute progress from peer tip — during bulk sync this path
-        // fires for every fetched block long before we reach the chain
-        // tip, so we cannot unconditionally claim 100%.  Once our applied
-        // slot catches the peer tip slot, `compute_sync_progress` returns
-        // 100.0 and `health_status()` reports "healthy".
-        self.metrics.refresh_sync_progress(block_slot.0);
+        // Tip-query staleness fix (2026-05-16): shared post-apply housekeeping
+        // also used by try_forge_block_at.  Replaces the previous inline
+        // metric/mempool/snapshot updates.
+        self.post_block_apply_updates(&block, block_slot, block_number)
+            .await;
 
         // Announce to downstream peers.
         if let Some(ref tx) = self.block_announcement_tx {
@@ -3790,71 +3804,6 @@ impl Node {
             self.metrics
                 .blocks_announced
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        }
-
-        // Remove confirmed transactions from mempool.
-        let confirmed: Vec<_> = block.transactions.iter().map(|tx| tx.hash).collect();
-        if !confirmed.is_empty() {
-            self.mempool.remove_txs(&confirmed);
-        }
-
-        // Sweep remaining mempool transactions for invalidity after the new block.
-        // Catches double-spends (consumed inputs), TTL expiry, and orphaned chained
-        // txs whose parent was confirmed. Mirrors process_forward_blocks() sync.rs:1355.
-        //
-        // Note: This uses a heuristic closure, not full validate_transaction().
-        // Full reapplyTx-style revalidation is tracked as future work.
-        if !self.mempool.is_empty() {
-            let consumed_inputs: std::collections::HashSet<_> = block
-                .transactions
-                .iter()
-                .flat_map(|tx| tx.body.inputs.iter().cloned())
-                .collect();
-            let tip_slot = block_slot; // already captured at top of apply_fetched_block
-            let ls = self.ledger_state.read().await;
-            self.mempool.revalidate_all(|tx| {
-                // Evict if any input was consumed by this block (double-spend).
-                if tx.body.inputs.iter().any(|i| consumed_inputs.contains(i)) {
-                    return false;
-                }
-                // Evict if TTL has expired (half-open: slot >= ttl means expired).
-                if let Some(ttl) = tx.body.ttl {
-                    if tip_slot.0 >= ttl.0 {
-                        return false;
-                    }
-                }
-                // Evict if any input is absent from both on-chain UTxO and mempool
-                // virtual UTxO (catches orphaned chained txs whose parent was removed).
-                for input in &tx.body.inputs {
-                    if !ls.utxo.utxo_set.contains(input)
-                        && self.mempool.lookup_virtual_utxo(input).is_none()
-                    {
-                        return false;
-                    }
-                }
-                true
-            });
-            drop(ls); // Release read lock before update_query_state() acquires it.
-        }
-
-        // Update mempool metrics so Prometheus reflects confirmed-tx removal
-        // immediately. Placed unconditionally so the metric reaches 0 even
-        // when the mempool is empty after remove_txs().
-        self.metrics.set_mempool_count(self.mempool.len() as u64);
-        self.metrics.mempool_bytes.store(
-            self.mempool.total_bytes() as u64,
-            std::sync::atomic::Ordering::Relaxed,
-        );
-
-        // Refresh the N2C query handler snapshot at most once per second.
-        // `update_query_state()` does an O(n²) DRep delegator scan (8k DReps ×
-        // 38k reward accounts) and held the ledger read lock for the full
-        // duration, stalling the apply loop on every block. Capping at 1 Hz
-        // keeps N2C query data fresh for interactive clients while removing
-        // the per-block stall.
-        if self.last_query_state_update.elapsed() >= Duration::from_secs(1) {
-            self.update_query_state().await;
-            self.last_query_state_update = Instant::now();
         }
 
         // Run background maintenance (copy-to-immutable, GC, snapshot).
@@ -3884,6 +3833,87 @@ impl Node {
         // This method exists as a hook point for when the fetched-block
         // pipeline is fully wired in. For now, the sync.rs chain_sync_loop
         // continues to drive these operations.
+    }
+
+    /// Post-apply housekeeping shared by every code path that adopts a block
+    /// at live tip.
+    ///
+    /// Updates the Prometheus block_number/slot/tip_slot_time_ms/epoch gauges,
+    /// refreshes `compute_sync_progress`, sweeps the mempool for confirmed +
+    /// invalid transactions, and refreshes the N2C `NodeStateSnapshot`
+    /// (rate-limited to once per second to avoid the O(n²) DRep scan stalling
+    /// the apply loop).
+    ///
+    /// Both `apply_fetched_block` and `try_forge_block_at` MUST call this
+    /// after a successful block adopt.  Before this helper existed the forge
+    /// path skipped every one of these updates, leaving Prometheus and N2C
+    /// tip queries stale on every own-forged block.
+    async fn post_block_apply_updates(
+        &mut self,
+        block: &dugite_primitives::block::Block,
+        block_slot: dugite_primitives::time::SlotNo,
+        block_number: dugite_primitives::time::BlockNo,
+    ) {
+        // 1. Metrics — gauge updates that drive Prometheus + the tip_age timer.
+        self.metrics.set_block_number(block_number.0);
+        self.metrics.set_slot(block_slot.0);
+        {
+            let ls = self.ledger_state.read().await;
+            let sc = &ls.slot_config;
+            let slot_time_ms =
+                sc.zero_time + block_slot.0.saturating_sub(sc.zero_slot) * sc.slot_length as u64;
+            self.metrics.set_tip_slot_time_ms(slot_time_ms);
+            self.metrics.set_epoch(ls.epoch.0);
+        }
+        self.metrics.refresh_sync_progress(block_slot.0);
+
+        // 2. Mempool sweep.  Remove confirmed txs first, then run the
+        //    input-conflict / TTL revalidation just like apply_fetched_block
+        //    used to do inline.
+        let confirmed: Vec<_> = block.transactions.iter().map(|tx| tx.hash).collect();
+        if !confirmed.is_empty() {
+            self.mempool.remove_txs(&confirmed);
+        }
+        if !self.mempool.is_empty() {
+            let consumed_inputs: std::collections::HashSet<_> = block
+                .transactions
+                .iter()
+                .flat_map(|tx| tx.body.inputs.iter().cloned())
+                .collect();
+            let tip_slot = block_slot;
+            let ls = self.ledger_state.read().await;
+            self.mempool.revalidate_all(|tx| {
+                if tx.body.inputs.iter().any(|i| consumed_inputs.contains(i)) {
+                    return false;
+                }
+                if let Some(ttl) = tx.body.ttl {
+                    if tip_slot.0 >= ttl.0 {
+                        return false;
+                    }
+                }
+                for input in &tx.body.inputs {
+                    if !ls.utxo.utxo_set.contains(input)
+                        && self.mempool.lookup_virtual_utxo(input).is_none()
+                    {
+                        return false;
+                    }
+                }
+                true
+            });
+            drop(ls); // Release before update_query_state re-acquires.
+        }
+        self.metrics.set_mempool_count(self.mempool.len() as u64);
+        self.metrics.mempool_bytes.store(
+            self.mempool.total_bytes() as u64,
+            std::sync::atomic::Ordering::Relaxed,
+        );
+
+        // 3. N2C snapshot refresh, rate-limited at 1 Hz (matches the existing
+        //    apply_fetched_block predicate at mod.rs:3854 pre-refactor).
+        if self.last_query_state_update.elapsed() >= std::time::Duration::from_secs(1) {
+            self.update_query_state().await;
+            self.last_query_state_update = std::time::Instant::now();
+        }
     }
 
     // ─── handle_n2c_connection() ─────────────────────────────────────────────
@@ -5420,6 +5450,13 @@ impl Node {
                     "TraceAdoptedBlock",
                 );
 
+                // Tip-query staleness fix (2026-05-16): own-forged blocks must
+                // also refresh the Prometheus gauges and the N2C
+                // NodeStateSnapshot.  Without this, `cardano-cli query tip`
+                // and `dugite_block_number` lag the chain by every own-forge.
+                self.post_block_apply_updates(&block, next_slot, block_number)
+                    .await;
+
                 // Announce the new block to all connected peers.
                 //
                 // This is the critical propagation edge for issue #439: the
@@ -5557,6 +5594,47 @@ mod tests {
         assert_eq!(next_forged_block_number(&point, BlockNo(0)).0, 1);
         assert_eq!(next_forged_block_number(&point, BlockNo(41)).0, 42);
         assert_eq!(next_forged_block_number(&point, BlockNo(413)).0, 414);
+    }
+
+    /// Tip-query staleness regression — narrow contract test.
+    ///
+    /// Before the 2026-05-16 fix, `Node::try_forge_block_at` skipped the
+    /// metric setters that `apply_fetched_block` ran inline on every
+    /// peer-adopted block.  The new `post_block_apply_updates` helper
+    /// centralises those setters and is now called from BOTH paths.
+    ///
+    /// A full end-to-end test of `post_block_apply_updates` requires a real
+    /// `Node` fixture (ledger + chain DB + N2C query handler), which the
+    /// existing test harness does not provide.  This narrower test pins the
+    /// metric contract that the forge path was missing: the gauges that the
+    /// helper calls actually persist and Prometheus will report them.  The
+    /// snapshot-refresh half of the contract is exercised end-to-end by the
+    /// local-devnet 30-min soak (verify.sh predicate 4 — tip parity over
+    /// time, dugite-bp not excluded).
+    ///
+    /// Design doc:
+    /// docs/superpowers/specs/2026-05-16-tip-query-staleness-fix.md
+    #[test]
+    fn metrics_setters_advance_block_number_and_slot() {
+        use std::sync::atomic::Ordering;
+
+        let metrics = crate::metrics::NodeMetrics::new();
+        assert_eq!(metrics.block_number.load(Ordering::Relaxed), 0);
+        assert_eq!(metrics.slot_number.load(Ordering::Relaxed), 0);
+
+        metrics.set_block_number(42);
+        metrics.set_slot(500);
+
+        assert_eq!(
+            metrics.block_number.load(Ordering::Relaxed),
+            42,
+            "set_block_number must persist for Prometheus + N2C tip queries"
+        );
+        assert_eq!(
+            metrics.slot_number.load(Ordering::Relaxed),
+            500,
+            "set_slot must persist for Prometheus + N2C tip queries"
+        );
     }
 
     /// Helper to create a minimal test block with the given era, block number, hash, and prev_hash.
