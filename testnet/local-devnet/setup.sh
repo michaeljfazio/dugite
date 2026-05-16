@@ -122,4 +122,47 @@ find "$LD_KEYS" -name '*.skey' -exec chmod 0600 {} \;
 
 log_info "Keys reorganized; payment address: $(cat "$LD_KEYS/utxo/payment.addr")"
 
-# Task 10 adds: config rendering
+# ---- Config + topology rendering ----
+log_info "Computing genesis hashes"
+
+BYRON_HASH="$(cardano-cli byron genesis print-genesis-hash --genesis-json "$LD_GENESIS/byron-genesis.json")"
+SHELLEY_HASH="$(cardano-cli hash genesis-file --genesis "$LD_GENESIS/shelley-genesis.json")"
+ALONZO_HASH="$(cardano-cli hash genesis-file --genesis "$LD_GENESIS/alonzo-genesis.json")"
+CONWAY_HASH="$(cardano-cli hash genesis-file --genesis "$LD_GENESIS/conway-genesis.json")"
+
+cat > "$LD_CONFIG/genesis-hashes.env" <<EOF
+BYRON_HASH=$BYRON_HASH
+SHELLEY_HASH=$SHELLEY_HASH
+ALONZO_HASH=$ALONZO_HASH
+CONWAY_HASH=$CONWAY_HASH
+EOF
+
+log_info "Genesis hashes: byron=$BYRON_HASH shelley=$SHELLEY_HASH alonzo=$ALONZO_HASH conway=$CONWAY_HASH"
+
+# Render every template — substitute @@TOKEN@@ placeholders
+render_template() {
+    local src="$1" dst="$2"
+    sed \
+        -e "s|@@GENESIS_DIR@@|$LD_GENESIS|g" \
+        -e "s|@@KEYS_DIR@@|$LD_KEYS|g" \
+        -e "s|@@BYRON_HASH@@|$BYRON_HASH|g" \
+        -e "s|@@SHELLEY_HASH@@|$SHELLEY_HASH|g" \
+        -e "s|@@ALONZO_HASH@@|$ALONZO_HASH|g" \
+        -e "s|@@CONWAY_HASH@@|$CONWAY_HASH|g" \
+        "$src" > "$dst"
+}
+
+render_template "$LD_CONFIG/templates/dugite-bp.config.tmpl.json"      "$LD_CONFIG/dugite-bp.config.json"
+render_template "$LD_CONFIG/templates/dugite-relay.config.tmpl.json"   "$LD_CONFIG/dugite-relay.config.json"
+render_template "$LD_CONFIG/templates/cardano-bp.config.tmpl.json"     "$LD_CONFIG/cardano-bp.config.json"
+render_template "$LD_CONFIG/templates/dugite-bp.topology.tmpl.json"    "$LD_CONFIG/dugite-bp.topology.json"
+render_template "$LD_CONFIG/templates/dugite-relay.topology.tmpl.json" "$LD_CONFIG/dugite-relay.topology.json"
+render_template "$LD_CONFIG/templates/cardano-bp.topology.tmpl.json"   "$LD_CONFIG/cardano-bp.topology.json"
+
+# Sanity check — every rendered file must parse as JSON
+for f in "$LD_CONFIG"/dugite-*.json "$LD_CONFIG"/cardano-*.json; do
+    jq empty "$f" || die "Rendered config $f is not valid JSON"
+done
+
+log_info "All configs + topologies rendered to $LD_CONFIG/"
+log_info "Setup complete. Next: ./run.sh"
