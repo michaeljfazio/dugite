@@ -481,14 +481,12 @@ impl App {
     /// warning (this is a no-op in practice since dugite-node only runs on
     /// Unix).
     pub fn save_and_reload(&mut self, pid_file: &std::path::Path) {
-        // Step 1 — save to disk.
-        if let Err(e) = crate::config::save_config(&mut self.config) {
-            self.feedback = Some(format!("Save failed: {e}"));
+        // Save first; if save fails, no point trying to signal.
+        if !self.save_for_reload() {
             return;
         }
-        self.quit_prompt = false;
 
-        // Step 2 — read the node PID.
+        // Read the node PID from the file.
         let pid_raw = match std::fs::read_to_string(pid_file) {
             Ok(s) => s.trim().to_string(),
             Err(e) => {
@@ -511,7 +509,33 @@ impl App {
             }
         };
 
-        // Step 3 — send SIGHUP.
+        self.send_sighup(pid_num);
+    }
+
+    /// Save to disk and send SIGHUP directly to a known PID (used by the
+    /// discovery path, where the PID came from `sysinfo` rather than a file).
+    pub fn save_and_signal_pid(&mut self, pid: u32) {
+        if !self.save_for_reload() {
+            return;
+        }
+        self.send_sighup(pid as i32);
+    }
+
+    /// Persist the current config to disk; report success via `feedback`.
+    /// Returns `true` if the save succeeded (so the caller can proceed to
+    /// signalling the node).
+    fn save_for_reload(&mut self) -> bool {
+        if let Err(e) = crate::config::save_config(&mut self.config) {
+            self.feedback = Some(format!("Save failed: {e}"));
+            return false;
+        }
+        self.quit_prompt = false;
+        true
+    }
+
+    /// Send SIGHUP to `pid_num`; on non-Unix platforms, report a no-op.
+    /// Sets `feedback` to describe the outcome regardless.
+    fn send_sighup(&mut self, pid_num: i32) {
         #[cfg(unix)]
         {
             use nix::sys::signal::{kill, Signal};
