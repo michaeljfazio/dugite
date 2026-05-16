@@ -309,14 +309,22 @@ pub struct ShelleyGenesisStaking {
 pub struct ShelleyGenesisPool {
     pub cost: u64,
     pub margin: f64,
+    #[serde(default)]
     #[allow(dead_code)] // deserialized but not used for ledger state
     pub metadata: Option<serde_json::Value>,
+    #[serde(default)]
     pub owners: Vec<String>,
     pub pledge: u64,
-    /// VRF key hash (hex-encoded).
+    /// VRF key hash (hex-encoded). Older cardano-cli emits this under
+    /// `publicKey`; cardano-cli 11.0.0.0+ emits it as `vrf`.
+    #[serde(alias = "vrf")]
     pub public_key: String,
+    #[serde(default)]
     #[allow(dead_code)] // deserialized but not used for ledger state
     pub relays: Vec<serde_json::Value>,
+    /// Reward account. Older cardano-cli emits this under `rewardAccount`;
+    /// cardano-cli 11.0.0.0+ emits it under `accountAddress`.
+    #[serde(alias = "accountAddress")]
     pub reward_account: serde_json::Value,
 }
 
@@ -519,7 +527,11 @@ pub struct AlonzoGenesis {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AlonzoExPrices {
+    /// Older cardano-cli emits `prSteps`; cardano-cli 11.0.0.0+ emits `priceSteps`.
+    #[serde(alias = "priceSteps")]
     pub pr_steps: AlonzoRational,
+    /// Older cardano-cli emits `prMem`; cardano-cli 11.0.0.0+ emits `priceMemory`.
+    #[serde(alias = "priceMemory")]
     pub pr_mem: AlonzoRational,
 }
 
@@ -556,7 +568,11 @@ impl AlonzoRational {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AlonzoExUnits {
+    /// Older cardano-cli emits `exUnitsMem`; cardano-cli 11.0.0.0+ emits `memory`.
+    #[serde(alias = "memory")]
     pub ex_units_mem: u64,
+    /// Older cardano-cli emits `exUnitsSteps`; cardano-cli 11.0.0.0+ emits `steps`.
+    #[serde(alias = "steps")]
     pub ex_units_steps: u64,
 }
 
