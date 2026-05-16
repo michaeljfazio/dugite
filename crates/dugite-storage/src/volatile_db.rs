@@ -515,6 +515,14 @@ pub struct VolatileDB {
     selected_chain: Vec<Hash32>,
     /// Blocks scheduled for garbage collection (orphaned fork blocks).
     gc_schedule: HashMap<Hash32, Instant>,
+    /// Cached block headers, populated only by `add_block_with_header`.
+    ///
+    /// Used by `ChainSelQueue::process_add_block` to run the Haskell
+    /// `comparePraos` tiebreaker (issue #497).  When a block has no cached
+    /// header (Byron, legacy callers, tests with synthetic CBOR) the
+    /// comparator falls back to the strict-greater block_no rule, preserving
+    /// existing behavior.
+    headers: HashMap<Hash32, dugite_primitives::block::BlockHeader>,
 }
 
 impl VolatileDB {
@@ -529,6 +537,7 @@ impl VolatileDB {
             wal: None,
             selected_chain: Vec::new(),
             gc_schedule: HashMap::new(),
+            headers: HashMap::new(),
         }
     }
 
@@ -556,6 +565,7 @@ impl VolatileDB {
             wal: None,
             selected_chain: Vec::new(),
             gc_schedule: HashMap::new(),
+            headers: HashMap::new(),
         };
 
         // Rebuild in-memory state from WAL, using the recovered prev_hash.
@@ -620,6 +630,37 @@ impl VolatileDB {
         }
 
         self.insert_block_internal(hash, slot, block_no, prev_hash, cbor)
+    }
+
+    /// Variant of [`add_block`] that also caches the block's `BlockHeader`
+    /// for later use by the chain-selection Praos tiebreaker.
+    ///
+    /// Bug D (issue #497): when an incoming block carries header info, we
+    /// stash it so that `ChainSelQueue::process_add_block` can call
+    /// `dugite_consensus::ChainSelection::prefer_chain_with_headers` instead
+    /// of the strict-greater fallback.  Behaves identically to `add_block`
+    /// for storage purposes.
+    pub fn add_block_with_header(
+        &mut self,
+        hash: Hash32,
+        slot: u64,
+        block_no: u64,
+        prev_hash: Hash32,
+        cbor: Vec<u8>,
+        header: dugite_primitives::block::BlockHeader,
+    ) -> bool {
+        self.headers.insert(hash, header);
+        // Reuse the existing WAL + insert path so byte-for-byte storage
+        // behavior is identical to `add_block`.
+        self.add_block(hash, slot, block_no, prev_hash, cbor)
+    }
+
+    /// Look up a previously cached header (Bug D Praos tiebreaker).
+    ///
+    /// Returns `None` for any block stored via the legacy `add_block` path,
+    /// for ImmutableDB blocks, and for blocks that have been GC'd.
+    pub fn get_header(&self, hash: &Hash32) -> Option<&dugite_primitives::block::BlockHeader> {
+        self.headers.get(hash)
     }
 
     /// Internal block insertion (no WAL write).
@@ -757,6 +798,7 @@ impl VolatileDB {
             }
             self.selected_chain.retain(|h| h != hash);
             self.gc_schedule.remove(hash);
+            self.headers.remove(hash);
         }
     }
 
@@ -794,6 +836,7 @@ impl VolatileDB {
                     }
                 }
                 self.gc_schedule.remove(hash);
+                self.headers.remove(hash);
             }
         }
 
@@ -839,6 +882,7 @@ impl VolatileDB {
                         }
                     }
                     self.gc_schedule.remove(&hash);
+                    self.headers.remove(&hash);
                     removed_set.insert(hash);
                     removed.push(hash);
                 }
@@ -980,6 +1024,7 @@ impl VolatileDB {
                         }
                     }
                     self.gc_schedule.remove(&hash);
+                    self.headers.remove(&hash);
                     removed.push(hash);
                 }
             }
@@ -1012,6 +1057,7 @@ impl VolatileDB {
         self.successors.clear();
         self.selected_chain.clear();
         self.gc_schedule.clear();
+        self.headers.clear();
         self.tip = None;
 
         if let Some(ref mut wal) = self.wal {
@@ -1419,6 +1465,7 @@ impl VolatileDB {
                             self.successors.remove(&block.prev_hash);
                         }
                     }
+                    self.headers.remove(hash);
                 }
             }
         }

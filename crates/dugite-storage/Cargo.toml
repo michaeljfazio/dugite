@@ -15,6 +15,7 @@ io-uring = { version = "0.7", optional = true }
 dugite-primitives = { workspace = true }
 dugite-serialization = { workspace = true }
 dugite-crypto = { workspace = true }
+dugite-consensus = { workspace = true }   # NEW: for prefer_chain_with_headers (Bug D fix)
 tokio = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }

@@ -221,6 +221,34 @@ impl ChainDB {
         Ok(extended_tip)
     }
 
+    /// Variant of [`add_block`] that also caches the block's header in
+    /// VolatileDB for the Praos chain-selection tiebreaker (Bug D, #497).
+    pub fn add_block_with_header(
+        &mut self,
+        hash: BlockHeaderHash,
+        slot: SlotNo,
+        block_no: BlockNo,
+        prev_hash: BlockHeaderHash,
+        cbor: Vec<u8>,
+        header: dugite_primitives::block::BlockHeader,
+    ) -> Result<bool, ChainDBError> {
+        if self.has_block(&hash) {
+            return Ok(false);
+        }
+        let extended = self
+            .volatile
+            .add_block_with_header(hash, slot.0, block_no.0, prev_hash, cbor, header);
+        Ok(extended)
+    }
+
+    /// Look up a previously cached VolatileDB header.
+    pub fn get_volatile_header(
+        &self,
+        hash: &BlockHeaderHash,
+    ) -> Option<&dugite_primitives::block::BlockHeader> {
+        self.volatile.get_header(hash)
+    }
+
     /// Store multiple blocks in a batch (all go to VolatileDB).
     pub fn add_blocks_batch(
         &mut self,
