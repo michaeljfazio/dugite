@@ -43,12 +43,17 @@ pub enum ParamType {
     Bool,
     /// An unsigned integer in the range `[min, max]`.
     U64 { min: u64, max: u64 },
+    /// A floating-point number (accepts integer or decimal input).
+    F64 { min: f64, max: f64 },
     /// A free-form UTF-8 string (no validation beyond non-empty).
     String,
     /// One of a fixed set of string values (cycled with arrow keys).
     Enum { values: &'static [&'static str] },
     /// A file-system path (stored as a JSON string, shown with a path icon).
     Path,
+    /// A nested JSON object displayed as read-only (edit sub-fields in the
+    /// config file directly). The value is always valid; validation is a no-op.
+    Object,
 }
 
 impl ParamType {
@@ -57,9 +62,11 @@ impl ParamType {
         match self {
             ParamType::Bool => "bool",
             ParamType::U64 { .. } => "u64",
+            ParamType::F64 { .. } => "f64",
             ParamType::String => "string",
             ParamType::Enum { .. } => "enum",
             ParamType::Path => "path",
+            ParamType::Object => "object",
         }
     }
 
@@ -86,6 +93,16 @@ impl ParamType {
                         Err(format!("must be between {min} and {max}, got {v}"))
                     }
                 }),
+            ParamType::F64 { min, max } => raw
+                .parse::<f64>()
+                .map_err(|_| format!("must be a number, got '{raw}'"))
+                .and_then(|v| {
+                    if v >= *min && v <= *max {
+                        Ok(())
+                    } else {
+                        Err(format!("must be between {min} and {max}, got {v}"))
+                    }
+                }),
             ParamType::String | ParamType::Path => Ok(()),
             ParamType::Enum { values } => {
                 if values.contains(&raw) {
@@ -97,6 +114,7 @@ impl ParamType {
                     ))
                 }
             }
+            ParamType::Object => Ok(()),
         }
     }
 }
@@ -191,53 +209,54 @@ pub static KNOWN_PARAMS: &[ParamDef] = &[
     ParamDef {
         key: "PeerSharing",
         section: "Network",
-        param_type: ParamType::Enum {
-            values: &["NoPeerSharing", "PeerSharingPrivate", "PeerSharingPublic"],
-        },
-        default: "PeerSharingPublic",
-        description: "Peer sharing policy. 'PeerSharingPublic' allows this node to share \
-                      its known peers with others. 'PeerSharingPrivate' refuses peer share \
-                      requests. 'NoPeerSharing' disables the mini-protocol entirely.",
-        tuning_hint: "Use 'PeerSharingPublic' for public relays to help decentralise \
-                      peer discovery. Block producers may prefer 'PeerSharingPrivate'.",
+        param_type: ParamType::Bool,
+        default: "false",
+        description: "Enable peer sharing mini-protocol. When true, this node \
+                      advertises known peers to requesting peers. Automatically \
+                      disabled for block producers (when KES/VRF keys are provided) \
+                      and enabled for relays when not set explicitly. Setting this \
+                      field overrides the automatic detection.",
+        tuning_hint: "Leave unset to use the automatic default (enabled for relays, \
+                      disabled for block producers). Only set explicitly if you need \
+                      to override the detection.",
     },
     ParamDef {
         key: "TargetNumberOfActivePeers",
         section: "Network",
         param_type: ParamType::U64 { min: 1, max: 100 },
-        default: "15",
+        default: "20",
         description: "Target number of fully active (hot) peers — connections where \
                       block headers and bodies are exchanged. Raising this improves \
                       propagation at the cost of higher CPU and bandwidth.",
-        tuning_hint: "20 is good for public relays. \
+        tuning_hint: "20 is the cardano-node default and suits most relays. \
                       Block producers may want 10-15 for lower latency and less noise.",
     },
     ParamDef {
         key: "TargetNumberOfEstablishedPeers",
         section: "Network",
-        param_type: ParamType::U64 { min: 1, max: 200 },
-        default: "40",
+        param_type: ParamType::U64 { min: 1, max: 1000 },
+        default: "30",
         description: "Target number of established (warm) peers — TCP connections that \
                       are open but not yet doing full block exchange. Acts as a reservoir \
                       to promote to hot when needed.",
-        tuning_hint: "Keep at 2-3x TargetNumberOfActivePeers to ensure a healthy \
-                      promotion reservoir. 40 is a sensible default for most relays.",
+        tuning_hint: "Keep at 1.5-2x TargetNumberOfActivePeers to ensure a healthy \
+                      promotion reservoir. 30 is the cardano-node default.",
     },
     ParamDef {
         key: "TargetNumberOfKnownPeers",
         section: "Network",
-        param_type: ParamType::U64 { min: 1, max: 500 },
-        default: "85",
+        param_type: ParamType::U64 { min: 1, max: 10000 },
+        default: "150",
         description: "Target size of the known-peers set (cold + warm + hot). The peer \
                       governor will attempt to keep at least this many addresses in its \
                       address book at all times.",
-        tuning_hint: "100 is a good default. \
+        tuning_hint: "150 is the cardano-node default. \
                       Increase to 200+ for higher network resilience on busy relays.",
     },
     ParamDef {
         key: "TargetNumberOfRootPeers",
         section: "Network",
-        param_type: ParamType::U64 { min: 1, max: 200 },
+        param_type: ParamType::U64 { min: 1, max: 1000 },
         default: "60",
         description: "Target number of root peers — connections maintained to the \
                       topology file entries (trusted relays). These anchor the node to \
@@ -291,35 +310,35 @@ pub static KNOWN_PARAMS: &[ParamDef] = &[
         key: "SyncTargetNumberOfActivePeers",
         section: "Network",
         param_type: ParamType::U64 { min: 0, max: 100 },
-        default: "0",
+        default: "5",
         description: "Target active peers during Genesis bulk sync. Only used when \
                       ConsensusMode is GenesisMode.",
-        tuning_hint: "Leave at 0 for PraosMode. For GenesisMode, match your regular \
-                      TargetNumberOfActivePeers or set higher for aggressive sync.",
+        tuning_hint: "5 is the cardano-node default. For GenesisMode, match or \
+                      raise your regular TargetNumberOfActivePeers for aggressive sync.",
     },
     ParamDef {
         key: "SyncTargetNumberOfEstablishedPeers",
         section: "Network",
-        param_type: ParamType::U64 { min: 0, max: 200 },
-        default: "0",
+        param_type: ParamType::U64 { min: 0, max: 1000 },
+        default: "10",
         description: "Target established peers during Genesis bulk sync.",
-        tuning_hint: "Leave at 0 for PraosMode.",
+        tuning_hint: "10 is the cardano-node default.",
     },
     ParamDef {
         key: "SyncTargetNumberOfKnownPeers",
         section: "Network",
-        param_type: ParamType::U64 { min: 0, max: 500 },
-        default: "0",
+        param_type: ParamType::U64 { min: 0, max: 10000 },
+        default: "150",
         description: "Target known peers during Genesis bulk sync.",
-        tuning_hint: "Leave at 0 for PraosMode.",
+        tuning_hint: "150 is the cardano-node default.",
     },
     ParamDef {
         key: "SyncTargetNumberOfRootPeers",
         section: "Network",
-        param_type: ParamType::U64 { min: 0, max: 200 },
+        param_type: ParamType::U64 { min: 0, max: 1000 },
         default: "0",
         description: "Target root peers during Genesis bulk sync.",
-        tuning_hint: "Leave at 0 for PraosMode.",
+        tuning_hint: "0 is the cardano-node default (root peers not needed during Genesis sync).",
     },
     ParamDef {
         key: "SyncTargetNumberOfActiveBigLedgerPeers",
@@ -328,24 +347,24 @@ pub static KNOWN_PARAMS: &[ParamDef] = &[
         default: "30",
         description: "Target active big ledger peers during Genesis bulk sync. \
                       High value ensures honest chain availability during sync.",
-        tuning_hint: "30 is the Haskell default. Higher values improve Genesis safety \
+        tuning_hint: "30 is the cardano-node default. Higher values improve Genesis safety \
                       at the cost of more connections during sync.",
     },
     ParamDef {
         key: "SyncTargetNumberOfEstablishedBigLedgerPeers",
         section: "Network",
-        param_type: ParamType::U64 { min: 0, max: 200 },
-        default: "50",
+        param_type: ParamType::U64 { min: 0, max: 1000 },
+        default: "40",
         description: "Target established big ledger peers during Genesis bulk sync.",
-        tuning_hint: "50 is the Haskell default.",
+        tuning_hint: "40 is the cardano-node default.",
     },
     ParamDef {
         key: "SyncTargetNumberOfKnownBigLedgerPeers",
         section: "Network",
-        param_type: ParamType::U64 { min: 0, max: 500 },
+        param_type: ParamType::U64 { min: 0, max: 10000 },
         default: "100",
         description: "Target known big ledger peers during Genesis bulk sync.",
-        tuning_hint: "100 is the Haskell default.",
+        tuning_hint: "100 is the cardano-node default.",
     },
     ParamDef {
         key: "MinBigLedgerPeersForTrustedState",
@@ -554,6 +573,20 @@ pub static KNOWN_PARAMS: &[ParamDef] = &[
                       Use 'Debug' only for active troubleshooting sessions.",
     },
     ParamDef {
+        key: "LogDirective",
+        section: "Logging",
+        param_type: ParamType::String,
+        default: "",
+        description: "Per-subsystem trace filter directive in tracing_subscriber EnvFilter \
+                      syntax. Example: 'info,dugite_network=trace,dugite_consensus=debug'. \
+                      Applied on SIGHUP without a process restart (commit 1f34ac81c). \
+                      If absent, the --log-level CLI flag value remains in effect. \
+                      Equivalent to the RUST_LOG environment variable for startup.",
+        tuning_hint: "Edit this field and send SIGHUP to reload log verbosity at runtime \
+                      without restarting the node. Useful for diagnosing live issues. \
+                      Leave empty to use the startup --log-level value.",
+    },
+    ParamDef {
         key: "TurnOnLogMetrics",
         section: "Logging",
         param_type: ParamType::Bool,
@@ -705,22 +738,67 @@ pub static KNOWN_PARAMS: &[ParamDef] = &[
     ParamDef {
         key: "EgressPollInterval",
         section: "Advanced",
-        param_type: ParamType::U64 { min: 1, max: 3600 },
-        default: "10",
+        param_type: ParamType::F64 {
+            min: 0.0,
+            max: 3600.0,
+        },
+        default: "0",
         description: "How often (in seconds) the outbound governor polls for new \
-                      connection opportunities.",
-        tuning_hint: "10 seconds (default) matches Haskell. Lower values increase \
-                      responsiveness at the cost of more CPU cycles.",
+                      connection opportunities. 0 means the governor runs on-demand \
+                      as events arrive (the Haskell default). Accepts fractional seconds.",
+        tuning_hint: "0 (default) matches Haskell: governor runs event-driven. \
+                      Non-zero values introduce a polling interval and reduce CPU usage \
+                      at the cost of slower peer promotion response.",
     },
     ParamDef {
         key: "ChainSyncIdleTimeout",
         section: "Advanced",
-        param_type: ParamType::U64 { min: 0, max: 3600 },
-        default: "300",
-        description: "ChainSync-specific idle timeout in seconds. 0 disables the timeout \
-                      (used in GenesisMode). Default 300s for PraosMode.",
-        tuning_hint: "300 seconds for PraosMode, 0 for GenesisMode. A lower value helps \
-                      detect stalled ChainSync peers faster.",
+        param_type: ParamType::F64 {
+            min: 0.0,
+            max: 3600.0,
+        },
+        default: "0",
+        description: "ChainSync-specific idle timeout in seconds. 0 disables the timeout. \
+                      If set, a ChainSync session that produces no messages for this many \
+                      seconds is closed and the peer is demoted. Accepts fractional seconds.",
+        tuning_hint: "Leave at 0 (no timeout) for most deployments. \
+                      Set to 300-600 to aggressively shed stalled peers.",
+    },
+    // --- Diffusion section ------------------------------------------------
+    ParamDef {
+        key: "AcceptedConnectionsLimit",
+        section: "Diffusion",
+        param_type: ParamType::Object,
+        default: r#"{"hardLimit":512,"softLimit":384,"delay":5.0}"#,
+        description: "Inbound connection admission limits. 'hardLimit' is the maximum \
+                      concurrent inbound connections (new connections are refused above \
+                      this). 'softLimit' is the threshold above which new connections \
+                      are progressively delayed by up to 'delay' seconds. \
+                      Matches Haskell's AcceptedConnectionsLimit with short keys \
+                      hardLimit/softLimit/delay (old long camelCase aliases also accepted).",
+        tuning_hint: "hardLimit=512, softLimit=384, delay=5.0 are the cardano-node defaults. \
+                      Lower hardLimit on memory-constrained relays. \
+                      Raise delay (up to 30s) to slow down aggressive inbound peers.",
+    },
+    // --- Storage section --------------------------------------------------
+    ParamDef {
+        key: "Storage",
+        section: "Storage",
+        param_type: ParamType::Object,
+        default: r#"{"profile":"high-memory"}"#,
+        description: "Storage subsystem configuration. Sub-fields (all optional): \
+                      'profile': preset profile name ('ultra-memory', 'high-memory', \
+                      'low-memory', 'minimal'); \
+                      'immutableIndexType': 'mmap' (default) or 'in-memory'; \
+                      'mmapLoadFactor': mmap hash table load factor (0.0-1.0, default 0.7); \
+                      'utxoBackend': 'lsm' (default) or 'in-memory'; \
+                      'utxoMemtableSizeMb': LSM memtable size in MB; \
+                      'utxoBlockCacheSizeMb': LSM block cache size in MB; \
+                      'utxoBloomFilterBits': LSM bloom filter bits per key (default 10).",
+        tuning_hint: "Start with a profile matching your RAM: 'high-memory' for 16GB, \
+                      'low-memory' for 8GB, 'minimal' for 4GB. \
+                      Set 'utxoBackend' to 'lsm' for production (recommended). \
+                      CLI flags --storage-profile / --utxo-* take precedence over this field.",
     },
 ];
 
@@ -750,7 +828,15 @@ pub fn build_lookup() -> HashMap<&'static str, &'static ParamDef> {
 ///
 /// Sections not listed here are appended after the last known section,
 /// with [`SECTION_UNKNOWN`] always last.
-pub const SECTION_ORDER: &[&str] = &["Network", "Genesis", "Protocol", "Logging", "Advanced"];
+pub const SECTION_ORDER: &[&str] = &[
+    "Network",
+    "Genesis",
+    "Protocol",
+    "Logging",
+    "Advanced",
+    "Diffusion",
+    "Storage",
+];
 
 /// Return the display priority index of a section name (lower = earlier).
 pub fn section_priority(section: &str) -> usize {
@@ -835,7 +921,8 @@ pub fn network_defaults(network: Network) -> serde_json::Map<String, serde_json:
 
     // P2P networking.
     map.insert("DiffusionMode".into(), json!("InitiatorAndResponder"));
-    map.insert("PeerSharing".into(), json!("PeerSharingPublic"));
+    // PeerSharing is a bool in NodeConfig; leave unset to use the auto-default
+    // (enabled for relays, disabled for block producers).
     map.insert("TargetNumberOfActivePeers".into(), json!(20));
     map.insert("TargetNumberOfEstablishedPeers".into(), json!(30));
     map.insert("TargetNumberOfKnownPeers".into(), json!(150));
@@ -847,7 +934,7 @@ pub fn network_defaults(network: Network) -> serde_json::Map<String, serde_json:
     // Consensus mode.
     map.insert("ConsensusMode".into(), json!("PraosMode"));
 
-    // Genesis sync targets.
+    // Genesis sync targets (cardano-node defaults).
     map.insert("SyncTargetNumberOfActivePeers".into(), json!(5));
     map.insert("SyncTargetNumberOfEstablishedPeers".into(), json!(10));
     map.insert("SyncTargetNumberOfKnownPeers".into(), json!(150));
@@ -896,6 +983,7 @@ pub fn network_defaults(network: Network) -> serde_json::Map<String, serde_json:
 
     // Logging.
     map.insert("MinSeverity".into(), json!("Info"));
+    // LogDirective is optional — omit from defaults so SIGHUP is a no-op unless set.
     map.insert("TurnOnLogMetrics".into(), json!(true));
     map.insert("TurnOnScripting".into(), json!(false));
     map.insert("MetricsPort".into(), json!(12798));
@@ -910,11 +998,23 @@ pub fn network_defaults(network: Network) -> serde_json::Map<String, serde_json:
     map.insert("StallDemotionCycles".into(), json!(6));
     map.insert("ErrorDemotionThreshold".into(), json!(5));
 
-    // Connection management.
+    // Connection management (fractional seconds, matching Haskell DiffTime).
     map.insert("ProtocolIdleTimeout".into(), json!(5));
     map.insert("TimeWaitTimeout".into(), json!(60));
     map.insert("EgressPollInterval".into(), json!(0));
-    map.insert("ChainSyncIdleTimeout".into(), json!(300));
+    // ChainSyncIdleTimeout is optional; omit from defaults (None = no timeout).
+
+    // Diffusion — inbound connection limits (optional; node uses hard-coded defaults when absent).
+    // Uncomment and tune for relay nodes under heavy inbound pressure:
+    // map.insert("AcceptedConnectionsLimit".into(), json!({
+    //     "hardLimit": 512,
+    //     "softLimit": 384,
+    //     "delay": 5.0
+    // }));
+
+    // Storage — omit from defaults; the --storage-profile CLI flag is the preferred knob.
+    // Uncomment to pin storage settings in the config file:
+    // map.insert("Storage".into(), json!({"profile": "high-memory"}));
 
     map
 }
@@ -947,12 +1047,34 @@ mod tests {
     }
 
     #[test]
+    fn test_param_type_validate_f64_range() {
+        let t = ParamType::F64 {
+            min: 0.0,
+            max: 3600.0,
+        };
+        assert!(t.validate("0").is_ok());
+        assert!(t.validate("0.0").is_ok());
+        assert!(t.validate("3600").is_ok());
+        assert!(t.validate("5.5").is_ok());
+        assert!(t.validate("-1").is_err());
+        assert!(t.validate("3601").is_err());
+        assert!(t.validate("abc").is_err());
+    }
+
+    #[test]
     fn test_param_type_validate_enum() {
         let t = ParamType::Enum {
             values: &["A", "B", "C"],
         };
         assert!(t.validate("A").is_ok());
         assert!(t.validate("D").is_err());
+    }
+
+    #[test]
+    fn test_param_type_validate_object_always_ok() {
+        let t = ParamType::Object;
+        assert!(t.validate("").is_ok());
+        assert!(t.validate("anything").is_ok());
     }
 
     #[test]
@@ -970,16 +1092,27 @@ mod tests {
         assert!(section_priority("Genesis") < section_priority("Protocol"));
         assert!(section_priority("Protocol") < section_priority("Logging"));
         assert!(section_priority("Logging") < section_priority("Advanced"));
-        assert!(section_priority("Advanced") < section_priority(SECTION_UNKNOWN));
+        assert!(section_priority("Advanced") < section_priority("Diffusion"));
+        assert!(section_priority("Diffusion") < section_priority("Storage"));
+        assert!(section_priority("Storage") < section_priority(SECTION_UNKNOWN));
     }
 
     #[test]
     fn test_param_type_label() {
         assert_eq!(ParamType::Bool.label(), "bool");
         assert_eq!(ParamType::U64 { min: 0, max: 10 }.label(), "u64");
+        assert_eq!(
+            ParamType::F64 {
+                min: 0.0,
+                max: 10.0
+            }
+            .label(),
+            "f64"
+        );
         assert_eq!(ParamType::String.label(), "string");
         assert_eq!(ParamType::Enum { values: &["a"] }.label(), "enum");
         assert_eq!(ParamType::Path.label(), "path");
+        assert_eq!(ParamType::Object.label(), "object");
     }
 
     #[test]
@@ -994,6 +1127,117 @@ mod tests {
             );
         }
     }
+
+    // ── Correct defaults for NodeConfig-matching params ────────────────────
+
+    #[test]
+    fn test_peer_sharing_is_bool_type() {
+        let map = build_lookup();
+        let def = map["PeerSharing"];
+        assert_eq!(def.param_type, ParamType::Bool);
+    }
+
+    #[test]
+    fn test_target_active_peers_default_is_20() {
+        let map = build_lookup();
+        let def = map["TargetNumberOfActivePeers"];
+        assert_eq!(def.default, "20");
+    }
+
+    #[test]
+    fn test_target_established_peers_default_is_30() {
+        let map = build_lookup();
+        let def = map["TargetNumberOfEstablishedPeers"];
+        assert_eq!(def.default, "30");
+    }
+
+    #[test]
+    fn test_target_known_peers_default_is_150() {
+        let map = build_lookup();
+        let def = map["TargetNumberOfKnownPeers"];
+        assert_eq!(def.default, "150");
+    }
+
+    #[test]
+    fn test_sync_target_active_peers_default_is_5() {
+        let map = build_lookup();
+        let def = map["SyncTargetNumberOfActivePeers"];
+        assert_eq!(def.default, "5");
+    }
+
+    #[test]
+    fn test_sync_target_established_peers_default_is_10() {
+        let map = build_lookup();
+        let def = map["SyncTargetNumberOfEstablishedPeers"];
+        assert_eq!(def.default, "10");
+    }
+
+    #[test]
+    fn test_sync_target_known_peers_default_is_150() {
+        let map = build_lookup();
+        let def = map["SyncTargetNumberOfKnownPeers"];
+        assert_eq!(def.default, "150");
+    }
+
+    #[test]
+    fn test_sync_established_blp_default_is_40() {
+        let map = build_lookup();
+        let def = map["SyncTargetNumberOfEstablishedBigLedgerPeers"];
+        assert_eq!(def.default, "40");
+    }
+
+    #[test]
+    fn test_egress_poll_interval_default_is_0() {
+        let map = build_lookup();
+        let def = map["EgressPollInterval"];
+        assert_eq!(def.default, "0");
+        // Must be F64 because the node uses fractional seconds.
+        assert!(matches!(def.param_type, ParamType::F64 { .. }));
+    }
+
+    #[test]
+    fn test_chain_sync_idle_timeout_is_f64() {
+        let map = build_lookup();
+        let def = map["ChainSyncIdleTimeout"];
+        assert!(matches!(def.param_type, ParamType::F64 { .. }));
+    }
+
+    // ── New params present in schema ───────────────────────────────────────
+
+    #[test]
+    fn test_log_directive_param_exists() {
+        let map = build_lookup();
+        assert!(
+            map.contains_key("LogDirective"),
+            "LogDirective must be in schema"
+        );
+        let def = map["LogDirective"];
+        assert_eq!(def.section, "Logging");
+        assert_eq!(def.param_type, ParamType::String);
+    }
+
+    #[test]
+    fn test_accepted_connections_limit_param_exists() {
+        let map = build_lookup();
+        assert!(
+            map.contains_key("AcceptedConnectionsLimit"),
+            "AcceptedConnectionsLimit must be in schema"
+        );
+        let def = map["AcceptedConnectionsLimit"];
+        assert_eq!(def.section, "Diffusion");
+        assert_eq!(def.param_type, ParamType::Object);
+    }
+
+    #[test]
+    fn test_storage_param_exists() {
+        let map = build_lookup();
+        assert!(map.contains_key("Storage"), "Storage must be in schema");
+        let def = map["Storage"];
+        assert_eq!(def.section, "Storage");
+        assert_eq!(def.param_type, ParamType::Object);
+    }
+
+    // ── network_defaults correctness ───────────────────────────────────────
 
     #[test]
     fn test_network_defaults_mainnet_magic() {
@@ -1031,10 +1275,100 @@ mod tests {
     }
 
     #[test]
+    fn test_network_defaults_peer_targets_match_node() {
+        // Verify the network_defaults peer targets match NodeConfig defaults.
+        let map = network_defaults(Network::Preview);
+        assert_eq!(map["TargetNumberOfActivePeers"], serde_json::json!(20));
+        assert_eq!(map["TargetNumberOfEstablishedPeers"], serde_json::json!(30));
+        assert_eq!(map["TargetNumberOfKnownPeers"], serde_json::json!(150));
+        assert_eq!(map["TargetNumberOfRootPeers"], serde_json::json!(60));
+        assert_eq!(
+            map["SyncTargetNumberOfEstablishedBigLedgerPeers"],
+            serde_json::json!(40)
+        );
+        assert_eq!(map["SyncTargetNumberOfActivePeers"], serde_json::json!(5));
+        assert_eq!(
+            map["SyncTargetNumberOfEstablishedPeers"],
+            serde_json::json!(10)
+        );
+        assert_eq!(map["SyncTargetNumberOfKnownPeers"], serde_json::json!(150));
+    }
+
+    #[test]
+    fn test_network_defaults_egress_poll_interval_is_0() {
+        let map = network_defaults(Network::Mainnet);
+        assert_eq!(map["EgressPollInterval"], serde_json::json!(0));
+    }
+
+    #[test]
+    fn test_network_defaults_no_peer_sharing_key() {
+        // PeerSharing is intentionally omitted from defaults to use auto-detection.
+        let map = network_defaults(Network::Mainnet);
+        assert!(
+            !map.contains_key("PeerSharing"),
+            "PeerSharing should not appear in network_defaults (auto-detected)"
+        );
+    }
+
+    #[test]
     fn test_network_from_str() {
         assert_eq!(Network::from_str("mainnet"), Some(Network::Mainnet));
         assert_eq!(Network::from_str("PREVIEW"), Some(Network::Preview));
         assert_eq!(Network::from_str("preprod"), Some(Network::Preprod));
         assert_eq!(Network::from_str("devnet"), None);
+    }
+
+    // ── Roundtrip: network_defaults → JSON → NodeConfig ───────────────────
+    // This verifies that every field produced by network_defaults() survives a
+    // round-trip through dugite-node's NodeConfig deserializer without
+    // type-mismatch or field-loss errors.  We only check a representative
+    // subset because NodeConfig lives in a different crate and we do not import
+    // it here; the full roundtrip test lives in config_coverage.rs.
+
+    #[test]
+    fn test_network_defaults_produce_valid_json() {
+        let map = network_defaults(Network::Preview);
+        let json = serde_json::Value::Object(map.clone());
+        // Must round-trip to/from JSON without error.
+        let s = serde_json::to_string(&json).expect("serialise");
+        let reparsed: serde_json::Value = serde_json::from_str(&s).expect("parse");
+        assert_eq!(reparsed, json);
+    }
+
+    #[test]
+    fn test_known_params_count() {
+        // We expect at least 45 known parameters (audit baseline: 43 before
+        // this change; +3 new: LogDirective, AcceptedConnectionsLimit, Storage).
+        assert!(
+            KNOWN_PARAMS.len() >= 45,
+            "Expected >= 45 known params, got {}",
+            KNOWN_PARAMS.len()
+        );
+    }
+
+    #[test]
+    fn test_every_known_param_has_unique_key() {
+        let mut seen = std::collections::HashSet::new();
+        for def in KNOWN_PARAMS {
+            assert!(
+                seen.insert(def.key),
+                "Duplicate key '{}' in KNOWN_PARAMS",
+                def.key
+            );
+        }
+    }
+
+    #[test]
+    fn test_every_known_param_has_valid_section() {
+        let valid_sections: std::collections::HashSet<&str> =
+            SECTION_ORDER.iter().copied().collect();
+        for def in KNOWN_PARAMS {
+            assert!(
+                valid_sections.contains(def.section),
+                "ParamDef '{}' has unknown section '{}'",
+                def.key,
+                def.section
+            );
+        }
     }
 }
