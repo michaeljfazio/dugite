@@ -48,31 +48,56 @@ p1_forge_cross_check() {
         PREDICATE_FAIL+=("p1:forge-cross-check ($fails/$total blocks missing observers; example: $fail_examples)")
     fi
 }
-# Predicate 2: both pools must have forged >=3 blocks
+# Predicate 2: both pools must have forged >=3 blocks.
+#
+# Attribution model (2026-05-16): pool = observer. dugite's forge log line
+#   "INFO forge: TraceForgedBlock slot=23 block_no=1 block_hash=46db..."
+# does NOT emit an issuer= field, and cardano-node's Forge.Loop.AdoptedBlock
+# JSON does not reliably populate .data.issuerVerKey either. Since the local
+# devnet is a hub-and-spoke with exactly one BP per node (dugite-bp == pool1,
+# cardano-bp == pool2), the log SOURCE is itself the pool identity. We
+# attribute forges by `observer` directly.
+#
+# Fallback: if observer-based attribution finds 0 forges from one side, we
+# also try the legacy issuer_vkey match (kept for forward compatibility with
+# any future dugite log changes that DO emit an issuer field).
 p2_per_bp_attribution() {
     local blocks="$1"
     [ -s "$blocks" ] || { PREDICATE_FAIL+=("p2:no-data"); return; }
 
-    local pool1_vkey="" pool2_vkey=""
-    if [ -f "$LD_KEYS/pool1/cold.vkey" ]; then
-        pool1_vkey=$(jq -r '.cborHex' "$LD_KEYS/pool1/cold.vkey" 2>/dev/null \
-            | tail -c +5 | head -c 64 || echo "")
-    fi
-    if [ -f "$LD_KEYS/pool2/cold.vkey" ]; then
-        pool2_vkey=$(jq -r '.cborHex' "$LD_KEYS/pool2/cold.vkey" 2>/dev/null \
-            | tail -c +5 | head -c 64 || echo "")
-    fi
-
-    # If we don't have keys (running on test fixtures), match against literal POOL1/POOL2 strings
-    if [ -z "$pool1_vkey" ]; then pool1_vkey="POOL1"; fi
-    if [ -z "$pool2_vkey" ]; then pool2_vkey="POOL2"; fi
-
+    # Primary path: observer-based attribution. One forge row per
+    # (observer, slot, hash) — dedupe within an observer to avoid counting
+    # cardano-node's ForgedBlock+AdoptedBlock as two forges.
     local p1_forges p2_forges
-    p1_forges=$(awk -F, -v k="$pool1_vkey" '$3=="forge" && $6==k' "$blocks" | wc -l | tr -d ' ')
-    p2_forges=$(awk -F, -v k="$pool2_vkey" '$3=="forge" && $6==k' "$blocks" | wc -l | tr -d ' ')
+    p1_forges=$(awk -F, '$2=="dugite-bp"  && $3=="forge" {print $4","$5}' "$blocks" \
+                | sort -u | wc -l | tr -d ' ')
+    p2_forges=$(awk -F, '$2=="cardano-bp" && $3=="forge" {print $4","$5}' "$blocks" \
+                | sort -u | wc -l | tr -d ' ')
+
+    # Fallback: if either side has 0 forges, retry with issuer_vkey match
+    # in case the user wired up real pool key matching upstream.
+    if [ "$p1_forges" -eq 0 ] || [ "$p2_forges" -eq 0 ]; then
+        local pool1_vkey="" pool2_vkey=""
+        if [ -f "$LD_KEYS/pool1/cold.vkey" ]; then
+            pool1_vkey=$(jq -r '.cborHex' "$LD_KEYS/pool1/cold.vkey" 2>/dev/null \
+                | tail -c +5 | head -c 64 || echo "")
+        fi
+        if [ -f "$LD_KEYS/pool2/cold.vkey" ]; then
+            pool2_vkey=$(jq -r '.cborHex' "$LD_KEYS/pool2/cold.vkey" 2>/dev/null \
+                | tail -c +5 | head -c 64 || echo "")
+        fi
+        if [ -n "$pool1_vkey" ] && [ "$p1_forges" -eq 0 ]; then
+            p1_forges=$(awk -F, -v k="$pool1_vkey" '$3=="forge" && $6==k' "$blocks" \
+                | wc -l | tr -d ' ')
+        fi
+        if [ -n "$pool2_vkey" ] && [ "$p2_forges" -eq 0 ]; then
+            p2_forges=$(awk -F, -v k="$pool2_vkey" '$3=="forge" && $6==k' "$blocks" \
+                | wc -l | tr -d ' ')
+        fi
+    fi
 
     if [ "$p1_forges" -ge 3 ] && [ "$p2_forges" -ge 3 ]; then
-        PREDICATE_PASS+=("p2:per-bp-attribution (pool1=$p1_forges pool2=$p2_forges)")
+        PREDICATE_PASS+=("p2:per-bp-attribution (pool1=$p1_forges pool2=$p2_forges via observer)")
         {
             printf 'pool1_forges\t%s\n' "$p1_forges"
             printf 'pool2_forges\t%s\n' "$p2_forges"
