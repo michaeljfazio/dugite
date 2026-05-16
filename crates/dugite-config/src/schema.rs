@@ -105,6 +105,29 @@ impl ParamType {
 // Parameter definition
 // ---------------------------------------------------------------------------
 
+/// Whether a config parameter supports live (SIGHUP) reload.
+///
+/// Used by the TUI to show a `[H]` (hot-reloadable) or `[R]` (restart-required)
+/// indicator next to each field and to surface a warning in the diff view when
+/// the operator edits a restart-required field.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Reloadability {
+    /// Parameter can be applied live via SIGHUP without a process restart.
+    Hot,
+    /// Parameter requires a process restart to take effect.
+    Restart,
+}
+
+impl Reloadability {
+    /// Short indicator string shown next to the parameter key in the TUI.
+    pub fn indicator(self) -> &'static str {
+        match self {
+            Reloadability::Hot => "[H]",
+            Reloadability::Restart => "[R]",
+        }
+    }
+}
+
 /// A single known configuration parameter.
 #[derive(Debug, Clone)]
 pub struct ParamDef {
@@ -124,6 +147,10 @@ pub struct ParamDef {
     /// behind a setting — what to change and when — rather than repeating
     /// what the description already says.
     pub tuning_hint: &'static str,
+    /// Whether this parameter can be live-reloaded via SIGHUP or requires
+    /// a process restart.  Used by the TUI to show `[H]`/`[R]` indicators
+    /// and warn the operator in the diff view.
+    pub reloadability: Reloadability,
 }
 
 // ---------------------------------------------------------------------------
@@ -148,6 +175,7 @@ pub static KNOWN_PARAMS: &[ParamDef] = &[
                       'Testnet' for any test network (requires NetworkMagic).",
         tuning_hint: "Set to 'Testnet' for Preview/Preprod/private deployments \
                       and ensure NetworkMagic matches the genesis file.",
+        reloadability: Reloadability::Restart,
     },
     ParamDef {
         key: "NetworkMagic",
@@ -161,6 +189,7 @@ pub static KNOWN_PARAMS: &[ParamDef] = &[
                       Must match the genesis files and all connecting peers.",
         tuning_hint: "Mainnet = 764824073, Preview = 2, Preprod = 1. \
                       A mismatched magic will cause all peer handshakes to fail immediately.",
+        reloadability: Reloadability::Restart,
     },
     ParamDef {
         key: "RequiresNetworkMagic",
@@ -172,6 +201,7 @@ pub static KNOWN_PARAMS: &[ParamDef] = &[
         description: "Controls whether the network magic is enforced on peer handshakes. \
                       Use 'RequiresMagic' for all non-mainnet deployments.",
         tuning_hint: "Use 'RequiresMagic' for all testnets, 'RequiresNoMagic' for mainnet.",
+        reloadability: Reloadability::Restart,
     },
     ParamDef {
         key: "DiffusionMode",
@@ -187,6 +217,7 @@ pub static KNOWN_PARAMS: &[ParamDef] = &[
         tuning_hint: "Use 'InitiatorAndResponder' for relays and public-facing nodes. \
                       Use 'InitiatorOnly' for block producers that should never accept \
                       unsolicited inbound connections.",
+        reloadability: Reloadability::Restart,
     },
     ParamDef {
         key: "PeerSharing",
@@ -200,6 +231,7 @@ pub static KNOWN_PARAMS: &[ParamDef] = &[
                       requests. 'NoPeerSharing' disables the mini-protocol entirely.",
         tuning_hint: "Use 'PeerSharingPublic' for public relays to help decentralise \
                       peer discovery. Block producers may prefer 'PeerSharingPrivate'.",
+        reloadability: Reloadability::Restart,
     },
     ParamDef {
         key: "TargetNumberOfActivePeers",
@@ -211,6 +243,7 @@ pub static KNOWN_PARAMS: &[ParamDef] = &[
                       propagation at the cost of higher CPU and bandwidth.",
         tuning_hint: "20 is good for public relays. \
                       Block producers may want 10-15 for lower latency and less noise.",
+        reloadability: Reloadability::Hot,
     },
     ParamDef {
         key: "TargetNumberOfEstablishedPeers",
@@ -222,6 +255,7 @@ pub static KNOWN_PARAMS: &[ParamDef] = &[
                       to promote to hot when needed.",
         tuning_hint: "Keep at 2-3x TargetNumberOfActivePeers to ensure a healthy \
                       promotion reservoir. 40 is a sensible default for most relays.",
+        reloadability: Reloadability::Hot,
     },
     ParamDef {
         key: "TargetNumberOfKnownPeers",
@@ -233,6 +267,7 @@ pub static KNOWN_PARAMS: &[ParamDef] = &[
                       address book at all times.",
         tuning_hint: "100 is a good default. \
                       Increase to 200+ for higher network resilience on busy relays.",
+        reloadability: Reloadability::Hot,
     },
     ParamDef {
         key: "TargetNumberOfRootPeers",
@@ -244,6 +279,7 @@ pub static KNOWN_PARAMS: &[ParamDef] = &[
                       the network before ledger peer discovery kicks in.",
         tuning_hint: "Match or slightly exceed your topology file entry count. \
                       Root peers keep the node anchored during initial bootstrap.",
+        reloadability: Reloadability::Hot,
     },
     ParamDef {
         key: "TargetNumberOfActiveBigLedgerPeers",
@@ -255,6 +291,7 @@ pub static KNOWN_PARAMS: &[ParamDef] = &[
                       after useLedgerAfterSlot is reached.",
         tuning_hint: "5-10 is sufficient for most relays. \
                       Big ledger peers are high-quality but may be geographically distant.",
+        reloadability: Reloadability::Hot,
     },
     ParamDef {
         key: "TargetNumberOfEstablishedBigLedgerPeers",
@@ -264,6 +301,7 @@ pub static KNOWN_PARAMS: &[ParamDef] = &[
         description: "Target number of established (warm) connections to big ledger peers.",
         tuning_hint: "Keep at 2x TargetNumberOfActiveBigLedgerPeers \
                       to allow smooth promotion without cold-start delays.",
+        reloadability: Reloadability::Hot,
     },
     ParamDef {
         key: "TargetNumberOfKnownBigLedgerPeers",
@@ -273,6 +311,7 @@ pub static KNOWN_PARAMS: &[ParamDef] = &[
         description: "Target size of the known big-ledger-peer set (cold + warm + hot).",
         tuning_hint: "15-25 gives a good pool of candidates for ledger peer selection \
                       without excessive churn.",
+        reloadability: Reloadability::Hot,
     },
     ParamDef {
         key: "ConsensusMode",
@@ -286,6 +325,7 @@ pub static KNOWN_PARAMS: &[ParamDef] = &[
                       potentially dishonest peers.",
         tuning_hint: "Use PraosMode unless you specifically need Genesis sync guarantees. \
                       GenesisMode requires additional SyncTargetNumberOf* configuration.",
+        reloadability: Reloadability::Restart,
     },
     ParamDef {
         key: "SyncTargetNumberOfActivePeers",
@@ -296,6 +336,7 @@ pub static KNOWN_PARAMS: &[ParamDef] = &[
                       ConsensusMode is GenesisMode.",
         tuning_hint: "Leave at 0 for PraosMode. For GenesisMode, match your regular \
                       TargetNumberOfActivePeers or set higher for aggressive sync.",
+        reloadability: Reloadability::Restart,
     },
     ParamDef {
         key: "SyncTargetNumberOfEstablishedPeers",
@@ -304,6 +345,7 @@ pub static KNOWN_PARAMS: &[ParamDef] = &[
         default: "0",
         description: "Target established peers during Genesis bulk sync.",
         tuning_hint: "Leave at 0 for PraosMode.",
+        reloadability: Reloadability::Restart,
     },
     ParamDef {
         key: "SyncTargetNumberOfKnownPeers",
@@ -312,6 +354,7 @@ pub static KNOWN_PARAMS: &[ParamDef] = &[
         default: "0",
         description: "Target known peers during Genesis bulk sync.",
         tuning_hint: "Leave at 0 for PraosMode.",
+        reloadability: Reloadability::Restart,
     },
     ParamDef {
         key: "SyncTargetNumberOfRootPeers",
@@ -320,6 +363,7 @@ pub static KNOWN_PARAMS: &[ParamDef] = &[
         default: "0",
         description: "Target root peers during Genesis bulk sync.",
         tuning_hint: "Leave at 0 for PraosMode.",
+        reloadability: Reloadability::Restart,
     },
     ParamDef {
         key: "SyncTargetNumberOfActiveBigLedgerPeers",
@@ -330,6 +374,7 @@ pub static KNOWN_PARAMS: &[ParamDef] = &[
                       High value ensures honest chain availability during sync.",
         tuning_hint: "30 is the Haskell default. Higher values improve Genesis safety \
                       at the cost of more connections during sync.",
+        reloadability: Reloadability::Restart,
     },
     ParamDef {
         key: "SyncTargetNumberOfEstablishedBigLedgerPeers",
@@ -338,6 +383,7 @@ pub static KNOWN_PARAMS: &[ParamDef] = &[
         default: "50",
         description: "Target established big ledger peers during Genesis bulk sync.",
         tuning_hint: "50 is the Haskell default.",
+        reloadability: Reloadability::Restart,
     },
     ParamDef {
         key: "SyncTargetNumberOfKnownBigLedgerPeers",
@@ -346,6 +392,7 @@ pub static KNOWN_PARAMS: &[ParamDef] = &[
         default: "100",
         description: "Target known big ledger peers during Genesis bulk sync.",
         tuning_hint: "100 is the Haskell default.",
+        reloadability: Reloadability::Restart,
     },
     ParamDef {
         key: "MinBigLedgerPeersForTrustedState",
@@ -357,6 +404,7 @@ pub static KNOWN_PARAMS: &[ParamDef] = &[
                       paused until enough connections recover.",
         tuning_hint: "5 is the Haskell default. Lower values reduce safety guarantees. \
                       Only relevant when ConsensusMode is GenesisMode.",
+        reloadability: Reloadability::Restart,
     },
     // --- Genesis section ---------------------------------------------------
     ParamDef {
@@ -368,6 +416,7 @@ pub static KNOWN_PARAMS: &[ParamDef] = &[
                       config file's directory or absolute. Must match ByronGenesisHash.",
         tuning_hint: "Must match the network. Do not change unless switching networks. \
                       Use paths relative to the config file for portability.",
+        reloadability: Reloadability::Restart,
     },
     ParamDef {
         key: "ByronGenesisHash",
@@ -378,6 +427,7 @@ pub static KNOWN_PARAMS: &[ParamDef] = &[
                       The node verifies this on startup to detect genesis mismatches.",
         tuning_hint: "Must exactly match the hash of the genesis file at ByronGenesisFile. \
                       An incorrect hash will prevent the node from starting.",
+        reloadability: Reloadability::Restart,
     },
     ParamDef {
         key: "ShelleyGenesisFile",
@@ -387,6 +437,7 @@ pub static KNOWN_PARAMS: &[ParamDef] = &[
         description: "Path to the Shelley-era genesis JSON file. Contains network \
                       parameters, initial delegation, protocol magic, and epoch length.",
         tuning_hint: "Must match the network. Do not change unless switching networks.",
+        reloadability: Reloadability::Restart,
     },
     ParamDef {
         key: "ShelleyGenesisHash",
@@ -395,6 +446,7 @@ pub static KNOWN_PARAMS: &[ParamDef] = &[
         default: "",
         description: "Blake2b-256 hash (hex) of the Shelley genesis file.",
         tuning_hint: "Must exactly match the hash of the file at ShelleyGenesisFile.",
+        reloadability: Reloadability::Restart,
     },
     ParamDef {
         key: "AlonzoGenesisFile",
@@ -404,6 +456,7 @@ pub static KNOWN_PARAMS: &[ParamDef] = &[
         description: "Path to the Alonzo-era genesis JSON file. Contains initial Plutus \
                       cost model parameters and collateral percentage.",
         tuning_hint: "Must match the network. Do not change unless switching networks.",
+        reloadability: Reloadability::Restart,
     },
     ParamDef {
         key: "AlonzoGenesisHash",
@@ -412,6 +465,7 @@ pub static KNOWN_PARAMS: &[ParamDef] = &[
         default: "",
         description: "Blake2b-256 hash (hex) of the Alonzo genesis file.",
         tuning_hint: "Must exactly match the hash of the file at AlonzoGenesisFile.",
+        reloadability: Reloadability::Restart,
     },
     ParamDef {
         key: "ConwayGenesisFile",
@@ -421,6 +475,7 @@ pub static KNOWN_PARAMS: &[ParamDef] = &[
         description: "Path to the Conway-era genesis JSON file. Contains governance \
                       bootstrap DReps, committee members, and Plutus V3 cost models.",
         tuning_hint: "Must match the network. Do not change unless switching networks.",
+        reloadability: Reloadability::Restart,
     },
     ParamDef {
         key: "ConwayGenesisHash",
@@ -429,6 +484,7 @@ pub static KNOWN_PARAMS: &[ParamDef] = &[
         default: "",
         description: "Blake2b-256 hash (hex) of the Conway genesis file.",
         tuning_hint: "Must exactly match the hash of the file at ConwayGenesisFile.",
+        reloadability: Reloadability::Restart,
     },
     // --- Protocol section --------------------------------------------------
     ParamDef {
@@ -443,6 +499,7 @@ pub static KNOWN_PARAMS: &[ParamDef] = &[
                       single-era modes used only for isolated test networks.",
         tuning_hint: "Always use 'Cardano' for mainnet and public testnets. \
                       'TPraos'/'Praos' are for private devnet experiments only.",
+        reloadability: Reloadability::Restart,
     },
     ParamDef {
         key: "TraceBlockFetchClient",
@@ -453,6 +510,7 @@ pub static KNOWN_PARAMS: &[ParamDef] = &[
                       diagnosing slow block propagation but very verbose at high sync rates.",
         tuning_hint: "Enable only for debugging slow block propagation. \
                       Increases log volume significantly; disable in production.",
+        reloadability: Reloadability::Restart,
     },
     ParamDef {
         key: "TraceBlockFetchServer",
@@ -462,6 +520,7 @@ pub static KNOWN_PARAMS: &[ParamDef] = &[
         description: "Emit detailed block-fetch server trace events (blocks served \
                       to downstream peers).",
         tuning_hint: "Enable only for debugging. Increases log volume significantly.",
+        reloadability: Reloadability::Restart,
     },
     ParamDef {
         key: "TraceChainSyncClient",
@@ -471,6 +530,7 @@ pub static KNOWN_PARAMS: &[ParamDef] = &[
         description: "Emit chain-sync client trace events (header fetch from upstream).",
         tuning_hint: "Enable only for debugging chain-sync issues. \
                       Very verbose during initial sync; keep off in production.",
+        reloadability: Reloadability::Restart,
     },
     ParamDef {
         key: "TraceChainSyncHeaderServer",
@@ -480,6 +540,7 @@ pub static KNOWN_PARAMS: &[ParamDef] = &[
         description: "Emit chain-sync header server trace events (headers served to \
                       downstream peers).",
         tuning_hint: "Enable only for debugging. Increases log volume significantly.",
+        reloadability: Reloadability::Restart,
     },
     ParamDef {
         key: "TraceChainSyncBlockServer",
@@ -488,6 +549,7 @@ pub static KNOWN_PARAMS: &[ParamDef] = &[
         default: "false",
         description: "Emit chain-sync block server trace events.",
         tuning_hint: "Enable only for debugging. Increases log volume significantly.",
+        reloadability: Reloadability::Restart,
     },
     ParamDef {
         key: "TraceChainDb",
@@ -498,6 +560,7 @@ pub static KNOWN_PARAMS: &[ParamDef] = &[
                       rollback operations). Useful for diagnosing storage-layer issues.",
         tuning_hint: "Enable to debug block storage problems or unexpected rollbacks. \
                       Moderate log volume; safe to leave enabled in production if needed.",
+        reloadability: Reloadability::Restart,
     },
     ParamDef {
         key: "TraceChainSyncServer",
@@ -508,6 +571,7 @@ pub static KNOWN_PARAMS: &[ParamDef] = &[
                       to downstream N2N peers).",
         tuning_hint: "Enable only for debugging downstream sync issues. \
                       Increases log volume significantly under heavy peer load.",
+        reloadability: Reloadability::Restart,
     },
     ParamDef {
         key: "TraceForge",
@@ -518,6 +582,7 @@ pub static KNOWN_PARAMS: &[ParamDef] = &[
                       KES signing, block announcement). Essential for block producer debugging.",
         tuning_hint: "Enable on block producers to diagnose missed slots or forging failures. \
                       Low volume (one event per slot check); safe for production.",
+        reloadability: Reloadability::Restart,
     },
     ParamDef {
         key: "TraceMempool",
@@ -528,6 +593,7 @@ pub static KNOWN_PARAMS: &[ParamDef] = &[
                       on block application, TTL expiry).",
         tuning_hint: "Enable to debug transaction flow or mempool capacity issues. \
                       Volume depends on transaction rate; moderate on mainnet.",
+        reloadability: Reloadability::Restart,
     },
     // --- Logging section ---------------------------------------------------
     ParamDef {
@@ -552,6 +618,7 @@ pub static KNOWN_PARAMS: &[ParamDef] = &[
         tuning_hint: "'Info' is the recommended default. \
                       Use 'Warning' for quiet production nodes. \
                       Use 'Debug' only for active troubleshooting sessions.",
+        reloadability: Reloadability::Hot,
     },
     ParamDef {
         key: "TurnOnLogMetrics",
@@ -562,6 +629,7 @@ pub static KNOWN_PARAMS: &[ParamDef] = &[
                       are published on port 12798 and can be scraped by Prometheus.",
         tuning_hint: "Keep enabled. Disabling removes Prometheus scraping capability \
                       and breaks monitoring dashboards.",
+        reloadability: Reloadability::Restart,
     },
     ParamDef {
         key: "TurnOnScripting",
@@ -572,6 +640,7 @@ pub static KNOWN_PARAMS: &[ParamDef] = &[
                       Not applicable to Dugite's tracing-subscriber backend.",
         tuning_hint: "Leave disabled for Dugite. This setting is a legacy flag \
                       that has no effect on Dugite's tracing-subscriber backend.",
+        reloadability: Reloadability::Restart,
     },
     ParamDef {
         key: "MetricsPort",
@@ -584,6 +653,7 @@ pub static KNOWN_PARAMS: &[ParamDef] = &[
         tuning_hint: "12798 (default) matches cardano-node. Change only if the port \
                       conflicts with another service. Set to 0 in hardened environments \
                       where metrics scraping is not needed.",
+        reloadability: Reloadability::Restart,
     },
     // --- Advanced section --------------------------------------------------
     ParamDef {
@@ -596,6 +666,7 @@ pub static KNOWN_PARAMS: &[ParamDef] = &[
                       cost of higher memory usage.",
         tuning_hint: "4-8 on fast hardware/NVMe with ample RAM. \
                       Lower to 2 if memory is constrained below 8 GB.",
+        reloadability: Reloadability::Restart,
     },
     ParamDef {
         key: "MaxConcurrencyDeadline",
@@ -606,6 +677,7 @@ pub static KNOWN_PARAMS: &[ParamDef] = &[
                       (deadline mode). Lower than bulk to reduce latency jitter.",
         tuning_hint: "Keep lower than MaxConcurrencyBulkSync. \
                       2-4 is optimal; higher values add latency jitter near tip.",
+        reloadability: Reloadability::Restart,
     },
     ParamDef {
         key: "SnapshotInterval",
@@ -621,6 +693,7 @@ pub static KNOWN_PARAMS: &[ParamDef] = &[
         tuning_hint: "72 minutes (default) matches the Haskell node. \
                       Never set to 0 in production — recovery from an unclean \
                       shutdown will require a full replay from genesis.",
+        reloadability: Reloadability::Restart,
     },
     ParamDef {
         key: "ExperimentalHardForksEnabled",
@@ -633,6 +706,7 @@ pub static KNOWN_PARAMS: &[ParamDef] = &[
         tuning_hint: "Leave disabled unless you have been explicitly asked to enable it \
                       for a specific testnet upgrade. Enabling prematurely can cause \
                       chain divergence on mainnet.",
+        reloadability: Reloadability::Restart,
     },
     ParamDef {
         key: "ChurnIntervalNormalSecs",
@@ -648,6 +722,7 @@ pub static KNOWN_PARAMS: &[ParamDef] = &[
                       the same peer set. Default 3300 s (55 minutes) matches cardano-node.",
         tuning_hint: "Lower values increase peer diversity at the cost of more handshakes. \
                       Block producers may prefer higher values (3600+) for connection stability.",
+        reloadability: Reloadability::Hot,
     },
     ParamDef {
         key: "ChurnIntervalSyncSecs",
@@ -662,6 +737,7 @@ pub static KNOWN_PARAMS: &[ParamDef] = &[
                       unresponsive peers. Default 900 s (15 minutes) matches cardano-node.",
         tuning_hint: "Keep below 15 minutes to shed unresponsive peers during catch-up. \
                       Lower values improve sync speed at the cost of more connection churn.",
+        reloadability: Reloadability::Hot,
     },
     ParamDef {
         key: "StallDemotionCycles",
@@ -673,6 +749,7 @@ pub static KNOWN_PARAMS: &[ParamDef] = &[
                       back to warm. Default of 6 cycles = 3 minutes of inactivity.",
         tuning_hint: "Increase if hot peers legitimately produce zero blocks for extended \
                       periods (e.g., low-stake pools). Decrease for aggressive stall detection.",
+        reloadability: Reloadability::Hot,
     },
     ParamDef {
         key: "ErrorDemotionThreshold",
@@ -684,6 +761,7 @@ pub static KNOWN_PARAMS: &[ParamDef] = &[
                       peers are exempt from this check.",
         tuning_hint: "Lower to aggressively shed failing peers. Raise if peers are being \
                       demoted too frequently due to transient network issues.",
+        reloadability: Reloadability::Hot,
     },
     ParamDef {
         key: "ProtocolIdleTimeout",
@@ -693,6 +771,7 @@ pub static KNOWN_PARAMS: &[ParamDef] = &[
         description: "Time in seconds before an idle mini-protocol connection is pruned.",
         tuning_hint: "5 seconds (default) matches Haskell. Increase if peers have high \
                       latency and idle connections are being pruned prematurely.",
+        reloadability: Reloadability::Restart,
     },
     ParamDef {
         key: "TimeWaitTimeout",
@@ -701,6 +780,7 @@ pub static KNOWN_PARAMS: &[ParamDef] = &[
         default: "60",
         description: "Duration in seconds a connection stays in TIME_WAIT after close.",
         tuning_hint: "60 seconds (default) matches Haskell. Rarely needs changing.",
+        reloadability: Reloadability::Restart,
     },
     ParamDef {
         key: "EgressPollInterval",
@@ -711,6 +791,7 @@ pub static KNOWN_PARAMS: &[ParamDef] = &[
                       connection opportunities.",
         tuning_hint: "10 seconds (default) matches Haskell. Lower values increase \
                       responsiveness at the cost of more CPU cycles.",
+        reloadability: Reloadability::Restart,
     },
     ParamDef {
         key: "ChainSyncIdleTimeout",
@@ -721,6 +802,7 @@ pub static KNOWN_PARAMS: &[ParamDef] = &[
                       (used in GenesisMode). Default 300s for PraosMode.",
         tuning_hint: "300 seconds for PraosMode, 0 for GenesisMode. A lower value helps \
                       detect stalled ChainSync peers faster.",
+        reloadability: Reloadability::Restart,
     },
 ];
 
@@ -1036,5 +1118,95 @@ mod tests {
         assert_eq!(Network::from_str("PREVIEW"), Some(Network::Preview));
         assert_eq!(Network::from_str("preprod"), Some(Network::Preprod));
         assert_eq!(Network::from_str("devnet"), None);
+    }
+
+    // -----------------------------------------------------------------------
+    // Reloadability tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_reloadability_indicators() {
+        assert_eq!(Reloadability::Hot.indicator(), "[H]");
+        assert_eq!(Reloadability::Restart.indicator(), "[R]");
+    }
+
+    #[test]
+    fn test_hot_reloadable_params_are_classified_correctly() {
+        let lookup = build_lookup();
+
+        // These 12 params must be Hot-reloadable per the SIGHUP handler in
+        // dugite-node: 7 peer-target fields + 4 churn/demotion fields +
+        // MinSeverity (log directive is not in the config schema).
+        let expected_hot = [
+            "TargetNumberOfActivePeers",
+            "TargetNumberOfEstablishedPeers",
+            "TargetNumberOfKnownPeers",
+            "TargetNumberOfRootPeers",
+            "TargetNumberOfActiveBigLedgerPeers",
+            "TargetNumberOfEstablishedBigLedgerPeers",
+            "TargetNumberOfKnownBigLedgerPeers",
+            "MinSeverity",
+            "ChurnIntervalNormalSecs",
+            "ChurnIntervalSyncSecs",
+            "StallDemotionCycles",
+            "ErrorDemotionThreshold",
+        ];
+
+        for key in &expected_hot {
+            let def = lookup.get(*key).unwrap_or_else(|| {
+                panic!("Expected parameter '{}' not found in KNOWN_PARAMS", key)
+            });
+            assert_eq!(
+                def.reloadability,
+                Reloadability::Hot,
+                "Parameter '{}' should be Hot-reloadable",
+                key
+            );
+        }
+    }
+
+    #[test]
+    fn test_restart_required_params_are_classified_correctly() {
+        let lookup = build_lookup();
+
+        // Core structural parameters that require restart.
+        let expected_restart = [
+            "Network",
+            "NetworkMagic",
+            "ByronGenesisFile",
+            "ShelleyGenesisFile",
+            "AlonzoGenesisFile",
+            "ConwayGenesisFile",
+            "MetricsPort",
+            "DiffusionMode",
+        ];
+
+        for key in &expected_restart {
+            let def = lookup.get(*key).unwrap_or_else(|| {
+                panic!("Expected parameter '{}' not found in KNOWN_PARAMS", key)
+            });
+            assert_eq!(
+                def.reloadability,
+                Reloadability::Restart,
+                "Parameter '{}' should require Restart",
+                key
+            );
+        }
+    }
+
+    #[test]
+    fn test_all_params_have_reloadability() {
+        // Every entry in KNOWN_PARAMS must have an explicit reloadability value.
+        // This test acts as a guard against accidentally leaving a new param
+        // unclassified (Rust's exhaustive match would catch that at compile
+        // time, but this test makes the intent explicit in the test suite).
+        for def in KNOWN_PARAMS {
+            // The match is exhaustive — this just ensures the field is
+            // populated and we have a test exercising every param.
+            let _ = match def.reloadability {
+                Reloadability::Hot => "hot",
+                Reloadability::Restart => "restart",
+            };
+        }
     }
 }
