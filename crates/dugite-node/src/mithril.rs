@@ -20,6 +20,7 @@ use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::fs;
 use std::io::BufReader;
+use std::net::{IpAddr, Ipv4Addr};
 use std::path::{Path, PathBuf};
 #[cfg(test)]
 use tracing::debug;
@@ -545,7 +546,17 @@ pub async fn import_snapshot(
 // Download & verification
 // ---------------------------------------------------------------------------
 
-/// Download a snapshot archive with progress reporting
+/// Default number of parallel ranged-GET workers.
+const DEFAULT_DOWNLOAD_PARALLELISM: usize = 8;
+
+/// Download a snapshot archive with progress reporting.
+///
+/// When the server advertises `Accept-Ranges: bytes` (GCS always does),
+/// the download is split into `DUGITE_MITHRIL_DOWNLOAD_PARALLELISM` (default
+/// 8, capped 1-16) roughly-equal chunks fetched in parallel, each written
+/// directly to its offset in the pre-allocated temp file.  When the server
+/// does not support ranged GETs the function falls back to the original
+/// single-stream path.
 async fn download_snapshot(
     client: &reqwest::Client,
     url: &str,
@@ -560,14 +571,26 @@ async fn download_snapshot(
         }
     }
 
-    let response = client
-        .get(url)
+    // Probe the server with a HEAD request to check Range support.
+    let head = client
+        .head(url)
         .send()
-        .await?
-        .error_for_status()
-        .context("Download request failed")?;
+        .await
+        .context("HEAD request failed")?;
 
-    let total_size = response.content_length().unwrap_or(expected_size);
+    let accepts_ranges = head
+        .headers()
+        .get(reqwest::header::ACCEPT_RANGES)
+        .and_then(|v| v.to_str().ok())
+        .map(|v| v.trim().eq_ignore_ascii_case("bytes"))
+        .unwrap_or(false);
+
+    let total_size = head
+        .headers()
+        .get(reqwest::header::CONTENT_LENGTH)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .unwrap_or(expected_size);
 
     let pb = ProgressBar::new(total_size);
     pb.set_style(
@@ -579,32 +602,185 @@ async fn download_snapshot(
     );
 
     let temp_path = dest.with_extension("tmp");
-    let file = tokio::fs::File::create(&temp_path).await?;
-    let mut writer = tokio::io::BufWriter::with_capacity(8 * 1024 * 1024, file);
 
-    use futures_util::StreamExt;
-    use tokio::io::AsyncWriteExt;
-    let mut stream = response.bytes_stream();
-    let mut downloaded: u64 = 0;
+    if accepts_ranges && total_size > 0 {
+        // ----------------------------------------------------------------
+        // Parallel ranged download path
+        // ----------------------------------------------------------------
+        let parallelism = {
+            let p = std::env::var("DUGITE_MITHRIL_DOWNLOAD_PARALLELISM")
+                .ok()
+                .and_then(|s| s.parse::<usize>().ok())
+                .unwrap_or(DEFAULT_DOWNLOAD_PARALLELISM);
+            p.clamp(1, 16)
+        };
+        info!(
+            parallelism,
+            size_gb = total_size as f64 / (1024.0 * 1024.0 * 1024.0),
+            "Mithril      starting parallel ranged download"
+        );
 
-    while let Some(chunk) = stream.next().await {
-        let chunk = chunk.context("Error reading download stream")?;
-        writer.write_all(&chunk).await?;
-        downloaded += chunk.len() as u64;
-        pb.set_position(downloaded);
+        // Pre-allocate the file so concurrent writers can seek freely.
+        {
+            let f = tokio::fs::File::create(&temp_path).await?;
+            f.set_len(total_size).await?;
+        }
+
+        // Shared atomic progress counter updated by all workers.
+        let progress = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+
+        // Ticker task: update progress bar every 200 ms.
+        let pb_clone = pb.clone();
+        let progress_clone = std::sync::Arc::clone(&progress);
+        let ticker = tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                let pos = progress_clone.load(std::sync::atomic::Ordering::Relaxed);
+                pb_clone.set_position(pos);
+                if pos >= total_size {
+                    break;
+                }
+            }
+        });
+
+        // Compute byte ranges.
+        let chunk_size = total_size.div_ceil(parallelism as u64);
+        let mut ranges: Vec<(u64, u64)> = Vec::with_capacity(parallelism);
+        let mut offset = 0u64;
+        while offset < total_size {
+            let end = (offset + chunk_size - 1).min(total_size - 1);
+            ranges.push((offset, end));
+            offset = end + 1;
+        }
+
+        // Build a dedicated HTTP/1.1 client for parallel ranged GETs. The
+        // shared `client` defaults to HTTP/2 which multiplexes all 8 requests
+        // onto a single TCP connection — same single-stream throughput as
+        // sequential. Forcing HTTP/1.1 makes each worker open its own TCP
+        // socket, so we actually parallelise the link.
+        //
+        // `local_address(0.0.0.0)` forces IPv4 outbound binding.  On some
+        // ISP+CDN combos (observed: Google Cloud Storage over IPv6 from
+        // residential AU networks at ~290 KB/s vs ~10 MB/s on IPv4),
+        // Happy-Eyeballs picks IPv6 but the underlying path is heavily
+        // throttled.  Pinning to IPv4 sidesteps this without disabling
+        // IPv6 system-wide.
+        let parallel_client = reqwest::Client::builder()
+            .user_agent("dugite-node/0.1")
+            .http1_only()
+            .pool_max_idle_per_host(parallelism)
+            .local_address(IpAddr::V4(Ipv4Addr::UNSPECIFIED))
+            .build()
+            .context("Failed to build parallel HTTP/1.1 client")?;
+
+        // Spawn workers.
+        let mut join_set = tokio::task::JoinSet::new();
+        for (start, end) in ranges {
+            let client = parallel_client.clone();
+            let url = url.to_owned();
+            let temp_path = temp_path.clone();
+            let progress = std::sync::Arc::clone(&progress);
+            join_set.spawn(async move {
+                download_range(&client, &url, &temp_path, start, end, &progress)
+                    .await
+                    .with_context(|| format!("range {start}-{end} failed"))
+            });
+        }
+
+        // Collect results — abort on first error.
+        while let Some(res) = join_set.join_next().await {
+            res.context("worker panicked")??;
+        }
+
+        ticker.abort();
+        pb.set_position(total_size);
+        pb.finish_with_message("Download complete");
+    } else {
+        // ----------------------------------------------------------------
+        // Sequential fallback path (original implementation)
+        // ----------------------------------------------------------------
+        info!("Mithril      server does not support ranged GETs; using sequential download");
+
+        let response = client
+            .get(url)
+            .send()
+            .await?
+            .error_for_status()
+            .context("Download request failed")?;
+
+        let file = tokio::fs::File::create(&temp_path).await?;
+        let mut writer = tokio::io::BufWriter::with_capacity(8 * 1024 * 1024, file);
+
+        use futures_util::StreamExt;
+        use tokio::io::AsyncWriteExt;
+        let mut stream = response.bytes_stream();
+        let mut downloaded: u64 = 0;
+
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk.context("Error reading download stream")?;
+            writer.write_all(&chunk).await?;
+            downloaded += chunk.len() as u64;
+            pb.set_position(downloaded);
+        }
+
+        writer.flush().await?;
+        drop(writer);
+
+        pb.finish_with_message("Download complete");
     }
-
-    writer.flush().await?;
-    drop(writer);
-
-    pb.finish_with_message("Download complete");
 
     fs::rename(&temp_path, dest)?;
     info!(
         "Mithril      download complete ({:.1} GB)",
-        downloaded as f64 / (1024.0 * 1024.0 * 1024.0),
+        total_size as f64 / (1024.0 * 1024.0 * 1024.0),
     );
 
+    Ok(())
+}
+
+/// Download the byte range `[start, end]` (inclusive) from `url` and write
+/// the bytes directly to `path` at the corresponding file offset.
+async fn download_range(
+    client: &reqwest::Client,
+    url: &str,
+    path: &Path,
+    start: u64,
+    end: u64,
+    progress: &std::sync::Arc<std::sync::atomic::AtomicU64>,
+) -> Result<()> {
+    use tokio::io::{AsyncSeekExt, AsyncWriteExt};
+
+    let range_header = format!("bytes={start}-{end}");
+    let response = client
+        .get(url)
+        .header(reqwest::header::RANGE, &range_header)
+        .send()
+        .await
+        .context("range GET send failed")?
+        .error_for_status()
+        .context("range GET error status")?;
+
+    let file = tokio::fs::OpenOptions::new()
+        .write(true)
+        .open(path)
+        .await
+        .context("failed to open temp file for range write")?;
+    let mut writer = tokio::io::BufWriter::with_capacity(8 * 1024 * 1024, file);
+    writer
+        .seek(std::io::SeekFrom::Start(start))
+        .await
+        .context("seek to range start failed")?;
+
+    use futures_util::StreamExt;
+    let mut stream = response.bytes_stream();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.context("error reading range stream")?;
+        let n = chunk.len() as u64;
+        writer.write_all(&chunk).await?;
+        progress.fetch_add(n, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    writer.flush().await?;
     Ok(())
 }
 
@@ -2954,5 +3130,200 @@ mod tests {
             msg.contains("not_an_object"),
             "error must include the offending body prefix, got: {msg}"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // download_snapshot parallel-ranged-GET tests
+    // -----------------------------------------------------------------------
+
+    /// Spin up an in-process HTTP/1.1 server that:
+    ///   1. Responds to HEAD with `Accept-Ranges: bytes` and `Content-Length`.
+    ///   2. For each ranged GET, records the `Range` header and serves the
+    ///      slice of a known byte pattern.
+    ///
+    /// The test asserts:
+    ///   - Exactly N workers were used (one Range header per chunk).
+    ///   - The ranges are disjoint, inclusive, and together cover [0, size-1].
+    ///   - The assembled file matches the original byte pattern exactly.
+    #[tokio::test]
+    async fn test_download_snapshot_parallel_ranged() {
+        use std::sync::{Arc, Mutex};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        // 64 KiB payload filled with a deterministic pattern.
+        const SIZE: usize = 64 * 1024;
+        let payload: Vec<u8> = (0..SIZE).map(|i| (i % 251) as u8).collect();
+        let payload = Arc::new(payload);
+
+        // Shared list of Range header values received by the server.
+        let recorded_ranges: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let payload_srv = Arc::clone(&payload);
+        let ranges_srv = Arc::clone(&recorded_ranges);
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    break;
+                };
+                let payload_conn = Arc::clone(&payload_srv);
+                let ranges_conn = Arc::clone(&ranges_srv);
+                tokio::spawn(async move {
+                    let mut buf = vec![0u8; 4096];
+                    let n = stream.read(&mut buf).await.unwrap_or(0);
+                    let req = std::str::from_utf8(&buf[..n]).unwrap_or("");
+
+                    let is_head = req.starts_with("HEAD ");
+                    let range_header = req
+                        .lines()
+                        .find(|l| l.to_lowercase().starts_with("range:"))
+                        .and_then(|l| l.split_once(':').map(|x| x.1))
+                        .map(|v| v.trim().to_string());
+
+                    if is_head {
+                        let resp = format!(
+                            "HTTP/1.1 200 OK\r\nContent-Length: {SIZE}\r\nAccept-Ranges: bytes\r\nConnection: close\r\n\r\n"
+                        );
+                        let _ = stream.write_all(resp.as_bytes()).await;
+                    } else if let Some(range_str) = range_header {
+                        ranges_conn.lock().unwrap().push(range_str.clone());
+                        // Parse "bytes=START-END"
+                        let range_val = range_str.strip_prefix("bytes=").unwrap_or(&range_str);
+                        let mut parts = range_val.splitn(2, '-');
+                        let start: usize = parts.next().unwrap().parse().unwrap();
+                        let end: usize = parts.next().unwrap().parse().unwrap();
+                        let slice = &payload_conn[start..=end];
+                        let resp = format!(
+                            "HTTP/1.1 206 Partial Content\r\nContent-Length: {}\r\nContent-Range: bytes {start}-{end}/{SIZE}\r\nConnection: close\r\n\r\n",
+                            slice.len()
+                        );
+                        let _ = stream.write_all(resp.as_bytes()).await;
+                        let _ = stream.write_all(slice).await;
+                    } else {
+                        // Unexpected full GET — return 400 so the test fails clearly.
+                        let _ = stream
+                            .write_all(b"HTTP/1.1 400 Bad Request\r\nConnection: close\r\n\r\n")
+                            .await;
+                    }
+                    let _ = stream.shutdown().await;
+                });
+            }
+        });
+
+        let client = reqwest::Client::new();
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join("snapshot.tar.zst");
+
+        // Force parallelism = 4 for a deterministic test.
+        std::env::set_var("DUGITE_MITHRIL_DOWNLOAD_PARALLELISM", "4");
+        let result =
+            download_snapshot(&client, &format!("http://{addr}/snap"), &dest, SIZE as u64).await;
+        std::env::remove_var("DUGITE_MITHRIL_DOWNLOAD_PARALLELISM");
+        result.expect("parallel download should succeed");
+
+        // Verify the assembled file.
+        let got = std::fs::read(&dest).expect("output file must exist");
+        assert_eq!(got.len(), SIZE, "output size must equal payload size");
+        assert_eq!(got, *payload, "output bytes must match original payload");
+
+        // Inspect the recorded Range headers.
+        let ranges = recorded_ranges.lock().unwrap().clone();
+        assert_eq!(
+            ranges.len(),
+            4,
+            "expected exactly 4 range requests, got: {ranges:?}"
+        );
+
+        // Parse all ranges and verify they are disjoint and cover [0, SIZE-1].
+        let mut parsed: Vec<(u64, u64)> = ranges
+            .iter()
+            .map(|r| {
+                let v = r.strip_prefix("bytes=").unwrap();
+                let mut p = v.splitn(2, '-');
+                let s: u64 = p.next().unwrap().parse().unwrap();
+                let e: u64 = p.next().unwrap().parse().unwrap();
+                (s, e)
+            })
+            .collect();
+        parsed.sort_by_key(|&(s, _)| s);
+
+        // First range must start at 0.
+        assert_eq!(parsed[0].0, 0, "first range must start at 0");
+        // Last range must end at SIZE-1.
+        assert_eq!(
+            parsed.last().unwrap().1,
+            SIZE as u64 - 1,
+            "last range must end at SIZE-1"
+        );
+        // Consecutive ranges must be contiguous (end+1 == next start).
+        for w in parsed.windows(2) {
+            assert_eq!(
+                w[0].1 + 1,
+                w[1].0,
+                "ranges must be contiguous: {:?} and {:?}",
+                w[0],
+                w[1]
+            );
+        }
+    }
+
+    /// When the server responds with `Accept-Ranges: none` (or omits the
+    /// header entirely), `download_snapshot` must fall back to the sequential
+    /// single-stream path and still produce a correct output file.
+    #[tokio::test]
+    async fn test_download_snapshot_sequential_fallback() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        const SIZE: usize = 8 * 1024;
+        let payload: Vec<u8> = (0..SIZE).map(|i| (i % 199) as u8).collect();
+        let payload = std::sync::Arc::new(payload);
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let payload_srv = std::sync::Arc::clone(&payload);
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    break;
+                };
+                let payload_conn = std::sync::Arc::clone(&payload_srv);
+                tokio::spawn(async move {
+                    let mut buf = vec![0u8; 4096];
+                    let n = stream.read(&mut buf).await.unwrap_or(0);
+                    let req = std::str::from_utf8(&buf[..n]).unwrap_or("");
+                    let is_head = req.starts_with("HEAD ");
+                    if is_head {
+                        // Advertise Accept-Ranges: none — sequential fallback required.
+                        let resp = format!(
+                            "HTTP/1.1 200 OK\r\nContent-Length: {SIZE}\r\nAccept-Ranges: none\r\nConnection: close\r\n\r\n"
+                        );
+                        let _ = stream.write_all(resp.as_bytes()).await;
+                    } else {
+                        // Full GET — serve the entire payload.
+                        let resp = format!(
+                            "HTTP/1.1 200 OK\r\nContent-Length: {SIZE}\r\nConnection: close\r\n\r\n"
+                        );
+                        let _ = stream.write_all(resp.as_bytes()).await;
+                        let _ = stream.write_all(&payload_conn).await;
+                    }
+                    let _ = stream.shutdown().await;
+                });
+            }
+        });
+
+        let client = reqwest::Client::new();
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join("snapshot.tar.zst");
+
+        let result =
+            download_snapshot(&client, &format!("http://{addr}/snap"), &dest, SIZE as u64).await;
+        result.expect("sequential fallback download should succeed");
+
+        let got = std::fs::read(&dest).expect("output file must exist");
+        assert_eq!(got.len(), SIZE, "output size must equal payload size");
+        assert_eq!(got, *payload, "output bytes must match original payload");
     }
 }

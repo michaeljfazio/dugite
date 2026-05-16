@@ -22,6 +22,8 @@
 
 use std::collections::HashMap;
 
+use serde_json::Value;
+
 // ---------------------------------------------------------------------------
 // Section identifiers
 // ---------------------------------------------------------------------------
@@ -165,6 +167,39 @@ pub struct ParamDef {
     /// Whether a runtime change to this parameter can be applied
     /// via SIGHUP or requires a full process restart.
     pub reloadability: Reloadability,
+}
+
+impl ParamDef {
+    /// Parse this parameter's documented [`default`](Self::default) into a
+    /// JSON value matching its [`param_type`](Self::param_type). Returns
+    /// `None` only when the default string cannot be parsed for the given
+    /// type (e.g. an empty string for a numeric type) — the TUI then skips
+    /// surfacing this parameter as an unset row.
+    ///
+    /// Used by [`crate::config::LoadedConfig::inject_schema_defaults`] to
+    /// show every schema parameter in the TUI with its default value, and by
+    /// [`crate::config::save_config`] to decide whether a synthetic entry has
+    /// drifted from its default (and therefore needs to be persisted).
+    pub fn default_as_json(&self) -> Option<Value> {
+        match &self.param_type {
+            ParamType::Bool => self.default.parse::<bool>().ok().map(Value::Bool),
+            ParamType::U64 { .. } => self
+                .default
+                .parse::<u64>()
+                .ok()
+                .map(|n| Value::Number(serde_json::Number::from(n))),
+            ParamType::F64 { .. } => self
+                .default
+                .parse::<f64>()
+                .ok()
+                .and_then(serde_json::Number::from_f64)
+                .map(Value::Number),
+            ParamType::String | ParamType::Path | ParamType::Enum { .. } => {
+                Some(Value::String(self.default.to_string()))
+            }
+            ParamType::Object => serde_json::from_str(self.default).ok(),
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -641,12 +676,23 @@ pub static KNOWN_PARAMS: &[ParamDef] = &[
         param_type: ParamType::String,
         default: "",
         description: "Per-subsystem trace filter directive in tracing_subscriber EnvFilter \
-                      syntax. Example: 'info,dugite_network=trace,dugite_consensus=debug'. \
+                      syntax. Levels (low to high verbosity): error, warn, info, debug, trace \
+                      (lowercase — distinct from MinSeverity's syslog-style 'Info'/'Warning'). \
+                      A directive is a comma-separated list of '<target>=<level>' pairs, where \
+                      a bare level acts as the global default for all targets. \
+                      Examples: \
+                      'info' (global INFO); \
+                      'debug,hyper=warn' (DEBUG globally, quiet hyper); \
+                      'info,dugite_network=trace,dugite_consensus=debug' (per-subsystem); \
+                      'warn,dugite_network::chainsync=trace' (per-module within a crate); \
+                      'off,dugite_ledger=info' (silence everything except the ledger). \
                       Applied on SIGHUP without a process restart (commit 1f34ac81c). \
                       If absent, the --log-level CLI flag value remains in effect. \
                       Equivalent to the RUST_LOG environment variable for startup.",
         tuning_hint: "Edit this field and send SIGHUP to reload log verbosity at runtime \
                       without restarting the node. Useful for diagnosing live issues. \
+                      Start broad ('debug') then narrow to the noisy subsystem \
+                      ('info,dugite_network=trace') once you've located it. \
                       Leave empty to use the startup --log-level value.",
         reloadability: Reloadability::Hot,
     },
@@ -1176,6 +1222,67 @@ mod tests {
         assert!(section_priority("Advanced") < section_priority("Diffusion"));
         assert!(section_priority("Diffusion") < section_priority("Storage"));
         assert!(section_priority("Storage") < section_priority(SECTION_UNKNOWN));
+    }
+
+    #[test]
+    fn test_default_as_json_coerces_each_param_type() {
+        let lookup = build_lookup();
+
+        // Bool default parses to JSON bool.
+        let v = lookup
+            .get("TurnOnLogMetrics")
+            .unwrap()
+            .default_as_json()
+            .unwrap();
+        assert_eq!(v, Value::Bool(true));
+
+        // U64 default parses to JSON number.
+        let v = lookup
+            .get("MaxConcurrencyBulkSync")
+            .unwrap()
+            .default_as_json()
+            .unwrap();
+        assert_eq!(v, Value::Number(2.into()));
+
+        // String default parses to JSON string (even when empty).
+        let v = lookup
+            .get("LogDirective")
+            .unwrap()
+            .default_as_json()
+            .unwrap();
+        assert_eq!(v, Value::String(String::new()));
+
+        // Enum default parses to JSON string.
+        let v = lookup
+            .get("MinSeverity")
+            .unwrap()
+            .default_as_json()
+            .unwrap();
+        assert_eq!(v, Value::String("Info".into()));
+
+        // Object default parses to JSON object.
+        let v = lookup.get("Storage").unwrap().default_as_json().unwrap();
+        assert!(v.as_object().is_some());
+        assert_eq!(
+            v.as_object().unwrap().get("profile"),
+            Some(&Value::String("high-memory".into()))
+        );
+    }
+
+    #[test]
+    fn test_default_as_json_covers_every_param() {
+        // The TUI surfaces an unset row for every schema parameter — so every
+        // ParamDef must parse its default into a JSON value. Catches typos
+        // (e.g. "tru" for a bool) and unsupported defaults early.
+        for def in KNOWN_PARAMS {
+            assert!(
+                def.default_as_json().is_some(),
+                "default_as_json failed for '{}' (default = {:?}, type = {:?})",
+                def.key,
+                def.default,
+                def.param_type
+            );
+        }
     }
 
     #[test]
