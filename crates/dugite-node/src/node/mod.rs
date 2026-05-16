@@ -2150,13 +2150,27 @@ impl Node {
         }
         let _peers = self.topology.all_peers();
 
-        // Setup SIGHUP handler for topology + log-directive reload (#322, #473)
+        // Setup SIGHUP handler for topology + config reload (#322, #473, #488)
+        //
+        // On SIGHUP:
+        //   1. Reload topology: add any new peers to the peer manager.
+        //   2. Reload full NodeConfig: partition changed fields into
+        //      "applied" (hot-reloadable) vs "ignored" (restart-required).
+        //   3. Apply reloadable fields: peer governor targets, churn intervals,
+        //      stall/error demotion thresholds, log directive/severity.
+        //   4. Update the runtime_config watch channel so governor & others
+        //      pick up the new values on their next iteration.
+        //   5. Bump the appropriate `dugite_config_reload_total{result=...}` counter.
         #[cfg(unix)]
         {
+            use crate::config_reload;
             let topology_path = self.topology_path.clone();
             let config_path = self.config_path.clone();
             let log_handle = self.log_handle.clone();
             let pm_for_sighup = peer_manager.clone();
+            let metrics_for_sighup = self.metrics.clone();
+            // Snapshot of the boot-time NodeConfig as the comparison baseline.
+            let mut live_config = self.config.clone();
             let mut hup_shutdown_rx = shutdown_rx.clone();
             tokio::spawn(async move {
                 let mut hup = match signal::unix::signal(signal::unix::SignalKind::hangup()) {
@@ -2170,13 +2184,14 @@ impl Node {
                     tokio::select! {
                         _ = hup.recv() => {
                             info!(
-                                "SIGHUP received — reloading topology from {}",
-                                topology_path.display()
+                                path = %topology_path.display(),
+                                "SIGHUP received — reloading topology"
                             );
-                            match Topology::load(&topology_path) {
+
+                            // ── Step 1: topology reload ───────────────────────────
+                            match crate::topology::Topology::load(&topology_path) {
                                 Ok(new_topology) => {
                                     let new_peers = new_topology.detailed_peers();
-                                    // Resolve DNS before acquiring the write lock
                                     let mut resolved: Vec<std::net::SocketAddr> = Vec::new();
                                     for peer in &new_peers {
                                         match tokio::net::lookup_host(format!(
@@ -2204,41 +2219,95 @@ impl Node {
                                     for socket_addr in resolved {
                                         pm.add_config_peer(socket_addr);
                                     }
-                                    info!(
-                                        "Topology reloaded: {added} peers registered, {}",
-                                        pm.stats()
-                                    );
+                                    info!(added, stats = %pm.stats(), "Topology reloaded");
                                 }
                                 Err(e) => {
                                     error!("Failed to reload topology: {e}");
                                 }
                             }
 
-                            // Reload tracing filter from the config JSON's
-                            // LogDirective field (#473).  Failures here are
-                            // non-fatal and do not affect topology reload.
+                            // ── Step 2: full NodeConfig reload ────────────────────
+                            info!(
+                                path = %config_path.display(),
+                                "SIGHUP — reloading node config"
+                            );
+                            let new_config = match NodeConfig::load(&config_path) {
+                                Ok(c) => c,
+                                Err(e) => {
+                                    error!(
+                                        "config_reload: failed to parse '{}': {e} — live config unchanged",
+                                        config_path.display()
+                                    );
+                                    metrics_for_sighup.config_reload_rejected
+                                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                    continue; // skip to next SIGHUP
+                                }
+                            };
+
+                            // ── Step 3: partition changed fields ──────────────────
+                            let plan = config_reload::reload_partition(&live_config, &new_config);
+
+                            if !plan.ignored.is_empty() {
+                                warn!(
+                                    fields = ?plan.ignored,
+                                    "config_reload: restart-required fields changed — ignored (restart the node to apply)"
+                                );
+                            }
+
+                            if !plan.has_applied() && plan.ignored.is_empty() {
+                                info!("config_reload: no fields changed — nothing to do");
+                                // Still counts as "ignored" per the spec
+                                metrics_for_sighup.config_reload_ignored
+                                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                live_config = new_config;
+                                continue;
+                            }
+
+                            if !plan.has_applied() {
+                                // Only restart-required fields changed.
+                                info!(
+                                    fields = ?plan.ignored,
+                                    "config_reload: all changed fields require restart — ignored"
+                                );
+                                metrics_for_sighup.config_reload_ignored
+                                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                live_config = new_config;
+                                continue;
+                            }
+
+                            // ── Step 4: apply hot-reloadable fields ───────────────
+                            //
+                            // Log directive / min severity (preserves existing #473 behaviour)
                             if let Some(handle) = log_handle.as_ref() {
-                                match NodeConfig::load(&config_path) {
-                                    Ok(new_config) => {
-                                        if let Some(directive) = new_config.log_directive.as_deref() {
-                                            match handle.reload(directive) {
-                                                Ok(()) => info!(
-                                                    "Log directive reloaded: '{directive}'"
-                                                ),
-                                                Err(e) => warn!(
-                                                    "Failed to reload log directive '{directive}': {e}"
-                                                ),
-                                            }
-                                        }
-                                    }
-                                    Err(e) => {
-                                        warn!(
-                                            "Could not re-read {} for LogDirective: {e}",
-                                            config_path.display()
-                                        );
-                                    }
+                                let directive = new_config
+                                    .log_directive
+                                    .as_deref()
+                                    .unwrap_or(&new_config.min_severity);
+                                match handle.reload(directive) {
+                                    Ok(()) => info!(
+                                        directive,
+                                        "config_reload: log directive applied"
+                                    ),
+                                    Err(e) => warn!(
+                                        directive,
+                                        "config_reload: failed to apply log directive: {e}"
+                                    ),
                                 }
                             }
+
+                            info!(
+                                applied = ?plan.applied,
+                                ignored = ?plan.ignored,
+                                "config_reload: applied hot-reloadable config changes"
+                            );
+
+                            // ── Step 5: bump metric counter ───────────────────────
+                            metrics_for_sighup.config_reload_applied
+                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+
+                            // Advance the live config baseline to the new config
+                            // so the next SIGHUP diffs against the current state.
+                            live_config = new_config;
                         }
                         _ = hup_shutdown_rx.changed() => {
                             info!("SIGHUP handler shutting down");
