@@ -3416,7 +3416,25 @@ impl Node {
                     // ledger-only rollback so we don't truncate selected_chain
                     // back to the intersection (which would leave the volatile
                     // tip stuck and cause an O(N) per-block cascade).
-                    self.handle_ledger_rollback(&rollback_point).await;
+                    //
+                    // Fix C (Bug B): guard fork replay on rollback success.
+                    // If the rollback cannot complete (LedgerSeq empty AND no
+                    // snapshot), skipping replay prevents the
+                    // "Block does not connect to tip" WARN + clear_volatile()
+                    // that causes the permanent StoreButDontChange cascade.
+                    // Fix A (below) ensures the seq is always populated so this
+                    // guard is a safety net rather than the primary defence.
+                    if !self.handle_ledger_rollback(&rollback_point).await {
+                        warn!(
+                            rollback_slot = intersection_slot.0,
+                            "Fork rollback failed; skipping fork replay. \
+                             Node will resync on the next connection attempt."
+                        );
+                        // Do NOT clear_volatile here — VolatileDB already holds
+                        // the fork, and clearing it causes the permanent
+                        // StoreButDontChange cascade (Bug B design doc 2026-05-16).
+                        return;
+                    }
 
                     // Replay the new fork's blocks from VolatileDB onto the ledger,
                     // matching Haskell's `forkerCommit` behaviour.  The `apply` list
@@ -3443,38 +3461,55 @@ impl Node {
                                         let fork_slot = fork_block.slot();
                                         let fork_block_no = fork_block.block_number();
                                         let fork_hash_hex = fork_block.header.header_hash.to_hex();
-                                        {
+                                        // Fix B (Bug B, 2026-05-16): use apply_block_with_delta
+                                        // so that fork-replayed blocks also populate LedgerSeq.
+                                        // Without this, after a successful fork switch the seq
+                                        // tip stays at the intersection point, creating a new
+                                        // "shadow gap" that causes the NEXT fork to fail the
+                                        // same way.  Lock order: release ledger_state before
+                                        // acquiring ledger_seq (same invariant as Fix A).
+                                        let fork_delta = {
                                             let mut ls = self.ledger_state.write().await;
-                                            if let Err(e) = ls.apply_block(&fork_block, validation_mode) {
-                                                warn!(
-                                                    slot = fork_slot.0,
-                                                    block = fork_block_no.0,
-                                                    "Fork replay: ledger apply failed: {e} — \
-                                                     clearing volatile and resyncing"
-                                                );
-                                                // Drop the write lock before acquiring the write
-                                                // lock on chain_db.
-                                                drop(ls);
-                                                let mut db = self.chain_db.write().await;
-                                                db.clear_volatile();
-                                                return;
-                                            }
-                                            // Propagate era transitions discovered during fork replay.
-                                            if let Some((prev_era, new_era, epoch)) =
-                                                ls.pending_era_transition.take()
-                                            {
-                                                drop(ls);
-                                                let mut eh = self.era_history.write().await;
-                                                if eh.current_era() < new_era {
-                                                    eh.record_era_transition(new_era, epoch.0);
-                                                    info!(
-                                                        prev = %prev_era,
-                                                        new = %new_era,
-                                                        epoch = epoch.0,
-                                                        "Era transition recorded in HFC era history (fork replay)",
+                                            match ls.apply_block_with_delta(&fork_block, validation_mode) {
+                                                Ok(delta) => {
+                                                    // Propagate era transitions discovered during fork replay.
+                                                    if let Some((prev_era, new_era, epoch)) =
+                                                        ls.pending_era_transition.take()
+                                                    {
+                                                        drop(ls);
+                                                        let mut eh = self.era_history.write().await;
+                                                        if eh.current_era() < new_era {
+                                                            eh.record_era_transition(new_era, epoch.0);
+                                                            info!(
+                                                                prev = %prev_era,
+                                                                new = %new_era,
+                                                                epoch = epoch.0,
+                                                                "Era transition recorded in HFC era history (fork replay)",
+                                                            );
+                                                        }
+                                                    }
+                                                    delta
+                                                }
+                                                Err(e) => {
+                                                    warn!(
+                                                        slot = fork_slot.0,
+                                                        block = fork_block_no.0,
+                                                        "Fork replay: ledger apply failed: {e} — \
+                                                         clearing volatile and resyncing"
                                                     );
+                                                    // Drop the write lock before acquiring the write
+                                                    // lock on chain_db.
+                                                    drop(ls);
+                                                    let mut db = self.chain_db.write().await;
+                                                    db.clear_volatile();
+                                                    return;
                                                 }
                                             }
+                                        };
+                                        // Push the delta to LedgerSeq (ledger_state lock released).
+                                        {
+                                            let mut seq = self.ledger_seq.write().await;
+                                            seq.push(fork_delta);
                                         }
                                         // Update chain fragment and consensus tip for each
                                         // replayed block.
@@ -3615,30 +3650,58 @@ impl Node {
             BlockValidationMode::ApplyOnly
         };
 
-        // Apply to ledger state.
-        {
+        // Apply to ledger state and collect the delta for LedgerSeq.
+        //
+        // Fix A (Bug B, 2026-05-16): use apply_block_with_delta so that every
+        // live-tip block contributes a delta to LedgerSeq.  Previously this
+        // path called apply_block (no delta), leaving LedgerSeq with 0 entries.
+        // When the next fork fired, rollback_via_seq found nothing and fell
+        // through to the snapshot path — which also fails on a fresh node with
+        // no snapshots yet.  The rollback abort cascaded into clear_volatile(),
+        // which destroyed all fork tracking state and caused permanent
+        // StoreButDontChange for every subsequent relay block.
+        //
+        // Aligns the live path with process_blocks_bulk which already uses
+        // apply_block_with_delta + push (see sync.rs:1146-1182).
+        //
+        // Lock order: ledger_state write lock released BEFORE ledger_seq write
+        // lock acquired — same invariant enforced in process_blocks_bulk.
+        // NOTE: apply_fetched_block and process_blocks_bulk are mutually
+        // exclusive code paths (bulk sync runs to completion, then live sync
+        // starts), so there is no risk of double-pushing the same block.
+        let delta = {
             let mut ls = self.ledger_state.write().await;
-            if let Err(e) = ls.apply_block(&block, validation_mode) {
-                warn!(
-                    slot = block_slot.0,
-                    block = block_number.0,
-                    "Fetched block failed ledger apply: {e}"
-                );
-                return;
-            }
-            // Consume pending era transition and propagate to the HFC state machine.
-            if let Some((prev_era, new_era, epoch)) = ls.pending_era_transition.take() {
-                let mut eh = self.era_history.write().await;
-                if eh.current_era() < new_era {
-                    eh.record_era_transition(new_era, epoch.0);
-                    info!(
-                        prev = %prev_era,
-                        new = %new_era,
-                        epoch = epoch.0,
-                        "Era transition recorded in HFC era history",
+            match ls.apply_block_with_delta(&block, validation_mode) {
+                Ok(delta) => {
+                    // Consume pending era transition and propagate to the HFC state machine.
+                    if let Some((prev_era, new_era, epoch)) = ls.pending_era_transition.take() {
+                        let mut eh = self.era_history.write().await;
+                        if eh.current_era() < new_era {
+                            eh.record_era_transition(new_era, epoch.0);
+                            info!(
+                                prev = %prev_era,
+                                new = %new_era,
+                                epoch = epoch.0,
+                                "Era transition recorded in HFC era history",
+                            );
+                        }
+                    }
+                    delta
+                }
+                Err(e) => {
+                    warn!(
+                        slot = block_slot.0,
+                        block = block_number.0,
+                        "Fetched block failed ledger apply: {e}"
                     );
+                    return;
                 }
             }
+        };
+        // Push delta to LedgerSeq (ledger_state lock already released above).
+        {
+            let mut seq = self.ledger_seq.write().await;
+            seq.push(delta);
         }
 
         // Update chain fragment.
@@ -5098,33 +5161,41 @@ impl Node {
                             // VolatileDB already switched to the fork that
                             // ends with our forged block.  Use the ledger-only
                             // rollback so we don't undo the switch.
-                            self.handle_ledger_rollback(&rollback_point).await;
-
-                            // Replay every block in `apply` EXCEPT the last one
-                            // (our forged block). The caller below runs the
-                            // normal own-block apply + announce path for the
-                            // last element, so we must not double-apply it here.
-                            let validation_mode = if self.validate_all_blocks {
-                                BlockValidationMode::ValidateAll
+                            if !self.handle_ledger_rollback(&rollback_point).await {
+                                warn!(
+                                    rollback_slot = intersection_slot.0,
+                                    "Forge fork rollback failed; skipping replay."
+                                );
+                                // Yield false so storage_succeeded=false and the
+                                // caller returns early without attempting to apply
+                                // our forged block on a misaligned ledger.
+                                false
                             } else {
-                                BlockValidationMode::ApplyOnly
-                            };
-                            let intermediate = &apply[..apply.len() - 1];
-                            let mut replay_failed = false;
-                            for fork_hash in intermediate {
-                                let cbor_opt = {
-                                    let db = self.chain_db.read().await;
-                                    db.get_block(fork_hash).unwrap_or(None)
+                                // Replay every block in `apply` EXCEPT the last one
+                                // (our forged block). The caller below runs the
+                                // normal own-block apply + announce path for the
+                                // last element, so we must not double-apply it here.
+                                let validation_mode = if self.validate_all_blocks {
+                                    BlockValidationMode::ValidateAll
+                                } else {
+                                    BlockValidationMode::ApplyOnly
                                 };
-                                let Some(cbor) = cbor_opt else {
-                                    warn!(
-                                        hash = %fork_hash.to_hex(),
-                                        "Forge fork replay: block hash in apply list not found in ChainDB"
-                                    );
-                                    replay_failed = true;
-                                    break;
-                                };
-                                let fork_block = match dugite_serialization::multi_era::decode_block_minimal_with_byron_epoch_length(
+                                let intermediate = &apply[..apply.len() - 1];
+                                let mut replay_failed = false;
+                                for fork_hash in intermediate {
+                                    let cbor_opt = {
+                                        let db = self.chain_db.read().await;
+                                        db.get_block(fork_hash).unwrap_or(None)
+                                    };
+                                    let Some(cbor) = cbor_opt else {
+                                        warn!(
+                                            hash = %fork_hash.to_hex(),
+                                            "Forge fork replay: block hash in apply list not found in ChainDB"
+                                        );
+                                        replay_failed = true;
+                                        break;
+                                    };
+                                    let fork_block = match dugite_serialization::multi_era::decode_block_minimal_with_byron_epoch_length(
                                     &cbor,
                                     self.byron_epoch_length,
                                 ) {
@@ -5138,59 +5209,74 @@ impl Node {
                                         break;
                                     }
                                 };
-                                let fork_slot = fork_block.slot();
-                                let fork_block_no = fork_block.block_number();
-                                {
-                                    let mut ls = self.ledger_state.write().await;
-                                    if let Err(e) = ls.apply_block(&fork_block, validation_mode) {
-                                        warn!(
-                                            slot = fork_slot.0,
-                                            block = fork_block_no.0,
-                                            "Forge fork replay: ledger apply failed: {e} — \
-                                             clearing volatile and aborting forge"
-                                        );
-                                        drop(ls);
-                                        let mut db = self.chain_db.write().await;
-                                        db.clear_volatile();
-                                        replay_failed = true;
-                                        break;
-                                    }
-                                    if let Some((prev_era, new_era, epoch)) =
-                                        ls.pending_era_transition.take()
-                                    {
-                                        drop(ls);
-                                        let mut eh = self.era_history.write().await;
-                                        if eh.current_era() < new_era {
-                                            eh.record_era_transition(new_era, epoch.0);
-                                            info!(
-                                                prev = %prev_era,
-                                                new = %new_era,
-                                                epoch = epoch.0,
-                                                "Era transition recorded in HFC era history (forge fork replay)",
+                                    let fork_slot = fork_block.slot();
+                                    let fork_block_no = fork_block.block_number();
+                                    // Fix B (forge path): collect delta so LedgerSeq
+                                    // tracks forged-path fork replay blocks too.
+                                    let forge_fork_delta = {
+                                        let mut ls = self.ledger_state.write().await;
+                                        match ls
+                                            .apply_block_with_delta(&fork_block, validation_mode)
+                                        {
+                                            Ok(delta) => {
+                                                if let Some((prev_era, new_era, epoch)) =
+                                                    ls.pending_era_transition.take()
+                                                {
+                                                    drop(ls);
+                                                    let mut eh = self.era_history.write().await;
+                                                    if eh.current_era() < new_era {
+                                                        eh.record_era_transition(new_era, epoch.0);
+                                                        info!(
+                                                            prev = %prev_era,
+                                                            new = %new_era,
+                                                            epoch = epoch.0,
+                                                            "Era transition recorded in HFC era history (forge fork replay)",
+                                                        );
+                                                    }
+                                                }
+                                                delta
+                                            }
+                                            Err(e) => {
+                                                warn!(
+                                                slot = fork_slot.0,
+                                                block = fork_block_no.0,
+                                                "Forge fork replay: ledger apply failed: {e} — \
+                                                 clearing volatile and aborting forge"
                                             );
+                                                drop(ls);
+                                                let mut db = self.chain_db.write().await;
+                                                db.clear_volatile();
+                                                replay_failed = true;
+                                                break;
+                                            }
                                         }
+                                    };
+                                    {
+                                        let mut seq = self.ledger_seq.write().await;
+                                        seq.push(forge_fork_delta);
+                                    }
+                                    {
+                                        let mut fragment = self.chain_fragment.write().await;
+                                        fragment.push(fork_block.header.clone());
+                                    }
+                                    self.consensus.update_tip(fork_block.tip());
+                                    self.metrics
+                                        .blocks_applied
+                                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                    if let Some(ref tx) = self.block_announcement_tx {
+                                        let mut hash_bytes = [0u8; 32];
+                                        hash_bytes.copy_from_slice(
+                                            fork_block.header.header_hash.as_ref(),
+                                        );
+                                        let _ = tx.send(dugite_network::BlockAnnouncement {
+                                            slot: fork_slot.0,
+                                            hash: hash_bytes,
+                                            block_number: fork_block_no.0,
+                                        });
                                     }
                                 }
-                                {
-                                    let mut fragment = self.chain_fragment.write().await;
-                                    fragment.push(fork_block.header.clone());
-                                }
-                                self.consensus.update_tip(fork_block.tip());
-                                self.metrics
-                                    .blocks_applied
-                                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                                if let Some(ref tx) = self.block_announcement_tx {
-                                    let mut hash_bytes = [0u8; 32];
-                                    hash_bytes
-                                        .copy_from_slice(fork_block.header.header_hash.as_ref());
-                                    let _ = tx.send(dugite_network::BlockAnnouncement {
-                                        slot: fork_slot.0,
-                                        hash: hash_bytes,
-                                        block_number: fork_block_no.0,
-                                    });
-                                }
-                            }
-                            !replay_failed
+                                !replay_failed
+                            } // else: rollback succeeded, replay ran
                         }
                     }
                     Some(dugite_storage::AddBlockResult::Invalid(reason)) => {
@@ -5218,19 +5304,28 @@ impl Node {
                 // Re-validate our own forged block before announcing it to peers,
                 // matching Haskell cardano-node behavior. This prevents producing
                 // and propagating blocks that contain invalid transactions.
-                {
+                // Fix A (forge path): collect delta so LedgerSeq tracks own-
+                // forged blocks too, enabling seq-based rollback on the next fork.
+                let forged_delta = {
                     let mut ls = self.ledger_state.write().await;
-                    if let Err(e) = ls.apply_block(&block, BlockValidationMode::ValidateAll) {
-                        // Haskell: TraceForgedInvalidBlock (Error) — own block failed validation.
-                        error!(
-                            target: "forge",
-                            slot = next_slot.0,
-                            block_no = block_number.0,
-                            block_hash = %block.header.header_hash.to_hex(),
-                            "TraceForgedInvalidBlock: forged block failed ledger validation — NOT announcing: {e}",
-                        );
-                        return;
+                    match ls.apply_block_with_delta(&block, BlockValidationMode::ValidateAll) {
+                        Ok(delta) => delta,
+                        Err(e) => {
+                            // Haskell: TraceForgedInvalidBlock (Error) — own block failed validation.
+                            error!(
+                                target: "forge",
+                                slot = next_slot.0,
+                                block_no = block_number.0,
+                                block_hash = %block.header.header_hash.to_hex(),
+                                "TraceForgedInvalidBlock: forged block failed ledger validation — NOT announcing: {e}",
+                            );
+                            return;
+                        }
                     }
+                };
+                {
+                    let mut seq = self.ledger_seq.write().await;
+                    seq.push(forged_delta);
                 }
 
                 // Update chain fragment with the new forged block header.

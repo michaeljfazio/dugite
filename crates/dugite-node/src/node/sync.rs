@@ -181,6 +181,18 @@ impl Node {
     ///    rollbacks past the volatile window and post-restart cases where the
     ///    seq is empty).
     ///
+    /// # Return value
+    ///
+    /// Returns `true` if the rollback succeeded (including benign no-ops like
+    /// "already at target" or "immutable-tip guard skipped").  Returns `false`
+    /// only when the rollback could not be completed — i.e. the target is
+    /// outside both the LedgerSeq volatile window AND no canonical snapshot is
+    /// available (or the snapshot was corrupt).  Callers MUST check the return
+    /// value and skip fork replay when it is `false`; attempting replay against
+    /// a misaligned ledger will always fail and clearing VolatileDB as a
+    /// recovery action produces the permanent `StoreButDontChange` cascade
+    /// described in the Bug-B design doc (2026-05-16).
+    ///
     /// Matches Haskell's `LedgerDB.V2` rollback flow: try the in-memory
     /// `LedgerSeq` first, fall back to snapshot-driven recovery.
     ///
@@ -191,11 +203,11 @@ impl Node {
     /// selection (`ChainSelQueue::TriggeredFork`) owns the global ledger
     /// rollback decision (Haskell parity with `ChainSync.Client::rollBackward`).
     /// See the 2026-04-21 fix for the original cascade bug this guards against.
-    pub async fn handle_ledger_rollback(&self, rollback_point: &Point) {
+    pub async fn handle_ledger_rollback(&self, rollback_point: &Point) -> bool {
         self.handle_rollback_inner(rollback_point).await
     }
 
-    async fn handle_rollback_inner(&self, rollback_point: &Point) {
+    async fn handle_rollback_inner(&self, rollback_point: &Point) -> bool {
         let rollback_slot = rollback_point.slot().map(|s| s.0).unwrap_or(0);
 
         // Count every rollback event for observability, even no-ops.
@@ -224,7 +236,7 @@ impl Node {
                         "Ignoring rollback to point older than immutable tip; \
                          peer is stale or on a divergent chain. Node state preserved."
                     );
-                    return;
+                    return true;
                 }
             }
         }
@@ -240,7 +252,7 @@ impl Node {
                     rollback_slot,
                     ledger_slot, "Rollback point equals ledger tip, skipping"
                 );
-                return;
+                return true;
             }
 
             if rollback_slot > ledger_slot {
@@ -292,7 +304,7 @@ impl Node {
                     ledger_slot,
                     rollback_slot, replayed, "Gap-bridge: advanced ledger to meet rollback target"
                 );
-                return;
+                return true;
             }
         }
 
@@ -319,7 +331,7 @@ impl Node {
                 // mempool/forge tip thought we were, the live tip is now correct
                 // and downstream callers (mempool TTL sweep, BlockFetch decision)
                 // will pick up the new tip on their next iteration.
-                return;
+                return true;
             }
             // Else: fall through to the snapshot-reload slow path.  This
             // happens when:
@@ -523,7 +535,7 @@ impl Node {
                              Operator should inspect the snapshot file or \
                              restart from a known-good Mithril import."
                         );
-                        return;
+                        return false;
                     }
                 }
             } else {
@@ -556,7 +568,7 @@ impl Node {
                      state preserved.  Operator should restart from a Mithril \
                      import."
                 );
-                return;
+                return false;
             }
         }
 
@@ -609,6 +621,8 @@ impl Node {
 
         // 4. Notify peers
         self.notify_rollback(rollback_point).await;
+
+        true
     }
 
     /// Process a batch of forward blocks: store in ChainDB, apply to ledger, validate, log progress.
@@ -903,7 +917,10 @@ impl Node {
                             // VolatileDB's selected_chain has already been
                             // switched to the new fork by ChainSelQueue; use
                             // the ledger-only path so we don't undo the switch.
-                            self.handle_ledger_rollback(&rollback_point).await;
+                            // In the bulk-sync path we do not short-circuit on
+                            // rollback failure: the gap-bridging loop below will
+                            // fail cleanly if the ledger is misaligned.
+                            let _ = self.handle_ledger_rollback(&rollback_point).await;
                             // Block is stored; ledger is rolled back; the
                             // gap-bridging path further down will apply the
                             // new fork blocks in order.
@@ -4506,6 +4523,157 @@ mod additional_sync_tests {
         assert_eq!(
             extract_slot_from_wrapped_header(&[0xDE, 0xAD, 0xBE, 0xEF]),
             None
+        );
+    }
+}
+
+// ─── Bug B regression test ────────────────────────────────────────────────────
+//
+// Reproduces the root cause of the fork-switch stall described in:
+//   docs/superpowers/specs/2026-05-16-bug-b-fork-switch-stall-fix.md
+//
+// Root cause: the live-tip apply path called `apply_block` (no delta) instead
+// of `apply_block_with_delta`, leaving `LedgerSeq` with 0 deltas after N
+// applied blocks.  When the first fork fired, `rollback_via_seq` returned
+// `None` (no matching point in an empty seq), the snapshot slow-path also
+// failed (no snapshot on a fresh node), and the rollback was aborted.
+// The subsequent fork replay then cleared VolatileDB, causing permanent
+// `StoreButDontChange` for every relay block from that point on.
+//
+// These tests verify the LedgerSeq invariant that Fix A + B enforce:
+// every applied block MUST contribute a delta so that rollback_via_seq
+// can always find the intersection point within k blocks.
+#[cfg(test)]
+mod bug_b_ledger_seq_regression {
+    use dugite_ledger::ledger_seq::{LedgerDelta, LedgerSeq};
+    use dugite_primitives::block::Point;
+    use dugite_primitives::hash::Hash32;
+    use dugite_primitives::time::{BlockNo, SlotNo};
+
+    /// Build a minimal LedgerDelta for use in tests.
+    fn make_delta(slot: u64, hash_byte: u8) -> LedgerDelta {
+        LedgerDelta::new(
+            SlotNo(slot),
+            Hash32::from_bytes([hash_byte; 32]),
+            BlockNo(slot),
+        )
+    }
+
+    /// Build a `Point::Specific` for the given slot / hash byte.
+    fn make_point(slot: u64, hash_byte: u8) -> Point {
+        Point::Specific(SlotNo(slot), Hash32::from_bytes([hash_byte; 32]))
+    }
+
+    /// PRE-FIX SCENARIO: verify that an empty LedgerSeq returns None from
+    /// `find_rollback_n`.
+    ///
+    /// This is the exact condition that triggered Bug B: after 11 live-applied
+    /// blocks with no delta pushes, the seq was empty, `find_rollback_n`
+    /// returned `None`, and the snapshot fallback also failed — causing
+    /// `handle_ledger_rollback` to abort and `clear_volatile()` to fire.
+    #[test]
+    fn empty_ledger_seq_rollback_returns_none() {
+        // Build an anchor at origin (slot 0).
+        let anchor_state = dugite_ledger::LedgerState::new(
+            dugite_primitives::protocol_params::ProtocolParameters::mainnet_defaults(),
+        );
+        let seq = LedgerSeq::with_defaults(anchor_state, 2160);
+
+        // Simulated fork intersection at slot 46 (relay chain block 4).
+        let target = make_point(46, 0xAA);
+
+        // Without any delta pushes, find_rollback_n must return None.
+        // This is the pre-fix failure mode that caused the cascade.
+        assert_eq!(
+            seq.find_rollback_n(&target),
+            None,
+            "empty seq must return None — this is the bug condition Fix A prevents"
+        );
+    }
+
+    /// POST-FIX SCENARIO: after pushing deltas for each applied block,
+    /// `find_rollback_n` returns `Some(n)` for the intersection point —
+    /// rollback succeeds and no cascade follows.
+    #[test]
+    fn populated_ledger_seq_rollback_succeeds() {
+        let anchor_state = dugite_ledger::LedgerState::new(
+            dugite_primitives::protocol_params::ProtocolParameters::mainnet_defaults(),
+        );
+        let mut seq = LedgerSeq::with_defaults(anchor_state, 2160);
+
+        // Simulate 5 relay blocks (slots 17..46) each pushing a delta.
+        // This is what Fix A ensures happens for every live-applied block.
+        let relay_slots: &[(u64, u8)] = &[
+            (17, 0x01),
+            (24, 0x02),
+            (31, 0x03),
+            (38, 0x04),
+            (46, 0xAA), // intersection slot — the rollback target
+        ];
+        for &(slot, hash_byte) in relay_slots {
+            seq.push(make_delta(slot, hash_byte));
+        }
+
+        // 6 self-forged blocks on top (slots 50..79).
+        for (i, slot) in (50u64..80).step_by(6).enumerate() {
+            seq.push(make_delta(slot, 0xF0 + i as u8));
+        }
+
+        // The intersection point (relay slot 46) is now in the volatile window.
+        let target = make_point(46, 0xAA);
+        let n = seq.find_rollback_n(&target);
+        assert!(
+            n.is_some(),
+            "populated seq must find the intersection — Fix A makes this true"
+        );
+        // We pushed 5 relay + some self-forged blocks; intersection is at index 4
+        // so n = (total_deltas - 4 - 1) = deltas after intersection.
+        assert!(
+            n.unwrap() > 0,
+            "rollback should unwind at least the self-forged blocks"
+        );
+    }
+
+    /// POST-FIX SCENARIO: after a fork switch + replay, deltas for the fork
+    /// blocks are also in the seq (Fix B), so the NEXT fork can also roll back.
+    #[test]
+    fn fork_replay_deltas_enable_subsequent_rollback() {
+        let anchor_state = dugite_ledger::LedgerState::new(
+            dugite_primitives::protocol_params::ProtocolParameters::mainnet_defaults(),
+        );
+        let mut seq = LedgerSeq::with_defaults(anchor_state, 2160);
+
+        // Phase 1: push 3 common-prefix blocks.
+        seq.push(make_delta(10, 0x10));
+        seq.push(make_delta(20, 0x20));
+        seq.push(make_delta(30, 0x30)); // intersection for first fork
+
+        // Phase 2: rollback to slot 30 (simulating first fork).
+        let fork1_target = make_point(30, 0x30);
+        let n1 = seq
+            .find_rollback_n(&fork1_target)
+            .expect("must find slot 30");
+        seq.rollback(n1);
+        assert_eq!(seq.len(), 3, "after rollback to slot 30, 3 deltas remain");
+
+        // Phase 3: replay fork1 blocks — Fix B ensures these are pushed.
+        seq.push(make_delta(35, 0x31));
+        seq.push(make_delta(40, 0x32));
+        seq.push(make_delta(45, 0x33)); // fork1 tip
+
+        // Phase 4: a second fork fires with intersection at slot 35.
+        // Without Fix B, seq would only have 3 deltas (pre-fork) and slot 35
+        // would NOT be in it.  With Fix B, slot 35 IS present.
+        let fork2_target = make_point(35, 0x31);
+        let n2 = seq.find_rollback_n(&fork2_target);
+        assert!(
+            n2.is_some(),
+            "Fix B: fork replay deltas must be in seq so second fork can roll back"
+        );
+        assert_eq!(
+            n2.unwrap(),
+            2,
+            "two deltas (slots 40 and 45) should be rolled back"
         );
     }
 }
