@@ -406,5 +406,55 @@ fn test_set_modifies_value() {
     }
 }
 
+/// `set` must work for schema keys that aren't yet present in the file —
+/// after the change, the new key is appended with the user-supplied value.
+#[test]
+fn test_set_adds_missing_schema_key() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("test-config.json");
+    // File deliberately omits Protocol; the schema knows it.
+    let config = serde_json::json!({"NetworkMagic": 2});
+    std::fs::write(&path, serde_json::to_string_pretty(&config).unwrap()).unwrap();
+
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_dugite-config"))
+        .args(["set", "Protocol", "TPraos", "--config"])
+        .arg(&path)
+        .output()
+        .expect("dugite-config binary must exist");
+
+    assert!(
+        output.status.success(),
+        "set failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let content = std::fs::read_to_string(&path).unwrap();
+    let json: serde_json::Value = serde_json::from_str(&content).unwrap();
+    assert_eq!(json["Protocol"], "TPraos");
+    // Existing entries survive.
+    assert_eq!(json["NetworkMagic"], 2);
+}
+
+/// `set` for a key that's neither in the file nor in the schema must fail with
+/// a clear message rather than silently appending an unknown key.
+#[test]
+fn test_set_rejects_unknown_key() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("test-config.json");
+    std::fs::write(&path, r#"{"NetworkMagic": 2}"#).unwrap();
+
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_dugite-config"))
+        .args(["set", "NotInSchema", "hello", "--config"])
+        .arg(&path)
+        .output()
+        .expect("dugite-config binary must exist");
+
+    assert!(
+        !output.status.success(),
+        "set of unknown key should fail; stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
 // Note: dugite-config is a binary crate with no lib target.
 // Schema/config tests are in the source modules (57 tests total).
