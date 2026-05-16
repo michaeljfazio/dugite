@@ -442,8 +442,12 @@ async fn process_add_block(
             let era = current_header.protocol_version.era();
             let slot_window: u64 = match era {
                 Era::Conway | Era::Dijkstra => 5, // RestrictedVRFTiebreaker 5
-                Era::Byron => 0,                  // no tiebreaker (handled below)
-                _ => u64::MAX,                    // pre-Conway Praos: unrestricted
+                // Byron uses density not Praos; `prefer_chain_with_headers`
+                // short-circuits to `compare_density` and never consults
+                // `slot_window`. Value is irrelevant — keep `u64::MAX` for
+                // consistency with other unrestricted arms.
+                Era::Byron => u64::MAX,
+                _ => u64::MAX, // pre-Conway Praos: unrestricted
             };
 
             let mut sel = ChainSelection::new();
@@ -492,12 +496,22 @@ async fn process_add_block(
 
         let best_fork = match (header, current_tip_header.as_ref()) {
             (Some(_new_h), Some(cur_h)) => {
-                // Praos path: at least one fork-tip header must also be
-                // present in the cache; otherwise individual candidates with
-                // missing headers are silently excluded by the filter_map
-                // (acceptable: a missing-header candidate would also be
-                // skipped by the legacy strict-greater filter when block_no
-                // ties).
+                // Praos path. `select_best_praos` consults the comparator for
+                // every fork-tip whose header is cached. Returning `None` here
+                // means either:
+                //   (a) no candidate's header is cached (legacy / Byron path),
+                //       in which case we must fall back to give those callers
+                //       some chance of triggering a fork switch; OR
+                //   (b) every cached candidate was explicitly rejected by
+                //       Praos (PreferCurrent or Equal).
+                //
+                // Case (b) is safe to fall through because `select_best_legacy`
+                // is strictly weaker than Praos for the cases they both decide:
+                // any candidate Praos rejected via the EQUAL-block_no
+                // tiebreaker has bn == current_tip_block_no, which `> filter`
+                // also rejects. A candidate with bn > current_tip would have
+                // been chosen by Praos's `compare_length` (PreferCandidate),
+                // so we never reach this fallback for that case.
                 select_best_praos(fork_tips, cur_h, &db)
                     .or_else(|| select_best_legacy(db.get_all_fork_tips(), current_tip_block_no))
             }
@@ -1826,7 +1840,7 @@ mod tests {
             vec![0xFFu8; 32], // equal to a's vrf — Praos tiebreaker = ShouldNotSwitch
             9,
         );
-        handle
+        let b2_result = handle
             .submit_block_with_header(
                 Hash32::from_bytes(b2_bytes),
                 SlotNo(115),
@@ -1837,6 +1851,16 @@ mod tests {
             )
             .await
             .unwrap();
+        // Pin the intermediate state: b2 has equal block_no AND equal VRF to
+        // `a`, so Praos's comparePraos returns ShouldNotSwitch EQ and b2 must
+        // remain a fork. Asserting this prevents a future regression that
+        // would adopt equal-VRF candidates from passing this test on the
+        // b3 step alone.
+        assert_eq!(
+            b2_result,
+            AddBlockResult::StoredAsFork,
+            "b2 (equal block_no, equal VRF) must stay a fork — Praos tiebreaker = ShouldNotSwitch EQ; got {b2_result:?}",
+        );
 
         let b3_bytes = [0xB3u8; 32];
         let b3_header = praos_header(
