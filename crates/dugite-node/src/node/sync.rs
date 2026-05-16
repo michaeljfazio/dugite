@@ -2767,6 +2767,9 @@ pub async fn chainsync_client_task(
     // GSM event sender — emits PeerRegistered, BlockReceived, PeerTipUpdated,
     // PeerActive, PeerIdling events to the GSM actor. Uses try_send (non-blocking).
     gsm_event_tx: tokio::sync::mpsc::Sender<crate::gsm::GsmEvent>,
+    // Shared flag: set to true on the first non-Origin MsgIntersectFound.
+    // Allows the forge loop to gate on successful peer intersection.
+    peer_intersection_established: Arc<std::sync::atomic::AtomicBool>,
 ) -> Result<()> {
     // ═══════════════════════════════════════════════════════════════════════
     // Phase 1: Build known points for intersection
@@ -3037,6 +3040,24 @@ pub async fn chainsync_client_task(
              ledger tip; disconnecting to retry after peer catches up"
         ));
     }
+
+    // Forge gate: signal that at least one peer has established a valid
+    // intersection.  We reach this point only after the Bug-A guard has
+    // passed (Origin intersections with non-Origin local tip are rejected
+    // above), so any intersection that survives is safe for the forge loop.
+    //
+    // Two valid cases:
+    //   1. Specific intersection — the peer shares our chain; normal sync.
+    //   2. Origin intersection with Origin local ledger — both fresh from
+    //      genesis; forging can proceed immediately once the first peer blocks
+    //      arrive.
+    //
+    // In the Bug-C scenario the BP has a self-forged fork (non-Origin local
+    // tip) and the relay starts at a different chain point.  The Bug-A guard
+    // catches that case above and returns Err before we reach here.  So
+    // reaching this line means the intersection is either Specific or Origin-
+    // with-Origin-ledger, both of which are safe — we set the flag regardless.
+    peer_intersection_established.store(true, std::sync::atomic::Ordering::Relaxed);
 
     // Initialize candidate chain state for this peer.
     let intersection_slot = intersection
