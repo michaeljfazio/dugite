@@ -45,11 +45,26 @@ SAMPLER_PIDS=()
 
 cleanup() {
     log_info "Stopping samplers"
+    # Kill each sampler PID *and* its descendants. The samplers run
+    # `tail -F <log> | while read`; the recorded $! is the subshell
+    # holding the pipeline, but `tail -F` is a sibling child that
+    # may survive a SIGTERM on the subshell alone. Walk descendants
+    # to clean up tail/jq/grep processes too.
+    kill_tree() {
+        local parent="$1" child
+        for child in $(pgrep -P "$parent" 2>/dev/null); do
+            kill_tree "$child"
+        done
+        kill -TERM "$parent" 2>/dev/null || true
+    }
     for pid in "${SAMPLER_PIDS[@]}"; do
-        kill -TERM "$pid" 2>/dev/null || true
+        kill_tree "$pid"
     done
     sleep 1
     for pid in "${SAMPLER_PIDS[@]}"; do
+        for descendant in $(pgrep -P "$pid" 2>/dev/null); do
+            kill -KILL "$descendant" 2>/dev/null || true
+        done
         kill -0 "$pid" 2>/dev/null && kill -KILL "$pid" 2>/dev/null || true
     done
     # Snapshot logs to evidence dir
@@ -81,7 +96,68 @@ sample_tips "$EVD/tip-samples.csv" &
 SAMPLER_PIDS+=($!)
 log_info "tip-sampler PID $!"
 
-# Task 16 adds: block-recorder
+# ---- Block recorder ----
+# Tails the three node logs and records forge + receive events.
+#
+# Observed log lines (real soak, 2026-05-16):
+#
+#   dugite (relay or bp) — text format with `forge:` target for forge events:
+#     2026-05-16T06:07:47.684Z  INFO forge: TraceForgedBlock slot=21 block_no=0 block_hash=bba2... txs=0
+#     2026-05-16T06:07:47.695Z  INFO forge: TraceAdoptedBlock block_no=0 slot=21 block_hash=bba2... txs=0
+#     2026-05-16T06:07:29.692Z  INFO dugite_node::node: Chain extended era=Conway slot=2 block=0 txs=0 hash=a36d...
+#
+#   cardano-bp — MachineFormat JSON (one object per line):
+#     {"ns":"Forge.Loop.AdoptedBlock","data":{"slot":2,"blockHash":"a36d...","blockSize":828,...}}
+#     {"ns":"ChainDB.AddBlockEvent.AddedToCurrentChain","data":{"newtip":"a36d...@2","newSuffixSelectView":{"slotNo":2,...}}}
+record_dugite() {
+    local observer="$1" log="$2" out="$3"
+    tail -n 0 -F "$log" 2>/dev/null | while IFS= read -r line; do
+        local now slot hash issuer
+        now="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+        if echo "$line" | grep -q 'TraceForgedBlock'; then
+            slot=$(echo "$line"  | grep -oE 'slot=[0-9]+'         | head -1 | cut -d= -f2)
+            hash=$(echo "$line"  | grep -oE 'block_hash=[a-f0-9]+'| head -1 | cut -d= -f2)
+            printf '%s,%s,forge,%s,%s,,,\n' "$now" "$observer" "${slot:-?}" "${hash:-?}" >> "$out"
+        elif echo "$line" | grep -q 'Chain extended'; then
+            slot=$(echo "$line"  | grep -oE 'slot=[0-9]+'  | head -1 | cut -d= -f2)
+            hash=$(echo "$line"  | grep -oE 'hash=[a-f0-9]+'| head -1 | cut -d= -f2)
+            printf '%s,%s,recv,%s,%s,,,\n' "$now" "$observer" "${slot:-?}" "${hash:-?}" >> "$out"
+        fi
+    done
+}
+
+record_cardano() {
+    local observer="$1" log="$2" out="$3"
+    tail -n 0 -F "$log" 2>/dev/null | while IFS= read -r line; do
+        # cardano-node MachineFormat — one JSON object per line. Use jq for parsing.
+        ns=$(echo "$line" | jq -r '.ns // empty' 2>/dev/null) || continue
+        case "$ns" in
+            "Forge.Loop.AdoptedBlock"|"Forge.Loop.ForgedBlock")
+                ts=$(  echo "$line" | jq -r '.at // empty'                            2>/dev/null)
+                slot=$(echo "$line" | jq -r '.data.slot // empty'                     2>/dev/null)
+                # AdoptedBlock uses .data.blockHash; ForgedBlock uses .data.block
+                hash=$(echo "$line" | jq -r '.data.blockHash // .data.block // empty' 2>/dev/null)
+                printf '%s,%s,forge,%s,%s,,,\n' "${ts:-$(date -u +%Y-%m-%dT%H:%M:%SZ)}" "$observer" "${slot:-?}" "${hash:-?}" >> "$out"
+                ;;
+            "ChainDB.AddBlockEvent.AddedToCurrentChain")
+                ts=$(  echo "$line" | jq -r '.at // empty'                              2>/dev/null)
+                slot=$(echo "$line" | jq -r '.data.newSuffixSelectView.slotNo // empty' 2>/dev/null)
+                # newtip is "hash@slot" — strip the @slot suffix
+                hash=$(echo "$line" | jq -r '.data.newtip // empty'                     2>/dev/null | cut -d@ -f1)
+                printf '%s,%s,recv,%s,%s,,,\n' "${ts:-$(date -u +%Y-%m-%dT%H:%M:%SZ)}" "$observer" "${slot:-?}" "${hash:-?}" >> "$out"
+                ;;
+        esac
+    done
+}
+
+record_dugite  "dugite-bp"    "$LD_LOGS/dugite-bp.log"    "$EVD/blocks.csv" &
+SAMPLER_PIDS+=($!)
+record_dugite  "dugite-relay" "$LD_LOGS/dugite-relay.log" "$EVD/blocks.csv" &
+SAMPLER_PIDS+=($!)
+record_cardano "cardano-bp"   "$LD_LOGS/cardano-bp.log"   "$EVD/blocks.csv" &
+SAMPLER_PIDS+=($!)
+log_info "block-recorder pids: ${SAMPLER_PIDS[*]: -3}"
+
 # Task 17 adds: tx-injector
 
 END_EPOCH=$(($(date +%s) + DURATION))
