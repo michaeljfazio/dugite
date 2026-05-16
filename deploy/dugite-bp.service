@@ -1,0 +1,88 @@
+# dugite-bp.service — block producer node
+#
+# Install:
+#   sudo cp deploy/dugite-bp.service /etc/systemd/system/
+#   sudo systemctl daemon-reload && sudo systemctl enable --now dugite-bp
+#
+# Required: /etc/dugite/bp.env must exist and export key paths, e.g.:
+#   DUGITE_KES_KEY=/etc/dugite/keys/kes.skey
+#   DUGITE_VRF_KEY=/etc/dugite/keys/vrf.skey
+#   DUGITE_OPCERT=/etc/dugite/keys/opcert.cert
+#
+# Optional tuning overrides also go in bp.env:
+#   DUGITE_PIPELINE_DEPTH=300
+#   RUST_LOG=info
+#
+# Key files should be owned root:dugite with mode 0640 so that only the
+# dugite service account (and root) can read them.
+#
+# For passive relay / observer deployments use dugite-node.service instead.
+
+[Unit]
+Description=Dugite Cardano Node (block producer)
+Documentation=https://github.com/your-org/dugite
+After=network-online.target
+Wants=network-online.target
+# Ensure the BP does not start without its key environment file.
+ConditionPathExists=/etc/dugite/bp.env
+
+[Service]
+Type=simple
+User=dugite
+Group=dugite
+
+# Common tuning overrides (optional, silently skipped if absent)
+EnvironmentFile=-/etc/dugite/env
+# Block-producer secrets — required; unit will not start if this file is missing
+EnvironmentFile=/etc/dugite/bp.env
+
+ExecStart=/usr/local/bin/dugite-node run \
+    --config /etc/dugite/config.json \
+    --topology /etc/dugite/topology.json \
+    --database-path /var/lib/dugite/db \
+    --socket-path /run/dugite/node.sock \
+    --host-addr 0.0.0.0 \
+    --port 3001 \
+    --shelley-kes-key ${DUGITE_KES_KEY} \
+    --shelley-vrf-key ${DUGITE_VRF_KEY} \
+    --shelley-operational-certificate ${DUGITE_OPCERT}
+
+# Reload re-reads per-subsystem trace verbosity without restarting the node
+# (commit 1f34ac81c / PR #473 — SIGHUP handler in dugite-node).
+ExecReload=/bin/kill -HUP $MAINPID
+
+Restart=on-failure
+RestartSec=10
+
+# Give ChainDB time to flush volatile→immutable before systemd SIGKILL
+TimeoutStopSec=60
+
+# Many concurrent N2N sockets — keep headroom well above the 1024 default
+LimitNOFILE=65536
+
+# Runtime directory (/run/dugite) created automatically by systemd; cleaned on stop
+RuntimeDirectory=dugite
+RuntimeDirectoryMode=0750
+
+# Allow writes to DB and socket; everything else is read-only from the service's view
+ProtectSystem=strict
+ReadWritePaths=/var/lib/dugite /run/dugite
+
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+NoNewPrivileges=true
+RestrictSUIDSGID=true
+LockPersonality=true
+
+# WASM/Plutus script execution requires a writable + executable mapping.
+# Do NOT set MemoryDenyWriteExecute=true here.
+MemoryDenyWriteExecute=false
+
+# Deny syscall groups that a Cardano node has no business calling.
+SystemCallFilter=~@privileged @debug @mount @raw-io @reboot @swap @clock @cpu-emulation @obsolete @resources @keyring
+
+RestrictNamespaces=true
+
+[Install]
+WantedBy=multi-user.target
