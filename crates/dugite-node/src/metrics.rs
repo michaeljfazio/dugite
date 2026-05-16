@@ -567,6 +567,26 @@ pub struct NodeMetrics {
     /// `dugite_config_reload_total{result="rejected"}` — SIGHUP reloads where
     /// the config file failed to parse; the live config was not altered.
     pub config_reload_rejected: AtomicU64,
+
+    // ── Peer governor target gauges (hot-reloadable via SIGHUP) ────────────
+    //
+    // Exposed as `dugite_peer_governor_target{name="..."}` so the integration
+    // test and Prometheus alerts can observe that SIGHUP target changes took
+    // effect within 10 seconds.
+    /// Target number of active (hot) peers (`TargetNumberOfActivePeers`).
+    pub peer_governor_target_active: AtomicU64,
+    /// Target number of established (warm) peers (`TargetNumberOfEstablishedPeers`).
+    pub peer_governor_target_established: AtomicU64,
+    /// Maximum number of known (cold) peers (`TargetNumberOfKnownPeers`).
+    pub peer_governor_target_known: AtomicU64,
+    /// Target number of root peers (`TargetNumberOfRootPeers`).
+    pub peer_governor_target_root: AtomicU64,
+    /// Target number of active big-ledger peers.
+    pub peer_governor_target_active_big: AtomicU64,
+    /// Target number of established big-ledger peers.
+    pub peer_governor_target_established_big: AtomicU64,
+    /// Maximum number of known big-ledger peers.
+    pub peer_governor_target_known_big: AtomicU64,
 }
 
 /// Plain-data view of the governance-related ledger state and Conway
@@ -703,6 +723,13 @@ impl NodeMetrics {
             config_reload_applied: AtomicU64::new(0),
             config_reload_ignored: AtomicU64::new(0),
             config_reload_rejected: AtomicU64::new(0),
+            peer_governor_target_active: AtomicU64::new(0),
+            peer_governor_target_established: AtomicU64::new(0),
+            peer_governor_target_known: AtomicU64::new(0),
+            peer_governor_target_root: AtomicU64::new(0),
+            peer_governor_target_active_big: AtomicU64::new(0),
+            peer_governor_target_established_big: AtomicU64::new(0),
+            peer_governor_target_known_big: AtomicU64::new(0),
         }
     }
 
@@ -795,6 +822,37 @@ impl NodeMetrics {
             .store(f64::to_bits(min), Ordering::Relaxed);
         self.peer_rtt_max_ms
             .store(f64::to_bits(max), Ordering::Relaxed);
+    }
+
+    /// Update the peer governor target gauges from a live `RuntimeConfig`.
+    ///
+    /// Called both at node startup (to initialise the gauges) and on every
+    /// SIGHUP reload so Prometheus reflects the new targets immediately.
+    #[allow(clippy::too_many_arguments)]
+    pub fn set_peer_governor_targets(
+        &self,
+        active: usize,
+        established: usize,
+        known: usize,
+        root: usize,
+        active_big: usize,
+        established_big: usize,
+        known_big: usize,
+    ) {
+        self.peer_governor_target_active
+            .store(active as u64, Ordering::Relaxed);
+        self.peer_governor_target_established
+            .store(established as u64, Ordering::Relaxed);
+        self.peer_governor_target_known
+            .store(known as u64, Ordering::Relaxed);
+        self.peer_governor_target_root
+            .store(root as u64, Ordering::Relaxed);
+        self.peer_governor_target_active_big
+            .store(active_big as u64, Ordering::Relaxed);
+        self.peer_governor_target_established_big
+            .store(established_big as u64, Ordering::Relaxed);
+        self.peer_governor_target_known_big
+            .store(known_big as u64, Ordering::Relaxed);
     }
 
     pub fn add_blocks_received(&self, count: u64) {
@@ -1670,6 +1728,47 @@ impl NodeMetrics {
             ));
             out.push_str(&format!(
                 "dugite_config_reload_total{{result=\"rejected\"}} {rejected}\n"
+            ));
+        }
+
+        // Peer governor target gauges — emitted unconditionally so alert rules
+        // can use `absent()` without a "metric not found" guard.
+        {
+            let active = self.peer_governor_target_active.load(Ordering::Relaxed);
+            let established = self
+                .peer_governor_target_established
+                .load(Ordering::Relaxed);
+            let known = self.peer_governor_target_known.load(Ordering::Relaxed);
+            let root = self.peer_governor_target_root.load(Ordering::Relaxed);
+            let active_big = self.peer_governor_target_active_big.load(Ordering::Relaxed);
+            let established_big = self
+                .peer_governor_target_established_big
+                .load(Ordering::Relaxed);
+            let known_big = self.peer_governor_target_known_big.load(Ordering::Relaxed);
+            out.push_str(
+                "# HELP dugite_peer_governor_target Peer governor target counts by name\n",
+            );
+            out.push_str("# TYPE dugite_peer_governor_target gauge\n");
+            out.push_str(&format!(
+                "dugite_peer_governor_target{{name=\"active\"}} {active}\n"
+            ));
+            out.push_str(&format!(
+                "dugite_peer_governor_target{{name=\"established\"}} {established}\n"
+            ));
+            out.push_str(&format!(
+                "dugite_peer_governor_target{{name=\"known\"}} {known}\n"
+            ));
+            out.push_str(&format!(
+                "dugite_peer_governor_target{{name=\"root\"}} {root}\n"
+            ));
+            out.push_str(&format!(
+                "dugite_peer_governor_target{{name=\"active_big\"}} {active_big}\n"
+            ));
+            out.push_str(&format!(
+                "dugite_peer_governor_target{{name=\"established_big\"}} {established_big}\n"
+            ));
+            out.push_str(&format!(
+                "dugite_peer_governor_target{{name=\"known_big\"}} {known_big}\n"
             ));
         }
 

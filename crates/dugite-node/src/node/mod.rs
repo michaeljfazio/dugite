@@ -2150,6 +2150,38 @@ impl Node {
         }
         let _peers = self.topology.all_peers();
 
+        // ── RuntimeConfig watch channel (SIGHUP → governor) ─────────────────
+        //
+        // The `RuntimeConfig` watch channel is the single source of truth for
+        // all hot-reloadable config values.  It is written by the SIGHUP
+        // handler (below) and read on every governor tick so the governor
+        // always operates with the latest operator-supplied targets.
+        //
+        // This satisfies the acceptance criterion (#488): `kill -HUP <pid>`
+        // with an edited config propagates to the governor within the next
+        // 2-second tick — well within the 10-second budget.
+        use crate::config_reload::RuntimeConfig;
+        let initial_runtime_config = RuntimeConfig::from_node_config(&self.config);
+
+        // Initialise the peer governor target gauges from the boot-time config.
+        self.metrics.set_peer_governor_targets(
+            initial_runtime_config.target_number_of_active_peers,
+            initial_runtime_config.target_number_of_established_peers,
+            initial_runtime_config.target_number_of_known_peers,
+            initial_runtime_config.target_number_of_root_peers,
+            initial_runtime_config.target_number_of_active_big_ledger_peers,
+            initial_runtime_config.target_number_of_established_big_ledger_peers,
+            initial_runtime_config.target_number_of_known_big_ledger_peers,
+        );
+
+        let (runtime_config_tx, runtime_config_rx) = watch::channel(initial_runtime_config);
+
+        // On non-Unix platforms there is no SIGHUP so the sender is never used.
+        // Drop it here so the receiver's `has_changed()` returns Err (no sender)
+        // and the governor tick skips the update path cleanly.
+        #[cfg(not(unix))]
+        drop(runtime_config_tx);
+
         // Setup SIGHUP handler for topology + config reload (#322, #473, #488)
         //
         // On SIGHUP:
@@ -2158,8 +2190,8 @@ impl Node {
         //      "applied" (hot-reloadable) vs "ignored" (restart-required).
         //   3. Apply reloadable fields: peer governor targets, churn intervals,
         //      stall/error demotion thresholds, log directive/severity.
-        //   4. Update the runtime_config watch channel so governor & others
-        //      pick up the new values on their next iteration.
+        //   4. Send updated RuntimeConfig on the watch channel so the governor
+        //      and other consumers pick up new values on their next iteration.
         //   5. Bump the appropriate `dugite_config_reload_total{result=...}` counter.
         #[cfg(unix)]
         {
@@ -2169,6 +2201,7 @@ impl Node {
             let log_handle = self.log_handle.clone();
             let pm_for_sighup = peer_manager.clone();
             let metrics_for_sighup = self.metrics.clone();
+            let runtime_config_tx_for_sighup = runtime_config_tx;
             // Snapshot of the boot-time NodeConfig as the comparison baseline.
             let mut live_config = self.config.clone();
             let mut hup_shutdown_rx = shutdown_rx.clone();
@@ -2300,6 +2333,31 @@ impl Node {
                                 ignored = ?plan.ignored,
                                 "config_reload: applied hot-reloadable config changes"
                             );
+
+                            // ── Step 4b: publish new RuntimeConfig on watch ────────
+                            //
+                            // The governor tick and any other consumer that holds a
+                            // `watch::Receiver<RuntimeConfig>` will see the new values
+                            // on their next iteration (≤ 2 seconds for the governor).
+                            // Also update the Prometheus target gauges immediately
+                            // so the metrics endpoint reflects the change within the
+                            // same polling window.
+                            let new_runtime = config_reload::RuntimeConfig::from_node_config(&new_config);
+                            metrics_for_sighup.set_peer_governor_targets(
+                                new_runtime.target_number_of_active_peers,
+                                new_runtime.target_number_of_established_peers,
+                                new_runtime.target_number_of_known_peers,
+                                new_runtime.target_number_of_root_peers,
+                                new_runtime.target_number_of_active_big_ledger_peers,
+                                new_runtime.target_number_of_established_big_ledger_peers,
+                                new_runtime.target_number_of_known_big_ledger_peers,
+                            );
+                            // send() only fails if all receivers are dropped — that
+                            // would mean the main loop has already exited, so we log
+                            // the condition but don't abort the SIGHUP handler.
+                            if runtime_config_tx_for_sighup.send(new_runtime).is_err() {
+                                warn!("config_reload: runtime_config watch has no receivers (main loop exited?)");
+                            }
 
                             // ── Step 5: bump metric counter ───────────────────────
                             metrics_for_sighup.config_reload_applied
@@ -2860,6 +2918,11 @@ impl Node {
         };
         let mut governor = Governor::new(gov_config);
 
+        // Hold the runtime_config watch receiver so we can drain it on each
+        // governor tick.  `borrow_and_update()` marks the latest value as
+        // "seen" so successive ticks only see genuinely new values.
+        let mut runtime_config_rx = runtime_config_rx;
+
         // Governor evaluation every 2 seconds — matches Haskell's warm-promotion
         // check frequency for responsive peer lifecycle management.
         let mut governor_ticker = tokio::time::interval(Duration::from_secs(2));
@@ -2938,6 +3001,29 @@ impl Node {
 
                 // ── Governor evaluation (periodic, every 2s) ────────────
                 _ = governor_ticker.tick() => {
+                    // ── Apply any pending RuntimeConfig update ───────────
+                    //
+                    // `has_changed()` returns true if the SIGHUP handler
+                    // sent a new value since the last time we called
+                    // `borrow_and_update()`.  The cost is a single atomic
+                    // load, so we check unconditionally on every tick.
+                    if runtime_config_rx.has_changed().unwrap_or(false) {
+                        let rt = runtime_config_rx.borrow_and_update().clone();
+                        governor.update_targets(PeerTargets {
+                            target_warm: rt.target_number_of_established_peers,
+                            target_hot: rt.target_number_of_active_peers,
+                            max_cold: rt.target_number_of_known_peers,
+                            target_warm_big_ledger: rt.target_number_of_established_big_ledger_peers,
+                            target_hot_big_ledger: rt.target_number_of_active_big_ledger_peers,
+                        });
+                        debug!(
+                            active = rt.target_number_of_active_peers,
+                            established = rt.target_number_of_established_peers,
+                            known = rt.target_number_of_known_peers,
+                            "governor: applied updated peer targets from RuntimeConfig"
+                        );
+                    }
+
                     // Compute governor actions based on current peer state.
                     // Build LocalRootGroupTargets from the peer manager's stored
                     // local root groups so the governor can promote topology peers

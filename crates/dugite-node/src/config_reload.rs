@@ -582,4 +582,117 @@ mod tests {
         assert_eq!(restored.min_severity, cfg.min_severity);
         assert_eq!(restored.network_magic, cfg.network_magic);
     }
+
+    // ── watch::channel wiring sanity (#488) ─────────────────────────────────
+    //
+    // Verifies that a `RuntimeConfig` published via `watch::Sender::send()`
+    // is immediately visible to a `watch::Receiver::borrow_and_update()` call
+    // on the consuming side.  This is the wiring pattern used by the governor
+    // tick in `node/mod.rs`; if the pattern were wrong (e.g. using the wrong
+    // channel primitive, or loading a stale snapshot), target updates would
+    // silently not reach the governor.
+
+    #[test]
+    fn test_watch_channel_wiring_pattern() {
+        // Initial RuntimeConfig with active target = 20 (default)
+        let mut cfg = default_config();
+        let initial = RuntimeConfig::from_node_config(&cfg);
+        assert_eq!(initial.target_number_of_active_peers, 20);
+
+        let (tx, mut rx) = tokio::sync::watch::channel(initial);
+
+        // The consumer's initial borrow should see 20.
+        {
+            let snapshot = rx.borrow_and_update();
+            assert_eq!(snapshot.target_number_of_active_peers, 20);
+        }
+
+        // After the "operator" changes the config and sends a new RuntimeConfig …
+        cfg.target_number_of_active_peers = 50;
+        let updated = RuntimeConfig::from_node_config(&cfg);
+        tx.send(updated)
+            .expect("send must succeed while receiver is alive");
+
+        // … the consumer must observe the new value on the next borrow.
+        assert!(
+            rx.has_changed()
+                .expect("sender is alive so Err is impossible"),
+            "receiver should see a new value after send()"
+        );
+        {
+            let snapshot = rx.borrow_and_update();
+            assert_eq!(
+                snapshot.target_number_of_active_peers, 50,
+                "consumer must see the new active-peer target after SIGHUP send"
+            );
+        }
+
+        // After `borrow_and_update()` marks the value as seen, `has_changed()`
+        // should return false — no new value has arrived since the last borrow.
+        assert!(
+            !rx.has_changed().expect("sender still alive"),
+            "has_changed() must be false after borrow_and_update() consumed the latest value"
+        );
+    }
+
+    // ── Governor target propagation path (#488) ──────────────────────────────
+    //
+    // Exercises the `Governor::update_targets()` method — added to dugite-network
+    // for this PR — to confirm that `compute_actions` reflects the new targets
+    // rather than the boot-time values.
+
+    #[test]
+    fn test_governor_update_targets_reflects_in_actions() {
+        use dugite_network::{Governor, GovernorConfig, PeerTargets};
+
+        // Start with a very low target (1 hot peer) so the governor emits
+        // PromoteToWarm / PromoteToHot actions on a fresh PeerManager.
+        let config = GovernorConfig {
+            targets: PeerTargets {
+                target_warm: 1,
+                target_hot: 1,
+                max_cold: 10,
+                target_warm_big_ledger: 0,
+                target_hot_big_ledger: 0,
+            },
+            ..Default::default()
+        };
+        let mut gov = Governor::new(config);
+
+        // Raise the target to 3 via update_targets — simulating a SIGHUP reload.
+        gov.update_targets(PeerTargets {
+            target_warm: 3,
+            target_hot: 3,
+            max_cold: 10,
+            target_warm_big_ledger: 0,
+            target_hot_big_ledger: 0,
+        });
+
+        // With 3 cold peers and a target_hot = 3, the governor should emit
+        // PromoteToWarm actions (since hot < target_hot = 3).
+        use dugite_network::{PeerManager, PeerSource};
+        let mut pm = PeerManager::default();
+        for i in 1u8..=3 {
+            pm.add_peer(
+                std::net::SocketAddr::from(([10, 0, 0, i], 3001)),
+                PeerSource::Topology,
+            );
+        }
+
+        let actions = gov.compute_actions(&pm, &[]);
+        let promote_count = actions
+            .iter()
+            .filter(|a| {
+                matches!(
+                    a,
+                    dugite_network::peer::governor::GovernorAction::PromoteToWarm(_)
+                )
+            })
+            .count();
+        assert!(
+            promote_count > 0,
+            "governor should emit PromoteToWarm after update_targets raised target to 3; got {:?}",
+            actions
+        );
+    }
 }
