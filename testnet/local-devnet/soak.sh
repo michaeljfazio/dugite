@@ -158,7 +158,46 @@ record_cardano "cardano-bp"   "$LD_LOGS/cardano-bp.log"   "$EVD/blocks.csv" &
 SAMPLER_PIDS+=($!)
 log_info "block-recorder pids: ${SAMPLER_PIDS[*]: -3}"
 
-# Task 17 adds: tx-injector
+# ---- Tx injector ----
+# Submits 5 txs to each of the 3 sockets at T+120s, T+600s, T+1200s.
+inject_wave() {
+    local wave="$1"
+    local out="$2"
+    log_info "tx-injector: wave $wave starting"
+    for entry in "relay:$LD_RELAY_SOCK" "dugite-bp:$LD_DUGITE_BP_SOCK" "cardano-bp:$LD_CARDANO_BP_SOCK"; do
+        name="${entry%%:*}"
+        sock="${entry##*:}"
+        # Capture both txids and a per-tx return code.
+        while IFS= read -r txid; do
+            rc=$?
+            ts="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+            printf '%s,%s,%s,%s,%s\n' "$ts" "$sock" "$wave" "$txid" "$rc" >> "$out"
+        done < <("$SCRIPT_DIR/submit-txs.sh" "$sock" 5 "wave${wave}-${name}" 2>/dev/null || true)
+    done
+    log_info "tx-injector: wave $wave done"
+}
+
+inject_runner() {
+    local out="$1"
+    local start
+    start="$(date +%s)"
+    local wave=0
+    # Wave triggers (seconds from soak start)
+    for w in 120 600 1200; do
+        while [ $(( $(date +%s) - start )) -lt "$w" ]; do
+            sleep 5
+            # If soak duration is shorter than the wave trigger, exit early
+            if [ $(( $(date +%s) - start )) -ge "$DURATION" ]; then
+                return
+            fi
+        done
+        wave=$((wave + 1))
+        inject_wave "$wave" "$out"
+    done
+}
+inject_runner "$EVD/tx-submissions.csv" &
+SAMPLER_PIDS+=($!)
+log_info "tx-injector PID $!"
 
 END_EPOCH=$(($(date +%s) + DURATION))
 log_info "Soak end at epoch $END_EPOCH ($(date -u -r $END_EPOCH 2>/dev/null || date -u -d @$END_EPOCH))"
