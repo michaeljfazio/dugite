@@ -1398,6 +1398,7 @@ dependencies = [
  "bytes",
  "crc32fast",
  "criterion",
+ "dugite-consensus",
  "dugite-crypto",
  "dugite-primitives",
  "dugite-serialization",

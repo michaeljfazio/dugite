@@ -3385,12 +3385,13 @@ impl Node {
         let storage_succeeded = if let Some(ref handle) = self.chain_sel_handle {
             let cbor = block.raw_cbor.clone().unwrap_or_default();
             let result = handle
-                .submit_block(
+                .submit_block_with_header(
                     block_hash,
                     block_slot,
                     block_number,
                     *block.prev_hash(),
                     cbor,
+                    block.header.clone(),
                 )
                 .await;
             match result {
@@ -5086,12 +5087,13 @@ impl Node {
                 // fall back to the direct ChainDB write path for correctness.
                 let chain_sel_verdict = if let Some(ref handle) = self.chain_sel_handle {
                     handle
-                        .submit_block(
+                        .submit_block_with_header(
                             *block.hash(),
                             block.slot(),
                             block.block_number(),
                             *block.prev_hash(),
                             cbor,
+                            block.header.clone(),
                         )
                         .await
                 } else {
