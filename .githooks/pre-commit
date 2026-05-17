@@ -1,5 +1,27 @@
 #!/usr/bin/env bash
 set -e
+
+# Multi-crate tripwire: warn (or fail with DUGITE_PRECOMMIT_STRICT=1) when a
+# single commit's staged paths span more than two distinct workspace crates.
+# Most legitimate commits touch 1-2 crates; co-mingled commits across many
+# crates are usually accidental and obscure history (#482).
+staged_crates=$(git diff --cached --name-only --diff-filter=ACMR \
+    | grep -oE '^crates/[^/]+/' | sort -u || true)
+crate_count=0
+if [ -n "$staged_crates" ]; then
+    crate_count=$(printf '%s\n' "$staged_crates" | grep -c .)
+fi
+if [ "$crate_count" -gt 2 ]; then
+    echo "Pre-commit: WARNING — this commit touches $crate_count crates:"
+    printf '%s\n' "$staged_crates" | sed 's/^/    /'
+    echo "Consider splitting into focused commits per crate."
+    echo "(Set DUGITE_PRECOMMIT_STRICT=1 to make this fatal.)"
+    if [ "${DUGITE_PRECOMMIT_STRICT:-0}" = "1" ]; then
+        echo "ERROR: DUGITE_PRECOMMIT_STRICT=1 set; refusing multi-crate commit."
+        exit 1
+    fi
+fi
+
 echo "Pre-commit: checking formatting..."
 cargo fmt --all -- --check || { echo "ERROR: Run 'cargo fmt --all'"; exit 1; }
 echo "Pre-commit: building..."
