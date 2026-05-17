@@ -1,0 +1,10 @@
+ts,observer,event,slot,hash,issuer_vkey,body_size,n_txs
+2026-05-16T10:00:00Z,dugite-bp,forge,10,aaaa,POOL1,,
+2026-05-16T10:00:01Z,dugite-relay,recv,10,aaaa,,,
+2026-05-16T10:00:01Z,cardano-bp,recv,10,aaaa,,,
+2026-05-16T10:00:10Z,cardano-bp,forge,20,bbbb,POOL2,,
+2026-05-16T10:00:11Z,dugite-relay,recv,20,bbbb,,,
+2026-05-16T10:00:11Z,dugite-bp,recv,20,bbbb,,,
+2026-05-16T10:00:20Z,dugite-bp,forge,30,cccc,POOL1,,
+2026-05-16T10:00:21Z,dugite-relay,recv,30,cccc,,,
+2026-05-16T10:00:21Z,cardano-bp,recv,30,cccc,,,
