@@ -218,10 +218,16 @@ pub fn compute_reward_update(
 
     let total_stake = MAX_LOVELACE_SUPPLY.saturating_sub(reserves.0);
     if total_stake == 0 {
-        let net = treasury_cut.saturating_sub(epoch_fees);
+        // No pools can distribute, so undistributed = reward_pot.
+        // Haskell: deltaT = treasury_cut + undistributed, deltaR = expansion.
+        // expansion = treasury_cut + reward_pot - epoch_fees
+        //           = treasury_cut + (total_rewards_available - treasury_cut) - epoch_fees
+        //           = total_rewards_available - epoch_fees
+        let delta_treasury = total_rewards_available; // treasury_cut + reward_pot
+        let delta_reserves = total_rewards_available.saturating_sub(epoch_fees); // expansion
         return PendingRewardUpdate {
-            delta_reserves: net,
-            delta_treasury: treasury_cut,
+            delta_reserves,
+            delta_treasury,
             rewards: HashMap::new(),
         };
     }
@@ -231,13 +237,18 @@ pub fn compute_reward_update(
     // conditions), Haskell's pulser still drains expansion and routes the
     // tau cut to treasury — only the per-pool distribution loop is skipped
     // because there are no pools to distribute to.  Match that behaviour.
+    //
+    // Issue #485-D2 fix: undistributed = reward_pot (all of it, since distributed=0).
+    // Haskell: deltaT = treasury_cut + undistributed, deltaR = expansion.
     let go = match go_snapshot {
         Some(s) => s,
         None => {
-            let net = treasury_cut.saturating_sub(epoch_fees);
+            // distributed=0, undistributed=reward_pot
+            let delta_treasury = total_rewards_available; // treasury_cut + reward_pot
+            let delta_reserves = total_rewards_available.saturating_sub(epoch_fees); // expansion
             return PendingRewardUpdate {
-                delta_reserves: net,
-                delta_treasury: treasury_cut,
+                delta_reserves,
+                delta_treasury,
                 rewards: HashMap::new(),
             };
         }
@@ -254,10 +265,12 @@ pub fn compute_reward_update(
             go.pool_params.len(),
             go.pool_stake.len()
         );
-        let net = treasury_cut.saturating_sub(epoch_fees);
+        // distributed=0, undistributed=reward_pot
+        let delta_treasury = total_rewards_available; // treasury_cut + reward_pot
+        let delta_reserves = total_rewards_available.saturating_sub(epoch_fees); // expansion
         return PendingRewardUpdate {
-            delta_reserves: net,
-            delta_treasury: treasury_cut,
+            delta_reserves,
+            delta_treasury,
             rewards: HashMap::new(),
         };
     }
@@ -443,24 +456,48 @@ pub fn compute_reward_update(
 
     let undistributed = reward_pot.saturating_sub(total_distributed);
 
+    // Issue #485-D2: Haskell's completeStep adds undistributed rewards to treasury
+    // (deltaT = treasury_cut + undistributed). Previously dugite only credited
+    // treasury_cut, leaving undistributed silently in reserves instead of moving it
+    // to treasury, causing a cumulative 15B-lovelace treasury deficit on preview.
+    //
+    // Conservation check (Haskell RUPD):
+    //   deltaT = treasury_cut + undistributed
+    //   deltaR = expansion  = treasury_cut + distributed + undistributed - epoch_fees
+    //          = (treasury_cut + undistributed) + distributed - epoch_fees
+    //          = delta_treasury + total_distributed - epoch_fees
+    //
+    // Six-pot: -deltaR + deltaT + distributed - epoch_fees = 0 ✓
+    let delta_treasury = treasury_cut.saturating_add(undistributed);
+    // delta_reserves = expansion = delta_treasury + distributed - epoch_fees
+    let delta_reserves = delta_treasury
+        .saturating_add(total_distributed)
+        .saturating_sub(epoch_fees);
+
     debug!(
-        "Rewards calculated: {} lovelace to {} accounts, {} to treasury (expansion: {}, fees: {})",
+        "Rewards calculated: {} lovelace to {} accounts, \
+         treasury_cut={} undistributed={} delta_treasury={} delta_reserves={} \
+         (expansion: {}, fees: {})",
         total_distributed,
         reward_map.len(),
-        treasury_cut + undistributed,
+        treasury_cut,
+        undistributed,
+        delta_treasury,
+        delta_reserves,
         expansion,
         epoch_fees
     );
 
-    let gross = treasury_cut + total_distributed;
-    let net_reserve_decrease = gross.saturating_sub(epoch_fees);
     if epoch_fees > 0 {
-        debug!("Fee offset: gross={gross}, epoch_fees={epoch_fees}, net={net_reserve_decrease}");
+        debug!(
+            "Fee offset: delta_treasury={delta_treasury}, epoch_fees={epoch_fees}, \
+             delta_reserves={delta_reserves}"
+        );
     }
     PendingRewardUpdate {
         rewards: reward_map,
-        delta_treasury: treasury_cut,
-        delta_reserves: net_reserve_decrease,
+        delta_treasury,
+        delta_reserves,
     }
 }
 

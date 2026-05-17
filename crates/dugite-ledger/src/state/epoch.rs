@@ -1173,10 +1173,12 @@ mod tests {
         // new() sets reserves = MAX_LOVELACE_SUPPLY, so total_stake = 0.
         // With prev_d = 1.0 (>= 0.8): eta = 1, expansion = floor(rho * reserves).
         // rho = 3/1000, so expansion = floor(3/1000 * 45_000_000_000_000_000) = 135_000_000_000_000.
-        // treasury_cut = floor(tau * expansion) = floor(2/10 * 135_000_000_000_000) = 27_000_000_000_000.
-        // delta_reserves = treasury_cut - epoch_fees = 27_000_000_000_000 (total_stake==0 path).
-        let expected_treasury_cut = 27_000_000_000_000u64;
-        let expected_delta_reserves = 27_000_000_000_000u64;
+        // With no pools: distributed=0, undistributed=reward_pot.
+        // Haskell: deltaT = treasury_cut + undistributed = expansion + fees = expansion (fees=0).
+        //          deltaR = expansion.
+        let expansion = 135_000_000_000_000u64;
+        let expected_delta_treasury = expansion; // treasury_cut + undistributed = expansion + fees
+        let expected_delta_reserves = expansion; // deltaR = expansion (Haskell)
 
         let treasury_before = state.epochs.treasury;
         let reserves_before = state.epochs.reserves;
@@ -1185,13 +1187,13 @@ mod tests {
 
         assert_eq!(
             state.epochs.treasury.0,
-            treasury_before.0 + expected_treasury_cut,
-            "treasury should increase by tau * expansion"
+            treasury_before.0 + expected_delta_treasury,
+            "treasury should increase by expansion (treasury_cut + undistributed) when no pools"
         );
         assert_eq!(
             state.epochs.reserves.0,
             reserves_before.0 - expected_delta_reserves,
-            "reserves should decrease by the net expansion"
+            "reserves should decrease by expansion (Haskell deltaR)"
         );
     }
 
