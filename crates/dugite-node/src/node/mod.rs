@@ -76,7 +76,6 @@ use crate::topology::Topology;
 /// as a blob.
 ///
 /// Used by the Mithril InMemory snapshot importer. Issue #460.
-#[allow(dead_code)] // currently driven only by tests; importer call-site lands with the WIP InMemory rewrite
 pub(crate) fn resolve_inmemory_tables_path(snap: &std::path::Path) -> Option<PathBuf> {
     let flat = snap.join("tables");
     let nested = flat.join("tvar");
@@ -4244,12 +4243,23 @@ impl Node {
         };
         state.node_network = Some(network_id);
 
-        // ── Load UTxOs from tvar file ────────────────────────────────────
-        let tvar_path = snapshot_dir.join("tables").join("tvar");
-        if tvar_path.exists() {
+        // ── Load UTxOs from MemPack tables blob ──────────────────────────
+        //
+        // `resolve_inmemory_tables_path` handles both layouts:
+        //   * ouroboros-consensus < 1.0.0.0 (cardano-node ≤ 10.6.x): `tables/tvar`
+        //   * ouroboros-consensus ≥ 1.0.0.0 (cardano-node ≥ 11.0.1): flat `tables`
+        // Preview is on PV11 (cardano-node 11.0.1+), so the flat layout is what
+        // ships today.  Hard-coding `tables/tvar` silently skipped the UTxO load
+        // on every fresh preview import (#495), leaving `utxos=0` in the saved
+        // native snapshot and tripping the UTxO-empty-gate on the next startup.
+        if let Some(tvar_path) = resolve_inmemory_tables_path(snapshot_dir) {
             let tvar_data = std::fs::read(&tvar_path)
                 .with_context(|| format!("reading tvar file at {}", tvar_path.display()))?;
-            info!(bytes = tvar_data.len(), "Loading UTxO set from tvar file");
+            info!(
+                path = %tvar_path.display(),
+                bytes = tvar_data.len(),
+                "Loading UTxO set from MemPack tables blob"
+            );
 
             let iter = dugite_serialization::mempack::TvarIterator::new(&tvar_data)
                 .context("Failed to create tvar iterator")?;
@@ -4323,9 +4333,9 @@ impl Node {
             info!(utxo_count, skipped, "UTxO loading from tvar file complete");
         } else {
             warn!(
-                "No tvar file found at {} — UTxO set will be empty; \
-                 full chain replay required",
-                tvar_path.display()
+                snapshot_dir = %snapshot_dir.display(),
+                "No tables blob (neither `tables` flat file nor `tables/tvar` legacy) \
+                 found — UTxO set will be empty; full chain replay required"
             );
         }
 
@@ -6483,6 +6493,56 @@ mod tests {
         let tmp = tempfile::tempdir().expect("tempdir");
         // Empty snapshot dir: neither layout present.
         assert!(resolve_inmemory_tables_path(tmp.path()).is_none());
+    }
+
+    /// Regression for #495: the importer's UTxO-loading sub-block must
+    /// decode the MemPack tables blob from the v11+ flat layout
+    /// (`<snap>/tables` as a file).  Prior to the fix the importer
+    /// hard-coded the legacy `<snap>/tables/tvar` path, so every preview
+    /// import (preview is PV11) silently skipped the UTxO load and saved
+    /// `utxos=0` into the native snapshot — tripping the defensive
+    /// UTxO-empty gate on the next startup and forcing a full-chain
+    /// replay.  This test pins the integration so a regression to the
+    /// hard-coded path is caught.
+    #[test]
+    fn importer_loads_utxos_from_v11_flat_tables_layout() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let snap = tmp.path();
+        // Minimal valid MemPack tables blob: array(1)[ map() ].
+        //   0x81        array(1)
+        //   0xbf        indefinite-length map start
+        //   0xff        break  (= empty map)
+        std::fs::write(snap.join("tables"), [0x81u8, 0xbf, 0xff]).expect("write tables blob");
+
+        // The resolver must point the importer at the flat blob.
+        let resolved =
+            resolve_inmemory_tables_path(snap).expect("v11 flat tables path must resolve");
+        assert_eq!(resolved, snap.join("tables"));
+
+        // And the importer's actual decode path (TvarIterator) must accept it.
+        let data = std::fs::read(&resolved).unwrap();
+        let mut iter = dugite_serialization::mempack::TvarIterator::new(&data)
+            .expect("v11 flat tables must decode as MemPack array(1)[ map() ]");
+        assert!(iter.next().is_none(), "empty map yields no entries");
+    }
+
+    /// The importer must NOT silently skip the UTxO load when only the
+    /// legacy `tables/tvar` layout is present (cardano-node ≤ 10.6.x
+    /// snapshots).  Same TvarIterator path, different filesystem layout.
+    #[test]
+    fn importer_loads_utxos_from_legacy_nested_tvar_layout() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let snap = tmp.path();
+        std::fs::create_dir_all(snap.join("tables")).expect("mkdir tables");
+        std::fs::write(snap.join("tables").join("tvar"), [0x81u8, 0xbf, 0xff])
+            .expect("write nested tvar");
+
+        let resolved = resolve_inmemory_tables_path(snap).expect("legacy nested tvar must resolve");
+        assert_eq!(resolved, snap.join("tables").join("tvar"));
+        let data = std::fs::read(&resolved).unwrap();
+        let mut iter = dugite_serialization::mempack::TvarIterator::new(&data)
+            .expect("legacy nested tvar must decode as MemPack array(1)[ map() ]");
+        assert!(iter.next().is_none());
     }
 
     #[test]
