@@ -235,16 +235,16 @@ proptest! {
     /// The six pots are:
     ///   `utxo_total + reserves + treasury + sum(reward_accounts) + deposits_pot + fee_pot`
     ///
-    /// The ADA flows during RUPD are:
-    ///   - `reserves -= (expansion - ssFee_offset)` (net_reserve_decrease)
-    ///   - `treasury += treasury_cut`
-    ///   - `reward_accounts += member_rewards`
+    /// The ADA flows during RUPD are (matching Haskell's RUPD/completeStep):
+    ///   - `reserves -= expansion`  (deltaR = full monetary expansion)
+    ///   - `treasury += treasury_cut + undistributed`  (deltaT includes leftover rewards)
+    ///   - `reward_accounts += distributed`  (registered rewards credited)
     ///   - `epoch_fees (ssFee via ss_fee) → consumed by rPot; epoch_fees reset to 0`
     ///
     /// These flows are ADA-neutral when all six pots are included:
-    ///   `expansion = treasury_cut + member_rewards + undistributed`
-    ///   `net_reserve_decrease = treasury_cut + member_rewards - ssFee`
-    ///   `change = -net_reserve_decrease + treasury_cut + member_rewards + 0 - ssFee = 0`
+    ///   `expansion = treasury_cut + distributed + undistributed - ssFee`
+    ///   (since rewardPot = expansion + ssFee - treasury_cut = distributed + undistributed)
+    ///   `change = -expansion + (treasury_cut + undistributed) + distributed - ssFee = 0`
     ///
     /// # Why we check pre == post, not pre == MAX_LOVELACE_SUPPLY
     ///
