@@ -11,7 +11,7 @@ cd "$(dirname "$0")/.."
 CLI="./target/release/dugite-cli"
 SOCKET="./node.sock"
 MAGIC=2
-KEY_DIR="./keys/preview-test"
+KEY_DIR="./keys"
 ADDR=$(cat "$KEY_DIR/payment.addr")
 SKEY="$KEY_DIR/payment.skey"
 FEE=200000
