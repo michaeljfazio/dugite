@@ -219,6 +219,18 @@ pub fn decode_hash28(data: &[u8]) -> Result<(Hash28, usize), SerializationError>
 pub fn decode_hash32(data: &[u8]) -> Result<(Hash32, usize), SerializationError> {
     let (bytes, n) = decode_bytes(data)?;
     if bytes.len() != 32 {
+        // Diagnostic: log the surrounding CBOR header so we can see what was
+        // actually presented when the decoder hits a 28-byte field where it
+        // expected a 32-byte one (issue #504). The header bytes pin the exact
+        // CBOR major-type / length encoding the caller passed in.
+        let preview_len = data.len().min(16);
+        let preview = hex::encode(&data[..preview_len]);
+        tracing::warn!(
+            got = bytes.len(),
+            data_len = data.len(),
+            header_hex = %preview,
+            "decode_hash32 received non-32 bytestring"
+        );
         return Err(SerializationError::InvalidLength {
             expected: 32,
             got: bytes.len(),

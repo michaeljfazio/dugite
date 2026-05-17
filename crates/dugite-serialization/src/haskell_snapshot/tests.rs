@@ -1157,3 +1157,34 @@ fn test_decode_committee_two_members_and_threshold() {
 
     assert_eq!(committee.threshold, (2, 3), "threshold is 2/3");
 }
+
+// ── #504 regression: real preprod ExtLedgerState decode round-trip ────────────
+//
+// Loads the actual preprod Haskell ancillary state file (if present locally)
+// and asserts decode_state_file succeeds. This caught the bug where
+// futureStakePoolParams was decoded with the StakePoolState shape instead
+// of the PoolParams shape — a real preprod snapshot containing a single
+// pending pool registration triggered the regression.
+//
+// The file is large (~28 MB) and only present on developer machines with a
+// fresh Mithril ancillary import, so this test is gated on environment
+// variable for CI; locally, set `DUGITE_HASKELL_STATE_FILE=…` (or place the
+// file at the default path) to exercise it.
+#[test]
+fn decode_state_file_preprod_haskell_snapshot_regression_504() {
+    let path = std::env::var("DUGITE_HASKELL_STATE_FILE").unwrap_or_else(|_| {
+        "/Users/michaelfazio/Source/dugite/db-preprod/haskell-ledger/123270750/state".to_string()
+    });
+    let data = match std::fs::read(&path) {
+        Ok(d) => d,
+        Err(_) => {
+            // No local snapshot — skip silently. The decoder is also
+            // exercised by the unit tests in this module.
+            return;
+        }
+    };
+    super::decode_state_file(&data).expect(
+        "decode_state_file must succeed on a real preprod Haskell ancillary snapshot \
+         (regression for #504: PoolParams ≠ StakePoolState)",
+    );
+}
