@@ -1,0 +1,28 @@
+{
+  "activeSlotsCoeff": 0.2,
+  "epochLength": 500,
+  "securityParam": 10,
+  "slotLength": 1.0,
+  "updateQuorum": 2,
+  "maxLovelaceSupply": 60000000000000000,
+  "networkMagic": 42,
+  "protocolParams": {
+    "minFeeA": 44,
+    "minFeeB": 155381,
+    "maxBlockBodySize": 90112,
+    "maxTxSize": 16384,
+    "maxBlockHeaderSize": 1100,
+    "keyDeposit": 2000000,
+    "poolDeposit": 500000000,
+    "minPoolCost": 340000000,
+    "eMax": 18,
+    "nOpt": 500,
+    "a0": 0.3,
+    "rho": 0.003,
+    "tau": 0.2,
+    "protocolVersion": {
+      "major": 2,
+      "minor": 0
+    }
+  }
+}

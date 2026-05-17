@@ -35,7 +35,10 @@ use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, oneshot, RwLock};
 use tracing::{debug, info, trace, warn};
 
-use dugite_primitives::hash::BlockHeaderHash;
+use dugite_consensus::chain_selection::{ChainPreference, ChainSelection};
+use dugite_primitives::block::{Point, Tip};
+use dugite_primitives::era::Era;
+use dugite_primitives::hash::{BlockHeaderHash, Hash32};
 use dugite_primitives::time::{BlockNo, SlotNo};
 
 use crate::chain_db::ChainDB;
@@ -65,6 +68,10 @@ pub enum ChainSelMessage {
         prev_hash: BlockHeaderHash,
         /// Raw CBOR bytes of the complete block.
         cbor: Vec<u8>,
+        /// Block header for the Praos chain-selection tiebreaker (Bug D, #497).
+        /// `None` for legacy callers and Byron blocks; comparator falls back to
+        /// strict-greater block_no in that case.
+        header: Option<dugite_primitives::block::BlockHeader>,
         /// Fulfillment channel for the processing result.
         result_tx: oneshot::Sender<AddBlockResult>,
     },
@@ -286,6 +293,7 @@ pub async fn add_block_runner(
                 block_no,
                 prev_hash,
                 cbor,
+                header,
                 result_tx,
             } => {
                 let result = process_add_block(
@@ -294,6 +302,7 @@ pub async fn add_block_runner(
                     block_no,
                     prev_hash,
                     cbor,
+                    header.as_ref(),
                     &chain_db,
                     &invalid_cache,
                 )
@@ -322,12 +331,14 @@ pub async fn add_block_runner(
 /// Core processing logic for a single `AddBlock` message.
 ///
 /// Extracted from the runner loop to make unit testing straightforward.
+#[allow(clippy::too_many_arguments)]
 async fn process_add_block(
     hash: &BlockHeaderHash,
     slot: SlotNo,
     block_no: BlockNo,
     prev_hash: BlockHeaderHash,
     cbor: Vec<u8>,
+    header: Option<&dugite_primitives::block::BlockHeader>,
     chain_db: &Arc<RwLock<ChainDB>>,
     invalid_cache: &Arc<RwLock<InvalidBlockCache>>,
 ) -> AddBlockResult {
@@ -358,7 +369,18 @@ async fn process_add_block(
     let extended_tip;
     {
         let mut db = chain_db.write().await;
-        match db.add_block(hash.to_owned(), slot, block_no, prev_hash, cbor) {
+        let add_result = match header {
+            Some(h) => db.add_block_with_header(
+                hash.to_owned(),
+                slot,
+                block_no,
+                prev_hash,
+                cbor,
+                h.clone(),
+            ),
+            None => db.add_block(hash.to_owned(), slot, block_no, prev_hash, cbor),
+        };
+        match add_result {
             Ok(did_extend) => {
                 extended_tip = did_extend;
             }
@@ -375,47 +397,128 @@ async fn process_add_block(
 
     // --- Step 4: Chain selection (Haskell `chainSelectionForBlock`) ---------
     //
-    // Query the VolatileDB for all competing fork tips — leaf blocks that are
-    // NOT on the currently-selected chain.  If any has a strictly-higher block
-    // number than the current selected-chain tip, we switch to that fork.
+    // Per Haskell `Ouroboros.Consensus.Protocol.Praos.Common::comparePraos`:
     //
-    // This matches Haskell's `constructPreferableCandidates` + `switchFork`
-    // in `ChainSel.hs`:
-    //   1. `maximalCandidates` → our `get_all_fork_tips()`
-    //   2. `preferAnchoredCandidate` (longest-chain rule) → block_no comparison
-    //   3. `switchFork` → `switch_to_fork()`
+    // - block_no strictly greater  → switch (longest-chain rule).
+    // - block_no equal             → run Praos tiebreaker:
+    //                                  same slot + same issuer → compare OCert
+    //                                  seq number; otherwise compare VRF output
+    //                                  bytes if within RestrictedVRFTiebreaker
+    //                                  window (Conway: 5 slots), else no switch.
+    // - block_no strictly less     → no switch.
     //
-    // The "strictly preferred" invariant (block_no MUST be strictly greater)
-    // matches Haskell's `preferCandidate` which requires the candidate to be
-    // "at least as long and at least as heavy" — we use strict length (block_no)
-    // for correctness in the simple case; tiebreaking via VRF / density will
-    // be added when headers are available in this path.
-    //
-    // NOTE: This check is performed AFTER writing to VolatileDB so the new
-    // block is visible when computing fork tips.
+    // dugite-consensus implements this in `ChainSelection::prefer_chain_with_headers`.
+    // We call it when ALL relevant headers (new block, current tip, candidate)
+    // are present; otherwise fall back to the legacy strict-greater rule so
+    // tests using synthetic CBOR keep their existing semantics (Bug D, #497).
     {
         let mut db = chain_db.write().await;
 
-        // Current selected-chain tip block_no. If 0 / unknown there is
-        // nothing to compare against and no fork is possible yet.
-        let current_tip_block_no: u64 = db
-            .get_tip_info()
+        let current_tip_info = db.get_tip_info();
+        let current_tip_block_no: u64 = current_tip_info
+            .as_ref()
             .map(|(_slot, _hash, bn)| bn.0)
             .unwrap_or(0);
 
-        // Enumerate all competing fork tips.
+        // For the Praos tiebreaker we need: (a) the current tip's BlockHeader,
+        // (b) each fork-tip's BlockHeader.  All come from the in-memory cache
+        // populated by `add_block_with_header`.
+        let current_tip_header = current_tip_info
+            .as_ref()
+            .and_then(|(_, h, _)| db.get_volatile_header(h).cloned());
+
         let fork_tips = db.get_all_fork_tips();
 
-        // Find the fork tip (if any) that is STRICTLY longer than the current
-        // selected-chain tip.  If multiple forks qualify, pick the one with the
-        // highest block_no (i.e. the longest chain).
-        let best_fork = fork_tips
-            .into_iter()
-            .filter(|(_h, bn, _slot)| bn.0 > current_tip_block_no)
-            .max_by_key(|(_h, bn, _slot)| bn.0);
+        // Helper: pick the best fork using the Praos comparator.  Returns the
+        // (hash, block_no, slot) of the preferred candidate, or None.
+        fn select_best_praos(
+            fork_tips: Vec<(Hash32, BlockNo, SlotNo)>,
+            current_header: &dugite_primitives::block::BlockHeader,
+            db: &ChainDB,
+        ) -> Option<(Hash32, BlockNo, SlotNo)> {
+            // Era for the slot-window decision: use the current tip's era,
+            // which always matches the candidate's era within a 5-slot
+            // tiebreaker window.
+            let era = current_header.protocol_version.era();
+            let slot_window: u64 = match era {
+                Era::Conway | Era::Dijkstra => 5, // RestrictedVRFTiebreaker 5
+                // Byron uses density not Praos; `prefer_chain_with_headers`
+                // short-circuits to `compare_density` and never consults
+                // `slot_window`. Value is irrelevant — keep `u64::MAX` for
+                // consistency with other unrestricted arms.
+                Era::Byron => u64::MAX,
+                _ => u64::MAX, // pre-Conway Praos: unrestricted
+            };
+
+            let mut sel = ChainSelection::new();
+            sel.set_tip(Tip {
+                point: Point::Specific(current_header.slot, current_header.header_hash),
+                block_number: current_header.block_number,
+            });
+
+            fork_tips
+                .into_iter()
+                .filter_map(|(h, bn, slot)| {
+                    let cand_header = db.get_volatile_header(&h)?.clone();
+                    let cand_tip = Tip {
+                        point: Point::Specific(cand_header.slot, cand_header.header_hash),
+                        block_number: cand_header.block_number,
+                    };
+                    let pref = sel.prefer_chain_with_headers(
+                        &cand_tip,
+                        current_header,
+                        &cand_header,
+                        era,
+                        slot_window,
+                    );
+                    if matches!(pref, ChainPreference::PreferCandidate) {
+                        Some((h, bn, slot))
+                    } else {
+                        None
+                    }
+                })
+                // Among preferred candidates, prefer highest block_no.
+                .max_by_key(|(_, bn, _)| bn.0)
+        }
+
+        // Legacy fallback for callers that did not pass a header (or where
+        // some required header is missing).  This preserves the strict-greater
+        // semantics used by the older chain_sel_queue tests.
+        fn select_best_legacy(
+            fork_tips: Vec<(Hash32, BlockNo, SlotNo)>,
+            current_tip_block_no: u64,
+        ) -> Option<(Hash32, BlockNo, SlotNo)> {
+            fork_tips
+                .into_iter()
+                .filter(|(_h, bn, _slot)| bn.0 > current_tip_block_no)
+                .max_by_key(|(_h, bn, _slot)| bn.0)
+        }
+
+        let best_fork = match (header, current_tip_header.as_ref()) {
+            (Some(_new_h), Some(cur_h)) => {
+                // Praos path. `select_best_praos` consults the comparator for
+                // every fork-tip whose header is cached. Returning `None` here
+                // means either:
+                //   (a) no candidate's header is cached (legacy / Byron path),
+                //       in which case we must fall back to give those callers
+                //       some chance of triggering a fork switch; OR
+                //   (b) every cached candidate was explicitly rejected by
+                //       Praos (PreferCurrent or Equal).
+                //
+                // Case (b) is safe to fall through because `select_best_legacy`
+                // is strictly weaker than Praos for the cases they both decide:
+                // any candidate Praos rejected via the EQUAL-block_no
+                // tiebreaker has bn == current_tip_block_no, which `> filter`
+                // also rejects. A candidate with bn > current_tip would have
+                // been chosen by Praos's `compare_length` (PreferCandidate),
+                // so we never reach this fallback for that case.
+                select_best_praos(fork_tips, cur_h, &db)
+                    .or_else(|| select_best_legacy(db.get_all_fork_tips(), current_tip_block_no))
+            }
+            _ => select_best_legacy(fork_tips, current_tip_block_no),
+        };
 
         if let Some((fork_hash, fork_bn, fork_slot)) = best_fork {
-            // A strictly-preferred fork exists — switch to it.
             info!(
                 fork_hash = %fork_hash.to_hex(),
                 fork_block_no = fork_bn.0,
@@ -559,6 +662,41 @@ impl ChainSelHandle {
                 block_no,
                 prev_hash,
                 cbor,
+                header: None, // legacy path, no Praos tiebreak
+                result_tx,
+            })
+            .await
+            .ok()?;
+
+        result_rx.await.ok()
+    }
+
+    /// Variant of [`submit_block`] that also forwards the block's
+    /// `BlockHeader` so chain selection can run the Praos tiebreaker
+    /// (Bug D / issue #497).
+    ///
+    /// Production callers (live BlockFetch path, forge path) should call this
+    /// method.  The legacy [`submit_block`] is retained as a thin wrapper for
+    /// tests and any code that cannot easily obtain a header.
+    pub async fn submit_block_with_header(
+        &self,
+        hash: BlockHeaderHash,
+        slot: SlotNo,
+        block_no: BlockNo,
+        prev_hash: BlockHeaderHash,
+        cbor: Vec<u8>,
+        header: dugite_primitives::block::BlockHeader,
+    ) -> Option<AddBlockResult> {
+        let (result_tx, result_rx) = oneshot::channel();
+
+        self.tx
+            .send(ChainSelMessage::AddBlock {
+                hash,
+                slot,
+                block_no,
+                prev_hash,
+                cbor,
+                header: Some(header),
                 result_tx,
             })
             .await
@@ -1374,6 +1512,384 @@ mod tests {
                 );
             }
             other => panic!("b4 (strictly longer fork) must return TriggeredFork; got: {other:?}"),
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Bug D (issue #497) — Praos tiebreaker regression tests
+    // -----------------------------------------------------------------------
+    //
+    // The legacy tests in this module pass `None` for the header via
+    // `submit_block`, so they exercise the strict-greater fallback unchanged.
+    // The tests below pass synthesized `BlockHeader`s via the new
+    // `submit_block_with_header` method, so they exercise the Praos
+    // `comparePraos` tiebreaker imported from dugite-consensus.
+
+    use dugite_primitives::block::{BlockHeader, OperationalCert, ProtocolVersion, VrfOutput};
+    use dugite_primitives::time::{BlockNo as PrimBlockNo, SlotNo as PrimSlotNo};
+
+    /// Construct a minimal BlockHeader for tiebreaker tests.
+    ///
+    /// `issuer_vkey` determines the pool ID (blake2b-224 of these bytes).
+    /// `vrf_output` is the VRF output bytes used by the Praos cross-pool
+    /// tiebreaker — lower lex wins.
+    /// `opcert_seq` is the operational certificate sequence number — used by
+    /// the same-pool-same-slot tiebreaker.
+    /// `protocol_major` selects the era: 9..=11 → Conway (5-slot window),
+    /// 12+ → Dijkstra, 7..=8 → Babbage (unrestricted), etc.
+    #[allow(clippy::too_many_arguments)]
+    fn praos_header(
+        hash_bytes: [u8; 32],
+        prev_hash_bytes: [u8; 32],
+        slot: u64,
+        block_no: u64,
+        issuer_vkey: Vec<u8>,
+        opcert_seq: u64,
+        vrf_output: Vec<u8>,
+        protocol_major: u64,
+    ) -> BlockHeader {
+        BlockHeader {
+            header_hash: Hash32::from_bytes(hash_bytes),
+            prev_hash: Hash32::from_bytes(prev_hash_bytes),
+            issuer_vkey,
+            vrf_vkey: vec![],
+            vrf_result: VrfOutput {
+                output: vrf_output,
+                proof: vec![],
+            },
+            block_number: PrimBlockNo(block_no),
+            slot: PrimSlotNo(slot),
+            epoch_nonce: Hash32::ZERO,
+            body_size: 0,
+            body_hash: Hash32::ZERO,
+            operational_cert: OperationalCert {
+                hot_vkey: vec![],
+                sequence_number: opcert_seq,
+                kes_period: 0,
+                sigma: vec![],
+            },
+            protocol_version: ProtocolVersion {
+                major: protocol_major,
+                minor: 0,
+            },
+            kes_signature: vec![],
+            nonce_vrf_output: vec![],
+            nonce_vrf_proof: vec![],
+        }
+    }
+
+    /// Bug D regression: equal block_no + lower VRF on candidate + within the
+    /// 5-slot Conway window → MUST trigger a fork switch.
+    ///
+    /// Mirrors the local-devnet scenario where two BPs slot-battle at f=0.2
+    /// and never converged under the old strict-greater filter.
+    #[tokio::test]
+    async fn praos_tiebreaker_switches_on_equal_block_no_lower_vrf_in_window() {
+        let dir = tempfile::tempdir().unwrap();
+        let chain_db = make_chain_db(dir.path());
+
+        let (handle, runner) = ChainSelHandle::new(Arc::clone(&chain_db));
+        let _runner_task = tokio::spawn(runner);
+
+        // Common parent at slot 100, block_no 1 (Conway era, protocol_major 9).
+        let common_bytes = [0xC0u8; 32];
+        let common_header = praos_header(
+            common_bytes,
+            [0u8; 32],
+            100,
+            1,
+            vec![0xAA; 32],
+            0,
+            vec![0xFF; 32],
+            9,
+        );
+        handle
+            .submit_block_with_header(
+                Hash32::from_bytes(common_bytes),
+                SlotNo(100),
+                BlockNo(1),
+                Hash32::ZERO,
+                fake_cbor(&Hash32::from_bytes(common_bytes)),
+                common_header,
+            )
+            .await
+            .expect("runner alive");
+
+        // Current tip: pool A forges at slot 110, block_no 2, vrf=0xFF.
+        let a_bytes = [0xA2u8; 32];
+        let a_header = praos_header(
+            a_bytes,
+            common_bytes,
+            110,
+            2,
+            vec![0xAA; 32], // pool A vkey
+            1,
+            vec![0xFFu8; 32], // high VRF
+            9,
+        );
+        let r = handle
+            .submit_block_with_header(
+                Hash32::from_bytes(a_bytes),
+                SlotNo(110),
+                BlockNo(2),
+                Hash32::from_bytes(common_bytes),
+                fake_cbor(&Hash32::from_bytes(a_bytes)),
+                a_header,
+            )
+            .await
+            .expect("runner alive");
+        assert!(matches!(r, AddBlockResult::AddedAsTip { .. }), "a: {r:?}");
+
+        // Candidate: pool B forges at slot 112 (within 5-slot window),
+        // block_no 2 (same as A), vrf=0x00 (strictly lower than A's 0xFF).
+        // Praos tiebreaker: lower VRF wins → MUST switch to B.
+        let b_bytes = [0xB2u8; 32];
+        let b_header = praos_header(
+            b_bytes,
+            common_bytes,
+            112,
+            2,
+            vec![0xBB; 32], // pool B vkey (different from A)
+            1,
+            vec![0x00u8; 32], // low VRF
+            9,
+        );
+        let r = handle
+            .submit_block_with_header(
+                Hash32::from_bytes(b_bytes),
+                SlotNo(112),
+                BlockNo(2),
+                Hash32::from_bytes(common_bytes),
+                fake_cbor(&Hash32::from_bytes(b_bytes)),
+                b_header,
+            )
+            .await
+            .expect("runner alive");
+
+        match r {
+            AddBlockResult::TriggeredFork { .. } => {} // OK
+            other => panic!(
+                "expected TriggeredFork (Praos tiebreaker should switch on lower VRF \
+                 within 5-slot window), got: {other:?}"
+            ),
+        }
+    }
+
+    /// Bug D regression: equal block_no + lower VRF on candidate but OUTSIDE
+    /// the 5-slot Conway window → MUST NOT switch (RestrictedVRFTiebreaker).
+    #[tokio::test]
+    async fn praos_tiebreaker_does_not_switch_when_slot_gap_exceeds_window() {
+        let dir = tempfile::tempdir().unwrap();
+        let chain_db = make_chain_db(dir.path());
+
+        let (handle, runner) = ChainSelHandle::new(Arc::clone(&chain_db));
+        let _runner_task = tokio::spawn(runner);
+
+        // Same setup as above, but candidate slot is 120 vs current tip slot
+        // 110 (gap of 10, exceeds the Conway window of 5).
+        let common_bytes = [0xC0u8; 32];
+        let common_header = praos_header(
+            common_bytes,
+            [0u8; 32],
+            100,
+            1,
+            vec![0xAA; 32],
+            0,
+            vec![0xFF; 32],
+            9,
+        );
+        handle
+            .submit_block_with_header(
+                Hash32::from_bytes(common_bytes),
+                SlotNo(100),
+                BlockNo(1),
+                Hash32::ZERO,
+                fake_cbor(&Hash32::from_bytes(common_bytes)),
+                common_header,
+            )
+            .await
+            .unwrap();
+
+        let a_bytes = [0xA2u8; 32];
+        let a_header = praos_header(
+            a_bytes,
+            common_bytes,
+            110,
+            2,
+            vec![0xAA; 32],
+            1,
+            vec![0xFFu8; 32],
+            9,
+        );
+        handle
+            .submit_block_with_header(
+                Hash32::from_bytes(a_bytes),
+                SlotNo(110),
+                BlockNo(2),
+                Hash32::from_bytes(common_bytes),
+                fake_cbor(&Hash32::from_bytes(a_bytes)),
+                a_header,
+            )
+            .await
+            .unwrap();
+
+        // Candidate B at slot 120 (>5 from A's slot 110), block_no 2, lower VRF.
+        let b_bytes = [0xB2u8; 32];
+        let b_header = praos_header(
+            b_bytes,
+            common_bytes,
+            120,
+            2,
+            vec![0xBB; 32],
+            1,
+            vec![0x00u8; 32],
+            9,
+        );
+        let r = handle
+            .submit_block_with_header(
+                Hash32::from_bytes(b_bytes),
+                SlotNo(120),
+                BlockNo(2),
+                Hash32::from_bytes(common_bytes),
+                fake_cbor(&Hash32::from_bytes(b_bytes)),
+                b_header,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            r,
+            AddBlockResult::StoredAsFork,
+            "expected StoredAsFork: slot gap {} > Conway window {}, RestrictedVRFTiebreaker \
+             must keep current selection",
+            10,
+            5
+        );
+    }
+
+    /// Sanity regression: strictly-greater block_no still triggers a switch
+    /// when full headers are present. (The existing strict-greater test uses
+    /// `submit_block`; this twin confirms the Praos path agrees.)
+    #[tokio::test]
+    async fn praos_tiebreaker_switches_on_strictly_greater_block_no() {
+        let dir = tempfile::tempdir().unwrap();
+        let chain_db = make_chain_db(dir.path());
+
+        let (handle, runner) = ChainSelHandle::new(Arc::clone(&chain_db));
+        let _runner_task = tokio::spawn(runner);
+
+        let common_bytes = [0xC0u8; 32];
+        let common_header = praos_header(
+            common_bytes,
+            [0u8; 32],
+            100,
+            1,
+            vec![0xAA; 32],
+            0,
+            vec![0xFF; 32],
+            9,
+        );
+        handle
+            .submit_block_with_header(
+                Hash32::from_bytes(common_bytes),
+                SlotNo(100),
+                BlockNo(1),
+                Hash32::ZERO,
+                fake_cbor(&Hash32::from_bytes(common_bytes)),
+                common_header,
+            )
+            .await
+            .unwrap();
+
+        let a_bytes = [0xA2u8; 32];
+        let a_header = praos_header(
+            a_bytes,
+            common_bytes,
+            110,
+            2,
+            vec![0xAA; 32],
+            1,
+            vec![0xFFu8; 32],
+            9,
+        );
+        handle
+            .submit_block_with_header(
+                Hash32::from_bytes(a_bytes),
+                SlotNo(110),
+                BlockNo(2),
+                Hash32::from_bytes(common_bytes),
+                fake_cbor(&Hash32::from_bytes(a_bytes)),
+                a_header,
+            )
+            .await
+            .unwrap();
+
+        // Sibling fork at block_no 2 with a VRF that is NOT lower than a's
+        // (equal, so the praos tiebreaker says "no switch" — b2 stays as a
+        // fork at the same height as the current tip).  Then extending to
+        // block_no 3 (strictly greater) MUST trigger a switch under both
+        // the legacy strict-greater rule and the Praos comparator path.
+        let b2_bytes = [0xB2u8; 32];
+        let b2_header = praos_header(
+            b2_bytes,
+            common_bytes,
+            115,
+            2,
+            vec![0xBB; 32],
+            1,
+            vec![0xFFu8; 32], // equal to a's vrf — Praos tiebreaker = ShouldNotSwitch
+            9,
+        );
+        let b2_result = handle
+            .submit_block_with_header(
+                Hash32::from_bytes(b2_bytes),
+                SlotNo(115),
+                BlockNo(2),
+                Hash32::from_bytes(common_bytes),
+                fake_cbor(&Hash32::from_bytes(b2_bytes)),
+                b2_header,
+            )
+            .await
+            .unwrap();
+        // Pin the intermediate state: b2 has equal block_no AND equal VRF to
+        // `a`, so Praos's comparePraos returns ShouldNotSwitch EQ and b2 must
+        // remain a fork. Asserting this prevents a future regression that
+        // would adopt equal-VRF candidates from passing this test on the
+        // b3 step alone.
+        assert_eq!(
+            b2_result,
+            AddBlockResult::StoredAsFork,
+            "b2 (equal block_no, equal VRF) must stay a fork — Praos tiebreaker = ShouldNotSwitch EQ; got {b2_result:?}",
+        );
+
+        let b3_bytes = [0xB3u8; 32];
+        let b3_header = praos_header(
+            b3_bytes,
+            b2_bytes,
+            117,
+            3,
+            vec![0xBB; 32],
+            2,
+            vec![0x88; 32],
+            9,
+        );
+        let r = handle
+            .submit_block_with_header(
+                Hash32::from_bytes(b3_bytes),
+                SlotNo(117),
+                BlockNo(3),
+                Hash32::from_bytes(b2_bytes),
+                fake_cbor(&Hash32::from_bytes(b3_bytes)),
+                b3_header,
+            )
+            .await
+            .unwrap();
+
+        match r {
+            AddBlockResult::TriggeredFork { .. } => {} // OK
+            other => panic!(
+                "strictly greater block_no MUST trigger switch under both legacy and Praos rules, got: {other:?}"
+            ),
         }
     }
 }

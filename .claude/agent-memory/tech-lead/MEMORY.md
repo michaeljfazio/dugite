@@ -4,7 +4,10 @@
 - [Dijkstra era rules dispatch (#462)](issue-462-dijkstra-era-rules.md) — Conway alias removed; DijkstraRules delegates to Conway plus identity translateEraDijkstra
 
 ## Critical Invariants & Bug Patterns
+- [Forge connectivity gate (Bug C)](forge-connectivity-gate-bug-c.md) — forge before peers connect → self-forged fork → Bug-A disconnect loop → permanent stall; fix: AtomicBool + hot_peer_count gate in try_forge_block_at; flag set after Bug-A guard in chainsync_client_task (9d30beaf2)
+- [Live apply path skips LedgerSeq delta push (Bug B)](node-live-apply-no-ledgerseq-delta.md) — apply_fetched_block uses apply_block (no delta), LedgerSeq empty, fork rollback fails → clear_volatile → StoreButDontChange forever; fix: use apply_block_with_delta + push in apply_fetched_block and fork replay loop
 - [ChainSync at_tip rollback stall](chainsync-at-tip-rollback-stall.md) — at_tip not reset on MsgRollBackward → pipeline freeze → bearer closed; fix: at_tip=false in MsgRollBackward arm (5abaf2687)
+- [ChainSync Origin intersection stall](chainsync-origin-intersection-fix.md) — intersection=Origin with non-Origin local chain → VolatileDB switch_chain blocked (isReachable fails) → node stuck on self-forged fork; fix: disconnect+reconnect (5 lines after try_find_intersect call site)
 - [Fork snapshot stall cascade](fork-snapshot-stall-fix.md) — 6-bug cascade: fork snapshot → bad intersection → deep rollback → UTxO corruption; all fixed (1ff9cbce)
 - [Live-tip fork stall fix](node-fork-stall-fix.md) — TriggeredFork doesn't apply blocks + MsgRollBackward not propagated + LSM lock; 3 commits (85f1d53, 040cb13, c364c59)
 - [Cascade failure invariant](ledger-cascade-failure-invariant.md) — Never hard-return on confirmed blocks; log+self-correct for ledger-state-divergence checks

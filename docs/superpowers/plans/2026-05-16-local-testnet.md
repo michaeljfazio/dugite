@@ -119,7 +119,8 @@ Implementation plan: `docs/superpowers/plans/2026-05-16-local-testnet.md`
 
 \`\`\`
    dugite-bp  <-->  dugite-relay  <-->  cardano-node bp
-   port 30001       port 30000          port 30003
+   port 3001        port 3002           port 3003
+   metrics 12798    metrics 12799
    (Rust, pool1)    (Rust, hub)         (Haskell, pool2)
 \`\`\`
 
@@ -333,9 +334,15 @@ LD_EVIDENCE="$LD_ROOT/evidence"
 
 # ---- Constants ----
 LD_MAGIC=42
-LD_RELAY_PORT=30000
-LD_DUGITE_BP_PORT=30001
-LD_CARDANO_BP_PORT=30003
+# N2N ports are single-digit-incremented from the standard Cardano BP port.
+# dugite-bp keeps 3001 so dugite-monitor and cardano-cli connect without overrides.
+LD_DUGITE_BP_PORT=3001
+LD_RELAY_PORT=3002
+LD_CARDANO_BP_PORT=3003
+# Prometheus metrics ports; dugite-bp on the dugite-monitor default (12798);
+# relay on 12799 to avoid the two dugite processes fighting over the listener.
+LD_DUGITE_BP_METRICS_PORT=12798
+LD_DUGITE_RELAY_METRICS_PORT=12799
 LD_RELAY_SOCK="$LD_STATE/dugite-relay.sock"
 LD_DUGITE_BP_SOCK="$LD_STATE/dugite-bp.sock"
 LD_CARDANO_BP_SOCK="$LD_STATE/cardano-bp.sock"
@@ -601,7 +608,7 @@ git commit -m "testnet: add dugite + cardano-node config templates"
   "localRoots": [
     {
       "accessPoints": [
-        { "address": "127.0.0.1", "port": 30000 }
+        { "address": "127.0.0.1", "port": 3002 }
       ],
       "advertise": false,
       "trustable": true,
@@ -621,8 +628,8 @@ git commit -m "testnet: add dugite + cardano-node config templates"
   "localRoots": [
     {
       "accessPoints": [
-        { "address": "127.0.0.1", "port": 30001 },
-        { "address": "127.0.0.1", "port": 30003 }
+        { "address": "127.0.0.1", "port": 3001 },
+        { "address": "127.0.0.1", "port": 3003 }
       ],
       "advertise": false,
       "trustable": true,
@@ -644,7 +651,7 @@ Cardano-node uses the same modern topology schema (P2P-enabled).
   "localRoots": [
     {
       "accessPoints": [
-        { "address": "127.0.0.1", "port": 30000 }
+        { "address": "127.0.0.1", "port": 3002 }
       ],
       "advertise": false,
       "trustable": true,
@@ -2402,8 +2409,8 @@ the dugite relay.
 
 ```mermaid
 graph LR
-  dbp[dugite-bp<br/>port 30001<br/>pool1] <--> dr[dugite-relay<br/>port 30000<br/>hub]
-  dr <--> cbp[cardano-node bp<br/>port 30003<br/>pool2]
+  dbp[dugite-bp<br/>N2N 3001<br/>metrics 12798<br/>pool1] <--> dr[dugite-relay<br/>N2N 3002<br/>metrics 12799<br/>hub]
+  dr <--> cbp[cardano-node bp<br/>N2N 3003<br/>pool2]
 ```
 
 The dugite relay is the only path between the two BPs. A block forged by
@@ -2533,14 +2540,28 @@ test fixtures:
 
 ## Topology & port reference
 
-| Process | Port | Socket | Config | Topology |
-|---------|------|--------|--------|----------|
-| `dugite-relay` (hub) | 30000 | `state/dugite-relay.sock` | `config/dugite-relay.config.json` | `config/dugite-relay.topology.json` |
-| `dugite-bp` (pool1) | 30001 | `state/dugite-bp.sock` | `config/dugite-bp.config.json` | `config/dugite-bp.topology.json` |
-| `cardano-node bp` (pool2) | 30003 | `state/cardano-bp.sock` | `config/cardano-bp.config.json` | `config/cardano-bp.topology.json` |
+| Process | N2N | Metrics | Socket | Config | Topology |
+|---------|-----|---------|--------|--------|----------|
+| `dugite-bp` (pool1) | 3001 | 12798 | `dugite-bp.sock` | `dugite-bp.config.json` | `dugite-bp.topology.json` |
+| `dugite-relay` (hub) | 3002 | 12799 | `dugite-relay.sock` | `dugite-relay.config.json` | `dugite-relay.topology.json` |
+| `cardano-node bp` (pool2) | 3003 | — | `cardano-bp.sock` | `cardano-bp.config.json` | `cardano-bp.topology.json` |
 
-Ports 30000/30001/30003 are far from the public soak's defaults (3001/3002),
-so this devnet can run alongside an active soak on the same host.
+Ports are single-digit-incremented from the standard Cardano port. `dugite-bp`
+keeps the well-known defaults (N2N 3001, Prometheus 12798) so that
+`dugite-monitor` connects without overrides. If a public-network soak is
+running on the same host it must be stopped before the devnet boots, since
+both processes would otherwise bind 3001.
+
+### Monitoring the BP with `dugite-monitor`
+
+In a separate terminal once the devnet is up:
+
+```bash
+./target/release/dugite-monitor
+```
+
+The TUI defaults to `http://localhost:12798/metrics`, which is the BP. To
+inspect the relay instead, pass `--metrics-url http://localhost:12799/metrics`.
 
 ## Configuration reference
 

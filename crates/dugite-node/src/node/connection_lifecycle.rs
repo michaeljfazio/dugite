@@ -318,6 +318,11 @@ pub struct ConnectionLifecycleManager {
     /// observes the connection as duplex-paired from our listen port —
     /// matching Haskell ouroboros-network's `configureOutboundSocket`.
     local_listen_addr: Option<SocketAddr>,
+
+    /// Shared flag set by the first ChainSync task that finds a non-Origin
+    /// intersection.  Passed to `chainsync_client_task` so it can signal
+    /// the forge loop that peer connectivity is established.
+    peer_intersection_established: Arc<std::sync::atomic::AtomicBool>,
 }
 
 /// Errors from lifecycle management operations.
@@ -395,6 +400,7 @@ impl ConnectionLifecycleManager {
         block_provider: Arc<ChainDBBlockProvider>,
         rollback_announcement_tx: broadcast::Sender<RollbackAnnouncement>,
         peer_manager_for_servers: Arc<RwLock<NodePeerManager>>,
+        peer_intersection_established: Arc<std::sync::atomic::AtomicBool>,
     ) -> Self {
         Self {
             connections: HashMap::new(),
@@ -420,6 +426,7 @@ impl ConnectionLifecycleManager {
             rollback_announcement_tx,
             peer_manager_for_servers,
             local_listen_addr: None,
+            peer_intersection_established,
         }
     }
 
@@ -1051,6 +1058,7 @@ impl ConnectionLifecycleManager {
         let active_slots_coeff = self.active_slots_coeff;
         let metrics = self.metrics.clone();
         let gsm_event_tx = self.gsm_event_tx.clone();
+        let peer_intersection_established = self.peer_intersection_established.clone();
 
         Box::new(move |channel, cancel| {
             Box::pin(async move {
@@ -1067,6 +1075,7 @@ impl ConnectionLifecycleManager {
                     metrics,
                     cancel,
                     gsm_event_tx,
+                    peer_intersection_established,
                 )
                 .await
                 {
@@ -1882,6 +1891,7 @@ impl ConnectionLifecycleManager {
             block_provider,
             rollback_announcement_tx,
             peer_manager_for_servers,
+            Arc::new(std::sync::atomic::AtomicBool::new(false)),
         )
     }
 

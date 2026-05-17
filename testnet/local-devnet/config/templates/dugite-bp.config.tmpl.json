@@ -1,0 +1,15 @@
+{
+  "ByronGenesisFile": "@@GENESIS_DIR@@/byron-genesis.json",
+  "ByronGenesisHash": "@@BYRON_HASH@@",
+  "ShelleyGenesisFile": "@@GENESIS_DIR@@/shelley-genesis.json",
+  "ShelleyGenesisHash": "@@SHELLEY_HASH@@",
+  "AlonzoGenesisFile": "@@GENESIS_DIR@@/alonzo-genesis.json",
+  "AlonzoGenesisHash": "@@ALONZO_HASH@@",
+  "ConwayGenesisFile": "@@GENESIS_DIR@@/conway-genesis.json",
+  "ConwayGenesisHash": "@@CONWAY_HASH@@",
+  "Network": "Testnet",
+  "NetworkMagic": 42,
+  "DiffusionMode": "InitiatorAndResponder",
+  "MinSeverity": "Info",
+  "LogDirective": "info"
+}

@@ -42,7 +42,8 @@ Three processes on loopback, hub-and-spoke through the dugite relay. **No public
 ```
    ┌──────────────────┐        ┌────────────────────┐        ┌──────────────────────┐
    │   dugite-bp      │◄──────►│   dugite-relay     │◄──────►│   cardano-node bp    │
-   │   port 30001     │  N2N   │   port 30000       │  N2N   │   port 30003         │
+   │   N2N      3001  │  N2N   │   N2N      3002    │  N2N   │   N2N      3003      │
+   │   metrics 12798  │        │   metrics 12799    │        │                      │
    │   (Rust)         │        │   (Rust)           │        │   (Haskell)          │
    │   pool1 keys     │        │   no keys          │        │   pool2 keys         │
    └──────────────────┘        └────────────────────┘        └──────────────────────┘
@@ -52,7 +53,7 @@ Three processes on loopback, hub-and-spoke through the dugite relay. **No public
 
 The relay's `localRoots` lists both BPs (valency 2). Each BP's `localRoots` lists only the relay (valency 1). This means a block forged by dugite-bp must transit dugite-relay's BlockFetch server → cardano-bp's BlockFetch client (and vice versa) — the relay's bidirectional N2N is the system under test. All three nodes expose an N2C local socket for `cardano-cli` / `dugite-cli` queries and tx submission.
 
-Ports 30000/30001/30003 were chosen far from existing soak defaults (3001/3002) so this devnet can run alongside an active public-network soak on the same host without conflict. The gap at 30002 leaves room to add a second relay later.
+**Ports.** N2N is single-digit-incremented from the standard Cardano port: dugite-bp on `3001` (default), dugite-relay on `3002`, cardano-bp on `3003`. Prometheus metrics for the BP are on the dugite default port `12798` so `dugite-monitor` (which defaults to `http://localhost:12798/metrics`) attaches without overrides; the relay gets `12799` to avoid the two dugite processes binding the same listener. Operators running a public-network soak in parallel should stop it before bringing the devnet up, since the BP now binds the standard ports.
 
 **Workspace layout** (everything new lives under `testnet/local-devnet/`, all generated artefacts gitignored):
 

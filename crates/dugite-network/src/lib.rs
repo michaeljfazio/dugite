@@ -52,6 +52,38 @@ pub trait BlockProvider: Send + Sync + 'static {
     /// Uses strict `>` comparison: only returns blocks with `slot > after_slot`.
     fn get_next_block_after_slot(&self, after_slot: u64) -> Option<(u64, [u8; 32], Vec<u8>)>;
 
+    /// Return `true` iff `hash` is on the current canonical chain (the
+    /// volatile `selected_chain` window OR the immutable layer).  A fork
+    /// block stored alongside the chain returns `false`.
+    ///
+    /// Used by the ChainSync server to detect when its follower cursor's
+    /// block has been rolled back off the active chain and to trigger a
+    /// downstream `MsgRollBackward` before serving any further blocks
+    /// (Haskell's "follower cursor revalidation").
+    ///
+    /// Default implementation: assume any known block is on chain, which
+    /// is correct for simple block stores that do not maintain forks.
+    fn is_on_chain(&self, hash: &[u8; 32]) -> bool {
+        self.has_block(hash)
+    }
+
+    /// Find the most recent ancestor of `start_hash` that is on the current
+    /// canonical chain.  Returns `Some((slot, hash, block_number))` for the
+    /// first ancestor (walking via `prev_hash` links) found on chain, or
+    /// `None` when no on-chain ancestor exists within reach.
+    ///
+    /// Callers invoke this after observing `!is_on_chain(cursor_hash)` —
+    /// the follower cursor's block has been displaced by a chain switch
+    /// and must be rewound before any forward serving resumes.
+    ///
+    /// Default implementation: report `start_hash` itself if it is known;
+    /// concrete providers MUST override this to walk the prev_hash chain
+    /// through their volatile store.
+    fn find_chain_ancestor(&self, start_hash: &[u8; 32]) -> Option<(u64, [u8; 32], u64)> {
+        let _ = start_hash;
+        None
+    }
+
     /// Get the first block at or after a given slot. Returns `(slot, hash, cbor)`.
     ///
     /// Uses `>=` comparison, so `get_block_at_or_after_slot(0)` includes blocks

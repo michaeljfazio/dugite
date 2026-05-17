@@ -37,6 +37,7 @@ use dugite_network::protocol::blockfetch::decision::{
     BlockFetchDecision, FetchRange, PeerFetchState,
 };
 use dugite_network::{BlockFetchClient, MuxChannel};
+use dugite_storage::ChainDB;
 
 use super::connection_lifecycle::{CandidateChainState, FetchedBlock, PendingHeader};
 
@@ -103,9 +104,22 @@ pub struct BlockFetchLogicTask {
 
     /// Current chain tip slot from the ledger.
     ///
-    /// Used to skip headers for blocks we already have (slot <= current_tip_slot).
-    /// Updated by the run loop as blocks are applied.
+    /// Kept for compatibility (e.g. logging) but NO LONGER used to filter
+    /// pending headers — see the comment above the (removed) slot check in
+    /// `pump_decisions`.  Bug I (2026-05-16): the old `slot <= tip_slot`
+    /// filter silently dropped peer headers at earlier slots when local +
+    /// peer chains had diverged, so the fork was never fetched and
+    /// `chain_sel_queue::process_add_block` saw it as "fork unreachable"
+    /// every time a new peer block arrived.
     current_tip_slot: u64,
+
+    /// Read-only access to the local ChainDB.
+    ///
+    /// Used to skip pending headers for blocks we already have (by hash),
+    /// regardless of slot.  Without this, divergent forks at slots ≤ our
+    /// tip would never be fetched and chain selection would permanently
+    /// reject the peer's longer chain.
+    chain_db: Option<Arc<RwLock<ChainDB>>>,
 
     /// Decision interval — how often the task evaluates fetch decisions.
     ///
@@ -166,9 +180,34 @@ impl BlockFetchLogicTask {
         byron_epoch_length: u64,
         cancel: CancellationToken,
     ) -> Self {
+        Self::new_with_chain_db(
+            candidate_chains,
+            fetched_blocks_tx,
+            byron_epoch_length,
+            cancel,
+            None,
+        )
+    }
+
+    /// Variant of [`new`] that also threads a read handle to the local
+    /// ChainDB so the decision task can skip headers for blocks we already
+    /// have (by hash, regardless of slot).  Bug I (2026-05-16): without
+    /// this, divergent forks at slots ≤ our tip would never be fetched
+    /// because the legacy `slot <= current_tip_slot` filter dropped them.
+    /// Production callers should always pass `Some(chain_db)`; the legacy
+    /// `new()` is kept for the existing unit tests that don't construct
+    /// a real ChainDB.
+    pub fn new_with_chain_db(
+        candidate_chains: Arc<RwLock<HashMap<SocketAddr, CandidateChainState>>>,
+        fetched_blocks_tx: mpsc::Sender<FetchedBlock>,
+        byron_epoch_length: u64,
+        cancel: CancellationToken,
+        chain_db: Option<Arc<RwLock<ChainDB>>>,
+    ) -> Self {
         Self {
             candidate_chains,
             current_tip_slot: 0,
+            chain_db,
             decision_interval: PRAOS_DECISION_INTERVAL,
             fetch_senders: HashMap::new(),
             fetched_blocks_tx,
@@ -290,35 +329,58 @@ impl BlockFetchLogicTask {
         }
 
         // Read candidate chain state from all peers.
-        let chains = self.candidate_chains.read().await;
+        // Snapshot all pending headers BEFORE acquiring the chain_db lock so
+        // we minimise lock contention on the hot apply-block path.
+        let raw_pending: Vec<(SocketAddr, PendingHeader)> = {
+            let chains = self.candidate_chains.read().await;
+            chains
+                .iter()
+                .filter(|(addr, _)| self.fetch_senders.contains_key(addr))
+                .flat_map(|(addr, state)| {
+                    state
+                        .pending_headers
+                        .iter()
+                        .map(move |h| (*addr, h.clone()))
+                })
+                .collect()
+        };
 
-        // Collect new pending headers from all peers, filtering out already-fetched
-        // and already-in-flight blocks.
+        // Bug I (2026-05-16): use a hash-based has_block check, not the old
+        // `slot <= current_tip_slot` filter.  The slot filter wrongly dropped
+        // peer headers at earlier slots when local and peer chains had
+        // diverged (same slot, different hash), so divergent forks were
+        // never fetched and chain selection saw "fork unreachable" forever.
+        //
+        // We acquire the chain_db read lock for the briefest possible window:
+        // a single `has_block` call per pending header, then release.  No I/O
+        // inside the critical section.
         let mut new_headers: Vec<(SocketAddr, PendingHeader)> = Vec::new();
-
-        for (addr, state) in chains.iter() {
-            // Only consider peers we have a fetch channel for.
-            if !self.fetch_senders.contains_key(addr) {
-                continue;
-            }
-
-            for header in &state.pending_headers {
-                // Skip blocks we already have (at or before our tip).
-                if header.slot <= self.current_tip_slot {
+        if let Some(db_handle) = self.chain_db.as_ref() {
+            let db = db_handle.read().await;
+            for (addr, header) in raw_pending {
+                let hash = dugite_primitives::hash::Hash32::from_bytes(header.hash);
+                if db.has_block(&hash) {
                     continue;
                 }
-
-                // Skip blocks already in-flight.
                 if self.in_flight.contains_key(&header.hash) {
                     continue;
                 }
-
-                new_headers.push((*addr, header.clone()));
+                new_headers.push((addr, header));
+            }
+            // Lock dropped at end of scope.
+        } else {
+            // Legacy unit-test path (no ChainDB available): fall back to the
+            // slot-based check that preserved the original test fixtures.
+            for (addr, header) in raw_pending {
+                if header.slot <= self.current_tip_slot {
+                    continue;
+                }
+                if self.in_flight.contains_key(&header.hash) {
+                    continue;
+                }
+                new_headers.push((addr, header));
             }
         }
-
-        // Release the read lock before doing I/O.
-        drop(chains);
 
         if new_headers.is_empty() {
             return;

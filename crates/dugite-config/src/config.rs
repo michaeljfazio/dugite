@@ -17,10 +17,12 @@
 
 use std::collections::HashSet;
 use std::fs;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use serde_json::Value;
+use tempfile::NamedTempFile;
 
 use crate::schema::KNOWN_PARAMS;
 
@@ -270,12 +272,27 @@ pub fn save_config(config: &mut LoadedConfig) -> Result<()> {
     let mut out = serde_json::to_string_pretty(&json).context("serialising config to JSON")?;
     out.push('\n'); // trailing newline
 
-    // Step 4 — atomic write via temp file in the same directory.
+    // Step 4 — atomic write via a unique-name temp file in the same
+    // directory, then atomic rename onto the target.
+    //
+    // `NamedTempFile::new_in(dir)` produces an OS-randomised path so
+    // concurrent `save_config` calls (across cargo-test workers sharing
+    // `/tmp` and, in principle, two long-running dugite-config instances
+    // editing different files on the same volume) do not clobber each
+    // other's temp file before the rename — observed as a CI flake in
+    // `test_save_*` (2026-05-17).  The previous hardcoded
+    // `.dugite-config.tmp` filename meant the second writer overwrote
+    // the first, then the first's rename ENOENT'd.
     let dir = path.parent().unwrap_or_else(|| Path::new("."));
-    let tmp_path = dir.join(".dugite-config.tmp");
-    fs::write(&tmp_path, &out)
-        .with_context(|| format!("writing temp file '{}'", tmp_path.display()))?;
-    fs::rename(&tmp_path, &path)
+    let mut tmp = NamedTempFile::new_in(dir)
+        .with_context(|| format!("creating temp file for atomic write in '{}'", dir.display()))?;
+    tmp.write_all(out.as_bytes())
+        .with_context(|| format!("writing temp file '{}'", tmp.path().display()))?;
+    tmp.as_file_mut()
+        .sync_all()
+        .with_context(|| format!("fsync temp file '{}'", tmp.path().display()))?;
+    tmp.persist(&path)
+        .map_err(|e| e.error)
         .with_context(|| format!("renaming temp file to '{}'", path.display()))?;
 
     // Mark all entries clean now that the file is on disk.

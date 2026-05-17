@@ -18,6 +18,7 @@
 - [Monitoring](./running/monitoring.md)
 - [Relay Node](./running/relay.md)
 - [Block Producer](./running/block-producer.md)
+- [Local Testnet](./running/local-testnet.md)
 - [Kubernetes Deployment](./running/kubernetes.md)
 
 # CLI Reference
