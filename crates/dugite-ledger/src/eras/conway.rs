@@ -3370,4 +3370,481 @@ mod tests {
             "Script credential withdrawal should skip delegation check: {result:?}"
         );
     }
+
+    // -----------------------------------------------------------------------
+    // #496 — UpdateCommittee enactment during chunk-file replay
+    //
+    // The reported bug: in a from-genesis chunk-file replay, on-chain
+    // UpdateCommittee proposals never enact, even though they DO enact on
+    // the real Cardano chain (e.g. preview tx f4188b…, ratified epoch 993,
+    // enacted epoch 994).  The unit test
+    // `test_update_committee_no_cc_required_when_confidence` in
+    // state/governance.rs already proves the basic enactment loop works
+    // when proposals + votes are added via `process_proposal` /
+    // `process_vote` directly on `LedgerState`.  The chunk-replay path
+    // dispatches through `ConwayRules::apply_valid_tx →
+    // process_governance_votes_and_proposals`, which is a different code
+    // path with no bootstrap guard, no `prev_action_id` chain validation,
+    // and no constitution check.  This test exercises THAT path end-to-end
+    // and asserts the same outcome: a freshly-submitted UpdateCommittee
+    // with passing DRep+SPO votes enacts at the next eligible epoch
+    // boundary.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_conway_apply_tx_updatecommittee_enacts_through_era_rules() {
+        use crate::state::DRepRegistration;
+        use dugite_primitives::credentials::Credential;
+        use dugite_primitives::hash::Hash28;
+        use dugite_primitives::transaction::{GovAction, GovActionId, Rational, Voter};
+
+        // PV10 (post-bootstrap) on mainnet defaults — real DRep+SPO thresholds apply.
+        let mut params = ProtocolParameters::mainnet_defaults();
+        params.protocol_version_major = 10;
+        params.committee_min_size = 0;
+        params.gov_action_lifetime = 10;
+        params.committee_max_term_length = 200;
+        // Lower thresholds so a small synthetic electorate clears them.
+        params.dvt_committee_normal = Rational {
+            numerator: 1,
+            denominator: 2,
+        };
+        params.pvt_committee_normal = Rational {
+            numerator: 1,
+            denominator: 2,
+        };
+
+        let ctx = make_conway_ctx(&params);
+        let rules = ConwayRules::new();
+
+        let mut utxo = make_utxo_sub(vec![]);
+        let mut certs = make_cert_sub();
+        let mut gov = make_gov_sub();
+        let mut epochs = make_epoch_sub();
+        epochs.protocol_params = params.clone();
+        epochs.prev_protocol_params = params.clone();
+        epochs.prev_protocol_version_major = 10;
+        let mut consensus = make_consensus_sub();
+
+        // ── Seed DRep electorate (10 DReps, 1B stake each delegated to them).
+        for i in 0..10u8 {
+            let drep_cred = Credential::VerificationKey(Hash28::from_bytes([i; 28]));
+            let drep_key = dugite_primitives::credentials::Credential::to_typed_hash32(&drep_cred);
+            Arc::make_mut(&mut gov.governance).dreps.insert(
+                drep_key,
+                DRepRegistration {
+                    credential: drep_cred.clone(),
+                    deposit: Lovelace(500_000_000),
+                    anchor: None,
+                    registered_epoch: EpochNo(0),
+                    drep_expiry: EpochNo(100),
+                    active: true,
+                },
+            );
+            let stake_key = Hash32::from_bytes([200u8 + i; 32]);
+            Arc::make_mut(&mut gov.governance)
+                .vote_delegations
+                .insert(stake_key, DRep::KeyHash(drep_key));
+            certs
+                .stake_distribution
+                .stake_map
+                .insert(stake_key, Lovelace(1_000_000_000));
+        }
+
+        // ── Seed SPO electorate (5 pools, 1B stake each).
+        for i in 0..5u8 {
+            let pool_id = Hash28::from_bytes([100u8 + i; 28]);
+            Arc::make_mut(&mut certs.pool_params).insert(
+                pool_id,
+                PoolRegistration {
+                    pool_id,
+                    vrf_keyhash: Hash32::ZERO,
+                    pledge: Lovelace(1_000_000),
+                    cost: Lovelace(340_000_000),
+                    margin_numerator: 1,
+                    margin_denominator: 100,
+                    reward_account: vec![],
+                    owners: vec![],
+                    relays: vec![],
+                    metadata_url: None,
+                    metadata_hash: None,
+                },
+            );
+            let stake_key = Hash32::from_bytes([150u8 + i; 32]);
+            Arc::make_mut(&mut certs.delegations).insert(stake_key, pool_id);
+            certs
+                .stake_distribution
+                .stake_map
+                .insert(stake_key, Lovelace(1_000_000_000));
+        }
+        // Prime the mark snapshot with this SPO stake so ratification's SPO
+        // denominator matches (ratify_proposals_impl reads `snapshots.set`
+        // for total_spo_stake; absent that, falls back to live).
+        let mark_pool_stake: HashMap<Hash28, Lovelace> = (0..5u8)
+            .map(|i| (Hash28::from_bytes([100u8 + i; 28]), Lovelace(1_000_000_000)))
+            .collect();
+        let pool_params_snap = certs.pool_params.clone();
+        let make_snap = || crate::state::StakeSnapshot {
+            epoch: ctx.current_epoch,
+            delegations: Arc::new(HashMap::new()),
+            pool_stake: mark_pool_stake.clone(),
+            pool_params: pool_params_snap.clone(),
+            stake_distribution: Arc::new(HashMap::new()),
+            epoch_fees: Lovelace(0),
+            epoch_block_count: 0,
+            epoch_blocks_by_pool: Arc::new(HashMap::new()),
+        };
+        epochs.snapshots.mark = Some(make_snap());
+        epochs.snapshots.set = Some(make_snap());
+        epochs.snapshots.go = Some(make_snap());
+
+        // ── Build a tx with a single UpdateCommittee proposal (chain-link 1).
+        let new_member_cred = Credential::VerificationKey(Hash28::from_bytes([0x99; 28]));
+        let new_member_key =
+            dugite_primitives::credentials::Credential::to_typed_hash32(&new_member_cred);
+        let mut members_to_add = BTreeMap::new();
+        members_to_add.insert(new_member_cred.clone(), 100u64);
+
+        let proposal = ProposalProcedure {
+            deposit: Lovelace(100_000_000_000),
+            return_addr: vec![0u8; 29],
+            gov_action: GovAction::UpdateCommittee {
+                prev_action_id: None,
+                members_to_remove: vec![],
+                members_to_add,
+                threshold: Rational {
+                    numerator: 1,
+                    denominator: 2,
+                },
+            },
+            anchor: Anchor {
+                url: "https://test".to_string(),
+                data_hash: Hash32::ZERO,
+            },
+        };
+
+        let mut prop_tx = make_tx(0x40, vec![], vec![], 0);
+        prop_tx.body.proposal_procedures = vec![proposal];
+        rules
+            .apply_valid_tx(
+                &prop_tx,
+                BlockValidationMode::ApplyOnly,
+                &ctx,
+                &mut utxo,
+                &mut certs,
+                &mut gov,
+                &mut epochs,
+            )
+            .expect("apply UpdateCommittee proposal tx");
+
+        let action_id = GovActionId {
+            transaction_id: prop_tx.hash,
+            action_index: 0,
+        };
+        assert!(
+            gov.governance.proposals.contains_key(&action_id),
+            "proposal must be ingested by process_governance_votes_and_proposals"
+        );
+
+        // ── Build a tx with the DRep + SPO votes.
+        let mut vote_tx = make_tx(0x41, vec![], vec![], 0);
+        for i in 0..10u8 {
+            let voter = Voter::DRep(Credential::VerificationKey(Hash28::from_bytes([i; 28])));
+            vote_tx
+                .body
+                .voting_procedures
+                .entry(voter)
+                .or_default()
+                .insert(
+                    action_id.clone(),
+                    VotingProcedure {
+                        vote: Vote::Yes,
+                        anchor: None,
+                    },
+                );
+        }
+        for i in 0..5u8 {
+            let pool_hash32 = Hash28::from_bytes([100u8 + i; 28]).to_hash32_padded();
+            let voter = Voter::StakePool(pool_hash32);
+            vote_tx
+                .body
+                .voting_procedures
+                .entry(voter)
+                .or_default()
+                .insert(
+                    action_id.clone(),
+                    VotingProcedure {
+                        vote: Vote::Yes,
+                        anchor: None,
+                    },
+                );
+        }
+        rules
+            .apply_valid_tx(
+                &vote_tx,
+                BlockValidationMode::ApplyOnly,
+                &ctx,
+                &mut utxo,
+                &mut certs,
+                &mut gov,
+                &mut epochs,
+            )
+            .expect("apply votes tx");
+
+        // Sanity: votes recorded for our proposal.
+        let recorded = gov
+            .governance
+            .votes_by_action
+            .get(&action_id)
+            .map(|v| v.len())
+            .unwrap_or(0);
+        assert_eq!(
+            recorded, 15,
+            "all 10 DRep + 5 SPO votes must be in votes_by_action"
+        );
+
+        // ── Cross epoch boundaries until either ratification fires or the
+        // proposal expires.  In Conway timing, ratification reads from the
+        // snapshot captured at the *previous* boundary, so the proposal
+        // becomes eligible at boundary E+1→E+2 (where E is the proposal's
+        // proposed_epoch).  Loop up to 8 boundaries to be defensive.
+        let starting_epoch = ctx.current_epoch.0;
+        for next_epoch in (starting_epoch + 1)..=(starting_epoch + 8) {
+            rules
+                .process_epoch_transition(
+                    EpochNo(next_epoch),
+                    &ctx,
+                    &mut utxo,
+                    &mut certs,
+                    &mut gov,
+                    &mut epochs,
+                    &mut consensus,
+                )
+                .expect("epoch transition must not fail");
+            if gov
+                .governance
+                .committee_expiration
+                .contains_key(&new_member_key)
+            {
+                return; // success
+            }
+        }
+
+        panic!(
+            "UpdateCommittee proposal applied through Conway::apply_valid_tx + \
+             process_epoch_transition never enacted after 8 epoch boundaries; \
+             committee_expiration={:?}, proposals_remaining={:?}, \
+             enacted_committee={:?}",
+            gov.governance.committee_expiration,
+            gov.governance.proposals.keys().collect::<Vec<_>>(),
+            gov.governance.enacted_committee,
+        );
+    }
+
+    /// Companion to `test_conway_apply_tx_updatecommittee_enacts_through_era_rules`:
+    /// a Plomin-style HardForkInitiation (PV9 → PV10) must enact through the
+    /// chunk-replay code path.  If THIS fails, dugite stays at PV9 (bootstrap)
+    /// after replaying past preview epoch 743, which in turn blocks subsequent
+    /// UpdateCommittee proposals from enacting because the bootstrap phase
+    /// disallows the disposition of any DRep votes for non-PParam, non-HF,
+    /// non-Info actions (CC also has no voters at PV9 boot).
+    #[test]
+    fn test_conway_hardfork_pv9_to_pv10_enacts_through_era_rules() {
+        use dugite_primitives::credentials::Credential;
+        use dugite_primitives::hash::Hash28;
+        use dugite_primitives::transaction::{GovAction, GovActionId, Rational, Voter};
+
+        // PV9 bootstrap.
+        let mut params = ProtocolParameters::mainnet_defaults();
+        params.protocol_version_major = 9;
+        params.committee_min_size = 0;
+        params.gov_action_lifetime = 10;
+        // Realistic Plomin SPO threshold is around 0.6; lower it so a small
+        // synthetic SPO electorate clears.  DRep threshold is 0 at bootstrap.
+        params.pvt_hard_fork = Rational {
+            numerator: 1,
+            denominator: 2,
+        };
+
+        let ctx = make_conway_ctx(&params);
+        let rules = ConwayRules::new();
+
+        let mut utxo = make_utxo_sub(vec![]);
+        let mut certs = make_cert_sub();
+        let mut gov = make_gov_sub();
+        let mut epochs = make_epoch_sub();
+        epochs.protocol_params = params.clone();
+        epochs.prev_protocol_params = params.clone();
+        epochs.prev_protocol_version_major = 9;
+        let mut consensus = make_consensus_sub();
+
+        // Seed 1 committee member (genesis member) + threshold so CC approval
+        // path has a quorum (committee_min_size=0 already lets it pass; the
+        // member is here to mirror the Conway-genesis seed at era transition).
+        let cc_cold = Credential::VerificationKey(Hash28::from_bytes([0x10; 28]));
+        let cc_hot = Credential::VerificationKey(Hash28::from_bytes([0x20; 28]));
+        let cc_cold_key = cc_cold.to_typed_hash32();
+        let cc_hot_key = cc_hot.to_typed_hash32();
+        {
+            let g = Arc::make_mut(&mut gov.governance);
+            g.committee_expiration.insert(cc_cold_key, EpochNo(10_000));
+            g.committee_hot_keys.insert(cc_cold_key, cc_hot_key);
+            g.committee_threshold = Some(Rational {
+                numerator: 1,
+                denominator: 2,
+            });
+        }
+
+        // Seed 5 SPOs with stake.
+        for i in 0..5u8 {
+            let pool_id = Hash28::from_bytes([100u8 + i; 28]);
+            Arc::make_mut(&mut certs.pool_params).insert(
+                pool_id,
+                PoolRegistration {
+                    pool_id,
+                    vrf_keyhash: Hash32::ZERO,
+                    pledge: Lovelace(1_000_000),
+                    cost: Lovelace(340_000_000),
+                    margin_numerator: 1,
+                    margin_denominator: 100,
+                    reward_account: vec![],
+                    owners: vec![],
+                    relays: vec![],
+                    metadata_url: None,
+                    metadata_hash: None,
+                },
+            );
+            let stake_key = Hash32::from_bytes([150u8 + i; 32]);
+            Arc::make_mut(&mut certs.delegations).insert(stake_key, pool_id);
+            certs
+                .stake_distribution
+                .stake_map
+                .insert(stake_key, Lovelace(1_000_000_000));
+        }
+        let pool_stake_snap: HashMap<Hash28, Lovelace> = (0..5u8)
+            .map(|i| (Hash28::from_bytes([100u8 + i; 28]), Lovelace(1_000_000_000)))
+            .collect();
+        let pool_params_snap = certs.pool_params.clone();
+        let make_snap = || crate::state::StakeSnapshot {
+            epoch: ctx.current_epoch,
+            delegations: Arc::new(HashMap::new()),
+            pool_stake: pool_stake_snap.clone(),
+            pool_params: pool_params_snap.clone(),
+            stake_distribution: Arc::new(HashMap::new()),
+            epoch_fees: Lovelace(0),
+            epoch_block_count: 0,
+            epoch_blocks_by_pool: Arc::new(HashMap::new()),
+        };
+        epochs.snapshots.mark = Some(make_snap());
+        epochs.snapshots.set = Some(make_snap());
+        epochs.snapshots.go = Some(make_snap());
+
+        // Build a HardForkInitiation proposal: PV9 → PV10 (Plomin shape).
+        let proposal = ProposalProcedure {
+            deposit: Lovelace(100_000_000_000),
+            return_addr: vec![0u8; 29],
+            gov_action: GovAction::HardForkInitiation {
+                prev_action_id: None,
+                protocol_version: (10, 0),
+            },
+            anchor: Anchor {
+                url: "https://test".to_string(),
+                data_hash: Hash32::ZERO,
+            },
+        };
+        let mut prop_tx = make_tx(0x50, vec![], vec![], 0);
+        prop_tx.body.proposal_procedures = vec![proposal];
+        rules
+            .apply_valid_tx(
+                &prop_tx,
+                BlockValidationMode::ApplyOnly,
+                &ctx,
+                &mut utxo,
+                &mut certs,
+                &mut gov,
+                &mut epochs,
+            )
+            .expect("apply HardForkInitiation proposal tx");
+
+        let action_id = GovActionId {
+            transaction_id: prop_tx.hash,
+            action_index: 0,
+        };
+        assert!(
+            gov.governance.proposals.contains_key(&action_id),
+            "HF proposal must be ingested at PV9 bootstrap (HFs ARE allowed during boot)"
+        );
+
+        // SPO votes + CC vote.
+        let mut vote_tx = make_tx(0x51, vec![], vec![], 0);
+        for i in 0..5u8 {
+            let pool_hash32 = Hash28::from_bytes([100u8 + i; 28]).to_hash32_padded();
+            let voter = Voter::StakePool(pool_hash32);
+            vote_tx
+                .body
+                .voting_procedures
+                .entry(voter)
+                .or_default()
+                .insert(
+                    action_id.clone(),
+                    VotingProcedure {
+                        vote: Vote::Yes,
+                        anchor: None,
+                    },
+                );
+        }
+        // CC hot-key vote (HardFork needs CC approval too).
+        let cc_voter = Voter::ConstitutionalCommittee(cc_hot);
+        vote_tx
+            .body
+            .voting_procedures
+            .entry(cc_voter)
+            .or_default()
+            .insert(
+                action_id.clone(),
+                VotingProcedure {
+                    vote: Vote::Yes,
+                    anchor: None,
+                },
+            );
+        rules
+            .apply_valid_tx(
+                &vote_tx,
+                BlockValidationMode::ApplyOnly,
+                &ctx,
+                &mut utxo,
+                &mut certs,
+                &mut gov,
+                &mut epochs,
+            )
+            .expect("apply HF votes tx");
+
+        // Cross boundaries.  Expected: PV bumps to 10 within ≤8 boundaries.
+        let starting_epoch = ctx.current_epoch.0;
+        for next_epoch in (starting_epoch + 1)..=(starting_epoch + 8) {
+            rules
+                .process_epoch_transition(
+                    EpochNo(next_epoch),
+                    &ctx,
+                    &mut utxo,
+                    &mut certs,
+                    &mut gov,
+                    &mut epochs,
+                    &mut consensus,
+                )
+                .expect("epoch transition must not fail");
+            if epochs.protocol_params.protocol_version_major == 10 {
+                return; // success — HF enacted
+            }
+        }
+
+        panic!(
+            "HardForkInitiation(PV9→PV10) never enacted after 8 epoch boundaries; \
+             current PV={}.{}, proposals_remaining={:?}, enacted_hard_fork={:?}",
+            epochs.protocol_params.protocol_version_major,
+            epochs.protocol_params.protocol_version_minor,
+            gov.governance.proposals.keys().collect::<Vec<_>>(),
+            gov.governance.enacted_hard_fork,
+        );
+    }
 }
