@@ -1059,11 +1059,12 @@ impl ConnectionLifecycleManager {
         let metrics = self.metrics.clone();
         let gsm_event_tx = self.gsm_event_tx.clone();
         let peer_intersection_established = self.peer_intersection_established.clone();
+        let peer_failure_tx = self.peer_failure_tx.clone();
 
         Box::new(move |channel, cancel| {
             Box::pin(async move {
                 info!(%addr, "chainsync task started");
-                if let Err(e) = super::sync::chainsync_client_task(
+                let result = super::sync::chainsync_client_task(
                     channel,
                     addr,
                     candidate_chains,
@@ -1073,13 +1074,21 @@ impl ConnectionLifecycleManager {
                     security_param,
                     active_slots_coeff,
                     metrics,
-                    cancel,
+                    cancel.clone(),
                     gsm_event_tx,
                     peer_intersection_established,
                 )
-                .await
-                {
+                .await;
+                // Report any non-cancel failure to the peer manager so the
+                // governor can demote-and-re-promote the peer — without this,
+                // a chainsync death (bearer close, decode error, stale
+                // intersection) leaves the TCP connection up but no headers
+                // arriving (#499).  Matches keepalive/blockfetch pattern.
+                if let Err(e) = result {
                     warn!(%addr, error = %e, "chainsync task failed");
+                    if !cancel.is_cancelled() {
+                        let _ = peer_failure_tx.try_send(addr);
+                    }
                 }
                 debug!(%addr, "chainsync task exiting");
             })
@@ -1893,6 +1902,64 @@ impl ConnectionLifecycleManager {
             peer_manager_for_servers,
             Arc::new(std::sync::atomic::AtomicBool::new(false)),
         )
+    }
+
+    /// Variant of [`new_for_test`] that returns the peer-failure receiver
+    /// instead of dropping it, so tests can observe failures reported by
+    /// protocol tasks (e.g. the chainsync auto-restart hook from #499).
+    pub(crate) fn new_for_test_with_failure_rx() -> (Self, mpsc::Receiver<SocketAddr>) {
+        let (fetched_blocks_tx, _rx) = mpsc::channel(1);
+        let (block_announcement_tx, _) = broadcast::channel(1);
+        let (rollback_announcement_tx, _) = broadcast::channel(1);
+        let (peer_failure_tx, peer_failure_rx) = mpsc::channel(8);
+        let (keepalive_rtt_tx, _) = mpsc::channel(1);
+        let (gsm_event_tx, _) = mpsc::channel(1);
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let chain_db = dugite_storage::ChainDB::open(tmp.path()).expect("ChainDB::open in test");
+
+        let ledger_state = dugite_ledger::LedgerState::new(
+            dugite_primitives::protocol_params::ProtocolParameters::mainnet_defaults(),
+        );
+
+        let peer_manager_for_servers = Arc::new(RwLock::new(
+            super::networking::NodePeerManager::new(super::networking::PeerManagerConfig::default()),
+        ));
+
+        let block_provider = Arc::new(super::serve::ChainDBBlockProvider {
+            chain_db: Arc::new(RwLock::new(chain_db)),
+        });
+
+        let ledger_arc = Arc::new(RwLock::new(ledger_state));
+
+        let tmp2 = tempfile::tempdir().expect("tempdir2");
+        let chain_db2 = dugite_storage::ChainDB::open(tmp2.path()).expect("ChainDB::open2 in test");
+
+        let lc = Self::new(
+            764_824_073,
+            false,
+            std::time::Duration::from_secs(10),
+            Arc::new(RwLock::new(std::collections::HashMap::new())),
+            fetched_blocks_tx,
+            block_announcement_tx,
+            Arc::new(RwLock::new(chain_db2)),
+            ledger_arc,
+            432_000,
+            2160,
+            0.05,
+            Arc::new(crate::metrics::NodeMetrics::new()),
+            Arc::new(dugite_mempool::Mempool::new(
+                dugite_mempool::MempoolConfig::default(),
+            )),
+            peer_failure_tx,
+            keepalive_rtt_tx,
+            gsm_event_tx,
+            block_provider,
+            rollback_announcement_tx,
+            peer_manager_for_servers,
+            Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        );
+        (lc, peer_failure_rx)
     }
 
     /// Insert a fake connection entry so `connection_count()` reflects the
@@ -2798,5 +2865,79 @@ mod tests {
             ids.contains(hash_a.as_bytes()),
             "A must be re-announced after re-entering the mempool"
         );
+    }
+
+    // ───────────────────────────────────────────────────────────────────
+    // #499 — chainsync task auto-restart hook
+    // ───────────────────────────────────────────────────────────────────
+
+    /// Build a `MuxChannel` whose ingress is closed so the first `recv()`
+    /// returns `BearerClosed`. Used to force `chainsync_client_task` to
+    /// return `Err` immediately.
+    fn closed_ingress_channel() -> dugite_network::MuxChannel {
+        use dugite_network::{Direction, MuxChannel};
+        use std::sync::atomic::AtomicUsize;
+        type Bytes = tokio_util::bytes::Bytes;
+        let (egress_tx, _egress_rx) = mpsc::channel::<(u16, Direction, Bytes)>(8);
+        let (ingress_tx, ingress_rx) = mpsc::channel::<Bytes>(8);
+        drop(ingress_tx); // close ingress immediately
+        MuxChannel::new(
+            2, // ChainSync protocol id (arbitrary for the test)
+            Direction::InitiatorDir,
+            egress_tx,
+            ingress_rx,
+            65_536,
+            Arc::new(AtomicUsize::new(0)),
+        )
+    }
+
+    /// When `chainsync_client_task` returns `Err` and the cancellation token
+    /// is NOT cancelled, the task must signal the peer manager via
+    /// `peer_failure_tx` so the governor can demote-and-re-promote.  Prior to
+    /// the fix the warn! was silent and the peer stayed “hot” forever.
+    #[tokio::test]
+    async fn chainsync_task_reports_failure_to_peer_manager_on_error() {
+        use tokio_util::sync::CancellationToken;
+        let (lc, mut peer_failure_rx) = ConnectionLifecycleManager::new_for_test_with_failure_rx();
+        let addr: SocketAddr = "127.0.0.1:39499".parse().unwrap();
+        let task = lc.make_chainsync_task(addr);
+        let channel = closed_ingress_channel();
+        let cancel = CancellationToken::new();
+        // Run the closure and wait for the failure report.  We don't await the
+        // closure first because some chainsync setup may yield before erroring;
+        // the failure-report send happens after chainsync_client_task returns.
+        let handle = tokio::spawn(task(channel, cancel));
+        let received =
+            tokio::time::timeout(std::time::Duration::from_secs(5), peer_failure_rx.recv())
+                .await
+                .expect("peer_failure_rx timed out");
+        assert_eq!(
+            received,
+            Some(addr),
+            "chainsync task must report failure to peer manager when bearer closes"
+        );
+        // Drain the spawned task; it should already be finishing.
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(2), handle).await;
+    }
+
+    /// When the task is cancelled (graceful shutdown), failure must NOT be
+    /// reported even though chainsync_client_task returns Err — otherwise we
+    /// would spam peer_failed() during planned demotions and shutdown.
+    #[tokio::test]
+    async fn chainsync_task_does_not_report_failure_when_cancelled() {
+        use tokio_util::sync::CancellationToken;
+        let (lc, mut peer_failure_rx) = ConnectionLifecycleManager::new_for_test_with_failure_rx();
+        let addr: SocketAddr = "127.0.0.1:39500".parse().unwrap();
+        let task = lc.make_chainsync_task(addr);
+        let channel = closed_ingress_channel();
+        let cancel = CancellationToken::new();
+        cancel.cancel(); // pre-cancel before the task runs
+        let handle = tokio::spawn(task(channel, cancel));
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(2), handle).await;
+        // No failure should be reported.
+        match peer_failure_rx.try_recv() {
+            Err(mpsc::error::TryRecvError::Empty) => { /* expected */ }
+            other => panic!("expected no peer_failure when cancelled, got {:?}", other),
+        }
     }
 }
