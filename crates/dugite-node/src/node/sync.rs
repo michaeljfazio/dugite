@@ -1946,7 +1946,11 @@ impl Node {
                 ls.epochs.needs_stake_rebuild = false;
             }
 
-            let result = crate::mithril::replay_from_chunk_files(&replay_dir, |cbor| {
+            // Pass ledger_tip_slot for #502 chunk-skip optimization.
+            // When the gap is small (typical after Mithril import), this
+            // binary-searches the chunk list rather than iterating every
+            // entry from genesis just to find ~20 blocks to apply.
+            let result = crate::mithril::replay_from_chunk_files(&replay_dir, ledger_tip_slot, bel, |cbor| {
                 // Check shutdown every 1000 blocks
                 if replayed.is_multiple_of(1000) && *shutdown_rx.borrow() {
                     info!("Shutdown requested during chunk replay at block {replayed}");

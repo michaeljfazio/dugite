@@ -1142,9 +1142,21 @@ fn copy_dir_recursive(src: &Path, dst: &Path) -> Result<()> {
 /// decode — the callback receives raw CBOR slices that are decoded once by the
 /// caller for ledger application.
 ///
+/// `start_after_slot` enables gap-fill skipping (issue #502): when the caller's
+/// ledger tip is at slot `s`, passing `start_after_slot = s` makes this function
+/// binary-search the chunk list to find the first chunk that may contain blocks
+/// past `s`. Pass `0` to iterate from genesis (e.g. for offline dump/replay).
+/// `byron_epoch_length` is required for slot computation on Byron blocks during
+/// the binary-search probe and may be `0` when `start_after_slot == 0`.
+///
 /// Calls the provided callback for each block in order. The callback receives
 /// the raw CBOR bytes. Returns the total number of blocks iterated.
-pub fn replay_from_chunk_files<F>(immutable_dir: &Path, mut on_block: F) -> Result<u64>
+pub fn replay_from_chunk_files<F>(
+    immutable_dir: &Path,
+    start_after_slot: u64,
+    byron_epoch_length: u64,
+    mut on_block: F,
+) -> Result<u64>
 where
     F: FnMut(&[u8]) -> Result<()>,
 {
@@ -1161,9 +1173,18 @@ where
     }
     chunk_numbers.sort();
 
+    // Gap-fill optimization (#502): when start_after_slot > 0, skip whole
+    // chunks whose blocks are already applied. Without this, a fresh Mithril
+    // import that lands a few hundred slots behind the immutable tip iterates
+    // every chunk entry from genesis (4.3M on preview, ~10M on mainnet) just
+    // to apply ~20 blocks.
+    let start_idx = find_replay_start_chunk_idx(&chunk_numbers, start_after_slot, |chunk_num| {
+        read_chunk_first_block_slot(immutable_dir, chunk_num, byron_epoch_length)
+    })?;
+
     let mut total_blocks = 0u64;
 
-    for chunk_num in &chunk_numbers {
+    for chunk_num in &chunk_numbers[start_idx..] {
         let chunk_path = immutable_dir.join(format!("{chunk_num:05}.chunk"));
         let secondary_path = immutable_dir.join(format!("{chunk_num:05}.secondary"));
 
@@ -1182,6 +1203,123 @@ where
     }
 
     Ok(total_blocks)
+}
+
+/// Locate the first chunk index that may contain blocks past `start_after_slot`.
+///
+/// Binary-searches `chunk_numbers` (already sorted ascending) by probing each
+/// chunk's first block slot via `chunk_first_slot`. Returns the start of the
+/// range that must be scanned to find all blocks > `start_after_slot`.
+///
+/// The result is the smallest index `i` such that `chunk_first_slot(i) > start_after_slot`,
+/// minus one — the step-back includes any straggler blocks in the boundary chunk
+/// whose slots lie between `chunk_first_slot(i-1)` and `start_after_slot`.
+///
+/// When `start_after_slot == 0` (full replay from genesis) or the chunk list is
+/// empty, returns 0 without probing. A `None` result from `chunk_first_slot`
+/// (unreadable / corrupt) is treated as "include this and earlier chunks" to
+/// avoid silently dropping blocks.
+fn find_replay_start_chunk_idx<F>(
+    chunk_numbers: &[u64],
+    start_after_slot: u64,
+    mut chunk_first_slot: F,
+) -> Result<usize>
+where
+    F: FnMut(u64) -> Result<Option<u64>>,
+{
+    if start_after_slot == 0 || chunk_numbers.is_empty() {
+        return Ok(0);
+    }
+
+    let mut lo = 0usize;
+    let mut hi = chunk_numbers.len();
+    while lo < hi {
+        let mid = (lo + hi) / 2;
+        match chunk_first_slot(chunk_numbers[mid])? {
+            Some(slot) if slot <= start_after_slot => lo = mid + 1,
+            _ => hi = mid,
+        }
+    }
+    Ok(lo.saturating_sub(1))
+}
+
+/// Read just enough of a chunk file to decode its first block and return its slot.
+///
+/// Used by [`find_replay_start_chunk_idx`] to binary-search for the gap-fill
+/// start chunk without iterating every block. Returns `None` on missing files,
+/// empty chunks, or decode failures — callers treat `None` as a hint to include
+/// the chunk in replay rather than risk dropping a block.
+fn read_chunk_first_block_slot(
+    immutable_dir: &Path,
+    chunk_num: u64,
+    byron_epoch_length: u64,
+) -> Result<Option<u64>> {
+    let chunk_path = immutable_dir.join(format!("{chunk_num:05}.chunk"));
+    let secondary_path = immutable_dir.join(format!("{chunk_num:05}.secondary"));
+
+    let chunk_file = match fs::File::open(&chunk_path) {
+        Ok(f) => f,
+        Err(_) => return Ok(None),
+    };
+    let chunk_len = chunk_file.metadata()?.len() as usize;
+    if chunk_len == 0 {
+        return Ok(None);
+    }
+    // SAFETY: File is opened read-only and not modified externally during the lifetime of this Mmap.
+    let chunk_data = unsafe { Mmap::map(&chunk_file).context("Failed to mmap chunk file")? };
+
+    let (block_start, block_end) = if secondary_path.exists() {
+        match fs::read(&secondary_path) {
+            Ok(secondary_data) if secondary_data.len() >= 56 => {
+                let first = match SecondaryIndexEntry::from_bytes(&secondary_data) {
+                    Some(e) => e,
+                    None => return Ok(None),
+                };
+                let start = first.block_offset as usize;
+                if start >= chunk_len {
+                    return Ok(None);
+                }
+                let end = if secondary_data.len() >= 112 {
+                    SecondaryIndexEntry::from_bytes(&secondary_data[56..])
+                        .map(|e| e.block_offset as usize)
+                        .unwrap_or(chunk_len)
+                } else {
+                    chunk_len
+                };
+                (start, end.min(chunk_len))
+            }
+            _ => probe_first_cbor_item(&chunk_data),
+        }
+    } else {
+        probe_first_cbor_item(&chunk_data)
+    };
+
+    if block_start >= chunk_len || block_end > chunk_len || block_start >= block_end {
+        return Ok(None);
+    }
+
+    let block_cbor = &chunk_data[block_start..block_end];
+    match dugite_serialization::multi_era::decode_block_minimal_with_byron_epoch_length(
+        block_cbor,
+        byron_epoch_length,
+    ) {
+        Ok(block) => Ok(Some(block.slot().0)),
+        Err(_) => Ok(None),
+    }
+}
+
+/// Scan a chunk buffer for the first valid CBOR item, returning its byte range.
+/// Returns `(len, len)` (empty range) when no item is found.
+fn probe_first_cbor_item(chunk_data: &[u8]) -> (usize, usize) {
+    let mut offset = 0;
+    while offset < chunk_data.len() {
+        let remaining = &chunk_data[offset..];
+        match cbor_item_size(remaining) {
+            Some(size) if size > 0 => return (offset, offset + size),
+            _ => offset += 1,
+        }
+    }
+    (chunk_data.len(), chunk_data.len())
 }
 
 /// Replay a single chunk file using secondary index for block boundaries.
@@ -3325,5 +3463,130 @@ mod tests {
         let got = std::fs::read(&dest).expect("output file must exist");
         assert_eq!(got.len(), SIZE, "output size must equal payload size");
         assert_eq!(got, *payload, "output bytes must match original payload");
+    }
+
+    // -------------------------------------------------------------------
+    // Issue #502: chunk-skip gap-fill optimization
+    // -------------------------------------------------------------------
+
+    /// Build a chunk-first-slot lookup over `chunks: &[(chunk_num, first_slot)]`
+    /// that also counts how many lookups the binary search performs. Returns
+    /// (lookup_fn, counter handle).
+    fn counting_lookup(
+        chunks: Vec<(u64, u64)>,
+    ) -> (
+        impl FnMut(u64) -> Result<Option<u64>>,
+        std::rc::Rc<std::cell::Cell<usize>>,
+    ) {
+        let counter = std::rc::Rc::new(std::cell::Cell::new(0usize));
+        let counter_clone = counter.clone();
+        let lookup = move |chunk_num: u64| -> Result<Option<u64>> {
+            counter_clone.set(counter_clone.get() + 1);
+            Ok(chunks
+                .iter()
+                .find(|(n, _)| *n == chunk_num)
+                .map(|(_, s)| *s))
+        };
+        (lookup, counter)
+    }
+
+    #[test]
+    fn test_find_replay_start_chunk_idx_full_replay_from_genesis() {
+        // start_after_slot == 0 means "replay from genesis"; no probing at all.
+        let chunks = vec![(0u64, 0u64), (1, 100), (2, 200), (3, 300)];
+        let chunk_nums: Vec<u64> = chunks.iter().map(|(n, _)| *n).collect();
+        let (lookup, counter) = counting_lookup(chunks);
+        let idx = find_replay_start_chunk_idx(&chunk_nums, 0, lookup).unwrap();
+        assert_eq!(idx, 0, "genesis replay must start at index 0");
+        assert_eq!(counter.get(), 0, "no probes should be performed");
+    }
+
+    #[test]
+    fn test_find_replay_start_chunk_idx_empty_chunk_list() {
+        let chunk_nums: Vec<u64> = vec![];
+        let (lookup, counter) = counting_lookup(vec![]);
+        let idx = find_replay_start_chunk_idx(&chunk_nums, 1000, lookup).unwrap();
+        assert_eq!(idx, 0);
+        assert_eq!(counter.get(), 0);
+    }
+
+    #[test]
+    fn test_find_replay_start_chunk_idx_boundary_chunk_included() {
+        // Chunks 0,1,2,3 cover slot ranges [0..100), [100..200), [200..300), [300..400).
+        // Ledger tip at slot 150 means we need to apply blocks 151..199 from chunk 1
+        // plus all of chunks 2 and 3. find_replay_start_chunk_idx must return 1.
+        let chunks = vec![(0u64, 0u64), (1, 100), (2, 200), (3, 300)];
+        let chunk_nums: Vec<u64> = chunks.iter().map(|(n, _)| *n).collect();
+        let (lookup, _counter) = counting_lookup(chunks);
+        let idx = find_replay_start_chunk_idx(&chunk_nums, 150, lookup).unwrap();
+        assert_eq!(
+            idx, 1,
+            "boundary chunk must be included so straggler blocks at slots > 150 aren't dropped"
+        );
+    }
+
+    #[test]
+    fn test_find_replay_start_chunk_idx_skips_when_tip_equals_chunk_first_slot() {
+        // start_after_slot exactly equal to a chunk's first slot must still
+        // include that chunk's predecessor (a block at slot 100 itself is
+        // already applied, but the predecessor chunk may have blocks > 100
+        // — no, actually predecessor's last slot < 100, so we could skip,
+        // but our conservative step-back is fine).
+        let chunks = vec![(0u64, 0u64), (1, 100), (2, 200)];
+        let chunk_nums: Vec<u64> = chunks.iter().map(|(n, _)| *n).collect();
+        let (lookup, _counter) = counting_lookup(chunks);
+        let idx = find_replay_start_chunk_idx(&chunk_nums, 100, lookup).unwrap();
+        // Binary search finds smallest i where first(i) > 100 → i=2; step back → 1.
+        assert_eq!(idx, 1);
+    }
+
+    #[test]
+    fn test_find_replay_start_chunk_idx_tip_past_all_chunks() {
+        // If start_after_slot exceeds every chunk's first slot, we still
+        // process the last chunk: its blocks may all be ≤ start_after_slot,
+        // but the caller's existing per-block skip handles that. This is
+        // the only chunk that *could* contain blocks past start_after_slot.
+        let chunks = vec![(0u64, 0u64), (1, 100), (2, 200)];
+        let chunk_nums: Vec<u64> = chunks.iter().map(|(n, _)| *n).collect();
+        let (lookup, _counter) = counting_lookup(chunks);
+        let idx = find_replay_start_chunk_idx(&chunk_nums, 9999, lookup).unwrap();
+        assert_eq!(idx, 2);
+    }
+
+    #[test]
+    fn test_find_replay_start_chunk_idx_large_chunk_list_uses_log_probes() {
+        // The whole point of #502: avoid linear scans. With 26000 chunks,
+        // binary search must probe O(log n) ≈ 15 — not 26000.
+        let chunks: Vec<(u64, u64)> = (0..26_000u64).map(|n| (n, n * 100)).collect();
+        let chunk_nums: Vec<u64> = chunks.iter().map(|(n, _)| *n).collect();
+        let (lookup, counter) = counting_lookup(chunks);
+        let _ = find_replay_start_chunk_idx(&chunk_nums, 100_000, lookup).unwrap();
+        assert!(
+            counter.get() < 20,
+            "binary search must do O(log n) probes, got {}",
+            counter.get()
+        );
+    }
+
+    #[test]
+    fn test_find_replay_start_chunk_idx_unreadable_chunk_treated_as_includable() {
+        // A chunk that returns None (unreadable / corrupt) must not be skipped
+        // — biases toward correctness over speed.
+        let chunk_nums = vec![0u64, 1, 2, 3];
+        let lookup = |chunk_num: u64| -> Result<Option<u64>> {
+            // Only chunk 3 is readable, with slot 300.
+            Ok(if chunk_num == 3 { Some(300) } else { None })
+        };
+        let idx = find_replay_start_chunk_idx(&chunk_nums, 100, lookup).unwrap();
+        // All None responses push hi down; lo never advances → lo=0; step back → 0.
+        assert_eq!(idx, 0);
+    }
+
+    #[test]
+    fn test_replay_from_chunk_files_empty_dir() {
+        // Sanity: integration-style smoke test of the public entrypoint.
+        let dir = tempfile::tempdir().unwrap();
+        let count = replay_from_chunk_files(dir.path(), 0, 0, |_cbor| Ok(())).unwrap();
+        assert_eq!(count, 0);
     }
 }
