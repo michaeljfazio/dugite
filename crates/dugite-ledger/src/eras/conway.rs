@@ -3847,4 +3847,443 @@ mod tests {
             gov.governance.enacted_hard_fork,
         );
     }
+
+    /// Regression test for issue #496: three chained UpdateCommittee proposals
+    /// (each with a `prev_action_id` pointing at the previous proposal's action ID)
+    /// must each enact through the era-rules chunk-replay code path.
+    ///
+    /// All three proposals are submitted in the SAME epoch (before the first
+    /// boundary), matching the real preview-testnet chain where proposals 1, 2, 3
+    /// were submitted at epochs 992, 996, 1011, all well before ratification at
+    /// boundary 1041→1042.
+    ///
+    ///   Proposal 1 (prev=None)      → adds p1_member (enacted at boundary E+1)
+    ///   Proposal 2 (prev=Proposal1) → adds p2_member (enacted at boundary E+2)
+    ///   Proposal 3 (prev=Proposal2) → removes p1_member (enacted at boundary E+3)
+    ///
+    /// The delaying-action rule means only one UpdateCommittee can enact per
+    /// boundary.  The ratification snapshot carries `enacted_committee` forward
+    /// across boundaries, allowing each successive proposal to see the correct
+    /// `prev_action_id` chain.
+    #[test]
+    fn test_conway_updatecommittee_chained_prev_action_id_enacts_through_era_rules() {
+        use crate::state::DRepRegistration;
+        use dugite_primitives::credentials::Credential;
+        use dugite_primitives::hash::Hash28;
+        use dugite_primitives::transaction::{GovAction, GovActionId, Rational, Voter};
+
+        // PV10 (post-bootstrap), lower DRep/SPO thresholds for small electorate.
+        let mut params = ProtocolParameters::mainnet_defaults();
+        params.protocol_version_major = 10;
+        params.committee_min_size = 0;
+        params.gov_action_lifetime = 30; // Matches preview testnet
+        params.committee_max_term_length = 365; // Matches preview testnet
+        params.dvt_committee_normal = Rational {
+            numerator: 1,
+            denominator: 2,
+        };
+        params.pvt_committee_normal = Rational {
+            numerator: 1,
+            denominator: 2,
+        };
+
+        let ctx = make_conway_ctx(&params);
+        let rules = ConwayRules::new();
+
+        let mut utxo = make_utxo_sub(vec![]);
+        let mut certs = make_cert_sub();
+        let mut gov = make_gov_sub();
+        let mut epochs = make_epoch_sub();
+        epochs.protocol_params = params.clone();
+        epochs.prev_protocol_params = params.clone();
+        epochs.prev_protocol_version_major = 10;
+        let mut consensus = make_consensus_sub();
+
+        // ── Seed DRep electorate (10 DReps, 1B stake each delegated to them).
+        for i in 0..10u8 {
+            let drep_cred = Credential::VerificationKey(Hash28::from_bytes([i; 28]));
+            let drep_key = Credential::to_typed_hash32(&drep_cred);
+            Arc::make_mut(&mut gov.governance).dreps.insert(
+                drep_key,
+                DRepRegistration {
+                    credential: drep_cred.clone(),
+                    deposit: Lovelace(500_000_000),
+                    anchor: None,
+                    registered_epoch: EpochNo(0),
+                    drep_expiry: EpochNo(200),
+                    active: true,
+                },
+            );
+            let stake_key = Hash32::from_bytes([200u8 + i; 32]);
+            Arc::make_mut(&mut gov.governance)
+                .vote_delegations
+                .insert(stake_key, DRep::KeyHash(drep_key));
+            certs
+                .stake_distribution
+                .stake_map
+                .insert(stake_key, Lovelace(1_000_000_000));
+        }
+
+        // ── Seed SPO electorate (5 pools, 1B stake each).
+        for i in 0..5u8 {
+            let pool_id = Hash28::from_bytes([100u8 + i; 28]);
+            Arc::make_mut(&mut certs.pool_params).insert(
+                pool_id,
+                PoolRegistration {
+                    pool_id,
+                    vrf_keyhash: Hash32::ZERO,
+                    pledge: Lovelace(1_000_000),
+                    cost: Lovelace(340_000_000),
+                    margin_numerator: 1,
+                    margin_denominator: 100,
+                    reward_account: vec![],
+                    owners: vec![],
+                    relays: vec![],
+                    metadata_url: None,
+                    metadata_hash: None,
+                },
+            );
+            let stake_key = Hash32::from_bytes([150u8 + i; 32]);
+            Arc::make_mut(&mut certs.delegations).insert(stake_key, pool_id);
+            certs
+                .stake_distribution
+                .stake_map
+                .insert(stake_key, Lovelace(1_000_000_000));
+        }
+
+        // Prime the mark/set snapshots with SPO stake so the ratification
+        // denominator is populated (ratify_proposals_impl reads snapshots.set
+        // for total_spo_stake; absent that, falls back to live state).
+        let mark_pool_stake: HashMap<Hash28, Lovelace> = (0..5u8)
+            .map(|i| (Hash28::from_bytes([100u8 + i; 28]), Lovelace(1_000_000_000)))
+            .collect();
+        let pool_params_snap = certs.pool_params.clone();
+        let make_snap = || crate::state::StakeSnapshot {
+            epoch: ctx.current_epoch,
+            delegations: Arc::new(HashMap::new()),
+            pool_stake: mark_pool_stake.clone(),
+            pool_params: pool_params_snap.clone(),
+            stake_distribution: Arc::new(HashMap::new()),
+            epoch_fees: Lovelace(0),
+            epoch_block_count: 0,
+            epoch_blocks_by_pool: Arc::new(HashMap::new()),
+        };
+        epochs.snapshots.mark = Some(make_snap());
+        epochs.snapshots.set = Some(make_snap());
+        epochs.snapshots.go = Some(make_snap());
+
+        // Helper: append 10 DRep + 5 SPO yes-votes for `action_id` into `vote_tx`.
+        let append_votes = |vote_tx: &mut Transaction, action_id: &GovActionId| {
+            for i in 0..10u8 {
+                let voter = Voter::DRep(Credential::VerificationKey(Hash28::from_bytes([i; 28])));
+                vote_tx
+                    .body
+                    .voting_procedures
+                    .entry(voter)
+                    .or_default()
+                    .insert(
+                        action_id.clone(),
+                        VotingProcedure {
+                            vote: Vote::Yes,
+                            anchor: None,
+                        },
+                    );
+            }
+            for i in 0..5u8 {
+                let pool_hash32 = Hash28::from_bytes([100u8 + i; 28]).to_hash32_padded();
+                let voter = Voter::StakePool(pool_hash32);
+                vote_tx
+                    .body
+                    .voting_procedures
+                    .entry(voter)
+                    .or_default()
+                    .insert(
+                        action_id.clone(),
+                        VotingProcedure {
+                            vote: Vote::Yes,
+                            anchor: None,
+                        },
+                    );
+            }
+        };
+
+        // ── Proposal 1: prev_action_id = None, adds p1_member.
+        let p1_member_cred = Credential::VerificationKey(Hash28::from_bytes([0xA1; 28]));
+        let p1_member_key = Credential::to_typed_hash32(&p1_member_cred);
+        let mut p1_members = BTreeMap::new();
+        p1_members.insert(p1_member_cred.clone(), 200u64); // expiry epoch 200
+
+        let proposal1 = ProposalProcedure {
+            deposit: Lovelace(100_000_000_000),
+            return_addr: vec![0u8; 29],
+            gov_action: GovAction::UpdateCommittee {
+                prev_action_id: None,
+                members_to_remove: vec![],
+                members_to_add: p1_members,
+                threshold: Rational {
+                    numerator: 1,
+                    denominator: 2,
+                },
+            },
+            anchor: Anchor {
+                url: "https://test/p1".to_string(),
+                data_hash: Hash32::ZERO,
+            },
+        };
+
+        let p1_tx_hash = Hash32::from_bytes([0x01u8; 32]);
+        let action_id_1 = GovActionId {
+            transaction_id: p1_tx_hash,
+            action_index: 0,
+        };
+
+        // ── Proposal 2: prev_action_id = Some(action_id_1), adds p2_member.
+        let p2_member_cred = Credential::VerificationKey(Hash28::from_bytes([0xA2; 28]));
+        let p2_member_key = Credential::to_typed_hash32(&p2_member_cred);
+        let mut p2_members = BTreeMap::new();
+        p2_members.insert(p2_member_cred.clone(), 200u64);
+
+        let proposal2 = ProposalProcedure {
+            deposit: Lovelace(100_000_000_000),
+            return_addr: vec![0u8; 29],
+            gov_action: GovAction::UpdateCommittee {
+                prev_action_id: Some(action_id_1.clone()),
+                members_to_remove: vec![],
+                members_to_add: p2_members,
+                threshold: Rational {
+                    numerator: 1,
+                    denominator: 2,
+                },
+            },
+            anchor: Anchor {
+                url: "https://test/p2".to_string(),
+                data_hash: Hash32::ZERO,
+            },
+        };
+
+        let p2_tx_hash = Hash32::from_bytes([0x02u8; 32]);
+        let action_id_2 = GovActionId {
+            transaction_id: p2_tx_hash,
+            action_index: 0,
+        };
+
+        // ── Proposal 3: prev_action_id = Some(action_id_2), removes p1_member.
+        let proposal3 = ProposalProcedure {
+            deposit: Lovelace(100_000_000_000),
+            return_addr: vec![0u8; 29],
+            gov_action: GovAction::UpdateCommittee {
+                prev_action_id: Some(action_id_2.clone()),
+                members_to_remove: vec![p1_member_cred.clone()],
+                members_to_add: BTreeMap::new(),
+                threshold: Rational {
+                    numerator: 1,
+                    denominator: 2,
+                },
+            },
+            anchor: Anchor {
+                url: "https://test/p3".to_string(),
+                data_hash: Hash32::ZERO,
+            },
+        };
+
+        let p3_tx_hash = Hash32::from_bytes([0x03u8; 32]);
+        let action_id_3 = GovActionId {
+            transaction_id: p3_tx_hash,
+            action_index: 0,
+        };
+
+        // ── Submit ALL three proposals in a single tx BEFORE the first boundary.
+        //    This matches the real chain: proposals submitted at epochs 992/996/1011,
+        //    all well before the ratification boundary at 1041→1042.
+        let mut prop_tx = make_tx(0x01, vec![], vec![], 0);
+        // Override the hash so action_id_1 matches.
+        prop_tx.hash = p1_tx_hash;
+        prop_tx.body.proposal_procedures = vec![proposal1];
+        rules
+            .apply_valid_tx(
+                &prop_tx,
+                BlockValidationMode::ApplyOnly,
+                &ctx,
+                &mut utxo,
+                &mut certs,
+                &mut gov,
+                &mut epochs,
+            )
+            .expect("apply proposal 1 tx");
+        assert!(
+            gov.governance.proposals.contains_key(&action_id_1),
+            "proposal 1 must be ingested"
+        );
+
+        let mut prop2_tx = make_tx(0x02, vec![], vec![], 0);
+        prop2_tx.hash = p2_tx_hash;
+        prop2_tx.body.proposal_procedures = vec![proposal2];
+        rules
+            .apply_valid_tx(
+                &prop2_tx,
+                BlockValidationMode::ApplyOnly,
+                &ctx,
+                &mut utxo,
+                &mut certs,
+                &mut gov,
+                &mut epochs,
+            )
+            .expect("apply proposal 2 tx");
+        assert!(
+            gov.governance.proposals.contains_key(&action_id_2),
+            "proposal 2 must be ingested"
+        );
+
+        let mut prop3_tx = make_tx(0x03, vec![], vec![], 0);
+        prop3_tx.hash = p3_tx_hash;
+        prop3_tx.body.proposal_procedures = vec![proposal3];
+        rules
+            .apply_valid_tx(
+                &prop3_tx,
+                BlockValidationMode::ApplyOnly,
+                &ctx,
+                &mut utxo,
+                &mut certs,
+                &mut gov,
+                &mut epochs,
+            )
+            .expect("apply proposal 3 tx");
+        assert!(
+            gov.governance.proposals.contains_key(&action_id_3),
+            "proposal 3 must be ingested"
+        );
+
+        // ── Submit all votes for all three proposals in a single tx.
+        let mut vote_tx = make_tx(0x10, vec![], vec![], 0);
+        append_votes(&mut vote_tx, &action_id_1);
+        append_votes(&mut vote_tx, &action_id_2);
+        append_votes(&mut vote_tx, &action_id_3);
+        rules
+            .apply_valid_tx(
+                &vote_tx,
+                BlockValidationMode::ApplyOnly,
+                &ctx,
+                &mut utxo,
+                &mut certs,
+                &mut gov,
+                &mut epochs,
+            )
+            .expect("apply votes tx");
+
+        let starting_epoch = ctx.current_epoch.0;
+
+        // ── Boundary E+1: proposal 1 ratifies (prev=None matches enacted_committee=None).
+        //    Proposals 2 and 3 are delayed (UpdateCommittee is a delaying action).
+        rules
+            .process_epoch_transition(
+                EpochNo(starting_epoch + 1),
+                &ctx,
+                &mut utxo,
+                &mut certs,
+                &mut gov,
+                &mut epochs,
+                &mut consensus,
+            )
+            .expect("epoch transition E+1");
+
+        assert!(
+            gov.governance
+                .committee_expiration
+                .contains_key(&p1_member_key),
+            "proposal 1 must have enacted after E+1; \
+             enacted_committee={:?}, proposals_remaining={:?}",
+            gov.governance.enacted_committee,
+            gov.governance.proposals.keys().collect::<Vec<_>>(),
+        );
+        assert_eq!(
+            gov.governance.enacted_committee,
+            Some(action_id_1.clone()),
+            "enacted_committee must be proposal 1's ID after E+1"
+        );
+        // The ratification snapshot must carry enacted_id_1 so that proposal 2's
+        // prev_action_as_expected check passes at E+2 ratification.
+        let snap = gov
+            .governance
+            .ratification_snapshot
+            .as_ref()
+            .expect("ratification snapshot must be populated after E+1");
+        assert_eq!(
+            snap.enacted_committee,
+            Some(action_id_1.clone()),
+            "ratification snapshot must carry proposal 1's ID for proposal 2 chain check"
+        );
+        assert!(
+            snap.proposals.contains_key(&action_id_2),
+            "snapshot must contain proposal 2 so it is visible at E+2 ratification; \
+             snap.proposals={:?}",
+            snap.proposals.keys().collect::<Vec<_>>()
+        );
+
+        // ── Boundary E+2: proposal 2 ratifies (prev=action_id_1, snapshot.enacted=action_id_1).
+        rules
+            .process_epoch_transition(
+                EpochNo(starting_epoch + 2),
+                &ctx,
+                &mut utxo,
+                &mut certs,
+                &mut gov,
+                &mut epochs,
+                &mut consensus,
+            )
+            .expect("epoch transition E+2");
+
+        assert!(
+            gov.governance
+                .committee_expiration
+                .contains_key(&p2_member_key),
+            "proposal 2 must have enacted after E+2; \
+             enacted_committee={:?}, proposals_remaining={:?}",
+            gov.governance.enacted_committee,
+            gov.governance.proposals.keys().collect::<Vec<_>>(),
+        );
+        assert_eq!(
+            gov.governance.enacted_committee,
+            Some(action_id_2.clone()),
+            "enacted_committee must be proposal 2's ID after E+2"
+        );
+
+        // ── Boundary E+3: proposal 3 ratifies (prev=action_id_2, snapshot.enacted=action_id_2).
+        rules
+            .process_epoch_transition(
+                EpochNo(starting_epoch + 3),
+                &ctx,
+                &mut utxo,
+                &mut certs,
+                &mut gov,
+                &mut epochs,
+                &mut consensus,
+            )
+            .expect("epoch transition E+3");
+
+        // Proposal 3 removes p1_member.
+        assert!(
+            !gov.governance
+                .committee_expiration
+                .contains_key(&p1_member_key),
+            "proposal 3 must remove p1_member from committee after E+3; \
+             enacted_committee={:?}, committee={:?}",
+            gov.governance.enacted_committee,
+            gov.governance
+                .committee_expiration
+                .keys()
+                .collect::<Vec<_>>(),
+        );
+        // p2_member was added by proposal 2 and not removed by proposal 3.
+        assert!(
+            gov.governance
+                .committee_expiration
+                .contains_key(&p2_member_key),
+            "p2_member must remain in committee after E+3"
+        );
+        assert_eq!(
+            gov.governance.enacted_committee,
+            Some(action_id_3.clone()),
+            "enacted_committee must be proposal 3's ID after E+3"
+        );
+    }
 }
