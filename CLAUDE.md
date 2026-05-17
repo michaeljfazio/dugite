@@ -51,6 +51,7 @@ The storage layer is pure Rust with no system dependencies. cardano-lsm (used fo
 - **Tests pass** — All tests must pass before committing
 - **CI green** — GitHub Actions pipeline must be passing
 - **Commit regularly** — Push changes to remote after each successful iteration
+- **Focused commits** — Stage explicit filenames (no `git add -A` / `git commit -a`). The pre-commit hook warns when staged paths span more than two crates; set `DUGITE_PRECOMMIT_STRICT=1` to make that fatal (recommended for autonomous agent runs).
 
 ## Architecture
 
