@@ -2,6 +2,7 @@
 
 ## ExtLedgerState Snapshot Format
 - [ext-ledger-state-snapshot-format.md](ext-ledger-state-snapshot-format.md) — Complete CBOR encoding of state file: snapshot wrapper array(2)[1,...], ExtLedgerState array(2), HeaderState array(2)[withOrigin,telescope], PraosState 8-field array, ShelleyLedgerState 4-field array, Nonce encoding, telescope lengths
+- [ledger-state-11-0-1-format-changes.md](ledger-state-11-0-1-format-changes.md) — Breaking format changes 10.6.2→11.0.1: spsAccountId array(2)[tag,hash28] (was bytes(29)), Peras field in ShelleyLedgerState array(4), psFutureStakePoolParams values changed type
 
 ## GDD — Genesis Density Disconnector
 - [gdd-genesis-density-disconnector.md](gdd-genesis-density-disconnector.md) — Complete GDD algorithm: genesis window=3k/f slots, integer density bounds (lower/upper), 4 disconnection guards, 1s rate limit, LoE enforcement in ChainSel (+k blocks), GSM state gating (only runs in Syncing)
