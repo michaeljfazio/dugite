@@ -233,14 +233,24 @@ fn decode_pstate(data: &[u8]) -> Result<(HaskellPState, usize), SerializationErr
     }
     off += reader.finish(&data[off..])?;
 
-    // [2] futureStakePoolParams: map(bytes(28) → PoolParams(9))
+    // [2] futureStakePoolParams: map(bytes(28) → PoolParams)
+    //
+    // Bug #504 root cause: PoolParams ≠ StakePoolState. PoolParams is the
+    // standard CDDL `pool_params` array(9) [operator (pool_id, 28B), vrf_hash
+    // (32B), pledge, cost, margin, reward_account, owners, relays, metadata].
+    // StakePoolState (which lives in `stakePools`) is array(10) starting with
+    // vrf_hash (32B) — no operator field because the map key already pins it.
+    //
+    // The old decoder reused `decode_stake_pool_state` here and tried to read
+    // a 32-byte vrf_hash where PoolParams encodes a 28-byte operator, causing
+    // a hard decode failure on any snapshot containing pending pool registrations.
     let (mut reader, n) = MapReader::new(&data[off..])?;
     off += n;
     let mut future_pool_params = HashMap::with_capacity(reader.size_hint());
     while reader.has_next(&data[off..])? {
         let (pool_id, n) = decode_hash28(&data[off..])?;
         off += n;
-        let (params, n) = decode_stake_pool_state(&data[off..])?;
+        let (params, n) = decode_pool_params(&data[off..])?;
         off += n;
         future_pool_params.insert(pool_id, params);
     }
@@ -395,6 +405,270 @@ fn decode_stake_pool_state(
             relays,
             metadata,
             deposit,
+        },
+        off,
+    ))
+}
+
+/// Decode a `psFutureStakePoolParams` map value.
+///
+/// Cardano-node 11.0.1 / cardano-ledger HEAD encodes this as CDDL `pool_params`:
+/// `array(9) [operator(28B), vrf_hash(32B), pledge, cost, margin, reward_account,
+/// owners, relays, metadata]` (see `cardano-ledger-shelley` commit `da53415156c0`,
+/// 2025-11-05, which reverted a brief in-development change that had stored
+/// `StakePoolState` in this field).
+///
+/// For backward compatibility with fixtures captured from the intermediate
+/// in-development cardano-ledger (between commits `b1f299dfa89c` [2025-08-11] and
+/// `da53415156c0` [2025-11-05]), we also accept the `StakePoolState` layout —
+/// `array(10) [vrf_hash(32B), pledge, …, deposit, delegators]` — when the length
+/// is 10. We dispatch on array length: 9 = `StakePoolParams`, 10 = legacy
+/// `StakePoolState`.
+///
+/// We discard the operator/pool_id (when present) because the caller already
+/// has it from the map key. `deposit` synthesises to 0 for `StakePoolParams`
+/// since pending registrations have not paid the deposit yet.
+fn decode_pool_params(data: &[u8]) -> Result<(HaskellStakePoolState, usize), SerializationError> {
+    let mut off = 0;
+
+    let (arr_len, n) = decode_array_len(&data[off..])?;
+    off += n;
+
+    match arr_len {
+        9 => {
+            // array(9) has two known shapes:
+            //   - released 11.0.1 CDDL `pool_params`: [operator(28B), vrf(32B), ...]
+            //   - intermediate dev fixtures (preview e1259):
+            //     `StakePoolState` minus delegators: [vrf(32B), pledge, …, deposit]
+            //
+            // Peek at the first field's bytestring length to discriminate:
+            // 28 → real PoolParams; 32 → legacy StakePoolState-shape.
+            let first_len_byte = data.get(off).copied().ok_or_else(|| {
+                SerializationError::CborDecode(
+                    "PoolParams: unexpected EOF after array header".into(),
+                )
+            })?;
+            // `0x58 0x1c` = bytes(28); `0x58 0x20` = bytes(32); both have
+            // major type 2 (`0x58` = major 2 + info 24 = 1-byte follow-on len).
+            // Use the LENGTH byte (data[off + 1]) when major-info is 24.
+            if first_len_byte == 0x58 {
+                let len_byte = data.get(off + 1).copied().unwrap_or(0);
+                match len_byte {
+                    0x1c => decode_pool_params_array9(data, off),
+                    0x20 => decode_legacy_pool_state_array9(data, off),
+                    n => Err(SerializationError::CborDecode(format!(
+                        "PoolParams[0]: expected bytes(28) or bytes(32), got bytes({n})"
+                    ))),
+                }
+            } else {
+                Err(SerializationError::CborDecode(format!(
+                    "PoolParams[0]: expected bytestring (major 2, info 24), got byte {first_len_byte:#04x}"
+                )))
+            }
+        }
+        10 => {
+            // Released `StakePoolState` shape — the live `psStakePools` layout.
+            // Forward to the live-pool decoder; it re-reads the array header,
+            // so pass the full `data` slice (not `&data[off..]`).
+            let (pool, n_inner) = decode_stake_pool_state(data)?;
+            Ok((pool, n_inner))
+        }
+        n => Err(SerializationError::CborDecode(format!(
+            "PoolParams: expected array(9) or array(10), got array({n})"
+        ))),
+    }
+}
+
+/// Decode the legacy intermediate-HEAD `psFutureStakePoolParams` shape:
+/// `array(9) [vrf_hash(32B), pledge, cost, margin, reward_account, owners,
+/// relays, metadata, deposit]` — i.e. `StakePoolState` minus the
+/// `delegators` set. Only emitted by unreleased cardano-ledger commits between
+/// `b1f299dfa89c` (2025-08-11) and `da53415156c0` (2025-11-05), but our preview
+/// epoch 1259 test fixture happens to capture this format.
+fn decode_legacy_pool_state_array9(
+    data: &[u8],
+    mut off: usize,
+) -> Result<(HaskellStakePoolState, usize), SerializationError> {
+    // [0] vrf_hash: bytes(32)
+    let (vrf_hash, n) = decode_hash32(&data[off..])?;
+    off += n;
+
+    // [1..8] same as StakePoolState[1..8] (pledge … deposit). We inline the
+    // reads rather than refactor decode_stake_pool_state.
+    let (pledge, n) = decode_uint(&data[off..])?;
+    off += n;
+    let (cost, n) = decode_uint(&data[off..])?;
+    off += n;
+    let ((margin_num, margin_den), n) = decode_rational(&data[off..])?;
+    off += n;
+
+    let reward_account = match data.get(off).map(|b| b >> 5) {
+        Some(2) => {
+            let (bytes, n) = decode_bytes(&data[off..])?;
+            off += n;
+            bytes.to_vec()
+        }
+        Some(4) => {
+            let ((cred_tag, hash), n) = decode_credential(&data[off..])?;
+            off += n;
+            let mut buf = Vec::with_capacity(29);
+            buf.push(if cred_tag == 0 { 0xE0 } else { 0xF0 });
+            buf.extend_from_slice(hash.as_bytes());
+            buf
+        }
+        Some(major) => {
+            return Err(SerializationError::CborDecode(format!(
+                "legacy PoolState[4] reward_account: expected bytes or array, got major {major}"
+            )));
+        }
+        None => {
+            return Err(SerializationError::CborDecode(
+                "legacy PoolState[4] reward_account: unexpected EOF".into(),
+            ));
+        }
+    };
+
+    let n_owners = skip_set_tag(&data[off..])?;
+    off += n_owners;
+    let (owners_len, n) = decode_array_len(&data[off..])?;
+    off += n;
+    let mut owners = Vec::with_capacity(owners_len);
+    for _ in 0..owners_len {
+        let (hash, n) = decode_hash28(&data[off..])?;
+        off += n;
+        owners.push(hash);
+    }
+
+    let (relays_len, n) = decode_array_len(&data[off..])?;
+    off += n;
+    let mut relays = Vec::with_capacity(relays_len);
+    for _ in 0..relays_len {
+        let (relay, n) = decode_relay(&data[off..])?;
+        off += n;
+        relays.push(relay);
+    }
+
+    let (metadata, n) = decode_optional_anchor(&data[off..])?;
+    off += n;
+
+    let (deposit, n) = decode_uint(&data[off..])?;
+    off += n;
+
+    Ok((
+        HaskellStakePoolState {
+            vrf_hash,
+            pledge,
+            cost,
+            margin_num,
+            margin_den,
+            reward_account,
+            owners,
+            relays,
+            metadata,
+            deposit,
+        },
+        off,
+    ))
+}
+
+/// Decode the 11.0.1+ CDDL `pool_params` shape (`array(9)` without
+/// `delegators`/`deposit`, with `operator` as the leading field).
+///
+/// Called after [`decode_pool_params`] has already consumed the array(9)
+/// header at byte 0; `off` points one byte past it.
+fn decode_pool_params_array9(
+    data: &[u8],
+    mut off: usize,
+) -> Result<(HaskellStakePoolState, usize), SerializationError> {
+    // [0] operator: bytes(28) — pool ID, already known from the map key, discard.
+    let (_operator, n) = decode_hash28(&data[off..])?;
+    off += n;
+
+    // [1] vrf_hash: bytes(32)
+    let (vrf_hash, n) = decode_hash32(&data[off..])?;
+    off += n;
+
+    // [2] pledge: uint
+    let (pledge, n) = decode_uint(&data[off..])?;
+    off += n;
+
+    // [3] cost: uint
+    let (cost, n) = decode_uint(&data[off..])?;
+    off += n;
+
+    // [4] margin: rational
+    let ((margin_num, margin_den), n) = decode_rational(&data[off..])?;
+    off += n;
+
+    // [5] reward_account — same dual encoding as StakePoolState[4]:
+    //   - legacy bytes(29) = header byte + bytes(28)
+    //   - 11.0.1+         = array(2)[uint(0|1), bytes(28)] (AccountId = Credential)
+    let reward_account = match data.get(off).map(|b| b >> 5) {
+        Some(2) => {
+            let (bytes, n) = decode_bytes(&data[off..])?;
+            off += n;
+            bytes.to_vec()
+        }
+        Some(4) => {
+            let ((cred_tag, hash), n) = decode_credential(&data[off..])?;
+            off += n;
+            let mut buf = Vec::with_capacity(29);
+            buf.push(if cred_tag == 0 { 0xE0 } else { 0xF0 });
+            buf.extend_from_slice(hash.as_bytes());
+            buf
+        }
+        Some(major) => {
+            return Err(SerializationError::CborDecode(format!(
+                "PoolParams[5] reward_account: expected bytes(29) or array(2), \
+                 got major type {major}"
+            )));
+        }
+        None => {
+            return Err(SerializationError::CborDecode(
+                "PoolParams[5] reward_account: unexpected EOF".into(),
+            ));
+        }
+    };
+
+    // [6] owners: set (tag 258) or plain array of bytes(28)
+    let n_owners = skip_set_tag(&data[off..])?;
+    off += n_owners;
+    let (owners_len, n) = decode_array_len(&data[off..])?;
+    off += n;
+    let mut owners = Vec::with_capacity(owners_len);
+    for _ in 0..owners_len {
+        let (hash, n) = decode_hash28(&data[off..])?;
+        off += n;
+        owners.push(hash);
+    }
+
+    // [7] relays: array of relay encodings
+    let (relays_len, n) = decode_array_len(&data[off..])?;
+    off += n;
+    let mut relays = Vec::with_capacity(relays_len);
+    for _ in 0..relays_len {
+        let (relay, n) = decode_relay(&data[off..])?;
+        off += n;
+        relays.push(relay);
+    }
+
+    // [8] metadata: null | array(2) [url, hash32]
+    let (metadata, n) = decode_optional_anchor(&data[off..])?;
+    off += n;
+
+    Ok((
+        HaskellStakePoolState {
+            vrf_hash,
+            pledge,
+            cost,
+            margin_num,
+            margin_den,
+            reward_account,
+            owners,
+            relays,
+            metadata,
+            // PoolParams has no deposit field — pending pools haven't paid yet.
+            deposit: 0,
         },
         off,
     ))

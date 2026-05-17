@@ -125,7 +125,13 @@ pub struct HaskellStakePoolState {
     // delegators (field 10) skipped — only in newer nodes
 }
 
-/// PoolParams (9 fields from future_pool_params) — same layout as StakePoolState.
+/// PoolParams (array(9) from `futureStakePoolParams`).
+///
+/// CDDL `pool_params` is `[operator, vrf, pledge, cost, margin, reward_acct,
+/// owners, relays, metadata]` — note the leading `operator` (pool ID, 28B)
+/// that distinguishes it from `StakePoolState` (no operator, vrf comes first).
+/// The decoder discards the operator (already in the map key) and synthesises
+/// `deposit = 0` so the resulting Rust value reuses `HaskellStakePoolState`.
 pub type HaskellPoolParams = HaskellStakePoolState;
 
 /// Pool relay descriptor.
