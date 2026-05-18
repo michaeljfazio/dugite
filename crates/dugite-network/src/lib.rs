@@ -387,7 +387,23 @@ pub struct UtxoSnapshot {
     pub multi_asset: MultiAssetSnapshot,
     /// Optional datum hash (32 bytes).
     pub datum_hash: Option<Vec<u8>>,
-    /// Optional raw CBOR of the entire output (for script reference, inline datum, etc.).
+    /// Reference script attached to this output (CIP-33 / Babbage+).
+    ///
+    /// Emitted as CBOR map key 3 in PostAlonzo output encoding:
+    ///   `3: tag(24) bstr(encode_script_ref(script_ref))`
+    ///
+    /// `TransactionOutput.raw_cbor` is `#[serde(skip)]` so it does NOT survive
+    /// LSM round-trips; we carry the structured `ScriptRef` here instead so that
+    /// the N2C query encoder can reconstruct the correct CBOR even after a store
+    /// round-trip.
+    pub script_ref: Option<dugite_primitives::transaction::ScriptRef>,
+    /// Optional raw CBOR of the entire output (for Plutus script evaluation).
+    ///
+    /// When `Some`, the bytes are written verbatim to the N2C response in place
+    /// of a re-encoded output, preserving the original wire format.  After an
+    /// LSM round-trip this field is `None` (it is not persisted); the encoder
+    /// falls back to re-encoding from the structured fields above, including
+    /// `script_ref`.
     pub raw_cbor: Option<Vec<u8>>,
 }
 

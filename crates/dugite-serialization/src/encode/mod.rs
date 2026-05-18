@@ -27,6 +27,7 @@ pub use block::{
 pub use certificate::encode_certificate;
 pub use script::{
     compute_script_data_hash, compute_script_data_hash_from_cbor, encode_native_script,
+    encode_script_ref,
 };
 pub use transaction::{
     compute_transaction_hash, encode_auxiliary_data, encode_transaction, encode_transaction_body,
