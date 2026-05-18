@@ -2739,6 +2739,28 @@ impl Node {
             .as_ref()
             .map(|g| g.active_slots_coeff)
             .unwrap_or(0.05);
+        // Build the tx validator for N2N TxSubmission2 admission.
+        // Uses the same Phase-1 + Phase-2 pipeline as the N2C path so that
+        // peers advertising invalid txs (is_valid tag mismatch, bad scripts,
+        // fee violations) are rejected before they ever reach the mempool.
+        // Fix for DoS class issue #522.
+        let n2n_slot_config = self
+            .shelley_genesis
+            .as_ref()
+            .map(|g| g.slot_config())
+            .unwrap_or(dugite_ledger::plutus::SlotConfig {
+                zero_time: 0,
+                zero_slot: 0,
+                slot_length: 1000,
+            });
+        let n2n_tx_validator: Arc<dyn dugite_network::TxValidator> =
+            Arc::new(serve::LedgerTxValidator {
+                ledger: self.ledger_state.clone(),
+                slot_config: n2n_slot_config,
+                metrics: self.metrics.clone(),
+                mempool: Some(self.mempool.clone()),
+            });
+
         let mut lifecycle = ConnectionLifecycleManager::new(
             self.network_magic,
             self.config
@@ -2770,6 +2792,7 @@ impl Node {
                 .clone(),
             peer_manager.clone(),
             self.peer_intersection_established.clone(),
+            n2n_tx_validator,
         );
         // Enable outbound source-port pairing only when this node is also
         // running as a responder (it has a listen socket to share). When
@@ -5518,6 +5541,38 @@ impl Node {
                                 block_hash = %block.header.header_hash.to_hex(),
                                 "TraceForgedInvalidBlock: forged block failed ledger validation — NOT announcing: {e}",
                             );
+
+                            // Defence-in-depth recovery (#522):
+                            //
+                            // The most likely cause is a tag-mismatched tx (is_valid=false
+                            // but scripts evaluate to True) that slipped into the mempool
+                            // before the Phase-2 admission check was tightened.  Even with
+                            // the admission fix, this path can fire for edge cases (e.g. a
+                            // tx whose scripts pass at admission time but fail at block-apply
+                            // time due to ledger-state differences).
+                            //
+                            // Recovery: evict all txs in the bad block from the mempool so
+                            // the next forge attempt does not re-include them.  Then remove
+                            // the bad block from the VolatileDB so it does not occupy the
+                            // current height and block future forges at the same slot.
+                            let bad_tx_hashes: Vec<_> =
+                                block.transactions.iter().map(|tx| tx.hash).collect();
+                            if !bad_tx_hashes.is_empty() {
+                                self.mempool.remove_txs(&bad_tx_hashes);
+                                error!(
+                                    target: "forge",
+                                    count = bad_tx_hashes.len(),
+                                    "TraceForgedInvalidBlock: evicted bad txs from mempool",
+                                );
+                            }
+
+                            // Remove the bad block from VolatileDB so subsequent
+                            // forges at the same slot can succeed.
+                            {
+                                let mut db = self.chain_db.write().await;
+                                db.remove_volatile_block(&block.header.header_hash);
+                            }
+
                             return;
                         }
                     }
