@@ -34,6 +34,52 @@ pub enum NodeStatus {
     Offline,
 }
 
+/// Tip-age display state derived from the combination of sync progress,
+/// tip age, and whether the block number is advancing between polls.
+///
+/// This 4-state enum resolves the ambiguity where a freshly-imported
+/// Mithril snapshot starts with a legitimately large tip age that is
+/// *expected* (the node is catching up) versus the same large tip age
+/// when the node is at-tip but stuck (a real problem).
+///
+/// | sync_progress | tip_age   | block advancing | State       |
+/// |---------------|-----------|-----------------|-------------|
+/// | ≥ 99.90 %     | < 120 s   | —               | AtTip       |
+/// | ≥ 99.90 %     | ≥ 120 s   | —               | Stale       |
+/// | < 99.90 %     | any       | yes             | CatchingUp  |
+/// | < 99.90 %     | any       | no              | Stuck       |
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TipState {
+    /// Node is at the chain tip and tip age is fresh (< 120 s). Green.
+    AtTip,
+    /// Node is at the chain tip but tip age is stale (≥ 120 s).
+    /// This is a real problem — the node may be disconnected. Red.
+    Stale,
+    /// Node is below 99.9 % sync and the block number is advancing
+    /// between polls. This is the expected catch-up state. Yellow.
+    CatchingUp,
+    /// Node is below 99.9 % sync and the block number has **not**
+    /// advanced since the last poll. Possible stall. Red.
+    Stuck,
+}
+
+impl TipState {
+    /// Short human-readable label for the state.
+    pub fn label(self) -> &'static str {
+        match self {
+            TipState::AtTip => "At tip",
+            TipState::Stale => "Stale",
+            TipState::CatchingUp => "Catching up",
+            TipState::Stuck => "Stuck",
+        }
+    }
+
+    /// Whether this state represents a problem that needs attention.
+    pub fn is_problem(self) -> bool {
+        matches!(self, TipState::Stale | TipState::Stuck)
+    }
+}
+
 /// The sync state of the node, as inferred from Prometheus metrics.
 ///
 /// Used by the TUI header pill and status-bar colour coding.  The variants
@@ -404,6 +450,14 @@ pub struct App {
     pub block_rate_history: VecDeque<u64>,
     /// Last `dugite_blocks_applied` value, used to compute per-poll deltas.
     prev_blocks_applied: u64,
+    /// Last `dugite_block_number` value seen, used to detect block advancement
+    /// between successive polls (for the tip-state 4-state matrix).
+    prev_block_number: u64,
+    /// Whether `dugite_block_number` advanced in the most recent poll.
+    ///
+    /// Initialised to `true` so the first sample does not incorrectly report
+    /// "Stuck" before any data has been received.
+    pub block_number_advancing: bool,
     /// Ring-buffer of CPU utilisation samples (one per poll).
     ///
     /// Each entry is the CPU percentage scaled by 10 (e.g. 475 means 47.5 %).
@@ -445,6 +499,8 @@ impl App {
             rtt_bands: RttBands::default(),
             block_rate_history: VecDeque::with_capacity(BLOCK_HISTORY_LEN),
             prev_blocks_applied: 0,
+            prev_block_number: 0,
+            block_number_advancing: true,
             cpu_pct_history: VecDeque::with_capacity(CPU_HISTORY_LEN),
             theme_idx: monokai_idx,
             should_quit: false,
@@ -517,6 +573,19 @@ impl App {
         // Initialise on first call (or after a reset) so prev is correct next poll.
         if blocks_applied > 0 {
             self.prev_blocks_applied = blocks_applied;
+        }
+
+        // Track block_number advancement for the tip-state 4-state matrix.
+        //
+        // We only update `block_number_advancing` once we have seen at least
+        // one non-zero block_number, so the very first successful poll does not
+        // falsely report "Stuck".
+        let block_number = snapshot.get_u64("dugite_block_number");
+        if self.prev_block_number > 0 {
+            self.block_number_advancing = block_number > self.prev_block_number;
+        }
+        if block_number > 0 {
+            self.prev_block_number = block_number;
         }
 
         // Record CPU utilisation sample.
@@ -673,6 +742,43 @@ impl App {
             SyncState::Stalled
         } else {
             SyncState::Syncing
+        }
+    }
+
+    /// Determine the tip display state using the 4-state matrix.
+    ///
+    /// Composes `sync_progress_percent`, `tip_age_seconds`, and whether the
+    /// block number has advanced since the last poll to produce an unambiguous
+    /// display state for the tip-age pill:
+    ///
+    /// | sync_progress | tip_age   | block advancing | State       |
+    /// |---------------|-----------|-----------------|-------------|
+    /// | ≥ 99.90 %     | < 120 s   | —               | AtTip       |
+    /// | ≥ 99.90 %     | ≥ 120 s   | —               | Stale       |
+    /// | < 99.90 %     | any       | yes             | CatchingUp  |
+    /// | < 99.90 %     | any       | no              | Stuck       |
+    ///
+    /// This resolves the ambiguity where a freshly-imported Mithril snapshot
+    /// legitimately starts with a large `tip_age` while catching up, but that
+    /// same large `tip_age` would indicate a real stall at 99.9 %+ sync.
+    pub fn tip_state(&self) -> TipState {
+        let pct = self.metrics.get("dugite_sync_progress_percent") / 100.0;
+        let tip_age = self.metrics.get_u64("dugite_tip_age_seconds");
+
+        if pct >= 99.9 {
+            // Node is at (or very near) tip.
+            if tip_age < 120 {
+                TipState::AtTip
+            } else {
+                TipState::Stale
+            }
+        } else {
+            // Node is still catching up.
+            if self.block_number_advancing {
+                TipState::CatchingUp
+            } else {
+                TipState::Stuck
+            }
         }
     }
 
@@ -1275,5 +1381,125 @@ mod tests {
             1,
             "offline snapshot must not push a CPU sample"
         );
+    }
+
+    // ---- TipState 4-state matrix tests ----
+
+    #[test]
+    fn test_tip_state_at_tip() {
+        let mut app = App::new();
+        app.node_status = NodeStatus::Online;
+        app.update_metrics(make_snapshot(vec![
+            ("dugite_sync_progress_percent", 9990.0),
+            ("dugite_tip_age_seconds", 60.0),
+            ("dugite_block_number", 1000.0),
+        ]));
+        assert_eq!(app.tip_state(), TipState::AtTip);
+        assert!(!app.tip_state().is_problem());
+        assert!(!app.tip_state().is_problem());
+        assert_eq!(app.tip_state().label(), "At tip");
+    }
+
+    #[test]
+    fn test_tip_state_stale_at_tip_but_old() {
+        let mut app = App::new();
+        app.node_status = NodeStatus::Online;
+        app.update_metrics(make_snapshot(vec![
+            ("dugite_sync_progress_percent", 9990.0),
+            ("dugite_tip_age_seconds", 120.0),
+            ("dugite_block_number", 1000.0),
+        ]));
+        assert_eq!(app.tip_state(), TipState::Stale);
+        assert!(app.tip_state().is_problem());
+        assert!(app.tip_state().is_problem());
+        assert_eq!(app.tip_state().label(), "Stale");
+    }
+
+    #[test]
+    fn test_tip_state_catching_up_block_advancing() {
+        let mut app = App::new();
+        app.node_status = NodeStatus::Online;
+        // Seed prev_block_number.
+        app.update_metrics(make_snapshot(vec![
+            ("dugite_sync_progress_percent", 5000.0),
+            ("dugite_tip_age_seconds", 57_600.0),
+            ("dugite_block_number", 1000.0),
+        ]));
+        // Second poll: block_number advanced.
+        app.update_metrics(make_snapshot(vec![
+            ("dugite_sync_progress_percent", 5001.0),
+            ("dugite_tip_age_seconds", 57_580.0),
+            ("dugite_block_number", 1050.0),
+        ]));
+        assert_eq!(app.tip_state(), TipState::CatchingUp);
+        assert!(!app.tip_state().is_problem());
+        assert!(!app.tip_state().is_problem());
+        assert_eq!(app.tip_state().label(), "Catching up");
+    }
+
+    #[test]
+    fn test_tip_state_stuck_block_not_advancing() {
+        let mut app = App::new();
+        app.node_status = NodeStatus::Online;
+        // Seed prev_block_number.
+        app.update_metrics(make_snapshot(vec![
+            ("dugite_sync_progress_percent", 5000.0),
+            ("dugite_tip_age_seconds", 57_600.0),
+            ("dugite_block_number", 1000.0),
+        ]));
+        // Second poll: block_number did NOT advance (same value).
+        app.update_metrics(make_snapshot(vec![
+            ("dugite_sync_progress_percent", 5000.0),
+            ("dugite_tip_age_seconds", 57_620.0),
+            ("dugite_block_number", 1000.0),
+        ]));
+        assert_eq!(app.tip_state(), TipState::Stuck);
+        assert!(app.tip_state().is_problem());
+        assert!(app.tip_state().is_problem());
+        assert_eq!(app.tip_state().label(), "Stuck");
+    }
+
+    /// First poll must not falsely report Stuck (block_number_advancing
+    /// defaults to true so no comparison can be made yet).
+    #[test]
+    fn test_tip_state_first_poll_not_stuck() {
+        let mut app = App::new();
+        app.node_status = NodeStatus::Online;
+        app.update_metrics(make_snapshot(vec![
+            ("dugite_sync_progress_percent", 5000.0),
+            ("dugite_tip_age_seconds", 50_000.0),
+            ("dugite_block_number", 1.0),
+        ]));
+        assert_eq!(
+            app.tip_state(),
+            TipState::CatchingUp,
+            "first poll must be CatchingUp, not Stuck"
+        );
+    }
+
+    /// Boundary: exactly 99.9% with tip_age == 119 => AtTip.
+    #[test]
+    fn test_tip_state_exact_boundary_at_tip() {
+        let mut app = App::new();
+        app.node_status = NodeStatus::Online;
+        app.update_metrics(make_snapshot(vec![
+            ("dugite_sync_progress_percent", 9990.0), // 99.90%
+            ("dugite_tip_age_seconds", 119.0),        // just below 120s threshold
+            ("dugite_block_number", 500.0),
+        ]));
+        assert_eq!(app.tip_state(), TipState::AtTip);
+    }
+
+    /// Boundary: exactly 99.9% with tip_age == 120 => Stale.
+    #[test]
+    fn test_tip_state_exact_boundary_stale() {
+        let mut app = App::new();
+        app.node_status = NodeStatus::Online;
+        app.update_metrics(make_snapshot(vec![
+            ("dugite_sync_progress_percent", 9990.0), // 99.90%
+            ("dugite_tip_age_seconds", 120.0),        // exactly 120s threshold
+            ("dugite_block_number", 500.0),
+        ]));
+        assert_eq!(app.tip_state(), TipState::Stale);
     }
 }
