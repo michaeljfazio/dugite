@@ -97,6 +97,22 @@ fn decode_redeemer_tag_index(redeemer_cbor: &[u8]) -> Option<(u8, u32)> {
     Some((tag, index))
 }
 
+/// Map a `RedeemerTag` to its on-wire CBOR encoding byte, matching the values
+/// `decode_redeemer_tag_index` returns. This is the inverse used when looking
+/// the declared `ex_units` for a redeemer back up from a tag/index pair the
+/// uplc evaluator surfaced.
+fn redeemer_tag_byte(tag: &dugite_primitives::transaction::RedeemerTag) -> u8 {
+    use dugite_primitives::transaction::RedeemerTag::*;
+    match tag {
+        Spend => 0,
+        Mint => 1,
+        Cert => 2,
+        Reward => 3,
+        Vote => 4,
+        Propose => 5,
+    }
+}
+
 /// Encode a TransactionInput as CBOR bytes (pallas wire format)
 ///
 /// TransactionInput is encoded as a 2-element CBOR array: [hash(32 bytes), index(uint)]
@@ -267,9 +283,12 @@ pub fn evaluate_plutus_scripts(
             for (redeemer_bytes, eval_result) in &results {
                 let cost = eval_result.cost();
 
+                // Decode tag and index from the CBOR redeemer: array(4)[tag, idx, …]
+                // (or map-keyed `(tag, idx) => [data, ex_units]` in Conway).
+                let tag_idx = decode_redeemer_tag_index(redeemer_bytes);
+
                 // Determine whether this specific redeemer executes a V3 script.
-                // Decode tag and index from the CBOR redeemer: array(4)[tag, idx, …].
-                let is_v3 = decode_redeemer_tag_index(redeemer_bytes)
+                let is_v3 = tag_idx
                     .and_then(|(tag, idx)| redeemer_version_map.get(&(tag, idx)).copied())
                     .map(|ver| ver == 3)
                     .unwrap_or(false);
@@ -304,6 +323,61 @@ pub fn evaluate_plutus_scripts(
                     );
                     return Err(PlutusError::EvalFailed(err_msg));
                 }
+
+                // Per-redeemer declared-budget enforcement.
+                //
+                // cardano-node's CEK evaluator halts the moment a redeemer's
+                // declared `ExUnits` (mem, steps) are overspent — producing a
+                // `PlutusFailure` and rejecting the transaction. The aiken
+                // `uplc` crate we link against runs each redeemer with the
+                // **tx-wide** budget passed to `eval_phase_two_raw` (the
+                // protocol `max_tx_ex_units`), NOT the per-redeemer declared
+                // `ex_units`. As a result `eval_phase_two_raw` happily
+                // completes evaluation as long as the tx max isn't blown,
+                // even when the redeemer's own declared budget is too low.
+                //
+                // We close that gap here by comparing the **actual** measured
+                // cost (`eval_result.cost()`) against the redeemer's
+                // **declared** `ex_units` from the input transaction. If the
+                // script genuinely needed more than its declared budget, the
+                // tx must be rejected — otherwise cardano-node will reject
+                // any block dugite forges containing it (Conway
+                // `ConwayUtxowFailure (UtxoFailure (UtxosFailure
+                // (ValidationTagMismatch (IsValid True) (FailedUnexpectedly
+                // (PlutusFailure …)))))`).
+                if let Some((tag, idx)) = tag_idx {
+                    let declared = tx
+                        .witness_set
+                        .redeemers
+                        .iter()
+                        .find(|r| redeemer_tag_byte(&r.tag) == tag && r.index == idx);
+                    if let Some(declared) = declared {
+                        let declared_mem = declared.ex_units.mem as i64;
+                        let declared_cpu = declared.ex_units.steps as i64;
+                        if cost.mem > declared_mem || cost.cpu > declared_cpu {
+                            let over_mem = cost.mem - declared_mem;
+                            let over_cpu = cost.cpu - declared_cpu;
+                            let err_msg = format!(
+                                "Plutus script overspent declared budget for redeemer \
+                                 (tag={tag}, index={idx}): actual=(mem={}, cpu={}), \
+                                 declared=(mem={}, cpu={}), overspent=(mem={}, cpu={})",
+                                cost.mem,
+                                cost.cpu,
+                                declared_mem,
+                                declared_cpu,
+                                over_mem.max(0),
+                                over_cpu.max(0),
+                            );
+                            debug!(
+                                tx_hash = %tx.hash.to_hex(),
+                                error = %err_msg,
+                                "Plutus script overspent declared ex_units — rejecting tx"
+                            );
+                            return Err(PlutusError::EvalFailed(err_msg));
+                        }
+                    }
+                }
+
                 trace!(
                     tx_hash = %tx.hash.to_hex(),
                     cpu = cost.cpu,
