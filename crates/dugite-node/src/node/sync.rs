@@ -139,6 +139,46 @@ impl Node {
         eh.wallclock_to_slot(chrono::Utc::now(), &system_start).ok()
     }
 
+    /// Compute the POSIX wall-clock time (in ms) of an absolute slot.
+    ///
+    /// Era-aware: uses the HFC era history so Byron's 20-sec slots are
+    /// correctly distinguished from Shelley+'s 1-sec slots. Without this,
+    /// the naive `zero_time + slot * 1s` formula under-counts wall time
+    /// on networks with non-zero `shelley_transition_epoch` (e.g. preprod
+    /// has 4 Byron epochs = 86400 Byron slots × 20s = 1,728,000 sec
+    /// = 20 days of wall time that the naive formula misses), causing
+    /// `dugite_tip_age_seconds` to be off by exactly that gap — most
+    /// visibly the "tip 19d 0h 0m" display in dugite-monitor.
+    ///
+    /// Falls back to the naive `slot_config` formula only when the
+    /// Shelley genesis isn't loaded yet or `slot_to_wallclock` returns
+    /// `PastHorizonError` (shouldn't happen for already-applied slots).
+    pub async fn slot_to_wallclock_ms(
+        &self,
+        slot: u64,
+        ledger_slot_config: &dugite_ledger::plutus::SlotConfig,
+    ) -> u64 {
+        let fallback = || {
+            ledger_slot_config.zero_time
+                + slot.saturating_sub(ledger_slot_config.zero_slot)
+                    * ledger_slot_config.slot_length as u64
+        };
+        let Some(genesis) = self.shelley_genesis.as_ref() else {
+            return fallback();
+        };
+        let Ok(parsed) = chrono::DateTime::parse_from_rfc3339(&genesis.system_start) else {
+            return fallback();
+        };
+        let system_start = dugite_primitives::time::SystemStart {
+            utc_time: parsed.with_timezone(&chrono::Utc),
+        };
+        let eh = self.era_history.read().await;
+        match eh.slot_to_wallclock(dugite_primitives::time::SlotNo(slot), &system_start) {
+            Ok(utc) => utc.timestamp_millis().max(0) as u64,
+            Err(_) => fallback(),
+        }
+    }
+
     /// Notify connected N2N/N2C peers of a chain rollback by broadcasting a
     /// `RollbackAnnouncement`.  Both the N2N ChainSync server and the N2C
     /// LocalChainSync server subscribe to this channel and translate the
@@ -1738,10 +1778,8 @@ impl Node {
                 }
                 self.metrics
                     .set_governance_snapshot(&super::governance_snapshot_from_ledger(&ls));
-                // Store tip slot time for dynamic tip_age computation
-                let sc = &ls.slot_config;
-                let slot_time_ms =
-                    sc.zero_time + slot.saturating_sub(sc.zero_slot) * sc.slot_length as u64;
+                // Era-aware tip-age computation (see slot_to_wallclock_ms doc).
+                let slot_time_ms = self.slot_to_wallclock_ms(slot, &ls.slot_config).await;
                 self.metrics.set_tip_slot_time_ms(slot_time_ms);
                 // Update chainsync idle time
                 self.metrics.update_chainsync_idle();
