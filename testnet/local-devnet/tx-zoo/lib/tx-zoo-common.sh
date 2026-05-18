@@ -224,14 +224,16 @@ ZOO_ANCHOR_PID="$ZOO_STATE/anchor.pid"
 
 # Compute the Blake2b-256 hash of a file, lower-case hex. Matches
 # what cardano-cli computes for anchor-data-hash.
+#
+# We always use the python3 path: it's universally available on the
+# dev hosts that run tx-zoo, has stable BLAKE2b semantics, and avoids
+# the GNU `b2sum --algorithm blake2b` flag drift across coreutils
+# releases (the `-a` flag was removed in 9.x — passing it produces an
+# empty stdout, which silently corrupts `--anchor-data-hash` arguments
+# and surfaces only as a confusing `Unable to read hash` CLI error).
 _zoo_anchor_b2b256() {
     local file="$1"
-    if command -v b2sum >/dev/null 2>&1; then
-        b2sum -l 256 -a blake2b "$file" 2>/dev/null | awk '{print $1}'
-    else
-        # Fall back to cardano-cli's hashing surface (always available
-        # in the zoo's environment) via a temp Cardano command.
-        python3 - "$file" <<'PY'
+    python3 - "$file" <<'PY'
 import sys, hashlib
 h = hashlib.blake2b(digest_size=32)
 with open(sys.argv[1], 'rb') as f:
@@ -239,7 +241,6 @@ with open(sys.argv[1], 'rb') as f:
         h.update(chunk)
 print(h.hexdigest())
 PY
-    fi
 }
 
 # Generate the anchor JSON files we serve. Each tx-zoo entry refers to
