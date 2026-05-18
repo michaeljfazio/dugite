@@ -382,7 +382,12 @@ fn render_node_panel(frame: &mut Frame, app: &App, theme: &Theme, area: Rect) {
         theme.info
     };
 
-    let network = app.network.label();
+    let network_magic = app.metrics.get_u64("dugite_network_magic");
+    let network = if network_magic > 0 {
+        format!("{} ({})", app.network.label(), network_magic)
+    } else {
+        app.network.label().to_string()
+    };
     let version = env!("CARGO_PKG_VERSION");
     let uptime_secs = app.metrics.get_u64("dugite_uptime_seconds");
     let uptime = App::format_uptime(uptime_secs);
