@@ -473,6 +473,21 @@ pub enum ValidationError {
     MissingRawCbor,
     #[error("Plutus transaction missing slot configuration for script evaluation")]
     MissingSlotConfig,
+    /// The tx body `is_valid` flag does not match the Phase-2 Plutus evaluation
+    /// result.
+    ///
+    /// Mirrors Haskell `Cardano.Ledger.Conway.Rules.Utxos` predicate
+    /// `ValidationTagMismatch`: a tx that declares `is_valid=false` but whose
+    /// scripts all evaluate to `True` would allow the producer to steal
+    /// collateral without a legitimate script failure (DoS vector).  Conversely,
+    /// declaring `is_valid=true` while scripts actually fail would produce an
+    /// invalid block.
+    ///
+    /// Cardano mempool (`applyTx`) enforces this at admission time; we mirror
+    /// that check in `validate_transaction_with_context` so BPs never admit
+    /// tag-mismatched txs.
+    #[error("is_valid tag mismatch: declared={declared}, evaluated={evaluated}")]
+    IsValidTagMismatch { declared: bool, evaluated: bool },
     #[error("Script-locked input at index {index} has no matching Spend redeemer")]
     MissingSpendRedeemer { index: u32 },
     /// A script-locked withdrawal or Plutus minting policy has no matching
@@ -2549,14 +2564,38 @@ pub fn validate_transaction_with_pools(
                     // Our ExUnits struct uses { mem, steps } where mem=memory_units and steps=cpu_steps.
                     // Swap the fields to match the uplc convention: (steps, mem) = (cpu, mem).
                     let max_ex = (params.max_tx_ex_units.steps, params.max_tx_ex_units.mem);
-                    if let Err(e) = evaluate_plutus_scripts(
+                    let eval_result = evaluate_plutus_scripts(
                         tx,
                         utxo_set,
                         cost_models_cbor.as_deref(),
                         max_ex,
                         sc,
-                    ) {
-                        errors.push(ValidationError::ScriptFailed(e.to_string()));
+                    );
+                    if tx.is_valid {
+                        // Tx claims scripts pass — reject if they actually fail.
+                        if let Err(e) = eval_result {
+                            errors.push(ValidationError::ScriptFailed(e.to_string()));
+                        }
+                    } else {
+                        // Tx claims scripts fail (is_valid=false) — reject if they
+                        // actually pass.  This is the "DoS-class" attack vector:
+                        // an attacker marks is_valid=false on a tx whose Plutus
+                        // script evaluates to True.  Cardano mempool (`applyTx`)
+                        // catches this with `ValidationTagMismatch`; we mirror
+                        // that check here so BPs never admit such txs.
+                        // Haskell rule: `Cardano.Ledger.Conway.Rules.Utxos`
+                        // predicate `ConwayUtxos`:
+                        //   IsValid True vs eval False → `TagMismatch False`
+                        //   IsValid False vs eval True → `TagMismatch True`
+                        if eval_result.is_ok() {
+                            errors.push(ValidationError::IsValidTagMismatch {
+                                declared: false,
+                                evaluated: true,
+                            });
+                        }
+                        // If eval also fails (both agree scripts fail), the
+                        // is_valid=false path is legitimate — collateral is
+                        // consumed at block apply time. No error here.
                     }
                 }
             }
