@@ -257,9 +257,13 @@ keygen_all() {
     gen_drep "drep-3"
     gen_cc   "cc-1"
     gen_pool "pool3"
-    # Fund the sub-wallets so they can submit their own txs.
-    fund_address "$ZOO_KEYS/wallet-a/payment-stake.addr" 5000000000 1000000000
-    fund_address "$ZOO_KEYS/wallet-b/payment-stake.addr" 5000000000 1000000000
+    # Fund the sub-wallets so they can submit their own txs. The amount has
+    # to cover the gov-action deposit (`govActionDeposit` from
+    # conway-genesis.json — 100 000 000 000 lovelace = 100 K ADA on the
+    # default cardano-testnet output) used by 06a..06g. We give each wallet
+    # 200 K ADA so there's headroom for fees + extra deposits.
+    fund_address "$ZOO_KEYS/wallet-a/payment-stake.addr" 200000000000 100000000000
+    fund_address "$ZOO_KEYS/wallet-b/payment-stake.addr" 200000000000 100000000000
     # Pre-split the genesis addr so plutus_collateral always finds a
     # spare UTxO (the 03 category locks + collateral pattern would
     # otherwise exhaust the single genesis UTxO).
