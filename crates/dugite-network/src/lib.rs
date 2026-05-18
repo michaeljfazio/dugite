@@ -317,6 +317,15 @@ pub enum TxValidationError {
         /// mismatched withdrawal.
         mismatches: Vec<(String, u64, u64)>,
     },
+    /// The tx body `is_valid` flag does not match the Phase-2 Plutus evaluation
+    /// result.  Mirrors Haskell `ValidationTagMismatch` from
+    /// `Cardano.Ledger.Conway.Rules.Utxos`.  Rejected at mempool admission to
+    /// prevent BPs from ever forging blocks with is_valid-tagged txs that
+    /// disagree with actual script execution (DoS class: #522).
+    IsValidTagMismatch {
+        declared: bool,
+        evaluated: bool,
+    },
     /// Multiple validation errors collected.
     Multiple(Vec<TxValidationError>),
     /// Catch-all for other validation failures.
