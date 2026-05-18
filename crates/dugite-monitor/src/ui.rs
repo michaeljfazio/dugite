@@ -33,7 +33,7 @@
 //! ├──────────────────────── Footer (1 line) ───────────────────────────────────┘
 //! ```
 
-use crate::app::{App, NodeStatus};
+use crate::app::{App, NodeStatus, TipState};
 
 use crate::layout::{compute_layout, LayoutMode};
 use crate::theme::Theme;
@@ -156,13 +156,25 @@ fn render_header(frame: &mut Frame, app: &App, theme: &Theme, area: Rect) {
         format!(" {} {:.2}% ", sync_state.label(), pct)
     };
 
-    // Tip age indicator: check mark / warning / X based on age brackets.
-    // Requirements: green check <20s, warning 20-60s, red X >60s.
-    let (tip_icon, tip_age_col) = tip_age_indicator(theme, tip_age);
+    // Tip age indicator: 4-state pill derived from sync_progress + tip_age +
+    // block_number advancement.  This distinguishes healthy catch-up (yellow)
+    // from a real stall (red) even when tip_age is large.
+    let tip_state = app.tip_state();
+    let (tip_icon, tip_age_col) = tip_age_indicator(theme, tip_age, tip_state);
+    // For non-AtTip states, show the state label alongside the age so operators
+    // can immediately tell whether a large tip age is a healthy catch-up or a
+    // real stall (e.g. ">> Catching up 15h 0m" vs "XX Stale 3m 0s").
     let tip_str = if tip_age == 0 {
         format!("{} --", tip_icon)
-    } else {
+    } else if tip_state == TipState::AtTip {
         format!("{} {}", tip_icon, format_tip_age(tip_age))
+    } else {
+        format!(
+            "{} {} {}",
+            tip_icon,
+            tip_state.label(),
+            format_tip_age(tip_age)
+        )
     };
 
     let mut spans = vec![
@@ -218,13 +230,14 @@ fn render_header(frame: &mut Frame, app: &App, theme: &Theme, area: Rect) {
         Span::styled("Net ", Style::default().fg(theme.muted)),
         Span::styled(network, Style::default().fg(theme.accent)),
         sep_spaced(theme),
-        // Tip age with colored indicator icon.
+        // Tip age with colored indicator icon.  Bold when the state signals
+        // a problem (Stale or Stuck) to draw the operator's attention.
         Span::styled("Tip ", Style::default().fg(theme.muted)),
         Span::styled(
             tip_str,
             Style::default()
                 .fg(tip_age_col)
-                .add_modifier(if tip_age >= 120 {
+                .add_modifier(if tip_state.is_problem() {
                     Modifier::BOLD
                 } else {
                     Modifier::empty()
@@ -585,11 +598,12 @@ fn render_chain_panel(frame: &mut Frame, app: &App, theme: &Theme, area: Rect) {
 
     let col_w = inner.width.saturating_sub(2) as usize;
 
-    // Tip age with indicator icon (<20s green check, 20-60s warning, >60s red X).
+    // Tip age with 4-state indicator (AtTip/CatchingUp/Stale/Stuck).
     // Humanised to days/hours/minutes/seconds (matches the header-bar
     // tip-diff indicator) so a multi-day bulk sync doesn't display as a
     // six-figure raw-seconds count.
-    let (tip_icon, tip_age_col) = tip_age_indicator(theme, tip_age);
+    let tip_state = app.tip_state();
+    let (tip_icon, tip_age_col) = tip_age_indicator(theme, tip_age, tip_state);
     let tip_str = format!("{} {}", tip_icon, format_tip_age(tip_age));
 
     // Compute how many text rows we can fit before the mempool gauge row.
@@ -605,7 +619,7 @@ fn render_chain_panel(frame: &mut Frame, app: &App, theme: &Theme, area: Rect) {
             tip_age_col,
             theme,
             col_w,
-            tip_age >= 120,
+            tip_state.is_problem(),
         ),
         kv_aligned("Density", &density_str, theme.info, theme, col_w),
         kv_aligned(
@@ -1708,22 +1722,30 @@ fn sep_spaced(theme: &Theme) -> Span<'static> {
 // Color and indicator helpers
 // ---------------------------------------------------------------------------
 
-/// Return (icon_str, color) for tip-age display.
+/// Return (icon_str, color, label) for tip-age display using the 4-state matrix.
 ///
-/// Thresholds per requirements:
-///   - < 60s    => green check indicator (within one slot interval)
-///   - 60-120s  => warning indicator
-///   - > 120s   => red X indicator
-fn tip_age_indicator(theme: &Theme, tip_age_secs: u64) -> (&'static str, Color) {
+/// The icon and colour are chosen based on [`TipState`], which composes
+/// `sync_progress_percent`, `tip_age_seconds`, and whether the block number
+/// is advancing between polls:
+///
+/// | TipState   | icon | colour  | meaning                          |
+/// |------------|------|---------|----------------------------------|
+/// | AtTip      | OK   | green   | at tip, fresh                    |
+/// | Stale      | XX   | red     | at tip but age ≥ 120 s (problem) |
+/// | CatchingUp | >>   | yellow  | below 99.9%, block advancing     |
+/// | Stuck      | !!   | red     | below 99.9%, not advancing       |
+///
+/// Falls back to the legacy tip-age-only thresholds when no TipState can be
+/// derived (e.g. tip_age_secs == 0 meaning no data yet).
+fn tip_age_indicator(theme: &Theme, tip_age_secs: u64, state: TipState) -> (&'static str, Color) {
     if tip_age_secs == 0 {
-        // No data yet — neutral display.
-        ("-", theme.muted)
-    } else if tip_age_secs < 60 {
-        ("OK", theme.success)
-    } else if tip_age_secs < 120 {
-        ("!!", theme.warning)
-    } else {
-        ("XX", theme.error)
+        // No data yet — neutral display regardless of state.
+        return ("-", theme.muted);
+    }
+    match state {
+        TipState::AtTip => ("OK", theme.success),
+        TipState::CatchingUp => (">>", theme.warning),
+        TipState::Stale | TipState::Stuck => ("XX", theme.error),
     }
 }
 
@@ -1863,37 +1885,171 @@ mod tests {
     #[test]
     fn test_tip_age_indicator_thresholds() {
         let theme = &crate::theme::THEME_MONOKAI;
-        // 0 => neutral (no data)
-        let (icon_0, col_0) = tip_age_indicator(theme, 0);
+
+        // tip_age == 0 => no data sentinel (muted, regardless of TipState)
+        let (icon_0, col_0) = tip_age_indicator(theme, 0, TipState::AtTip);
         assert_eq!(icon_0, "-");
         assert_eq!(col_0, theme.muted);
 
-        // <60s => success (green OK)
-        let (icon_5, col_5) = tip_age_indicator(theme, 5);
-        assert_eq!(icon_5, "OK");
-        assert_eq!(col_5, theme.success);
+        // AtTip => green OK
+        let (icon_at, col_at) = tip_age_indicator(theme, 5, TipState::AtTip);
+        assert_eq!(icon_at, "OK");
+        assert_eq!(col_at, theme.success);
 
-        let (icon_59, col_59) = tip_age_indicator(theme, 59);
-        assert_eq!(icon_59, "OK");
-        assert_eq!(col_59, theme.success);
+        // CatchingUp => yellow >>
+        let (icon_cu, col_cu) = tip_age_indicator(theme, 86_400, TipState::CatchingUp);
+        assert_eq!(icon_cu, ">>");
+        assert_eq!(col_cu, theme.warning);
 
-        // 60-120s => warning
-        let (icon_60, col_60) = tip_age_indicator(theme, 60);
-        assert_eq!(icon_60, "!!");
-        assert_eq!(col_60, theme.warning);
+        // Stale => red XX
+        let (icon_stale, col_stale) = tip_age_indicator(theme, 300, TipState::Stale);
+        assert_eq!(icon_stale, "XX");
+        assert_eq!(col_stale, theme.error);
 
-        let (icon_119, col_119) = tip_age_indicator(theme, 119);
-        assert_eq!(icon_119, "!!");
-        assert_eq!(col_119, theme.warning);
+        // Stuck => red XX
+        let (icon_stuck, col_stuck) = tip_age_indicator(theme, 600, TipState::Stuck);
+        assert_eq!(icon_stuck, "XX");
+        assert_eq!(col_stuck, theme.error);
+    }
 
-        // >=120s => error (red X)
-        let (icon_120, col_120) = tip_age_indicator(theme, 120);
-        assert_eq!(icon_120, "XX");
-        assert_eq!(col_120, theme.error);
+    /// 4-state matrix: verify all four cells of the issue's display matrix
+    /// using App::tip_state() driven by fake metric snapshots.
+    #[test]
+    fn test_tip_state_four_state_matrix() {
+        use crate::app::{App, NodeStatus};
+        use crate::metrics::MetricsSnapshot;
+        use std::collections::HashMap;
 
-        let (icon_300, col_300) = tip_age_indicator(theme, 300);
-        assert_eq!(icon_300, "XX");
-        assert_eq!(col_300, theme.error);
+        fn make_snap(values: Vec<(&str, f64)>) -> MetricsSnapshot {
+            MetricsSnapshot {
+                values: values
+                    .into_iter()
+                    .map(|(k, v)| (k.to_string(), v))
+                    .collect(),
+                histogram_buckets: HashMap::new(),
+                string_labels: HashMap::new(),
+                connected: true,
+                error: None,
+            }
+        }
+
+        // Row 1: sync >= 99.90%, tip_age < 120 => AtTip (green)
+        {
+            let mut app = App::new();
+            app.node_status = NodeStatus::Online;
+            app.update_metrics(make_snap(vec![
+                ("dugite_sync_progress_percent", 9990.0),
+                ("dugite_tip_age_seconds", 60.0),
+                ("dugite_block_number", 100.0),
+            ]));
+            assert_eq!(
+                app.tip_state(),
+                TipState::AtTip,
+                "sync>=99.9%, tip<120 => AtTip"
+            );
+            assert!(!app.tip_state().is_problem());
+        }
+
+        // Row 2: sync >= 99.90%, tip_age >= 120 => Stale (red)
+        {
+            let mut app = App::new();
+            app.node_status = NodeStatus::Online;
+            app.update_metrics(make_snap(vec![
+                ("dugite_sync_progress_percent", 9990.0),
+                ("dugite_tip_age_seconds", 300.0),
+                ("dugite_block_number", 200.0),
+            ]));
+            assert_eq!(
+                app.tip_state(),
+                TipState::Stale,
+                "sync>=99.9%, tip>=120 => Stale"
+            );
+            assert!(app.tip_state().is_problem());
+        }
+
+        // Row 3: sync < 99.90%, block_number advancing => CatchingUp (yellow)
+        {
+            let mut app = App::new();
+            app.node_status = NodeStatus::Online;
+            // First poll seeds prev_block_number.
+            app.update_metrics(make_snap(vec![
+                ("dugite_sync_progress_percent", 5000.0),
+                ("dugite_tip_age_seconds", 57_600.0),
+                ("dugite_block_number", 1000.0),
+            ]));
+            // Second poll: block_number advanced.
+            app.update_metrics(make_snap(vec![
+                ("dugite_sync_progress_percent", 5001.0),
+                ("dugite_tip_age_seconds", 57_595.0),
+                ("dugite_block_number", 1050.0),
+            ]));
+            assert_eq!(
+                app.tip_state(),
+                TipState::CatchingUp,
+                "sync<99.9%, block advancing => CatchingUp"
+            );
+            assert!(!app.tip_state().is_problem());
+        }
+
+        // Row 4: sync < 99.90%, block_number NOT advancing => Stuck (red)
+        {
+            let mut app = App::new();
+            app.node_status = NodeStatus::Online;
+            // First poll seeds prev_block_number.
+            app.update_metrics(make_snap(vec![
+                ("dugite_sync_progress_percent", 5000.0),
+                ("dugite_tip_age_seconds", 57_600.0),
+                ("dugite_block_number", 1000.0),
+            ]));
+            // Second poll: block_number did NOT advance.
+            app.update_metrics(make_snap(vec![
+                ("dugite_sync_progress_percent", 5000.0),
+                ("dugite_tip_age_seconds", 57_610.0),
+                ("dugite_block_number", 1000.0),
+            ]));
+            assert_eq!(
+                app.tip_state(),
+                TipState::Stuck,
+                "sync<99.9%, block not advancing => Stuck"
+            );
+            assert!(app.tip_state().is_problem());
+        }
+    }
+
+    /// First poll should never show Stuck even though prev_block_number is 0.
+    #[test]
+    fn test_tip_state_first_poll_not_stuck() {
+        use crate::app::{App, NodeStatus};
+        use crate::metrics::MetricsSnapshot;
+        use std::collections::HashMap;
+
+        fn make_snap(values: Vec<(&str, f64)>) -> MetricsSnapshot {
+            MetricsSnapshot {
+                values: values
+                    .into_iter()
+                    .map(|(k, v)| (k.to_string(), v))
+                    .collect(),
+                histogram_buckets: HashMap::new(),
+                string_labels: HashMap::new(),
+                connected: true,
+                error: None,
+            }
+        }
+
+        let mut app = App::new();
+        app.node_status = NodeStatus::Online;
+        // First and only poll — prev_block_number is still 0.
+        app.update_metrics(make_snap(vec![
+            ("dugite_sync_progress_percent", 5000.0),
+            ("dugite_tip_age_seconds", 50_000.0),
+            ("dugite_block_number", 1.0),
+        ]));
+        // Should be CatchingUp (block_number_advancing defaults to true).
+        assert_eq!(
+            app.tip_state(),
+            TipState::CatchingUp,
+            "first poll should not show Stuck"
+        );
     }
 
     #[test]
