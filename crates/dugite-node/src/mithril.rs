@@ -887,7 +887,9 @@ fn verify_snapshot_digest(
     if computed != expected_digest {
         anyhow::bail!(
             "Mithril snapshot digest mismatch!\n  Expected: {expected_digest}\n  Computed: {computed}\n\
-             The snapshot may be corrupted or tampered with. Delete the extract directory and retry."
+             The snapshot may be corrupted, tampered with, or the extraction may have been interrupted.\n\
+             Delete the extract directory and retry:\n  rm -rf {}",
+            extract_dir.display(),
         );
     }
 
@@ -899,15 +901,41 @@ fn verify_snapshot_digest(
 // Archive extraction
 // ---------------------------------------------------------------------------
 
+/// Sentinel file written to an extract directory after extraction completes
+/// successfully. Its presence is the only signal that the directory can be
+/// reused on a subsequent run; without it, the dir is treated as a partial /
+/// interrupted extraction and re-extracted from scratch.
+const EXTRACT_SENTINEL: &str = ".dugite-extracted";
+
 /// Extract a tar.zst archive to a directory
 fn extract_archive(archive_path: &Path, extract_dir: &Path) -> Result<()> {
-    // If already extracted, skip
+    let sentinel_path = extract_dir.join(EXTRACT_SENTINEL);
+
+    // Cache hit requires BOTH an immutable/ subdir AND the sentinel — the
+    // sentinel is only written after a previous extraction ran to completion.
     if extract_dir.exists() {
         let immutable_dir = find_immutable_dir(extract_dir);
-        if immutable_dir.is_some() {
-            info!("Mithril      archive already extracted, skipping");
+        if immutable_dir.is_some() && sentinel_path.exists() {
+            info!(
+                "Mithril      archive already extracted, skipping ({})",
+                extract_dir.display()
+            );
             return Ok(());
         }
+
+        // Sentinel missing → the dir is either empty or holds a partial /
+        // interrupted extraction. Wipe it for a clean re-extract so we don't
+        // silently reuse stale files (was the root cause of issue #509).
+        warn!(
+            "Mithril      partial / unverified extract at {}, wiping for clean re-extract",
+            extract_dir.display()
+        );
+        fs::remove_dir_all(extract_dir).with_context(|| {
+            format!(
+                "Failed to remove partial extract dir: {}",
+                extract_dir.display()
+            )
+        })?;
     }
 
     fs::create_dir_all(extract_dir)?;
@@ -944,6 +972,16 @@ fn extract_archive(archive_path: &Path, extract_dir: &Path) -> Result<()> {
     }
 
     pb.finish_with_message(format!("{entry_count} entries extracted"));
+
+    // Mark the extraction complete. Future runs trust the cache only if this
+    // sentinel exists, so we write it last and treat its absence as "partial".
+    fs::write(&sentinel_path, b"ok\n").with_context(|| {
+        format!(
+            "Failed to write extract sentinel: {}",
+            sentinel_path.display()
+        )
+    })?;
+
     info!("Mithril      extraction complete ({} entries)", entry_count);
 
     Ok(())
@@ -2639,12 +2677,16 @@ mod tests {
 
     #[test]
     fn test_extract_archive_already_extracted() {
+        // Cache hit: when BOTH the immutable/ subdir and the completion
+        // sentinel exist, extract_archive must return Ok without touching
+        // the archive on disk. We prove that by giving it a nonexistent
+        // archive path — if the skip path didn't fire, the open would fail.
         let dir = tempfile::tempdir().unwrap();
         let extract_dir = dir.path().join("extracted");
         let immutable = extract_dir.join("immutable");
         fs::create_dir_all(&immutable).unwrap();
+        fs::write(extract_dir.join(EXTRACT_SENTINEL), b"ok").unwrap();
 
-        // Should return Ok immediately without touching the archive
         let fake_archive = dir.path().join("nonexistent.tar.zst");
         let result = extract_archive(&fake_archive, &extract_dir);
         assert!(result.is_ok());
@@ -3588,5 +3630,88 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let count = replay_from_chunk_files(dir.path(), 0, 0, |_cbor| Ok(())).unwrap();
         assert_eq!(count, 0);
+    }
+
+    /// Build a tiny in-memory `tar.zst` archive containing a single
+    /// `immutable/00001.chunk` file. Used by extract_archive tests.
+    fn build_tiny_tar_zst(archive_path: &Path) {
+        let mut tar_buf: Vec<u8> = Vec::new();
+        {
+            let mut builder = tar::Builder::new(&mut tar_buf);
+            let payload = b"hello";
+            let mut header = tar::Header::new_gnu();
+            header.set_path("immutable/00001.chunk").unwrap();
+            header.set_size(payload.len() as u64);
+            header.set_cksum();
+            builder.append(&header, &payload[..]).unwrap();
+            builder.finish().unwrap();
+        }
+        let compressed = zstd::encode_all(&tar_buf[..], 0).unwrap();
+        fs::write(archive_path, compressed).unwrap();
+    }
+
+    #[test]
+    fn test_extract_archive_re_extracts_when_sentinel_missing() {
+        // Pre-populate an extract dir with `immutable/` but NO sentinel —
+        // simulating a previous run that was interrupted mid-extraction.
+        // extract_archive must NOT trust this stale dir; it must re-extract.
+        let work_dir = tempfile::tempdir().unwrap();
+        let extract_dir = work_dir.path().join("extract-test");
+        fs::create_dir_all(extract_dir.join("immutable")).unwrap();
+        fs::write(extract_dir.join("immutable").join("99999.chunk"), b"stale").unwrap();
+        assert!(!extract_dir.join(EXTRACT_SENTINEL).exists());
+
+        let archive = work_dir.path().join("snap.tar.zst");
+        build_tiny_tar_zst(&archive);
+
+        extract_archive(&archive, &extract_dir).expect("extract should succeed");
+
+        // Sentinel must exist after re-extraction.
+        assert!(extract_dir.join(EXTRACT_SENTINEL).exists());
+        // The stale file must be gone (the partial dir was wiped).
+        assert!(!extract_dir.join("immutable").join("99999.chunk").exists());
+        // The fresh file from the tar must be present.
+        assert!(extract_dir.join("immutable").join("00001.chunk").exists());
+    }
+
+    #[test]
+    fn test_extract_archive_writes_sentinel_on_fresh_extract() {
+        let work_dir = tempfile::tempdir().unwrap();
+        let extract_dir = work_dir.path().join("extract-test");
+        let archive = work_dir.path().join("snap.tar.zst");
+        build_tiny_tar_zst(&archive);
+
+        extract_archive(&archive, &extract_dir).expect("extract should succeed");
+
+        assert!(
+            extract_dir.join(EXTRACT_SENTINEL).exists(),
+            "sentinel must be written after successful extraction"
+        );
+    }
+
+    #[test]
+    fn test_verify_snapshot_digest_error_includes_extract_dir_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let immutable = dir.path().join("immutable");
+        fs::create_dir_all(&immutable).unwrap();
+        fs::write(immutable.join("00001.chunk"), b"data").unwrap();
+
+        let beacon = SnapshotBeacon {
+            epoch: 1,
+            immutable_file_number: 1,
+        };
+
+        let result = verify_snapshot_digest(
+            dir.path(),
+            "preview",
+            &beacon,
+            "0000000000000000000000000000000000000000000000000000000000000000",
+        );
+        let err_msg = result.unwrap_err().to_string();
+        // For users to manually recover, the error must surface the path.
+        assert!(
+            err_msg.contains(&dir.path().display().to_string()),
+            "error must contain extract dir path, got: {err_msg}"
+        );
     }
 }
