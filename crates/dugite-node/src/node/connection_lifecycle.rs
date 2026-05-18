@@ -44,8 +44,8 @@ use tokio::sync::{broadcast, mpsc, RwLock};
 use tracing::{debug, info, warn};
 
 use dugite_network::peer::governor::GovernorAction;
-use dugite_network::BlockAnnouncement;
 use dugite_network::RollbackAnnouncement;
+use dugite_network::{BlockAnnouncement, TxValidator};
 
 use dugite_ledger::LedgerState;
 use dugite_mempool::Mempool;
@@ -313,6 +313,15 @@ pub struct ConnectionLifecycleManager {
     /// Shared peer manager for PeerSharing server to query connected peers.
     peer_manager_for_servers: Arc<RwLock<NodePeerManager>>,
 
+    /// Tx validator for N2N TxSubmission2 admission.
+    ///
+    /// Every tx received via TxSubmission2 is validated through this before
+    /// being added to the mempool.  This closes the N2N admission gap: without
+    /// validation, an attacker can propagate a tx with `is_valid=false` but a
+    /// script that evaluates to `True` — every BP that ingests it will forge a
+    /// block that immediately fails its own ledger validation (#522).
+    tx_validator: Arc<dyn TxValidator>,
+
     /// Our N2N listen address. When set, outbound connections bind their
     /// source port to it (SO_REUSEADDR + SO_REUSEPORT) so a remote peer
     /// observes the connection as duplex-paired from our listen port —
@@ -379,6 +388,7 @@ impl ConnectionLifecycleManager {
     /// * `block_provider` — Shared block provider for server protocols
     /// * `rollback_announcement_tx` — Broadcast sender for rollback announcements
     /// * `peer_manager_for_servers` — Shared peer manager for PeerSharing server
+    /// * `tx_validator` — Tx validator for N2N TxSubmission2 admission (Phase-1 + Phase-2)
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         network_magic: u64,
@@ -401,6 +411,7 @@ impl ConnectionLifecycleManager {
         rollback_announcement_tx: broadcast::Sender<RollbackAnnouncement>,
         peer_manager_for_servers: Arc<RwLock<NodePeerManager>>,
         peer_intersection_established: Arc<std::sync::atomic::AtomicBool>,
+        tx_validator: Arc<dyn TxValidator>,
     ) -> Self {
         Self {
             connections: HashMap::new(),
@@ -427,6 +438,7 @@ impl ConnectionLifecycleManager {
             peer_manager_for_servers,
             local_listen_addr: None,
             peer_intersection_established,
+            tx_validator,
         }
     }
 
@@ -1477,29 +1489,51 @@ impl ConnectionLifecycleManager {
     /// Create the TxSubmission2 server task closure.
     ///
     /// Receives transactions from downstream peers, decodes them across all
-    /// supported eras (Conway=6 through Shelley=2), and adds valid ones to
-    /// the mempool. Tracks received/validated/rejected metrics.
+    /// supported eras (Conway=6 through Shelley=2), validates each tx through
+    /// the full Phase-1 + Phase-2 ledger pipeline (including IsValid tag
+    /// verification), and adds only valid ones to the mempool.
+    /// Tracks received/validated/rejected metrics.
     fn make_txsubmission_server_task(&self, addr: SocketAddr) -> ProtocolTaskFn {
         let mempool = self.mempool.clone();
         let metrics = self.metrics.clone();
+        let tx_validator = self.tx_validator.clone();
 
         Box::new(move |mut channel, cancel| {
             Box::pin(async move {
                 let on_tx = {
                     let tx_mempool = mempool;
                     let tx_metrics = metrics;
+                    let validator = tx_validator;
                     move |tx_hash: [u8; 32], tx_bytes: Vec<u8>| -> bool {
                         // Track every transaction received from peers in real-time.
                         tx_metrics
                             .transactions_received
                             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
-                        // Best-effort mempool admission: try all supported eras for decoding.
+                        // Run full Phase-1 + Phase-2 validation (including IsValid
+                        // tag check) before mempool admission.  This mirrors
+                        // Haskell cardano-node's `applyTx` (mempool admission path)
+                        // and prevents DoS via is_valid=false / script-passes txs
+                        // (#522).  Try all supported eras for decoding.
                         let size_bytes = tx_bytes.len();
                         for era_id in [6u16, 5, 4, 3, 2] {
                             if let Ok(tx) =
                                 dugite_serialization::decode_transaction(era_id, &tx_bytes)
                             {
+                                // Phase-1 + Phase-2 validation via LedgerTxValidator.
+                                if let Err(e) = validator.validate_tx(era_id, &tx_bytes) {
+                                    debug!(
+                                        %addr,
+                                        tx_hash = %dugite_primitives::hash::Hash32::from_bytes(tx_hash).to_hex(),
+                                        reason = ?e,
+                                        "N2N tx rejected by validator"
+                                    );
+                                    tx_metrics
+                                        .transactions_rejected
+                                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                    return false;
+                                }
+
                                 let hash = dugite_primitives::hash::Hash32::from_bytes(tx_hash);
                                 if tx_mempool.add_tx(hash, tx, size_bytes).is_ok() {
                                     tx_metrics
@@ -1838,6 +1872,23 @@ impl<Q: MempoolQuerySource> TxSource for MempoolTxSource<Q> {
 
 // ─── Test-only helpers ───────────────────────────────────────────────────────
 
+/// A no-op [`TxValidator`] for unit tests that always reports every
+/// transaction as valid.  Only used in test constructors — production code
+/// always supplies a real [`super::serve::LedgerTxValidator`].
+#[cfg(test)]
+struct NoOpTxValidator;
+
+#[cfg(test)]
+impl TxValidator for NoOpTxValidator {
+    fn validate_tx(
+        &self,
+        _era_id: u16,
+        _tx_bytes: &[u8],
+    ) -> Result<(), dugite_network::TxValidationError> {
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 impl ConnectionLifecycleManager {
     /// Create a minimal `ConnectionLifecycleManager` for use in unit tests.
@@ -1901,6 +1952,7 @@ impl ConnectionLifecycleManager {
             rollback_announcement_tx,
             peer_manager_for_servers,
             Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            Arc::new(NoOpTxValidator),
         )
     }
 
@@ -1958,6 +2010,7 @@ impl ConnectionLifecycleManager {
             rollback_announcement_tx,
             peer_manager_for_servers,
             Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            Arc::new(NoOpTxValidator),
         );
         (lc, peer_failure_rx)
     }
