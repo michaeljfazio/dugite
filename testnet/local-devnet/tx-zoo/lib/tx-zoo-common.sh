@@ -185,6 +185,113 @@ zoo_pparams_file() {
     echo "$f"
 }
 
+# ---- Anchor-data HTTP server ----
+#
+# cardano-cli 11.0's `transaction build` and the cert-/proposal-create
+# subcommands ALWAYS fetch `--anchor-url` (or `--drep-metadata-url`,
+# `--metadata-url`) at build time and validate the downloaded content
+# against the `--anchor-data-hash`. Placeholder URLs like
+# `https://example.com/*` 404 and the script crashes pre-record.
+#
+# We stand up a tiny local HTTP server on $ZOO_ANCHOR_PORT that serves
+# pre-generated JSON files under $ZOO_ANCHOR_DIR. The helpers below
+# resolve to that server's URL+hash for a named anchor.
+#
+# Lifecycle: `zoo_anchor_start` is invoked once by run-all.sh before any
+# script runs; `zoo_anchor_stop` is invoked at the end. Individual
+# scripts call only `zoo_anchor_url` and `zoo_anchor_hash`.
+ZOO_ANCHOR_PORT="${ZOO_ANCHOR_PORT:-18019}"
+ZOO_ANCHOR_DIR="$ZOO_STATE/anchor"
+ZOO_ANCHOR_PID="$ZOO_STATE/anchor.pid"
+
+# Compute the Blake2b-256 hash of a file, lower-case hex. Matches
+# what cardano-cli computes for anchor-data-hash.
+_zoo_anchor_b2b256() {
+    local file="$1"
+    if command -v b2sum >/dev/null 2>&1; then
+        b2sum -l 256 -a blake2b "$file" 2>/dev/null | awk '{print $1}'
+    else
+        # Fall back to cardano-cli's hashing surface (always available
+        # in the zoo's environment) via a temp Cardano command.
+        python3 - "$file" <<'PY'
+import sys, hashlib
+h = hashlib.blake2b(digest_size=32)
+with open(sys.argv[1], 'rb') as f:
+    for chunk in iter(lambda: f.read(8192), b''):
+        h.update(chunk)
+print(h.hexdigest())
+PY
+    fi
+}
+
+# Generate the anchor JSON files we serve. Each tx-zoo entry refers to
+# them by name (the file stem). New anchors should be added here and
+# in the per-script helper calls below.
+_zoo_anchor_seed() {
+    mkdir -p "$ZOO_ANCHOR_DIR"
+    local f
+    declare -A anchors=(
+        [pool3]='{"name":"tx-zoo pool 3","ticker":"TXZP3","description":"tx-zoo synthetic pool","homepage":"http://127.0.0.1/"}'
+        [drep-1]='{"@context":{},"hashAlgorithm":"blake2b-256","body":{"references":[],"comment":"tx-zoo drep","externalUpdates":[]}}'
+        [drep-1-v2]='{"@context":{},"hashAlgorithm":"blake2b-256","body":{"references":[],"comment":"tx-zoo drep v2","externalUpdates":[]}}'
+        [info-action]='{"@context":{},"hashAlgorithm":"blake2b-256","body":{"title":"tx-zoo info","abstract":"info","motivation":"info","rationale":"info","references":[]}}'
+        [pparam-change]='{"@context":{},"hashAlgorithm":"blake2b-256","body":{"title":"tx-zoo pparam","abstract":"pparam","motivation":"pparam","rationale":"pparam","references":[]}}'
+        [hardfork]='{"@context":{},"hashAlgorithm":"blake2b-256","body":{"title":"tx-zoo hardfork","abstract":"hf","motivation":"hf","rationale":"hf","references":[]}}'
+        [treasury]='{"@context":{},"hashAlgorithm":"blake2b-256","body":{"title":"tx-zoo treasury","abstract":"tw","motivation":"tw","rationale":"tw","references":[]}}'
+        [no-confidence]='{"@context":{},"hashAlgorithm":"blake2b-256","body":{"title":"tx-zoo noconf","abstract":"nc","motivation":"nc","rationale":"nc","references":[]}}'
+        [update-committee]='{"@context":{},"hashAlgorithm":"blake2b-256","body":{"title":"tx-zoo cc","abstract":"cc","motivation":"cc","rationale":"cc","references":[]}}'
+        [new-constitution]='{"@context":{},"hashAlgorithm":"blake2b-256","body":{"title":"tx-zoo constitution","abstract":"cn","motivation":"cn","rationale":"cn","references":[]}}'
+        [constitution-body]='{"@context":{},"hashAlgorithm":"blake2b-256","body":{"text":"tx-zoo constitution body","articles":[]}}'
+    )
+    for f in "${!anchors[@]}"; do
+        printf '%s' "${anchors[$f]}" > "$ZOO_ANCHOR_DIR/$f.json"
+    done
+}
+
+# Start the anchor HTTP server. Idempotent: if already running, no-op.
+zoo_anchor_start() {
+    if [ -f "$ZOO_ANCHOR_PID" ] && kill -0 "$(cat "$ZOO_ANCHOR_PID")" 2>/dev/null; then
+        return 0
+    fi
+    _zoo_anchor_seed
+    ( cd "$ZOO_ANCHOR_DIR" && python3 -m http.server "$ZOO_ANCHOR_PORT" \
+        --bind 127.0.0.1 >"$ZOO_LOGS/anchor-server.log" 2>&1 ) &
+    echo $! > "$ZOO_ANCHOR_PID"
+    # Wait up to 3 s for the server to accept connections.
+    local i=0
+    while [ "$i" -lt 30 ]; do
+        if curl -sf "http://127.0.0.1:$ZOO_ANCHOR_PORT/" >/dev/null 2>&1; then
+            zoo_info "anchor server up on http://127.0.0.1:$ZOO_ANCHOR_PORT"
+            return 0
+        fi
+        sleep 0.1
+        i=$((i+1))
+    done
+    zoo_fail "anchor server did not come up on port $ZOO_ANCHOR_PORT"
+    return 1
+}
+
+zoo_anchor_stop() {
+    if [ -f "$ZOO_ANCHOR_PID" ]; then
+        local pid
+        pid="$(cat "$ZOO_ANCHOR_PID")"
+        kill "$pid" 2>/dev/null || true
+        rm -f "$ZOO_ANCHOR_PID"
+    fi
+}
+
+zoo_anchor_url() {
+    local name="$1"
+    echo "http://127.0.0.1:$ZOO_ANCHOR_PORT/$name.json"
+}
+
+zoo_anchor_hash() {
+    local name="$1"
+    local f="$ZOO_ANCHOR_DIR/$name.json"
+    [ -s "$f" ] || die "anchor file missing: $f (did zoo_anchor_start run?)"
+    _zoo_anchor_b2b256 "$f"
+}
+
 # ---- Result recording ----
 # Append a line to the central run-all results CSV.
 ZOO_RESULTS_CSV="${ZOO_RESULTS_CSV:-$ZOO_STATE/results.csv}"

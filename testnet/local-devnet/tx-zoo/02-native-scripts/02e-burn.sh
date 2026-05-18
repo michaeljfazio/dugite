@@ -52,10 +52,24 @@ RAW="$ZOO_BUILT/$NAME.raw"
 SIGNED="$ZOO_BUILT/$NAME.signed"
 TX_OUT="${ADDR}+2000000"
 [ "$REMAIN" -gt 0 ] && TX_OUT="${TX_OUT} + ${REMAIN} ${ASSET}"
+# The asset-bearing UTxO carries exactly 2_000_000 lovelace, which is
+# the min-utxo for the tx-out preserving the remainder. We need a second
+# pure-ADA input to cover the fee. Pick the largest other UTxO at the
+# funder.
+FEE_TXIN=$(zoo_largest_utxo "$ADDR" "$ZOO_SOCKET" | awk '{print $1}')
+# If the largest happens to be the same UTxO we already chose, take the
+# next-largest.
+if [ "$FEE_TXIN" = "$TXIN" ]; then
+    FEE_TXIN=$(zoo_utxo_at "$ADDR" 1 "$ZOO_SOCKET" | awk '{print $1}') || true
+fi
+if [ -z "$FEE_TXIN" ] || [ "$FEE_TXIN" = "$TXIN" ]; then
+    zoo_record "$NAME" FAIL "" "no-fee-utxo"; exit 1
+fi
 cardano-cli conway transaction build \
     --testnet-magic "$LD_MAGIC" \
     --socket-path   "$ZOO_SOCKET" \
     --tx-in         "$TXIN" \
+    --tx-in         "$FEE_TXIN" \
     --tx-out        "$TX_OUT" \
     --change-address "$ADDR" \
     --mint          "-${BURN} ${ASSET}" \

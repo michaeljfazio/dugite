@@ -13,7 +13,7 @@ ADDR=$(cat "$WA/payment-stake.addr")
 PPARAMS=$(zoo_pparams_file)
 DEPOSIT=$(jq -r '.dRepDeposit // .drepDeposit // 500000000' "$PPARAMS")
 DREP_KH=$(cardano-cli conway governance drep id \
-    --drep-verification-key-file "$DREP/drep.vkey" --output-format hex)
+    --drep-verification-key-file "$DREP/drep.vkey" --output-hex)
 REG_LIST=$(cardano-cli conway query drep-state \
     --testnet-magic "$LD_MAGIC" --socket-path "$ZOO_SOCKET" \
     --drep-key-hash "$DREP_KH" 2>/dev/null || echo "[]")

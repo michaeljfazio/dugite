@@ -17,8 +17,8 @@ cardano-cli conway governance action create-protocol-parameters-update \
     --testnet \
     --governance-action-deposit "$GOV_DEPOSIT" \
     --deposit-return-stake-verification-key-file "$WA/stake.vkey" \
-    --anchor-url  "https://example.com/pparam-change.json" \
-    --anchor-data-hash "0000000000000000000000000000000000000000000000000000000000000000" \
+    --anchor-url  "$(zoo_anchor_url pparam-change)" \
+    --anchor-data-hash "$(zoo_anchor_hash pparam-change)" \
     --max-block-body-size "$NEW_MAX_BODY" \
     --out-file "$ACTION"
 

@@ -40,6 +40,14 @@ SIGNED="$ZOO_BUILT/$NAME.signed"
 PPARAMS=$(zoo_pparams_file)
 # Need exec-units for the redeemer. Use modest placeholders since the script
 # is always-true and the tx is intentionally invalid.
+# Phase-1 value-conservation is enforced for ALL txs, including
+# is_valid=false. The regular-path balance must hold:
+#   sum(inputs)  ==  sum(outputs)  +  fee
+# So the single regular tx-out must drain SCRIPT_TXIN minus the fee.
+# (Collateral inputs / collateral-return are a separate sub-balance:
+#  collat_in - total_collateral == collat_return.)
+FEE=500000
+REG_OUT=$((SCRIPT_AMT - FEE))
 cardano-cli conway transaction build-raw \
     --tx-in         "$SCRIPT_TXIN" \
     --tx-in-script-file "$SCRIPT" \
@@ -49,8 +57,8 @@ cardano-cli conway transaction build-raw \
     --tx-in-collateral  "$COLLAT" \
     --tx-total-collateral "$((COLLAT_AMT - RETURN_AMT))" \
     --tx-out-return-collateral "${ADDR}+${RETURN_AMT}" \
-    --tx-out        "${ADDR}+2000000" \
-    --fee           500000 \
+    --tx-out        "${ADDR}+${REG_OUT}" \
+    --fee           "$FEE" \
     --ttl           "$TTL" \
     --script-invalid \
     --protocol-params-file "$PPARAMS" \

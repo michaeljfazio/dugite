@@ -17,8 +17,8 @@ cardano-cli conway governance action create-treasury-withdrawal \
     --testnet \
     --governance-action-deposit "$GOV_DEPOSIT" \
     --deposit-return-stake-verification-key-file "$WA/stake.vkey" \
-    --anchor-url  "https://example.com/treasury.json" \
-    --anchor-data-hash "0000000000000000000000000000000000000000000000000000000000000000" \
+    --anchor-url  "$(zoo_anchor_url treasury)" \
+    --anchor-data-hash "$(zoo_anchor_hash treasury)" \
     --funds-receiving-stake-verification-key-file "$WA/stake.vkey" \
     --transfer "$WITHDRAW" \
     --out-file "$ACTION"

@@ -30,7 +30,7 @@ DEPOSIT=$(jq -r '.stakeAddressDeposit' "$PPARAMS")
 # Conway "stake-and-vote-registration-delegation-certificate" combines
 # register + delegate-stake + delegate-vote in one cert.
 CERT="$ZOO_BUILT/$NAME.cert"
-cardano-cli conway stake-address stake-and-vote-registration-and-delegation-certificate \
+cardano-cli conway stake-address registration-stake-and-vote-delegation-certificate \
     --stake-verification-key-file "$WB/stake.vkey" \
     --stake-pool-id "$POOL_ID" \
     --always-abstain \

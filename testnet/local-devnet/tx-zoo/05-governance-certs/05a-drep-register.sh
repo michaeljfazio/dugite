@@ -17,8 +17,8 @@ CERT="$ZOO_BUILT/$NAME.cert"
 cardano-cli conway governance drep registration-certificate \
     --drep-verification-key-file "$DREP/drep.vkey" \
     --key-reg-deposit-amt "$DEPOSIT" \
-    --drep-metadata-url  "https://example.com/drep-1.json" \
-    --drep-metadata-hash "0000000000000000000000000000000000000000000000000000000000000000" \
+    --drep-metadata-url  "$(zoo_anchor_url drep-1)" \
+    --drep-metadata-hash "$(zoo_anchor_hash drep-1)" \
     --out-file "$CERT"
 
 UTXO=$(zoo_largest_utxo "$ADDR") || { zoo_record "$NAME" FAIL "" "no-utxo"; exit 1; }
