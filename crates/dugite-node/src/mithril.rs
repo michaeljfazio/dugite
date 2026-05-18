@@ -16,12 +16,14 @@ use dugite_primitives::time::{BlockNo, SlotNo};
 use ed25519_dalek::{Signature, VerifyingKey};
 use indicatif::{ProgressBar, ProgressStyle};
 use memmap2::Mmap;
+use rayon::iter::{IntoParallelRefIterator, ParallelIterator};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::fs;
 use std::io::BufReader;
 use std::net::{IpAddr, Ipv4Addr};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 #[cfg(test)]
 use tracing::debug;
 use tracing::{info, warn};
@@ -333,28 +335,13 @@ pub async fn import_snapshot(
             "Verifying snapshot content against certificate (hashing all immutable files)..."
         );
 
-        // Spawn a periodic heartbeat so the user knows the process isn't stuck.
-        let heartbeat = tokio::spawn(async {
-            let start = std::time::Instant::now();
-            let mut interval = tokio::time::interval(std::time::Duration::from_secs(30));
-            interval.tick().await; // consume the immediate first tick
-            loop {
-                interval.tick().await;
-                let elapsed = start.elapsed();
-                info!(
-                    elapsed_secs = elapsed.as_secs(),
-                    "Still hashing immutable files ({:.0}s elapsed)...",
-                    elapsed.as_secs() as f64
-                );
-            }
-        });
-
-        let message = mithril_client::MessageBuilder::new()
-            .compute_snapshot_message(&certificate, &extract_dir)
+        // Parallel SHA256 over all immutable files (rayon par_iter on a
+        // spawn_blocking thread).  Replaces the serial upstream
+        // MessageBuilder::compute_snapshot_message which takes ~11 min on
+        // mainnet (26 K files × 25 ms/file single-threaded).
+        let message = compute_snapshot_message_parallel(&certificate, &extract_dir)
             .await
             .context("Failed to compute snapshot message from extracted files")?;
-
-        heartbeat.abort();
 
         if !certificate.match_message(&message) {
             anyhow::bail!(
@@ -784,6 +771,141 @@ async fn download_range(
     Ok(())
 }
 
+// ---------------------------------------------------------------------------
+// Parallel Mithril snapshot message computation
+// ---------------------------------------------------------------------------
+
+/// Compute the Mithril `ProtocolMessage` for a snapshot certificate using
+/// parallel (rayon) per-file SHA256, then verify it against the certificate.
+///
+/// The upstream `mithril_client::MessageBuilder::compute_snapshot_message`
+/// hashes every immutable file sequentially inside a single `spawn_blocking`
+/// call — on mainnet (~26 K files) this takes ~11 minutes single-threaded.
+/// This function reproduces the identical algorithm but uses `rayon::par_iter`
+/// for the per-file step, preserving the required sort order
+/// `(file_number, path)` via index-preserving parallel collection.
+///
+/// Algorithm (matches mithril-cardano-node-internal-database CardanoImmutableDigester):
+///   1. beacon_hash  = hex(SHA256(network_bytes || epoch_u64_be || immutable_file_number_u64_be))
+///   2. file_hashes  = [hex(SHA256(file_i)) for file_i sorted by (number, path)]   ← parallel
+///   3. snapshot_digest = hex(SHA256(beacon_hash_bytes || file_hash_bytes_0 || ...)) ← sequential reduce
+///   4. message = clone(certificate.protocol_message); message[SnapshotDigest] = snapshot_digest
+async fn compute_snapshot_message_parallel(
+    certificate: &mithril_client::MithrilCertificate,
+    extract_dir: &Path,
+) -> Result<mithril_client::common::ProtocolMessage> {
+    // Extract the beacon from the certificate's signed entity type.
+    let beacon = match &certificate.signed_entity_type {
+        mithril_client::common::SignedEntityType::CardanoImmutableFilesFull(b) => b,
+        other => anyhow::bail!(
+            "Certificate does not certify a snapshot (got {:?}); cannot compute message",
+            other
+        ),
+    };
+
+    let network = &certificate.metadata.network;
+
+    // Step 1: beacon hash — matches compute_beacon_hash() in mithril-cardano-node-internal-database.
+    let beacon_hash = {
+        let mut hasher = Sha256::new();
+        hasher.update(network.as_bytes());
+        hasher.update(beacon.epoch.to_be_bytes());
+        hasher.update(beacon.immutable_file_number.to_be_bytes());
+        hex::encode(hasher.finalize())
+    };
+
+    // Step 2: collect and sort immutable files (number then path, matching ImmutableFile::cmp).
+    let immutable_dir = find_immutable_dir(extract_dir)
+        .context("Could not find immutable/ directory for parallel message computation")?;
+
+    let mut immutable_files: Vec<(u64, PathBuf)> = Vec::new();
+    for entry in fs::read_dir(&immutable_dir).context("Failed to read immutable directory")? {
+        let entry = entry?;
+        let path = entry.path();
+        if !path.is_file() {
+            continue;
+        }
+        let name = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or_default();
+        let is_immutable =
+            name.ends_with(".chunk") || name.ends_with(".primary") || name.ends_with(".secondary");
+        if !is_immutable {
+            continue;
+        }
+        let stem = path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or_default();
+        let file_number = stem.parse::<u64>().unwrap_or(0);
+        if file_number <= beacon.immutable_file_number {
+            immutable_files.push((file_number, path));
+        }
+    }
+    immutable_files.sort_by(|(na, pa), (nb, pb)| na.cmp(nb).then(pa.cmp(pb)));
+
+    let total_files = immutable_files.len() as u64;
+    info!(
+        files = total_files,
+        "Computing snapshot message (parallel SHA256 over immutable files)..."
+    );
+    let pb = Arc::new(ProgressBar::new(total_files));
+    pb.set_style(
+        ProgressStyle::default_bar()
+            .template(
+                "{spinner:.green} [{elapsed_precise}] [{wide_bar:.cyan/blue}] {pos}/{len} files (message)",
+            )
+            .expect("progress bar template is a valid constant")
+            .progress_chars("█▉▊▋▌▍▎▏ "),
+    );
+
+    // Step 2 (parallel): hash each file; rayon par_iter on a slice is index-preserving.
+    // Run inside spawn_blocking so the CPU-bound rayon work does not starve the
+    // tokio runtime.  ProgressBar is wrapped in Arc to allow it to cross the
+    // 'static bound of spawn_blocking.
+    let pb_clone = pb.clone();
+    let file_hex_hashes: Vec<String> = tokio::task::spawn_blocking(move || {
+        immutable_files
+            .par_iter()
+            .map(|(_num, path)| {
+                let content = fs::read(path)
+                    .unwrap_or_else(|e| panic!("Failed to read {}: {e}", path.display()));
+                let hex = hex::encode(Sha256::digest(&content));
+                pb_clone.inc(1);
+                hex
+            })
+            .collect()
+    })
+    .await
+    .context("Parallel file hashing task panicked")?;
+
+    pb.finish_with_message("Done");
+
+    // Step 3: sequential reduce — order is guaranteed by index-preserving collection.
+    let snapshot_digest = {
+        let mut hasher = Sha256::new();
+        hasher.update(beacon_hash.as_bytes());
+        for hex in &file_hex_hashes {
+            hasher.update(hex.as_bytes());
+        }
+        hex::encode(hasher.finalize())
+    };
+
+    // Step 4: build the ProtocolMessage the same way the upstream MessageBuilder does.
+    let mut message = certificate.protocol_message.clone();
+    message.set_message_part(
+        mithril_client::common::ProtocolMessagePartKey::SnapshotDigest,
+        snapshot_digest,
+    );
+
+    Ok(message)
+}
+
+// ---------------------------------------------------------------------------
+// Snapshot digest verification (legacy V1 API path)
+// ---------------------------------------------------------------------------
+
 /// Verify the Mithril snapshot digest over extracted immutable files.
 ///
 /// Reproduces the Mithril aggregator's digest algorithm:
@@ -859,29 +981,28 @@ fn verify_snapshot_digest(
             .progress_chars("█▉▊▋▌▍▎▏ "),
     );
 
-    // Step 3: Hash each file individually, then combine
-    let mut final_hasher = Sha256::new();
-    final_hasher.update(beacon_hash.as_bytes());
-
-    let mut buf = [0u8; 256 * 1024];
-    for (_file_number, path) in &immutable_files {
-        let mut file_hasher = Sha256::new();
-        let mut file = fs::File::open(path)
-            .with_context(|| format!("Failed to open immutable file: {}", path.display()))?;
-        loop {
-            let n = std::io::Read::read(&mut file, &mut buf)
-                .with_context(|| format!("IO error reading: {}", path.display()))?;
-            if n == 0 {
-                break;
-            }
-            file_hasher.update(&buf[..n]);
-        }
-        let file_hash_hex = hex::encode(file_hasher.finalize());
-        final_hasher.update(file_hash_hex.as_bytes());
-        pb.inc(1);
-    }
+    // Step 3: Hash each file individually in parallel (rayon), then reduce in
+    // sorted order.  Rayon's par_iter() on a slice preserves index identity so
+    // collecting into Vec<_> gives results in the same (sorted) order.
+    // ProgressBar is Sync so &pb is safe to share across rayon threads.
+    let file_hex_hashes: Result<Vec<String>> = immutable_files
+        .par_iter()
+        .map(|(_file_number, path)| {
+            let content =
+                fs::read(path).with_context(|| format!("IO error reading: {}", path.display()))?;
+            let hash_hex = hex::encode(Sha256::digest(&content));
+            pb.inc(1);
+            Ok(hash_hex)
+        })
+        .collect();
 
     pb.finish_with_message("Verification complete");
+
+    let mut final_hasher = Sha256::new();
+    final_hasher.update(beacon_hash.as_bytes());
+    for hex in file_hex_hashes? {
+        final_hasher.update(hex.as_bytes());
+    }
 
     let computed = hex::encode(final_hasher.finalize());
     if computed != expected_digest {
@@ -3712,6 +3833,146 @@ mod tests {
         assert!(
             err_msg.contains(&dir.path().display().to_string()),
             "error must contain extract dir path, got: {err_msg}"
+        );
+    }
+
+    /// Byte-exact test: parallel digest (rayon) must produce the same output as
+    /// the sequential reference algorithm.
+    ///
+    /// Builds a synthetic extract directory with 6 small immutable files spread
+    /// across 2 chunk numbers (matching the .chunk/.primary/.secondary triad),
+    /// then:
+    ///   1. Computes the expected digest using the serial reference path
+    ///      (same algorithm as `verify_snapshot_digest` and as the upstream
+    ///      mithril-cardano-node-internal-database `CardanoImmutableDigester`).
+    ///   2. Runs the same digest via the rayon par_iter path inside
+    ///      `compute_snapshot_message_parallel` and asserts byte-exact equality.
+    ///   3. Confirms the parallel path also passes `verify_snapshot_digest`.
+    #[test]
+    fn test_parallel_snapshot_digest_matches_serial() {
+        // Build a minimal extract dir: immutable/{00001,00002}.{chunk,primary,secondary}
+        let work_dir = tempfile::tempdir().unwrap();
+        let immutable = work_dir.path().join("immutable");
+        fs::create_dir_all(&immutable).unwrap();
+
+        let files: &[(&str, &[u8])] = &[
+            ("00001.chunk", b"block data for chunk 1"),
+            ("00001.primary", b"primary index 1"),
+            ("00001.secondary", b"secondary index 1"),
+            ("00002.chunk", b"block data for chunk 2"),
+            ("00002.primary", b"primary index 2"),
+            ("00002.secondary", b"secondary index 2"),
+        ];
+        for (name, content) in files {
+            fs::write(immutable.join(name), content).unwrap();
+        }
+
+        let network = "preview";
+        let epoch: u64 = 42;
+        let immutable_file_number: u64 = 2;
+
+        // --- Serial reference ---
+        // Algorithm: SHA256(network || epoch_be || ifn_be) → beacon_hash_hex
+        //            SHA256(beacon_hash_hex || sha256hex(file0) || sha256hex(file1) || ...)
+        let beacon_hash = {
+            let mut h = Sha256::new();
+            h.update(network.as_bytes());
+            h.update(epoch.to_be_bytes());
+            h.update(immutable_file_number.to_be_bytes());
+            hex::encode(h.finalize())
+        };
+
+        let mut sorted: Vec<(u64, PathBuf)> = files
+            .iter()
+            .map(|(name, _)| {
+                let stem = name.split('.').next().unwrap();
+                let num = stem.parse::<u64>().unwrap();
+                (num, immutable.join(name))
+            })
+            .collect();
+        sorted.sort_by(|(na, pa), (nb, pb)| na.cmp(nb).then(pa.cmp(pb)));
+
+        let mut final_hasher = Sha256::new();
+        final_hasher.update(beacon_hash.as_bytes());
+        for (_, path) in &sorted {
+            let content = fs::read(path).unwrap();
+            let file_hash = hex::encode(Sha256::digest(&content));
+            final_hasher.update(file_hash.as_bytes());
+        }
+        let expected_digest = hex::encode(final_hasher.finalize());
+
+        // --- verify_snapshot_digest should agree with the serial reference ---
+        let beacon = SnapshotBeacon {
+            epoch,
+            immutable_file_number,
+        };
+        verify_snapshot_digest(work_dir.path(), network, &beacon, &expected_digest)
+            .expect("serial verify_snapshot_digest must pass with the reference digest");
+
+        // --- Parallel path via compute_snapshot_message_parallel ---
+        // We deserialise a minimal MithrilCertificate from JSON so we don't
+        // depend on the exact struct field layout (some fields use DateTime<Utc>
+        // and ProtocolParameters which require specific constructors).
+        let cert_json = serde_json::json!({
+            "hash": "test-hash",
+            "previous_hash": "",
+            "epoch": epoch,
+            "signed_entity_type": {
+                "CardanoImmutableFilesFull": {
+                    "epoch": epoch,
+                    "immutable_file_number": immutable_file_number
+                }
+            },
+            "metadata": {
+                "network": network,
+                "version": "0.1.0",
+                "parameters": { "k": 1, "m": 1, "phi_f": 0.5 },
+                "initiated_at": "2024-01-01T00:00:00Z",
+                "sealed_at": "2024-01-01T00:00:00Z",
+                "signers": []
+            },
+            "protocol_message": {
+                "message_parts": {
+                    "next_aggregate_verification_key": "some-avk"
+                }
+            },
+            "signed_message": "irrelevant",
+            "aggregate_verification_key": "avk",
+            "multi_signature": "",
+            "genesis_signature": ""
+        });
+        let certificate: mithril_client::MithrilCertificate =
+            serde_json::from_value(cert_json).expect("minimal certificate JSON must deserialise");
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        let message = rt
+            .block_on(compute_snapshot_message_parallel(
+                &certificate,
+                work_dir.path(),
+            ))
+            .expect("parallel message computation must succeed");
+
+        let parallel_digest = message
+            .message_parts
+            .get(&mithril_client::common::ProtocolMessagePartKey::SnapshotDigest)
+            .expect("SnapshotDigest part must be present");
+
+        assert_eq!(
+            parallel_digest, &expected_digest,
+            "parallel digest must match serial digest byte-for-byte"
+        );
+
+        // Confirm pre-existing message parts are preserved.
+        assert_eq!(
+            message
+                .message_parts
+                .get(&mithril_client::common::ProtocolMessagePartKey::NextAggregateVerificationKey),
+            Some(&"some-avk".to_string()),
+            "pre-existing message parts must be preserved"
         );
     }
 }
