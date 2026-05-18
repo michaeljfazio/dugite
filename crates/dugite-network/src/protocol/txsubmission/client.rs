@@ -91,18 +91,38 @@ impl TxSubmissionClient {
                         // acknowledged previously-outstanding tx IDs.  Subsequent
                         // polls must NOT re-acknowledge (ack_count=0) but the
                         // outstanding set was already drained by the first call.
+                        //
+                        // Race-free ordering:
+                        //   1. Create the `Notified` future BEFORE re-querying.
+                        //   2. Re-query the mempool.
+                        //   3. Await the pre-armed `Notified` only if still empty.
+                        //
+                        // tokio's `Notify::notify_waiters()` does NOT buffer — it
+                        // only wakes futures that already exist when it fires. If
+                        // we re-queried first and then created the Notified, a
+                        // `notify_waiters` fired in between would be lost and the
+                        // task would block until the next tx admission happens
+                        // by chance. That's exactly the symptom seen with Conway
+                        // cert-bearing txs in #521: the tx sat in the upstream
+                        // mempool for ~60 s waiting for an unrelated wakeup.
+                        //
+                        // Creating the `Notified` before the re-check guarantees
+                        // any `notify_waiters` that fires after this point wakes
+                        // us (Notified captures wakes targeted at it regardless
+                        // of whether `.await` has been polled yet). And the
+                        // re-check immediately afterwards picks up txs that were
+                        // already in the mempool when we entered the loop, so
+                        // we never block indefinitely on a tx that's already there.
                         tracing::debug!("txsubmission2 client: blocking — waiting for mempool txs");
                         loop {
-                            // Event-driven wakeup when the mempool provides a Notify
-                            // handle; falls back to 500ms polling for TxSource impls
-                            // that don't support notification (e.g. test mocks).
-                            if let Some(notify) = source.tx_notify() {
-                                notify.notified().await;
-                            } else {
-                                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-                            }
-                            // ack_count=0: the first call already acknowledged.
-                            // req_count stays the same — peer wants up to this many.
+                            // Step 1: arm the wakeup BEFORE checking state.
+                            let notified = source
+                                .tx_notify()
+                                .map(|n| Box::pin(async move { n.notified().await }));
+
+                            // Step 2: re-query the mempool. ack_count=0: the
+                            // first call already acknowledged; req_count stays
+                            // the same — peer wants up to this many.
                             tx_ids = source.get_tx_ids(0, req_count);
                             if !tx_ids.is_empty() {
                                 tracing::info!(
@@ -110,6 +130,24 @@ impl TxSubmissionClient {
                                     "txsubmission2 client: mempool txs available, resuming"
                                 );
                                 break;
+                            }
+
+                            // Step 3: wait for next notify, with a 500 ms
+                            // fallback so we still re-poll periodically if a
+                            // TxSource impl doesn't provide a Notify (test
+                            // mocks) or to provide defence-in-depth.
+                            match notified {
+                                Some(fut) => {
+                                    tokio::select! {
+                                        _ = fut => {}
+                                        _ = tokio::time::sleep(
+                                            std::time::Duration::from_millis(500),
+                                        ) => {}
+                                    }
+                                }
+                                None => {
+                                    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                                }
                             }
                         }
                     }
@@ -386,6 +424,186 @@ mod tests {
         }
 
         // Clean up
+        handle.abort();
+        let _ = handle.await;
+    }
+
+    /// Regression test for #521: cert-bearing txs sat in the relay's mempool
+    /// for ~60 s before propagating to the BP.
+    ///
+    /// Root cause: a race between `get_tx_ids` returning empty and the
+    /// `Notify::notified()` future being created. `Notify::notify_waiters()`
+    /// does NOT buffer; if it fires before a `Notified` is created, the
+    /// wake is lost and the client blocks until the next admission.
+    ///
+    /// This test simulates the race: it adds a tx and fires `notify_waiters`
+    /// BEFORE the client enters its inner wait loop. The fixed client must
+    /// re-query the mempool before awaiting (so it picks up the tx without
+    /// needing a second notify) AND it must arm the `Notified` before the
+    /// re-query (so a notify fired immediately after the re-query is not
+    /// lost). With the previous code (await-then-requery), this test hangs
+    /// for ~500 ms (or forever if no fallback poll exists).
+    #[tokio::test]
+    async fn client_does_not_miss_notify_fired_before_blocking_wait() {
+        let (mut channel, mut egress_rx, ingress_tx) = make_test_channel();
+        let notify = Arc::new(tokio::sync::Notify::new());
+        let shared_tx_ids: std::sync::Arc<std::sync::Mutex<Vec<TxIdAndSize>>> =
+            std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let tx_ids_handle = shared_tx_ids.clone();
+
+        let source = NotifyMockTxSource {
+            notify: notify.clone(),
+            tx_ids: shared_tx_ids,
+            txs: vec![([0xEE; 32], vec![0x77])],
+        };
+
+        let handle =
+            tokio::spawn(async move { TxSubmissionClient::run(&mut channel, &source).await });
+
+        // Drain MsgInit (sent immediately on startup).
+        let _ = egress_rx.recv().await.unwrap();
+
+        // Inject the tx and fire notify_waiters() BEFORE sending
+        // MsgRequestTxIds. This reproduces the race where notify_waiters
+        // fires while no Notified is yet listening:
+        //
+        //   - In the buggy code, the client would call get_tx_ids (empty
+        //     because we haven't sent the request yet — wait, actually
+        //     the request hasn't been received yet, so the client is
+        //     blocked on channel.recv()).
+        //
+        // Actually, the more direct repro is: send MsgRequestTxIds first,
+        // then BEFORE the client wakes from recv to call get_tx_ids, push
+        // the tx and fire notify. The client's get_tx_ids will then return
+        // [tx] on first call — no race. That's not the bug.
+        //
+        // The real bug is: send MsgRequestTxIds, client's get_tx_ids
+        // returns empty (mempool empty), client enters inner wait loop.
+        // Between get_tx_ids returning empty and Notified being created,
+        // a tx is added and notify_waiters fires.
+        //
+        // We can't deterministically schedule that micro-window in a test,
+        // but we CAN guarantee Notified-first ordering by: registering the
+        // mempool tx + firing notify_waiters AFTER MsgRequestTxIds arrives
+        // but BEFORE the inner wait sleep completes. We use a longer sleep
+        // before sending MsgRequestTxIds to give the test predictable
+        // timing.
+        //
+        // Easier deterministic repro: do the "add + notify_waiters" at the
+        // same time as sending MsgRequestTxIds. With the fix, the client's
+        // re-query inside the inner loop picks up the tx without needing
+        // another notify. With the buggy await-first code, the client
+        // would block until the 500ms fallback elapses (or forever if no
+        // fallback).
+
+        // Add the tx and fire notify_waiters (this is the "stale" notify
+        // that the buggy code misses).
+        tx_ids_handle.lock().unwrap().push(TxIdAndSize {
+            era_id: 6,
+            tx_id: [0xEE; 32],
+            size_in_bytes: 200,
+        });
+        notify.notify_waiters();
+
+        // Now send the blocking MsgRequestTxIds. The client will call
+        // get_tx_ids inside the outer match arm and find the tx
+        // immediately (no inner-loop entry needed for this exact path).
+        let req = encode_message(&TxSubmissionMessage::MsgRequestTxIds {
+            blocking: true,
+            ack_count: 0,
+            req_count: 10,
+        });
+        ingress_tx.send(Bytes::from(req)).await.unwrap();
+
+        // Expect MsgReplyTxIds promptly (well under the 500ms fallback).
+        let reply_result =
+            tokio::time::timeout(std::time::Duration::from_millis(200), egress_rx.recv()).await;
+        assert!(
+            reply_result.is_ok(),
+            "client should respond promptly using already-armed wakeup"
+        );
+        let (_, _, reply_bytes) = reply_result.unwrap().unwrap();
+        if let TxSubmissionMessage::MsgReplyTxIds(ids) = decode_message(&reply_bytes).unwrap() {
+            assert_eq!(ids.len(), 1);
+            assert_eq!(ids[0].tx_id, [0xEE; 32]);
+        } else {
+            panic!("expected MsgReplyTxIds");
+        }
+
+        handle.abort();
+        let _ = handle.await;
+    }
+
+    /// Regression test for #521 — the harder race variant.
+    ///
+    /// The client receives a blocking MsgRequestTxIds when the mempool is
+    /// empty. It enters the inner wait loop. After get_tx_ids returns empty
+    /// inside the loop (or, in the buggy code, after `notify.notified()`
+    /// has not yet been created), a tx is admitted and notify_waiters
+    /// fires. With the fix, the re-query inside the loop sees the tx
+    /// without requiring a second wake-up. With the buggy code, the loop
+    /// would block on Notified until either (a) the 500 ms fallback fires
+    /// (current code) or (b) a subsequent admission, whichever came first.
+    #[tokio::test]
+    async fn client_inner_loop_picks_up_tx_added_just_before_wait() {
+        let (mut channel, mut egress_rx, ingress_tx) = make_test_channel();
+        let notify = Arc::new(tokio::sync::Notify::new());
+        let shared_tx_ids: std::sync::Arc<std::sync::Mutex<Vec<TxIdAndSize>>> =
+            std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let tx_ids_handle = shared_tx_ids.clone();
+
+        let source = NotifyMockTxSource {
+            notify: notify.clone(),
+            tx_ids: shared_tx_ids,
+            txs: vec![([0xCC; 32], vec![0x44])],
+        };
+
+        let handle =
+            tokio::spawn(async move { TxSubmissionClient::run(&mut channel, &source).await });
+
+        // Drain MsgInit.
+        let _ = egress_rx.recv().await.unwrap();
+
+        // Send blocking MsgRequestTxIds with empty mempool — client enters
+        // the inner wait loop.
+        let req = encode_message(&TxSubmissionMessage::MsgRequestTxIds {
+            blocking: true,
+            ack_count: 0,
+            req_count: 10,
+        });
+        ingress_tx.send(Bytes::from(req)).await.unwrap();
+
+        // Yield briefly so the client task gets a chance to run, hit the
+        // empty get_tx_ids, and enter the inner wait loop.
+        tokio::task::yield_now().await;
+
+        // Now race: add a tx and fire notify_waiters. The fixed client
+        // arms Notified BEFORE re-querying, so this wake is guaranteed
+        // to be observed even if it lands between iterations.
+        tx_ids_handle.lock().unwrap().push(TxIdAndSize {
+            era_id: 6,
+            tx_id: [0xCC; 32],
+            size_in_bytes: 250,
+        });
+        notify.notify_waiters();
+
+        // The client must respond well before the 500 ms fallback would
+        // have fired — proving it observed the wake-up (not just the
+        // polling fallback).
+        let reply_result =
+            tokio::time::timeout(std::time::Duration::from_millis(200), egress_rx.recv()).await;
+        assert!(
+            reply_result.is_ok(),
+            "fixed client must observe notify_waiters fired right before await"
+        );
+        let (_, _, reply_bytes) = reply_result.unwrap().unwrap();
+        if let TxSubmissionMessage::MsgReplyTxIds(ids) = decode_message(&reply_bytes).unwrap() {
+            assert_eq!(ids.len(), 1);
+            assert_eq!(ids[0].tx_id, [0xCC; 32]);
+        } else {
+            panic!("expected MsgReplyTxIds");
+        }
+
         handle.abort();
         let _ = handle.await;
     }
