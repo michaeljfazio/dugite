@@ -36,6 +36,12 @@ DUGITE_METRICS=${DUGITE_METRICS:-http://localhost:12798/metrics}
 HASKELL_METRICS=${HASKELL_METRICS:-http://127.0.0.1:12797/metrics}
 KOIOS_BASE=${KOIOS_BASE:-https://preview.koios.rest/api/v1}
 BARE_BP=${BARE_BP:-0}   # set 1 to disable relay-side monitoring (bare-BP mode)
+# Issue #508 absolute tip-age threshold (seconds). Once sync_progress hits
+# 100%, dugite_tip_age_seconds is expected to stay below this value. The
+# growing-tip detector below (TIP_AGE_GROW_TICKS) catches drift; this
+# threshold catches a stably-high value (e.g. the 19d-stale class of bug
+# fixed in cb509ef91).
+TIP_AGE_STALE_THRESHOLD=${TIP_AGE_STALE_THRESHOLD:-300}
 
 REPORT_DIR=./logs/soak-6h
 mkdir -p "$REPORT_DIR"
@@ -235,6 +241,7 @@ PREV_SYNC_TIP_AGE=""
 NO_PROGRESS_TICKS=0
 BLOCK_STALL_TICKS=0
 TIP_AGE_GROW_TICKS=0
+TIP_AGE_STALE_TICKS=0
 
 sync_check() {
     local slot block peers tip_age sync rolls
@@ -329,6 +336,20 @@ sync_check() {
         TIP_AGE_GROW_TICKS=0
     fi
     PREV_SYNC_TIP_AGE=$age_int
+
+    # Issue #508 — absolute tip-age threshold once we're caught up. The
+    # GROWING check above misses the case where tip_age is stably high
+    # (e.g. era-naive metric reports a steady 19-day value). Once sync
+    # progress reaches 100%, tip_age above $TIP_AGE_STALE_THRESHOLD for
+    # two consecutive sync ticks is treated as a stale-tip incident.
+    local sync_pct_int
+    sync_pct_int=$(printf '%.0f' "${sync:-0}" 2>/dev/null || echo 0)
+    if (( sync_pct_int >= 100 )) && (( age_int > TIP_AGE_STALE_THRESHOLD )); then
+        TIP_AGE_STALE_TICKS=$((TIP_AGE_STALE_TICKS + 1))
+        emit "TIP-AGE STALE — caught up (sync=${sync}/100) but tip_age=${age_int}s > ${TIP_AGE_STALE_THRESHOLD}s threshold (${TIP_AGE_STALE_TICKS} ticks)"
+    else
+        TIP_AGE_STALE_TICKS=0
+    fi
 
     # Divergence from relay
     local divergence
@@ -496,6 +517,8 @@ emit "Total KOIOS FAIL events:   $(grep -c 'KOIOS FAIL' "$REPORT")"
 emit "Total FORK SWITCH events:  $(grep -c 'FORK SWITCH' "$REPORT")"
 emit "Total HANG SUSPECTED:      $(grep -c 'HANG SUSPECTED' "$REPORT")"
 emit "Total ROLLBACK STORM:      $(grep -c 'ROLLBACK STORM' "$REPORT")"
+emit "Total TIP-AGE STALE:       $(grep -c 'TIP-AGE STALE' "$REPORT")"
+emit "Total TIP-AGE GROWING:     $(grep -c 'TIP-AGE GROWING' "$REPORT")"
 emit "Total BP CRIT events:      $(grep -c 'BP CRIT' "$REPORT")"
 emit "Total FORGE ERROR events:  $(grep -c 'FORGE ERROR' "$REPORT")"
 emit "Total RELAY ERR events:    $(grep -c 'RELAY ERR' "$REPORT")"
