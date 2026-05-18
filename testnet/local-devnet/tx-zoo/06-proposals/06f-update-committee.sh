@@ -19,8 +19,8 @@ cardano-cli conway governance action update-committee \
     --testnet \
     --governance-action-deposit "$GOV_DEPOSIT" \
     --deposit-return-stake-verification-key-file "$WA/stake.vkey" \
-    --anchor-url  "https://example.com/update-committee.json" \
-    --anchor-data-hash "0000000000000000000000000000000000000000000000000000000000000000" \
+    --anchor-url  "$(zoo_anchor_url update-committee)" \
+    --anchor-data-hash "$(zoo_anchor_hash update-committee)" \
     --add-cc-cold-verification-key-file "$CC/cc-cold.vkey" \
     --epoch "$EXPIRES_AT" \
     --threshold "1/2" \

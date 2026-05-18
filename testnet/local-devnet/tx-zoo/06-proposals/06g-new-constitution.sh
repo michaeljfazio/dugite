@@ -15,10 +15,10 @@ cardano-cli conway governance action create-constitution \
     --testnet \
     --governance-action-deposit "$GOV_DEPOSIT" \
     --deposit-return-stake-verification-key-file "$WA/stake.vkey" \
-    --anchor-url  "https://example.com/new-constitution.json" \
-    --anchor-data-hash "0000000000000000000000000000000000000000000000000000000000000000" \
-    --constitution-url  "https://example.com/constitution-body.json" \
-    --constitution-hash "1111111111111111111111111111111111111111111111111111111111111111" \
+    --anchor-url  "$(zoo_anchor_url new-constitution)" \
+    --anchor-data-hash "$(zoo_anchor_hash new-constitution)" \
+    --constitution-url  "$(zoo_anchor_url constitution-body)" \
+    --constitution-hash "$(zoo_anchor_hash constitution-body)" \
     --out-file "$ACTION"
 
 UTXO=$(zoo_largest_utxo "$ADDR") || { zoo_record "$NAME" FAIL "" "no-utxo"; exit 1; }

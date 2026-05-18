@@ -1,18 +1,18 @@
 #!/usr/bin/env bash
 # Build / vendor the Plutus binaries the zoo needs.
 #
-# Strategy:
-#   1. If `aiken` is on PATH, compile minimal "always-true" validators for
-#      Plutus V1/V2/V3 (preferred — uses the canonical Plutus toolchain).
-#   2. Otherwise, write vendored "always-true" cborHex bytes for V1/V2 and
-#      a best-effort V3 candidate. These come from the canonical IOG
-#      cardano-node integration test fixtures (V1, V2) and a hand-built
-#      V3 validator. If V3 spend/mint scripts fail on submit, install
-#      aiken and rerun this script — the V3 wire shape changed several
-#      times during Conway development.
+# V1 and V2 use canonical vendored "always-true" cborHex bytes — these
+# wire shapes are stable and known-good across all post-Conway nodes.
+#
+# V3 has historically been a moving target during Conway development.
+# We require `aiken` on PATH to generate a known-good V3 always-true
+# validator (`spend(_datum, _redeemer, _ctx)` returns True). If aiken
+# is missing, we fall back to a placeholder cborHex and warn — the
+# V3-using scripts (03c/03f/03h) will fail with TooMuchSpace until
+# aiken is installed.
 #
 # Output: $ZOO_LIB/plutus/{always-true-v1,always-true-v2,always-true-v3}.plutus
-# Each is a JSON file matching cardano-cli's --tx-out-script-file expectation.
+# Each is a JSON envelope matching cardano-cli's --tx-out-script-file expectation.
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -21,7 +21,10 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PLUTUS_DIR="$ZOO_LIB/plutus"
 mkdir -p "$PLUTUS_DIR"
 
-write_vendored() {
+# Stable, known-good V1/V2 always-true validators. These have shipped
+# unchanged since the corresponding eras and remain the canonical
+# reference in cardano-node's integration test fixtures.
+write_v1_v2_vendored() {
     cat > "$PLUTUS_DIR/always-true-v1.plutus" <<'EOF'
 {
     "type": "PlutusScriptV1",
@@ -36,73 +39,107 @@ EOF
     "cborHex": "49480100002221200101"
 }
 EOF
-    cat > "$PLUTUS_DIR/always-true-v3.plutus" <<'EOF'
-{
-    "type": "PlutusScriptV3",
-    "description": "always-true (vendored, V3 wire-shape candidate)",
-    "cborHex": "46010100002601"
-}
-EOF
-    zoo_info "wrote vendored always-true V1/V2/V3 to $PLUTUS_DIR"
 }
 
-build_via_aiken() {
+# Build a V3 always-true validator via Aiken. Writes the resulting
+# textEnvelope JSON file to $PLUTUS_DIR/always-true-v3.plutus.
+build_v3_via_aiken() {
     if ! command -v aiken >/dev/null; then
         return 1
     fi
     local work; work="$(mktemp -d)"
-    trap 'rm -rf "$work"' RETURN
-    zoo_info "building Plutus always-true via Aiken in $work"
+    zoo_info "building Plutus V3 always-true via Aiken in $work"
 
-    # Minimal aiken project with three validators, one per Plutus version.
-    # Aiken targets the latest Plutus version by default; we override per file.
     pushd "$work" >/dev/null
-    aiken new tx-zoo/always-true >/dev/null
-    cd tx-zoo/always-true
-    cat > validators/always_true_v1.ak <<'EOF'
-// Aiken's `validator` block targets the configured plutus-version in
-// aiken.toml; we keep one validator and copy the resulting .plutus for
-// each version. For V2/V3 we adjust the type tag post-build.
-validator always_true_v1 {
-  spend(_datum: Data, _redeemer: Data, _purpose: Data, _ctx: Data) {
+    # `aiken new <ns>/<name>` strips the namespace and creates ./<name>/
+    aiken new tx-zoo/always-true-v3 >/dev/null 2>&1 \
+        || { popd >/dev/null; zoo_fail "aiken new failed"; return 1; }
+    cd always-true-v3
+
+    # Conway Plutus V3 validator surface: a real-typed validator from
+    # the stdlib so that the compiled UPLC is wire-valid (the placeholder
+    # `46010100002601` failed deserialisation with TooMuchSpace).
+    # The stdlib bring imports for Credential / PolicyId / Transaction /
+    # OutputReference — we use them as opaque types since the body is
+    # `True` regardless. Removing the default placeholder is required
+    # because the `aiken build` invocation otherwise fails on its
+    # `todo` calls.
+    rm -f validators/placeholder.ak
+    cat > validators/always_true.ak <<'EOF'
+use cardano/address.{Credential}
+use cardano/assets.{PolicyId}
+use cardano/transaction.{Transaction, OutputReference}
+
+validator always_true {
+  mint(_redeemer: Data, _policy_id: PolicyId, _self: Transaction) {
+    True
+  }
+
+  spend(_datum: Option<Data>, _redeemer: Data, _utxo: OutputReference, _self: Transaction) {
+    True
+  }
+
+  withdraw(_redeemer: Data, _account: Credential, _self: Transaction) {
     True
   }
 }
 EOF
-    aiken build >/dev/null 2>&1 || { zoo_skip "aiken build failed — falling back to vendored bytes"; return 1; }
-    local out_hex
-    out_hex=$(jq -r '.cborHex' plutus.json 2>/dev/null | head -1)
-    if [ -z "$out_hex" ]; then
-        zoo_skip "aiken did not produce expected plutus.json — fallback"
+
+    aiken build >/tmp/aiken-build-tx-zoo.log 2>&1 \
+        || { popd >/dev/null; zoo_fail "aiken build failed (see /tmp/aiken-build-tx-zoo.log)"; return 1; }
+
+    # Use `aiken blueprint convert --to cardano-cli` to produce the
+    # exact textEnvelope cardano-cli expects. This DOUBLE-CBOR-wraps
+    # the compiled plutus-core bytes (bytes(N) of bytes(M) of plutus),
+    # matching the encoding cardano-cli reads when loading a script
+    # file. Reading `compiledCode` from `plutus.json` directly yields
+    # only the single-wrapped form and produces a "TooMuchSpace"
+    # deserialisation failure at script load.
+    if ! aiken blueprint convert --module always_true \
+        > "$PLUTUS_DIR/always-true-v3.plutus" 2>/tmp/aiken-convert-tx-zoo.log; then
+        popd >/dev/null
+        rm -rf "$work"
+        zoo_fail "aiken blueprint convert failed (see /tmp/aiken-convert-tx-zoo.log)"
         return 1
     fi
+
     popd >/dev/null
-    # Aiken produces a V3 validator by default; copy with V1/V2/V3 tags so the
-    # downstream scripts can pick. For V1/V2, this only typechecks if the
-    # validator is wire-compatible — for trivial always-true bodies it is.
-    for v in V1 V2 V3; do
-        local label; label=$(echo "$v" | tr 'V' 'v')
-        cat > "$PLUTUS_DIR/always-true-${label}.plutus" <<EOF
-{
-    "type": "PlutusScript${v}",
-    "description": "always-true (aiken-built)",
-    "cborHex": "$out_hex"
-}
-EOF
-    done
-    zoo_info "wrote aiken-built always-true V1/V2/V3 to $PLUTUS_DIR"
+    rm -rf "$work"
+    zoo_ok "wrote aiken-built V3 always-true to $PLUTUS_DIR/always-true-v3.plutus"
     return 0
 }
 
 build_plutus_all() {
-    if [ -s "$PLUTUS_DIR/always-true-v1.plutus" ] \
-       && [ -s "$PLUTUS_DIR/always-true-v2.plutus" ] \
-       && [ -s "$PLUTUS_DIR/always-true-v3.plutus" ]; then
-        zoo_info "plutus binaries already present — skipping rebuild"
-        return 0
+    # V1/V2: always overwrite with the known-good vendored bytes (cheap
+    # and self-healing if a previous run produced bad files).
+    write_v1_v2_vendored
+    zoo_info "wrote vendored V1/V2 always-true to $PLUTUS_DIR"
+
+    # V3: skip the rebuild if the existing file looks plausible
+    # (cborHex starts with 0x59 or 0x58 — bytes tag for a sufficiently
+    # large bytestring matching a real plutus-core script). Otherwise
+    # try aiken.
+    local v3_file="$PLUTUS_DIR/always-true-v3.plutus"
+    if [ -s "$v3_file" ]; then
+        local hex
+        hex=$(jq -r '.cborHex' "$v3_file" 2>/dev/null || true)
+        # Vendored placeholder is "46010100002601" — a 6-byte string.
+        # Real aiken output is 60+ bytes. Use length as a quick filter.
+        if [ -n "$hex" ] && [ "${#hex}" -ge 100 ]; then
+            zoo_info "V3 binary already present (${#hex} hex chars) — skipping rebuild"
+            return 0
+        fi
     fi
-    if ! build_via_aiken; then
-        write_vendored
+
+    if ! build_v3_via_aiken; then
+        zoo_fail "aiken not available — writing placeholder V3 (03c/03f/03h will fail)"
+        cat > "$v3_file" <<'EOF'
+{
+    "type": "PlutusScriptV3",
+    "description": "always-true (PLACEHOLDER — install aiken and rebuild)",
+    "cborHex": "46010100002601"
+}
+EOF
     fi
 }
 

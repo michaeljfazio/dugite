@@ -28,8 +28,8 @@ cardano-cli conway stake-pool registration-certificate \
     --pool-reward-account-verification-key-file "$WA/stake.vkey" \
     --pool-owner-stake-verification-key-file    "$WA/stake.vkey" \
     --single-host-pool-relay 127.0.0.1 --pool-relay-port 3099 \
-    --metadata-url   "https://example.com/pool3.json" \
-    --metadata-hash  "0000000000000000000000000000000000000000000000000000000000000000" \
+    --metadata-url   "$(zoo_anchor_url pool3)" \
+    --metadata-hash  "$(zoo_anchor_hash pool3)" \
     --testnet-magic  "$LD_MAGIC" \
     --out-file       "$REG_CERT"
 cardano-cli conway stake-address stake-delegation-certificate \

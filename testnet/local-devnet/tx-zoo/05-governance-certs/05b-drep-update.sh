@@ -12,8 +12,8 @@ ADDR=$(cat "$WA/payment-stake.addr")
 CERT="$ZOO_BUILT/$NAME.cert"
 cardano-cli conway governance drep update-certificate \
     --drep-verification-key-file "$DREP/drep.vkey" \
-    --drep-metadata-url  "https://example.com/drep-1-v2.json" \
-    --drep-metadata-hash "1111111111111111111111111111111111111111111111111111111111111111" \
+    --drep-metadata-url  "$(zoo_anchor_url drep-1-v2)" \
+    --drep-metadata-hash "$(zoo_anchor_hash drep-1-v2)" \
     --out-file "$CERT"
 
 UTXO=$(zoo_largest_utxo "$ADDR") || { zoo_record "$NAME" FAIL "" "no-utxo"; exit 1; }

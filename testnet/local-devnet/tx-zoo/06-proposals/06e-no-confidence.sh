@@ -15,8 +15,8 @@ cardano-cli conway governance action create-no-confidence \
     --testnet \
     --governance-action-deposit "$GOV_DEPOSIT" \
     --deposit-return-stake-verification-key-file "$WA/stake.vkey" \
-    --anchor-url  "https://example.com/no-confidence.json" \
-    --anchor-data-hash "0000000000000000000000000000000000000000000000000000000000000000" \
+    --anchor-url  "$(zoo_anchor_url no-confidence)" \
+    --anchor-data-hash "$(zoo_anchor_hash no-confidence)" \
     --out-file "$ACTION"
 
 UTXO=$(zoo_largest_utxo "$ADDR") || { zoo_record "$NAME" FAIL "" "no-utxo"; exit 1; }

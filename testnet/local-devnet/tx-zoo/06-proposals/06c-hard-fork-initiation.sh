@@ -17,8 +17,8 @@ cardano-cli conway governance action create-hardfork \
     --testnet \
     --governance-action-deposit "$GOV_DEPOSIT" \
     --deposit-return-stake-verification-key-file "$WA/stake.vkey" \
-    --anchor-url  "https://example.com/hardfork.json" \
-    --anchor-data-hash "0000000000000000000000000000000000000000000000000000000000000000" \
+    --anchor-url  "$(zoo_anchor_url hardfork)" \
+    --anchor-data-hash "$(zoo_anchor_hash hardfork)" \
     --protocol-major-version "$NEW_PV_MAJOR" \
     --protocol-minor-version 0 \
     --out-file "$ACTION"

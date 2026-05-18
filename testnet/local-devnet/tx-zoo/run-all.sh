@@ -99,6 +99,13 @@ zoo_require_devnet
 > "$ZOO_RESULTS_CSV"
 echo "ts,name,status,txid,detail" > "$ZOO_RESULTS_CSV"
 
+# cardano-cli 11.0 fetches --anchor-url / --metadata-url / --drep-metadata-url
+# at build time and validates the downloaded content against the supplied hash.
+# Stand up a local HTTP server that serves predictable anchor JSON files so
+# cert-/proposal-create scripts don't crash on placeholder URLs (#515 follow-up).
+zoo_anchor_start
+trap 'zoo_anchor_stop' EXIT
+
 EXIT_RC=0
 for cat in "${SELECTED[@]}"; do
     cat_dir="$SCRIPT_DIR/$cat"

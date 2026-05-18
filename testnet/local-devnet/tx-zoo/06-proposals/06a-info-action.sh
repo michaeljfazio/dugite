@@ -16,8 +16,8 @@ cardano-cli conway governance action create-info \
     --testnet \
     --governance-action-deposit "$GOV_DEPOSIT" \
     --deposit-return-stake-verification-key-file "$WA/stake.vkey" \
-    --anchor-url  "https://example.com/info-action.json" \
-    --anchor-data-hash "0000000000000000000000000000000000000000000000000000000000000000" \
+    --anchor-url  "$(zoo_anchor_url info-action)" \
+    --anchor-data-hash "$(zoo_anchor_hash info-action)" \
     --out-file "$ACTION"
 
 UTXO=$(zoo_largest_utxo "$ADDR") || { zoo_record "$NAME" FAIL "" "no-utxo"; exit 1; }
