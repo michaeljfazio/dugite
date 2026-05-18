@@ -27,14 +27,22 @@ fi
 
 if [[ ! -d "./db-mainnet/immutable" ]]; then
     echo "Database empty. Importing Mithril snapshot (~35 GB, may take 30+ minutes)..."
-    # On failure (stale partial extract, transient network blip) wipe the
-    # dugite-mithril work dir and retry once so unattended soak / Ralph-loop
-    # runs don't die on a single recoverable error.
-    if ! "$BIN" mithril-import --network-magic 764824073 --database-path ./db-mainnet; then
-        WORK_DIR="${TMPDIR:-/tmp}/dugite-mithril"
-        echo "mithril-import failed; clearing $WORK_DIR and retrying once..."
-        rm -rf "$WORK_DIR"
-        "$BIN" mithril-import --network-magic 764824073 --database-path ./db-mainnet
+    # On failure, retry once — but refuse if the disk is full (ENOSPC), and
+    # preserve the snapshot archive so the retry can reuse it.
+    #
+    # The archive is content-addressed (snapshot-<digest>.tar.zst) and dugite-node
+    # skips the download when the file exists with the expected size.  The extract
+    # directory is auto-wiped by the sentinel logic inside dugite-node when a
+    # previous extraction was interrupted, so we do NOT rm -rf the work directory.
+    IMPORT_CMD=("$BIN" mithril-import --network-magic 764824073 --database-path ./db-mainnet)
+    if ! IMPORT_OUTPUT=$("${IMPORT_CMD[@]}" 2>&1); then
+        printf '%s\n' "$IMPORT_OUTPUT" >&2
+        if printf '%s\n' "$IMPORT_OUTPUT" | grep -qi "no space left on device\|ENOSPC"; then
+            echo "ERROR: mithril-import failed: disk full (ENOSPC). Free up space and retry." >&2
+            exit 1
+        fi
+        echo "mithril-import failed; retrying once (archive cache preserved)..."
+        "${IMPORT_CMD[@]}"
     fi
 fi
 

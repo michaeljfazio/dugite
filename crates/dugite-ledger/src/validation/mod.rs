@@ -2163,8 +2163,7 @@ pub fn validate_transaction_with_pools(
                     ..
                 } => Some(*pool_hash),
                 dugite_primitives::transaction::Certificate::PoolRetirement {
-                    pool_hash,
-                    ..
+                    pool_hash, ..
                 } => Some(*pool_hash),
                 _ => None,
             };
