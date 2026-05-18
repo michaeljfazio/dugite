@@ -283,7 +283,7 @@ mod tests {
     fn format_row_default_appends_default_marker() {
         let n = node(
             7,
-            "config/mainnet-config.json",
+            "config/mainnet/config.json",
             ConfigSource::Default,
             ConfigStatus::Missing,
             None,
