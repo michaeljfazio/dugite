@@ -881,26 +881,42 @@ impl ConwayGenesis {
         }
 
         // PlutusV2 cost model: if not already set from Alonzo genesis or
-        // on-chain protocol parameter updates, set from the well-known
-        // Babbage-era values. V2 was introduced at the Alonzo→Babbage hard fork.
-        // In Haskell, translateEraPParams adds V2 during era transition.
-        // The values below match the canonical Babbage cost model used on
-        // mainnet, preview, and preprod.
+        // on-chain protocol parameter updates, fall back to the initial V2
+        // values cardano-node uses when no V2 is present in genesis files.
+        //
+        // These are the pre-Babbage `defaultV2CostModel` values from
+        // `cardano-api/src/Cardano/Api/Genesis/Internal.hs` — the V2 cost
+        // model as introduced at the Alonzo→Babbage HFC. They share the
+        // first ~133 entries with V1 (V2 inherited V1's pricing for
+        // pre-existing builtins and added new ones on top), then diverge
+        // with `serialiseData`, `keccak256`, `blake2b224`, etc.
+        //
+        // On mainnet/preview/preprod, a Babbage-era ParameterChange action
+        // updated V2 to the values starting `[100788, 420, ...]` —
+        // dugite's on-chain `apply_protocol_param_update` applies that
+        // automatically during sync, so we converge with public networks
+        // after that epoch.
+        //
+        // On a Conway-direct devnet (cardano-testnet), no such
+        // ParameterChange has ever run, so these initial values remain
+        // authoritative. Using the post-Babbage values here would break
+        // script integrity hash validation against cardano-node, which
+        // computes `LangDepView` from these initial values.
         if params.cost_models.plutus_v2.is_none() {
-            debug!("PlutusV2 cost model not set — loading standard Babbage values");
+            debug!("PlutusV2 cost model not set — loading pre-Babbage defaultV2CostModel");
             params.cost_models.plutus_v2 = Some(vec![
-                100788, 420, 1, 1, 1000, 173, 0, 1, 1000, 59957, 4, 1, 11183, 32, 201305, 8356, 4,
-                16000, 100, 16000, 100, 16000, 100, 16000, 100, 16000, 100, 16000, 100, 100, 100,
-                16000, 100, 94375, 32, 132994, 32, 61462, 4, 72010, 178, 0, 1, 22151, 32, 91189,
-                769, 4, 2, 85848, 228465, 122, 0, 1, 1, 1000, 42921, 4, 2, 24548, 29498, 38, 1,
-                898148, 27279, 1, 51775, 558, 1, 39184, 1000, 60594, 1, 141895, 32, 83150, 32,
-                15299, 32, 76049, 1, 13169, 4, 22100, 10, 28999, 74, 1, 28999, 74, 1, 43285, 552,
-                1, 44749, 541, 1, 33852, 32, 68246, 32, 72362, 32, 7243, 32, 7391, 32, 11546, 32,
-                85848, 228465, 122, 0, 1, 1, 90434, 519, 0, 1, 74433, 32, 85848, 228465, 122, 0, 1,
-                1, 85848, 228465, 122, 0, 1, 1, 955506, 213312, 0, 2, 270652, 22588, 4, 1457325,
-                64566, 4, 20467, 1, 4, 0, 141992, 32, 100788, 420, 1, 1, 81663, 32, 59498, 32,
-                20142, 32, 24588, 32, 20744, 32, 25933, 32, 24623, 32, 43053543, 10, 53384111,
-                14333, 10, 43574283, 26308, 10,
+                205665, 812, 1, 1, 1000, 571, 0, 1, 1000, 24177, 4, 1, 1000, 32, 117366, 10475, 4,
+                23000, 100, 23000, 100, 23000, 100, 23000, 100, 23000, 100, 23000, 100, 100, 100,
+                23000, 100, 19537, 32, 175354, 32, 46417, 4, 221973, 511, 0, 1, 89141, 32, 497525,
+                14068, 4, 2, 196500, 453240, 220, 0, 1, 1, 1000, 28662, 4, 2, 245000, 216773, 62,
+                1, 1060367, 12586, 1, 208512, 421, 1, 187000, 1000, 52998, 1, 80436, 32, 43249, 32,
+                1000, 32, 80556, 1, 57667, 4, 1000, 10, 197145, 156, 1, 197145, 156, 1, 204924,
+                473, 1, 208896, 511, 1, 52467, 32, 64832, 32, 65493, 32, 22558, 32, 16563, 32,
+                76511, 32, 196500, 453240, 220, 0, 1, 1, 69522, 11687, 0, 1, 60091, 32, 196500,
+                453240, 220, 0, 1, 1, 196500, 453240, 220, 0, 1, 1, 1159724, 392670, 0, 2, 806990,
+                30482, 4, 1927926, 82523, 4, 265318, 0, 4, 0, 85931, 32, 205665, 812, 1, 1, 41182,
+                32, 212342, 32, 31220, 32, 32696, 32, 43357, 32, 32247, 32, 38314, 32, 35892428,
+                10, 9462713, 1021, 10, 38887044, 32947, 10,
             ]);
         }
 
