@@ -43,26 +43,36 @@ jq -s '.[0] * .[1]' \
     "$TMP_DEFAULTS/defaults/conway-genesis.json" \
     "$LD_CONFIG/spec/conway-spec.json" > "$TMP_SPEC/conway-spec.json"
 
-# Step B.5: pre-generate a Constitutional Committee key pair so we can patch
+# Step B.5: pre-generate TWO Constitutional Committee key pairs so we can patch
 # the conway-genesis.json after Step D. cardano-cli 11.0.0's
 # create-testnet-data IGNORES the `committee` field in its --spec-conway
 # input — it always emits members={} and threshold=0 regardless of what the
-# spec says. To bootstrap a real seated CC member we have to post-process the
+# spec says. To bootstrap real seated CC members we have to post-process the
 # generated conway-genesis.json *before* we hash it (Step D.5 below).
-log_info "Pre-generating CC member keys (cc-1)"
-mkdir -p "$LD_KEYS/cc-1"
-cardano-cli conway governance committee key-gen-cold \
-    --verification-key-file "$LD_KEYS/cc-1/cc-cold.vkey" \
-    --cold-signing-key-file "$LD_KEYS/cc-1/cc-cold.skey"
-cardano-cli conway governance committee key-gen-hot \
-    --verification-key-file "$LD_KEYS/cc-1/cc-hot.vkey" \
-    --signing-key-file      "$LD_KEYS/cc-1/cc-hot.skey"
-CC_COLD_HASH="$(cardano-cli conway governance committee key-hash \
+#
+# Two members are seated so the tx-zoo can exercise both wire paths in the
+# same run: cc-1 is authorised by 05g and resigned by 05h (testing the
+# authorize+resign cert paths); cc-2 stays authorised through the run so
+# 07f/07g can vote with a hot key that remains attached to a live seated
+# member after 05h retires cc-1.
+log_info "Pre-generating CC member keys (cc-1, cc-2)"
+for cc in cc-1 cc-2; do
+    mkdir -p "$LD_KEYS/$cc"
+    cardano-cli conway governance committee key-gen-cold \
+        --verification-key-file "$LD_KEYS/$cc/cc-cold.vkey" \
+        --cold-signing-key-file "$LD_KEYS/$cc/cc-cold.skey"
+    cardano-cli conway governance committee key-gen-hot \
+        --verification-key-file "$LD_KEYS/$cc/cc-hot.vkey" \
+        --signing-key-file      "$LD_KEYS/$cc/cc-hot.skey"
+done
+CC1_COLD_HASH="$(cardano-cli conway governance committee key-hash \
                 --verification-key-file "$LD_KEYS/cc-1/cc-cold.vkey")"
+CC2_COLD_HASH="$(cardano-cli conway governance committee key-hash \
+                --verification-key-file "$LD_KEYS/cc-2/cc-cold.vkey")"
 # Pick an expiry epoch well past anything a soak/zoo run will reach
 # (govActionLifetime + committeeMaxTermLength = 6 + 73 = 79 epochs upper bound).
 CC_EXPIRY_EPOCH=1000
-log_info "CC cold-key hash: $CC_COLD_HASH (expiry epoch $CC_EXPIRY_EPOCH)"
+log_info "CC cold-key hashes: cc-1=$CC1_COLD_HASH cc-2=$CC2_COLD_HASH (expiry epoch $CC_EXPIRY_EPOCH)"
 
 # Step C: write the on-chain pool relay descriptor.
 # cardano-cli 11.0.0.0 expects a Map keyed by pool index (Word) → array of relay entries,
@@ -132,17 +142,20 @@ log_info "stake-pool delegation counts: $(jq -c '
     .staking.stake | to_entries | group_by(.value) | map({pool: .[0].value, n: length})
 ' "$LD_GENESIS/shelley-genesis.json")"
 
-# Step D.5: patch the conway-genesis.json to seat the CC member (and set a
+# Step D.5: patch the conway-genesis.json to seat both CC members (and set a
 # matching threshold). cardano-cli omits this field on output, so we inject
 # it post-hoc before any hash is taken. The hash recorded into
 # genesis-hashes.env will reflect this patched content, so nodes will boot
 # with a properly populated committee. cardano-spec threshold is a Rational;
-# we pick 1/1 so a single CC vote is enough for ratification (the tx-zoo only
-# seats one member).
-log_info "Patching conway-genesis.json to seat CC member cc-1"
-jq --arg cred "keyHash-${CC_COLD_HASH}" --argjson exp "$CC_EXPIRY_EPOCH" \
-   '.committee.members = {($cred): $exp}
-    | .committee.threshold = {"numerator": 1, "denominator": 1}' \
+# we pick 1/2 so a single CC vote is enough for ratification (the tx-zoo only
+# casts one vote per action) and so the committee remains viable after 05h
+# retires cc-1 (one of two ⇒ one of one ⇒ 100% ≥ 50%).
+log_info "Patching conway-genesis.json to seat CC members cc-1 + cc-2"
+jq --arg cred1 "keyHash-${CC1_COLD_HASH}" \
+   --arg cred2 "keyHash-${CC2_COLD_HASH}" \
+   --argjson exp "$CC_EXPIRY_EPOCH" \
+   '.committee.members = {($cred1): $exp, ($cred2): $exp}
+    | .committee.threshold = {"numerator": 1, "denominator": 2}' \
    "$LD_GENESIS/conway-genesis.json" > "$LD_GENESIS/conway-genesis.patched.json"
 mv "$LD_GENESIS/conway-genesis.patched.json" "$LD_GENESIS/conway-genesis.json"
 log_info "conway-genesis.committee now: $(jq -c .committee "$LD_GENESIS/conway-genesis.json")"
@@ -151,8 +164,9 @@ log_info "conway-genesis.committee now: $(jq -c .committee "$LD_GENESIS/conway-g
 log_info "Reorganizing keys into testnet/local-devnet/keys/"
 
 mkdir -p "$LD_KEYS/pool1" "$LD_KEYS/pool2" "$LD_KEYS/utxo" "$LD_KEYS/genesis-keys"
-# $LD_KEYS/cc-1 was already created earlier when we bootstrapped the CC member;
-# keep its tightened perms in the chmod sweep below.
+# $LD_KEYS/cc-1 and $LD_KEYS/cc-2 were already created earlier when we
+# bootstrapped the CC members; keep their tightened perms in the chmod
+# sweep below.
 
 # Pools — cardano-cli writes them as pool1/, pool2/ inside pools-keys/.
 # Note: cardano-cli 11.0.0.0 emits the operational counter as opcert.counter
@@ -195,7 +209,8 @@ fi
 cp -R "$LD_GENESIS"/genesis-keys/* "$LD_KEYS/genesis-keys/" 2>/dev/null || true
 
 # Tighten permissions
-chmod 0700 "$LD_KEYS" "$LD_KEYS"/pool* "$LD_KEYS/utxo" "$LD_KEYS/genesis-keys" "$LD_KEYS/cc-1"
+chmod 0700 "$LD_KEYS" "$LD_KEYS"/pool* "$LD_KEYS/utxo" "$LD_KEYS/genesis-keys" \
+           "$LD_KEYS/cc-1" "$LD_KEYS/cc-2"
 find "$LD_KEYS" -name '*.skey' -exec chmod 0600 {} \;
 
 log_info "Keys reorganized; payment address: $(cat "$LD_KEYS/utxo/payment.addr")"

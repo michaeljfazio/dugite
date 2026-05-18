@@ -1,7 +1,11 @@
 #!/usr/bin/env bash
-# 07f — CC hot-key (cc-1) votes YES on the InfoAction. Requires the CC hot
+# 07f — CC hot-key (cc-2) votes YES on the InfoAction. Requires the CC hot
 # key to be authorized via 05g; otherwise the build fails and the script
 # records SKIP.
+#
+# Uses cc-2 (not cc-1) so the vote still goes through after 05h-cc-resign
+# retires cc-1. Both CC members are seated at genesis by setup.sh and 05g
+# authorises both hot keys in a single tx.
 set -euo pipefail
 ZOO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 . "$ZOO_DIR/lib/tx-zoo-common.sh"
@@ -10,7 +14,7 @@ ZOO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 NAME="$(zoo_name)"
 zoo_require_devnet
 ACTION=$(zoo_gov_action_id) || { zoo_skip "no action"; zoo_record "$NAME" SKIP; exit 0; }
-CC="$ZOO_KEYS/cc-1"
+CC="$ZOO_KEYS/cc-2"
 WA="$ZOO_KEYS/wallet-a"
 ADDR=$(cat "$WA/payment-stake.addr")
 
@@ -32,7 +36,7 @@ if ! cardano-cli conway transaction build \
         --change-address "$ADDR" \
         --vote-file     "$VOTE" \
         --out-file      "$RAW" 2> "$ZOO_LOGS/$NAME.err" ; then
-    zoo_skip "build rejected (cc-1 hot key likely not authorized): $(tail -1 "$ZOO_LOGS/$NAME.err")"
+    zoo_skip "build rejected (cc-2 hot key likely not authorized): $(tail -1 "$ZOO_LOGS/$NAME.err")"
     zoo_record "$NAME" SKIP "" "cc-not-authorized"
     exit 0
 fi

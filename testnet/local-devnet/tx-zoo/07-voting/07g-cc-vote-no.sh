@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# 07g — CC hot-key (cc-1) votes NO on the InfoAction. Same auth caveat as 07f.
+# 07g — CC hot-key (cc-2) votes NO on the InfoAction. Same auth caveat as 07f.
+# Uses cc-2 so the vote still goes through after 05h-cc-resign retires cc-1.
 set -euo pipefail
 ZOO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 . "$ZOO_DIR/lib/tx-zoo-common.sh"
@@ -8,7 +9,7 @@ ZOO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 NAME="$(zoo_name)"
 zoo_require_devnet
 ACTION=$(zoo_gov_action_id) || { zoo_skip "no action"; zoo_record "$NAME" SKIP; exit 0; }
-CC="$ZOO_KEYS/cc-1"
+CC="$ZOO_KEYS/cc-2"
 WA="$ZOO_KEYS/wallet-a"
 ADDR=$(cat "$WA/payment-stake.addr")
 

@@ -38,7 +38,11 @@ else
         --signing-key-file "$DREP/drep.skey" \
         --out-file "$ZOO_BUILT/$NAME-reg.signed" >/dev/null
     REG_TXID=$(zoo_submit "$ZOO_BUILT/$NAME-reg.signed") || { zoo_record "$NAME" FAIL "" "reg-submit"; exit 1; }
-    zoo_wait_inclusion "$REG_TXID" 60 || { zoo_record "$NAME" FAIL "$REG_TXID" "reg-not-incl"; exit 1; }
+    # Change output is at wallet-a's payment-stake addr ($ADDR), NOT the
+    # default genesis utxo addr that zoo_wait_inclusion would otherwise
+    # search. Without this 3rd-arg the wait always times out as
+    # `reg-not-incl` even when the tx is forged 1-2 slots later.
+    zoo_wait_inclusion "$REG_TXID" 60 "$ADDR" || { zoo_record "$NAME" FAIL "$REG_TXID" "reg-not-incl"; exit 1; }
 fi
 
 CERT="$ZOO_BUILT/$NAME.cert"
