@@ -14,8 +14,8 @@ dugite-node run [OPTIONS]
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `--config` | `config/mainnet-config.json` | Path to the node configuration file |
-| `--topology` | `config/mainnet-topology.json` | Path to the topology file |
+| `--config` | `config/mainnet/config.json` | Path to the node configuration file |
+| `--topology` | `config/mainnet/topology.json` | Path to the topology file |
 | `--database-path` | `db` | Path to the database directory |
 | `--socket-path` | `node.sock` | Unix domain socket path for N2C (local client) connections |
 | `--port` | `3001` | TCP port for N2N (node-to-node) connections |
@@ -48,8 +48,8 @@ Run as a relay node with no block production keys:
 
 ```bash
 dugite-node run \
-  --config config/preview-config.json \
-  --topology config/preview-topology.json \
+  --config config/preview/config.json \
+  --topology config/preview/topology.json \
   --database-path ./db-preview \
   --socket-path ./node.sock \
   --host-addr 0.0.0.0 \
@@ -62,8 +62,8 @@ Run as a block producer by providing all three key/certificate paths:
 
 ```bash
 dugite-node run \
-  --config config/preview-config.json \
-  --topology config/preview-topology.json \
+  --config config/preview/config.json \
+  --topology config/preview/topology.json \
   --database-path ./db-preview \
   --socket-path ./node.sock \
   --host-addr 0.0.0.0 \
@@ -146,8 +146,8 @@ dugite-node mithril-import \
 
 # Then start the node to sync from the snapshot to tip
 dugite-node run \
-  --config config/preview-config.json \
-  --topology config/preview-topology.json \
+  --config config/preview/config.json \
+  --topology config/preview/topology.json \
   --database-path ./db-preview \
   --socket-path ./node.sock
 ```

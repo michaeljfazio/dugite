@@ -68,8 +68,8 @@ if ! "$DUGITE_CLI_PATH" query tip --socket-path "$SOCKET" &>/dev/null; then
     echo ""
     echo "--- Node not running. Checking for config..."
 
-    CONFIG="${DUGITE_CONFIG:-$PROJECT_ROOT/config/preview-config.json}"
-    TOPOLOGY="${DUGITE_TOPOLOGY:-$PROJECT_ROOT/config/preview-topology.json}"
+    CONFIG="${DUGITE_CONFIG:-$PROJECT_ROOT/config/preview/config.json}"
+    TOPOLOGY="${DUGITE_TOPOLOGY:-$PROJECT_ROOT/config/preview/topology.json}"
     DB_PATH="${DUGITE_DB_PATH:-$PROJECT_ROOT/db-preview}"
 
     if [ ! -f "$CONFIG" ]; then

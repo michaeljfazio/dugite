@@ -17,7 +17,7 @@ Genesis mode is opt-in via the `--consensus-mode genesis` CLI flag:
 ```bash
 dugite-node run \
   --consensus-mode genesis \
-  --config config/preview-config.json \
+  --config config/preview/config.json \
   ...
 ```
 
@@ -53,5 +53,5 @@ The recommended deployment path uses Mithril snapshot import for fast sync with 
 dugite-node mithril-import --network-magic 2 --database-path ./db
 
 # Then run in default praos mode
-dugite-node run --config config/preview-config.json --database-path ./db ...
+dugite-node run --config config/preview/config.json --database-path ./db ...
 ```
