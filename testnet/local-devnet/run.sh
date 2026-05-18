@@ -62,12 +62,17 @@ echo $! > "$LD_STATE/dugite-relay.pid"
 log_info "dugite-relay PID $(cat "$LD_STATE/dugite-relay.pid")"
 
 # ---- cardano-bp ----
-# cardano-node 11.0.1 only reads pool key paths from CLI flags, not from
-# ShelleyKesKeyFile / ShelleyVrfKeyFile / ShelleyOperationalCertificateFile
-# in the config JSON. Without these flags the node silently runs as a
-# non-producing relay (ncProtocolFiles all Nothing) and the chain never
-# advances. Pass them explicitly.
-log_info "Starting cardano-bp on port $LD_CARDANO_BP_PORT (pool2)"
+# cardano-bp runs as a non-forging relay so we never get asymmetric
+# forks between the two BPs racing for the same height. cardano-node
+# 11.0.1 only treats a node as a forger when --shelley-kes-key /
+# --shelley-vrf-key / --shelley-operational-certificate are passed
+# explicitly (the config file is ignored for these); omitting them
+# means ncProtocolFiles is all Nothing and the node runs as a passive
+# chainsync+blockfetch validator. This gives us byte-exact Haskell
+# cross-validation of every dugite-forged block without any chain
+# divergence risk. Setup.sh redirects all 20 stake-delegators to
+# pool1 so pool2 has no active stake (its absence here is fine).
+log_info "Starting cardano-bp on port $LD_CARDANO_BP_PORT (relay / validator only)"
 cardano-node run \
     --config        "$LD_CONFIG/cardano-bp.config.json" \
     --topology      "$LD_CONFIG/cardano-bp.topology.json" \
@@ -75,9 +80,6 @@ cardano-node run \
     --socket-path   "$LD_CARDANO_BP_SOCK" \
     --host-addr     127.0.0.1 \
     --port          "$LD_CARDANO_BP_PORT" \
-    --shelley-kes-key                 "$LD_KEYS/pool2/kes.skey" \
-    --shelley-vrf-key                 "$LD_KEYS/pool2/vrf.skey" \
-    --shelley-operational-certificate "$LD_KEYS/pool2/opcert.cert" \
     > "$LD_LOGS/cardano-bp.log" 2>&1 &
 echo $! > "$LD_STATE/cardano-bp.pid"
 log_info "cardano-bp PID $(cat "$LD_STATE/cardano-bp.pid")"
@@ -86,29 +88,12 @@ log_info "cardano-bp PID $(cat "$LD_STATE/cardano-bp.pid")"
 wait_for_socket "$LD_RELAY_SOCK"      120
 wait_for_socket "$LD_CARDANO_BP_SOCK" 120
 
-# Wait for the relay's chain to advance past slot 0. cardano-bp forges blocks
-# and pushes them to the relay over N2N; once the relay's tip slot > 0, we
-# know the relay has accepted at least one cardano-bp block and is no longer
-# at origin.
-log_info "Waiting for dugite-relay chain to advance past slot 0 (Bug-A workaround)"
-STAGGER_TIMEOUT=120
-i=0
-while [ $i -lt "$STAGGER_TIMEOUT" ]; do
-    relay_slot="$(query_slot "$LD_RELAY_SOCK" 2>/dev/null || echo 0)"
-    # Treat non-numeric as 0
-    case "$relay_slot" in
-        ''|*[!0-9]*) relay_slot=0 ;;
-    esac
-    if [ "$relay_slot" -gt 0 ]; then
-        log_info "dugite-relay tip slot=$relay_slot after ${i}s — proceeding to start dugite-bp"
-        break
-    fi
-    sleep 1
-    i=$((i + 1))
-done
-if [ "$i" -ge "$STAGGER_TIMEOUT" ]; then
-    die "dugite-relay did not see any cardano-bp block within ${STAGGER_TIMEOUT}s — aborting"
-fi
+# The original "Bug-A workaround" stagger that waited for cardano-bp to
+# push a block into the relay is no longer needed: cardano-bp now runs
+# as a validator (no forging keys), so dugite-bp is the sole producer.
+# Both relay and dugite-bp start at origin and the relay advances from
+# dugite-bp's own forges — the stale-intersection class can't fire
+# because dugite-bp's own chain is always at the producing edge.
 
 # ---- dugite-bp ----
 # Metrics on default port 12798 so `dugite-monitor` works without overrides.

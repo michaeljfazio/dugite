@@ -2,27 +2,42 @@
 
 A 3-node loopback testnet for verifying dugite block production and diffusion
 against the Haskell reference implementation. One dugite block producer, one
-dugite relay, and one cardano-node block producer, all on the same machine,
-all on the loopback interface — both BPs connect to the network only through
+dugite relay, and one cardano-node validator (relay role), all on the same
+machine, all on the loopback interface — the cardano-node connects through
 the dugite relay.
 
 ## What this is
 
 ```mermaid
 graph LR
-  dbp[dugite-bp<br/>N2N 3001<br/>metrics 12798<br/>pool1] <--> dr[dugite-relay<br/>N2N 3002<br/>metrics 12799<br/>hub]
-  dr <--> cbp[cardano-node bp<br/>N2N 3003<br/>pool2]
+  dbp[dugite-bp<br/>N2N 3001<br/>metrics 12798<br/>pool1 — sole forger] <--> dr[dugite-relay<br/>N2N 3002<br/>metrics 12799<br/>hub]
+  dr <--> cbp[cardano-node<br/>N2N 3003<br/>validator only]
 ```
 
-The dugite relay is the only path between the two BPs. A block forged by
-dugite-bp must transit dugite-relay's BlockFetch server before cardano-bp
-can fetch it (and vice versa). This is what the soak test exercises.
+dugite-bp is the **sole block producer**. cardano-node runs as a passive
+validator (no forging keys passed) and chainsync+blockfetches every block
+forged by dugite-bp, applying each one through the Haskell ledger. This
+gives us byte-exact cross-validation of dugite's forged blocks against the
+reference implementation with **zero risk of asymmetric forks** (no two
+forgers competing for the same height).
 
-The chain boots into Conway PV10 from a fresh genesis with two equally-staked
-pools, 1-second slots, `activeSlotsCoeff = 0.2`, `epochLength = 200`, and
-`securityParam = 10`. Blocks are minted every ~5 seconds on average and an
-epoch elapses every ~3.3 minutes, so the 30-minute soak crosses ~9 epoch
-boundaries (enough for reward distribution to complete before the soak ends).
+The chain boots into Conway PV10 from a fresh genesis with a single
+forging pool (pool1, 100% of active stake; pool2's keys exist but its
+stake is 0), 1-second slots, `activeSlotsCoeff = 0.2`, `epochLength = 200`,
+and `securityParam = 10`. Blocks are minted every ~5 seconds on average
+and an epoch elapses every ~3.3 minutes, so the 30-minute soak crosses
+~9 epoch boundaries (enough for reward distribution to complete before
+the soak ends).
+
+> **Historical note:** prior to 2026-05-18, cardano-node also ran as a
+> forger (pool2, equal stake) for symmetric multi-forger cross-validation.
+> That topology produced an asymmetric-fork class that no per-tx test
+> could survive: the slower side's leader-slot timer fired before
+> propagation completed and each pool ended up on its own short chain
+> permanently (first-seen tiebreaker, equal lengths). Making
+> cardano-node a validator eliminates that class entirely while
+> preserving the cross-validation we actually rely on (does cardano-node
+> accept every dugite block byte-for-byte?).
 
 ## Prerequisites
 
@@ -125,7 +140,7 @@ The verifier evaluates four pass/fail predicates and writes
 | # | Predicate | Pass condition |
 |---|-----------|----------------|
 | 1 | **Block forge cross-check** | Every confirmed (slot, hash) pair is seen by all three observers in `blocks.csv`. (Most-recent 10 blocks are excluded from the check to allow rollback grace.) |
-| 2 | **Per-BP forge attribution** | Both pools forged >= 3 blocks each. Expected ~180 each at f=0.2, sigma=0.5 — failure at 3 is a real wiring bug, not a slot-lottery flake. |
+| 2 | **Per-BP forge attribution** | dugite-bp forged >= 3 blocks; cardano-node forged 0 (it's a validator). Expected ~360 by dugite-bp at f=0.2, σ=1.0 — failure at 3 is a real wiring bug, not a slot-lottery flake. Any forge events attributed to a non-dugite-bp issuer are a setup error. |
 | 3 | **Transaction inclusion round-trip** | Every submitted tx has `submit_rc=0` and (when run with the devnet up) appears in all three nodes' UTxO sets at the genesis payment address. |
 | 4 | **Tip parity over time** | At >=95% of 5-second ticks (excluding the first 60s warmup), all three nodes report tips within 2 blocks of each other. |
 
@@ -144,9 +159,9 @@ test fixtures:
 
 | Process | N2N | Metrics | Socket | Config | Topology |
 |---------|-----|---------|--------|--------|----------|
-| `dugite-bp` (pool1) | 3001 | 12798 | `dugite-bp.sock` | `dugite-bp.config.json` | `dugite-bp.topology.json` |
+| `dugite-bp` (pool1, sole forger) | 3001 | 12798 | `dugite-bp.sock` | `dugite-bp.config.json` | `dugite-bp.topology.json` |
 | `dugite-relay` (hub) | 3002 | 12799 | `dugite-relay.sock` | `dugite-relay.config.json` | `dugite-relay.topology.json` |
-| `cardano-node bp` (pool2) | 3003 | — | `cardano-bp.sock` | `cardano-bp.config.json` | `cardano-bp.topology.json` |
+| `cardano-node` (validator) | 3003 | — | `cardano-bp.sock` | `cardano-bp.config.json` | `cardano-bp.topology.json` |
 
 The devnet uses the standard Cardano N2N port (3001) for `dugite-bp` and
 single-digit increments for the relay (3002) and the Haskell BP (3003). The
@@ -172,9 +187,9 @@ port:
 ./target/release/dugite-monitor --metrics-url http://localhost:12799/metrics
 ```
 
-The `cardano-node` BP does not expose a Prometheus endpoint in this devnet
-(its EKG/Prometheus exporters are disabled to keep the configuration minimal
-and avoid port collisions).
+The `cardano-node` validator does not expose a Prometheus endpoint in this
+devnet (its EKG/Prometheus exporters are disabled to keep the configuration
+minimal and avoid port collisions).
 
 ## Configuration reference
 
@@ -210,17 +225,21 @@ to 10.0 so the chain boots straight into Conway.
 ## What this validates
 
 - Dugite block production end-to-end (forge -> adopt -> diffuse)
-- Dugite relay's bidirectional ChainSync/BlockFetch (Haskell <-> Rust <-> Haskell)
+- Dugite relay's ChainSync/BlockFetch serving (Rust -> Haskell validator)
 - Dugite N2N peer connection lifecycle on loopback
 - Dugite N2C local-socket tx submission, query tip, query utxo
-- Cross-implementation chain agreement under healthy conditions
+- Byte-exact acceptance of every dugite-forged block by cardano-node 11.0.1+
+  (the Haskell ledger applies each block; any header / body / Conway
+  predicate mismatch surfaces as a `ChainDB.AddBlockValidation.InvalidBlock`
+  trace in `logs/cardano-bp.log`)
 
 ## What this does NOT validate
 
 - Byron-era code paths (chain boots in Conway)
 - Hard-fork combinator era transitions (none occur during the soak)
 - Multi-relay diffusion topologies (single hub)
-- Plutus phase-2 / governance enactment (no proposals or scripts)
+- Plutus phase-2 / governance enactment (no proposals or scripts in the soak; the tx-zoo covers governance under a separate driver)
+- Symmetric multi-forger chain selection (cardano-node is a validator here, not a forger — see "Historical note" at top)
 - Mainnet-scale peer counts, NAT/firewall behaviour, or BGP-level routing
 - Mithril snapshot import (covered by other tests)
 

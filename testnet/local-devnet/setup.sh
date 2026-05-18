@@ -76,13 +76,25 @@ EOF
 
 # Step D: generate the real testnet data with our merged spec.
 #
-# We use 20 stake-delegators so that we can skew stake 19:1 toward pool1
-# (dugite-bp) in Step D.4 below. Equal-stake (10:10 = 50/50) between the
-# two pools produces constant chain divergence — both forge at the same
-# rate and the relay's chain selection flips between forks ~every block.
-# Skewing 95/5 means dugite-bp wins ~95% of leader lotteries, forks
-# happen rarely and never on consecutive blocks, but cardano-bp still
-# occasionally forges so we keep the Haskell-side cross-validation.
+# Two pools are generated (so the keys exist for any cross-validation
+# tooling that wants to address them), but ALL 20 stake-delegators are
+# redirected to pool1 in Step D.4 below. pool2 has zero active stake,
+# never wins a leader lottery, and cardano-bp runs as a non-forging
+# validator (relay role) — see run.sh, which omits the
+# --shelley-{kes,vrf,operational-certificate} flags for cardano-bp.
+#
+# Rationale: equal-stake (10:10) between the two pools produces
+# constant chain divergence — both forge at the same rate and the
+# relay's chain selection flips between forks ~every block. Even with
+# a heavy 95/5 skew, the 5% pool occasionally beats the propagation
+# window and produces a competing block at the same height
+# (cardano-bp forges at its own slot before dugite-bp's block reaches
+# it), creating an asymmetric fork that cardano-bp never resolves
+# (first-seen tiebreaker keeps cardano-bp on its short chain). The
+# clean fix is to make cardano-bp non-forging: dugite-bp is the sole
+# producer, cardano-bp chainsync+blockfetches and applies every block
+# through the Haskell ledger — exact cross-validation, zero
+# divergence possible.
 cardano-cli conway genesis create-testnet-data \
     --spec-shelley "$TMP_SPEC/shelley-spec.json" \
     --spec-conway  "$TMP_SPEC/conway-spec.json" \
@@ -100,27 +112,20 @@ cardano-cli conway genesis create-testnet-data \
 log_info "Genesis generated at $LD_GENESIS"
 ls -1 "$LD_GENESIS"
 
-# Step D.4: skew the stake-delegation map 19:1 toward pool1 (dugite-bp).
-# cardano-cli splits the 20 delegators evenly across the 2 pools (10:10
-# = 50/50 stake). Rewrite the `staking.stake` map so 19 delegators point
-# at pool1's cold-key hash and only 1 stays on pool2's. The change is
-# applied to shelley-genesis.json before the hash is taken in Step E.
+# Step D.4: redirect ALL 20 stake-delegators to pool1. cardano-cli splits
+# the delegators evenly across the two generated pools by default
+# (10:10), but pool2's stake would only be useful if cardano-bp were
+# forging — and we run cardano-bp as a non-forger to eliminate the
+# asymmetric-fork class entirely (see Step D rationale). Giving all
+# stake to pool1 maximises dugite-bp's leader rate.
 POOL1_HEX="$(cardano-cli conway stake-pool id \
     --cold-verification-key-file "$LD_GENESIS/pools-keys/pool1/cold.vkey" \
     --output-hex)"
-POOL2_HEX="$(cardano-cli conway stake-pool id \
-    --cold-verification-key-file "$LD_GENESIS/pools-keys/pool2/cold.vkey" \
-    --output-hex)"
-log_info "Skewing stake 19:1 toward pool1=$POOL1_HEX (pool2=$POOL2_HEX)"
-jq --arg p1 "$POOL1_HEX" --arg p2 "$POOL2_HEX" '
-    # Build a sorted list of stake-key hashes, keep the first as the
-    # lone pool2 delegate, redirect the remaining 19 to pool1.
-    .staking.stake as $orig
-    | ($orig | keys | sort) as $keys
-    | .staking.stake = (
-        reduce range(0; ($keys | length)) as $i ({};
-            . + { ($keys[$i]): (if $i == 0 then $p2 else $p1 end) })
-      )' "$LD_GENESIS/shelley-genesis.json" \
+log_info "Redirecting all stake delegations to pool1=$POOL1_HEX"
+jq --arg p1 "$POOL1_HEX" '
+    .staking.stake = (
+        .staking.stake | with_entries(.value = $p1)
+    )' "$LD_GENESIS/shelley-genesis.json" \
    > "$LD_GENESIS/shelley-genesis.patched.json"
 mv "$LD_GENESIS/shelley-genesis.patched.json" "$LD_GENESIS/shelley-genesis.json"
 log_info "stake-pool delegation counts: $(jq -c '
