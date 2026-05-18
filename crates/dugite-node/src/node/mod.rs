@@ -3153,6 +3153,19 @@ impl Node {
                             for action in actions {
                                 match action {
                                     dugite_network::peer::governor::GovernorAction::PromoteToWarm(_) => {} // handled above
+                                    dugite_network::peer::governor::GovernorAction::PromoteToHot(addr) => {
+                                        // Dispatch the promotion, then unconditionally clear
+                                        // in_progress_promote_warm so the governor can re-evaluate
+                                        // this peer on the next tick (#516).  Without this call the
+                                        // governor's HashSet grows without bound and peers that were
+                                        // once promoted via handle_governor_action can never be
+                                        // re-promoted by the governor after a subsequent demotion.
+                                        lifecycle.handle_governor_action(
+                                            dugite_network::peer::governor::GovernorAction::PromoteToHot(addr),
+                                            &mut pm,
+                                        ).await;
+                                        governor.promotion_warm_completed(&addr);
+                                    }
                                     other => {
                                         lifecycle.handle_governor_action(other, &mut pm).await;
                                     }

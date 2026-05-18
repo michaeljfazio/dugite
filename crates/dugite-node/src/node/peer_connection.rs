@@ -809,6 +809,23 @@ impl PeerConnection {
     pub fn has_hot_protocols(&self) -> bool {
         !self.hot_tasks.is_empty()
     }
+
+    /// Check whether the hot client protocol channels are still available for use.
+    ///
+    /// Returns `true` only if ALL three hot client channels (ChainSync, BlockFetch,
+    /// TxSubmission2) are present.  Once `start_hot_protocols` has been called,
+    /// all three channels are moved (`Option::take`) into their respective tasks
+    /// and this method returns `false` — the channels cannot be reclaimed without
+    /// closing the TCP connection and opening a fresh `PeerConnection`.
+    ///
+    /// Used as a pre-flight check in `promote_to_hot` to detect the warm→hot
+    /// promotion race (#516) early and emit a clear diagnostic before returning
+    /// `PeerConnectionError::ChannelUnavailable`.
+    pub fn has_hot_client_channels(&self) -> bool {
+        self.chainsync_client_channel.is_some()
+            && self.blockfetch_client_channel.is_some()
+            && self.txsubmission_client_channel.is_some()
+    }
 }
 
 /// Errors specific to `PeerConnection` lifecycle operations.
@@ -895,6 +912,66 @@ impl PeerConnection {
             server_tasks: Vec::new(),
         }
     }
+
+    /// Create a `PeerConnection` with **fake but present** hot client channels.
+    ///
+    /// Each channel is backed by a disconnected `mpsc` pair (the sender side is
+    /// kept alive for the lifetime of this helper).  The channels are functional
+    /// enough for `start_hot_protocols` / `has_hot_client_channels` checks; they
+    /// will return `MuxError::BearerClosed` on the first actual `recv()`.
+    ///
+    /// Used by regression tests for the warm→hot promotion race (#516).
+    pub(crate) fn fake_with_hot_channels(addr: SocketAddr) -> Self {
+        use std::sync::atomic::AtomicUsize;
+        use tokio::sync::mpsc;
+
+        fn make_channel(protocol_id: u16) -> MuxChannel {
+            // Shared egress queue — the sender end is kept alive by the channel itself.
+            let (egress_tx, _egress_rx) = mpsc::channel(32);
+            // Ingress: receiver lives inside MuxChannel; sender dropped immediately so
+            // recv() returns BearerClosed, mimicking a closed connection.
+            let (_ingress_tx, ingress_rx) = mpsc::channel(32);
+            MuxChannel::new(
+                protocol_id,
+                dugite_network::mux::segment::Direction::InitiatorDir,
+                egress_tx,
+                ingress_rx,
+                65536,
+                std::sync::Arc::new(AtomicUsize::new(0)),
+            )
+        }
+
+        let local_addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
+        let mux_handle = tokio::spawn(async { Ok::<(), MuxError>(()) });
+
+        use dugite_network::protocol::{
+            PROTOCOL_N2N_BLOCKFETCH, PROTOCOL_N2N_CHAINSYNC, PROTOCOL_N2N_KEEPALIVE,
+            PROTOCOL_N2N_TXSUBMISSION,
+        };
+
+        Self {
+            addr,
+            local_addr,
+            direction: PeerConnectionDirection::Outbound,
+            version: 0,
+            network_magic: 0,
+            chainsync_client_channel: Some(make_channel(PROTOCOL_N2N_CHAINSYNC)),
+            blockfetch_client_channel: Some(make_channel(PROTOCOL_N2N_BLOCKFETCH)),
+            txsubmission_client_channel: Some(make_channel(PROTOCOL_N2N_TXSUBMISSION)),
+            keepalive_client_channel: Some(make_channel(PROTOCOL_N2N_KEEPALIVE)),
+            peersharing_client_channel: None,
+            chainsync_server_channel: None,
+            blockfetch_server_channel: None,
+            txsubmission_server_channel: None,
+            keepalive_server_channel: None,
+            peersharing_server_channel: None,
+            mux_handle,
+            cancel: tokio_util::sync::CancellationToken::new(),
+            warm_tasks: Vec::new(),
+            hot_tasks: Vec::new(),
+            server_tasks: Vec::new(),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -930,5 +1007,107 @@ mod tests {
     fn default_constants() {
         assert_eq!(DEFAULT_INGRESS_LIMIT, 64 * 1024 * 1024);
         assert_eq!(DEFAULT_CONNECT_TIMEOUT, Duration::from_secs(10));
+    }
+
+    // ── warm→hot promotion race regression tests (#516) ─────────────────────
+    //
+    // Root cause: `MuxChannel` is single-use.  Once `start_hot_protocols`
+    // moves the three client channels into their tasks, the `Option` fields are
+    // `None`.  Any subsequent `start_hot_protocols` call (e.g. after a
+    // governor-initiated Hot→Warm demotion followed by a PromoteToHot action)
+    // fails with `ChannelUnavailable("chainsync")`, producing the churn loop
+    // observed in the soak logs (#516).
+    //
+    // The fix is to close the TCP connection entirely on Hot→Warm demotion so
+    // that the next PromoteToWarm creates a fresh `PeerConnection` (and fresh
+    // channels).  These tests pin the channel-lifecycle invariants so a
+    // regression in the fix path is caught immediately.
+
+    /// Fresh connection: all hot client channels are present.
+    #[tokio::test]
+    async fn hot_channels_available_on_fresh_connection() {
+        let addr: SocketAddr = "10.0.0.1:3001".parse().unwrap();
+        let conn = PeerConnection::fake_with_hot_channels(addr);
+        assert!(
+            conn.has_hot_client_channels(),
+            "fresh connection must have all hot client channels available"
+        );
+    }
+
+    /// After `start_hot_protocols`, channels are consumed: subsequent call fails.
+    ///
+    /// This is the exact precondition that caused the churn loop in #516.
+    /// Without the `demote_to_warm` fix, a Hot→Warm demotion left channels
+    /// consumed, making the next `PromoteToHot` fail with ChannelUnavailable.
+    #[tokio::test]
+    async fn start_hot_protocols_consumes_channels_second_call_fails() {
+        let addr: SocketAddr = "10.0.0.2:3001".parse().unwrap();
+        let mut conn = PeerConnection::fake_with_hot_channels(addr);
+
+        assert!(
+            conn.has_hot_client_channels(),
+            "channels must be Some before first promotion"
+        );
+
+        // Protocol task factories that immediately return without reading/writing.
+        fn noop_fn() -> ProtocolTaskFn {
+            Box::new(move |_ch, _cancel| Box::pin(async {}))
+        }
+
+        // First promotion succeeds and consumes the channels.
+        conn.start_hot_protocols(noop_fn(), noop_fn(), noop_fn())
+            .expect("first start_hot_protocols must succeed");
+
+        assert!(
+            !conn.has_hot_client_channels(),
+            "channels must be None after start_hot_protocols (they were moved into tasks)"
+        );
+
+        // Second promotion — simulates PromoteToHot on a demoted-but-not-reconnected
+        // connection — must fail with ChannelUnavailable.
+        let err = conn
+            .start_hot_protocols(noop_fn(), noop_fn(), noop_fn())
+            .expect_err("second start_hot_protocols must fail (channels already consumed)");
+
+        assert!(
+            matches!(err, PeerConnectionError::ChannelUnavailable("chainsync")),
+            "expected ChannelUnavailable(\"chainsync\"), got: {err}"
+        );
+
+        // The error message must contain the string observed in the soak logs (#516).
+        assert!(
+            err.to_string()
+                .contains("chainsync channel unavailable (already taken)"),
+            "error Display must match the log string from #516: {err}"
+        );
+    }
+
+    /// After `stop_hot_protocols`, channels remain `None` — confirming that
+    /// stopping tasks does NOT restore channels and that reconnection is required.
+    ///
+    /// This pins the invariant that motivates the `demote_to_warm` fix:
+    /// closing the TCP connection on Hot→Warm is necessary because there
+    /// is no way to recover channels after the tasks have consumed them.
+    #[tokio::test]
+    async fn stop_hot_protocols_does_not_restore_channels() {
+        let addr: SocketAddr = "10.0.0.3:3001".parse().unwrap();
+        let mut conn = PeerConnection::fake_with_hot_channels(addr);
+
+        fn noop_fn() -> ProtocolTaskFn {
+            Box::new(move |_ch, _cancel| Box::pin(async {}))
+        }
+
+        conn.start_hot_protocols(noop_fn(), noop_fn(), noop_fn())
+            .expect("start_hot_protocols must succeed");
+
+        // Wait for the no-op tasks to exit naturally.
+        conn.stop_hot_protocols().await;
+
+        assert!(
+            !conn.has_hot_client_channels(),
+            "channels must remain None after stop_hot_protocols — \
+             stopping tasks does not restore consumed channels; \
+             reconnection is the only recovery path"
+        );
     }
 }
