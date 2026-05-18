@@ -386,7 +386,31 @@ pub struct UtxoSnapshot {
     /// Multi-asset values: `[(policy_id, [(asset_name, quantity)])]`.
     pub multi_asset: MultiAssetSnapshot,
     /// Optional datum hash (32 bytes).
+    ///
+    /// Set when the output uses `OutputDatum::DatumHash`. Mutually exclusive
+    /// with `inline_datum`.
     pub datum_hash: Option<Vec<u8>>,
+    /// Optional **inline** datum, as the verbatim CBOR bytes of the
+    /// `PlutusData` value (CIP-32 / Babbage+).
+    ///
+    /// Emitted as CBOR map key 2 with the inline-datum variant:
+    ///   `2: [1, tag(24) bstr(inline_datum_cbor)]`
+    ///
+    /// Per the Conway CDDL `datum_option = [0, $hash32] // [1, data]` where
+    /// `data = #6.24(bytes .cbor data)` — the integer discriminator selects
+    /// between hashed and inline.
+    ///
+    /// `TransactionOutput.raw_cbor` is `#[serde(skip)]` so re-encoding from
+    /// the in-memory `PlutusData` after an LSM round-trip can mutate the
+    /// bytes (canonical-vs-non-canonical, map ordering). We carry the
+    /// preserved CBOR here directly so the N2C query path emits the exact
+    /// bytes cardano-cli's auto-balance evaluator needs to reconstruct the
+    /// `ScriptContext.txInfoOutputs` datum field bit-for-bit. Without this
+    /// field cardano-cli silently underestimates `ex_units` for any tx
+    /// that spends an inline-datum UTxO, and dugite-forged blocks are
+    /// rejected by cardano-node with `ValidationTagMismatch (IsValid True)
+    /// (FailedUnexpectedly (PlutusFailure …))`.
+    pub inline_datum: Option<Vec<u8>>,
     /// Reference script attached to this output (CIP-33 / Babbage+).
     ///
     /// Emitted as CBOR map key 3 in PostAlonzo output encoding:

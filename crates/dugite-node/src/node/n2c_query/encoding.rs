@@ -442,7 +442,7 @@ pub(crate) fn encode_query_result_value(
 /// encoding is `tag(24) bstr(encode_script_ref(sr))` matching the Babbage/Conway
 /// CDDL: `3 => #6.24(bytes .cbor script)`.
 pub(crate) fn encode_utxo_output(enc: &mut minicbor::Encoder<&mut Vec<u8>>, utxo: &UtxoSnapshot) {
-    let has_datum = utxo.datum_hash.is_some();
+    let has_datum = utxo.datum_hash.is_some() || utxo.inline_datum.is_some();
     let has_script_ref = utxo.script_ref.is_some();
     let field_count = 2 + has_datum as u64 + has_script_ref as u64;
     enc.map(field_count).ok();
@@ -471,8 +471,26 @@ pub(crate) fn encode_utxo_output(enc: &mut minicbor::Encoder<&mut Vec<u8>>, utxo
         }
     }
 
-    // 2: datum_option (if present)
-    if let Some(ref datum_hash) = utxo.datum_hash {
+    // 2: datum_option
+    //
+    // Per Conway CDDL:
+    //     datum_option = [0, $hash32]     ; hashed datum (legacy)
+    //                  // [1, data]       ; inline datum
+    //     data         = #6.24(bytes .cbor data)
+    //
+    // The discriminator is the leading integer: 0 = hashed, 1 = inline.
+    // Inline datums are CBOR-tag-24-wrapped to indicate "embedded CBOR
+    // datum bytes" — cardano-cli's auto-balance evaluator unwraps this
+    // when constructing the `ScriptContext.txInfoOutputs` datum field.
+    // Hashed datums are mutually exclusive with inline; only one can be
+    // present.
+    if let Some(ref inline_datum) = utxo.inline_datum {
+        enc.u32(2).ok();
+        enc.array(2).ok();
+        enc.u32(1).ok();
+        enc.tag(minicbor::data::Tag::new(24)).ok();
+        enc.bytes(inline_datum).ok();
+    } else if let Some(ref datum_hash) = utxo.datum_hash {
         enc.u32(2).ok();
         // DatumOption::Hash variant: [0, datum_hash]
         enc.array(2).ok();
@@ -3783,6 +3801,7 @@ mod tests {
             lovelace: 5_000_000,
             multi_asset: vec![],
             datum_hash: None,
+            inline_datum: None,
             script_ref,
             raw_cbor: None,
         };
@@ -3980,6 +3999,7 @@ mod tests {
             lovelace: 2_000_000,
             multi_asset: vec![],
             datum_hash: Some(vec![0xDD; 32]),
+            inline_datum: None,
             script_ref: Some(ScriptRef::PlutusV2(script_bytes)),
             raw_cbor: None,
         };

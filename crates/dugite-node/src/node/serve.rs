@@ -871,9 +871,25 @@ pub(crate) fn utxo_to_snapshot(
         })
         .collect();
 
-    let datum_hash = match &output.datum {
-        dugite_primitives::transaction::OutputDatum::DatumHash(h) => Some(h.as_ref().to_vec()),
-        _ => None,
+    let (datum_hash, inline_datum) = match &output.datum {
+        dugite_primitives::transaction::OutputDatum::DatumHash(h) => {
+            (Some(h.as_ref().to_vec()), None)
+        }
+        dugite_primitives::transaction::OutputDatum::InlineDatum { data, raw_cbor } => {
+            // Prefer the preserved CBOR (byte-exact original) — falls back to
+            // a fresh deterministic re-encoding of `data` only when raw_cbor
+            // wasn't kept (e.g., locally constructed `TransactionOutput`s
+            // that never round-tripped through the wire). The cardano-cli
+            // auto-balance evaluator computes the per-redeemer `ex_units`
+            // budget from the bytes we return here, so any byte-level drift
+            // surfaces as an `IsValid True / FailedUnexpectedly / PlutusFailure`
+            // when cardano-node validates the dugite-forged block.
+            let cbor = raw_cbor
+                .clone()
+                .unwrap_or_else(|| dugite_serialization::encode_plutus_data(data));
+            (None, Some(cbor))
+        }
+        dugite_primitives::transaction::OutputDatum::None => (None, None),
     };
 
     UtxoSnapshot {
@@ -883,6 +899,7 @@ pub(crate) fn utxo_to_snapshot(
         lovelace: output.value.coin.0,
         multi_asset,
         datum_hash,
+        inline_datum,
         script_ref: output.script_ref.clone(),
         raw_cbor: output.raw_cbor.clone(),
     }
