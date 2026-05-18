@@ -883,6 +883,7 @@ pub(crate) fn utxo_to_snapshot(
         lovelace: output.value.coin.0,
         multi_asset,
         datum_hash,
+        script_ref: output.script_ref.clone(),
         raw_cbor: output.raw_cbor.clone(),
     }
 }
@@ -1219,6 +1220,48 @@ mod tests {
         };
         let snap = utxo_to_snapshot(&input, &output);
         assert!(snap.datum_hash.is_none());
+    }
+
+    /// `utxo_to_snapshot` must propagate `script_ref` from the output so that the
+    /// N2C encoder can emit CBOR key 3 even after an LSM round-trip (where
+    /// `TransactionOutput.raw_cbor` is cleared by `#[serde(skip)]`).
+    #[test]
+    fn utxo_to_snapshot_propagates_script_ref() {
+        use dugite_primitives::address::Address;
+        use dugite_primitives::transaction::{
+            OutputDatum, ScriptRef, TransactionInput, TransactionOutput,
+        };
+        use dugite_primitives::value::Value;
+
+        let addr = Address::from_bytes(&enterprise_addr_bytes()).unwrap();
+        let script_bytes = vec![0x01, 0x00, 0x00, 0x22, 0x21, 0x20, 0x01, 0x01]; // always-true-v2
+        let output = TransactionOutput {
+            address: addr,
+            value: Value::lovelace(3_000_000),
+            datum: OutputDatum::None,
+            script_ref: Some(ScriptRef::PlutusV2(script_bytes.clone())),
+            is_legacy: false,
+            raw_cbor: None, // Simulates post-LSM state: raw_cbor is #[serde(skip)]
+        };
+        let input = TransactionInput {
+            transaction_id: Hash32::from_bytes([0xAB; 32]),
+            index: 2,
+        };
+
+        let snap = utxo_to_snapshot(&input, &output);
+
+        // script_ref must be propagated even though raw_cbor is None
+        match snap.script_ref {
+            Some(ScriptRef::PlutusV2(bytes)) => {
+                assert_eq!(
+                    bytes, script_bytes,
+                    "PlutusV2 script bytes must survive utxo_to_snapshot"
+                );
+            }
+            other => panic!("Expected Some(PlutusV2), got {other:?}"),
+        }
+        // raw_cbor must still be None (we didn't set it)
+        assert!(snap.raw_cbor.is_none());
     }
 
     // ─── Connection metric bridges ───────────────────────────────────────────
