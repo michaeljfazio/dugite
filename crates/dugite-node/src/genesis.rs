@@ -1639,7 +1639,7 @@ mod tests {
     #[test]
     fn test_shelley_genesis_gen_delegs_from_preview_file() {
         // Load the actual preview Shelley genesis and verify genDelegs parse
-        let path = std::path::Path::new("../../config/preview-shelley-genesis.json");
+        let path = std::path::Path::new("../../config/preview/shelley-genesis.json");
         if !path.exists() {
             return; // skip if config files not available
         }

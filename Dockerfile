@@ -73,8 +73,8 @@ VOLUME ["/opt/dugite/db", "/opt/dugite/ipc"]
 
 ENTRYPOINT ["dugite-node"]
 CMD ["run", \
-     "--config", "/opt/dugite/config/preview-config.json", \
-     "--topology", "/opt/dugite/config/preview-topology.json", \
+     "--config", "/opt/dugite/config/preview/config.json", \
+     "--topology", "/opt/dugite/config/preview/topology.json", \
      "--database-path", "/opt/dugite/db", \
      "--socket-path", "/opt/dugite/ipc/node.sock", \
      "--host-addr", "0.0.0.0", \

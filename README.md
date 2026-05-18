@@ -27,19 +27,25 @@ For project status, capability matrix, and known issues see the [Developer Wiki]
 
 ## Quick Start
 
+Dugite ships a top-level [`justfile`](./justfile) — install [just](https://github.com/casey/just) and the most common workflows become one-liners. `just --list` shows everything.
+
 ```bash
-# Build
+# Build, lint, test (full CI gate)
+just check
+
+# Fast sync with a Mithril snapshot (recommended), then run as a relay on preview.
+just mithril-import preview
+just run-relay preview
+```
+
+Without `just`, the same steps map directly to the underlying scripts and `cargo` commands:
+
+```bash
 cargo build --release
-
-# Fast sync with Mithril snapshot (recommended)
-./target/release/dugite-node mithril-import \
-  --network-magic 2 \
-  --database-path ./db-preview
-
-# Run the node
+./scripts/mithril/import.sh preview
 ./target/release/dugite-node run \
-  --config config/preview-config.json \
-  --topology config/preview-topology.json \
+  --config config/preview/config.json \
+  --topology config/preview/topology.json \
   --database-path ./db-preview \
   --socket-path ./node.sock \
   --host-addr 0.0.0.0 \

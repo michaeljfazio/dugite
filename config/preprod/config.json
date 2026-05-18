@@ -1,0 +1,19 @@
+{
+  "Network": "Testnet",
+  "NetworkMagic": 1,
+  "DiffusionMode": "InitiatorAndResponder",
+  "TargetNumberOfRootPeers": 60,
+  "TargetNumberOfActivePeers": 15,
+  "TargetNumberOfEstablishedPeers": 40,
+  "TargetNumberOfKnownPeers": 85,
+  "TargetNumberOfActiveBigLedgerPeers": 5,
+  "TargetNumberOfEstablishedBigLedgerPeers": 10,
+  "TargetNumberOfKnownBigLedgerPeers": 15,
+  "ByronGenesisFile": "byron-genesis.json",
+  "ByronGenesisHash": "559db4dedff91ea6291019d55ac0708595b3820a5aad8cddc4b4863e7947cc8f",
+  "ShelleyGenesisFile": "shelley-genesis.json",
+  "ShelleyGenesisHash": "162d29c4e1cf6b8a84f2d692e67a3ac6bc7851bc3e6e4afe64d15778bed8bd86",
+  "AlonzoGenesisFile": "alonzo-genesis.json",
+  "ConwayGenesisFile": "conway-genesis.json",
+  "MinSeverity": "Info"
+}
