@@ -89,7 +89,8 @@ plutus_lock() {
 _plutus_collateral_jq='
     to_entries
     | map(select(
-        .value.value.lovelace <= 100000000
+        .value.value.lovelace >= 10000000
+        and .value.value.lovelace <= 100000000
         and (.value.value | keys) == ["lovelace"]
         and (.value.datumhash // null) == null
         and (.value.datum // null) == null
