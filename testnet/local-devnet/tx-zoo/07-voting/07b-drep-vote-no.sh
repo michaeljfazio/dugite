@@ -15,7 +15,7 @@ ADDR=$(cat "$WA/payment-stake.addr")
 # Register drep-2 first if needed (drep-1 was reg'd by 05a; we want a second voter).
 PPARAMS=$(zoo_pparams_file)
 DEPOSIT=$(jq -r '.dRepDeposit // .drepDeposit // 500000000' "$PPARAMS")
-DREP_KH=$(cardano-cli conway governance drep id --drep-verification-key-file "$DREP/drep.vkey" --output-format hex)
+DREP_KH=$(cardano-cli conway governance drep id --drep-verification-key-file "$DREP/drep.vkey" --output-hex)
 REG_LIST=$(cardano-cli conway query drep-state \
     --testnet-magic "$LD_MAGIC" --socket-path "$ZOO_SOCKET" \
     --drep-key-hash "$DREP_KH" 2>/dev/null || echo "[]")
@@ -38,7 +38,10 @@ if ! echo "$REG_LIST" | jq -e 'length>0' >/dev/null; then
         --signing-key-file "$DREP/drep.skey" \
         --out-file "$ZOO_BUILT/$NAME-reg.signed" >/dev/null
     RT=$(zoo_submit "$ZOO_BUILT/$NAME-reg.signed") || { zoo_record "$NAME" FAIL "" "reg-submit"; exit 1; }
-    zoo_wait_inclusion "$RT" 60 || { zoo_record "$NAME" FAIL "$RT" "reg-not-incl"; exit 1; }
+    # Same wait-address gotcha as 05c: change goes to wallet-a, not the
+    # default genesis addr. Pass $ADDR explicitly to avoid a spurious
+    # `reg-not-incl` timeout.
+    zoo_wait_inclusion "$RT" 60 "$ADDR" || { zoo_record "$NAME" FAIL "$RT" "reg-not-incl"; exit 1; }
 fi
 
 VOTE="$ZOO_BUILT/$NAME.vote"
