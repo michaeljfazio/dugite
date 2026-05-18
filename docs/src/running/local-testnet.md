@@ -19,9 +19,10 @@ dugite-bp must transit dugite-relay's BlockFetch server before cardano-bp
 can fetch it (and vice versa). This is what the soak test exercises.
 
 The chain boots into Conway PV10 from a fresh genesis with two equally-staked
-pools, 1-second slots, `activeSlotsCoeff = 0.2`, `epochLength = 500`, and
-`securityParam = 10`. Blocks are minted every ~5 seconds on average, and the
-30-minute soak crosses 3–4 epoch boundaries.
+pools, 1-second slots, `activeSlotsCoeff = 0.2`, `epochLength = 200`, and
+`securityParam = 10`. Blocks are minted every ~5 seconds on average and an
+epoch elapses every ~3.3 minutes, so the 30-minute soak crosses ~9 epoch
+boundaries (enough for reward distribution to complete before the soak ends).
 
 ## Prerequisites
 
@@ -187,7 +188,7 @@ differ from cardano-cli's defaults are listed below.
 |-------|-------|---------|
 | `slotLength` | `1.0` | 1-second slot duration |
 | `activeSlotsCoeff` | `0.2` | f = 0.2; ~5s expected block time |
-| `epochLength` | `500` | ~8.3 minutes per epoch -> 3–4 epoch transitions in the 30-min soak |
+| `epochLength` | `200` | ~3.3 minutes per epoch -> ~9 epoch transitions in the 30-min soak. The Praos lower bound is `3k/f = 150` slots; we stay safely above that while keeping reward/governance cycles short enough for tx-zoo. |
 | `securityParam` | `10` | small k -> fast immutability (3k/f ~= 150 slots) |
 | `updateQuorum` | `2` | matches the 3 genesis keys (2-of-3) |
 | `maxLovelaceSupply` | `60_000_000_000_000_000` | 60 B ADA, mainnet-shaped |
@@ -223,40 +224,94 @@ to 10.0 so the chain boots straight into Conway.
 - Mainnet-scale peer counts, NAT/firewall behaviour, or BGP-level routing
 - Mithril snapshot import (covered by other tests)
 
-### Known dugite-node bugs surfaced by this testnet
+## Transaction validation (tx-zoo)
 
-Bringing up the devnet for the first time exposed four real defects in
-`dugite-node`. Three were fixed on this branch as part of bringing the test
-infrastructure online; the fourth is tracked separately and remains the
-blocker for full predicate parity.
+In addition to the soak (which exercises block production + diffusion under a
+steady-state load of identical self-payments), the devnet ships with a
+**transaction zoo** that exercises the full Conway tx surface against the same
+3-node hub. Use this when you want to verify that the dugite mempool, forger,
+and validator accept every transaction class that mainnet allows.
 
-- **Bug A** (FIXED in this branch as `7e6a4af54`): ChainSync intersection at
-  Origin with a non-Origin local tip used to leave the node permanently stuck
-  on its own fork — the node sat at the local tip and never re-intersected
-  once the peer caught up. The fix disconnects after a backoff so the next
-  reconnection can intersect at a real shared point. This was the root cause
-  behind the "node appears to hang" reports.
-- **Bug B** (FIXED in this branch as `59a5fc64d`): the live BlockFetch apply
-  path did not push `LedgerDelta`s onto the `LedgerSeq`, so a fork-switch
-  rollback would fail to find the rollback ledger state on shallow chains
-  and silently keep the wrong tip. The fix pushes deltas in all apply paths
-  (live, replay, and triggered-fork) so rollback is always possible up to k.
-- **Bug C** (FIXED in this branch as `9d30beaf2`): the forge loop fired as
-  soon as the node finished booting, even before any peer connection or
-  ChainSync intersection had completed. On a fresh devnet, dugite-bp would
-  self-forge an orphan block at chain start, then refuse to abandon it. The
-  fix gates the forge loop on `peer_hot_count > 0` AND at least one
-  successful ChainSync intersection.
-- **Bug D** (NOT YET FIXED — tracked in
-  [#497](https://github.com/michaeljfazio/dugite/issues/497)): after initial
-  sync, dugite-bp's chain selection does not switch to a peer's longer
-  competing chain when two BPs forge concurrently. The peer chain's blocks
-  are received and stored in VolatileDB, but the local chain selector never
-  adopts them — `dugite_blocks_applied_total` stays stuck at the initial-sync
-  count while `dugite_blocks_forged_total` continues to grow on the local
-  fork. Predicates 1 (forge cross-check) and 3 (tx round-trip) will FAIL
-  for `dugite-bp` until this is resolved. The relay is unaffected (it
-  doesn't forge) and adopts the canonical chain cleanly.
+```bash
+./testnet/local-devnet/tx-zoo/run-all.sh --setup    # one-time: keys + Plutus binaries
+./testnet/local-devnet/tx-zoo/run-all.sh            # run everything
+./testnet/local-devnet/tx-zoo/run-all.sh 03-plutus  # one category
+./testnet/local-devnet/tx-zoo/run-all.sh --summary  # totals from the last run
+```
+
+The zoo covers 8 categories (59 scripts total): bookkeeping (simple-pay,
+multi-output, metadata CIP-20/CIP-25, validity intervals, required signers,
+treasury donation, tx chaining), native scripts (all/any/atLeast policies,
+time-locked, burns, pay-to-script, spend-from-script), Plutus V1/V2/V3
+(spend, mint, inline datums, reference scripts, reference inputs, datum-hash
+reveal, collateral consumption), stake operations (register, delegate,
+combined certs, deregister, pool register/retire, reward withdrawal),
+governance certificates (DRep register/update/deregister, vote-delegation to
+DRep + always-abstain + always-no-confidence, CC hot-key authorisation,
+CC resignation), proposals (Info, ParameterChange, HardForkInitiation,
+TreasuryWithdrawal, NoConfidence, UpdateCommittee, NewConstitution), voting
+(DRep + SPO + CC yes/no/abstain), and negative paths (min-utxo violation,
+fee-too-low, expired TTL, insufficient collateral). Each script submits
+through the dugite relay socket and waits for inclusion at that same socket
+to guarantee diffusion + validation on the dugite path before recording
+PASS/FAIL/SKIP into `tx-zoo/state/results.csv`.
+
+### Requirements
+
+- The devnet must be up via `./run.sh` (the zoo refuses to start without all 3
+  sockets).
+- The Conway genesis must boot at protocol version >= 10 so Plutus V1/V2/V3
+  and Conway-only certs are admissible. The committed `shelley-spec.json`
+  already sets `protocolVersion.major = 10`; if you fork the spec to a lower
+  version every script that touches Plutus or governance will record FAIL
+  with "ScriptFailed: requires protocol >= N" from cardano-cli or the dugite
+  mempool.
+- `aiken` is **optional** — when missing, the zoo falls back to vendored
+  always-true Plutus binaries for V1/V2/V3. Three categories still need real
+  scripts (collateral, ref-scripts, inline-datum) and will run with the
+  vendored versions; only the negative-path "insufficient collateral" needs a
+  real V2 always-true (vendored).
+
+### Caveats
+
+- **`not-included` failures**: the zoo uses a single shared funding wallet
+  (the genesis UTxO key) and runs scripts in lexical order. Each test
+  consumes the largest UTxO at that wallet, so concurrent runs against the
+  same socket will race. If you see intermittent `not-included` in
+  `results.csv` for a tx that was added to the mempool, check that no other
+  client is submitting to the same socket — the zoo expects exclusive access.
+- **Rewards warmup**: `reward-withdrawal` cannot succeed until the delegated
+  stake earns rewards, which requires at least two epoch boundaries after
+  delegation. On the 200-slot epoch this means the script SKIPs for the
+  first ~7 minutes after a fresh devnet boot. The script records SKIP with
+  reason `no-rewards` rather than failing.
+
+### Seated CC member
+
+`cardano-cli conway genesis create-testnet-data` emits an empty
+Constitutional Committee (`members={}, threshold=0`), which would make the
+CC hot-key auth, CC resignation, and CC voting scripts non-runnable. To
+provide full governance coverage out of the box, `setup.sh` generates a CC
+cold/hot key pair at `keys/cc-1/` and post-processes the generated
+`conway-genesis.json` to seat that member with a 1-of-1 threshold and a
+long expiry term (epoch 1000). `tx-zoo/lib/keygen.sh` then reuses those
+same keys, so `05g-cc-hot-key-authorization`, `05h-cc-resign`,
+`07f-cc-vote-yes`, and `07g-cc-vote-no` operate on a genuine seated member
+rather than an orphan keypair.
+
+If you fork `setup.sh` or generate genesis through any other path, ensure
+the resulting `conway-genesis.json` has a non-empty `committee.members`
+map and a `threshold` matching that membership; otherwise those four
+scripts will auto-SKIP with reason `empty-committee` / `cc-not-authorized`.
+
+Results are appended to `tx-zoo/state/results.csv` (one row per script with
+ts, name, status, txid, detail) and the per-script stderr lives under
+`tx-zoo/state/logs/<name>.log`. After a failed run, re-run a single category
+or script directly:
+
+```bash
+./testnet/local-devnet/tx-zoo/03-plutus/03a-spend-v1.sh
+```
 
 ---
 

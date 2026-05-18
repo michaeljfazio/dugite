@@ -9,7 +9,8 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 zoo_info "keygen — writing into $ZOO_KEYS"
 
 gen_payment() {
-    local name="$1" dir="$ZOO_KEYS/$name"
+    local name="$1"
+    local dir="$ZOO_KEYS/$name"
     mkdir -p "$dir"
     if [ ! -s "$dir/payment.skey" ]; then
         zoo_info "  payment key: $name"
@@ -26,7 +27,8 @@ gen_payment() {
 }
 
 gen_stake() {
-    local name="$1" dir="$ZOO_KEYS/$name"
+    local name="$1"
+    local dir="$ZOO_KEYS/$name"
     mkdir -p "$dir"
     if [ ! -s "$dir/stake.skey" ]; then
         zoo_info "  stake key: $name"
@@ -44,7 +46,8 @@ gen_stake() {
 
 # Combined payment+stake address used by reward-withdrawal tests etc.
 gen_payment_with_stake() {
-    local name="$1" dir="$ZOO_KEYS/$name"
+    local name="$1"
+    local dir="$ZOO_KEYS/$name"
     gen_payment "$name"
     gen_stake   "$name"
     if [ ! -s "$dir/payment-stake.addr" ]; then
@@ -57,7 +60,8 @@ gen_payment_with_stake() {
 }
 
 gen_drep() {
-    local name="$1" dir="$ZOO_KEYS/$name"
+    local name="$1"
+    local dir="$ZOO_KEYS/$name"
     mkdir -p "$dir"
     if [ ! -s "$dir/drep.skey" ]; then
         zoo_info "  drep key: $name"
@@ -73,10 +77,27 @@ gen_drep() {
 }
 
 gen_cc() {
-    local name="$1" dir="$ZOO_KEYS/$name"
+    local name="$1"
+    local dir="$ZOO_KEYS/$name"
     mkdir -p "$dir"
+    # If setup.sh pre-provisioned a CC keypair at $LD_KEYS/$name (it bootstraps
+    # cc-1 as a real committee member in the conway-genesis), reuse those keys
+    # so the zoo's CC hot-key auth + voting + resign scripts operate on a
+    # genuinely seated member rather than an orphan. Otherwise fall back to
+    # generating an orphan keypair (legacy path).
+    local devnet_dir="$LD_KEYS/$name"
+    if [ -s "$devnet_dir/cc-cold.skey" ] && [ -s "$devnet_dir/cc-hot.skey" ]; then
+        if [ ! -s "$dir/cc-cold.skey" ]; then
+            zoo_info "  CC keys: reusing $name from devnet ($devnet_dir)"
+            cp "$devnet_dir/cc-cold.skey" "$dir/cc-cold.skey"
+            cp "$devnet_dir/cc-cold.vkey" "$dir/cc-cold.vkey"
+            cp "$devnet_dir/cc-hot.skey"  "$dir/cc-hot.skey"
+            cp "$devnet_dir/cc-hot.vkey"  "$dir/cc-hot.vkey"
+        fi
+        return 0
+    fi
     if [ ! -s "$dir/cc-cold.skey" ]; then
-        zoo_info "  CC cold key: $name"
+        zoo_info "  CC cold key: $name (orphan — devnet has no seated CC)"
         cardano-cli conway governance committee key-gen-cold \
             --verification-key-file "$dir/cc-cold.vkey" \
             --cold-signing-key-file "$dir/cc-cold.skey"
@@ -90,7 +111,8 @@ gen_cc() {
 }
 
 gen_pool() {
-    local name="$1" dir="$ZOO_KEYS/$name"
+    local name="$1"
+    local dir="$ZOO_KEYS/$name"
     mkdir -p "$dir"
     if [ ! -s "$dir/cold.skey" ]; then
         zoo_info "  pool cold key: $name"
@@ -142,6 +164,23 @@ fund_address() {
         --out-file      "$signed" >/dev/null
     local txid; txid=$(zoo_submit "$signed")
     zoo_wait_inclusion "$txid" 120 || die "funding tx $txid not seen"
+    # Wait until the funding socket itself shows the spent input gone — otherwise
+    # the next fund_address picks the now-spent input and the submit fails.
+    local consumed_in="$in" j=0
+    while [ "$j" -lt 60 ]; do
+        local still
+        still=$(cardano-cli conway query utxo \
+                  --testnet-magic "$LD_MAGIC" \
+                  --socket-path   "$ZOO_SOCKET" \
+                  --address       "$src_addr" \
+                  --output-json 2>/dev/null \
+                | jq --arg t "$consumed_in" '[keys[] | select(. == $t)] | length' 2>/dev/null \
+                || echo 0)
+        [ "${still:-0}" -eq 0 ] && return 0
+        sleep 1
+        j=$((j+1))
+    done
+    die "funder UTxO $consumed_in still visible at $ZOO_SOCKET after 60s"
 }
 
 # Top-level: provision every key the zoo needs.

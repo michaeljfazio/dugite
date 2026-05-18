@@ -1,6 +1,6 @@
 {
   "activeSlotsCoeff": 0.2,
-  "epochLength": 500,
+  "epochLength": 200,
   "securityParam": 10,
   "slotLength": 1.0,
   "updateQuorum": 2,
@@ -21,7 +21,7 @@
     "rho": 0.003,
     "tau": 0.2,
     "protocolVersion": {
-      "major": 2,
+      "major": 10,
       "minor": 0
     }
   }
