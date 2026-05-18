@@ -1673,10 +1673,8 @@ impl Node {
                 self.metrics.set_slot(slot.0);
                 self.metrics.set_block_number(tip.block_number.0);
                 self.metrics.refresh_sync_progress(slot.0);
-                // Initialize tip slot time for tip_age_seconds computation
-                let sc = &ls.slot_config;
-                let slot_time_ms =
-                    sc.zero_time + slot.0.saturating_sub(sc.zero_slot) * sc.slot_length as u64;
+                // Era-aware tip-age computation (see Node::slot_to_wallclock_ms).
+                let slot_time_ms = self.slot_to_wallclock_ms(slot.0, &ls.slot_config).await;
                 self.metrics.set_tip_slot_time_ms(slot_time_ms);
             }
         }
@@ -3566,10 +3564,10 @@ impl Node {
                                         self.metrics.set_block_number(fork_block_no.0);
                                         {
                                             let ls = self.ledger_state.read().await;
-                                            let sc = &ls.slot_config;
-                                            let slot_time_ms = sc.zero_time
-                                                + fork_slot.0.saturating_sub(sc.zero_slot)
-                                                    * sc.slot_length as u64;
+                                            // Era-aware tip-age (see Node::slot_to_wallclock_ms).
+                                            let slot_time_ms = self
+                                                .slot_to_wallclock_ms(fork_slot.0, &ls.slot_config)
+                                                .await;
                                             self.metrics.set_tip_slot_time_ms(slot_time_ms);
                                             self.metrics.set_epoch(ls.epoch.0);
                                         }
@@ -3863,9 +3861,10 @@ impl Node {
         self.metrics.set_slot(block_slot.0);
         {
             let ls = self.ledger_state.read().await;
-            let sc = &ls.slot_config;
-            let slot_time_ms =
-                sc.zero_time + block_slot.0.saturating_sub(sc.zero_slot) * sc.slot_length as u64;
+            // Era-aware tip-age (see Node::slot_to_wallclock_ms).
+            let slot_time_ms = self
+                .slot_to_wallclock_ms(block_slot.0, &ls.slot_config)
+                .await;
             self.metrics.set_tip_slot_time_ms(slot_time_ms);
             self.metrics.set_epoch(ls.epoch.0);
         }
