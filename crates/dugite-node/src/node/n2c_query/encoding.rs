@@ -437,9 +437,14 @@ pub(crate) fn encode_query_result_value(
 ///
 /// Format: `{0: address_bytes, 1: value, 2?: datum_option, 3?: script_ref}`
 /// Value: `coin` (integer) or `[coin, {policy_id -> {asset_name -> quantity}}]`
+///
+/// Key 3 (script_ref) is emitted when `utxo.script_ref` is `Some`.  The wire
+/// encoding is `tag(24) bstr(encode_script_ref(sr))` matching the Babbage/Conway
+/// CDDL: `3 => #6.24(bytes .cbor script)`.
 pub(crate) fn encode_utxo_output(enc: &mut minicbor::Encoder<&mut Vec<u8>>, utxo: &UtxoSnapshot) {
     let has_datum = utxo.datum_hash.is_some();
-    let field_count = 2 + has_datum as u64; // address + value + optional datum
+    let has_script_ref = utxo.script_ref.is_some();
+    let field_count = 2 + has_datum as u64 + has_script_ref as u64;
     enc.map(field_count).ok();
 
     // 0: address (raw bytes)
@@ -473,6 +478,17 @@ pub(crate) fn encode_utxo_output(enc: &mut minicbor::Encoder<&mut Vec<u8>>, utxo
         enc.array(2).ok();
         enc.u32(0).ok();
         enc.bytes(datum_hash).ok();
+    }
+
+    // 3: script_ref (if present)
+    // Wire: 3 => tag(24) bstr(<encode_script_ref bytes>)
+    // This is the Babbage/Conway CDDL `script_ref = #6.24(bytes .cbor script)`.
+    // `encode_script_ref` returns `array(2)[variant_tag, script_bytes]`.
+    if let Some(ref script_ref) = utxo.script_ref {
+        enc.u32(3).ok();
+        enc.tag(minicbor::data::Tag::new(24)).ok();
+        let script_cbor = dugite_serialization::encode_script_ref(script_ref);
+        enc.bytes(&script_cbor).ok();
     }
 }
 
@@ -3750,5 +3766,246 @@ mod tests {
         assert_eq!(dec.array().unwrap(), Some(2));
         let _ = dec.u64().unwrap();
         let _ = dec.u64().unwrap();
+    }
+
+    // ─── Reference script (CIP-33) encoding tests ──────────────────────────────
+
+    /// Build a `UtxoSnapshot` with the given `ScriptRef` and no other optional fields,
+    /// then encode it via `encode_query_result` and return the inner CBOR map bytes
+    /// (key stripped of the MsgResult + HFC wrapper + outer UTxO map header + TxIn key).
+    fn encode_utxo_with_script_ref(
+        script_ref: Option<dugite_primitives::transaction::ScriptRef>,
+    ) -> Vec<u8> {
+        let utxo = UtxoSnapshot {
+            tx_hash: vec![0xAA; 32],
+            output_index: 0,
+            address_bytes: vec![0x61u8; 29],
+            lovelace: 5_000_000,
+            multi_asset: vec![],
+            datum_hash: None,
+            script_ref,
+            raw_cbor: None,
+        };
+        let result = QueryResult::UtxoByAddress(vec![utxo]);
+        let encoded = encode_query_result(&result);
+        // Strip [4, [ map(1) [ [tx_hash, 0] -> output_cbor ] ]]
+        // Strip MsgResult + HFC wrapper:
+        let inner = strip_wrappers(&encoded);
+        // inner = map(1) { [tx_hash, idx] => output }
+        let mut dec = Decoder::new(&inner);
+        dec.map().unwrap(); // map(1)
+        dec.array().unwrap(); // [tx_hash, idx]
+        dec.bytes().unwrap(); // tx_hash
+        dec.u32().unwrap(); // idx
+                            // remaining bytes = output CBOR
+        inner[dec.position()..].to_vec()
+    }
+
+    /// UTxO output without a script_ref must encode as map(2) {0: addr, 1: value}.
+    #[test]
+    fn utxo_output_no_script_ref_is_map_2() {
+        let output_cbor = encode_utxo_with_script_ref(None);
+        let mut dec = Decoder::new(&output_cbor);
+        let map_len = dec.map().unwrap().unwrap();
+        assert_eq!(
+            map_len, 2,
+            "Output without script_ref must be map(2) {{0: addr, 1: value}}"
+        );
+        // key 0 (address) and key 1 (value) must be present, no key 3
+        let k0 = dec.u32().unwrap();
+        assert_eq!(k0, 0);
+        dec.bytes().unwrap(); // address bytes
+        let k1 = dec.u32().unwrap();
+        assert_eq!(k1, 1);
+        dec.skip().unwrap(); // value
+    }
+
+    /// UTxO output with a PlutusV2 script_ref must encode as map(3) with key 3 =
+    /// tag(24) bstr([2, script_bytes]).  This is the most common reference-script
+    /// variant on Conway-era Cardano.
+    ///
+    /// cardano-cli parses this and emits:
+    /// ```json
+    /// "referenceScript": {
+    ///   "script": {"cborHex": "<hex>", "description": "", "type": "PlutusScriptV2"},
+    ///   "scriptLanguage": "PlutusScriptLanguage PlutusScriptV2"
+    /// }
+    /// ```
+    #[test]
+    fn utxo_output_plutus_v2_script_ref_roundtrip() {
+        use dugite_primitives::transaction::ScriptRef;
+
+        // Minimal PlutusV2 script bytes (always-true-v2 inner CBOR from local-devnet)
+        let script_bytes = hex::decode("480100002221200101").unwrap();
+        let output_cbor =
+            encode_utxo_with_script_ref(Some(ScriptRef::PlutusV2(script_bytes.clone())));
+
+        let mut dec = Decoder::new(&output_cbor);
+        let map_len = dec.map().unwrap().unwrap();
+        assert_eq!(map_len, 3, "Output with PlutusV2 script_ref must be map(3)");
+
+        // key 0: address
+        assert_eq!(dec.u32().unwrap(), 0);
+        dec.bytes().unwrap();
+        // key 1: value
+        assert_eq!(dec.u32().unwrap(), 1);
+        dec.skip().unwrap();
+        // key 3: script_ref = tag(24) bstr(array(2)[2, script_bytes])
+        assert_eq!(dec.u32().unwrap(), 3, "Key 3 must be script_ref");
+        let tag = dec.tag().unwrap();
+        assert_eq!(tag.as_u64(), 24, "script_ref must be wrapped in tag(24)");
+        let inner_cbor = dec.bytes().unwrap();
+        // inner_cbor = encode_script_ref(PlutusV2) = array(2)[2, bstr(script_bytes)]
+        let mut inner_dec = Decoder::new(inner_cbor);
+        let arr_len = inner_dec.array().unwrap().unwrap();
+        assert_eq!(arr_len, 2, "encode_script_ref must produce array(2)");
+        let variant = inner_dec.u32().unwrap();
+        assert_eq!(variant, 2, "PlutusV2 variant tag must be 2");
+        let decoded_script = inner_dec.bytes().unwrap();
+        assert_eq!(
+            decoded_script, script_bytes,
+            "script bytes must round-trip exactly"
+        );
+    }
+
+    /// UTxO output with a PlutusV1 script_ref uses variant tag 1.
+    #[test]
+    fn utxo_output_plutus_v1_script_ref_roundtrip() {
+        use dugite_primitives::transaction::ScriptRef;
+
+        let script_bytes = vec![0xDE, 0xAD, 0xBE, 0xEF];
+        let output_cbor =
+            encode_utxo_with_script_ref(Some(ScriptRef::PlutusV1(script_bytes.clone())));
+
+        let mut dec = Decoder::new(&output_cbor);
+        assert_eq!(dec.map().unwrap().unwrap(), 3);
+        dec.u32().unwrap();
+        dec.bytes().unwrap(); // addr
+        dec.u32().unwrap();
+        dec.skip().unwrap(); // value
+        assert_eq!(dec.u32().unwrap(), 3); // key 3
+        assert_eq!(dec.tag().unwrap().as_u64(), 24);
+        let inner_cbor = dec.bytes().unwrap();
+        let mut inner = Decoder::new(inner_cbor);
+        inner.array().unwrap();
+        assert_eq!(inner.u32().unwrap(), 1, "PlutusV1 variant tag must be 1");
+        assert_eq!(inner.bytes().unwrap(), script_bytes);
+    }
+
+    /// UTxO output with a PlutusV3 script_ref uses variant tag 3.
+    #[test]
+    fn utxo_output_plutus_v3_script_ref_roundtrip() {
+        use dugite_primitives::transaction::ScriptRef;
+
+        let script_bytes = vec![0x01, 0x02, 0x03];
+        let output_cbor =
+            encode_utxo_with_script_ref(Some(ScriptRef::PlutusV3(script_bytes.clone())));
+
+        let mut dec = Decoder::new(&output_cbor);
+        assert_eq!(dec.map().unwrap().unwrap(), 3);
+        dec.u32().unwrap();
+        dec.bytes().unwrap();
+        dec.u32().unwrap();
+        dec.skip().unwrap();
+        assert_eq!(dec.u32().unwrap(), 3); // key 3
+        assert_eq!(dec.tag().unwrap().as_u64(), 24);
+        let inner_cbor = dec.bytes().unwrap();
+        let mut inner = Decoder::new(inner_cbor);
+        inner.array().unwrap();
+        assert_eq!(inner.u32().unwrap(), 3, "PlutusV3 variant tag must be 3");
+        assert_eq!(inner.bytes().unwrap(), script_bytes);
+    }
+
+    /// UTxO output with a NativeScript reference uses variant tag 0 and encodes
+    /// the script as a nested CBOR array, NOT raw bytes.
+    ///
+    /// cardano-cli parses this and emits:
+    /// ```json
+    /// "referenceScript": {
+    ///   "script": {"cborHex": "<hex>", "description": "", "type": "SimpleScript"},
+    ///   "scriptLanguage": "SimpleScriptLanguage"
+    /// }
+    /// ```
+    #[test]
+    fn utxo_output_native_script_ref_roundtrip() {
+        use dugite_primitives::hash::Hash32;
+        use dugite_primitives::transaction::{NativeScript, ScriptRef};
+
+        // ScriptPubkey native script
+        let key_hash = Hash32::from_bytes([0xCC; 32]);
+        let native = NativeScript::ScriptPubkey(key_hash);
+        let output_cbor =
+            encode_utxo_with_script_ref(Some(ScriptRef::NativeScript(native.clone())));
+
+        let mut dec = Decoder::new(&output_cbor);
+        assert_eq!(dec.map().unwrap().unwrap(), 3);
+        dec.u32().unwrap();
+        dec.bytes().unwrap();
+        dec.u32().unwrap();
+        dec.skip().unwrap();
+        assert_eq!(dec.u32().unwrap(), 3); // key 3
+        assert_eq!(dec.tag().unwrap().as_u64(), 24);
+        let inner_cbor = dec.bytes().unwrap();
+        let mut inner = Decoder::new(inner_cbor);
+        // NativeScript variant tag = 0, body = native script encoding
+        let arr_len = inner.array().unwrap().unwrap();
+        assert_eq!(arr_len, 2, "encode_script_ref must produce array(2)");
+        assert_eq!(
+            inner.u32().unwrap(),
+            0,
+            "NativeScript variant tag must be 0"
+        );
+        // Native ScriptPubkey encodes as array(2)[0, hash28]
+        let ns_arr = inner.array().unwrap().unwrap();
+        assert_eq!(ns_arr, 2);
+        assert_eq!(inner.u32().unwrap(), 0); // ScriptPubkey tag
+        let key_bytes = inner.bytes().unwrap();
+        // encode_native_script truncates Hash32 to 28 bytes on the wire
+        assert_eq!(key_bytes.len(), 28);
+        assert_eq!(key_bytes, &[0xCC; 28]);
+    }
+
+    /// UTxO output with a datum_hash AND a script_ref must be map(3) with keys
+    /// 0 (address), 1 (value), 2 (datum_hash), 3 (script_ref) — the map count
+    /// must be 4 in this case.
+    #[test]
+    fn utxo_output_datum_hash_and_script_ref_is_map_4() {
+        use dugite_primitives::transaction::ScriptRef;
+
+        let script_bytes = vec![0x01];
+        let utxo = UtxoSnapshot {
+            tx_hash: vec![0xBB; 32],
+            output_index: 1,
+            address_bytes: vec![0x61u8; 29],
+            lovelace: 2_000_000,
+            multi_asset: vec![],
+            datum_hash: Some(vec![0xDD; 32]),
+            script_ref: Some(ScriptRef::PlutusV2(script_bytes)),
+            raw_cbor: None,
+        };
+        let result = QueryResult::UtxoByAddress(vec![utxo]);
+        let encoded = encode_query_result(&result);
+        let inner = strip_wrappers(&encoded);
+
+        let mut dec = Decoder::new(&inner);
+        dec.map().unwrap(); // UTxO map(1)
+        dec.array().unwrap();
+        dec.bytes().unwrap(); // tx_hash
+        dec.u32().unwrap(); // idx
+                            // output map
+        let map_len = dec.map().unwrap().unwrap();
+        assert_eq!(
+            map_len, 4,
+            "Output with datum_hash + script_ref must be map(4)"
+        );
+        // key order: 0, 1, 2, 3
+        let keys: Vec<u32> = (0..4)
+            .map(|_| {
+                let k = dec.u32().unwrap();
+                dec.skip().unwrap();
+                k
+            })
+            .collect();
+        assert_eq!(keys, [0, 1, 2, 3], "Keys must appear in order 0,1,2,3");
     }
 }

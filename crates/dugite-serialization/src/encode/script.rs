@@ -2,8 +2,14 @@ use crate::cbor::*;
 use dugite_primitives::hash::Hash32;
 use dugite_primitives::transaction::*;
 
-/// Encode a script reference
-pub(crate) fn encode_script_ref(script_ref: &ScriptRef) -> Vec<u8> {
+/// Encode a script reference.
+///
+/// Wire format (PostAlonzo output key 3 value, inside tag(24) bstr):
+///   `array(2) [variant_tag, script_bytes]`
+///
+/// Variant tags:
+///   0 = NativeScript, 1 = PlutusV1, 2 = PlutusV2, 3 = PlutusV3
+pub fn encode_script_ref(script_ref: &ScriptRef) -> Vec<u8> {
     let mut buf = encode_array_header(2);
     match script_ref {
         ScriptRef::NativeScript(ns) => {

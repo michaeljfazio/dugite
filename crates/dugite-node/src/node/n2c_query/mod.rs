@@ -1119,6 +1119,7 @@ mod tests {
                     lovelace: 5_000_000,
                     multi_asset: vec![],
                     datum_hash: None,
+                    script_ref: None,
                     raw_cbor: None,
                 }]
             }
