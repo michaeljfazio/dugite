@@ -2107,11 +2107,25 @@ pub fn validate_transaction_with_pools(
 
     // ------------------------------------------------------------------
     // Delegation to unregistered pool (Haskell `DelegateeStakePoolNotRegisteredDELEG`)
+    // + Retirement of unregistered pool (Haskell `StakePoolNotRegisteredOnKeyPOOL`)
     //
-    // A delegation certificate that targets a pool ID not currently registered
-    // in `pool_params` is rejected. This covers all variants that carry a
-    // target pool hash: `StakeDelegation` (tag 2), `RegStakeDeleg` (tag 11),
-    // `StakeVoteDelegation` (tag 13), `RegStakeVoteDeleg` (tag 14).
+    // Each certificate in a Conway transaction is processed sequentially by
+    // the ledger CERTS rule: every cert sees the **evolving** pool registry,
+    // not the pre-tx snapshot. The standard idiom is one tx that contains a
+    // `PoolRegistration` followed by a `StakeDelegation` to the just-
+    // registered pool — `cardano-cli stake-pool registration-certificate`
+    // emits exactly this pair. Checking against the static pre-tx
+    // `registered_pools` set would reject that legitimate use case and let
+    // illegitimate "retire a never-registered pool" txs through; we mirror
+    // the Haskell sequential semantics here so dugite admission matches
+    // what cardano-node accepts and rejects.
+    //
+    // Covered cert variants and the predicate they fire:
+    //   * `StakeDelegation`     (tag 2 ) → `DelegateeStakePoolNotRegisteredDELEG`
+    //   * `RegStakeDeleg`       (tag 11) → same
+    //   * `StakeVoteDelegation` (tag 13) → same
+    //   * `RegStakeVoteDeleg`   (tag 14) → same
+    //   * `PoolRetirement`              → `StakePoolNotRegisteredOnKeyPOOL`
     //
     // `VoteRegDeleg` (tag 15) does NOT include a pool delegation component —
     // it registers and sets a DRep vote delegation only — so it is excluded.
@@ -2119,11 +2133,21 @@ pub fn validate_transaction_with_pools(
     // This check is only enforced when `registered_pools` is provided.
     //
     // Reference: Haskell `DelegateeStakePoolNotRegisteredDELEG` in
-    // `cardano-ledger-shelley:Cardano.Ledger.Shelley.Rules.Deleg`.
+    // `cardano-ledger-shelley:Cardano.Ledger.Shelley.Rules.Deleg` and
+    // `StakePoolNotRegisteredOnKeyPOOL` in
+    // `cardano-ledger-shelley:Cardano.Ledger.Shelley.Rules.Pool`.
     // ------------------------------------------------------------------
     if let Some(pools) = registered_pools {
+        let mut live: std::collections::HashSet<Hash28> = pools.clone();
         for cert in &tx.body.certificates {
-            let opt_pool: Option<Hash28> = match cert {
+            // Pool registration adds to the live set BEFORE we check
+            // subsequent delegations/retirements in this tx.
+            if let dugite_primitives::transaction::Certificate::PoolRegistration(params) = cert {
+                live.insert(params.operator);
+                continue;
+            }
+
+            let opt_target: Option<Hash28> = match cert {
                 dugite_primitives::transaction::Certificate::StakeDelegation {
                     pool_hash, ..
                 } => Some(*pool_hash),
@@ -2138,10 +2162,14 @@ pub fn validate_transaction_with_pools(
                     pool_hash,
                     ..
                 } => Some(*pool_hash),
+                dugite_primitives::transaction::Certificate::PoolRetirement {
+                    pool_hash,
+                    ..
+                } => Some(*pool_hash),
                 _ => None,
             };
-            if let Some(pool_id) = opt_pool {
-                if !pools.contains(&pool_id) {
+            if let Some(pool_id) = opt_target {
+                if !live.contains(&pool_id) {
                     errors.push(ValidationError::DelegateePoolNotRegistered {
                         pool_id: pool_id.to_hex(),
                     });
