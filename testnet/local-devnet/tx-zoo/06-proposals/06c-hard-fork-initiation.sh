@@ -40,5 +40,5 @@ cardano-cli conway transaction sign \
     --signing-key-file "$WA/payment.skey" \
     --out-file      "$SIGNED" >/dev/null
 TXID=$(zoo_submit "$SIGNED") || { zoo_record "$NAME" FAIL "" "submit"; exit 1; }
-zoo_wait_inclusion "$TXID" 60 && zoo_record "$NAME" PASS "$TXID" "PV ${CUR_PV_MAJOR}->${NEW_PV_MAJOR}" \
+zoo_wait_all_observers "$TXID" 120 "$ADDR" && zoo_record "$NAME" PASS "$TXID" "PV ${CUR_PV_MAJOR}->${NEW_PV_MAJOR}" \
                               || zoo_record "$NAME" FAIL "$TXID" "not-included"

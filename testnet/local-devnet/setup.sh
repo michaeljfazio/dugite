@@ -75,13 +75,21 @@ cat > "$LD_CONFIG/relays.json" <<EOF
 EOF
 
 # Step D: generate the real testnet data with our merged spec.
+#
+# We use 20 stake-delegators so that we can skew stake 19:1 toward pool1
+# (dugite-bp) in Step D.4 below. Equal-stake (10:10 = 50/50) between the
+# two pools produces constant chain divergence — both forge at the same
+# rate and the relay's chain selection flips between forks ~every block.
+# Skewing 95/5 means dugite-bp wins ~95% of leader lotteries, forks
+# happen rarely and never on consecutive blocks, but cardano-bp still
+# occasionally forges so we keep the Haskell-side cross-validation.
 cardano-cli conway genesis create-testnet-data \
     --spec-shelley "$TMP_SPEC/shelley-spec.json" \
     --spec-conway  "$TMP_SPEC/conway-spec.json" \
     --testnet-magic "$LD_MAGIC" \
     --genesis-keys 3 \
     --pools 2 \
-    --stake-delegators 4 \
+    --stake-delegators 20 \
     --utxo-keys 1 \
     --total-supply     60000000000000000 \
     --delegated-supply 30000000000000000 \
@@ -91,6 +99,33 @@ cardano-cli conway genesis create-testnet-data \
 
 log_info "Genesis generated at $LD_GENESIS"
 ls -1 "$LD_GENESIS"
+
+# Step D.4: skew the stake-delegation map 19:1 toward pool1 (dugite-bp).
+# cardano-cli splits the 20 delegators evenly across the 2 pools (10:10
+# = 50/50 stake). Rewrite the `staking.stake` map so 19 delegators point
+# at pool1's cold-key hash and only 1 stays on pool2's. The change is
+# applied to shelley-genesis.json before the hash is taken in Step E.
+POOL1_HEX="$(cardano-cli conway stake-pool id \
+    --cold-verification-key-file "$LD_GENESIS/pools-keys/pool1/cold.vkey" \
+    --output-hex)"
+POOL2_HEX="$(cardano-cli conway stake-pool id \
+    --cold-verification-key-file "$LD_GENESIS/pools-keys/pool2/cold.vkey" \
+    --output-hex)"
+log_info "Skewing stake 19:1 toward pool1=$POOL1_HEX (pool2=$POOL2_HEX)"
+jq --arg p1 "$POOL1_HEX" --arg p2 "$POOL2_HEX" '
+    # Build a sorted list of stake-key hashes, keep the first as the
+    # lone pool2 delegate, redirect the remaining 19 to pool1.
+    .staking.stake as $orig
+    | ($orig | keys | sort) as $keys
+    | .staking.stake = (
+        reduce range(0; ($keys | length)) as $i ({};
+            . + { ($keys[$i]): (if $i == 0 then $p2 else $p1 end) })
+      )' "$LD_GENESIS/shelley-genesis.json" \
+   > "$LD_GENESIS/shelley-genesis.patched.json"
+mv "$LD_GENESIS/shelley-genesis.patched.json" "$LD_GENESIS/shelley-genesis.json"
+log_info "stake-pool delegation counts: $(jq -c '
+    .staking.stake | to_entries | group_by(.value) | map({pool: .[0].value, n: length})
+' "$LD_GENESIS/shelley-genesis.json")"
 
 # Step D.5: patch the conway-genesis.json to seat the CC member (and set a
 # matching threshold). cardano-cli omits this field on output, so we inject

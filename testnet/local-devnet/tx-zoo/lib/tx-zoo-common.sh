@@ -115,14 +115,23 @@ zoo_submit() {
 }
 
 # Wait up to $timeout seconds for the change UTxO carrying $txid to appear at
-# the $ZOO_SOCKET (default relay). We REQUIRE this specific socket because the
-# next test will call zoo_largest_utxo against it; returning early on a
-# different observer (e.g. cbp) leaves a race where the relay still shows the
-# old UTxO and the next tx picks the same input → mempool conflict → silent
-# eviction with "not-included" 60s later. Returns 0 when seen at $ZOO_SOCKET.
+# the $ZOO_SOCKET (default relay).
+#
+# Args: $1=txid  [$2=timeout=60]  [$3=address=$ZOO_PAY_ADDR_FILE]
+#
+# The 3rd argument is required for any tx whose CHANGE address is NOT the
+# funding genesis-utxo address — cert/governance/voting txs send change
+# back to wallet-a or wallet-b, so passing the genesis address would
+# always time out even when the tx made it into a block.
+#
+# We REQUIRE the relay socket (not BP / cardano-bp) because the next test
+# will call zoo_largest_utxo against it; returning early on a different
+# observer leaves a race where the relay still shows the old UTxO and
+# the next tx picks the same input → mempool conflict → silent eviction
+# with "not-included" 60s later. Returns 0 when seen at $ZOO_SOCKET.
 zoo_wait_inclusion() {
-    local txid="$1" timeout="${2:-60}"
-    local addr; addr=$(cat "$ZOO_PAY_ADDR_FILE")
+    local txid="$1" timeout="${2:-60}" addr="${3:-}"
+    [ -z "$addr" ] && addr=$(cat "$ZOO_PAY_ADDR_FILE")
     local i=0
     while [ "$i" -lt "$timeout" ]; do
         local hit
@@ -145,13 +154,21 @@ zoo_wait_inclusion() {
 }
 
 # Wait for a given tx to land on the canonical chain (i.e., all three observers
-# agree it's in their UTxO). Stricter than zoo_wait_inclusion.
+# agree it's in their UTxO). Stricter than zoo_wait_inclusion and more robust
+# against transient chain-selection flips: an observer that briefly rolls
+# back its tip will not satisfy the all-3 predicate until the tx is back on
+# the canonical chain everywhere.
+#
+# Args: $1=txid  [$2=timeout=120]  [$3=address=$ZOO_PAY_ADDR_FILE]
+#
+# Use this for tests where the change goes to a known wallet address other
+# than the genesis funder (cert / governance / voting txs).
 zoo_wait_all_observers() {
-    local txid="$1" timeout="${2:-120}"
-    local addr; addr=$(cat "$ZOO_PAY_ADDR_FILE")
-    local i=0
+    local txid="$1" timeout="${2:-120}" addr="${3:-}"
+    [ -z "$addr" ] && addr=$(cat "$ZOO_PAY_ADDR_FILE")
+    local i=0 n=0
     while [ "$i" -lt "$timeout" ]; do
-        local n=0
+        n=0
         for sock in "$LD_RELAY_SOCK" "$LD_DUGITE_BP_SOCK" "$LD_CARDANO_BP_SOCK"; do
             [ -S "$sock" ] || continue
             local hit
