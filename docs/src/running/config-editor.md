@@ -144,7 +144,7 @@ Press `d` to toggle the diff view, which shows a side-by-side comparison of the 
 #!/usr/bin/env bash
 # Example: configure a relay node for preview testnet
 
-CONFIG="config/preview-config.json"
+CONFIG="config/preview/config.json"
 
 dugite-config init --out-file "$CONFIG" \
   --network Testnet \
