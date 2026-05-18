@@ -14364,4 +14364,81 @@ mod tests {
             "phase-1 ReferenceInputOverlapsInput must not fire at PV11, got {errors:?}"
         );
     }
+
+    // ── IsValidTagMismatch (#522) ─────────────────────────────────────────────
+
+    /// A transaction with `is_valid=false` and NO Plutus scripts (no redeemers)
+    /// must not be rejected with `IsValidTagMismatch`.  The Phase-2 evaluator
+    /// is only invoked when `has_plutus_scripts(tx)` is true; when the tx body
+    /// has no Plutus involvement, `is_valid=false` is a valid (if unusual) flag.
+    ///
+    /// Regression guard: this was the accidental blocking of legitimate
+    /// is_valid=false legacy txs before the #522 fix scoped the check to
+    /// redeemer-bearing txs only.
+    #[test]
+    fn is_valid_false_no_scripts_not_rejected_as_tag_mismatch() {
+        let (utxo_set, input) = make_simple_utxo_set();
+        let mut tx = make_simple_tx(input, 9_000_000, 1_000_000);
+        // Declare is_valid=false with no Plutus scripts or redeemers — the
+        // IsValidTagMismatch check must not fire because there is nothing to
+        // evaluate. Phase-1 still runs and the tx passes all structural rules.
+        tx.is_valid = false;
+
+        let params = ProtocolParameters::mainnet_defaults();
+        // Must succeed: no Plutus, so no Phase-2, so no tag-mismatch check.
+        // The tx will fail other checks (no collateral for is_valid=false without
+        // scripts) only if the implementation mistakenly runs collateral checks on
+        // non-Plutus txs. Verify the result does NOT contain IsValidTagMismatch.
+        let result = validate_transaction(&tx, &utxo_set, &params, 100, 300, None);
+        if let Err(ref errors) = result {
+            assert!(
+                !errors
+                    .iter()
+                    .any(|e| matches!(e, ValidationError::IsValidTagMismatch { .. })),
+                "is_valid=false with no scripts must not produce IsValidTagMismatch, got {errors:?}"
+            );
+        }
+        // Either Ok or some other error is acceptable — IsValidTagMismatch
+        // must never appear for a non-Plutus tx.
+    }
+
+    /// `IsValidTagMismatch` is a proper `ValidationError` variant and can be
+    /// constructed and matched as expected.  This guards the variant definition
+    /// against refactoring that accidentally removes it or changes its fields.
+    #[test]
+    fn is_valid_tag_mismatch_variant_is_defined() {
+        // Verify the variant can be constructed and compared with matches!().
+        // This is the error that `validate_transaction_with_context` emits when
+        // a tx has `is_valid=false` but its Plutus scripts evaluate to True
+        // (DoS class #522 attacker pattern).
+        let err = ValidationError::IsValidTagMismatch {
+            declared: false,
+            evaluated: true,
+        };
+        assert!(
+            matches!(
+                err,
+                ValidationError::IsValidTagMismatch {
+                    declared: false,
+                    evaluated: true
+                }
+            ),
+            "IsValidTagMismatch variant did not match: {err:?}"
+        );
+
+        // Also verify the reverse (declared true, evaluated false) — this
+        // direction is also theoretically possible but currently not emitted
+        // by validate_transaction_with_context (scripts fail ⟹ ScriptFailed).
+        let err2 = ValidationError::IsValidTagMismatch {
+            declared: true,
+            evaluated: false,
+        };
+        assert!(matches!(
+            err2,
+            ValidationError::IsValidTagMismatch {
+                declared: true,
+                evaluated: false
+            }
+        ));
+    }
 }
