@@ -288,6 +288,82 @@ p4_tip_parity() {
     fi
 }
 
+# Predicate 5: dugite_tip_age_seconds must be below threshold post-catch-up.
+#
+# Issue #508 (gap caught by cb509ef91 era-aware tip_age fix): the v1.5.0 BP
+# soak reported PASS on `Chain extended` counts but missed an era-aware
+# tip-age computation bug that made dugite-monitor render "Tip 19d 0h 0m"
+# on preprod even though the chain was healthy. This predicate fails the
+# soak immediately if the metric exceeds threshold once the node has had
+# time to catch up.
+#
+# Default threshold: 300s ≈ 5 min. Override via LD_TIP_AGE_THRESHOLD_SEC.
+# Loose enough to absorb normal Praos gaps (devnet f=0.05); tight enough
+# to catch the 19-day class of bug.
+#
+# Catch-up grace: we ignore samples in the first GRACE_SEC of the soak so
+# the metric has time to settle after node start. Default 60s.
+p5_tip_age() {
+    local samples="$1"
+    local threshold="${LD_TIP_AGE_THRESHOLD_SEC:-300}"
+    local grace="${LD_TIP_AGE_GRACE_SEC:-60}"
+
+    if [ ! -s "$samples" ]; then
+        PREDICATE_FAIL+=("p5:no-data")
+        return
+    fi
+
+    # Drop header + first $grace seconds worth of samples. Samples are
+    # written every 5s across 2 dugite nodes, so $grace seconds == roughly
+    # (grace / 5) * 2 rows.
+    local skip_rows=$(( grace / 5 * 2 ))
+
+    # Find the max observed tip_age across all post-grace samples per node,
+    # plus the most recent sample. Skip rows with '?' (sampler couldn't reach
+    # metrics endpoint — already covered by other predicates).
+    local result
+    result=$(awk -F, -v skip="$skip_rows" '
+        NR == 1 { next }                           # header
+        NR <= skip + 1 { next }                    # grace window
+        $3 == "?" || $3 == "" { next }             # no-data rows
+        {
+            age = $3 + 0
+            if (age > max[$2]) max[$2] = age
+            last[$2] = age
+            count[$2]++
+        }
+        END {
+            for (n in count) {
+                printf "%s %d %d %d\n", n, max[n], last[n], count[n]
+            }
+        }
+    ' "$samples")
+
+    if [ -z "$result" ]; then
+        PREDICATE_FAIL+=("p5:tip-age (no usable samples after ${grace}s grace window)")
+        return
+    fi
+
+    local fails=0
+    local summary=""
+    while read -r node max last samples_n; do
+        [ -z "$node" ] && continue
+        if [ "$max" -gt "$threshold" ]; then
+            fails=$((fails + 1))
+            summary="${summary}${node}=max${max}s/last${last}s/n${samples_n} "
+        else
+            summary="${summary}${node}=max${max}s/last${last}s/n${samples_n} "
+        fi
+    done <<< "$result"
+
+    summary="${summary% }"
+    if [ "$fails" -eq 0 ]; then
+        PREDICATE_PASS+=("p5:tip-age (threshold ${threshold}s; $summary)")
+    else
+        PREDICATE_FAIL+=("p5:tip-age ($fails/$(echo "$result" | wc -l | tr -d ' ') nodes above ${threshold}s; $summary)")
+    fi
+}
+
 generate_report() {
     local evd="$1"
     local rpt="$evd/report.md"
@@ -342,7 +418,7 @@ generate_report() {
         echo
         echo "## Evidence files"
         echo
-        for f in tip-samples.csv blocks.csv tx-submissions.csv metadata.json; do
+        for f in tip-samples.csv tip-age-samples.csv blocks.csv tx-submissions.csv metadata.json; do
             [ -f "$evd/$f" ] && echo "- \`$f\` ($(wc -l < "$evd/$f" | tr -d ' ') lines)"
         done
         echo
@@ -429,6 +505,33 @@ self_test() {
         || die "p4 self-test bad: expected FAIL, got ${PREDICATE_PASS[*]:-}"
     log_info "  OK"
 
+    # p5 self-test: use a zero-grace window so the fixture's rows are not
+    # all skipped. Default grace (60s) assumes a live 5s-cadence soak.
+    local saved_grace="${LD_TIP_AGE_GRACE_SEC:-}"
+    LD_TIP_AGE_GRACE_SEC=0
+    export LD_TIP_AGE_GRACE_SEC
+
+    log_info "p5 - good fixture (expect PASS)"
+    PREDICATE_PASS=(); PREDICATE_FAIL=()
+    p5_tip_age "$fix/predicate-5-good.csv"
+    [ ${#PREDICATE_PASS[@]} -gt 0 ] && [ ${#PREDICATE_FAIL[@]} -eq 0 ] \
+        || { unset LD_TIP_AGE_GRACE_SEC; die "p5 self-test good: expected PASS, got ${PREDICATE_FAIL[*]:-}"; }
+    log_info "  OK"
+
+    log_info "p5 - bad fixture (expect FAIL)"
+    PREDICATE_PASS=(); PREDICATE_FAIL=()
+    p5_tip_age "$fix/predicate-5-bad.csv"
+    [ ${#PREDICATE_FAIL[@]} -gt 0 ] && [ ${#PREDICATE_PASS[@]} -eq 0 ] \
+        || { unset LD_TIP_AGE_GRACE_SEC; die "p5 self-test bad: expected FAIL, got ${PREDICATE_PASS[*]:-}"; }
+    log_info "  OK"
+
+    if [ -n "$saved_grace" ]; then
+        LD_TIP_AGE_GRACE_SEC="$saved_grace"
+        export LD_TIP_AGE_GRACE_SEC
+    else
+        unset LD_TIP_AGE_GRACE_SEC
+    fi
+
     PREDICATE_PASS=("${saved_pass[@]:+${saved_pass[@]}}"); PREDICATE_FAIL=("${saved_fail[@]:+${saved_fail[@]}}")
     log_info "Self-test complete."
 }
@@ -445,6 +548,7 @@ p1_forge_cross_check  "$EVD/blocks.csv"
 p2_per_bp_attribution "$EVD/blocks.csv"
 p3_tx_inclusion       "$EVD/tx-submissions.csv" "$EVD"
 p4_tip_parity         "$EVD/tip-samples.csv"
+p5_tip_age            "$EVD/tip-age-samples.csv"
 generate_report       "$EVD"
 
 if [ ${#PREDICATE_FAIL[@]} -gt 0 ]; then

@@ -39,6 +39,11 @@ EOF
 echo "ts,node,slot,block_no,hash,era" > "$EVD/tip-samples.csv"
 echo "ts,observer,event,slot,hash,issuer_vkey,body_size,n_txs" > "$EVD/blocks.csv"
 echo "ts,target_socket,wave,txid,submit_rc" > "$EVD/tx-submissions.csv"
+# tip-age sampler (Issue #508): record the `dugite_tip_age_seconds`
+# Prometheus metric from both dugite processes so verify.sh can assert
+# the chain is fresh post-catch-up — catches the 19d-stale class of bug
+# that slipped through v1.5.0 BP soak (fixed in cb509ef91).
+echo "ts,node,tip_age_seconds" > "$EVD/tip-age-samples.csv"
 
 # Sampler PIDs collected for cleanup
 SAMPLER_PIDS=()
@@ -95,6 +100,27 @@ sample_tips() {
 sample_tips "$EVD/tip-samples.csv" &
 SAMPLER_PIDS+=($!)
 log_info "tip-sampler PID $!"
+
+# ---- Tip-age (Prometheus) sampler ----
+sample_tip_age() {
+    local out="$1"
+    while true; do
+        local now
+        now="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+        for entry in "dugite-bp:$LD_DUGITE_BP_METRICS_PORT" "dugite-relay:$LD_DUGITE_RELAY_METRICS_PORT"; do
+            name="${entry%%:*}"
+            port="${entry##*:}"
+            age=$(curl -s --max-time 3 "http://127.0.0.1:${port}/metrics" 2>/dev/null \
+                  | awk '/^dugite_tip_age_seconds / {print $2; exit}')
+            [ -z "$age" ] && age="?"
+            printf '%s,%s,%s\n' "$now" "$name" "$age" >> "$out"
+        done
+        sleep 5
+    done
+}
+sample_tip_age "$EVD/tip-age-samples.csv" &
+SAMPLER_PIDS+=($!)
+log_info "tip-age-sampler PID $!"
 
 # ---- Block recorder ----
 # Tails the three node logs and records forge + receive events.
