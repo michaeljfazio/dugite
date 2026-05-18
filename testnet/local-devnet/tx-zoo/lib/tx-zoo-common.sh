@@ -153,16 +153,17 @@ zoo_wait_inclusion() {
     return 1
 }
 
-# Wait for a given tx to land on the canonical chain (i.e., all three observers
-# agree it's in their UTxO). Stricter than zoo_wait_inclusion and more robust
-# against transient chain-selection flips: an observer that briefly rolls
-# back its tip will not satisfy the all-3 predicate until the tx is back on
-# the canonical chain everywhere.
+# Wait for a given tx to land on all three observers (dugite-relay,
+# dugite-bp, cardano-bp). Strongest available assertion: dugite forged
+# the tx, the relay propagated it, AND the Haskell cardano-node accepts
+# the block carrying it. This requires a non-forking topology — see
+# setup.sh, which runs cardano-bp as a passive validator (no forging
+# keys) so cardano-bp's chain is always a prefix or copy of dugite's.
 #
 # Args: $1=txid  [$2=timeout=120]  [$3=address=$ZOO_PAY_ADDR_FILE]
 #
-# Use this for tests where the change goes to a known wallet address other
-# than the genesis funder (cert / governance / voting txs).
+# Use this for tests where the change goes to a known wallet address
+# other than the genesis funder (cert / governance / voting txs).
 zoo_wait_all_observers() {
     local txid="$1" timeout="${2:-120}" addr="${3:-}"
     [ -z "$addr" ] && addr=$(cat "$ZOO_PAY_ADDR_FILE")

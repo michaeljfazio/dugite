@@ -1,18 +1,34 @@
 #!/usr/bin/env bash
-# 03j — Plutus Phase-2 failure path: tx with --script-invalid forces ledger
-# to mark is_valid=false and consume collateral, returning any collateral-return
-# output. This exercises the divergent code path Dugite has to match exactly.
+# 03j — Plutus Phase-2 failure path (SKIPPED).
 #
-# We use the V2 always-true script but flip --script-invalid; cardano-cli's
-# `transaction build` requires Phase-2 validation to be skipped when the user
-# is intentionally building an invalid tx, so we use `transaction build-raw`.
+# This test should exercise the collateral-consumed path: a tx that
+# *actually fails* Phase-2 evaluation, signed with --script-invalid so
+# the ledger applies it with is_valid=false (consuming collateral
+# instead of regular inputs, emitting only the collateral-return).
+#
+# The vendored script `always-true-v2.plutus` is the wrong vehicle:
+# Phase-2 succeeds for any input, so combining it with --script-invalid
+# produces a tx whose declared `is_valid=false` disagrees with the
+# evaluator's `is_valid=true`. Per ConwayUtxowFailure rules, the block
+# carrying that tx fails the IsValid check, and the BP gets stuck
+# re-forging it indefinitely.
+#
+# To run this test properly we need to vendor an `always-false-v2`
+# (or v3) validator under `lib/plutus/`. Filed as a separate harness
+# follow-up; mark SKIP for now so the rest of the zoo can progress.
 set -euo pipefail
 ZOO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 . "$ZOO_DIR/lib/tx-zoo-common.sh"
-. "$ZOO_DIR/03-plutus/_lock-helper.sh"
 
 NAME="$(zoo_name)"
 zoo_require_devnet
+zoo_skip "needs an always-false validator (always-true + --script-invalid is invalid block)"
+zoo_record "$NAME" SKIP "" "needs-always-false-validator"
+exit 0
+
+# (Original implementation below kept for reference; see header.)
+. "$ZOO_DIR/03-plutus/_lock-helper.sh"
+
 SCRIPT="$ZOO_DIR/lib/plutus/always-true-v2.plutus"
 [ -s "$SCRIPT" ] || { zoo_skip "missing $SCRIPT"; zoo_record "$NAME" SKIP; exit 0; }
 
