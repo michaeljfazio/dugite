@@ -1,7 +1,7 @@
 {
   "activeSlotsCoeff": 0.2,
-  "epochLength": 200,
-  "securityParam": 10,
+  "epochLength": 4000,
+  "securityParam": 300,
   "slotLength": 1.0,
   "updateQuorum": 2,
   "maxLovelaceSupply": 60000000000000000,
