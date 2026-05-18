@@ -485,6 +485,9 @@ pub(crate) fn convert_validation_error(
         }
         VE::MissingRawCbor => TxValidationError::MissingRawCbor,
         VE::MissingSlotConfig => TxValidationError::MissingSlotConfig,
+        VE::IsValidTagMismatch { declared, evaluated } => {
+            TxValidationError::IsValidTagMismatch { declared, evaluated }
+        }
         VE::MissingSpendRedeemer { index } => TxValidationError::MissingSpendRedeemer { index },
         VE::RedeemerIndexOutOfRange { tag, index, max } => {
             TxValidationError::RedeemerIndexOutOfRange { tag, index, max: max as u32 }
@@ -1026,6 +1029,23 @@ mod tests {
 
         let e = convert_validation_error(VE::ValueOverflow);
         assert!(matches!(e, TxValidationError::ValueOverflow));
+
+        // IsValidTagMismatch (#522) must map 1:1 to the network variant so
+        // the rejection reason is visible to the submitting client.
+        let e = convert_validation_error(VE::IsValidTagMismatch {
+            declared: false,
+            evaluated: true,
+        });
+        assert!(
+            matches!(
+                e,
+                TxValidationError::IsValidTagMismatch {
+                    declared: false,
+                    evaluated: true
+                }
+            ),
+            "IsValidTagMismatch must map 1:1 to network variant, got {e:?}"
+        );
     }
 
     #[test]
