@@ -1510,6 +1510,17 @@ impl Node {
             // rather than guessing from peer counts.
             let effective_peer_sharing = args.config.effective_peer_sharing(is_bp);
             m.set_p2p_config(&args.config.diffusion_mode, effective_peer_sharing);
+            // Publish chain-shape parameters from the Shelley genesis so
+            // dugite-monitor and dashboards don't have to hard-code
+            // mainnet/preview defaults. Without these the epoch-progress
+            // ETA reads "~5 days" on a devnet with a 200-slot epoch.
+            if let Some(ref sg) = shelley_genesis {
+                m.set_shelley_chain_params(
+                    sg.epoch_length,
+                    sg.slot_length.saturating_mul(1000), // genesis is seconds; metric wants ms
+                    sg.active_slots_coeff,
+                );
+            }
             Arc::new(m)
         };
 
