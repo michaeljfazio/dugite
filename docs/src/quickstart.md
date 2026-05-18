@@ -40,16 +40,22 @@ This downloads the latest snapshot from the Mithril aggregator, extracts it, and
 
 ## 3. Run the Node
 
-Dugite ships with configuration files for all networks. If you built from source, they are in the `config/` directory:
+Dugite ships with configuration files for all networks. If you built from source, they are in `config/<network>/` (`config.json`, `topology.json`, and four genesis files per network):
 
 ```bash
 dugite-node run \
-  --config config/preview-config.json \
-  --topology config/preview-topology.json \
+  --config config/preview/config.json \
+  --topology config/preview/topology.json \
   --database-path ./db-preview \
   --socket-path ./node.sock \
   --host-addr 0.0.0.0 \
   --port 3001
+```
+
+Or via the top-level [justfile](./development.md):
+
+```bash
+just run-relay preview
 ```
 
 Or with Docker:

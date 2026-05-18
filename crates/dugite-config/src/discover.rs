@@ -15,7 +15,7 @@ use std::path::{Path, PathBuf};
 /// Compiled-in default for `dugite-node run --config` when the flag is absent.
 /// Mirrors `crates/dugite-node/src/main.rs` and is updated manually if the
 /// upstream default changes.
-pub const DUGITE_NODE_DEFAULT_CONFIG: &str = "config/mainnet-config.json";
+pub const DUGITE_NODE_DEFAULT_CONFIG: &str = "config/mainnet/config.json";
 
 /// Whether a discovered node's config path was specified on the command line
 /// or fell back to the binary's compiled-in default.
@@ -375,9 +375,9 @@ mod tests {
             "/Users/op/dugite/target/release/dugite-node",
             "run",
             "--config",
-            "config/preview-config.json",
+            "config/preview/config.json",
             "--topology",
-            "config/preview-topology.json",
+            "config/preview/topology.json",
             "--database-path",
             "./db-preview",
             "--socket-path",
@@ -388,7 +388,7 @@ mod tests {
             "3001",
         ]);
         let p = parse_run_argv(&v).unwrap();
-        assert_eq!(p.config.as_deref(), Some("config/preview-config.json"));
+        assert_eq!(p.config.as_deref(), Some("config/preview/config.json"));
         assert_eq!(p.port, Some(3001));
         assert_eq!(p.socket.as_deref(), Some("./node.sock"));
     }
@@ -458,7 +458,7 @@ mod tests {
         assert_eq!(n.config_source, ConfigSource::Default);
         // Default file doesn't exist in our temp dir, so status is Missing.
         assert_eq!(n.status, ConfigStatus::Missing);
-        assert!(n.config_path.ends_with("config/mainnet-config.json"));
+        assert!(n.config_path.ends_with("config/mainnet/config.json"));
         assert!(!n.is_selectable());
     }
 

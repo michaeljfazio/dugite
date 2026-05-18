@@ -95,11 +95,11 @@ struct LogArgs {
 #[derive(clap::Args, Debug)]
 struct RunArgs {
     /// Path to the node configuration file
-    #[arg(long, default_value = "config/mainnet-config.json")]
+    #[arg(long, default_value = "config/mainnet/config.json")]
     config: PathBuf,
 
     /// Path to the topology file
-    #[arg(long, default_value = "config/mainnet-topology.json")]
+    #[arg(long, default_value = "config/mainnet/topology.json")]
     topology: PathBuf,
 
     /// Path to the database directory

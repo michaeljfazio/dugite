@@ -208,7 +208,7 @@ scrape_configs:
 
 ## Grafana Dashboard
 
-Dugite ships with a pre-built Grafana dashboard at `config/grafana-dashboard.json`. The dashboard covers all node metrics organized into nine sections:
+Dugite ships with a pre-built Grafana dashboard at `config/monitoring/grafana-dashboard.json`. The dashboard covers all node metrics organized into nine sections:
 
 - **Overview** — Sync progress gauge, block height, epoch, slot, connected peers, blocks forged
 - **Node Health** — Uptime, disk available (stat + time series)
@@ -227,16 +227,16 @@ The fastest way to start a local monitoring stack is with the included script:
 
 ```bash
 # Start Prometheus + Grafana
-./scripts/start-monitoring.sh
+just monitor-start         # or: ./scripts/monitoring/start.sh
 
 # Open the dashboard (admin/admin)
 open http://localhost:3000/d/dugite-node/dugite-node
 
 # Check status
-./scripts/start-monitoring.sh status
+just monitor-status        # or: ./scripts/monitoring/start.sh status
 
 # Stop
-./scripts/start-monitoring.sh stop
+just monitor-stop          # or: ./scripts/monitoring/start.sh stop
 ```
 
 The script starts Prometheus (port 9090) and Grafana (port 3000) as Docker containers, auto-configures the Prometheus datasource, and imports the Dugite dashboard. Prometheus data is persisted in `.monitoring-data/` so metrics survive restarts.
@@ -252,7 +252,7 @@ Environment variables for port customization:
 ### Importing the Dashboard
 
 1. Open Grafana and go to **Dashboards > Import**
-2. Click **Upload JSON file** and select `config/grafana-dashboard.json`
+2. Click **Upload JSON file** and select `config/monitoring/grafana-dashboard.json`
 3. Select your Prometheus data source when prompted
 4. Click **Import**
 
@@ -263,7 +263,7 @@ The dashboard includes an `instance` template variable so you can monitor multip
 To auto-provision the dashboard, copy it into your Grafana provisioning directory:
 
 ```bash
-cp config/grafana-dashboard.json /etc/grafana/provisioning/dashboards/dugite.json
+cp config/monitoring/grafana-dashboard.json /etc/grafana/provisioning/dashboards/dugite.json
 ```
 
 Add a dashboard provider in `/etc/grafana/provisioning/dashboards/dugite.yaml`:
@@ -322,7 +322,7 @@ providers:
 EOF
 
 mkdir -p /opt/homebrew/var/lib/grafana/dashboards
-sed 's/${DS_PROMETHEUS}/DS_PROMETHEUS/g' config/grafana-dashboard.json \
+sed 's/${DS_PROMETHEUS}/DS_PROMETHEUS/g' config/monitoring/grafana-dashboard.json \
   > /opt/homebrew/var/lib/grafana/dashboards/dugite.json
 
 # Start services

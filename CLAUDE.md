@@ -16,29 +16,25 @@ Follow the Ralph autonomous development loop:
 
 ## Build & Test Commands
 
+The top-level `justfile` wraps the common dev commands. Pick whichever feels more natural — both shapes are equivalent.
+
 ```bash
-# Build everything
+# Just recipes (preferred when in a fresh shell)
+just check          # full CI gate: fmt-check + clippy + build + test + test-doc
+just build
+just test           # cargo nextest run --workspace
+just test-doc
+just clippy
+just fmt-check      # cargo fmt --all -- --check  (fix with: just fmt)
+
+# Direct cargo (still works for narrow invocations)
 cargo build --all-targets
-
-# Run all tests (nextest — parallel, matches CI)
 cargo nextest run --workspace
-
-# Run tests for a single crate
-cargo nextest run -p dugite-ledger
-
-# Run a single test by name
-cargo nextest run -p dugite-ledger -E 'test(test_name)'
-
-# Run doc tests (nextest doesn't support these yet)
+cargo nextest run -p dugite-ledger                    # single crate
+cargo nextest run -p dugite-ledger -E 'test(name)'    # single test
 cargo test --doc
-
-# Lint
 cargo clippy --all-targets -- -D warnings
-
-# Format check (fix with: cargo fmt --all)
 cargo fmt --all -- --check
-
-# Build release binary
 cargo build --release
 ```
 
@@ -97,22 +93,32 @@ dugite-primitives (core types: hashes, blocks, txs, addresses, values, protocol 
 - Pallas 28-byte hash types (DRep keys, pool voter keys, required signers) must be padded to 32 bytes — do not use `Hash<32>::from()` directly on 28-byte hashes
 
 ## Current Focus
-Soak testing on preview testnet (Sandstone Pool [SAND], pool ID 6954ec11cf7097a693721104139b96c54e7f3e2a8f9e7577630f7856). Automated restart cycles, transaction submission via scripts/soak-test.sh, Koios cross-validation. Stability and block production verification.
+Soak testing on preview testnet (Sandstone Pool [SAND], pool ID 6954ec11cf7097a693721104139b96c54e7f3e2a8f9e7577630f7856). Automated restart cycles, transaction submission via `scripts/soak/varied-batch.sh` (driven by the 6h orchestrator at `scripts/soak/orchestrator-6h.sh`), Koios cross-validation. Stability and block production verification.
 
 ## Running the Node
 
-```bash
-# Fast sync with Mithril snapshot (preview testnet, magic=2)
-./target/release/dugite-node mithril-import \
-  --network-magic 2 --database-path ./db-preview
+Config files live under per-network subdirectories (`config/{mainnet,preview,preprod}/{config,topology,*-genesis}.json`). The justfile wraps the common launchers; underlying scripts live in `scripts/run/`.
 
-# Run the node
+```bash
+# Justfile (preferred)
+just mithril-import preview
+just run-relay preview          # or: just run-bp preview
+
+# Equivalent direct invocation
+./target/release/dugite-node mithril-import --network-magic 2 --database-path ./db-preview
 ./target/release/dugite-node run \
-  --config config/preview-config.json \
-  --topology config/preview-topology.json \
+  --config config/preview/config.json \
+  --topology config/preview/topology.json \
   --database-path ./db-preview \
   --socket-path ./node.sock \
   --host-addr 0.0.0.0 --port 3001
 ```
 
 Network magic: Mainnet=764824073, Preview=2, Preprod=1
+
+## Scripts & configs at a glance
+
+- `config/{mainnet,preview,preprod}/` — per-network configs and genesis files (self-contained, relative paths).
+- `config/bp-pair/` — Sandstone preview BP-pair soak rig (dugite-bp + dugite-relay + haskell-relay).
+- `config/monitoring/` — Grafana dashboard, Prometheus scrape + alert rules.
+- `scripts/run/`, `scripts/soak/`, `scripts/monitoring/`, `scripts/validation/`, `scripts/mithril/`, `scripts/dev/` — see `just --list` for the entry points.

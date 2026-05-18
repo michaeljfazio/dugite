@@ -492,5 +492,5 @@ Complete list of all third-party crates used by Dugite, sorted alphabetically.
 This page is generated from `Cargo.lock` metadata. To regenerate after dependency changes:
 
 ```bash
-python3 scripts/generate-licenses.py > docs/src/reference/third-party-licenses.md
+python3 scripts/dev/generate-licenses.py > docs/src/reference/third-party-licenses.md
 ```
