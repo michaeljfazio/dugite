@@ -27,7 +27,15 @@ fi
 
 if [[ ! -d "./db-mainnet/immutable" ]]; then
     echo "Database empty. Importing Mithril snapshot (~35 GB, may take 30+ minutes)..."
-    "$BIN" mithril-import --network-magic 764824073 --database-path ./db-mainnet
+    # On failure (stale partial extract, transient network blip) wipe the
+    # dugite-mithril work dir and retry once so unattended soak / Ralph-loop
+    # runs don't die on a single recoverable error.
+    if ! "$BIN" mithril-import --network-magic 764824073 --database-path ./db-mainnet; then
+        WORK_DIR="${TMPDIR:-/tmp}/dugite-mithril"
+        echo "mithril-import failed; clearing $WORK_DIR and retrying once..."
+        rm -rf "$WORK_DIR"
+        "$BIN" mithril-import --network-magic 764824073 --database-path ./db-mainnet
+    fi
 fi
 
 CMD=(
