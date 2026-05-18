@@ -523,6 +523,18 @@ pub struct NodeMetrics {
     peak_mem_bytes: AtomicU64,
     /// Network magic number (764824073=mainnet, 2=preview, 1=preprod).
     pub network_magic: AtomicU64,
+    /// Slots per epoch from the active Shelley genesis. Exposed as
+    /// `dugite_epoch_length` so downstream tools (dugite-monitor, dashboards)
+    /// can compute epoch progress and ETA without hard-coding network defaults.
+    pub epoch_length_slots: AtomicU64,
+    /// Slot duration in milliseconds from the active Shelley genesis. Exposed
+    /// as `dugite_slot_length_ms`. With this and `epoch_length_slots` clients
+    /// can derive total epoch wall-clock time and remaining time precisely.
+    pub slot_length_ms: AtomicU64,
+    /// `activeSlotsCoeff` × 1000 from the active Shelley genesis (Praos f).
+    /// Exposed as `dugite_active_slots_coeff_x1000` (rational scaled to an
+    /// integer for the Prometheus encoder). 200 means f=0.20.
+    pub active_slots_coeff_x1000: AtomicU64,
     /// Liveness threshold in seconds — `/live` returns 503 when no block has
     /// been applied within this window (and the node is not freshly started).
     /// Default 600s (10 minutes). 0 disables the threshold (always 200).
@@ -713,6 +725,9 @@ impl NodeMetrics {
             cpu_tracker: std::sync::Mutex::new(CpuTracker::new()),
             peak_mem_bytes: AtomicU64::new(0),
             network_magic: AtomicU64::new(0),
+            epoch_length_slots: AtomicU64::new(0),
+            slot_length_ms: AtomicU64::new(0),
+            active_slots_coeff_x1000: AtomicU64::new(0),
             liveness_threshold_secs: AtomicU64::new(600),
             is_block_producer: AtomicU64::new(0),
             pool_id_hex: std::sync::Mutex::new(String::new()),
@@ -1082,6 +1097,25 @@ impl NodeMetrics {
     /// Set the network magic number.
     pub fn set_network_magic(&self, magic: u64) {
         self.network_magic.store(magic, Ordering::Relaxed);
+    }
+
+    /// Record Shelley-derived chain parameters that don't change at runtime
+    /// without a hard fork: epoch length (slots), slot duration (ms), and
+    /// `activeSlotsCoeff` × 1000. Call once at startup after the Shelley
+    /// genesis has been parsed.
+    pub fn set_shelley_chain_params(
+        &self,
+        epoch_length_slots: u64,
+        slot_length_ms: u64,
+        active_slots_coeff: f64,
+    ) {
+        self.epoch_length_slots
+            .store(epoch_length_slots, Ordering::Relaxed);
+        self.slot_length_ms.store(slot_length_ms, Ordering::Relaxed);
+        self.active_slots_coeff_x1000.store(
+            (active_slots_coeff * 1000.0).round() as u64,
+            Ordering::Relaxed,
+        );
     }
 
     /// Record P2P networking configuration state.
@@ -1575,6 +1609,21 @@ impl NodeMetrics {
                 "dugite_network_magic",
                 "Network magic number (764824073=mainnet, 2=preview, 1=preprod)",
                 &self.network_magic,
+            ),
+            (
+                "dugite_epoch_length",
+                "Slots per epoch from the active Shelley genesis",
+                &self.epoch_length_slots,
+            ),
+            (
+                "dugite_slot_length_ms",
+                "Slot duration in milliseconds from the active Shelley genesis",
+                &self.slot_length_ms,
+            ),
+            (
+                "dugite_active_slots_coeff_x1000",
+                "activeSlotsCoeff (Praos f) scaled by 1000, e.g. 200 = f=0.20",
+                &self.active_slots_coeff_x1000,
             ),
             (
                 "dugite_is_block_producer",
