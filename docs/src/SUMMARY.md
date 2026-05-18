@@ -6,6 +6,7 @@
 
 - [Installation](./installation.md)
 - [Quick Start](./quickstart.md)
+- [Development](./development.md)
 
 # Running a Node
 

@@ -61,8 +61,8 @@ If instances are already running, **do not kill them without confirming**. Repor
 **Then verify prerequisites:**
 - Ensure the project compiles cleanly: `cargo build --release 2>&1`
 - Check that required config files exist:
-  - Dugite: `config/preview-config.json`, `config/preview-topology.json`
-  - Haskell: `config/haskell-preview-config.json`, `config/haskell-preview-topology.json`
+  - Dugite: `config/preview/config.json`, `config/preview/topology.json`
+  - Haskell relay (paired with dugite-bp): `config/bp-pair/haskell-relay.config.json`, `config/bp-pair/haskell-relay.topology.json`
 - Check for block producer keys:
   - `keys/preview-test/pool/kes.skey`
   - `keys/preview-test/pool/vrf.skey`
@@ -111,8 +111,8 @@ This ensures both nodes start from the same chain state without downloading twic
 ```bash
 KEY_DIR=./keys/preview-test/pool
 RUST_LOG=info ./target/release/dugite-node run \
-  --config config/preview-config.json \
-  --topology config/preview-topology.json \
+  --config config/preview/config.json \
+  --topology config/preview/topology.json \
   --database-path ./db-preview \
   --socket-path ./node.sock \
   --host-addr 0.0.0.0 --port 3001 \
@@ -132,7 +132,7 @@ The Haskell node must be configured with:
 - **Praos mode** (default for Conway era, no Genesis mode)
 - **Single static peer**: Dugite at `127.0.0.1:3001`
 
-Use the Dugite-only config/topology: `config/haskell-dugite-only-config.json` and `config/haskell-dugite-only-topology.json`. If these don't exist or don't have the right settings, create them:
+Use the bp-pair Haskell relay config/topology: `config/bp-pair/haskell-relay.config.json` and `config/bp-pair/haskell-relay.topology.json`. These files were renamed from the legacy `config/haskell-dugite-only-*.json` pair as part of the config cleanup. If they don't have the right settings, edit them:
 
 ```bash
 # Verify config has P2P disabled and correct prometheus port:
@@ -145,8 +145,8 @@ Use the Dugite-only config/topology: `config/haskell-dugite-only-config.json` an
 
 ```bash
 cardano-node run \
-  --config config/haskell-dugite-only-config.json \
-  --topology config/haskell-dugite-only-topology.json \
+  --config config/bp-pair/haskell-relay.config.json \
+  --topology config/bp-pair/haskell-relay.topology.json \
   --database-path ./db-preview-haskell/db/db \
   --socket-path ./haskell-node.sock \
   --host-addr 0.0.0.0 --port 3002 \
@@ -500,9 +500,9 @@ Your diagnostic report MUST include ALL of the following sections:
 - Runs as a **relay** (no block producer keys), syncing exclusively from Dugite
 - **P2P enabled** (`EnableP2P: true`) — cardano-node 10.6.2 requires P2P mode
 - **Praos mode** (default for Conway era)
-- Config: `config/haskell-dugite-only-config.json` (P2P on, prometheus 12799)
-- Topology: `config/haskell-dugite-only-topology.json` (P2P format, single peer: Dugite at 127.0.0.1:3001)
-- Genesis files: `config/haskell-{byron,shelley,alonzo,conway}-genesis.json`
+- Config: `config/bp-pair/haskell-relay.config.json` (P2P on, prometheus 12799)
+- Topology: `config/bp-pair/haskell-relay.topology.json` (P2P format, single peer: Dugite at 127.0.0.1:3001)
+- Genesis files: `config/preview/{byron,shelley,alonzo,conway}-genesis.json` (the bp-pair config references these via `../preview/`)
 - Prometheus metrics on port 12799 (non-default)
 - Socket path: `./haskell-node.sock`
 - Database path: `./db-preview-haskell/db/db`
@@ -510,9 +510,10 @@ Your diagnostic report MUST include ALL of the following sections:
 - Use `CARDANO_NODE_SOCKET_PATH` env var for cardano-cli queries
 
 **Cross-validation helpers:**
-- `scripts/compare-epochs.py` — compare epoch snapshots between implementations
-- `scripts/chained-tx-investigation/start-both.sh` — existing dual-node startup script
-- `scripts/soak-test-preview.sh` — automated soak test with tx submission
+- `scripts/validation/n2c-compat-test.sh` — full N2C compatibility suite (`just compat-n2c`)
+- `scripts/validation/leader-schedule-compat.sh` — leader-schedule cross-check (`just compat-leader`)
+- `scripts/run/dual-node.sh` — start dugite + cardano-node together (`just` equivalent: `./scripts/run/dual-node.sh`)
+- `scripts/soak/orchestrator-6h.sh` + helpers — 6h preview soak (`just soak-6h`, `just soak-bare-bp`, `just soak-status`)
 - Koios MCP server available for independent on-chain verification
 
 **Network details:**

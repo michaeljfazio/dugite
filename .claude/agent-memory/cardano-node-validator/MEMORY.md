@@ -3,7 +3,7 @@
 ## Key Files
 - Node binary: `./target/release/dugite-node`
 - CLI binary: `./target/release/dugite-cli`
-- Config dir: `./config/` (preview-config.json, preview-topology.json)
+- Config dir: `./config/preview/` (config.json, topology.json — reorganized 2026-05-18)
 - Preview DB: `/tmp/dugite-db-preview/` — epoch=1238, 2,935,506 UTxOs (run #16)
 - Ledger snapshot: `<db>/ledger-snapshot.bin` (~80 MB with LSM backend)
 - Node logs: `/tmp/dugite-vrf-debug.log` (run #16 — VRF nonce fix validation)
@@ -11,8 +11,8 @@
 ## Startup Command Pattern (LSM backend, default)
 ```
 DUGITE_PIPELINE_DEPTH=150 ./target/release/dugite-node run \
-  --config config/preview-config.json \
-  --topology config/preview-topology.json \
+  --config config/preview/config.json \
+  --topology config/preview/topology.json \
   --database-path /tmp/dugite-db-preview \
   --socket-path ./node-lsm-test.sock \
   --host-addr 0.0.0.0 --port 3002 \
