@@ -2,7 +2,7 @@
 # Restart only the dugite-node block producer (NOT the cardano-node relay).
 # Used by the soak loop to verify recovery-after-restart on a regular cadence.
 set -uo pipefail
-cd "$(dirname "$0")/.."
+cd "$(dirname "$0")/../.."
 
 LOG_DIR="./logs/bp-pair"
 BP_PID_FILE="$LOG_DIR/bp.pid"
@@ -29,8 +29,8 @@ rm -f ./node.sock ./db-preview/utxo-store/lock 2>/dev/null || true
 
 # Restart dugite-node with the same args as launch-bp-pair.sh
 nohup ./target/release/dugite-node run \
-    --config config/preview-config.json \
-    --topology config/bp-single-relay-topology.json \
+    --config config/preview/config.json \
+    --topology config/bp-pair/dugite-bp.topology.json \
     --database-path ./db-preview \
     --socket-path ./node.sock \
     --host-addr 0.0.0.0 \

@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
 # Run Dugite as a relay node on the Cardano preprod testnet.
 #
-# Usage: ./scripts/run-relay-preprod.sh [--log FILE]
+# Usage: ./scripts/run/relay-preprod.sh [--log FILE]
 
 set -euo pipefail
-cd "$(dirname "$0")/.."
+cd "$(dirname "$0")/../.."
 
 LOGFILE=""
 while [[ $# -gt 0 ]]; do
@@ -28,8 +28,8 @@ fi
 
 CMD=(
     "$BIN" run
-    --config config/preprod-config.json
-    --topology config/preprod-topology.json
+    --config config/preprod/config.json
+    --topology config/preprod/topology.json
     --database-path ./db-preprod
     --socket-path ./node.sock
     --host-addr 0.0.0.0

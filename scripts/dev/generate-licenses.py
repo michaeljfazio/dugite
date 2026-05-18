@@ -2,7 +2,7 @@
 """Generate the third-party licenses documentation page from Cargo metadata.
 
 Usage:
-    python3 scripts/generate-licenses.py > docs/src/reference/third-party-licenses.md
+    python3 scripts/dev/generate-licenses.py > docs/src/reference/third-party-licenses.md
 """
 
 import json
@@ -123,7 +123,7 @@ def main():
     lines.append("This page is generated from `Cargo.lock` metadata. To regenerate after dependency changes:")
     lines.append("")
     lines.append("```bash")
-    lines.append("python3 scripts/generate-licenses.py > docs/src/reference/third-party-licenses.md")
+    lines.append("python3 scripts/dev/generate-licenses.py > docs/src/reference/third-party-licenses.md")
     lines.append("```")
 
     print("\n".join(lines))

@@ -3,9 +3,9 @@
 # Start a local Prometheus + Grafana monitoring stack for Dugite development.
 #
 # Usage:
-#   ./scripts/start-monitoring.sh          # Start monitoring
-#   ./scripts/start-monitoring.sh stop     # Stop monitoring
-#   ./scripts/start-monitoring.sh status   # Show container status
+#   ./scripts/monitoring/start.sh          # Start monitoring
+#   ./scripts/monitoring/start.sh stop     # Stop monitoring
+#   ./scripts/monitoring/start.sh status   # Show container status
 #
 # Prerequisites: Docker (or Podman with docker CLI compatibility)
 #

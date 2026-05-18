@@ -2,7 +2,7 @@
 # One-shot health snapshot of the BP+relay pair.
 # Output is single-line key=value pairs for easy parsing.
 set -uo pipefail
-cd "$(dirname "$0")/.."
+cd "$(dirname "$0")/../.."
 
 CLI="./target/release/dugite-cli"
 DUGITE_METRICS="http://localhost:12798/metrics"

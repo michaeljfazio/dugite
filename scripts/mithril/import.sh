@@ -2,12 +2,12 @@
 # Import a Mithril snapshot for any network.
 #
 # Usage:
-#   ./scripts/mithril-import.sh preview    # Preview testnet
-#   ./scripts/mithril-import.sh preprod    # Preprod testnet
-#   ./scripts/mithril-import.sh mainnet    # Mainnet
+#   ./scripts/mithril/import.sh preview    # Preview testnet
+#   ./scripts/mithril/import.sh preprod    # Preprod testnet
+#   ./scripts/mithril/import.sh mainnet    # Mainnet
 
 set -euo pipefail
-cd "$(dirname "$0")/.."
+cd "$(dirname "$0")/../.."
 
 NETWORK="${1:-preview}"
 BIN=./target/release/dugite-node

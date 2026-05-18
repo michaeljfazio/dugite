@@ -8,7 +8,7 @@
 # from freezing the process during long soaks (see project memory note
 # project_macos_appnap_freeze_2026_05_08).
 set -euo pipefail
-cd "$(dirname "$0")/.."
+cd "$(dirname "$0")/../.."
 
 LOG_DIR="./logs/bp-pair"
 mkdir -p "$LOG_DIR"
@@ -39,8 +39,8 @@ rm -f "$LOG_DIR/relay.current.log" 2>/dev/null || true
 echo "===== Starting dugite-node BARE BP (port 3001, caffeinated) ====="
 nohup caffeinate -dimsu \
     ./target/release/dugite-node run \
-    --config config/preview-config.json \
-    --topology config/bp-bare-topology.json \
+    --config config/preview/config.json \
+    --topology config/bp-pair/dugite-bp.topology.json \
     --database-path ./db-preview \
     --socket-path ./node.sock \
     --host-addr 0.0.0.0 \

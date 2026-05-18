@@ -25,7 +25,7 @@
 # Relay restarts are too disruptive (re-sync from disk) and would mask issues.
 
 set -uo pipefail
-cd "$(dirname "$0")/.."
+cd "$(dirname "$0")/../.."
 
 DURATION_SEC=${DURATION_SEC:-21600}            # 6 hours
 SNAPSHOT_INTERVAL=${SNAPSHOT_INTERVAL:-120}    # 2 min
@@ -171,8 +171,8 @@ restart_dugite_node() {
     emit "RESTART — new log → $new_log"
     nohup caffeinate -dimsu \
         ./target/release/dugite-node run \
-        --config config/preview-config.json \
-        --topology config/bp-single-relay-topology.json \
+        --config config/preview/config.json \
+        --topology config/bp-pair/dugite-bp.topology.json \
         --database-path ./db-preview \
         --socket-path ./node.sock \
         --host-addr 0.0.0.0 \
@@ -205,7 +205,7 @@ restart_dugite_node() {
 submit_varied_batch() {
     emit "TX BATCH — submitting varied batch (A/B/C/D=6 txs)"
     local out
-    if out=$(./scripts/soak-varied-batch.sh 2>&1); then
+    if out=$(./scripts/soak/varied-batch.sh 2>&1); then
         echo "$out" | while IFS= read -r ln; do
             emit "  TX: ${ln:0:240}"
         done

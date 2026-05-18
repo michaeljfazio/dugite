@@ -17,7 +17,7 @@
 # accepted/rejected counters.
 
 set -uo pipefail
-cd "$(dirname "$0")/.."
+cd "$(dirname "$0")/../.."
 
 CLI="./target/release/dugite-cli"
 SOCKET="./node.sock"

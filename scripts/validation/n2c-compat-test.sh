@@ -18,15 +18,15 @@
 #   sockets. Nothing is written outside OUT_DIR.
 #
 # USAGE
-#   scripts/n2c-compat-test.sh \
+#   scripts/validation/n2c-compat-test.sh \
 #       --dugite-socket  ./node.sock \
 #       --haskell-socket ./cardano-node.sock \
 #       --network-magic  2 \
 #       --out-dir        logs/n2c-compat/$(date +%Y%m%dT%H%M%SZ)
 #
-#   scripts/n2c-compat-test.sh --only tip
-#   scripts/n2c-compat-test.sh --skip ledger-state --skip utxo-whole
-#   DUGITE_SOCKET=./node.sock HASKELL_SOCKET=./cn.sock scripts/n2c-compat-test.sh
+#   scripts/validation/n2c-compat-test.sh --only tip
+#   scripts/validation/n2c-compat-test.sh --skip ledger-state --skip utxo-whole
+#   DUGITE_SOCKET=./node.sock HASKELL_SOCKET=./cn.sock scripts/validation/n2c-compat-test.sh
 #
 # OUTPUT LAYOUT
 #   <OUT_DIR>/
@@ -80,7 +80,7 @@ Runs every `cardano-cli query` subcommand against a dugite-node N2C socket
 AND a cardano-node N2C socket, normalizes outputs with jq, and diffs them.
 
 USAGE
-    scripts/n2c-compat-test.sh [flags]
+    scripts/validation/n2c-compat-test.sh [flags]
 
 FLAGS
     --dugite-socket  <path>   Path to dugite-node socket        [default: ./node.sock]
@@ -105,13 +105,13 @@ ENVIRONMENT
 
 EXAMPLES
     # Full run with defaults
-    scripts/n2c-compat-test.sh
+    scripts/validation/n2c-compat-test.sh
 
     # Single query
-    scripts/n2c-compat-test.sh --only tip
+    scripts/validation/n2c-compat-test.sh --only tip
 
     # Skip the heavy ones
-    scripts/n2c-compat-test.sh --skip ledger-state --skip utxo-whole
+    scripts/validation/n2c-compat-test.sh --skip ledger-state --skip utxo-whole
 
 EXIT CODES
     0  all queries matched

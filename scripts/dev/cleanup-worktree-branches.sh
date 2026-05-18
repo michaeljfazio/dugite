@@ -6,7 +6,7 @@
 #
 # Usage:
 #   cd /Users/michaelfazio/Source/dugite
-#   bash scripts/cleanup-worktree-branches.sh
+#   bash scripts/dev/cleanup-worktree-branches.sh
 #
 # What it does:
 #   1. Removes all .claude/worktrees/agent-* git worktrees (git worktree remove --force)

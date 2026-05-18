@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Benchmark different pipeline depths against the Cardano Preview testnet.
 #
-# Usage: ./scripts/benchmark-pipeline-depth.sh [duration_seconds]
+# Usage: ./scripts/validation/benchmark-pipeline-depth.sh [duration_seconds]
 #
 # Each configuration syncs from genesis for the specified duration (default: 180s),
 # then the blocks/sec throughput is extracted from the logs.
@@ -10,8 +10,8 @@ set -euo pipefail
 
 DURATION=${1:-180}
 BINARY="./target/release/dugite-node"
-CONFIG="./config/preview-config.json"
-TOPOLOGY="./config/preview-topology.json"
+CONFIG="./config/preview/config.json"
+TOPOLOGY="./config/preview/topology.json"
 SOCKET="/tmp/dugite-bench.socket"
 BASE_DB_DIR="/tmp/dugite-bench"
 

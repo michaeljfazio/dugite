@@ -6,7 +6,7 @@
 # crash (cardano-node 10.6.2 + ledger peers + connection-timeout cascade)
 # might fire without immediate human attention.
 set -uo pipefail
-cd "$(dirname "$0")/.."
+cd "$(dirname "$0")/../.."
 
 LOG_DIR=./logs/bp-pair
 mkdir -p "$LOG_DIR"
@@ -32,8 +32,8 @@ while true; do
         emit "CYCLE $CYCLE — launching cardano-node relay → $new_relay_log"
         rm -f ./haskell-node.sock 2>/dev/null || true
         nohup cardano-node run \
-            --config           config/haskell-preview-config.json \
-            --topology         config/haskell-relay-single-bp-topology.json \
+            --config           config/bp-pair/haskell-relay.config.json \
+            --topology         config/bp-pair/haskell-relay.topology.json \
             --database-path    ./db-haskell \
             --socket-path      ./haskell-node.sock \
             --host-addr        0.0.0.0 \

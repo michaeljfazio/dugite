@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
 # =============================================================================
-# Submit 100 Transactions to Dugite Node (Preview Testnet)
+# Submit N self-to-self transactions on Preview (default N=100). Override with $1 or N=<count>.
 # =============================================================================
 # Self-to-self transactions, each consuming a separate UTxO.
 # Uses dugite-cli for build-raw, sign, and submit.
 # =============================================================================
 set -euo pipefail
-cd "$(dirname "$0")/.."
+cd "$(dirname "$0")/../.."
 
 CLI="./target/release/dugite-cli"
 SOCKET="./node.sock"
@@ -16,7 +16,7 @@ ADDR=$(cat "$KEY_DIR/payment.addr")
 SKEY="$KEY_DIR/payment.skey"
 FEE=200000
 SEND=2000000        # 2 ADA to self
-TX_COUNT=100
+TX_COUNT="${N:-${1:-100}}"
 TMP_DIR=$(mktemp -d)
 
 RED='\033[0;31m'

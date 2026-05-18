@@ -20,13 +20,13 @@
 # Against cardano-node (self-consistency check — the harness should PASS
 # because the golden was captured against cardano-node in the first place):
 #
-#     ./scripts/test-leader-schedule-compat.sh \
+#     ./scripts/validation/leader-schedule-compat.sh \
 #         --socket-path ./haskell-node.sock
 #
 # Against dugite-node (the actual compat test — requires #403 to be fixed
 # so dugite-node can reach a stable listening socket):
 #
-#     ./scripts/test-leader-schedule-compat.sh \
+#     ./scripts/validation/leader-schedule-compat.sh \
 #         --socket-path ./node.sock
 #
 # TODO(#408): once #403 lands and dugite-node's N2C listener is stable,
@@ -41,12 +41,12 @@
 
 set -euo pipefail
 
-cd "$(dirname "$0")/.."
+cd "$(dirname "$0")/../.."
 
 # ---- defaults ---------------------------------------------------------------
 
 SOCKET_PATH=""
-GENESIS="config/shelley-genesis.json"
+GENESIS="config/preview/shelley-genesis.json"
 TESTNET_MAGIC=2
 VRF_SKEY="${HOME}/Downloads/forTorst/vrf.skey"
 GOLDEN="tests/golden/leadership-schedule/preview-epoch-1268/haskell-current.json"

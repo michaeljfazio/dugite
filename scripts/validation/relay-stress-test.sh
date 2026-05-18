@@ -4,9 +4,9 @@
 # Builds N chained transactions offline from each UTxO, then submits in rapid-fire.
 # Tests: mempool ingestion rate, tx validation throughput, relay propagation.
 #
-# Usage: ./scripts/relay-stress-test.sh [--chains N] [--chain-len N]
+# Usage: ./scripts/validation/relay-stress-test.sh [--chains N] [--chain-len N]
 set -uo pipefail
-cd "$(dirname "$0")/.."
+cd "$(dirname "$0")/../.."
 
 CLI="./target/release/dugite-cli"
 SOCKET="./relay.sock"

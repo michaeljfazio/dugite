@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Run Dugite as a block producer on the Cardano preview testnet.
 #
-# Usage: ./scripts/run-bp-preview.sh [--log FILE]
+# Usage: ./scripts/run/bp-preview.sh [--log FILE]
 #
 # Prerequisites:
 #   - Build: cargo build --release
@@ -9,7 +9,7 @@
 #   - Database in ./db-preview/ (use mithril-import first if empty)
 
 set -euo pipefail
-cd "$(dirname "$0")/.."
+cd "$(dirname "$0")/../.."
 
 LOGFILE=""
 while [[ $# -gt 0 ]]; do
@@ -42,8 +42,8 @@ fi
 
 CMD=(
     "$BIN" run
-    --config config/preview-config.json
-    --topology config/preview-topology.json
+    --config config/preview/config.json
+    --topology config/preview/topology.json
     --database-path ./db-preview
     --socket-path ./node.sock
     --host-addr 0.0.0.0

@@ -2,7 +2,7 @@
 # Run the Haskell cardano-node as a relay on the Cardano preview testnet,
 # peering exclusively with a local Dugite node.
 #
-# Usage: ./scripts/run-haskell-relay-preview.sh [--db PATH] [--log FILE]
+# Usage: ./scripts/run/haskell-relay-preview.sh [--db PATH] [--log FILE]
 #
 # Ports (non-conflicting with Dugite defaults):
 #   Node listen:       3002   (Dugite uses 3001)
@@ -21,7 +21,7 @@
 #   - ExperimentalProtocolsEnabled: false
 
 set -euo pipefail
-cd "$(dirname "$0")/.."
+cd "$(dirname "$0")/../.."
 
 DATABASE_PATH=./db-haskell
 LOGFILE=""
@@ -45,8 +45,8 @@ mkdir -p "$DATABASE_PATH"
 
 CMD=(
     "$BIN" run
-    --config           config/haskell-preview-config.json
-    --topology         config/haskell-topology.json
+    --config           config/bp-pair/haskell-relay.config.json
+    --topology         config/bp-pair/haskell-relay.topology.json
     --database-path    "$DATABASE_PATH"
     --socket-path      ./haskell-node.sock
     --host-addr        0.0.0.0

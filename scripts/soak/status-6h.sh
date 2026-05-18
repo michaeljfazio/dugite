@@ -9,7 +9,7 @@
 #   4. Last 8 lines from orchestrator report
 
 set -uo pipefail
-cd "$(dirname "$0")/.."
+cd "$(dirname "$0")/../.."
 
 REPORT_LINK="./logs/soak-6h/orchestrator.current.log"
 DUGITE_METRICS=${DUGITE_METRICS:-http://localhost:12798/metrics}

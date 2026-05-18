@@ -3,7 +3,7 @@
 # caffeinated dugite-node alone (no local Haskell relay) and starts the
 # orchestrator in BARE_BP=1 mode.
 set -euo pipefail
-cd "$(dirname "$0")/.."
+cd "$(dirname "$0")/../.."
 
 mkdir -p ./logs/soak-6h ./logs/bp-pair
 
@@ -21,7 +21,7 @@ if [[ ! -x ./target/release/dugite-node || ! -x ./target/release/dugite-cli ]]; 
 fi
 
 echo "== Launching bare BP (caffeinated)"
-./scripts/launch-bare-bp.sh
+./scripts/soak/launch-bare-bp.sh
 
 echo
 echo "== Waiting 20s for node to settle"
@@ -33,7 +33,7 @@ if ! pgrep -f "dugite-node run" > /dev/null; then
 fi
 
 echo "== Starting soak orchestrator (BARE_BP=1, background)"
-BARE_BP=1 nohup ./scripts/soak-6h-orchestrator.sh > ./logs/soak-6h/orchestrator-stdout.log 2>&1 &
+BARE_BP=1 nohup ./scripts/soak/orchestrator-6h.sh > ./logs/soak-6h/orchestrator-stdout.log 2>&1 &
 ORCH_PID=$!
 echo "$ORCH_PID" > ./logs/soak-6h/orchestrator.pid
 echo "Orchestrator PID $ORCH_PID, report at ./logs/soak-6h/orchestrator.current.log"
@@ -47,4 +47,4 @@ fi
 echo "== All systems go (bare BP mode)"
 echo "BP log:     $(readlink -f ./logs/bp-pair/bp.current.log)"
 echo "Soak rpt:   $(readlink -f ./logs/soak-6h/orchestrator.current.log)"
-echo "Status:     ./scripts/soak-6h-status.sh"
+echo "Status:     ./scripts/soak/status-6h.sh"

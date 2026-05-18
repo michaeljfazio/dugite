@@ -3,7 +3,7 @@
 # `caffeinate -dimsu` to prevent macOS App Nap from freezing the process
 # during long soaks (see memory: macOS App Nap froze BP 2026-05-08).
 set -euo pipefail
-cd "$(dirname "$0")/.."
+cd "$(dirname "$0")/../.."
 
 LOG_DIR="./logs/bp-pair"
 mkdir -p "$LOG_DIR"
@@ -36,8 +36,8 @@ echo "===== Starting cardano-node Haskell relay (port 3002) ====="
 # doesn't suffer from App Nap), but BP does because dugite is a thin Tokio
 # runtime that macOS classifies as napable.
 nohup cardano-node run \
-    --config           config/haskell-preview-config.json \
-    --topology         config/haskell-relay-single-bp-topology.json \
+    --config           config/bp-pair/haskell-relay.config.json \
+    --topology         config/bp-pair/haskell-relay.topology.json \
     --database-path    ./db-haskell \
     --socket-path      ./haskell-node.sock \
     --host-addr        0.0.0.0 \
@@ -71,8 +71,8 @@ echo "===== Starting dugite-node BP (port 3001, caffeinated) ====="
 #   -u  declare user is active (extra App Nap suppression for child PID)
 nohup caffeinate -dimsu \
     ./target/release/dugite-node run \
-    --config config/preview-config.json \
-    --topology config/bp-single-relay-topology.json \
+    --config config/preview/config.json \
+    --topology config/bp-pair/dugite-bp.topology.json \
     --database-path ./db-preview \
     --socket-path ./node.sock \
     --host-addr 0.0.0.0 \

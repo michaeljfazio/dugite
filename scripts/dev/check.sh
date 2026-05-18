@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
 # Run all pre-commit checks: format, clippy, test.
 #
-# Usage: ./scripts/check.sh
+# Usage: ./scripts/dev/check.sh
 
 set -euo pipefail
-cd "$(dirname "$0")/.."
+cd "$(dirname "$0")/../.."
 
 echo "=== Format Check ==="
 cargo fmt --all -- --check

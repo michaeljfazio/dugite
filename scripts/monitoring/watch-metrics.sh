@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Watch Prometheus metrics in real-time (updates every 5 seconds).
 #
-# Usage: ./scripts/watch-metrics.sh [PORT]
+# Usage: ./scripts/monitoring/watch-metrics.sh [PORT]
 
 PORT="${1:-12798}"
 URL="http://localhost:$PORT/metrics"

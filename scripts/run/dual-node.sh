@@ -10,12 +10,12 @@
 #   tail -f logs/bp.log
 #
 # Monitor with:
-#   ./scripts/dual-node-monitor.sh
+#   ./scripts/monitoring/watch-metrics.sh
 #
-# Usage: ./scripts/run-dual-node.sh [--no-build]
+# Usage: ./scripts/run/dual-node.sh [--no-build]
 
 set -euo pipefail
-cd "$(dirname "$0")/.."
+cd "$(dirname "$0")/../.."
 
 SKIP_BUILD=0
 while [[ $# -gt 0 ]]; do
@@ -58,8 +58,8 @@ echo "  Metrics : http://localhost:12798/metrics"
 echo "  Log     : $RELAY_LOG"
 
 "$BIN" run \
-    --config config/relay-config.json \
-    --topology config/relay-topology.json \
+    --config config/bp-pair/dugite-relay.config.json \
+    --topology config/bp-pair/dugite-relay.topology.json \
     --database-path ./db-preview-relay \
     --socket-path ./relay.sock \
     --host-addr 0.0.0.0 \
@@ -84,8 +84,8 @@ echo "  Metrics : http://localhost:12799/metrics"
 echo "  Log     : $BP_LOG"
 
 "$BIN" run \
-    --config config/bp-config.json \
-    --topology config/bp-topology.json \
+    --config config/bp-pair/dugite-bp.config.json \
+    --topology config/bp-pair/dugite-bp.topology.json \
     --database-path ./db-preview \
     --socket-path ./bp.sock \
     --host-addr 0.0.0.0 \
@@ -105,7 +105,7 @@ echo ""
 echo "Both nodes running. To monitor:"
 echo "  tail -f $RELAY_LOG          # relay logs"
 echo "  tail -f $BP_LOG             # bp logs"
-echo "  ./scripts/dual-node-monitor.sh  # metrics dashboard"
+echo "  ./scripts/monitoring/watch-metrics.sh  # metrics dashboard"
 echo ""
 echo "To stop:"
 echo "  kill \$(cat $RELAY_PID_FILE) \$(cat $BP_PID_FILE)"

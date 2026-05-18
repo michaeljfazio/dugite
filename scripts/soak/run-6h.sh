@@ -4,7 +4,7 @@
 #
 # Idempotent: tears down stale nodes first.
 set -euo pipefail
-cd "$(dirname "$0")/.."
+cd "$(dirname "$0")/../.."
 
 mkdir -p ./logs/soak-6h ./logs/bp-pair
 
@@ -22,7 +22,7 @@ if [[ ! -x ./target/release/dugite-node || ! -x ./target/release/dugite-cli ]]; 
 fi
 
 echo "== Launching BP+relay pair (caffeinated)"
-./scripts/launch-bp-pair-caffeinated.sh
+./scripts/soak/run-bp-pair.sh
 
 echo
 echo "== Waiting 20s for nodes to settle"
@@ -39,7 +39,7 @@ if ! pgrep -f "cardano-node run" > /dev/null; then
 fi
 
 echo "== Starting soak orchestrator (background)"
-nohup ./scripts/soak-6h-orchestrator.sh > ./logs/soak-6h/orchestrator-stdout.log 2>&1 &
+nohup ./scripts/soak/orchestrator-6h.sh > ./logs/soak-6h/orchestrator-stdout.log 2>&1 &
 ORCH_PID=$!
 echo "$ORCH_PID" > ./logs/soak-6h/orchestrator.pid
 echo "Orchestrator PID $ORCH_PID, report at ./logs/soak-6h/orchestrator.current.log"
@@ -54,4 +54,4 @@ echo "== All systems go"
 echo "BP log:     $(readlink -f ./logs/bp-pair/bp.current.log)"
 echo "Relay log:  $(readlink -f ./logs/bp-pair/relay.current.log)"
 echo "Soak rpt:   $(readlink -f ./logs/soak-6h/orchestrator.current.log)"
-echo "Status:     ./scripts/soak-6h-status.sh"
+echo "Status:     ./scripts/soak/status-6h.sh"

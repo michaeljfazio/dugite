@@ -1,14 +1,14 @@
 #!/usr/bin/env bash
 # Run Dugite as a relay node on Cardano mainnet.
 #
-# Usage: ./scripts/run-relay-mainnet.sh [--log FILE]
+# Usage: ./scripts/run/relay-mainnet.sh [--log FILE]
 #
 # Prerequisites:
 #   - Build: cargo build --release
 #   - Database in ./db-mainnet/ (use mithril-import first if empty)
 
 set -euo pipefail
-cd "$(dirname "$0")/.."
+cd "$(dirname "$0")/../.."
 
 LOGFILE=""
 while [[ $# -gt 0 ]]; do
@@ -40,8 +40,8 @@ fi
 
 CMD=(
     "$BIN" run
-    --config config/mainnet-config.json
-    --topology config/mainnet-topology.json
+    --config config/mainnet/config.json
+    --topology config/mainnet/topology.json
     --database-path ./db-mainnet
     --socket-path ./node.sock
     --host-addr 0.0.0.0
