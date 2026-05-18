@@ -115,33 +115,32 @@ zoo_submit() {
 }
 
 # Wait up to $timeout seconds for the change UTxO carrying $txid to appear at
-# any of the 3 devnet observers. Returns 0 when seen everywhere.
+# the $ZOO_SOCKET (default relay). We REQUIRE this specific socket because the
+# next test will call zoo_largest_utxo against it; returning early on a
+# different observer (e.g. cbp) leaves a race where the relay still shows the
+# old UTxO and the next tx picks the same input → mempool conflict → silent
+# eviction with "not-included" 60s later. Returns 0 when seen at $ZOO_SOCKET.
 zoo_wait_inclusion() {
     local txid="$1" timeout="${2:-60}"
     local addr; addr=$(cat "$ZOO_PAY_ADDR_FILE")
     local i=0
     while [ "$i" -lt "$timeout" ]; do
-        local n=0
-        for sock in "$LD_RELAY_SOCK" "$LD_DUGITE_BP_SOCK" "$LD_CARDANO_BP_SOCK"; do
-            [ -S "$sock" ] || continue
-            local hit
-            hit=$(cardano-cli conway query utxo \
-                    --testnet-magic "$LD_MAGIC" \
-                    --socket-path "$sock" \
-                    --address "$addr" \
-                    --output-json 2>/dev/null \
-                  | jq --arg t "$txid" '[keys[] | select(startswith($t))] | length' 2>/dev/null \
-                  || echo 0)
-            [ "${hit:-0}" -ge 1 ] && n=$((n+1))
-        done
-        if [ "$n" -ge 1 ]; then
-            zoo_ok "tx $txid seen on $n/3 observers after ${i}s"
+        local hit
+        hit=$(cardano-cli conway query utxo \
+                --testnet-magic "$LD_MAGIC" \
+                --socket-path "$ZOO_SOCKET" \
+                --address "$addr" \
+                --output-json 2>/dev/null \
+              | jq --arg t "$txid" '[keys[] | select(startswith($t))] | length' 2>/dev/null \
+              || echo 0)
+        if [ "${hit:-0}" -ge 1 ]; then
+            zoo_ok "tx $txid seen at ZOO_SOCKET after ${i}s"
             return 0
         fi
         sleep 1
         i=$((i+1))
     done
-    zoo_fail "tx $txid not visible on any observer after ${timeout}s"
+    zoo_fail "tx $txid not visible at ZOO_SOCKET after ${timeout}s"
     return 1
 }
 
