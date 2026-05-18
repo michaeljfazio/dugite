@@ -75,10 +75,60 @@ plutus_lock() {
 
 # Pick a fresh, datum-free collateral UTxO at the payer addr. Plutus txs
 # require collateral; we use the genesis utxo address itself.
+#
+# `prefund_collateral_pool` in lib/keygen.sh pre-splits the addr into ~30
+# small UTxOs (50M lovelace each) so we always have spare candidates. We
+# pick a small UTxO (lovelace <= 100M) that has no datum and no
+# reference script attached — those constraints match what cardano-cli's
+# Plutus phase-2 evaluator requires from a collateral input.
+#
+# Two flavours:
+#   plutus_collateral       — outputs "<txid>#<ix>"  (just the txin)
+#   plutus_collateral_pair  — outputs "<txid>#<ix> <lovelace>" for callers
+#                             that need the lovelace amount (e.g. 03j).
+_plutus_collateral_jq='
+    to_entries
+    | map(select(
+        .value.value.lovelace <= 100000000
+        and (.value.value | keys) == ["lovelace"]
+        and (.value.datumhash // null) == null
+        and (.value.datum // null) == null
+        and (.value.inlineDatum // null) == null
+        and (.value.referenceScript // null) == null
+      ))
+    | sort_by(.value.value.lovelace)
+'
+
 plutus_collateral() {
     local addr; addr=$(cat "$ZOO_PAY_ADDR_FILE")
-    # Pick a UTxO of "reasonable" size (the protocol param maxCollateralInputs
-    # caps how many we can list; here we use exactly one).
-    local utxo; utxo=$(zoo_utxo_at "$addr" 1) || die "plutus_collateral: no spare UTxO"
-    echo "${utxo%% *}"
+    local tmp; tmp=$(mktemp)
+    cardano-cli conway query utxo \
+        --testnet-magic "$LD_MAGIC" \
+        --socket-path   "$ZOO_SOCKET" \
+        --address       "$addr" \
+        --output-json > "$tmp"
+    local txin
+    txin=$(jq -r "$_plutus_collateral_jq | .[0].key // empty" "$tmp")
+    rm -f "$tmp"
+    if [ -z "$txin" ]; then
+        die "plutus_collateral: no spare UTxO ≤100M ADA at $addr — re-run with --setup to provision the collateral pool"
+    fi
+    echo "$txin"
+}
+
+plutus_collateral_pair() {
+    local addr; addr=$(cat "$ZOO_PAY_ADDR_FILE")
+    local tmp; tmp=$(mktemp)
+    cardano-cli conway query utxo \
+        --testnet-magic "$LD_MAGIC" \
+        --socket-path   "$ZOO_SOCKET" \
+        --address       "$addr" \
+        --output-json > "$tmp"
+    local pair
+    pair=$(jq -r "$_plutus_collateral_jq | .[0] | select(. != null) | \"\(.key) \(.value.value.lovelace)\"" "$tmp")
+    rm -f "$tmp"
+    if [ -z "$pair" ]; then
+        die "plutus_collateral_pair: no spare UTxO ≤100M ADA at $addr — re-run with --setup to provision the collateral pool"
+    fi
+    echo "$pair"
 }

@@ -183,6 +183,68 @@ fund_address() {
     die "funder UTxO $consumed_in still visible at $ZOO_SOCKET after 60s"
 }
 
+# Pre-split the genesis payment address into many small UTxOs so the
+# Plutus tests (03a..03h, 03j) always find a spare UTxO for collateral.
+#
+# Without this step the addr holds exactly ONE UTxO (the genesis fund)
+# and each lock tx consumes it + emits a single change output, leaving
+# the addr with only one UTxO again. `plutus_collateral` looks at the
+# second-largest UTxO and fails with "no spare UTxO".
+#
+# We emit $count outputs of $each lovelace each, all at the genesis
+# addr. Idempotent: if there are already $count or more "small"
+# UTxOs (lovelace < threshold), skip.
+prefund_collateral_pool() {
+    local count="${1:-30}" each="${2:-50000000}"
+    local addr; addr=$(cat "$ZOO_PAY_ADDR_FILE")
+    local tmp; tmp=$(mktemp)
+    cardano-cli conway query utxo \
+        --testnet-magic "$LD_MAGIC" \
+        --socket-path   "$ZOO_SOCKET" \
+        --address       "$addr" \
+        --output-json > "$tmp"
+    # Count UTxOs with lovelace at-or-below $each*2 (collateral-shaped).
+    local existing
+    existing=$(jq --argjson e "$each" '[.[] | select(.value.lovelace <= ($e * 2))] | length' "$tmp")
+    if [ "${existing:-0}" -ge "$count" ]; then
+        zoo_info "  collateral pool already provisioned ($existing small UTxOs)"
+        rm -f "$tmp"
+        return 0
+    fi
+    zoo_info "  pre-splitting collateral pool: $count x $each lovelace at $addr"
+
+    # Pick the largest UTxO as the funding input.
+    local in; in=$(jq -r 'to_entries | sort_by(-.value.value.lovelace) | .[0].key' "$tmp")
+    rm -f "$tmp"
+    [ -z "$in" ] || [ "$in" = "null" ] && die "prefund_collateral_pool: no UTxO at $addr"
+
+    local raw="$ZOO_BUILT/prefund-collateral.raw"
+    local signed="$ZOO_BUILT/prefund-collateral.signed"
+    # Build a tx with $count outputs of $each lovelace each, change
+    # back to $addr. cardano-cli auto-balances.
+    local outs=()
+    local i=0
+    while [ "$i" -lt "$count" ]; do
+        outs+=(--tx-out "${addr}+${each}")
+        i=$((i+1))
+    done
+    cardano-cli conway transaction build \
+        --testnet-magic "$LD_MAGIC" \
+        --socket-path   "$ZOO_SOCKET" \
+        --tx-in         "$in" \
+        "${outs[@]}" \
+        --change-address "$addr" \
+        --out-file      "$raw" >/dev/null
+    cardano-cli conway transaction sign \
+        --testnet-magic "$LD_MAGIC" \
+        --tx-body-file  "$raw" \
+        --signing-key-file "$ZOO_PAY_SKEY" \
+        --out-file      "$signed" >/dev/null
+    local txid; txid=$(zoo_submit "$signed")
+    zoo_wait_inclusion "$txid" 120 || die "prefund_collateral_pool: tx $txid not seen"
+    zoo_info "  collateral pool ready ($count outputs in tx ${txid:0:16}…)"
+}
+
 # Top-level: provision every key the zoo needs.
 keygen_all() {
     zoo_require_devnet
@@ -198,6 +260,10 @@ keygen_all() {
     # Fund the sub-wallets so they can submit their own txs.
     fund_address "$ZOO_KEYS/wallet-a/payment-stake.addr" 5000000000 1000000000
     fund_address "$ZOO_KEYS/wallet-b/payment-stake.addr" 5000000000 1000000000
+    # Pre-split the genesis addr so plutus_collateral always finds a
+    # spare UTxO (the 03 category locks + collateral pattern would
+    # otherwise exhaust the single genesis UTxO).
+    prefund_collateral_pool 30 50000000
     zoo_info "keygen complete — $(ls -1 "$ZOO_KEYS" | wc -l | tr -d ' ') sub-dirs"
 }
 

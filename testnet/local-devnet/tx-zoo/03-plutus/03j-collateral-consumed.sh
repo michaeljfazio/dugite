@@ -3,7 +3,11 @@
 # script actually FAILS Phase-2.  This is the LEGITIMATE collateral-consumed
 # path: the ledger consumes collateral and skips regular inputs/outputs.
 #
-# Script used: always-false-v2.plutus (UPLC error term — always fails).
+# Script used: always-false-v3.plutus — an Aiken-compiled validator whose
+# spend handler is `fail`. The is_valid=false + script-fails path is
+# era-agnostic; we use V3 because Aiken supports only V3 (the previous
+# vendored always-false-v2 cborHex was malformed UPLC).
+#
 # The tx body declares is_valid=false (--script-invalid) AND evaluation
 # agrees (scripts fail), so admission is accepted and collateral consumed.
 #
@@ -17,16 +21,16 @@ ZOO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
 NAME="$(zoo_name)"
 zoo_require_devnet
-SCRIPT="$ZOO_DIR/lib/plutus/always-false-v2.plutus"
+SCRIPT="$ZOO_DIR/lib/plutus/always-false-v3.plutus"
 [ -s "$SCRIPT" ] || { zoo_skip "missing $SCRIPT"; zoo_record "$NAME" SKIP; exit 0; }
 
 PAIR=$(plutus_lock "$SCRIPT" inline 5000000) || { zoo_record "$NAME" FAIL "" "lock"; exit 1; }
 SCRIPT_TXIN=${PAIR%% *}
 SCRIPT_AMT=${PAIR##* }
 
-COLLAT_RAW=$(zoo_utxo_at "$(cat "$ZOO_PAY_ADDR_FILE")" 1) || { zoo_record "$NAME" FAIL "" "collat"; exit 1; }
-COLLAT=${COLLAT_RAW%% *}
-COLLAT_AMT=${COLLAT_RAW##* }
+COLLAT_PAIR=$(plutus_collateral_pair) || { zoo_record "$NAME" FAIL "" "collat"; exit 1; }
+COLLAT=${COLLAT_PAIR%% *}
+COLLAT_AMT=${COLLAT_PAIR##* }
 RETURN_AMT=$((COLLAT_AMT - 2000000))
 [ "$RETURN_AMT" -lt 1000000 ] && { zoo_skip "collateral utxo too small ($COLLAT_AMT)"; zoo_record "$NAME" SKIP; exit 0; }
 
@@ -70,5 +74,5 @@ cardano-cli conway transaction sign \
     --signing-key-file "$ZOO_PAY_SKEY" \
     --out-file      "$SIGNED" >/dev/null
 TXID=$(zoo_submit "$SIGNED") || { zoo_record "$NAME" FAIL "" "submit"; exit 1; }
-zoo_wait_inclusion "$TXID" 90 && zoo_record "$NAME" PASS "$TXID" "is_valid=false always-false-v2 consumed=$((COLLAT_AMT - RETURN_AMT))" \
+zoo_wait_inclusion "$TXID" 90 && zoo_record "$NAME" PASS "$TXID" "is_valid=false always-false-v3 consumed=$((COLLAT_AMT - RETURN_AMT))" \
                               || zoo_record "$NAME" FAIL "$TXID" "not-included"

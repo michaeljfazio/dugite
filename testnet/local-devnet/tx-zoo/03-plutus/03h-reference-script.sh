@@ -42,9 +42,17 @@ REF_TXIN=$(jq -r --arg t "$DEP_TXID" '
     to_entries
     | map(select(.key | startswith($t)))
     | map(select(.value.referenceScript != null))
-    | .[0].key' "$TMP")
+    | .[0].key // empty' "$TMP")
 rm -f "$TMP"
-[ -z "$REF_TXIN" ] && { zoo_fail "could not locate ref-script output"; zoo_record "$NAME" FAIL "$DEP_TXID" "no-ref-out"; exit 1; }
+if [ -z "$REF_TXIN" ]; then
+    # No output with a referenceScript attached. Either the deposit tx
+    # didn't carry one (build/encode bug) OR the N2C query handler
+    # dropped the referenceScript field (dugite bug). Either way we
+    # can't continue — record and exit cleanly.
+    zoo_fail "could not locate ref-script output (dugite N2C query utxo may not surface referenceScript)"
+    zoo_record "$NAME" FAIL "$DEP_TXID" "no-ref-out"
+    exit 1
+fi
 
 # Step 2: lock funds at the V2 script addr (inline datum).
 PAIR=$(plutus_lock "$SCRIPT" inline 5000000) || { zoo_record "$NAME" FAIL "" "lock"; exit 1; }
