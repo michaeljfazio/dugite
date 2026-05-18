@@ -551,23 +551,6 @@ impl NodePeerManager {
         }
     }
 
-    /// Transition an active outbound connection back to idle.
-    ///
-    /// Called when demoting hot → warm on an outbound connection.
-    /// `OutboundDup` → `OutboundIdle(Duplex)`, `OutboundUni` → `OutboundIdle(Unidirectional)`.
-    pub fn mark_outbound_idle(&mut self, addr: &SocketAddr) {
-        if let Some(state) = self.conn_states.get(addr) {
-            let new_state = match state {
-                ConnectionState::OutboundDup => ConnectionState::OutboundIdle(DataFlow::Duplex),
-                ConnectionState::OutboundUni => {
-                    ConnectionState::OutboundIdle(DataFlow::Unidirectional)
-                }
-                _ => return,
-            };
-            self.conn_states.insert(*addr, new_state);
-        }
-    }
-
     /// Transition an inbound idle connection to active (responder protocols running).
     ///
     /// Called when promoting warm → hot on an inbound connection.
@@ -576,20 +559,6 @@ impl NodePeerManager {
         if let Some(state) = self.conn_states.get(addr) {
             let new_state = match state {
                 ConnectionState::InboundIdle(df) => ConnectionState::InboundState(*df),
-                _ => return,
-            };
-            self.conn_states.insert(*addr, new_state);
-        }
-    }
-
-    /// Transition an active inbound connection back to idle.
-    ///
-    /// Called when demoting hot → warm on an inbound connection.
-    /// `InboundState(df)` → `InboundIdle(df)`.
-    pub fn mark_inbound_idle(&mut self, addr: &SocketAddr) {
-        if let Some(state) = self.conn_states.get(addr) {
-            let new_state = match state {
-                ConnectionState::InboundState(df) => ConnectionState::InboundIdle(*df),
                 _ => return,
             };
             self.conn_states.insert(*addr, new_state);
