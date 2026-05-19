@@ -1902,6 +1902,29 @@ impl Node {
                     return Err(e.into());
                 }
             };
+
+            // A-009 (security audit 2026-05-19): warn if the socket file is
+            // world-readable/writable.  Haskell cardano-node relies on filesystem
+            // permissions as the sole access-control mechanism for N2C; we enforce
+            // the same convention by warning operators if the umask is too permissive.
+            // The recommended permission is 0o600 (owner r/w only) or 0o660 (group).
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                if let Ok(meta) = std::fs::metadata(&n2c_socket_path) {
+                    let mode = meta.permissions().mode();
+                    if mode & 0o006 != 0 {
+                        warn!(
+                            socket = %n2c_socket_path.display(),
+                            mode = format_args!("{:#o}", mode & 0o777),
+                            "N2C socket is world-readable/writable — any local process can \
+                             submit transactions. Restrict with: chmod 600 {}",
+                            n2c_socket_path.display()
+                        );
+                    }
+                }
+            }
+
             info!(
                 socket = %n2c_socket_path.display(),
                 "N2C server listening"
@@ -2483,6 +2506,42 @@ impl Node {
                 .filter(|ip| crate::node::networking::is_non_public_ip(*ip))
                 .collect();
 
+            // A-001 / A-002 (security audit 2026-05-19): gate every inbound
+            // connection through a Semaphore (global cap) and a ConnectionManager
+            // (per-IP cap + state tracking) before spawning a handler task.
+            //
+            // Previously `accepted_connections_limit` was parsed from config but
+            // never consulted at the accept point — `ConnectionManager::accept_inbound`
+            // was dead code. Now it is the single mandatory gate.
+            //
+            // Haskell `cardano-node` enforces limits in `Server.run` via
+            // `ConnectionLimits` (maxAcceptedConnections + maxAcceptedConnectionsPerHost)
+            // acquired before the TCP fd enters the handshake pipeline.
+            let n2n_max_inbound = self
+                .config
+                .accepted_connections_limit
+                .unwrap_or_default()
+                .hard_limit as usize;
+            let n2n_per_ip_limit: usize = 5; // matches Haskell maxAcceptedConnectionsPerHost default
+
+            // The semaphore doubles as a backpressure signal: when all permits
+            // are taken the accept() call still proceeds (we don't want to stop
+            // calling accept() as that would fill the OS SYN backlog), but the
+            // spawn is immediately rejected by the ConnectionManager check below.
+            let n2n_conn_semaphore =
+                std::sync::Arc::new(tokio::sync::Semaphore::new(n2n_max_inbound));
+
+            // Shared ConnectionManager for per-IP rate limiting.
+            let n2n_conn_mgr = std::sync::Arc::new(dugite_network::ConnectionManager::new(
+                dugite_network::ConnectionManagerConfig {
+                    max_inbound: n2n_max_inbound,
+                    max_outbound: 20,
+                    per_ip_rate_limit: n2n_per_ip_limit,
+                    network_magic: n2n_network_magic,
+                    peer_sharing: n2n_peer_sharing,
+                },
+            ));
+
             let n2n_inbound_tx = inbound_accept_tx.clone();
             tokio::spawn(async move {
                 let mut shutdown = n2n_shutdown_rx;
@@ -2512,7 +2571,58 @@ impl Node {
                                         drop(stream);
                                         continue;
                                     }
-                                    info!(%peer_addr, "N2N inbound connection accepted");
+
+                                    // A-001 / A-002: gate through ConnectionManager before spawning.
+                                    match n2n_conn_mgr.accept_inbound(peer_addr).await {
+                                        Ok(()) => {}
+                                        Err(dugite_network::ConnectionError::MaxConnectionsReached) => {
+                                            info!(
+                                                %peer_addr,
+                                                max = n2n_max_inbound,
+                                                "N2N inbound rejected: max connections reached"
+                                            );
+                                            drop(stream);
+                                            continue;
+                                        }
+                                        Err(dugite_network::ConnectionError::RateLimited(_)) => {
+                                            debug!(
+                                                %peer_addr,
+                                                per_ip_limit = n2n_per_ip_limit,
+                                                "N2N inbound rejected: per-IP rate limit"
+                                            );
+                                            drop(stream);
+                                            continue;
+                                        }
+                                        Err(e) => {
+                                            debug!(%peer_addr, error = %e, "N2N inbound rejected by connection manager");
+                                            drop(stream);
+                                            continue;
+                                        }
+                                    }
+
+                                    // Acquire a semaphore permit (non-blocking try variant).
+                                    // The permit is dropped when the connection task exits,
+                                    // freeing the slot for the next inbound connection.
+                                    let permit = match n2n_conn_semaphore.clone().try_acquire_owned() {
+                                        Ok(p) => p,
+                                        Err(_) => {
+                                            // All permits taken — ConnectionManager already
+                                            // enforces max_inbound; this is a double-check.
+                                            info!(
+                                                %peer_addr,
+                                                "N2N inbound rejected: semaphore full"
+                                            );
+                                            n2n_conn_mgr.remove_connection(&peer_addr).await;
+                                            drop(stream);
+                                            continue;
+                                        }
+                                    };
+
+                                    // A-007 (security audit 2026-05-19): downgrade to debug.
+                                    // One INFO log per TCP SYN at 100 conn/s = ~50 KB/s of
+                                    // structured JSON log traffic; synchronous log drain stalls
+                                    // the async runtime. Haskell traces at Debug severity.
+                                    debug!(%peer_addr, "N2N inbound connection accepted");
                                     let conn_metrics = n2n_metrics.clone();
                                     conn_metrics
                                         .n2n_connections_total
@@ -2521,8 +2631,12 @@ impl Node {
                                     let magic = n2n_network_magic;
                                     let ps = n2n_peer_sharing;
                                     let tx = n2n_inbound_tx.clone();
+                                    let cm = n2n_conn_mgr.clone();
 
                                     tokio::spawn(async move {
+                                        // `permit` is held for the lifetime of this task.
+                                        // Dropping it at end of scope releases the semaphore slot.
+                                        let _permit = permit;
                                         let start = std::time::Instant::now();
                                         match PeerConnection::accept(
                                             stream, peer_addr, magic, false, ps,
@@ -2535,6 +2649,8 @@ impl Node {
                                                 let _ = tx.send(Err((peer_addr, e.to_string()))).await;
                                             }
                                         }
+                                        // Decrement per-IP counter on task exit.
+                                        cm.remove_connection(&peer_addr).await;
                                     });
                                 }
                                 Err(e) => {
