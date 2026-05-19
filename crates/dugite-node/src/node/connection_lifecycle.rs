@@ -1558,6 +1558,22 @@ impl ConnectionLifecycleManager {
                             .transactions_received
                             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
+                        // B7: Hard cap on tx body size before any decoding or
+                        // Plutus evaluation.  A malicious peer can send a tx at
+                        // the maximum protocol size (16,384 bytes) that passes
+                        // Phase-1 but triggers worst-case Plutus V3 execution.
+                        // Without this pre-flight check, 100 such txs in rapid
+                        // succession can saturate the tokio runtime for seconds.
+                        // The Cardano protocol max tx size is 16,384 bytes per
+                        // protocol parameter `maxTxSize` (Conway value).
+                        const MAX_TX_BODY_BYTES: usize = 16_384;
+                        if tx_bytes.len() > MAX_TX_BODY_BYTES {
+                            tx_metrics
+                                .transactions_rejected
+                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            return false;
+                        }
+
                         // Run full Phase-1 + Phase-2 validation (including IsValid
                         // tag check) before mempool admission.  This mirrors
                         // Haskell cardano-node's `applyTx` (mempool admission path)
