@@ -28,7 +28,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::signal;
-use tokio::sync::{mpsc, watch, RwLock};
+use tokio::sync::{mpsc, watch, RwLock, Semaphore};
 use tokio::task::JoinHandle;
 use tracing::{debug, error, info, trace, warn};
 
@@ -1281,11 +1281,13 @@ impl Node {
         // network_magic computed earlier (before ledger snapshot loading).
         // Server tasks are spawned in run() and live for the node's lifetime.
 
-        // Wire up live UTxO provider before wrapping in lock
+        // Wire up live UTxO provider and ChainDB before wrapping in lock.
+        // ChainDB is needed for validate_acquire (C1: SpecificPoint on-chain check).
         let mut qh = QueryHandler::new(args.config.max_major_protocol_version() as u32);
         qh.set_utxo_provider(Arc::new(serve::LedgerUtxoProvider {
             ledger: ledger_state.clone(),
         }));
+        qh.set_chain_db(chain_db.clone());
         let query_handler = Arc::new(RwLock::new(qh));
 
         // Load block producer credentials if key paths are provided.
@@ -1920,17 +1922,43 @@ impl Node {
             let n2c_block_ann_tx = block_ann_tx;
             let n2c_rollback_ann_tx = rollback_ann_tx;
 
+            // C4 fix: bound the number of concurrent N2C connections.
+            // Matches Haskell cardano-node's default of 64 concurrent N2C clients.
+            // When the limit is reached, new accepts are dropped (not queued).
+            const MAX_N2C_CONNECTIONS: usize = 64;
+            let n2c_semaphore = Arc::new(Semaphore::new(MAX_N2C_CONNECTIONS));
+
             tokio::spawn(async move {
                 let mut shutdown = n2c_shutdown_rx;
                 // Track spawned connection handlers so we can abort them on
                 // shutdown — otherwise they block indefinitely waiting for
                 // client I/O, preventing the process from exiting.
+                //
+                // C13 fix: prune finished handles every PRUNE_INTERVAL accepts
+                // to prevent unbounded Vec growth over long-running nodes.
                 let mut conn_handles: Vec<tokio::task::JoinHandle<()>> = Vec::new();
+                let mut accept_count: usize = 0;
+                const PRUNE_INTERVAL: usize = 64;
+
                 loop {
                     tokio::select! {
                         accept_result = listener.accept() => {
                             match accept_result {
                                 Ok((stream, _addr)) => {
+                                    // C4: enforce connection limit — drop the connection
+                                    // if we are already at MAX_N2C_CONNECTIONS.
+                                    let permit = match n2c_semaphore.clone().try_acquire_owned() {
+                                        Ok(p) => p,
+                                        Err(_) => {
+                                            warn!(
+                                                limit = MAX_N2C_CONNECTIONS,
+                                                "N2C connection limit reached — dropping new connection"
+                                            );
+                                            // stream is dropped here, closing the socket.
+                                            continue;
+                                        }
+                                    };
+
                                     let conn_metrics = n2c_metrics.clone();
                                     conn_metrics
                                         .n2c_connections_total
@@ -1950,6 +1978,10 @@ impl Node {
                                     let magic = n2c_network_magic;
 
                                     let handle = tokio::spawn(async move {
+                                        // permit is held for the duration of the connection
+                                        // and released (dropping the OwnedSemaphorePermit)
+                                        // when the task exits.
+                                        let _permit = permit;
                                         if let Err(e) = Self::handle_n2c_connection(
                                             stream, magic, qh, bp, mp, tv, ledger, ann_rx,
                                             rb_rx, metrics.clone(),
@@ -1963,6 +1995,14 @@ impl Node {
                                             .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
                                     });
                                     conn_handles.push(handle);
+
+                                    // C13 fix: periodically prune completed JoinHandles
+                                    // to prevent unbounded Vec growth (each finished handle
+                                    // is ~128 bytes; over millions of connections this adds up).
+                                    accept_count += 1;
+                                    if accept_count.is_multiple_of(PRUNE_INTERVAL) {
+                                        conn_handles.retain(|h| !h.is_finished());
+                                    }
                                 }
                                 Err(e) => {
                                     warn!("N2C accept error: {e}");
@@ -4101,25 +4141,36 @@ impl Node {
         let lts_mempool = mempool.clone();
         let lts_metrics = metrics.clone();
         let lts_task = tokio::spawn(async move {
-            let on_accepted = |era_id: u16, tx_bytes: Vec<u8>| {
+            // C12 fix: on_accepted now returns Result<(), String> so the server
+            // can send MsgRejectTx if the mempool fails to admit the transaction
+            // after successful Phase-1/Phase-2 validation. This prevents the
+            // protocol violation of sending MsgAcceptTx for an un-admitted tx.
+            let on_accepted = |era_id: u16, tx_bytes: Vec<u8>| -> Result<(), String> {
                 // Decode the transaction and add it to the mempool.
                 let size_bytes = tx_bytes.len();
                 match dugite_serialization::decode_transaction(era_id, &tx_bytes) {
                     Ok(tx) => {
                         let tx_hash = tx.hash;
                         debug!("N2C tx accepted, adding to mempool: {}", tx_hash);
-                        if let Err(e) = lts_mempool.add_tx(tx_hash, tx, size_bytes) {
-                            debug!("N2C tx accepted but mempool add failed: {e}");
+                        match lts_mempool.add_tx(tx_hash, tx, size_bytes) {
+                            Ok(_) => {
+                                // Update mempool metrics immediately
+                                lts_metrics.set_mempool_count(lts_mempool.len() as u64);
+                                lts_metrics.mempool_bytes.store(
+                                    lts_mempool.total_bytes() as u64,
+                                    std::sync::atomic::Ordering::Relaxed,
+                                );
+                                Ok(())
+                            }
+                            Err(e) => {
+                                debug!("N2C tx accepted but mempool add failed: {e}");
+                                Err(e.to_string())
+                            }
                         }
-                        // Update mempool metrics immediately after accepting a transaction
-                        lts_metrics.set_mempool_count(lts_mempool.len() as u64);
-                        lts_metrics.mempool_bytes.store(
-                            lts_mempool.total_bytes() as u64,
-                            std::sync::atomic::Ordering::Relaxed,
-                        );
                     }
                     Err(e) => {
                         debug!("N2C tx decode for mempool failed: {e}");
+                        Err(e.to_string())
                     }
                 }
             };
@@ -4154,13 +4205,58 @@ impl Node {
             }
         });
 
-        // LocalStateQuery server
+        // LocalStateQuery server.
+        //
+        // C3 fix: do NOT hold the RwLock guard for the entire connection lifetime.
+        // The old pattern `let handler = lsq_handler.read().await;` blocked the
+        // periodic `update_state()` write lock until the client disconnected.
+        // Instead, use a per-query wrapper that acquires and releases the read lock
+        // inside each dispatch method — the lock is never held across an .await point.
         let lsq_handler = query_handler;
         let lsq_task = tokio::spawn(async move {
-            let handler = lsq_handler.read().await;
+            // Per-query read-lock wrapper: acquires a blocking_read() guard for each
+            // individual dispatch call and drops it before returning. This ensures
+            // update_state() can always acquire its write lock between queries.
+            struct PerQueryHandler(Arc<RwLock<QueryHandler>>);
+            impl dugite_network::QueryHandler for PerQueryHandler {
+                fn handle_query(
+                    &self,
+                    query_cbor: &[u8],
+                    n2c_version: u16,
+                ) -> Result<Vec<u8>, String> {
+                    // Acquire read guard for this single query dispatch, then release.
+                    let guard = tokio::task::block_in_place(|| self.0.blocking_read());
+                    guard.handle_query(query_cbor, n2c_version)
+                }
+                fn handle_block_query(
+                    &self,
+                    tag: u64,
+                    query_cbor: &[u8],
+                ) -> Result<Vec<u8>, String> {
+                    let guard = tokio::task::block_in_place(|| self.0.blocking_read());
+                    guard.handle_block_query(tag, query_cbor)
+                }
+                fn handle_query_anytime(&self, query_cbor: &[u8]) -> Result<Vec<u8>, String> {
+                    let guard = tokio::task::block_in_place(|| self.0.blocking_read());
+                    guard.handle_query_anytime(query_cbor)
+                }
+                fn handle_query_hard_fork(&self, query_cbor: &[u8]) -> Result<Vec<u8>, String> {
+                    let guard = tokio::task::block_in_place(|| self.0.blocking_read());
+                    guard.handle_query_hard_fork(query_cbor)
+                }
+                fn validate_acquire(
+                    &self,
+                    target: &dugite_network::protocol::local_state_query::AcquireTarget,
+                ) -> Result<(), dugite_network::protocol::local_state_query::AcquireFailure>
+                {
+                    let guard = tokio::task::block_in_place(|| self.0.blocking_read());
+                    guard.validate_acquire(target)
+                }
+            }
+            let wrapper = PerQueryHandler(lsq_handler);
             if let Err(e) = protocol::local_state_query::server::LocalStateQueryServer::run(
                 &mut sq_ch,
-                &*handler,
+                &wrapper,
                 n2c_version,
             )
             .await
