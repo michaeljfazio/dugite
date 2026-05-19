@@ -713,6 +713,22 @@ impl Node {
         } else {
             ValidationMode::Replay
         };
+
+        // Issue #545 E1: compute the wall-clock slot ONCE before the header
+        // validation loop.  `validate_header_full` checks `header.slot >
+        // current_slot`; the old code passed `block.slot()` as current_slot,
+        // making the guard tautologically false (same value on both sides).
+        //
+        // Haskell's `updateChainDepState` obtains the current slot via
+        // `getCurrentSlot` (wall clock), not from the candidate block.
+        //
+        // Fallback: if the wall-clock derivation fails (e.g. no Shelley genesis
+        // loaded on a pure Byron node or very early in startup), fall back to the
+        // ledger tip slot so the check is still meaningful even if not wall-clock
+        // exact.  A block arriving whose slot is ahead of the tip is suspicious and
+        // should be scrutinised; only a block in the far future is truly dangerous.
+        let wall_clock_slot = self.current_wall_clock_slot().await;
+
         {
             // Read ledger state once for the whole batch
             let ls = self.ledger_state.read().await;
@@ -792,8 +808,18 @@ impl Node {
 
                     pool_reg.map(|reg| {
                         if total_active_stake == 0 {
-                            // No snapshot data — just do VRF key binding, skip leader check.
-                            // Use 1/1 (= 100%) so the pool passes the threshold trivially.
+                            // Issue #545 E7: no stake snapshot yet (first ~3 epochs of sync).
+                            // VRF key binding still runs (vrf_keyhash comparison below), but the
+                            // leader threshold check is skipped — any registered pool passes.
+                            // Haskell uses `MissingStake` when the snapshot entry is absent;
+                            // we log a warning in strict mode so operators know the window exists.
+                            if strict {
+                                warn!(
+                                    slot = block.slot().0,
+                                    "Leader check: no stake snapshot available — skipping threshold \
+                                     (stake = 1/1). This window covers the first ~3 epochs of sync."
+                                );
+                            }
                             return BlockIssuerInfo {
                                 vrf_keyhash: reg.vrf_keyhash,
                                 pool_stake: 1,
@@ -832,9 +858,19 @@ impl Node {
                     return 0;
                 }
 
+                // Issue #545 E1: use the wall-clock slot as `current_slot`.
+                // Fall back to the ledger tip slot if the wall clock is unavailable,
+                // and ultimately to the block's own slot (old, incorrect behaviour)
+                // only as a last resort.  Using the block's slot makes the future-slot
+                // guard tautologically false (`block.slot() > block.slot()` is always
+                // false); using the wall clock matches Haskell's `getCurrentSlot`.
+                let current_slot_for_check = wall_clock_slot
+                    .or_else(|| ls.tip.point.slot())
+                    .unwrap_or(block.slot());
+
                 if let Err(e) = self.consensus.validate_header_full(
                     &header_with_nonce,
-                    block.slot(),
+                    current_slot_for_check,
                     issuer_info.as_ref(),
                     overlay_ctx.as_ref(),
                     mode,
@@ -1191,6 +1227,31 @@ impl Node {
                                 "EBB advance failed: {e} — skipping block"
                             );
                             break;
+                        }
+                    }
+                }
+
+                // Issue #545 E5: body hash check in bulk apply path.
+                // A malicious relay could substitute block body bytes while leaving
+                // the header signatures intact.  Check before ledger apply so
+                // corrupted bodies never enter ledger state.  Byron blocks have no
+                // body_hash field and are skipped.
+                if block.era.is_shelley_based() {
+                    if let Some(raw) = block.raw_cbor.as_deref() {
+                        if let Some(body_bytes) = dugite_serialization::extract_block_body_cbor(raw)
+                        {
+                            if let Err(e) = dugite_consensus::praos::validate_block_body_hash(
+                                &block.header,
+                                body_bytes,
+                            ) {
+                                warn!(
+                                    slot = block.slot().0,
+                                    block_no = block.block_number().0,
+                                    hash = %block.hash().to_hex(),
+                                    "Body hash mismatch in bulk apply — skipping block: {e}"
+                                );
+                                break;
+                            }
                         }
                     }
                 }

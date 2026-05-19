@@ -225,6 +225,98 @@ pub fn compute_block_body_size_from_cbor(raw_cbor: &[u8]) -> Option<u64> {
     Some((off - body_start) as u64)
 }
 
+/// Extract the raw CBOR bytes of the block body from a full block CBOR buffer.
+///
+/// The Cardano wire format is `[era_tag, [header, tx_bodies, witnesses, aux_data,
+/// invalid_txs]]`.  The block body hash (`header.body_hash`) is
+/// `blake2b_256(body_bytes)` where `body_bytes` is the concatenation of the
+/// serialized body components (indices 1..N-1 of the inner array, i.e.
+/// everything except the header at index 0).
+///
+/// This matches Haskell's `mkOriginalBlockBodyHashed` in
+/// `Ouroboros.Consensus.Shelley.Ledger.Block`.
+///
+/// Returns `None` for Byron/EBB blocks (which have no `body_hash` header field)
+/// or if the CBOR structure is not parseable.
+///
+/// Issue #545 E5: used to wire body-hash verification into `apply_fetched_block`.
+pub fn extract_block_body_cbor(raw_cbor: &[u8]) -> Option<&[u8]> {
+    use crate::haskell_snapshot::cbor_utils::skip_cbor_value;
+
+    if raw_cbor.is_empty() {
+        return None;
+    }
+
+    // Outer array: [era_tag, inner_block]
+    let outer_major = raw_cbor[0] >> 5;
+    if outer_major != 4 {
+        return None;
+    }
+    let info = raw_cbor[0] & 0x1f;
+    let (outer_len, mut off) = match info {
+        0..=23 => (info as u64, 1usize),
+        24 if raw_cbor.len() >= 2 => (raw_cbor[1] as u64, 2),
+        _ => return None,
+    };
+    if outer_len != 2 {
+        return None;
+    }
+
+    // Read and skip era tag
+    if off >= raw_cbor.len() {
+        return None;
+    }
+    let era_major = raw_cbor[off] >> 5;
+    if era_major != 0 {
+        return None;
+    }
+    let era_info = raw_cbor[off] & 0x1f;
+    let era_tag = match era_info {
+        0..=23 => era_info as u64,
+        24 if raw_cbor.len() > off + 1 => raw_cbor[off + 1] as u64,
+        _ => return None,
+    };
+    if era_tag <= 1 {
+        // Byron — no body_hash
+        return None;
+    }
+    let era_size = skip_cbor_value(&raw_cbor[off..]).ok()?;
+    off += era_size;
+
+    // Inner array: [header, tx_bodies, witnesses, aux_data, invalid_txs]
+    if off >= raw_cbor.len() {
+        return None;
+    }
+    let inner_major = raw_cbor[off] >> 5;
+    if inner_major != 4 {
+        return None;
+    }
+    let inner_info = raw_cbor[off] & 0x1f;
+    let (inner_len, hdr_bytes) = match inner_info {
+        0..=23 => (inner_info as u64, 1usize),
+        24 if raw_cbor.len() > off + 1 => (raw_cbor[off + 1] as u64, 2),
+        _ => return None,
+    };
+    if inner_len < 4 {
+        return None;
+    }
+    off += hdr_bytes;
+
+    // Skip the header (index 0)
+    let header_size = skip_cbor_value(&raw_cbor[off..]).ok()?;
+    off += header_size;
+
+    // Body starts here: indices 1..inner_len-1 (tx_bodies, witnesses, aux_data, invalid_txs)
+    let body_start = off;
+    let body_components = inner_len - 1;
+    for _ in 0..body_components {
+        let item_size = skip_cbor_value(&raw_cbor[off..]).ok()?;
+        off += item_size;
+    }
+
+    Some(&raw_cbor[body_start..off])
+}
+
 /// Shared block decode implementation.
 ///
 /// `mode` controls whether witness-set fields are populated.  All callers should
