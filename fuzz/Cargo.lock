@@ -602,7 +602,7 @@ dependencies = [
 
 [[package]]
 name = "dugite-consensus"
-version = "1.3.0"
+version = "1.7.0"
 dependencies = [
  "async-trait",
  "chrono",
@@ -624,7 +624,7 @@ dependencies = [
 
 [[package]]
 name = "dugite-crypto"
-version = "1.3.0"
+version = "1.7.0"
 dependencies = [
  "curve25519-dalek 3.2.0 (git+https://github.com/iquerejeta/curve25519-dalek?branch=ietf03_vrf_compat_ell2)",
  "dashu-base",
@@ -667,7 +667,7 @@ dependencies = [
 
 [[package]]
 name = "dugite-ledger"
-version = "1.3.0"
+version = "1.7.0"
 dependencies = [
  "bincode",
  "dugite-crypto",
@@ -688,7 +688,7 @@ dependencies = [
 
 [[package]]
 name = "dugite-lsm"
-version = "1.3.0"
+version = "1.7.0"
 dependencies = [
  "byteorder",
  "crc32fast",
@@ -699,7 +699,7 @@ dependencies = [
 
 [[package]]
 name = "dugite-mempool"
-version = "1.3.0"
+version = "1.7.0"
 dependencies = [
  "dashmap",
  "dugite-crypto",
@@ -713,7 +713,7 @@ dependencies = [
 
 [[package]]
 name = "dugite-network"
-version = "1.3.0"
+version = "1.7.0"
 dependencies = [
  "async-trait",
  "byteorder",
@@ -736,7 +736,7 @@ dependencies = [
 
 [[package]]
 name = "dugite-primitives"
-version = "1.3.0"
+version = "1.7.0"
 dependencies = [
  "bech32 0.11.1",
  "blake2",
@@ -755,7 +755,7 @@ dependencies = [
 
 [[package]]
 name = "dugite-serialization"
-version = "1.3.0"
+version = "1.7.0"
 dependencies = [
  "bytes",
  "dugite-primitives",
@@ -773,10 +773,11 @@ dependencies = [
 
 [[package]]
 name = "dugite-storage"
-version = "1.3.0"
+version = "1.7.0"
 dependencies = [
  "bytes",
  "crc32fast",
+ "dugite-consensus",
  "dugite-crypto",
  "dugite-primitives",
  "dugite-serialization",

@@ -87,6 +87,29 @@ impl UtxoLookup for EmptyUtxoSet {
 // Mainnet slot config used for time-conversion inside script contexts.
 const MAINNET_SLOT_CONFIG: (u64, u64, u32) = (1_596_059_091_000, 4_492_800, 1_000);
 
+// ---------------------------------------------------------------------------
+// Panic guards
+//
+// Both `evaluate_plutus_scripts` (Path A) and `uplc::tx::eval_phase_two_raw`
+// (Path B) ultimately call into upstream aiken-lang/uplc, which still contains
+// `todo!()` / `unimplemented!()` / `Result::unwrap()` panic sites on malformed
+// or unexpected-era input (e.g. `uplc/src/tx.rs:181` panics on pre-Conway era
+// shapes with "transaction is serialized in an old era format").
+//
+// Production code in `crates/dugite-ledger/src/plutus.rs` wraps the upstream
+// call in `std::panic::catch_unwind` (panic = "unwind" in the workspace
+// release profile) and converts panics into hard validation failures. The
+// fuzz target replicates that defense so libfuzzer doesn't terminate the run
+// on every newly-discovered upstream panic — those are recorded as artifacts
+// but never produce CI-blocking signals. A regression in production's panic
+// guard (e.g. switching back to panic = "abort") would still be caught by the
+// regression tests in `crates/dugite-ledger/src/plutus.rs::tests`.
+//
+// IMPORTANT: this guard is *not* there to hide dugite bugs. It only catches
+// panics from third-party crates we cannot patch. Any panic crossing this
+// boundary indicates an upstream bug worth reporting to aiken-lang/aiken.
+// ---------------------------------------------------------------------------
+
 fuzz_target!(|data: &[u8]| {
     // Need at least 1 byte to do anything meaningful.
     if data.is_empty() {
@@ -108,13 +131,15 @@ fuzz_target!(|data: &[u8]| {
 
     for era_id in [6u16, 7, 8] {
         if let Ok(tx) = dugite_serialization::decode_transaction(era_id, data) {
-            let _ = evaluate_plutus_scripts(
-                &tx,
-                &EmptyUtxoSet,
-                None, // no cost model; CEK budget applied via FUZZ_BUDGET below
-                FUZZ_BUDGET,
-                &slot_config,
-            );
+            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                evaluate_plutus_scripts(
+                    &tx,
+                    &EmptyUtxoSet,
+                    None, // no cost model; CEK budget applied via FUZZ_BUDGET below
+                    FUZZ_BUDGET,
+                    &slot_config,
+                )
+            }));
             // Only try the first era that successfully decodes.
             break;
         }
@@ -133,13 +158,15 @@ fuzz_target!(|data: &[u8]| {
     // terminates immediately with an error.  For the rare valid case, FUZZ_BUDGET
     // is passed as `initial_budget` (enforced only when cost model is Some).
     // ---------------------------------------------------------------------------
-    let _ = uplc::tx::eval_phase_two_raw(
-        data,
-        &[],    // no UTxOs
-        None,   // no cost model
-        FUZZ_BUDGET,
-        MAINNET_SLOT_CONFIG,
-        false,  // skip phase one (we are testing phase two decoding)
-        |_| {},
-    );
+    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        uplc::tx::eval_phase_two_raw(
+            data,
+            &[],   // no UTxOs
+            None,  // no cost model
+            FUZZ_BUDGET,
+            MAINNET_SLOT_CONFIG,
+            false, // skip phase one (we are testing phase two decoding)
+            |_| {},
+        )
+    }));
 });

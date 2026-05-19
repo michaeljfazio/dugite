@@ -274,11 +274,19 @@ fn verify_single_witness<W: HasWitnessFields>(
 ) -> Option<ValidationError> {
     let vkey = witness.vkey();
     let sig = witness.signature();
-    // Witnesses with non-standard key sizes are silently accepted —
-    // Cardano uses Ed25519 (32-byte keys, 64-byte sigs) and we only
-    // verify those.
+    // Ed25519 requires exact 32-byte vkeys and 64-byte signatures. Haskell
+    // cardano-node rejects malformed witnesses at CBOR decode time via the
+    // fixed-size `VKey` / `SignedDSIGN Ed25519DSIGN` newtype decoders
+    // (`decodeSignedDSIGN` -> `failSizeCheck`). Pallas decodes witnesses as
+    // variable-length `Bytes`, so we enforce the length invariant here and
+    // emit a structured `InvalidWitnessSignature` (better than Haskell's
+    // codec-level socket-close, which is an artifact of its CBOR layout).
     if vkey.len() != 32 || sig.len() != 64 {
-        return None;
+        return Some(ValidationError::InvalidWitnessSignature(format!(
+            "{prefix}malformed witness: vkey={} bytes, sig={} bytes (expected 32/64)",
+            vkey.len(),
+            sig.len(),
+        )));
     }
     match dugite_crypto::keys::PaymentVerificationKey::from_bytes(vkey) {
         Ok(vk) => {
@@ -1239,8 +1247,8 @@ mod tests {
     use dugite_primitives::protocol_params::ProtocolParameters;
     use dugite_primitives::time::SlotNo;
     use dugite_primitives::transaction::{
-        ExUnits, OutputDatum, Redeemer, RedeemerTag, Transaction, TransactionBody,
-        TransactionInput, TransactionOutput, TransactionWitnessSet, VKeyWitness,
+        BootstrapWitness, ExUnits, OutputDatum, Redeemer, RedeemerTag, Transaction,
+        TransactionBody, TransactionInput, TransactionOutput, TransactionWitnessSet, VKeyWitness,
     };
     use dugite_primitives::value::{AssetName, Lovelace, Value};
 
@@ -1876,6 +1884,158 @@ mod tests {
                 .any(|e| matches!(e, ValidationError::InvalidWitnessSignature(_))),
             "expected InvalidWitnessSignature, got {errors:?}"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // Test 20a..20i — Rule 14 wrong-length witness rejection (issue #537)
+    //
+    // Haskell cardano-node rejects any witness whose signature is not 64
+    // bytes (and whose vkey is not 32 bytes) at CBOR decode time via
+    // `decodeSignedDSIGN`/`failSizeCheck`. Pallas-based decode keeps these
+    // as variable-length `Bytes`, so dugite enforces the invariant in
+    // Phase-1 (`verify_single_witness`).
+    //
+    // Regression matrix: every wrong size — including the truncated-64→63
+    // case from the 314pool bounty repro — must produce
+    // `InvalidWitnessSignature` rather than being silently accepted.
+    // -----------------------------------------------------------------------
+
+    /// Helper: build a valid baseline tx with one user-supplied vkey witness
+    /// and validate it under mainnet defaults, returning the error list.
+    fn validate_with_vkey_witness(vkey: Vec<u8>, signature: Vec<u8>) -> Vec<ValidationError> {
+        let (utxo_set, mut tx, _) = make_valid_tx();
+        tx.witness_set
+            .vkey_witnesses
+            .push(VKeyWitness { vkey, signature });
+        let params = ProtocolParameters::mainnet_defaults();
+        validate_transaction(&tx, &utxo_set, &params, 100, 300, None).unwrap_err()
+    }
+
+    /// Helper: same as above but for BootstrapWitness (Byron).
+    fn validate_with_bootstrap_witness(vkey: Vec<u8>, signature: Vec<u8>) -> Vec<ValidationError> {
+        let (utxo_set, mut tx, _) = make_valid_tx();
+        tx.witness_set.bootstrap_witnesses.push(BootstrapWitness {
+            vkey,
+            signature,
+            chain_code: vec![0u8; 32],
+            attributes: vec![],
+        });
+        let params = ProtocolParameters::mainnet_defaults();
+        validate_transaction(&tx, &utxo_set, &params, 100, 300, None).unwrap_err()
+    }
+
+    fn assert_invalid_witness(errors: &[ValidationError]) {
+        assert!(
+            errors
+                .iter()
+                .any(|e| matches!(e, ValidationError::InvalidWitnessSignature(_))),
+            "expected InvalidWitnessSignature, got {errors:?}"
+        );
+    }
+
+    // Truncated 64→63-byte signature — the exact 314pool bounty repro.
+    #[test]
+    fn test_vkey_witness_truncated_signature_63_rejected() {
+        let errors = validate_with_vkey_witness(vec![1u8; 32], vec![0u8; 63]);
+        assert_invalid_witness(&errors);
+    }
+
+    // Oversized signature.
+    #[test]
+    fn test_vkey_witness_oversized_signature_65_rejected() {
+        let errors = validate_with_vkey_witness(vec![1u8; 32], vec![0u8; 65]);
+        assert_invalid_witness(&errors);
+    }
+
+    // Empty signature — degenerate edge case.
+    #[test]
+    fn test_vkey_witness_empty_signature_rejected() {
+        let errors = validate_with_vkey_witness(vec![1u8; 32], vec![]);
+        assert_invalid_witness(&errors);
+    }
+
+    // Short vkey.
+    #[test]
+    fn test_vkey_witness_short_vkey_31_rejected() {
+        let errors = validate_with_vkey_witness(vec![1u8; 31], vec![0u8; 64]);
+        assert_invalid_witness(&errors);
+    }
+
+    // Long vkey.
+    #[test]
+    fn test_vkey_witness_long_vkey_33_rejected() {
+        let errors = validate_with_vkey_witness(vec![1u8; 33], vec![0u8; 64]);
+        assert_invalid_witness(&errors);
+    }
+
+    // Empty vkey — degenerate edge case (also exercises the slice-bound
+    // guard `vkey[..8.min(vkey.len())]` was originally added for).
+    #[test]
+    fn test_vkey_witness_empty_vkey_rejected() {
+        let errors = validate_with_vkey_witness(vec![], vec![0u8; 64]);
+        assert_invalid_witness(&errors);
+    }
+
+    // Both vkey and signature wrong size simultaneously.
+    #[test]
+    fn test_vkey_witness_both_wrong_size_rejected() {
+        let errors = validate_with_vkey_witness(vec![1u8; 31], vec![0u8; 63]);
+        assert_invalid_witness(&errors);
+    }
+
+    // BootstrapWitness (Byron) — truncated signature must also be rejected
+    // since `decodeSignedDSIGN` enforces the same 64-byte invariant on
+    // Byron bootstrap witnesses.
+    #[test]
+    fn test_bootstrap_witness_truncated_signature_rejected() {
+        let errors = validate_with_bootstrap_witness(vec![1u8; 32], vec![0u8; 63]);
+        assert_invalid_witness(&errors);
+    }
+
+    // BootstrapWitness with short vkey.
+    #[test]
+    fn test_bootstrap_witness_short_vkey_rejected() {
+        let errors = validate_with_bootstrap_witness(vec![1u8; 31], vec![0u8; 64]);
+        assert_invalid_witness(&errors);
+    }
+
+    // Property test: across the full malformed-size lattice, validation
+    // must report `InvalidWitnessSignature`. Witnesses with size {32, 64}
+    // are excluded — they are exercised by `test_ed25519_signature_verification`
+    // (where the all-zero sig still fails crypto verification).
+    #[test]
+    fn test_vkey_witness_length_lattice_rejected() {
+        for vkey_len in [0usize, 1, 16, 31, 33, 48, 64, 128] {
+            for sig_len in [0usize, 1, 32, 63, 65, 96, 128] {
+                if vkey_len == 32 && sig_len == 64 {
+                    continue;
+                }
+                let errors = validate_with_vkey_witness(vec![1u8; vkey_len], vec![0u8; sig_len]);
+                assert!(
+                    errors.iter().any(|e| matches!(
+                        e,
+                        ValidationError::InvalidWitnessSignature(_)
+                    )),
+                    "vkey_len={vkey_len} sig_len={sig_len}: expected InvalidWitnessSignature, got {errors:?}"
+                );
+            }
+        }
+    }
+
+    // Diagnostic-quality check: the rejection message must surface both
+    // observed lengths so operators can diagnose corrupt submissions.
+    #[test]
+    fn test_vkey_witness_malformed_error_message_includes_sizes() {
+        let errors = validate_with_vkey_witness(vec![1u8; 31], vec![0u8; 63]);
+        let msg = errors
+            .iter()
+            .find_map(|e| match e {
+                ValidationError::InvalidWitnessSignature(s) => Some(s.clone()),
+                _ => None,
+            })
+            .expect("InvalidWitnessSignature not found");
+        assert!(msg.contains("31"), "message must include vkey size: {msg}");
+        assert!(msg.contains("63"), "message must include sig size: {msg}");
     }
 
     // -----------------------------------------------------------------------
