@@ -362,6 +362,48 @@ pub struct ProtocolVersion {
 }
 
 impl ShelleyGenesis {
+    /// Validate genesis parameters that would cause panics or undefined behavior
+    /// if zero.
+    ///
+    /// Called from `load_with_hash` immediately after deserialization so that
+    /// degenerate genesis files are rejected at startup rather than causing
+    /// divide-by-zero / modulo-by-zero panics later in consensus:
+    ///   - `slotsPerKESPeriod == 0`: divide-by-zero in `validate_kes_period`
+    ///   - `maxKESEvolutions == 0`: KES max_period = 0, all blocks invalid
+    ///   - `epochLength == 0`: modulo-by-zero in `in_nonce_contribution_window`
+    ///   - `securityParam == 0`: k=0 breaks chain-selection and ImmutableDB thresholds
+    ///
+    /// Issue #545 E8/E9 defense-in-depth: `validate_kes_period` and
+    /// `in_nonce_contribution_window` also use `checked_div`/`checked_rem` to
+    /// guard against degenerate values from callers that bypass this check.
+    pub fn validate(&self) -> anyhow::Result<()> {
+        if self.slots_per_k_e_s_period == 0 {
+            anyhow::bail!(
+                "Invalid Shelley genesis: slotsPerKESPeriod is 0 — \
+                 would cause divide-by-zero in KES period validation"
+            );
+        }
+        if self.max_k_e_s_evolutions == 0 {
+            anyhow::bail!(
+                "Invalid Shelley genesis: maxKESEvolutions is 0 — \
+                 all blocks would fail KES period validation"
+            );
+        }
+        if self.epoch_length == 0 {
+            anyhow::bail!(
+                "Invalid Shelley genesis: epochLength is 0 — \
+                 would cause modulo-by-zero in nonce contribution window check"
+            );
+        }
+        if self.security_param == 0 {
+            anyhow::bail!(
+                "Invalid Shelley genesis: securityParam (k) is 0 — \
+                 would break chain selection and ImmutableDB flush thresholds"
+            );
+        }
+        Ok(())
+    }
+
     /// Load the Shelley genesis and compute its Blake2b-256 hash.
     ///
     /// The hash is computed over the raw file content (canonical JSON), matching
@@ -372,6 +414,7 @@ impl ShelleyGenesis {
             .with_context(|| format!("Failed to read Shelley genesis: {}", path.display()))?;
         let genesis: Self = serde_json::from_str(&content)
             .with_context(|| format!("Failed to parse Shelley genesis: {}", path.display()))?;
+        genesis.validate()?;
         let hash = dugite_primitives::hash::blake2b_256(content.as_bytes());
         debug!(
             genesis_hash = %hash.to_hex(),
@@ -1800,5 +1843,118 @@ mod tests {
         assert!(genesis.staking.is_none());
         assert!(genesis.gen_delegs_entries().is_empty());
         assert!(genesis.initial_utxos().is_empty());
+    }
+
+    // ── Issue #545 E8/E9 tests: ShelleyGenesis::validate() ────────────────
+
+    /// Helper: build a minimal valid ShelleyGenesis struct for testing.
+    fn make_valid_shelley_genesis() -> ShelleyGenesis {
+        ShelleyGenesis {
+            network_magic: 2,
+            network_id: "Testnet".to_string(),
+            system_start: "2022-10-25T00:00:00Z".to_string(),
+            active_slots_coeff: 0.05,
+            security_param: 2160,
+            epoch_length: 432000,
+            slot_length: 1,
+            max_lovelace_supply: 45_000_000_000_000_000,
+            max_k_e_s_evolutions: 62,
+            slots_per_k_e_s_period: 129600,
+            update_quorum: 5,
+            protocol_params: ShelleyGenesisProtocolParams {
+                min_fee_a: 44,
+                min_fee_b: 155381,
+                max_block_body_size: 65536,
+                max_tx_size: 16384,
+                max_block_header_size: 1100,
+                key_deposit: 2000000,
+                pool_deposit: 500000000,
+                e_max: 18,
+                n_opt: 150,
+                a0: 0.3,
+                rho: 0.003,
+                tau: 0.2,
+                decentralisation_param: 0.5,
+                min_pool_cost: 340000000,
+                min_u_tx_o_value: 1000000,
+                protocol_version: ProtocolVersion { major: 2, minor: 0 },
+            },
+            gen_delegs: Default::default(),
+            initial_funds: Default::default(),
+            staking: None,
+        }
+    }
+
+    #[test]
+    fn issue_545_e8_valid_genesis_passes_validate() {
+        let genesis = make_valid_shelley_genesis();
+        assert!(
+            genesis.validate().is_ok(),
+            "Valid genesis should pass validate()"
+        );
+    }
+
+    #[test]
+    fn issue_545_e8_slots_per_kes_period_zero_rejected() {
+        let mut genesis = make_valid_shelley_genesis();
+        genesis.slots_per_k_e_s_period = 0;
+        let result = genesis.validate();
+        assert!(
+            result.is_err(),
+            "slotsPerKESPeriod=0 must be rejected, got: {result:?}"
+        );
+        let msg = result.unwrap_err().to_string();
+        assert!(
+            msg.contains("slotsPerKESPeriod"),
+            "Error must mention slotsPerKESPeriod, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn issue_545_e8_max_kes_evolutions_zero_rejected() {
+        let mut genesis = make_valid_shelley_genesis();
+        genesis.max_k_e_s_evolutions = 0;
+        let result = genesis.validate();
+        assert!(
+            result.is_err(),
+            "maxKESEvolutions=0 must be rejected, got: {result:?}"
+        );
+        let msg = result.unwrap_err().to_string();
+        assert!(
+            msg.contains("maxKESEvolutions"),
+            "Error must mention maxKESEvolutions, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn issue_545_e9_epoch_length_zero_rejected() {
+        let mut genesis = make_valid_shelley_genesis();
+        genesis.epoch_length = 0;
+        let result = genesis.validate();
+        assert!(
+            result.is_err(),
+            "epochLength=0 must be rejected, got: {result:?}"
+        );
+        let msg = result.unwrap_err().to_string();
+        assert!(
+            msg.contains("epochLength"),
+            "Error must mention epochLength, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn issue_545_e9_security_param_zero_rejected() {
+        let mut genesis = make_valid_shelley_genesis();
+        genesis.security_param = 0;
+        let result = genesis.validate();
+        assert!(
+            result.is_err(),
+            "securityParam=0 must be rejected, got: {result:?}"
+        );
+        let msg = result.unwrap_err().to_string();
+        assert!(
+            msg.contains("securityParam"),
+            "Error must mention securityParam, got: {msg}"
+        );
     }
 }
