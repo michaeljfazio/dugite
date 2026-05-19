@@ -209,3 +209,8 @@ doc = false
 name = "fuzz_body_hash"
 path = "fuzz_targets/body_hash.rs"
 doc = false
+
+[[bin]]
+name = "fuzz_lsq_query_dispatch"
+path = "fuzz_targets/lsq_query_dispatch.rs"
+doc = false

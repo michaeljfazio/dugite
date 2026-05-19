@@ -50,14 +50,42 @@ pub(crate) fn handle_utxo_by_address(
     }
 }
 
+/// Hard cap on the number of UTxO entries returned by `GetUTxOWhole` (C2 fix).
+///
+/// `GetUTxOWhole` materializes the entire UTxO set under a blocking read lock.
+/// At mainnet scale (~10M entries × ~100 bytes) this can allocate ~1 GB per
+/// call and hold the ledger `RwLock` for seconds, stalling block validation and
+/// forging. The cap rejects queries that would exceed this limit, matching the
+/// defensive behaviour of Haskell cardano-node which gates access by permissions.
+///
+/// 500,000 entries × ~200 bytes CBOR ≈ 100 MB — large but bounded.
+/// Operators running indexers that need the full UTxO should use a dedicated
+/// db-sync instance or the Mithril snapshot protocol instead.
+pub const MAX_UTXO_QUERY_ENTRIES: usize = 500_000;
+
 /// Handle GetUTxOWhole (tag 7).
 ///
 /// Returns the entire UTxO set as a CBOR map. Used by chain indexers
 /// (db-sync, Ogmios, Oura) to bootstrap their UTxO state.
+///
+/// C2: enforces `MAX_UTXO_QUERY_ENTRIES` to prevent a single N2C client from
+/// holding the ledger read lock for multiple seconds at mainnet scale.
 pub(crate) fn handle_utxo_whole(utxo_provider: &Option<Arc<dyn UtxoQueryProvider>>) -> QueryResult {
     debug!("Query: GetUTxOWhole");
     if let Some(provider) = utxo_provider {
-        QueryResult::UtxoByAddress(provider.utxos_all())
+        let entries = provider.utxos_all();
+        if entries.len() > MAX_UTXO_QUERY_ENTRIES {
+            // Return an error result rather than materializing gigabytes of data.
+            // Clients that genuinely need the full UTxO set should use a dedicated
+            // indexer (db-sync, Mithril) rather than the N2C query protocol.
+            return QueryResult::Error(format!(
+                "GetUTxOWhole: UTxO set too large ({} entries, max {}); \
+                 use a dedicated indexer for full UTxO access",
+                entries.len(),
+                MAX_UTXO_QUERY_ENTRIES,
+            ));
+        }
+        QueryResult::UtxoByAddress(entries)
     } else {
         QueryResult::UtxoByAddress(vec![])
     }
@@ -272,6 +300,59 @@ mod tests {
         match result {
             QueryResult::UtxoByAddress(utxos) => assert!(utxos.is_empty()),
             _ => panic!("Expected UtxoByAddress"),
+        }
+    }
+
+    // ── C2 tests: GetUTxOWhole entry cap ──────────────────────────────────────
+
+    /// C2: UTxO set at exactly the limit must succeed.
+    #[test]
+    fn c2_utxo_whole_at_limit_succeeds() {
+        let utxos: Vec<_> = (0..MAX_UTXO_QUERY_ENTRIES)
+            .map(|i| {
+                let mut hash = vec![0u8; 32];
+                hash[0..8].copy_from_slice(&(i as u64).to_le_bytes());
+                make_utxo(hash, 0, vec![0x61; 29], 1_000_000)
+            })
+            .collect();
+        let provider = make_provider(utxos);
+        let result = handle_utxo_whole(&provider);
+        match result {
+            QueryResult::UtxoByAddress(entries) => {
+                assert_eq!(entries.len(), MAX_UTXO_QUERY_ENTRIES);
+            }
+            QueryResult::Error(msg) => panic!("Expected success at limit, got error: {msg}"),
+            _ => panic!("Expected UtxoByAddress"),
+        }
+    }
+
+    /// C2: UTxO set one over the limit must return Error.
+    #[test]
+    fn c2_utxo_whole_over_limit_returns_error() {
+        let utxos: Vec<_> = (0..=MAX_UTXO_QUERY_ENTRIES)
+            .map(|i| {
+                let mut hash = vec![0u8; 32];
+                hash[0..8].copy_from_slice(&(i as u64).to_le_bytes());
+                make_utxo(hash, 0, vec![0x61; 29], 1_000_000)
+            })
+            .collect();
+        let provider = make_provider(utxos);
+        let result = handle_utxo_whole(&provider);
+        match result {
+            QueryResult::Error(msg) => {
+                assert!(
+                    msg.contains("too large"),
+                    "Error message should mention size: {msg}"
+                );
+                assert!(
+                    !msg.contains('{') && !msg.contains('}'),
+                    "Error must not expose internal formatting: {msg}"
+                );
+            }
+            QueryResult::UtxoByAddress(_) => {
+                panic!("Expected Error for oversized UTxO set, got UtxoByAddress")
+            }
+            _ => panic!("Expected Error variant"),
         }
     }
 

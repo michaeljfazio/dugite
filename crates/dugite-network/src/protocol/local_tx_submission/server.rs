@@ -32,8 +32,11 @@ pub struct LocalTxSubmissionServer;
 impl LocalTxSubmissionServer {
     /// Run the LocalTxSubmission server loop.
     ///
-    /// `on_accepted` is called with `(era_id, tx_bytes)` for each accepted transaction.
-    /// The caller is responsible for adding the tx to the mempool.
+    /// `on_accepted` is called with `(era_id, tx_bytes)` for each validated transaction.
+    /// It must return `Ok(())` if the tx was successfully added to the mempool, or
+    /// `Err(reason)` if the mempool rejected it (e.g. capacity exceeded). On error,
+    /// the server sends `MsgRejectTx` rather than `MsgAcceptTx`, preventing the
+    /// protocol violation of claiming acceptance for an un-propagated transaction (C12).
     pub async fn run<V, F>(
         channel: &mut MuxChannel,
         validator: &V,
@@ -41,7 +44,7 @@ impl LocalTxSubmissionServer {
     ) -> Result<LocalTxSubmissionStats, ProtocolError>
     where
         V: TxValidator,
-        F: FnMut(u16, Vec<u8>) + Send,
+        F: FnMut(u16, Vec<u8>) -> Result<(), String> + Send,
     {
         let mut stats = LocalTxSubmissionStats::default();
 
@@ -82,36 +85,110 @@ impl LocalTxSubmissionServer {
                         reason: e.to_string(),
                     })?;
                     // The tx may be wrapped in CBOR tag 24 (wrapCBORinCBOR).
-                    // Consume the tag if present, then read the raw bytes.
-                    let pos = dec.position();
-                    if let Ok(tag) = dec.tag() {
-                        if tag.as_u64() != 24 {
-                            dec.set_position(pos); // not tag 24, rewind
+                    // C9 fix: use `dec.datatype()` to detect the CBOR type before
+                    // consuming — this avoids the rewind bug where a non-24 tag would
+                    // leave the decoder positioned before the tag byte, causing
+                    // `dec.bytes()` to fail with a type mismatch instead of sending
+                    // a structured MsgRejectTx. Also reject any tag that is NOT 24
+                    // (including double-wrapped tag(24)(tag(24)(...))): the CDDL for
+                    // LocalTxSubmission requires exactly zero or one tag-24 wrapper.
+                    let tx_bytes = {
+                        use minicbor::data::Type;
+                        match dec.datatype() {
+                            Ok(Type::Tag) => {
+                                let tag = dec.tag().map_err(|e| ProtocolError::CborDecode {
+                                    protocol: "LocalTxSubmission",
+                                    reason: e.to_string(),
+                                })?;
+                                if tag.as_u64() != 24 {
+                                    // Non-24 tag — reject with structured error instead of
+                                    // dropping the connection.
+                                    tracing::debug!(
+                                        tag = tag.as_u64(),
+                                        "LocalTxSubmission: unexpected CBOR tag (expected 24 or none)"
+                                    );
+                                    // Build a MsgRejectTx with a decode-failure reason
+                                    let apply_tx_err = super::encode::encode_apply_tx_err(
+                                        &crate::TxValidationError::Other(
+                                            "malformed transaction encoding".to_string(),
+                                        ),
+                                        era_id,
+                                    );
+                                    let mut buf = Vec::new();
+                                    let mut enc = Encoder::new(&mut buf);
+                                    enc.array(2).expect("infallible");
+                                    enc.u64(TAG_REJECT_TX).expect("infallible");
+                                    let writer = enc.writer_mut();
+                                    writer.extend_from_slice(&apply_tx_err);
+                                    channel.send(buf).await.map_err(ProtocolError::from)?;
+                                    stats.rejected += 1;
+                                    continue;
+                                }
+                                // tag 24 consumed; the inner bytes follow
+                                dec.bytes()
+                                    .map_err(|e| ProtocolError::CborDecode {
+                                        protocol: "LocalTxSubmission",
+                                        reason: e.to_string(),
+                                    })?
+                                    .to_vec()
+                            }
+                            Ok(Type::Bytes) | Ok(_) => {
+                                // No tag wrapper — read raw bytes directly
+                                dec.bytes()
+                                    .map_err(|e| ProtocolError::CborDecode {
+                                        protocol: "LocalTxSubmission",
+                                        reason: e.to_string(),
+                                    })?
+                                    .to_vec()
+                            }
+                            Err(e) => {
+                                return Err(ProtocolError::CborDecode {
+                                    protocol: "LocalTxSubmission",
+                                    reason: e.to_string(),
+                                });
+                            }
                         }
-                        // tag 24 consumed, bytes follow
-                    } else {
-                        dec.set_position(pos); // no tag, rewind
-                    }
-                    let tx_bytes = dec
-                        .bytes()
-                        .map_err(|e| ProtocolError::CborDecode {
-                            protocol: "LocalTxSubmission",
-                            reason: e.to_string(),
-                        })?
-                        .to_vec();
+                    };
 
                     // Validate via TxValidator
                     match validator.validate_tx(era_id, &tx_bytes) {
                         Ok(()) => {
-                            stats.accepted += 1;
-                            on_accepted(era_id, tx_bytes);
+                            // C12 fix: the `on_accepted` closure must return Ok(()) if the
+                            // transaction was successfully added to the mempool, or Err(reason)
+                            // if the mempool rejected it (e.g. capacity exceeded). We MUST NOT
+                            // send MsgAcceptTx if the tx was not actually admitted, as that is a
+                            // protocol violation — the client believes the tx will be propagated.
+                            match on_accepted(era_id, tx_bytes) {
+                                Ok(()) => {
+                                    stats.accepted += 1;
 
-                            // Send MsgAcceptTx
-                            let mut buf = Vec::new();
-                            let mut enc = Encoder::new(&mut buf);
-                            enc.array(1).expect("infallible");
-                            enc.u64(TAG_ACCEPT_TX).expect("infallible");
-                            channel.send(buf).await.map_err(ProtocolError::from)?;
+                                    // Send MsgAcceptTx
+                                    let mut buf = Vec::new();
+                                    let mut enc = Encoder::new(&mut buf);
+                                    enc.array(1).expect("infallible");
+                                    enc.u64(TAG_ACCEPT_TX).expect("infallible");
+                                    channel.send(buf).await.map_err(ProtocolError::from)?;
+                                }
+                                Err(reason) => {
+                                    // Mempool admitted the tx failed after validator Ok.
+                                    // Send MsgRejectTx with a generic mempool-full reason.
+                                    stats.rejected += 1;
+                                    tracing::debug!(era_id, %reason, "local tx: mempool add failed after validator Ok");
+                                    let apply_tx_err = super::encode::encode_apply_tx_err(
+                                        &crate::TxValidationError::Other(
+                                            "mempool full or duplicate".to_string(),
+                                        ),
+                                        era_id,
+                                    );
+                                    let mut buf = Vec::new();
+                                    let mut enc = Encoder::new(&mut buf);
+                                    enc.array(2).expect("infallible");
+                                    enc.u64(TAG_REJECT_TX).expect("infallible");
+                                    let writer = enc.writer_mut();
+                                    writer.extend_from_slice(&apply_tx_err);
+                                    channel.send(buf).await.map_err(ProtocolError::from)?;
+                                }
+                            }
                         }
                         Err(e) => {
                             stats.rejected += 1;
@@ -217,6 +294,7 @@ mod tests {
         let handle = tokio::spawn(async move {
             LocalTxSubmissionServer::run(&mut channel, &validator, move |era, tx| {
                 accepted_clone.lock().unwrap().push((era, tx));
+                Ok(())
             })
             .await
         });
@@ -251,7 +329,7 @@ mod tests {
         let validator = RejectAllValidator;
 
         let handle = tokio::spawn(async move {
-            LocalTxSubmissionServer::run(&mut channel, &validator, |_, _| {}).await
+            LocalTxSubmissionServer::run(&mut channel, &validator, |_, _| Ok(())).await
         });
 
         let submit = encode_submit_tx(6, &[0xBA, 0xAD]);
@@ -275,12 +353,17 @@ mod tests {
 
         // The failure should be ConwayMempoolFailure (tag 7) since RejectAllValidator
         // returns Other("test rejection") which falls through to mempool fallback.
+        // C8 fix: the text must NOT contain internal Rust debug formatting.
         let failure_len = dec.array().unwrap().unwrap();
         assert_eq!(failure_len, 2);
         let ledger_tag = dec.u8().unwrap();
         assert_eq!(ledger_tag, 7, "ConwayMempoolFailure");
         let text = dec.str().unwrap();
-        assert!(text.contains("test rejection"));
+        // The sanitized message must not contain Rust struct/field names.
+        assert!(
+            !text.contains('{') && !text.contains('}') && !text.contains("Other"),
+            "rejection text must be sanitized: got {text:?}"
+        );
 
         // Send MsgDone
         ingress_tx.send(Bytes::from(encode_done())).await.unwrap();
@@ -308,7 +391,7 @@ mod tests {
         let validator = FeeTooSmallValidator;
 
         let handle = tokio::spawn(async move {
-            LocalTxSubmissionServer::run(&mut channel, &validator, |_, _| {}).await
+            LocalTxSubmissionServer::run(&mut channel, &validator, |_, _| Ok(())).await
         });
 
         let submit = encode_submit_tx(6, &[0xDE, 0xAD]);
@@ -339,5 +422,110 @@ mod tests {
         ingress_tx.send(Bytes::from(encode_done())).await.unwrap();
         let stats = handle.await.unwrap().unwrap();
         assert_eq!(stats.rejected, 1);
+    }
+
+    // ── C12 tests: mempool add failure after validator Ok ─────────────────────
+
+    /// C12: when on_accepted returns Err, server must send MsgRejectTx (not MsgAcceptTx).
+    #[tokio::test]
+    async fn c12_mempool_full_after_validation_sends_reject() {
+        let (mut channel, mut egress_rx, ingress_tx) = make_test_channel();
+        let validator = AcceptAllValidator;
+
+        // on_accepted returns Err to simulate a full mempool.
+        let handle = tokio::spawn(async move {
+            LocalTxSubmissionServer::run(&mut channel, &validator, |_, _| {
+                Err("mempool full".to_string())
+            })
+            .await
+        });
+
+        let submit = encode_submit_tx(6, &[0xDE, 0xAD]);
+        ingress_tx.send(Bytes::from(submit)).await.unwrap();
+
+        // Must receive MsgRejectTx, NOT MsgAcceptTx.
+        let (_, _, resp) = egress_rx.recv().await.unwrap();
+        let mut dec = Decoder::new(&resp);
+        dec.array().unwrap();
+        let tag = dec.u64().unwrap();
+        assert_eq!(
+            tag, TAG_REJECT_TX,
+            "mempool full after validation must send MsgRejectTx (got tag {tag})"
+        );
+
+        ingress_tx.send(Bytes::from(encode_done())).await.unwrap();
+        let stats = handle.await.unwrap().unwrap();
+        assert_eq!(stats.submitted, 1);
+        assert_eq!(stats.accepted, 0, "accepted must be 0 when mempool rejects");
+        assert_eq!(stats.rejected, 1, "rejected must be 1");
+    }
+
+    /// C12: when on_accepted returns Ok, server sends MsgAcceptTx as before.
+    #[tokio::test]
+    async fn c12_mempool_ok_sends_accept() {
+        let (mut channel, mut egress_rx, ingress_tx) = make_test_channel();
+        let validator = AcceptAllValidator;
+
+        let handle = tokio::spawn(async move {
+            LocalTxSubmissionServer::run(&mut channel, &validator, |_, _| Ok(())).await
+        });
+
+        let submit = encode_submit_tx(6, &[0xDE, 0xAD]);
+        ingress_tx.send(Bytes::from(submit)).await.unwrap();
+
+        let (_, _, resp) = egress_rx.recv().await.unwrap();
+        let mut dec = Decoder::new(&resp);
+        dec.array().unwrap();
+        let tag = dec.u64().unwrap();
+        assert_eq!(
+            tag, TAG_ACCEPT_TX,
+            "successful mempool add must send MsgAcceptTx"
+        );
+
+        ingress_tx.send(Bytes::from(encode_done())).await.unwrap();
+        let stats = handle.await.unwrap().unwrap();
+        assert_eq!(stats.accepted, 1);
+        assert_eq!(stats.rejected, 0);
+    }
+
+    // ── C9 test: non-24 CBOR tag in tx payload ────────────────────────────────
+
+    /// C9: tag(99)(bytes) must receive MsgRejectTx instead of dropping the connection.
+    #[tokio::test]
+    async fn c9_non_24_tag_sends_reject_not_disconnect() {
+        let (mut channel, mut egress_rx, ingress_tx) = make_test_channel();
+        let validator = AcceptAllValidator;
+
+        let handle = tokio::spawn(async move {
+            LocalTxSubmissionServer::run(&mut channel, &validator, |_, _| Ok(())).await
+        });
+
+        // Build [0, [6, tag(99)(bytes([0xDE, 0xAD]))]]
+        let mut buf = Vec::new();
+        let mut enc = Encoder::new(&mut buf);
+        enc.array(2).expect("infallible");
+        enc.u64(TAG_SUBMIT_TX).expect("infallible");
+        enc.array(2).expect("infallible");
+        enc.u16(6).expect("infallible"); // era_id
+        enc.tag(minicbor::data::Tag::new(99)).expect("infallible");
+        enc.bytes(&[0xDE, 0xAD]).expect("infallible");
+
+        ingress_tx.send(Bytes::from(buf)).await.unwrap();
+
+        // Must receive MsgRejectTx (tag 2), not a connection drop.
+        let response = egress_rx.recv().await;
+        assert!(response.is_some(), "server must respond (not disconnect)");
+        let (_, _, resp) = response.unwrap();
+        let mut dec = Decoder::new(&resp);
+        dec.array().unwrap();
+        let tag = dec.u64().unwrap();
+        assert_eq!(
+            tag, TAG_REJECT_TX,
+            "non-24 tag must produce MsgRejectTx (got tag {tag})"
+        );
+
+        // Server should still be running — send MsgDone to clean up.
+        ingress_tx.send(Bytes::from(encode_done())).await.unwrap();
+        let _ = handle.await;
     }
 }
