@@ -257,6 +257,14 @@ pub fn decode_message(data: &[u8]) -> Result<ChainSyncMessage, String> {
         TAG_FIND_INTERSECT => {
             // Accept both definite and indefinite-length arrays.
             // The CDDL spec uses `[* point]` which permits either encoding.
+            // C7 fix: cap the intersection candidate list to MAX_INTERSECTION_POINTS.
+            //
+            // Each point triggers a ChainDB has_block() lookup (read lock +
+            // potentially disk I/O). Haskell caps this at security-parameter k
+            // because points older than k are always PointTooOld. We use k+40
+            // headroom to match.
+            const MAX_INTERSECTION_POINTS: usize = 2200;
+
             let mut points = Vec::new();
             match dec.datatype().map_err(|e| e.to_string())? {
                 Type::ArrayIndef => {
@@ -266,6 +274,12 @@ pub fn decode_message(data: &[u8]) -> Result<ChainSyncMessage, String> {
                             dec.skip().map_err(|e| e.to_string())?;
                             break;
                         }
+                        if points.len() >= MAX_INTERSECTION_POINTS {
+                            return Err(format!(
+                                "MsgFindIntersect: too many points (limit {})",
+                                MAX_INTERSECTION_POINTS
+                            ));
+                        }
                         points.push(codec::decode_point(&mut dec).map_err(|e| e.to_string())?);
                     }
                 }
@@ -274,6 +288,11 @@ pub fn decode_message(data: &[u8]) -> Result<ChainSyncMessage, String> {
                         .array()
                         .map_err(|e| e.to_string())?
                         .ok_or("expected definite array length")?;
+                    if arr_len as usize > MAX_INTERSECTION_POINTS {
+                        return Err(format!(
+                            "MsgFindIntersect: too many points ({arr_len}, limit {MAX_INTERSECTION_POINTS})"
+                        ));
+                    }
                     points.reserve(arr_len as usize);
                     for _ in 0..arr_len {
                         points.push(codec::decode_point(&mut dec).map_err(|e| e.to_string())?);
@@ -493,5 +512,56 @@ mod tests {
         let encoded = encode_message(&ChainSyncMessage::MsgDone);
         let decoded = decode_message(&encoded).unwrap();
         assert!(matches!(decoded, ChainSyncMessage::MsgDone));
+    }
+
+    // ── C7 tests: MsgFindIntersect point count cap ────────────────────────────
+
+    /// C7: exactly MAX_INTERSECTION_POINTS points must be accepted.
+    #[test]
+    fn c7_find_intersect_at_limit_succeeds() {
+        const MAX: usize = 2200;
+        let points: Vec<Point> = (0..MAX as u64)
+            .map(|i| Point::Specific(i, [i as u8; 32]))
+            .collect();
+        let msg = ChainSyncMessage::MsgFindIntersect(points);
+        let encoded = encode_message(&msg);
+        // Decode must succeed
+        let result = decode_message(&encoded);
+        assert!(
+            result.is_ok(),
+            "decode should succeed at limit, got: {:?}",
+            result
+        );
+    }
+
+    /// C7: MAX_INTERSECTION_POINTS + 1 points must be rejected.
+    #[test]
+    fn c7_find_intersect_over_limit_rejected() {
+        const OVER: usize = 2201;
+        let points: Vec<Point> = (0..OVER as u64)
+            .map(|i| Point::Specific(i, [i as u8; 32]))
+            .collect();
+        let msg = ChainSyncMessage::MsgFindIntersect(points);
+        let encoded = encode_message(&msg);
+        let result = decode_message(&encoded);
+        assert!(
+            result.is_err(),
+            "decode must reject {} points (limit 2200)",
+            OVER
+        );
+        let err = result.unwrap_err();
+        assert!(
+            err.contains("too many points"),
+            "error should mention point limit: {err}"
+        );
+    }
+
+    /// C7: zero points is a valid (degenerate) MsgFindIntersect.
+    #[test]
+    fn c7_find_intersect_zero_points_ok() {
+        let msg = ChainSyncMessage::MsgFindIntersect(vec![]);
+        let encoded = encode_message(&msg);
+        let result = decode_message(&encoded);
+        assert!(result.is_ok(), "zero points must be accepted");
     }
 }
