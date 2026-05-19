@@ -3838,27 +3838,8 @@ impl Node {
                                         let fork_block_no = fork_block.block_number();
                                         let fork_hash_hex = fork_block.header.header_hash.to_hex();
 
-                                        // Issue #545 E5: body hash check in fork replay path.
-                                        if fork_block.era.is_shelley_based() {
-                                            if let Some(body_bytes) =
-                                                dugite_serialization::extract_block_body_cbor(&cbor)
-                                            {
-                                                if let Err(e) =
-                                                    dugite_consensus::praos::validate_block_body_hash(
-                                                        &fork_block.header,
-                                                        body_bytes,
-                                                    )
-                                                {
-                                                    warn!(
-                                                        slot = fork_slot.0,
-                                                        block = fork_block_no.0,
-                                                        hash = %fork_hash_hex,
-                                                        "Fork replay: body hash mismatch — skipping block: {e}"
-                                                    );
-                                                    continue;
-                                                }
-                                            }
-                                        }
+                                        // Issue #545 E5 — body-hash verification DISABLED pending a
+                                        // correct implementation; see notes in `apply_fetched_block`.
 
                                         // Fix B (Bug B, 2026-05-16): use apply_block_with_delta
                                         // so that fork-replayed blocks also populate LedgerSeq.
@@ -4043,39 +4024,16 @@ impl Node {
         // We check AFTER storage because the block is keyed by header hash in ChainDB;
         // a body-hash mismatch is a data integrity error from this peer, not a
         // chain-selection issue.  The block is evicted from volatile state on mismatch.
-        if block.era.is_shelley_based() {
-            if let Some(raw) = block.raw_cbor.as_deref() {
-                match dugite_serialization::extract_block_body_cbor(raw) {
-                    Some(body_bytes) => {
-                        if let Err(e) = dugite_consensus::praos::validate_block_body_hash(
-                            &block.header,
-                            body_bytes,
-                        ) {
-                            warn!(
-                                peer = %fetched.peer,
-                                slot = block_slot.0,
-                                block = block_number.0,
-                                hash = %block_hash.to_hex(),
-                                "Body hash mismatch — discarding block and evicting from volatile state: {e}"
-                            );
-                            // Evict the block we just stored: its body is compromised.
-                            let mut db = self.chain_db.write().await;
-                            db.remove_volatile_block(&block_hash);
-                            return;
-                        }
-                    }
-                    None => {
-                        // Body extraction failed (unexpected CBOR structure).
-                        // Log but do not reject — the body_size envelope check
-                        // already ran upstream; this is a best-effort integrity guard.
-                        debug!(
-                            slot = block_slot.0,
-                            "Body hash check skipped: could not extract body CBOR from raw block"
-                        );
-                    }
-                }
-            }
-        }
+        // E5 (audit #545) — body-hash verification wire-in is DISABLED pending
+        // a correct implementation. The current `validate_block_body_hash` uses
+        // `blake2b_256(body_cbor)` over the concatenated 4-component body, but
+        // Haskell `bbHash` (in cardano-ledger `Cardano.Ledger.Block`) hashes
+        // each component independently and then hashes their concatenation:
+        //   bbHash = blake2b_256( blake2b_256(tx_bodies) || blake2b_256(witnesses)
+        //                       || blake2b_256(aux_data)  || blake2b_256(invalid_txs) )
+        // Calling the current implementation would reject every legitimate
+        // network block. Re-enable when the algorithm is corrected.
+        let _ = block.era.is_shelley_based();
 
         // When TriggeredFork already replayed all fork blocks (including the
         // incoming block) onto the ledger, skip the single-block apply path.

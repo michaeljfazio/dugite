@@ -1231,30 +1231,10 @@ impl Node {
                     }
                 }
 
-                // Issue #545 E5: body hash check in bulk apply path.
-                // A malicious relay could substitute block body bytes while leaving
-                // the header signatures intact.  Check before ledger apply so
-                // corrupted bodies never enter ledger state.  Byron blocks have no
-                // body_hash field and are skipped.
-                if block.era.is_shelley_based() {
-                    if let Some(raw) = block.raw_cbor.as_deref() {
-                        if let Some(body_bytes) = dugite_serialization::extract_block_body_cbor(raw)
-                        {
-                            if let Err(e) = dugite_consensus::praos::validate_block_body_hash(
-                                &block.header,
-                                body_bytes,
-                            ) {
-                                warn!(
-                                    slot = block.slot().0,
-                                    block_no = block.block_number().0,
-                                    hash = %block.hash().to_hex(),
-                                    "Body hash mismatch in bulk apply — skipping block: {e}"
-                                );
-                                break;
-                            }
-                        }
-                    }
-                }
+                // Issue #545 E5 — body-hash verification DISABLED pending a
+                // correct implementation; see the matching note in
+                // `apply_fetched_block`. The current `validate_block_body_hash`
+                // uses the wrong algorithm and rejects every legitimate block.
 
                 let ledger_mode = if strict || self.validate_all_blocks {
                     BlockValidationMode::ValidateAll
