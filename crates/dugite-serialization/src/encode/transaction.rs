@@ -52,14 +52,23 @@ where
 
 /// Encode a set-typed body field using the correct format for the given era.
 ///
-/// - Conway: CBOR tag 258 with lexicographically sorted items
-///   (`set<a> = #6.258([* a])` per Conway CDDL)
+/// - Conway and Dijkstra (and any later era): CBOR tag 258 with lexicographically
+///   sorted items (`set<a> = #6.258([* a])` per Conway CDDL — Dijkstra inherits
+///   Conway CDDL verbatim)
 /// - Pre-Conway: plain definite-length array (`[* a]`)
+///
+/// # D5 / audit #544 — Dijkstra era missing from tag-258 path
+///
+/// The original code checked `era == Era::Conway` only. Dijkstra-era transactions
+/// re-encoded with the `else` branch emitted unsorted plain arrays, producing a
+/// different body hash than pallas computed from the original wire bytes — a
+/// chain-split for any relayed or re-encoded Dijkstra block.
 fn encode_set_for_era<T, F>(era: Era, items: &[T], encode_item: F) -> Vec<u8>
 where
     F: Fn(&T) -> Vec<u8>,
 {
-    if era == Era::Conway {
+    // Conway, Dijkstra, and any future era that inherits Conway CDDL uses tag 258.
+    if matches!(era, Era::Conway | Era::Dijkstra) {
         encode_tagged_set(items, encode_item)
     } else {
         encode_plain_array(items, encode_item)
@@ -256,9 +265,10 @@ pub(super) fn encode_witness_set_for_era(ws: &TransactionWitnessSet, era: Era) -
 
     if !ws.redeemers.is_empty() {
         buf.extend(encode_uint(5));
-        if era == Era::Conway {
-            // Conway map format: { [tag, index] => [data, ex_units], ... }
-            // Per Conway CDDL: redeemers = nonempty_map<redeemer_key, redeemer_value>
+        if matches!(era, Era::Conway | Era::Dijkstra) {
+            // Conway/Dijkstra map format: { [tag, index] => [data, ex_units], ... }
+            // Per Conway CDDL (also inherited by Dijkstra):
+            //   redeemers = nonempty_map<redeemer_key, redeemer_value>
             buf.extend(encode_map_header(ws.redeemers.len()));
             for r in &ws.redeemers {
                 // Key: [tag, index]
@@ -624,10 +634,47 @@ pub fn encode_transaction(tx: &Transaction) -> Vec<u8> {
     buf
 }
 
-/// Compute the transaction hash from the body encoding (blake2b-256 of CBOR body)
+/// Compute the transaction hash from the body encoding (blake2b-256 of CBOR body).
+///
+/// This overload re-encodes the body from its parsed fields using Conway-era
+/// encoding (tag 258 for set fields).  Use this for forged transactions where
+/// the body is constructed in memory and `raw_body_cbor` is `None`.
+///
+/// For decoded transactions, prefer [`compute_transaction_hash_from_tx`] which
+/// uses the preserved original wire bytes when available.
 pub fn compute_transaction_hash(body: &TransactionBody) -> Hash32 {
     let body_cbor = encode_transaction_body(body);
     blake2b_256(&body_cbor)
+}
+
+/// Compute the transaction hash from a complete decoded transaction.
+///
+/// # D11 / audit #544 — tx hash invariance
+///
+/// When a transaction is decoded from wire CBOR (e.g., from a block received
+/// over the network), pallas computes the hash over the original raw bytes and
+/// stores it in `tx.hash`.  Our `encode_transaction_body` re-encodes from parsed
+/// fields, which may differ from the original bytes for:
+///
+/// - Non-canonical input orderings in pre-Conway transactions
+/// - Dijkstra-era transactions decoded by older code paths
+/// - Any encoding detail that pallas decodes losslessly but we cannot reproduce
+///
+/// This function uses `tx.raw_body_cbor` when available — the exact bytes that
+/// produced `tx.hash` — and falls back to re-encoding only for forged transactions
+/// where `raw_body_cbor` is `None`.
+///
+/// Haskell cardano-node always hashes the original wire bytes; it never re-encodes.
+/// This function matches that behaviour.
+pub fn compute_transaction_hash_from_tx(tx: &Transaction) -> Hash32 {
+    if let Some(raw) = &tx.raw_body_cbor {
+        // Use the preserved original body bytes: guaranteed to match tx.hash.
+        blake2b_256(raw)
+    } else {
+        // Forged transaction: re-encode from fields using era-aware encoding.
+        let body_cbor = encode_transaction_body_for_era(&tx.body, tx.era);
+        blake2b_256(&body_cbor)
+    }
 }
 
 #[cfg(test)]
@@ -929,6 +976,81 @@ mod tests {
         assert_eq!(encoded[2], 0x81, "plain array(1) for Babbage inputs");
     }
 
+    /// D5 / audit #544: Dijkstra body must also encode inputs with tag(258).
+    /// Dijkstra inherits Conway CDDL verbatim — plain arrays produce a wrong body hash.
+    #[test]
+    fn test_dijkstra_inputs_use_tag_258() {
+        let body = minimal_body();
+        let encoded = encode_transaction_body_for_era(&body, Era::Dijkstra);
+
+        assert_eq!(encoded[0], 0xa3, "minimal body map(3)");
+        assert_eq!(encoded[1], 0x00, "key 0 = inputs");
+        // tag(258) must appear immediately after key 0
+        assert_eq!(
+            encoded[2], 0xd9,
+            "Dijkstra inputs: tag prefix byte 1 (0xd9)"
+        );
+        assert_eq!(
+            encoded[3], 0x01,
+            "Dijkstra inputs: tag prefix byte 2 (0x01)"
+        );
+        assert_eq!(
+            encoded[4], 0x02,
+            "Dijkstra inputs: tag prefix byte 3 (0x02)"
+        );
+    }
+
+    /// D5 / audit #544: Dijkstra witness set must use Conway map format for redeemers.
+    #[test]
+    fn test_dijkstra_witness_redeemers_map_format() {
+        let mut ws = empty_witness_set();
+        ws.redeemers.push(Redeemer {
+            tag: RedeemerTag::Spend,
+            index: 0,
+            data: PlutusData::Integer(1),
+            ex_units: ExUnits {
+                mem: 1000,
+                steps: 2000,
+            },
+        });
+        let encoded = encode_witness_set_for_era(&ws, Era::Dijkstra);
+        // map(1) = 0xa1
+        assert_eq!(
+            encoded[0], 0xa1,
+            "Dijkstra witness set with redeemers: map(1)"
+        );
+        assert_eq!(encoded[1], 0x05, "redeemer key must be 5");
+        // Dijkstra uses Conway map format: map(1) = 0xa1 for one redeemer
+        assert_eq!(
+            encoded[2], 0xa1,
+            "Dijkstra redeemers must use Conway map format, not Babbage array format"
+        );
+    }
+
+    /// D5 roundtrip: Dijkstra-era encode/decode hash invariant.
+    /// Encodes a body as Dijkstra, hashes it, and verifies it differs from
+    /// the Babbage-encoded version (which uses plain arrays).
+    #[test]
+    fn test_dijkstra_body_hash_differs_from_babbage() {
+        use dugite_primitives::hash::blake2b_256;
+        let body = minimal_body();
+        let dijkstra_encoded = encode_transaction_body_for_era(&body, Era::Dijkstra);
+        let babbage_encoded = encode_transaction_body_for_era(&body, Era::Babbage);
+        // The Dijkstra encoding uses tag(258) for inputs; the Babbage encoding uses
+        // plain array.  They must produce different bytes and therefore different hashes.
+        assert_ne!(
+            dijkstra_encoded, babbage_encoded,
+            "Dijkstra encoding must differ from Babbage encoding"
+        );
+        let h_dijkstra = blake2b_256(&dijkstra_encoded);
+        let h_conway = blake2b_256(&encode_transaction_body_for_era(&body, Era::Conway));
+        // Dijkstra body hash must match Conway body hash (same CDDL)
+        assert_eq!(
+            h_dijkstra, h_conway,
+            "Dijkstra and Conway body must have same hash (same CDDL)"
+        );
+    }
+
     // ── witness set redeemer format ──────────────────────────────────────────
 
     /// Conway witness set: redeemer at key 5 encoded as map (0xa1 for single redeemer)
@@ -1213,5 +1335,65 @@ mod tests {
         let h1 = compute_transaction_hash(&body1);
         let h2 = compute_transaction_hash(&body2);
         assert_ne!(h1, h2, "different bodies must produce different hashes");
+    }
+
+    // ── D11: compute_transaction_hash_from_tx ────────────────────────────────
+
+    /// D11: When raw_body_cbor is None (forged tx), falls back to re-encoding.
+    #[test]
+    fn test_compute_hash_from_tx_no_raw_body_matches_reencoded() {
+        let body = minimal_body();
+        let tx = dugite_primitives::transaction::Transaction {
+            hash: Hash32::ZERO,
+            era: Era::Conway,
+            body: body.clone(),
+            witness_set: empty_witness_set(),
+            is_valid: true,
+            auxiliary_data: None,
+            raw_cbor: None,
+            raw_body_cbor: None,
+            raw_witness_cbor: None,
+        };
+        let from_tx = compute_transaction_hash_from_tx(&tx);
+        let from_body = compute_transaction_hash(&body);
+        assert_eq!(
+            from_tx, from_body,
+            "without raw_body_cbor, must fall back to re-encode = same as compute_transaction_hash"
+        );
+    }
+
+    /// D11: When raw_body_cbor is Some, must hash the raw bytes directly.
+    /// This ensures tx.hash (computed by pallas from wire bytes) is preserved.
+    #[test]
+    fn test_compute_hash_from_tx_uses_raw_body_cbor() {
+        use dugite_primitives::hash::blake2b_256;
+        // Craft raw_body_cbor that is NOT a valid transaction body — just a known byte sequence.
+        // compute_transaction_hash_from_tx must hash these exact bytes.
+        let raw_body: Vec<u8> = vec![0xde, 0xad, 0xbe, 0xef];
+        let expected_hash = blake2b_256(&raw_body);
+
+        let body = minimal_body();
+        let tx = dugite_primitives::transaction::Transaction {
+            hash: expected_hash,
+            era: Era::Conway,
+            body,
+            witness_set: empty_witness_set(),
+            is_valid: true,
+            auxiliary_data: None,
+            raw_cbor: None,
+            raw_body_cbor: Some(raw_body),
+            raw_witness_cbor: None,
+        };
+        let from_tx = compute_transaction_hash_from_tx(&tx);
+        assert_eq!(
+            from_tx, expected_hash,
+            "with raw_body_cbor set, must hash raw bytes (not re-encode)"
+        );
+        // Also verify it differs from the re-encode hash
+        let from_body = compute_transaction_hash(&tx.body);
+        assert_ne!(
+            from_tx, from_body,
+            "raw_body hash must differ from re-encoded hash when raw differs from re-encoded"
+        );
     }
 }

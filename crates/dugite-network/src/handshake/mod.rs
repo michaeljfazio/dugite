@@ -59,6 +59,16 @@ const MSG_REFUSE: u64 = 2;
 #[allow(dead_code)]
 const MSG_QUERY_REPLY: u64 = 3;
 
+/// Maximum number of version entries accepted in a `MsgProposeVersions` map.
+///
+/// A peer can send a CBOR map header advertising `2^63` entries, causing the
+/// decode loop to run for billions of iterations, pegging a CPU core for the
+/// 10-second handshake window. Haskell's `decodeVersions` is bounded to the
+/// version table size (≤ 16 entries for N2N). We cap at 32 which is above
+/// any real cardano-node version table while rejecting clearly adversarial
+/// inputs early (A-003, security audit 2026-05-19).
+const MAX_HANDSHAKE_VERSIONS: u64 = 32;
+
 /// Run the handshake as the client (initiator) for N2N connections.
 ///
 /// Sends `MsgProposeVersions` with our version table, then waits for the server's response.
@@ -336,6 +346,16 @@ fn decode_propose_versions_n2n(
         .map_err(|e| HandshakeError::DecodeError(e.to_string()))?
         .ok_or_else(|| HandshakeError::DecodeError("indefinite map not supported".to_string()))?;
 
+    // A-003 (security audit 2026-05-19): reject absurdly large version maps
+    // before iterating. A malicious peer advertising 2^63 entries would peg a
+    // CPU core for the full 10-second handshake window. Cap at 32 — above any
+    // real cardano-node version table (≤ 16 for N2N).
+    if map_len > MAX_HANDSHAKE_VERSIONS {
+        return Err(HandshakeError::DecodeError(format!(
+            "MsgProposeVersions: too many versions ({map_len} > {MAX_HANDSHAKE_VERSIONS})"
+        )));
+    }
+
     let mut versions = BTreeMap::new();
     for _ in 0..map_len {
         let version = dec
@@ -382,6 +402,13 @@ fn decode_propose_versions_n2c(
         .map()
         .map_err(|e| HandshakeError::DecodeError(e.to_string()))?
         .ok_or_else(|| HandshakeError::DecodeError("indefinite map not supported".to_string()))?;
+
+    // A-003 (security audit 2026-05-19): same cap as the N2N path.
+    if map_len > MAX_HANDSHAKE_VERSIONS {
+        return Err(HandshakeError::DecodeError(format!(
+            "MsgProposeVersions: too many versions ({map_len} > {MAX_HANDSHAKE_VERSIONS})"
+        )));
+    }
 
     let mut versions = BTreeMap::new();
     for _ in 0..map_len {
@@ -687,5 +714,107 @@ mod tests {
             matches!(result, Err(HandshakeError::NetworkMagicMismatch { .. })),
             "expected NetworkMagicMismatch, got: {result:?}"
         );
+    }
+
+    // ── A-003: handshake version map cap (security audit 2026-05-19) ─────────
+
+    /// Build a raw MsgProposeVersions N2N CBOR with `n` map entries.
+    fn build_n2n_propose_with_n_versions(n: u64) -> Vec<u8> {
+        let mut buf = Vec::new();
+        let mut enc = Encoder::new(&mut buf);
+        enc.array(2).unwrap();
+        enc.u64(MSG_PROPOSE_VERSIONS).unwrap();
+        enc.map(n).unwrap();
+        // Fill with `n` version entries (version=99, data=[2,false,false,false])
+        for _ in 0..n {
+            enc.u16(99).unwrap(); // unknown version key
+            enc.array(4).unwrap();
+            enc.u64(2).unwrap(); // network_magic
+            enc.bool(false).unwrap(); // initiatorOnlyDiffusionMode
+            enc.bool(false).unwrap(); // peerSharing
+            enc.bool(false).unwrap(); // query
+        }
+        buf
+    }
+
+    /// Build a raw MsgProposeVersions N2C CBOR with `n` map entries.
+    fn build_n2c_propose_with_n_versions(n: u64) -> Vec<u8> {
+        let mut buf = Vec::new();
+        let mut enc = Encoder::new(&mut buf);
+        enc.array(2).unwrap();
+        enc.u64(MSG_PROPOSE_VERSIONS).unwrap();
+        enc.map(n).unwrap();
+        for _ in 0..n {
+            // N2C version with bit-15 set: wire version 0x8011 = logical 17
+            enc.u16(0x8011).unwrap();
+            enc.array(2).unwrap();
+            enc.u64(2).unwrap(); // network_magic
+            enc.bool(false).unwrap(); // query
+        }
+        buf
+    }
+
+    #[test]
+    fn n2n_propose_within_version_cap_accepted() {
+        // Exactly MAX_HANDSHAKE_VERSIONS entries — must decode OK.
+        let buf = build_n2n_propose_with_n_versions(MAX_HANDSHAKE_VERSIONS);
+        // All versions are unknown (99), so decoded map will be empty — that's fine.
+        let result = decode_propose_versions_n2n(&buf);
+        assert!(
+            result.is_ok(),
+            "version count == MAX should succeed, got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn n2n_propose_exceeding_version_cap_rejected() {
+        let buf = build_n2n_propose_with_n_versions(MAX_HANDSHAKE_VERSIONS + 1);
+        let result = decode_propose_versions_n2n(&buf);
+        assert!(
+            matches!(result, Err(HandshakeError::DecodeError(_))),
+            "version count > MAX must be rejected, got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn n2c_propose_within_version_cap_accepted() {
+        let buf = build_n2c_propose_with_n_versions(MAX_HANDSHAKE_VERSIONS);
+        let result = decode_propose_versions_n2c(&buf);
+        assert!(
+            result.is_ok(),
+            "N2C version count == MAX should succeed, got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn n2c_propose_exceeding_version_cap_rejected() {
+        let buf = build_n2c_propose_with_n_versions(MAX_HANDSHAKE_VERSIONS + 1);
+        let result = decode_propose_versions_n2c(&buf);
+        assert!(
+            matches!(result, Err(HandshakeError::DecodeError(_))),
+            "N2C version count > MAX must be rejected, got: {result:?}"
+        );
+    }
+
+    /// Property test: version count lattice [0, MAX/2, MAX, MAX+1, MAX*4].
+    #[test]
+    fn n2n_version_count_lattice() {
+        for n in [0u64, 1, MAX_HANDSHAKE_VERSIONS / 2, MAX_HANDSHAKE_VERSIONS] {
+            let buf = build_n2n_propose_with_n_versions(n);
+            let result = decode_propose_versions_n2n(&buf);
+            assert!(
+                result.is_ok(),
+                "count {n} <= MAX should succeed; got: {result:?}"
+            );
+        }
+        for n in [
+            MAX_HANDSHAKE_VERSIONS + 1,
+            MAX_HANDSHAKE_VERSIONS * 2,
+            MAX_HANDSHAKE_VERSIONS * 4,
+        ] {
+            let buf = build_n2n_propose_with_n_versions(n);
+            let result = decode_propose_versions_n2n(&buf);
+            assert!(result.is_err(), "count {n} > MAX must fail; got: Ok(..)");
+        }
     }
 }

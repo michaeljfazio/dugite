@@ -40,6 +40,7 @@ use super::scripts::{
     collect_available_script_hashes, compute_min_fee, estimate_value_cbor_size,
     evaluate_native_script,
 };
+use super::size_check::expect_size;
 use super::ValidationError;
 
 // ---------------------------------------------------------------------------
@@ -258,14 +259,11 @@ impl HasWitnessFields for dugite_primitives::transaction::VKeyWitness {
     }
 }
 
-impl HasWitnessFields for dugite_primitives::transaction::BootstrapWitness {
-    fn vkey(&self) -> &[u8] {
-        &self.vkey
-    }
-    fn signature(&self) -> &[u8] {
-        &self.signature
-    }
-}
+// NOTE: BootstrapWitness does NOT implement HasWitnessFields.
+// Byron extended public keys are 64 bytes; the 32-byte guard in
+// `verify_single_witness` would fire and return None (silent accept) for
+// every bootstrap witness. Bootstrap witnesses use `verify_bootstrap_witnesses`
+// instead. See F1 in the 2026-05-19 security audit (#546).
 
 fn verify_single_witness<W: HasWitnessFields>(
     witness: &W,
@@ -274,20 +272,34 @@ fn verify_single_witness<W: HasWitnessFields>(
 ) -> Option<ValidationError> {
     let vkey = witness.vkey();
     let sig = witness.signature();
-    // Ed25519 requires exact 32-byte vkeys and 64-byte signatures. Haskell
-    // cardano-node rejects malformed witnesses at CBOR decode time via the
-    // fixed-size `VKey` / `SignedDSIGN Ed25519DSIGN` newtype decoders
-    // (`decodeSignedDSIGN` -> `failSizeCheck`). Pallas decodes witnesses as
-    // variable-length `Bytes`, so we enforce the length invariant here and
-    // emit a structured `InvalidWitnessSignature` (better than Haskell's
-    // codec-level socket-close, which is an artifact of its CBOR layout).
-    if vkey.len() != 32 || sig.len() != 64 {
-        return Some(ValidationError::InvalidWitnessSignature(format!(
-            "{prefix}malformed witness: vkey={} bytes, sig={} bytes (expected 32/64)",
-            vkey.len(),
-            sig.len(),
-        )));
+    // Pre-flight: enforce Ed25519 wire sizes (32-byte key, 64-byte sig) BEFORE
+    // any crypto. Haskell's `rawDeserialiseVerKeyDSIGN` fails hard for non-32-byte
+    // keys, returning `InvalidWitness`. We must never silently accept malformed
+    // witnesses — that would let a fabricated 1-byte vkey satisfy a required-signer
+    // check without any cryptographic verification (D2/D9 class, audit #544;
+    // same class as #537).
+    //
+    // Bootstrap witnesses (Byron extended keys, 64-byte vkey) take the separate
+    // `verify_bootstrap_witnesses` path (#546 F1) and are never dispatched here —
+    // `HasWitnessFields` is intentionally not impl'd on `BootstrapWitness`.
+    //
+    // `expect_size` is the uniform helper from `size_check.rs`; all crypto-input
+    // length checks in the validation layer go through it.
+    if let Err(e) = expect_size("vkey", vkey.len(), 32) {
+        return Some(e);
     }
+    if let Err(e) = expect_size("signature", sig.len(), 64) {
+        return Some(e);
+    }
+    // Inline defense-in-depth: even after the pre-flight above, the crypto call
+    // must not receive wrong-size inputs if this function is ever invoked through
+    // a future call path that bypasses the pre-flight.
+    debug_assert_eq!(
+        vkey.len(),
+        32,
+        "vkey must be exactly 32 bytes at crypto site"
+    );
+    debug_assert_eq!(sig.len(), 64, "sig must be exactly 64 bytes at crypto site");
     match dugite_crypto::keys::PaymentVerificationKey::from_bytes(vkey) {
         Ok(vk) => {
             if vk.verify(tx_hash_bytes, sig).is_err() {
@@ -304,6 +316,200 @@ fn verify_single_witness<W: HasWitnessFields>(
             &vkey[..8.min(vkey.len())]
         ))),
     }
+}
+
+// ---------------------------------------------------------------------------
+// Bootstrap witness (Byron) verification — F1 security audit 2026-05-19 (#546)
+//
+// Wire format: bootstrap_witness = [vkey: bytes .size 64, sig: bytes .size 64,
+//                                   chain_code: bytes .size 32, attributes: bytes]
+//
+// Byron "extended" Ed25519: 64 bytes = 32-byte scalar || 32-byte extension.
+// Signature verification uses only bytes 0..32 (the scalar / public key part).
+//
+// Haskell references:
+//   - `verifyDSIGN Ed25519DSIGN` (uses first 32 bytes of 64-byte extended key)
+//   - `checkBootstrap` (address-root binding check)
+//   - `bootstrapKeyHash` (root derivation)
+// ---------------------------------------------------------------------------
+
+/// Verify one Byron bootstrap witness (structural + signature check).
+///
+/// Step 1: Pre-flight: vkey must be 64 bytes, sig 64 bytes, chain_code 32 bytes.
+/// Step 2: Ed25519 verify over `tx_hash_bytes` using `vkey[0..32]` as the scalar.
+///
+/// Address binding (step 3) is handled by `check_bootstrap_address_binding`.
+fn verify_single_bootstrap_witness(
+    bw: &dugite_primitives::transaction::BootstrapWitness,
+    tx_hash_bytes: &[u8],
+) -> Option<ValidationError> {
+    let vkey = &bw.vkey;
+    let sig = &bw.signature;
+    let chain_code = &bw.chain_code;
+
+    // Pre-flight structural check — mirrors Haskell CBOR fixed-size decode.
+    if vkey.len() != 64 || sig.len() != 64 {
+        return Some(ValidationError::InvalidWitnessSignature(format!(
+            "bootstrap: malformed witness: vkey={} bytes (expected 64), sig={} bytes (expected 64)",
+            vkey.len(),
+            sig.len(),
+        )));
+    }
+    if chain_code.len() != 32 {
+        return Some(ValidationError::InvalidWitnessSignature(format!(
+            "bootstrap: malformed chain_code: {} bytes (expected 32)",
+            chain_code.len(),
+        )));
+    }
+
+    // Ed25519 verify using vkey[0..32] (the scalar part of the extended key).
+    let scalar_bytes = &vkey[..32];
+    match dugite_crypto::keys::PaymentVerificationKey::from_bytes(scalar_bytes) {
+        Ok(vk) => {
+            if vk.verify(tx_hash_bytes, sig).is_err() {
+                Some(ValidationError::InvalidWitnessSignature(format!(
+                    "bootstrap:sig_invalid:{:02x?}",
+                    &scalar_bytes[..4]
+                )))
+            } else {
+                None
+            }
+        }
+        Err(_) => Some(ValidationError::InvalidWitnessSignature(format!(
+            "bootstrap:invalid_scalar:{:02x?}",
+            &scalar_bytes[..4]
+        ))),
+    }
+}
+
+/// Compute the Byron address root from bootstrap witness fields.
+///
+/// `root = blake2b_224(sha3_256(CBOR([addrtype=0, [0, vkey64], attrs_cbor])))`
+///
+/// Matches Haskell `bootstrapKeyHash` in `cardano-ledger-shelley`.
+///
+/// `attrs_cbor` are the raw CBOR bytes of the address attribute map as
+/// stored in the `BootstrapWitness.attributes` field.
+pub(crate) fn compute_bootstrap_root(vkey64: &[u8], attrs_cbor: &[u8]) -> Option<[u8; 28]> {
+    use sha3::Digest as _;
+
+    // CBOR encode: array(3) [ uint(0), array(2)[uint(0), bytes(vkey64)], attrs_raw ]
+    let mut buf = Vec::with_capacity(8 + vkey64.len() + attrs_cbor.len());
+    buf.push(0x83); // array(3)
+    buf.push(0x00); // uint(0) — AddrType::PubKey
+    buf.push(0x82); // array(2) — SpendingData::PubKey
+    buf.push(0x00); // uint(0)
+                    // bytes(vkey64) length encoding
+    let vkey_len = vkey64.len();
+    if vkey_len <= 23 {
+        buf.push(0x40 | vkey_len as u8);
+    } else if vkey_len <= 0xFF {
+        buf.push(0x58);
+        buf.push(vkey_len as u8);
+    } else {
+        buf.push(0x59);
+        buf.push((vkey_len >> 8) as u8);
+        buf.push(vkey_len as u8);
+    }
+    buf.extend_from_slice(vkey64);
+    buf.extend_from_slice(attrs_cbor); // attrs verbatim
+
+    let sha3_hash = sha3::Sha3_256::digest(&buf);
+    let root = dugite_primitives::hash::blake2b_224(&sha3_hash[..]);
+    Some(*root.as_bytes())
+}
+
+/// Extract the 28-byte root from a Byron address payload.
+///
+/// Byron address wire: `array(2) [ tag(24, bytes(inner_cbor)), crc32 ]`
+/// `inner_cbor`:       `array(3) [ root: bytes(28), attributes: map, addrtype: uint ]`
+fn extract_byron_address_root(payload: &[u8]) -> Option<[u8; 28]> {
+    let mut d = minicbor::Decoder::new(payload);
+    let inner_bytes: &[u8] = if payload.first() == Some(&0x82) {
+        d.array().ok()?;
+        let tag = d.tag().ok()?;
+        if tag.as_u64() != 24 {
+            return None;
+        }
+        d.bytes().ok()?
+    } else {
+        payload
+    };
+    let mut d2 = minicbor::Decoder::new(inner_bytes);
+    d2.array().ok()?;
+    let root_bytes = d2.bytes().ok()?;
+    if root_bytes.len() == 28 {
+        let mut arr = [0u8; 28];
+        arr.copy_from_slice(root_bytes);
+        Some(arr)
+    } else {
+        None
+    }
+}
+
+/// Check address binding: each bootstrap witness's computed root must match
+/// the root in the Byron address of at least one regular input (Haskell `checkBootstrap`).
+fn check_bootstrap_address_binding(
+    tx: &Transaction,
+    utxo_set: &dyn UtxoLookup,
+) -> Vec<ValidationError> {
+    use dugite_primitives::address::Address;
+    let mut errors = Vec::new();
+
+    for bw in &tx.witness_set.bootstrap_witnesses {
+        // Only check structurally valid witnesses (others are caught by signature verifier).
+        if bw.vkey.len() != 64 || bw.signature.len() != 64 || bw.chain_code.len() != 32 {
+            continue;
+        }
+        let computed_root = match compute_bootstrap_root(&bw.vkey, &bw.attributes) {
+            Some(r) => r,
+            None => {
+                errors.push(ValidationError::InvalidWitnessSignature(format!(
+                    "bootstrap:address_root_computation_failed:{:02x?}",
+                    &bw.vkey[..4]
+                )));
+                continue;
+            }
+        };
+
+        let mut matched = false;
+        'outer: for input in &tx.body.inputs {
+            if let Some(output) = utxo_set.lookup(input) {
+                if let Address::Byron(ref byron) = output.address {
+                    if let Some(root_bytes) = extract_byron_address_root(&byron.payload) {
+                        if root_bytes == computed_root {
+                            matched = true;
+                            break 'outer;
+                        }
+                    }
+                }
+            }
+        }
+
+        if !matched {
+            errors.push(ValidationError::InvalidWitnessSignature(format!(
+                "bootstrap:address_binding_failed:{:02x?}",
+                &bw.vkey[..4]
+            )));
+        }
+    }
+    errors
+}
+
+/// Verify all bootstrap witnesses in a transaction (signature + address binding).
+fn verify_bootstrap_witnesses(
+    tx: &Transaction,
+    utxo_set: &dyn UtxoLookup,
+    tx_hash_bytes: &[u8],
+) -> Vec<ValidationError> {
+    let mut errors: Vec<ValidationError> = tx
+        .witness_set
+        .bootstrap_witnesses
+        .iter()
+        .filter_map(|bw| verify_single_bootstrap_witness(bw, tx_hash_bytes))
+        .collect();
+    errors.extend(check_bootstrap_address_binding(tx, utxo_set));
+    errors
 }
 
 #[cfg(feature = "parallel-verification")]
@@ -516,6 +722,30 @@ pub(super) fn run_phase1_rules(
     }
 
     // ------------------------------------------------------------------
+    // Rule 1h1a: Pool margin must be a valid rational in [0, 1]
+    //            (Haskell `PoolMarginsInvalidPOOL`)
+    //
+    // Haskell's POOL rule rejects registrations with:
+    //   * denominator == 0 (division by zero; panics in reward calculation)
+    //   * numerator > denominator (margin > 100%)
+    //
+    // Reference: Haskell `PoolMarginsInvalidPOOL` in
+    // `cardano-ledger-shelley:Cardano.Ledger.Shelley.Rules.Pool`.
+    // ------------------------------------------------------------------
+    for cert in &body.certificates {
+        if let Certificate::PoolRegistration(pool_params) = cert {
+            let denom = pool_params.margin.denominator;
+            let numer = pool_params.margin.numerator;
+            if denom == 0 || numer > denom {
+                errors.push(ValidationError::PoolMarginInvalid {
+                    numerator: numer,
+                    denominator: denom,
+                });
+            }
+        }
+    }
+
+    // ------------------------------------------------------------------
     // Rule 1h2: Pool metadata hash must not exceed 32 bytes
     //          (Haskell `PoolMedataHashTooBig`, Alonzo+)
     //
@@ -547,6 +777,27 @@ pub(super) fn run_phase1_rules(
     }
 
     // ------------------------------------------------------------------
+    // Rule 1i-pre: Pool reward account must be exactly 29 bytes
+    //             (D8 of security audit #544)
+    //
+    // A pool reward account is always exactly 29 bytes: 1 header byte followed
+    // by a 28-byte (Blake2b-224) credential hash. Haskell's `checkPoolParams`
+    // deserialises the raw bytes as an `Addr` via `deserialiseFromRawBytes
+    // AsShelleyAddress`, which fails hard on any other length. This check runs
+    // unconditionally — no `network_id` in the tx body is required.
+    // ------------------------------------------------------------------
+    for cert in &body.certificates {
+        if let Certificate::PoolRegistration(pool_params) = cert {
+            if pool_params.reward_account.len() != 29 {
+                errors.push(ValidationError::InvalidRewardAccount(format!(
+                    "pool reward account must be exactly 29 bytes, got {}",
+                    pool_params.reward_account.len()
+                )));
+            }
+        }
+    }
+
+    // ------------------------------------------------------------------
     // Rule 1i: Pool reward account network must match transaction network_id
     //          (Haskell `WrongNetworkInTxBody`, Alonzo+)
     //
@@ -573,6 +824,7 @@ pub(super) fn run_phase1_rules(
             if let Certificate::PoolRegistration(pool_params) = cert {
                 // Reward account format: header_byte || 28-byte credential hash.
                 // Bit 0 of the header encodes the network: 0 = testnet, 1 = mainnet.
+                // Length is already checked in Rule 1i-pre above; skip here if bad.
                 if let Some(header) = pool_params.reward_account.first() {
                     let network_bit = header & 0x01;
                     let actual_network = if network_bit == 0 {
@@ -990,11 +1242,20 @@ pub(super) fn run_phase1_rules(
     // Rule 9b: Witness completeness
     // ------------------------------------------------------------------
     if errors.is_empty() {
-        // Build the set of VKey witness key hashes (blake2b-224 of each vkey)
+        // Build the set of VKey witness key hashes (blake2b-224 of each vkey).
+        //
+        // D9 / audit #544: Only hash vkeys that are exactly 32 bytes.
+        // A malformed 1-byte vkey must NOT be hashed and used to satisfy a
+        // required-signer check — that would let fabricated witnesses bypass
+        // all cryptographic verification.  Haskell rejects non-32-byte vkeys
+        // at CBOR decode time (`decodeVerKeyDSIGN` / `failSizeCheck`), so
+        // they never reach the witness-completeness check.  Pallas accepts any
+        // byte length; we enforce the invariant here.
         let vkey_witness_hashes: HashSet<Hash28> = tx
             .witness_set
             .vkey_witnesses
             .iter()
+            .filter(|w| w.vkey.len() == 32) // only well-formed Ed25519 keys
             .map(|w| dugite_primitives::hash::blake2b_224(&w.vkey))
             .collect();
 
@@ -1082,10 +1343,13 @@ pub(super) fn run_phase1_rules(
     // Rule 10: Required signers must have corresponding vkey witnesses
     // ------------------------------------------------------------------
     if !body.required_signers.is_empty() && !tx.witness_set.vkey_witnesses.is_empty() {
+        // D9 / audit #544: Same filter as Rule 9b — only hash well-formed 32-byte
+        // vkeys.  A malformed vkey must never satisfy a required-signer check.
         let witness_keyhashes: HashSet<_> = tx
             .witness_set
             .vkey_witnesses
             .iter()
+            .filter(|w| w.vkey.len() == 32) // only well-formed Ed25519 keys
             .map(|w| dugite_primitives::hash::blake2b_224(&w.vkey))
             .collect();
         for required_signer in &body.required_signers {
@@ -1215,8 +1479,19 @@ pub(super) fn run_phase1_rules(
 
     // ------------------------------------------------------------------
     // Rule 14: Witness signature verification
+    //
+    // Haskell runs all UTXOW predicates independently — Rule 14 fires even
+    // when other rules have also fired (e.g. missing-input). We mirror that
+    // behaviour so operators receive the full error set on one submission.
+    // `tx.hash` is always populated during deserialization.
+    //
+    // VKeyWitness: 32-byte Ed25519 key + 64-byte signature.
+    // BootstrapWitness (Byron): 64-byte extended key; separate verifier:
+    //   (a) verifies the signature using vkey[0..32] (scalar part), and
+    //   (b) checks the address-binding (computed root vs Byron address root
+    //       stored in the UTxO being spent).
     // ------------------------------------------------------------------
-    if errors.is_empty() {
+    {
         let tx_hash_bytes = tx.hash.as_bytes();
 
         errors.extend(verify_witness_signatures(
@@ -1224,11 +1499,7 @@ pub(super) fn run_phase1_rules(
             tx_hash_bytes,
             "",
         ));
-        errors.extend(verify_witness_signatures(
-            &tx.witness_set.bootstrap_witnesses,
-            tx_hash_bytes,
-            "bootstrap:",
-        ));
+        errors.extend(verify_bootstrap_witnesses(tx, utxo_set, tx_hash_bytes));
     }
 }
 
@@ -2026,6 +2297,8 @@ mod tests {
     // observed lengths so operators can diagnose corrupt submissions.
     #[test]
     fn test_vkey_witness_malformed_error_message_includes_sizes() {
+        // D2 fix: expect_size checks vkey first, then sig, each returning a separate error.
+        // With vkey=31 bytes: error mentions "31" and "32" (expected).
         let errors = validate_with_vkey_witness(vec![1u8; 31], vec![0u8; 63]);
         let msg = errors
             .iter()
@@ -2034,8 +2307,32 @@ mod tests {
                 _ => None,
             })
             .expect("InvalidWitnessSignature not found");
-        assert!(msg.contains("31"), "message must include vkey size: {msg}");
-        assert!(msg.contains("63"), "message must include sig size: {msg}");
+        // The error must reference the actual size (31) and the expected size (32)
+        assert!(
+            msg.contains("31"),
+            "message must include actual vkey size: {msg}"
+        );
+        assert!(
+            msg.contains("32"),
+            "message must include expected vkey size: {msg}"
+        );
+        // Also verify wrong-size sig is rejected when vkey is correct
+        let errors2 = validate_with_vkey_witness(vec![0u8; 32], vec![0u8; 63]);
+        let msg2 = errors2
+            .iter()
+            .find_map(|e| match e {
+                ValidationError::InvalidWitnessSignature(s) => Some(s.clone()),
+                _ => None,
+            })
+            .expect("InvalidWitnessSignature not found for wrong-size sig");
+        assert!(
+            msg2.contains("63"),
+            "message must include actual sig size: {msg2}"
+        );
+        assert!(
+            msg2.contains("64"),
+            "message must include expected sig size: {msg2}"
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -3039,6 +3336,794 @@ mod tests {
                 .iter()
                 .any(|e| matches!(e, ValidationError::PoolMedataHashTooBig { .. })),
             "expected no PoolMedataHashTooBig, got {errors:?}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // D9 / audit #544: Malformed vkeys must not satisfy required-signer check
+    //
+    // A fabricated 1-byte vkey whose blake2b_224 happens to equal a required
+    // signer's keyhash must NOT satisfy rule 10.  Before the D9 fix, the
+    // vkey_witness_hashes set included hashes of malformed vkeys, allowing a
+    // tx with `vkey=[0x01]` and `required_signer = blake2b_224([0x01])` to
+    // pass phase-1 with zero cryptographic verification.
+    // -----------------------------------------------------------------------
+
+    /// D9: blake2b_224 of a 1-byte vkey must not satisfy a required-signer check.
+    /// Haskell rejects any non-32-byte vkey at `rawDeserialiseVerKeyDSIGN` time;
+    /// Dugite must reject it at the hashing filter (rule 9b/10).
+    #[test]
+    fn test_d9_malformed_vkey_cannot_satisfy_required_signer() {
+        use dugite_primitives::hash::{blake2b_224, Hash32};
+
+        // The malformed vkey is just one byte.
+        let malformed_vkey = vec![0x01u8];
+        let fabricated_keyhash = blake2b_224(&malformed_vkey);
+
+        // Build the Hash32 form used in required_signers (zero-padded from 28 bytes).
+        let mut hash32_bytes = [0u8; 32];
+        hash32_bytes[..28].copy_from_slice(fabricated_keyhash.as_bytes());
+        let required_signer = Hash32::from_bytes(hash32_bytes);
+
+        let (utxo_set, mut tx, _) = make_valid_tx();
+        // Set a required signer whose keyhash = blake2b_224([0x01])
+        tx.body.required_signers = vec![required_signer];
+        // Add a malformed vkey witness with the 1-byte vkey
+        tx.witness_set
+            .vkey_witnesses
+            .push(dugite_primitives::transaction::VKeyWitness {
+                vkey: malformed_vkey.clone(),
+                signature: vec![0u8; 64],
+            });
+
+        let params = ProtocolParameters::mainnet_defaults();
+        let errors = validate_transaction(&tx, &utxo_set, &params, 100, 300, None)
+            .err()
+            .unwrap_or_default();
+
+        // Must reject: the 1-byte vkey must not satisfy required_signer.
+        // We expect either InvalidWitnessSignature (from rule 14) or
+        // MissingRequiredSigner (from rule 10) — both are correct.
+        let rejected = errors.iter().any(|e| {
+            matches!(
+                e,
+                ValidationError::InvalidWitnessSignature(_)
+                    | ValidationError::MissingRequiredSigner(_)
+            )
+        });
+        assert!(
+            rejected,
+            "malformed 1-byte vkey must not satisfy required-signer check; errors: {errors:?}"
+        );
+    }
+
+    /// D9 length-lattice: for all vkey sizes except 32, the required-signer check
+    /// must reject (either via InvalidWitnessSignature or MissingRequiredSigner).
+    #[test]
+    fn test_d9_required_signer_length_lattice() {
+        use dugite_primitives::hash::{blake2b_224, Hash32};
+
+        for vkey_len in [0_usize, 1, 16, 31, 33, 64] {
+            let malformed_vkey = vec![0xABu8; vkey_len];
+            let fabricated_keyhash = blake2b_224(&malformed_vkey);
+            let mut hash32_bytes = [0u8; 32];
+            hash32_bytes[..28].copy_from_slice(fabricated_keyhash.as_bytes());
+            let required_signer = Hash32::from_bytes(hash32_bytes);
+
+            let (utxo_set, mut tx, _) = make_valid_tx();
+            tx.body.required_signers = vec![required_signer];
+            tx.witness_set
+                .vkey_witnesses
+                .push(dugite_primitives::transaction::VKeyWitness {
+                    vkey: malformed_vkey,
+                    signature: vec![0u8; 64],
+                });
+
+            let params = ProtocolParameters::mainnet_defaults();
+            let errors = validate_transaction(&tx, &utxo_set, &params, 100, 300, None)
+                .err()
+                .unwrap_or_default();
+
+            let rejected = errors.iter().any(|e| {
+                matches!(
+                    e,
+                    ValidationError::InvalidWitnessSignature(_)
+                        | ValidationError::MissingRequiredSigner(_)
+                )
+            });
+            assert!(
+                rejected,
+                "vkey_len={vkey_len}: malformed vkey must not satisfy required-signer; errors={errors:?}"
+            );
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Test D8 — Rule 1i: pool reward account must be exactly 29 bytes
+    // -----------------------------------------------------------------------
+    #[test]
+    fn test_d8_pool_reward_account_wrong_length_rejected() {
+        use dugite_primitives::transaction::{Certificate, PoolParams, Rational};
+        // Test both too-short (28 bytes) and too-long (30 bytes) cases.
+        for bad_len in [0usize, 1, 28, 30, 64] {
+            let (utxo_set, mut tx, _) = make_valid_tx();
+            let params = ProtocolParameters::mainnet_defaults();
+
+            tx.body
+                .certificates
+                .push(Certificate::PoolRegistration(PoolParams {
+                    operator: Hash28::from_bytes([0x88u8; 28]),
+                    vrf_keyhash: Hash32::from_bytes([0x99u8; 32]),
+                    pledge: Lovelace(0),
+                    cost: Lovelace(340_000_000),
+                    margin: Rational {
+                        numerator: 1,
+                        denominator: 100,
+                    },
+                    // Wrong-length reward account — one byte header (mainnet) + wrong tail.
+                    reward_account: {
+                        let mut acct = vec![0xE1u8]; // mainnet key reward addr header
+                        acct.extend_from_slice(&vec![0xAA; bad_len.saturating_sub(1)]);
+                        acct.truncate(bad_len);
+                        acct
+                    },
+                    pool_owners: vec![],
+                    relays: vec![],
+                    pool_metadata: None,
+                }));
+
+            let errors = validate_transaction(&tx, &utxo_set, &params, 100, 300, None).unwrap_err();
+            assert!(
+                errors
+                    .iter()
+                    .any(|e| matches!(e, ValidationError::InvalidRewardAccount(_))),
+                "reward_account of length {bad_len} must produce InvalidRewardAccount, got {errors:?}"
+            );
+        }
+    }
+
+    /// Length-lattice: exactly 29 bytes with a valid header must not produce
+    /// InvalidRewardAccount (it may still fail for other reasons, but not D8).
+    #[test]
+    fn test_d8_pool_reward_account_exact_length_ok() {
+        use dugite_primitives::transaction::{Certificate, PoolParams, Rational};
+        let (utxo_set, mut tx, _) = make_valid_tx();
+        let params = ProtocolParameters::mainnet_defaults();
+
+        // 29-byte mainnet key reward account — should NOT produce InvalidRewardAccount.
+        tx.body
+            .certificates
+            .push(Certificate::PoolRegistration(PoolParams {
+                operator: Hash28::from_bytes([0x88u8; 28]),
+                vrf_keyhash: Hash32::from_bytes([0x99u8; 32]),
+                pledge: Lovelace(0),
+                cost: Lovelace(340_000_000),
+                margin: Rational {
+                    numerator: 1,
+                    denominator: 100,
+                },
+                reward_account: {
+                    let mut acct = vec![0xE1u8]; // mainnet key reward addr
+                    acct.extend_from_slice(&[0xAA; 28]);
+                    acct
+                },
+                pool_owners: vec![],
+                relays: vec![],
+                pool_metadata: None,
+            }));
+
+        // May succeed or fail for other reasons (e.g. pool not registered) —
+        // but must not fail with InvalidRewardAccount.
+        match validate_transaction(&tx, &utxo_set, &params, 100, 300, None) {
+            Ok(_) => {}
+            Err(errors) => {
+                assert!(
+                    !errors
+                        .iter()
+                        .any(|e| matches!(e, ValidationError::InvalidRewardAccount(_))),
+                    "exactly 29-byte reward account must not produce InvalidRewardAccount, got {errors:?}"
+                );
+            }
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Tests — F3: Pool margin bounds validation (#546 security audit)
+    //
+    // Haskell `PoolMarginsInvalidPOOL` rejects:
+    //   * denominator == 0 (division by zero)
+    //   * numerator > denominator (margin > 100%)
+    // -----------------------------------------------------------------------
+
+    use dugite_primitives::transaction::{Certificate, PoolParams, Rational};
+
+    fn make_pool_registration_tx(
+        numerator: u64,
+        denominator: u64,
+    ) -> (crate::utxo::UtxoSet, Transaction) {
+        let (mut utxo_set, mut tx, _) = make_valid_tx();
+        // Add enough inputs to cover the pool deposit (500 ADA on mainnet)
+        let extra_input = TransactionInput {
+            transaction_id: Hash32::from_bytes([0xBBu8; 32]),
+            index: 0,
+        };
+        utxo_set.insert(
+            extra_input.clone(),
+            TransactionOutput {
+                address: Address::Byron(dugite_primitives::address::ByronAddress {
+                    payload: vec![0x82, 0x00, 0x01],
+                }),
+                value: Value::lovelace(600_000_000),
+                datum: OutputDatum::None,
+                script_ref: None,
+                is_legacy: false,
+                raw_cbor: None,
+            },
+        );
+        tx.body.inputs.push(extra_input);
+        // Update output to match new value: 10M + 600M - 500M_deposit - 200K_fee
+        // For test purposes we just keep it simple: output = 5M, fee = 200K,
+        // pool_deposit = 500M. The value check isn't relevant; we check margin.
+        // We don't rebalance the tx body — we only check the PoolMarginInvalid error.
+
+        let pool_params = PoolParams {
+            operator: Hash28::from_bytes([0x11u8; 28]),
+            vrf_keyhash: Hash32::from_bytes([0x22u8; 32]),
+            pledge: Lovelace(0),
+            cost: Lovelace(340_000_000),
+            margin: Rational {
+                numerator,
+                denominator,
+            },
+            reward_account: {
+                let mut acct = vec![0xE0];
+                acct.extend_from_slice(&[0x33u8; 28]);
+                acct
+            },
+            pool_owners: vec![],
+            relays: vec![],
+            pool_metadata: None,
+        };
+        tx.body
+            .certificates
+            .push(Certificate::PoolRegistration(pool_params));
+        (utxo_set, tx)
+    }
+
+    /// Helper: validate a pool registration and check for PoolMarginInvalid.
+    fn pool_margin_errors(numerator: u64, denominator: u64) -> Vec<ValidationError> {
+        let (utxo_set, tx) = make_pool_registration_tx(numerator, denominator);
+        let params = ProtocolParameters::mainnet_defaults();
+        validate_transaction(&tx, &utxo_set, &params, 100, 300, None)
+            .err()
+            .unwrap_or_default()
+    }
+
+    #[test]
+    fn test_pool_margin_zero_denominator_rejected() {
+        let errors = pool_margin_errors(0, 0);
+        assert!(
+            errors
+                .iter()
+                .any(|e| matches!(e, ValidationError::PoolMarginInvalid { denominator: 0, .. })),
+            "expected PoolMarginInvalid with denominator=0, got {errors:?}"
+        );
+    }
+
+    #[test]
+    fn test_pool_margin_numerator_greater_than_denominator_rejected() {
+        // margin = 101/100 > 1.0
+        let errors = pool_margin_errors(101, 100);
+        assert!(
+            errors.iter().any(|e| matches!(
+                e,
+                ValidationError::PoolMarginInvalid {
+                    numerator: 101,
+                    denominator: 100,
+                }
+            )),
+            "expected PoolMarginInvalid(101/100), got {errors:?}"
+        );
+    }
+
+    #[test]
+    fn test_pool_margin_exactly_one_accepted() {
+        // margin = 1/1 == 1.0 (100%) — at the boundary, should NOT be rejected
+        let errors = pool_margin_errors(1, 1);
+        assert!(
+            !errors
+                .iter()
+                .any(|e| matches!(e, ValidationError::PoolMarginInvalid { .. })),
+            "margin 1/1 must NOT be rejected as PoolMarginInvalid, got {errors:?}"
+        );
+    }
+
+    #[test]
+    fn test_pool_margin_zero_numerator_accepted() {
+        // margin = 0/100 == 0.0 — valid lower bound
+        let errors = pool_margin_errors(0, 100);
+        assert!(
+            !errors
+                .iter()
+                .any(|e| matches!(e, ValidationError::PoolMarginInvalid { .. })),
+            "margin 0/100 must NOT be rejected as PoolMarginInvalid, got {errors:?}"
+        );
+    }
+
+    #[test]
+    fn test_pool_margin_typical_5_percent_accepted() {
+        // margin = 5/100 == 0.05 — typical SPO margin
+        let errors = pool_margin_errors(5, 100);
+        assert!(
+            !errors
+                .iter()
+                .any(|e| matches!(e, ValidationError::PoolMarginInvalid { .. })),
+            "margin 5/100 must NOT be rejected as PoolMarginInvalid, got {errors:?}"
+        );
+    }
+
+    #[test]
+    fn test_pool_margin_max_u64_denominator_zero_numerator_accepted() {
+        // 0/u64::MAX — valid (0%)
+        let errors = pool_margin_errors(0, u64::MAX);
+        assert!(
+            !errors
+                .iter()
+                .any(|e| matches!(e, ValidationError::PoolMarginInvalid { .. })),
+            "margin 0/MAX must NOT be rejected as PoolMarginInvalid, got {errors:?}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Tests — F1: BootstrapWitness crypto verification (#546 security audit)
+    //
+    // Byron bootstrap witnesses carry 64-byte extended Ed25519 keys.
+    // Verification uses vkey[0..32] (the scalar part) over the tx body hash.
+    // Address binding: computed root must match the root in the Byron UTxO address.
+    // -----------------------------------------------------------------------
+
+    /// Build a synthetic Byron address payload whose root field contains the given 28 bytes.
+    ///
+    /// Structure: array(2) [ tag(24, bytes(inner)), crc(0) ]
+    /// inner:     array(3) [ bytes(root_28), map({}), uint(0) ]
+    fn synth_byron_addr_with_root(root28: &[u8; 28]) -> Vec<u8> {
+        let inner = {
+            let mut buf = Vec::new();
+            let mut e = minicbor::Encoder::new(&mut buf);
+            e.array(3).unwrap();
+            e.bytes(root28).unwrap();
+            e.map(0).unwrap(); // empty attrs map
+            e.u8(0).unwrap(); // addrtype=PubKey
+            buf
+        };
+
+        let mut outer = Vec::new();
+        let mut oe = minicbor::Encoder::new(&mut outer);
+        oe.array(2).unwrap();
+        oe.tag(minicbor::data::Tag::new(24)).unwrap();
+        oe.bytes(&inner).unwrap();
+        oe.u32(0).unwrap(); // dummy CRC
+        outer
+    }
+
+    /// Build a UTxO whose input address is a Byron address with the given root,
+    /// plus a matching Transaction referencing that input.
+    fn make_byron_utxo_tx_with_root(root28: &[u8; 28]) -> (UtxoSet, Transaction, TransactionInput) {
+        let mut utxo_set = UtxoSet::new();
+        let input = TransactionInput {
+            transaction_id: Hash32::from_bytes([0xCCu8; 32]),
+            index: 0,
+        };
+        let utxo_output = TransactionOutput {
+            address: Address::Byron(dugite_primitives::address::ByronAddress {
+                payload: synth_byron_addr_with_root(root28),
+            }),
+            value: Value::lovelace(10_000_000),
+            datum: OutputDatum::None,
+            script_ref: None,
+            is_legacy: false,
+            raw_cbor: None,
+        };
+        utxo_set.insert(input.clone(), utxo_output);
+
+        // Use make_valid_tx as a baseline and override the input/utxo
+        let (_, mut tx, _) = make_valid_tx();
+        tx.hash = Hash32::from_bytes([0xDDu8; 32]);
+        tx.body.inputs = vec![input.clone()];
+        tx.witness_set.bootstrap_witnesses = vec![];
+        (utxo_set, tx, input)
+    }
+
+    /// Compute the Byron address root from a 64-byte extended key and empty attributes.
+    /// This mirrors `compute_bootstrap_root` (which is pub(super) for tests).
+    fn compute_root_for_vkey64(vkey64: &[u8; 64]) -> [u8; 28] {
+        super::compute_bootstrap_root(vkey64, &[0xa0]) // 0xa0 = CBOR empty map
+            .expect("root computation must succeed")
+    }
+
+    // ------ Positive tests -------
+
+    #[test]
+    fn test_bootstrap_witness_malformed_64byte_vkey_invalid_sig_rejected() {
+        // vkey=64 bytes (Byron extended), sig=64 bytes, but sig is all-zeros → fails Ed25519 verify.
+        // Address binding will also fail (root mismatch). Both → InvalidWitnessSignature.
+        let vkey64 = [0x55u8; 64]; // not a valid Ed25519 scalar but structurally well-sized
+        let root28 = compute_root_for_vkey64(&vkey64);
+        let (mut utxo_set, mut tx, _) = make_byron_utxo_tx_with_root(&root28);
+        // Replace the UTxO's address with a Byron address whose root does NOT match
+        // (to isolate the sig-verification path from the address-binding path).
+        let mismatched_input = TransactionInput {
+            transaction_id: Hash32::from_bytes([0xCCu8; 32]),
+            index: 0,
+        };
+        utxo_set.insert(
+            mismatched_input,
+            TransactionOutput {
+                address: Address::Byron(dugite_primitives::address::ByronAddress {
+                    payload: synth_byron_addr_with_root(&root28),
+                }),
+                value: Value::lovelace(10_000_000),
+                datum: OutputDatum::None,
+                script_ref: None,
+                is_legacy: false,
+                raw_cbor: None,
+            },
+        );
+        tx.witness_set.bootstrap_witnesses.push(BootstrapWitness {
+            vkey: vkey64.to_vec(),
+            signature: vec![0u8; 64], // invalid signature
+            chain_code: vec![0u8; 32],
+            attributes: vec![0xa0], // empty CBOR map
+        });
+        let params = ProtocolParameters::mainnet_defaults();
+        let errors = validate_transaction(&tx, &utxo_set, &params, 100, 300, None)
+            .err()
+            .unwrap_or_default();
+        assert!(
+            errors
+                .iter()
+                .any(|e| matches!(e, ValidationError::InvalidWitnessSignature(_))),
+            "expected InvalidWitnessSignature for bad sig on 64-byte vkey, got {errors:?}"
+        );
+    }
+
+    // ------ Structural pre-flight: size checks -------
+
+    #[test]
+    fn test_bootstrap_witness_32byte_vkey_rejected() {
+        // 32-byte vkey (Shelley format) in a bootstrap witness → must be rejected.
+        // Byron requires exactly 64-byte extended keys.
+        let errors = validate_with_bootstrap_witness(vec![0xAAu8; 32], vec![0u8; 64]);
+        assert_invalid_witness(&errors);
+    }
+
+    #[test]
+    fn test_bootstrap_witness_31byte_vkey_rejected() {
+        let errors = validate_with_bootstrap_witness(vec![0xAAu8; 31], vec![0u8; 64]);
+        assert_invalid_witness(&errors);
+    }
+
+    #[test]
+    fn test_bootstrap_witness_65byte_vkey_rejected() {
+        let errors = validate_with_bootstrap_witness(vec![0xAAu8; 65], vec![0u8; 64]);
+        assert_invalid_witness(&errors);
+    }
+
+    #[test]
+    fn test_bootstrap_witness_0byte_vkey_rejected() {
+        let errors = validate_with_bootstrap_witness(vec![], vec![0u8; 64]);
+        assert_invalid_witness(&errors);
+    }
+
+    #[test]
+    fn test_bootstrap_witness_63byte_sig_rejected() {
+        let errors = validate_with_bootstrap_witness(vec![0xAAu8; 64], vec![0u8; 63]);
+        assert_invalid_witness(&errors);
+    }
+
+    #[test]
+    fn test_bootstrap_witness_65byte_sig_rejected() {
+        let errors = validate_with_bootstrap_witness(vec![0xAAu8; 64], vec![0u8; 65]);
+        assert_invalid_witness(&errors);
+    }
+
+    #[test]
+    fn test_bootstrap_witness_0byte_sig_rejected() {
+        let errors = validate_with_bootstrap_witness(vec![0xAAu8; 64], vec![]);
+        assert_invalid_witness(&errors);
+    }
+
+    #[test]
+    fn test_bootstrap_witness_both_wrong_size_rejected() {
+        let errors = validate_with_bootstrap_witness(vec![0xAAu8; 63], vec![0u8; 63]);
+        assert_invalid_witness(&errors);
+    }
+
+    /// Length-lattice property: for all {vkey_len, sig_len} ≠ {64, 64},
+    /// a bootstrap witness must produce `InvalidWitnessSignature`.
+    /// Excludes {64, 64} which passes structural checks but fails sig verify.
+    #[test]
+    fn test_bootstrap_witness_length_lattice_rejected() {
+        for vkey_len in [0usize, 1, 16, 31, 32, 33, 48, 63, 65, 128] {
+            for sig_len in [0usize, 1, 32, 63, 65, 96, 128] {
+                let errors =
+                    validate_with_bootstrap_witness(vec![0xAAu8; vkey_len], vec![0u8; sig_len]);
+                assert!(
+                    errors.iter().any(|e| matches!(
+                        e,
+                        ValidationError::InvalidWitnessSignature(_)
+                    )),
+                    "bootstrap vkey_len={vkey_len} sig_len={sig_len}: expected InvalidWitnessSignature, got {errors:?}"
+                );
+            }
+        }
+    }
+
+    /// Chain-code length check: 64-byte vkey + 64-byte sig but 31-byte chain_code → rejected.
+    #[test]
+    fn test_bootstrap_witness_short_chain_code_rejected() {
+        let (utxo_set, mut tx, _) = make_valid_tx();
+        tx.witness_set.bootstrap_witnesses.push(BootstrapWitness {
+            vkey: vec![0xAAu8; 64],
+            signature: vec![0u8; 64],
+            chain_code: vec![0u8; 31], // wrong size
+            attributes: vec![],
+        });
+        let params = ProtocolParameters::mainnet_defaults();
+        let errors = validate_transaction(&tx, &utxo_set, &params, 100, 300, None)
+            .err()
+            .unwrap_or_default();
+        assert!(
+            errors
+                .iter()
+                .any(|e| matches!(e, ValidationError::InvalidWitnessSignature(_))),
+            "expected InvalidWitnessSignature for 31-byte chain_code, got {errors:?}"
+        );
+    }
+
+    /// Address binding failure: structurally valid witness but no matching Byron address in UTxO.
+    #[test]
+    fn test_bootstrap_witness_address_binding_mismatch_rejected() {
+        // Build a Byron UTxO with root = all-zeros (doesn't match any real witness key)
+        let mismatch_root = [0u8; 28];
+        let (mut utxo_set, mut tx, _) = make_byron_utxo_tx_with_root(&mismatch_root);
+
+        // Witness with a DIFFERENT computed root
+        let vkey64 = [0x42u8; 64];
+        let computed_root = compute_root_for_vkey64(&vkey64);
+        assert_ne!(
+            computed_root, mismatch_root,
+            "test setup: roots must differ"
+        );
+
+        // Replace UTxO address with mismatched root
+        let input = TransactionInput {
+            transaction_id: Hash32::from_bytes([0xCCu8; 32]),
+            index: 0,
+        };
+        utxo_set.insert(
+            input,
+            TransactionOutput {
+                address: Address::Byron(dugite_primitives::address::ByronAddress {
+                    payload: synth_byron_addr_with_root(&mismatch_root),
+                }),
+                value: Value::lovelace(10_000_000),
+                datum: OutputDatum::None,
+                script_ref: None,
+                is_legacy: false,
+                raw_cbor: None,
+            },
+        );
+        tx.witness_set.bootstrap_witnesses.push(BootstrapWitness {
+            vkey: vkey64.to_vec(),
+            signature: vec![0u8; 64], // sig fails too but binding is the point
+            chain_code: vec![0u8; 32],
+            attributes: vec![0xa0],
+        });
+        let params = ProtocolParameters::mainnet_defaults();
+        let errors = validate_transaction(&tx, &utxo_set, &params, 100, 300, None)
+            .err()
+            .unwrap_or_default();
+        assert!(
+            errors
+                .iter()
+                .any(|e| matches!(e, ValidationError::InvalidWitnessSignature(_))),
+            "expected InvalidWitnessSignature for address-binding mismatch, got {errors:?}"
+        );
+    }
+
+    /// Error message for a malformed bootstrap witness includes both observed sizes.
+    #[test]
+    fn test_bootstrap_witness_malformed_error_message_includes_sizes() {
+        let errors = validate_with_bootstrap_witness(vec![0xAAu8; 32], vec![0u8; 63]);
+        let msg = errors
+            .iter()
+            .find_map(|e| match e {
+                ValidationError::InvalidWitnessSignature(s) => Some(s.clone()),
+                _ => None,
+            })
+            .expect("InvalidWitnessSignature not found");
+        assert!(
+            msg.contains("32") && msg.contains("63"),
+            "error message must include observed sizes (32, 63): {msg}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Tests — F2: ConwayDRepNotRegistered (#546 security audit)
+    //
+    // `UnregDRep` for a non-existent DRep must be rejected to prevent
+    // fabricating an ADA-refund without a corresponding deposit.
+    // -----------------------------------------------------------------------
+
+    fn make_unreg_drep_tx(cred_hash: Hash28) -> (UtxoSet, Transaction) {
+        let (utxo_set, mut tx, _) = make_valid_tx();
+        tx.body.certificates.push(Certificate::UnregDRep {
+            credential: Credential::VerificationKey(cred_hash),
+            refund: Lovelace(2_000_000),
+        });
+        (utxo_set, tx)
+    }
+
+    /// `UnregDRep` for a non-registered DRep → `DRepNotRegistered` when `registered_dreps` provided.
+    #[test]
+    fn test_unreg_drep_not_registered_rejected() {
+        let cred_hash = Hash28::from_bytes([0xDEu8; 28]);
+        let (utxo_set, tx) = make_unreg_drep_tx(cred_hash);
+        let params = {
+            let mut p = ProtocolParameters::mainnet_defaults();
+            p.protocol_version_major = 9; // Conway
+            p
+        };
+        let registered_dreps: std::collections::HashSet<Hash32> = std::collections::HashSet::new(); // empty — DRep not registered
+        let errors = validate_transaction_with_pools(
+            &tx,
+            &utxo_set,
+            &params,
+            100,
+            300,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(&registered_dreps),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap_err();
+        assert!(
+            errors
+                .iter()
+                .any(|e| matches!(e, ValidationError::DRepNotRegistered { .. })),
+            "expected DRepNotRegistered for unregistered DRep, got {errors:?}"
+        );
+    }
+
+    /// `UnregDRep` for a registered DRep → no `DRepNotRegistered`.
+    #[test]
+    fn test_unreg_drep_registered_accepted() {
+        let cred_hash = Hash28::from_bytes([0xDEu8; 28]);
+        let (utxo_set, tx) = make_unreg_drep_tx(cred_hash);
+        let params = {
+            let mut p = ProtocolParameters::mainnet_defaults();
+            p.protocol_version_major = 9;
+            p
+        };
+        // Build registered_dreps with the typed hash for this credential
+        let credential = Credential::VerificationKey(cred_hash);
+        let key = credential.to_typed_hash32();
+        let mut registered_dreps: std::collections::HashSet<Hash32> =
+            std::collections::HashSet::new();
+        registered_dreps.insert(key);
+
+        let errors = validate_transaction_with_pools(
+            &tx,
+            &utxo_set,
+            &params,
+            100,
+            300,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(&registered_dreps),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .err()
+        .unwrap_or_default();
+        assert!(
+            !errors
+                .iter()
+                .any(|e| matches!(e, ValidationError::DRepNotRegistered { .. })),
+            "DRep IS registered — must not produce DRepNotRegistered, got {errors:?}"
+        );
+    }
+
+    /// `UnregDRep` with no `registered_dreps` provided (mempool mode) → check skipped.
+    #[test]
+    fn test_unreg_drep_no_registry_check_skipped() {
+        let cred_hash = Hash28::from_bytes([0xDEu8; 28]);
+        let (utxo_set, tx) = make_unreg_drep_tx(cred_hash);
+        let params = {
+            let mut p = ProtocolParameters::mainnet_defaults();
+            p.protocol_version_major = 9;
+            p
+        };
+        // registered_dreps=None → check is skipped
+        let errors = validate_transaction_with_pools(
+            &tx, &utxo_set, &params, 100, 300, None, None, None, None, None,
+            None, // registered_dreps = None
+            None, None, None, None, None, None, None,
+        )
+        .err()
+        .unwrap_or_default();
+        assert!(
+            !errors
+                .iter()
+                .any(|e| matches!(e, ValidationError::DRepNotRegistered { .. })),
+            "With registered_dreps=None the check must be skipped, got {errors:?}"
+        );
+    }
+
+    /// `RegDRep` for an already-registered DRep must not produce `DRepNotRegistered`.
+    /// (Regression: ensure the check only applies to `UnregDRep`.)
+    #[test]
+    fn test_reg_drep_not_affected_by_unreg_check() {
+        let (utxo_set, mut tx, _) = make_valid_tx();
+        let cred_hash = Hash28::from_bytes([0xDEu8; 28]);
+        tx.body.certificates.push(Certificate::RegDRep {
+            credential: Credential::VerificationKey(cred_hash),
+            deposit: dugite_primitives::protocol_params::ProtocolParameters::mainnet_defaults()
+                .drep_deposit,
+            anchor: None,
+        });
+        let params = {
+            let mut p = ProtocolParameters::mainnet_defaults();
+            p.protocol_version_major = 9;
+            p
+        };
+        let registered_dreps: std::collections::HashSet<Hash32> = std::collections::HashSet::new();
+        let errors = validate_transaction_with_pools(
+            &tx,
+            &utxo_set,
+            &params,
+            100,
+            300,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(&registered_dreps),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .err()
+        .unwrap_or_default();
+        // RegDRep must never produce DRepNotRegistered (that's for UnregDRep only)
+        assert!(
+            !errors
+                .iter()
+                .any(|e| matches!(e, ValidationError::DRepNotRegistered { .. })),
+            "RegDRep must not produce DRepNotRegistered, got {errors:?}"
         );
     }
 }

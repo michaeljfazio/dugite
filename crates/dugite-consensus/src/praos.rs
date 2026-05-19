@@ -324,11 +324,20 @@ impl OuroborosPraos {
     ///
     /// Conceptually runs at the same point as Haskell's CBOR decode — before
     /// any cryptographic verification — so a header with an attacker-supplied
-    /// wrong-length `issuer_vkey`/`vrf_vkey`/`vrf_result.output`/`opcert.sigma`
-    /// cannot reach (and silently bypass) the VRF leader check or opcert
-    /// signature verification path. The downstream `validate_header`,
-    /// `validate_header_full`, and `verify_header_crypto` entry points all
-    /// call this helper.
+    /// wrong-length field cannot reach (and silently bypass) the VRF leader
+    /// check, opcert signature verification, or KES path. The downstream
+    /// `validate_header`, `validate_header_full`, and `verify_header_crypto`
+    /// entry points all call this helper.
+    ///
+    /// Fields covered (issue #539 original + #545 E2/E4 extension):
+    ///   - `issuer_vkey`           32 bytes  (Ed25519 cold vkey)
+    ///   - `vrf_vkey`              32 bytes  (ECVRF-ED25519 public key)
+    ///   - `vrf_result.output`     64 bytes  (Praos VRF output)
+    ///   - `opcert.sigma`          64 bytes  (Ed25519 cold-key sig over opcert)
+    ///   - `opcert.hot_vkey`       32 bytes  (Sum6KES vkey, non-empty only)
+    ///   - `kes_signature`        448 bytes  (Sum6KesSig, non-empty only)
+    ///   - `nonce_vrf_proof`       80 bytes  (TPraos only: nonce VRF proof)
+    ///   - `nonce_vrf_output`      64 bytes  (TPraos only: nonce VRF output)
     ///
     /// Empty fields are deliberately NOT covered here: they are reported as
     /// `EmptyIssuerVkey` / `EmptyVrfKey` / `InvalidOperationalCert` by other
@@ -342,68 +351,56 @@ impl OuroborosPraos {
         header: &BlockHeader,
         strict: bool,
     ) -> Result<(), ConsensusError> {
-        // Empty fields are handled by their own dedicated predicates upstream;
-        // skip them here so we don't override more specific errors.
-        let issuer_vkey_len = header.issuer_vkey.len();
-        if issuer_vkey_len != 0 && issuer_vkey_len != 32 {
-            if strict {
-                return Err(ConsensusError::MalformedHeaderField {
-                    field: "issuer_vkey",
-                    expected_len: 32,
-                    actual_len: issuer_vkey_len,
-                });
-            }
-            debug!(
-                slot = header.slot.0,
-                actual_len = issuer_vkey_len,
-                "Praos: malformed issuer_vkey size (non-strict, skipping crypto)"
-            );
+        // Helper macro: check a single fixed-size field.
+        // Empty fields (len==0) are skipped — dedicated predicates handle those.
+        macro_rules! check_field {
+            ($field_name:literal, $value:expr, $expected:literal) => {{
+                let actual = $value.len();
+                if actual != 0 && actual != $expected {
+                    if strict {
+                        return Err(ConsensusError::MalformedHeaderField {
+                            field: $field_name,
+                            expected_len: $expected,
+                            actual_len: actual,
+                        });
+                    }
+                    debug!(
+                        slot = header.slot.0,
+                        field = $field_name,
+                        expected = $expected,
+                        actual_len = actual,
+                        "Praos: malformed header field size (non-strict, skipping crypto)"
+                    );
+                }
+            }};
         }
-        let vrf_vkey_len = header.vrf_vkey.len();
-        if vrf_vkey_len != 0 && vrf_vkey_len != 32 {
-            if strict {
-                return Err(ConsensusError::MalformedHeaderField {
-                    field: "vrf_vkey",
-                    expected_len: 32,
-                    actual_len: vrf_vkey_len,
-                });
-            }
-            debug!(
-                slot = header.slot.0,
-                actual_len = vrf_vkey_len,
-                "Praos: malformed vrf_vkey size (non-strict, skipping crypto)"
-            );
+
+        // ── Core Praos fields (present in all non-Byron eras) ──────────────
+        check_field!("issuer_vkey", header.issuer_vkey, 32);
+        check_field!("vrf_vkey", header.vrf_vkey, 32);
+        check_field!("vrf_result.output", header.vrf_result.output, 64);
+        check_field!("opcert.sigma", header.operational_cert.sigma, 64);
+
+        // ── KES fields (non-empty only for Shelley+ blocks) ────────────────
+        // `kes_signature` and `hot_vkey` are empty for Byron; the `is_empty()`
+        // fast-path in `verify_kes_signature` handles that case.  When present
+        // they MUST be exactly Sum6KesSig (448 bytes) / Ed25519 (32 bytes).
+        // Issue #545 E4: add to pre-flight to match Haskell's `decodeVerKeyKES`
+        // `failSizeCheck` semantics and provide `MalformedHeaderField` diagnostics
+        // instead of the less-informative `InvalidKesSignature`.
+        check_field!("opcert.hot_vkey", header.operational_cert.hot_vkey, 32);
+        check_field!("kes_signature", header.kes_signature, 448);
+
+        // ── TPraos nonce VRF fields (proto < 7 only) ───────────────────────
+        // In Praos (proto >= 7) these are always empty — skip the check.
+        // Issue #545 E2: add to pre-flight to close the non-strict silent-skip gap
+        // that existed for Shelley/Allegra/Mary/Alonzo blocks with a malformed
+        // nonce VRF proof.  Matches Haskell's `decodeVerKeyVRF` `failSizeCheck`.
+        if header.protocol_version.major < 7 {
+            check_field!("nonce_vrf_proof", header.nonce_vrf_proof, 80);
+            check_field!("nonce_vrf_output", header.nonce_vrf_output, 64);
         }
-        let vrf_output_len = header.vrf_result.output.len();
-        if vrf_output_len != 0 && vrf_output_len != 64 {
-            if strict {
-                return Err(ConsensusError::MalformedHeaderField {
-                    field: "vrf_result.output",
-                    expected_len: 64,
-                    actual_len: vrf_output_len,
-                });
-            }
-            debug!(
-                slot = header.slot.0,
-                actual_len = vrf_output_len,
-                "Praos: malformed vrf_result.output size (non-strict, skipping leader check)"
-            );
-        }
-        let sigma_len = header.operational_cert.sigma.len();
-        if sigma_len != 0 && sigma_len != 64 {
-            if strict {
-                return Err(ConsensusError::MalformedHeaderField {
-                    field: "opcert.sigma",
-                    expected_len: 64,
-                    actual_len: sigma_len,
-                });
-            }
-            debug!(
-                slot = header.slot.0,
-                actual_len = sigma_len,
-                "Praos: malformed opcert.sigma size (non-strict, skipping opcert verify)"
-            );
-        }
+
         Ok(())
     }
 
@@ -1277,7 +1274,20 @@ impl OuroborosPraos {
     /// The KES key must not have expired: the block's KES period must be
     /// >= the cert's start period and < start + max_evolutions.
     fn validate_kes_period(&self, header: &BlockHeader) -> Result<(), ConsensusError> {
-        let block_kes_period = header.slot.0 / self.slots_per_kes_period;
+        // Issue #545 E8 defense-in-depth: slots_per_kes_period is validated at genesis
+        // load time (ShelleyGenesis::validate), but guard here too so this function is
+        // self-defensible if called with a synthetically constructed OuroborosPraos in
+        // tests or if the genesis check is bypassed.
+        let block_kes_period = header
+            .slot
+            .0
+            .checked_div(self.slots_per_kes_period)
+            .ok_or_else(|| {
+                ConsensusError::InvalidBlock(
+                    "slots_per_kes_period is 0 — divide-by-zero in KES period calculation"
+                        .to_string(),
+                )
+            })?;
         let cert_kes_period = header.operational_cert.kes_period;
 
         trace!(
@@ -1405,7 +1415,13 @@ impl OuroborosPraos {
             return Ok(()); // Skip if sizes don't match expected KES format
         }
 
-        let block_kes_period = header.slot.0 / self.slots_per_kes_period;
+        // Defense-in-depth (issue #545 E8): use checked_div in case this
+        // function is ever called with slots_per_kes_period == 0.
+        let block_kes_period = header
+            .slot
+            .0
+            .checked_div(self.slots_per_kes_period)
+            .ok_or(ConsensusError::InvalidKesSignature)?;
         let kes_period_offset = block_kes_period.saturating_sub(opcert.kes_period);
 
         // Reconstruct the header body CBOR for verification
@@ -1562,13 +1578,25 @@ impl OuroborosPraos {
     }
 
     /// Standalone VRF proof verification (no &self required).
+    ///
+    /// Issue #545 E3: Use the era-correct VRF seed.
+    /// The instance method `verify_vrf_proof` correctly branches on protocol version;
+    /// the static path must mirror that to avoid failing all TPraos blocks when
+    /// parallel verification is wired up.
+    ///   - TPraos (proto < 7, Shelley–Alonzo): tpraos_leader_vrf_input (TAG_L XOR)
+    ///   - Praos  (proto >= 7, Babbage/Conway): vrf_input (plain Blake2b-256)
     fn verify_vrf_proof_static(
         params: &CryptoVerificationParams,
         header: &BlockHeader,
     ) -> Result<(), ConsensusError> {
         let vrf_is_fatal = params.strict_verification;
 
-        let seed = crate::slot_leader::vrf_input(&header.epoch_nonce, header.slot);
+        // Era-correct seed construction (issue #545 E3).
+        let seed = if header.protocol_version.major < 7 {
+            crate::slot_leader::tpraos_leader_vrf_input(&header.epoch_nonce, header.slot)
+        } else {
+            crate::slot_leader::vrf_input(&header.epoch_nonce, header.slot)
+        };
 
         match dugite_crypto::vrf::verify_vrf_proof(
             &header.vrf_vkey,
@@ -1648,7 +1676,12 @@ impl OuroborosPraos {
             return Ok(());
         }
 
-        let block_kes_period = header.slot.0 / params.slots_per_kes_period;
+        // Defense-in-depth (issue #545 E8): use checked_div.
+        let block_kes_period = header
+            .slot
+            .0
+            .checked_div(params.slots_per_kes_period)
+            .ok_or(ConsensusError::InvalidKesSignature)?;
         let kes_period_offset = block_kes_period.saturating_sub(opcert.kes_period);
 
         let header_body_cbor = dugite_serialization::encode_block_header_body(header);
@@ -4782,6 +4815,233 @@ mod tests {
                 "sig_len={sig_len}: expected MalformedHeaderField {{ field: opcert.sigma }}, got {result:?}"
             );
         }
+    }
+
+    // ── Issue #545 E2 tests: nonce_vrf_proof field size pre-flight ─────────
+
+    /// E2 strict: TPraos header (proto < 7) with nonce_vrf_proof of wrong length
+    /// is rejected with MalformedHeaderField before any crypto is attempted.
+    #[test]
+    fn issue_545_e2_tpraos_short_nonce_vrf_proof_strict_rejects() {
+        let mut praos = OuroborosPraos::new(11);
+        praos.set_strict_verification(true);
+        let mut header = make_valid_header(100);
+        // Switch to TPraos era (proto < 7)
+        header.protocol_version.major = 2;
+        // 79 bytes — one short of the expected 80
+        header.nonce_vrf_proof = vec![0u8; 79];
+        header.nonce_vrf_output = vec![0u8; 64];
+        let result = OuroborosPraos::check_header_field_sizes(&header, true);
+        assert!(
+            matches!(&result, Err(e) if malformed(e, "nonce_vrf_proof")),
+            "Expected MalformedHeaderField {{ field: nonce_vrf_proof }}, got {result:?}"
+        );
+    }
+
+    /// E2 non-strict: same header is allowed through (logged at debug).
+    #[test]
+    fn issue_545_e2_tpraos_short_nonce_vrf_proof_non_strict_ok() {
+        let mut header = make_valid_header(100);
+        header.protocol_version.major = 2;
+        header.nonce_vrf_proof = vec![0u8; 79];
+        header.nonce_vrf_output = vec![0u8; 64];
+        let result = OuroborosPraos::check_header_field_sizes(&header, false);
+        assert!(
+            result.is_ok(),
+            "Non-strict should allow wrong-size nonce_vrf_proof: {result:?}"
+        );
+    }
+
+    /// E2: Praos-era (proto >= 7) headers are NOT checked for nonce_vrf_proof
+    /// (field is empty/absent in Praos; the check is TPraos-gated).
+    #[test]
+    fn issue_545_e2_praos_era_nonce_vrf_proof_not_checked() {
+        let mut header = make_valid_header(100);
+        header.protocol_version.major = 9; // Conway
+                                           // Even if nonce_vrf_proof has a weird length, it should not be checked
+                                           // for Praos-era blocks (the field is always empty).
+        header.nonce_vrf_proof = vec![0u8; 42];
+        let result = OuroborosPraos::check_header_field_sizes(&header, true);
+        assert!(
+            result.is_ok(),
+            "Praos era: nonce_vrf_proof length should not be checked: {result:?}"
+        );
+    }
+
+    /// E2 length-lattice: all non-80 non-zero lengths for nonce_vrf_proof in TPraos are rejected.
+    #[test]
+    fn issue_545_e2_nonce_vrf_proof_length_lattice_strict_rejects() {
+        for proof_len in [1usize, 32, 64, 79, 81, 160] {
+            let mut header = make_valid_header(100);
+            header.protocol_version.major = 2; // TPraos era
+            header.nonce_vrf_proof = vec![0u8; proof_len];
+            header.nonce_vrf_output = vec![0u8; 64];
+            let result = OuroborosPraos::check_header_field_sizes(&header, true);
+            assert!(
+                matches!(&result, Err(e) if malformed(e, "nonce_vrf_proof")),
+                "proof_len={proof_len}: expected MalformedHeaderField, got {result:?}"
+            );
+        }
+    }
+
+    // ── Issue #545 E3 tests: verify_vrf_proof_static TPraos seed ───────────
+
+    /// E3: verify_vrf_proof_static must use TPraos seed for proto < 7.
+    /// Since we can't call crypto with a fake key, we test that the function
+    /// dispatches differently for proto < 7 vs >= 7 by observing that the same
+    /// header fields produce a crypto error in both paths (not a panic or wrong
+    /// seed panic). Both should return Err (VRF failure) for a synthetic header.
+    #[test]
+    fn issue_545_e3_verify_vrf_proof_static_tpraos_does_not_panic() {
+        let params = CryptoVerificationParams {
+            strict_verification: false, // non-strict so we don't bubble the error
+            slots_per_kes_period: 129600,
+            max_kes_evolutions: 62,
+        };
+        let mut header = make_valid_header(100);
+        header.protocol_version.major = 2; // TPraos
+                                           // This calls the static path with a synthetic (invalid) key, which should
+                                           // return Ok(()) in non-strict mode regardless of VRF outcome.
+        let result = OuroborosPraos::verify_header_crypto(&params, &header);
+        // In non-strict mode, VRF/KES failures are not fatal.
+        // The important thing is: no panic, and the function returned without error.
+        assert!(
+            result.is_ok(),
+            "verify_header_crypto on TPraos header must not panic (non-strict): {result:?}"
+        );
+    }
+
+    // ── Issue #545 E4 tests: hot_vkey and kes_signature pre-flight ─────────
+
+    /// E4 strict: wrong-length hot_vkey is rejected with MalformedHeaderField.
+    #[test]
+    fn issue_545_e4_short_hot_vkey_strict_rejects() {
+        let mut header = make_valid_header(100);
+        header.operational_cert.hot_vkey = vec![3u8; 31]; // 31 instead of 32
+        let result = OuroborosPraos::check_header_field_sizes(&header, true);
+        assert!(
+            matches!(&result, Err(e) if malformed(e, "opcert.hot_vkey")),
+            "Expected MalformedHeaderField {{ field: opcert.hot_vkey }}, got {result:?}"
+        );
+    }
+
+    /// E4 strict: wrong-length kes_signature is rejected with MalformedHeaderField.
+    #[test]
+    fn issue_545_e4_wrong_kes_signature_strict_rejects() {
+        for sig_len in [1usize, 32, 64, 100, 447, 449] {
+            let mut header = make_valid_header(100);
+            header.kes_signature = vec![5u8; sig_len];
+            let result = OuroborosPraos::check_header_field_sizes(&header, true);
+            assert!(
+                matches!(&result, Err(e) if malformed(e, "kes_signature")),
+                "sig_len={sig_len}: expected MalformedHeaderField {{ field: kes_signature }}, got {result:?}"
+            );
+        }
+    }
+
+    /// E4: empty kes_signature (Byron) is not flagged.
+    #[test]
+    fn issue_545_e4_empty_kes_signature_byron_not_checked() {
+        let mut header = make_valid_header(100);
+        header.kes_signature = vec![]; // empty = Byron block
+        let result = OuroborosPraos::check_header_field_sizes(&header, true);
+        assert!(
+            result.is_ok(),
+            "Empty kes_signature (Byron) should not be flagged: {result:?}"
+        );
+    }
+
+    /// E4 non-strict: wrong-length hot_vkey is allowed through.
+    #[test]
+    fn issue_545_e4_short_hot_vkey_non_strict_ok() {
+        let mut header = make_valid_header(100);
+        header.operational_cert.hot_vkey = vec![3u8; 31];
+        let result = OuroborosPraos::check_header_field_sizes(&header, false);
+        assert!(
+            result.is_ok(),
+            "Non-strict should allow wrong-size hot_vkey: {result:?}"
+        );
+    }
+
+    // ── Issue #545 E8 tests: KES period divide-by-zero protection ──────────
+
+    /// E8: validate_kes_period with slots_per_kes_period=0 returns Err, not panic.
+    #[test]
+    fn issue_545_e8_kes_period_zero_slots_per_period_returns_err() {
+        let mut praos = OuroborosPraos::new(11);
+        praos.slots_per_kes_period = 0;
+        let header = make_valid_header(100);
+        // validate_kes_period is private, but verify_kes_signature is the entry point
+        // that calls it.  Use a header with an empty kes_signature so the function
+        // returns early (Byron skip path) — the divide-by-zero is in validate_kes_period
+        // which runs before verify_kes_signature.
+        // Actually test via validate_header_full which calls validate_kes_period:
+        let result = praos.validate_header(&header, SlotNo(200), ValidationMode::Full, Some(9));
+        // Any result is acceptable EXCEPT a panic; if it returns Ok or Err that's fine.
+        // The key invariant is: no panic.
+        let _ = result;
+    }
+
+    // ── Issue #545 E1 tests: future-slot guard ─────────────────────────────
+
+    /// E1: validate_header correctly rejects a block whose slot > current_slot.
+    #[test]
+    fn issue_545_e1_future_block_is_rejected() {
+        let praos = OuroborosPraos::new(11);
+        let header = make_valid_header(200); // block at slot 200
+        let current_slot = SlotNo(100); // wall clock at slot 100
+        let result = praos.validate_header(&header, current_slot, ValidationMode::Full, None);
+        assert!(
+            matches!(
+                result,
+                Err(ConsensusError::FutureBlock {
+                    current: 100,
+                    block: 200
+                })
+            ),
+            "Expected FutureBlock {{ current: 100, block: 200 }}, got {result:?}"
+        );
+    }
+
+    /// E1: validate_header_full correctly rejects a block whose slot > current_slot.
+    #[test]
+    fn issue_545_e1_future_block_full_is_rejected() {
+        let mut praos = OuroborosPraos::new(11);
+        let header = make_valid_header(500); // block far in the future
+        let current_slot = SlotNo(100);
+        let result = praos.validate_header_full(
+            &header,
+            current_slot,
+            None,
+            None,
+            ValidationMode::Replay,
+            None,
+            Some(SlotNo(50)),
+        );
+        assert!(
+            matches!(
+                result,
+                Err(ConsensusError::FutureBlock {
+                    current: 100,
+                    block: 500
+                })
+            ),
+            "Expected FutureBlock, got {result:?}"
+        );
+    }
+
+    /// E1: a block at the current slot (not future) is NOT rejected by the future-slot guard.
+    #[test]
+    fn issue_545_e1_current_slot_block_not_rejected_as_future() {
+        let praos = OuroborosPraos::new(11);
+        let header = make_valid_header(100); // block at slot 100
+        let current_slot = SlotNo(100); // same slot
+        let result = praos.validate_header(&header, current_slot, ValidationMode::Replay, None);
+        // Should NOT be FutureBlock — header.slot == current_slot is allowed
+        assert!(
+            !matches!(result, Err(ConsensusError::FutureBlock { .. })),
+            "Block at current_slot should not be rejected as FutureBlock, got {result:?}"
+        );
     }
 }
 

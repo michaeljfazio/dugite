@@ -225,6 +225,98 @@ pub fn compute_block_body_size_from_cbor(raw_cbor: &[u8]) -> Option<u64> {
     Some((off - body_start) as u64)
 }
 
+/// Extract the raw CBOR bytes of the block body from a full block CBOR buffer.
+///
+/// The Cardano wire format is `[era_tag, [header, tx_bodies, witnesses, aux_data,
+/// invalid_txs]]`.  The block body hash (`header.body_hash`) is
+/// `blake2b_256(body_bytes)` where `body_bytes` is the concatenation of the
+/// serialized body components (indices 1..N-1 of the inner array, i.e.
+/// everything except the header at index 0).
+///
+/// This matches Haskell's `mkOriginalBlockBodyHashed` in
+/// `Ouroboros.Consensus.Shelley.Ledger.Block`.
+///
+/// Returns `None` for Byron/EBB blocks (which have no `body_hash` header field)
+/// or if the CBOR structure is not parseable.
+///
+/// Issue #545 E5: used to wire body-hash verification into `apply_fetched_block`.
+pub fn extract_block_body_cbor(raw_cbor: &[u8]) -> Option<&[u8]> {
+    use crate::haskell_snapshot::cbor_utils::skip_cbor_value;
+
+    if raw_cbor.is_empty() {
+        return None;
+    }
+
+    // Outer array: [era_tag, inner_block]
+    let outer_major = raw_cbor[0] >> 5;
+    if outer_major != 4 {
+        return None;
+    }
+    let info = raw_cbor[0] & 0x1f;
+    let (outer_len, mut off) = match info {
+        0..=23 => (info as u64, 1usize),
+        24 if raw_cbor.len() >= 2 => (raw_cbor[1] as u64, 2),
+        _ => return None,
+    };
+    if outer_len != 2 {
+        return None;
+    }
+
+    // Read and skip era tag
+    if off >= raw_cbor.len() {
+        return None;
+    }
+    let era_major = raw_cbor[off] >> 5;
+    if era_major != 0 {
+        return None;
+    }
+    let era_info = raw_cbor[off] & 0x1f;
+    let era_tag = match era_info {
+        0..=23 => era_info as u64,
+        24 if raw_cbor.len() > off + 1 => raw_cbor[off + 1] as u64,
+        _ => return None,
+    };
+    if era_tag <= 1 {
+        // Byron — no body_hash
+        return None;
+    }
+    let era_size = skip_cbor_value(&raw_cbor[off..]).ok()?;
+    off += era_size;
+
+    // Inner array: [header, tx_bodies, witnesses, aux_data, invalid_txs]
+    if off >= raw_cbor.len() {
+        return None;
+    }
+    let inner_major = raw_cbor[off] >> 5;
+    if inner_major != 4 {
+        return None;
+    }
+    let inner_info = raw_cbor[off] & 0x1f;
+    let (inner_len, hdr_bytes) = match inner_info {
+        0..=23 => (inner_info as u64, 1usize),
+        24 if raw_cbor.len() > off + 1 => (raw_cbor[off + 1] as u64, 2),
+        _ => return None,
+    };
+    if inner_len < 4 {
+        return None;
+    }
+    off += hdr_bytes;
+
+    // Skip the header (index 0)
+    let header_size = skip_cbor_value(&raw_cbor[off..]).ok()?;
+    off += header_size;
+
+    // Body starts here: indices 1..inner_len-1 (tx_bodies, witnesses, aux_data, invalid_txs)
+    let body_start = off;
+    let body_components = inner_len - 1;
+    for _ in 0..body_components {
+        let item_size = skip_cbor_value(&raw_cbor[off..]).ok()?;
+        off += item_size;
+    }
+
+    Some(&raw_cbor[body_start..off])
+}
+
 /// Shared block decode implementation.
 ///
 /// `mode` controls whether witness-set fields are populated.  All callers should
@@ -507,7 +599,7 @@ fn decode_transaction_from_pallas_with_mode(
 
     let fee = Lovelace(tx.fee().unwrap_or(0));
 
-    let mint = convert_mint(tx);
+    let mint = convert_mint(tx)?;
 
     let collateral: Vec<TransactionInput> = tx.collateral().iter().map(convert_input).collect();
 
@@ -621,9 +713,13 @@ fn decode_transaction_from_pallas_with_mode(
                 .plutus_data()
                 .iter()
                 .map(|d| convert_plutus_data(d))
-                .collect();
+                .collect::<Result<Vec<_>, _>>()?;
 
-            let redeemers = tx.redeemers().iter().map(|r| convert_redeemer(r)).collect();
+            let redeemers = tx
+                .redeemers()
+                .iter()
+                .map(convert_redeemer)
+                .collect::<Result<Vec<_>, _>>()?;
 
             // Extract raw CBOR bytes for redeemers and datums from the pallas
             // transaction.  These preserve the original encoding format (map vs
@@ -764,7 +860,7 @@ fn convert_output_inner(
 
     let multi_era_value = output.value();
     let lovelace = multi_era_value.coin();
-    let multi_asset = convert_value_assets(&multi_era_value);
+    let multi_asset = convert_value_assets(&multi_era_value)?;
 
     let value = if multi_asset.is_empty() {
         Value::lovelace(lovelace)
@@ -787,7 +883,7 @@ fn convert_output_inner(
             // re-encoding after an LSM round-trip would differ byte-for-byte.
             let raw_datum_cbor = d.0.raw_cbor().to_vec();
             OutputDatum::InlineDatum {
-                data: convert_plutus_data(&d.0),
+                data: convert_plutus_data(&d.0)?,
                 raw_cbor: Some(raw_datum_cbor),
             }
         }
@@ -842,7 +938,7 @@ fn convert_address(output: &PallasOutput) -> Result<Address, SerializationError>
 
 fn convert_value_assets(
     value: &pallas_traverse::MultiEraValue,
-) -> BTreeMap<Hash28, BTreeMap<AssetName, u64>> {
+) -> Result<BTreeMap<Hash28, BTreeMap<AssetName, u64>>, SerializationError> {
     let mut result = BTreeMap::new();
 
     for policy_assets in value.assets() {
@@ -850,7 +946,16 @@ fn convert_value_assets(
         if let Ok(policy) = Hash28::try_from(policy_bytes) {
             let assets_entry = result.entry(policy).or_insert_with(BTreeMap::new);
             for asset in policy_assets.assets() {
-                let asset_name = AssetName(asset.name().to_vec());
+                // D4: reject asset names exceeding the 32-byte CDDL limit.
+                // Direct tuple-struct construction bypasses AssetName::new(),
+                // so we use AssetName::new() explicitly here.
+                let asset_name = AssetName::new(asset.name().to_vec()).map_err(|_| {
+                    SerializationError::CborDecode(format!(
+                        "asset name too long: {} bytes (max {})",
+                        asset.name().len(),
+                        AssetName::MAX_LENGTH
+                    ))
+                })?;
                 if let Some(qty) = asset.output_coin() {
                     assets_entry.insert(asset_name, qty);
                 }
@@ -858,10 +963,12 @@ fn convert_value_assets(
         }
     }
 
-    result
+    Ok(result)
 }
 
-fn convert_mint(tx: &PallasTx) -> BTreeMap<Hash28, BTreeMap<AssetName, i64>> {
+fn convert_mint(
+    tx: &PallasTx,
+) -> Result<BTreeMap<Hash28, BTreeMap<AssetName, i64>>, SerializationError> {
     let mut result = BTreeMap::new();
 
     for policy_assets in tx.mints() {
@@ -869,7 +976,14 @@ fn convert_mint(tx: &PallasTx) -> BTreeMap<Hash28, BTreeMap<AssetName, i64>> {
         if let Ok(policy) = Hash28::try_from(policy_bytes) {
             let assets_entry = result.entry(policy).or_insert_with(BTreeMap::new);
             for asset in policy_assets.assets() {
-                let asset_name = AssetName(asset.name().to_vec());
+                // D4: same guard as convert_value_assets.
+                let asset_name = AssetName::new(asset.name().to_vec()).map_err(|_| {
+                    SerializationError::CborDecode(format!(
+                        "mint asset name too long: {} bytes (max {})",
+                        asset.name().len(),
+                        AssetName::MAX_LENGTH
+                    ))
+                })?;
                 if let Some(qty) = asset.mint_coin() {
                     assets_entry.insert(asset_name, qty);
                 }
@@ -877,7 +991,7 @@ fn convert_mint(tx: &PallasTx) -> BTreeMap<Hash28, BTreeMap<AssetName, i64>> {
         }
     }
 
-    result
+    Ok(result)
 }
 
 /// Convert a pallas transaction's auxiliary data into our `AuxiliaryData` type.
@@ -1176,7 +1290,7 @@ fn convert_native_script_inner(script: &pallas_primitives::alonzo::NativeScript)
     }
 }
 
-fn convert_redeemer(r: &pallas_traverse::MultiEraRedeemer) -> Redeemer {
+fn convert_redeemer(r: &pallas_traverse::MultiEraRedeemer) -> Result<Redeemer, SerializationError> {
     use pallas_primitives::conway::RedeemerTag as PRT;
     let tag = match r.tag() {
         PRT::Spend => RedeemerTag::Spend,
@@ -1187,25 +1301,52 @@ fn convert_redeemer(r: &pallas_traverse::MultiEraRedeemer) -> Redeemer {
         PRT::Propose => RedeemerTag::Propose,
     };
     let ex = r.ex_units();
-    Redeemer {
+    Ok(Redeemer {
         tag,
         index: r.index(),
-        data: convert_plutus_data(r.data()),
+        data: convert_plutus_data(r.data())?,
         ex_units: ExUnits {
             mem: ex.mem,
             steps: ex.steps,
         },
-    }
+    })
 }
 
-fn convert_plutus_data(data: &pallas_primitives::conway::PlutusData) -> PlutusData {
+/// Convert a pallas PlutusData into our internal type, returning an error if
+/// a CBOR bignum exceeds the i128 range.
+///
+/// # D3 / audit #544 — BigInt overflow
+///
+/// Haskell's `Plutus.Data` type uses arbitrary-precision `Integer`, so on-chain
+/// bignums can be any size.  Our `PlutusData::Integer` holds an `i128`.  A CBOR
+/// `BigUInt` encodes a non-negative integer as a byte array; any value requiring
+/// more than 16 bytes cannot be represented in `i128` and must be rejected —
+/// silently wrapping would produce a different integer value than what scripts see,
+/// causing a chain-split when script comparisons depend on datum integers.
+///
+/// Rejection boundary:
+///   - `BigUInt`: max representable is i128::MAX = 2^127-1 (fits in 16 bytes, MSB ≤ 0x7f)
+///   - `BigNInt`: CBOR encoding is `-(1 + N)` where N is the unsigned byte-string value;
+///     min representable is i128::MIN = -(2^127). The byte-string encodes the value N,
+///     so we reject when N >= 2^127 (i.e. the byte string encodes a value > i128::MAX).
+fn convert_plutus_data(
+    data: &pallas_primitives::conway::PlutusData,
+) -> Result<PlutusData, SerializationError> {
     use pallas_primitives::conway::PlutusData as PD;
-    match data {
+    Ok(match data {
         PD::BigInt(bi) => {
             let val: i128 = match bi {
                 pallas_primitives::conway::BigInt::Int(n) => (*n).into(),
                 pallas_primitives::conway::BigInt::BigUInt(b) => {
                     let bytes: &[u8] = b;
+                    // i128 holds 16 bytes; more bytes always overflow.
+                    // A 16-byte value is valid only if the MSB ≤ 0x7f (sign bit unset).
+                    if bytes.len() > 16 || (bytes.len() == 16 && bytes[0] > 0x7f) {
+                        return Err(SerializationError::CborDecode(format!(
+                            "PlutusData BigUInt exceeds i128 range: {} bytes",
+                            bytes.len()
+                        )));
+                    }
                     let mut val: i128 = 0;
                     for byte in bytes {
                         val = (val << 8) | (*byte as i128);
@@ -1214,6 +1355,14 @@ fn convert_plutus_data(data: &pallas_primitives::conway::PlutusData) -> PlutusDa
                 }
                 pallas_primitives::conway::BigInt::BigNInt(b) => {
                     let bytes: &[u8] = b;
+                    // BigNInt encodes -(1 + N).  The minimum i128 is -(2^127) = -1 - (2^127-1).
+                    // N must be ≤ 2^127-1, i.e. the byte string length ≤ 16 with MSB ≤ 0x7f.
+                    if bytes.len() > 16 || (bytes.len() == 16 && bytes[0] > 0x7f) {
+                        return Err(SerializationError::CborDecode(format!(
+                            "PlutusData BigNInt exceeds i128 range: {} bytes",
+                            bytes.len()
+                        )));
+                    }
                     let mut val: i128 = 0;
                     for byte in bytes {
                         val = (val << 8) | (*byte as i128);
@@ -1233,21 +1382,28 @@ fn convert_plutus_data(data: &pallas_primitives::conway::PlutusData) -> PlutusDa
             } else {
                 tag
             };
-            let fields: Vec<PlutusData> = constr.fields.iter().map(convert_plutus_data).collect();
+            let fields: Vec<PlutusData> = constr
+                .fields
+                .iter()
+                .map(convert_plutus_data)
+                .collect::<Result<_, _>>()?;
             PlutusData::Constr(constructor, fields)
         }
         PD::Map(entries) => {
             let converted: Vec<(PlutusData, PlutusData)> = entries
                 .iter()
-                .map(|(k, v)| (convert_plutus_data(k), convert_plutus_data(v)))
-                .collect();
+                .map(|(k, v)| Ok((convert_plutus_data(k)?, convert_plutus_data(v)?)))
+                .collect::<Result<_, SerializationError>>()?;
             PlutusData::Map(converted)
         }
         PD::Array(items) => {
-            let converted: Vec<PlutusData> = items.iter().map(convert_plutus_data).collect();
+            let converted: Vec<PlutusData> = items
+                .iter()
+                .map(convert_plutus_data)
+                .collect::<Result<_, _>>()?;
             PlutusData::List(converted)
         }
-    }
+    })
 }
 
 /// Safely convert a byte slice to Hash32, padding with zeros if shorter than 32 bytes.
@@ -1536,13 +1692,25 @@ fn convert_relay(relay: &pallas_primitives::Relay) -> Option<Relay> {
                 arr
             }),
         }),
-        PR::SingleHostName(port, dns) => Some(Relay::SingleHostName {
-            port: port.map(|p| p as u16),
-            dns_name: dns.clone(),
-        }),
-        PR::MultiHostName(dns) => Some(Relay::MultiHostName {
-            dns_name: dns.clone(),
-        }),
+        PR::SingleHostName(port, dns) => {
+            // D13: dns_name CDDL limit is text .size (0..128).
+            // Reject oversized names to prevent unbounded heap allocation.
+            if dns.len() > 128 {
+                return None;
+            }
+            Some(Relay::SingleHostName {
+                port: port.map(|p| p as u16),
+                dns_name: dns.clone(),
+            })
+        }
+        PR::MultiHostName(dns) => {
+            if dns.len() > 128 {
+                return None;
+            }
+            Some(Relay::MultiHostName {
+                dns_name: dns.clone(),
+            })
+        }
     }
 }
 
@@ -2007,7 +2175,7 @@ mod tests {
     fn test_convert_plutus_data_positive_int() {
         use pallas_primitives::conway::{BigInt, PlutusData as PD};
         let pd = PD::BigInt(BigInt::Int(42.into()));
-        let converted = convert_plutus_data(&pd);
+        let converted = convert_plutus_data(&pd).unwrap();
         assert_eq!(converted, PlutusData::Integer(42));
     }
 
@@ -2015,7 +2183,7 @@ mod tests {
     fn test_convert_plutus_data_negative_int() {
         use pallas_primitives::conway::{BigInt, PlutusData as PD};
         let pd = PD::BigInt(BigInt::Int((-7).into()));
-        let converted = convert_plutus_data(&pd);
+        let converted = convert_plutus_data(&pd).unwrap();
         assert_eq!(converted, PlutusData::Integer(-7));
     }
 
@@ -2024,7 +2192,7 @@ mod tests {
         use pallas_primitives::conway::PlutusData as PD;
         use pallas_primitives::BoundedBytes;
         let pd = PD::BoundedBytes(BoundedBytes::from(vec![0xde, 0xad]));
-        let converted = convert_plutus_data(&pd);
+        let converted = convert_plutus_data(&pd).unwrap();
         assert_eq!(converted, PlutusData::Bytes(vec![0xde, 0xad]));
     }
 
@@ -2036,7 +2204,7 @@ mod tests {
             PD::BigInt(BigInt::Int(1.into())),
             PD::BigInt(BigInt::Int(2.into())),
         ]));
-        let converted = convert_plutus_data(&pd);
+        let converted = convert_plutus_data(&pd).unwrap();
         assert_eq!(
             converted,
             PlutusData::List(vec![PlutusData::Integer(1), PlutusData::Integer(2)])
@@ -2051,7 +2219,7 @@ mod tests {
             PD::BigInt(BigInt::Int(1.into())),
             PD::BoundedBytes(BoundedBytes::from(vec![0xff])),
         )]));
-        let converted = convert_plutus_data(&pd);
+        let converted = convert_plutus_data(&pd).unwrap();
         assert_eq!(
             converted,
             PlutusData::Map(vec![(
@@ -2059,6 +2227,80 @@ mod tests {
                 PlutusData::Bytes(vec![0xff])
             )])
         );
+    }
+
+    // ── D3: BigInt overflow tests ─────────────────────────────────────────────
+
+    /// D3: BigUInt of exactly 16 bytes with MSB ≤ 0x7f must succeed (max i128).
+    #[test]
+    fn test_convert_plutus_bigint_16_bytes_max_ok() {
+        use pallas_primitives::conway::{BigInt, PlutusData as PD};
+        use pallas_primitives::BoundedBytes;
+        // 0x7f followed by 15 0xff bytes = i128::MAX = 2^127-1
+        let mut bytes = vec![0x7fu8];
+        bytes.extend_from_slice(&[0xffu8; 15]);
+        let pd = PD::BigInt(BigInt::BigUInt(BoundedBytes::from(bytes)));
+        let result = convert_plutus_data(&pd).unwrap();
+        assert_eq!(result, PlutusData::Integer(i128::MAX));
+    }
+
+    /// D3: BigUInt of 17 bytes must be rejected.
+    #[test]
+    fn test_convert_plutus_bigint_17_bytes_err() {
+        use pallas_primitives::conway::{BigInt, PlutusData as PD};
+        use pallas_primitives::BoundedBytes;
+        let bytes = vec![0x01u8; 17];
+        let pd = PD::BigInt(BigInt::BigUInt(BoundedBytes::from(bytes)));
+        assert!(
+            convert_plutus_data(&pd).is_err(),
+            "17-byte BigUInt must be rejected (exceeds i128)"
+        );
+    }
+
+    /// D3: BigUInt of 16 bytes with MSB > 0x7f must be rejected (would overflow into negative).
+    #[test]
+    fn test_convert_plutus_bigint_16_bytes_high_msb_err() {
+        use pallas_primitives::conway::{BigInt, PlutusData as PD};
+        use pallas_primitives::BoundedBytes;
+        let mut bytes = vec![0x80u8]; // MSB set → value ≥ 2^127 > i128::MAX
+        bytes.extend_from_slice(&[0x00u8; 15]);
+        let pd = PD::BigInt(BigInt::BigUInt(BoundedBytes::from(bytes)));
+        assert!(
+            convert_plutus_data(&pd).is_err(),
+            "16-byte BigUInt with MSB=0x80 must be rejected"
+        );
+    }
+
+    /// D3: BigNInt of 17 bytes must be rejected.
+    #[test]
+    fn test_convert_plutus_bignint_17_bytes_err() {
+        use pallas_primitives::conway::{BigInt, PlutusData as PD};
+        use pallas_primitives::BoundedBytes;
+        let bytes = vec![0x01u8; 17];
+        let pd = PD::BigInt(BigInt::BigNInt(BoundedBytes::from(bytes)));
+        assert!(
+            convert_plutus_data(&pd).is_err(),
+            "17-byte BigNInt must be rejected"
+        );
+    }
+
+    /// D3: Length-lattice for BigUInt — only lengths ≤ 15 always succeed;
+    /// 16 succeeds only with MSB ≤ 0x7f; 17+ always fails.
+    #[test]
+    fn test_convert_plutus_bigint_length_lattice() {
+        use pallas_primitives::conway::{BigInt, PlutusData as PD};
+        use pallas_primitives::BoundedBytes;
+        for len in [0_usize, 1, 15, 16, 17, 32] {
+            // All-zeros bytes: MSB = 0x00, always ≤ 0x7f → valid up to 16 bytes
+            let bytes = vec![0x00u8; len];
+            let pd = PD::BigInt(BigInt::BigUInt(BoundedBytes::from(bytes)));
+            let result = convert_plutus_data(&pd);
+            if len <= 16 {
+                assert!(result.is_ok(), "len={len} should succeed (MSB=0)");
+            } else {
+                assert!(result.is_err(), "len={len} should fail");
+            }
+        }
     }
 
     #[test]

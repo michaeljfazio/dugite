@@ -204,3 +204,77 @@ doc = false
 name = "fuzz_header_field_sizes"
 path = "fuzz_targets/header_field_sizes.rs"
 doc = false
+
+[[bin]]
+name = "fuzz_body_hash"
+path = "fuzz_targets/body_hash.rs"
+doc = false
+
+[[bin]]
+name = "fuzz_lsq_query_dispatch"
+path = "fuzz_targets/lsq_query_dispatch.rs"
+doc = false
+
+[[bin]]
+name = "fuzz_skip_cbor_value"
+path = "fuzz_targets/skip_cbor_value.rs"
+doc = false
+
+[[bin]]
+name = "fuzz_propose_versions"
+path = "fuzz_targets/propose_versions.rs"
+doc = false
+
+[[bin]]
+name = "fuzz_mux_ingress"
+path = "fuzz_targets/mux_ingress.rs"
+doc = false
+
+[[bin]]
+name = "fuzz_chainsync_client_pipelined_state_machine"
+path = "fuzz_targets/chainsync_client_pipelined_state_machine.rs"
+doc = false
+
+[[bin]]
+name = "fuzz_chainsync_server_state_machine"
+path = "fuzz_targets/chainsync_server_state_machine.rs"
+doc = false
+
+[[bin]]
+name = "fuzz_blockfetch_client_recv"
+path = "fuzz_targets/blockfetch_client_recv.rs"
+doc = false
+
+[[bin]]
+name = "fuzz_txsubmission2_server_state_machine"
+path = "fuzz_targets/txsubmission2_server_state_machine.rs"
+doc = false
+
+[[bin]]
+name = "fuzz_peer_sharing_client_addr_injection"
+path = "fuzz_targets/peer_sharing_client_addr_injection.rs"
+doc = false
+
+[[bin]]
+name = "fuzz_bootstrap_witness_sizes"
+path = "fuzz_targets/bootstrap_witness_sizes.rs"
+doc = false
+
+# D2/D9: VKeyWitness size validation (audit #544 — distinct from
+# fuzz_bootstrap_witness_sizes which targets the BootstrapWitness path).
+[[bin]]
+name = "fuzz_vkey_witness_sizes"
+path = "fuzz_targets/vkey_witness_sizes.rs"
+doc = false
+
+# D3: PlutusData BigInt bignum overflow (audit #544)
+[[bin]]
+name = "fuzz_plutus_bignum"
+path = "fuzz_targets/plutus_bignum.rs"
+doc = false
+
+# D10/D15: skip_cbor_value depth-limited recursion + indefinite string handling (audit #544)
+[[bin]]
+name = "fuzz_cbor_skip_value_depth"
+path = "fuzz_targets/cbor_skip_value_depth.rs"
+doc = false

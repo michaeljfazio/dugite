@@ -8,13 +8,26 @@
 //! - Connection limits (max inbound, max outbound, per-IP rate)
 
 use std::collections::HashMap;
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::Mutex;
+use tracing::warn;
 
 use super::handler::ConnectionHandler;
 use super::state::{ConnectionState, DataFlow, Provenance};
+
+/// Duration of the per-IP rate-limit sliding window.
+///
+/// Connections from the same IP address are counted within this window.
+/// Connections accepted more than `PER_IP_WINDOW` ago are not counted.
+const PER_IP_WINDOW: Duration = Duration::from_secs(60);
+
+/// Per-IP connection window entry.
+struct IpWindowEntry {
+    /// Timestamps of accepted connections from this IP within the window.
+    timestamps: Vec<Instant>,
+}
 
 /// Inbound idle timeout — connections in `InboundIdle` for longer than this
 /// are transitioned to `TerminatingConn` and closed.
@@ -71,6 +84,19 @@ pub struct ConnectionManager {
     config: ConnectionManagerConfig,
     /// Active connections, keyed by peer address.
     connections: Arc<Mutex<HashMap<SocketAddr, ConnectionEntry>>>,
+    /// Per-IP sliding-window counters for inbound rate limiting (G1, #547).
+    ///
+    /// Keyed by the remote IP address.  Each entry holds a `Vec<Instant>` of
+    /// recent connection timestamps; entries older than `PER_IP_WINDOW` are
+    /// pruned on access so the Vec stays bounded to `per_ip_rate_limit` entries.
+    ip_window: Arc<Mutex<HashMap<IpAddr, IpWindowEntry>>>,
+    /// Per-IP concurrent inbound connection count (A-002, #541).
+    ///
+    /// Keyed by source IP; value is the count of currently-active inbound
+    /// connections from that IP. Decremented via `remove_connection()`. This
+    /// gate complements `ip_window` — `ip_window` rate-limits new connection
+    /// establishment over time, this rate-limits *concurrent* active connections.
+    per_ip_count: Arc<Mutex<HashMap<IpAddr, usize>>>,
 }
 
 impl ConnectionManager {
@@ -79,7 +105,53 @@ impl ConnectionManager {
         Self {
             config,
             connections: Arc::new(Mutex::new(HashMap::new())),
+            ip_window: Arc::new(Mutex::new(HashMap::new())),
+            per_ip_count: Arc::new(Mutex::new(HashMap::new())),
         }
+    }
+
+    /// Check whether a new inbound connection from `ip` is permitted under the
+    /// per-IP rate limit.
+    ///
+    /// Returns `true` if the connection is within the rate limit and the new
+    /// connection timestamp has been recorded.  Returns `false` if the IP has
+    /// exceeded `per_ip_rate_limit` connections within `PER_IP_WINDOW` — the
+    /// caller should drop the stream without spawning any task.
+    ///
+    /// This is the G1 per-IP gate that was previously defined in config but
+    /// never enforced.  The accept loop in `dugite-node` calls this method
+    /// immediately after TCP accept, before spawning any task.
+    pub async fn check_and_record_inbound_ip(&self, ip: IpAddr) -> bool {
+        let limit = self.config.per_ip_rate_limit;
+        if limit == 0 {
+            // Rate limiting disabled.
+            return true;
+        }
+
+        let mut table = self.ip_window.lock().await;
+        let now = Instant::now();
+        let entry = table.entry(ip).or_insert_with(|| IpWindowEntry {
+            timestamps: Vec::new(),
+        });
+
+        // Prune timestamps older than the window.
+        entry
+            .timestamps
+            .retain(|t| now.duration_since(*t) < PER_IP_WINDOW);
+
+        if entry.timestamps.len() >= limit {
+            warn!(
+                %ip,
+                count = entry.timestamps.len(),
+                limit,
+                window_secs = PER_IP_WINDOW.as_secs(),
+                "G1: per-IP inbound rate limit exceeded, dropping connection"
+            );
+            return false;
+        }
+
+        entry.timestamps.push(now);
+        true
     }
 
     /// Reserve an outbound connection slot.
@@ -144,6 +216,14 @@ impl ConnectionManager {
     /// Accept an inbound connection.
     ///
     /// Returns `Ok(())` if the connection is accepted, `Err` if limits reached.
+    ///
+    /// Enforces:
+    /// - Global inbound limit (`max_inbound`)
+    /// - Per-IP inbound limit (`per_ip_rate_limit`)
+    ///
+    /// A-001 / A-002 (security audit 2026-05-19): this function was previously
+    /// never called from the actual N2N accept loop. It is now the single gate
+    /// that must be passed before spawning a connection handler task.
     pub async fn accept_inbound(
         &self,
         addr: SocketAddr,
@@ -161,7 +241,7 @@ impl ConnectionManager {
             return Err(crate::error::ConnectionError::ForbiddenConnection);
         }
 
-        // Check inbound limit
+        // Check global inbound limit.
         let inbound_count = conns
             .values()
             .filter(|e| {
@@ -178,6 +258,16 @@ impl ConnectionManager {
         if inbound_count >= self.config.max_inbound {
             return Err(crate::error::ConnectionError::MaxConnectionsReached);
         }
+
+        // Check per-IP limit.
+        let src_ip = addr.ip();
+        let mut per_ip = self.per_ip_count.lock().await;
+        let ip_count = per_ip.get(&src_ip).copied().unwrap_or(0);
+        if ip_count >= self.config.per_ip_rate_limit {
+            return Err(crate::error::ConnectionError::RateLimited(addr));
+        }
+        *per_ip.entry(src_ip).or_insert(0) += 1;
+        drop(per_ip);
 
         conns.insert(
             addr,
@@ -249,9 +339,28 @@ impl ConnectionManager {
     }
 
     /// Remove a connection (disconnected).
+    ///
+    /// Decrements the per-IP inbound counter if this was an inbound connection.
     pub async fn remove_connection(&self, addr: &SocketAddr) {
         let mut conns = self.connections.lock().await;
-        conns.remove(addr);
+        if let Some(entry) = conns.remove(addr) {
+            // Only decrement per-IP for inbound connections (they incremented on accept).
+            let was_inbound = matches!(
+                entry.state,
+                ConnectionState::InboundIdle(_)
+                    | ConnectionState::InboundState(_)
+                    | ConnectionState::UnnegotiatedConn(Provenance::Inbound)
+                    | ConnectionState::DuplexConn
+            );
+            if was_inbound {
+                let mut per_ip = self.per_ip_count.lock().await;
+                let count = per_ip.entry(addr.ip()).or_insert(0);
+                *count = count.saturating_sub(1);
+                if *count == 0 {
+                    per_ip.remove(&addr.ip());
+                }
+            }
+        }
     }
 
     /// Get current connection count.
@@ -321,6 +430,125 @@ mod tests {
         cm.accept_inbound(test_addr(3001)).await.unwrap();
         cm.inbound_negotiated(test_addr(3001), true).await;
         assert_eq!(cm.connection_count().await, 1);
+    }
+
+    // ── A-001 / A-002: per-IP concurrent-count rate limit (#541 audit) ───────
+
+    #[tokio::test]
+    async fn per_ip_concurrent_limit_enforced() {
+        let config = ConnectionManagerConfig {
+            per_ip_rate_limit: 3,
+            max_inbound: 100,
+            ..Default::default()
+        };
+        let cm = ConnectionManager::new(config);
+
+        // Three connections from 1.2.3.4 should succeed.
+        cm.accept_inbound("1.2.3.4:10001".parse().unwrap())
+            .await
+            .unwrap();
+        cm.accept_inbound("1.2.3.4:10002".parse().unwrap())
+            .await
+            .unwrap();
+        cm.accept_inbound("1.2.3.4:10003".parse().unwrap())
+            .await
+            .unwrap();
+
+        // Fourth from same IP must be rate-limited.
+        let result = cm.accept_inbound("1.2.3.4:10004".parse().unwrap()).await;
+        assert!(
+            matches!(result, Err(crate::error::ConnectionError::RateLimited(_))),
+            "4th connection from same IP must be rate-limited; got: {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn per_ip_rate_limit_different_ips_independent() {
+        let config = ConnectionManagerConfig {
+            per_ip_rate_limit: 2,
+            max_inbound: 100,
+            ..Default::default()
+        };
+        let cm = ConnectionManager::new(config);
+
+        // Two different IPs each within per-IP limit of 2.
+        cm.accept_inbound("1.2.3.4:10001".parse().unwrap())
+            .await
+            .unwrap();
+        cm.accept_inbound("1.2.3.4:10002".parse().unwrap())
+            .await
+            .unwrap();
+        cm.accept_inbound("5.6.7.8:10001".parse().unwrap())
+            .await
+            .unwrap();
+        cm.accept_inbound("5.6.7.8:10002".parse().unwrap())
+            .await
+            .unwrap();
+
+        // Third from first IP: rate-limited.
+        assert!(cm
+            .accept_inbound("1.2.3.4:10003".parse().unwrap())
+            .await
+            .is_err());
+        // Third from second IP: also rate-limited.
+        assert!(cm
+            .accept_inbound("5.6.7.8:10003".parse().unwrap())
+            .await
+            .is_err());
+    }
+
+    #[tokio::test]
+    async fn per_ip_slot_released_on_remove() {
+        let config = ConnectionManagerConfig {
+            per_ip_rate_limit: 1,
+            max_inbound: 100,
+            ..Default::default()
+        };
+        let cm = ConnectionManager::new(config);
+
+        let addr: std::net::SocketAddr = "1.2.3.4:10001".parse().unwrap();
+        cm.accept_inbound(addr).await.unwrap();
+
+        // At limit: second connection rejected.
+        assert!(cm
+            .accept_inbound("1.2.3.4:10002".parse().unwrap())
+            .await
+            .is_err());
+
+        // After removal: slot freed, new connection from same IP accepted.
+        cm.remove_connection(&addr).await;
+        cm.accept_inbound("1.2.3.4:10003".parse().unwrap())
+            .await
+            .unwrap();
+    }
+
+    /// Property test: N accept calls within limit succeed; N+1 is rejected.
+    #[tokio::test]
+    async fn per_ip_rate_limit_lattice() {
+        for limit in [1usize, 2, 5, 10] {
+            let config = ConnectionManagerConfig {
+                per_ip_rate_limit: limit,
+                max_inbound: 1000,
+                ..Default::default()
+            };
+            let cm = ConnectionManager::new(config);
+            // Fill to limit.
+            for port in 0..limit {
+                let addr: std::net::SocketAddr =
+                    format!("9.9.9.9:{}", 10000 + port).parse().unwrap();
+                assert!(
+                    cm.accept_inbound(addr).await.is_ok(),
+                    "connection {port} within limit {limit} should succeed"
+                );
+            }
+            // One over: rejected.
+            let over_addr: std::net::SocketAddr =
+                format!("9.9.9.9:{}", 10000 + limit).parse().unwrap();
+            assert!(
+                cm.accept_inbound(over_addr).await.is_err(),
+                "connection {limit} over per-IP limit {limit} should fail"
+            );
+        }
     }
 
     #[tokio::test]
@@ -420,5 +648,83 @@ mod tests {
             expired.is_empty(),
             "outbound connections should not be affected by inbound idle timeout"
         );
+    }
+
+    // ── G1: per-IP rate limit tests ─────────────────────────────────────────
+
+    fn test_ip(last_octet: u8) -> IpAddr {
+        use std::net::Ipv4Addr;
+        IpAddr::V4(Ipv4Addr::new(1, 2, 3, last_octet))
+    }
+
+    /// The first `per_ip_rate_limit` connections from one IP are accepted;
+    /// the next is rejected.
+    #[tokio::test]
+    async fn per_ip_rate_limit_enforced() {
+        let config = ConnectionManagerConfig {
+            per_ip_rate_limit: 3,
+            ..Default::default()
+        };
+        let cm = ConnectionManager::new(config);
+        let ip = test_ip(10);
+
+        // First 3 connections: accepted
+        for _ in 0..3 {
+            assert!(
+                cm.check_and_record_inbound_ip(ip).await,
+                "connection within limit should be accepted"
+            );
+        }
+
+        // 4th connection: rejected
+        assert!(
+            !cm.check_and_record_inbound_ip(ip).await,
+            "connection exceeding limit should be rejected"
+        );
+    }
+
+    /// A different IP is not affected by another IP's rate limit.
+    #[tokio::test]
+    async fn per_ip_rate_limit_per_source_independent() {
+        let config = ConnectionManagerConfig {
+            per_ip_rate_limit: 2,
+            ..Default::default()
+        };
+        let cm = ConnectionManager::new(config);
+        let ip_a = test_ip(1);
+        let ip_b = test_ip(2);
+
+        // Exhaust ip_a's limit
+        cm.check_and_record_inbound_ip(ip_a).await;
+        cm.check_and_record_inbound_ip(ip_a).await;
+        assert!(
+            !cm.check_and_record_inbound_ip(ip_a).await,
+            "ip_a exhausted"
+        );
+
+        // ip_b is still within its own limit
+        assert!(
+            cm.check_and_record_inbound_ip(ip_b).await,
+            "ip_b should not be affected by ip_a's limit"
+        );
+    }
+
+    /// When per_ip_rate_limit = 0, rate limiting is disabled and every
+    /// connection is accepted regardless of source IP.
+    #[tokio::test]
+    async fn per_ip_rate_limit_zero_disables() {
+        let config = ConnectionManagerConfig {
+            per_ip_rate_limit: 0,
+            ..Default::default()
+        };
+        let cm = ConnectionManager::new(config);
+        let ip = test_ip(42);
+
+        for _ in 0..100 {
+            assert!(
+                cm.check_and_record_inbound_ip(ip).await,
+                "all connections should be accepted when rate limit is disabled"
+            );
+        }
     }
 }
