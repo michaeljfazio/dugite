@@ -87,8 +87,21 @@ gen_cc() {
     # generating an orphan keypair (legacy path).
     local devnet_dir="$LD_KEYS/$name"
     if [ -s "$devnet_dir/cc-cold.skey" ] && [ -s "$devnet_dir/cc-hot.skey" ]; then
-        if [ ! -s "$dir/cc-cold.skey" ]; then
-            zoo_info "  CC keys: reusing $name from devnet ($devnet_dir)"
+        # Always refresh from devnet — setup.sh regenerates the system CC keys
+        # on each run, so the tx-zoo copies become stale after re-setup. Without
+        # refreshing, the zoo's CC keys diverge from the seated committee and
+        # mempool admission correctly rejects CommitteeHotAuth/vote certs that
+        # name unelected cold keys (see #551).
+        local devnet_hash
+        devnet_hash=$(cardano-cli conway governance committee key-hash \
+            --verification-key-file "$devnet_dir/cc-cold.vkey" 2>/dev/null || true)
+        local zoo_hash=""
+        if [ -s "$dir/cc-cold.vkey" ]; then
+            zoo_hash=$(cardano-cli conway governance committee key-hash \
+                --verification-key-file "$dir/cc-cold.vkey" 2>/dev/null || true)
+        fi
+        if [ "$devnet_hash" != "$zoo_hash" ]; then
+            zoo_info "  CC keys: syncing $name from devnet ($devnet_dir)"
             cp "$devnet_dir/cc-cold.skey" "$dir/cc-cold.skey"
             cp "$devnet_dir/cc-cold.vkey" "$dir/cc-cold.vkey"
             cp "$devnet_dir/cc-hot.skey"  "$dir/cc-hot.skey"

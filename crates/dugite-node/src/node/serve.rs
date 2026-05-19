@@ -283,6 +283,8 @@ fn build_governance_validation_state(
         dugite_ledger::validation::ActiveProposal,
     >,
     std::collections::HashSet<dugite_primitives::hash::Hash32>,
+    std::collections::HashSet<dugite_primitives::hash::Hash32>,
+    std::collections::HashSet<dugite_primitives::hash::Hash32>,
 ) {
     let active_proposals = ledger
         .gov
@@ -309,7 +311,30 @@ fn build_governance_validation_state(
         .values()
         .copied()
         .collect();
-    (active_proposals, committee_hot_keys)
+    // Mempool admission must enforce the same Conway predicate failures the
+    // block-apply path does — without these two sets, `CommitteeHotAuth`
+    // certificates with unelected (or resigned) cold keys are silently admitted
+    // and forged into blocks that cardano-node correctly rejects. See #551.
+    let committee_members = ledger
+        .gov
+        .governance
+        .committee_expiration
+        .keys()
+        .copied()
+        .collect();
+    let committee_resigned = ledger
+        .gov
+        .governance
+        .committee_resigned
+        .keys()
+        .copied()
+        .collect();
+    (
+        active_proposals,
+        committee_hot_keys,
+        committee_members,
+        committee_resigned,
+    )
 }
 
 /// Validates transactions against the live ledger state (Phase-1 + Phase-2 Plutus).
@@ -362,12 +387,15 @@ impl TxValidator for LedgerTxValidator {
         //
         // Mirrors Haskell's GovEnv exposing both `proposals` and
         // `authorizedHotCommitteeCredentials` to the GOV rule.
-        let (active_proposals, committee_hot_keys) = build_governance_validation_state(&ledger);
+        let (active_proposals, committee_hot_keys, committee_members, committee_resigned) =
+            build_governance_validation_state(&ledger);
 
         let context = dugite_ledger::validation::ValidationContext::new()
             .with_pools(registered_pool_ids)
             .with_active_proposals(active_proposals)
-            .with_committee_authorized_hot_keys(committee_hot_keys);
+            .with_committee_authorized_hot_keys(committee_hot_keys)
+            .with_committee_members(committee_members)
+            .with_committee_resigned(committee_resigned);
 
         dugite_ledger::validation::validate_transaction_with_context(
             &tx,
@@ -967,7 +995,7 @@ mod tests {
             gov.committee_hot_keys.insert(cold_cred, hot_cred);
         }
 
-        let (active, hot_keys) = build_governance_validation_state(&ledger);
+        let (active, hot_keys, _members, _resigned) = build_governance_validation_state(&ledger);
 
         // Proposal projection: every ActiveProposal field must mirror the
         // ProposalState/ProposalProcedure source.
@@ -994,9 +1022,11 @@ mod tests {
     #[test]
     fn build_governance_validation_state_empty_for_fresh_ledger() {
         let ledger = LedgerState::new(ProtocolParameters::mainnet_defaults());
-        let (active, hot_keys) = build_governance_validation_state(&ledger);
+        let (active, hot_keys, members, resigned) = build_governance_validation_state(&ledger);
         assert!(active.is_empty());
         assert!(hot_keys.is_empty());
+        assert!(members.is_empty());
+        assert!(resigned.is_empty());
     }
 
     // ─── convert_validation_error ────────────────────────────────────────────
