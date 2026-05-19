@@ -2027,21 +2027,30 @@ impl Node {
         {
             // Resolve all DNS addresses BEFORE acquiring the write lock to avoid
             // holding the lock during potentially slow DNS lookups.
+            //
+            // Uses SRV-first resolution: tries `_cardano._tcp.<host>` SRV records
+            // first (Haskell cardano-node behaviour), falls back to A/AAAA on
+            // the original hostname if no SRV records exist.
+            use dugite_network::peer::discovery::{resolve_with_srv, HickoryDnsResolver};
+            let dns_resolver = match HickoryDnsResolver::new() {
+                Ok(r) => r,
+                Err(e) => {
+                    warn!("Failed to create DNS resolver: {e}");
+                    return Ok(());
+                }
+            };
+
             let mut resolved_peers: Vec<std::net::SocketAddr> = Vec::new();
             for peer in &detailed_peers {
-                match tokio::net::lookup_host(format!("{}:{}", peer.address, peer.port)).await {
-                    Ok(addrs) => {
-                        for socket_addr in addrs {
-                            resolved_peers.push(socket_addr);
-                        }
-                    }
-                    Err(e) => {
-                        warn!(
-                            address = %peer.address,
-                            port = peer.port,
-                            "Failed to resolve peer address: {e}"
-                        );
-                    }
+                let addrs = resolve_with_srv(&dns_resolver, &peer.address, peer.port).await;
+                if addrs.is_empty() {
+                    warn!(
+                        address = %peer.address,
+                        port = peer.port,
+                        "Failed to resolve peer address (SRV + A/AAAA both failed)"
+                    );
+                } else {
+                    resolved_peers.extend(addrs);
                 }
             }
 
@@ -2066,19 +2075,15 @@ impl Node {
                 });
                 let mut group_addrs = Vec::new();
                 for ap in &group.access_points {
-                    match tokio::net::lookup_host(format!("{}:{}", ap.address, ap.port)).await {
-                        Ok(addrs) => {
-                            for socket_addr in addrs {
-                                group_addrs.push(socket_addr);
-                            }
-                        }
-                        Err(e) => {
-                            warn!(
-                                address = %ap.address,
-                                port = ap.port,
-                                "Failed to resolve local root group member address: {e}"
-                            );
-                        }
+                    let addrs = resolve_with_srv(&dns_resolver, &ap.address, ap.port).await;
+                    if addrs.is_empty() {
+                        warn!(
+                            address = %ap.address,
+                            port = ap.port,
+                            "Failed to resolve local root group member address (SRV + A/AAAA both failed)"
+                        );
+                    } else {
+                        group_addrs.extend(addrs);
                     }
                 }
                 if !group_addrs.is_empty() {
