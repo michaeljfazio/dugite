@@ -3540,6 +3540,29 @@ impl Node {
                                         let fork_slot = fork_block.slot();
                                         let fork_block_no = fork_block.block_number();
                                         let fork_hash_hex = fork_block.header.header_hash.to_hex();
+
+                                        // Issue #545 E5: body hash check in fork replay path.
+                                        if fork_block.era.is_shelley_based() {
+                                            if let Some(body_bytes) =
+                                                dugite_serialization::extract_block_body_cbor(&cbor)
+                                            {
+                                                if let Err(e) =
+                                                    dugite_consensus::praos::validate_block_body_hash(
+                                                        &fork_block.header,
+                                                        body_bytes,
+                                                    )
+                                                {
+                                                    warn!(
+                                                        slot = fork_slot.0,
+                                                        block = fork_block_no.0,
+                                                        hash = %fork_hash_hex,
+                                                        "Fork replay: body hash mismatch — skipping block: {e}"
+                                                    );
+                                                    continue;
+                                                }
+                                            }
+                                        }
+
                                         // Fix B (Bug B, 2026-05-16): use apply_block_with_delta
                                         // so that fork-replayed blocks also populate LedgerSeq.
                                         // Without this, after a successful fork switch the seq
@@ -3712,6 +3735,49 @@ impl Node {
                 "Failed to store fetched block — skipping ledger apply"
             );
             return;
+        }
+
+        // Issue #545 E5: verify that the block body delivered by BlockFetch matches
+        // the body hash committed in the header.  A malicious or buggy relay can
+        // substitute the body bytes while leaving the header (and its KES/VRF
+        // signatures) intact.  This check mirrors Haskell's `verifyBlockIntegrity`
+        // (`matchesHeaderHash`) called at the decode-and-apply boundary.
+        //
+        // We check AFTER storage because the block is keyed by header hash in ChainDB;
+        // a body-hash mismatch is a data integrity error from this peer, not a
+        // chain-selection issue.  The block is evicted from volatile state on mismatch.
+        if block.era.is_shelley_based() {
+            if let Some(raw) = block.raw_cbor.as_deref() {
+                match dugite_serialization::extract_block_body_cbor(raw) {
+                    Some(body_bytes) => {
+                        if let Err(e) = dugite_consensus::praos::validate_block_body_hash(
+                            &block.header,
+                            body_bytes,
+                        ) {
+                            warn!(
+                                peer = %fetched.peer,
+                                slot = block_slot.0,
+                                block = block_number.0,
+                                hash = %block_hash.to_hex(),
+                                "Body hash mismatch — discarding block and evicting from volatile state: {e}"
+                            );
+                            // Evict the block we just stored: its body is compromised.
+                            let mut db = self.chain_db.write().await;
+                            db.remove_volatile_block(&block_hash);
+                            return;
+                        }
+                    }
+                    None => {
+                        // Body extraction failed (unexpected CBOR structure).
+                        // Log but do not reject — the body_size envelope check
+                        // already ran upstream; this is a best-effort integrity guard.
+                        debug!(
+                            slot = block_slot.0,
+                            "Body hash check skipped: could not extract body CBOR from raw block"
+                        );
+                    }
+                }
+            }
         }
 
         // When TriggeredFork already replayed all fork blocks (including the
