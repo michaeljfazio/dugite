@@ -40,6 +40,7 @@ use super::scripts::{
     collect_available_script_hashes, compute_min_fee, estimate_value_cbor_size,
     evaluate_native_script,
 };
+use super::size_check::expect_size;
 use super::ValidationError;
 
 // ---------------------------------------------------------------------------
@@ -271,22 +272,34 @@ fn verify_single_witness<W: HasWitnessFields>(
 ) -> Option<ValidationError> {
     let vkey = witness.vkey();
     let sig = witness.signature();
-    // Ed25519 requires exact 32-byte vkeys and 64-byte signatures. Haskell
-    // cardano-node rejects malformed witnesses at CBOR decode time via the
-    // fixed-size `VKey` / `SignedDSIGN Ed25519DSIGN` newtype decoders
-    // (`decodeSignedDSIGN` -> `failSizeCheck`). Pallas decodes witnesses as
-    // variable-length `Bytes`, so we enforce the length invariant here and
-    // emit a structured `InvalidWitnessSignature`.
+    // Pre-flight: enforce Ed25519 wire sizes (32-byte key, 64-byte sig) BEFORE
+    // any crypto. Haskell's `rawDeserialiseVerKeyDSIGN` fails hard for non-32-byte
+    // keys, returning `InvalidWitness`. We must never silently accept malformed
+    // witnesses — that would let a fabricated 1-byte vkey satisfy a required-signer
+    // check without any cryptographic verification (D2/D9 class, audit #544;
+    // same class as #537).
     //
-    // Bootstrap witnesses (Byron extended keys, 64 bytes) take the separate
-    // `verify_bootstrap_witnesses` path and are never dispatched here.
-    if vkey.len() != 32 || sig.len() != 64 {
-        return Some(ValidationError::InvalidWitnessSignature(format!(
-            "{prefix}malformed witness: vkey={} bytes, sig={} bytes (expected 32/64)",
-            vkey.len(),
-            sig.len(),
-        )));
+    // Bootstrap witnesses (Byron extended keys, 64-byte vkey) take the separate
+    // `verify_bootstrap_witnesses` path (#546 F1) and are never dispatched here —
+    // `HasWitnessFields` is intentionally not impl'd on `BootstrapWitness`.
+    //
+    // `expect_size` is the uniform helper from `size_check.rs`; all crypto-input
+    // length checks in the validation layer go through it.
+    if let Err(e) = expect_size("vkey", vkey.len(), 32) {
+        return Some(e);
     }
+    if let Err(e) = expect_size("signature", sig.len(), 64) {
+        return Some(e);
+    }
+    // Inline defense-in-depth: even after the pre-flight above, the crypto call
+    // must not receive wrong-size inputs if this function is ever invoked through
+    // a future call path that bypasses the pre-flight.
+    debug_assert_eq!(
+        vkey.len(),
+        32,
+        "vkey must be exactly 32 bytes at crypto site"
+    );
+    debug_assert_eq!(sig.len(), 64, "sig must be exactly 64 bytes at crypto site");
     match dugite_crypto::keys::PaymentVerificationKey::from_bytes(vkey) {
         Ok(vk) => {
             if vk.verify(tx_hash_bytes, sig).is_err() {
@@ -764,6 +777,27 @@ pub(super) fn run_phase1_rules(
     }
 
     // ------------------------------------------------------------------
+    // Rule 1i-pre: Pool reward account must be exactly 29 bytes
+    //             (D8 of security audit #544)
+    //
+    // A pool reward account is always exactly 29 bytes: 1 header byte followed
+    // by a 28-byte (Blake2b-224) credential hash. Haskell's `checkPoolParams`
+    // deserialises the raw bytes as an `Addr` via `deserialiseFromRawBytes
+    // AsShelleyAddress`, which fails hard on any other length. This check runs
+    // unconditionally — no `network_id` in the tx body is required.
+    // ------------------------------------------------------------------
+    for cert in &body.certificates {
+        if let Certificate::PoolRegistration(pool_params) = cert {
+            if pool_params.reward_account.len() != 29 {
+                errors.push(ValidationError::InvalidRewardAccount(format!(
+                    "pool reward account must be exactly 29 bytes, got {}",
+                    pool_params.reward_account.len()
+                )));
+            }
+        }
+    }
+
+    // ------------------------------------------------------------------
     // Rule 1i: Pool reward account network must match transaction network_id
     //          (Haskell `WrongNetworkInTxBody`, Alonzo+)
     //
@@ -790,6 +824,7 @@ pub(super) fn run_phase1_rules(
             if let Certificate::PoolRegistration(pool_params) = cert {
                 // Reward account format: header_byte || 28-byte credential hash.
                 // Bit 0 of the header encodes the network: 0 = testnet, 1 = mainnet.
+                // Length is already checked in Rule 1i-pre above; skip here if bad.
                 if let Some(header) = pool_params.reward_account.first() {
                     let network_bit = header & 0x01;
                     let actual_network = if network_bit == 0 {
@@ -1207,11 +1242,20 @@ pub(super) fn run_phase1_rules(
     // Rule 9b: Witness completeness
     // ------------------------------------------------------------------
     if errors.is_empty() {
-        // Build the set of VKey witness key hashes (blake2b-224 of each vkey)
+        // Build the set of VKey witness key hashes (blake2b-224 of each vkey).
+        //
+        // D9 / audit #544: Only hash vkeys that are exactly 32 bytes.
+        // A malformed 1-byte vkey must NOT be hashed and used to satisfy a
+        // required-signer check — that would let fabricated witnesses bypass
+        // all cryptographic verification.  Haskell rejects non-32-byte vkeys
+        // at CBOR decode time (`decodeVerKeyDSIGN` / `failSizeCheck`), so
+        // they never reach the witness-completeness check.  Pallas accepts any
+        // byte length; we enforce the invariant here.
         let vkey_witness_hashes: HashSet<Hash28> = tx
             .witness_set
             .vkey_witnesses
             .iter()
+            .filter(|w| w.vkey.len() == 32) // only well-formed Ed25519 keys
             .map(|w| dugite_primitives::hash::blake2b_224(&w.vkey))
             .collect();
 
@@ -1299,10 +1343,13 @@ pub(super) fn run_phase1_rules(
     // Rule 10: Required signers must have corresponding vkey witnesses
     // ------------------------------------------------------------------
     if !body.required_signers.is_empty() && !tx.witness_set.vkey_witnesses.is_empty() {
+        // D9 / audit #544: Same filter as Rule 9b — only hash well-formed 32-byte
+        // vkeys.  A malformed vkey must never satisfy a required-signer check.
         let witness_keyhashes: HashSet<_> = tx
             .witness_set
             .vkey_witnesses
             .iter()
+            .filter(|w| w.vkey.len() == 32) // only well-formed Ed25519 keys
             .map(|w| dugite_primitives::hash::blake2b_224(&w.vkey))
             .collect();
         for required_signer in &body.required_signers {
@@ -2250,6 +2297,8 @@ mod tests {
     // observed lengths so operators can diagnose corrupt submissions.
     #[test]
     fn test_vkey_witness_malformed_error_message_includes_sizes() {
+        // D2 fix: expect_size checks vkey first, then sig, each returning a separate error.
+        // With vkey=31 bytes: error mentions "31" and "32" (expected).
         let errors = validate_with_vkey_witness(vec![1u8; 31], vec![0u8; 63]);
         let msg = errors
             .iter()
@@ -2258,8 +2307,32 @@ mod tests {
                 _ => None,
             })
             .expect("InvalidWitnessSignature not found");
-        assert!(msg.contains("31"), "message must include vkey size: {msg}");
-        assert!(msg.contains("63"), "message must include sig size: {msg}");
+        // The error must reference the actual size (31) and the expected size (32)
+        assert!(
+            msg.contains("31"),
+            "message must include actual vkey size: {msg}"
+        );
+        assert!(
+            msg.contains("32"),
+            "message must include expected vkey size: {msg}"
+        );
+        // Also verify wrong-size sig is rejected when vkey is correct
+        let errors2 = validate_with_vkey_witness(vec![0u8; 32], vec![0u8; 63]);
+        let msg2 = errors2
+            .iter()
+            .find_map(|e| match e {
+                ValidationError::InvalidWitnessSignature(s) => Some(s.clone()),
+                _ => None,
+            })
+            .expect("InvalidWitnessSignature not found for wrong-size sig");
+        assert!(
+            msg2.contains("63"),
+            "message must include actual sig size: {msg2}"
+        );
+        assert!(
+            msg2.contains("64"),
+            "message must include expected sig size: {msg2}"
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -3264,6 +3337,194 @@ mod tests {
                 .any(|e| matches!(e, ValidationError::PoolMedataHashTooBig { .. })),
             "expected no PoolMedataHashTooBig, got {errors:?}"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // D9 / audit #544: Malformed vkeys must not satisfy required-signer check
+    //
+    // A fabricated 1-byte vkey whose blake2b_224 happens to equal a required
+    // signer's keyhash must NOT satisfy rule 10.  Before the D9 fix, the
+    // vkey_witness_hashes set included hashes of malformed vkeys, allowing a
+    // tx with `vkey=[0x01]` and `required_signer = blake2b_224([0x01])` to
+    // pass phase-1 with zero cryptographic verification.
+    // -----------------------------------------------------------------------
+
+    /// D9: blake2b_224 of a 1-byte vkey must not satisfy a required-signer check.
+    /// Haskell rejects any non-32-byte vkey at `rawDeserialiseVerKeyDSIGN` time;
+    /// Dugite must reject it at the hashing filter (rule 9b/10).
+    #[test]
+    fn test_d9_malformed_vkey_cannot_satisfy_required_signer() {
+        use dugite_primitives::hash::{blake2b_224, Hash32};
+
+        // The malformed vkey is just one byte.
+        let malformed_vkey = vec![0x01u8];
+        let fabricated_keyhash = blake2b_224(&malformed_vkey);
+
+        // Build the Hash32 form used in required_signers (zero-padded from 28 bytes).
+        let mut hash32_bytes = [0u8; 32];
+        hash32_bytes[..28].copy_from_slice(fabricated_keyhash.as_bytes());
+        let required_signer = Hash32::from_bytes(hash32_bytes);
+
+        let (utxo_set, mut tx, _) = make_valid_tx();
+        // Set a required signer whose keyhash = blake2b_224([0x01])
+        tx.body.required_signers = vec![required_signer];
+        // Add a malformed vkey witness with the 1-byte vkey
+        tx.witness_set
+            .vkey_witnesses
+            .push(dugite_primitives::transaction::VKeyWitness {
+                vkey: malformed_vkey.clone(),
+                signature: vec![0u8; 64],
+            });
+
+        let params = ProtocolParameters::mainnet_defaults();
+        let errors = validate_transaction(&tx, &utxo_set, &params, 100, 300, None)
+            .err()
+            .unwrap_or_default();
+
+        // Must reject: the 1-byte vkey must not satisfy required_signer.
+        // We expect either InvalidWitnessSignature (from rule 14) or
+        // MissingRequiredSigner (from rule 10) — both are correct.
+        let rejected = errors.iter().any(|e| {
+            matches!(
+                e,
+                ValidationError::InvalidWitnessSignature(_)
+                    | ValidationError::MissingRequiredSigner(_)
+            )
+        });
+        assert!(
+            rejected,
+            "malformed 1-byte vkey must not satisfy required-signer check; errors: {errors:?}"
+        );
+    }
+
+    /// D9 length-lattice: for all vkey sizes except 32, the required-signer check
+    /// must reject (either via InvalidWitnessSignature or MissingRequiredSigner).
+    #[test]
+    fn test_d9_required_signer_length_lattice() {
+        use dugite_primitives::hash::{blake2b_224, Hash32};
+
+        for vkey_len in [0_usize, 1, 16, 31, 33, 64] {
+            let malformed_vkey = vec![0xABu8; vkey_len];
+            let fabricated_keyhash = blake2b_224(&malformed_vkey);
+            let mut hash32_bytes = [0u8; 32];
+            hash32_bytes[..28].copy_from_slice(fabricated_keyhash.as_bytes());
+            let required_signer = Hash32::from_bytes(hash32_bytes);
+
+            let (utxo_set, mut tx, _) = make_valid_tx();
+            tx.body.required_signers = vec![required_signer];
+            tx.witness_set
+                .vkey_witnesses
+                .push(dugite_primitives::transaction::VKeyWitness {
+                    vkey: malformed_vkey,
+                    signature: vec![0u8; 64],
+                });
+
+            let params = ProtocolParameters::mainnet_defaults();
+            let errors = validate_transaction(&tx, &utxo_set, &params, 100, 300, None)
+                .err()
+                .unwrap_or_default();
+
+            let rejected = errors.iter().any(|e| {
+                matches!(
+                    e,
+                    ValidationError::InvalidWitnessSignature(_)
+                        | ValidationError::MissingRequiredSigner(_)
+                )
+            });
+            assert!(
+                rejected,
+                "vkey_len={vkey_len}: malformed vkey must not satisfy required-signer; errors={errors:?}"
+            );
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Test D8 — Rule 1i: pool reward account must be exactly 29 bytes
+    // -----------------------------------------------------------------------
+    #[test]
+    fn test_d8_pool_reward_account_wrong_length_rejected() {
+        use dugite_primitives::transaction::{Certificate, PoolParams, Rational};
+        // Test both too-short (28 bytes) and too-long (30 bytes) cases.
+        for bad_len in [0usize, 1, 28, 30, 64] {
+            let (utxo_set, mut tx, _) = make_valid_tx();
+            let params = ProtocolParameters::mainnet_defaults();
+
+            tx.body
+                .certificates
+                .push(Certificate::PoolRegistration(PoolParams {
+                    operator: Hash28::from_bytes([0x88u8; 28]),
+                    vrf_keyhash: Hash32::from_bytes([0x99u8; 32]),
+                    pledge: Lovelace(0),
+                    cost: Lovelace(340_000_000),
+                    margin: Rational {
+                        numerator: 1,
+                        denominator: 100,
+                    },
+                    // Wrong-length reward account — one byte header (mainnet) + wrong tail.
+                    reward_account: {
+                        let mut acct = vec![0xE1u8]; // mainnet key reward addr header
+                        acct.extend_from_slice(&vec![0xAA; bad_len.saturating_sub(1)]);
+                        acct.truncate(bad_len);
+                        acct
+                    },
+                    pool_owners: vec![],
+                    relays: vec![],
+                    pool_metadata: None,
+                }));
+
+            let errors = validate_transaction(&tx, &utxo_set, &params, 100, 300, None).unwrap_err();
+            assert!(
+                errors
+                    .iter()
+                    .any(|e| matches!(e, ValidationError::InvalidRewardAccount(_))),
+                "reward_account of length {bad_len} must produce InvalidRewardAccount, got {errors:?}"
+            );
+        }
+    }
+
+    /// Length-lattice: exactly 29 bytes with a valid header must not produce
+    /// InvalidRewardAccount (it may still fail for other reasons, but not D8).
+    #[test]
+    fn test_d8_pool_reward_account_exact_length_ok() {
+        use dugite_primitives::transaction::{Certificate, PoolParams, Rational};
+        let (utxo_set, mut tx, _) = make_valid_tx();
+        let params = ProtocolParameters::mainnet_defaults();
+
+        // 29-byte mainnet key reward account — should NOT produce InvalidRewardAccount.
+        tx.body
+            .certificates
+            .push(Certificate::PoolRegistration(PoolParams {
+                operator: Hash28::from_bytes([0x88u8; 28]),
+                vrf_keyhash: Hash32::from_bytes([0x99u8; 32]),
+                pledge: Lovelace(0),
+                cost: Lovelace(340_000_000),
+                margin: Rational {
+                    numerator: 1,
+                    denominator: 100,
+                },
+                reward_account: {
+                    let mut acct = vec![0xE1u8]; // mainnet key reward addr
+                    acct.extend_from_slice(&[0xAA; 28]);
+                    acct
+                },
+                pool_owners: vec![],
+                relays: vec![],
+                pool_metadata: None,
+            }));
+
+        // May succeed or fail for other reasons (e.g. pool not registered) —
+        // but must not fail with InvalidRewardAccount.
+        match validate_transaction(&tx, &utxo_set, &params, 100, 300, None) {
+            Ok(_) => {}
+            Err(errors) => {
+                assert!(
+                    !errors
+                        .iter()
+                        .any(|e| matches!(e, ValidationError::InvalidRewardAccount(_))),
+                    "exactly 29-byte reward account must not produce InvalidRewardAccount, got {errors:?}"
+                );
+            }
+        }
     }
 
     // -----------------------------------------------------------------------

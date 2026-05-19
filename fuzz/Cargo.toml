@@ -259,3 +259,22 @@ doc = false
 name = "fuzz_bootstrap_witness_sizes"
 path = "fuzz_targets/bootstrap_witness_sizes.rs"
 doc = false
+
+# D2/D9: VKeyWitness size validation (audit #544 — distinct from
+# fuzz_bootstrap_witness_sizes which targets the BootstrapWitness path).
+[[bin]]
+name = "fuzz_vkey_witness_sizes"
+path = "fuzz_targets/vkey_witness_sizes.rs"
+doc = false
+
+# D3: PlutusData BigInt bignum overflow (audit #544)
+[[bin]]
+name = "fuzz_plutus_bignum"
+path = "fuzz_targets/plutus_bignum.rs"
+doc = false
+
+# D10/D15: skip_cbor_value depth-limited recursion + indefinite string handling (audit #544)
+[[bin]]
+name = "fuzz_cbor_skip_value_depth"
+path = "fuzz_targets/cbor_skip_value_depth.rs"
+doc = false

@@ -20,6 +20,7 @@ pub mod mir;
 mod phase1;
 pub mod ppup;
 mod scripts;
+pub(crate) mod size_check;
 pub mod withdrawals;
 
 #[cfg(test)]
@@ -1128,6 +1129,15 @@ pub enum ValidationError {
         expected: dugite_primitives::network::NetworkId,
         actual: dugite_primitives::network::NetworkId,
     },
+    /// Pool registration: reward account has wrong length.
+    ///
+    /// A pool reward account must be exactly 29 bytes: 1 header byte followed by
+    /// a 28-byte credential hash (Blake2b-224). Any other length is rejected
+    /// by Haskell's `checkPoolParams` which deserialises the address strictly.
+    ///
+    /// Finding D8 of security audit #544.
+    #[error("Invalid pool reward account: {0}")]
+    InvalidRewardAccount(String),
     /// Auxiliary data hash content mismatch.
     ///
     /// When both `auxiliary_data_hash` and `auxiliary_data` are present in a

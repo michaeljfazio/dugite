@@ -807,6 +807,9 @@ pub(crate) fn convert_validation_error(
             numerator,
             denominator,
         },
+        VE::InvalidRewardAccount(msg) => TxValidationError::ScriptFailed {
+            reason: format!("InvalidRewardAccount: {msg}"),
+        },
     }
 }
 
