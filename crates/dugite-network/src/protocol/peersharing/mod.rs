@@ -87,12 +87,23 @@ pub fn decode_message(data: &[u8]) -> Result<PeerSharingMessage, String> {
             let mut addrs = Vec::new();
             match dec.datatype().map_err(|e| e.to_string())? {
                 Type::ArrayIndef => {
+                    // B11: Cap indefinite-array items at MAX_SHARED_ADDRS.
+                    // Without this a peer could stream thousands of addresses to
+                    // cause memory pressure and repeated allocation spikes.
                     dec.array().map_err(|e| e.to_string())?;
+                    let mut count: u64 = 0;
                     loop {
                         if dec.datatype().map_err(|e| e.to_string())? == Type::Break {
                             dec.skip().map_err(|e| e.to_string())?;
                             break;
                         }
+                        if count >= MAX_SHARED_ADDRS {
+                            return Err(format!(
+                                "MsgSharePeers: indefinite array exceeded max \
+                                 {MAX_SHARED_ADDRS} addresses"
+                            ));
+                        }
+                        count += 1;
                         addrs.push(decode_address(&mut dec)?);
                     }
                 }
@@ -192,29 +203,37 @@ fn decode_address(dec: &mut Decoder<'_>) -> Result<SocketAddr, String> {
 /// - RFC1918: 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16
 /// - CGNAT: 100.64.0.0/10
 /// - Loopback: 127.0.0.0/8
-/// - Link-local: 169.254.0.0/16
-/// - 0.0.0.0
+/// - Link-local: 169.254.0.0/16 (includes AWS/GCP/Azure metadata 169.254.169.254)
+/// - Documentation ranges: 192.0.2.0/24, 198.51.100.0/24, 203.0.113.0/24 (RFC 5737)
+/// - Multicast: 224.0.0.0/4
+/// - Reserved: 240.0.0.0/4, 255.255.255.255
+/// - 0.0.0.0 (unspecified)
 /// - IPv6 ULA: fc00::/7
 /// - IPv6 link-local: fe80::/10
 /// - IPv6 loopback: ::1
 /// - IPv6 unspecified: ::
+/// - IPv6 multicast: ff00::/8
+///
+/// B14: Mirrors cardano-node's `isRelayAddress` which excludes loopback, private,
+/// link-local, and multicast for both IPv4 and IPv6.  The link-local exclusion is
+/// critical because AWS/GCP/Azure metadata endpoints sit at 169.254.169.254.
 pub fn is_routable(addr: &IpAddr) -> bool {
     match addr {
         IpAddr::V4(ip) => {
             let octets = ip.octets();
-            // 10.0.0.0/8
+            // 10.0.0.0/8 (RFC1918)
             if octets[0] == 10 {
                 return false;
             }
-            // 172.16.0.0/12
+            // 172.16.0.0/12 (RFC1918)
             if octets[0] == 172 && (octets[1] & 0xF0) == 16 {
                 return false;
             }
-            // 192.168.0.0/16
+            // 192.168.0.0/16 (RFC1918)
             if octets[0] == 192 && octets[1] == 168 {
                 return false;
             }
-            // 100.64.0.0/10 (CGNAT)
+            // 100.64.0.0/10 (CGNAT, RFC6598)
             if octets[0] == 100 && (octets[1] & 0xC0) == 64 {
                 return false;
             }
@@ -222,11 +241,31 @@ pub fn is_routable(addr: &IpAddr) -> bool {
             if octets[0] == 127 {
                 return false;
             }
-            // 169.254.0.0/16 (link-local)
+            // 169.254.0.0/16 (link-local; includes cloud metadata 169.254.169.254)
             if octets[0] == 169 && octets[1] == 254 {
                 return false;
             }
-            // 0.0.0.0
+            // 192.0.2.0/24 (TEST-NET-1, RFC5737)
+            if octets[0] == 192 && octets[1] == 0 && octets[2] == 2 {
+                return false;
+            }
+            // 198.51.100.0/24 (TEST-NET-2, RFC5737)
+            if octets[0] == 198 && octets[1] == 51 && octets[2] == 100 {
+                return false;
+            }
+            // 203.0.113.0/24 (TEST-NET-3, RFC5737)
+            if octets[0] == 203 && octets[1] == 0 && octets[2] == 113 {
+                return false;
+            }
+            // 224.0.0.0/4 (multicast)
+            if octets[0] >= 224 && octets[0] <= 239 {
+                return false;
+            }
+            // 240.0.0.0/4 (reserved) and 255.255.255.255 (broadcast)
+            if octets[0] >= 240 {
+                return false;
+            }
+            // 0.0.0.0 (unspecified)
             if ip.is_unspecified() {
                 return false;
             }
@@ -248,6 +287,10 @@ pub fn is_routable(addr: &IpAddr) -> bool {
             }
             // fe80::/10 (link-local)
             if (segments[0] & 0xFFC0) == 0xFE80 {
+                return false;
+            }
+            // ff00::/8 (multicast)
+            if (segments[0] & 0xFF00) == 0xFF00 {
                 return false;
             }
             true
@@ -371,5 +414,112 @@ mod tests {
         assert!(is_routable(&IpAddr::V6(Ipv6Addr::new(
             0x2001, 0x0db8, 0, 0, 0, 0, 0, 1
         ))));
+    }
+
+    // ─── B14 new ranges ───
+
+    /// B14: RFC 5737 documentation ranges must be rejected (TEST-NET-1/2/3).
+    #[test]
+    fn non_routable_rfc5737_doc_ranges() {
+        // TEST-NET-1: 192.0.2.0/24
+        assert!(!is_routable(&IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1))));
+        assert!(!is_routable(&IpAddr::V4(Ipv4Addr::new(192, 0, 2, 255))));
+        // Adjacent /24 should be routable (not in 192.0.2.x).
+        assert!(is_routable(&IpAddr::V4(Ipv4Addr::new(192, 0, 3, 1))));
+
+        // TEST-NET-2: 198.51.100.0/24
+        assert!(!is_routable(&IpAddr::V4(Ipv4Addr::new(198, 51, 100, 0))));
+        assert!(!is_routable(&IpAddr::V4(Ipv4Addr::new(198, 51, 100, 200))));
+        assert!(is_routable(&IpAddr::V4(Ipv4Addr::new(198, 51, 99, 1))));
+
+        // TEST-NET-3: 203.0.113.0/24
+        assert!(!is_routable(&IpAddr::V4(Ipv4Addr::new(203, 0, 113, 1))));
+        assert!(!is_routable(&IpAddr::V4(Ipv4Addr::new(203, 0, 113, 254))));
+        assert!(is_routable(&IpAddr::V4(Ipv4Addr::new(203, 0, 114, 1))));
+    }
+
+    /// B14: IPv4 multicast (224.0.0.0/4) must be rejected.
+    #[test]
+    fn non_routable_ipv4_multicast() {
+        assert!(!is_routable(&IpAddr::V4(Ipv4Addr::new(224, 0, 0, 1))));
+        assert!(!is_routable(&IpAddr::V4(Ipv4Addr::new(239, 255, 255, 255))));
+        // 223.x.x.x is just below the multicast boundary — routable.
+        assert!(is_routable(&IpAddr::V4(Ipv4Addr::new(223, 0, 0, 1))));
+    }
+
+    /// B14: IPv4 reserved range (240.0.0.0/4) and broadcast must be rejected.
+    #[test]
+    fn non_routable_ipv4_reserved_and_broadcast() {
+        assert!(!is_routable(&IpAddr::V4(Ipv4Addr::new(240, 0, 0, 1))));
+        assert!(!is_routable(&IpAddr::V4(Ipv4Addr::new(255, 255, 255, 255))));
+        assert!(!is_routable(&IpAddr::V4(Ipv4Addr::new(248, 0, 0, 1))));
+    }
+
+    /// B14: IPv6 multicast (ff00::/8) must be rejected.
+    #[test]
+    fn non_routable_ipv6_multicast() {
+        // ff02::1 (all nodes) and ff0e::1 (global scope multicast)
+        assert!(!is_routable(&IpAddr::V6(Ipv6Addr::new(
+            0xFF02, 0, 0, 0, 0, 0, 0, 1
+        ))));
+        assert!(!is_routable(&IpAddr::V6(Ipv6Addr::new(
+            0xFF0E, 0, 0, 0, 0, 0, 0, 1
+        ))));
+        // 0xFE00 is NOT multicast (fe00::/9 is below ff00::/8).
+        assert!(!is_routable(&IpAddr::V6(Ipv6Addr::new(
+            0xFE80, 0, 0, 0, 0, 0, 0, 1
+        ))));
+    }
+
+    /// B14: Cloud metadata endpoint 169.254.169.254 must be blocked (SSRF prevention).
+    #[test]
+    fn non_routable_cloud_metadata_endpoint() {
+        assert!(!is_routable(&IpAddr::V4(Ipv4Addr::new(169, 254, 169, 254))));
+        // Any 169.254.x.x is link-local.
+        assert!(!is_routable(&IpAddr::V4(Ipv4Addr::new(169, 254, 0, 1))));
+    }
+
+    /// B11: MsgSharePeers indefinite-length array beyond MAX_SHARED_ADDRS is rejected.
+    #[test]
+    fn msg_share_peers_indefinite_over_cap_rejected() {
+        // Build an indefinite-length MsgSharePeers with MAX_SHARED_ADDRS+1 entries.
+        let mut buf = Vec::new();
+        let mut enc = minicbor::Encoder::new(&mut buf);
+        enc.array(2).unwrap();
+        enc.u64(1).unwrap(); // TAG_SHARE_PEERS
+        enc.begin_array().unwrap(); // indefinite-length
+        for i in 0..=(MAX_SHARED_ADDRS as u8) {
+            // Each entry is a valid IPv4 address struct: [0, ip_u32, port_u16]
+            enc.array(3).unwrap();
+            enc.u8(0).unwrap();
+            enc.u32(u32::from(Ipv4Addr::new(1, 2, 3, i.wrapping_add(1))))
+                .unwrap();
+            enc.u16(3001).unwrap();
+        }
+        enc.end().unwrap(); // break
+        let result = decode_message(&buf);
+        assert!(
+            result.is_err(),
+            "over-cap indefinite array must be rejected"
+        );
+        let err = result.unwrap_err();
+        assert!(
+            err.contains("exceeded max"),
+            "error must mention cap: {err}"
+        );
+    }
+
+    /// B11: MsgSharePeers definite-length array beyond MAX_SHARED_ADDRS is rejected.
+    #[test]
+    fn msg_share_peers_definite_over_cap_rejected() {
+        let mut buf = Vec::new();
+        let mut enc = minicbor::Encoder::new(&mut buf);
+        enc.array(2).unwrap();
+        enc.u64(1).unwrap(); // TAG_SHARE_PEERS
+                             // definite array of MAX_SHARED_ADDRS+1 entries
+        enc.array(MAX_SHARED_ADDRS + 1).unwrap();
+        // No actual elements needed — the length check fires before reading items.
+        let result = decode_message(&buf);
+        assert!(result.is_err(), "over-cap definite array must be rejected");
     }
 }
