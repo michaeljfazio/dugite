@@ -97,6 +97,20 @@ pub enum ConsensusError {
     GenesisVrfKeyMismatch { expected: Hash32, got: Hash32 },
     #[error("OutsideForecastRange: {0}")]
     OutsideForecast(#[from] crate::forecast::OutsideForecastRange),
+    /// A block header field had the wrong byte length. Haskell cardano-base's
+    /// fixed-size DSIGN/VRF/KES newtypes reject these at CBOR decode time via
+    /// `decodeSignedDSIGN`/`decodeVerKeyVRF`/`decodeVerKeyKES` and
+    /// `failSizeCheck`. Pallas decodes header fields as variable-length `Bytes`,
+    /// so dugite enforces the invariant here. Sibling of #537/#538's
+    /// witness-class `InvalidWitnessSignature`.
+    #[error(
+        "Malformed header field `{field}`: expected {expected_len} bytes, got {actual_len} bytes"
+    )]
+    MalformedHeaderField {
+        field: &'static str,
+        expected_len: usize,
+        actual_len: usize,
+    },
 }
 
 /// Information about a registered pool needed for full block validation.
@@ -299,6 +313,100 @@ impl OuroborosPraos {
         self.strict_verification = strict;
     }
 
+    /// Pre-flight structural check: reject malformed-size header fields in
+    /// strict mode (issue #539).
+    ///
+    /// Haskell cardano-base's fixed-size DSIGN/VRF/KES newtypes reject
+    /// wrong-length fields at CBOR decode time via `failSizeCheck`
+    /// (`decodeSignedDSIGN`, `decodeVerKeyVRF`, `decodeVerKeyKES`,
+    /// cardano-protocol-tpraos' OCert decoder). Pallas decodes header fields
+    /// as variable-length `Bytes`, so this gap is enforced here.
+    ///
+    /// Conceptually runs at the same point as Haskell's CBOR decode — before
+    /// any cryptographic verification — so a header with an attacker-supplied
+    /// wrong-length `issuer_vkey`/`vrf_vkey`/`vrf_result.output`/`opcert.sigma`
+    /// cannot reach (and silently bypass) the VRF leader check or opcert
+    /// signature verification path. The downstream `validate_header`,
+    /// `validate_header_full`, and `verify_header_crypto` entry points all
+    /// call this helper.
+    ///
+    /// Empty fields are deliberately NOT covered here: they are reported as
+    /// `EmptyIssuerVkey` / `EmptyVrfKey` / `InvalidOperationalCert` by other
+    /// checks so callers get the most specific predicate (preserving
+    /// pre-#539 diagnostics for that class of malformed header).
+    ///
+    /// In non-strict mode (initial sync), wrong sizes are logged at `debug`
+    /// and `Ok(())` is returned, matching the pre-#539 silent-skip behaviour
+    /// for the downstream verify sites.
+    pub fn check_header_field_sizes(
+        header: &BlockHeader,
+        strict: bool,
+    ) -> Result<(), ConsensusError> {
+        // Empty fields are handled by their own dedicated predicates upstream;
+        // skip them here so we don't override more specific errors.
+        let issuer_vkey_len = header.issuer_vkey.len();
+        if issuer_vkey_len != 0 && issuer_vkey_len != 32 {
+            if strict {
+                return Err(ConsensusError::MalformedHeaderField {
+                    field: "issuer_vkey",
+                    expected_len: 32,
+                    actual_len: issuer_vkey_len,
+                });
+            }
+            debug!(
+                slot = header.slot.0,
+                actual_len = issuer_vkey_len,
+                "Praos: malformed issuer_vkey size (non-strict, skipping crypto)"
+            );
+        }
+        let vrf_vkey_len = header.vrf_vkey.len();
+        if vrf_vkey_len != 0 && vrf_vkey_len != 32 {
+            if strict {
+                return Err(ConsensusError::MalformedHeaderField {
+                    field: "vrf_vkey",
+                    expected_len: 32,
+                    actual_len: vrf_vkey_len,
+                });
+            }
+            debug!(
+                slot = header.slot.0,
+                actual_len = vrf_vkey_len,
+                "Praos: malformed vrf_vkey size (non-strict, skipping crypto)"
+            );
+        }
+        let vrf_output_len = header.vrf_result.output.len();
+        if vrf_output_len != 0 && vrf_output_len != 64 {
+            if strict {
+                return Err(ConsensusError::MalformedHeaderField {
+                    field: "vrf_result.output",
+                    expected_len: 64,
+                    actual_len: vrf_output_len,
+                });
+            }
+            debug!(
+                slot = header.slot.0,
+                actual_len = vrf_output_len,
+                "Praos: malformed vrf_result.output size (non-strict, skipping leader check)"
+            );
+        }
+        let sigma_len = header.operational_cert.sigma.len();
+        if sigma_len != 0 && sigma_len != 64 {
+            if strict {
+                return Err(ConsensusError::MalformedHeaderField {
+                    field: "opcert.sigma",
+                    expected_len: 64,
+                    actual_len: sigma_len,
+                });
+            }
+            debug!(
+                slot = header.slot.0,
+                actual_len = sigma_len,
+                "Praos: malformed opcert.sigma size (non-strict, skipping opcert verify)"
+            );
+        }
+        Ok(())
+    }
+
     /// Extract the parameters needed for standalone cryptographic verification.
     /// Used to run VRF/KES/opcert verification in parallel (via rayon)
     /// without holding a mutable reference to the consensus engine.
@@ -379,6 +487,11 @@ impl OuroborosPraos {
             warn!("Praos: empty VRF key");
             return Err(ConsensusError::EmptyVrfKey);
         }
+
+        // Structural field-size checks (issue #539). Equivalent to Haskell's
+        // CBOR decode-time `failSizeCheck` — must precede any cryptographic
+        // verification so wrong-length fields cannot silently bypass them.
+        Self::check_header_field_sizes(header, self.strict_verification)?;
 
         // Protocol version checks (Haskell's envelopeChecks):
         // 1. ObsoleteNode: the ledger's current PV exceeds our node's max — we can't
@@ -506,6 +619,12 @@ impl OuroborosPraos {
             return Err(ConsensusError::EmptyVrfKey);
         }
 
+        // 1a. Structural field-size checks (issue #539). Equivalent to
+        // Haskell's CBOR decode-time `failSizeCheck` — must precede any
+        // cryptographic verification (including the VRF leader threshold,
+        // BFT-overlay VRF key binding, and opcert signature checks below).
+        Self::check_header_field_sizes(header, self.strict_verification)?;
+
         // 1b. Protocol version checks (Haskell's envelopeChecks):
         // ObsoleteNode: ledger PV exceeds node max — node must be upgraded.
         // HeaderProtVerTooHigh: block header PV more than one major version ahead of ledger.
@@ -621,7 +740,11 @@ impl OuroborosPraos {
                             );
                         }
 
-                        // c. Verify VRF key matches the delegate's registered VRF key hash
+                        // c. Verify VRF key matches the delegate's registered VRF key hash.
+                        // Wrong-size vrf_vkey is rejected upstream by
+                        // `check_header_field_sizes` (issue #539); the inline length guard
+                        // remains as defense-in-depth for the non-strict / future-caller
+                        // path so a malformed header can never silently bypass binding.
                         if header.vrf_vkey.len() == 32 {
                             let header_vrf_hash = blake2b_256(&header.vrf_vkey);
                             if header_vrf_hash != *delegate_vrf_hash {
@@ -638,6 +761,14 @@ impl OuroborosPraos {
                                     "Praos: genesis delegate VRF key mismatch (non-fatal during sync)"
                                 );
                             }
+                        } else {
+                            // Should be unreachable in strict mode (check_header_field_sizes
+                            // already rejected). Logged at debug for non-strict mode.
+                            debug!(
+                                slot = header.slot.0,
+                                vrf_vkey_len = header.vrf_vkey.len(),
+                                "Praos: skipping genesis delegate VRF binding — malformed vrf_vkey size"
+                            );
                         }
 
                         // d. NO leader threshold check — BFT delegate is entitled by schedule
@@ -683,7 +814,11 @@ impl OuroborosPraos {
         // 3. Pool-aware checks (only when issuer info is available)
         if let Some(info) = issuer_info {
             // Verify VRF key binding: Blake2b-256(header.vrf_vkey) must match
-            // the pool's registered VRF key hash
+            // the pool's registered VRF key hash. Wrong-size vrf_vkey is
+            // rejected upstream by `check_header_field_sizes` (issue #539);
+            // the inline length guard remains as defense-in-depth so this
+            // function is self-defensible if invoked through any future path
+            // that bypasses the pre-flight.
             if header.vrf_vkey.len() == 32 {
                 let header_vrf_hash = blake2b_256(&header.vrf_vkey);
                 if *header_vrf_hash.as_bytes() != *info.vrf_keyhash.as_bytes() {
@@ -699,6 +834,12 @@ impl OuroborosPraos {
                         "Praos: VRF key hash mismatch (non-fatal during sync)"
                     );
                 }
+            } else {
+                debug!(
+                    slot = header.slot.0,
+                    vrf_vkey_len = header.vrf_vkey.len(),
+                    "Praos: skipping pool VRF binding — malformed vrf_vkey size (should be pre-empted in strict mode)"
+                );
             }
 
             // Verify VRF leader eligibility: the VRF output must satisfy the
@@ -707,6 +848,11 @@ impl OuroborosPraos {
             // Haskell's taylorExpCmp / pallas-math implementation.
             // Both sigma (relative stake) and f (active slot coeff) are passed
             // as exact rationals to avoid f64 precision loss at boundaries.
+            //
+            // Wrong-size `vrf_result.output` is rejected upstream by
+            // `check_header_field_sizes` (issue #539) so the leader check
+            // cannot be silently skipped by a malformed header. The inline
+            // length guard remains for defense in depth.
             if header.vrf_result.output.len() == 64 {
                 // Praos (Babbage/Conway, protocol >= 7): Blake2b-256("L" || vrf_output), certNatMax = 2^256
                 // TPraos (Shelley-Alonzo, protocol < 7): raw 64-byte vrf_output, certNatMax = 2^512
@@ -1197,6 +1343,11 @@ impl OuroborosPraos {
         // Verify the operational certificate signature:
         // The cold key (issuer_vkey) signs raw bytes: hot_vkey(32) || counter(8 BE) || kes_period(8 BE)
         // per the Haskell OCertSignable format.
+        //
+        // Wrong-size `issuer_vkey` or `opcert.sigma` is rejected upstream by
+        // `check_header_field_sizes` (issue #539); the inline length guard
+        // remains as defense-in-depth so a malformed header can never
+        // silently bypass the cold-key signature verification.
         if header.issuer_vkey.len() == 32 && opcert.sigma.len() == 64 {
             match verify_opcert_signature(
                 &header.issuer_vkey,
@@ -1215,6 +1366,12 @@ impl OuroborosPraos {
                     debug!("Opcert signature verification deferred (non-strict mode): {e}");
                 }
             }
+        } else {
+            debug!(
+                issuer_vkey_len = header.issuer_vkey.len(),
+                sigma_len = opcert.sigma.len(),
+                "Praos: skipping opcert verify — malformed field size (should be pre-empted in strict mode)"
+            );
         }
 
         Ok(())
@@ -1395,6 +1552,9 @@ impl OuroborosPraos {
         params: &CryptoVerificationParams,
         header: &BlockHeader,
     ) -> Result<(), ConsensusError> {
+        // Structural field-size checks (issue #539) precede crypto verification,
+        // matching Haskell's CBOR decode-time `failSizeCheck`.
+        Self::check_header_field_sizes(header, params.strict_verification)?;
         Self::verify_vrf_proof_static(params, header)?;
         Self::verify_opcert_static(params, header)?;
         Self::verify_kes_signature_static(params, header)?;
@@ -1451,6 +1611,9 @@ impl OuroborosPraos {
             return Err(ConsensusError::InvalidOperationalCert);
         }
 
+        // Wrong-size `issuer_vkey` or `opcert.sigma` is rejected upstream by
+        // `check_header_field_sizes` (issue #539); the inline length guard
+        // remains as defense-in-depth.
         if header.issuer_vkey.len() == 32 && opcert.sigma.len() == 64 {
             if let Err(e) = verify_opcert_signature(
                 &header.issuer_vkey,
@@ -1619,7 +1782,12 @@ mod tests {
         }
     }
 
-    /// Create a valid test header at the given slot
+    /// Create a valid test header at the given slot.
+    ///
+    /// Uses Praos-legal sizes for all structural fields (issue #539):
+    /// `issuer_vkey`/`vrf_vkey`/`hot_vkey` = 32 bytes, `vrf_result.output` = 64
+    /// bytes (Praos), `vrf_result.proof` = 80 bytes, `sigma` = 64 bytes. Tests
+    /// that want to exercise wrong-size cases override the field explicitly.
     fn make_valid_header(slot: u64) -> BlockHeader {
         BlockHeader {
             header_hash: Hash32::ZERO,
@@ -1627,7 +1795,7 @@ mod tests {
             issuer_vkey: vec![1u8; 32],
             vrf_vkey: vec![2u8; 32],
             vrf_result: dugite_primitives::block::VrfOutput {
-                output: vec![0u8; 32],
+                output: vec![0u8; 64],
                 proof: vec![0u8; 80],
             },
             nonce_vrf_output: vec![],
@@ -3296,10 +3464,12 @@ mod tests {
         praos.set_strict_verification(true);
 
         let mut header = make_valid_header(100);
-        // Set VRF key/proof to valid sizes but garbage data
+        // Set VRF key/proof to valid sizes but garbage data. Output stays at
+        // the Praos-legal 64 bytes (see #539) so the structural size check
+        // doesn't pre-empt the VRF crypto failure this test is asserting.
         header.vrf_vkey = vec![99u8; 32];
         header.vrf_result.proof = vec![88u8; 80];
-        header.vrf_result.output = vec![77u8; 32];
+        header.vrf_result.output = vec![77u8; 64];
 
         let result = praos.validate_header(&header, SlotNo(200), ValidationMode::Full, Some(9));
         assert!(
@@ -4165,6 +4335,453 @@ mod tests {
             matches!(b, Err(ConsensusError::ObsoleteNode { .. })),
             "path B: expected ObsoleteNode, got {b:?}"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // Issue #539 — malformed header field rejection (sibling of #537/#538)
+    //
+    // Haskell cardano-base's fixed-size DSIGN/VRF/KES newtypes reject wrong-
+    // length fields at CBOR decode time via `failSizeCheck`. Pallas decodes
+    // header fields as variable-length `Bytes`, so dugite enforces the
+    // invariant in header validation. Previously the affected sites used
+    // `if len == expected { check }` and silently passed wrong-size headers.
+    //
+    // Five affected sites in `praos.rs`:
+    //   - `:625`  BFT-overlay VRF key binding (genesis delegate)
+    //   - `:687`  Pool VRF key binding (Praos path)
+    //   - `:710`  VRF leader threshold check
+    //   - `:1200` Opcert signature verification (instance method)
+    //   - `:1454` Opcert signature verification (standalone path)
+    // -----------------------------------------------------------------------
+
+    use crate::overlay::OverlayContext;
+    use std::collections::BTreeSet;
+
+    /// Build a minimal OverlayContext that maps slot 100 (within the first
+    /// epoch) to the active genesis delegate signing the supplied header.
+    /// `d = 1/1` (fully federated), `f = 1/20`.
+    fn make_overlay_ctx_active_at_slot_100(header: &BlockHeader) -> OverlayContext {
+        let genesis_key = blake2b_224(&[0xAAu8; 32]);
+        let delegate_key = blake2b_224(&header.issuer_vkey);
+        let delegate_vrf = if header.vrf_vkey.len() == 32 {
+            blake2b_256(&header.vrf_vkey)
+        } else {
+            Hash32::from_bytes([0u8; 32])
+        };
+
+        let mut genesis_delegates = HashMap::new();
+        genesis_delegates.insert(genesis_key, (delegate_key, delegate_vrf));
+        let mut genesis_keys = BTreeSet::new();
+        genesis_keys.insert(genesis_key);
+
+        OverlayContext {
+            genesis_delegates,
+            genesis_keys,
+            d: (1, 1),
+            first_slot_of_epoch: 0,
+        }
+    }
+
+    fn pool_issuer_info_for(header: &BlockHeader) -> BlockIssuerInfo {
+        let vrf_keyhash = if header.vrf_vkey.len() == 32 {
+            blake2b_256(&header.vrf_vkey)
+        } else {
+            Hash32::from_bytes([0u8; 32])
+        };
+        BlockIssuerInfo {
+            vrf_keyhash,
+            pool_stake: 1,
+            total_active_stake: 1,
+        }
+    }
+
+    fn malformed(err: &ConsensusError, field: &str) -> bool {
+        matches!(
+            err,
+            ConsensusError::MalformedHeaderField { field: f, .. } if *f == field
+        )
+    }
+
+    // ---- Site :625 — BFT overlay VRF key binding ------------------------
+
+    #[test]
+    fn issue_539_bft_overlay_short_vrf_vkey_strict_rejects() {
+        let mut praos = OuroborosPraos::new(11);
+        praos.set_strict_verification(true);
+        let mut header = make_valid_header(100);
+        header.vrf_vkey = vec![2u8; 31]; // wrong size — should reject in strict mode
+        let ctx = make_overlay_ctx_active_at_slot_100(&header);
+        // Restore vrf_vkey AFTER ctx so ctx has a stable delegate_vrf for the
+        // valid-size baseline; the test mutates header.vrf_vkey AFTER ctx.
+        header.vrf_vkey = vec![2u8; 31];
+        let result = praos.validate_header_full(
+            &header,
+            SlotNo(200),
+            None,
+            Some(&ctx),
+            ValidationMode::Full,
+            Some(9),
+            None,
+        );
+        match result {
+            Err(ref e) if malformed(e, "vrf_vkey") => {}
+            other => panic!("expected MalformedHeaderField {{ field: vrf_vkey }}, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn issue_539_bft_overlay_short_vrf_vkey_non_strict_ok() {
+        let praos = OuroborosPraos::new(11); // strict=false
+        let mut praos_mut = praos;
+        let mut header = make_valid_header(100);
+        header.vrf_vkey = vec![2u8; 31];
+        let ctx = make_overlay_ctx_active_at_slot_100(&header);
+        assert!(praos_mut
+            .validate_header_full(
+                &header,
+                SlotNo(200),
+                None,
+                Some(&ctx),
+                ValidationMode::Full,
+                Some(9),
+                None,
+            )
+            .is_ok());
+    }
+
+    // ---- Site :687 — Pool VRF key binding (Praos path) -------------------
+
+    #[test]
+    fn issue_539_pool_short_vrf_vkey_strict_rejects() {
+        let mut praos = OuroborosPraos::new(11);
+        praos.set_strict_verification(true);
+        let mut header = make_valid_header(100);
+        header.vrf_vkey = vec![2u8; 31];
+        let info = pool_issuer_info_for(&header);
+        let result = praos.validate_header_full(
+            &header,
+            SlotNo(200),
+            Some(&info),
+            None,
+            ValidationMode::Full,
+            Some(9),
+            None,
+        );
+        match result {
+            Err(ref e) if malformed(e, "vrf_vkey") => {}
+            other => panic!("expected MalformedHeaderField {{ field: vrf_vkey }}, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn issue_539_pool_long_vrf_vkey_strict_rejects() {
+        let mut praos = OuroborosPraos::new(11);
+        praos.set_strict_verification(true);
+        let mut header = make_valid_header(100);
+        header.vrf_vkey = vec![2u8; 33];
+        let info = pool_issuer_info_for(&header);
+        let result = praos.validate_header_full(
+            &header,
+            SlotNo(200),
+            Some(&info),
+            None,
+            ValidationMode::Full,
+            Some(9),
+            None,
+        );
+        assert!(
+            matches!(&result, Err(e) if malformed(e, "vrf_vkey")),
+            "expected MalformedHeaderField {{ field: vrf_vkey }}, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn issue_539_pool_short_vrf_vkey_non_strict_ok() {
+        let mut praos = OuroborosPraos::new(11); // strict=false
+        let mut header = make_valid_header(100);
+        header.vrf_vkey = vec![2u8; 31];
+        let info = pool_issuer_info_for(&header);
+        assert!(praos
+            .validate_header_full(
+                &header,
+                SlotNo(200),
+                Some(&info),
+                None,
+                ValidationMode::Full,
+                Some(9),
+                None,
+            )
+            .is_ok());
+    }
+
+    // ---- Site :710 — VRF leader threshold --------------------------------
+
+    #[test]
+    fn issue_539_pool_short_vrf_output_strict_rejects() {
+        let mut praos = OuroborosPraos::new(11);
+        praos.set_strict_verification(true);
+        praos.snapshots_established = true;
+        let mut header = make_valid_header(100);
+        header.vrf_result.output = vec![0u8; 63]; // wrong size: need 64
+        let info = pool_issuer_info_for(&header);
+        let result = praos.validate_header_full(
+            &header,
+            SlotNo(200),
+            Some(&info),
+            None,
+            ValidationMode::Full,
+            Some(9),
+            None,
+        );
+        assert!(
+            matches!(&result, Err(e) if malformed(e, "vrf_result.output")),
+            "expected MalformedHeaderField {{ field: vrf_result.output }}, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn issue_539_pool_long_vrf_output_strict_rejects() {
+        let mut praos = OuroborosPraos::new(11);
+        praos.set_strict_verification(true);
+        praos.snapshots_established = true;
+        let mut header = make_valid_header(100);
+        header.vrf_result.output = vec![0u8; 65]; // wrong size: need 64
+        let info = pool_issuer_info_for(&header);
+        let result = praos.validate_header_full(
+            &header,
+            SlotNo(200),
+            Some(&info),
+            None,
+            ValidationMode::Full,
+            Some(9),
+            None,
+        );
+        assert!(
+            matches!(&result, Err(e) if malformed(e, "vrf_result.output")),
+            "expected MalformedHeaderField {{ field: vrf_result.output }}, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn issue_539_pool_short_vrf_output_non_strict_ok() {
+        let mut praos = OuroborosPraos::new(11); // strict=false
+        let mut header = make_valid_header(100);
+        header.vrf_result.output = vec![0u8; 63];
+        let info = pool_issuer_info_for(&header);
+        assert!(praos
+            .validate_header_full(
+                &header,
+                SlotNo(200),
+                Some(&info),
+                None,
+                ValidationMode::Full,
+                Some(9),
+                None,
+            )
+            .is_ok());
+    }
+
+    // ---- Site :1200 — opcert verify (instance method) --------------------
+
+    #[test]
+    fn issue_539_opcert_short_issuer_vkey_strict_rejects() {
+        let mut praos = OuroborosPraos::new(11);
+        praos.set_strict_verification(true);
+        let mut header = make_valid_header(100);
+        header.vrf_result.output = vec![0u8; 64]; // Praos-size baseline
+        header.issuer_vkey = vec![1u8; 31]; // wrong size: need 32
+        let result = praos.validate_header(&header, SlotNo(200), ValidationMode::Full, Some(9));
+        assert!(
+            matches!(&result, Err(e) if malformed(e, "issuer_vkey")),
+            "expected MalformedHeaderField {{ field: issuer_vkey }}, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn issue_539_opcert_short_sigma_strict_rejects() {
+        let mut praos = OuroborosPraos::new(11);
+        praos.set_strict_verification(true);
+        let mut header = make_valid_header(100);
+        header.vrf_result.output = vec![0u8; 64];
+        header.operational_cert.sigma = vec![4u8; 63]; // wrong size: need 64
+        let result = praos.validate_header(&header, SlotNo(200), ValidationMode::Full, Some(9));
+        assert!(
+            matches!(&result, Err(e) if malformed(e, "opcert.sigma")),
+            "expected MalformedHeaderField {{ field: opcert.sigma }}, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn issue_539_opcert_long_sigma_strict_rejects() {
+        let mut praos = OuroborosPraos::new(11);
+        praos.set_strict_verification(true);
+        let mut header = make_valid_header(100);
+        header.vrf_result.output = vec![0u8; 64];
+        header.operational_cert.sigma = vec![4u8; 65];
+        let result = praos.validate_header(&header, SlotNo(200), ValidationMode::Full, Some(9));
+        assert!(
+            matches!(&result, Err(e) if malformed(e, "opcert.sigma")),
+            "expected MalformedHeaderField {{ field: opcert.sigma }}, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn issue_539_opcert_short_sigma_non_strict_ok() {
+        let praos = OuroborosPraos::new(11); // strict=false
+        let mut header = make_valid_header(100);
+        header.operational_cert.sigma = vec![4u8; 63];
+        assert!(praos
+            .validate_header(&header, SlotNo(200), ValidationMode::Full, Some(9))
+            .is_ok());
+    }
+
+    // ---- Site :1454 — opcert verify (standalone path) --------------------
+
+    #[test]
+    fn issue_539_opcert_static_short_issuer_vkey_strict_rejects() {
+        let params = CryptoVerificationParams {
+            strict_verification: true,
+            slots_per_kes_period: KES_PERIOD_SLOTS,
+            max_kes_evolutions: MAX_KES_EVOLUTIONS,
+        };
+        let mut header = make_valid_header(100);
+        header.vrf_result.output = vec![0u8; 64]; // Praos-size baseline
+        header.issuer_vkey = vec![1u8; 31];
+        let result = OuroborosPraos::verify_header_crypto(&params, &header);
+        assert!(
+            matches!(&result, Err(e) if malformed(e, "issuer_vkey")),
+            "expected MalformedHeaderField {{ field: issuer_vkey }}, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn issue_539_opcert_static_short_sigma_strict_rejects() {
+        let params = CryptoVerificationParams {
+            strict_verification: true,
+            slots_per_kes_period: KES_PERIOD_SLOTS,
+            max_kes_evolutions: MAX_KES_EVOLUTIONS,
+        };
+        let mut header = make_valid_header(100);
+        header.vrf_result.output = vec![0u8; 64];
+        header.operational_cert.sigma = vec![4u8; 63];
+        let result = OuroborosPraos::verify_header_crypto(&params, &header);
+        assert!(
+            matches!(&result, Err(e) if malformed(e, "opcert.sigma")),
+            "expected MalformedHeaderField {{ field: opcert.sigma }}, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn issue_539_opcert_static_short_sigma_non_strict_ok() {
+        let params = CryptoVerificationParams {
+            strict_verification: false,
+            slots_per_kes_period: KES_PERIOD_SLOTS,
+            max_kes_evolutions: MAX_KES_EVOLUTIONS,
+        };
+        let mut header = make_valid_header(100);
+        header.operational_cert.sigma = vec![4u8; 63];
+        assert!(OuroborosPraos::verify_header_crypto(&params, &header).is_ok());
+    }
+
+    // ---- Length-lattice property test for the pool VRF key binding -------
+    //
+    // For each malformed (length != 32) `vrf_vkey`, validate_header_full in
+    // strict mode must reject with MalformedHeaderField. The 32-byte case
+    // is exercised by other tests (it should NOT trigger this predicate).
+
+    #[test]
+    fn issue_539_vrf_vkey_length_lattice_strict_rejects() {
+        for vkey_len in [1usize, 16, 31, 33, 48, 64, 128] {
+            // Need a fresh praos per iteration because validate_header_full
+            // mutates opcert_counters.
+            let mut praos = OuroborosPraos::new(11);
+            praos.set_strict_verification(true);
+            let mut header = make_valid_header(100);
+            header.vrf_vkey = vec![2u8; vkey_len];
+            // Make issuer_info irrelevant by giving a matching-but-junk hash;
+            // the malformed-size predicate should fire BEFORE the hash check.
+            let info = pool_issuer_info_for(&header);
+            let result = praos.validate_header_full(
+                &header,
+                SlotNo(200),
+                Some(&info),
+                None,
+                ValidationMode::Full,
+                Some(9),
+                None,
+            );
+            assert!(
+                matches!(&result, Err(e) if malformed(e, "vrf_vkey")),
+                "vkey_len={vkey_len}: expected MalformedHeaderField {{ field: vrf_vkey }}, got {result:?}"
+            );
+        }
+    }
+
+    // Property test: across the full malformed-size space (lengths in
+    // 0..=512, every combination of the four fields), strict-mode
+    // pre-flight must (a) never panic and (b) reject whenever at least
+    // one non-empty field has a non-canonical length. Empty fields are
+    // delegated upstream (covered by `EmptyIssuerVkey`, `EmptyVrfKey`,
+    // `InvalidOperationalCert`) and are intentionally `Ok` here.
+    //
+    // Uses `proptest` (already in workspace dev-deps) for shrinking.
+    proptest::proptest! {
+        #[test]
+        fn issue_539_check_header_field_sizes_strict_invariants(
+            issuer_vkey_len in 0usize..=512,
+            vrf_vkey_len in 0usize..=512,
+            vrf_output_len in 0usize..=512,
+            sigma_len in 0usize..=512,
+        ) {
+            let mut header = make_valid_header(100);
+            header.issuer_vkey = vec![0u8; issuer_vkey_len];
+            header.vrf_vkey = vec![0u8; vrf_vkey_len];
+            header.vrf_result.output = vec![0u8; vrf_output_len];
+            header.operational_cert.sigma = vec![0u8; sigma_len];
+
+            let any_malformed = (issuer_vkey_len != 0 && issuer_vkey_len != 32)
+                || (vrf_vkey_len != 0 && vrf_vkey_len != 32)
+                || (vrf_output_len != 0 && vrf_output_len != 64)
+                || (sigma_len != 0 && sigma_len != 64);
+
+            let strict_result = OuroborosPraos::check_header_field_sizes(&header, true);
+            let non_strict_result = OuroborosPraos::check_header_field_sizes(&header, false);
+
+            // Non-strict mode never rejects (preserves pre-#539 silent-skip).
+            proptest::prop_assert!(
+                non_strict_result.is_ok(),
+                "non-strict must never reject: {non_strict_result:?}"
+            );
+
+            if any_malformed {
+                proptest::prop_assert!(
+                    matches!(&strict_result, Err(ConsensusError::MalformedHeaderField { .. })),
+                    "strict mode must reject malformed: got {strict_result:?}"
+                );
+            } else {
+                proptest::prop_assert!(
+                    strict_result.is_ok(),
+                    "strict mode with canonical/empty sizes must accept: {strict_result:?}"
+                );
+            }
+        }
+    }
+
+    // Length-lattice property test for the opcert.sigma case.
+    #[test]
+    fn issue_539_opcert_sigma_length_lattice_strict_rejects() {
+        for sig_len in [1usize, 32, 63, 65, 96, 128] {
+            let mut praos = OuroborosPraos::new(11);
+            praos.set_strict_verification(true);
+            let mut header = make_valid_header(100);
+            header.vrf_result.output = vec![0u8; 64]; // Praos-size baseline
+            header.operational_cert.sigma = vec![4u8; sig_len];
+            let result = praos.validate_header(&header, SlotNo(200), ValidationMode::Full, Some(9));
+            assert!(
+                matches!(&result, Err(e) if malformed(e, "opcert.sigma")),
+                "sig_len={sig_len}: expected MalformedHeaderField {{ field: opcert.sigma }}, got {result:?}"
+            );
+        }
     }
 }
 
