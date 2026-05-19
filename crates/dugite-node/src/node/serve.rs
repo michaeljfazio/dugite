@@ -797,6 +797,9 @@ pub(crate) fn convert_validation_error(
         VE::PVCannotFollowPPUP { bad_pv } => TxValidationError::ScriptFailed {
             reason: format!("PVCannotFollowPPUP: bad_pv={bad_pv:?}"),
         },
+        VE::InvalidRewardAccount(msg) => TxValidationError::ScriptFailed {
+            reason: format!("InvalidRewardAccount: {msg}"),
+        },
     }
 }
 

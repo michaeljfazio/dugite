@@ -1600,13 +1600,25 @@ fn convert_relay(relay: &pallas_primitives::Relay) -> Option<Relay> {
                 arr
             }),
         }),
-        PR::SingleHostName(port, dns) => Some(Relay::SingleHostName {
-            port: port.map(|p| p as u16),
-            dns_name: dns.clone(),
-        }),
-        PR::MultiHostName(dns) => Some(Relay::MultiHostName {
-            dns_name: dns.clone(),
-        }),
+        PR::SingleHostName(port, dns) => {
+            // D13: dns_name CDDL limit is text .size (0..128).
+            // Reject oversized names to prevent unbounded heap allocation.
+            if dns.len() > 128 {
+                return None;
+            }
+            Some(Relay::SingleHostName {
+                port: port.map(|p| p as u16),
+                dns_name: dns.clone(),
+            })
+        }
+        PR::MultiHostName(dns) => {
+            if dns.len() > 128 {
+                return None;
+            }
+            Some(Relay::MultiHostName {
+                dns_name: dns.clone(),
+            })
+        }
     }
 }
 
