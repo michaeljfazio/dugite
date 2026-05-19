@@ -214,3 +214,18 @@ doc = false
 name = "fuzz_lsq_query_dispatch"
 path = "fuzz_targets/lsq_query_dispatch.rs"
 doc = false
+
+[[bin]]
+name = "fuzz_skip_cbor_value"
+path = "fuzz_targets/skip_cbor_value.rs"
+doc = false
+
+[[bin]]
+name = "fuzz_propose_versions"
+path = "fuzz_targets/propose_versions.rs"
+doc = false
+
+[[bin]]
+name = "fuzz_mux_ingress"
+path = "fuzz_targets/mux_ingress.rs"
+doc = false
