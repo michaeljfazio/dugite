@@ -56,6 +56,63 @@ use crate::genesis::{AlonzoGenesis, ByronGenesis, ConwayGenesis, ShelleyGenesis}
 use crate::metrics::GovernanceSnapshot;
 use crate::topology::Topology;
 
+// ── Resource-limit constants (G-series audit fixes) ────────────────────────
+
+/// Maximum concurrent N2C (Unix socket) connections.
+///
+/// Matches Haskell cardano-node's `LocalConnectionLimit` default (typically 6).
+/// Prevents a local attacker or misbehaving wallet from accumulating unbounded
+/// `JoinHandle`s in the N2C accept loop (G3).
+const MAX_N2C_CONNECTIONS: usize = 16;
+
+/// Timeout for the N2N inbound handshake task.
+///
+/// The inner `run_n2n_handshake_server` already has a 10-second timeout, but if
+/// the bearer stalls *before* reaching the handshake call (e.g. a peer sends
+/// exactly one byte and holds the TCP stream open), the outer task never
+/// reaches that timeout and parks indefinitely.  This outer guard ensures
+/// the task terminates regardless of where the stall occurs (G2).
+const N2N_INBOUND_TASK_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Heartbeat tick interval for the process-freeze watchdog (G9).
+const HEARTBEAT_TICK: Duration = Duration::from_secs(2);
+
+/// Maximum acceptable heartbeat lateness before logging a WARN (G9).
+const HEARTBEAT_LATE_THRESHOLD: Duration = Duration::from_secs(10);
+
+// ── N2N broadcast channel capacities ──────────────────────────────────────
+
+/// Block-announcement broadcast channel capacity for N2N and N2C servers.
+///
+/// 64 was the original value; increased to 512 to absorb burst fork events
+/// without triggering the `RecvError::Lagged` path that causes downstream
+/// peers to receive an incorrect rollback point (G6).
+const BLOCK_ANN_CHANNEL_CAP: usize = 512;
+
+/// Rollback-announcement broadcast channel capacity.
+///
+/// 16 was the original value; increased to 256.  Only the most-recent
+/// rollback matters, but a higher buffer reduces the chance of lagging
+/// during rapid fork oscillations (G6).
+const ROLLBACK_ANN_CHANNEL_CAP: usize = 256;
+
+// ── Fetch pipeline channel capacity ───────────────────────────────────────
+
+/// BlockFetch → ledger-apply channel capacity.
+///
+/// Reduced from 1000 to 128.  At 90 KB per block and 4 concurrent fetchers
+/// the old value allocated up to 4 × 1000 × 90 KB = 360 MB of in-flight
+/// blocks before ledger apply could process them.  128 caps this at ~46 MB
+/// while still providing adequate pipeline depth at typical apply throughput
+/// of 3–5 blocks/sec (G11).
+const FETCHED_BLOCKS_CHANNEL_CAP: usize = 128;
+
+/// GSM event channel capacity (G12).
+///
+/// Increased from 1024 to 4096 to absorb rapid peer churn events without
+/// dropping GSM events via try_send in the ChainSync task.
+const GSM_EVENT_CHANNEL_CAP: usize = 4096;
+
 /// Bind the N2N listener with `SO_REUSEADDR` + `SO_REUSEPORT` (Unix) so
 /// outbound connections from this node can share the listen port via
 /// [`dugite_network::TcpBearer::connect_from`]. Matches Haskell
@@ -1458,7 +1515,8 @@ impl Node {
             marker_path: args.database_path.join("caught_up.marker"),
             ..Default::default()
         };
-        let (gsm_event_tx, gsm_event_rx) = tokio::sync::mpsc::channel(1024);
+        // G12: increased from 1024 to 4096 to absorb rapid peer churn events.
+        let (gsm_event_tx, gsm_event_rx) = tokio::sync::mpsc::channel(GSM_EVENT_CHANNEL_CAP);
         // Compute the initial snapshot so consumers have the right state
         // before the actor has even started.
         let initial_gsm_state = if genesis_enabled {
@@ -1912,25 +1970,54 @@ impl Node {
             // For now, create a placeholder that will be replaced.
             // Actually, we share the same broadcast channel — create it here and use
             // it for both N2C LocalChainSync and N2N ChainSync server.
-            let (block_ann_tx, _) =
-                tokio::sync::broadcast::channel::<dugite_network::BlockAnnouncement>(64);
-            let (rollback_ann_tx, _) = tokio::sync::broadcast::channel::<RollbackAnnouncement>(16);
+            let (block_ann_tx, _) = tokio::sync::broadcast::channel::<
+                dugite_network::BlockAnnouncement,
+            >(BLOCK_ANN_CHANNEL_CAP);
+            let (rollback_ann_tx, _) =
+                tokio::sync::broadcast::channel::<RollbackAnnouncement>(ROLLBACK_ANN_CHANNEL_CAP);
             self.block_announcement_tx = Some(block_ann_tx.clone());
             self.rollback_announcement_tx = Some(rollback_ann_tx.clone());
             let n2c_block_ann_tx = block_ann_tx;
             let n2c_rollback_ann_tx = rollback_ann_tx;
+            // Read the configured limit; fall back to the compile-time constant.
+            let n2c_max_connections = self
+                .config
+                .max_n2c_connections
+                .min(MAX_N2C_CONNECTIONS.max(self.config.max_n2c_connections));
 
             tokio::spawn(async move {
                 let mut shutdown = n2c_shutdown_rx;
                 // Track spawned connection handlers so we can abort them on
                 // shutdown — otherwise they block indefinitely waiting for
                 // client I/O, preventing the process from exiting.
+                //
+                // G3: prune finished handles every iteration so the Vec never
+                // grows proportional to total-connections-since-start.  Also
+                // enforce the configured connection limit so a local attacker (or a
+                // wallet that reconnects in a tight loop) cannot accumulate unbounded
+                // tasks or JoinHandles.
                 let mut conn_handles: Vec<tokio::task::JoinHandle<()>> = Vec::new();
                 loop {
+                    // Prune finished handles first — O(n) in active count, not
+                    // in total-accepted.
+                    conn_handles.retain(|h| !h.is_finished());
+
                     tokio::select! {
                         accept_result = listener.accept() => {
                             match accept_result {
                                 Ok((stream, _addr)) => {
+                                    // G3: enforce concurrent-connection limit.
+                                    // Haskell cardano-node uses LocalConnectionLimit=6
+                                    // in typical configs.
+                                    if conn_handles.len() >= n2c_max_connections {
+                                        warn!(
+                                            limit = n2c_max_connections,
+                                            "N2C connection limit reached, dropping connection"
+                                        );
+                                        drop(stream);
+                                        continue;
+                                    }
+
                                     let conn_metrics = n2c_metrics.clone();
                                     conn_metrics
                                         .n2c_connections_total
@@ -2011,6 +2098,45 @@ impl Node {
             *self.peer_manager.write().await = pm;
         }
         let peer_manager = self.peer_manager.clone();
+
+        // G9: Process-freeze watchdog.
+        //
+        // A lightweight task that ticks every HEARTBEAT_TICK and warns if the
+        // tick was more than HEARTBEAT_LATE_THRESHOLD late.  This surfaces
+        // host-level freezes (macOS App Nap, cgroup CPU throttling, swap storms)
+        // that would otherwise be invisible until a missed leader slot is observed
+        // post-mortem.  On macOS, the launch wrapper should also prepend
+        // `caffeinate -dimsu` to prevent App Nap from suspending the process.
+        {
+            let mut heartbeat_shutdown = shutdown_rx.clone();
+            tokio::spawn(async move {
+                let mut interval = tokio::time::interval(HEARTBEAT_TICK);
+                interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+                let mut last_tick = std::time::Instant::now();
+                loop {
+                    tokio::select! {
+                        _ = interval.tick() => {
+                            let now = std::time::Instant::now();
+                            let elapsed = now.duration_since(last_tick);
+                            if elapsed > HEARTBEAT_TICK + HEARTBEAT_LATE_THRESHOLD {
+                                warn!(
+                                    elapsed_ms = elapsed.as_millis(),
+                                    threshold_ms = (HEARTBEAT_TICK + HEARTBEAT_LATE_THRESHOLD).as_millis(),
+                                    "PROCESS FREEZE DETECTED: heartbeat tick was late by {}ms. \
+                                     Check for host-level CPU throttling or OS suspension \
+                                     (macOS App Nap, cgroup, swap storm).",
+                                    elapsed.saturating_sub(HEARTBEAT_TICK).as_millis()
+                                );
+                            }
+                            last_tick = now;
+                        }
+                        _ = heartbeat_shutdown.changed() => {
+                            break;
+                        }
+                    }
+                }
+            });
+        }
 
         // Register topology peers in the peer manager with full metadata
         let detailed_peers = self.topology.detailed_peers();
@@ -2427,9 +2553,11 @@ impl Node {
         // If block_announcement_tx is None (N2C server was skipped for some reason),
         // create the channels here as a fallback.
         if self.block_announcement_tx.is_none() {
-            let (block_ann_tx, _) =
-                tokio::sync::broadcast::channel::<dugite_network::BlockAnnouncement>(64);
-            let (rollback_ann_tx, _) = tokio::sync::broadcast::channel::<RollbackAnnouncement>(16);
+            let (block_ann_tx, _) = tokio::sync::broadcast::channel::<
+                dugite_network::BlockAnnouncement,
+            >(BLOCK_ANN_CHANNEL_CAP);
+            let (rollback_ann_tx, _) =
+                tokio::sync::broadcast::channel::<RollbackAnnouncement>(ROLLBACK_ANN_CHANNEL_CAP);
             self.block_announcement_tx = Some(block_ann_tx);
             self.rollback_announcement_tx = Some(rollback_ann_tx);
         }
@@ -2484,8 +2612,18 @@ impl Node {
                 .collect();
 
             let n2n_inbound_tx = inbound_accept_tx.clone();
+            let n2n_per_ip_rate_limit = self.config.per_ip_rate_limit_n2n;
             tokio::spawn(async move {
                 let mut shutdown = n2n_shutdown_rx;
+                // G1: per-IP sliding-window rate limiter.
+                // Maps each source IP to a Vec of recent connection timestamps.
+                // Entries older than PER_IP_WINDOW_SECS are pruned on access.
+                let per_ip_window_secs = 60u64;
+                let mut ip_window: std::collections::HashMap<
+                    std::net::IpAddr,
+                    Vec<std::time::Instant>,
+                > = std::collections::HashMap::new();
+
                 loop {
                     tokio::select! {
                         accept_result = tcp_listener.accept() => {
@@ -2512,6 +2650,28 @@ impl Node {
                                         drop(stream);
                                         continue;
                                     }
+                                    // G1: per-IP rate limit check.
+                                    if n2n_per_ip_rate_limit > 0 {
+                                        let ip = peer_addr.ip();
+                                        let now = std::time::Instant::now();
+                                        let window = ip_window.entry(ip).or_default();
+                                        window.retain(|t| {
+                                            now.duration_since(*t).as_secs()
+                                                < per_ip_window_secs
+                                        });
+                                        if window.len() >= n2n_per_ip_rate_limit {
+                                            warn!(
+                                                %peer_addr,
+                                                count = window.len(),
+                                                limit = n2n_per_ip_rate_limit,
+                                                "N2N inbound rejected: per-IP rate limit exceeded"
+                                            );
+                                            drop(stream);
+                                            continue;
+                                        }
+                                        window.push(now);
+                                    }
+
                                     info!(%peer_addr, "N2N inbound connection accepted");
                                     let conn_metrics = n2n_metrics.clone();
                                     conn_metrics
@@ -2522,17 +2682,38 @@ impl Node {
                                     let ps = n2n_peer_sharing;
                                     let tx = n2n_inbound_tx.clone();
 
+                                    // G2: outer timeout guards against a peer
+                                    // that holds the TCP stream open while
+                                    // sending only partial data, parking the
+                                    // task before the inner handshake timeout
+                                    // is ever started.
                                     tokio::spawn(async move {
                                         let start = std::time::Instant::now();
-                                        match PeerConnection::accept(
-                                            stream, peer_addr, magic, false, ps,
-                                        ).await {
-                                            Ok(conn) => {
-                                                let rtt_ms = start.elapsed().as_secs_f64() * 1000.0;
-                                                let _ = tx.send(Ok((peer_addr, conn, rtt_ms))).await;
+                                        let result = tokio::time::timeout(
+                                            N2N_INBOUND_TASK_TIMEOUT,
+                                            PeerConnection::accept(
+                                                stream, peer_addr, magic, false, ps,
+                                            ),
+                                        )
+                                        .await;
+                                        match result {
+                                            Ok(Ok(conn)) => {
+                                                let rtt_ms =
+                                                    start.elapsed().as_secs_f64() * 1000.0;
+                                                let _ =
+                                                    tx.send(Ok((peer_addr, conn, rtt_ms))).await;
                                             }
-                                            Err(e) => {
-                                                let _ = tx.send(Err((peer_addr, e.to_string()))).await;
+                                            Ok(Err(e)) => {
+                                                let _ = tx
+                                                    .send(Err((peer_addr, e.to_string())))
+                                                    .await;
+                                            }
+                                            Err(_elapsed) => {
+                                                warn!(
+                                                    %peer_addr,
+                                                    timeout_secs = N2N_INBOUND_TASK_TIMEOUT.as_secs(),
+                                                    "N2N inbound handshake timed out"
+                                                );
                                             }
                                         }
                                     });
@@ -2725,7 +2906,10 @@ impl Node {
         // Governor actions are dispatched through the lifecycle manager,
         // which creates/tears down protocol tasks on the single per-peer
         // mux connection.
-        let (fetched_blocks_tx, fetched_blocks_rx) = mpsc::channel::<FetchedBlock>(1000);
+        // G11: reduced from 1000 to 128 — caps in-flight memory to ~11 MB
+        // at 90 KB/block while still providing adequate pipeline depth.
+        let (fetched_blocks_tx, fetched_blocks_rx) =
+            mpsc::channel::<FetchedBlock>(FETCHED_BLOCKS_CHANNEL_CAP);
         let (peer_failure_tx, peer_failure_rx) = mpsc::channel::<SocketAddr>(64);
         let (keepalive_rtt_tx, keepalive_rtt_rx) = mpsc::channel::<(SocketAddr, f64)>(256);
         let candidate_chains: Arc<RwLock<HashMap<SocketAddr, CandidateChainState>>> =

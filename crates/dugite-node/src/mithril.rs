@@ -1078,14 +1078,74 @@ fn extract_archive(archive_path: &Path, extract_dir: &Path) -> Result<()> {
     archive.set_preserve_permissions(false);
     archive.set_overwrite(true);
 
+    // G13: path-traversal guard.
+    //
+    // `tar::Entry::unpack_in` already refuses paths containing `..` components
+    // and absolute paths (it returns `Ok(false)` for traversal attempts rather
+    // than actually writing the file).  We add two layers of explicit defense:
+    //
+    //  1. Reject any entry whose path starts with `..` or is absolute before
+    //     calling `unpack_in` — catches crafted entries that the `tar` crate
+    //     might silently skip rather than error on.
+    //  2. After `unpack_in`, the caller must ensure no symlink inside
+    //     `extract_dir` points outside it.  We do not follow symlinks during
+    //     extraction (`set_preserve_permissions(false)` already skips setuid);
+    //     `archive.set_unpack_xattrs(false)` is the default.
+    //
+    // Note: the STM certificate chain verification (Mithril aggregator
+    // signature) runs BEFORE extraction in the outer download flow (digest
+    // is checked after download, archive is extracted second), so a
+    // compromised aggregator is required to exploit this vector.  Defense
+    // in depth is still warranted.
+    archive.set_unpack_xattrs(false);
+
+    let canonical_extract_dir = extract_dir
+        .canonicalize()
+        .context("extract_dir canonicalize failed")?;
+
     for entry in archive
         .entries()
         .context("Failed to read archive entries")?
     {
         let mut entry = entry.context("Failed to read archive entry")?;
-        entry
-            .unpack_in(extract_dir)
+
+        // Explicit path-traversal check (G13 layer 1).
+        // Collect the path into an owned PathBuf before the mutable borrow
+        // for unpack_in so that the borrow checker is satisfied.
+        let entry_path: std::path::PathBuf = entry
+            .path()
+            .context("Failed to read entry path")?
+            .into_owned();
+        if entry_path.is_absolute() {
+            anyhow::bail!(
+                "Mithril archive contains absolute path: {}",
+                entry_path.display()
+            );
+        }
+        for component in entry_path.components() {
+            if component == std::path::Component::ParentDir {
+                anyhow::bail!(
+                    "Mithril archive contains path-traversal component: {}",
+                    entry_path.display()
+                );
+            }
+        }
+
+        let unpacked = entry
+            .unpack_in(&canonical_extract_dir)
             .context("Failed to extract entry")?;
+
+        if !unpacked {
+            // `unpack_in` returns false when it silently skips an entry (e.g.
+            // a traversal path or a file type it cannot handle).  Treat this
+            // as an error so crafted archives fail loudly rather than silently.
+            anyhow::bail!(
+                "Mithril archive entry was silently skipped by tar::unpack_in (possible \
+                 path traversal): {}",
+                entry_path.display()
+            );
+        }
+
         entry_count += 1;
         if entry_count.is_multiple_of(100) {
             pb.set_message(format!("{entry_count} entries extracted"));
