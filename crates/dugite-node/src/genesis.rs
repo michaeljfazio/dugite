@@ -367,38 +367,37 @@ impl ShelleyGenesis {
     ///
     /// Called from `load_with_hash` immediately after deserialization so that
     /// degenerate genesis files are rejected at startup rather than causing
-    /// divide-by-zero / modulo-by-zero panics later in consensus:
-    ///   - `slotsPerKESPeriod == 0`: divide-by-zero in `validate_kes_period`
-    ///   - `maxKESEvolutions == 0`: KES max_period = 0, all blocks invalid
-    ///   - `epochLength == 0`: modulo-by-zero in `in_nonce_contribution_window`
-    ///   - `securityParam == 0`: k=0 breaks chain-selection and ImmutableDB thresholds
+    /// divide-by-zero / modulo-by-zero panics later in consensus.
     ///
-    /// Issue #545 E8/E9 defense-in-depth: `validate_kes_period` and
-    /// `in_nonce_contribution_window` also use `checked_div`/`checked_rem` to
-    /// guard against degenerate values from callers that bypass this check.
-    pub fn validate(&self) -> anyhow::Result<()> {
+    /// Issues #545 E8/E9 (consensus defense-in-depth via `checked_div` /
+    /// `checked_rem`) and #546 (startup rejection) both contribute here.
+    pub fn validate(&self) -> Result<()> {
         if self.slots_per_k_e_s_period == 0 {
             anyhow::bail!(
                 "Invalid Shelley genesis: slotsPerKESPeriod is 0 — \
-                 would cause divide-by-zero in KES period validation"
+                 this would cause a divide-by-zero in KES period validation. \
+                 Expected a positive value (mainnet/preview/preprod use 129600)."
             );
         }
         if self.max_k_e_s_evolutions == 0 {
             anyhow::bail!(
                 "Invalid Shelley genesis: maxKESEvolutions is 0 — \
-                 all blocks would fail KES period validation"
+                 every block's KES key would be immediately expired. \
+                 Expected a positive value (mainnet/preview/preprod use 62)."
             );
         }
         if self.epoch_length == 0 {
             anyhow::bail!(
                 "Invalid Shelley genesis: epochLength is 0 — \
-                 would cause modulo-by-zero in nonce contribution window check"
+                 this would cause a modulo-by-zero in the nonce contribution window check. \
+                 Expected a positive value (mainnet uses 432000)."
             );
         }
         if self.security_param == 0 {
             anyhow::bail!(
                 "Invalid Shelley genesis: securityParam (k) is 0 — \
-                 would break chain selection and ImmutableDB flush thresholds"
+                 the stability window would collapse to zero, preventing any block from \
+                 being considered stable. Expected a positive value (mainnet uses 2160)."
             );
         }
         Ok(())

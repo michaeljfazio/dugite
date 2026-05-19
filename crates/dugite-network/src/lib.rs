@@ -326,6 +326,20 @@ pub enum TxValidationError {
         declared: bool,
         evaluated: bool,
     },
+    /// Conway `ConwayDRepNotRegistered` predicate failure (#546 F2): an
+    /// `UnregDRep` certificate names a DRep credential that is not in the
+    /// registry.  Without this rejection, a tx could credit a deposit refund
+    /// for a credential that never registered.
+    DRepNotRegistered {
+        credential_hash: String,
+    },
+    /// Shelley+ `PoolMarginsInvalidPOOL` predicate failure (#546 F3): a
+    /// `PoolRegistration` cert declares `margin = numerator/denominator`
+    /// outside `[0, 1]` (denominator == 0 or numerator > denominator).
+    PoolMarginInvalid {
+        numerator: u64,
+        denominator: u64,
+    },
     /// Multiple validation errors collected.
     Multiple(Vec<TxValidationError>),
     /// Catch-all for other validation failures.

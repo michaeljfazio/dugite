@@ -797,6 +797,16 @@ pub(crate) fn convert_validation_error(
         VE::PVCannotFollowPPUP { bad_pv } => TxValidationError::ScriptFailed {
             reason: format!("PVCannotFollowPPUP: bad_pv={bad_pv:?}"),
         },
+        VE::DRepNotRegistered { credential_hash } => {
+            TxValidationError::DRepNotRegistered { credential_hash }
+        }
+        VE::PoolMarginInvalid {
+            numerator,
+            denominator,
+        } => TxValidationError::PoolMarginInvalid {
+            numerator,
+            denominator,
+        },
     }
 }
 

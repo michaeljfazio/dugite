@@ -254,3 +254,8 @@ doc = false
 name = "fuzz_peer_sharing_client_addr_injection"
 path = "fuzz_targets/peer_sharing_client_addr_injection.rs"
 doc = false
+
+[[bin]]
+name = "fuzz_bootstrap_witness_sizes"
+path = "fuzz_targets/bootstrap_witness_sizes.rs"
+doc = false
