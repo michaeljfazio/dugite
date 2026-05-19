@@ -557,6 +557,27 @@ pub(super) fn run_phase1_rules(
     }
 
     // ------------------------------------------------------------------
+    // Rule 1i-pre: Pool reward account must be exactly 29 bytes
+    //             (D8 of security audit #544)
+    //
+    // A pool reward account is always exactly 29 bytes: 1 header byte followed
+    // by a 28-byte (Blake2b-224) credential hash. Haskell's `checkPoolParams`
+    // deserialises the raw bytes as an `Addr` via `deserialiseFromRawBytes
+    // AsShelleyAddress`, which fails hard on any other length. This check runs
+    // unconditionally — no `network_id` in the tx body is required.
+    // ------------------------------------------------------------------
+    for cert in &body.certificates {
+        if let Certificate::PoolRegistration(pool_params) = cert {
+            if pool_params.reward_account.len() != 29 {
+                errors.push(ValidationError::InvalidRewardAccount(format!(
+                    "pool reward account must be exactly 29 bytes, got {}",
+                    pool_params.reward_account.len()
+                )));
+            }
+        }
+    }
+
+    // ------------------------------------------------------------------
     // Rule 1i: Pool reward account network must match transaction network_id
     //          (Haskell `WrongNetworkInTxBody`, Alonzo+)
     //
@@ -583,6 +604,7 @@ pub(super) fn run_phase1_rules(
             if let Certificate::PoolRegistration(pool_params) = cert {
                 // Reward account format: header_byte || 28-byte credential hash.
                 // Bit 0 of the header encodes the network: 0 = testnet, 1 = mainnet.
+                // Length is already checked in Rule 1i-pre above; skip here if bad.
                 if let Some(header) = pool_params.reward_account.first() {
                     let network_bit = header & 0x01;
                     let actual_network = if network_bit == 0 {
@@ -3186,6 +3208,95 @@ mod tests {
                 rejected,
                 "vkey_len={vkey_len}: malformed vkey must not satisfy required-signer; errors={errors:?}"
             );
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Test D8 — Rule 1i: pool reward account must be exactly 29 bytes
+    // -----------------------------------------------------------------------
+    #[test]
+    fn test_d8_pool_reward_account_wrong_length_rejected() {
+        use dugite_primitives::transaction::{Certificate, PoolParams, Rational};
+        // Test both too-short (28 bytes) and too-long (30 bytes) cases.
+        for bad_len in [0usize, 1, 28, 30, 64] {
+            let (utxo_set, mut tx, _) = make_valid_tx();
+            let params = ProtocolParameters::mainnet_defaults();
+
+            tx.body
+                .certificates
+                .push(Certificate::PoolRegistration(PoolParams {
+                    operator: Hash28::from_bytes([0x88u8; 28]),
+                    vrf_keyhash: Hash32::from_bytes([0x99u8; 32]),
+                    pledge: Lovelace(0),
+                    cost: Lovelace(340_000_000),
+                    margin: Rational {
+                        numerator: 1,
+                        denominator: 100,
+                    },
+                    // Wrong-length reward account — one byte header (mainnet) + wrong tail.
+                    reward_account: {
+                        let mut acct = vec![0xE1u8]; // mainnet key reward addr header
+                        acct.extend_from_slice(&vec![0xAA; bad_len.saturating_sub(1)]);
+                        acct.truncate(bad_len);
+                        acct
+                    },
+                    pool_owners: vec![],
+                    relays: vec![],
+                    pool_metadata: None,
+                }));
+
+            let errors = validate_transaction(&tx, &utxo_set, &params, 100, 300, None).unwrap_err();
+            assert!(
+                errors
+                    .iter()
+                    .any(|e| matches!(e, ValidationError::InvalidRewardAccount(_))),
+                "reward_account of length {bad_len} must produce InvalidRewardAccount, got {errors:?}"
+            );
+        }
+    }
+
+    /// Length-lattice: exactly 29 bytes with a valid header must not produce
+    /// InvalidRewardAccount (it may still fail for other reasons, but not D8).
+    #[test]
+    fn test_d8_pool_reward_account_exact_length_ok() {
+        use dugite_primitives::transaction::{Certificate, PoolParams, Rational};
+        let (utxo_set, mut tx, _) = make_valid_tx();
+        let params = ProtocolParameters::mainnet_defaults();
+
+        // 29-byte mainnet key reward account — should NOT produce InvalidRewardAccount.
+        tx.body
+            .certificates
+            .push(Certificate::PoolRegistration(PoolParams {
+                operator: Hash28::from_bytes([0x88u8; 28]),
+                vrf_keyhash: Hash32::from_bytes([0x99u8; 32]),
+                pledge: Lovelace(0),
+                cost: Lovelace(340_000_000),
+                margin: Rational {
+                    numerator: 1,
+                    denominator: 100,
+                },
+                reward_account: {
+                    let mut acct = vec![0xE1u8]; // mainnet key reward addr
+                    acct.extend_from_slice(&[0xAA; 28]);
+                    acct
+                },
+                pool_owners: vec![],
+                relays: vec![],
+                pool_metadata: None,
+            }));
+
+        // May succeed or fail for other reasons (e.g. pool not registered) —
+        // but must not fail with InvalidRewardAccount.
+        match validate_transaction(&tx, &utxo_set, &params, 100, 300, None) {
+            Ok(_) => {}
+            Err(errors) => {
+                assert!(
+                    !errors
+                        .iter()
+                        .any(|e| matches!(e, ValidationError::InvalidRewardAccount(_))),
+                    "exactly 29-byte reward account must not produce InvalidRewardAccount, got {errors:?}"
+                );
+            }
         }
     }
 }

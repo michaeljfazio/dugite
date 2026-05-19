@@ -507,7 +507,7 @@ fn decode_transaction_from_pallas_with_mode(
 
     let fee = Lovelace(tx.fee().unwrap_or(0));
 
-    let mint = convert_mint(tx);
+    let mint = convert_mint(tx)?;
 
     let collateral: Vec<TransactionInput> = tx.collateral().iter().map(convert_input).collect();
 
@@ -768,7 +768,7 @@ fn convert_output_inner(
 
     let multi_era_value = output.value();
     let lovelace = multi_era_value.coin();
-    let multi_asset = convert_value_assets(&multi_era_value);
+    let multi_asset = convert_value_assets(&multi_era_value)?;
 
     let value = if multi_asset.is_empty() {
         Value::lovelace(lovelace)
@@ -846,7 +846,7 @@ fn convert_address(output: &PallasOutput) -> Result<Address, SerializationError>
 
 fn convert_value_assets(
     value: &pallas_traverse::MultiEraValue,
-) -> BTreeMap<Hash28, BTreeMap<AssetName, u64>> {
+) -> Result<BTreeMap<Hash28, BTreeMap<AssetName, u64>>, SerializationError> {
     let mut result = BTreeMap::new();
 
     for policy_assets in value.assets() {
@@ -854,7 +854,16 @@ fn convert_value_assets(
         if let Ok(policy) = Hash28::try_from(policy_bytes) {
             let assets_entry = result.entry(policy).or_insert_with(BTreeMap::new);
             for asset in policy_assets.assets() {
-                let asset_name = AssetName(asset.name().to_vec());
+                // D4: reject asset names exceeding the 32-byte CDDL limit.
+                // Direct tuple-struct construction bypasses AssetName::new(),
+                // so we use AssetName::new() explicitly here.
+                let asset_name = AssetName::new(asset.name().to_vec()).map_err(|_| {
+                    SerializationError::CborDecode(format!(
+                        "asset name too long: {} bytes (max {})",
+                        asset.name().len(),
+                        AssetName::MAX_LENGTH
+                    ))
+                })?;
                 if let Some(qty) = asset.output_coin() {
                     assets_entry.insert(asset_name, qty);
                 }
@@ -862,10 +871,12 @@ fn convert_value_assets(
         }
     }
 
-    result
+    Ok(result)
 }
 
-fn convert_mint(tx: &PallasTx) -> BTreeMap<Hash28, BTreeMap<AssetName, i64>> {
+fn convert_mint(
+    tx: &PallasTx,
+) -> Result<BTreeMap<Hash28, BTreeMap<AssetName, i64>>, SerializationError> {
     let mut result = BTreeMap::new();
 
     for policy_assets in tx.mints() {
@@ -873,7 +884,14 @@ fn convert_mint(tx: &PallasTx) -> BTreeMap<Hash28, BTreeMap<AssetName, i64>> {
         if let Ok(policy) = Hash28::try_from(policy_bytes) {
             let assets_entry = result.entry(policy).or_insert_with(BTreeMap::new);
             for asset in policy_assets.assets() {
-                let asset_name = AssetName(asset.name().to_vec());
+                // D4: same guard as convert_value_assets.
+                let asset_name = AssetName::new(asset.name().to_vec()).map_err(|_| {
+                    SerializationError::CborDecode(format!(
+                        "mint asset name too long: {} bytes (max {})",
+                        asset.name().len(),
+                        AssetName::MAX_LENGTH
+                    ))
+                })?;
                 if let Some(qty) = asset.mint_coin() {
                     assets_entry.insert(asset_name, qty);
                 }
@@ -881,7 +899,7 @@ fn convert_mint(tx: &PallasTx) -> BTreeMap<Hash28, BTreeMap<AssetName, i64>> {
         }
     }
 
-    result
+    Ok(result)
 }
 
 /// Convert a pallas transaction's auxiliary data into our `AuxiliaryData` type.
