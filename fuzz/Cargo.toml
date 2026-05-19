@@ -199,3 +199,8 @@ doc = false
 name = "fuzz_cost_model_eval"
 path = "fuzz_targets/cost_model_eval.rs"
 doc = false
+
+[[bin]]
+name = "fuzz_header_field_sizes"
+path = "fuzz_targets/header_field_sizes.rs"
+doc = false
