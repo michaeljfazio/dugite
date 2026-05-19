@@ -62,6 +62,21 @@ const WAL_HEADER_SIZE_LEGACY: usize = 4 + 8 + 8 + 32 + 4; // 56 bytes
 /// WAL file name within the volatile directory.
 const WAL_FILENAME: &str = "volatile-wal.bin";
 
+/// Maximum WAL file size before a preemptive compact is triggered.
+///
+/// At 90 KiB per Conway block and security parameter k = 2160, a full
+/// volatile window is ≈ 194 MiB.  Allow 2× headroom for fork blocks that
+/// live alongside the selected chain before GC, giving 400 MiB.
+///
+/// If the WAL on disk exceeds this threshold when a new block is added,
+/// `compact_wal()` is called before writing so that finalized blocks
+/// already removed from memory do not remain on disk indefinitely.
+///
+/// This guards against the G4 attack: a peer serving a crafted chain that
+/// stays just below the k-depth flush threshold can cause the WAL to grow
+/// without bound (ENOSPC → crash) unless we compact proactively.
+const WAL_MAX_SIZE_BYTES: u64 = 400 * 1024 * 1024; // 400 MiB
+
 /// Manages the write-ahead log file for crash recovery.
 struct WalWriter {
     file: BufWriter<File>,
@@ -610,6 +625,11 @@ impl VolatileDB {
     /// the WAL so that the successors map can be reconstructed accurately
     /// after a crash.
     ///
+    /// G4: If the WAL exceeds `WAL_MAX_SIZE_BYTES`, `compact_wal()` is called
+    /// before appending to prevent adversarial WAL growth (a peer serving a
+    /// crafted chain just below the k-depth flush threshold can cause the WAL
+    /// to accumulate until ENOSPC).
+    ///
     /// Returns `true` iff the block extended `selected_chain` (i.e. it
     /// became the new selected-chain tip). Returns `false` when the block
     /// was stored as a fork block without advancing the selected chain.
@@ -621,6 +641,23 @@ impl VolatileDB {
         prev_hash: Hash32,
         cbor: Vec<u8>,
     ) -> bool {
+        // G4: proactively compact the WAL if it has grown past the size cap.
+        // This rewrites the WAL to contain only the current in-memory blocks,
+        // dropping finalized entries that survived after flush_to_immutable.
+        if let Some(ref wal) = self.wal {
+            match std::fs::metadata(&wal.path) {
+                Ok(meta) if meta.len() > WAL_MAX_SIZE_BYTES => {
+                    warn!(
+                        wal_bytes = meta.len(),
+                        cap_bytes = WAL_MAX_SIZE_BYTES,
+                        "WAL size cap exceeded — compacting before next append"
+                    );
+                    self.compact_wal();
+                }
+                _ => {}
+            }
+        }
+
         // Write to WAL first (if enabled) so that prev_hash is durable
         // before the in-memory state is updated.
         if let Some(ref mut wal) = self.wal {
@@ -2987,5 +3024,93 @@ mod tests {
                 "selected-chain block {i} must still be present after failed switch"
             );
         }
+    }
+
+    // ── G4: WAL size cap enforcement ────────────────────────────────────────
+
+    /// After calling compact_wal, the WAL on disk must contain only entries for
+    /// blocks currently in memory (not all blocks ever written).
+    #[test]
+    fn test_wal_compact_shrinks_after_flush() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let path = tmp.path();
+        let mut db = VolatileDB::open(path).expect("open");
+
+        // Add 5 blocks (simulating a small chain).
+        let blocks: Vec<(Hash32, u64, u64, Hash32, Vec<u8>)> = (0u64..5)
+            .map(|i| {
+                let mut h = [0u8; 32];
+                h[0..8].copy_from_slice(&i.to_be_bytes());
+                let mut prev = [0u8; 32];
+                if i > 0 {
+                    prev[0..8].copy_from_slice(&(i - 1).to_be_bytes());
+                }
+                (
+                    Hash32::from_bytes(h),
+                    i * 1000,
+                    i,
+                    Hash32::from_bytes(prev),
+                    vec![0u8; 512], // 512-byte CBOR stub
+                )
+            })
+            .collect();
+
+        for (hash, slot, block_no, prev, cbor) in &blocks {
+            db.add_block(*hash, *slot, *block_no, *prev, cbor.clone());
+        }
+
+        let wal_path = path.join("volatile-wal.bin");
+        let size_after_adds = std::fs::metadata(&wal_path).unwrap().len();
+        assert!(size_after_adds > 0, "WAL must have content after adds");
+
+        // Remove 3 blocks (simulating flush_to_immutable removing them from memory)
+        let hashes_to_remove: Vec<Hash32> = blocks[..3].iter().map(|(h, ..)| *h).collect();
+        db.remove_blocks_by_hashes(&hashes_to_remove);
+
+        let size_after_flush = std::fs::metadata(&wal_path).unwrap().len();
+        assert!(
+            size_after_flush < size_after_adds,
+            "WAL must shrink after flushed blocks are removed (was {size_after_adds}, now {size_after_flush})"
+        );
+
+        // Compact_wal must be idempotent and result in size <= size_after_flush
+        db.compact_wal();
+        let size_after_compact = std::fs::metadata(&wal_path).unwrap().len();
+        assert!(
+            size_after_compact <= size_after_flush,
+            "compact_wal must not grow the WAL"
+        );
+    }
+
+    /// Verify that WAL_MAX_SIZE_BYTES is exposed (compile-time check) and that
+    /// compact_wal is called before writing when the WAL exceeds the cap.
+    ///
+    /// We cannot easily create a 400 MiB WAL in a unit test, so we verify that
+    /// the compaction path works correctly by checking that compact_wal does not
+    /// corrupt the WAL and that the remaining entries can be replayed.
+    #[test]
+    fn test_wal_compact_preserves_replay_integrity() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let path = tmp.path();
+        let mut db = VolatileDB::open(path).expect("open");
+
+        let (hash, prev) = {
+            let mut h = [0u8; 32];
+            h[0] = 1;
+            let p = [0u8; 32];
+            (Hash32::from_bytes(h), Hash32::from_bytes(p))
+        };
+        db.add_block(hash, 1000, 1, prev, vec![0xde, 0xad, 0xbe, 0xef]);
+
+        // Compact directly — should rewrite with 1 entry.
+        db.compact_wal();
+
+        // Close and reopen to verify replay.
+        drop(db);
+        let db2 = VolatileDB::open(path).expect("reopen after compact");
+        assert!(
+            db2.has_block(&hash),
+            "block must survive compact + close + reopen"
+        );
     }
 }

@@ -8,13 +8,26 @@
 //! - Connection limits (max inbound, max outbound, per-IP rate)
 
 use std::collections::HashMap;
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::Mutex;
+use tracing::warn;
 
 use super::handler::ConnectionHandler;
 use super::state::{ConnectionState, DataFlow, Provenance};
+
+/// Duration of the per-IP rate-limit sliding window.
+///
+/// Connections from the same IP address are counted within this window.
+/// Connections accepted more than `PER_IP_WINDOW` ago are not counted.
+const PER_IP_WINDOW: Duration = Duration::from_secs(60);
+
+/// Per-IP connection window entry.
+struct IpWindowEntry {
+    /// Timestamps of accepted connections from this IP within the window.
+    timestamps: Vec<Instant>,
+}
 
 /// Inbound idle timeout — connections in `InboundIdle` for longer than this
 /// are transitioned to `TerminatingConn` and closed.
@@ -71,6 +84,12 @@ pub struct ConnectionManager {
     config: ConnectionManagerConfig,
     /// Active connections, keyed by peer address.
     connections: Arc<Mutex<HashMap<SocketAddr, ConnectionEntry>>>,
+    /// Per-IP sliding-window counters for inbound rate limiting (G1).
+    ///
+    /// Keyed by the remote IP address.  Each entry holds a `Vec<Instant>` of
+    /// recent connection timestamps; entries older than `PER_IP_WINDOW` are
+    /// pruned on access so the Vec stays bounded to `per_ip_rate_limit` entries.
+    ip_window: Arc<Mutex<HashMap<IpAddr, IpWindowEntry>>>,
 }
 
 impl ConnectionManager {
@@ -79,7 +98,52 @@ impl ConnectionManager {
         Self {
             config,
             connections: Arc::new(Mutex::new(HashMap::new())),
+            ip_window: Arc::new(Mutex::new(HashMap::new())),
         }
+    }
+
+    /// Check whether a new inbound connection from `ip` is permitted under the
+    /// per-IP rate limit.
+    ///
+    /// Returns `true` if the connection is within the rate limit and the new
+    /// connection timestamp has been recorded.  Returns `false` if the IP has
+    /// exceeded `per_ip_rate_limit` connections within `PER_IP_WINDOW` — the
+    /// caller should drop the stream without spawning any task.
+    ///
+    /// This is the G1 per-IP gate that was previously defined in config but
+    /// never enforced.  The accept loop in `dugite-node` calls this method
+    /// immediately after TCP accept, before spawning any task.
+    pub async fn check_and_record_inbound_ip(&self, ip: IpAddr) -> bool {
+        let limit = self.config.per_ip_rate_limit;
+        if limit == 0 {
+            // Rate limiting disabled.
+            return true;
+        }
+
+        let mut table = self.ip_window.lock().await;
+        let now = Instant::now();
+        let entry = table.entry(ip).or_insert_with(|| IpWindowEntry {
+            timestamps: Vec::new(),
+        });
+
+        // Prune timestamps older than the window.
+        entry
+            .timestamps
+            .retain(|t| now.duration_since(*t) < PER_IP_WINDOW);
+
+        if entry.timestamps.len() >= limit {
+            warn!(
+                %ip,
+                count = entry.timestamps.len(),
+                limit,
+                window_secs = PER_IP_WINDOW.as_secs(),
+                "G1: per-IP inbound rate limit exceeded, dropping connection"
+            );
+            return false;
+        }
+
+        entry.timestamps.push(now);
+        true
     }
 
     /// Reserve an outbound connection slot.
@@ -420,5 +484,83 @@ mod tests {
             expired.is_empty(),
             "outbound connections should not be affected by inbound idle timeout"
         );
+    }
+
+    // ── G1: per-IP rate limit tests ─────────────────────────────────────────
+
+    fn test_ip(last_octet: u8) -> IpAddr {
+        use std::net::Ipv4Addr;
+        IpAddr::V4(Ipv4Addr::new(1, 2, 3, last_octet))
+    }
+
+    /// The first `per_ip_rate_limit` connections from one IP are accepted;
+    /// the next is rejected.
+    #[tokio::test]
+    async fn per_ip_rate_limit_enforced() {
+        let config = ConnectionManagerConfig {
+            per_ip_rate_limit: 3,
+            ..Default::default()
+        };
+        let cm = ConnectionManager::new(config);
+        let ip = test_ip(10);
+
+        // First 3 connections: accepted
+        for _ in 0..3 {
+            assert!(
+                cm.check_and_record_inbound_ip(ip).await,
+                "connection within limit should be accepted"
+            );
+        }
+
+        // 4th connection: rejected
+        assert!(
+            !cm.check_and_record_inbound_ip(ip).await,
+            "connection exceeding limit should be rejected"
+        );
+    }
+
+    /// A different IP is not affected by another IP's rate limit.
+    #[tokio::test]
+    async fn per_ip_rate_limit_per_source_independent() {
+        let config = ConnectionManagerConfig {
+            per_ip_rate_limit: 2,
+            ..Default::default()
+        };
+        let cm = ConnectionManager::new(config);
+        let ip_a = test_ip(1);
+        let ip_b = test_ip(2);
+
+        // Exhaust ip_a's limit
+        cm.check_and_record_inbound_ip(ip_a).await;
+        cm.check_and_record_inbound_ip(ip_a).await;
+        assert!(
+            !cm.check_and_record_inbound_ip(ip_a).await,
+            "ip_a exhausted"
+        );
+
+        // ip_b is still within its own limit
+        assert!(
+            cm.check_and_record_inbound_ip(ip_b).await,
+            "ip_b should not be affected by ip_a's limit"
+        );
+    }
+
+    /// When per_ip_rate_limit = 0, rate limiting is disabled and every
+    /// connection is accepted regardless of source IP.
+    #[tokio::test]
+    async fn per_ip_rate_limit_zero_disables() {
+        let config = ConnectionManagerConfig {
+            per_ip_rate_limit: 0,
+            ..Default::default()
+        };
+        let cm = ConnectionManager::new(config);
+        let ip = test_ip(42);
+
+        for _ in 0..100 {
+            assert!(
+                cm.check_and_record_inbound_ip(ip).await,
+                "all connections should be accepted when rate limit is disabled"
+            );
+        }
     }
 }
