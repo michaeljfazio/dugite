@@ -49,6 +49,7 @@ jobs:
           - ed25519_verify
           - blake2b_hash
           - chain_select
+          - header_field_sizes
           # Phase 3 — storage layer (Mithril skipped — HTTP-coupled, no byte API)
           - immutable_chunk_parse
           - volatile_recovery
