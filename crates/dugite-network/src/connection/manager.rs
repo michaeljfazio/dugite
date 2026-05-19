@@ -432,10 +432,10 @@ mod tests {
         assert_eq!(cm.connection_count().await, 1);
     }
 
-    // ── A-001 / A-002: per-IP rate limit (security audit 2026-05-19) ─────────
+    // ── A-001 / A-002: per-IP concurrent-count rate limit (#541 audit) ───────
 
     #[tokio::test]
-    async fn per_ip_rate_limit_enforced() {
+    async fn per_ip_concurrent_limit_enforced() {
         let config = ConnectionManagerConfig {
             per_ip_rate_limit: 3,
             max_inbound: 100,

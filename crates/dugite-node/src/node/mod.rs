@@ -58,12 +58,6 @@ use crate::topology::Topology;
 
 // ── Resource-limit constants (G-series audit fixes) ────────────────────────
 
-/// Maximum concurrent N2C (Unix socket) connections.
-///
-/// Matches Haskell cardano-node's `LocalConnectionLimit` default (typically 6).
-/// Prevents a local attacker or misbehaving wallet from accumulating unbounded
-/// `JoinHandle`s in the N2C accept loop (G3).
-
 /// Timeout for the N2N inbound handshake task.
 ///
 /// The inner `run_n2n_handshake_server` already has a 10-second timeout, but if
