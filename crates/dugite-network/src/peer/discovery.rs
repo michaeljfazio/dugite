@@ -215,6 +215,16 @@ pub async fn resolve_with_srv(
     }
 }
 
+/// Maximum number of SRV records accepted from a single DNS response.
+///
+/// A malicious or compromised DNS server could return thousands of SRV entries.
+/// Each entry without glue IPs triggers a follow-up A/AAAA lookup (async task),
+/// so O(N) tasks are spawned. We cap at 64 to prevent DNS amplification into an
+/// async task storm.  No real cardano relay publishes more than a few SRV entries.
+///
+/// A-008 (security audit 2026-05-19).
+pub const MAX_SRV_RECORDS: usize = 64;
+
 /// Convert a non-empty list of SRV records to socket addresses.
 ///
 /// Sorts by priority (ascending), then applies weighted shuffle within each
@@ -226,6 +236,15 @@ async fn srv_records_to_addrs(
     mut records: Vec<SrvRecord>,
     topology_port: u16,
 ) -> Vec<SocketAddr> {
+    // A-008: cap the number of SRV records before any processing.
+    if records.len() > MAX_SRV_RECORDS {
+        tracing::warn!(
+            count = records.len(),
+            cap = MAX_SRV_RECORDS,
+            "SRV response exceeded record cap — truncating"
+        );
+        records.truncate(MAX_SRV_RECORDS);
+    }
     // Sort ascending by priority so the lowest (= most preferred) comes first.
     records.sort_by_key(|r| r.priority);
 
@@ -570,5 +589,87 @@ mod tests {
         let addrs = resolve_topology_relays(&[("::1".to_string(), 3001)]).await;
         assert_eq!(addrs.len(), 1);
         assert_eq!(addrs[0].port(), 3001);
+    }
+
+    // ── A-008: SRV record count cap (security audit 2026-05-19) ──────────────
+
+    fn make_srv_records(n: usize, base_port: u16) -> Vec<SrvRecord> {
+        (0..n)
+            .map(|i| SrvRecord {
+                priority: 1,
+                weight: 1,
+                port: base_port + i as u16,
+                target: format!("relay{i}.example.com"),
+                ips: vec![ipv4(1, 2, 3, (i % 254 + 1) as u8)], // glue — no A/AAAA needed
+            })
+            .collect()
+    }
+
+    /// Fewer than MAX_SRV_RECORDS: all resolved.
+    #[tokio::test]
+    async fn srv_count_within_cap_all_resolved() {
+        let n = MAX_SRV_RECORDS / 2;
+        let records = make_srv_records(n, 3001);
+        let resolver = MockResolver {
+            srv_result: Ok(records),
+            a_aaaa_ips: vec![],
+        };
+        let addrs = resolve_with_srv(&resolver, "pool.example.com", 0).await;
+        assert_eq!(
+            addrs.len(),
+            n,
+            "all {n} records within cap should be resolved"
+        );
+    }
+
+    /// Exactly MAX_SRV_RECORDS: all resolved.
+    #[tokio::test]
+    async fn srv_count_exactly_at_cap_all_resolved() {
+        let n = MAX_SRV_RECORDS;
+        let records = make_srv_records(n, 3001);
+        let resolver = MockResolver {
+            srv_result: Ok(records),
+            a_aaaa_ips: vec![],
+        };
+        let addrs = resolve_with_srv(&resolver, "pool.example.com", 0).await;
+        assert_eq!(
+            addrs.len(),
+            n,
+            "exactly {n} records at cap should all be resolved"
+        );
+    }
+
+    /// More than MAX_SRV_RECORDS: only MAX_SRV_RECORDS resolved.
+    #[tokio::test]
+    async fn srv_count_over_cap_truncated_to_max() {
+        let n = MAX_SRV_RECORDS + 50; // well over cap
+        let records = make_srv_records(n, 3001);
+        let resolver = MockResolver {
+            srv_result: Ok(records),
+            a_aaaa_ips: vec![],
+        };
+        let addrs = resolve_with_srv(&resolver, "pool.example.com", 0).await;
+        assert_eq!(
+            addrs.len(),
+            MAX_SRV_RECORDS,
+            "oversized SRV response must be truncated to {MAX_SRV_RECORDS}"
+        );
+    }
+
+    /// 10× over cap: still only MAX_SRV_RECORDS.
+    #[tokio::test]
+    async fn srv_count_massively_over_cap_truncated() {
+        let n = MAX_SRV_RECORDS * 10;
+        let records = make_srv_records(n, 3001);
+        let resolver = MockResolver {
+            srv_result: Ok(records),
+            a_aaaa_ips: vec![],
+        };
+        let addrs = resolve_with_srv(&resolver, "pool.example.com", 0).await;
+        assert_eq!(
+            addrs.len(),
+            MAX_SRV_RECORDS,
+            "massive SRV flood must be truncated to {MAX_SRV_RECORDS}"
+        );
     }
 }

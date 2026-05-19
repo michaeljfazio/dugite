@@ -90,6 +90,14 @@ fn decode_uint_info(data: &[u8], info: u8) -> Result<(u64, usize), Serialization
 
 /// Decode a CBOR bigint (tag 2 = positive bignum wrapping a bytestring).
 /// Falls back to regular uint if no tag is present.
+///
+/// # D6 / audit #544 — bignum saturation replaced with hard rejection
+///
+/// The previous implementation silently saturated to `u64::MAX` when the bignum
+/// byte string exceeded 8 bytes.  A malformed or adversarial Haskell ledger
+/// snapshot could thus inject `u64::MAX` into protocol parameter fields (e.g.
+/// `max_tx_ex_steps`) without any diagnostic.  We now reject such values
+/// outright — a bignum of 9+ bytes cannot be represented in `u64`.
 pub fn decode_bigint_or_uint(data: &[u8]) -> Result<(u64, usize), SerializationError> {
     if data.is_empty() {
         return Err(eof());
@@ -101,9 +109,17 @@ pub fn decode_bigint_or_uint(data: &[u8]) -> Result<(u64, usize), SerializationE
     // Tag 2 (positive bignum): 0xc2 + bytestring
     if data[0] == 0xc2 {
         let (bytes, n) = decode_bytes(&data[1..])?;
+        // u64 holds at most 8 bytes.  Reject bignums that exceed u64 range
+        // rather than silently saturating to u64::MAX (D6, audit #544).
+        if bytes.len() > 8 {
+            return Err(SerializationError::CborDecode(format!(
+                "bignum too large for u64: {} bytes (max 8)",
+                bytes.len()
+            )));
+        }
         let mut val = 0u64;
         for &b in bytes {
-            val = val.checked_shl(8).unwrap_or(u64::MAX) | b as u64;
+            val = (val << 8) | b as u64;
         }
         return Ok((val, 1 + n));
     }
@@ -336,10 +352,32 @@ pub fn decode_null(data: &[u8]) -> Result<(bool, usize), SerializationError> {
     }
 }
 
+/// Maximum nesting depth for `skip_cbor_value`.
+///
+/// D10 / audit #544: a deeply-nested indefinite CBOR (e.g. 1000 nested arrays) would
+/// exhaust the stack via unbounded recursion.  We cap at 64 levels — sufficient for
+/// any legitimate Cardano ledger state structure — and return an error beyond that.
+const CBOR_SKIP_MAX_DEPTH: usize = 64;
+
 /// Skip over any single CBOR value, returning the number of bytes consumed.
 ///
 /// Used for fields we don't need to fully decode (e.g., NonMyopic, pulsingRewUpdate).
+///
+/// # D10 / audit #544 — recursion depth limit
+///
+/// This is a thin public wrapper that enforces a maximum nesting depth via
+/// `skip_cbor_value_depth`.  Adversarial CBOR with thousands of nested arrays
+/// would otherwise cause a stack overflow.
 pub fn skip_cbor_value(data: &[u8]) -> Result<usize, SerializationError> {
+    skip_cbor_value_depth(data, 0)
+}
+
+fn skip_cbor_value_depth(data: &[u8], depth: usize) -> Result<usize, SerializationError> {
+    if depth > CBOR_SKIP_MAX_DEPTH {
+        return Err(SerializationError::CborDecode(format!(
+            "CBOR nesting depth exceeds limit ({CBOR_SKIP_MAX_DEPTH})"
+        )));
+    }
     if data.is_empty() {
         return Err(eof());
     }
@@ -353,53 +391,67 @@ pub fn skip_cbor_value(data: &[u8]) -> Result<usize, SerializationError> {
         }
         // Byte string or text string
         2 | 3 => {
-            let hdr_len = match info {
-                0..=23 => 1usize,
-                24 => 2,
-                25 => 3,
-                26 => 5,
-                27 => 9,
-                _ => {
-                    return Err(SerializationError::CborDecode(
-                        "invalid string length encoding".into(),
-                    ))
+            if info == 31 {
+                // D15 / audit #544: indefinite-length chunked byte/text string (CBOR §2.2).
+                // Iterate through definite-length chunks until the break byte (0xff).
+                let mut off = 1; // skip the 0x5f/0x7f header
+                while off < data.len() && data[off] != 0xff {
+                    // Each chunk is a definite-length byte/text string with the same major type.
+                    off += skip_cbor_value_depth(&data[off..], depth + 1)?;
                 }
-            };
-            let payload_len = match info {
-                0..=23 => info as usize,
-                24 => {
-                    if data.len() < 2 {
-                        return Err(eof());
+                if off >= data.len() {
+                    return Err(eof());
+                }
+                Ok(off + 1) // +1 for the break byte 0xff
+            } else {
+                let hdr_len = match info {
+                    0..=23 => 1usize,
+                    24 => 2,
+                    25 => 3,
+                    26 => 5,
+                    27 => 9,
+                    _ => {
+                        return Err(SerializationError::CborDecode(
+                            "invalid string length encoding".into(),
+                        ))
                     }
-                    data[1] as usize
-                }
-                25 => {
-                    if data.len() < 3 {
-                        return Err(eof());
+                };
+                let payload_len = match info {
+                    0..=23 => info as usize,
+                    24 => {
+                        if data.len() < 2 {
+                            return Err(eof());
+                        }
+                        data[1] as usize
                     }
-                    u16::from_be_bytes([data[1], data[2]]) as usize
-                }
-                26 => {
-                    if data.len() < 5 {
-                        return Err(eof());
+                    25 => {
+                        if data.len() < 3 {
+                            return Err(eof());
+                        }
+                        u16::from_be_bytes([data[1], data[2]]) as usize
                     }
-                    u32::from_be_bytes([data[1], data[2], data[3], data[4]]) as usize
-                }
-                27 => {
-                    if data.len() < 9 {
-                        return Err(eof());
+                    26 => {
+                        if data.len() < 5 {
+                            return Err(eof());
+                        }
+                        u32::from_be_bytes([data[1], data[2], data[3], data[4]]) as usize
                     }
-                    u64::from_be_bytes([
-                        data[1], data[2], data[3], data[4], data[5], data[6], data[7], data[8],
-                    ]) as usize
-                }
-                _ => {
-                    return Err(SerializationError::CborDecode(
-                        "invalid string length encoding".into(),
-                    ))
-                }
-            };
-            Ok(hdr_len + payload_len)
+                    27 => {
+                        if data.len() < 9 {
+                            return Err(eof());
+                        }
+                        u64::from_be_bytes([
+                            data[1], data[2], data[3], data[4], data[5], data[6], data[7], data[8],
+                        ]) as usize
+                    }
+                    _ => {
+                        return Err(SerializationError::CborDecode(
+                            "invalid string length encoding".into(),
+                        ))
+                    }
+                };
+                Ok(hdr_len + payload_len)
+            }
         }
         // Array
         4 => {
@@ -407,13 +459,13 @@ pub fn skip_cbor_value(data: &[u8]) -> Result<usize, SerializationError> {
                 // Indefinite-length array
                 let mut off = 1;
                 while off < data.len() && data[off] != 0xff {
-                    off += skip_cbor_value(&data[off..])?;
+                    off += skip_cbor_value_depth(&data[off..], depth + 1)?;
                 }
                 Ok(off + 1) // +1 for the break byte 0xff
             } else {
                 let (count, mut off) = decode_uint_info(data, info)?;
                 for _ in 0..count {
-                    off += skip_cbor_value(&data[off..])?;
+                    off += skip_cbor_value_depth(&data[off..], depth + 1)?;
                 }
                 Ok(off)
             }
@@ -423,15 +475,15 @@ pub fn skip_cbor_value(data: &[u8]) -> Result<usize, SerializationError> {
             if info == 31 {
                 let mut off = 1;
                 while off < data.len() && data[off] != 0xff {
-                    off += skip_cbor_value(&data[off..])?; // key
-                    off += skip_cbor_value(&data[off..])?; // value
+                    off += skip_cbor_value_depth(&data[off..], depth + 1)?; // key
+                    off += skip_cbor_value_depth(&data[off..], depth + 1)?; // value
                 }
                 Ok(off + 1) // +1 for the break byte 0xff
             } else {
                 let (count, mut off) = decode_uint_info(data, info)?;
                 for _ in 0..count {
-                    off += skip_cbor_value(&data[off..])?; // key
-                    off += skip_cbor_value(&data[off..])?; // value
+                    off += skip_cbor_value_depth(&data[off..], depth + 1)?; // key
+                    off += skip_cbor_value_depth(&data[off..], depth + 1)?; // value
                 }
                 Ok(off)
             }
@@ -439,7 +491,7 @@ pub fn skip_cbor_value(data: &[u8]) -> Result<usize, SerializationError> {
         // Tag: skip the tag header then skip the tagged value
         6 => {
             let (_, n) = decode_uint_info(data, info)?;
-            let inner = skip_cbor_value(&data[n..])?;
+            let inner = skip_cbor_value_depth(&data[n..], depth + 1)?;
             Ok(n + inner)
         }
         // Simple values and floats

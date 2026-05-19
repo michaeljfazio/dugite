@@ -420,6 +420,27 @@ mod tests {
         assert!(too_long.is_err());
     }
 
+    /// Length-lattice: test the full neighbourhood around the 32-byte boundary.
+    /// This guards against D4 (AssetName::new() bypass in convert_value_assets /
+    /// convert_mint); those call sites must always route through AssetName::new().
+    #[test]
+    fn test_asset_name_length_lattice() {
+        // All lengths 0..=32 must be accepted.
+        for n in 0..=32usize {
+            assert!(
+                AssetName::new(vec![0u8; n]).is_ok(),
+                "length {n} should be accepted"
+            );
+        }
+        // All lengths 33..=64 must be rejected.
+        for n in 33..=64usize {
+            assert!(
+                AssetName::new(vec![0u8; n]).is_err(),
+                "length {n} should be rejected"
+            );
+        }
+    }
+
     #[test]
     fn test_asset_name_display() {
         // ASCII-printable should display as text

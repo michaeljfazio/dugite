@@ -189,28 +189,43 @@ impl TxSubmissionServer {
                             reason: e,
                         })?;
 
-                    if let TxSubmissionMessage::MsgReplyTxs(txs) = txs_reply {
-                        for (i, (_era_id, tx_bytes)) in txs.into_iter().enumerate() {
-                            stats.txs_received += 1;
+                    // B8: Use exhaustive match instead of `if let`.
+                    // An `if let` silently falls through when the peer sends any
+                    // message other than MsgReplyTxs (e.g. MsgReplyTxIds or garbage
+                    // that decodes to a wrong variant).  The inflight entries for the
+                    // requested tx IDs are never removed, eventually hitting the
+                    // MAX_INFLIGHT_TX_IDS cap and permanently stalling the pipeline.
+                    match txs_reply {
+                        TxSubmissionMessage::MsgReplyTxs(txs) => {
+                            for (i, (_era_id, tx_bytes)) in txs.into_iter().enumerate() {
+                                stats.txs_received += 1;
 
-                            // tx_id is the hash portion of the (era_id, hash) pair.
-                            let tx_id = if i < to_fetch.len() {
-                                to_fetch[i].1
-                            } else {
-                                [0; 32]
-                            };
+                                // tx_id is the hash portion of the (era_id, hash) pair.
+                                let tx_id = if i < to_fetch.len() {
+                                    to_fetch[i].1
+                                } else {
+                                    [0; 32]
+                                };
 
-                            // Pass raw tx bytes (era wrapper stripped) to the callback.
-                            if on_tx(tx_id, tx_bytes) {
-                                stats.txs_accepted += 1;
-                            } else {
-                                stats.txs_rejected += 1;
+                                // Pass raw tx bytes (era wrapper stripped) to the callback.
+                                if on_tx(tx_id, tx_bytes) {
+                                    stats.txs_accepted += 1;
+                                } else {
+                                    stats.txs_rejected += 1;
+                                }
+
+                                // Remove from inflight using the hash component.
+                                if i < to_fetch.len() {
+                                    inflight.remove(&to_fetch[i].1);
+                                }
                             }
-
-                            // Remove from inflight using the hash component.
-                            if i < to_fetch.len() {
-                                inflight.remove(&to_fetch[i].1);
-                            }
+                        }
+                        other => {
+                            return Err(ProtocolError::StateViolation {
+                                protocol: "TxSubmission2",
+                                expected: "MsgReplyTxs".to_string(),
+                                actual: format!("{other:?}"),
+                            });
                         }
                     }
                 }
@@ -439,6 +454,69 @@ mod tests {
         assert!(
             matches!(err, ProtocolError::BoundsExceeded { .. }),
             "expected BoundsExceeded, got: {err:?}"
+        );
+    }
+
+    /// B8: Server must disconnect (StateViolation) when peer sends wrong message
+    /// type instead of MsgReplyTxs after a MsgRequestTxs.
+    ///
+    /// Before the exhaustive match fix, an `if let` silently fell through,
+    /// leaving inflight entries forever and eventually stalling the pipeline at
+    /// MAX_INFLIGHT_TX_IDS.
+    #[tokio::test]
+    async fn server_rejects_wrong_reply_to_request_txs() {
+        let (mut channel, mut egress_rx, ingress_tx) = make_test_channel();
+
+        let handle = tokio::spawn(async move {
+            TxSubmissionServer::run(&mut channel, |_tx_id, _tx_bytes| true).await
+        });
+
+        // MsgInit
+        ingress_tx
+            .send(Bytes::from(encode_message(&TxSubmissionMessage::MsgInit)))
+            .await
+            .unwrap();
+
+        // Read first MsgRequestTxIds
+        let _ = egress_rx.recv().await.unwrap();
+
+        // Reply with one tx ID so the server will send MsgRequestTxs.
+        let reply = encode_message(&TxSubmissionMessage::MsgReplyTxIds(vec![TxIdAndSize {
+            era_id: 6,
+            tx_id: [0xDD; 32],
+            size_in_bytes: 50,
+        }]));
+        ingress_tx.send(Bytes::from(reply)).await.unwrap();
+
+        // Read MsgRequestTxs
+        let (_, _, req) = egress_rx.recv().await.unwrap();
+        assert!(matches!(
+            decode_message(&req).unwrap(),
+            TxSubmissionMessage::MsgRequestTxs(_)
+        ));
+
+        // Send MsgReplyTxIds instead of MsgReplyTxs — agency violation.
+        let wrong_reply = encode_message(&TxSubmissionMessage::MsgReplyTxIds(vec![TxIdAndSize {
+            era_id: 6,
+            tx_id: [0xEE; 32],
+            size_in_bytes: 50,
+        }]));
+        ingress_tx.send(Bytes::from(wrong_reply)).await.unwrap();
+
+        let result = handle.await.unwrap();
+        assert!(
+            result.is_err(),
+            "wrong reply to MsgRequestTxs should be a protocol error"
+        );
+        assert!(
+            matches!(
+                result.unwrap_err(),
+                ProtocolError::StateViolation {
+                    protocol: "TxSubmission2",
+                    ..
+                }
+            ),
+            "expected StateViolation"
         );
     }
 

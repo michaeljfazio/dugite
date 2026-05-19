@@ -124,11 +124,40 @@ pub fn try_decode_cbor_boundary(data: &[u8]) -> Option<usize> {
     }
 }
 
+/// Maximum CBOR nesting depth allowed by `skip_cbor_value`.
+///
+/// A peer can craft `array(1)[array(1)[...]]` nested D levels deep. Rust's
+/// default stack is 8 MB; each recursive frame is ~64-128 bytes, giving
+/// ~65,000-131,000 safe levels. We cap at 64 which is far above any real
+/// Cardano CBOR (blocks, txs, datums) while providing a large safety margin
+/// before stack overflow. Haskell's CBOR decoder (cborg) avoids recursion by
+/// using heap-allocated continuations; we replicate the same safety guarantee
+/// by enforcing an explicit depth limit.
+///
+/// Finding A-004 (security audit 2026-05-19): a single malformed mux frame
+/// containing deeply-nested CBOR would have caused an unbounded stack
+/// recursion → SIGABRT (remote process crash, unauthenticated).
+pub const MAX_CBOR_DEPTH: usize = 64;
+
 /// Skip one complete CBOR data item, recursively descending into containers.
 ///
 /// This doesn't allocate or interpret values — it just advances the decoder
 /// past a complete item, which is exactly what we need for boundary detection.
-fn skip_cbor_value(dec: &mut Decoder<'_>) -> Result<(), minicbor::decode::Error> {
+///
+/// Returns `Err` if the nesting depth exceeds [`MAX_CBOR_DEPTH`] (A-004).
+pub fn skip_cbor_value(dec: &mut Decoder<'_>) -> Result<(), minicbor::decode::Error> {
+    skip_cbor_value_depth(dec, 0)
+}
+
+fn skip_cbor_value_depth(
+    dec: &mut Decoder<'_>,
+    depth: usize,
+) -> Result<(), minicbor::decode::Error> {
+    if depth > MAX_CBOR_DEPTH {
+        return Err(minicbor::decode::Error::message(
+            "CBOR nesting depth exceeded maximum (A-004)",
+        ));
+    }
     use minicbor::data::Type;
     match dec.datatype()? {
         // Unsigned integers
@@ -156,13 +185,13 @@ fn skip_cbor_value(dec: &mut Decoder<'_>) -> Result<(), minicbor::decode::Error>
         // CBOR tags: skip the tag then recursively skip the tagged value
         Type::Tag => {
             dec.tag()?;
-            skip_cbor_value(dec)?;
+            skip_cbor_value_depth(dec, depth + 1)?;
         }
         // Definite-length arrays
         Type::Array => {
             let len = dec.array()?.expect("definite array");
             for _ in 0..len {
-                skip_cbor_value(dec)?;
+                skip_cbor_value_depth(dec, depth + 1)?;
             }
         }
         // Indefinite-length arrays: read until Break marker
@@ -173,15 +202,15 @@ fn skip_cbor_value(dec: &mut Decoder<'_>) -> Result<(), minicbor::decode::Error>
                     dec.skip()?;
                     break;
                 }
-                skip_cbor_value(dec)?;
+                skip_cbor_value_depth(dec, depth + 1)?;
             }
         }
         // Definite-length maps
         Type::Map => {
             let len = dec.map()?.expect("definite map");
             for _ in 0..len {
-                skip_cbor_value(dec)?; // key
-                skip_cbor_value(dec)?; // value
+                skip_cbor_value_depth(dec, depth + 1)?; // key
+                skip_cbor_value_depth(dec, depth + 1)?; // value
             }
         }
         // Indefinite-length maps: read until Break marker
@@ -192,8 +221,8 @@ fn skip_cbor_value(dec: &mut Decoder<'_>) -> Result<(), minicbor::decode::Error>
                     dec.skip()?;
                     break;
                 }
-                skip_cbor_value(dec)?; // key
-                skip_cbor_value(dec)?; // value
+                skip_cbor_value_depth(dec, depth + 1)?; // key
+                skip_cbor_value_depth(dec, depth + 1)?; // value
             }
         }
         // Simple values (other than bool/null/undefined)
@@ -299,5 +328,97 @@ mod tests {
         enc.bytes(&[0xAA; 16]).unwrap();
         let mut dec = Decoder::new(&buf);
         assert!(decode_point(&mut dec).is_err());
+    }
+
+    // ── A-004: CBOR depth limit (security audit 2026-05-19) ──────────────────
+
+    /// Build a deeply-nested definite-length CBOR array: array(1)[array(1)[...]] to depth D.
+    fn build_nested_array(depth: usize) -> Vec<u8> {
+        // Each array(1) header is 0x81 (1 byte); leaf value is integer 0 (0x00).
+        let mut buf: Vec<u8> = std::iter::repeat_n(0x81u8, depth).collect();
+        buf.push(0x00);
+        buf
+    }
+
+    #[test]
+    fn cbor_depth_at_limit_succeeds() {
+        // Nesting exactly at MAX_CBOR_DEPTH should succeed.
+        let buf = build_nested_array(MAX_CBOR_DEPTH);
+        let mut dec = Decoder::new(&buf);
+        assert!(
+            skip_cbor_value(&mut dec).is_ok(),
+            "depth == MAX_CBOR_DEPTH should succeed"
+        );
+    }
+
+    #[test]
+    fn cbor_depth_one_over_limit_fails() {
+        // Nesting one level beyond MAX_CBOR_DEPTH must be rejected.
+        let buf = build_nested_array(MAX_CBOR_DEPTH + 1);
+        let mut dec = Decoder::new(&buf);
+        let result = skip_cbor_value(&mut dec);
+        assert!(
+            result.is_err(),
+            "depth > MAX_CBOR_DEPTH must return Err; got Ok"
+        );
+    }
+
+    #[test]
+    fn cbor_depth_deeply_nested_does_not_panic() {
+        // 10× over the limit — must return Err, never panic (no stack overflow).
+        let buf = build_nested_array(MAX_CBOR_DEPTH * 10);
+        let mut dec = Decoder::new(&buf);
+        // Either Ok (impossible at this depth) or Err is fine; panic is not.
+        let _ = skip_cbor_value(&mut dec);
+    }
+
+    #[test]
+    fn cbor_depth_tag_nesting_rejected() {
+        // CBOR tags also count as nesting. Build tag(tag(tag(...(0)...))) past the limit.
+        // CBOR tag: 0xC0 (tag 0), followed by value. Nest MAX_CBOR_DEPTH + 1 times.
+        let mut buf: Vec<u8> = std::iter::repeat_n(0xC0u8, MAX_CBOR_DEPTH + 1).collect();
+        buf.push(0x00); // leaf integer
+        let mut dec = Decoder::new(&buf);
+        let result = skip_cbor_value(&mut dec);
+        assert!(result.is_err(), "tag nesting past limit must be rejected");
+    }
+
+    #[test]
+    fn cbor_depth_map_nesting_rejected() {
+        // Definite-length map(1){ 0 => map(1){ 0 => ... } } past limit.
+        // Each level: 0xa1 (map of length 1) + 0x00 (key) then the nested value.
+        // Build depth MAX_CBOR_DEPTH + 2 levels.
+        let mut buf = Vec::new();
+        let depth = MAX_CBOR_DEPTH + 2;
+        for _ in 0..depth {
+            buf.push(0xa1); // map(1)
+            buf.push(0x00); // key: integer 0
+        }
+        buf.push(0x00); // leaf value at deepest level
+        let mut dec = Decoder::new(&buf);
+        let result = skip_cbor_value(&mut dec);
+        assert!(result.is_err(), "map nesting past limit must be rejected");
+    }
+
+    /// Property test: for any depth in [0, MAX_CBOR_DEPTH] skip succeeds;
+    /// for depth in [MAX_CBOR_DEPTH+1, MAX_CBOR_DEPTH*4] skip fails.
+    #[test]
+    fn cbor_depth_lattice_property() {
+        for depth in 0..=MAX_CBOR_DEPTH {
+            let buf = build_nested_array(depth);
+            let mut dec = Decoder::new(&buf);
+            assert!(
+                skip_cbor_value(&mut dec).is_ok(),
+                "depth {depth} <= MAX should succeed"
+            );
+        }
+        for depth in (MAX_CBOR_DEPTH + 1)..=(MAX_CBOR_DEPTH * 4) {
+            let buf = build_nested_array(depth);
+            let mut dec = Decoder::new(&buf);
+            assert!(
+                skip_cbor_value(&mut dec).is_err(),
+                "depth {depth} > MAX should fail"
+            );
+        }
     }
 }

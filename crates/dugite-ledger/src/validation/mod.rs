@@ -20,6 +20,7 @@ pub mod mir;
 mod phase1;
 pub mod ppup;
 mod scripts;
+pub(crate) mod size_check;
 pub mod withdrawals;
 
 #[cfg(test)]
@@ -1017,6 +1018,22 @@ pub enum ValidationError {
         /// Expected deposit from `drep_deposit` protocol parameter.
         expected: u64,
     },
+    /// Haskell `ConwayDRepNotRegistered`: an `UnregDRep` certificate names a
+    /// DRep credential that is not present in the DRep registry.
+    ///
+    /// Without this check a transaction can credit a DRep deposit refund for a
+    /// credential that never registered — effectively minting ADA from nothing.
+    ///
+    /// Reference: Haskell `ConwayDRepNotRegistered` in
+    /// `cardano-ledger-conway:Cardano.Ledger.Conway.Rules.GovCert`.
+    #[error(
+        "DRep unregistration rejected: credential {credential_hash} is not registered \
+         (ConwayDRepNotRegistered)"
+    )]
+    DRepNotRegistered {
+        /// Hex-encoded DRep credential hash (zero-padded to 32 bytes).
+        credential_hash: String,
+    },
     /// Haskell `ProposalDepositIncorrect`: a governance proposal declares a
     /// deposit amount that does not match the current `gov_action_deposit`
     /// protocol parameter.
@@ -1073,6 +1090,27 @@ pub enum ValidationError {
         /// `minPoolCost` protocol parameter in lovelace.
         minimum: u64,
     },
+    /// POOL rule: pool registration margin must be a valid rational in `[0, 1]`.
+    ///
+    /// Haskell's POOL rule enforces `0 ≤ margin ≤ 1` via `PoolMarginsInvalidPOOL`.
+    /// Two conditions are rejected:
+    ///   * `denominator == 0` — division by zero; would panic in reward calculation.
+    ///   * `numerator > denominator` — margin > 100%; pool takes more than all rewards.
+    ///
+    /// The `u64` wire type already prevents negative numerator/denominator.
+    ///
+    /// Reference: Haskell `PoolMarginsInvalidPOOL` in
+    /// `cardano-ledger-shelley:Cardano.Ledger.Shelley.Rules.Pool`.
+    #[error(
+        "Pool registration rejected: margin {numerator}/{denominator} is not in [0,1] \
+         (PoolMarginsInvalidPOOL)"
+    )]
+    PoolMarginInvalid {
+        /// Declared margin numerator.
+        numerator: u64,
+        /// Declared margin denominator.
+        denominator: u64,
+    },
     /// Alonzo+ POOL rule: pool registration reward account network must match the
     /// network ID declared in the transaction body.
     ///
@@ -1091,6 +1129,15 @@ pub enum ValidationError {
         expected: dugite_primitives::network::NetworkId,
         actual: dugite_primitives::network::NetworkId,
     },
+    /// Pool registration: reward account has wrong length.
+    ///
+    /// A pool reward account must be exactly 29 bytes: 1 header byte followed by
+    /// a 28-byte credential hash (Blake2b-224). Any other length is rejected
+    /// by Haskell's `checkPoolParams` which deserialises the address strictly.
+    ///
+    /// Finding D8 of security audit #544.
+    #[error("Invalid pool reward account: {0}")]
+    InvalidRewardAccount(String),
     /// Auxiliary data hash content mismatch.
     ///
     /// When both `auxiliary_data_hash` and `auxiliary_data` are present in a
@@ -2199,6 +2246,37 @@ pub fn validate_transaction_with_pools(
                     let key = credential.to_typed_hash32();
                     if dreps.contains(&key) {
                         errors.push(ValidationError::DRepAlreadyRegistered {
+                            credential_hash: key.to_hex(),
+                        });
+                    }
+                }
+            }
+        }
+
+        // ------------------------------------------------------------------
+        // DRep not registered check (Haskell `ConwayDRepNotRegistered`)
+        //
+        // An `UnregDRep` certificate is rejected when the named DRep credential
+        // is NOT present in the DRep registry.  Without this check, the deposit
+        // accounting in `calculate_deposits_and_refunds` would credit the
+        // `refund` amount from the certificate even though no deposit was ever
+        // made — effectively minting ADA from nothing.
+        //
+        // This check is symmetric to the `ConwayDRepAlreadyRegistered` check
+        // above (RegDRep must NOT be registered; UnregDRep MUST be registered).
+        //
+        // Reference: Haskell `ConwayDRepNotRegistered` in
+        // `cardano-ledger-conway:Cardano.Ledger.Conway.Rules.GovCert`.
+        // ------------------------------------------------------------------
+        if let Some(dreps) = registered_dreps {
+            for cert in &tx.body.certificates {
+                if let dugite_primitives::transaction::Certificate::UnregDRep {
+                    credential, ..
+                } = cert
+                {
+                    let key = credential.to_typed_hash32();
+                    if !dreps.contains(&key) {
+                        errors.push(ValidationError::DRepNotRegistered {
                             credential_hash: key.to_hex(),
                         });
                     }

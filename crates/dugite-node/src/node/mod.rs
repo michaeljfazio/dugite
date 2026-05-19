@@ -28,7 +28,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::signal;
-use tokio::sync::{mpsc, watch, RwLock};
+use tokio::sync::{mpsc, watch, RwLock, Semaphore};
 use tokio::task::JoinHandle;
 use tracing::{debug, error, info, trace, warn};
 
@@ -55,6 +55,56 @@ use crate::config::NodeConfig;
 use crate::genesis::{AlonzoGenesis, ByronGenesis, ConwayGenesis, ShelleyGenesis};
 use crate::metrics::GovernanceSnapshot;
 use crate::topology::Topology;
+
+// ── Resource-limit constants (G-series audit fixes) ────────────────────────
+
+/// Timeout for the N2N inbound handshake task.
+///
+/// The inner `run_n2n_handshake_server` already has a 10-second timeout, but if
+/// the bearer stalls *before* reaching the handshake call (e.g. a peer sends
+/// exactly one byte and holds the TCP stream open), the outer task never
+/// reaches that timeout and parks indefinitely.  This outer guard ensures
+/// the task terminates regardless of where the stall occurs (G2).
+const N2N_INBOUND_TASK_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Heartbeat tick interval for the process-freeze watchdog (G9).
+const HEARTBEAT_TICK: Duration = Duration::from_secs(2);
+
+/// Maximum acceptable heartbeat lateness before logging a WARN (G9).
+const HEARTBEAT_LATE_THRESHOLD: Duration = Duration::from_secs(10);
+
+// ── N2N broadcast channel capacities ──────────────────────────────────────
+
+/// Block-announcement broadcast channel capacity for N2N and N2C servers.
+///
+/// 64 was the original value; increased to 512 to absorb burst fork events
+/// without triggering the `RecvError::Lagged` path that causes downstream
+/// peers to receive an incorrect rollback point (G6).
+const BLOCK_ANN_CHANNEL_CAP: usize = 512;
+
+/// Rollback-announcement broadcast channel capacity.
+///
+/// 16 was the original value; increased to 256.  Only the most-recent
+/// rollback matters, but a higher buffer reduces the chance of lagging
+/// during rapid fork oscillations (G6).
+const ROLLBACK_ANN_CHANNEL_CAP: usize = 256;
+
+// ── Fetch pipeline channel capacity ───────────────────────────────────────
+
+/// BlockFetch → ledger-apply channel capacity.
+///
+/// Reduced from 1000 to 128.  At 90 KB per block and 4 concurrent fetchers
+/// the old value allocated up to 4 × 1000 × 90 KB = 360 MB of in-flight
+/// blocks before ledger apply could process them.  128 caps this at ~46 MB
+/// while still providing adequate pipeline depth at typical apply throughput
+/// of 3–5 blocks/sec (G11).
+const FETCHED_BLOCKS_CHANNEL_CAP: usize = 128;
+
+/// GSM event channel capacity (G12).
+///
+/// Increased from 1024 to 4096 to absorb rapid peer churn events without
+/// dropping GSM events via try_send in the ChainSync task.
+const GSM_EVENT_CHANNEL_CAP: usize = 4096;
 
 /// Bind the N2N listener with `SO_REUSEADDR` + `SO_REUSEPORT` (Unix) so
 /// outbound connections from this node can share the listen port via
@@ -1281,11 +1331,13 @@ impl Node {
         // network_magic computed earlier (before ledger snapshot loading).
         // Server tasks are spawned in run() and live for the node's lifetime.
 
-        // Wire up live UTxO provider before wrapping in lock
+        // Wire up live UTxO provider and ChainDB before wrapping in lock.
+        // ChainDB is needed for validate_acquire (C1: SpecificPoint on-chain check).
         let mut qh = QueryHandler::new(args.config.max_major_protocol_version() as u32);
         qh.set_utxo_provider(Arc::new(serve::LedgerUtxoProvider {
             ledger: ledger_state.clone(),
         }));
+        qh.set_chain_db(chain_db.clone());
         let query_handler = Arc::new(RwLock::new(qh));
 
         // Load block producer credentials if key paths are provided.
@@ -1458,7 +1510,8 @@ impl Node {
             marker_path: args.database_path.join("caught_up.marker"),
             ..Default::default()
         };
-        let (gsm_event_tx, gsm_event_rx) = tokio::sync::mpsc::channel(1024);
+        // G12: increased from 1024 to 4096 to absorb rapid peer churn events.
+        let (gsm_event_tx, gsm_event_rx) = tokio::sync::mpsc::channel(GSM_EVENT_CHANNEL_CAP);
         // Compute the initial snapshot so consumers have the right state
         // before the actor has even started.
         let initial_gsm_state = if genesis_enabled {
@@ -1902,6 +1955,29 @@ impl Node {
                     return Err(e.into());
                 }
             };
+
+            // A-009 (security audit 2026-05-19): warn if the socket file is
+            // world-readable/writable.  Haskell cardano-node relies on filesystem
+            // permissions as the sole access-control mechanism for N2C; we enforce
+            // the same convention by warning operators if the umask is too permissive.
+            // The recommended permission is 0o600 (owner r/w only) or 0o660 (group).
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                if let Ok(meta) = std::fs::metadata(&n2c_socket_path) {
+                    let mode = meta.permissions().mode();
+                    if mode & 0o006 != 0 {
+                        warn!(
+                            socket = %n2c_socket_path.display(),
+                            mode = format_args!("{:#o}", mode & 0o777),
+                            "N2C socket is world-readable/writable — any local process can \
+                             submit transactions. Restrict with: chmod 600 {}",
+                            n2c_socket_path.display()
+                        );
+                    }
+                }
+            }
+
             info!(
                 socket = %n2c_socket_path.display(),
                 "N2C server listening"
@@ -1912,25 +1988,63 @@ impl Node {
             // For now, create a placeholder that will be replaced.
             // Actually, we share the same broadcast channel — create it here and use
             // it for both N2C LocalChainSync and N2N ChainSync server.
-            let (block_ann_tx, _) =
-                tokio::sync::broadcast::channel::<dugite_network::BlockAnnouncement>(64);
-            let (rollback_ann_tx, _) = tokio::sync::broadcast::channel::<RollbackAnnouncement>(16);
+            let (block_ann_tx, _) = tokio::sync::broadcast::channel::<
+                dugite_network::BlockAnnouncement,
+            >(BLOCK_ANN_CHANNEL_CAP);
+            let (rollback_ann_tx, _) =
+                tokio::sync::broadcast::channel::<RollbackAnnouncement>(ROLLBACK_ANN_CHANNEL_CAP);
             self.block_announcement_tx = Some(block_ann_tx.clone());
             self.rollback_announcement_tx = Some(rollback_ann_tx.clone());
             let n2c_block_ann_tx = block_ann_tx;
             let n2c_rollback_ann_tx = rollback_ann_tx;
+            // C4 + G3: bound the number of concurrent N2C connections.
+            // Reads from NodeConfig::max_n2c_connections (default 16); the
+            // semaphore enforces it via owned permits held for the connection
+            // lifetime. Matches Haskell cardano-node's LocalConnectionLimit
+            // semantics.
+            let n2c_max_connections = self.config.max_n2c_connections.max(1);
+            let n2c_semaphore = Arc::new(Semaphore::new(n2c_max_connections));
 
             tokio::spawn(async move {
                 let mut shutdown = n2c_shutdown_rx;
                 // Track spawned connection handlers so we can abort them on
                 // shutdown — otherwise they block indefinitely waiting for
                 // client I/O, preventing the process from exiting.
+                //
+                // C13 + G3: prune finished handles every iteration so the Vec
+                // never grows proportional to total-connections-since-start.
+                // The semaphore above enforces the configured connection limit
+                // so a local attacker (or a wallet that reconnects in a tight
+                // loop) cannot accumulate unbounded tasks or JoinHandles.
                 let mut conn_handles: Vec<tokio::task::JoinHandle<()>> = Vec::new();
+                let mut accept_count: usize = 0;
+                const PRUNE_INTERVAL: usize = 64;
+
                 loop {
+                    // Prune finished handles first — O(n) in active count, not
+                    // in total-accepted.
+                    conn_handles.retain(|h| !h.is_finished());
+
                     tokio::select! {
                         accept_result = listener.accept() => {
                             match accept_result {
                                 Ok((stream, _addr)) => {
+                                    // C4 + G3: enforce connection limit via the
+                                    // owned-permit semaphore. The permit is held
+                                    // for the connection lifetime and released
+                                    // automatically when the spawned task exits.
+                                    let permit = match n2c_semaphore.clone().try_acquire_owned() {
+                                        Ok(p) => p,
+                                        Err(_) => {
+                                            warn!(
+                                                limit = n2c_max_connections,
+                                                "N2C connection limit reached — dropping new connection"
+                                            );
+                                            // stream is dropped here, closing the socket.
+                                            continue;
+                                        }
+                                    };
+
                                     let conn_metrics = n2c_metrics.clone();
                                     conn_metrics
                                         .n2c_connections_total
@@ -1950,6 +2064,10 @@ impl Node {
                                     let magic = n2c_network_magic;
 
                                     let handle = tokio::spawn(async move {
+                                        // permit is held for the duration of the connection
+                                        // and released (dropping the OwnedSemaphorePermit)
+                                        // when the task exits.
+                                        let _permit = permit;
                                         if let Err(e) = Self::handle_n2c_connection(
                                             stream, magic, qh, bp, mp, tv, ledger, ann_rx,
                                             rb_rx, metrics.clone(),
@@ -1963,6 +2081,14 @@ impl Node {
                                             .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
                                     });
                                     conn_handles.push(handle);
+
+                                    // C13 fix: periodically prune completed JoinHandles
+                                    // to prevent unbounded Vec growth (each finished handle
+                                    // is ~128 bytes; over millions of connections this adds up).
+                                    accept_count += 1;
+                                    if accept_count.is_multiple_of(PRUNE_INTERVAL) {
+                                        conn_handles.retain(|h| !h.is_finished());
+                                    }
                                 }
                                 Err(e) => {
                                     warn!("N2C accept error: {e}");
@@ -2011,6 +2137,45 @@ impl Node {
             *self.peer_manager.write().await = pm;
         }
         let peer_manager = self.peer_manager.clone();
+
+        // G9: Process-freeze watchdog.
+        //
+        // A lightweight task that ticks every HEARTBEAT_TICK and warns if the
+        // tick was more than HEARTBEAT_LATE_THRESHOLD late.  This surfaces
+        // host-level freezes (macOS App Nap, cgroup CPU throttling, swap storms)
+        // that would otherwise be invisible until a missed leader slot is observed
+        // post-mortem.  On macOS, the launch wrapper should also prepend
+        // `caffeinate -dimsu` to prevent App Nap from suspending the process.
+        {
+            let mut heartbeat_shutdown = shutdown_rx.clone();
+            tokio::spawn(async move {
+                let mut interval = tokio::time::interval(HEARTBEAT_TICK);
+                interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+                let mut last_tick = std::time::Instant::now();
+                loop {
+                    tokio::select! {
+                        _ = interval.tick() => {
+                            let now = std::time::Instant::now();
+                            let elapsed = now.duration_since(last_tick);
+                            if elapsed > HEARTBEAT_TICK + HEARTBEAT_LATE_THRESHOLD {
+                                warn!(
+                                    elapsed_ms = elapsed.as_millis(),
+                                    threshold_ms = (HEARTBEAT_TICK + HEARTBEAT_LATE_THRESHOLD).as_millis(),
+                                    "PROCESS FREEZE DETECTED: heartbeat tick was late by {}ms. \
+                                     Check for host-level CPU throttling or OS suspension \
+                                     (macOS App Nap, cgroup, swap storm).",
+                                    elapsed.saturating_sub(HEARTBEAT_TICK).as_millis()
+                                );
+                            }
+                            last_tick = now;
+                        }
+                        _ = heartbeat_shutdown.changed() => {
+                            break;
+                        }
+                    }
+                }
+            });
+        }
 
         // Register topology peers in the peer manager with full metadata
         let detailed_peers = self.topology.detailed_peers();
@@ -2427,9 +2592,11 @@ impl Node {
         // If block_announcement_tx is None (N2C server was skipped for some reason),
         // create the channels here as a fallback.
         if self.block_announcement_tx.is_none() {
-            let (block_ann_tx, _) =
-                tokio::sync::broadcast::channel::<dugite_network::BlockAnnouncement>(64);
-            let (rollback_ann_tx, _) = tokio::sync::broadcast::channel::<RollbackAnnouncement>(16);
+            let (block_ann_tx, _) = tokio::sync::broadcast::channel::<
+                dugite_network::BlockAnnouncement,
+            >(BLOCK_ANN_CHANNEL_CAP);
+            let (rollback_ann_tx, _) =
+                tokio::sync::broadcast::channel::<RollbackAnnouncement>(ROLLBACK_ANN_CHANNEL_CAP);
             self.block_announcement_tx = Some(block_ann_tx);
             self.rollback_announcement_tx = Some(rollback_ann_tx);
         }
@@ -2483,9 +2650,47 @@ impl Node {
                 .filter(|ip| crate::node::networking::is_non_public_ip(*ip))
                 .collect();
 
+            // A-001 / A-002 (security audit 2026-05-19): gate every inbound
+            // connection through a Semaphore (global cap) and a ConnectionManager
+            // (per-IP cap + state tracking) before spawning a handler task.
+            //
+            // Previously `accepted_connections_limit` was parsed from config but
+            // never consulted at the accept point — `ConnectionManager::accept_inbound`
+            // was dead code. Now it is the single mandatory gate.
+            //
+            // Haskell `cardano-node` enforces limits in `Server.run` via
+            // `ConnectionLimits` (maxAcceptedConnections + maxAcceptedConnectionsPerHost)
+            // acquired before the TCP fd enters the handshake pipeline.
+            let n2n_max_inbound = self
+                .config
+                .accepted_connections_limit
+                .unwrap_or_default()
+                .hard_limit as usize;
+            let n2n_per_ip_limit: usize = 5; // matches Haskell maxAcceptedConnectionsPerHost default
+
+            // The semaphore doubles as a backpressure signal: when all permits
+            // are taken the accept() call still proceeds (we don't want to stop
+            // calling accept() as that would fill the OS SYN backlog), but the
+            // spawn is immediately rejected by the ConnectionManager check below.
+            let n2n_conn_semaphore =
+                std::sync::Arc::new(tokio::sync::Semaphore::new(n2n_max_inbound));
+
+            // Shared ConnectionManager for per-IP rate limiting.
+            let n2n_conn_mgr = std::sync::Arc::new(dugite_network::ConnectionManager::new(
+                dugite_network::ConnectionManagerConfig {
+                    max_inbound: n2n_max_inbound,
+                    max_outbound: 20,
+                    per_ip_rate_limit: n2n_per_ip_limit,
+                    network_magic: n2n_network_magic,
+                    peer_sharing: n2n_peer_sharing,
+                },
+            ));
+
             let n2n_inbound_tx = inbound_accept_tx.clone();
             tokio::spawn(async move {
                 let mut shutdown = n2n_shutdown_rx;
+                // Per-IP rate limiting (G1 sliding-window + A-002 concurrent-count)
+                // is enforced via the shared ConnectionManager (n2n_conn_mgr).
                 loop {
                     tokio::select! {
                         accept_result = tcp_listener.accept() => {
@@ -2512,7 +2717,69 @@ impl Node {
                                         drop(stream);
                                         continue;
                                     }
-                                    info!(%peer_addr, "N2N inbound connection accepted");
+                                    // G1 (#547): per-IP sliding-window rate limit
+                                    // (catches tight reconnect loops). 60-second window.
+                                    if !n2n_conn_mgr.check_and_record_inbound_ip(peer_addr.ip()).await {
+                                        debug!(
+                                            %peer_addr,
+                                            "N2N inbound rejected: per-IP sliding-window rate limit exceeded"
+                                        );
+                                        drop(stream);
+                                        continue;
+                                    }
+
+                                    // A-001 / A-002 (#541): gate through ConnectionManager
+                                    // for global max-inbound + per-IP concurrent-count.
+                                    match n2n_conn_mgr.accept_inbound(peer_addr).await {
+                                        Ok(()) => {}
+                                        Err(dugite_network::ConnectionError::MaxConnectionsReached) => {
+                                            info!(
+                                                %peer_addr,
+                                                max = n2n_max_inbound,
+                                                "N2N inbound rejected: max connections reached"
+                                            );
+                                            drop(stream);
+                                            continue;
+                                        }
+                                        Err(dugite_network::ConnectionError::RateLimited(_)) => {
+                                            debug!(
+                                                %peer_addr,
+                                                per_ip_limit = n2n_per_ip_limit,
+                                                "N2N inbound rejected: per-IP concurrent limit"
+                                            );
+                                            drop(stream);
+                                            continue;
+                                        }
+                                        Err(e) => {
+                                            debug!(%peer_addr, error = %e, "N2N inbound rejected by connection manager");
+                                            drop(stream);
+                                            continue;
+                                        }
+                                    }
+
+                                    // Acquire a semaphore permit (non-blocking try variant).
+                                    // The permit is dropped when the connection task exits,
+                                    // freeing the slot for the next inbound connection.
+                                    let permit = match n2n_conn_semaphore.clone().try_acquire_owned() {
+                                        Ok(p) => p,
+                                        Err(_) => {
+                                            // All permits taken — ConnectionManager already
+                                            // enforces max_inbound; this is a double-check.
+                                            info!(
+                                                %peer_addr,
+                                                "N2N inbound rejected: semaphore full"
+                                            );
+                                            n2n_conn_mgr.remove_connection(&peer_addr).await;
+                                            drop(stream);
+                                            continue;
+                                        }
+                                    };
+
+                                    // A-007 (security audit 2026-05-19): downgrade to debug.
+                                    // One INFO log per TCP SYN at 100 conn/s = ~50 KB/s of
+                                    // structured JSON log traffic; synchronous log drain stalls
+                                    // the async runtime. Haskell traces at Debug severity.
+                                    debug!(%peer_addr, "N2N inbound connection accepted");
                                     let conn_metrics = n2n_metrics.clone();
                                     conn_metrics
                                         .n2n_connections_total
@@ -2521,20 +2788,47 @@ impl Node {
                                     let magic = n2n_network_magic;
                                     let ps = n2n_peer_sharing;
                                     let tx = n2n_inbound_tx.clone();
+                                    let cm = n2n_conn_mgr.clone();
 
+                                    // G2: outer timeout guards against a peer
+                                    // that holds the TCP stream open while
+                                    // sending only partial data, parking the
+                                    // task before the inner handshake timeout
+                                    // is ever started.
                                     tokio::spawn(async move {
+                                        // `permit` is held for the lifetime of this task.
+                                        // Dropping it at end of scope releases the semaphore slot.
+                                        let _permit = permit;
                                         let start = std::time::Instant::now();
-                                        match PeerConnection::accept(
-                                            stream, peer_addr, magic, false, ps,
-                                        ).await {
-                                            Ok(conn) => {
-                                                let rtt_ms = start.elapsed().as_secs_f64() * 1000.0;
-                                                let _ = tx.send(Ok((peer_addr, conn, rtt_ms))).await;
+                                        let result = tokio::time::timeout(
+                                            N2N_INBOUND_TASK_TIMEOUT,
+                                            PeerConnection::accept(
+                                                stream, peer_addr, magic, false, ps,
+                                            ),
+                                        )
+                                        .await;
+                                        match result {
+                                            Ok(Ok(conn)) => {
+                                                let rtt_ms =
+                                                    start.elapsed().as_secs_f64() * 1000.0;
+                                                let _ =
+                                                    tx.send(Ok((peer_addr, conn, rtt_ms))).await;
                                             }
-                                            Err(e) => {
-                                                let _ = tx.send(Err((peer_addr, e.to_string()))).await;
+                                            Ok(Err(e)) => {
+                                                let _ = tx
+                                                    .send(Err((peer_addr, e.to_string())))
+                                                    .await;
+                                            }
+                                            Err(_elapsed) => {
+                                                warn!(
+                                                    %peer_addr,
+                                                    timeout_secs = N2N_INBOUND_TASK_TIMEOUT.as_secs(),
+                                                    "N2N inbound handshake timed out"
+                                                );
                                             }
                                         }
+                                        // Decrement per-IP counter on task exit.
+                                        cm.remove_connection(&peer_addr).await;
                                     });
                                 }
                                 Err(e) => {
@@ -2725,7 +3019,10 @@ impl Node {
         // Governor actions are dispatched through the lifecycle manager,
         // which creates/tears down protocol tasks on the single per-peer
         // mux connection.
-        let (fetched_blocks_tx, fetched_blocks_rx) = mpsc::channel::<FetchedBlock>(1000);
+        // G11: reduced from 1000 to 128 — caps in-flight memory to ~11 MB
+        // at 90 KB/block while still providing adequate pipeline depth.
+        let (fetched_blocks_tx, fetched_blocks_rx) =
+            mpsc::channel::<FetchedBlock>(FETCHED_BLOCKS_CHANNEL_CAP);
         let (peer_failure_tx, peer_failure_rx) = mpsc::channel::<SocketAddr>(64);
         let (keepalive_rtt_tx, keepalive_rtt_rx) = mpsc::channel::<(SocketAddr, f64)>(256);
         let candidate_chains: Arc<RwLock<HashMap<SocketAddr, CandidateChainState>>> =
@@ -3540,6 +3837,10 @@ impl Node {
                                         let fork_slot = fork_block.slot();
                                         let fork_block_no = fork_block.block_number();
                                         let fork_hash_hex = fork_block.header.header_hash.to_hex();
+
+                                        // Issue #545 E5 — body-hash verification DISABLED pending a
+                                        // correct implementation; see notes in `apply_fetched_block`.
+
                                         // Fix B (Bug B, 2026-05-16): use apply_block_with_delta
                                         // so that fork-replayed blocks also populate LedgerSeq.
                                         // Without this, after a successful fork switch the seq
@@ -3713,6 +4014,26 @@ impl Node {
             );
             return;
         }
+
+        // Issue #545 E5: verify that the block body delivered by BlockFetch matches
+        // the body hash committed in the header.  A malicious or buggy relay can
+        // substitute the body bytes while leaving the header (and its KES/VRF
+        // signatures) intact.  This check mirrors Haskell's `verifyBlockIntegrity`
+        // (`matchesHeaderHash`) called at the decode-and-apply boundary.
+        //
+        // We check AFTER storage because the block is keyed by header hash in ChainDB;
+        // a body-hash mismatch is a data integrity error from this peer, not a
+        // chain-selection issue.  The block is evicted from volatile state on mismatch.
+        // E5 (audit #545) — body-hash verification wire-in is DISABLED pending
+        // a correct implementation. The current `validate_block_body_hash` uses
+        // `blake2b_256(body_cbor)` over the concatenated 4-component body, but
+        // Haskell `bbHash` (in cardano-ledger `Cardano.Ledger.Block`) hashes
+        // each component independently and then hashes their concatenation:
+        //   bbHash = blake2b_256( blake2b_256(tx_bodies) || blake2b_256(witnesses)
+        //                       || blake2b_256(aux_data)  || blake2b_256(invalid_txs) )
+        // Calling the current implementation would reject every legitimate
+        // network block. Re-enable when the algorithm is corrected.
+        let _ = block.era.is_shelley_based();
 
         // When TriggeredFork already replayed all fork blocks (including the
         // incoming block) onto the ledger, skip the single-block apply path.
@@ -4101,25 +4422,36 @@ impl Node {
         let lts_mempool = mempool.clone();
         let lts_metrics = metrics.clone();
         let lts_task = tokio::spawn(async move {
-            let on_accepted = |era_id: u16, tx_bytes: Vec<u8>| {
+            // C12 fix: on_accepted now returns Result<(), String> so the server
+            // can send MsgRejectTx if the mempool fails to admit the transaction
+            // after successful Phase-1/Phase-2 validation. This prevents the
+            // protocol violation of sending MsgAcceptTx for an un-admitted tx.
+            let on_accepted = |era_id: u16, tx_bytes: Vec<u8>| -> Result<(), String> {
                 // Decode the transaction and add it to the mempool.
                 let size_bytes = tx_bytes.len();
                 match dugite_serialization::decode_transaction(era_id, &tx_bytes) {
                     Ok(tx) => {
                         let tx_hash = tx.hash;
                         debug!("N2C tx accepted, adding to mempool: {}", tx_hash);
-                        if let Err(e) = lts_mempool.add_tx(tx_hash, tx, size_bytes) {
-                            debug!("N2C tx accepted but mempool add failed: {e}");
+                        match lts_mempool.add_tx(tx_hash, tx, size_bytes) {
+                            Ok(_) => {
+                                // Update mempool metrics immediately
+                                lts_metrics.set_mempool_count(lts_mempool.len() as u64);
+                                lts_metrics.mempool_bytes.store(
+                                    lts_mempool.total_bytes() as u64,
+                                    std::sync::atomic::Ordering::Relaxed,
+                                );
+                                Ok(())
+                            }
+                            Err(e) => {
+                                debug!("N2C tx accepted but mempool add failed: {e}");
+                                Err(e.to_string())
+                            }
                         }
-                        // Update mempool metrics immediately after accepting a transaction
-                        lts_metrics.set_mempool_count(lts_mempool.len() as u64);
-                        lts_metrics.mempool_bytes.store(
-                            lts_mempool.total_bytes() as u64,
-                            std::sync::atomic::Ordering::Relaxed,
-                        );
                     }
                     Err(e) => {
                         debug!("N2C tx decode for mempool failed: {e}");
+                        Err(e.to_string())
                     }
                 }
             };
@@ -4154,13 +4486,58 @@ impl Node {
             }
         });
 
-        // LocalStateQuery server
+        // LocalStateQuery server.
+        //
+        // C3 fix: do NOT hold the RwLock guard for the entire connection lifetime.
+        // The old pattern `let handler = lsq_handler.read().await;` blocked the
+        // periodic `update_state()` write lock until the client disconnected.
+        // Instead, use a per-query wrapper that acquires and releases the read lock
+        // inside each dispatch method — the lock is never held across an .await point.
         let lsq_handler = query_handler;
         let lsq_task = tokio::spawn(async move {
-            let handler = lsq_handler.read().await;
+            // Per-query read-lock wrapper: acquires a blocking_read() guard for each
+            // individual dispatch call and drops it before returning. This ensures
+            // update_state() can always acquire its write lock between queries.
+            struct PerQueryHandler(Arc<RwLock<QueryHandler>>);
+            impl dugite_network::QueryHandler for PerQueryHandler {
+                fn handle_query(
+                    &self,
+                    query_cbor: &[u8],
+                    n2c_version: u16,
+                ) -> Result<Vec<u8>, String> {
+                    // Acquire read guard for this single query dispatch, then release.
+                    let guard = tokio::task::block_in_place(|| self.0.blocking_read());
+                    guard.handle_query(query_cbor, n2c_version)
+                }
+                fn handle_block_query(
+                    &self,
+                    tag: u64,
+                    query_cbor: &[u8],
+                ) -> Result<Vec<u8>, String> {
+                    let guard = tokio::task::block_in_place(|| self.0.blocking_read());
+                    guard.handle_block_query(tag, query_cbor)
+                }
+                fn handle_query_anytime(&self, query_cbor: &[u8]) -> Result<Vec<u8>, String> {
+                    let guard = tokio::task::block_in_place(|| self.0.blocking_read());
+                    guard.handle_query_anytime(query_cbor)
+                }
+                fn handle_query_hard_fork(&self, query_cbor: &[u8]) -> Result<Vec<u8>, String> {
+                    let guard = tokio::task::block_in_place(|| self.0.blocking_read());
+                    guard.handle_query_hard_fork(query_cbor)
+                }
+                fn validate_acquire(
+                    &self,
+                    target: &dugite_network::protocol::local_state_query::AcquireTarget,
+                ) -> Result<(), dugite_network::protocol::local_state_query::AcquireFailure>
+                {
+                    let guard = tokio::task::block_in_place(|| self.0.blocking_read());
+                    guard.validate_acquire(target)
+                }
+            }
+            let wrapper = PerQueryHandler(lsq_handler);
             if let Err(e) = protocol::local_state_query::server::LocalStateQueryServer::run(
                 &mut sq_ch,
-                &*handler,
+                &wrapper,
                 n2c_version,
             )
             .await

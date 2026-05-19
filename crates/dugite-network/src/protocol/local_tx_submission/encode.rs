@@ -100,7 +100,10 @@ fn encode_conway_ledger_pred_failure(enc: &mut Encoder<&mut Vec<u8>>, err: &TxVa
                     enc.u32(tx_ix).expect("infallible");
                 });
             } else {
-                encode_mempool_fallback(enc, &format!("{err:?}"));
+                {
+                    tracing::debug!(err = ?err, "LocalTxSubmission: partial encode fallback");
+                    encode_mempool_fallback(enc, "transaction validation failed");
+                }
             }
         }
 
@@ -208,7 +211,10 @@ fn encode_conway_ledger_pred_failure(enc: &mut Encoder<&mut Vec<u8>>, err: &TxVa
             let parsed: Vec<([u8; 32], u32)> =
                 inputs.iter().filter_map(|s| parse_tx_input(s)).collect();
             if parsed.is_empty() {
-                encode_mempool_fallback(enc, &format!("{err:?}"));
+                {
+                    tracing::debug!(err = ?err, "LocalTxSubmission: partial encode fallback");
+                    encode_mempool_fallback(enc, "transaction validation failed");
+                }
             } else {
                 encode_utxo_failure(enc, 0, |enc| {
                     // ConwayUtxosPredFailure: [1, CollectErrors-payload]
@@ -247,7 +253,10 @@ fn encode_conway_ledger_pred_failure(enc: &mut Encoder<&mut Vec<u8>>, err: &TxVa
                     enc.u32(tx_ix).expect("infallible");
                 });
             } else {
-                encode_mempool_fallback(enc, &format!("{err:?}"));
+                {
+                    tracing::debug!(err = ?err, "LocalTxSubmission: partial encode fallback");
+                    encode_mempool_fallback(enc, "transaction validation failed");
+                }
             }
         }
 
@@ -261,7 +270,10 @@ fn encode_conway_ledger_pred_failure(enc: &mut Encoder<&mut Vec<u8>>, err: &TxVa
                     enc.bytes(&vkey_bytes).expect("infallible");
                 });
             } else {
-                encode_mempool_fallback(enc, &format!("{err:?}"));
+                {
+                    tracing::debug!(err = ?err, "LocalTxSubmission: partial encode fallback");
+                    encode_mempool_fallback(enc, "transaction validation failed");
+                }
             }
         }
 
@@ -277,7 +289,10 @@ fn encode_conway_ledger_pred_failure(enc: &mut Encoder<&mut Vec<u8>>, err: &TxVa
                     enc.bytes(&keyhash).expect("infallible");
                 });
             } else {
-                encode_mempool_fallback(enc, &format!("{err:?}"));
+                {
+                    tracing::debug!(err = ?err, "LocalTxSubmission: partial encode fallback");
+                    encode_mempool_fallback(enc, "transaction validation failed");
+                }
             }
         }
 
@@ -292,7 +307,10 @@ fn encode_conway_ledger_pred_failure(enc: &mut Encoder<&mut Vec<u8>>, err: &TxVa
                     enc.bytes(&script_hash).expect("infallible");
                 });
             } else {
-                encode_mempool_fallback(enc, &format!("{err:?}"));
+                {
+                    tracing::debug!(err = ?err, "LocalTxSubmission: partial encode fallback");
+                    encode_mempool_fallback(enc, "transaction validation failed");
+                }
             }
         }
 
@@ -401,8 +419,17 @@ fn encode_conway_ledger_pred_failure(enc: &mut Encoder<&mut Vec<u8>>, err: &TxVa
 
         // ── Fallback for all unmapped variants ──
         // ConwayMempoolFailure (Ledger tag 7): [7, "descriptive text"]
+        //
+        // C8 fix: do NOT send internal Rust debug formatting (struct names,
+        // field values, hashes) to the client — that leaks pool IDs, stake
+        // credential hashes, and other ledger internals. Log the full detail
+        // server-side at DEBUG level and send only a generic reason.
         _ => {
-            encode_mempool_fallback(enc, &format!("{err:?}"));
+            tracing::debug!(
+                err = ?err,
+                "LocalTxSubmission: unmapped validation error (sending generic rejection)"
+            );
+            encode_mempool_fallback(enc, "transaction validation failed");
         }
     }
 }
@@ -475,6 +502,12 @@ fn encode_utxow_failure(
 
 /// Encode a `ConwayMempoolFailure` (Ledger tag 7) with a text description.
 /// Used as fallback for error variants that can't be mapped to structured CBOR.
+/// Encode a `ConwayMempoolFailure` (tag 7) with a sanitized message.
+///
+/// C8 fix: the `text` parameter MUST NOT contain internal Rust debug output
+/// (struct field names, enum variant names, internal state values). Callers
+/// should log the detailed error server-side at `tracing::debug!` level and
+/// pass only a sanitized public reason string here.
 fn encode_mempool_fallback(enc: &mut Encoder<&mut Vec<u8>>, text: &str) {
     // ConwayLedgerPredFailure: array(2)[7, text]
     enc.array(2).expect("infallible");
@@ -911,6 +944,9 @@ mod tests {
 
     #[test]
     fn test_encode_fallback() {
+        // C8 fix: the fallback arm must NOT expose internal Rust debug details.
+        // The error variant "Other" with a detailed message must produce a sanitized
+        // wire message ("transaction validation failed") rather than the raw debug string.
         let err = TxValidationError::Other("something unexpected".to_string());
         let bytes = encode_apply_tx_err(&err, 6);
 
@@ -926,7 +962,17 @@ mod tests {
         let tag = dec.u8().unwrap();
         assert_eq!(tag, 7, "ConwayMempoolFailure");
         let text = dec.str().unwrap();
-        assert!(text.contains("something unexpected"));
+        // C8: must NOT contain the internal error string or Rust debug formatting.
+        assert!(
+            !text.contains("something unexpected"),
+            "internal error text must not reach the wire: got {text:?}"
+        );
+        assert!(
+            !text.contains('{') && !text.contains('}'),
+            "Rust struct formatting must not reach the wire: got {text:?}"
+        );
+        // Must be the sanitized generic message.
+        assert_eq!(text, "transaction validation failed");
     }
 
     #[test]

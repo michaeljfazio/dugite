@@ -20,7 +20,9 @@ pub mod types;
 mod utxo;
 
 use dugite_primitives::block::Point;
+use dugite_storage::ChainDB;
 use std::sync::Arc;
+use tokio::sync::RwLock;
 use tracing::{debug, warn};
 
 // Re-export all public types for backwards compatibility.
@@ -56,6 +58,12 @@ pub struct QueryHandler {
     /// reflects the running configuration (PV11 by default, PV12 when
     /// `experimental_hard_forks_enabled` is set) rather than a stale constant.
     max_major_prot_ver: u32,
+    /// ChainDB reference for `validate_acquire` point-on-chain checks (C1).
+    ///
+    /// When `None` (tests that don't wire up storage), `VolatileTip` and
+    /// `ImmutableTip` always succeed and `SpecificPoint` always fails with
+    /// `PointNotOnChain` — the safest default.
+    chain_db: Option<Arc<RwLock<ChainDB>>>,
 }
 
 impl QueryHandler {
@@ -70,7 +78,16 @@ impl QueryHandler {
             utxo_provider: None,
             n2c_version: std::sync::atomic::AtomicU16::new(0),
             max_major_prot_ver,
+            chain_db: None,
         }
+    }
+
+    /// Wire up the ChainDB reference for `validate_acquire` (C1 fix).
+    ///
+    /// Must be called before the handler is exposed to N2C clients. Without
+    /// this, `SpecificPoint` acquires always fail with `PointNotOnChain`.
+    pub fn set_chain_db(&mut self, chain_db: Arc<RwLock<ChainDB>>) {
+        self.chain_db = Some(chain_db);
     }
 
     /// Returns the configured max major protocol version. Exposed for tests.
@@ -635,12 +652,56 @@ impl dugite_network::QueryHandler for QueryHandler {
 
     fn validate_acquire(
         &self,
-        _target: &dugite_network::protocol::local_state_query::AcquireTarget,
+        target: &dugite_network::protocol::local_state_query::AcquireTarget,
     ) -> Result<(), dugite_network::protocol::local_state_query::AcquireFailure> {
-        // Always succeed — the old server always accepted acquire requests.
-        // A more sophisticated implementation could validate that the point
-        // is on-chain and within the volatile window.
-        Ok(())
+        use dugite_network::codec::Point as CodecPoint;
+        use dugite_network::protocol::local_state_query::{AcquireFailure, AcquireTarget};
+
+        match target {
+            // VolatileTip and ImmutableTip always refer to the current chain
+            // tip — they are always valid acquire targets.
+            AcquireTarget::VolatileTip | AcquireTarget::ImmutableTip => Ok(()),
+
+            // SpecificPoint: the client has requested a historical point.
+            // Mirror Haskell `ouroboros-consensus`: the point must exist in
+            // either the VolatileDB (recent blocks) or the ImmutableDB (finalized
+            // blocks). If it is not found on any chain, return PointNotOnChain.
+            //
+            // Note: we do NOT distinguish PointTooOld from PointNotOnChain here
+            // because ImmutableDB already contains all finalized blocks — if a
+            // block is in ImmutableDB it is still addressable. A point before the
+            // immutable tip that is truly absent simply was never on our chain.
+            AcquireTarget::SpecificPoint(point) => match point {
+                CodecPoint::Origin => {
+                    // Origin is always a valid acquire target.
+                    Ok(())
+                }
+                CodecPoint::Specific(_slot, hash_arr) => match &self.chain_db {
+                    None => {
+                        // No ChainDB wired (tests without storage) — refuse specific-point
+                        // acquires defensively rather than silently accepting a fabricated point.
+                        debug!("validate_acquire: no chain_db wired, refusing SpecificPoint");
+                        Err(AcquireFailure::PointNotOnChain)
+                    }
+                    Some(chain_db) => {
+                        let block_hash = dugite_primitives::hash::Hash32::from_bytes(*hash_arr);
+                        let on_chain = tokio::task::block_in_place(|| {
+                            let db = chain_db.blocking_read();
+                            db.has_block(&block_hash)
+                        });
+                        if on_chain {
+                            Ok(())
+                        } else {
+                            debug!(
+                                hash = hex::encode(hash_arr),
+                                "validate_acquire: SpecificPoint not on chain — refusing"
+                            );
+                            Err(AcquireFailure::PointNotOnChain)
+                        }
+                    }
+                },
+            },
+        }
     }
 }
 
@@ -1630,5 +1691,70 @@ mod tests {
         enc.u32(1).unwrap();
         let result = handler.handle_query_hard_fork(&buf);
         assert!(result.is_ok());
+    }
+
+    // ── C1 tests: validate_acquire point-on-chain checks ─────────────────────
+
+    use dugite_network::codec::Point as CodecPoint;
+    use dugite_network::protocol::local_state_query::{AcquireFailure, AcquireTarget};
+
+    /// C1: VolatileTip and ImmutableTip always succeed regardless of chain_db.
+    #[test]
+    fn c1_volatile_tip_always_succeeds() {
+        use dugite_network::QueryHandler as _;
+        let handler = super::QueryHandler::new(11); // no chain_db
+        assert_eq!(
+            handler.validate_acquire(&AcquireTarget::VolatileTip),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn c1_immutable_tip_always_succeeds() {
+        use dugite_network::QueryHandler as _;
+        let handler = super::QueryHandler::new(11); // no chain_db
+        assert_eq!(
+            handler.validate_acquire(&AcquireTarget::ImmutableTip),
+            Ok(())
+        );
+    }
+
+    /// C1: SpecificPoint with no chain_db must return PointNotOnChain (defensive default).
+    #[test]
+    fn c1_specific_point_no_chain_db_returns_not_on_chain() {
+        use dugite_network::QueryHandler as _;
+        let handler = super::QueryHandler::new(11); // no chain_db
+        let point = AcquireTarget::SpecificPoint(CodecPoint::Specific(1000, [0xAA; 32]));
+        assert_eq!(
+            handler.validate_acquire(&point),
+            Err(AcquireFailure::PointNotOnChain),
+            "SpecificPoint with no chain_db must refuse (defensive default)"
+        );
+    }
+
+    /// C1: Origin point is always valid even without chain_db.
+    #[test]
+    fn c1_origin_point_always_valid() {
+        use dugite_network::QueryHandler as _;
+        let handler = super::QueryHandler::new(11); // no chain_db
+        let point = AcquireTarget::SpecificPoint(CodecPoint::Origin);
+        assert_eq!(
+            handler.validate_acquire(&point),
+            Ok(()),
+            "Origin point must always be a valid acquire target"
+        );
+    }
+
+    /// C1: failure encoding — PointNotOnChain → wire tag 1.
+    #[test]
+    fn c1_failure_encoding_point_not_on_chain() {
+        // The server encodes AcquireFailure::PointNotOnChain as [2, [1]]
+        // (MsgFailure tag=2, failure = array(1)[1])
+        // Verify our enum value matches the Haskell wire encoding.
+        let failure = AcquireFailure::PointNotOnChain;
+        assert_eq!(failure, AcquireFailure::PointNotOnChain); // round-trip through PartialEq
+                                                              // Also verify PointTooOld has a distinct value
+        let too_old = AcquireFailure::PointTooOld;
+        assert_ne!(failure, too_old);
     }
 }

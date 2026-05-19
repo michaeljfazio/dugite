@@ -308,11 +308,13 @@ fn praos_tiebreak(
         // block forged much later cannot displace an already-adopted chain by
         // winning the VRF lottery — doing so would incentivize pools to ignore
         // other pools' blocks, harming geographic decentralization.
-        let is_conway = era == Era::Conway || {
-            // Also treat any era that would map to protocol ≥ 9 as Conway-style.
-            // In practice we check the era enum directly.
-            false
-        };
+        // Issue #545 E6: apply RestrictedVRFTiebreaker to all Conway+ eras.
+        // Dijkstra is a Conway alias (proto >= 9) and must use the same slot-window
+        // restriction — otherwise a Dijkstra-era block from a later slot can displace
+        // an already-adopted chain tip, violating the Conway protocol specification.
+        // Use era matching rather than protocol_version so this is forward-compatible
+        // with future era additions that share the Conway consensus rules.
+        let is_conway = matches!(era, Era::Conway | Era::Dijkstra);
 
         let apply_vrf_comparison = if is_conway {
             // Only compare VRF if slots are within the window.
@@ -2483,6 +2485,122 @@ mod tests {
             result,
             ChainPreference::PreferCurrent,
             "Honest dense chain must beat longer sparse adversary chain"
+        );
+    }
+
+    // ── Issue #545 E6 tests: Dijkstra era chain selection tiebreaker ──────────
+
+    /// E6: Dijkstra-era blocks must apply the RestrictedVRFTiebreaker slot-window
+    /// restriction just like Conway.  A block far outside the window should NOT
+    /// displace an already-adopted chain tip in Dijkstra era.
+    #[test]
+    fn issue_545_e6_dijkstra_applies_slot_window_restriction() {
+        use dugite_primitives::block::{BlockHeader, OperationalCert, ProtocolVersion, VrfOutput};
+        use dugite_primitives::hash::Hash32;
+        use dugite_primitives::time::{BlockNo, SlotNo};
+
+        // Helper: make a minimal header at a given slot with VRF output.
+        let make_header = |slot: u64, vrf_out: u8| BlockHeader {
+            header_hash: Hash32::ZERO,
+            prev_hash: Hash32::ZERO,
+            issuer_vkey: vec![vrf_out; 32], // different pools
+            vrf_vkey: vec![vrf_out; 32],
+            vrf_result: VrfOutput {
+                output: vec![vrf_out; 64],
+                proof: vec![0u8; 80],
+            },
+            nonce_vrf_output: vec![],
+            nonce_vrf_proof: vec![],
+            block_number: BlockNo(1),
+            slot: SlotNo(slot),
+            epoch_nonce: Hash32::ZERO,
+            body_size: 0,
+            body_hash: Hash32::ZERO,
+            operational_cert: OperationalCert {
+                hot_vkey: vec![1u8; 32],
+                sequence_number: 0,
+                kes_period: 0,
+                sigma: vec![0u8; 64],
+            },
+            protocol_version: ProtocolVersion {
+                major: 10,
+                minor: 0,
+            },
+            kes_signature: vec![],
+        };
+
+        // Current tip: slot 1000, pool A (VRF output = 0x01 = "small")
+        let current = make_header(1000, 0x01);
+        // Candidate: slot 10000 (far outside 3*2160/0.05 = 129600 window, but still
+        // within for this small slot_window value), with VRF output = 0xFF = "large"
+        // (normally would win the VRF lottery, but should be suppressed by slot-window).
+        let candidate = make_header(2000, 0xFF);
+
+        // slot_window = 129600 (mainnet default).
+        // slot_diff = 1000 → within window → VRF comparison applies.
+        let within_result = praos_tiebreak(&current, &candidate, Era::Dijkstra, 129600);
+        // current.vrf_result.output = 0x01 (lower) → current wins
+        assert_eq!(
+            within_result,
+            ChainPreference::PreferCurrent,
+            "Dijkstra: current with lower VRF output should win within slot window"
+        );
+
+        // Now test outside the window: candidate at slot 200_000 (> slot_window from slot 1000)
+        let far_candidate = make_header(200_000, 0x00); // even with 0x00 (minimum VRF), should lose
+        let outside_result = praos_tiebreak(&current, &far_candidate, Era::Dijkstra, 129600);
+        assert_eq!(
+            outside_result,
+            ChainPreference::PreferCurrent,
+            "Dijkstra: current chain should be preferred when candidate is far outside slot window"
+        );
+    }
+
+    /// E6: pre-Conway eras still apply VRF comparison unconditionally (no slot-window gate).
+    #[test]
+    fn issue_545_e6_pre_conway_no_slot_window_restriction() {
+        use dugite_primitives::block::{BlockHeader, OperationalCert, ProtocolVersion, VrfOutput};
+        use dugite_primitives::hash::Hash32;
+        use dugite_primitives::time::{BlockNo, SlotNo};
+
+        let make_header = |slot: u64, vrf_out: u8, pool_id: u8| BlockHeader {
+            header_hash: Hash32::ZERO,
+            prev_hash: Hash32::ZERO,
+            issuer_vkey: vec![pool_id; 32], // different pools via distinct pool_id
+            vrf_vkey: vec![pool_id; 32],
+            vrf_result: VrfOutput {
+                output: vec![vrf_out; 64],
+                proof: vec![0u8; 80],
+            },
+            nonce_vrf_output: vec![],
+            nonce_vrf_proof: vec![],
+            block_number: BlockNo(1),
+            slot: SlotNo(slot),
+            epoch_nonce: Hash32::ZERO,
+            body_size: 0,
+            body_hash: Hash32::ZERO,
+            operational_cert: OperationalCert {
+                hot_vkey: vec![1u8; 32],
+                sequence_number: 0,
+                kes_period: 0,
+                sigma: vec![0u8; 64],
+            },
+            protocol_version: ProtocolVersion { major: 6, minor: 0 }, // Alonzo
+            kes_signature: vec![],
+        };
+
+        let current = make_header(1000, 0xFF, 0xAA); // large VRF output, pool A
+                                                     // Candidate far outside slot window, but with a smaller VRF output
+        let far_candidate = make_header(200_000, 0x01, 0xBB); // small VRF output, pool B
+
+        // In Alonzo (non-Conway), slot-window restriction is NOT applied,
+        // so the VRF comparison runs unconditionally.
+        // candidate.vrf_result.output = 0x01 < current.vrf_result.output = 0xFF
+        // → candidate should win.
+        let result = praos_tiebreak(&current, &far_candidate, Era::Alonzo, 129600);
+        assert_eq!(
+            result, ChainPreference::PreferCandidate,
+            "Pre-Conway: VRF comparison is unconditional, candidate with lower VRF output should win"
         );
     }
 }

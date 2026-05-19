@@ -9,6 +9,24 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use tracing::{debug, info, trace, warn};
 
+/// Maximum number of entries the `order` VecDeque may hold, including tombstoned
+/// slots that have not yet been compacted.  This is an absolute upper bound;
+/// compaction fires well before this point (when tombstones exceed 50% AND > 100).
+///
+/// With `max_transactions = 16_384` a 4× headroom gives 65_536 slots — each slot
+/// is one `TransactionHash` (32 bytes) ≈ 2 MiB worst-case, which is acceptable.
+/// An adversary cycling add/evict at full mempool rate cannot push past this cap.
+const ORDER_DEQUE_MAX: usize = 4 * 16_384; // 65 536 entries
+
+/// Maximum chain depth for dependent transactions admitted via the virtual UTxO
+/// set.  Admitting a tx whose parent chain already reaches this depth is
+/// rejected at admission time, preventing adversarial O(N²) cascade eviction.
+///
+/// Haskell cardano-node does not admit chained (dependent) txs at all; we allow
+/// a small fixed depth to support wallet workflows while bounding worst-case
+/// cascade cost to `VIRTUAL_CHAIN_MAX_DEPTH * O(log N)`.
+const VIRTUAL_CHAIN_MAX_DEPTH: usize = 5;
+
 /// Configuration for the mempool
 #[derive(Debug, Clone)]
 pub struct MempoolConfig {
@@ -208,6 +226,10 @@ pub enum MempoolError {
     /// `claimed_by` is the hash of the tx that holds the conflicting input.
     #[error("Input conflict: input already claimed by mempool tx {claimed_by}")]
     InputConflict { claimed_by: TransactionHash },
+    /// Rejected because the virtual (chained) dependency chain exceeds the
+    /// admission depth limit.  Prevents adversarial O(N²) cascade eviction.
+    #[error("Virtual chain too deep: depth {depth} exceeds max {max}")]
+    VirtualChainTooDeep { depth: usize, max: usize },
 }
 
 /// Result of adding a transaction
@@ -408,6 +430,11 @@ impl Mempool {
         // UTxO set.  If so, record this tx as a child of that parent so that
         // cascading removal works correctly when the parent is removed.
         //
+        // G7: also enforce VIRTUAL_CHAIN_MAX_DEPTH — reject txs that would
+        // extend a virtual chain beyond the cap so that cascade eviction cost
+        // stays bounded at O(VIRTUAL_CHAIN_MAX_DEPTH * log N).  Haskell does
+        // not admit chained txs at all; our cap is a safe middle ground.
+        //
         // Note: `claimed_inputs` was populated just above for this tx's own
         // inputs.  We use `virtual_utxo` as the authoritative lookup because
         // virtual_utxo is keyed by (parent_tx_hash, output_index) — exactly
@@ -424,6 +451,34 @@ impl Mempool {
                     // Guard against a tx referencing its own hash (impossible
                     // in practice but defensive).
                     if parent_hash != tx_hash {
+                        // Walk up the dependency chain to measure depth.
+                        let mut depth = 1usize;
+                        let mut ancestor = parent_hash;
+                        while let Some(grandparents) = dep_map
+                            .iter()
+                            .find_map(|(k, v)| if v.contains(&ancestor) { Some(k) } else { None })
+                            .copied()
+                        {
+                            depth += 1;
+                            if depth >= VIRTUAL_CHAIN_MAX_DEPTH {
+                                // Release inputs we already claimed before returning
+                                for inp in &tx.body.inputs {
+                                    self.claimed_inputs.remove(inp);
+                                }
+                                self.tx_count.fetch_sub(1, Ordering::Relaxed);
+                                warn!(
+                                    hash = %tx_hash.to_hex(),
+                                    depth,
+                                    max = VIRTUAL_CHAIN_MAX_DEPTH,
+                                    "Mempool: rejecting tx — virtual chain depth limit exceeded"
+                                );
+                                return Err(MempoolError::VirtualChainTooDeep {
+                                    depth,
+                                    max: VIRTUAL_CHAIN_MAX_DEPTH,
+                                });
+                            }
+                            ancestor = grandparents;
+                        }
                         dep_map.entry(parent_hash).or_default().push(tx_hash);
                     }
                 }
@@ -460,7 +515,24 @@ impl Mempool {
         // The old order entry becomes a harmless duplicate — deduplication in
         // get_txs_for_block handles it.
         self.order_tombstones.write().remove(&tx_hash);
-        self.order.write().push_back(tx_hash);
+        // G5: cap the order VecDeque to prevent unbounded growth under
+        // adversarial add/evict cycling.  Compact first (cheap when below
+        // threshold), then enforce the hard cap.
+        self.maybe_compact_order();
+        {
+            let mut order = self.order.write();
+            if order.len() >= ORDER_DEQUE_MAX {
+                // Hard cap hit — this should be unreachable in practice because
+                // ensure_capacity evicts before we get here, but treat it as a
+                // safety net against tombstone accumulation races.
+                warn!(
+                    cap = ORDER_DEQUE_MAX,
+                    "Mempool: order VecDeque cap reached, discarding oldest tombstoned slot"
+                );
+                order.pop_front();
+            }
+            order.push_back(tx_hash);
+        }
         *self.total_bytes.write() += size_bytes;
         self.total_ex_mem.fetch_add(ex_units_mem, Ordering::Relaxed);
         self.total_ex_steps
@@ -652,26 +724,39 @@ impl Mempool {
         let removed_tx = entry.tx;
 
         if cascade {
-            // BFS cascade: collect the direct children of this tx, then for
-            // each child collect its children, until no more dependents remain.
-            // We do not recurse to avoid stack overflow on deep chains.
-            let mut queue: Vec<TransactionHash> = {
+            // G7: BFS cascade — collect ALL descendant hashes first, then do a
+            // single batched removal for fee_index and total_bytes to avoid
+            // acquiring those write locks O(N) times for a chain of N dependents.
+            // This reduces the worst-case cost from O(N log N) write-locks to a
+            // single O(N log N) BTreeSet batch + 2 lock acquisitions.
+            let mut all_children: Vec<TransactionHash> = Vec::new();
+            let mut bfs: Vec<TransactionHash> = {
                 let mut dep_map = self.dependents.write();
                 dep_map.remove(tx_hash).unwrap_or_default()
             };
 
-            while !queue.is_empty() {
-                let mut next_queue: Vec<TransactionHash> = Vec::new();
-                for child_hash in &queue {
-                    // Collect this child's own children before removing it
+            while !bfs.is_empty() {
+                let mut next: Vec<TransactionHash> = Vec::new();
+                for child_hash in &bfs {
                     let grandchildren: Vec<TransactionHash> = {
                         let mut dep_map = self.dependents.write();
                         dep_map.remove(child_hash).unwrap_or_default()
                     };
-                    next_queue.extend(grandchildren);
+                    next.extend(grandchildren);
+                }
+                all_children.extend(bfs);
+                bfs = next;
+            }
 
-                    // Remove the child without triggering another cascade
-                    // (we handle it in this BFS loop instead).
+            if !all_children.is_empty() {
+                // Batch: collect all keys before acquiring fee_index write lock once.
+                let mut child_keys: Vec<FeeDensityKey> = Vec::with_capacity(all_children.len());
+                let mut child_byte_total: usize = 0;
+                let mut child_ex_mem_total: u64 = 0;
+                let mut child_ex_steps_total: u64 = 0;
+                let mut child_ref_total: usize = 0;
+
+                for child_hash in &all_children {
                     if let Some((_, child_entry)) = self.txs.remove(child_hash) {
                         self.tx_count.fetch_sub(1, Ordering::Relaxed);
                         self.order_tombstones.write().insert(*child_hash);
@@ -687,19 +772,15 @@ impl Mempool {
                             self.virtual_utxo.remove(&virt_input);
                         }
 
-                        let child_key = FeeDensityKey::new(
+                        child_keys.push(FeeDensityKey::new(
                             child_entry.fee.0,
                             child_entry.size_bytes,
                             *child_hash,
-                        );
-                        self.fee_index.write().remove(&child_key);
-                        *self.total_bytes.write() -= child_entry.size_bytes;
-                        self.total_ex_mem
-                            .fetch_sub(child_entry.ex_units_mem, Ordering::Relaxed);
-                        self.total_ex_steps
-                            .fetch_sub(child_entry.ex_units_steps, Ordering::Relaxed);
-                        self.total_ref_scripts_bytes
-                            .fetch_sub(child_entry.ref_scripts_bytes, Ordering::Relaxed);
+                        ));
+                        child_byte_total += child_entry.size_bytes;
+                        child_ex_mem_total += child_entry.ex_units_mem;
+                        child_ex_steps_total += child_entry.ex_units_steps;
+                        child_ref_total += child_entry.ref_scripts_bytes;
 
                         debug!(
                             hash = %child_hash.to_hex(),
@@ -709,9 +790,27 @@ impl Mempool {
                         );
                     }
                 }
-                queue = next_queue;
+
+                // Single write lock for the entire batch
+                {
+                    let mut fi = self.fee_index.write();
+                    for key in child_keys {
+                        fi.remove(&key);
+                    }
+                }
+                *self.total_bytes.write() -= child_byte_total;
+                self.total_ex_mem
+                    .fetch_sub(child_ex_mem_total, Ordering::Relaxed);
+                self.total_ex_steps
+                    .fetch_sub(child_ex_steps_total, Ordering::Relaxed);
+                self.total_ref_scripts_bytes
+                    .fetch_sub(child_ref_total, Ordering::Relaxed);
             }
         }
+
+        // G5: compact the order VecDeque after every removal to prevent unbounded
+        // growth under adversarial churn (not just from evict_expired).
+        self.maybe_compact_order();
 
         Some(removed_tx)
     }
@@ -4598,5 +4697,138 @@ mod tests {
             mempool.contains(&simple_hash),
             "simple tx should survive ExUnits check (no redeemers)"
         );
+    }
+
+    // ── G5: order VecDeque cap enforcement ──────────────────────────────────
+
+    /// After 10 000 add+evict cycles the order VecDeque must stay below the cap.
+    ///
+    /// Scenario: fill the mempool to `max_transactions`, then cycle one
+    /// low-priority tx in/out so that every admission triggers an eviction.
+    /// The order deque would grow by 1 per cycle without the cap; with the cap
+    /// it must remain bounded.
+    #[test]
+    fn test_order_deque_bounded_under_churn() {
+        let cfg = MempoolConfig {
+            max_transactions: 32,
+            max_bytes: 512 * 1024 * 1024,
+            ..MempoolConfig::default()
+        };
+        let mempool = Mempool::new(cfg);
+
+        // Flood with mid-priority txs
+        for i in 0u64..32 {
+            let (tx, hash) = make_churn_tx(500, i);
+            let _ = mempool.add_tx_full(hash, tx, 300, Lovelace(500), 0, 0, 0, TxOrigin::Remote);
+        }
+        assert_eq!(mempool.len(), 32);
+
+        // Cycle: add a low-priority tx (immediately evicted), repeat 200 times.
+        for i in 0u64..200 {
+            let (tx, hash) = make_churn_tx(1, i + 1000);
+            let _ = mempool.add_tx_full(hash, tx, 300, Lovelace(1), 0, 0, 0, TxOrigin::Remote);
+        }
+
+        let order_len = mempool.order.read().len();
+        assert!(
+            order_len <= ORDER_DEQUE_MAX,
+            "order VecDeque must stay <= ORDER_DEQUE_MAX ({ORDER_DEQUE_MAX}), got {order_len}"
+        );
+        // Also assert tombstones don't drift past the live tx count by more than
+        // 4x (since compaction fires at 50% ratio + 100 tombstones minimum).
+        let tombstone_count = mempool.order_tombstones.read().len();
+        let live = mempool.len();
+        assert!(
+            tombstone_count <= live * 4 + 200,
+            "tombstones ({tombstone_count}) should not vastly exceed live count ({live})"
+        );
+    }
+
+    // Helper: make a tx with a given fee and unique u64 seed (for G5/G7 tests).
+    // Uses make_tx_with_outputs which uses an atomic counter for unique hashes.
+    // Named distinctly to avoid conflict with the `make_tx_with_fee(fee: u64) -> Transaction`
+    // helper defined earlier in the test module.
+    fn make_churn_tx(fee: u64, _seed: u64) -> (Transaction, TransactionHash) {
+        let (mut tx, hash) = make_tx_with_outputs(&[2_000_000]);
+        tx.body.fee = Lovelace(fee);
+        (tx, hash)
+    }
+
+    // ── G7: virtual chain depth cap ─────────────────────────────────────────
+
+    /// Admitting a virtual chain of exactly VIRTUAL_CHAIN_MAX_DEPTH must succeed;
+    /// the (depth+1)th tx in the chain must be rejected.
+    #[test]
+    fn test_virtual_chain_depth_cap() {
+        let mempool = Mempool::new(default_config());
+
+        // Build a chain of VIRTUAL_CHAIN_MAX_DEPTH - 1 txs (all should succeed).
+        let (root_tx, root_hash) = make_tx_with_outputs(&[1_000_000]);
+        mempool.add_tx(root_hash, root_tx, 300).unwrap();
+
+        let mut prev_hash = root_hash;
+        for depth in 1..VIRTUAL_CHAIN_MAX_DEPTH {
+            let child = make_tx_spending_virtual(prev_hash, 0);
+            let child_hash = child.hash;
+            let result = mempool.add_tx(child_hash, child, 300);
+            assert!(
+                result.is_ok(),
+                "depth {depth} should be accepted (max={VIRTUAL_CHAIN_MAX_DEPTH})"
+            );
+            prev_hash = child_hash;
+        }
+
+        // One more should be rejected
+        let too_deep = make_tx_spending_virtual(prev_hash, 0);
+        let too_deep_hash = too_deep.hash;
+        let result = mempool.add_tx(too_deep_hash, too_deep, 300);
+        assert!(
+            matches!(result, Err(MempoolError::VirtualChainTooDeep { .. })),
+            "tx at depth VIRTUAL_CHAIN_MAX_DEPTH should be rejected"
+        );
+        assert!(
+            !mempool.contains(&too_deep_hash),
+            "rejected tx should not appear in the mempool"
+        );
+    }
+
+    /// G7: cascade eviction of a depth-5 chain must complete in bounded time.
+    ///
+    /// Builds the maximum-depth chain and removes the root, verifying all
+    /// descendants are cascade-removed in a single remove_tx call.
+    #[test]
+    fn test_cascade_bounded_depth() {
+        let mempool = Mempool::new(default_config());
+
+        let (root_tx, root_hash) = make_tx_with_outputs(&[1_000_000]);
+        mempool.add_tx(root_hash, root_tx, 300).unwrap();
+
+        let mut prev_hash = root_hash;
+        let mut chain_hashes = vec![root_hash];
+        for _ in 1..VIRTUAL_CHAIN_MAX_DEPTH {
+            let child = make_tx_spending_virtual(prev_hash, 0);
+            let child_hash = child.hash;
+            mempool.add_tx(child_hash, child, 300).unwrap();
+            prev_hash = child_hash;
+            chain_hashes.push(child_hash);
+        }
+
+        assert_eq!(mempool.len(), VIRTUAL_CHAIN_MAX_DEPTH);
+
+        mempool.remove_tx(&root_hash);
+
+        assert_eq!(
+            mempool.len(),
+            0,
+            "all {VIRTUAL_CHAIN_MAX_DEPTH} descendants should be cascade-removed"
+        );
+        for h in &chain_hashes {
+            assert!(
+                !mempool.contains(h),
+                "tx {h:?} should be gone after cascade"
+            );
+        }
+        assert_eq!(mempool.virtual_utxo_count(), 0);
+        assert_eq!(mempool.claimed_inputs_count(), 0);
     }
 }

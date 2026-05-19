@@ -5,8 +5,13 @@
 //! appropriate per-protocol channel.
 //!
 //! ## Protocol ID 1
-//! Protocol ID 1 is reserved in the Ouroboros spec and never used. Data for this
-//! protocol is silently discarded.
+//! Protocol ID 1 is reserved in the Ouroboros spec and never used. A frame on this
+//! protocol ID is treated as a protocol error and terminates the connection (A-011).
+//!
+//! ## Unknown protocol IDs
+//! Any frame for a protocol ID not registered in the subscription table is treated
+//! as a protocol error and terminates the connection (A-005). This matches Haskell's
+//! `Ouroboros.Network.Mux.Ingress` which errors on unknown protocol IDs.
 //!
 //! ## Byte tracking
 //! The ingress task tracks how many bytes are currently buffered per
@@ -113,16 +118,16 @@ impl IngressTask {
 
             let header = decode_header(header_bytes[..8].try_into().expect("read exact 8 bytes"));
 
-            // Skip reserved protocol ID 1
+            // A-011 (security audit 2026-05-19): reject reserved protocol ID 1.
+            // Per the Ouroboros mux spec, protocol ID 1 is permanently reserved and
+            // must never carry data. A peer sending frames on it has violated the
+            // protocol — treat as a fatal error rather than silently discarding,
+            // matching Haskell's `error "unknown protocol"` in Ouroboros.Network.Mux.
             if header.protocol_id == RESERVED_PROTOCOL_ID {
-                if header.payload_length > 0 {
-                    // Read and discard the payload
-                    tokio::time::timeout(SDU_READ_TIMEOUT, read_fn(header.payload_length as usize))
-                        .await
-                        .map_err(|_| MuxError::SduReadTimeout)?
-                        .map_err(MuxError::Bearer)?;
-                }
-                continue;
+                return Err(MuxError::InvalidHeader {
+                    protocol_id: header.protocol_id,
+                    payload_len: header.payload_length,
+                });
             }
 
             // Phase 2: Read the payload with sduTimeout (30s).
@@ -156,6 +161,15 @@ impl IngressTask {
                 Some(route) => {
                     let payload_len = payload.len();
 
+                    // A-012 (security audit 2026-05-19): skip counter ops for
+                    // zero-length payloads entirely — fetch_add(0)+fetch_sub(0) is
+                    // a no-op and the atomic bus lock is wasted work.
+                    if payload_len == 0 {
+                        // Zero-length SDUs are valid per spec (keep-alive in some
+                        // implementations). Accept silently with no counter change.
+                        continue;
+                    }
+
                     // Atomically add the incoming payload size and check whether
                     // we have exceeded the per-channel byte budget.
                     //
@@ -180,60 +194,61 @@ impl IngressTask {
                         });
                     }
 
-                    if !payload.is_empty() {
-                        // Deliver to protocol channel using try_send (non-blocking).
-                        //
-                        // CRITICAL: We must NOT use the blocking `.send().await` here.
-                        // If a protocol's ingress channel is full (e.g. ChainSync server
-                        // blocked at tip waiting for announcements while pipelined
-                        // MsgRequestNext messages fill the buffer), the blocking send
-                        // would stall the ENTIRE ingress task, preventing ALL other
-                        // protocols (KeepAlive, BlockFetch) from receiving data.
-                        //
-                        // This matches Haskell's network-mux demuxer which throws
-                        // IngressQueueOverRun (fatal connection error) when a protocol's
-                        // queue overflows — the demuxer never blocks.
-                        //
-                        // MuxChannel::recv() will decrement bytes_in_flight after
-                        // consuming the chunk.
-                        match route.tx.try_send(Bytes::from(payload)) {
-                            Ok(()) => {} // delivered successfully
-                            Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
-                                // Channel full — protocol is not consuming fast enough.
-                                // Revert counter and return fatal overrun error.
-                                route
-                                    .bytes_in_flight
-                                    .fetch_sub(payload_len, Ordering::Relaxed);
-                                return Err(MuxError::IngressQueueOverrun {
-                                    protocol_id: header.protocol_id,
-                                    bytes: new_total,
-                                    limit: route.limit,
-                                });
-                            }
-                            Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
-                                // Receiver dropped (protocol shut down) — undo counter.
-                                route
-                                    .bytes_in_flight
-                                    .fetch_sub(payload_len, Ordering::Relaxed);
-                            }
+                    // Deliver to protocol channel using try_send (non-blocking).
+                    //
+                    // CRITICAL: We must NOT use the blocking `.send().await` here.
+                    // If a protocol's ingress channel is full (e.g. ChainSync server
+                    // blocked at tip waiting for announcements while pipelined
+                    // MsgRequestNext messages fill the buffer), the blocking send
+                    // would stall the ENTIRE ingress task, preventing ALL other
+                    // protocols (KeepAlive, BlockFetch) from receiving data.
+                    //
+                    // This matches Haskell's network-mux demuxer which throws
+                    // IngressQueueOverRun (fatal connection error) when a protocol's
+                    // queue overflows — the demuxer never blocks.
+                    //
+                    // MuxChannel::recv() will decrement bytes_in_flight after
+                    // consuming the chunk.
+                    match route.tx.try_send(Bytes::from(payload)) {
+                        Ok(()) => {} // delivered successfully
+                        Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                            // Channel full — protocol is not consuming fast enough.
+                            // Revert counter and return fatal overrun error.
+                            route
+                                .bytes_in_flight
+                                .fetch_sub(payload_len, Ordering::Relaxed);
+                            return Err(MuxError::IngressQueueOverrun {
+                                protocol_id: header.protocol_id,
+                                bytes: new_total,
+                                limit: route.limit,
+                            });
                         }
-                    } else {
-                        // Zero-length payload — undo the no-op counter increment.
-                        route
-                            .bytes_in_flight
-                            .fetch_sub(payload_len, Ordering::Relaxed);
+                        Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                            // Receiver dropped (protocol shut down) — undo counter.
+                            route
+                                .bytes_in_flight
+                                .fetch_sub(payload_len, Ordering::Relaxed);
+                        }
                     }
                 }
                 None => {
-                    // Unknown protocol — could log a warning, but for now just skip.
-                    // This is more lenient than returning UnknownProtocol, since
-                    // Haskell nodes may send data for protocols we haven't subscribed to.
-                    tracing::debug!(
+                    // A-005 (security audit 2026-05-19): terminate on any frame for a
+                    // protocol ID not in our subscription table.
+                    //
+                    // Previous behaviour silently discarded the payload and continued,
+                    // allowing an attacker to flood garbage frames on phantom protocol
+                    // IDs (e.g. 0xFFFE) with no consequence: each frame consumed NIC
+                    // bandwidth, CPU (decode + log), and debug-log I/O at full read speed.
+                    //
+                    // Haskell `Ouroboros.Network.Mux.Ingress` terminates the bearer on
+                    // any unknown protocol ID. We match that behaviour.
+                    tracing::warn!(
                         protocol_id = header.protocol_id,
                         direction = ?local_direction,
                         payload_len = header.payload_length,
-                        "ingress: received data for unsubscribed protocol"
+                        "ingress: received data for unsubscribed protocol — terminating connection"
                     );
+                    return Err(MuxError::UnknownProtocol(header.protocol_id));
                 }
             }
         }
@@ -326,9 +341,11 @@ mod tests {
         assert_eq!(chunk3.as_ref(), &[0x83, 0x01, 0x02, 0x03]);
     }
 
+    /// A-011 (security audit 2026-05-19): reserved protocol ID 1 must terminate
+    /// the connection, not be silently discarded.
     #[tokio::test]
-    async fn reserved_protocol_id_discarded() {
-        let (tx2, mut rx2) = mpsc::channel(32);
+    async fn reserved_protocol_id_terminates_connection() {
+        let (tx2, _rx2) = mpsc::channel(32);
 
         let mut routes = HashMap::new();
         routes.insert(
@@ -342,41 +359,36 @@ mod tests {
 
         let task = IngressTask::new(routes);
 
-        // Reserved protocol 1 message followed by valid protocol 2 message
-        let mut wire_data = Vec::new();
-        wire_data.extend_from_slice(&build_sdu(
-            RESERVED_PROTOCOL_ID,
-            Direction::InitiatorDir,
-            &[0xFF, 0xFF],
-        ));
-        wire_data.extend_from_slice(&build_sdu(2, Direction::InitiatorDir, &[0x81, 0x01]));
-
+        // Reserved protocol 1 frame — must cause a fatal error.
+        let wire_data = build_sdu(RESERVED_PROTOCOL_ID, Direction::InitiatorDir, &[0xFF, 0xFF]);
         let wire_data = std::sync::Arc::new(std::sync::Mutex::new(wire_data));
         let offset = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
 
         let wire_data_clone = wire_data.clone();
         let offset_clone = offset.clone();
 
-        task.run(move |n: usize| {
-            let wire_data = wire_data_clone.clone();
-            let offset = offset_clone.clone();
-            Box::pin(async move {
-                let data = wire_data.lock().unwrap();
-                let off = offset.load(std::sync::atomic::Ordering::SeqCst);
-                if off + n > data.len() {
-                    return Err(BearerError::ConnectionReset);
-                }
-                let result = data[off..off + n].to_vec();
-                offset.store(off + n, std::sync::atomic::Ordering::SeqCst);
-                Ok(result)
+        let result = task
+            .run(move |n: usize| {
+                let wire_data = wire_data_clone.clone();
+                let offset = offset_clone.clone();
+                Box::pin(async move {
+                    let data = wire_data.lock().unwrap();
+                    let off = offset.load(std::sync::atomic::Ordering::SeqCst);
+                    if off + n > data.len() {
+                        return Err(BearerError::ConnectionReset);
+                    }
+                    let result = data[off..off + n].to_vec();
+                    offset.store(off + n, std::sync::atomic::Ordering::SeqCst);
+                    Ok(result)
+                })
             })
-        })
-        .await
-        .unwrap();
+            .await;
 
-        // Only protocol 2 should have received data
-        let chunk = rx2.recv().await.unwrap();
-        assert_eq!(chunk.as_ref(), &[0x81, 0x01]);
+        // Reserved protocol ID must produce InvalidHeader error.
+        assert!(
+            matches!(result, Err(MuxError::InvalidHeader { protocol_id: 1, .. })),
+            "reserved protocol ID 1 must terminate with InvalidHeader, got: {result:?}"
+        );
     }
 
     /// Verify that a stalled bearer during header wait blocks indefinitely.
@@ -511,10 +523,14 @@ mod tests {
         assert_eq!(chunk.as_ref(), &[0x02, 0x03]);
     }
 
-    /// Verify that an unknown protocol ID is silently dropped (no panic, no error).
+    /// Verify that an unknown protocol ID terminates the connection (A-005).
+    ///
+    /// Haskell `Ouroboros.Network.Mux.Ingress` terminates the bearer on any
+    /// unknown protocol ID. Silently discarding would allow attackers to flood
+    /// garbage frames at full read speed with no consequence.
     #[tokio::test]
-    async fn unknown_protocol_silently_dropped() {
-        // No routes registered. Protocol 99 should be silently dropped.
+    async fn unknown_protocol_terminates_connection() {
+        // No routes registered. Protocol 99 must return UnknownProtocol error.
         let routes = HashMap::new();
         let task = IngressTask::new(routes);
 
@@ -540,10 +556,10 @@ mod tests {
             })
             .await;
 
-        // Should return Ok — unknown protocol is not a fatal error.
+        // A-005: unknown protocol must be a fatal error (UnknownProtocol).
         assert!(
-            result.is_ok(),
-            "unknown protocol should not be fatal: {result:?}"
+            matches!(result, Err(MuxError::UnknownProtocol(99))),
+            "unknown protocol must terminate with UnknownProtocol(99), got: {result:?}"
         );
     }
 
@@ -595,10 +611,11 @@ mod tests {
         );
     }
 
-    /// Verify that reserved protocol 1 with zero-length payload is silently dropped.
+    /// A-011: reserved protocol 1 with zero-length payload also terminates the connection.
+    /// The payload length being zero doesn't change the protocol violation.
     #[tokio::test]
-    async fn reserved_protocol_id_zero_length_payload_discarded() {
-        let (tx2, mut rx2) = mpsc::channel(32);
+    async fn reserved_protocol_id_zero_length_also_terminates() {
+        let (tx2, _rx2) = mpsc::channel(32);
         let mut routes = HashMap::new();
         routes.insert(
             (2, Direction::ResponderDir),
@@ -611,34 +628,34 @@ mod tests {
 
         let task = IngressTask::new(routes);
 
-        // Zero-length payload for reserved protocol 1, then protocol 2 message.
-        let mut wire = build_sdu(RESERVED_PROTOCOL_ID, Direction::InitiatorDir, &[]);
-        wire.extend_from_slice(&build_sdu(2, Direction::InitiatorDir, &[0xAB]));
-
+        // Zero-length payload for reserved protocol 1.
+        let wire = build_sdu(RESERVED_PROTOCOL_ID, Direction::InitiatorDir, &[]);
         let wire = std::sync::Arc::new(std::sync::Mutex::new(wire));
         let offset = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let wire2 = wire.clone();
         let off2 = offset.clone();
-        task.run(move |n: usize| {
-            let w = wire2.clone();
-            let o = off2.clone();
-            Box::pin(async move {
-                let data = w.lock().unwrap();
-                let off = o.load(std::sync::atomic::Ordering::SeqCst);
-                if off + n > data.len() {
-                    return Err(BearerError::ConnectionReset);
-                }
-                let r = data[off..off + n].to_vec();
-                o.store(off + n, std::sync::atomic::Ordering::SeqCst);
-                Ok(r)
+        let result = task
+            .run(move |n: usize| {
+                let w = wire2.clone();
+                let o = off2.clone();
+                Box::pin(async move {
+                    let data = w.lock().unwrap();
+                    let off = o.load(std::sync::atomic::Ordering::SeqCst);
+                    if off + n > data.len() {
+                        return Err(BearerError::ConnectionReset);
+                    }
+                    let r = data[off..off + n].to_vec();
+                    o.store(off + n, std::sync::atomic::Ordering::SeqCst);
+                    Ok(r)
+                })
             })
-        })
-        .await
-        .unwrap();
+            .await;
 
-        // Protocol 2 should have been delivered.
-        let chunk = rx2.recv().await.unwrap();
-        assert_eq!(chunk.as_ref(), &[0xAB]);
+        // Even zero-length reserved-ID frame must produce InvalidHeader.
+        assert!(
+            matches!(result, Err(MuxError::InvalidHeader { protocol_id: 1, .. })),
+            "zero-length reserved-ID frame must terminate, got: {result:?}"
+        );
     }
 
     /// Verify bytes_in_flight counter is correctly incremented for delivered payloads.

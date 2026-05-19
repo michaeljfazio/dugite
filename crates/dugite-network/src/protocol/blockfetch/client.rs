@@ -11,6 +11,15 @@ use crate::mux::channel::MuxChannel;
 
 use super::{decode_message, encode_message, BlockFetchMessage};
 
+/// Hard cap on `MsgBlock` messages received per batch.
+///
+/// B4: A malicious peer could stream `MsgBlock` indefinitely without sending
+/// `MsgBatchDone`, blocking the receive task and consuming unbounded memory
+/// through the `on_block` callback (which writes to storage and applies to
+/// ledger).  The Haskell typed protocol knows the exact expected block count;
+/// we approximate with a generous cap matching the server's `MAX_BLOCKS_PER_BATCH`.
+pub const MAX_BLOCKS_PER_FETCH: usize = 2_000;
+
 /// BlockFetch client for downloading block ranges.
 pub struct BlockFetchClient;
 
@@ -69,8 +78,22 @@ impl BlockFetchClient {
         }
 
         // Receive blocks until MsgBatchDone
+        // B4: Track block_count and enforce MAX_BLOCKS_PER_FETCH.
+        // Without this cap a peer can stream MsgBlock indefinitely without ever
+        // sending MsgBatchDone, filling storage/ledger with attacker-controlled
+        // data and blocking the BlockFetch task forever.
         let mut block_count = 0;
         loop {
+            if block_count >= MAX_BLOCKS_PER_FETCH {
+                return Err(ProtocolError::BoundsExceeded {
+                    protocol: "BlockFetch",
+                    reason: format!(
+                        "peer sent more than {MAX_BLOCKS_PER_FETCH} MsgBlock messages \
+                         without MsgBatchDone"
+                    ),
+                });
+            }
+
             let block_bytes = channel.recv().await.map_err(ProtocolError::from)?;
             let msg = decode_message(&block_bytes).map_err(|e| ProtocolError::CborDecode {
                 protocol: "BlockFetch",
@@ -209,5 +232,174 @@ mod tests {
 
         let count = handle.await.unwrap().unwrap();
         assert_eq!(count, 0);
+    }
+
+    /// B4: A peer streaming MsgBlock beyond MAX_BLOCKS_PER_FETCH must be disconnected.
+    #[tokio::test]
+    async fn fetch_range_rejects_infinite_msg_block_stream() {
+        // Use a 1-block cap for test speed.
+        use crate::protocol::blockfetch::encode_message as bf_enc;
+        let (mut channel, mut egress_rx, ingress_tx) = make_test_channel();
+
+        // Spawn a task that checks the error returned by fetch_range.
+        let handle = tokio::spawn(async move {
+            let mut count = 0usize;
+            let result = BlockFetchClient::fetch_range(
+                &mut channel,
+                Point::Origin,
+                Point::Specific(999, [0xFF; 32]),
+                |_| {
+                    count += 1;
+                    Ok(())
+                },
+            )
+            .await;
+            (result, count)
+        });
+
+        // Server side: MsgRequestRange consumed.
+        let _ = egress_rx.recv().await.unwrap();
+
+        // Send MsgStartBatch.
+        ingress_tx
+            .send(Bytes::from(bf_enc(&BlockFetchMessage::MsgStartBatch)))
+            .await
+            .unwrap();
+
+        // Stream MAX_BLOCKS_PER_FETCH + 1 MsgBlock messages without MsgBatchDone.
+        for _ in 0..=MAX_BLOCKS_PER_FETCH {
+            ingress_tx
+                .send(Bytes::from(bf_enc(&BlockFetchMessage::MsgBlock(vec![
+                    0x42,
+                ]))))
+                .await
+                .unwrap();
+        }
+
+        let (result, _count) = handle.await.unwrap();
+        assert!(
+            result.is_err(),
+            "fetch_range should error when peer exceeds MAX_BLOCKS_PER_FETCH"
+        );
+        assert!(
+            matches!(
+                result.unwrap_err(),
+                ProtocolError::BoundsExceeded {
+                    protocol: "BlockFetch",
+                    ..
+                }
+            ),
+            "expected BoundsExceeded from BlockFetch"
+        );
+    }
+
+    /// B4: MAX_BLOCKS_PER_FETCH - 1 blocks followed by MsgBatchDone must succeed.
+    ///
+    /// The cap check fires at the START of the loop iteration when block_count has
+    /// already reached MAX_BLOCKS_PER_FETCH, so the maximum blocks a peer can serve
+    /// in a single batch before triggering the guard is MAX_BLOCKS_PER_FETCH - 1
+    /// followed by MsgBatchDone.  This is the correct bounded-success path.
+    #[tokio::test]
+    async fn fetch_range_accepts_below_cap() {
+        use crate::protocol::blockfetch::encode_message as bf_enc;
+        let (egress_tx, egress_rx) = tokio::sync::mpsc::channel(4096);
+        let (ingress_tx, ingress_rx) = tokio::sync::mpsc::channel(4096);
+        let mut channel = MuxChannel::new(
+            3,
+            crate::mux::Direction::InitiatorDir,
+            egress_tx,
+            ingress_rx,
+            // Large enough window for MAX_BLOCKS_PER_FETCH - 1 messages.
+            1_000_000_000,
+            std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        );
+        let mut egress_rx = egress_rx;
+
+        let handle = tokio::spawn(async move {
+            let mut count = 0usize;
+            let result = BlockFetchClient::fetch_range(
+                &mut channel,
+                Point::Origin,
+                Point::Specific(1, [0x01; 32]),
+                |_| {
+                    count += 1;
+                    Ok(())
+                },
+            )
+            .await;
+            (result, count)
+        });
+
+        let _ = egress_rx.recv().await.unwrap(); // consume MsgRequestRange
+
+        ingress_tx
+            .send(Bytes::from(bf_enc(&BlockFetchMessage::MsgStartBatch)))
+            .await
+            .unwrap();
+
+        // Send MAX_BLOCKS_PER_FETCH - 1 blocks then MsgBatchDone.
+        // (MAX_BLOCKS_PER_FETCH blocks would trigger the guard on the next iteration.)
+        let valid_count = MAX_BLOCKS_PER_FETCH - 1;
+        for _ in 0..valid_count {
+            ingress_tx
+                .send(Bytes::from(bf_enc(&BlockFetchMessage::MsgBlock(vec![
+                    0x00,
+                ]))))
+                .await
+                .unwrap();
+        }
+        ingress_tx
+            .send(Bytes::from(bf_enc(&BlockFetchMessage::MsgBatchDone)))
+            .await
+            .unwrap();
+
+        let (result, count) = handle.await.unwrap();
+        assert!(
+            result.is_ok(),
+            "MAX_BLOCKS_PER_FETCH - 1 blocks should succeed: {result:?}"
+        );
+        assert_eq!(count, valid_count);
+    }
+
+    /// B4: Unexpected message instead of MsgBlock/MsgBatchDone triggers StateViolation.
+    #[tokio::test]
+    async fn fetch_range_state_violation_mid_batch() {
+        use crate::protocol::blockfetch::encode_message as bf_enc;
+        let (mut channel, mut egress_rx, ingress_tx) = make_test_channel();
+
+        let handle = tokio::spawn(async move {
+            BlockFetchClient::fetch_range(
+                &mut channel,
+                Point::Origin,
+                Point::Specific(1, [0x01; 32]),
+                |_| Ok(()),
+            )
+            .await
+        });
+
+        let _ = egress_rx.recv().await.unwrap(); // MsgRequestRange
+
+        // Start batch then send an invalid message (MsgNoBlocks mid-batch).
+        ingress_tx
+            .send(Bytes::from(bf_enc(&BlockFetchMessage::MsgStartBatch)))
+            .await
+            .unwrap();
+        ingress_tx
+            .send(Bytes::from(bf_enc(&BlockFetchMessage::MsgNoBlocks)))
+            .await
+            .unwrap();
+
+        let result = handle.await.unwrap();
+        assert!(result.is_err(), "invalid mid-batch message should error");
+        assert!(
+            matches!(
+                result.unwrap_err(),
+                ProtocolError::StateViolation {
+                    protocol: "BlockFetch",
+                    ..
+                }
+            ),
+            "expected StateViolation"
+        );
     }
 }

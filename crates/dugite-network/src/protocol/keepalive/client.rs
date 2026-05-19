@@ -12,6 +12,9 @@ use crate::mux::channel::MuxChannel;
 
 use super::{decode_message, encode_message, KeepAliveMessage};
 
+// B16: Use rand for the initial cookie value so consecutive connections
+// use different starting points.  Haskell cardano-node uses a random u16.
+
 /// Default keepalive ping interval.
 ///
 /// Must be well under the 30-second `SDU_READ_TIMEOUT` to ensure pings (and
@@ -69,7 +72,10 @@ impl KeepAliveClient {
     /// verifies the cookie matches, measures RTT, then sleeps for `interval`.
     /// On cancellation, sends `MsgDone` and returns.
     pub async fn run(&self, channel: &mut MuxChannel) -> Result<Option<Duration>, ProtocolError> {
-        let mut cookie: u16 = 0;
+        // B16: Start cookie from a random value to prevent sequence prediction.
+        // Haskell cardano-node randomises the initial cookie; fixing it at 0
+        // allows a network observer to infer connection count/uptime.
+        let mut cookie: u16 = rand::random();
         let mut last_rtt: Option<Duration> = None;
         let mut consecutive_failures: u32 = 0;
 
@@ -213,13 +219,17 @@ mod tests {
         let cancel_clone = cancel.clone();
         let handle = tokio::spawn(async move { client.run(&mut channel).await });
 
-        // Read the ping from egress
+        // B16: The initial cookie is now random, so we must read it from the
+        // first ping rather than assuming it starts at 0.
         let (_, _, ping_bytes) = egress_rx.recv().await.unwrap();
         let ping = decode_message(&ping_bytes).unwrap();
-        assert_eq!(ping, KeepAliveMessage::MsgKeepAlive(0));
+        let initial_cookie = match ping {
+            KeepAliveMessage::MsgKeepAlive(c) => c,
+            other => panic!("expected MsgKeepAlive, got {other:?}"),
+        };
 
-        // Send matching pong via ingress
-        let pong = encode_message(&KeepAliveMessage::MsgKeepAliveResponse(0));
+        // Send matching pong via ingress using the actual initial cookie
+        let pong = encode_message(&KeepAliveMessage::MsgKeepAliveResponse(initial_cookie));
         ingress_tx.send(Bytes::from(pong)).await.unwrap();
 
         // Wait a bit then cancel
@@ -254,13 +264,12 @@ mod tests {
 
         let handle = tokio::spawn(async move { client.run(&mut channel).await });
 
-        // For each of the 3 expected pings, drain the ping from egress
-        // but never send a pong — let the response timeout fire.
-        for expected_cookie in 0..3u16 {
-            // Read the outgoing MsgKeepAlive.
-            let (_, _, ping_bytes) = egress_rx.recv().await.unwrap();
-            let ping = decode_message(&ping_bytes).unwrap();
-            assert_eq!(ping, KeepAliveMessage::MsgKeepAlive(expected_cookie));
+        // B16: cookie starts random — just consume 3 pings without caring
+        // about the exact value; we only care that 3 consecutive timeouts
+        // trigger KeepAliveTimeout (not what the cookie numbers are).
+        for _ in 0..3usize {
+            // Read the outgoing MsgKeepAlive (any cookie value).
+            let (_, _, _ping_bytes) = egress_rx.recv().await.unwrap();
 
             // Advance past the 30s response timeout + 100ms ping interval.
             tokio::time::advance(Duration::from_secs(31)).await;
@@ -288,15 +297,20 @@ mod tests {
 
         let handle = tokio::spawn(async move { client.run(&mut channel).await });
 
+        // B16: Read the initial cookie from ping 0 (it is now random).
+
         // Ping 0: timeout (failure 1)
         let (_, _, ping_bytes) = egress_rx.recv().await.unwrap();
         let _ = decode_message(&ping_bytes).unwrap();
         tokio::time::advance(Duration::from_secs(31)).await;
 
-        // Ping 1: success (resets counter to 0)
+        // Ping 1: success (resets counter to 0) — read the actual cookie.
         let (_, _, ping_bytes) = egress_rx.recv().await.unwrap();
-        let _ = decode_message(&ping_bytes).unwrap();
-        let pong = encode_message(&KeepAliveMessage::MsgKeepAliveResponse(1));
+        let ping1_cookie = match decode_message(&ping_bytes).unwrap() {
+            KeepAliveMessage::MsgKeepAlive(c) => c,
+            other => panic!("expected MsgKeepAlive, got {other:?}"),
+        };
+        let pong = encode_message(&KeepAliveMessage::MsgKeepAliveResponse(ping1_cookie));
         ingress_tx.send(Bytes::from(pong)).await.unwrap();
         // Advance past the interval
         tokio::time::advance(Duration::from_millis(200)).await;

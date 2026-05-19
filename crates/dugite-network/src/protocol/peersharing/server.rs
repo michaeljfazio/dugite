@@ -2,6 +2,7 @@
 
 use crate::error::ProtocolError;
 use crate::mux::channel::MuxChannel;
+use rand::seq::SliceRandom as _;
 use std::net::SocketAddr;
 
 use super::{decode_message, encode_message, is_routable, PeerSharingMessage};
@@ -27,13 +28,21 @@ impl PeerSharingServer {
 
             match msg {
                 PeerSharingMessage::MsgShareRequest(amount) => {
-                    // Filter to only routable addresses and limit to requested amount
-                    let peers: Vec<SocketAddr> = known_peers
+                    // Filter to only routable addresses, then shuffle before
+                    // limiting to the requested amount.
+                    //
+                    // B17: Returning peers in deterministic order (e.g. always the
+                    // first N from `known_peers`) allows a peer to enumerate our full
+                    // peer list incrementally by making repeated requests.  Shuffling
+                    // prevents full enumeration and mirrors cardano-node's behaviour.
+                    let mut routable: Vec<SocketAddr> = known_peers
                         .iter()
                         .filter(|addr| is_routable(&addr.ip()))
-                        .take(amount as usize)
                         .copied()
                         .collect();
+                    routable.shuffle(&mut rand::rng());
+                    let peers: Vec<SocketAddr> =
+                        routable.into_iter().take(amount as usize).collect();
 
                     let reply = encode_message(&PeerSharingMessage::MsgSharePeers(peers));
                     channel.send(reply).await.map_err(ProtocolError::from)?;
@@ -100,12 +109,24 @@ mod tests {
         let req = encode_message(&PeerSharingMessage::MsgShareRequest(10));
         ingress_tx.send(Bytes::from(req)).await.unwrap();
 
-        // Should only get the 2 routable addresses
+        // Should only get the 2 routable addresses (order may vary due to shuffle).
         let (_, _, resp) = egress_rx.recv().await.unwrap();
         if let PeerSharingMessage::MsgSharePeers(addrs) = decode_message(&resp).unwrap() {
-            assert_eq!(addrs.len(), 2);
-            assert_eq!(addrs[0].ip(), IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4)));
-            assert_eq!(addrs[1].ip(), IpAddr::V4(Ipv4Addr::new(8, 8, 4, 4)));
+            assert_eq!(
+                addrs.len(),
+                2,
+                "only 2 routable addresses should be returned"
+            );
+            // B17: Addresses are now shuffled, so we check presence rather than order.
+            let ips: Vec<_> = addrs.iter().map(|a| a.ip()).collect();
+            assert!(
+                ips.contains(&IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4))),
+                "1.2.3.4 should be in result"
+            );
+            assert!(
+                ips.contains(&IpAddr::V4(Ipv4Addr::new(8, 8, 4, 4))),
+                "8.8.4.4 should be in result"
+            );
         } else {
             panic!("expected MsgSharePeers");
         }

@@ -184,6 +184,24 @@ impl LocalStateQueryServer {
                     let query_start = dec.position();
                     let query_cbor = &msg_bytes[query_start..];
 
+                    // C11 fix: cap the query blob size before attempting parse.
+                    // A 1 MB blob of malformed deeply-nested CBOR (e.g. 0x81 bytes) can
+                    // consume O(N) CPU time in minicbor's skip/array traversal before
+                    // returning an error. The outer channel ingress limit is 1 MB;
+                    // legitimate queries are tiny (< 1 KB). Cap at 4 KB.
+                    const MAX_QUERY_CBOR_BYTES: usize = 4096;
+                    if query_cbor.len() > MAX_QUERY_CBOR_BYTES {
+                        return Err(ProtocolError::InvalidMessage {
+                            protocol: "LocalStateQuery",
+                            tag: TAG_QUERY as u8,
+                            reason: format!(
+                                "query blob too large: {} bytes (max {})",
+                                query_cbor.len(),
+                                MAX_QUERY_CBOR_BYTES
+                            ),
+                        });
+                    }
+
                     let result_cbor =
                         handler.handle_query(query_cbor, n2c_version).map_err(|e| {
                             ProtocolError::CborDecode {
@@ -789,6 +807,87 @@ mod tests {
         );
 
         // Done.
+        ingress_tx.send(Bytes::from(encode_done())).await.unwrap();
+        handle.await.unwrap().unwrap();
+    }
+
+    // ── C11 test: oversized MsgQuery blob is rejected ─────────────────────────
+
+    /// C11: a MsgQuery with > 4096 bytes of query CBOR must disconnect the client.
+    #[tokio::test]
+    async fn c11_oversized_query_blob_rejected() {
+        let (mut channel, _egress_rx, ingress_tx) = make_test_channel();
+        let handler = MockQueryHandler;
+
+        let handle =
+            tokio::spawn(
+                async move { LocalStateQueryServer::run(&mut channel, &handler, 16).await },
+            );
+
+        // First acquire so we can send MsgQuery.
+        ingress_tx
+            .send(Bytes::from(encode_acquire_volatile()))
+            .await
+            .unwrap();
+
+        // Build MsgQuery with a 5000-byte query blob (exceeds MAX_QUERY_CBOR_BYTES=4096).
+        let mut buf = Vec::new();
+        {
+            let mut enc = Encoder::new(&mut buf);
+            enc.array(2).expect("infallible");
+            enc.u64(TAG_QUERY).expect("infallible");
+            // Write 5000 bytes of padding as a CBOR byte-string.
+            enc.bytes(&[0x00u8; 5000]).expect("infallible");
+        }
+        ingress_tx.send(Bytes::from(buf)).await.unwrap();
+
+        // Server should terminate with an InvalidMessage error (not panic).
+        let result = handle.await.unwrap();
+        assert!(
+            matches!(
+                result,
+                Err(crate::error::ProtocolError::InvalidMessage { .. })
+            ),
+            "oversized query must return InvalidMessage, got: {result:?}"
+        );
+    }
+
+    /// C1 server test: SpecificPoint at slot > 1000 returns MsgFailure PointNotOnChain.
+    #[tokio::test]
+    async fn c1_specific_point_not_on_chain_returns_failure() {
+        let (mut channel, mut egress_rx, ingress_tx) = make_test_channel();
+        let handler = MockQueryHandler; // rejects slot > 1000
+
+        let handle =
+            tokio::spawn(
+                async move { LocalStateQueryServer::run(&mut channel, &handler, 16).await },
+            );
+
+        // MsgAcquire SpecificPoint at slot 2000 — MockQueryHandler returns PointNotOnChain.
+        let mut buf = Vec::new();
+        {
+            let mut enc = Encoder::new(&mut buf);
+            enc.array(2).expect("infallible");
+            enc.u64(TAG_ACQUIRE_SPECIFIC).expect("infallible");
+            // Point::Specific(2000, [0xAA; 32]) wire format: [2000, bytes(32)]
+            enc.array(2).expect("infallible");
+            enc.u64(2000).expect("infallible");
+            enc.bytes(&[0xAAu8; 32]).expect("infallible");
+        }
+        ingress_tx.send(Bytes::from(buf)).await.unwrap();
+
+        // Expect MsgFailure = [2, [1]]  (tag 2, PointNotOnChain = [1])
+        let (_, _, resp) = egress_rx.recv().await.unwrap();
+        let mut dec = Decoder::new(&resp);
+        dec.array().unwrap();
+        let tag = dec.u64().unwrap();
+        assert_eq!(tag, TAG_FAILURE, "must send MsgFailure");
+        // Inner failure: array(1)[1] = PointNotOnChain
+        let inner_len = dec.array().unwrap().unwrap();
+        assert_eq!(inner_len, 1);
+        let code = dec.u8().unwrap();
+        assert_eq!(code, 1, "PointNotOnChain wire code must be 1");
+
         ingress_tx.send(Bytes::from(encode_done())).await.unwrap();
         handle.await.unwrap().unwrap();
     }

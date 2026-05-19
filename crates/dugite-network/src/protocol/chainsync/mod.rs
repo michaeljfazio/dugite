@@ -46,6 +46,14 @@ use crate::codec::{self, Point};
 use minicbor::{data::Type, Decoder, Encoder};
 use std::io::Write as _;
 
+/// Maximum number of points in a `MsgFindIntersect` request.
+///
+/// B3/B19: Haskell's `ouroboros-consensus` limits this to `maxNumOfPoints` (100).
+/// Exceeding this would allow:
+///  (a) `points.reserve(u64::MAX)` allocation bomb before the bounds check (B19).
+///  (b) O(N) `has_block()` DB lookups per request (B3 I/O amplification).
+pub const MAX_INTERSECT_POINTS: u64 = 100;
+
 /// ChainSync protocol state.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ChainSyncState {
@@ -257,15 +265,31 @@ pub fn decode_message(data: &[u8]) -> Result<ChainSyncMessage, String> {
         TAG_FIND_INTERSECT => {
             // Accept both definite and indefinite-length arrays.
             // The CDDL spec uses `[* point]` which permits either encoding.
+            //
+            // B3+B19 (#542) supersedes C7 (#543): cap the number of intersection
+            // points using MAX_INTERSECT_POINTS=100 to match Haskell's
+            // `ouroboros-consensus maxNumOfPoints`. Prevents:
+            //   (a) Allocation bombs: `points.reserve(u64::MAX)` before a bounds
+            //       check causes the allocator to attempt a huge allocation.
+            //   (b) I/O amplification: each Point::Specific triggers a has_block()
+            //       DB lookup in the server.
             let mut points = Vec::new();
             match dec.datatype().map_err(|e| e.to_string())? {
                 Type::ArrayIndef => {
                     dec.array().map_err(|e| e.to_string())?;
+                    let mut count: u64 = 0;
                     loop {
                         if dec.datatype().map_err(|e| e.to_string())? == Type::Break {
                             dec.skip().map_err(|e| e.to_string())?;
                             break;
                         }
+                        if count >= MAX_INTERSECT_POINTS {
+                            return Err(format!(
+                                "MsgFindIntersect: indefinite array exceeded max \
+                                 {MAX_INTERSECT_POINTS} points"
+                            ));
+                        }
+                        count += 1;
                         points.push(codec::decode_point(&mut dec).map_err(|e| e.to_string())?);
                     }
                 }
@@ -274,6 +298,14 @@ pub fn decode_message(data: &[u8]) -> Result<ChainSyncMessage, String> {
                         .array()
                         .map_err(|e| e.to_string())?
                         .ok_or("expected definite array length")?;
+                    // B19: Check BEFORE reserve — a u64 arr_len of u64::MAX would
+                    // cause Vec::reserve to attempt a huge allocation before failing.
+                    if arr_len > MAX_INTERSECT_POINTS {
+                        return Err(format!(
+                            "MsgFindIntersect: array length {arr_len} exceeds max \
+                             {MAX_INTERSECT_POINTS} points"
+                        ));
+                    }
                     points.reserve(arr_len as usize);
                     for _ in 0..arr_len {
                         points.push(codec::decode_point(&mut dec).map_err(|e| e.to_string())?);
@@ -493,5 +525,90 @@ mod tests {
         let encoded = encode_message(&ChainSyncMessage::MsgDone);
         let decoded = decode_message(&encoded).unwrap();
         assert!(matches!(decoded, ChainSyncMessage::MsgDone));
+    }
+
+    // ─── B3/B19: MsgFindIntersect cap tests ───────────────────────────────────
+
+    /// B19: Definite-array MsgFindIntersect exceeding MAX_INTERSECT_POINTS must be rejected
+    /// BEFORE any allocation (checks cap before reserve).
+    #[test]
+    fn find_intersect_definite_over_cap_rejected() {
+        let mut buf = Vec::new();
+        {
+            let mut enc = minicbor::Encoder::new(&mut buf);
+            enc.array(2).unwrap();
+            enc.u64(4).unwrap(); // TAG_FIND_INTERSECT
+                                 // Claim arr_len = MAX_INTERSECT_POINTS + 1 but only write 0 items
+                                 // (the decoder should reject before iterating).
+            enc.array(MAX_INTERSECT_POINTS + 1).unwrap();
+            // Write one dummy point so the decode doesn't fail on an empty stream first.
+            // Origin point = [0]
+            enc.array(1).unwrap();
+            enc.u64(0).unwrap();
+        }
+        let result = decode_message(&buf);
+        assert!(
+            result.is_err(),
+            "should reject definite array > MAX_INTERSECT_POINTS"
+        );
+        assert!(
+            result.unwrap_err().contains("exceeds max"),
+            "error should mention max"
+        );
+    }
+
+    /// B3: Indefinite-array MsgFindIntersect exceeding MAX_INTERSECT_POINTS must be rejected.
+    #[test]
+    fn find_intersect_indefinite_over_cap_rejected() {
+        let mut buf = Vec::new();
+        {
+            let mut enc = minicbor::Encoder::new(&mut buf);
+            enc.array(2).unwrap();
+            enc.u64(4).unwrap(); // TAG_FIND_INTERSECT
+            enc.begin_array().unwrap(); // 0x9F
+                                        // Write MAX_INTERSECT_POINTS + 1 Origin points.
+            for _ in 0..=MAX_INTERSECT_POINTS {
+                enc.array(1).unwrap();
+                enc.u64(0).unwrap(); // Origin
+            }
+            enc.end().unwrap(); // 0xFF
+        }
+        let result = decode_message(&buf);
+        assert!(
+            result.is_err(),
+            "should reject indefinite array > MAX_INTERSECT_POINTS"
+        );
+    }
+
+    /// B3: Definite-array MsgFindIntersect at exactly MAX_INTERSECT_POINTS must succeed.
+    #[test]
+    fn find_intersect_at_cap_accepted() {
+        let mut buf = Vec::new();
+        {
+            let mut enc = minicbor::Encoder::new(&mut buf);
+            enc.array(2).unwrap();
+            enc.u64(4).unwrap(); // TAG_FIND_INTERSECT
+            enc.array(MAX_INTERSECT_POINTS).unwrap();
+            for i in 0..MAX_INTERSECT_POINTS {
+                // Specific point
+                enc.array(2).unwrap();
+                enc.u64(i * 100 + 1).unwrap(); // slot
+                enc.bytes(&[i as u8; 32]).unwrap(); // hash
+            }
+        }
+        let result = decode_message(&buf);
+        assert!(
+            result.is_ok(),
+            "exactly MAX_INTERSECT_POINTS must be accepted: {result:?}"
+        );
+    }
+
+    /// Zero points is a valid (degenerate) MsgFindIntersect.
+    #[test]
+    fn find_intersect_zero_points_ok() {
+        let msg = ChainSyncMessage::MsgFindIntersect(vec![]);
+        let encoded = encode_message(&msg);
+        let result = decode_message(&encoded);
+        assert!(result.is_ok(), "zero points must be accepted");
     }
 }

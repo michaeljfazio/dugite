@@ -60,6 +60,10 @@ jobs:
           # and the catch_unwind guard in dugite-ledger/src/plutus.rs).
           - plutus_data_decode
           - cost_model_eval
+          # Audit #544 — CBOR serialization strictness (D2/D3/D9/D10/D15)
+          - vkey_witness_sizes
+          - plutus_bignum
+          - cbor_skip_value_depth
     steps:
       - uses: actions/checkout@v6
 

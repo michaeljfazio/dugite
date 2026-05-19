@@ -713,6 +713,22 @@ impl Node {
         } else {
             ValidationMode::Replay
         };
+
+        // Issue #545 E1: compute the wall-clock slot ONCE before the header
+        // validation loop.  `validate_header_full` checks `header.slot >
+        // current_slot`; the old code passed `block.slot()` as current_slot,
+        // making the guard tautologically false (same value on both sides).
+        //
+        // Haskell's `updateChainDepState` obtains the current slot via
+        // `getCurrentSlot` (wall clock), not from the candidate block.
+        //
+        // Fallback: if the wall-clock derivation fails (e.g. no Shelley genesis
+        // loaded on a pure Byron node or very early in startup), fall back to the
+        // ledger tip slot so the check is still meaningful even if not wall-clock
+        // exact.  A block arriving whose slot is ahead of the tip is suspicious and
+        // should be scrutinised; only a block in the far future is truly dangerous.
+        let wall_clock_slot = self.current_wall_clock_slot().await;
+
         {
             // Read ledger state once for the whole batch
             let ls = self.ledger_state.read().await;
@@ -792,8 +808,18 @@ impl Node {
 
                     pool_reg.map(|reg| {
                         if total_active_stake == 0 {
-                            // No snapshot data — just do VRF key binding, skip leader check.
-                            // Use 1/1 (= 100%) so the pool passes the threshold trivially.
+                            // Issue #545 E7: no stake snapshot yet (first ~3 epochs of sync).
+                            // VRF key binding still runs (vrf_keyhash comparison below), but the
+                            // leader threshold check is skipped — any registered pool passes.
+                            // Haskell uses `MissingStake` when the snapshot entry is absent;
+                            // we log a warning in strict mode so operators know the window exists.
+                            if strict {
+                                warn!(
+                                    slot = block.slot().0,
+                                    "Leader check: no stake snapshot available — skipping threshold \
+                                     (stake = 1/1). This window covers the first ~3 epochs of sync."
+                                );
+                            }
                             return BlockIssuerInfo {
                                 vrf_keyhash: reg.vrf_keyhash,
                                 pool_stake: 1,
@@ -832,9 +858,19 @@ impl Node {
                     return 0;
                 }
 
+                // Issue #545 E1: use the wall-clock slot as `current_slot`.
+                // Fall back to the ledger tip slot if the wall clock is unavailable,
+                // and ultimately to the block's own slot (old, incorrect behaviour)
+                // only as a last resort.  Using the block's slot makes the future-slot
+                // guard tautologically false (`block.slot() > block.slot()` is always
+                // false); using the wall clock matches Haskell's `getCurrentSlot`.
+                let current_slot_for_check = wall_clock_slot
+                    .or_else(|| ls.tip.point.slot())
+                    .unwrap_or(block.slot());
+
                 if let Err(e) = self.consensus.validate_header_full(
                     &header_with_nonce,
-                    block.slot(),
+                    current_slot_for_check,
                     issuer_info.as_ref(),
                     overlay_ctx.as_ref(),
                     mode,
@@ -1194,6 +1230,11 @@ impl Node {
                         }
                     }
                 }
+
+                // Issue #545 E5 — body-hash verification DISABLED pending a
+                // correct implementation; see the matching note in
+                // `apply_fetched_block`. The current `validate_block_body_hash`
+                // uses the wrong algorithm and rejects every legitimate block.
 
                 let ledger_mode = if strict || self.validate_all_blocks {
                     BlockValidationMode::ValidateAll
@@ -2733,6 +2774,15 @@ pub(crate) const PENDING_HEADERS_PAUSE: usize = 10_000;
 /// would thrash on every fetched block.
 pub(crate) const PENDING_HEADERS_RESUME: usize = 6_000;
 
+/// Maximum size of a single header CBOR payload received via `MsgRollForward`.
+///
+/// B12: Without this cap, a malicious peer could send headers up to the MUX
+/// frame limit (~65 KB) and fill `pending_headers` with
+/// `PENDING_HEADERS_PAUSE × 65 KB ≈ 650 MB` of data.  Cardano Conway headers
+/// are typically ≤ 2 KB; we allow 8 KB (4× safety margin) for future eras.
+/// At that size: 10,000 × 8 KB = 80 MB peak, which is safe.
+pub(crate) const MAX_HEADER_CBOR_BYTES: usize = 8_192;
+
 /// Decide whether the ChainSync pipeline should send more `MsgRequestNext`.
 ///
 /// Returns `true` only when:
@@ -3311,11 +3361,42 @@ pub async fn chainsync_client_task(
                         }
                         headers_received += 1;
 
+                        // B12: Reject oversized headers before any parsing.
+                        // Haskell's multiplexer enforces a maximum frame size of
+                        // 65,535 bytes, and `blockHeaderMaxSize` is ~4 KB for Conway.
+                        // We allow 8 KB (2× safety margin) to tolerate future eras.
+                        // At PENDING_HEADERS_PAUSE=10,000 × 8 KB = 80 MB maximum
+                        // pending_headers memory, vs the current uncapped
+                        // 10,000 × 65 KB ≈ 650 MB worst case.
+                        if header.len() > MAX_HEADER_CBOR_BYTES {
+                            return Err(anyhow::anyhow!(
+                                "ChainSync: {peer_addr} sent oversized header \
+                                 ({} bytes, limit {}); disconnecting",
+                                header.len(),
+                                MAX_HEADER_CBOR_BYTES
+                            ));
+                        }
+
                         // Extract slot and hash from the header CBOR.
                         // The hash is blake2b_256 of the raw header bytes.
                         let hash = extract_hash_from_header(&header);
-                        let slot = extract_slot_from_wrapped_header(&header)
-                            .unwrap_or(tip_slot);
+                        // B13: Never fall back to the peer-supplied `tip_slot` when
+                        // the header's slot cannot be extracted.  `tip_slot` is fully
+                        // controlled by the peer and substituting it would allow the
+                        // peer to inject an arbitrary slot value into pipeline
+                        // scheduling and epoch-boundary logic.  An undecodable header
+                        // is a protocol violation → disconnect.
+                        let slot = match extract_slot_from_wrapped_header(&header) {
+                            Some(s) => s,
+                            None => {
+                                return Err(anyhow::anyhow!(
+                                    "ChainSync: {peer_addr} sent MsgRollForward with \
+                                     undecodable header slot (header len={}); \
+                                     disconnecting to prevent slot-injection",
+                                    header.len()
+                                ));
+                            }
+                        };
 
                         // Update candidate chain state.
                         //
@@ -3673,10 +3754,21 @@ pub async fn chainsync_client_task(
                     }
 
                     other => {
-                        warn!(
-                            %peer_addr,
-                            "ChainSync unexpected message: {other:?}",
-                        );
+                        // B1: State machine violation — a pipelined ChainSync client
+                        // MUST NOT silently skip unexpected messages.  Doing so
+                        // desynchronises the `outstanding` counter from the peer's
+                        // actual state: either the pipeline drains to zero (sync
+                        // stalls) or we keep sending MsgRequestNext when the peer
+                        // no longer expects them (peer disconnects with AgencyViolation).
+                        //
+                        // The Haskell typed-protocol framework makes this impossible at
+                        // compile time; we enforce the same invariant at runtime here by
+                        // returning an error that triggers peer disconnect and reconnection.
+                        return Err(anyhow::anyhow!(
+                            "ChainSync state machine violation from {peer_addr}: \
+                             unexpected message {other:?} (outstanding={outstanding}); \
+                             disconnecting to trigger reconnection"
+                        ));
                     }
                 }
             }

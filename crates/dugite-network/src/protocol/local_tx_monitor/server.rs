@@ -5,6 +5,7 @@
 
 use minicbor::{Decoder, Encoder};
 use std::collections::HashSet;
+use std::time::Duration;
 
 use crate::error::ProtocolError;
 use crate::mux::channel::MuxChannel;
@@ -72,8 +73,23 @@ impl LocalTxMonitorServer {
                     return Ok(());
                 }
                 TAG_ACQUIRE => {
-                    // MsgAcquire (from StIdle) or MsgAwaitAcquire (from StAcquired)
-                    // Both capture a new snapshot.
+                    // TAG_ACQUIRE serves two purposes depending on state:
+                    //   StIdle    → MsgAcquire: capture a new snapshot immediately.
+                    //   StAcquired → MsgAwaitAcquire (C6 fix): Haskell blocks until the
+                    //     mempool changes (new tx added / tx removed). Without this guard,
+                    //     a malicious client can spam MsgAwaitAcquire in a tight loop,
+                    //     calling mempool.snapshot() at mux speed and driving lock contention.
+                    //
+                    // Because MempoolProvider does not expose a generation counter or an
+                    // async notification channel, we apply a minimum rate-limit sleep of 50 ms
+                    // when in StAcquired state before capturing the new snapshot. This caps
+                    // the rate at 20 snapshots/second per connection — adequate for honest
+                    // monitoring clients and safe against adversarial busy-polling.
+                    if snapshot.is_some() {
+                        // StAcquired → MsgAwaitAcquire: rate-limit before re-snapshot.
+                        tokio::time::sleep(Duration::from_millis(50)).await;
+                    }
+
                     let snap = mempool.snapshot();
                     let slot = current_slot();
 

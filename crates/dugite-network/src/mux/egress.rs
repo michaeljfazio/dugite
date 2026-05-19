@@ -38,8 +38,52 @@ use crate::mux::segment::{current_timestamp, encode_header, Direction, SduHeader
 /// Maximum number of SDUs to accumulate in a single write batch.
 const MAX_SDUS_PER_BATCH: usize = 100;
 
+/// Maximum total bytes buffered per egress channel (protocol_id, direction) pair.
+///
+/// When a peer reads TCP data very slowly, the protocol layers keep generating
+/// outgoing blocks/messages which accumulate in the per-channel `VecDeque<Bytes>`.
+/// Without a cap, a single slow-reader peer can cause unbounded heap growth.
+///
+/// Haskell's `Ouroboros.Network.Mux.Egress` uses `STM TBQueue` with finite
+/// capacity to provide natural back-pressure. We mirror this by rejecting new
+/// messages once the per-channel byte budget is exhausted.
+///
+/// 8 MB matches 2× the largest Cardano block (~4 MB post-Conway) so that a
+/// single in-flight large block + one pending block can coexist without false
+/// overrun rejections.
+///
+/// A-010 (security audit 2026-05-19).
+pub const MAX_EGRESS_BYTES_PER_CHANNEL: usize = 8 * 1024 * 1024; // 8 MB
+
 /// Key identifying a protocol channel: (protocol_id, direction).
 type ChannelKey = (u16, Direction);
+
+/// Enqueue a message for egress, enforcing the per-channel byte cap (A-010).
+///
+/// If the channel's pending byte count would exceed [`MAX_EGRESS_BYTES_PER_CHANNEL`],
+/// the message is silently dropped and a warning is emitted.  This matches
+/// Haskell's `STM TBQueue` bounded-queue back-pressure semantics.
+fn enqueue_message(
+    queues: &mut HashMap<ChannelKey, VecDeque<Bytes>>,
+    channel_bytes: &mut HashMap<ChannelKey, usize>,
+    key: ChannelKey,
+    data: Bytes,
+) {
+    let current = channel_bytes.get(&key).copied().unwrap_or(0);
+    if current + data.len() > MAX_EGRESS_BYTES_PER_CHANNEL {
+        tracing::warn!(
+            protocol_id = key.0,
+            direction = ?key.1,
+            queued_bytes = current,
+            message_bytes = data.len(),
+            cap = MAX_EGRESS_BYTES_PER_CHANNEL,
+            "egress queue cap exceeded — dropping message (peer is too slow)"
+        );
+        return;
+    }
+    *channel_bytes.entry(key).or_insert(0) += data.len();
+    queues.entry(key).or_default().push_back(data);
+}
 
 /// Egress task state. Created by the [`Mux`] and run as a spawned tokio task.
 pub struct EgressTask {
@@ -88,6 +132,9 @@ impl EgressTask {
         // current one so their bytes never interleave.
         let mut queues: HashMap<ChannelKey, VecDeque<Bytes>> = HashMap::new();
 
+        // Per-channel byte counters for A-010 back-pressure.
+        let mut channel_bytes: HashMap<ChannelKey, usize> = HashMap::new();
+
         // Batch buffer for accumulating multiple SDUs before a single write.
         let mut batch_buf: Vec<u8> = Vec::with_capacity(self.batch_size);
 
@@ -106,6 +153,16 @@ impl EgressTask {
                 let data = queue.pop_front().unwrap();
                 let chunk_len = data.len().min(self.sdu_size);
 
+                // A-010: account for bytes leaving the queue.
+                // `chunk_len` bytes are about to be sent; the rest (if any) go
+                // back into the queue as a remainder.  We decrement the full
+                // `data.len()` here, then re-increment the remainder below.
+                *channel_bytes.entry(*key).or_insert(0) = channel_bytes
+                    .get(key)
+                    .copied()
+                    .unwrap_or(0)
+                    .saturating_sub(data.len());
+
                 let header = SduHeader {
                     timestamp: current_timestamp(),
                     protocol_id: key.0,
@@ -119,7 +176,10 @@ impl EgressTask {
                 // If there's a remainder, push it BACK TO THE FRONT so it
                 // is sent before any queued successor message.
                 if chunk_len < data.len() {
-                    queue.push_front(data.slice(chunk_len..));
+                    let remainder = data.slice(chunk_len..);
+                    // Re-account the unsent bytes.
+                    *channel_bytes.entry(*key).or_insert(0) += remainder.len();
+                    queue.push_front(remainder);
                 }
 
                 if batch_buf.len() >= self.batch_size {
@@ -128,8 +188,15 @@ impl EgressTask {
                 }
             }
 
-            // Remove empty queues.
-            queues.retain(|_, q| !q.is_empty());
+            // Remove empty queues and their byte counters.
+            queues.retain(|k, q| {
+                if q.is_empty() {
+                    channel_bytes.remove(k);
+                    false
+                } else {
+                    true
+                }
+            });
 
             // Flush whatever accumulated in this round.
             if !batch_buf.is_empty() {
@@ -144,7 +211,7 @@ impl EgressTask {
                 // we were writing.
                 let mut sdu_count = 0;
                 while let Ok((pid, dir, data)) = self.rx.try_recv() {
-                    queues.entry((pid, dir)).or_default().push_back(data);
+                    enqueue_message(&mut queues, &mut channel_bytes, (pid, dir), data);
                     sdu_count += 1;
                     if sdu_count >= MAX_SDUS_PER_BATCH {
                         break;
@@ -157,13 +224,13 @@ impl EgressTask {
             match self.rx.recv().await {
                 None => return Ok(()),
                 Some((pid, dir, data)) => {
-                    queues.entry((pid, dir)).or_default().push_back(data);
+                    enqueue_message(&mut queues, &mut channel_bytes, (pid, dir), data);
                 }
             }
 
             // Non-blocking drain of any additional messages.
             while let Ok((pid, dir, data)) = self.rx.try_recv() {
-                queues.entry((pid, dir)).or_default().push_back(data);
+                enqueue_message(&mut queues, &mut channel_bytes, (pid, dir), data);
             }
         }
     }

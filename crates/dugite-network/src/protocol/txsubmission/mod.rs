@@ -196,13 +196,22 @@ pub fn decode_message(data: &[u8]) -> Result<TxSubmissionMessage, String> {
             let mut ids = Vec::new();
             match dec.datatype().map_err(|e| e.to_string())? {
                 Type::ArrayIndef => {
-                    // Indefinite-length: consume items until a Break code.
+                    // B2: Apply MAX_INFLIGHT cap inside the indefinite-array loop.
+                    // Without this guard a peer can stream 0x9F…items…0xFF without
+                    // bound, exhausting heap until OOM.
                     dec.array().map_err(|e| e.to_string())?;
+                    let mut count: u64 = 0;
                     loop {
                         if dec.datatype().map_err(|e| e.to_string())? == Type::Break {
                             dec.skip().map_err(|e| e.to_string())?;
                             break;
                         }
+                        if count >= MAX_INFLIGHT {
+                            return Err(format!(
+                                "MsgReplyTxIds: indefinite array exceeded max {MAX_INFLIGHT} items"
+                            ));
+                        }
+                        count += 1;
                         // Outer entry: [GenTxId, size]
                         dec.array().map_err(|e| e.to_string())?;
                         // GenTxId = [era_id, txid_bytes]
@@ -272,12 +281,20 @@ pub fn decode_message(data: &[u8]) -> Result<TxSubmissionMessage, String> {
             let mut ids: Vec<(u8, [u8; 32])> = Vec::new();
             match dec.datatype().map_err(|e| e.to_string())? {
                 Type::ArrayIndef => {
+                    // B2: Cap indefinite-array items at MAX_INFLIGHT.
                     dec.array().map_err(|e| e.to_string())?;
+                    let mut count: u64 = 0;
                     loop {
                         if dec.datatype().map_err(|e| e.to_string())? == Type::Break {
                             dec.skip().map_err(|e| e.to_string())?;
                             break;
                         }
+                        if count >= MAX_INFLIGHT {
+                            return Err(format!(
+                                "MsgRequestTxs: indefinite array exceeded max {MAX_INFLIGHT} items"
+                            ));
+                        }
+                        count += 1;
                         // GenTxId = [era_id, txid_bytes]
                         dec.array().map_err(|e| e.to_string())?;
                         let era_id = dec.u8().map_err(|e| e.to_string())?;
@@ -326,17 +343,33 @@ pub fn decode_message(data: &[u8]) -> Result<TxSubmissionMessage, String> {
             let mut txs: Vec<(u8, Vec<u8>)> = Vec::new();
             match dec.datatype().map_err(|e| e.to_string())? {
                 Type::ArrayIndef => {
+                    // B2: Cap indefinite-array items at MAX_INFLIGHT.
                     dec.array().map_err(|e| e.to_string())?;
+                    let mut count: u64 = 0;
                     loop {
                         if dec.datatype().map_err(|e| e.to_string())? == Type::Break {
                             dec.skip().map_err(|e| e.to_string())?;
                             break;
                         }
+                        if count >= MAX_INFLIGHT {
+                            return Err(format!(
+                                "MsgReplyTxs: indefinite array exceeded max {MAX_INFLIGHT} items"
+                            ));
+                        }
+                        count += 1;
                         // GenTx = [era_id, tag(24)(tx_cbor)]
                         dec.array().map_err(|e| e.to_string())?;
                         let era_id = dec.u8().map_err(|e| e.to_string())?;
-                        // Consume tag(24) — wrapCBORinCBOR per Haskell reference
-                        let _tag = dec.tag().map_err(|e| e.to_string())?;
+                        // B6: Validate tag is exactly 24 (wrapCBORinCBOR convention).
+                        // The Haskell codec explicitly requires tag 24; accepting any
+                        // tag would allow CBOR semantic confusion in era decode loop.
+                        let cbor_tag = dec.tag().map_err(|e| e.to_string())?;
+                        if cbor_tag != minicbor::data::Tag::new(24) {
+                            return Err(format!(
+                                "MsgReplyTxs: expected tag(24) for tx body, got tag({})",
+                                u64::from(cbor_tag)
+                            ));
+                        }
                         let tx_cbor = dec.bytes().map_err(|e| e.to_string())?.to_vec();
                         txs.push((era_id, tx_cbor));
                     }
@@ -356,8 +389,14 @@ pub fn decode_message(data: &[u8]) -> Result<TxSubmissionMessage, String> {
                         // GenTx = [era_id, tag(24)(tx_cbor)]
                         dec.array().map_err(|e| e.to_string())?;
                         let era_id = dec.u8().map_err(|e| e.to_string())?;
-                        // Consume tag(24) — wrapCBORinCBOR per Haskell reference
-                        let _tag = dec.tag().map_err(|e| e.to_string())?;
+                        // B6: Validate tag is exactly 24.
+                        let cbor_tag = dec.tag().map_err(|e| e.to_string())?;
+                        if cbor_tag != minicbor::data::Tag::new(24) {
+                            return Err(format!(
+                                "MsgReplyTxs: expected tag(24) for tx body, got tag({})",
+                                u64::from(cbor_tag)
+                            ));
+                        }
                         let tx_cbor = dec.bytes().map_err(|e| e.to_string())?.to_vec();
                         txs.push((era_id, tx_cbor));
                     }
@@ -724,5 +763,203 @@ mod tests {
         } else {
             panic!("expected MsgReplyTxIds");
         }
+    }
+
+    // ─── B2: Indefinite-array cap tests ──────────────────────────────────────
+
+    /// B2: MsgReplyTxIds indefinite-array must reject when count exceeds MAX_INFLIGHT.
+    #[test]
+    fn reply_tx_ids_indefinite_rejects_over_cap() {
+        let cap = MAX_INFLIGHT as usize;
+        let mut buf = Vec::new();
+        {
+            let mut enc = minicbor::Encoder::new(&mut buf);
+            enc.array(2).unwrap();
+            enc.u64(TAG_REPLY_TX_IDS).unwrap();
+            enc.begin_array().unwrap();
+            // Write cap+1 entries (one more than allowed).
+            for i in 0..=(cap as u64) {
+                enc.array(2).unwrap(); // [GenTxId, size]
+                enc.array(2).unwrap(); // GenTxId
+                enc.u8(6).unwrap();
+                let mut id = [0u8; 32];
+                id[0] = (i & 0xFF) as u8;
+                id[1] = ((i >> 8) & 0xFF) as u8;
+                enc.bytes(&id).unwrap();
+                enc.u32(100).unwrap();
+            }
+            enc.end().unwrap();
+        }
+        let result = decode_message(&buf);
+        assert!(
+            result.is_err(),
+            "should reject indefinite array > MAX_INFLIGHT"
+        );
+        assert!(
+            result.unwrap_err().contains("exceeded max"),
+            "error message should mention cap"
+        );
+    }
+
+    /// B2: MsgReplyTxIds indefinite-array at exactly MAX_INFLIGHT must succeed.
+    #[test]
+    fn reply_tx_ids_indefinite_accepts_at_cap() {
+        let cap = MAX_INFLIGHT as usize;
+        let mut buf = Vec::new();
+        {
+            let mut enc = minicbor::Encoder::new(&mut buf);
+            enc.array(2).unwrap();
+            enc.u64(TAG_REPLY_TX_IDS).unwrap();
+            enc.begin_array().unwrap();
+            for i in 0..cap {
+                enc.array(2).unwrap();
+                enc.array(2).unwrap();
+                enc.u8(6).unwrap();
+                let mut id = [0u8; 32];
+                id[0] = (i & 0xFF) as u8;
+                id[1] = ((i >> 8) & 0xFF) as u8;
+                enc.bytes(&id).unwrap();
+                enc.u32(100).unwrap();
+            }
+            enc.end().unwrap();
+        }
+        let result = decode_message(&buf);
+        assert!(
+            result.is_ok(),
+            "exactly MAX_INFLIGHT items must be accepted"
+        );
+        if let TxSubmissionMessage::MsgReplyTxIds(ids) = result.unwrap() {
+            assert_eq!(ids.len(), cap);
+        }
+    }
+
+    /// B2: MsgRequestTxs indefinite-array must reject when count exceeds MAX_INFLIGHT.
+    #[test]
+    fn request_txs_indefinite_rejects_over_cap() {
+        let cap = MAX_INFLIGHT as usize;
+        let mut buf = Vec::new();
+        {
+            let mut enc = minicbor::Encoder::new(&mut buf);
+            enc.array(2).unwrap();
+            enc.u64(TAG_REQUEST_TXS).unwrap();
+            enc.begin_array().unwrap();
+            for i in 0..=(cap as u64) {
+                enc.array(2).unwrap(); // GenTxId
+                enc.u8(6).unwrap();
+                let mut id = [0u8; 32];
+                id[0] = (i & 0xFF) as u8;
+                id[1] = ((i >> 8) & 0xFF) as u8;
+                enc.bytes(&id).unwrap();
+            }
+            enc.end().unwrap();
+        }
+        let result = decode_message(&buf);
+        assert!(
+            result.is_err(),
+            "should reject indefinite array > MAX_INFLIGHT"
+        );
+    }
+
+    /// B2: MsgReplyTxs indefinite-array must reject when count exceeds MAX_INFLIGHT.
+    #[test]
+    fn reply_txs_indefinite_rejects_over_cap() {
+        let cap = MAX_INFLIGHT as usize;
+        let mut buf = Vec::new();
+        {
+            let mut enc = minicbor::Encoder::new(&mut buf);
+            enc.array(2).unwrap();
+            enc.u64(TAG_REPLY_TXS).unwrap();
+            enc.begin_array().unwrap();
+            for _ in 0..=(cap as u64) {
+                enc.array(2).unwrap(); // GenTx
+                enc.u8(6).unwrap();
+                enc.tag(minicbor::data::Tag::new(24)).unwrap();
+                enc.bytes(&[0x01]).unwrap();
+            }
+            enc.end().unwrap();
+        }
+        let result = decode_message(&buf);
+        assert!(
+            result.is_err(),
+            "should reject indefinite array > MAX_INFLIGHT"
+        );
+    }
+
+    // ─── B6: tag(24) validation tests ────────────────────────────────────────
+
+    /// B6: MsgReplyTxs with wrong tag value must be rejected.
+    #[test]
+    fn reply_txs_wrong_tag_rejected() {
+        let mut buf = Vec::new();
+        {
+            let mut enc = minicbor::Encoder::new(&mut buf);
+            enc.array(2).unwrap();
+            enc.u64(TAG_REPLY_TXS).unwrap();
+            enc.begin_array().unwrap();
+            enc.array(2).unwrap(); // GenTx
+            enc.u8(6).unwrap();
+            // Use tag(6) instead of tag(24)
+            enc.tag(minicbor::data::Tag::new(6)).unwrap();
+            enc.bytes(&[0xDE, 0xAD]).unwrap();
+            enc.end().unwrap();
+        }
+        let result = decode_message(&buf);
+        assert!(result.is_err(), "tag(6) in MsgReplyTxs must be rejected");
+        let err = result.unwrap_err();
+        assert!(
+            err.contains("tag(24)"),
+            "error should mention expected tag(24)"
+        );
+    }
+
+    /// B6: MsgReplyTxs with tag(24) must be accepted (the normal case).
+    #[test]
+    fn reply_txs_correct_tag_accepted() {
+        let tx_body = vec![0x82u8, 0x00, 0x01];
+        let msg = TxSubmissionMessage::MsgReplyTxs(vec![(6, tx_body.clone())]);
+        let encoded = encode_message(&msg);
+        let decoded = decode_message(&encoded).unwrap();
+        if let TxSubmissionMessage::MsgReplyTxs(txs) = decoded {
+            assert_eq!(txs.len(), 1);
+            assert_eq!(txs[0].1, tx_body);
+        } else {
+            panic!("expected MsgReplyTxs");
+        }
+    }
+
+    /// B6: MsgReplyTxs with tag(24) in definite-array path must be accepted.
+    #[test]
+    fn reply_txs_definite_correct_tag_accepted() {
+        let mut buf = Vec::new();
+        {
+            let mut enc = minicbor::Encoder::new(&mut buf);
+            enc.array(2).unwrap();
+            enc.u64(TAG_REPLY_TXS).unwrap();
+            enc.array(1).unwrap(); // definite array of 1
+            enc.array(2).unwrap(); // GenTx
+            enc.u8(6).unwrap();
+            enc.tag(minicbor::data::Tag::new(24)).unwrap();
+            enc.bytes(&[0xAB, 0xCD]).unwrap();
+        }
+        let result = decode_message(&buf);
+        assert!(result.is_ok());
+    }
+
+    /// B6: MsgReplyTxs with wrong tag in definite-array path must be rejected.
+    #[test]
+    fn reply_txs_definite_wrong_tag_rejected() {
+        let mut buf = Vec::new();
+        {
+            let mut enc = minicbor::Encoder::new(&mut buf);
+            enc.array(2).unwrap();
+            enc.u64(TAG_REPLY_TXS).unwrap();
+            enc.array(1).unwrap(); // definite array of 1
+            enc.array(2).unwrap(); // GenTx
+            enc.u8(6).unwrap();
+            enc.tag(minicbor::data::Tag::new(999)).unwrap();
+            enc.bytes(&[0xAB, 0xCD]).unwrap();
+        }
+        let result = decode_message(&buf);
+        assert!(result.is_err(), "tag(999) must be rejected");
     }
 }

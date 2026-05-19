@@ -315,6 +315,27 @@ pub struct NodeConfig {
     /// Accepts fractional seconds, matching Haskell's `DiffTime` type.
     #[serde(default)]
     pub chain_sync_idle_timeout: Option<f64>,
+
+    // ── Inbound rate limiting (G1) ─────────────────────────────────────
+    /// Maximum N2N inbound connections per source IP within a 60-second window.
+    ///
+    /// Set to 0 to disable per-IP rate limiting entirely (not recommended).
+    /// Default: 5 — matches Haskell ouroboros-network `InboundGovernor`
+    /// `connectionRateLimit`.  Prevents a single source IP from exhausting all
+    /// inbound connection slots with stalled half-open connections.
+    ///
+    /// Note: this config field was previously defined in `ConnectionManagerConfig`
+    /// in `dugite-network` but was never wired into the accept loop.  This is the
+    /// authoritative config field going forward.
+    #[serde(default = "default_per_ip_rate_limit_n2n")]
+    pub per_ip_rate_limit_n2n: usize,
+
+    /// Maximum concurrent N2C (Unix socket) connections.
+    ///
+    /// Default: 16.  Prevents a local attacker or misbehaving wallet from
+    /// accumulating unbounded JoinHandles in the N2C accept loop (G3).
+    #[serde(default = "default_max_n2c_connections")]
+    pub max_n2c_connections: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -450,6 +471,18 @@ fn default_min_severity() -> String {
 
 fn default_requires_network_magic() -> String {
     "RequiresMagic".to_string()
+}
+
+/// Default N2N per-IP rate limit: 5 connections per 60-second window.
+///
+/// Matches Haskell ouroboros-network's `InboundGovernor` `connectionRateLimit`.
+fn default_per_ip_rate_limit_n2n() -> usize {
+    5
+}
+
+/// Default maximum concurrent N2C connections (G3).
+fn default_max_n2c_connections() -> usize {
+    16
 }
 
 /// Deserialize Protocol from either a string (e.g. "Cardano") or a struct
@@ -778,6 +811,8 @@ impl Default for NodeConfig {
             time_wait_timeout: default_time_wait_timeout(),
             egress_poll_interval: default_egress_poll_interval(),
             chain_sync_idle_timeout: None,
+            per_ip_rate_limit_n2n: default_per_ip_rate_limit_n2n(),
+            max_n2c_connections: default_max_n2c_connections(),
         }
     }
 }

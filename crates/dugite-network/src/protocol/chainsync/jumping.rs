@@ -380,6 +380,40 @@ impl PeerJumpState {
     }
 }
 
+// ─── Coordinator invariant helpers ───────────────────────────────────────────
+
+/// B15: Verify that a set of CSJ peers maintains the Dynamo invariant.
+///
+/// The Ouroboros CSJ protocol requires that **exactly one** peer is always in
+/// the `Dynamo` state (it is the only peer making `MsgRequestNext` calls).
+/// If all peers enter `Jumper` state simultaneously, no peer makes progress —
+/// a coordinated group of slow peers can trigger this deadlock.
+///
+/// Returns `Ok(())` if the invariant holds, `Err(message)` otherwise.
+///
+/// **Usage:** Call this after every state transition during Phase B integration
+/// to catch violations before they cause a silent sync stall.
+pub fn check_dynamo_invariant(peers: &[&PeerJumpState]) -> Result<(), String> {
+    let dynamo_count = peers.iter().filter(|p| p.is_dynamo()).count();
+    // Disengaged peers have left CSJ; they do not count against the invariant.
+    // An empty set (no CSJ peers) trivially satisfies it.
+    let active_count = peers.iter().filter(|p| !p.is_disengaged()).count();
+    if active_count == 0 {
+        return Ok(());
+    }
+    match dynamo_count {
+        1 => Ok(()),
+        0 => Err(format!(
+            "CSJ invariant violated: 0 dynamos among {active_count} active peers; \
+             sync will stall (no peer is issuing MsgRequestNext)"
+        )),
+        n => Err(format!(
+            "CSJ invariant violated: {n} peers are simultaneously Dynamo; \
+             only 1 is permitted at a time"
+        )),
+    }
+}
+
 // ─── Bisection helper ─────────────────────────────────────────────────────────
 
 /// Compute the bisection midpoint slot between `lo` and `hi`.
@@ -843,5 +877,87 @@ mod tests {
         let msg = err.to_string();
         assert!(msg.contains("on_jump_issued"));
         assert!(msg.contains("Dynamo"));
+    }
+
+    // ── B15: Dynamo invariant checks ──────────────────────────────────────────
+
+    /// B15: Exactly one Dynamo among active peers → invariant satisfied.
+    #[test]
+    fn dynamo_invariant_exactly_one_dynamo_ok() {
+        let dynamo = PeerJumpState::new_dynamo();
+        let jumper1 = PeerJumpState::new_jumper();
+        let jumper2 = PeerJumpState::new_jumper();
+        let result = check_dynamo_invariant(&[&dynamo, &jumper1, &jumper2]);
+        assert!(
+            result.is_ok(),
+            "exactly one dynamo should satisfy invariant"
+        );
+    }
+
+    /// B15: Zero Dynamos among active peers → invariant violated (sync stall).
+    #[test]
+    fn dynamo_invariant_zero_dynamo_violated() {
+        let jumper1 = PeerJumpState::new_jumper();
+        let jumper2 = PeerJumpState::new_jumper();
+        let result = check_dynamo_invariant(&[&jumper1, &jumper2]);
+        assert!(result.is_err(), "zero dynamos should violate the invariant");
+        let msg = result.unwrap_err();
+        assert!(
+            msg.contains("0 dynamos"),
+            "error should mention 0 dynamos: {msg}"
+        );
+    }
+
+    /// B15: Two Dynamos among active peers → invariant violated (duplicate leader).
+    #[test]
+    fn dynamo_invariant_two_dynamos_violated() {
+        let dynamo1 = PeerJumpState::new_dynamo();
+        let dynamo2 = PeerJumpState::new_dynamo();
+        let jumper = PeerJumpState::new_jumper();
+        let result = check_dynamo_invariant(&[&dynamo1, &dynamo2, &jumper]);
+        assert!(result.is_err(), "two dynamos should violate the invariant");
+        let msg = result.unwrap_err();
+        assert!(
+            msg.contains("2 peers"),
+            "error should mention peer count: {msg}"
+        );
+    }
+
+    /// B15: Empty peer set → invariant trivially satisfied (no active peers).
+    #[test]
+    fn dynamo_invariant_empty_peer_set_ok() {
+        let result = check_dynamo_invariant(&[]);
+        assert!(
+            result.is_ok(),
+            "empty peer set should satisfy invariant trivially"
+        );
+    }
+
+    /// B15: Disengaged peers do not count against the invariant, even if they
+    /// were formerly Dynamo-like — but here we test all-disengaged peers.
+    #[test]
+    fn dynamo_invariant_all_disengaged_ok() {
+        let mut peer1 = PeerJumpState::new_jumper();
+        let mut peer2 = PeerJumpState::new_jumper();
+        peer1.disengage();
+        peer2.disengage();
+        let result = check_dynamo_invariant(&[&peer1, &peer2]);
+        assert!(
+            result.is_ok(),
+            "all-disengaged peer set should satisfy invariant (no active peers)"
+        );
+    }
+
+    /// B15: One Dynamo + one disengaged → valid (only 1 active, and it is dynamo).
+    #[test]
+    fn dynamo_invariant_dynamo_with_disengaged_ok() {
+        let dynamo = PeerJumpState::new_dynamo();
+        let mut disengaged = PeerJumpState::new_jumper();
+        disengaged.disengage();
+        let result = check_dynamo_invariant(&[&dynamo, &disengaged]);
+        assert!(
+            result.is_ok(),
+            "one dynamo + one disengaged should satisfy invariant"
+        );
     }
 }

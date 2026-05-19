@@ -76,6 +76,14 @@ impl N2CVersionData {
             Some(1) => {
                 // V16 legacy format: [network_magic] — query defaults to false
                 let network_magic = dec.u64()?;
+                // C10 fix: network_magic is a Word32 in Haskell — values above u32::MAX
+                // are not valid Cardano network identifiers and indicate a malformed
+                // or spoofed handshake from an incompatible client.
+                if network_magic > u32::MAX as u64 {
+                    return Err(minicbor::decode::Error::message(
+                        "network_magic exceeds Word32 range",
+                    ));
+                }
                 Ok(Self {
                     network_magic,
                     query: false,
@@ -84,6 +92,12 @@ impl N2CVersionData {
             Some(2) => {
                 // V17+ format: [network_magic, query]
                 let network_magic = dec.u64()?;
+                // C10 fix: same Word32 range check.
+                if network_magic > u32::MAX as u64 {
+                    return Err(minicbor::decode::Error::message(
+                        "network_magic exceeds Word32 range",
+                    ));
+                }
                 let query = dec.bool()?;
                 Ok(Self {
                     network_magic,
@@ -217,5 +231,62 @@ mod tests {
             assert!(is_n2c_version(wire));
             assert_eq!(decode_n2c_version(wire), v);
         }
+    }
+
+    // ── C10 tests: network_magic Word32 range validation ──────────────────────
+
+    /// C10: network_magic = u32::MAX should be accepted (top of valid range).
+    #[test]
+    fn c10_network_magic_u32_max_accepted() {
+        let mut buf = Vec::new();
+        let mut enc = Encoder::new(&mut buf);
+        enc.array(2).expect("infallible");
+        enc.u64(u32::MAX as u64).expect("infallible");
+        enc.bool(false).expect("infallible");
+        let mut dec = Decoder::new(&buf);
+        let data = N2CVersionData::decode(&mut dec).unwrap();
+        assert_eq!(data.network_magic, u32::MAX as u64);
+    }
+
+    /// C10: network_magic = u32::MAX + 1 should be rejected.
+    #[test]
+    fn c10_network_magic_overflow_rejected_two_elem() {
+        let mut buf = Vec::new();
+        let mut enc = Encoder::new(&mut buf);
+        enc.array(2).expect("infallible");
+        enc.u64(u32::MAX as u64 + 1).expect("infallible");
+        enc.bool(false).expect("infallible");
+        let mut dec = Decoder::new(&buf);
+        assert!(
+            N2CVersionData::decode(&mut dec).is_err(),
+            "network_magic > u32::MAX must be rejected"
+        );
+    }
+
+    /// C10: network_magic overflow in legacy single-element format.
+    #[test]
+    fn c10_network_magic_overflow_rejected_one_elem() {
+        let mut buf = Vec::new();
+        let mut enc = Encoder::new(&mut buf);
+        enc.array(1).expect("infallible");
+        enc.u64(u64::MAX).expect("infallible");
+        let mut dec = Decoder::new(&buf);
+        assert!(
+            N2CVersionData::decode(&mut dec).is_err(),
+            "u64::MAX network_magic must be rejected"
+        );
+    }
+
+    /// C10: mainnet magic (764824073) is within Word32 range and must be accepted.
+    #[test]
+    fn c10_mainnet_magic_accepted() {
+        let mut buf = Vec::new();
+        let mut enc = Encoder::new(&mut buf);
+        enc.array(2).expect("infallible");
+        enc.u64(764_824_073u64).expect("infallible");
+        enc.bool(false).expect("infallible");
+        let mut dec = Decoder::new(&buf);
+        let data = N2CVersionData::decode(&mut dec).unwrap();
+        assert_eq!(data.network_magic, 764_824_073);
     }
 }

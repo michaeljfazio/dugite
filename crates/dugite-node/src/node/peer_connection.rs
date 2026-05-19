@@ -47,20 +47,20 @@ use dugite_network::protocol::{
 };
 use dugite_network::{MuxError, TcpBearer};
 
-/// Default ingress buffer size per protocol channel (64 KiB).
-///
-/// Matches the Haskell `network-mux` default SDU limit. Large enough for
-/// full block headers but bounded to prevent memory exhaustion from
-/// misbehaving peers.
 /// Ingress queue byte limit per protocol channel.
 ///
-/// Haskell uses 262,143 bytes (0x3FFFF) as the soft egress buffer limit.
-/// We use a much larger value because our ingress byte tracking only
-/// INCREMENTS (never decrements when the consumer reads), so it represents
-/// total bytes ever received rather than current buffer occupancy.
-/// Setting this high effectively allows the pipelined ChainSync to work
-/// while still protecting against truly unbounded growth from malicious peers.
-const DEFAULT_INGRESS_LIMIT: usize = 64 * 1024 * 1024; // 64 MB
+/// Matches Haskell's `Ouroboros.Network.Mux` `ingressQueueSize = 4 * 1024 * 1024`
+/// (4 MiB).  The `bytes_in_flight` counter is decremented by `MuxChannel::recv()`
+/// as data is consumed, so this limit correctly represents current buffered bytes —
+/// not total bytes ever received.
+///
+/// With 10 protocols × N peers × 4MB = 40MB per peer at worst, this is a large
+/// reduction from the prior 64MB per channel (640MB per peer).
+///
+/// A-006 (security audit 2026-05-19): the prior 64MB limit enabled a slow-reader
+/// attack where a peer could accumulate 640MB of ingress buffer before triggering
+/// IngressQueueOverrun.  Reduced to match Haskell's limit.
+const DEFAULT_INGRESS_LIMIT: usize = 4 * 1024 * 1024; // 4 MB (matches Haskell ingressQueueSize)
 
 /// Timeout for graceful protocol task shutdown (seconds).
 ///
@@ -1003,9 +1003,12 @@ mod tests {
     }
 
     /// Verify default constants are reasonable.
+    ///
+    /// A-006 (security audit 2026-05-19): DEFAULT_INGRESS_LIMIT was reduced
+    /// from 64 MB to 4 MB to match Haskell's `ingressQueueSize = 4 * 1024 * 1024`.
     #[test]
     fn default_constants() {
-        assert_eq!(DEFAULT_INGRESS_LIMIT, 64 * 1024 * 1024);
+        assert_eq!(DEFAULT_INGRESS_LIMIT, 4 * 1024 * 1024); // 4 MB — matches Haskell
         assert_eq!(DEFAULT_CONNECT_TIMEOUT, Duration::from_secs(10));
     }
 

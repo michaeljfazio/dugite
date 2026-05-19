@@ -577,14 +577,8 @@ pub(crate) fn check_extra_redeemers(
         }
     }
 
-    // Reward: script-locked withdrawals
-    for (idx, reward_addr) in body.withdrawals.keys().enumerate() {
-        if reward_addr.len() >= 29 && (reward_addr[0] & 0x10) != 0 {
-            valid_purposes.insert((2, idx as u32));
-        }
-    }
-
     // Cert: script-credential certificates
+    // CBOR redeemer_tag = 2 (Cardano CDDL: 0=spend,1=mint,2=cert,3=reward).
     for (idx, cert) in body.certificates.iter().enumerate() {
         let script_cred: Option<&Credential> = match cert {
             Certificate::StakeDeregistration(c) => Some(c),
@@ -606,6 +600,14 @@ pub(crate) fn check_extra_redeemers(
             _ => None,
         };
         if let Some(Credential::Script(_)) = script_cred {
+            valid_purposes.insert((2, idx as u32));
+        }
+    }
+
+    // Reward: script-locked withdrawals
+    // CBOR redeemer_tag = 3 (Cardano CDDL: 0=spend,1=mint,2=cert,3=reward).
+    for (idx, reward_addr) in body.withdrawals.keys().enumerate() {
+        if reward_addr.len() >= 29 && (reward_addr[0] & 0x10) != 0 {
             valid_purposes.insert((3, idx as u32));
         }
     }
@@ -630,13 +632,15 @@ pub(crate) fn check_extra_redeemers(
         }
     }
 
-    // Check each redeemer against valid purposes
+    // Check each redeemer against valid purposes.
+    // Tag bytes match the Cardano CDDL redeemer_tag encoding:
+    //   0=spend, 1=mint, 2=cert, 3=reward, 4=vote, 5=propose.
     for redeemer in &tx.witness_set.redeemers {
         let tag_byte = match redeemer.tag {
             RedeemerTag::Spend => 0u8,
             RedeemerTag::Mint => 1u8,
-            RedeemerTag::Reward => 2u8,
-            RedeemerTag::Cert => 3u8,
+            RedeemerTag::Cert => 2u8,
+            RedeemerTag::Reward => 3u8,
             RedeemerTag::Vote => 4u8,
             RedeemerTag::Propose => 5u8,
         };

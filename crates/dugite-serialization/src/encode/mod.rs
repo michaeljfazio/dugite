@@ -30,8 +30,8 @@ pub use script::{
     encode_script_ref,
 };
 pub use transaction::{
-    compute_transaction_hash, encode_auxiliary_data, encode_transaction, encode_transaction_body,
-    encode_transaction_output, encode_witness_set,
+    compute_transaction_hash, compute_transaction_hash_from_tx, encode_auxiliary_data,
+    encode_transaction, encode_transaction_body, encode_transaction_output, encode_witness_set,
 };
 pub use value::encode_value;
 
