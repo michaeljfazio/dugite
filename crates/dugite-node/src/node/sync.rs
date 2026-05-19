@@ -2794,6 +2794,15 @@ pub(crate) const PENDING_HEADERS_PAUSE: usize = 10_000;
 /// would thrash on every fetched block.
 pub(crate) const PENDING_HEADERS_RESUME: usize = 6_000;
 
+/// Maximum size of a single header CBOR payload received via `MsgRollForward`.
+///
+/// B12: Without this cap, a malicious peer could send headers up to the MUX
+/// frame limit (~65 KB) and fill `pending_headers` with
+/// `PENDING_HEADERS_PAUSE × 65 KB ≈ 650 MB` of data.  Cardano Conway headers
+/// are typically ≤ 2 KB; we allow 8 KB (4× safety margin) for future eras.
+/// At that size: 10,000 × 8 KB = 80 MB peak, which is safe.
+pub(crate) const MAX_HEADER_CBOR_BYTES: usize = 8_192;
+
 /// Decide whether the ChainSync pipeline should send more `MsgRequestNext`.
 ///
 /// Returns `true` only when:
@@ -3372,11 +3381,42 @@ pub async fn chainsync_client_task(
                         }
                         headers_received += 1;
 
+                        // B12: Reject oversized headers before any parsing.
+                        // Haskell's multiplexer enforces a maximum frame size of
+                        // 65,535 bytes, and `blockHeaderMaxSize` is ~4 KB for Conway.
+                        // We allow 8 KB (2× safety margin) to tolerate future eras.
+                        // At PENDING_HEADERS_PAUSE=10,000 × 8 KB = 80 MB maximum
+                        // pending_headers memory, vs the current uncapped
+                        // 10,000 × 65 KB ≈ 650 MB worst case.
+                        if header.len() > MAX_HEADER_CBOR_BYTES {
+                            return Err(anyhow::anyhow!(
+                                "ChainSync: {peer_addr} sent oversized header \
+                                 ({} bytes, limit {}); disconnecting",
+                                header.len(),
+                                MAX_HEADER_CBOR_BYTES
+                            ));
+                        }
+
                         // Extract slot and hash from the header CBOR.
                         // The hash is blake2b_256 of the raw header bytes.
                         let hash = extract_hash_from_header(&header);
-                        let slot = extract_slot_from_wrapped_header(&header)
-                            .unwrap_or(tip_slot);
+                        // B13: Never fall back to the peer-supplied `tip_slot` when
+                        // the header's slot cannot be extracted.  `tip_slot` is fully
+                        // controlled by the peer and substituting it would allow the
+                        // peer to inject an arbitrary slot value into pipeline
+                        // scheduling and epoch-boundary logic.  An undecodable header
+                        // is a protocol violation → disconnect.
+                        let slot = match extract_slot_from_wrapped_header(&header) {
+                            Some(s) => s,
+                            None => {
+                                return Err(anyhow::anyhow!(
+                                    "ChainSync: {peer_addr} sent MsgRollForward with \
+                                     undecodable header slot (header len={}); \
+                                     disconnecting to prevent slot-injection",
+                                    header.len()
+                                ));
+                            }
+                        };
 
                         // Update candidate chain state.
                         //
@@ -3734,10 +3774,21 @@ pub async fn chainsync_client_task(
                     }
 
                     other => {
-                        warn!(
-                            %peer_addr,
-                            "ChainSync unexpected message: {other:?}",
-                        );
+                        // B1: State machine violation — a pipelined ChainSync client
+                        // MUST NOT silently skip unexpected messages.  Doing so
+                        // desynchronises the `outstanding` counter from the peer's
+                        // actual state: either the pipeline drains to zero (sync
+                        // stalls) or we keep sending MsgRequestNext when the peer
+                        // no longer expects them (peer disconnects with AgencyViolation).
+                        //
+                        // The Haskell typed-protocol framework makes this impossible at
+                        // compile time; we enforce the same invariant at runtime here by
+                        // returning an error that triggers peer disconnect and reconnection.
+                        return Err(anyhow::anyhow!(
+                            "ChainSync state machine violation from {peer_addr}: \
+                             unexpected message {other:?} (outstanding={outstanding}); \
+                             disconnecting to trigger reconnection"
+                        ));
                     }
                 }
             }

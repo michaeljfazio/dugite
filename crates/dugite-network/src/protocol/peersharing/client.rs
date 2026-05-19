@@ -4,7 +4,7 @@ use crate::error::ProtocolError;
 use crate::mux::channel::MuxChannel;
 use std::net::SocketAddr;
 
-use super::{decode_message, encode_message, PeerSharingMessage};
+use super::{decode_message, encode_message, is_routable, PeerSharingMessage};
 
 /// PeerSharing client that requests addresses from a remote peer.
 pub struct PeerSharingClient;
@@ -27,7 +27,19 @@ impl PeerSharingClient {
         })?;
 
         match response {
-            PeerSharingMessage::MsgSharePeers(addrs) => Ok(addrs),
+            PeerSharingMessage::MsgSharePeers(addrs) => {
+                // B10: Filter addresses on the CLIENT side before returning to the
+                // PeerManager.  A malicious peer can send private/loopback/link-local
+                // addresses (127.0.0.1, 169.254.169.254, 10.0.0.0/8) to cause dugite
+                // to dial internal services — an SSRF-class vulnerability.
+                // cardano-node applies `isValid` on the client side before adding peers
+                // to PeerStateActions.  We mirror that with our `is_routable()` filter.
+                let routable: Vec<SocketAddr> = addrs
+                    .into_iter()
+                    .filter(|addr| is_routable(&addr.ip()))
+                    .collect();
+                Ok(routable)
+            }
             other => Err(ProtocolError::StateViolation {
                 protocol: "PeerSharing",
                 expected: "MsgSharePeers".to_string(),
@@ -195,5 +207,74 @@ mod tests {
         let (_, _, bytes) = egress_rx.recv().await.unwrap();
         let msg = decode_message(&bytes).unwrap();
         assert_eq!(msg, PeerSharingMessage::MsgDone);
+    }
+
+    /// B10: Client MUST filter non-routable addresses returned by a malicious peer.
+    ///
+    /// A peer serving private IPs (10.x, 192.168.x, 127.x, 169.254.x) would cause
+    /// dugite to connect to internal services — SSRF-class.  The client must drop
+    /// all non-routable addresses before returning to PeerManager.
+    #[tokio::test]
+    async fn client_filters_private_addresses_from_peer_reply() {
+        let (mut channel, mut egress_rx, ingress_tx) = make_test_channel();
+
+        // Attacker-controlled server returns a mix of private and routable addresses.
+        let malicious_addrs = vec![
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4)), 3001), // routable
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)), 3001), // RFC1918 — drop
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 3001), // loopback — drop
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::new(5, 5, 5, 5)), 3001), // routable
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 1)), 3001), // RFC1918 — drop
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::new(169, 254, 169, 254)), 3001), // cloud metadata — drop
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)), 3001),         // routable
+        ];
+
+        let handle =
+            tokio::spawn(async move { PeerSharingClient::request_peers(&mut channel, 10).await });
+
+        let (_, _, _req_bytes) = egress_rx.recv().await.unwrap();
+
+        let resp = encode_message(&PeerSharingMessage::MsgSharePeers(malicious_addrs));
+        ingress_tx.send(Bytes::from(resp)).await.unwrap();
+
+        let result = handle.await.unwrap().unwrap();
+
+        // Only the 3 routable addresses (1.2.3.4, 5.5.5.5, 8.8.8.8) survive filtering.
+        assert_eq!(result.len(), 3, "only 3 routable addresses should survive");
+        let ips: Vec<_> = result.iter().map(|a| a.ip()).collect();
+        assert!(ips.contains(&IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4))));
+        assert!(ips.contains(&IpAddr::V4(Ipv4Addr::new(5, 5, 5, 5))));
+        assert!(ips.contains(&IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8))));
+
+        // None of the private/loopback addresses must be present.
+        assert!(!ips.contains(&IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1))));
+        assert!(!ips.contains(&IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1))));
+        assert!(!ips.contains(&IpAddr::V4(Ipv4Addr::new(192, 168, 1, 1))));
+        assert!(!ips.contains(&IpAddr::V4(Ipv4Addr::new(169, 254, 169, 254))));
+    }
+
+    /// B10: Client must drop all addresses when all are non-routable.
+    #[tokio::test]
+    async fn client_returns_empty_when_all_addrs_non_routable() {
+        let (mut channel, mut egress_rx, ingress_tx) = make_test_channel();
+
+        let all_private = vec![
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)), 3001),
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::new(172, 16, 0, 1)), 3001),
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 3001),
+        ];
+
+        let handle =
+            tokio::spawn(async move { PeerSharingClient::request_peers(&mut channel, 5).await });
+
+        let (_, _, _) = egress_rx.recv().await.unwrap();
+        let resp = encode_message(&PeerSharingMessage::MsgSharePeers(all_private));
+        ingress_tx.send(Bytes::from(resp)).await.unwrap();
+
+        let result = handle.await.unwrap().unwrap();
+        assert!(
+            result.is_empty(),
+            "all non-routable input → empty output expected"
+        );
     }
 }
