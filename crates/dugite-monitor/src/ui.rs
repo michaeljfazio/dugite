@@ -33,7 +33,7 @@
 //! ├──────────────────────── Footer (1 line) ───────────────────────────────────┘
 //! ```
 
-use crate::app::{App, NodeStatus, TipState};
+use crate::app::{App, Network, NodeStatus, TipState};
 
 use crate::layout::{compute_layout, LayoutMode};
 use crate::theme::Theme;
@@ -396,10 +396,14 @@ fn render_node_panel(frame: &mut Frame, app: &App, theme: &Theme, area: Rect) {
     };
 
     let network_magic = app.metrics.get_u64("dugite_network_magic");
-    let network = if network_magic > 0 {
-        format!("{} ({})", app.network.label(), network_magic)
-    } else {
-        app.network.label().to_string()
+    // The Node panel value column is fixed at VALUE_W (16 chars). Mainnet's
+    // magic alone is 9 digits, so "Mainnet (764824073)" (19 chars) gets cut by
+    // the panel border to "Mainnet (76482407", losing the closing paren.
+    // For recognised networks the label is unambiguous — drop the magic. Show
+    // the raw magic only for Unknown networks where it is diagnostically useful.
+    let network = match app.network {
+        Network::Unknown if network_magic > 0 => format!("magic {}", network_magic),
+        _ => app.network.label().to_string(),
     };
     let version = env!("CARGO_PKG_VERSION");
     let uptime_secs = app.metrics.get_u64("dugite_uptime_seconds");
