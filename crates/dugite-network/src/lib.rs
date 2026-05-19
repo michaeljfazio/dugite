@@ -450,6 +450,10 @@ pub trait ConnectionMetrics: Send + Sync + 'static {
 pub use protocol::blockfetch::client::BlockFetchClient;
 pub use protocol::blockfetch::decision::BlockFetchDecision;
 pub use protocol::chainsync::client::{ChainSyncEvent, PipelinedChainSyncClient};
+pub use protocol::chainsync::jumping::{
+    bisect_midpoint, EraParams as CsjEraParams, JumpInstruction, JumpState, JumperState,
+    PeerJumpState, TransitionError as CsjTransitionError,
+};
 pub use protocol::chainsync::server::{BlockAnnouncement, RollbackAnnouncement};
 pub use protocol::keepalive::client::{KeepAliveClient, DEFAULT_KEEPALIVE_INTERVAL};
 pub use protocol::keepalive::server::KeepAliveServer;

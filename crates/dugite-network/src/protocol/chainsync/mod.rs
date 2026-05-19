@@ -39,6 +39,7 @@
 //! verbatim into the message; the decoder captures the corresponding sub-value.
 
 pub mod client;
+pub mod jumping;
 pub mod server;
 
 use crate::codec::{self, Point};
