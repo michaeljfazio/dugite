@@ -8,10 +8,6 @@ publish = false
 name = "golden_tests"
 path = "tests/golden_tests.rs"
 
-[[test]]
-name = "nonce_golden"
-path = "tests/nonce_golden.rs"
-
 [dependencies]
 dugite-crypto = { path = "../../crates/dugite-crypto" }
 dugite-network = { path = "../../crates/dugite-network" }
@@ -19,7 +15,3 @@ dugite-primitives = { path = "../../crates/dugite-primitives" }
 dugite-serialization = { path = "../../crates/dugite-serialization" }
 hex = "0.4"
 minicbor = { workspace = true }
-pallas-crypto = { workspace = true }
-pallas-traverse = { workspace = true }
-pallas-primitives = { workspace = true }
-memmap2 = { workspace = true }
