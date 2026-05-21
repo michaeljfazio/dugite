@@ -17,6 +17,10 @@ env:
 jobs:
   benchmarks:
     runs-on: ubuntu-latest
+    # Keep within the 6h GitHub-hosted runner ceiling. Recent runs landed
+    # between 5h and 5h56m; capping at 5h25m fails fast (with usable logs +
+    # artifacts) instead of being silently killed at the 6h limit.
+    timeout-minutes: 325
     if: github.ref == 'refs/heads/main'
     steps:
       - uses: actions/checkout@v6
@@ -46,32 +50,30 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-criterion-baselines
 
+      # Each benchmark is run ONCE with `--save-baseline nightly`. Criterion
+      # both produces the HTML report (target/criterion/<name>/report/) AND
+      # saves the run as the `nightly` baseline that the next run's default
+      # invocation compares against. Running twice (default + save-baseline)
+      # doubled job runtime and was pushing us past the 6h runner cap.
       - name: Run storage benchmarks
         run: |
-          # Run in default mode first (generates HTML reports with comparison)
-          cargo bench -p dugite-storage --bench storage_bench 2>&1 | tee storage_bench.txt || true
-          # Save baselines for next run
-          cargo bench -p dugite-storage --bench storage_bench -- --save-baseline nightly 2>/dev/null || true
+          cargo bench -p dugite-storage --bench storage_bench -- --save-baseline nightly 2>&1 | tee storage_bench.txt || true
 
       - name: Run UTxO benchmarks
         run: |
-          cargo bench -p dugite-ledger --bench utxo_bench 2>&1 | tee utxo_bench.txt || true
-          cargo bench -p dugite-ledger --bench utxo_bench -- --save-baseline nightly 2>/dev/null || true
+          cargo bench -p dugite-ledger --bench utxo_bench -- --save-baseline nightly 2>&1 | tee utxo_bench.txt || true
 
       - name: Run network benchmarks
         run: |
-          cargo bench -p dugite-network --bench network_bench 2>&1 | tee network_bench.txt || true
-          cargo bench -p dugite-network --bench network_bench -- --save-baseline nightly 2>/dev/null || true
+          cargo bench -p dugite-network --bench network_bench -- --save-baseline nightly 2>&1 | tee network_bench.txt || true
 
       - name: Run consensus benchmarks
         run: |
-          cargo bench -p dugite-consensus --bench consensus_bench 2>&1 | tee consensus_bench.txt || true
-          cargo bench -p dugite-consensus --bench consensus_bench -- --save-baseline nightly 2>/dev/null || true
+          cargo bench -p dugite-consensus --bench consensus_bench -- --save-baseline nightly 2>&1 | tee consensus_bench.txt || true
 
       - name: Run LSM benchmarks
         run: |
-          cargo bench -p dugite-lsm --bench lsm_bench 2>&1 | tee lsm_bench.txt || true
-          cargo bench -p dugite-lsm --bench lsm_bench -- --save-baseline nightly 2>/dev/null || true
+          cargo bench -p dugite-lsm --bench lsm_bench -- --save-baseline nightly 2>&1 | tee lsm_bench.txt || true
 
       - name: Run LSM large-scale stress tests
         run: |
