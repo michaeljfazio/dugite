@@ -103,8 +103,22 @@ pub fn decode_block_minimal_with_byron_epoch_length(
 
 /// Decode a transaction CBOR for a specific era.
 ///
-/// Currently routes to the legacy pallas wrapper. M6 follow-up will add
-/// in-house tx-level entry points (`decode_*_tx`) to each era module.
+/// `era_id` follows the Cardano HFC convention:
+/// 0 = Byron, 1 = Shelley, 2 = Allegra, 3 = Mary, 4 = Alonzo,
+/// 5 = Babbage, 6 = Conway, 7 = Dijkstra.
 pub fn decode_transaction(era_id: u16, tx_cbor: &[u8]) -> Result<Transaction, SerializationError> {
-    crate::multi_era::decode_transaction(era_id, tx_cbor)
+    use dugite_primitives::era::Era;
+    match era_id {
+        0 => era_byron::decode_byron_tx_standalone(tx_cbor),
+        1 => era_shelley::decode_shelley_tx_standalone(tx_cbor),
+        2 => era_alonzo::decode_alonzo_family_tx_standalone(tx_cbor, Era::Allegra),
+        3 => era_alonzo::decode_alonzo_family_tx_standalone(tx_cbor, Era::Mary),
+        4 => era_alonzo::decode_alonzo_family_tx_standalone(tx_cbor, Era::Alonzo),
+        5 => era_babbage::decode_babbage_tx_standalone(tx_cbor),
+        6 => era_conway::decode_conway_tx_standalone(tx_cbor, Era::Conway),
+        7 => era_conway::decode_conway_tx_standalone(tx_cbor, Era::Dijkstra),
+        n => Err(SerializationError::CborDecode(format!(
+            "unknown era id: {n}"
+        ))),
+    }
 }
