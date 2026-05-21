@@ -1333,7 +1333,6 @@ dependencies = [
  "num-bigint",
  "pallas-addresses 1.0.0-alpha.6",
  "pallas-crypto 1.0.0-alpha.6",
- "pallas-traverse 1.0.0-alpha.6",
  "proptest",
  "rand 0.9.4",
  "rayon",

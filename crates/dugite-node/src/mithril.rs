@@ -1855,13 +1855,12 @@ fn parse_chunk_with_index(
             // could be computed over a different range in some eras)
         }
 
-        // Try to decode with pallas to get the slot and block number
-        match pallas_traverse::MultiEraBlock::decode(block_cbor) {
-            Ok(pallas_block) => {
-                let slot = SlotNo(pallas_block.slot());
-                let block_no = BlockNo(pallas_block.number());
+        // Extract block identity (slot + block_no) via the in-house
+        // serialization layer. The hash comes from the secondary index;
+        // we trust the index over re-decoding the header.
+        match dugite_serialization::extract_block_identity(block_cbor) {
+            Ok((slot, block_no, _header_hash)) => {
                 let hash = Hash32::from_bytes(entry._header_hash);
-
                 blocks.push((slot, hash, block_no, block_cbor.to_vec()));
             }
             Err(e) => {
@@ -1915,14 +1914,8 @@ fn parse_chunk_sequential(chunk_path: &Path) -> Result<Vec<ParsedBlock>> {
         };
 
         // Try to decode the CBOR item as a Cardano block
-        match pallas_traverse::MultiEraBlock::decode(&remaining[..item_size]) {
-            Ok(pallas_block) => {
-                let slot = SlotNo(pallas_block.slot());
-                let block_no = BlockNo(pallas_block.number());
-                let hash_bytes: [u8; 32] =
-                    pallas_block.hash().as_ref().try_into().unwrap_or([0u8; 32]);
-                let hash = Hash32::from_bytes(hash_bytes);
-
+        match dugite_serialization::extract_block_identity(&remaining[..item_size]) {
+            Ok((slot, block_no, hash)) => {
                 blocks.push((slot, hash, block_no, remaining[..item_size].to_vec()));
             }
             Err(_) => {
