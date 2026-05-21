@@ -65,7 +65,7 @@ dugite-cli (binary: cardano-cli compatible, 38+ subcommands)
 dugite-monitor (binary: terminal monitoring dashboard, ratatui-based, real-time metrics)
 dugite-config (binary: interactive TUI configuration editor with tree navigation, inline editing, diff view)
 
-dugite-serialization (CBOR encode/decode via pallas)
+dugite-serialization (CBOR encode/decode — in-house multi-era decoder + minicbor)
 dugite-crypto (Ed25519, VRF, KES, text envelope)
 dugite-primitives (core types: hashes, blocks, txs, addresses, values, protocol params, all eras)
 ```
@@ -76,8 +76,8 @@ dugite-primitives (core types: hashes, blocks, txs, addresses, values, protocol 
 - **`ChainDB`** — wraps ImmutableDB (append-only chunk files) + VolatileDB (HashMap), handles rollback and volatile→immutable flush
 
 ### Wire Format
-- All Cardano wire-format compatibility via pallas crates (v1.0.0-alpha.5)
-- `Transaction.hash` field is set during deserialization from `pallas tx.hash()`
+- All Cardano wire-format compatibility via the in-house multi-era CBOR decoder under `crates/dugite-serialization/src/decode/`
+- `Transaction.hash` is `blake2b_256(raw_body_cbor)` over the bytes captured by `KeepRaw::parse_with` during decode
 - CBOR encoding for N2C protocol params uses integer keys 0-33 (not JSON strings)
 
 ## Key Patterns
@@ -87,10 +87,10 @@ dugite-primitives (core types: hashes, blocks, txs, addresses, values, protocol 
 - ChainDB write happens BEFORE ledger apply to prevent divergence on failure
 - Epoch transitions use mark/set/go snapshot model with reward distribution from "go" snapshot
 - Governance ratification: DRep/SPO/CC voting thresholds vary by action type (CIP-1694)
-- Pipelined ChainSync bypasses pallas serial state machine; default pipeline depth 300 (configurable via `DUGITE_PIPELINE_DEPTH`)
+- Pipelined ChainSync runs an in-house state machine for maximum throughput; default pipeline depth 300 (configurable via `DUGITE_PIPELINE_DEPTH`)
 - Ledger-based peer discovery: extracts SPO relay addresses from `pool_params` when past `useLedgerAfterSlot`
-- Pallas 1.0: `DatumOption` (was `PseudoDatumOption`), `Option<T>` (was `Nullable<T>`)
-- Pallas 28-byte hash types (DRep keys, pool voter keys, required signers) must be padded to 32 bytes — do not use `Hash<32>::from()` directly on 28-byte hashes
+- DatumOption / Nullable wrappers: see `crates/dugite-serialization/src/decode/primitives.rs` for the in-house equivalents (`Nullable`, `MaybeIndef`, `KeyValuePairs`)
+- 28-byte hash types (DRep keys, pool voter keys, required signers) must be padded to 32 bytes via `Hash28::to_hash32_padded()` — do not use `Hash<32>::from()` directly on 28-byte hashes
 
 ## Current Focus
 Soak testing on preview testnet (Sandstone Pool [SAND], pool ID 6954ec11cf7097a693721104139b96c54e7f3e2a8f9e7577630f7856). Automated restart cycles, transaction submission via `scripts/soak/varied-batch.sh` (driven by the 6h orchestrator at `scripts/soak/orchestrator-6h.sh`), Koios cross-validation. Stability and block production verification.
