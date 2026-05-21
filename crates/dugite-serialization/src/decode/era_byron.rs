@@ -1043,4 +1043,153 @@ mod tests {
         let expected = blake2b_256(&expected_input);
         assert_eq!(byron_ebb_header_hash(raw), expected);
     }
+
+    // ── decode_byron_tx error paths ───────────────────────────────────────
+
+    #[test]
+    fn decode_byron_tx_rejects_wrong_arity() {
+        // array(2) instead of array(3)
+        let tx_cbor = cbor_arr2(&cbor_indef_arr0(), &cbor_indef_arr0());
+        let err = decode_byron_tx(&tx_cbor, &[]).unwrap_err();
+        let SerializationError::CborDecode(msg) = err else {
+            panic!("expected CborDecode");
+        };
+        assert!(msg.contains("array(2)"));
+    }
+
+    #[test]
+    fn decode_byron_tx_rejects_indefinite_outer() {
+        // array(indef) for the tx body — must be definite array(3).
+        let tx_cbor = vec![0x9f, 0xff];
+        assert!(decode_byron_tx(&tx_cbor, &[]).is_err());
+    }
+
+    #[test]
+    fn decode_byron_tx_empty_inputs_outputs_decodes() {
+        // [[], [], {}]
+        let tx_cbor = cbor_arr3(&cbor_indef_arr0(), &cbor_indef_arr0(), &cbor_map0());
+        let tx = decode_byron_tx(&tx_cbor, &[]).unwrap();
+        assert_eq!(tx.era, Era::Byron);
+        assert_eq!(tx.body.inputs.len(), 0);
+        assert_eq!(tx.body.outputs.len(), 0);
+        assert!(tx.is_valid);
+    }
+
+    // ── read_byron_tx_input error paths ───────────────────────────────────
+
+    #[test]
+    fn read_byron_tx_input_rejects_unknown_disc() {
+        // [5, ...] — disc must be 0
+        let mut data = vec![0x82];
+        data.extend(cbor_uint(5));
+        data.extend(cbor_bytes(&[0; 4])); // some bytes
+        let mut r = Reader::new(&data);
+        let err = read_byron_tx_input(&mut r).unwrap_err();
+        let SerializationError::CborDecode(msg) = err else {
+            panic!("expected CborDecode");
+        };
+        assert!(msg.contains("unknown discriminator"));
+    }
+
+    #[test]
+    fn read_byron_tx_input_rejects_wrong_outer_arity() {
+        // array(3) instead of array(2)
+        let mut data = vec![0x83];
+        data.extend(cbor_uint(0));
+        data.extend(cbor_uint(0));
+        data.extend(cbor_uint(0));
+        let mut r = Reader::new(&data);
+        assert!(read_byron_tx_input(&mut r).is_err());
+    }
+
+    #[test]
+    fn read_byron_tx_input_decodes_pubkey_form() {
+        // [0, tag(24) bstr( [txhash(32), txix] )]
+        let mut inner = vec![0x82];
+        inner.extend(cbor_bytes(&[0xAB; 32]));
+        inner.extend(cbor_uint(7));
+        let mut data = vec![0x82];
+        data.extend(cbor_uint(0)); // PubKey disc
+        data.push(0xd8);
+        data.push(0x18); // tag(24)
+        data.extend(cbor_bytes(&inner));
+        let mut r = Reader::new(&data);
+        let input = read_byron_tx_input(&mut r).unwrap();
+        assert_eq!(input.transaction_id.as_bytes(), &[0xAB; 32]);
+        assert_eq!(input.index, 7);
+    }
+
+    #[test]
+    fn read_byron_tx_input_inner_wrong_arity() {
+        // [0, tag(24) bstr( array(3) [...] )] — inner must be array(2)
+        let mut inner = vec![0x83];
+        inner.extend(cbor_uint(0));
+        inner.extend(cbor_uint(0));
+        inner.extend(cbor_uint(0));
+        let mut data = vec![0x82];
+        data.extend(cbor_uint(0));
+        data.push(0xd8);
+        data.push(0x18);
+        data.extend(cbor_bytes(&inner));
+        let mut r = Reader::new(&data);
+        assert!(read_byron_tx_input(&mut r).is_err());
+    }
+
+    // ── read_byron_tx_output error paths ──────────────────────────────────
+
+    #[test]
+    fn read_byron_tx_output_rejects_wrong_arity() {
+        // array(3) instead of array(2)
+        let mut data = vec![0x83];
+        data.extend(cbor_uint(0));
+        data.extend(cbor_uint(0));
+        data.extend(cbor_uint(0));
+        let mut r = Reader::new(&data);
+        assert!(read_byron_tx_output(&mut r).is_err());
+    }
+
+    // ── decode_byron_tx_standalone ────────────────────────────────────────
+
+    #[test]
+    fn decode_byron_tx_standalone_rejects_non_tag() {
+        // Plain array, no tag
+        let data = [0x82u8, 0xa0, 0xa0];
+        assert!(decode_byron_tx_standalone(&data).is_err());
+    }
+
+    #[test]
+    fn decode_byron_tx_standalone_rejects_wrong_tag() {
+        // tag(99) bstr — must be tag(30)
+        let mut data = vec![0xd8, 0x63]; // tag(99)
+        data.extend(cbor_bytes(&[0; 4]));
+        let err = decode_byron_tx_standalone(&data).unwrap_err();
+        let SerializationError::CborDecode(msg) = err else {
+            panic!("expected CborDecode");
+        };
+        assert!(msg.contains("tag(30)"));
+    }
+
+    #[test]
+    fn decode_byron_tx_standalone_rejects_inner_wrong_arity() {
+        // tag(30) bstr( array(3) [...] ) — must be array(2)
+        let inner = cbor_arr3(&cbor_uint(0), &cbor_uint(0), &cbor_uint(0));
+        let mut data = vec![0xd8, 0x1e]; // tag(30)
+        data.extend(cbor_bytes(&inner));
+        let err = decode_byron_tx_standalone(&data).unwrap_err();
+        let SerializationError::CborDecode(msg) = err else {
+            panic!("expected CborDecode");
+        };
+        assert!(msg.contains("array(2)"));
+    }
+
+    #[test]
+    fn decode_byron_tx_standalone_minimal_tx_decodes() {
+        // tag(30) bstr( [ tx=[[],[],{}], witnesses=[] ] )
+        let tx_body = cbor_arr3(&cbor_indef_arr0(), &cbor_indef_arr0(), &cbor_map0());
+        let inner = cbor_arr2(&tx_body, &cbor_indef_arr0());
+        let mut data = vec![0xd8, 0x1e];
+        data.extend(cbor_bytes(&inner));
+        let tx = decode_byron_tx_standalone(&data).unwrap();
+        assert_eq!(tx.era, Era::Byron);
+    }
 }

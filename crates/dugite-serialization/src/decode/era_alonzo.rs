@@ -1775,4 +1775,321 @@ mod tests {
         assert!(block.transactions[0].witness_set.vkey_witnesses.is_empty());
         assert!(block.transactions[0].witness_set.redeemers.is_empty());
     }
+
+    // ── Plutus data edge cases ────────────────────────────────────────────
+
+    #[test]
+    fn plutus_data_constr_102_alternative_encoding() {
+        // tag(102) [constructor, [fields]] — alternative for constr 128+
+        let mut data = vec![0xd8, 0x66]; // tag(102)
+        data.push(0x82); // array(2)
+        data.extend(cbor_uint(200)); // constructor
+        data.push(0x80); // empty fields
+        let mut r = Reader::new(&data);
+        let pd = read_plutus_data(&mut r).unwrap();
+        assert!(matches!(pd, PlutusData::Constr(200, _)));
+    }
+
+    #[test]
+    fn plutus_data_constr_102_wrong_arity_rejected() {
+        let data = vec![0xd8, 0x66, 0x81, 0x00];
+        let mut r = Reader::new(&data);
+        assert!(read_plutus_data(&mut r).is_err());
+    }
+
+    #[test]
+    fn plutus_data_positive_bignum_tag2() {
+        // tag(2) bstr — positive bignum
+        let mut data = vec![0xc2];
+        data.extend(cbor_bytes(&[0x01, 0x00])); // 256
+        let mut r = Reader::new(&data);
+        let pd = read_plutus_data(&mut r).unwrap();
+        assert_eq!(pd, PlutusData::Integer(BigInt::from(256u64)));
+    }
+
+    #[test]
+    fn plutus_data_negative_bignum_tag3() {
+        let mut data = vec![0xc3];
+        data.extend(cbor_bytes(&[0x00])); // -(0)-1 = -1
+        let mut r = Reader::new(&data);
+        let pd = read_plutus_data(&mut r).unwrap();
+        assert_eq!(pd, PlutusData::Integer(BigInt::from(-1i32)));
+    }
+
+    #[test]
+    fn plutus_data_negative_int() {
+        // -5 = major 1, info 4 = 0x24
+        let data = [0x24u8];
+        let mut r = Reader::new(&data);
+        let pd = read_plutus_data(&mut r).unwrap();
+        assert_eq!(pd, PlutusData::Integer(BigInt::from(-5i32)));
+    }
+
+    #[test]
+    fn plutus_data_unknown_tag_rejected() {
+        let mut data = vec![0xd9, 0x10, 0x00]; // tag(4096) — unknown
+        data.push(0x80);
+        let mut r = Reader::new(&data);
+        assert!(read_plutus_data(&mut r).is_err());
+    }
+
+    #[test]
+    fn plutus_data_unexpected_type_rejected() {
+        // null (major 7) is not valid plutus_data
+        let data = [0xf6u8];
+        let mut r = Reader::new(&data);
+        assert!(read_plutus_data(&mut r).is_err());
+    }
+
+    #[test]
+    fn read_ex_units_decodes() {
+        // [mem, steps]
+        let mut data = vec![0x82];
+        data.extend(cbor_uint(100));
+        data.extend(cbor_uint(2_000));
+        let mut r = Reader::new(&data);
+        let eu = read_ex_units(&mut r).unwrap();
+        assert_eq!(eu.mem, 100);
+        assert_eq!(eu.steps, 2_000);
+    }
+
+    #[test]
+    fn read_ex_units_rejects_wrong_arity() {
+        let data = [0x83, 0x00, 0x00, 0x00];
+        let mut r = Reader::new(&data);
+        assert!(read_ex_units(&mut r).is_err());
+    }
+
+    // ── Redeemer ───────────────────────────────────────────────────────────
+
+    #[test]
+    fn read_redeemer_all_tags() {
+        for (tag_u, expected_tag) in [
+            (0u64, RedeemerTag::Spend),
+            (1, RedeemerTag::Mint),
+            (2, RedeemerTag::Cert),
+            (3, RedeemerTag::Reward),
+            (4, RedeemerTag::Vote),
+            (5, RedeemerTag::Propose),
+        ] {
+            let mut data = vec![0x84]; // array(4)
+            data.extend(cbor_uint(tag_u));
+            data.extend(cbor_uint(0));
+            data.push(0x00); // plutus_data = uint(0)
+            data.push(0x82); // ex_units array(2)
+            data.extend(cbor_uint(1));
+            data.extend(cbor_uint(2));
+            let mut r = Reader::new(&data);
+            let red = read_redeemer(&mut r).unwrap();
+            assert_eq!(red.tag, expected_tag);
+            assert_eq!(red.ex_units.mem, 1);
+            assert_eq!(red.ex_units.steps, 2);
+        }
+    }
+
+    #[test]
+    fn read_redeemer_unknown_tag_rejected() {
+        let mut data = vec![0x84];
+        data.extend(cbor_uint(99));
+        data.extend(cbor_uint(0));
+        data.push(0x00);
+        data.push(0x82);
+        data.push(0x00);
+        data.push(0x00);
+        let mut r = Reader::new(&data);
+        assert!(read_redeemer(&mut r).is_err());
+    }
+
+    #[test]
+    fn read_redeemer_wrong_arity_rejected() {
+        // array(3) instead of array(4)
+        let data = [0x83, 0x00, 0x00, 0x00];
+        let mut r = Reader::new(&data);
+        assert!(read_redeemer(&mut r).is_err());
+    }
+
+    // ── Witness set: covers vkey, native, bootstrap, plutus_v1, data, redeemers ──
+
+    /// Build a witness-set CBOR with a mix of keys.
+    fn alonzo_ws_all_keys() -> Vec<u8> {
+        let mut ws = vec![0xa6]; // map(6)
+
+        // 0: vkey witnesses [[vkey, sig]]
+        ws.extend(cbor_uint(0));
+        ws.push(0x81);
+        ws.push(0x82);
+        ws.extend(cbor_bytes(&[0xAA; 32]));
+        ws.extend(cbor_bytes(&[0xBB; 64]));
+
+        // 1: native_scripts [[5, 100]]
+        ws.extend(cbor_uint(1));
+        ws.push(0x81);
+        ws.push(0x82);
+        ws.extend(cbor_uint(5));
+        ws.extend(cbor_uint(100));
+
+        // 2: bootstrap_witnesses [[vkey, sig, cc, attrs]]
+        ws.extend(cbor_uint(2));
+        ws.push(0x81);
+        ws.push(0x84);
+        ws.extend(cbor_bytes(&[0x01; 32]));
+        ws.extend(cbor_bytes(&[0x02; 64]));
+        ws.extend(cbor_bytes(&[0x03; 32]));
+        ws.extend(cbor_bytes(&[]));
+
+        // 3: plutus_v1_scripts [bytes]
+        ws.extend(cbor_uint(3));
+        ws.push(0x81);
+        ws.extend(cbor_bytes(&[0xCA, 0xFE]));
+
+        // 4: plutus_data [uint(7)]
+        ws.extend(cbor_uint(4));
+        ws.push(0x81);
+        ws.extend(cbor_uint(7));
+
+        // 5: redeemers [[0, 0, uint(0), [1, 1]]]
+        ws.extend(cbor_uint(5));
+        ws.push(0x81);
+        ws.push(0x84);
+        ws.extend(cbor_uint(0));
+        ws.extend(cbor_uint(0));
+        ws.push(0x00);
+        ws.push(0x82);
+        ws.extend(cbor_uint(1));
+        ws.extend(cbor_uint(1));
+
+        ws
+    }
+
+    #[test]
+    fn alonzo_witness_set_all_keys_decode() {
+        let ws_cbor = alonzo_ws_all_keys();
+        let mut r = Reader::new(&ws_cbor);
+        let ws = decode_alonzo_witness_set(&mut r, Era::Alonzo).unwrap();
+        assert_eq!(ws.vkey_witnesses.len(), 1);
+        assert_eq!(ws.native_scripts.len(), 1);
+        assert_eq!(ws.bootstrap_witnesses.len(), 1);
+        assert_eq!(ws.plutus_v1_scripts.len(), 1);
+        assert_eq!(ws.plutus_data.len(), 1);
+        assert_eq!(ws.redeemers.len(), 1);
+        assert!(ws.raw_redeemers_cbor.is_some());
+        assert!(ws.raw_plutus_data_cbor.is_some());
+    }
+
+    #[test]
+    fn alonzo_witness_set_unknown_key_skipped() {
+        let mut ws = vec![0xa1];
+        ws.extend(cbor_uint(99));
+        ws.extend(cbor_uint(0));
+        let mut r = Reader::new(&ws);
+        let result = decode_alonzo_witness_set(&mut r, Era::Alonzo).unwrap();
+        assert!(result.vkey_witnesses.is_empty());
+    }
+
+    // ── Standalone tx decoder (Alonzo family) ──────────────────────────────
+
+    fn build_alonzo_standalone_tx(era: Era) -> Vec<u8> {
+        let mut tx = vec![0x84];
+        // body
+        tx.push(0xa3);
+        tx.extend(cbor_uint(0));
+        tx.push(0x80);
+        tx.extend(cbor_uint(1));
+        tx.push(0x80);
+        tx.extend(cbor_uint(2));
+        tx.extend(cbor_uint(500_000));
+        // ws
+        tx.push(0xa0);
+        // is_valid
+        tx.push(0xf5);
+        // aux
+        tx.push(0xf6);
+        let _ = era;
+        tx
+    }
+
+    #[test]
+    fn alonzo_standalone_tx_decodes() {
+        let tx_cbor = build_alonzo_standalone_tx(Era::Alonzo);
+        let tx = decode_alonzo_family_tx_standalone(&tx_cbor, Era::Alonzo).unwrap();
+        assert_eq!(tx.era, Era::Alonzo);
+        assert_eq!(tx.body.fee.0, 500_000);
+        assert!(tx.is_valid);
+    }
+
+    #[test]
+    fn allegra_standalone_tx_decodes() {
+        let tx_cbor = build_alonzo_standalone_tx(Era::Allegra);
+        let tx = decode_alonzo_family_tx_standalone(&tx_cbor, Era::Allegra).unwrap();
+        assert_eq!(tx.era, Era::Allegra);
+    }
+
+    #[test]
+    fn mary_standalone_tx_decodes() {
+        let tx_cbor = build_alonzo_standalone_tx(Era::Mary);
+        let tx = decode_alonzo_family_tx_standalone(&tx_cbor, Era::Mary).unwrap();
+        assert_eq!(tx.era, Era::Mary);
+    }
+
+    #[test]
+    fn alonzo_standalone_tx_rejects_wrong_arity() {
+        let cbor = [0x83, 0xa0, 0xa0, 0xf6];
+        assert!(decode_alonzo_family_tx_standalone(&cbor, Era::Alonzo).is_err());
+    }
+
+    #[test]
+    fn alonzo_standalone_tx_rejects_indefinite() {
+        assert!(decode_alonzo_family_tx_standalone(&[0x9f, 0xff], Era::Alonzo).is_err());
+    }
+
+    #[test]
+    fn alonzo_standalone_tx_with_aux_data() {
+        let mut tx = vec![0x84];
+        tx.push(0xa3);
+        tx.extend(cbor_uint(0));
+        tx.push(0x80);
+        tx.extend(cbor_uint(1));
+        tx.push(0x80);
+        tx.extend(cbor_uint(2));
+        tx.extend(cbor_uint(0));
+        tx.push(0xa0);
+        tx.push(0xf5);
+        // aux = tag(259) {}
+        tx.push(0xd9);
+        tx.push(0x01);
+        tx.push(0x03);
+        tx.push(0xa0);
+        let tx_decoded = decode_alonzo_family_tx_standalone(&tx, Era::Alonzo).unwrap();
+        assert!(tx_decoded.auxiliary_data.is_some());
+    }
+
+    #[test]
+    fn alonzo_standalone_tx_invalid_flag() {
+        // is_valid = false (0xf4)
+        let mut tx = vec![0x84];
+        tx.push(0xa3);
+        tx.extend(cbor_uint(0));
+        tx.push(0x80);
+        tx.extend(cbor_uint(1));
+        tx.push(0x80);
+        tx.extend(cbor_uint(2));
+        tx.extend(cbor_uint(0));
+        tx.push(0xa0);
+        tx.push(0xf4); // false
+        tx.push(0xf6);
+        let tx_decoded = decode_alonzo_family_tx_standalone(&tx, Era::Alonzo).unwrap();
+        assert!(!tx_decoded.is_valid);
+    }
+
+    // ── Native script wrapper ─────────────────────────────────────────────
+
+    #[test]
+    fn native_script_from_cbor_wraps_read_native_script() {
+        let mut data = vec![0x82];
+        data.extend(cbor_uint(0));
+        data.extend(cbor_bytes(&[0x77; 28]));
+        let mut r = Reader::new(&data);
+        let ns = read_native_script_from_cbor(&mut r).unwrap();
+        assert!(matches!(ns, NativeScript::ScriptPubkey(_)));
+    }
 }

@@ -1502,4 +1502,800 @@ mod tests {
         assert_eq!(block.header.operational_cert.kes_period, 0);
         assert_eq!(block.header.operational_cert.sigma, vec![0x04u8; 64]);
     }
+
+    // ── tx_body optional keys 3-7 ──────────────────────────────────────────
+
+    /// Build a Shelley block carrying one tx with an arbitrary body-map content
+    /// inserted after the mandatory keys 0/1/2. `extra_entries` is appended
+    /// directly to the body map and the map header is updated to match.
+    fn shelley_block_with_tx_body(extra_entries: &[u8], extra_count: usize) -> Vec<u8> {
+        let _ = make_shelley_block(1); // sanity-check helper signature
+                                       // Rebuild the block manually instead of patching offsets.
+
+        // Re-use header from make_shelley_block(0) by stripping the empty txs.
+        let template = make_shelley_block(0);
+        // Drop the trailing aux_data + tx_witnesses + tx_bodies (3 bytes 0xa0, 0x80, 0x80).
+        let header_only_end = template.len() - 3;
+        let mut block = vec![0x84]; // array(4)
+        block.extend_from_slice(&template[1..header_only_end]);
+
+        // tx_bodies = array(1)[body]
+        let base_keys = 3; // keys 0, 1, 2
+        let total_keys = base_keys + extra_count;
+        assert!(total_keys <= 23, "too many keys");
+        block.push(0x81); // array(1)
+        block.push(0xa0 | total_keys as u8); // map(N)
+        block.extend(cbor_uint(0));
+        block.push(0x80); // inputs = []
+        block.extend(cbor_uint(1));
+        block.push(0x80); // outputs = []
+        block.extend(cbor_uint(2));
+        block.extend(cbor_uint(1_000_000)); // fee
+        block.extend_from_slice(extra_entries);
+
+        block.push(0x81); // tx_witnesses = array(1)
+        block.push(0xa0); // {}
+
+        block.push(0xa0); // aux_data = {}
+
+        block
+    }
+
+    #[test]
+    fn shelley_body_key_3_ttl_decoded() {
+        let mut extra = Vec::new();
+        extra.extend(cbor_uint(3));
+        extra.extend(cbor_uint(42));
+        let block = decode_shelley_block(&shelley_block_with_tx_body(&extra, 1)).unwrap();
+        assert_eq!(block.transactions[0].body.ttl, Some(SlotNo(42)));
+    }
+
+    #[test]
+    fn shelley_body_key_4_certificates_stake_registration() {
+        // cert array(1) [ array(2) [0, [0, hash28]] ] — StakeRegistration KeyHash
+        let mut cert = vec![0x82]; // array(2)
+        cert.extend(cbor_uint(0)); // disc 0
+        cert.push(0x82); // stake_credential array(2)
+        cert.extend(cbor_uint(0)); // KeyHash
+        cert.extend(cbor_bytes(&[0xAA; 28]));
+        let mut extra = Vec::new();
+        extra.extend(cbor_uint(4));
+        extra.push(0x81); // certs array(1)
+        extra.extend(&cert);
+        let block = decode_shelley_block(&shelley_block_with_tx_body(&extra, 1)).unwrap();
+        assert_eq!(block.transactions[0].body.certificates.len(), 1);
+        assert!(matches!(
+            block.transactions[0].body.certificates[0],
+            Certificate::StakeRegistration(Credential::VerificationKey(_))
+        ));
+    }
+
+    #[test]
+    fn shelley_body_key_4_certificate_stake_deregistration_script_cred() {
+        let mut cert = vec![0x82];
+        cert.extend(cbor_uint(1)); // disc 1 = StakeDeregistration
+        cert.push(0x82);
+        cert.extend(cbor_uint(1)); // Script
+        cert.extend(cbor_bytes(&[0xBB; 28]));
+        let mut extra = Vec::new();
+        extra.extend(cbor_uint(4));
+        extra.push(0x81);
+        extra.extend(&cert);
+        let block = decode_shelley_block(&shelley_block_with_tx_body(&extra, 1)).unwrap();
+        assert!(matches!(
+            block.transactions[0].body.certificates[0],
+            Certificate::StakeDeregistration(Credential::Script(_))
+        ));
+    }
+
+    #[test]
+    fn shelley_body_key_4_certificate_stake_delegation() {
+        let mut cert = vec![0x83]; // array(3) for delegation
+        cert.extend(cbor_uint(2));
+        cert.push(0x82);
+        cert.extend(cbor_uint(0));
+        cert.extend(cbor_bytes(&[0xCC; 28]));
+        cert.extend(cbor_bytes(&[0xDD; 28])); // pool hash
+        let mut extra = Vec::new();
+        extra.extend(cbor_uint(4));
+        extra.push(0x81);
+        extra.extend(&cert);
+        let block = decode_shelley_block(&shelley_block_with_tx_body(&extra, 1)).unwrap();
+        assert!(matches!(
+            block.transactions[0].body.certificates[0],
+            Certificate::StakeDelegation { .. }
+        ));
+    }
+
+    #[test]
+    fn shelley_body_key_4_certificate_pool_retirement() {
+        let mut cert = vec![0x83]; // array(3)
+        cert.extend(cbor_uint(4));
+        cert.extend(cbor_bytes(&[0xEE; 28]));
+        cert.extend(cbor_uint(123));
+        let mut extra = Vec::new();
+        extra.extend(cbor_uint(4));
+        extra.push(0x81);
+        extra.extend(&cert);
+        let block = decode_shelley_block(&shelley_block_with_tx_body(&extra, 1)).unwrap();
+        assert!(matches!(
+            block.transactions[0].body.certificates[0],
+            Certificate::PoolRetirement { epoch: 123, .. }
+        ));
+    }
+
+    #[test]
+    fn shelley_body_key_4_certificate_genesis_key_delegation() {
+        let mut cert = vec![0x84]; // array(4)
+        cert.extend(cbor_uint(5));
+        cert.extend(cbor_bytes(&[0x01; 32])); // genesis hash
+        cert.extend(cbor_bytes(&[0x02; 32])); // delegate hash
+        cert.extend(cbor_bytes(&[0x03; 32])); // vrf keyhash
+        let mut extra = Vec::new();
+        extra.extend(cbor_uint(4));
+        extra.push(0x81);
+        extra.extend(&cert);
+        let block = decode_shelley_block(&shelley_block_with_tx_body(&extra, 1)).unwrap();
+        assert!(matches!(
+            block.transactions[0].body.certificates[0],
+            Certificate::GenesisKeyDelegation { .. }
+        ));
+    }
+
+    #[test]
+    fn shelley_body_key_4_mir_certificate_reserves_to_credentials() {
+        // [6, [0, {cred => delta}]]
+        let mut cert = vec![0x82];
+        cert.extend(cbor_uint(6));
+        // mir array(2) [source=0, target_map(1)]
+        let mut mir = vec![0x82];
+        mir.extend(cbor_uint(0)); // source = Reserves
+                                  // target = map(1)
+        mir.push(0xa1);
+        // key: stake credential [0, hash28]
+        mir.push(0x82);
+        mir.extend(cbor_uint(0));
+        mir.extend(cbor_bytes(&[0x09; 28]));
+        // value: delta = -1 (negative int)
+        mir.push(0x20); // major 1, value 0 → -1
+        cert.extend(&mir);
+        let mut extra = Vec::new();
+        extra.extend(cbor_uint(4));
+        extra.push(0x81);
+        extra.extend(&cert);
+        let block = decode_shelley_block(&shelley_block_with_tx_body(&extra, 1)).unwrap();
+        assert!(matches!(
+            block.transactions[0].body.certificates[0],
+            Certificate::MoveInstantaneousRewards {
+                source: MIRSource::Reserves,
+                target: MIRTarget::StakeCredentials(_),
+            }
+        ));
+    }
+
+    #[test]
+    fn shelley_body_key_4_mir_certificate_treasury_to_other_pot() {
+        let mut cert = vec![0x82];
+        cert.extend(cbor_uint(6));
+        let mut mir = vec![0x82];
+        mir.extend(cbor_uint(1)); // source = Treasury
+        mir.extend(cbor_uint(9999)); // target = coin (uint)
+        cert.extend(&mir);
+        let mut extra = Vec::new();
+        extra.extend(cbor_uint(4));
+        extra.push(0x81);
+        extra.extend(&cert);
+        let block = decode_shelley_block(&shelley_block_with_tx_body(&extra, 1)).unwrap();
+        match &block.transactions[0].body.certificates[0] {
+            Certificate::MoveInstantaneousRewards {
+                source: MIRSource::Treasury,
+                target: MIRTarget::OtherAccountingPot(c),
+            } => {
+                assert_eq!(*c, 9999);
+            }
+            other => panic!("unexpected cert: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn shelley_body_key_4_unknown_cert_type_rejected() {
+        let mut cert = vec![0x82];
+        cert.extend(cbor_uint(99));
+        cert.extend(cbor_uint(0));
+        let mut extra = Vec::new();
+        extra.extend(cbor_uint(4));
+        extra.push(0x81);
+        extra.extend(&cert);
+        assert!(decode_shelley_block(&shelley_block_with_tx_body(&extra, 1)).is_err());
+    }
+
+    #[test]
+    fn shelley_body_key_4_mir_unknown_source_rejected() {
+        let mut cert = vec![0x82];
+        cert.extend(cbor_uint(6));
+        let mut mir = vec![0x82];
+        mir.extend(cbor_uint(2)); // unknown source
+        mir.extend(cbor_uint(0));
+        cert.extend(&mir);
+        let mut extra = Vec::new();
+        extra.extend(cbor_uint(4));
+        extra.push(0x81);
+        extra.extend(&cert);
+        assert!(decode_shelley_block(&shelley_block_with_tx_body(&extra, 1)).is_err());
+    }
+
+    #[test]
+    fn shelley_body_key_5_withdrawals() {
+        let mut wd = vec![0xa1]; // map(1)
+        wd.extend(cbor_bytes(&[0xE0; 29])); // reward account
+        wd.extend(cbor_uint(500_000));
+        let mut extra = Vec::new();
+        extra.extend(cbor_uint(5));
+        extra.extend(&wd);
+        let block = decode_shelley_block(&shelley_block_with_tx_body(&extra, 1)).unwrap();
+        assert_eq!(block.transactions[0].body.withdrawals.len(), 1);
+        let &v = block.transactions[0]
+            .body
+            .withdrawals
+            .values()
+            .next()
+            .unwrap();
+        assert_eq!(v.0, 500_000);
+    }
+
+    #[test]
+    fn shelley_body_key_6_update_proposal_skipped() {
+        // key 6 = update proposals (just skip)
+        let mut extra = Vec::new();
+        extra.extend(cbor_uint(6));
+        extra.push(0xa0); // empty map placeholder for update
+        let block = decode_shelley_block(&shelley_block_with_tx_body(&extra, 1)).unwrap();
+        assert!(block.transactions[0].body.update.is_none());
+    }
+
+    #[test]
+    fn shelley_body_key_7_aux_data_hash() {
+        let mut extra = Vec::new();
+        extra.extend(cbor_uint(7));
+        extra.extend(cbor_bytes(&[0x42; 32]));
+        let block = decode_shelley_block(&shelley_block_with_tx_body(&extra, 1)).unwrap();
+        assert_eq!(
+            block.transactions[0].body.auxiliary_data_hash.unwrap(),
+            Hash32::from_bytes([0x42; 32])
+        );
+    }
+
+    #[test]
+    fn shelley_body_unknown_key_skipped() {
+        // Unknown key 42 — must be skipped without error.
+        let mut extra = Vec::new();
+        extra.extend(cbor_uint(42));
+        extra.extend(cbor_uint(0));
+        let block = decode_shelley_block(&shelley_block_with_tx_body(&extra, 1)).unwrap();
+        assert_eq!(block.transactions[0].body.fee.0, 1_000_000);
+    }
+
+    // ── pool_params + pool_metadata + relays ────────────────────────────────
+
+    #[test]
+    fn shelley_pool_registration_with_metadata() {
+        // PoolRegistration cert: array(2) [3, ...inline pool_params]
+        // pool_params: operator, vrf, pledge, cost, margin, reward_acct, owners, relays, metadata
+        let mut params = Vec::new();
+        params.extend(cbor_bytes(&[0xA1; 28])); // operator
+        params.extend(cbor_bytes(&[0xB2; 32])); // vrf_keyhash
+        params.extend(cbor_uint(1_000_000)); // pledge
+        params.extend(cbor_uint(340_000_000)); // cost
+                                               // margin = tag(30) [1, 100]
+        let mut margin = vec![0xd8, 0x1e, 0x82];
+        margin.extend(cbor_uint(1));
+        margin.extend(cbor_uint(100));
+        params.extend(&margin);
+        params.extend(cbor_bytes(&[0xE0; 29])); // reward_account
+                                                // owners = tag(258) array(1)[hash28] OR plain array(1)[hash28]
+        let mut owners = vec![0x81];
+        owners.extend(cbor_bytes(&[0xC3; 28]));
+        params.extend(&owners);
+        // relays = array(0)
+        params.push(0x80);
+        // pool_metadata = [url, hash32]
+        let mut pm = vec![0x82];
+        pm.push(0x63); // text(3)
+        pm.extend_from_slice(b"foo");
+        pm.extend(cbor_bytes(&[0xD4; 32]));
+        params.extend(&pm);
+
+        // cert outer: array(10) [3, ...the 9 params elements]
+        let mut cert = vec![0x8a]; // array(10) = 1 disc + 9 fields
+        cert.extend(cbor_uint(3));
+        cert.extend(&params);
+
+        let mut extra = Vec::new();
+        extra.extend(cbor_uint(4));
+        extra.push(0x81); // array(1) certs
+        extra.extend(&cert);
+        let block = decode_shelley_block(&shelley_block_with_tx_body(&extra, 1)).unwrap();
+        let pp = match &block.transactions[0].body.certificates[0] {
+            Certificate::PoolRegistration(p) => p,
+            _ => panic!("expected PoolRegistration"),
+        };
+        assert_eq!(pp.pledge.0, 1_000_000);
+        assert_eq!(pp.cost.0, 340_000_000);
+        assert_eq!(pp.margin.numerator, 1);
+        assert_eq!(pp.margin.denominator, 100);
+        assert!(pp.pool_metadata.is_some());
+        let md = pp.pool_metadata.as_ref().unwrap();
+        assert_eq!(md.url, "foo");
+    }
+
+    #[test]
+    fn shelley_pool_registration_with_null_metadata() {
+        let mut params = Vec::new();
+        params.extend(cbor_bytes(&[0xA1; 28]));
+        params.extend(cbor_bytes(&[0xB2; 32]));
+        params.extend(cbor_uint(0));
+        params.extend(cbor_uint(0));
+        let mut margin = vec![0xd8, 0x1e, 0x82];
+        margin.extend(cbor_uint(0));
+        margin.extend(cbor_uint(1));
+        params.extend(&margin);
+        params.extend(cbor_bytes(&[0xE0; 29]));
+        params.push(0x80); // empty owners
+        params.push(0x80); // empty relays
+        params.push(0xf6); // null metadata
+        let mut cert = vec![0x8a];
+        cert.extend(cbor_uint(3));
+        cert.extend(&params);
+        let mut extra = Vec::new();
+        extra.extend(cbor_uint(4));
+        extra.push(0x81);
+        extra.extend(&cert);
+        let block = decode_shelley_block(&shelley_block_with_tx_body(&extra, 1)).unwrap();
+        let pp = match &block.transactions[0].body.certificates[0] {
+            Certificate::PoolRegistration(p) => p,
+            _ => panic!("expected PoolRegistration"),
+        };
+        assert!(pp.pool_metadata.is_none());
+    }
+
+    // ── Witness sets: vkey, native_script, bootstrap ────────────────────────
+
+    /// Replace the witness set in a 1-tx Shelley block. `ws_cbor` is the full
+    /// witness-set map CBOR; the function wraps it in `array(1)[..]`.
+    fn shelley_block_with_witness_set(ws_cbor: &[u8]) -> Vec<u8> {
+        let _ = make_shelley_block(1);
+
+        let template = make_shelley_block(0);
+        // strip trailing 3 bytes (aux_data + empty witness + empty bodies).
+        let header_only_end = template.len() - 3;
+        let mut out = vec![0x84];
+        out.extend_from_slice(&template[1..header_only_end]);
+        // tx_bodies = array(1)[ minimal body ]
+        out.push(0x81); // array(1)
+                        // {0: [], 1: [], 2: 1_000_000}
+        out.push(0xa3);
+        out.extend(cbor_uint(0));
+        out.push(0x80);
+        out.extend(cbor_uint(1));
+        out.push(0x80);
+        out.extend(cbor_uint(2));
+        out.extend(cbor_uint(1_000_000));
+        // tx_witnesses = array(1)[ ws_cbor ]
+        out.push(0x81);
+        out.extend_from_slice(ws_cbor);
+        // aux_data = {}
+        out.push(0xa0);
+        out
+    }
+
+    #[test]
+    fn shelley_witness_set_vkey_decoded() {
+        // ws = {0: [[vkey, sig]]}
+        let mut ws = vec![0xa1];
+        ws.extend(cbor_uint(0));
+        // array(1) of vkey witnesses
+        ws.push(0x81);
+        // [vkey(32), sig(64)]
+        ws.push(0x82);
+        ws.extend(cbor_bytes(&[0x77; 32]));
+        ws.extend(cbor_bytes(&[0x88; 64]));
+        let block = decode_shelley_block(&shelley_block_with_witness_set(&ws)).unwrap();
+        let w = &block.transactions[0].witness_set.vkey_witnesses;
+        assert_eq!(w.len(), 1);
+        assert_eq!(w[0].vkey, vec![0x77; 32]);
+        assert_eq!(w[0].signature, vec![0x88; 64]);
+    }
+
+    #[test]
+    fn shelley_witness_set_bootstrap_decoded() {
+        let mut ws = vec![0xa1];
+        ws.extend(cbor_uint(2));
+        ws.push(0x81); // array(1)
+        ws.push(0x84); // [vkey, sig, chain_code, attrs]
+        ws.extend(cbor_bytes(&[0x01; 32]));
+        ws.extend(cbor_bytes(&[0x02; 64]));
+        ws.extend(cbor_bytes(&[0x03; 32]));
+        ws.extend(cbor_bytes(&[])); // empty attributes
+        let block = decode_shelley_block(&shelley_block_with_witness_set(&ws)).unwrap();
+        let b = &block.transactions[0].witness_set.bootstrap_witnesses;
+        assert_eq!(b.len(), 1);
+        assert_eq!(b[0].vkey.len(), 32);
+        assert_eq!(b[0].signature.len(), 64);
+    }
+
+    #[test]
+    fn shelley_witness_set_all_native_script_variants() {
+        // Build native_scripts containing one of each variant (0..=5).
+        let mut scripts_arr = vec![0x86]; // array(6)
+                                          // [0, hash28]
+        scripts_arr.push(0x82);
+        scripts_arr.extend(cbor_uint(0));
+        scripts_arr.extend(cbor_bytes(&[0xAA; 28]));
+        // [1, []]
+        scripts_arr.push(0x82);
+        scripts_arr.extend(cbor_uint(1));
+        scripts_arr.push(0x80);
+        // [2, []]
+        scripts_arr.push(0x82);
+        scripts_arr.extend(cbor_uint(2));
+        scripts_arr.push(0x80);
+        // [3, n=2, []]
+        scripts_arr.push(0x83);
+        scripts_arr.extend(cbor_uint(3));
+        scripts_arr.extend(cbor_uint(2));
+        scripts_arr.push(0x80);
+        // [4, slot]
+        scripts_arr.push(0x82);
+        scripts_arr.extend(cbor_uint(4));
+        scripts_arr.extend(cbor_uint(100));
+        // [5, slot]
+        scripts_arr.push(0x82);
+        scripts_arr.extend(cbor_uint(5));
+        scripts_arr.extend(cbor_uint(200));
+
+        let mut ws = vec![0xa1];
+        ws.extend(cbor_uint(1));
+        ws.extend(&scripts_arr);
+        let block = decode_shelley_block(&shelley_block_with_witness_set(&ws)).unwrap();
+        let ns = &block.transactions[0].witness_set.native_scripts;
+        assert_eq!(ns.len(), 6);
+        assert!(matches!(ns[0], NativeScript::ScriptPubkey(_)));
+        assert!(matches!(ns[1], NativeScript::ScriptAll(_)));
+        assert!(matches!(ns[2], NativeScript::ScriptAny(_)));
+        assert!(matches!(ns[3], NativeScript::ScriptNOfK(2, _)));
+        assert!(matches!(ns[4], NativeScript::InvalidBefore(SlotNo(100))));
+        assert!(matches!(ns[5], NativeScript::InvalidHereafter(SlotNo(200))));
+    }
+
+    #[test]
+    fn shelley_witness_set_unknown_key_skipped() {
+        // ws = {99: 0} — unknown key, value uint(0). Decoder must skip and return empty ws.
+        let mut ws = vec![0xa1];
+        ws.extend(cbor_uint(99));
+        ws.extend(cbor_uint(0));
+        let block = decode_shelley_block(&shelley_block_with_witness_set(&ws)).unwrap();
+        assert!(block.transactions[0].witness_set.vkey_witnesses.is_empty());
+    }
+
+    #[test]
+    fn shelley_native_script_unknown_variant_rejected() {
+        let mut ws = vec![0xa1];
+        ws.extend(cbor_uint(1));
+        ws.push(0x81); // array(1) of native_scripts
+        ws.push(0x82); // [99, anything]
+        ws.extend(cbor_uint(99));
+        ws.extend(cbor_uint(0));
+        assert!(decode_shelley_block(&shelley_block_with_witness_set(&ws)).is_err());
+    }
+
+    // ── Outputs with datum hash + multi-asset ──────────────────────────────
+
+    #[test]
+    fn shelley_output_with_datum_hash() {
+        // Use a 3-element output: [address, value, datum_hash]
+        let mut out = vec![0x83];
+        let mut addr = vec![0x60u8]; // enterprise testnet header
+        addr.extend_from_slice(&[0xCA; 28]);
+        out.extend(cbor_bytes(&addr));
+        out.extend(cbor_uint(5_000_000));
+        out.extend(cbor_bytes(&[0xDA; 32]));
+
+        // Build body with outputs replaced.
+        let template = make_shelley_block(0);
+        let header_only_end = template.len() - 3;
+        let mut block = vec![0x84];
+        block.extend_from_slice(&template[1..header_only_end]);
+        block.push(0x81); // tx_bodies array(1)
+                          // body: {0: [], 1: [out], 2: fee}
+        block.push(0xa3);
+        block.extend(cbor_uint(0));
+        block.push(0x80);
+        block.extend(cbor_uint(1));
+        block.push(0x81); // array(1) of outputs
+        block.extend(&out);
+        block.extend(cbor_uint(2));
+        block.extend(cbor_uint(1));
+        // ws and aux
+        block.push(0x81);
+        block.push(0xa0);
+        block.push(0xa0);
+        let res = decode_shelley_block(&block).unwrap();
+        let tx = &res.transactions[0];
+        assert_eq!(tx.body.outputs.len(), 1);
+        match tx.body.outputs[0].datum {
+            OutputDatum::DatumHash(_) => {}
+            _ => panic!("expected DatumHash"),
+        }
+    }
+
+    #[test]
+    fn shelley_output_with_multi_asset_value() {
+        // Output value = [coin, {policy => {asset => qty}}]
+        let mut value = vec![0x82];
+        value.extend(cbor_uint(2_000_000));
+        // multiasset map(1)
+        let mut ma = vec![0xa1];
+        ma.extend(cbor_bytes(&[0xAA; 28])); // policy
+                                            // assets map(1)
+        ma.push(0xa1);
+        ma.extend(cbor_bytes(b"TKN")); // asset name
+        ma.extend(cbor_uint(42));
+        value.extend(&ma);
+
+        let mut addr = vec![0x60u8];
+        addr.extend_from_slice(&[0xAB; 28]);
+        let mut out = vec![0x82];
+        out.extend(cbor_bytes(&addr));
+        out.extend(&value);
+
+        let template = make_shelley_block(0);
+        let header_only_end = template.len() - 3;
+        let mut block = vec![0x84];
+        block.extend_from_slice(&template[1..header_only_end]);
+        block.push(0x81); // array(1) tx_bodies
+        block.push(0xa3);
+        block.extend(cbor_uint(0));
+        block.push(0x80);
+        block.extend(cbor_uint(1));
+        block.push(0x81);
+        block.extend(&out);
+        block.extend(cbor_uint(2));
+        block.extend(cbor_uint(0));
+        block.push(0x81);
+        block.push(0xa0);
+        block.push(0xa0);
+        let decoded = decode_shelley_block(&block).unwrap();
+        let v = &decoded.transactions[0].body.outputs[0].value;
+        assert_eq!(v.coin.0, 2_000_000);
+        assert_eq!(v.multi_asset.len(), 1);
+    }
+
+    #[test]
+    fn shelley_output_with_empty_multi_asset_value_yields_pure_ada() {
+        // [coin, {}] → still treated as pure ADA
+        let mut value = vec![0x82];
+        value.extend(cbor_uint(7));
+        value.push(0xa0);
+        let mut addr = vec![0x60u8];
+        addr.extend_from_slice(&[0xAB; 28]);
+        let mut out = vec![0x82];
+        out.extend(cbor_bytes(&addr));
+        out.extend(&value);
+        let template = make_shelley_block(0);
+        let header_only_end = template.len() - 3;
+        let mut block = vec![0x84];
+        block.extend_from_slice(&template[1..header_only_end]);
+        block.push(0x81);
+        block.push(0xa3);
+        block.extend(cbor_uint(0));
+        block.push(0x80);
+        block.extend(cbor_uint(1));
+        block.push(0x81);
+        block.extend(&out);
+        block.extend(cbor_uint(2));
+        block.extend(cbor_uint(0));
+        block.push(0x81);
+        block.push(0xa0);
+        block.push(0xa0);
+        let decoded = decode_shelley_block(&block).unwrap();
+        assert!(decoded.transactions[0].body.outputs[0]
+            .value
+            .multi_asset
+            .is_empty());
+    }
+
+    // ── Auxiliary data: Mary-form + metadata variants ──────────────────────
+
+    /// Build a block whose aux_data_set contains one entry for tx_idx=0.
+    fn shelley_block_with_aux_for_tx0(aux_cbor: &[u8]) -> Vec<u8> {
+        let template = make_shelley_block(0);
+        let header_only_end = template.len() - 3;
+        let mut block = vec![0x84];
+        block.extend_from_slice(&template[1..header_only_end]);
+        block.push(0x81); // 1 tx
+        block.push(0xa3);
+        block.extend(cbor_uint(0));
+        block.push(0x80);
+        block.extend(cbor_uint(1));
+        block.push(0x80);
+        block.extend(cbor_uint(2));
+        block.extend(cbor_uint(0));
+        block.push(0x81); // ws array(1)
+        block.push(0xa0);
+        // aux_data_set = map(1) {0 => aux}
+        block.push(0xa1);
+        block.extend(cbor_uint(0));
+        block.extend_from_slice(aux_cbor);
+        block
+    }
+
+    #[test]
+    fn shelley_aux_data_metadata_map_form() {
+        // aux = { 5 => "hello" }
+        let mut aux = vec![0xa1];
+        aux.extend(cbor_uint(5));
+        // text "hello"
+        aux.push(0x65);
+        aux.extend_from_slice(b"hello");
+        let block = decode_shelley_block(&shelley_block_with_aux_for_tx0(&aux)).unwrap();
+        let md = &block.transactions[0]
+            .auxiliary_data
+            .as_ref()
+            .unwrap()
+            .metadata;
+        assert_eq!(md.len(), 1);
+        match md.get(&5).unwrap() {
+            TransactionMetadatum::Text(s) => assert_eq!(s, "hello"),
+            _ => panic!("expected Text"),
+        }
+    }
+
+    #[test]
+    fn shelley_aux_data_mary_form_array() {
+        // aux = [metadata_map, native_scripts]
+        let mut aux = vec![0x82];
+        aux.push(0xa1);
+        aux.extend(cbor_uint(0));
+        aux.extend(cbor_uint(7)); // metadatum = Int
+        aux.push(0x80); // empty native_scripts
+        let block = decode_shelley_block(&shelley_block_with_aux_for_tx0(&aux)).unwrap();
+        let md = &block.transactions[0]
+            .auxiliary_data
+            .as_ref()
+            .unwrap()
+            .metadata;
+        match md.get(&0).unwrap() {
+            TransactionMetadatum::Int(7) => {}
+            _ => panic!("unexpected"),
+        }
+    }
+
+    #[test]
+    fn shelley_aux_data_mary_form_wrong_length_returns_empty() {
+        // [single] — wrong arity, parser should swallow it gracefully.
+        let mut aux = vec![0x81];
+        aux.push(0xa0);
+        let block = decode_shelley_block(&shelley_block_with_aux_for_tx0(&aux)).unwrap();
+        assert!(block.transactions[0]
+            .auxiliary_data
+            .as_ref()
+            .unwrap()
+            .metadata
+            .is_empty());
+    }
+
+    #[test]
+    fn shelley_metadatum_variants_all_decode() {
+        // aux map covers Map / List / Int(+/-) / Bytes / Text.
+        let mut aux = vec![0xa5]; // map(5)
+                                  // 0 => map(0)
+        aux.extend(cbor_uint(0));
+        aux.push(0xa0);
+        // 1 => list[uint(1)]
+        aux.extend(cbor_uint(1));
+        aux.push(0x81);
+        aux.extend(cbor_uint(1));
+        // 2 => int(-3)
+        aux.extend(cbor_uint(2));
+        aux.push(0x22); // major 1, val 2 → -3
+                        // 3 => bytes
+        aux.extend(cbor_uint(3));
+        aux.extend(cbor_bytes(&[0xAB, 0xCD]));
+        // 4 => text "ok"
+        aux.extend(cbor_uint(4));
+        aux.push(0x62);
+        aux.extend_from_slice(b"ok");
+        let block = decode_shelley_block(&shelley_block_with_aux_for_tx0(&aux)).unwrap();
+        let md = &block.transactions[0]
+            .auxiliary_data
+            .as_ref()
+            .unwrap()
+            .metadata;
+        assert!(matches!(md.get(&0).unwrap(), TransactionMetadatum::Map(_)));
+        assert!(matches!(md.get(&1).unwrap(), TransactionMetadatum::List(_)));
+        assert!(matches!(md.get(&2).unwrap(), TransactionMetadatum::Int(-3)));
+        assert!(matches!(
+            md.get(&3).unwrap(),
+            TransactionMetadatum::Bytes(_)
+        ));
+        assert!(matches!(md.get(&4).unwrap(), TransactionMetadatum::Text(_)));
+    }
+
+    // ── Standalone tx decoder ──────────────────────────────────────────────
+
+    fn build_shelley_standalone_tx(aux: Option<Vec<u8>>) -> Vec<u8> {
+        // [body, ws, is_valid_bool, aux_or_null]
+        let mut tx = vec![0x84];
+        // body = {0: [], 1: [], 2: 1_000_000}
+        tx.push(0xa3);
+        tx.extend(cbor_uint(0));
+        tx.push(0x80);
+        tx.extend(cbor_uint(1));
+        tx.push(0x80);
+        tx.extend(cbor_uint(2));
+        tx.extend(cbor_uint(1_000_000));
+        // ws = {}
+        tx.push(0xa0);
+        // is_valid = true
+        tx.push(0xf5);
+        // aux
+        match aux {
+            Some(a) => tx.extend(&a),
+            None => tx.push(0xf6),
+        }
+        tx
+    }
+
+    #[test]
+    fn shelley_standalone_tx_decodes_with_null_aux() {
+        let tx_cbor = build_shelley_standalone_tx(None);
+        let tx = decode_shelley_tx_standalone(&tx_cbor).unwrap();
+        assert_eq!(tx.era, Era::Shelley);
+        assert_eq!(tx.body.fee.0, 1_000_000);
+        assert!(tx.is_valid);
+        assert!(tx.auxiliary_data.is_none());
+        assert!(tx.raw_body_cbor.is_some());
+        assert!(tx.raw_witness_cbor.is_some());
+    }
+
+    #[test]
+    fn shelley_standalone_tx_decodes_with_aux() {
+        let mut aux = vec![0xa1];
+        aux.extend(cbor_uint(0));
+        aux.extend(cbor_uint(123));
+        let tx_cbor = build_shelley_standalone_tx(Some(aux));
+        let tx = decode_shelley_tx_standalone(&tx_cbor).unwrap();
+        assert!(tx.auxiliary_data.is_some());
+    }
+
+    #[test]
+    fn shelley_standalone_tx_rejects_wrong_arity() {
+        // array(3) instead of array(4)
+        let cbor = [0x83, 0xa0, 0xa0, 0xf6];
+        assert!(decode_shelley_tx_standalone(&cbor).is_err());
+    }
+
+    #[test]
+    fn shelley_standalone_tx_rejects_indefinite_outer() {
+        // array(indef)
+        assert!(decode_shelley_tx_standalone(&[0x9f, 0xff]).is_err());
+    }
+
+    #[test]
+    fn shelley_standalone_tx_is_valid_non_bool_skipped() {
+        // Replace is_valid with uint(0) — decoder must skip and treat as valid.
+        let mut tx = vec![0x84];
+        tx.push(0xa3);
+        tx.extend(cbor_uint(0));
+        tx.push(0x80);
+        tx.extend(cbor_uint(1));
+        tx.push(0x80);
+        tx.extend(cbor_uint(2));
+        tx.extend(cbor_uint(0));
+        tx.push(0xa0); // ws
+        tx.extend(cbor_uint(0)); // is_valid as uint instead of bool
+        tx.push(0xf6); // null aux
+        let tx = decode_shelley_tx_standalone(&tx).unwrap();
+        assert!(tx.is_valid);
+    }
 }
