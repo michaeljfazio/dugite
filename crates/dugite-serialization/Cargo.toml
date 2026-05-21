@@ -24,7 +24,6 @@ pallas-primitives = { workspace = true }
 pallas-traverse = { workspace = true }
 pallas-codec = { workspace = true }
 pallas-crypto = { workspace = true }
-pallas-addresses = { workspace = true }
 tracing = { workspace = true }
 num-bigint = { workspace = true }
 num-traits = { workspace = true }
