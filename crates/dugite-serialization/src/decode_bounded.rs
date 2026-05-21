@@ -433,7 +433,6 @@ mod tests {
 
     // length-lattice property: for any (declared_len, actual_len_byte_payload)
     // the decoder rejects without allocating more than MAX_METADATA_ENTRIES.
-    #[cfg(feature = "proptest-tests")]
     mod proptests {
         use super::*;
         use proptest::prelude::*;
@@ -449,9 +448,7 @@ mod tests {
                 let mut buf = Vec::new();
                 let mut enc = Encoder::new(&mut buf);
                 enc.array(declared).unwrap();
-                for _ in 0..actual_bytes {
-                    buf.push(0x00);
-                }
+                buf.resize(buf.len() + actual_bytes, 0x00);
 
                 let result = decode_metadatum_from_bytes(&buf);
                 if declared <= MAX_METADATA_ENTRIES
