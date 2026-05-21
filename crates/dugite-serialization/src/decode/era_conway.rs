@@ -1077,16 +1077,27 @@ fn read_optional_anchor(r: &mut Reader<'_>) -> Result<Option<Anchor>, Serializat
 }
 
 fn read_anchor(r: &mut Reader<'_>) -> Result<Anchor, SerializationError> {
-    // anchor = [url, data_hash(32)]
+    // anchor = [url : text, anchor_data_hash : $hash32]
+    // Conway CDDL: url = text (CBOR major type 3).
+    // Some implementations may encode the URL as bytes (major type 2); handle both
+    // to stay robust against non-canonical encodings.
     let arr_len = r.read_array_header()?;
     if !matches!(arr_len, Some(2)) {
         return Err(SerializationError::CborDecode(format!(
             "anchor: expected array(2), got {arr_len:?}"
         )));
     }
-    let url_bytes = r.read_bytes()?;
-    let url = String::from_utf8(url_bytes.to_vec())
-        .map_err(|_| SerializationError::CborDecode("anchor: URL is not valid UTF-8".into()))?;
+    let ty = r.peek_major()?;
+    let url = match ty {
+        minicbor::data::Type::String => r.read_str()?.to_string(),
+        _ => {
+            // Fallback: treat as bytes and convert UTF-8.
+            let url_bytes = r.read_bytes()?;
+            String::from_utf8(url_bytes.to_vec()).map_err(|_| {
+                SerializationError::CborDecode("anchor: URL bytes are not valid UTF-8".into())
+            })?
+        }
+    };
     let data_hash = read_hash32(r)?;
     Ok(Anchor { url, data_hash })
 }
@@ -1716,9 +1727,11 @@ fn decode_conway_witness_set(
                 plutus_v1_scripts = r.read_set(|r| Ok(r.read_bytes()?.to_vec()))?;
             }
             4 => {
-                // plutus_data: [* plutus_data] — plain list, NOT a set
+                // plutus_data: nonempty_set<plutus_data> — may be tag(258) on mainnet
+                // Conway CDDL allows both plain-array and tag-258 set encoding.
+                // read_set() strips the optional tag-258 prefix before reading items.
                 let pd_start = r.position();
-                plutus_data = r.read_array(|r| read_plutus_data(r))?;
+                plutus_data = r.read_set(|r| read_plutus_data(r))?;
                 raw_plutus_data_cbor = Some(r.slice_from(pd_start).to_vec());
             }
             5 => {
