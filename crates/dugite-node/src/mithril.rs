@@ -115,7 +115,7 @@ struct SecondaryIndexEntry {
     _header_size: u16,
     _checksum: u32,
     _header_hash: [u8; 32],
-    _block_or_ebb: u64,
+    block_or_ebb: u64,
 }
 
 impl SecondaryIndexEntry {
@@ -137,7 +137,7 @@ impl SecondaryIndexEntry {
             _header_size: header_size,
             _checksum: checksum,
             _header_hash: header_hash,
-            _block_or_ebb: block_or_ebb,
+            block_or_ebb,
         })
     }
 }
@@ -1625,12 +1625,29 @@ where
     Ok(lo.saturating_sub(1))
 }
 
-/// Read just enough of a chunk file to decode its first block and return its slot.
+/// Read the first block's slot for a chunk, used by [`find_replay_start_chunk_idx`]
+/// to binary-search for the gap-fill start chunk without iterating every block.
 ///
-/// Used by [`find_replay_start_chunk_idx`] to binary-search for the gap-fill
-/// start chunk without iterating every block. Returns `None` on missing files,
-/// empty chunks, or decode failures — callers treat `None` as a hint to include
-/// the chunk in replay rather than risk dropping a block.
+/// The slot is taken directly from the secondary index entry 0's `block_or_ebb`
+/// field (bytes 48..56). cardano-node serialises `BlockOrEBB` as a raw u64 BE:
+///
+///   * for Shelley+ blocks the value is the absolute `SlotNo`,
+///   * for Byron Main blocks the value is the absolute `SlotNo`,
+///   * for Byron EBBs the value is the `EpochNo` (epoch-relative).
+///
+/// EBB-encoded epoch numbers are always far smaller than any post-Byron tip
+/// slot, so the binary search still places Byron chunks correctly to the left
+/// of any modern target slot. Using the index avoids invoking the block decoder
+/// on the first block of every probed chunk — that path was failing for several
+/// thousand Byron / edge-case chunks and tripping the binary search into
+/// returning `start_idx = 0` (full-chain replay from genesis).
+///
+/// The `byron_epoch_length` parameter is retained for the legacy fallback when
+/// the secondary index is missing.
+///
+/// Returns `None` on missing files, empty chunks, or missing/short secondary
+/// index — callers treat `None` as a hint to include the chunk in replay rather
+/// than risk dropping a block.
 fn read_chunk_first_block_slot(
     immutable_dir: &Path,
     chunk_num: u64,
@@ -1639,6 +1656,21 @@ fn read_chunk_first_block_slot(
     let chunk_path = immutable_dir.join(format!("{chunk_num:05}.chunk"));
     let secondary_path = immutable_dir.join(format!("{chunk_num:05}.secondary"));
 
+    // Fast path: read slot directly from the on-disk secondary index entry 0.
+    // No decoder dependency, no block read.
+    if secondary_path.exists() {
+        if let Ok(secondary_data) = fs::read(&secondary_path) {
+            if secondary_data.len() >= 56 {
+                if let Some(entry) = SecondaryIndexEntry::from_bytes(&secondary_data) {
+                    return Ok(Some(entry.block_or_ebb));
+                }
+            }
+        }
+    }
+
+    // Fallback (no secondary index): probe the chunk for the first CBOR item
+    // and decode just enough to extract the slot. This path is only exercised
+    // for partial / un-finalised chunks.
     let chunk_file = match fs::File::open(&chunk_path) {
         Ok(f) => f,
         Err(_) => return Ok(None),
@@ -1649,40 +1681,12 @@ fn read_chunk_first_block_slot(
     }
     // SAFETY: File is opened read-only and not modified externally during the lifetime of this Mmap.
     let chunk_data = unsafe { Mmap::map(&chunk_file).context("Failed to mmap chunk file")? };
-
-    let (block_start, block_end) = if secondary_path.exists() {
-        match fs::read(&secondary_path) {
-            Ok(secondary_data) if secondary_data.len() >= 56 => {
-                let first = match SecondaryIndexEntry::from_bytes(&secondary_data) {
-                    Some(e) => e,
-                    None => return Ok(None),
-                };
-                let start = first.block_offset as usize;
-                if start >= chunk_len {
-                    return Ok(None);
-                }
-                let end = if secondary_data.len() >= 112 {
-                    SecondaryIndexEntry::from_bytes(&secondary_data[56..])
-                        .map(|e| e.block_offset as usize)
-                        .unwrap_or(chunk_len)
-                } else {
-                    chunk_len
-                };
-                (start, end.min(chunk_len))
-            }
-            _ => probe_first_cbor_item(&chunk_data),
-        }
-    } else {
-        probe_first_cbor_item(&chunk_data)
-    };
-
+    let (block_start, block_end) = probe_first_cbor_item(&chunk_data);
     if block_start >= chunk_len || block_end > chunk_len || block_start >= block_end {
         return Ok(None);
     }
-
-    let block_cbor = &chunk_data[block_start..block_end];
     match dugite_serialization::decode_block_minimal_with_byron_epoch_length(
-        block_cbor,
+        &chunk_data[block_start..block_end],
         byron_epoch_length,
     ) {
         Ok(block) => Ok(Some(block.slot().0)),
@@ -2453,7 +2457,7 @@ mod tests {
         data[12..16].copy_from_slice(&12345u32.to_be_bytes());
         // header_hash
         data[16..48].copy_from_slice(&[0xAB; 32]);
-        // _block_or_ebb (slot 5000)
+        // block_or_ebb (slot 5000)
         data[48..56].copy_from_slice(&5000u64.to_be_bytes());
 
         let entry = SecondaryIndexEntry::from_bytes(&data).unwrap();
@@ -2462,7 +2466,7 @@ mod tests {
         assert_eq!(entry._header_size, 100);
         assert_eq!(entry._checksum, 12345);
         assert_eq!(entry._header_hash, [0xAB; 32]);
-        assert_eq!(entry._block_or_ebb, 5000);
+        assert_eq!(entry.block_or_ebb, 5000);
     }
 
     #[test]
@@ -4298,6 +4302,87 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let count = replay_from_chunk_files(dir.path(), 0, 0, |_cbor| Ok(())).unwrap();
         assert_eq!(count, 0);
+    }
+
+    /// Synthesise a single 56-byte secondary index entry with the given
+    /// `block_or_ebb` slot value (and a zero block_offset / dummy hash).
+    fn make_secondary_entry(block_or_ebb_slot: u64) -> Vec<u8> {
+        let mut buf = vec![0u8; 56];
+        buf[0..8].copy_from_slice(&0u64.to_be_bytes()); // block_offset
+        buf[8..10].copy_from_slice(&0u16.to_be_bytes()); // header_offset
+        buf[10..12].copy_from_slice(&0u16.to_be_bytes()); // header_size
+        buf[12..16].copy_from_slice(&0u32.to_be_bytes()); // checksum
+                                                          // bytes [16..48] header_hash zeroed
+        buf[48..56].copy_from_slice(&block_or_ebb_slot.to_be_bytes());
+        buf
+    }
+
+    /// Regression: `read_chunk_first_block_slot` must NOT depend on the in-
+    /// house block decoder. Mainnet replay bug (May 2026): 2722 of 8687
+    /// chunks had Byron / edge-case bytes that the decoder couldn't parse,
+    /// so the helper returned None for them; the binary search interpreted
+    /// None as "search left" and landed at start_idx=0, triggering a
+    /// full-chain replay from genesis (227K decode errors logged).
+    ///
+    /// The fix reads the slot from the secondary-index `block_or_ebb` field
+    /// directly. This test plants a `.chunk` file with garbage bytes the
+    /// decoder cannot parse and asserts the helper still returns the slot
+    /// from the secondary index.
+    #[test]
+    fn test_read_chunk_first_block_slot_uses_secondary_index() {
+        let dir = tempfile::tempdir().unwrap();
+        let chunk_num = 5u64;
+        // Chunk file with garbage bytes (NOT valid CBOR / block) — decoder
+        // would error on this if invoked.
+        fs::write(
+            dir.path().join(format!("{chunk_num:05}.chunk")),
+            b"this is not a valid block",
+        )
+        .unwrap();
+        // Secondary index with block_or_ebb = 12345.
+        fs::write(
+            dir.path().join(format!("{chunk_num:05}.secondary")),
+            make_secondary_entry(12345),
+        )
+        .unwrap();
+
+        let slot = read_chunk_first_block_slot(dir.path(), chunk_num, 21600).unwrap();
+        assert_eq!(slot, Some(12345));
+    }
+
+    /// Variant: missing secondary file → fallback path engages, returns None
+    /// for un-decodable chunk bytes (preserved legacy behaviour).
+    #[test]
+    fn test_read_chunk_first_block_slot_fallback_on_missing_secondary() {
+        let dir = tempfile::tempdir().unwrap();
+        let chunk_num = 7u64;
+        fs::write(
+            dir.path().join(format!("{chunk_num:05}.chunk")),
+            b"this is not a valid block",
+        )
+        .unwrap();
+        // No secondary file present.
+        let slot = read_chunk_first_block_slot(dir.path(), chunk_num, 21600).unwrap();
+        assert_eq!(slot, None);
+    }
+
+    /// Variant: empty / short secondary file → fallback engages.
+    #[test]
+    fn test_read_chunk_first_block_slot_short_secondary_falls_back() {
+        let dir = tempfile::tempdir().unwrap();
+        let chunk_num = 9u64;
+        fs::write(
+            dir.path().join(format!("{chunk_num:05}.chunk")),
+            b"this is not a valid block",
+        )
+        .unwrap();
+        fs::write(
+            dir.path().join(format!("{chunk_num:05}.secondary")),
+            b"too short", // < 56 bytes
+        )
+        .unwrap();
+        let slot = read_chunk_first_block_slot(dir.path(), chunk_num, 21600).unwrap();
+        assert_eq!(slot, None);
     }
 
     /// Build a tiny in-memory `tar.zst` archive containing a single
