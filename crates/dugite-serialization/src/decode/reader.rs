@@ -213,7 +213,7 @@ impl<'b> Reader<'b> {
         let len = self.read_array_header()?;
         match len {
             Some(n) => {
-                let mut out = Vec::with_capacity(n as usize);
+                let mut out = Vec::with_capacity(self.safe_alloc_capacity(n));
                 for _ in 0..n {
                     out.push(item(self)?);
                 }
@@ -235,6 +235,26 @@ impl<'b> Reader<'b> {
                 Ok(out)
             }
         }
+    }
+
+    /// Cap the initial allocation for a peer-controlled CBOR length header.
+    ///
+    /// Every CBOR value occupies at least one byte, so a declared array/map
+    /// length larger than the number of bytes still in the input cannot
+    /// honestly represent that many items. Clamping `Vec::with_capacity` to
+    /// `min(declared, remaining_bytes)` prevents an attacker from forcing a
+    /// multi-exabyte allocation via a single forged length header
+    /// (audit #544 / #554).
+    ///
+    /// This is a *hint only*. The decode loop still runs `n` iterations and
+    /// errors out the moment a per-item decode hits end-of-input, so an
+    /// over-declared length is rejected within microseconds.
+    pub(crate) fn safe_alloc_capacity(&self, declared: u64) -> usize {
+        let pos = self.inner.position();
+        let remaining_bytes = self.origin.len().saturating_sub(pos);
+        usize::try_from(declared)
+            .unwrap_or(usize::MAX)
+            .min(remaining_bytes)
     }
 
     /// Iterate the items of an array (definite or indefinite) without buffering
@@ -309,7 +329,7 @@ impl<'b> Reader<'b> {
         let len = self.read_map_header()?;
         match len {
             Some(n) => {
-                let mut out = Vec::with_capacity(n as usize);
+                let mut out = Vec::with_capacity(self.safe_alloc_capacity(n));
                 for _ in 0..n {
                     let key = k(self)?;
                     let val = v(self)?;
