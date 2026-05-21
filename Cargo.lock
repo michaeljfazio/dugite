@@ -1182,11 +1182,7 @@ dependencies = [
  "dugite-primitives",
  "dugite-serialization",
  "hex",
- "memmap2",
  "minicbor 0.26.5",
- "pallas-crypto 1.0.0-alpha.6",
- "pallas-primitives 1.0.0-alpha.6",
- "pallas-traverse 1.0.0-alpha.6",
 ]
 
 [[package]]

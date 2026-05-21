@@ -5,9 +5,9 @@
 //! from the CDDL in `cardano-ledger/eras/conway/cddl-spec/conway.cddl` and
 //! `ledger.cddl`, then verified against the dugite encoder where one exists.
 //!
-//! For complex era-specific types we encode against pallas-primitives (the
-//! same library dugite uses for wire-format compatibility) to ensure that
-//! encoder drift is caught.
+//! For complex era-specific types we hand-build the expected CBOR byte
+//! sequences against the official Cardano CDDL specs and assert byte-exact
+//! equality against the dugite encoder, so any encoder drift is caught.
 
 use minicbor::Encoder;
 
