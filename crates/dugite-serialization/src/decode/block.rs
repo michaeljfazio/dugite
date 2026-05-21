@@ -30,6 +30,8 @@
 //! | 7   | Conway     | Governance (CIP-1694), Plutus V3                   |
 //! | 8   | Dijkstra   | Peras + new TxBody keys 14/23/25/26                |
 
+use crate::decode::era_byron;
+use crate::decode::era_shelley;
 use crate::decode::reader::Reader;
 use crate::error::SerializationError;
 use dugite_primitives::block::Block;
@@ -194,34 +196,43 @@ pub fn decode_block_envelope<'b>(
 /// This is the top-level dispatch point for the in-house decoder. It walks the
 /// block envelope via [`decode_block_envelope`] and routes to the per-era decoder.
 ///
-/// **Current status (M4 foundation):** all era arms return `unimplemented!()`.
-/// Per-era decoders land in M4a (Byron/Shelley/Allegra/Mary), M4b (Alonzo/Babbage),
-/// and M4c (Conway/Dijkstra). Until then, the caller must use
-/// `crate::multi_era::decode_block` (the pallas-backed path) or the shadow harness.
+/// `byron_epoch_length`: Byron-era epoch slot count. Pass `0` for mainnet
+/// (uses the 21600 slot-per-epoch mainnet GenesisValues formula). Pass the
+/// network-specific value for preview/preprod/custom networks.
+///
+/// `minimal`: if `true`, witness sets are skipped for faster replay.
+///
+/// # Status
+///
+/// - M4a: Byron (eras 0/1) and Shelley (era 2) are implemented in-house.
+/// - M4b/c (Allegra–Dijkstra): still delegate via `unimplemented!()`.
 ///
 /// # Errors
 ///
 /// Returns `SerializationError::CborDecode` if the outer CBOR envelope is malformed.
-#[allow(unused_variables)]
-pub fn decode_block(cbor: &[u8]) -> Result<Block, SerializationError> {
+pub fn decode_block(
+    cbor: &[u8],
+    byron_epoch_length: u64,
+    minimal: bool,
+) -> Result<Block, SerializationError> {
     let mut r = Reader::new(cbor);
     let (era_tag, inner_cbor) = decode_block_envelope(&mut r)?;
 
     match era_tag {
-        EraTag::ByronMain => {
-            unimplemented!("M4a: Byron main-chain decoder not yet implemented")
-        }
-        EraTag::ByronEbb => {
-            unimplemented!("M4a: Byron EBB decoder not yet implemented")
-        }
+        EraTag::ByronMain => era_byron::decode_byron_main_block(inner_cbor, byron_epoch_length),
+        EraTag::ByronEbb => era_byron::decode_byron_ebb_block(inner_cbor, byron_epoch_length),
         EraTag::Shelley => {
-            unimplemented!("M4a: Shelley decoder not yet implemented")
+            if minimal {
+                era_shelley::decode_shelley_block_minimal(inner_cbor)
+            } else {
+                era_shelley::decode_shelley_block(inner_cbor)
+            }
         }
         EraTag::Allegra => {
-            unimplemented!("M4a: Allegra decoder not yet implemented")
+            unimplemented!("M4b: Allegra decoder not yet implemented")
         }
         EraTag::Mary => {
-            unimplemented!("M4a: Mary decoder not yet implemented")
+            unimplemented!("M4b: Mary decoder not yet implemented")
         }
         EraTag::Alonzo => {
             unimplemented!("M4b: Alonzo decoder not yet implemented")
@@ -443,7 +454,7 @@ mod tests {
     fn decode_block_unknown_era_returns_error() {
         let inner = minimal_inner(0);
         let cbor = make_envelope(99, &inner);
-        let err = decode_block(&cbor).unwrap_err();
+        let err = decode_block(&cbor, 0, false).unwrap_err();
         assert!(matches!(err, SerializationError::CborDecode(_)));
         assert!(format!("{err}").contains("99"));
     }
@@ -453,7 +464,7 @@ mod tests {
     fn decode_block_conway_panics_until_era_implemented() {
         let inner = minimal_inner(7);
         let cbor = make_envelope(7, &inner);
-        let _ = decode_block(&cbor);
+        let _ = decode_block(&cbor, 0, false);
     }
 
     #[test]
@@ -461,6 +472,6 @@ mod tests {
     fn decode_block_dijkstra_panics_until_era_implemented() {
         let inner = minimal_inner(8);
         let cbor = make_envelope(8, &inner);
-        let _ = decode_block(&cbor);
+        let _ = decode_block(&cbor, 0, false);
     }
 }
