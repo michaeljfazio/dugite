@@ -3838,8 +3838,37 @@ impl Node {
                                         let fork_block_no = fork_block.block_number();
                                         let fork_hash_hex = fork_block.header.header_hash.to_hex();
 
-                                        // Issue #545 E5 — body-hash verification DISABLED pending a
-                                        // correct implementation; see notes in `apply_fetched_block`.
+                                        // Issue #545 E5 (#550): verify body
+                                        // hash on fork-replayed blocks too.
+                                        // Fork blocks come from ChainDB
+                                        // (stored locally), so a mismatch
+                                        // here would indicate either a prior
+                                        // accepted bad block or local
+                                        // storage corruption — we treat it
+                                        // as a hard fault and abort the
+                                        // replay, falling through to the
+                                        // same recovery path as a ledger
+                                        // apply failure (clear volatile and
+                                        // resync).
+                                        if fork_block.era.is_shelley_based() {
+                                            if let Err(e) = dugite_consensus::praos::validate_block_body_hash(
+                                                &fork_block.header,
+                                                &cbor,
+                                            ) {
+                                                warn!(
+                                                    slot = fork_slot.0,
+                                                    block = fork_block_no.0,
+                                                    error = %e,
+                                                    "Fork replay: body hash verification failed — \
+                                                     clearing volatile and resyncing"
+                                                );
+                                                {
+                                                    let mut db = self.chain_db.write().await;
+                                                    db.clear_volatile();
+                                                }
+                                                break;
+                                            }
+                                        }
 
                                         // Fix B (Bug B, 2026-05-16): use apply_block_with_delta
                                         // so that fork-replayed blocks also populate LedgerSeq.
@@ -4015,25 +4044,36 @@ impl Node {
             return;
         }
 
-        // Issue #545 E5: verify that the block body delivered by BlockFetch matches
-        // the body hash committed in the header.  A malicious or buggy relay can
-        // substitute the body bytes while leaving the header (and its KES/VRF
-        // signatures) intact.  This check mirrors Haskell's `verifyBlockIntegrity`
-        // (`matchesHeaderHash`) called at the decode-and-apply boundary.
+        // Issue #545 E5 (#550): verify that the block body delivered by
+        // BlockFetch matches the body hash committed in the header. A
+        // malicious or buggy relay can substitute the body bytes while
+        // leaving the header (and its KES/VRF signatures) intact. This
+        // check mirrors Haskell's `verifyBlockIntegrity` / `matchesHeaderHash`
+        // called at the decode-and-apply boundary, using the per-component
+        // `bbHash` algorithm from `Cardano.Ledger.Alonzo.BlockBody`:
+        //   bbHash = blake2b_256( blake2b_256(c_0) || ... || blake2b_256(c_{N-1}) )
+        // where c_i is each body component (tx_bodies, witness_sets,
+        // aux_data, [invalid_txs]) as CBOR-encoded on the wire.
         //
-        // We check AFTER storage because the block is keyed by header hash in ChainDB;
-        // a body-hash mismatch is a data integrity error from this peer, not a
-        // chain-selection issue.  The block is evicted from volatile state on mismatch.
-        // E5 (audit #545) — body-hash verification wire-in is DISABLED pending
-        // a correct implementation. The current `validate_block_body_hash` uses
-        // `blake2b_256(body_cbor)` over the concatenated 4-component body, but
-        // Haskell `bbHash` (in cardano-ledger `Cardano.Ledger.Block`) hashes
-        // each component independently and then hashes their concatenation:
-        //   bbHash = blake2b_256( blake2b_256(tx_bodies) || blake2b_256(witnesses)
-        //                       || blake2b_256(aux_data)  || blake2b_256(invalid_txs) )
-        // Calling the current implementation would reject every legitimate
-        // network block. Re-enable when the algorithm is corrected.
-        let _ = block.era.is_shelley_based();
+        // We check AFTER storage because the block is keyed by header hash
+        // in ChainDB; a body-hash mismatch is a data integrity error from
+        // this peer, not a chain-selection issue.
+        if block.era.is_shelley_based() {
+            if let Some(raw_cbor) = block.raw_cbor.as_deref() {
+                if let Err(e) =
+                    dugite_consensus::praos::validate_block_body_hash(&block.header, raw_cbor)
+                {
+                    warn!(
+                        slot = block_slot.0,
+                        block = block_number.0,
+                        hash = %block_hash.to_hex(),
+                        error = %e,
+                        "Block body hash verification failed — rejecting block (substitution / corruption)"
+                    );
+                    return;
+                }
+            }
+        }
 
         // When TriggeredFork already replayed all fork blocks (including the
         // incoming block) onto the ledger, skip the single-block apply path.

@@ -1231,10 +1231,29 @@ impl Node {
                     }
                 }
 
-                // Issue #545 E5 — body-hash verification DISABLED pending a
-                // correct implementation; see the matching note in
-                // `apply_fetched_block`. The current `validate_block_body_hash`
-                // uses the wrong algorithm and rejects every legitimate block.
+                // Issue #545 E5 (#550): verify the block body matches the
+                // header's `body_hash` claim before applying. Mirrors the
+                // wire-in in `apply_fetched_block` for the bulk-sync path.
+                // Uses the per-component `bbHash` algorithm from
+                // `Cardano.Ledger.Alonzo.BlockBody`.
+                if block.era.is_shelley_based() {
+                    if let Some(raw_cbor) = block.raw_cbor.as_deref() {
+                        if let Err(e) = dugite_consensus::praos::validate_block_body_hash(
+                            &block.header,
+                            raw_cbor,
+                        ) {
+                            error!(
+                                slot = block.slot().0,
+                                block_no = block.block_number().0,
+                                hash = %block.hash().to_hex(),
+                                error = %e,
+                                "Bulk apply: block body hash verification failed — \
+                                 stopping batch (substitution / corruption)"
+                            );
+                            break;
+                        }
+                    }
+                }
 
                 let ledger_mode = if strict || self.validate_all_blocks {
                     BlockValidationMode::ValidateAll

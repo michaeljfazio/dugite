@@ -1132,6 +1132,7 @@ dependencies = [
  "dugite-primitives",
  "dugite-serialization",
  "futures",
+ "hex",
  "minicbor 0.26.5",
  "num-bigint",
  "num-rational",
