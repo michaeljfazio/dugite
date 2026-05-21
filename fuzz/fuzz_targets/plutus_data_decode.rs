@@ -7,8 +7,8 @@
 //!   - N2C `GetUTxO*` query responses
 //!   - `LocalTxSubmission` datum witnesses
 //!
-//! The decoder under test is `uplc::plutus_data()`, which calls pallas's
-//! `PlutusData::decode_fragment`.  This is the same decoder invoked by
+//! The decoder under test is `uplc::plutus_data()` (the Aiken UPLC interpreter's
+//! Plutus data CBOR decoder).  This is the same decoder invoked by
 //! `eval_phase_two_raw` when it loads datums and redeemers from a transaction.
 //!
 //! A secondary path exercises our own `encode_plutus_data` / round-trip encoder
@@ -27,17 +27,16 @@
 use libfuzzer_sys::fuzz_target;
 
 fuzz_target!(|data: &[u8]| {
-    // Path 1: uplc PlutusData CBOR decoder.
+    // Path 1: uplc PlutusData CBOR decoder (Aiken UPLC interpreter).
     //
-    // uplc::plutus_data() calls pallas_primitives::PlutusData::decode_fragment,
-    // which is the same decoder used by eval_phase_two_raw when loading datums
+    // This is the same decoder used by eval_phase_two_raw when loading datums
     // and redeemers from a transaction witness set.
     let _ = uplc::plutus_data(data);
 
-    // Path 2: dugite-serialization PlutusData decoder via pallas decode_block /
-    // decode_transaction.  We exercise this by trying to decode the fuzz bytes
-    // as a Conway transaction; if that succeeds the deserialization path
-    // (including PlutusData datum conversion) is exercised.  Most inputs will
-    // fail at the outer transaction decode, which is expected and fine.
+    // Path 2: dugite-serialization in-house block decoder. We exercise this by
+    // trying to decode the fuzz bytes as a block; if that succeeds the
+    // deserialisation path (including PlutusData datum conversion via the
+    // in-house Conway/Babbage decoders) is exercised. Most inputs will fail
+    // at the outer block envelope, which is expected and fine.
     let _ = dugite_serialization::decode_block(data);
 });
