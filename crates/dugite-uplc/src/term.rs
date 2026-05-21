@@ -1,0 +1,295 @@
+//! UPLC term and constant AST.
+//!
+//! This module defines the in-memory representation of Untyped Plutus Core
+//! programs after they have been decoded from flat-encoded bytes. The
+//! design follows the Haskell reference (`Plutus.Core.Term`) but is
+//! adapted to idiomatic Rust:
+//!
+//!  - Binders use **De Bruijn indices** end-to-end (no `Name`-based
+//!    variant). The flat decoder produces `DeBruijn` directly and the
+//!    CEK machine consumes it directly; we never carry symbolic names
+//!    through the evaluator. This avoids the `NamedDeBruijn` /
+//!    `FakeNamedDeBruijn` shuffling that aiken-uplc has to do.
+//!
+//!  - Term recursion uses `Box<Term>` rather than `Rc`/`Arc`/arena.
+//!    The CEK machine evaluates by stepping through an explicit context
+//!    stack (heap-allocated) so the term tree is never recursively
+//!    walked. This keeps the AST sharing-free and trivially
+//!    `Send + Sync + Clone` without arena lifetimes leaking into
+//!    consumer APIs.
+//!
+//!  - The `Constant` enum carries discriminants in the order the Haskell
+//!    reference's `DefaultUni` enum uses, so flat-tag decoding is a
+//!    direct table lookup.
+//!
+//! Bit-for-bit compatibility with the Haskell reference is required for
+//! every variant — round-trip property tests are in
+//! `tests/term_roundtrip.rs` (to be added with the flat decoder).
+
+use crate::data::Data;
+
+/// A UPLC term — a single AST node.
+///
+/// The `Box` wrapping makes every recursive variant heap-allocated, so
+/// the enum size stays a fixed 8 bytes for the discriminant + pointers.
+/// Stack overflow on deeply-nested terms is avoided by never recursing
+/// over the term tree directly: the CEK machine carries an explicit
+/// continuation stack instead.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Term {
+    /// `Var i` — a variable referring to the binder at De Bruijn index
+    /// `i` (with `1` being the innermost binder, matching the Haskell
+    /// convention).
+    Var(u64),
+
+    /// `Lam body` — a lambda abstraction. The body is open under one
+    /// additional binder.
+    Lam(Box<Term>),
+
+    /// `App fun arg` — function application.
+    App(Box<Term>, Box<Term>),
+
+    /// `Constant c` — a primitive value lifted into a term.
+    Const(Constant),
+
+    /// `Delay t` — wraps `t` into a thunk; reduced only by `Force`.
+    Delay(Box<Term>),
+
+    /// `Force t` — forces a `Delay`-wrapped thunk.
+    Force(Box<Term>),
+
+    /// `Error` — script failure (the CEK machine raises
+    /// [`UplcError::ScriptError`](crate::UplcError::ScriptError)).
+    Error,
+
+    /// `Builtin id` — a reference to one of the Plutus-Core builtin
+    /// functions, identified by its [`BuiltinId`].
+    Builtin(BuiltinId),
+
+    /// `Constr tag args` — Plutus-Core SOP constructor (introduced for
+    /// PlutusV3; CIP-0085).
+    Constr { tag: u64, args: Vec<Term> },
+
+    /// `Case scrutinee branches` — Plutus-Core SOP case expression
+    /// (introduced for PlutusV3; CIP-0085).
+    Case {
+        scrutinee: Box<Term>,
+        branches: Vec<Term>,
+    },
+}
+
+/// Primitive constants, in the exact discriminant order used by the
+/// Haskell `DefaultUni` enum so flat-tag decoding is a direct mapping.
+///
+/// The flat encoding tags these via the universe-tag bit sequence
+/// described in `crates/dugite-uplc/DESIGN.md` §3.2. New variants for
+/// future Plutus versions are appended; we do not reorder.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(non_camel_case_types)]
+pub enum Constant {
+    /// Arbitrary-precision integer.
+    Integer(num_bigint::BigInt),
+    /// Byte string (the underlying storage is a `Vec<u8>` so we own the
+    /// data; this matches Haskell's `ByteString`).
+    ByteString(Vec<u8>),
+    /// UTF-8 string. Decoding rejects non-UTF-8 sequences.
+    String(String),
+    /// The unit value `()`.
+    Unit,
+    /// Boolean.
+    Bool(bool),
+    /// `ProtoList element_type elements` — a flat-encoded list whose
+    /// element type is recorded for type-checking at evaluation time.
+    ///
+    /// We store both the element-type sequence (`TypeTag`) and the
+    /// elements together so the CEK machine can type-check builtin
+    /// applications without re-parsing the wire bytes.
+    ProtoList {
+        elem_type: TypeTag,
+        elements: Vec<Constant>,
+    },
+    /// `ProtoPair t1 t2 a b` — a flat-encoded pair, parameterised by
+    /// the static types of its components.
+    ProtoPair {
+        a_type: TypeTag,
+        b_type: TypeTag,
+        a: Box<Constant>,
+        b: Box<Constant>,
+    },
+    /// PlutusData — recursive sum type used by the script context.
+    Data(Data),
+    /// BLS12-381 G1 element. Stored compressed (48 bytes) for canonical
+    /// equality; uncompressed cache is materialised in the CEK machine
+    /// state when needed. Boxed to keep the `Constant` enum compact.
+    Bls12_381G1Element(Box<[u8; 48]>),
+    /// BLS12-381 G2 element. Stored compressed (96 bytes). Boxed.
+    Bls12_381G2Element(Box<[u8; 96]>),
+    /// BLS12-381 GT (Miller-loop result). The on-chain representation
+    /// is canonical-compressed (576 bytes after `final_exponentiation`).
+    /// Boxed — the variant would otherwise dominate the enum size.
+    Bls12_381MlResult(Box<[u8; 576]>),
+}
+
+/// Static type-tags for `ProtoList` / `ProtoPair` element types.
+///
+/// Flat-encoded universe tags are a *bit sequence* (Haskell:
+/// `Encoding`-of-`DefaultUni`), but at the term level we only ever
+/// inspect the top-level type, so a flat enum here is sufficient.
+/// Nested universes (lists of lists, pairs of pairs) are still
+/// representable because the constants themselves recurse.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(non_camel_case_types)]
+pub enum TypeTag {
+    Integer,
+    ByteString,
+    String,
+    Unit,
+    Bool,
+    Data,
+    List(Box<TypeTag>),
+    Pair(Box<TypeTag>, Box<TypeTag>),
+    Bls12_381G1Element,
+    Bls12_381G2Element,
+    Bls12_381MlResult,
+}
+
+/// All Plutus Core builtin function identifiers.
+///
+/// The discriminants match the Haskell `DefaultFun` enum order verbatim
+/// — that ordering is **normative** because the flat encoding stores
+/// the builtin as a raw `u8` discriminant. Reordering would break wire
+/// compatibility with cardano-node. See the formal spec
+/// (plutus-core/docs/) for the authoritative list per Plutus version.
+///
+/// Additions follow protocol-version gating in cardano-ledger:
+///
+/// - PV1..  : 0–27 (Plutus V1)
+/// - PV6..  : 28..52 (V2 additions; CIP-0033)
+/// - PV9..  : V3 additions (CIP-0035 — keccak_256, blake2b_224, BLS12-381
+///   ops, integerToByteString, byteStringToInteger, andByteString,
+///   orByteString, xorByteString, complementByteString, readBit,
+///   writeBits, replicateByte, shiftByteString, rotateByteString,
+///   countSetBits, findFirstSetBit, ripemd_160, expModInteger, plus the
+///   SOP constructors)
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[repr(u8)]
+#[non_exhaustive]
+// Variant names mirror the Haskell `DefaultFun` spelling 1:1 (which
+// uses `Bls12_381_G1_Add`, `Sha2_256`, etc. — underscore-separated by
+// design). Suppressing the lint here keeps the spec-aligned spelling.
+#[allow(non_camel_case_types)]
+pub enum BuiltinId {
+    AddInteger = 0,
+    SubtractInteger = 1,
+    MultiplyInteger = 2,
+    DivideInteger = 3,
+    QuotientInteger = 4,
+    RemainderInteger = 5,
+    ModInteger = 6,
+    EqualsInteger = 7,
+    LessThanInteger = 8,
+    LessThanEqualsInteger = 9,
+    AppendByteString = 10,
+    ConsByteString = 11,
+    SliceByteString = 12,
+    LengthOfByteString = 13,
+    IndexByteString = 14,
+    EqualsByteString = 15,
+    LessThanByteString = 16,
+    LessThanEqualsByteString = 17,
+    Sha2_256 = 18,
+    Sha3_256 = 19,
+    Blake2b_256 = 20,
+    VerifyEd25519Signature = 21,
+    AppendString = 22,
+    EqualsString = 23,
+    EncodeUtf8 = 24,
+    DecodeUtf8 = 25,
+    IfThenElse = 26,
+    ChooseUnit = 27,
+    Trace = 28,
+    FstPair = 29,
+    SndPair = 30,
+    ChooseList = 31,
+    MkCons = 32,
+    HeadList = 33,
+    TailList = 34,
+    NullList = 35,
+    ChooseData = 36,
+    ConstrData = 37,
+    MapData = 38,
+    ListData = 39,
+    IData = 40,
+    BData = 41,
+    UnConstrData = 42,
+    UnMapData = 43,
+    UnListData = 44,
+    UnIData = 45,
+    UnBData = 46,
+    EqualsData = 47,
+    MkPairData = 48,
+    MkNilData = 49,
+    MkNilPairData = 50,
+    SerialiseData = 51,
+    VerifyEcdsaSecp256k1Signature = 52,
+    VerifySchnorrSecp256k1Signature = 53,
+    // ── PlutusV3 additions ──────────────────────────────────────────
+    Bls12_381_G1_Add = 54,
+    Bls12_381_G1_Neg = 55,
+    Bls12_381_G1_ScalarMul = 56,
+    Bls12_381_G1_Equal = 57,
+    Bls12_381_G1_HashToGroup = 58,
+    Bls12_381_G1_Compress = 59,
+    Bls12_381_G1_Uncompress = 60,
+    Bls12_381_G2_Add = 61,
+    Bls12_381_G2_Neg = 62,
+    Bls12_381_G2_ScalarMul = 63,
+    Bls12_381_G2_Equal = 64,
+    Bls12_381_G2_HashToGroup = 65,
+    Bls12_381_G2_Compress = 66,
+    Bls12_381_G2_Uncompress = 67,
+    Bls12_381_MillerLoop = 68,
+    Bls12_381_MulMlResult = 69,
+    Bls12_381_FinalVerify = 70,
+    Keccak_256 = 71,
+    Blake2b_224 = 72,
+    // SOP / case-on-Constr (PlutusV3).
+    IntegerToByteString = 73,
+    ByteStringToInteger = 74,
+    AndByteString = 75,
+    OrByteString = 76,
+    XorByteString = 77,
+    ComplementByteString = 78,
+    ReadBit = 79,
+    WriteBits = 80,
+    ReplicateByte = 81,
+    ShiftByteString = 82,
+    RotateByteString = 83,
+    CountSetBits = 84,
+    FindFirstSetBit = 85,
+    Ripemd_160 = 86,
+    ExpModInteger = 87,
+}
+
+impl BuiltinId {
+    /// Parse a builtin id from the raw 7-bit wire discriminant.
+    ///
+    /// Unknown discriminants are an error rather than a panic — the
+    /// flat decoder calls this on every `Term::Builtin` we see and
+    /// must reject adversarial inputs cleanly.
+    pub fn from_u8(raw: u8) -> Result<Self, crate::UplcError> {
+        // Filled in alongside the flat decoder. Keeping it as
+        // `Internal` for now lets the scaffold compile.
+        Err(crate::UplcError::Internal(format!(
+            "BuiltinId::from_u8 not yet implemented (raw={raw})"
+        )))
+    }
+
+    /// Lowercase identifier used in the Plutus textual syntax and in
+    /// error messages. Stable across Plutus versions.
+    pub fn name(&self) -> &'static str {
+        // Filled in when builtins are implemented. The table is wired
+        // alongside the dispatcher in `crate::builtin`.
+        "<unimplemented>"
+    }
+}
