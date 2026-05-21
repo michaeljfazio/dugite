@@ -131,29 +131,25 @@ fn decode_conway_block_mode(
     };
 
     // -------------------------------------------------------------------------
-    // 2. tx_bodies
+    // 2. tx_bodies (definite OR indefinite-length array — mainnet uses both)
     // -------------------------------------------------------------------------
-    let tx_count = r.read_array_header()?.unwrap_or(0) as usize;
-    let mut raw_bodies: Vec<Vec<u8>> = Vec::with_capacity(tx_count);
-    let mut parsed_bodies: Vec<TransactionBody> = Vec::with_capacity(tx_count);
-
-    for _ in 0..tx_count {
-        let body = KeepRaw::parse_with(&mut r, decode_conway_tx_body)?;
+    let mut raw_bodies: Vec<Vec<u8>> = Vec::new();
+    let mut parsed_bodies: Vec<TransactionBody> = Vec::new();
+    r.for_each_array_item(|r| {
+        let body = KeepRaw::parse_with(r, decode_conway_tx_body)?;
         raw_bodies.push(body.raw.to_vec());
         parsed_bodies.push(body.value);
-    }
+        Ok(())
+    })?;
 
     // -------------------------------------------------------------------------
-    // 3. tx_witness_sets
+    // 3. tx_witness_sets (definite OR indefinite)
     // -------------------------------------------------------------------------
-    let witness_count = r.read_array_header()?.unwrap_or(0) as usize;
-    let mut raw_witnesses: Vec<Vec<u8>> = Vec::with_capacity(witness_count);
-    let mut parsed_witnesses: Vec<Option<TransactionWitnessSet>> =
-        Vec::with_capacity(witness_count);
-
-    for _ in 0..witness_count {
+    let mut raw_witnesses: Vec<Vec<u8>> = Vec::new();
+    let mut parsed_witnesses: Vec<Option<TransactionWitnessSet>> = Vec::new();
+    r.for_each_array_item(|r| {
         if mode == DecodeMode::Full {
-            let ws = KeepRaw::parse_with(&mut r, decode_conway_witness_set)?;
+            let ws = KeepRaw::parse_with(r, decode_conway_witness_set)?;
             raw_witnesses.push(ws.raw.to_vec());
             parsed_witnesses.push(Some(ws.value));
         } else {
@@ -162,7 +158,8 @@ fn decode_conway_block_mode(
             raw_witnesses.push(r.slice_from(ws_start).to_vec());
             parsed_witnesses.push(None);
         }
-    }
+        Ok(())
+    })?;
 
     // -------------------------------------------------------------------------
     // 4. auxiliary_data_set
@@ -614,15 +611,12 @@ fn read_legacy_tx_output(r: &mut Reader<'_>) -> Result<TransactionOutput, Serial
 }
 
 fn read_map_tx_output(r: &mut Reader<'_>) -> Result<TransactionOutput, SerializationError> {
-    let map_len = r.read_map_header()?;
-    let n = map_len.unwrap_or(0) as usize;
-
     let mut address_bytes: Option<Vec<u8>> = None;
     let mut value: Option<Value> = None;
     let mut datum = OutputDatum::None;
     let mut script_ref = None;
 
-    for _ in 0..n {
+    r.for_each_map_entry(|r| {
         let key = r.read_uint()?;
         match key {
             0 => {
@@ -641,7 +635,8 @@ fn read_map_tx_output(r: &mut Reader<'_>) -> Result<TransactionOutput, Serializa
                 r.skip()?;
             }
         }
-    }
+        Ok(())
+    })?;
 
     let addr_bytes = address_bytes.ok_or_else(|| {
         SerializationError::CborDecode("map tx_out: missing address (key 0)".into())
@@ -1674,10 +1669,7 @@ fn decode_conway_witness_set(
     let mut raw_redeemers_cbor: Option<Vec<u8>> = None;
     let mut raw_plutus_data_cbor: Option<Vec<u8>> = None;
 
-    let map_len = r.read_map_header()?;
-    let n_entries = map_len.unwrap_or(0) as usize;
-
-    for _ in 0..n_entries {
+    r.for_each_map_entry(|r| {
         let key = r.read_uint()?;
         match key {
             0 => {
@@ -1747,7 +1739,8 @@ fn decode_conway_witness_set(
                 r.skip()?;
             }
         }
-    }
+        Ok(())
+    })?;
 
     Ok(TransactionWitnessSet {
         vkey_witnesses,
