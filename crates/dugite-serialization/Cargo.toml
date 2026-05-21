@@ -4,6 +4,15 @@ version.workspace = true
 edition.workspace = true
 description = "CBOR serialization for Cardano wire format compatibility"
 
+[features]
+default = ["pallas-shadow-decode"]
+# Compiles the legacy pallas-backed decoder alongside the in-house one and
+# enables the runtime dual-decode comparator (controlled by DUGITE_DUAL_DECODE
+# at runtime). Keep ON during the pallas-removal program (plan: humming-dewdrop).
+# Flipped OFF at the M6 cutover, at which point the pallas decoder is deleted
+# entirely and only the in-house path remains.
+pallas-shadow-decode = []
+
 [dependencies]
 dugite-primitives = { workspace = true }
 minicbor = { workspace = true }
