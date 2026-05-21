@@ -1128,17 +1128,11 @@ pub(crate) fn read_plutus_data(r: &mut Reader<'_>) -> Result<PlutusData, Seriali
                 ))),
             }
         }
-        Type::Map => {
-            let n = r.read_map_header()?.unwrap_or(0) as usize;
-            let mut entries = Vec::with_capacity(n);
-            for _ in 0..n {
-                let k = read_plutus_data(r)?;
-                let v = read_plutus_data(r)?;
-                entries.push((k, v));
-            }
-            Ok(PlutusData::Map(entries))
+        Type::Map | Type::MapIndef => {
+            let pairs = r.read_map(|r| read_plutus_data(r), |r| read_plutus_data(r))?;
+            Ok(PlutusData::Map(pairs))
         }
-        Type::Array => {
+        Type::Array | Type::ArrayIndef => {
             let items = r.read_array(|r| read_plutus_data(r))?;
             Ok(PlutusData::List(items))
         }
@@ -1325,6 +1319,88 @@ fn read_metadatum(r: &mut Reader<'_>) -> Result<TransactionMetadatum, Serializat
             "metadatum: unexpected type {other}"
         ))),
     }
+}
+
+// ============================================================================
+// Standalone tx decoder (Allegra / Mary / Alonzo era family)
+// ============================================================================
+
+/// Decode a standalone Alonzo-family transaction from raw CBOR bytes.
+///
+/// Covers Allegra (era_id=2), Mary (era_id=3), and Alonzo (era_id=4).
+/// The standalone tx format is `[body_map, witness_set_map, is_valid_bool, aux_data]`.
+///
+/// The `era` argument is stamped onto the returned [`Transaction`] and controls
+/// which body fields are decoded (Allegra adds validity_start, Mary adds mint,
+/// Alonzo adds script_data_hash/collateral/required_signers).
+///
+/// The transaction hash is `blake2b_256(raw_body_cbor)`.
+pub(crate) fn decode_alonzo_family_tx_standalone(
+    cbor: &[u8],
+    era: Era,
+) -> Result<Transaction, SerializationError> {
+    let mut r = Reader::new(cbor);
+
+    // tx = [body, witness_set, is_valid, aux_data]
+    let arr_len = r.read_array_header()?;
+    match arr_len {
+        Some(4) => {}
+        Some(n) => {
+            return Err(SerializationError::CborDecode(format!(
+                "{era:?} tx: expected array(4), got array({n})"
+            )));
+        }
+        None => {
+            return Err(SerializationError::CborDecode(format!(
+                "{era:?} tx: expected definite-length array"
+            )));
+        }
+    }
+
+    // 1. Body — capture raw bytes for hash computation
+    let body_raw = KeepRaw::parse_with(&mut r, |r| decode_alonzo_tx_body(r, era))?;
+    let raw_body_cbor = body_raw.raw.to_vec();
+    let tx_hash = blake2b_256(&raw_body_cbor);
+    let body = body_raw.value;
+
+    // 2. Witness set
+    let ws_raw = KeepRaw::parse_with(&mut r, |r| decode_alonzo_witness_set(r, era))?;
+    let raw_witness_cbor = ws_raw.raw.to_vec();
+    let witness_set = ws_raw.value;
+
+    // 3. is_valid bool
+    let is_valid = {
+        let ty = r.peek_major()?;
+        if ty == Type::Bool {
+            r.read_bool()?
+        } else {
+            r.skip()?;
+            true
+        }
+    };
+
+    // 4. Auxiliary data (null or a value)
+    let auxiliary_data = {
+        let ty = r.peek_major()?;
+        if ty == Type::Null {
+            r.read_null()?;
+            None
+        } else {
+            Some(decode_alonzo_auxiliary_data(&mut r)?)
+        }
+    };
+
+    Ok(Transaction {
+        hash: tx_hash,
+        era,
+        body,
+        witness_set,
+        is_valid,
+        auxiliary_data,
+        raw_cbor: Some(cbor.to_vec()),
+        raw_body_cbor: Some(raw_body_cbor),
+        raw_witness_cbor: Some(raw_witness_cbor),
+    })
 }
 
 // ============================================================================
