@@ -34,6 +34,7 @@ use crate::decode::era_allegra;
 use crate::decode::era_alonzo;
 use crate::decode::era_babbage;
 use crate::decode::era_byron;
+use crate::decode::era_conway;
 use crate::decode::era_mary;
 use crate::decode::era_shelley;
 use crate::decode::reader::Reader;
@@ -210,7 +211,7 @@ pub fn decode_block_envelope<'b>(
 ///
 /// - M4a: Byron (eras 0/1) and Shelley (era 2) are implemented in-house.
 /// - M4b: Allegra (era 3), Mary (era 4), Alonzo (era 5), Babbage (era 6) implemented.
-/// - M4c (Conway/Dijkstra): still delegate via `unimplemented!()`.
+/// - M4c: Conway (era 7) and Dijkstra (era 8) implemented.
 ///
 /// # Errors
 ///
@@ -262,10 +263,18 @@ pub fn decode_block(
             }
         }
         EraTag::Conway => {
-            unimplemented!("M4c: Conway decoder not yet implemented")
+            if minimal {
+                era_conway::decode_conway_block_minimal(inner_cbor)
+            } else {
+                era_conway::decode_conway_block(inner_cbor)
+            }
         }
         EraTag::Dijkstra => {
-            unimplemented!("M4c: Dijkstra decoder not yet implemented")
+            if minimal {
+                era_conway::decode_dijkstra_block_minimal(inner_cbor)
+            } else {
+                era_conway::decode_dijkstra_block(inner_cbor)
+            }
         }
         EraTag::Unknown(tag) => Err(SerializationError::CborDecode(format!(
             "decode_block: unknown era tag {tag}"
@@ -467,8 +476,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // decode_block — only the unknown-tag error path is exercisable without
-    // per-era decoders; the known-era arms are stubs returning unimplemented!().
+    // decode_block — unknown-tag error path and Conway/Dijkstra dispatch.
     // -----------------------------------------------------------------------
 
     #[test]
@@ -480,19 +488,33 @@ mod tests {
         assert!(format!("{err}").contains("99"));
     }
 
+    /// Conway (era 7) is now implemented in-house; a minimal (invalid) block
+    /// must return a `CborDecode` error, NOT an `unimplemented!()` panic.
     #[test]
-    #[should_panic(expected = "not yet implemented")]
-    fn decode_block_conway_panics_until_era_implemented() {
+    fn decode_block_conway_returns_decode_error_not_panic() {
         let inner = minimal_inner(7);
         let cbor = make_envelope(7, &inner);
-        let _ = decode_block(&cbor, 0, false);
+        let result = decode_block(&cbor, 0, false);
+        assert!(
+            result.is_err(),
+            "minimal synthetic Conway block must fail to decode"
+        );
+        assert!(
+            !matches!(result, Err(SerializationError::CborDecode(ref m)) if m.contains("not yet implemented")),
+            "must not be an unimplemented!() panic disguised as an error"
+        );
     }
 
+    /// Dijkstra (era 8) is now implemented in-house (via the Conway decoder);
+    /// a minimal (invalid) block must return a `CborDecode` error, NOT a panic.
     #[test]
-    #[should_panic(expected = "not yet implemented")]
-    fn decode_block_dijkstra_panics_until_era_implemented() {
+    fn decode_block_dijkstra_returns_decode_error_not_panic() {
         let inner = minimal_inner(8);
         let cbor = make_envelope(8, &inner);
-        let _ = decode_block(&cbor, 0, false);
+        let result = decode_block(&cbor, 0, false);
+        assert!(
+            result.is_err(),
+            "minimal synthetic Dijkstra block must fail to decode"
+        );
     }
 }

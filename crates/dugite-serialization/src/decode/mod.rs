@@ -45,11 +45,13 @@ pub(crate) mod raw;
 #[allow(dead_code)]
 pub(crate) mod reader;
 
-// In-house era decoders (M4a — Byron + Shelley; M4b — Allegra/Mary/Alonzo/Babbage).
+// In-house era decoders (M4a — Byron + Shelley; M4b — Allegra/Mary/Alonzo/Babbage;
+// M4c — Conway + Dijkstra).
 pub(crate) mod era_allegra;
 pub(crate) mod era_alonzo;
 pub(crate) mod era_babbage;
 pub(crate) mod era_byron;
+pub(crate) mod era_conway;
 pub(crate) mod era_mary;
 pub(crate) mod era_shelley;
 
@@ -82,7 +84,7 @@ fn peek_era_tag(cbor: &[u8]) -> Option<EraTag> {
     }
 }
 
-/// Returns `true` if the era tag is handled by the in-house decoder (M4a + M4b).
+/// Returns `true` if the era tag is handled by the in-house decoder (M4a + M4b + M4c).
 fn is_inhouse_era(tag: EraTag) -> bool {
     matches!(
         tag,
@@ -93,18 +95,21 @@ fn is_inhouse_era(tag: EraTag) -> bool {
             | EraTag::Mary
             | EraTag::Alonzo
             | EraTag::Babbage
+            | EraTag::Conway
+            | EraTag::Dijkstra
     )
 }
 
 // ---------------------------------------------------------------------------
-// Public API — dispatch Byron/Shelley in-house, others via pallas
+// Public API — all eras in-house (M4a + M4b + M4c complete)
 // ---------------------------------------------------------------------------
 
 /// Decode a multi-era block from raw CBOR bytes into a dugite [`Block`].
 ///
-/// **M4a routing:**
-/// - Byron (era tags 0/1) and Shelley (era tag 2) → in-house decoder.
-/// - All other eras → pallas-backed decoder.
+/// All eras are handled by the in-house decoder (M4a/b/c complete):
+/// - Byron (era tags 0/1), Shelley (2) — M4a.
+/// - Allegra (3), Mary (4), Alonzo (5), Babbage (6) — M4b.
+/// - Conway (7), Dijkstra (8) — M4c.
 pub fn decode_block(cbor: &[u8]) -> Result<Block, SerializationError> {
     decode_block_with_byron_epoch_length(cbor, 0)
 }
@@ -117,7 +122,11 @@ pub fn decode_block_with_byron_epoch_length(
 ) -> Result<Block, SerializationError> {
     if let Some(tag) = peek_era_tag(cbor) {
         if is_inhouse_era(tag) {
-            return block::decode_block(cbor, byron_epoch_length, false);
+            let mut blk = block::decode_block(cbor, byron_epoch_length, false)?;
+            // Mirror the pallas path: store the full HFC-wrapped bytes so that
+            // ChainDB can serve byte-exact CBOR on BlockFetch without re-encoding.
+            blk.raw_cbor = Some(cbor.to_vec());
+            return Ok(blk);
         }
     }
     crate::multi_era::decode_block_with_byron_epoch_length(cbor, byron_epoch_length)
@@ -138,7 +147,9 @@ pub fn decode_block_minimal_with_byron_epoch_length(
 ) -> Result<Block, SerializationError> {
     if let Some(tag) = peek_era_tag(cbor) {
         if is_inhouse_era(tag) {
-            return block::decode_block(cbor, byron_epoch_length, true);
+            let mut blk = block::decode_block(cbor, byron_epoch_length, true)?;
+            blk.raw_cbor = Some(cbor.to_vec());
+            return Ok(blk);
         }
     }
     crate::multi_era::decode_block_minimal_with_byron_epoch_length(cbor, byron_epoch_length)
