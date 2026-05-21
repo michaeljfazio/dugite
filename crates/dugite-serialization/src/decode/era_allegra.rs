@@ -22,3 +22,45 @@ pub fn decode_allegra_block(inner_cbor: &[u8]) -> Result<Block, SerializationErr
 pub fn decode_allegra_block_minimal(inner_cbor: &[u8]) -> Result<Block, SerializationError> {
     decode_alonzo_family_block(inner_cbor, Era::Allegra, false, DecodeMode::Minimal)
 }
+
+#[cfg(test)]
+mod tests {
+    //! Allegra block structure is byte-identical to Shelley (4-element block,
+    //! no `invalid_transactions` field). We exercise the Allegra wrappers
+    //! against the Shelley test vector — Shelley CBOR is a strict subset of
+    //! Allegra wire-format and must round-trip through both entry points.
+    use super::*;
+
+    fn shelley_inner_cbor() -> Vec<u8> {
+        let hex_str = std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/test_vectors/shelley.hex"
+        ))
+        .unwrap();
+        let raw = hex::decode(hex_str.trim()).unwrap();
+        // Outer wrapper is `[0x82, era_tag, inner_block]`. Era tag is one byte
+        // (info <= 23) for all current Cardano eras, so inner starts at offset 2.
+        assert_eq!(raw[0], 0x82, "expected outer array(2)");
+        raw[2..].to_vec()
+    }
+
+    #[test]
+    fn decode_allegra_block_full_smokes() {
+        let inner = shelley_inner_cbor();
+        let blk = decode_allegra_block(&inner).expect("full-mode allegra decode");
+        assert_eq!(blk.era, Era::Allegra);
+    }
+
+    #[test]
+    fn decode_allegra_block_minimal_smokes() {
+        let inner = shelley_inner_cbor();
+        let blk = decode_allegra_block_minimal(&inner).expect("minimal-mode allegra decode");
+        assert_eq!(blk.era, Era::Allegra);
+    }
+
+    #[test]
+    fn decode_allegra_block_rejects_garbage() {
+        assert!(decode_allegra_block(&[]).is_err());
+        assert!(decode_allegra_block_minimal(&[0xff]).is_err());
+    }
+}

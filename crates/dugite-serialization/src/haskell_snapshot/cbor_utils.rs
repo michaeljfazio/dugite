@@ -732,6 +732,429 @@ mod cap_tests {
     }
 
     #[test]
+    fn skip_cbor_value_uint_one_byte() {
+        // info<=23 path
+        assert_eq!(skip_cbor_value(&[0x05]).unwrap(), 1);
+    }
+
+    #[test]
+    fn skip_cbor_value_uint_info_27() {
+        // info=27 path = 8 follow-on bytes.
+        let bytes = [0x1b, 0, 0, 0, 0, 0, 0, 0, 42];
+        assert_eq!(skip_cbor_value(&bytes).unwrap(), 9);
+    }
+
+    #[test]
+    fn skip_cbor_value_negative_int() {
+        // major 1 path
+        assert_eq!(skip_cbor_value(&[0x37]).unwrap(), 1);
+    }
+
+    #[test]
+    fn skip_cbor_value_text_short() {
+        // text("ab") = 0x62 0x61 0x62
+        assert_eq!(skip_cbor_value(&[0x62, b'a', b'b']).unwrap(), 3);
+    }
+
+    #[test]
+    fn skip_cbor_value_bytes_info_25() {
+        // bstr(info=25, len=2, val=[0xff,0xfe])
+        let bytes = [0x59, 0x00, 0x02, 0xff, 0xfe];
+        assert_eq!(skip_cbor_value(&bytes).unwrap(), 5);
+    }
+
+    #[test]
+    fn skip_cbor_value_indef_byte_string() {
+        // 0x5f (bstr-indef) + bstr(1)=0x41 0x00 + break 0xff
+        let bytes = [0x5f, 0x41, 0x00, 0xff];
+        assert_eq!(skip_cbor_value(&bytes).unwrap(), 4);
+    }
+
+    #[test]
+    fn skip_cbor_value_indef_array() {
+        // array(indef): 0x9f + 0x01 + 0xff
+        let bytes = [0x9f, 0x01, 0xff];
+        assert_eq!(skip_cbor_value(&bytes).unwrap(), 3);
+    }
+
+    #[test]
+    fn skip_cbor_value_indef_map() {
+        // map(indef): 0xbf + key/value pair + break
+        let bytes = [0xbf, 0x00, 0x01, 0xff];
+        assert_eq!(skip_cbor_value(&bytes).unwrap(), 4);
+    }
+
+    #[test]
+    fn skip_cbor_value_tag_wraps_inner() {
+        // tag(30) wrapping array(2)[1,2]: 0xd8 0x1e 0x82 0x01 0x02
+        let bytes = [0xd8, 0x1e, 0x82, 0x01, 0x02];
+        assert_eq!(skip_cbor_value(&bytes).unwrap(), 5);
+    }
+
+    #[test]
+    fn skip_cbor_value_simple_values() {
+        // null = 0xf6, true = 0xf5, false = 0xf4 — all 1-byte
+        assert_eq!(skip_cbor_value(&[0xf6]).unwrap(), 1);
+        assert_eq!(skip_cbor_value(&[0xf5]).unwrap(), 1);
+        assert_eq!(skip_cbor_value(&[0xf4]).unwrap(), 1);
+    }
+
+    #[test]
+    fn skip_cbor_value_simple_value_24() {
+        // simple value with info=24, 2 bytes
+        assert_eq!(skip_cbor_value(&[0xf8, 0x80]).unwrap(), 2);
+    }
+
+    #[test]
+    fn skip_cbor_value_float16_32_64() {
+        // float16 = 0xf9 + 2 bytes; float32 = 0xfa + 4; float64 = 0xfb + 8
+        assert_eq!(skip_cbor_value(&[0xf9, 0x00, 0x00]).unwrap(), 3);
+        assert_eq!(skip_cbor_value(&[0xfa, 0, 0, 0, 0]).unwrap(), 5);
+        assert_eq!(skip_cbor_value(&[0xfb, 0, 0, 0, 0, 0, 0, 0, 0]).unwrap(), 9);
+    }
+
+    #[test]
+    fn skip_cbor_value_break_at_top_level() {
+        // 0xff (break) skipped at top-level — handled gracefully (1 byte).
+        assert_eq!(skip_cbor_value(&[0xff]).unwrap(), 1);
+    }
+
+    #[test]
+    fn skip_cbor_value_empty_errors() {
+        assert!(skip_cbor_value(&[]).is_err());
+    }
+
+    #[test]
+    fn skip_cbor_value_returns_claimed_size_not_clipped() {
+        // `skip_cbor_value` returns the *claimed* CBOR size, including for
+        // truncated input — bounds checking is the caller's responsibility.
+        // bstr(info=25, len=2) reports `3 + 2 = 5` even though only 4 bytes exist.
+        assert_eq!(skip_cbor_value(&[0x59, 0x00, 0x02, 0xff]).unwrap(), 5);
+    }
+
+    #[test]
+    fn skip_cbor_value_truncated_string_header_errors() {
+        // info=25 needs 2 follow-on bytes for the length; only 1 present.
+        assert!(skip_cbor_value(&[0x59, 0x00]).is_err());
+    }
+
+    #[test]
+    fn skip_cbor_value_deeply_nested_rejected() {
+        // Build 80 nested array(1) wrappers — exceeds CBOR_SKIP_MAX_DEPTH=64.
+        let depth = 80usize;
+        let mut data = vec![0x81u8; depth];
+        // innermost value
+        data.push(0x00);
+        let err = skip_cbor_value(&data).unwrap_err();
+        let SerializationError::CborDecode(msg) = err else {
+            panic!("expected CborDecode");
+        };
+        assert!(msg.contains("CBOR nesting depth exceeds limit"));
+    }
+
+    // ── decode_uint / decode_int / decode_bigint_or_uint ────────────────────
+
+    #[test]
+    fn decode_uint_truncated_info_24_errors() {
+        assert!(decode_uint(&[0x18]).is_err()); // info=24 needs 1 follow-on byte
+    }
+
+    #[test]
+    fn decode_uint_truncated_info_25_errors() {
+        assert!(decode_uint(&[0x19, 0x00]).is_err()); // info=25 needs 2
+    }
+
+    #[test]
+    fn decode_uint_truncated_info_27_errors() {
+        assert!(decode_uint(&[0x1b, 0, 0, 0, 0, 0, 0, 0]).is_err());
+    }
+
+    #[test]
+    fn decode_int_wrong_major_errors() {
+        // bytestring (major 2)
+        assert!(decode_int(&[0x40]).is_err());
+    }
+
+    #[test]
+    fn decode_bigint_accepts_tag2_bignum() {
+        // tag 2 + bstr(2)[0xff, 0xfe] = 0xfffe
+        let (v, n) = decode_bigint_or_uint(&[0xc2, 0x42, 0xff, 0xfe]).unwrap();
+        assert_eq!(v, 0xfffe);
+        assert_eq!(n, 4);
+    }
+
+    #[test]
+    fn decode_bigint_rejects_too_large() {
+        // tag 2 + bstr(9) = 9 byte bignum > u64
+        let mut cbor = vec![0xc2, 0x49];
+        cbor.extend_from_slice(&[0xff; 9]);
+        assert!(decode_bigint_or_uint(&cbor).is_err());
+    }
+
+    #[test]
+    fn decode_bigint_rejects_other_major() {
+        // text string is neither uint nor tag 2
+        assert!(decode_bigint_or_uint(&[0x60]).is_err());
+    }
+
+    #[test]
+    fn decode_bigint_empty_errors() {
+        assert!(decode_bigint_or_uint(&[]).is_err());
+    }
+
+    // ── decode_array_len / decode_map_len / decode_bytes / decode_text ──────
+
+    #[test]
+    fn decode_array_len_rejects_indefinite() {
+        assert!(decode_array_len(&[0x9f]).is_err());
+    }
+
+    #[test]
+    fn decode_array_len_rejects_non_array() {
+        assert!(decode_array_len(&[0x00]).is_err());
+        assert!(decode_array_len(&[]).is_err());
+    }
+
+    #[test]
+    fn decode_map_len_indefinite_returns_none() {
+        let (len, n) = decode_map_len(&[0xbf]).unwrap();
+        assert!(len.is_none());
+        assert_eq!(n, 1);
+    }
+
+    #[test]
+    fn decode_map_len_rejects_non_map() {
+        assert!(decode_map_len(&[0x00]).is_err());
+        assert!(decode_map_len(&[]).is_err());
+    }
+
+    #[test]
+    fn decode_bytes_truncated_errors() {
+        // bstr(3) followed by only 2 bytes
+        assert!(decode_bytes(&[0x43, 0x00, 0x01]).is_err());
+    }
+
+    #[test]
+    fn decode_bytes_rejects_non_bstr() {
+        assert!(decode_bytes(&[0x00]).is_err());
+        assert!(decode_bytes(&[]).is_err());
+    }
+
+    #[test]
+    fn decode_text_invalid_utf8_errors() {
+        // 0x62 = text(2), then [0xff, 0xff] — not valid utf-8.
+        assert!(decode_text(&[0x62, 0xff, 0xff]).is_err());
+    }
+
+    #[test]
+    fn decode_text_truncated_errors() {
+        assert!(decode_text(&[0x62, b'a']).is_err());
+    }
+
+    #[test]
+    fn decode_text_rejects_non_text() {
+        assert!(decode_text(&[0x00]).is_err());
+        assert!(decode_text(&[]).is_err());
+    }
+
+    // ── decode_hash28 / decode_hash32 ─────────────────────────────────────────
+
+    #[test]
+    fn decode_hash28_wrong_length_errors() {
+        // bstr(20)
+        let mut data = vec![0x54];
+        data.extend_from_slice(&[0u8; 20]);
+        let err = decode_hash28(&data).unwrap_err();
+        assert!(matches!(
+            err,
+            SerializationError::InvalidLength {
+                expected: 28,
+                got: 20
+            }
+        ));
+    }
+
+    #[test]
+    fn decode_hash32_wrong_length_errors() {
+        let mut data = vec![0x58, 28];
+        data.extend_from_slice(&[0u8; 28]);
+        let err = decode_hash32(&data).unwrap_err();
+        assert!(matches!(
+            err,
+            SerializationError::InvalidLength {
+                expected: 32,
+                got: 28
+            }
+        ));
+    }
+
+    // ── decode_nonce ─────────────────────────────────────────────────────────
+
+    #[test]
+    fn decode_nonce_neutral_is_zero_hash() {
+        // array(1) [0]
+        let (h, n) = decode_nonce(&[0x81, 0x00]).unwrap();
+        assert_eq!(h, Hash32::ZERO);
+        assert_eq!(n, 2);
+    }
+
+    #[test]
+    fn decode_nonce_with_hash() {
+        // array(2) [1, bstr(32)]
+        let mut data = vec![0x82, 0x01, 0x58, 0x20];
+        data.extend_from_slice(&[0xAB; 32]);
+        let (h, _) = decode_nonce(&data).unwrap();
+        assert_eq!(h.as_bytes(), &[0xAB; 32]);
+    }
+
+    #[test]
+    fn decode_nonce_invalid_shape_errors() {
+        // array(3) → error
+        assert!(decode_nonce(&[0x83, 0x00, 0x00, 0x00]).is_err());
+        // array(2) with tag 5 → error
+        assert!(decode_nonce(&[0x82, 0x05, 0x00]).is_err());
+    }
+
+    // ── decode_credential ────────────────────────────────────────────────────
+
+    #[test]
+    fn decode_credential_rejects_wrong_array_arity() {
+        // array(3) → InvalidLength
+        let err = decode_credential(&[0x83, 0x00, 0x00, 0x00]).unwrap_err();
+        assert!(matches!(
+            err,
+            SerializationError::InvalidLength { expected: 2, .. }
+        ));
+    }
+
+    #[test]
+    fn decode_credential_happy_path() {
+        let mut data = vec![0x82, 0x01, 0x58, 0x1c];
+        data.extend_from_slice(&[0xCD; 28]);
+        let ((tag, h), _) = decode_credential(&data).unwrap();
+        assert_eq!(tag, 1);
+        assert_eq!(h.as_bytes(), &[0xCD; 28]);
+    }
+
+    // ── decode_with_origin_len ───────────────────────────────────────────────
+
+    #[test]
+    fn decode_with_origin_len_origin() {
+        let (len, n) = decode_with_origin_len(&[0x80]).unwrap();
+        assert_eq!(len, None);
+        assert_eq!(n, 1);
+    }
+
+    #[test]
+    fn decode_with_origin_len_some() {
+        let (len, n) = decode_with_origin_len(&[0x81, 0x00]).unwrap();
+        assert_eq!(len, Some(1));
+        assert_eq!(n, 1); // only the header byte
+    }
+
+    #[test]
+    fn decode_with_origin_len_rejects_other() {
+        assert!(decode_with_origin_len(&[0x82, 0x00, 0x00]).is_err());
+    }
+
+    // ── decode_rational ──────────────────────────────────────────────────────
+
+    #[test]
+    fn decode_rational_with_tag30() {
+        // tag(30) + array(2)[1, 2]
+        let bytes = [0xd8, 0x1e, 0x82, 0x01, 0x02];
+        let ((num, den), n) = decode_rational(&bytes).unwrap();
+        assert_eq!(num, 1);
+        assert_eq!(den, 2);
+        assert_eq!(n, 5);
+    }
+
+    #[test]
+    fn decode_rational_without_tag() {
+        let ((num, den), _) = decode_rational(&[0x82, 0x03, 0x04]).unwrap();
+        assert_eq!((num, den), (3, 4));
+    }
+
+    #[test]
+    fn decode_rational_wrong_arity_errors() {
+        assert!(decode_rational(&[0x81, 0x00]).is_err());
+    }
+
+    // ── decode_null ──────────────────────────────────────────────────────────
+
+    #[test]
+    fn decode_null_recognizes_f6() {
+        let (is_null, n) = decode_null(&[0xf6]).unwrap();
+        assert!(is_null);
+        assert_eq!(n, 1);
+    }
+
+    #[test]
+    fn decode_null_non_null_does_not_consume() {
+        let (is_null, n) = decode_null(&[0x00]).unwrap();
+        assert!(!is_null);
+        assert_eq!(n, 0);
+    }
+
+    #[test]
+    fn decode_null_empty_errors() {
+        assert!(decode_null(&[]).is_err());
+    }
+
+    // ── decode_array_len_or_indef ────────────────────────────────────────────
+
+    #[test]
+    fn decode_array_len_or_indef_definite() {
+        let (len, n) = decode_array_len_or_indef(&[0x83]).unwrap();
+        assert_eq!(len, Some(3));
+        assert_eq!(n, 1);
+    }
+
+    #[test]
+    fn decode_array_len_or_indef_indefinite() {
+        let (len, n) = decode_array_len_or_indef(&[0x9f]).unwrap();
+        assert!(len.is_none());
+        assert_eq!(n, 1);
+    }
+
+    #[test]
+    fn decode_array_len_or_indef_rejects_non_array() {
+        assert!(decode_array_len_or_indef(&[0x00]).is_err());
+        assert!(decode_array_len_or_indef(&[]).is_err());
+    }
+
+    // ── MapReader: indefinite vs definite ───────────────────────────────────
+
+    #[test]
+    fn map_reader_indefinite_finish_requires_break() {
+        let (reader, _) = MapReader::new(&[0xbf]).unwrap();
+        // No break byte present.
+        assert!(reader.finish(&[0x00]).is_err());
+    }
+
+    #[test]
+    fn map_reader_indefinite_has_next_empty_errors() {
+        let (mut reader, _) = MapReader::new(&[0xbf]).unwrap();
+        assert!(reader.has_next(&[]).is_err());
+    }
+
+    #[test]
+    fn map_reader_indefinite_break_terminates() {
+        let (mut reader, _) = MapReader::new(&[0xbf]).unwrap();
+        assert!(!reader.has_next(&[0xff]).unwrap());
+        assert_eq!(reader.finish(&[0xff]).unwrap(), 1);
+    }
+
+    #[test]
+    fn map_reader_definite_counts_down() {
+        let (mut reader, _) = MapReader::new(&[0xa2]).unwrap();
+        assert!(reader.has_next(&[0x00]).unwrap());
+        assert!(reader.has_next(&[0x00]).unwrap());
+        assert!(!reader.has_next(&[0x00]).unwrap());
+        assert_eq!(reader.finish(&[]).unwrap(), 0);
+    }
+
+    #[test]
     fn map_size_hint_small_passthrough() {
         let reader = MapReader {
             remaining: Some(42),

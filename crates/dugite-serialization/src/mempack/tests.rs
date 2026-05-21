@@ -467,3 +467,220 @@ fn test_tvar_iterator_immediate_break() {
     let entries: Vec<_> = iter.collect();
     assert!(entries.is_empty());
 }
+
+// ── Additional TxOut error-path coverage ──────────────────────────────────────
+
+#[test]
+fn test_decode_mempack_txout_empty_input_errors() {
+    assert!(decode_mempack_txout(&[]).is_err());
+}
+
+#[test]
+fn test_decode_mempack_txout_tag1_too_short() {
+    // tag=1 then nothing — clearly < 34 bytes.
+    let data = [0x01u8; 5];
+    assert!(decode_mempack_txout(&data).is_err());
+}
+
+#[test]
+fn test_decode_mempack_txout_tag1_with_datum_hash() {
+    // tag(1) + addr_len(29) + 29 addr bytes + value_tag(0) + coin_varlen(0x00) + 32-byte hash
+    let mut val = Vec::new();
+    val.push(0x01);
+    val.push(29);
+    val.extend_from_slice(&[0x70; 29]);
+    val.push(0); // ADA-only value tag
+    val.push(0); // coin VarLen = 0
+    val.extend_from_slice(&[0xCDu8; 32]); // datum hash
+    let (txout, consumed) = decode_mempack_txout(&val).unwrap();
+    assert_eq!(consumed, val.len());
+    assert_eq!(txout.tag, 1);
+    assert_eq!(txout.coin, 0);
+    assert_eq!(txout.datum_hash.as_ref().unwrap(), &[0xCDu8; 32]);
+}
+
+#[test]
+fn test_decode_mempack_txout_tag2_invalid_stake_cred_tag() {
+    // tag(2) outer + invalid Credential Staking tag (must be 0 or 1).
+    let mut bytes = vec![0x02, 0x05]; // stake cred tag = 5 (invalid)
+    bytes.extend_from_slice(&[0x00u8; 28]); // stake hash
+    bytes.extend_from_slice(&[0x00u8; 32]); // Addr28Extra (all zero, doesn't matter — will fail before)
+    bytes.push(0x00); // CompactCoin inner tag
+    bytes.push(0x00); // VarLen = 0
+    let err = decode_mempack_txout(&bytes).unwrap_err();
+    let SerializationError::CborDecode(msg) = err else {
+        panic!("expected CborDecode");
+    };
+    assert!(
+        msg.contains("invalid Credential Staking tag"),
+        "unexpected error: {msg}"
+    );
+}
+
+#[test]
+fn test_decode_mempack_txout_tag2_truncated_stake_cred() {
+    // tag(2) outer + only 10 bytes — fails the 29-byte stake cred check.
+    let bytes = vec![0x02u8; 10];
+    let err = decode_mempack_txout(&bytes).unwrap_err();
+    assert!(matches!(err, SerializationError::CborDecode(_)));
+}
+
+#[test]
+fn test_decode_mempack_txout_tag2_truncated_addr28extra() {
+    // tag(2) + 29 byte cred + 16 bytes (not 32) of addr28extra.
+    let mut bytes = vec![0x02, 0x01]; // tag + KeyHash
+    bytes.extend_from_slice(&[0u8; 28]);
+    bytes.extend_from_slice(&[0u8; 16]); // truncated Addr28Extra
+    let err = decode_mempack_txout(&bytes).unwrap_err();
+    assert!(matches!(err, SerializationError::CborDecode(_)));
+}
+
+#[test]
+fn test_decode_mempack_txout_tag2_unexpected_compactcoin_inner_tag() {
+    // tag(2) + cred + addr28extra valid + inner tag != 0.
+    let mut bytes = vec![0x02, 0x01];
+    bytes.extend_from_slice(&[0u8; 28]);
+    bytes.extend_from_slice(&[0u8; 32]);
+    bytes.push(0x07); // wrong inner tag (must be 0)
+    bytes.push(0x00);
+    let err = decode_mempack_txout(&bytes).unwrap_err();
+    let SerializationError::CborDecode(msg) = err else {
+        panic!("expected CborDecode");
+    };
+    assert!(
+        msg.contains("unexpected CompactCoin inner tag"),
+        "got: {msg}"
+    );
+}
+
+#[test]
+fn test_decode_mempack_txout_tag3_truncated_datum_hash() {
+    // Build a valid tag-3 prefix but only include 10 bytes of DataHash32.
+    let mut bytes = vec![0x03, 0x01];
+    bytes.extend_from_slice(&[0u8; 28]);
+    bytes.extend_from_slice(&[0u8; 32]);
+    bytes.push(0x00); // CompactCoin inner tag
+    bytes.push(0x00); // VarLen = 0
+    bytes.extend_from_slice(&[0u8; 10]); // truncated DataHash32 (need 32)
+    let err = decode_mempack_txout(&bytes).unwrap_err();
+    assert!(matches!(err, SerializationError::CborDecode(_)));
+}
+
+#[test]
+fn test_decode_mempack_txout_tag4_no_value_data() {
+    // tag(4) + addr only, no value byte.
+    let val = vec![
+        4u8, 29, /* 29 addr bytes */ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+        0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    ];
+    // addr is 29 bytes, but we need 30 total (tag + len byte + 29 addr) + value...
+    // The slice above is 31 bytes, which is exactly tag + len + 29 addr. No value byte.
+    let err = decode_mempack_txout(&val).unwrap_err();
+    let SerializationError::CborDecode(msg) = err else {
+        panic!("expected CborDecode");
+    };
+    assert!(msg.contains("tag 4: no value data"), "got: {msg}");
+}
+
+#[test]
+fn test_decode_mempack_txout_tag4_multi_asset() {
+    // tag(4) + addr(29 bytes) + value_tag=1 (multi-asset) + coin + opaque tail
+    let mut val = vec![4, 29];
+    val.extend_from_slice(&[0x70u8; 29]);
+    val.push(1); // value tag = 1 (multi-asset)
+    val.push(0x00); // VarLen coin = 0
+    val.extend_from_slice(&[0xAA, 0xBB, 0xCC]); // some opaque trailing bytes
+    let (txout, consumed) = decode_mempack_txout(&val).unwrap();
+    assert_eq!(consumed, val.len());
+    assert_eq!(txout.tag, 4);
+    assert!(txout.multi_asset.is_some());
+    assert!(txout.datum.is_none());
+}
+
+#[test]
+fn test_decode_mempack_txout_tag5_no_value_data() {
+    let val = vec![
+        5u8, 29, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+        0, 0,
+    ];
+    let err = decode_mempack_txout(&val).unwrap_err();
+    let SerializationError::CborDecode(msg) = err else {
+        panic!("expected CborDecode");
+    };
+    assert!(msg.contains("tag 5: no value data"), "got: {msg}");
+}
+
+#[test]
+fn test_decode_mempack_txout_tag5_ada_only_with_opaque_tail() {
+    let mut val = vec![5, 29];
+    val.extend_from_slice(&[0x70u8; 29]);
+    val.push(0); // ADA-only value tag
+    val.push(0x00); // VarLen coin = 0
+    val.extend_from_slice(&[0xDE, 0xAD]); // opaque datum + script bytes
+    let (txout, consumed) = decode_mempack_txout(&val).unwrap();
+    assert_eq!(consumed, val.len());
+    assert_eq!(txout.tag, 5);
+    assert_eq!(txout.opaque_tail.as_deref(), Some(&[0xDE, 0xAD][..]));
+}
+
+#[test]
+fn test_decode_mempack_txout_tag5_multi_asset() {
+    let mut val = vec![5, 29];
+    val.extend_from_slice(&[0x70u8; 29]);
+    val.push(1); // multi-asset value tag
+    val.push(0x00); // VarLen coin
+    val.extend_from_slice(&[0xCA, 0xFE]);
+    let (txout, consumed) = decode_mempack_txout(&val).unwrap();
+    assert_eq!(consumed, val.len());
+    assert_eq!(txout.tag, 5);
+    assert!(txout.multi_asset.is_some());
+}
+
+// ── TvarIterator: definite-length map handling ────────────────────────────────
+
+#[test]
+fn test_tvar_iterator_definite_length_map_zero_entries() {
+    // array(1) + map(0) — definite-length empty map, no break byte.
+    let data = [0x81, 0xa0];
+    let iter = TvarIterator::new(&data).unwrap();
+    let entries: Vec<_> = iter.collect();
+    assert!(entries.is_empty());
+}
+
+#[test]
+fn test_tvar_iterator_wrong_outer_array_length() {
+    // array(2) instead of array(1).
+    let data = [0x82, 0xbf, 0xff];
+    assert!(TvarIterator::new(&data).is_err());
+}
+
+#[test]
+fn test_tvar_iterator_inner_not_a_map() {
+    // array(1) + uint(0) — not a map.
+    let data = [0x81, 0x00];
+    assert!(TvarIterator::new(&data).is_err());
+}
+
+#[test]
+fn test_tvar_iterator_truncated_before_map_header() {
+    // array(1) and nothing else.
+    let data = [0x81];
+    assert!(TvarIterator::new(&data).is_err());
+}
+
+// ── MemPackTxIn error paths ───────────────────────────────────────────────────
+
+#[test]
+fn test_decode_mempack_txin_short_length_returns_invalid_length_error() {
+    let err = decode_mempack_txin(&[0u8; 10]).unwrap_err();
+    match err {
+        SerializationError::InvalidLength { expected, got } => {
+            assert_eq!(expected, 34);
+            assert_eq!(got, 10);
+        }
+        other => panic!("expected InvalidLength, got {other:?}"),
+    }
+}
+
+// Re-import for the SerializationError type used above.
+use crate::error::SerializationError;
