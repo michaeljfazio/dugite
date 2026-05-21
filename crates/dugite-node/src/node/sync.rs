@@ -2740,6 +2740,145 @@ fn from_codec_point(p: &CodecPoint) -> Point {
     }
 }
 
+/// Inputs to `build_known_points`.
+///
+/// This struct exists as a seam between the live `chainsync_client_task` and
+/// the pure point-construction logic so the latter can be unit/property-tested
+/// without spinning up a ChainDB / LedgerState.
+#[derive(Debug, Clone)]
+pub(crate) struct KnownPointsInputs {
+    /// Current ledger tip (`Point::Origin` if no blocks applied).
+    pub(crate) ledger_tip: Point,
+    /// Most-recent canonical points from the VolatileDB (oldest at the end of
+    /// the slice is fine — relative order is preserved, duplicates dropped).
+    /// Typically `ChainDB::get_chain_points(N)`.
+    pub(crate) volatile_chain_points: Vec<Point>,
+    /// ImmutableDB tip — the finalized anchor that *every* peer on the network
+    /// is expected to know. Issue #552: must be unconditionally included so a
+    /// peer that is behind our ledger tip but ahead of our immutable tip can
+    /// still find an intersection.
+    pub(crate) immutable_tip: Option<Point>,
+    /// Sparse historical anchor points sampled from older ImmutableDB chunks
+    /// (typically one per chunk). Provides ancestor coverage for peers that
+    /// have rolled back past our immutable tip or are on a deep fork.
+    pub(crate) deep_historical: Vec<Point>,
+    /// Set when the VolatileDB blocks above the ledger tip do not connect to
+    /// the ledger tip (e.g. orphan fork blocks left over by a flushed fork
+    /// snapshot). In that mode we must *not* offer volatile points — only the
+    /// canonical ImmutableDB anchors are safe.
+    pub(crate) chain_diverged: bool,
+}
+
+impl Default for KnownPointsInputs {
+    fn default() -> Self {
+        Self {
+            ledger_tip: Point::Origin,
+            volatile_chain_points: Vec::new(),
+            immutable_tip: None,
+            deep_historical: Vec::new(),
+            chain_diverged: false,
+        }
+    }
+}
+
+/// Build the ChainSync `known_points` list offered to a peer in
+/// `MsgFindIntersect`.
+///
+/// # Order (newest → oldest)
+///
+/// 1. **ImmutableDB tip** — always included when non-Origin. This is the
+///    single most important anchor: a finalized point that every peer on the
+///    correct network is guaranteed to know. Mirrors Haskell ouroboros-consensus
+///    `chainSyncClientPipelined`, which anchors candidate fragments at the
+///    LedgerDB immutable tip.
+/// 2. **Ledger tip** — current applied tip (if non-Origin and not already
+///    covered by the immutable tip).
+/// 3. **Volatile recent points** — last `~k/2` blocks of the selected chain
+///    (skipped when `chain_diverged` to avoid offering orphan fork blocks).
+/// 4. **Deep historical anchors** — one point per older ImmutableDB chunk,
+///    giving exponential-ish coverage back to genesis. Lets a peer recover
+///    from forks deeper than our volatile window.
+/// 5. **Origin** — final fallback.
+///
+/// # Issue #552
+///
+/// Before this refactor, the "ledger leads" branch (the common case at a
+/// stable tip) offered `ledger_tip + last 10 volatile points` only. When a
+/// peer's chain was strictly behind our ledger tip, none of those points
+/// matched the peer's chain prefix and the intersection landed at Origin,
+/// after which the node never re-intersected — visible as "tip-age growing"
+/// while no headers arrived. The fix is to *always* include the immutable
+/// tip + sparse deep history in the known_points list, regardless of branch.
+///
+/// # Determinism & uniqueness
+///
+/// - Duplicates are dropped (first-occurrence wins).
+/// - `Point::Origin` is filtered out everywhere except the explicit final
+///   fallback (so it always appears exactly once at the end).
+/// - Empty chain (everything Origin / empty) yields `[Origin]`.
+///
+/// # Output bound
+///
+/// Capped at `MAX_KNOWN_POINTS` to keep `MsgFindIntersect` under the Haskell
+/// peer's payload limit. Inputs beyond the cap are silently truncated; the
+/// caller is expected to size `volatile_chain_points` / `deep_historical`
+/// sensibly (typical: 10 + 8).
+pub(crate) fn build_known_points(inp: &KnownPointsInputs) -> Vec<Point> {
+    let mut out: Vec<Point> = Vec::with_capacity(MAX_KNOWN_POINTS);
+
+    let push_unique = |out: &mut Vec<Point>, p: Point| {
+        if p == Point::Origin {
+            return;
+        }
+        if out.len() >= MAX_KNOWN_POINTS - 1 {
+            // Reserve one slot for the final Origin entry.
+            return;
+        }
+        if !out.contains(&p) {
+            out.push(p);
+        }
+    };
+
+    // 1. ImmutableDB tip — unconditional, ALWAYS first. (Issue #552 fix.)
+    if let Some(imm) = inp.immutable_tip.clone() {
+        push_unique(&mut out, imm);
+    }
+
+    // 2. Ledger tip — usually equal to or above immutable tip; include unless
+    //    we have a divergent volatile chain (in which case the ledger tip is
+    //    still canonical — just don't trust the surrounding volatile blocks).
+    push_unique(&mut out, inp.ledger_tip.clone());
+
+    // 3. Volatile recent points — skipped when chain_diverged.
+    if !inp.chain_diverged {
+        for p in &inp.volatile_chain_points {
+            push_unique(&mut out, p.clone());
+        }
+    }
+
+    // 4. Deep historical anchors from older ImmutableDB chunks.
+    for p in &inp.deep_historical {
+        push_unique(&mut out, p.clone());
+    }
+
+    // 5. Final fallback — Origin always closes the list.
+    out.push(Point::Origin);
+    out
+}
+
+/// Upper bound on the number of points sent in a single `MsgFindIntersect`.
+/// Haskell ouroboros-network accepts up to ~32 points in the request payload;
+/// we cap conservatively below that.
+pub(crate) const MAX_KNOWN_POINTS: usize = 24;
+
+/// Default count of recent VolatileDB points requested for the known_points
+/// list (passed to `ChainDB::get_chain_points`).
+pub(crate) const VOLATILE_POINTS_DEPTH: usize = 10;
+
+/// Default count of deep historical anchors requested from older ImmutableDB
+/// chunks (passed to `ChainDB::get_immutable_historical_points`).
+pub(crate) const DEEP_HISTORICAL_DEPTH: usize = 8;
+
 /// Drop pending headers whose block is already stored in the local ChainDB.
 ///
 /// Use **hash equality** rather than slot comparison: after a peer issues
@@ -2891,11 +3030,18 @@ pub async fn chainsync_client_task(
     // a common chain prefix, which is critical for recovery after forging
     // (our local tip may be a freshly-forged block the peer hasn't seen).
 
-    let (chain_tip, chain_points) = {
+    // Snapshot the storage layer in one read-lock acquisition.
+    let (chain_tip, volatile_chain_points, immutable_tip, deep_historical) = {
         let db = chain_db.read().await;
         let tip = db.get_tip().point;
-        let points = db.get_chain_points(10);
-        (tip, points)
+        let recent = db.get_chain_points(VOLATILE_POINTS_DEPTH);
+        let imm = db.get_immutable_tip_point();
+        let deep: Vec<Point> = db
+            .get_immutable_historical_points(DEEP_HISTORICAL_DEPTH)
+            .into_iter()
+            .map(|(slot, hash)| Point::Specific(dugite_primitives::time::SlotNo(slot), hash))
+            .collect();
+        (tip, recent, imm, deep)
     };
 
     let ledger_tip = ledger_state.read().await.tip.point.clone();
@@ -2906,7 +3052,6 @@ pub async fn chainsync_client_task(
     // ChainDB actually connect. If not, the ImmutableDB (or volatile)
     // contains orphan fork blocks — we must exclude them from the
     // intersection offer.
-    let mut use_chain_tip = chain_slot > ledger_slot;
     let mut chain_diverged = false;
     if chain_slot >= ledger_slot && ledger_tip != Point::Origin {
         let db = chain_db.read().await;
@@ -2924,87 +3069,32 @@ pub async fn chainsync_client_task(
                     warn!(
                         %peer_addr,
                         "ChainDB fork divergence detected: blocks after ledger tip \
-                         do not connect. Using ledger tip only for intersection.",
+                         do not connect. Skipping volatile points in intersection.",
                     );
-                    use_chain_tip = false;
                     chain_diverged = true;
                 }
             }
         }
     }
 
-    // Build the known_points list, including chain history for robustness.
-    let mut known_points = Vec::new();
-    if use_chain_tip {
-        // ChainDB leads: include all chain ancestry points first.
-        for p in &chain_points {
-            if *p != Point::Origin && !known_points.contains(p) {
-                known_points.push(p.clone());
-            }
-        }
-        // Include ledger tip if it wasn't already covered by chain walk.
-        if ledger_tip != Point::Origin && !known_points.contains(&ledger_tip) {
-            known_points.push(ledger_tip.clone());
-        }
-    } else if chain_diverged {
-        // ChainDB volatile blocks do not connect to the ledger tip (fork
-        // divergence).  We must offer only *canonical* intersection points
-        // from the ImmutableDB.  The ImmutableDB tip is the single most
-        // important candidate: it is finalized, on the canonical chain, and
-        // guaranteed to be known by all peers.
-        //
-        // Haskell behaviour after startup with an empty VolatileDB: the node
-        // offers exactly [ImmutableDB tip] as the intersection candidate,
-        // since that is the LedgerDB anchor point.
-        //
-        // Without this fix, the code sent only 8 deep-historical sparse points
-        // (e.g. slot 107857439) instead of the ImmutableDB tip (107957082),
-        // causing a 97K-slot / ~4980-block rollback on every restart after a
-        // fork snapshot.
-        let db = chain_db.read().await;
-
-        // 1. ImmutableDB tip — always offered first (canonical, finalized anchor).
-        if let Some(imm_tip) = db.get_immutable_tip_point() {
-            if imm_tip != Point::Origin && !known_points.contains(&imm_tip) {
-                known_points.push(imm_tip);
-            }
-        }
-
-        // 2. Deep historical sparse points from older ImmutableDB chunks
-        //    (fallback for peers that have rolled back past the current imm tip).
-        for (slot, hash) in db.get_immutable_historical_points(8) {
-            let p = Point::Specific(dugite_primitives::time::SlotNo(slot), hash);
-            if !known_points.contains(&p) {
-                known_points.push(p);
-            }
-        }
-
-        // 3. If no ImmutableDB points found at all, fall back to ledger tip
-        //    (last-chance candidate; peer will reject if it is on a fork, which
-        //    is harmless — we'll fall back to Origin and resync from genesis).
-        if known_points.is_empty() && ledger_tip != Point::Origin {
-            known_points.push(ledger_tip.clone());
-        }
-    } else {
-        // Ledger leads or tips are equal: offer ledger tip first, then
-        // chain ancestry.
-        if ledger_tip != Point::Origin {
-            known_points.push(ledger_tip.clone());
-        }
-        for p in &chain_points {
-            if *p != Point::Origin && !known_points.contains(p) {
-                known_points.push(p.clone());
-            }
-        }
-    }
-    known_points.push(Point::Origin);
+    // Build the known_points list via the pure helper (Issue #552):
+    // always anchor on the ImmutableDB tip + deep historical samples so that a
+    // peer behind our ledger tip but ahead of our immutable tip can still find
+    // an intersection without us having to disconnect and retry.
+    let known_points = build_known_points(&KnownPointsInputs {
+        ledger_tip: ledger_tip.clone(),
+        volatile_chain_points,
+        immutable_tip,
+        deep_historical,
+        chain_diverged,
+    });
 
     info!(
         %peer_addr,
         chain_tip = %chain_tip,
         ledger_tip = %ledger_tip,
         known_points_count = known_points.len(),
-        use_chain_tip,
+        chain_diverged,
         "ChainSync intersection candidates",
     );
     for (i, p) in known_points.iter().enumerate() {
@@ -3151,6 +3241,12 @@ pub async fn chainsync_client_task(
     // killed the relay→dbp chainsync session at second 1 of every soak,
     // and the peer manager had no path to re-promote (inbound connection
     // already up), causing permanent divergence (Bug E).
+    //
+    // Issue #552 (2026-05-20): the structural fix is in `build_known_points`,
+    // which now unconditionally offers the ImmutableDB tip + deep historical
+    // anchors. This block is retained as defense-in-depth — it still fires
+    // for genuine fork-divergence cases where the peer's chain has *no*
+    // overlap with any of our offered points and our local chain is past k.
     //
     // See: docs/superpowers/specs/2026-05-16-bug-a-stale-intersection-fix.md
     if matches!(intersection, Some(CodecPoint::Origin)) && ledger_tip != Point::Origin {
@@ -4135,6 +4231,461 @@ mod chainsync_task_tests {
     #[test]
     fn test_k_rollback_mainnet_within_limit() {
         assert!(!rollback_exceeds_k_limit(10_000, 6_001, 2160));
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // Issue #552: known_points construction for ChainSync MsgFindIntersect
+    // ─────────────────────────────────────────────────────────────────────────
+
+    use dugite_primitives::hash::Hash32 as TestHash32;
+    use dugite_primitives::time::SlotNo as TestSlotNo;
+
+    /// Helper: build a `Point::Specific` from a slot number and a single-byte
+    /// hash seed (rest zero).
+    fn pt(slot: u64, seed: u8) -> Point {
+        let mut bytes = [0u8; 32];
+        bytes[31] = seed;
+        Point::Specific(TestSlotNo(slot), TestHash32::from_bytes(bytes))
+    }
+
+    /// Empty chain (everything Origin / empty) yields exactly `[Origin]`.
+    #[test]
+    fn known_points_empty_chain() {
+        let pts = build_known_points(&KnownPointsInputs::default());
+        assert_eq!(pts, vec![Point::Origin]);
+    }
+
+    /// Only the ImmutableDB tip is known (no volatile, no ledger): list is
+    /// `[imm_tip, Origin]`.  This is the "fresh after Mithril import" case.
+    #[test]
+    fn known_points_only_immutable_tip() {
+        let imm = pt(100, 1);
+        let pts = build_known_points(&KnownPointsInputs {
+            immutable_tip: Some(imm.clone()),
+            ..Default::default()
+        });
+        assert_eq!(pts, vec![imm, Point::Origin]);
+    }
+
+    /// Immutable tip + ledger tip both present and distinct: both appear,
+    /// immutable tip first.
+    #[test]
+    fn known_points_immutable_and_ledger_tip_distinct() {
+        let imm = pt(100, 1);
+        let ledger = pt(200, 2);
+        let pts = build_known_points(&KnownPointsInputs {
+            ledger_tip: ledger.clone(),
+            immutable_tip: Some(imm.clone()),
+            ..Default::default()
+        });
+        assert_eq!(pts, vec![imm, ledger, Point::Origin]);
+    }
+
+    /// When the immutable tip equals the ledger tip (no volatile blocks
+    /// above the immutable anchor — common when the volatile DB is empty),
+    /// the duplicate is collapsed.
+    #[test]
+    fn known_points_immutable_equals_ledger_tip() {
+        let p = pt(100, 1);
+        let pts = build_known_points(&KnownPointsInputs {
+            ledger_tip: p.clone(),
+            immutable_tip: Some(p.clone()),
+            ..Default::default()
+        });
+        assert_eq!(pts, vec![p, Point::Origin]);
+    }
+
+    /// Deep chain: immutable tip + ledger tip + several volatile points +
+    /// deep historical anchors all appear in order, no duplicates, Origin
+    /// last.  This is the steady-state case that issue #552 is about.
+    #[test]
+    fn known_points_deep_chain() {
+        let imm = pt(1000, 10);
+        let v0 = pt(1100, 11);
+        let v1 = pt(1050, 12);
+        let v2 = pt(1010, 13);
+        let ledger = v0.clone();
+        let deep0 = pt(900, 20);
+        let deep1 = pt(800, 21);
+
+        let pts = build_known_points(&KnownPointsInputs {
+            ledger_tip: ledger.clone(),
+            volatile_chain_points: vec![v0.clone(), v1.clone(), v2.clone()],
+            immutable_tip: Some(imm.clone()),
+            deep_historical: vec![deep0.clone(), deep1.clone()],
+            chain_diverged: false,
+        });
+
+        // Expected: [imm, ledger(=v0), v1, v2, deep0, deep1, Origin].
+        assert_eq!(pts, vec![imm, ledger, v1, v2, deep0, deep1, Point::Origin]);
+    }
+
+    /// Acceptance condition for issue #552: when the local ledger is well
+    /// past origin and the immutable tip is non-Origin, the immutable tip
+    /// MUST appear in the known_points list.  Without this, a peer behind
+    /// our ledger tip but ahead of our immutable tip cannot intersect.
+    #[test]
+    fn known_points_issue_552_always_includes_immutable_tip() {
+        // Volatile points clustered near ledger tip (slot 2000).
+        let imm = pt(1000, 1);
+        let volatile: Vec<Point> = (0..10).map(|i| pt(1990 + i as u64, 100 + i)).collect();
+        let pts = build_known_points(&KnownPointsInputs {
+            ledger_tip: pt(2000, 200),
+            volatile_chain_points: volatile,
+            immutable_tip: Some(imm.clone()),
+            deep_historical: vec![],
+            chain_diverged: false,
+        });
+
+        assert!(
+            pts.contains(&imm),
+            "issue #552: immutable tip must be in known_points: {pts:?}"
+        );
+        assert_eq!(*pts.last().unwrap(), Point::Origin);
+    }
+
+    /// `chain_diverged = true`: volatile points must be excluded but the
+    /// immutable tip and deep historical anchors must still be offered.
+    #[test]
+    fn known_points_chain_diverged_skips_volatile() {
+        let imm = pt(1000, 1);
+        let v_orphan = pt(1100, 99);
+        let deep = pt(800, 20);
+        let pts = build_known_points(&KnownPointsInputs {
+            ledger_tip: pt(950, 10),
+            volatile_chain_points: vec![v_orphan.clone()],
+            immutable_tip: Some(imm.clone()),
+            deep_historical: vec![deep.clone()],
+            chain_diverged: true,
+        });
+
+        assert!(pts.contains(&imm));
+        assert!(pts.contains(&deep));
+        assert!(
+            !pts.contains(&v_orphan),
+            "diverged volatile blocks must NOT be offered as intersection candidates: {pts:?}"
+        );
+        assert_eq!(*pts.last().unwrap(), Point::Origin);
+    }
+
+    /// Duplicates across inputs are dropped (first occurrence wins).
+    #[test]
+    fn known_points_drops_duplicates() {
+        let p1 = pt(100, 1);
+        let p2 = pt(200, 2);
+        let pts = build_known_points(&KnownPointsInputs {
+            ledger_tip: p2.clone(),
+            volatile_chain_points: vec![p1.clone(), p2.clone(), p1.clone()],
+            immutable_tip: Some(p1.clone()),
+            deep_historical: vec![p1.clone(), p2.clone()],
+            chain_diverged: false,
+        });
+
+        // Each non-Origin point appears at most once.
+        let p1_count = pts.iter().filter(|p| **p == p1).count();
+        let p2_count = pts.iter().filter(|p| **p == p2).count();
+        assert_eq!(p1_count, 1, "p1 deduped: {pts:?}");
+        assert_eq!(p2_count, 1, "p2 deduped: {pts:?}");
+        // Origin appears exactly once at the end.
+        assert_eq!(
+            pts.iter().filter(|p| **p == Point::Origin).count(),
+            1,
+            "Origin appears exactly once: {pts:?}"
+        );
+        assert_eq!(*pts.last().unwrap(), Point::Origin);
+    }
+
+    /// `Point::Origin` passed in any of the input fields is filtered out (we
+    /// don't want to offer Origin twice).
+    #[test]
+    fn known_points_filters_explicit_origin_inputs() {
+        let p = pt(100, 1);
+        let pts = build_known_points(&KnownPointsInputs {
+            ledger_tip: Point::Origin,
+            volatile_chain_points: vec![Point::Origin, p.clone(), Point::Origin],
+            immutable_tip: Some(Point::Origin),
+            deep_historical: vec![Point::Origin],
+            chain_diverged: false,
+        });
+        // Only `p` and the final Origin should remain.
+        assert_eq!(pts, vec![p, Point::Origin]);
+    }
+
+    /// The point list is bounded — pathologically large inputs are
+    /// truncated to `MAX_KNOWN_POINTS` (last slot reserved for Origin).
+    #[test]
+    fn known_points_bounded_by_max_known_points() {
+        // Build many distinct points.
+        let huge: Vec<Point> = (0..200u64).map(|i| pt(i, (i % 250) as u8 + 1)).collect();
+        let pts = build_known_points(&KnownPointsInputs {
+            ledger_tip: pt(999, 250),
+            volatile_chain_points: huge,
+            immutable_tip: Some(pt(500, 251)),
+            deep_historical: vec![],
+            chain_diverged: false,
+        });
+        assert!(
+            pts.len() <= MAX_KNOWN_POINTS,
+            "expected <= {} points, got {}: {:?}",
+            MAX_KNOWN_POINTS,
+            pts.len(),
+            pts
+        );
+        assert_eq!(*pts.last().unwrap(), Point::Origin);
+    }
+
+    /// Integration test for issue #552 acceptance criterion: build a real
+    /// `ChainDB` whose state mirrors "synced to current preview tip" — many
+    /// volatile blocks above an immutable anchor — and verify that the
+    /// known_points list we would offer in `MsgFindIntersect` includes the
+    /// ImmutableDB tip.
+    ///
+    /// Before the fix, the "ledger leads" branch built `[ledger_tip,
+    /// last 10 volatile points, Origin]`, omitting the immutable tip.  A peer
+    /// whose chain was behind us by more than ~10 volatile blocks would have
+    /// zero overlap with that list and the intersection would collapse to
+    /// Origin.  After the fix, the immutable tip is *always* included.
+    #[test]
+    fn known_points_integration_peer_behind_local_tip() {
+        use dugite_primitives::hash::Hash32 as PH;
+        use dugite_primitives::time::{BlockNo, SlotNo};
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut chain_db = dugite_storage::ChainDB::open(dir.path()).unwrap();
+
+        // Helper for generating distinct test block hashes.
+        let make_hash = |seed: u8| {
+            let mut bytes = [0u8; 32];
+            bytes[31] = seed;
+            PH::from_bytes(bytes)
+        };
+
+        // Stage 1: lay down an immutable anchor at slot 100 (block 1).
+        let imm_hash = make_hash(1);
+        chain_db
+            .put_blocks_batch(&[(SlotNo(100), &imm_hash, BlockNo(1), b"imm".as_ref(), false)])
+            .unwrap();
+
+        // Stage 2: extend with 15 volatile blocks (slots 200..3200, blocks
+        // 2..16) — peer is behind us, so none of these will match its chain.
+        let mut prev = imm_hash;
+        for i in 0..15u8 {
+            let h = make_hash(10 + i);
+            let slot = SlotNo(200 + (i as u64) * 200);
+            chain_db
+                .add_block(h, slot, BlockNo(2 + i as u64), prev, vec![i])
+                .unwrap();
+            prev = h;
+        }
+        let ledger_tip_hash = prev;
+        let ledger_tip = Point::Specific(SlotNo(200 + 14 * 200), ledger_tip_hash);
+
+        // Snapshot the same fields chainsync_client_task uses.
+        let volatile_chain_points = chain_db.get_chain_points(VOLATILE_POINTS_DEPTH);
+        let immutable_tip = chain_db.get_immutable_tip_point();
+        assert!(
+            immutable_tip.is_some(),
+            "test setup: ChainDB should have an immutable tip"
+        );
+
+        let deep_historical: Vec<Point> = chain_db
+            .get_immutable_historical_points(DEEP_HISTORICAL_DEPTH)
+            .into_iter()
+            .map(|(slot, h)| Point::Specific(SlotNo(slot), h))
+            .collect();
+
+        let pts = build_known_points(&KnownPointsInputs {
+            ledger_tip: ledger_tip.clone(),
+            volatile_chain_points,
+            immutable_tip: immutable_tip.clone(),
+            deep_historical,
+            chain_diverged: false,
+        });
+
+        // ─── Issue #552 acceptance: immutable tip MUST be present. ────────
+        let imm_pt = immutable_tip.unwrap();
+        assert!(
+            pts.contains(&imm_pt),
+            "issue #552: immutable tip {imm_pt:?} must be offered in known_points: {pts:?}"
+        );
+
+        // ─── Defense-in-depth checks for the rest of the list shape. ──────
+        // Ledger tip is offered (any peer at our tip can intersect).
+        assert!(
+            pts.contains(&ledger_tip),
+            "ledger tip {ledger_tip:?} must be offered: {pts:?}"
+        );
+        // Origin is the final fallback (so even a peer with no overlap can
+        // sync from genesis).
+        assert_eq!(*pts.last().unwrap(), Point::Origin);
+        // Bounded length (sanity).
+        assert!(pts.len() <= MAX_KNOWN_POINTS);
+
+        // ─── Simulate "peer is k blocks behind us": construct a candidate
+        //     point that matches the immutable anchor (which the peer DOES
+        //     know about) and verify the peer's MsgIntersectFound would
+        //     succeed against our offered list.
+        // This is the actual recovery path: peer's MsgFindIntersect response
+        // anchors at our immutable tip, RollForward stream resumes from
+        // there, tip-age stops growing.
+        let peer_known_hashes: std::collections::HashSet<&PH> =
+            std::iter::once(&imm_hash).collect();
+        let intersection: Option<&Point> = pts
+            .iter()
+            .find(|p| p.hash().is_some_and(|h| peer_known_hashes.contains(h)));
+        assert!(
+            intersection.is_some(),
+            "peer behind us (only knows immutable anchor) must find intersection \
+             in our offered list: {pts:?}"
+        );
+        assert_eq!(intersection.unwrap(), &imm_pt);
+    }
+
+    /// Ordering: immutable tip is always the FIRST non-Origin point when
+    /// non-Origin.  This matches Haskell's `chainSyncClientPipelined` anchor
+    /// preference (LedgerDB anchor first).
+    #[test]
+    fn known_points_immutable_tip_is_first() {
+        let imm = pt(1000, 10);
+        let pts = build_known_points(&KnownPointsInputs {
+            ledger_tip: pt(2000, 20),
+            volatile_chain_points: vec![pt(1990, 30), pt(1980, 31)],
+            immutable_tip: Some(imm.clone()),
+            deep_historical: vec![pt(900, 40)],
+            chain_diverged: false,
+        });
+        // First non-Origin entry should be the immutable tip.
+        assert_eq!(pts[0], imm, "imm tip must be first: {pts:?}");
+    }
+}
+
+// ─── proptest: known_points construction invariants (Issue #552) ─────────────
+
+#[cfg(test)]
+mod known_points_proptests {
+    use super::*;
+    use proptest::prelude::*;
+
+    fn arb_point() -> impl Strategy<Value = Point> {
+        prop_oneof![
+            Just(Point::Origin),
+            (1u64..1_000_000u64, any::<[u8; 32]>()).prop_map(|(s, h)| {
+                Point::Specific(
+                    dugite_primitives::time::SlotNo(s),
+                    dugite_primitives::hash::Hash32::from_bytes(h),
+                )
+            }),
+        ]
+    }
+
+    fn arb_opt_point() -> impl Strategy<Value = Option<Point>> {
+        prop_oneof![Just(None), arb_point().prop_map(Some),]
+    }
+
+    fn arb_inputs() -> impl Strategy<Value = KnownPointsInputs> {
+        (
+            arb_point(),
+            proptest::collection::vec(arb_point(), 0..20),
+            arb_opt_point(),
+            proptest::collection::vec(arb_point(), 0..20),
+            any::<bool>(),
+        )
+            .prop_map(
+                |(ledger_tip, volatile, immutable_tip, deep_historical, chain_diverged)| {
+                    KnownPointsInputs {
+                        ledger_tip,
+                        volatile_chain_points: volatile,
+                        immutable_tip,
+                        deep_historical,
+                        chain_diverged,
+                    }
+                },
+            )
+    }
+
+    proptest! {
+        /// Issue #552 invariant: if the immutable tip is non-Origin, the
+        /// known_points list MUST contain it (regardless of any other input
+        /// state — divergence, deep history, large volatile slates, etc.).
+        ///
+        /// This is the property that previously broke: when a peer was behind
+        /// our ledger tip, the constructed list omitted the immutable tip
+        /// and the intersection collapsed to Origin.
+        #[test]
+        fn prop_immutable_tip_always_present_when_non_origin(inp in arb_inputs()) {
+            let pts = build_known_points(&inp);
+            if let Some(ref imm) = inp.immutable_tip {
+                if *imm != Point::Origin {
+                    prop_assert!(
+                        pts.contains(imm),
+                        "immutable tip {imm:?} must be in known_points {pts:?}"
+                    );
+                }
+            }
+        }
+
+        /// The list always ends in `Point::Origin` (so the peer has a final
+        /// fallback to sync from genesis when nothing else matches).
+        #[test]
+        fn prop_origin_always_last(inp in arb_inputs()) {
+            let pts = build_known_points(&inp);
+            prop_assert!(!pts.is_empty());
+            prop_assert_eq!(pts.last().cloned(), Some(Point::Origin));
+        }
+
+        /// `Point::Origin` appears exactly once in the output (only as the
+        /// final fallback, never via any of the input slots).
+        #[test]
+        fn prop_origin_appears_exactly_once(inp in arb_inputs()) {
+            let pts = build_known_points(&inp);
+            let n = pts.iter().filter(|p| **p == Point::Origin).count();
+            prop_assert_eq!(n, 1);
+        }
+
+        /// No duplicates in the output list.
+        #[test]
+        fn prop_no_duplicates(inp in arb_inputs()) {
+            let pts = build_known_points(&inp);
+            let mut sorted = pts.clone();
+            sorted.sort();
+            sorted.dedup();
+            prop_assert_eq!(sorted.len(), pts.len(), "duplicates: {:?}", pts);
+        }
+
+        /// Length bound: never exceeds `MAX_KNOWN_POINTS`.
+        #[test]
+        fn prop_bounded_length(inp in arb_inputs()) {
+            let pts = build_known_points(&inp);
+            prop_assert!(pts.len() <= MAX_KNOWN_POINTS);
+        }
+
+        /// When `chain_diverged = true`, no volatile point appears in the
+        /// output (volatile blocks may be orphan fork blocks; we MUST NOT
+        /// offer them as intersection candidates).
+        #[test]
+        fn prop_diverged_excludes_volatile(inp in arb_inputs()) {
+            if !inp.chain_diverged {
+                return Ok(());
+            }
+            let pts = build_known_points(&inp);
+            for v in &inp.volatile_chain_points {
+                if *v == Point::Origin {
+                    continue;
+                }
+                // The same point COULD also be the ledger/immutable tip; in
+                // that case its presence is fine.  Only flag if it's *only*
+                // present as a volatile point.
+                let elsewhere = inp.immutable_tip.as_ref() == Some(v)
+                    || inp.ledger_tip == *v
+                    || inp.deep_historical.contains(v);
+                if !elsewhere {
+                    prop_assert!(
+                        !pts.contains(v),
+                        "diverged volatile point {v:?} leaked into output {pts:?}"
+                    );
+                }
+            }
+        }
     }
 }
 
