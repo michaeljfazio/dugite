@@ -613,6 +613,63 @@ pub fn decode_byron_ebb_block(
 }
 
 // ============================================================================
+// Standalone tx decoder (Byron era)
+// ============================================================================
+
+/// Decode a standalone Byron transaction from raw CBOR bytes.
+///
+/// The pallas standalone Byron tx format is `tag(30, bstr(cbor([tx, witnesses])))`.
+/// The outer tag(30) is the CBSE (CBOR Simple Encoding) wrapper. The inner CBOR is a
+/// 2-element array `[tx_body, witnesses]` where `tx_body = [inputs, outputs, attributes]`.
+///
+/// The transaction hash is `blake2b_256(raw_tx_cbor)` — over the Tx struct bytes only,
+/// not the full TxPayload.
+pub(crate) fn decode_byron_tx_standalone(cbor: &[u8]) -> Result<Transaction, SerializationError> {
+    let mut r = Reader::new(cbor);
+
+    // The Byron standalone format is tag(30, bstr(cbor([tx, witnesses]))).
+    // Read the tag (expect 30).
+    let tag = r
+        .read_tag()
+        .map_err(|e| SerializationError::CborDecode(format!("byron tx: {e}")))?;
+    if tag != 30 {
+        return Err(SerializationError::CborDecode(format!(
+            "byron tx: expected tag(30), got tag({tag})"
+        )));
+    }
+
+    // Read the embedded bytes.
+    let inner_bytes: Vec<u8> = r
+        .read_bytes()
+        .map_err(|e| SerializationError::CborDecode(format!("byron tx bstr: {e}")))?
+        .to_vec();
+
+    // Decode the inner [tx, witnesses] 2-element array.
+    let mut inner_r = Reader::new(&inner_bytes);
+    let payload_arr = inner_r.read_array_header()?;
+    match payload_arr {
+        Some(2) => {}
+        _ => {
+            return Err(SerializationError::CborDecode(format!(
+                "byron tx payload: expected array(2), got {payload_arr:?}"
+            )));
+        }
+    }
+
+    // tx: capture raw bytes (this is the KeepRaw<Tx> in pallas)
+    let tx_start = inner_r.position();
+    inner_r.skip()?;
+    let raw_tx = inner_r.slice_from(tx_start).to_vec();
+
+    // witnesses: skip (we don't use them for now)
+    let witness_start = inner_r.position();
+    inner_r.skip()?;
+    let raw_witness = inner_r.slice_from(witness_start).to_vec();
+
+    decode_byron_tx(&raw_tx, &raw_witness)
+}
+
+// ============================================================================
 // Tests
 // ============================================================================
 
