@@ -211,7 +211,7 @@ pub fn decode_block_envelope<'b>(
 ///
 /// - M4a: Byron (eras 0/1) and Shelley (era 2) are implemented in-house.
 /// - M4b: Allegra (era 3), Mary (era 4), Alonzo (era 5), Babbage (era 6) implemented.
-/// - M4c (Conway/Dijkstra): still delegate via `unimplemented!()`.
+/// - M4c: Conway (era 7) and Dijkstra (era 8) implemented.
 ///
 /// # Errors
 ///
