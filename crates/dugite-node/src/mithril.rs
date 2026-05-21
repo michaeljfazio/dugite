@@ -1773,6 +1773,17 @@ where
                 continue;
             }
         };
+        // Validate the probed boundary actually yields a decodable block
+        // before invoking the callback. Without this gate, every random
+        // byte sequence inside a block body that looks like a CBOR item
+        // (which is very common — tx CBOR has nested arrays/maps/strings)
+        // would call into the callback and log "decode failed" warnings.
+        // Sequential probing without a secondary index is inherently lossy;
+        // we only want to surface boundaries that are actually blocks.
+        if dugite_serialization::decode_block_minimal(&remaining[..item_size]).is_err() {
+            offset += 1;
+            continue;
+        }
         on_block(&remaining[..item_size])?;
         count += 1;
         offset += item_size;
