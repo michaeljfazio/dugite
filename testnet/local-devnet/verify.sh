@@ -127,7 +127,44 @@ p2_per_bp_attribution() {
         fi
     fi
 
-    if [ "$p1_forges" -ge 3 ] && [ "$p2_forges" -ge 3 ]; then
+    # Detect validator-only mode: since b6084633c, cardano-bp runs as a
+    # passive validator (no --shelley-{kes,vrf,operational-certificate}
+    # flags) and all stake is delegated to pool1. In that topology pool2
+    # cannot win a leader lottery and must have zero forges by design —
+    # demanding pool2 >= 3 would always fail. Detect by looking for the
+    # forging flags on cardano-bp's running command or its run.sh source.
+    local cardano_bp_pid="" cardano_bp_cmd=""
+    if [ -f "$LD_STATE/cardano-bp.pid" ]; then
+        cardano_bp_pid="$(cat "$LD_STATE/cardano-bp.pid" 2>/dev/null || true)"
+    fi
+    if [ -n "$cardano_bp_pid" ] && kill -0 "$cardano_bp_pid" 2>/dev/null; then
+        cardano_bp_cmd="$(ps -p "$cardano_bp_pid" -o command= 2>/dev/null || true)"
+    fi
+    local validator_only=0
+    if [ -n "$cardano_bp_cmd" ]; then
+        if ! echo "$cardano_bp_cmd" | grep -q -- '--shelley-kes-key'; then
+            validator_only=1
+        fi
+    else
+        # Process already gone (post-soak verify) — fall back to the run
+        # script source which is the canonical recipe for this devnet.
+        if ! grep -q -- '--shelley-kes-key' "$SCRIPT_DIR/run.sh" 2>/dev/null; then
+            validator_only=1
+        fi
+    fi
+
+    if [ "$validator_only" -eq 1 ]; then
+        if [ "$p1_forges" -ge 3 ] && [ "$p2_forges" -eq 0 ]; then
+            PREDICATE_PASS+=("p2:per-bp-attribution (validator-only: pool1=$p1_forges, pool2=0 as designed)")
+            {
+                printf 'mode\tvalidator-only\n'
+                printf 'pool1_forges\t%s\n' "$p1_forges"
+                printf 'pool2_forges\t%s\n' "$p2_forges"
+            } > "$(dirname "$blocks")/forge-attribution.tsv"
+        else
+            PREDICATE_FAIL+=("p2:per-bp-attribution (validator-only mode: pool1=$p1_forges need >=3, pool2=$p2_forges must be 0)")
+        fi
+    elif [ "$p1_forges" -ge 3 ] && [ "$p2_forges" -ge 3 ]; then
         PREDICATE_PASS+=("p2:per-bp-attribution (pool1=$p1_forges pool2=$p2_forges via observer)")
         {
             printf 'pool1_forges\t%s\n' "$p1_forges"
