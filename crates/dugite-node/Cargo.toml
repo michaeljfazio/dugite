@@ -52,7 +52,6 @@ indicatif = { workspace = true }
 futures-util = { workspace = true }
 pallas-addresses = { workspace = true }
 pallas-crypto = { workspace = true }
-pallas-traverse = { workspace = true }
 sha2 = { workspace = true }
 ed25519-dalek = { workspace = true }
 memmap2 = { workspace = true }

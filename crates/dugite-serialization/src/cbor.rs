@@ -1,7 +1,29 @@
 use crate::error::SerializationError;
 use dugite_primitives::block::Point;
 use dugite_primitives::hash::{Hash28, Hash32};
+use dugite_primitives::time::{BlockNo, SlotNo};
 use dugite_primitives::transaction::{PlutusData, TransactionInput, TransactionMetadatum};
+
+/// Extract `(slot, block_no, header_hash)` from a multi-era block CBOR.
+///
+/// Used by chunk-file import (Mithril) where callers only need to index a
+/// block by its header identity without paying for a full body decode. The
+/// returned triple is byte-equal to what a full decode would yield —
+/// importers can use it to populate their `(slot, hash) -> chunk_offset`
+/// indexes safely.
+///
+/// TODO(M4): once the in-house decoder lands, replace the internal
+/// `decode_block_minimal` call with a header-only CBOR walker (Shelley+:
+/// `blake2b_256(header_cbor)` over the first inner-array element; Byron:
+/// the Cardano-ledger `coerceHash` wrapper). The current implementation
+/// does a minimal body decode — correct, but heavier than needed for
+/// pure identity extraction.
+pub fn extract_block_identity(
+    cbor: &[u8],
+) -> Result<(SlotNo, BlockNo, Hash32), SerializationError> {
+    let block = crate::multi_era::decode_block_minimal(cbor)?;
+    Ok((block.slot(), block.block_number(), *block.hash()))
+}
 
 /// Encode a Hash32 to CBOR bytes
 pub fn encode_hash32(hash: &Hash32) -> Vec<u8> {
