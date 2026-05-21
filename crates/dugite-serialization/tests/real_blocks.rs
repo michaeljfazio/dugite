@@ -169,12 +169,16 @@ fn test_body_size_from_cbor_returns_none_for_invalid() {
     assert!(dugite_serialization::compute_block_body_size_from_cbor(&[0xff, 0xfe]).is_none());
 }
 
-// ── Dijkstra-shim tests (#466) ───────────────────────────────────────────────
+// ── Dijkstra native dispatch tests (M4c, #466) ──────────────────────────────
 //
-// Until pallas exposes Era::Dijkstra, dugite decodes Dijkstra blocks by
-// byte-patching the era tag 8 -> 7 in `decode_block_inner`. These tests
-// synthesize a Dijkstra-tagged block from the real Conway test vector to
-// exercise the shim end-to-end.
+// M4c added `era_conway.rs` which decodes Dijkstra (era tag 8) natively via
+// `decode_dijkstra_block` — a thin wrapper over the Conway decoder that stamps
+// `Era::Dijkstra` on the result.  The old pallas byte-rewrite shim (tag 8→7)
+// is kept only in the shadow `multi_era.rs` path for dual-decode comparison.
+//
+// These tests synthesize a Dijkstra-tagged block from the real Conway test
+// vector (same wire structure, different outer era byte) to exercise the
+// end-to-end dispatch path.
 
 /// Conway block CBOR with the outer era tag flipped from 7 to 8 so it looks
 /// like a Dijkstra block on the wire.
@@ -190,9 +194,11 @@ fn dijkstra_synthetic_from_conway() -> Vec<u8> {
 }
 
 #[test]
-fn test_decode_block_dijkstra_via_conway_shim() {
+fn test_decode_block_dijkstra_native_dispatch() {
+    // Era tag 8 must be routed to the in-house Dijkstra decoder (M4c) and
+    // produce Era::Dijkstra — not fall through to the old Conway shim.
     let cbor = dijkstra_synthetic_from_conway();
-    let block = decode_block(&cbor).expect("Dijkstra-tagged block must decode via the shim");
+    let block = decode_block(&cbor).expect("Dijkstra-tagged block must decode via native dispatch");
 
     assert_eq!(block.era, Era::Dijkstra, "era must be Dijkstra");
     // raw_cbor MUST preserve the original tag-8 bytes so ChainDB serves the
@@ -202,10 +208,11 @@ fn test_decode_block_dijkstra_via_conway_shim() {
 }
 
 #[test]
-fn test_dijkstra_shim_body_size_sanity_check_passes_for_conway_compatible() {
-    // The shim's sanity check warns when the header's claimed body_size
-    // disagrees with the size we measure from the raw CBOR. For a real Conway
-    // block re-tagged as Dijkstra, those MUST agree.
+fn test_dijkstra_body_size_matches_header_for_conway_compatible() {
+    // The header's claimed body_size must agree with the byte size we measure
+    // from the raw CBOR.  Conway-compatible Dijkstra blocks (same structure,
+    // different era tag) must round-trip this field correctly under the native
+    // in-house decoder.
     let cbor = dijkstra_synthetic_from_conway();
     let block = decode_block(&cbor).expect("decode");
     let measured =
@@ -217,9 +224,9 @@ fn test_dijkstra_shim_body_size_sanity_check_passes_for_conway_compatible() {
 }
 
 #[test]
-fn test_non_dijkstra_blocks_unaffected_by_shim() {
-    // Regression guard: the byte-patch branch must be gated strictly on
-    // [0x82, 0x08, ...] and not touch Conway (tag 7) or earlier eras.
+fn test_non_dijkstra_blocks_dispatch_correctly() {
+    // Regression guard: the Dijkstra dispatch branch (era tag 8) must not
+    // affect Conway (tag 7) or any earlier era.
     for (name, era) in [
         ("shelley", Era::Shelley),
         ("mary", Era::Mary),
@@ -229,7 +236,7 @@ fn test_non_dijkstra_blocks_unaffected_by_shim() {
     ] {
         let cbor = load_vector(name);
         let block = decode_block(&cbor).unwrap_or_else(|e| panic!("{name}: decode failed: {e}"));
-        assert_eq!(block.era, era, "{name}: era must be unchanged by shim");
+        assert_eq!(block.era, era, "{name}: era must be unaffected by Dijkstra dispatch");
     }
 }
 
