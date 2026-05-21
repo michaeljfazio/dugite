@@ -95,13 +95,18 @@ pub enum NativeScript {
     InvalidHereafter(SlotNo),
 }
 
-/// Plutus data (arbitrary structured data for smart contracts)
+/// Plutus data (arbitrary structured data for smart contracts).
+///
+/// `Integer` holds an arbitrary-precision signed integer (Haskell `Integer`).
+/// Cardano Plutus values are unbounded — real mainnet/preprod blocks routinely
+/// contain BigInts > 2^127, so a fixed `i128` cannot represent them and would
+/// reject legitimate canonical chain data during block decode. Use `num_bigint::BigInt`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum PlutusData {
     Constr(u64, Vec<PlutusData>),
     Map(Vec<(PlutusData, PlutusData)>),
     List(Vec<PlutusData>),
-    Integer(i128),
+    Integer(num_bigint::BigInt),
     Bytes(Vec<u8>),
 }
 

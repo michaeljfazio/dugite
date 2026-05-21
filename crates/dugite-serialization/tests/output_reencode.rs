@@ -223,11 +223,11 @@ fn test_indef_array_encoding_difference_documented() {
 
     // Five zeros as a Plutus List
     let datum = PlutusData::List(vec![
-        PlutusData::Integer(0),
-        PlutusData::Integer(0),
-        PlutusData::Integer(0),
-        PlutusData::Integer(0),
-        PlutusData::Integer(0),
+        PlutusData::Integer(num_bigint::BigInt::from(0i64)),
+        PlutusData::Integer(num_bigint::BigInt::from(0i64)),
+        PlutusData::Integer(num_bigint::BigInt::from(0i64)),
+        PlutusData::Integer(num_bigint::BigInt::from(0i64)),
+        PlutusData::Integer(num_bigint::BigInt::from(0i64)),
     ]);
 
     let our_encoding = encode_plutus_data(&datum);

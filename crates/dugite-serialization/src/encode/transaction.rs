@@ -861,7 +861,7 @@ mod tests {
             address: test_address(),
             value: ada(500_000),
             datum: OutputDatum::InlineDatum {
-                data: PlutusData::Integer(42),
+                data: PlutusData::Integer(num_bigint::BigInt::from(42i64)),
                 raw_cbor: None,
             },
             script_ref: None,
@@ -888,7 +888,7 @@ mod tests {
             address: test_address(),
             value: ada(500_000),
             datum: OutputDatum::InlineDatum {
-                data: PlutusData::Integer(1), // ignored because raw_cbor is set
+                data: PlutusData::Integer(num_bigint::BigInt::from(1i64)), // ignored because raw_cbor is set
                 raw_cbor: Some(raw.clone()),
             },
             script_ref: None,
@@ -1007,7 +1007,7 @@ mod tests {
         ws.redeemers.push(Redeemer {
             tag: RedeemerTag::Spend,
             index: 0,
-            data: PlutusData::Integer(1),
+            data: PlutusData::Integer(num_bigint::BigInt::from(1i64)),
             ex_units: ExUnits {
                 mem: 1000,
                 steps: 2000,
@@ -1060,7 +1060,7 @@ mod tests {
         ws.redeemers.push(Redeemer {
             tag: RedeemerTag::Spend,
             index: 0,
-            data: PlutusData::Integer(1),
+            data: PlutusData::Integer(num_bigint::BigInt::from(1i64)),
             ex_units: ExUnits {
                 mem: 1000,
                 steps: 2000,
@@ -1082,7 +1082,7 @@ mod tests {
         ws.redeemers.push(Redeemer {
             tag: RedeemerTag::Spend,
             index: 0,
-            data: PlutusData::Integer(1),
+            data: PlutusData::Integer(num_bigint::BigInt::from(1i64)),
             ex_units: ExUnits {
                 mem: 1000,
                 steps: 2000,

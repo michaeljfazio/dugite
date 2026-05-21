@@ -1081,6 +1081,8 @@ dependencies = [
  "dugite-serialization",
  "hex",
  "minicbor 0.26.5",
+ "num-bigint",
+ "num-traits",
  "rand 0.9.4",
  "reqwest",
  "serde",
@@ -1115,6 +1117,7 @@ dependencies = [
  "dugite-primitives",
  "dugite-serialization",
  "hex",
+ "num-bigint",
  "serde",
  "serde_json",
  "tempfile",
@@ -1250,6 +1253,7 @@ dependencies = [
  "dugite-crypto",
  "dugite-ledger",
  "dugite-primitives",
+ "num-bigint",
  "parking_lot",
  "proptest",
  "thiserror 2.0.18",
@@ -1383,6 +1387,8 @@ dependencies = [
  "dugite-primitives",
  "hex",
  "minicbor 0.26.5",
+ "num-bigint",
+ "num-traits",
  "pallas-addresses 1.0.0-alpha.6",
  "pallas-codec 1.0.0-alpha.6",
  "pallas-crypto 1.0.0-alpha.6",
@@ -3001,6 +3007,7 @@ checksum = "a5e44f723f1133c9deac646763579fdb3ac745e418f2a7af9cd0c431da1f20b9"
 dependencies = [
  "num-integer",
  "num-traits",
+ "serde",
 ]
 
 [[package]]

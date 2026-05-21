@@ -1026,7 +1026,7 @@ pub(crate) fn parse_plutus_data_json(json: &serde_json::Value) -> Result<PlutusD
         let i = n
             .as_i64()
             .ok_or_else(|| anyhow::anyhow!("PlutusData 'int' must be an integer, got: {n}"))?;
-        return Ok(PlutusData::Integer(i as i128));
+        return Ok(PlutusData::Integer(num_bigint::BigInt::from(i)));
     }
 
     if let Some(b) = json.get("bytes") {
@@ -1165,44 +1165,43 @@ fn encode_redeemer_to_cbor(r: &Redeemer) -> Vec<u8> {
 fn encode_plutus_data_to_cbor(data: &PlutusData) -> Vec<u8> {
     match data {
         PlutusData::Integer(n) => {
-            let n = *n;
-            if n >= 0 {
-                // Non-negative: CBOR major type 0 (unsigned)
-                if n <= u64::MAX as i128 {
+            use num_bigint::Sign;
+            use num_traits::{Signed, ToPrimitive};
+            if !n.is_negative() {
+                // Non-negative path
+                if let Some(v) = n.to_u64() {
+                    // CBOR major type 0 (unsigned)
                     let mut buf = Vec::new();
-                    minicbor::Encoder::new(&mut buf).u64(n as u64).unwrap();
+                    minicbor::Encoder::new(&mut buf).u64(v).unwrap();
                     buf
                 } else {
-                    // Positive bignum: tag(2) + bytes(big-endian)
-                    let bytes = (n as u128).to_be_bytes();
-                    let start = bytes.iter().position(|&b| b != 0).unwrap_or(15);
+                    // Positive bignum: tag(2) + bytes(big-endian magnitude)
+                    let (_, bytes) = n.to_bytes_be();
                     let mut buf = Vec::new();
                     {
                         let mut enc = minicbor::Encoder::new(&mut buf);
                         enc.tag(minicbor::data::Tag::new(2)).unwrap();
-                        enc.bytes(&bytes[start..]).unwrap();
+                        enc.bytes(&bytes).unwrap();
                     }
                     buf
                 }
+            } else if let Some(v) = n.to_i64() {
+                // Small negative: CBOR major type 1
+                let mut buf = Vec::new();
+                minicbor::Encoder::new(&mut buf).i64(v).unwrap();
+                buf
             } else {
-                // Negative: CBOR major type 1
-                if n >= i64::MIN as i128 {
-                    let mut buf = Vec::new();
-                    minicbor::Encoder::new(&mut buf).i64(n as i64).unwrap();
-                    buf
-                } else {
-                    // Negative bignum: tag(3) + bytes(big-endian of -(1+n))
-                    let abs = (-(1 + n)) as u128;
-                    let bytes = abs.to_be_bytes();
-                    let start = bytes.iter().position(|&b| b != 0).unwrap_or(15);
-                    let mut buf = Vec::new();
-                    {
-                        let mut enc = minicbor::Encoder::new(&mut buf);
-                        enc.tag(minicbor::data::Tag::new(3)).unwrap();
-                        enc.bytes(&bytes[start..]).unwrap();
-                    }
-                    buf
+                // Negative bignum: tag(3) + bytes(big-endian of -(1+n))
+                let abs = -n - num_bigint::BigInt::from(1);
+                let (sign, bytes) = abs.to_bytes_be();
+                debug_assert_eq!(sign, Sign::Plus);
+                let mut buf = Vec::new();
+                {
+                    let mut enc = minicbor::Encoder::new(&mut buf);
+                    enc.tag(minicbor::data::Tag::new(3)).unwrap();
+                    enc.bytes(&bytes).unwrap();
                 }
+                buf
             }
         }
         PlutusData::Bytes(b) => {
@@ -1519,11 +1518,11 @@ fn decode_plutus_cbor_inner(dec: &mut minicbor::Decoder<'_>) -> Option<PlutusDat
         }
         Type::U8 | Type::U16 | Type::U32 | Type::U64 => {
             let n = dec.u64().ok()?;
-            Some(PlutusData::Integer(n as i128))
+            Some(PlutusData::Integer(num_bigint::BigInt::from(n)))
         }
         Type::I8 | Type::I16 | Type::I32 | Type::I64 => {
             let n = dec.i64().ok()?;
-            Some(PlutusData::Integer(n as i128))
+            Some(PlutusData::Integer(num_bigint::BigInt::from(n)))
         }
         Type::Bytes => {
             let b = dec.bytes().ok()?.to_vec();
@@ -4575,14 +4574,14 @@ mod tests {
     fn test_parse_plutus_data_int() {
         let json = serde_json::json!({"int": 42});
         let data = parse_plutus_data_json(&json).unwrap();
-        assert_eq!(data, PlutusData::Integer(42));
+        assert_eq!(data, PlutusData::Integer(num_bigint::BigInt::from(42i64)));
     }
 
     #[test]
     fn test_parse_plutus_data_negative_int() {
         let json = serde_json::json!({"int": -100});
         let data = parse_plutus_data_json(&json).unwrap();
-        assert_eq!(data, PlutusData::Integer(-100));
+        assert_eq!(data, PlutusData::Integer(num_bigint::BigInt::from(-100i64)));
     }
 
     #[test]
@@ -4605,7 +4604,10 @@ mod tests {
         let data = parse_plutus_data_json(&json).unwrap();
         assert_eq!(
             data,
-            PlutusData::List(vec![PlutusData::Integer(1), PlutusData::Integer(2)])
+            PlutusData::List(vec![
+                PlutusData::Integer(num_bigint::BigInt::from(1i64)),
+                PlutusData::Integer(num_bigint::BigInt::from(2i64))
+            ])
         );
     }
 
@@ -4627,7 +4629,7 @@ mod tests {
         assert_eq!(
             data,
             PlutusData::Map(vec![(
-                PlutusData::Integer(1),
+                PlutusData::Integer(num_bigint::BigInt::from(1i64)),
                 PlutusData::Bytes(vec![0xaa, 0xbb])
             )])
         );
@@ -4638,7 +4640,13 @@ mod tests {
         // Constructor 0 with one field
         let json = serde_json::json!({"constructor": 0, "fields": [{"int": 42}]});
         let data = parse_plutus_data_json(&json).unwrap();
-        assert_eq!(data, PlutusData::Constr(0, vec![PlutusData::Integer(42)]));
+        assert_eq!(
+            data,
+            PlutusData::Constr(
+                0,
+                vec![PlutusData::Integer(num_bigint::BigInt::from(42i64))]
+            )
+        );
     }
 
     #[test]
@@ -4663,7 +4671,7 @@ mod tests {
             PlutusData::Constr(
                 0,
                 vec![PlutusData::List(vec![
-                    PlutusData::Integer(10),
+                    PlutusData::Integer(num_bigint::BigInt::from(10i64)),
                     PlutusData::Bytes(vec![0xff])
                 ])]
             )
@@ -4686,14 +4694,15 @@ mod tests {
 
     #[test]
     fn test_encode_plutus_integer_zero() {
-        let cbor = encode_plutus_data_to_cbor(&PlutusData::Integer(0));
+        let cbor = encode_plutus_data_to_cbor(&PlutusData::Integer(num_bigint::BigInt::from(0i64)));
         // CBOR uint(0) = 0x00
         assert_eq!(cbor, vec![0x00]);
     }
 
     #[test]
     fn test_encode_plutus_integer_positive() {
-        let cbor = encode_plutus_data_to_cbor(&PlutusData::Integer(42));
+        let cbor =
+            encode_plutus_data_to_cbor(&PlutusData::Integer(num_bigint::BigInt::from(42i64)));
         // CBOR uint(42) = 0x18 0x2a
         let mut dec = minicbor::Decoder::new(&cbor);
         assert_eq!(dec.u64().unwrap(), 42);
@@ -4701,7 +4710,8 @@ mod tests {
 
     #[test]
     fn test_encode_plutus_integer_negative() {
-        let cbor = encode_plutus_data_to_cbor(&PlutusData::Integer(-1));
+        let cbor =
+            encode_plutus_data_to_cbor(&PlutusData::Integer(num_bigint::BigInt::from(-1i64)));
         // CBOR negative int -1 = 0x20
         assert_eq!(cbor, vec![0x20]);
     }
@@ -4716,8 +4726,8 @@ mod tests {
     #[test]
     fn test_encode_plutus_list() {
         let cbor = encode_plutus_data_to_cbor(&PlutusData::List(vec![
-            PlutusData::Integer(1),
-            PlutusData::Integer(2),
+            PlutusData::Integer(num_bigint::BigInt::from(1i64)),
+            PlutusData::Integer(num_bigint::BigInt::from(2i64)),
         ]));
         let mut dec = minicbor::Decoder::new(&cbor);
         assert_eq!(dec.array().unwrap(), Some(2));
@@ -4728,8 +4738,10 @@ mod tests {
     #[test]
     fn test_encode_plutus_constr_small() {
         // Constructor 0 → CBOR tag 121
-        let cbor =
-            encode_plutus_data_to_cbor(&PlutusData::Constr(0, vec![PlutusData::Integer(42)]));
+        let cbor = encode_plutus_data_to_cbor(&PlutusData::Constr(
+            0,
+            vec![PlutusData::Integer(num_bigint::BigInt::from(42i64))],
+        ));
         let mut dec = minicbor::Decoder::new(&cbor);
         let tag = dec.tag().unwrap();
         assert_eq!(tag.as_u64(), 121); // 121 + 0
@@ -4804,8 +4816,8 @@ mod tests {
     #[test]
     fn test_script_data_hash_present_for_witness() {
         // A witness with an integer datum/redeemer must produce a hash
-        let datum = PlutusData::Integer(42);
-        let redeemer = PlutusData::Integer(0);
+        let datum = PlutusData::Integer(num_bigint::BigInt::from(42i64));
+        let redeemer = PlutusData::Integer(num_bigint::BigInt::from(0i64));
         let w = ScriptWitness {
             version: PlutusVersion::V2,
             script_bytes: vec![0x01, 0x02, 0x03],
@@ -4855,8 +4867,8 @@ mod tests {
 
     #[test]
     fn test_build_plutus_witness_set_v2_single() {
-        let datum = PlutusData::Integer(1);
-        let redeemer = PlutusData::Integer(0);
+        let datum = PlutusData::Integer(num_bigint::BigInt::from(1i64));
+        let redeemer = PlutusData::Integer(num_bigint::BigInt::from(0i64));
         let w = ScriptWitness {
             version: PlutusVersion::V2,
             script_bytes: vec![0x01],
@@ -5137,7 +5149,8 @@ mod tests {
             bech32::encode::<bech32::Bech32>(bech32::Hrp::parse("addr_test").unwrap(), &[0x00; 57])
                 .unwrap();
         // Inline datum: PlutusData Integer(42) → CBOR encoding: 0x18 0x2a
-        let datum_cbor = encode_plutus_data_to_cbor(&PlutusData::Integer(42));
+        let datum_cbor =
+            encode_plutus_data_to_cbor(&PlutusData::Integer(num_bigint::BigInt::from(42i64)));
         let outputs = vec![ParsedTxOutput {
             address: addr,
             lovelace: 2_000_000,
@@ -5282,7 +5295,8 @@ mod tests {
             bech32::encode::<bech32::Bech32>(bech32::Hrp::parse("addr_test").unwrap(), &[0x00; 57])
                 .unwrap();
         let policy = "a".repeat(56);
-        let datum_cbor = encode_plutus_data_to_cbor(&PlutusData::Integer(99));
+        let datum_cbor =
+            encode_plutus_data_to_cbor(&PlutusData::Integer(num_bigint::BigInt::from(99i64)));
         let outputs = vec![ParsedTxOutput {
             address: addr,
             lovelace: 3_000_000,

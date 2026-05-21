@@ -1064,7 +1064,7 @@ mod tests {
                 redeemers: vec![Redeemer {
                     tag: RedeemerTag::Spend,
                     index: 0,
-                    data: PlutusData::Integer(0i128),
+                    data: PlutusData::Integer(num_bigint::BigInt::from(0i128)),
                     ex_units: ExUnits {
                         mem: 100,
                         steps: 100,
@@ -1340,7 +1340,7 @@ mod tests {
         tx.witness_set.redeemers = vec![Redeemer {
             tag: RedeemerTag::Spend,
             index: 0,
-            data: PlutusData::Integer(0i128),
+            data: PlutusData::Integer(num_bigint::BigInt::from(0i128)),
             ex_units: ExUnits {
                 mem: mem_limit + 1,
                 steps: 100,
@@ -1380,7 +1380,7 @@ mod tests {
         tx.witness_set.redeemers = vec![Redeemer {
             tag: RedeemerTag::Spend,
             index: 0,
-            data: PlutusData::Integer(0i128),
+            data: PlutusData::Integer(num_bigint::BigInt::from(0i128)),
             ex_units: ExUnits {
                 mem: 100,
                 steps: steps_limit + 1,
@@ -1415,7 +1415,7 @@ mod tests {
         tx.witness_set.redeemers = vec![Redeemer {
             tag: RedeemerTag::Spend,
             index: 5,
-            data: PlutusData::Integer(0i128),
+            data: PlutusData::Integer(num_bigint::BigInt::from(0i128)),
             ex_units: ExUnits {
                 mem: 100,
                 steps: 100,
@@ -1497,7 +1497,7 @@ mod tests {
         tx.witness_set.redeemers = vec![Redeemer {
             tag: RedeemerTag::Vote,
             index: 3,
-            data: PlutusData::Integer(0i128),
+            data: PlutusData::Integer(num_bigint::BigInt::from(0i128)),
             ex_units: ExUnits {
                 mem: 100,
                 steps: 100,
@@ -1593,7 +1593,7 @@ mod tests {
                 redeemers: vec![Redeemer {
                     tag: RedeemerTag::Spend,
                     index: 99,
-                    data: PlutusData::Integer(0i128),
+                    data: PlutusData::Integer(num_bigint::BigInt::from(0i128)),
                     ex_units: ExUnits {
                         mem: 100,
                         steps: 100,
@@ -1690,7 +1690,7 @@ mod tests {
                 redeemers: vec![Redeemer {
                     tag: RedeemerTag::Spend,
                     index: 0,
-                    data: PlutusData::Integer(0i128),
+                    data: PlutusData::Integer(num_bigint::BigInt::from(0i128)),
                     ex_units: ExUnits {
                         mem: 100,
                         steps: 100,

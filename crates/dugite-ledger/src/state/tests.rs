@@ -12253,7 +12253,7 @@ fn test_validate_transaction_ex_units_exceeded() {
     tx.witness_set.redeemers.push(Redeemer {
         tag: RedeemerTag::Spend,
         index: 0,
-        data: PlutusData::Integer(0),
+        data: PlutusData::Integer(num_bigint::BigInt::from(0i64)),
         ex_units: ExUnits {
             steps: 2_000, // exceeds the 1_000 limit
             mem: 100,
@@ -12319,7 +12319,7 @@ fn test_validate_transaction_ex_units_within_limit() {
     tx.witness_set.redeemers.push(Redeemer {
         tag: RedeemerTag::Spend,
         index: 0,
-        data: PlutusData::Integer(0),
+        data: PlutusData::Integer(num_bigint::BigInt::from(0i64)),
         ex_units: ExUnits {
             steps: 1_000_000, // << 10B limit
             mem: 1_000,       // << 14M limit
@@ -13473,7 +13473,7 @@ fn make_tx_with_redeemers(tx_hash_byte: u8, mem: u64, steps: u64) -> Transaction
             redeemers: vec![Redeemer {
                 tag: RedeemerTag::Spend,
                 index: 0,
-                data: PlutusData::Integer(0),
+                data: PlutusData::Integer(num_bigint::BigInt::from(0i64)),
                 ex_units: ExUnits { mem, steps },
             }],
             raw_redeemers_cbor: None,

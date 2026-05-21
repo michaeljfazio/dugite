@@ -447,7 +447,7 @@ fn to_transaction_inner(tx: &TestTransaction) -> Result<Transaction, AdapterErro
                 vec![transaction::Redeemer {
                     tag: transaction::RedeemerTag::Spend,
                     index: 0,
-                    data: transaction::PlutusData::Integer(0),
+                    data: transaction::PlutusData::Integer(num_bigint::BigInt::from(0)),
                     ex_units: transaction::ExUnits { mem: 0, steps: 0 },
                 }]
             } else {

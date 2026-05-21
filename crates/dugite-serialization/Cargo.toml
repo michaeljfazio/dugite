@@ -17,6 +17,8 @@ pallas-codec = { workspace = true }
 pallas-crypto = { workspace = true }
 pallas-addresses = { workspace = true }
 tracing = { workspace = true }
+num-bigint = { workspace = true }
+num-traits = { workspace = true }
 
 [dev-dependencies]
 serde_json = { workspace = true }

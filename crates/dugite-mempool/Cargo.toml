@@ -10,6 +10,7 @@ dugite-ledger = { workspace = true }
 dugite-crypto = { workspace = true }
 tokio = { workspace = true }
 thiserror = { workspace = true }
+num-bigint = { workspace = true }
 tracing = { workspace = true }
 parking_lot = { workspace = true }
 dashmap = { workspace = true }

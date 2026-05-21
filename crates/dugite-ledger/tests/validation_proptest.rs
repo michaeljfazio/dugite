@@ -403,7 +403,9 @@ fn make_plutus_tx(
         .push(dugite_primitives::transaction::Redeemer {
             tag: dugite_primitives::transaction::RedeemerTag::Spend,
             index: 0,
-            data: dugite_primitives::transaction::PlutusData::Integer(0),
+            data: dugite_primitives::transaction::PlutusData::Integer(num_bigint::BigInt::from(
+                0i64,
+            )),
             ex_units: dugite_primitives::transaction::ExUnits {
                 mem: 1000,
                 steps: 1000,

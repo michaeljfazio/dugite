@@ -1267,7 +1267,7 @@ mod tests {
             address: addr,
             value: Value::lovelace(1),
             datum: OutputDatum::InlineDatum {
-                data: PlutusData::Integer(42i128),
+                data: PlutusData::Integer(num_bigint::BigInt::from(42i128)),
                 raw_cbor: Some(vec![0x18, 0x2A]),
             },
             script_ref: None,

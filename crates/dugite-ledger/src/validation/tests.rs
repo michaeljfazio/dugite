@@ -725,7 +725,7 @@ mod tests {
         tx.witness_set.redeemers.push(Redeemer {
             tag: RedeemerTag::Spend,
             index: 0,
-            data: PlutusData::Integer(0),
+            data: PlutusData::Integer(num_bigint::BigInt::from(0i64)),
             ex_units: ExUnits {
                 mem: 100,
                 steps: 100,
@@ -1799,7 +1799,7 @@ mod tests {
         tx.witness_set.redeemers.push(Redeemer {
             tag: RedeemerTag::Spend,
             index: 5,
-            data: PlutusData::Integer(0),
+            data: PlutusData::Integer(num_bigint::BigInt::from(0i64)),
             ex_units: ExUnits {
                 mem: 100,
                 steps: 100,
@@ -2027,7 +2027,7 @@ mod tests {
                 redeemers: vec![Redeemer {
                     tag: RedeemerTag::Spend,
                     index: 0,
-                    data: PlutusData::Integer(42),
+                    data: PlutusData::Integer(num_bigint::BigInt::from(42i64)),
                     ex_units: ExUnits {
                         mem: 1000,
                         steps: 1000,
@@ -2126,7 +2126,7 @@ mod tests {
         tx.witness_set.redeemers.push(Redeemer {
             tag: RedeemerTag::Spend,
             index: 0,
-            data: PlutusData::Integer(42),
+            data: PlutusData::Integer(num_bigint::BigInt::from(42i64)),
             ex_units: ExUnits {
                 mem: 1000,
                 steps: 1000,
@@ -2194,7 +2194,7 @@ mod tests {
         tx.witness_set.redeemers.push(Redeemer {
             tag: RedeemerTag::Spend,
             index: 0,
-            data: PlutusData::Integer(42),
+            data: PlutusData::Integer(num_bigint::BigInt::from(42i64)),
             ex_units: ExUnits {
                 mem: mem_units,
                 steps: step_units,
@@ -2487,7 +2487,7 @@ mod tests {
                 // Script-locked Plutus inputs must carry a datum; use inline so
                 // no datum witness in the witness set is required.
                 datum: OutputDatum::InlineDatum {
-                    data: PlutusData::Integer(0),
+                    data: PlutusData::Integer(num_bigint::BigInt::from(0i64)),
                     raw_cbor: None,
                 },
                 script_ref: None,
@@ -2511,7 +2511,7 @@ mod tests {
         let redeemers = vec![Redeemer {
             tag: RedeemerTag::Spend,
             index: 0,
-            data: PlutusData::Integer(0),
+            data: PlutusData::Integer(num_bigint::BigInt::from(0i64)),
             ex_units: ExUnits {
                 mem: 100,
                 steps: 100,
@@ -4340,7 +4340,7 @@ mod tests {
                 redeemers: vec![Redeemer {
                     tag: RedeemerTag::Reward,
                     index: 0,
-                    data: PlutusData::Integer(0),
+                    data: PlutusData::Integer(num_bigint::BigInt::from(0i64)),
                     ex_units: ExUnits {
                         mem: 100,
                         steps: 100,
@@ -4554,7 +4554,7 @@ mod tests {
                 redeemers: vec![Redeemer {
                     tag: RedeemerTag::Mint,
                     index: 0,
-                    data: PlutusData::Integer(0),
+                    data: PlutusData::Integer(num_bigint::BigInt::from(0i64)),
                     ex_units: ExUnits {
                         mem: 100,
                         steps: 100,
@@ -4678,7 +4678,7 @@ mod tests {
                 redeemers: vec![Redeemer {
                     tag: RedeemerTag::Mint,
                     index: 0,
-                    data: PlutusData::Integer(0),
+                    data: PlutusData::Integer(num_bigint::BigInt::from(0i64)),
                     ex_units: ExUnits {
                         mem: 100,
                         steps: 100,
@@ -4823,7 +4823,7 @@ mod tests {
                     Redeemer {
                         tag: RedeemerTag::Spend,
                         index: 0,
-                        data: PlutusData::Integer(1),
+                        data: PlutusData::Integer(num_bigint::BigInt::from(1i64)),
                         ex_units: ExUnits {
                             mem: 100,
                             steps: 100,
@@ -4832,7 +4832,7 @@ mod tests {
                     Redeemer {
                         tag: RedeemerTag::Spend,
                         index: 1,
-                        data: PlutusData::Integer(2),
+                        data: PlutusData::Integer(num_bigint::BigInt::from(2i64)),
                         ex_units: ExUnits {
                             mem: 100,
                             steps: 100,
@@ -5325,7 +5325,7 @@ mod tests {
                 redeemers: vec![Redeemer {
                     tag: RedeemerTag::Spend,
                     index: 0,
-                    data: PlutusData::Integer(0),
+                    data: PlutusData::Integer(num_bigint::BigInt::from(0i64)),
                     ex_units: ExUnits {
                         mem: 100,
                         steps: 100,
@@ -5551,7 +5551,7 @@ mod tests {
                 redeemers: vec![Redeemer {
                     tag: RedeemerTag::Cert,
                     index: 0,
-                    data: PlutusData::Integer(0),
+                    data: PlutusData::Integer(num_bigint::BigInt::from(0i64)),
                     ex_units: ExUnits {
                         mem: 100,
                         steps: 100,
@@ -5972,7 +5972,7 @@ mod tests {
                 redeemers: vec![Redeemer {
                     tag: RedeemerTag::Cert,
                     index: 1,
-                    data: PlutusData::Integer(0),
+                    data: PlutusData::Integer(num_bigint::BigInt::from(0i64)),
                     ex_units: ExUnits {
                         mem: 100,
                         steps: 100,
@@ -6502,7 +6502,7 @@ mod tests {
                 redeemers: vec![Redeemer {
                     tag: RedeemerTag::Vote,
                     index: 0,
-                    data: PlutusData::Integer(0),
+                    data: PlutusData::Integer(num_bigint::BigInt::from(0i64)),
                     ex_units: ExUnits {
                         mem: 100,
                         steps: 100,
@@ -6623,7 +6623,7 @@ mod tests {
                 redeemers: vec![Redeemer {
                     tag: RedeemerTag::Vote,
                     index: 1,
-                    data: PlutusData::Integer(0),
+                    data: PlutusData::Integer(num_bigint::BigInt::from(0i64)),
                     ex_units: ExUnits {
                         mem: 100,
                         steps: 100,
@@ -7401,7 +7401,7 @@ mod tests {
                 redeemers: vec![Redeemer {
                     tag: RedeemerTag::Propose,
                     index: 0,
-                    data: PlutusData::Integer(1),
+                    data: PlutusData::Integer(num_bigint::BigInt::from(1i64)),
                     ex_units: ExUnits {
                         mem: 200,
                         steps: 200,
@@ -7471,7 +7471,7 @@ mod tests {
     fn test_datum_witness_missing_for_script_locked_input() {
         use super::super::datum::check_datum_witnesses;
 
-        let datum = PlutusData::Integer(42);
+        let datum = PlutusData::Integer(num_bigint::BigInt::from(42i64));
         let hash = datum_hash_of(&datum);
 
         let mut utxo_set = UtxoSet::new();
@@ -7560,7 +7560,7 @@ mod tests {
     fn test_datum_witness_present_for_script_locked_input_ok() {
         use super::super::datum::check_datum_witnesses;
 
-        let datum = PlutusData::Integer(42);
+        let datum = PlutusData::Integer(num_bigint::BigInt::from(42i64));
         let hash = datum_hash_of(&datum);
 
         let mut utxo_set = UtxoSet::new();
@@ -7643,7 +7643,7 @@ mod tests {
     fn test_datum_witness_inline_datum_no_witness_needed() {
         use super::super::datum::check_datum_witnesses;
 
-        let datum = PlutusData::Integer(99);
+        let datum = PlutusData::Integer(num_bigint::BigInt::from(99i64));
 
         let mut utxo_set = UtxoSet::new();
         let input = TransactionInput {
@@ -7819,7 +7819,7 @@ mod tests {
         use super::super::datum::check_datum_witnesses;
 
         // Spurious datum — no input or output needs this.
-        let spurious = PlutusData::Integer(12345);
+        let spurious = PlutusData::Integer(num_bigint::BigInt::from(12345i64));
 
         let mut utxo_set = UtxoSet::new();
         let input = TransactionInput {
@@ -7906,7 +7906,7 @@ mod tests {
     fn test_datum_witness_all_needed_present_no_extras_ok() {
         use super::super::datum::check_datum_witnesses;
 
-        let datum_a = PlutusData::Integer(1);
+        let datum_a = PlutusData::Integer(num_bigint::BigInt::from(1i64));
         let datum_b = PlutusData::Bytes(vec![0x01, 0x02, 0x03]);
         let hash_a = datum_hash_of(&datum_a);
         let hash_b = datum_hash_of(&datum_b);
@@ -8012,7 +8012,7 @@ mod tests {
     fn test_datum_witness_output_datum_hash_allows_supplemental_witness() {
         use super::super::datum::check_datum_witnesses;
 
-        let datum = PlutusData::List(vec![PlutusData::Integer(7)]);
+        let datum = PlutusData::List(vec![PlutusData::Integer(num_bigint::BigInt::from(7i64))]);
         let hash = datum_hash_of(&datum);
 
         let mut utxo_set = UtxoSet::new();
@@ -12179,7 +12179,7 @@ mod tests {
         tx.witness_set.redeemers.push(Redeemer {
             tag: RedeemerTag::Propose,
             index: 2,
-            data: PlutusData::Integer(0),
+            data: PlutusData::Integer(num_bigint::BigInt::from(0i64)),
             ex_units: ExUnits {
                 mem: 100_000,
                 steps: 100_000,
@@ -14259,7 +14259,9 @@ mod tests {
         tx.witness_set.redeemers = vec![Redeemer {
             tag: RedeemerTag::Spend,
             index: 0,
-            data: dugite_primitives::transaction::PlutusData::Integer(0),
+            data: dugite_primitives::transaction::PlutusData::Integer(num_bigint::BigInt::from(
+                0i64,
+            )),
             ex_units: ExUnits {
                 mem: 1_000_000,
                 steps: 1_000_000,
