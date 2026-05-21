@@ -828,9 +828,7 @@ proptest! {
         let mut buf = Vec::new();
         let mut enc = minicbor::Encoder::new(&mut buf);
         enc.array(declared).unwrap();
-        for _ in 0..actual_bytes {
-            buf.push(0x00);
-        }
+        buf.resize(buf.len() + actual_bytes, 0x00);
 
         let result = decode_metadatum_from_bytes(&buf);
 
@@ -863,9 +861,7 @@ proptest! {
         let mut buf = Vec::new();
         let mut enc = minicbor::Encoder::new(&mut buf);
         enc.map(declared).unwrap();
-        for _ in 0..actual_pairs * 2 {
-            buf.push(0x00);
-        }
+        buf.resize(buf.len() + actual_pairs * 2, 0x00);
 
         let result = decode_metadatum_from_bytes(&buf);
 
