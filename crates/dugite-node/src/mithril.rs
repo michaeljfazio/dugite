@@ -393,7 +393,16 @@ pub async fn import_snapshot(
     // block-replay path.  Ancillary download is NON-FATAL: if it fails the node
     // falls back to full replay from genesis (original behaviour).
     info!("Downloading ancillary archive (Haskell ledger state)...");
-    match download_ancillary(aggregator, network_magic, database_path, &work_dir).await {
+    let main_immutable = latest.beacon.immutable_file_number;
+    match download_ancillary(
+        aggregator,
+        network_magic,
+        database_path,
+        &work_dir,
+        Some(main_immutable),
+    )
+    .await
+    {
         Ok(ancillary_dir) => {
             // Move ledger/ to database_path/haskell-ledger/
             let haskell_ledger_dir = database_path.join("haskell-ledger");
@@ -2215,21 +2224,80 @@ pub(crate) fn verify_ancillary_manifest(
     Ok(())
 }
 
+/// Choose the cardano-database snapshot to use for the ancillary download.
+///
+/// When `pin_to_immutable=Some(N)`, the snapshot whose `immutable_file_number`
+/// matches `N` is selected. This is the **paired** mode: the ancillary
+/// archive bundled with the main `immutable_file_number=N` mithril snapshot
+/// contains the partial chunk past the finalized boundary (chunk `N+1`).
+/// Pairing them ensures the on-disk ImmutableDB ends up contiguous —
+/// the main archive delivers chunks `0..=N` and the matching ancillary
+/// delivers chunk `N+1`.
+///
+/// When `pin_to_immutable=None`, the latest cardano-database snapshot is
+/// returned. This is **racy** when the aggregator publishes new snapshots
+/// between the V1 (main) and V2 (ancillary) list queries: a freshly-built
+/// ancillary at `N+1` paired with a main archive at `N` leaves chunk `N+1`
+/// absent on disk (the ancillary delivers chunk `N+2`, not `N+1`). The
+/// `None` mode exists for legacy callers / tests that do not have a
+/// matching main archive to anchor to.
+fn select_cardano_db_snapshot(
+    snapshots: &[CardanoDatabaseSnapshotListItem],
+    pin_to_immutable: Option<u64>,
+) -> Result<&CardanoDatabaseSnapshotListItem> {
+    match pin_to_immutable {
+        Some(target) => snapshots
+            .iter()
+            .find(|s| s.beacon.immutable_file_number == target)
+            .ok_or_else(|| {
+                let available: Vec<u64> = snapshots
+                    .iter()
+                    .map(|s| s.beacon.immutable_file_number)
+                    .collect();
+                anyhow::anyhow!(
+                    "No cardano-database snapshot found with \
+                     immutable_file_number={target} to pair with main archive. \
+                     Available: {available:?}. Re-run mithril-import to pick a \
+                     consistent pair."
+                )
+            }),
+        None => snapshots
+            .first()
+            .context("No Cardano Database snapshots available"),
+    }
+}
+
 /// Download and verify the ancillary archive from the Mithril V2 API.
 ///
+/// `pin_to_immutable` — when `Some(N)`, pick the cardano-database snapshot
+/// whose `immutable_file_number == N`, NOT the latest. This is critical
+/// because the V1 `/artifact/snapshots` (main) and V2
+/// `/artifact/cardano-database` (ancillary) endpoints are queried
+/// sequentially and the aggregator may publish a newer snapshot between
+/// the two calls. The two archives are *paired*: the main archive
+/// delivers chunks 0..N and the matching ancillary delivers chunk N+1
+/// (the partial chunk past the finalized boundary). Mixing main=N with
+/// ancillary=N+1 leaves chunk N+1 unrepresented on disk (a gap), which
+/// then trips the canonicality check at startup and triggers a spurious
+/// genesis replay. Passing `None` falls back to the legacy "latest"
+/// behaviour (kept for tests and CLI callers that have no main reference).
+///
 /// Steps:
-/// 1. Fetch the latest Cardano Database snapshot from the aggregator.
-/// 2. Extract the cloud storage URI for the ancillary archive.
-/// 3. Download the tar.zst archive with progress reporting.
-/// 4. Extract to a temporary directory.
-/// 5. Parse and verify the ancillary manifest (file digests + Ed25519 signature).
-/// 6. Return the path to the extracted ancillary directory.
+/// 1. Fetch Cardano Database snapshot list from the aggregator.
+/// 2. Select either the pinned snapshot (when `pin_to_immutable=Some`)
+///    or the latest entry.
+/// 3. Extract the cloud storage URI for the ancillary archive.
+/// 4. Download the tar.zst archive with progress reporting.
+/// 5. Extract to a temporary directory.
+/// 6. Parse and verify the ancillary manifest (file digests + Ed25519 signature).
+/// 7. Return the path to the extracted ancillary directory.
 #[allow(dead_code)]
 pub(crate) async fn download_ancillary(
     aggregator: &str,
     network_magic: u64,
     _database_path: &Path,
     temp_dir: &Path,
+    pin_to_immutable: Option<u64>,
 ) -> Result<PathBuf> {
     let client = reqwest::Client::builder()
         .user_agent("dugite-node/0.1")
@@ -2253,9 +2321,14 @@ pub(crate) async fn download_ancillary(
     )
     .await?;
 
-    let latest = snapshots
-        .first()
-        .context("No Cardano Database snapshots available")?;
+    let latest = select_cardano_db_snapshot(&snapshots, pin_to_immutable)?;
+    if pin_to_immutable.is_some() {
+        info!(
+            target_immutable = ?pin_to_immutable,
+            matched_hash = %latest.hash,
+            "Found cardano-database snapshot matching main archive"
+        );
+    }
 
     info!(
         hash = %latest.hash,
@@ -4606,5 +4679,99 @@ mod tests {
             Some(&"some-avk".to_string()),
             "pre-existing message parts must be preserved"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // select_cardano_db_snapshot pairing logic (regression for chunk-gap bug)
+    //
+    // Repro: dugite queries V1 `/artifact/snapshots` for the main archive at
+    // T=0; the aggregator returns immutable=N. Main download/extract takes
+    // ~2 min. dugite then queries V2 `/artifact/cardano-database` for the
+    // ancillary at T+2min; the aggregator has published a newer snapshot
+    // (immutable=N+1) in the meantime. The ancillary at N+1 delivers chunk
+    // N+2 (its partial chunk past the finalized boundary), leaving chunk
+    // N+1 absent from disk. dugite's canonicality check then classifies the
+    // haskell-ledger tip (which lives in the missing chunk N+1) as a "dead
+    // fork" and triggers a spurious genesis replay.
+    //
+    // The fix: pin the V2 selection to the same immutable_file_number as
+    // the V1 main snapshot.
+    // -----------------------------------------------------------------------
+
+    fn mk_db_snapshot(hash: &str, immutable: u64) -> CardanoDatabaseSnapshotListItem {
+        let json = format!(
+            r#"{{"hash":"{hash}","beacon":{{"epoch":1304,"immutable_file_number":{immutable}}}}}"#
+        );
+        serde_json::from_str(&json).expect("test fixture deserialize")
+    }
+
+    #[test]
+    fn pin_to_immutable_selects_matching_snapshot() {
+        let snapshots = vec![
+            mk_db_snapshot("hash-26089", 26089),
+            mk_db_snapshot("hash-26088", 26088),
+            mk_db_snapshot("hash-26087", 26087),
+        ];
+        let selected = select_cardano_db_snapshot(&snapshots, Some(26088))
+            .expect("matching snapshot must be returned");
+        assert_eq!(selected.hash, "hash-26088");
+        assert_eq!(selected.beacon.immutable_file_number, 26088);
+    }
+
+    #[test]
+    fn pin_to_immutable_does_not_pick_latest_when_match_is_older() {
+        // Aggregator just published 26089 (newer than the 26088 main archive
+        // we already downloaded). We MUST not pick 26089 — that would leave
+        // chunk 26089 missing on disk.
+        let snapshots = vec![
+            mk_db_snapshot("hash-26089-latest", 26089),
+            mk_db_snapshot("hash-26088-paired", 26088),
+        ];
+        let selected = select_cardano_db_snapshot(&snapshots, Some(26088)).unwrap();
+        assert_eq!(
+            selected.hash, "hash-26088-paired",
+            "must pair with main's immutable_file_number, not pick latest"
+        );
+    }
+
+    #[test]
+    fn pin_to_immutable_errors_when_no_match() {
+        // Aggregator garbage-collected the snapshot version we're trying to
+        // pair with. Fail loudly rather than silently picking a mismatched
+        // ancillary.
+        let snapshots = vec![
+            mk_db_snapshot("hash-26090", 26090),
+            mk_db_snapshot("hash-26089", 26089),
+        ];
+        let err = select_cardano_db_snapshot(&snapshots, Some(26088))
+            .expect_err("no-match must produce an error, not a silent fallback");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("immutable_file_number=26088"),
+            "error must name the target immutable, got: {msg}"
+        );
+        assert!(
+            msg.contains("[26090, 26089]") || msg.contains("[26089, 26090]"),
+            "error must list available versions for debuggability, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn pin_to_immutable_none_falls_back_to_latest() {
+        // Legacy "pick the first entry" behaviour for callers without a
+        // main reference to pin to.
+        let snapshots = vec![
+            mk_db_snapshot("hash-26090", 26090),
+            mk_db_snapshot("hash-26089", 26089),
+        ];
+        let selected = select_cardano_db_snapshot(&snapshots, None).unwrap();
+        assert_eq!(selected.hash, "hash-26090");
+    }
+
+    #[test]
+    fn empty_snapshot_list_errors_in_both_modes() {
+        let empty: Vec<CardanoDatabaseSnapshotListItem> = Vec::new();
+        assert!(select_cardano_db_snapshot(&empty, None).is_err());
+        assert!(select_cardano_db_snapshot(&empty, Some(26088)).is_err());
     }
 }

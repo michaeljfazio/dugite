@@ -744,6 +744,27 @@ impl ImmutableDB {
         self.tip_block_no
     }
 
+    /// Returns `true` if any present chunk's observed slot range contains
+    /// `slot` (i.e., `first_slot <= slot <= last_slot` for some chunk).
+    ///
+    /// This is the inverse of "does `slot` fall in a chunk-level gap". A
+    /// chunk-level gap arises when the mithril aggregator's main archive
+    /// (covering chunks 0..immutable_file_number) plus the ancillary's
+    /// partial chunk at the tip have a missing chunk between them — the
+    /// chunk for the ledger snapshot's tip slot is not delivered by either
+    /// archive even though that chunk's nominal slot range is between two
+    /// present chunks.
+    ///
+    /// Callers use this to distinguish "empty slot inside a present chunk"
+    /// (a real fork — the canonical chain says no block existed at that slot)
+    /// from "slot is in a missing chunk's range" (we can't conclude anything;
+    /// trust the haskell-ledger snapshot and let ChainSync backfill).
+    pub fn chunk_covers_slot(&self, slot: u64) -> bool {
+        self.chunks
+            .iter()
+            .any(|c| c.first_slot <= slot && slot <= c.last_slot)
+    }
+
     /// Directory containing the chunk files.
     pub fn dir(&self) -> &Path {
         &self.dir
@@ -1545,6 +1566,57 @@ mod tests {
         let db = ImmutableDB::open(dir.path()).unwrap();
         assert!(!db.has_block(&Hash32::from_bytes([99u8; 32])));
         assert!(db.get_block(&Hash32::from_bytes([99u8; 32])).is_none());
+    }
+
+    #[test]
+    fn test_chunk_covers_slot_within_chunk() {
+        let dir = tempfile::tempdir().unwrap();
+        create_test_chunk(
+            dir.path(),
+            0,
+            &[(b"a", [1u8; 32], 10), (b"b", [2u8; 32], 30)],
+        );
+        let db = ImmutableDB::open(dir.path()).unwrap();
+        // Slot at first/last entry and slot between them are all covered.
+        assert!(db.chunk_covers_slot(10));
+        assert!(db.chunk_covers_slot(20));
+        assert!(db.chunk_covers_slot(30));
+        // Outside the chunk's observed range: not covered.
+        assert!(!db.chunk_covers_slot(9));
+        assert!(!db.chunk_covers_slot(31));
+    }
+
+    #[test]
+    fn test_chunk_covers_slot_with_gap_between_chunks() {
+        // Mirror the production failure mode: main mithril provides chunks
+        // 0 and 2 (i.e. the chunk number-skipping case where the aggregator
+        // delivers a non-contiguous chunk sequence). A snapshot tip slot that
+        // falls in the gap between two present chunks must NOT be reported
+        // as covered — that's the signal the canonicality check needs to
+        // trust the haskell-ledger snapshot.
+        let dir = tempfile::tempdir().unwrap();
+        create_test_chunk(dir.path(), 0, &[(b"a", [1u8; 32], 10)]);
+        create_test_chunk(dir.path(), 2, &[(b"c", [3u8; 32], 50)]);
+        let db = ImmutableDB::open(dir.path()).unwrap();
+
+        assert!(db.chunk_covers_slot(10), "first chunk's slot is covered");
+        assert!(db.chunk_covers_slot(50), "third chunk's slot is covered");
+        assert!(
+            !db.chunk_covers_slot(20),
+            "slot inside the missing-chunk gap must report uncovered"
+        );
+        assert!(
+            !db.chunk_covers_slot(40),
+            "slot just before next chunk's first block must report uncovered"
+        );
+    }
+
+    #[test]
+    fn test_chunk_covers_slot_empty_db() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = ImmutableDB::open(dir.path()).unwrap();
+        assert!(!db.chunk_covers_slot(0));
+        assert!(!db.chunk_covers_slot(1_000_000));
     }
 
     #[test]
