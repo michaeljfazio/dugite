@@ -227,8 +227,8 @@ impl ByronGenesis {
             key_bytes.len()
         );
 
-        let pubkey = pallas_crypto::key::ed25519::PublicKey::try_from(key_bytes.as_slice())
-            .map_err(|e| anyhow::anyhow!("Invalid Ed25519 key: {e}"))?;
+        let mut pubkey = [0u8; 32];
+        pubkey.copy_from_slice(&key_bytes);
 
         // Build network tag: None for mainnet (764824073), Some(cbor(magic)) for testnets
         let network_tag = if protocol_magic == 764824073 {
@@ -241,12 +241,12 @@ impl ByronGenesis {
             Some(tag_buf)
         };
 
-        // Build the redeem address using pallas
-        let payload = pallas_addresses::byron::AddressPayload::new_redeem(pubkey, network_tag);
-        let byron_addr = pallas_addresses::byron::ByronAddress::from(payload);
-
-        // Serialize to CBOR bytes (the wire format)
-        Ok(byron_addr.to_vec())
+        // Build the redeem address via the in-house ByronAddressPayload (M6b).
+        let payload = dugite_primitives::address::byron::ByronAddressPayload::new_redeem(
+            &pubkey,
+            network_tag,
+        );
+        Ok(payload.to_wire_bytes())
     }
 }
 
@@ -1524,13 +1524,17 @@ mod tests {
         let addr_bytes = ByronGenesis::avvm_to_address(pubkey_b64, 764824073).unwrap();
 
         // Should be valid CBOR that decodes as a Byron address
-        let byron_addr = pallas_addresses::byron::ByronAddress::from_bytes(&addr_bytes).unwrap();
-        let payload = byron_addr.decode().unwrap();
+        let payload =
+            dugite_primitives::address::byron::ByronAddressPayload::from_wire_bytes(&addr_bytes)
+                .unwrap();
 
         // Redeem address type
-        assert_eq!(payload.addrtype, pallas_addresses::byron::AddrType::Redeem);
+        assert_eq!(
+            payload.addr_type,
+            dugite_primitives::address::byron::ByronAddrType::Redeem
+        );
         // Address root should be 28 bytes
-        assert_eq!(payload.root.as_ref().len(), 28);
+        assert_eq!(payload.root.len(), 28);
     }
 
     #[test]
@@ -1538,13 +1542,15 @@ mod tests {
         let pubkey_b64 = "-0BJDi-gauylk4LptQTgjMeo7kY9lTCbZv12vwOSTZk=";
         let addr_bytes = ByronGenesis::avvm_to_address(pubkey_b64, 764824073).unwrap();
 
-        let byron_addr = pallas_addresses::byron::ByronAddress::from_bytes(&addr_bytes).unwrap();
-        let payload = byron_addr.decode().unwrap();
+        let payload =
+            dugite_primitives::address::byron::ByronAddressPayload::from_wire_bytes(&addr_bytes)
+                .unwrap();
 
-        // Mainnet should have empty attributes (no network tag)
-        assert!(
-            payload.attributes.is_empty(),
-            "Mainnet AVVM address should have no network tag"
+        // Mainnet should have empty attributes (CBOR-encoded empty map = 0xa0)
+        assert_eq!(
+            payload.attributes.as_slice(),
+            &[0xa0],
+            "Mainnet AVVM address should have empty attributes map"
         );
     }
 
@@ -1554,13 +1560,15 @@ mod tests {
         // Preview testnet magic = 2
         let addr_bytes = ByronGenesis::avvm_to_address(pubkey_b64, 2).unwrap();
 
-        let byron_addr = pallas_addresses::byron::ByronAddress::from_bytes(&addr_bytes).unwrap();
-        let payload = byron_addr.decode().unwrap();
+        let payload =
+            dugite_primitives::address::byron::ByronAddressPayload::from_wire_bytes(&addr_bytes)
+                .unwrap();
 
-        // Testnet should have network tag attribute
+        // Testnet should have non-empty attributes (network tag attribute present)
         assert!(
-            !payload.attributes.is_empty(),
-            "Testnet AVVM address should have network tag"
+            !payload.attributes.is_empty() && payload.attributes != [0xa0],
+            "Testnet AVVM address should have network tag, got attributes={:?}",
+            payload.attributes
         );
     }
 
@@ -1608,9 +1616,14 @@ mod tests {
 
         // Each address should be valid Byron CBOR
         for entry in &utxos {
-            let addr = pallas_addresses::byron::ByronAddress::from_bytes(&entry.address).unwrap();
-            let payload = addr.decode().unwrap();
-            assert_eq!(payload.addrtype, pallas_addresses::byron::AddrType::Redeem);
+            let payload = dugite_primitives::address::byron::ByronAddressPayload::from_wire_bytes(
+                &entry.address,
+            )
+            .unwrap();
+            assert_eq!(
+                payload.addr_type,
+                dugite_primitives::address::byron::ByronAddrType::Redeem
+            );
         }
     }
 

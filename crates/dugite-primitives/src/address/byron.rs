@@ -173,9 +173,7 @@ fn addr_root_hash(
     let sha3_digest: [u8; 32] = Sha3_256::digest(&spec).into();
 
     // Blake2b-224 of the SHA3 output
-    let blake2b_output = Blake2bParams::new()
-        .hash_length(28)
-        .hash(&sha3_digest);
+    let blake2b_output = Blake2bParams::new().hash_length(28).hash(&sha3_digest);
 
     let mut root = [0u8; 28];
     root.copy_from_slice(blake2b_output.as_bytes());
@@ -254,9 +252,7 @@ fn decode_inner(inner: &[u8]) -> Result<ByronAddressPayload, ByronAddressError> 
     let attrs_end = d.position();
     let attributes = inner[attrs_start..attrs_end].to_vec();
 
-    let addr_type_raw = d
-        .u8()
-        .map_err(|e| ByronAddressError::Cbor(e.to_string()))?;
+    let addr_type_raw = d.u8().map_err(|e| ByronAddressError::Cbor(e.to_string()))?;
     let addr_type = ByronAddrType::from_u8(addr_type_raw)?;
 
     Ok(ByronAddressPayload {
@@ -316,8 +312,7 @@ mod tests {
 
     fn base64_decode(s: &str) -> Vec<u8> {
         // Minimal base64 decoder: standard alphabet, handles padding.
-        const ALPHABET: &[u8] =
-            b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+        const ALPHABET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
         let mut table = [0u8; 256];
         for (i, &c) in ALPHABET.iter().enumerate() {
             table[c as usize] = i as u8;
@@ -404,7 +399,11 @@ mod tests {
         assert_eq!(payload.addr_type, ByronAddrType::Redeem);
         assert_eq!(payload.root.len(), 28);
         // Mainnet: empty attributes map (0xa0)
-        assert_eq!(payload.attributes, vec![0xa0u8], "mainnet must have empty attrs");
+        assert_eq!(
+            payload.attributes,
+            vec![0xa0u8],
+            "mainnet must have empty attrs"
+        );
     }
 
     #[test]
