@@ -1088,7 +1088,7 @@ fn test_epoch_nonce_computation() {
         .unwrap();
 
     // Evolving nonce: update_evolving_nonce always hashes nonce_vrf_output once more
-    // before combining — matching pallas generate_rolling_nonce exactly (commit 49f9885).
+    // before combining — matching the legacy generate_rolling_nonce exactly (commit 49f9885).
     //
     // Serialization (multi_era.rs) pre-hashes per era:
     //   TPraos (Shelley-Alonzo): eta = blake2b_256(nonce_vrf_cert.0)  [stored in nonce_vrf_output]
@@ -1173,7 +1173,7 @@ fn test_epoch_nonce_computation() {
     // Haskell ⭒ operator: x ⭒ NeutralNonce = x (identity, no hashing).
     // So epochNonce' = candidateNonce (unmodified).
     //
-    // Note: pallas generate_epoch_nonce unconditionally hashes, but that function is
+    // Note: the legacy decoder generate_epoch_nonce unconditionally hashes, but that function is
     // designed for normal epochs where lastEpochBlockNonce is always a real hash.
     // At genesis, the Haskell type system gives NeutralNonce identity behavior.
     assert_eq!(
@@ -8838,7 +8838,7 @@ fn test_validate_all_rejects_hash_mismatch_at_tip_plus_one() {
 }
 
 /// Under `ApplyOnly` (chunk-file replay), the bypass is retained ONLY for
-/// Byron blocks: pallas's `OriginalHash<32> for KeepRaw<'_, byron::BlockHead>`
+/// Byron blocks: the legacy decoder's `OriginalHash<32> for KeepRaw<'_, byron::BlockHead>`
 /// re-encodes the decoded struct and can produce a hash different from the
 /// original wire bytes. A Byron block at exactly `tip+1` with a mismatched
 /// `prev_hash` is accepted with an info-level log.
@@ -8865,7 +8865,7 @@ fn test_apply_only_accepts_hash_mismatch_at_tip_plus_one() {
     assert!(
         result.is_ok(),
         "ApplyOnly + Byron must retain the tip+1 sequence-number bypass for chunk-file \
-         replay (pallas Byron hash re-encoding bug); got {result:?}"
+         replay (legacy decoder Byron hash re-encoding bug); got {result:?}"
     );
     assert_eq!(state.tip.block_number, BlockNo(11));
 }

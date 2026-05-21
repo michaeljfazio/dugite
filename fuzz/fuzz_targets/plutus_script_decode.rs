@@ -22,9 +22,9 @@
 //!
 //! ⚠️  CURRENTLY EXCLUDED FROM CI ⚠️
 //!
-//! Both `pallas-codec`'s flat decoder and `uplc::tx::apply_params_to_script`
+//! Both `the legacy CBOR codec`'s flat decoder and `uplc::tx::apply_params_to_script`
 //! panic on malformed input from third-party code that we cannot patch:
-//!   - pallas-codec/src/flat/decode/decoder.rs:154 — unchecked unwrap
+//!   - the legacy CBOR codec/src/flat/decode/decoder.rs:154 — unchecked unwrap
 //!   - uplc/src/tx.rs:194 — `Result::unwrap()` on Err(EndOfInput)
 //! These are real DoS findings (a peer-supplied script can crash the node)
 //! that should be filed upstream. Until upstream fixes, this target is kept

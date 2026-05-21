@@ -89,7 +89,7 @@ fn conway_config() -> BlockProducerConfig {
 /// The block body is itself an array(5):
 ///   [header, tx_bodies, tx_witnesses, aux_map, invalid_txs]
 ///
-/// This verifies the outermost wire format only — pallas' decoder is the
+/// This verifies the outermost wire format only — the in-house decoder is the
 /// authoritative Cardano wire format consumer and is used here to parse the
 /// produced bytes.
 #[test]

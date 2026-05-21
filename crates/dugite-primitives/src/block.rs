@@ -87,7 +87,7 @@ pub struct BlockHeader {
     /// - Babbage / Conway (Praos, proto >= 7):
     ///   `nonce_vrf_output = blake2b_256("N" || vrf_result.output)`
     ///   The single `vrf_result` field replaces both nonce_vrf and leader_vrf.
-    ///   The nonce contribution is derived with the "N" tag.  Matches pallas's
+    ///   The nonce contribution is derived with the "N" tag.  Matches the legacy decoder's
     ///   `HeaderBody::nonce_vrf_output()` and Haskell's `vrfNonceValue` in Praos.
     ///
     /// Empty for Byron blocks (OBFT — no VRF).

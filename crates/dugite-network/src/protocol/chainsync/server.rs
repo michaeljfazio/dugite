@@ -43,7 +43,7 @@ use crate::protocol::{storage_era_tag_to_hfc_index, CBOR_TAG_EMBEDDED};
 ///
 /// # Era tag conversion
 ///
-/// The block CBOR uses pallas storage era tags (Byron=0/1, Shelley=2, …,
+/// The block CBOR uses storage era tags (Byron=0/1, Shelley=2, …,
 /// Conway=7).  The N2N ChainSync `MsgRollForward` uses HFC NS indices
 /// (Byron=0, Shelley=1, …, Conway=6) — one less than the storage tag for all
 /// post-Byron eras.  This function converts between the two schemes so that
@@ -626,7 +626,7 @@ mod tests {
     /// Build the expected HFC-wrapped header bytes that `extract_header_for_chainsync`
     /// should produce.
     ///
-    /// `storage_era_tag` is the era tag from the block's on-disk/wire CBOR (pallas
+    /// `storage_era_tag` is the era tag from the block's on-disk/wire CBOR (legacy
     /// convention: Byron=0/1, Shelley=2, ..., Conway=7).  The function converts it
     /// to the HFC NS index and encodes `[hfc_index_u8, #6.24(bstr(header_cbor))]`.
     ///

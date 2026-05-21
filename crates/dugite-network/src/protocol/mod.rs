@@ -28,10 +28,10 @@ pub mod local_state_query;
 /// CBOR tag number for embedded CBOR (RFC 7049 §2.4.4.1 / RFC 8949 §3.4.5.1).
 pub(crate) const CBOR_TAG_EMBEDDED: u64 = 24;
 
-/// Convert a pallas/ImmutableDB block storage era tag to the HFC NS index used
+/// Convert a on-disk/ImmutableDB block storage era tag to the HFC NS index used
 /// in the N2N wire format.
 ///
-/// | Era      | Storage tag (pallas) | HFC NS index |
+/// | Era      | Storage tag (legacy) | HFC NS index |
 /// |----------|----------------------|--------------|
 /// | Byron    | 0 or 1               | 0            |
 /// | Shelley  | 2                    | 1            |
@@ -43,7 +43,7 @@ pub(crate) const CBOR_TAG_EMBEDDED: u64 = 24;
 /// | Dijkstra | 8                    | 7            |
 pub(crate) fn storage_era_tag_to_hfc_index(storage_era_tag: u64) -> Result<u8, String> {
     match storage_era_tag {
-        // Byron: pallas uses both 0 and 1 depending on context; both map to HFC index 0.
+        // Byron: cardano-node uses both 0 and 1 depending on context; both map to HFC index 0.
         0 | 1 => Ok(0),
         2 => Ok(1), // Shelley
         3 => Ok(2), // Allegra

@@ -226,7 +226,7 @@ impl Default for Blake2b256Hasher {
 
 /// Hash `[tag_byte] || data` with Blake2b-224.
 ///
-/// Matches pallas `Hasher::<224>::hash_tagged(&self.0, VERSION as u8)`
+/// Matches the cardano-ledger `Hasher::<224>::hash_tagged(&self.0, VERSION as u8)`
 /// which hashes `[tag] || raw_bytes` for Plutus script hashing.
 /// The tag byte indicates the script version:
 /// 0 = NativeScript, 1 = PlutusV1, 2 = PlutusV2, 3 = PlutusV3.

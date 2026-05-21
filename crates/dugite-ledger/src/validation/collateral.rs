@@ -749,7 +749,7 @@ pub(crate) fn plutus_script_version_map(
 /// version (1=V1, 2=V2, 3=V3) for every redeemer in the transaction.
 ///
 /// The redeemer tag byte matches the Cardano CDDL encoding used by
-/// `eval_phase_two_raw`'s result tuple (the CBOR-encoded pallas `Redeemer`):
+/// `eval_phase_two_raw`'s result tuple (the CBOR-encoded `Redeemer`):
 ///   0 = Spend, 1 = Mint, 2 = Cert, 3 = Reward, 4 = Vote, 5 = Propose.
 ///
 /// This is used by `evaluate_plutus_scripts` to apply the PlutusV3 Unit-return

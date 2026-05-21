@@ -2,7 +2,7 @@
 //!
 //! Uses the `kes-summed-ed25519` crate directly for the Sum6Kes implementation
 //! (depth-6 binary sum composition over Ed25519), matching cardano-node's KES
-//! scheme.  The pallas-crypto wrapper previously used here simply re-exports
+//! scheme.  The wrapper crate previously used here simply re-exports
 //! types from this same upstream crate, so the swap is a pure no-op at the
 //! cryptographic level.
 
@@ -49,7 +49,7 @@ pub enum KesError {
 /// Returns (secret_key_bytes, public_key_bytes).
 /// The secret key bytes include the period counter (SIZE + 4 bytes total).
 ///
-/// IMPORTANT: The pallas Sum6Kes Drop implementation zeroizes the buffer,
+/// IMPORTANT: The the upstream kes-summed-ed25519 Sum6Kes Drop implementation zeroizes the buffer,
 /// so we must copy the bytes before the key object is dropped.
 pub fn kes_keygen(seed: &[u8; 32]) -> Result<(Vec<u8>, [u8; 32]), KesError> {
     let mut key_buffer = vec![0u8; KES_SECRET_KEY_BUFFER_SIZE];
@@ -203,7 +203,7 @@ fn check_key_size(len: usize) -> Result<(), KesError> {
     Ok(())
 }
 
-/// KES key pair (wraps pallas Sum6Kes key material)
+/// KES key pair (wraps the upstream kes-summed-ed25519 Sum6Kes key material)
 #[derive(Debug, Clone)]
 pub struct KesKeyPair {
     pub secret: Vec<u8>,

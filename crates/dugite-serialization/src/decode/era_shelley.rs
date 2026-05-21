@@ -43,7 +43,7 @@
 //! `blake2b_256(raw_header_cbor)` — the hash of the exact bytes of the `header`
 //! struct (the 2-element array containing `[header_body, kes_signature]`).
 //!
-//! This matches pallas `OriginalHash<32> for KeepRaw<'_, alonzo::Header>`:
+//! This matches the cardano-ledger spec `OriginalHash<32> for KeepRaw<'_, alonzo::Header>`:
 //! `Hasher::<256>::hash(self.raw_cbor())`.
 //!
 //! ## Transaction hash
@@ -51,7 +51,7 @@
 //! `blake2b_256(raw_tx_body_cbor)` — the hash of the exact bytes of the transaction
 //! body map (the `KeepRaw<TransactionBody>` CBOR).
 //!
-//! This matches pallas `OriginalHash<32> for KeepRaw<'_, alonzo::TransactionBody>`:
+//! This matches the cardano-ledger spec `OriginalHash<32> for KeepRaw<'_, alonzo::TransactionBody>`:
 //! `Hasher::<256>::hash(self.raw_cbor())`.
 //!
 //! ## Tx body structure (Shelley CDDL)

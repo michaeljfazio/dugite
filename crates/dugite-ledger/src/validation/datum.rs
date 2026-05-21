@@ -55,7 +55,7 @@ use super::ValidationError;
 /// from the original wire bytes.
 ///
 /// For transactions received from the network the witness datums are always
-/// parsed through pallas before being stored in `plutus_data`, so
+/// parsed through the in-house decoder before being stored in `plutus_data`, so
 /// re-encoding is safe.  Any encoding-detail differences (e.g.
 /// indefinite-length arrays) would also exist in the on-chain UTxO datum hash
 /// — but in practice datum hashes committed to UTxOs were produced by

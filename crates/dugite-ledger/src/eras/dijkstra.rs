@@ -12,7 +12,7 @@
 //!
 //! Dijkstra **does** add new tx-level / block-level features layered on top
 //! of the unchanged state machine. Those are NOT implemented here yet
-//! because they require native pallas Dijkstra wire-format support (issue
+//! because they require native Dijkstra wire-format support (issue
 //! #466) to decode in the first place. They are catalogued under the
 //! `dijkstra_unimplemented` test module below as `#[ignore]` placeholders
 //! and linked to follow-on issues so future work has a concrete checklist.
@@ -26,7 +26,7 @@
 //! `Cardano.Ledger.Dijkstra.Translation` (state unchanged, only era tag
 //! advances).
 //!
-//! ## What's deferred (require pallas #466 + spec stability)
+//! ## What's deferred (require #466 + spec stability)
 //!
 //! - **Sub-transactions** (TxBody key 23): nested SUB-rule hierarchy
 //!   (`SUBLEDGERS`/`SUBLEDGER`/`SUBUTXO`/`SUBUTXOW`/`SUBCERT`/`SUBCERTS`/
@@ -120,7 +120,7 @@ impl EraRules for DijkstraRules {
         // Dijkstra-only TxBody fields (keys 23 sub_transactions, 25
         // direct_deposits, 26 account_balance_intervals) and the new key-14
         // credential-guard semantics are unreachable through the current
-        // pallas decoder (#466). When they land, this delegate is replaced
+        // the in-house decoder (#466). When they land, this delegate is replaced
         // by a Dijkstra-specific pipeline that:
         //   1. validates `account_balance_intervals` against reward
         //      account balances (UTXO predicate),
@@ -144,7 +144,7 @@ impl EraRules for DijkstraRules {
         epochs: &mut EpochSubState,
     ) -> Result<UtxoDiff, LedgerError> {
         // CIP-0167 removes the top-level `isValid` flag in Dijkstra. Until
-        // pallas exposes the restructured invalid-tx flow we keep the
+        // the upstream spec exposes the restructured invalid-tx flow we keep the
         // Conway path — the on-the-wire Dijkstra blocks observed during
         // preview activation (2026-05-07 onwards) still round-trip through
         // the Conway invalid-tx semantics via the multi_era byte-patch
@@ -178,7 +178,7 @@ impl EraRules for DijkstraRules {
     ) {
         // Issue #462 Phase 7.3: Dijkstra adds a `prevNonceBlockHeaderL` lens
         // for cross-epoch nonce chaining adjustments. The wire-level header
-        // may gain a `prevNonce` field. Until pallas exposes it our header
+        // may gain a `prevNonce` field. Until the upstream spec exposes it our header
         // type carries no extra slot, so we evolve nonce per Conway/Praos.
         self.conway().evolve_nonce(header, ctx, consensus)
     }
@@ -581,7 +581,7 @@ mod tests {
     // -- unimplemented Dijkstra features (tracked) -------------------------
     //
     // Each test below is an `#[ignore]` placeholder pinning a concrete
-    // Dijkstra-only behaviour to a follow-up issue. When pallas (#466)
+    // Dijkstra-only behaviour to a follow-up issue. When (#466)
     // lands native Dijkstra support and the relevant Phase work proceeds,
     // strip the `#[ignore]` and fill in the body.
     mod dijkstra_unimplemented {

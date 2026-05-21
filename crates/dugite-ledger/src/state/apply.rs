@@ -136,9 +136,9 @@ impl LedgerState {
                                 got_prev = %block.prev_hash().to_hex(),
                                 era = ?block.era,
                                 "ApplyOnly (Byron): accepting block by sequence number despite \
-                                 hash mismatch — pallas byron::BlockHead `OriginalHash` re-encodes \
+                                 hash mismatch — byron::BlockHead `OriginalHash` re-encodes \
                                  instead of using raw bytes; Shelley+ uses raw bytes and cannot \
-                                 exhibit this mismatch. Tracked upstream in pallas."
+                                 exhibit this mismatch. Tracked upstream in the in-house decoder."
                             );
                         }
                         _ => {
@@ -1598,7 +1598,7 @@ mod tests {
     // ── Test 16: ApplyOnly rejects Shelley+ hash mismatch ────────────────────
     //
     // After Sprint 1 Task 1, `ApplyOnly` only tolerates hash mismatch for Byron
-    // blocks. Shelley+ blocks must still be rejected — pallas's Shelley-era
+    // blocks. Shelley+ blocks must still be rejected — the legacy decoder's Shelley-era
     // `OriginalHash` uses raw bytes so hash mismatch cannot legitimately occur
     // through the decode→store→decode cycle.
     #[test]
@@ -1626,12 +1626,12 @@ mod tests {
         assert_eq!(state.tip.block_number, BlockNo(10));
     }
 
-    // ── Test 17: ApplyOnly accepts Byron hash mismatch (pallas re-encode bug) ──
+    // ── Test 17: ApplyOnly accepts Byron hash mismatch (re-encode bug) ──
     //
-    // The `ApplyOnly` bypass is retained for Byron blocks: pallas's
+    // The `ApplyOnly` bypass is retained for Byron blocks: the legacy decoder's
     // `OriginalHash<32> for KeepRaw<'_, byron::BlockHead>` re-encodes the
     // decoded struct and can produce a hash different from the original wire
-    // bytes. Chunk-file replay must tolerate this until the pallas upstream
+    // bytes. Chunk-file replay must tolerate this until the in-house upstream
     // fix lands (tracked separately).
     #[test]
     fn test_apply_only_byron_hash_mismatch_accepted() {
@@ -1644,7 +1644,7 @@ mod tests {
         };
 
         // Byron-era block at tip+1 with a prev_hash that does NOT match tip
-        // hash — must be accepted in ApplyOnly mode (pallas bypass retained).
+        // hash — must be accepted in ApplyOnly mode (legacy-decoder bypass retained).
         let mut byron_block = make_test_block(Era::Byron, 101, 11, 1, 0, vec![]);
         // prev_hash = 0xBB... does not match tip hash = 0xAA...
         byron_block.header.prev_hash = Hash32::from_bytes([0xBBu8; 32]);
@@ -1653,7 +1653,7 @@ mod tests {
 
         assert!(
             result.is_ok(),
-            "ApplyOnly + Byron era must retain the bypass until pallas upstream fix. Got: {result:?}"
+            "ApplyOnly + Byron era must retain the bypass until upstream fix. Got: {result:?}"
         );
         assert_eq!(state.tip.block_number, BlockNo(11));
     }

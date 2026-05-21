@@ -315,9 +315,14 @@ impl Node {
                             if next_slot.0 > rollback_slot {
                                 break;
                             }
-                            match dugite_serialization::multi_era::decode_block_minimal_with_byron_epoch_length(&cbor, self.byron_epoch_length) {
+                            match dugite_serialization::decode_block_minimal_with_byron_epoch_length(
+                                &cbor,
+                                self.byron_epoch_length,
+                            ) {
                                 Ok(block) => {
-                                    if let Err(e) = ls.apply_block(&block, BlockValidationMode::ApplyOnly) {
+                                    if let Err(e) =
+                                        ls.apply_block(&block, BlockValidationMode::ApplyOnly)
+                                    {
                                         warn!(
                                             slot = next_slot.0,
                                             "Gap-bridge: ledger apply failed: {e} — stopping advance"
@@ -328,7 +333,10 @@ impl Node {
                                     current_slot = next_slot.0;
                                 }
                                 Err(e) => {
-                                    warn!("Gap-bridge: failed to decode block at slot {}: {e}", next_slot.0);
+                                    warn!(
+                                        "Gap-bridge: failed to decode block at slot {}: {e}",
+                                        next_slot.0
+                                    );
                                     break;
                                 }
                             }
@@ -525,7 +533,7 @@ impl Node {
                                     }
                                     // Minimal decode: rollback replay uses ApplyOnly
                                     // mode, so witness-set data is never read.
-                                    match dugite_serialization::multi_era::decode_block_minimal_with_byron_epoch_length(&cbor, self.byron_epoch_length) {
+                                    match dugite_serialization::decode_block_minimal_with_byron_epoch_length(&cbor, self.byron_epoch_length) {
                                         Ok(block) => {
                                             if let Err(e) = ls.apply_block(&block, BlockValidationMode::ApplyOnly) {
                                                 error!(
@@ -1103,7 +1111,7 @@ impl Node {
                                 }
                                 // Minimal decode: gap-bridge replay uses ApplyOnly
                                 // mode, so witness-set data is never read.
-                                match dugite_serialization::multi_era::decode_block_minimal_with_byron_epoch_length(&cbor, self.byron_epoch_length) {
+                                match dugite_serialization::decode_block_minimal_with_byron_epoch_length(&cbor, self.byron_epoch_length) {
                                     Ok(block) => {
                                         // Verify the block connects to the ledger tip
                                         // before applying.  ImmutableDB may contain
@@ -2060,7 +2068,7 @@ impl Node {
                 // the witness set (vkey witnesses, scripts, redeemers, Plutus
                 // data) is the largest per-tx allocation and is never read by
                 // the ledger during ApplyOnly block application.
-                match dugite_serialization::multi_era::decode_block_minimal_with_byron_epoch_length(
+                match dugite_serialization::decode_block_minimal_with_byron_epoch_length(
                     cbor, bel,
                 ) {
                     Ok(block) => {
@@ -2273,7 +2281,7 @@ impl Node {
                 match (next_block, ledger_tip_hash) {
                     (Ok(Some((_slot, _hash, cbor))), Some(expected_prev)) => {
                         // Decode just enough to get prev_hash.
-                        match dugite_serialization::multi_era::decode_block_minimal_with_byron_epoch_length(
+                        match dugite_serialization::decode_block_minimal_with_byron_epoch_length(
                             &cbor,
                             self.byron_epoch_length,
                         ) {
@@ -2480,7 +2488,7 @@ impl Node {
 
                     // Minimal decode: LSM replay always uses ApplyOnly mode;
                     // witness-set fields are never accessed.
-                    match dugite_serialization::multi_era::decode_block_minimal_with_byron_epoch_length(
+                    match dugite_serialization::decode_block_minimal_with_byron_epoch_length(
                         &cbor,
                         self.byron_epoch_length,
                     ) {
@@ -2488,10 +2496,7 @@ impl Node {
                             let mut ls = self.ledger_state.write().await;
                             let block_no = ls.tip.block_number.0 + 1;
                             if let Err(e) = ls.apply_block(&block, BlockValidationMode::ApplyOnly) {
-                                warn!(
-                                    slot = next_slot.0,
-                                    "Replay ledger apply failed: {e}"
-                                );
+                                warn!(slot = next_slot.0, "Replay ledger apply failed: {e}");
                             }
                             replayed += 1;
                             current_slot = next_slot.0;
@@ -2531,7 +2536,8 @@ impl Node {
                                 // bulk snapshot has correct pool_stake values using the
                                 // current incremental stake_distribution.
                                 ls.recompute_snapshot_pool_stakes();
-                                ls.consensus.opcert_counters = self.consensus.opcert_counters().clone();
+                                ls.consensus.opcert_counters =
+                                    self.consensus.opcert_counters().clone();
                                 if let Err(e) = ls.save_snapshot(&snapshot_path) {
                                     warn!("Failed to save ledger snapshot during replay: {e}");
                                 }
@@ -2539,7 +2545,10 @@ impl Node {
                             }
                         }
                         Err(e) => {
-                            warn!(slot = next_slot.0, "Failed to decode block during replay: {e}");
+                            warn!(
+                                slot = next_slot.0,
+                                "Failed to decode block during replay: {e}"
+                            );
                             // Advance past the undecodable slot to avoid an infinite loop.
                             current_slot = next_slot.0;
                         }
@@ -3058,12 +3067,10 @@ pub async fn chainsync_client_task(
         if let Ok(Some((_next_slot, _hash, cbor))) =
             db.get_next_block_after_slot(dugite_primitives::time::SlotNo(ledger_slot))
         {
-            if let Ok(block) =
-                dugite_serialization::multi_era::decode_block_minimal_with_byron_epoch_length(
-                    &cbor,
-                    byron_epoch_length,
-                )
-            {
+            if let Ok(block) = dugite_serialization::decode_block_minimal_with_byron_epoch_length(
+                &cbor,
+                byron_epoch_length,
+            ) {
                 let ledger_hash = ledger_tip.hash();
                 if ledger_hash.is_some_and(|h| h != block.prev_hash()) {
                     warn!(

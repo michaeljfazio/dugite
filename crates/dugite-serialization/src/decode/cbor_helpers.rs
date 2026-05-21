@@ -2,7 +2,7 @@
 //!
 //! These helpers measure / extract pieces of a Cardano block envelope without
 //! decoding the full block. They were previously hosted in `crate::multi_era`
-//! alongside the pallas-backed decoder; M6 cutover moves them here as
+//! alongside the legacy decoder; M6 cutover moves them here as
 //! `crate::multi_era` is deleted.
 //!
 //! Used by:

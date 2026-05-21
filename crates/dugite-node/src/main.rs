@@ -644,7 +644,7 @@ async fn run_dump_snapshot(args: DumpSnapshotArgs) -> Result<()> {
 
     // Dump-snapshot replay walks from genesis (start_after_slot = 0).
     mithril::replay_from_chunk_files(&immutable_dir, 0, byron_epoch_length, |cbor| {
-        let block = dugite_serialization::multi_era::decode_block_minimal_with_byron_epoch_length(
+        let block = dugite_serialization::decode_block_minimal_with_byron_epoch_length(
             cbor,
             byron_epoch_length,
         )
