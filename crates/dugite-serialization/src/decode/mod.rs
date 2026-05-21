@@ -45,6 +45,22 @@ pub(crate) mod raw;
 #[allow(dead_code)]
 pub(crate) mod reader;
 
+// In-house era decoders — M4a-in-progress (Byron + Shelley).
+//
+// Currently unwired: the public `decode_block` below still delegates to
+// `crate::multi_era::*`. These modules will become live once each era's
+// output has been byte-exact verified against pallas via the M3 shadow
+// harness on the real_blocks test corpus.
+//
+// Dead-code allowance: the era modules expose `decode_byron_main_block`,
+// `decode_byron_ebb_block`, and `decode_shelley_block(_minimal)` for the
+// follow-up activation PR; until that PR lands, no caller exists outside
+// each module's own unit tests.
+#[allow(dead_code, unused_imports, unused_variables)]
+pub(crate) mod era_byron;
+#[allow(dead_code, unused_imports, unused_variables)]
+pub(crate) mod era_shelley;
+
 use crate::error::SerializationError;
 use dugite_primitives::block::Block;
 use dugite_primitives::transaction::Transaction;

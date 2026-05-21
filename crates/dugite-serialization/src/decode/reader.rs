@@ -305,6 +305,16 @@ impl<'b> Reader<'b> {
         }
     }
 
+    /// Read a definite-length CBOR text string (major type 3), returning a
+    /// zero-copy `&str` slice of the original buffer.
+    ///
+    /// Used for transaction metadata text values (`TransactionMetadatum::Text`).
+    pub fn read_str(&mut self) -> Result<&'b str, SerializationError> {
+        self.inner
+            .str()
+            .map_err(|e| SerializationError::CborDecode(format!("str: {e}")))
+    }
+
     /// Read an indefinite-length CBOR byte string (`0x5f ... 0xff`), concatenating
     /// all chunks in wire order.
     ///
