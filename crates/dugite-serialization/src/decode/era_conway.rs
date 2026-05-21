@@ -785,7 +785,18 @@ fn read_datum_option(r: &mut Reader<'_>) -> Result<OutputDatum, SerializationErr
     }
 }
 
-/// Read a script reference: tag(24) bytes wrapping `[script_type, script_bytes]`.
+/// Read a script reference: `#6.24(bytes .cbor script)` where the embedded
+/// CBOR is `[script_type, script_value]`.
+///
+/// **Script-type-dependent shape of `script_value`** (Conway CDDL):
+/// - `script_type == 0` (native_script): the value is the native_script CBOR
+///   itself — an array, NOT wrapped in a bytes string. Reading `read_bytes`
+///   here trips the "expected bytes, got array" decode failure that orphaned
+///   preprod block 4734057 at slot 123,678,510.
+/// - `script_type == 1/2/3` (plutus_v1/v2/v3): the value is a bytes string
+///   containing the serialized Plutus script.
+///
+/// This mirrors the Babbage `read_script_ref` shape (see `era_babbage.rs`).
 fn read_script_ref(
     r: &mut Reader<'_>,
 ) -> Result<dugite_primitives::transaction::ScriptRef, SerializationError> {
@@ -800,17 +811,24 @@ fn read_script_ref(
         )));
     }
     let script_type = sr.read_uint()?;
-    let script_bytes = sr.read_bytes()?.to_vec();
     match script_type {
         0 => {
-            // Native script — decode it
-            let mut ns_r = Reader::new(&script_bytes);
-            let ns = read_native_script(&mut ns_r)?;
+            // Native script — value is an array, read in place.
+            let ns = read_native_script(&mut sr)?;
             Ok(ScriptRef::NativeScript(ns))
         }
-        1 => Ok(ScriptRef::PlutusV1(script_bytes)),
-        2 => Ok(ScriptRef::PlutusV2(script_bytes)),
-        3 => Ok(ScriptRef::PlutusV3(script_bytes)),
+        1 => {
+            let script_bytes = sr.read_bytes()?.to_vec();
+            Ok(ScriptRef::PlutusV1(script_bytes))
+        }
+        2 => {
+            let script_bytes = sr.read_bytes()?.to_vec();
+            Ok(ScriptRef::PlutusV2(script_bytes))
+        }
+        3 => {
+            let script_bytes = sr.read_bytes()?.to_vec();
+            Ok(ScriptRef::PlutusV3(script_bytes))
+        }
         other => Err(SerializationError::CborDecode(format!(
             "script_ref: unknown script type {other}"
         ))),
@@ -3341,5 +3359,130 @@ mod tests {
         assert_eq!(vp.len(), 1);
         let inner = vp.values().next().unwrap();
         assert_eq!(inner.len(), 1);
+    }
+
+    // ── script_ref native-script shape regression ──────────────────────────────
+    //
+    // The Conway CDDL has a type-dependent shape inside the embedded script_ref:
+    //   script = [ 0, native_script ]      ← native_script is an array, NOT bytes
+    //          / [ 1, plutus_v1_script ]   ← plutus_v* are bytes
+    //          / [ 2, plutus_v2_script ]
+    //          / [ 3, plutus_v3_script ]
+    //
+    // The pre-fix code unconditionally called read_bytes() after reading
+    // script_type, which decode-failed at "position 2" for native scripts
+    // (the array header byte for the inline native_script body).
+    //
+    // Repro: preprod block 4,734,057 at slot 123,678,510 contained an output
+    // with a script_ref carrying a native multi-sig script. The decoder
+    // refused the block, the BlockFetch path could not store it, and
+    // dugite's chain stuck at the previous block while the network advanced.
+
+    /// Wrap inner CBOR into the `#6.24(bytes .cbor X)` tag-24-bytes envelope.
+    fn embed_cbor_tag24(inner: &[u8]) -> Vec<u8> {
+        let mut out = vec![0xd8, 0x18]; // tag 24
+        out.extend(cbor_bytes(inner));
+        out
+    }
+
+    /// Inline native script: `[3, 1, [[0, addr_keyhash(28 bytes)]]]` = 1-of-1
+    /// signature requirement. Mirrors the exact byte pattern from the failing
+    /// preprod block.
+    fn synthetic_native_script_cbor() -> Vec<u8> {
+        // [3, 1, [[0, addr_keyhash(28)]]] = script_n_of_k(n=1, [script_pubkey])
+        let mut v = vec![
+            0x83, // array(3) — script_n_of_k
+            0x03, //   uint 3 — discriminator
+            0x01, //   uint 1 — n
+            0x81, //   array(1) — children
+            0x82, //     array(2) — script_pubkey [0, keyhash]
+            0x00, //       uint 0 — script_pubkey discriminator
+        ];
+        v.extend(cbor_bytes(&[0xaau8; 28])); //  bytes(28) — addr_keyhash
+        v
+    }
+
+    #[test]
+    fn script_ref_native_script_decodes_as_array_not_bytes() {
+        use dugite_primitives::transaction::ScriptRef;
+
+        let ns = synthetic_native_script_cbor();
+        // inner = [0, native_script]
+        let mut inner = vec![0x82, 0x00];
+        inner.extend(&ns);
+        let outer = embed_cbor_tag24(&inner);
+
+        let mut r = Reader::new(&outer);
+        let parsed = read_script_ref(&mut r)
+            .expect("native script_ref must decode (regression: preprod 4734057)");
+        match parsed {
+            ScriptRef::NativeScript(_) => {}
+            other => panic!("expected NativeScript, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn script_ref_plutus_v1_decodes_as_bytes() {
+        use dugite_primitives::transaction::ScriptRef;
+        let script = vec![0xde, 0xad, 0xbe, 0xef];
+        let mut inner = vec![0x82, 0x01];
+        inner.extend(cbor_bytes(&script));
+        let outer = embed_cbor_tag24(&inner);
+
+        let mut r = Reader::new(&outer);
+        let parsed = read_script_ref(&mut r).expect("plutus v1 script_ref must decode");
+        match parsed {
+            ScriptRef::PlutusV1(bytes) => assert_eq!(bytes, script),
+            other => panic!("expected PlutusV1, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn script_ref_plutus_v2_decodes_as_bytes() {
+        use dugite_primitives::transaction::ScriptRef;
+        let script = vec![0x12, 0x34, 0x56];
+        let mut inner = vec![0x82, 0x02];
+        inner.extend(cbor_bytes(&script));
+        let outer = embed_cbor_tag24(&inner);
+
+        let mut r = Reader::new(&outer);
+        let parsed = read_script_ref(&mut r).expect("plutus v2 script_ref must decode");
+        match parsed {
+            ScriptRef::PlutusV2(bytes) => assert_eq!(bytes, script),
+            other => panic!("expected PlutusV2, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn script_ref_plutus_v3_decodes_as_bytes() {
+        use dugite_primitives::transaction::ScriptRef;
+        let script = vec![0xab, 0xcd];
+        let mut inner = vec![0x82, 0x03];
+        inner.extend(cbor_bytes(&script));
+        let outer = embed_cbor_tag24(&inner);
+
+        let mut r = Reader::new(&outer);
+        let parsed = read_script_ref(&mut r).expect("plutus v3 script_ref must decode");
+        match parsed {
+            ScriptRef::PlutusV3(bytes) => assert_eq!(bytes, script),
+            other => panic!("expected PlutusV3, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn script_ref_unknown_script_type_errors_cleanly() {
+        // Type 7 is not defined for Conway. Must surface as a CborDecode
+        // error, not a panic or silent skip.
+        let mut inner = vec![0x82, 0x07];
+        inner.extend(cbor_bytes(&[0x00]));
+        let outer = embed_cbor_tag24(&inner);
+
+        let mut r = Reader::new(&outer);
+        let err = read_script_ref(&mut r).expect_err("unknown type must error");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("unknown script type"),
+            "error must surface the rejection reason, got: {msg}"
+        );
     }
 }

@@ -1382,6 +1382,25 @@ impl ConnectionLifecycleManager {
                                                 }
                                                 Err(e) => {
                                                     warn!(%addr, "block decode error: {e}");
+                                                    // DEBUG: dump failing CBOR for offline analysis.
+                                                    // Always-on capture for repro of preprod PV11 decode bug.
+                                                    if let Ok(dump_dir) = std::env::var("DUGITE_DECODE_FAIL_DUMP") {
+                                                        let ts = std::time::SystemTime::now()
+                                                            .duration_since(std::time::UNIX_EPOCH)
+                                                            .map(|d| d.as_nanos())
+                                                            .unwrap_or(0);
+                                                        let len = block_cbor.len();
+                                                        let path = std::path::PathBuf::from(&dump_dir)
+                                                            .join(format!("decode_fail_{ts}_{len}.cbor"));
+                                                        if let Some(parent) = path.parent() {
+                                                            let _ = std::fs::create_dir_all(parent);
+                                                        }
+                                                        if let Err(write_err) = std::fs::write(&path, &block_cbor) {
+                                                            warn!(%addr, "failed to dump CBOR: {write_err}");
+                                                        } else {
+                                                            warn!(%addr, path = %path.display(), bytes = block_cbor.len(), "dumped failing block CBOR");
+                                                        }
+                                                    }
                                                 }
                                             }
                                             Ok(())
