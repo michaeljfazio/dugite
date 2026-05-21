@@ -557,7 +557,6 @@ impl<'b> Reader<'b> {
         self.expect_tag(TAG_EMBEDDED_CBOR)?;
         self.read_bytes()
     }
-
 }
 
 // =========================================================================
