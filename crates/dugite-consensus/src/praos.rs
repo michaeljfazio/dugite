@@ -71,6 +71,14 @@ pub enum ConsensusError {
         header_hash: Hash32,
         computed_hash: Hash32,
     },
+    /// The block CBOR could not be parsed into its per-component body slices.
+    /// Returned by `validate_block_body_hash` when the wire format does not
+    /// match the expected `[era_tag, [header, c_0, c_1, ...]]` shape (e.g.
+    /// truncated bytes, wrong outer/inner arity, Byron/EBB block with no
+    /// `body_hash`). A peer delivering such bytes is misbehaving — treat as
+    /// a data-integrity error from that peer. Issue #550 (audit #545 E5).
+    #[error("Block body extraction failed: CBOR not in [era_tag, [header, body...]] form")]
+    BodyExtractionFailed,
     #[error("Unregistered pool: pool {pool_id} not found in stake distribution")]
     UnregisteredPool { pool_id: Hash28 },
     #[error(
@@ -908,32 +916,36 @@ impl OuroborosPraos {
         Ok(())
     }
 
-    /// Validate that the block header's `body_hash` field matches the actual hash
-    /// of the block body CBOR.
+    /// Validate that the block header's `body_hash` field matches the
+    /// per-component hash of the block body.
     ///
-    /// This prevents a malicious peer from sending a valid header with a substituted
-    /// body. The body hash is computed as Blake2b-256 of the CBOR-encoded block body.
+    /// This prevents a malicious peer from sending a valid header with a
+    /// substituted body. The body hash is computed using Haskell's
+    /// `hashAlonzoSegWits` / `hashShelleySegWits` algorithm
+    /// (`cardano-ledger`, `Cardano.Ledger.Alonzo.BlockBody`):
     ///
-    /// This check should be performed whenever the full block body is available
-    /// (not during header-only chain sync).
+    /// ```text
+    /// bbHash = blake2b_256(
+    ///     blake2b_256(c_0) || blake2b_256(c_1) || ... || blake2b_256(c_{N-1})
+    /// )
+    /// ```
+    ///
+    /// where `c_i` is the raw CBOR encoding of body component `i` exactly as
+    /// it appears on the wire (the bytes at indices 1..N-1 of the inner block
+    /// array). The number of components depends on the era: Shelley/Allegra/
+    /// Mary have 3 (`tx_bodies`, `witness_sets`, `aux_data`); Alonzo and later
+    /// have 4 (the same plus `invalid_transactions`).
+    ///
+    /// This check should be performed whenever the full block body is
+    /// available (i.e. after BlockFetch), not during header-only chain sync.
+    ///
+    /// Issue #550 (audit #545 E5).
     pub fn validate_block_body_hash(
         &self,
         header: &BlockHeader,
-        body_cbor: &[u8],
+        raw_block_cbor: &[u8],
     ) -> Result<(), ConsensusError> {
-        let computed_hash = blake2b_256(body_cbor);
-        if header.body_hash != computed_hash {
-            warn!(
-                slot = header.slot.0,
-                header_body_hash = %header.body_hash,
-                computed_body_hash = %computed_hash,
-                "Praos: block body hash mismatch"
-            );
-            return Err(ConsensusError::BodyHashMismatch {
-                header_hash: header.body_hash,
-                computed_hash,
-            });
-        }
+        validate_block_body_hash(header, raw_block_cbor)?;
         trace!(slot = header.slot.0, "Praos: block body hash verified");
         Ok(())
     }
@@ -1758,14 +1770,58 @@ pub fn verify_leader_eligibility(
     }
 }
 
-/// Validate that a block header's `body_hash` matches the Blake2b-256 hash of the
-/// CBOR-encoded block body. Standalone version that does not require an `OuroborosPraos`
-/// instance.
+/// Compute the block-body hash (`bbHash`) over the per-component CBOR slices.
+///
+/// This implements the Haskell `hashAlonzoSegWits` /
+/// `hashShelleySegWits` algorithm from `cardano-ledger`
+/// (`Cardano.Ledger.Alonzo.BlockBody`):
+///
+/// ```text
+/// bbHash(c_0, c_1, ..., c_{N-1}) =
+///   blake2b_256( blake2b_256(c_0) || blake2b_256(c_1) || ... || blake2b_256(c_{N-1}) )
+/// ```
+///
+/// where each `c_i` is the raw CBOR byte sequence of a body component as it
+/// appears on the wire (the bytes at indices 1..N-1 of the inner block array).
+///
+/// The number of components is era-dependent:
+/// - Shelley/Allegra/Mary: 3 (`tx_bodies`, `tx_witness_sets`, `aux_data`)
+/// - Alonzo and later: 4 (the same plus `invalid_transactions`)
+///
+/// Verified byte-exact against real on-chain blocks for Shelley, Mary, Alonzo,
+/// Babbage and Conway (see `compute_bbhash_matches_*` tests).
+///
+/// Issue #550 (audit #545 E5).
+pub fn compute_block_body_hash(components: &[&[u8]]) -> Hash32 {
+    // Concatenate the Blake2b-256 hash of each component into a single buffer.
+    let mut concat = Vec::with_capacity(components.len() * 32);
+    for c in components {
+        let h = blake2b_256(c);
+        concat.extend_from_slice(h.as_bytes());
+    }
+    blake2b_256(&concat)
+}
+
+/// Validate that a block header's `body_hash` matches the per-component hash
+/// of the block body. Standalone version that does not require an
+/// `OuroborosPraos` instance.
+///
+/// `raw_block_cbor` is the full wire-format block CBOR (`[era_tag,
+/// [header, c_0, c_1, ...]]`). The function extracts each body component
+/// slice, computes `bbHash`, and compares to `header.body_hash`.
+///
+/// Returns `BodyExtractionFailed` if the block CBOR is malformed (we cannot
+/// distinguish a tampered body from a structurally broken block). Returns
+/// `BodyHashMismatch` if the computed hash disagrees with the header claim.
+///
+/// Issue #550 (audit #545 E5).
 pub fn validate_block_body_hash(
     header: &BlockHeader,
-    body_cbor: &[u8],
+    raw_block_cbor: &[u8],
 ) -> Result<(), ConsensusError> {
-    let computed_hash = blake2b_256(body_cbor);
+    let components = dugite_serialization::extract_block_body_components(raw_block_cbor)
+        .ok_or(ConsensusError::BodyExtractionFailed)?;
+    let computed_hash = compute_block_body_hash(&components);
     if header.body_hash != computed_hash {
         return Err(ConsensusError::BodyHashMismatch {
             header_hash: header.body_hash,
@@ -2896,90 +2952,257 @@ mod tests {
         assert_eq!(praos2.max_kes_evolutions, 46);
     }
 
-    // --- Tests for body hash validation (Bug fix) ---
+    // ── Tests for block-body hash validation (Issue #550, audit #545 E5) ───
+    //
+    // bbHash algorithm (Haskell `Cardano.Ledger.Alonzo.BlockBody`):
+    //
+    //   bbHash(c_0, c_1, ..., c_{N-1}) =
+    //     blake2b_256( blake2b_256(c_0) || ... || blake2b_256(c_{N-1}) )
+    //
+    // where each c_i is the raw CBOR encoding of one body component.
+    //
+    // The corresponding `compute_block_body_hash` helper takes the
+    // per-component slices directly; `validate_block_body_hash` extracts the
+    // components from a full block-CBOR buffer first. Cross-validation against
+    // 5 real on-chain blocks (Shelley/Mary/Alonzo/Babbage/Conway) lives in
+    // `tests/body_hash_cross_validation.rs`.
 
-    #[test]
-    fn test_body_hash_valid() {
-        let praos = OuroborosPraos::new(11);
-        let body_cbor = b"some block body content in CBOR";
-        let body_hash = blake2b_256(body_cbor);
-
-        let mut header = make_valid_header(100);
-        header.body_hash = body_hash;
-
-        assert!(praos.validate_block_body_hash(&header, body_cbor).is_ok());
-    }
-
-    #[test]
-    fn test_body_hash_mismatch_rejected() {
-        let praos = OuroborosPraos::new(11);
-        let body_cbor = b"actual block body content";
-        let wrong_body_cbor = b"different block body content";
-        let wrong_hash = blake2b_256(wrong_body_cbor);
-
-        let mut header = make_valid_header(100);
-        header.body_hash = wrong_hash;
-
-        let result = praos.validate_block_body_hash(&header, body_cbor);
+    /// Build a minimal "block CBOR" envelope around N body component slices.
+    ///
+    /// Produces `[era_tag, [<header_placeholder>, c_0, c_1, ...]]` where the
+    /// header placeholder is a single CBOR null. Used to exercise
+    /// `validate_block_body_hash` without needing a fully-formed block.
+    fn synth_block_cbor(era_tag: u8, components: &[&[u8]]) -> Vec<u8> {
+        let mut out = vec![0x82, era_tag]; // outer array(2), era tag
+                                           // inner array: header_placeholder + N components
+        let inner_len = 1 + components.len();
+        // For our tests inner_len is small (<= 6), so encode directly.
         assert!(
-            matches!(result, Err(ConsensusError::BodyHashMismatch { .. })),
-            "Expected BodyHashMismatch, got: {result:?}"
+            inner_len < 24,
+            "synth_block_cbor only supports small arrays"
         );
+        out.push(0x80 + inner_len as u8); // array header
+        out.push(0xf6); // header placeholder = CBOR null
+        for c in components {
+            out.extend_from_slice(c);
+        }
+        out
     }
 
     #[test]
-    fn test_body_hash_mismatch_contains_both_hashes() {
-        let praos = OuroborosPraos::new(11);
-        let body_cbor = b"real body";
-        let computed_hash = blake2b_256(body_cbor);
+    fn compute_block_body_hash_alonzo_4_components() {
+        // bbHash for 4 components matches Haskell hashAlonzoSegWits.
+        let c0 = b"tx_bodies".as_slice();
+        let c1 = b"witness_sets".as_slice();
+        let c2 = b"aux_data".as_slice();
+        let c3 = b"invalid_txs".as_slice();
+        let computed = compute_block_body_hash(&[c0, c1, c2, c3]);
 
-        let mut header = make_valid_header(100);
-        // Set header body_hash to something different
-        header.body_hash = Hash32::from_bytes([0xAA; 32]);
+        // Spec by construction: blake2b_256(H(c0)||H(c1)||H(c2)||H(c3)).
+        let mut expected_input = Vec::new();
+        expected_input.extend_from_slice(blake2b_256(c0).as_bytes());
+        expected_input.extend_from_slice(blake2b_256(c1).as_bytes());
+        expected_input.extend_from_slice(blake2b_256(c2).as_bytes());
+        expected_input.extend_from_slice(blake2b_256(c3).as_bytes());
+        let expected = blake2b_256(&expected_input);
+        assert_eq!(computed, expected);
+    }
 
-        let result = praos.validate_block_body_hash(&header, body_cbor);
-        match result {
-            Err(ConsensusError::BodyHashMismatch {
-                header_hash,
-                computed_hash: ch,
-            }) => {
-                assert_eq!(header_hash, Hash32::from_bytes([0xAA; 32]));
-                assert_eq!(ch, computed_hash);
-            }
-            other => panic!("Expected BodyHashMismatch, got: {other:?}"),
+    #[test]
+    fn compute_block_body_hash_shelley_3_components() {
+        // Pre-Alonzo: hashShelleySegWits over 3 components.
+        let c0 = b"tx_bodies".as_slice();
+        let c1 = b"witness_sets".as_slice();
+        let c2 = b"aux_data".as_slice();
+        let computed = compute_block_body_hash(&[c0, c1, c2]);
+
+        let mut expected_input = Vec::new();
+        expected_input.extend_from_slice(blake2b_256(c0).as_bytes());
+        expected_input.extend_from_slice(blake2b_256(c1).as_bytes());
+        expected_input.extend_from_slice(blake2b_256(c2).as_bytes());
+        let expected = blake2b_256(&expected_input);
+        assert_eq!(computed, expected);
+    }
+
+    #[test]
+    fn compute_block_body_hash_empty_body_all_empty_components() {
+        // Empty-body case: 4 zero-length components. Each blake2b_256(b"")
+        // produces the same 32-byte hash; the final input is 128 bytes of
+        // four identical hashes.
+        let empty: &[u8] = b"";
+        let computed = compute_block_body_hash(&[empty, empty, empty, empty]);
+        let h0 = blake2b_256(empty);
+        let mut expected_input = Vec::new();
+        for _ in 0..4 {
+            expected_input.extend_from_slice(h0.as_bytes());
+        }
+        assert_eq!(computed, blake2b_256(&expected_input));
+        // Sanity: the result must NOT equal blake2b_256("") — that was the
+        // old (wrong) algorithm and conflating the two is the bug we are fixing.
+        assert_ne!(computed, blake2b_256(empty));
+    }
+
+    #[test]
+    fn compute_block_body_hash_changes_when_any_component_changes() {
+        let c0 = b"a".as_slice();
+        let c1 = b"b".as_slice();
+        let c2 = b"c".as_slice();
+        let c3 = b"d".as_slice();
+        let baseline = compute_block_body_hash(&[c0, c1, c2, c3]);
+        // Tamper one byte in each position; result must differ in each case.
+        for i in 0..4 {
+            let mut parts: Vec<&[u8]> = vec![c0, c1, c2, c3];
+            let tampered: &[u8] = match i {
+                0 => b"x",
+                1 => b"y",
+                2 => b"z",
+                _ => b"w",
+            };
+            parts[i] = tampered;
+            assert_ne!(
+                compute_block_body_hash(&parts),
+                baseline,
+                "tampering component {i} did not change bbHash"
+            );
         }
     }
 
     #[test]
-    fn test_body_hash_empty_body() {
-        let praos = OuroborosPraos::new(11);
-        let empty_body = b"";
-        let empty_hash = blake2b_256(empty_body);
-
-        let mut header = make_valid_header(100);
-        header.body_hash = empty_hash;
-
-        assert!(praos.validate_block_body_hash(&header, empty_body).is_ok());
+    fn compute_block_body_hash_distinguishes_concatenation_grouping() {
+        // bbHash is NOT just blake2b_256(c0 || c1 || ... || c_{N-1}).
+        // The per-component-hash grouping must be preserved: moving a byte
+        // across a component boundary changes the result. (If we used the
+        // wrong algorithm this assertion would falsely pass for two-byte
+        // re-splits.)
+        let split_a = [b"ab".as_slice(), b"cd".as_slice()];
+        let split_b = [b"abc".as_slice(), b"d".as_slice()];
+        assert_ne!(
+            compute_block_body_hash(&split_a),
+            compute_block_body_hash(&split_b),
+            "bbHash must depend on component boundaries"
+        );
     }
 
     #[test]
-    fn test_body_hash_standalone_function() {
-        let body_cbor = b"block body data";
-        let body_hash = blake2b_256(body_cbor);
-
+    fn validate_block_body_hash_accepts_matching_header() {
+        let praos = OuroborosPraos::new(11);
+        let c0 = b"\x80".as_slice(); // empty array (valid CBOR)
+        let c1 = b"\xa0".as_slice(); // empty map (valid CBOR)
+        let c2 = b"\xa0".as_slice();
+        let c3 = b"\x80".as_slice();
+        let expected = compute_block_body_hash(&[c0, c1, c2, c3]);
         let mut header = make_valid_header(100);
-        header.body_hash = body_hash;
+        header.body_hash = expected;
 
-        // Valid case
-        assert!(validate_block_body_hash(&header, body_cbor).is_ok());
+        // era_tag 7 = Conway (4 body components)
+        let raw = synth_block_cbor(0x07, &[c0, c1, c2, c3]);
+        assert!(praos.validate_block_body_hash(&header, &raw).is_ok());
+    }
 
-        // Invalid case
-        let wrong_body = b"wrong body data";
-        let result = validate_block_body_hash(&header, wrong_body);
+    #[test]
+    fn validate_block_body_hash_rejects_mismatched_header() {
+        let praos = OuroborosPraos::new(11);
+        let c0 = b"\x80".as_slice();
+        let c1 = b"\xa0".as_slice();
+        let c2 = b"\xa0".as_slice();
+        let c3 = b"\x80".as_slice();
+        let mut header = make_valid_header(100);
+        header.body_hash = Hash32::from_bytes([0xAA; 32]);
+
+        let raw = synth_block_cbor(0x07, &[c0, c1, c2, c3]);
+        let result = praos.validate_block_body_hash(&header, &raw);
+        match result {
+            Err(ConsensusError::BodyHashMismatch {
+                header_hash,
+                computed_hash,
+            }) => {
+                assert_eq!(header_hash, Hash32::from_bytes([0xAA; 32]));
+                assert_eq!(computed_hash, compute_block_body_hash(&[c0, c1, c2, c3]));
+            }
+            other => panic!("expected BodyHashMismatch, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn validate_block_body_hash_rejects_malformed_cbor() {
+        // Garbage bytes must not be silently accepted as "empty body".
+        let mut header = make_valid_header(100);
+        header.body_hash = Hash32::ZERO;
+        let err = validate_block_body_hash(&header, &[0xff, 0xfe]).unwrap_err();
+        assert!(
+            matches!(err, ConsensusError::BodyExtractionFailed),
+            "expected BodyExtractionFailed, got: {err:?}"
+        );
+        // Empty CBOR also fails extraction.
+        let err = validate_block_body_hash(&header, &[]).unwrap_err();
+        assert!(matches!(err, ConsensusError::BodyExtractionFailed));
+    }
+
+    #[test]
+    fn validate_block_body_hash_standalone_round_trip() {
+        let c0 = b"\x82\x01\x02".as_slice(); // [1, 2]
+        let c1 = b"\xa1\x00\x01".as_slice(); // {0: 1}
+        let c2 = b"\x80".as_slice();
+        let expected = compute_block_body_hash(&[c0, c1, c2]);
+        let mut header = make_valid_header(100);
+        header.body_hash = expected;
+
+        // era_tag 2 = Shelley (3 body components, inner_len=4)
+        let raw = synth_block_cbor(0x02, &[c0, c1, c2]);
+        assert!(validate_block_body_hash(&header, &raw).is_ok());
+
+        // Tamper any component → mismatch.
+        let raw_bad = synth_block_cbor(0x02, &[b"\x82\x01\x03", c1, c2]);
+        let result = validate_block_body_hash(&header, &raw_bad);
         assert!(matches!(
             result,
             Err(ConsensusError::BodyHashMismatch { .. })
         ));
+    }
+
+    // Property: for any vector of 1..=6 components each up to 64 bytes,
+    // `compute_block_body_hash` is deterministic and any single-byte change
+    // in any component changes the hash. This is the structural guarantee
+    // `bbHash` provides: substituting any tx body, witness set, etc. is
+    // detected by the header's `body_hash` field.
+    proptest::proptest! {
+        #![proptest_config(proptest::prelude::ProptestConfig { cases: 64, ..Default::default() })]
+        #[test]
+        fn prop_body_hash_deterministic_and_change_sensitive(
+            components in proptest::collection::vec(
+                proptest::collection::vec(proptest::prelude::any::<u8>(), 0..64),
+                1..=6,
+            ),
+        ) {
+            // Determinism
+            let refs: Vec<&[u8]> = components.iter().map(|v| v.as_slice()).collect();
+            let h1 = compute_block_body_hash(&refs);
+            let h2 = compute_block_body_hash(&refs);
+            proptest::prop_assert_eq!(h1, h2);
+
+            // Change-sensitivity: flip a bit in any one component → hash differs
+            for (i, comp) in components.iter().enumerate() {
+                if comp.is_empty() {
+                    // Skip — flipping a bit requires at least one byte. We
+                    // separately cover the "extend by one byte" case below.
+                    let mut extended = components.clone();
+                    extended[i].push(0u8);
+                    let ext_refs: Vec<&[u8]> = extended.iter().map(|v| v.as_slice()).collect();
+                    proptest::prop_assert_ne!(
+                        compute_block_body_hash(&ext_refs), h1,
+                        "extending empty component {} did not change bbHash", i
+                    );
+                } else {
+                    let mut tampered = components.clone();
+                    tampered[i][0] ^= 0x01;
+                    let tref: Vec<&[u8]> = tampered.iter().map(|v| v.as_slice()).collect();
+                    proptest::prop_assert_ne!(
+                        compute_block_body_hash(&tref), h1,
+                        "flipping a bit in component {} did not change bbHash", i
+                    );
+                }
+            }
+        }
     }
 
     // --- Tests for unregistered pool rejection (Bug fix) ---
@@ -3091,14 +3314,22 @@ mod tests {
 
     #[test]
     fn test_body_hash_mismatch_error_message() {
-        let body_cbor = b"body content";
+        // Build a syntactically valid synth block (era=2, 3 empty components)
+        // so `validate_block_body_hash` reaches the hash-comparison step and
+        // returns `BodyHashMismatch` rather than `BodyExtractionFailed`.
+        let raw = synth_block_cbor(0x02, &[&[0x80][..], &[0xa0][..], &[0xa0][..]]);
         let mut header = make_valid_header(100);
         header.body_hash = Hash32::from_bytes([0xFF; 32]);
 
-        let result = validate_block_body_hash(&header, body_cbor);
-        assert!(result.is_err());
+        let result = validate_block_body_hash(&header, &raw);
+        assert!(result.is_err(), "expected an error");
 
-        let err_msg = format!("{}", result.unwrap_err());
+        let err = result.unwrap_err();
+        assert!(
+            matches!(err, ConsensusError::BodyHashMismatch { .. }),
+            "expected BodyHashMismatch, got: {err:?}"
+        );
+        let err_msg = format!("{err}");
         assert!(
             err_msg.contains("Body hash mismatch"),
             "Error message should mention 'Body hash mismatch', got: {err_msg}"

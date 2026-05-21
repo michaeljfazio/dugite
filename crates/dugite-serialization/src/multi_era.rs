@@ -317,6 +317,108 @@ pub fn extract_block_body_cbor(raw_cbor: &[u8]) -> Option<&[u8]> {
     Some(&raw_cbor[body_start..off])
 }
 
+/// Extract the raw CBOR bytes of each individual block-body component.
+///
+/// The Cardano wire format is `[era_tag, [header, c_0, c_1, ..., c_{N-1}]]`.
+/// Returns a `Vec` of slices, one per component, in the order they appear on
+/// the wire. The exact component count depends on the era:
+///
+/// - Shelley/Allegra/Mary (`inner_len == 4`): 3 components — `tx_bodies`,
+///   `tx_witness_sets`, `auxiliary_data_set`.
+/// - Alonzo and later (`inner_len == 5`): 4 components — `tx_bodies`,
+///   `tx_witness_sets`, `auxiliary_data_set`, `invalid_transactions`.
+///
+/// Each slice covers the byte range of one component, exactly as encoded in
+/// `raw_cbor` (no copying, no re-serialization). These are the byte ranges
+/// used as input to `bbHash` — see Haskell `Cardano.Ledger.Alonzo.BlockBody`
+/// (`hashAlonzoSegWits` / `txSeqBodyBytes`).
+///
+/// Returns `None` for Byron/EBB blocks (no `body_hash` to verify) or any
+/// CBOR structure that doesn't match the expected `[tag, [header, ...]]`
+/// shape.
+///
+/// Issue #550 E5: per-component view used by `validate_block_body_hash` to
+/// match the Haskell `bbHash` algorithm exactly.
+pub fn extract_block_body_components(raw_cbor: &[u8]) -> Option<Vec<&[u8]>> {
+    use crate::haskell_snapshot::cbor_utils::skip_cbor_value;
+
+    if raw_cbor.is_empty() {
+        return None;
+    }
+
+    // Outer array: [era_tag, inner_block]
+    let outer_major = raw_cbor[0] >> 5;
+    if outer_major != 4 {
+        return None;
+    }
+    let info = raw_cbor[0] & 0x1f;
+    let (outer_len, mut off) = match info {
+        0..=23 => (info as u64, 1usize),
+        24 if raw_cbor.len() >= 2 => (raw_cbor[1] as u64, 2),
+        _ => return None,
+    };
+    if outer_len != 2 {
+        return None;
+    }
+
+    // Read and skip era tag
+    if off >= raw_cbor.len() {
+        return None;
+    }
+    let era_major = raw_cbor[off] >> 5;
+    if era_major != 0 {
+        return None;
+    }
+    let era_info = raw_cbor[off] & 0x1f;
+    let era_tag = match era_info {
+        0..=23 => era_info as u64,
+        24 if raw_cbor.len() > off + 1 => raw_cbor[off + 1] as u64,
+        _ => return None,
+    };
+    if era_tag <= 1 {
+        // Byron — no body_hash
+        return None;
+    }
+    let era_size = skip_cbor_value(&raw_cbor[off..]).ok()?;
+    off += era_size;
+
+    // Inner array: [header, c_0, c_1, ..., c_{N-1}]
+    if off >= raw_cbor.len() {
+        return None;
+    }
+    let inner_major = raw_cbor[off] >> 5;
+    if inner_major != 4 {
+        return None;
+    }
+    let inner_info = raw_cbor[off] & 0x1f;
+    let (inner_len, hdr_bytes) = match inner_info {
+        0..=23 => (inner_info as u64, 1usize),
+        24 if raw_cbor.len() > off + 1 => (raw_cbor[off + 1] as u64, 2),
+        _ => return None,
+    };
+    // Need at least 4 elements (header + 3 body components for Shelley/Mary)
+    if inner_len < 4 {
+        return None;
+    }
+    off += hdr_bytes;
+
+    // Skip the header (index 0)
+    let header_size = skip_cbor_value(&raw_cbor[off..]).ok()?;
+    off += header_size;
+
+    // Capture each component slice
+    let n_components = (inner_len - 1) as usize;
+    let mut components = Vec::with_capacity(n_components);
+    for _ in 0..n_components {
+        let start = off;
+        let item_size = skip_cbor_value(&raw_cbor[off..]).ok()?;
+        off += item_size;
+        components.push(&raw_cbor[start..off]);
+    }
+
+    Some(components)
+}
+
 /// Shared block decode implementation.
 ///
 /// `mode` controls whether witness-set fields are populated.  All callers should
