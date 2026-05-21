@@ -133,3 +133,70 @@ fn mainnet_chunk_08686_first_10_blocks_decode() {
     }
     assert_eq!(failures, 0, "expected zero decode failures");
 }
+
+/// Decode every block in chunk 08685 (Conway era, 4298 blocks).
+///
+/// This is the exhaustive variant of `mainnet_chunk_08686_first_10_blocks_decode`.
+/// It covers the full diversity of Conway-era encodings present in the chunk
+/// (tag-258 sets, indefinite-length arrays, text-URL anchors, etc.) and is the
+/// canonical regression gate for M5 mainnet decoder correctness.
+///
+/// Run with:
+///
+///     cargo nextest run -p dugite-serialization mainnet_chunk_08685_all -- --ignored
+#[test]
+#[ignore]
+fn mainnet_chunk_08685_all_blocks_decode() {
+    let root = db_mainnet_immutable();
+    if !root.exists() {
+        eprintln!("SKIPPING: db-mainnet/immutable not present");
+        return;
+    }
+    let chunk = fs::read(root.join("08685.chunk")).expect("read chunk");
+    let secondary = fs::read(root.join("08685.secondary")).expect("read secondary");
+
+    let n = secondary.len() / 56;
+    eprintln!("chunk has {n} blocks");
+    let mut failures = 0;
+    let mut samples_of_failures: Vec<(usize, String, Vec<u8>)> = Vec::new();
+    for i in 0..n {
+        let off = read_secondary_block_offset(&secondary, i).unwrap() as usize;
+        let next = read_secondary_block_offset(&secondary, i + 1)
+            .map(|n| n as usize)
+            .unwrap_or(chunk.len());
+        let block_cbor = &chunk[off..next];
+        match decode_block(block_cbor) {
+            Ok(_) => {}
+            Err(e) => {
+                failures += 1;
+                if samples_of_failures.len() < 3 {
+                    samples_of_failures.push((i, e.to_string(), block_cbor.to_vec()));
+                }
+            }
+        }
+    }
+    eprintln!("failures: {failures} / {n}");
+    for (i, e, bytes) in &samples_of_failures {
+        eprintln!("\nfail[{i}]: {e}");
+        eprintln!("  size: {}", bytes.len());
+        eprintln!("  first 64: {}", hex::encode(&bytes[..64.min(bytes.len())]));
+        if let Some(pos_str) = e
+            .split("position ")
+            .nth(1)
+            .and_then(|s| s.split(':').next())
+        {
+            if let Ok(pos) = pos_str.parse::<usize>() {
+                let start = pos.saturating_sub(8);
+                let end = (pos + 16).min(bytes.len());
+                eprintln!(
+                    "  bytes [{start}..{end}] (error position={pos}): {}",
+                    hex::encode(&bytes[start..end])
+                );
+            }
+        }
+    }
+    assert_eq!(
+        failures, 0,
+        "expected zero decode failures for all {n} blocks"
+    );
+}

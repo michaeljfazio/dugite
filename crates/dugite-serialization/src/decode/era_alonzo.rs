@@ -786,9 +786,18 @@ fn read_pool_metadata(r: &mut Reader<'_>) -> Result<Option<PoolMetadata>, Serial
             "pool_metadata: expected array(2) or null, got {arr_len:?}"
         )));
     }
-    let url_bytes = r.read_bytes()?;
-    let url = String::from_utf8(url_bytes.to_vec())
-        .map_err(|_| SerializationError::CborDecode("pool_metadata url: invalid UTF-8".into()))?;
+    // pool_metadata_url = text (CDDL). Mainnet uses CBOR major type 3 (text string).
+    // Handle both text and bytes for robustness against non-canonical encodings.
+    let ty = r.peek_major()?;
+    let url = match ty {
+        Type::String => r.read_str()?.to_string(),
+        _ => {
+            let url_bytes = r.read_bytes()?;
+            String::from_utf8(url_bytes.to_vec()).map_err(|_| {
+                SerializationError::CborDecode("pool_metadata url: invalid UTF-8".into())
+            })?
+        }
+    };
     let hash = {
         let bytes = r.read_bytes()?;
         let mut buf = [0u8; 32];
