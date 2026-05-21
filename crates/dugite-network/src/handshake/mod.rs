@@ -443,7 +443,15 @@ fn decode_refuse_reason(dec: &mut Decoder<'_>) -> HandshakeError {
     let reason = match reason_tag {
         0 => {
             // VersionMismatch: [0, [v1, v2, ...]] per CDDL refuseReasonVersionMismatch.
+            //
+            // #554: Cap the array length at MAX_HANDSHAKE_VERSIONS BEFORE
+            // iterating. Without this cap a peer could declare
+            // `array(u64::MAX)` and force `(0..n).collect()` to spin for
+            // ~9e18 iterations (and the implicit `Vec::with_capacity` in
+            // `collect()` for `n=u64::MAX as usize` would attempt a huge
+            // allocation on 64-bit hosts).
             let versions: Vec<u16> = if let Ok(Some(n)) = dec.array() {
+                let n = n.min(MAX_HANDSHAKE_VERSIONS);
                 (0..n).filter_map(|_| dec.u16().ok()).collect()
             } else {
                 vec![]

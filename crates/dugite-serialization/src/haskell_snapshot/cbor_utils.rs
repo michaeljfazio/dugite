@@ -604,12 +604,117 @@ impl MapReader {
     }
 
     /// Hint for pre-allocating collections.  Returns 0 for indefinite maps.
+    ///
+    /// **Cap (#554):** the value is clamped to `MAP_SIZE_HINT_CAP` to
+    /// prevent untrusted CBOR (corrupted snapshot, peer-controlled gov
+    /// state) from forcing a huge `HashMap::with_capacity` allocation. The
+    /// actual decode loop drives `has_next`, so clamping the *hint* never
+    /// truncates real data — it only bounds the initial allocation.
     pub fn size_hint(&self) -> usize {
-        self.remaining.unwrap_or(0)
+        self.remaining.unwrap_or(0).min(MAP_SIZE_HINT_CAP)
     }
+}
+
+/// Cap on the initial `HashMap::with_capacity` allocation when a CBOR map's
+/// declared length is used as a size hint. The Cardano ledger snapshot
+/// contains some genuinely large maps (millions of UTxOs, hundreds of
+/// thousands of stake credentials), so the cap must be generous enough to
+/// allow them — but it MUST exist, because the declared length comes from
+/// CBOR header bytes that an attacker (e.g. via a tampered Mithril snapshot)
+/// can manipulate.
+///
+/// 8M entries × HashMap's per-entry overhead (~48 bytes on x86_64) ≈ 384 MiB.
+/// That's a realistic memory budget for the largest known maps. Anything
+/// beyond that is rejected and the decoder falls back to organic growth.
+pub const MAP_SIZE_HINT_CAP: usize = 8 * 1024 * 1024;
+
+/// Compute a safe `Vec::with_capacity` value for an array whose declared
+/// length came from peer-controlled / untrusted CBOR.
+///
+/// Caps the value at the smaller of:
+///   - the declared length (the natural value),
+///   - the protocol-spec `max_allowed` (or `usize::MAX` if unbounded),
+///   - `remaining_bytes / MIN_BYTES_PER_ELEMENT`, since every CBOR value is
+///     at least 1 byte and a declared length larger than the input cannot
+///     possibly be honest.
+///
+/// Returns `Err` if the declared length exceeds `max_allowed`.
+///
+/// This is the canonical pre-flight for the systemic pattern #5 from audit
+/// #548 / #554. Use it at every site where `Vec::with_capacity(arr_len)` or
+/// `Vec::reserve(arr_len)` is called with `arr_len` derived from CBOR.
+pub fn bounded_alloc_capacity(
+    declared_len: usize,
+    max_allowed: usize,
+    remaining_bytes: usize,
+) -> Result<usize, SerializationError> {
+    if declared_len > max_allowed {
+        return Err(SerializationError::CborDecode(format!(
+            "declared length {declared_len} exceeds protocol-spec max {max_allowed}"
+        )));
+    }
+    if declared_len > remaining_bytes {
+        return Err(SerializationError::CborDecode(format!(
+            "declared length {declared_len} exceeds remaining input bytes ({remaining_bytes})"
+        )));
+    }
+    Ok(declared_len)
 }
 
 /// Construct an "unexpected end of input" error.
 fn eof() -> SerializationError {
     SerializationError::CborDecode("unexpected end of input".into())
+}
+
+#[cfg(test)]
+mod cap_tests {
+    use super::*;
+
+    #[test]
+    fn bounded_alloc_happy() {
+        assert_eq!(bounded_alloc_capacity(100, 1000, 200).unwrap(), 100);
+    }
+
+    #[test]
+    fn bounded_alloc_rejects_over_max() {
+        let err = bounded_alloc_capacity(1001, 1000, 10_000).unwrap_err();
+        assert!(format!("{err:?}").contains("exceeds protocol-spec max"));
+    }
+
+    #[test]
+    fn bounded_alloc_rejects_over_remaining() {
+        let err = bounded_alloc_capacity(100, 1000, 50).unwrap_err();
+        assert!(format!("{err:?}").contains("exceeds remaining input bytes"));
+    }
+
+    #[test]
+    fn bounded_alloc_u64_max_class_attack_rejected() {
+        // The actual attack pattern: arr_len from CBOR is usize::MAX / 8
+        // (typical 64-bit Vec capacity bombs).
+        let err = bounded_alloc_capacity(usize::MAX, 1000, 10).unwrap_err();
+        assert!(format!("{err:?}").contains("exceeds"));
+    }
+
+    #[test]
+    fn map_size_hint_capped() {
+        // MapReader::size_hint shouldn't be larger than MAP_SIZE_HINT_CAP.
+        let reader = MapReader {
+            remaining: Some(usize::MAX),
+        };
+        assert_eq!(reader.size_hint(), MAP_SIZE_HINT_CAP);
+    }
+
+    #[test]
+    fn map_size_hint_indefinite_returns_zero() {
+        let reader = MapReader { remaining: None };
+        assert_eq!(reader.size_hint(), 0);
+    }
+
+    #[test]
+    fn map_size_hint_small_passthrough() {
+        let reader = MapReader {
+            remaining: Some(42),
+        };
+        assert_eq!(reader.size_hint(), 42);
+    }
 }

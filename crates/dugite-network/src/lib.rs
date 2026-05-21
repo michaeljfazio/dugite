@@ -6,6 +6,7 @@
 //! - Layer 3: Mini-protocols (ChainSync, BlockFetch, TxSubmission2, etc.)
 //! - Layer 4: Connection Manager (lifecycle, peer management)
 
+pub mod cbor_limits;
 pub mod codec;
 pub mod error;
 
