@@ -12,7 +12,7 @@
 //! block failures with "expected bytes, got string at variable position".
 //! See `soak-logs/mainnet-20260521-203250.log`.
 
-use dugite_serialization::decode_block;
+use dugite_serialization::{decode_block, decode_block_minimal};
 use std::fs;
 use std::path::Path;
 
@@ -199,4 +199,100 @@ fn mainnet_chunk_08685_all_blocks_decode() {
         failures, 0,
         "expected zero decode failures for all {n} blocks"
     );
+}
+
+/// Sync replay (ApplyOnly) uses `decode_block_minimal` for speed; the live
+/// soak failures come from that path, so regress against it explicitly.
+#[test]
+#[ignore]
+fn mainnet_chunk_08685_all_blocks_decode_minimal() {
+    let root = db_mainnet_immutable();
+    if !root.exists() {
+        eprintln!("SKIPPING: db-mainnet/immutable not present");
+        return;
+    }
+    let chunk = fs::read(root.join("08685.chunk")).expect("read chunk");
+    let secondary = fs::read(root.join("08685.secondary")).expect("read secondary");
+    let n = secondary.len() / 56;
+    let mut failures = 0usize;
+    let mut first_fail: Option<(usize, String, Vec<u8>)> = None;
+    for i in 0..n {
+        let off = read_secondary_block_offset(&secondary, i).unwrap() as usize;
+        let next = read_secondary_block_offset(&secondary, i + 1)
+            .map(|x| x as usize)
+            .unwrap_or(chunk.len());
+        let cbor = &chunk[off..next];
+        if let Err(e) = decode_block_minimal(cbor) {
+            failures += 1;
+            if first_fail.is_none() {
+                first_fail = Some((i, e.to_string(), cbor.to_vec()));
+            }
+        }
+    }
+    if let Some((i, e, _)) = &first_fail {
+        eprintln!("first minimal failure: block[{i}] err={e}");
+    }
+    assert_eq!(failures, 0, "minimal-mode replay must decode every block");
+}
+
+#[test]
+#[ignore]
+fn mainnet_chunk_08686_minimal_mode() {
+    let root = db_mainnet_immutable();
+    if !root.exists() {
+        eprintln!("SKIPPING");
+        return;
+    }
+    let chunk_path = root.join("08686.chunk");
+    let secondary_path = root.join("08686.secondary");
+    if !chunk_path.exists() || !secondary_path.exists() {
+        // 08686 is the actively-written chunk; secondary index may be absent
+        // until the chunk is finalised. That's an expected runtime state, not
+        // a regression — the in-house decoder correctness gate is the 08685
+        // tests above.
+        eprintln!("SKIPPING: db-mainnet/immutable/08686.{{chunk,secondary}} not both present");
+        return;
+    }
+    let chunk = fs::read(&chunk_path).expect("read chunk");
+    let secondary = fs::read(&secondary_path).expect("read secondary");
+    let n = secondary.len() / 56;
+    let mut failures = 0usize;
+    let mut first_fail: Option<(usize, String, Vec<u8>)> = None;
+    for i in 0..n {
+        let off = read_secondary_block_offset(&secondary, i).unwrap() as usize;
+        let next = read_secondary_block_offset(&secondary, i + 1)
+            .map(|x| x as usize)
+            .unwrap_or(chunk.len());
+        let cbor = &chunk[off..next];
+        if let Err(e) = decode_block_minimal(cbor) {
+            failures += 1;
+            if first_fail.is_none() {
+                first_fail = Some((i, e.to_string(), cbor.to_vec()));
+            }
+        }
+    }
+    if let Some((i, e, bytes)) = &first_fail {
+        eprintln!("first minimal failure: block[{i}] err={e}");
+        eprintln!(
+            "  first 64 bytes: {}",
+            hex::encode(&bytes[..64.min(bytes.len())])
+        );
+        if let Some(pos_str) = e
+            .split("position ")
+            .nth(1)
+            .and_then(|s| s.split(':').next())
+            .and_then(|s| s.split(' ').next())
+        {
+            if let Ok(pos) = pos_str.parse::<usize>() {
+                let start = pos.saturating_sub(8);
+                let end = (pos + 24).min(bytes.len());
+                eprintln!(
+                    "  bytes [{start}..{end}] (error pos={pos}): {}",
+                    hex::encode(&bytes[start..end])
+                );
+            }
+        }
+    }
+    eprintln!("chunk 08686 minimal-mode: {failures} / {n} failures");
+    assert_eq!(failures, 0, "chunk 08686 minimal-mode must be clean");
 }
