@@ -638,7 +638,7 @@ pub(super) fn check_script_data_hash(
             }
 
             // Compute the expected script_data_hash. When raw tx CBOR is
-            // available we use pallas KeepRaw to preserve the original encoding
+            // available we use the in-house KeepRaw to preserve the original encoding
             // of redeemers and datums exactly.
             let computed = if let Some(raw) = tx.raw_cbor.as_ref() {
                 dugite_serialization::compute_script_data_hash_from_cbor(

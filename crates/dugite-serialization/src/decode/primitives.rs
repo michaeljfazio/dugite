@@ -1,8 +1,8 @@
 //! Wire-form-preserving CBOR wrapper types.
 //!
-//! These types mirror the pallas-codec wrappers (`Nullable`, `MaybeIndefArray`,
-//! `KeyValuePairs`) that the existing `multi_era.rs` decoder uses via pallas.
-//! Replacing them with in-house equivalents severs the pallas-codec dependency.
+//! These types mirror the the legacy CBOR codec wrappers (`Nullable`, `MaybeIndefArray`,
+//! `KeyValuePairs`) that the existing `multi_era.rs` decoder uses via the in-house decoder.
+//! Replacing them with in-house equivalents severs the the legacy CBOR codec dependency.
 //!
 //! ## Design decisions
 //!

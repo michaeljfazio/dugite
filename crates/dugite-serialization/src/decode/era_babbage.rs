@@ -289,7 +289,7 @@ fn decode_babbage_header_inner(r: &mut Reader<'_>) -> Result<BlockHeader, Serial
         },
         kes_signature,
         // Babbage/Conway Praos: nonce_vrf_output = blake2b_256("N" || vrf_result.output).
-        // The "N" prefix tag and blake2b-256 hash match pallas's HeaderBody::nonce_vrf_output()
+        // The "N" prefix tag and blake2b-256 hash match the legacy decoder's HeaderBody::nonce_vrf_output()
         // and Haskell's vrfNonceValue in the Praos era.
         nonce_vrf_output: {
             let mut tagged = b"N".to_vec();
@@ -1215,7 +1215,7 @@ mod tests {
         let block = decode_babbage_block(&cbor).unwrap();
         // In Babbage, vrf_result.output holds the raw 64-byte output.
         assert_eq!(block.header.vrf_result.output, vec![0u8; 64]);
-        // nonce_vrf_output = blake2b_256("N" || vrf_result.output), matching pallas.
+        // nonce_vrf_output = blake2b_256("N" || vrf_result.output), matching the cardano-ledger spec.
         let expected_nonce = {
             let mut tagged = b"N".to_vec();
             tagged.extend_from_slice(&[0u8; 64]);

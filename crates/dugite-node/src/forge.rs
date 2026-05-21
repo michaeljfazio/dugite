@@ -83,7 +83,7 @@ impl BlockProducerCredentials {
 
         // cardano-cli / cardano-node text envelope files store only the raw
         // 608-byte key material (Sum6Kes::SIZE) without the 4-byte period
-        // counter that pallas-crypto appends at runtime.  When we see exactly
+        // counter that the upstream KES crate appends at runtime.  When we see exactly
         // 608 bytes we initialise the period counter to zero, which is correct
         // because the key has not been evolved since it was serialised to disk.
         // The forge path will evolve it forward to the correct period via
@@ -94,7 +94,7 @@ impl BlockProducerCredentials {
         let kes_key_bytes = match raw_kes_bytes.len() {
             dugite_crypto::kes::KES_SECRET_KEY_SIZE => {
                 // Text-envelope format: 608 bytes of key material, no period counter.
-                // Append period 0 ([0,0,0,0]) so the buffer satisfies pallas's
+                // Append period 0 ([0,0,0,0]) so the buffer satisfies the legacy decoder's
                 // 612-byte invariant.
                 let mut buf = Vec::with_capacity(dugite_crypto::kes::KES_SECRET_KEY_BUFFER_SIZE);
                 buf.extend_from_slice(&raw_kes_bytes);
@@ -279,7 +279,7 @@ pub fn forge_block(
     //
     //     eta = blake2b_256("N" || vrf_output_bytes)
     //
-    // This matches pallas's `HeaderBody::nonce_vrf_output()` for Babbage+
+    // This matches the legacy decoder's `HeaderBody::nonce_vrf_output()` for Babbage+
     // (which performs the same single Blake2b over the "N"-prefixed raw VRF
     // output), so any node decoding our forged block reads back the same eta
     // we produced here.

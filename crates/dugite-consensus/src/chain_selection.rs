@@ -332,7 +332,7 @@ fn praos_tiebreak(
             // Lower value = block had "luckier" VRF draw = preferred.
             //
             // Field correctness: `vrf_result.output` is the VRF output bytes
-            // (NOT the proof).  In pallas, `VrfCert` is `(output, proof)`:
+            // (NOT the proof).  In the cardano-ledger spec, `VrfCert` is `(output, proof)`:
             //   - `.0` = output (64 bytes for TPraos, 64 bytes for Praos)
             //   - `.1` = proof
             // During deserialization (`dugite-serialization/src/multi_era.rs`):

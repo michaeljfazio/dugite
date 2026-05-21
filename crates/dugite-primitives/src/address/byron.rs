@@ -182,7 +182,7 @@ fn addr_root_hash(
 
 /// Encode redeem spending data: `array(2)[i64(2), bstr(32)(pubkey)]`.
 ///
-/// Mirrors pallas `SpendingData::Redeem(ByteVec)` with `#[cbor(flat)]` encoding.
+/// Mirrors cardano-ledger `SpendingData::Redeem(ByteVec)` with `#[cbor(flat)]` encoding.
 /// The `#[n(0)]` field index causes `max_index = 0`, so array length = 0 + 2 = 2.
 fn redeem_spending_data_cbor(pubkey: &[u8; 32]) -> Vec<u8> {
     let mut buf = Vec::new();
@@ -199,7 +199,7 @@ fn redeem_spending_data_cbor(pubkey: &[u8; 32]) -> Vec<u8> {
 /// Mainnet (no network_tag): `map(0)` = `0xa0`.
 /// Testnet: `map(1){u8(2): bytes(network_tag)}`.
 ///
-/// Attribute key 2 is `NetworkTag` in pallas (`AddrAttrProperty::NetworkTag`).
+/// Attribute key 2 is `NetworkTag` in the in-house decoder (`AddrAttrProperty::NetworkTag`).
 fn attributes_cbor(network_tag: Option<&[u8]>) -> Vec<u8> {
     let mut buf = Vec::new();
     let mut e = minicbor::Encoder::new(&mut buf);
@@ -262,7 +262,7 @@ fn decode_inner(inner: &[u8]) -> Result<ByronAddressPayload, ByronAddressError> 
     })
 }
 
-/// CRC-32/ISO-HDLC checksum (same as `crc::CRC_32_ISO_HDLC` used by pallas).
+/// CRC-32/ISO-HDLC checksum (same as `crc::CRC_32_ISO_HDLC` used by the in-house decoder).
 fn crc32_ieee(data: &[u8]) -> u32 {
     crc32fast::hash(data)
 }
@@ -289,7 +289,7 @@ mod tests {
     // Golden CBOR vectors (mainnet, no network tag)
     //
     // Verified independently via Python SHA3-256 + Blake2b-224 + CRC-32/zlib,
-    // and cross-validated against pallas `AddressPayload::new_redeem` via the
+    // and cross-validated against the cardano-ledger AVVM bootstrap path via the
     // dugite-node `test_avvm_genesis_initial_utxos` integration test.
     //
     // Wire format: array(2)[tag(24, bstr(inner)), u32(crc)]

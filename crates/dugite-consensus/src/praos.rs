@@ -850,7 +850,7 @@ impl OuroborosPraos {
             // Verify VRF leader eligibility: the VRF output must satisfy the
             // Praos threshold for this pool's relative stake.
             // Uses exact 34-digit fixed-point arithmetic (dashu IBig) matching
-            // Haskell's taylorExpCmp / pallas-math implementation.
+            // Haskell's taylorExpCmp / the cardano-base math library implementation.
             // Both sigma (relative stake) and f (active slot coeff) are passed
             // as exact rationals to avoid f64 precision loss at boundaries.
             //

@@ -12,8 +12,8 @@ use dugite_primitives::transaction::{PlutusData, TransactionInput, TransactionMe
 /// importers can use it to populate their `(slot, hash) -> chunk_offset`
 /// indexes safely.
 ///
-/// TODO(M4): once the in-house decoder lands, replace the internal
-/// `decode_block_minimal` call with a header-only CBOR walker (Shelley+:
+/// Currently delegates to [`crate::decode::decode_block_minimal`]. A future
+/// optimisation could replace this with a header-only CBOR walker (Shelley+:
 /// `blake2b_256(header_cbor)` over the first inner-array element; Byron:
 /// the Cardano-ledger `coerceHash` wrapper). The current implementation
 /// does a minimal body decode — correct, but heavier than needed for
@@ -21,7 +21,7 @@ use dugite_primitives::transaction::{PlutusData, TransactionInput, TransactionMe
 pub fn extract_block_identity(
     cbor: &[u8],
 ) -> Result<(SlotNo, BlockNo, Hash32), SerializationError> {
-    let block = crate::multi_era::decode_block_minimal(cbor)?;
+    let block = crate::decode::decode_block_minimal(cbor)?;
     Ok((block.slot(), block.block_number(), *block.hash()))
 }
 

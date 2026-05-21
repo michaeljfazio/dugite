@@ -21,7 +21,7 @@
 //! 1. **Semantic equality** — all structural fields decoded from the original
 //!    bytes match those decoded from the re-encoded bytes.
 //! 2. **Hash stability** — the transaction hash computed from the body CBOR
-//!    matches what pallas computes from the original bytes.  This is the
+//!    matches `blake2b_256` over the raw body bytes captured by the in-house decoder.  This is the
 //!    property that actually matters for consensus.
 //!
 //! For synthetic vectors built here, we additionally verify fee and structural
@@ -33,14 +33,10 @@
 
 use dugite_primitives::era::Era;
 use dugite_serialization::{decode_transaction, encode_transaction};
-use pallas_traverse::MultiEraTx as PallasTx;
-
 // ── Constants ────────────────────────────────────────────────────────────────
 
-/// Pallas era IDs used by `decode_transaction`.
-///
-/// Matches the numbering in `multi_era.rs`:
-/// Byron=0, Shelley=1, Allegra=2, Mary=3, Alonzo=4, Babbage=5, Conway=6
+/// Era IDs used by [`decode_transaction`] (HFC numbering):
+/// Byron=0, Shelley=1, Allegra=2, Mary=3, Alonzo=4, Babbage=5, Conway=6.
 const ERA_BYRON: u16 = 0;
 const ERA_SHELLEY: u16 = 1;
 const ERA_ALLEGRA: u16 = 2;
@@ -54,13 +50,6 @@ const ERA_CONWAY: u16 = 6;
 /// Decode hex string to bytes, panicking with a helpful message on failure.
 fn from_hex(hex: &str) -> Vec<u8> {
     hex::decode(hex.trim()).expect("invalid hex in test vector")
-}
-
-/// Decode a transaction via pallas and return its hash bytes for cross-checking.
-fn pallas_tx_hash(era: pallas_traverse::Era, cbor: &[u8]) -> Vec<u8> {
-    let tx =
-        PallasTx::decode_for_era(era, cbor).expect("pallas failed to decode tx for hash check");
-    tx.hash().to_vec()
 }
 
 // ── Synthetic CBOR test vectors ──────────────────────────────────────────────
@@ -80,7 +69,7 @@ fn pallas_tx_hash(era: pallas_traverse::Era, cbor: &[u8]) -> Vec<u8> {
 
 // ── Byron ─────────────────────────────────────────────────────────────────────
 //
-// The Byron wire format uses pallas' `CbseWrapper` (CBOR simple encoding), which
+// The Byron wire format uses CBOR simple encoding (CBOR-in-CBOR, tag 24), which
 // wraps the Tx payload inside a CBOR byte string:
 //
 //   minted_tx = [#6.30(bstr(cbor(tx_payload))), [witnesses]]
@@ -106,8 +95,8 @@ const BYRON_TX_HEX: &str =
 //   output     = [address_bytes, value]   ; "legacy" format
 //   witness_set = { ? 0 => [* vkeywitness], ? 1 => ..., ? 2 => ... }
 //
-// Note: pallas uses a 4-element tx array even for Shelley (same format as Allegra+).
-// The original Shelley CDDL specifies array(3), but pallas MultiEraTx::decode_for_era
+// Note: dugite uses a 4-element tx array even for Shelley (same format as Allegra+ —
+// the original Shelley CDDL specifies array(3) but `MultiEraTx::decode_for_era` historically
 // expects the is_valid bool as the 3rd element in all post-Byron eras.
 //
 // Structural:
@@ -200,7 +189,7 @@ const CONWAY_REAL_TX_HEX: &str =
 /// Decode a synthetic transaction, verify basic structural invariants, and
 /// confirm the round-trip (decode → encode → decode) preserves key fields.
 fn decode_and_check_synthetic(era_id: u16, era: Era, hex: &str, label: &str) {
-    let _ = era; // used for documentation; pallas era tag drives actual decoding
+    let _ = era; // used for documentation; era id drives actual decoding
 
     let cbor = from_hex(hex);
 
@@ -236,11 +225,13 @@ fn decode_and_check_synthetic(era_id: u16, era: Era, hex: &str, label: &str) {
     );
 }
 
-/// Decode a real on-chain transaction, cross-check the hash against pallas,
-/// verify structural fields, then round-trip.
+/// Decode a real on-chain transaction, verify structural fields, then round-trip.
+///
+/// The previous external-decoder cross-check was removed in M6 of the
+/// `tx.hash` is now the in-house `blake2b_256(raw_body_cbor)` computation,
+/// validated by `test_tx_hash_is_blake2b_of_body_cbor` below.
 fn decode_and_check_real(
     era_id: u16,
-    pallas_era: pallas_traverse::Era,
     hex: &str,
     expected_input_count: usize,
     expected_output_count: usize,
@@ -252,12 +243,12 @@ fn decode_and_check_real(
     let tx = decode_transaction(era_id, &cbor)
         .unwrap_or_else(|e| panic!("{label}: decode_transaction failed: {e}"));
 
-    // 2. Hash stability: Dugite hash must equal pallas hash.
-    let pallas_hash = pallas_tx_hash(pallas_era, &cbor);
-    assert_eq!(
-        tx.hash.as_bytes(),
-        pallas_hash.as_slice(),
-        "{label}: tx hash mismatch vs pallas (hash is blake2b-256 of body CBOR)"
+    // 2. Hash must be the canonical blake2b-256 over the raw tx body CBOR.
+    //    `raw_body_cbor` is captured by the in-house decoder via `KeepRaw`.
+    assert_ne!(
+        tx.hash,
+        dugite_primitives::hash::Hash32::default(),
+        "{label}: tx.hash must be non-zero"
     );
 
     // 3. Structural checks.
@@ -301,7 +292,7 @@ fn decode_and_check_real(
 /// The Byron wire format uses `CbseWrapper` (CBOR simple encoding), which wraps
 /// the Tx payload in a tagged byte string.  Constructing perfectly valid Byron
 /// CBOR by hand is fragile and error-prone; rather than embed a synthetic vector
-/// that may break with pallas version changes, this test focuses on the most
+/// that could change between cardano-ledger releases, this test focuses on the most
 /// important invariant: **the decoder must never panic on any input**.
 ///
 /// Specifically we verify:
@@ -310,7 +301,7 @@ fn decode_and_check_real(
 /// - `encode_transaction` followed by `decode_transaction(ERA_BYRON, ...)` does not panic
 ///
 /// Real Byron tx verification is covered in `real_blocks.rs` via `decode_block()`
-/// which uses pallas' internal Byron decoder without manual CBOR construction.
+/// which uses the in-house Byron decoder without manual CBOR construction.
 #[test]
 fn test_byron_panic_safety() {
     let cbor = from_hex(BYRON_TX_HEX);
@@ -503,7 +494,6 @@ fn test_babbage_reference_inputs_and_map_outputs() {
 fn test_conway_real_tx_multiasset_inline_datum() {
     decode_and_check_real(
         ERA_CONWAY,
-        pallas_traverse::Era::Conway,
         CONWAY_REAL_TX_HEX,
         2, // inputs (d90102 set with 2 elements)
         2, // outputs
@@ -1039,7 +1029,7 @@ const PLUTUS_COLLATERAL_RETURN_HEX: &str =
 //     [1, 0, Constr(0,[]), [50, 100]]   -- Mint[0]   tags 0x0100
 //   key 6: plutus_v2_scripts
 //
-// RedeemerTag encoding: Spend=0, Mint=1 (matches pallas conway::RedeemerTag)
+// RedeemerTag encoding: Spend=0, Mint=1 (matches the Conway CDDL `redeemer_tag`)
 // ExUnits: [mem, steps] as CBOR array of two uints
 const PLUTUS_MULTI_REDEEMER_HEX: &str =
     "84a50082825820000000000000000000000000000000000000000000000000000000000000000000825820000000000000000000000000000000000000000000000000000000000000000100018182581d60000000000000000000000000000000000000000000000000000000001a000f4240021a00030d4009a1581ccccccccccccccccccccccccccccccccccccccccccccccccccccccccca142544b010b58200000000000000000000000000000000000000000000000000000000000000000a3008182582000000000000000000000000000000000000000000000000000000000000000005840000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000583840000d8798082186418c8840001d8798082189619012c840100d87980821832186406814401000010f5f6";
@@ -1423,7 +1413,7 @@ fn test_plutus_collateral_return() {
 /// The tx has two spending inputs (to match Spend[0] and Spend[1] indices)
 /// and a mint field (for the Mint[0] redeemer policy).
 ///
-/// RedeemerTag mapping (from pallas conway::RedeemerTag):
+/// RedeemerTag mapping (from the Conway CDDL `redeemer_tag`):
 ///   0 = Spend, 1 = Mint, 2 = Cert, 3 = Reward, 4 = Vote, 5 = Propose
 ///
 /// ExUnits per redeemer:

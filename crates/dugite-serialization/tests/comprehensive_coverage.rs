@@ -2344,13 +2344,13 @@ fn test_compute_transaction_hash_is_32_bytes() {
 ///   addr_keyhash      = hash28
 ///
 /// Internally required_signers are stored as Hash32 (zero-padded from the
-/// 28-byte pallas key hashes).  The encoder must strip the trailing 4 zero
+/// 28-byte CDDL `addr_keyhash` values).  The encoder must strip the trailing 4 zero
 /// bytes and emit exactly 28 bytes on the wire so that cardano-node and
 /// cardano-cli can round-trip the transaction body without error.
 #[test]
 fn test_required_signers_encoded_as_28_bytes() {
     let mut body = minimal_body();
-    // Build a padded Hash32 the same way pallas does: 28 real bytes followed
+    // Build a padded Hash32 the same way the decoder does: 28 real bytes followed
     // by 4 zero bytes.
     let mut raw = [0u8; 32];
     raw[..28].copy_from_slice(&[0xDE; 28]);

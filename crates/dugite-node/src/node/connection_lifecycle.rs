@@ -1366,7 +1366,7 @@ impl ConnectionLifecycleManager {
                                         from,
                                         to,
                                         |block_cbor| {
-                                            match dugite_serialization::multi_era::decode_block_with_byron_epoch_length(
+                                            match dugite_serialization::decode_block_with_byron_epoch_length(
                                                 &block_cbor, bel,
                                             ) {
                                                 Ok(block) => {

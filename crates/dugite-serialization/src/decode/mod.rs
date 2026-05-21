@@ -1,8 +1,8 @@
 //! In-house multi-era Cardano block / transaction decoder.
 //!
 //! This module is the production decoder for Cardano blocks across all 8 eras
-//! (Byron through Dijkstra). It replaced the pallas-backed decoder in
-//! milestone M4 of the pallas-removal program (plan: humming-dewdrop).
+//! (Byron through Dijkstra). It replaced the legacy decoder in
+//! milestone M4 of the in-house decoder program (plan: humming-dewdrop).
 //!
 //! ## Layout
 //!
@@ -13,7 +13,7 @@
 //!   raw.rs            — KeepRaw<'b, T>::parse_with helper
 //!   primitives.rs     — Nullable, MaybeIndef, KeyValuePairs wrappers
 //!   helpers.rs        — hash decode, lovelace, NetworkId
-//!   cbor_helpers.rs   — pallas-free block-body byte walkers
+//!   cbor_helpers.rs   — stateless block-body byte walkers
 //!   block.rs          — envelope walker + per-era dispatch
 //!   era_byron.rs      — Byron main + EBB (era tags 0, 1)
 //!   era_shelley.rs    — Shelley (era tag 2)
@@ -26,7 +26,7 @@
 //!
 //! All public `decode_block*` entry points route through this module to the
 //! in-house decoder. `decode_transaction` is currently still routed via the
-//! legacy pallas wrapper at [`crate::multi_era`] pending the in-house tx-level
+//! legacy wrapper at [`crate::multi_era`] pending the in-house tx-level
 //! decoder (M6 follow-up).
 
 #[allow(dead_code)]

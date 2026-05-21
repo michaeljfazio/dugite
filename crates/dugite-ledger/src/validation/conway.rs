@@ -244,7 +244,7 @@ pub(super) fn check_pparam_update_well_formed(
             // Strict CostModels structural validation — PV >= 11.
             //
             // Mirrors Haskell `validateCostModelsParamsUpdate` (cardano-ledger
-            // 10.7 / pallas-validate PR #755): under PV >= 11 every present
+            // 10.7 / cardano-ledger validate PR #755): under PV >= 11 every present
             // language's cost vector must have at least the language's
             // minimum parameter count. Pre-PV11 behaviour is unchanged so
             // historical mainnet/preview blocks replay cleanly.

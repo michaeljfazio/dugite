@@ -2,7 +2,7 @@
 //!
 //! KES verification takes a 32-byte public key, a u32 period, a 448-byte
 //! signature, and an arbitrary message.  The Sum6KesSig deserializer and the
-//! underlying pallas-crypto verifier must never panic — only succeed or return
+//! underlying KES verifier must never panic — only succeed or return
 //! an error.
 //!
 //! Byte layout consumed from `data`:

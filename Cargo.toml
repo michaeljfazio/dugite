@@ -69,10 +69,6 @@ async-trait = "0.1"
 
 # Networking
 tokio-tungstenite = "0.24"
-pallas-codec = "1.0.0-alpha.5"
-pallas-primitives = "1.0.0-alpha.5"
-pallas-traverse = "1.0.0-alpha.5"
-pallas-crypto = "1.0.0-alpha.5"
 kes-summed-ed25519 = "0.2.1"
 vrf_dalek = { git = "https://github.com/input-output-hk/vrf", rev = "03ac038e9b92c754ebbcb71824866d93f25e27f3" }
 curve25519-dalek-fork = { package = "curve25519-dalek", git = "https://github.com/iquerejeta/curve25519-dalek", branch = "ietf03_vrf_compat_ell2" }
@@ -136,10 +132,10 @@ lto = "thin"
 codegen-units = 1
 strip = true
 # panic = "unwind" (the default) is REQUIRED so we can catch panics from
-# third-party untrusted-input parsers (notably pallas-codec's flat decoder
-# and uplc, both of which panic on malformed Plutus scripts that an adversary
-# can deliver via the witness set of a gossiped transaction). See the
-# catch_unwind guard around eval_phase_two_raw in dugite-ledger/src/plutus.rs.
+# third-party untrusted-input parsers (notably uplc, which panics on malformed
+# Plutus scripts that an adversary can deliver via the witness set of a
+# gossiped transaction). See the catch_unwind guard around
+# eval_phase_two_raw in dugite-ledger/src/plutus.rs.
 # Do NOT change to "abort" without a corresponding upstream fix.
 panic = "unwind"
 

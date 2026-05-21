@@ -69,7 +69,7 @@ pub enum EraTag {
     Conway,
     /// Era tag 8: Dijkstra (Peras certificates, new TxBody keys).
     ///
-    /// Added natively here to avoid the Conway-rewrite shim in the pallas-based
+    /// Added natively here to avoid the Conway-rewrite shim in the legacy
     /// decoder. Once the in-house decoder is wired to this era, remove the shim
     /// in `multi_era.rs`.
     Dijkstra,

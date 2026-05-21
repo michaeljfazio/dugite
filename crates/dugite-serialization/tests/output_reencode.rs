@@ -3,7 +3,7 @@
 //! This is the critical invariant for Plutus script correctness: when a TransactionOutput is
 //! deserialized from wire CBOR and then re-encoded (either directly or after being serialized
 //! to/from bincode for the LSM store), the resulting CBOR must be byte-identical to the
-//! original output bytes that pallas extracted via `output.encode()`.
+//! original wire bytes the in-house decoder captured into `TransactionOutput::raw_cbor`.
 //!
 //! Why this matters:
 //! - Plutus scripts hash the script context, which includes the UTxO output CBOR.
@@ -17,12 +17,15 @@
 //! For inline datums this re-encoding is only byte-exact if the raw datum CBOR bytes are
 //! preserved inside `OutputDatum::InlineDatum.raw_cbor`.
 //!
+//! Reference bytes for the byte-exact assertions come from
+//! `TransactionOutput::raw_cbor`, populated by the in-house decoder via
+//! `KeepRaw::parse_with` over the original wire CBOR.
+//!
 //! Test vectors are real Conway-era transactions from the Preview testnet (network magic 2),
 //! fetched via Koios on 2026-03-15.
 
 use dugite_primitives::transaction::OutputDatum;
 use dugite_serialization::{decode_transaction, encode_transaction_output};
-use pallas_traverse::MultiEraTx;
 
 /// Simulate an LSM round-trip by serializing via bincode (which drops `raw_cbor` on
 /// TransactionOutput) and deserializing back.
@@ -62,58 +65,51 @@ const TX_EE50ED: &str = "84aa00838258205dea2b05335efeecec83f88e0916917b120fc6f8b
 // Core round-trip assertion
 // ---------------------------------------------------------------------------
 
-/// Assert that every output in a transaction encodes byte-identically to
-/// what pallas produced via `output.encode()`, both:
-/// (a) directly after deserialization (raw_cbor is set)
-/// (b) after simulated LSM round-trip (raw_cbor is None — re-encoding path)
+/// Assert that every output in a transaction encodes byte-identically to the
+/// original wire bytes captured by the in-house decoder into
+/// `TransactionOutput::raw_cbor`, both:
+/// (a) directly after deserialization (raw_cbor is set; should be returned verbatim)
+/// (b) after simulated LSM round-trip (raw_cbor is None — re-encoding path must
+///     reproduce the original wire bytes from the parsed fields)
 fn assert_outputs_reencode_exact(tx_cbor_hex: &str, tx_label: &str) {
     let cbor = hex::decode(tx_cbor_hex.trim()).expect("hex decode");
 
-    // Decode with dugite
+    // Decode with the in-house decoder; raw_cbor on each output is populated
+    // by KeepRaw::parse_with over the wire bytes.
     let tx = decode_transaction(6, &cbor).expect("decode_transaction");
 
-    // Decode with pallas to get reference output.encode() bytes
-    let pallas_tx =
-        MultiEraTx::decode_for_era(pallas_traverse::Era::Conway, &cbor).expect("pallas decode");
-    let pallas_outputs: Vec<Vec<u8>> = pallas_tx.outputs().iter().map(|o| o.encode()).collect();
+    for (i, output) in tx.body.outputs.iter().enumerate() {
+        let raw_ref: Vec<u8> = output
+            .raw_cbor
+            .as_ref()
+            .unwrap_or_else(|| {
+                panic!("{tx_label} output {i}: in-house decoder must populate raw_cbor")
+            })
+            .clone();
 
-    assert_eq!(
-        tx.body.outputs.len(),
-        pallas_outputs.len(),
-        "{tx_label}: output count mismatch"
-    );
-
-    for (i, (output, pallas_ref)) in tx
-        .body
-        .outputs
-        .iter()
-        .zip(pallas_outputs.iter())
-        .enumerate()
-    {
-        // (a) Direct re-encode: raw_cbor is Some — path used when output is
-        //     freshly deserialized and not yet persisted to LSM.
+        // (a) Direct re-encode: raw_cbor is Some — fast path returns it verbatim.
         let direct = encode_transaction_output(output);
         assert_eq!(
-            &direct,
-            pallas_ref,
-            "{tx_label} output {i}: direct re-encode differs from pallas output.encode()\n\
+            direct,
+            raw_ref,
+            "{tx_label} output {i}: direct re-encode differs from original wire bytes\n\
              expected: {}\n\
              got:      {}",
-            hex::encode(pallas_ref),
+            hex::encode(&raw_ref),
             hex::encode(&direct),
         );
 
         // (b) After LSM round-trip: raw_cbor becomes None (serde skip).
-        //     The re-encoding path must still reproduce pallas bytes exactly.
+        //     The re-encoding path must still reproduce the wire bytes.
         let restored = lsm_round_trip(output);
         let after_lsm = encode_transaction_output(&restored);
         assert_eq!(
-            &after_lsm,
-            pallas_ref,
-            "{tx_label} output {i}: post-LSM re-encode differs from pallas output.encode()\n\
+            after_lsm,
+            raw_ref,
+            "{tx_label} output {i}: post-LSM re-encode differs from original wire bytes\n\
              expected: {}\n\
              got:      {}",
-            hex::encode(pallas_ref),
+            hex::encode(&raw_ref),
             hex::encode(&after_lsm),
         );
     }
@@ -255,8 +251,8 @@ fn test_indef_array_encoding_difference_documented() {
 
 /// Verifies that `collateral_return` outputs also get `raw_cbor` populated during
 /// deserialization. TX_5DEA2B has a collateral_return (body key 16) which is a
-/// plain ADA output. After our fix, `convert_output_with_cbor` is used for
-/// collateral_return so `raw_cbor` is set and re-encoding is byte-exact.
+/// plain ADA output. The in-house Conway decoder uses `KeepRaw::parse_with` for
+/// the collateral_return so `raw_cbor` is set and re-encoding is byte-exact.
 #[test]
 fn test_collateral_return_raw_cbor_preserved() {
     let cbor = hex::decode(TX_5DEA2B).expect("hex decode");
@@ -269,29 +265,21 @@ fn test_collateral_return_raw_cbor_preserved() {
         .as_ref()
         .expect("TX_5DEA2B must have collateral_return");
 
-    // raw_cbor must be populated after deserialization
-    assert!(
-        cr.raw_cbor.is_some(),
-        "collateral_return.raw_cbor must be Some after deserialization"
-    );
+    let raw_ref: Vec<u8> = cr
+        .raw_cbor
+        .as_ref()
+        .expect("collateral_return.raw_cbor must be Some after deserialization")
+        .clone();
 
-    // Decode with pallas to get reference collateral_return bytes
-    let pallas_tx =
-        MultiEraTx::decode_for_era(pallas_traverse::Era::Conway, &cbor).expect("pallas decode");
-    let pallas_cr_bytes = pallas_tx
-        .collateral_return()
-        .expect("pallas collateral_return")
-        .encode();
-
-    // Direct re-encode must match pallas
+    // Direct re-encode must match the captured wire bytes
     let direct = encode_transaction_output(cr);
     assert_eq!(
         direct,
-        pallas_cr_bytes,
-        "collateral_return direct re-encode differs from pallas\n\
+        raw_ref,
+        "collateral_return direct re-encode differs from original wire bytes\n\
          expected: {}\n\
          got:      {}",
-        hex::encode(&pallas_cr_bytes),
+        hex::encode(&raw_ref),
         hex::encode(&direct),
     );
 
@@ -300,11 +288,11 @@ fn test_collateral_return_raw_cbor_preserved() {
     let after_lsm = encode_transaction_output(&restored);
     assert_eq!(
         after_lsm,
-        pallas_cr_bytes,
-        "collateral_return post-LSM re-encode differs from pallas\n\
+        raw_ref,
+        "collateral_return post-LSM re-encode differs from original wire bytes\n\
          expected: {}\n\
          got:      {}",
-        hex::encode(&pallas_cr_bytes),
+        hex::encode(&raw_ref),
         hex::encode(&after_lsm),
     );
 }

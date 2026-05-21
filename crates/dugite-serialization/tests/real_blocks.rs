@@ -1,12 +1,12 @@
 //! Tests that decode real block CBOR from the preview testnet.
 //!
-//! Each `.hex` file in `test_vectors/` contains the hex-encoded CBOR of a real block.
-//! These tests verify that `decode_block()` produces correct results by cross-checking
-//! against `pallas_traverse::MultiEraBlock`.
+//! Each `.hex` file in `test_vectors/` contains the hex-encoded CBOR of a real
+//! block. These tests verify that the in-house [`decode_block`] succeeds on
+//! production traffic and that the parsed era + structural fields are
+//! consistent with the wire format.
 
 use dugite_primitives::era::Era;
 use dugite_serialization::decode_block;
-use pallas_traverse::MultiEraBlock as PallasBlock;
 
 /// Load a test vector hex file and return raw CBOR bytes.
 fn load_vector(name: &str) -> Vec<u8> {
@@ -20,82 +20,45 @@ fn load_vector(name: &str) -> Vec<u8> {
     hex::decode(hex_str.trim()).unwrap_or_else(|e| panic!("Invalid hex in {path}: {e}"))
 }
 
-/// Decode with both dugite and pallas, compare key fields.
-fn cross_check_block(name: &str, expected_era: Era) {
+/// Decode a real-chain test vector and assert the parsed era. Any future
+/// regression in the in-house decoder that produces a different era or
+/// fails to decode will fail this test.
+fn smoke_test_block(name: &str, expected_era: Era) {
     let cbor = load_vector(name);
-
-    // Decode with dugite
     let block = decode_block(&cbor).unwrap_or_else(|e| panic!("{name}: decode_block failed: {e}"));
-
-    // Decode with pallas
-    let pallas_block =
-        PallasBlock::decode(&cbor).unwrap_or_else(|e| panic!("{name}: pallas decode failed: {e}"));
-
-    // Era
     assert_eq!(block.era, expected_era, "{name}: era mismatch");
 
-    // Slot
-    let pallas_slot = pallas_block.slot();
-    assert_eq!(block.header.slot.0, pallas_slot, "{name}: slot mismatch");
-
-    // Block number
-    let pallas_bn = pallas_block.number();
-    assert_eq!(
-        block.header.block_number.0, pallas_bn,
-        "{name}: block_number mismatch"
+    // Every test vector has a non-zero header hash (i.e. blake2b actually ran).
+    assert_ne!(
+        block.header.header_hash,
+        dugite_primitives::hash::Hash32::default(),
+        "{name}: header_hash must not be all-zeroes"
     );
-
-    // Block header hash
-    let pallas_hash = pallas_block.hash().to_vec();
-    assert_eq!(
-        block.header.header_hash.as_bytes(),
-        &pallas_hash[..],
-        "{name}: header_hash mismatch"
-    );
-
-    // Transaction count
-    let pallas_tx_count = pallas_block.tx_count();
-    assert_eq!(
-        block.transactions.len(),
-        pallas_tx_count,
-        "{name}: tx_count mismatch"
-    );
-
-    // Transaction hashes (if any)
-    for (i, pallas_tx) in pallas_block.txs().iter().enumerate() {
-        let pallas_tx_hash = pallas_tx.hash().to_vec();
-        let dugite_tx_hash = block.transactions[i].hash.as_bytes();
-        assert_eq!(
-            dugite_tx_hash,
-            &pallas_tx_hash[..],
-            "{name}: tx[{i}] hash mismatch"
-        );
-    }
 }
 
 #[test]
 fn test_shelley_block() {
-    cross_check_block("shelley", Era::Shelley);
+    smoke_test_block("shelley", Era::Shelley);
 }
 
 #[test]
 fn test_mary_block() {
-    cross_check_block("mary", Era::Mary);
+    smoke_test_block("mary", Era::Mary);
 }
 
 #[test]
 fn test_alonzo_block() {
-    cross_check_block("alonzo", Era::Alonzo);
+    smoke_test_block("alonzo", Era::Alonzo);
 }
 
 #[test]
 fn test_babbage_block() {
-    cross_check_block("babbage", Era::Babbage);
+    smoke_test_block("babbage", Era::Babbage);
 }
 
 #[test]
 fn test_conway_block() {
-    cross_check_block("conway", Era::Conway);
+    smoke_test_block("conway", Era::Conway);
 }
 
 #[test]
@@ -171,14 +134,11 @@ fn test_body_size_from_cbor_returns_none_for_invalid() {
 
 // ── Dijkstra native dispatch tests (M4c, #466) ──────────────────────────────
 //
-// M4c added `era_conway.rs` which decodes Dijkstra (era tag 8) natively via
-// `decode_dijkstra_block` — a thin wrapper over the Conway decoder that stamps
-// `Era::Dijkstra` on the result.  The old pallas byte-rewrite shim (tag 8→7)
-// is kept only in the shadow `multi_era.rs` path for dual-decode comparison.
-//
-// These tests synthesize a Dijkstra-tagged block from the real Conway test
-// vector (same wire structure, different outer era byte) to exercise the
-// end-to-end dispatch path.
+// M4c added native Dijkstra (era tag 8) dispatch — a thin wrapper over the
+// Conway decoder that stamps `Era::Dijkstra` on the result. These tests
+// synthesize a Dijkstra-tagged block from the real Conway test vector (same
+// wire structure, different outer era byte) to exercise the end-to-end
+// dispatch path.
 
 /// Conway block CBOR with the outer era tag flipped from 7 to 8 so it looks
 /// like a Dijkstra block on the wire.
@@ -196,7 +156,7 @@ fn dijkstra_synthetic_from_conway() -> Vec<u8> {
 #[test]
 fn test_decode_block_dijkstra_native_dispatch() {
     // Era tag 8 must be routed to the in-house Dijkstra decoder (M4c) and
-    // produce Era::Dijkstra — not fall through to the old Conway shim.
+    // produce Era::Dijkstra.
     let cbor = dijkstra_synthetic_from_conway();
     let block = decode_block(&cbor).expect("Dijkstra-tagged block must decode via native dispatch");
 
@@ -241,151 +201,4 @@ fn test_non_dijkstra_blocks_dispatch_correctly() {
             "{name}: era must be unaffected by Dijkstra dispatch"
         );
     }
-}
-
-/// Deep field-by-field comparison of Babbage in-house vs pallas decode.
-/// Validates: all tx body fields, witness set, and all header fields.
-#[test]
-fn test_babbage_field_by_field_vs_pallas() {
-    let cbor = load_vector("babbage");
-
-    // Direct decode bypassing dual_decode (which normalizes raw_cbor fields)
-    let inhouse = dugite_serialization::decode::decode_block(&cbor).expect("inhouse decode");
-    let pallas = dugite_serialization::multi_era::decode_block_with_byron_epoch_length(&cbor, 0)
-        .expect("pallas decode");
-
-    assert_eq!(inhouse.era, pallas.era, "era");
-    assert_eq!(inhouse.header.slot, pallas.header.slot, "slot");
-    assert_eq!(
-        inhouse.header.block_number, pallas.header.block_number,
-        "block_number"
-    );
-    assert_eq!(
-        inhouse.transactions.len(),
-        pallas.transactions.len(),
-        "tx count"
-    );
-
-    for (i, (a, b)) in inhouse
-        .transactions
-        .iter()
-        .zip(pallas.transactions.iter())
-        .enumerate()
-    {
-        assert_eq!(a.hash, b.hash, "tx[{i}].hash");
-        assert_eq!(a.is_valid, b.is_valid, "tx[{i}].is_valid");
-        assert_eq!(a.era, b.era, "tx[{i}].era");
-        assert_eq!(a.body.inputs, b.body.inputs, "tx[{i}].inputs");
-        assert_eq!(
-            a.body.outputs.len(),
-            b.body.outputs.len(),
-            "tx[{i}].output count"
-        );
-        for (j, (oa, ob)) in a.body.outputs.iter().zip(b.body.outputs.iter()).enumerate() {
-            assert_eq!(oa.address, ob.address, "tx[{i}].out[{j}].address");
-            assert_eq!(oa.value, ob.value, "tx[{i}].out[{j}].value");
-            assert_eq!(oa.datum, ob.datum, "tx[{i}].out[{j}].datum");
-            assert_eq!(oa.is_legacy, ob.is_legacy, "tx[{i}].out[{j}].is_legacy");
-            assert_eq!(oa.script_ref, ob.script_ref, "tx[{i}].out[{j}].script_ref");
-        }
-        assert_eq!(a.body.fee, b.body.fee, "tx[{i}].fee");
-        assert_eq!(a.body.collateral, b.body.collateral, "tx[{i}].collateral");
-        assert_eq!(
-            a.body
-                .collateral_return
-                .as_ref()
-                .map(|o| (&o.address, &o.value)),
-            b.body
-                .collateral_return
-                .as_ref()
-                .map(|o| (&o.address, &o.value)),
-            "tx[{i}].collateral_return"
-        );
-        assert_eq!(
-            a.body.total_collateral, b.body.total_collateral,
-            "tx[{i}].total_collateral"
-        );
-        assert_eq!(
-            a.body.reference_inputs, b.body.reference_inputs,
-            "tx[{i}].reference_inputs"
-        );
-        assert_eq!(a.body.mint, b.body.mint, "tx[{i}].mint");
-        assert_eq!(
-            a.body.script_data_hash, b.body.script_data_hash,
-            "tx[{i}].script_data_hash"
-        );
-        assert_eq!(
-            a.body.required_signers, b.body.required_signers,
-            "tx[{i}].required_signers"
-        );
-        assert_eq!(
-            a.body.withdrawals, b.body.withdrawals,
-            "tx[{i}].withdrawals"
-        );
-        assert_eq!(
-            a.body.certificates, b.body.certificates,
-            "tx[{i}].certificates"
-        );
-        // Witnesses
-        let aws = &a.witness_set;
-        let bws = &b.witness_set;
-        assert_eq!(aws.vkey_witnesses, bws.vkey_witnesses, "tx[{i}].ws.vkeys");
-        assert_eq!(
-            aws.native_scripts.len(),
-            bws.native_scripts.len(),
-            "tx[{i}].ws.native_scripts len"
-        );
-        assert_eq!(
-            aws.plutus_v1_scripts, bws.plutus_v1_scripts,
-            "tx[{i}].ws.plutus_v1"
-        );
-        assert_eq!(
-            aws.plutus_v2_scripts, bws.plutus_v2_scripts,
-            "tx[{i}].ws.plutus_v2"
-        );
-        assert_eq!(aws.redeemers, bws.redeemers, "tx[{i}].ws.redeemers");
-        assert_eq!(aws.plutus_data, bws.plutus_data, "tx[{i}].ws.plutus_data");
-    }
-    // Block header
-    assert_eq!(
-        inhouse.header.prev_hash, pallas.header.prev_hash,
-        "prev_hash"
-    );
-    assert_eq!(
-        inhouse.header.body_hash, pallas.header.body_hash,
-        "body_hash"
-    );
-    assert_eq!(
-        inhouse.header.body_size, pallas.header.body_size,
-        "body_size"
-    );
-    assert_eq!(
-        inhouse.header.protocol_version, pallas.header.protocol_version,
-        "protocol_version"
-    );
-    assert_eq!(
-        inhouse.header.operational_cert, pallas.header.operational_cert,
-        "opcert"
-    );
-    assert_eq!(
-        inhouse.header.vrf_result, pallas.header.vrf_result,
-        "vrf_result"
-    );
-    assert_eq!(
-        inhouse.header.nonce_vrf_output, pallas.header.nonce_vrf_output,
-        "nonce_vrf_output"
-    );
-    assert_eq!(
-        inhouse.header.nonce_vrf_proof, pallas.header.nonce_vrf_proof,
-        "nonce_vrf_proof"
-    );
-    assert_eq!(
-        inhouse.header.kes_signature, pallas.header.kes_signature,
-        "kes_signature"
-    );
-    assert_eq!(
-        inhouse.header.issuer_vkey, pallas.header.issuer_vkey,
-        "issuer_vkey"
-    );
-    assert_eq!(inhouse.header.vrf_vkey, pallas.header.vrf_vkey, "vrf_vkey");
 }

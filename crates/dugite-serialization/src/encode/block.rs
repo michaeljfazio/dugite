@@ -76,7 +76,7 @@ pub fn encode_block_header(header: &BlockHeader, kes_signature: &[u8]) -> Vec<u8
 ///
 /// Block = [storage_era_tag, [header, tx_bodies, tx_witness_sets, aux_data_map, invalid_txs]]
 ///
-/// Uses **pallas/ImmutableDB storage era tags**, which differ from the HFC NS
+/// Uses **on-disk/ImmutableDB storage era tags**, which differ from the HFC NS
 /// indices used in the N2N ChainSync header wire format:
 ///
 /// | Era     | Storage tag (this fn) | HFC NS index (ChainSync header) |
@@ -505,7 +505,7 @@ mod tests {
     }
 
     #[test]
-    fn test_encode_block_header_body_roundtrip_genesis_via_pallas() {
+    fn test_encode_block_header_body_roundtrip_genesis() {
         // Sanity: decode the encoded header body via minicbor and confirm the
         // PrevHash field reads back as null (matching cardano-ledger's
         // `instance DecCBOR PrevHash` which peeks TypeNull to reconstruct

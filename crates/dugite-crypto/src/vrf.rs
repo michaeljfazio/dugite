@@ -213,7 +213,7 @@ pub fn check_leader_value_tpraos_rational_cached(
 /// Exact-precision VRF leader check matching Haskell's `checkLeaderNatValue`.
 ///
 /// Uses `dashu-int` (IBig) for 34-digit fixed-point arithmetic, matching the
-/// exact same algorithm as pallas-math / Haskell's NonIntegral:
+/// exact same algorithm as the cardano-base math library / Haskell's NonIntegral:
 /// - `Cardano.Protocol.TPraos.BHeader.checkLeaderNatValue`
 /// - `Cardano.Ledger.NonIntegral.taylorExpCmp` / `ln'` / `lncf`
 /// - `Cardano.Ledger.BaseTypes.FixedPoint` (10^34 resolution)
@@ -243,7 +243,7 @@ mod leader_check {
     }
 
     /// Fixed-point division: (x * PRECISION) / y, with proper quotient+remainder handling
-    /// matching pallas-math's `div` function exactly.
+    /// matching the cardano-base math library's `div` function exactly.
     fn fp_div(rop: &mut IBig, x: &IBig, y: &IBig) {
         let (temp_q, temp_r): (IBig, IBig) = x.div_rem(y);
         let mut temp = &temp_q * &*PRECISION;
@@ -254,7 +254,7 @@ mod leader_check {
     }
 
     /// Fixed-point scale (truncate toward negative infinity for negative, toward zero for positive)
-    /// matching pallas-math's `scale` exactly.
+    /// matching the cardano-base math library's `scale` exactly.
     fn fp_scale(rop: &mut IBig) {
         let (a, remainder): (IBig, IBig) = (&*rop).div_rem(&*PRECISION);
         if *rop < *ZERO && remainder != *ZERO {
@@ -264,7 +264,7 @@ mod leader_check {
         }
     }
 
-    /// Integer power via repeated squaring, matching pallas-math's `ipow_` + `ipow`.
+    /// Integer power via repeated squaring, matching the cardano-base math library's `ipow_` + `ipow`.
     fn ipow(rop: &mut IBig, x: &IBig, n: i64) {
         if n < 0 {
             let mut temp = IBig::from(0);
@@ -302,7 +302,7 @@ mod leader_check {
     }
 
     /// Taylor/Maclaurin series for exp(x) with convergence check.
-    /// Matches pallas-math's `mp_exp_taylor` exactly.
+    /// Matches the cardano-base math library's `mp_exp_taylor` exactly.
     fn mp_exp_taylor(rop: &mut IBig, max_n: i32, x: &IBig, epsilon: &IBig) -> i32 {
         let mut divisor = ONE.clone();
         let mut last_x = ONE.clone();
@@ -327,7 +327,7 @@ mod leader_check {
     }
 
     /// Entry point for exp approximation. Scales x to [0,1] then uses Taylor series.
-    /// Matches pallas-math's `ref_exp` exactly.
+    /// Matches the cardano-base math library's `ref_exp` exactly.
     fn ref_exp(rop: &mut IBig, x: &IBig) {
         use std::cmp::Ordering;
         match x.cmp(&ZERO) {
@@ -355,7 +355,7 @@ mod leader_check {
     }
 
     /// Continued fraction approximation for ln(1+x).
-    /// Matches pallas-math's `mp_ln_n` exactly.
+    /// Matches the cardano-base math library's `mp_ln_n` exactly.
     fn mp_ln_n(rop: &mut IBig, max_n: i32, x: &IBig, epsilon: &IBig) {
         let mut convergent = IBig::from(0);
         let mut last = IBig::from(0);
@@ -417,7 +417,7 @@ mod leader_check {
     }
 
     /// Find n such that e^n <= x < e^(n+1).
-    /// Matches pallas-math's `find_e` exactly.
+    /// Matches the cardano-base math library's `find_e` exactly.
     fn find_e(x: &IBig) -> i64 {
         let mut x_ = IBig::from(0);
         fp_div(&mut x_, &ONE, &E);
@@ -453,7 +453,7 @@ mod leader_check {
     }
 
     /// Entry point for ln approximation.
-    /// Matches pallas-math's `ref_ln` exactly.
+    /// Matches the cardano-base math library's `ref_ln` exactly.
     fn ref_ln(rop: &mut IBig, x: &IBig) -> bool {
         if x <= &*ZERO {
             return false;
@@ -476,7 +476,7 @@ mod leader_check {
     }
 
     /// Compare `compare` against `exp(x)` using bounded Taylor series.
-    /// Matches pallas-math's `ref_exp_cmp` exactly.
+    /// Matches the cardano-base math library's `ref_exp_cmp` exactly.
     ///
     /// Returns: GT if compare > exp(x), LT if compare < exp(x), UNKNOWN if indeterminate.
     fn ref_exp_cmp(max_n: u64, x: &IBig, bound_x: i64, compare: &IBig) -> ExpCmpResult {

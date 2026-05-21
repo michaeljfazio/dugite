@@ -2,7 +2,7 @@
 //!
 //! This is the highest-blast-radius boundary in the Dugite stack: arbitrary
 //! bytes parsed as a Cardano transaction and then fed directly into the uplc
-//! evaluator.  Bugs in the uplc pallas transaction decoder, script-context
+//! evaluator.  Bugs in the uplc transaction decoder, script-context
 //! builder, or CEK machine that manifest as Rust panics are findings worth
 //! reporting upstream to aiken-lang/aiken.
 //!
@@ -34,11 +34,11 @@
 //! Step 3 is where the script-context builder lives; this target provides
 //! indirect coverage of `TxInfoV3::from_transaction`,
 //! `DataLookupTable::from_transaction`, and `get_tx_in_info_v2` without
-//! requiring a direct pallas-primitives dependency in the fuzz crate.
+//! requiring a direct the legacy primitives crate dependency in the fuzz crate.
 //!
 //! # What we look for
 //!
-//! - Panics (unwrap/expect/index-out-of-bounds) inside uplc or pallas decoders.
+//! - Panics (unwrap/expect/index-out-of-bounds) inside uplc or the in-house decoders.
 //! - Panics inside our script-version dispatch (version map, redeemer tag decode,
 //!   V3 Unit check).
 //! - Stack overflows from deeply recursive PlutusData or CEK term structures.

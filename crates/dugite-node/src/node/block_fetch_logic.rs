@@ -598,7 +598,7 @@ pub async fn blockfetch_worker(
                         to,
                         |block_cbor| {
                             // Decode the block from raw CBOR.
-                            match dugite_serialization::multi_era::decode_block_minimal_with_byron_epoch_length(
+                            match dugite_serialization::decode_block_minimal_with_byron_epoch_length(
                                 &block_cbor,
                                 epoch_len,
                             ) {

@@ -718,7 +718,7 @@ fn koios_rational(v: &serde_json::Value, ctx: &str) -> Rational {
 /// **Fail-closed**: any field present in the JSON that is not in
 /// [`KNOWN_PPU_FIELDS`] causes a panic.  This is intentional — silently
 /// dropping an unknown PPU field would let `modified_pp_groups` return the
-/// wrong group set and silently change a ratification verdict.  When pallas
+/// wrong group set and silently change a ratification verdict.  When the legacy decoder
 /// or cardano-ledger introduces a new PPU field, this decoder must be
 /// updated and `KNOWN_PPU_FIELDS` extended in lock-step.
 pub fn koios_protocol_param_update(v: &serde_json::Value) -> ProtocolParamUpdate {

@@ -1,7 +1,7 @@
 //! Mithril snapshot import for fast initial sync.
 //!
 //! Downloads a Mithril-certified snapshot of the Cardano immutable DB,
-//! extracts the cardano-node chunk files, parses blocks with pallas,
+//! extracts the cardano-node chunk files, parses blocks with the in-house decoder,
 //! and bulk-imports them into Dugite's ImmutableDB (chunk files).
 //!
 //! Supports both the legacy `/artifact/snapshots` API and the newer
@@ -1520,7 +1520,7 @@ fn copy_dir_recursive(src: &Path, dst: &Path) -> Result<()> {
 /// sequentially is orders of magnitude faster than random LSM lookups because
 /// chunk files are already laid out in block order on disk.
 ///
-/// Uses secondary index entries for block boundaries to avoid redundant pallas
+/// Uses secondary index entries for block boundaries to avoid redundant
 /// decode — the callback receives raw CBOR slices that are decoded once by the
 /// caller for ledger application.
 ///
@@ -1570,7 +1570,7 @@ where
         let chunk_path = immutable_dir.join(format!("{chunk_num:05}.chunk"));
         let secondary_path = immutable_dir.join(format!("{chunk_num:05}.secondary"));
 
-        // Fast path: use secondary index for block boundaries (no pallas decode)
+        // Fast path: use secondary index for block boundaries (no full decode)
         if secondary_path.exists() {
             let count = replay_chunk_with_index(&chunk_path, &secondary_path, &mut on_block)?;
             if count > 0 {
@@ -1579,7 +1579,7 @@ where
             }
         }
 
-        // Fallback: sequential CBOR probe for block boundaries (no pallas decode)
+        // Fallback: sequential CBOR probe for block boundaries (no full decode)
         let count = replay_chunk_sequential(&chunk_path, &mut on_block)?;
         total_blocks += count;
     }
@@ -1681,7 +1681,7 @@ fn read_chunk_first_block_slot(
     }
 
     let block_cbor = &chunk_data[block_start..block_end];
-    match dugite_serialization::multi_era::decode_block_minimal_with_byron_epoch_length(
+    match dugite_serialization::decode_block_minimal_with_byron_epoch_length(
         block_cbor,
         byron_epoch_length,
     ) {
@@ -1705,7 +1705,7 @@ fn probe_first_cbor_item(chunk_data: &[u8]) -> (usize, usize) {
 }
 
 /// Replay a single chunk file using secondary index for block boundaries.
-/// Returns raw CBOR slices without pallas decode (the caller decodes once).
+/// Returns raw CBOR slices without a full block decode (the caller decodes once).
 fn replay_chunk_with_index<F>(
     chunk_path: &Path,
     secondary_path: &Path,
@@ -1749,7 +1749,7 @@ where
     Ok(count)
 }
 
-/// Replay a single chunk file by sequential CBOR probing (no pallas decode).
+/// Replay a single chunk file by sequential CBOR probing (no full decode).
 fn replay_chunk_sequential<F>(chunk_path: &Path, on_block: &mut F) -> Result<u64>
 where
     F: FnMut(&[u8]) -> Result<()>,
@@ -1903,7 +1903,7 @@ fn parse_chunk_sequential(chunk_path: &Path) -> Result<Vec<ParsedBlock>> {
         }
 
         // First, probe the CBOR item size to know how many bytes to skip
-        // regardless of whether pallas can decode this particular era/block.
+        // regardless of whether the in-house decoder can decode this particular era/block.
         let item_size = match cbor_item_size(remaining) {
             Some(size) if size > 0 => size,
             _ => {

@@ -33,7 +33,7 @@
 //! - EBB header: `blake2b_256(cbor_encode([0u16, raw_header_cbor]))`
 //! - Main header: `blake2b_256(cbor_encode([1u16, raw_header_cbor]))`
 //!
-//! This matches `OriginalHash for KeepRaw<'_, byron::BlockHead>` in pallas which
+//! This matches `OriginalHash for KeepRaw<'_, byron::BlockHead>` in the in-house decoder which
 //! uses `Hasher::<256>::hash_cbor(&(1, self))`.
 //!
 //! # Slot computation
@@ -75,7 +75,7 @@ use dugite_primitives::value::{Lovelace, Value};
 use std::collections::BTreeMap;
 
 // ============================================================================
-// Mainnet Byron genesis constants (from pallas GenesisValues::mainnet())
+// Mainnet Byron genesis constants (from the in-house decoder GenesisValues::mainnet())
 // ============================================================================
 
 /// Mainnet Byron epoch length in slots.
@@ -86,7 +86,7 @@ const MAINNET_BYRON_SLOT_LENGTH: u64 = 20;
 
 /// Compute absolute slot from (epoch, rel_slot) using the mainnet formula.
 ///
-/// Matches pallas `compute_absolute_slot_within_era(epoch, slot, 432000, 20)`:
+/// Matches `compute_absolute_slot_within_era(epoch, slot, 432000, 20)`:
 /// `(epoch * 432000) / 20 + slot = epoch * 21600 + slot`.
 #[inline]
 fn mainnet_absolute_slot(epoch: u64, rel_slot: u64) -> u64 {
@@ -103,18 +103,18 @@ fn mainnet_absolute_slot(epoch: u64, rel_slot: u64) -> u64 {
 ///
 /// CBOR encoding:
 /// - `0x82` — array(2)
-/// - `0x19 0x00 0x01` — uint 1 (pallas uses u16 encoding: major 1, 2-byte extra)
+/// - `0x19 0x00 0x01` — uint 1 (legacy decoder uses u16 encoding: major 1, 2-byte extra)
 ///
-/// Wait: pallas uses Rust's minicbor where `(1u16, data)` encodes `1` as
+/// Wait: minicbor encodes where `(1u16, data)` encodes `1` as
 /// u16 → CBOR major type 0 (unsigned int) with value 1. The minimal CBOR for
 /// uint 1 is just `0x01`. Let's use that.
 ///
-/// Actually pallas calls `hash_cbor(&(1, self))` where `1` is a Rust integer
+/// Actually `hash_cbor(&(1, self))` where `1` is a Rust integer
 /// literal — minicbor will encode it as the smallest uint, which is `0x01`.
 /// So the encoding is `[0x82, 0x01, <raw_header_bytes>]`.
 fn byron_main_header_hash(raw_header_cbor: &[u8]) -> Hash32 {
     // Build: array(2) [uint(1), bstr(raw_header_cbor)]
-    // But wait — pallas KeepRaw<BlockHead> encodes itself as its raw bytes
+    // But wait — the in-house KeepRaw<BlockHead> encodes itself as its raw bytes
     // WITHOUT a bstr wrapper. When you encode (1, keep_raw_value), you get:
     //   array(2)[uint(1), <keep_raw_cbor_as_is>]
     // So the input to blake2b is:
@@ -618,7 +618,7 @@ pub fn decode_byron_ebb_block(
 
 /// Decode a standalone Byron transaction from raw CBOR bytes.
 ///
-/// The pallas standalone Byron tx format is `tag(30, bstr(cbor([tx, witnesses])))`.
+/// The standalone Byron tx format is `tag(30, bstr(cbor([tx, witnesses])))`.
 /// The outer tag(30) is the CBSE (CBOR Simple Encoding) wrapper. The inner CBOR is a
 /// 2-element array `[tx_body, witnesses]` where `tx_body = [inputs, outputs, attributes]`.
 ///
@@ -656,7 +656,7 @@ pub(crate) fn decode_byron_tx_standalone(cbor: &[u8]) -> Result<Transaction, Ser
         }
     }
 
-    // tx: capture raw bytes (this is the KeepRaw<Tx> in pallas)
+    // tx: capture raw bytes (this is the KeepRaw<Tx> in the in-house decoder)
     let tx_start = inner_r.position();
     inner_r.skip()?;
     let raw_tx = inner_r.slice_from(tx_start).to_vec();

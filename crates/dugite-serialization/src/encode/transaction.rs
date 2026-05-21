@@ -61,7 +61,7 @@ where
 ///
 /// The original code checked `era == Era::Conway` only. Dijkstra-era transactions
 /// re-encoded with the `else` branch emitted unsorted plain arrays, producing a
-/// different body hash than pallas computed from the original wire bytes — a
+/// different body hash than the canonical from the original wire bytes — a
 /// chain-split for any relayed or re-encoded Dijkstra block.
 fn encode_set_for_era<T, F>(era: Era, items: &[T], encode_item: F) -> Vec<u8>
 where
@@ -547,7 +547,7 @@ pub(super) fn encode_transaction_body_for_era(body: &TransactionBody, era: Era) 
 
     // 14: required_signers
     // CDDL: required_signers = nonempty_set<addr_keyhash> where addr_keyhash = hash28.
-    // required_signers is stored internally as Hash32 (zero-padded from 28-byte pallas hashes),
+    // required_signers is stored internally as Hash32 (zero-padded from 28-byte cardano-ledger key hashes),
     // so we emit only the first 28 bytes on the wire to match the CDDL spec.
     if !body.required_signers.is_empty() {
         buf.extend(encode_uint(14));
@@ -652,13 +652,13 @@ pub fn compute_transaction_hash(body: &TransactionBody) -> Hash32 {
 /// # D11 / audit #544 — tx hash invariance
 ///
 /// When a transaction is decoded from wire CBOR (e.g., from a block received
-/// over the network), pallas computes the hash over the original raw bytes and
+/// over the network), the in-house decoder computes the hash over the original raw bytes and
 /// stores it in `tx.hash`.  Our `encode_transaction_body` re-encodes from parsed
 /// fields, which may differ from the original bytes for:
 ///
 /// - Non-canonical input orderings in pre-Conway transactions
 /// - Dijkstra-era transactions decoded by older code paths
-/// - Any encoding detail that pallas decodes losslessly but we cannot reproduce
+/// - Any encoding detail that the in-house decoder captures via KeepRaw but we cannot reproduce
 ///
 /// This function uses `tx.raw_body_cbor` when available — the exact bytes that
 /// produced `tx.hash` — and falls back to re-encoding only for forged transactions
@@ -1363,7 +1363,7 @@ mod tests {
     }
 
     /// D11: When raw_body_cbor is Some, must hash the raw bytes directly.
-    /// This ensures tx.hash (computed by pallas from wire bytes) is preserved.
+    /// This ensures tx.hash (computed by the in-house decoder from wire bytes) is preserved.
     #[test]
     fn test_compute_hash_from_tx_uses_raw_body_cbor() {
         use dugite_primitives::hash::blake2b_256;

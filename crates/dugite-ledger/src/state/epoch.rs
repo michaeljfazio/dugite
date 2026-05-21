@@ -905,7 +905,7 @@ impl LedgerState {
         // This matches Haskell's updateNonce: hash(evolving || eta)
         // where eta was already computed as vrfNonceValue in reupdateChainDepState.
         let prev = self.consensus.evolving_nonce;
-        // ALWAYS hash the input — matching pallas's generate_rolling_nonce exactly.
+        // ALWAYS hash the input — matching the legacy decoder's generate_rolling_nonce exactly.
         // DO NOT use a pass-through for 32-byte inputs — this was verified to produce
         // wrong nonces. The hash step is required for both TPraos and Praos:
         //   TPraos (64-byte raw nonce_vrf.0): eta = blake2b_256(raw) — 1 hash total

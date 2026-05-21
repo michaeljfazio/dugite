@@ -76,7 +76,7 @@ impl SlotConfig {
     }
 }
 
-/// Decode the `(tag_byte, index)` from the CBOR-encoded pallas `Redeemer`
+/// Decode the `(tag_byte, index)` from the CBOR-encoded `Redeemer`
 /// returned by `eval_phase_two_raw`.
 ///
 /// The encoding is `array(4)[tag_uint, index_uint, data, ex_units]`.  We only
@@ -113,7 +113,7 @@ fn redeemer_tag_byte(tag: &dugite_primitives::transaction::RedeemerTag) -> u8 {
     }
 }
 
-/// Encode a TransactionInput as CBOR bytes (pallas wire format)
+/// Encode a TransactionInput as CBOR bytes (wire format)
 ///
 /// TransactionInput is encoded as a 2-element CBOR array: [hash(32 bytes), index(uint)]
 fn encode_input_cbor(input: &dugite_primitives::transaction::TransactionInput) -> Vec<u8> {
@@ -164,7 +164,7 @@ pub fn evaluate_plutus_scripts(
     //     matching `compute_script_data_hash` so script integrity stays
     //     consistent.
     //
-    // Reference: see `pallas` `KeepRaw<TransactionBody>` and Haskell
+    // Reference: see the in-house `KeepRaw<TransactionBody>` and Haskell
     // `MemoBytes`/`SafeHash` — both capture original CBOR on decode and hash
     // those exact bytes for the TxId.
     let owned_cbor: Vec<u8>;
@@ -230,7 +230,7 @@ pub fn evaluate_plutus_scripts(
     // Build the per-redeemer version map: (tag_byte, index) → language version.
     //
     // `eval_phase_two_raw` returns one `(redeemer_cbor, EvalResult)` pair per
-    // executed redeemer.  The `redeemer_cbor` bytes are a CBOR-encoded pallas
+    // executed redeemer.  The `redeemer_cbor` bytes are a CBOR-encoded
     // `Redeemer`: `array(4)[tag_uint, index_uint, data, ex_units]`.  We decode
     // the first two fields to recover (tag, index) and look up the language
     // version from this map.
@@ -246,8 +246,8 @@ pub fn evaluate_plutus_scripts(
     // valid V1/V2 scripts that return non-Unit in mixed-version transactions.
     let redeemer_version_map = redeemer_script_version_map(tx, utxo_set, &version_map);
 
-    // SECURITY: wrap the third-party uplc / pallas-codec call in catch_unwind.
-    // Both crates have known panics on malformed input (pallas-codec flat
+    // SECURITY: wrap the third-party uplc / the legacy CBOR codec call in catch_unwind.
+    // Both crates have known panics on malformed input (the legacy CBOR codec flat
     // decoder unwrap, uplc tx.rs:194 unwrap on Err(EndOfInput)). Without this
     // guard, an adversary can craft a transaction whose witness-set Plutus
     // script crashes the node — a remote DoS over TxSubmission2 / N2C.
@@ -274,7 +274,7 @@ pub fn evaluate_plutus_scripts(
                 "Plutus evaluator panicked on adversarial input — rejecting tx"
             );
             return Err(PlutusError::EvalFailed(format!(
-                "uplc/pallas-codec panic on malformed script: {msg}"
+                "uplc/the legacy CBOR codec panic on malformed script: {msg}"
             )));
         }
     };
@@ -501,7 +501,7 @@ mod tests {
     // The full Conway-era CBOR transaction used as `raw_cbor` is assembled
     // manually using `minicbor::Encoder`.  Since `evaluate_plutus_scripts`
     // calls `eval_phase_two_raw` with `run_phase_one = false`, the
-    // script_data_hash field in the body is intentionally omitted; pallas
+    // script_data_hash field in the body is intentionally omitted; the legacy decoder
     // will parse the transaction, but uplc will not re-validate structural
     // rules that our own Phase-1 pass already enforces.
     // -----------------------------------------------------------------------
@@ -814,7 +814,7 @@ mod tests {
         enc.map(2).expect("infallible");
 
         // key 6: PlutusV2 scripts — plain array(1) [script_cbor_bytes]
-        // pallas accepts a plain array as well as tag(258)+array for NonEmptySet
+        // the in-house decoder accepts a plain array as well as tag(258)+array for NonEmptySet
         enc.u8(6).expect("infallible");
         enc.array(1).expect("infallible");
         enc.bytes(script_cbor).expect("infallible");
@@ -1048,8 +1048,8 @@ mod tests {
     // -----------------------------------------------------------------------
     // Regression test for #450: adversarial malformed Plutus witness scripts.
     //
-    // Both pallas-codec's flat decoder and aiken-lang/uplc have known panics
-    // on malformed input (pallas-codec/src/flat/decode/decoder.rs unwrap,
+    // Both the legacy CBOR codec's flat decoder and aiken-lang/uplc have known panics
+    // on malformed input (the legacy CBOR codec/src/flat/decode/decoder.rs unwrap,
     // uplc/src/tx.rs:194 unwrap on Err(EndOfInput)). Without the catch_unwind
     // guard added in `evaluate_plutus_scripts`, a peer-supplied script bundled
     // in a gossiped transaction could panic the node — a remote DoS over
@@ -1094,7 +1094,7 @@ mod tests {
             // tx_cbor produced by build_conway_tx_cbor embeds the malformed
             // bytes verbatim in the witness set (key 3 = plutus_v2_script),
             // which is exactly the path through `eval_phase_two_raw` →
-            // `Program::<DeBruijn>::from_cbor` → pallas-codec flat decoder
+            // `Program::<DeBruijn>::from_cbor` → the legacy CBOR codec flat decoder
             // that historically panicked.
             let tx_cbor = build_conway_tx_cbor(&tx_input_hash, &script_cbor, 14_000_000, 2_000_000);
             let (utxo_set, input) = build_script_utxo_set(&tx_input_hash, &script_hash);

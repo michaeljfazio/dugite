@@ -513,7 +513,7 @@ impl Node {
         // Load Byron genesis if configured — done early so we can read the
         // security parameter k before opening ChainDB.
         let config_dir = args.config_dir.clone();
-        let mut byron_epoch_length: u64 = 0; // 0 = use pallas defaults (mainnet)
+        let mut byron_epoch_length: u64 = 0; // 0 = use mainnet defaults (mainnet)
         let mut byron_slot_duration_ms: u64 = 20_000; // default 20s, overridden by genesis
         let mut byron_genesis_file_hash: Option<dugite_primitives::hash::Hash32> = None;
         let mut security_param_k: usize = dugite_storage::chain_db::DEFAULT_SECURITY_PARAM_K;
@@ -3829,7 +3829,7 @@ impl Node {
                         };
                         match cbor_opt {
                             Some(cbor) => {
-                                match dugite_serialization::multi_era::decode_block_minimal_with_byron_epoch_length(
+                                match dugite_serialization::decode_block_minimal_with_byron_epoch_length(
                                     &cbor,
                                     self.byron_epoch_length,
                                 ) {
@@ -5852,7 +5852,7 @@ impl Node {
                                         replay_failed = true;
                                         break;
                                     };
-                                    let fork_block = match dugite_serialization::multi_era::decode_block_minimal_with_byron_epoch_length(
+                                    let fork_block = match dugite_serialization::decode_block_minimal_with_byron_epoch_length(
                                     &cbor,
                                     self.byron_epoch_length,
                                 ) {
