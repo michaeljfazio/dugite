@@ -1,12 +1,14 @@
 //! KES (Key Evolving Signature) implementation for Cardano.
 //!
-//! Uses pallas-crypto's Sum6Kes implementation (depth-6 binary sum composition
-//! over Ed25519), matching cardano-node's KES scheme.
+//! Uses the `kes-summed-ed25519` crate directly for the Sum6Kes implementation
+//! (depth-6 binary sum composition over Ed25519), matching cardano-node's KES
+//! scheme.  The pallas-crypto wrapper previously used here simply re-exports
+//! types from this same upstream crate, so the swap is a pure no-op at the
+//! cryptographic level.
 
-use pallas_crypto::kes::common::PublicKey as KesPublicKey;
-use pallas_crypto::kes::errors::Error as PallasKesError;
-use pallas_crypto::kes::summed_kes::{Sum6Kes, Sum6KesSig};
-use pallas_crypto::kes::traits::{KesSig, KesSk};
+use kes_summed_ed25519::kes::{Sum6Kes, Sum6KesSig};
+use kes_summed_ed25519::traits::{KesSig, KesSk};
+use kes_summed_ed25519::PublicKey as KesPublicKey;
 use thiserror::Error;
 
 /// KES period (each period is 129600 slots = 36 hours on mainnet)
@@ -38,11 +40,9 @@ pub enum KesError {
     VerificationFailed(String),
 }
 
-impl From<PallasKesError> for KesError {
-    fn from(e: PallasKesError) -> Self {
-        KesError::KeyError(e.to_string())
-    }
-}
+// `kes-summed-ed25519::errors::Error` lives in a private module so we can't
+// name it for a `From` impl. The error is reachable only through return-type
+// position; convert inline at call sites with `format!("{e:?}")`.
 
 /// Generate a new KES key pair from a 32-byte seed.
 ///
@@ -75,7 +75,7 @@ pub fn kes_sign_message(sk_bytes: &[u8], message: &[u8]) -> Result<(Sum6KesSig, 
     check_key_size(sk_bytes.len())?;
 
     let mut sk_copy = sk_bytes.to_vec();
-    let sk = Sum6Kes::from_bytes(&mut sk_copy).map_err(|e| KesError::KeyError(e.to_string()))?;
+    let sk = Sum6Kes::from_bytes(&mut sk_copy).map_err(|e| KesError::KeyError(format!("{e:?}")))?;
 
     let period = sk.get_period();
     let sig = sk.sign(message);
@@ -117,7 +117,7 @@ pub fn kes_verify_bytes(
     message: &[u8],
 ) -> Result<(), KesError> {
     let sig = Sum6KesSig::from_bytes(sig_bytes)
-        .map_err(|e| KesError::VerificationFailed(format!("invalid KES sig bytes: {e}")))?;
+        .map_err(|e| KesError::VerificationFailed(format!("invalid KES sig bytes: {e:?}")))?;
     kes_verify(pk_bytes, period, &sig, message)
 }
 
@@ -129,10 +129,10 @@ pub fn kes_verify(
     message: &[u8],
 ) -> Result<(), KesError> {
     let pk = KesPublicKey::from_bytes(pk_bytes)
-        .map_err(|e| KesError::VerificationFailed(e.to_string()))?;
+        .map_err(|e| KesError::VerificationFailed(format!("{e:?}")))?;
 
     sig.verify(period, &pk, message)
-        .map_err(|e| KesError::VerificationFailed(e.to_string()))
+        .map_err(|e| KesError::VerificationFailed(format!("{e:?}")))
 }
 
 /// Update (evolve) a KES secret key to the next period.
@@ -143,7 +143,7 @@ pub fn kes_update(sk_bytes: &[u8]) -> Result<(Vec<u8>, u32), KesError> {
 
     let mut sk_copy = sk_bytes.to_vec();
     let mut sk =
-        Sum6Kes::from_bytes(&mut sk_copy).map_err(|e| KesError::KeyError(e.to_string()))?;
+        Sum6Kes::from_bytes(&mut sk_copy).map_err(|e| KesError::KeyError(format!("{e:?}")))?;
 
     let current_period = sk.get_period();
     if current_period as u64 >= MAX_KES_EVOLUTIONS {
@@ -153,7 +153,8 @@ pub fn kes_update(sk_bytes: &[u8]) -> Result<(Vec<u8>, u32), KesError> {
         ));
     }
 
-    sk.update().map_err(|e| KesError::KeyError(e.to_string()))?;
+    sk.update()
+        .map_err(|e| KesError::KeyError(format!("{e:?}")))?;
     let new_period = sk.get_period();
 
     // Copy bytes before Drop zeroizes
@@ -173,7 +174,7 @@ pub fn kes_sk_to_pk(sk_bytes: &[u8]) -> Result<[u8; 32], KesError> {
     check_key_size(sk_bytes.len())?;
 
     let mut sk_copy = sk_bytes.to_vec();
-    let sk = Sum6Kes::from_bytes(&mut sk_copy).map_err(|e| KesError::KeyError(e.to_string()))?;
+    let sk = Sum6Kes::from_bytes(&mut sk_copy).map_err(|e| KesError::KeyError(format!("{e:?}")))?;
 
     let pk = sk.to_pk();
     let mut pk_bytes = [0u8; 32];
@@ -187,7 +188,7 @@ pub fn kes_get_period(sk_bytes: &[u8]) -> Result<u32, KesError> {
     check_key_size(sk_bytes.len())?;
 
     let mut sk_copy = sk_bytes.to_vec();
-    let sk = Sum6Kes::from_bytes(&mut sk_copy).map_err(|e| KesError::KeyError(e.to_string()))?;
+    let sk = Sum6Kes::from_bytes(&mut sk_copy).map_err(|e| KesError::KeyError(format!("{e:?}")))?;
 
     Ok(sk.get_period())
 }
