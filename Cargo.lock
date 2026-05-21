@@ -1161,8 +1161,8 @@ dependencies = [
  "dugite-primitives",
  "ed25519-dalek",
  "hex",
+ "kes-summed-ed25519",
  "minicbor 0.26.5",
- "pallas-crypto 1.0.0-alpha.6",
  "rand 0.9.4",
  "rand_chacha 0.9.0",
  "serde",
@@ -3243,16 +3243,11 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2082f415b36965e6238d44a331e3d6e52fdb3bd04b75248c496a3883aa80fedc"
 dependencies = [
  "cryptoxide",
- "ed25519-dalek",
  "hex",
  "pallas-codec 1.0.0-alpha.6",
- "rand 0.9.4",
- "rand_chacha 0.9.0",
  "rand_core 0.9.5",
  "serde",
- "serde_with 3.18.0",
  "thiserror 1.0.69",
- "zeroize",
 ]
 
 [[package]]
