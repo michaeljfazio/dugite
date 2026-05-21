@@ -158,8 +158,8 @@ emit "  config:   $CONFIG"
 emit "  topology: $TOPOLOGY"
 
 if [[ ! -x "$BIN" ]]; then
-    emit "Binary not found at $BIN — building with --features pallas-shadow-decode..."
-    cargo build --release --features pallas-shadow-decode -p dugite-node 2>&1 | tee -a "$LOG_FILE"
+    emit "Binary not found at $BIN — building release..."
+    cargo build --release -p dugite-node 2>&1 | tee -a "$LOG_FILE"
 fi
 
 # ── Optional Mithril import ───────────────────────────────────────────────────
@@ -204,10 +204,8 @@ trap cleanup EXIT INT TERM
 
 # ── Launch node ───────────────────────────────────────────────────────────────
 
-emit "Starting dugite-node with DUGITE_DUAL_DECODE=dump..."
+emit "Starting dugite-node (post-M6: in-house decoder is the only path)..."
 
-DUGITE_DUAL_DECODE=dump \
-DUGITE_DUAL_DECODE_DUMP_DIR="$DUMP_DIR" \
 DUGITE_PIPELINE_DEPTH="${DUGITE_PIPELINE_DEPTH:-300}" \
 RUST_LOG="${LOG_LEVEL}" \
 "$BIN" run \
@@ -240,18 +238,20 @@ if [[ ! -S "$SOCKET_PATH" ]]; then
 fi
 emit "Socket ready after ${waited}s."
 
-# ── Monitor loop ──────────────────────────────────────────────────────────────
+# ── Monitor loop (post-M6 signals) ────────────────────────────────────────────
 # Poll:
 #   1. Node liveness (SIGKILL check)
-#   2. Mismatch artefacts in DUMP_DIR
+#   2. Decode errors / panics in the log
 #   3. Block count (stop at max-blocks if set)
 #
-# Block counting is done by tailing the log for "blocks_applied_total" from
-# Prometheus; if Prometheus is unavailable we fall back to log line counting.
+# The dual-decode shadow-compare artefacts no longer exist after M6 — the
+# in-house decoder is the only path. The new failure signals are direct:
+# (a) the node crashes / panics, (b) blocks fail to decode (logged as
+# "decode failed" or similar), (c) ChainSync stalls.
 
-MISMATCH_COUNT_PREV=0
-LOG_OFFSET=0
 POLL_INTERVAL=10   # seconds
+PANIC_COUNT_PREV=0
+DECODE_ERR_COUNT_PREV=0
 
 emit "Entering monitor loop (poll every ${POLL_INTERVAL}s)..."
 
@@ -262,18 +262,25 @@ while true; do
         break
     fi
 
-    # Count mismatch artefacts (anchor on .cbor; fall back to .diff.txt)
-    MISMATCH_COUNT=$(find "$DUMP_DIR" \( -name "*.cbor" -o -name "*.diff.txt" \) 2>/dev/null | wc -l | tr -d ' ')
-    if (( MISMATCH_COUNT > MISMATCH_COUNT_PREV )); then
-        new=$((MISMATCH_COUNT - MISMATCH_COUNT_PREV))
-        emit "MISMATCH DETECTED — ${new} new artefact(s) (total: ${MISMATCH_COUNT}) in $DUMP_DIR"
-        MISMATCH_COUNT_PREV=$MISMATCH_COUNT
+    # Count panics / fatal errors
+    PANIC_COUNT=$(grep -c -E "panic|FATAL|thread.*panicked" "$LOG_FILE" 2>/dev/null || echo 0)
+    if (( PANIC_COUNT > PANIC_COUNT_PREV )); then
+        emit "PANIC DETECTED — ${PANIC_COUNT} total in log"
+        grep -E "panic|FATAL|thread.*panicked" "$LOG_FILE" | tail -3
+        PANIC_COUNT_PREV=$PANIC_COUNT
+    fi
+
+    # Count block-decode errors
+    DECODE_ERR_COUNT=$(grep -c -E "decode failed|CborDecode|block decode error" "$LOG_FILE" 2>/dev/null || echo 0)
+    if (( DECODE_ERR_COUNT > DECODE_ERR_COUNT_PREV )); then
+        new=$((DECODE_ERR_COUNT - DECODE_ERR_COUNT_PREV))
+        emit "DECODE-ERR — ${new} new (total: ${DECODE_ERR_COUNT})"
+        DECODE_ERR_COUNT_PREV=$DECODE_ERR_COUNT
     fi
 
     # Max-blocks gate: parse from log
     if (( MAX_BLOCKS > 0 )); then
-        # Count "block applied" log lines as a proxy; real metric is blocks_applied_total
-        APPLIED=$(grep -c "block applied\|blocks_applied\|BlockApplied\|TraceAddedToCurrentChain" "$LOG_FILE" 2>/dev/null || echo 0)
+        APPLIED=$(grep -c -E "block applied|blocks_applied|BlockApplied|TraceAddedToCurrentChain|TraceForgedBlock" "$LOG_FILE" 2>/dev/null || echo 0)
         if (( APPLIED >= MAX_BLOCKS )); then
             emit "max-blocks reached (${APPLIED} >= ${MAX_BLOCKS}) — stopping node."
             break
@@ -288,19 +295,21 @@ sleep 2
 
 # ── Final report ──────────────────────────────────────────────────────────────
 
-FINAL_MISMATCH_COUNT=$(find "$DUMP_DIR" \( -name "*.cbor" -o -name "*.diff.txt" \) 2>/dev/null | wc -l | tr -d ' ')
+FINAL_PANIC=$(grep -c -E "panic|FATAL|thread.*panicked" "$LOG_FILE" 2>/dev/null || echo 0)
+FINAL_DECODE_ERR=$(grep -c -E "decode failed|CborDecode|block decode error" "$LOG_FILE" 2>/dev/null || echo 0)
+FINAL_APPLIED=$(grep -c -E "block applied|blocks_applied|BlockApplied|TraceAddedToCurrentChain|TraceForgedBlock" "$LOG_FILE" 2>/dev/null || echo 0)
 
-emit "=== DUAL-DECODE SOAK COMPLETE ==="
-emit "network:         $NETWORK"
-emit "log:             $LOG_FILE"
-emit "dump_dir:        $DUMP_DIR"
-emit "mismatch count:  $FINAL_MISMATCH_COUNT"
+emit "=== POST-M6 NETWORK SOAK COMPLETE ==="
+emit "network:        $NETWORK"
+emit "log:            $LOG_FILE"
+emit "blocks_applied: $FINAL_APPLIED"
+emit "panics:         $FINAL_PANIC"
+emit "decode_errors:  $FINAL_DECODE_ERR"
 
-if (( FINAL_MISMATCH_COUNT > 0 )); then
-    emit "RESULT: FAIL — ${FINAL_MISMATCH_COUNT} mismatch artefact(s) found."
-    emit "Run: python3 scripts/validation/dual-decode-report.py $DUMP_DIR"
+if (( FINAL_PANIC > 0 )) || (( FINAL_DECODE_ERR > 0 )); then
+    emit "RESULT: FAIL — panics or decode errors detected; see $LOG_FILE"
     exit 1
 else
-    emit "RESULT: PASS — no mismatch artefacts."
+    emit "RESULT: PASS — clean run, ${FINAL_APPLIED} blocks applied."
     exit 0
 fi
