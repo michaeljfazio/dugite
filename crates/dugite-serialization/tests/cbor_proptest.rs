@@ -63,7 +63,8 @@ fn arb_tx_input() -> impl Strategy<Value = TransactionInput> {
 fn arb_plutus_data() -> impl Strategy<Value = PlutusData> {
     let leaf = prop_oneof![
         // Integer: use a range that fits in CBOR encoding (avoid i128 extremes)
-        (-1_000_000_000i128..1_000_000_000i128).prop_map(PlutusData::Integer),
+        (-1_000_000_000i128..1_000_000_000i128)
+            .prop_map(|n| PlutusData::Integer(num_bigint::BigInt::from(n))),
         prop::collection::vec(any::<u8>(), 0..=64).prop_map(PlutusData::Bytes),
     ];
 
@@ -461,7 +462,7 @@ proptest! {
     // -----------------------------------------------------------------------
     #[test]
     fn prop_plutus_data_integer_roundtrip(n in -1_000_000_000i128..1_000_000_000i128) {
-        let data = PlutusData::Integer(n);
+        let data = PlutusData::Integer(num_bigint::BigInt::from(n));
         let encoded = encode_plutus_data(&data);
         let (decoded, consumed) = decode_cbor_int(&encoded).unwrap();
         prop_assert_eq!(decoded, n);

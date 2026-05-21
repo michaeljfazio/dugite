@@ -1358,7 +1358,9 @@ mod tests {
             tx.witness_set.redeemers = vec![Redeemer {
                 tag: RedeemerTag::Spend,
                 index: 0,
-                data: dugite_primitives::transaction::PlutusData::Integer(0),
+                data: dugite_primitives::transaction::PlutusData::Integer(
+                    num_bigint::BigInt::from(0i64),
+                ),
                 ex_units: ExUnits { mem: 6, steps: 1 },
             }];
             txs.push(tx);
@@ -1396,7 +1398,9 @@ mod tests {
             tx.witness_set.redeemers = vec![Redeemer {
                 tag: RedeemerTag::Spend,
                 index: 0,
-                data: dugite_primitives::transaction::PlutusData::Integer(0),
+                data: dugite_primitives::transaction::PlutusData::Integer(
+                    num_bigint::BigInt::from(0i64),
+                ),
                 ex_units: ExUnits { mem: 1, steps: 6 },
             }];
             txs.push(tx);

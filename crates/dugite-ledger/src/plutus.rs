@@ -453,7 +453,7 @@ mod tests {
         tx.witness_set.redeemers.push(Redeemer {
             tag: RedeemerTag::Spend,
             index: 0,
-            data: PlutusData::Integer(0),
+            data: PlutusData::Integer(num_bigint::BigInt::from(0i64)),
             ex_units: ExUnits {
                 mem: 100,
                 steps: 100,

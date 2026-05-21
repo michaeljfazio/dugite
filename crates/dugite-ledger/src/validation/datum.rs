@@ -371,7 +371,7 @@ mod tests {
 
     /// A simple, unique integer datum suitable for use in tests.
     fn int_datum(n: i128) -> PlutusData {
-        PlutusData::Integer(n)
+        PlutusData::Integer(num_bigint::BigInt::from(n))
     }
 
     // -----------------------------------------------------------------------

@@ -108,7 +108,7 @@ fn ws_with_redeemer() -> TransactionWitnessSet {
     ws.redeemers.push(Redeemer {
         tag: RedeemerTag::Spend,
         index: 0,
-        data: PlutusData::Integer(42),
+        data: PlutusData::Integer(num_bigint::BigInt::from(42i64)),
         ex_units: ExUnits {
             mem: 1_000,
             steps: 500_000,

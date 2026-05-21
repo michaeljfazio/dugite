@@ -449,7 +449,7 @@ mod tests {
         let r = Redeemer {
             tag: RedeemerTag::Spend,
             index: 0,
-            data: PlutusData::Integer(42),
+            data: PlutusData::Integer(num_bigint::BigInt::from(42i64)),
             ex_units: ExUnits {
                 mem: 100000,
                 steps: 200000,

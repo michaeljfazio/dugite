@@ -647,8 +647,14 @@ fn test_encode_metadatum_large_negative_int() {
 #[test]
 fn test_encode_plutus_data_map_variant() {
     let data = PlutusData::Map(vec![
-        (PlutusData::Integer(1), PlutusData::Bytes(vec![0xAA])),
-        (PlutusData::Integer(2), PlutusData::Bytes(vec![0xBB])),
+        (
+            PlutusData::Integer(num_bigint::BigInt::from(1i64)),
+            PlutusData::Bytes(vec![0xAA]),
+        ),
+        (
+            PlutusData::Integer(num_bigint::BigInt::from(2i64)),
+            PlutusData::Bytes(vec![0xBB]),
+        ),
     ]);
     let enc = encode_plutus_data(&data);
     assert_eq!(enc[0], 0xA2); // map(2)
@@ -667,7 +673,10 @@ fn test_encode_plutus_data_empty_map() {
 #[test]
 fn test_encode_plutus_data_nested_constr() {
     // Constructor 1 containing constructor 0 with integer 42
-    let inner = PlutusData::Constr(0, vec![PlutusData::Integer(42)]);
+    let inner = PlutusData::Constr(
+        0,
+        vec![PlutusData::Integer(num_bigint::BigInt::from(42i64))],
+    );
     let outer = PlutusData::Constr(1, vec![inner]);
     let enc = encode_plutus_data(&outer);
     // Outer: tag 122 (121 + 1), array(1)
@@ -803,7 +812,7 @@ fn witness_set_with_redeemer(tag: RedeemerTag, index: u32) -> Vec<u8> {
         redeemers: vec![Redeemer {
             tag,
             index,
-            data: PlutusData::Integer(0),
+            data: PlutusData::Integer(num_bigint::BigInt::from(0i64)),
             ex_units: ExUnits { mem: 0, steps: 0 },
         }],
         ..empty_witness_set()
@@ -1753,7 +1762,7 @@ fn test_encode_tx_output_inline_datum_fresh_encode() {
         address: test_addr(),
         value: Value::lovelace(1_000_000),
         datum: OutputDatum::InlineDatum {
-            data: PlutusData::Integer(42),
+            data: PlutusData::Integer(num_bigint::BigInt::from(42i64)),
             raw_cbor: None,
         },
         script_ref: None,
@@ -1785,7 +1794,7 @@ fn test_encode_tx_output_inline_datum_uses_raw_cbor_when_present() {
         address: test_addr(),
         value: Value::lovelace(500_000),
         datum: OutputDatum::InlineDatum {
-            data: PlutusData::Integer(99), // intentionally different from raw_cbor
+            data: PlutusData::Integer(num_bigint::BigInt::from(99i64)), // intentionally different from raw_cbor
             raw_cbor: Some(raw.clone()),
         },
         script_ref: None,

@@ -93,6 +93,31 @@ pub fn encode_uint(value: u64) -> Vec<u8> {
     buf
 }
 
+/// Encode an arbitrary-precision Plutus integer to CBOR.
+///
+/// Plutus values are unbounded (Haskell `Integer`). For magnitudes that fit in
+/// i128 we emit the small-int encoding (major types 0/1); larger values use
+/// CBOR tag 2 (positive bigint) or tag 3 (negative bigint) followed by a
+/// byte-string of the big-endian magnitude.
+pub fn encode_plutus_int(value: &num_bigint::BigInt) -> Vec<u8> {
+    use num_bigint::Sign;
+    use num_traits::ToPrimitive;
+    if let Some(v) = value.to_i128() {
+        return encode_int(v);
+    }
+    let (tag, mag) = if value.sign() == Sign::Minus {
+        let n = -value - num_bigint::BigInt::from(1);
+        let (_, bytes) = n.to_bytes_be();
+        (3u64, bytes)
+    } else {
+        let (_, bytes) = value.to_bytes_be();
+        (2u64, bytes)
+    };
+    let mut buf = encode_tag(tag);
+    buf.extend(encode_bytes(&mag));
+    buf
+}
+
 /// Encode a signed integer to CBOR
 pub fn encode_int(value: i128) -> Vec<u8> {
     if value >= 0 {
@@ -245,7 +270,7 @@ pub fn encode_plutus_data(data: &PlutusData) -> Vec<u8> {
             }
             buf
         }
-        PlutusData::Integer(n) => encode_int(*n),
+        PlutusData::Integer(n) => encode_plutus_int(n),
         PlutusData::Bytes(b) => encode_bytes(b),
     }
 }
@@ -410,7 +435,7 @@ mod tests {
 
     #[test]
     fn test_encode_plutus_data_integer() {
-        let data = PlutusData::Integer(42);
+        let data = PlutusData::Integer(num_bigint::BigInt::from(42i64));
         let encoded = encode_plutus_data(&data);
         assert_eq!(encoded, vec![0x18, 42]);
     }
@@ -424,14 +449,17 @@ mod tests {
 
     #[test]
     fn test_encode_plutus_data_list() {
-        let data = PlutusData::List(vec![PlutusData::Integer(1), PlutusData::Integer(2)]);
+        let data = PlutusData::List(vec![
+            PlutusData::Integer(num_bigint::BigInt::from(1i64)),
+            PlutusData::Integer(num_bigint::BigInt::from(2i64)),
+        ]);
         let encoded = encode_plutus_data(&data);
         assert_eq!(encoded, vec![0x82, 0x01, 0x02]);
     }
 
     #[test]
     fn test_encode_plutus_data_constr() {
-        let data = PlutusData::Constr(0, vec![PlutusData::Integer(1)]);
+        let data = PlutusData::Constr(0, vec![PlutusData::Integer(num_bigint::BigInt::from(1i64))]);
         let encoded = encode_plutus_data(&data);
         assert_eq!(encoded[0], 0xd8); // tag
         assert_eq!(encoded[1], 121); // constructor 0 = tag 121
@@ -489,7 +517,7 @@ mod tests {
     #[test]
     fn test_encode_plutus_constr_medium() {
         // Constructors 7-127 use CBOR tags 1280+
-        let data = PlutusData::Constr(7, vec![PlutusData::Integer(1)]);
+        let data = PlutusData::Constr(7, vec![PlutusData::Integer(num_bigint::BigInt::from(1i64))]);
         let encoded = encode_plutus_data(&data);
         assert_eq!(encoded[0], 0xd9); // 2-byte tag
         let tag_val = u16::from_be_bytes([encoded[1], encoded[2]]);
@@ -499,7 +527,10 @@ mod tests {
     #[test]
     fn test_encode_plutus_constr_large_uses_tag_102() {
         // Constructors >= 128 must use CBOR tag 102 (NOT tag 258)
-        let data = PlutusData::Constr(128, vec![PlutusData::Integer(99)]);
+        let data = PlutusData::Constr(
+            128,
+            vec![PlutusData::Integer(num_bigint::BigInt::from(99i64))],
+        );
         let encoded = encode_plutus_data(&data);
 
         // Tag 102 = 0xd8 0x66

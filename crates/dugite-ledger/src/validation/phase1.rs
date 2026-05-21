@@ -2116,7 +2116,9 @@ mod tests {
         tx.witness_set.redeemers.push(Redeemer {
             tag: RedeemerTag::Spend,
             index: 0,
-            data: dugite_primitives::transaction::PlutusData::Integer(0),
+            data: dugite_primitives::transaction::PlutusData::Integer(num_bigint::BigInt::from(
+                0i64,
+            )),
             ex_units: ExUnits { mem: 0, steps: 0 },
         });
         // Deliberately leave script_data_hash as None → MissingScriptDataHash
