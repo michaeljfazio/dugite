@@ -392,4 +392,364 @@ mod tests {
     // `test_script_data_hash_from_real_tx` already covers the only
     // invariant that matters: the hash matches the declared
     // `script_data_hash` field of the witness set on a real tx.
+
+    // ── ScriptRef variant tags ───────────────────────────────────────────────
+
+    #[test]
+    fn script_ref_native_tag_is_0() {
+        let sr = ScriptRef::NativeScript(NativeScript::InvalidBefore(
+            dugite_primitives::time::SlotNo(1),
+        ));
+        let cbor = encode_script_ref(&sr);
+        // Outer array(2), then uint(0), then encoded native script.
+        assert_eq!(cbor[0], 0x82);
+        assert_eq!(cbor[1], 0x00);
+    }
+
+    #[test]
+    fn script_ref_plutus_v1_tag_is_1() {
+        let sr = ScriptRef::PlutusV1(vec![0xde, 0xad]);
+        let cbor = encode_script_ref(&sr);
+        assert_eq!(cbor[0], 0x82);
+        assert_eq!(cbor[1], 0x01);
+        // After variant tag: bstr length(2) + bytes.
+        assert_eq!(cbor[2], 0x42);
+        assert_eq!(&cbor[3..5], &[0xde, 0xad]);
+    }
+
+    #[test]
+    fn script_ref_plutus_v2_tag_is_2() {
+        let sr = ScriptRef::PlutusV2(vec![0x01]);
+        let cbor = encode_script_ref(&sr);
+        assert_eq!(cbor[1], 0x02);
+    }
+
+    #[test]
+    fn script_ref_plutus_v3_tag_is_3() {
+        let sr = ScriptRef::PlutusV3(vec![]);
+        let cbor = encode_script_ref(&sr);
+        assert_eq!(cbor[1], 0x03);
+        // Empty plutus bytes → bstr(0) = 0x40.
+        assert_eq!(cbor[2], 0x40);
+    }
+
+    // ── NativeScript variants ────────────────────────────────────────────────
+
+    #[test]
+    fn native_script_pubkey_truncates_to_28_bytes() {
+        use dugite_primitives::hash::Hash32;
+        // Build a Hash32 whose first 28 bytes are 0xAA and last 4 are 0xBB.
+        let mut raw = [0xAAu8; 32];
+        raw[28..].copy_from_slice(&[0xBB; 4]);
+        let hash = Hash32::from_bytes(raw);
+        let cbor = encode_native_script(&NativeScript::ScriptPubkey(hash));
+        // array(2) + uint(0) + bstr(28) + 28 bytes
+        assert_eq!(cbor[0], 0x82);
+        assert_eq!(cbor[1], 0x00);
+        // 0x58 0x1c = bstr(28).
+        assert_eq!(cbor[2], 0x58);
+        assert_eq!(cbor[3], 0x1c);
+        // Verify the padding bytes were dropped (only 28 bytes follow).
+        assert_eq!(&cbor[4..32], &[0xAA; 28]);
+        assert_eq!(cbor.len(), 32);
+    }
+
+    #[test]
+    fn native_script_all_encodes_inner_scripts() {
+        use dugite_primitives::time::SlotNo;
+        let inner = vec![
+            NativeScript::InvalidBefore(SlotNo(7)),
+            NativeScript::InvalidHereafter(SlotNo(11)),
+        ];
+        let cbor = encode_native_script(&NativeScript::ScriptAll(inner));
+        // array(2) + uint(1) + array(2) + 2 inner native scripts (each 3 bytes)
+        assert_eq!(cbor[0], 0x82);
+        assert_eq!(cbor[1], 0x01);
+        assert_eq!(cbor[2], 0x82); // array(2) of inner scripts
+    }
+
+    #[test]
+    fn native_script_any_tag_is_2() {
+        let cbor = encode_native_script(&NativeScript::ScriptAny(vec![]));
+        assert_eq!(cbor[1], 0x02);
+        assert_eq!(cbor[2], 0x80); // empty inner array
+    }
+
+    #[test]
+    fn native_script_n_of_k_encodes_n_first() {
+        let cbor = encode_native_script(&NativeScript::ScriptNOfK(3, vec![]));
+        // array(3) + uint(3 = NOfK tag) + uint(3 = n) + array(0)
+        assert_eq!(cbor[0], 0x83);
+        assert_eq!(cbor[1], 0x03);
+        assert_eq!(cbor[2], 0x03);
+        assert_eq!(cbor[3], 0x80);
+    }
+
+    #[test]
+    fn native_script_invalid_before_tag_is_4() {
+        use dugite_primitives::time::SlotNo;
+        let cbor = encode_native_script(&NativeScript::InvalidBefore(SlotNo(100)));
+        assert_eq!(cbor[0], 0x82);
+        assert_eq!(cbor[1], 0x04);
+        assert_eq!(cbor[2], 0x18); // uint(info=24)
+        assert_eq!(cbor[3], 100);
+    }
+
+    #[test]
+    fn native_script_invalid_hereafter_tag_is_5() {
+        use dugite_primitives::time::SlotNo;
+        let cbor = encode_native_script(&NativeScript::InvalidHereafter(SlotNo(0)));
+        assert_eq!(cbor[1], 0x05);
+        assert_eq!(cbor[2], 0x00);
+    }
+
+    // ── encode_redeemer_tag for each variant ────────────────────────────────
+
+    #[test]
+    fn redeemer_tag_encodings_match_wire_values() {
+        // The wire-format uints for each tag (per Conway spec).
+        let cases = [
+            (RedeemerTag::Spend, 0u64),
+            (RedeemerTag::Mint, 1),
+            (RedeemerTag::Cert, 2),
+            (RedeemerTag::Reward, 3),
+            (RedeemerTag::Vote, 4),
+            (RedeemerTag::Propose, 5),
+        ];
+        for (tag, expected) in cases {
+            let cbor = encode_redeemer_tag(&tag);
+            // Small uints encode as a single byte (info=value when value < 24).
+            assert_eq!(cbor, vec![expected as u8], "tag mismatch for {tag:?}");
+        }
+    }
+
+    // ── encode_redeemer round-trips a structurally tagged blob ──────────────
+
+    #[test]
+    fn encode_redeemer_layout_is_array_of_four() {
+        let r = Redeemer {
+            tag: RedeemerTag::Spend,
+            index: 0,
+            data: PlutusData::Integer(0u32.into()),
+            ex_units: ExUnits { mem: 7, steps: 11 },
+        };
+        let cbor = encode_redeemer(&r);
+        // Outer array(4)
+        assert_eq!(cbor[0], 0x84);
+        assert_eq!(cbor[1], 0x00); // tag = Spend → 0
+        assert_eq!(cbor[2], 0x00); // index = 0
+    }
+
+    // ── encode_vkey_witness / encode_bootstrap_witness ──────────────────────
+
+    #[test]
+    fn vkey_witness_is_two_bytestrings() {
+        let w = VKeyWitness {
+            vkey: vec![0x01; 32],
+            signature: vec![0x02; 64],
+        };
+        let cbor = encode_vkey_witness(&w);
+        assert_eq!(cbor[0], 0x82); // array(2)
+        assert_eq!(cbor[1], 0x58); // bstr(info=24)
+        assert_eq!(cbor[2], 0x20); // length 32
+    }
+
+    #[test]
+    fn bootstrap_witness_is_four_bytestrings() {
+        let w = BootstrapWitness {
+            vkey: vec![0x01; 32],
+            signature: vec![0x02; 64],
+            chain_code: vec![0x03; 32],
+            attributes: vec![],
+        };
+        let cbor = encode_bootstrap_witness(&w);
+        assert_eq!(cbor[0], 0x84); // array(4)
+    }
+
+    // ── encode_metadata_map ─────────────────────────────────────────────────
+
+    #[test]
+    fn metadata_map_orders_by_label() {
+        let mut md = std::collections::BTreeMap::new();
+        md.insert(674u64, TransactionMetadatum::Text("hello".to_string()));
+        md.insert(0u64, TransactionMetadatum::Int(42));
+        let cbor = encode_metadata_map(&md);
+        // 0xa2 = map(2). Then keys in BTreeMap order: 0 first.
+        assert_eq!(cbor[0], 0xa2);
+        assert_eq!(cbor[1], 0x00); // label 0
+                                   // After integer metadatum (1-2 bytes), next label is 674 = 0x19 0x02 0xa2.
+                                   // We just assert the first key is the smaller label.
+    }
+
+    // ── encode_language_views: each language path ───────────────────────────
+
+    #[test]
+    fn language_views_empty_is_empty_map() {
+        let cm = CostModels {
+            plutus_v1: None,
+            plutus_v2: None,
+            plutus_v3: None,
+        };
+        // No `has_*` flags set → empty map.
+        let cbor = encode_language_views(&cm, false, false, false);
+        assert_eq!(cbor, vec![0xa0]);
+    }
+
+    #[test]
+    fn language_views_v1_only_double_bagged_key() {
+        let cm = CostModels {
+            plutus_v1: Some(vec![1, 2, 3]),
+            plutus_v2: None,
+            plutus_v3: None,
+        };
+        let cbor = encode_language_views(&cm, true, false, false);
+        // Map(1), then key = bstr(0x00) = [0x41, 0x00] ("double-bagged"),
+        // then value = bstr-wrapped indef-array.
+        assert_eq!(cbor[0], 0xa1);
+        assert_eq!(&cbor[1..3], &[0x41, 0x00]);
+    }
+
+    #[test]
+    fn language_views_v2_only_array_form() {
+        let cm = CostModels {
+            plutus_v1: None,
+            plutus_v2: Some(vec![10, 20]),
+            plutus_v3: None,
+        };
+        let cbor = encode_language_views(&cm, false, true, false);
+        // Map(1), key = uint(1), value = array(2)[uint(10), uint(20)].
+        assert_eq!(cbor[0], 0xa1);
+        assert_eq!(cbor[1], 0x01); // key = uint(1)
+        assert_eq!(cbor[2], 0x82); // array(2)
+    }
+
+    #[test]
+    fn language_views_v3_only_array_form() {
+        let cm = CostModels {
+            plutus_v1: None,
+            plutus_v2: None,
+            plutus_v3: Some(vec![1]),
+        };
+        let cbor = encode_language_views(&cm, false, false, true);
+        assert_eq!(cbor[1], 0x02); // key = uint(2)
+    }
+
+    #[test]
+    fn language_views_short_lex_order_v2_v3_v1() {
+        let cm = CostModels {
+            plutus_v1: Some(vec![1]),
+            plutus_v2: Some(vec![2]),
+            plutus_v3: Some(vec![3]),
+        };
+        let cbor = encode_language_views(&cm, true, true, true);
+        // map(3); first key uint(1)=V2 (1 byte), second uint(2)=V3 (1 byte),
+        // third bstr(0x00)=V1 (2 bytes). Verify the key order on the wire.
+        assert_eq!(cbor[0], 0xa3);
+        assert_eq!(cbor[1], 0x01); // V2 first
+    }
+
+    #[test]
+    fn language_views_has_flag_without_cost_model_is_noop() {
+        // `has_v1=true` but no cost model → entry is skipped.
+        let cm = CostModels {
+            plutus_v1: None,
+            plutus_v2: None,
+            plutus_v3: None,
+        };
+        let cbor = encode_language_views(&cm, true, true, true);
+        assert_eq!(cbor, vec![0xa0]);
+    }
+
+    // ── compute_script_data_hash (in-memory inputs) ─────────────────────────
+
+    #[test]
+    fn compute_script_data_hash_empty_redeemers_uses_a0_sentinel() {
+        let cm = CostModels {
+            plutus_v1: None,
+            plutus_v2: None,
+            plutus_v3: None,
+        };
+        // Empty redeemers, no datums, no languages → preimage = [0xa0, 0xa0]
+        // (empty-map sentinel + empty language-views map).
+        let h = compute_script_data_hash(&[], &[], &cm, false, false, false, None, None);
+        let expected = dugite_primitives::hash::blake2b_256(&[0xa0, 0xa0]);
+        assert_eq!(h, expected);
+    }
+
+    #[test]
+    fn compute_script_data_hash_raw_inputs_passthrough() {
+        let cm = CostModels {
+            plutus_v1: None,
+            plutus_v2: None,
+            plutus_v3: None,
+        };
+        let raw_red = [0xa1, 0x82, 0x00, 0x00, 0x82, 0x80, 0x82, 0x07, 0x0b];
+        let raw_dat = [0x80];
+        let h1 = compute_script_data_hash(
+            &[],
+            &[],
+            &cm,
+            false,
+            false,
+            false,
+            Some(&raw_red),
+            Some(&raw_dat),
+        );
+        // Manually compute: preimage = raw_red || raw_dat || encode_language_views()
+        let mut preimage = raw_red.to_vec();
+        preimage.extend_from_slice(&raw_dat);
+        preimage.extend(encode_language_views(&cm, false, false, false));
+        assert_eq!(h1, dugite_primitives::hash::blake2b_256(&preimage));
+    }
+
+    #[test]
+    fn compute_script_data_hash_reencodes_redeemers_when_no_raw() {
+        let cm = CostModels {
+            plutus_v1: None,
+            plutus_v2: None,
+            plutus_v3: None,
+        };
+        let r = Redeemer {
+            tag: RedeemerTag::Spend,
+            index: 0,
+            data: PlutusData::Integer(0u32.into()),
+            ex_units: ExUnits { mem: 1, steps: 1 },
+        };
+        // Just exercise the re-encode branch — confirm we get *some* hash and
+        // that it differs from the empty-redeemers hash.
+        let h_with = compute_script_data_hash(
+            std::slice::from_ref(&r),
+            &[],
+            &cm,
+            false,
+            false,
+            false,
+            None,
+            None,
+        );
+        let h_empty = compute_script_data_hash(&[], &[], &cm, false, false, false, None, None);
+        assert_ne!(h_with, h_empty);
+    }
+
+    #[test]
+    fn compute_script_data_hash_reencodes_datums_when_no_raw() {
+        let cm = CostModels {
+            plutus_v1: None,
+            plutus_v2: None,
+            plutus_v3: None,
+        };
+        let d = PlutusData::Bytes(vec![0xab, 0xcd]);
+        let h = compute_script_data_hash(
+            &[],
+            std::slice::from_ref(&d),
+            &cm,
+            false,
+            false,
+            false,
+            None,
+            None,
+        );
+        let h_empty = compute_script_data_hash(&[], &[], &cm, false, false, false, None, None);
+        assert_ne!(h, h_empty);
+    }
 }

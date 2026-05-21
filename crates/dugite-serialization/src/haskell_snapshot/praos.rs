@@ -166,3 +166,72 @@ pub fn decode_praos_state(data: &[u8]) -> Result<(HaskellPraosState, usize), Ser
         off,
     ))
 }
+
+#[cfg(test)]
+mod tests {
+    //! Error-path coverage for the PraosState decoder. The happy-path test
+    //! (versioned array(2) → version=0 → inner array(7)) lives in the parent
+    //! `tests.rs` and consumes a real preview fixture. Here we focus on the
+    //! malformed-input rejection branches.
+    use super::*;
+
+    #[test]
+    fn rejects_wrong_outer_array_length() {
+        // array(3) instead of array(2).
+        let err = decode_praos_state(&[0x83, 0x00, 0x00, 0x00]).unwrap_err();
+        let SerializationError::CborDecode(msg) = err else {
+            panic!("expected CborDecode");
+        };
+        assert!(msg.contains("PraosState outer array"));
+    }
+
+    #[test]
+    fn rejects_unknown_version() {
+        // array(2) [version=1, ...] — only version 0 is known.
+        let err = decode_praos_state(&[0x82, 0x01, 0x80]).unwrap_err();
+        let SerializationError::CborDecode(msg) = err else {
+            panic!("expected CborDecode");
+        };
+        assert!(msg.contains("PraosState version"));
+    }
+
+    #[test]
+    fn rejects_inner_wrong_arity() {
+        // array(2) [version=0, array(5)=...] — must be array(7) or array(8).
+        let err = decode_praos_state(&[0x82, 0x00, 0x85, 0, 0, 0, 0, 0]).unwrap_err();
+        let SerializationError::CborDecode(msg) = err else {
+            panic!("expected CborDecode");
+        };
+        assert!(msg.contains("PraosState inner array"));
+    }
+
+    #[test]
+    fn rejects_last_slot_with_unexpected_shape() {
+        // [array(2), version=0, array(7), array(3)[5,5,5], ...] — lastSlot must
+        // be array(1)[0] or array(2)[1, slot].
+        let cbor = [0x82, 0x00, 0x87, 0x83, 0x05, 0x05, 0x05];
+        let err = decode_praos_state(&cbor).unwrap_err();
+        let SerializationError::CborDecode(msg) = err else {
+            panic!("expected CborDecode");
+        };
+        assert!(msg.contains("lastSlot WithOrigin"));
+    }
+
+    #[test]
+    fn last_slot_origin_form_decodes_then_fails_later() {
+        // Build [array(2), 0, array(7), array(1)[0], ...] just to exercise the
+        // Origin branch of lastSlot. The decoder will eventually fail when it
+        // can't decode subsequent fields — that's fine, we're after coverage.
+        let cbor = [
+            0x82, 0x00, 0x87, // outer + version + inner array(7) header
+            0x81, 0x00, // lastSlot = Origin
+        ];
+        let err = decode_praos_state(&cbor).unwrap_err();
+        assert!(matches!(err, SerializationError::CborDecode(_)));
+    }
+
+    #[test]
+    fn empty_input_errors() {
+        assert!(decode_praos_state(&[]).is_err());
+    }
+}

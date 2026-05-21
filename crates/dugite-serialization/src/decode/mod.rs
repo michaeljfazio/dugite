@@ -122,3 +122,70 @@ pub fn decode_transaction(era_id: u16, tx_cbor: &[u8]) -> Result<Transaction, Se
         ))),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn decode_transaction_unknown_era_errors() {
+        // era_id = 8 is past Dijkstra; era_id = 99 is gibberish.
+        for n in [8u16, 9, 42, 99] {
+            let err = decode_transaction(n, &[0x80]).unwrap_err();
+            let SerializationError::CborDecode(msg) = err else {
+                panic!("expected CborDecode for era_id={n}");
+            };
+            assert!(
+                msg.contains("unknown era id"),
+                "era_id={n}: unexpected message: {msg}"
+            );
+        }
+    }
+
+    #[test]
+    fn decode_transaction_invalid_cbor_per_era_errors() {
+        // Every era should produce an error (not panic) on truncated/garbage CBOR.
+        for era_id in 0u16..=7 {
+            assert!(
+                decode_transaction(era_id, &[]).is_err(),
+                "era_id={era_id}: empty CBOR must error"
+            );
+            assert!(
+                decode_transaction(era_id, &[0xff]).is_err(),
+                "era_id={era_id}: bare break byte must error"
+            );
+        }
+    }
+
+    #[test]
+    fn decode_block_minimal_smokes_on_real_vector() {
+        // Exercises decode_block_minimal — the minimal-mode public entrypoint
+        // — against the bundled Conway vector. Mainly to cover the wrapper.
+        let cbor = std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/test_vectors/conway.hex"
+        ))
+        .unwrap();
+        let raw = hex::decode(cbor.trim()).unwrap();
+        let blk = decode_block_minimal(&raw).expect("minimal-mode decode");
+        assert!(blk.raw_cbor.is_some(), "raw_cbor must be preserved");
+    }
+
+    #[test]
+    fn decode_block_with_byron_epoch_length_passes_through() {
+        // The non-zero byron_epoch_length path is exercised when decoding Byron
+        // blocks; for a Shelley+ vector the value is ignored. We pin that the
+        // wrapper at least returns Ok and preserves raw_cbor.
+        let cbor = std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/test_vectors/shelley.hex"
+        ))
+        .unwrap();
+        let raw = hex::decode(cbor.trim()).unwrap();
+        let blk = decode_block_with_byron_epoch_length(&raw, 21_600).expect("decode");
+        assert!(blk.raw_cbor.is_some());
+        let blk2 =
+            decode_block_minimal_with_byron_epoch_length(&raw, 21_600).expect("minimal decode");
+        assert!(blk2.raw_cbor.is_some());
+    }
+}
