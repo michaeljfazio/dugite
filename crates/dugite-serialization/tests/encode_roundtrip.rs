@@ -98,7 +98,7 @@ fn empty_ws() -> TransactionWitnessSet {
         redeemers: vec![],
         raw_redeemers_cbor: None,
         raw_plutus_data_cbor: None,
-        pallas_script_data_hash: None,
+        original_script_data_hash: None,
     }
 }
 

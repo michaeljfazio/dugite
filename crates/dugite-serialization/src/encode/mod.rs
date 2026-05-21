@@ -165,7 +165,7 @@ mod tests {
             redeemers: vec![],
             raw_redeemers_cbor: None,
             raw_plutus_data_cbor: None,
-            pallas_script_data_hash: None,
+            original_script_data_hash: None,
         };
         let encoded = encode_witness_set(&ws);
         assert_eq!(encoded, vec![0xa0]); // empty map
@@ -187,7 +187,7 @@ mod tests {
             redeemers: vec![],
             raw_redeemers_cbor: None,
             raw_plutus_data_cbor: None,
-            pallas_script_data_hash: None,
+            original_script_data_hash: None,
         };
         let encoded = encode_witness_set(&ws);
         assert_eq!(encoded[0], 0xa1); // map of 1
@@ -334,7 +334,7 @@ mod tests {
                 redeemers: vec![],
                 raw_redeemers_cbor: None,
                 raw_plutus_data_cbor: None,
-                pallas_script_data_hash: None,
+                original_script_data_hash: None,
             },
             is_valid: true,
             auxiliary_data: None,

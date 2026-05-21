@@ -69,7 +69,6 @@ async-trait = "0.1"
 
 # Networking
 tokio-tungstenite = "0.24"
-pallas-network = "1.0.0-alpha.5"
 pallas-codec = "1.0.0-alpha.5"
 pallas-primitives = "1.0.0-alpha.5"
 pallas-traverse = "1.0.0-alpha.5"
