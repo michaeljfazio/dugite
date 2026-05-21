@@ -354,16 +354,65 @@ impl Equality {
     }
 }
 
-/// Two-block equality, currently delegates to `PartialEq`.
+/// Two-block equality with `raw_cbor` normalization.
 ///
-/// The plan envisions a tolerance layer (normalize HashMap iteration order,
-/// re-encode-and-byte-diff) here. Today every collection in `Block`/`Transaction`
-/// is already iteration-order-deterministic (`Vec` or `BTreeMap`), so the
-/// tolerant tier reduces to the cheap tier. Hook is kept so M4/M5 can add
-/// normalization without changing call sites.
+/// `raw_cbor` fields (`Block::raw_cbor`, `Transaction::raw_cbor`,
+/// `Transaction::raw_body_cbor`, `Transaction::raw_witness_cbor`,
+/// `TransactionOutput::raw_cbor`, `AuxiliaryData::raw_cbor`) are
+/// **implementation artifacts** — the in-house decoder captures them
+/// differently from pallas (which re-encodes via `tx.encode()`).
+/// They carry no semantic content for correctness checking, so we strip
+/// them before comparing.
+///
+/// All other collections (`Vec`, `BTreeMap`) are deterministic by insertion
+/// order, so no additional normalization is needed today.
 #[cfg(feature = "pallas-shadow-decode")]
 fn block_equality(a: &Block, b: &Block) -> Equality {
-    if a == b {
+    use dugite_primitives::transaction::{AuxiliaryData, TransactionOutput};
+
+    fn normalize_output(o: &TransactionOutput) -> TransactionOutput {
+        TransactionOutput {
+            raw_cbor: None,
+            ..o.clone()
+        }
+    }
+
+    fn normalize_aux(aux: &Option<AuxiliaryData>) -> Option<AuxiliaryData> {
+        aux.as_ref().map(|a| AuxiliaryData {
+            raw_cbor: None,
+            ..a.clone()
+        })
+    }
+
+    fn normalize_tx(
+        tx: &dugite_primitives::transaction::Transaction,
+    ) -> dugite_primitives::transaction::Transaction {
+        dugite_primitives::transaction::Transaction {
+            raw_cbor: None,
+            raw_body_cbor: None,
+            raw_witness_cbor: None,
+            auxiliary_data: normalize_aux(&tx.auxiliary_data),
+            body: {
+                let mut body = tx.body.clone();
+                body.outputs = body.outputs.iter().map(normalize_output).collect();
+                if let Some(cr) = body.collateral_return.take() {
+                    body.collateral_return = Some(normalize_output(&cr));
+                }
+                body
+            },
+            ..tx.clone()
+        }
+    }
+
+    fn normalize_block(b: &Block) -> Block {
+        Block {
+            raw_cbor: None,
+            transactions: b.transactions.iter().map(normalize_tx).collect(),
+            ..b.clone()
+        }
+    }
+
+    if normalize_block(a) == normalize_block(b) {
         Equality::Match
     } else {
         Equality::ContentDiverged
