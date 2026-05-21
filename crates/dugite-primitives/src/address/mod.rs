@@ -1,3 +1,5 @@
+pub mod byron;
+
 use crate::credentials::{Credential, Pointer, StakeReference};
 use crate::hash::Hash28;
 use crate::network::NetworkId;
