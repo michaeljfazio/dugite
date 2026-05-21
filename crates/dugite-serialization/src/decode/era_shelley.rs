@@ -1089,6 +1089,79 @@ fn read_metadatum(r: &mut Reader<'_>) -> Result<TransactionMetadatum, Serializat
 }
 
 // ============================================================================
+// Standalone tx decoder (Shelley era)
+// ============================================================================
+
+/// Decode a standalone Shelley-era transaction from raw CBOR bytes.
+///
+/// The standalone tx format is `[body_map, witness_set_map, is_valid_bool, aux_data]`.
+/// Pallas encodes Shelley txs in a 4-element array (with `is_valid` as the 3rd
+/// element, always `true` for Shelley since invalid txs weren't introduced until Alonzo).
+///
+/// The transaction hash is `blake2b_256(raw_body_cbor)`.
+pub(crate) fn decode_shelley_tx_standalone(cbor: &[u8]) -> Result<Transaction, SerializationError> {
+    let mut r = Reader::new(cbor);
+
+    // tx = [body, witness_set, is_valid, aux_data]
+    let arr_len = r.read_array_header()?;
+    match arr_len {
+        Some(4) => {}
+        Some(n) => {
+            return Err(SerializationError::CborDecode(format!(
+                "shelley tx: expected array(4), got array({n})"
+            )));
+        }
+        None => {
+            return Err(SerializationError::CborDecode(
+                "shelley tx: expected definite-length array".into(),
+            ));
+        }
+    }
+
+    // 1. Body — capture raw bytes for hash computation
+    let body_raw = KeepRaw::parse_with(&mut r, |r| decode_shelley_tx_body(r))?;
+    let raw_body_cbor = body_raw.raw.to_vec();
+    let tx_hash = blake2b_256(&raw_body_cbor);
+    let body = body_raw.value;
+
+    // 2. Witness set
+    let ws_raw = KeepRaw::parse_with(&mut r, |r| decode_shelley_witness_set(r))?;
+    let raw_witness_cbor = ws_raw.raw.to_vec();
+    let witness_set = ws_raw.value;
+
+    // 3. is_valid — Shelley always true; read but ignore
+    let ty = r.peek_major()?;
+    if ty == minicbor::data::Type::Bool {
+        let _is_valid = r.read_bool()?;
+    } else {
+        r.skip()?;
+    }
+
+    // 4. Auxiliary data (null or a map)
+    let auxiliary_data = {
+        let ty = r.peek_major()?;
+        if ty == minicbor::data::Type::Null {
+            r.read_null()?;
+            None
+        } else {
+            Some(decode_auxiliary_data(&mut r)?)
+        }
+    };
+
+    Ok(Transaction {
+        hash: tx_hash,
+        era: Era::Shelley,
+        body,
+        witness_set,
+        is_valid: true,
+        auxiliary_data,
+        raw_cbor: Some(cbor.to_vec()),
+        raw_body_cbor: Some(raw_body_cbor),
+        raw_witness_cbor: Some(raw_witness_cbor),
+    })
+}
+
+// ============================================================================
 // Tests
 // ============================================================================
 
