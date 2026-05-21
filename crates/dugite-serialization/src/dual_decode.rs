@@ -354,21 +354,25 @@ impl Equality {
     }
 }
 
-/// Two-block equality with `raw_cbor` normalization.
+/// Two-block equality with raw-CBOR-preservation field normalization.
 ///
-/// `raw_cbor` fields (`Block::raw_cbor`, `Transaction::raw_cbor`,
-/// `Transaction::raw_body_cbor`, `Transaction::raw_witness_cbor`,
-/// `TransactionOutput::raw_cbor`, `AuxiliaryData::raw_cbor`) are
-/// **implementation artifacts** — the in-house decoder captures them
-/// differently from pallas (which re-encodes via `tx.encode()`).
-/// They carry no semantic content for correctness checking, so we strip
-/// them before comparing.
+/// The following are **implementation artifacts** — captured differently by
+/// the in-house decoder and pallas, carrying no semantic content for
+/// correctness checking:
+///
+/// - `Block::raw_cbor`
+/// - `Transaction::{raw_cbor, raw_body_cbor, raw_witness_cbor}`
+/// - `TransactionOutput::raw_cbor`
+/// - `AuxiliaryData::raw_cbor`
+/// - `TransactionWitnessSet::{raw_redeemers_cbor, raw_plutus_data_cbor,
+///   original_script_data_hash}` — pallas extracts raw bytes from the wire;
+///   the in-house decoder leaves them `None` until M4 is complete.
 ///
 /// All other collections (`Vec`, `BTreeMap`) are deterministic by insertion
-/// order, so no additional normalization is needed today.
+/// order, so no additional normalization is needed.
 #[cfg(feature = "pallas-shadow-decode")]
 fn block_equality(a: &Block, b: &Block) -> Equality {
-    use dugite_primitives::transaction::{AuxiliaryData, TransactionOutput};
+    use dugite_primitives::transaction::{AuxiliaryData, TransactionOutput, TransactionWitnessSet};
 
     fn normalize_output(o: &TransactionOutput) -> TransactionOutput {
         TransactionOutput {
@@ -384,6 +388,15 @@ fn block_equality(a: &Block, b: &Block) -> Equality {
         })
     }
 
+    fn normalize_witness(ws: &TransactionWitnessSet) -> TransactionWitnessSet {
+        TransactionWitnessSet {
+            raw_redeemers_cbor: None,
+            raw_plutus_data_cbor: None,
+            original_script_data_hash: None,
+            ..ws.clone()
+        }
+    }
+
     fn normalize_tx(
         tx: &dugite_primitives::transaction::Transaction,
     ) -> dugite_primitives::transaction::Transaction {
@@ -392,6 +405,7 @@ fn block_equality(a: &Block, b: &Block) -> Equality {
             raw_body_cbor: None,
             raw_witness_cbor: None,
             auxiliary_data: normalize_aux(&tx.auxiliary_data),
+            witness_set: normalize_witness(&tx.witness_set),
             body: {
                 let mut body = tx.body.clone();
                 body.outputs = body.outputs.iter().map(normalize_output).collect();
