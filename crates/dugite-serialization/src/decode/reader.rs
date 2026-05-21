@@ -536,6 +536,18 @@ impl<'b> Reader<'b> {
         self.expect_tag(TAG_EMBEDDED_CBOR)?;
         self.read_bytes()
     }
+
+    /// Read and return a CBOR tag value (major type 6), advancing past the tag
+    /// header. The tagged value that follows is left for the caller to consume.
+    ///
+    /// Used by per-era Plutus data decoders to dispatch on Constr tag ranges
+    /// (121..127, 1280..1400, 102) without prior knowledge of the tag value.
+    pub fn read_tag(&mut self) -> Result<u64, SerializationError> {
+        self.inner
+            .tag()
+            .map(|t| t.as_u64())
+            .map_err(|e| SerializationError::CborDecode(format!("read_tag: {e}")))
+    }
 }
 
 // =========================================================================

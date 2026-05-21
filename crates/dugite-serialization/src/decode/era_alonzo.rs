@@ -1,0 +1,1693 @@
+//! In-house decoder for the Alonzo era (era tag 5).
+//!
+//! # Alonzo block wire format
+//!
+//! After stripping the HFC envelope `[era_tag, inner]`, the inner CBOR is:
+//!
+//! ```text
+//! block = [header, tx_bodies, tx_witness_sets, auxiliary_data_set, invalid_transactions]
+//! ```
+//!
+//! **5 elements** — Alonzo introduced the `invalid_transactions` field (array of
+//! tx indices whose `is_valid` flag is `false`). Shelley/Allegra/Mary have 4.
+//!
+//! ## Header structure (same as Shelley)
+//!
+//! ```text
+//! header = [header_body, kes_signature]
+//! header_body = [
+//!   block_number,        ; 0 — u64
+//!   slot,                ; 1 — u64
+//!   prev_hash,           ; 2 — bytes(32) or null
+//!   issuer_vkey,         ; 3 — bytes(32)
+//!   vrf_vkey,            ; 4 — bytes(32)
+//!   nonce_vrf_cert,      ; 5 — [bytes(64), bytes(80)]
+//!   leader_vrf_cert,     ; 6 — [bytes(64), bytes(80)]
+//!   block_body_size,     ; 7 — u64
+//!   block_body_hash,     ; 8 — bytes(32)
+//!   op_cert_hot_vkey,    ; 9 — bytes(32)
+//!   op_cert_seq_number,  ; 10 — u64
+//!   op_cert_kes_period,  ; 11 — u64
+//!   op_cert_sigma,       ; 12 — bytes(64)
+//!   protocol_major,      ; 13 — u64
+//!   protocol_minor,      ; 14 — u64
+//! ]
+//! ```
+//!
+//! Fields 9–12 are the operational certificate fields (inline in Shelley/Alonzo).
+//!
+//! ## Tx body additions over Shelley
+//!
+//! Allegra added:
+//! - key 8: validity_interval_start (slot, u64)
+//!
+//! Mary added:
+//! - key 9: mint ({ policy_id => { asset_name => int } })
+//!
+//! Alonzo added:
+//! - key 11: script_data_hash (bytes(32))
+//! - key 13: collateral ([* transaction_input])
+//! - key 14: required_signers ([* addr_keyhash(28)]) — padded to Hash32
+//! - key 15: network_id (uint 0|1)
+//!
+//! ## Witness set additions over Shelley
+//!
+//! - key 3: plutus_v1_scripts ([* bytes])
+//! - key 4: plutus_data ([* plutus_data])
+//! - key 5: redeemers ([* [tag, index, plutus_data, ex_units]])
+//!
+//! ## invalid_transactions
+//!
+//! The 5th element of the block array is `[* tx_index]`. A transaction at
+//! `tx_index` in the tx_bodies/witnesses arrays has `is_valid = false`:
+//! its collateral inputs are consumed; regular inputs/outputs are skipped.
+
+use crate::decode::helpers::{read_hash28, read_hash32, read_lovelace, read_network_id};
+use crate::decode::raw::KeepRaw;
+use crate::decode::reader::Reader;
+use crate::error::SerializationError;
+use dugite_primitives::address::Address;
+use dugite_primitives::block::{Block, BlockHeader, OperationalCert, ProtocolVersion, VrfOutput};
+use dugite_primitives::credentials::Credential;
+use dugite_primitives::era::Era;
+use dugite_primitives::hash::{blake2b_256, Hash28, Hash32};
+use dugite_primitives::time::{BlockNo, SlotNo};
+use dugite_primitives::transaction::{
+    AuxiliaryData, BootstrapWitness, Certificate, ExUnits, MIRSource, MIRTarget, NativeScript,
+    OutputDatum, PlutusData, PoolMetadata, PoolParams, Rational, Redeemer, RedeemerTag,
+    Transaction, TransactionBody, TransactionInput, TransactionMetadatum, TransactionOutput,
+    TransactionWitnessSet, VKeyWitness,
+};
+use dugite_primitives::value::{AssetName, Lovelace, Value};
+use minicbor::data::Type;
+use num_bigint::BigInt;
+use std::collections::BTreeMap;
+
+// ============================================================================
+// Decode mode
+// ============================================================================
+
+/// Controls whether the witness set is decoded.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DecodeMode {
+    /// Decode body, witnesses, aux data.
+    Full,
+    /// Decode body and aux data only; witness set is left empty.
+    Minimal,
+}
+
+// ============================================================================
+// Top-level entry points
+// ============================================================================
+
+/// Decode an Alonzo block from the inner CBOR (after HFC envelope stripping).
+pub fn decode_alonzo_block(inner_cbor: &[u8]) -> Result<Block, SerializationError> {
+    decode_alonzo_block_mode(inner_cbor, DecodeMode::Full)
+}
+
+/// Decode an Alonzo block in minimal mode (witness set skipped).
+pub fn decode_alonzo_block_minimal(inner_cbor: &[u8]) -> Result<Block, SerializationError> {
+    decode_alonzo_block_mode(inner_cbor, DecodeMode::Minimal)
+}
+
+// ============================================================================
+// Block decoder (shared by Allegra/Mary/Alonzo)
+// ============================================================================
+
+/// Decode an Alonzo (or Allegra/Mary) block with a specific era label.
+///
+/// `era` is the era to stamp on the resulting `Block` and `Transaction` structs.
+/// The 4-element vs 5-element block structure is determined by `has_invalid_txs`.
+pub(crate) fn decode_alonzo_family_block(
+    inner_cbor: &[u8],
+    era: Era,
+    has_invalid_txs: bool,
+    mode: DecodeMode,
+) -> Result<Block, SerializationError> {
+    let mut r = Reader::new(inner_cbor);
+
+    let expected_len = if has_invalid_txs { 5 } else { 4 };
+    let block_arr = r.read_array_header()?;
+    if !matches!(block_arr, Some(n) if n == expected_len) {
+        return Err(SerializationError::CborDecode(format!(
+            "{era:?} block: expected array({expected_len}), got {block_arr:?}"
+        )));
+    }
+
+    // -------------------------------------------------------------------------
+    // 1. Header
+    // -------------------------------------------------------------------------
+    let header = {
+        let raw = KeepRaw::parse_with(&mut r, decode_alonzo_header_inner)?;
+        let header_hash = blake2b_256(raw.raw);
+        let mut h = raw.value;
+        h.header_hash = header_hash;
+        h
+    };
+
+    // -------------------------------------------------------------------------
+    // 2. tx_bodies
+    // -------------------------------------------------------------------------
+    let tx_count = r.read_array_header()?.unwrap_or(0) as usize;
+    let mut raw_bodies: Vec<Vec<u8>> = Vec::with_capacity(tx_count);
+    let mut parsed_bodies: Vec<TransactionBody> = Vec::with_capacity(tx_count);
+
+    for _ in 0..tx_count {
+        let body = KeepRaw::parse_with(&mut r, |r| decode_alonzo_tx_body(r, era))?;
+        raw_bodies.push(body.raw.to_vec());
+        parsed_bodies.push(body.value);
+    }
+
+    // -------------------------------------------------------------------------
+    // 3. tx_witness_sets
+    // -------------------------------------------------------------------------
+    let witness_count = r.read_array_header()?.unwrap_or(0) as usize;
+    let mut raw_witnesses: Vec<Vec<u8>> = Vec::with_capacity(witness_count);
+    let mut parsed_witnesses: Vec<Option<TransactionWitnessSet>> =
+        Vec::with_capacity(witness_count);
+
+    for _ in 0..witness_count {
+        if mode == DecodeMode::Full {
+            let ws = KeepRaw::parse_with(&mut r, |r| decode_alonzo_witness_set(r, era))?;
+            raw_witnesses.push(ws.raw.to_vec());
+            parsed_witnesses.push(Some(ws.value));
+        } else {
+            let ws_start = r.position();
+            r.skip()?;
+            raw_witnesses.push(r.slice_from(ws_start).to_vec());
+            parsed_witnesses.push(None);
+        }
+    }
+
+    // -------------------------------------------------------------------------
+    // 4. auxiliary_data_set
+    // -------------------------------------------------------------------------
+    let aux_map = decode_alonzo_aux_data_map(&mut r)?;
+
+    // -------------------------------------------------------------------------
+    // 5. invalid_transactions (Alonzo+ only)
+    // -------------------------------------------------------------------------
+    let mut invalid_tx_set: std::collections::HashSet<usize> = std::collections::HashSet::new();
+    if has_invalid_txs {
+        let inv_count = r.read_array_header()?.unwrap_or(0) as usize;
+        for _ in 0..inv_count {
+            let idx = r.read_uint()? as usize;
+            invalid_tx_set.insert(idx);
+        }
+    }
+
+    // -------------------------------------------------------------------------
+    // Build transactions
+    // -------------------------------------------------------------------------
+    let transactions: Result<Vec<Transaction>, SerializationError> = parsed_bodies
+        .into_iter()
+        .enumerate()
+        .map(|(i, body)| {
+            let raw_body = raw_bodies[i].clone();
+            let tx_hash = blake2b_256(&raw_body);
+
+            let is_valid = !invalid_tx_set.contains(&i);
+
+            let witness_set = match parsed_witnesses.get(i).and_then(|w| w.as_ref()) {
+                Some(ws) => ws.clone(),
+                None => empty_witness_set(),
+            };
+            let raw_witness = raw_witnesses.get(i).cloned();
+            let auxiliary_data = aux_map.get(&(i as u32)).cloned();
+
+            Ok(Transaction {
+                hash: tx_hash,
+                era,
+                body,
+                witness_set,
+                is_valid,
+                auxiliary_data,
+                raw_cbor: None,
+                raw_body_cbor: Some(raw_body),
+                raw_witness_cbor: raw_witness,
+            })
+        })
+        .collect();
+    let transactions = transactions?;
+
+    Ok(Block {
+        header,
+        transactions,
+        era,
+        raw_cbor: None,
+    })
+}
+
+fn decode_alonzo_block_mode(
+    inner_cbor: &[u8],
+    mode: DecodeMode,
+) -> Result<Block, SerializationError> {
+    decode_alonzo_family_block(inner_cbor, Era::Alonzo, true, mode)
+}
+
+fn empty_witness_set() -> TransactionWitnessSet {
+    TransactionWitnessSet {
+        vkey_witnesses: Vec::new(),
+        native_scripts: Vec::new(),
+        bootstrap_witnesses: Vec::new(),
+        plutus_v1_scripts: Vec::new(),
+        plutus_v2_scripts: Vec::new(),
+        plutus_v3_scripts: Vec::new(),
+        plutus_data: Vec::new(),
+        redeemers: Vec::new(),
+        raw_redeemers_cbor: None,
+        raw_plutus_data_cbor: None,
+        original_script_data_hash: None,
+    }
+}
+
+// ============================================================================
+// Header decoder (same as Shelley — 15-field inline opcert)
+// ============================================================================
+
+fn decode_alonzo_header_inner(r: &mut Reader<'_>) -> Result<BlockHeader, SerializationError> {
+    // header = [header_body, kes_signature]
+    let hdr_arr = r.read_array_header()?;
+    if !matches!(hdr_arr, Some(2)) {
+        return Err(SerializationError::CborDecode(format!(
+            "alonzo header: expected array(2), got {hdr_arr:?}"
+        )));
+    }
+
+    // header_body = array(15)
+    let body_arr = r.read_array_header()?;
+    if !matches!(body_arr, Some(15)) {
+        return Err(SerializationError::CborDecode(format!(
+            "alonzo header_body: expected array(15), got {body_arr:?}"
+        )));
+    }
+
+    let block_number = r.read_uint()?;
+    let slot = r.read_uint()?;
+    let prev_hash = read_optional_hash32(r)?;
+    let issuer_vkey = r.read_bytes()?.to_vec();
+    let vrf_vkey = r.read_bytes()?.to_vec();
+    let (nonce_output, nonce_proof) = read_vrf_cert(r)?;
+    // Alonzo uses `leader_vrf` field (not `nonce_vrf`) as the VRF result.
+    // The consensus leader check uses leader_vrf.0 (64-byte output).
+    let (leader_output, leader_proof) = read_vrf_cert(r)?;
+    let body_size = r.read_uint()?;
+    let body_hash = read_hash32(r)?;
+    let op_hot_vkey = r.read_bytes()?.to_vec();
+    let op_seq_number = r.read_uint()?;
+    let op_kes_period = r.read_uint()?;
+    let op_sigma = r.read_bytes()?.to_vec();
+    let protocol_major = r.read_uint()?;
+    let protocol_minor = r.read_uint()?;
+
+    let kes_signature = r.read_bytes()?.to_vec();
+
+    Ok(BlockHeader {
+        header_hash: Hash32::ZERO,
+        prev_hash,
+        issuer_vkey,
+        vrf_vkey,
+        vrf_result: VrfOutput {
+            output: leader_output,
+            proof: leader_proof,
+        },
+        block_number: BlockNo(block_number),
+        slot: SlotNo(slot),
+        epoch_nonce: Hash32::ZERO,
+        body_size,
+        body_hash,
+        operational_cert: OperationalCert {
+            hot_vkey: op_hot_vkey,
+            sequence_number: op_seq_number,
+            kes_period: op_kes_period,
+            sigma: op_sigma,
+        },
+        protocol_version: ProtocolVersion {
+            major: protocol_major,
+            minor: protocol_minor,
+        },
+        kes_signature,
+        nonce_vrf_output: nonce_output,
+        nonce_vrf_proof: nonce_proof,
+    })
+}
+
+fn read_optional_hash32(r: &mut Reader<'_>) -> Result<Hash32, SerializationError> {
+    let ty = r.peek_major()?;
+    if ty == Type::Null {
+        r.read_null()?;
+        Ok(Hash32::ZERO)
+    } else {
+        read_hash32(r)
+    }
+}
+
+fn read_vrf_cert(r: &mut Reader<'_>) -> Result<(Vec<u8>, Vec<u8>), SerializationError> {
+    let arr_len = r.read_array_header()?;
+    if !matches!(arr_len, Some(2)) {
+        return Err(SerializationError::CborDecode(format!(
+            "vrf_cert: expected array(2), got {arr_len:?}"
+        )));
+    }
+    let output = r.read_bytes()?.to_vec();
+    let proof = r.read_bytes()?.to_vec();
+    Ok((output, proof))
+}
+
+// ============================================================================
+// Transaction body decoder
+// ============================================================================
+
+/// Decode an Alonzo (or Allegra/Mary) transaction body.
+///
+/// The map key set depends on the era:
+/// - Shelley: keys 0–7
+/// - Allegra: + key 8 (validity_interval_start)
+/// - Mary: + key 9 (mint)
+/// - Alonzo: + keys 11, 13, 14, 15
+pub(crate) fn decode_alonzo_tx_body(
+    r: &mut Reader<'_>,
+    era: Era,
+) -> Result<TransactionBody, SerializationError> {
+    let mut inputs: Vec<TransactionInput> = Vec::new();
+    let mut outputs: Vec<TransactionOutput> = Vec::new();
+    let mut fee = Lovelace(0);
+    let mut ttl: Option<SlotNo> = None;
+    let mut certificates: Vec<Certificate> = Vec::new();
+    let mut withdrawals: BTreeMap<Vec<u8>, Lovelace> = BTreeMap::new();
+    let mut auxiliary_data_hash: Option<Hash32> = None;
+    let mut validity_interval_start: Option<SlotNo> = None;
+    let mut mint: BTreeMap<Hash28, BTreeMap<AssetName, i64>> = BTreeMap::new();
+    let mut script_data_hash: Option<Hash32> = None;
+    let mut collateral: Vec<TransactionInput> = Vec::new();
+    let mut required_signers: Vec<Hash32> = Vec::new();
+    let mut network_id: Option<u8> = None;
+
+    let map_len = r.read_map_header()?;
+    let n_entries = match map_len {
+        Some(n) => n as i64,
+        None => -1,
+    };
+
+    let mut i = 0i64;
+    loop {
+        if n_entries >= 0 && i >= n_entries {
+            break;
+        }
+        if n_entries < 0 {
+            let ty = r.peek_major()?;
+            if ty == Type::Break {
+                r.skip()?;
+                break;
+            }
+        }
+        i += 1;
+
+        let key = r.read_uint()?;
+        match key {
+            0 => {
+                inputs = r.read_array(read_tx_input)?;
+            }
+            1 => {
+                outputs = r.read_array(|r| read_alonzo_tx_output(r, era))?;
+            }
+            2 => {
+                fee = read_lovelace(r)?;
+            }
+            3 => {
+                ttl = Some(SlotNo(r.read_uint()?));
+            }
+            4 => {
+                certificates = r.read_array(|r| read_alonzo_certificate(r))?;
+            }
+            5 => {
+                withdrawals = read_withdrawals(r)?;
+            }
+            6 => {
+                // Update proposals — skip
+                r.skip()?;
+            }
+            7 => {
+                auxiliary_data_hash = Some(read_hash32(r)?);
+            }
+            8 => {
+                // validity_interval_start (Allegra+)
+                validity_interval_start = Some(SlotNo(r.read_uint()?));
+            }
+            9 => {
+                // mint (Mary+): { policy_id => { asset_name => int } }
+                mint = read_mint_map(r)?;
+            }
+            11 => {
+                // script_data_hash (Alonzo+)
+                script_data_hash = Some(read_hash32(r)?);
+            }
+            13 => {
+                // collateral (Alonzo+)
+                collateral = r.read_array(read_tx_input)?;
+            }
+            14 => {
+                // required_signers (Alonzo+): [* addr_keyhash(28)] → padded to Hash32
+                required_signers = r.read_array(|r| {
+                    let h28 = read_hash28(r)?;
+                    Ok(h28.to_hash32_padded())
+                })?;
+            }
+            15 => {
+                // network_id (Alonzo+)
+                network_id = Some(read_network_id(r)?);
+            }
+            _ => {
+                r.skip()?;
+            }
+        }
+    }
+
+    Ok(TransactionBody {
+        inputs,
+        outputs,
+        fee,
+        ttl,
+        certificates,
+        withdrawals,
+        auxiliary_data_hash,
+        validity_interval_start,
+        mint,
+        script_data_hash,
+        collateral,
+        required_signers,
+        network_id,
+        collateral_return: None,      // Babbage+
+        total_collateral: None,       // Babbage+
+        reference_inputs: Vec::new(), // Babbage+
+        update: None,
+        voting_procedures: BTreeMap::new(), // Conway+
+        proposal_procedures: Vec::new(),    // Conway+
+        treasury_value: None,
+        donation: None,
+    })
+}
+
+fn read_tx_input(r: &mut Reader<'_>) -> Result<TransactionInput, SerializationError> {
+    let arr_len = r.read_array_header()?;
+    if !matches!(arr_len, Some(2)) {
+        return Err(SerializationError::CborDecode(format!(
+            "tx_in: expected array(2), got {arr_len:?}"
+        )));
+    }
+    let tx_hash = read_hash32(r)?;
+    let index = r.read_uint()? as u32;
+    Ok(TransactionInput {
+        transaction_id: tx_hash,
+        index,
+    })
+}
+
+/// Read an Alonzo-era transaction output: `[address, value]` or `[address, value, datum_hash]`.
+///
+/// Alonzo outputs are always the legacy array format (not the Babbage map format).
+fn read_alonzo_tx_output(
+    r: &mut Reader<'_>,
+    _era: Era,
+) -> Result<TransactionOutput, SerializationError> {
+    let arr_len = r.read_array_header()?;
+    let n = match arr_len {
+        Some(2) | Some(3) => arr_len.unwrap(),
+        _ => {
+            return Err(SerializationError::CborDecode(format!(
+                "alonzo tx_out: expected array(2) or array(3), got {arr_len:?}"
+            )));
+        }
+    };
+
+    let addr_bytes = r.read_bytes()?.to_vec();
+    let address = Address::from_bytes(&addr_bytes)
+        .map_err(|e| SerializationError::InvalidData(format!("alonzo output address: {e}")))?;
+
+    let value = read_value(r)?;
+
+    let datum = if n == 3 {
+        let dh = read_hash32(r)?;
+        OutputDatum::DatumHash(dh)
+    } else {
+        OutputDatum::None
+    };
+
+    Ok(TransactionOutput {
+        address,
+        value,
+        datum,
+        script_ref: None,
+        is_legacy: true,
+        raw_cbor: None,
+    })
+}
+
+/// Read a Value: either a plain uint (ADA only) or `[coin, multiasset_map]`.
+pub(crate) fn read_value(r: &mut Reader<'_>) -> Result<Value, SerializationError> {
+    let ty = r.peek_major()?;
+    match ty {
+        Type::U8 | Type::U16 | Type::U32 | Type::U64 => {
+            let coin = r.read_uint()?;
+            Ok(Value::lovelace(coin))
+        }
+        Type::Array => {
+            let arr_len = r.read_array_header()?;
+            if !matches!(arr_len, Some(2)) {
+                return Err(SerializationError::CborDecode(format!(
+                    "value array: expected array(2), got {arr_len:?}"
+                )));
+            }
+            let coin = Lovelace(r.read_uint()?);
+            let multi_asset = read_multiasset_map_u64(r)?;
+            if multi_asset.is_empty() {
+                Ok(Value::lovelace(coin.0))
+            } else {
+                Ok(Value { coin, multi_asset })
+            }
+        }
+        other => Err(SerializationError::CborDecode(format!(
+            "value: expected uint or array, got {other}"
+        ))),
+    }
+}
+
+fn read_multiasset_map_u64(
+    r: &mut Reader<'_>,
+) -> Result<BTreeMap<Hash28, BTreeMap<AssetName, u64>>, SerializationError> {
+    // Both the outer policy map and inner asset maps may be definite or
+    // indefinite-length. Use read_map() which handles both transparently.
+    let entries = r.read_map(
+        |r| {
+            let policy_bytes = r.read_bytes()?;
+            Hash28::try_from(policy_bytes).map_err(|_| SerializationError::InvalidLength {
+                expected: 28,
+                got: policy_bytes.len(),
+            })
+        },
+        |r| {
+            let asset_entries = r.read_map(
+                |r| {
+                    let name_bytes = r.read_bytes()?.to_vec();
+                    AssetName::new(name_bytes).map_err(|_| {
+                        SerializationError::CborDecode("multiasset: asset name too long".into())
+                    })
+                },
+                |r| r.read_uint(),
+            )?;
+            let mut assets: BTreeMap<AssetName, u64> = BTreeMap::new();
+            for (k, v) in asset_entries {
+                assets.insert(k, v);
+            }
+            Ok(assets)
+        },
+    )?;
+    let mut result = BTreeMap::new();
+    for (k, v) in entries {
+        result.insert(k, v);
+    }
+    Ok(result)
+}
+
+/// Read a mint map: `{ policy_id => { asset_name => int } }`.
+/// Quantities are signed (minting is positive, burning is negative).
+fn read_mint_map(
+    r: &mut Reader<'_>,
+) -> Result<BTreeMap<Hash28, BTreeMap<AssetName, i64>>, SerializationError> {
+    // Both the outer policy map and inner asset maps may be definite or
+    // indefinite-length. Use read_map() which handles both transparently.
+    let entries = r.read_map(
+        |r| {
+            // key: policy_id bytes(28)
+            let policy_bytes = r.read_bytes()?;
+            Hash28::try_from(policy_bytes).map_err(|_| SerializationError::InvalidLength {
+                expected: 28,
+                got: policy_bytes.len(),
+            })
+        },
+        |r| {
+            // value: { asset_name => signed_int }
+            let asset_entries = r.read_map(
+                |r| {
+                    let name_bytes = r.read_bytes()?.to_vec();
+                    AssetName::new(name_bytes).map_err(|_| {
+                        SerializationError::CborDecode("mint: asset name too long".into())
+                    })
+                },
+                |r| Ok(r.read_int()? as i64),
+            )?;
+            let mut assets: BTreeMap<AssetName, i64> = BTreeMap::new();
+            for (k, v) in asset_entries {
+                assets.insert(k, v);
+            }
+            Ok(assets)
+        },
+    )?;
+    let mut result = BTreeMap::new();
+    for (k, v) in entries {
+        result.insert(k, v);
+    }
+    Ok(result)
+}
+
+fn read_withdrawals(r: &mut Reader<'_>) -> Result<BTreeMap<Vec<u8>, Lovelace>, SerializationError> {
+    // Withdrawals: { reward_account_bytes => coin }
+    // Map may be definite or indefinite length.
+    let entries = r.read_map(
+        |r| Ok(r.read_bytes()?.to_vec()),
+        |r| Ok(Lovelace(r.read_uint()?)),
+    )?;
+    let mut result = BTreeMap::new();
+    for (k, v) in entries {
+        result.insert(k, v);
+    }
+    Ok(result)
+}
+
+// ============================================================================
+// Certificate decoder (Alonzo — same as Shelley certs 0-6)
+// ============================================================================
+
+/// Read a single certificate from CBOR. Re-exported as `read_alonzo_cert_inner` for
+/// use by the Babbage decoder which shares the same certificate encoding.
+pub(crate) fn read_alonzo_cert_inner(
+    r: &mut Reader<'_>,
+) -> Result<Certificate, SerializationError> {
+    read_alonzo_certificate(r)
+}
+
+fn read_alonzo_certificate(r: &mut Reader<'_>) -> Result<Certificate, SerializationError> {
+    let arr_len = r.read_array_header()?;
+    if arr_len.is_none() {
+        return Err(SerializationError::CborDecode(
+            "certificate: expected definite-length array".into(),
+        ));
+    }
+    let cert_type = r.read_uint()?;
+    match cert_type {
+        0 => Ok(Certificate::StakeRegistration(read_stake_credential(r)?)),
+        1 => Ok(Certificate::StakeDeregistration(read_stake_credential(r)?)),
+        2 => {
+            let cred = read_stake_credential(r)?;
+            let pool_hash = read_hash28_cert(r)?;
+            Ok(Certificate::StakeDelegation {
+                credential: cred,
+                pool_hash,
+            })
+        }
+        3 => Ok(Certificate::PoolRegistration(read_pool_params(r)?)),
+        4 => {
+            let pool_hash = read_hash28_cert(r)?;
+            let epoch = r.read_uint()?;
+            Ok(Certificate::PoolRetirement { pool_hash, epoch })
+        }
+        5 => {
+            let genesis_hash = read_hash32(r)?;
+            let delegate_hash = read_hash32(r)?;
+            let vrf_keyhash = read_hash32(r)?;
+            Ok(Certificate::GenesisKeyDelegation {
+                genesis_hash,
+                genesis_delegate_hash: delegate_hash,
+                vrf_keyhash,
+            })
+        }
+        6 => read_mir_cert(r),
+        other => Err(SerializationError::CborDecode(format!(
+            "certificate: unknown type {other}"
+        ))),
+    }
+}
+
+fn read_stake_credential(r: &mut Reader<'_>) -> Result<Credential, SerializationError> {
+    let arr_len = r.read_array_header()?;
+    if !matches!(arr_len, Some(2)) {
+        return Err(SerializationError::CborDecode(format!(
+            "stake_credential: expected array(2), got {arr_len:?}"
+        )));
+    }
+    let disc = r.read_uint()?;
+    let hash = read_hash28_cert(r)?;
+    match disc {
+        0 => Ok(Credential::VerificationKey(hash)),
+        1 => Ok(Credential::Script(hash)),
+        other => Err(SerializationError::CborDecode(format!(
+            "stake_credential: unknown discriminator {other}"
+        ))),
+    }
+}
+
+fn read_hash28_cert(r: &mut Reader<'_>) -> Result<Hash28, SerializationError> {
+    let bytes = r.read_bytes()?;
+    Hash28::try_from(bytes).map_err(|_| SerializationError::InvalidLength {
+        expected: 28,
+        got: bytes.len(),
+    })
+}
+
+fn read_pool_params(r: &mut Reader<'_>) -> Result<PoolParams, SerializationError> {
+    let operator = read_hash28_cert(r)?;
+    let vrf_keyhash = read_hash32(r)?;
+    let pledge = read_lovelace(r)?;
+    let cost = read_lovelace(r)?;
+    let margin = r.read_rational()?;
+    let reward_account = r.read_bytes()?.to_vec();
+    let pool_owners: Vec<Hash28> = r.read_set(|r| read_hash28_cert(r))?;
+    let relays_count = r.read_array_header()?.unwrap_or(0) as usize;
+    for _ in 0..relays_count {
+        r.skip()?;
+    }
+    let pool_metadata = read_pool_metadata(r)?;
+
+    Ok(PoolParams {
+        operator,
+        vrf_keyhash,
+        pledge,
+        cost,
+        margin: Rational {
+            numerator: margin.numerator,
+            denominator: margin.denominator,
+        },
+        reward_account,
+        pool_owners,
+        relays: Vec::new(),
+        pool_metadata,
+    })
+}
+
+fn read_pool_metadata(r: &mut Reader<'_>) -> Result<Option<PoolMetadata>, SerializationError> {
+    let ty = r.peek_major()?;
+    if ty == Type::Null {
+        r.read_null()?;
+        return Ok(None);
+    }
+    let arr_len = r.read_array_header()?;
+    if !matches!(arr_len, Some(2)) {
+        return Err(SerializationError::CborDecode(format!(
+            "pool_metadata: expected array(2) or null, got {arr_len:?}"
+        )));
+    }
+    let url_bytes = r.read_bytes()?;
+    let url = String::from_utf8(url_bytes.to_vec())
+        .map_err(|_| SerializationError::CborDecode("pool_metadata url: invalid UTF-8".into()))?;
+    let hash = {
+        let bytes = r.read_bytes()?;
+        let mut buf = [0u8; 32];
+        let len = bytes.len().min(32);
+        buf[..len].copy_from_slice(&bytes[..len]);
+        Hash32::from_bytes(buf)
+    };
+    Ok(Some(PoolMetadata { url, hash }))
+}
+
+fn read_mir_cert(r: &mut Reader<'_>) -> Result<Certificate, SerializationError> {
+    let arr_len = r.read_array_header()?;
+    if !matches!(arr_len, Some(2)) {
+        return Err(SerializationError::CborDecode(format!(
+            "mir: expected array(2), got {arr_len:?}"
+        )));
+    }
+    let source_disc = r.read_uint()?;
+    let source = match source_disc {
+        0 => MIRSource::Reserves,
+        1 => MIRSource::Treasury,
+        other => {
+            return Err(SerializationError::CborDecode(format!(
+                "mir: unknown source {other}"
+            )));
+        }
+    };
+    let ty = r.peek_major()?;
+    let target = match ty {
+        Type::Map => {
+            let mut creds = Vec::new();
+            let n = r.read_map_header()?.unwrap_or(0) as usize;
+            for _ in 0..n {
+                let cred = read_stake_credential(r)?;
+                let delta = r.read_int()? as i64;
+                creds.push((cred, delta));
+            }
+            MIRTarget::StakeCredentials(creds)
+        }
+        Type::U8 | Type::U16 | Type::U32 | Type::U64 => {
+            let coin = r.read_uint()?;
+            MIRTarget::OtherAccountingPot(coin)
+        }
+        other => {
+            return Err(SerializationError::CborDecode(format!(
+                "mir target: expected map or uint, got {other}"
+            )));
+        }
+    };
+    Ok(Certificate::MoveInstantaneousRewards { source, target })
+}
+
+// ============================================================================
+// Witness set decoder
+// ============================================================================
+
+/// Decode an Alonzo witness set.
+///
+/// ```text
+/// transaction_witness_set = {
+///   ? 0 : [* vkeywitness],       ; vkey_witnesses
+///   ? 1 : [* native_script],     ; native_scripts
+///   ? 2 : [* bootstrap_witness], ; bootstrap_witnesses
+///   ? 3 : [* bytes],             ; plutus_v1_scripts
+///   ? 4 : [* plutus_data],       ; plutus_data
+///   ? 5 : [* [tag, idx, data, ex_units]], ; redeemers
+/// }
+/// ```
+pub(crate) fn decode_alonzo_witness_set(
+    r: &mut Reader<'_>,
+    _era: Era,
+) -> Result<TransactionWitnessSet, SerializationError> {
+    let mut vkey_witnesses: Vec<VKeyWitness> = Vec::new();
+    let mut native_scripts = Vec::new();
+    let mut bootstrap_witnesses = Vec::new();
+    let mut plutus_v1_scripts: Vec<Vec<u8>> = Vec::new();
+    let mut raw_plutus_data: Option<Vec<u8>> = None;
+    let mut plutus_data: Vec<PlutusData> = Vec::new();
+    let mut raw_redeemers: Option<Vec<u8>> = None;
+    let mut redeemers: Vec<Redeemer> = Vec::new();
+
+    let map_len = r.read_map_header()?;
+    let n_entries = match map_len {
+        Some(n) => n as i64,
+        None => -1,
+    };
+
+    let mut i = 0i64;
+    loop {
+        if n_entries >= 0 && i >= n_entries {
+            break;
+        }
+        if n_entries < 0 {
+            let ty = r.peek_major()?;
+            if ty == Type::Break {
+                r.skip()?;
+                break;
+            }
+        }
+        i += 1;
+
+        let key = r.read_uint()?;
+        match key {
+            0 => {
+                vkey_witnesses = r.read_array(|r| {
+                    let arr_len = r.read_array_header()?;
+                    if !matches!(arr_len, Some(2)) {
+                        return Err(SerializationError::CborDecode(
+                            "vkeywitness: expected array(2)".into(),
+                        ));
+                    }
+                    let vkey = r.read_bytes()?.to_vec();
+                    let signature = r.read_bytes()?.to_vec();
+                    Ok(VKeyWitness { vkey, signature })
+                })?;
+            }
+            1 => {
+                native_scripts = r.read_array(|r| read_native_script(r))?;
+            }
+            2 => {
+                bootstrap_witnesses = r.read_array(|r| {
+                    let arr_len = r.read_array_header()?;
+                    if !matches!(arr_len, Some(4)) {
+                        return Err(SerializationError::CborDecode(
+                            "bootstrap_witness: expected array(4)".into(),
+                        ));
+                    }
+                    let vkey = r.read_bytes()?.to_vec();
+                    let sig = r.read_bytes()?.to_vec();
+                    let chain_code = r.read_bytes()?.to_vec();
+                    let attrs = r.read_bytes()?.to_vec();
+                    Ok(BootstrapWitness {
+                        vkey,
+                        signature: sig,
+                        chain_code,
+                        attributes: attrs,
+                    })
+                })?;
+            }
+            3 => {
+                // plutus_v1_scripts: [* bytes]
+                plutus_v1_scripts = r.read_array(|r| Ok(r.read_bytes()?.to_vec()))?;
+            }
+            4 => {
+                // plutus_data: [* plutus_data]
+                // Capture raw bytes for script_data_hash computation.
+                let pd_start = r.position();
+                let items = r.read_array(|r| read_plutus_data(r))?;
+                raw_plutus_data = Some(r.slice_from(pd_start).to_vec());
+                plutus_data = items;
+            }
+            5 => {
+                // redeemers: [* [tag, index, data, ex_units]]
+                let rd_start = r.position();
+                let items = r.read_array(|r| read_redeemer(r))?;
+                raw_redeemers = Some(r.slice_from(rd_start).to_vec());
+                redeemers = items;
+            }
+            _ => {
+                r.skip()?;
+            }
+        }
+    }
+
+    Ok(TransactionWitnessSet {
+        vkey_witnesses,
+        native_scripts,
+        bootstrap_witnesses,
+        plutus_v1_scripts,
+        plutus_v2_scripts: Vec::new(),
+        plutus_v3_scripts: Vec::new(),
+        plutus_data,
+        redeemers,
+        raw_redeemers_cbor: raw_redeemers,
+        raw_plutus_data_cbor: raw_plutus_data,
+        original_script_data_hash: None,
+    })
+}
+
+/// Read a single native script from CBOR. Re-exported as `read_native_script_from_cbor` for
+/// use by the Babbage decoder which shares the same native script encoding.
+pub(crate) fn read_native_script_from_cbor(
+    r: &mut Reader<'_>,
+) -> Result<NativeScript, SerializationError> {
+    read_native_script(r)
+}
+
+fn read_native_script(r: &mut Reader<'_>) -> Result<NativeScript, SerializationError> {
+    let arr_len = r.read_array_header()?;
+    if arr_len.is_none() {
+        return Err(SerializationError::CborDecode(
+            "native_script: expected definite-length array".into(),
+        ));
+    }
+    let disc = r.read_uint()?;
+    match disc {
+        0 => {
+            let h28 = read_hash28_cert(r)?;
+            Ok(NativeScript::ScriptPubkey(h28.to_hash32_padded()))
+        }
+        1 => {
+            let scripts = r.read_array(read_native_script)?;
+            Ok(NativeScript::ScriptAll(scripts))
+        }
+        2 => {
+            let scripts = r.read_array(read_native_script)?;
+            Ok(NativeScript::ScriptAny(scripts))
+        }
+        3 => {
+            let n = r.read_uint()? as u32;
+            let scripts = r.read_array(read_native_script)?;
+            Ok(NativeScript::ScriptNOfK(n, scripts))
+        }
+        4 => {
+            let slot = r.read_uint()?;
+            Ok(NativeScript::InvalidBefore(SlotNo(slot)))
+        }
+        5 => {
+            let slot = r.read_uint()?;
+            Ok(NativeScript::InvalidHereafter(SlotNo(slot)))
+        }
+        other => Err(SerializationError::CborDecode(format!(
+            "native_script: unknown type {other}"
+        ))),
+    }
+}
+
+/// Read a single Plutus redeemer: `[tag, index, plutus_data, ex_units]`.
+fn read_redeemer(r: &mut Reader<'_>) -> Result<Redeemer, SerializationError> {
+    let arr_len = r.read_array_header()?;
+    if !matches!(arr_len, Some(4)) {
+        return Err(SerializationError::CborDecode(format!(
+            "redeemer: expected array(4), got {arr_len:?}"
+        )));
+    }
+    let tag_u = r.read_uint()?;
+    let tag = match tag_u {
+        0 => RedeemerTag::Spend,
+        1 => RedeemerTag::Mint,
+        2 => RedeemerTag::Cert,
+        3 => RedeemerTag::Reward,
+        4 => RedeemerTag::Vote,
+        5 => RedeemerTag::Propose,
+        other => {
+            return Err(SerializationError::CborDecode(format!(
+                "redeemer tag: unknown {other}"
+            )));
+        }
+    };
+    let index = r.read_uint()? as u32;
+    let data = read_plutus_data(r)?;
+    let ex_units = read_ex_units(r)?;
+    Ok(Redeemer {
+        tag,
+        index,
+        data,
+        ex_units,
+    })
+}
+
+fn read_ex_units(r: &mut Reader<'_>) -> Result<ExUnits, SerializationError> {
+    let arr_len = r.read_array_header()?;
+    if !matches!(arr_len, Some(2)) {
+        return Err(SerializationError::CborDecode(format!(
+            "ex_units: expected array(2), got {arr_len:?}"
+        )));
+    }
+    let mem = r.read_uint()?;
+    let steps = r.read_uint()?;
+    Ok(ExUnits { mem, steps })
+}
+
+/// Read a Plutus data value (recursive).
+///
+/// Plutus data encoding (CDDL):
+/// ```text
+/// plutus_data
+///   = #6.121([* plutus_data])    ; Constr 0
+///   / #6.122([* plutus_data])    ; Constr 1
+///   ...
+///   / #6.127([* plutus_data])    ; Constr 6
+///   / #6.1280([* plutus_data])   ; Constr 7
+///   ...
+///   / #6.1400([* plutus_data])   ; Constr 127
+///   / #6.102([int, [* plutus_data]]) ; other alternatives
+///   / { * plutus_data => plutus_data } ; map
+///   / [* plutus_data]            ; list
+///   / big_int                    ; integer
+///   / bounded_bytes              ; bytes (possibly indefinite-length)
+/// ```
+pub(crate) fn read_plutus_data(r: &mut Reader<'_>) -> Result<PlutusData, SerializationError> {
+    let ty = r.peek_major()?;
+    match ty {
+        Type::Tag => {
+            // Peek the tag value without consuming via skip-and-restore trick.
+            // We use the raw underlying bytes to read the tag value.
+            let tag_n = read_tag_value(r)?;
+            match tag_n {
+                2 => {
+                    // Positive bignum: tag was already consumed, just read bytes.
+                    let bytes = r.read_bytes()?;
+                    let val = BigInt::from_bytes_be(num_bigint::Sign::Plus, bytes);
+                    Ok(PlutusData::Integer(val))
+                }
+                3 => {
+                    // Negative bignum: tag was already consumed, just read bytes.
+                    let bytes = r.read_bytes()?;
+                    let n = BigInt::from_bytes_be(num_bigint::Sign::Plus, bytes);
+                    Ok(PlutusData::Integer(-BigInt::from(1) - n))
+                }
+                121..=127 => {
+                    // Constr alternative 0..6: tag = 121 + N
+                    let constructor = tag_n - 121;
+                    let fields = r.read_array(|r| read_plutus_data(r))?;
+                    Ok(PlutusData::Constr(constructor, fields))
+                }
+                1280..=1400 => {
+                    // Constr alternative 7..127: tag = 1280 + (N - 7)
+                    let constructor = tag_n - 1280 + 7;
+                    let fields = r.read_array(|r| read_plutus_data(r))?;
+                    Ok(PlutusData::Constr(constructor, fields))
+                }
+                102 => {
+                    // Alternative encoding: [constructor_index, [* plutus_data]]
+                    let arr_len = r.read_array_header()?;
+                    if !matches!(arr_len, Some(2)) {
+                        return Err(SerializationError::CborDecode(format!(
+                            "plutus_data constr(102): expected array(2), got {arr_len:?}"
+                        )));
+                    }
+                    let constructor = r.read_uint()?;
+                    let fields = r.read_array(|r| read_plutus_data(r))?;
+                    Ok(PlutusData::Constr(constructor, fields))
+                }
+                other => Err(SerializationError::CborDecode(format!(
+                    "plutus_data: unknown tag {other}"
+                ))),
+            }
+        }
+        Type::Map => {
+            let n = r.read_map_header()?.unwrap_or(0) as usize;
+            let mut entries = Vec::with_capacity(n);
+            for _ in 0..n {
+                let k = read_plutus_data(r)?;
+                let v = read_plutus_data(r)?;
+                entries.push((k, v));
+            }
+            Ok(PlutusData::Map(entries))
+        }
+        Type::Array => {
+            let items = r.read_array(|r| read_plutus_data(r))?;
+            Ok(PlutusData::List(items))
+        }
+        Type::U8 | Type::U16 | Type::U32 | Type::U64 => {
+            let v = r.read_uint()?;
+            Ok(PlutusData::Integer(BigInt::from(v)))
+        }
+        Type::I8 | Type::I16 | Type::I32 | Type::I64 | Type::Int => {
+            let v = r.read_int()?;
+            Ok(PlutusData::Integer(BigInt::from(v)))
+        }
+        Type::Bytes => {
+            let bytes = r.read_bytes()?.to_vec();
+            Ok(PlutusData::Bytes(bytes))
+        }
+        Type::BytesIndef => {
+            let bytes = r.read_indef_bytes()?;
+            Ok(PlutusData::Bytes(bytes))
+        }
+        other => Err(SerializationError::CborDecode(format!(
+            "plutus_data: unexpected type {other}"
+        ))),
+    }
+}
+
+/// Peek and consume a CBOR tag value (major type 6) without consuming the
+/// tagged value that follows.
+///
+/// CBOR tag encoding:
+/// - 0xc0..0xd7: tag value 0..23 inline in the first byte (major=6, info=val)
+/// - 0xd8 NN: 1-byte tag (info=24, then 1 byte for value)
+/// - 0xd9 NN NN: 2-byte tag (info=25, then 2 bytes BE)
+/// - 0xda NN NN NN NN: 4-byte tag (info=26, then 4 bytes BE)
+/// - 0xdb NN×8: 8-byte tag (info=27, then 8 bytes BE)
+///
+/// Advances the reader past the tag header only; the tagged value is left
+/// for the caller to consume.
+fn read_tag_value(r: &mut Reader<'_>) -> Result<u64, SerializationError> {
+    r.read_tag()
+}
+
+// ============================================================================
+// Auxiliary data decoder
+// ============================================================================
+
+/// Decode the auxiliary_data_set map: `{ tx_index => auxiliary_data }`.
+pub(crate) fn decode_alonzo_aux_data_map(
+    r: &mut Reader<'_>,
+) -> Result<BTreeMap<u32, AuxiliaryData>, SerializationError> {
+    let mut result = BTreeMap::new();
+    let n = r.read_map_header()?;
+    let count = n.unwrap_or(0) as usize;
+    for _ in 0..count {
+        let tx_idx = r.read_uint()? as u32;
+        let aux = decode_alonzo_auxiliary_data(r)?;
+        result.insert(tx_idx, aux);
+    }
+    Ok(result)
+}
+
+/// Decode an Alonzo auxiliary data value.
+///
+/// Wire formats:
+/// - Plain map (Shelley): `{ label => metadatum }`
+/// - ShelleyMa (Allegra/Mary): `[metadata_map, native_scripts]`
+/// - PostAlonzo: `tag(259) { 0 => metadata, 1 => [native_scripts], 2 => [plutus_v1] }`
+pub(crate) fn decode_alonzo_auxiliary_data(
+    r: &mut Reader<'_>,
+) -> Result<AuxiliaryData, SerializationError> {
+    let raw_start = r.position();
+    r.skip()?;
+    let raw_bytes = r.slice_from(raw_start).to_vec();
+
+    let mut aux_r = Reader::new(&raw_bytes);
+    let ty = aux_r.peek_major()?;
+
+    let mut metadata = BTreeMap::new();
+    let native_scripts: Vec<NativeScript> = Vec::new();
+    let mut plutus_v1_scripts: Vec<Vec<u8>> = Vec::new();
+
+    match ty {
+        Type::Map => {
+            metadata = decode_metadata_map(&mut aux_r)?;
+        }
+        Type::Array => {
+            // ShelleyMa: [metadata_map, native_scripts]
+            let arr_len = aux_r.read_array_header()?;
+            if matches!(arr_len, Some(2)) {
+                metadata = decode_metadata_map(&mut aux_r)?;
+                // Skip native scripts (we don't decode them from aux data)
+                aux_r.skip()?;
+            }
+        }
+        Type::Tag => {
+            // PostAlonzo: tag(259) { ... }
+            // Consume the tag (any value accepted; cardano uses 259)
+            let _ = aux_r.read_tag()?;
+            // Now we have a map
+            let n = aux_r.read_map_header()?.unwrap_or(0) as usize;
+            for _ in 0..n {
+                let k = aux_r.read_uint()?;
+                match k {
+                    0 => {
+                        metadata = decode_metadata_map(&mut aux_r)?;
+                    }
+                    1 => {
+                        // native scripts — skip for now
+                        aux_r.skip()?;
+                    }
+                    2 => {
+                        // plutus_v1_scripts
+                        let count = aux_r.read_array_header()?.unwrap_or(0) as usize;
+                        for _ in 0..count {
+                            plutus_v1_scripts.push(aux_r.read_bytes()?.to_vec());
+                        }
+                    }
+                    _ => {
+                        aux_r.skip()?;
+                    }
+                }
+            }
+        }
+        _ => {
+            // Unknown format — return raw bytes only
+        }
+    }
+
+    Ok(AuxiliaryData {
+        metadata,
+        native_scripts,
+        plutus_v1_scripts,
+        plutus_v2_scripts: Vec::new(),
+        plutus_v3_scripts: Vec::new(),
+        raw_cbor: Some(raw_bytes),
+    })
+}
+
+fn decode_metadata_map(
+    r: &mut Reader<'_>,
+) -> Result<BTreeMap<u64, TransactionMetadatum>, SerializationError> {
+    let mut result = BTreeMap::new();
+    let n = r.read_map_header()?;
+    let count = n.unwrap_or(0) as usize;
+    for _ in 0..count {
+        let label = r.read_uint()?;
+        let value = read_metadatum(r)?;
+        result.insert(label, value);
+    }
+    Ok(result)
+}
+
+fn read_metadatum(r: &mut Reader<'_>) -> Result<TransactionMetadatum, SerializationError> {
+    let ty = r.peek_major()?;
+    match ty {
+        Type::Map => {
+            let entries = r.read_map(read_metadatum, read_metadatum)?;
+            Ok(TransactionMetadatum::Map(entries))
+        }
+        Type::Array => {
+            let items = r.read_array(read_metadatum)?;
+            Ok(TransactionMetadatum::List(items))
+        }
+        Type::U8 | Type::U16 | Type::U32 | Type::U64 => {
+            let v = r.read_uint()?;
+            Ok(TransactionMetadatum::Int(v as i128))
+        }
+        Type::I8 | Type::I16 | Type::I32 | Type::I64 | Type::Int => {
+            let v = r.read_int()?;
+            Ok(TransactionMetadatum::Int(v))
+        }
+        Type::Bytes => {
+            let bytes = r.read_bytes()?.to_vec();
+            Ok(TransactionMetadatum::Bytes(bytes))
+        }
+        Type::BytesIndef => {
+            let bytes = r.read_indef_bytes()?;
+            Ok(TransactionMetadatum::Bytes(bytes))
+        }
+        Type::String => {
+            let s = r.read_str()?.to_string();
+            Ok(TransactionMetadatum::Text(s))
+        }
+        other => Err(SerializationError::CborDecode(format!(
+            "metadatum: unexpected type {other}"
+        ))),
+    }
+}
+
+// ============================================================================
+// Tests
+// ============================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use dugite_primitives::era::Era;
+
+    // -----------------------------------------------------------------------
+    // CBOR encoding helpers
+    // -----------------------------------------------------------------------
+
+    fn cbor_uint(n: u64) -> Vec<u8> {
+        if n == 0 {
+            vec![0x00]
+        } else if n <= 23 {
+            vec![n as u8]
+        } else if n <= 0xff {
+            vec![0x18, n as u8]
+        } else if n <= 0xffff {
+            let b = (n as u16).to_be_bytes();
+            vec![0x19, b[0], b[1]]
+        } else {
+            let b = n.to_be_bytes();
+            vec![0x1b, b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]]
+        }
+    }
+
+    fn cbor_bytes(b: &[u8]) -> Vec<u8> {
+        if b.len() <= 23 {
+            let mut v = vec![0x40 | b.len() as u8];
+            v.extend_from_slice(b);
+            v
+        } else if b.len() <= 0xff {
+            let mut v = vec![0x58, b.len() as u8];
+            v.extend_from_slice(b);
+            v
+        } else {
+            let l = b.len() as u16;
+            let lb = l.to_be_bytes();
+            let mut v = vec![0x59, lb[0], lb[1]];
+            v.extend_from_slice(b);
+            v
+        }
+    }
+
+    fn cbor_arr(items: &[&[u8]]) -> Vec<u8> {
+        assert!(items.len() <= 23);
+        let mut v = vec![0x80 | items.len() as u8];
+        for item in items {
+            v.extend_from_slice(item);
+        }
+        v
+    }
+
+    fn cbor_map0() -> Vec<u8> {
+        vec![0xa0]
+    }
+
+    #[allow(dead_code)]
+    fn cbor_null() -> Vec<u8> {
+        vec![0xf6]
+    }
+
+    /// Build a minimal Alonzo block CBOR (inner, after envelope stripping).
+    fn make_alonzo_block(n_txs: usize) -> Vec<u8> {
+        // VRF cert = array(2)[output(64), proof(80)]
+        let vrf_output = cbor_bytes(&[0u8; 64]);
+        let vrf_proof = cbor_bytes(&[0u8; 80]);
+        let vrf_cert = cbor_arr(&[&vrf_output, &vrf_proof]);
+
+        // Header body: 15 fields (same as Shelley)
+        let mut hb = vec![0x8f]; // array(15)
+        hb.extend(cbor_uint(42)); // block_number
+        hb.extend(cbor_uint(654321)); // slot
+        hb.extend(cbor_bytes(&[0xba; 32])); // prev_hash
+        hb.extend(cbor_bytes(&[0x01; 32])); // issuer_vkey
+        hb.extend(cbor_bytes(&[0x02; 32])); // vrf_vkey
+        hb.extend(&vrf_cert); // nonce_vrf_cert
+        hb.extend(&vrf_cert); // leader_vrf_cert
+        hb.extend(cbor_uint(0)); // body_size
+        hb.extend(cbor_bytes(&[0x00; 32])); // body_hash
+        hb.extend(cbor_bytes(&[0x03; 32])); // op_hot_vkey
+        hb.extend(cbor_uint(0)); // op_seq
+        hb.extend(cbor_uint(0)); // op_kes
+        hb.extend(cbor_bytes(&[0x04; 64])); // op_sigma
+        hb.extend(cbor_uint(5)); // proto_major
+        hb.extend(cbor_uint(0)); // proto_minor
+
+        let kes_sig = cbor_bytes(&[0x05; 448]);
+        let mut header = vec![0x82]; // array(2)[header_body, kes_sig]
+        header.extend(&hb);
+        header.extend(&kes_sig);
+
+        // tx_bodies = array(n_txs) of minimal bodies
+        let mut tx_bodies_v = Vec::new();
+        let mut tx_witnesses_v = Vec::new();
+        if n_txs <= 23 {
+            tx_bodies_v.push(0x80 | n_txs as u8);
+            tx_witnesses_v.push(0x80 | n_txs as u8);
+        }
+        for _ in 0..n_txs {
+            // {0: [], 1: [], 2: 1000000}
+            let mut tb = vec![0xa3];
+            tb.extend(cbor_uint(0));
+            tb.push(0x80); // empty inputs
+            tb.extend(cbor_uint(1));
+            tb.push(0x80); // empty outputs
+            tb.extend(cbor_uint(2));
+            tb.extend(cbor_uint(1_000_000));
+            tx_bodies_v.extend(&tb);
+            tx_witnesses_v.push(0xa0); // empty witness set
+        }
+
+        // aux_data_set = {}
+        let aux_data = cbor_map0();
+
+        // invalid_transactions = []
+        let invalid_txs = vec![0x80]; // array(0)
+
+        // block = array(5)[header, tx_bodies, tx_witnesses, aux_data, invalid_txs]
+        let mut block = vec![0x85]; // array(5)
+        block.extend(&header);
+        block.extend(&tx_bodies_v);
+        block.extend(&tx_witnesses_v);
+        block.extend(&aux_data);
+        block.extend(&invalid_txs);
+        block
+    }
+
+    // -----------------------------------------------------------------------
+    // Tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn alonzo_empty_block_decodes() {
+        let cbor = make_alonzo_block(0);
+        let block = decode_alonzo_block(&cbor).unwrap();
+        assert_eq!(block.era, Era::Alonzo);
+        assert_eq!(block.transactions.len(), 0);
+        assert_eq!(block.header.slot.0, 654321);
+        assert_eq!(block.header.block_number.0, 42);
+    }
+
+    #[test]
+    fn alonzo_single_tx_valid_flag() {
+        let cbor = make_alonzo_block(1);
+        let block = decode_alonzo_block(&cbor).unwrap();
+        assert_eq!(block.transactions.len(), 1);
+        assert!(block.transactions[0].is_valid);
+    }
+
+    #[test]
+    fn alonzo_invalid_tx_is_marked() {
+        // Build a block with 2 txs, tx index 1 is invalid.
+        let mut cbor = make_alonzo_block(2);
+        // The invalid_txs array is `[0x80]` = empty array(0).
+        // Replace the last byte sequence with `[0x81, 0x01]` = array(1)[uint(1)].
+        // Find and replace the trailing empty invalid_txs array.
+        let pos = cbor.len() - 1; // last byte is 0x80
+        assert_eq!(cbor[pos], 0x80, "expected empty invalid_txs array at end");
+        cbor.pop();
+        cbor.push(0x81); // array(1)
+        cbor.push(0x01); // uint(1)
+
+        let block = decode_alonzo_block(&cbor).unwrap();
+        assert!(block.transactions[0].is_valid, "tx 0 should be valid");
+        assert!(!block.transactions[1].is_valid, "tx 1 should be invalid");
+    }
+
+    #[test]
+    fn alonzo_block_5_elements_required() {
+        // array(4) instead of array(5) should fail
+        let data = vec![0x84, 0x00, 0x00, 0x00, 0x00];
+        let result = decode_alonzo_block(&data);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn alonzo_header_hash_is_blake2b256_of_header_cbor() {
+        let cbor = make_alonzo_block(0);
+        let block = decode_alonzo_block(&cbor).unwrap();
+
+        let mut r = Reader::new(&cbor);
+        r.read_array_header().unwrap();
+        let header_start = r.position();
+        r.skip().unwrap();
+        let header_bytes = r.slice_from(header_start);
+        let expected_hash = blake2b_256(header_bytes);
+        assert_eq!(block.header.header_hash, expected_hash);
+    }
+
+    #[test]
+    fn alonzo_tx_hash_is_blake2b256_of_body_cbor() {
+        let cbor = make_alonzo_block(1);
+        let block = decode_alonzo_block(&cbor).unwrap();
+        assert_eq!(block.transactions.len(), 1);
+
+        let mut r = Reader::new(&cbor);
+        r.read_array_header().unwrap();
+        r.skip().unwrap(); // skip header
+        r.read_array_header().unwrap();
+        let body_start = r.position();
+        r.skip().unwrap();
+        let body_bytes = r.slice_from(body_start);
+        let expected_hash = blake2b_256(body_bytes);
+        assert_eq!(block.transactions[0].hash, expected_hash);
+    }
+
+    #[test]
+    fn alonzo_script_data_hash_decoded() {
+        // Build a tx body with script_data_hash (key 11)
+        let sdh = [0xde; 32];
+        let mut tb = vec![0xa4]; // map(4)
+        tb.extend(cbor_uint(0));
+        tb.push(0x80); // inputs []
+        tb.extend(cbor_uint(1));
+        tb.push(0x80); // outputs []
+        tb.extend(cbor_uint(2));
+        tb.extend(cbor_uint(500_000)); // fee
+        tb.extend(cbor_uint(11));
+        tb.extend(cbor_bytes(&sdh)); // script_data_hash
+
+        let raw_sdh = KeepRaw::parse_with(&mut Reader::new(&tb), |r| {
+            decode_alonzo_tx_body(r, Era::Alonzo)
+        })
+        .unwrap();
+        assert_eq!(
+            raw_sdh.value.script_data_hash,
+            Some(Hash32::from_bytes(sdh))
+        );
+    }
+
+    #[test]
+    fn alonzo_collateral_decoded() {
+        // Build a tx body with collateral (key 13)
+        let tx_id = [0xaa; 32];
+        let mut inp = cbor_arr(&[&cbor_bytes(&tx_id), &cbor_uint(0)]);
+        let mut collateral_arr = vec![0x81]; // array(1)
+        collateral_arr.append(&mut inp);
+
+        let mut tb = vec![0xa3]; // map(3)
+        tb.extend(cbor_uint(0));
+        tb.push(0x80); // inputs []
+        tb.extend(cbor_uint(2));
+        tb.extend(cbor_uint(200_000)); // fee
+        tb.extend(cbor_uint(13));
+        tb.extend(&collateral_arr);
+
+        let raw = KeepRaw::parse_with(&mut Reader::new(&tb), |r| {
+            decode_alonzo_tx_body(r, Era::Alonzo)
+        })
+        .unwrap();
+        assert_eq!(raw.value.collateral.len(), 1);
+        assert_eq!(raw.value.collateral[0].transaction_id.as_bytes(), &tx_id);
+    }
+
+    #[test]
+    fn alonzo_required_signers_padded_to_hash32() {
+        // required_signers (key 14): [* addr_keyhash(28)] → padded to Hash32
+        let signer = [0xcc; 28];
+        let mut arr = vec![0x81]; // array(1)
+        arr.extend(cbor_bytes(&signer));
+
+        let mut tb = vec![0xa3]; // map(3)
+        tb.extend(cbor_uint(0));
+        tb.push(0x80);
+        tb.extend(cbor_uint(2));
+        tb.extend(cbor_uint(100_000));
+        tb.extend(cbor_uint(14));
+        tb.extend(&arr);
+
+        let raw = KeepRaw::parse_with(&mut Reader::new(&tb), |r| {
+            decode_alonzo_tx_body(r, Era::Alonzo)
+        })
+        .unwrap();
+        assert_eq!(raw.value.required_signers.len(), 1);
+        // First 28 bytes match the signer; last 4 are zero-padding
+        let h32 = raw.value.required_signers[0];
+        assert_eq!(&h32.as_bytes()[..28], &signer);
+        assert_eq!(&h32.as_bytes()[28..], &[0u8; 4]);
+    }
+
+    #[test]
+    fn plutus_data_integer() {
+        let data = [0x05u8]; // uint(5)
+        let mut r = Reader::new(&data);
+        let pd = read_plutus_data(&mut r).unwrap();
+        assert_eq!(pd, PlutusData::Integer(BigInt::from(5u64)));
+    }
+
+    #[test]
+    fn plutus_data_bytes() {
+        let payload = [0xde, 0xad, 0xbe, 0xef];
+        let data = cbor_bytes(&payload);
+        let mut r = Reader::new(&data);
+        let pd = read_plutus_data(&mut r).unwrap();
+        assert_eq!(pd, PlutusData::Bytes(payload.to_vec()));
+    }
+
+    #[test]
+    fn plutus_data_constr_121() {
+        // tag(121) array(0) — Constr 0 with no fields
+        let mut data = vec![0xd8, 0x79]; // tag(121) — 0xc0 | 0x18 (1-byte), value 121 = 0x79
+        data.push(0x80); // array(0)
+        let mut r = Reader::new(&data);
+        let pd = read_plutus_data(&mut r).unwrap();
+        assert_eq!(pd, PlutusData::Constr(0, vec![]));
+    }
+
+    #[test]
+    fn plutus_data_constr_1280() {
+        // tag(1280) array(0) — Constr 7 with no fields
+        // 1280 = 0x500; tag encoding: 0xd9 0x05 0x00
+        let mut data = vec![0xd9, 0x05, 0x00]; // tag(1280)
+        data.push(0x80); // array(0)
+        let mut r = Reader::new(&data);
+        let pd = read_plutus_data(&mut r).unwrap();
+        assert_eq!(pd, PlutusData::Constr(7, vec![]));
+    }
+
+    #[test]
+    fn plutus_data_map() {
+        // {0 => 1}
+        let mut data = vec![0xa1]; // map(1)
+        data.push(0x00); // uint(0)
+        data.push(0x01); // uint(1)
+        let mut r = Reader::new(&data);
+        let pd = read_plutus_data(&mut r).unwrap();
+        assert_eq!(
+            pd,
+            PlutusData::Map(vec![(
+                PlutusData::Integer(BigInt::from(0u64)),
+                PlutusData::Integer(BigInt::from(1u64))
+            )])
+        );
+    }
+
+    #[test]
+    fn plutus_data_list() {
+        // [1, 2]
+        let mut data = vec![0x82]; // array(2)
+        data.push(0x01);
+        data.push(0x02);
+        let mut r = Reader::new(&data);
+        let pd = read_plutus_data(&mut r).unwrap();
+        assert_eq!(
+            pd,
+            PlutusData::List(vec![
+                PlutusData::Integer(BigInt::from(1u64)),
+                PlutusData::Integer(BigInt::from(2u64))
+            ])
+        );
+    }
+
+    #[test]
+    fn alonzo_minimal_mode_skips_witnesses() {
+        let cbor = make_alonzo_block(1);
+        let block = decode_alonzo_block_minimal(&cbor).unwrap();
+        assert!(block.transactions[0].witness_set.vkey_witnesses.is_empty());
+        assert!(block.transactions[0].witness_set.redeemers.is_empty());
+    }
+}
