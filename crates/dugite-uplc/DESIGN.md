@@ -314,6 +314,67 @@ All of these are reachable from witness-set scripts on the gossip layer
 and have produced libfuzzer crashes in dugite's fuzz CI. dugite-uplc
 must demonstrably not have analogues — the fuzz matrix gates on it.
 
+## Conformance gotchas from the Haskell reference
+
+Surfaced by the cardano-haskell-oracle survey of `IntersectMBO/plutus`
+HEAD; each is a place where the obvious-looking Rust translation
+diverges from cardano-node and must be tested explicitly:
+
+1. **Program version gate for `Constr`/`Case`.** Flat tags 8 and 9 are
+   only legal when the program's outer version triple is `≥ 1.1.0`. A
+   `1.0.0` program containing either node fails *phase-1* with
+   `not allowed before version 1.1.0`. The flat decoder must thread
+   the program version through so it can reject early.
+
+2. **PlutusData 64-byte bytestring limit at decode.** Definite-length
+   `B` leaves over 64 bytes are decode errors. Larger byte strings
+   must use indefinite-length chunking. Integer bignums must have a
+   ≤ 64 byte payload too. (Source: `decodeBoundedBytes` in
+   `plutus-core/.../Data.hs`.)
+
+3. **`Map` semantics for `Data`.** Duplicate keys are accepted; order
+   is preserved as-is; no canonical-form enforcement. Scripts that
+   need uniqueness enforce it themselves. Definite-length on encode.
+
+4. **`Index = 0` is a sentinel free variable.** `mkTermToEvaluate`
+   runs `checkScope` *before* evaluation and rejects programs with
+   any free De Bruijn variable. `checkScope` failure is reported as
+   a *phase-2* error (charged collateral), not a decode error.
+
+5. **Slippage overshoot.** `defaultSlippage = 200` — scripts can
+   exceed their budget by up to ~200 step-costs before the machine
+   notices. The final returned `ExBudget` is the *remaining* budget
+   (negative on overshoot); the ledger checks `final >= 0`. Don't
+   short-circuit on exact-zero; honour the slippage.
+
+6. **`DefaultUniValue` and the new `Value`-tagged builtins**
+   (`InsertCoin`, `LookupCoin`, `UnionValue`, `ValueContains`,
+   `ValueData`, `UnValueData`, `ScaleValue`) are on `IntersectMBO/plutus`
+   master but **not** enabled in current mainnet protocol versions.
+   Do not implement in the initial dugite-uplc target — but reserve
+   the `BuiltinId` discriminants so we don't have to renumber later.
+
+7. **V3-only fee/mint semantics.** `txInfoFee` is `Lovelace` (not
+   `Value`) and `txInfoMint` is `MintValue` (the zero-Ada invariant is
+   enforced at the ledger level: zero-quantity Ada entries never
+   appear). The V1/V2 `Value`-typed fee field is V1/V2-only.
+
+8. **V3 `ScriptContext` shape change.** V3 has three fields, not
+   two: `txInfo`, `redeemer`, and `scriptInfo`. The third field
+   (`scriptInfo`) replaces V1/V2's `scriptContextPurpose` with a
+   richer type that carries the inline datum for `SpendingScript`.
+
+9. **V3 redeemer iteration adds voting + proposing.** The
+   `ScriptPurpose` enum gains `Voting Voter` and
+   `Proposing Integer ProposalProcedure` variants on top of the V2
+   four (`Minting`, `Spending`, `Rewarding`, `Certifying`).
+
+10. **Reference script size fee** (Conway). `txNonDistinctRefScriptsSize`
+    sums `originalBytesSize` of all reference scripts referenced by
+    inputs ∪ reference inputs, *counting duplicates*, and is fed into
+    minimum-fee computation. This is a fee rule (phase-1), not a
+    script-budget rule.
+
 ## Open questions (to be answered in implementation PRs)
 
 1. Single-crate or multi-crate split for the phase-two wrapper? (Likely
