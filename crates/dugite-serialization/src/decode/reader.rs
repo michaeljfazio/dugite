@@ -509,6 +509,27 @@ impl<'b> Reader<'b> {
             .map_err(|e| SerializationError::CborDecode(format!("null: {e}")))
     }
 
+    /// Read a CBOR tag value and advance past it.
+    ///
+    /// Returns the numeric tag value. Unlike [`expect_tag`], this does not
+    /// check the value — callers can switch on it themselves.
+    pub fn read_tag(&mut self) -> Result<u64, SerializationError> {
+        self.inner
+            .tag()
+            .map(|t| t.as_u64())
+            .map_err(|e| SerializationError::CborDecode(format!("read_tag: {e}")))
+    }
+
+    /// Peek at the CBOR tag value at the current position **without** advancing.
+    ///
+    /// Returns an error if the current value is not a tag.
+    pub fn probe_tag(&mut self) -> Result<u64, SerializationError> {
+        let saved = self.inner.position();
+        let tag_val = self.read_tag()?;
+        self.inner.set_position(saved);
+        Ok(tag_val)
+    }
+
     /// Expect a specific CBOR tag at the current position and consume it.
     ///
     /// Advances past the tag header. Returns an error if the tag value does not
@@ -537,17 +558,6 @@ impl<'b> Reader<'b> {
         self.read_bytes()
     }
 
-    /// Read and return a CBOR tag value (major type 6), advancing past the tag
-    /// header. The tagged value that follows is left for the caller to consume.
-    ///
-    /// Used by per-era Plutus data decoders to dispatch on Constr tag ranges
-    /// (121..127, 1280..1400, 102) without prior knowledge of the tag value.
-    pub fn read_tag(&mut self) -> Result<u64, SerializationError> {
-        self.inner
-            .tag()
-            .map(|t| t.as_u64())
-            .map_err(|e| SerializationError::CborDecode(format!("read_tag: {e}")))
-    }
 }
 
 // =========================================================================
