@@ -27,6 +27,24 @@
 //! generation runs, so M4 only needs to swap the implementation, not the
 //! plumbing.
 
+// Foundation modules — Reader, KeepRaw, primitives, helpers, block envelope.
+//
+// Currently `pub(crate)` because no caller outside this crate consumes them
+// directly; per-era decoder files (M4a/b/c) will use them. The dead-code
+// allowance covers items not yet wired into a caller as those era files
+// land; once each era's decoder is in place, callers exist and the allow
+// reduces to no-ops.
+#[allow(dead_code)]
+pub(crate) mod block;
+#[allow(dead_code)]
+pub(crate) mod helpers;
+#[allow(dead_code)]
+pub(crate) mod primitives;
+#[allow(dead_code)]
+pub(crate) mod raw;
+#[allow(dead_code)]
+pub(crate) mod reader;
+
 use crate::error::SerializationError;
 use dugite_primitives::block::Block;
 use dugite_primitives::transaction::Transaction;
