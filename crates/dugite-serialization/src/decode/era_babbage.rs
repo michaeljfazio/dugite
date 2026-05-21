@@ -1350,4 +1350,312 @@ mod tests {
         let block = decode_babbage_block_minimal(&cbor).unwrap();
         assert!(block.transactions[0].witness_set.vkey_witnesses.is_empty());
     }
+
+    // ── datum_option + script_ref ─────────────────────────────────────────
+
+    #[test]
+    fn datum_option_hash_form_decodes() {
+        // [0, hash32]
+        let mut data = vec![0x82];
+        data.extend(cbor_uint(0));
+        data.extend(cbor_bytes(&[0xDA; 32]));
+        let mut r = Reader::new(&data);
+        let d = read_datum_option(&mut r).unwrap();
+        assert!(matches!(d, OutputDatum::DatumHash(_)));
+    }
+
+    #[test]
+    fn datum_option_inline_form_decodes() {
+        let datum_cbor = vec![0x18u8, 0x2a]; // uint(42)
+        let mut data = vec![0x82];
+        data.push(0x01); // disc 1
+        data.push(0xd8);
+        data.push(0x18); // tag(24)
+        data.extend(cbor_bytes(&datum_cbor));
+        let mut r = Reader::new(&data);
+        let d = read_datum_option(&mut r).unwrap();
+        match d {
+            OutputDatum::InlineDatum { data, raw_cbor } => {
+                assert_eq!(data, PlutusData::Integer(num_bigint::BigInt::from(42u64)));
+                assert!(raw_cbor.is_some());
+            }
+            _ => panic!("expected InlineDatum"),
+        }
+    }
+
+    #[test]
+    fn datum_option_unknown_disc_rejected() {
+        let data = [0x82, 0x05, 0x00];
+        let mut r = Reader::new(&data);
+        assert!(read_datum_option(&mut r).is_err());
+    }
+
+    #[test]
+    fn datum_option_wrong_arity_rejected() {
+        let data = [0x83, 0x00, 0x00, 0x00];
+        let mut r = Reader::new(&data);
+        assert!(read_datum_option(&mut r).is_err());
+    }
+
+    /// Build a tag(24)-wrapped script_ref CBOR.
+    fn build_script_ref_cbor(script_type: u64, payload: &[u8]) -> Vec<u8> {
+        // Build inner = [script_type, payload_bstr]
+        let mut inner = vec![0x82];
+        inner.extend(cbor_uint(script_type));
+        inner.extend(cbor_bytes(payload));
+        let mut out = vec![0xd8, 0x18];
+        out.extend(cbor_bytes(&inner));
+        out
+    }
+
+    #[test]
+    fn script_ref_plutus_v1() {
+        let cbor = build_script_ref_cbor(1, &[0xCA, 0xFE]);
+        let mut r = Reader::new(&cbor);
+        let sr = read_script_ref(&mut r).unwrap();
+        assert!(matches!(sr, ScriptRef::PlutusV1(_)));
+    }
+
+    #[test]
+    fn script_ref_plutus_v2() {
+        let cbor = build_script_ref_cbor(2, &[0xDE, 0xAD]);
+        let mut r = Reader::new(&cbor);
+        let sr = read_script_ref(&mut r).unwrap();
+        assert!(matches!(sr, ScriptRef::PlutusV2(_)));
+    }
+
+    #[test]
+    fn script_ref_plutus_v3() {
+        let cbor = build_script_ref_cbor(3, &[0xBE, 0xEF]);
+        let mut r = Reader::new(&cbor);
+        let sr = read_script_ref(&mut r).unwrap();
+        assert!(matches!(sr, ScriptRef::PlutusV3(_)));
+    }
+
+    #[test]
+    fn script_ref_native_script() {
+        // Inner = [0, native_script_cbor]
+        // native_script = [5, slot] (InvalidHereafter)
+        let mut inner = vec![0x82];
+        inner.extend(cbor_uint(0));
+        // inline native script (no bstr wrapper for type 0 — the function re-parses)
+        let mut ns = vec![0x82];
+        ns.extend(cbor_uint(5));
+        ns.extend(cbor_uint(99));
+        inner.extend(&ns);
+        let mut out = vec![0xd8, 0x18];
+        out.extend(cbor_bytes(&inner));
+        let mut r = Reader::new(&out);
+        let sr = read_script_ref(&mut r).unwrap();
+        match sr {
+            ScriptRef::NativeScript(
+                dugite_primitives::transaction::NativeScript::InvalidHereafter(SlotNo(99)),
+            ) => {}
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn script_ref_unknown_type_rejected() {
+        let cbor = build_script_ref_cbor(99, &[]);
+        let mut r = Reader::new(&cbor);
+        assert!(read_script_ref(&mut r).is_err());
+    }
+
+    #[test]
+    fn script_ref_wrong_inner_arity_rejected() {
+        // tag(24) bstr containing array(3) — wrong arity
+        let mut inner = vec![0x83];
+        inner.extend(cbor_uint(0));
+        inner.extend(cbor_uint(0));
+        inner.extend(cbor_uint(0));
+        let mut out = vec![0xd8, 0x18];
+        out.extend(cbor_bytes(&inner));
+        let mut r = Reader::new(&out);
+        assert!(read_script_ref(&mut r).is_err());
+    }
+
+    // ── Babbage redeemer (separate function from Alonzo's) ────────────────
+
+    #[test]
+    fn babbage_redeemer_all_tags() {
+        for (tag_u, expected) in [
+            (0u64, RedeemerTag::Spend),
+            (1, RedeemerTag::Mint),
+            (2, RedeemerTag::Cert),
+            (3, RedeemerTag::Reward),
+        ] {
+            let mut data = vec![0x84];
+            data.extend(cbor_uint(tag_u));
+            data.extend(cbor_uint(0));
+            data.push(0x00);
+            data.push(0x82);
+            data.extend(cbor_uint(1));
+            data.extend(cbor_uint(2));
+            let mut r = Reader::new(&data);
+            let red = read_babbage_redeemer(&mut r).unwrap();
+            assert_eq!(red.tag, expected);
+        }
+    }
+
+    #[test]
+    fn babbage_redeemer_wrong_arity_rejected() {
+        let data = [0x83, 0x00, 0x00, 0x00];
+        let mut r = Reader::new(&data);
+        assert!(read_babbage_redeemer(&mut r).is_err());
+    }
+
+    #[test]
+    fn babbage_redeemer_unknown_tag_rejected() {
+        let mut data = vec![0x84];
+        data.extend(cbor_uint(99));
+        data.extend(cbor_uint(0));
+        data.push(0x00);
+        data.push(0x82);
+        data.push(0x00);
+        data.push(0x00);
+        let mut r = Reader::new(&data);
+        assert!(read_babbage_redeemer(&mut r).is_err());
+    }
+
+    // ── Babbage witness set with plutus_v2 (key 6) + all keys ──────────────
+
+    #[test]
+    fn babbage_witness_set_plutus_v2_decoded() {
+        // ws = {6: [bytes]}
+        let mut ws = vec![0xa1];
+        ws.extend(cbor_uint(6));
+        ws.push(0x81);
+        ws.extend(cbor_bytes(&[0x42, 0x42, 0x42]));
+        let mut r = Reader::new(&ws);
+        let result = decode_babbage_witness_set(&mut r).unwrap();
+        assert_eq!(result.plutus_v2_scripts.len(), 1);
+        assert_eq!(result.plutus_v2_scripts[0], vec![0x42; 3]);
+    }
+
+    #[test]
+    fn babbage_witness_set_unknown_key_skipped() {
+        let mut ws = vec![0xa1];
+        ws.extend(cbor_uint(99));
+        ws.extend(cbor_uint(0));
+        let mut r = Reader::new(&ws);
+        let result = decode_babbage_witness_set(&mut r).unwrap();
+        assert!(result.vkey_witnesses.is_empty());
+    }
+
+    // ── Babbage standalone tx ─────────────────────────────────────────────
+
+    #[test]
+    fn babbage_standalone_tx_decodes() {
+        let mut tx = vec![0x84];
+        // body
+        tx.push(0xa3);
+        tx.extend(cbor_uint(0));
+        tx.push(0x80);
+        tx.extend(cbor_uint(1));
+        tx.push(0x80);
+        tx.extend(cbor_uint(2));
+        tx.extend(cbor_uint(700_000));
+        // ws
+        tx.push(0xa0);
+        // is_valid
+        tx.push(0xf5);
+        // aux
+        tx.push(0xf6);
+        let decoded = decode_babbage_tx_standalone(&tx).unwrap();
+        assert_eq!(decoded.era, Era::Babbage);
+        assert_eq!(decoded.body.fee.0, 700_000);
+        assert!(decoded.is_valid);
+    }
+
+    #[test]
+    fn babbage_standalone_tx_invalid_marker() {
+        let mut tx = vec![0x84];
+        tx.push(0xa3);
+        tx.extend(cbor_uint(0));
+        tx.push(0x80);
+        tx.extend(cbor_uint(1));
+        tx.push(0x80);
+        tx.extend(cbor_uint(2));
+        tx.extend(cbor_uint(0));
+        tx.push(0xa0);
+        tx.push(0xf4); // is_valid = false
+        tx.push(0xf6);
+        let decoded = decode_babbage_tx_standalone(&tx).unwrap();
+        assert!(!decoded.is_valid);
+    }
+
+    #[test]
+    fn babbage_standalone_tx_rejects_wrong_arity() {
+        let cbor = [0x83, 0xa0, 0xa0, 0xf6];
+        assert!(decode_babbage_tx_standalone(&cbor).is_err());
+    }
+
+    #[test]
+    fn babbage_standalone_tx_rejects_indefinite() {
+        assert!(decode_babbage_tx_standalone(&[0x9f, 0xff]).is_err());
+    }
+
+    // ── Babbage mint map (i64 quantities) ─────────────────────────────────
+
+    #[test]
+    fn babbage_mint_map_negative_quantities() {
+        // {policy => {asset => i64}}
+        let mut mint = vec![0xa1];
+        mint.extend(cbor_bytes(&[0xAA; 28])); // policy
+        mint.push(0xa1);
+        mint.extend(cbor_bytes(b"BURN"));
+        mint.push(0x29); // -10 (major 1, val 9)
+        let mut r = Reader::new(&mint);
+        let result = read_babbage_mint_map(&mut r).unwrap();
+        assert_eq!(result.len(), 1);
+        let (_pol, assets) = result.iter().next().unwrap();
+        let &qty = assets.values().next().unwrap();
+        assert_eq!(qty, -10);
+    }
+
+    // ── post-Alonzo map output with script_ref ────────────────────────────
+
+    #[test]
+    fn babbage_map_output_with_script_ref() {
+        let addr_bytes: Vec<u8> = {
+            let mut v = vec![0x60];
+            v.extend_from_slice(&[0u8; 28]);
+            v
+        };
+        // {0: addr, 1: coin, 3: script_ref}
+        let mut out = vec![0xa3];
+        out.extend(cbor_uint(0));
+        out.extend(cbor_bytes(&addr_bytes));
+        out.extend(cbor_uint(1));
+        out.extend(cbor_uint(1_000_000));
+        out.extend(cbor_uint(3));
+        out.extend(build_script_ref_cbor(2, &[0xAB])); // PlutusV2
+
+        let mut r = Reader::new(&out);
+        let decoded = read_babbage_tx_output(&mut r).unwrap();
+        assert!(decoded.script_ref.is_some());
+        assert!(matches!(
+            decoded.script_ref.unwrap(),
+            ScriptRef::PlutusV2(_)
+        ));
+    }
+
+    #[test]
+    fn babbage_legacy_output_with_datum_hash() {
+        // Legacy 3-element output: [addr, coin, datum_hash32]
+        let addr_bytes: Vec<u8> = {
+            let mut v = vec![0x60];
+            v.extend_from_slice(&[0u8; 28]);
+            v
+        };
+        let mut out = vec![0x83]; // array(3)
+        out.extend(cbor_bytes(&addr_bytes));
+        out.extend(cbor_uint(5_000_000));
+        out.extend(cbor_bytes(&[0x55; 32]));
+        let mut r = Reader::new(&out);
+        let decoded = read_babbage_legacy_output(&mut r).unwrap();
+        assert!(matches!(decoded.datum, OutputDatum::DatumHash(_)));
+        assert!(decoded.is_legacy);
+    }
 }

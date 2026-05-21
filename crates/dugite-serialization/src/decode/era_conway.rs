@@ -2715,4 +2715,631 @@ mod tests {
         let body = decode_conway_tx_body(&mut r).unwrap();
         assert_eq!(body.fee, Lovelace(42));
     }
+
+    // ── Voter (all discriminators 0-4 + error) ────────────────────────────
+
+    #[test]
+    fn voter_committee_key() {
+        let mut data = vec![0x82];
+        data.extend(cbor_uint(0));
+        data.extend(cbor_bytes(&[0xAA; 28]));
+        let mut r = Reader::new(&data);
+        let v = read_voter(&mut r).unwrap();
+        assert!(matches!(
+            v,
+            Voter::ConstitutionalCommittee(Credential::VerificationKey(_))
+        ));
+    }
+
+    #[test]
+    fn voter_committee_script() {
+        let mut data = vec![0x82];
+        data.extend(cbor_uint(1));
+        data.extend(cbor_bytes(&[0xBB; 28]));
+        let mut r = Reader::new(&data);
+        let v = read_voter(&mut r).unwrap();
+        assert!(matches!(
+            v,
+            Voter::ConstitutionalCommittee(Credential::Script(_))
+        ));
+    }
+
+    #[test]
+    fn voter_drep_key() {
+        let mut data = vec![0x82];
+        data.extend(cbor_uint(2));
+        data.extend(cbor_bytes(&[0xCC; 28]));
+        let mut r = Reader::new(&data);
+        let v = read_voter(&mut r).unwrap();
+        assert!(matches!(v, Voter::DRep(Credential::VerificationKey(_))));
+    }
+
+    #[test]
+    fn voter_drep_script() {
+        let mut data = vec![0x82];
+        data.extend(cbor_uint(3));
+        data.extend(cbor_bytes(&[0xDD; 28]));
+        let mut r = Reader::new(&data);
+        let v = read_voter(&mut r).unwrap();
+        assert!(matches!(v, Voter::DRep(Credential::Script(_))));
+    }
+
+    #[test]
+    fn voter_pool_padded_to_hash32() {
+        let mut data = vec![0x82];
+        data.extend(cbor_uint(4));
+        data.extend(cbor_bytes(&[0xEE; 28]));
+        let mut r = Reader::new(&data);
+        let v = read_voter(&mut r).unwrap();
+        match v {
+            Voter::StakePool(h32) => {
+                assert_eq!(&h32.as_bytes()[..28], &[0xEE; 28]);
+                assert_eq!(&h32.as_bytes()[28..], &[0u8; 4]);
+            }
+            _ => panic!("expected StakePool"),
+        }
+    }
+
+    #[test]
+    fn voter_unknown_disc_rejected() {
+        let mut data = vec![0x82];
+        data.extend(cbor_uint(5));
+        data.extend(cbor_bytes(&[0; 28]));
+        let mut r = Reader::new(&data);
+        assert!(read_voter(&mut r).is_err());
+    }
+
+    #[test]
+    fn voter_wrong_arity_rejected() {
+        let data = [0x83, 0x00, 0x00, 0x00];
+        let mut r = Reader::new(&data);
+        assert!(read_voter(&mut r).is_err());
+    }
+
+    // ── Anchor ────────────────────────────────────────────────────────────
+
+    #[test]
+    fn anchor_with_text_url() {
+        let mut data = vec![0x82];
+        data.push(0x63); // text(3)
+        data.extend_from_slice(b"foo");
+        data.extend(cbor_bytes(&[0x42; 32]));
+        let mut r = Reader::new(&data);
+        let a = read_anchor(&mut r).unwrap();
+        assert_eq!(a.url, "foo");
+        assert_eq!(a.data_hash.as_bytes(), &[0x42; 32]);
+    }
+
+    #[test]
+    fn anchor_with_bytes_url_fallback() {
+        let mut data = vec![0x82];
+        data.extend(cbor_bytes(b"bar"));
+        data.extend(cbor_bytes(&[0x42; 32]));
+        let mut r = Reader::new(&data);
+        let a = read_anchor(&mut r).unwrap();
+        assert_eq!(a.url, "bar");
+    }
+
+    #[test]
+    fn anchor_invalid_utf8_bytes_url_rejected() {
+        let mut data = vec![0x82];
+        data.extend(cbor_bytes(&[0xff, 0xff]));
+        data.extend(cbor_bytes(&[0; 32]));
+        let mut r = Reader::new(&data);
+        assert!(read_anchor(&mut r).is_err());
+    }
+
+    #[test]
+    fn anchor_wrong_arity_rejected() {
+        let data = [0x83, 0x60, 0x00, 0x00];
+        let mut r = Reader::new(&data);
+        assert!(read_anchor(&mut r).is_err());
+    }
+
+    #[test]
+    fn optional_anchor_null_yields_none() {
+        let data = [0xf6u8];
+        let mut r = Reader::new(&data);
+        let a = read_optional_anchor(&mut r).unwrap();
+        assert!(a.is_none());
+    }
+
+    #[test]
+    fn optional_anchor_some_decodes_inner() {
+        let mut data = vec![0x82];
+        data.push(0x63);
+        data.extend_from_slice(b"foo");
+        data.extend(cbor_bytes(&[0; 32]));
+        let mut r = Reader::new(&data);
+        let a = read_optional_anchor(&mut r).unwrap();
+        assert!(a.is_some());
+    }
+
+    // ── Vote / VotingProcedure / GovActionId ──────────────────────────────
+
+    #[test]
+    fn read_vote_all_values() {
+        for (v, expected) in [(0u64, Vote::No), (1, Vote::Yes), (2, Vote::Abstain)] {
+            let data = cbor_uint(v);
+            let mut r = Reader::new(&data);
+            assert_eq!(read_vote(&mut r).unwrap(), expected);
+        }
+    }
+
+    #[test]
+    fn read_vote_unknown_rejected() {
+        let data = cbor_uint(99);
+        let mut r = Reader::new(&data);
+        assert!(read_vote(&mut r).is_err());
+    }
+
+    #[test]
+    fn voting_procedure_decodes_with_null_anchor() {
+        // [vote=1, null]
+        let mut data = vec![0x82];
+        data.extend(cbor_uint(1));
+        data.push(0xf6);
+        let mut r = Reader::new(&data);
+        let vp = read_voting_procedure(&mut r).unwrap();
+        assert_eq!(vp.vote, Vote::Yes);
+        assert!(vp.anchor.is_none());
+    }
+
+    #[test]
+    fn voting_procedure_wrong_arity_rejected() {
+        let data = [0x83, 0x00, 0xf6, 0xf6];
+        let mut r = Reader::new(&data);
+        assert!(read_voting_procedure(&mut r).is_err());
+    }
+
+    #[test]
+    fn gov_action_id_decodes() {
+        let mut data = vec![0x82];
+        data.extend(cbor_bytes(&[0xAB; 32]));
+        data.extend(cbor_uint(3));
+        let mut r = Reader::new(&data);
+        let id = read_gov_action_id(&mut r).unwrap();
+        assert_eq!(id.action_index, 3);
+        assert_eq!(id.transaction_id.as_bytes(), &[0xAB; 32]);
+    }
+
+    #[test]
+    fn gov_action_id_wrong_arity_rejected() {
+        let data = [0x83, 0x00, 0x00, 0x00];
+        let mut r = Reader::new(&data);
+        assert!(read_gov_action_id(&mut r).is_err());
+    }
+
+    // ── Constitution + Anchor + Optional hash ─────────────────────────────
+
+    #[test]
+    fn constitution_with_script_hash() {
+        // [anchor, hash28]
+        let mut data = vec![0x82];
+        let mut anchor = vec![0x82];
+        anchor.push(0x63);
+        anchor.extend_from_slice(b"foo");
+        anchor.extend(cbor_bytes(&[0; 32]));
+        data.extend(&anchor);
+        data.extend(cbor_bytes(&[0x11; 28]));
+        let mut r = Reader::new(&data);
+        let c = read_constitution(&mut r).unwrap();
+        assert!(c.script_hash.is_some());
+    }
+
+    #[test]
+    fn constitution_with_null_script_hash() {
+        let mut data = vec![0x82];
+        let mut anchor = vec![0x82];
+        anchor.push(0x63);
+        anchor.extend_from_slice(b"foo");
+        anchor.extend(cbor_bytes(&[0; 32]));
+        data.extend(&anchor);
+        data.push(0xf6);
+        let mut r = Reader::new(&data);
+        let c = read_constitution(&mut r).unwrap();
+        assert!(c.script_hash.is_none());
+    }
+
+    #[test]
+    fn constitution_wrong_arity_rejected() {
+        let data = [0x83, 0x00, 0x00, 0x00];
+        let mut r = Reader::new(&data);
+        assert!(read_constitution(&mut r).is_err());
+    }
+
+    // ── Cost models + ex_unit_prices + ex_units ───────────────────────────
+
+    #[test]
+    fn cost_models_all_three_versions() {
+        // {0: [...], 1: [...], 2: [...]}
+        let mut data = vec![0xa3];
+        data.extend(cbor_uint(0));
+        data.push(0x82); // array(2)
+        data.extend(cbor_uint(100));
+        data.extend(cbor_uint(200));
+        data.extend(cbor_uint(1));
+        data.push(0x81);
+        data.extend(cbor_uint(50));
+        data.extend(cbor_uint(2));
+        data.push(0x81);
+        data.extend(cbor_uint(75));
+        let mut r = Reader::new(&data);
+        let cm = read_cost_models(&mut r).unwrap();
+        assert_eq!(cm.plutus_v1.as_ref().unwrap(), &vec![100, 200]);
+        assert_eq!(cm.plutus_v2.as_ref().unwrap(), &vec![50]);
+        assert_eq!(cm.plutus_v3.as_ref().unwrap(), &vec![75]);
+    }
+
+    #[test]
+    fn cost_models_unknown_keys_ignored() {
+        let mut data = vec![0xa1];
+        data.extend(cbor_uint(99));
+        data.push(0x80);
+        let mut r = Reader::new(&data);
+        let cm = read_cost_models(&mut r).unwrap();
+        assert!(cm.plutus_v1.is_none());
+        assert!(cm.plutus_v2.is_none());
+        assert!(cm.plutus_v3.is_none());
+    }
+
+    #[test]
+    fn ex_unit_prices_decodes() {
+        let mut data = vec![0x82];
+        // mem = tag(30) [1, 100]
+        let mut rat = vec![0xd8, 0x1e, 0x82];
+        rat.extend(cbor_uint(1));
+        rat.extend(cbor_uint(100));
+        data.extend(&rat);
+        // step = tag(30) [2, 1000]
+        let mut rat2 = vec![0xd8, 0x1e, 0x82];
+        rat2.extend(cbor_uint(2));
+        rat2.extend(cbor_uint(1000));
+        data.extend(&rat2);
+        let mut r = Reader::new(&data);
+        let p = read_ex_unit_prices(&mut r).unwrap();
+        assert_eq!(p.mem_price.numerator, 1);
+        assert_eq!(p.mem_price.denominator, 100);
+        assert_eq!(p.step_price.denominator, 1000);
+    }
+
+    #[test]
+    fn ex_unit_prices_wrong_arity_rejected() {
+        let data = [0x83, 0x00, 0x00, 0x00];
+        let mut r = Reader::new(&data);
+        assert!(read_ex_unit_prices(&mut r).is_err());
+    }
+
+    #[test]
+    fn ex_units_wrong_arity_rejected() {
+        let data = [0x83, 0x00, 0x00, 0x00];
+        let mut r = Reader::new(&data);
+        assert!(read_ex_units(&mut r).is_err());
+    }
+
+    // ── gov_action variants ───────────────────────────────────────────────
+
+    fn cbor_anchor(url: &str) -> Vec<u8> {
+        let mut v = vec![0x82];
+        let bytes = url.as_bytes();
+        v.push(0x60 | bytes.len() as u8); // text(len)
+        v.extend_from_slice(bytes);
+        v.extend(cbor_bytes(&[0; 32]));
+        v
+    }
+
+    #[test]
+    fn gov_action_info_action() {
+        // [6]
+        let data = [0x81, 0x06];
+        let mut r = Reader::new(&data);
+        let g = read_gov_action(&mut r).unwrap();
+        assert!(matches!(g, GovAction::InfoAction));
+    }
+
+    #[test]
+    fn gov_action_no_confidence_with_null_prev() {
+        // [3, null]
+        let data = [0x82, 0x03, 0xf6];
+        let mut r = Reader::new(&data);
+        let g = read_gov_action(&mut r).unwrap();
+        assert!(matches!(
+            g,
+            GovAction::NoConfidence {
+                prev_action_id: None
+            }
+        ));
+    }
+
+    #[test]
+    fn gov_action_hard_fork_initiation() {
+        // [1, null, [11, 0]]
+        let mut data = vec![0x83];
+        data.extend(cbor_uint(1));
+        data.push(0xf6);
+        data.push(0x82);
+        data.extend(cbor_uint(11));
+        data.extend(cbor_uint(0));
+        let mut r = Reader::new(&data);
+        let g = read_gov_action(&mut r).unwrap();
+        match g {
+            GovAction::HardForkInitiation {
+                protocol_version, ..
+            } => assert_eq!(protocol_version, (11, 0)),
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn gov_action_hard_fork_invalid_version_arity() {
+        // [1, null, [11]]
+        let mut data = vec![0x83];
+        data.extend(cbor_uint(1));
+        data.push(0xf6);
+        data.push(0x81);
+        data.extend(cbor_uint(11));
+        let mut r = Reader::new(&data);
+        assert!(read_gov_action(&mut r).is_err());
+    }
+
+    #[test]
+    fn gov_action_treasury_withdrawals() {
+        // [2, {reward_acct => coin}, null]
+        let mut data = vec![0x83];
+        data.extend(cbor_uint(2));
+        data.push(0xa1);
+        data.extend(cbor_bytes(&[0xE0; 29]));
+        data.extend(cbor_uint(1_000_000));
+        data.push(0xf6); // null policy
+        let mut r = Reader::new(&data);
+        let g = read_gov_action(&mut r).unwrap();
+        match g {
+            GovAction::TreasuryWithdrawals { withdrawals, .. } => {
+                assert_eq!(withdrawals.len(), 1);
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn gov_action_new_constitution() {
+        // [5, null, [anchor, null]]
+        let mut data = vec![0x83];
+        data.extend(cbor_uint(5));
+        data.push(0xf6);
+        data.push(0x82);
+        data.extend(cbor_anchor("foo"));
+        data.push(0xf6);
+        let mut r = Reader::new(&data);
+        let g = read_gov_action(&mut r).unwrap();
+        assert!(matches!(g, GovAction::NewConstitution { .. }));
+    }
+
+    #[test]
+    fn gov_action_update_committee() {
+        // [4, null, set<cred>, {cred => epoch}, threshold]
+        let mut data = vec![0x85];
+        data.extend(cbor_uint(4));
+        data.push(0xf6); // prev_id = null
+                         // members_to_remove = []
+        data.push(0x80);
+        // members_to_add = {cred(0, hash28) => 10}
+        data.push(0xa1);
+        data.push(0x82);
+        data.extend(cbor_uint(0));
+        data.extend(cbor_bytes(&[0xAA; 28]));
+        data.extend(cbor_uint(10));
+        // threshold = tag(30) [1, 2]
+        let mut rat = vec![0xd8, 0x1e, 0x82];
+        rat.extend(cbor_uint(1));
+        rat.extend(cbor_uint(2));
+        data.extend(&rat);
+        let mut r = Reader::new(&data);
+        let g = read_gov_action(&mut r).unwrap();
+        assert!(matches!(g, GovAction::UpdateCommittee { .. }));
+    }
+
+    #[test]
+    fn gov_action_parameter_change_with_empty_update() {
+        // [0, null, {}, null]
+        let mut data = vec![0x84];
+        data.extend(cbor_uint(0));
+        data.push(0xf6); // prev_id
+        data.push(0xa0); // empty pparam update
+        data.push(0xf6); // null policy
+        let mut r = Reader::new(&data);
+        let g = read_gov_action(&mut r).unwrap();
+        assert!(matches!(g, GovAction::ParameterChange { .. }));
+    }
+
+    #[test]
+    fn gov_action_unknown_disc_rejected() {
+        let data = [0x82, 0x18, 0x63, 0xf6]; // [99, null]
+        let mut r = Reader::new(&data);
+        assert!(read_gov_action(&mut r).is_err());
+    }
+
+    #[test]
+    fn gov_action_indefinite_array_rejected() {
+        let data = [0x9f, 0x06, 0xff];
+        let mut r = Reader::new(&data);
+        assert!(read_gov_action(&mut r).is_err());
+    }
+
+    // ── Protocol param update ─────────────────────────────────────────────
+
+    #[test]
+    fn pparam_update_min_fee_a_and_b() {
+        // {0: 100, 1: 200}
+        let mut data = vec![0xa2];
+        data.extend(cbor_uint(0));
+        data.extend(cbor_uint(100));
+        data.extend(cbor_uint(1));
+        data.extend(cbor_uint(200));
+        let mut r = Reader::new(&data);
+        let ppu = read_protocol_param_update(&mut r).unwrap();
+        assert_eq!(ppu.min_fee_a, Some(100));
+        assert_eq!(ppu.min_fee_b, Some(200));
+    }
+
+    #[test]
+    fn pparam_update_unknown_key_skipped() {
+        // {99: 0, 2: 4096}
+        let mut data = vec![0xa2];
+        data.extend(cbor_uint(99));
+        data.extend(cbor_uint(0));
+        data.extend(cbor_uint(2));
+        data.extend(cbor_uint(4096));
+        let mut r = Reader::new(&data);
+        let ppu = read_protocol_param_update(&mut r).unwrap();
+        assert_eq!(ppu.max_block_body_size, Some(4096));
+    }
+
+    // ── Proposal procedure ────────────────────────────────────────────────
+
+    #[test]
+    fn proposal_procedure_decodes() {
+        // [deposit, reward_acct, gov_action=[6], anchor]
+        let mut data = vec![0x84];
+        data.extend(cbor_uint(500_000));
+        data.extend(cbor_bytes(&[0xE0; 29]));
+        data.push(0x81);
+        data.extend(cbor_uint(6)); // InfoAction
+        data.extend(cbor_anchor("a"));
+        let mut r = Reader::new(&data);
+        let pp = read_proposal_procedure(&mut r).unwrap();
+        assert_eq!(pp.deposit.0, 500_000);
+        assert!(matches!(pp.gov_action, GovAction::InfoAction));
+    }
+
+    #[test]
+    fn proposal_procedure_wrong_arity_rejected() {
+        let data = [0x83, 0x00, 0x40, 0x81];
+        let mut r = Reader::new(&data);
+        assert!(read_proposal_procedure(&mut r).is_err());
+    }
+
+    // ── Standalone tx (Conway + Dijkstra) ─────────────────────────────────
+
+    fn build_conway_standalone_tx() -> Vec<u8> {
+        let mut tx = vec![0x84];
+        tx.push(0xa3);
+        tx.extend(cbor_uint(0));
+        tx.push(0x80);
+        tx.extend(cbor_uint(1));
+        tx.push(0x80);
+        tx.extend(cbor_uint(2));
+        tx.extend(cbor_uint(123_456));
+        tx.push(0xa0);
+        tx.push(0xf5);
+        tx.push(0xf6);
+        tx
+    }
+
+    #[test]
+    fn conway_standalone_tx_decodes() {
+        let cbor = build_conway_standalone_tx();
+        let tx = decode_conway_tx_standalone(&cbor, Era::Conway).unwrap();
+        assert_eq!(tx.era, Era::Conway);
+        assert_eq!(tx.body.fee.0, 123_456);
+    }
+
+    #[test]
+    fn dijkstra_standalone_tx_decodes() {
+        let cbor = build_conway_standalone_tx();
+        let tx = decode_conway_tx_standalone(&cbor, Era::Dijkstra).unwrap();
+        assert_eq!(tx.era, Era::Dijkstra);
+    }
+
+    #[test]
+    fn conway_standalone_tx_invalid_flag() {
+        let mut tx = vec![0x84];
+        tx.push(0xa3);
+        tx.extend(cbor_uint(0));
+        tx.push(0x80);
+        tx.extend(cbor_uint(1));
+        tx.push(0x80);
+        tx.extend(cbor_uint(2));
+        tx.extend(cbor_uint(0));
+        tx.push(0xa0);
+        tx.push(0xf4);
+        tx.push(0xf6);
+        let result = decode_conway_tx_standalone(&tx, Era::Conway).unwrap();
+        assert!(!result.is_valid);
+    }
+
+    #[test]
+    fn conway_standalone_tx_rejects_wrong_arity() {
+        let cbor = [0x83, 0xa0, 0xa0, 0xf6];
+        assert!(decode_conway_tx_standalone(&cbor, Era::Conway).is_err());
+    }
+
+    #[test]
+    fn conway_standalone_tx_rejects_indefinite() {
+        assert!(decode_conway_tx_standalone(&[0x9f, 0xff], Era::Conway).is_err());
+    }
+
+    // ── pool_voting_thresholds + drep_voting_thresholds ────────────────────
+
+    #[test]
+    fn pool_voting_thresholds_5_rationals() {
+        // {25: [5 rationals]}
+        let mut data = vec![0xa1];
+        data.extend(cbor_uint(25));
+        data.push(0x85);
+        for _ in 0..5 {
+            let mut rat = vec![0xd8, 0x1e, 0x82];
+            rat.extend(cbor_uint(1));
+            rat.extend(cbor_uint(2));
+            data.extend(&rat);
+        }
+        let mut r = Reader::new(&data);
+        let ppu = read_protocol_param_update(&mut r).unwrap();
+        assert!(ppu.pvt_motion_no_confidence.is_some());
+        assert!(ppu.pvt_pp_security_group.is_some());
+    }
+
+    #[test]
+    fn drep_voting_thresholds_10_rationals() {
+        let mut data = vec![0xa1];
+        data.extend(cbor_uint(26));
+        data.push(0x8a); // array(10)
+        for _ in 0..10 {
+            let mut rat = vec![0xd8, 0x1e, 0x82];
+            rat.extend(cbor_uint(1));
+            rat.extend(cbor_uint(3));
+            data.extend(&rat);
+        }
+        let mut r = Reader::new(&data);
+        let ppu = read_protocol_param_update(&mut r).unwrap();
+        assert!(ppu.dvt_no_confidence.is_some());
+    }
+
+    // ── voting_procedures (whole map) ─────────────────────────────────────
+
+    #[test]
+    fn voting_procedures_decode() {
+        // {voter => {gov_action_id => voting_procedure}}
+        // Build one voter (DRep key 28), one gov_action_id, one procedure (Yes, null).
+        let mut data = vec![0xa1];
+        // voter [2, hash28]
+        data.push(0x82);
+        data.extend(cbor_uint(2));
+        data.extend(cbor_bytes(&[0x44; 28]));
+        // inner map(1)
+        data.push(0xa1);
+        // gov_action_id [tx, idx]
+        data.push(0x82);
+        data.extend(cbor_bytes(&[0; 32]));
+        data.extend(cbor_uint(0));
+        // voting_procedure [Yes, null]
+        data.push(0x82);
+        data.extend(cbor_uint(1));
+        data.push(0xf6);
+        let mut r = Reader::new(&data);
+        let vp = read_voting_procedures(&mut r).unwrap();
+        assert_eq!(vp.len(), 1);
+        let inner = vp.values().next().unwrap();
+        assert_eq!(inner.len(), 1);
+    }
 }
