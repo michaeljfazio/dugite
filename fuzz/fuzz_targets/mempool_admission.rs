@@ -84,7 +84,7 @@ fn build_mempool_tx(
             redeemers: vec![],
             raw_redeemers_cbor: None,
             raw_plutus_data_cbor: None,
-            pallas_script_data_hash: None,
+            original_script_data_hash: None,
         },
         is_valid: true,
         auxiliary_data: None,

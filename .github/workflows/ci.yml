@@ -37,6 +37,14 @@ jobs:
       - name: Build
         run: cargo build --all-targets
 
+      - name: Guard against pallas-network re-entry
+        run: |
+          if cargo tree --workspace --prefix none 2>/dev/null | grep -qi '^pallas-network '; then
+            echo "::error::pallas-network is in the dependency tree; it was removed and must stay removed."
+            cargo tree --workspace -i pallas-network || true
+            exit 1
+          fi
+
       - name: Clippy
         run: cargo clippy --all-targets -- -D warnings
 

@@ -141,8 +141,8 @@ impl ProtocolVersion {
     }
 }
 
-/// A complete block with header and body
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// A complete block with header and body.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Block {
     pub header: BlockHeader,
     pub transactions: Vec<Transaction>,

@@ -696,7 +696,7 @@ impl Transaction {
                 redeemers: vec![],
                 raw_redeemers_cbor: None,
                 raw_plutus_data_cbor: None,
-                pallas_script_data_hash: None,
+                original_script_data_hash: None,
             },
             is_valid: true,
             auxiliary_data: None,
@@ -749,8 +749,8 @@ pub struct TransactionWitnessSet {
     /// Raw CBOR bytes of the redeemers from the original transaction.
     /// Preserves the encoding format (map in Conway, array in Alonzo)
     /// which is essential for correct script_data_hash computation.
-    /// Extracted from pallas during deserialization; None when constructing
-    /// new transactions (which use our canonical encoding).
+    /// Captured during deserialisation; None when constructing new
+    /// transactions (which use our canonical encoding).
     #[serde(skip)]
     pub raw_redeemers_cbor: Option<Vec<u8>>,
     /// Raw CBOR bytes of the plutus datums from the original transaction.
@@ -758,12 +758,12 @@ pub struct TransactionWitnessSet {
     /// which affect the script_data_hash.
     #[serde(skip)]
     pub raw_plutus_data_cbor: Option<Vec<u8>>,
-    /// Pre-computed script_data_hash from pallas during deserialization.
-    /// This uses pallas's ScriptData::hash() which correctly handles all
-    /// encoding variants (map/array redeemers, KeepRaw datums, etc.).
-    /// When available, validation uses this instead of re-computing.
+    /// Pre-computed script_data_hash captured from the wire-CBOR during
+    /// deserialisation. Correctly handles all encoding variants (map/array
+    /// redeemers, raw-preserved datums, etc.). When available, validation
+    /// uses this instead of re-computing from the parsed structures.
     #[serde(skip)]
-    pub pallas_script_data_hash: Option<crate::hash::Hash32>,
+    pub original_script_data_hash: Option<crate::hash::Hash32>,
 }
 
 /// Verification key witness (signature)

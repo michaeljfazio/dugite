@@ -314,7 +314,7 @@ pub fn build_simple_tx(inputs: Vec<TransactionInput>, output_value: u64, fee: u6
             redeemers: vec![],
             raw_redeemers_cbor: None,
             raw_plutus_data_cbor: None,
-            pallas_script_data_hash: None,
+            original_script_data_hash: None,
         },
         is_valid: true,
         auxiliary_data: None,

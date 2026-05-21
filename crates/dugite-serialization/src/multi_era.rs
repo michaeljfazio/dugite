@@ -841,7 +841,7 @@ fn decode_transaction_from_pallas_with_mode(
                 redeemers,
                 raw_redeemers_cbor,
                 raw_plutus_data_cbor,
-                pallas_script_data_hash: None,
+                original_script_data_hash: None,
             }
         }
 
@@ -861,7 +861,7 @@ fn decode_transaction_from_pallas_with_mode(
             redeemers: Vec::new(),
             raw_redeemers_cbor: None,
             raw_plutus_data_cbor: None,
-            pallas_script_data_hash: None,
+            original_script_data_hash: None,
         },
     };
 
@@ -2573,7 +2573,7 @@ mod tests {
             redeemers: Vec::new(),
             raw_redeemers_cbor: None,
             raw_plutus_data_cbor: None,
-            pallas_script_data_hash: None,
+            original_script_data_hash: None,
         };
         // All fields that ApplyOnly mode accesses must be empty.
         assert!(
