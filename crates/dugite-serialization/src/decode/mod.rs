@@ -45,8 +45,12 @@ pub(crate) mod raw;
 #[allow(dead_code)]
 pub(crate) mod reader;
 
-// In-house era decoders (M4a — Byron + Shelley).
+// In-house era decoders (M4a — Byron + Shelley; M4b — Allegra/Mary/Alonzo/Babbage).
+pub(crate) mod era_allegra;
+pub(crate) mod era_alonzo;
+pub(crate) mod era_babbage;
 pub(crate) mod era_byron;
+pub(crate) mod era_mary;
 pub(crate) mod era_shelley;
 
 use crate::decode::block::EraTag;
@@ -78,10 +82,18 @@ fn peek_era_tag(cbor: &[u8]) -> Option<EraTag> {
     }
 }
 
-/// Returns `true` if the era tag identifies a Byron or Shelley era that is
-/// handled by the in-house decoder (M4a).
+/// Returns `true` if the era tag is handled by the in-house decoder (M4a + M4b).
 fn is_inhouse_era(tag: EraTag) -> bool {
-    matches!(tag, EraTag::ByronMain | EraTag::ByronEbb | EraTag::Shelley)
+    matches!(
+        tag,
+        EraTag::ByronMain
+            | EraTag::ByronEbb
+            | EraTag::Shelley
+            | EraTag::Allegra
+            | EraTag::Mary
+            | EraTag::Alonzo
+            | EraTag::Babbage
+    )
 }
 
 // ---------------------------------------------------------------------------

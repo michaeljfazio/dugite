@@ -762,7 +762,7 @@ mod tests {
         // block_sig — use a minimal placeholder: [0, [delegator, signature]]
         // where 0 = ProxySKLight discriminator
         // For our decoder we only read this to skip it
-        let dlg_cert = cbor_arr5(
+        let _dlg_cert = cbor_arr5(
             &cbor_uint(0),           // epoch range start
             &cbor_uint(0),           // epoch range end
             &cbor_bytes(&[0u8; 32]), // issuer

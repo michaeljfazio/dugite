@@ -232,3 +232,150 @@ fn test_non_dijkstra_blocks_unaffected_by_shim() {
         assert_eq!(block.era, era, "{name}: era must be unchanged by shim");
     }
 }
+
+/// Deep field-by-field comparison of Babbage in-house vs pallas decode.
+/// Validates: all tx body fields, witness set, and all header fields.
+#[test]
+fn test_babbage_field_by_field_vs_pallas() {
+    let cbor = load_vector("babbage");
+
+    // Direct decode bypassing dual_decode (which normalizes raw_cbor fields)
+    let inhouse = dugite_serialization::decode::decode_block(&cbor).expect("inhouse decode");
+    let pallas = dugite_serialization::multi_era::decode_block_with_byron_epoch_length(&cbor, 0)
+        .expect("pallas decode");
+
+    assert_eq!(inhouse.era, pallas.era, "era");
+    assert_eq!(inhouse.header.slot, pallas.header.slot, "slot");
+    assert_eq!(
+        inhouse.header.block_number, pallas.header.block_number,
+        "block_number"
+    );
+    assert_eq!(
+        inhouse.transactions.len(),
+        pallas.transactions.len(),
+        "tx count"
+    );
+
+    for (i, (a, b)) in inhouse
+        .transactions
+        .iter()
+        .zip(pallas.transactions.iter())
+        .enumerate()
+    {
+        assert_eq!(a.hash, b.hash, "tx[{i}].hash");
+        assert_eq!(a.is_valid, b.is_valid, "tx[{i}].is_valid");
+        assert_eq!(a.era, b.era, "tx[{i}].era");
+        assert_eq!(a.body.inputs, b.body.inputs, "tx[{i}].inputs");
+        assert_eq!(
+            a.body.outputs.len(),
+            b.body.outputs.len(),
+            "tx[{i}].output count"
+        );
+        for (j, (oa, ob)) in a.body.outputs.iter().zip(b.body.outputs.iter()).enumerate() {
+            assert_eq!(oa.address, ob.address, "tx[{i}].out[{j}].address");
+            assert_eq!(oa.value, ob.value, "tx[{i}].out[{j}].value");
+            assert_eq!(oa.datum, ob.datum, "tx[{i}].out[{j}].datum");
+            assert_eq!(oa.is_legacy, ob.is_legacy, "tx[{i}].out[{j}].is_legacy");
+            assert_eq!(oa.script_ref, ob.script_ref, "tx[{i}].out[{j}].script_ref");
+        }
+        assert_eq!(a.body.fee, b.body.fee, "tx[{i}].fee");
+        assert_eq!(a.body.collateral, b.body.collateral, "tx[{i}].collateral");
+        assert_eq!(
+            a.body
+                .collateral_return
+                .as_ref()
+                .map(|o| (&o.address, &o.value)),
+            b.body
+                .collateral_return
+                .as_ref()
+                .map(|o| (&o.address, &o.value)),
+            "tx[{i}].collateral_return"
+        );
+        assert_eq!(
+            a.body.total_collateral, b.body.total_collateral,
+            "tx[{i}].total_collateral"
+        );
+        assert_eq!(
+            a.body.reference_inputs, b.body.reference_inputs,
+            "tx[{i}].reference_inputs"
+        );
+        assert_eq!(a.body.mint, b.body.mint, "tx[{i}].mint");
+        assert_eq!(
+            a.body.script_data_hash, b.body.script_data_hash,
+            "tx[{i}].script_data_hash"
+        );
+        assert_eq!(
+            a.body.required_signers, b.body.required_signers,
+            "tx[{i}].required_signers"
+        );
+        assert_eq!(
+            a.body.withdrawals, b.body.withdrawals,
+            "tx[{i}].withdrawals"
+        );
+        assert_eq!(
+            a.body.certificates, b.body.certificates,
+            "tx[{i}].certificates"
+        );
+        // Witnesses
+        let aws = &a.witness_set;
+        let bws = &b.witness_set;
+        assert_eq!(aws.vkey_witnesses, bws.vkey_witnesses, "tx[{i}].ws.vkeys");
+        assert_eq!(
+            aws.native_scripts.len(),
+            bws.native_scripts.len(),
+            "tx[{i}].ws.native_scripts len"
+        );
+        assert_eq!(
+            aws.plutus_v1_scripts, bws.plutus_v1_scripts,
+            "tx[{i}].ws.plutus_v1"
+        );
+        assert_eq!(
+            aws.plutus_v2_scripts, bws.plutus_v2_scripts,
+            "tx[{i}].ws.plutus_v2"
+        );
+        assert_eq!(aws.redeemers, bws.redeemers, "tx[{i}].ws.redeemers");
+        assert_eq!(aws.plutus_data, bws.plutus_data, "tx[{i}].ws.plutus_data");
+    }
+    // Block header
+    assert_eq!(
+        inhouse.header.prev_hash, pallas.header.prev_hash,
+        "prev_hash"
+    );
+    assert_eq!(
+        inhouse.header.body_hash, pallas.header.body_hash,
+        "body_hash"
+    );
+    assert_eq!(
+        inhouse.header.body_size, pallas.header.body_size,
+        "body_size"
+    );
+    assert_eq!(
+        inhouse.header.protocol_version, pallas.header.protocol_version,
+        "protocol_version"
+    );
+    assert_eq!(
+        inhouse.header.operational_cert, pallas.header.operational_cert,
+        "opcert"
+    );
+    assert_eq!(
+        inhouse.header.vrf_result, pallas.header.vrf_result,
+        "vrf_result"
+    );
+    assert_eq!(
+        inhouse.header.nonce_vrf_output, pallas.header.nonce_vrf_output,
+        "nonce_vrf_output"
+    );
+    assert_eq!(
+        inhouse.header.nonce_vrf_proof, pallas.header.nonce_vrf_proof,
+        "nonce_vrf_proof"
+    );
+    assert_eq!(
+        inhouse.header.kes_signature, pallas.header.kes_signature,
+        "kes_signature"
+    );
+    assert_eq!(
+        inhouse.header.issuer_vkey, pallas.header.issuer_vkey,
+        "issuer_vkey"
+    );
+    assert_eq!(inhouse.header.vrf_vkey, pallas.header.vrf_vkey, "vrf_vkey");
+}
