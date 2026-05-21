@@ -237,6 +237,62 @@ impl<'b> Reader<'b> {
         }
     }
 
+    /// Iterate the items of an array (definite or indefinite) without buffering
+    /// the items into a `Vec`. Invokes `item(self)` for each element; for an
+    /// indefinite-length array the loop stops at the CBOR break byte. Use this
+    /// when the per-item handling needs the [`Reader`] state directly (e.g. to
+    /// build `KeepRaw` wrappers) and a regular `Vec` of values is undesirable.
+    pub fn for_each_array_item<F>(&mut self, mut item: F) -> Result<(), SerializationError>
+    where
+        F: FnMut(&mut Reader<'b>) -> Result<(), SerializationError>,
+    {
+        let len = self.read_array_header()?;
+        match len {
+            Some(n) => {
+                for _ in 0..n {
+                    item(self)?;
+                }
+            }
+            None => loop {
+                let ty = self.peek_major()?;
+                if ty == Type::Break {
+                    let pos = self.inner.position();
+                    self.inner.set_position(pos + 1);
+                    break;
+                }
+                item(self)?;
+            },
+        }
+        Ok(())
+    }
+
+    /// Iterate the entries of a map (definite or indefinite). The closure must
+    /// consume exactly one CBOR key + one CBOR value per call. For
+    /// indefinite-length maps the loop stops at the CBOR break byte.
+    pub fn for_each_map_entry<F>(&mut self, mut entry: F) -> Result<(), SerializationError>
+    where
+        F: FnMut(&mut Reader<'b>) -> Result<(), SerializationError>,
+    {
+        let len = self.read_map_header()?;
+        match len {
+            Some(n) => {
+                for _ in 0..n {
+                    entry(self)?;
+                }
+            }
+            None => loop {
+                let ty = self.peek_major()?;
+                if ty == Type::Break {
+                    let pos = self.inner.position();
+                    self.inner.set_position(pos + 1);
+                    break;
+                }
+                entry(self)?;
+            },
+        }
+        Ok(())
+    }
+
     /// Read a definite- or indefinite-length CBOR map, decoding each key-value pair.
     ///
     /// Entries are returned in the order they appear in the input; no deduplication
