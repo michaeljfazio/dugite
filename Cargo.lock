@@ -1388,7 +1388,6 @@ dependencies = [
  "minicbor 0.26.5",
  "num-bigint",
  "num-traits",
- "pallas-addresses 1.0.0-alpha.6",
  "pallas-codec 1.0.0-alpha.6",
  "pallas-crypto 1.0.0-alpha.6",
  "pallas-primitives 1.0.0-alpha.6",
