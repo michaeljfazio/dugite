@@ -57,6 +57,15 @@ use crate::haskell_snapshot::types::{
 use dugite_primitives::hash::{Hash28, Hash32};
 use std::collections::HashMap;
 
+/// Maximum number of pool owners we accept on snapshot decode (#554 cap).
+/// Real pools have 1-3 owners; 1024 is far beyond any conceivable real value
+/// and far below any allocation-bomb threshold.
+const MAX_POOL_OWNERS: usize = 1024;
+
+/// Maximum number of pool relays we accept on snapshot decode (#554 cap).
+/// Real pools typically advertise 1-6 relays; 1024 is generous.
+const MAX_POOL_RELAYS: usize = 1024;
+
 /// Decode a complete `SnapShots = array(4) [mark, set, go, fee]`.
 ///
 /// Returns `(snapshots, bytes_consumed)`.
@@ -337,7 +346,14 @@ fn decode_legacy_snapshot_pool(
     off += n;
     let (owners_len, n) = decode_array_len(&data[off..])?;
     off += n;
-    let mut owners = Vec::with_capacity(owners_len);
+    // #554: cap declared length to prevent allocation bomb via tampered
+    // snapshot. Real pools have at most a few owners; 1024 is generous.
+    let owners_cap = super::cbor_utils::bounded_alloc_capacity(
+        owners_len,
+        MAX_POOL_OWNERS,
+        data.len().saturating_sub(off),
+    )?;
+    let mut owners = Vec::with_capacity(owners_cap);
     for _ in 0..owners_len {
         let (hash, n) = decode_hash28(&data[off..])?;
         off += n;
@@ -347,7 +363,13 @@ fn decode_legacy_snapshot_pool(
     // [7] relays: array([relay])
     let (relays_len, n) = decode_array_len(&data[off..])?;
     off += n;
-    let mut relays = Vec::with_capacity(relays_len);
+    // #554: same cap rationale as owners.
+    let relays_cap = super::cbor_utils::bounded_alloc_capacity(
+        relays_len,
+        MAX_POOL_RELAYS,
+        data.len().saturating_sub(off),
+    )?;
+    let mut relays = Vec::with_capacity(relays_cap);
     for _ in 0..relays_len {
         let (relay, n) = decode_relay(&data[off..])?;
         off += n;

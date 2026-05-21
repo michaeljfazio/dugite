@@ -789,3 +789,100 @@ proptest! {
         let _ = dugite_serialization::decode_transaction(era_id, &data);
     }
 }
+
+// ===========================================================================
+// Length-lattice property tests for bounded CBOR decoders (#554)
+// ===========================================================================
+//
+// For any (declared_len, actual_payload_bytes) pair, the bounded metadatum
+// decoder must either succeed (when both caps satisfied) or fail gracefully
+// (when either cap exceeded). It must never panic and never allocate more
+// than `MAX_METADATA_ENTRIES` elements.
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(2000))]
+
+    /// Length-lattice for bounded metadatum array decoder.
+    ///
+    /// Walks the lattice of (declared_len, available_bytes) and asserts:
+    /// - if both bounds are satisfied → decode succeeds and returns
+    ///   exactly `declared_len` zero-int elements.
+    /// - else → decode fails gracefully (no panic, no oversized alloc).
+    #[test]
+    fn prop_metadatum_length_lattice_array(
+        // Cover small, mid, very-large, and u64::MAX-class lengths.
+        declared in prop_oneof![
+            0u64..=20,
+            1000u64..=20_000,
+            (u32::MAX as u64 - 8)..=u32::MAX as u64,
+            (u64::MAX - 8)..=u64::MAX,
+        ],
+        actual_bytes in 0usize..=512,
+    ) {
+        use dugite_serialization::decode_bounded::{
+            decode_metadatum_from_bytes, MAX_METADATA_ENTRIES,
+        };
+
+        // Build CBOR: array(declared) followed by `actual_bytes` 0x00 bytes
+        // (each is a single CBOR int = 0 = 0x00).
+        let mut buf = Vec::new();
+        let mut enc = minicbor::Encoder::new(&mut buf);
+        enc.array(declared).unwrap();
+        for _ in 0..actual_bytes {
+            buf.push(0x00);
+        }
+
+        let result = decode_metadatum_from_bytes(&buf);
+
+        if declared <= MAX_METADATA_ENTRIES
+            && declared as usize <= actual_bytes
+        {
+            prop_assert!(result.is_ok(), "expected success for declared={declared} bytes={actual_bytes}, got {:?}", result.err());
+        } else {
+            prop_assert!(result.is_err(), "expected reject for declared={declared} bytes={actual_bytes}");
+        }
+    }
+
+    /// Same lattice for maps.
+    #[test]
+    fn prop_metadatum_length_lattice_map(
+        declared in prop_oneof![
+            0u64..=20,
+            1000u64..=20_000,
+            (u32::MAX as u64 - 8)..=u32::MAX as u64,
+            (u64::MAX - 8)..=u64::MAX,
+        ],
+        actual_pairs in 0usize..=256,
+    ) {
+        use dugite_serialization::decode_bounded::{
+            decode_metadatum_from_bytes, MAX_METADATA_ENTRIES,
+        };
+
+        // Build CBOR: map(declared) followed by `actual_pairs * 2` 0x00
+        // bytes (each pair is key=0 value=0).
+        let mut buf = Vec::new();
+        let mut enc = minicbor::Encoder::new(&mut buf);
+        enc.map(declared).unwrap();
+        for _ in 0..actual_pairs * 2 {
+            buf.push(0x00);
+        }
+
+        let result = decode_metadatum_from_bytes(&buf);
+
+        if declared <= MAX_METADATA_ENTRIES
+            && declared as usize <= actual_pairs
+        {
+            prop_assert!(result.is_ok(), "expected success for declared={declared} pairs={actual_pairs}, got {:?}", result.err());
+        } else {
+            prop_assert!(result.is_err(), "expected reject for declared={declared} pairs={actual_pairs}");
+        }
+    }
+
+    /// Random raw bytes: bounded metadatum decoder never panics.
+    #[test]
+    fn prop_metadatum_no_panic_random_input(
+        data in prop::collection::vec(any::<u8>(), 0..=1024),
+    ) {
+        let _ = dugite_serialization::decode_bounded::decode_metadatum_from_bytes(&data);
+    }
+}

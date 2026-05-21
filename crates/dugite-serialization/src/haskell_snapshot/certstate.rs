@@ -14,6 +14,7 @@
 //! [`HaskellCertState`].
 
 use crate::error::SerializationError;
+use crate::haskell_snapshot::cbor_utils::bounded_alloc_capacity;
 use crate::haskell_snapshot::cbor_utils::{
     decode_array_len, decode_bytes, decode_credential, decode_hash28, decode_hash32, decode_int,
     decode_null, decode_rational, decode_text, decode_uint, skip_cbor_value, MapReader,
@@ -25,6 +26,12 @@ use crate::haskell_snapshot::types::{
 use dugite_primitives::hash::{Hash28, Hash32};
 use dugite_primitives::time::EpochNo;
 use std::collections::HashMap;
+
+/// Maximum pool owners — #554 cap, see snapshots.rs for rationale.
+const MAX_POOL_OWNERS: usize = 1024;
+
+/// Maximum pool relays — #554 cap, see snapshots.rs for rationale.
+const MAX_POOL_RELAYS: usize = 1024;
 
 /// Decode a complete `CertState = array(3) [VState, PState, DState]`.
 ///
@@ -362,7 +369,10 @@ fn decode_stake_pool_state(
     off += n_owners;
     let (owners_len, n) = decode_array_len(&data[off..])?;
     off += n;
-    let mut owners = Vec::with_capacity(owners_len);
+    // #554: cap declared length to prevent allocation bomb via tampered snapshot.
+    let owners_cap =
+        bounded_alloc_capacity(owners_len, MAX_POOL_OWNERS, data.len().saturating_sub(off))?;
+    let mut owners = Vec::with_capacity(owners_cap);
     for _ in 0..owners_len {
         let (hash, n) = decode_hash28(&data[off..])?;
         off += n;
@@ -372,7 +382,10 @@ fn decode_stake_pool_state(
     // [6] relays: array of relay encodings
     let (relays_len, n) = decode_array_len(&data[off..])?;
     off += n;
-    let mut relays = Vec::with_capacity(relays_len);
+    // #554: cap declared length to prevent allocation bomb via tampered snapshot.
+    let relays_cap =
+        bounded_alloc_capacity(relays_len, MAX_POOL_RELAYS, data.len().saturating_sub(off))?;
+    let mut relays = Vec::with_capacity(relays_cap);
     for _ in 0..relays_len {
         let (relay, n) = decode_relay(&data[off..])?;
         off += n;
@@ -532,7 +545,10 @@ fn decode_legacy_pool_state_array9(
     off += n_owners;
     let (owners_len, n) = decode_array_len(&data[off..])?;
     off += n;
-    let mut owners = Vec::with_capacity(owners_len);
+    // #554: cap declared length to prevent allocation bomb via tampered snapshot.
+    let owners_cap =
+        bounded_alloc_capacity(owners_len, MAX_POOL_OWNERS, data.len().saturating_sub(off))?;
+    let mut owners = Vec::with_capacity(owners_cap);
     for _ in 0..owners_len {
         let (hash, n) = decode_hash28(&data[off..])?;
         off += n;
@@ -541,7 +557,10 @@ fn decode_legacy_pool_state_array9(
 
     let (relays_len, n) = decode_array_len(&data[off..])?;
     off += n;
-    let mut relays = Vec::with_capacity(relays_len);
+    // #554: cap declared length to prevent allocation bomb via tampered snapshot.
+    let relays_cap =
+        bounded_alloc_capacity(relays_len, MAX_POOL_RELAYS, data.len().saturating_sub(off))?;
+    let mut relays = Vec::with_capacity(relays_cap);
     for _ in 0..relays_len {
         let (relay, n) = decode_relay(&data[off..])?;
         off += n;
@@ -635,7 +654,10 @@ fn decode_pool_params_array9(
     off += n_owners;
     let (owners_len, n) = decode_array_len(&data[off..])?;
     off += n;
-    let mut owners = Vec::with_capacity(owners_len);
+    // #554: cap declared length to prevent allocation bomb via tampered snapshot.
+    let owners_cap =
+        bounded_alloc_capacity(owners_len, MAX_POOL_OWNERS, data.len().saturating_sub(off))?;
+    let mut owners = Vec::with_capacity(owners_cap);
     for _ in 0..owners_len {
         let (hash, n) = decode_hash28(&data[off..])?;
         off += n;
@@ -645,7 +667,10 @@ fn decode_pool_params_array9(
     // [7] relays: array of relay encodings
     let (relays_len, n) = decode_array_len(&data[off..])?;
     off += n;
-    let mut relays = Vec::with_capacity(relays_len);
+    // #554: cap declared length to prevent allocation bomb via tampered snapshot.
+    let relays_cap =
+        bounded_alloc_capacity(relays_len, MAX_POOL_RELAYS, data.len().saturating_sub(off))?;
+    let mut relays = Vec::with_capacity(relays_cap);
     for _ in 0..relays_len {
         let (relay, n) = decode_relay(&data[off..])?;
         off += n;

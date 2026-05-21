@@ -278,3 +278,9 @@ doc = false
 name = "fuzz_cbor_skip_value_depth"
 path = "fuzz_targets/cbor_skip_value_depth.rs"
 doc = false
+
+# D7 / #554: tx metadata CBOR decoder allocation cap
+[[bin]]
+name = "fuzz_tx_metadata_decode"
+path = "fuzz_targets/tx_metadata_decode.rs"
+doc = false

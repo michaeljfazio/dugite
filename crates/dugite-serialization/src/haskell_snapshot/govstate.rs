@@ -34,11 +34,18 @@ use dugite_primitives::hash::Hash28;
 use dugite_primitives::protocol_params::ProtocolParameters;
 
 use super::cbor_utils::{
-    decode_array_len, decode_bytes, decode_credential, decode_hash32, decode_map_len,
-    decode_rational, decode_text, decode_uint, skip_cbor_value,
+    bounded_alloc_capacity, decode_array_len, decode_bytes, decode_credential, decode_hash32,
+    decode_map_len, decode_rational, decode_text, decode_uint, skip_cbor_value,
 };
 use super::pparams::decode_pparams;
 use super::types::{HaskellConstitution, HaskellGovState};
+
+/// Maximum constitutional committee members we accept on snapshot decode.
+/// CIP-1694 caps the committee at `committeeMaxTermLength`-many members; the
+/// largest realistic value is in the hundreds. 4096 is generous headroom.
+///
+/// #554: prevents allocation-bomb attacks via tampered gov-state.
+const MAX_COMMITTEE_MEMBERS: usize = 4096;
 
 // ── Public entry point ──────────────────────────────────────────────────────
 
@@ -372,7 +379,13 @@ pub fn decode_committee(data: &[u8]) -> Result<(HaskellCommittee, usize), Serial
         )
     })?;
 
-    let mut members: Vec<CommitteeMember> = Vec::with_capacity(map_len);
+    // #554: cap declared length to prevent allocation bomb via tampered gov-state.
+    let members_cap = bounded_alloc_capacity(
+        map_len,
+        MAX_COMMITTEE_MEMBERS,
+        data.len().saturating_sub(off),
+    )?;
+    let mut members: Vec<CommitteeMember> = Vec::with_capacity(members_cap);
     for _ in 0..map_len {
         let (cred, n) = decode_credential(&data[off..])?;
         off += n;

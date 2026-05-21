@@ -518,6 +518,15 @@ pub fn decode_cost_models(data: &[u8]) -> Result<(CostModels, usize), Serializat
     ))
 }
 
+/// Defensive ceiling on the number of entries in a single Plutus cost model
+/// array. The current Plutus V3 cost model has ~250 entries; future Plutus
+/// versions may add more, but never thousands. 4096 is generous headroom.
+///
+/// Without this cap, a corrupted Mithril snapshot or peer-controlled gov-state
+/// download could declare `array(u64::MAX)` and force `Vec::with_capacity` to
+/// attempt a huge allocation (systemic pattern #5 from audit #548 / #554).
+const MAX_COST_MODEL_ENTRIES: usize = 4096;
+
 /// Decode an array of signed cost-model integers, returning `(values, bytes_consumed)`.
 ///
 /// Each entry is decoded as a signed integer (`decode_int`) to correctly
@@ -526,6 +535,11 @@ pub fn decode_cost_models(data: &[u8]) -> Result<(CostModels, usize), Serializat
 ///
 /// Supports both definite-length and indefinite-length CBOR arrays, since the
 /// Haskell node may use either encoding depending on the serialisation path.
+///
+/// **Cap (#554):** the declared length is checked against
+/// `MAX_COST_MODEL_ENTRIES` BEFORE `Vec::with_capacity` to prevent
+/// allocation-bomb attacks on the snapshot loader. Indefinite arrays grow
+/// organically and are capped during iteration.
 fn decode_cost_array(data: &[u8]) -> Result<(Vec<i64>, usize), SerializationError> {
     let mut off = 0;
 
@@ -534,6 +548,20 @@ fn decode_cost_array(data: &[u8]) -> Result<(Vec<i64>, usize), SerializationErro
 
     match maybe_len {
         Some(arr_len) => {
+            // #554: cap BEFORE allocating.
+            if arr_len > MAX_COST_MODEL_ENTRIES {
+                return Err(SerializationError::CborDecode(format!(
+                    "cost array declared length {arr_len} exceeds max {MAX_COST_MODEL_ENTRIES}"
+                )));
+            }
+            // Also check physical realisability: each entry is at least 1
+            // byte, so arr_len > data.len() - off is impossible.
+            let remaining = data.len().saturating_sub(off);
+            if arr_len > remaining {
+                return Err(SerializationError::CborDecode(format!(
+                    "cost array declared length {arr_len} exceeds remaining input bytes ({remaining})"
+                )));
+            }
             let mut costs = Vec::with_capacity(arr_len);
             for _ in 0..arr_len {
                 let (v, n) = decode_int(&data[off..])?;
@@ -543,9 +571,15 @@ fn decode_cost_array(data: &[u8]) -> Result<(Vec<i64>, usize), SerializationErro
             Ok((costs, off))
         }
         None => {
-            // Indefinite-length array: read until break byte 0xff.
+            // Indefinite-length array: read until break byte 0xff. Cap the
+            // total element count to mirror the definite path.
             let mut costs = Vec::new();
             while off < data.len() && data[off] != 0xff {
+                if costs.len() >= MAX_COST_MODEL_ENTRIES {
+                    return Err(SerializationError::CborDecode(format!(
+                        "cost array (indefinite) exceeded max {MAX_COST_MODEL_ENTRIES} entries"
+                    )));
+                }
                 let (v, n) = decode_int(&data[off..])?;
                 off += n;
                 costs.push(v);
@@ -598,5 +632,70 @@ pub fn decode_min_fee_ref_script(data: &[u8]) -> Result<(u64, usize), Serializat
         // Plain uint fallback
         let (v, n) = decode_uint(data)?;
         Ok((v, n))
+    }
+}
+
+#[cfg(test)]
+mod cap_tests {
+    //! #554 allocation-cap tests for the haskell_snapshot pparams decoder.
+    use super::*;
+
+    #[test]
+    fn cost_array_rejects_declared_u32_max() {
+        // CBOR array header with definite length 0xffff_ffff (u32::MAX)
+        let bytes: Vec<u8> = vec![0x9a, 0xff, 0xff, 0xff, 0xff];
+        let err = decode_cost_array(&bytes).unwrap_err();
+        let msg = format!("{err:?}");
+        assert!(msg.contains("exceeds"), "got: {msg}");
+    }
+
+    #[test]
+    fn cost_array_rejects_declared_u64_max() {
+        // CBOR array header with definite length u64::MAX
+        let bytes: Vec<u8> = vec![0x9b, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff];
+        let err = decode_cost_array(&bytes).unwrap_err();
+        assert!(format!("{err:?}").contains("exceeds"));
+    }
+
+    #[test]
+    fn cost_array_rejects_declared_just_over_max() {
+        // 4097 entries — one over MAX_COST_MODEL_ENTRIES
+        let mut bytes = Vec::new();
+        bytes.push(0x9a); // array, 4-byte length follows
+        bytes.extend_from_slice(&((MAX_COST_MODEL_ENTRIES + 1) as u32).to_be_bytes());
+        // append a single 0 byte so the remaining-bytes check doesn't fire
+        // first (we want to verify the protocol-cap check)
+        bytes.extend(std::iter::repeat_n(0x00, MAX_COST_MODEL_ENTRIES + 1));
+        let err = decode_cost_array(&bytes).unwrap_err();
+        assert!(format!("{err:?}").contains("exceeds max"));
+    }
+
+    #[test]
+    fn cost_array_accepts_at_max() {
+        // Exactly MAX_COST_MODEL_ENTRIES entries of 0x00 — must succeed.
+        let mut bytes = Vec::new();
+        bytes.push(0x9a);
+        bytes.extend_from_slice(&(MAX_COST_MODEL_ENTRIES as u32).to_be_bytes());
+        bytes.extend(std::iter::repeat_n(0x00, MAX_COST_MODEL_ENTRIES));
+        let (costs, _) = decode_cost_array(&bytes).unwrap();
+        assert_eq!(costs.len(), MAX_COST_MODEL_ENTRIES);
+    }
+
+    #[test]
+    fn cost_array_rejects_physical_impossibility() {
+        // Declares 100 entries but only 5 bytes of input — impossible.
+        let bytes: Vec<u8> = vec![0x98, 100, 0, 0, 0, 0];
+        let err = decode_cost_array(&bytes).unwrap_err();
+        assert!(format!("{err:?}").contains("exceeds"));
+    }
+
+    #[test]
+    fn cost_array_indefinite_capped() {
+        // Indefinite array of MAX_COST_MODEL_ENTRIES + 1 zero entries.
+        let mut bytes = vec![0x9f]; // indefinite array marker
+        bytes.extend(std::iter::repeat_n(0x00, MAX_COST_MODEL_ENTRIES + 1));
+        bytes.push(0xff); // break
+        let err = decode_cost_array(&bytes).unwrap_err();
+        assert!(format!("{err:?}").contains("exceeded max"));
     }
 }
