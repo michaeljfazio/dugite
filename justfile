@@ -134,6 +134,27 @@ stress-relay:
 benchmark-pipeline:
     ./scripts/validation/benchmark-pipeline-depth.sh
 
+# ─── Dual-decode validation (M5 pallas-removal infrastructure) ───────────────
+
+# Local smoke run: serialization tests with DUGITE_DUAL_DECODE=panic (mirrors the PR CI job).
+dual-decode-smoke:
+    DUGITE_DUAL_DECODE=panic \
+    cargo nextest run \
+      -p dugite-serialization \
+      --features dugite-serialization/pallas-shadow-decode \
+      --no-fail-fast
+
+# Run the dual-decode soak on NETWORK (preview|preprod|mainnet|devnet).
+# Pass MAX_BLOCKS as second arg to limit blocks applied (0 = unlimited).
+# Accepts extra flags: --with-mithril
+dual-decode-soak NETWORK="preview" MAX_BLOCKS="0" *FLAGS="":
+    ./scripts/validation/dual-decode-soak.sh {{NETWORK}} {{MAX_BLOCKS}} {{FLAGS}}
+
+# Summarise mismatch artefacts in DIR (default ./dual_decode_mismatches/).
+# Exits 0 if clean, 1 if mismatches present.
+dual-decode-report DIR="./dual_decode_mismatches":
+    python3 ./scripts/validation/dual-decode-report.py {{DIR}}
+
 # ─── Dev / release ───────────────────────────────────────────────────────────
 
 # Regenerate docs/src/reference/third-party-licenses.md.
