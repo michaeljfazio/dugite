@@ -30,7 +30,11 @@
 //! | 7   | Conway     | Governance (CIP-1694), Plutus V3                   |
 //! | 8   | Dijkstra   | Peras + new TxBody keys 14/23/25/26                |
 
+use crate::decode::era_allegra;
+use crate::decode::era_alonzo;
+use crate::decode::era_babbage;
 use crate::decode::era_byron;
+use crate::decode::era_mary;
 use crate::decode::era_shelley;
 use crate::decode::reader::Reader;
 use crate::error::SerializationError;
@@ -205,7 +209,8 @@ pub fn decode_block_envelope<'b>(
 /// # Status
 ///
 /// - M4a: Byron (eras 0/1) and Shelley (era 2) are implemented in-house.
-/// - M4b/c (Allegra–Dijkstra): still delegate via `unimplemented!()`.
+/// - M4b: Allegra (era 3), Mary (era 4), Alonzo (era 5), Babbage (era 6) implemented.
+/// - M4c (Conway/Dijkstra): still delegate via `unimplemented!()`.
 ///
 /// # Errors
 ///
@@ -229,16 +234,32 @@ pub fn decode_block(
             }
         }
         EraTag::Allegra => {
-            unimplemented!("M4b: Allegra decoder not yet implemented")
+            if minimal {
+                era_allegra::decode_allegra_block_minimal(inner_cbor)
+            } else {
+                era_allegra::decode_allegra_block(inner_cbor)
+            }
         }
         EraTag::Mary => {
-            unimplemented!("M4b: Mary decoder not yet implemented")
+            if minimal {
+                era_mary::decode_mary_block_minimal(inner_cbor)
+            } else {
+                era_mary::decode_mary_block(inner_cbor)
+            }
         }
         EraTag::Alonzo => {
-            unimplemented!("M4b: Alonzo decoder not yet implemented")
+            if minimal {
+                era_alonzo::decode_alonzo_block_minimal(inner_cbor)
+            } else {
+                era_alonzo::decode_alonzo_block(inner_cbor)
+            }
         }
         EraTag::Babbage => {
-            unimplemented!("M4b: Babbage decoder not yet implemented")
+            if minimal {
+                era_babbage::decode_babbage_block_minimal(inner_cbor)
+            } else {
+                era_babbage::decode_babbage_block(inner_cbor)
+            }
         }
         EraTag::Conway => {
             unimplemented!("M4c: Conway decoder not yet implemented")
