@@ -459,12 +459,18 @@ fn skip_cbor_value_depth(data: &[u8], depth: usize) -> Result<usize, Serializati
                 // Indefinite-length array
                 let mut off = 1;
                 while off < data.len() && data[off] != 0xff {
+                    if off > data.len() {
+                        return Err(eof());
+                    }
                     off += skip_cbor_value_depth(&data[off..], depth + 1)?;
                 }
                 Ok(off + 1) // +1 for the break byte 0xff
             } else {
                 let (count, mut off) = decode_uint_info(data, info)?;
                 for _ in 0..count {
+                    if off > data.len() {
+                        return Err(eof());
+                    }
                     off += skip_cbor_value_depth(&data[off..], depth + 1)?;
                 }
                 Ok(off)
@@ -475,14 +481,26 @@ fn skip_cbor_value_depth(data: &[u8], depth: usize) -> Result<usize, Serializati
             if info == 31 {
                 let mut off = 1;
                 while off < data.len() && data[off] != 0xff {
+                    if off > data.len() {
+                        return Err(eof());
+                    }
                     off += skip_cbor_value_depth(&data[off..], depth + 1)?; // key
+                    if off > data.len() {
+                        return Err(eof());
+                    }
                     off += skip_cbor_value_depth(&data[off..], depth + 1)?; // value
                 }
                 Ok(off + 1) // +1 for the break byte 0xff
             } else {
                 let (count, mut off) = decode_uint_info(data, info)?;
                 for _ in 0..count {
+                    if off > data.len() {
+                        return Err(eof());
+                    }
                     off += skip_cbor_value_depth(&data[off..], depth + 1)?; // key
+                    if off > data.len() {
+                        return Err(eof());
+                    }
                     off += skip_cbor_value_depth(&data[off..], depth + 1)?; // value
                 }
                 Ok(off)
@@ -491,6 +509,9 @@ fn skip_cbor_value_depth(data: &[u8], depth: usize) -> Result<usize, Serializati
         // Tag: skip the tag header then skip the tagged value
         6 => {
             let (_, n) = decode_uint_info(data, info)?;
+            if n > data.len() {
+                return Err(eof());
+            }
             let inner = skip_cbor_value_depth(&data[n..], depth + 1)?;
             Ok(n + inner)
         }

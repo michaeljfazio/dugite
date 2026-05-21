@@ -509,6 +509,16 @@ impl<'b> Reader<'b> {
             .map_err(|e| SerializationError::CborDecode(format!("null: {e}")))
     }
 
+    /// Peek at the CBOR tag value at the current position **without** advancing.
+    ///
+    /// Returns an error if the current value is not a tag.
+    pub fn probe_tag(&mut self) -> Result<u64, SerializationError> {
+        let saved = self.inner.position();
+        let tag_val = self.read_tag()?;
+        self.inner.set_position(saved);
+        Ok(tag_val)
+    }
+
     /// Expect a specific CBOR tag at the current position and consume it.
     ///
     /// Advances past the tag header. Returns an error if the tag value does not

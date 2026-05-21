@@ -492,11 +492,22 @@ fn decode_block_inner(
         convert_era(pallas_block.era())
     };
     let header = decode_block_header(&pallas_block, byron_epoch_length)?;
-    let transactions = pallas_block
+    let mut transactions = pallas_block
         .txs()
         .iter()
         .map(|tx| decode_transaction_from_pallas_with_mode(tx, mode))
         .collect::<Result<Vec<_>, _>>()?;
+
+    // The Dijkstra shim patches the outer era tag 8→7 so that pallas decodes
+    // the block as Conway.  Pallas therefore labels each transaction Era::Conway,
+    // but they belong to a Dijkstra block, so we override the per-tx era to
+    // match the block era.  This keeps pallas and in-house tx.era fields
+    // consistent (both Dijkstra) for the dual-decode comparator.
+    if dijkstra {
+        for tx in &mut transactions {
+            tx.era = Era::Dijkstra;
+        }
+    }
 
     Ok(Block {
         header,
