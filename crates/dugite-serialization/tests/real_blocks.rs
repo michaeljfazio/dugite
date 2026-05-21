@@ -236,7 +236,10 @@ fn test_non_dijkstra_blocks_dispatch_correctly() {
     ] {
         let cbor = load_vector(name);
         let block = decode_block(&cbor).unwrap_or_else(|e| panic!("{name}: decode failed: {e}"));
-        assert_eq!(block.era, era, "{name}: era must be unaffected by Dijkstra dispatch");
+        assert_eq!(
+            block.era, era,
+            "{name}: era must be unaffected by Dijkstra dispatch"
+        );
     }
 }
 
