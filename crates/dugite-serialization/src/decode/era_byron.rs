@@ -287,6 +287,7 @@ fn decode_byron_tx(
         donation: None,
         sub_transactions: Vec::new(),
         account_balance_intervals: Vec::new(),
+        direct_deposits: BTreeMap::new(),
     };
 
     Ok(Transaction {

@@ -104,6 +104,7 @@ fn minimal_body() -> TransactionBody {
         donation: None,
         sub_transactions: vec![],
         account_balance_intervals: vec![],
+        direct_deposits: ::std::collections::BTreeMap::new(),
     }
 }
 

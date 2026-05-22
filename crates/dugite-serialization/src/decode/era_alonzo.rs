@@ -489,6 +489,7 @@ pub(crate) fn decode_alonzo_tx_body(
         donation: None,
         sub_transactions: Vec::new(),          // Dijkstra+
         account_balance_intervals: Vec::new(), // Dijkstra+
+        direct_deposits: BTreeMap::new(),      // Dijkstra+
     })
 }
 
