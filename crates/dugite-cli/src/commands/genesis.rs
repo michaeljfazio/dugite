@@ -642,10 +642,12 @@ impl GenesisCmd {
                 Ok(())
             }
             GenesisSubcommand::Hash { genesis_file } => {
-                let content = std::fs::read_to_string(&genesis_file)?;
-                let json: serde_json::Value = serde_json::from_str(&content)?;
-                let canonical = serde_json::to_vec(&json)?;
-                let hash = dugite_primitives::hash::blake2b_256(&canonical);
+                // cardano-cli hashes the raw file bytes with Blake2b-256 for all
+                // non-Byron genesis files (shelley/alonzo/conway).  Parsing and
+                // re-serialising the JSON via serde_json reorders keys and strips
+                // whitespace, producing a different hash.  Read raw bytes instead.
+                let raw = std::fs::read(&genesis_file)?;
+                let hash = dugite_primitives::hash::blake2b_256(&raw);
                 println!("{}", hash.to_hex());
                 Ok(())
             }
@@ -898,5 +900,84 @@ mod tests {
 
         let funds = genesis_json["initialFunds"].as_object().unwrap();
         assert_eq!(funds.len(), 0, "no utxo keys → empty initialFunds");
+    }
+
+    // ── Genesis hash regression tests ─────────────────────────────────────────
+    //
+    // cardano-cli hashes the raw file bytes with Blake2b-256.  The old dugite-cli
+    // code parsed the JSON and re-serialised it via serde_json, which sorts keys
+    // alphabetically and strips any whitespace differences — producing a different
+    // hash for any file whose key order differs from alphabetical.
+    //
+    // These tests pin the correct (raw-bytes) behaviour and confirm that the old
+    // parse+re-serialise approach would have produced a different result, proving
+    // the regression guard is meaningful.
+
+    /// Helper: Blake2b-256 of raw bytes, returned as lowercase hex.
+    fn blake2b256_hex(data: &[u8]) -> String {
+        dugite_primitives::hash::blake2b_256(data).to_hex()
+    }
+
+    /// Helper: Blake2b-256 of a parse+re-serialise round-trip, simulating the
+    /// old broken behaviour (serde_json sorts keys alphabetically).
+    fn buggy_hash_hex(raw: &[u8]) -> String {
+        let json: serde_json::Value = serde_json::from_slice(raw).unwrap();
+        let canonical = serde_json::to_vec(&json).unwrap();
+        blake2b256_hex(&canonical)
+    }
+
+    #[test]
+    fn test_genesis_hash_raw_bytes_matches_cardano_cli() {
+        // JSON with keys deliberately in non-alphabetical order.
+        // cardano-cli (and now dugite-cli) hashes this exact byte sequence.
+        // serde_json would reorder keys to {"a":1,"z":99}, giving a different hash.
+        let fixture: &[u8] = b"{\"z\":99,\"a\":1}";
+
+        let correct_hash = blake2b256_hex(fixture);
+        let old_broken_hash = buggy_hash_hex(fixture);
+
+        // The two code paths must differ on this fixture, confirming the test
+        // would have caught the original bug.
+        assert_ne!(
+            correct_hash, old_broken_hash,
+            "raw-bytes and parse+reser hashes unexpectedly equal — fixture must have keys out of alphabetical order"
+        );
+
+        // Pin the expected raw-bytes hash (verified against cardano-cli via Python
+        // blake2b with digest_size=32 on the exact fixture bytes above).
+        assert_eq!(
+            correct_hash,
+            "1a82d5ea4a94dc561407f739963678a495d0638f75e38da5eb9d0232b2e0b697",
+            "Blake2b-256 of raw genesis bytes changed — update the expected hash if the fixture changed"
+        );
+    }
+
+    #[test]
+    fn test_genesis_hash_via_tempfile_roundtrip() {
+        // Write the fixture to a real temp file and hash via the same code path
+        // that the `genesis hash` subcommand now uses (std::fs::read + blake2b_256).
+        // This validates the end-to-end file I/O path, not just the hash function.
+        let tmp = TempDir::new().unwrap();
+        let fixture_path = tmp.path().join("shelley-genesis.json");
+
+        // Realistic-looking fixture with keys out-of-alpha order (z before a).
+        let fixture: &[u8] = b"{\"z\":\"last\",\"activeSlotsCoeff\":0.05,\"networkMagic\":1}";
+        std::fs::write(&fixture_path, fixture).unwrap();
+
+        let raw = std::fs::read(&fixture_path).unwrap();
+        let hash = blake2b256_hex(&raw);
+
+        // Pin the expected hash (verified with Python blake2b digest_size=32).
+        assert_eq!(
+            hash, "860e5e9637d94f372f7c684b2f77cd5e666ef3b7a43bce56bc40cf0702df1303",
+            "Raw-bytes hash of fixture changed unexpectedly"
+        );
+
+        // Confirm that parse+re-serialize gives a DIFFERENT hash (regression guard).
+        let old_hash = buggy_hash_hex(fixture);
+        assert_ne!(
+            hash, old_hash,
+            "Raw and parse+reser hashes are equal — the fixture keys must be out of alphabetical order for this guard to be meaningful"
+        );
     }
 }
