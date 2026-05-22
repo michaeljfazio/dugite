@@ -17,7 +17,7 @@ use super::certificate::encode_rational;
 ///   24: min_committee_size, 25: committee_term_limit, 26: gov_action_lifetime,
 ///   27: gov_action_deposit, 28: drep_deposit, 29: drep_activity,
 ///   30: min_fee_ref_script_cost_per_byte
-pub(crate) fn encode_protocol_param_update(ppu: &ProtocolParamUpdate) -> Vec<u8> {
+pub fn encode_protocol_param_update(ppu: &ProtocolParamUpdate) -> Vec<u8> {
     // Count non-None fields to determine map size
     let mut entries: Vec<(u64, Vec<u8>)> = Vec::new();
 
@@ -205,7 +205,7 @@ pub(crate) fn encode_protocol_param_update(ppu: &ProtocolParamUpdate) -> Vec<u8>
 }
 
 /// Encode CostModels as CBOR map: {0: [v1...], 1: [v2...], 2: [v3...]}
-pub(crate) fn encode_cost_models(cm: &CostModels) -> Vec<u8> {
+pub fn encode_cost_models(cm: &CostModels) -> Vec<u8> {
     let count = [&cm.plutus_v1, &cm.plutus_v2, &cm.plutus_v3]
         .iter()
         .filter(|m| m.is_some())
