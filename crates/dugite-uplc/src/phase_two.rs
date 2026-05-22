@@ -158,24 +158,92 @@ pub fn eval_phase_two_raw<O: RedeemerObserver>(
     tx_cbor: &[u8],
     utxos: &[(Vec<u8>, Vec<u8>)],
     cost_models_cbor: Option<&[u8]>,
-    _initial_budget: (u64, u64),
-    _slot_config: SlotConfig,
+    initial_budget: (u64, u64),
+    slot_config: SlotConfig,
     _run_phase_one: bool,
-    _observer: &mut O,
+    observer: &mut O,
 ) -> Result<Vec<RedeemerResult>, PhaseTwoError> {
-    // Wire-up checklist before this returns Ok(...):
+    // Wire-up checklist:
     //   1. Decode tx via dugite-serialization                ── DONE (UPLC-9 part 1)
     //   2. Decode UTxO entries                               ── DONE (UPLC-9 part 1)
     //   3. Parse cost models per Plutus version              ── DONE (UPLC-9 part 2)
-    //   4. Build per-version TxInfo                          ── UPLC-9 part 3
-    //   5. For each redeemer:                                ── UPLC-9 part 4
+    //   4. Build per-version TxInfo                          ── DONE (UPLC-9 part 3a-3e)
+    //   5. For each redeemer:                                ── DONE (UPLC-9 part 4a-4c)
     //      a. Resolve script (witness set or reference input)
     //      b. Resolve datum (V1/V2 only)
     //      c. Build ScriptContext + encode to Data
     //      d. Apply args + evaluate via CEK with budget tracker
     //      e. Push RedeemerResult
-    let _decoded = decode_phase_two_inputs(tx_cbor, utxos, cost_models_cbor)?;
-    Err(PhaseTwoError::NotImplemented)
+    let decoded = decode_phase_two_inputs(tx_cbor, utxos, cost_models_cbor)?;
+
+    // Build the resolved-UTxO triple list the eval pipeline expects.
+    let resolved_triples: Vec<(
+        dugite_primitives::transaction::TransactionInput,
+        dugite_primitives::transaction::TransactionOutput,
+        Vec<u8>,
+    )> = decoded
+        .utxos
+        .iter()
+        .map(|(i, o, raw)| (i.clone(), o.clone(), raw.clone()))
+        .collect();
+
+    let resolved_redeemers =
+        crate::redeemer_resolve::resolve_redeemers(&decoded.tx, &resolved_triples)?;
+
+    let initial_ex_budget = crate::machine::ExBudget {
+        cpu: initial_budget.0 as i64,
+        mem: initial_budget.1 as i64,
+    };
+
+    let mut results: Vec<RedeemerResult> = Vec::with_capacity(resolved_redeemers.len());
+    for resolved_r in &resolved_redeemers {
+        // The observer wants the raw redeemer CBOR — but the wire
+        // form of a redeemer is `[tag, idx, data, ex_units]` (Alonzo)
+        // or a map entry (Conway). We don't have the raw bytes here,
+        // so we re-encode the redeemer's Data payload as a minimal
+        // observable proxy. The observer is only used for logging;
+        // tests that need byte-exact CBOR should hook
+        // `tx.witness_set.raw_redeemers_cbor` instead.
+        let redeemer_data_translated =
+            crate::tx_info_populate::plutus_data_to_data(&resolved_r.redeemer_data);
+        let redeemer_proxy_cbor = redeemer_data_translated.to_cbor().unwrap_or_default();
+        observer.on_redeemer(&redeemer_proxy_cbor);
+
+        let outcome = crate::eval_redeemer::eval_resolved_redeemer(
+            &decoded.tx,
+            &resolved_triples,
+            resolved_r,
+            &slot_config,
+            initial_ex_budget,
+            decoded.cost_models.as_ref(),
+        )?;
+
+        // Enforce per-redeemer declared budget: cardano-node rejects the
+        // tx when the actual consumed cost exceeds what the redeemer
+        // declared. `declared_ex_units` is `(mem, cpu)` from the wire
+        // (matches `ExUnits { mem, steps }`); `outcome.consumed` is
+        // `(cpu, mem)` so we compare each dimension explicitly.
+        let declared_mem = resolved_r.declared_ex_units.0 as i64;
+        let declared_cpu = resolved_r.declared_ex_units.1 as i64;
+        if outcome.consumed.cpu > declared_cpu || outcome.consumed.mem > declared_mem {
+            return Err(PhaseTwoError::Internal(format!(
+                "redeemer {tag:?}@{idx} consumed (cpu={}, mem={}) exceeds declared \
+                 (cpu={}, mem={})",
+                outcome.consumed.cpu,
+                outcome.consumed.mem,
+                declared_cpu,
+                declared_mem,
+                tag = resolved_r.tag,
+                idx = resolved_r.index,
+            )));
+        }
+
+        results.push(RedeemerResult {
+            redeemer_cbor: redeemer_proxy_cbor,
+            consumed: outcome.consumed,
+        });
+    }
+    Ok(results)
 }
 
 /// Decode the wire-format inputs (`tx_cbor` + resolved-UTxO pairs + cost
@@ -487,11 +555,10 @@ mod tests {
     // ─────────────────────────────────────────────────────────────
 
     #[test]
-    fn eval_phase_two_raw_reaches_not_implemented_after_decode() {
-        // With a valid tx + no utxos, decode succeeds; the function must then
-        // surface NotImplemented (the wire-up checklist's next step). This
-        // pins the boundary so we notice if a downstream PR forgets to remove
-        // the NotImplemented marker.
+    fn eval_phase_two_raw_with_no_redeemers_returns_empty_results() {
+        // With a valid tx that has no redeemers (no Plutus scripts being
+        // executed), the function must return an empty `Ok(vec![])` rather
+        // than the `NotImplemented` stub that earlier UPLC-9 parts surfaced.
         let tx_cbor = minimal_conway_tx_cbor();
         let result = eval_phase_two_raw(
             &tx_cbor,
@@ -501,8 +568,9 @@ mod tests {
             default_slot_config(),
             true,
             &mut (),
-        );
-        assert!(matches!(result, Err(PhaseTwoError::NotImplemented)));
+        )
+        .expect("phase_two on a no-redeemer tx must succeed");
+        assert!(result.is_empty(), "expected empty results, got {result:?}");
     }
 
     #[test]
