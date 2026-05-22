@@ -32,7 +32,8 @@ pub use script::{
 };
 pub use transaction::{
     compute_transaction_hash, compute_transaction_hash_from_tx, encode_auxiliary_data,
-    encode_transaction, encode_transaction_body, encode_transaction_output, encode_witness_set,
+    encode_dijkstra_transaction, encode_transaction, encode_transaction_body,
+    encode_transaction_output, encode_witness_set,
 };
 pub use value::encode_value;
 
@@ -496,6 +497,7 @@ mod tests {
             plutus_v1: Some(vec![100, 200]),
             plutus_v2: None,
             plutus_v3: None,
+            plutus_v4: None,
         };
         let encoded = encode_language_views(&cost_models, true, false, false);
         // map(1), key = bstr(0x00) = [0x41, 0x00]
@@ -517,6 +519,7 @@ mod tests {
             plutus_v1: Some(vec![1, 2, 3]),
             plutus_v2: None,
             plutus_v3: None,
+            plutus_v4: None,
         };
         let encoded = encode_language_views(&cost_models, true, false, false);
         // The value should be a bstr containing [0x9F, <ints>, 0xFF]
@@ -546,6 +549,7 @@ mod tests {
             plutus_v1: None,
             plutus_v2: Some(vec![10, 20]),
             plutus_v3: None,
+            plutus_v4: None,
         };
         let encoded = encode_language_views(&cost_models, false, true, false);
         // map(1), key = uint(1) = [0x01]
@@ -563,6 +567,7 @@ mod tests {
             plutus_v1: Some(vec![1]),
             plutus_v2: Some(vec![2]),
             plutus_v3: None,
+            plutus_v4: None,
         };
         let encoded = encode_language_views(&cost_models, true, true, false);
         assert_eq!(encoded[0], 0xA2); // map(2)
@@ -579,6 +584,7 @@ mod tests {
             plutus_v1: Some(vec![1]),
             plutus_v2: Some(vec![2]),
             plutus_v3: Some(vec![3]),
+            plutus_v4: None,
         };
         let encoded = encode_language_views(&cost_models, true, true, true);
         assert_eq!(encoded[0], 0xA3); // map(3)
@@ -598,6 +604,7 @@ mod tests {
             plutus_v1: None,
             plutus_v2: None,
             plutus_v3: None,
+            plutus_v4: None,
         };
         let encoded = encode_language_views(&cost_models, false, false, false);
         assert_eq!(encoded, encode_map_header(0));
@@ -695,6 +702,7 @@ mod tests {
                 plutus_v1: None,
                 plutus_v2: Some(vec![100, 200, 300]),
                 plutus_v3: None,
+                plutus_v4: None,
             }),
             ..Default::default()
         };

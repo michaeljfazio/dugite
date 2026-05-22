@@ -128,7 +128,11 @@ pub fn decode_transaction(era_id: u16, tx_cbor: &[u8]) -> Result<Transaction, Se
         4 => era_alonzo::decode_alonzo_family_tx_standalone(tx_cbor, Era::Alonzo),
         5 => era_babbage::decode_babbage_tx_standalone(tx_cbor),
         6 => era_conway::decode_conway_tx_standalone(tx_cbor, Era::Conway),
-        7 => era_conway::decode_conway_tx_standalone(tx_cbor, Era::Dijkstra),
+        // CIP-0167: Dijkstra removes the top-level `isValid` flag. The
+        // standalone tx wire shape is array(3) — body, witness_set, aux_data
+        // — instead of Conway's array(4). Route to the Dijkstra-specific
+        // decoder so the missing element does not cause a decode error.
+        7 => era_conway::decode_dijkstra_tx_standalone(tx_cbor),
         n => Err(SerializationError::CborDecode(format!(
             "unknown era id: {n}"
         ))),
