@@ -192,10 +192,12 @@ pub fn reload_partition(old: &NodeConfig, new: &NodeConfig) -> ReloadPlan {
     check_restart_required!(byron_genesis_file);
     check_restart_required!(alonzo_genesis_file);
     check_restart_required!(conway_genesis_file);
+    check_restart_required!(dijkstra_genesis_file);
     check_restart_required!(shelley_genesis_hash);
     check_restart_required!(byron_genesis_hash);
     check_restart_required!(alonzo_genesis_hash);
     check_restart_required!(conway_genesis_hash);
+    check_restart_required!(dijkstra_genesis_hash);
     check_restart_required!(metrics_port);
     check_restart_required!(diffusion_mode);
     check_restart_required!(experimental_hard_forks_enabled);
