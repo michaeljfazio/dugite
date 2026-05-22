@@ -113,7 +113,7 @@ uplc = { git = "https://github.com/aiken-lang/aiken.git", rev = "6806d52211fbb46
 crc32fast = "1"
 reqwest = { version = "0.12", features = ["rustls-tls", "stream", "json"], default-features = false }
 libc = "0.2"
-hickory-resolver = "0.25"
+hickory-resolver = "0.26"
 socket2 = "0.6"
 zstd = "0.13"
 tar = "0.4"
