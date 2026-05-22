@@ -1,7 +1,6 @@
 use crate::utxo::UtxoLookup;
 #[cfg(test)]
 use crate::utxo::UtxoSet;
-use crate::validation::{plutus_script_version_map, redeemer_script_version_map};
 use dugite_primitives::transaction::Transaction;
 use tracing::{debug, trace};
 
@@ -73,43 +72,6 @@ impl SlotConfig {
             zero_slot: 0,
             slot_length: 1_000,
         }
-    }
-}
-
-/// Decode the `(tag_byte, index)` from the CBOR-encoded `Redeemer`
-/// returned by `eval_phase_two_raw`.
-///
-/// The encoding is `array(4)[tag_uint, index_uint, data, ex_units]`.  We only
-/// need the first two elements.  The tag encoding matches the Cardano CDDL
-/// redeemer tag enumeration:
-///   0 = Spend, 1 = Mint, 2 = Cert, 3 = Reward, 4 = Vote, 5 = Propose.
-///
-/// Returns `None` if the bytes cannot be decoded (malformed CBOR or unexpected
-/// structure).  Callers treat `None` as "unknown version" and fall back to the
-/// permissive non-Unit check, which is the safe direction.
-fn decode_redeemer_tag_index(redeemer_cbor: &[u8]) -> Option<(u8, u32)> {
-    use minicbor::Decoder;
-    let mut dec = Decoder::new(redeemer_cbor);
-    // Expect an array of at least 2 elements.
-    let _len = dec.array().ok()?;
-    let tag = dec.u8().ok()?;
-    let index = dec.u32().ok()?;
-    Some((tag, index))
-}
-
-/// Map a `RedeemerTag` to its on-wire CBOR encoding byte, matching the values
-/// `decode_redeemer_tag_index` returns. This is the inverse used when looking
-/// the declared `ex_units` for a redeemer back up from a tag/index pair the
-/// uplc evaluator surfaced.
-fn redeemer_tag_byte(tag: &dugite_primitives::transaction::RedeemerTag) -> u8 {
-    use dugite_primitives::transaction::RedeemerTag::*;
-    match tag {
-        Spend => 0,
-        Mint => 1,
-        Cert => 2,
-        Reward => 3,
-        Vote => 4,
-        Propose => 5,
     }
 }
 
@@ -217,51 +179,29 @@ pub fn evaluate_plutus_scripts(
         "Evaluating Plutus scripts"
     );
 
-    let sc = (
-        slot_config.zero_time,
-        slot_config.zero_slot,
-        slot_config.slot_length,
-    );
-
-    // Build the script hash → language version map (1=V1, 2=V2, 3=V3) for all
-    // Plutus scripts available to this transaction (witness set + ref scripts).
-    let version_map = plutus_script_version_map(tx, utxo_set);
-
-    // Build the per-redeemer version map: (tag_byte, index) → language version.
+    // Dugite's in-house phase-2 evaluator. Replaces the
+    // `aiken-lang/uplc` crate.
     //
-    // `eval_phase_two_raw` returns one `(redeemer_cbor, EvalResult)` pair per
-    // executed redeemer.  The `redeemer_cbor` bytes are a CBOR-encoded
-    // `Redeemer`: `array(4)[tag_uint, index_uint, data, ex_units]`.  We decode
-    // the first two fields to recover (tag, index) and look up the language
-    // version from this map.
-    //
-    // Per Haskell's `evaluateScriptRestricting` (PlutusLedgerApi.Common.Eval):
-    // - V1 / V2: success = any non-error CEK result (term value is ignored).
-    // - V3: success = script returned exactly `Unit` (`()`); any other term
-    //   (Data, Bool, integer, …) is treated as `InvalidReturnValue`.
-    //
-    // By resolving each redeemer individually we avoid the prior bug where
-    // the transaction-wide `has_any_v3` flag applied the V3 Unit check to
-    // ALL redeemers when any V3 script was present — incorrectly rejecting
-    // valid V1/V2 scripts that return non-Unit in mixed-version transactions.
-    let redeemer_version_map = redeemer_script_version_map(tx, utxo_set, &version_map);
-
-    // SECURITY: wrap the third-party uplc / the legacy CBOR codec call in catch_unwind.
-    // Both crates have known panics on malformed input (the legacy CBOR codec flat
-    // decoder unwrap, uplc tx.rs:194 unwrap on Err(EndOfInput)). Without this
-    // guard, an adversary can craft a transaction whose witness-set Plutus
-    // script crashes the node — a remote DoS over TxSubmission2 / N2C.
-    // Treat any panic as a hard script-validation failure → tx is rejected,
-    // node keeps running. Requires panic = "unwind" in the release profile.
+    // The new API does V1/V2/V3 success classification + per-redeemer
+    // declared-budget enforcement internally and surfaces failures as
+    // typed `PhaseTwoError` variants. We still wrap the call in
+    // `catch_unwind` as a defense-in-depth measure: even though
+    // `dugite-uplc` is panic-free by contract (lib.rs §1), the catch
+    // unwind ensures any future regression cannot crash the node.
+    let dugite_slot_config = dugite_uplc::phase_two::SlotConfig {
+        network_start_unix_seconds: slot_config.zero_time / 1_000,
+        slot_zero_offset: slot_config.zero_slot,
+        slot_length_ms: slot_config.slot_length,
+    };
     let eval_outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        uplc::tx::eval_phase_two_raw(
+        dugite_uplc::phase_two::eval_phase_two_raw(
             tx_cbor,
             &utxo_pairs,
             cost_models_cbor,
             max_tx_ex_units,
-            sc,
+            dugite_slot_config,
             false, // don't run phase one (we already do our own phase 1 validation)
-            |_redeemer| {},
+            &mut (),
         )
     }));
     let eval_result = match eval_outcome {
@@ -274,114 +214,17 @@ pub fn evaluate_plutus_scripts(
                 "Plutus evaluator panicked on adversarial input — rejecting tx"
             );
             return Err(PlutusError::EvalFailed(format!(
-                "uplc/the legacy CBOR codec panic on malformed script: {msg}"
+                "dugite-uplc panic on malformed script: {msg}"
             )));
         }
     };
     match eval_result {
         Ok(results) => {
-            for (redeemer_bytes, eval_result) in &results {
-                let cost = eval_result.cost();
-
-                // Decode tag and index from the CBOR redeemer: array(4)[tag, idx, …]
-                // (or map-keyed `(tag, idx) => [data, ex_units]` in Conway).
-                let tag_idx = decode_redeemer_tag_index(redeemer_bytes);
-
-                // Determine whether this specific redeemer executes a V3 script.
-                let is_v3 = tag_idx
-                    .and_then(|(tag, idx)| redeemer_version_map.get(&(tag, idx)).copied())
-                    .map(|ver| ver == 3)
-                    .unwrap_or(false);
-
-                let script_failed = match &eval_result.result {
-                    Err(_) => true,
-                    Ok(term) => {
-                        if matches!(term, uplc::ast::Term::Error) {
-                            true
-                        } else if is_v3 && !term.is_unit() {
-                            // PlutusV3: only Unit is a valid return value.
-                            // Any other term is treated as InvalidReturnValue.
-                            true
-                        } else {
-                            false
-                        }
-                    }
-                };
-                if script_failed {
-                    let err_msg = match &eval_result.result {
-                        Err(e) => format!("{e}"),
-                        Ok(term) if matches!(term, uplc::ast::Term::Error) => {
-                            format!("Script error: {term:?}")
-                        }
-                        Ok(term) => format!("PlutusV3 script returned non-Unit value: {term:?}"),
-                    };
-                    debug!(
-                        tx_hash = %tx.hash.to_hex(),
-                        error = %err_msg,
-                        logs = ?eval_result.logs(),
-                        "Plutus script failed"
-                    );
-                    return Err(PlutusError::EvalFailed(err_msg));
-                }
-
-                // Per-redeemer declared-budget enforcement.
-                //
-                // cardano-node's CEK evaluator halts the moment a redeemer's
-                // declared `ExUnits` (mem, steps) are overspent — producing a
-                // `PlutusFailure` and rejecting the transaction. The aiken
-                // `uplc` crate we link against runs each redeemer with the
-                // **tx-wide** budget passed to `eval_phase_two_raw` (the
-                // protocol `max_tx_ex_units`), NOT the per-redeemer declared
-                // `ex_units`. As a result `eval_phase_two_raw` happily
-                // completes evaluation as long as the tx max isn't blown,
-                // even when the redeemer's own declared budget is too low.
-                //
-                // We close that gap here by comparing the **actual** measured
-                // cost (`eval_result.cost()`) against the redeemer's
-                // **declared** `ex_units` from the input transaction. If the
-                // script genuinely needed more than its declared budget, the
-                // tx must be rejected — otherwise cardano-node will reject
-                // any block dugite forges containing it (Conway
-                // `ConwayUtxowFailure (UtxoFailure (UtxosFailure
-                // (ValidationTagMismatch (IsValid True) (FailedUnexpectedly
-                // (PlutusFailure …)))))`).
-                if let Some((tag, idx)) = tag_idx {
-                    let declared = tx
-                        .witness_set
-                        .redeemers
-                        .iter()
-                        .find(|r| redeemer_tag_byte(&r.tag) == tag && r.index == idx);
-                    if let Some(declared) = declared {
-                        let declared_mem = declared.ex_units.mem as i64;
-                        let declared_cpu = declared.ex_units.steps as i64;
-                        if cost.mem > declared_mem || cost.cpu > declared_cpu {
-                            let over_mem = cost.mem - declared_mem;
-                            let over_cpu = cost.cpu - declared_cpu;
-                            let err_msg = format!(
-                                "Plutus script overspent declared budget for redeemer \
-                                 (tag={tag}, index={idx}): actual=(mem={}, cpu={}), \
-                                 declared=(mem={}, cpu={}), overspent=(mem={}, cpu={})",
-                                cost.mem,
-                                cost.cpu,
-                                declared_mem,
-                                declared_cpu,
-                                over_mem.max(0),
-                                over_cpu.max(0),
-                            );
-                            debug!(
-                                tx_hash = %tx.hash.to_hex(),
-                                error = %err_msg,
-                                "Plutus script overspent declared ex_units — rejecting tx"
-                            );
-                            return Err(PlutusError::EvalFailed(err_msg));
-                        }
-                    }
-                }
-
+            for r in &results {
                 trace!(
                     tx_hash = %tx.hash.to_hex(),
-                    cpu = cost.cpu,
-                    mem = cost.mem,
+                    cpu = r.consumed.cpu,
+                    mem = r.consumed.mem,
                     "Plutus script passed"
                 );
             }
@@ -510,14 +353,55 @@ mod tests {
     /// transaction witness set).
     ///
     /// A Plutus script in the witness set is `CBOR_bytes(flat_encoded_program)`:
-    /// the `uplc` crate's `Program::to_cbor()` produces exactly this format.
+    /// `dugite_uplc::Program::to_cbor()` produces exactly this format.
+    ///
+    /// We map the small set of UPLC source patterns the test suite uses
+    /// to direct `dugite_uplc::Program` constructions. The original
+    /// implementation parsed a textual `(program …)` via aiken's
+    /// `uplc::parser`; dugite-uplc does not ship a textual parser
+    /// (production never needs one — scripts arrive as CBOR-flat on
+    /// the wire), so tests express the equivalent `Term` AST directly
+    /// here.
     fn build_script_cbor(uplc_src: &str) -> Vec<u8> {
-        let program = uplc::parser::program(uplc_src).expect("UPLC parse failed");
-        program
-            .to_debruijn()
-            .expect("DeBruijn conversion failed")
-            .to_cbor()
-            .expect("CBOR encode failed")
+        use dugite_uplc::term::{Constant, Term};
+        use dugite_uplc::Program;
+        let (version, term) = match uplc_src {
+            // V1/V2 always-succeeds: 3 lambdas around a Unit constant.
+            "(program 1.0.0 (lam _ (lam _ (lam _ (con unit ())))))" => (
+                (1, 0, 0),
+                Term::Lam(Box::new(Term::Lam(Box::new(Term::Lam(Box::new(
+                    Term::Const(Constant::Unit),
+                )))))),
+            ),
+            // V3 always-succeeds: 1 lambda around a Unit constant.
+            "(program 1.1.0 (lam _ (con unit ())))" => {
+                ((1, 1, 0), Term::Lam(Box::new(Term::Const(Constant::Unit))))
+            }
+            // V2 single-arg "always-succeeds" (used by tests that confirm
+            // the V3 Unit-check doesn't bleed into V2 evaluation).
+            "(program 1.0.0 (lam _ (con unit ())))" => {
+                ((1, 0, 0), Term::Lam(Box::new(Term::Const(Constant::Unit))))
+            }
+            // V3 returns integer 42 — used by tests that verify the V3
+            // non-Unit-return rejection path.
+            "(program 1.1.0 (lam _ (con integer 42)))" => (
+                (1, 1, 0),
+                Term::Lam(Box::new(Term::Const(Constant::Integer(42.into())))),
+            ),
+            // V1/V2 returns integer 42 — used by tests that verify
+            // non-Error returns are accepted for V1/V2.
+            "(program 1.0.0 (lam _ (lam _ (lam _ (con integer 42)))))" => (
+                (1, 0, 0),
+                Term::Lam(Box::new(Term::Lam(Box::new(Term::Lam(Box::new(
+                    Term::Const(Constant::Integer(42.into())),
+                )))))),
+            ),
+            // V1/V2 always-fails.
+            "(program 1.0.0 (error))" => ((1, 0, 0), Term::Error),
+            other => panic!("build_script_cbor: unsupported test script: {other:?}"),
+        };
+        let program = Program { version, term };
+        program.to_cbor().expect("CBOR encode failed")
     }
 
     /// Compute the PlutusV2 script hash for a script in witness-set encoding.
@@ -819,12 +703,12 @@ mod tests {
         enc.array(1).expect("infallible");
         enc.bytes(script_cbor).expect("infallible");
 
-        // key 5: redeemers — array(1) [[Spend, 0, Unit, [steps, mem]]]
+        // key 5: redeemers — array(1) [[Spend, 0, Unit, [mem, steps]]]
         // Each redeemer: array(4) [tag, index, data, ex_units]
         // - tag 0 = Spend
         // - index 0 (first input)
         // - data = Unit = d87980 (Constr tag 0 with empty list, CBOR alternate format)
-        // - ex_units = array(2) [steps, mem]
+        // - ex_units = array(2) [mem, steps]  (CDDL order: mem first)
         enc.u8(5).expect("infallible");
         enc.array(1).expect("infallible");
         enc.array(4).expect("infallible");
@@ -836,8 +720,8 @@ mod tests {
         enc.tag(minicbor::data::Tag::new(121)).expect("infallible");
         enc.array(0).expect("infallible");
         enc.array(2).expect("infallible");
-        enc.u64(ex_units_steps).expect("infallible");
         enc.u64(ex_units_mem).expect("infallible");
+        enc.u64(ex_units_steps).expect("infallible");
 
         // ----------------------------------------------------------------
         // [2] is_valid = true
@@ -1155,13 +1039,8 @@ mod tests {
         use dugite_primitives::value::Value;
 
         // Build always-succeeds V1 validator
-        let script_text = "(program 1.0.0 (lam _ (lam _ (lam _ (con unit ())))))";
-        let program = uplc::parser::program(script_text).expect("UPLC parse failed");
-        let script_cbor = program
-            .to_debruijn()
-            .expect("DeBruijn conversion failed")
-            .to_cbor()
-            .expect("CBOR encode failed");
+        let script_cbor =
+            build_script_cbor("(program 1.0.0 (lam _ (lam _ (lam _ (con unit ())))))");
 
         // V1 script hash: blake2b_224(0x01 || script_bytes)
         let v1_script_hash: [u8; 28] = {
@@ -1418,51 +1297,13 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // Test 7: decode_redeemer_tag_index — round-trip sanity check
+    // (Removed) `decode_redeemer_tag_index` round-trip test
     //
-    // Verifies that we can recover (tag, index) from the CBOR redeemer bytes
-    // produced by our own `build_conway_tx_cbor` helper (which encodes the
-    // witness-set redeemer in the same `array(4)[tag, idx, data, ex_units]`
-    // format that `eval_phase_two_raw` returns).  This exercises the function
-    // used in the per-redeemer V3 Unit-check path.
+    // The helper was only used to look up the per-redeemer language
+    // version after aiken-uplc's `eval_phase_two_raw` returned. The new
+    // `dugite_uplc::phase_two::eval_phase_two_raw` resolves the version
+    // internally per redeemer, so the helper + this test are obsolete.
     // -----------------------------------------------------------------------
-    #[test]
-    fn test_decode_redeemer_tag_index() {
-        use minicbor::Encoder;
-
-        // Build a redeemer CBOR manually: array(4)[tag=0, idx=3, data=unit, ex_units]
-        let mut buf = Vec::new();
-        let mut enc = Encoder::new(&mut buf);
-        enc.array(4).expect("infallible");
-        enc.u8(0).expect("infallible"); // Spend = 0
-        enc.u32(3).expect("infallible"); // index 3
-        enc.tag(minicbor::data::Tag::new(121)).expect("infallible");
-        enc.array(0).expect("infallible"); // Unit datum
-        enc.array(2).expect("infallible");
-        enc.u64(1000).expect("infallible"); // steps
-        enc.u64(500).expect("infallible"); // mem
-
-        let result = decode_redeemer_tag_index(&buf);
-        assert_eq!(result, Some((0u8, 3u32)), "Expected (tag=0 Spend, index=3)");
-
-        // Mint redeemer at index 1
-        let mut buf2 = Vec::new();
-        let mut enc2 = Encoder::new(&mut buf2);
-        enc2.array(4).expect("infallible");
-        enc2.u8(1).expect("infallible"); // Mint = 1
-        enc2.u32(1).expect("infallible");
-        enc2.tag(minicbor::data::Tag::new(121)).expect("infallible");
-        enc2.array(0).expect("infallible");
-        enc2.array(2).expect("infallible");
-        enc2.u64(0).expect("infallible");
-        enc2.u64(0).expect("infallible");
-
-        assert_eq!(decode_redeemer_tag_index(&buf2), Some((1u8, 1u32)));
-
-        // Malformed CBOR must return None
-        assert_eq!(decode_redeemer_tag_index(&[0xFF, 0xAB]), None);
-        assert_eq!(decode_redeemer_tag_index(&[]), None);
-    }
 
     // -----------------------------------------------------------------------
     // Test: Cross-validation — always-succeeds V2 with real cost model
@@ -1579,8 +1420,8 @@ mod tests {
         enc.tag(minicbor::data::Tag::new(121)).expect("infallible");
         enc.array(0).expect("infallible"); // Unit redeemer data
         enc.array(2).expect("infallible");
-        enc.u64(ex_units_steps).expect("infallible");
         enc.u64(ex_units_mem).expect("infallible");
+        enc.u64(ex_units_steps).expect("infallible");
 
         enc.bool(true).expect("infallible");
         enc.null().expect("infallible");
