@@ -20,6 +20,11 @@ checkpoints.json
 .claude/worktrees/
 .DS_Store
 
+# UPLC conformance test corpus — downloaded on demand from the Plutus
+# repository by scripts/dev/download-plutus-conformance.sh. Not vendored
+# (would balloon the repo and mask drift from upstream).
+/crates/dugite-uplc/tests/conformance/
+
 # Nix
 result
 result-*
