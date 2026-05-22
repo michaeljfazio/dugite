@@ -78,6 +78,7 @@ fn make_tx(input: TransactionInput, output_value: u64, fee: u64) -> Transaction 
             donation: None,
             sub_transactions: vec![],
             account_balance_intervals: vec![],
+            direct_deposits: ::std::collections::BTreeMap::new(),
         },
         witness_set: TransactionWitnessSet {
             vkey_witnesses: vec![],
@@ -769,6 +770,7 @@ fn make_mint_tx(
             donation: None,
             sub_transactions: vec![],
             account_balance_intervals: vec![],
+            direct_deposits: ::std::collections::BTreeMap::new(),
         },
         witness_set: TransactionWitnessSet {
             vkey_witnesses: vec![],
@@ -992,6 +994,7 @@ proptest! {
                 donation: None,
                 sub_transactions: vec![],
             account_balance_intervals: vec![],
+            direct_deposits: ::std::collections::BTreeMap::new(),
             },
             witness_set: TransactionWitnessSet {
                 vkey_witnesses: vec![],
@@ -1119,6 +1122,7 @@ proptest! {
                 donation: None,
                 sub_transactions: vec![],
             account_balance_intervals: vec![],
+            direct_deposits: ::std::collections::BTreeMap::new(),
             },
             witness_set: TransactionWitnessSet {
                 vkey_witnesses: vec![],
@@ -1270,6 +1274,7 @@ proptest! {
                 donation: None,
                 sub_transactions: vec![],
             account_balance_intervals: vec![],
+            direct_deposits: ::std::collections::BTreeMap::new(),
             },
             witness_set: TransactionWitnessSet {
                 vkey_witnesses: vec![],
@@ -1414,6 +1419,7 @@ proptest! {
                 donation: None,
                 sub_transactions: vec![],
             account_balance_intervals: vec![],
+            direct_deposits: ::std::collections::BTreeMap::new(),
             },
             witness_set: TransactionWitnessSet {
                 vkey_witnesses: vec![],
@@ -1516,6 +1522,7 @@ fn minting_without_policy_script_rejected() {
             donation: None,
             sub_transactions: vec![],
             account_balance_intervals: vec![],
+            direct_deposits: ::std::collections::BTreeMap::new(),
         },
         witness_set: TransactionWitnessSet {
             vkey_witnesses: vec![],
