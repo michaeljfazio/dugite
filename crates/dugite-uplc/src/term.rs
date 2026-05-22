@@ -276,21 +276,208 @@ impl BuiltinId {
     ///
     /// Unknown discriminants are an error rather than a panic — the
     /// flat decoder calls this on every `Term::Builtin` we see and
-    /// must reject adversarial inputs cleanly.
+    /// must reject adversarial inputs cleanly. The table is
+    /// authoritative against the Haskell `DefaultFun` enum order in
+    /// `IntersectMBO/plutus:plutus-core/.../Default/Builtins.hs`.
     pub fn from_u8(raw: u8) -> Result<Self, crate::UplcError> {
-        // Filled in alongside the flat decoder. Keeping it as
-        // `Internal` for now lets the scaffold compile.
-        Err(crate::UplcError::Internal(format!(
-            "BuiltinId::from_u8 not yet implemented (raw={raw})"
-        )))
+        match raw {
+            0 => Ok(BuiltinId::AddInteger),
+            1 => Ok(BuiltinId::SubtractInteger),
+            2 => Ok(BuiltinId::MultiplyInteger),
+            3 => Ok(BuiltinId::DivideInteger),
+            4 => Ok(BuiltinId::QuotientInteger),
+            5 => Ok(BuiltinId::RemainderInteger),
+            6 => Ok(BuiltinId::ModInteger),
+            7 => Ok(BuiltinId::EqualsInteger),
+            8 => Ok(BuiltinId::LessThanInteger),
+            9 => Ok(BuiltinId::LessThanEqualsInteger),
+            10 => Ok(BuiltinId::AppendByteString),
+            11 => Ok(BuiltinId::ConsByteString),
+            12 => Ok(BuiltinId::SliceByteString),
+            13 => Ok(BuiltinId::LengthOfByteString),
+            14 => Ok(BuiltinId::IndexByteString),
+            15 => Ok(BuiltinId::EqualsByteString),
+            16 => Ok(BuiltinId::LessThanByteString),
+            17 => Ok(BuiltinId::LessThanEqualsByteString),
+            18 => Ok(BuiltinId::Sha2_256),
+            19 => Ok(BuiltinId::Sha3_256),
+            20 => Ok(BuiltinId::Blake2b_256),
+            21 => Ok(BuiltinId::VerifyEd25519Signature),
+            22 => Ok(BuiltinId::AppendString),
+            23 => Ok(BuiltinId::EqualsString),
+            24 => Ok(BuiltinId::EncodeUtf8),
+            25 => Ok(BuiltinId::DecodeUtf8),
+            26 => Ok(BuiltinId::IfThenElse),
+            27 => Ok(BuiltinId::ChooseUnit),
+            28 => Ok(BuiltinId::Trace),
+            29 => Ok(BuiltinId::FstPair),
+            30 => Ok(BuiltinId::SndPair),
+            31 => Ok(BuiltinId::ChooseList),
+            32 => Ok(BuiltinId::MkCons),
+            33 => Ok(BuiltinId::HeadList),
+            34 => Ok(BuiltinId::TailList),
+            35 => Ok(BuiltinId::NullList),
+            36 => Ok(BuiltinId::ChooseData),
+            37 => Ok(BuiltinId::ConstrData),
+            38 => Ok(BuiltinId::MapData),
+            39 => Ok(BuiltinId::ListData),
+            40 => Ok(BuiltinId::IData),
+            41 => Ok(BuiltinId::BData),
+            42 => Ok(BuiltinId::UnConstrData),
+            43 => Ok(BuiltinId::UnMapData),
+            44 => Ok(BuiltinId::UnListData),
+            45 => Ok(BuiltinId::UnIData),
+            46 => Ok(BuiltinId::UnBData),
+            47 => Ok(BuiltinId::EqualsData),
+            48 => Ok(BuiltinId::MkPairData),
+            49 => Ok(BuiltinId::MkNilData),
+            50 => Ok(BuiltinId::MkNilPairData),
+            51 => Ok(BuiltinId::SerialiseData),
+            52 => Ok(BuiltinId::VerifyEcdsaSecp256k1Signature),
+            53 => Ok(BuiltinId::VerifySchnorrSecp256k1Signature),
+            54 => Ok(BuiltinId::Bls12_381_G1_Add),
+            55 => Ok(BuiltinId::Bls12_381_G1_Neg),
+            56 => Ok(BuiltinId::Bls12_381_G1_ScalarMul),
+            57 => Ok(BuiltinId::Bls12_381_G1_Equal),
+            58 => Ok(BuiltinId::Bls12_381_G1_HashToGroup),
+            59 => Ok(BuiltinId::Bls12_381_G1_Compress),
+            60 => Ok(BuiltinId::Bls12_381_G1_Uncompress),
+            61 => Ok(BuiltinId::Bls12_381_G2_Add),
+            62 => Ok(BuiltinId::Bls12_381_G2_Neg),
+            63 => Ok(BuiltinId::Bls12_381_G2_ScalarMul),
+            64 => Ok(BuiltinId::Bls12_381_G2_Equal),
+            65 => Ok(BuiltinId::Bls12_381_G2_HashToGroup),
+            66 => Ok(BuiltinId::Bls12_381_G2_Compress),
+            67 => Ok(BuiltinId::Bls12_381_G2_Uncompress),
+            68 => Ok(BuiltinId::Bls12_381_MillerLoop),
+            69 => Ok(BuiltinId::Bls12_381_MulMlResult),
+            70 => Ok(BuiltinId::Bls12_381_FinalVerify),
+            71 => Ok(BuiltinId::Keccak_256),
+            72 => Ok(BuiltinId::Blake2b_224),
+            73 => Ok(BuiltinId::IntegerToByteString),
+            74 => Ok(BuiltinId::ByteStringToInteger),
+            75 => Ok(BuiltinId::AndByteString),
+            76 => Ok(BuiltinId::OrByteString),
+            77 => Ok(BuiltinId::XorByteString),
+            78 => Ok(BuiltinId::ComplementByteString),
+            79 => Ok(BuiltinId::ReadBit),
+            80 => Ok(BuiltinId::WriteBits),
+            81 => Ok(BuiltinId::ReplicateByte),
+            82 => Ok(BuiltinId::ShiftByteString),
+            83 => Ok(BuiltinId::RotateByteString),
+            84 => Ok(BuiltinId::CountSetBits),
+            85 => Ok(BuiltinId::FindFirstSetBit),
+            86 => Ok(BuiltinId::Ripemd_160),
+            87 => Ok(BuiltinId::ExpModInteger),
+            _ => Err(crate::UplcError::FlatDecode(format!(
+                "unknown builtin id {raw} (max recognised: 87)"
+            ))),
+        }
+    }
+
+    /// Wire-discriminant byte for flat encoding (7-bit field). Inverse
+    /// of [`Self::from_u8`].
+    pub fn as_u8(&self) -> u8 {
+        // `#[repr(u8)]` on the enum makes the discriminant accessible
+        // via a single cast — no match expression required.
+        *self as u8
     }
 
     /// Lowercase identifier used in the Plutus textual syntax and in
-    /// error messages. Stable across Plutus versions.
+    /// error messages. Names mirror Haskell `DefaultFun` show output
+    /// (camelCase) since that's the canonical form quoted in
+    /// cardano-node error logs and trace output.
     pub fn name(&self) -> &'static str {
-        // Filled in when builtins are implemented. The table is wired
-        // alongside the dispatcher in `crate::builtin`.
-        "<unimplemented>"
+        match self {
+            BuiltinId::AddInteger => "addInteger",
+            BuiltinId::SubtractInteger => "subtractInteger",
+            BuiltinId::MultiplyInteger => "multiplyInteger",
+            BuiltinId::DivideInteger => "divideInteger",
+            BuiltinId::QuotientInteger => "quotientInteger",
+            BuiltinId::RemainderInteger => "remainderInteger",
+            BuiltinId::ModInteger => "modInteger",
+            BuiltinId::EqualsInteger => "equalsInteger",
+            BuiltinId::LessThanInteger => "lessThanInteger",
+            BuiltinId::LessThanEqualsInteger => "lessThanEqualsInteger",
+            BuiltinId::AppendByteString => "appendByteString",
+            BuiltinId::ConsByteString => "consByteString",
+            BuiltinId::SliceByteString => "sliceByteString",
+            BuiltinId::LengthOfByteString => "lengthOfByteString",
+            BuiltinId::IndexByteString => "indexByteString",
+            BuiltinId::EqualsByteString => "equalsByteString",
+            BuiltinId::LessThanByteString => "lessThanByteString",
+            BuiltinId::LessThanEqualsByteString => "lessThanEqualsByteString",
+            BuiltinId::Sha2_256 => "sha2_256",
+            BuiltinId::Sha3_256 => "sha3_256",
+            BuiltinId::Blake2b_256 => "blake2b_256",
+            BuiltinId::VerifyEd25519Signature => "verifyEd25519Signature",
+            BuiltinId::AppendString => "appendString",
+            BuiltinId::EqualsString => "equalsString",
+            BuiltinId::EncodeUtf8 => "encodeUtf8",
+            BuiltinId::DecodeUtf8 => "decodeUtf8",
+            BuiltinId::IfThenElse => "ifThenElse",
+            BuiltinId::ChooseUnit => "chooseUnit",
+            BuiltinId::Trace => "trace",
+            BuiltinId::FstPair => "fstPair",
+            BuiltinId::SndPair => "sndPair",
+            BuiltinId::ChooseList => "chooseList",
+            BuiltinId::MkCons => "mkCons",
+            BuiltinId::HeadList => "headList",
+            BuiltinId::TailList => "tailList",
+            BuiltinId::NullList => "nullList",
+            BuiltinId::ChooseData => "chooseData",
+            BuiltinId::ConstrData => "constrData",
+            BuiltinId::MapData => "mapData",
+            BuiltinId::ListData => "listData",
+            BuiltinId::IData => "iData",
+            BuiltinId::BData => "bData",
+            BuiltinId::UnConstrData => "unConstrData",
+            BuiltinId::UnMapData => "unMapData",
+            BuiltinId::UnListData => "unListData",
+            BuiltinId::UnIData => "unIData",
+            BuiltinId::UnBData => "unBData",
+            BuiltinId::EqualsData => "equalsData",
+            BuiltinId::MkPairData => "mkPairData",
+            BuiltinId::MkNilData => "mkNilData",
+            BuiltinId::MkNilPairData => "mkNilPairData",
+            BuiltinId::SerialiseData => "serialiseData",
+            BuiltinId::VerifyEcdsaSecp256k1Signature => "verifyEcdsaSecp256k1Signature",
+            BuiltinId::VerifySchnorrSecp256k1Signature => "verifySchnorrSecp256k1Signature",
+            BuiltinId::Bls12_381_G1_Add => "bls12_381_G1_add",
+            BuiltinId::Bls12_381_G1_Neg => "bls12_381_G1_neg",
+            BuiltinId::Bls12_381_G1_ScalarMul => "bls12_381_G1_scalarMul",
+            BuiltinId::Bls12_381_G1_Equal => "bls12_381_G1_equal",
+            BuiltinId::Bls12_381_G1_HashToGroup => "bls12_381_G1_hashToGroup",
+            BuiltinId::Bls12_381_G1_Compress => "bls12_381_G1_compress",
+            BuiltinId::Bls12_381_G1_Uncompress => "bls12_381_G1_uncompress",
+            BuiltinId::Bls12_381_G2_Add => "bls12_381_G2_add",
+            BuiltinId::Bls12_381_G2_Neg => "bls12_381_G2_neg",
+            BuiltinId::Bls12_381_G2_ScalarMul => "bls12_381_G2_scalarMul",
+            BuiltinId::Bls12_381_G2_Equal => "bls12_381_G2_equal",
+            BuiltinId::Bls12_381_G2_HashToGroup => "bls12_381_G2_hashToGroup",
+            BuiltinId::Bls12_381_G2_Compress => "bls12_381_G2_compress",
+            BuiltinId::Bls12_381_G2_Uncompress => "bls12_381_G2_uncompress",
+            BuiltinId::Bls12_381_MillerLoop => "bls12_381_millerLoop",
+            BuiltinId::Bls12_381_MulMlResult => "bls12_381_mulMlResult",
+            BuiltinId::Bls12_381_FinalVerify => "bls12_381_finalVerify",
+            BuiltinId::Keccak_256 => "keccak_256",
+            BuiltinId::Blake2b_224 => "blake2b_224",
+            BuiltinId::IntegerToByteString => "integerToByteString",
+            BuiltinId::ByteStringToInteger => "byteStringToInteger",
+            BuiltinId::AndByteString => "andByteString",
+            BuiltinId::OrByteString => "orByteString",
+            BuiltinId::XorByteString => "xorByteString",
+            BuiltinId::ComplementByteString => "complementByteString",
+            BuiltinId::ReadBit => "readBit",
+            BuiltinId::WriteBits => "writeBits",
+            BuiltinId::ReplicateByte => "replicateByte",
+            BuiltinId::ShiftByteString => "shiftByteString",
+            BuiltinId::RotateByteString => "rotateByteString",
+            BuiltinId::CountSetBits => "countSetBits",
+            BuiltinId::FindFirstSetBit => "findFirstSetBit",
+            BuiltinId::Ripemd_160 => "ripemd_160",
+            BuiltinId::ExpModInteger => "expModInteger",
+        }
     }
 }
 
@@ -305,37 +492,58 @@ mod tests {
     use crate::UplcError;
 
     #[test]
-    fn from_u8_is_internal_pending_table() {
-        // Until the dispatch table lands, every input — including the
-        // ones that will become valid `BuiltinId`s — must yield
-        // `Internal(...)`. We assert the error variant and that the
-        // raw byte is round-tripped into the message so future readers
-        // see exactly which input hit the stub.
-        for raw in [0u8, 1, 27, 86] {
+    fn from_u8_round_trip_full_table() {
+        // Every defined discriminant must round-trip through
+        // `from_u8` → `as_u8`. Anything past 87 must error rather
+        // than wrap or panic.
+        for raw in 0u8..=87 {
+            let id = BuiltinId::from_u8(raw).unwrap_or_else(|e| {
+                panic!("from_u8({raw}) failed: {e}");
+            });
+            assert_eq!(id.as_u8(), raw, "as_u8 round-trip for raw={raw}");
+        }
+        for raw in [88u8, 100, 127] {
             let err = BuiltinId::from_u8(raw).unwrap_err();
-            match err {
-                UplcError::Internal(msg) => {
-                    assert!(
-                        msg.contains(&format!("raw={raw}")),
-                        "expected message to mention raw byte; got {msg}"
-                    );
-                }
-                other => panic!("expected Internal, got {other:?}"),
-            }
+            assert!(
+                matches!(err, UplcError::FlatDecode(_)),
+                "expected FlatDecode for raw={raw}; got {err:?}"
+            );
         }
     }
 
     #[test]
-    fn name_is_unimplemented_placeholder() {
-        // Any `BuiltinId` returns the stable placeholder until the
-        // table lands. Pick a few variants to confirm the contract is
-        // uniform.
-        for id in [
-            BuiltinId::AddInteger,
-            BuiltinId::Sha2_256,
-            BuiltinId::Bls12_381_FinalVerify,
-        ] {
-            assert_eq!(id.name(), "<unimplemented>");
+    fn name_table_complete_and_distinct() {
+        // Every variant gets a stable Haskell-style name and no two
+        // names collide.
+        let mut seen = std::collections::HashSet::new();
+        for raw in 0u8..=87 {
+            let id = BuiltinId::from_u8(raw).expect("from_u8");
+            let name = id.name();
+            assert!(!name.is_empty(), "empty name for raw={raw}");
+            assert!(
+                !name.starts_with('<'),
+                "placeholder name for raw={raw}: {name:?}"
+            );
+            assert!(seen.insert(name), "duplicate name {name:?} at raw={raw}");
         }
+    }
+
+    #[test]
+    fn name_spot_checks_match_haskell() {
+        // Hand-picked names from Haskell's `DefaultFun` show output to
+        // protect against transcription drift.
+        assert_eq!(BuiltinId::AddInteger.name(), "addInteger");
+        assert_eq!(BuiltinId::Sha2_256.name(), "sha2_256");
+        assert_eq!(
+            BuiltinId::VerifyEd25519Signature.name(),
+            "verifyEd25519Signature"
+        );
+        assert_eq!(
+            BuiltinId::Bls12_381_FinalVerify.name(),
+            "bls12_381_finalVerify"
+        );
+        assert_eq!(BuiltinId::Keccak_256.name(), "keccak_256");
+        assert_eq!(BuiltinId::Ripemd_160.name(), "ripemd_160");
+        assert_eq!(BuiltinId::IntegerToByteString.name(), "integerToByteString");
     }
 }
