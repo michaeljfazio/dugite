@@ -17,14 +17,19 @@
 //! plus their unit tests. The per-version `TxInfo` builders that
 //! consume these helpers land in UPLC-9 part 3b.
 
+use crate::data::Data;
 use crate::phase_two::{PhaseTwoError, SlotConfig};
 use crate::script_context::{
-    Address as PlAddress, AssetEntry, Credential as PlCredential, PlutusValue, PosixTimeRange,
-    PubKeyHash, ScriptHash, StakingCredential, TxId, TxOutRef,
+    Address as PlAddress, AssetEntry, Credential as PlCredential, OutputDatum as PlOutputDatum,
+    PlutusValue, PosixTimeRange, PubKeyHash, ScriptHash, StakingCredential, TxId, TxInInfo, TxOut,
+    TxOutRef,
 };
 use dugite_primitives::address::Address as PrimAddress;
 use dugite_primitives::credentials::{Credential as PrimCred, Pointer as PrimPointer};
-use dugite_primitives::transaction::Withdrawal as PrimWithdrawal;
+use dugite_primitives::transaction::{
+    OutputDatum as PrimOutputDatum, PlutusData as PrimPlutusData, TransactionInput as PrimTxIn,
+    TransactionOutput as PrimTxOut, Withdrawal as PrimWithdrawal,
+};
 use dugite_primitives::value::Value as PrimValue;
 use num_bigint::BigInt;
 use std::collections::BTreeMap;
@@ -231,6 +236,110 @@ fn hash28_to_array(h: &dugite_primitives::hash::Hash<28>) -> [u8; 28] {
 /// `signatories` field of `TxInfo`.
 pub fn required_signers_to_plutus(signers: &[dugite_primitives::hash::Hash28]) -> Vec<PubKeyHash> {
     signers.iter().map(hash28_to_array).collect()
+}
+
+/// Recursively translate a primitive [`PrimPlutusData`] value into the
+/// crate-local [`Data`]. The two enums are structurally identical
+/// (`Constr` / `Map` / `List` / `Integer→I` / `Bytes→B`); this is a
+/// pure structural rewrite with no semantic interpretation.
+///
+/// Recursion is bounded only by the input depth. Adversarial inputs
+/// reach this path via tx witness sets (datums) and tx outputs (inline
+/// datums); the upstream CBOR decoder has already enforced its own
+/// depth cap before producing the typed `PrimPlutusData`, so we don't
+/// re-cap here.
+pub fn plutus_data_to_data(p: &PrimPlutusData) -> Data {
+    match p {
+        PrimPlutusData::Constr(tag, fields) => {
+            Data::Constr(*tag, fields.iter().map(plutus_data_to_data).collect())
+        }
+        PrimPlutusData::Map(entries) => Data::Map(
+            entries
+                .iter()
+                .map(|(k, v)| (plutus_data_to_data(k), plutus_data_to_data(v)))
+                .collect(),
+        ),
+        PrimPlutusData::List(items) => Data::List(items.iter().map(plutus_data_to_data).collect()),
+        PrimPlutusData::Integer(n) => Data::I(n.clone()),
+        PrimPlutusData::Bytes(b) => Data::B(b.clone()),
+    }
+}
+
+/// Translate a primitive [`PrimOutputDatum`] into the Plutus
+/// [`script_context::OutputDatum`] shape.
+///
+/// `DatumHash(h)` is byte-copied. `InlineDatum { data, .. }` recursively
+/// translates `data` via [`plutus_data_to_data`]; the `raw_cbor` side
+/// channel is dropped at this layer — Plutus validators only observe
+/// the structural `Data` value, not its on-the-wire byte form.
+pub fn output_datum_to_plutus(d: &PrimOutputDatum) -> PlOutputDatum {
+    match d {
+        PrimOutputDatum::None => PlOutputDatum::None,
+        PrimOutputDatum::DatumHash(h) => PlOutputDatum::Hash(h.0),
+        PrimOutputDatum::InlineDatum { data, .. } => {
+            PlOutputDatum::Inline(plutus_data_to_data(data))
+        }
+    }
+}
+
+/// Translate a primitive [`PrimTxOut`] into the Plutus [`TxOut`].
+///
+/// `reference_script` is left as `None` for now — script-reference
+/// hashing requires the per-language tag-byte prefix the Haskell
+/// reference uses for `ScriptHash` and lands in UPLC-9 part 3c
+/// alongside the per-purpose ScriptInfo wiring. Plutus validators
+/// that don't observe the reference script (the common case) are
+/// unaffected; validators that do will see `None` until that PR.
+pub fn output_to_plutus(out: &PrimTxOut) -> Result<TxOut, PhaseTwoError> {
+    Ok(TxOut {
+        address: address_to_plutus(&out.address)?,
+        value: value_to_plutus(&out.value),
+        datum: output_datum_to_plutus(&out.datum),
+        reference_script: None,
+    })
+}
+
+/// Resolve a primitive [`PrimTxIn`] against a list of already-decoded
+/// resolved-UTxO entries (the `(TransactionInput, TransactionOutput,
+/// raw_cbor)` triples produced by
+/// [`crate::phase_two::decode_phase_two_inputs`]).
+///
+/// Returns [`PhaseTwoError::UtxoDecode`] if `input` does not appear in
+/// `resolved` — meaning the ledger handed the evaluator a tx whose
+/// inputs reference UTxOs it did not also supply, which always
+/// indicates a caller-side bug rather than adversarial input.
+pub fn input_to_txininfo(
+    input: &PrimTxIn,
+    resolved: &[(PrimTxIn, PrimTxOut, Vec<u8>)],
+) -> Result<TxInInfo, PhaseTwoError> {
+    for (resolved_in, resolved_out, _raw) in resolved {
+        if resolved_in.transaction_id == input.transaction_id && resolved_in.index == input.index {
+            return Ok(TxInInfo {
+                out_ref: input_to_outref(input),
+                resolved: output_to_plutus(resolved_out)?,
+            });
+        }
+    }
+    Err(PhaseTwoError::UtxoDecode(format!(
+        "input_to_txininfo: tx input {tx}@{idx} not in resolved-utxo map",
+        tx = hex::encode(input.transaction_id.0),
+        idx = input.index,
+    )))
+}
+
+/// Resolve a `Vec` of inputs into a `Vec<TxInInfo>` preserving the
+/// input order — Plutus validators observe inputs in the order they
+/// appear in the tx body (post-canonical-sort, which has already
+/// happened by the time we see the decoded inputs).
+pub fn inputs_to_txininfos(
+    inputs: &[PrimTxIn],
+    resolved: &[(PrimTxIn, PrimTxOut, Vec<u8>)],
+) -> Result<Vec<TxInInfo>, PhaseTwoError> {
+    let mut out = Vec::with_capacity(inputs.len());
+    for input in inputs {
+        out.push(input_to_txininfo(input, resolved)?);
+    }
+    Ok(out)
 }
 
 #[cfg(test)]
@@ -542,5 +651,238 @@ mod tests {
         let signers = vec![h28(1), h28(2), h28(3)];
         let pl = required_signers_to_plutus(&signers);
         assert_eq!(pl, vec![[1u8; 28], [2u8; 28], [3u8; 28]]);
+    }
+
+    // ────────────────────────────────────────────────────────────
+    // PlutusData translation
+    // ────────────────────────────────────────────────────────────
+
+    #[test]
+    fn plutus_data_to_data_translates_primitive_leaves() {
+        let i = PrimPlutusData::Integer(BigInt::from(-42));
+        assert_eq!(plutus_data_to_data(&i), Data::I(BigInt::from(-42)));
+
+        let b = PrimPlutusData::Bytes(b"hello".to_vec());
+        assert_eq!(plutus_data_to_data(&b), Data::B(b"hello".to_vec()));
+    }
+
+    #[test]
+    fn plutus_data_to_data_round_trips_constr_with_nested_fields() {
+        let p = PrimPlutusData::Constr(
+            3,
+            vec![
+                PrimPlutusData::Integer(BigInt::from(1)),
+                PrimPlutusData::Bytes(vec![0xff, 0xee]),
+                PrimPlutusData::List(vec![PrimPlutusData::Integer(BigInt::from(2))]),
+            ],
+        );
+        let d = plutus_data_to_data(&p);
+        assert_eq!(
+            d,
+            Data::Constr(
+                3,
+                vec![
+                    Data::I(BigInt::from(1)),
+                    Data::B(vec![0xff, 0xee]),
+                    Data::List(vec![Data::I(BigInt::from(2))]),
+                ]
+            )
+        );
+    }
+
+    #[test]
+    fn plutus_data_to_data_preserves_map_order() {
+        let p = PrimPlutusData::Map(vec![
+            (
+                PrimPlutusData::Integer(BigInt::from(2)),
+                PrimPlutusData::Bytes(vec![0x02]),
+            ),
+            (
+                PrimPlutusData::Integer(BigInt::from(1)),
+                PrimPlutusData::Bytes(vec![0x01]),
+            ),
+        ]);
+        let d = plutus_data_to_data(&p);
+        match d {
+            Data::Map(entries) => {
+                assert_eq!(entries.len(), 2);
+                assert_eq!(entries[0].0, Data::I(BigInt::from(2))); // input order preserved
+                assert_eq!(entries[1].0, Data::I(BigInt::from(1)));
+            }
+            other => panic!("expected Map, got {other:?}"),
+        }
+    }
+
+    // ────────────────────────────────────────────────────────────
+    // OutputDatum / TransactionOutput translation
+    // ────────────────────────────────────────────────────────────
+
+    #[test]
+    fn output_datum_to_plutus_covers_all_three_variants() {
+        assert_eq!(
+            output_datum_to_plutus(&PrimOutputDatum::None),
+            PlOutputDatum::None
+        );
+        let hash = Hash::<32>([0xee; 32]);
+        assert_eq!(
+            output_datum_to_plutus(&PrimOutputDatum::DatumHash(hash)),
+            PlOutputDatum::Hash([0xee; 32])
+        );
+        let inline = PrimOutputDatum::InlineDatum {
+            data: PrimPlutusData::Integer(BigInt::from(7)),
+            raw_cbor: None,
+        };
+        assert_eq!(
+            output_datum_to_plutus(&inline),
+            PlOutputDatum::Inline(Data::I(BigInt::from(7)))
+        );
+    }
+
+    fn enterprise_output(lovelace: u64) -> PrimTxOut {
+        PrimTxOut {
+            address: PrimAddress::Enterprise(EnterpriseAddress {
+                network: NetworkId::Testnet,
+                payment: key_cred(0x77),
+            }),
+            value: PrimValue::lovelace(lovelace),
+            datum: PrimOutputDatum::None,
+            script_ref: None,
+            is_legacy: false,
+            raw_cbor: None,
+        }
+    }
+
+    #[test]
+    fn output_to_plutus_translates_address_value_datum() {
+        let out = enterprise_output(2_500_000);
+        let pl = output_to_plutus(&out).unwrap();
+        assert!(matches!(pl.address.payment, PlCredential::PubKey(h) if h == [0x77; 28]));
+        assert!(pl.address.staking.is_none());
+        assert_eq!(pl.value.policies[0].1[0].1, BigInt::from(2_500_000));
+        assert_eq!(pl.datum, PlOutputDatum::None);
+        // reference_script is intentionally None until UPLC-9 part 3c.
+        assert!(pl.reference_script.is_none());
+    }
+
+    #[test]
+    fn output_to_plutus_propagates_address_failure() {
+        // Byron output triggers `address_to_plutus`'s `Internal` error.
+        let out = PrimTxOut {
+            address: PrimAddress::Byron(dugite_primitives::address::ByronAddress {
+                payload: vec![],
+            }),
+            value: PrimValue::lovelace(1),
+            datum: PrimOutputDatum::None,
+            script_ref: None,
+            is_legacy: false,
+            raw_cbor: None,
+        };
+        let err = output_to_plutus(&out).unwrap_err();
+        assert!(matches!(err, PhaseTwoError::Internal(_)));
+    }
+
+    // ────────────────────────────────────────────────────────────
+    // input → TxInInfo resolution
+    // ────────────────────────────────────────────────────────────
+
+    fn resolved_entry(hash_byte: u8, idx: u32, lovelace: u64) -> (PrimTxIn, PrimTxOut, Vec<u8>) {
+        (
+            PrimTxIn {
+                transaction_id: h32(hash_byte),
+                index: idx,
+            },
+            enterprise_output(lovelace),
+            vec![0x00],
+        )
+    }
+
+    #[test]
+    fn input_to_txininfo_finds_matching_resolved_entry() {
+        let resolved = vec![
+            resolved_entry(0xaa, 0, 1_000_000),
+            resolved_entry(0xbb, 1, 2_000_000),
+        ];
+        let input = PrimTxIn {
+            transaction_id: h32(0xbb),
+            index: 1,
+        };
+        let info = input_to_txininfo(&input, &resolved).unwrap();
+        assert_eq!(info.out_ref.tx_id, [0xbb; 32]);
+        assert_eq!(info.out_ref.idx, 1);
+        assert_eq!(
+            info.resolved.value.policies[0].1[0].1,
+            BigInt::from(2_000_000)
+        );
+    }
+
+    #[test]
+    fn input_to_txininfo_errors_when_input_not_in_resolved() {
+        let resolved = vec![resolved_entry(0xaa, 0, 1)];
+        let missing = PrimTxIn {
+            transaction_id: h32(0xff),
+            index: 9,
+        };
+        let err = input_to_txininfo(&missing, &resolved).unwrap_err();
+        let PhaseTwoError::UtxoDecode(msg) = err else {
+            panic!("expected UtxoDecode");
+        };
+        assert!(msg.contains("not in resolved-utxo map"), "got: {msg}");
+        // The error should also surface the missing tx/idx for diagnosis.
+        assert!(msg.contains("@9"), "got: {msg}");
+    }
+
+    #[test]
+    fn inputs_to_txininfos_preserves_input_order() {
+        let resolved = vec![
+            resolved_entry(0xaa, 0, 1),
+            resolved_entry(0xbb, 0, 2),
+            resolved_entry(0xcc, 0, 3),
+        ];
+        // Request inputs in a deliberately un-sorted order.
+        let inputs = vec![
+            PrimTxIn {
+                transaction_id: h32(0xcc),
+                index: 0,
+            },
+            PrimTxIn {
+                transaction_id: h32(0xaa),
+                index: 0,
+            },
+            PrimTxIn {
+                transaction_id: h32(0xbb),
+                index: 0,
+            },
+        ];
+        let infos = inputs_to_txininfos(&inputs, &resolved).unwrap();
+        let coins: Vec<u64> = infos
+            .iter()
+            .map(|i| match &i.resolved.value.policies[0].1[0].1 {
+                v if v == &BigInt::from(1) => 1u64,
+                v if v == &BigInt::from(2) => 2u64,
+                v if v == &BigInt::from(3) => 3u64,
+                _ => unreachable!(),
+            })
+            .collect();
+        assert_eq!(coins, vec![3, 1, 2]);
+    }
+
+    #[test]
+    fn inputs_to_txininfos_surfaces_first_missing_input() {
+        let resolved = vec![resolved_entry(0xaa, 0, 1)];
+        let inputs = vec![
+            PrimTxIn {
+                transaction_id: h32(0xaa),
+                index: 0,
+            },
+            PrimTxIn {
+                transaction_id: h32(0xbb),
+                index: 0,
+            },
+        ];
+        let err = inputs_to_txininfos(&inputs, &resolved).unwrap_err();
+        let PhaseTwoError::UtxoDecode(msg) = err else {
+            panic!("expected UtxoDecode");
+        };
+        assert!(msg.contains("@0"), "got: {msg}");
     }
 }
