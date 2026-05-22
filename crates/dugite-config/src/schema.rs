@@ -536,6 +536,28 @@ pub static KNOWN_PARAMS: &[ParamDef] = &[
         tuning_hint: "Must exactly match the hash of the file at ConwayGenesisFile.",
         reloadability: Reloadability::Restart,
     },
+    ParamDef {
+        key: "DijkstraGenesisFile",
+        section: "Genesis",
+        param_type: ParamType::Path,
+        default: "dijkstra-genesis.json",
+        description: "Path to the Dijkstra-era genesis JSON file. Carries the four \
+                      reference-script protocol parameters introduced at the \
+                      Conway-to-Dijkstra HFC (maxRefScriptSizePerBlock, \
+                      maxRefScriptSizePerTx, refScriptCostStride, \
+                      refScriptCostMultiplier).",
+        tuning_hint: "Must match the network. Do not change unless switching networks.",
+        reloadability: Reloadability::Restart,
+    },
+    ParamDef {
+        key: "DijkstraGenesisHash",
+        section: "Genesis",
+        param_type: ParamType::String,
+        default: "",
+        description: "Blake2b-256 hash (hex) of the Dijkstra genesis file.",
+        tuning_hint: "Must exactly match the hash of the file at DijkstraGenesisFile.",
+        reloadability: Reloadability::Restart,
+    },
     // --- Protocol section --------------------------------------------------
     ParamDef {
         key: "Protocol",
@@ -1095,6 +1117,11 @@ pub fn network_defaults(network: Network) -> serde_json::Map<String, serde_json:
         Value::String(format!("{prefix}-conway-genesis.json")),
     );
     map.insert("ConwayGenesisHash".into(), json!(""));
+    map.insert(
+        "DijkstraGenesisFile".into(),
+        Value::String(format!("{prefix}-dijkstra-genesis.json")),
+    );
+    map.insert("DijkstraGenesisHash".into(), json!(""));
 
     // Protocol.
     map.insert("Protocol".into(), json!("Cardano"));
@@ -1460,6 +1487,11 @@ mod tests {
             map["ConwayGenesisFile"],
             serde_json::json!("preview-conway-genesis.json")
         );
+        assert_eq!(
+            map["DijkstraGenesisFile"],
+            serde_json::json!("preview-dijkstra-genesis.json")
+        );
+        assert_eq!(map["DijkstraGenesisHash"], serde_json::json!(""));
     }
 
     #[test]

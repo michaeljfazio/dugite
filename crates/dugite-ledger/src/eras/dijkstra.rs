@@ -1045,10 +1045,49 @@ mod tests {
         /// CLI flag needed.
         ///
         /// Issue: #462 Phase 6.
+        ///
+        /// Parser-only milestone: confirms the upstream JSON shape round-trips
+        /// through `dugite_primitives::genesis::DijkstraGenesis` with the
+        /// expected default values. Actual PParams 34-37 seeding lives in
+        /// Phase 4 and is tracked separately under
+        /// `new_pparams_34_37_decode_and_apply` above.
         #[test]
-        #[ignore = "dijkstra-genesis.json parsing and PParams seeding — see #462 Phase 6"]
         fn dijkstra_genesis_parse_and_seed() {
-            unimplemented!();
+            use dugite_primitives::genesis::DijkstraGenesis;
+
+            // Upstream-defaults JSON (mirrors
+            // `cardano-api/.../Genesis/Internal.hs::dijkstraGenesisDefaults`).
+            const JSON: &str = r#"{
+                "maxRefScriptSizePerBlock": 1048576,
+                "maxRefScriptSizePerTx": 204800,
+                "refScriptCostStride": 25600,
+                "refScriptCostMultiplier": 1.2
+            }"#;
+
+            let genesis =
+                DijkstraGenesis::from_json_str(JSON).expect("upstream defaults must parse");
+
+            // Non-empty / non-zero across the board — defends against any
+            // future default drift that silently zeroes a field.
+            assert!(genesis.max_ref_script_size_per_block > 0);
+            assert!(genesis.max_ref_script_size_per_tx > 0);
+            assert!(genesis.ref_script_cost_stride > 0);
+            assert!(genesis.ref_script_cost_multiplier.numerator() > 0);
+            assert!(genesis.ref_script_cost_multiplier.denominator() > 0);
+
+            // Byte-exact pinning of the four upstream-default values so any
+            // drift in the parser / default constructor surfaces here.
+            assert_eq!(genesis.max_ref_script_size_per_block, 1024 * 1024);
+            assert_eq!(genesis.max_ref_script_size_per_tx, 200 * 1024);
+            assert_eq!(genesis.ref_script_cost_stride, 25_600);
+            assert_eq!(genesis.ref_script_cost_multiplier.numerator(), 6);
+            assert_eq!(genesis.ref_script_cost_multiplier.denominator(), 5);
+            assert_eq!(genesis, DijkstraGenesis::defaults());
+
+            // PParams 34-37 seeding into runtime ProtocolParameters is the
+            // Phase 4 task tracked by `new_pparams_34_37_decode_and_apply`
+            // above; this test asserts only that the parser surface is in
+            // place and the upstream wire shape decodes cleanly.
         }
     }
 }
