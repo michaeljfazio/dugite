@@ -252,6 +252,19 @@ dual-decode-soak NETWORK="preview" MAX_BLOCKS="0" *FLAGS="":
 dual-decode-report DIR="./dual_decode_mismatches":
     python3 ./scripts/validation/dual-decode-report.py {{DIR}}
 
+# ─── UPLC conformance ────────────────────────────────────────────────────────
+
+# Download the official UPLC evaluation test vectors from the latest
+# stable IntersectMBO/plutus release. Override with
+#   PLUTUS_VERSION=1.65.0.0 just uplc-conformance-fetch
+uplc-conformance-fetch:
+    ./scripts/dev/download-plutus-conformance.sh
+
+# Run the UPLC conformance test suite (requires the corpus to have
+# been fetched). Runs the full corpus — no filters.
+uplc-conformance:
+    cargo nextest run -p dugite-uplc --features conformance --test conformance
+
 # ─── Dev / release ───────────────────────────────────────────────────────────
 
 # Regenerate docs/src/reference/third-party-licenses.md.

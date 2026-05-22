@@ -63,6 +63,54 @@ jobs:
           token: ${{ secrets.CODECOV_TOKEN }}
           fail_ci_if_error: false
 
+  uplc-conformance:
+    name: UPLC conformance (IntersectMBO/plutus)
+    runs-on: ubuntu-latest
+    # Pin the Plutus release used for the conformance corpus. Bumping
+    # this MUST come with a refresh of
+    # `crates/dugite-uplc/tests/conformance_skip.txt` (build.rs will
+    # fail the build if any skip-list path no longer exists, and the
+    # harness will fail on any newly-added vector that is not yet
+    # passing or skipped). The end-state goal is an empty skip list at
+    # the latest release.
+    env:
+      PLUTUS_VERSION: "1.65.0.0"
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry and build
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-conformance-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-conformance-
+            ${{ runner.os }}-cargo-
+
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@nextest
+
+      - name: Download Plutus conformance corpus (pinned)
+        run: ./scripts/dev/download-plutus-conformance.sh
+
+      - name: Run the full UPLC evaluation conformance suite
+        run: cargo nextest run -p dugite-uplc --features conformance --test conformance --profile ci
+
+      - name: Upload conformance test results to Codecov
+        if: ${{ !cancelled() }}
+        uses: codecov/codecov-action@v6
+        with:
+          files: target/nextest/ci/junit.xml
+          report_type: test_results
+          token: ${{ secrets.CODECOV_TOKEN }}
+          fail_ci_if_error: false
+
   coverage:
     runs-on: ubuntu-latest
     steps:

@@ -59,6 +59,13 @@ pub mod term;
 pub mod tx_info;
 pub mod tx_info_populate;
 
+// Textual UPLC parser — feature-gated. Excluded from the default
+// build so the production graph stays free of textual-parser code.
+// Activated by the `parser` feature; the `conformance` test target
+// enables it automatically.
+#[cfg(feature = "parser")]
+pub mod syn;
+
 mod error;
 
 pub use crate::data::Data;

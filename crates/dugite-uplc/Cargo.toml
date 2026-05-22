@@ -5,6 +5,9 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 description = "Untyped Plutus Core (UPLC) evaluator, flat/CBOR codec, and CEK machine for the dugite Cardano node"
+# Generates per-test #[test] functions from the conformance corpus (when
+# `tests/conformance/` is populated by scripts/dev/download-plutus-conformance.sh).
+build = "build.rs"
 
 [lints.rust]
 # `unsafe` is forbidden everywhere except the BLS12-381 module, which
@@ -95,6 +98,20 @@ serde_json = { workspace = true }
 # CI workflow runs `cargo test --features cross-validate` on every PR
 # that touches `crates/dugite-uplc/`.
 cross-validate = ["dep:amaru-uplc", "dep:minicbor_025"]
+
+# Enables `dugite_uplc::syn` — a first-party textual UPLC parser that
+# accepts the s-expression form documented in the Plutus Core formal
+# specification. Used only off the production code path; the on-chain
+# wire format is the flat encoding handled by `dugite_uplc::flat`. Kept
+# behind a feature flag so default builds do not compile parser code.
+parser = []
+
+# Enables the UPLC evaluation conformance harness in `tests/conformance.rs`.
+# Test vectors are downloaded by `scripts/dev/download-plutus-conformance.sh`
+# into `tests/conformance/`. The harness consumes the textual .uplc files
+# via the first-party `parser` feature — no third-party UPLC parser is
+# linked in.
+conformance = ["parser"]
 
 [lib]
 name = "dugite_uplc"
