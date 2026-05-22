@@ -24,10 +24,13 @@ from pathlib import Path
 def epoch_of(record: dict) -> int | None:
     """Best-effort extract of the epoch number from a Haskell record.
 
-    The exact path depends on the cli version.  We try a few obvious
-    locations before giving up.
+    cn 11.0.1's `cardano-cli debug log-epoch-state` emits `{"currentEpoch": N, ...}`
+    per block-applied (NOT once per epoch).  We keep one record per
+    epoch — the LAST seen for each epoch number (representing end-of-epoch
+    state).  Older / future versions may differ; try common locations.
     """
     for path in (
+        ("currentEpoch",),
         ("epoch",),
         ("nesEL", "unEpochNo"),
         ("nesEL",),
@@ -60,7 +63,26 @@ def main() -> int:
     out: Path = args.out_dir
     out.mkdir(parents=True, exist_ok=True)
 
+    # The cli emits per-block, but we only need one record per epoch
+    # (the last one BEFORE the epoch transition = end-of-epoch state).
+    # Buffer the latest record for the current epoch and flush only when
+    # the epoch number advances — this avoids ~thousands of needless
+    # rewrites per epoch.
+    cur_epoch: int | None = None
+    cur_record: dict | None = None
     sequential = 0
+
+    def flush(ep: int | None, rec: dict | None) -> None:
+        if ep is None or rec is None:
+            return
+        path = out / f"epoch_{ep:06d}.json"
+        tmp = path.with_suffix(".json.tmp")
+        with tmp.open("w", encoding="utf-8") as f:
+            json.dump(rec, f, indent=2, sort_keys=True)
+            f.write("\n")
+        os.replace(tmp, path)
+        print(f"[split] wrote {path}", file=sys.stderr)
+
     for line in sys.stdin:
         line = line.strip()
         if not line:
@@ -84,13 +106,19 @@ def main() -> int:
             )
             epoch = -sequential
             sequential += 1
-        path = out / f"epoch_{epoch:06d}.json"
-        tmp = path.with_suffix(".json.tmp")
-        with tmp.open("w", encoding="utf-8") as f:
-            json.dump(record, f, indent=2, sort_keys=True)
-            f.write("\n")
-        os.replace(tmp, path)
-        print(f"[split] wrote {path}", file=sys.stderr)
+        if cur_epoch is None:
+            cur_epoch = epoch
+            cur_record = record
+        elif epoch != cur_epoch:
+            # Epoch advanced (or rolled back) — flush the previous one.
+            flush(cur_epoch, cur_record)
+            cur_epoch = epoch
+            cur_record = record
+        else:
+            # Same epoch — overwrite buffer with newer record.
+            cur_record = record
+    # Final flush of the last in-flight epoch.
+    flush(cur_epoch, cur_record)
     return 0
 
 
