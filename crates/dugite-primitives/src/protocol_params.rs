@@ -2,10 +2,74 @@ use crate::transaction::{CostModels, ExUnitPrices, ExUnits, Rational};
 use crate::value::Lovelace;
 use serde::{Deserialize, Serialize};
 
-/// Complete protocol parameters (Conway era)
+/// Lovelace per byte of serialized transaction body, used as the linear
+/// coefficient in the minimum-fee formula (`fee = a × tx_size + b`).
+///
+/// Cardano upstream introduced the dedicated `CoinPerByte` type in
+/// Babbage (`cardano-ledger/libs/cardano-ledger-core/src/Cardano/Ledger/Coin.hs`)
+/// and re-affirmed the rename of the PParam from `minFeeA` to `txFeePerByte`
+/// in Dijkstra (`eras/dijkstra/impl/.../PParams.hs`, field `dppTxFeePerByte`).
+///
+/// On the wire the field is still encoded as a CBOR `uint` at PParams key 0
+/// — the type carries semantic intent only. JSON serialization is
+/// `derive(newtype)` over `Word64`, so `CoinPerByte(44)` renders as the bare
+/// integer `44` — identical to the legacy `Coin` shape. See Phase 4.3 of
+/// issue #462 for the full audit.
+///
+/// Construct via [`CoinPerByte::new`] or `.into()` and read with `.lovelace()`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct CoinPerByte(pub u64);
+
+impl CoinPerByte {
+    /// Construct a new `CoinPerByte` from a raw lovelace-per-byte value.
+    pub const fn new(lovelace_per_byte: u64) -> Self {
+        CoinPerByte(lovelace_per_byte)
+    }
+
+    /// Underlying `u64` lovelace-per-byte coefficient.
+    pub const fn lovelace(self) -> u64 {
+        self.0
+    }
+}
+
+impl From<u64> for CoinPerByte {
+    fn from(v: u64) -> Self {
+        CoinPerByte(v)
+    }
+}
+
+impl From<CoinPerByte> for u64 {
+    fn from(v: CoinPerByte) -> Self {
+        v.0
+    }
+}
+
+impl std::fmt::Display for CoinPerByte {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+/// Complete protocol parameters (Conway era and forward; identical wire shape
+/// in Dijkstra apart from the four new ref-script tier keys 34-37 which are
+/// tracked under #462 Phase 4).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProtocolParameters {
-    // Fee calculation: fee = min_fee_a * tx_size + min_fee_b
+    /// Linear coefficient of the minimum-fee formula:
+    /// `fee = min_fee_a × tx_size_bytes + min_fee_b`.
+    ///
+    /// Encoded at PParams key 0 as a CBOR `uint` and serialised in JSON as a
+    /// plain integer under the modern name `"txFeePerByte"` (with the legacy
+    /// alias `"minFeeA"` accepted on deserialization for older fixtures).
+    ///
+    /// In Dijkstra (#462 Phase 4.3) the Haskell ledger renamed
+    /// `cppMinFeeA`/`bppMinFeeA`/`sppMinFeeA` to `*TxFeePerByte` and bound
+    /// the typed-newtype `CoinPerByte` to it. The byte representation is
+    /// unchanged; this struct retains the historical Rust field name for
+    /// source compatibility. Prefer the [`Self::tx_fee_per_byte`] accessor
+    /// when expressing intent — that returns a [`CoinPerByte`] wrapper.
+    #[serde(alias = "txFeePerByte", alias = "minFeeA")]
     pub min_fee_a: u64,
     pub min_fee_b: u64,
 
@@ -142,6 +206,20 @@ impl ProtocolParameters {
     /// Calculate the minimum fee for a transaction
     pub fn min_fee(&self, tx_size: u64) -> Lovelace {
         Lovelace(self.min_fee_a * tx_size + self.min_fee_b)
+    }
+
+    /// Dijkstra-named accessor returning the linear fee coefficient as a
+    /// typed [`CoinPerByte`] (see #462 Phase 4.3).
+    ///
+    /// The byte representation on the wire and in JSON is unchanged from
+    /// Conway — this accessor purely surfaces the semantic intent.
+    pub fn tx_fee_per_byte(&self) -> CoinPerByte {
+        CoinPerByte(self.min_fee_a)
+    }
+
+    /// Set the linear fee coefficient from a typed [`CoinPerByte`].
+    pub fn set_tx_fee_per_byte(&mut self, c: CoinPerByte) {
+        self.min_fee_a = c.lovelace();
     }
 
     /// Active slot coefficient (1/20 = 0.05 on mainnet)
@@ -419,5 +497,83 @@ mod tests {
         // When the result is exact, no rounding should occur
         // 4 * 100 * 20 / 1 = 8000
         assert_eq!(ceiling_div_by_rational(4, 100, 1, 20), 8000);
+    }
+
+    // ── #462 Phase 4.3: CoinPerByte / txFeePerByte ───────────────────────────
+
+    #[test]
+    fn coin_per_byte_construction_and_accessor() {
+        let c = CoinPerByte::new(44);
+        assert_eq!(c.lovelace(), 44);
+        assert_eq!(u64::from(c), 44);
+        assert_eq!(CoinPerByte::from(155_381u64).lovelace(), 155_381);
+        assert_eq!(format!("{c}"), "44");
+    }
+
+    /// `CoinPerByte` must serialise transparently as a bare `uint` in JSON to
+    /// match Haskell's `deriving newtype (ToJSON, FromJSON)` semantics on
+    /// `cardano-ledger`'s `CoinPerByte`. The JSON shape MUST NOT become an
+    /// object — that would diverge from `cardano-cli protocol-parameters`.
+    #[test]
+    fn coin_per_byte_serde_is_transparent_uint() {
+        let c = CoinPerByte::new(44);
+        let json = serde_json::to_string(&c).unwrap();
+        assert_eq!(json, "44");
+        let parsed: CoinPerByte = serde_json::from_str("44").unwrap();
+        assert_eq!(parsed, c);
+    }
+
+    /// `ProtocolParameters::tx_fee_per_byte()` is the Dijkstra-named accessor;
+    /// it must surface exactly the same lovelace coefficient that
+    /// `min_fee()` uses.
+    #[test]
+    fn tx_fee_per_byte_matches_min_fee_formula() {
+        let mut pp = ProtocolParameters::mainnet_defaults();
+        pp.min_fee_a = 44;
+        pp.min_fee_b = 155_381;
+        assert_eq!(pp.tx_fee_per_byte(), CoinPerByte::new(44));
+        // fee = 44 * 200 + 155_381 = 164_181
+        assert_eq!(pp.min_fee(200).0, 164_181);
+        assert_eq!(
+            pp.min_fee(200).0,
+            pp.tx_fee_per_byte().lovelace() * 200 + pp.min_fee_b
+        );
+    }
+
+    /// Setter round-trip via the typed `CoinPerByte` newtype.
+    #[test]
+    fn set_tx_fee_per_byte_round_trip() {
+        let mut pp = ProtocolParameters::mainnet_defaults();
+        pp.set_tx_fee_per_byte(CoinPerByte::new(99));
+        assert_eq!(pp.min_fee_a, 99);
+        assert_eq!(pp.tx_fee_per_byte(), CoinPerByte::new(99));
+    }
+
+    /// Phase 4.3 documents the Haskell rename `minFeeA` → `txFeePerByte`. The
+    /// in-house JSON deserialiser must accept BOTH names so config files
+    /// produced by upstream tooling (and our own historical fixtures) round
+    /// trip without manual rewrite.
+    #[test]
+    fn protocol_params_accepts_tx_fee_per_byte_json_alias() {
+        let base = ProtocolParameters::mainnet_defaults();
+        let mut json = serde_json::to_value(&base).unwrap();
+        // Replace the snake_case key with the Haskell/upstream camelCase name.
+        let map = json.as_object_mut().unwrap();
+        let v = map.remove("min_fee_a").unwrap();
+        map.insert("txFeePerByte".to_string(), v);
+        let parsed: ProtocolParameters = serde_json::from_value(json).unwrap();
+        assert_eq!(parsed.min_fee_a, base.min_fee_a);
+    }
+
+    /// And the legacy `minFeeA` Haskell-pre-Dijkstra alias must also parse.
+    #[test]
+    fn protocol_params_accepts_min_fee_a_camel_alias() {
+        let base = ProtocolParameters::mainnet_defaults();
+        let mut json = serde_json::to_value(&base).unwrap();
+        let map = json.as_object_mut().unwrap();
+        let v = map.remove("min_fee_a").unwrap();
+        map.insert("minFeeA".to_string(), v);
+        let parsed: ProtocolParameters = serde_json::from_value(json).unwrap();
+        assert_eq!(parsed.min_fee_a, base.min_fee_a);
     }
 }
