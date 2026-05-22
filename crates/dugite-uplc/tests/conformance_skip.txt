@@ -20,43 +20,21 @@
 #
 # Current totals (regenerate by running `just uplc-conformance` and
 # re-categorising):
-#   parse_rejects_valid:        169  parser gaps (mostly PV1.1.0 `array`,
-#                                    `(value …)` constant, `insertCoin` /
-#                                    `lookupCoin` / `scaleValue` / `unValueData`
-#                                    builtin token-bundles, etc.)
-#   budget:                     390  CPU/mem cost-model divergence (per-builtin costs
+#   budget:                     521  CPU/mem cost-model divergence (per-builtin costs
 #                                    class — every per-step CPU charge needs
 #                                    to be aligned with the Haskell tiered model)
 #   eval_fails_unexpectedly:     74  CEK rejects programs the reference accepts
 #   result_mismatch:             65  CEK produces a different normal form
 #                                    than the reference
 #   ───────────────────────────────
-#   Total skipped:              698 / 999 (301 currently pass)
+#   Total skipped:              660 / 999 (339 currently pass)
 #
 # Goal: 0 / 999.
 
-
-# === parse_rejects_valid (169 tests) ===
-# parser rejects input that the Plutus reference accepts (typically a `(array T)` PV1.1.0 constant or some other newer grammar surface)
-builtin/constant/array/emptyArray
-builtin/constant/array/simpleArray
-builtin/constant/array/unitArray
-builtin/constant/string/string-04
-builtin/constant/string/string-07
-builtin/constant/value/duplicate-keys
-builtin/constant/value/empty
-builtin/constant/value/empty-tokens
-builtin/constant/value/max-key-length-1
-builtin/constant/value/max-key-length-2
-builtin/constant/value/multi
-builtin/constant/value/no-overflow
-builtin/constant/value/no-underflow
-builtin/constant/value/unordered
-builtin/constant/value/zero-asset
+# === budget (521 tests) ===
+# CPU/mem budget consumed by dugite-uplc differs from the Haskell golden — dugite-uplc cost model needs alignment
+# PV1.1.0 builtins: parse+eval correct, per-step CPU charges need cost-model alignment
 builtin/interleaving/iteStringString
-builtin/interleaving/iteUnforcedFullyApplied
-builtin/interleaving/iteWrongCondTypeFullyAppied
-builtin/interleaving/iteWrongCondTypePartiallyApplied
 builtin/semantics/bls12_381_G1_multiScalarMul/multiScalarMul-01
 builtin/semantics/bls12_381_G1_multiScalarMul/multiScalarMul-02a
 builtin/semantics/bls12_381_G1_multiScalarMul/multiScalarMul-02b
@@ -122,10 +100,6 @@ builtin/semantics/dropList/dropList-14
 builtin/semantics/dropList/dropList-15
 builtin/semantics/dropList/dropList-16
 builtin/semantics/indexArray/indexArray-01
-builtin/semantics/indexArray/indexArray-02
-builtin/semantics/indexArray/indexArray-03
-builtin/semantics/insertCoin/key-too-long-1
-builtin/semantics/insertCoin/key-too-long-2
 builtin/semantics/insertCoin/long-key-zero-1
 builtin/semantics/insertCoin/long-key-zero-2
 builtin/semantics/insertCoin/multi-ccy-empty
@@ -134,10 +108,8 @@ builtin/semantics/insertCoin/multi-token
 builtin/semantics/insertCoin/negative-empty
 builtin/semantics/insertCoin/no-overflow
 builtin/semantics/insertCoin/no-underflow
-builtin/semantics/insertCoin/overflow
 builtin/semantics/insertCoin/positive-empty
 builtin/semantics/insertCoin/positive-nonempty
-builtin/semantics/insertCoin/underflow
 builtin/semantics/insertCoin/zero-positive
 builtin/semantics/lengthOfArray/lengthOfArray-01
 builtin/semantics/lengthOfArray/lengthOfArray-02
@@ -150,9 +122,6 @@ builtin/semantics/scaleValue/by-pos
 builtin/semantics/scaleValue/by-zero
 builtin/semantics/scaleValue/no-overflow
 builtin/semantics/scaleValue/no-underflow
-builtin/semantics/scaleValue/overflow
-builtin/semantics/scaleValue/underflow
-builtin/semantics/unValueData/currency-key-too-long
 builtin/semantics/unValueData/data-duplicate-currencies
 builtin/semantics/unValueData/data-duplicate-currencies-cancel
 builtin/semantics/unValueData/data-duplicate-currencies-merge
@@ -167,19 +136,8 @@ builtin/semantics/unValueData/max-key-len
 builtin/semantics/unValueData/multi-currency
 builtin/semantics/unValueData/multi-token
 builtin/semantics/unValueData/negative-quantity
-builtin/semantics/unValueData/non-bytestring-currency
-builtin/semantics/unValueData/non-bytestring-token
-builtin/semantics/unValueData/non-integer-quantity
-builtin/semantics/unValueData/non-map-bytes
-builtin/semantics/unValueData/non-map-constr
-builtin/semantics/unValueData/non-map-integer
-builtin/semantics/unValueData/non-map-list
-builtin/semantics/unValueData/non-map-tokens
-builtin/semantics/unValueData/quantity-overflow
-builtin/semantics/unValueData/quantity-underflow
 builtin/semantics/unValueData/roundtrip-from-data
 builtin/semantics/unValueData/single-entry
-builtin/semantics/unValueData/token-key-too-long
 builtin/semantics/unionValue/cancel-01
 builtin/semantics/unionValue/cancel-02
 builtin/semantics/unionValue/combine
@@ -207,9 +165,6 @@ builtin/semantics/valueData/multi-token
 builtin/semantics/valueData/negative-quantity
 builtin/semantics/valueData/roundtrip-from-value
 builtin/semantics/valueData/single-entry
-
-# === budget (390 tests) ===
-# CPU/mem budget consumed by dugite-uplc differs from the Haskell golden â dugite-uplc cost model needs alignment
 builtin/interleaving/iteAtIntegerArrowIntegerApplied1
 builtin/interleaving/iteAtIntegerArrowIntegerApplied2
 builtin/interleaving/iteAtIntegerArrowIntegerAppliedApplied
