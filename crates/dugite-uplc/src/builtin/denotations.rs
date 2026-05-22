@@ -1108,10 +1108,12 @@ pub fn denote(id: BuiltinId, args: Vec<Value>) -> Result<Value, UplcError> {
             // (policy: ByteString) (token: ByteString) (amount: Integer)
             // (value: Value) -> Value
             //
-            // Adds `amount` to the given (policy, token) entry in the value.
-            // If the resulting amount is zero the entry is removed.
-            // Overflow / underflow beyond i128 → BuiltinFailure.
-            // Keys longer than 32 bytes → BuiltinFailure.
+            // Mirrors the Haskell `insertCoin` semantics exactly:
+            //   - amount == 0  → deleteCoin (remove entry if present; no key checks)
+            //   - amount != 0  → validate keys (≤32 bytes) and amount (i128 range),
+            //                    then SET (not add) the entry to `amount`.
+            // Keys longer than 32 bytes with non-zero amount → BuiltinFailure.
+            // Amount outside i128 range → BuiltinFailure.
             let mut it = args.into_iter();
             let policy =
                 unwrap_byte_string(it.next().ok_or_else(|| builtin_arity_mismatch(id))?, id)?;
@@ -1120,11 +1122,20 @@ pub fn denote(id: BuiltinId, args: Vec<Value>) -> Result<Value, UplcError> {
             let amount_bi =
                 unwrap_integer(it.next().ok_or_else(|| builtin_arity_mismatch(id))?, id)?;
             let mut val = unwrap_value(it.next().ok_or_else(|| builtin_arity_mismatch(id))?, id)?;
-            use num_traits::ToPrimitive;
-            let amount = amount_bi
-                .to_i128()
-                .ok_or_else(|| builtin_failure(id, "insertCoin: amount out of i128 range"))?;
-            // Key length checks (32-byte limit per Cardano ledger rules).
+
+            // amount == 0 → deleteCoin: remove entry if present; bypass key checks.
+            use num_traits::{ToPrimitive, Zero};
+            if amount_bi.is_zero() {
+                if let Some(inner) = val.get_mut(&policy) {
+                    inner.remove(&token);
+                    if inner.is_empty() {
+                        val.remove(&policy);
+                    }
+                }
+                return Ok(Value::Const(Constant::Value(val)));
+            }
+
+            // Non-zero amount: validate key lengths (32-byte limit per Plutus ledger rules).
             const MAX_KEY: usize = 32;
             if policy.len() > MAX_KEY {
                 return Err(builtin_failure(
@@ -1138,20 +1149,14 @@ pub fn denote(id: BuiltinId, args: Vec<Value>) -> Result<Value, UplcError> {
                     "insertCoin: token-name exceeds 32 bytes",
                 ));
             }
-            let inner = val.entry(policy.clone()).or_default();
-            let cur = inner.entry(token.clone()).or_default();
-            // Checked addition: i128 models Plutus Integer; overflow is a builtin failure.
-            let new_amt = cur
-                .checked_add(amount)
-                .ok_or_else(|| builtin_failure(id, "insertCoin: amount overflow"))?;
-            if new_amt == 0 {
-                inner.remove(&token);
-                if inner.is_empty() {
-                    val.remove(&policy);
-                }
-            } else {
-                *cur = new_amt;
-            }
+
+            // Validate amount is within signed 128-bit range.
+            let amount = amount_bi
+                .to_i128()
+                .ok_or_else(|| builtin_failure(id, "insertCoin: amount out of i128 range"))?;
+
+            // SET semantics: insert or overwrite the (policy, token) entry.
+            val.entry(policy.clone()).or_default().insert(token, amount);
             Ok(Value::Const(Constant::Value(val)))
         }
 
@@ -1207,12 +1212,19 @@ pub fn denote(id: BuiltinId, args: Vec<Value>) -> Result<Value, UplcError> {
             //
             // Decodes a Data value of the form
             //   Map [(B policy, Map [(B token, I amount), ...]), ...]
-            // into a canonical Value.  The Haskell reference validates:
-            //   - Outer and inner must be Map data.
-            //   - Keys must be B (bytes), amounts must be I (integer).
-            //   - No key longer than 32 bytes.
-            //   - No integer outside i128 range.
-            //   - Duplicate keys: amounts are summed; zero entries removed.
+            // into a canonical Value.
+            //
+            // The Haskell reference (`PlutusCore.Value.buildValueWith`) validates:
+            //   1. The outer and inner maps must be Map data constructors.
+            //   2. Currency/token keys must be B constructors with ≤ 32 bytes.
+            //   3. Amounts must be I constructors within signed 128-bit range.
+            //   4. Amounts must NOT be zero (zero quantity → evaluation failure).
+            //   5. Currency symbols must be STRICTLY ASCENDING (no duplicates,
+            //      no out-of-order entries).
+            //   6. Token names within each currency must be STRICTLY ASCENDING.
+            //   7. Inner maps must NOT be empty.
+            // All of these are failure conditions — unValueData does NOT merge
+            // duplicates or normalise zeros.
             let d = unwrap_data(take_one(args, id)?, id)?;
             use crate::data::Data;
             let outer_pairs = match d {
@@ -1222,6 +1234,7 @@ pub fn denote(id: BuiltinId, args: Vec<Value>) -> Result<Value, UplcError> {
             const MAX_KEY: usize = 32;
             use num_traits::ToPrimitive;
             let mut result: ValueMap = BTreeMap::new();
+            let mut prev_policy: Option<Vec<u8>> = None;
             for (k, v) in outer_pairs {
                 let policy = match k {
                     Data::B(b) => b,
@@ -1233,13 +1246,29 @@ pub fn denote(id: BuiltinId, args: Vec<Value>) -> Result<Value, UplcError> {
                         "unValueData: policy-id exceeds 32 bytes",
                     ));
                 }
+                // Strictly ascending check for currency symbols.
+                if let Some(ref prev) = prev_policy {
+                    if policy <= *prev {
+                        return Err(builtin_failure(
+                            id,
+                            "unValueData: currency symbols not strictly ascending",
+                        ));
+                    }
+                }
+                prev_policy = Some(policy.clone());
+
                 let inner_pairs = match v {
                     Data::Map(pairs) => pairs,
                     _ => {
                         return Err(builtin_failure(id, "unValueData: expected inner Map"));
                     }
                 };
+                // Empty inner map is a failure.
+                if inner_pairs.is_empty() {
+                    return Err(builtin_failure(id, "unValueData: empty inner map"));
+                }
                 let inner_map = result.entry(policy).or_default();
+                let mut prev_token: Option<Vec<u8>> = None;
                 for (tk, tv) in inner_pairs {
                     let token = match tk {
                         Data::B(b) => b,
@@ -1251,6 +1280,17 @@ pub fn denote(id: BuiltinId, args: Vec<Value>) -> Result<Value, UplcError> {
                             "unValueData: token-name exceeds 32 bytes",
                         ));
                     }
+                    // Strictly ascending check for token names.
+                    if let Some(ref prev) = prev_token {
+                        if token <= *prev {
+                            return Err(builtin_failure(
+                                id,
+                                "unValueData: token names not strictly ascending",
+                            ));
+                        }
+                    }
+                    prev_token = Some(token.clone());
+
                     let amount_bi = match tv {
                         Data::I(i) => i,
                         _ => {
@@ -1260,14 +1300,13 @@ pub fn denote(id: BuiltinId, args: Vec<Value>) -> Result<Value, UplcError> {
                     let amount = amount_bi.to_i128().ok_or_else(|| {
                         builtin_failure(id, "unValueData: amount outside i128 range")
                     })?;
-                    *inner_map.entry(token).or_default() += amount;
+                    // Zero quantity is not allowed.
+                    if amount == 0 {
+                        return Err(builtin_failure(id, "unValueData: zero quantity"));
+                    }
+                    inner_map.insert(token, amount);
                 }
             }
-            // Remove zeros and empty inner maps.
-            for inner in result.values_mut() {
-                inner.retain(|_, v| *v != 0);
-            }
-            result.retain(|_, inner| !inner.is_empty());
             Ok(Value::Const(Constant::Value(result)))
         }
 
@@ -1291,12 +1330,32 @@ pub fn denote(id: BuiltinId, args: Vec<Value>) -> Result<Value, UplcError> {
 
         ValueContains => {
             // (super_val: Value) (sub_val: Value) -> Bool
-            // Returns True if every (policy, token) present in sub_val is
-            // present in super_val with an amount ≥ the sub amount.
-            // Negative amounts in sub_val: uses signed comparison.
+            //
+            // Mirrors the Haskell `valueContains` semantics:
+            //   - Fails (BuiltinFailure) if EITHER value contains negative amounts.
+            //   - Returns True iff sub_val is a sub-map-by-≤ of super_val.
             let mut it = args.into_iter();
             let sup = unwrap_value(it.next().ok_or_else(|| builtin_arity_mismatch(id))?, id)?;
             let sub = unwrap_value(it.next().ok_or_else(|| builtin_arity_mismatch(id))?, id)?;
+            // Check for negative amounts in either value.
+            let has_negative = |map: &BTreeMap<Vec<u8>, BTreeMap<Vec<u8>, i128>>| {
+                map.values()
+                    .flat_map(|inner| inner.values())
+                    .any(|&amt| amt < 0)
+            };
+            if has_negative(&sup) {
+                return Err(builtin_failure(
+                    id,
+                    "valueContains: first value contains negative amounts",
+                ));
+            }
+            if has_negative(&sub) {
+                return Err(builtin_failure(
+                    id,
+                    "valueContains: second value contains negative amounts",
+                ));
+            }
+            // sub must be a sub-map-by-≤ of sup.
             let mut ok = true;
             'outer: for (policy, inner_sub) in &sub {
                 let inner_sup = match sup.get(policy) {
@@ -1320,13 +1379,20 @@ pub fn denote(id: BuiltinId, args: Vec<Value>) -> Result<Value, UplcError> {
         UnionValue => {
             // (a: Value) (b: Value) -> Value
             // Merges two values by summing amounts; zero entries are removed.
+            // Overflow/underflow beyond i128 range → BuiltinFailure.
             let mut it = args.into_iter();
             let mut a = unwrap_value(it.next().ok_or_else(|| builtin_arity_mismatch(id))?, id)?;
             let b = unwrap_value(it.next().ok_or_else(|| builtin_arity_mismatch(id))?, id)?;
             for (policy, inner_b) in b {
                 let inner_a = a.entry(policy).or_default();
-                for (token, amt) in inner_b {
-                    *inner_a.entry(token).or_default() += amt;
+                for (token, amt_b) in inner_b {
+                    let slot = inner_a.entry(token).or_insert(0);
+                    *slot = slot.checked_add(amt_b).ok_or_else(|| {
+                        builtin_failure(
+                            id,
+                            "unionValue: quantity is out of the signed 128-bit integer bounds",
+                        )
+                    })?;
                 }
             }
             // Remove zeros and empty inner maps.
