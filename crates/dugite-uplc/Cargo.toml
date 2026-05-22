@@ -64,6 +64,15 @@ thiserror = { workspace = true }
 # Hex display for Data debug output.
 hex = { workspace = true }
 
+# In-house tx + utxo decoders for phase-2. Used by `phase_two.rs` to lift
+# the raw CBOR the ledger passes us into typed `Transaction` / `TransactionInput`
+# / `TransactionOutput` values before TxInfo construction. Both dugite-primitives
+# and dugite-serialization are first-party crates with no third-party UPLC
+# dependency, so they do not violate the "no aiken-uplc, no pallas, no
+# amaru-uplc" rule.
+dugite-primitives = { workspace = true }
+dugite-serialization = { workspace = true }
+
 # Cross-validation only — pragma-org/uplc (`amaru-uplc`) is pinned at a
 # stable revision and used solely by `tests/cross_validate_*.rs` to
 # differential-test our codecs against another Rust UPLC implementation.

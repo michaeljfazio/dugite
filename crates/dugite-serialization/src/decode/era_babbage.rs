@@ -1020,6 +1020,25 @@ pub(crate) fn decode_babbage_tx_standalone(cbor: &[u8]) -> Result<Transaction, S
     })
 }
 
+/// Decode a single Babbage `transaction_output` CBOR value.
+///
+/// Babbage outputs are either a legacy 2-or-3-element array or the
+/// post-Alonzo `{ 0: addr, 1: value, ? 2: datum_option, ? 3: script_ref }`
+/// map. The decoder accepts either form.
+///
+/// Used by [`crate::decode::decode_transaction_output`] (Babbage dispatch)
+/// and by `dugite-uplc`'s phase-2 evaluator to decode resolved-UTxO CBOR
+/// pairs.
+pub(crate) fn decode_babbage_tx_output_standalone(
+    cbor: &[u8],
+) -> Result<TransactionOutput, SerializationError> {
+    let mut r = Reader::new(cbor);
+    let raw = KeepRaw::parse_with(&mut r, read_babbage_tx_output)?;
+    let mut output = raw.value;
+    output.raw_cbor = Some(raw.raw.to_vec());
+    Ok(output)
+}
+
 // ============================================================================
 // Tests
 // ============================================================================

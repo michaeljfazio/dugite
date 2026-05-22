@@ -43,6 +43,7 @@
 //! transitive `pallas-*` chain comes with it.
 
 use crate::machine::cost::ExBudget;
+use dugite_primitives::transaction::{Transaction, TransactionInput, TransactionOutput};
 
 /// Slot config — `(network_start_unix_seconds, slot_zero_offset,
 /// slot_length_ms)`. Mirrors the Cardano `SlotConfig` used to
@@ -52,6 +53,26 @@ pub struct SlotConfig {
     pub network_start_unix_seconds: u64,
     pub slot_zero_offset: u64,
     pub slot_length_ms: u32,
+}
+
+/// The "fully decoded" inputs to phase-2 evaluation. Constructed once at
+/// the top of [`eval_phase_two_raw`] and consumed by all downstream
+/// TxInfo-population / ScriptContext-building steps.
+///
+/// The `output_raw_cbor` slice retained per UTxO is the exact bytes the
+/// caller passed in; preserving them lets the downstream TxInfo builder
+/// hand reference scripts back to the CEK machine byte-exact and keeps
+/// us aligned with the script-data-hash domain.
+//
+// Fields are read by tests in this module and will be consumed by UPLC-9
+// parts 2-4 (TxInfo population, ScriptContext build, CEK eval).
+#[allow(dead_code)]
+#[derive(Debug)]
+pub(crate) struct DecodedPhaseTwoInputs {
+    /// The decoded transaction.
+    pub tx: Transaction,
+    /// The resolved UTxO entries: `(input, output, output_raw_cbor)` triples.
+    pub utxos: Vec<(TransactionInput, TransactionOutput, Vec<u8>)>,
 }
 
 /// Per-redeemer evaluation result. Returned by
@@ -128,8 +149,8 @@ impl RedeemerObserver for () {
 /// `observer` is invoked once per redeemer with its raw CBOR bytes,
 /// before the CEK evaluation. Pass `()` if you don't need this.
 pub fn eval_phase_two_raw<O: RedeemerObserver>(
-    _tx_cbor: &[u8],
-    _utxos: &[(Vec<u8>, Vec<u8>)],
+    tx_cbor: &[u8],
+    utxos: &[(Vec<u8>, Vec<u8>)],
     _cost_models_cbor: Option<&[u8]>,
     _initial_budget: (u64, u64),
     _slot_config: SlotConfig,
@@ -137,40 +158,343 @@ pub fn eval_phase_two_raw<O: RedeemerObserver>(
     _observer: &mut O,
 ) -> Result<Vec<RedeemerResult>, PhaseTwoError> {
     // Wire-up checklist before this returns Ok(...):
-    //   1. Decode tx via dugite-serialization
-    //   2. Decode UTxO entries
-    //   3. Parse cost models per Plutus version
-    //   4. Build per-version TxInfo
-    //   5. For each redeemer:
+    //   1. Decode tx via dugite-serialization                ── DONE (UPLC-9 part 1)
+    //   2. Decode UTxO entries                               ── DONE (UPLC-9 part 1)
+    //   3. Parse cost models per Plutus version              ── UPLC-9 part 2
+    //   4. Build per-version TxInfo                          ── UPLC-9 part 3
+    //   5. For each redeemer:                                ── UPLC-9 part 4
     //      a. Resolve script (witness set or reference input)
     //      b. Resolve datum (V1/V2 only)
     //      c. Build ScriptContext + encode to Data
     //      d. Apply args + evaluate via CEK with budget tracker
     //      e. Push RedeemerResult
+    let _decoded = decode_phase_two_inputs(tx_cbor, utxos)?;
     Err(PhaseTwoError::NotImplemented)
+}
+
+/// Decode the wire-format inputs (`tx_cbor` + resolved-UTxO pairs) the ledger
+/// hands to [`eval_phase_two_raw`].
+///
+/// The transaction is decoded by trying eras Conway → Babbage → Alonzo in turn
+/// (which covers every era that admits Plutus scripts). The first success
+/// wins, and the decoded `Transaction::era` is then used as the era hint for
+/// every UTxO output the same caller supplies. Each input CBOR is decoded
+/// era-agnostically (the `[tx_hash(32), index]` shape is era-invariant from
+/// Shelley onwards).
+///
+/// On failure, returns a [`PhaseTwoError`] variant naming exactly which part
+/// could not be decoded (transaction body, input #N, or output #N) so the
+/// caller's logs surface the offending entry.
+pub(crate) fn decode_phase_two_inputs(
+    tx_cbor: &[u8],
+    utxos: &[(Vec<u8>, Vec<u8>)],
+) -> Result<DecodedPhaseTwoInputs, PhaseTwoError> {
+    let tx = decode_tx_multi_era(tx_cbor)?;
+    let output_era_id = era_id_for_outputs(&tx);
+    let mut decoded_utxos: Vec<(TransactionInput, TransactionOutput, Vec<u8>)> =
+        Vec::with_capacity(utxos.len());
+    for (idx, (input_cbor, output_cbor)) in utxos.iter().enumerate() {
+        let input = dugite_serialization::decode_transaction_input(input_cbor)
+            .map_err(|e| PhaseTwoError::UtxoDecode(format!("utxo #{idx} input: {e}")))?;
+        let output = dugite_serialization::decode_transaction_output(output_era_id, output_cbor)
+            .map_err(|e| PhaseTwoError::UtxoDecode(format!("utxo #{idx} output: {e}")))?;
+        decoded_utxos.push((input, output, output_cbor.clone()));
+    }
+    Ok(DecodedPhaseTwoInputs {
+        tx,
+        utxos: decoded_utxos,
+    })
+}
+
+/// Attempt to decode `tx_cbor` as a Conway/Babbage/Alonzo transaction.
+///
+/// We try post-Alonzo eras in newest-first order because (a) at-tip txs are
+/// nearly always Conway today and (b) Conway accepts the strictest CDDL, so
+/// a successful Conway decode is the strongest era signal. If every era
+/// rejects the bytes, we surface the **last** (= oldest-era / least-strict)
+/// decoder's error, which is the most likely to describe a real malformedness
+/// rather than an era mismatch.
+fn decode_tx_multi_era(tx_cbor: &[u8]) -> Result<Transaction, PhaseTwoError> {
+    // Era ids in dispatch order: Conway, Babbage, Alonzo. (Dijkstra shares
+    // Conway's wire shape; the conway decoder accepts both — we don't need to
+    // try id=7 separately.) Plutus is impossible in Allegra/Mary/Shelley/Byron
+    // so we never attempt those.
+    let mut last_err: Option<String> = None;
+    for era_id in [6u16, 5, 4] {
+        match dugite_serialization::decode_transaction(era_id, tx_cbor) {
+            Ok(tx) => return Ok(tx),
+            Err(e) => last_err = Some(format!("era_id={era_id}: {e}")),
+        }
+    }
+    Err(PhaseTwoError::TxDecode(last_err.unwrap_or_else(|| {
+        "phase-2 tx decode: no era accepted the bytes".to_string()
+    })))
+}
+
+/// Map a decoded [`Transaction::era`] back to the `era_id` accepted by
+/// [`dugite_serialization::decode_transaction_output`]. We restrict the
+/// codomain to Plutus-capable eras and fall back to Conway for any future
+/// era we have not yet enumerated — that is the safest default since Conway
+/// outputs accept the legacy array form too.
+fn era_id_for_outputs(tx: &Transaction) -> u16 {
+    use dugite_primitives::era::Era;
+    match tx.era {
+        Era::Allegra => 2,
+        Era::Mary => 3,
+        Era::Alonzo => 4,
+        Era::Babbage => 5,
+        Era::Conway => 6,
+        Era::Dijkstra => 7,
+        // Byron / Shelley have no Plutus scripts. If we somehow end up here,
+        // treat outputs as Conway (the most-permissive shape) so downstream
+        // wiring can surface a meaningful failure rather than a panic.
+        Era::Byron | Era::Shelley => 6,
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use dugite_primitives::era::Era;
+
+    // ─────────────────────────────────────────────────────────────
+    // CBOR builders (kept tiny — only what these tests need)
+    // ─────────────────────────────────────────────────────────────
+
+    fn minimal_conway_tx_cbor() -> Vec<u8> {
+        // tx = [body, witness_set, is_valid, aux] with body = {0: [], 1: [], 2: fee}.
+        // Matches the minimal-but-valid Conway tx the era_conway tests use.
+        let mut tx = vec![0x84]; // array(4)
+        tx.push(0xa3); // map(3): tx_body
+        tx.push(0x00); // key 0 = inputs
+        tx.push(0x80); // array(0)
+        tx.push(0x01); // key 1 = outputs
+        tx.push(0x80); // array(0)
+        tx.push(0x02); // key 2 = fee
+        tx.push(0x1a); // uint(u32)
+        tx.extend(123_456u32.to_be_bytes());
+        tx.push(0xa0); // map(0): witness_set
+        tx.push(0xf5); // is_valid = true
+        tx.push(0xf6); // aux_data = null
+        tx
+    }
+
+    fn minimal_conway_tx_cbor_with_two_inputs() -> Vec<u8> {
+        // Same minimal tx but with two declared inputs (we don't care about UTxO
+        // resolution in this test — just shape parsing).
+        // Inputs encoded as set-tagged-258 in Conway.
+        let mut tx = vec![0x84];
+        tx.push(0xa3);
+        tx.push(0x00); // inputs
+                       // tag 258: 0xd9 0x01 0x02
+        tx.extend([0xd9, 0x01, 0x02]);
+        tx.push(0x82); // array(2)
+                       // input 0
+        tx.push(0x82); // array(2)
+        tx.push(0x58); // bytes(32)
+        tx.push(32);
+        tx.extend([0x11; 32]);
+        tx.push(0x00); // index 0
+                       // input 1
+        tx.push(0x82);
+        tx.push(0x58);
+        tx.push(32);
+        tx.extend([0x22; 32]);
+        tx.push(0x01); // index 1
+        tx.push(0x01); // outputs
+        tx.push(0x80);
+        tx.push(0x02); // fee
+        tx.push(0x18);
+        tx.push(99);
+        tx.push(0xa0);
+        tx.push(0xf5);
+        tx.push(0xf6);
+        tx
+    }
+
+    fn make_input_cbor(hash_byte: u8, idx: u32) -> Vec<u8> {
+        let mut v = vec![0x82, 0x58, 0x20];
+        v.extend(std::iter::repeat_n(hash_byte, 32));
+        v.push(0x1a);
+        v.extend(idx.to_be_bytes());
+        v
+    }
+
+    fn make_conway_map_output_cbor(lovelace: u32) -> Vec<u8> {
+        let mut out = vec![0xa2, 0x00, 0x58, 29, 0x60];
+        out.extend([0xab; 28]);
+        out.push(0x01);
+        out.push(0x1a);
+        out.extend(lovelace.to_be_bytes());
+        out
+    }
+
+    fn default_slot_config() -> SlotConfig {
+        SlotConfig {
+            network_start_unix_seconds: 1_596_491_091,
+            slot_zero_offset: 4_492_800,
+            slot_length_ms: 1_000,
+        }
+    }
+
+    // ─────────────────────────────────────────────────────────────
+    // Decode path
+    // ─────────────────────────────────────────────────────────────
 
     #[test]
-    fn stub_returns_not_implemented() {
+    fn decode_phase_two_inputs_lifts_minimal_conway_tx() {
+        let tx_cbor = minimal_conway_tx_cbor();
+        let decoded = decode_phase_two_inputs(&tx_cbor, &[]).expect("decode");
+        assert_eq!(decoded.tx.era, Era::Conway);
+        assert_eq!(decoded.tx.body.fee.0, 123_456);
+        assert!(decoded.utxos.is_empty());
+    }
+
+    #[test]
+    fn decode_phase_two_inputs_decodes_each_utxo_entry() {
+        let tx_cbor = minimal_conway_tx_cbor_with_two_inputs();
+        let utxos = vec![
+            (
+                make_input_cbor(0x11, 0),
+                make_conway_map_output_cbor(1_000_000),
+            ),
+            (
+                make_input_cbor(0x22, 1),
+                make_conway_map_output_cbor(2_500_000),
+            ),
+        ];
+        let decoded = decode_phase_two_inputs(&tx_cbor, &utxos).expect("decode");
+        assert_eq!(decoded.utxos.len(), 2);
+        assert_eq!(decoded.utxos[0].0.index, 0);
+        assert_eq!(decoded.utxos[0].1.value.coin.0, 1_000_000);
+        assert_eq!(decoded.utxos[1].0.index, 1);
+        assert_eq!(decoded.utxos[1].1.value.coin.0, 2_500_000);
+        // raw output bytes are preserved verbatim for the downstream TxInfo builder.
+        assert_eq!(decoded.utxos[0].2, utxos[0].1);
+        assert_eq!(decoded.utxos[1].2, utxos[1].1);
+    }
+
+    #[test]
+    fn decode_phase_two_inputs_reports_failing_utxo_index() {
+        // Valid tx, two utxos — second one's output is malformed.
+        let tx_cbor = minimal_conway_tx_cbor_with_two_inputs();
+        let utxos = vec![
+            (
+                make_input_cbor(0x11, 0),
+                make_conway_map_output_cbor(1_000_000),
+            ),
+            (make_input_cbor(0x22, 1), vec![0xff]), // bogus
+        ];
+        let err = decode_phase_two_inputs(&tx_cbor, &utxos).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("utxo #1 output"),
+            "error should name the failing entry: {msg}"
+        );
+    }
+
+    #[test]
+    fn decode_phase_two_inputs_reports_failing_input() {
+        let tx_cbor = minimal_conway_tx_cbor();
+        let utxos = vec![(vec![0xff], make_conway_map_output_cbor(1))];
+        let err = decode_phase_two_inputs(&tx_cbor, &utxos).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("utxo #0 input"), "got: {msg}");
+    }
+
+    #[test]
+    fn decode_phase_two_inputs_rejects_empty_tx_cbor() {
+        let err = decode_phase_two_inputs(&[], &[]).unwrap_err();
+        assert!(matches!(err, PhaseTwoError::TxDecode(_)));
+    }
+
+    #[test]
+    fn decode_phase_two_inputs_rejects_garbage_tx_cbor() {
+        // None of the post-Alonzo era decoders accept a bare break byte.
+        let err = decode_phase_two_inputs(&[0xff], &[]).unwrap_err();
+        assert!(matches!(err, PhaseTwoError::TxDecode(_)));
+    }
+
+    // ─────────────────────────────────────────────────────────────
+    // eval_phase_two_raw — still NotImplemented after decode lands
+    // ─────────────────────────────────────────────────────────────
+
+    #[test]
+    fn eval_phase_two_raw_reaches_not_implemented_after_decode() {
+        // With a valid tx + no utxos, decode succeeds; the function must then
+        // surface NotImplemented (the wire-up checklist's next step). This
+        // pins the boundary so we notice if a downstream PR forgets to remove
+        // the NotImplemented marker.
+        let tx_cbor = minimal_conway_tx_cbor();
         let result = eval_phase_two_raw(
-            &[],
+            &tx_cbor,
             &[],
             None,
             (10_000_000, 10_000_000),
-            SlotConfig {
-                network_start_unix_seconds: 1_596_491_091,
-                slot_zero_offset: 4_492_800,
-                slot_length_ms: 1_000,
-            },
+            default_slot_config(),
             true,
             &mut (),
         );
         assert!(matches!(result, Err(PhaseTwoError::NotImplemented)));
     }
+
+    #[test]
+    fn eval_phase_two_raw_surfaces_tx_decode_failure() {
+        // Empty/garbage tx must surface as TxDecode (not NotImplemented and
+        // not a panic). This is the adversarial-input guarantee from
+        // lib.rs §1.
+        let result =
+            eval_phase_two_raw(&[], &[], None, (1, 1), default_slot_config(), true, &mut ());
+        assert!(matches!(result, Err(PhaseTwoError::TxDecode(_))));
+    }
+
+    #[test]
+    fn eval_phase_two_raw_surfaces_utxo_decode_failure() {
+        // Valid tx but malformed utxo output: must surface as UtxoDecode.
+        let tx_cbor = minimal_conway_tx_cbor();
+        let result = eval_phase_two_raw(
+            &tx_cbor,
+            &[(make_input_cbor(0xaa, 0), vec![0xff])],
+            None,
+            (1, 1),
+            default_slot_config(),
+            true,
+            &mut (),
+        );
+        assert!(matches!(result, Err(PhaseTwoError::UtxoDecode(_))));
+    }
+
+    // ─────────────────────────────────────────────────────────────
+    // era → output_id mapping
+    // ─────────────────────────────────────────────────────────────
+
+    #[test]
+    fn era_id_for_outputs_covers_plutus_eras() {
+        let mut tx =
+            dugite_serialization::decode_transaction(6, &minimal_conway_tx_cbor()).unwrap();
+        tx.era = Era::Alonzo;
+        assert_eq!(era_id_for_outputs(&tx), 4);
+        tx.era = Era::Babbage;
+        assert_eq!(era_id_for_outputs(&tx), 5);
+        tx.era = Era::Conway;
+        assert_eq!(era_id_for_outputs(&tx), 6);
+        tx.era = Era::Dijkstra;
+        assert_eq!(era_id_for_outputs(&tx), 7);
+    }
+
+    #[test]
+    fn era_id_for_outputs_falls_back_to_conway_for_non_plutus_eras() {
+        let mut tx =
+            dugite_serialization::decode_transaction(6, &minimal_conway_tx_cbor()).unwrap();
+        for non_plutus_era in [Era::Byron, Era::Shelley] {
+            tx.era = non_plutus_era;
+            assert_eq!(era_id_for_outputs(&tx), 6, "era={non_plutus_era:?}");
+        }
+    }
+
+    // ─────────────────────────────────────────────────────────────
+    // Trivia coverage retained from the API skeleton
+    // ─────────────────────────────────────────────────────────────
 
     #[test]
     fn unit_redeemer_observer_is_no_op() {
@@ -180,12 +504,8 @@ mod tests {
 
     #[test]
     fn slot_config_is_copy() {
-        let sc = SlotConfig {
-            network_start_unix_seconds: 0,
-            slot_zero_offset: 0,
-            slot_length_ms: 1000,
-        };
-        let _sc2 = sc; // Copy
-        let _sc3 = sc; // still usable
+        let sc = default_slot_config();
+        let _sc2 = sc;
+        let _sc3 = sc;
     }
 }

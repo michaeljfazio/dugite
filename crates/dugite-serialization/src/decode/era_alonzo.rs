@@ -1413,6 +1413,27 @@ pub(crate) fn decode_alonzo_family_tx_standalone(
     })
 }
 
+/// Decode a single Alonzo-family (Allegra / Mary / Alonzo) `transaction_output`
+/// CBOR value.
+///
+/// Alonzo outputs are always the legacy array form: `[address, value]` or
+/// `[address, value, datum_hash]`. The `era` is forwarded to
+/// [`read_alonzo_tx_output`] for diagnostic context.
+///
+/// Used by [`crate::decode::decode_transaction_output`] (Allegra/Mary/Alonzo
+/// dispatch) and by `dugite-uplc`'s phase-2 evaluator to decode resolved-UTxO
+/// CBOR pairs.
+pub(crate) fn decode_alonzo_tx_output_standalone(
+    cbor: &[u8],
+    era: Era,
+) -> Result<TransactionOutput, SerializationError> {
+    let mut r = Reader::new(cbor);
+    let raw = KeepRaw::parse_with(&mut r, |r| read_alonzo_tx_output(r, era))?;
+    let mut output = raw.value;
+    output.raw_cbor = Some(raw.raw.to_vec());
+    Ok(output)
+}
+
 // ============================================================================
 // Tests
 // ============================================================================
