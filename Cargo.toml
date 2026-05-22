@@ -14,6 +14,7 @@ members = [
     "crates/dugite-integration-tests",
     "crates/dugite-monitor",
     "crates/dugite-config",
+    "crates/dugite-uplc",
     "tests/conformance",
     "tests/golden",
 ]
@@ -40,6 +41,7 @@ dugite-node = { path = "crates/dugite-node" }
 dugite-cli = { path = "crates/dugite-cli" }
 dugite-lsm = { path = "crates/dugite-lsm" }
 dugite-monitor = { path = "crates/dugite-monitor" }
+dugite-uplc = { path = "crates/dugite-uplc" }
 
 # Terminal UI
 ratatui = "0.30"

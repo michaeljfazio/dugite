@@ -1414,6 +1414,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "dugite-uplc"
+version = "1.7.0"
+dependencies = [
+ "blake2 0.10.6",
+ "hex",
+ "minicbor 0.26.5",
+ "num-bigint",
+ "num-traits",
+ "proptest",
+ "serde_json",
+ "sha2 0.11.0",
+ "sha3",
+ "thiserror 2.0.18",
+ "tracing",
+]
+
+[[package]]
 name = "dyn-clone"
 version = "1.0.20"
 source = "registry+https://github.com/rust-lang/crates.io-index"
