@@ -32,11 +32,8 @@
 #                                    than the reference
 #   should_fail_eval:            15  CEK accepts programs the reference rejects
 #                                    at evaluation
-#   should_fail_parse:           10  parser accepts programs the reference
-#                                    rejects at parse (over-permissive lexer
-#                                    in our integer / string handling)
 #   ───────────────────────────────
-#   Total skipped:              723 / 999 (276 currently pass)
+#   Total skipped:              713 / 999 (286 currently pass)
 #
 # Goal: 0 / 999.
 
@@ -769,15 +766,3 @@ builtin/semantics/verifyEcdsaSecp256k1Signature/test-vector-18
 builtin/semantics/verifySchnorrSecp256k1Signature/test-vector-05
 builtin/semantics/verifySchnorrSecp256k1Signature/test-vector-14
 
-# === should_fail_parse (10 tests) ===
-# dugite-uplc accepts a program the reference rejects at parse
-builtin/constant/bls12-381/G1/bad-zero-01
-builtin/constant/bls12-381/G1/bad-zero-02
-builtin/constant/bls12-381/G1/bad-zero-03
-builtin/constant/bls12-381/G1/off-curve
-builtin/constant/bls12-381/G1/out-of-group
-builtin/constant/bls12-381/G2/bad-zero-01
-builtin/constant/bls12-381/G2/bad-zero-02
-builtin/constant/bls12-381/G2/off-curve
-builtin/constant/bls12-381/G2/out-of-group
-term/constr/constr-06

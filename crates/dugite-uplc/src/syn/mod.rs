@@ -327,4 +327,55 @@ mod tests {
         assert!(parse_signed_bigint("12a").is_err());
         assert!(parse_signed_bigint("--3").is_err());
     }
+
+    // ── Parser strictness (#604) ────────────────────────────────────────
+
+    #[test]
+    fn constr_rejected_before_plutus_core_1_1_0() {
+        // CIP-0085 introduced `constr` / `case` in Plutus Core 1.1.0.
+        // Anything older must parse-error.
+        let err = parse_program("(program 1.0.0 (constr 0))").unwrap_err();
+        assert!(err.message.contains("constr"), "msg: {}", err.message);
+    }
+
+    #[test]
+    fn case_rejected_before_plutus_core_1_1_0() {
+        let err =
+            parse_program("(program 1.0.0 (case (con integer 0) (con integer 1)))").unwrap_err();
+        assert!(err.message.contains("case"), "msg: {}", err.message);
+    }
+
+    #[test]
+    fn constr_accepted_at_plutus_core_1_1_0() {
+        // The bump is at the version itself, not strictly above it.
+        parse_program("(program 1.1.0 (constr 0))").unwrap();
+    }
+
+    #[test]
+    fn bls_g1_off_curve_rejected_at_parse() {
+        // 48-byte encoding whose field element is not the x-coordinate
+        // of any curve point — bls12_381_G1/off-curve in the upstream
+        // conformance corpus.
+        let src = "(program 1.0.0 (con bls12_381_G1_element 0xa00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000003))";
+        let err = parse_program(src).unwrap_err();
+        assert!(err.message.contains("G1"), "msg: {}", err.message);
+    }
+
+    #[test]
+    fn bls_g1_out_of_group_rejected_at_parse() {
+        // Valid curve point, not in the prime-order subgroup —
+        // bls12_381_G1/out-of-group.
+        let src = "(program 1.0.0 (con bls12_381_G1_element 0xa00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000005))";
+        let err = parse_program(src).unwrap_err();
+        assert!(err.message.contains("subgroup"), "msg: {}", err.message);
+    }
+
+    #[test]
+    fn bls_g2_bad_zero_rejected_at_parse() {
+        // 96-byte encoding with the negative bit set but nothing else
+        // — bls12_381_G2/bad-zero-01.
+        let src = "(program 1.0.0 (con bls12_381_G2_element 0x400000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000))";
+        let err = parse_program(src).unwrap_err();
+        assert!(err.message.contains("G2"), "msg: {}", err.message);
+    }
 }

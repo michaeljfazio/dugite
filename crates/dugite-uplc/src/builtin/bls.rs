@@ -38,9 +38,58 @@ use blst::{
     blst_scalar, blst_scalar_from_bendian, BLST_ERROR,
 };
 
-const G1_COMPRESSED_BYTES: usize = 48;
-const G2_COMPRESSED_BYTES: usize = 96;
+pub const G1_COMPRESSED_BYTES: usize = 48;
+pub const G2_COMPRESSED_BYTES: usize = 96;
 const FP12_BYTES: usize = 576;
+
+/// Validate a 48-byte BLS12-381 G1 compressed encoding without
+/// materialising a `Value`.  Used by the textual parser to reject
+/// invalid encodings at parse time (matching the Plutus reference,
+/// which fails `(con bls12_381_G1_element 0x…)` at parse for bad-zero,
+/// off-curve, or out-of-subgroup encodings).
+///
+/// Returns `Err(reason)` with a stable, human-readable explanation.
+pub fn validate_g1_compressed(bs: &[u8]) -> Result<(), String> {
+    if bs.len() != G1_COMPRESSED_BYTES {
+        return Err(format!(
+            "G1 expects {G1_COMPRESSED_BYTES}-byte compressed input, got {}",
+            bs.len()
+        ));
+    }
+    let mut aff = blst_p1_affine::default();
+    let err = unsafe { blst_p1_uncompress(&mut aff, bs.as_ptr()) };
+    if err != BLST_ERROR::BLST_SUCCESS {
+        return Err(format!("G1 uncompress failed: {err:?}"));
+    }
+    let mut p = blst_p1::default();
+    unsafe { blst_p1_from_affine(&mut p, &aff) };
+    if !unsafe { blst_p1_in_g1(&p) } {
+        return Err("G1 point not in prime-order subgroup".into());
+    }
+    Ok(())
+}
+
+/// Validate a 96-byte BLS12-381 G2 compressed encoding without
+/// materialising a `Value`.  See [`validate_g1_compressed`].
+pub fn validate_g2_compressed(bs: &[u8]) -> Result<(), String> {
+    if bs.len() != G2_COMPRESSED_BYTES {
+        return Err(format!(
+            "G2 expects {G2_COMPRESSED_BYTES}-byte compressed input, got {}",
+            bs.len()
+        ));
+    }
+    let mut aff = blst_p2_affine::default();
+    let err = unsafe { blst_p2_uncompress(&mut aff, bs.as_ptr()) };
+    if err != BLST_ERROR::BLST_SUCCESS {
+        return Err(format!("G2 uncompress failed: {err:?}"));
+    }
+    let mut p = blst_p2::default();
+    unsafe { blst_p2_from_affine(&mut p, &aff) };
+    if !unsafe { blst_p2_in_g2(&p) } {
+        return Err("G2 point not in prime-order subgroup".into());
+    }
+    Ok(())
+}
 
 // IETF/RFC 9380 ciphersuites mandated by CIP-0381.
 const G1_DST: &[u8] = b"BLS_SIG_BLS12381G1_XMD:SHA-256_SSWU_RO_NUL_";
