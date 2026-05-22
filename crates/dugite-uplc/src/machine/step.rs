@@ -77,9 +77,53 @@ fn compute(term: Term, env: Env, mut kont: Kont) -> Result<State, UplcError> {
             "Builtin {} not yet wired (UPLC-4)",
             id.name()
         ))),
-        Term::Constr { .. } | Term::Case { .. } => Err(UplcError::Internal(
-            "Constr / Case evaluation not yet wired (UPLC-3 part 2)".into(),
-        )),
+        Term::Constr { tag, args } => {
+            // No args: short-circuit to a fully-evaluated Constr value.
+            if args.is_empty() {
+                return Ok(State::Return {
+                    value: Value::Constr {
+                        tag,
+                        args: Vec::new(),
+                    },
+                    kont,
+                });
+            }
+            // Otherwise: push a Constr frame and evaluate the first arg.
+            let mut pending: Vec<Term> = args.into_iter().rev().collect();
+            // SAFETY: just confirmed args.is_empty() == false, so pop
+            // is Some. Surfaced as Internal for the no-panic invariant.
+            let first = pending.pop().ok_or_else(|| {
+                UplcError::Internal("Constr args empty after non-empty check".into())
+            })?;
+            kont.push(Frame::Constr {
+                tag,
+                pending,
+                evaluated: Vec::new(),
+                env: env.clone(),
+            })?;
+            Ok(State::Compute {
+                term: first,
+                env,
+                kont,
+            })
+        }
+        Term::Case {
+            scrutinee,
+            branches,
+        } => {
+            // Evaluate the scrutinee; save the branches for the
+            // `Cases` frame to dispatch on once the scrutinee value
+            // (a `Constr`) lands.
+            kont.push(Frame::Cases {
+                branches,
+                env: env.clone(),
+            })?;
+            Ok(State::Compute {
+                term: *scrutinee,
+                env,
+                kont,
+            })
+        }
     }
 }
 
@@ -102,6 +146,65 @@ fn return_compute(value: Value, mut kont: Kont) -> Result<State, UplcError> {
         }
         Frame::AwaitArg { function, .. } => apply(function, value, kont),
         Frame::Force => force_value(value, kont),
+        Frame::ApplyValue { argument } => apply(value, argument, kont),
+        Frame::Constr {
+            tag,
+            mut pending,
+            mut evaluated,
+            env,
+        } => {
+            // We just got an evaluated arg. Append it; if more args
+            // remain, evaluate the next one; else emit the Constr
+            // value.
+            evaluated.push(value);
+            if let Some(next) = pending.pop() {
+                kont.push(Frame::Constr {
+                    tag,
+                    pending,
+                    evaluated,
+                    env: env.clone(),
+                })?;
+                Ok(State::Compute {
+                    term: next,
+                    env,
+                    kont,
+                })
+            } else {
+                Ok(State::Return {
+                    value: Value::Constr {
+                        tag,
+                        args: evaluated,
+                    },
+                    kont,
+                })
+            }
+        }
+        Frame::Cases { branches, env } => match value {
+            Value::Constr { tag, args } => {
+                // Pick the branch term by tag. Mismatched tag = script
+                // error (Haskell `MissingCaseBranch`).
+                let branch = branches
+                    .get(tag as usize)
+                    .ok_or(UplcError::ScriptError)?
+                    .clone();
+                // Apply `branch` to each constr arg in order. Push
+                // ApplyValue frames in REVERSE so the first arg ends
+                // up on top of the stack and is popped (applied)
+                // first.
+                for arg in args.into_iter().rev() {
+                    kont.push(Frame::ApplyValue { argument: arg })?;
+                }
+                Ok(State::Compute {
+                    term: branch,
+                    env,
+                    kont,
+                })
+            }
+            other => Err(UplcError::Internal(format!(
+                "Case scrutinee must reduce to Constr, got {:?}",
+                std::mem::discriminant(&other)
+            ))),
+        },
     }
 }
 
@@ -218,5 +321,134 @@ mod tests {
     fn builtin_application_pending_returns_internal() {
         let bad = Term::Builtin(crate::term::BuiltinId::AddInteger);
         assert!(matches!(evaluate(bad), Err(UplcError::Internal(_))));
+    }
+
+    // ── Constr / Case (UPLC-3 part 2) ──────────────────────────────────────
+
+    #[test]
+    fn constr_zero_args_evaluates_to_constr_value() {
+        let t = Term::Constr {
+            tag: 0,
+            args: vec![],
+        };
+        let v = evaluate(t).unwrap();
+        assert_eq!(
+            v,
+            Value::Constr {
+                tag: 0,
+                args: vec![]
+            }
+        );
+    }
+
+    #[test]
+    fn constr_with_args_evaluates_left_to_right() {
+        // Constr 3 [1, 2]
+        let t = Term::Constr {
+            tag: 3,
+            args: vec![int_term(1), int_term(2)],
+        };
+        let v = evaluate(t).unwrap();
+        assert_eq!(
+            v,
+            Value::Constr {
+                tag: 3,
+                args: vec![int_val(1), int_val(2)]
+            }
+        );
+    }
+
+    #[test]
+    fn constr_arg_evaluates_to_lambda() {
+        // Constr 0 [(lam x. x)]
+        let id = Term::Lam(Box::new(Term::Var(1)));
+        let t = Term::Constr {
+            tag: 0,
+            args: vec![id.clone()],
+        };
+        let v = evaluate(t).unwrap();
+        match v {
+            Value::Constr { tag, args } => {
+                assert_eq!(tag, 0);
+                assert_eq!(args.len(), 1);
+                assert!(matches!(args[0], Value::Lambda { .. }));
+            }
+            other => panic!("expected Constr, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn case_picks_branch_by_constr_tag() {
+        // (case (Constr 1) [42, 99])  ⇒  99
+        let scrutinee = Term::Constr {
+            tag: 1,
+            args: vec![],
+        };
+        let case = Term::Case {
+            scrutinee: Box::new(scrutinee),
+            branches: vec![int_term(42), int_term(99)],
+        };
+        let v = evaluate(case).unwrap();
+        assert_eq!(v, int_val(99));
+    }
+
+    #[test]
+    fn case_applies_branch_to_constr_args() {
+        // (case (Constr 0 1 2) [(lam x. lam y. y)])  ⇒  2
+        // i.e. the branch is a 2-arg lambda returning the second arg.
+        let scrutinee = Term::Constr {
+            tag: 0,
+            args: vec![int_term(1), int_term(2)],
+        };
+        // (lam (lam (var 1)))  — index 1 = innermost (= second arg)
+        let branch = Term::Lam(Box::new(Term::Lam(Box::new(Term::Var(1)))));
+        let case = Term::Case {
+            scrutinee: Box::new(scrutinee),
+            branches: vec![branch],
+        };
+        let v = evaluate(case).unwrap();
+        assert_eq!(v, int_val(2));
+    }
+
+    #[test]
+    fn case_first_arg_then_second_applied_in_order() {
+        // (case (Constr 0 10 20) [(lam (lam (var 2)))])  ⇒  10
+        // The branch returns its FIRST argument (which is at de Bruijn
+        // index 2 from inside the inner lambda).
+        let scrutinee = Term::Constr {
+            tag: 0,
+            args: vec![int_term(10), int_term(20)],
+        };
+        let branch = Term::Lam(Box::new(Term::Lam(Box::new(Term::Var(2)))));
+        let case = Term::Case {
+            scrutinee: Box::new(scrutinee),
+            branches: vec![branch],
+        };
+        let v = evaluate(case).unwrap();
+        assert_eq!(v, int_val(10));
+    }
+
+    #[test]
+    fn case_with_out_of_range_tag_yields_script_error() {
+        // Constr 5 with only 2 branches.
+        let scrutinee = Term::Constr {
+            tag: 5,
+            args: vec![],
+        };
+        let case = Term::Case {
+            scrutinee: Box::new(scrutinee),
+            branches: vec![int_term(1), int_term(2)],
+        };
+        assert!(matches!(evaluate(case), Err(UplcError::ScriptError)));
+    }
+
+    #[test]
+    fn case_with_non_constr_scrutinee_errors() {
+        // (case 42 [99]) — scrutinee isn't a Constr.
+        let case = Term::Case {
+            scrutinee: Box::new(int_term(42)),
+            branches: vec![int_term(99)],
+        };
+        assert!(matches!(evaluate(case), Err(UplcError::Internal(_))));
     }
 }
