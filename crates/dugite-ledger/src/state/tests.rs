@@ -228,6 +228,7 @@ fn test_apply_block_with_transaction() {
             treasury_value: None,
             donation: None,
             sub_transactions: vec![],
+            account_balance_intervals: vec![],
         },
         witness_set: TransactionWitnessSet {
             vkey_witnesses: vec![],
@@ -314,6 +315,7 @@ fn test_apply_block_skips_invalid_tx() {
             treasury_value: None,
             donation: None,
             sub_transactions: vec![],
+            account_balance_intervals: vec![],
         },
         witness_set: TransactionWitnessSet {
             vkey_witnesses: vec![],
@@ -616,6 +618,7 @@ fn test_fee_accumulation() {
             treasury_value: None,
             donation: None,
             sub_transactions: vec![],
+            account_balance_intervals: vec![],
         },
         witness_set: TransactionWitnessSet {
             vkey_witnesses: vec![],
@@ -1963,6 +1966,7 @@ fn test_treasury_donation() {
             treasury_value: None,
             donation: Some(Lovelace(1_000_000)),
             sub_transactions: vec![],
+            account_balance_intervals: vec![],
         },
         witness_set: TransactionWitnessSet {
             vkey_witnesses: vec![],
@@ -3964,6 +3968,7 @@ fn test_utxo_stake_distribution_tracking() {
             treasury_value: None,
             donation: None,
             sub_transactions: vec![],
+            account_balance_intervals: vec![],
         },
         witness_set: TransactionWitnessSet {
             vkey_witnesses: vec![],
@@ -4668,6 +4673,7 @@ fn test_invalid_tx_uses_collateral_for_fees_not_declared_fee() {
             treasury_value: None,
             donation: None,
             sub_transactions: vec![],
+            account_balance_intervals: vec![],
         },
         witness_set: TransactionWitnessSet {
             vkey_witnesses: vec![],
@@ -4762,6 +4768,7 @@ fn test_invalid_tx_collateral_with_return() {
             treasury_value: None,
             donation: None,
             sub_transactions: vec![],
+            account_balance_intervals: vec![],
         },
         witness_set: TransactionWitnessSet {
             vkey_witnesses: vec![],
@@ -4844,6 +4851,7 @@ fn test_invalid_tx_total_collateral_field() {
             treasury_value: None,
             donation: None,
             sub_transactions: vec![],
+            account_balance_intervals: vec![],
         },
         witness_set: TransactionWitnessSet {
             vkey_witnesses: vec![],
@@ -10576,6 +10584,7 @@ fn make_delegation_block(
             treasury_value: None,
             donation: None,
             sub_transactions: vec![],
+            account_balance_intervals: vec![],
         },
         witness_set: TransactionWitnessSet {
             vkey_witnesses: vec![],
@@ -10654,6 +10663,7 @@ fn make_pool_registration_block(
             treasury_value: None,
             donation: None,
             sub_transactions: vec![],
+            account_balance_intervals: vec![],
         },
         witness_set: TransactionWitnessSet {
             vkey_witnesses: vec![],
@@ -11917,6 +11927,7 @@ fn make_invalid_tx_with_collateral(
             treasury_value: None,
             donation: None,
             sub_transactions: vec![],
+            account_balance_intervals: vec![],
         },
         witness_set: TransactionWitnessSet {
             vkey_witnesses: vec![],
@@ -13019,6 +13030,7 @@ fn make_simple_tx(
             treasury_value: None,
             donation: None,
             sub_transactions: vec![],
+            account_balance_intervals: vec![],
         },
         witness_set: TransactionWitnessSet {
             vkey_witnesses: vec![],
@@ -13111,6 +13123,7 @@ fn make_tx_with_treasury(
             treasury_value: Some(treasury_value),
             donation: None,
             sub_transactions: vec![],
+            account_balance_intervals: vec![],
         },
         witness_set: TransactionWitnessSet {
             vkey_witnesses: vec![],
@@ -13171,6 +13184,7 @@ fn make_tx_with_committee_hot_auth(
             treasury_value: None,
             donation: None,
             sub_transactions: vec![],
+            account_balance_intervals: vec![],
         },
         witness_set: TransactionWitnessSet {
             vkey_witnesses: vec![],
@@ -13485,6 +13499,7 @@ fn make_tx_with_redeemers(tx_hash_byte: u8, mem: u64, steps: u64) -> Transaction
             treasury_value: None,
             donation: None,
             sub_transactions: vec![],
+            account_balance_intervals: vec![],
         },
         witness_set: TransactionWitnessSet {
             vkey_witnesses: vec![],
@@ -13779,6 +13794,7 @@ fn make_invalid_tx_with_col_return(
             treasury_value: None,
             donation: None,
             sub_transactions: vec![],
+            account_balance_intervals: vec![],
         },
         witness_set: TransactionWitnessSet {
             vkey_witnesses: vec![],
@@ -14256,6 +14272,7 @@ fn test_treasury_donation_accumulates_correctly() {
             treasury_value: None,
             donation: Some(Lovelace(donation_amount)),
             sub_transactions: vec![],
+            account_balance_intervals: vec![],
         },
         witness_set: TransactionWitnessSet {
             vkey_witnesses: vec![],
@@ -14904,6 +14921,7 @@ fn make_donation_tx(state: &mut LedgerState, unique_id: u8, donation_lovelace: u
             treasury_value: None,
             donation: Some(Lovelace(donation_lovelace)),
             sub_transactions: vec![],
+            account_balance_intervals: vec![],
         },
         witness_set: TransactionWitnessSet {
             vkey_witnesses: vec![],

@@ -122,6 +122,22 @@ impl EraRules for DijkstraRules {
         gov: &mut GovSubState,
         epochs: &mut EpochSubState,
     ) -> Result<UtxoDiff, LedgerError> {
+        // 0) UTXO predicate `AccountBalanceOutOfRange` (issue #475 Phase 3.3).
+        //
+        //    Dijkstra TxBody key 26 — `account_balance_intervals` — declares
+        //    a `lower..upper` interval over the reward-account balance of one
+        //    or more stake credentials. The tx is rejected if, at the point
+        //    UTXO validation runs, any declared account's balance falls
+        //    outside its interval (`lower` inclusive, `upper` exclusive). See
+        //    `Cardano.Ledger.Dijkstra.Rules.Utxo` (`AccountBalanceOutOfRange`)
+        //    and `Cardano.Ledger.Dijkstra.Scripts.AccountBalanceInterval`.
+        //
+        //    The check runs BEFORE any state mutation — a single failure here
+        //    aborts the whole tx without touching the UTxO set, mirroring the
+        //    Haskell `UTXO` rule's predicate-failure semantics. Unregistered
+        //    accounts are treated as having a balance of 0, matching upstream.
+        check_account_balance_intervals(tx, certs)?;
+
         // 1) Run the parent (top-level) Conway pipeline. This consumes the
         //    parent tx's inputs, creates its outputs, processes its certs,
         //    governance actions and withdrawals. The returned diff is the
@@ -375,6 +391,68 @@ fn apply_sub_transactions(tx: &Transaction, utxo: &mut UtxoSubState) -> UtxoDiff
     }
 
     diff
+}
+
+// ---------------------------------------------------------------------------
+// AccountBalanceOutOfRange predicate (Phase 3.3)
+// ---------------------------------------------------------------------------
+
+/// Verify every declared `account_balance_intervals` entry holds against the
+/// current reward-account balance state (`CertSubState::reward_accounts`).
+///
+/// Mirrors the Dijkstra UTXO rule predicate `AccountBalanceOutOfRange` in
+/// `Cardano.Ledger.Dijkstra.Rules.Utxo`:
+///
+///   - **Lookup**: each entry is keyed by a stake [`Credential`]. The current
+///     account balance is read from `CertSubState::reward_accounts`, which
+///     is keyed by the typed `Hash32` form (`Credential::to_typed_hash32`).
+///     Unregistered accounts (no entry in `reward_accounts`) are treated as
+///     having a balance of 0 — matches Haskell's `validateBatchWithdrawals`
+///     handling.
+///
+///   - **Predicate**: `lower <= balance && balance < upper`, where either
+///     bound may be absent (the absent half is unconstrained). At least one
+///     bound must be present — the decoder rejects `[null, null]` so this
+///     invariant is guaranteed when the tx came from the wire; in-memory
+///     constructions can call `AccountBalanceInterval::is_degenerate()` to
+///     pre-validate.
+///
+///   - **Failure mode**: returns `LedgerError::InvalidTransaction` containing
+///     the credential, observed balance and offending interval bound, so the
+///     calling block-application path can surface it through the usual
+///     `BlockTxValidationFailed` envelope.
+fn check_account_balance_intervals(
+    tx: &Transaction,
+    certs: &CertSubState,
+) -> Result<(), LedgerError> {
+    use dugite_primitives::value::Lovelace;
+
+    for (cred, interval) in &tx.body.account_balance_intervals {
+        let key = cred.to_typed_hash32();
+        // Unregistered accounts == 0 balance, mirroring upstream's
+        // `validateBatchWithdrawals` ("Unregistered accounts are treated
+        // as having 0 balance").
+        let balance = certs
+            .reward_accounts
+            .get(&key)
+            .copied()
+            .unwrap_or(Lovelace(0));
+
+        if !interval.contains(balance) {
+            // Format the failure to make the offending pair clear at trace
+            // time. Avoid panic — UTXO predicate failures surface as
+            // ordinary `InvalidTransaction` errors per Haskell.
+            return Err(LedgerError::InvalidTransaction(format!(
+                "AccountBalanceOutOfRange: credential {} balance {} \
+                 not in interval [{:?}, {:?})",
+                key.to_hex(),
+                balance.0,
+                interval.lower.map(|c| c.0),
+                interval.upper.map(|c| c.0),
+            )));
+        }
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -991,6 +1069,7 @@ mod tests {
                 treasury_value: None,
                 donation: None,
                 sub_transactions: vec![sub_a.clone(), sub_b.clone()],
+                account_balance_intervals: vec![],
             };
             let parent_hash = Hash32::from_bytes([0xDE; 32]);
             let parent_tx = Transaction {
@@ -1240,6 +1319,7 @@ mod tests {
                 treasury_value: None,
                 donation: None,
                 sub_transactions: vec![],
+                account_balance_intervals: vec![],
             };
 
             // Per CIP-0167 the author-supplied `is_valid` is irrelevant on the
@@ -1427,11 +1507,373 @@ mod tests {
         /// gates application on reward-account balance ranges (atomic
         /// conditional transfers).
         ///
-        /// Issue: #462 Phase 3.3 (blocked on #466).
+        /// Issue: #475 Phase 3.3 — `AccountBalanceOutOfRange`.
+        ///
+        /// Three sub-cases pin the predicate semantics:
+        ///
+        /// 1. **In-range balance**: declared interval `[100, 200)` and the
+        ///    on-chain reward-account balance is `150` — `apply_valid_tx`
+        ///    succeeds and the parent tx's UTxO effects land.
+        /// 2. **Out-of-range balance**: same interval, balance is `250` —
+        ///    `apply_valid_tx` returns `LedgerError::InvalidTransaction`
+        ///    (`AccountBalanceOutOfRange`) and no UTxO state has changed.
+        /// 3. **Unregistered account**: declared interval `[1, ∞)` against a
+        ///    credential that is NOT in `reward_accounts` — treated as
+        ///    balance 0, predicate fails, tx rejected. Mirrors Haskell's
+        ///    "Unregistered accounts are treated as having 0 balance".
         #[test]
-        #[ignore = "Dijkstra account_balance_intervals — see issue #462 Phase 3.3"]
         fn account_balance_intervals_predicate() {
-            unimplemented!();
+            use super::super::*;
+            use crate::eras::EraRules;
+            use crate::state::{BlockValidationMode, StakeDistributionState};
+            use crate::utxo::UtxoSet;
+            use crate::utxo_diff::DiffSeq;
+            use dugite_primitives::address::Address;
+            use dugite_primitives::credentials::Credential;
+            use dugite_primitives::era::Era;
+            use dugite_primitives::hash::{Hash28, Hash32};
+            use dugite_primitives::protocol_params::ProtocolParameters;
+            use dugite_primitives::time::EpochNo;
+            use dugite_primitives::transaction::{
+                AccountBalanceInterval, OutputDatum, Transaction, TransactionBody,
+                TransactionInput, TransactionOutput, TransactionWitnessSet,
+            };
+            use dugite_primitives::value::{Lovelace, Value};
+            use std::collections::{BTreeMap, HashMap, HashSet};
+            use std::sync::Arc;
+
+            // ── fixture helpers ───────────────────────────────────────
+            let make_enterprise_address = |kh: Hash28| -> Address {
+                let mut b = vec![0x61];
+                b.extend_from_slice(kh.as_bytes());
+                Address::from_bytes(&b).expect("enterprise addr")
+            };
+            let make_output = |addr: Address, coin: u64| TransactionOutput {
+                address: addr,
+                value: Value::lovelace(coin),
+                datum: OutputDatum::None,
+                script_ref: None,
+                is_legacy: true,
+                raw_cbor: None,
+            };
+            let make_input = |tx_id_byte: u8, idx: u32| TransactionInput {
+                transaction_id: Hash32::from_bytes([tx_id_byte; 32]),
+                index: idx,
+            };
+
+            // Build a parent tx that:
+            //   - spends UTxO P
+            //   - creates output OP
+            //   - declares `cred_a` must have balance in [100, 200)
+            // Then we vary the on-chain reward-account balance for `cred_a`
+            // and the registration status of a second credential `cred_b`
+            // across the three sub-cases.
+            let payment_kh = Hash28::from_bytes([0xAB; 28]);
+            let addr = make_enterprise_address(payment_kh);
+            let parent_in = make_input(0xEE, 0);
+            let parent_out_input = make_output(addr.clone(), 10_000_000);
+            let parent_out = make_output(addr.clone(), 7_000_000);
+
+            let cred_a = Credential::VerificationKey(Hash28::from_bytes([0xA1; 28]));
+            let cred_b = Credential::VerificationKey(Hash28::from_bytes([0xB2; 28]));
+
+            // Build helper that constructs a fresh full ledger-state shell
+            // seeded with cred_a's reward_account balance set as supplied,
+            // and either including or excluding cred_b from the registered
+            // set. Returns (utxo, certs, gov, epochs, ctx_owner) — the
+            // params/delegates are kept alive via tuple ownership at the
+            // call site.
+            let build_state = |cred_a_balance: Option<Lovelace>, register_cred_b: bool| {
+                let mut utxo_set = UtxoSet::new();
+                utxo_set.insert(parent_in.clone(), parent_out_input.clone());
+                let utxo = UtxoSubState {
+                    utxo_set,
+                    diff_seq: DiffSeq::new(),
+                    epoch_fees: Lovelace(0),
+                    pending_donations: Lovelace(0),
+                };
+
+                let mut reward_accounts: HashMap<Hash32, Lovelace> = HashMap::new();
+                if let Some(bal) = cred_a_balance {
+                    reward_accounts.insert(cred_a.to_typed_hash32(), bal);
+                }
+                if register_cred_b {
+                    // Register cred_b with a balance high enough to satisfy
+                    // its own declared >= 1 interval in the multi-entry case.
+                    reward_accounts.insert(cred_b.to_typed_hash32(), Lovelace(5));
+                }
+
+                let certs = CertSubState {
+                    delegations: Arc::new(HashMap::new()),
+                    pool_params: Arc::new(HashMap::new()),
+                    future_pool_params: HashMap::new(),
+                    pending_retirements: HashMap::new(),
+                    reward_accounts: Arc::new(reward_accounts),
+                    stake_key_deposits: HashMap::new(),
+                    pool_deposits: HashMap::new(),
+                    total_stake_key_deposits: 0,
+                    pointer_map: HashMap::new(),
+                    stake_distribution: StakeDistributionState {
+                        stake_map: HashMap::new(),
+                    },
+                    script_stake_credentials: HashSet::new(),
+                };
+                let gov = super::make_gov_sub();
+                let epochs = EpochSubState {
+                    snapshots: crate::state::EpochSnapshots::default(),
+                    treasury: Lovelace(0),
+                    reserves: Lovelace(0),
+                    pending_reward_update: None,
+                    pending_pp_updates: BTreeMap::new(),
+                    future_pp_updates: BTreeMap::new(),
+                    needs_stake_rebuild: false,
+                    ptr_stake: HashMap::new(),
+                    ptr_stake_excluded: true,
+                    protocol_params: ProtocolParameters::mainnet_defaults(),
+                    prev_protocol_params: ProtocolParameters::mainnet_defaults(),
+                    prev_protocol_version_major: 12,
+                    prev_d: 0.0,
+                };
+                (utxo, certs, gov, epochs)
+            };
+
+            let make_parent_tx =
+                |intervals: Vec<(Credential, AccountBalanceInterval)>| Transaction {
+                    era: Era::Dijkstra,
+                    hash: Hash32::from_bytes([0xDE; 32]),
+                    body: TransactionBody {
+                        inputs: vec![parent_in.clone()],
+                        outputs: vec![parent_out.clone()],
+                        fee: Lovelace(0),
+                        ttl: None,
+                        certificates: vec![],
+                        withdrawals: BTreeMap::new(),
+                        auxiliary_data_hash: None,
+                        validity_interval_start: None,
+                        mint: BTreeMap::new(),
+                        script_data_hash: None,
+                        collateral: vec![],
+                        required_signers: vec![],
+                        network_id: None,
+                        collateral_return: None,
+                        total_collateral: None,
+                        reference_inputs: vec![],
+                        update: None,
+                        voting_procedures: BTreeMap::new(),
+                        proposal_procedures: vec![],
+                        treasury_value: None,
+                        donation: None,
+                        sub_transactions: vec![],
+                        account_balance_intervals: intervals,
+                    },
+                    witness_set: TransactionWitnessSet {
+                        vkey_witnesses: vec![],
+                        native_scripts: vec![],
+                        bootstrap_witnesses: vec![],
+                        plutus_v1_scripts: vec![],
+                        plutus_v2_scripts: vec![],
+                        plutus_v3_scripts: vec![],
+                        plutus_data: vec![],
+                        redeemers: vec![],
+                        raw_redeemers_cbor: None,
+                        raw_plutus_data_cbor: None,
+                        original_script_data_hash: None,
+                    },
+                    is_valid: true,
+                    auxiliary_data: None,
+                    raw_cbor: None,
+                    raw_body_cbor: None,
+                    raw_witness_cbor: None,
+                };
+
+            let params = ProtocolParameters::mainnet_defaults();
+            let delegates: HashMap<Hash28, (Hash28, Hash32)> = HashMap::new();
+            let make_ctx = || RuleContext {
+                params: &params,
+                current_slot: 2_000_000,
+                current_epoch: EpochNo(700),
+                era: Era::Dijkstra,
+                slot_config: None,
+                node_network: None,
+                genesis_delegates: &delegates,
+                update_quorum: 5,
+                epoch_length: 432_000,
+                shelley_transition_epoch: 0,
+                byron_epoch_length: 21_600,
+                stability_window: 129_600,
+                stability_window_3kf: 129_600,
+                randomness_stabilisation_window: 129_600,
+                tx_index: 0,
+                conway_genesis: None,
+            };
+
+            let rules = DijkstraRules::new();
+
+            // ── Case 1: in-range balance → apply succeeds ──────────────
+            {
+                let (mut utxo, mut certs, mut gov, mut epochs) =
+                    build_state(Some(Lovelace(150)), false);
+                let parent_tx = make_parent_tx(vec![(
+                    cred_a.clone(),
+                    AccountBalanceInterval::closed_open(Lovelace(100), Lovelace(200)),
+                )]);
+                let diff = rules
+                    .apply_valid_tx(
+                        &parent_tx,
+                        BlockValidationMode::ApplyOnly,
+                        &make_ctx(),
+                        &mut utxo,
+                        &mut certs,
+                        &mut gov,
+                        &mut epochs,
+                    )
+                    .expect("balance 150 IS in [100, 200) — apply must succeed");
+                // Parent tx's input consumed, output created.
+                assert!(
+                    utxo.utxo_set.lookup(&parent_in).is_none(),
+                    "in-range case: parent input must have been consumed"
+                );
+                assert_eq!(
+                    diff.deletes.len(),
+                    1,
+                    "in-range case: exactly 1 delete (parent input)"
+                );
+                assert_eq!(
+                    diff.inserts.len(),
+                    1,
+                    "in-range case: exactly 1 insert (parent output)"
+                );
+            }
+
+            // ── Case 2: out-of-range balance → apply rejected ──────────
+            {
+                let (mut utxo, mut certs, mut gov, mut epochs) =
+                    build_state(Some(Lovelace(250)), false);
+                let parent_tx = make_parent_tx(vec![(
+                    cred_a.clone(),
+                    AccountBalanceInterval::closed_open(Lovelace(100), Lovelace(200)),
+                )]);
+                let err = rules
+                    .apply_valid_tx(
+                        &parent_tx,
+                        BlockValidationMode::ApplyOnly,
+                        &make_ctx(),
+                        &mut utxo,
+                        &mut certs,
+                        &mut gov,
+                        &mut epochs,
+                    )
+                    .expect_err("balance 250 is NOT in [100, 200) — apply must reject");
+                let msg = format!("{err:?}");
+                assert!(
+                    msg.contains("AccountBalanceOutOfRange"),
+                    "error must name the predicate, got: {msg}"
+                );
+                // No mutation: parent input must STILL be in the UTxO.
+                assert!(
+                    utxo.utxo_set.lookup(&parent_in).is_some(),
+                    "out-of-range case: predicate-failure path MUST NOT mutate UTxO state"
+                );
+            }
+
+            // ── Case 3: unregistered account → treated as 0, fails ─────
+            // cred_b is NOT in reward_accounts; the interval `at_least(1)`
+            // requires >= 1, so a 0 balance triggers rejection. This pins
+            // the unregistered-account-=-balance-0 semantics.
+            {
+                let (mut utxo, mut certs, mut gov, mut epochs) =
+                    build_state(Some(Lovelace(150)), false);
+                let parent_tx = make_parent_tx(vec![(
+                    cred_b.clone(),
+                    AccountBalanceInterval::at_least(Lovelace(1)),
+                )]);
+                let err = rules
+                    .apply_valid_tx(
+                        &parent_tx,
+                        BlockValidationMode::ApplyOnly,
+                        &make_ctx(),
+                        &mut utxo,
+                        &mut certs,
+                        &mut gov,
+                        &mut epochs,
+                    )
+                    .expect_err("unregistered cred_b is treated as 0; interval [1, ∞) excludes it");
+                let msg = format!("{err:?}");
+                assert!(
+                    msg.contains("AccountBalanceOutOfRange"),
+                    "unregistered case: error must still surface AccountBalanceOutOfRange, got: {msg}"
+                );
+            }
+
+            // ── Bonus: multi-entry all-pass case ──────────────────────
+            // Two credentials, both in-range, must succeed and apply the
+            // parent's UTxO effect. Pins that the check is an AND across
+            // ALL declared intervals (not OR).
+            {
+                let (mut utxo, mut certs, mut gov, mut epochs) =
+                    build_state(Some(Lovelace(150)), true);
+                let parent_tx = make_parent_tx(vec![
+                    (
+                        cred_a.clone(),
+                        AccountBalanceInterval::closed_open(Lovelace(100), Lovelace(200)),
+                    ),
+                    (
+                        cred_b.clone(),
+                        AccountBalanceInterval::at_least(Lovelace(1)),
+                    ),
+                ]);
+                let _ = rules
+                    .apply_valid_tx(
+                        &parent_tx,
+                        BlockValidationMode::ApplyOnly,
+                        &make_ctx(),
+                        &mut utxo,
+                        &mut certs,
+                        &mut gov,
+                        &mut epochs,
+                    )
+                    .expect("multi-entry all-pass case must succeed");
+                assert!(
+                    utxo.utxo_set.lookup(&parent_in).is_none(),
+                    "all-pass case: parent input must have been consumed"
+                );
+            }
+
+            // ── Bonus: multi-entry one-fail short-circuit ──────────────
+            // cred_a in-range, cred_b registered with balance 5 but the
+            // declared interval requires >= 100. The combined check must
+            // fail, and UTxO state must be untouched.
+            {
+                let (mut utxo, mut certs, mut gov, mut epochs) =
+                    build_state(Some(Lovelace(150)), true);
+                let parent_tx = make_parent_tx(vec![
+                    (
+                        cred_a.clone(),
+                        AccountBalanceInterval::closed_open(Lovelace(100), Lovelace(200)),
+                    ),
+                    (
+                        cred_b.clone(),
+                        AccountBalanceInterval::at_least(Lovelace(100)),
+                    ),
+                ]);
+                let err = rules
+                    .apply_valid_tx(
+                        &parent_tx,
+                        BlockValidationMode::ApplyOnly,
+                        &make_ctx(),
+                        &mut utxo,
+                        &mut certs,
+                        &mut gov,
+                        &mut epochs,
+                    )
+                    .expect_err("multi-entry one-fail case must reject the whole tx");
+                let msg = format!("{err:?}");
+                assert!(msg.contains("AccountBalanceOutOfRange"));
+                assert!(
+                    utxo.utxo_set.lookup(&parent_in).is_some(),
+                    "any predicate failure aborts the tx BEFORE state mutation"
+                );
+            }
         }
 
         /// TxBody key 25 — `direct_deposits`: `{+ reward_account => coin}`,
