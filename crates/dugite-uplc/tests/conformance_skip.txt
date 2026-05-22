@@ -24,7 +24,7 @@
 #                                    `(value …)` constant, `insertCoin` /
 #                                    `lookupCoin` / `scaleValue` / `unValueData`
 #                                    builtin token-bundles, etc.)
-#   budget:                     458  CPU/mem cost-model divergence (dominant
+#   budget:                     390  CPU/mem cost-model divergence (per-builtin costs
 #                                    class — every per-step CPU charge needs
 #                                    to be aligned with the Haskell tiered model)
 #   eval_fails_unexpectedly:     74  CEK rejects programs the reference accepts
@@ -36,7 +36,7 @@
 #                                    rejects at parse (over-permissive lexer
 #                                    in our integer / string handling)
 #   ───────────────────────────────
-#   Total skipped:              791 / 999 (208 currently pass)
+#   Total skipped:              723 / 999 (276 currently pass)
 #
 # Goal: 0 / 999.
 
@@ -213,46 +213,12 @@ builtin/semantics/valueData/negative-quantity
 builtin/semantics/valueData/roundtrip-from-value
 builtin/semantics/valueData/single-entry
 
-# === budget (460 tests) ===
+# === budget (390 tests) ===
 # CPU/mem budget consumed by dugite-uplc differs from the Haskell golden â dugite-uplc cost model needs alignment
-builtin/constant/bls12-381/G1/on-curve-bit3-clear
-builtin/constant/bls12-381/G1/on-curve-bit3-set
-builtin/constant/bls12-381/G1/zero
-builtin/constant/bls12-381/G2/on-curve-bit3-clear
-builtin/constant/bls12-381/G2/on-curve-bit3-set
-builtin/constant/bls12-381/G2/zero
-builtin/constant/bool/False
-builtin/constant/bool/True
-builtin/constant/bytestring/bytestring-01
-builtin/constant/bytestring/bytestring-02
-builtin/constant/bytestring/bytestring-03
-builtin/constant/data/dataByteString
-builtin/constant/data/dataConstr
-builtin/constant/data/dataInteger
-builtin/constant/data/dataList
-builtin/constant/data/dataMap
-builtin/constant/integer/integer-01
-builtin/constant/integer/integer-02
-builtin/constant/integer/integer-03
-builtin/constant/integer/integer-04
-builtin/constant/integer/integer-05
-builtin/constant/integer/integer-06
-builtin/constant/integer/integer-07
-builtin/constant/integer/integer-08
-builtin/constant/list/emptyList
-builtin/constant/pair/nestedPair
-builtin/constant/pair/simplePair
-builtin/constant/string/string-01
-builtin/constant/string/string-02
-builtin/constant/string/string-03
-builtin/constant/string/string-05
-builtin/constant/unit/unit
-builtin/interleaving/ite
 builtin/interleaving/iteAtIntegerArrowIntegerApplied1
 builtin/interleaving/iteAtIntegerArrowIntegerApplied2
 builtin/interleaving/iteAtIntegerArrowIntegerAppliedApplied
 builtin/interleaving/iteAtIntegerArrowIntegerWithCond
-builtin/interleaving/iteForced
 builtin/interleaving/iteForcedWithIntegerAndString
 builtin/interleaving/iteStringInteger
 builtin/semantics/addInteger/addInteger-01
@@ -456,8 +422,6 @@ builtin/semantics/lessThanInteger/lessThanInteger-03
 builtin/semantics/lessThanInteger/lessThanInteger-04
 builtin/semantics/lessThanInteger/lessThanInteger-05
 builtin/semantics/listData
-builtin/semantics/listOfList
-builtin/semantics/listOfPair
 builtin/semantics/mapData
 builtin/semantics/mkCons/mkCons-01
 builtin/semantics/mkCons/mkCons-02
@@ -481,7 +445,6 @@ builtin/semantics/orByteString/case-03
 builtin/semantics/orByteString/case-04
 builtin/semantics/orByteString/case-08
 builtin/semantics/orByteString/case-09
-builtin/semantics/pairOfPairAndList
 builtin/semantics/quotientInteger/quotientInteger-01
 builtin/semantics/quotientInteger/quotientInteger-neg-neg
 builtin/semantics/quotientInteger/quotientInteger-neg-pos
@@ -636,45 +599,12 @@ example/ApplyAdd1
 example/ApplyAdd2
 example/IfIntegers
 example/NatRoundTrip
-example/ScottListSum
-example/churchSucc
-example/churchZero
-example/even2
-example/even3
 example/evenList
 example/factorial
 example/fibonacci
-example/force-lam
 example/overapplication
-example/succInteger
-term/app/app-1
-term/app/app-2
-term/app/app-3
-term/app/app-4
-term/app/app-5
-term/app/app-6
-term/app/app-7
-term/app/app-8
-term/app/app-9
-term/case/case-01
-term/case/case-02
 term/case/case-03
 term/case/case-04
-term/case/case-08
-term/case/case-10
-term/closure
-term/constr/constr-01
-term/constr/constr-02
-term/constr/constr-03
-term/constr/constr-08
-term/delay/delay-error-1
-term/delay/delay-error-2
-term/delay/delay-lam
-term/force/force-2
-term/force/force-3
-term/lam/lam-1
-term/lam/lam-2
-term/unlifting-unsat
 
 # === eval_fails_unexpectedly (74 tests) ===
 # dugite-uplc CEK fails on a program the reference accepts
