@@ -1,4 +1,4 @@
-name: devnet-validate smoke
+name: Devnet Validate Smoke
 
 on:
   pull_request:
