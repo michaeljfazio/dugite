@@ -71,6 +71,29 @@ Normative (must match byte-for-byte):
 | Cost-model parameter order | `IntersectMBO/plutus:plutus-core/cost-model/` + Conway-era `cardano-ledger-conway/cddl-files/conway.cddl`. |
 | Conformance corpus | `IntersectMBO/plutus:plutus-conformance/test-cases/`. |
 
+### Reference-implementation tie-break order
+
+When two of our reference implementations disagree, resolve in this strict
+priority (per user directive 2026-05-22):
+
+  1. **`IntersectMBO/plutus` (Haskell)** — most authoritative. This is
+     what runs on mainnet. If a Rust implementation diverges from
+     Haskell, the Rust implementation is wrong by definition.
+  2. **`pragma-org/uplc` (`amaru-uplc`)** — second. Useful for
+     idiomatic Rust translation choices but supersedable by Haskell.
+  3. **`aiken-lang/uplc`** — third. Useful as a corner-case oracle but
+     known to carry adversarial-input panics we explicitly do *not*
+     reproduce.
+
+The UPLC-1 PlutusData encoder fix (#560) is the canonical example: pragma
+and aiken disagreed on indefinite-length encoding of short `Constr` /
+`List` payloads. The Haskell `Codec.Serialise.Class.encodeList`
+implementation was inspected directly and used as ground truth; the
+indefinite-length form pragma emits and the definite-length form aiken
+historically used are both legal CBOR but only the Haskell form
+round-trips byte-exactly with mainnet — so the Rust implementations'
+disagreement was resolved in favour of Haskell.
+
 Reference implementations to study (NOT to depend on):
 
 | Source | What to steal | What to skip |
