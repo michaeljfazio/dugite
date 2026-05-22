@@ -24,9 +24,8 @@
 #                                    `(value …)` constant, `insertCoin` /
 #                                    `lookupCoin` / `scaleValue` / `unValueData`
 #                                    builtin token-bundles, etc.)
-#   eval_fails_unexpectedly:     74  CEK rejects programs the reference accepts
 #   ───────────────────────────────
-#   Total skipped:              243 / 999 (756 currently pass)
+#   Total skipped:              169 / 999 (830 currently pass)
 #
 # Goal: 0 / 999.
 
@@ -202,81 +201,4 @@ builtin/semantics/valueData/multi-token
 builtin/semantics/valueData/negative-quantity
 builtin/semantics/valueData/roundtrip-from-value
 builtin/semantics/valueData/single-entry
-
-# === eval_fails_unexpectedly (74 tests) ===
-# dugite-uplc CEK fails on a program the reference accepts
-builtin/semantics/andByteString/case-01
-builtin/semantics/andByteString/case-02
-builtin/semantics/andByteString/case-05
-builtin/semantics/andByteString/case-06
-builtin/semantics/andByteString/case-07
-builtin/semantics/andByteString/case-10
-builtin/semantics/andByteString/case-11
-builtin/semantics/andByteString/case-12
-builtin/semantics/andByteString/case-13
-builtin/semantics/andByteString/case-14
-builtin/semantics/expModInteger/expMod-03
-builtin/semantics/expModInteger/expMod-04
-builtin/semantics/expModInteger/expMod-05
-builtin/semantics/expModInteger/extra/expModInteger-09
-builtin/semantics/expModInteger/extra/expModInteger-36
-builtin/semantics/expModInteger/extra/expModInteger-37
-builtin/semantics/expModInteger/extra/expModInteger-38
-builtin/semantics/expModInteger/extra/expModInteger-39
-builtin/semantics/expModInteger/extra/expModInteger-40
-builtin/semantics/expModInteger/extra/expModInteger-41
-builtin/semantics/expModInteger/extra/expModInteger-42
-builtin/semantics/expModInteger/extra/expModInteger-43
-builtin/semantics/expModInteger/extra/expModInteger-44
-builtin/semantics/expModInteger/extra/expModInteger-45
-builtin/semantics/expModInteger/extra/expModInteger-46
-builtin/semantics/expModInteger/extra/expModInteger-47
-builtin/semantics/expModInteger/extra/expModInteger-48
-builtin/semantics/expModInteger/extra/expModInteger-49
-builtin/semantics/expModInteger/extra/expModInteger-50
-builtin/semantics/expModInteger/extra/expModInteger-51
-builtin/semantics/expModInteger/extra/expModInteger-52
-builtin/semantics/expModInteger/extra/expModInteger-53
-builtin/semantics/expModInteger/extra/expModInteger-54
-builtin/semantics/expModInteger/extra/expModInteger-55
-builtin/semantics/expModInteger/extra/expModInteger-58
-builtin/semantics/expModInteger/extra/expModInteger-61
-builtin/semantics/expModInteger/extra/expModInteger-62
-builtin/semantics/expModInteger/extra/expModInteger-64
-builtin/semantics/expModInteger/extra/expModInteger-66
-builtin/semantics/expModInteger/extra/expModInteger-72
-builtin/semantics/expModInteger/extra/expModInteger-73
-builtin/semantics/expModInteger/extra/expModInteger-75
-builtin/semantics/expModInteger/extra/expModInteger-77
-builtin/semantics/orByteString/case-01
-builtin/semantics/orByteString/case-02
-builtin/semantics/orByteString/case-05
-builtin/semantics/orByteString/case-06
-builtin/semantics/orByteString/case-07
-builtin/semantics/orByteString/case-10
-builtin/semantics/orByteString/case-11
-builtin/semantics/orByteString/case-12
-builtin/semantics/orByteString/case-13
-builtin/semantics/orByteString/case-14
-builtin/semantics/xorByteString/case-01
-builtin/semantics/xorByteString/case-02
-builtin/semantics/xorByteString/case-05
-builtin/semantics/xorByteString/case-06
-builtin/semantics/xorByteString/case-07
-builtin/semantics/xorByteString/case-10
-builtin/semantics/xorByteString/case-11
-builtin/semantics/xorByteString/case-12
-builtin/semantics/xorByteString/case-13
-builtin/semantics/xorByteString/case-14
-term/case/case-07
-term/constant-case/bool/bool-01
-term/constant-case/bool/bool-02
-term/constant-case/bool/bool-03
-term/constant-case/integer/integer-02
-term/constant-case/list/list-01
-term/constant-case/list/list-02
-term/constant-case/list/list-03
-term/constant-case/pair/pair-01
-term/constant-case/pair/pair-02
-term/constant-case/unit/unit-01
 
