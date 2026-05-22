@@ -1067,6 +1067,35 @@ impl ConwayGenesis {
     }
 }
 
+// ──────────────────────────────────────────────────────────────────────────
+// Dijkstra genesis
+// ──────────────────────────────────────────────────────────────────────────
+
+// The parsed shape lives in `dugite-primitives::genesis::dijkstra` so other
+// crates (`dugite-ledger`, tests) can consume it without depending on
+// `dugite-node`.  This module only provides the file-loading wrapper that
+// mirrors `AlonzoGenesis::load_with_hash` / `ConwayGenesis::load_with_hash`.
+
+pub use dugite_primitives::genesis::DijkstraGenesis;
+
+/// File-system loader for `dijkstra-genesis.json` that also returns the
+/// Blake2b-256 hash of the raw file bytes (canonical JSON), matching the
+/// Cardano reference implementation's genesis-file hashing convention.
+pub fn load_dijkstra_genesis_with_hash(
+    path: &Path,
+) -> Result<(DijkstraGenesis, dugite_primitives::hash::Hash32)> {
+    let content = std::fs::read_to_string(path)
+        .with_context(|| format!("Failed to read Dijkstra genesis: {}", path.display()))?;
+    let genesis = DijkstraGenesis::from_json_str(&content)
+        .with_context(|| format!("Failed to parse Dijkstra genesis: {}", path.display()))?;
+    let hash = dugite_primitives::hash::blake2b_256(content.as_bytes());
+    debug!(
+        genesis_hash = %hash.to_hex(),
+        "Dijkstra genesis hash computed"
+    );
+    Ok((genesis, hash))
+}
+
 /// Convert a float to a rational approximation
 fn float_to_rational(f: f64) -> Rational {
     if f == 0.0 {
