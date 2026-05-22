@@ -653,6 +653,150 @@ fn unwrap_bytes(v: Option<Value>, id: BuiltinId) -> Result<Vec<u8>, UplcError> {
     }
 }
 
+/// Denotation for `bls12_381_G1_multiScalarMul` and
+/// `bls12_381_G2_multiScalarMul` (PV1.1.0).
+///
+/// Computes `Σᵢ sᵢ·Pᵢ` (multi-scalar multiplication = sum of scalar
+/// multiples of group elements). The two lists must have equal length;
+/// mismatched lengths are a `BuiltinFailure`.
+pub fn denote_multi_scalar_mul(id: BuiltinId, args: Vec<Value>) -> Result<Value, UplcError> {
+    use BuiltinId::*;
+    let mut it = args.into_iter();
+    let scalars_val = it
+        .next()
+        .ok_or_else(|| UplcError::Internal(format!("{}: missing scalar list arg", id.name())))?;
+    let points_val = it
+        .next()
+        .ok_or_else(|| UplcError::Internal(format!("{}: missing points list arg", id.name())))?;
+
+    // Unwrap the scalar list (ProtoList Integer).
+    let scalars: Vec<BigInt> = match scalars_val {
+        Value::Const(crate::term::Constant::ProtoList { elements, .. }) => elements
+            .into_iter()
+            .map(|c| match c {
+                crate::term::Constant::Integer(i) => Ok(i),
+                other => Err(UplcError::BuiltinTypeError {
+                    builtin: id.name(),
+                    reason: format!(
+                        "scalar list must contain Integers, got {:?}",
+                        std::mem::discriminant(&other)
+                    ),
+                }),
+            })
+            .collect::<Result<_, _>>()?,
+        other => {
+            return Err(UplcError::BuiltinTypeError {
+                builtin: id.name(),
+                reason: format!(
+                    "expected ProtoList for scalars, got {:?}",
+                    std::mem::discriminant(&other)
+                ),
+            })
+        }
+    };
+
+    match id {
+        Bls12_381_G1_MultiScalarMul => {
+            // Unwrap the G1 point list.
+            let points_bytes: Vec<Vec<u8>> = match points_val {
+                Value::Const(crate::term::Constant::ProtoList { elements, .. }) => elements
+                    .into_iter()
+                    .map(|c| match c {
+                        crate::term::Constant::Bls12_381G1Element(boxed) => Ok(boxed.to_vec()),
+                        other => Err(UplcError::BuiltinTypeError {
+                            builtin: id.name(),
+                            reason: format!(
+                                "G1 list must contain G1 elements, got {:?}",
+                                std::mem::discriminant(&other)
+                            ),
+                        }),
+                    })
+                    .collect::<Result<_, _>>()?,
+                other => {
+                    return Err(UplcError::BuiltinTypeError {
+                        builtin: id.name(),
+                        reason: format!(
+                            "expected ProtoList for G1 points, got {:?}",
+                            std::mem::discriminant(&other)
+                        ),
+                    })
+                }
+            };
+            if scalars.len() != points_bytes.len() {
+                return Err(UplcError::BuiltinFailure {
+                    builtin: id.name(),
+                    reason: format!(
+                        "scalar count ({}) != point count ({})",
+                        scalars.len(),
+                        points_bytes.len()
+                    ),
+                });
+            }
+            // Accumulate: start with G1 identity, add each sᵢ·Pᵢ.
+            let mut acc = blst_p1::default(); // identity
+            for (s, p_bytes) in scalars.into_iter().zip(points_bytes) {
+                let p = uncompress_g1(&p_bytes, id)?;
+                let scalar = bigint_to_blst_scalar(&s);
+                let mut term = blst_p1::default();
+                // SAFETY: `term`, `p` are valid blst_p1; scalar is 32
+                // big-endian bytes.
+                unsafe { blst_p1_mult(&mut term, &p, scalar.as_ptr(), scalar.len() * 8) };
+                unsafe { blst_p1_add_or_double(&mut acc, &acc, &term) };
+            }
+            Ok(g1_to_value(&acc))
+        }
+        Bls12_381_G2_MultiScalarMul => {
+            let points_bytes: Vec<Vec<u8>> = match points_val {
+                Value::Const(crate::term::Constant::ProtoList { elements, .. }) => elements
+                    .into_iter()
+                    .map(|c| match c {
+                        crate::term::Constant::Bls12_381G2Element(boxed) => Ok(boxed.to_vec()),
+                        other => Err(UplcError::BuiltinTypeError {
+                            builtin: id.name(),
+                            reason: format!(
+                                "G2 list must contain G2 elements, got {:?}",
+                                std::mem::discriminant(&other)
+                            ),
+                        }),
+                    })
+                    .collect::<Result<_, _>>()?,
+                other => {
+                    return Err(UplcError::BuiltinTypeError {
+                        builtin: id.name(),
+                        reason: format!(
+                            "expected ProtoList for G2 points, got {:?}",
+                            std::mem::discriminant(&other)
+                        ),
+                    })
+                }
+            };
+            if scalars.len() != points_bytes.len() {
+                return Err(UplcError::BuiltinFailure {
+                    builtin: id.name(),
+                    reason: format!(
+                        "scalar count ({}) != point count ({})",
+                        scalars.len(),
+                        points_bytes.len()
+                    ),
+                });
+            }
+            let mut acc = blst_p2::default();
+            for (s, p_bytes) in scalars.into_iter().zip(points_bytes) {
+                let p = uncompress_g2(&p_bytes, id)?;
+                let scalar = bigint_to_blst_scalar(&s);
+                let mut term = blst_p2::default();
+                unsafe { blst_p2_mult(&mut term, &p, scalar.as_ptr(), scalar.len() * 8) };
+                unsafe { blst_p2_add_or_double(&mut acc, &acc, &term) };
+            }
+            Ok(g2_to_value(&acc))
+        }
+        _ => Err(UplcError::Internal(format!(
+            "denote_multi_scalar_mul called with non-MSM builtin {:?}",
+            id
+        ))),
+    }
+}
+
 fn unwrap_integer_for_bls(v: Option<Value>, id: BuiltinId) -> Result<BigInt, UplcError> {
     match v {
         Some(Value::Const(Constant::Integer(i))) => Ok(i),
