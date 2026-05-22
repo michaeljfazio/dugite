@@ -27,16 +27,21 @@ fuzz_target!(|data: &[u8]| {
     // Returns Ok(consumed) or Err — both are acceptable.
     let _ = skip_cbor_value(data);
 
-    // Also verify a hand-crafted deeply-nested indefinite array returns Err:
-    // [0x9f, 0x9f, 0x9f, ..., 0xff, 0xff, 0xff, ...]  → depth 65+ should Err
-    if data.len() >= 1 && data[0] == 0x01 {
-        // Build 65 nested indefinite arrays: 0x9f repeated 65 times + 0xff 65 times
-        let mut nested = vec![0x9fu8; 65];
-        nested.extend(vec![0xffu8; 65]);
+    // Also verify a hand-crafted deeply-nested indefinite array returns Err.
+    //
+    // CBOR_SKIP_MAX_DEPTH = 64, checked as `depth > CBOR_SKIP_MAX_DEPTH`. The
+    // outer call uses depth=0 so up to depth=64 (65 nesting levels) is
+    // permitted; the 66th nesting level (depth=65) is rejected. We test
+    // significantly past that bound (80 levels) to be robust against future
+    // tweaks to the constant.
+    if !data.is_empty() && data[0] == 0x01 {
+        let levels = 80usize;
+        let mut nested = vec![0x9fu8; levels];
+        nested.extend(vec![0xffu8; levels]);
         let result = skip_cbor_value(&nested);
         assert!(
             result.is_err(),
-            "depth-65 nested indefinite arrays must return Err, not panic"
+            "{levels}-nested indefinite arrays must return Err, not panic"
         );
     }
 
