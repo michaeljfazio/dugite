@@ -933,11 +933,24 @@ pub fn denote(id: BuiltinId, args: Vec<Value>) -> Result<Value, UplcError> {
             Ok(Value::Const(Constant::Bool(vk.verify(&msg, &sig).is_ok())))
         }
 
-        // Anything else is a future commit.
-        _ => Err(UplcError::Internal(format!(
-            "builtin denotation for {} not yet wired",
-            id.name()
-        ))),
+        // ── BLS12-381 (V3; CIP-0381) ──────────────────────────────────
+        Bls12_381_G1_Add
+        | Bls12_381_G1_Neg
+        | Bls12_381_G1_ScalarMul
+        | Bls12_381_G1_Equal
+        | Bls12_381_G1_HashToGroup
+        | Bls12_381_G1_Compress
+        | Bls12_381_G1_Uncompress
+        | Bls12_381_G2_Add
+        | Bls12_381_G2_Neg
+        | Bls12_381_G2_ScalarMul
+        | Bls12_381_G2_Equal
+        | Bls12_381_G2_HashToGroup
+        | Bls12_381_G2_Compress
+        | Bls12_381_G2_Uncompress
+        | Bls12_381_MillerLoop
+        | Bls12_381_MulMlResult
+        | Bls12_381_FinalVerify => crate::builtin::bls::denote_bls(id, args),
     }
 }
 

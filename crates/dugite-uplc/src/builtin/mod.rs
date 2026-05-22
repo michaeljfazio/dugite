@@ -30,6 +30,7 @@
 #![allow(dead_code)]
 
 pub mod arity;
+pub mod bls;
 pub mod denotations;
 pub mod dispatch;
 pub mod sized;
