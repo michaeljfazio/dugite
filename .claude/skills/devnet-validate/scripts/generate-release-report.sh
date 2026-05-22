@@ -205,6 +205,16 @@ process_round() {
         fi
     fi
 
+    # --- Adversarial N2N summary ---
+    local n2n_pass=0 n2n_fail=0 n2n_panic=0 n2n_silent=0
+    local n2n_csv="$evd/n2n-trace.csv"
+    if [ -f "$n2n_csv" ] && [ -s "$n2n_csv" ]; then
+        n2n_pass=$(awk -F, 'NR>1 && ($7=="PASS"||$7=="REJECTED") {c++} END{print c+0}' "$n2n_csv")
+        n2n_fail=$(awk -F, 'NR>1 && ($7=="PANIC"||$7=="SILENT_SKIP"||$7=="ERROR") {c++} END{print c+0}' "$n2n_csv")
+        n2n_panic=$(awk -F, 'NR>1 && $7=="PANIC" {c++} END{print c+0}' "$n2n_csv")
+        n2n_silent=$(awk -F, 'NR>1 && $7=="SILENT_SKIP" {c++} END{print c+0}' "$n2n_csv")
+    fi
+
     # --- CLI parity summary ---
     local cli_parity_equal=0 cli_parity_divergent=0 cli_parity_skip=0 cli_parity_error=0
     local parity_csv="$evd/cli-parity.csv"
@@ -262,6 +272,12 @@ process_round() {
   "log_errors": $log_json,
   "anomalies": $anomalies_json,
   "epoch_transitions_observed": $epoch_transitions,
+  "n2n_adversarial": {
+    "pass": $n2n_pass,
+    "fail": $n2n_fail,
+    "panic": $n2n_panic,
+    "silent_skip": $n2n_silent
+  },
   "cli_parity": {
     "equal": $cli_parity_equal,
     "divergent": $cli_parity_divergent,
