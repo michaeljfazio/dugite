@@ -50,6 +50,7 @@ pub mod phase_two;
 pub mod program;
 pub mod script_context;
 pub mod term;
+pub mod tx_info;
 
 mod error;
 
