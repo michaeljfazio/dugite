@@ -288,6 +288,7 @@ mod tests {
             kes_signature: vec![0x07; 448],
             nonce_vrf_output: vec![],
             nonce_vrf_proof: vec![],
+            prev_nonce: None,
         }
     }
 

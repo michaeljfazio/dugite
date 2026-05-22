@@ -337,6 +337,7 @@ fn decode_shelley_header_inner(r: &mut Reader<'_>) -> Result<BlockHeader, Serial
         kes_signature,
         nonce_vrf_output: nonce_output,
         nonce_vrf_proof: nonce_proof,
+        prev_nonce: None,
     })
 }
 

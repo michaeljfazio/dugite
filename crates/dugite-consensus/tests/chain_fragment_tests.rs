@@ -40,6 +40,7 @@ fn make_header(slot: u64, block_no: u64, hash_byte: u8, prev_byte: u8) -> BlockH
         kes_signature: vec![],
         nonce_vrf_output: vec![],
         nonce_vrf_proof: vec![],
+        prev_nonce: None,
     }
 }
 

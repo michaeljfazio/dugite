@@ -582,6 +582,7 @@ mod tests {
                 kes_signature: vec![],
                 nonce_vrf_output: vec![],
                 nonce_vrf_proof: vec![],
+                prev_nonce: None,
             },
             transactions: vec![],
             raw_cbor: None,

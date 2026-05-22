@@ -940,6 +940,7 @@ mod tests {
                 },
                 nonce_vrf_output: vec![],
                 nonce_vrf_proof: vec![],
+                prev_nonce: None,
                 block_number: BlockNo(block_no),
                 slot: SlotNo(slot),
                 epoch_nonce: Hash32::ZERO,
