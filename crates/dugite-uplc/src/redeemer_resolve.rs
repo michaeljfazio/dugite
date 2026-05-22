@@ -391,6 +391,19 @@ fn find_script_bytes(
                     PrimScriptRef::PlutusV1(b) => return Ok((b.clone(), ScriptLanguage::PlutusV1)),
                     PrimScriptRef::PlutusV2(b) => return Ok((b.clone(), ScriptLanguage::PlutusV2)),
                     PrimScriptRef::PlutusV3(b) => return Ok((b.clone(), ScriptLanguage::PlutusV3)),
+                    // PlutusV4 (Dijkstra) ref-script resolution is part of
+                    // issue #475 Phase 5; the `ScriptLanguage::PlutusV4`
+                    // variant + evaluator wiring don't exist yet. Until they
+                    // land, refuse to resolve V4 ref-scripts so phase-2
+                    // doesn't silently feed V4 bytes to the V3 machine.
+                    PrimScriptRef::PlutusV4(_) => {
+                        return Err(PhaseTwoError::Internal(format!(
+                            "find_script_bytes: script {h} resolves to a PlutusV4 \
+                             reference script — V4 evaluation is not yet implemented \
+                             (issue #475 Phase 5)",
+                            h = hex::encode(script_hash)
+                        )));
+                    }
                     PrimScriptRef::NativeScript(_) => {
                         return Err(PhaseTwoError::Internal(format!(
                             "find_script_bytes: script {h} resolves to a native script — \

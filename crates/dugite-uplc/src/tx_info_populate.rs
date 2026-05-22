@@ -53,6 +53,8 @@ const SCRIPT_TAG_NATIVE: u8 = 0;
 const SCRIPT_TAG_PLUTUS_V1: u8 = 1;
 const SCRIPT_TAG_PLUTUS_V2: u8 = 2;
 const SCRIPT_TAG_PLUTUS_V3: u8 = 3;
+/// PlutusV4 hash-prefix byte (Dijkstra, issue #475 Phase 5).
+const SCRIPT_TAG_PLUTUS_V4: u8 = 4;
 
 /// Translate a dugite primitive [`PrimCred`] into the Plutus
 /// `Credential` shape Plutus scripts observe.
@@ -327,6 +329,14 @@ pub fn script_ref_hash(s: &PrimScriptRef) -> ScriptHash {
         PrimScriptRef::PlutusV1(bytes) => blake2b_224_tagged(SCRIPT_TAG_PLUTUS_V1, bytes).0,
         PrimScriptRef::PlutusV2(bytes) => blake2b_224_tagged(SCRIPT_TAG_PLUTUS_V2, bytes).0,
         PrimScriptRef::PlutusV3(bytes) => blake2b_224_tagged(SCRIPT_TAG_PLUTUS_V3, bytes).0,
+        // PlutusV4 (Dijkstra, language tag 4, hash prefix `\x04`).
+        //
+        // Initial Dijkstra rollout: same wire shape and hash discipline as V3
+        // (prefix-tagged blake2b-224 over the flat program bytes), only the
+        // language tag differs. Full TxInfo translation for V4 ships as a
+        // follow-on under issue #475 Phase 5 (decoder now emits V4 from the
+        // Conway script_ref reader; runtime evaluation still gated).
+        PrimScriptRef::PlutusV4(bytes) => blake2b_224_tagged(SCRIPT_TAG_PLUTUS_V4, bytes).0,
     }
 }
 
