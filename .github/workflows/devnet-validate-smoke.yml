@@ -1,0 +1,136 @@
+name: devnet-validate smoke
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - 'crates/dugite-node/**'
+      - 'crates/dugite-network/**'
+      - 'crates/dugite-consensus/**'
+      - 'crates/dugite-ledger/**'
+      - 'crates/dugite-storage/**'
+      - 'crates/dugite-serialization/**'
+      - 'crates/dugite-crypto/**'
+      - 'crates/dugite-primitives/**'
+      - 'crates/dugite-cli/**'
+      - 'testnet/local-devnet/**'
+      - '.github/workflows/devnet-validate-smoke.yml'
+
+concurrency:
+  group: devnet-smoke-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  smoke:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      CARGO_TERM_COLOR: always
+      RUSTFLAGS: "-D warnings"
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry and build
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-smoke-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-smoke-
+
+      - name: Build release binary
+        run: cargo build --release -p dugite-node -p dugite-cli
+
+      - name: Install devnet prerequisites
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq jq socat bc
+
+      - name: Install cardano-node ${{ env.CARDANO_NODE_VERSION }}
+        env:
+          CARDANO_NODE_VERSION: "10.4.1"
+        run: |
+          URL="https://github.com/IntersectMBO/cardano-node/releases/download/${CARDANO_NODE_VERSION}/cardano-node-${CARDANO_NODE_VERSION}-linux.tar.gz"
+          curl -fsSL "$URL" | tar -xz -C /tmp
+          find /tmp -name 'cardano-node' -o -name 'cardano-cli' 2>/dev/null | \
+            while read -r f; do sudo install -m755 "$f" /usr/local/bin/; done
+          cardano-cli --version
+
+      - name: Setup local devnet
+        run: |
+          cd testnet/local-devnet
+          ./setup.sh
+
+      - name: Run devnet (background)
+        run: |
+          cd testnet/local-devnet
+          ./run.sh &
+          echo "DEVNET_PID=$!" >> "$GITHUB_ENV"
+          # Wait for sockets to appear (up to 60s)
+          for i in $(seq 1 30); do
+            sleep 2
+            if [ -S "/tmp/ld-$(id -u)/relay.sock" ]; then
+              echo "Devnet up after $((i*2))s"
+              break
+            fi
+          done
+
+      - name: Wait for blocks
+        run: |
+          MAGIC=42
+          RELAY_SOCK="/tmp/ld-$(id -u)/relay.sock"
+          for i in $(seq 1 30); do
+            sleep 3
+            BLOCKS=$(cardano-cli query tip --testnet-magic "$MAGIC" --socket-path "$RELAY_SOCK" 2>/dev/null | jq -r '.block // 0' || echo 0)
+            echo "Tip: $BLOCKS blocks"
+            [ "$BLOCKS" -ge 3 ] && break
+          done
+
+      - name: Run tx-zoo smoke (critical categories only)
+        run: |
+          export EVIDENCE_DIR="$(pwd)/testnet/local-devnet/evidence/smoke-$(date -u +%Y%m%dT%H%M%SZ)"
+          mkdir -p "$EVIDENCE_DIR"
+          cd testnet/local-devnet/tx-zoo
+          ./run-all.sh 01-bookkeeping 02-native-scripts 08-negative --summary
+
+      - name: Run CLI parity (top-5 queries)
+        run: |
+          export ZOO_SOCKET="/tmp/ld-$(id -u)/relay.sock"
+          export LD_DUGITE_BP_SOCK="/tmp/ld-$(id -u)/dbp.sock"
+          export LD_CARDANO_BP_SOCK="/tmp/ld-$(id -u)/cbp.sock"
+          cd testnet/local-devnet/tx-zoo/09-cli-parity
+          for script in 09a-tip.sh 09b-protocol-parameters.sh 09c-utxo.sh; do
+            [ -x "./$script" ] && ./"$script" || true
+          done
+
+      - name: Run adversarial N2N (handshake only)
+        run: |
+          cd testnet/local-devnet/protocols
+          [ -x "./01-handshake.sh" ] && ./01-handshake.sh || true
+
+      - name: Verify predicates
+        run: |
+          cd testnet/local-devnet
+          LATEST=$(ls -t evidence 2>/dev/null | head -1)
+          [ -n "$LATEST" ] && ./verify.sh "evidence/$LATEST" || true
+
+      - name: Upload evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: devnet-smoke-evidence-${{ github.sha }}
+          path: testnet/local-devnet/evidence/
+          retention-days: 7
+
+      - name: Stop devnet
+        if: always()
+        run: |
+          cd testnet/local-devnet
+          ./stop.sh 2>/dev/null || true

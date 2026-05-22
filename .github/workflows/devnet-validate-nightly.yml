@@ -1,0 +1,135 @@
+name: devnet-validate nightly
+
+on:
+  schedule:
+    - cron: '0 3 * * *'  # 03:00 UTC daily
+  workflow_dispatch:
+    inputs:
+      preset:
+        description: 'Validation preset'
+        required: false
+        default: 'standard'
+        type: choice
+        options: [smoke, standard, extended]
+
+concurrency:
+  group: devnet-nightly
+  cancel-in-progress: true
+
+jobs:
+  nightly:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      CARGO_TERM_COLOR: always
+      RUSTFLAGS: "-D warnings"
+      PRESET: ${{ inputs.preset || 'standard' }}
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry and build
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-nightly-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-nightly-
+
+      - name: Build release binary
+        run: cargo build --release -p dugite-node -p dugite-cli
+
+      - name: Install devnet prerequisites
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq jq socat bc netcat-openbsd
+
+      - name: Install cardano-node
+        env:
+          CARDANO_NODE_VERSION: "10.4.1"
+        run: |
+          URL="https://github.com/IntersectMBO/cardano-node/releases/download/${CARDANO_NODE_VERSION}/cardano-node-${CARDANO_NODE_VERSION}-linux.tar.gz"
+          curl -fsSL "$URL" | tar -xz -C /tmp
+          find /tmp -name 'cardano-node' -o -name 'cardano-cli' 2>/dev/null | \
+            while read -r f; do sudo install -m755 "$f" /usr/local/bin/; done
+
+      - name: Setup local devnet (round 1)
+        run: cd testnet/local-devnet && ./setup.sh
+
+      - name: Run devnet round 1 (baseline)
+        run: |
+          cd testnet/local-devnet
+          EVD="evidence/round1-$(date -u +%Y%m%dT%H%M%SZ)"
+          mkdir -p "$EVD"
+          ./run.sh &
+          sleep 120
+          EVIDENCE_DIR="$EVD" ./tx-zoo/run-all.sh
+          EVIDENCE_DIR="$EVD" ./sync/bulk-sync-throughput.sh
+          EVIDENCE_DIR="$EVD" ./perf/resource-health.sh
+          EVIDENCE_DIR="$EVD" ./perf/log-level-predicate.sh
+          ./verify.sh "$EVD"
+          ./stop.sh
+
+      - name: Setup local devnet (round 2 — post-epoch-boundary)
+        run: cd testnet/local-devnet && ./setup.sh
+
+      - name: Run devnet round 2 (epoch boundary)
+        run: |
+          cd testnet/local-devnet
+          EVD="evidence/round2-$(date -u +%Y%m%dT%H%M%SZ)"
+          mkdir -p "$EVD"
+          ./run.sh &
+          sleep 600  # Wait for ~1-2 epoch boundaries (400s epochs)
+          EVIDENCE_DIR="$EVD" ./tx-zoo/run-all.sh 10-gov-lifecycle
+          EVIDENCE_DIR="$EVD" ./perf/log-level-predicate.sh
+          ./verify.sh "$EVD"
+          ./stop.sh
+
+      - name: Setup local devnet (round 3 — restart)
+        run: cd testnet/local-devnet && ./setup.sh
+
+      - name: Run devnet round 3 (restart resilience)
+        run: |
+          cd testnet/local-devnet
+          EVD="evidence/round3-$(date -u +%Y%m%dT%H%M%SZ)"
+          mkdir -p "$EVD"
+          ./run.sh &
+          sleep 60
+          ./stop.sh
+          sleep 5
+          ./run.sh &
+          sleep 120
+          EVIDENCE_DIR="$EVD" ./tx-zoo/run-all.sh 01-bookkeeping 11-mempool
+          EVIDENCE_DIR="$EVD" ./perf/log-level-predicate.sh
+          ./verify.sh "$EVD"
+          ./stop.sh
+
+      - name: Generate release report
+        run: |
+          LATEST_ROUNDS=$(ls -dt testnet/local-devnet/evidence/round* 2>/dev/null | head -3 | tr '\n' ' ')
+          if [ -n "$LATEST_ROUNDS" ]; then
+            .claude/skills/devnet-validate/scripts/generate-release-report.sh \
+              --preset "$PRESET" \
+              --output-dir reports/devnet-validate \
+              $LATEST_ROUNDS 2>/dev/null || true
+          fi
+
+      - name: Upload evidence and report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: devnet-nightly-evidence-${{ github.run_number }}
+          path: |
+            testnet/local-devnet/evidence/
+            reports/devnet-validate/
+          retention-days: 30
+
+      - name: Stop devnet (cleanup)
+        if: always()
+        run: cd testnet/local-devnet && ./stop.sh 2>/dev/null || true

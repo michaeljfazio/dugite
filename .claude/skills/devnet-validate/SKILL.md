@@ -218,3 +218,82 @@ If any round fails, stop. Do not run the next round. Bundle `logs/` + `evidence/
 - Rebuild before declaring a fix unfixed — check `target/release/dugite-node` mtime vs the fix commit time (memory: `feedback_rebuild_before_declaring_unfixed`).
 - A PASS requires on-disk evidence. Do not call PASS from log skim alone — quote `verify.sh` output verbatim.
 - Treat unexpected log lines as load-bearing signals, not noise. The point of this skill is to find bugs.
+
+---
+
+## v2 capability matrix (added Phases 1-8)
+
+The harness now covers 9 dimensions across 3 intensity presets:
+
+| Dim | Capability | Smoke | Standard | Extended |
+|-----|------------|-------|----------|----------|
+| D1 | Forge & adoption | 1 epoch | 2 epochs | 5 epochs |
+| D2 | Tx surface | 08-negative subset | 59 + 30 negatives + gov-lifecycle | + CBOR fuzz |
+| D3 | N2N adversarial | handshake only | + all 7 protocol scripts | + slow-loris |
+| D4 | N2C CLI parity | 3 queries | 22 queries (09a–09v) | all |
+| D5 | Sync paths | from-relay-tip | + bulk-throughput | + from-genesis + Mithril |
+| D6 | Chaos | — | kill-9 + app-nap check | + partition + disk-full + flood |
+| D7 | Epoch transitions | 1 boundary | 2 boundaries | + gov-lifecycle enactment |
+| D8 | Resource health | log-level only | + CPU/RSS/FD sampling | + 30-min leak check |
+| D9 | Determinism | — | feasibility verdict | tip-hash match |
+
+### Quick-start v2
+
+```bash
+# Smoke (~5 min) — smoke gate for PRs
+just devnet-validate-smoke
+
+# Standard — equivalent to old 3-round workflow but with all v2 suites
+cd testnet/local-devnet
+just devnet-report
+
+# Extended (~75 min) — release tag gate
+just devnet-validate-extended
+```
+
+### New evidence files (v2)
+
+| File | Written by | Content |
+|------|-----------|---------|
+| `cli-parity.csv` | `09-cli-parity/run.sh` | query, dugite_sha, cardano_sha, equal |
+| `n2n-trace.csv` | `protocols/run.sh` | protocol, msg_type, outcome, notes |
+| `throughput.csv` | `sync/*.sh` | ts, scenario, blocks, seconds, blocks/sec, MB/sec |
+| `resource-samples.csv` | `perf/resource-health.sh` | ts, pid, node, cpu%, rss_kb, fds, threads |
+| `chaos-events.csv` | `chaos/*.sh` | ts, scenario, action, recovery_sec, result |
+| `log-anomalies.csv` | `perf/log-level-predicate.sh` | ts, node, level, pattern, count |
+
+### New tx-zoo categories
+
+| Category | Scripts | What it tests |
+|----------|---------|---------------|
+| `08-negative` (expanded) | 08e–08s (15 new) | Phase-1 predicates: NoInputs, DuplicateInput, InputNotFound, ValueNotConserved, TxTooLarge, NotYetValid, BadSignature, MissingRequiredSigner, OutputValueTooLarge, WrongNetworkOutput, InvalidMint, NativeScriptFailed, RefInputNotFound, MalformedCBOR, StakePoolCostTooLow |
+| `10-gov-lifecycle` | 10a–10e | propose → DRep vote → SPO vote → CC vote → assert enactment |
+| `11-mempool` | 11a–11c | TTL eviction, input-conflict rejection, drain latency p99 |
+
+### Chaos tests
+
+All chaos tests live in `testnet/local-devnet/chaos/`. Each records to `evidence/<ts>/chaos-events.csv`.
+
+| Script | What it tests | Recovery bound |
+|--------|--------------|---------------|
+| `kill-9-mid-forge.sh` | SIGKILL recovery | 120s |
+| `network-partition.sh` | 60s relay block + reconnect | 60s |
+| `clock-skew.sh` | Future-slot injection rejected, no panic | — |
+| `disk-full.sh` | Write failure → no corruption, no panic | — |
+| `inbound-syn-flood.sh` | 200 rapid connections → node stays responsive | — |
+| `macos-app-nap.sh` | `caffeinate` present and used (macOS only) | — |
+
+### CI integration (Phase 8)
+
+| Workflow | Trigger | Timeout |
+|----------|---------|---------|
+| `.github/workflows/devnet-validate-smoke.yml` | PR touching core crates | 15 min |
+| `.github/workflows/devnet-validate-nightly.yml` | Daily 03:00 UTC | 60 min |
+
+The smoke workflow gates PRs; the nightly runs all 3 rounds of the standard preset.
+
+### Flaky-test policy
+
+- **Non-chaos predicates**: zero retries. Flake = bug.
+- **Chaos predicates**: 1 retry. Two consecutive failures on the same scenario = file a bug.
+- **Network-bound (Mithril, public DNS)**: bounded timeout; skip-with-warning if unreachable.

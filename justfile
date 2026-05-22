@@ -100,6 +100,78 @@ devnet-report TAG="":
         "evidence/$latest"
     echo "Report written to reports/devnet-validate/"
 
+# Run smoke devnet-validate (single boot, ~5 min). PR gate for core crates.
+devnet-validate-smoke:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    REPO_ROOT="$(pwd)"
+    cd testnet/local-devnet
+    EVD="evidence/smoke-$(date -u +%Y%m%dT%H%M%SZ)"
+    mkdir -p "$EVD"
+    ./setup.sh
+    ./run.sh &
+    DEVNET_PID=$!
+    trap 'kill $DEVNET_PID 2>/dev/null; ./stop.sh 2>/dev/null || true' EXIT
+    # Wait for relay socket
+    for i in $(seq 1 30); do
+        sleep 2
+        [ -S "/tmp/ld-$(id -u)/relay.sock" ] && break
+    done
+    # Wait for 3+ blocks
+    for i in $(seq 1 30); do
+        sleep 3
+        B=$(cardano-cli query tip --testnet-magic 42 --socket-path "/tmp/ld-$(id -u)/relay.sock" 2>/dev/null | jq -r '.block // 0' || echo 0)
+        [ "$B" -ge 3 ] && break
+    done
+    EVIDENCE_DIR="$EVD" ./tx-zoo/run-all.sh 01-bookkeeping 02-native-scripts 08-negative
+    EVIDENCE_DIR="$EVD" ./perf/log-level-predicate.sh
+    ./verify.sh "$EVD"
+    ./stop.sh 2>/dev/null || true
+    "$REPO_ROOT/.claude/skills/devnet-validate/scripts/generate-release-report.sh" \
+        --preset smoke \
+        --output-dir "$REPO_ROOT/reports/devnet-validate" \
+        "$EVD"
+    echo "Smoke report written to reports/devnet-validate/"
+
+# Run extended devnet-validate (~75 min). Used for release tagging.
+devnet-validate-extended:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    REPO_ROOT="$(pwd)"
+    cd testnet/local-devnet
+    ROUND_DIRS=()
+    for ROUND in 1 2 3; do
+        EVD="evidence/round${ROUND}-$(date -u +%Y%m%dT%H%M%SZ)"
+        mkdir -p "$EVD"
+        ./setup.sh
+        ./run.sh &
+        DEVNET_PID=$!
+        trap 'kill $DEVNET_PID 2>/dev/null; ./stop.sh 2>/dev/null || true' RETURN
+        for i in $(seq 1 30); do sleep 2; [ -S "/tmp/ld-$(id -u)/relay.sock" ] && break; done
+        for i in $(seq 1 30); do
+            sleep 3
+            B=$(cardano-cli query tip --testnet-magic 42 --socket-path "/tmp/ld-$(id -u)/relay.sock" 2>/dev/null | jq -r '.block // 0' || echo 0)
+            [ "$B" -ge 5 ] && break
+        done
+        EVIDENCE_DIR="$EVD" ./tx-zoo/run-all.sh
+        EVIDENCE_DIR="$EVD" ./sync/bulk-sync-throughput.sh
+        EVIDENCE_DIR="$EVD" ./perf/resource-health.sh
+        EVIDENCE_DIR="$EVD" ./perf/log-level-predicate.sh
+        EVIDENCE_DIR="$EVD" ./perf/determinism-feasibility.sh
+        [ "$ROUND" -eq 2 ] && {
+            sleep 300  # extra wait for epoch boundary
+            EVIDENCE_DIR="$EVD" ./tx-zoo/run-all.sh 10-gov-lifecycle
+        }
+        ./verify.sh "$EVD"
+        ./stop.sh 2>/dev/null || true
+        ROUND_DIRS+=("$EVD")
+    done
+    "$REPO_ROOT/.claude/skills/devnet-validate/scripts/generate-release-report.sh" \
+        --preset extended \
+        --output-dir "$REPO_ROOT/reports/devnet-validate" \
+        "${ROUND_DIRS[@]}"
+    echo "Extended report written to reports/devnet-validate/"
+
 # ─── Preview Sandstone soak (BP-pair + bare-BP) ──────────────────────────────
 
 # Launch the 6h orchestrated soak (Haskell relay + dugite BP).
