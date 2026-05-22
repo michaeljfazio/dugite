@@ -298,6 +298,10 @@ impl<'a> Parser<'a> {
                         let b = self.parse_type()?;
                         TypeTag::Pair(Box::new(a), Box::new(b))
                     }
+                    "array" => {
+                        let inner = self.parse_type()?;
+                        TypeTag::Array(Box::new(inner))
+                    }
                     other => {
                         return Err(ParseError::at(
                             self.pos,
@@ -322,6 +326,7 @@ impl<'a> Parser<'a> {
                     "bls12_381_G1_element" => Ok(TypeTag::Bls12_381G1Element),
                     "bls12_381_G2_element" => Ok(TypeTag::Bls12_381G2Element),
                     "bls12_381_mlresult" => Ok(TypeTag::Bls12_381MlResult),
+                    "value" => Ok(TypeTag::Value),
                     other => Err(ParseError::at(start, format!("unknown type `{other}`"))),
                 }
             }
@@ -419,6 +424,23 @@ impl<'a> Parser<'a> {
                 arr.copy_from_slice(&bytes);
                 Ok(Constant::Bls12_381MlResult(Box::new(arr)))
             }
+            TypeTag::Array(elem) => {
+                // `(array T)` literal uses the same `[e1, e2, ...]`
+                // bracket syntax as `(list T)`.
+                let elems = self.parse_list_literal(elem)?;
+                Ok(Constant::Array {
+                    elem_type: (**elem).clone(),
+                    elements: elems,
+                })
+            }
+            TypeTag::Value => {
+                // `value` literal: `[( #policy, [( #token, amount ), ...] ), ...]`
+                // Outer `[...]` is the outer list; inner `[...]` is the
+                // token map for each policy.  We normalise in place:
+                // sort both maps, remove zero-amount entries, remove
+                // empty inner maps.
+                self.parse_value_literal()
+            }
         }
     }
 
@@ -453,6 +475,151 @@ impl<'a> Parser<'a> {
                 None => return Err(ParseError::at(self.pos, "unterminated list literal".into())),
             }
         }
+    }
+
+    /// Parse a `value` literal.
+    ///
+    /// Syntax: `[ (#policy, [ (#token, amount), ... ]), ... ]`
+    ///
+    /// Constraints enforced (matching the Haskell reference):
+    ///   - Policy IDs and token names: ≤ 32 bytes.
+    ///   - Duplicate (policy, token) pairs: amounts are summed.
+    ///   - Zero-amount entries: removed after summation.
+    ///   - Empty inner maps: removed.
+    ///   - Outer and inner maps are lexicographically sorted.
+    fn parse_value_literal(&mut self) -> Result<Constant, ParseError> {
+        use std::collections::BTreeMap;
+        const MAX_KEY_LEN: usize = 32;
+        // Outer `[...]` — list of (policy, inner_map) pairs.
+        self.expect_char('[')?;
+        let mut outer: BTreeMap<Vec<u8>, BTreeMap<Vec<u8>, i128>> = BTreeMap::new();
+        self.skip_trivia();
+        if matches!(self.peek_char(), Some(']')) {
+            self.pos += 1;
+            return Ok(Constant::Value(outer));
+        }
+        loop {
+            self.skip_trivia();
+            // Each entry is `( #policy, [ ... ] )`
+            self.expect_char('(')?;
+            self.skip_trivia();
+            let policy = self.parse_hash_bytes()?;
+            if policy.len() > MAX_KEY_LEN {
+                return Err(ParseError::at(
+                    self.pos,
+                    format!(
+                        "value: policy-id exceeds {MAX_KEY_LEN} bytes (got {})",
+                        policy.len()
+                    ),
+                ));
+            }
+            self.skip_trivia();
+            self.expect_char(',')?;
+            self.skip_trivia();
+            // Inner `[...]` — list of (token, amount) pairs.
+            self.expect_char('[')?;
+            let inner_map = outer.entry(policy).or_default();
+            self.skip_trivia();
+            if !matches!(self.peek_char(), Some(']')) {
+                loop {
+                    self.skip_trivia();
+                    self.expect_char('(')?;
+                    self.skip_trivia();
+                    let token = self.parse_hash_bytes()?;
+                    if token.len() > MAX_KEY_LEN {
+                        return Err(ParseError::at(
+                            self.pos,
+                            format!(
+                                "value: token-name exceeds {MAX_KEY_LEN} bytes (got {})",
+                                token.len()
+                            ),
+                        ));
+                    }
+                    self.skip_trivia();
+                    self.expect_char(',')?;
+                    self.skip_trivia();
+                    let amount = self.parse_signed_int_i128()?;
+                    self.skip_trivia();
+                    self.expect_char(')')?;
+                    // Accumulate (handles duplicates by summing).
+                    *inner_map.entry(token).or_default() += amount;
+                    self.skip_trivia();
+                    match self.peek_char() {
+                        Some(',') => {
+                            self.pos += 1;
+                            continue;
+                        }
+                        Some(']') => {
+                            self.pos += 1;
+                            break;
+                        }
+                        Some(other) => {
+                            return Err(ParseError::at(
+                                self.pos,
+                                format!("expected `,` or `]` in value token list, got `{other}`"),
+                            ))
+                        }
+                        None => {
+                            return Err(ParseError::at(
+                                self.pos,
+                                "unterminated value token list".into(),
+                            ))
+                        }
+                    }
+                }
+            } else {
+                self.pos += 1; // consume `]`
+            }
+            self.skip_trivia();
+            self.expect_char(')')?;
+            self.skip_trivia();
+            match self.peek_char() {
+                Some(',') => {
+                    self.pos += 1;
+                    continue;
+                }
+                Some(']') => {
+                    self.pos += 1;
+                    break;
+                }
+                Some(other) => {
+                    return Err(ParseError::at(
+                        self.pos,
+                        format!("expected `,` or `]` in value policy list, got `{other}`"),
+                    ))
+                }
+                None => {
+                    return Err(ParseError::at(
+                        self.pos,
+                        "unterminated value policy list".into(),
+                    ))
+                }
+            }
+        }
+        // Normalise: remove zero-amount tokens, then empty policy maps.
+        for inner in outer.values_mut() {
+            inner.retain(|_, amt| *amt != 0);
+        }
+        outer.retain(|_, inner| !inner.is_empty());
+        Ok(Constant::Value(outer))
+    }
+
+    /// Parse a signed integer into an `i128` (used for `value` amounts
+    /// where amounts must fit in i128 / Haskell's Integer that is
+    /// checked for ≤ 2^127−1 overflow per the conformance corpus).
+    fn parse_signed_int_i128(&mut self) -> Result<i128, ParseError> {
+        let bi = self.parse_signed_int()?;
+        // The Haskell reference caps amounts at 2^127 - 1 and floors at
+        // -(2^127 - 1).  Any value outside that range is canonically
+        // stored but the parser itself is not supposed to reject it at
+        // this level — the Plutus spec leaves rejection to evaluation
+        // time for insertCoin etc.  We use i128 internally and clamp
+        // during conversion; values that actually overflow i128 (larger
+        // than 2^127) will be rejected by the builtin denotation.
+        use num_traits::ToPrimitive;
+        bi.to_i128().ok_or_else(|| {
+            ParseError::at(self.pos, format!("value amount {bi} exceeds i128 range"))
+        })
     }
 
     fn parse_signed_int(&mut self) -> Result<BigInt, ParseError> {
@@ -511,6 +678,30 @@ impl<'a> Parser<'a> {
                         b'b' => out.push('\u{08}'),
                         b'f' => out.push('\u{0C}'),
                         b'v' => out.push('\u{0B}'),
+                        // Haskell-style decimal codepoint escape: \N (where N is a digit)
+                        // e.g. \172 = ¬, \8712 = ∈
+                        c if c.is_ascii_digit() => {
+                            let dec_start = self.pos - 1; // already consumed first digit
+                            let mut dec = String::new();
+                            dec.push(c as char);
+                            while let Some(&nc) = bytes.get(self.pos) {
+                                if nc.is_ascii_digit() {
+                                    dec.push(nc as char);
+                                    self.pos += 1;
+                                } else {
+                                    break;
+                                }
+                            }
+                            let n: u32 = dec.parse().map_err(|e| {
+                                ParseError::at(dec_start, format!("bad decimal escape: {e}"))
+                            })?;
+                            out.push(char::from_u32(n).ok_or_else(|| {
+                                ParseError::at(
+                                    dec_start,
+                                    format!("invalid \\N decimal escape: U+{n:04X}"),
+                                )
+                            })?);
+                        }
                         b'x' => {
                             let h = self.read_hex_chars(2)?;
                             let n = u32::from_str_radix(&h, 16).map_err(|e| {
@@ -537,6 +728,59 @@ impl<'a> Parser<'a> {
                             out.push(char::from_u32(n).ok_or_else(|| {
                                 ParseError::at(self.pos, format!("invalid \\u escape: U+{n:04X}"))
                             })?);
+                        }
+                        // Haskell-style octal escape: \oNNN
+                        b'o' => {
+                            let oct_start = self.pos;
+                            let mut oct = String::new();
+                            while let Some(&c) = bytes.get(self.pos) {
+                                if c.is_ascii_digit() && c < b'8' {
+                                    oct.push(c as char);
+                                    self.pos += 1;
+                                } else {
+                                    break;
+                                }
+                            }
+                            if oct.is_empty() {
+                                return Err(ParseError::at(
+                                    oct_start,
+                                    "\\o escape requires octal digits".into(),
+                                ));
+                            }
+                            let n = u32::from_str_radix(&oct, 8).map_err(|e| {
+                                ParseError::at(oct_start, format!("bad octal escape: {e}"))
+                            })?;
+                            out.push(char::from_u32(n).ok_or_else(|| {
+                                ParseError::at(oct_start, format!("invalid \\o escape: {n:#o}"))
+                            })?);
+                        }
+                        // Haskell-style named escapes
+                        // \NUL \SOH \STX \ETX \EOT \ENQ \ACK \BEL \BS \HT \LF \VT \FF \CR \SO \SI
+                        // \DLE \DC1 \DC2 \DC3 \DC4 \NAK \SYN \ETB \CAN \EM \SUB \ESC \FS \GS \RS \US
+                        // \SP \DEL
+                        c if (c as char).is_ascii_uppercase() => {
+                            // Back up: we already consumed `c` via the outer match —
+                            // reconstruct the named escape by reading the rest of the
+                            // identifier (starting from the char we already have).
+                            let named_start = self.pos - 1; // pos was bumped past `c`
+                            let _ = named_start; // keep for error context
+                            let mut name = String::new();
+                            name.push(c as char);
+                            while let Some(&nc) = bytes.get(self.pos) {
+                                if nc.is_ascii_uppercase() || nc.is_ascii_digit() {
+                                    name.push(nc as char);
+                                    self.pos += 1;
+                                } else {
+                                    break;
+                                }
+                            }
+                            let ch = named_ascii_escape(&name).ok_or_else(|| {
+                                ParseError::at(
+                                    self.pos,
+                                    format!("unknown named string escape `\\{name}`"),
+                                )
+                            })?;
+                            out.push(ch);
                         }
                         other => {
                             return Err(ParseError::at(
@@ -892,5 +1136,51 @@ fn hex_nybble(b: u8) -> Result<u8, String> {
         b'a'..=b'f' => Ok(b - b'a' + 10),
         b'A'..=b'F' => Ok(b - b'A' + 10),
         _ => Err(format!("invalid hex digit `{}`", b as char)),
+    }
+}
+
+/// Haskell-style named ASCII/control character escapes.
+/// These are the multi-character names used in Haskell string literals
+/// after a backslash, e.g. `\NUL`, `\DEL`, `\SOH`, `\SO`, `\SI` etc.
+fn named_ascii_escape(name: &str) -> Option<char> {
+    // Two-letter codes that could conflict with longer codes first.
+    // We match exact names only (the parser already collected the full
+    // uppercase+digit run).
+    match name {
+        "NUL" => Some('\x00'),
+        "SOH" => Some('\x01'),
+        "STX" => Some('\x02'),
+        "ETX" => Some('\x03'),
+        "EOT" => Some('\x04'),
+        "ENQ" => Some('\x05'),
+        "ACK" => Some('\x06'),
+        "BEL" | "a" => Some('\x07'),
+        "BS" => Some('\x08'),
+        "HT" => Some('\x09'),
+        "LF" => Some('\x0A'),
+        "VT" => Some('\x0B'),
+        "FF" => Some('\x0C'),
+        "CR" => Some('\x0D'),
+        "SO" => Some('\x0E'),
+        "SI" => Some('\x0F'),
+        "DLE" => Some('\x10'),
+        "DC1" => Some('\x11'),
+        "DC2" => Some('\x12'),
+        "DC3" => Some('\x13'),
+        "DC4" => Some('\x14'),
+        "NAK" => Some('\x15'),
+        "SYN" => Some('\x16'),
+        "ETB" => Some('\x17'),
+        "CAN" => Some('\x18'),
+        "EM" => Some('\x19'),
+        "SUB" => Some('\x1A'),
+        "ESC" => Some('\x1B'),
+        "FS" => Some('\x1C'),
+        "GS" => Some('\x1D'),
+        "RS" => Some('\x1E'),
+        "US" => Some('\x1F'),
+        "SP" => Some(' '),
+        "DEL" => Some('\x7F'),
+        _ => None,
     }
 }

@@ -294,6 +294,11 @@ fn encode_type_tag(w: &mut BitWriter, t: &TypeTag) -> FlatResult<()> {
                     .into(),
             ));
         }
+        TypeTag::Array(_) | TypeTag::Value => {
+            return Err(UplcError::Encode(
+                "Array / Value flat encoding not yet wired".into(),
+            ));
+        }
     };
     w.write_bit(true); // cons-bit: one atom follows
     w.write_bits8(atom, CONST_TAG_WIDTH)?;
@@ -317,6 +322,11 @@ fn constant_type_tag(c: &Constant) -> FlatResult<TypeTag> {
         | Constant::Bls12_381MlResult(_) => Err(UplcError::Encode(
             "BLS12-381 constants cannot appear in flat-encoded \
              scripts per Haskell reference"
+                .into(),
+        )),
+        Constant::Array { .. } | Constant::Value(_) => Err(UplcError::Encode(
+            "Array / Value constants cannot appear in flat-encoded \
+             scripts (flat codec not yet wired for PV1.1.0 types)"
                 .into(),
         )),
     }
@@ -353,7 +363,9 @@ fn decode_constant_value(r: &mut BitReader<'_>, tag: &TypeTag) -> FlatResult<Con
         | TypeTag::Pair(_, _)
         | TypeTag::Bls12_381G1Element
         | TypeTag::Bls12_381G2Element
-        | TypeTag::Bls12_381MlResult => Err(UplcError::FlatDecode(format!(
+        | TypeTag::Bls12_381MlResult
+        | TypeTag::Array(_)
+        | TypeTag::Value => Err(UplcError::FlatDecode(format!(
             "constant payload for type {tag:?} not yet wired"
         ))),
     }
@@ -393,6 +405,11 @@ fn encode_constant_value(w: &mut BitWriter, c: &Constant) -> FlatResult<()> {
                 "BLS12-381 constants cannot appear in flat-encoded \
                  scripts per Haskell reference"
                     .into(),
+            ));
+        }
+        Constant::Array { .. } | Constant::Value(_) => {
+            return Err(UplcError::Encode(
+                "Array / Value constants flat encoding not yet wired".into(),
             ));
         }
     }

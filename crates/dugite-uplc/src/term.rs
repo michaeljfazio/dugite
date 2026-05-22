@@ -128,6 +128,25 @@ pub enum Constant {
     /// is canonical-compressed (576 bytes after `final_exponentiation`).
     /// Boxed — the variant would otherwise dominate the enum size.
     Bls12_381MlResult(Box<[u8; 576]>),
+    /// PV1.1.0 `(array T)` — an immutable indexed array.  Elements are
+    /// all of the same type (recorded in `elem_type` for type-checking).
+    Array {
+        elem_type: TypeTag,
+        elements: Vec<Constant>,
+    },
+    /// PV1.1.0 `value` — a Cardano multi-asset value
+    /// `Map<PolicyId, Map<TokenName, Integer>>` (policy IDs and token
+    /// names are byte strings, amounts are i128).
+    ///
+    /// Canonical form requirements (enforced at parse time, matching
+    /// the Haskell reference):
+    ///   - Outer and inner maps are lexicographically sorted by key.
+    ///   - Entries with a zero amount are removed.
+    ///   - Empty inner maps (no tokens for a policy) are removed.
+    ///   - Duplicate keys: amounts are summed; if the result is zero the
+    ///     entry is removed.
+    ///   - Policy IDs and token names must be ≤ 32 bytes.
+    Value(std::collections::BTreeMap<Vec<u8>, std::collections::BTreeMap<Vec<u8>, i128>>),
 }
 
 impl Constant {
@@ -150,6 +169,8 @@ impl Constant {
             Constant::Bls12_381G1Element(_) => TypeTag::Bls12_381G1Element,
             Constant::Bls12_381G2Element(_) => TypeTag::Bls12_381G2Element,
             Constant::Bls12_381MlResult(_) => TypeTag::Bls12_381MlResult,
+            Constant::Array { elem_type, .. } => TypeTag::Array(Box::new(elem_type.clone())),
+            Constant::Value(_) => TypeTag::Value,
         }
     }
 }
@@ -175,6 +196,10 @@ pub enum TypeTag {
     Bls12_381G1Element,
     Bls12_381G2Element,
     Bls12_381MlResult,
+    /// PV1.1.0 immutable array type.
+    Array(Box<TypeTag>),
+    /// PV1.1.0 multi-asset value type.
+    Value,
 }
 
 /// All Plutus Core builtin function identifiers.
@@ -293,6 +318,33 @@ pub enum BuiltinId {
     FindFirstSetBit = 85,
     Ripemd_160 = 86,
     ExpModInteger = 87,
+    // ── PV1.1.0 additions ───────────────────────────────────────────────
+    /// `dropList : (Integer, list T) -> list T` (PV1.1.0).
+    DropList = 88,
+    /// `indexArray : (array T, Integer) -> T` (PV1.1.0).
+    IndexArray = 89,
+    /// `lengthOfArray : (array T) -> Integer` (PV1.1.0).
+    LengthOfArray = 90,
+    /// `listToArray : (list T) -> (array T)` (PV1.1.0).
+    ListToArray = 91,
+    /// `insertCoin : ByteString -> ByteString -> Integer -> Value -> Value` (PV1.1.0).
+    InsertCoin = 92,
+    /// `lookupCoin : ByteString -> ByteString -> Value -> Integer` (PV1.1.0).
+    LookupCoin = 93,
+    /// `scaleValue : Integer -> Value -> Value` (PV1.1.0).
+    ScaleValue = 94,
+    /// `unValueData : Data -> Value` (PV1.1.0).
+    UnValueData = 95,
+    /// `valueData : Value -> Data` (PV1.1.0).
+    ValueData = 96,
+    /// `valueContains : Value -> Value -> Bool` (PV1.1.0).
+    ValueContains = 97,
+    /// `unionValue : Value -> Value -> Value` (PV1.1.0).
+    UnionValue = 98,
+    /// `bls12_381_G1_multiScalarMul : (list Integer) -> (list G1) -> G1` (PV1.1.0).
+    Bls12_381_G1_MultiScalarMul = 99,
+    /// `bls12_381_G2_multiScalarMul : (list Integer) -> (list G2) -> G2` (PV1.1.0).
+    Bls12_381_G2_MultiScalarMul = 100,
 }
 
 impl BuiltinId {
@@ -393,8 +445,21 @@ impl BuiltinId {
             85 => Ok(BuiltinId::FindFirstSetBit),
             86 => Ok(BuiltinId::Ripemd_160),
             87 => Ok(BuiltinId::ExpModInteger),
+            88 => Ok(BuiltinId::DropList),
+            89 => Ok(BuiltinId::IndexArray),
+            90 => Ok(BuiltinId::LengthOfArray),
+            91 => Ok(BuiltinId::ListToArray),
+            92 => Ok(BuiltinId::InsertCoin),
+            93 => Ok(BuiltinId::LookupCoin),
+            94 => Ok(BuiltinId::ScaleValue),
+            95 => Ok(BuiltinId::UnValueData),
+            96 => Ok(BuiltinId::ValueData),
+            97 => Ok(BuiltinId::ValueContains),
+            98 => Ok(BuiltinId::UnionValue),
+            99 => Ok(BuiltinId::Bls12_381_G1_MultiScalarMul),
+            100 => Ok(BuiltinId::Bls12_381_G2_MultiScalarMul),
             _ => Err(crate::UplcError::FlatDecode(format!(
-                "unknown builtin id {raw} (max recognised: 87)"
+                "unknown builtin id {raw} (max recognised: 100)"
             ))),
         }
     }
@@ -501,6 +566,19 @@ impl BuiltinId {
             BuiltinId::FindFirstSetBit => "findFirstSetBit",
             BuiltinId::Ripemd_160 => "ripemd_160",
             BuiltinId::ExpModInteger => "expModInteger",
+            BuiltinId::DropList => "dropList",
+            BuiltinId::IndexArray => "indexArray",
+            BuiltinId::LengthOfArray => "lengthOfArray",
+            BuiltinId::ListToArray => "listToArray",
+            BuiltinId::InsertCoin => "insertCoin",
+            BuiltinId::LookupCoin => "lookupCoin",
+            BuiltinId::ScaleValue => "scaleValue",
+            BuiltinId::UnValueData => "unValueData",
+            BuiltinId::ValueData => "valueData",
+            BuiltinId::ValueContains => "valueContains",
+            BuiltinId::UnionValue => "unionValue",
+            BuiltinId::Bls12_381_G1_MultiScalarMul => "bls12_381_G1_multiScalarMul",
+            BuiltinId::Bls12_381_G2_MultiScalarMul => "bls12_381_G2_multiScalarMul",
         }
     }
 }
@@ -520,13 +598,13 @@ mod tests {
         // Every defined discriminant must round-trip through
         // `from_u8` → `as_u8`. Anything past 87 must error rather
         // than wrap or panic.
-        for raw in 0u8..=87 {
+        for raw in 0u8..=100 {
             let id = BuiltinId::from_u8(raw).unwrap_or_else(|e| {
                 panic!("from_u8({raw}) failed: {e}");
             });
             assert_eq!(id.as_u8(), raw, "as_u8 round-trip for raw={raw}");
         }
-        for raw in [88u8, 100, 127] {
+        for raw in [101u8, 127] {
             let err = BuiltinId::from_u8(raw).unwrap_err();
             assert!(
                 matches!(err, UplcError::FlatDecode(_)),
@@ -540,7 +618,7 @@ mod tests {
         // Every variant gets a stable Haskell-style name and no two
         // names collide.
         let mut seen = std::collections::HashSet::new();
-        for raw in 0u8..=87 {
+        for raw in 0u8..=100 {
             let id = BuiltinId::from_u8(raw).expect("from_u8");
             let name = id.name();
             assert!(!name.is_empty(), "empty name for raw={raw}");

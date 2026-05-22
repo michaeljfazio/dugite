@@ -300,6 +300,26 @@ const BUILTIN_NAME_TABLE: &[(&str, BuiltinId)] = &[
     ("findFirstSetBit", BuiltinId::FindFirstSetBit),
     ("ripemd_160", BuiltinId::Ripemd_160),
     ("expModInteger", BuiltinId::ExpModInteger),
+    // PV1.1.0 additions
+    ("dropList", BuiltinId::DropList),
+    ("indexArray", BuiltinId::IndexArray),
+    ("lengthOfArray", BuiltinId::LengthOfArray),
+    ("listToArray", BuiltinId::ListToArray),
+    ("insertCoin", BuiltinId::InsertCoin),
+    ("lookupCoin", BuiltinId::LookupCoin),
+    ("scaleValue", BuiltinId::ScaleValue),
+    ("unValueData", BuiltinId::UnValueData),
+    ("valueData", BuiltinId::ValueData),
+    ("valueContains", BuiltinId::ValueContains),
+    ("unionValue", BuiltinId::UnionValue),
+    (
+        "bls12_381_G1_multiScalarMul",
+        BuiltinId::Bls12_381_G1_MultiScalarMul,
+    ),
+    (
+        "bls12_381_G2_multiScalarMul",
+        BuiltinId::Bls12_381_G2_MultiScalarMul,
+    ),
 ];
 
 #[cfg(test)]
