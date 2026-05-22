@@ -1,4 +1,8 @@
-# Dugite
+<p align="center">
+  <img src="assets/logo.png" alt="Dugite logo" width="220" />
+</p>
+
+<h1 align="center">Dugite</h1>
 
 Named after the [dugite](https://en.wikipedia.org/wiki/Dugite) (*Pseudonaja affinis*), a highly venomous brown snake indigenous to Perth, Western Australia — where the project's main author is from. Dugites are fast, resilient, and quietly formidable; traits shared by this node. They're also responsible for the loss of more than a few beloved family pets over the years.
 
