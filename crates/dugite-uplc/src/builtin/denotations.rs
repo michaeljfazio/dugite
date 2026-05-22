@@ -225,6 +225,337 @@ pub fn denote(id: BuiltinId, args: Vec<Value>) -> Result<Value, UplcError> {
             ripemd::Ripemd160::digest(bs).to_vec()
         }),
 
+        // ── Ed25519 signature verification (V1) ───────────────────────
+        VerifyEd25519Signature => {
+            // (pub_key : ByteString(32)) (message : ByteString) (sig : ByteString(64)) -> Bool
+            let mut it = args.into_iter();
+            let pk = unwrap_byte_string(it.next().ok_or_else(|| builtin_arity_mismatch(id))?, id)?;
+            let msg = unwrap_byte_string(it.next().ok_or_else(|| builtin_arity_mismatch(id))?, id)?;
+            let sig = unwrap_byte_string(it.next().ok_or_else(|| builtin_arity_mismatch(id))?, id)?;
+            if pk.len() != 32 {
+                return Err(builtin_failure(
+                    id,
+                    &format!("ed25519 public key must be 32 bytes, got {}", pk.len()),
+                ));
+            }
+            if sig.len() != 64 {
+                return Err(builtin_failure(
+                    id,
+                    &format!("ed25519 signature must be 64 bytes, got {}", sig.len()),
+                ));
+            }
+            let pk_bytes: [u8; 32] = pk.try_into().map_err(|_| {
+                UplcError::Internal("ed25519 pk length check failed after success".into())
+            })?;
+            let sig_bytes: [u8; 64] = sig.try_into().map_err(|_| {
+                UplcError::Internal("ed25519 sig length check failed after success".into())
+            })?;
+            let vk = match ed25519_dalek::VerifyingKey::from_bytes(&pk_bytes) {
+                Ok(vk) => vk,
+                Err(_) => {
+                    // Malformed public key: Haskell semantics is to
+                    // return `False`, not crash.
+                    return Ok(Value::Const(Constant::Bool(false)));
+                }
+            };
+            let sig = ed25519_dalek::Signature::from_bytes(&sig_bytes);
+            Ok(Value::Const(Constant::Bool(
+                vk.verify_strict(&msg, &sig).is_ok(),
+            )))
+        }
+
+        // ── List builtins (V1) ────────────────────────────────────────
+        HeadList => {
+            let v = take_one(args, id)?;
+            let (_, elems) = unwrap_proto_list(v, id)?;
+            elems
+                .into_iter()
+                .next()
+                .map(Value::Const)
+                .ok_or_else(|| builtin_failure(id, "headList on empty list"))
+        }
+        TailList => {
+            let v = take_one(args, id)?;
+            let (elem_type, mut elems) = unwrap_proto_list(v, id)?;
+            if elems.is_empty() {
+                return Err(builtin_failure(id, "tailList on empty list"));
+            }
+            elems.remove(0);
+            Ok(Value::Const(Constant::ProtoList {
+                elem_type,
+                elements: elems,
+            }))
+        }
+        NullList => {
+            let v = take_one(args, id)?;
+            let (_, elems) = unwrap_proto_list(v, id)?;
+            Ok(Value::Const(Constant::Bool(elems.is_empty())))
+        }
+        ChooseList => {
+            // (list : ProtoList) (nil_case) (cons_case) -> branch
+            let mut it = args.into_iter();
+            let list = it.next().ok_or_else(|| builtin_arity_mismatch(id))?;
+            let nil_case = it.next().ok_or_else(|| builtin_arity_mismatch(id))?;
+            let cons_case = it.next().ok_or_else(|| builtin_arity_mismatch(id))?;
+            let (_, elems) = unwrap_proto_list(list, id)?;
+            Ok(if elems.is_empty() {
+                nil_case
+            } else {
+                cons_case
+            })
+        }
+        MkCons => {
+            // (head : Constant) (list : ProtoList) -> ProtoList
+            let mut it = args.into_iter();
+            let head = it.next().ok_or_else(|| builtin_arity_mismatch(id))?;
+            let list = it.next().ok_or_else(|| builtin_arity_mismatch(id))?;
+            let (elem_type, mut elems) = unwrap_proto_list(list, id)?;
+            // The head must be a plain Const value.
+            let head_const = match head {
+                Value::Const(c) => c,
+                _ => {
+                    return Err(UplcError::BuiltinTypeError {
+                        builtin: id.name(),
+                        reason: "mkCons head must be a Constant".into(),
+                    })
+                }
+            };
+            elems.insert(0, head_const);
+            Ok(Value::Const(Constant::ProtoList {
+                elem_type,
+                elements: elems,
+            }))
+        }
+        MkNilData => {
+            // (unit : Unit) -> ProtoList of Data
+            let v = take_one(args, id)?;
+            match v {
+                Value::Const(Constant::Unit) => Ok(Value::Const(Constant::ProtoList {
+                    elem_type: crate::term::TypeTag::Data,
+                    elements: Vec::new(),
+                })),
+                _ => Err(UplcError::BuiltinTypeError {
+                    builtin: id.name(),
+                    reason: "mkNilData expects Unit".into(),
+                }),
+            }
+        }
+        MkNilPairData => {
+            // (unit : Unit) -> ProtoList of Pair(Data, Data)
+            let v = take_one(args, id)?;
+            match v {
+                Value::Const(Constant::Unit) => Ok(Value::Const(Constant::ProtoList {
+                    elem_type: crate::term::TypeTag::Pair(
+                        Box::new(crate::term::TypeTag::Data),
+                        Box::new(crate::term::TypeTag::Data),
+                    ),
+                    elements: Vec::new(),
+                })),
+                _ => Err(UplcError::BuiltinTypeError {
+                    builtin: id.name(),
+                    reason: "mkNilPairData expects Unit".into(),
+                }),
+            }
+        }
+
+        // ── Pair builtins (V1) ────────────────────────────────────────
+        FstPair => {
+            let v = take_one(args, id)?;
+            let (a, _b) = unwrap_proto_pair(v, id)?;
+            Ok(Value::Const(*a))
+        }
+        SndPair => {
+            let v = take_one(args, id)?;
+            let (_a, b) = unwrap_proto_pair(v, id)?;
+            Ok(Value::Const(*b))
+        }
+
+        // ── Data builtins (V1) ────────────────────────────────────────
+        ChooseData => {
+            // (data) (constr_case) (map_case) (list_case) (i_case) (b_case) -> branch
+            let mut it = args.into_iter();
+            let d = unwrap_data(it.next().ok_or_else(|| builtin_arity_mismatch(id))?, id)?;
+            let constr_case = it.next().ok_or_else(|| builtin_arity_mismatch(id))?;
+            let map_case = it.next().ok_or_else(|| builtin_arity_mismatch(id))?;
+            let list_case = it.next().ok_or_else(|| builtin_arity_mismatch(id))?;
+            let i_case = it.next().ok_or_else(|| builtin_arity_mismatch(id))?;
+            let b_case = it.next().ok_or_else(|| builtin_arity_mismatch(id))?;
+            Ok(match d {
+                crate::data::Data::Constr(_, _) => constr_case,
+                crate::data::Data::Map(_) => map_case,
+                crate::data::Data::List(_) => list_case,
+                crate::data::Data::I(_) => i_case,
+                crate::data::Data::B(_) => b_case,
+            })
+        }
+        ConstrData => {
+            // (tag : Integer) (args : ProtoList Data) -> Data
+            let mut it = args.into_iter();
+            let tag = unwrap_integer(it.next().ok_or_else(|| builtin_arity_mismatch(id))?, id)?;
+            let list = it.next().ok_or_else(|| builtin_arity_mismatch(id))?;
+            let (_, elems) = unwrap_proto_list(list, id)?;
+            let tag_u64 = match u64::try_from(&tag) {
+                Ok(n) => n,
+                _ => return Err(builtin_failure(id, "constrData tag out of u64 range")),
+            };
+            let data_args: Result<Vec<crate::data::Data>, _> = elems
+                .into_iter()
+                .map(|c| match c {
+                    Constant::Data(d) => Ok(d),
+                    _ => Err(UplcError::BuiltinTypeError {
+                        builtin: id.name(),
+                        reason: "constrData args must be Data".into(),
+                    }),
+                })
+                .collect();
+            Ok(Value::Const(Constant::Data(crate::data::Data::Constr(
+                tag_u64, data_args?,
+            ))))
+        }
+        MapData => {
+            // (list : ProtoList (Pair Data Data)) -> Data
+            let v = take_one(args, id)?;
+            let (_, elems) = unwrap_proto_list(v, id)?;
+            let pairs: Result<Vec<(crate::data::Data, crate::data::Data)>, _> = elems
+                .into_iter()
+                .map(|c| match c {
+                    Constant::ProtoPair { a, b, .. } => match (*a, *b) {
+                        (Constant::Data(k), Constant::Data(vv)) => Ok((k, vv)),
+                        _ => Err(UplcError::BuiltinTypeError {
+                            builtin: id.name(),
+                            reason: "mapData pair components must be Data".into(),
+                        }),
+                    },
+                    _ => Err(UplcError::BuiltinTypeError {
+                        builtin: id.name(),
+                        reason: "mapData expects ProtoList of ProtoPair".into(),
+                    }),
+                })
+                .collect();
+            Ok(Value::Const(Constant::Data(crate::data::Data::Map(pairs?))))
+        }
+        ListData => {
+            // (list : ProtoList Data) -> Data
+            let v = take_one(args, id)?;
+            let (_, elems) = unwrap_proto_list(v, id)?;
+            let datas: Result<Vec<crate::data::Data>, _> = elems
+                .into_iter()
+                .map(|c| match c {
+                    Constant::Data(d) => Ok(d),
+                    _ => Err(UplcError::BuiltinTypeError {
+                        builtin: id.name(),
+                        reason: "listData args must be Data".into(),
+                    }),
+                })
+                .collect();
+            Ok(Value::Const(Constant::Data(crate::data::Data::List(
+                datas?,
+            ))))
+        }
+        IData => {
+            let v = take_one(args, id)?;
+            let i = unwrap_integer(v, id)?;
+            Ok(Value::Const(Constant::Data(crate::data::Data::I(i))))
+        }
+        BData => {
+            let v = take_one(args, id)?;
+            let b = unwrap_byte_string(v, id)?;
+            Ok(Value::Const(Constant::Data(crate::data::Data::B(b))))
+        }
+        UnConstrData => {
+            // Data -> Pair Integer (ProtoList Data)
+            let d = unwrap_data(take_one(args, id)?, id)?;
+            match d {
+                crate::data::Data::Constr(tag, fields) => {
+                    let elements: Vec<Constant> = fields.into_iter().map(Constant::Data).collect();
+                    Ok(Value::Const(Constant::ProtoPair {
+                        a_type: crate::term::TypeTag::Integer,
+                        b_type: crate::term::TypeTag::List(Box::new(crate::term::TypeTag::Data)),
+                        a: Box::new(Constant::Integer(BigInt::from(tag))),
+                        b: Box::new(Constant::ProtoList {
+                            elem_type: crate::term::TypeTag::Data,
+                            elements,
+                        }),
+                    }))
+                }
+                _ => Err(builtin_failure(id, "unConstrData on non-Constr Data")),
+            }
+        }
+        UnMapData => {
+            let d = unwrap_data(take_one(args, id)?, id)?;
+            match d {
+                crate::data::Data::Map(entries) => {
+                    let elements: Vec<Constant> = entries
+                        .into_iter()
+                        .map(|(k, v)| Constant::ProtoPair {
+                            a_type: crate::term::TypeTag::Data,
+                            b_type: crate::term::TypeTag::Data,
+                            a: Box::new(Constant::Data(k)),
+                            b: Box::new(Constant::Data(v)),
+                        })
+                        .collect();
+                    Ok(Value::Const(Constant::ProtoList {
+                        elem_type: crate::term::TypeTag::Pair(
+                            Box::new(crate::term::TypeTag::Data),
+                            Box::new(crate::term::TypeTag::Data),
+                        ),
+                        elements,
+                    }))
+                }
+                _ => Err(builtin_failure(id, "unMapData on non-Map Data")),
+            }
+        }
+        UnListData => {
+            let d = unwrap_data(take_one(args, id)?, id)?;
+            match d {
+                crate::data::Data::List(items) => Ok(Value::Const(Constant::ProtoList {
+                    elem_type: crate::term::TypeTag::Data,
+                    elements: items.into_iter().map(Constant::Data).collect(),
+                })),
+                _ => Err(builtin_failure(id, "unListData on non-List Data")),
+            }
+        }
+        UnIData => {
+            let d = unwrap_data(take_one(args, id)?, id)?;
+            match d {
+                crate::data::Data::I(i) => Ok(Value::Const(Constant::Integer(i))),
+                _ => Err(builtin_failure(id, "unIData on non-I Data")),
+            }
+        }
+        UnBData => {
+            let d = unwrap_data(take_one(args, id)?, id)?;
+            match d {
+                crate::data::Data::B(b) => Ok(Value::Const(Constant::ByteString(b))),
+                _ => Err(builtin_failure(id, "unBData on non-B Data")),
+            }
+        }
+        EqualsData => {
+            let mut it = args.into_iter();
+            let a = unwrap_data(it.next().ok_or_else(|| builtin_arity_mismatch(id))?, id)?;
+            let b = unwrap_data(it.next().ok_or_else(|| builtin_arity_mismatch(id))?, id)?;
+            Ok(Value::Const(Constant::Bool(a == b)))
+        }
+        MkPairData => {
+            // (a : Data) (b : Data) -> Pair Data Data
+            let mut it = args.into_iter();
+            let a = unwrap_data(it.next().ok_or_else(|| builtin_arity_mismatch(id))?, id)?;
+            let b = unwrap_data(it.next().ok_or_else(|| builtin_arity_mismatch(id))?, id)?;
+            Ok(Value::Const(Constant::ProtoPair {
+                a_type: crate::term::TypeTag::Data,
+                b_type: crate::term::TypeTag::Data,
+                a: Box::new(Constant::Data(a)),
+                b: Box::new(Constant::Data(b)),
+            }))
+        }
+        SerialiseData => {
+            // Data -> ByteString (CBOR encoding)
+            let d = unwrap_data(take_one(args, id)?, id)?;
+            let bytes = d
+                .to_cbor()
+                .map_err(|e| builtin_failure(id, &format!("serialiseData: {e}")))?;
+            Ok(Value::Const(Constant::ByteString(bytes)))
+        }
+
         // Anything else is a future commit.
         _ => Err(UplcError::Internal(format!(
             "builtin denotation for {} not yet wired",
@@ -241,6 +572,53 @@ where
     let mut it = args.into_iter();
     let input = unwrap_byte_string(it.next().ok_or_else(|| builtin_arity_mismatch(id))?, id)?;
     Ok(Value::Const(Constant::ByteString(hash(&input))))
+}
+
+fn take_one(args: Vec<Value>, id: BuiltinId) -> Result<Value, UplcError> {
+    let mut it = args.into_iter();
+    it.next().ok_or_else(|| builtin_arity_mismatch(id))
+}
+
+fn unwrap_proto_list(
+    v: Value,
+    id: BuiltinId,
+) -> Result<(crate::term::TypeTag, Vec<Constant>), UplcError> {
+    match v {
+        Value::Const(Constant::ProtoList {
+            elem_type,
+            elements,
+        }) => Ok((elem_type, elements)),
+        other => Err(UplcError::BuiltinTypeError {
+            builtin: id.name(),
+            reason: format!(
+                "expected ProtoList, got {:?}",
+                std::mem::discriminant(&other)
+            ),
+        }),
+    }
+}
+
+fn unwrap_proto_pair(v: Value, id: BuiltinId) -> Result<(Box<Constant>, Box<Constant>), UplcError> {
+    match v {
+        Value::Const(Constant::ProtoPair { a, b, .. }) => Ok((a, b)),
+        other => Err(UplcError::BuiltinTypeError {
+            builtin: id.name(),
+            reason: format!(
+                "expected ProtoPair, got {:?}",
+                std::mem::discriminant(&other)
+            ),
+        }),
+    }
+}
+
+fn unwrap_data(v: Value, id: BuiltinId) -> Result<crate::data::Data, UplcError> {
+    match v {
+        Value::Const(Constant::Data(d)) => Ok(d),
+        other => Err(UplcError::BuiltinTypeError {
+            builtin: id.name(),
+            reason: format!("expected Data, got {:?}", std::mem::discriminant(&other)),
+        }),
+    }
 }
 
 fn take_two_byte_strings(args: Vec<Value>, id: BuiltinId) -> Result<(Vec<u8>, Vec<u8>), UplcError> {
@@ -609,9 +987,259 @@ mod tests {
 
     #[test]
     fn unwired_builtin_returns_internal() {
-        // verifyEd25519Signature not wired yet.
-        let err = run(BuiltinId::VerifyEd25519Signature, vec![]).unwrap_err();
+        // VerifyEcdsaSecp256k1Signature not wired yet.
+        let err = run(BuiltinId::VerifyEcdsaSecp256k1Signature, vec![]).unwrap_err();
         assert!(matches!(err, UplcError::Internal(_)));
+    }
+
+    // ── List / Pair / Data builtins ─────────────────────────────────
+
+    use crate::data::Data;
+    use crate::term::TypeTag;
+
+    fn data_i(n: i64) -> Constant {
+        Constant::Data(Data::I(BigInt::from(n)))
+    }
+    fn list_of_data(items: Vec<Data>) -> Value {
+        Value::Const(Constant::ProtoList {
+            elem_type: TypeTag::Data,
+            elements: items.into_iter().map(Constant::Data).collect(),
+        })
+    }
+    fn data_val(d: Data) -> Value {
+        Value::Const(Constant::Data(d))
+    }
+
+    #[test]
+    fn head_list_returns_first() {
+        let l = list_of_data(vec![Data::I(BigInt::from(1)), Data::I(BigInt::from(2))]);
+        assert_eq!(
+            run(BuiltinId::HeadList, vec![l]).unwrap(),
+            Value::Const(data_i(1))
+        );
+    }
+
+    #[test]
+    fn head_list_on_empty_fails() {
+        let l = list_of_data(vec![]);
+        assert!(matches!(
+            run(BuiltinId::HeadList, vec![l]),
+            Err(UplcError::BuiltinFailure { .. })
+        ));
+    }
+
+    #[test]
+    fn tail_list_drops_first() {
+        let l = list_of_data(vec![Data::I(BigInt::from(1)), Data::I(BigInt::from(2))]);
+        let v = run(BuiltinId::TailList, vec![l]).unwrap();
+        assert_eq!(v, list_of_data(vec![Data::I(BigInt::from(2))]));
+    }
+
+    #[test]
+    fn null_list() {
+        assert_eq!(
+            run(BuiltinId::NullList, vec![list_of_data(vec![])]).unwrap(),
+            b(true)
+        );
+        assert_eq!(
+            run(
+                BuiltinId::NullList,
+                vec![list_of_data(vec![Data::I(BigInt::from(1))])]
+            )
+            .unwrap(),
+            b(false)
+        );
+    }
+
+    #[test]
+    fn choose_list_picks_branch() {
+        let nil_l = list_of_data(vec![]);
+        assert_eq!(
+            run(BuiltinId::ChooseList, vec![nil_l.clone(), int(0), int(1)]).unwrap(),
+            int(0)
+        );
+        let cons_l = list_of_data(vec![Data::I(BigInt::from(7))]);
+        assert_eq!(
+            run(BuiltinId::ChooseList, vec![cons_l, int(0), int(1)]).unwrap(),
+            int(1)
+        );
+    }
+
+    #[test]
+    fn mk_cons_prepends() {
+        let l = list_of_data(vec![Data::I(BigInt::from(2))]);
+        let head = Value::Const(data_i(1));
+        let v = run(BuiltinId::MkCons, vec![head, l]).unwrap();
+        assert_eq!(
+            v,
+            list_of_data(vec![Data::I(BigInt::from(1)), Data::I(BigInt::from(2))])
+        );
+    }
+
+    #[test]
+    fn mk_nil_data_empty() {
+        let v = run(BuiltinId::MkNilData, vec![Value::Const(Constant::Unit)]).unwrap();
+        assert_eq!(v, list_of_data(vec![]));
+    }
+
+    #[test]
+    fn fst_snd_pair() {
+        let p = Value::Const(Constant::ProtoPair {
+            a_type: TypeTag::Integer,
+            b_type: TypeTag::ByteString,
+            a: Box::new(Constant::Integer(BigInt::from(7))),
+            b: Box::new(Constant::ByteString(vec![0xab])),
+        });
+        assert_eq!(run(BuiltinId::FstPair, vec![p.clone()]).unwrap(), int(7));
+        assert_eq!(run(BuiltinId::SndPair, vec![p]).unwrap(), bs(&[0xab]));
+    }
+
+    #[test]
+    fn data_constructors_and_destructors_round_trip() {
+        // IData / UnIData
+        let v = run(BuiltinId::IData, vec![int(42)]).unwrap();
+        assert_eq!(v, data_val(Data::I(BigInt::from(42))));
+        let v2 = run(BuiltinId::UnIData, vec![v]).unwrap();
+        assert_eq!(v2, int(42));
+
+        // BData / UnBData
+        let v = run(BuiltinId::BData, vec![bs(b"abc")]).unwrap();
+        assert_eq!(v, data_val(Data::B(b"abc".to_vec())));
+        let v2 = run(BuiltinId::UnBData, vec![v]).unwrap();
+        assert_eq!(v2, bs(b"abc"));
+    }
+
+    #[test]
+    fn constr_data_packs_fields() {
+        let fields = list_of_data(vec![Data::I(BigInt::from(1)), Data::I(BigInt::from(2))]);
+        let v = run(BuiltinId::ConstrData, vec![int(3), fields]).unwrap();
+        assert_eq!(
+            v,
+            data_val(Data::Constr(
+                3,
+                vec![Data::I(BigInt::from(1)), Data::I(BigInt::from(2))]
+            ))
+        );
+    }
+
+    #[test]
+    fn un_constr_data_unpacks() {
+        let d = data_val(Data::Constr(3, vec![Data::I(BigInt::from(1))]));
+        let v = run(BuiltinId::UnConstrData, vec![d]).unwrap();
+        // result is Pair(Integer, List Data)
+        if let Value::Const(Constant::ProtoPair { a, b, .. }) = v {
+            assert_eq!(*a, Constant::Integer(BigInt::from(3)));
+            if let Constant::ProtoList { elements, .. } = *b {
+                assert_eq!(elements.len(), 1);
+                assert_eq!(elements[0], Constant::Data(Data::I(BigInt::from(1))));
+            } else {
+                panic!("expected ProtoList for second pair element");
+            }
+        } else {
+            panic!("expected ProtoPair");
+        }
+    }
+
+    #[test]
+    fn choose_data_picks_by_constructor() {
+        let d_constr = data_val(Data::Constr(0, vec![]));
+        assert_eq!(
+            run(
+                BuiltinId::ChooseData,
+                vec![d_constr, int(1), int(2), int(3), int(4), int(5)]
+            )
+            .unwrap(),
+            int(1)
+        );
+        let d_i = data_val(Data::I(BigInt::from(0)));
+        assert_eq!(
+            run(
+                BuiltinId::ChooseData,
+                vec![d_i, int(1), int(2), int(3), int(4), int(5)]
+            )
+            .unwrap(),
+            int(4)
+        );
+    }
+
+    #[test]
+    fn equals_data() {
+        let a = data_val(Data::I(BigInt::from(5)));
+        let b1 = data_val(Data::I(BigInt::from(5)));
+        let b2 = data_val(Data::I(BigInt::from(6)));
+        assert_eq!(
+            run(BuiltinId::EqualsData, vec![a.clone(), b1]).unwrap(),
+            b(true)
+        );
+        assert_eq!(run(BuiltinId::EqualsData, vec![a, b2]).unwrap(), b(false));
+    }
+
+    #[test]
+    fn serialise_data_round_trips_via_cbor() {
+        let d = data_val(Data::Constr(0, vec![Data::I(BigInt::from(42))]));
+        let v = run(BuiltinId::SerialiseData, vec![d]).unwrap();
+        // The result is the CBOR encoding of Constr 0 [I 42]
+        if let Value::Const(Constant::ByteString(bytes)) = v {
+            // CBOR: tag 121 + array(1) + 42 (which is 0x18 0x2a)
+            assert_eq!(bytes[0..2], [0xd8, 0x79]); // tag 121 (0x79 = 121)
+        } else {
+            panic!("expected ByteString");
+        }
+    }
+
+    // ── Ed25519 ─────────────────────────────────────────────────────
+
+    #[test]
+    fn verify_ed25519_known_vector() {
+        // RFC 8032 §7.1 test vector 1:
+        //   secret: 9d61b19deffd5a60ba844af492ec2cc44449c5697b326919703bac031cae7f60
+        //   public: d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a
+        //   message: (empty)
+        //   signature: e5564300c360ac729086e2cc806e828a84877f1eb8e5d974d873e065224901555fb8821590a33bacc61e39701cf9b46bd25bf5f0595bbe24655141438e7a100b
+        let pk = hex::decode("d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a")
+            .unwrap();
+        let msg: Vec<u8> = vec![];
+        let sig = hex::decode("e5564300c360ac729086e2cc806e828a84877f1eb8e5d974d873e065224901555fb8821590a33bacc61e39701cf9b46bd25bf5f0595bbe24655141438e7a100b").unwrap();
+        let v = run(
+            BuiltinId::VerifyEd25519Signature,
+            vec![bs(&pk), bs(&msg), bs(&sig)],
+        )
+        .unwrap();
+        assert_eq!(v, b(true));
+    }
+
+    #[test]
+    fn verify_ed25519_wrong_sig_returns_false() {
+        let pk = hex::decode("d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a")
+            .unwrap();
+        let msg: Vec<u8> = vec![];
+        let bad_sig = vec![0u8; 64];
+        let v = run(
+            BuiltinId::VerifyEd25519Signature,
+            vec![bs(&pk), bs(&msg), bs(&bad_sig)],
+        )
+        .unwrap();
+        assert_eq!(v, b(false));
+    }
+
+    #[test]
+    fn verify_ed25519_wrong_length_fails() {
+        // 31-byte pk
+        assert!(matches!(
+            run(
+                BuiltinId::VerifyEd25519Signature,
+                vec![bs(&[0u8; 31]), bs(b""), bs(&[0u8; 64])]
+            ),
+            Err(UplcError::BuiltinFailure { .. })
+        ));
+        // 63-byte sig
+        assert!(matches!(
+            run(
+                BuiltinId::VerifyEd25519Signature,
+                vec![bs(&[0u8; 32]), bs(b""), bs(&[0u8; 63])]
+            ),
+            Err(UplcError::BuiltinFailure { .. })
+        ));
     }
 
     // ── Hash functions ─────────────────────────────────────────────
