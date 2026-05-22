@@ -46,6 +46,7 @@ pub mod builtin;
 pub mod data;
 pub mod flat;
 pub mod machine;
+pub mod phase_two;
 pub mod program;
 pub mod script_context;
 pub mod term;
