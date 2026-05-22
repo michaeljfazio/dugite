@@ -26,13 +26,33 @@ use crate::script_context::{
 };
 use dugite_primitives::address::Address as PrimAddress;
 use dugite_primitives::credentials::{Credential as PrimCred, Pointer as PrimPointer};
+use dugite_primitives::hash::blake2b_224_tagged;
 use dugite_primitives::transaction::{
-    OutputDatum as PrimOutputDatum, PlutusData as PrimPlutusData, TransactionInput as PrimTxIn,
-    TransactionOutput as PrimTxOut, Withdrawal as PrimWithdrawal,
+    OutputDatum as PrimOutputDatum, PlutusData as PrimPlutusData, ScriptRef as PrimScriptRef,
+    TransactionInput as PrimTxIn, TransactionOutput as PrimTxOut, Withdrawal as PrimWithdrawal,
 };
 use dugite_primitives::value::Value as PrimValue;
 use num_bigint::BigInt;
 use std::collections::BTreeMap;
+
+/// Plutus / native script hash domain tags (matches the Haskell reference
+/// in `Cardano.Ledger.Hashes`):
+///
+/// | tag | language        |
+/// |-----|-----------------|
+/// |  0  | NativeScript    |
+/// |  1  | PlutusV1        |
+/// |  2  | PlutusV2        |
+/// |  3  | PlutusV3        |
+///
+/// The hash domain is always `blake2b_224(tag || preimage)`.
+/// For Plutus scripts, `preimage` is the **raw script bytes** (the
+/// inner content of the CBOR bstr, NOT CBOR-encoded). For native
+/// scripts, `preimage` is the CBOR-encoded native script.
+const SCRIPT_TAG_NATIVE: u8 = 0;
+const SCRIPT_TAG_PLUTUS_V1: u8 = 1;
+const SCRIPT_TAG_PLUTUS_V2: u8 = 2;
+const SCRIPT_TAG_PLUTUS_V3: u8 = 3;
 
 /// Translate a dugite primitive [`PrimCred`] into the Plutus
 /// `Credential` shape Plutus scripts observe.
@@ -282,20 +302,45 @@ pub fn output_datum_to_plutus(d: &PrimOutputDatum) -> PlOutputDatum {
     }
 }
 
+/// Compute the 28-byte hash of a [`PrimScriptRef`] using the Cardano
+/// `blake2b_224(tag || preimage)` script-hash domain.
+///
+/// | variant         | tag  | preimage                       |
+/// |-----------------|------|--------------------------------|
+/// | `NativeScript`  | 0x00 | canonical CBOR of the script    |
+/// | `PlutusV1(bs)`  | 0x01 | `bs` verbatim                   |
+/// | `PlutusV2(bs)`  | 0x02 | `bs` verbatim                   |
+/// | `PlutusV3(bs)`  | 0x03 | `bs` verbatim                   |
+///
+/// The native-script CBOR is produced by
+/// [`dugite_serialization::encode::encode_native_script`], which emits
+/// the canonical post-Mary encoding. Hash byte-for-byte equality with
+/// cardano-node is verified by the existing
+/// `dugite-cli::transaction::Policyid` path which uses the same
+/// helpers.
+pub fn script_ref_hash(s: &PrimScriptRef) -> ScriptHash {
+    match s {
+        PrimScriptRef::NativeScript(ns) => {
+            let cbor = dugite_serialization::encode::encode_native_script(ns);
+            blake2b_224_tagged(SCRIPT_TAG_NATIVE, &cbor).0
+        }
+        PrimScriptRef::PlutusV1(bytes) => blake2b_224_tagged(SCRIPT_TAG_PLUTUS_V1, bytes).0,
+        PrimScriptRef::PlutusV2(bytes) => blake2b_224_tagged(SCRIPT_TAG_PLUTUS_V2, bytes).0,
+        PrimScriptRef::PlutusV3(bytes) => blake2b_224_tagged(SCRIPT_TAG_PLUTUS_V3, bytes).0,
+    }
+}
+
 /// Translate a primitive [`PrimTxOut`] into the Plutus [`TxOut`].
 ///
-/// `reference_script` is left as `None` for now — script-reference
-/// hashing requires the per-language tag-byte prefix the Haskell
-/// reference uses for `ScriptHash` and lands in UPLC-9 part 3c
-/// alongside the per-purpose ScriptInfo wiring. Plutus validators
-/// that don't observe the reference script (the common case) are
-/// unaffected; validators that do will see `None` until that PR.
+/// `reference_script` is populated from `out.script_ref` via
+/// [`script_ref_hash`] when present, matching what Plutus validators
+/// observe via `TxOut.referenceScript` in V2+ contexts.
 pub fn output_to_plutus(out: &PrimTxOut) -> Result<TxOut, PhaseTwoError> {
     Ok(TxOut {
         address: address_to_plutus(&out.address)?,
         value: value_to_plutus(&out.value),
         datum: output_datum_to_plutus(&out.datum),
-        reference_script: None,
+        reference_script: out.script_ref.as_ref().map(script_ref_hash),
     })
 }
 
@@ -760,8 +805,83 @@ mod tests {
         assert!(pl.address.staking.is_none());
         assert_eq!(pl.value.policies[0].1[0].1, BigInt::from(2_500_000));
         assert_eq!(pl.datum, PlOutputDatum::None);
-        // reference_script is intentionally None until UPLC-9 part 3c.
+        // No script_ref → no reference_script.
         assert!(pl.reference_script.is_none());
+    }
+
+    // ────────────────────────────────────────────────────────────
+    // script-ref hashing
+    // ────────────────────────────────────────────────────────────
+
+    #[test]
+    fn script_ref_hash_plutus_v1_v2_v3_use_distinct_tag_bytes() {
+        // Same raw script bytes through three Plutus versions must yield
+        // three different hashes — proving the tag byte participates.
+        let bytes = vec![0xab, 0xcd, 0xef];
+        let h1 = script_ref_hash(&PrimScriptRef::PlutusV1(bytes.clone()));
+        let h2 = script_ref_hash(&PrimScriptRef::PlutusV2(bytes.clone()));
+        let h3 = script_ref_hash(&PrimScriptRef::PlutusV3(bytes.clone()));
+        assert_ne!(h1, h2);
+        assert_ne!(h2, h3);
+        assert_ne!(h1, h3);
+    }
+
+    #[test]
+    fn script_ref_hash_plutus_v1_matches_manual_blake2b_224() {
+        // Cross-check against the same `blake2b_224(tag || raw)` formula used
+        // by the existing `dugite-cli policyid` path.
+        let raw = vec![0x12, 0x34, 0x56];
+        let expected = {
+            let mut buf = vec![0x01];
+            buf.extend_from_slice(&raw);
+            dugite_primitives::hash::blake2b_224(&buf).0
+        };
+        assert_eq!(script_ref_hash(&PrimScriptRef::PlutusV1(raw)), expected);
+    }
+
+    #[test]
+    fn script_ref_hash_native_uses_cbor_preimage_and_tag_zero() {
+        // A NativeScript hash should equal blake2b_224(0x00 || cbor(script)).
+        // We don't pin a specific byte value here (the encoder owns that),
+        // but we verify the contract: independent encode + manual hash
+        // yields the same digest the helper produced.
+        let script = dugite_primitives::transaction::NativeScript::InvalidBefore(
+            dugite_primitives::time::SlotNo(123),
+        );
+        let helper = script_ref_hash(&PrimScriptRef::NativeScript(script.clone()));
+        let manual = {
+            let cbor = dugite_serialization::encode::encode_native_script(&script);
+            let mut buf = vec![0x00];
+            buf.extend_from_slice(&cbor);
+            dugite_primitives::hash::blake2b_224(&buf).0
+        };
+        assert_eq!(helper, manual);
+    }
+
+    #[test]
+    fn script_ref_hash_native_differs_from_plutus_with_same_cbor() {
+        // Same raw bytes used as plutus and as native preimage must hash
+        // differently because the tag byte is different.
+        let raw = vec![0x01, 0x02, 0x03];
+        let plutus_h = script_ref_hash(&PrimScriptRef::PlutusV1(raw.clone()));
+        let manual_native = {
+            let mut buf = vec![0x00];
+            buf.extend_from_slice(&raw);
+            dugite_primitives::hash::blake2b_224(&buf).0
+        };
+        assert_ne!(plutus_h, manual_native);
+    }
+
+    #[test]
+    fn output_to_plutus_populates_reference_script_when_present() {
+        let mut out = enterprise_output(1);
+        let raw = vec![0xff; 8];
+        out.script_ref = Some(PrimScriptRef::PlutusV3(raw.clone()));
+        let pl = output_to_plutus(&out).unwrap();
+        assert_eq!(
+            pl.reference_script,
+            Some(script_ref_hash(&PrimScriptRef::PlutusV3(raw)))
+        );
     }
 
     #[test]
