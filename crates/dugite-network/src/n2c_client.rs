@@ -1680,6 +1680,36 @@ mod tests {
         assert_eq!(format_rational_decimal(2, 10), "0.2");
     }
 
+    /// Phase 4.3 (#462) parity: a synthetic `GetCurrentPParams` MsgResult
+    /// CBOR payload whose PParams array starts with a single `uint`
+    /// (`txFeePerByte` = 44) must render in JSON under the modern Haskell
+    /// PParam name `txFeePerByte` — NOT the legacy `minFeeA`. The Dijkstra
+    /// rename and `CoinPerByte` typing are upstream-deserialization-only;
+    /// over the wire and in JSON the byte shape is unchanged.
+    #[test]
+    fn protocol_params_renders_tx_fee_per_byte_phase_4_3() {
+        // Build minimal MsgResult: [4, [pparams_array_of_1]]
+        //   0x82          array(2) — outer MsgResult [tag, payload]
+        //   0x04          u8(4)    — MsgResult tag
+        //   0x81          array(1) — HFC success wrapper
+        //   0x81          array(1) — pparams positional array (len 1)
+        //   0x18 0x2c     u8(44)   — txFeePerByte = 44
+        let payload = vec![0x82, 0x04, 0x81, 0x81, 0x18, 0x2c];
+
+        let json = parse_protocol_params_cbor(&payload).expect("parse should succeed");
+        assert!(
+            json.contains("\"txFeePerByte\": 44"),
+            "expected modern Haskell PParam name `txFeePerByte` (Phase 4.3); \
+             rendered output was: {json}"
+        );
+        assert!(
+            !json.contains("\"minFeeA\""),
+            "rendered JSON must NOT use the legacy `minFeeA` key — Dijkstra `txFeePerByte` \
+             is the canonical N2C name; cardano-cli 10.x outputs `txFeePerByte`. \
+             Rendered: {json}"
+        );
+    }
+
     #[test]
     fn test_format_rational_decimal_integers() {
         assert_eq!(format_rational_decimal(15, 1), "15.0");
