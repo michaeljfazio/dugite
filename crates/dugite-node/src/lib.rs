@@ -6,4 +6,5 @@
 /// starting a live network.
 pub mod config;
 pub mod config_reload;
+pub mod csj_orchestrator;
 pub mod forge;
