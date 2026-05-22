@@ -29,7 +29,10 @@
 //! pick up the missing pieces as the follow-on PRs land.
 
 use crate::phase_two::{PhaseTwoError, SlotConfig};
-use crate::script_context::{GovActionId, ProposalProcedure, TxInfoV3, Vote, Voter};
+use crate::populate_gov::{
+    certificates_to_plutus, proposals_to_plutus, voting_procedures_to_plutus,
+};
+use crate::script_context::TxInfoV3;
 use crate::tx_info_populate::{
     datums_to_plutus, inputs_to_txininfos, mint_to_plutus, output_to_plutus,
     required_signers_to_plutus_padded, tx_hash_to_array, valid_range_to_posix,
@@ -68,6 +71,21 @@ pub fn populate_tx_info_v3(
     )?;
     let signatories = required_signers_to_plutus_padded(&tx.body.required_signers);
     let datums = datums_to_plutus(&tx.witness_set.plutus_data)?;
+    let votes = voting_procedures_to_plutus(&tx.body.voting_procedures);
+    let proposal_procedures = proposals_to_plutus(&tx.body.proposal_procedures)?;
+    // `certificates` are observable from `TxInfo.txCerts` (V3-only) and
+    // wired below as part of the V3 builder, but `TxInfoV3` itself does
+    // not currently expose a `certificates` field — the Haskell V3
+    // reference moves certs to be observed via redeemer purpose
+    // (`ScriptPurpose::Certifying(idx, TxCert)`). We still translate
+    // them here so the per-redeemer path can pick them up by index in
+    // UPLC-9 part 4. The translation is currently dropped on the
+    // floor with a single tracing line for visibility.
+    let _txcerts = certificates_to_plutus(&tx.body.certificates)?;
+    tracing::trace!(
+        count = _txcerts.len(),
+        "populate_tx_info_v3: certs translated"
+    );
 
     Ok(TxInfoV3 {
         inputs,
@@ -81,9 +99,8 @@ pub fn populate_tx_info_v3(
         redeemers: Vec::new(),
         datums,
         txid: tx_hash_to_array(&tx.hash),
-        // Filled by UPLC-9 part 3e (governance + certs).
-        votes: Vec::<(Voter, Vec<(GovActionId, Vote)>)>::new(),
-        proposal_procedures: Vec::<ProposalProcedure>::new(),
+        votes,
+        proposal_procedures,
         current_treasury: tx.body.treasury_value.map(|v| BigInt::from(v.0)),
         treasury_donation: tx.body.donation.map(|v| BigInt::from(v.0)),
     })
