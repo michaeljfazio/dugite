@@ -814,6 +814,125 @@ pub fn denote(id: BuiltinId, args: Vec<Value>) -> Result<Value, UplcError> {
             Ok(Value::Const(Constant::ByteString(out)))
         }
 
+        // ── secp256k1 sig verify (V2; CIP-49) ─────────────────────────
+        VerifyEcdsaSecp256k1Signature => {
+            // (pk: ByteString(33)) (msg_hash: ByteString(32)) (sig: ByteString(64)) -> Bool
+            //
+            // Per Cardano's CIP-49 §"ECDSA signatures":
+            //   - pk is a *compressed* SEC-1 public key (33 bytes;
+            //     leading 0x02/0x03 tag byte).
+            //   - msg_hash is a pre-hashed 32-byte digest (Cardano
+            //     does NOT hash the message; the script must hash it).
+            //   - sig is a 64-byte (r || s) fixed-size pair, low-S
+            //     normalised. Mainnet ECDSA verification REJECTS any
+            //     signature with s > n/2.
+            //
+            // Length mismatches and parse failures are BuiltinFailure;
+            // a structurally well-formed but invalid signature returns
+            // False.
+            let mut it = args.into_iter();
+            let pk = unwrap_byte_string(it.next().ok_or_else(|| builtin_arity_mismatch(id))?, id)?;
+            let msg = unwrap_byte_string(it.next().ok_or_else(|| builtin_arity_mismatch(id))?, id)?;
+            let sig = unwrap_byte_string(it.next().ok_or_else(|| builtin_arity_mismatch(id))?, id)?;
+            if pk.len() != 33 {
+                return Err(builtin_failure(
+                    id,
+                    &format!("ECDSA public key must be 33 bytes, got {}", pk.len()),
+                ));
+            }
+            if msg.len() != 32 {
+                return Err(builtin_failure(
+                    id,
+                    &format!("ECDSA message hash must be 32 bytes, got {}", msg.len()),
+                ));
+            }
+            if sig.len() != 64 {
+                return Err(builtin_failure(
+                    id,
+                    &format!("ECDSA signature must be 64 bytes, got {}", sig.len()),
+                ));
+            }
+            use k256::ecdsa::{signature::hazmat::PrehashVerifier, Signature, VerifyingKey};
+            use k256::elliptic_curve::scalar::IsHigh;
+            let vk = match VerifyingKey::from_sec1_bytes(&pk) {
+                Ok(vk) => vk,
+                Err(_) => return Ok(Value::Const(Constant::Bool(false))),
+            };
+            let sig_arr: [u8; 64] = match sig.as_slice().try_into() {
+                Ok(a) => a,
+                Err(_) => {
+                    return Err(UplcError::Internal(
+                        "ECDSA sig length check failed after success".into(),
+                    ));
+                }
+            };
+            let sig = match Signature::from_bytes(&sig_arr.into()) {
+                Ok(s) => s,
+                Err(_) => return Ok(Value::Const(Constant::Bool(false))),
+            };
+            // Low-S enforcement: reject high-S signatures explicitly
+            // (k256's `from_bytes` parses them but `verify_prehash`
+            // accepts either form unless we route through
+            // `Signature::normalize_s`).
+            if sig.s().is_high().into() {
+                return Ok(Value::Const(Constant::Bool(false)));
+            }
+            Ok(Value::Const(Constant::Bool(
+                vk.verify_prehash(&msg, &sig).is_ok(),
+            )))
+        }
+        VerifySchnorrSecp256k1Signature => {
+            // (pk: ByteString(32)) (msg: ByteString) (sig: ByteString(64)) -> Bool
+            //
+            // Per CIP-49 §"Schnorr signatures": BIP-340.
+            //   - pk is a 32-byte x-only public key.
+            //   - msg is arbitrary-length (BIP-340 does internal
+            //     tagged-hash construction).
+            //   - sig is 64 bytes (R.x || s).
+            let mut it = args.into_iter();
+            let pk = unwrap_byte_string(it.next().ok_or_else(|| builtin_arity_mismatch(id))?, id)?;
+            let msg = unwrap_byte_string(it.next().ok_or_else(|| builtin_arity_mismatch(id))?, id)?;
+            let sig = unwrap_byte_string(it.next().ok_or_else(|| builtin_arity_mismatch(id))?, id)?;
+            if pk.len() != 32 {
+                return Err(builtin_failure(
+                    id,
+                    &format!("Schnorr public key must be 32 bytes, got {}", pk.len()),
+                ));
+            }
+            if sig.len() != 64 {
+                return Err(builtin_failure(
+                    id,
+                    &format!("Schnorr signature must be 64 bytes, got {}", sig.len()),
+                ));
+            }
+            use k256::schnorr::{signature::Verifier, Signature, VerifyingKey};
+            let pk_arr: [u8; 32] = match pk.as_slice().try_into() {
+                Ok(a) => a,
+                Err(_) => {
+                    return Err(UplcError::Internal(
+                        "Schnorr pk length check failed after success".into(),
+                    ));
+                }
+            };
+            let vk = match VerifyingKey::from_bytes(&pk_arr) {
+                Ok(vk) => vk,
+                Err(_) => return Ok(Value::Const(Constant::Bool(false))),
+            };
+            let sig_arr: [u8; 64] = match sig.as_slice().try_into() {
+                Ok(a) => a,
+                Err(_) => {
+                    return Err(UplcError::Internal(
+                        "Schnorr sig length check failed after success".into(),
+                    ));
+                }
+            };
+            let sig = match Signature::try_from(&sig_arr[..]) {
+                Ok(s) => s,
+                Err(_) => return Ok(Value::Const(Constant::Bool(false))),
+            };
+            Ok(Value::Const(Constant::Bool(vk.verify(&msg, &sig).is_ok())))
+        }
+
         // Anything else is a future commit.
         _ => Err(UplcError::Internal(format!(
             "builtin denotation for {} not yet wired",
