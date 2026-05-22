@@ -95,6 +95,25 @@ pub const fn arity_of(id: BuiltinId) -> (u8, u8) {
 
         // V3 modular exponentiation.
         ExpModInteger => (0, 3),
+
+        // PV1.1.0 list / array.
+        DropList => (1, 2),      // (Integer, list T) -> list T
+        IndexArray => (1, 2),    // (array T, Integer) -> T
+        LengthOfArray => (1, 1), // array T -> Integer
+        ListToArray => (1, 1),   // list T -> array T
+
+        // PV1.1.0 Value builtins.
+        InsertCoin => (0, 4), // ByteString -> ByteString -> Integer -> Value -> Value
+        LookupCoin => (0, 3), // ByteString -> ByteString -> Value -> Integer
+        ScaleValue => (0, 2), // Integer -> Value -> Value
+        UnValueData => (0, 1), // Data -> Value
+        ValueData => (0, 1),  // Value -> Data
+        ValueContains => (0, 2), // Value -> Value -> Bool
+        UnionValue => (0, 2), // Value -> Value -> Value
+
+        // PV1.1.0 BLS multi-scalar multiplication.
+        Bls12_381_G1_MultiScalarMul => (0, 2), // list Integer -> list G1 -> G1
+        Bls12_381_G2_MultiScalarMul => (0, 2), // list Integer -> list G2 -> G2
     }
 }
 
@@ -104,7 +123,7 @@ mod tests {
 
     #[test]
     fn arity_total_for_every_builtin() {
-        for raw in 0u8..=87 {
+        for raw in 0u8..=100 {
             let id = BuiltinId::from_u8(raw).unwrap();
             let (forces, args) = arity_of(id);
             assert!(
