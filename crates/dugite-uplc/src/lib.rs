@@ -45,6 +45,7 @@
 pub mod builtin;
 pub mod cost_models;
 pub mod data;
+pub mod eval_redeemer;
 pub mod flat;
 pub mod machine;
 pub mod phase_two;
