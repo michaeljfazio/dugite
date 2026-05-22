@@ -25,10 +25,8 @@
 #                                    `lookupCoin` / `scaleValue` / `unValueData`
 #                                    builtin token-bundles, etc.)
 #   eval_fails_unexpectedly:     74  CEK rejects programs the reference accepts
-#   result_mismatch:              9  CEK produces a different normal form
-#                                    than the reference
 #   ───────────────────────────────
-#   Total skipped:              252 / 999 (747 currently pass)
+#   Total skipped:              243 / 999 (756 currently pass)
 #
 # Goal: 0 / 999.
 
@@ -281,17 +279,4 @@ term/constant-case/list/list-03
 term/constant-case/pair/pair-01
 term/constant-case/pair/pair-02
 term/constant-case/unit/unit-01
-
-# === result_mismatch (9 tests) ===
-# dugite-uplc CEK produces a different normal form than the reference
-builtin/semantics/verifySchnorrSecp256k1Signature/test-vector-00
-builtin/semantics/verifySchnorrSecp256k1Signature/test-vector-01
-builtin/semantics/verifySchnorrSecp256k1Signature/test-vector-02
-builtin/semantics/verifySchnorrSecp256k1Signature/test-vector-03
-builtin/semantics/verifySchnorrSecp256k1Signature/test-vector-04
-builtin/semantics/verifySchnorrSecp256k1Signature/test-vector-15
-builtin/semantics/verifySchnorrSecp256k1Signature/test-vector-16
-builtin/semantics/verifySchnorrSecp256k1Signature/test-vector-17
-builtin/semantics/verifySchnorrSecp256k1Signature/test-vector-18
-
 

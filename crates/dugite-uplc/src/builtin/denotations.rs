@@ -949,7 +949,7 @@ pub fn denote(id: BuiltinId, args: Vec<Value>) -> Result<Value, UplcError> {
                     &format!("Schnorr signature must be 64 bytes, got {}", sig.len()),
                 ));
             }
-            use k256::schnorr::{signature::Verifier, Signature, VerifyingKey};
+            use k256::schnorr::{Signature, VerifyingKey};
             let pk_arr: [u8; 32] = match pk.as_slice().try_into() {
                 Ok(a) => a,
                 Err(_) => {
@@ -987,7 +987,15 @@ pub fn denote(id: BuiltinId, args: Vec<Value>) -> Result<Value, UplcError> {
                 Ok(s) => s,
                 Err(_) => return Ok(Value::Const(Constant::Bool(false))),
             };
-            Ok(Value::Const(Constant::Bool(vk.verify(&msg, &sig).is_ok())))
+            // `verify_raw` matches BIP-340 exactly: the message is fed
+            // straight into the tagged challenge hash without an outer
+            // SHA-256 wrap.  k256's `Verifier::verify` would call
+            // `Sha256::new_with_prefix(msg).finalize()` first, which
+            // produces a different point on the curve and therefore
+            // rejects every valid Plutus test vector.
+            Ok(Value::Const(Constant::Bool(
+                vk.verify_raw(&msg, &sig).is_ok(),
+            )))
         }
 
         // ── BLS12-381 (V3; CIP-0381) ──────────────────────────────────
