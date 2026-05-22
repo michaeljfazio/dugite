@@ -24,13 +24,14 @@
 //! budget (a Cardano-specific DoS concern noted in the original Plutus
 //! tech report).
 
-#![allow(dead_code)]
-
 pub mod context;
 pub mod cost;
 pub mod env;
 pub mod step;
 pub mod value;
+
+pub use self::step::{evaluate, State};
+pub use self::value::Value;
 
 /// Cap on the continuation-stack depth. Mainnet scripts never reach
 /// anywhere close to this; the limit is purely a DoS guard.
