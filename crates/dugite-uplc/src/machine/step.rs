@@ -73,10 +73,32 @@ fn compute(term: Term, env: Env, mut kont: Kont) -> Result<State, UplcError> {
             })
         }
         Term::Error => Err(UplcError::ScriptError),
-        Term::Builtin(id) => Err(UplcError::Internal(format!(
-            "Builtin {} not yet wired (UPLC-4)",
-            id.name()
-        ))),
+        Term::Builtin(id) => {
+            // Emit a partially-applied builtin value; the dispatcher
+            // accumulates forces / args as subsequent `Force`s and
+            // `Apply`s occur, then fires the denotation when the
+            // builtin's arity is satisfied. A zero-force / zero-arity
+            // builtin would fire immediately, but no such builtin
+            // exists on the wire.
+            let (required_forces, required_arity) = crate::builtin::arity::arity_of(id);
+            let v = Value::Builtin {
+                id,
+                forces: 0,
+                args: Vec::new(),
+            };
+            // Defensive check: a zero-force, zero-arity builtin would
+            // be a value already and should fire its denotation here.
+            // No such on-chain builtin exists, but we surface the
+            // hypothetical via a typed error rather than skipping.
+            if required_forces == 0 && required_arity == 0 {
+                return Err(UplcError::Internal(format!(
+                    "builtin {} has zero forces+arity; no on-chain \
+                     denotation should match this shape",
+                    id.name()
+                )));
+            }
+            Ok(State::Return { value: v, kont })
+        }
         Term::Constr { tag, args } => {
             // No args: short-circuit to a fully-evaluated Constr value.
             if args.is_empty() {
@@ -215,9 +237,10 @@ fn apply(function: Value, argument: Value, kont: Kont) -> Result<State, UplcErro
             env: env.extend(argument),
             kont,
         }),
-        Value::Builtin { .. } => Err(UplcError::Internal(
-            "Builtin application not yet wired (UPLC-4)".into(),
-        )),
+        Value::Builtin { id, forces, args } => {
+            let v = crate::builtin::dispatch::apply_builtin(id, forces, args, argument)?;
+            Ok(State::Return { value: v, kont })
+        }
         Value::Const(_) | Value::Delay { .. } | Value::Constr { .. } => {
             Err(UplcError::Internal(format!(
                 "applied non-function value: {:?}",
@@ -234,6 +257,18 @@ fn force_value(value: Value, kont: Kont) -> Result<State, UplcError> {
             env,
             kont,
         }),
+        Value::Builtin { id, forces, args } => {
+            use crate::builtin::dispatch::{force_builtin, ForceOutcome};
+            match force_builtin(id, forces, args)? {
+                ForceOutcome::Pending(v) | ForceOutcome::Done(v) => {
+                    Ok(State::Return { value: v, kont })
+                }
+                ForceOutcome::Excess => Err(UplcError::BuiltinTypeError {
+                    builtin: id.name(),
+                    reason: "excess force on already-saturated builtin".into(),
+                }),
+            }
+        }
         other => Err(UplcError::Internal(format!(
             "force applied to non-Delay value: {:?}",
             std::mem::discriminant(&other)
@@ -317,10 +352,77 @@ mod tests {
         ));
     }
 
+    // ── Builtin dispatch (UPLC-4 part 2) ───────────────────────────────────
+
+    fn app(f: Term, a: Term) -> Term {
+        Term::App(Box::new(f), Box::new(a))
+    }
+
     #[test]
-    fn builtin_application_pending_returns_internal() {
-        let bad = Term::Builtin(crate::term::BuiltinId::AddInteger);
-        assert!(matches!(evaluate(bad), Err(UplcError::Internal(_))));
+    fn add_integer_via_builtin_dispatch() {
+        // (addInteger 3 4)  ⇒  7
+        let t = app(
+            app(
+                Term::Builtin(crate::term::BuiltinId::AddInteger),
+                int_term(3),
+            ),
+            int_term(4),
+        );
+        assert_eq!(evaluate(t).unwrap(), int_val(7));
+    }
+
+    #[test]
+    fn equals_integer_via_builtin_dispatch() {
+        let t = app(
+            app(
+                Term::Builtin(crate::term::BuiltinId::EqualsInteger),
+                int_term(5),
+            ),
+            int_term(5),
+        );
+        assert_eq!(evaluate(t).unwrap(), Value::Const(Constant::Bool(true)));
+    }
+
+    #[test]
+    fn if_then_else_requires_force_first() {
+        // IfThenElse needs 1 force. Without forcing first, applying
+        // an arg is a BuiltinTypeError.
+        let t = app(
+            Term::Builtin(crate::term::BuiltinId::IfThenElse),
+            Term::Const(Constant::Bool(true)),
+        );
+        assert!(matches!(
+            evaluate(t),
+            Err(UplcError::BuiltinTypeError { .. })
+        ));
+    }
+
+    #[test]
+    fn if_then_else_picks_then_branch_after_force() {
+        // (force ifThenElse) True 1 2  ⇒  1
+        let t = app(
+            app(
+                app(
+                    Term::Force(Box::new(Term::Builtin(crate::term::BuiltinId::IfThenElse))),
+                    Term::Const(Constant::Bool(true)),
+                ),
+                int_term(1),
+            ),
+            int_term(2),
+        );
+        assert_eq!(evaluate(t).unwrap(), int_val(1));
+    }
+
+    #[test]
+    fn divide_by_zero_yields_builtin_failure() {
+        let t = app(
+            app(
+                Term::Builtin(crate::term::BuiltinId::DivideInteger),
+                int_term(7),
+            ),
+            int_term(0),
+        );
+        assert!(matches!(evaluate(t), Err(UplcError::BuiltinFailure { .. })));
     }
 
     // ── Constr / Case (UPLC-3 part 2) ──────────────────────────────────────
