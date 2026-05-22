@@ -130,6 +130,56 @@ pub struct PosixTimeRange {
     pub upper: Option<i64>,
 }
 
+/// V1 TxInfo. Mirrors `PlutusV1.Contexts.TxInfo` — the original
+/// Alonzo-era shape. No reference inputs, no inline datums, no
+/// governance.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TxInfoV1 {
+    pub inputs: Vec<TxInInfo>,
+    pub outputs: Vec<TxOut>,
+    pub fee: BigInt,
+    pub mint: PlutusValue,
+    pub dcert: Vec<TxCert>,
+    pub wdrl: Vec<(StakingCredential, BigInt)>,
+    pub valid_range: PosixTimeRange,
+    pub signatories: Vec<PubKeyHash>,
+    pub data: Vec<([u8; 32], Data)>,
+    pub txid: TxId,
+}
+
+/// V1 ScriptContext = `(TxInfo, ScriptPurpose)`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScriptContextV1 {
+    pub tx_info: TxInfoV1,
+    pub purpose: ScriptPurpose,
+}
+
+/// V2 TxInfo. Mirrors `PlutusV2.Contexts.TxInfo`. Adds reference
+/// inputs, inline datums and reference scripts on outputs, and
+/// redeemers map (per CIP-31/32/33). No governance.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TxInfoV2 {
+    pub inputs: Vec<TxInInfo>,
+    pub reference_inputs: Vec<TxInInfo>,
+    pub outputs: Vec<TxOut>,
+    pub fee: BigInt,
+    pub mint: PlutusValue,
+    pub dcert: Vec<TxCert>,
+    pub wdrl: Vec<(StakingCredential, BigInt)>,
+    pub valid_range: PosixTimeRange,
+    pub signatories: Vec<PubKeyHash>,
+    pub redeemers: Vec<(ScriptPurpose, Data)>,
+    pub data: Vec<([u8; 32], Data)>,
+    pub txid: TxId,
+}
+
+/// V2 ScriptContext = `(TxInfo, ScriptPurpose)`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScriptContextV2 {
+    pub tx_info: TxInfoV2,
+    pub purpose: ScriptPurpose,
+}
+
 /// V3 TxInfo. Fields mirror
 /// `PlutusV3.Contexts.TxInfo` in the Haskell reference.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -499,6 +549,94 @@ impl ScriptContextV3 {
     }
 }
 
+impl TxInfoV1 {
+    pub fn to_data(&self) -> Data {
+        data_constr(
+            0,
+            vec![
+                data_list(self.inputs.iter().map(TxInInfo::to_data).collect()),
+                data_list(self.outputs.iter().map(TxOut::to_data).collect()),
+                data_i(self.fee.clone()),
+                self.mint.to_data(),
+                data_list(self.dcert.iter().map(|c| c.0.clone()).collect()),
+                data_list(
+                    self.wdrl
+                        .iter()
+                        .map(|(cred, amt)| {
+                            data_constr(0, vec![cred.to_data(), data_i(amt.clone())])
+                        })
+                        .collect(),
+                ),
+                self.valid_range.to_data(),
+                data_list(self.signatories.iter().map(data_bs28).collect()),
+                data_map(
+                    self.data
+                        .iter()
+                        .map(|(h, d)| (data_bs32(h), d.clone()))
+                        .collect(),
+                ),
+                data_bs32(&self.txid),
+            ],
+        )
+    }
+}
+
+impl ScriptContextV1 {
+    pub fn to_data(&self) -> Data {
+        data_constr(0, vec![self.tx_info.to_data(), self.purpose.to_data()])
+    }
+}
+
+impl TxInfoV2 {
+    pub fn to_data(&self) -> Data {
+        data_constr(
+            0,
+            vec![
+                data_list(self.inputs.iter().map(TxInInfo::to_data).collect()),
+                data_list(
+                    self.reference_inputs
+                        .iter()
+                        .map(TxInInfo::to_data)
+                        .collect(),
+                ),
+                data_list(self.outputs.iter().map(TxOut::to_data).collect()),
+                data_i(self.fee.clone()),
+                self.mint.to_data(),
+                data_list(self.dcert.iter().map(|c| c.0.clone()).collect()),
+                data_list(
+                    self.wdrl
+                        .iter()
+                        .map(|(cred, amt)| {
+                            data_constr(0, vec![cred.to_data(), data_i(amt.clone())])
+                        })
+                        .collect(),
+                ),
+                self.valid_range.to_data(),
+                data_list(self.signatories.iter().map(data_bs28).collect()),
+                data_map(
+                    self.redeemers
+                        .iter()
+                        .map(|(p, d)| (p.to_data(), d.clone()))
+                        .collect(),
+                ),
+                data_map(
+                    self.data
+                        .iter()
+                        .map(|(h, d)| (data_bs32(h), d.clone()))
+                        .collect(),
+                ),
+                data_bs32(&self.txid),
+            ],
+        )
+    }
+}
+
+impl ScriptContextV2 {
+    pub fn to_data(&self) -> Data {
+        data_constr(0, vec![self.tx_info.to_data(), self.purpose.to_data()])
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -589,6 +727,99 @@ mod tests {
         assert!(matches!(Vote::No.to_data(), Data::Constr(0, _)));
         assert!(matches!(Vote::Yes.to_data(), Data::Constr(1, _)));
         assert!(matches!(Vote::Abstain.to_data(), Data::Constr(2, _)));
+    }
+
+    #[test]
+    fn empty_tx_info_v1_round_trips_through_cbor() {
+        let info = TxInfoV1 {
+            inputs: vec![],
+            outputs: vec![],
+            fee: BigInt::from(0),
+            mint: PlutusValue::default(),
+            dcert: vec![],
+            wdrl: vec![],
+            valid_range: PosixTimeRange {
+                lower: None,
+                upper: None,
+            },
+            signatories: vec![],
+            data: vec![],
+            txid: [0u8; 32],
+        };
+        let d = info.to_data();
+        let cbor = d.to_cbor().unwrap();
+        let d2 = Data::from_cbor(&cbor).unwrap();
+        assert_eq!(d, d2);
+    }
+
+    #[test]
+    fn empty_tx_info_v2_round_trips_through_cbor() {
+        let info = TxInfoV2 {
+            inputs: vec![],
+            reference_inputs: vec![],
+            outputs: vec![],
+            fee: BigInt::from(0),
+            mint: PlutusValue::default(),
+            dcert: vec![],
+            wdrl: vec![],
+            valid_range: PosixTimeRange {
+                lower: None,
+                upper: None,
+            },
+            signatories: vec![],
+            redeemers: vec![],
+            data: vec![],
+            txid: [0u8; 32],
+        };
+        let d = info.to_data();
+        let cbor = d.to_cbor().unwrap();
+        let d2 = Data::from_cbor(&cbor).unwrap();
+        assert_eq!(d, d2);
+    }
+
+    #[test]
+    fn script_context_v1_v2_v3_all_top_constr_zero() {
+        let p = ScriptPurpose::Minting([0u8; 28]);
+        let v1 = ScriptContextV1 {
+            tx_info: TxInfoV1 {
+                inputs: vec![],
+                outputs: vec![],
+                fee: BigInt::from(0),
+                mint: PlutusValue::default(),
+                dcert: vec![],
+                wdrl: vec![],
+                valid_range: PosixTimeRange {
+                    lower: None,
+                    upper: None,
+                },
+                signatories: vec![],
+                data: vec![],
+                txid: [0u8; 32],
+            },
+            purpose: p.clone(),
+        };
+        let v2 = ScriptContextV2 {
+            tx_info: TxInfoV2 {
+                inputs: vec![],
+                reference_inputs: vec![],
+                outputs: vec![],
+                fee: BigInt::from(0),
+                mint: PlutusValue::default(),
+                dcert: vec![],
+                wdrl: vec![],
+                valid_range: PosixTimeRange {
+                    lower: None,
+                    upper: None,
+                },
+                signatories: vec![],
+                redeemers: vec![],
+                data: vec![],
+                txid: [0u8; 32],
+            },
+            purpose: p,
+        };
+        assert!(matches!(v1.to_data(), Data::Constr(0, _)));
+        assert!(matches!(v2.to_data(), Data::Constr(0, _)));
     }
 
     #[test]
