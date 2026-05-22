@@ -25,13 +25,15 @@ SOCKET=""
 OUT_DIR=""
 MAGIC="2"
 CLI="cardano-cli"
+NODE_CONFIG=""
 
 while [ "$#" -gt 0 ]; do
     case "$1" in
-        --socket)  SOCKET="$2"; shift 2 ;;
-        --out-dir) OUT_DIR="$2"; shift 2 ;;
-        --magic)   MAGIC="$2";   shift 2 ;;
-        --cli)     CLI="$2";     shift 2 ;;
+        --socket)        SOCKET="$2"; shift 2 ;;
+        --out-dir)       OUT_DIR="$2"; shift 2 ;;
+        --magic)         MAGIC="$2";   shift 2 ;;
+        --cli)           CLI="$2";     shift 2 ;;
+        --node-config)   NODE_CONFIG="$2"; shift 2 ;;
         -h|--help)
             sed -n '1,30p' "$0"
             exit 0
@@ -43,8 +45,8 @@ while [ "$#" -gt 0 ]; do
     esac
 done
 
-if [ -z "$SOCKET" ] || [ -z "$OUT_DIR" ]; then
-    echo "usage: $0 --socket <path> --out-dir <dir> [--magic N] [--cli <path>]" >&2
+if [ -z "$SOCKET" ] || [ -z "$OUT_DIR" ] || [ -z "$NODE_CONFIG" ]; then
+    echo "usage: $0 --socket <path> --out-dir <dir> --node-config <path> [--magic N] [--cli <path>]" >&2
     exit 2
 fi
 
@@ -67,7 +69,7 @@ echo "[capture] cli=$CLI socket=$SOCKET magic=$MAGIC out=$OUT_DIR jsonl=$JSONL"
 (
     "$CLI" debug log-epoch-state \
         --socket-path "$SOCKET" \
-        --testnet-magic "$MAGIC" \
+        --node-configuration-file "$NODE_CONFIG" \
         --out-file "$JSONL"
 ) &
 CLI_PID=$!
