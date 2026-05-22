@@ -441,6 +441,10 @@ fn decode_conway_tx_body(r: &mut Reader<'_>) -> Result<TransactionBody, Serializ
     let mut proposal_procedures: Vec<ProposalProcedure> = Vec::new();
     let mut treasury_value: Option<Lovelace> = None;
     let mut donation: Option<Lovelace> = None;
+    // Dijkstra TxBody key 23 — OMap TxId (Tx SubTx era). Populated only
+    // when a Dijkstra-shaped body carries the field. Conway bodies never
+    // emit key 23 so this stays empty for them.
+    let mut sub_transactions: Vec<dugite_primitives::transaction::SubTransaction> = Vec::new();
 
     let map_len = r.read_map_header()?;
     let n_entries = match map_len {
@@ -549,6 +553,16 @@ fn decode_conway_tx_body(r: &mut Reader<'_>) -> Result<TransactionBody, Serializ
                 // donation
                 donation = Some(read_lovelace(r)?);
             }
+            23 => {
+                // Dijkstra sub_transactions:
+                //   OMap TxId (Tx SubTx era)  ==  CBOR map { tx_id => sub_tx_body }
+                // Each sub_tx_body is itself a Dijkstra-SubTx-shaped CBOR map.
+                // We never see this key on a Conway-only body, but the
+                // Dijkstra-routed decoder reuses this function, so we parse
+                // it here. See issue #475 Phase 3.1 / cardano-ledger
+                // `eras/dijkstra/impl/.../TxBody.hs` (key 23 emitter).
+                sub_transactions = decode_sub_transactions(r)?;
+            }
             6 => {
                 // update (pre-Conway field) — skip in Conway
                 r.skip()?;
@@ -582,7 +596,147 @@ fn decode_conway_tx_body(r: &mut Reader<'_>) -> Result<TransactionBody, Serializ
         proposal_procedures,
         treasury_value,
         donation,
+        sub_transactions, // Dijkstra+ only; empty for Conway-shaped bodies
     })
+}
+
+/// Decode the Dijkstra `sub_transactions` field (TxBody key 23).
+///
+/// Wire shape is the CBOR encoding of `OMap TxId (Tx SubTx era)`:
+///
+/// ```text
+/// map { tx_id : bstr(32) => sub_tx_body : map {...} }
+/// ```
+///
+/// We map each entry to a [`dugite_primitives::transaction::SubTransaction`]:
+///   - the OMap key becomes [`SubTransaction::tx_id`],
+///   - the value is a Dijkstra-SubTx-shaped map (see [`decode_sub_tx_body`]).
+///
+/// The body bytes are captured verbatim so the [`SubTransaction::raw_body_cbor`]
+/// field stays byte-exact across a round-trip. We also assert (in debug only)
+/// that `blake2b_256(raw_body_cbor) == tx_id` for the entries that carry the
+/// hash; mismatches surface as a strict decode error to mirror the Haskell
+/// `OMap.HasOKey` invariant.
+fn decode_sub_transactions(
+    r: &mut Reader<'_>,
+) -> Result<Vec<dugite_primitives::transaction::SubTransaction>, SerializationError> {
+    use dugite_primitives::transaction::SubTransaction;
+
+    let len = r.read_map_header()?;
+    let mut out: Vec<SubTransaction> = match len {
+        Some(n) => Vec::with_capacity(n.min(1024) as usize),
+        None => Vec::new(),
+    };
+    let mut i: i64 = 0;
+    let total: i64 = len.map(|n| n as i64).unwrap_or(-1);
+    loop {
+        if total >= 0 && i >= total {
+            break;
+        }
+        if total < 0 {
+            let ty = r.peek_major()?;
+            if ty == minicbor::data::Type::Break {
+                r.skip()?;
+                break;
+            }
+        }
+        i += 1;
+
+        // Key: the TxId (32-byte hash).
+        let tx_id_bytes = r.read_bytes()?;
+        let tx_id =
+            Hash32::try_from(tx_id_bytes).map_err(|_| SerializationError::InvalidLength {
+                expected: 32,
+                got: tx_id_bytes.len(),
+            })?;
+
+        // Value: the SubTx body, captured raw so the OMap key invariant
+        // (`tx_id == blake2b_256(raw)`) can be verified after the fact.
+        let body_raw = KeepRaw::parse_with(r, decode_sub_tx_body)?;
+        let mut sub = body_raw.value;
+        sub.tx_id = tx_id;
+        sub.raw_body_cbor = Some(body_raw.raw.to_vec());
+
+        // Invariant: OMap.HasOKey TxId. The key must agree with the
+        // canonical hash of the body bytes. We enforce strictly here —
+        // a divergence would let an adversary smuggle one body under
+        // another body's id and have it picked up by the SUB rule.
+        let computed = blake2b_256(body_raw.raw);
+        if computed != tx_id {
+            return Err(SerializationError::CborDecode(format!(
+                "sub_transactions: OMap key mismatch — key={} computed={}",
+                tx_id.to_hex(),
+                computed.to_hex()
+            )));
+        }
+        out.push(sub);
+    }
+    Ok(out)
+}
+
+/// Decode a Dijkstra SubTx body (`DijkstraSubTxBodyRaw`), keyed subset.
+///
+/// Only the keys that affect dugite's SUB UTxO pipeline are extracted; the
+/// rest are skipped for forward compatibility. The full SubTx schema (certs,
+/// gov, mint, …) is tracked under follow-on phases of issue #475.
+fn decode_sub_tx_body(
+    r: &mut Reader<'_>,
+) -> Result<dugite_primitives::transaction::SubTransaction, SerializationError> {
+    use dugite_primitives::transaction::SubTransaction;
+
+    let mut sub = SubTransaction::default();
+
+    let len = r.read_map_header()?;
+    let total: i64 = len.map(|n| n as i64).unwrap_or(-1);
+    let mut i: i64 = 0;
+    loop {
+        if total >= 0 && i >= total {
+            break;
+        }
+        if total < 0 {
+            let ty = r.peek_major()?;
+            if ty == minicbor::data::Type::Break {
+                r.skip()?;
+                break;
+            }
+        }
+        i += 1;
+        let key = r.read_uint()?;
+        match key {
+            0 => {
+                // spend inputs: set<transaction_input>  (tag 258 in Dijkstra)
+                sub.inputs = r.read_set(read_tx_input)?;
+            }
+            1 => {
+                // outputs
+                sub.outputs = r.read_array(|r| read_babbage_tx_output_with_raw(r))?;
+            }
+            3 => {
+                sub.ttl = Some(SlotNo(r.read_uint()?));
+            }
+            7 => {
+                sub.auxiliary_data_hash = Some(read_hash32(r)?);
+            }
+            8 => {
+                sub.validity_interval_start = Some(SlotNo(r.read_uint()?));
+            }
+            18 => {
+                sub.reference_inputs = r.read_set(read_tx_input)?;
+            }
+            // Other Dijkstra SubTx keys (4 certs, 5 withdrawals, 9 mint,
+            // 11 script_integrity_hash, 14 guards, 15 network_id, 19/20
+            // voting/proposal, 21 treasury_value, 22 donation, 24
+            // required_top_level_guards, 25 direct_deposits, 26
+            // account_balance_intervals) are skipped at Phase 3.1. The
+            // hash invariant on the parent OMap key still pins the bytes
+            // so a later phase that extends this decoder cannot quietly
+            // alter behaviour for an already-stored sub-tx.
+            _ => {
+                r.skip()?;
+            }
+        }
+    }
+    Ok(sub)
 }
 
 fn read_tx_input(r: &mut Reader<'_>) -> Result<TransactionInput, SerializationError> {

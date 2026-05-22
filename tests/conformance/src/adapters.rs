@@ -429,6 +429,7 @@ fn to_transaction_inner(tx: &TestTransaction) -> Result<Transaction, AdapterErro
         proposal_procedures: Vec::new(),
         treasury_value: None,
         donation: tx.donation.map(Lovelace),
+        sub_transactions: Vec::new(),
     };
 
     Ok(Transaction {

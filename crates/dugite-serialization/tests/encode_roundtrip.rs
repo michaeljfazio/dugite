@@ -82,6 +82,7 @@ fn body_for_era(_era: Era) -> TransactionBody {
         proposal_procedures: vec![],
         treasury_value: None,
         donation: None,
+        sub_transactions: vec![],
     }
 }
 

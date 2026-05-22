@@ -734,6 +734,7 @@ impl Transaction {
                 proposal_procedures: vec![],
                 treasury_value: None,
                 donation: None,
+                sub_transactions: vec![],
             },
             witness_set: TransactionWitnessSet {
                 vkey_witnesses: vec![],
@@ -783,6 +784,90 @@ pub struct TransactionBody {
     pub proposal_procedures: Vec<ProposalProcedure>,
     pub treasury_value: Option<Lovelace>,
     pub donation: Option<Lovelace>,
+    /// Dijkstra (PV12+) only: nested sub-transactions (TxBody key 23).
+    ///
+    /// Each [`SubTransaction`] is an OMap-keyed entry (TxId → SubTx in the
+    /// upstream Haskell) and is applied through the SUBLEDGERS / SUBLEDGER
+    /// rule hierarchy (`Cardano.Ledger.Dijkstra.Rules.SubLedgers`). For
+    /// every pre-Dijkstra era this list is always empty; the field is
+    /// `#[serde(default)]` so older snapshots / JSON without it keep
+    /// round-tripping.
+    ///
+    /// See issue #475 Phase 3.1.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub sub_transactions: Vec<SubTransaction>,
+}
+
+impl Default for TransactionBody {
+    fn default() -> Self {
+        TransactionBody {
+            inputs: Vec::new(),
+            outputs: Vec::new(),
+            fee: Lovelace(0),
+            ttl: None,
+            certificates: Vec::new(),
+            withdrawals: BTreeMap::new(),
+            auxiliary_data_hash: None,
+            validity_interval_start: None,
+            mint: BTreeMap::new(),
+            script_data_hash: None,
+            collateral: Vec::new(),
+            required_signers: Vec::new(),
+            network_id: None,
+            collateral_return: None,
+            total_collateral: None,
+            reference_inputs: Vec::new(),
+            update: None,
+            voting_procedures: BTreeMap::new(),
+            proposal_procedures: Vec::new(),
+            treasury_value: None,
+            donation: None,
+            sub_transactions: Vec::new(),
+        }
+    }
+}
+
+/// Nested sub-transaction (Dijkstra TxBody key 23, `Tx SubTx era`).
+///
+/// Mirrors the relevant fragment of upstream `DijkstraSubTxBodyRaw` — the
+/// subset that affects the UTxO state machine when SUBLEDGERS folds over
+/// the OMap. The fields we model are exactly those the SUB-rule pipeline
+/// reads on a sub-tx body: spend inputs, outputs, optional witness-set
+/// reference inputs, optional validity interval. Witnesses, scripts, mint,
+/// certs and governance fields are NOT modelled here because Phase 3.1 of
+/// issue #475 is scoped to "deserialize + on-disk apply" and the dugite
+/// SUB-rule implementation routes those through the parent tx's Conway
+/// pipeline. Lifting the wire shape one layer at a time avoids a 600-line
+/// patch to every TxBody-literal call site in the workspace.
+///
+/// Wire shape: a CBOR map keyed by the upstream `DijkstraSubTxBodyRaw`
+/// integer keys (subset):
+///   - 0  : set<transaction_input>   — spend inputs (required)
+///   - 1  : [* transaction_output]   — outputs (required)
+///   - 3  : ttl (optional)
+///   - 8  : validity_interval_start (optional)
+///   - 18 : set<transaction_input>   — reference inputs (optional)
+///   - 7  : auxiliary_data_hash      (optional)
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct SubTransaction {
+    /// The TxId this sub-transaction is keyed under inside the parent
+    /// TxBody's OMap. Computed as `blake2b_256(raw_sub_body_cbor)`.
+    ///
+    /// Populated by the decoder; ignored by the encoder (the key is taken
+    /// from this field on the way out, so a round-trip is byte-stable as
+    /// long as the underlying body bytes are preserved).
+    pub tx_id: Hash32,
+    pub inputs: Vec<TransactionInput>,
+    pub outputs: Vec<TransactionOutput>,
+    pub ttl: Option<SlotNo>,
+    pub validity_interval_start: Option<SlotNo>,
+    pub reference_inputs: Vec<TransactionInput>,
+    pub auxiliary_data_hash: Option<AuxiliaryDataHash>,
+    /// Raw CBOR bytes of the sub-tx body, captured at decode time, used
+    /// for byte-exact re-encoding and TxId recomputation. `None` when the
+    /// sub-tx was constructed in-memory.
+    #[serde(default, skip_serializing)]
+    pub raw_body_cbor: Option<Vec<u8>>,
 }
 
 /// Transaction witness set

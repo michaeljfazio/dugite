@@ -102,6 +102,7 @@ fn minimal_body() -> TransactionBody {
         proposal_procedures: vec![],
         treasury_value: None,
         donation: None,
+        sub_transactions: vec![],
     }
 }
 

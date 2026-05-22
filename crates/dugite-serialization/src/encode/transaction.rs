@@ -465,6 +465,17 @@ pub(super) fn encode_transaction_body_for_era(body: &TransactionBody, era: Era) 
     if body.donation.is_some() {
         count += 1;
     }
+    // Dijkstra TxBody key 23: sub_transactions. The Haskell encoder emits
+    // `Omit null (Key 23 $ To dtbrSubTransactions)`, i.e. it ONLY appears
+    // when non-empty. We mirror that exactly: never write the key on a
+    // pre-Dijkstra body, and never write it on a Dijkstra body that
+    // happens to carry an empty list (canonical wire shape requires the
+    // omission, otherwise the Haskell side would round-trip to a
+    // structurally distinct CBOR map).
+    let emit_sub_transactions = era >= Era::Dijkstra && !body.sub_transactions.is_empty();
+    if emit_sub_transactions {
+        count += 1;
+    }
 
     let mut buf = encode_map_header(count);
 
@@ -614,6 +625,86 @@ pub(super) fn encode_transaction_body_for_era(body: &TransactionBody, era: Era) 
         buf.extend(encode_uint(donation.0));
     }
 
+    // 23: sub_transactions (Dijkstra+) — OMap TxId (Tx SubTx era).
+    //
+    // Wire shape: CBOR map keyed by the 32-byte TxId, value is the SubTx
+    // body (itself a CBOR map of integer-keyed fields, see
+    // [`encode_sub_tx_body`]). When a sub-tx was decoded from chain we
+    // round-trip its raw body bytes verbatim so the OMap key invariant
+    // `key == blake2b_256(value)` holds byte-exact. When the sub-tx was
+    // constructed in-memory we synthesise a body via `encode_sub_tx_body`.
+    if emit_sub_transactions {
+        buf.extend(encode_uint(23));
+        buf.extend(encode_map_header(body.sub_transactions.len()));
+        for sub in &body.sub_transactions {
+            buf.extend(crate::cbor::encode_bytes(sub.tx_id.as_bytes()));
+            match &sub.raw_body_cbor {
+                Some(bytes) => buf.extend_from_slice(bytes),
+                None => buf.extend(encode_sub_tx_body(sub)),
+            }
+        }
+    }
+
+    buf
+}
+
+/// Encode a Dijkstra SubTx body as the upstream `DijkstraSubTxBodyRaw`
+/// CBOR map (subset of keys we currently model — keys 0/1/3/7/8/18). Other
+/// keys are not emitted by the in-memory path; if you need them, decode
+/// the body once and let the round-trip path reuse `raw_body_cbor`.
+fn encode_sub_tx_body(sub: &dugite_primitives::transaction::SubTransaction) -> Vec<u8> {
+    let mut count = 2; // inputs + outputs (always present)
+    if sub.ttl.is_some() {
+        count += 1;
+    }
+    if sub.auxiliary_data_hash.is_some() {
+        count += 1;
+    }
+    if sub.validity_interval_start.is_some() {
+        count += 1;
+    }
+    if !sub.reference_inputs.is_empty() {
+        count += 1;
+    }
+
+    let mut buf = encode_map_header(count);
+    // 0: inputs (Dijkstra: tag 258 set semantics)
+    buf.extend(encode_uint(0));
+    buf.extend(encode_set_for_era(
+        Era::Dijkstra,
+        &sub.inputs,
+        crate::cbor::encode_tx_input,
+    ));
+    // 1: outputs
+    buf.extend(encode_uint(1));
+    buf.extend(encode_array_header(sub.outputs.len()));
+    for out in &sub.outputs {
+        buf.extend(encode_transaction_output(out));
+    }
+    // 3: ttl
+    if let Some(ttl) = sub.ttl {
+        buf.extend(encode_uint(3));
+        buf.extend(encode_uint(ttl.0));
+    }
+    // 7: auxiliary_data_hash
+    if let Some(h) = &sub.auxiliary_data_hash {
+        buf.extend(encode_uint(7));
+        buf.extend(crate::cbor::encode_bytes(h.as_bytes()));
+    }
+    // 8: validity_interval_start
+    if let Some(s) = sub.validity_interval_start {
+        buf.extend(encode_uint(8));
+        buf.extend(encode_uint(s.0));
+    }
+    // 18: reference_inputs
+    if !sub.reference_inputs.is_empty() {
+        buf.extend(encode_uint(18));
+        buf.extend(encode_set_for_era(
+            Era::Dijkstra,
+            &sub.reference_inputs,
+            crate::cbor::encode_tx_input,
+        ));
+    }
     buf
 }
 
@@ -791,6 +882,7 @@ mod tests {
             proposal_procedures: vec![],
             treasury_value: None,
             donation: None,
+            sub_transactions: vec![],
         }
     }
 

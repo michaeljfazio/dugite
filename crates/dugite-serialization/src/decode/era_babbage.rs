@@ -507,6 +507,7 @@ fn decode_babbage_tx_body(r: &mut Reader<'_>) -> Result<TransactionBody, Seriali
         proposal_procedures: Vec::new(),
         treasury_value: None,
         donation: None,
+        sub_transactions: Vec::new(),
     })
 }
 
