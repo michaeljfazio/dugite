@@ -304,6 +304,7 @@ pub fn build_simple_tx(inputs: Vec<TransactionInput>, output_value: u64, fee: u6
             donation: None,
             sub_transactions: vec![],
             account_balance_intervals: vec![],
+            direct_deposits: std::collections::BTreeMap::new(),
         },
         witness_set: TransactionWitnessSet {
             vkey_witnesses: vec![],

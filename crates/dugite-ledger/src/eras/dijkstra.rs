@@ -138,6 +138,22 @@ impl EraRules for DijkstraRules {
         //    accounts are treated as having a balance of 0, matching upstream.
         check_account_balance_intervals(tx, certs)?;
 
+        // 0b) UTXOS predicate `DirectDepositToUnregisteredAccount`
+        //     (issue #475 Phase 3.4).
+        //
+        //     Dijkstra TxBody key 25 — `direct_deposits` — atomically credits
+        //     the listed Lovelace amounts into the named reward accounts (the
+        //     inverse of a withdrawal). Each named credential MUST already be
+        //     registered in `CertSubState::reward_accounts`; an entry for an
+        //     unregistered account causes the entire tx to be rejected before
+        //     any state mutation, matching the Haskell `DepositToUnregistered\
+        //     Account` predicate failure in `Cardano.Ledger.Dijkstra.Rules\
+        //     .Utxos`. Sum-deduction on the balance equation is enforced by
+        //     Phase-1 validation upstream (mirroring how withdrawals' credit
+        //     side is enforced); the apply path here is responsible only for
+        //     the registration check and the post-Conway crediting step.
+        validate_direct_deposits_registration(tx, certs)?;
+
         // 1) Run the parent (top-level) Conway pipeline. This consumes the
         //    parent tx's inputs, creates its outputs, processes its certs,
         //    governance actions and withdrawals. The returned diff is the
@@ -145,6 +161,25 @@ impl EraRules for DijkstraRules {
         let mut diff = self
             .conway()
             .apply_valid_tx(tx, mode, ctx, utxo, certs, gov, epochs)?;
+
+        // 1b) Credit `direct_deposits` onto reward-account balances
+        //     (issue #475 Phase 3.4).
+        //
+        //     The pre-check at step 0b has already guaranteed every target
+        //     credential is registered. We perform the crediting here AFTER
+        //     the Conway pipeline because:
+        //       - Conway's own withdrawal processing runs first and consumes
+        //         the existing reward_account entry. Crediting before that
+        //         would risk being immediately undone by a same-tx withdrawal
+        //         of the freshly-deposited amount.
+        //       - Crediting after Conway matches the upstream UTXOS rule
+        //         ordering: `applyDirectDeposits` is sequenced after the
+        //         standard withdrawal/cert effects in `EraRule "UTXO"` so the
+        //         new balance is visible to the next block, not the current
+        //         tx's other entries.
+        if !tx.body.direct_deposits.is_empty() {
+            apply_direct_deposits(tx, certs);
+        }
 
         // 2) Apply nested sub-transactions through the dugite SUB pipeline.
         //
@@ -453,6 +488,125 @@ fn check_account_balance_intervals(
         }
     }
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// DirectDepositToUnregisteredAccount predicate + applier (Phase 3.4)
+// ---------------------------------------------------------------------------
+
+/// Convert a 29-byte `reward_account` bstr into the [`Hash<32>`] key used
+/// by `CertSubState::reward_accounts`.
+///
+/// Wire shape (per the Shelley CDDL `reward_account = bytes`):
+///   - byte 0 : network/credential-type header
+///       - bit 4 (`0x10`) set ⇒ script credential, clear ⇒ key credential
+///       - high nibble `0xE` (key) / `0xF` (script); low nibble = network
+///   - bytes 1..29 : the 28-byte credential hash (`Hash<28>`)
+///
+/// The returned [`Hash<32>`] mirrors `Credential::to_typed_hash32`:
+/// 28 bytes of credential hash, then 28 zero bytes for key credentials or
+/// `[0x01, 0, 0, 0]` for script credentials. This is the canonical key into
+/// the reward-account map and lets us look up balances without rebuilding a
+/// `Credential` value.
+///
+/// Returns `None` for any input that is not exactly 29 bytes — Dijkstra
+/// upstream rejects such bodies at the decoder stage, so this fallback is
+/// defensive only.
+fn reward_account_bytes_to_typed_hash32(
+    bytes: &[u8],
+) -> Option<dugite_primitives::hash::Hash<32>> {
+    if bytes.len() != 29 {
+        return None;
+    }
+    let header = bytes[0];
+    let is_script = (header & 0x10) != 0;
+    let mut typed = [0u8; 32];
+    typed[..28].copy_from_slice(&bytes[1..29]);
+    if is_script {
+        typed[28] = 0x01;
+    }
+    Some(dugite_primitives::hash::Hash::<32>(typed))
+}
+
+/// Verify every `direct_deposits` entry targets a currently-registered
+/// reward account.
+///
+/// Mirrors the Dijkstra UTXOS rule predicate `DepositToUnregisteredAccount`
+/// in `Cardano.Ledger.Dijkstra.Rules.Utxos`. The check runs BEFORE any
+/// state mutation so a single failure aborts the tx without touching either
+/// the UTxO set or reward-account state, matching upstream predicate
+/// failure semantics.
+fn validate_direct_deposits_registration(
+    tx: &Transaction,
+    certs: &CertSubState,
+) -> Result<(), LedgerError> {
+    for (reward_account, amount) in &tx.body.direct_deposits {
+        let key = reward_account_bytes_to_typed_hash32(reward_account).ok_or_else(|| {
+            LedgerError::InvalidTransaction(format!(
+                "DirectDepositToUnregisteredAccount: malformed reward_account \
+                 (expected 29 bytes, got {})",
+                reward_account.len()
+            ))
+        })?;
+        if !certs.reward_accounts.contains_key(&key) {
+            return Err(LedgerError::InvalidTransaction(format!(
+                "DirectDepositToUnregisteredAccount: credential {} not in \
+                 reward_accounts (deposit amount {})",
+                key.to_hex(),
+                amount.0,
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Apply the tx's `direct_deposits` map by adding each declared Lovelace
+/// amount to the named reward-account balance.
+///
+/// **Precondition**: every entry's credential is already registered — this
+/// is guaranteed by the matched call to
+/// [`validate_direct_deposits_registration`] at apply-start. Defensive
+/// behaviour for an unregistered entry that slips through (impossible on
+/// the happy path): the entry is skipped with a `tracing::warn!`. We do
+/// NOT mutate the registration set here — direct deposits never register
+/// or deregister accounts; they only adjust balances of already-registered
+/// ones, matching upstream Haskell semantics.
+///
+/// Balances are `saturating_add`-ed to guard against overflow against the
+/// 2^64 lovelace cap (well above Cardano's circulating supply).
+fn apply_direct_deposits(tx: &Transaction, certs: &mut CertSubState) {
+    use dugite_primitives::value::Lovelace;
+    use std::sync::Arc;
+
+    let accounts = Arc::make_mut(&mut certs.reward_accounts);
+    for (reward_account, amount) in &tx.body.direct_deposits {
+        let Some(key) = reward_account_bytes_to_typed_hash32(reward_account) else {
+            tracing::warn!(
+                "Dijkstra direct_deposits apply: malformed reward_account \
+                 ({} bytes) — skipping (should have been caught at validate \
+                 time)",
+                reward_account.len()
+            );
+            continue;
+        };
+        match accounts.get_mut(&key) {
+            Some(balance) => {
+                *balance = Lovelace(balance.0.saturating_add(amount.0));
+            }
+            None => {
+                // Unreachable on the happy path — registration check at
+                // apply-start prevents it. Logged as a defensive WARN so a
+                // future predicate-bypass shows up in soak traces rather
+                // than silently creating a new (and unconnected) account.
+                tracing::warn!(
+                    credential = %key.to_hex(),
+                    amount = amount.0,
+                    "Dijkstra direct_deposits apply: target credential not \
+                     registered — skipping (UTXOS predicate bypass?)"
+                );
+            }
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1070,6 +1224,7 @@ mod tests {
                 donation: None,
                 sub_transactions: vec![sub_a.clone(), sub_b.clone()],
                 account_balance_intervals: vec![],
+                direct_deposits: ::std::collections::BTreeMap::new(),
             };
             let parent_hash = Hash32::from_bytes([0xDE; 32]);
             let parent_tx = Transaction {
@@ -1320,6 +1475,7 @@ mod tests {
                 donation: None,
                 sub_transactions: vec![],
                 account_balance_intervals: vec![],
+                direct_deposits: ::std::collections::BTreeMap::new(),
             };
 
             // Per CIP-0167 the author-supplied `is_valid` is irrelevant on the
@@ -1665,6 +1821,7 @@ mod tests {
                         donation: None,
                         sub_transactions: vec![],
                         account_balance_intervals: intervals,
+                        direct_deposits: BTreeMap::new(),
                     },
                     witness_set: TransactionWitnessSet {
                         vkey_witnesses: vec![],
@@ -1876,14 +2033,361 @@ mod tests {
             }
         }
 
-        /// TxBody key 25 — `direct_deposits`: `{+ reward_account => coin}`,
-        /// ADA flows directly into reward accounts as a UTXOS rule.
+        /// TxBody key 25 — `direct_deposits`: `{+ reward_account => coin}`.
+        /// ADA flows directly into reward accounts (inverse of withdrawal)
+        /// as a UTXOS rule.
         ///
-        /// Issue: #462 Phase 3.4 (blocked on #466).
+        /// Issue: #475 Phase 3.4 — `DirectDepositToUnregisteredAccount`.
+        ///
+        /// Three sub-cases pin the apply / predicate semantics:
+        ///
+        /// 1. **Registered single account**: deposit `1_500_000` lovelace
+        ///    to a credential that is already in `reward_accounts` with
+        ///    balance `100` — `apply_valid_tx` succeeds and the
+        ///    reward-account balance grows by exactly the deposit amount.
+        /// 2. **Multi-account deposits**: two registered credentials, two
+        ///    deposit amounts — both balances grow independently and the
+        ///    Conway pipeline's UTxO effects still land for the parent tx.
+        /// 3. **Unregistered account**: deposit targets a credential that
+        ///    is NOT in `reward_accounts` — `apply_valid_tx` returns
+        ///    `LedgerError::InvalidTransaction` (`DirectDepositToUnregistered\
+        ///    Account`) and no UTxO mutation NOR reward-account mutation
+        ///    has occurred (atomic predicate failure).
+        ///
+        /// Wire-shape compatibility note: the reward_account bytes used in
+        /// this test follow the same `0xE0|payload` (key) / `0xF0|payload`
+        /// (script) layout the encoder uses in
+        /// `direct_deposits_roundtrip_dijkstra`, so an on-the-wire tx with
+        /// the same byte map would route through the identical apply path.
         #[test]
-        #[ignore = "Dijkstra direct_deposits — see issue #462 Phase 3.4"]
         fn direct_deposits_credit_reward_accounts() {
-            unimplemented!();
+            use super::super::*;
+            use crate::eras::EraRules;
+            use crate::state::{BlockValidationMode, StakeDistributionState};
+            use crate::utxo::UtxoSet;
+            use crate::utxo_diff::DiffSeq;
+            use dugite_primitives::address::Address;
+            use dugite_primitives::credentials::Credential;
+            use dugite_primitives::era::Era;
+            use dugite_primitives::hash::{Hash28, Hash32};
+            use dugite_primitives::protocol_params::ProtocolParameters;
+            use dugite_primitives::time::EpochNo;
+            use dugite_primitives::transaction::{
+                OutputDatum, Transaction, TransactionBody, TransactionInput, TransactionOutput,
+                TransactionWitnessSet,
+            };
+            use dugite_primitives::value::{Lovelace, Value};
+            use std::collections::{BTreeMap, HashMap, HashSet};
+            use std::sync::Arc;
+
+            // ── fixture helpers (local, kept minimal) ─────────────────
+            let make_enterprise_address = |kh: Hash28| -> Address {
+                let mut b = vec![0x61];
+                b.extend_from_slice(kh.as_bytes());
+                Address::from_bytes(&b).expect("enterprise addr")
+            };
+            let make_output = |addr: Address, coin: u64| TransactionOutput {
+                address: addr,
+                value: Value::lovelace(coin),
+                datum: OutputDatum::None,
+                script_ref: None,
+                is_legacy: true,
+                raw_cbor: None,
+            };
+            let make_input = |tx_id_byte: u8, idx: u32| TransactionInput {
+                transaction_id: Hash32::from_bytes([tx_id_byte; 32]),
+                index: idx,
+            };
+            // Build a 29-byte reward_account: header byte then 28-byte
+            // hash. `header` low nibble 0 = mainnet, high nibble 0xE / 0xF
+            // discriminates key / script.
+            let reward_account_bytes = |header: u8, h28: Hash28| -> Vec<u8> {
+                let mut b = Vec::with_capacity(29);
+                b.push(header);
+                b.extend_from_slice(h28.as_bytes());
+                b
+            };
+
+            let payment_kh = Hash28::from_bytes([0xAB; 28]);
+            let addr = make_enterprise_address(payment_kh);
+            let parent_in = make_input(0xEE, 0);
+            let parent_out_input = make_output(addr.clone(), 10_000_000);
+            let parent_out = make_output(addr.clone(), 7_000_000);
+
+            // Two credentials we may credit:
+            //   cred_a: keyhash    → reward_account header 0xE0
+            //   cred_b: scripthash → reward_account header 0xF0
+            // The unregistered case uses a third keyhash credential
+            // (cred_c) that is intentionally absent from reward_accounts.
+            let cred_a_hash = Hash28::from_bytes([0xA1; 28]);
+            let cred_b_hash = Hash28::from_bytes([0xB2; 28]);
+            let cred_c_hash = Hash28::from_bytes([0xC3; 28]);
+            let cred_a = Credential::VerificationKey(cred_a_hash);
+            let cred_b = Credential::Script(cred_b_hash);
+            let ra_a = reward_account_bytes(0xE0, cred_a_hash);
+            let ra_b = reward_account_bytes(0xF0, cred_b_hash);
+            let ra_c = reward_account_bytes(0xE0, cred_c_hash);
+
+            // Build a fresh shell ledger seeded with the requested
+            // reward_account balances. `register` flags toggle whether each
+            // credential is actually in `reward_accounts`.
+            let build_state = |bal_a: Option<Lovelace>, bal_b: Option<Lovelace>| {
+                let mut utxo_set = UtxoSet::new();
+                utxo_set.insert(parent_in.clone(), parent_out_input.clone());
+                let utxo = UtxoSubState {
+                    utxo_set,
+                    diff_seq: DiffSeq::new(),
+                    epoch_fees: Lovelace(0),
+                    pending_donations: Lovelace(0),
+                };
+
+                let mut reward_accounts: HashMap<Hash32, Lovelace> = HashMap::new();
+                if let Some(bal) = bal_a {
+                    reward_accounts.insert(cred_a.to_typed_hash32(), bal);
+                }
+                if let Some(bal) = bal_b {
+                    reward_accounts.insert(cred_b.to_typed_hash32(), bal);
+                }
+
+                let certs = CertSubState {
+                    delegations: Arc::new(HashMap::new()),
+                    pool_params: Arc::new(HashMap::new()),
+                    future_pool_params: HashMap::new(),
+                    pending_retirements: HashMap::new(),
+                    reward_accounts: Arc::new(reward_accounts),
+                    stake_key_deposits: HashMap::new(),
+                    pool_deposits: HashMap::new(),
+                    total_stake_key_deposits: 0,
+                    pointer_map: HashMap::new(),
+                    stake_distribution: StakeDistributionState {
+                        stake_map: HashMap::new(),
+                    },
+                    script_stake_credentials: HashSet::new(),
+                };
+                let gov = super::make_gov_sub();
+                let epochs = EpochSubState {
+                    snapshots: crate::state::EpochSnapshots::default(),
+                    treasury: Lovelace(0),
+                    reserves: Lovelace(0),
+                    pending_reward_update: None,
+                    pending_pp_updates: BTreeMap::new(),
+                    future_pp_updates: BTreeMap::new(),
+                    needs_stake_rebuild: false,
+                    ptr_stake: HashMap::new(),
+                    ptr_stake_excluded: true,
+                    protocol_params: ProtocolParameters::mainnet_defaults(),
+                    prev_protocol_params: ProtocolParameters::mainnet_defaults(),
+                    prev_protocol_version_major: 12,
+                    prev_d: 0.0,
+                };
+                (utxo, certs, gov, epochs)
+            };
+
+            let make_parent_tx = |deposits: BTreeMap<Vec<u8>, Lovelace>| Transaction {
+                era: Era::Dijkstra,
+                hash: Hash32::from_bytes([0xDE; 32]),
+                body: TransactionBody {
+                    inputs: vec![parent_in.clone()],
+                    outputs: vec![parent_out.clone()],
+                    fee: Lovelace(0),
+                    ttl: None,
+                    certificates: vec![],
+                    withdrawals: BTreeMap::new(),
+                    auxiliary_data_hash: None,
+                    validity_interval_start: None,
+                    mint: BTreeMap::new(),
+                    script_data_hash: None,
+                    collateral: vec![],
+                    required_signers: vec![],
+                    network_id: None,
+                    collateral_return: None,
+                    total_collateral: None,
+                    reference_inputs: vec![],
+                    update: None,
+                    voting_procedures: BTreeMap::new(),
+                    proposal_procedures: vec![],
+                    treasury_value: None,
+                    donation: None,
+                    sub_transactions: vec![],
+                    account_balance_intervals: vec![],
+                    direct_deposits: deposits,
+                },
+                witness_set: TransactionWitnessSet {
+                    vkey_witnesses: vec![],
+                    native_scripts: vec![],
+                    bootstrap_witnesses: vec![],
+                    plutus_v1_scripts: vec![],
+                    plutus_v2_scripts: vec![],
+                    plutus_v3_scripts: vec![],
+                    plutus_data: vec![],
+                    redeemers: vec![],
+                    raw_redeemers_cbor: None,
+                    raw_plutus_data_cbor: None,
+                    original_script_data_hash: None,
+                },
+                is_valid: true,
+                auxiliary_data: None,
+                raw_cbor: None,
+                raw_body_cbor: None,
+                raw_witness_cbor: None,
+            };
+
+            let params = ProtocolParameters::mainnet_defaults();
+            let delegates: HashMap<Hash28, (Hash28, Hash32)> = HashMap::new();
+            let make_ctx = || RuleContext {
+                params: &params,
+                current_slot: 2_000_000,
+                current_epoch: EpochNo(700),
+                era: Era::Dijkstra,
+                slot_config: None,
+                node_network: None,
+                genesis_delegates: &delegates,
+                update_quorum: 5,
+                epoch_length: 432_000,
+                shelley_transition_epoch: 0,
+                byron_epoch_length: 21_600,
+                stability_window: 129_600,
+                stability_window_3kf: 129_600,
+                randomness_stabilisation_window: 129_600,
+                tx_index: 0,
+                conway_genesis: None,
+            };
+
+            let rules = DijkstraRules::new();
+
+            // ── Case 1: registered single account → balance grows ──────
+            {
+                let (mut utxo, mut certs, mut gov, mut epochs) =
+                    build_state(Some(Lovelace(100)), None);
+                let deposits: BTreeMap<Vec<u8>, Lovelace> =
+                    [(ra_a.clone(), Lovelace(1_500_000))].into_iter().collect();
+                let parent_tx = make_parent_tx(deposits);
+                let _diff = rules
+                    .apply_valid_tx(
+                        &parent_tx,
+                        BlockValidationMode::ApplyOnly,
+                        &make_ctx(),
+                        &mut utxo,
+                        &mut certs,
+                        &mut gov,
+                        &mut epochs,
+                    )
+                    .expect("registered deposit must succeed");
+                let key = cred_a.to_typed_hash32();
+                let post = certs
+                    .reward_accounts
+                    .get(&key)
+                    .copied()
+                    .expect("cred_a must still be registered");
+                assert_eq!(
+                    post,
+                    Lovelace(100 + 1_500_000),
+                    "registered case: balance must grow by exactly the deposit"
+                );
+                // Sanity: parent UTxO effect also applied.
+                assert!(
+                    utxo.utxo_set.lookup(&parent_in).is_none(),
+                    "registered case: parent input must have been consumed"
+                );
+            }
+
+            // ── Case 2: multi-account deposits → both balances grow ────
+            {
+                let (mut utxo, mut certs, mut gov, mut epochs) =
+                    build_state(Some(Lovelace(100)), Some(Lovelace(50)));
+                let deposits: BTreeMap<Vec<u8>, Lovelace> = [
+                    (ra_a.clone(), Lovelace(1_500_000)),
+                    (ra_b.clone(), Lovelace(2_500_000)),
+                ]
+                .into_iter()
+                .collect();
+                let parent_tx = make_parent_tx(deposits);
+                rules
+                    .apply_valid_tx(
+                        &parent_tx,
+                        BlockValidationMode::ApplyOnly,
+                        &make_ctx(),
+                        &mut utxo,
+                        &mut certs,
+                        &mut gov,
+                        &mut epochs,
+                    )
+                    .expect("multi-account registered deposits must succeed");
+                let key_a = cred_a.to_typed_hash32();
+                let key_b = cred_b.to_typed_hash32();
+                assert_eq!(
+                    certs.reward_accounts.get(&key_a).copied(),
+                    Some(Lovelace(100 + 1_500_000)),
+                    "cred_a balance must grow by its declared deposit"
+                );
+                assert_eq!(
+                    certs.reward_accounts.get(&key_b).copied(),
+                    Some(Lovelace(50 + 2_500_000)),
+                    "cred_b balance must grow by its declared deposit"
+                );
+                assert!(
+                    utxo.utxo_set.lookup(&parent_in).is_none(),
+                    "multi-account case: parent input must have been consumed"
+                );
+            }
+
+            // ── Case 3: unregistered target → predicate failure ────────
+            // cred_c (`ra_c` bytes) is NOT seeded into reward_accounts.
+            // Deposit must fail with DirectDepositToUnregisteredAccount and
+            // leave both the UTxO set and the reward_accounts map untouched.
+            {
+                let (mut utxo, mut certs, mut gov, mut epochs) =
+                    build_state(Some(Lovelace(100)), None);
+                let deposits: BTreeMap<Vec<u8>, Lovelace> = [
+                    // cred_a IS registered (would succeed in isolation),
+                    // but the presence of an unregistered ra_c MUST abort
+                    // the whole tx — AND mutation MUST NOT happen on
+                    // cred_a's account either (atomic predicate failure).
+                    (ra_a.clone(), Lovelace(1_500_000)),
+                    (ra_c.clone(), Lovelace(999_999)),
+                ]
+                .into_iter()
+                .collect();
+                let parent_tx = make_parent_tx(deposits);
+                let err = rules
+                    .apply_valid_tx(
+                        &parent_tx,
+                        BlockValidationMode::ApplyOnly,
+                        &make_ctx(),
+                        &mut utxo,
+                        &mut certs,
+                        &mut gov,
+                        &mut epochs,
+                    )
+                    .expect_err("unregistered cred_c target must be rejected");
+                let msg = format!("{err:?}");
+                assert!(
+                    msg.contains("DirectDepositToUnregisteredAccount"),
+                    "error must name the predicate, got: {msg}"
+                );
+                // Atomic predicate-failure invariants:
+                assert!(
+                    utxo.utxo_set.lookup(&parent_in).is_some(),
+                    "unregistered case: parent input MUST still be in the UTxO \
+                     (no mutation before predicate failure)"
+                );
+                let key_a = cred_a.to_typed_hash32();
+                assert_eq!(
+                    certs.reward_accounts.get(&key_a).copied(),
+                    Some(Lovelace(100)),
+                    "unregistered case: cred_a's balance MUST NOT have been \
+                     touched (predicate aborts the entire tx atomically)"
+                );
+                let key_c_typed = {
+                    let mut typed = [0u8; 32];
+                    typed[..28].copy_from_slice(cred_c_hash.as_bytes());
+                    Hash32::from_bytes(typed)
+                };
+                assert!(
+                    !certs.reward_accounts.contains_key(&key_c_typed),
+                    "unregistered case: deposit MUST NOT auto-register cred_c"
+                );
+            }
         }
 
         /// TxBody key 14 — `guards`: was `required_signers` in Conway, now

@@ -1059,6 +1059,7 @@ mod tests {
             donation: None,
             sub_transactions: vec![],
             account_balance_intervals: vec![],
+            direct_deposits: ::std::collections::BTreeMap::new(),
         };
         Transaction {
             era: Era::Shelley,
