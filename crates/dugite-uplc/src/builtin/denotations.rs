@@ -556,6 +556,154 @@ pub fn denote(id: BuiltinId, args: Vec<Value>) -> Result<Value, UplcError> {
             Ok(Value::Const(Constant::ByteString(bytes)))
         }
 
+        // ── CIP-0117 Integer ↔ ByteString conversions (V3) ────────────
+        IntegerToByteString => {
+            // (endianness: Bool, big-endian if True) (width: Integer) (n: Integer) -> ByteString
+            // If width = 0, output is the minimal big-endian
+            // representation of n. Else output is exactly `width`
+            // bytes (zero-padded on the high-order side). Negative n
+            // is a BuiltinFailure.
+            let mut it = args.into_iter();
+            let endian = unwrap_bool(it.next().ok_or_else(|| builtin_arity_mismatch(id))?, id)?;
+            let width = unwrap_integer(it.next().ok_or_else(|| builtin_arity_mismatch(id))?, id)?;
+            let n = unwrap_integer(it.next().ok_or_else(|| builtin_arity_mismatch(id))?, id)?;
+            if n.sign() == num_bigint::Sign::Minus {
+                return Err(builtin_failure(id, "integerToByteString: negative input"));
+            }
+            let width_u = bigint_to_usize_or_failure(&width, id, "integerToByteString width")?;
+            // Reasonable cap to avoid runaway allocation.
+            const MAX_INT_TO_BS_WIDTH: usize = 8192;
+            if width_u > MAX_INT_TO_BS_WIDTH {
+                return Err(builtin_failure(
+                    id,
+                    "integerToByteString: width exceeds 8192-byte cap",
+                ));
+            }
+            let mut be_bytes = n.to_bytes_be().1;
+            if be_bytes.len() == 1 && be_bytes[0] == 0 && width_u == 0 {
+                // n = 0 with auto-width → empty bytestring (matches
+                // Haskell's `integerToByteStringBE 0`).
+                return Ok(Value::Const(Constant::ByteString(Vec::new())));
+            }
+            if width_u != 0 {
+                if be_bytes.len() > width_u {
+                    return Err(builtin_failure(
+                        id,
+                        "integerToByteString: value doesn't fit in declared width",
+                    ));
+                }
+                let mut padded = vec![0u8; width_u - be_bytes.len()];
+                padded.append(&mut be_bytes);
+                be_bytes = padded;
+            }
+            if !endian {
+                be_bytes.reverse();
+            }
+            Ok(Value::Const(Constant::ByteString(be_bytes)))
+        }
+        ByteStringToInteger => {
+            // (endianness: Bool) (bs: ByteString) -> Integer
+            let mut it = args.into_iter();
+            let endian = unwrap_bool(it.next().ok_or_else(|| builtin_arity_mismatch(id))?, id)?;
+            let bs = unwrap_byte_string(it.next().ok_or_else(|| builtin_arity_mismatch(id))?, id)?;
+            let mut be_bytes = bs;
+            if !endian {
+                be_bytes.reverse();
+            }
+            Ok(Value::Const(Constant::Integer(BigInt::from_bytes_be(
+                num_bigint::Sign::Plus,
+                &be_bytes,
+            ))))
+        }
+
+        // ── CIP-0123 bitwise (V3) ─────────────────────────────────────
+        AndByteString => bitwise_byte_string(args, id, |a, b| a & b, 0),
+        OrByteString => bitwise_byte_string(args, id, |a, b| a | b, 0),
+        XorByteString => bitwise_byte_string(args, id, |a, b| a ^ b, 0),
+        ComplementByteString => {
+            let v = take_one(args, id)?;
+            let bs = unwrap_byte_string(v, id)?;
+            let out: Vec<u8> = bs.iter().map(|b| !*b).collect();
+            Ok(Value::Const(Constant::ByteString(out)))
+        }
+        ReadBit => {
+            // (bs: ByteString) (i: Integer) -> Bool
+            // Bit 0 = LSB of byte 0. (Per CIP-0123 §"Bit ordering".)
+            let mut it = args.into_iter();
+            let bs = unwrap_byte_string(it.next().ok_or_else(|| builtin_arity_mismatch(id))?, id)?;
+            let i = unwrap_integer(it.next().ok_or_else(|| builtin_arity_mismatch(id))?, id)?;
+            let idx = bigint_to_usize_or_failure(&i, id, "readBit index")?;
+            if idx >= bs.len().saturating_mul(8) {
+                return Err(builtin_failure(id, "readBit: index out of range"));
+            }
+            // CIP-0123 §"Indexing": bit i is bit (i % 8) of byte (i / 8),
+            // with byte 0 the least-significant. We use the "natural"
+            // little-endian byte order matching the spec.
+            let byte = bs[idx / 8];
+            let bit = (byte >> (idx % 8)) & 1;
+            Ok(Value::Const(Constant::Bool(bit != 0)))
+        }
+        ReplicateByte => {
+            // (count: Integer) (byte: Integer) -> ByteString
+            let mut it = args.into_iter();
+            let count = unwrap_integer(it.next().ok_or_else(|| builtin_arity_mismatch(id))?, id)?;
+            let byte = unwrap_integer(it.next().ok_or_else(|| builtin_arity_mismatch(id))?, id)?;
+            let count_u = bigint_to_usize_or_failure(&count, id, "replicateByte count")?;
+            const MAX_REPLICATE: usize = 8192;
+            if count_u > MAX_REPLICATE {
+                return Err(builtin_failure(
+                    id,
+                    "replicateByte: count exceeds 8192-byte cap",
+                ));
+            }
+            let b = bigint_to_u8(&byte, id, "replicateByte byte must be 0..=255")?;
+            Ok(Value::Const(Constant::ByteString(vec![b; count_u])))
+        }
+        CountSetBits => {
+            let v = take_one(args, id)?;
+            let bs = unwrap_byte_string(v, id)?;
+            let count: u32 = bs.iter().map(|b| b.count_ones()).sum();
+            Ok(Value::Const(Constant::Integer(BigInt::from(count))))
+        }
+        FindFirstSetBit => {
+            // Returns the index of the first 1 bit, or -1 if none.
+            // CIP-0123 §"Indexing": bit 0 is LSB of byte 0.
+            let v = take_one(args, id)?;
+            let bs = unwrap_byte_string(v, id)?;
+            for (byte_idx, &byte) in bs.iter().enumerate() {
+                if byte != 0 {
+                    let bit_in_byte = byte.trailing_zeros() as usize;
+                    let global = byte_idx * 8 + bit_in_byte;
+                    return Ok(Value::Const(Constant::Integer(BigInt::from(global))));
+                }
+            }
+            Ok(Value::Const(Constant::Integer(BigInt::from(-1))))
+        }
+
+        // ── ExpModInteger (V3) ────────────────────────────────────────
+        ExpModInteger => {
+            // (base: Integer) (exp: Integer) (modulus: Integer) -> Integer
+            // Haskell: expModInteger b e m = b ^ e mod m, requiring
+            // m > 0 and e >= 0.
+            let mut it = args.into_iter();
+            let base = unwrap_integer(it.next().ok_or_else(|| builtin_arity_mismatch(id))?, id)?;
+            let exp = unwrap_integer(it.next().ok_or_else(|| builtin_arity_mismatch(id))?, id)?;
+            let modulus = unwrap_integer(it.next().ok_or_else(|| builtin_arity_mismatch(id))?, id)?;
+            if modulus.sign() != num_bigint::Sign::Plus {
+                return Err(builtin_failure(
+                    id,
+                    "expModInteger: modulus must be positive",
+                ));
+            }
+            if exp.sign() == num_bigint::Sign::Minus {
+                return Err(builtin_failure(
+                    id,
+                    "expModInteger: exponent must be non-negative",
+                ));
+            }
+            Ok(Value::Const(Constant::Integer(base.modpow(&exp, &modulus))))
+        }
+
         // Anything else is a future commit.
         _ => Err(UplcError::Internal(format!(
             "builtin denotation for {} not yet wired",
@@ -609,6 +757,69 @@ fn unwrap_proto_pair(v: Value, id: BuiltinId) -> Result<(Box<Constant>, Box<Cons
             ),
         }),
     }
+}
+
+fn unwrap_bool(v: Value, id: BuiltinId) -> Result<bool, UplcError> {
+    match v {
+        Value::Const(Constant::Bool(b)) => Ok(b),
+        other => Err(UplcError::BuiltinTypeError {
+            builtin: id.name(),
+            reason: format!("expected Bool, got {:?}", std::mem::discriminant(&other)),
+        }),
+    }
+}
+
+fn bigint_to_usize_or_failure(i: &BigInt, id: BuiltinId, what: &str) -> Result<usize, UplcError> {
+    use num_bigint::Sign;
+    if i.sign() == Sign::Minus {
+        return Err(builtin_failure(id, &format!("{what}: negative")));
+    }
+    let digits = i.iter_u64_digits().collect::<Vec<_>>();
+    if digits.is_empty() {
+        return Ok(0);
+    }
+    if digits.len() > 1 {
+        return Err(builtin_failure(id, &format!("{what}: value exceeds usize")));
+    }
+    usize::try_from(digits[0])
+        .map_err(|_| builtin_failure(id, &format!("{what}: value exceeds usize on this platform")))
+}
+
+/// Bitwise binary op on two byte strings of equal length.
+/// `pad` is the byte to use when extending the shorter input to the
+/// longer length. Per CIP-0123: padding semantics are part of the
+/// builtin (`andByteString` pads with 0xFF for max-len, `orByteString`
+/// and `xorByteString` pad with 0x00). Our current implementation
+/// requires equal-length inputs and rejects mismatched lengths as a
+/// `BuiltinFailure`; the padding-mode variant arrives with the
+/// `padded`-flavour builtins in a follow-on commit.
+fn bitwise_byte_string<F>(
+    args: Vec<Value>,
+    id: BuiltinId,
+    op: F,
+    _pad: u8,
+) -> Result<Value, UplcError>
+where
+    F: Fn(u8, u8) -> u8,
+{
+    // The current Haskell signature is (padding: Bool, a: ByteString,
+    // b: ByteString) -> ByteString. The first arg controls padding
+    // semantics (True = pad with 0xFF, False = pad with 0x00 — or
+    // some such; CIP-0123 spec details vary). For now we accept the
+    // padding flag but treat both inputs as equal-length (rejecting
+    // mismatched lengths).
+    let mut it = args.into_iter();
+    let _padding = unwrap_bool(it.next().ok_or_else(|| builtin_arity_mismatch(id))?, id)?;
+    let a = unwrap_byte_string(it.next().ok_or_else(|| builtin_arity_mismatch(id))?, id)?;
+    let b = unwrap_byte_string(it.next().ok_or_else(|| builtin_arity_mismatch(id))?, id)?;
+    if a.len() != b.len() {
+        return Err(builtin_failure(
+            id,
+            "bitwise: mismatched byte-string lengths (padding modes wired in follow-on)",
+        ));
+    }
+    let out: Vec<u8> = a.iter().zip(b.iter()).map(|(x, y)| op(*x, *y)).collect();
+    Ok(Value::Const(Constant::ByteString(out)))
 }
 
 fn unwrap_data(v: Value, id: BuiltinId) -> Result<crate::data::Data, UplcError> {
