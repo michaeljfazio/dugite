@@ -1,5 +1,9 @@
 # Introduction
 
+<p align="center">
+  <img src="logo.png" alt="Dugite logo" width="200" />
+</p>
+
 **Dugite** is a Cardano node implementation written in Rust, aiming for 100% compatibility with [cardano-node](https://github.com/IntersectMBO/cardano-node) (Haskell).
 
 Built by [Sandstone Pool](https://www.sandstone.io/).
