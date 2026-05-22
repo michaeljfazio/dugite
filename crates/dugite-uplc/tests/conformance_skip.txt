@@ -24,14 +24,11 @@
 #                                    `(value …)` constant, `insertCoin` /
 #                                    `lookupCoin` / `scaleValue` / `unValueData`
 #                                    builtin token-bundles, etc.)
-#   budget:                      14  CPU/mem cost-model divergence (residual size-rule edge cases
-#                                    class — every per-step CPU charge needs
-#                                    to be aligned with the Haskell tiered model)
 #   eval_fails_unexpectedly:     74  CEK rejects programs the reference accepts
 #   result_mismatch:             65  CEK produces a different normal form
 #                                    than the reference
 #   ───────────────────────────────
-#   Total skipped:              322 / 999 (677 currently pass)
+#   Total skipped:              308 / 999 (691 currently pass)
 #
 # Goal: 0 / 999.
 
@@ -207,23 +204,6 @@ builtin/semantics/valueData/multi-token
 builtin/semantics/valueData/negative-quantity
 builtin/semantics/valueData/roundtrip-from-value
 builtin/semantics/valueData/single-entry
-
-# === budget (14 tests) ===
-# CPU/mem budget consumed by dugite-uplc differs from the Haskell golden â dugite-uplc cost model needs alignment
-builtin/semantics/encodeUtf8
-builtin/semantics/equalsData/equalsData-01
-builtin/semantics/equalsData/equalsData-02
-builtin/semantics/equalsData/equalsData-03
-builtin/semantics/equalsData/equalsData-04
-builtin/semantics/expModInteger/extra/expModInteger-22
-builtin/semantics/expModInteger/extra/expModInteger-25
-builtin/semantics/quotientInteger/quotientInteger-neg-neg
-builtin/semantics/quotientInteger/quotientInteger-neg-pos
-builtin/semantics/quotientInteger/quotientInteger-pos-neg
-builtin/semantics/quotientInteger/quotientInteger-pos-pos
-builtin/semantics/verifySchnorrSecp256k1Signature/test-vector-09
-builtin/semantics/verifySchnorrSecp256k1Signature/test-vector-12
-builtin/semantics/verifySchnorrSecp256k1Signature/test-vector-13
 
 # === eval_fails_unexpectedly (74 tests) ===
 # dugite-uplc CEK fails on a program the reference accepts
