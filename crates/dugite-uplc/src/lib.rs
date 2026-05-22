@@ -52,6 +52,7 @@ pub mod program;
 pub mod script_context;
 pub mod term;
 pub mod tx_info;
+pub mod tx_info_populate;
 
 mod error;
 
