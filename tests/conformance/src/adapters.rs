@@ -733,6 +733,11 @@ fn make_protocol_params(pp: &crate::schema::UtxoProtocolParams) -> ProtocolParam
             numerator: 0,
             denominator: 1,
         },
+        // Dijkstra-era PParams (keys 34-37): not used in conformance tests.
+        max_ref_script_size_per_block: None,
+        max_ref_script_size_per_tx: None,
+        ref_script_cost_stride: None,
+        ref_script_cost_multiplier: None,
     }
 }
 

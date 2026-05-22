@@ -434,6 +434,11 @@ pub fn decode_pparams(data: &[u8]) -> Result<(ProtocolParameters, usize), Serial
             numerator: 0,
             denominator: 1,
         },
+        // Dijkstra-era PParams (keys 34-37): absent in Conway-era snapshots.
+        max_ref_script_size_per_block: None,
+        max_ref_script_size_per_tx: None,
+        ref_script_cost_stride: None,
+        ref_script_cost_multiplier: None,
     };
 
     Ok((pp, off))

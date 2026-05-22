@@ -189,6 +189,19 @@ impl LedgerState {
         if let Some(v) = update.protocol_version_minor {
             self.epochs.protocol_params.protocol_version_minor = v;
         }
+        // Dijkstra-era parameters (keys 34-37).
+        if let Some(v) = update.max_ref_script_size_per_block {
+            self.epochs.protocol_params.max_ref_script_size_per_block = Some(v);
+        }
+        if let Some(v) = update.max_ref_script_size_per_tx {
+            self.epochs.protocol_params.max_ref_script_size_per_tx = Some(v);
+        }
+        if let Some(v) = update.ref_script_cost_stride {
+            self.epochs.protocol_params.ref_script_cost_stride = Some(v);
+        }
+        if let Some(ref v) = update.ref_script_cost_multiplier {
+            self.epochs.protocol_params.ref_script_cost_multiplier = Some(v.clone());
+        }
         Ok(())
     }
 }

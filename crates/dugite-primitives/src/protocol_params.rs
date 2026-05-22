@@ -94,6 +94,44 @@ pub struct ProtocolParameters {
     /// reward calculation forces eta = 1 (no performance adjustment).
     #[serde(default)]
     pub d: Rational,
+
+    // Dijkstra-era parameters (PParams map keys 34-37).
+    //
+    // These re-parameterise the ref-script tiering that was hardcoded in Conway
+    // (1 MiB block limit / 200 KiB tx limit / 25_600-byte stride / 1.2×
+    // multiplier).  The fields are `None` for pre-Dijkstra protocol versions
+    // and are populated when a ParameterChange governance action carrying keys
+    // 34-37 is ratified, or when the Dijkstra genesis file seeds them.
+    //
+    // Haskell source: `cardano-ledger:eras/dijkstra/impl/src/Cardano/Ledger/
+    // Dijkstra/PParams.hs`, `PParamUpdate` tags 34-37.
+    /// PParam key 34 — maximum total bytes of reference scripts across all
+    /// transactions in a block (`maxRefScriptSizePerBlock`, Word32).
+    ///
+    /// Default (per `dijkstra-genesis.json`): 1 MiB = 1_048_576.
+    #[serde(default)]
+    pub max_ref_script_size_per_block: Option<u32>,
+
+    /// PParam key 35 — maximum total bytes of reference scripts a single
+    /// transaction may use (`maxRefScriptSizePerTx`, Word32).
+    ///
+    /// Default: 200 KiB = 204_800.
+    #[serde(default)]
+    pub max_ref_script_size_per_tx: Option<u32>,
+
+    /// PParam key 36 — stride (in bytes) of each pricing tier for reference
+    /// scripts (`refScriptCostStride`, NonZero Word32).
+    ///
+    /// Default: 25_600.
+    #[serde(default)]
+    pub ref_script_cost_stride: Option<u32>,
+
+    /// PParam key 37 — per-tier fee multiplier for reference scripts
+    /// (`refScriptCostMultiplier`, PositiveInterval encoded as rational).
+    ///
+    /// Stored as `(numerator, denominator)`; default 6/5 = 1.2.
+    #[serde(default)]
+    pub ref_script_cost_multiplier: Option<Rational>,
 }
 
 fn default_active_slot_coeff() -> f64 {
@@ -261,6 +299,12 @@ impl ProtocolParameters {
                 numerator: 0,
                 denominator: 1,
             },
+            // Dijkstra PParams (keys 34-37): None until a Dijkstra genesis or
+            // governance ParameterChange populates them.
+            max_ref_script_size_per_block: None,
+            max_ref_script_size_per_tx: None,
+            ref_script_cost_stride: None,
+            ref_script_cost_multiplier: None,
         }
     }
 }
