@@ -76,6 +76,7 @@ cd testnet/local-devnet
 sleep 30                            # let the chain advance past slot 0
 ./tx-zoo/run-all.sh --setup         # ~20s — keys + plutus binaries (one-time per setup)
 ./tx-zoo/run-all.sh                 # ~3-5 min — all 59 tx scripts
+./tx-zoo/09-cli-parity/run.sh       # ~1 min — 22 LSQ parity checks; writes cli-parity.csv
 ./soak.sh 120                       # 2 min idle evidence
 ./verify.sh evidence/$(ls -t evidence | head -1)
 .claude/skills/devnet-validate/scripts/analyze-evidence.sh evidence/$(ls -t evidence | head -1)
@@ -95,6 +96,7 @@ tail -F logs/cardano-bp.log   | grep -E 'TraceAdoptedBlock|TraceForgedInvalidBlo
 - Zero `TraceForgedInvalidBlock` in `logs/cardano-bp.log`
 - `dugite_tip_age_seconds` stays <5 throughout the soak
 - `analyze-evidence.sh` reports no anomalies
+- `evidence/<ts>/cli-parity.csv` has zero DIVERGENT rows that are not filed as known-divergence issues
 
 ### Round 2 — Epoch-boundary stress (~7 min)
 

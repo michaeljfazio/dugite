@@ -205,6 +205,16 @@ process_round() {
         fi
     fi
 
+    # --- CLI parity summary ---
+    local cli_parity_equal=0 cli_parity_divergent=0 cli_parity_skip=0 cli_parity_error=0
+    local parity_csv="$evd/cli-parity.csv"
+    if [ -f "$parity_csv" ] && [ -s "$parity_csv" ]; then
+        cli_parity_equal=$(awk -F, 'NR>1 && $5=="true" {c++} END{print c+0}' "$parity_csv")
+        cli_parity_divergent=$(awk -F, 'NR>1 && $5=="false" && $6!~/skip|known-divergence/ {c++} END{print c+0}' "$parity_csv")
+        cli_parity_skip=$(awk -F, 'NR>1 && ($6~/^skip/ || $2~/\//) {c++} END{print c+0}' "$parity_csv" || echo 0)
+        cli_parity_error=$(awk -F, 'NR>1 && $6~/^error|ERROR/ {c++} END{print c+0}' "$parity_csv" || echo 0)
+    fi
+
     # --- Epoch transitions ---
     local epoch_transitions="null"
     if [ -d "$logs_dir" ] && [ -f "$logs_dir/dugite-bp.log" ]; then
@@ -251,7 +261,13 @@ process_round() {
   },
   "log_errors": $log_json,
   "anomalies": $anomalies_json,
-  "epoch_transitions_observed": $epoch_transitions
+  "epoch_transitions_observed": $epoch_transitions,
+  "cli_parity": {
+    "equal": $cli_parity_equal,
+    "divergent": $cli_parity_divergent,
+    "skip": $cli_parity_skip,
+    "error": $cli_parity_error
+  }
 }
 ROUND_JSON
 }
@@ -384,8 +400,8 @@ cat <<HEADER
 
 ## Round summary
 
-| Round | Result | Canonical blocks | Tx-zoo | Tip-age p99 | Chain density |
-|---|---|---|---|---|---|
+| Round | Result | Canonical blocks | Tx-zoo | CLI parity | Tip-age p99 | Chain density |
+|---|---|---|---|---|---|---|
 HEADER
 
 for i in "${!EVIDENCE_DIRS[@]}"; do
@@ -394,10 +410,13 @@ for i in "${!EVIDENCE_DIRS[@]}"; do
     r_can=$(echo "$ROUNDS_JSON"   | jq -r ".[$i].blocks.canonical // 0")
     r_tz_p=$(echo "$ROUNDS_JSON"  | jq -r ".[$i].tx_zoo.pass // 0")
     r_tz_t=$(echo "$ROUNDS_JSON"  | jq -r ".[$i].tx_zoo.total // 0")
+    r_cp_e=$(echo "$ROUNDS_JSON"  | jq -r ".[$i].cli_parity.equal // \"?\"")
+    r_cp_d=$(echo "$ROUNDS_JSON"  | jq -r ".[$i].cli_parity.divergent // 0")
     r_tip=$(echo "$ROUNDS_JSON"   | jq -r ".[$i].tip_age.p99_seconds // \"?\"")
     r_dens=$(echo "$ROUNDS_JSON"  | jq -r ".[$i].chain_density // \"?\"")
     badge=$([ "$r_pass" = "true" ] && echo "✅ PASS" || echo "❌ FAIL")
-    echo "| $rname | $badge | $r_can | $r_tz_p/$r_tz_t | ${r_tip}s | $r_dens |"
+    cp_badge=$([ "${r_cp_d:-0}" -eq 0 ] && echo "✅ ${r_cp_e}✓" || echo "❌ ${r_cp_d}✗")
+    echo "| $rname | $badge | $r_can | $r_tz_p/$r_tz_t | $cp_badge | ${r_tip}s | $r_dens |"
 done
 
 cat <<TOTALS
