@@ -238,6 +238,22 @@ impl LedgerState {
                     &mut self.consensus,
                 )?;
                 self.epoch = next_epoch;
+
+                // Tasks #21/#22/#23: per-epoch-boundary full-state dump.
+                // No-op unless the crate is built with `--features
+                // epoch-state-debug` AND `DUGITE_EPOCH_STATE_DUMP=<dir>`
+                // is set at runtime.  Called immediately after the
+                // boundary handler so reward/treasury/reserve scalars
+                // reflect the post-boundary state, matching what
+                // `cardano-cli debug log-epoch-state` would emit on the
+                // Haskell side.
+                #[cfg(feature = "epoch-state-debug")]
+                crate::state::epoch_state_debug::maybe_dump(
+                    self,
+                    next_epoch.0,
+                    block.slot().0,
+                    self.epochs.pending_reward_update.as_ref(),
+                );
             }
         }
 

@@ -1,6 +1,8 @@
 mod apply;
 mod certificates;
 mod epoch;
+#[cfg(feature = "epoch-state-debug")]
+pub mod epoch_state_debug;
 pub(crate) mod governance;
 mod protocol_params;
 #[cfg(feature = "reward-debug-dump")]
