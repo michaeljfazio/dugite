@@ -52,6 +52,15 @@ enum QuerySubcommand {
         socket_path: PathBuf,
         #[arg(long)]
         testnet_magic: Option<u64>,
+        /// Format output as JSON (default; matches cardano-cli)
+        #[arg(long)]
+        output_json: bool,
+        /// Format output as human-readable text table
+        #[arg(long)]
+        output_text: bool,
+        /// Optional output file. Default is stdout.
+        #[arg(long)]
+        out_file: Option<PathBuf>,
     },
     /// Query stake address info
     StakeAddressInfo {
@@ -68,6 +77,15 @@ enum QuerySubcommand {
         socket_path: PathBuf,
         #[arg(long)]
         testnet_magic: Option<u64>,
+        /// Format output as JSON (default; matches cardano-cli)
+        #[arg(long)]
+        output_json: bool,
+        /// Format output as human-readable text summary
+        #[arg(long)]
+        output_text: bool,
+        /// Optional output file. Default is stdout.
+        #[arg(long)]
+        out_file: Option<PathBuf>,
     },
     /// Query DRep state (Conway era)
     DrepState {
@@ -250,6 +268,37 @@ enum QuerySubcommand {
         socket_path: PathBuf,
         #[arg(long)]
         testnet_magic: Option<u64>,
+        /// Format output as JSON (matches cardano-cli --output-json)
+        #[arg(long)]
+        output_json: bool,
+        /// Format output as human-readable text (default)
+        #[arg(long)]
+        output_text: bool,
+        /// Optional output file. Default is stdout.
+        #[arg(long)]
+        out_file: Option<PathBuf>,
+    },
+    /// Query active governance proposals (Conway era).
+    ///
+    /// Returns the list of live governance action proposals, matching
+    /// `cardano-cli query proposals`.
+    Proposals {
+        #[arg(long, default_value = "node.sock")]
+        socket_path: PathBuf,
+        #[arg(long)]
+        testnet_magic: Option<u64>,
+        /// Return all proposals (default)
+        #[arg(long)]
+        all_proposals: bool,
+        /// Filter by governance action tx ID
+        #[arg(long)]
+        governance_action_tx_id: Option<String>,
+        /// Filter by governance action index (requires --governance-action-tx-id)
+        #[arg(long)]
+        governance_action_index: Option<u32>,
+        /// Optional output file. Default is stdout.
+        #[arg(long)]
+        out_file: Option<PathBuf>,
     },
     /// Query the ledger state (debug endpoint)
     LedgerState {
@@ -1075,6 +1124,9 @@ impl QueryCmd {
             QuerySubcommand::StakeDistribution {
                 socket_path,
                 testnet_magic,
+                output_json: _,
+                output_text,
+                out_file,
             } => {
                 let mut client = connect_and_acquire(&socket_path, testnet_magic).await?;
 
@@ -1104,9 +1156,13 @@ impl QueryCmd {
 
                 let map_len = decoder.map().unwrap_or(Some(0)).unwrap_or(0);
 
-                println!("{:<60} {:>18}", "PoolId", "Stake Fraction");
-                println!("{}", "-".repeat(80));
-
+                // Collect pool entries for output
+                struct PoolEntry {
+                    pool_hex: String,
+                    num: u64,
+                    den: u64,
+                }
+                let mut entries = Vec::with_capacity(map_len as usize);
                 for _ in 0..map_len {
                     let pool_id = decoder.bytes().unwrap_or(&[]);
                     let pool_hex = hex::encode(pool_id);
@@ -1116,12 +1172,48 @@ impl QueryCmd {
                     let _ = decoder.array();
                     let num = decoder.u64().unwrap_or(0);
                     let den = decoder.u64().unwrap_or(1);
-                    let fraction = num as f64 / den.max(1) as f64;
                     decoder.skip().ok(); // vrf_hash
-                    println!("{pool_hex:<60} {fraction:>18.10}");
+                    entries.push(PoolEntry { pool_hex, num, den });
                 }
 
-                println!("\nTotal pools: {map_len}");
+                let output = if output_text {
+                    // Human-readable text table
+                    let mut lines = Vec::new();
+                    lines.push(format!("{:<60} {:>18}", "PoolId", "Stake Fraction"));
+                    lines.push("-".repeat(80));
+                    for e in &entries {
+                        let fraction = e.num as f64 / e.den.max(1) as f64;
+                        lines.push(format!("{:<60} {:>18.10}", e.pool_hex, fraction));
+                    }
+                    lines.push(String::new());
+                    lines.push(format!("Total pools: {}", entries.len()));
+                    lines.join("\n")
+                } else {
+                    // JSON output matching cardano-cli `query stake-distribution --output-json`:
+                    // { "pool_hex": { "poolId": "pool_hex", "stakeFraction": "num/den" } }
+                    let mut obj = serde_json::Map::new();
+                    for e in &entries {
+                        let stake_frac = if e.den == 0 {
+                            "0/1".to_string()
+                        } else {
+                            format!("{}/{}", e.num, e.den)
+                        };
+                        obj.insert(
+                            e.pool_hex.clone(),
+                            serde_json::json!({
+                                "poolId": e.pool_hex,
+                                "stakeFraction": stake_frac,
+                            }),
+                        );
+                    }
+                    serde_json::to_string_pretty(&serde_json::Value::Object(obj))?
+                };
+
+                if let Some(path) = out_file {
+                    std::fs::write(&path, &output)?;
+                } else {
+                    println!("{output}");
+                }
                 Ok(())
             }
             QuerySubcommand::StakeAddressInfo {
@@ -1229,6 +1321,9 @@ impl QueryCmd {
             QuerySubcommand::GovState {
                 socket_path,
                 testnet_magic,
+                output_json: _,
+                output_text,
+                out_file,
             } => {
                 let mut client = connect_and_acquire(&socket_path, testnet_magic).await?;
 
@@ -1371,34 +1466,74 @@ impl QueryCmd {
                     // We don't display these, just note they exist
                 }
 
-                println!("Governance State (Conway)");
-                println!("========================");
-                println!("Committee Members: {committee_count}");
-                if !constitution_url.is_empty() {
-                    println!("Constitution:     {constitution_url}");
-                }
-                println!("Active Proposals: {}", proposals.len());
-
-                if !proposals.is_empty() {
-                    println!("\nProposals:");
-                    println!(
-                        "{:<20} {:<14} {:>15} {:>8} {:>8}",
-                        "Type", "TxId", "Deposit (ADA)", "Proposed", "Expires"
-                    );
-                    println!("{}", "-".repeat(68));
-                    for (tx_id, idx, action_type, deposit, proposed, expires) in &proposals {
-                        let short_tx = if tx_id.len() > 8 {
-                            format!("{}#{idx}", &tx_id[..8])
-                        } else {
-                            format!("{tx_id}#{idx}")
-                        };
-                        println!(
-                            "{action_type:<20} {short_tx:<14} {:>15} {:>8} {:>8}",
-                            deposit / 1_000_000,
-                            proposed,
-                            expires
-                        );
+                let output = if output_text {
+                    // Human-readable text summary (legacy format)
+                    let mut lines = vec![
+                        "Governance State (Conway)".to_string(),
+                        "========================".to_string(),
+                        format!("Committee Members: {committee_count}"),
+                    ];
+                    if !constitution_url.is_empty() {
+                        lines.push(format!("Constitution:     {constitution_url}"));
                     }
+                    lines.push(format!("Active Proposals: {}", proposals.len()));
+                    if !proposals.is_empty() {
+                        lines.push(String::new());
+                        lines.push("Proposals:".to_string());
+                        lines.push(format!(
+                            "{:<20} {:<14} {:>15} {:>8} {:>8}",
+                            "Type", "TxId", "Deposit (ADA)", "Proposed", "Expires"
+                        ));
+                        lines.push("-".repeat(68));
+                        for (tx_id, idx, action_type, deposit, proposed, expires) in &proposals {
+                            let short_tx = if tx_id.len() > 8 {
+                                format!("{}#{idx}", &tx_id[..8])
+                            } else {
+                                format!("{tx_id}#{idx}")
+                            };
+                            lines.push(format!(
+                                "{action_type:<20} {short_tx:<14} {:>15} {:>8} {:>8}",
+                                deposit / 1_000_000,
+                                proposed,
+                                expires
+                            ));
+                        }
+                    }
+                    lines.join("\n")
+                } else {
+                    // JSON output matching cardano-cli `query gov-state --output-json`.
+                    // Emit a structured JSON object with proposals, committee, and constitution.
+                    let proposals_json: Vec<serde_json::Value> = proposals
+                        .iter()
+                        .map(|(tx_id, idx, action_type, deposit, proposed, expires)| {
+                            serde_json::json!({
+                                "actionId": {
+                                    "txId": tx_id,
+                                    "govActionIx": idx,
+                                },
+                                "actionType": action_type,
+                                "deposit": deposit,
+                                "proposedIn": proposed,
+                                "expiresAfter": expires,
+                                "committeeVotes": {},
+                                "dRepVotes": {},
+                                "stakePoolVotes": {},
+                            })
+                        })
+                        .collect();
+                    let gov_json = serde_json::json!({
+                        "proposals": proposals_json,
+                        "committeeSize": committee_count,
+                        "constitutionUrl": if constitution_url.is_empty() { serde_json::Value::Null } else { serde_json::Value::String(constitution_url) },
+                        "currentEpochNo": serde_json::Value::Null,
+                    });
+                    serde_json::to_string_pretty(&gov_json)?
+                };
+
+                if let Some(path) = out_file {
+                    std::fs::write(&path, &output)?;
+                } else {
+                    println!("{output}");
                 }
 
                 Ok(())
@@ -2652,6 +2787,9 @@ impl QueryCmd {
                 op_cert_file,
                 socket_path,
                 testnet_magic,
+                output_json,
+                output_text: _,
+                out_file,
             } => {
                 // Read and decode the operational certificate text envelope.
                 // OpCert envelope type is "NodeOperationalCertificate".
@@ -2732,26 +2870,55 @@ impl QueryCmd {
                 };
 
                 let periods_remaining = cert_end.saturating_sub(current_kes_period);
+                let remaining_slots = periods_remaining.saturating_mul(slots_per_kes_period);
+                let max_kes_evolutions: u64 = 62;
 
-                // Output format matches cardano-cli query kes-period-info.
-                println!("KES Period Info");
-                println!("===============");
-                println!("Status:                  {status}");
-                println!("Operational certificate: {}", op_cert_file.display());
-                println!("KES counter:             {opcert_counter}");
-                println!("Opcert start KES period: {cert_start}");
-                println!("Opcert end KES period:   {cert_end}");
-                println!("Current KES period:      {current_kes_period}");
-                println!("KES periods remaining:   {periods_remaining}");
+                let output = if output_json {
+                    // JSON format matching `cardano-cli query kes-period-info --output-json`
+                    // Field names match Haskell's `CurrentKesPeriodInfo` record.
+                    let kes_json = serde_json::json!({
+                        "qKesCurrentKesPeriod": current_kes_period,
+                        "qKesStartKesInterval": cert_start,
+                        "qKesEndKesInterval": cert_end,
+                        "qKesRemainingSlotsInKesPeriod": remaining_slots,
+                        "qKesOnDiskOperationalCertificateNumber": opcert_counter,
+                        "qKesNodeStateOperationalCertificateNumber": opcert_counter,
+                        "qKesMaxKESEvolutions": max_kes_evolutions,
+                        "qKesSlotsPerKesPeriod": slots_per_kes_period,
+                        "qKesKesKeyExpiry": serde_json::Value::Null,
+                        "qKesKesKeyFailed": status == "EXPIRED",
+                    });
+                    serde_json::to_string_pretty(&kes_json)?
+                } else {
+                    // Human-readable text format (default for dugite-cli direct use)
+                    let mut lines = vec![
+                        "KES Period Info".to_string(),
+                        "===============".to_string(),
+                        format!("Status:                  {status}"),
+                        format!("Operational certificate: {}", op_cert_file.display()),
+                        format!("KES counter:             {opcert_counter}"),
+                        format!("Opcert start KES period: {cert_start}"),
+                        format!("Opcert end KES period:   {cert_end}"),
+                        format!("Current KES period:      {current_kes_period}"),
+                        format!("KES periods remaining:   {periods_remaining}"),
+                    ];
+                    if status == "EXPIRED" {
+                        lines.push(
+                            "Warning: operational certificate has expired. Rotate KES key immediately."
+                                .to_string(),
+                        );
+                    } else if status == "NOT YET VALID" {
+                        lines.push(format!(
+                            "Warning: operational certificate is not yet valid (starts at period {cert_start}, currently {current_kes_period})."
+                        ));
+                    }
+                    lines.join("\n")
+                };
 
-                if status == "EXPIRED" {
-                    eprintln!(
-                        "Warning: operational certificate has expired. Rotate KES key immediately."
-                    );
-                } else if status == "NOT YET VALID" {
-                    eprintln!(
-                        "Warning: operational certificate is not yet valid (starts at period {cert_start}, currently {current_kes_period})."
-                    );
+                if let Some(path) = out_file {
+                    std::fs::write(&path, &output)?;
+                } else {
+                    println!("{output}");
                 }
 
                 Ok(())
@@ -2814,6 +2981,164 @@ impl QueryCmd {
                 } else {
                     println!("{}", hex::encode(&raw));
                 }
+                Ok(())
+            }
+            QuerySubcommand::Proposals {
+                socket_path,
+                testnet_magic,
+                all_proposals: _,
+                governance_action_tx_id,
+                governance_action_index,
+                out_file,
+            } => {
+                let mut client = connect_and_acquire(&socket_path, testnet_magic).await?;
+
+                let raw = client
+                    .query_gov_state()
+                    .await
+                    .map_err(|e| anyhow::anyhow!("Failed to query governance state: {e}"))?;
+
+                release_and_done(&mut client).await;
+
+                // Parse the ConwayGovState CBOR and extract proposals.
+                // Re-uses the same CBOR path as GovState handler.
+                let mut decoder = minicbor::Decoder::new(&raw);
+                let _ = decoder.array();
+                let tag = decoder.u32().unwrap_or(999);
+                if tag != 4 {
+                    anyhow::bail!("Expected MsgResult tag 4, got {tag}");
+                }
+
+                // Strip HFC success wrapper
+                let pos = decoder.position();
+                if let Ok(Some(2)) = decoder.array() {
+                    let _ = decoder.u64();
+                } else if let Ok(Some(1)) = {
+                    decoder.set_position(pos);
+                    decoder.array()
+                } {
+                } else {
+                    decoder.set_position(pos);
+                }
+
+                // Collect proposals from ConwayGovState array(7)[0] = Proposals
+                let mut proposals: Vec<serde_json::Value> = Vec::new();
+                if let Ok(Some(7)) = decoder.array() {
+                    if let Ok(Some(2)) = decoder.array() {
+                        decoder.skip().ok(); // skip roots
+                        if let Ok(Some(n)) = decoder.array() {
+                            for _ in 0..n {
+                                if let Ok(Some(7)) = decoder.array() {
+                                    // [0] GovActionId
+                                    let _ = decoder.array();
+                                    let tx_id = hex::encode(decoder.bytes().unwrap_or(&[]));
+                                    let action_idx = decoder.u32().unwrap_or(0);
+                                    // [1] committeeVotes, [2] drepVotes, [3] spoVotes
+                                    decoder.skip().ok();
+                                    decoder.skip().ok();
+                                    decoder.skip().ok();
+                                    // [4] ProposalProcedure
+                                    let mut action_type = "InfoAction".to_string();
+                                    let mut deposit = 0u64;
+                                    let mut return_addr = String::new();
+                                    let mut anchor_url = String::new();
+                                    let mut anchor_data_hash = String::new();
+                                    if let Ok(Some(4)) = decoder.array() {
+                                        deposit = decoder.u64().unwrap_or(0);
+                                        // return addr (bytes)
+                                        return_addr = hex::encode(decoder.bytes().unwrap_or(&[]));
+                                        // gov_action
+                                        if let Ok(Some(_)) = decoder.array() {
+                                            let gov_tag = decoder.u32().unwrap_or(6);
+                                            action_type = match gov_tag {
+                                                0 => "ParameterChange",
+                                                1 => "HardForkInitiation",
+                                                2 => "TreasuryWithdrawals",
+                                                3 => "NoConfidence",
+                                                4 => "UpdateCommittee",
+                                                5 => "NewConstitution",
+                                                _ => "InfoAction",
+                                            }
+                                            .to_string();
+                                            let skip_count = match gov_tag {
+                                                0 => 3,
+                                                1 => 2,
+                                                2 => 2,
+                                                3 => 1,
+                                                4 => 4,
+                                                5 => 2,
+                                                _ => 0,
+                                            };
+                                            for _ in 0..skip_count {
+                                                decoder.skip().ok();
+                                            }
+                                        }
+                                        // anchor
+                                        if let Ok(Some(2)) = decoder.array() {
+                                            anchor_url = decoder.str().unwrap_or("").to_string();
+                                            anchor_data_hash =
+                                                hex::encode(decoder.bytes().unwrap_or(&[]));
+                                        }
+                                    }
+                                    let proposed = decoder.u64().unwrap_or(0);
+                                    let expires = decoder.u64().unwrap_or(0);
+
+                                    proposals.push(serde_json::json!({
+                                        "actionId": {
+                                            "txId": tx_id,
+                                            "govActionIx": action_idx,
+                                        },
+                                        "actionType": action_type,
+                                        "deposit": deposit,
+                                        "returnAddress": return_addr,
+                                        "anchor": {
+                                            "url": anchor_url,
+                                            "dataHash": anchor_data_hash,
+                                        },
+                                        "proposedIn": proposed,
+                                        "expiresAfter": expires,
+                                    }));
+                                } else {
+                                    decoder.skip().ok();
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // Apply filters if requested
+                let filtered: Vec<serde_json::Value> =
+                    if let Some(ref tx_id_filter) = governance_action_tx_id {
+                        proposals
+                            .into_iter()
+                            .filter(|p| {
+                                let id_matches = p["actionId"]["txId"]
+                                    .as_str()
+                                    .map(|t| t == tx_id_filter.as_str())
+                                    .unwrap_or(false);
+                                if let Some(idx_filter) = governance_action_index {
+                                    let idx_matches = p["actionId"]["govActionIx"]
+                                        .as_u64()
+                                        .map(|i| i == idx_filter as u64)
+                                        .unwrap_or(false);
+                                    id_matches && idx_matches
+                                } else {
+                                    id_matches
+                                }
+                            })
+                            .collect()
+                    } else {
+                        proposals
+                    };
+
+                let output = serde_json::to_string_pretty(&serde_json::Value::Array(filtered))?;
+
+                if let Some(path) = out_file {
+                    std::fs::write(&path, &output)?;
+                } else {
+                    println!("{output}");
+                }
+
                 Ok(())
             }
         }
