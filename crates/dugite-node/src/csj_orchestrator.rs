@@ -289,7 +289,7 @@ impl CsjOrchestrator {
 
     // ─── Registration ─────────────────────────────────────────────────────────
 
-    async fn handle_registration(
+    pub async fn handle_registration(
         &mut self,
         addr: SocketAddr,
         latency_ms: Option<f64>,
@@ -385,7 +385,7 @@ impl CsjOrchestrator {
 
     // ─── Peer disconnection ───────────────────────────────────────────────────
 
-    async fn handle_peer_disconnected(&mut self, addr: SocketAddr) {
+    pub async fn handle_peer_disconnected(&mut self, addr: SocketAddr) {
         debug!(%addr, "CSJ: peer disconnected");
         let was_dynamo = self.dynamo_addr == Some(addr);
         self.peers.remove(&addr);
@@ -399,7 +399,7 @@ impl CsjOrchestrator {
 
     // ─── Dynamo tip advance → schedule jumps ─────────────────────────────────
 
-    async fn handle_dynamo_tip_advanced(
+    pub async fn handle_dynamo_tip_advanced(
         &mut self,
         addr: SocketAddr,
         tip_slot: u64,
@@ -466,7 +466,7 @@ impl CsjOrchestrator {
 
     // ─── Intersect found ──────────────────────────────────────────────────────
 
-    async fn handle_intersect_found(&mut self, addr: SocketAddr, found_point: Point) {
+    pub async fn handle_intersect_found(&mut self, addr: SocketAddr, found_point: Point) {
         debug!(%addr, ?found_point, "CSJ: intersect found");
         if let Some(h) = self.peers.get_mut(&addr) {
             if let Err(e) = h.jump_state.on_intersect_found(found_point.clone()) {
@@ -487,7 +487,7 @@ impl CsjOrchestrator {
 
     // ─── Intersect not found → promote to objector ────────────────────────────
 
-    async fn handle_intersect_not_found(&mut self, addr: SocketAddr) {
+    pub async fn handle_intersect_not_found(&mut self, addr: SocketAddr) {
         debug!(%addr, "CSJ: intersect not found — peer becomes objector");
 
         // Retrieve the bisection lo/hi bounds from the peer's LookingForIntersection state
@@ -547,7 +547,7 @@ impl CsjOrchestrator {
 
     // ─── Bisection complete → GDD comparison ─────────────────────────────────
 
-    async fn handle_bisection_complete(
+    pub async fn handle_bisection_complete(
         &mut self,
         addr: SocketAddr,
         fork_point: Point,
@@ -740,6 +740,67 @@ impl CsjOrchestrator {
         if let Err(msg) = check_dynamo_invariant(&states) {
             warn!("CSJ invariant violation: {msg}");
         }
+    }
+}
+
+// ─── Test-only accessor helpers ───────────────────────────────────────────────
+//
+// These methods are public so that integration test binaries (which are separate
+// compilation units from the library crate and cannot see `pub(crate)` items)
+// can reach them.  The `#[doc(hidden)]` attribute prevents them from showing up
+// in rustdoc.  Do not call these methods from production code.
+
+impl CsjOrchestrator {
+    /// Return the current dynamo address, if any.
+    pub fn test_dynamo_addr(&self) -> Option<SocketAddr> {
+        self.dynamo_addr
+    }
+
+    /// Return a snapshot of per-peer jump states for invariant checking.
+    pub fn test_peer_jump_states(&self) -> Vec<PeerJumpState> {
+        self.peers.values().map(|h| h.jump_state.clone()).collect()
+    }
+
+    /// Return `true` if `addr` is an objector.
+    pub fn test_is_objector(&self, addr: SocketAddr) -> bool {
+        self.peers
+            .get(&addr)
+            .map(|h| h.jump_state.is_objector())
+            .unwrap_or(false)
+    }
+
+    /// Return `true` if `addr` is disengaged.
+    pub fn test_is_disengaged(&self, addr: SocketAddr) -> bool {
+        self.peers
+            .get(&addr)
+            .map(|h| h.jump_state.is_disengaged())
+            .unwrap_or(false)
+    }
+
+    /// Set the dynamo tip directly (for GDD setup in tests).
+    pub fn test_set_dynamo_tip(&mut self, addr: SocketAddr, tip_slot: u64, tip_hash: [u8; 32]) {
+        if let Some(h) = self.peers.get_mut(&addr) {
+            h.dynamo_tip = Some((tip_slot, tip_hash));
+        }
+    }
+
+    /// Force-issue a jump instruction to a peer in `Happy` state (for tests).
+    ///
+    /// Returns `true` if the jump was successfully issued.
+    pub fn test_issue_jump(&mut self, addr: SocketAddr, slot: u64) -> bool {
+        use dugite_network::protocol::chainsync::jumping::EraParams;
+        let instr = JumpInstruction {
+            point: Point::Specific(slot, [slot as u8; 32]),
+            era_params: EraParams {
+                epoch_size: 432_000,
+                slot_length_ms: 1_000,
+                safe_zone: 60,
+            },
+        };
+        self.peers
+            .get_mut(&addr)
+            .map(|h| h.jump_state.on_jump_issued(&instr).is_ok())
+            .unwrap_or(false)
     }
 }
 
