@@ -33,6 +33,13 @@ parallel-verification = ["rayon"]
 # bisect path-dependent reward divergences (see issue #438 / #471).
 # Off by default — production builds incur zero overhead.
 reward-debug-dump = ["dep:serde_json"]
+# Compile in the per-epoch-boundary FULL ledger-state dumper.
+# When this feature is enabled, setting `DUGITE_EPOCH_STATE_DUMP=<dir>` at
+# runtime writes one JSON file per epoch boundary capturing nonce, UTxO,
+# stake-snapshot, pool, reward, and governance state for cross-validation
+# against `cardano-cli debug log-epoch-state` (tasks #21/#22/#23).
+# Off by default — production builds incur zero overhead.
+epoch-state-debug = ["dep:serde_json"]
 
 [dev-dependencies]
 serde_json = { workspace = true }
