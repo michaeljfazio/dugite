@@ -6,9 +6,43 @@ use crate::term::Term;
 
 #[derive(Debug, Clone)]
 pub enum Frame {
-    AwaitArg { function: Value, env: Env },
-    AwaitFunTerm { argument: Term, env: Env },
+    AwaitArg {
+        function: Value,
+        env: Env,
+    },
+    AwaitFunTerm {
+        argument: Term,
+        env: Env,
+    },
     Force,
+    /// `ApplyValue arg` — when the current return value lands, apply
+    /// it to `arg` (which is already an evaluated `Value`). Used by
+    /// `Case` dispatch to apply the matching branch to the
+    /// Constr-payload values in left-to-right order.
+    ApplyValue {
+        argument: Value,
+    },
+    /// `Constr tag pending_args evaluated_args env` — we're evaluating
+    /// the arguments of a `Constr` left-to-right. The next pending arg
+    /// is at `pending_args.front()`; already-evaluated args are kept
+    /// in order in `evaluated_args`.
+    ///
+    /// We use `Vec<Term>` for the pending list (popping from the front
+    /// via swap-remove or by tracking an offset would be cheaper, but
+    /// the SoP arg-count is small).
+    Constr {
+        tag: u64,
+        pending: Vec<Term>,
+        evaluated: Vec<Value>,
+        env: Env,
+    },
+    /// `Case branches env` — the scrutinee has been reduced to a
+    /// `Constr`; we pick a branch from `branches` indexed by the
+    /// constr tag, apply the constr args, and evaluate.
+    Cases {
+        branches: Vec<Term>,
+        env: Env,
+    },
 }
 
 #[derive(Debug, Clone, Default)]
