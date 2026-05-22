@@ -42,6 +42,7 @@
 //! `uplc = { git = aiken-lang/aiken.git }` workspace dep and the
 //! transitive `pallas-*` chain comes with it.
 
+use crate::cost_models::{decode_cost_models_cbor, CostModels};
 use crate::machine::cost::ExBudget;
 use dugite_primitives::transaction::{Transaction, TransactionInput, TransactionOutput};
 
@@ -65,7 +66,7 @@ pub struct SlotConfig {
 /// us aligned with the script-data-hash domain.
 //
 // Fields are read by tests in this module and will be consumed by UPLC-9
-// parts 2-4 (TxInfo population, ScriptContext build, CEK eval).
+// parts 3-4 (TxInfo population, ScriptContext build, CEK eval).
 #[allow(dead_code)]
 #[derive(Debug)]
 pub(crate) struct DecodedPhaseTwoInputs {
@@ -73,6 +74,11 @@ pub(crate) struct DecodedPhaseTwoInputs {
     pub tx: Transaction,
     /// The resolved UTxO entries: `(input, output, output_raw_cbor)` triples.
     pub utxos: Vec<(TransactionInput, TransactionOutput, Vec<u8>)>,
+    /// The per-Plutus-version cost-model coefficient arrays the ledger
+    /// supplied via `cost_models_cbor`. `None` when the caller passed
+    /// `cost_models_cbor: None` — the CEK machine falls back to its
+    /// per-step default cost from `machine::cost` in that case.
+    pub cost_models: Option<CostModels>,
 }
 
 /// Per-redeemer evaluation result. Returned by
@@ -151,7 +157,7 @@ impl RedeemerObserver for () {
 pub fn eval_phase_two_raw<O: RedeemerObserver>(
     tx_cbor: &[u8],
     utxos: &[(Vec<u8>, Vec<u8>)],
-    _cost_models_cbor: Option<&[u8]>,
+    cost_models_cbor: Option<&[u8]>,
     _initial_budget: (u64, u64),
     _slot_config: SlotConfig,
     _run_phase_one: bool,
@@ -160,7 +166,7 @@ pub fn eval_phase_two_raw<O: RedeemerObserver>(
     // Wire-up checklist before this returns Ok(...):
     //   1. Decode tx via dugite-serialization                ── DONE (UPLC-9 part 1)
     //   2. Decode UTxO entries                               ── DONE (UPLC-9 part 1)
-    //   3. Parse cost models per Plutus version              ── UPLC-9 part 2
+    //   3. Parse cost models per Plutus version              ── DONE (UPLC-9 part 2)
     //   4. Build per-version TxInfo                          ── UPLC-9 part 3
     //   5. For each redeemer:                                ── UPLC-9 part 4
     //      a. Resolve script (witness set or reference input)
@@ -168,12 +174,12 @@ pub fn eval_phase_two_raw<O: RedeemerObserver>(
     //      c. Build ScriptContext + encode to Data
     //      d. Apply args + evaluate via CEK with budget tracker
     //      e. Push RedeemerResult
-    let _decoded = decode_phase_two_inputs(tx_cbor, utxos)?;
+    let _decoded = decode_phase_two_inputs(tx_cbor, utxos, cost_models_cbor)?;
     Err(PhaseTwoError::NotImplemented)
 }
 
-/// Decode the wire-format inputs (`tx_cbor` + resolved-UTxO pairs) the ledger
-/// hands to [`eval_phase_two_raw`].
+/// Decode the wire-format inputs (`tx_cbor` + resolved-UTxO pairs + cost
+/// models) the ledger hands to [`eval_phase_two_raw`].
 ///
 /// The transaction is decoded by trying eras Conway → Babbage → Alonzo in turn
 /// (which covers every era that admits Plutus scripts). The first success
@@ -182,12 +188,17 @@ pub fn eval_phase_two_raw<O: RedeemerObserver>(
 /// era-agnostically (the `[tx_hash(32), index]` shape is era-invariant from
 /// Shelley onwards).
 ///
+/// `cost_models_cbor` is parsed via [`crate::cost_models::decode_cost_models_cbor`]
+/// when present. `None` means "no cost model configured" — downstream the CEK
+/// machine falls back to the per-step default cost from `machine::cost`.
+///
 /// On failure, returns a [`PhaseTwoError`] variant naming exactly which part
-/// could not be decoded (transaction body, input #N, or output #N) so the
-/// caller's logs surface the offending entry.
+/// could not be decoded (transaction body, input #N, output #N, or cost model)
+/// so the caller's logs surface the offending entry.
 pub(crate) fn decode_phase_two_inputs(
     tx_cbor: &[u8],
     utxos: &[(Vec<u8>, Vec<u8>)],
+    cost_models_cbor: Option<&[u8]>,
 ) -> Result<DecodedPhaseTwoInputs, PhaseTwoError> {
     let tx = decode_tx_multi_era(tx_cbor)?;
     let output_era_id = era_id_for_outputs(&tx);
@@ -200,9 +211,14 @@ pub(crate) fn decode_phase_two_inputs(
             .map_err(|e| PhaseTwoError::UtxoDecode(format!("utxo #{idx} output: {e}")))?;
         decoded_utxos.push((input, output, output_cbor.clone()));
     }
+    let cost_models = match cost_models_cbor {
+        Some(bytes) => Some(decode_cost_models_cbor(bytes)?),
+        None => None,
+    };
     Ok(DecodedPhaseTwoInputs {
         tx,
         utxos: decoded_utxos,
+        cost_models,
     })
 }
 
@@ -344,7 +360,7 @@ mod tests {
     #[test]
     fn decode_phase_two_inputs_lifts_minimal_conway_tx() {
         let tx_cbor = minimal_conway_tx_cbor();
-        let decoded = decode_phase_two_inputs(&tx_cbor, &[]).expect("decode");
+        let decoded = decode_phase_two_inputs(&tx_cbor, &[], None).expect("decode");
         assert_eq!(decoded.tx.era, Era::Conway);
         assert_eq!(decoded.tx.body.fee.0, 123_456);
         assert!(decoded.utxos.is_empty());
@@ -363,7 +379,7 @@ mod tests {
                 make_conway_map_output_cbor(2_500_000),
             ),
         ];
-        let decoded = decode_phase_two_inputs(&tx_cbor, &utxos).expect("decode");
+        let decoded = decode_phase_two_inputs(&tx_cbor, &utxos, None).expect("decode");
         assert_eq!(decoded.utxos.len(), 2);
         assert_eq!(decoded.utxos[0].0.index, 0);
         assert_eq!(decoded.utxos[0].1.value.coin.0, 1_000_000);
@@ -385,7 +401,7 @@ mod tests {
             ),
             (make_input_cbor(0x22, 1), vec![0xff]), // bogus
         ];
-        let err = decode_phase_two_inputs(&tx_cbor, &utxos).unwrap_err();
+        let err = decode_phase_two_inputs(&tx_cbor, &utxos, None).unwrap_err();
         let msg = err.to_string();
         assert!(
             msg.contains("utxo #1 output"),
@@ -397,22 +413,73 @@ mod tests {
     fn decode_phase_two_inputs_reports_failing_input() {
         let tx_cbor = minimal_conway_tx_cbor();
         let utxos = vec![(vec![0xff], make_conway_map_output_cbor(1))];
-        let err = decode_phase_two_inputs(&tx_cbor, &utxos).unwrap_err();
+        let err = decode_phase_two_inputs(&tx_cbor, &utxos, None).unwrap_err();
         let msg = err.to_string();
         assert!(msg.contains("utxo #0 input"), "got: {msg}");
     }
 
     #[test]
     fn decode_phase_two_inputs_rejects_empty_tx_cbor() {
-        let err = decode_phase_two_inputs(&[], &[]).unwrap_err();
+        let err = decode_phase_two_inputs(&[], &[], None).unwrap_err();
         assert!(matches!(err, PhaseTwoError::TxDecode(_)));
     }
 
     #[test]
     fn decode_phase_two_inputs_rejects_garbage_tx_cbor() {
         // None of the post-Alonzo era decoders accept a bare break byte.
-        let err = decode_phase_two_inputs(&[0xff], &[]).unwrap_err();
+        let err = decode_phase_two_inputs(&[0xff], &[], None).unwrap_err();
         assert!(matches!(err, PhaseTwoError::TxDecode(_)));
+    }
+
+    // ─────────────────────────────────────────────────────────────
+    // cost_models wire-through (UPLC-9 part 2)
+    // ─────────────────────────────────────────────────────────────
+
+    #[test]
+    fn decode_phase_two_inputs_threads_cost_models_when_supplied() {
+        use dugite_primitives::transaction::CostModels as PrimCostModels;
+        let prim = PrimCostModels {
+            plutus_v1: Some(vec![1, 2, 3]),
+            plutus_v2: Some(vec![4, 5]),
+            plutus_v3: Some(vec![6]),
+        };
+        let cm_cbor = prim.to_cbor().unwrap();
+        let tx_cbor = minimal_conway_tx_cbor();
+        let decoded = decode_phase_two_inputs(&tx_cbor, &[], Some(&cm_cbor)).expect("decode");
+        let cm = decoded.cost_models.expect("cost_models present");
+        assert_eq!(cm.plutus_v1.as_deref(), Some(&[1i64, 2, 3][..]));
+        assert_eq!(cm.plutus_v2.as_deref(), Some(&[4i64, 5][..]));
+        assert_eq!(cm.plutus_v3.as_deref(), Some(&[6i64][..]));
+    }
+
+    #[test]
+    fn decode_phase_two_inputs_none_cost_models_yields_none() {
+        let tx_cbor = minimal_conway_tx_cbor();
+        let decoded = decode_phase_two_inputs(&tx_cbor, &[], None).expect("decode");
+        assert!(decoded.cost_models.is_none());
+    }
+
+    #[test]
+    fn decode_phase_two_inputs_surfaces_cost_model_decode_failure() {
+        let tx_cbor = minimal_conway_tx_cbor();
+        // Bare break byte — not a map; decode_cost_models_cbor must fail.
+        let err = decode_phase_two_inputs(&tx_cbor, &[], Some(&[0xff])).unwrap_err();
+        assert!(matches!(err, PhaseTwoError::CostModelDecode(_)));
+    }
+
+    #[test]
+    fn eval_phase_two_raw_surfaces_cost_model_decode_failure() {
+        let tx_cbor = minimal_conway_tx_cbor();
+        let result = eval_phase_two_raw(
+            &tx_cbor,
+            &[],
+            Some(&[0xff]),
+            (1, 1),
+            default_slot_config(),
+            true,
+            &mut (),
+        );
+        assert!(matches!(result, Err(PhaseTwoError::CostModelDecode(_))));
     }
 
     // ─────────────────────────────────────────────────────────────

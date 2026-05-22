@@ -43,6 +43,7 @@
 #![cfg_attr(not(test), deny(clippy::panic, clippy::todo, clippy::unimplemented))]
 
 pub mod builtin;
+pub mod cost_models;
 pub mod data;
 pub mod flat;
 pub mod machine;
