@@ -487,7 +487,8 @@ pub(crate) fn decode_alonzo_tx_body(
         proposal_procedures: Vec::new(),    // Conway+
         treasury_value: None,
         donation: None,
-        sub_transactions: Vec::new(), // Dijkstra+
+        sub_transactions: Vec::new(),          // Dijkstra+
+        account_balance_intervals: Vec::new(), // Dijkstra+
     })
 }
 

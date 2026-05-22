@@ -3,7 +3,7 @@ use dugite_primitives::era::Era;
 use dugite_primitives::hash::{blake2b_256, Hash32};
 use dugite_primitives::transaction::*;
 
-use super::certificate::encode_certificate;
+use super::certificate::{encode_certificate, encode_credential};
 use super::governance::{encode_proposal_procedure, encode_voting_procedures};
 use super::script::{
     encode_bootstrap_witness, encode_metadata_map, encode_native_script, encode_redeemer_tag,
@@ -476,6 +476,14 @@ pub(super) fn encode_transaction_body_for_era(body: &TransactionBody, era: Era) 
     if emit_sub_transactions {
         count += 1;
     }
+    // Dijkstra TxBody key 26: account_balance_intervals (issue #475 Phase 3.3).
+    // Same `Omit null` discipline as key 23: only emitted on Dijkstra+ bodies
+    // that actually declare at least one interval.
+    let emit_account_balance_intervals =
+        era >= Era::Dijkstra && !body.account_balance_intervals.is_empty();
+    if emit_account_balance_intervals {
+        count += 1;
+    }
 
     let mut buf = encode_map_header(count);
 
@@ -645,6 +653,41 @@ pub(super) fn encode_transaction_body_for_era(body: &TransactionBody, era: Era) 
         }
     }
 
+    // 26: account_balance_intervals (Dijkstra+) — per-account balance
+    // predicate gating apply on reward-account balances. Wire shape:
+    //   map { stake_credential => [ coin / null, coin / null ] }
+    // The Haskell decoder rejects `[null, null]`; we mirror that in the
+    // decoder, so a defaulted `AccountBalanceInterval { lower: None, upper: None }`
+    // would round-trip to a decode failure. We don't proactively skip
+    // such entries here because the only way to construct one in-memory
+    // is via the public `AccountBalanceInterval::is_degenerate()` check,
+    // which callers should run first.
+    if emit_account_balance_intervals {
+        buf.extend(encode_uint(26));
+        buf.extend(encode_map_header(body.account_balance_intervals.len()));
+        for (cred, iv) in &body.account_balance_intervals {
+            buf.extend(encode_credential(cred));
+            buf.extend(encode_account_balance_interval(iv));
+        }
+    }
+
+    buf
+}
+
+/// Encode a single `AccountBalanceInterval` as a 2-element CBOR array
+/// `[lower, upper]`, with `null` for missing bounds.
+fn encode_account_balance_interval(
+    iv: &dugite_primitives::transaction::AccountBalanceInterval,
+) -> Vec<u8> {
+    let mut buf = encode_array_header(2);
+    match iv.lower {
+        Some(c) => buf.extend(encode_uint(c.0)),
+        None => buf.extend(encode_null()),
+    }
+    match iv.upper {
+        Some(c) => buf.extend(encode_uint(c.0)),
+        None => buf.extend(encode_null()),
+    }
     buf
 }
 
@@ -883,6 +926,7 @@ mod tests {
             treasury_value: None,
             donation: None,
             sub_transactions: vec![],
+            account_balance_intervals: vec![],
         }
     }
 
@@ -1698,6 +1742,154 @@ mod tests {
                 || msg.contains("array(4)")
                 || msg.to_lowercase().contains("dijkstra"),
             "error should explain the array-shape mismatch, got: {msg}"
+        );
+    }
+
+    // ── Dijkstra TxBody key 26: account_balance_intervals (issue #475 Phase 3.3) ──
+
+    /// Per-account balance interval predicates round-trip through the
+    /// Dijkstra encoder / decoder. Pins:
+    ///
+    /// 1. Encoder emits a `map { stake_credential => [ coin/null, coin/null ] }`
+    ///    keyed under TxBody key 26 ONLY when era >= Dijkstra AND the list is
+    ///    non-empty (matches Haskell `Omit null`).
+    /// 2. Decoder recovers the same ordered list back into
+    ///    `TransactionBody.account_balance_intervals` for a Dijkstra body.
+    /// 3. The Conway encoder NEVER emits key 26 even when the field is
+    ///    populated in-memory.
+    /// 4. The decoder rejects `[null, null]` matching the Haskell
+    ///    `DecoderErrorCustom "AccountBalanceInterval" "Both interval bounds cannot be nil."`
+    #[test]
+    fn account_balance_intervals_roundtrip_dijkstra() {
+        use dugite_primitives::credentials::Credential;
+        use dugite_primitives::era::Era;
+        use dugite_primitives::transaction::AccountBalanceInterval;
+
+        let key_cred = Credential::VerificationKey(Hash28::from_bytes([0xAA; 28]));
+        let script_cred = Credential::Script(Hash28::from_bytes([0xBB; 28]));
+
+        // Three interval shapes:
+        //  - both bounds: [100, 200)
+        //  - lower only:  >= 1_000_000
+        //  - upper only:  < 5
+        let intervals = vec![
+            (
+                key_cred.clone(),
+                AccountBalanceInterval::closed_open(Lovelace(100), Lovelace(200)),
+            ),
+            (
+                script_cred.clone(),
+                AccountBalanceInterval::at_least(Lovelace(1_000_000)),
+            ),
+            (
+                Credential::VerificationKey(Hash28::from_bytes([0xCC; 28])),
+                AccountBalanceInterval::below(Lovelace(5)),
+            ),
+        ];
+
+        let mut body = minimal_body();
+        body.account_balance_intervals = intervals.clone();
+
+        // (1) Dijkstra encoder MUST emit key 26.
+        let cbor = encode_transaction_body_for_era(&body, Era::Dijkstra);
+        // Sentinel: key 26 = 0x18 0x1a (uint major-0 followed by single-byte 26).
+        assert!(
+            cbor.windows(2).any(|w| w == [0x18, 0x1a]),
+            "Dijkstra encoder must emit TxBody key 26 (0x18 0x1a sentinel) when \
+             account_balance_intervals is non-empty"
+        );
+
+        // (2) Round-trip through the Dijkstra-routed decoder.
+        // We construct a full standalone Dijkstra tx so the public
+        // `decode_transaction(7, ..)` entry point exercises this path
+        // end-to-end (era_id=7 = Dijkstra).
+        let tx = Transaction {
+            era: Era::Dijkstra,
+            hash: Hash32::ZERO, // recomputed by decoder
+            body,
+            witness_set: empty_witness_set(),
+            is_valid: true,
+            auxiliary_data: None,
+            raw_cbor: None,
+            raw_body_cbor: None,
+            raw_witness_cbor: None,
+        };
+        let tx_cbor = encode_transaction(&tx);
+        let decoded = crate::decode::decode_transaction(7, &tx_cbor)
+            .expect("Dijkstra tx with account_balance_intervals must round-trip");
+        assert_eq!(decoded.era, Era::Dijkstra);
+        assert_eq!(
+            decoded.body.account_balance_intervals, intervals,
+            "decoded account_balance_intervals must match the encoded input exactly"
+        );
+
+        // (3) Conway encoder MUST NOT emit key 26 even with the field populated.
+        let mut conway_body = minimal_body();
+        conway_body.account_balance_intervals = intervals.clone();
+        let conway_cbor = encode_transaction_body_for_era(&conway_body, Era::Conway);
+        assert!(
+            !conway_cbor.windows(2).any(|w| w == [0x18, 0x1a]),
+            "Conway encoder MUST NOT emit TxBody key 26 (account_balance_intervals \
+             is Dijkstra-only) — found 0x18 0x1a sentinel in Conway output"
+        );
+
+        // (4) Empty list on Dijkstra: key 26 omitted (matches `Omit null`).
+        let mut empty_body = minimal_body();
+        empty_body.account_balance_intervals = vec![]; // explicit
+        let empty_cbor = encode_transaction_body_for_era(&empty_body, Era::Dijkstra);
+        assert!(
+            !empty_cbor.windows(2).any(|w| w == [0x18, 0x1a]),
+            "Dijkstra encoder MUST omit key 26 when account_balance_intervals is empty"
+        );
+    }
+
+    /// The decoder must reject `[null, null]` AccountBalanceInterval (mirrors
+    /// Haskell `DecoderErrorCustom "AccountBalanceInterval" "Both interval bounds cannot be nil."`).
+    /// We construct a hand-rolled CBOR body that puts key 26 = map(1) with a
+    /// single entry whose interval is `[null, null]`, and assert the
+    /// decoder errors out before reaching the rest of the body.
+    #[test]
+    fn account_balance_intervals_decoder_rejects_both_null() {
+        use crate::cbor::*;
+
+        // Build: body = map { 0: inputs, 1: outputs, 2: fee, 26: { cred => [null, null] } }
+        let mut buf = encode_map_header(4);
+        // 0: inputs — empty set (tag 258)
+        buf.extend(encode_uint(0));
+        buf.extend(encode_tag(258));
+        buf.extend(encode_array_header(0));
+        // 1: outputs — empty array
+        buf.extend(encode_uint(1));
+        buf.extend(encode_array_header(0));
+        // 2: fee
+        buf.extend(encode_uint(2));
+        buf.extend(encode_uint(0));
+        // 26: map(1) { vkey-cred => [null, null] }
+        buf.extend(encode_uint(26));
+        buf.extend(encode_map_header(1));
+        // credential = [0, hash28]
+        buf.extend(encode_array_header(2));
+        buf.extend(encode_uint(0));
+        buf.extend(encode_bytes(&[0u8; 28]));
+        // interval = [null, null]
+        buf.extend(encode_array_header(2));
+        buf.extend(encode_null());
+        buf.extend(encode_null());
+
+        // Wrap in a Dijkstra standalone tx: array(3)[body, ws, null].
+        let mut tx_cbor = encode_array_header(3);
+        tx_cbor.extend(&buf);
+        // empty witness set: map(0)
+        tx_cbor.extend(encode_map_header(0));
+        // null aux
+        tx_cbor.extend(encode_null());
+
+        let err = crate::decode::decode_transaction(7, &tx_cbor)
+            .expect_err("decoder must reject [null, null] AccountBalanceInterval");
+        let msg = format!("{err:?}");
+        assert!(
+            msg.contains("AccountBalanceInterval") || msg.contains("both bounds"),
+            "error should mention AccountBalanceInterval / both bounds, got: {msg}"
         );
     }
 }

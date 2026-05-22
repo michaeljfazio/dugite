@@ -233,6 +233,7 @@ mod tests {
             treasury_value: None,
             donation: None,
             sub_transactions: vec![],
+            account_balance_intervals: vec![],
         };
 
         let encoded = encode_transaction_body(&body);
@@ -277,6 +278,7 @@ mod tests {
             treasury_value: None,
             donation: None,
             sub_transactions: vec![],
+            account_balance_intervals: vec![],
         };
 
         // Hash should be deterministic
@@ -327,6 +329,7 @@ mod tests {
                 treasury_value: None,
                 donation: None,
                 sub_transactions: vec![],
+                account_balance_intervals: vec![],
             },
             witness_set: TransactionWitnessSet {
                 vkey_witnesses: vec![],

@@ -445,6 +445,15 @@ fn decode_conway_tx_body(r: &mut Reader<'_>) -> Result<TransactionBody, Serializ
     // when a Dijkstra-shaped body carries the field. Conway bodies never
     // emit key 23 so this stays empty for them.
     let mut sub_transactions: Vec<dugite_primitives::transaction::SubTransaction> = Vec::new();
+    // Dijkstra TxBody key 26 — account_balance_intervals (issue #475 Phase 3.3).
+    // Map { stake_credential => AccountBalanceInterval }. Same nuance as
+    // sub_transactions: only Dijkstra bodies emit it, but the same decoder
+    // covers both eras so the field is parsed here and dispatched to the
+    // (currently empty for Conway) `account_balance_intervals` field.
+    let mut account_balance_intervals: Vec<(
+        dugite_primitives::credentials::Credential,
+        dugite_primitives::transaction::AccountBalanceInterval,
+    )> = Vec::new();
 
     let map_len = r.read_map_header()?;
     let n_entries = match map_len {
@@ -563,6 +572,15 @@ fn decode_conway_tx_body(r: &mut Reader<'_>) -> Result<TransactionBody, Serializ
                 // `eras/dijkstra/impl/.../TxBody.hs` (key 23 emitter).
                 sub_transactions = decode_sub_transactions(r)?;
             }
+            26 => {
+                // Dijkstra account_balance_intervals (issue #475 Phase 3.3):
+                //   { stake_credential => AccountBalanceInterval }
+                // Wire shape per
+                // `Cardano.Ledger.Dijkstra.Scripts.AccountBalanceInterval`:
+                // each value is a CBOR `array(2)` of two `coin / null`
+                // entries — `[lower, upper]` — with at least one non-null.
+                account_balance_intervals = decode_account_balance_intervals(r)?;
+            }
             6 => {
                 // update (pre-Conway field) — skip in Conway
                 r.skip()?;
@@ -596,7 +614,8 @@ fn decode_conway_tx_body(r: &mut Reader<'_>) -> Result<TransactionBody, Serializ
         proposal_procedures,
         treasury_value,
         donation,
-        sub_transactions, // Dijkstra+ only; empty for Conway-shaped bodies
+        sub_transactions,          // Dijkstra+ only; empty for Conway-shaped bodies
+        account_balance_intervals, // Dijkstra+ only; empty for Conway-shaped bodies
     })
 }
 
@@ -737,6 +756,98 @@ fn decode_sub_tx_body(
         }
     }
     Ok(sub)
+}
+
+/// Decode Dijkstra TxBody key 26 — `account_balance_intervals`.
+///
+/// Wire shape (mirrors `Cardano.Ledger.Dijkstra.Scripts.AccountBalanceIntervals`):
+///
+/// ```text
+/// map { stake_credential => account_balance_interval }
+/// account_balance_interval = [ coin / null, coin / null ]
+/// ```
+///
+/// The Haskell decoder rejects intervals where **both** bounds are `null`
+/// (`AccountBalanceInterval "Both interval bounds cannot be nil."`); we
+/// surface the same rejection here.
+///
+/// See issue #475 Phase 3.3 — UTXO predicate `AccountBalanceOutOfRange`.
+fn decode_account_balance_intervals(
+    r: &mut Reader<'_>,
+) -> Result<
+    Vec<(
+        dugite_primitives::credentials::Credential,
+        dugite_primitives::transaction::AccountBalanceInterval,
+    )>,
+    SerializationError,
+> {
+    use dugite_primitives::transaction::AccountBalanceInterval;
+
+    let len = r.read_map_header()?;
+    let mut out: Vec<(_, AccountBalanceInterval)> = match len {
+        Some(n) => Vec::with_capacity(n.min(1024) as usize),
+        None => Vec::new(),
+    };
+    let total: i64 = len.map(|n| n as i64).unwrap_or(-1);
+    let mut i: i64 = 0;
+    loop {
+        if total >= 0 && i >= total {
+            break;
+        }
+        if total < 0 {
+            let ty = r.peek_major()?;
+            if ty == minicbor::data::Type::Break {
+                r.skip()?;
+                break;
+            }
+        }
+        i += 1;
+
+        let cred = read_stake_credential(r)?;
+        let interval = decode_account_balance_interval(r)?;
+        out.push((cred, interval));
+    }
+    Ok(out)
+}
+
+/// Decode a single `AccountBalanceInterval` — a 2-element CBOR array
+/// `[lower, upper]` of `coin / null`.
+fn decode_account_balance_interval(
+    r: &mut Reader<'_>,
+) -> Result<dugite_primitives::transaction::AccountBalanceInterval, SerializationError> {
+    use dugite_primitives::transaction::AccountBalanceInterval;
+    use dugite_primitives::value::Lovelace;
+
+    let arr_len = r.read_array_header()?;
+    if !matches!(arr_len, Some(2)) {
+        return Err(SerializationError::CborDecode(format!(
+            "AccountBalanceInterval: expected array(2), got {arr_len:?}"
+        )));
+    }
+
+    // Helper: read an optional Coin — either null (skipped) or uint.
+    let read_opt_coin = |r: &mut Reader<'_>| -> Result<Option<Lovelace>, SerializationError> {
+        let ty = r.peek_major()?;
+        if ty == minicbor::data::Type::Null {
+            r.read_null()?;
+            Ok(None)
+        } else {
+            Ok(Some(Lovelace(r.read_uint()?)))
+        }
+    };
+
+    let lower = read_opt_coin(r)?;
+    let upper = read_opt_coin(r)?;
+
+    if lower.is_none() && upper.is_none() {
+        // Mirror Haskell `Cardano.Ledger.Dijkstra.Scripts`:
+        //   "Both interval bounds cannot be nil."
+        return Err(SerializationError::CborDecode(
+            "AccountBalanceInterval: both bounds cannot be nil".to_string(),
+        ));
+    }
+
+    Ok(AccountBalanceInterval { lower, upper })
 }
 
 fn read_tx_input(r: &mut Reader<'_>) -> Result<TransactionInput, SerializationError> {

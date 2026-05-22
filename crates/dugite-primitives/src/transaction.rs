@@ -735,6 +735,7 @@ impl Transaction {
                 treasury_value: None,
                 donation: None,
                 sub_transactions: vec![],
+                account_balance_intervals: vec![],
             },
             witness_set: TransactionWitnessSet {
                 vkey_witnesses: vec![],
@@ -796,6 +797,22 @@ pub struct TransactionBody {
     /// See issue #475 Phase 3.1.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub sub_transactions: Vec<SubTransaction>,
+    /// Dijkstra (PV12+) only: per-account balance interval predicates
+    /// (TxBody key 26 — `account_balance_intervals`).
+    ///
+    /// Each entry asserts that the reward-account balance of the listed
+    /// stake [`Credential`] lies within the declared interval at the moment
+    /// the tx is applied (UTXO predicate `AccountBalanceOutOfRange`). The
+    /// interval is `[lower, upper)` — lower bound inclusive, upper bound
+    /// exclusive — matching `Cardano.Ledger.Dijkstra.Scripts.AccountBalanceInterval`.
+    /// At least one of `lower` / `upper` MUST be `Some`; the decoder rejects
+    /// `[null, null]` and the encoder skips key 26 entirely when the list
+    /// is empty (matching Haskell's `Omit null`).
+    ///
+    /// See issue #475 Phase 3.3 / cardano-ledger
+    /// `eras/dijkstra/impl/src/Cardano/Ledger/Dijkstra/TxBody.hs` (key 26).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub account_balance_intervals: Vec<(Credential, AccountBalanceInterval)>,
 }
 
 impl Default for TransactionBody {
@@ -823,7 +840,86 @@ impl Default for TransactionBody {
             treasury_value: None,
             donation: None,
             sub_transactions: Vec::new(),
+            account_balance_intervals: Vec::new(),
         }
+    }
+}
+
+/// Per-account balance predicate for Dijkstra TxBody key 26
+/// (`account_balance_intervals`).
+///
+/// Wire shape (matches upstream `Cardano.Ledger.Dijkstra.Scripts.AccountBalanceInterval`):
+/// a 2-element CBOR array `[lower, upper]` where each element is either a
+/// `Coin` (uint) or CBOR `null`. The Haskell decoder rejects `[null, null]`.
+///
+/// Semantics:
+/// - `lower` is **inclusive** (`Inclusive Coin` in Haskell)
+/// - `upper` is **exclusive** (`Exclusive Coin` in Haskell)
+///
+/// The UTXO predicate is `lower <= balance && balance < upper` (with each
+/// half skipped when its bound is `None`). A balance that falls outside the
+/// declared interval triggers `AccountBalanceOutOfRange` at apply time.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize, Default)]
+pub struct AccountBalanceInterval {
+    /// Inclusive lower bound. `None` encodes as CBOR `null` (no floor).
+    pub lower: Option<Lovelace>,
+    /// Exclusive upper bound. `None` encodes as CBOR `null` (no ceiling).
+    pub upper: Option<Lovelace>,
+}
+
+impl AccountBalanceInterval {
+    /// Construct an interval with both bounds set.
+    pub fn closed_open(lower: Lovelace, upper: Lovelace) -> Self {
+        AccountBalanceInterval {
+            lower: Some(lower),
+            upper: Some(upper),
+        }
+    }
+
+    /// Construct an interval with only an inclusive lower bound.
+    pub fn at_least(lower: Lovelace) -> Self {
+        AccountBalanceInterval {
+            lower: Some(lower),
+            upper: None,
+        }
+    }
+
+    /// Construct an interval with only an exclusive upper bound.
+    pub fn below(upper: Lovelace) -> Self {
+        AccountBalanceInterval {
+            lower: None,
+            upper: Some(upper),
+        }
+    }
+
+    /// Check whether the supplied account balance satisfies this interval.
+    ///
+    /// Returns `true` iff:
+    ///   - `lower.is_none() || lower <= balance` AND
+    ///   - `upper.is_none() || balance < upper`
+    ///
+    /// Mirrors the UTXO predicate in
+    /// `Cardano.Ledger.Dijkstra.Rules.Utxo` (Phase 3.3 of issue #475).
+    pub fn contains(&self, balance: Lovelace) -> bool {
+        if let Some(lo) = self.lower {
+            if balance < lo {
+                return false;
+            }
+        }
+        if let Some(hi) = self.upper {
+            if balance >= hi {
+                return false;
+            }
+        }
+        true
+    }
+
+    /// Whether the interval is degenerate (both bounds `None`).
+    ///
+    /// The Haskell decoder rejects this case; provided here so callers
+    /// constructing intervals in-memory can validate before serialising.
+    pub fn is_degenerate(&self) -> bool {
+        self.lower.is_none() && self.upper.is_none()
     }
 }
 
@@ -1357,5 +1453,66 @@ mod tests {
         assert!(tx.raw_witness_cbor.is_none());
         assert!(tx.witness_set.vkey_witnesses.is_empty());
         assert!(tx.witness_set.redeemers.is_empty());
+    }
+
+    // ── AccountBalanceInterval (Dijkstra TxBody key 26) ────────────────────
+
+    #[test]
+    fn account_balance_interval_closed_open_contains_lower_excludes_upper() {
+        let iv = AccountBalanceInterval::closed_open(Lovelace(100), Lovelace(200));
+        // Lower bound is inclusive.
+        assert!(iv.contains(Lovelace(100)), "lower bound is inclusive");
+        // Interior.
+        assert!(iv.contains(Lovelace(150)));
+        assert!(iv.contains(Lovelace(199)));
+        // Upper bound is EXCLUSIVE — matches Haskell `Exclusive Coin`.
+        assert!(!iv.contains(Lovelace(200)), "upper bound is exclusive");
+        assert!(!iv.contains(Lovelace(99)));
+        assert!(!iv.contains(Lovelace(201)));
+    }
+
+    #[test]
+    fn account_balance_interval_at_least_unbounded_above() {
+        let iv = AccountBalanceInterval::at_least(Lovelace(100));
+        assert!(iv.contains(Lovelace(100)));
+        assert!(iv.contains(Lovelace(u64::MAX)));
+        assert!(!iv.contains(Lovelace(99)));
+    }
+
+    #[test]
+    fn account_balance_interval_below_unbounded_below() {
+        let iv = AccountBalanceInterval::below(Lovelace(100));
+        assert!(iv.contains(Lovelace(0)));
+        assert!(iv.contains(Lovelace(99)));
+        assert!(!iv.contains(Lovelace(100)), "100 is excluded by upper");
+    }
+
+    #[test]
+    fn account_balance_interval_is_degenerate_detects_double_null() {
+        // The Haskell decoder rejects [null, null] — we surface it via
+        // `is_degenerate` so encoders / validators can catch it before
+        // emitting wire bytes that would round-trip to a decode failure.
+        let degenerate = AccountBalanceInterval {
+            lower: None,
+            upper: None,
+        };
+        assert!(degenerate.is_degenerate());
+        assert!(!AccountBalanceInterval::at_least(Lovelace(1)).is_degenerate());
+        assert!(!AccountBalanceInterval::below(Lovelace(1)).is_degenerate());
+        assert!(!AccountBalanceInterval::closed_open(Lovelace(1), Lovelace(2)).is_degenerate());
+    }
+
+    #[test]
+    fn account_balance_interval_serde_roundtrip() {
+        let cases = vec![
+            AccountBalanceInterval::closed_open(Lovelace(1), Lovelace(2)),
+            AccountBalanceInterval::at_least(Lovelace(123)),
+            AccountBalanceInterval::below(Lovelace(456)),
+        ];
+        for iv in cases {
+            let j = serde_json::to_string(&iv).unwrap();
+            let round: AccountBalanceInterval = serde_json::from_str(&j).unwrap();
+            assert_eq!(iv, round);
+        }
     }
 }

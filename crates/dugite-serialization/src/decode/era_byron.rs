@@ -286,6 +286,7 @@ fn decode_byron_tx(
         treasury_value: None,
         donation: None,
         sub_transactions: Vec::new(),
+        account_balance_intervals: Vec::new(),
     };
 
     Ok(Transaction {

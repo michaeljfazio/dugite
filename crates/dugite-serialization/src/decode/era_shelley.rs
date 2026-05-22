@@ -470,7 +470,8 @@ fn decode_shelley_tx_body(r: &mut Reader<'_>) -> Result<TransactionBody, Seriali
         proposal_procedures: Vec::new(),    // Conway+
         treasury_value: None,
         donation: None,
-        sub_transactions: Vec::new(), // Dijkstra+
+        sub_transactions: Vec::new(),          // Dijkstra+
+        account_balance_intervals: Vec::new(), // Dijkstra+
     })
 }
 
