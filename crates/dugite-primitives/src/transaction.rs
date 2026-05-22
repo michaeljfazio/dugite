@@ -82,6 +82,13 @@ pub enum ScriptRef {
     PlutusV1(Vec<u8>),
     PlutusV2(Vec<u8>),
     PlutusV3(Vec<u8>),
+    /// PlutusV4 (Dijkstra era, language tag 4, hash prefix `\x04`).
+    ///
+    /// Initial Dijkstra rollout: same wire shape as V3 — `bstr(flat_program)`.
+    /// Cost-model slot 3 governs evaluation; the slot is initialised identical
+    /// to V3 per upstream (`IntersectMBO/cardano-ledger:eras/dijkstra/impl`).
+    /// See issue #475 Phase 5.
+    PlutusV4(Vec<u8>),
 }
 
 /// Native script (multi-sig and time-lock)
@@ -561,20 +568,31 @@ pub struct ProtocolParamUpdate {
 }
 
 /// Plutus cost models
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CostModels {
     pub plutus_v1: Option<Vec<i64>>,
     pub plutus_v2: Option<Vec<i64>>,
     pub plutus_v3: Option<Vec<i64>>,
+    /// PlutusV4 cost model (Dijkstra era, CBOR map slot 3).
+    ///
+    /// Initially identical to `plutus_v3` per upstream
+    /// (`eras/dijkstra/impl/src/Cardano/Ledger/Dijkstra/PParams.hs`); the
+    /// separate slot exists so a future ParameterChange action can
+    /// independently re-tune V4 without touching V3. Issue #475 Phase 5.
+    pub plutus_v4: Option<Vec<i64>>,
 }
 
 impl CostModels {
     /// Encode cost models to CBOR bytes for the uplc evaluator.
     ///
-    /// The encoding is a CBOR map: {0: [v1_costs...], 1: [v2_costs...], 2: [v3_costs...]}
+    /// The encoding is a CBOR map keyed by Plutus language version:
+    /// `{0: [v1_costs...], 1: [v2_costs...], 2: [v3_costs...], 3: [v4_costs...]}`.
+    /// Absent versions are simply omitted from the map.
     pub fn to_cbor(&self) -> Option<Vec<u8>> {
-        let has_any =
-            self.plutus_v1.is_some() || self.plutus_v2.is_some() || self.plutus_v3.is_some();
+        let has_any = self.plutus_v1.is_some()
+            || self.plutus_v2.is_some()
+            || self.plutus_v3.is_some()
+            || self.plutus_v4.is_some();
         if !has_any {
             return None;
         }
@@ -585,10 +603,15 @@ impl CostModels {
 
         // Safety: minicbor encoding to Vec<u8> is infallible (cannot fail on memory writes).
         // All expect() calls below use the same "infallible" message for this reason.
-        let count = [&self.plutus_v1, &self.plutus_v2, &self.plutus_v3]
-            .iter()
-            .filter(|m| m.is_some())
-            .count();
+        let count = [
+            &self.plutus_v1,
+            &self.plutus_v2,
+            &self.plutus_v3,
+            &self.plutus_v4,
+        ]
+        .iter()
+        .filter(|m| m.is_some())
+        .count();
         enc.map(count as u64).expect("infallible: Vec<u8> write");
 
         if let Some(v1) = &self.plutus_v1 {
@@ -612,6 +635,14 @@ impl CostModels {
             enc.array(v3.len() as u64)
                 .expect("infallible: Vec<u8> write");
             for cost in v3 {
+                enc.i64(*cost).expect("infallible: Vec<u8> write");
+            }
+        }
+        if let Some(v4) = &self.plutus_v4 {
+            enc.u32(3).expect("infallible: Vec<u8> write");
+            enc.array(v4.len() as u64)
+                .expect("infallible: Vec<u8> write");
+            for cost in v4 {
                 enc.i64(*cost).expect("infallible: Vec<u8> write");
             }
         }
@@ -1082,11 +1113,7 @@ mod tests {
 
     #[test]
     fn test_cost_models_to_cbor_all_none() {
-        let cm = CostModels {
-            plutus_v1: None,
-            plutus_v2: None,
-            plutus_v3: None,
-        };
+        let cm = CostModels::default();
         assert!(cm.to_cbor().is_none());
     }
 
@@ -1094,8 +1121,7 @@ mod tests {
     fn test_cost_models_to_cbor_v1_only() {
         let cm = CostModels {
             plutus_v1: Some(vec![1, 2, 3]),
-            plutus_v2: None,
-            plutus_v3: None,
+            ..Default::default()
         };
         let cbor = cm.to_cbor().expect("should produce CBOR");
         // Decode and verify: should be a map with key 0
@@ -1116,25 +1142,67 @@ mod tests {
             plutus_v1: Some(vec![10]),
             plutus_v2: Some(vec![20]),
             plutus_v3: Some(vec![30]),
+            plutus_v4: Some(vec![40]),
         };
         let cbor = cm.to_cbor().expect("should produce CBOR");
         let mut dec = minicbor::Decoder::new(&cbor);
         let map_len = dec.map().unwrap().unwrap();
-        assert_eq!(map_len, 3);
+        assert_eq!(map_len, 4);
     }
 
     #[test]
     fn test_cost_models_to_cbor_v3_only() {
         let cm = CostModels {
-            plutus_v1: None,
-            plutus_v2: None,
             plutus_v3: Some(vec![-1, 0, 100]),
+            ..Default::default()
         };
         let cbor = cm.to_cbor().expect("should produce CBOR");
         let mut dec = minicbor::Decoder::new(&cbor);
         let map_len = dec.map().unwrap().unwrap();
         assert_eq!(map_len, 1);
         assert_eq!(dec.u32().unwrap(), 2); // key for v3
+    }
+
+    /// PlutusV4 cost-model slot encodes at key 3 (Dijkstra; issue #475 Phase 5).
+    #[test]
+    fn test_cost_models_to_cbor_v4_only() {
+        let cm = CostModels {
+            plutus_v4: Some(vec![1, 2, 3]),
+            ..Default::default()
+        };
+        let cbor = cm
+            .to_cbor()
+            .expect("V4-only cost model should produce CBOR");
+        let mut dec = minicbor::Decoder::new(&cbor);
+        let map_len = dec.map().unwrap().unwrap();
+        assert_eq!(map_len, 1, "V4-only encoding is map(1)");
+        assert_eq!(dec.u32().unwrap(), 3, "PlutusV4 occupies cost-model slot 3");
+        let arr_len = dec.array().unwrap().unwrap();
+        assert_eq!(arr_len, 3);
+        assert_eq!(dec.i64().unwrap(), 1);
+        assert_eq!(dec.i64().unwrap(), 2);
+        assert_eq!(dec.i64().unwrap(), 3);
+    }
+
+    /// All four versions present: map(4) ordered by key 0/1/2/3.
+    #[test]
+    fn test_cost_models_to_cbor_v1_v2_v3_v4_ordering() {
+        let cm = CostModels {
+            plutus_v1: Some(vec![1]),
+            plutus_v2: Some(vec![2]),
+            plutus_v3: Some(vec![3]),
+            plutus_v4: Some(vec![4]),
+        };
+        let cbor = cm.to_cbor().expect("4-version cost model");
+        let mut dec = minicbor::Decoder::new(&cbor);
+        assert_eq!(dec.map().unwrap().unwrap(), 4);
+        // Keys appear in 0, 1, 2, 3 order because `to_cbor` writes them
+        // in source order; the V4 slot occupies the last entry.
+        for expected_key in 0..=3u32 {
+            assert_eq!(dec.u32().unwrap(), expected_key);
+            assert_eq!(dec.array().unwrap().unwrap(), 1);
+            assert_eq!(dec.i64().unwrap(), (expected_key as i64) + 1);
+        }
     }
 
     // ========== DRep::credential_hash32 ==========
