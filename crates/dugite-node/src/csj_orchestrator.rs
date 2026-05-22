@@ -53,6 +53,8 @@ use dugite_network::protocol::chainsync::jumping::{
     bisect_midpoint, check_dynamo_invariant, JumpInstruction, JumpState, JumperState, PeerJumpState,
 };
 
+use crate::gsm::{CsjObjectionOutcome, GsmEvent};
+
 // ─── Timing constants ──────────────────────────────────────────────────────────
 
 /// Haskell `csjReprocessLoEDelay`: grace period before demoting a stalled dynamo.
@@ -212,16 +214,33 @@ pub struct CsjOrchestrator {
     /// Channel senders for registering new peers.
     /// New senders arrive via a secondary mpsc — peers call `register_peer`.
     registration_rx: PeerRegistrationReceiver,
+    /// Optional sender to the GSM actor.
+    ///
+    /// When set, the orchestrator forwards CSJ events (`JumpAgreed`,
+    /// `ObjectionRaised`, `ObjectionResolved`) to the GSM so it can
+    /// enforce the LoP (Limit on Patience) gate on the `Syncing → CaughtUp`
+    /// transition.  `None` when genesis mode is disabled.
+    gsm_tx: Option<mpsc::Sender<GsmEvent>>,
 }
 
 impl CsjOrchestrator {
     /// Create a new orchestrator and return it along with its public channels.
     ///
+    /// # Arguments
+    ///
+    /// - `config`: CSJ configuration (k, f).
+    /// - `gsm_tx`: optional sender to the GSM actor.  Pass `Some(tx)` when
+    ///   genesis mode is enabled so that CSJ events are forwarded to the GSM
+    ///   for LoP enforcement.  Pass `None` when genesis mode is disabled.
+    ///
     /// # Returns
     /// `(orchestrator, event_tx, register_tx)`
     /// - `event_tx` — clone and give to each peer task to send [`PeerEvent`]s.
     /// - `register_tx` — call once per peer to register its instruction channel.
-    pub fn new(config: CsjConfig) -> (Self, mpsc::Sender<PeerEvent>, PeerRegistrationSender) {
+    pub fn new(
+        config: CsjConfig,
+        gsm_tx: Option<mpsc::Sender<GsmEvent>>,
+    ) -> (Self, mpsc::Sender<PeerEvent>, PeerRegistrationSender) {
         let (event_tx, event_rx) = mpsc::channel(256);
         let (registration_tx, registration_rx) = mpsc::channel(64);
         let orchestrator = Self {
@@ -230,6 +249,7 @@ impl CsjOrchestrator {
             peers: HashMap::new(),
             dynamo_addr: None,
             registration_rx,
+            gsm_tx,
         };
         (orchestrator, event_tx, registration_tx)
     }
@@ -449,7 +469,7 @@ impl CsjOrchestrator {
     async fn handle_intersect_found(&mut self, addr: SocketAddr, found_point: Point) {
         debug!(%addr, ?found_point, "CSJ: intersect found");
         if let Some(h) = self.peers.get_mut(&addr) {
-            if let Err(e) = h.jump_state.on_intersect_found(found_point) {
+            if let Err(e) = h.jump_state.on_intersect_found(found_point.clone()) {
                 warn!(%addr, error=%e, "CSJ: on_intersect_found transition failed");
                 return;
             }
@@ -458,6 +478,11 @@ impl CsjOrchestrator {
                 warn!(%addr, error=%e, "CSJ: acknowledge transition failed");
             }
         }
+        // Inform the GSM that this peer agreed to the jump point.
+        self.emit_gsm(GsmEvent::JumpAgreed {
+            peer: addr,
+            point: found_point,
+        });
     }
 
     // ─── Intersect not found → promote to objector ────────────────────────────
@@ -465,25 +490,27 @@ impl CsjOrchestrator {
     async fn handle_intersect_not_found(&mut self, addr: SocketAddr) {
         debug!(%addr, "CSJ: intersect not found — peer becomes objector");
 
-        // Retrieve the bisection hi bound from the peer's LookingForIntersection state.
-        let bisect_mid = if let Some(h) = self.peers.get(&addr) {
+        // Retrieve the bisection lo/hi bounds from the peer's LookingForIntersection state
+        // and compute the midpoint for the next bisection step.
+        let (bisect_mid, lo_point, hi_point) = if let Some(h) = self.peers.get(&addr) {
             match &h.jump_state.state {
                 JumpState::Jumper(JumperState::LookingForIntersection { lo, hi }) => {
-                    bisect_midpoint(lo, hi)
+                    let mid = bisect_midpoint(lo, hi);
+                    (mid, lo.clone(), hi.clone())
                 }
                 other => {
                     warn!(%addr, ?other, "CSJ: IntersectNotFound in unexpected state");
-                    None
+                    (None, Point::Origin, Point::Origin)
                 }
             }
         } else {
-            None
+            (None, Point::Origin, Point::Origin)
         };
 
         // Compute a midpoint bisection point.
         let dissenting_point = match bisect_mid {
             Some(mid_slot) => {
-                // Use the dynamo's hash as placeholder; Phase C will use the
+                // Use the dynamo's hash as placeholder; Phase D will use the
                 // chain-fragment hash at `mid_slot`.
                 let hash = self
                     .dynamo_addr
@@ -508,6 +535,14 @@ impl CsjOrchestrator {
                 warn!(%addr, error=%e, "CSJ: on_intersect_not_found transition failed");
             }
         }
+
+        // Inform the GSM that this peer has raised an objection.
+        // The GSM uses this to block the Syncing → CaughtUp transition (LoP gate).
+        self.emit_gsm(GsmEvent::ObjectionRaised {
+            peer: addr,
+            lo: lo_point,
+            hi: hi_point,
+        });
     }
 
     // ─── Bisection complete → GDD comparison ─────────────────────────────────
@@ -588,6 +623,16 @@ impl CsjOrchestrator {
                 let _ = h.tx.send(PeerInstruction::Disengage).await;
             }
         }
+
+        // Inform the GSM that the objection is resolved.
+        let gsm_outcome = match decision {
+            OrchestratorDecision::AdoptDynamo => CsjObjectionOutcome::DynamoWins,
+            OrchestratorDecision::KeepObjector => CsjObjectionOutcome::ObjectorWins,
+        };
+        self.emit_gsm(GsmEvent::ObjectionResolved {
+            peer: addr,
+            outcome: gsm_outcome,
+        });
 
         // Respond to the peer task (ignore send errors — peer may have died).
         let _ = response.send(decision);
@@ -674,6 +719,20 @@ impl CsjOrchestrator {
         }
     }
 
+    // ─── GSM forwarding helper ────────────────────────────────────────────────
+
+    /// Forward a CSJ event to the GSM actor (fire-and-forget).
+    ///
+    /// Errors are logged and ignored — the GSM is best-effort; a dropped event
+    /// only delays a LoP state update by one polling cycle.
+    fn emit_gsm(&self, event: GsmEvent) {
+        if let Some(ref tx) = self.gsm_tx {
+            if tx.try_send(event).is_err() {
+                debug!("CSJ: GSM event channel full or closed — skipping LoP update");
+            }
+        }
+    }
+
     // ─── Invariant checks ─────────────────────────────────────────────────────
 
     fn assert_dynamo_invariant(&self) {
@@ -688,16 +747,24 @@ impl CsjOrchestrator {
 
 /// Spawn the CSJ orchestrator as a background tokio task.
 ///
+/// # Arguments
+///
+/// - `config`: CSJ configuration.
+/// - `cancel`: cancellation token — the task exits when cancelled.
+/// - `gsm_tx`: optional sender to the GSM actor for LoP enforcement.
+///   Pass `Some(tx)` when genesis mode is enabled.
+///
 /// Returns `(event_tx, register_tx, join_handle)`.
 pub fn spawn_csj_orchestrator(
     config: CsjConfig,
     cancel: CancellationToken,
+    gsm_tx: Option<mpsc::Sender<GsmEvent>>,
 ) -> (
     mpsc::Sender<PeerEvent>,
     PeerRegistrationSender,
     tokio::task::JoinHandle<()>,
 ) {
-    let (orchestrator, event_tx, register_tx) = CsjOrchestrator::new(config);
+    let (orchestrator, event_tx, register_tx) = CsjOrchestrator::new(config, gsm_tx);
     let handle = tokio::spawn(orchestrator.run(cancel));
     (event_tx, register_tx, handle)
 }
@@ -744,7 +811,7 @@ mod tests {
     async fn t1_single_peer_becomes_dynamo() {
         time::pause();
         let _cancel = CancellationToken::new();
-        let (orch, _event_tx, register_tx) = CsjOrchestrator::new(test_config());
+        let (orch, _event_tx, register_tx) = CsjOrchestrator::new(test_config(), None);
 
         // We do NOT spawn — drive the orchestrator manually via handle_registration.
         // (This avoids the complexity of racing with the background task in tests.)
@@ -779,7 +846,7 @@ mod tests {
     #[tokio::test]
     async fn t2_lowest_latency_elected_as_dynamo() {
         time::pause();
-        let (mut orch, _event_tx, _register_tx) = CsjOrchestrator::new(test_config());
+        let (mut orch, _event_tx, _register_tx) = CsjOrchestrator::new(test_config(), None);
 
         let (tx1, mut rx1) = mpsc::channel(16);
         let (tx2, mut rx2) = mpsc::channel(16);
@@ -820,7 +887,7 @@ mod tests {
     #[tokio::test]
     async fn t3_dynamo_tip_advance_schedules_jump() {
         time::pause();
-        let (mut orch, _event_tx, _register_tx) = CsjOrchestrator::new(test_config());
+        let (mut orch, _event_tx, _register_tx) = CsjOrchestrator::new(test_config(), None);
 
         let (tx_dynamo, mut rx_dynamo) = mpsc::channel(16);
         let (tx_jumper, mut rx_jumper) = mpsc::channel(16);
@@ -861,7 +928,7 @@ mod tests {
     #[tokio::test]
     async fn t4_intersect_not_found_becomes_objector() {
         time::pause();
-        let (mut orch, _event_tx, _register_tx) = CsjOrchestrator::new(test_config());
+        let (mut orch, _event_tx, _register_tx) = CsjOrchestrator::new(test_config(), None);
 
         let (tx_dynamo, mut rx_dynamo) = mpsc::channel(16);
         let (tx_jumper, _rx_jumper) = mpsc::channel(16);
@@ -902,7 +969,7 @@ mod tests {
     #[tokio::test]
     async fn t5_bisection_complete_dynamo_wins() {
         time::pause();
-        let (mut orch, _event_tx, _register_tx) = CsjOrchestrator::new(test_config());
+        let (mut orch, _event_tx, _register_tx) = CsjOrchestrator::new(test_config(), None);
 
         let (tx_dynamo, mut rx_dynamo) = mpsc::channel(16);
         let (tx_objector, _rx_objector) = mpsc::channel(16);
@@ -944,7 +1011,7 @@ mod tests {
     #[tokio::test]
     async fn t6_bisection_complete_objector_wins() {
         time::pause();
-        let (mut orch, _event_tx, _register_tx) = CsjOrchestrator::new(test_config());
+        let (mut orch, _event_tx, _register_tx) = CsjOrchestrator::new(test_config(), None);
 
         let (tx_dynamo, mut rx_dynamo) = mpsc::channel(16);
         let (tx_objector, mut rx_objector) = mpsc::channel(16);
@@ -1003,7 +1070,7 @@ mod tests {
     async fn t7_dynamo_stall_demotion() {
         let cancel = CancellationToken::new();
         let (event_tx, register_tx, _handle) =
-            spawn_csj_orchestrator(test_config(), cancel.clone());
+            spawn_csj_orchestrator(test_config(), cancel.clone(), None);
 
         // Register two peers; addr(1) has lower latency and will be elected.
         let mut rx1 = register_peer(&register_tx, addr(1), Some(50.0)).await;
@@ -1049,7 +1116,8 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn t8_all_peers_stall_no_deadlock() {
         let cancel = CancellationToken::new();
-        let (event_tx, register_tx, handle) = spawn_csj_orchestrator(test_config(), cancel.clone());
+        let (event_tx, register_tx, handle) =
+            spawn_csj_orchestrator(test_config(), cancel.clone(), None);
 
         // Register one peer.
         let _rx = register_peer(&register_tx, addr(1), None).await;
@@ -1075,7 +1143,7 @@ mod tests {
     #[tokio::test]
     async fn t9_three_peer_topology_exactly_one_dynamo() {
         time::pause();
-        let (mut orch, _event_tx, _register_tx) = CsjOrchestrator::new(test_config());
+        let (mut orch, _event_tx, _register_tx) = CsjOrchestrator::new(test_config(), None);
 
         let (tx1, mut rx1) = mpsc::channel(16);
         let (tx2, _rx2) = mpsc::channel(16);
@@ -1111,7 +1179,7 @@ mod tests {
     #[tokio::test]
     async fn t10_peer_disconnect_reconnect() {
         time::pause();
-        let (mut orch, _event_tx, _register_tx) = CsjOrchestrator::new(test_config());
+        let (mut orch, _event_tx, _register_tx) = CsjOrchestrator::new(test_config(), None);
 
         let (tx1, mut rx1) = mpsc::channel(16);
         orch.handle_registration(addr(1), Some(50.0), tx1).await;

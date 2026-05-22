@@ -501,6 +501,54 @@ impl DensityWindow {
     }
 }
 
+/// Snapshot of CSJ objector dissent data used to enrich GDD density comparisons.
+///
+/// When a CSJ jumper cannot find the dynamo's jump point on its own chain it
+/// becomes an *objector* and performs a binary-search bisection to locate the
+/// precise fork point.  At bisection completion the orchestrator has:
+///
+/// - The fork point (slot + hash) where the two chains diverge.
+/// - The number of blocks the objector's chain places in the genesis window
+///   above the fork point.
+/// - The estimated number of blocks the dynamo's chain places in the same window.
+///
+/// This struct carries those counts into [`GenesisDensityComparator::compare_with_csj`]
+/// so that the GDD verdict is based on the actual CSJ bisection output rather than
+/// only on the online density windows maintained by the GSM.
+///
+/// ## Haskell correspondence
+///
+/// Matches the dissent snapshot produced by `csjGsmHandler` in
+/// `Ouroboros.Consensus.Genesis.Governor`: after bisection the objector's
+/// block count and the dynamo's block count within the genesis window are
+/// compared directly (integer comparison, no floating point).
+#[derive(Debug, Clone, Copy)]
+pub struct CsjDissent {
+    /// Number of blocks the objector's chain places in the genesis window
+    /// above the fork point.
+    pub objector_blocks: u64,
+    /// Number of blocks the dynamo's chain places in the genesis window
+    /// above the fork point (may be a conservative estimate until Phase D).
+    pub dynamo_blocks: u64,
+}
+
+impl CsjDissent {
+    /// Create a new dissent snapshot.
+    pub fn new(objector_blocks: u64, dynamo_blocks: u64) -> Self {
+        CsjDissent {
+            objector_blocks,
+            dynamo_blocks,
+        }
+    }
+
+    /// Returns `true` when the dynamo chain is at least as dense as the objector.
+    ///
+    /// Matches Haskell's GDD outcome: `dynamo_blocks >= objector_blocks` → adopt dynamo.
+    pub fn dynamo_wins(&self) -> bool {
+        self.dynamo_blocks >= self.objector_blocks
+    }
+}
+
 /// Density-based chain selection for Ouroboros Genesis.
 ///
 /// During initial sync the node may receive two competing chains that diverge
@@ -653,6 +701,54 @@ impl GenesisDensityComparator {
             ChainPreference::PreferCurrent
         } else {
             ChainPreference::Equal
+        }
+    }
+
+    /// Compare two chains using a CSJ bisection dissent snapshot.
+    ///
+    /// This variant is used when the CsjOrchestrator has completed bisection
+    /// and has exact block counts for both the objector and dynamo chains within
+    /// the genesis window above the fork point.  Because the CSJ dissection
+    /// process already localises the fork point precisely, we skip the
+    /// partial-window normalisation used by [`compare`] and compare the raw
+    /// block counts directly — matching Haskell's GDD outcome computation.
+    ///
+    /// ## Fallback to Praos
+    ///
+    /// When both block counts are equal the method falls back to the standard
+    /// Praos longest-chain comparison, consistent with the non-CSJ path.
+    ///
+    /// ## Arguments
+    ///
+    /// - `dissent`: block counts from the bisection snapshot.
+    /// - `candidate_tip`: tip of the candidate (objector) chain — used for
+    ///   Praos fallback.
+    /// - `current_praos_tip`: tip of the current (dynamo) chain.
+    ///
+    /// ## Returns
+    ///
+    /// `ChainPreference::PreferCurrent` when the dynamo wins (adopt dynamo),
+    /// `ChainPreference::PreferCandidate` when the objector wins,
+    /// `ChainPreference::Equal` when counts are equal and lengths are equal.
+    pub fn compare_with_csj(
+        &self,
+        dissent: CsjDissent,
+        candidate_tip: &Tip,
+        current_praos_tip: &Tip,
+    ) -> ChainPreference {
+        match dissent.dynamo_blocks.cmp(&dissent.objector_blocks) {
+            std::cmp::Ordering::Greater => {
+                // Dynamo is strictly denser — keep dynamo chain (current).
+                ChainPreference::PreferCurrent
+            }
+            std::cmp::Ordering::Less => {
+                // Objector is strictly denser — switch to objector (candidate).
+                ChainPreference::PreferCandidate
+            }
+            std::cmp::Ordering::Equal => {
+                // Equal density — fall back to Praos length comparison.
+                self.length_comparison(current_praos_tip, candidate_tip)
+            }
         }
     }
 
@@ -2601,6 +2697,100 @@ mod tests {
         assert_eq!(
             result, ChainPreference::PreferCandidate,
             "Pre-Conway: VRF comparison is unconditional, candidate with lower VRF output should win"
+        );
+    }
+
+    // ── CsjDissent / compare_with_csj ─────────────────────────────────────────
+
+    /// (c) GDD verdict: dynamo wins (more blocks) → PreferCurrent
+    #[test]
+    fn test_csj_dissent_dynamo_wins() {
+        let comparator = GenesisDensityComparator::new(129_600);
+        let current_tip = make_tip(200, 10_000); // dynamo chain, longer
+        let candidate_tip = make_tip(150, 8_000); // objector chain
+
+        let dissent = CsjDissent::new(/* objector_blocks */ 30, /* dynamo_blocks   */ 50);
+        assert!(
+            dissent.dynamo_wins(),
+            "dynamo_wins() must be true when dynamo has more blocks"
+        );
+
+        let result = comparator.compare_with_csj(dissent, &candidate_tip, &current_tip);
+        assert_eq!(
+            result,
+            ChainPreference::PreferCurrent,
+            "when dynamo has more blocks GDD verdict is PreferCurrent (adopt dynamo)"
+        );
+    }
+
+    /// (c) GDD verdict: objector wins (more blocks) → PreferCandidate
+    #[test]
+    fn test_csj_dissent_objector_wins() {
+        let comparator = GenesisDensityComparator::new(129_600);
+        let current_tip = make_tip(200, 10_000); // dynamo chain
+        let candidate_tip = make_tip(210, 10_500); // objector chain, longer
+
+        let dissent = CsjDissent::new(/* objector_blocks */ 70, /* dynamo_blocks   */ 40);
+        assert!(
+            !dissent.dynamo_wins(),
+            "dynamo_wins() must be false when objector has more blocks"
+        );
+
+        let result = comparator.compare_with_csj(dissent, &candidate_tip, &current_tip);
+        assert_eq!(
+            result,
+            ChainPreference::PreferCandidate,
+            "when objector has more blocks GDD verdict is PreferCandidate (switch to objector)"
+        );
+    }
+
+    /// (c) GDD verdict: equal density → fall back to Praos length comparison
+    #[test]
+    fn test_csj_dissent_equal_density_praos_fallback() {
+        let comparator = GenesisDensityComparator::new(129_600);
+
+        // candidate (objector) is longer
+        let current_tip = make_tip(100, 5_000);
+        let candidate_tip = make_tip(150, 7_000);
+
+        let dissent = CsjDissent::new(
+            /* objector_blocks */ 50, /* dynamo_blocks   */ 50, // equal
+        );
+
+        // Equal density → fall back to Praos; candidate is longer → PreferCandidate.
+        let result = comparator.compare_with_csj(dissent, &candidate_tip, &current_tip);
+        assert_eq!(
+            result,
+            ChainPreference::PreferCandidate,
+            "equal density falls back to Praos length; longer candidate wins"
+        );
+    }
+
+    /// (c) GDD verdict: equal density, equal length → Equal
+    #[test]
+    fn test_csj_dissent_equal_density_equal_length() {
+        let comparator = GenesisDensityComparator::new(129_600);
+
+        let current_tip = make_tip(100, 5_000);
+        let candidate_tip = make_tip(100, 5_000); // same block number
+
+        let dissent = CsjDissent::new(25, 25); // equal
+
+        let result = comparator.compare_with_csj(dissent, &candidate_tip, &current_tip);
+        assert_eq!(
+            result,
+            ChainPreference::Equal,
+            "equal density and equal length → Equal"
+        );
+    }
+
+    /// CsjDissent: equal counts → dynamo_wins returns true (adopted on tie)
+    #[test]
+    fn test_csj_dissent_equal_counts_dynamo_wins_tie() {
+        let dissent = CsjDissent::new(50, 50);
+        assert!(
+            dissent.dynamo_wins(),
+            "dynamo_wins() must be true on equal counts (dynamo_blocks >= objector_blocks)"
         );
     }
 }
