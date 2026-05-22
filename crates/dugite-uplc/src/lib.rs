@@ -47,6 +47,7 @@ pub mod data;
 pub mod flat;
 pub mod machine;
 pub mod program;
+pub mod script_context;
 pub mod term;
 
 mod error;
