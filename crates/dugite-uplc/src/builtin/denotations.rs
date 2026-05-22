@@ -959,10 +959,20 @@ pub fn denote(id: BuiltinId, args: Vec<Value>) -> Result<Value, UplcError> {
                     ));
                 }
             };
-            // Same: signature byte parse failure → evaluation failure.
-            let sig = Signature::try_from(&sig_arr[..]).map_err(|e| {
-                builtin_failure(id, &format!("Schnorr signature parse failed: {e}"))
-            })?;
+            // BIP-340 §"Verification": a structurally well-formed 64-byte
+            // signature whose R-x component lifts to no curve point (or
+            // whose s is out of range) MUST return False, not raise an
+            // evaluation failure.  k256's `Signature::try_from` is
+            // stricter than BIP-340 here — it rejects R-x = 0 and other
+            // degenerate forms at parse — so we treat any such parse
+            // failure as a verification failure (False) rather than
+            // surfacing it as `BuiltinFailure`.  Public-key parse
+            // failures stay as `BuiltinFailure` (those are genuinely
+            // malformed inputs that should not be silently accepted).
+            let sig = match Signature::try_from(&sig_arr[..]) {
+                Ok(s) => s,
+                Err(_) => return Ok(Value::Const(Constant::Bool(false))),
+            };
             Ok(Value::Const(Constant::Bool(vk.verify(&msg, &sig).is_ok())))
         }
 

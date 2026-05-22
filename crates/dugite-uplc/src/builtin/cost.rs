@@ -125,7 +125,14 @@ pub fn integer_costed_literally(n: &num_bigint::BigInt) -> i64 {
     n.magnitude().to_i64().unwrap_or(i64::MAX).abs()
 }
 
-/// Recursive data-node size: 4 per node.
+/// Recursive `Data` memory size mirroring the Haskell `sizeData`
+/// rose-tree fold (`ExMemoryUsage Data`):
+///
+/// * every node adds 4 (the `dataNodeRose` constant),
+/// * `I n` contributes an additional `memoryUsageInteger n` (= 1 for
+///   `n == 0`, else `ilog2(|n|).div(64) + 1`),
+/// * `B bs` contributes an additional `((len-1) quot 8) + 1`,
+/// * `Constr` / `Map` / `List` recurse into their children.
 fn size_of_data(d: &Data) -> i64 {
     let mut total = 0i64;
     let mut stack = vec![d];
@@ -148,10 +155,31 @@ fn size_of_data(d: &Data) -> i64 {
                     stack.push(e);
                 }
             }
-            Data::I(_) | Data::B(_) => {}
+            Data::I(n) => {
+                total = total.saturating_add(memory_usage_integer(n));
+            }
+            Data::B(b) => {
+                total = total.saturating_add(size_of_bytestring(b));
+            }
         }
     }
     total
+}
+
+/// `memoryUsageInteger` from PlutusCore.Evaluation.Machine.ExMemoryUsage:
+///   * `n == 0` → 1 (preserved special case from pre-GHC-9.2 `integerLog2`)
+///   * else → `ilog2(|n|).div(64) + 1`
+fn memory_usage_integer(n: &num_bigint::BigInt) -> i64 {
+    use num_bigint::Sign;
+    if n.sign() == Sign::NoSign {
+        return 1;
+    }
+    // bits() = ilog2(|n|) + 1; we need ilog2(|n|).div(64) + 1.
+    let bits = n.bits() as i64;
+    if bits == 0 {
+        return 1;
+    }
+    (bits - 1) / 64 + 1
 }
 
 // ─── CostingFun ──────────────────────────────────────────────────────────────
@@ -274,27 +302,34 @@ impl ConstAboveDiagLinXYP {
     }
 }
 
-/// Quadratic in x and y: `c00 + c01*x + c02*x^2 + c10*y + c11*x*y + c20*y^2`,
-/// with a minimum floor.
+/// Quadratic in x and y, with a minimum floor.
+///
+/// Standard `c_ij = coefficient of x^i * y^j` convention (matches
+/// IntersectMBO/plutus `TwoVariableQuadraticFunction`):
+///
+///   `c00 + c10·x + c01·y + c20·x² + c11·x·y + c02·y²`
+///
+/// Used by `quotientInteger` / `remainderInteger` / `valueContains` /
+/// `divideInteger` / `modInteger`.
 #[derive(Debug, Clone, Copy)]
 pub struct QuadXY {
     pub c00: i64,
-    pub c01: i64,
-    pub c02: i64,
     pub c10: i64,
-    pub c11: i64,
+    pub c01: i64,
     pub c20: i64,
+    pub c11: i64,
+    pub c02: i64,
     pub minimum: i64,
 }
 
 impl QuadXY {
     fn eval(self, x: i64, y: i64) -> i64 {
         (self.c00
-            + self.c01 * x
-            + self.c02 * x * x
-            + self.c10 * y
+            + self.c10 * x
+            + self.c01 * y
+            + self.c20 * x * x
             + self.c11 * x * y
-            + self.c20 * y * y)
+            + self.c02 * y * y)
             .max(self.minimum)
     }
 }
@@ -543,9 +578,11 @@ impl BuiltinCosts {
                 let sx = args.first().map_or(0, size_of_value);
                 (sx, 0, 0)
             }
-            // ── EncodeUtf8: input is a String costed by char count (default)
+            // ── EncodeUtf8: input is a String costed by UTF-8 byte length
+            //    (TextCostedByByteLength in the V2 builtin semantics).
+            //    Conformance corpus computes goldens against this variant.
             EncodeUtf8 => {
-                let sx = args.first().map_or(0, string_costed_by_char_count);
+                let sx = args.first().map_or(0, string_costed_by_byte_len);
                 (sx, 0, 0)
             }
             // ── integerToByteString: arg2 is width (NumBytesCostedAsNumWords),
