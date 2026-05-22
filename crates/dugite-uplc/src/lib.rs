@@ -49,6 +49,7 @@ pub mod flat;
 pub mod machine;
 pub mod phase_two;
 pub mod populate_gov;
+pub mod populate_v1_v2;
 pub mod populate_v3;
 pub mod program;
 pub mod script_context;
