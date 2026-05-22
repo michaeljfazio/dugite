@@ -1679,6 +1679,7 @@ mod tests {
             plutus_v1: None,
             plutus_v2: Some(v2_costs),
             plutus_v3: None,
+            plutus_v4: None,
         };
 
         let cbor = cm
@@ -1731,6 +1732,8 @@ mod tests {
             plutus_v1: Some(vec![100; 166]), // V1 has 166 cost model entries
             plutus_v2: Some(vec![100; 178]), // V2 has 178 cost model entries
             plutus_v3: Some(vec![100; 251]), // V3 has 251 cost model entries (Conway)
+            // PlutusV4 (Dijkstra) cost-model slot is part of issue #475 Phase 5.
+            plutus_v4: None,
         };
 
         let cbor = cm

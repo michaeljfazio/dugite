@@ -3481,6 +3481,7 @@ fn test_enact_parameter_change_applies_all_fields() {
             plutus_v1: None,
             plutus_v2: Some(vec![1, 2, 3]),
             plutus_v3: Some(vec![4, 5, 6]),
+            plutus_v4: None,
         }),
         max_tx_ex_units: Some(ExUnits {
             mem: 20_000_000,
@@ -3593,6 +3594,7 @@ fn test_pp_groups_technical() {
             plutus_v1: None,
             plutus_v2: Some(vec![1, 2, 3]),
             plutus_v3: None,
+            plutus_v4: None,
         }),
         ..Default::default()
     };
@@ -3660,6 +3662,7 @@ fn test_pp_drep_threshold_max_of_multiple_groups() {
             plutus_v1: None,
             plutus_v2: Some(vec![1]),
             plutus_v3: None,
+            plutus_v4: None,
         }),
         ..Default::default()
     };
@@ -3694,6 +3697,7 @@ fn test_pp_spo_threshold_not_security_relevant() {
             plutus_v1: None,
             plutus_v2: Some(vec![1]),
             plutus_v3: None,
+            plutus_v4: None,
         }),
         ..Default::default()
     };
@@ -3791,6 +3795,7 @@ fn test_per_group_technical_only_uses_technical_threshold() {
             plutus_v1: None,
             plutus_v2: Some(vec![1]),
             plutus_v3: None,
+            plutus_v4: None,
         }),
         ..Default::default()
     };
@@ -3824,6 +3829,7 @@ fn test_per_group_multi_group_must_meet_all_thresholds() {
             plutus_v1: None,
             plutus_v2: Some(vec![1]),
             plutus_v3: None,
+            plutus_v4: None,
         }), // Technical
         ..Default::default()
     };
@@ -8201,6 +8207,7 @@ fn test_cost_model_update_via_governance() {
             plutus_v1: None,
             plutus_v2: Some(v2_costs.clone()),
             plutus_v3: None,
+            plutus_v4: None,
         }),
         ..Default::default()
     };

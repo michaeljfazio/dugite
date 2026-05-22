@@ -55,7 +55,11 @@ fn snapshot_format_hash_stability() {
 
     // This hash was computed from the current LedgerStateSnapshot layout.
     // If this changes, existing snapshot files become unreadable.
-    const EXPECTED_HASH: &str = "fa4d90c0003b7614d3731d4f91c0ec6c45526512e3f44ff6fd2d9844b8fb5ba8";
+    //
+    // Last update: SNAPSHOT_VERSION 15 → 16 (issue #475 Phase 5) added
+    // `CostModels.plutus_v4: Option<Vec<i64>>` for the Dijkstra cost-model
+    // slot 3, shifting every CostModels field boundary in the bincode stream.
+    const EXPECTED_HASH: &str = "49da0434791705adcc57226e9ee64c148af55242b692679cdb2b98c304c070af";
 
     if EXPECTED_HASH == "COMPUTE_ON_FIRST_RUN" {
         panic!(

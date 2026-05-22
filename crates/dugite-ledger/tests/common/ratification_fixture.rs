@@ -1003,6 +1003,8 @@ fn read_cost_models(v: &serde_json::Value, ctx: &str) -> CostModels {
         plutus_v1: read_lang("PlutusV1").or_else(|| read_lang("plutus:v1")),
         plutus_v2: read_lang("PlutusV2").or_else(|| read_lang("plutus:v2")),
         plutus_v3: read_lang("PlutusV3").or_else(|| read_lang("plutus:v3")),
+        // PlutusV4 (Dijkstra) cost-model slot is part of issue #475 Phase 5.
+        plutus_v4: read_lang("PlutusV4").or_else(|| read_lang("plutus:v4")),
     }
 }
 

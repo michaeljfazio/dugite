@@ -74,7 +74,11 @@ impl LedgerState {
     ///
     /// Increment when `GovernanceState`/`LedgerState` fields change.
     /// Bincode is positional — any field addition/reorder breaks old snapshots.
-    pub(crate) const SNAPSHOT_VERSION: u8 = 15;
+    ///
+    /// v16 (issue #475 Phase 5): `CostModels` gained `plutus_v4: Option<Vec<i64>>`
+    /// (Dijkstra cost-model slot 3). This shifts every `CostModels` field
+    /// boundary in the bincode stream and breaks v15 snapshots.
+    pub(crate) const SNAPSHOT_VERSION: u8 = 16;
 
     /// Save ledger state snapshot to disk using bincode serialization.
     ///
