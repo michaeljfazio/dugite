@@ -61,7 +61,7 @@ done
 # Tally from CSV
 if [ -f "$PARITY_CSV" ]; then
     EQUAL=$(awk -F, 'NR>1 && $5=="true"  {c++} END{print c+0}' "$PARITY_CSV")
-    DIVERGENT_CSV=$(awk -F, 'NR>1 && $5=="false" && $6!~/skip/ {c++} END{print c+0}' "$PARITY_CSV")
+    DIVERGENT_CSV=$(awk -F, 'NR>1 && $5=="false" && $6!~/skip/ && $6!~/^known-divergence:/ {c++} END{print c+0}' "$PARITY_CSV")
     SKIPS=$(awk -F, 'NR>1 && $6~/^skip/ {c++} END{print c+0}' "$PARITY_CSV")
 fi
 

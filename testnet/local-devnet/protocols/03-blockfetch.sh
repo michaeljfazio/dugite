@@ -55,8 +55,6 @@ REQ_RANGE_CBOR="8300820319e8204420000000820101442000000000"
 run_blockfetch_case "inverted-range" "$REQ_RANGE_CBOR"
 
 # ---- Case 2: MsgRequestRange with oversized range (slots 0 to 2^32-1) ------
-HUGE_RANGE_CBOR="83008200442000000082001a${ffffffff}4420000000"
-# Use a well-formed version
 HUGE_RANGE_CBOR="83008201441a0000000082001affffffff44ffffffff"
 run_blockfetch_case "oversized-range" "$HUGE_RANGE_CBOR"
 

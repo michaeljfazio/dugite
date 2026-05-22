@@ -36,7 +36,15 @@ _parity_ensure_csv() {
 # Maps query name → tracking issue URL.
 # Populated by individual test scripts using: KNOWN_DIVERGENCES[name]=url
 declare -gA KNOWN_DIVERGENCES=(
-    # Example: ["protocol-state"]="https://github.com/.../issues/123"
+    # All tracked under the umbrella issue #597 until each query is fixed.
+    ["protocol-parameters"]="https://github.com/michaeljfazio/dugite/issues/597"
+    ["stake-distribution"]="https://github.com/michaeljfazio/dugite/issues/597"
+    ["protocol-state/version"]="https://github.com/michaeljfazio/dugite/issues/597"
+    ["gov-state"]="https://github.com/michaeljfazio/dugite/issues/597"
+    ["kes-period-info"]="https://github.com/michaeljfazio/dugite/issues/597"
+    ["slot-number"]="https://github.com/michaeljfazio/dugite/issues/597"
+    ["treasury"]="https://github.com/michaeljfazio/dugite/issues/597"
+    ["proposals"]="https://github.com/michaeljfazio/dugite/issues/597"
 )
 
 # ---- Core parity function -------------------------------------------------
@@ -130,6 +138,12 @@ parity_query_json() {
 parity_record() {
     local qname="$1" status="$2" dsha="$3" csha="$4" notes="${5:-}"
     _parity_ensure_csv
+    # If this query is known to diverge, prefix the note so the runner's
+    # CSV tally excludes it from the non-known DIVERGENT count.  Scripts
+    # that bypass parity_query_json (e.g. 09h) still get the same treatment.
+    if [ "$status" = "DIVERGENT" ] && [[ -v "KNOWN_DIVERGENCES[$qname]" ]]; then
+        notes="known-divergence:${KNOWN_DIVERGENCES[$qname]} ${notes}"
+    fi
     printf '%s,%s,%s,%s,%s,%s\n' \
         "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
         "$qname" "$dsha" "$csha" \

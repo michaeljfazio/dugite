@@ -63,11 +63,10 @@ done
 run_txsub_case "duplicate-txids" "$DUPE_PAYLOAD"
 
 # ---- Case 2: Flood — 1000 tx IDs in a single MsgReplyTxIds -----------------
-FLOOD_PAYLOAD="82018219${3e8}"  # [1, [1000 entries]]
-FLOOD_PAYLOAD="8201821903e8"
+FLOOD_PAYLOAD="8201821903e8"  # [1, [1000 entries]]
 for _ in $(seq 1 1000); do
     hash=$(printf '%064x' $RANDOM)
-    FLOOD_PAYLOAD+="8258${40}${hash}190100"
+    FLOOD_PAYLOAD+="825820${hash}190100"
 done
 run_txsub_case "flood-txids" "$FLOOD_PAYLOAD"
 
