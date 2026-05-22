@@ -46,12 +46,13 @@
 //!   peer selection policy that prioritises big ledger peers (BLPs). Currently,
 //!   peer selection uses the standard P2P governor policy.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use dugite_consensus::DensityWindow;
+use dugite_network::codec::Point;
 use tokio::sync::{mpsc, watch};
 use tracing::{debug, info, warn};
 
@@ -80,7 +81,24 @@ impl std::fmt::Display for GenesisSyncState {
 
 // ── Event / snapshot / action types ─────────────────────────────────────────
 
+/// Outcome of a resolved CSJ objection.
+///
+/// Mirrors Haskell's `CsjOutcome` used in `csjGsmHandler`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)] // constructed in csj_orchestrator (lib target), invisible to bin dead-code pass
+pub enum CsjObjectionOutcome {
+    /// GDD comparison resolved in the dynamo's favour — adopt the dynamo chain.
+    DynamoWins,
+    /// GDD comparison resolved in the objector's favour — retain the objector chain.
+    ObjectorWins,
+}
+
 /// Event sent to the GSM actor from producers (ChainSync, BlockFetch, networking).
+// The CSJ Phase C variants (JumpAgreed / ObjectionRaised / ObjectionResolved) are
+// constructed exclusively in `csj_orchestrator` (lib target).  The binary-target
+// dead-code pass cannot see across the lib/bin split so it reports those variants
+// as unused; the allow suppresses the false positive.
+#[allow(dead_code)]
 #[derive(Debug)]
 pub enum GsmEvent {
     /// A new peer has been registered with known intersection and tip.
@@ -105,6 +123,48 @@ pub enum GsmEvent {
         all_chainsync_idle: bool,
         tip_age_secs: u64,
         immutable_tip_slot: u64,
+    },
+
+    // ── CSJ Phase C events — constructed in csj_orchestrator (lib target) ───
+    // The binary target's dead-code pass cannot see csj_orchestrator so it
+    // reports these variants as unused; suppress that false positive.
+    /// A jumper peer agreed to the proposed jump point and has found the
+    /// intersection on its own chain (CSJ `IntersectFound`).
+    ///
+    /// Emitted by `CsjOrchestrator` when a peer transitions
+    /// `LookingForIntersection → FoundIntersection`.  Informational only —
+    /// the GSM records it for diagnostics and future LoP extension points.
+    JumpAgreed {
+        /// The peer that agreed.
+        peer: SocketAddr,
+        /// The agreed intersection point.
+        point: Point,
+    },
+
+    /// A jumper peer could **not** find the jump point on its own chain and
+    /// has entered objector/bisection mode (`MsgIntersectNotFound`).
+    ///
+    /// The GSM records the objection and **blocks the `Syncing → CaughtUp`
+    /// transition** until it is resolved (Haskell LoP — Limit on Patience).
+    ObjectionRaised {
+        /// The objecting peer.
+        peer: SocketAddr,
+        /// Lower bound of the bisection range (inclusive).
+        lo: Point,
+        /// Upper bound of the bisection range (inclusive).
+        hi: Point,
+    },
+
+    /// An earlier objection has been resolved by the GDD density comparison.
+    ///
+    /// Emitted by `CsjOrchestrator` when `BisectionComplete` is processed.
+    /// Once all outstanding objections are resolved, the LoP gate is lifted
+    /// and `CaughtUp` transitions become possible again.
+    ObjectionResolved {
+        /// The previously objecting peer.
+        peer: SocketAddr,
+        /// How the GDD decided.
+        outcome: CsjObjectionOutcome,
     },
 }
 
@@ -244,6 +304,7 @@ impl PeerChainInfo {
 /// and tip freshness. The GSM also manages:
 /// - **LoE (Limit on Eagerness)**: constrains block application during sync
 /// - **GDD (Genesis Density Disconnector)**: disconnects sparse-chain peers
+/// - **LoP (Limit on Patience)**: blocks `CaughtUp` while CSJ objections are live
 pub struct GenesisStateMachine {
     config: GsmConfig,
     state: GenesisSyncState,
@@ -260,6 +321,15 @@ pub struct GenesisStateMachine {
     /// Random jitter (seconds) added to `min_caught_up_dwell_secs` to
     /// prevent multiple nodes from regressing simultaneously.
     anti_thundering_herd_jitter_secs: u64,
+    /// Set of peers with an unresolved CSJ objection.
+    ///
+    /// An objection is raised when a jumper cannot find the jump point on its
+    /// own chain (`ObjectionRaised`) and resolved when the GDD density
+    /// comparison completes (`ObjectionResolved`).  While this set is
+    /// non-empty the LoP gate blocks the `Syncing → CaughtUp` transition,
+    /// matching Haskell's `csjReprocessLoEDelay` / LoP predicate in
+    /// `Ouroboros.Consensus.Genesis.Governor`.
+    pending_objections: HashSet<SocketAddr>,
 }
 
 impl GenesisStateMachine {
@@ -307,6 +377,7 @@ impl GenesisStateMachine {
             peer_info: HashMap::new(),
             caught_up_since,
             anti_thundering_herd_jitter_secs: jitter,
+            pending_objections: HashSet::new(),
         }
     }
 
@@ -435,12 +506,14 @@ impl GenesisStateMachine {
                     && self.all_peers_idling()
                     && tip_age_secs < self.config.max_caught_up_age_secs
                     && self.all_peers_within_window(immutable_tip_slot)
+                    && self.lop_satisfied()
                 {
                     // Transition to CaughtUp when:
                     // 1. All ChainSync clients are idle (both external heuristic
                     //    AND per-peer MsgAwaitReply tracking)
                     // 2. Our tip is fresh
                     // 3. All peers' tips are within the genesis window
+                    // 4. LoP (Limit on Patience) satisfied — no unresolved CSJ objections
                     self.state = GenesisSyncState::CaughtUp;
                     self.caught_up_since = Some(Instant::now());
                     self.write_marker();
@@ -504,6 +577,63 @@ impl GenesisStateMachine {
                 .saturating_add(self.config.genesis_window_slots);
             immutable_tip_slot <= window_end
         })
+    }
+
+    // ── LoP (Limit on Patience) — CSJ objection tracking ────────────────────
+
+    /// Record that a peer has raised a CSJ objection.
+    ///
+    /// An objection means the jumper could not find the jump point on its own
+    /// chain and has entered bisection mode.  The GSM blocks the
+    /// `Syncing → CaughtUp` transition until the objection is resolved.
+    pub fn raise_objection(&mut self, peer: SocketAddr) {
+        if !self.enabled {
+            return;
+        }
+        let inserted = self.pending_objections.insert(peer);
+        if inserted {
+            debug!(
+                %peer,
+                pending = self.pending_objections.len(),
+                "LoP: objection raised — CaughtUp blocked"
+            );
+        }
+    }
+
+    /// Resolve a previously raised CSJ objection.
+    ///
+    /// Once resolved (via GDD density comparison), the peer is removed from
+    /// `pending_objections`.  When the set becomes empty the LoP gate lifts.
+    pub fn resolve_objection(&mut self, peer: &SocketAddr, outcome: CsjObjectionOutcome) {
+        if !self.enabled {
+            return;
+        }
+        let removed = self.pending_objections.remove(peer);
+        if removed {
+            debug!(
+                %peer,
+                ?outcome,
+                pending = self.pending_objections.len(),
+                "LoP: objection resolved"
+            );
+            if self.pending_objections.is_empty() {
+                debug!("LoP: all objections resolved — CaughtUp gate lifted");
+            }
+        }
+    }
+
+    /// Returns `true` when the LoP (Limit on Patience) predicate is satisfied.
+    ///
+    /// The predicate is satisfied when there are no pending CSJ objections.
+    /// Matches Haskell's `LoP` check in `Ouroboros.Consensus.Genesis.Governor`.
+    pub fn lop_satisfied(&self) -> bool {
+        self.pending_objections.is_empty()
+    }
+
+    /// Read-only view of the pending objection set (for diagnostics / tests).
+    #[allow(dead_code)] // public API for diagnostics and tests
+    pub fn pending_objections(&self) -> &HashSet<SocketAddr> {
+        &self.pending_objections
     }
 
     // ── LoE ─────────────────────────────────────────────────────────────────
@@ -822,6 +952,30 @@ pub async fn run_gsm_actor(
                         if gsm.evaluate(active_blp_count, all_chainsync_idle, tip_age_secs, immutable_tip_slot).is_some() {
                             state_changed = true;
                         }
+                    }
+
+                    // ── CSJ Phase C events ────────────────────────────────
+
+                    GsmEvent::JumpAgreed { peer, point } => {
+                        // Informational — the peer found the jump point on
+                        // its own chain.  No state change required; logged
+                        // for diagnostics.
+                        debug!(%peer, ?point, "GSM: jump agreed by peer");
+                    }
+
+                    GsmEvent::ObjectionRaised { peer, lo, hi } => {
+                        debug!(%peer, ?lo, ?hi, "GSM: CSJ objection raised");
+                        gsm.raise_objection(peer);
+                        // LoP gate may now block a pending CaughtUp — publish
+                        // an updated snapshot so consumers see the change.
+                        state_changed = true;
+                    }
+
+                    GsmEvent::ObjectionResolved { peer, outcome } => {
+                        debug!(%peer, ?outcome, "GSM: CSJ objection resolved");
+                        gsm.resolve_objection(&peer, outcome);
+                        // LoP gate may have been lifted — snapshot needed.
+                        state_changed = true;
                     }
                 }
 
@@ -1762,5 +1916,308 @@ mod tests {
         let result = load_peer_snapshot(&path);
         assert!(result.is_err(), "unrecognised format must return an error");
         let _ = std::fs::remove_file(&path);
+    }
+
+    // ── CSJ Phase C: LoP (Limit on Patience) tests ──────────────────────────
+
+    /// Helper: build a GSM that is already in Syncing state, with all
+    /// preconditions met for a CaughtUp transition (except the LoP gate).
+    fn make_syncing_gsm(marker: &str) -> GenesisStateMachine {
+        let _ = std::fs::remove_file(marker);
+        let config = GsmConfig {
+            min_active_blp: 1,
+            max_caught_up_age_secs: 600,
+            min_caught_up_dwell_secs: 0,
+            anti_thundering_herd_max_secs: 0,
+            genesis_window_slots: 1_000,
+            gdd_rate_limit_ms: 100,
+            security_param_k: 2160,
+            marker_path: PathBuf::from(marker),
+        };
+        let mut gsm = GenesisStateMachine::new(config, true);
+        gsm.set_jitter(0);
+        // Enough BLPs to satisfy HAA → Syncing.
+        gsm.evaluate(5, false, 0, 0);
+        assert_eq!(gsm.state(), GenesisSyncState::Syncing);
+        gsm
+    }
+
+    // (a) Objection raised → CaughtUp transition is blocked
+
+    #[test]
+    fn test_lop_objection_blocks_caught_up() {
+        let marker = "/tmp/test_lop_blocks_marker";
+        let mut gsm = make_syncing_gsm(marker);
+
+        let peer_a: SocketAddr = "1.2.3.4:3001".parse().unwrap();
+
+        // Raise an objection from peer_a.
+        gsm.raise_objection(peer_a);
+        assert!(
+            !gsm.lop_satisfied(),
+            "LoP must be unsatisfied with pending objection"
+        );
+
+        // All conditions for CaughtUp are met EXCEPT the LoP gate.
+        // Tip is fresh, all ChainSync idle, all peers within window.
+        let result = gsm.evaluate(5, true, 100, 0);
+        assert_eq!(
+            result, None,
+            "CaughtUp transition must be blocked while objection is pending"
+        );
+        assert_eq!(
+            gsm.state(),
+            GenesisSyncState::Syncing,
+            "must remain Syncing"
+        );
+
+        let _ = std::fs::remove_file(marker);
+    }
+
+    // (b) Objection resolved → CaughtUp transition is unblocked
+
+    #[test]
+    fn test_lop_resolution_unblocks_caught_up() {
+        let marker = "/tmp/test_lop_unblocks_marker";
+        let mut gsm = make_syncing_gsm(marker);
+
+        let peer_a: SocketAddr = "1.2.3.4:3001".parse().unwrap();
+
+        // Raise then resolve the objection.
+        gsm.raise_objection(peer_a);
+        assert!(!gsm.lop_satisfied(), "LoP unsatisfied after raise");
+
+        gsm.resolve_objection(&peer_a, CsjObjectionOutcome::DynamoWins);
+        assert!(
+            gsm.lop_satisfied(),
+            "LoP must be satisfied after resolution"
+        );
+
+        // Now CaughtUp should be reachable.
+        let result = gsm.evaluate(5, true, 100, 0);
+        assert_eq!(
+            result,
+            Some(GenesisSyncState::CaughtUp),
+            "CaughtUp must be reachable once LoP is satisfied"
+        );
+        assert_eq!(gsm.state(), GenesisSyncState::CaughtUp);
+
+        let _ = std::fs::remove_file(marker);
+    }
+
+    // (b2) Multiple objections: all must be resolved before CaughtUp
+
+    #[test]
+    fn test_lop_multiple_objections_all_must_resolve() {
+        let marker = "/tmp/test_lop_multi_marker";
+        let mut gsm = make_syncing_gsm(marker);
+
+        let peer_a: SocketAddr = "1.2.3.4:3001".parse().unwrap();
+        let peer_b: SocketAddr = "5.6.7.8:3001".parse().unwrap();
+
+        gsm.raise_objection(peer_a);
+        gsm.raise_objection(peer_b);
+        assert_eq!(gsm.pending_objections().len(), 2);
+
+        // Resolve only one — gate must still be closed.
+        gsm.resolve_objection(&peer_a, CsjObjectionOutcome::ObjectorWins);
+        assert_eq!(gsm.pending_objections().len(), 1);
+        assert!(!gsm.lop_satisfied());
+
+        let result = gsm.evaluate(5, true, 100, 0);
+        assert_eq!(
+            result, None,
+            "must remain Syncing with one pending objection"
+        );
+
+        // Resolve the second — gate lifts.
+        gsm.resolve_objection(&peer_b, CsjObjectionOutcome::DynamoWins);
+        assert!(gsm.lop_satisfied());
+
+        let result = gsm.evaluate(5, true, 100, 0);
+        assert_eq!(result, Some(GenesisSyncState::CaughtUp));
+
+        let _ = std::fs::remove_file(marker);
+    }
+
+    // (c) GDD verdict via actor channel: ObjectionRaised → ObjectionResolved
+
+    #[tokio::test]
+    async fn test_csj_events_via_actor_channel() {
+        use tokio::sync::mpsc;
+
+        let config = GsmConfig {
+            min_active_blp: 1,
+            max_caught_up_age_secs: 600,
+            min_caught_up_dwell_secs: 0,
+            anti_thundering_herd_max_secs: 0,
+            genesis_window_slots: 1_000,
+            gdd_rate_limit_ms: 10_000, // suppress GDD tick
+            security_param_k: 2160,
+            marker_path: PathBuf::from("/tmp/test_csj_actor_lop_marker"),
+        };
+        let _ = std::fs::remove_file(&config.marker_path);
+
+        let (event_tx, event_rx) = mpsc::channel(64);
+        let (snapshot_tx, mut snapshot_rx) = watch::channel(GsmSnapshot {
+            state: GenesisSyncState::PreSyncing,
+            loe_slot: Some(0),
+        });
+        let (action_tx, _action_rx) = mpsc::channel(64);
+
+        let handle = tokio::spawn(run_gsm_actor(
+            config,
+            true,
+            event_rx,
+            snapshot_tx,
+            action_tx,
+        ));
+
+        // Wait for initial snapshot.
+        snapshot_rx.changed().await.unwrap();
+
+        // Transition to Syncing.
+        event_tx
+            .send(GsmEvent::SyncStatus {
+                active_blp_count: 5,
+                all_chainsync_idle: false,
+                tip_age_secs: 0,
+                immutable_tip_slot: 0,
+            })
+            .await
+            .unwrap();
+        snapshot_rx.changed().await.unwrap();
+        assert_eq!(snapshot_rx.borrow().state, GenesisSyncState::Syncing);
+
+        let peer_a: SocketAddr = "1.2.3.4:3001".parse().unwrap();
+
+        // Raise an objection — this blocks CaughtUp.
+        event_tx
+            .send(GsmEvent::ObjectionRaised {
+                peer: peer_a,
+                lo: Point::Origin,
+                hi: Point::Origin,
+            })
+            .await
+            .unwrap();
+        // ObjectionRaised triggers state_changed; wait for the snapshot.
+        snapshot_rx.changed().await.unwrap();
+
+        // Attempt to transition to CaughtUp — should be blocked.
+        event_tx
+            .send(GsmEvent::SyncStatus {
+                active_blp_count: 5,
+                all_chainsync_idle: true,
+                tip_age_secs: 100,
+                immutable_tip_slot: 0,
+            })
+            .await
+            .unwrap();
+        // Give the actor time to process.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(
+            snapshot_rx.borrow().state,
+            GenesisSyncState::Syncing,
+            "CaughtUp must be blocked by pending objection"
+        );
+
+        // Resolve the objection — gate lifts.
+        event_tx
+            .send(GsmEvent::ObjectionResolved {
+                peer: peer_a,
+                outcome: CsjObjectionOutcome::DynamoWins,
+            })
+            .await
+            .unwrap();
+        snapshot_rx.changed().await.unwrap();
+
+        // Now CaughtUp should be achievable on the next SyncStatus.
+        event_tx
+            .send(GsmEvent::SyncStatus {
+                active_blp_count: 5,
+                all_chainsync_idle: true,
+                tip_age_secs: 100,
+                immutable_tip_slot: 0,
+            })
+            .await
+            .unwrap();
+        snapshot_rx.changed().await.unwrap();
+        assert_eq!(
+            snapshot_rx.borrow().state,
+            GenesisSyncState::CaughtUp,
+            "CaughtUp must be reachable after objection resolution"
+        );
+
+        drop(event_tx);
+        let _ = handle.await;
+        let _ = std::fs::remove_file("/tmp/test_csj_actor_lop_marker");
+    }
+
+    // JumpAgreed event is informational — no state change expected
+
+    #[tokio::test]
+    async fn test_jump_agreed_is_informational() {
+        use tokio::sync::mpsc;
+
+        let config = GsmConfig {
+            min_active_blp: 1,
+            max_caught_up_age_secs: 600,
+            min_caught_up_dwell_secs: 0,
+            anti_thundering_herd_max_secs: 0,
+            genesis_window_slots: 1_000,
+            gdd_rate_limit_ms: 10_000,
+            security_param_k: 2160,
+            marker_path: PathBuf::from("/tmp/test_jump_agreed_marker"),
+        };
+        let _ = std::fs::remove_file(&config.marker_path);
+
+        let (event_tx, event_rx) = mpsc::channel(64);
+        let (snapshot_tx, mut snapshot_rx) = watch::channel(GsmSnapshot {
+            state: GenesisSyncState::PreSyncing,
+            loe_slot: Some(0),
+        });
+        let (action_tx, _action_rx) = mpsc::channel(64);
+
+        let handle = tokio::spawn(run_gsm_actor(
+            config,
+            true,
+            event_rx,
+            snapshot_tx,
+            action_tx,
+        ));
+        snapshot_rx.changed().await.unwrap();
+
+        // Transition to Syncing.
+        event_tx
+            .send(GsmEvent::SyncStatus {
+                active_blp_count: 5,
+                all_chainsync_idle: false,
+                tip_age_secs: 0,
+                immutable_tip_slot: 0,
+            })
+            .await
+            .unwrap();
+        snapshot_rx.changed().await.unwrap();
+
+        let peer_a: SocketAddr = "1.2.3.4:3001".parse().unwrap();
+
+        // JumpAgreed is informational — state must remain Syncing.
+        event_tx
+            .send(GsmEvent::JumpAgreed {
+                peer: peer_a,
+                point: Point::Origin,
+            })
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(
+            snapshot_rx.borrow().state,
+            GenesisSyncState::Syncing,
+            "JumpAgreed must not change GSM state"
+        );
+
+        drop(event_tx);
+        let _ = handle.await;
+        let _ = std::fs::remove_file("/tmp/test_jump_agreed_marker");
     }
 }

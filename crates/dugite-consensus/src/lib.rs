@@ -11,7 +11,9 @@ pub mod peras_wire;
 pub mod praos;
 pub mod slot_leader;
 
-pub use chain_selection::{ChainPreference, ChainSelection, DensityWindow};
+pub use chain_selection::{
+    ChainPreference, ChainSelection, CsjDissent, DensityWindow, GenesisDensityComparator,
+};
 pub use era_history::{Bound, EraHistory, EraParams, EraSummaryEntry, PastHorizonError};
 pub use forecast::{forecast_for, OutsideForecastRange};
 pub use overlay::{OBftSlot, OverlayContext};
