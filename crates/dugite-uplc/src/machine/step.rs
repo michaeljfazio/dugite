@@ -20,7 +20,7 @@ pub fn evaluate(term: Term) -> Result<Value, UplcError> {
         kont: Kont::new(),
     };
     loop {
-        state = step(state)?;
+        state = step(state, None)?;
         if let State::Done(v) = state {
             return Ok(v);
         }
@@ -29,9 +29,11 @@ pub fn evaluate(term: Term) -> Result<Value, UplcError> {
 
 /// Evaluate with explicit budget tracking. Charges the per-term-type
 /// CEK machine cost on each `Compute` transition (mirroring the
-/// Haskell reference's `enterComputeCek`); `Return` transitions are
-/// free.  Startup cost is charged once by `BudgetTracker::new`.  On
-/// success, `tracker.consumed()` reports the budget actually used.
+/// Haskell reference's `enterComputeCek`) and the per-builtin cost at
+/// each saturated builtin application; `Return` transitions are
+/// otherwise free.  Startup cost is charged once by
+/// `BudgetTracker::new`.  On success, `tracker.consumed()` reports the
+/// budget actually used.
 pub fn evaluate_with_budget(
     term: Term,
     tracker: &mut crate::machine::cost::BudgetTracker,
@@ -45,7 +47,7 @@ pub fn evaluate_with_budget(
         if let State::Compute { ref term, .. } = state {
             tracker.compute_step(term)?;
         }
-        state = step(state)?;
+        state = step(state, Some(&mut *tracker))?;
         if let State::Done(v) = state {
             tracker.flush()?;
             return Ok(v);
@@ -53,10 +55,13 @@ pub fn evaluate_with_budget(
     }
 }
 
-fn step(state: State) -> Result<State, UplcError> {
+fn step(
+    state: State,
+    tracker: Option<&mut crate::machine::cost::BudgetTracker>,
+) -> Result<State, UplcError> {
     match state {
         State::Compute { term, env, kont } => compute(term, env, kont),
-        State::Return { value, kont } => return_compute(value, kont),
+        State::Return { value, kont } => return_compute(value, kont, tracker),
         State::Done(_) => Err(UplcError::Internal("step called on Done state".into())),
     }
 }
@@ -175,7 +180,11 @@ fn compute(term: Term, env: Env, mut kont: Kont) -> Result<State, UplcError> {
     }
 }
 
-fn return_compute(value: Value, mut kont: Kont) -> Result<State, UplcError> {
+fn return_compute(
+    value: Value,
+    mut kont: Kont,
+    tracker: Option<&mut crate::machine::cost::BudgetTracker>,
+) -> Result<State, UplcError> {
     let frame = match kont.pop() {
         None => return Ok(State::Done(value)),
         Some(f) => f,
@@ -192,9 +201,9 @@ fn return_compute(value: Value, mut kont: Kont) -> Result<State, UplcError> {
                 kont,
             })
         }
-        Frame::AwaitArg { function, .. } => apply(function, value, kont),
-        Frame::Force => force_value(value, kont),
-        Frame::ApplyValue { argument } => apply(value, argument, kont),
+        Frame::AwaitArg { function, .. } => apply(function, value, kont, tracker),
+        Frame::Force => force_value(value, kont, tracker),
+        Frame::ApplyValue { argument } => apply(value, argument, kont, tracker),
         Frame::Constr {
             tag,
             mut pending,
@@ -256,7 +265,12 @@ fn return_compute(value: Value, mut kont: Kont) -> Result<State, UplcError> {
     }
 }
 
-fn apply(function: Value, argument: Value, kont: Kont) -> Result<State, UplcError> {
+fn apply(
+    function: Value,
+    argument: Value,
+    kont: Kont,
+    tracker: Option<&mut crate::machine::cost::BudgetTracker>,
+) -> Result<State, UplcError> {
     match function {
         Value::Lambda { body, env } => Ok(State::Compute {
             term: *body,
@@ -264,7 +278,7 @@ fn apply(function: Value, argument: Value, kont: Kont) -> Result<State, UplcErro
             kont,
         }),
         Value::Builtin { id, forces, args } => {
-            let v = crate::builtin::dispatch::apply_builtin(id, forces, args, argument)?;
+            let v = crate::builtin::dispatch::apply_builtin(id, forces, args, argument, tracker)?;
             Ok(State::Return { value: v, kont })
         }
         Value::Const(_) | Value::Delay { .. } | Value::Constr { .. } => {
@@ -276,7 +290,11 @@ fn apply(function: Value, argument: Value, kont: Kont) -> Result<State, UplcErro
     }
 }
 
-fn force_value(value: Value, kont: Kont) -> Result<State, UplcError> {
+fn force_value(
+    value: Value,
+    kont: Kont,
+    tracker: Option<&mut crate::machine::cost::BudgetTracker>,
+) -> Result<State, UplcError> {
     match value {
         Value::Delay { body, env } => Ok(State::Compute {
             term: *body,
@@ -285,7 +303,7 @@ fn force_value(value: Value, kont: Kont) -> Result<State, UplcError> {
         }),
         Value::Builtin { id, forces, args } => {
             use crate::builtin::dispatch::{force_builtin, ForceOutcome};
-            match force_builtin(id, forces, args)? {
+            match force_builtin(id, forces, args, tracker)? {
                 ForceOutcome::Pending(v) | ForceOutcome::Done(v) => {
                     Ok(State::Return { value: v, kont })
                 }
