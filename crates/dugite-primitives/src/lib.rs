@@ -4,6 +4,7 @@ pub mod address;
 pub mod block;
 pub mod credentials;
 pub mod era;
+pub mod genesis;
 pub mod governance;
 pub mod hash;
 pub mod mempool;
