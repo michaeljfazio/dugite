@@ -8,7 +8,7 @@ use dugite_primitives::transaction::*;
 ///   `array(2) [variant_tag, script_bytes]`
 ///
 /// Variant tags:
-///   0 = NativeScript, 1 = PlutusV1, 2 = PlutusV2, 3 = PlutusV3
+///   0 = NativeScript, 1 = PlutusV1, 2 = PlutusV2, 3 = PlutusV3, 4 = PlutusV4 (Dijkstra)
 pub fn encode_script_ref(script_ref: &ScriptRef) -> Vec<u8> {
     let mut buf = encode_array_header(2);
     match script_ref {
@@ -26,6 +26,11 @@ pub fn encode_script_ref(script_ref: &ScriptRef) -> Vec<u8> {
         }
         ScriptRef::PlutusV3(script) => {
             buf.extend(encode_uint(3));
+            buf.extend(encode_bytes(script));
+        }
+        ScriptRef::PlutusV4(script) => {
+            // Dijkstra-only language tag 4 (issue #475 Phase 5).
+            buf.extend(encode_uint(4));
             buf.extend(encode_bytes(script));
         }
     }
@@ -374,6 +379,7 @@ mod tests {
                 14333, 10, 43574283, 26308, 10,
             ]),
             plutus_v3: None,
+            plutus_v4: None,
         };
 
         let result = compute_script_data_hash_from_cbor(&tx_cbor, &cost_models, false, true, false);
@@ -589,6 +595,7 @@ mod tests {
             plutus_v1: None,
             plutus_v2: None,
             plutus_v3: None,
+            plutus_v4: None,
         };
         // No `has_*` flags set → empty map.
         let cbor = encode_language_views(&cm, false, false, false);
@@ -601,6 +608,7 @@ mod tests {
             plutus_v1: Some(vec![1, 2, 3]),
             plutus_v2: None,
             plutus_v3: None,
+            plutus_v4: None,
         };
         let cbor = encode_language_views(&cm, true, false, false);
         // Map(1), then key = bstr(0x00) = [0x41, 0x00] ("double-bagged"),
@@ -615,6 +623,7 @@ mod tests {
             plutus_v1: None,
             plutus_v2: Some(vec![10, 20]),
             plutus_v3: None,
+            plutus_v4: None,
         };
         let cbor = encode_language_views(&cm, false, true, false);
         // Map(1), key = uint(1), value = array(2)[uint(10), uint(20)].
@@ -629,6 +638,7 @@ mod tests {
             plutus_v1: None,
             plutus_v2: None,
             plutus_v3: Some(vec![1]),
+            plutus_v4: None,
         };
         let cbor = encode_language_views(&cm, false, false, true);
         assert_eq!(cbor[1], 0x02); // key = uint(2)
@@ -640,6 +650,7 @@ mod tests {
             plutus_v1: Some(vec![1]),
             plutus_v2: Some(vec![2]),
             plutus_v3: Some(vec![3]),
+            plutus_v4: None,
         };
         let cbor = encode_language_views(&cm, true, true, true);
         // map(3); first key uint(1)=V2 (1 byte), second uint(2)=V3 (1 byte),
@@ -655,6 +666,7 @@ mod tests {
             plutus_v1: None,
             plutus_v2: None,
             plutus_v3: None,
+            plutus_v4: None,
         };
         let cbor = encode_language_views(&cm, true, true, true);
         assert_eq!(cbor, vec![0xa0]);
@@ -668,6 +680,7 @@ mod tests {
             plutus_v1: None,
             plutus_v2: None,
             plutus_v3: None,
+            plutus_v4: None,
         };
         // Empty redeemers, no datums, no languages → preimage = [0xa0, 0xa0]
         // (empty-map sentinel + empty language-views map).
@@ -682,6 +695,7 @@ mod tests {
             plutus_v1: None,
             plutus_v2: None,
             plutus_v3: None,
+            plutus_v4: None,
         };
         let raw_red = [0xa1, 0x82, 0x00, 0x00, 0x82, 0x80, 0x82, 0x07, 0x0b];
         let raw_dat = [0x80];
@@ -708,6 +722,7 @@ mod tests {
             plutus_v1: None,
             plutus_v2: None,
             plutus_v3: None,
+            plutus_v4: None,
         };
         let r = Redeemer {
             tag: RedeemerTag::Spend,
@@ -737,6 +752,7 @@ mod tests {
             plutus_v1: None,
             plutus_v2: None,
             plutus_v3: None,
+            plutus_v4: None,
         };
         let d = PlutusData::Bytes(vec![0xab, 0xcd]);
         let h = compute_script_data_hash(
