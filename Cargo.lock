@@ -1520,6 +1520,7 @@ dependencies = [
  "amaru-uplc",
  "blake2 0.10.6",
  "digest 0.11.2",
+ "ed25519-dalek",
  "hex",
  "minicbor 0.25.1",
  "minicbor 0.26.5",
