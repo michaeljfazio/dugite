@@ -45,3 +45,8 @@ cstreamer-reference/
 crates/dugite-ledger/tests/fixtures/*.cbor
 reward-dumps-issue-438/
 reward-dumps-issue-481/
+
+# devnet-validate generated artifacts (commit only tagged release reports)
+reports/devnet-validate/report.json
+reports/devnet-validate/report.md
+testnet/local-devnet/evidence/

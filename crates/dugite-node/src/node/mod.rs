@@ -1933,6 +1933,13 @@ impl Node {
                 slot_config: n2c_slot_config,
                 metrics: self.metrics.clone(),
                 mempool: Some(self.mempool.clone()),
+                network: if self.network_magic
+                    == dugite_primitives::network::NetworkId::Mainnet.magic()
+                {
+                    dugite_primitives::network::NetworkId::Mainnet
+                } else {
+                    dugite_primitives::network::NetworkId::Testnet
+                },
             });
 
             // Remove stale socket file if it exists (e.g., from a previous unclean shutdown).
@@ -3061,6 +3068,13 @@ impl Node {
                 slot_config: n2n_slot_config,
                 metrics: self.metrics.clone(),
                 mempool: Some(self.mempool.clone()),
+                network: if self.network_magic
+                    == dugite_primitives::network::NetworkId::Mainnet.magic()
+                {
+                    dugite_primitives::network::NetworkId::Mainnet
+                } else {
+                    dugite_primitives::network::NetworkId::Testnet
+                },
             });
 
         let mut lifecycle = ConnectionLifecycleManager::new(

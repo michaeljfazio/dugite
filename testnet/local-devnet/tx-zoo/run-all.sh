@@ -23,6 +23,8 @@ ALL_CATEGORIES=(
     06-proposals
     07-voting
     08-negative
+    10-gov-lifecycle
+    11-mempool
 )
 
 usage() { sed -n '2,12p' "$0" | sed 's/^# \{0,1\}//'; }
