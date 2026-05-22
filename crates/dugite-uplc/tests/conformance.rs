@@ -29,7 +29,7 @@
 use dugite_uplc::machine::cost::BudgetTracker;
 use dugite_uplc::machine::env::Env;
 use dugite_uplc::machine::step::evaluate_with_budget;
-use dugite_uplc::machine::{ExBudget, Value};
+use dugite_uplc::machine::Value;
 use dugite_uplc::syn::{parse_program, ParseError};
 use dugite_uplc::term::Term;
 use dugite_uplc::Program;
@@ -77,14 +77,12 @@ fn run_conformance_test(
         }
     };
 
-    // Step 2: evaluate with budget tracking. Haskell uses `counting`
-    // mode (unbounded budget); we use a budget so large that legitimate
-    // programs never exhaust it. The corpus's "evaluation failure"
-    // tests fail by other means (type mismatch, builtin failure, ...).
-    let mut tracker = BudgetTracker::new(ExBudget {
-        cpu: i64::MAX / 2,
-        mem: i64::MAX / 2,
-    });
+    // Step 2: evaluate in Haskell "counting" mode (unbounded budget).
+    // The corpus's "evaluation failure" tests fail by other means
+    // (type mismatch, builtin failure, etc.) — never by budget exhaustion.
+    // Counting mode mirrors `evaluateCekNoEmit` in counting mode: costs
+    // accumulate with saturation but never block evaluation.
+    let mut tracker = BudgetTracker::new_counting();
     let eval = evaluate_with_budget(input_prog.term.clone(), &mut tracker);
 
     let value = match eval {

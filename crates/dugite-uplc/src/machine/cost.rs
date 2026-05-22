@@ -124,6 +124,13 @@ pub struct BudgetTracker {
     /// Compute steps accumulated since the last flush — when this
     /// reaches `SLIPPAGE` the running total is flushed.
     pending_count: u64,
+    /// When `true`, the tracker operates in Haskell "counting" mode:
+    /// execution never fails due to budget exhaustion; costs accumulate
+    /// with saturation into `counting_spent`.  Used by the conformance
+    /// test harness to mirror `evaluateCekNoEmit` in counting mode.
+    counting: bool,
+    /// Total cost accumulated so far (counting mode only).
+    counting_spent: ExBudget,
 }
 
 impl BudgetTracker {
@@ -145,12 +152,46 @@ impl BudgetTracker {
             costs,
             pending: ExBudget { cpu: 0, mem: 0 },
             pending_count: 0,
+            counting: false,
+            counting_spent: ExBudget { cpu: 0, mem: 0 },
         };
         // Charge startup so `consumed()` always includes it. We
         // tolerate a starting budget too small to cover the startup
         // cost (remaining goes negative) — the next flush surfaces
         // it as a normal exhaustion error.
-        let _ = t.remaining.try_subtract(t.costs.startup);
+        if t.counting {
+            t.counting_spent.cpu = t.counting_spent.cpu.saturating_add(t.costs.startup.cpu);
+            t.counting_spent.mem = t.counting_spent.mem.saturating_add(t.costs.startup.mem);
+        } else {
+            let _ = t.remaining.try_subtract(t.costs.startup);
+        }
+        t
+    }
+
+    /// Construct a tracker in Haskell "counting" mode: evaluation never
+    /// fails due to budget exhaustion, and costs are accumulated with
+    /// saturation.  Used by the conformance harness.
+    pub fn new_counting() -> Self {
+        let costs = MachineCosts::DEFAULT;
+        let startup = costs.startup;
+        let mut t = Self {
+            remaining: ExBudget {
+                cpu: i64::MAX,
+                mem: i64::MAX,
+            },
+            starting: ExBudget {
+                cpu: i64::MAX,
+                mem: i64::MAX,
+            },
+            costs,
+            pending: ExBudget { cpu: 0, mem: 0 },
+            pending_count: 0,
+            counting: true,
+            counting_spent: ExBudget { cpu: 0, mem: 0 },
+        };
+        // Charge startup cost into counting_spent.
+        t.counting_spent.cpu = t.counting_spent.cpu.saturating_add(startup.cpu);
+        t.counting_spent.mem = t.counting_spent.mem.saturating_add(startup.mem);
         t
     }
 
@@ -178,7 +219,10 @@ impl BudgetTracker {
         if cost.cpu == 0 && cost.mem == 0 {
             return Ok(());
         }
-        if !self.remaining.try_subtract(cost) {
+        if self.counting {
+            self.counting_spent.cpu = self.counting_spent.cpu.saturating_add(cost.cpu);
+            self.counting_spent.mem = self.counting_spent.mem.saturating_add(cost.mem);
+        } else if !self.remaining.try_subtract(cost) {
             return Err(UplcError::BudgetExhausted {
                 cpu_remaining: self.remaining.cpu,
                 mem_remaining: self.remaining.mem,
@@ -193,7 +237,10 @@ impl BudgetTracker {
     /// semantics.
     pub fn charge(&mut self, cost: ExBudget) -> Result<(), UplcError> {
         self.flush()?;
-        if !self.remaining.try_subtract(cost) {
+        if self.counting {
+            self.counting_spent.cpu = self.counting_spent.cpu.saturating_add(cost.cpu);
+            self.counting_spent.mem = self.counting_spent.mem.saturating_add(cost.mem);
+        } else if !self.remaining.try_subtract(cost) {
             return Err(UplcError::BudgetExhausted {
                 cpu_remaining: self.remaining.cpu,
                 mem_remaining: self.remaining.mem,
@@ -202,13 +249,23 @@ impl BudgetTracker {
         Ok(())
     }
 
-    /// Compute the consumed budget = starting - remaining + pending.
+    /// Compute the consumed budget.
+    ///
+    /// In counting mode: returns the directly accumulated `counting_spent`.
+    /// In restricting mode: `starting - remaining + pending`.
     /// Includes unflushed step charges so partial-run observability is
     /// accurate.
     pub fn consumed(&self) -> ExBudget {
-        ExBudget {
-            cpu: (self.starting.cpu - self.remaining.cpu).saturating_add(self.pending.cpu),
-            mem: (self.starting.mem - self.remaining.mem).saturating_add(self.pending.mem),
+        if self.counting {
+            ExBudget {
+                cpu: self.counting_spent.cpu.saturating_add(self.pending.cpu),
+                mem: self.counting_spent.mem.saturating_add(self.pending.mem),
+            }
+        } else {
+            ExBudget {
+                cpu: (self.starting.cpu - self.remaining.cpu).saturating_add(self.pending.cpu),
+                mem: (self.starting.mem - self.remaining.mem).saturating_add(self.pending.mem),
+            }
         }
     }
 }
