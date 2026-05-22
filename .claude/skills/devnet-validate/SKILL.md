@@ -283,14 +283,19 @@ All chaos tests live in `testnet/local-devnet/chaos/`. Each records to `evidence
 | `inbound-syn-flood.sh` | 200 rapid connections → node stays responsive | — |
 | `macos-app-nap.sh` | `caffeinate` present and used (macOS only) | — |
 
-### CI integration (Phase 8)
+### When to invoke
 
-| Workflow | Trigger | Timeout |
-|----------|---------|---------|
-| `.github/workflows/devnet-validate-smoke.yml` | PR touching core crates | 15 min |
-| `.github/workflows/devnet-validate-nightly.yml` | Daily 03:00 UTC | 60 min |
+devnet-validate is **developer-machine only** — it is not wired into GitHub
+Actions and never runs in CI.  Invoke it locally at critical moments:
 
-The smoke workflow gates PRs; the nightly runs all 3 rounds of the standard preset.
+- Before tagging a release (`just devnet-validate-extended` — see
+  `.claude/skills/release-lead/SKILL.md` for the release checklist)
+- Before merging a PR that touches ledger / consensus / network / forging /
+  mempool / dugite-cli (`just devnet-validate-smoke`)
+- After landing a change you want to soak-test against Haskell
+
+CI keeps the unit/integration test surface (`just check`, `just test`)
+green; devnet-validate is the human-driven cross-validation pass.
 
 ### Flaky-test policy
 
