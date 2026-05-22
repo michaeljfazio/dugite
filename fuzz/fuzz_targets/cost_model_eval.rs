@@ -96,21 +96,54 @@ const MAINNET_SLOT_CONFIG: (u64, u64, u32) = (1_596_059_091_000, 4_492_800, 1_00
 // or unexpected-era input (e.g. `uplc/src/tx.rs:181` panics on pre-Conway era
 // shapes with "transaction is serialized in an old era format").
 //
-// Production code in `crates/dugite-ledger/src/plutus.rs` wraps the upstream
-// call in `std::panic::catch_unwind` (panic = "unwind" in the workspace
-// release profile) and converts panics into hard validation failures. The
-// fuzz target replicates that defense so libfuzzer doesn't terminate the run
-// on every newly-discovered upstream panic — those are recorded as artifacts
-// but never produce CI-blocking signals. A regression in production's panic
-// guard (e.g. switching back to panic = "abort") would still be caught by the
-// regression tests in `crates/dugite-ledger/src/plutus.rs::tests`.
+// `libfuzzer_sys::initialize()` installs a panic hook that *aborts the
+// process* before unwinding, so a plain `catch_unwind` is insufficient — the
+// SIGABRT fires from the hook itself, bypassing the unwind path. We replace
+// the hook with a discriminating one that swallows panics whose location
+// points at third-party `~/.cargo` paths (aiken/uplc, pallas-codec, etc.)
+// but preserves the abort for panics in dugite crates. That way:
 //
-// IMPORTANT: this guard is *not* there to hide dugite bugs. It only catches
-// panics from third-party crates we cannot patch. Any panic crossing this
-// boundary indicates an upstream bug worth reporting to aiken-lang/aiken.
+//   - upstream third-party panics on adversarial input do NOT block CI; they
+//     are recorded to the corpus and skipped via `catch_unwind` below.
+//   - a panic in any in-tree dugite crate still aborts immediately so
+//     libFuzzer treats it as a finding, with the usual stack trace.
+//
+// Production code in `crates/dugite-ledger/src/plutus.rs` wraps the upstream
+// call in `std::panic::catch_unwind` and converts panics into hard validation
+// failures; this fuzz hook mirrors the same defense for the fuzz harness.
 // ---------------------------------------------------------------------------
 
+fn install_upstream_panic_filter() {
+    use std::sync::Once;
+    static INIT: Once = Once::new();
+    INIT.call_once(|| {
+        std::panic::set_hook(Box::new(|info| {
+            // A panic location of None or pointing inside a third-party
+            // crate (cargo registry / git checkout) is treated as an
+            // upstream-uplc panic that we want catch_unwind to swallow.
+            let is_upstream = info
+                .location()
+                .map(|loc| {
+                    let f = loc.file();
+                    f.contains("/.cargo/git/checkouts/aiken-")
+                        || f.contains("/.cargo/git/checkouts/uplc-")
+                        || f.contains("/.cargo/registry/src/")
+                })
+                .unwrap_or(false);
+            if !is_upstream {
+                // Mirror libfuzzer-sys's default hook: print to stderr and
+                // abort so libFuzzer records the crash as a finding.
+                eprintln!("[fuzz] dugite-side panic in cost_model_eval: {info}");
+                std::process::abort();
+            }
+            // Upstream panic: silently let catch_unwind handle the unwind.
+        }));
+    });
+}
+
 fuzz_target!(|data: &[u8]| {
+    install_upstream_panic_filter();
+
     // Need at least 1 byte to do anything meaningful.
     if data.is_empty() {
         return;

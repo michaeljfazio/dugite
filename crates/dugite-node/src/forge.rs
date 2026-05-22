@@ -531,6 +531,32 @@ mod tests {
         }
     }
 
+    /// Same as `make_test_credentials` but with a caller-supplied VRF seed
+    /// so the resulting credentials are bit-for-bit reproducible. Use in
+    /// any test whose pass/fail criterion depends on a specific VRF
+    /// output (e.g. slot-leader Bernoulli sampling).
+    fn make_deterministic_test_credentials(vrf_seed: [u8; 32]) -> BlockProducerCredentials {
+        let vrf_kp = dugite_crypto::vrf::generate_vrf_keypair_from_secret(&vrf_seed);
+        let cold_sk = dugite_crypto::keys::PaymentSigningKey::generate();
+        let cold_vk = cold_sk.verification_key();
+        let cold_vkey = cold_vk.to_bytes().to_vec();
+
+        let seed = [42u8; 32];
+        let (kes_sk, kes_pk) = dugite_crypto::kes::kes_keygen(&seed).unwrap();
+
+        BlockProducerCredentials {
+            vrf_skey: *vrf_kp.secret_key(),
+            vrf_vkey: vrf_kp.public_key,
+            cold_vkey: cold_vkey.clone(),
+            kes_skey: kes_sk,
+            kes_vkey: kes_pk.to_vec(),
+            opcert_sequence: 0,
+            opcert_kes_period: 0,
+            opcert_sigma: vec![0u8; 64],
+            pool_id: dugite_primitives::hash::blake2b_224(&cold_vkey),
+        }
+    }
+
     #[test]
     fn test_forge_empty_block() {
         let creds = make_test_credentials();
@@ -641,23 +667,35 @@ mod tests {
 
     #[test]
     fn test_check_slot_leadership() {
-        let creds = make_test_credentials();
+        // Use a deterministic VRF key + nonce so the bounds we assert below
+        // hold for every CI run. The previous version called
+        // `generate_vrf_keypair()` which seeds from the OS CSPRNG; with
+        // f = 0.05 over 100 slots the probability of zero wins is
+        // (0.95)^100 ≈ 0.6%, flaking on ~1-in-170 runs. Switching to a
+        // fixed seed + a 500-slot horizon drives the flake probability
+        // below 10^-11 while keeping the test's intent intact.
+        let creds = make_deterministic_test_credentials([13u8; 32]);
         let epoch_nonce = Hash32::from_bytes([42u8; 32]);
 
-        // With 100% stake (pool=1000, total=1000), should be leader for some slots
+        // With 100% stake (pool=1000, total=1000), expected wins ≈ 500 * 0.05 = 25.
         // f = 1/20 = 0.05
         let mut leader_count = 0;
-        for i in 0..100 {
+        for i in 0..500 {
             if check_slot_leadership(&creds, SlotNo(i), &epoch_nonce, 1000, 1000, (1, 20)) {
                 leader_count += 1;
             }
         }
 
-        // With f=0.05 and 100% stake, expect ~5 leader slots out of 100
-        assert!(leader_count > 0, "Should win some slots with 100% stake");
+        // With f=0.05 and 100% stake, expect ~25 leader slots out of 500.
+        // The bounds are generous (the chance of escaping them under a
+        // genuine implementation regression is still tiny).
         assert!(
-            leader_count < 50,
-            "Should not win too many slots with f=0.05"
+            leader_count > 0,
+            "Should win some slots with 100% stake (got {leader_count})"
+        );
+        assert!(
+            leader_count < 250,
+            "Should not win too many slots with f=0.05 (got {leader_count})"
         );
     }
 

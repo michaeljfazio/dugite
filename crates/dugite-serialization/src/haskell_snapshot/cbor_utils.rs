@@ -450,7 +450,19 @@ fn skip_cbor_value_depth(data: &[u8], depth: usize) -> Result<usize, Serializati
                         ))
                     }
                 };
-                Ok(hdr_len + payload_len)
+                // The declared payload must actually be present in the buffer.
+                // Without this check, `skip_cbor_value` could return a consumed
+                // count past the end of `data`, causing the caller's
+                // `set_position` to leave the reader in an invalid state and a
+                // later `slice_from` to panic with an out-of-range index
+                // (audit #544 follow-up; fuzz-discovered).
+                let total = hdr_len.checked_add(payload_len).ok_or_else(|| {
+                    SerializationError::CborDecode("string length encoding overflow".into())
+                })?;
+                if total > data.len() {
+                    return Err(eof());
+                }
+                Ok(total)
             }
         }
         // Array
@@ -463,6 +475,12 @@ fn skip_cbor_value_depth(data: &[u8], depth: usize) -> Result<usize, Serializati
                         return Err(eof());
                     }
                     off += skip_cbor_value_depth(&data[off..], depth + 1)?;
+                }
+                // Loop exited either by finding the break byte (`data[off]
+                // == 0xff`) or by exhausting the buffer. Only the former is
+                // a well-formed array; the latter is truncated input.
+                if off >= data.len() {
+                    return Err(eof());
                 }
                 Ok(off + 1) // +1 for the break byte 0xff
             } else {
@@ -490,6 +508,11 @@ fn skip_cbor_value_depth(data: &[u8], depth: usize) -> Result<usize, Serializati
                     }
                     off += skip_cbor_value_depth(&data[off..], depth + 1)?; // value
                 }
+                // Same post-loop check as the indefinite-array path: only a
+                // 0xff-terminated loop is well-formed.
+                if off >= data.len() {
+                    return Err(eof());
+                }
                 Ok(off + 1) // +1 for the break byte 0xff
             } else {
                 let (count, mut off) = decode_uint_info(data, info)?;
@@ -516,17 +539,29 @@ fn skip_cbor_value_depth(data: &[u8], depth: usize) -> Result<usize, Serializati
             Ok(n + inner)
         }
         // Simple values and floats
-        7 => match info {
-            0..=23 => Ok(1), // simple value (null=22, true=21, false=20, etc.)
-            24 => Ok(2),
-            25 => Ok(3), // float16
-            26 => Ok(5), // float32
-            27 => Ok(9), // float64
-            31 => Ok(1), // break code (should not appear at top level, but handle gracefully)
-            _ => Err(SerializationError::CborDecode(
-                "invalid simple/float encoding".into(),
-            )),
-        },
+        7 => {
+            let size = match info {
+                0..=23 => 1usize, // simple value (null=22, true=21, false=20, etc.)
+                24 => 2,
+                25 => 3, // float16
+                26 => 5, // float32
+                27 => 9, // float64
+                31 => 1, // break code (should not appear at top level, but handle gracefully)
+                _ => {
+                    return Err(SerializationError::CborDecode(
+                        "invalid simple/float encoding".into(),
+                    ))
+                }
+            };
+            // Validate that the declared payload is actually present in the
+            // buffer. Without this check, `skip_cbor_value` returns a
+            // consumed count past the end of `data`, leaving the reader in
+            // an invalid state and panicking later in `slice_from`.
+            if size > data.len() {
+                return Err(eof());
+            }
+            Ok(size)
+        }
         _ => unreachable!("CBOR major type is 3 bits, range 0-7"),
     }
 }
@@ -825,11 +860,43 @@ mod cap_tests {
     }
 
     #[test]
-    fn skip_cbor_value_returns_claimed_size_not_clipped() {
-        // `skip_cbor_value` returns the *claimed* CBOR size, including for
-        // truncated input — bounds checking is the caller's responsibility.
-        // bstr(info=25, len=2) reports `3 + 2 = 5` even though only 4 bytes exist.
-        assert_eq!(skip_cbor_value(&[0x59, 0x00, 0x02, 0xff]).unwrap(), 5);
+    fn skip_cbor_value_rejects_truncated_string_payload() {
+        // Audit #544 follow-up (fuzz-discovered): `skip_cbor_value` must
+        // reject inputs whose declared CBOR length exceeds the buffer.
+        // Previously it returned the claimed size and left the caller to
+        // handle the truncation — that pattern leaked positions past EOF
+        // and caused later `slice_from` calls to panic with out-of-range
+        // indices. The new contract is "consumed <= data.len() or Err".
+        //
+        // bstr(info=25, len=2) claims 3 + 2 = 5 bytes; only 4 are present.
+        assert!(skip_cbor_value(&[0x59, 0x00, 0x02, 0xff]).is_err());
+    }
+
+    #[test]
+    fn skip_cbor_value_rejects_truncated_float_payload() {
+        // Same contract for major-type 7 floats: a single `0xf9` header
+        // claims 3 bytes (one header + two-byte half-float); buffer is just
+        // the header.
+        assert!(skip_cbor_value(&[0xf9]).is_err());
+        // float32: 5 bytes claimed, only 1 present.
+        assert!(skip_cbor_value(&[0xfa]).is_err());
+        // float64: 9 bytes claimed, only 1 present.
+        assert!(skip_cbor_value(&[0xfb]).is_err());
+    }
+
+    #[test]
+    fn skip_cbor_value_rejects_unterminated_indef_array() {
+        // Indefinite-length array opened with 0x9f but no 0xff terminator
+        // must error, not silently report consumed-past-EOF.
+        assert!(skip_cbor_value(&[0x9f]).is_err());
+        assert!(skip_cbor_value(&[0x9f, 0x01]).is_err());
+    }
+
+    #[test]
+    fn skip_cbor_value_rejects_unterminated_indef_map() {
+        // Same for indefinite-length maps.
+        assert!(skip_cbor_value(&[0xbf]).is_err());
+        assert!(skip_cbor_value(&[0xbf, 0x01, 0x02]).is_err());
     }
 
     #[test]

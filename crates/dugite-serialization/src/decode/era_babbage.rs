@@ -115,8 +115,9 @@ fn decode_babbage_block_mode(
     // 2. tx_bodies
     // -------------------------------------------------------------------------
     let tx_count = r.read_array_header()?.unwrap_or(0) as usize;
-    let mut raw_bodies: Vec<Vec<u8>> = Vec::with_capacity(tx_count);
-    let mut parsed_bodies: Vec<TransactionBody> = Vec::with_capacity(tx_count);
+    let alloc_cap = r.safe_alloc_capacity(tx_count as u64);
+    let mut raw_bodies: Vec<Vec<u8>> = Vec::with_capacity(alloc_cap);
+    let mut parsed_bodies: Vec<TransactionBody> = Vec::with_capacity(alloc_cap);
 
     for _ in 0..tx_count {
         let body = KeepRaw::parse_with(&mut r, |r| decode_babbage_tx_body(r))?;
@@ -128,9 +129,9 @@ fn decode_babbage_block_mode(
     // 3. tx_witness_sets
     // -------------------------------------------------------------------------
     let witness_count = r.read_array_header()?.unwrap_or(0) as usize;
-    let mut raw_witnesses: Vec<Vec<u8>> = Vec::with_capacity(witness_count);
-    let mut parsed_witnesses: Vec<Option<TransactionWitnessSet>> =
-        Vec::with_capacity(witness_count);
+    let ws_alloc_cap = r.safe_alloc_capacity(witness_count as u64);
+    let mut raw_witnesses: Vec<Vec<u8>> = Vec::with_capacity(ws_alloc_cap);
+    let mut parsed_witnesses: Vec<Option<TransactionWitnessSet>> = Vec::with_capacity(ws_alloc_cap);
 
     for _ in 0..witness_count {
         if mode == DecodeMode::Full {
