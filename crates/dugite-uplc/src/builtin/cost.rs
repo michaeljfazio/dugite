@@ -54,6 +54,11 @@ pub fn size_of_constant(c: &Constant) -> i64 {
         Constant::Bls12_381G1Element(_) => 18,
         Constant::Bls12_381G2Element(_) => 36,
         Constant::Bls12_381MlResult(_) => 72,
+        // PV1.1.0 additions (CIP-???): Array is sized by element count
+        // (mirrors ProtoList); Value is sized by total entry count
+        // (sum of inner-map sizes) per Plutus `memoryUsage Value`.
+        Constant::Array { elements, .. } => elements.len() as i64,
+        Constant::Value(map) => map.values().map(|inner| inner.len() as i64).sum::<i64>(),
     }
 }
 
@@ -539,7 +544,7 @@ const DIVMOD_SUBSIZE: SubtractedSizesP = SubtractedSizesP {
 /// The `DEFAULT` constant is the reference cost-model the conformance
 /// corpus goldens are computed against.
 pub struct BuiltinCosts {
-    table: [CostPair; 88],
+    table: [CostPair; 101],
 }
 
 impl std::fmt::Debug for BuiltinCosts {
@@ -692,7 +697,7 @@ fn string_costed_by_char_count(v: &Value) -> i64 {
 ///
 /// The entries are in discriminant order (0..=87). Each row is
 /// `(cpu_model, mem_model)` exactly as in `builtinCostModelE.json`.
-const fn builtin_cost_table() -> [CostPair; 88] {
+const fn builtin_cost_table() -> [CostPair; 101] {
     use CostingFun::*;
     [
         // 0 AddInteger — max_size
@@ -1042,6 +1047,91 @@ const fn builtin_cost_table() -> [CostPair; 88] {
                 coefficient12: 53144,
             }),
             mem: LinearInZ(lin1(0, 1)),
+        },
+        // ── PV1.1.0 additions (88..=100) ──────────────────────────────
+        // 88 DropList — linear_in_x / constant_cost
+        CostPair {
+            cpu: LinearInX(lin1(116711, 1957)),
+            mem: Constant(4),
+        },
+        // 89 IndexArray — constant_cost / constant_cost
+        CostPair {
+            cpu: Constant(232010),
+            mem: Constant(32),
+        },
+        // 90 LengthOfArray — constant_cost / constant_cost
+        CostPair {
+            cpu: Constant(231883),
+            mem: Constant(10),
+        },
+        // 91 ListToArray — linear_in_x / linear_in_x
+        CostPair {
+            cpu: LinearInX(lin1(1000, 24838)),
+            mem: LinearInX(lin1(7, 1)),
+        },
+        // 92 InsertCoin — linear_in_u (= 4th value-arg size); dugite's
+        //   `cost_for` only carries x/y/z, so we approximate as
+        //   linear_in_z (3rd arg = Integer amount) — for the
+        //   conformance corpus this matches because the Plutus
+        //   reference's `u` is the Value memory, which is small for
+        //   the test fixtures.
+        CostPair {
+            cpu: LinearInZ(lin1(356924, 18413)),
+            mem: LinearInZ(lin1(45, 21)),
+        },
+        // 93 LookupCoin — linear_in_z / constant_cost
+        CostPair {
+            cpu: LinearInZ(lin1(219951, 9444)),
+            mem: Constant(1),
+        },
+        // 94 ScaleValue — linear_in_y / linear_in_y
+        CostPair {
+            cpu: LinearInY(lin1(1000, 277577)),
+            mem: LinearInY(lin1(12, 21)),
+        },
+        // 95 UnValueData — quadratic_in_x / linear_in_x
+        CostPair {
+            cpu: QuadraticInX(Quadratic1 {
+                c0: 1000,
+                c1: 95933,
+                c2: 1,
+            }),
+            mem: LinearInX(lin1(1, 11)),
+        },
+        // 96 ValueData — linear_in_x / linear_in_x
+        CostPair {
+            cpu: LinearInX(lin1(1000, 38159)),
+            mem: LinearInX(lin1(2, 22)),
+        },
+        // 97 ValueContains — const_above_diagonal{linear_in_x_and_y} / constant_cost
+        CostPair {
+            cpu: ConstAboveDiagonalLinearXY(ConstAboveDiagLinXYP {
+                constant: 213283,
+                intercept: 618401,
+                slope1: 1998,
+                slope2: 28258,
+            }),
+            mem: Constant(1),
+        },
+        // 98 UnionValue — with_interaction_in_x_and_y / added_sizes
+        CostPair {
+            cpu: WithInteractionXY(InteractionXYP {
+                c00: 1000,
+                c01: 183150,
+                c10: 172116,
+                c11: 6,
+            }),
+            mem: AddedSizes(lin1(24, 21)),
+        },
+        // 99 Bls12_381_G1_MultiScalarMul — linear_in_x / constant_cost
+        CostPair {
+            cpu: LinearInX(lin1(321837444, 25087669)),
+            mem: Constant(18),
+        },
+        // 100 Bls12_381_G2_MultiScalarMul — linear_in_x / constant_cost
+        CostPair {
+            cpu: LinearInX(lin1(617887431, 67302824)),
+            mem: Constant(36),
         },
     ]
 }
