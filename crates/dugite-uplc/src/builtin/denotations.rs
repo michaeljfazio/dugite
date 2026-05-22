@@ -652,7 +652,12 @@ pub fn denote(id: BuiltinId, args: Vec<Value>) -> Result<Value, UplcError> {
         }
         ReadBit => {
             // (bs: ByteString) (i: Integer) -> Bool
-            // Bit 0 = LSB of byte 0. (Per CIP-0123 §"Bit ordering".)
+            //
+            // CIP-122 §"Bit ordering": treat the bytestring as a single
+            // bit-stream whose LAST byte holds bits 0..7 (with bit 0
+            // = LSB), second-to-last byte holds bits 8..15, etc.  So
+            // bit `i`'s byte index is `len - 1 - i/8`, and its bit
+            // position within that byte is `i % 8`.
             let mut it = args.into_iter();
             let bs = unwrap_byte_string(it.next().ok_or_else(|| builtin_arity_mismatch(id))?, id)?;
             let i = unwrap_integer(it.next().ok_or_else(|| builtin_arity_mismatch(id))?, id)?;
@@ -660,11 +665,8 @@ pub fn denote(id: BuiltinId, args: Vec<Value>) -> Result<Value, UplcError> {
             if idx >= bs.len().saturating_mul(8) {
                 return Err(builtin_failure(id, "readBit: index out of range"));
             }
-            // CIP-0123 §"Indexing": bit i is bit (i % 8) of byte (i / 8),
-            // with byte 0 the least-significant. We use the "natural"
-            // little-endian byte order matching the spec.
-            let byte = bs[idx / 8];
-            let bit = (byte >> (idx % 8)) & 1;
+            let byte_idx = bs.len() - 1 - idx / 8;
+            let bit = (bs[byte_idx] >> (idx % 8)) & 1;
             Ok(Value::Const(Constant::Bool(bit != 0)))
         }
         ReplicateByte => {
@@ -690,14 +692,17 @@ pub fn denote(id: BuiltinId, args: Vec<Value>) -> Result<Value, UplcError> {
             Ok(Value::Const(Constant::Integer(BigInt::from(count))))
         }
         FindFirstSetBit => {
-            // Returns the index of the first 1 bit, or -1 if none.
-            // CIP-0123 §"Indexing": bit 0 is LSB of byte 0.
+            // Returns the index of the lowest-position 1 bit, or -1 if
+            // none.  Bit ordering per CIP-122: the LAST byte holds the
+            // lowest-numbered bits.  Scan from the last byte forward.
             let v = take_one(args, id)?;
             let bs = unwrap_byte_string(v, id)?;
-            for (byte_idx, &byte) in bs.iter().enumerate() {
+            let n = bs.len();
+            for offset in 0..n {
+                let byte = bs[n - 1 - offset];
                 if byte != 0 {
                     let bit_in_byte = byte.trailing_zeros() as usize;
-                    let global = byte_idx * 8 + bit_in_byte;
+                    let global = offset * 8 + bit_in_byte;
                     return Ok(Value::Const(Constant::Integer(BigInt::from(global))));
                 }
             }
@@ -772,9 +777,13 @@ pub fn denote(id: BuiltinId, args: Vec<Value>) -> Result<Value, UplcError> {
                     Some(s) if s < len_bits => s,
                     _ => continue, // out-of-range source → 0 (already initialised)
                 };
-                let src_bit = (bs[src / 8] >> (src % 8)) & 1;
+                // CIP-122 bit ordering: bit i lives in byte
+                // `len - 1 - i/8`, bit position `i % 8`.
+                let src_byte = bs.len() - 1 - src / 8;
+                let dst_byte = bs.len() - 1 - target_idx / 8;
+                let src_bit = (bs[src_byte] >> (src % 8)) & 1;
                 if src_bit != 0 {
-                    out[target_idx / 8] |= 1u8 << (target_idx % 8);
+                    out[dst_byte] |= 1u8 << (target_idx % 8);
                 }
             }
             Ok(Value::Const(Constant::ByteString(out)))
@@ -800,9 +809,12 @@ pub fn denote(id: BuiltinId, args: Vec<Value>) -> Result<Value, UplcError> {
             let mut out = vec![0u8; bs.len()];
             for target_idx in 0..len_bits {
                 let src = (target_idx + len_bits - r_u) % len_bits;
-                let src_bit = (bs[src / 8] >> (src % 8)) & 1;
+                // CIP-122 bit ordering, as ShiftByteString above.
+                let src_byte = bs.len() - 1 - src / 8;
+                let dst_byte = bs.len() - 1 - target_idx / 8;
+                let src_bit = (bs[src_byte] >> (src % 8)) & 1;
                 if src_bit != 0 {
-                    out[target_idx / 8] |= 1u8 << (target_idx % 8);
+                    out[dst_byte] |= 1u8 << (target_idx % 8);
                 }
             }
             Ok(Value::Const(Constant::ByteString(out)))
@@ -832,12 +844,14 @@ pub fn denote(id: BuiltinId, args: Vec<Value>) -> Result<Value, UplcError> {
                 if idx >= len_bits {
                     return Err(builtin_failure(id, "writeBits: index out of range"));
                 }
-                let byte = &mut out[idx / 8];
+                // Same CIP-122 bit ordering as ReadBit — the LAST
+                // byte holds bits 0..7.
+                let byte_idx = out.len() - 1 - idx / 8;
                 let mask = 1u8 << (idx % 8);
                 if value {
-                    *byte |= mask;
+                    out[byte_idx] |= mask;
                 } else {
-                    *byte &= !mask;
+                    out[byte_idx] &= !mask;
                 }
             }
             Ok(Value::Const(Constant::ByteString(out)))
