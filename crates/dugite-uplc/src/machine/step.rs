@@ -27,6 +27,29 @@ pub fn evaluate(term: Term) -> Result<Value, UplcError> {
     }
 }
 
+/// Evaluate with explicit budget tracking. Advances the budget
+/// tracker one tick per CEK step; if any step exhausts the budget,
+/// returns `UplcError::BudgetExhausted`. On success, `tracker.consumed()`
+/// reports the budget actually used.
+pub fn evaluate_with_budget(
+    term: Term,
+    tracker: &mut crate::machine::cost::BudgetTracker,
+) -> Result<Value, UplcError> {
+    let mut state = State::Compute {
+        term,
+        env: Env::new(),
+        kont: Kont::new(),
+    };
+    loop {
+        tracker.tick()?;
+        state = step(state)?;
+        if let State::Done(v) = state {
+            tracker.flush()?;
+            return Ok(v);
+        }
+    }
+}
+
 fn step(state: State) -> Result<State, UplcError> {
     match state {
         State::Compute { term, env, kont } => compute(term, env, kont),
