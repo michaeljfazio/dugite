@@ -277,11 +277,7 @@ impl ProtocolParameters {
             },
             min_pool_cost: Lovelace(170_000_000),
             ada_per_utxo_byte: Lovelace(4310),
-            cost_models: CostModels {
-                plutus_v1: None,
-                plutus_v2: None,
-                plutus_v3: None,
-            },
+            cost_models: CostModels::default(),
             execution_costs: ExUnitPrices {
                 mem_price: Rational {
                     numerator: 577,

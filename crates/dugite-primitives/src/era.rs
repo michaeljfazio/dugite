@@ -48,6 +48,11 @@ impl Era {
         matches!(self, Era::Conway | Era::Dijkstra)
     }
 
+    /// PlutusV4 introduced in Dijkstra (issue #475 Phase 5).
+    pub fn supports_plutus_v4(&self) -> bool {
+        matches!(self, Era::Dijkstra)
+    }
+
     pub fn supports_governance(&self) -> bool {
         matches!(self, Era::Conway | Era::Dijkstra)
     }
@@ -152,6 +157,26 @@ mod tests {
         assert!(Era::Babbage.supports_plutus_v2());
         assert!(!Era::Babbage.supports_plutus_v3());
         assert!(Era::Conway.supports_plutus_v3());
+    }
+
+    #[test]
+    fn test_supports_plutus_v4() {
+        // V4 lights up exactly at the Dijkstra hard fork (issue #475 Phase 5).
+        for prior in [
+            Era::Byron,
+            Era::Shelley,
+            Era::Allegra,
+            Era::Mary,
+            Era::Alonzo,
+            Era::Babbage,
+            Era::Conway,
+        ] {
+            assert!(
+                !prior.supports_plutus_v4(),
+                "{prior:?} must NOT support V4 — V4 lights up at Dijkstra"
+            );
+        }
+        assert!(Era::Dijkstra.supports_plutus_v4());
     }
 
     #[test]
