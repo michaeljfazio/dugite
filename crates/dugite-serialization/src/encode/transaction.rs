@@ -617,16 +617,55 @@ pub(super) fn encode_transaction_body_for_era(body: &TransactionBody, era: Era) 
     buf
 }
 
-/// Encode a complete transaction: [body, witness_set, is_valid, auxiliary_data]
+/// Encode a complete transaction.
 ///
-/// Uses era-aware encoding driven by `tx.era`:
-/// - Conway: tag 258 for set fields in body; map format for redeemers
+/// The wire shape depends on `tx.era`:
+/// - **Pre-Dijkstra (Byron … Conway):** `[body, witness_set, is_valid, auxiliary_data]`
+///   — a 4-element array, where `is_valid` is the explicit author-signaled
+///   Phase-2 outcome.
+/// - **Dijkstra and later (CIP-0167):** `[body, witness_set, auxiliary_data]`
+///   — a 3-element array. The author no longer signals validity; the ledger
+///   determines it dynamically from the Phase-2 script outcome and applies
+///   collateral consumption on failure. `tx.is_valid` is **ignored** by this
+///   encoder for Dijkstra+, mirroring the Haskell `OmitC dtIsValid` in
+///   `Cardano.Ledger.Dijkstra.Tx.toCBORForMempoolSubmission`.
+///
+/// Body and witness-set encoding remain era-aware:
+/// - Conway/Dijkstra: tag 258 for set fields in body; map format for redeemers
 /// - Pre-Conway: plain arrays for set fields; array format for redeemers
 pub fn encode_transaction(tx: &Transaction) -> Vec<u8> {
+    if tx.era >= Era::Dijkstra {
+        encode_dijkstra_transaction(tx)
+    } else {
+        encode_pre_dijkstra_transaction(tx)
+    }
+}
+
+/// Encode a pre-Dijkstra (Byron … Conway) standalone transaction.
+///
+/// Wire shape: `[body, witness_set, is_valid, auxiliary_data]` — 4 elements.
+fn encode_pre_dijkstra_transaction(tx: &Transaction) -> Vec<u8> {
     let mut buf = encode_array_header(4);
     buf.extend(encode_transaction_body_for_era(&tx.body, tx.era));
     buf.extend(encode_witness_set_for_era(&tx.witness_set, tx.era));
     buf.extend(encode_bool(tx.is_valid));
+    match &tx.auxiliary_data {
+        Some(aux) => buf.extend(encode_auxiliary_data(aux)),
+        None => buf.extend(encode_null()),
+    }
+    buf
+}
+
+/// Encode a Dijkstra (CIP-0167) standalone transaction.
+///
+/// Wire shape: `[body, witness_set, auxiliary_data]` — 3 elements. The
+/// `is_valid` flag is omitted from the wire form per CIP-0167; on the receive
+/// side, validity is determined dynamically by Phase-2 script evaluation, not
+/// signaled by the author. See [`encode_transaction`] for the rationale.
+pub fn encode_dijkstra_transaction(tx: &Transaction) -> Vec<u8> {
+    let mut buf = encode_array_header(3);
+    buf.extend(encode_transaction_body_for_era(&tx.body, tx.era));
+    buf.extend(encode_witness_set_for_era(&tx.witness_set, tx.era));
     match &tx.auxiliary_data {
         Some(aux) => buf.extend(encode_auxiliary_data(aux)),
         None => buf.extend(encode_null()),
@@ -1394,6 +1433,179 @@ mod tests {
         assert_ne!(
             from_tx, from_body,
             "raw_body hash must differ from re-encoded hash when raw differs from re-encoded"
+        );
+    }
+
+    // ── Dijkstra CIP-0167: isValid removed from wire ─────────────────────────
+
+    /// Dijkstra standalone tx is array(3): [body, witness, aux_data].
+    /// No is_valid bool element appears on the wire.
+    #[test]
+    fn test_encode_dijkstra_transaction_array3_no_is_valid() {
+        let body = minimal_body();
+        let tx = dugite_primitives::transaction::Transaction {
+            hash: Hash32::ZERO,
+            era: Era::Dijkstra,
+            body,
+            witness_set: empty_witness_set(),
+            is_valid: true,
+            auxiliary_data: None,
+            raw_cbor: None,
+            raw_body_cbor: None,
+            raw_witness_cbor: None,
+        };
+        let encoded = encode_transaction(&tx);
+        // array(3) header = 0x83
+        assert_eq!(
+            encoded[0], 0x83,
+            "Dijkstra transaction must be array(3) per CIP-0167"
+        );
+        // The wire MUST NOT contain a CBOR bool (0xf4 false or 0xf5 true) —
+        // the is_valid byte is omitted.
+        assert!(
+            !encoded.contains(&0xf4),
+            "Dijkstra tx wire MUST NOT carry is_valid=false (0xf4)"
+        );
+        assert!(
+            !encoded.contains(&0xf5),
+            "Dijkstra tx wire MUST NOT carry is_valid=true (0xf5)"
+        );
+        // The last byte is the trailing null for absent aux_data (0xf6).
+        assert_eq!(
+            *encoded.last().unwrap(),
+            0xf6,
+            "Dijkstra tx without aux data must end with CBOR null"
+        );
+    }
+
+    /// CIP-0167: even when the in-memory `Transaction.is_valid == false`, the
+    /// Dijkstra encoder must NOT emit a wire bool. Author-supplied validity
+    /// is irrelevant in Dijkstra — it's derived dynamically at apply time.
+    #[test]
+    fn test_encode_dijkstra_transaction_is_valid_false_still_omits_byte() {
+        let body = minimal_body();
+        let tx = dugite_primitives::transaction::Transaction {
+            hash: Hash32::ZERO,
+            era: Era::Dijkstra,
+            body,
+            witness_set: empty_witness_set(),
+            is_valid: false,
+            auxiliary_data: None,
+            raw_cbor: None,
+            raw_body_cbor: None,
+            raw_witness_cbor: None,
+        };
+        let encoded = encode_transaction(&tx);
+        assert_eq!(encoded[0], 0x83, "Dijkstra tx is still array(3)");
+        assert!(
+            !encoded.contains(&0xf4) && !encoded.contains(&0xf5),
+            "Dijkstra wire MUST omit the is_valid bool even when is_valid=false"
+        );
+    }
+
+    /// Conway (era < Dijkstra) MUST still emit array(4) with the is_valid byte.
+    /// This pins that the era dispatch doesn't accidentally regress pre-Dijkstra
+    /// encoding.
+    #[test]
+    fn test_encode_conway_transaction_still_array4() {
+        let body = minimal_body();
+        let tx = dugite_primitives::transaction::Transaction {
+            hash: Hash32::ZERO,
+            era: Era::Conway,
+            body,
+            witness_set: empty_witness_set(),
+            is_valid: true,
+            auxiliary_data: None,
+            raw_cbor: None,
+            raw_body_cbor: None,
+            raw_witness_cbor: None,
+        };
+        let encoded = encode_transaction(&tx);
+        assert_eq!(
+            encoded[0], 0x84,
+            "Conway tx wire shape is unchanged (array(4))"
+        );
+        assert!(
+            encoded.contains(&0xf5),
+            "Conway is_valid=true must encode as CBOR true (0xf5)"
+        );
+    }
+
+    /// Round-trip Dijkstra: encode then decode via the in-house dispatch
+    /// (`decode_transaction(7, ..)` → `decode_dijkstra_tx_standalone`).
+    /// Body fields must survive, era must be Dijkstra, and is_valid defaults
+    /// to true (CIP-0167 dynamic semantics — no on-wire signal).
+    #[test]
+    fn test_dijkstra_transaction_round_trip_through_dispatch() {
+        let mut body = minimal_body();
+        body.fee = Lovelace(444_555);
+        let tx = dugite_primitives::transaction::Transaction {
+            hash: Hash32::ZERO,
+            era: Era::Dijkstra,
+            body,
+            witness_set: empty_witness_set(),
+            is_valid: true,
+            auxiliary_data: None,
+            raw_cbor: None,
+            raw_body_cbor: None,
+            raw_witness_cbor: None,
+        };
+        let encoded = encode_transaction(&tx);
+        // HFC era id 7 == Dijkstra in `decode_transaction`.
+        let decoded =
+            crate::decode::decode_transaction(7, &encoded).expect("Dijkstra tx must decode");
+        assert_eq!(
+            decoded.era,
+            Era::Dijkstra,
+            "era must round-trip as Dijkstra"
+        );
+        assert_eq!(
+            decoded.body.fee,
+            Lovelace(444_555),
+            "fee survives round-trip"
+        );
+        assert_eq!(decoded.body.inputs.len(), tx.body.inputs.len());
+        assert_eq!(decoded.body.outputs.len(), tx.body.outputs.len());
+        // is_valid defaults to true on Dijkstra-decoded txs (no wire signal).
+        assert!(decoded.is_valid);
+        // raw_body_cbor must be preserved for hash-stability invariants.
+        assert!(decoded.raw_body_cbor.is_some());
+    }
+
+    /// A 4-element CBOR array offered as Dijkstra must fail to decode — the
+    /// Conway shape is rejected, the loosening would mask malformed input.
+    #[test]
+    fn test_decode_dijkstra_rejects_array4_conway_shape() {
+        // Build a Conway-shaped (array(4)) tx and ask the Dijkstra dispatch
+        // to decode it. The decoder MUST refuse rather than silently accept
+        // the legacy shape — defense in depth per Dugite's adversarial-input
+        // posture.
+        let body = minimal_body();
+        let conway_tx = dugite_primitives::transaction::Transaction {
+            hash: Hash32::ZERO,
+            era: Era::Conway,
+            body,
+            witness_set: empty_witness_set(),
+            is_valid: true,
+            auxiliary_data: None,
+            raw_cbor: None,
+            raw_body_cbor: None,
+            raw_witness_cbor: None,
+        };
+        let conway_encoded = encode_transaction(&conway_tx);
+        assert_eq!(
+            conway_encoded[0], 0x84,
+            "sanity: Conway encoded as array(4)"
+        );
+        // Dispatch as Dijkstra → must error.
+        let err = crate::decode::decode_transaction(7, &conway_encoded)
+            .expect_err("Dijkstra decoder must reject array(4) Conway shape");
+        let msg = format!("{err:?}");
+        assert!(
+            msg.contains("array(3)")
+                || msg.contains("array(4)")
+                || msg.to_lowercase().contains("dijkstra"),
+            "error should explain the array-shape mismatch, got: {msg}"
         );
     }
 }

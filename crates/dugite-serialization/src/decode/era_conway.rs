@@ -886,6 +886,12 @@ fn read_script_ref(
             let script_bytes = sr.read_bytes()?.to_vec();
             Ok(ScriptRef::PlutusV3(script_bytes))
         }
+        4 => {
+            // PlutusV4: Dijkstra language tag 4. Wire shape identical to V3 —
+            // `bstr(flat_program)`. Cost-model slot 3 (issue #475 Phase 5).
+            let script_bytes = sr.read_bytes()?.to_vec();
+            Ok(ScriptRef::PlutusV4(script_bytes))
+        }
         other => Err(SerializationError::CborDecode(format!(
             "script_ref: unknown script type {other}"
         ))),
@@ -1647,6 +1653,7 @@ fn read_cost_models(r: &mut Reader<'_>) -> Result<CostModels, SerializationError
     let mut plutus_v1 = None;
     let mut plutus_v2 = None;
     let mut plutus_v3 = None;
+    let mut plutus_v4 = None;
     // Use read_map to handle both definite- and indefinite-length maps.
     let pairs = r.read_map(
         |r| r.read_uint(),
@@ -1657,6 +1664,8 @@ fn read_cost_models(r: &mut Reader<'_>) -> Result<CostModels, SerializationError
             0 => plutus_v1 = Some(costs),
             1 => plutus_v2 = Some(costs),
             2 => plutus_v3 = Some(costs),
+            // Dijkstra cost-model slot 3 = PlutusV4 (issue #475 Phase 5).
+            3 => plutus_v4 = Some(costs),
             _ => {}
         }
     }
@@ -1664,6 +1673,7 @@ fn read_cost_models(r: &mut Reader<'_>) -> Result<CostModels, SerializationError
         plutus_v1,
         plutus_v2,
         plutus_v3,
+        plutus_v4,
     })
 }
 
@@ -2329,6 +2339,96 @@ pub(crate) fn decode_conway_tx_standalone(
         body,
         witness_set,
         is_valid,
+        auxiliary_data,
+        raw_cbor: Some(cbor.to_vec()),
+        raw_body_cbor: Some(raw_body_cbor),
+        raw_witness_cbor: Some(raw_witness_cbor),
+    })
+}
+
+/// Decode a standalone Dijkstra transaction from raw CBOR bytes (CIP-0167).
+///
+/// Dijkstra removes the top-level `isValid` flag from the mempool / standalone
+/// transaction wire format. The wire shape is therefore:
+///
+/// ```text
+/// tx = [body, witness_set, auxiliary_data]    -- 3 elements
+/// ```
+///
+/// instead of the pre-Dijkstra `[body, witness_set, is_valid, aux_data]`.
+///
+/// This matches Haskell `Cardano.Ledger.Dijkstra.Tx`:
+///
+/// ```haskell
+/// toCBORForMempoolSubmission DijkstraTx{..} =
+///   encode $ Rec DijkstraTx
+///     !> To dtBody
+///     !> To dtWits
+///     !> OmitC dtIsValid          -- *** removed from wire ***
+///     !> E (encodeNullStrictMaybe encCBOR) dtAuxData
+/// ```
+///
+/// Because the wire no longer carries an explicit validity flag, the returned
+/// [`Transaction`] has `is_valid` defaulted to `true`. The ledger determines
+/// the actual outcome dynamically: a Phase-2 script failure routes the
+/// transaction through the collateral-consumption path
+/// (`apply_invalid_tx`), exactly as in Conway, regardless of any
+/// author-supplied flag.
+///
+/// The transaction hash is `blake2b_256(raw_body_cbor)` — identical
+/// computation to Conway.
+pub(crate) fn decode_dijkstra_tx_standalone(
+    cbor: &[u8],
+) -> Result<Transaction, SerializationError> {
+    let mut r = Reader::new(cbor);
+
+    // tx = [body, witness_set, aux_data]  -- CIP-0167: NO is_valid bool.
+    let arr_len = r.read_array_header()?;
+    match arr_len {
+        Some(3) => {}
+        Some(n) => {
+            return Err(SerializationError::CborDecode(format!(
+                "Dijkstra tx: expected array(3) per CIP-0167, got array({n})"
+            )));
+        }
+        None => {
+            return Err(SerializationError::CborDecode(
+                "Dijkstra tx: expected definite-length array".to_string(),
+            ));
+        }
+    }
+
+    // 1. Body — capture raw bytes for hash computation.
+    let body_raw = KeepRaw::parse_with(&mut r, decode_conway_tx_body)?;
+    let raw_body_cbor = body_raw.raw.to_vec();
+    let tx_hash = blake2b_256(&raw_body_cbor);
+    let body = body_raw.value;
+
+    // 2. Witness set.
+    let ws_raw = KeepRaw::parse_with(&mut r, decode_conway_witness_set)?;
+    let raw_witness_cbor = ws_raw.raw.to_vec();
+    let witness_set = ws_raw.value;
+
+    // 3. Auxiliary data (null or a value). No is_valid bool in between.
+    let auxiliary_data = {
+        let ty = r.peek_major()?;
+        if ty == Type::Null {
+            r.read_null()?;
+            None
+        } else {
+            Some(decode_auxiliary_data(&mut r)?)
+        }
+    };
+
+    Ok(Transaction {
+        hash: tx_hash,
+        era: Era::Dijkstra,
+        body,
+        witness_set,
+        // CIP-0167: validity is determined dynamically by Phase-2 evaluation,
+        // not signaled on the wire. Default to `true` here; the ledger's
+        // `apply_invalid_tx` path runs when Phase-2 actually fails.
+        is_valid: true,
         auxiliary_data,
         raw_cbor: Some(cbor.to_vec()),
         raw_body_cbor: Some(raw_body_cbor),
