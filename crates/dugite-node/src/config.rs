@@ -20,6 +20,39 @@ pub enum ConsensusMode {
     GenesisMode,
 }
 
+impl ConsensusMode {
+    /// Lower-case string identifier matching the dugite-node `--consensus-mode`
+    /// CLI flag values (`"praos"` / `"genesis"`).
+    pub fn as_runtime_str(self) -> &'static str {
+        match self {
+            ConsensusMode::PraosMode => "praos",
+            ConsensusMode::GenesisMode => "genesis",
+        }
+    }
+}
+
+/// Resolve the effective consensus mode (#535).
+///
+/// Precedence: explicit CLI flag (`--consensus-mode`) wins; otherwise the
+/// JSON config field `ConsensusMode` is canonical (mirroring cardano-node).
+///
+/// Returns `(mode, source)` where `source` is `"cli"` or `"config"` for the
+/// startup log line — operators must be able to see which source won.
+///
+/// Invalid CLI values (anything other than `"praos"` / `"genesis"`) are
+/// rejected by `clap`'s `value_parser` before reaching this function.
+pub fn resolve_consensus_mode(
+    cli: Option<&str>,
+    config: ConsensusMode,
+) -> (&'static str, &'static str) {
+    match cli {
+        Some("genesis") => ("genesis", "cli"),
+        Some("praos") => ("praos", "cli"),
+        Some(_) => (config.as_runtime_str(), "config"),
+        None => (config.as_runtime_str(), "config"),
+    }
+}
+
 /// Inbound connection limits (matches Haskell AcceptedConnectionsLimit).
 ///
 /// Haskell's hand-written `FromJSON` instance uses short keys (`hardLimit`,
@@ -1088,6 +1121,53 @@ mod tests {
         let json = r#"{"ConsensusMode": "GenesisMode"}"#;
         let config: NodeConfig = serde_json::from_str(json).unwrap();
         assert_eq!(config.consensus_mode, ConsensusMode::GenesisMode);
+    }
+
+    // ── ConsensusMode CLI/JSON resolution (#535) ─────────────────────────────
+
+    #[test]
+    fn test_resolve_consensus_mode_cli_overrides_config() {
+        // CLI explicitly says praos → wins over config GenesisMode.
+        assert_eq!(
+            resolve_consensus_mode(Some("praos"), ConsensusMode::GenesisMode),
+            ("praos", "cli")
+        );
+        // CLI explicitly says genesis → wins over config PraosMode.
+        assert_eq!(
+            resolve_consensus_mode(Some("genesis"), ConsensusMode::PraosMode),
+            ("genesis", "cli")
+        );
+    }
+
+    #[test]
+    fn test_resolve_consensus_mode_config_used_when_cli_absent() {
+        // No CLI flag → JSON config GenesisMode is honoured (#535 main bug).
+        assert_eq!(
+            resolve_consensus_mode(None, ConsensusMode::GenesisMode),
+            ("genesis", "config")
+        );
+        // No CLI flag, config PraosMode → praos.
+        assert_eq!(
+            resolve_consensus_mode(None, ConsensusMode::PraosMode),
+            ("praos", "config")
+        );
+    }
+
+    #[test]
+    fn test_resolve_consensus_mode_unexpected_cli_falls_back_to_config() {
+        // clap normally rejects unknown values via `value_parser`, but the
+        // helper must be total — if a future caller bypasses clap we fall
+        // back to the JSON source-of-truth rather than panic.
+        assert_eq!(
+            resolve_consensus_mode(Some("weird"), ConsensusMode::GenesisMode),
+            ("genesis", "config")
+        );
+    }
+
+    #[test]
+    fn test_consensus_mode_as_runtime_str() {
+        assert_eq!(ConsensusMode::PraosMode.as_runtime_str(), "praos");
+        assert_eq!(ConsensusMode::GenesisMode.as_runtime_str(), "genesis");
     }
 
     // ── Genesis sync targets ────────────────────────────────────────────────
