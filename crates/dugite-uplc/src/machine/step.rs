@@ -236,32 +236,126 @@ fn return_compute(
                 })
             }
         }
-        Frame::Cases { branches, env } => match value {
-            Value::Constr { tag, args } => {
-                // Pick the branch term by tag. Mismatched tag = script
-                // error (Haskell `MissingCaseBranch`).
-                let branch = branches
-                    .get(tag as usize)
-                    .ok_or(UplcError::ScriptError)?
-                    .clone();
-                // Apply `branch` to each constr arg in order. Push
-                // ApplyValue frames in REVERSE so the first arg ends
-                // up on top of the stack and is popped (applied)
-                // first.
-                for arg in args.into_iter().rev() {
-                    kont.push(Frame::ApplyValue { argument: arg })?;
+        Frame::Cases { branches, env } => {
+            // Plutus 1.1.0 `case` accepts a SOP `Constr` (CIP-0085) or
+            // a small set of enumerable `Constant` scrutinees — see
+            // the formal spec.  For constants, the scrutinee is
+            // re-projected to a `(tag, args)` shape and the matching
+            // branch is invoked with `args` applied in order.
+            // Plutus 1.1.0 `case`-on-Constant requires the branch
+            // count to match the scrutinee's constructor count
+            // exactly (or be in-range for Integer).  Mismatched
+            // branch counts surface as `ScriptError` per the spec's
+            // `MissingCaseBranch` / extra-branch semantics.
+            let branch_count = branches.len();
+            // For constant scrutinees, `max_branches` caps the
+            // branch list length to the number of constructors in
+            // the scrutinee's type — extra branches are a script
+            // error.  `None` ⇒ no cap (Constr; Integer-indexed).
+            let (tag, payload, max_branches): (
+                u64,
+                Vec<crate::machine::value::Value>,
+                Option<usize>,
+            ) = match value {
+                crate::machine::value::Value::Constr { tag, args } => (tag, args, None),
+                crate::machine::value::Value::Const(c) => {
+                    use crate::term::Constant;
+                    match c {
+                        // Bool: False = 0, True = 1.  Exactly 2 branches.
+                        Constant::Bool(false) => (0, Vec::new(), Some(2)),
+                        Constant::Bool(true) => (1, Vec::new(), Some(2)),
+                        // Unit: single branch.
+                        Constant::Unit => (0, Vec::new(), Some(1)),
+                        // List: branch 0 = Cons (head, tail), branch 1 = Nil.
+                        // Exactly 2 branches.
+                        Constant::ProtoList {
+                            elem_type,
+                            elements,
+                        } => {
+                            if elements.is_empty() {
+                                (1, Vec::new(), Some(2))
+                            } else {
+                                let mut iter = elements.into_iter();
+                                let head = iter.next().ok_or_else(|| {
+                                    UplcError::Internal("list empty after non-empty check".into())
+                                })?;
+                                let tail: Vec<Constant> = iter.collect();
+                                (
+                                    0,
+                                    vec![
+                                        crate::machine::value::Value::Const(head),
+                                        crate::machine::value::Value::Const(Constant::ProtoList {
+                                            elem_type,
+                                            elements: tail,
+                                        }),
+                                    ],
+                                    Some(2),
+                                )
+                            }
+                        }
+                        // Pair: single branch with `(a, b)` payload.
+                        Constant::ProtoPair { a, b, .. } => (
+                            0,
+                            vec![
+                                crate::machine::value::Value::Const(*a),
+                                crate::machine::value::Value::Const(*b),
+                            ],
+                            Some(1),
+                        ),
+                        // Integer: scrutinee value indexes into the
+                        // branches list (must be in `0..len`).  Out
+                        // of range → ScriptError.
+                        Constant::Integer(n) => {
+                            use num_traits::ToPrimitive;
+                            let idx = n
+                                .to_u64()
+                                .filter(|i| (*i as usize) < branch_count)
+                                .ok_or(UplcError::ScriptError)?;
+                            // No required-count constraint — any
+                            // non-empty branch list whose length
+                            // covers the index is fine.
+                            (idx, Vec::new(), None)
+                        }
+                        // Other constants (ByteString, String, Data,
+                        // BLS): not enumerable, `case` fails.
+                        other => {
+                            return Err(UplcError::Internal(format!(
+                                "case on non-enumerable constant: {:?}",
+                                std::mem::discriminant(&other)
+                            )));
+                        }
+                    }
                 }
-                Ok(State::Compute {
-                    term: branch,
-                    env,
-                    kont,
-                })
+                other => {
+                    return Err(UplcError::Internal(format!(
+                        "Case scrutinee must reduce to Constr or enumerable Constant, got {:?}",
+                        std::mem::discriminant(&other)
+                    )));
+                }
+            };
+            if let Some(max) = max_branches {
+                if branch_count > max {
+                    return Err(UplcError::ScriptError);
+                }
             }
-            other => Err(UplcError::Internal(format!(
-                "Case scrutinee must reduce to Constr, got {:?}",
-                std::mem::discriminant(&other)
-            ))),
-        },
+            // Pick the branch term by tag. Mismatched tag = script
+            // error (Haskell `MissingCaseBranch`).
+            let branch = branches
+                .get(tag as usize)
+                .ok_or(UplcError::ScriptError)?
+                .clone();
+            // Apply `branch` to each payload value in order. Push
+            // ApplyValue frames in REVERSE so the first arg ends up
+            // on top of the stack and is popped (applied) first.
+            for arg in payload.into_iter().rev() {
+                kont.push(Frame::ApplyValue { argument: arg })?;
+            }
+            Ok(State::Compute {
+                term: branch,
+                env,
+                kont,
+            })
+        }
     }
 }
 
@@ -589,10 +683,23 @@ mod tests {
     }
 
     #[test]
-    fn case_with_non_constr_scrutinee_errors() {
-        // (case 42 [99]) — scrutinee isn't a Constr.
+    fn case_with_integer_scrutinee_out_of_range_errors() {
+        // (case 42 [99]) — Plutus 1.1.0 case-on-Integer indexes
+        // into branches by the scrutinee value; 42 is out of range
+        // for a single-branch list → ScriptError.
         let case = Term::Case {
             scrutinee: Box::new(int_term(42)),
+            branches: vec![int_term(99)],
+        };
+        assert!(matches!(evaluate(case), Err(UplcError::ScriptError)));
+    }
+
+    #[test]
+    fn case_with_bytestring_scrutinee_errors() {
+        // ByteString is not enumerable by case → Internal error.
+        use crate::term::Constant;
+        let case = Term::Case {
+            scrutinee: Box::new(Term::Const(Constant::ByteString(vec![1, 2]))),
             branches: vec![int_term(99)],
         };
         assert!(matches!(evaluate(case), Err(UplcError::Internal(_))));

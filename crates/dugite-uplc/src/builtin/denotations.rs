@@ -641,9 +641,9 @@ pub fn denote(id: BuiltinId, args: Vec<Value>) -> Result<Value, UplcError> {
         }
 
         // ── CIP-0123 bitwise (V3) ─────────────────────────────────────
-        AndByteString => bitwise_byte_string(args, id, |a, b| a & b, 0),
-        OrByteString => bitwise_byte_string(args, id, |a, b| a | b, 0),
-        XorByteString => bitwise_byte_string(args, id, |a, b| a ^ b, 0),
+        AndByteString => bitwise_byte_string(args, id, |a, b| a & b),
+        OrByteString => bitwise_byte_string(args, id, |a, b| a | b),
+        XorByteString => bitwise_byte_string(args, id, |a, b| a ^ b),
         ComplementByteString => {
             let v = take_one(args, id)?;
             let bs = unwrap_byte_string(v, id)?;
@@ -712,25 +712,51 @@ pub fn denote(id: BuiltinId, args: Vec<Value>) -> Result<Value, UplcError> {
         // ── ExpModInteger (V3) ────────────────────────────────────────
         ExpModInteger => {
             // (base: Integer) (exp: Integer) (modulus: Integer) -> Integer
-            // Haskell: expModInteger b e m = b ^ e mod m, requiring
-            // m > 0 and e >= 0.
+            //
+            // Reference (`PlutusCore.Crypto.ExpMod.expMod`):
+            //   * m <= 0 → fail ("invalid modulus")
+            //   * m == 1 → 0
+            //   * b == 0 && e < 0 → fail ("not invertible")
+            //   * |b| or |e| > 2^8191 → fail ("out of bounds")
+            //   * otherwise → b^e mod m, where negative e uses the
+            //     modular inverse of b mod m (fails when none exists).
             let mut it = args.into_iter();
             let base = unwrap_integer(it.next().ok_or_else(|| builtin_arity_mismatch(id))?, id)?;
             let exp = unwrap_integer(it.next().ok_or_else(|| builtin_arity_mismatch(id))?, id)?;
             let modulus = unwrap_integer(it.next().ok_or_else(|| builtin_arity_mismatch(id))?, id)?;
             if modulus.sign() != num_bigint::Sign::Plus {
-                return Err(builtin_failure(
-                    id,
-                    "expModInteger: modulus must be positive",
-                ));
+                return Err(builtin_failure(id, "expModInteger: invalid modulus"));
+            }
+            if modulus == BigInt::from(1u32) {
+                return Ok(Value::Const(Constant::Integer(BigInt::from(0u32))));
+            }
+            // Out-of-bounds guard matches the Plutus `maxBoundI` / `minBoundI`
+            // (= ±(2^8191)).
+            let max_bound = BigInt::from(1u32) << 8191u32;
+            if base.magnitude() >= max_bound.magnitude() || exp.magnitude() >= max_bound.magnitude()
+            {
+                return Err(builtin_failure(id, "expModInteger: out of bounds"));
             }
             if exp.sign() == num_bigint::Sign::Minus {
-                return Err(builtin_failure(
-                    id,
-                    "expModInteger: exponent must be non-negative",
-                ));
+                if base.sign() == num_bigint::Sign::NoSign {
+                    return Err(builtin_failure(id, "expModInteger: 0 is not invertible"));
+                }
+                // For e < 0: compute modular inverse of base, then
+                // raise to |e|.  `BigInt::modinv` gives the inverse if
+                // gcd(base, m) == 1; else there is no inverse.
+                let abs_exp = -&exp;
+                match base.modinv(&modulus) {
+                    Some(inv) => Ok(Value::Const(Constant::Integer(
+                        inv.modpow(&abs_exp, &modulus),
+                    ))),
+                    None => Err(builtin_failure(
+                        id,
+                        "expModInteger: base is not invertible modulo the modulus",
+                    )),
+                }
+            } else {
+                Ok(Value::Const(Constant::Integer(base.modpow(&exp, &modulus))))
             }
-            Ok(Value::Const(Constant::Integer(base.modpow(&exp, &modulus))))
         }
 
         // ── CIP-0123 bitwise (continued) ──────────────────────────────
@@ -1112,32 +1138,40 @@ fn bigint_to_i64_or_failure(i: &BigInt, id: BuiltinId, what: &str) -> Result<i64
 /// requires equal-length inputs and rejects mismatched lengths as a
 /// `BuiltinFailure`; the padding-mode variant arrives with the
 /// `padded`-flavour builtins in a follow-on commit.
-fn bitwise_byte_string<F>(
-    args: Vec<Value>,
-    id: BuiltinId,
-    op: F,
-    _pad: u8,
-) -> Result<Value, UplcError>
+fn bitwise_byte_string<F>(args: Vec<Value>, id: BuiltinId, op: F) -> Result<Value, UplcError>
 where
     F: Fn(u8, u8) -> u8,
 {
-    // The current Haskell signature is (padding: Bool, a: ByteString,
-    // b: ByteString) -> ByteString. The first arg controls padding
-    // semantics (True = pad with 0xFF, False = pad with 0x00 — or
-    // some such; CIP-0123 spec details vary). For now we accept the
-    // padding flag but treat both inputs as equal-length (rejecting
-    // mismatched lengths).
+    // CIP-122/123 (`andByteString` / `orByteString` / `xorByteString`)
+    // take a `padded: Bool` flag plus two bytestrings.
+    //
+    // Reference (`PlutusCore.Bitwise`): sort the inputs into
+    // (shorter, longer); if `padded` then output starts as a copy of
+    // `longer` (max-length); else output starts as a copy of `shorter`
+    // (min-length).  The op is applied bytewise for the first
+    // `len(shorter)` positions of the output; bytes beyond that are
+    // left as-is (they came from the longer side and have no
+    // counterpart in the shorter).
     let mut it = args.into_iter();
-    let _padding = unwrap_bool(it.next().ok_or_else(|| builtin_arity_mismatch(id))?, id)?;
+    let padded = unwrap_bool(it.next().ok_or_else(|| builtin_arity_mismatch(id))?, id)?;
     let a = unwrap_byte_string(it.next().ok_or_else(|| builtin_arity_mismatch(id))?, id)?;
     let b = unwrap_byte_string(it.next().ok_or_else(|| builtin_arity_mismatch(id))?, id)?;
-    if a.len() != b.len() {
-        return Err(builtin_failure(
-            id,
-            "bitwise: mismatched byte-string lengths (padding modes wired in follow-on)",
-        ));
+    let (shorter, longer) = if a.len() <= b.len() {
+        (&a, &b)
+    } else {
+        (&b, &a)
+    };
+    let traverse_len = shorter.len();
+    let mut out: Vec<u8> = if padded {
+        longer.clone()
+    } else {
+        shorter.clone()
+    };
+    for i in 0..traverse_len {
+        let x = shorter[i];
+        let y = longer[i];
+        out[i] = op(x, y);
     }
-    let out: Vec<u8> = a.iter().zip(b.iter()).map(|(x, y)| op(*x, *y)).collect();
     Ok(Value::Const(Constant::ByteString(out)))
 }
 
