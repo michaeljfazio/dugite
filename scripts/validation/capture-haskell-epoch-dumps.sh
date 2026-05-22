@@ -51,7 +51,14 @@ if [ -z "$SOCKET" ] || [ -z "$OUT_DIR" ] || [ -z "$NODE_CONFIG" ]; then
 fi
 
 mkdir -p "$OUT_DIR"
-JSONL="$OUT_DIR/epoch-states.jsonl"
+# Named pipe (FIFO) instead of a regular file: the cli writes per-block
+# records into the pipe, the splitter reads them out and emits one
+# epoch_NNNNNN.json per epoch.  Nothing accumulates on disk.  Without
+# this, cn 11.0.1's per-block emission writes ~10 GB/min and saturates
+# the filesystem within minutes (observed 284 GB in 30 min).
+FIFO="$OUT_DIR/epoch-states.fifo"
+rm -f "$FIFO"
+mkfifo "$FIFO"
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 SPLITTER="$SCRIPT_DIR/split-haskell-jsonl.py"
@@ -61,31 +68,22 @@ if [ ! -x "$SPLITTER" ] && [ ! -r "$SPLITTER" ]; then
     exit 3
 fi
 
-echo "[capture] cli=$CLI socket=$SOCKET magic=$MAGIC out=$OUT_DIR jsonl=$JSONL"
+echo "[capture] cli=$CLI socket=$SOCKET magic=$MAGIC out=$OUT_DIR fifo=$FIFO"
 
-# Run the cli in the foreground; user is expected to background this
-# whole script.  Tail the jsonl and feed each line into the splitter
-# so per-epoch files appear as the chain advances.
-(
-    "$CLI" debug log-epoch-state \
-        --socket-path "$SOCKET" \
-        --node-configuration-file "$NODE_CONFIG" \
-        --out-file "$JSONL"
-) &
+# Start the splitter FIRST, reading from the FIFO (blocks until writer opens).
+python3 "$SPLITTER" --out-dir "$OUT_DIR" < "$FIFO" &
+SPLITTER_PID=$!
+
+# Now start the cli writer — opens the FIFO writer end, splitter unblocks.
+"$CLI" debug log-epoch-state \
+    --socket-path "$SOCKET" \
+    --node-configuration-file "$NODE_CONFIG" \
+    --out-file "$FIFO" &
 CLI_PID=$!
 
-trap 'kill $CLI_PID 2>/dev/null || true' EXIT INT TERM
+trap 'kill $CLI_PID $SPLITTER_PID 2>/dev/null || true; rm -f "$FIFO"' EXIT INT TERM
 
-# Wait for the jsonl to appear (cli takes a few seconds to attach).
-TRIES=0
-while [ ! -e "$JSONL" ]; do
-    sleep 1
-    TRIES=$((TRIES + 1))
-    if [ "$TRIES" -gt 60 ]; then
-        echo "[capture] timed out waiting for $JSONL" >&2
-        exit 4
-    fi
-done
-
-# Tail and split.  `tail -F` follows even if the file is rotated.
-tail -n +1 -F "$JSONL" | python3 "$SPLITTER" --out-dir "$OUT_DIR"
+wait "$CLI_PID"
+rc=$?
+echo "[capture] cli exited rc=$rc"
+exit "$rc"
