@@ -302,6 +302,7 @@ pub fn build_simple_tx(inputs: Vec<TransactionInput>, output_value: u64, fee: u6
             proposal_procedures: vec![],
             treasury_value: None,
             donation: None,
+            sub_transactions: vec![],
         },
         witness_set: TransactionWitnessSet {
             vkey_witnesses: vec![],

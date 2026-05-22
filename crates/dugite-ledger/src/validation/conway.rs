@@ -905,6 +905,7 @@ mod tests {
             proposal_procedures,
             treasury_value: None,
             donation: None,
+            sub_transactions: vec![],
         }
     }
 
