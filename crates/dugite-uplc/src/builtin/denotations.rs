@@ -104,12 +104,174 @@ pub fn denote(id: BuiltinId, args: Vec<Value>) -> Result<Value, UplcError> {
             Ok(rest)
         }
 
+        // ── ByteString operations (V1) ──────────────────────────────
+        AppendByteString => {
+            let (a, b) = take_two_byte_strings(args, id)?;
+            let mut out = a;
+            out.extend_from_slice(&b);
+            Ok(Value::Const(Constant::ByteString(out)))
+        }
+        ConsByteString => {
+            // First arg is an Integer in 0..=255; second is a ByteString.
+            // Haskell: `consByteString : i -> bs -> (i `mod` 256) `BS.cons` bs`
+            // The Plutus V2+ semantics CHANGE: range-check (0..=255)
+            // and reject out-of-range. We follow V2 semantics by
+            // default (which is mainnet).
+            let mut it = args.into_iter();
+            let i = unwrap_integer(it.next().ok_or_else(|| builtin_arity_mismatch(id))?, id)?;
+            let bs = unwrap_byte_string(it.next().ok_or_else(|| builtin_arity_mismatch(id))?, id)?;
+            // Range check (V2+).
+            let i_u8 = bigint_to_u8(&i, id, "cons byte must be 0..=255")?;
+            let mut out = Vec::with_capacity(1 + bs.len());
+            out.push(i_u8);
+            out.extend_from_slice(&bs);
+            Ok(Value::Const(Constant::ByteString(out)))
+        }
+        SliceByteString => {
+            // sliceByteString : start -> length -> bs -> sliced
+            // Haskell: BS.take length (BS.drop start bs).
+            // Negative or out-of-range indices clamp to zero / EOF.
+            let mut it = args.into_iter();
+            let start = unwrap_integer(it.next().ok_or_else(|| builtin_arity_mismatch(id))?, id)?;
+            let len = unwrap_integer(it.next().ok_or_else(|| builtin_arity_mismatch(id))?, id)?;
+            let bs = unwrap_byte_string(it.next().ok_or_else(|| builtin_arity_mismatch(id))?, id)?;
+            let start = bigint_to_usize_clamped(&start);
+            let len = bigint_to_usize_clamped(&len);
+            let start_clamped = start.min(bs.len());
+            let end_clamped = start_clamped.saturating_add(len).min(bs.len());
+            Ok(Value::Const(Constant::ByteString(
+                bs[start_clamped..end_clamped].to_vec(),
+            )))
+        }
+        LengthOfByteString => {
+            let mut it = args.into_iter();
+            let bs = unwrap_byte_string(it.next().ok_or_else(|| builtin_arity_mismatch(id))?, id)?;
+            Ok(Value::Const(Constant::Integer(BigInt::from(bs.len()))))
+        }
+        IndexByteString => {
+            // Haskell: indexByteString bs i = BS.index bs (fromInteger i).
+            // If i is out of range, this is a BuiltinFailure.
+            let mut it = args.into_iter();
+            let bs = unwrap_byte_string(it.next().ok_or_else(|| builtin_arity_mismatch(id))?, id)?;
+            let i = unwrap_integer(it.next().ok_or_else(|| builtin_arity_mismatch(id))?, id)?;
+            let idx = match usize::try_from(&i) {
+                Ok(n) if n < bs.len() => n,
+                _ => {
+                    return Err(builtin_failure(id, "indexByteString: index out of range"));
+                }
+            };
+            Ok(Value::Const(Constant::Integer(BigInt::from(bs[idx]))))
+        }
+        EqualsByteString => {
+            let (a, b) = take_two_byte_strings(args, id)?;
+            Ok(Value::Const(Constant::Bool(a == b)))
+        }
+        LessThanByteString => {
+            let (a, b) = take_two_byte_strings(args, id)?;
+            Ok(Value::Const(Constant::Bool(a < b)))
+        }
+        LessThanEqualsByteString => {
+            let (a, b) = take_two_byte_strings(args, id)?;
+            Ok(Value::Const(Constant::Bool(a <= b)))
+        }
+
+        // ── String operations (V1) ──────────────────────────────────
+        AppendString => {
+            let (a, b) = take_two_strings(args, id)?;
+            let mut out = a;
+            out.push_str(&b);
+            Ok(Value::Const(Constant::String(out)))
+        }
+        EqualsString => {
+            let (a, b) = take_two_strings(args, id)?;
+            Ok(Value::Const(Constant::Bool(a == b)))
+        }
+        EncodeUtf8 => {
+            let mut it = args.into_iter();
+            let s = unwrap_string(it.next().ok_or_else(|| builtin_arity_mismatch(id))?, id)?;
+            Ok(Value::Const(Constant::ByteString(s.into_bytes())))
+        }
+        DecodeUtf8 => {
+            let mut it = args.into_iter();
+            let bs = unwrap_byte_string(it.next().ok_or_else(|| builtin_arity_mismatch(id))?, id)?;
+            let s = String::from_utf8(bs)
+                .map_err(|e| builtin_failure(id, &format!("decodeUtf8: not valid UTF-8: {e}")))?;
+            Ok(Value::Const(Constant::String(s)))
+        }
+
         // Anything else is a future commit.
         _ => Err(UplcError::Internal(format!(
             "builtin denotation for {} not yet wired",
             id.name()
         ))),
     }
+}
+
+fn take_two_byte_strings(args: Vec<Value>, id: BuiltinId) -> Result<(Vec<u8>, Vec<u8>), UplcError> {
+    let mut it = args.into_iter();
+    let a = unwrap_byte_string(it.next().ok_or_else(|| builtin_arity_mismatch(id))?, id)?;
+    let b = unwrap_byte_string(it.next().ok_or_else(|| builtin_arity_mismatch(id))?, id)?;
+    Ok((a, b))
+}
+
+fn take_two_strings(args: Vec<Value>, id: BuiltinId) -> Result<(String, String), UplcError> {
+    let mut it = args.into_iter();
+    let a = unwrap_string(it.next().ok_or_else(|| builtin_arity_mismatch(id))?, id)?;
+    let b = unwrap_string(it.next().ok_or_else(|| builtin_arity_mismatch(id))?, id)?;
+    Ok((a, b))
+}
+
+fn unwrap_byte_string(v: Value, id: BuiltinId) -> Result<Vec<u8>, UplcError> {
+    match v {
+        Value::Const(Constant::ByteString(b)) => Ok(b),
+        other => Err(UplcError::BuiltinTypeError {
+            builtin: id.name(),
+            reason: format!(
+                "expected ByteString, got {:?}",
+                std::mem::discriminant(&other)
+            ),
+        }),
+    }
+}
+
+fn unwrap_string(v: Value, id: BuiltinId) -> Result<String, UplcError> {
+    match v {
+        Value::Const(Constant::String(s)) => Ok(s),
+        other => Err(UplcError::BuiltinTypeError {
+            builtin: id.name(),
+            reason: format!("expected String, got {:?}", std::mem::discriminant(&other)),
+        }),
+    }
+}
+
+fn bigint_to_u8(i: &BigInt, id: BuiltinId, why: &str) -> Result<u8, UplcError> {
+    use num_bigint::Sign;
+    if i.sign() == Sign::Minus {
+        return Err(builtin_failure(id, why));
+    }
+    let digits = i.iter_u64_digits().collect::<Vec<_>>();
+    if digits.is_empty() {
+        return Ok(0);
+    }
+    if digits.len() > 1 || digits[0] > 255 {
+        return Err(builtin_failure(id, why));
+    }
+    Ok(digits[0] as u8)
+}
+
+fn bigint_to_usize_clamped(i: &BigInt) -> usize {
+    use num_bigint::Sign;
+    if i.sign() == Sign::Minus {
+        return 0;
+    }
+    let digits = i.iter_u64_digits().collect::<Vec<_>>();
+    if digits.is_empty() {
+        return 0;
+    }
+    if digits.len() > 1 {
+        return usize::MAX;
+    }
+    usize::try_from(digits[0]).unwrap_or(usize::MAX)
 }
 
 fn int_binop<F>(args: Vec<Value>, id: BuiltinId, op: F) -> Result<Value, UplcError>
@@ -411,8 +573,183 @@ mod tests {
 
     #[test]
     fn unwired_builtin_returns_internal() {
-        // ByteString builtin not wired yet.
-        let err = run(BuiltinId::AppendByteString, vec![]).unwrap_err();
+        // sha2_256 (a hash builtin) not wired yet.
+        let err = run(BuiltinId::Sha2_256, vec![]).unwrap_err();
         assert!(matches!(err, UplcError::Internal(_)));
+    }
+
+    // ── ByteString operations ─────────────────────────────────────
+
+    fn bs(b: &[u8]) -> Value {
+        Value::Const(Constant::ByteString(b.to_vec()))
+    }
+    fn s(v: &str) -> Value {
+        Value::Const(Constant::String(v.into()))
+    }
+
+    #[test]
+    fn append_byte_string() {
+        assert_eq!(
+            run(
+                BuiltinId::AppendByteString,
+                vec![bs(b"hello "), bs(b"world")]
+            )
+            .unwrap(),
+            bs(b"hello world")
+        );
+    }
+
+    #[test]
+    fn cons_byte_string_prepends_byte() {
+        assert_eq!(
+            run(BuiltinId::ConsByteString, vec![int(0x41), bs(b"bc")]).unwrap(),
+            bs(b"Abc")
+        );
+    }
+
+    #[test]
+    fn cons_byte_string_out_of_range_fails() {
+        assert!(matches!(
+            run(BuiltinId::ConsByteString, vec![int(256), bs(b"")]),
+            Err(UplcError::BuiltinFailure { .. })
+        ));
+        assert!(matches!(
+            run(BuiltinId::ConsByteString, vec![int(-1), bs(b"")]),
+            Err(UplcError::BuiltinFailure { .. })
+        ));
+    }
+
+    #[test]
+    fn slice_byte_string_clamps_to_bounds() {
+        let bs7 = bs(b"abcdefg");
+        assert_eq!(
+            run(
+                BuiltinId::SliceByteString,
+                vec![int(1), int(3), bs7.clone()]
+            )
+            .unwrap(),
+            bs(b"bcd")
+        );
+        // start past end → empty
+        assert_eq!(
+            run(
+                BuiltinId::SliceByteString,
+                vec![int(100), int(3), bs7.clone()]
+            )
+            .unwrap(),
+            bs(b"")
+        );
+        // negative start clamps to 0
+        assert_eq!(
+            run(BuiltinId::SliceByteString, vec![int(-5), int(3), bs7]).unwrap(),
+            bs(b"abc")
+        );
+    }
+
+    #[test]
+    fn length_of_byte_string() {
+        assert_eq!(
+            run(BuiltinId::LengthOfByteString, vec![bs(b"abc")]).unwrap(),
+            int(3)
+        );
+        assert_eq!(
+            run(BuiltinId::LengthOfByteString, vec![bs(b"")]).unwrap(),
+            int(0)
+        );
+    }
+
+    #[test]
+    fn index_byte_string_in_range() {
+        assert_eq!(
+            run(BuiltinId::IndexByteString, vec![bs(b"hello"), int(0)]).unwrap(),
+            int(b'h' as i64)
+        );
+        assert_eq!(
+            run(BuiltinId::IndexByteString, vec![bs(b"hello"), int(4)]).unwrap(),
+            int(b'o' as i64)
+        );
+    }
+
+    #[test]
+    fn index_byte_string_out_of_range_fails() {
+        assert!(matches!(
+            run(BuiltinId::IndexByteString, vec![bs(b"abc"), int(5)]),
+            Err(UplcError::BuiltinFailure { .. })
+        ));
+        assert!(matches!(
+            run(BuiltinId::IndexByteString, vec![bs(b"abc"), int(-1)]),
+            Err(UplcError::BuiltinFailure { .. })
+        ));
+    }
+
+    #[test]
+    fn equals_byte_string() {
+        assert_eq!(
+            run(BuiltinId::EqualsByteString, vec![bs(b"a"), bs(b"a")]).unwrap(),
+            b(true)
+        );
+        assert_eq!(
+            run(BuiltinId::EqualsByteString, vec![bs(b"a"), bs(b"b")]).unwrap(),
+            b(false)
+        );
+    }
+
+    #[test]
+    fn lexicographic_byte_string_comparisons() {
+        assert_eq!(
+            run(BuiltinId::LessThanByteString, vec![bs(b"abc"), bs(b"abd")]).unwrap(),
+            b(true)
+        );
+        assert_eq!(
+            run(BuiltinId::LessThanByteString, vec![bs(b"abc"), bs(b"abc")]).unwrap(),
+            b(false)
+        );
+        assert_eq!(
+            run(
+                BuiltinId::LessThanEqualsByteString,
+                vec![bs(b"abc"), bs(b"abc")]
+            )
+            .unwrap(),
+            b(true)
+        );
+    }
+
+    // ── String operations ─────────────────────────────────────────
+
+    #[test]
+    fn append_string() {
+        assert_eq!(
+            run(BuiltinId::AppendString, vec![s("hello "), s("world")]).unwrap(),
+            s("hello world")
+        );
+    }
+
+    #[test]
+    fn equals_string() {
+        assert_eq!(
+            run(BuiltinId::EqualsString, vec![s("abc"), s("abc")]).unwrap(),
+            b(true)
+        );
+        assert_eq!(
+            run(BuiltinId::EqualsString, vec![s("abc"), s("xyz")]).unwrap(),
+            b(false)
+        );
+    }
+
+    #[test]
+    fn encode_decode_utf8_round_trip() {
+        let s_val = s("héllo 🎉");
+        let encoded = run(BuiltinId::EncodeUtf8, vec![s_val.clone()]).unwrap();
+        let decoded = run(BuiltinId::DecodeUtf8, vec![encoded]).unwrap();
+        assert_eq!(decoded, s_val);
+    }
+
+    #[test]
+    fn decode_utf8_invalid_fails() {
+        // Lone continuation byte 0x80 is invalid UTF-8.
+        assert!(matches!(
+            run(BuiltinId::DecodeUtf8, vec![bs(&[0x80])]),
+            Err(UplcError::BuiltinFailure { .. })
+        ));
     }
 }
