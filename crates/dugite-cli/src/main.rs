@@ -61,6 +61,8 @@ enum TopCommand {
 enum Commands {
     /// Address commands
     Address(commands::address::AddressCmd),
+    /// Byron-era key conversion commands
+    Byron(ByronTopCmd),
     /// Key generation commands
     Key(commands::key::KeyCmd),
     /// Transaction commands
@@ -81,10 +83,26 @@ enum Commands {
     TextView(commands::text_view::TextViewCmd),
 }
 
+/// `byron key <subcommand>` — mirror the cardano-cli `byron key` nesting.
+#[derive(clap::Args, Debug)]
+struct ByronTopCmd {
+    #[command(subcommand)]
+    command: ByronSubcommand,
+}
+
+#[derive(clap::Subcommand, Debug)]
+enum ByronSubcommand {
+    /// Byron key operations
+    Key(commands::byron::ByronKeyCmd),
+}
+
 impl Commands {
     fn run(self) -> Result<()> {
         match self {
             Commands::Address(cmd) => cmd.run(),
+            Commands::Byron(top) => match top.command {
+                ByronSubcommand::Key(cmd) => cmd.run(),
+            },
             Commands::Key(cmd) => cmd.run(),
             Commands::Transaction(cmd) => cmd.run(),
             Commands::Query(cmd) => cmd.run(),

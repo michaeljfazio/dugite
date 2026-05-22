@@ -1,4 +1,5 @@
 pub mod address;
+pub mod byron;
 pub mod genesis;
 pub mod governance;
 pub mod key;
