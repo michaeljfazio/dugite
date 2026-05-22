@@ -24,6 +24,11 @@ ripemd = "0.1"
 # hash families; pull it in explicitly so the trait is in scope.
 digest = "0.11"
 
+# ed25519 signature verification — Cardano uses the non-strict
+# verifier (matches RFC 8032 plus the older permissive-cofactor
+# behaviour). ed25519-dalek's default `verify` matches.
+ed25519-dalek = { workspace = true }
+
 # Integer arithmetic for the `integer` and rational-cost-model paths.
 num-bigint = { workspace = true }
 num-traits = { workspace = true }
