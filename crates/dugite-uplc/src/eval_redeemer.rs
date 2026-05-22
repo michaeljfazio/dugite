@@ -374,6 +374,7 @@ mod tests {
             proposal_procedures: vec![],
             treasury_value: None,
             donation: None,
+            sub_transactions: vec![],
         };
         let ws = TransactionWitnessSet {
             vkey_witnesses: vec![],
