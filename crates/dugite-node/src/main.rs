@@ -195,9 +195,13 @@ struct RunArgs {
     #[arg(long)]
     utxo_bloom_filter_bits: Option<u32>,
 
-    /// Consensus mode: praos (default) or genesis (enables genesis bootstrap from empty DB)
-    #[arg(long, default_value = "praos")]
-    consensus_mode: String,
+    /// Consensus mode override: `praos` or `genesis`.
+    ///
+    /// When omitted, the value is read from the JSON config field
+    /// `ConsensusMode` (default `PraosMode`).  When provided, this CLI flag
+    /// wins.  See #535.
+    #[arg(long, value_parser = ["praos", "genesis"])]
+    consensus_mode: Option<String>,
 
     /// Force full Phase-2 Plutus validation on all blocks, even during initial sync.
     /// Normally only blocks at tip are fully validated; this enables paranoid/auditing mode.
@@ -1409,6 +1413,17 @@ async fn run_node(args: RunArgs, log_handle: Option<logging::LogHandle>) -> Resu
         "Storage",
     );
 
+    // Resolve effective consensus mode (#535).  CLI flag wins; otherwise the
+    // JSON config field `ConsensusMode` is canonical, matching cardano-node.
+    let (consensus_mode_str, consensus_mode_source) =
+        config::resolve_consensus_mode(args.consensus_mode.as_deref(), node_config.consensus_mode);
+    let consensus_mode = consensus_mode_str.to_string();
+    info!(
+        mode = %consensus_mode,
+        source = consensus_mode_source,
+        "ConsensusMode resolved",
+    );
+
     // Initialize the node
     let mut node = node::Node::new(node::NodeArgs {
         config: node_config,
@@ -1433,7 +1448,7 @@ async fn run_node(args: RunArgs, log_handle: Option<logging::LogHandle>) -> Resu
         snapshot_bulk_min_blocks: args.snapshot_bulk_min_blocks,
         snapshot_bulk_min_secs: args.snapshot_bulk_min_secs,
         storage_config,
-        consensus_mode: args.consensus_mode,
+        consensus_mode,
         validate_all_blocks: args.validate_all_blocks,
         log_handle,
     })?;
