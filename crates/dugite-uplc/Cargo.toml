@@ -7,7 +7,11 @@ repository.workspace = true
 description = "Untyped Plutus Core (UPLC) evaluator, flat/CBOR codec, and CEK machine for the dugite Cardano node"
 
 [lints.rust]
-unsafe_code = "forbid"
+# `unsafe` is forbidden everywhere except the BLS12-381 module, which
+# wraps the audited `blst` C library via raw FFI. That module
+# explicitly opts in via `#[allow(unsafe_code)]` on the items that
+# need it; nothing else in the crate may use `unsafe`.
+unsafe_code = "deny"
 
 [dependencies]
 # Crypto primitives (BLS12-381, ed25519, sha2/3, blake2, keccak256, ripemd160,
@@ -34,6 +38,14 @@ ed25519-dalek = { workspace = true }
 # default `k256::ecdsa` verifier (low-S-normalised, fixed 64-byte
 # signatures); Schnorr matches BIP-340 (`k256::schnorr`).
 k256 = { version = "0.13", default-features = false, features = ["std", "ecdsa", "schnorr", "sha256"] }
+
+# BLS12-381 — Cardano CIP-0381 mandates the IETF/zkcrypto compressed
+# serialisation (48-byte G1 / 96-byte G2) with strict subgroup checks
+# and the IETF hash-to-curve ciphersuite (BLS12381G[12]_XMD:SHA-256_SSWU_RO_).
+# `blst` is the cardano-node reference and the only Rust binding that
+# matches mainnet byte-for-byte. C/asm under the hood, but no
+# transitive pallas chain — direct FFI to a self-contained library.
+blst = "0.3"
 
 # Integer arithmetic for the `integer` and rational-cost-model paths.
 num-bigint = { workspace = true }
