@@ -76,19 +76,25 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 cat <<RECIPE
 [driver] cross-validation recipe for $NETWORK (magic=$MAGIC), epochs $FROM_EPOCH..$TO_EPOCH
 
-Step 1 — (optional) bootstrap dugite from a Mithril snapshot:
-    just mithril-import $NETWORK
+Both nodes sync from genesis with the dumper attached, capturing EVERY
+epoch boundary from epoch 0 to current tip.  Mithril snapshots cannot
+satisfy 'every epoch up to current tip' coverage — they only provide
+forward-going state from the snapshot point.  Wall time on preview is
+~12-24h Haskell + ~6-12h dugite running in parallel.
 
-Step 2 — start cardano-haskell-node (foreground, terminal A):
+Step 1 — start cardano-haskell-node from genesis (background, terminal A):
+    rm -rf ./db-$NETWORK-haskell
     cardano-node run \\
         --config         config/$NETWORK/config.json \\
         --topology       config/$NETWORK/topology.json \\
         --database-path  ./db-$NETWORK-haskell \\
         --socket-path    ./node-haskell.sock \\
-        --port 3002
+        --port 3002 \\
+        +RTS -N -A64m -RTS
 
-Step 3 — start dugite-node with the dumper feature (foreground, terminal B):
+Step 2 — start dugite-node from genesis with the dumper feature (terminal B):
     cargo build --release -p dugite-node --features dugite-ledger/epoch-state-debug
+    rm -rf ./db-$NETWORK-dugite
     DUGITE_EPOCH_STATE_DUMP=$DUGITE_DIR \\
     DUGITE_EPOCH_STATE_DUMP_SKIP_ASSETS=1 \\
     ./target/release/dugite-node run \\
@@ -98,13 +104,46 @@ Step 3 — start dugite-node with the dumper feature (foreground, terminal B):
         --socket-path   ./node-dugite.sock \\
         --port 3001
 
-Step 4 — start the Haskell-side capture (foreground, terminal C):
+Step 3 — start Haskell-side capture immediately after node startup (terminal C):
     $SCRIPT_DIR/capture-haskell-epoch-dumps.sh \\
         --socket ./node-haskell.sock \\
         --magic  $MAGIC \\
         --out-dir $HASKELL_DIR
 
-Step 5 — wait for both sides to cross epoch $TO_EPOCH then run the diff:
+Step 4 — wait for both sides to cross epoch $TO_EPOCH then diff:
+    $SCRIPT_DIR/diff-epoch-dumps.py \\
+        --haskell-dir $HASKELL_DIR \\
+        --dugite-dir  $DUGITE_DIR \\
+        --from-epoch $FROM_EPOCH --to-epoch $TO_EPOCH \\
+        ${REPORT_MD:+--report-md $REPORT_MD} \\
+        ${REPORT_JSON:+--report-json $REPORT_JSON}
+
+Step 1 — start cardano-haskell-node (foreground, terminal A):
+    cardano-node run \\
+        --config         config/$NETWORK/config.json \\
+        --topology       config/$NETWORK/topology.json \\
+        --database-path  ./db-$NETWORK-haskell \\
+        --socket-path    ./node-haskell.sock \\
+        --port 3002
+
+Step 2 — start dugite-node with the dumper feature (foreground, terminal B):
+    cargo build --release -p dugite-node --features dugite-ledger/epoch-state-debug
+    DUGITE_EPOCH_STATE_DUMP=$DUGITE_DIR \\
+    DUGITE_EPOCH_STATE_DUMP_SKIP_ASSETS=1 \\
+    ./target/release/dugite-node run \\
+        --config        config/$NETWORK/config.json \\
+        --topology      config/$NETWORK/topology.json \\
+        --database-path ./db-$NETWORK \\
+        --socket-path   ./node-dugite.sock \\
+        --port 3001
+
+Step 3 — start the Haskell-side capture (foreground, terminal C):
+    $SCRIPT_DIR/capture-haskell-epoch-dumps.sh \\
+        --socket ./node-haskell.sock \\
+        --magic  $MAGIC \\
+        --out-dir $HASKELL_DIR
+
+Step 4 — wait for both sides to cross epoch $TO_EPOCH then run the diff:
     $SCRIPT_DIR/diff-epoch-dumps.py \\
         --haskell-dir $HASKELL_DIR \\
         --dugite-dir  $DUGITE_DIR \\
