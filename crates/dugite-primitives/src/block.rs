@@ -101,6 +101,21 @@ pub struct BlockHeader {
     /// certificate, so this field is empty.
     #[serde(default)]
     pub nonce_vrf_proof: Vec<u8>,
+
+    /// Dijkstra-era header field: previous epoch nonce (`prevNonce`).
+    ///
+    /// Added in protocol version 12+ (Dijkstra era) for cross-epoch nonce
+    /// chaining adjustments via `prevNonceBlockHeaderL` (see
+    /// `Cardano.Ledger.Dijkstra.Era.DijkstraEraBlockHeader`). The field is
+    /// obtained from the consensus header, not the ledger block body.
+    ///
+    /// Wire encoding: the Dijkstra `header_body` may extend the Conway
+    /// `array(10)` with an 11th element — a 32-byte bytes value for the
+    /// previous epoch nonce, or `null` / absent if not applicable.
+    ///
+    /// `None` for all pre-Dijkstra eras (Byron through Conway).
+    #[serde(default)]
+    pub prev_nonce: Option<Hash32>,
 }
 
 /// VRF output
@@ -245,6 +260,7 @@ mod tests {
             kes_signature: vec![],
             nonce_vrf_output: vec![],
             nonce_vrf_proof: vec![],
+            prev_nonce: None,
         }
     }
 

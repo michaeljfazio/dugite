@@ -385,6 +385,7 @@ fn test_opcert_counter_tracking() {
         },
         nonce_vrf_output: vec![],
         nonce_vrf_proof: vec![],
+        prev_nonce: None,
         block_number: BlockNo(1),
         // slot must be ≤ current_slot to avoid FutureBlock error.
         slot: SlotNo(1_000),

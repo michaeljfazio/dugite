@@ -1082,6 +1082,7 @@ mod tests {
             kes_signature: vec![],
             nonce_vrf_output: vec![],
             nonce_vrf_proof: vec![],
+            prev_nonce: None,
         }
     }
 
@@ -2607,6 +2608,7 @@ mod tests {
             },
             nonce_vrf_output: vec![],
             nonce_vrf_proof: vec![],
+            prev_nonce: None,
             block_number: BlockNo(1),
             slot: SlotNo(slot),
             epoch_nonce: Hash32::ZERO,
@@ -2670,6 +2672,7 @@ mod tests {
             },
             nonce_vrf_output: vec![],
             nonce_vrf_proof: vec![],
+            prev_nonce: None,
             block_number: BlockNo(1),
             slot: SlotNo(slot),
             epoch_nonce: Hash32::ZERO,

@@ -299,6 +299,7 @@ fn decode_babbage_header_inner(r: &mut Reader<'_>) -> Result<BlockHeader, Serial
         },
         // Babbage has no separate nonce VRF proof (single VRF certificate).
         nonce_vrf_proof: Vec::new(),
+        prev_nonce: None,
     })
 }
 

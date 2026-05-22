@@ -150,6 +150,7 @@ fn test_header() -> BlockHeader {
         },
         nonce_vrf_output: vec![],
         nonce_vrf_proof: vec![],
+        prev_nonce: None,
         block_number: BlockNo(1),
         slot: SlotNo(1000),
         epoch_nonce: Hash32::ZERO,

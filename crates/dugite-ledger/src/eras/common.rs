@@ -845,6 +845,7 @@ mod tests {
             kes_signature: vec![],
             nonce_vrf_output,
             nonce_vrf_proof: vec![],
+            prev_nonce: None,
         }
     }
 

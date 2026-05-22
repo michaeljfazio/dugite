@@ -473,6 +473,7 @@ pub fn decode_byron_main_block(
         kes_signature: Vec::new(),
         nonce_vrf_output: Vec::new(),
         nonce_vrf_proof: Vec::new(),
+        prev_nonce: None,
     };
 
     Ok(Block {
@@ -602,6 +603,7 @@ pub fn decode_byron_ebb_block(
         kes_signature: Vec::new(),
         nonce_vrf_output: Vec::new(),
         nonce_vrf_proof: Vec::new(),
+        prev_nonce: None,
     };
 
     Ok(Block {
