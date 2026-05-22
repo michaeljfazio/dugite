@@ -26,16 +26,16 @@
 use crate::machine::value::Value;
 use crate::term::{BuiltinId, Constant};
 use crate::UplcError;
-use num_bigint::{BigInt, Sign};
+use num_bigint::BigInt;
 
 use blst::{
-    blst_bendian_from_scalar, blst_fp12, blst_fp12_inverse, blst_fp12_is_equal, blst_fp12_mul,
-    blst_fp12_one, blst_hash_to_g1, blst_hash_to_g2, blst_miller_loop, blst_p1,
-    blst_p1_add_or_double, blst_p1_affine, blst_p1_cneg, blst_p1_compress, blst_p1_from_affine,
-    blst_p1_in_g1, blst_p1_is_equal, blst_p1_mult, blst_p1_to_affine, blst_p1_uncompress, blst_p2,
+    blst_fp12, blst_fp12_inverse, blst_fp12_is_equal, blst_fp12_mul, blst_fp12_one,
+    blst_hash_to_g1, blst_hash_to_g2, blst_miller_loop, blst_p1, blst_p1_add_or_double,
+    blst_p1_affine, blst_p1_cneg, blst_p1_compress, blst_p1_from_affine, blst_p1_in_g1,
+    blst_p1_is_equal, blst_p1_mult, blst_p1_to_affine, blst_p1_uncompress, blst_p2,
     blst_p2_add_or_double, blst_p2_affine, blst_p2_cneg, blst_p2_compress, blst_p2_from_affine,
     blst_p2_in_g2, blst_p2_is_equal, blst_p2_mult, blst_p2_to_affine, blst_p2_uncompress,
-    blst_scalar, blst_scalar_from_bendian, BLST_ERROR,
+    BLST_ERROR,
 };
 
 pub const G1_COMPRESSED_BYTES: usize = 48;
@@ -90,10 +90,6 @@ pub fn validate_g2_compressed(bs: &[u8]) -> Result<(), String> {
     }
     Ok(())
 }
-
-// IETF/RFC 9380 ciphersuites mandated by CIP-0381.
-const G1_DST: &[u8] = b"BLS_SIG_BLS12381G1_XMD:SHA-256_SSWU_RO_NUL_";
-const G2_DST: &[u8] = b"BLS_SIG_BLS12381G2_XMD:SHA-256_SSWU_RO_NUL_";
 
 /// Maximum length of the caller-supplied DST byte string for
 /// `bls12_381_*_hashToGroup`.  RFC 9380 §5.3.3 caps the DST at 255
@@ -213,6 +209,11 @@ fn g1_hash_to_group(args: Vec<Value>, id: BuiltinId) -> Result<Value, UplcError>
     let mut out = blst_p1::default();
     // SAFETY: `out` is a valid blst_p1; msg/dst are byte slices with
     // valid pointers + lengths. blst_hash_to_g1 follows RFC 9380.
+    //
+    // Signature: `blst_hash_to_g1(out, msg, msg_len, DST, DST_len,
+    // aug, aug_len)`.  Plutus does not pass an augmentation string,
+    // so we pass an empty `aug`.  Previously this slot incorrectly
+    // re-passed `G1_DST`, which produced a different curve point.
     unsafe {
         blst_hash_to_g1(
             &mut out,
@@ -220,8 +221,8 @@ fn g1_hash_to_group(args: Vec<Value>, id: BuiltinId) -> Result<Value, UplcError>
             msg.len(),
             dst.as_ptr(),
             dst.len(),
-            G1_DST.as_ptr(),
-            G1_DST.len(),
+            std::ptr::null(),
+            0,
         )
     };
     Ok(g1_to_value(&out))
@@ -316,6 +317,7 @@ fn g2_hash_to_group(args: Vec<Value>, id: BuiltinId) -> Result<Value, UplcError>
         });
     }
     let mut out = blst_p2::default();
+    // Empty `aug` — same reasoning as `g1_hash_to_group`.
     unsafe {
         blst_hash_to_g2(
             &mut out,
@@ -323,8 +325,8 @@ fn g2_hash_to_group(args: Vec<Value>, id: BuiltinId) -> Result<Value, UplcError>
             msg.len(),
             dst.as_ptr(),
             dst.len(),
-            G2_DST.as_ptr(),
-            G2_DST.len(),
+            std::ptr::null(),
+            0,
         )
     };
     Ok(g2_to_value(&out))
@@ -521,29 +523,34 @@ fn fp12_from_bytes(bs: &[u8; FP12_BYTES]) -> Result<blst_fp12, UplcError> {
 
 fn bigint_to_blst_scalar(n: &BigInt) -> [u8; 32] {
     // CIP-0381 scalar arg is an Integer interpreted mod r (the BLS
-    // group order). blst's mult takes a big-endian byte-buffer plus
-    // its bit length. We pass the raw 32-byte big-endian
-    // representation; reduction happens inside blst.
-    let mut be = n.to_bytes_be().1;
-    // Pad to 32 bytes; truncate if longer (shouldn't happen given r
-    // is 255 bits, but cap defensively).
-    if be.len() > 32 {
-        be.truncate(be.len() - 32);
-    }
+    // scalar-field order).  `blst_p1_mult` / `blst_p2_mult` expect the
+    // scalar as a **little-endian** byte buffer (blst README,
+    // §"Scalar input").  The Haskell cardano-crypto-class wrapper
+    // passes it LE as well.
+    //
+    // We reduce mod r ourselves so blst sees a canonical 0..r-1
+    // representative and negation works on the curve.  `blst_p1_mult`
+    // does not perform a mod-r reduction on a 256-bit buffer; large
+    // or negative inputs interpreted naively give a wrong point.
+    use num_bigint::BigInt as BI;
+    // BLS12-381 scalar-field modulus r (decimal).  Matches the value
+    // in IntersectMBO's `cardano-base` and pasta-curves crates.
+    let r_hex = "73eda753299d7d483339d80809a1d80553bda402fffe5bfeffffffff00000001";
+    // SAFETY: `r_hex` is a fixed hex constant; `parse_bytes` only
+    // returns `None` for malformed input — a compile-time invariant
+    // here.  Fall back to `r = 1` if parse ever fails so we never
+    // panic on this path; that would simply cause all scalarMul
+    // results to be the point at infinity for the affected call.
+    let r: BI = BI::parse_bytes(r_hex.as_bytes(), 16).unwrap_or_else(|| BI::from(1));
+    // Reduce: ((n mod r) + r) mod r — handles negative inputs.
+    let reduced = ((n % &r) + &r) % &r;
+    let abs_be = reduced.magnitude().to_bytes_be();
     let mut out = [0u8; 32];
-    let start = 32 - be.len();
-    out[start..].copy_from_slice(&be);
-    if n.sign() == Sign::Minus {
-        // For negative scalars, take additive inverse mod r. We
-        // approximate by negating in two's complement of the 256-bit
-        // buffer; blst reduces mod r internally.
-        for b in &mut out {
-            *b = !*b;
+    for (i, &b) in abs_be.iter().rev().enumerate() {
+        if i >= 32 {
+            break;
         }
-        // Plus one (for two's complement) — done via blst_scalar utils.
-        let mut s = blst_scalar::default();
-        unsafe { blst_scalar_from_bendian(&mut s, out.as_ptr()) };
-        unsafe { blst_bendian_from_scalar(out.as_mut_ptr(), &s) };
+        out[i] = b;
     }
     out
 }

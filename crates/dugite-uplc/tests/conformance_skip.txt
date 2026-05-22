@@ -25,10 +25,10 @@
 #                                    `lookupCoin` / `scaleValue` / `unValueData`
 #                                    builtin token-bundles, etc.)
 #   eval_fails_unexpectedly:     74  CEK rejects programs the reference accepts
-#   result_mismatch:             65  CEK produces a different normal form
+#   result_mismatch:              9  CEK produces a different normal form
 #                                    than the reference
 #   ───────────────────────────────
-#   Total skipped:              308 / 999 (691 currently pass)
+#   Total skipped:              252 / 999 (747 currently pass)
 #
 # Goal: 0 / 999.
 
@@ -282,56 +282,8 @@ term/constant-case/pair/pair-01
 term/constant-case/pair/pair-02
 term/constant-case/unit/unit-01
 
-# === result_mismatch (65 tests) ===
+# === result_mismatch (9 tests) ===
 # dugite-uplc CEK produces a different normal form than the reference
-builtin/semantics/bls12_381-cardano-crypto-tests/G1/arith/scalarMul
-builtin/semantics/bls12_381-cardano-crypto-tests/G2/arith/scalarMul
-builtin/semantics/bls12_381-cardano-crypto-tests/signature/augmented
-builtin/semantics/bls12_381-cardano-crypto-tests/signature/large-dst
-builtin/semantics/bls12_381_G1_hashToGroup/hash
-builtin/semantics/bls12_381_G1_hashToGroup/hash-dst-len-255
-builtin/semantics/bls12_381_G1_hashToGroup/hash-empty-dst
-builtin/semantics/bls12_381_G1_scalarMul/addmul
-builtin/semantics/bls12_381_G1_scalarMul/mul-44
-builtin/semantics/bls12_381_G1_scalarMul/mul-neg-one
-builtin/semantics/bls12_381_G1_scalarMul/mul-one
-builtin/semantics/bls12_381_G1_scalarMul/mul19+25
-builtin/semantics/bls12_381_G1_scalarMul/mul4x-11
-builtin/semantics/bls12_381_G1_scalarMul/muladd
-builtin/semantics/bls12_381_G1_scalarMul/mulneg-44
-builtin/semantics/bls12_381_G1_scalarMul/mulperiodic-01
-builtin/semantics/bls12_381_G1_scalarMul/mulperiodic-02
-builtin/semantics/bls12_381_G1_scalarMul/mulperiodic-03
-builtin/semantics/bls12_381_G1_scalarMul/mulperiodic-04
-builtin/semantics/bls12_381_G2_hashToGroup/hash
-builtin/semantics/bls12_381_G2_hashToGroup/hash-dst-len-255
-builtin/semantics/bls12_381_G2_hashToGroup/hash-empty-dst
-builtin/semantics/bls12_381_G2_scalarMul/addmul
-builtin/semantics/bls12_381_G2_scalarMul/mul-44
-builtin/semantics/bls12_381_G2_scalarMul/mul-neg-one
-builtin/semantics/bls12_381_G2_scalarMul/mul-one
-builtin/semantics/bls12_381_G2_scalarMul/mul19+25
-builtin/semantics/bls12_381_G2_scalarMul/mul4x-11
-builtin/semantics/bls12_381_G2_scalarMul/muladd
-builtin/semantics/bls12_381_G2_scalarMul/mulneg-44
-builtin/semantics/bls12_381_G2_scalarMul/mulperiodic-01
-builtin/semantics/bls12_381_G2_scalarMul/mulperiodic-02
-builtin/semantics/bls12_381_G2_scalarMul/mulperiodic-03
-builtin/semantics/bls12_381_G2_scalarMul/mulperiodic-04
-builtin/semantics/findFirstSetBit/case-03
-builtin/semantics/findFirstSetBit/case-04
-builtin/semantics/findFirstSetBit/case-06
-builtin/semantics/findFirstSetBit/case-07
-builtin/semantics/readBit/case-17
-builtin/semantics/rotateByteString/case-12
-builtin/semantics/rotateByteString/case-13
-builtin/semantics/rotateByteString/case-14
-builtin/semantics/rotateByteString/case-15
-builtin/semantics/rotateByteString/case-17
-builtin/semantics/shiftByteString/case-03
-builtin/semantics/shiftByteString/case-04
-builtin/semantics/shiftByteString/case-08
-builtin/semantics/shiftByteString/case-09
 builtin/semantics/verifySchnorrSecp256k1Signature/test-vector-00
 builtin/semantics/verifySchnorrSecp256k1Signature/test-vector-01
 builtin/semantics/verifySchnorrSecp256k1Signature/test-vector-02
@@ -341,13 +293,5 @@ builtin/semantics/verifySchnorrSecp256k1Signature/test-vector-15
 builtin/semantics/verifySchnorrSecp256k1Signature/test-vector-16
 builtin/semantics/verifySchnorrSecp256k1Signature/test-vector-17
 builtin/semantics/verifySchnorrSecp256k1Signature/test-vector-18
-builtin/semantics/writeBits/case-29
-builtin/semantics/writeBits/case-30
-builtin/semantics/writeBits/case-31
-builtin/semantics/writeBits/case-32
-builtin/semantics/writeBits/case-33
-builtin/semantics/writeBits/case-34
-builtin/semantics/writeBits/case-35
-builtin/semantics/writeBits/case-38
 
 
