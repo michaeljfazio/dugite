@@ -27,10 +27,11 @@ pub fn evaluate(term: Term) -> Result<Value, UplcError> {
     }
 }
 
-/// Evaluate with explicit budget tracking. Advances the budget
-/// tracker one tick per CEK step; if any step exhausts the budget,
-/// returns `UplcError::BudgetExhausted`. On success, `tracker.consumed()`
-/// reports the budget actually used.
+/// Evaluate with explicit budget tracking. Charges the per-term-type
+/// CEK machine cost on each `Compute` transition (mirroring the
+/// Haskell reference's `enterComputeCek`); `Return` transitions are
+/// free.  Startup cost is charged once by `BudgetTracker::new`.  On
+/// success, `tracker.consumed()` reports the budget actually used.
 pub fn evaluate_with_budget(
     term: Term,
     tracker: &mut crate::machine::cost::BudgetTracker,
@@ -41,7 +42,9 @@ pub fn evaluate_with_budget(
         kont: Kont::new(),
     };
     loop {
-        tracker.tick()?;
+        if let State::Compute { ref term, .. } = state {
+            tracker.compute_step(term)?;
+        }
         state = step(state)?;
         if let State::Done(v) = state {
             tracker.flush()?;
