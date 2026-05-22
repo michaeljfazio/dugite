@@ -704,6 +704,116 @@ pub fn denote(id: BuiltinId, args: Vec<Value>) -> Result<Value, UplcError> {
             Ok(Value::Const(Constant::Integer(base.modpow(&exp, &modulus))))
         }
 
+        // ── CIP-0123 bitwise (continued) ──────────────────────────────
+        ShiftByteString => {
+            // (bs: ByteString) (shift: Integer) -> ByteString
+            // Positive shift = left (toward high-index bytes); negative
+            // = right. Output is the same length as input; bits
+            // shifted out are discarded; new bits are 0. Bit ordering
+            // follows ReadBit (LSB of byte 0 = bit 0).
+            let mut it = args.into_iter();
+            let bs = unwrap_byte_string(it.next().ok_or_else(|| builtin_arity_mismatch(id))?, id)?;
+            let shift_int =
+                unwrap_integer(it.next().ok_or_else(|| builtin_arity_mismatch(id))?, id)?;
+            let len_bits = bs.len().saturating_mul(8);
+            if len_bits == 0 {
+                return Ok(Value::Const(Constant::ByteString(bs)));
+            }
+            // Cap shift at ±len_bits — anything larger just zeros out
+            // the whole string.
+            let shift = shift_int.clone();
+            let abs_shift_int = if shift.sign() == num_bigint::Sign::Minus {
+                -shift.clone()
+            } else {
+                shift.clone()
+            };
+            let abs_shift_u = bigint_to_usize_or_failure(&abs_shift_int, id, "shift amount")?;
+            if abs_shift_u >= len_bits {
+                return Ok(Value::Const(Constant::ByteString(vec![0u8; bs.len()])));
+            }
+            let mut out = vec![0u8; bs.len()];
+            for target_idx in 0..len_bits {
+                // For a left-shift of N: target bit T comes from source bit (T - N).
+                // For a right-shift of N: target bit T comes from source bit (T + N).
+                let src_signed = if shift.sign() == num_bigint::Sign::Minus {
+                    // Right shift: src = target + abs_shift
+                    Some(target_idx + abs_shift_u)
+                } else {
+                    // Left shift: src = target - abs_shift, only if ≥ 0
+                    target_idx.checked_sub(abs_shift_u)
+                };
+                let src = match src_signed {
+                    Some(s) if s < len_bits => s,
+                    _ => continue, // out-of-range source → 0 (already initialised)
+                };
+                let src_bit = (bs[src / 8] >> (src % 8)) & 1;
+                if src_bit != 0 {
+                    out[target_idx / 8] |= 1u8 << (target_idx % 8);
+                }
+            }
+            Ok(Value::Const(Constant::ByteString(out)))
+        }
+        RotateByteString => {
+            // (bs: ByteString) (rotate: Integer) -> ByteString
+            // Same direction convention as ShiftByteString; bits that
+            // would be lost wrap around.
+            let mut it = args.into_iter();
+            let bs = unwrap_byte_string(it.next().ok_or_else(|| builtin_arity_mismatch(id))?, id)?;
+            let rot_int = unwrap_integer(it.next().ok_or_else(|| builtin_arity_mismatch(id))?, id)?;
+            let len_bits = bs.len().saturating_mul(8);
+            if len_bits == 0 {
+                return Ok(Value::Const(Constant::ByteString(bs)));
+            }
+            // Normalise rotate amount mod len_bits.
+            let len_bi = BigInt::from(len_bits);
+            let r = ((rot_int % &len_bi) + &len_bi) % &len_bi;
+            let r_u = bigint_to_usize_or_failure(&r, id, "rotate amount")?;
+            let mut out = vec![0u8; bs.len()];
+            for target_idx in 0..len_bits {
+                let src = (target_idx + len_bits - r_u) % len_bits;
+                let src_bit = (bs[src / 8] >> (src % 8)) & 1;
+                if src_bit != 0 {
+                    out[target_idx / 8] |= 1u8 << (target_idx % 8);
+                }
+            }
+            Ok(Value::Const(Constant::ByteString(out)))
+        }
+        WriteBits => {
+            // (bs: ByteString) (indices: ProtoList Integer) (value: Bool) -> ByteString
+            // For each index in `indices`, set bit `index` to `value`.
+            // Out-of-range index → BuiltinFailure.
+            let mut it = args.into_iter();
+            let bs = unwrap_byte_string(it.next().ok_or_else(|| builtin_arity_mismatch(id))?, id)?;
+            let indices_val = it.next().ok_or_else(|| builtin_arity_mismatch(id))?;
+            let value = unwrap_bool(it.next().ok_or_else(|| builtin_arity_mismatch(id))?, id)?;
+            let (_, idx_elems) = unwrap_proto_list(indices_val, id)?;
+            let len_bits = bs.len().saturating_mul(8);
+            let mut out = bs;
+            for c in idx_elems {
+                let i = match c {
+                    Constant::Integer(i) => i,
+                    _ => {
+                        return Err(UplcError::BuiltinTypeError {
+                            builtin: id.name(),
+                            reason: "writeBits indices list must contain Integers".into(),
+                        });
+                    }
+                };
+                let idx = bigint_to_usize_or_failure(&i, id, "writeBits index")?;
+                if idx >= len_bits {
+                    return Err(builtin_failure(id, "writeBits: index out of range"));
+                }
+                let byte = &mut out[idx / 8];
+                let mask = 1u8 << (idx % 8);
+                if value {
+                    *byte |= mask;
+                } else {
+                    *byte &= !mask;
+                }
+            }
+            Ok(Value::Const(Constant::ByteString(out)))
+        }
+
         // Anything else is a future commit.
         _ => Err(UplcError::Internal(format!(
             "builtin denotation for {} not yet wired",
