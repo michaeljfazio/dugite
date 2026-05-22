@@ -697,7 +697,12 @@ fn collect_plutus_script_hashes(tx: &Transaction, utxo_set: &dyn UtxoLookup) -> 
         if let Some(utxo) = utxo_set.lookup(inp) {
             if let Some(script_ref) = &utxo.script_ref {
                 match script_ref {
-                    ScriptRef::PlutusV1(_) | ScriptRef::PlutusV2(_) | ScriptRef::PlutusV3(_) => {
+                    ScriptRef::PlutusV1(_)
+                    | ScriptRef::PlutusV2(_)
+                    | ScriptRef::PlutusV3(_)
+                    | ScriptRef::PlutusV4(_) => {
+                        // V4 (Dijkstra) requires a redeemer like V1/V2/V3
+                        // (issue #475 Phase 5; full validator integration TBD).
                         hashes.insert(compute_script_ref_hash(script_ref));
                     }
                     // Native scripts do not require redeemers.
@@ -736,6 +741,8 @@ pub(crate) fn plutus_script_version_map(
                     ScriptRef::PlutusV1(_) => 1u8,
                     ScriptRef::PlutusV2(_) => 2,
                     ScriptRef::PlutusV3(_) => 3,
+                    // Dijkstra V4 language tag (issue #475 Phase 5).
+                    ScriptRef::PlutusV4(_) => 4,
                     ScriptRef::NativeScript(_) => continue,
                 };
                 map.insert(compute_script_ref_hash(script_ref), tag);

@@ -68,6 +68,7 @@ pub fn evaluate_native_script(
 /// - `0x01` — Plutus V1
 /// - `0x02` — Plutus V2
 /// - `0x03` — Plutus V3
+/// - `0x04` — Plutus V4 (Dijkstra, issue #475 Phase 5)
 pub(super) fn compute_script_ref_hash(script_ref: &ScriptRef) -> Hash28 {
     match script_ref {
         ScriptRef::NativeScript(ns) => {
@@ -92,6 +93,13 @@ pub(super) fn compute_script_ref_hash(script_ref: &ScriptRef) -> Hash28 {
         ScriptRef::PlutusV3(bytes) => {
             let mut tagged = Vec::with_capacity(1 + bytes.len());
             tagged.push(0x03);
+            tagged.extend_from_slice(bytes);
+            dugite_primitives::hash::blake2b_224(&tagged)
+        }
+        ScriptRef::PlutusV4(bytes) => {
+            // Dijkstra-only hash prefix `0x04` (issue #475 Phase 5).
+            let mut tagged = Vec::with_capacity(1 + bytes.len());
+            tagged.push(0x04);
             tagged.extend_from_slice(bytes);
             dugite_primitives::hash::blake2b_224(&tagged)
         }
@@ -209,9 +217,11 @@ pub(crate) fn calculate_ref_script_size(
 pub(crate) fn script_ref_byte_size(script_ref: &ScriptRef) -> u64 {
     match script_ref {
         ScriptRef::NativeScript(ns) => dugite_serialization::encode_native_script(ns).len() as u64,
-        ScriptRef::PlutusV1(bytes) | ScriptRef::PlutusV2(bytes) | ScriptRef::PlutusV3(bytes) => {
-            bytes.len() as u64
-        }
+        // V4 byte sizing mirrors V1/V2/V3 — raw program byte length.
+        ScriptRef::PlutusV1(bytes)
+        | ScriptRef::PlutusV2(bytes)
+        | ScriptRef::PlutusV3(bytes)
+        | ScriptRef::PlutusV4(bytes) => bytes.len() as u64,
     }
 }
 
