@@ -67,3 +67,56 @@ pub struct EvalResult {
     pub budget_consumed: ExBudget,
     pub logs: Vec<String>,
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ex_budget_default_is_zero() {
+        let b = ExBudget::default();
+        assert_eq!(b.cpu, 0);
+        assert_eq!(b.mem, 0);
+    }
+
+    #[test]
+    fn try_subtract_succeeds_when_in_budget() {
+        let mut b = ExBudget { cpu: 100, mem: 50 };
+        assert!(b.try_subtract(ExBudget { cpu: 40, mem: 30 }));
+        assert_eq!(b, ExBudget { cpu: 60, mem: 20 });
+    }
+
+    #[test]
+    fn try_subtract_succeeds_at_exact_zero() {
+        let mut b = ExBudget { cpu: 10, mem: 5 };
+        assert!(b.try_subtract(ExBudget { cpu: 10, mem: 5 }));
+        assert_eq!(b, ExBudget { cpu: 0, mem: 0 });
+    }
+
+    #[test]
+    fn try_subtract_fails_on_cpu_overshoot() {
+        let mut b = ExBudget { cpu: 10, mem: 100 };
+        let before = b;
+        assert!(!b.try_subtract(ExBudget { cpu: 11, mem: 5 }));
+        // Failed subtractions must not mutate state — the caller may
+        // want to retry with a different budget or surface a
+        // BudgetExhausted error using the pre-attempt remaining.
+        assert_eq!(b, before);
+    }
+
+    #[test]
+    fn try_subtract_fails_on_mem_overshoot() {
+        let mut b = ExBudget { cpu: 100, mem: 10 };
+        let before = b;
+        assert!(!b.try_subtract(ExBudget { cpu: 5, mem: 11 }));
+        assert_eq!(b, before);
+    }
+
+    #[test]
+    fn try_subtract_fails_if_either_dim_overshoots() {
+        let mut b = ExBudget { cpu: 5, mem: 5 };
+        let before = b;
+        assert!(!b.try_subtract(ExBudget { cpu: 10, mem: 10 }));
+        assert_eq!(b, before);
+    }
+}

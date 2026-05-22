@@ -127,21 +127,7 @@ fn encode_data<W: minicbor::encode::Write>(
             }
             Ok(())
         }
-        Data::List(items) => {
-            if items.len() <= DATA_CHUNK_LIMIT {
-                e.array(items.len() as u64)?;
-                for item in items {
-                    encode_data(e, item)?;
-                }
-            } else {
-                e.begin_array()?;
-                for item in items {
-                    encode_data(e, item)?;
-                }
-                e.end()?;
-            }
-            Ok(())
-        }
+        Data::List(items) => encode_list(e, items),
         Data::I(n) => encode_integer(e, n),
         Data::B(bs) => encode_bytes(e, bs),
     }
@@ -171,17 +157,35 @@ fn encode_args<W: minicbor::encode::Write>(
     e: &mut Encoder<W>,
     args: &[Data],
 ) -> Result<(), minicbor::encode::Error<W::Error>> {
-    // The args of a `Constr` are themselves a `List` shape — same
-    // 64-element cutoff between definite / indefinite-length array.
-    if args.len() <= DATA_CHUNK_LIMIT {
-        e.array(args.len() as u64)?;
-        for a in args {
-            encode_data(e, a)?;
-        }
+    // `Constr i ds` is encoded in Haskell as
+    //   `encodeTag t <> encode ds`
+    // where `encode ds` reuses the `Serialise [Data]` instance — see
+    // `encode_list` for the exact empty / non-empty split.
+    encode_list(e, args)
+}
+
+/// Encode a list of `Data` using the `Serialise [a]` rule from `cborg`:
+///
+/// ```text
+/// encodeList [] = encodeListLen 0
+/// encodeList xs = encodeListLenIndef <> foldr (\x r -> encode x <> r) encodeBreak xs
+/// ```
+///
+/// i.e. an empty list is `0x80` (definite length zero); a non-empty
+/// list is `0x9f <items> 0xff` (indefinite length). This empty / non-
+/// empty asymmetry is what cborg's `Codec.Serialise.Class.encodeList`
+/// produces, and reproducing it byte-for-byte is required for wire
+/// compatibility with cardano-node's PlutusData hashes.
+fn encode_list<W: minicbor::encode::Write>(
+    e: &mut Encoder<W>,
+    items: &[Data],
+) -> Result<(), minicbor::encode::Error<W::Error>> {
+    if items.is_empty() {
+        e.array(0)?;
     } else {
         e.begin_array()?;
-        for a in args {
-            encode_data(e, a)?;
+        for item in items {
+            encode_data(e, item)?;
         }
         e.end()?;
     }
