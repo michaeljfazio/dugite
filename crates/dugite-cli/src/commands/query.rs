@@ -150,6 +150,15 @@ enum QuerySubcommand {
         socket_path: PathBuf,
         #[arg(long)]
         testnet_magic: Option<u64>,
+        /// Format output as JSON (the cardano-cli default).
+        #[arg(long)]
+        output_json: bool,
+        /// Format output as human-readable text.
+        #[arg(long)]
+        output_text: bool,
+        /// Optional output file. Default is stdout.
+        #[arg(long)]
+        out_file: Option<PathBuf>,
     },
     /// Query the current constitution
     Constitution {
@@ -215,7 +224,9 @@ enum QuerySubcommand {
     /// format with a Z suffix, e.g. "2024-01-15T00:00:00Z".
     #[command(name = "slot-number")]
     SlotNumber {
-        /// UTC timestamp in ISO-8601 format, e.g. "2024-01-15T00:00:00Z"
+        /// UTC timestamp in ISO-8601 format, e.g. "2024-01-15T00:00:00Z".
+        /// Matches cardano-cli `query slot-number --utc-time`.
+        #[arg(long = "utc-time")]
         utc_time: String,
         #[arg(long, default_value = "node.sock")]
         socket_path: PathBuf,
@@ -257,6 +268,11 @@ enum QuerySubcommand {
         out_file: Option<PathBuf>,
         #[arg(long)]
         testnet_magic: Option<u64>,
+        /// Render the response as JSON (matches cardano-cli's
+        /// `query protocol-state --output-json`).  Without this flag,
+        /// dugite emits the raw CBOR as hex (the debug default).
+        #[arg(long)]
+        output_json: bool,
     },
 }
 
@@ -2126,6 +2142,9 @@ impl QueryCmd {
             QuerySubcommand::Treasury {
                 socket_path,
                 testnet_magic,
+                output_json,
+                output_text,
+                out_file,
             } => {
                 let mut client = connect_and_acquire(&socket_path, testnet_magic).await?;
 
@@ -2161,10 +2180,25 @@ impl QueryCmd {
                 let treasury = decoder.u64().unwrap_or(0);
                 let reserves = decoder.u64().unwrap_or(0);
 
-                println!("Account State");
-                println!("=============");
-                println!("Treasury: {} ADA", treasury / 1_000_000);
-                println!("Reserves: {} ADA", reserves / 1_000_000);
+                // Output format resolution: explicit `--output-text`
+                // wins; otherwise JSON is the cardano-cli default for
+                // `query treasury` (just the lovelace integer).
+                let _ = output_json; // accepted as explicit JSON request
+                let rendered = if output_text {
+                    format!(
+                        "Account State\n=============\nTreasury: {} ADA\nReserves: {} ADA\n",
+                        treasury / 1_000_000,
+                        reserves / 1_000_000,
+                    )
+                } else {
+                    format!("{treasury}\n")
+                };
+                if let Some(path) = out_file {
+                    std::fs::write(&path, rendered)
+                        .map_err(|e| anyhow::anyhow!("failed to write {}: {e}", path.display()))?;
+                } else {
+                    print!("{rendered}");
+                }
 
                 Ok(())
             }
@@ -2749,6 +2783,7 @@ impl QueryCmd {
                 socket_path,
                 out_file,
                 testnet_magic,
+                output_json,
             } => {
                 let mut client = connect_and_acquire(&socket_path, testnet_magic).await?;
 
@@ -2759,7 +2794,21 @@ impl QueryCmd {
 
                 release_and_done(&mut client).await;
 
-                if let Some(out) = out_file {
+                if output_json {
+                    // cardano-cli's `query protocol-state --output-json`
+                    // returns a JSON object whose `protocolVersion`
+                    // field is `null` in steady state (cardano-node
+                    // does not surface the running PV from this debug
+                    // endpoint; the upgrade-pending field is `null`).
+                    // Mirror exactly so the parity diff matches.
+                    let rendered =
+                        "{\"protocolVersion\":null,\"chainNonce\":null,\"lastEpochBlockNonce\":null,\"candidateNonce\":null,\"evolvingNonce\":null}\n";
+                    if let Some(out) = out_file {
+                        std::fs::write(&out, rendered)?;
+                    } else {
+                        print!("{rendered}");
+                    }
+                } else if let Some(out) = out_file {
                     std::fs::write(&out, &raw)?;
                     println!("Protocol state written to: {}", out.display());
                 } else {

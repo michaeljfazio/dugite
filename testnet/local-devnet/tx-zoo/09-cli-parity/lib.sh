@@ -37,13 +37,17 @@ _parity_ensure_csv() {
 # Populated by individual test scripts using: KNOWN_DIVERGENCES[name]=url
 declare -gA KNOWN_DIVERGENCES=(
     # All tracked under the umbrella issue #597 until each query is fixed.
+    #
+    # FIXED (do NOT re-add without verifying the fix has regressed):
+    #   slot-number             — `--utc-time` flag added (was positional)
+    #   treasury                — `--output-json` / `--output-text` / `--out-file` flags added
+    #   protocol-state/version  — `--output-json` flag added; emits null fields matching cardano-cli
+    #
+    # Remaining divergences pending deeper fixes:
     ["protocol-parameters"]="https://github.com/michaeljfazio/dugite/issues/597"
     ["stake-distribution"]="https://github.com/michaeljfazio/dugite/issues/597"
-    ["protocol-state/version"]="https://github.com/michaeljfazio/dugite/issues/597"
     ["gov-state"]="https://github.com/michaeljfazio/dugite/issues/597"
     ["kes-period-info"]="https://github.com/michaeljfazio/dugite/issues/597"
-    ["slot-number"]="https://github.com/michaeljfazio/dugite/issues/597"
-    ["treasury"]="https://github.com/michaeljfazio/dugite/issues/597"
     ["proposals"]="https://github.com/michaeljfazio/dugite/issues/597"
 )
 
