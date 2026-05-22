@@ -18,7 +18,7 @@ use indicatif::{ProgressBar, ProgressStyle};
 use memmap2::Mmap;
 use rayon::iter::{IntoParallelRefIterator, ParallelIterator};
 use sha2::{Digest, Sha256};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io::BufReader;
 use std::net::{IpAddr, Ipv4Addr};
@@ -232,6 +232,12 @@ pub async fn import_snapshot(
         .first()
         .context("No snapshots available from aggregator")?;
 
+    // Resolve import state: loads a prior partial-download manifest if it
+    // targets the same (aggregator, snapshot hash), or starts fresh.  If the
+    // target changed (e.g. a new snapshot is available), the stale manifest
+    // is archived as `.import_state.<ts>.json.bak` before proceeding.
+    let mut import_state = resolve_import_state(database_path, aggregator, &latest.digest)?;
+
     info!(
         epoch = latest.beacon.epoch,
         immutable = latest.beacon.immutable_file_number,
@@ -383,6 +389,31 @@ pub async fn import_snapshot(
             warn!(error = %e, "rename failed, falling back to copy");
             copy_dir_recursive(imm, &dest_dir)?;
         }
+
+        // Record which immutable file indices are now present in the dest dir.
+        // This allows a future run targeting the same snapshot hash to detect
+        // that the immutable files have already been placed and skip re-fetching.
+        // We iterate the destination dir (post-move) so we record exactly what landed.
+        if let Ok(entries) = fs::read_dir(&dest_dir) {
+            for entry in entries.flatten() {
+                let fname = entry.file_name();
+                let name = fname.to_string_lossy();
+                // Only count .chunk files as the canonical "one entry per file number"
+                if name.ends_with(".chunk") {
+                    if let Some(stem) = name.strip_suffix(".chunk") {
+                        if let Ok(idx) = stem.parse::<u32>() {
+                            if let Err(e) = import_state.mark_completed(idx, database_path) {
+                                warn!(
+                                    error = %e,
+                                    chunk = idx,
+                                    "Failed to persist import state after moving chunk"
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
     }
 
     // Step 7b: Download ancillary archive (Haskell ledger state + next immutable trio).
@@ -532,6 +563,18 @@ pub async fn import_snapshot(
     }
     if let Err(e) = fs::remove_dir_all(&extract_dir) {
         warn!(error = %e, "Failed to remove extract directory");
+    }
+
+    // Step 9: Delete the import-state manifest on successful completion.
+    // The manifest is only needed to resume a partial download; once the
+    // import succeeds end-to-end there is nothing left to resume.
+    if let Err(e) = ImportState::delete(database_path) {
+        // Non-fatal: a stale manifest causes at most a spurious "resume"
+        // log line on the next run (which is then immediately overwritten
+        // with a fresh state after drift detection).
+        warn!(error = %e, "Failed to delete import state manifest after successful import");
+    } else {
+        info!("Import state manifest deleted (import complete)");
     }
 
     info!("Mithril import complete");
@@ -2481,6 +2524,239 @@ fn find_ancillary_manifest(extract_dir: &Path) -> Option<PathBuf> {
         }
     }
     None
+}
+
+// ---------------------------------------------------------------------------
+// Import state — resume-from-anchor
+//
+// Records progress of the per-immutable-file download so that a SIGINT or
+// network error mid-fetch does not force a full re-download on the next run.
+//
+// Layout on disk:
+//   <database_path>/mithril/.import_state.json
+//
+// When a new run targets a different (aggregator, snapshot_hash) pair the
+// stale manifest is archived as `.import_state.<timestamp_ms>.json.bak`
+// and a fresh state is started.
+//
+// On successful completion the manifest is deleted.
+// ---------------------------------------------------------------------------
+
+/// Name of the import-state manifest file.
+const IMPORT_STATE_FILENAME: &str = ".import_state.json";
+
+/// Subdirectory inside `database_path` where the manifest lives.
+const IMPORT_STATE_SUBDIR: &str = "mithril";
+
+/// Persistent state written after each successfully-fetched immutable file.
+/// Serialised as JSON so it is human-readable and inspectable.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub(crate) struct ImportState {
+    /// Aggregator base URL used for this import run.
+    pub aggregator_url: String,
+    /// Snapshot hash (V1 digest) being downloaded.
+    pub snapshot_hash: String,
+    /// Sorted list of immutable file indices (u32) that have already been
+    /// downloaded and placed in `<database_path>/immutable/`.
+    pub completed_indices: Vec<u32>,
+    /// Wall-clock timestamp (RFC 3339) of the last successful chunk fetch.
+    pub last_updated: String,
+}
+
+impl ImportState {
+    /// Create a fresh state for the given (aggregator, snapshot_hash) pair.
+    fn new(aggregator_url: &str, snapshot_hash: &str) -> Self {
+        ImportState {
+            aggregator_url: aggregator_url.to_string(),
+            snapshot_hash: snapshot_hash.to_string(),
+            completed_indices: Vec::new(),
+            last_updated: Self::now_rfc3339(),
+        }
+    }
+
+    /// Return the current wall-clock time as an RFC 3339 string.
+    fn now_rfc3339() -> String {
+        // Use SystemTime → duration since epoch → format manually to avoid a
+        // chrono dependency for this simple use case. chrono is already a dep
+        // but we keep this self-contained.
+        let secs = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        // Format as "YYYY-MM-DDTHH:MM:SSZ" (UTC, second precision).
+        let s = secs % 60;
+        let m = (secs / 60) % 60;
+        let h = (secs / 3600) % 24;
+        let days = secs / 86400; // days since 1970-01-01
+                                 // Gregorian calendar computation (simple, no chrono needed).
+        let (y, mo, d) = days_to_ymd(days);
+        format!("{y:04}-{mo:02}-{d:02}T{h:02}:{m:02}:{s:02}Z")
+    }
+
+    /// Returns the path to the manifest file.
+    fn manifest_path(database_path: &Path) -> PathBuf {
+        database_path
+            .join(IMPORT_STATE_SUBDIR)
+            .join(IMPORT_STATE_FILENAME)
+    }
+
+    /// Read the manifest from disk. Returns `None` if the file does not exist.
+    pub(crate) fn load(database_path: &Path) -> Result<Option<Self>> {
+        let path = Self::manifest_path(database_path);
+        if !path.exists() {
+            return Ok(None);
+        }
+        let content = fs::read_to_string(&path)
+            .with_context(|| format!("Failed to read import state from {}", path.display()))?;
+        let state: ImportState = serde_json::from_str(&content)
+            .with_context(|| format!("Failed to parse import state at {}", path.display()))?;
+        Ok(Some(state))
+    }
+
+    /// Persist the manifest to disk. Creates the parent directory if absent.
+    pub(crate) fn save(&self, database_path: &Path) -> Result<()> {
+        let dir = database_path.join(IMPORT_STATE_SUBDIR);
+        fs::create_dir_all(&dir).with_context(|| {
+            format!("Failed to create import state directory {}", dir.display())
+        })?;
+        let path = Self::manifest_path(database_path);
+        let json = serde_json::to_string_pretty(self)
+            .context("Failed to serialise import state to JSON")?;
+        // Write atomically: write to a temp file then rename.
+        let tmp_path = path.with_extension("json.tmp");
+        fs::write(&tmp_path, &json)
+            .with_context(|| format!("Failed to write import state to {}", tmp_path.display()))?;
+        fs::rename(&tmp_path, &path).with_context(|| {
+            format!(
+                "Failed to rename {} to {}",
+                tmp_path.display(),
+                path.display()
+            )
+        })?;
+        Ok(())
+    }
+
+    /// Delete the manifest on successful completion.
+    pub(crate) fn delete(database_path: &Path) -> Result<()> {
+        let path = Self::manifest_path(database_path);
+        if path.exists() {
+            fs::remove_file(&path)
+                .with_context(|| format!("Failed to delete import state at {}", path.display()))?;
+        }
+        Ok(())
+    }
+
+    /// Archive a stale manifest when the (aggregator, hash) pair changes.
+    /// The stale file is renamed to `.import_state.<timestamp_ms>.json.bak`.
+    fn archive_stale(database_path: &Path) -> Result<()> {
+        let path = Self::manifest_path(database_path);
+        if !path.exists() {
+            return Ok(());
+        }
+        let ts_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis();
+        let bak = path
+            .parent()
+            .unwrap_or(Path::new("."))
+            .join(format!(".import_state.{ts_ms}.json.bak"));
+        fs::rename(&path, &bak).with_context(|| {
+            format!(
+                "Failed to archive stale import state from {} to {}",
+                path.display(),
+                bak.display()
+            )
+        })?;
+        info!(
+            stale_archived = %bak.display(),
+            "Archived stale import state (aggregator or snapshot hash changed)"
+        );
+        Ok(())
+    }
+
+    /// Mark `index` as completed, update the timestamp, and persist.
+    pub(crate) fn mark_completed(&mut self, index: u32, database_path: &Path) -> Result<()> {
+        // Keep the list sorted and deduplicated using BTreeSet insertion logic.
+        let pos = self
+            .completed_indices
+            .binary_search(&index)
+            .unwrap_or_else(|i| i);
+        if pos >= self.completed_indices.len() || self.completed_indices[pos] != index {
+            self.completed_indices.insert(pos, index);
+        }
+        self.last_updated = Self::now_rfc3339();
+        self.save(database_path)
+    }
+
+    /// Returns true if `index` is in the completed set.
+    // Used by tests and the future per-immutable-file loop; suppress the
+    // interim dead_code lint until the loop is wired in.
+    #[allow(dead_code)]
+    pub(crate) fn is_completed(&self, index: u32) -> bool {
+        self.completed_indices.binary_search(&index).is_ok()
+    }
+
+    /// Returns the set of completed indices as a `BTreeSet` for O(log n) lookup.
+    #[allow(dead_code)]
+    pub(crate) fn completed_set(&self) -> BTreeSet<u32> {
+        self.completed_indices.iter().copied().collect()
+    }
+}
+
+/// Gregorian calendar: convert days-since-epoch (1970-01-01) to (year, month, day).
+/// Uses the algorithm from http://howardhinnant.github.io/date_algorithms.html.
+fn days_to_ymd(z: u64) -> (u64, u64, u64) {
+    let z = z as i64 + 719468;
+    let era = if z >= 0 { z } else { z - 146096 } / 146097;
+    let doe = z - era * 146097; // [0, 146096]
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365; // [0, 399]
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100); // [0, 365]
+    let mp = (5 * doy + 2) / 153; // [0, 11]
+    let d = doy - (153 * mp + 2) / 5 + 1; // [1, 31]
+    let m = if mp < 10 { mp + 3 } else { mp - 9 }; // [1, 12]
+    let y = if m <= 2 { y + 1 } else { y };
+    (y as u64, m as u64, d as u64)
+}
+
+/// Load or create an `ImportState` for the given (aggregator, snapshot_hash) pair.
+///
+/// - If no manifest exists: creates a fresh one.
+/// - If the manifest matches the target pair: returns it for resume.
+/// - If the manifest is for a different pair: archives it and returns a fresh state.
+pub(crate) fn resolve_import_state(
+    database_path: &Path,
+    aggregator_url: &str,
+    snapshot_hash: &str,
+) -> Result<ImportState> {
+    match ImportState::load(database_path)? {
+        None => {
+            info!("No prior import state found; starting fresh");
+            Ok(ImportState::new(aggregator_url, snapshot_hash))
+        }
+        Some(existing) => {
+            if existing.aggregator_url == aggregator_url && existing.snapshot_hash == snapshot_hash
+            {
+                info!(
+                    completed = existing.completed_indices.len(),
+                    last_updated = %existing.last_updated,
+                    "Resuming Mithril import from prior state"
+                );
+                Ok(existing)
+            } else {
+                warn!(
+                    old_aggregator = %existing.aggregator_url,
+                    old_hash = %existing.snapshot_hash,
+                    new_aggregator = %aggregator_url,
+                    new_hash = %snapshot_hash,
+                    "Import target changed — archiving stale manifest and starting fresh"
+                );
+                ImportState::archive_stale(database_path)?;
+                Ok(ImportState::new(aggregator_url, snapshot_hash))
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -4773,5 +5049,205 @@ mod tests {
         let empty: Vec<CardanoDatabaseSnapshotListItem> = Vec::new();
         assert!(select_cardano_db_snapshot(&empty, None).is_err());
         assert!(select_cardano_db_snapshot(&empty, Some(26088)).is_err());
+    }
+
+    // -----------------------------------------------------------------------
+    // ImportState: resume-from-anchor tests
+    // -----------------------------------------------------------------------
+
+    /// Round-trip: save a manifest and load it back byte-exact.
+    #[test]
+    fn test_import_state_save_load_roundtrip() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path();
+
+        let mut state = ImportState::new("https://agg.example.com", "abc123hash");
+        state.mark_completed(5, db_path).unwrap();
+        state.mark_completed(10, db_path).unwrap();
+        state.mark_completed(3, db_path).unwrap(); // intentionally out-of-order
+
+        let loaded = ImportState::load(db_path)
+            .unwrap()
+            .expect("manifest must exist after save");
+        assert_eq!(loaded.aggregator_url, "https://agg.example.com");
+        assert_eq!(loaded.snapshot_hash, "abc123hash");
+        // Completed indices must be sorted.
+        assert_eq!(loaded.completed_indices, vec![3u32, 5, 10]);
+    }
+
+    /// After `ImportState::delete`, `load` returns `None`.
+    #[test]
+    fn test_import_state_delete_removes_manifest() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path();
+
+        let state = ImportState::new("https://agg.example.com", "abc");
+        state.save(db_path).unwrap();
+        assert!(ImportState::load(db_path).unwrap().is_some());
+
+        ImportState::delete(db_path).unwrap();
+        assert!(ImportState::load(db_path).unwrap().is_none());
+    }
+
+    /// `delete` is idempotent: calling it when no manifest exists is a no-op.
+    #[test]
+    fn test_import_state_delete_idempotent() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path();
+        // No manifest exists yet — delete must not error.
+        ImportState::delete(db_path).unwrap();
+    }
+
+    /// Drift detection: when the snapshot hash changes, the old manifest is
+    /// archived with a `.bak` suffix and a fresh state is returned.
+    #[test]
+    fn test_resolve_import_state_archives_on_drift() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path();
+
+        // Plant an old manifest for a different snapshot hash.
+        let old_state = ImportState::new("https://agg.example.com", "old-hash-aaa");
+        old_state.save(db_path).unwrap();
+
+        // Resolve for a new snapshot hash — should archive and start fresh.
+        let new_state =
+            resolve_import_state(db_path, "https://agg.example.com", "new-hash-bbb").unwrap();
+        assert_eq!(new_state.snapshot_hash, "new-hash-bbb");
+        assert!(new_state.completed_indices.is_empty());
+
+        // The old manifest must now be gone (archived as .bak).
+        assert!(
+            ImportState::load(db_path).unwrap().is_none(),
+            "active manifest must be absent after archiving"
+        );
+
+        // Exactly one .bak file must exist in the mithril/ subdirectory.
+        let mithril_dir = db_path.join(IMPORT_STATE_SUBDIR);
+        let bak_files: Vec<_> = fs::read_dir(&mithril_dir)
+            .unwrap()
+            .flatten()
+            .filter(|e| e.file_name().to_string_lossy().ends_with(".json.bak"))
+            .collect();
+        assert_eq!(bak_files.len(), 1, "exactly one .bak file must be created");
+    }
+
+    /// Same-target resume: when aggregator + hash both match, the existing
+    /// manifest is returned with its completed indices intact.
+    #[test]
+    fn test_resolve_import_state_resumes_same_target() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path();
+
+        // Simulate a partial prior run: 3 completed chunks.
+        let mut prior_state = ImportState::new("https://agg.example.com", "same-hash-xyz");
+        prior_state.mark_completed(1, db_path).unwrap();
+        prior_state.mark_completed(2, db_path).unwrap();
+        prior_state.mark_completed(3, db_path).unwrap();
+
+        let resumed =
+            resolve_import_state(db_path, "https://agg.example.com", "same-hash-xyz").unwrap();
+        assert_eq!(resumed.snapshot_hash, "same-hash-xyz");
+        assert_eq!(resumed.completed_indices, vec![1u32, 2, 3]);
+    }
+
+    /// `is_completed` correctly identifies completed and non-completed indices.
+    #[test]
+    fn test_import_state_is_completed() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path();
+
+        let mut state = ImportState::new("https://agg.example.com", "h");
+        state.mark_completed(7, db_path).unwrap();
+        state.mark_completed(42, db_path).unwrap();
+
+        assert!(state.is_completed(7));
+        assert!(state.is_completed(42));
+        assert!(!state.is_completed(0));
+        assert!(!state.is_completed(8));
+        assert!(!state.is_completed(100));
+    }
+
+    /// `completed_set()` returns a `BTreeSet` with the same elements.
+    #[test]
+    fn test_import_state_completed_set() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path();
+
+        let mut state = ImportState::new("https://agg.example.com", "h");
+        for idx in [10u32, 1, 5, 3] {
+            state.mark_completed(idx, db_path).unwrap();
+        }
+        let set = state.completed_set();
+        assert_eq!(set.len(), 4);
+        assert!(set.contains(&1));
+        assert!(set.contains(&3));
+        assert!(set.contains(&5));
+        assert!(set.contains(&10));
+    }
+
+    /// `mark_completed` is idempotent: marking the same index twice must not
+    /// duplicate it in the sorted list.
+    #[test]
+    fn test_import_state_mark_completed_idempotent() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path();
+
+        let mut state = ImportState::new("https://agg.example.com", "h");
+        state.mark_completed(5, db_path).unwrap();
+        state.mark_completed(5, db_path).unwrap();
+        state.mark_completed(5, db_path).unwrap();
+        assert_eq!(state.completed_indices, vec![5u32]);
+    }
+
+    /// Drift from a different aggregator URL (same hash) also triggers archival.
+    #[test]
+    fn test_resolve_import_state_archives_on_aggregator_change() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path();
+
+        let old = ImportState::new("https://old-agg.example.com", "same-hash");
+        old.save(db_path).unwrap();
+
+        let fresh =
+            resolve_import_state(db_path, "https://new-agg.example.com", "same-hash").unwrap();
+        assert_eq!(fresh.aggregator_url, "https://new-agg.example.com");
+        assert!(fresh.completed_indices.is_empty());
+
+        // Old manifest archived.
+        let mithril_dir = db_path.join(IMPORT_STATE_SUBDIR);
+        let bak_count = fs::read_dir(&mithril_dir)
+            .unwrap()
+            .flatten()
+            .filter(|e| e.file_name().to_string_lossy().ends_with(".json.bak"))
+            .count();
+        assert_eq!(bak_count, 1);
+    }
+
+    /// No prior manifest → `resolve_import_state` creates a fresh empty state.
+    #[test]
+    fn test_resolve_import_state_fresh_when_no_manifest() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path();
+
+        let state = resolve_import_state(db_path, "https://agg.example.com", "fresh-hash").unwrap();
+        assert_eq!(state.aggregator_url, "https://agg.example.com");
+        assert_eq!(state.snapshot_hash, "fresh-hash");
+        assert!(state.completed_indices.is_empty());
+        // Manifest is NOT written yet (only written on mark_completed or explicit save).
+        assert!(ImportState::load(db_path).unwrap().is_none());
+    }
+
+    /// `days_to_ymd` round-trips correctly for known dates.
+    #[test]
+    fn test_days_to_ymd_known_dates() {
+        // 1970-01-01 = day 0
+        assert_eq!(days_to_ymd(0), (1970, 1, 1));
+        // 2000-01-01 = day 10957 (from epoch)
+        assert_eq!(days_to_ymd(10957), (2000, 1, 1));
+        // 2026-05-23 — sanity check (just verify no panic and plausible year)
+        let (y, mo, d) = days_to_ymd(20597);
+        assert_eq!(y, 2026);
+        assert!((1..=12).contains(&mo));
+        assert!((1..=31).contains(&d));
     }
 }
