@@ -14,6 +14,10 @@ use crate::machine::value::Value;
 use crate::term::{BuiltinId, Constant};
 use crate::UplcError;
 use num_bigint::BigInt;
+use std::collections::BTreeMap;
+
+/// Inner map type for the `value` constant: policy → token → amount.
+type ValueMap = BTreeMap<Vec<u8>, BTreeMap<Vec<u8>, i128>>;
 
 /// Saturated-application denotation. The CEK dispatcher calls this
 /// once both the force count and the value-argument count match the
@@ -1042,6 +1046,301 @@ pub fn denote(id: BuiltinId, args: Vec<Value>) -> Result<Value, UplcError> {
         | Bls12_381_MillerLoop
         | Bls12_381_MulMlResult
         | Bls12_381_FinalVerify => crate::builtin::bls::denote_bls(id, args),
+
+        // ── PV1.1.0 list builtin ──────────────────────────────────────
+        DropList => {
+            // (count: Integer, list: ProtoList T) -> ProtoList T
+            // Drops the first `count` elements from the list. If count
+            // is negative or larger than the list length, returns the
+            // empty list (matching the Haskell reference's clamp-at-
+            // zero / clamp-at-length semantics).
+            let mut it = args.into_iter();
+            let count = unwrap_integer(it.next().ok_or_else(|| builtin_arity_mismatch(id))?, id)?;
+            let list = it.next().ok_or_else(|| builtin_arity_mismatch(id))?;
+            let (elem_type, mut elems) = unwrap_proto_list(list, id)?;
+            let n = bigint_to_usize_clamped(&count);
+            if n >= elems.len() {
+                elems.clear();
+            } else {
+                elems.drain(..n);
+            }
+            Ok(Value::Const(Constant::ProtoList {
+                elem_type,
+                elements: elems,
+            }))
+        }
+
+        // ── PV1.1.0 array builtins ────────────────────────────────────
+        IndexArray => {
+            // (arr: Array T, i: Integer) -> T
+            // Returns the element at index `i`. Out-of-range → BuiltinFailure.
+            let mut it = args.into_iter();
+            let arr_val = it.next().ok_or_else(|| builtin_arity_mismatch(id))?;
+            let i_val = it.next().ok_or_else(|| builtin_arity_mismatch(id))?;
+            let (_, elems) = unwrap_array(arr_val, id)?;
+            let i = unwrap_integer(i_val, id)?;
+            let idx = match usize::try_from(&i) {
+                Ok(n) if n < elems.len() => n,
+                _ => return Err(builtin_failure(id, "indexArray: index out of range")),
+            };
+            Ok(Value::Const(elems.into_iter().nth(idx).ok_or_else(
+                || builtin_failure(id, "indexArray: index out of range (internal)"),
+            )?))
+        }
+        LengthOfArray => {
+            // (arr: Array T) -> Integer
+            let v = take_one(args, id)?;
+            let (_, elems) = unwrap_array(v, id)?;
+            Ok(Value::Const(Constant::Integer(BigInt::from(elems.len()))))
+        }
+        ListToArray => {
+            // (list: ProtoList T) -> Array T
+            let v = take_one(args, id)?;
+            let (elem_type, elements) = unwrap_proto_list(v, id)?;
+            Ok(Value::Const(Constant::Array {
+                elem_type,
+                elements,
+            }))
+        }
+
+        // ── PV1.1.0 Value builtins ────────────────────────────────────
+        InsertCoin => {
+            // (policy: ByteString) (token: ByteString) (amount: Integer)
+            // (value: Value) -> Value
+            //
+            // Adds `amount` to the given (policy, token) entry in the value.
+            // If the resulting amount is zero the entry is removed.
+            // Overflow / underflow beyond i128 → BuiltinFailure.
+            // Keys longer than 32 bytes → BuiltinFailure.
+            let mut it = args.into_iter();
+            let policy =
+                unwrap_byte_string(it.next().ok_or_else(|| builtin_arity_mismatch(id))?, id)?;
+            let token =
+                unwrap_byte_string(it.next().ok_or_else(|| builtin_arity_mismatch(id))?, id)?;
+            let amount_bi =
+                unwrap_integer(it.next().ok_or_else(|| builtin_arity_mismatch(id))?, id)?;
+            let mut val = unwrap_value(it.next().ok_or_else(|| builtin_arity_mismatch(id))?, id)?;
+            use num_traits::ToPrimitive;
+            let amount = amount_bi
+                .to_i128()
+                .ok_or_else(|| builtin_failure(id, "insertCoin: amount out of i128 range"))?;
+            // Key length checks (32-byte limit per Cardano ledger rules).
+            const MAX_KEY: usize = 32;
+            if policy.len() > MAX_KEY {
+                return Err(builtin_failure(
+                    id,
+                    "insertCoin: policy-id exceeds 32 bytes",
+                ));
+            }
+            if token.len() > MAX_KEY {
+                return Err(builtin_failure(
+                    id,
+                    "insertCoin: token-name exceeds 32 bytes",
+                ));
+            }
+            let inner = val.entry(policy.clone()).or_default();
+            let cur = inner.entry(token.clone()).or_default();
+            // Checked addition: i128 models Plutus Integer; overflow is a builtin failure.
+            let new_amt = cur
+                .checked_add(amount)
+                .ok_or_else(|| builtin_failure(id, "insertCoin: amount overflow"))?;
+            if new_amt == 0 {
+                inner.remove(&token);
+                if inner.is_empty() {
+                    val.remove(&policy);
+                }
+            } else {
+                *cur = new_amt;
+            }
+            Ok(Value::Const(Constant::Value(val)))
+        }
+
+        LookupCoin => {
+            // (policy: ByteString) (token: ByteString) (value: Value) -> Integer
+            // Returns 0 if not present.
+            let mut it = args.into_iter();
+            let policy =
+                unwrap_byte_string(it.next().ok_or_else(|| builtin_arity_mismatch(id))?, id)?;
+            let token =
+                unwrap_byte_string(it.next().ok_or_else(|| builtin_arity_mismatch(id))?, id)?;
+            let val = unwrap_value(it.next().ok_or_else(|| builtin_arity_mismatch(id))?, id)?;
+            let amt = val
+                .get(&policy)
+                .and_then(|inner| inner.get(&token))
+                .copied()
+                .unwrap_or(0);
+            Ok(Value::Const(Constant::Integer(BigInt::from(amt))))
+        }
+
+        ScaleValue => {
+            // (factor: Integer) (value: Value) -> Value
+            // Multiplies every coin amount by `factor`. If a resulting
+            // amount is zero, the entry is removed.  Overflow → BuiltinFailure.
+            let mut it = args.into_iter();
+            let factor_bi =
+                unwrap_integer(it.next().ok_or_else(|| builtin_arity_mismatch(id))?, id)?;
+            let val = unwrap_value(it.next().ok_or_else(|| builtin_arity_mismatch(id))?, id)?;
+            use num_traits::ToPrimitive;
+            let factor = factor_bi
+                .to_i128()
+                .ok_or_else(|| builtin_failure(id, "scaleValue: factor out of i128 range"))?;
+            let mut out: ValueMap = BTreeMap::new();
+            for (policy, inner) in val {
+                let mut new_inner: BTreeMap<Vec<u8>, i128> = BTreeMap::new();
+                for (token, amt) in inner {
+                    let new_amt = amt.checked_mul(factor).ok_or_else(|| {
+                        builtin_failure(id, "scaleValue: multiplication overflow")
+                    })?;
+                    if new_amt != 0 {
+                        new_inner.insert(token, new_amt);
+                    }
+                }
+                if !new_inner.is_empty() {
+                    out.insert(policy, new_inner);
+                }
+            }
+            Ok(Value::Const(Constant::Value(out)))
+        }
+
+        UnValueData => {
+            // (data: Data) -> Value
+            //
+            // Decodes a Data value of the form
+            //   Map [(B policy, Map [(B token, I amount), ...]), ...]
+            // into a canonical Value.  The Haskell reference validates:
+            //   - Outer and inner must be Map data.
+            //   - Keys must be B (bytes), amounts must be I (integer).
+            //   - No key longer than 32 bytes.
+            //   - No integer outside i128 range.
+            //   - Duplicate keys: amounts are summed; zero entries removed.
+            let d = unwrap_data(take_one(args, id)?, id)?;
+            use crate::data::Data;
+            let outer_pairs = match d {
+                Data::Map(pairs) => pairs,
+                _ => return Err(builtin_failure(id, "unValueData: expected outer Map")),
+            };
+            const MAX_KEY: usize = 32;
+            use num_traits::ToPrimitive;
+            let mut result: ValueMap = BTreeMap::new();
+            for (k, v) in outer_pairs {
+                let policy = match k {
+                    Data::B(b) => b,
+                    _ => return Err(builtin_failure(id, "unValueData: policy key must be B")),
+                };
+                if policy.len() > MAX_KEY {
+                    return Err(builtin_failure(
+                        id,
+                        "unValueData: policy-id exceeds 32 bytes",
+                    ));
+                }
+                let inner_pairs = match v {
+                    Data::Map(pairs) => pairs,
+                    _ => {
+                        return Err(builtin_failure(id, "unValueData: expected inner Map"));
+                    }
+                };
+                let inner_map = result.entry(policy).or_default();
+                for (tk, tv) in inner_pairs {
+                    let token = match tk {
+                        Data::B(b) => b,
+                        _ => return Err(builtin_failure(id, "unValueData: token key must be B")),
+                    };
+                    if token.len() > MAX_KEY {
+                        return Err(builtin_failure(
+                            id,
+                            "unValueData: token-name exceeds 32 bytes",
+                        ));
+                    }
+                    let amount_bi = match tv {
+                        Data::I(i) => i,
+                        _ => {
+                            return Err(builtin_failure(id, "unValueData: token amount must be I"))
+                        }
+                    };
+                    let amount = amount_bi.to_i128().ok_or_else(|| {
+                        builtin_failure(id, "unValueData: amount outside i128 range")
+                    })?;
+                    *inner_map.entry(token).or_default() += amount;
+                }
+            }
+            // Remove zeros and empty inner maps.
+            for inner in result.values_mut() {
+                inner.retain(|_, v| *v != 0);
+            }
+            result.retain(|_, inner| !inner.is_empty());
+            Ok(Value::Const(Constant::Value(result)))
+        }
+
+        ValueData => {
+            // (value: Value) -> Data
+            // Encodes as Map [(B policy, Map [(B token, I amount), ...]), ...].
+            let val = unwrap_value(take_one(args, id)?, id)?;
+            use crate::data::Data;
+            let outer: Vec<(Data, Data)> = val
+                .into_iter()
+                .map(|(policy, inner)| {
+                    let inner_data: Vec<(Data, Data)> = inner
+                        .into_iter()
+                        .map(|(token, amt)| (Data::B(token), Data::I(BigInt::from(amt))))
+                        .collect();
+                    (Data::B(policy), Data::Map(inner_data))
+                })
+                .collect();
+            Ok(Value::Const(Constant::Data(Data::Map(outer))))
+        }
+
+        ValueContains => {
+            // (super_val: Value) (sub_val: Value) -> Bool
+            // Returns True if every (policy, token) present in sub_val is
+            // present in super_val with an amount ≥ the sub amount.
+            // Negative amounts in sub_val: uses signed comparison.
+            let mut it = args.into_iter();
+            let sup = unwrap_value(it.next().ok_or_else(|| builtin_arity_mismatch(id))?, id)?;
+            let sub = unwrap_value(it.next().ok_or_else(|| builtin_arity_mismatch(id))?, id)?;
+            let mut ok = true;
+            'outer: for (policy, inner_sub) in &sub {
+                let inner_sup = match sup.get(policy) {
+                    Some(m) => m,
+                    None => {
+                        ok = false;
+                        break 'outer;
+                    }
+                };
+                for (token, &sub_amt) in inner_sub {
+                    let sup_amt = inner_sup.get(token).copied().unwrap_or(0);
+                    if sup_amt < sub_amt {
+                        ok = false;
+                        break 'outer;
+                    }
+                }
+            }
+            Ok(Value::Const(Constant::Bool(ok)))
+        }
+
+        UnionValue => {
+            // (a: Value) (b: Value) -> Value
+            // Merges two values by summing amounts; zero entries are removed.
+            let mut it = args.into_iter();
+            let mut a = unwrap_value(it.next().ok_or_else(|| builtin_arity_mismatch(id))?, id)?;
+            let b = unwrap_value(it.next().ok_or_else(|| builtin_arity_mismatch(id))?, id)?;
+            for (policy, inner_b) in b {
+                let inner_a = a.entry(policy).or_default();
+                for (token, amt) in inner_b {
+                    *inner_a.entry(token).or_default() += amt;
+                }
+            }
+            // Remove zeros and empty inner maps.
+            for inner in a.values_mut() {
+                inner.retain(|_, v| *v != 0);
+            }
+            a.retain(|_, inner| !inner.is_empty());
+            Ok(Value::Const(Constant::Value(a)))
+        }
+
+        // ── PV1.1.0 BLS multi-scalar multiplication ──────────────────
+        Bls12_381_G1_MultiScalarMul | Bls12_381_G2_MultiScalarMul => {
+            crate::builtin::bls::denote_multi_scalar_mul(id, args)
+        }
     }
 }
 
@@ -1173,6 +1472,32 @@ where
         out[i] = op(x, y);
     }
     Ok(Value::Const(Constant::ByteString(out)))
+}
+
+fn unwrap_array(
+    v: Value,
+    id: BuiltinId,
+) -> Result<(crate::term::TypeTag, Vec<Constant>), UplcError> {
+    match v {
+        Value::Const(Constant::Array {
+            elem_type,
+            elements,
+        }) => Ok((elem_type, elements)),
+        other => Err(UplcError::BuiltinTypeError {
+            builtin: id.name(),
+            reason: format!("expected Array, got {:?}", std::mem::discriminant(&other)),
+        }),
+    }
+}
+
+fn unwrap_value(v: Value, id: BuiltinId) -> Result<ValueMap, UplcError> {
+    match v {
+        Value::Const(Constant::Value(val)) => Ok(val),
+        other => Err(UplcError::BuiltinTypeError {
+            builtin: id.name(),
+            reason: format!("expected Value, got {:?}", std::mem::discriminant(&other)),
+        }),
+    }
 }
 
 fn unwrap_data(v: Value, id: BuiltinId) -> Result<crate::data::Data, UplcError> {
