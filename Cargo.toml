@@ -123,7 +123,7 @@ memmap2 = "0.9"
 fs2 = "0.4"
 rayon = "1"
 proptest = "1"
-mithril-client = { version = "0.13", default-features = false, features = ["num-integer-backend", "rustls-tls-webpki-roots", "fs"] }
+mithril-client = { version = "0.14", default-features = false, features = ["num-integer-backend", "rustls-tls-webpki-roots", "fs"] }
 
 ## [patch.crates-io]
 ## Removed: cardano-lsm now used from crates.io (for UTxO store in dugite-ledger)
