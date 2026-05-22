@@ -387,6 +387,92 @@ pub fn inputs_to_txininfos(
     Ok(out)
 }
 
+/// Translate a 32-byte padded required-signer hash back to its
+/// 28-byte Plutus `PubKeyHash`.
+///
+/// `dugite_primitives::TransactionBody::required_signers` stores each
+/// 28-byte addr_keyhash padded to 32 bytes via
+/// `Hash28::to_hash32_padded()` (the trailing 4 bytes are zero). The
+/// padding is purely an internal representation choice; the on-chain
+/// value is the 28-byte prefix. Plutus validators observe the 28-byte
+/// `PubKeyHash` directly, so we unpad here.
+fn padded_signer_to_pubkeyhash(h: &dugite_primitives::hash::Hash<32>) -> PubKeyHash {
+    let mut out = [0u8; 28];
+    out.copy_from_slice(&h.0[..28]);
+    out
+}
+
+/// Translate the full `required_signers` field (`Vec<Hash<32>>` —
+/// each entry is a 28-byte addr_keyhash padded to 32 bytes) into the
+/// Plutus `signatories` list (`Vec<PubKeyHash>`).
+pub fn required_signers_to_plutus_padded(
+    signers: &[dugite_primitives::hash::Hash<32>],
+) -> Vec<PubKeyHash> {
+    signers.iter().map(padded_signer_to_pubkeyhash).collect()
+}
+
+/// Translate the resolved-UTxO triples that
+/// [`crate::phase_two::decode_phase_two_inputs`] produces back into
+/// the `(PrimTxIn, PrimTxOut, Vec<u8>)` shape this module's helpers
+/// expect. The translation is a no-op `clone` — kept as a named
+/// helper so call sites read clearly.
+pub fn resolved_utxos(
+    triples: &[(PrimTxIn, PrimTxOut, Vec<u8>)],
+) -> Vec<(PrimTxIn, PrimTxOut, Vec<u8>)> {
+    triples.to_vec()
+}
+
+/// Compute the blake2b_256 hash of the canonical CBOR encoding of
+/// `data`. This is the same datum-hash domain used by the ledger to
+/// match `OutputDatum::DatumHash(h)` references back to inline-datum
+/// payloads in the tx witness set.
+fn datum_hash(data: &Data) -> Result<[u8; 32], PhaseTwoError> {
+    let cbor = data
+        .to_cbor()
+        .map_err(|e| PhaseTwoError::Internal(format!("datum_hash: data.to_cbor: {e}")))?;
+    Ok(dugite_primitives::hash::blake2b_256(&cbor).0)
+}
+
+/// Extract the witness-set's `plutus_data` list into the
+/// `Vec<([u8; 32], Data)>` shape TxInfoV3/V2 expose. Each entry is
+/// `(blake2b_256(canonical_cbor(d)), d)`.
+///
+/// Per CLAUDE.md / `lib.rs` §1, this never panics on malformed Data —
+/// the upstream CBOR decoder produced typed `PlutusData` values, so
+/// the only failure mode is the in-house `Data::to_cbor` encoder
+/// itself, which we surface as `PhaseTwoError::Internal`.
+pub fn datums_to_plutus(
+    plutus_data: &[PrimPlutusData],
+) -> Result<Vec<([u8; 32], Data)>, PhaseTwoError> {
+    let mut out: Vec<([u8; 32], Data)> = Vec::with_capacity(plutus_data.len());
+    for d in plutus_data {
+        let translated = plutus_data_to_data(d);
+        let h = datum_hash(&translated)?;
+        out.push((h, translated));
+    }
+    Ok(out)
+}
+
+/// Translate the V1/V2 `withdrawals` map into the
+/// `Vec<(StakingCredential, BigInt)>` shape Plutus TxInfo exposes.
+/// Iteration order matches the BTreeMap iteration order (lex by
+/// reward_account bytes), which is the canonical wire order.
+pub fn withdrawals_to_plutus(
+    wdrl: &BTreeMap<Vec<u8>, dugite_primitives::value::Lovelace>,
+) -> Result<Vec<(StakingCredential, BigInt)>, PhaseTwoError> {
+    let mut out = Vec::with_capacity(wdrl.len());
+    for (reward_account, amount) in wdrl {
+        // Reuse withdrawal_to_plutus by reconstructing a Withdrawal here so we
+        // share the exact reward-address parsing/validation path.
+        let w = PrimWithdrawal {
+            reward_account: reward_account.clone(),
+            amount: *amount,
+        };
+        out.push(withdrawal_to_plutus(&w)?);
+    }
+    Ok(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
