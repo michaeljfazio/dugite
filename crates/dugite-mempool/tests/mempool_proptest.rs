@@ -120,6 +120,7 @@ fn unique_tx_from_counter(n: u32) -> Transaction {
             treasury_value: None,
             donation: None,
             sub_transactions: vec![],
+            account_balance_intervals: vec![],
         },
         witness_set: empty_witness_set(),
         is_valid: true,
