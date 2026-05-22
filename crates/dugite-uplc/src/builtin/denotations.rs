@@ -320,6 +320,18 @@ pub fn denote(id: BuiltinId, args: Vec<Value>) -> Result<Value, UplcError> {
                     })
                 }
             };
+            // The head's value type must match the list's static
+            // element type — Haskell's `readKnown` unlifting raises
+            // an evaluation failure otherwise (#603).
+            let head_ty = head_const.type_tag();
+            if head_ty != elem_type {
+                return Err(UplcError::BuiltinTypeError {
+                    builtin: id.name(),
+                    reason: format!(
+                        "mkCons head type {head_ty:?} disagrees with list element type {elem_type:?}",
+                    ),
+                });
+            }
             elems.insert(0, head_const);
             Ok(Value::Const(Constant::ProtoList {
                 elem_type,
@@ -571,7 +583,9 @@ pub fn denote(id: BuiltinId, args: Vec<Value>) -> Result<Value, UplcError> {
                 return Err(builtin_failure(id, "integerToByteString: negative input"));
             }
             let width_u = bigint_to_usize_or_failure(&width, id, "integerToByteString width")?;
-            // Reasonable cap to avoid runaway allocation.
+            // Reasonable cap to avoid runaway allocation.  Matches the
+            // Haskell reference's `integerToByteStringMaximumOutputLength`
+            // (= 8192 bytes = 65536 bits); CIP-0117 mandates the limit.
             const MAX_INT_TO_BS_WIDTH: usize = 8192;
             if width_u > MAX_INT_TO_BS_WIDTH {
                 return Err(builtin_failure(
@@ -585,7 +599,17 @@ pub fn denote(id: BuiltinId, args: Vec<Value>) -> Result<Value, UplcError> {
                 // Haskell's `integerToByteStringBE 0`).
                 return Ok(Value::Const(Constant::ByteString(Vec::new())));
             }
-            if width_u != 0 {
+            if width_u == 0 {
+                // Auto-width: the minimal representation must itself
+                // fit within the 8192-byte CIP-0117 cap; n >= 2^65536
+                // is rejected as evaluation failure (#603).
+                if be_bytes.len() > MAX_INT_TO_BS_WIDTH {
+                    return Err(builtin_failure(
+                        id,
+                        "integerToByteString: value exceeds 8192-byte representable range",
+                    ));
+                }
+            } else {
                 if be_bytes.len() > width_u {
                     return Err(builtin_failure(
                         id,
@@ -719,9 +743,11 @@ pub fn denote(id: BuiltinId, args: Vec<Value>) -> Result<Value, UplcError> {
             if len_bits == 0 {
                 return Ok(Value::Const(Constant::ByteString(bs)));
             }
-            // Cap shift at ±len_bits — anything larger just zeros out
-            // the whole string.
-            let shift = shift_int.clone();
+            // The reference reads `shift` as Haskell `Int` (= Int64);
+            // values outside that range are an evaluation failure
+            // before the shift even runs (#603).
+            let shift_i64 = bigint_to_i64_or_failure(&shift_int, id, "shift amount")?;
+            let shift = BigInt::from(shift_i64);
             let abs_shift_int = if shift.sign() == num_bigint::Sign::Minus {
                 -shift.clone()
             } else {
@@ -764,9 +790,12 @@ pub fn denote(id: BuiltinId, args: Vec<Value>) -> Result<Value, UplcError> {
             if len_bits == 0 {
                 return Ok(Value::Const(Constant::ByteString(bs)));
             }
+            // The reference reads `rotate` as Haskell `Int` (= Int64);
+            // see ShiftByteString above (#603).
+            let rot_i64 = bigint_to_i64_or_failure(&rot_int, id, "rotate amount")?;
             // Normalise rotate amount mod len_bits.
             let len_bi = BigInt::from(len_bits);
-            let r = ((rot_int % &len_bi) + &len_bi) % &len_bi;
+            let r = ((BigInt::from(rot_i64) % &len_bi) + &len_bi) % &len_bi;
             let r_u = bigint_to_usize_or_failure(&r, id, "rotate amount")?;
             let mut out = vec![0u8; bs.len()];
             for target_idx in 0..len_bits {
@@ -854,10 +883,11 @@ pub fn denote(id: BuiltinId, args: Vec<Value>) -> Result<Value, UplcError> {
             }
             use k256::ecdsa::{signature::hazmat::PrehashVerifier, Signature, VerifyingKey};
             use k256::elliptic_curve::scalar::IsHigh;
-            let vk = match VerifyingKey::from_sec1_bytes(&pk) {
-                Ok(vk) => vk,
-                Err(_) => return Ok(Value::Const(Constant::Bool(false))),
-            };
+            // PK parse failure (uncompressed tag, off-curve x-coord,
+            // wrong leading byte, etc.) is an evaluation failure per
+            // the Haskell reference — NOT a `False` result (#603).
+            let vk = VerifyingKey::from_sec1_bytes(&pk)
+                .map_err(|e| builtin_failure(id, &format!("ECDSA public key parse failed: {e}")))?;
             let sig_arr: [u8; 64] = match sig.as_slice().try_into() {
                 Ok(a) => a,
                 Err(_) => {
@@ -866,10 +896,10 @@ pub fn denote(id: BuiltinId, args: Vec<Value>) -> Result<Value, UplcError> {
                     ));
                 }
             };
-            let sig = match Signature::from_bytes(&sig_arr.into()) {
-                Ok(s) => s,
-                Err(_) => return Ok(Value::Const(Constant::Bool(false))),
-            };
+            // Same: signature byte parse failures are an evaluation
+            // failure, not `False`.
+            let sig = Signature::from_bytes(&sig_arr.into())
+                .map_err(|e| builtin_failure(id, &format!("ECDSA signature parse failed: {e}")))?;
             // Low-S enforcement: reject high-S signatures explicitly
             // (k256's `from_bytes` parses them but `verify_prehash`
             // accepts either form unless we route through
@@ -914,10 +944,13 @@ pub fn denote(id: BuiltinId, args: Vec<Value>) -> Result<Value, UplcError> {
                     ));
                 }
             };
-            let vk = match VerifyingKey::from_bytes(&pk_arr) {
-                Ok(vk) => vk,
-                Err(_) => return Ok(Value::Const(Constant::Bool(false))),
-            };
+            // x-only pubkey parse failure (e.g. x-coord not on the
+            // curve, BIP-340 §"Public Key Conversion") is an
+            // evaluation failure per the Haskell reference, NOT a
+            // `False` result (#603).
+            let vk = VerifyingKey::from_bytes(&pk_arr).map_err(|e| {
+                builtin_failure(id, &format!("Schnorr public key parse failed: {e}"))
+            })?;
             let sig_arr: [u8; 64] = match sig.as_slice().try_into() {
                 Ok(a) => a,
                 Err(_) => {
@@ -926,10 +959,10 @@ pub fn denote(id: BuiltinId, args: Vec<Value>) -> Result<Value, UplcError> {
                     ));
                 }
             };
-            let sig = match Signature::try_from(&sig_arr[..]) {
-                Ok(s) => s,
-                Err(_) => return Ok(Value::Const(Constant::Bool(false))),
-            };
+            // Same: signature byte parse failure → evaluation failure.
+            let sig = Signature::try_from(&sig_arr[..]).map_err(|e| {
+                builtin_failure(id, &format!("Schnorr signature parse failed: {e}"))
+            })?;
             Ok(Value::Const(Constant::Bool(vk.verify(&msg, &sig).is_ok())))
         }
 
@@ -1025,6 +1058,18 @@ fn bigint_to_usize_or_failure(i: &BigInt, id: BuiltinId, what: &str) -> Result<u
     }
     usize::try_from(digits[0])
         .map_err(|_| builtin_failure(id, &format!("{what}: value exceeds usize on this platform")))
+}
+
+/// Decode a `BigInt` into Haskell's `Int` (`i64`).  Used for builtin
+/// inputs that the reference reads as `Int` — `shiftByteString` and
+/// `rotateByteString` shift/rotate amounts, for example.  The Haskell
+/// `readKnown` raises an evaluation failure when the integer overflows
+/// `Int64`; mirror that exactly so cardano-node's reject semantics
+/// match dugite's (#603).
+fn bigint_to_i64_or_failure(i: &BigInt, id: BuiltinId, what: &str) -> Result<i64, UplcError> {
+    use num_traits::ToPrimitive;
+    i.to_i64()
+        .ok_or_else(|| builtin_failure(id, &format!("{what}: value does not fit in Int64")))
 }
 
 /// Bitwise binary op on two byte strings of equal length.

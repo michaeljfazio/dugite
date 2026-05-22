@@ -30,10 +30,8 @@
 #   eval_fails_unexpectedly:     74  CEK rejects programs the reference accepts
 #   result_mismatch:             65  CEK produces a different normal form
 #                                    than the reference
-#   should_fail_eval:            15  CEK accepts programs the reference rejects
-#                                    at evaluation
 #   ───────────────────────────────
-#   Total skipped:              713 / 999 (286 currently pass)
+#   Total skipped:              698 / 999 (301 currently pass)
 #
 # Goal: 0 / 999.
 
@@ -748,21 +746,4 @@ builtin/semantics/writeBits/case-34
 builtin/semantics/writeBits/case-35
 builtin/semantics/writeBits/case-38
 
-# === should_fail_eval (15 tests) ===
-# dugite-uplc accepts a program the reference rejects at evaluation
-builtin/semantics/bls12_381_G1_hashToGroup/hash-dst-len-256
-builtin/semantics/bls12_381_G2_hashToGroup/hash-dst-len-256
-builtin/semantics/integerToByteString/big-endian/unbounded/input-too-big
-builtin/semantics/integerToByteString/little-endian/unbounded/input-too-big
-builtin/semantics/mkCons/mkCons-fail
-builtin/semantics/rotateByteString/case-16
-builtin/semantics/rotateByteString/case-18
-builtin/semantics/shiftByteString/case-13
-builtin/semantics/shiftByteString/case-15
-builtin/semantics/verifyEcdsaSecp256k1Signature/invalid-key
-builtin/semantics/verifyEcdsaSecp256k1Signature/test-vector-16
-builtin/semantics/verifyEcdsaSecp256k1Signature/test-vector-17
-builtin/semantics/verifyEcdsaSecp256k1Signature/test-vector-18
-builtin/semantics/verifySchnorrSecp256k1Signature/test-vector-05
-builtin/semantics/verifySchnorrSecp256k1Signature/test-vector-14
 
