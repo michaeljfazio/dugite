@@ -293,3 +293,49 @@ impl BuiltinId {
         "<unimplemented>"
     }
 }
+
+#[cfg(test)]
+mod tests {
+    //! Regression tests for the placeholder behaviour of `BuiltinId`.
+    //! These stubs are scheduled to be replaced when UPLC-4 lands the
+    //! builtin dispatch table; until then the tests guard the
+    //! placeholder contract so callers see a typed error rather than
+    //! a panic from any half-wired API.
+    use super::*;
+    use crate::UplcError;
+
+    #[test]
+    fn from_u8_is_internal_pending_table() {
+        // Until the dispatch table lands, every input — including the
+        // ones that will become valid `BuiltinId`s — must yield
+        // `Internal(...)`. We assert the error variant and that the
+        // raw byte is round-tripped into the message so future readers
+        // see exactly which input hit the stub.
+        for raw in [0u8, 1, 27, 86] {
+            let err = BuiltinId::from_u8(raw).unwrap_err();
+            match err {
+                UplcError::Internal(msg) => {
+                    assert!(
+                        msg.contains(&format!("raw={raw}")),
+                        "expected message to mention raw byte; got {msg}"
+                    );
+                }
+                other => panic!("expected Internal, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn name_is_unimplemented_placeholder() {
+        // Any `BuiltinId` returns the stable placeholder until the
+        // table lands. Pick a few variants to confirm the contract is
+        // uniform.
+        for id in [
+            BuiltinId::AddInteger,
+            BuiltinId::Sha2_256,
+            BuiltinId::Bls12_381_FinalVerify,
+        ] {
+            assert_eq!(id.name(), "<unimplemented>");
+        }
+    }
+}

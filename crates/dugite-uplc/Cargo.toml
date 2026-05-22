@@ -35,9 +35,28 @@ thiserror = { workspace = true }
 # Hex display for Data debug output.
 hex = { workspace = true }
 
+# Cross-validation only — pragma-org/uplc (`amaru-uplc`) is pinned at a
+# stable revision and used solely by `tests/cross_validate_*.rs` to
+# differential-test our codecs against another Rust UPLC implementation.
+# Gated behind the `cross-validate` feature so the default build never
+# pulls it in; production code MUST NOT reference it. This dependency is
+# never exposed in the runtime build, so it does not affect the
+# production dependency graph or the no-third-party-UPLC rule.
+amaru-uplc = { git = "https://github.com/pragma-org/uplc.git", rev = "fd5e970a5d9b345a2f0a43600e27be9827313c05", optional = true }
+# amaru-uplc uses minicbor 0.25; dugite-uplc itself uses 0.26 (workspace
+# default). Pull in 0.25 under a different package name so the
+# cross-validation tests can speak amaru-uplc's `Encode<()>` trait.
+minicbor_025 = { package = "minicbor", version = "0.25", default-features = false, features = ["std"], optional = true }
+
 [dev-dependencies]
 proptest = { workspace = true }
 serde_json = { workspace = true }
+
+[features]
+# Enables the cross-validation tests in `tests/cross_validate_*.rs`. The
+# CI workflow runs `cargo test --features cross-validate` on every PR
+# that touches `crates/dugite-uplc/`.
+cross-validate = ["dep:amaru-uplc", "dep:minicbor_025"]
 
 [lib]
 name = "dugite_uplc"

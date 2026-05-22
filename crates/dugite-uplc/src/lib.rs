@@ -51,6 +51,7 @@ pub mod term;
 
 mod error;
 
+pub use crate::data::Data;
 pub use crate::error::UplcError;
 pub use crate::program::Program;
 pub use crate::term::{Constant, Term};
