@@ -521,6 +521,46 @@ fn fp12_from_bytes(bs: &[u8; FP12_BYTES]) -> Result<blst_fp12, UplcError> {
     Ok(out)
 }
 
+/// BLS12-381 scalar-field modulus r (hex).
+const BLS_R_HEX: &str = "73eda753299d7d483339d80809a1d80553bda402fffe5bfeffffffff00000001";
+
+/// Returns the scalar-field modulus `r` as a `BigInt`.
+fn bls_scalar_r() -> BigInt {
+    BigInt::parse_bytes(BLS_R_HEX.as_bytes(), 16).unwrap_or_else(|| BigInt::from(1))
+}
+
+/// Check that a MSM scalar is within the valid Plutus range.
+///
+/// The Plutus specification (PlutusCore.Crypto.BLS12_381.Bounds) defines
+/// the valid range for `multiScalarMul` scalars as a signed 512-byte
+/// (4096-bit) integer:
+///   lb = -(2^4095)   ub = 2^4095 - 1
+/// Scalars outside `[lb, ub]` produce an evaluation failure; those
+/// within the range are accepted and reduced mod r by blst before use.
+/// This is NOT the same as `|s| < r` — scalars much larger than r are
+/// fine as long as they fit in 512 bytes.
+fn bigint_in_msm_scalar_range(n: &BigInt) -> bool {
+    use num_bigint::Sign;
+    // 0 is always in range.
+    if n.sign() == Sign::NoSign {
+        return true;
+    }
+    // ub = 2^4095 - 1, lb = -(2^4095).
+    // For positive s: s <= ub  ↔  s <= 2^4095 - 1  ↔  s < 2^4095.
+    // For negative s: s >= lb  ↔  |s| <= 2^4095.
+    // Both can be expressed as |s| <= 2^4095 with the sign caveat that
+    // -2^4095 is in range (lb) but 2^4095 is not (one past ub for positive).
+    let mag = n.magnitude();
+    let bound = num_bigint::BigUint::from(1u8) << 4095u32;
+    if n.sign() == Sign::Plus {
+        // positive: must be strictly less than 2^4095
+        mag < &bound
+    } else {
+        // negative: |s| must be <= 2^4095 (the lower bound -(2^4095) is allowed)
+        mag <= &bound
+    }
+}
+
 fn bigint_to_blst_scalar(n: &BigInt) -> [u8; 32] {
     // CIP-0381 scalar arg is an Integer interpreted mod r (the BLS
     // scalar-field order).  `blst_p1_mult` / `blst_p2_mult` expect the
@@ -532,16 +572,7 @@ fn bigint_to_blst_scalar(n: &BigInt) -> [u8; 32] {
     // representative and negation works on the curve.  `blst_p1_mult`
     // does not perform a mod-r reduction on a 256-bit buffer; large
     // or negative inputs interpreted naively give a wrong point.
-    use num_bigint::BigInt as BI;
-    // BLS12-381 scalar-field modulus r (decimal).  Matches the value
-    // in IntersectMBO's `cardano-base` and pasta-curves crates.
-    let r_hex = "73eda753299d7d483339d80809a1d80553bda402fffe5bfeffffffff00000001";
-    // SAFETY: `r_hex` is a fixed hex constant; `parse_bytes` only
-    // returns `None` for malformed input — a compile-time invariant
-    // here.  Fall back to `r = 1` if parse ever fails so we never
-    // panic on this path; that would simply cause all scalarMul
-    // results to be the point at infinity for the affected call.
-    let r: BI = BI::parse_bytes(r_hex.as_bytes(), 16).unwrap_or_else(|| BI::from(1));
+    let r = bls_scalar_r();
     // Reduce: ((n mod r) + r) mod r — handles negative inputs.
     let reduced = ((n % &r) + &r) % &r;
     let abs_be = reduced.magnitude().to_bytes_be();
@@ -722,19 +753,20 @@ pub fn denote_multi_scalar_mul(id: BuiltinId, args: Vec<Value>) -> Result<Value,
                     })
                 }
             };
-            if scalars.len() != points_bytes.len() {
-                return Err(UplcError::BuiltinFailure {
-                    builtin: id.name(),
-                    reason: format!(
-                        "scalar count ({}) != point count ({})",
-                        scalars.len(),
-                        points_bytes.len()
-                    ),
-                });
-            }
+            // Truncate to the shorter list (Haskell zip semantics: extra
+            // entries in either list are silently ignored).
             // Accumulate: start with G1 identity, add each sᵢ·Pᵢ.
             let mut acc = blst_p1::default(); // identity
             for (s, p_bytes) in scalars.into_iter().zip(points_bytes) {
+                // Range check: scalar must be in (-r, r) so blst sees a
+                // canonical representative.  |s| >= r is an error per the
+                // Plutus conformance tests (multiScalarMul-13b/13d).
+                if !bigint_in_msm_scalar_range(&s) {
+                    return Err(UplcError::BuiltinFailure {
+                        builtin: id.name(),
+                        reason: "scalar is out of range (|s| >= r)".to_string(),
+                    });
+                }
                 let p = uncompress_g1(&p_bytes, id)?;
                 let scalar = bigint_to_blst_scalar(&s);
                 let mut term = blst_p1::default();
@@ -770,18 +802,15 @@ pub fn denote_multi_scalar_mul(id: BuiltinId, args: Vec<Value>) -> Result<Value,
                     })
                 }
             };
-            if scalars.len() != points_bytes.len() {
-                return Err(UplcError::BuiltinFailure {
-                    builtin: id.name(),
-                    reason: format!(
-                        "scalar count ({}) != point count ({})",
-                        scalars.len(),
-                        points_bytes.len()
-                    ),
-                });
-            }
+            // Truncate to the shorter list (Haskell zip semantics).
             let mut acc = blst_p2::default();
             for (s, p_bytes) in scalars.into_iter().zip(points_bytes) {
+                if !bigint_in_msm_scalar_range(&s) {
+                    return Err(UplcError::BuiltinFailure {
+                        builtin: id.name(),
+                        reason: "scalar is out of range (|s| >= r)".to_string(),
+                    });
+                }
                 let p = uncompress_g2(&p_bytes, id)?;
                 let scalar = bigint_to_blst_scalar(&s);
                 let mut term = blst_p2::default();
