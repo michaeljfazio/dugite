@@ -27,10 +27,11 @@
 #![allow(clippy::expect_used, clippy::unwrap_used, clippy::panic)]
 
 use dugite_uplc::machine::cost::BudgetTracker;
+use dugite_uplc::machine::env::Env;
 use dugite_uplc::machine::step::evaluate_with_budget;
 use dugite_uplc::machine::{ExBudget, Value};
 use dugite_uplc::syn::{parse_program, ParseError};
-use dugite_uplc::term::{BuiltinId, Term};
+use dugite_uplc::term::Term;
 use dugite_uplc::Program;
 
 /// Sentinel strings used by the Haskell conformance harness for
@@ -174,41 +175,31 @@ fn classify(expected_trim: &str) -> ExpectKind {
 
 /// Convert a CEK `Value` back to a `Term` for comparison against the
 /// golden output. Matches the readback performed by the Haskell
-/// `runCekNoEmit` driver.
+/// `runCekNoEmit` driver — a normalisation-by-evaluation `quote` pass
+/// that produces a closed term in De Bruijn form.
 ///
-/// The conformance corpus reduces most programs to a `Const`. A
-/// handful reduce to closed lambdas, delays, partial-application
-/// builtins, or constrs — those map back to the corresponding term
-/// shape directly. Closures with non-empty captured environments
-/// would require De Bruijn substitution; we surface that as an
-/// explicit harness limitation rather than silently producing a
-/// term that disagrees with the golden.
+/// Algorithm: when a closure captures values from its enclosing
+/// environment, walk the closure body and replace every free De Bruijn
+/// index with the readback of the corresponding captured value. The
+/// substituent is always closed (every recursive readback produces a
+/// closed term), so no index-shifting is required when inlining.
 fn readback(value: Value) -> Result<Term, String> {
     match value {
         Value::Const(c) => Ok(Term::Const(c)),
         Value::Lambda { body, env } => {
-            if env.depth() != 0 {
-                return Err(format!(
-                    "Value::Lambda with non-empty captured env ({} entries) — \
-                     readback requires De Bruijn substitution",
-                    env.depth()
-                ));
-            }
-            Ok(Term::Lam(body))
+            // Entering the Lam binder bumps the local depth to 1: Var(1)
+            // inside `body` is the lambda's own parameter (not in `env`),
+            // and Var(i) for i > 1 indexes the captured environment.
+            Ok(Term::Lam(Box::new(quote_term(*body, &env, 1)?)))
         }
         Value::Delay { body, env } => {
-            if env.depth() != 0 {
-                return Err(format!(
-                    "Value::Delay with non-empty captured env ({} entries) — \
-                     readback requires De Bruijn substitution",
-                    env.depth()
-                ));
-            }
-            Ok(Term::Delay(body))
+            // `Delay` does not introduce a binder, so depth starts at 0:
+            // every Var(i) in `body` indexes into `env` directly.
+            Ok(Term::Delay(Box::new(quote_term(*body, &env, 0)?)))
         }
         Value::Builtin { id, forces, args } => {
             // Reconstruct as `Force...Force (builtin id) arg0 arg1 ...`.
-            let mut t = Term::Builtin(id_pass(id));
+            let mut t = Term::Builtin(id);
             for _ in 0..forces {
                 t = Term::Force(Box::new(t));
             }
@@ -228,10 +219,59 @@ fn readback(value: Value) -> Result<Term, String> {
     }
 }
 
-/// Identity on `BuiltinId`. Exists so the readback for `Value::Builtin`
-/// reads uniformly across variant kinds.
-fn id_pass(id: BuiltinId) -> BuiltinId {
-    id
+/// Walk `term` substituting every free De Bruijn reference into the
+/// captured environment `env`. `depth` is the number of binders we have
+/// entered since the enclosing closure was captured — Var(i) with
+/// `i <= depth` is bound locally and must be preserved; Var(i) with
+/// `i > depth` is a capture and resolves to `env.lookup(i - depth)`
+/// (1-based, innermost first), itself read back recursively.
+fn quote_term(term: Term, env: &Env, depth: u64) -> Result<Term, String> {
+    Ok(match term {
+        Term::Var(i) => {
+            if i <= depth {
+                Term::Var(i)
+            } else {
+                let captured = env
+                    .lookup(i - depth)
+                    .map_err(|e| format!("captured Var({i}) lookup failed: {e}"))?
+                    .clone();
+                // Recursive readback yields a closed term: no index shift
+                // is required when inlining at greater depth.
+                readback(captured)?
+            }
+        }
+        Term::Lam(body) => Term::Lam(Box::new(quote_term(*body, env, depth + 1)?)),
+        Term::App(f, a) => Term::App(
+            Box::new(quote_term(*f, env, depth)?),
+            Box::new(quote_term(*a, env, depth)?),
+        ),
+        Term::Const(c) => Term::Const(c),
+        Term::Delay(body) => Term::Delay(Box::new(quote_term(*body, env, depth)?)),
+        Term::Force(body) => Term::Force(Box::new(quote_term(*body, env, depth)?)),
+        Term::Error => Term::Error,
+        Term::Builtin(id) => Term::Builtin(id),
+        Term::Constr { tag, args } => {
+            let mut out = Vec::with_capacity(args.len());
+            for a in args {
+                out.push(quote_term(a, env, depth)?);
+            }
+            Term::Constr { tag, args: out }
+        }
+        Term::Case {
+            scrutinee,
+            branches,
+        } => {
+            let scrutinee = Box::new(quote_term(*scrutinee, env, depth)?);
+            let mut out = Vec::with_capacity(branches.len());
+            for b in branches {
+                out.push(quote_term(b, env, depth)?);
+            }
+            Term::Case {
+                scrutinee,
+                branches: out,
+            }
+        }
+    })
 }
 
 // Include the per-test-vector `#[test]` functions emitted by build.rs.

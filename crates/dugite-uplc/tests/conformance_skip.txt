@@ -27,9 +27,6 @@
 #   budget:                     458  CPU/mem cost-model divergence (dominant
 #                                    class — every per-step CPU charge needs
 #                                    to be aligned with the Haskell tiered model)
-#   readback_limit:               2  harness readback gap (Value::Lambda with
-#                                    non-empty captured env — needs De-Bruijn
-#                                    substitution)
 #   eval_fails_unexpectedly:     74  CEK rejects programs the reference accepts
 #   result_mismatch:             65  CEK produces a different normal form
 #                                    than the reference
@@ -39,7 +36,7 @@
 #                                    rejects at parse (over-permissive lexer
 #                                    in our integer / string handling)
 #   ───────────────────────────────
-#   Total skipped:              793 / 999 (206 currently pass)
+#   Total skipped:              791 / 999 (208 currently pass)
 #
 # Goal: 0 / 999.
 
@@ -216,7 +213,7 @@ builtin/semantics/valueData/negative-quantity
 builtin/semantics/valueData/roundtrip-from-value
 builtin/semantics/valueData/single-entry
 
-# === budget (458 tests) ===
+# === budget (460 tests) ===
 # CPU/mem budget consumed by dugite-uplc differs from the Haskell golden â dugite-uplc cost model needs alignment
 builtin/constant/bls12-381/G1/on-curve-bit3-clear
 builtin/constant/bls12-381/G1/on-curve-bit3-set
@@ -656,6 +653,7 @@ term/app/app-3
 term/app/app-4
 term/app/app-5
 term/app/app-6
+term/app/app-7
 term/app/app-8
 term/app/app-9
 term/case/case-01
@@ -664,6 +662,7 @@ term/case/case-03
 term/case/case-04
 term/case/case-08
 term/case/case-10
+term/closure
 term/constr/constr-01
 term/constr/constr-02
 term/constr/constr-03
@@ -676,11 +675,6 @@ term/force/force-3
 term/lam/lam-1
 term/lam/lam-2
 term/unlifting-unsat
-
-# === readback_limit (2 tests) ===
-# CEK result has a non-empty captured environment; the conformance readback does not yet do De-Bruijn substitution
-term/app/app-7
-term/closure
 
 # === eval_fails_unexpectedly (74 tests) ===
 # dugite-uplc CEK fails on a program the reference accepts
