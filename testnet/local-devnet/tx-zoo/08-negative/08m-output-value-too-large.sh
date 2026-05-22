@@ -21,17 +21,13 @@ POLICY_SCRIPT="$ZOO_BUILT/$NAME.policy.json"
 POLICY_SKEY="$ZOO_BUILT/$NAME.policy.skey"
 POLICY_VKEY="$ZOO_BUILT/$NAME.policy.vkey"
 
-cardano-cli conway key gen-policy \
-    --signing-key-file  "$POLICY_SKEY" \
-    --verification-key-file "$POLICY_VKEY" 2>/dev/null || \
-cardano-cli conway key gen-payment \
+cardano-cli conway address key-gen \
     --signing-key-file  "$POLICY_SKEY" \
     --verification-key-file "$POLICY_VKEY" >/dev/null
 
 # Write a simple "always succeeds" native script
-POLICY_VKEY_HASH=$(cardano-cli conway key hash \
-    --payment-verification-key-file "$POLICY_VKEY" 2>/dev/null || \
-    jq -r '.cborHex | .[4:]' "$POLICY_VKEY" | head -c 56)
+POLICY_VKEY_HASH=$(cardano-cli conway address key-hash \
+    --payment-verification-key-file "$POLICY_VKEY")
 
 cat > "$POLICY_SCRIPT" <<SCRIPT
 {

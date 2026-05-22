@@ -106,12 +106,9 @@ devnet-validate-smoke:
     set -euo pipefail
     REPO_ROOT="$(pwd)"
     cd testnet/local-devnet
-    EVD="evidence/smoke-$(date -u +%Y%m%dT%H%M%SZ)"
-    mkdir -p "$EVD"
     ./setup.sh
-    ./run.sh &
-    DEVNET_PID=$!
-    trap 'kill $DEVNET_PID 2>/dev/null; ./stop.sh 2>/dev/null || true' EXIT
+    ./run.sh
+    trap './stop.sh 2>/dev/null || true' EXIT
     # Wait for relay socket
     for i in $(seq 1 30); do
         sleep 2
@@ -123,9 +120,13 @@ devnet-validate-smoke:
         B=$(cardano-cli query tip --testnet-magic 42 --socket-path "/tmp/ld-$(id -u)/relay.sock" 2>/dev/null | jq -r '.block // 0' || echo 0)
         [ "$B" -ge 3 ] && break
     done
+    # Smoke = tx-zoo correctness + log-level predicate only.
+    # verify.sh's tip-parity / tx-inclusion predicates require sustained soak
+    # evidence and live in the standard/extended presets.
+    EVD="evidence/smoke-$(date -u +%Y%m%dT%H%M%SZ)"
+    mkdir -p "$EVD"
     EVIDENCE_DIR="$EVD" ./tx-zoo/run-all.sh 01-bookkeeping 02-native-scripts 08-negative
     EVIDENCE_DIR="$EVD" ./perf/log-level-predicate.sh
-    ./verify.sh "$EVD"
     ./stop.sh 2>/dev/null || true
     "$REPO_ROOT/.claude/skills/devnet-validate/scripts/generate-release-report.sh" \
         --preset smoke \

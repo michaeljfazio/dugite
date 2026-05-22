@@ -18,16 +18,13 @@ REQ_VKEY="$ZOO_BUILT/$NAME.req.vkey"
 REQ_SKEY="$ZOO_BUILT/$NAME.req.skey"
 
 # Generate a fresh key whose vkey hash we'll declare as required signer
-cardano-cli conway key gen-payment \
+cardano-cli conway address key-gen \
     --signing-key-file  "$REQ_SKEY" \
     --verification-key-file "$REQ_VKEY" >/dev/null
 
 # Get vkey hash
-REQ_HASH=$(cardano-cli conway transaction policyid \
-    --script-file /dev/null 2>/dev/null \
-    || cardano-cli conway key hash \
-        --payment-verification-key-file "$REQ_VKEY" 2>/dev/null \
-    || jq -r '.cborHex | .[4:]' "$REQ_VKEY" 2>/dev/null | head -c 56 || echo "")
+REQ_HASH=$(cardano-cli conway address key-hash \
+    --payment-verification-key-file "$REQ_VKEY" 2>/dev/null || echo "")
 
 if [ -z "$REQ_HASH" ]; then
     zoo_record "$NAME" SKIP "" "could-not-derive-req-signer-hash"

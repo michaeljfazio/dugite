@@ -348,6 +348,7 @@ pub(crate) struct LedgerTxValidator {
     pub slot_config: dugite_ledger::plutus::SlotConfig,
     pub metrics: Arc<crate::metrics::NodeMetrics>,
     pub mempool: Option<Arc<dugite_mempool::Mempool>>,
+    pub network: dugite_primitives::network::NetworkId,
 }
 
 impl TxValidator for LedgerTxValidator {
@@ -395,7 +396,8 @@ impl TxValidator for LedgerTxValidator {
             .with_active_proposals(active_proposals)
             .with_committee_authorized_hot_keys(committee_hot_keys)
             .with_committee_members(committee_members)
-            .with_committee_resigned(committee_resigned);
+            .with_committee_resigned(committee_resigned)
+            .with_network(self.network);
 
         dugite_ledger::validation::validate_transaction_with_context(
             &tx,

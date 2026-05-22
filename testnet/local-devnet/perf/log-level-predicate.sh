@@ -46,7 +46,7 @@ for log_file in "$LD_LOGS"/*.log; do
 
     # Check for panics
     for pattern in "${PANIC_PATTERNS[@]}"; do
-        count=$(grep -c -E "$pattern" "$log_file" 2>/dev/null || echo 0)
+        count=$(grep -c -E "$pattern" "$log_file" 2>/dev/null) || count=0
         if [ "$count" -gt 0 ]; then
             log_error "PANIC in $node: pattern='$pattern' count=$count"
             printf '%s,%s,PANIC,"%s",%s\n' \

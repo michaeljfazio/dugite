@@ -18,7 +18,7 @@ MAINNET_VKEY="$ZOO_BUILT/$NAME.mainnet.vkey"
 MAINNET_SKEY="$ZOO_BUILT/$NAME.mainnet.skey"
 
 # Generate a fresh key pair
-cardano-cli conway key gen-payment \
+cardano-cli conway address key-gen \
     --signing-key-file  "$MAINNET_SKEY" \
     --verification-key-file "$MAINNET_VKEY" >/dev/null
 

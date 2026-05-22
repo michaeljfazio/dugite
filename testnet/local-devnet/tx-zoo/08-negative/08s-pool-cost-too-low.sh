@@ -22,11 +22,11 @@ POOL_COUNTER="$ZOO_BUILT/$NAME.counter"
 POOL_REG="$ZOO_BUILT/$NAME.pool.reg"
 
 # Generate fresh pool keys
-cardano-cli conway node gen-cold \
+cardano-cli conway node key-gen \
     --cold-verification-key-file "$POOL_COLD_VKEY" \
     --cold-signing-key-file      "$POOL_COLD_SKEY" \
     --operational-certificate-issue-counter-file "$POOL_COUNTER" >/dev/null 2>&1 || \
-{ zoo_record "$NAME" SKIP "" "node-gen-cold-not-available"; exit 0; }
+{ zoo_record "$NAME" SKIP "" "node-key-gen-not-available"; exit 0; }
 
 cardano-cli conway node key-gen-VRF \
     --verification-key-file "$POOL_VRF_VKEY" \

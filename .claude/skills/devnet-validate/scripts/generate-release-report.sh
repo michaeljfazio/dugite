@@ -430,7 +430,11 @@ for i in "${!EVIDENCE_DIRS[@]}"; do
     r_cp_d=$(echo "$ROUNDS_JSON"  | jq -r ".[$i].cli_parity.divergent // 0")
     r_tip=$(echo "$ROUNDS_JSON"   | jq -r ".[$i].tip_age.p99_seconds // \"?\"")
     r_dens=$(echo "$ROUNDS_JSON"  | jq -r ".[$i].chain_density // \"?\"")
-    badge=$([ "$r_pass" = "true" ] && echo "✅ PASS" || echo "❌ FAIL")
+    case "$r_pass" in
+        true)  badge="✅ PASS" ;;
+        false) badge="❌ FAIL" ;;
+        *)     badge="— N/A"  ;;
+    esac
     cp_badge=$([ "${r_cp_d:-0}" -eq 0 ] && echo "✅ ${r_cp_e}✓" || echo "❌ ${r_cp_d}✗")
     echo "| $rname | $badge | $r_can | $r_tz_p/$r_tz_t | $cp_badge | ${r_tip}s | $r_dens |"
 done
@@ -464,7 +468,7 @@ for i in "${!EVIDENCE_DIRS[@]}"; do
             }
         ' "$in_rpt"
     else
-        echo "| (no in-round report.md found) | — | run verify.sh first |"
+        echo "| (no in-round report.md) | — | smoke preset skips verify.sh predicates |"
     fi
     echo
 done

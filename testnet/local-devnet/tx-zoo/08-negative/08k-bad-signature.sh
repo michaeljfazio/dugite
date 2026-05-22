@@ -19,7 +19,7 @@ WRONG_SKEY="$ZOO_BUILT/$NAME.wrong.skey"
 WRONG_VKEY="$ZOO_BUILT/$NAME.wrong.vkey"
 
 # Generate a throwaway payment key pair
-cardano-cli conway key gen-payment \
+cardano-cli conway address key-gen \
     --signing-key-file  "$WRONG_SKEY" \
     --verification-key-file "$WRONG_VKEY" >/dev/null
 
