@@ -1522,6 +1522,7 @@ dependencies = [
  "digest 0.11.2",
  "ed25519-dalek",
  "hex",
+ "k256",
  "minicbor 0.25.1",
  "minicbor 0.26.5",
  "num-bigint",

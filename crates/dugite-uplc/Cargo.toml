@@ -29,6 +29,12 @@ digest = "0.11"
 # behaviour). ed25519-dalek's default `verify` matches.
 ed25519-dalek = { workspace = true }
 
+# secp256k1 — ECDSA + Schnorr. We use `k256` (pure Rust) to avoid the
+# secp256k1-sys C dependency. Cardano's CIP-49 ECDSA matches the
+# default `k256::ecdsa` verifier (low-S-normalised, fixed 64-byte
+# signatures); Schnorr matches BIP-340 (`k256::schnorr`).
+k256 = { version = "0.13", default-features = false, features = ["std", "ecdsa", "schnorr", "sha256"] }
+
 # Integer arithmetic for the `integer` and rational-cost-model paths.
 num-bigint = { workspace = true }
 num-traits = { workspace = true }
