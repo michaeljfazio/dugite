@@ -156,6 +156,14 @@ pub struct NodeConfig {
     #[serde(default)]
     pub conway_genesis_file: Option<String>,
 
+    /// Dijkstra genesis file path (post-Conway HFC; carries pparams 34-37).
+    ///
+    /// Mirrors cardano-node's `DijkstraGenesisFile` config field. Parsed
+    /// via `dugite_primitives::genesis::DijkstraGenesis`; not yet wired
+    /// into runtime ledger rules (issue #462 Phase 6 — parse only).
+    #[serde(default)]
+    pub dijkstra_genesis_file: Option<String>,
+
     /// Expected Blake2b-256 hash of the Byron genesis file (hex string)
     #[serde(default)]
     pub byron_genesis_hash: Option<String>,
@@ -171,6 +179,12 @@ pub struct NodeConfig {
     /// Expected Blake2b-256 hash of the Conway genesis file (hex string)
     #[serde(default)]
     pub conway_genesis_hash: Option<String>,
+
+    /// Expected Blake2b-256 hash of the Dijkstra genesis file (hex string).
+    ///
+    /// Mirrors cardano-node's `DijkstraGenesisHash` config field.
+    #[serde(default)]
+    pub dijkstra_genesis_hash: Option<String>,
 
     /// Diffusion mode — controls inbound connection acceptance.
     ///
@@ -770,6 +784,11 @@ impl NodeConfig {
                 &self.conway_genesis_file,
                 &self.conway_genesis_hash,
             ),
+            (
+                "Dijkstra",
+                &self.dijkstra_genesis_file,
+                &self.dijkstra_genesis_hash,
+            ),
         ];
 
         for (era, file_opt, hash_opt) in genesis_files {
@@ -807,10 +826,12 @@ impl Default for NodeConfig {
             byron_genesis_file: None,
             alonzo_genesis_file: None,
             conway_genesis_file: None,
+            dijkstra_genesis_file: None,
             byron_genesis_hash: None,
             shelley_genesis_hash: None,
             alonzo_genesis_hash: None,
             conway_genesis_hash: None,
+            dijkstra_genesis_hash: None,
             diffusion_mode: DiffusionMode::default(),
             peer_sharing: None,
             target_number_of_root_peers: 60,
@@ -917,6 +938,51 @@ mod tests {
             ..NodeConfig::default()
         };
         assert!(config.validate(Path::new(".")).is_ok());
+    }
+
+    #[test]
+    fn test_dijkstra_genesis_fields_deserialise() {
+        // Mirrors cardano-node's PascalCase field names for the new
+        // post-Conway HFC genesis (issue #462 Phase 6 / Phase 4).
+        let json = r#"{
+            "DijkstraGenesisFile": "preview-dijkstra-genesis.json",
+            "DijkstraGenesisHash": "0000000000000000000000000000000000000000000000000000000000000000"
+        }"#;
+        let config: NodeConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(
+            config.dijkstra_genesis_file.as_deref(),
+            Some("preview-dijkstra-genesis.json")
+        );
+        assert_eq!(
+            config.dijkstra_genesis_hash.as_deref(),
+            Some("0000000000000000000000000000000000000000000000000000000000000000")
+        );
+    }
+
+    #[test]
+    fn test_validate_invalid_dijkstra_genesis_hash() {
+        let config = NodeConfig {
+            dijkstra_genesis_hash: Some("deadbeef".to_string()),
+            ..NodeConfig::default()
+        };
+        let err = config.validate(Path::new(".")).unwrap_err();
+        assert!(
+            err.to_string().contains("Dijkstra genesis hash"),
+            "validator must mention Dijkstra by name; got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_validate_missing_dijkstra_genesis_file() {
+        let config = NodeConfig {
+            dijkstra_genesis_file: Some("nonexistent-dijkstra-genesis.json".to_string()),
+            ..NodeConfig::default()
+        };
+        let err = config.validate(Path::new(".")).unwrap_err();
+        assert!(
+            err.to_string().contains("Dijkstra genesis file not found"),
+            "expected Dijkstra file-not-found error; got: {err}"
+        );
     }
 
     // ── MetricsPort config field ──────────────────────────────────────────────

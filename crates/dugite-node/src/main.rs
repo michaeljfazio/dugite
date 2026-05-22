@@ -208,6 +208,15 @@ struct RunArgs {
     #[arg(long)]
     validate_all_blocks: bool,
 
+    /// Path to the Dijkstra-era genesis JSON file.
+    ///
+    /// Overrides the JSON config field `DijkstraGenesisFile`. The file is
+    /// parsed at startup but not yet applied to runtime protocol parameters
+    /// (issue #462 Phase 6 — parse only; Phase 4 wires pparams 34-37).
+    /// Mirrors cardano-node's `--dijkstra-genesis` flag.
+    #[arg(long)]
+    dijkstra_genesis: Option<PathBuf>,
+
     // Block producer options (optional — enables block production mode)
     /// Path to the KES signing key file
     #[arg(long)]
@@ -1333,12 +1342,20 @@ async fn run_node(args: RunArgs, log_handle: Option<logging::LogHandle>) -> Resu
     );
 
     // Load configuration
-    let node_config = config::NodeConfig::load(&args.config)?;
+    let mut node_config = config::NodeConfig::load(&args.config)?;
     let config_dir = args
         .config
         .parent()
         .unwrap_or_else(|| std::path::Path::new("."))
         .to_path_buf();
+
+    // CLI override for the Dijkstra genesis path.  Mirrors cardano-node's
+    // `--dijkstra-genesis` flag; takes precedence over the JSON
+    // `DijkstraGenesisFile` config field when provided. Issue #462 Phase 6.
+    if let Some(ref cli_path) = args.dijkstra_genesis {
+        node_config.dijkstra_genesis_file = Some(cli_path.to_string_lossy().into_owned());
+    }
+
     node_config.validate(&config_dir)?;
 
     // Resolve effective metrics port using a three-level priority:

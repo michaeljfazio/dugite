@@ -52,7 +52,9 @@ use dugite_storage::background::{CopyToImmutable, GcScheduler, SnapshotScheduler
 use dugite_storage::{ChainDB, ChainSelHandle};
 
 use crate::config::NodeConfig;
-use crate::genesis::{AlonzoGenesis, ByronGenesis, ConwayGenesis, ShelleyGenesis};
+use crate::genesis::{
+    load_dijkstra_genesis_with_hash, AlonzoGenesis, ByronGenesis, ConwayGenesis, ShelleyGenesis,
+};
 use crate::metrics::GovernanceSnapshot;
 use crate::topology::Topology;
 
@@ -658,6 +660,57 @@ impl Node {
                         );
                     }
                     debug!("Conway genesis hash validated: {}", expected.to_hex());
+                }
+            }
+        }
+
+        // Load Dijkstra genesis if configured (issue #462 Phase 6 — parse only).
+        //
+        // The parsed values are not yet applied to `protocol_params`; pparams
+        // 34-37 (max_ref_script_size_per_block/_per_tx, ref_script_cost_stride,
+        // ref_script_cost_multiplier) are wired in a separate phase. We still
+        // perform full validation here so a malformed genesis is rejected at
+        // startup and a configured `DijkstraGenesisHash` is honoured.
+        let mut dijkstra_genesis_file_hash: Option<dugite_primitives::hash::Hash32> = None;
+        if let Some(ref genesis_path) = args.config.dijkstra_genesis_file {
+            let genesis_path = config_dir.join(genesis_path);
+            match load_dijkstra_genesis_with_hash(&genesis_path) {
+                Ok((genesis, hash)) => {
+                    info!(
+                        max_ref_script_size_per_block = genesis.max_ref_script_size_per_block,
+                        max_ref_script_size_per_tx = genesis.max_ref_script_size_per_tx,
+                        ref_script_cost_stride = genesis.ref_script_cost_stride,
+                        ref_script_cost_multiplier = %format!(
+                            "{}/{}",
+                            genesis.ref_script_cost_multiplier.numerator(),
+                            genesis.ref_script_cost_multiplier.denominator(),
+                        ),
+                        "Dijkstra genesis loaded (parse-only — pparams 34-37 not yet wired)",
+                    );
+                    dijkstra_genesis_file_hash = Some(hash);
+                    // `genesis` is intentionally unused at runtime — the
+                    // info-log above is the only consumer until pparams
+                    // 34-37 wiring lands in a follow-up phase.
+                    let _ = genesis;
+                }
+                Err(e) => {
+                    warn!("Failed to load Dijkstra genesis: {e}");
+                }
+            }
+        }
+
+        // Validate Dijkstra genesis hash if configured.
+        if let Some(ref expected_hex) = args.config.dijkstra_genesis_hash {
+            if let Ok(expected) = dugite_primitives::hash::Hash32::from_hex(expected_hex) {
+                if let Some(ref actual) = dijkstra_genesis_file_hash {
+                    if *actual != expected {
+                        anyhow::bail!(
+                            "Dijkstra genesis hash mismatch: expected {}, got {}",
+                            expected.to_hex(),
+                            actual.to_hex()
+                        );
+                    }
+                    debug!("Dijkstra genesis hash validated: {}", expected.to_hex());
                 }
             }
         }
