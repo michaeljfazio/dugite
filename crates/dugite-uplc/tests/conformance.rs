@@ -25,6 +25,11 @@
 
 #![cfg(feature = "conformance")]
 #![allow(clippy::expect_used, clippy::unwrap_used, clippy::panic)]
+// When the conformance corpus is not downloaded, build.rs emits a single
+// sentinel `#[test]` that doesn't reference any of the helpers below.
+// The helpers are still required when the corpus is present, so suppress
+// the dead-code warning unconditionally for this test binary.
+#![allow(dead_code)]
 
 use dugite_uplc::machine::cost::BudgetTracker;
 use dugite_uplc::machine::env::Env;
