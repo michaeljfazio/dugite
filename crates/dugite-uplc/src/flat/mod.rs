@@ -47,14 +47,22 @@
 
 #![allow(dead_code)] // pre-implementation scaffolding
 
+pub mod bits;
 pub mod decode;
 pub mod encode;
+pub mod term;
 
 /// Maximum recursion depth for the flat decoder. The on-chain script
-/// size limit is ~16 KiB; with 4-bit per constructor that's an upper
-/// bound of ~32 K nodes, but real scripts are much shallower. We pick
-/// a generous limit that protects against stack-exhaustion attacks.
-pub const FLAT_MAX_DEPTH: usize = 4096;
+/// size limit is ~16 KiB; real Plutus scripts rarely exceed depth 32.
+/// The cap protects against stack-exhaustion attacks (decoder recursion
+/// is one frame per level) and is set well below the OS thread stack
+/// budget so even pathological adversarial inputs cannot smash the
+/// stack before the depth check fires.
+///
+/// 256 is generous: it's an order of magnitude past any observed real
+/// script and ~16x below the smallest Rust default thread stack
+/// (the test runner's `nextest` default is 2 MiB).
+pub const FLAT_MAX_DEPTH: usize = 256;
 
 /// Result alias for flat decode/encode operations.
 pub type FlatResult<T> = Result<T, crate::UplcError>;
