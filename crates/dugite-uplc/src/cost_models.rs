@@ -7,6 +7,7 @@
 //! cost_models = { ? 0 => [* int]   ; PlutusV1
 //!               , ? 1 => [* int]   ; PlutusV2
 //!               , ? 2 => [* int]   ; PlutusV3
+//!               , ? 3 => [* int]   ; PlutusV4 (Dijkstra, issue #475 Phase 5)
 //!               }
 //! ```
 //!
@@ -24,7 +25,9 @@
 //! actions that grow or shrink the array as new builtins land (see
 //! e.g. CIP-0117 / CIP-0123) — the decoder must tolerate arrays of
 //! arbitrary size up to a defensive cap so adversarial cost models
-//! cannot trigger an unbounded `Vec::with_capacity`.
+//! cannot trigger an unbounded `Vec::with_capacity`. V4 (Dijkstra)
+//! ships at the same 297-entry length as V3 (no new builtins in
+//! PV1.2.0 vs PV1.1.0 per upstream `IntersectMBO/plutus` master).
 //!
 //! ## Adversarial-input contract
 //!
@@ -58,6 +61,8 @@ const MAX_VERSIONS: usize = 16;
 const KEY_V1: u32 = 0;
 const KEY_V2: u32 = 1;
 const KEY_V3: u32 = 2;
+/// PlutusV4 cost-model slot (Dijkstra, issue #475 Phase 5).
+const KEY_V4: u32 = 3;
 
 /// Per-version cost-model coefficient arrays. Each `Vec<i64>` is the
 /// raw flat array of parameter values in Plutus canonical order.
@@ -67,6 +72,8 @@ pub struct CostModels {
     pub plutus_v1: Option<Vec<i64>>,
     pub plutus_v2: Option<Vec<i64>>,
     pub plutus_v3: Option<Vec<i64>>,
+    /// PlutusV4 cost model (Dijkstra). Wire slot is map key 3.
+    pub plutus_v4: Option<Vec<i64>>,
 }
 
 impl CostModels {
@@ -75,7 +82,10 @@ impl CostModels {
     /// configured" and use the CEK machine's default per-step cost
     /// constants from `machine::cost`.
     pub fn is_empty(&self) -> bool {
-        self.plutus_v1.is_none() && self.plutus_v2.is_none() && self.plutus_v3.is_none()
+        self.plutus_v1.is_none()
+            && self.plutus_v2.is_none()
+            && self.plutus_v3.is_none()
+            && self.plutus_v4.is_none()
     }
 }
 
@@ -138,7 +148,7 @@ pub fn decode_cost_models_cbor(cbor: &[u8]) -> Result<CostModels, PhaseTwoError>
 
 /// Consume one (key, value) pair from the top-level map.
 ///
-/// Known keys (0/1/2 → V1/V2/V3) populate the matching field on
+/// Known keys (0/1/2/3 → V1/V2/V3/V4) populate the matching field on
 /// [`CostModels`]. Unknown keys are skipped — both the key (a single
 /// CBOR integer the decoder already consumed) and the value (which
 /// `skip` walks past in a single call).
@@ -157,6 +167,7 @@ fn consume_one_entry(d: &mut Decoder<'_>, out: &mut CostModels) -> Result<(), Ph
         KEY_V1 => out.plutus_v1 = Some(read_int_array(d, "V1")?),
         KEY_V2 => out.plutus_v2 = Some(read_int_array(d, "V2")?),
         KEY_V3 => out.plutus_v3 = Some(read_int_array(d, "V3")?),
+        KEY_V4 => out.plutus_v4 = Some(read_int_array(d, "V4")?),
         unknown => {
             // Forward-compat: skip the value associated with an unknown
             // version key rather than rejecting the whole encoding.
@@ -260,6 +271,20 @@ mod tests {
         assert!(cm.plutus_v1.is_none());
         assert!(cm.plutus_v2.is_none());
         assert_eq!(cm.plutus_v3.as_deref(), Some(&[1i64, 2, 3, -7][..]));
+        assert!(cm.plutus_v4.is_none());
+        assert!(!cm.is_empty());
+    }
+
+    /// PlutusV4 cost-model slot 3 decodes into `plutus_v4`
+    /// (Dijkstra, issue #475 Phase 5).
+    #[test]
+    fn decodes_single_v4_entry() {
+        let cbor = build_map_cbor(&[(KEY_V4, &[100, 200, -1])]);
+        let cm = decode_cost_models_cbor(&cbor).unwrap();
+        assert!(cm.plutus_v1.is_none());
+        assert!(cm.plutus_v2.is_none());
+        assert!(cm.plutus_v3.is_none());
+        assert_eq!(cm.plutus_v4.as_deref(), Some(&[100i64, 200, -1][..]));
         assert!(!cm.is_empty());
     }
 
@@ -273,9 +298,27 @@ mod tests {
         assert_eq!(cm.plutus_v1.as_ref().map(|v| v.len()), Some(50));
         assert_eq!(cm.plutus_v2.as_ref().map(|v| v.len()), Some(60));
         assert_eq!(cm.plutus_v3.as_ref().map(|v| v.len()), Some(70));
+        assert!(cm.plutus_v4.is_none());
         assert_eq!(cm.plutus_v1.unwrap()[0], 10);
         assert_eq!(cm.plutus_v2.unwrap()[0], 20);
         assert_eq!(cm.plutus_v3.unwrap()[0], 30);
+    }
+
+    /// All four supported versions (V1+V2+V3+V4) decode into the
+    /// matching field. Dijkstra cost-model wire shape (issue #475 Phase 5).
+    #[test]
+    fn decodes_all_four_versions() {
+        let v1 = vec![10i64; 5];
+        let v2 = vec![20i64; 6];
+        let v3 = vec![30i64; 7];
+        let v4 = vec![40i64; 8];
+        let cbor = build_map_cbor(&[(KEY_V1, &v1), (KEY_V2, &v2), (KEY_V3, &v3), (KEY_V4, &v4)]);
+        let cm = decode_cost_models_cbor(&cbor).unwrap();
+        assert_eq!(cm.plutus_v1.as_ref().map(|v| v.len()), Some(5));
+        assert_eq!(cm.plutus_v2.as_ref().map(|v| v.len()), Some(6));
+        assert_eq!(cm.plutus_v3.as_ref().map(|v| v.len()), Some(7));
+        assert_eq!(cm.plutus_v4.as_ref().map(|v| v.len()), Some(8));
+        assert_eq!(cm.plutus_v4.as_ref().unwrap()[0], 40);
     }
 
     #[test]
@@ -311,12 +354,14 @@ mod tests {
             plutus_v1: Some(vec![1, 2, 3]),
             plutus_v2: None,
             plutus_v3: Some(vec![100, 200, -300]),
+            plutus_v4: Some(vec![7, 8, 9, 10]),
         };
         let cbor = prim.to_cbor().unwrap();
         let cm = decode_cost_models_cbor(&cbor).unwrap();
         assert_eq!(cm.plutus_v1, prim.plutus_v1);
         assert_eq!(cm.plutus_v2, prim.plutus_v2);
         assert_eq!(cm.plutus_v3, prim.plutus_v3);
+        assert_eq!(cm.plutus_v4, prim.plutus_v4);
     }
 
     #[test]
