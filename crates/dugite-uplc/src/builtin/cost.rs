@@ -130,6 +130,78 @@ pub fn integer_costed_literally(n: &num_bigint::BigInt) -> i64 {
     n.magnitude().to_i64().unwrap_or(i64::MAX).abs()
 }
 
+/// Convenience alias for the nested-map type used by `Constant::Value`.
+type ValueMap = std::collections::BTreeMap<Vec<u8>, std::collections::BTreeMap<Vec<u8>, i128>>;
+
+/// `ValueTotalSize` ExMemory — count of distinct `(policy, token)` pairs.
+///
+/// Mirrors `memoryUsage (ValueTotalSize v) = singletonRose (totalSize v)`.
+/// Used for builtins that take a `ValueTotalSize`-wrapped argument
+/// (`unionValue`, `valueContains`, `valueData`).
+pub fn value_total_size(map: &ValueMap) -> i64 {
+    map.values().map(|inner| inner.len() as i64).sum::<i64>()
+}
+
+/// `ValueMaxDepth` ExMemory — `logOuter + logInner`.
+///
+/// Mirrors the Haskell `ExMemoryUsage ValueMaxDepth` instance:
+/// ```text
+/// logOuter = if outerSize > 0 then integerLog2(outerSize) + 1 else 0
+/// logInner = if maxInnerSize > 0 then integerLog2(maxInnerSize) + 1 else 0
+/// exMemory = logOuter + logInner
+/// ```
+/// Used for builtins that take a `ValueMaxDepth`-wrapped argument
+/// (`insertCoin`, `lookupCoin`).
+pub fn value_max_depth(map: &ValueMap) -> i64 {
+    let outer_size = map.len();
+    let max_inner = map.values().map(|inner| inner.len()).max().unwrap_or(0);
+    let log_outer = if outer_size > 0 {
+        (outer_size as u64).ilog2() as i64 + 1
+    } else {
+        0
+    };
+    let log_inner = if max_inner > 0 {
+        (max_inner as u64).ilog2() as i64 + 1
+    } else {
+        0
+    };
+    log_outer + log_inner
+}
+
+/// `DataNodeCount` ExMemory — count of nodes in the `Data` tree.
+///
+/// Mirrors the Haskell `ExMemoryUsage DataNodeCount` instance, which
+/// counts every node (Constr, Map entry pair, List element, I, B) as 1
+/// — unlike the standard `ExMemoryUsage Data` which adds 4 per node
+/// plus the content size.  Used by `unValueData`.
+pub fn data_node_count(d: &Data) -> i64 {
+    let mut total = 0i64;
+    let mut stack = vec![d];
+    while let Some(node) = stack.pop() {
+        total = total.saturating_add(1);
+        match node {
+            Data::Constr(_, fields) => {
+                for f in fields {
+                    stack.push(f);
+                }
+            }
+            Data::Map(entries) => {
+                for (k, v) in entries {
+                    stack.push(k);
+                    stack.push(v);
+                }
+            }
+            Data::List(elems) => {
+                for e in elems {
+                    stack.push(e);
+                }
+            }
+            Data::I(_) | Data::B(_) => {}
+        }
+    }
+    total
+}
+
 /// Recursive `Data` memory size mirroring the Haskell `sizeData`
 /// rose-tree fold (`ExMemoryUsage Data`):
 ///
@@ -197,8 +269,13 @@ pub struct Linear1 {
 }
 
 impl Linear1 {
-    const fn eval(self, x: i64) -> i64 {
-        self.intercept + self.slope * x
+    fn eval(self, x: i64) -> i64 {
+        // Use saturating arithmetic so that very large costing inputs
+        // (e.g. DropList with a huge integer argument) saturate at i64::MAX
+        // rather than panicking.  The Haskell reference saturates at the
+        // Word64/CekCost ceiling; i64::MAX is the closest Rust equivalent
+        // (and matches the expected budget in the conformance tests).
+        self.intercept.saturating_add(self.slope.saturating_mul(x))
     }
 }
 
@@ -212,7 +289,9 @@ pub struct Quadratic1 {
 
 impl Quadratic1 {
     fn eval(self, x: i64) -> i64 {
-        self.c0 + self.c1 * x + self.c2 * x * x
+        self.c0
+            .saturating_add(self.c1.saturating_mul(x))
+            .saturating_add(self.c2.saturating_mul(x).saturating_mul(x))
     }
 }
 
@@ -339,7 +418,13 @@ impl QuadXY {
     }
 }
 
-/// `with_interaction_in_x_and_y`: `c00 + c01*x + c10*y + c11*x*y`.
+/// `with_interaction_in_x_and_y`: `c00 + c10*x + c01*y + c11*x*y`.
+///
+/// Field naming follows the standard polynomial convention where `cij` is
+/// the coefficient of `x^i * y^j`.  `c10` multiplies x (x^1 y^0) and
+/// `c01` multiplies y (x^0 y^1).  This matches the Haskell definition:
+///   `c10*x + c01*y + c11*x*y + c00`
+/// (PlutusCore.Evaluation.Machine.CostingFun.Core, `with_interaction_in_x_and_y`).
 #[derive(Debug, Clone, Copy)]
 pub struct InteractionXYP {
     pub c00: i64,
@@ -350,7 +435,10 @@ pub struct InteractionXYP {
 
 impl InteractionXYP {
     fn eval(self, x: i64, y: i64) -> i64 {
-        self.c00 + self.c01 * x + self.c10 * y + self.c11 * x * y
+        self.c00
+            .saturating_add(self.c10.saturating_mul(x))
+            .saturating_add(self.c01.saturating_mul(y))
+            .saturating_add(self.c11.saturating_mul(x).saturating_mul(y))
     }
 }
 
@@ -626,6 +714,78 @@ impl BuiltinCosts {
                 let sx = args.first().map_or(0, size_of_value);
                 // arg2 not used in cpu/mem model (models only use x)
                 (sx, 0, 0)
+            }
+            // ── dropList: arg1=Integer (costed literally), arg2=list (ignored)
+            //    cpu: linear_in_x where x = integer_costed_literally(n)
+            DropList => {
+                let sx = args.first().map_or(0, |v| match v {
+                    Value::Const(Constant::Integer(n)) => integer_costed_literally(n),
+                    _ => 0,
+                });
+                (sx, 0, 0)
+            }
+            // ── insertCoin: 4 args (policy, token, amount, ValueMaxDepth)
+            //    cpu: linear_in_u where u = ValueMaxDepth(arg4)
+            //    We map u → z so that the LinearInZ table entry fires correctly.
+            InsertCoin => {
+                let sz = args.get(3).map_or(0, |v| match v {
+                    Value::Const(Constant::Value(map)) => value_max_depth(map),
+                    _ => 0,
+                });
+                (0, 0, sz)
+            }
+            // ── lookupCoin: 3 args (policy, token, ValueMaxDepth)
+            //    cpu: linear_in_z where z = ValueMaxDepth(arg3)
+            LookupCoin => {
+                let sz = args.get(2).map_or(0, |v| match v {
+                    Value::Const(Constant::Value(map)) => value_max_depth(map),
+                    _ => 0,
+                });
+                (0, 0, sz)
+            }
+            // ── unValueData: 1 arg (DataNodeCount)
+            //    cpu: quadratic_in_x where x = DataNodeCount(arg1)
+            UnValueData => {
+                let sx = args.first().map_or(0, |v| match v {
+                    Value::Const(Constant::Data(d)) => data_node_count(d),
+                    _ => 0,
+                });
+                (sx, 0, 0)
+            }
+            // ── valueData: 1 arg (ValueTotalSize)
+            //    cpu: linear_in_x where x = totalSize(arg1)
+            ValueData => {
+                let sx = args.first().map_or(0, |v| match v {
+                    Value::Const(Constant::Value(map)) => value_total_size(map),
+                    _ => 0,
+                });
+                (sx, 0, 0)
+            }
+            // ── valueContains: 2 args (ValueTotalSize, ValueTotalSize)
+            //    cpu: const_above_diagonal_linear_xy where x=totalSize(arg1), y=totalSize(arg2)
+            ValueContains => {
+                let sx = args.first().map_or(0, |v| match v {
+                    Value::Const(Constant::Value(map)) => value_total_size(map),
+                    _ => 0,
+                });
+                let sy = args.get(1).map_or(0, |v| match v {
+                    Value::Const(Constant::Value(map)) => value_total_size(map),
+                    _ => 0,
+                });
+                (sx, sy, 0)
+            }
+            // ── unionValue: 2 args (ValueTotalSize, ValueTotalSize)
+            //    cpu: with_interaction_in_x_and_y, mem: added_sizes
+            UnionValue => {
+                let sx = args.first().map_or(0, |v| match v {
+                    Value::Const(Constant::Value(map)) => value_total_size(map),
+                    _ => 0,
+                });
+                let sy = args.get(1).map_or(0, |v| match v {
+                    Value::Const(Constant::Value(map)) => value_total_size(map),
+                    _ => 0,
+                });
+                (sx, sy, 0)
             }
             // ── writeBits: arg1=BS, arg2=list of indices, arg3=Bool
             //    cpu: linear_in_y (list length), mem: linear_in_x (BS size)
