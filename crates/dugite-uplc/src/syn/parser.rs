@@ -22,6 +22,14 @@ pub(super) struct Parser<'a> {
     /// resolved by scanning right-to-left for the matching name, then
     /// converting the position to a De Bruijn index (`stack.len() - idx`).
     binders: Vec<&'a str>,
+    /// Plutus Core program version (`major.minor.patch`).  Latched in
+    /// `parse_program_top` so version-gated grammar (`constr`, `case`,
+    /// `array`, `value`, … — anything introduced in PV1.1.0) can be
+    /// rejected pre-version.  `None` for the standalone-term / typed-
+    /// constant / data-expression entry points where no version
+    /// preamble exists; those default to permissive behaviour because
+    /// the caller controls the language level.
+    program_version: Option<(u64, u64, u64)>,
 }
 
 impl<'a> Parser<'a> {
@@ -30,6 +38,17 @@ impl<'a> Parser<'a> {
             src,
             pos: 0,
             binders: Vec::new(),
+            program_version: None,
+        }
+    }
+
+    /// True if the program version is strictly older than the cutoff
+    /// `(major, minor, patch)`.  A `None` program_version (term/const
+    /// entry point) is treated as not-older for permissiveness.
+    fn version_below(&self, major: u64, minor: u64, patch: u64) -> bool {
+        match self.program_version {
+            None => false,
+            Some((maj, min, pat)) => (maj, min, pat) < (major, minor, patch),
         }
     }
 
@@ -42,6 +61,8 @@ impl<'a> Parser<'a> {
         self.expect_keyword("program")?;
         self.skip_trivia();
         let version = self.parse_version()?;
+        // Latch the version so version-gated grammar can refer to it.
+        self.program_version = Some(version);
         self.skip_trivia();
         let term = self.parse_term()?;
         self.skip_trivia();
@@ -187,6 +208,14 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_constr_term(&mut self) -> Result<Term, ParseError> {
+        // SOP `constr` was introduced in Plutus Core 1.1.0 (CIP-0085).
+        // The reference parser rejects it in older programs; mirror.
+        if self.version_below(1, 1, 0) {
+            return Err(ParseError::at(
+                self.pos,
+                "`constr` requires Plutus Core ≥ 1.1.0".into(),
+            ));
+        }
         let tag = self.parse_uint_u64()?;
         let mut args = Vec::new();
         loop {
@@ -200,6 +229,12 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_case_term(&mut self) -> Result<Term, ParseError> {
+        if self.version_below(1, 1, 0) {
+            return Err(ParseError::at(
+                self.pos,
+                "`case` requires Plutus Core ≥ 1.1.0".into(),
+            ));
+        }
         let scrutinee = self.parse_term()?;
         let mut branches = Vec::new();
         loop {
@@ -348,25 +383,24 @@ impl<'a> Parser<'a> {
                 })
             }
             TypeTag::Bls12_381G1Element => {
+                let here = self.pos;
                 let bytes = self.parse_0x_hex_bytes()?;
-                if bytes.len() != 48 {
-                    return Err(ParseError::at(
-                        self.pos,
-                        format!("BLS12-381 G1 element must be 48 bytes, got {}", bytes.len()),
-                    ));
-                }
+                // CIP-0381 mandates that compressed G1 element literals
+                // decompress to a point on the curve AND in the prime-
+                // order subgroup.  The Plutus reference enforces this
+                // at parse — bad-zero, off-curve, and out-of-group
+                // encodings all surface as `parse error`.
+                crate::builtin::bls::validate_g1_compressed(&bytes)
+                    .map_err(|reason| ParseError::at(here, reason))?;
                 let mut arr = [0u8; 48];
                 arr.copy_from_slice(&bytes);
                 Ok(Constant::Bls12_381G1Element(Box::new(arr)))
             }
             TypeTag::Bls12_381G2Element => {
+                let here = self.pos;
                 let bytes = self.parse_0x_hex_bytes()?;
-                if bytes.len() != 96 {
-                    return Err(ParseError::at(
-                        self.pos,
-                        format!("BLS12-381 G2 element must be 96 bytes, got {}", bytes.len()),
-                    ));
-                }
+                crate::builtin::bls::validate_g2_compressed(&bytes)
+                    .map_err(|reason| ParseError::at(here, reason))?;
                 let mut arr = [0u8; 96];
                 arr.copy_from_slice(&bytes);
                 Ok(Constant::Bls12_381G2Element(Box::new(arr)))
