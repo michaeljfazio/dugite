@@ -159,24 +159,37 @@ If Round 3 stalls past 60s, suspect the stale-intersection bug (memory: `project
 
 ## Final report
 
-Produce a single report after all three rounds. Sample shape:
+After all rounds complete, generate a machine-parseable + GitHub-release-ready report:
 
+```bash
+cd testnet/local-devnet
+
+# Collect the evidence directories for each completed round (most-recent first)
+EVD_ROUND3=$(ls -t evidence | sed -n '1p')
+EVD_ROUND2=$(ls -t evidence | sed -n '2p')
+EVD_ROUND1=$(ls -t evidence | sed -n '3p')
+
+# Optionally pass the previous release report for trend comparison:
+# --previous-report ../../reports/devnet-validate/v1.7.0.json
+
+../../.claude/skills/devnet-validate/scripts/generate-release-report.sh \
+    --preset standard \
+    --round-names "baseline,epoch-boundary,restart" \
+    --tx-zoo-state tx-zoo/state \
+    --output-dir ../../reports/devnet-validate \
+    "evidence/$EVD_ROUND1" "evidence/$EVD_ROUND2" "evidence/$EVD_ROUND3"
 ```
-devnet-validate report — <git rev-parse HEAD> @ <date>
-=======================================================
-Round 1 (baseline)         : PASS  (59/59 tx-zoo, 4/4 predicates, 0 invalid forges)
-Round 2 (epoch boundary)   : PASS  (boundary at slot 400, 198 blocks in epoch 0)
-Round 3 (restart)          : PASS  (catch-up 42s)
 
-Cross-validation summary
-- dugite-forged blocks accepted by cardano-relay : 612 / 612
-- Phase-1 rejections (must-fail tx-zoo)          : 4 / 4 expected
-- Phase-2 rejections (script failures)           : 0 / 0 expected
-- dugite-cli vs cardano-cli divergence           : none
+This writes two files:
+- `reports/devnet-validate/report.json` — schema-versioned, suitable for trend tracking and CI diffing
+- `reports/devnet-validate/report.md` — paste directly into the GitHub release body
 
-Anomalies
-- <any non-fatal log lines, slow start-ups, retransmits>
+Or use the justfile shortcut:
+```bash
+just devnet-report v1.8.0
 ```
+
+**Storing reports**: When tagging a release, commit `reports/devnet-validate/<tag>.json` to `main` before pushing the tag. Attach both `<tag>.json` and the three binary tarballs as GitHub release assets (see `.claude/skills/release-lead/SKILL.md` for the full release checklist).
 
 If any round fails, stop. Do not run the next round. Bundle `logs/` + `evidence/<ts>/` + `tx-zoo/state/` and produce a forensic report (commit hash, exact failing predicate, log excerpts, metric snapshot at failure time).
 
@@ -191,7 +204,8 @@ If any round fails, stop. Do not run the next round. Bundle `logs/` + `evidence/
 ## Bundled scripts
 
 - `scripts/restart-dugite-bp.sh` — relaunch ONLY dugite-bp with the same flags `run.sh` used (Round 3)
-- `scripts/analyze-evidence.sh` — post-run reporter; converts an `evidence/<ts>/` directory into the report block above
+- `scripts/analyze-evidence.sh` — post-run anomaly scanner; converts an `evidence/<ts>/` directory into a plain-text anomaly report with exit-code gate
+- `scripts/generate-release-report.sh` — aggregates one or more evidence directories into `report.json` + `report.md`; suitable for release gates and trend tracking. See `schemas/report.v1.json` for the output schema.
 
 ## Hard rules
 

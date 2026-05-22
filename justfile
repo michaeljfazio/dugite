@@ -70,11 +70,35 @@ devnet-soak:
 
 # Validate evidence captured by the last devnet run/soak.
 devnet-verify:
-    ./testnet/local-devnet/verify.sh
+    #!/usr/bin/env bash
+    set -euo pipefail
+    cd testnet/local-devnet
+    latest=$(ls -t evidence 2>/dev/null | head -1)
+    [ -z "$latest" ] && { echo "No evidence directories found in testnet/local-devnet/evidence/"; exit 1; }
+    ./verify.sh "evidence/$latest"
 
 # Stop all local-devnet processes.
 devnet-stop:
     ./testnet/local-devnet/stop.sh
+
+# Generate a release report from the most recent evidence directory.
+# Usage: just devnet-report [TAG]
+devnet-report TAG="":
+    #!/usr/bin/env bash
+    set -euo pipefail
+    REPO_ROOT="$(pwd)"
+    cd testnet/local-devnet
+    latest=$(ls -t evidence 2>/dev/null | head -1)
+    [ -z "$latest" ] && { echo "No evidence directories found in testnet/local-devnet/evidence/"; exit 1; }
+    tag_flag=""
+    [ -n "{{TAG}}" ] && tag_flag="--tag {{TAG}}"
+    mkdir -p "$REPO_ROOT/reports/devnet-validate"
+    "$REPO_ROOT/.claude/skills/devnet-validate/scripts/generate-release-report.sh" \
+        --preset standard \
+        $tag_flag \
+        --output-dir "$REPO_ROOT/reports/devnet-validate" \
+        "evidence/$latest"
+    echo "Report written to reports/devnet-validate/"
 
 # ─── Preview Sandstone soak (BP-pair + bare-BP) ──────────────────────────────
 

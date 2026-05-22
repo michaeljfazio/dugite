@@ -1,0 +1,166 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "devnet-validate/report.v1.json",
+  "title": "devnet-validate report",
+  "description": "Machine-parseable run report for devnet-validate, v1. One file per tagged release, stored under reports/devnet-validate/<tag>.json.",
+  "type": "object",
+  "required": ["schema_version", "timestamp", "git_rev", "preset", "rounds", "summary"],
+  "properties": {
+    "schema_version": {
+      "type": "integer",
+      "const": 1,
+      "description": "Schema version — always 1 for this schema."
+    },
+    "timestamp": {
+      "type": "string",
+      "format": "date-time",
+      "description": "ISO-8601 UTC timestamp of when the report was generated."
+    },
+    "git_rev": {
+      "type": "string",
+      "description": "Full 40-char SHA of dugite-node HEAD at run time."
+    },
+    "release_tag": {
+      "type": ["string", "null"],
+      "description": "Git tag (e.g. 'v1.7.0') if run was triggered by a release gate; null for ad-hoc runs."
+    },
+    "preset": {
+      "type": "string",
+      "enum": ["smoke", "standard", "extended"],
+      "description": "Which capability-matrix preset was used."
+    },
+    "cardano_node_version": {
+      "type": "string",
+      "description": "Version string of the co-running cardano-node."
+    },
+    "cardano_cli_version": {
+      "type": "string",
+      "description": "Version string of cardano-cli used for cross-validation."
+    },
+    "rounds": {
+      "type": "array",
+      "description": "One entry per round executed (baseline, epoch-boundary, restart, …).",
+      "items": {
+        "type": "object",
+        "required": ["name", "pass", "evidence_dir"],
+        "properties": {
+          "name": {
+            "type": "string",
+            "description": "Human-readable round identifier (e.g. 'baseline', 'epoch-boundary', 'restart')."
+          },
+          "pass": {
+            "type": "boolean",
+            "description": "True iff every predicate passed for this round."
+          },
+          "evidence_dir": {
+            "type": "string",
+            "description": "Relative path to the evidence/<ts>/ directory for this round."
+          },
+          "duration_seconds": {
+            "type": ["integer", "null"]
+          },
+          "blocks": {
+            "type": "object",
+            "properties": {
+              "total_forges":  { "type": "integer" },
+              "canonical":     { "type": "integer" },
+              "orphans":       { "type": "integer" },
+              "orphan_rate":   { "type": "number" }
+            }
+          },
+          "tip_age": {
+            "type": "object",
+            "properties": {
+              "avg_seconds": { "type": ["number", "null"] },
+              "p99_seconds": { "type": ["number", "null"] }
+            }
+          },
+          "chain_density": {
+            "type": ["number", "null"]
+          },
+          "tx_zoo": {
+            "type": "object",
+            "description": "tx-zoo pass/fail summary for this round.",
+            "properties": {
+              "pass":  { "type": "integer" },
+              "fail":  { "type": "integer" },
+              "skip":  { "type": "integer" },
+              "total": { "type": "integer" }
+            }
+          },
+          "predicates": {
+            "type": "object",
+            "description": "Structured outcome of verify.sh predicates p1-p4.",
+            "properties": {
+              "p1_forge_cross_check":    { "type": ["boolean", "null"] },
+              "p2_no_invalid_forges":    { "type": ["boolean", "null"] },
+              "p3_tip_age":              { "type": ["boolean", "null"] },
+              "p4_tx_submissions":       { "type": ["boolean", "null"] }
+            }
+          },
+          "log_errors": {
+            "type": "object",
+            "description": "Error + warn counts per node.",
+            "additionalProperties": {
+              "type": "object",
+              "properties": {
+                "errors": { "type": "integer" },
+                "warns":  { "type": "integer" }
+              }
+            }
+          },
+          "anomalies": {
+            "type": "array",
+            "items": { "type": "string" }
+          },
+          "epoch_transitions_observed": {
+            "type": ["integer", "null"],
+            "description": "How many epoch boundaries were crossed in this round."
+          },
+          "restart_catchup_seconds": {
+            "type": ["number", "null"],
+            "description": "Time (seconds) for dugite-bp to catch up after restart (Round 3 only)."
+          }
+        }
+      }
+    },
+    "summary": {
+      "type": "object",
+      "required": ["pass", "rounds_pass", "rounds_fail"],
+      "properties": {
+        "pass": {
+          "type": "boolean",
+          "description": "True iff ALL rounds passed."
+        },
+        "rounds_pass": { "type": "integer" },
+        "rounds_fail": { "type": "integer" },
+        "total_canonical_blocks": { "type": "integer" },
+        "total_tx_zoo_pass":      { "type": "integer" },
+        "total_tx_zoo_fail":      { "type": "integer" },
+        "invalid_forges_detected": { "type": "integer" },
+        "critical_anomalies":      { "type": "integer" }
+      }
+    },
+    "trend": {
+      "type": ["object", "null"],
+      "description": "Comparison against the previous tagged release (null if no baseline exists).",
+      "properties": {
+        "baseline_tag": { "type": "string" },
+        "canonical_blocks_delta": { "type": ["integer", "null"] },
+        "orphan_rate_delta":      { "type": ["number",  "null"] },
+        "tip_age_p99_delta":      { "type": ["number",  "null"] },
+        "tx_zoo_pass_delta":      { "type": ["integer", "null"] },
+        "regressions": {
+          "type": "array",
+          "description": "List of predicates that passed before but failed now.",
+          "items": { "type": "string" }
+        },
+        "improvements": {
+          "type": "array",
+          "description": "List of predicates that failed before but pass now.",
+          "items": { "type": "string" }
+        }
+      }
+    }
+  }
+}
