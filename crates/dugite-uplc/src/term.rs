@@ -130,6 +130,30 @@ pub enum Constant {
     Bls12_381MlResult(Box<[u8; 576]>),
 }
 
+impl Constant {
+    /// Static [`TypeTag`] describing this constant's value type.
+    /// Used by builtin denotations that need to enforce type matching
+    /// at the value level (e.g. `mkCons` must reject a head whose type
+    /// disagrees with the list's element type — see #603).
+    pub fn type_tag(&self) -> TypeTag {
+        match self {
+            Constant::Integer(_) => TypeTag::Integer,
+            Constant::ByteString(_) => TypeTag::ByteString,
+            Constant::String(_) => TypeTag::String,
+            Constant::Unit => TypeTag::Unit,
+            Constant::Bool(_) => TypeTag::Bool,
+            Constant::ProtoList { elem_type, .. } => TypeTag::List(Box::new(elem_type.clone())),
+            Constant::ProtoPair { a_type, b_type, .. } => {
+                TypeTag::Pair(Box::new(a_type.clone()), Box::new(b_type.clone()))
+            }
+            Constant::Data(_) => TypeTag::Data,
+            Constant::Bls12_381G1Element(_) => TypeTag::Bls12_381G1Element,
+            Constant::Bls12_381G2Element(_) => TypeTag::Bls12_381G2Element,
+            Constant::Bls12_381MlResult(_) => TypeTag::Bls12_381MlResult,
+        }
+    }
+}
+
 /// Static type-tags for `ProtoList` / `ProtoPair` element types.
 ///
 /// Flat-encoded universe tags are a *bit sequence* (Haskell:

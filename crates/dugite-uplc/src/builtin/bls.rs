@@ -95,6 +95,12 @@ pub fn validate_g2_compressed(bs: &[u8]) -> Result<(), String> {
 const G1_DST: &[u8] = b"BLS_SIG_BLS12381G1_XMD:SHA-256_SSWU_RO_NUL_";
 const G2_DST: &[u8] = b"BLS_SIG_BLS12381G2_XMD:SHA-256_SSWU_RO_NUL_";
 
+/// Maximum length of the caller-supplied DST byte string for
+/// `bls12_381_*_hashToGroup`.  RFC 9380 §5.3.3 caps the DST at 255
+/// bytes; CIP-0381 mandates the same limit. The Plutus reference
+/// fails evaluation when the input DST exceeds this.
+const MAX_HASH_TO_GROUP_DST_BYTES: usize = 255;
+
 // Public entry: dispatch one BLS builtin from `BuiltinId` + args.
 pub fn denote_bls(id: BuiltinId, args: Vec<Value>) -> Result<Value, UplcError> {
     use BuiltinId::*;
@@ -190,6 +196,20 @@ fn g1_hash_to_group(args: Vec<Value>, id: BuiltinId) -> Result<Value, UplcError>
     let mut it = args.into_iter();
     let msg = unwrap_bytes(it.next(), id)?;
     let dst = unwrap_bytes(it.next(), id)?;
+    // RFC 9380 §5.3.3 / CIP-0381: DST is limited to 255 bytes.  The
+    // Plutus reference rejects evaluation when the input DST exceeds
+    // this; blst itself would otherwise just hash a marker substring,
+    // producing a different point silently.
+    if dst.len() > MAX_HASH_TO_GROUP_DST_BYTES {
+        return Err(UplcError::BuiltinFailure {
+            builtin: id.name(),
+            reason: format!(
+                "DST length {} exceeds RFC 9380 / CIP-0381 maximum {}",
+                dst.len(),
+                MAX_HASH_TO_GROUP_DST_BYTES
+            ),
+        });
+    }
     let mut out = blst_p1::default();
     // SAFETY: `out` is a valid blst_p1; msg/dst are byte slices with
     // valid pointers + lengths. blst_hash_to_g1 follows RFC 9380.
@@ -284,6 +304,17 @@ fn g2_hash_to_group(args: Vec<Value>, id: BuiltinId) -> Result<Value, UplcError>
     let mut it = args.into_iter();
     let msg = unwrap_bytes(it.next(), id)?;
     let dst = unwrap_bytes(it.next(), id)?;
+    // See `g1_hash_to_group`: RFC 9380 / CIP-0381 cap DST at 255 bytes.
+    if dst.len() > MAX_HASH_TO_GROUP_DST_BYTES {
+        return Err(UplcError::BuiltinFailure {
+            builtin: id.name(),
+            reason: format!(
+                "DST length {} exceeds RFC 9380 / CIP-0381 maximum {}",
+                dst.len(),
+                MAX_HASH_TO_GROUP_DST_BYTES
+            ),
+        });
+    }
     let mut out = blst_p2::default();
     unsafe {
         blst_hash_to_g2(
