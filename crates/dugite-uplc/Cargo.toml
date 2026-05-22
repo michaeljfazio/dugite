@@ -16,7 +16,13 @@ unsafe_code = "forbid"
 blake2 = { workspace = true }
 sha2 = { workspace = true }
 sha3 = { workspace = true }
-# ripemd & keccak are pulled in via sha3 features where possible.
+# keccak_256 comes from `sha3::Keccak256` (sha3 crate ships the
+# keccak permutation in addition to NIST SHA-3).
+# ripemd_160 needs its own crate — sha3 doesn't expose it.
+ripemd = "0.1"
+# `digest::Digest` is the unifying trait we call into across all five
+# hash families; pull it in explicitly so the trait is in scope.
+digest = "0.11"
 
 # Integer arithmetic for the `integer` and rational-cost-model paths.
 num-bigint = { workspace = true }
