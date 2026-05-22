@@ -199,12 +199,48 @@ pub fn denote(id: BuiltinId, args: Vec<Value>) -> Result<Value, UplcError> {
             Ok(Value::Const(Constant::String(s)))
         }
 
+        // ── Hash functions (V1 + V2 + V3) ─────────────────────────────
+        Sha2_256 => hash_one(args, id, |bs| {
+            use sha2::Digest;
+            sha2::Sha256::digest(bs).to_vec()
+        }),
+        Sha3_256 => hash_one(args, id, |bs| {
+            use sha3::Digest;
+            sha3::Sha3_256::digest(bs).to_vec()
+        }),
+        Blake2b_256 => hash_one(args, id, |bs| {
+            use blake2::Digest;
+            blake2::Blake2b::<blake2::digest::consts::U32>::digest(bs).to_vec()
+        }),
+        Blake2b_224 => hash_one(args, id, |bs| {
+            use blake2::Digest;
+            blake2::Blake2b::<blake2::digest::consts::U28>::digest(bs).to_vec()
+        }),
+        Keccak_256 => hash_one(args, id, |bs| {
+            use sha3::Digest;
+            sha3::Keccak256::digest(bs).to_vec()
+        }),
+        Ripemd_160 => hash_one(args, id, |bs| {
+            use ripemd::Digest;
+            ripemd::Ripemd160::digest(bs).to_vec()
+        }),
+
         // Anything else is a future commit.
         _ => Err(UplcError::Internal(format!(
             "builtin denotation for {} not yet wired",
             id.name()
         ))),
     }
+}
+
+/// Helper for single-argument-ByteString → ByteString hash builtins.
+fn hash_one<F>(args: Vec<Value>, id: BuiltinId, hash: F) -> Result<Value, UplcError>
+where
+    F: FnOnce(&[u8]) -> Vec<u8>,
+{
+    let mut it = args.into_iter();
+    let input = unwrap_byte_string(it.next().ok_or_else(|| builtin_arity_mismatch(id))?, id)?;
+    Ok(Value::Const(Constant::ByteString(hash(&input))))
 }
 
 fn take_two_byte_strings(args: Vec<Value>, id: BuiltinId) -> Result<(Vec<u8>, Vec<u8>), UplcError> {
@@ -573,9 +609,102 @@ mod tests {
 
     #[test]
     fn unwired_builtin_returns_internal() {
-        // sha2_256 (a hash builtin) not wired yet.
-        let err = run(BuiltinId::Sha2_256, vec![]).unwrap_err();
+        // verifyEd25519Signature not wired yet.
+        let err = run(BuiltinId::VerifyEd25519Signature, vec![]).unwrap_err();
         assert!(matches!(err, UplcError::Internal(_)));
+    }
+
+    // ── Hash functions ─────────────────────────────────────────────
+
+    #[test]
+    fn sha2_256_known_vectors() {
+        // RFC 6234 §8.5 SHA-256 of "abc" =
+        //   ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad
+        let out = run(BuiltinId::Sha2_256, vec![bs(b"abc")]).unwrap();
+        let expected =
+            hex::decode("ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad")
+                .unwrap();
+        assert_eq!(out, bs(&expected));
+        // Empty input
+        let out = run(BuiltinId::Sha2_256, vec![bs(b"")]).unwrap();
+        let expected =
+            hex::decode("e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855")
+                .unwrap();
+        assert_eq!(out, bs(&expected));
+    }
+
+    #[test]
+    fn sha3_256_known_vector() {
+        // FIPS 202 SHA3-256 of "abc" =
+        //   3a985da74fe225b2045c172d6bd390bd855f086e3e9d525b46bfe24511431532
+        let out = run(BuiltinId::Sha3_256, vec![bs(b"abc")]).unwrap();
+        let expected =
+            hex::decode("3a985da74fe225b2045c172d6bd390bd855f086e3e9d525b46bfe24511431532")
+                .unwrap();
+        assert_eq!(out, bs(&expected));
+    }
+
+    #[test]
+    fn keccak_256_known_vector() {
+        // Keccak-256 of empty string =
+        //   c5d2460186f7233c927e7db2dcc703c0e500b653ca82273b7bfad8045d85a470
+        let out = run(BuiltinId::Keccak_256, vec![bs(b"")]).unwrap();
+        let expected =
+            hex::decode("c5d2460186f7233c927e7db2dcc703c0e500b653ca82273b7bfad8045d85a470")
+                .unwrap();
+        assert_eq!(out, bs(&expected));
+    }
+
+    #[test]
+    fn blake2b_256_known_vector() {
+        // BLAKE2b-256 of "abc" (verified against the `blake2` crate's
+        // Blake2b<U32>::digest reference output).
+        let out = run(BuiltinId::Blake2b_256, vec![bs(b"abc")]).unwrap();
+        let expected =
+            hex::decode("bddd813c634239723171ef3fee98579b94964e3bb1cb3e427262c8c068d52319")
+                .unwrap();
+        assert_eq!(out, bs(&expected));
+    }
+
+    #[test]
+    fn blake2b_224_known_vector() {
+        // BLAKE2b-224 of "abc" — verified against `blake2` crate's
+        // Blake2b<U28>::digest. Same key as cardano-base's
+        // `Crypto.Hash.Blake2b_224`.
+        let out = run(BuiltinId::Blake2b_224, vec![bs(b"abc")]).unwrap();
+        let expected =
+            hex::decode("9bd237b02a29e43bdd6738afa5b53ff0eee178d6210b618e4511aec8").unwrap();
+        assert_eq!(out, bs(&expected));
+    }
+
+    #[test]
+    fn ripemd_160_known_vector() {
+        // RIPEMD-160 of "abc" =
+        //   8eb208f7e05d987a9b044a8e98c6b087f15a0bfc
+        let out = run(BuiltinId::Ripemd_160, vec![bs(b"abc")]).unwrap();
+        let expected = hex::decode("8eb208f7e05d987a9b044a8e98c6b087f15a0bfc").unwrap();
+        assert_eq!(out, bs(&expected));
+    }
+
+    #[test]
+    fn hashes_take_arbitrary_input() {
+        // 1 KiB input: every hash builtin returns a fixed-size output.
+        let input: Vec<u8> = (0..1024u32).map(|i| (i & 0xff) as u8).collect();
+        for (id, len) in [
+            (BuiltinId::Sha2_256, 32),
+            (BuiltinId::Sha3_256, 32),
+            (BuiltinId::Blake2b_256, 32),
+            (BuiltinId::Blake2b_224, 28),
+            (BuiltinId::Keccak_256, 32),
+            (BuiltinId::Ripemd_160, 20),
+        ] {
+            let out = run(id, vec![bs(&input)]).unwrap();
+            if let Value::Const(Constant::ByteString(b)) = out {
+                assert_eq!(b.len(), len, "{} length", id.name());
+            } else {
+                panic!("expected ByteString from {}", id.name());
+            }
+        }
     }
 
     // ── ByteString operations ─────────────────────────────────────
