@@ -56,7 +56,8 @@ pub(crate) mod era_shelley;
 
 use crate::error::SerializationError;
 use dugite_primitives::block::Block;
-use dugite_primitives::transaction::Transaction;
+use dugite_primitives::hash::Hash32;
+use dugite_primitives::transaction::{Transaction, TransactionInput, TransactionOutput};
 
 // ---------------------------------------------------------------------------
 // Public API — every block-level decode routes through the in-house decoder
@@ -123,6 +124,72 @@ pub fn decode_transaction(era_id: u16, tx_cbor: &[u8]) -> Result<Transaction, Se
     }
 }
 
+/// Decode a single `transaction_output` CBOR value for a specific era.
+///
+/// `era_id` follows the same Cardano HFC convention as [`decode_transaction`].
+/// Only eras that admit Plutus scripts (Alonzo onwards) are supported here, as
+/// this entry is intended for phase-2 resolved-UTxO decoding. Pre-Alonzo eras
+/// return a [`SerializationError::CborDecode`] error.
+///
+/// | era_id | era      | output format                                |
+/// |--------|----------|----------------------------------------------|
+/// | 2      | Allegra  | legacy array `[addr, value, ?datum_hash]`    |
+/// | 3      | Mary     | legacy array `[addr, value, ?datum_hash]`    |
+/// | 4      | Alonzo   | legacy array `[addr, value, ?datum_hash]`    |
+/// | 5      | Babbage  | legacy array OR post-Alonzo map              |
+/// | 6      | Conway   | legacy array OR post-Alonzo map              |
+/// | 7      | Dijkstra | legacy array OR post-Alonzo map              |
+pub fn decode_transaction_output(
+    era_id: u16,
+    cbor: &[u8],
+) -> Result<TransactionOutput, SerializationError> {
+    use dugite_primitives::era::Era;
+    match era_id {
+        2 => era_alonzo::decode_alonzo_tx_output_standalone(cbor, Era::Allegra),
+        3 => era_alonzo::decode_alonzo_tx_output_standalone(cbor, Era::Mary),
+        4 => era_alonzo::decode_alonzo_tx_output_standalone(cbor, Era::Alonzo),
+        5 => era_babbage::decode_babbage_tx_output_standalone(cbor),
+        6 | 7 => era_conway::decode_conway_tx_output_standalone(cbor),
+        n => Err(SerializationError::CborDecode(format!(
+            "decode_transaction_output: unsupported era id: {n}"
+        ))),
+    }
+}
+
+/// Decode a single `transaction_input` CBOR value (era-invariant).
+///
+/// A transaction input is encoded as a 2-element array `[tx_hash(32), index]`
+/// in every era from Shelley onwards. This entry is intended for phase-2
+/// resolved-UTxO decoding where the ledger supplies input CBOR alongside the
+/// output CBOR.
+pub fn decode_transaction_input(cbor: &[u8]) -> Result<TransactionInput, SerializationError> {
+    use minicbor::Decoder;
+    let mut d = Decoder::new(cbor);
+    let arr = d
+        .array()
+        .map_err(|e| SerializationError::CborDecode(format!("tx_in: {e}")))?;
+    if !matches!(arr, Some(2)) {
+        return Err(SerializationError::CborDecode(format!(
+            "tx_in: expected array(2), got {arr:?}"
+        )));
+    }
+    let hash_bytes = d
+        .bytes()
+        .map_err(|e| SerializationError::CborDecode(format!("tx_in hash: {e}")))?;
+    let transaction_id =
+        Hash32::try_from(hash_bytes).map_err(|_| SerializationError::InvalidLength {
+            expected: 32,
+            got: hash_bytes.len(),
+        })?;
+    let index = d
+        .u32()
+        .map_err(|e| SerializationError::CborDecode(format!("tx_in idx: {e}")))?;
+    Ok(TransactionInput {
+        transaction_id,
+        index,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -187,5 +254,137 @@ mod tests {
         let blk2 =
             decode_block_minimal_with_byron_epoch_length(&raw, 21_600).expect("minimal decode");
         assert!(blk2.raw_cbor.is_some());
+    }
+
+    // ───────────────────────────────────────────────────────────────
+    // decode_transaction_input
+    // ───────────────────────────────────────────────────────────────
+
+    #[test]
+    fn decode_transaction_input_roundtrips_a_canonical_input() {
+        // [bytes(32), uint] — the canonical Cardano `transaction_input` shape.
+        // Construct: array(2) [bytes(32) of 0x11..0x11, uint(42)].
+        let mut cbor = vec![0x82, 0x58, 0x20];
+        cbor.extend(std::iter::repeat_n(0x11u8, 32));
+        cbor.push(0x18);
+        cbor.push(42);
+        let input = decode_transaction_input(&cbor).expect("decode");
+        assert_eq!(input.index, 42);
+        assert_eq!(input.transaction_id.as_bytes(), &[0x11; 32]);
+    }
+
+    #[test]
+    fn decode_transaction_input_rejects_wrong_arity() {
+        // array(3) instead of array(2).
+        let mut cbor = vec![0x83, 0x58, 0x20];
+        cbor.extend([0u8; 32]);
+        cbor.push(0x00);
+        cbor.push(0x00);
+        let err = decode_transaction_input(&cbor).unwrap_err();
+        let SerializationError::CborDecode(msg) = err else {
+            panic!("expected CborDecode");
+        };
+        assert!(msg.contains("expected array(2)"), "got: {msg}");
+    }
+
+    #[test]
+    fn decode_transaction_input_rejects_short_hash() {
+        // array(2) [bytes(28) ..., uint] — short hash.
+        let mut cbor = vec![0x82, 0x58, 0x1c];
+        cbor.extend([0u8; 28]);
+        cbor.push(0x00);
+        let err = decode_transaction_input(&cbor).unwrap_err();
+        match err {
+            SerializationError::InvalidLength { expected, got } => {
+                assert_eq!(expected, 32);
+                assert_eq!(got, 28);
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn decode_transaction_input_rejects_truncated() {
+        // Truncated array header — must error, not panic.
+        for bytes in [&[][..], &[0x82][..], &[0x82, 0x58][..]] {
+            assert!(decode_transaction_input(bytes).is_err());
+        }
+    }
+
+    // ───────────────────────────────────────────────────────────────
+    // decode_transaction_output
+    // ───────────────────────────────────────────────────────────────
+
+    /// A minimal Babbage/Conway map-form output: `{0: addr_bytes, 1: lovelace}`.
+    ///
+    /// `addr` is a 29-byte preview enterprise address (header 0x60 + 28-byte
+    /// key hash). Lovelace = 1_000_000.
+    fn make_babbage_map_output_cbor() -> Vec<u8> {
+        let mut out = vec![0xa2]; // map(2)
+        out.push(0x00); // key 0
+        out.push(0x58); // bytes(29)
+        out.push(29);
+        out.push(0x60); // mainnet enterprise header
+        out.extend([0xaa; 28]);
+        out.push(0x01); // key 1
+        out.push(0x1a); // uint(u32)
+        out.extend(1_000_000u32.to_be_bytes());
+        out
+    }
+
+    /// A minimal Alonzo-era legacy output: `[addr_bytes, lovelace]`.
+    fn make_alonzo_legacy_output_cbor() -> Vec<u8> {
+        let mut out = vec![0x82]; // array(2)
+        out.push(0x58);
+        out.push(29);
+        out.push(0x60);
+        out.extend([0xbb; 28]);
+        out.push(0x1a);
+        out.extend(2_000_000u32.to_be_bytes());
+        out
+    }
+
+    #[test]
+    fn decode_transaction_output_decodes_conway_map_form() {
+        let cbor = make_babbage_map_output_cbor();
+        for era_id in [5u16, 6, 7] {
+            let out = decode_transaction_output(era_id, &cbor).expect("decode");
+            assert_eq!(out.value.coin.0, 1_000_000, "era_id={era_id}");
+            assert!(out.raw_cbor.is_some(), "raw_cbor must be preserved");
+        }
+    }
+
+    #[test]
+    fn decode_transaction_output_decodes_alonzo_legacy_array() {
+        let cbor = make_alonzo_legacy_output_cbor();
+        for era_id in [2u16, 3, 4] {
+            let out = decode_transaction_output(era_id, &cbor).expect("decode");
+            assert_eq!(out.value.coin.0, 2_000_000, "era_id={era_id}");
+        }
+    }
+
+    #[test]
+    fn decode_transaction_output_rejects_pre_alonzo_eras() {
+        let cbor = make_alonzo_legacy_output_cbor();
+        for era_id in [0u16, 1, 8, 42] {
+            let err = decode_transaction_output(era_id, &cbor).unwrap_err();
+            let SerializationError::CborDecode(msg) = err else {
+                panic!("era_id={era_id}: expected CborDecode, got: {err:?}");
+            };
+            assert!(msg.contains("unsupported era id"), "era_id={era_id}: {msg}");
+        }
+    }
+
+    #[test]
+    fn decode_transaction_output_errors_on_truncated_input() {
+        // Empty / truncated / malformed bytes must error, never panic.
+        for era_id in [4u16, 5, 6, 7] {
+            for bytes in [&[][..], &[0xff][..], &[0x82, 0x58][..], &[0xa2, 0x00][..]] {
+                assert!(
+                    decode_transaction_output(era_id, bytes).is_err(),
+                    "era_id={era_id} bytes={bytes:?} must error"
+                );
+            }
+        }
     }
 }
