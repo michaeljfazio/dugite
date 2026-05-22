@@ -633,11 +633,7 @@ fn make_protocol_params(pp: &crate::schema::UtxoProtocolParams) -> ProtocolParam
         },
         min_pool_cost: Lovelace(170_000_000),
         ada_per_utxo_byte: Lovelace(pp.ada_per_utxo_byte),
-        cost_models: transaction::CostModels {
-            plutus_v1: None,
-            plutus_v2: None,
-            plutus_v3: None,
-        },
+        cost_models: transaction::CostModels::default(),
         execution_costs: transaction::ExUnitPrices {
             mem_price: Rational {
                 numerator: 577,
