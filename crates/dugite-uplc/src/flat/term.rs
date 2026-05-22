@@ -190,16 +190,18 @@ fn encode_term_depth(w: &mut BitWriter, t: &Term, depth: usize) -> FlatResult<()
         Term::Error => {
             w.write_bits8(6, TERM_TAG_WIDTH)?;
         }
-        Term::Builtin(_id) => {
+        Term::Builtin(id) => {
             w.write_bits8(7, TERM_TAG_WIDTH)?;
-            // BuiltinId discriminants are u8 in the AST; the wire
-            // form is a 7-bit field. We can't safely cast yet (the
-            // `BuiltinId::from_u8` table isn't wired), so we surface
-            // this as a typed encoder error rather than risk a
-            // wrong discriminant on the wire.
-            return Err(UplcError::Encode(
-                "BuiltinId wire encoding not yet implemented (UPLC-4)".into(),
-            ));
+            let raw = id.as_u8();
+            if raw >= 128 {
+                // 7-bit field overflow guard — should be unreachable
+                // given the enum's largest discriminant is 87, but we
+                // surface as a typed error rather than truncate.
+                return Err(UplcError::Encode(format!(
+                    "BuiltinId discriminant {raw} exceeds 7-bit wire field"
+                )));
+            }
+            w.write_bits8(raw, BUILTIN_TAG_WIDTH)?;
         }
         Term::Constr { .. } | Term::Case { .. } => {
             return Err(UplcError::Encode(
@@ -605,6 +607,25 @@ mod tests {
         let mut r = BitReader::new(&bytes);
         let r_out = decode_term(&mut r);
         assert!(r_out.is_err(), "got {r_out:?}");
+    }
+
+    #[test]
+    fn builtin_roundtrip_full_table() {
+        for raw in 0u8..=87 {
+            let id = BuiltinId::from_u8(raw).expect("from_u8");
+            let t = Term::Builtin(id);
+            let mut w = BitWriter::new();
+            encode_term(&mut w, &t).expect("encode");
+            let bytes = w.finish();
+            let mut r = BitReader::new(&bytes);
+            let decoded = decode_term(&mut r).expect("decode");
+            assert_eq!(
+                decoded,
+                t,
+                "builtin round-trip failed for {} (raw={raw})",
+                id.name()
+            );
+        }
     }
 
     #[test]
