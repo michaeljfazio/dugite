@@ -430,6 +430,7 @@ fn to_transaction_inner(tx: &TestTransaction) -> Result<Transaction, AdapterErro
         treasury_value: None,
         donation: tx.donation.map(Lovelace),
         sub_transactions: Vec::new(),
+        account_balance_intervals: Vec::new(),
     };
 
     Ok(Transaction {

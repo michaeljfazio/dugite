@@ -189,6 +189,7 @@ mod tests {
             treasury_value: None,
             donation: None,
             sub_transactions: vec![],
+            account_balance_intervals: vec![],
         }
     }
 
