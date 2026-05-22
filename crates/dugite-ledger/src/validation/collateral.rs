@@ -1055,6 +1055,7 @@ mod tests {
                 proposal_procedures: vec![],
                 treasury_value: None,
                 donation: None,
+                sub_transactions: vec![],
             },
             // Include a V2 script so `has_plutus_scripts()` is satisfied when
             // the full validate_transaction path is exercised.  For direct
@@ -1588,6 +1589,7 @@ mod tests {
                 proposal_procedures: vec![],
                 treasury_value: None,
                 donation: None,
+                sub_transactions: vec![],
             },
             witness_set: TransactionWitnessSet {
                 vkey_witnesses: vec![],
@@ -1685,6 +1687,7 @@ mod tests {
                 proposal_procedures: vec![],
                 treasury_value: None,
                 donation: None,
+                sub_transactions: vec![],
             },
             witness_set: TransactionWitnessSet {
                 vkey_witnesses: vec![],

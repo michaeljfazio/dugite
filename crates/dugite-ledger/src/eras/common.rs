@@ -882,6 +882,7 @@ mod tests {
                 proposal_procedures: vec![],
                 treasury_value: None,
                 donation: None,
+                sub_transactions: vec![],
             },
             witness_set: dugite_primitives::transaction::TransactionWitnessSet {
                 vkey_witnesses: vec![],

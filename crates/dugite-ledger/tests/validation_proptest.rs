@@ -76,6 +76,7 @@ fn make_tx(input: TransactionInput, output_value: u64, fee: u64) -> Transaction 
             proposal_procedures: vec![],
             treasury_value: None,
             donation: None,
+            sub_transactions: vec![],
         },
         witness_set: TransactionWitnessSet {
             vkey_witnesses: vec![],
@@ -765,6 +766,7 @@ fn make_mint_tx(
             proposal_procedures: vec![],
             treasury_value: None,
             donation: None,
+            sub_transactions: vec![],
         },
         witness_set: TransactionWitnessSet {
             vkey_witnesses: vec![],
@@ -986,6 +988,7 @@ proptest! {
                 proposal_procedures: vec![],
                 treasury_value: None,
                 donation: None,
+                sub_transactions: vec![],
             },
             witness_set: TransactionWitnessSet {
                 vkey_witnesses: vec![],
@@ -1111,6 +1114,7 @@ proptest! {
                 proposal_procedures: vec![],
                 treasury_value: None,
                 donation: None,
+                sub_transactions: vec![],
             },
             witness_set: TransactionWitnessSet {
                 vkey_witnesses: vec![],
@@ -1260,6 +1264,7 @@ proptest! {
                 proposal_procedures: vec![],
                 treasury_value: None,
                 donation: None,
+                sub_transactions: vec![],
             },
             witness_set: TransactionWitnessSet {
                 vkey_witnesses: vec![],
@@ -1402,6 +1407,7 @@ proptest! {
                 proposal_procedures: vec![],
                 treasury_value: None,
                 donation: None,
+                sub_transactions: vec![],
             },
             witness_set: TransactionWitnessSet {
                 vkey_witnesses: vec![],
@@ -1502,6 +1508,7 @@ fn minting_without_policy_script_rejected() {
             proposal_procedures: vec![],
             treasury_value: None,
             donation: None,
+            sub_transactions: vec![],
         },
         witness_set: TransactionWitnessSet {
             vkey_witnesses: vec![],
