@@ -472,6 +472,7 @@ fn decode_shelley_tx_body(r: &mut Reader<'_>) -> Result<TransactionBody, Seriali
         donation: None,
         sub_transactions: Vec::new(),          // Dijkstra+
         account_balance_intervals: Vec::new(), // Dijkstra+
+        direct_deposits: BTreeMap::new(),      // Dijkstra+
     })
 }
 

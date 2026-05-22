@@ -736,6 +736,7 @@ impl Transaction {
                 donation: None,
                 sub_transactions: vec![],
                 account_balance_intervals: vec![],
+                direct_deposits: BTreeMap::new(),
             },
             witness_set: TransactionWitnessSet {
                 vkey_witnesses: vec![],
@@ -813,6 +814,31 @@ pub struct TransactionBody {
     /// `eras/dijkstra/impl/src/Cardano/Ledger/Dijkstra/TxBody.hs` (key 26).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub account_balance_intervals: Vec<(Credential, AccountBalanceInterval)>,
+    /// Dijkstra (PV12+) only: direct ADA deposits into reward accounts
+    /// (TxBody key 25 — `direct_deposits`).
+    ///
+    /// This is the **inverse of a withdrawal**: instead of a stake credential
+    /// receiving rewards through the epoch-boundary reward distribution
+    /// machinery, a Dijkstra tx may directly debit Lovelace from its inputs
+    /// and credit it into the named stake credentials' reward-account
+    /// balances. The sum of every deposit is consumed from the tx's net
+    /// balance (alongside outputs, fees, treasury contributions, etc.).
+    ///
+    /// Map shape matches `withdrawals` (TxBody key 5):
+    /// `BTreeMap<reward_account_bytes, Coin>` where `reward_account_bytes`
+    /// is the 29-byte CBOR bstr `network_header | hash28` (`bit 4 of
+    /// network_header` set ⇒ script credential).
+    ///
+    /// Predicate failures:
+    /// - `DirectDepositToUnregisteredAccount`: the target credential isn't
+    ///   currently in `reward_accounts`. The entire tx is rejected; no UTxO
+    ///   or reward-account state has mutated.
+    ///
+    /// See issue #475 Phase 3.4 / cardano-ledger
+    /// `eras/dijkstra/impl/src/Cardano/Ledger/Dijkstra/TxBody.hs` (key 25)
+    /// and `Cardano/Ledger/Dijkstra/Rules.hs` (UTXOS).
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub direct_deposits: BTreeMap<Vec<u8>, Lovelace>,
 }
 
 impl Default for TransactionBody {
@@ -841,6 +867,7 @@ impl Default for TransactionBody {
             donation: None,
             sub_transactions: Vec::new(),
             account_balance_intervals: Vec::new(),
+            direct_deposits: BTreeMap::new(),
         }
     }
 }

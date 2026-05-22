@@ -454,6 +454,12 @@ fn decode_conway_tx_body(r: &mut Reader<'_>) -> Result<TransactionBody, Serializ
         dugite_primitives::credentials::Credential,
         dugite_primitives::transaction::AccountBalanceInterval,
     )> = Vec::new();
+    // Dijkstra TxBody key 25 — direct_deposits (issue #475 Phase 3.4).
+    // Map { reward_account_bytes => coin }. Wire shape mirrors withdrawals
+    // (key 5) exactly: a CBOR map keyed by 29-byte reward_account bstr.
+    // Only Dijkstra+ bodies emit it; the shared Conway+Dijkstra decoder
+    // parses it here and surfaces it through TransactionBody.direct_deposits.
+    let mut direct_deposits: BTreeMap<Vec<u8>, Lovelace> = BTreeMap::new();
 
     let map_len = r.read_map_header()?;
     let n_entries = match map_len {
@@ -572,6 +578,15 @@ fn decode_conway_tx_body(r: &mut Reader<'_>) -> Result<TransactionBody, Serializ
                 // `eras/dijkstra/impl/.../TxBody.hs` (key 23 emitter).
                 sub_transactions = decode_sub_transactions(r)?;
             }
+            25 => {
+                // Dijkstra direct_deposits (issue #475 Phase 3.4):
+                //   { reward_account => coin }
+                // Wire shape is identical to withdrawals (key 5) — a CBOR
+                // map keyed by the 29-byte reward_account bstr. See
+                // `eras/dijkstra/impl/src/Cardano/Ledger/Dijkstra/TxBody.hs`
+                // (key 25 emitter) and `Rules.hs` (UTXOS rule integration).
+                direct_deposits = read_withdrawals(r)?;
+            }
             26 => {
                 // Dijkstra account_balance_intervals (issue #475 Phase 3.3):
                 //   { stake_credential => AccountBalanceInterval }
@@ -616,6 +631,7 @@ fn decode_conway_tx_body(r: &mut Reader<'_>) -> Result<TransactionBody, Serializ
         donation,
         sub_transactions,          // Dijkstra+ only; empty for Conway-shaped bodies
         account_balance_intervals, // Dijkstra+ only; empty for Conway-shaped bodies
+        direct_deposits,           // Dijkstra+ only; empty for Conway-shaped bodies
     })
 }
 

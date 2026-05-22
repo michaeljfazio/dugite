@@ -484,6 +484,14 @@ pub(super) fn encode_transaction_body_for_era(body: &TransactionBody, era: Era) 
     if emit_account_balance_intervals {
         count += 1;
     }
+    // Dijkstra TxBody key 25: direct_deposits (issue #475 Phase 3.4).
+    // Same `Omit null` discipline as key 23/26: only emitted on Dijkstra+
+    // bodies that carry a non-empty deposit map. Wire-symmetric with
+    // withdrawals (key 5).
+    let emit_direct_deposits = era >= Era::Dijkstra && !body.direct_deposits.is_empty();
+    if emit_direct_deposits {
+        count += 1;
+    }
 
     let mut buf = encode_map_header(count);
 
@@ -650,6 +658,21 @@ pub(super) fn encode_transaction_body_for_era(body: &TransactionBody, era: Era) 
                 Some(bytes) => buf.extend_from_slice(bytes),
                 None => buf.extend(encode_sub_tx_body(sub)),
             }
+        }
+    }
+
+    // 25: direct_deposits (Dijkstra+) — atomic ADA flow into reward
+    // accounts. Wire-symmetric with withdrawals (key 5):
+    //   map { reward_account_bytes => coin }
+    // The encoder uses the canonical map ordering BTreeMap provides; this
+    // matches the Haskell `encodeFoldable . Map.toAscList` discipline.
+    // Issue #475 Phase 3.4.
+    if emit_direct_deposits {
+        buf.extend(encode_uint(25));
+        buf.extend(encode_map_header(body.direct_deposits.len()));
+        for (addr, amount) in &body.direct_deposits {
+            buf.extend(encode_bytes(addr));
+            buf.extend(encode_uint(amount.0));
         }
     }
 
@@ -927,6 +950,7 @@ mod tests {
             donation: None,
             sub_transactions: vec![],
             account_balance_intervals: vec![],
+            direct_deposits: BTreeMap::new(),
         }
     }
 
@@ -1890,6 +1914,94 @@ mod tests {
         assert!(
             msg.contains("AccountBalanceInterval") || msg.contains("both bounds"),
             "error should mention AccountBalanceInterval / both bounds, got: {msg}"
+        );
+    }
+
+    // ── Dijkstra TxBody key 25: direct_deposits (issue #475 Phase 3.4) ──
+
+    /// Direct deposits (the inverse of withdrawals) round-trip through the
+    /// Dijkstra encoder / decoder. Pins:
+    ///
+    /// 1. Encoder emits a `map { reward_account_bytes => coin }` keyed
+    ///    under TxBody key 25 ONLY when era >= Dijkstra AND the map is
+    ///    non-empty (matches Haskell `Omit null`).
+    /// 2. Decoder recovers the same map into
+    ///    `TransactionBody.direct_deposits` for a Dijkstra body.
+    /// 3. The Conway encoder NEVER emits key 25 even when the field is
+    ///    populated in-memory.
+    /// 4. Empty map on Dijkstra: key 25 omitted (matches `Omit null`).
+    ///
+    /// Sentinel: TxBody key 25 encodes as the CBOR sequence `0x18 0x19`
+    /// (uint major-0 with single-byte payload 25).
+    #[test]
+    fn direct_deposits_roundtrip_dijkstra() {
+        use dugite_primitives::era::Era;
+
+        // Two reward accounts with distinct credentials:
+        //  - keyhash credential: header byte 0xE0 (mainnet, key-typed)
+        //  - script credential:  header byte 0xF0 (mainnet, script-typed)
+        let mut ra_key = vec![0xE0_u8];
+        ra_key.extend_from_slice(&[0xA1; 28]);
+        let mut ra_script = vec![0xF0_u8];
+        ra_script.extend_from_slice(&[0xB2; 28]);
+
+        let deposits: BTreeMap<Vec<u8>, Lovelace> = [
+            (ra_key.clone(), Lovelace(1_500_000)),
+            (ra_script.clone(), Lovelace(2_500_000)),
+        ]
+        .into_iter()
+        .collect();
+
+        let mut body = minimal_body();
+        body.direct_deposits = deposits.clone();
+
+        // (1) Dijkstra encoder MUST emit key 25.
+        let cbor = encode_transaction_body_for_era(&body, Era::Dijkstra);
+        assert!(
+            cbor.windows(2).any(|w| w == [0x18, 0x19]),
+            "Dijkstra encoder must emit TxBody key 25 (0x18 0x19 sentinel) when \
+             direct_deposits is non-empty"
+        );
+
+        // (2) Round-trip through the Dijkstra-routed decoder via the public
+        //     `decode_transaction(7, ..)` (era_id=7 = Dijkstra).
+        let tx = Transaction {
+            era: Era::Dijkstra,
+            hash: Hash32::ZERO, // recomputed by decoder
+            body,
+            witness_set: empty_witness_set(),
+            is_valid: true,
+            auxiliary_data: None,
+            raw_cbor: None,
+            raw_body_cbor: None,
+            raw_witness_cbor: None,
+        };
+        let tx_cbor = encode_transaction(&tx);
+        let decoded = crate::decode::decode_transaction(7, &tx_cbor)
+            .expect("Dijkstra tx with direct_deposits must round-trip");
+        assert_eq!(decoded.era, Era::Dijkstra);
+        assert_eq!(
+            decoded.body.direct_deposits, deposits,
+            "decoded direct_deposits must match the encoded input exactly"
+        );
+
+        // (3) Conway encoder MUST NOT emit key 25 even with the field populated.
+        let mut conway_body = minimal_body();
+        conway_body.direct_deposits = deposits.clone();
+        let conway_cbor = encode_transaction_body_for_era(&conway_body, Era::Conway);
+        assert!(
+            !conway_cbor.windows(2).any(|w| w == [0x18, 0x19]),
+            "Conway encoder MUST NOT emit TxBody key 25 (direct_deposits is \
+             Dijkstra-only) — found 0x18 0x19 sentinel in Conway output"
+        );
+
+        // (4) Empty map on Dijkstra: key 25 omitted (matches `Omit null`).
+        let mut empty_body = minimal_body();
+        empty_body.direct_deposits = BTreeMap::new(); // explicit
+        let empty_cbor = encode_transaction_body_for_era(&empty_body, Era::Dijkstra);
+        assert!(
+            !empty_cbor.windows(2).any(|w| w == [0x18, 0x19]),
+            "Dijkstra encoder MUST omit key 25 when direct_deposits is empty"
         );
     }
 }
