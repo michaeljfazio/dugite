@@ -285,6 +285,7 @@ fn decode_byron_tx(
         proposal_procedures: Vec::new(),
         treasury_value: None,
         donation: None,
+        sub_transactions: Vec::new(),
     };
 
     Ok(Transaction {

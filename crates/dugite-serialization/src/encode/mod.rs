@@ -232,6 +232,7 @@ mod tests {
             proposal_procedures: vec![],
             treasury_value: None,
             donation: None,
+            sub_transactions: vec![],
         };
 
         let encoded = encode_transaction_body(&body);
@@ -275,6 +276,7 @@ mod tests {
             proposal_procedures: vec![],
             treasury_value: None,
             donation: None,
+            sub_transactions: vec![],
         };
 
         // Hash should be deterministic
@@ -324,6 +326,7 @@ mod tests {
                 proposal_procedures: vec![],
                 treasury_value: None,
                 donation: None,
+                sub_transactions: vec![],
             },
             witness_set: TransactionWitnessSet {
                 vkey_witnesses: vec![],
