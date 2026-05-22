@@ -50,3 +50,58 @@ impl Program {
         ))
     }
 }
+
+#[cfg(test)]
+mod tests {
+    //! Regression tests for the `Program` placeholder API. The four
+    //! entry points must surface their unimplemented state as a typed
+    //! `Internal` error rather than a panic, so a caller that wires
+    //! `dugite-ledger` against this crate before UPLC-2 lands sees a
+    //! deterministic failure mode.
+    use super::*;
+    use crate::UplcError;
+
+    fn assert_internal_contains(err: &UplcError, needle: &str) {
+        match err {
+            UplcError::Internal(msg) => {
+                assert!(
+                    msg.contains(needle),
+                    "expected message to contain {needle:?}; got {msg}"
+                );
+            }
+            other => panic!("expected Internal, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn from_cbor_stub_returns_internal() {
+        let err = Program::from_cbor(&[]).unwrap_err();
+        assert_internal_contains(&err, "from_cbor");
+    }
+
+    #[test]
+    fn from_flat_stub_returns_internal() {
+        let err = Program::from_flat(&[]).unwrap_err();
+        assert_internal_contains(&err, "from_flat");
+    }
+
+    #[test]
+    fn to_cbor_stub_returns_internal() {
+        let p = Program {
+            version: (1, 1, 0),
+            term: Term::Error,
+        };
+        let err = p.to_cbor().unwrap_err();
+        assert_internal_contains(&err, "to_cbor");
+    }
+
+    #[test]
+    fn to_flat_stub_returns_internal() {
+        let p = Program {
+            version: (1, 0, 0),
+            term: Term::Error,
+        };
+        let err = p.to_flat().unwrap_err();
+        assert_internal_contains(&err, "to_flat");
+    }
+}
