@@ -539,6 +539,25 @@ pub struct ProtocolParamUpdate {
     pub min_committee_size: Option<u64>,
     pub committee_term_limit: Option<u64>,
     pub drep_activity: Option<u64>,
+
+    // Dijkstra-era additions (map keys 34-37).
+    //
+    // Re-parameterise Conway's hardcoded ref-script tiering.
+    // Wire encoding:
+    //   34: uint  (Word32)      — maxRefScriptSizePerBlock
+    //   35: uint  (Word32)      — maxRefScriptSizePerTx
+    //   36: uint  (NonZero Word32) — refScriptCostStride
+    //   37: [uint, uint]        — refScriptCostMultiplier as rational tag-30
+    //
+    // Haskell: `PParams.hs` `ppuTag = 34..37` in `DijkstraEra`.
+    /// PParam key 34: `maxRefScriptSizePerBlock` (Word32).
+    pub max_ref_script_size_per_block: Option<u32>,
+    /// PParam key 35: `maxRefScriptSizePerTx` (Word32).
+    pub max_ref_script_size_per_tx: Option<u32>,
+    /// PParam key 36: `refScriptCostStride` (NonZero Word32 — must be >= 1).
+    pub ref_script_cost_stride: Option<u32>,
+    /// PParam key 37: `refScriptCostMultiplier` (PositiveInterval = rational).
+    pub ref_script_cost_multiplier: Option<Rational>,
 }
 
 /// Plutus cost models

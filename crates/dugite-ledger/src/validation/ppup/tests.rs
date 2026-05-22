@@ -79,6 +79,11 @@ fn empty_ppu() -> ProtocolParamUpdate {
         min_committee_size: None,
         committee_term_limit: None,
         drep_activity: None,
+        // Dijkstra-era fields (keys 34-37)
+        max_ref_script_size_per_block: None,
+        max_ref_script_size_per_tx: None,
+        ref_script_cost_stride: None,
+        ref_script_cost_multiplier: None,
     }
 }
 

@@ -99,6 +99,23 @@ pub fn decode_dijkstra_block_minimal(inner_cbor: &[u8]) -> Result<Block, Seriali
     decode_conway_block_mode(inner_cbor, DecodeMode::Minimal, Era::Dijkstra)
 }
 
+/// Decode a CBOR-encoded `protocol_param_update` map into a
+/// [`ProtocolParamUpdate`].
+///
+/// Accepts the map bytes directly (without a wrapping block or tx context).
+/// Used for testing and for CLI `GetCurrentPParams` / `ParameterChange`
+/// decoding where the map is extracted from an HFC-wrapped query result.
+///
+/// Keys 0-33 are the Conway PParams; keys 34-37 are the Dijkstra additions:
+/// - 34: `maxRefScriptSizePerBlock` (uint / Word32)
+/// - 35: `maxRefScriptSizePerTx` (uint / Word32)
+/// - 36: `refScriptCostStride` (uint / NonZero Word32)
+/// - 37: `refScriptCostMultiplier` (tag-30 rational)
+pub fn ppu_from_cbor(cbor: &[u8]) -> Result<ProtocolParamUpdate, SerializationError> {
+    let mut r = Reader::new(cbor);
+    read_protocol_param_update(&mut r)
+}
+
 // ============================================================================
 // Block decoder (Conway + Dijkstra share the same structure)
 // ============================================================================
@@ -123,7 +140,7 @@ fn decode_conway_block_mode(
     // 1. Header
     // -------------------------------------------------------------------------
     let header = {
-        let raw = KeepRaw::parse_with(&mut r, decode_conway_header_inner)?;
+        let raw = KeepRaw::parse_with(&mut r, |r| decode_conway_header_inner(r, era))?;
         let header_hash = blake2b_256(raw.raw);
         let mut h = raw.value;
         h.header_hash = header_hash;
@@ -234,7 +251,10 @@ fn empty_witness_set() -> TransactionWitnessSet {
 // Header decoder (Babbage/Conway Praos style)
 // ============================================================================
 
-fn decode_conway_header_inner(r: &mut Reader<'_>) -> Result<BlockHeader, SerializationError> {
+fn decode_conway_header_inner(
+    r: &mut Reader<'_>,
+    _era: Era,
+) -> Result<BlockHeader, SerializationError> {
     // header = [header_body, kes_signature]
     let hdr_arr = r.read_array_header()?;
     if !matches!(hdr_arr, Some(2)) {
@@ -243,13 +263,18 @@ fn decode_conway_header_inner(r: &mut Reader<'_>) -> Result<BlockHeader, Seriali
         )));
     }
 
-    // header_body = array(10)
+    // Conway header_body = array(10).
+    // Dijkstra may add an optional 11th element: prevNonce (bytes(32) or null).
+    // We accept array(10) or array(11) to handle both.
     let body_arr = r.read_array_header()?;
-    if !matches!(body_arr, Some(10)) {
-        return Err(SerializationError::CborDecode(format!(
-            "conway header_body: expected array(10), got {body_arr:?}"
-        )));
-    }
+    let body_len = match body_arr {
+        Some(n @ (10 | 11)) => n,
+        _ => {
+            return Err(SerializationError::CborDecode(format!(
+                "conway/dijkstra header_body: expected array(10) or array(11), got {body_arr:?}"
+            )));
+        }
+    };
 
     // 0: block_number
     let block_number = r.read_uint()?;
@@ -272,6 +297,21 @@ fn decode_conway_header_inner(r: &mut Reader<'_>) -> Result<BlockHeader, Seriali
     // 9: protocol_version = [major, minor]
     let protocol_version = read_protocol_version(r)?;
 
+    // 10 (optional, Dijkstra only): prevNonce — bytes(32) or null.
+    //
+    // `prevNonceBlockHeaderL` in `Cardano.Ledger.Dijkstra.Era` is used by the
+    // BBODY rule to validate Peras certificates. The nonce is either a
+    // 32-byte Blake2b-256 hash or CBOR null when no previous epoch nonce is
+    // available (e.g. first block of the epoch or bootstrap).
+    //
+    // We read the 11th element when present; both absent and CBOR-null map to
+    // `None` in our `prev_nonce: Option<Hash32>` field.
+    let prev_nonce: Option<Hash32> = if body_len == 11 {
+        read_optional_hash32_nullable(r)?
+    } else {
+        None
+    };
+
     // KES signature (second element of outer array)
     let kes_signature = r.read_bytes()?.to_vec();
 
@@ -292,7 +332,7 @@ fn decode_conway_header_inner(r: &mut Reader<'_>) -> Result<BlockHeader, Seriali
         operational_cert: op_cert,
         protocol_version,
         kes_signature,
-        // Babbage/Conway Praos: nonce_vrf_output = blake2b_256("N" || vrf_result.output)
+        // Babbage/Conway/Dijkstra Praos: nonce_vrf_output = blake2b_256("N" || vrf_result.output)
         // This matches the `vrfNonceValue` computation in the Haskell Praos era.
         nonce_vrf_output: {
             let mut nonce_input = Vec::with_capacity(1 + vrf_output.len());
@@ -301,7 +341,24 @@ fn decode_conway_header_inner(r: &mut Reader<'_>) -> Result<BlockHeader, Seriali
             blake2b_256(&nonce_input).to_vec()
         },
         nonce_vrf_proof: Vec::new(), // Praos has no separate nonce proof
+        prev_nonce,
     })
+}
+
+/// Read an optional 32-byte hash that may be `null` on the wire.
+///
+/// Returns `None` when the CBOR value is `null`, `Some(hash)` when it is a
+/// 32-byte byte string.  Used for Dijkstra `prevNonce` (field 10 of the
+/// `header_body` array).
+fn read_optional_hash32_nullable(r: &mut Reader<'_>) -> Result<Option<Hash32>, SerializationError> {
+    use minicbor::data::Type;
+    let ty = r.peek_major()?;
+    if ty == Type::Null {
+        r.read_null()?;
+        Ok(None)
+    } else {
+        Ok(Some(read_hash32(r)?))
+    }
 }
 
 fn read_optional_hash32(r: &mut Reader<'_>) -> Result<Hash32, SerializationError> {
@@ -1552,6 +1609,31 @@ fn read_protocol_param_update(
                 let rat = r.read_rational()?;
                 ppu.min_fee_ref_script_cost_per_byte =
                     Some(rat.numerator.checked_div(rat.denominator).unwrap_or(15));
+            }
+            // Dijkstra-era PParams (keys 34-37)
+            // Haskell: `eras/dijkstra/impl/src/Cardano/Ledger/Dijkstra/PParams.hs`
+            // `ppuTag = 34..37`.
+            34 => {
+                // maxRefScriptSizePerBlock: Word32 encoded as uint
+                ppu.max_ref_script_size_per_block = Some(r.read_uint()? as u32);
+            }
+            35 => {
+                // maxRefScriptSizePerTx: Word32 encoded as uint
+                ppu.max_ref_script_size_per_tx = Some(r.read_uint()? as u32);
+            }
+            36 => {
+                // refScriptCostStride: NonZero Word32 encoded as uint
+                // Must be >= 1 on the wire; we store as u32 (caller enforces > 0).
+                ppu.ref_script_cost_stride = Some(r.read_uint()? as u32);
+            }
+            37 => {
+                // refScriptCostMultiplier: PositiveInterval — CBOR rational (tag 30
+                // wrapping [numerator, denominator]) or bare [uint, uint].
+                let rat = r.read_rational()?;
+                ppu.ref_script_cost_multiplier = Some(Rational {
+                    numerator: rat.numerator,
+                    denominator: rat.denominator,
+                });
             }
             _ => {
                 r.skip()?;

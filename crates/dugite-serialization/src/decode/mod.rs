@@ -60,6 +60,17 @@ use dugite_primitives::hash::Hash32;
 use dugite_primitives::transaction::{Transaction, TransactionInput, TransactionOutput};
 
 // ---------------------------------------------------------------------------
+// Re-exports for specific era decoders used outside this crate
+// ---------------------------------------------------------------------------
+
+/// Decode a raw CBOR `protocol_param_update` map into a
+/// [`dugite_primitives::transaction::ProtocolParamUpdate`].
+///
+/// Accepts the map bytes directly (without a block or tx context).
+/// Conway keys 0-33 and Dijkstra keys 34-37 are all handled.
+pub use era_conway::ppu_from_cbor;
+
+// ---------------------------------------------------------------------------
 // Public API — every block-level decode routes through the in-house decoder
 // ---------------------------------------------------------------------------
 
