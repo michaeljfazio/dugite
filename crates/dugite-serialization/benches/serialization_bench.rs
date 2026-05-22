@@ -88,6 +88,7 @@ fn make_realistic_transaction() -> Transaction {
             treasury_value: None,
             donation: None,
             sub_transactions: vec![],
+            account_balance_intervals: vec![],
         },
         witness_set: TransactionWitnessSet {
             vkey_witnesses: vec![
