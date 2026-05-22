@@ -44,6 +44,7 @@
 //! - `0` → PlutusV1
 //! - `1` → PlutusV2
 //! - `2` → PlutusV3
+//! - `3` → PlutusV4 (Dijkstra, issue #475 Phase 5)
 //!
 //! ## Pool voting threshold order (index 22)
 //! `[pvtMotionNoConfidence, pvtCommitteeNormal, pvtCommitteeNoConfidence,
@@ -453,6 +454,7 @@ pub fn decode_pparams(data: &[u8]) -> Result<(ProtocolParameters, usize), Serial
 /// - `0` → PlutusV1
 /// - `1` → PlutusV2
 /// - `2` → PlutusV3
+/// - `3` → PlutusV4 (Dijkstra, issue #475 Phase 5)
 ///
 /// Both definite-length (`map(n)`) and indefinite-length (`*_`) maps are
 /// accepted, since the Haskell serialiser has historically used both.
@@ -470,6 +472,7 @@ pub fn decode_cost_models(data: &[u8]) -> Result<(CostModels, usize), Serializat
     let mut plutus_v1: Option<Vec<i64>> = None;
     let mut plutus_v2: Option<Vec<i64>> = None;
     let mut plutus_v3: Option<Vec<i64>> = None;
+    let mut plutus_v4: Option<Vec<i64>> = None;
 
     // Decode each key→value pair; stop when we've consumed `maybe_len` entries
     // (definite) or hit the break byte 0xff (indefinite).
@@ -505,6 +508,8 @@ pub fn decode_cost_models(data: &[u8]) -> Result<(CostModels, usize), Serializat
             0 => plutus_v1 = Some(costs),
             1 => plutus_v2 = Some(costs),
             2 => plutus_v3 = Some(costs),
+            // Dijkstra cost-model slot 3 = PlutusV4 (issue #475 Phase 5).
+            3 => plutus_v4 = Some(costs),
             // Silently ignore unknown language versions so future Plutus
             // versions don't break deserialization.
             _ => {}
@@ -518,6 +523,7 @@ pub fn decode_cost_models(data: &[u8]) -> Result<(CostModels, usize), Serializat
             plutus_v1,
             plutus_v2,
             plutus_v3,
+            plutus_v4,
         },
         off,
     ))

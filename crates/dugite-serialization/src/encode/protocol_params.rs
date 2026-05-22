@@ -204,9 +204,13 @@ pub fn encode_protocol_param_update(ppu: &ProtocolParamUpdate) -> Vec<u8> {
     buf
 }
 
-/// Encode CostModels as CBOR map: {0: [v1...], 1: [v2...], 2: [v3...]}
+/// Encode CostModels as CBOR map: `{0: [v1...], 1: [v2...], 2: [v3...], 3: [v4...]}`.
+///
+/// The V4 slot (key 3) was added in Dijkstra per
+/// `eras/dijkstra/impl/src/Cardano/Ledger/Dijkstra/PParams.hs`. Absent
+/// languages are simply omitted from the wire map (issue #475 Phase 5).
 pub fn encode_cost_models(cm: &CostModels) -> Vec<u8> {
-    let count = [&cm.plutus_v1, &cm.plutus_v2, &cm.plutus_v3]
+    let count = [&cm.plutus_v1, &cm.plutus_v2, &cm.plutus_v3, &cm.plutus_v4]
         .iter()
         .filter(|m| m.is_some())
         .count();
@@ -229,6 +233,13 @@ pub fn encode_cost_models(cm: &CostModels) -> Vec<u8> {
         buf.extend(encode_uint(2));
         buf.extend(encode_array_header(v3.len()));
         for cost in v3 {
+            buf.extend(encode_int(*cost as i128));
+        }
+    }
+    if let Some(ref v4) = cm.plutus_v4 {
+        buf.extend(encode_uint(3));
+        buf.extend(encode_array_header(v4.len()));
+        for cost in v4 {
             buf.extend(encode_int(*cost as i128));
         }
     }
@@ -576,8 +587,7 @@ mod tests {
     fn test_cost_models_v1_only() {
         let cm = CostModels {
             plutus_v1: Some(vec![100, 200, 300]),
-            plutus_v2: None,
-            plutus_v3: None,
+            ..Default::default()
         };
         let encoded = encode_cost_models(&cm);
 
@@ -608,6 +618,7 @@ mod tests {
             plutus_v1: Some(vec![1]),
             plutus_v2: Some(vec![2]),
             plutus_v3: Some(vec![3]),
+            plutus_v4: None,
         };
         let encoded = encode_cost_models(&cm);
 
@@ -633,14 +644,48 @@ mod tests {
         assert_eq!(encoded[9], 0x03);
     }
 
+    /// Cost models with all four versions (V1+V2+V3+V4) must produce map(4)
+    /// with keys 0,1,2,3 in slot order — Dijkstra (issue #475 Phase 5).
+    #[test]
+    fn test_cost_models_all_four_versions_with_v4() {
+        let cm = CostModels {
+            plutus_v1: Some(vec![1]),
+            plutus_v2: Some(vec![2]),
+            plutus_v3: Some(vec![3]),
+            plutus_v4: Some(vec![4]),
+        };
+        let encoded = encode_cost_models(&cm);
+        // map(4) = 0xa4
+        assert_eq!(encoded[0], 0xa4, "all 4 versions present → map(4)");
+        // The 4th slot (V4) is at key 3 (CBOR uint 0x03), array(1) [uint 4]
+        // Walk to the trailing entry — V4 at offset 10 (after V1/V2/V3 each
+        // contributing 3 bytes: key + array(1) + value).
+        assert_eq!(encoded[10], 0x03, "PlutusV4 occupies map key 3");
+        assert_eq!(encoded[11], 0x81, "V4 array(1)");
+        assert_eq!(encoded[12], 0x04, "V4 cost value 4");
+    }
+
+    /// Cost models with V4 only (issue #475 Phase 5).
+    #[test]
+    fn test_cost_models_v4_only() {
+        let cm = CostModels {
+            plutus_v4: Some(vec![42, -1, 7]),
+            ..Default::default()
+        };
+        let encoded = encode_cost_models(&cm);
+        // map(1), key 3, array(3) = 0xa1 0x03 0x83
+        assert_eq!(encoded[0], 0xa1);
+        assert_eq!(encoded[1], 0x03, "PlutusV4 cost-model key = 3 (Dijkstra)");
+        assert_eq!(encoded[2], 0x83);
+    }
+
     /// Cost models with negative values must use CBOR negative integer encoding.
     /// -1 encodes as 0x20.
     #[test]
     fn test_cost_models_negative_values() {
         let cm = CostModels {
             plutus_v1: Some(vec![-1, -100, 0, 1]),
-            plutus_v2: None,
-            plutus_v3: None,
+            ..Default::default()
         };
         let encoded = encode_cost_models(&cm);
 
@@ -671,8 +716,7 @@ mod tests {
         let ppu = ProtocolParamUpdate {
             cost_models: Some(CostModels {
                 plutus_v1: Some(vec![42]),
-                plutus_v2: None,
-                plutus_v3: None,
+                ..Default::default()
             }),
             ..Default::default()
         };
