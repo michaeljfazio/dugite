@@ -109,13 +109,15 @@ PATCH_SCRIPT="${SCRIPT_DIR}/patch-impspec-core.py"
 
 EXEC_SPEC_CORE="${CLONE_DIR}/libs/cardano-ledger-conformance/src/Test/Cardano/Ledger/Conformance/ExecSpecRule/Core.hs"
 IMP_CORE="${CLONE_DIR}/libs/cardano-ledger-conformance/test/Test/Cardano/Ledger/Conformance/Imp/Core.hs"
+CONFORMANCE_CABAL="${CLONE_DIR}/libs/cardano-ledger-conformance/cardano-ledger-conformance.cabal"
 
 [[ -f "${PATCH_SCRIPT}" ]] || { log "ERROR: patch script not found: ${PATCH_SCRIPT}"; exit 1; }
 [[ -f "${EXEC_SPEC_CORE}" ]] || { log "ERROR: ExecSpecRule/Core.hs not found at pinned SHA"; exit 1; }
 [[ -f "${IMP_CORE}" ]] || { log "ERROR: Imp/Core.hs not found at pinned SHA"; exit 1; }
+[[ -f "${CONFORMANCE_CABAL}" ]] || { log "ERROR: cardano-ledger-conformance.cabal not found at pinned SHA"; exit 1; }
 
 log "Applying ImpSpec dump patch..."
-python3 "${PATCH_SCRIPT}" "${EXEC_SPEC_CORE}" "${IMP_CORE}"
+python3 "${PATCH_SCRIPT}" "${EXEC_SPEC_CORE}" "${IMP_CORE}" "${CONFORMANCE_CABAL}"
 
 # ── Disable external-libsodium-vrf to use standard libsodium ─────────────────
 #

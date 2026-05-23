@@ -31,6 +31,81 @@ Usage:
 """
 
 import sys
+import re
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Patch 0: cardano-ledger-conformance.cabal  (add missing build-depends)
+# ──────────────────────────────────────────────────────────────────────────────
+
+def patch_cabal_file(path: str) -> None:
+    """Add 'filepath' and 'cardano-ledger-api' to the test-suite tests build-depends.
+
+    The patched Imp/Core.hs imports:
+      - System.FilePath  (package: filepath — a GHC boot pkg, but needs explicit listing)
+      - Test.Cardano.Ledger.Api.DebugTools  (package: cardano-ledger-api)
+
+    These are not in the test-suite's build-depends at the pinned SHA, so we
+    patch the cabal file before running 'cabal build'.
+    """
+    with open(path) as f:
+        content = f.read()
+
+    original = content
+
+    # Strategy: find the test-suite section and add missing build-depends.
+    # We look for the *first* build-depends entry inside the test-suite block
+    # and insert the two missing packages after it.
+    #
+    # The cabal file uses commas as list separators with each dep on its own line:
+    #   build-depends:
+    #       base
+    #     , other-package
+    #
+    # We add our two packages after the first dep in the test-suite section.
+
+    # Locate the test-suite block.
+    ts_match = re.search(r'^test-suite\s+tests\b', content, re.MULTILINE)
+    if not ts_match:
+        print(f"[patch-impspec-core] NOTE: no 'test-suite tests' section in {path}; skipping cabal patch")
+        return
+
+    ts_start = ts_match.start()
+
+    # Find the next top-level stanza after the test-suite (library, executable,
+    # another test-suite, benchmark, etc.) so we only search within the block.
+    next_stanza = re.search(
+        r'^\S', content[ts_start + 1:], re.MULTILINE
+    )
+    ts_end = (ts_start + 1 + next_stanza.start()) if next_stanza else len(content)
+    ts_block = content[ts_start:ts_end]
+
+    # Idempotency checks.
+    if "filepath" in ts_block and "cardano-ledger-api" in ts_block:
+        print(f"[patch-impspec-core] NOTE: cabal deps already present; skipping cabal patch")
+        return
+
+    # Find 'build-depends:' inside the block.
+    bd_match = re.search(r'build-depends:', ts_block)
+    if not bd_match:
+        print(f"[patch-impspec-core] WARNING: no build-depends in test-suite tests; skipping")
+        return
+
+    # Find the first dependency line (comma-prefix style or bare name).
+    # Insert our additions right after the 'build-depends:' header line.
+    bd_end = ts_start + bd_match.end()  # absolute offset just after 'build-depends:'
+
+    # Build the insertion: two packages.
+    to_add = ""
+    if "filepath" not in ts_block:
+        to_add += "\n    , filepath"
+    if "cardano-ledger-api" not in ts_block:
+        to_add += "\n    , cardano-ledger-api"
+
+    if to_add:
+        content = content[:bd_end] + to_add + content[bd_end:]
+
+    _write_if_changed(path, original, content)
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -227,11 +302,13 @@ def _die(path: str, msg: str) -> None:
 # ──────────────────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
-    if len(sys.argv) != 3:
+    if len(sys.argv) not in (3, 4):
         print(
-            f"Usage: {sys.argv[0]} <ExecSpecRule/Core.hs> <Imp/Core.hs>",
+            f"Usage: {sys.argv[0]} <ExecSpecRule/Core.hs> <Imp/Core.hs> [<conformance.cabal>]",
             file=sys.stderr,
         )
         sys.exit(1)
     patch_exec_spec_rule_core(sys.argv[1])
     patch_imp_core(sys.argv[2])
+    if len(sys.argv) == 4:
+        patch_cabal_file(sys.argv[3])
