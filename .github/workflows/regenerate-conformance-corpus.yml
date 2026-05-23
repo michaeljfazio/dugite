@@ -1,0 +1,142 @@
+name: Regenerate Conformance Corpus
+
+on:
+  workflow_dispatch:
+    inputs:
+      area:
+        description: "Capture only a specific area (leave blank for all)"
+        required: false
+        default: ""
+      ouroboros_consensus_sha:
+        description: "Override ouroboros-consensus SHA (leave blank to use sources.toml)"
+        required: false
+        default: ""
+      cardano_ledger_sha:
+        description: "Override cardano-ledger SHA (leave blank to use sources.toml)"
+        required: false
+        default: ""
+      cardano_node_sha:
+        description: "Override cardano-node SHA (leave blank to use sources.toml)"
+        required: false
+        default: ""
+      plutus_tag:
+        description: "Override plutus tag (leave blank to use sources.toml)"
+        required: false
+        default: ""
+
+  schedule:
+    # Weekly on Sunday at 06:00 UTC
+    - cron: "0 6 * * 0"
+
+  push:
+    paths:
+      - "scripts/regenerate-conformance-corpus/**"
+      - "tests/conformance/upstream/sources.toml"
+
+permissions:
+  contents: write
+
+jobs:
+  regenerate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Apply workflow_dispatch pin overrides to sources.toml
+        if: github.event_name == 'workflow_dispatch'
+        env:
+          OC_SHA: ${{ github.event.inputs.ouroboros_consensus_sha }}
+          CL_SHA: ${{ github.event.inputs.cardano_ledger_sha }}
+          CN_SHA: ${{ github.event.inputs.cardano_node_sha }}
+          PL_TAG: ${{ github.event.inputs.plutus_tag }}
+        run: |
+          TOML="tests/conformance/upstream/sources.toml"
+          apply_override() {
+            local section="$1" key="$2" value="$3"
+            if [[ -n "${value}" ]]; then
+              python3 - "${TOML}" "${section}" "${key}" "${value}" <<'EOF'
+          import sys, re
+          toml_file, section, key, value = sys.argv[1:]
+          with open(toml_file) as f:
+              lines = f.readlines()
+          in_section = False
+          result = []
+          for line in lines:
+              stripped = line.strip()
+              if stripped.startswith('[') and not stripped.startswith('[['):
+                  in_section = (stripped.strip('[]').strip() == section)
+              if in_section and re.match(rf'^{key}\s*=', stripped):
+                  line = f'{key}  = "{value}"\n'
+              result.append(line)
+          with open(toml_file, 'w') as f:
+              f.writelines(result)
+          EOF
+            fi
+          }
+          apply_override ouroboros-consensus sha  "${OC_SHA}"
+          apply_override cardano-ledger      sha  "${CL_SHA}"
+          apply_override cardano-node        sha  "${CN_SHA}"
+          apply_override plutus              tag  "${PL_TAG}"
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Make scripts executable
+        run: chmod +x scripts/regenerate-conformance-corpus/*.sh
+
+      - name: Run regeneration pipeline
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+          INPUT_AREA: ${{ github.event.inputs.area }}
+        run: |
+          ARGS=()
+          if [[ -n "${INPUT_AREA}" ]]; then
+            ARGS+=(--area "${INPUT_AREA}")
+          fi
+          bash scripts/regenerate-conformance-corpus/regenerate.sh "${ARGS[@]}"
+
+      - name: Verify release assets
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          # Find the most-recently-created conformance-corpus release and check it has
+          # all 7 area tarballs plus corpus-manifest.json.
+          LATEST_TAG="$(gh release list --repo "${GH_REPO}" \
+              --json tagName,createdAt \
+              --jq '[.[] | select(.tagName | startswith("conformance-corpus-"))] | sort_by(.createdAt) | last | .tagName')"
+
+          echo "Verifying release: ${LATEST_TAG}"
+
+          ASSETS="$(gh release view "${LATEST_TAG}" --repo "${GH_REPO}" --json assets --jq '[.assets[].name]')"
+
+          for area in ouroboros-consensus cardano-ledger cardano-node plutus ledger-rules cardano-base mithril; do
+            echo "${ASSETS}" | python3 -c "import sys,json; a=json.load(sys.stdin); assert '${area}.tar.gz' in a, 'Missing asset: ${area}.tar.gz'"
+            echo "  [ok] ${area}.tar.gz"
+          done
+
+          echo "${ASSETS}" | python3 -c "import sys,json; a=json.load(sys.stdin); assert 'corpus-manifest.json' in a, 'Missing corpus-manifest.json'"
+          echo "  [ok] corpus-manifest.json"
+
+          # Check stub areas have stub:true in the manifest
+          MANIFEST="$(gh release download "${LATEST_TAG}" --repo "${GH_REPO}" --pattern "corpus-manifest.json" --output -)"
+          for stub_area in ledger-rules cardano-base mithril; do
+            IS_STUB="$(echo "${MANIFEST}" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d['areas']['${stub_area}'].get('stub', False))")"
+            [[ "${IS_STUB}" == "True" ]] || { echo "ERROR: ${stub_area} should be stub" >&2; exit 1; }
+            echo "  [ok] ${stub_area} is stub"
+          done
+
+          # Check real areas have non-empty file_hashes
+          for real_area in ouroboros-consensus cardano-ledger cardano-node plutus; do
+            FILE_COUNT="$(echo "${MANIFEST}" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d['areas']['${real_area}'].get('file_count', 0))")"
+            [[ "${FILE_COUNT}" -gt 0 ]] || { echo "ERROR: ${real_area} has 0 files" >&2; exit 1; }
+            echo "  [ok] ${real_area}: ${FILE_COUNT} files"
+          done
+
+          echo "All verification checks passed."
