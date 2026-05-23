@@ -280,6 +280,11 @@ impl EraRules for ShelleyRules {
                     }
                 }
             }
+
+            // #615d: expose the freshly-applied RUPD to the epoch-state dumper.
+            // Without this, `epoch_state_debug::rewards_summary` sees `None` and
+            // emits `total_distributed = 0`, masking the real per-pool payout.
+            epochs.last_applied_rupd = Some(rupd);
         }
 
         // Step 3: SNAP — rotate snapshots, capture fees, update bprev.
