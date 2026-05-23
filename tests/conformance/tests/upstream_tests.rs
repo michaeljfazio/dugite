@@ -46,3 +46,16 @@ fn cardano_node_genesis_decodes() {
     };
     dugite_conformance::upstream::cardano_node::run_all_checks(&dir);
 }
+
+// ── cardano-ledger CDDL validation ───────────────────────────────────────────
+
+#[test]
+fn cardano_ledger_cddl_validates() {
+    let Some(ledger_dir) = fixtures::check_area("cardano-ledger") else {
+        return;
+    };
+    let Some(ouroboros_dir) = fixtures::check_area("ouroboros-consensus") else {
+        return;
+    };
+    dugite_conformance::upstream::cardano_ledger_cddl::run_all_checks(&ledger_dir, &ouroboros_dir);
+}

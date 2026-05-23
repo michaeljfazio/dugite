@@ -15,9 +15,12 @@ thiserror = { workspace = true }
 num-bigint = { workspace = true }
 hex = { workspace = true }
 sha2 = { workspace = true }
+# Optional: only compiled when upstream-conformance feature is active.
+minicbor   = { workspace = true, optional = true }
+cddl       = { version = "0.10.5", optional = true }
 
 [features]
-upstream-conformance = []
+upstream-conformance = ["dep:minicbor", "dep:cddl"]
 
 [dev-dependencies]
 tempfile = { workspace = true }
