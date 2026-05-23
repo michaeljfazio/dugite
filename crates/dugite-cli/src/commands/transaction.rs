@@ -1121,7 +1121,8 @@ pub(crate) fn parse_execution_units(s: &str) -> Result<ExUnits> {
 /// helper in `dugite-serialization`, keeping the CLI crate independent.
 fn encode_redeemer_to_cbor(r: &Redeemer) -> Vec<u8> {
     // Redeemer = [tag, index, data, ex_units]
-    // Tag: Spend=0, Mint=1, Cert=2, Reward=3, Vote=4, Propose=5
+    // Tag: Spend=0, Mint=1, Cert=2, Reward=3, Vote=4, Propose=5, Guarding=6
+    // (Guarding is Dijkstra-only — issue #475 Phase 3.5).
     let tag_num: u64 = match r.tag {
         RedeemerTag::Spend => 0,
         RedeemerTag::Mint => 1,
@@ -1129,6 +1130,7 @@ fn encode_redeemer_to_cbor(r: &Redeemer) -> Vec<u8> {
         RedeemerTag::Reward => 3,
         RedeemerTag::Vote => 4,
         RedeemerTag::Propose => 5,
+        RedeemerTag::Guarding => 6,
     };
 
     // Build header (array(4), tag, index) in a block so the encoder borrow ends
