@@ -25,8 +25,75 @@
 //! data.  The node can always reconstruct state from the chain.
 
 use super::{LedgerError, LedgerState, MAX_SNAPSHOT_SIZE};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use tracing::{debug, info, warn};
+
+/// Quarantine extension applied to snapshot files whose on-disk format
+/// version is older than [`LedgerState::SNAPSHOT_VERSION`] and for which
+/// no in-place migration path exists.
+///
+/// The file is renamed `<name>.bin` → `<name>.bin.vNN-unreadable` (where
+/// `NN` is the snapshot's version byte). This:
+///
+///   1. Preserves the bytes for post-mortem analysis instead of silently
+///      losing them when the caller falls through to a fresh-ledger start.
+///   2. Removes the file from [`crate::startup::enumerate_snapshots`] (which
+///      filters by the `.bin` suffix) so the next restart does not retry the
+///      same unreadable snapshot in a loop.
+///   3. Keeps the rename **inside** the database directory so operators
+///      can find and inspect (or delete) it without hunting elsewhere on
+///      the filesystem.
+///
+/// See issue #609.
+const QUARANTINE_SUFFIX_PREFIX: &str = "v";
+const QUARANTINE_SUFFIX_TAIL: &str = "-unreadable";
+
+/// Rename `path` to `<path>.v{version}-unreadable` so that:
+///
+///   * the file is preserved for forensic inspection, and
+///   * the next restart does not pick it up via the `.bin` enumerator.
+///
+/// Logs the rename outcome; failures are demoted to a warning because the
+/// caller can still make forward progress (it will fall back to a fresh
+/// ledger via chain replay). Returns the quarantine destination on
+/// success or `None` if the rename failed.
+fn quarantine_unreadable_snapshot(path: &Path, version: u8) -> Option<PathBuf> {
+    // Build `<original-name>.v{N}-unreadable`. We append rather than
+    // replace the extension so that `ledger-snapshot-epoch400-slot12345.bin`
+    // becomes `ledger-snapshot-epoch400-slot12345.bin.v15-unreadable`,
+    // preserving every original filename component for diagnostics.
+    let mut target = path.as_os_str().to_owned();
+    target.push(".");
+    target.push(format!(
+        "{QUARANTINE_SUFFIX_PREFIX}{version}{QUARANTINE_SUFFIX_TAIL}"
+    ));
+    let target = PathBuf::from(target);
+
+    match std::fs::rename(path, &target) {
+        Ok(()) => {
+            warn!(
+                original = %path.display(),
+                quarantined = %target.display(),
+                snapshot_version = version,
+                "Quarantined unreadable ledger snapshot — chain will be \
+                 replayed from ImmutableDB on next start. Inspect or \
+                 delete the .{QUARANTINE_SUFFIX_PREFIX}{version}{QUARANTINE_SUFFIX_TAIL} \
+                 file once recovery completes."
+            );
+            Some(target)
+        }
+        Err(e) => {
+            warn!(
+                path = %path.display(),
+                error = %e,
+                "Failed to rename unreadable snapshot for quarantine — \
+                 operator may need to delete it manually before next start \
+                 if it is the primary snapshot."
+            );
+            None
+        }
+    }
+}
 
 /// `std::io::Write` adapter that forwards every byte to an inner writer
 /// and simultaneously feeds it into a blake2b-256 hasher.
@@ -59,25 +126,43 @@ impl<'a, W: std::io::Write> std::io::Write for HashingWriter<'a, W> {
 impl LedgerState {
     /// Current snapshot format version.
     ///
-    /// **Migration policy:** Increment this when the serialized `LedgerState`
-    /// layout changes (adding, removing, or reordering fields). When bumped:
+    /// # Bump checklist
     ///
-    /// 1. Add a `migrate_vN_to_vM()` function that transforms the old data.
-    /// 2. Update `load_snapshot()` to dispatch to the migration chain.
-    /// 3. If bincode-level migration is infeasible (field layout changed too much),
-    ///    the old snapshot will fail to deserialize and the node re-syncs from chain.
+    /// Bincode is positional and not self-describing — adding, removing, or
+    /// reordering any serialised field (including transitively, e.g. a new
+    /// field in `CostModels` or `ProtocolParameters`) silently shifts every
+    /// downstream byte boundary and renders prior snapshots undecodable.
     ///
-    /// Since bincode is field-order-dependent and not self-describing, structural
-    /// changes (new/removed/reordered fields) will cause deserialization failures
-    /// for older snapshots.  This is acceptable — snapshots are an optimization,
-    /// not critical data.  The node can always reconstruct state from the chain.
+    /// When bumping `SNAPSHOT_VERSION`:
     ///
-    /// Increment when `GovernanceState`/`LedgerState` fields change.
-    /// Bincode is positional — any field addition/reorder breaks old snapshots.
+    /// 1. **Document the structural change** in a `vN (issue #...)` line below
+    ///    so future debugging has a citation back to the PR.
+    /// 2. **Prefer migration over rejection.** If a `migrate_vN_to_vM()`
+    ///    shim is feasible (typically requires duplicating the prior
+    ///    `LedgerStateSnapshot` shape under a different module), wire it into
+    ///    `load_snapshot()` before the version-mismatch quarantine guard.
+    /// 3. **If migration is infeasible**, the existing quarantine path will
+    ///    fire (issue #609): the unreadable snapshot is renamed to
+    ///    `<name>.vNN-unreadable` and `load_snapshot` returns an error
+    ///    naming both versions. The caller is expected to rebuild the
+    ///    ledger by replaying ImmutableDB chunks — the on-disk ChainDB is
+    ///    not touched by the snapshot layer, so no chain data is lost.
+    /// 4. **Add a breaking-change note to the release process** alongside
+    ///    the bump so operators are warned that the first restart on the
+    ///    new binary will trigger a from-chain replay (minutes-to-hours
+    ///    depending on tip distance).
     ///
-    /// v16 (issue #475 Phase 5): `CostModels` gained `plutus_v4: Option<Vec<i64>>`
-    /// (Dijkstra cost-model slot 3). This shifts every `CostModels` field
-    /// boundary in the bincode stream and breaks v15 snapshots.
+    /// # Version history
+    ///
+    /// * v16 (issue #475 Phase 5, issue #609 quarantine) — `CostModels`
+    ///   gained `plutus_v4: Option<Vec<i64>>` (Dijkstra cost-model slot 3).
+    ///   The new `Option` is serialised as a positional tag byte at the end
+    ///   of `CostModels`, which shifts every byte after `cost_models` in
+    ///   `protocol_params` (and `prev_protocol_params`) — v15 snapshots are
+    ///   unreadable. Prior to issue #609 the loader merely WARN-logged and
+    ///   then handed the v15 bytes to the v16 bincode decoder, which failed
+    ///   with `tag for enum is not valid, found 65`; the caller swallowed
+    ///   that error and silently re-synced from genesis.
     pub(crate) const SNAPSHOT_VERSION: u8 = 16;
 
     /// Save ledger state snapshot to disk using bincode serialization.
@@ -212,15 +297,33 @@ impl LedgerState {
                     )));
                 }
                 if version < Self::SNAPSHOT_VERSION {
-                    // Older version — attempt migration chain. For bincode-based
-                    // snapshots, structural changes make cross-version deserialization
-                    // impossible. Log clearly so the user knows to re-sync.
-                    warn!(
-                        snapshot_version = version,
-                        current_version = Self::SNAPSHOT_VERSION,
-                        "Snapshot version mismatch — snapshot may fail to load. \
-                         Delete the snapshot file to re-sync from chain if this fails."
-                    );
+                    // Older version — bincode is positional and not
+                    // self-describing, so a bump that adds, removes, or
+                    // reorders any serialised field makes the prior layout
+                    // unreadable by the current decoder. Rather than fall
+                    // through to a guaranteed-to-fail bincode call (which
+                    // emits cryptic "tag for enum is not valid, found NN"
+                    // errors and triggers `init_fresh_ledger`, silently
+                    // dropping the operator's working state — issue #609),
+                    // we refuse the snapshot **before** attempting to
+                    // deserialise it.
+                    //
+                    // The caller is expected to rebuild ledger state by
+                    // replaying ImmutableDB chunks; the on-disk ChainDB is
+                    // not touched by this path, so no chain data is lost.
+                    // The quarantine rename below preserves the original
+                    // bytes for forensics and prevents the same unreadable
+                    // file from being retried on the next restart.
+                    quarantine_unreadable_snapshot(path, version);
+                    return Err(LedgerError::EpochTransition(format!(
+                        "Snapshot version {version} predates current snapshot \
+                         format version {}; the on-disk LedgerState layout is \
+                         not bincode-compatible across SNAPSHOT_VERSION bumps. \
+                         The unreadable snapshot has been quarantined; the \
+                         ledger will be rebuilt by replaying ImmutableDB chunks. \
+                         See issue #609.",
+                        Self::SNAPSHOT_VERSION,
+                    )));
                 }
                 debug!(version, "Loading versioned snapshot");
                 let stored_checksum = &raw[5..37];
@@ -586,7 +689,7 @@ mod tests {
     // -----------------------------------------------------------------------
 
     /// Save a snapshot and assert that byte 4 (the version field) equals
-    /// `SNAPSHOT_VERSION` (currently 14).
+    /// the current `SNAPSHOT_VERSION` constant (whatever it happens to be).
     #[test]
     fn test_version_in_header() {
         let dir = tempfile::tempdir().unwrap();
@@ -629,6 +732,144 @@ mod tests {
         assert!(
             !tmp_path.exists(),
             ".tmp staging file must not exist after save_snapshot completes (atomic rename)"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // 9. Version-mismatch quarantine (issue #609)
+    // -----------------------------------------------------------------------
+    //
+    // When the on-disk SNAPSHOT_VERSION is older than the current code's
+    // SNAPSHOT_VERSION, the bincode layout is not forward-compatible: any
+    // field added, removed, or reordered in `LedgerStateSnapshot` (or any of
+    // its transitively-serialised types like `CostModels`) makes the prior
+    // stream undecodable. Issue #609 reported the user-visible failure mode:
+    //
+    //   WARN dugite_ledger::state::snapshot: Snapshot version mismatch
+    //         snapshot_version=15 current_version=16
+    //   Failed to load ledger snapshot, starting fresh:
+    //         tag for enum is not valid, found 65
+    //
+    // Followed by silent deletion of the ledger snapshot and a full from-
+    // genesis re-sync.
+    //
+    // The two tests below pin the new behaviour:
+    //
+    //   * `load_snapshot` returns `Err` *immediately* on a version that is
+    //     less than `SNAPSHOT_VERSION` — it must not attempt the doomed
+    //     bincode decode.
+    //   * The unreadable file is renamed to `<name>.vNN-unreadable` so that
+    //     (a) its bytes are preserved for forensic inspection and (b) the
+    //     `.bin` suffix-based enumerator in `dugite_node::startup` does not
+    //     pick it back up on the next restart.
+
+    /// Build a synthetic snapshot file whose header advertises `version`
+    /// (must be ≥ 1, < `SNAPSHOT_VERSION`, and < 128 so that the versioned
+    /// header branch is taken) but whose payload is empty. The blake2b
+    /// checksum is the digest of the empty payload, so the header itself is
+    /// internally consistent — we want `load_snapshot` to reject on the
+    /// version check, not on a checksum mismatch.
+    fn write_versioned_snapshot_stub(path: &Path, version: u8) {
+        assert!(
+            version > 0 && version < 128 && version < LedgerState::SNAPSHOT_VERSION,
+            "stub helper expects an older, valid version byte"
+        );
+        let mut bytes = Vec::with_capacity(37);
+        bytes.extend_from_slice(b"DUGT");
+        bytes.push(version);
+        let empty_payload_hash = dugite_primitives::hash::blake2b_256(&[]);
+        bytes.extend_from_slice(empty_payload_hash.as_bytes());
+        std::fs::write(path, &bytes).unwrap();
+    }
+
+    /// Older snapshot versions must produce a clear, version-aware error
+    /// *before* bincode is invoked. Issue #609 — silent chain wipe.
+    #[test]
+    fn test_version_mismatch_returns_error_and_does_not_attempt_decode() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("old.bin");
+        // Use the version one behind the current code path — that's the
+        // exact case from the #609 reproduction (v15 read by v16 binary).
+        let old_version = LedgerState::SNAPSHOT_VERSION - 1;
+        write_versioned_snapshot_stub(&path, old_version);
+
+        let result = LedgerState::load_snapshot(&path);
+        let err = result.expect_err("older snapshot version must be rejected");
+        let msg = err.to_string();
+
+        // Error must surface BOTH version numbers so an operator reading
+        // logs can immediately tell which bump caused the rejection.
+        assert!(
+            msg.contains(&old_version.to_string()),
+            "error must mention on-disk version {old_version}, got: {msg}"
+        );
+        assert!(
+            msg.contains(&LedgerState::SNAPSHOT_VERSION.to_string()),
+            "error must mention current SNAPSHOT_VERSION {}, got: {msg}",
+            LedgerState::SNAPSHOT_VERSION
+        );
+        // Error must NOT be the bincode tag-decode noise from the old code
+        // path. If this assertion ever fires, the early-return version
+        // guard has regressed and silent chain wipe is back.
+        assert!(
+            !msg.contains("tag for enum is not valid"),
+            "version mismatch must not surface bincode-internal errors, got: {msg}"
+        );
+    }
+
+    /// Quarantine renames the unreadable file to `<name>.vNN-unreadable`
+    /// inside the same directory, so that (a) the bytes survive for
+    /// forensics and (b) the next startup does not retry it (the
+    /// `.bin`-suffix enumerator no longer matches).
+    #[test]
+    fn test_version_mismatch_quarantines_original_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("quarantine.bin");
+        let old_version = LedgerState::SNAPSHOT_VERSION - 1;
+        write_versioned_snapshot_stub(&path, old_version);
+
+        let _ = LedgerState::load_snapshot(&path);
+
+        // The original `.bin` must no longer exist — otherwise the next
+        // restart would attempt to load it again and hit the same failure.
+        assert!(
+            !path.exists(),
+            "unreadable snapshot must be moved out of the .bin slot"
+        );
+
+        // The expected quarantine path must exist and contain the original
+        // header bytes (so post-mortem tooling can decode the version
+        // field even after the file is renamed).
+        let expected_quarantine = {
+            let mut s = path.as_os_str().to_owned();
+            s.push(format!(".v{old_version}-unreadable"));
+            PathBuf::from(s)
+        };
+        assert!(
+            expected_quarantine.exists(),
+            "quarantined file must exist at {}",
+            expected_quarantine.display()
+        );
+        let bytes = std::fs::read(&expected_quarantine).unwrap();
+        assert_eq!(&bytes[..4], b"DUGT", "quarantine must preserve magic word");
+        assert_eq!(
+            bytes[4], old_version,
+            "quarantine must preserve original version byte"
+        );
+
+        // The quarantine extension must not match the `*.bin` glob the
+        // startup enumerator uses, so the next restart skips it. We
+        // assert that here against the literal suffix the enumerator
+        // checks for (`.bin`), which would be brittle to re-import — but
+        // is sufficient as a defense-in-depth check that the rename did
+        // its job.
+        assert!(
+            !expected_quarantine
+                .file_name()
+                .and_then(|n| n.to_str())
+                .map(|n| n.ends_with(".bin"))
+                .unwrap_or(false),
+            "quarantined filename must not end with .bin"
         );
     }
 }
