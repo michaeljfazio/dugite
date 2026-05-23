@@ -182,25 +182,51 @@ impl EraRules for BabbageRules {
 
     /// Handle hard fork state transformations when entering Babbage.
     ///
-    /// Alonzo -> Babbage: No major ledger state transformation is needed. The
-    /// transition from TPraos to Praos (VRF output representation change) is
-    /// handled at the consensus layer. New Babbage features (reference inputs,
-    /// inline datums, reference scripts, collateral return) are additive and
-    /// do not require existing state changes.
+    /// Alonzo -> Babbage: bump the on-chain protocol version to (7, 0). New
+    /// Babbage features (reference inputs, inline datums, reference scripts,
+    /// collateral return) are additive and do not require existing state
+    /// changes; the transition from TPraos to Praos (VRF output representation
+    /// change) is handled at the consensus layer.
+    ///
+    /// In cardano-node the Alonzo→Babbage era boundary is a hard fork.
+    /// `translateEra @BabbageEra @AlonzoEra` for `PParams` copies the old
+    /// `ProtVer` across unchanged; the actual bump to PV7 is performed by the
+    /// consensus Hard Fork Combinator in the era-crossing tick. Dugite has no
+    /// separate HFC layer — era transitions are dispatched entirely in the
+    /// ledger crate via `block.era`. So we replicate the HFC's PV write here
+    /// at the Alonzo→Babbage boundary. Without this, dugite enters Babbage
+    /// with `curPParams.protocol_version_major = 6` (Alonzo's intra-era PV6
+    /// bump) and any code path gated on `pv >= 7` (decentralization parameter
+    /// override, Babbage min_fee semantics, etc.) silently fails. Tracked as
+    /// issue #615 — the same class as the resolved Babbage→Conway PV9 bug
+    /// (issue #481, see `eras/conway.rs:835-856`).
     fn on_era_transition(
         &self,
         from_era: Era,
-        _ctx: &RuleContext,
+        ctx: &RuleContext,
         _utxo: &mut UtxoSubState,
         _certs: &mut CertSubState,
         _gov: &mut GovSubState,
         _consensus: &mut ConsensusSubState,
-        _epochs: &mut EpochSubState,
+        epochs: &mut EpochSubState,
     ) -> Result<(), LedgerError> {
-        debug!(
-            "{:?} -> Babbage era transition (no state changes)",
-            from_era
-        );
+        // Mirror cardano-node's HFC era-crossing tick: set the new era's
+        // initial PV. Guard by `ctx.era == Babbage` so we never clobber if
+        // dispatched for any other destination (defensive).
+        if ctx.era == Era::Babbage {
+            debug!(
+                "{:?} -> Babbage era transition: bumping protocol version to (7, 0)",
+                from_era
+            );
+            epochs.protocol_params.protocol_version_major = 7;
+            epochs.protocol_params.protocol_version_minor = 0;
+        } else {
+            debug!(
+                "BabbageRules::on_era_transition called with unexpected ctx.era={:?} \
+                 (from_era={:?}); leaving protocol version untouched",
+                ctx.era, from_era,
+            );
+        }
         Ok(())
     }
 
@@ -734,17 +760,23 @@ mod tests {
         assert_eq!(fee, 44 * 200 + 155381);
     }
 
-    /// on_era_transition succeeds without state changes.
+    /// Alonzo -> Babbage bumps protocol_version to (7, 0). Mirrors the HFC
+    /// era-crossing tick in cardano-node — the same class as the resolved
+    /// Babbage→Conway PV9 bug (issue #481). See issue #615.
     #[test]
-    fn test_on_era_transition_succeeds() {
+    fn test_on_era_transition_alonzo_to_babbage_sets_pv7() {
         let rules = BabbageRules::new();
-        let params = ProtocolParameters::mainnet_defaults();
+        let mut params = ProtocolParameters::mainnet_defaults();
+        params.protocol_version_major = 6;
+        params.protocol_version_minor = 0;
         let ctx = make_babbage_ctx(&params);
         let mut utxo = make_utxo_sub(vec![]);
         let mut certs = make_cert_sub();
         let mut gov = make_gov_sub();
         let mut consensus = make_consensus_sub();
         let mut epochs = make_epoch_sub();
+        epochs.protocol_params.protocol_version_major = 6;
+        epochs.protocol_params.protocol_version_minor = 0;
 
         let result = rules.on_era_transition(
             Era::Alonzo,
@@ -756,6 +788,45 @@ mod tests {
             &mut epochs,
         );
         assert!(result.is_ok());
+        assert_eq!(
+            epochs.protocol_params.protocol_version_major, 7,
+            "Alonzo->Babbage HFC translation must bump protocol_version_major to 7 \
+             (issue #615 — same class as #481). Without this any `pv >= 7` gate \
+             (decentralization parameter override, etc.) silently fails.",
+        );
+        assert_eq!(epochs.protocol_params.protocol_version_minor, 0);
+    }
+
+    /// Defensive: when ctx.era is unexpected, do NOT clobber the PV.
+    #[test]
+    fn test_on_era_transition_babbage_unexpected_ctx_era_no_clobber() {
+        let rules = BabbageRules::new();
+        let mut params = ProtocolParameters::mainnet_defaults();
+        params.protocol_version_major = 9;
+        // Wrongly claim Conway so we can verify the guard.
+        let mut ctx = make_babbage_ctx(&params);
+        ctx.era = Era::Conway;
+        let mut utxo = make_utxo_sub(vec![]);
+        let mut certs = make_cert_sub();
+        let mut gov = make_gov_sub();
+        let mut consensus = make_consensus_sub();
+        let mut epochs = make_epoch_sub();
+        epochs.protocol_params.protocol_version_major = 9;
+
+        let result = rules.on_era_transition(
+            Era::Alonzo,
+            &ctx,
+            &mut utxo,
+            &mut certs,
+            &mut gov,
+            &mut consensus,
+            &mut epochs,
+        );
+        assert!(result.is_ok());
+        assert_eq!(
+            epochs.protocol_params.protocol_version_major, 9,
+            "BabbageRules must not bump PV when ctx.era != Babbage",
+        );
     }
 
     /// required_witnesses includes required_signers and excludes reference inputs.

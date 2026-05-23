@@ -629,55 +629,74 @@ impl EraRules for ShelleyRules {
 
     /// Handle hard fork state transformations when entering Shelley/Allegra/Mary.
     ///
-    /// - Byron -> Shelley: Staking state initialization from genesis would occur
-    ///   here. The current implementation returns Ok(()) — full TranslateEra
-    ///   logic (initial stake distribution from Byron UTxOs) can be added when
-    ///   the orchestrator (Task 12) wires era transitions.
-    /// - Shelley -> Allegra: No state transformation needed.
-    /// - Allegra -> Mary: No state transformation needed.
+    /// Each era boundary bumps `curPParams.protocol_version_major` to mirror the
+    /// HFC era-crossing tick in cardano-node. Dugite has no separate HFC layer —
+    /// era transitions are dispatched entirely in the ledger crate via
+    /// `block.era` — so we replicate the HFC's PV write here. Without these
+    /// bumps, dugite enters each post-Byron era still carrying the previous
+    /// era's PV, and any code path gated on `pv >= N` silently fails (cascade
+    /// of governance / reward / nonce-evolution divergences). Tracked as issue
+    /// #615, same class as the resolved Babbage→Conway PV9 bug (issue #481,
+    /// see `eras/conway.rs:835-856`).
+    ///
+    /// - Byron -> Shelley: bump PV to (2, 0). Staking state from genesis is
+    ///   already initialised during LedgerState construction (initial funds,
+    ///   genesis delegates), so no additional state transformation is needed.
+    /// - Shelley -> Allegra: bump PV to (3, 0). No other state changes.
+    /// - Allegra -> Mary: bump PV to (4, 0). No other state changes.
     fn on_era_transition(
         &self,
         from_era: Era,
-        _ctx: &RuleContext,
+        ctx: &RuleContext,
         _utxo: &mut UtxoSubState,
         _certs: &mut CertSubState,
         _gov: &mut GovSubState,
         _consensus: &mut ConsensusSubState,
-        _epochs: &mut EpochSubState,
+        epochs: &mut EpochSubState,
     ) -> Result<(), LedgerError> {
-        match from_era {
-            Era::Byron => {
-                // Byron→Shelley: In Haskell, translateToShelleyLedgerState converts
-                // Byron UTxOs and initializes staking from ShelleyGenesis.genDelegs.
-                // In dugite:
-                // - UTxOs are already in the unified set (no conversion needed)
-                // - Genesis delegates are loaded at node startup (node/mod.rs)
-                // - Initial funds/staking from ShelleyGenesis are applied during
-                //   LedgerState construction
-                // No state transformation needed at the era boundary.
-                debug!("Byron -> Shelley era transition (no state changes)");
-                Ok(())
-            }
-            Era::Shelley => {
-                // Shelley -> Allegra: no state transformation needed.
-                debug!("Shelley -> Allegra era transition (no state changes)");
-                Ok(())
-            }
-            Era::Allegra => {
-                // Allegra -> Mary: no state transformation needed.
-                debug!("Allegra -> Mary era transition (no state changes)");
-                Ok(())
-            }
+        // `ctx.era` is the destination era (from `block.era`); `from_era` is
+        // the source. ShelleyRules is dispatched for all three of
+        // Shelley/Allegra/Mary, so we discriminate by the destination so a
+        // skip-era apply (e.g. Mithril import jumping straight to Allegra/Mary)
+        // sets the correct PV for the era actually entered, rather than always
+        // bumping to PV2.
+        //
+        // Mirrors the HFC era-crossing tick in cardano-node, which always sets
+        // the new era's initial PV regardless of how many eras were stepped
+        // through.
+        let (new_major, new_minor) = match ctx.era {
+            Era::Shelley => (2, 0),
+            Era::Allegra => (3, 0),
+            Era::Mary => (4, 0),
             other => {
-                // Unexpected transition — this shouldn't happen but we handle it
-                // gracefully to avoid panics.
+                // ShelleyRules should never be dispatched for a non-S/A/M
+                // destination — EraRulesImpl::for_era keys this off block.era.
+                // Log and bail out without touching PV.
                 debug!(
-                    "Unexpected era transition from {:?} to Shelley/Allegra/Mary",
-                    other
+                    "ShelleyRules::on_era_transition called with unexpected ctx.era={:?} \
+                     (from_era={:?}); leaving protocol version untouched",
+                    other, from_era,
                 );
-                Ok(())
+                return Ok(());
             }
-        }
+        };
+        debug!(
+            "{:?} -> {:?} era transition: bumping protocol version to ({}, {})",
+            from_era, ctx.era, new_major, new_minor,
+        );
+
+        // Byron→Shelley side-note: In Haskell, translateToShelleyLedgerState
+        // also converts Byron UTxOs and initializes staking from
+        // ShelleyGenesis.genDelegs. In dugite:
+        // - UTxOs are already in the unified set (no conversion needed)
+        // - Genesis delegates are loaded at node startup (node/mod.rs)
+        // - Initial funds/staking from ShelleyGenesis are applied during
+        //   LedgerState construction
+        // The remaining HFC duty is the PV bump performed above.
+
+        epochs.protocol_params.protocol_version_major = new_major;
+        epochs.protocol_params.protocol_version_minor = new_minor;
+        Ok(())
     }
 
     /// Compute the set of required VKey witnesses for a Shelley/Allegra/Mary transaction.
@@ -1240,17 +1259,22 @@ mod tests {
         assert_eq!(fee, 164_181);
     }
 
-    /// Byron -> Shelley era transition succeeds.
+    /// Byron -> Shelley bumps protocol_version to (2, 0). Mirrors the HFC
+    /// era-crossing tick (issue #615, same class as resolved #481).
     #[test]
-    fn test_on_era_transition_byron_to_shelley() {
+    fn test_on_era_transition_byron_to_shelley_sets_pv2() {
         let rules = ShelleyRules::new();
-        let params = ProtocolParameters::mainnet_defaults();
-        let ctx = make_shelley_ctx(&params);
+        let mut params = ProtocolParameters::mainnet_defaults();
+        params.protocol_version_major = 1;
+        params.protocol_version_minor = 0;
+        let ctx = make_shelley_ctx(&params); // ctx.era = Era::Shelley
         let mut utxo = make_utxo_sub(vec![]);
         let mut certs = make_cert_sub();
         let mut gov = make_gov_sub();
         let mut epochs = make_epoch_sub();
         let mut consensus = make_consensus_sub();
+        epochs.protocol_params.protocol_version_major = 1;
+        epochs.protocol_params.protocol_version_minor = 0;
 
         let result = rules.on_era_transition(
             Era::Byron,
@@ -1262,19 +1286,25 @@ mod tests {
             &mut epochs,
         );
         assert!(result.is_ok());
+        assert_eq!(epochs.protocol_params.protocol_version_major, 2);
+        assert_eq!(epochs.protocol_params.protocol_version_minor, 0);
     }
 
-    /// Shelley -> Allegra era transition succeeds (no-op).
+    /// Shelley -> Allegra bumps protocol_version to (3, 0).
     #[test]
-    fn test_on_era_transition_shelley_to_allegra() {
+    fn test_on_era_transition_shelley_to_allegra_sets_pv3() {
         let rules = ShelleyRules::new();
-        let params = ProtocolParameters::mainnet_defaults();
-        let ctx = make_shelley_ctx(&params);
+        let mut params = ProtocolParameters::mainnet_defaults();
+        params.protocol_version_major = 2;
+        let mut ctx = make_shelley_ctx(&params);
+        ctx.era = Era::Allegra;
         let mut utxo = make_utxo_sub(vec![]);
         let mut certs = make_cert_sub();
         let mut gov = make_gov_sub();
         let mut epochs = make_epoch_sub();
         let mut consensus = make_consensus_sub();
+        epochs.protocol_params.protocol_version_major = 2;
+        epochs.protocol_params.protocol_version_minor = 0;
 
         let result = rules.on_era_transition(
             Era::Shelley,
@@ -1286,6 +1316,70 @@ mod tests {
             &mut epochs,
         );
         assert!(result.is_ok());
+        assert_eq!(epochs.protocol_params.protocol_version_major, 3);
+        assert_eq!(epochs.protocol_params.protocol_version_minor, 0);
+    }
+
+    /// Allegra -> Mary bumps protocol_version to (4, 0).
+    #[test]
+    fn test_on_era_transition_allegra_to_mary_sets_pv4() {
+        let rules = ShelleyRules::new();
+        let mut params = ProtocolParameters::mainnet_defaults();
+        params.protocol_version_major = 3;
+        let mut ctx = make_shelley_ctx(&params);
+        ctx.era = Era::Mary;
+        let mut utxo = make_utxo_sub(vec![]);
+        let mut certs = make_cert_sub();
+        let mut gov = make_gov_sub();
+        let mut epochs = make_epoch_sub();
+        let mut consensus = make_consensus_sub();
+        epochs.protocol_params.protocol_version_major = 3;
+        epochs.protocol_params.protocol_version_minor = 0;
+
+        let result = rules.on_era_transition(
+            Era::Allegra,
+            &ctx,
+            &mut utxo,
+            &mut certs,
+            &mut gov,
+            &mut consensus,
+            &mut epochs,
+        );
+        assert!(result.is_ok());
+        assert_eq!(epochs.protocol_params.protocol_version_major, 4);
+        assert_eq!(epochs.protocol_params.protocol_version_minor, 0);
+    }
+
+    /// Defensive: when ShelleyRules is dispatched but ctx.era is NOT in
+    /// {Shelley, Allegra, Mary}, do NOT clobber the protocol version.
+    #[test]
+    fn test_on_era_transition_shelleyrules_unexpected_ctx_era_no_clobber() {
+        let rules = ShelleyRules::new();
+        let params = ProtocolParameters::mainnet_defaults();
+        let mut ctx = make_shelley_ctx(&params);
+        ctx.era = Era::Conway; // shouldn't happen in production, defensive
+        let mut utxo = make_utxo_sub(vec![]);
+        let mut certs = make_cert_sub();
+        let mut gov = make_gov_sub();
+        let mut epochs = make_epoch_sub();
+        let mut consensus = make_consensus_sub();
+        epochs.protocol_params.protocol_version_major = 9;
+        epochs.protocol_params.protocol_version_minor = 0;
+
+        let result = rules.on_era_transition(
+            Era::Byron,
+            &ctx,
+            &mut utxo,
+            &mut certs,
+            &mut gov,
+            &mut consensus,
+            &mut epochs,
+        );
+        assert!(result.is_ok());
+        assert_eq!(
+            epochs.protocol_params.protocol_version_major, 9,
+            "ShelleyRules must not bump PV when ctx.era is outside Shelley/Allegra/Mary",
+        );
     }
 
     /// Basic epoch transition: fees reset, block count reset, mark snapshot created.

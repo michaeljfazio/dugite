@@ -188,21 +188,46 @@ impl EraRules for AlonzoRules {
 
     /// Handle hard fork state transformations when entering Alonzo.
     ///
-    /// Mary -> Alonzo: No major ledger state transformation is needed. Plutus
+    /// Mary -> Alonzo: bump the on-chain protocol version to (5, 0). Plutus
     /// scripts are new but do not change the ledger state shape. The new
     /// protocol parameters (cost models, execution costs, etc.) are set via
     /// the hard fork combinator genesis config, not via state transformation.
+    ///
+    /// In cardano-node the Mary→Alonzo era boundary is a hard fork. The HFC
+    /// era-crossing tick performs the PV5 bump. Dugite has no separate HFC
+    /// layer — era transitions are dispatched entirely in the ledger crate
+    /// via `block.era`. So we replicate the HFC's PV write here at the
+    /// Mary→Alonzo boundary. Note: PV6 is a subsequent intra-era ParameterChange
+    /// (the "Alonzo cost-model" hard fork) and continues to flow through the
+    /// normal PPUP path — we do not pre-bump to 6 here. Tracked as issue #615,
+    /// same class as the resolved Babbage→Conway PV9 bug (issue #481).
     fn on_era_transition(
         &self,
         from_era: Era,
-        _ctx: &RuleContext,
+        ctx: &RuleContext,
         _utxo: &mut UtxoSubState,
         _certs: &mut CertSubState,
         _gov: &mut GovSubState,
         _consensus: &mut ConsensusSubState,
-        _epochs: &mut EpochSubState,
+        epochs: &mut EpochSubState,
     ) -> Result<(), LedgerError> {
-        debug!("{:?} -> Alonzo era transition (no state changes)", from_era);
+        // Mirror cardano-node's HFC era-crossing tick: set the new era's
+        // initial PV. Guard by `ctx.era == Alonzo` so we never clobber if
+        // dispatched for any other destination (defensive).
+        if ctx.era == Era::Alonzo {
+            debug!(
+                "{:?} -> Alonzo era transition: bumping protocol version to (5, 0)",
+                from_era
+            );
+            epochs.protocol_params.protocol_version_major = 5;
+            epochs.protocol_params.protocol_version_minor = 0;
+        } else {
+            debug!(
+                "AlonzoRules::on_era_transition called with unexpected ctx.era={:?} \
+                 (from_era={:?}); leaving protocol version untouched",
+                ctx.era, from_era,
+            );
+        }
         Ok(())
     }
 
@@ -705,17 +730,23 @@ mod tests {
         assert_eq!(fee, 44 * 200 + 155381);
     }
 
-    /// on_era_transition succeeds without state changes.
+    /// Mary -> Alonzo bumps protocol_version to (5, 0). Mirrors the HFC
+    /// era-crossing tick in cardano-node — the same class as the resolved
+    /// Babbage→Conway PV9 bug (issue #481). See issue #615.
     #[test]
-    fn test_on_era_transition_succeeds() {
+    fn test_on_era_transition_mary_to_alonzo_sets_pv5() {
         let rules = AlonzoRules::new();
-        let params = ProtocolParameters::mainnet_defaults();
+        let mut params = ProtocolParameters::mainnet_defaults();
+        params.protocol_version_major = 4;
+        params.protocol_version_minor = 0;
         let ctx = make_alonzo_ctx(&params);
         let mut utxo = make_utxo_sub(vec![]);
         let mut certs = make_cert_sub();
         let mut gov = make_gov_sub();
         let mut consensus = make_consensus_sub();
         let mut epochs = make_epoch_sub();
+        epochs.protocol_params.protocol_version_major = 4;
+        epochs.protocol_params.protocol_version_minor = 0;
 
         let result = rules.on_era_transition(
             Era::Mary,
@@ -727,6 +758,44 @@ mod tests {
             &mut epochs,
         );
         assert!(result.is_ok());
+        assert_eq!(
+            epochs.protocol_params.protocol_version_major, 5,
+            "Mary->Alonzo HFC translation must bump protocol_version_major to 5 \
+             (issue #615 — same class as #481)",
+        );
+        assert_eq!(epochs.protocol_params.protocol_version_minor, 0);
+    }
+
+    /// Defensive: when ctx.era is unexpected, do NOT clobber the PV.
+    #[test]
+    fn test_on_era_transition_alonzo_unexpected_ctx_era_no_clobber() {
+        let rules = AlonzoRules::new();
+        let mut params = ProtocolParameters::mainnet_defaults();
+        params.protocol_version_major = 8;
+        // Build a ctx that wrongly claims Babbage so we can verify the guard.
+        let mut ctx = make_alonzo_ctx(&params);
+        ctx.era = Era::Babbage;
+        let mut utxo = make_utxo_sub(vec![]);
+        let mut certs = make_cert_sub();
+        let mut gov = make_gov_sub();
+        let mut consensus = make_consensus_sub();
+        let mut epochs = make_epoch_sub();
+        epochs.protocol_params.protocol_version_major = 8;
+
+        let result = rules.on_era_transition(
+            Era::Mary,
+            &ctx,
+            &mut utxo,
+            &mut certs,
+            &mut gov,
+            &mut consensus,
+            &mut epochs,
+        );
+        assert!(result.is_ok());
+        assert_eq!(
+            epochs.protocol_params.protocol_version_major, 8,
+            "AlonzoRules must not bump PV when ctx.era != Alonzo",
+        );
     }
 
     /// required_witnesses includes required_signers (Alonzo addition).
