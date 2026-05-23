@@ -144,13 +144,13 @@ if [[ $HAS_NIX -eq 1 ]]; then
     nix develop "${CLONE_DIR}" --command bash -c "
         cd '${CLONE_DIR}'
         cabal update
-        cabal build dugite-fixture-gen 2>&1 | tail -30
+        cabal build dugite-fixture-gen 2>&1 | tail -100
     "
 else
     (
         cd "${CLONE_DIR}"
         cabal update
-        cabal build dugite-fixture-gen 2>&1 | tail -30
+        cabal build dugite-fixture-gen 2>&1 | tail -100
     )
 fi
 
