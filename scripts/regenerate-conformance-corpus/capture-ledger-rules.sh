@@ -18,15 +18,17 @@
 # that all cardano-ledger-* dependency versions match exactly — no separate
 # cabal freeze file or version negotiation needed.
 #
-# ## Output layout (4 files per test-case directory)
+# ## Output layout (5 files per test-case directory; st_out is optional)
 #
-#   content/ConwayNEWEPOCH/<test_name>/conformance_dump_ctx.cbor   — CBOR null (0xF6)
-#   content/ConwayNEWEPOCH/<test_name>/conformance_dump_env.cbor   — CBOR null (0xF6)
-#   content/ConwayNEWEPOCH/<test_name>/conformance_dump_st.cbor    — NewEpochState array(7)
-#   content/ConwayNEWEPOCH/<test_name>/conformance_dump_sig.cbor   — EpochNo (CBOR uint)
+#   content/ConwayNEWEPOCH/<test_name>/conformance_dump_ctx.cbor     — CBOR null (0xF6)
+#   content/ConwayNEWEPOCH/<test_name>/conformance_dump_env.cbor     — CBOR null (0xF6)
+#   content/ConwayNEWEPOCH/<test_name>/conformance_dump_st.cbor      — NewEpochState array(7)
+#   content/ConwayNEWEPOCH/<test_name>/conformance_dump_sig.cbor     — EpochNo (CBOR uint)
+#   content/ConwayNEWEPOCH/<test_name>/conformance_dump_st_out.cbor  — Haskell final state (if STS succeeded)
 #
 # ctx/env are CBOR null (0xF6) because the NEWEPOCH rule uses () for both,
 # and Haskell's `EncCBOR ()` instance is `encodeNull`.
+# st_out is absent when the STS rule rejects the transition (e.g. signal == initial_epoch).
 #
 # The first real corpus run is expected to surface ledger bugs. Each failure
 # is tracked as a separate issue and added to SKIP_LIST in mod.rs.
@@ -81,11 +83,12 @@ To generate real CBOR conformance vectors:
 The generator (tools/ledger-fixture-gen/) builds as a sub-package inside
 the cloned cardano-ledger workspace and produces Conway NEWEPOCH fixtures.
 
-Vector format: 4 files per test-case directory
-  ConwayNEWEPOCH/<test_name>/conformance_dump_ctx.cbor  — CBOR null (0xF6, EncCBOR ())
-  ConwayNEWEPOCH/<test_name>/conformance_dump_env.cbor  — CBOR null (0xF6, EncCBOR ())
-  ConwayNEWEPOCH/<test_name>/conformance_dump_st.cbor   — NewEpochState array(7)
-  ConwayNEWEPOCH/<test_name>/conformance_dump_sig.cbor  — EpochNo (CBOR uint)
+Vector format: 5 files per test-case directory (st_out is optional)
+  ConwayNEWEPOCH/<test_name>/conformance_dump_ctx.cbor     — CBOR null (0xF6, EncCBOR ())
+  ConwayNEWEPOCH/<test_name>/conformance_dump_env.cbor     — CBOR null (0xF6, EncCBOR ())
+  ConwayNEWEPOCH/<test_name>/conformance_dump_st.cbor      — NewEpochState array(7)
+  ConwayNEWEPOCH/<test_name>/conformance_dump_sig.cbor     — EpochNo (CBOR uint)
+  ConwayNEWEPOCH/<test_name>/conformance_dump_st_out.cbor  — Haskell final state (if STS succeeded)
 
 The Phase 4 test module (ledger_rules_replay) will skip gracefully
 until real fixture directories are present (only the synthetic
@@ -167,19 +170,26 @@ else
     )
 fi
 
-# ── Mirror 4-file test-case directories into content structure ────────────────
+# ── Mirror test-case directories into content structure ───────────────────────
 #
 # The generator writes:
 #   <DUMP_DIR>/ConwayNEWEPOCH/<test_name>/conformance_dump_{ctx,env,st,sig}.cbor
+#   <DUMP_DIR>/ConwayNEWEPOCH/<test_name>/conformance_dump_st_out.cbor  (optional)
 #
-# We copy each 4-file test-case directory verbatim into CONTENT_DIR so the
-# Rust test module can scan subdirectories and find all 4 files.
+# We copy each test-case directory verbatim into CONTENT_DIR so the
+# Rust test module can scan subdirectories and find all required files.
+# The optional st_out file is copied when present.
 #
 REQUIRED_FILES=(
     "conformance_dump_ctx.cbor"
     "conformance_dump_env.cbor"
     "conformance_dump_st.cbor"
     "conformance_dump_sig.cbor"
+)
+
+# Optional file: present when the STS rule accepted the transition.
+OPTIONAL_FILES=(
+    "conformance_dump_st_out.cbor"
 )
 
 TEST_CASE_COUNT=0
@@ -205,12 +215,20 @@ for rule_dir in "${DUMP_DIR}"/*/; do
         done
         [[ $all_present -eq 0 ]] && continue
 
-        # Copy all 4 files into the content tree.
+        # Copy all 4 required files into the content tree.
         dest="${CONTENT_DIR}/${rule}/${test_name}"
         mkdir -p "${dest}"
         for req in "${REQUIRED_FILES[@]}"; do
             cp "${test_case_dir}/${req}" "${dest}/"
         done
+
+        # Copy optional files (st_out) when present.
+        for opt in "${OPTIONAL_FILES[@]}"; do
+            if [[ -f "${test_case_dir}/${opt}" ]]; then
+                cp "${test_case_dir}/${opt}" "${dest}/"
+            fi
+        done
+
         ((TEST_CASE_COUNT++))
         rule_found=1
     done

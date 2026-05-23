@@ -305,6 +305,7 @@ pub fn run_all_checks(dir: &Path) {
                 reserves,
                 utxo_count,
                 pool_count,
+                final_state_validated,
             } => {
                 let acct = match (treasury, reserves) {
                     (Some(t), Some(r)) => {
@@ -318,9 +319,14 @@ pub fn run_all_checks(dir: &Path) {
                 let pool_info = pool_count
                     .map(|n| format!(" pools={n}"))
                     .unwrap_or_default();
+                let st_out_info = if *final_state_validated {
+                    " [st_out=ok]"
+                } else {
+                    " [st_out=absent]"
+                };
                 eprintln!(
                     "[ledger-rules] PASS {label} rule={}: NEWEPOCH {initial_epoch} → {signal_epoch}\
-                     {acct}{utxo_info}{pool_info} (state shape: {})",
+                     {acct}{utxo_info}{pool_info}{st_out_info} (state shape: {})",
                     vec.rule, state.shape
                 );
                 passed += 1;

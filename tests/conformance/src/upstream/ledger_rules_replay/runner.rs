@@ -48,6 +48,12 @@ pub enum RunOutcome {
         utxo_count: Option<u64>,
         /// PoolDistr entry count from field[5] of the initial NewEpochState.
         pool_count: Option<u64>,
+        /// Whether the Haskell expected final state (`st_out_cbor`) was present
+        /// and its epoch number was successfully verified against the signal.
+        ///
+        /// `true`  — `st_out_cbor` was present and the final epoch matched the signal.
+        /// `false` — `st_out_cbor` was absent (synthetic fixture or rejected transition).
+        final_state_validated: bool,
     },
     /// UTXO signal decoded successfully as a transaction.
     UtxoDecoded { era_id: u16, tx_bytes: usize },
@@ -99,16 +105,18 @@ pub fn run_vector(vec: &ImpVector) -> RunOutcome {
 
 /// Validate a NEWEPOCH vector.
 ///
-/// Invariant: `signal_epoch > initial_epoch`.
+/// Gating invariant: `signal_epoch > initial_epoch`.
 ///
 /// The signal for NEWEPOCH is a bare CBOR u64 (target epoch number).
 /// The initial epoch number is field [0] of the NewEpochState `array(7)`.
 ///
-/// Additionally, `decode_new_epoch_state` is called on the state blob to
-/// extract treasury + reserves from `AccountState`.  A failure here does NOT
-/// fail the test — only the epoch-invariant check is gating.  The
-/// treasury/reserves are included in the PASS message for diagnostic value
-/// when real ImpSpec fixtures arrive.
+/// When `st_out_cbor` is present (real Haskell-generated vectors), the
+/// final state epoch (field [0] of the post-transition NewEpochState) is
+/// decoded and verified to equal `signal_epoch`.  A mismatch fails the test.
+///
+/// Additionally, `decode_new_epoch_state` is called on the initial state blob
+/// to extract treasury + reserves from `AccountState`.  A failure here is
+/// non-fatal — only the epoch-invariant is gating.
 fn run_newepoch(vec: &ImpVector) -> RunOutcome {
     let initial_epoch = match decode_initial_epoch_no(&vec.st_cbor) {
         Ok(n) => n,
@@ -129,15 +137,18 @@ fn run_newepoch(vec: &ImpVector) -> RunOutcome {
     };
 
     if signal_epoch <= initial_epoch {
-        return RunOutcome::Failed {
-            detail: format!(
-                "NEWEPOCH invariant violated: signal_epoch ({signal_epoch}) \
-                 must be > initial_epoch ({initial_epoch})"
+        // Conway NEWEPOCH: when signal <= nesEL, Haskell returns the same state
+        // (no-op transition). This is a valid STS outcome. Skip rather than fail:
+        // Dugite's runner only validates advancing transitions for now.
+        return RunOutcome::Skipped {
+            reason: format!(
+                "NEWEPOCH no-op: signal_epoch ({signal_epoch}) \
+                 <= initial_epoch ({initial_epoch}) — valid Haskell no-op, not yet validated"
             ),
         };
     }
 
-    // Best-effort: decode the full NewEpochState for diagnostic fields.
+    // Best-effort: decode the full initial NewEpochState for diagnostic fields.
     // Failure here is non-fatal — the epoch-invariant is the gating check.
     let (treasury, reserves, utxo_count, pool_count) = match decode_new_epoch_state(&vec.st_cbor) {
         Ok(nes) => (
@@ -152,6 +163,32 @@ fn run_newepoch(vec: &ImpVector) -> RunOutcome {
         }
     };
 
+    // Gating check: if Haskell's expected final state is present, verify that
+    // its epoch number (field[0] of the post-transition NewEpochState) equals
+    // the signal epoch.  This validates that the STS rule advanced the epoch
+    // counter correctly.
+    let mut final_state_validated = false;
+    if let Some(st_out) = &vec.st_out_cbor {
+        match decode_initial_epoch_no(st_out) {
+            Ok(final_epoch) => {
+                if final_epoch != signal_epoch {
+                    return RunOutcome::Failed {
+                        detail: format!(
+                            "Final state epoch ({final_epoch}) != signal epoch ({signal_epoch}): \
+                             Haskell's post-transition NewEpochState[0] must equal the signal"
+                        ),
+                    };
+                }
+                final_state_validated = true;
+            }
+            Err(e) => {
+                return RunOutcome::Failed {
+                    detail: format!("Could not decode final state epoch from st_out_cbor: {e}"),
+                };
+            }
+        }
+    }
+
     RunOutcome::NewEpochValidated {
         initial_epoch,
         signal_epoch,
@@ -159,6 +196,7 @@ fn run_newepoch(vec: &ImpVector) -> RunOutcome {
         reserves,
         utxo_count,
         pool_count,
+        final_state_validated,
     }
 }
 

@@ -107,10 +107,16 @@ applyNewEpoch st epochNo =
     Left  failures -> Left $ "NEWEPOCH STS failed (" ++ show (length failures) ++ " failures)"
     Right st'      -> Right st'
 
--- | Generate one test-case directory with 4 CBOR files.
+-- | Generate one test-case directory with 5 CBOR files.
 --
 -- ctx and env for NEWEPOCH are both (), which Haskell serializes as
 -- CBOR null (0xF6) via `EncCBOR () = encodeNull`.
+--
+-- The 5th file (`conformance_dump_st_out.cbor`) is Haskell's expected
+-- final state after applying the NEWEPOCH STS rule.  If `applyNewEpoch`
+-- fails (e.g. the signal is idempotent or violates a precondition), a
+-- warning is printed and the file is omitted; the test still exercises
+-- the input-parsing path.
 generateNewEpochVector
   :: FilePath                 -- ^ Output root directory
   -> String                   -- ^ Test name (sub-directory name)
@@ -128,6 +134,13 @@ generateNewEpochVector outDir testName st sig = do
   encodeFile (dir </> "conformance_dump_st.cbor")  st
   -- sig = EpochNo (CBOR uint).
   encodeFile (dir </> "conformance_dump_sig.cbor") sig
+  -- st_out = Haskell's expected final state after applying NEWEPOCH.
+  -- Omitted (with a warning) if the STS rule rejects the transition.
+  case applyNewEpoch st sig of
+    Left err ->
+      putStrLn $ "  [warn] " ++ testName ++ ": STS failed, st_out omitted: " ++ err
+    Right st' ->
+      encodeFile (dir </> "conformance_dump_st_out.cbor") st'
   putStrLn $ "  [ok] ConwayNEWEPOCH/" ++ testName
 
 

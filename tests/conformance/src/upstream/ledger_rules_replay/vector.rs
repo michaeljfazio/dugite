@@ -1,14 +1,20 @@
 //! CBOR decode for ImpSpec dump vectors.
 //!
-//! The cardano-ledger ImpSpec conformance framework (with `CONFORMANCE_CBOR_DUMP_PATH`
-//! set) produces **4 separate CBOR files per test case directory**:
+//! The dugite-fixture-gen Haskell generator produces **5 separate CBOR files
+//! per test case directory** (the original 4 ImpSpec files plus the expected
+//! final state):
 //!
 //! ```text
-//! conformance_dump_ctx.cbor   — ExecContext  (CBOR null `F6` for NEWEPOCH — EncCBOR () = encodeNull)
-//! conformance_dump_env.cbor   — Environment  (CBOR null `F6` for NEWEPOCH — EncCBOR () = encodeNull)
-//! conformance_dump_st.cbor    — State = NewEpochState as array(7)
-//! conformance_dump_sig.cbor   — Signal (u64 EpochNo for NEWEPOCH; tx CBOR for UTXO)
+//! conformance_dump_ctx.cbor     — ExecContext  (CBOR null `F6` for NEWEPOCH — EncCBOR () = encodeNull)
+//! conformance_dump_env.cbor     — Environment  (CBOR null `F6` for NEWEPOCH — EncCBOR () = encodeNull)
+//! conformance_dump_st.cbor      — State = NewEpochState as array(7)  (initial, before transition)
+//! conformance_dump_sig.cbor     — Signal (u64 EpochNo for NEWEPOCH; tx CBOR for UTXO)
+//! conformance_dump_st_out.cbor  — Expected final state from Haskell (optional — absent when STS rejects)
 //! ```
+//!
+//! The first 4 files are required (`REQUIRED_FILES`).  `st_out` is optional:
+//! real Haskell vectors have it; synthetic fixtures and rejected-transition
+//! vectors do not.
 //!
 //! The `rule` is derived from the parent directory name (e.g. "ConwayNEWEPOCH",
 //! "ConwayUTXO").
@@ -27,9 +33,9 @@
 
 use std::path::Path;
 
-/// A test vector decoded from a 4-file ImpSpec dump directory.
+/// A test vector decoded from a test-case ImpSpec dump directory.
 ///
-/// All four blobs are kept as raw CBOR bytes so that downstream modules
+/// All CBOR blobs are kept as raw bytes so that downstream modules
 /// (`bridge.rs`, `runner.rs`, `compare.rs`) can inspect them without
 /// coupling to a particular typed decode path.
 #[derive(Debug)]
@@ -40,25 +46,35 @@ pub struct ImpVector {
     pub ctx_cbor: Vec<u8>,
     /// Raw CBOR bytes of `conformance_dump_env.cbor` (Environment).
     pub env_cbor: Vec<u8>,
-    /// Raw CBOR bytes of `conformance_dump_st.cbor` (State = NewEpochState array(7)).
+    /// Raw CBOR bytes of `conformance_dump_st.cbor` (State = NewEpochState array(7), initial).
     pub st_cbor: Vec<u8>,
     /// Raw CBOR bytes of `conformance_dump_sig.cbor` (Signal).
     pub sig_cbor: Vec<u8>,
+    /// Raw CBOR bytes of `conformance_dump_st_out.cbor` (expected final state from Haskell).
+    ///
+    /// `None` when the file is absent — e.g. for synthetic fixtures or when the
+    /// Haskell STS rule rejected the transition (signal out of range, idempotent epoch, etc.).
+    /// Real Haskell-generated vectors always include this file for successful transitions.
+    pub st_out_cbor: Option<Vec<u8>>,
 }
 
-/// Decode an ImpSpec dump vector from a 4-file test directory.
+/// Decode an ImpSpec dump vector from a test-case directory.
 ///
-/// `dir` must contain:
+/// `dir` must contain the 4 required files:
 ///   - `conformance_dump_ctx.cbor`
 ///   - `conformance_dump_env.cbor`
 ///   - `conformance_dump_st.cbor`
 ///   - `conformance_dump_sig.cbor`
 ///
+/// The optional 5th file `conformance_dump_st_out.cbor` (Haskell expected
+/// final state) is read if present; `st_out_cbor` is `None` otherwise.
+///
 /// The `rule` field is taken from `dir`'s parent directory name
 /// (the rule directory, e.g. `ConwayNEWEPOCH/test_minimal_epoch_advance` →
 /// `rule = "ConwayNEWEPOCH"`).
 ///
-/// Returns `Err` with a human-readable message on any missing file or I/O failure.
+/// Returns `Err` with a human-readable message on any missing required file
+/// or I/O failure.
 pub fn decode_vector(dir: &Path) -> Result<ImpVector, String> {
     let rule = rule_from_dir(dir);
 
@@ -67,12 +83,17 @@ pub fn decode_vector(dir: &Path) -> Result<ImpVector, String> {
     let st_cbor = read_file(dir, "conformance_dump_st.cbor")?;
     let sig_cbor = read_file(dir, "conformance_dump_sig.cbor")?;
 
+    // Optional 5th file: Haskell's expected final state.
+    // Present in real Haskell-generated vectors; absent in synthetic fixtures.
+    let st_out_cbor = std::fs::read(dir.join("conformance_dump_st_out.cbor")).ok();
+
     Ok(ImpVector {
         rule,
         ctx_cbor,
         env_cbor,
         st_cbor,
         sig_cbor,
+        st_out_cbor,
     })
 }
 

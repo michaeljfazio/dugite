@@ -13,10 +13,11 @@ description:
     rule via `applySTS`, and serializes the initial state + signal as CBOR.
 
     Each test case directory contains:
-      conformance_dump_ctx.cbor   -- unit () encoded as CBOR null (0xF6)
-      conformance_dump_env.cbor   -- unit () encoded as CBOR null (0xF6)
-      conformance_dump_st.cbor    -- NewEpochState (initial, before transition)
-      conformance_dump_sig.cbor   -- EpochNo signal (CBOR uint)
+      conformance_dump_ctx.cbor     -- unit () encoded as CBOR null (0xF6)
+      conformance_dump_env.cbor     -- unit () encoded as CBOR null (0xF6)
+      conformance_dump_st.cbor      -- NewEpochState (initial, before transition)
+      conformance_dump_sig.cbor     -- EpochNo signal (CBOR uint)
+      conformance_dump_st_out.cbor  -- NewEpochState (final, after Haskell STS transition; omitted if STS rejects)
 
 license:            Apache-2.0
 author:             Dugite contributors
