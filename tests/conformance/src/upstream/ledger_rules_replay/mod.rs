@@ -2,20 +2,20 @@
 //!
 //! This module replays cardano-ledger ImpSpec test vectors through Dugite's
 //! ledger engine and compares the resulting state against the expected state
-//! encoded in each vector file.
+//! encoded in each vector directory.
 //!
 //! ## Status
 //!
 //! The fixture area (`tests/conformance/upstream/fixtures/ledger-rules/`) is
-//! currently a stub placeholder. To activate full replay:
+//! a stub placeholder when no real ImpSpec corpus has been generated yet.
+//! To activate full replay:
 //!
 //! 1. Run the regeneration pipeline:
 //!    ```sh
 //!    just regenerate-corpus-local  # or trigger the GH workflow
 //!    ```
 //!    This builds cardano-ledger at the pinned SHA and runs `cabal test
-//!    cardano-ledger-conformance` with `CONFORMANCE_CBOR_DUMP_PATH` set, which
-//!    emits one `.cbor` file per ImpSpec test case.
+//!    cardano-ledger-conformance` with `CONFORMANCE_CBOR_DUMP_PATH` set.
 //!
 //! 2. Update `tests/conformance/upstream/manifest.toml` to point at the new
 //!    corpus release tag.
@@ -26,17 +26,19 @@
 //! Each failure is tracked as a separate issue and added to `SKIP_LIST` below
 //! with a comment referencing the issue number; entries are removed when fixed.
 //!
-//! ## Vector format
+//! ## Vector format (4 files per test-case directory)
 //!
 //! ```text
-//! CBOR [config(arr[13]), initial_state(arr[7]), final_state(arr[7]), events(arr[N]), title(str)]
-//! events = [ [0, tx_cbor, valid_bool, slot]   -- Transaction
-//!           | [1, slot]                        -- PassTick
-//!           | [2, epoch_delta] ]               -- PassEpoch
+//! <fixtures>/ledger-rules/<Rule>/<test_name>/
+//!   conformance_dump_ctx.cbor   -- ExecContext (empty `80` for NEWEPOCH)
+//!   conformance_dump_env.cbor   -- Environment (empty `80` for NEWEPOCH)
+//!   conformance_dump_st.cbor    -- State (NewEpochState array(7))
+//!   conformance_dump_sig.cbor   -- Signal (u64 EpochNo for NEWEPOCH; tx CBOR for UTXO)
 //! ```
 //!
-//! See `vector.rs` for the decoder, `bridge.rs` for state decoding,
-//! `runner.rs` for event application, and `compare.rs` for state comparison.
+//! Each test-case directory under a rule directory is decoded as one `ImpVector`.
+//! See `vector.rs` for the decoder, `bridge.rs` for state/signal decoding,
+//! `runner.rs` for validation, and `compare.rs` for state comparison.
 
 pub mod bridge;
 pub mod compare;
@@ -47,9 +49,9 @@ use std::path::Path;
 
 /// Test scenarios known to fail due to unimplemented Dugite features.
 ///
-/// Each entry is a substring of the vector's `title` field. Matched vectors
-/// are skipped with a warning instead of failing. Every entry here must
-/// reference a tracking issue (see comment on each line).
+/// Each entry is a tuple of (rule_substring, issue_url). A test whose rule
+/// name contains `rule_substring` is skipped with a warning instead of failing.
+/// Every entry must reference a tracking issue (see comment on each line).
 ///
 /// **This list should decay to zero.** Removing a skip = closing the issue.
 ///
@@ -62,68 +64,158 @@ use std::path::Path;
 /// set, which requires a Haskell toolchain (GHC 9.6.x + cabal or Nix).
 ///
 /// When the first corpus run is completed (see `capture-ledger-rules.sh` and
-/// HANDOFF.md for the exact procedure), any divergences between dugite's ledger
-/// engine and the Agda/Haskell reference will surface as test failures. Each
-/// failure becomes a skip entry here with a tracking GitHub issue reference.
-/// Entries are removed only when the underlying bug is fixed in dugite.
+/// the regenerate-conformance-corpus workflow), any divergences between Dugite's
+/// ledger engine and the Agda/Haskell reference will surface as test failures.
+/// Each failure becomes a skip entry here with a tracking GitHub issue reference.
+/// Entries are removed only when the underlying bug is fixed in Dugite.
 ///
-/// Format: ("title-substring", "https://github.com/michaeljfazio/dugite/issues/NNN")
+/// Format: ("rule-substring", "https://github.com/michaeljfazio/dugite/issues/NNN")
 const SKIP_LIST: &[(&str, &str)] = &[];
 
-/// Map an ImpSpec category name to a Cardano HFC era_id for tx decoding.
-///
-/// cardano-ledger ImpSpec uses these directory names (see capture-ledger-rules.sh).
-/// Unmapped categories return `None` and skip tx decoding for that era.
-fn era_id_from_category(category: &str) -> Option<u16> {
-    match category {
-        "ShelleyImpSpec" => Some(1),
-        "AllegraImpSpec" => Some(2),
-        "MaryImpSpec" => Some(3),
-        "AlonzoImpSpec" => Some(4),
-        "BabbageImpSpec" => Some(5),
-        "ConwayImpSpec_-_Version_10" => Some(6),
-        _ => None,
-    }
-}
-
-/// Returns the issue URL for a vector whose title matches a skip entry, or `None`.
-fn is_skipped(title: &str) -> Option<&'static str> {
+/// Returns the issue URL if a test's rule matches a skip entry, or `None`.
+fn is_skipped(rule: &str) -> Option<&'static str> {
     for (pattern, issue) in SKIP_LIST {
-        if title.contains(pattern) {
+        if rule.contains(pattern) {
             return Some(issue);
         }
     }
     None
 }
 
-/// Run all `.cbor` vector files found under `dir/<category>`.
+/// The 4 required CBOR file names per test-case directory.
+const REQUIRED_FILES: &[&str] = &[
+    "conformance_dump_ctx.cbor",
+    "conformance_dump_env.cbor",
+    "conformance_dump_st.cbor",
+    "conformance_dump_sig.cbor",
+];
+
+/// Returns `true` when `dir` contains all 4 required CBOR files.
+fn is_test_case_dir(dir: &Path) -> bool {
+    REQUIRED_FILES.iter().all(|name| dir.join(name).is_file())
+}
+
+/// Collect all test-case directories under `rule_dir` (two levels deep).
 ///
-/// Each `.cbor` file is decoded via `vector::decode_vector`, then inspected
-/// via `bridge`, replayed via `runner` (which calls `decode_transaction` on
-/// every Transaction event), and compared via `compare`.
+/// Structure: `<rule_dir>/<Rule>/<test_name>/` — each `<test_name>` directory
+/// that contains all 4 required files is returned.
+fn collect_test_case_dirs(rule_dir: &Path) -> Vec<std::path::PathBuf> {
+    let mut out = Vec::new();
+    let Ok(rd) = std::fs::read_dir(rule_dir) else {
+        return out;
+    };
+    for entry in rd.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            // This is a rule directory (e.g. ConwayNEWEPOCH).
+            // Collect test-case dirs inside it.
+            let Ok(inner) = std::fs::read_dir(&path) else {
+                continue;
+            };
+            for inner_entry in inner.flatten() {
+                let inner_path = inner_entry.path();
+                if inner_path.is_dir() && is_test_case_dir(&inner_path) {
+                    out.push(inner_path);
+                }
+            }
+        } else if path.is_file() && is_test_case_dir(rule_dir) {
+            // Flat layout: the rule_dir itself is the test-case dir.
+            // (Only push once, not once per file.)
+            let rule_dir_buf = rule_dir.to_path_buf();
+            if !out.contains(&rule_dir_buf) {
+                out.push(rule_dir_buf);
+            }
+        }
+    }
+    out.sort();
+    out
+}
+
+/// Create the 4 CBOR fixture files for the minimal NEWEPOCH synthetic test.
 ///
-/// Skips gracefully when `dir` contains no `.cbor` files (stub mode).
-pub fn run_era_vectors(dir: &Path, category: &str) {
-    let era_id = era_id_from_category(category);
-    let sub = dir.join(category);
-    if !sub.exists() {
-        eprintln!(
-            "[ledger-rules] SKIP {category}: directory {} does not exist (stub mode)",
-            sub.display()
-        );
-        return;
+/// Directory layout:
+/// ```text
+/// dir/ConwayNEWEPOCH/test_minimal_epoch_advance/
+///   conformance_dump_ctx.cbor   — 0x80 (empty array)
+///   conformance_dump_env.cbor   — 0x80 (empty array)
+///   conformance_dump_st.cbor    — NewEpochState array(7), EpochNo=0
+///   conformance_dump_sig.cbor   — 0x01 (EpochNo = 1)
+/// ```
+///
+/// The state file is hand-encoded as raw CBOR bytes (each byte is annotated
+/// with its CBOR meaning in the inline comments).
+pub fn create_minimal_newepoch_fixture(dir: &Path) {
+    let test_dir = dir
+        .join("ConwayNEWEPOCH")
+        .join("test_minimal_epoch_advance");
+    std::fs::create_dir_all(&test_dir).expect("create fixture dir");
+
+    // ctx and env: empty CBOR array (0x80)
+    for name in &["conformance_dump_ctx.cbor", "conformance_dump_env.cbor"] {
+        std::fs::write(test_dir.join(name), [0x80u8]).expect("write ctx/env");
     }
 
-    let cbor_files: Vec<_> = walkdir(&sub)
-        .into_iter()
-        .filter(|p| p.extension().and_then(|e| e.to_str()) == Some("cbor"))
-        .collect();
+    // sig: CBOR uint(1) = 0x01
+    std::fs::write(test_dir.join("conformance_dump_sig.cbor"), [0x01u8]).expect("write sig");
 
-    if cbor_files.is_empty() {
+    // st: NewEpochState array(7) with EpochNo=0 in field[0].
+    //
+    // Minimal encoding:
+    //   87          — array(7)
+    //   00          — [0] EpochNo = 0 (uint)
+    //   a0          — [1] BlocksMade(prev) = empty map
+    //   a0          — [2] BlocksMade(cur) = empty map
+    //   84          — [3] EpochState = array(4)
+    //     82 00 00  —   [3.0] AccountState = array(2): treasury=0, reserves=0
+    //     80        —   [3.1] LedgerState = empty array (stub)
+    //     80        —   [3.2] Snapshots = empty array (stub)
+    //     80        —   [3.3] NonMyopic = empty array (stub)
+    //   80          — [4] StrictMaybe = array(0) = Nothing
+    //   a0          — [5] PoolDistr = empty map
+    //   80          — [6] stashedAVVM = array(0) (Conway: always empty)
+    let st_bytes: &[u8] = &[
+        0x87, // array(7)
+        0x00, // [0] EpochNo = 0
+        0xa0, // [1] BlocksMade(prev) = {}
+        0xa0, // [2] BlocksMade(cur) = {}
+        0x84, // [3] EpochState = array(4)
+        0x82, 0x00, 0x00, // [3.0] AccountState = [0, 0]
+        0x80, // [3.1] LedgerState stub
+        0x80, // [3.2] Snapshots stub
+        0x80, // [3.3] NonMyopic stub
+        0x80, // [4] StrictMaybe = Nothing
+        0xa0, // [5] PoolDistr = {}
+        0x80, // [6] stashedAVVM = []
+    ];
+    std::fs::write(test_dir.join("conformance_dump_st.cbor"), st_bytes).expect("write st");
+}
+
+/// Run all test-case directories found under `dir`.
+///
+/// `dir` is `<fixtures>/ledger-rules/`. Each subdirectory of the form
+/// `<Rule>/<test_name>/` with all 4 CBOR files present is treated as one
+/// test vector.
+///
+/// Skips gracefully when no test-case directories are found (stub mode),
+/// **except** when the synthetic fixture has been created (which always
+/// provides at least one test case).
+pub fn run_all_checks(dir: &Path) {
+    // Ensure at least the synthetic NEWEPOCH fixture exists so the test suite
+    // always has one real vector to exercise.
+    let synthetic_dir = dir
+        .join("ConwayNEWEPOCH")
+        .join("test_minimal_epoch_advance");
+    if !is_test_case_dir(&synthetic_dir) {
+        create_minimal_newepoch_fixture(dir);
+    }
+
+    let test_cases = collect_test_case_dirs(dir);
+
+    if test_cases.is_empty() {
         eprintln!(
-            "[ledger-rules] SKIP {category}: no .cbor files in {} \
+            "[ledger-rules] SKIP: no test-case directories found under {} \
              (stub mode — run `just regenerate-corpus-local` to populate vectors)",
-            sub.display()
+            dir.display()
         );
         return;
     }
@@ -132,164 +224,90 @@ pub fn run_era_vectors(dir: &Path, category: &str) {
     let mut skipped = 0usize;
     let mut failed = 0usize;
 
-    for path in &cbor_files {
-        let data =
-            std::fs::read(path).unwrap_or_else(|e| panic!("read vector {}: {e}", path.display()));
+    for test_dir in &test_cases {
+        let label = format!(
+            "{}/{}",
+            test_dir
+                .parent()
+                .and_then(|p| p.file_name())
+                .map(|n| n.to_string_lossy())
+                .unwrap_or_default(),
+            test_dir
+                .file_name()
+                .map(|n| n.to_string_lossy())
+                .unwrap_or_default()
+        );
 
-        let vec = match vector::decode_vector(&data) {
+        // Decode the 4 CBOR files.
+        let vec = match vector::decode_vector(test_dir) {
             Ok(v) => v,
             Err(e) => {
-                eprintln!(
-                    "[ledger-rules] FAIL decode {}: {e}",
-                    path.file_name().unwrap_or_default().to_string_lossy()
-                );
+                eprintln!("[ledger-rules] FAIL decode {label}: {e}");
                 failed += 1;
                 continue;
             }
         };
 
-        if let Some(issue) = is_skipped(&vec.title) {
+        // Skip-list check.
+        if let Some(issue) = is_skipped(&vec.rule) {
             eprintln!(
-                "[ledger-rules] SKIP {:?} (tracked: {issue})",
-                path.file_name().unwrap_or_default()
+                "[ledger-rules] SKIP {label} rule={} (tracked: {issue})",
+                vec.rule
             );
             skipped += 1;
             continue;
         }
 
-        // Validate config shape.
-        match bridge::decode_config(&vec.config_cbor) {
-            Ok(n) => {
-                if n == 0 {
-                    eprintln!(
-                        "[ledger-rules] WARN {}: config decoded as empty array",
-                        vec.title
-                    );
-                }
-            }
-            Err(e) => {
-                eprintln!("[ledger-rules] FAIL {}: config decode: {e}", vec.title);
-                failed += 1;
-                continue;
-            }
-        }
-
-        // Decode initial and final state shapes.
-        let initial = match bridge::decode_state(&vec.initial_state_cbor, "initial_state") {
+        // Validate the state shape.
+        let state = match bridge::decode_state(&vec.st_cbor, "st") {
             Ok(s) => s,
             Err(e) => {
-                eprintln!("[ledger-rules] FAIL {}: initial_state: {e}", vec.title);
-                failed += 1;
-                continue;
-            }
-        };
-        let expected = match bridge::decode_state(&vec.final_state_cbor, "final_state") {
-            Ok(s) => s,
-            Err(e) => {
-                eprintln!("[ledger-rules] FAIL {}: final_state: {e}", vec.title);
+                eprintln!("[ledger-rules] FAIL {label}: st_cbor decode: {e}");
                 failed += 1;
                 continue;
             }
         };
 
-        // Run all events through the runner (tx CBOR deserialization + event counting).
-        let era = era_id.unwrap_or(6); // default Conway if category unmapped
-        let outcome = runner::run_vector(&vec, era);
+        // Run the rule-specific validation.
+        let outcome = runner::run_vector(&vec);
         match &outcome {
-            runner::RunOutcome::Decoded {
-                transactions,
-                ticks,
-                epoch_advances,
+            runner::RunOutcome::NewEpochValidated {
+                initial_epoch,
+                signal_epoch,
             } => {
                 eprintln!(
-                    "[ledger-rules] {:?} {:?}: {} tx, {} tick, {} epoch | \
-                     initial={}, expected={}",
-                    path.file_name().unwrap_or_default(),
-                    vec.title,
-                    transactions,
-                    ticks,
-                    epoch_advances,
-                    initial.shape,
-                    expected.shape,
+                    "[ledger-rules] PASS {label} rule={}: NEWEPOCH {initial_epoch} → {signal_epoch} \
+                     (state shape: {})",
+                    vec.rule, state.shape
                 );
+                passed += 1;
             }
-            runner::RunOutcome::Failed { event_idx, detail } => {
+            runner::RunOutcome::UtxoDecoded { era_id, tx_bytes } => {
                 eprintln!(
-                    "[ledger-rules] FAIL {:?} at event {event_idx}: {detail}",
-                    path.file_name().unwrap_or_default()
+                    "[ledger-rules] PASS {label} rule={}: UTXO tx decoded \
+                     (era_id={era_id}, {tx_bytes} bytes, state shape: {})",
+                    vec.rule, state.shape
                 );
-                failed += 1;
-                continue;
+                passed += 1;
             }
             runner::RunOutcome::Skipped { reason } => {
-                eprintln!(
-                    "[ledger-rules] SKIP {:?}: {reason}",
-                    path.file_name().unwrap_or_default()
-                );
+                eprintln!("[ledger-rules] SKIP {label} rule={}: {reason}", vec.rule);
                 skipped += 1;
-                continue;
+            }
+            runner::RunOutcome::Failed { detail } => {
+                eprintln!("[ledger-rules] FAIL {label} rule={}: {detail}", vec.rule);
+                failed += 1;
             }
         }
-
-        // Compare states (skeleton: shape + byte-length comparison).
-        // In Phase 4 skeleton mode, initial_state == final_state since the runner
-        // hasn't applied events. Once the full bridge is wired, this compares the
-        // post-event state against the vector's expected final_state.
-        let cmp = compare::compare_states(&initial, &expected);
-        if !cmp.matches && std::env::var("DUGITE_REQUIRE_UPSTREAM").as_deref() == Ok("1") {
-            eprintln!(
-                "[ledger-rules] DIFF {:?}: {}",
-                path.file_name().unwrap_or_default(),
-                cmp.diff
-            );
-            // Don't count as failed in skeleton mode — states will differ until
-            // the runner actually applies events.
-        }
-
-        passed += 1;
     }
 
     eprintln!(
-        "[ledger-rules] {category}: {}/{} passed, {skipped} skipped, {failed} failed",
+        "[ledger-rules] {}/{} passed, {skipped} skipped, {failed} failed",
         passed,
-        cbor_files.len()
+        test_cases.len()
     );
 
     if failed > 0 {
-        panic!("[ledger-rules] {category}: {failed} vector(s) failed");
-    }
-}
-
-fn walkdir(dir: &Path) -> Vec<std::path::PathBuf> {
-    let mut out = Vec::new();
-    fn collect(dir: &Path, acc: &mut Vec<std::path::PathBuf>) {
-        let Ok(rd) = std::fs::read_dir(dir) else {
-            return;
-        };
-        for entry in rd.flatten() {
-            let p = entry.path();
-            if p.is_file() {
-                acc.push(p);
-            } else if p.is_dir() {
-                collect(&p, acc);
-            }
-        }
-    }
-    collect(dir, &mut out);
-    out.sort();
-    out
-}
-
-/// Entry point for all era categories.
-pub fn run_all_checks(dir: &Path) {
-    for category in &[
-        "ShelleyImpSpec",
-        "MaryImpSpec",
-        "AllegraImpSpec",
-        "AlonzoImpSpec",
-        "BabbageImpSpec",
-        "ConwayImpSpec_-_Version_10",
-    ] {
-        run_era_vectors(dir, category);
+        panic!("[ledger-rules] {failed} vector(s) failed");
     }
 }

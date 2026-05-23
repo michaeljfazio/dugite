@@ -1,163 +1,107 @@
 //! CBOR decode for ImpSpec dump vectors.
 //!
-//! Each `.cbor` file produced by cardano-ledger's ImpSpec test suite with
-//! `CONFORMANCE_CBOR_DUMP_PATH` set is a 5-element CBOR array:
+//! The cardano-ledger ImpSpec conformance framework (with `CONFORMANCE_CBOR_DUMP_PATH`
+//! set) produces **4 separate CBOR files per test case directory**:
 //!
 //! ```text
-//! [config, initial_state, final_state, events, title]
+//! conformance_dump_ctx.cbor   — ExecContext  (empty array `80` for NEWEPOCH)
+//! conformance_dump_env.cbor   — Environment  (empty array `80` for NEWEPOCH)
+//! conformance_dump_st.cbor    — State = NewEpochState as array(7)
+//! conformance_dump_sig.cbor   — Signal (u64 EpochNo for NEWEPOCH; tx CBOR for UTXO)
 //! ```
 //!
-//! Where:
-//! - `config` — arr[13] of protocol-param fields
-//! - `initial_state` — arr[7] ledger state snapshot
-//! - `final_state` — arr[7] expected state after applying events
-//! - `events` — arr[N] of event discriminants (0=Transaction, 1=PassTick, 2=PassEpoch)
-//! - `title` — UTF-8 text describing the test scenario
+//! The `rule` is derived from the parent directory name (e.g. "ConwayNEWEPOCH",
+//! "ConwayUTXO").
+//!
+//! ## NewEpochState array(7) field layout
+//!
+//! ```text
+//! [0] EpochNo             u64
+//! [1] BlocksMade(prev)    map (empty = a0)
+//! [2] BlocksMade(cur)     map (empty = a0)
+//! [3] EpochState          array(4) — AccountState + LedgerState + Snapshots + NonMyopic
+//! [4] StrictMaybe         array(0)=Nothing or array(1)=Just
+//! [5] PoolDistr           map
+//! [6] stashedAVVM         array(0) in Conway
+//! ```
 
-/// Decoded ImpSpec event.
-#[derive(Debug)]
-pub enum ImpEvent {
-    /// Apply a transaction.
-    Transaction {
-        tx_cbor: Vec<u8>,
-        expected_valid: bool,
-        slot: u64,
-    },
-    /// Advance the slot clock without a transaction.
-    PassTick { slot: u64 },
-    /// Cross an epoch boundary.
-    PassEpoch { delta: u64 },
-}
+use std::path::Path;
 
-/// Partially-decoded ImpSpec dump vector.
+/// A test vector decoded from a 4-file ImpSpec dump directory.
 ///
-/// `config`, `initial_state`, and `final_state` are kept as raw CBOR bytes for
-/// downstream bridge/compare modules. Decoding them fully requires the complete
-/// ledger state bridge (`bridge.rs`), which is a Phase 4 follow-on.
+/// All four blobs are kept as raw CBOR bytes so that downstream modules
+/// (`bridge.rs`, `runner.rs`, `compare.rs`) can inspect them without
+/// coupling to a particular typed decode path.
 #[derive(Debug)]
 pub struct ImpVector {
-    pub title: String,
-    pub config_cbor: Vec<u8>,
-    pub initial_state_cbor: Vec<u8>,
-    pub final_state_cbor: Vec<u8>,
-    pub events: Vec<ImpEvent>,
+    /// Ledger rule name derived from the directory name (e.g. "ConwayNEWEPOCH").
+    pub rule: String,
+    /// Raw CBOR bytes of `conformance_dump_ctx.cbor` (ExecContext).
+    pub ctx_cbor: Vec<u8>,
+    /// Raw CBOR bytes of `conformance_dump_env.cbor` (Environment).
+    pub env_cbor: Vec<u8>,
+    /// Raw CBOR bytes of `conformance_dump_st.cbor` (State = NewEpochState array(7)).
+    pub st_cbor: Vec<u8>,
+    /// Raw CBOR bytes of `conformance_dump_sig.cbor` (Signal).
+    pub sig_cbor: Vec<u8>,
 }
 
-/// Decode an ImpSpec dump vector from raw CBOR bytes.
+/// Decode an ImpSpec dump vector from a 4-file test directory.
 ///
-/// Returns `Err` with a human-readable message on any decode failure.
-pub fn decode_vector(data: &[u8]) -> Result<ImpVector, String> {
-    use minicbor::data::Type;
+/// `dir` must contain:
+///   - `conformance_dump_ctx.cbor`
+///   - `conformance_dump_env.cbor`
+///   - `conformance_dump_st.cbor`
+///   - `conformance_dump_sig.cbor`
+///
+/// The `rule` field is taken from `dir`'s parent directory name
+/// (the rule directory, e.g. `ConwayNEWEPOCH/test_minimal_epoch_advance` →
+/// `rule = "ConwayNEWEPOCH"`).
+///
+/// Returns `Err` with a human-readable message on any missing file or I/O failure.
+pub fn decode_vector(dir: &Path) -> Result<ImpVector, String> {
+    let rule = rule_from_dir(dir);
 
-    let mut dec = minicbor::Decoder::new(data);
-
-    // Outer: 5-element array.
-    match dec.array().map_err(|e| format!("outer array: {e}"))? {
-        Some(5) => {}
-        Some(n) => return Err(format!("expected 5-element outer array, got {n}")),
-        None => return Err("expected definite outer array, got indefinite".to_string()),
-    }
-
-    // Element 0 — config (opaque; we record its CBOR bytes).
-    let config_start = dec.position();
-    skip_cbor_value(&mut dec)?;
-    let config_end = dec.position();
-    let config_cbor = data[config_start..config_end].to_vec();
-
-    // Element 1 — initial_state (opaque).
-    let init_start = dec.position();
-    skip_cbor_value(&mut dec)?;
-    let init_end = dec.position();
-    let initial_state_cbor = data[init_start..init_end].to_vec();
-
-    // Element 2 — final_state (opaque).
-    let final_start = dec.position();
-    skip_cbor_value(&mut dec)?;
-    let final_end = dec.position();
-    let final_state_cbor = data[final_start..final_end].to_vec();
-
-    // Element 3 — events array.
-    let event_count = dec.array().map_err(|e| format!("events array: {e}"))?;
-    let mut events = Vec::new();
-    let count = event_count.unwrap_or(u64::MAX); // indefinite: decode until Break
-    for i in 0..count {
-        if count == u64::MAX {
-            // Check for indefinite-length break.
-            if matches!(dec.datatype(), Ok(Type::Break)) {
-                dec.skip().map_err(|e| format!("skip break: {e}"))?;
-                break;
-            }
-        }
-        let event = decode_event(&mut dec, i)?;
-        events.push(event);
-    }
-
-    // Element 4 — title (text string).
-    let title = dec.str().map_err(|e| format!("title: {e}"))?.to_owned();
+    let ctx_cbor = read_file(dir, "conformance_dump_ctx.cbor")?;
+    let env_cbor = read_file(dir, "conformance_dump_env.cbor")?;
+    let st_cbor = read_file(dir, "conformance_dump_st.cbor")?;
+    let sig_cbor = read_file(dir, "conformance_dump_sig.cbor")?;
 
     Ok(ImpVector {
-        title,
-        config_cbor,
-        initial_state_cbor,
-        final_state_cbor,
-        events,
+        rule,
+        ctx_cbor,
+        env_cbor,
+        st_cbor,
+        sig_cbor,
     })
 }
 
-fn decode_event(dec: &mut minicbor::Decoder, idx: u64) -> Result<ImpEvent, String> {
-    // Each event is a definite-length array: [discriminant, ...fields].
-    let len = dec
-        .array()
-        .map_err(|e| format!("event[{idx}] array: {e}"))?
-        .ok_or_else(|| format!("event[{idx}] must be definite array"))?;
-
-    if len == 0 {
-        return Err(format!("event[{idx}] is empty"));
+/// Derive the rule name from a test-case directory.
+///
+/// The convention is:
+///   `<fixtures>/<rule>/<test_name>/`
+///
+/// so we walk up to the parent and take its name.
+/// Falls back to the directory's own name if there is no parent.
+fn rule_from_dir(dir: &Path) -> String {
+    // Try parent (rule dir) → grandparent would be the fixture root.
+    if let Some(parent) = dir.parent() {
+        if let Some(name) = parent.file_name() {
+            let s = name.to_string_lossy().into_owned();
+            // If the parent name looks like a rule (starts with uppercase and contains
+            // only alphanumeric/_), use it; otherwise fall through to the dir name.
+            if s.chars().next().map(|c| c.is_uppercase()).unwrap_or(false) {
+                return s;
+            }
+        }
     }
-
-    let discriminant: u64 = dec
-        .u64()
-        .map_err(|e| format!("event[{idx}] discriminant: {e}"))?;
-
-    match discriminant {
-        0 => {
-            // Transaction: [0, tx_cbor_bytes, expected_valid, slot]
-            if len != 4 {
-                return Err(format!("Transaction event must have 4 elements, got {len}"));
-            }
-            let tx_bytes = dec
-                .bytes()
-                .map_err(|e| format!("event[{idx}] tx_cbor: {e}"))?
-                .to_vec();
-            let expected_valid = dec.bool().map_err(|e| format!("event[{idx}] valid: {e}"))?;
-            let slot = dec.u64().map_err(|e| format!("event[{idx}] slot: {e}"))?;
-            Ok(ImpEvent::Transaction {
-                tx_cbor: tx_bytes,
-                expected_valid,
-                slot,
-            })
-        }
-        1 => {
-            // PassTick: [1, slot]
-            if len != 2 {
-                return Err(format!("PassTick event must have 2 elements, got {len}"));
-            }
-            let slot = dec.u64().map_err(|e| format!("event[{idx}] slot: {e}"))?;
-            Ok(ImpEvent::PassTick { slot })
-        }
-        2 => {
-            // PassEpoch: [2, delta]
-            if len != 2 {
-                return Err(format!("PassEpoch event must have 2 elements, got {len}"));
-            }
-            let delta = dec.u64().map_err(|e| format!("event[{idx}] delta: {e}"))?;
-            Ok(ImpEvent::PassEpoch { delta })
-        }
-        d => Err(format!("unknown event discriminant {d}")),
-    }
+    // Fallback: use the directory name itself.
+    dir.file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "unknown".to_string())
 }
 
-/// Skip one CBOR value at the current position (recursively for nested structures).
-fn skip_cbor_value(dec: &mut minicbor::Decoder) -> Result<(), String> {
-    dec.skip().map_err(|e| format!("skip: {e}"))
+fn read_file(dir: &Path, name: &str) -> Result<Vec<u8>, String> {
+    let path = dir.join(name);
+    std::fs::read(&path).map_err(|e| format!("read {}: {e}", path.display()))
 }

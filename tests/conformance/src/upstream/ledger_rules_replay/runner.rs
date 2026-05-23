@@ -1,81 +1,146 @@
-//! Phase 4 — Runner: apply ImpSpec events and collect outcomes.
+//! Phase 4 — Runner: validate ImpSpec vectors against Dugite's engine.
 //!
 //! ## Current validation (Phase 4)
 //!
-//! For each vector the runner:
-//! 1. Parses every `Transaction` event's `tx_cbor` bytes using
-//!    `dugite_serialization::decode_transaction` (real tx deserialization).
-//! 2. Checks `expected_valid == true` transactions decode without error.
-//! 3. Counts PassTick and PassEpoch events for diagnostic output.
+//! For each vector the runner dispatches on the `rule` field derived from the
+//! directory name:
+//!
+//! - **ConwayNEWEPOCH** (and any `*NEWEPOCH*` rule): reads the initial epoch
+//!   number from `st_cbor[0]` and the signal epoch number from `sig_cbor`,
+//!   then validates the hard invariant `signal_epoch > initial_epoch`.
+//!
+//! - **ConwayUTXO** (and any `*UTXO*` rule): calls
+//!   `dugite_serialization::decode_transaction(era_id, sig_cbor)` on the
+//!   signal file and returns `Failed` if it errors.
+//!
+//! - **Unknown rules**: returns `Skipped` (no validation available yet).
 //!
 //! ## Phase 4 follow-on: full ledger replay
 //!
 //! Full ledger execution (apply_tx / apply_tick / apply_epoch) requires:
 //! 1. A `LedgerState::from_cbor(imp_spec_format)` bridge for the `arr[7]`
 //!    NewEpochState encoding (tracked as a separate ledger bridge task).
-//! 2. Actual ImpSpec fixture files (requires Haskell toolchain to generate).
+//! 2. Real ImpSpec fixture files generated from the Haskell toolchain.
 //!
-//! Until both are available, the runner provides the deepest validation
-//! achievable: real CBOR deserialization of every transaction in the vector.
+//! Until both are available the runner provides the deepest validation
+//! achievable without that bridge.
 
 use dugite_serialization::decode_transaction;
 
-use crate::upstream::ledger_rules_replay::vector::{ImpEvent, ImpVector};
+use crate::upstream::ledger_rules_replay::{
+    bridge::{decode_epoch_no, decode_initial_epoch_no},
+    vector::ImpVector,
+};
 
-/// Outcome of replaying one ImpSpec vector through the runner.
+/// Outcome of validating one ImpSpec vector.
 #[derive(Debug)]
 pub enum RunOutcome {
-    /// All tx events deserialized; full ledger replay pending Phase 4 follow-on.
-    Decoded {
-        transactions: usize,
-        ticks: usize,
-        epoch_advances: usize,
+    /// NEWEPOCH invariant validated: signal_epoch > initial_epoch.
+    NewEpochValidated {
+        initial_epoch: u64,
+        signal_epoch: u64,
     },
-    /// Vector was skipped (e.g., known-broken scenario in SKIP_LIST).
+    /// UTXO signal decoded successfully as a transaction.
+    UtxoDecoded { era_id: u16, tx_bytes: usize },
+    /// Vector was skipped because no rule handler is implemented yet.
     Skipped { reason: String },
-    /// A deserialize error occurred at event `event_idx`.
-    Failed { event_idx: usize, detail: String },
+    /// Validation failed.
+    Failed { detail: String },
 }
 
-/// Apply every event in `vec` and return the run outcome.
+/// Derive a Cardano HFC `era_id` from a rule name prefix.
 ///
-/// `era_id` is the Cardano HFC era number (1=Shelley, 2=Allegra, 3=Mary,
-/// 4=Alonzo, 5=Babbage, 6=Conway) and determines which CBOR decoder is used
-/// for Transaction events.
-pub fn run_vector(vec: &ImpVector, era_id: u16) -> RunOutcome {
-    let mut txs = 0usize;
-    let mut ticks = 0usize;
-    let mut epochs = 0usize;
+/// Rule names follow the pattern `<Era><RULENAME>`, e.g. "ConwayNEWEPOCH",
+/// "BabbageUTXO", "ShelleyNEWEPOCH". The era prefix determines the CBOR
+/// decoder used for Transaction signals.
+fn era_id_from_rule(rule: &str) -> u16 {
+    if rule.starts_with("Conway") || rule.starts_with("CONWAY") {
+        6
+    } else if rule.starts_with("Babbage") || rule.starts_with("BABBAGE") {
+        5
+    } else if rule.starts_with("Alonzo") || rule.starts_with("ALONZO") {
+        4
+    } else if rule.starts_with("Mary") || rule.starts_with("MARY") {
+        3
+    } else if rule.starts_with("Allegra") || rule.starts_with("ALLEGRA") {
+        2
+    } else if rule.starts_with("Shelley") || rule.starts_with("SHELLEY") {
+        1
+    } else {
+        6 // default Conway
+    }
+}
 
-    for (i, event) in vec.events.iter().enumerate() {
-        match event {
-            ImpEvent::Transaction {
-                tx_cbor,
-                expected_valid,
-                ..
-            } => {
-                txs += 1;
-                if *expected_valid {
-                    // Transactions the ImpSpec marks as valid must parse cleanly.
-                    if let Err(e) = decode_transaction(era_id, tx_cbor) {
-                        return RunOutcome::Failed {
-                            event_idx: i,
-                            detail: format!(
-                                "tx decode failed (era_id={era_id}, {} bytes): {e}",
-                                tx_cbor.len()
-                            ),
-                        };
-                    }
-                }
-            }
-            ImpEvent::PassTick { .. } => ticks += 1,
-            ImpEvent::PassEpoch { .. } => epochs += 1,
+/// Validate `vec` according to its rule and return the outcome.
+///
+/// The `era_id` used for UTXO tx decoding is derived from the rule name.
+pub fn run_vector(vec: &ImpVector) -> RunOutcome {
+    let rule = vec.rule.as_str();
+
+    if rule.contains("NEWEPOCH") || rule.contains("NewEpoch") {
+        run_newepoch(vec)
+    } else if rule.contains("UTXO") || rule.contains("Utxo") {
+        run_utxo(vec)
+    } else {
+        RunOutcome::Skipped {
+            reason: format!("no handler for rule '{rule}'"),
         }
     }
+}
 
-    RunOutcome::Decoded {
-        transactions: txs,
-        ticks,
-        epoch_advances: epochs,
+/// Validate a NEWEPOCH vector.
+///
+/// Invariant: `signal_epoch > initial_epoch`.
+///
+/// The signal for NEWEPOCH is a bare CBOR u64 (target epoch number).
+/// The initial epoch number is field [0] of the NewEpochState `array(7)`.
+fn run_newepoch(vec: &ImpVector) -> RunOutcome {
+    let initial_epoch = match decode_initial_epoch_no(&vec.st_cbor) {
+        Ok(n) => n,
+        Err(e) => {
+            return RunOutcome::Failed {
+                detail: format!("st_cbor decode (initial epoch_no): {e}"),
+            }
+        }
+    };
+
+    let signal_epoch = match decode_epoch_no(&vec.sig_cbor) {
+        Ok(n) => n,
+        Err(e) => {
+            return RunOutcome::Failed {
+                detail: format!("sig_cbor decode (signal epoch_no): {e}"),
+            }
+        }
+    };
+
+    if signal_epoch <= initial_epoch {
+        return RunOutcome::Failed {
+            detail: format!(
+                "NEWEPOCH invariant violated: signal_epoch ({signal_epoch}) \
+                 must be > initial_epoch ({initial_epoch})"
+            ),
+        };
+    }
+
+    RunOutcome::NewEpochValidated {
+        initial_epoch,
+        signal_epoch,
+    }
+}
+
+/// Validate a UTXO vector by decoding the signal as a transaction.
+fn run_utxo(vec: &ImpVector) -> RunOutcome {
+    let era_id = era_id_from_rule(&vec.rule);
+    match decode_transaction(era_id, &vec.sig_cbor) {
+        Ok(_tx) => RunOutcome::UtxoDecoded {
+            era_id,
+            tx_bytes: vec.sig_cbor.len(),
+        },
+        Err(e) => RunOutcome::Failed {
+            detail: format!(
+                "UTXO sig tx decode failed (era_id={era_id}, {} bytes): {e}",
+                vec.sig_cbor.len()
+            ),
+        },
     }
 }

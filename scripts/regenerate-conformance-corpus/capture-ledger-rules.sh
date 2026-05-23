@@ -2,8 +2,17 @@
 # Capture step for the ledger-rules area (Phase 4 — ImpSpec CBOR dump vectors).
 #
 # Builds cardano-ledger at the pinned SHA and runs the ImpSpec conformance
-# test suite with CONFORMANCE_CBOR_DUMP_PATH set, capturing one 5-element
-# CBOR vector file per test scenario.
+# test suite with CONFORMANCE_CBOR_DUMP_PATH set.  The ImpSpec framework
+# produces **4 separate CBOR files per diverging test case**, organised as:
+#
+#   <dump_path>/<Rule>/<test_name>/conformance_dump_ctx.cbor
+#   <dump_path>/<Rule>/<test_name>/conformance_dump_env.cbor
+#   <dump_path>/<Rule>/<test_name>/conformance_dump_st.cbor
+#   <dump_path>/<Rule>/<test_name>/conformance_dump_sig.cbor
+#
+# This script mirrors that layout verbatim into the output tarball so that
+# `tests/conformance/src/upstream/ledger_rules_replay/mod.rs` can scan
+# subdirectories and decode each test case from its 4 files.
 #
 # ## Prerequisites
 #
@@ -20,38 +29,22 @@
 #   cabal test cardano-ledger-conformance \
 #       --test-options '--dump-path ./dumps'
 #
-# ## CBOR vector format
+# ## Output layout (4 files per test-case directory)
 #
-# The ImpSpec test suite emits one `.cbor` file per test scenario with the
-# following 5-element structure:
+#   content/<Rule>/<test_name>/conformance_dump_ctx.cbor   — ExecContext
+#   content/<Rule>/<test_name>/conformance_dump_env.cbor   — Environment
+#   content/<Rule>/<test_name>/conformance_dump_st.cbor    — State (NewEpochState array(7))
+#   content/<Rule>/<test_name>/conformance_dump_sig.cbor   — Signal
 #
-#   [config, initial_state, final_state, events, title]
-#
-# Where:
-#   config        — arr[13] of protocol-param fields
-#   initial_state — arr[7]  NewEpochState (same encoding as cardano-cli
-#                           debug log-epoch-state output)
-#   final_state   — arr[7]  expected post-event NewEpochState
-#   events        — arr[N]  of discriminant-keyed sub-arrays:
-#                     [0, tx_cbor_bytes, expected_valid_bool, slot] — Transaction
-#                     [1, slot]                                      — PassTick
-#                     [2, epoch_delta]                               — PassEpoch
-#   title         — text string naming the scenario
-#
-# Files are organised under per-era subdirectories:
-#   dumps/ShelleyImpSpec/
-#   dumps/MaryImpSpec/
-#   dumps/AllegraImpSpec/
-#   dumps/AlonzoImpSpec/
-#   dumps/BabbageImpSpec/
-#   dumps/ConwayImpSpec_-_Version_10/
+# Where <Rule> is the ledger rule name (e.g. ConwayNEWEPOCH, ConwayUTXO) and
+# <test_name> is the ImpSpec test scenario name.
 #
 # ## Current status
 #
 # This script is a stub — the Haskell build step is not yet automated in CI.
 # To generate a real corpus:
 #
-#   1. Install Nix (or GHC 9.6.x + cabal 3.10.x).
+#   1. Install Nix (recommended) or GHC 9.6.x + cabal 3.10.x.
 #   2. Clone IntersectMBO/cardano-ledger at the pinned SHA.
 #   3. Run the ImpSpec test suite with the dump path set.
 #   4. Manually trigger `just regenerate-corpus-local` with the real dumps.
@@ -85,7 +78,7 @@ log "Target cardano-ledger SHA: ${SHA:-<not set>}"
 # ── Check for Nix / cabal ─────────────────────────────────────────────────────
 HAS_NIX=0
 HAS_CABAL=0
-command -v nix  >/dev/null 2>&1 && HAS_NIX=1
+command -v nix   >/dev/null 2>&1 && HAS_NIX=1
 command -v cabal >/dev/null 2>&1 && HAS_CABAL=1
 
 CONTENT_DIR="${WORK_DIR}/content"
@@ -107,8 +100,15 @@ To generate real ImpSpec CBOR vectors:
   3. Update manifest.toml to point at the new release tag.
   4. Run `cargo xtask download-upstream-fixtures`.
 
+Vector format: 4 files per test-case directory
+  <Rule>/<test_name>/conformance_dump_ctx.cbor  — ExecContext
+  <Rule>/<test_name>/conformance_dump_env.cbor  — Environment
+  <Rule>/<test_name>/conformance_dump_st.cbor   — State (NewEpochState array(7))
+  <Rule>/<test_name>/conformance_dump_sig.cbor  — Signal
+
 The Phase 4 test module (ledger_rules_replay) will skip gracefully
-until fixture files are present.
+until real fixture directories are present (only the synthetic
+ConwayNEWEPOCH/test_minimal_epoch_advance fixture runs in stub mode).
 EOF
     echo '{"__stub__": true}' > "${WORK_DIR}/hashes.json"
     tar -czf "${TARBALL}" -C "${CONTENT_DIR}" .
@@ -134,7 +134,7 @@ if [[ $HAS_NIX -eq 1 ]]; then
         cd '${CLONE_DIR}'
         cabal test cardano-ledger-conformance \
             --test-options '--dump-path ${DUMP_DIR}'
-    " || true  # non-zero exit is expected when conformance tests fail (dumps are still written)
+    " || true  # non-zero exit expected when conformance tests fail (dumps are still written)
 else
     (
         cd "${CLONE_DIR}"
@@ -144,35 +144,76 @@ else
     ) || true
 fi
 
-# ── Copy dumps into content structure ────────────────────────────────────────
-VECTOR_COUNT=0
-for era_dir in "${DUMP_DIR}"/*/; do
-    era=$(basename "${era_dir}")
-    mkdir -p "${CONTENT_DIR}/${era}"
-    while IFS= read -r -d '' f; do
-        cp "$f" "${CONTENT_DIR}/${era}/"
-        ((VECTOR_COUNT++))
-    done < <(find "${era_dir}" -name "*.cbor" -type f -print0 2>/dev/null)
+# ── Mirror 4-file test-case directories into content structure ────────────────
+#
+# The ImpSpec framework emits:
+#   <DUMP_DIR>/<Rule>/<test_name>/conformance_dump_{ctx,env,st,sig}.cbor
+#
+# We copy each 4-file test-case directory verbatim into CONTENT_DIR so the
+# Rust test module can scan subdirectories and find all 4 files.
+#
+REQUIRED_FILES=(
+    "conformance_dump_ctx.cbor"
+    "conformance_dump_env.cbor"
+    "conformance_dump_st.cbor"
+    "conformance_dump_sig.cbor"
+)
+
+TEST_CASE_COUNT=0
+RULE_COUNT=0
+
+for rule_dir in "${DUMP_DIR}"/*/; do
+    [[ -d "${rule_dir}" ]] || continue
+    rule=$(basename "${rule_dir}")
+    rule_found=0
+
+    for test_case_dir in "${rule_dir}"*/; do
+        [[ -d "${test_case_dir}" ]] || continue
+        test_name=$(basename "${test_case_dir}")
+
+        # Verify all 4 required files are present.
+        all_present=1
+        for req in "${REQUIRED_FILES[@]}"; do
+            if [[ ! -f "${test_case_dir}/${req}" ]]; then
+                log "WARN: ${rule}/${test_name}: missing ${req} — skipping"
+                all_present=0
+                break
+            fi
+        done
+        [[ $all_present -eq 0 ]] && continue
+
+        # Copy all 4 files into the content tree.
+        dest="${CONTENT_DIR}/${rule}/${test_name}"
+        mkdir -p "${dest}"
+        for req in "${REQUIRED_FILES[@]}"; do
+            cp "${test_case_dir}/${req}" "${dest}/"
+        done
+        ((TEST_CASE_COUNT++))
+        rule_found=1
+    done
+
+    [[ $rule_found -eq 1 ]] && ((RULE_COUNT++))
 done
 
-log "Captured ${VECTOR_COUNT} CBOR vector files across $(ls "${CONTENT_DIR}" | wc -l) era(s)"
+log "Captured ${TEST_CASE_COUNT} test cases across ${RULE_COUNT} rule(s)"
 
-if [[ $VECTOR_COUNT -eq 0 ]]; then
-    log "WARN: no CBOR vectors produced — ImpSpec ran but produced no dumps."
-    log "Check that CONFORMANCE_CBOR_DUMP_PATH was honoured."
+if [[ $TEST_CASE_COUNT -eq 0 ]]; then
+    log "WARN: no 4-file test-case directories found under ${DUMP_DIR}."
+    log "Check that CONFORMANCE_CBOR_DUMP_PATH was honoured by the ImpSpec suite."
     cat > "${CONTENT_DIR}/README.txt" <<'EOF'
 ledger-rules — empty corpus
 
-The ImpSpec test suite ran but produced no CBOR dump files. This means all
-conformance tests passed at the pinned cardano-ledger SHA, or the dump path
-was not set correctly. See capture-ledger-rules.sh.
+The ImpSpec test suite ran but produced no 4-file test-case directories.
+This means all conformance tests passed at the pinned cardano-ledger SHA,
+or CONFORMANCE_CBOR_DUMP_PATH was not set correctly.
+See capture-ledger-rules.sh.
 EOF
     echo '{"__stub__": true}' > "${WORK_DIR}/hashes.json"
     tar -czf "${TARBALL}" -C "${CONTENT_DIR}" .
     exit 0
 fi
 
-# ── Emit hashes ───────────────────────────────────────────────────────────────
+# ── Emit hashes (one entry per CBOR file) ────────────────────────────────────
 {
     echo "{"
     first=1
@@ -187,4 +228,4 @@ fi
 } > "${WORK_DIR}/hashes.json"
 
 tar -czf "${TARBALL}" -C "${CONTENT_DIR}" .
-log "Tarball written: ${TARBALL} (${VECTOR_COUNT} vectors)"
+log "Tarball written: ${TARBALL} (${TEST_CASE_COUNT} test cases, ${RULE_COUNT} rules)"
