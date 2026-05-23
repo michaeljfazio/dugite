@@ -17,5 +17,6 @@
   "TargetNumberOfKnownPeers": 85,
   "TargetNumberOfRootPeers": 60,
   "ExperimentalHardForksEnabled": true,
-  "LogDirective": "info"
+  "LogDirective": "info",
+  "MetricsPort": 12798
 }
