@@ -1,0 +1,41 @@
+# Upstream source pins for the conformance corpus regeneration pipeline.
+# Bumping a pin here and triggering the regenerate-conformance-corpus
+# workflow produces a new dugite release that manifest.toml then points at.
+#
+# See also: manifest.toml (which release consumers pull from)
+
+[ouroboros-consensus]
+repo = "IntersectMBO/ouroboros-consensus"
+sha  = "b7135f845480f347f618217a00f6ecad4124766d"
+
+[cardano-ledger]
+repo = "IntersectMBO/cardano-ledger"
+sha  = "ebed62de1ebcd4b13512418d49d17802a193e2c1"
+
+[cardano-node]
+repo = "IntersectMBO/cardano-node"
+sha  = "9c20173514507050308bb5f2d67ac30cb0963ac9"
+
+[plutus]
+# Conformance vectors live inside the source tarball at:
+#   plutus-<TAG>/plutus-conformance/test-cases/uplc/evaluation/
+# The capture script downloads the source archive (not a release asset).
+repo = "IntersectMBO/plutus"
+tag  = "1.65.0.0"
+
+[ledger-rules]
+# This area builds cardano-ledger + runs ImpSpec with CONFORMANCE_CBOR_DUMP_PATH.
+# The SHA below is the cardano-ledger version we build/run against.
+# Wired up in Phase 4; stub tarball produced until then.
+repo = "IntersectMBO/cardano-ledger"
+sha  = "ebed62de1ebcd4b13512418d49d17802a193e2c1"
+
+[cardano-base]
+# Wired up in Phase 5; stub tarball produced until then.
+repo = "IntersectMBO/cardano-base"
+sha  = "096124a9dfce0264270251115aaee64f574b50c3"
+
+[mithril]
+# Wired up in Phase 6; stub tarball produced until then.
+repo = "input-output-hk/mithril"
+sha  = "51874212d135567d7d1c85b811a23cc76e33372b"
