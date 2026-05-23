@@ -134,6 +134,16 @@ struct RunArgs {
     #[arg(long)]
     no_metrics: bool,
 
+    /// Make a metrics bind failure a fatal startup error.
+    ///
+    /// By default the node continues if the Prometheus metrics port cannot be
+    /// bound (e.g. already in use).  With this flag a bind failure causes the
+    /// node to exit with a non-zero status instead.  Useful in supervised
+    /// deployments where a missing metrics endpoint must be treated as a hard
+    /// failure rather than a silent degradation.
+    #[arg(long)]
+    require_metrics: bool,
+
     /// Also emit `cardano_node_metrics_*` compatibility aliases in the Prometheus
     /// output alongside the native `dugite_*` metrics.
     ///
@@ -1457,6 +1467,7 @@ async fn run_node(args: RunArgs, log_handle: Option<logging::LogHandle>) -> Resu
         shelley_operational_certificate: args.shelley_operational_certificate,
         _shelley_cold_key: args.shelley_cold_key,
         metrics_port: effective_metrics_port,
+        require_metrics: args.require_metrics,
         compat_metrics: args.compat_metrics,
         liveness_threshold_secs: args.liveness_threshold_secs,
         mempool_max_tx: args.mempool_max_tx,

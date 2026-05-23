@@ -1967,73 +1967,68 @@ impl Default for NodeMetrics {
     }
 }
 
-/// Start an HTTP metrics server on the given port.
+/// Bind a TCP listener for the metrics HTTP server.
 ///
-/// Responds to any request with Prometheus-format metrics.
+/// Retries up to `MAX_RETRIES` times (1-second delay between attempts) to
+/// tolerate brief port-in-use windows when the node is restarted quickly
+/// after a crash (`TIME_WAIT` / previous instance still shutting down).
 ///
-/// On node restart the previous process may have left the port in `TIME_WAIT`
-/// or another process may still be exiting.  Rather than failing immediately,
-/// we retry binding up to 5 times with a 1-second delay between attempts.
-/// This prevents the common "address already in use" startup failure when
-/// restarting the node quickly after a crash.
-pub async fn start_metrics_server(
-    port: u16,
-    metrics: Arc<NodeMetrics>,
-    mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
-) -> Result<(), std::io::Error> {
+/// Returns the bound listener on success, or the last bind error on failure.
+/// Non-retryable errors (permission denied, etc.) are returned immediately.
+///
+/// This function is separate from `start_metrics_server` so callers that need
+/// to fail fast on bind failure (e.g. `--require-metrics`) can call it
+/// synchronously before spawning the server loop.
+pub async fn bind_metrics_listener(port: u16) -> Result<TcpListener, std::io::Error> {
     let addr = format!("0.0.0.0:{port}");
 
-    // Attempt to bind with retries to handle brief port-in-use windows on
-    // fast restarts (TIME_WAIT, or a previous instance still shutting down).
     const MAX_RETRIES: u32 = 5;
     const RETRY_DELAY: std::time::Duration = std::time::Duration::from_secs(1);
 
-    let listener = {
-        let mut last_err = None;
-        let mut bound = None;
-        for attempt in 1..=MAX_RETRIES {
-            match TcpListener::bind(&addr).await {
-                Ok(l) => {
-                    bound = Some(l);
-                    break;
-                }
-                Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => {
-                    if attempt < MAX_RETRIES {
-                        tracing::warn!(
-                            port,
-                            attempt,
-                            max = MAX_RETRIES,
-                            "Metrics port in use, retrying in 1s"
-                        );
-                        tokio::time::sleep(RETRY_DELAY).await;
-                    }
-                    last_err = Some(e);
-                }
-                Err(e) => {
-                    // Non-retryable error (permission denied, etc.)
-                    error!("Failed to start metrics server on {addr}: {e}");
-                    return Err(e);
-                }
-            }
-        }
-        match bound {
-            Some(l) => {
+    let mut last_err = None;
+    for attempt in 1..=MAX_RETRIES {
+        match TcpListener::bind(&addr).await {
+            Ok(l) => {
                 info!(
                     url = format_args!("http://{addr}/metrics"),
                     "Metrics server started"
                 );
-                l
+                return Ok(l);
             }
-            None => {
-                let e = last_err.unwrap();
-                error!(
-                    "Failed to start metrics server on {addr} after {MAX_RETRIES} attempts: {e}"
-                );
+            Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => {
+                if attempt < MAX_RETRIES {
+                    tracing::warn!(
+                        port,
+                        attempt,
+                        max = MAX_RETRIES,
+                        "Metrics port in use, retrying in 1s"
+                    );
+                    tokio::time::sleep(RETRY_DELAY).await;
+                }
+                last_err = Some(e);
+            }
+            Err(e) => {
+                // Non-retryable error (permission denied, etc.)
+                error!("Failed to start metrics server on {addr}: {e}");
                 return Err(e);
             }
         }
-    };
+    }
 
+    let e = last_err.unwrap();
+    error!("Failed to start metrics server on {addr} after {MAX_RETRIES} attempts: {e}");
+    Err(e)
+}
+
+/// Run the metrics HTTP server accept loop on an already-bound listener.
+///
+/// Responds to each request with Prometheus-format metrics, health endpoints,
+/// etc.  Exits when `shutdown_rx` fires.
+pub async fn run_metrics_server(
+    listener: TcpListener,
+    metrics: Arc<NodeMetrics>,
+    mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
+) {
     // Connection timeout: if a client connects but does not send an HTTP
     // request within this window, the task is dropped and the connection closed.
     // Prevents an abandoned or slow client from blocking the metrics server
@@ -2068,6 +2063,22 @@ pub async fn start_metrics_server(
             }
         }
     }
+}
+
+/// Start an HTTP metrics server on the given port.
+///
+/// Convenience wrapper that binds (with retries) then runs the accept loop.
+/// Returns an error if the bind phase fails.
+///
+/// For callers that need to fail fast before spawning (e.g. `--require-metrics`),
+/// use [`bind_metrics_listener`] + [`run_metrics_server`] directly.
+pub async fn start_metrics_server(
+    port: u16,
+    metrics: Arc<NodeMetrics>,
+    shutdown_rx: tokio::sync::watch::Receiver<bool>,
+) -> Result<(), std::io::Error> {
+    let listener = bind_metrics_listener(port).await?;
+    run_metrics_server(listener, metrics, shutdown_rx).await;
     Ok(())
 }
 
@@ -2869,5 +2880,86 @@ mod tests {
             output.contains("Koios drep_epoch_summary"),
             "HELP text must reference Koios drep_epoch_summary"
         );
+    }
+
+    // ── Metrics server bind + serve tests ───────────────────────────────────
+
+    /// Verify that `bind_metrics_listener` binds successfully on a
+    /// kernel-assigned port (port 0) and that the listener's local address
+    /// is a valid socket with a non-zero port.
+    ///
+    /// Uses port 0 so the OS picks any free ephemeral port — no hardcoded
+    /// port number means this test is safe to run in any CI environment.
+    #[tokio::test]
+    async fn test_bind_metrics_listener_custom_port_zero() {
+        let listener = bind_metrics_listener(0)
+            .await
+            .expect("bind_metrics_listener(0) must succeed");
+        let local_addr = listener
+            .local_addr()
+            .expect("listener must have a local address");
+        assert!(
+            local_addr.port() > 0,
+            "OS-assigned port must be non-zero, got {local_addr}"
+        );
+    }
+
+    /// Full round-trip: bind on an OS-assigned port, start the metrics server
+    /// in a background task, issue an HTTP GET /metrics request, assert a 200
+    /// with the correct Prometheus payload, then shut down cleanly.
+    ///
+    /// This test validates the entire custom-port path end-to-end: bind →
+    /// accept loop → response routing.
+    #[tokio::test]
+    async fn test_metrics_server_responds_on_custom_port() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpStream;
+
+        let metrics = Arc::new(NodeMetrics::new());
+        metrics.set_slot(42_000);
+
+        // Bind on an OS-assigned port so this test never collides with a node.
+        let listener = bind_metrics_listener(0).await.expect("bind must succeed");
+        let bound_port = listener.local_addr().expect("local_addr").port();
+
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let metrics_clone = metrics.clone();
+        let server_handle = tokio::spawn(async move {
+            run_metrics_server(listener, metrics_clone, shutdown_rx).await;
+        });
+
+        // Give the accept loop a moment to start.
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+
+        // Issue a minimal HTTP GET request and read the full response.
+        let mut stream = TcpStream::connect(format!("127.0.0.1:{bound_port}"))
+            .await
+            .expect("connect must succeed");
+        stream
+            .write_all(b"GET /metrics HTTP/1.1\r\nHost: localhost\r\n\r\n")
+            .await
+            .expect("write must succeed");
+
+        let mut response = Vec::new();
+        let _ = stream.read_to_end(&mut response).await;
+        let response_str = String::from_utf8_lossy(&response);
+
+        assert!(
+            response_str.starts_with("HTTP/1.1 200 OK"),
+            "expected 200 OK, got: {}",
+            &response_str[..response_str.len().min(100)]
+        );
+        assert!(
+            response_str.contains("dugite_slot_number 42000"),
+            "expected slot metric in response"
+        );
+        assert!(
+            response_str.contains("text/plain"),
+            "expected Prometheus content-type"
+        );
+
+        // Shut down the server task cleanly.
+        shutdown_tx.send(true).ok();
+        let _ = server_handle.await;
     }
 }
