@@ -895,14 +895,36 @@ impl LedgerState {
         }
 
         // Build per-block scalar field delta from post-block state.
+        //
+        // Mirror Haskell `incrBlocks` (eras/shelley/impl/.../BlockBody/
+        // Internal.hs:241): per-block pool attribution gated on
+        // `!isOverlaySlot(firstSlotOfCurrentEpoch, d, blockSlot)`.
+        // This must match the same gate in
+        // `crates/dugite-ledger/src/eras/common.rs::compute_shelley_nonce`
+        // so this delta agrees with the canonical attribution count.
         let pool_block_increment = if !block.header.issuer_vkey.is_empty() {
-            let current_d = if self.epochs.protocol_params.protocol_version_major >= 7 {
-                0.0
+            let (d_num, d_den) = if self.epochs.protocol_params.protocol_version_major >= 7 {
+                (0u64, 1u64)
             } else {
-                self.epochs.protocol_params.d.numerator as f64
-                    / self.epochs.protocol_params.d.denominator.max(1) as f64
+                (
+                    self.epochs.protocol_params.d.numerator,
+                    self.epochs.protocol_params.d.denominator.max(1),
+                )
             };
-            if current_d < 0.8 {
+            let first_slot_of_current_epoch = self
+                .epoch
+                .0
+                .saturating_mul(self.epoch_length)
+                .saturating_add(
+                    self.shelley_transition_epoch
+                        .saturating_mul(self.byron_epoch_length),
+                );
+            if !crate::eras::common::is_overlay_slot(
+                first_slot_of_current_epoch,
+                block.slot().0,
+                d_num,
+                d_den,
+            ) {
                 Some(dugite_primitives::hash::blake2b_224(
                     &block.header.issuer_vkey,
                 ))
