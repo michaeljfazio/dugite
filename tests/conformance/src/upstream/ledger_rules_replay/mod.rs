@@ -4,27 +4,44 @@
 //! ledger engine and compares the resulting state against the expected state
 //! encoded in each vector directory.
 //!
-//! ## Status
+//! ## Status — corpus generation is blocked by design
 //!
-//! The fixture area (`tests/conformance/upstream/fixtures/ledger-rules/`) is
-//! a stub placeholder when no real ImpSpec corpus has been generated yet.
-//! To activate full replay:
+//! There are currently NO real ImpSpec CBOR vectors.
 //!
-//! 1. Run the regeneration pipeline:
-//!    ```sh
-//!    just regenerate-corpus-local  # or trigger the GH workflow
-//!    ```
-//!    This builds cardano-ledger at the pinned SHA and runs `cabal test
-//!    cardano-ledger-conformance` with `CONFORMANCE_CBOR_DUMP_PATH` set.
+//! The ImpSpec dump mechanism (`CONFORMANCE_CBOR_DUMP_PATH`) fires ONLY when
+//! the Haskell ledger implementation diverges from the Agda formal spec.
+//! Confirmed by oracle research on SHA `ebed62de1ebcd4b13512418d49d17802a193e2c1`,
+//! function `checkConformance` in
+//! `libs/cardano-ledger-conformance/src/Test/Cardano/Ledger/Conformance/ExecSpecRule/Core.hs`:
 //!
-//! 2. Update `tests/conformance/upstream/manifest.toml` to point at the new
-//!    corpus release tag.
+//! ```haskell
+//! case (implResNorm, agdaResNorm) of
+//!     (Right agda, Right impl)
+//!       | agda == impl -> pure ()   -- MATCH: no dump
+//!     (Left _, Left _) -> pure ()   -- BOTH FAIL: no dump
+//!     (agda, impl) -> do            -- DIVERGENCE ONLY: dump fires
+//!       ...
+//!       CONFORMANCE_CBOR_DUMP_PATH → dumpCbor ...
+//! ```
 //!
-//! 3. Run `cargo xtask download-upstream-fixtures`.
+//! Because the reference implementation at any stable pinned SHA passes all of
+//! its own ImpSpec tests, running `CONFORMANCE_CBOR_DUMP_PATH=/path cabal test
+//! cardano-ledger-conformance` produces ZERO dump files.  ImpSpec is a
+//! divergence detector between Haskell STS and Agda MAlonzo, not a fixture
+//! generator.
 //!
-//! The first corpus regeneration is expected to surface real ledger bugs.
-//! Each failure is tracked as a separate issue and added to `SKIP_LIST` below
-//! with a comment referencing the issue number; entries are removed when fixed.
+//! Phase 4 requires a redesigned capture approach.  See `HANDOFF.md` for the
+//! full analysis and alternative options (standalone Haskell generator,
+//! QuickCheck-based generator, Agda/MAlonzo direct invocation, or hand-crafted
+//! vectors).
+//!
+//! ## What IS implemented (ready for real vectors)
+//!
+//! - 4-file vector format: `vector.rs` reads `conformance_dump_{ctx,env,st,sig}.cbor`
+//! - Full NewEpochState structural bridge: `bridge.rs` decodes all 7 fields
+//! - Runner: NEWEPOCH epoch-invariant check + UTXO tx decode
+//! - Synthetic fixture: `ConwayNEWEPOCH/test_minimal_epoch_advance` exercises decode path
+//! - SKIP_LIST: empty (no pending entries — no corpus vectors exist yet)
 //!
 //! ## Vector format (4 files per test-case directory)
 //!
@@ -49,44 +66,36 @@ use std::path::Path;
 
 /// Test scenarios known to fail due to unimplemented Dugite features.
 ///
-/// Each entry is a tuple of (pattern, issue_url).  The pattern is matched
-/// against the rule name as follows:
-///
-/// - `"*"` — wildcard: skip **all** rules regardless of name.
-/// - Any other string — substring: skip if `rule.contains(pattern)`.
-///
-/// Every entry must reference a tracking issue.
-/// **This list should decay to zero.** Removing a skip = closing the issue.
+/// Each entry is a tuple of (rule_substring, issue_url).  The pattern is
+/// matched as a substring of the rule name.  Every entry must reference a
+/// tracking issue.  **This list should decay to zero.**  Removing a skip =
+/// closing the issue.
 ///
 /// ## Current state
 ///
-/// The wildcard entry below covers all ImpSpec rules because the corpus has
-/// not yet been generated.  Vectors are produced by running
-/// `cardano-ledger-conformance` with `CONFORMANCE_CBOR_DUMP_PATH` set, which
-/// requires GHC 9.6.5 + cabal (now wired into the CI workflow).
+/// This list is empty because there are no real ImpSpec CBOR vectors yet.
 ///
-/// Once the workflow runs and real fixture files are downloaded via
-/// `cargo xtask download-upstream-fixtures`, divergences become individual
-/// entries with their own tracking issues; this wildcard entry is removed.
+/// The ImpSpec dump mechanism fires ONLY when the Haskell ledger implementation
+/// diverges from the Agda formal spec — which never happens at the pinned SHA
+/// since that SHA is the validated reference implementation.  Running
+/// `CONFORMANCE_CBOR_DUMP_PATH=/path cabal test cardano-ledger-conformance`
+/// produces ZERO dump files.
 ///
-/// Format: ("*" or "rule-substring", "https://github.com/michaeljfazio/dugite/issues/NNN")
-const SKIP_LIST: &[(&str, &str)] = &[
-    // All ImpSpec rules: pending real corpus generation from the Haskell ImpSpec
-    // test suite.  The CI workflow (regenerate-conformance-corpus.yml) now has
-    // GHC 9.6.5 + cabal wired in.
-    // To unblock: trigger workflow_dispatch from GitHub Actions, then run
-    // `cargo xtask download-upstream-fixtures`.
-    // Track: https://github.com/michaeljfazio/dugite/issues/627
-    ("*", "https://github.com/michaeljfazio/dugite/issues/627"),
-];
+/// Phase 4 requires a redesigned capture approach. See `HANDOFF.md` for the
+/// full analysis and product-owner decision required.
+///
+/// When real vectors exist, per-rule entries follow this format:
+/// ```
+/// ("ConwayNEWEPOCH", "https://github.com/michaeljfazio/dugite/issues/NNN"),
+/// ```
+const SKIP_LIST: &[(&str, &str)] = &[];
 
 /// Returns the issue URL if a test's rule matches a skip entry, or `None`.
 ///
-/// Special pattern `"*"` matches any rule name (wildcard skip-all).
-/// All other patterns are matched as substrings of the rule name.
+/// Patterns are matched as substrings of the rule name.
 fn is_skipped(rule: &str) -> Option<&'static str> {
     for (pattern, issue) in SKIP_LIST {
-        if *pattern == "*" || rule.contains(pattern) {
+        if rule.contains(pattern) {
             return Some(issue);
         }
     }

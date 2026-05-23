@@ -1,35 +1,31 @@
 #!/usr/bin/env bash
 # Capture step for the ledger-rules area (Phase 4 — ImpSpec CBOR dump vectors).
 #
-# Builds cardano-ledger at the pinned SHA and runs the ImpSpec conformance
-# test suite with CONFORMANCE_CBOR_DUMP_PATH set.  The ImpSpec framework
-# produces **4 separate CBOR files per diverging test case**, organised as:
+# ## IMPORTANT: ImpSpec dump semantics
 #
-#   <dump_path>/<Rule>/<test_name>/conformance_dump_ctx.cbor
-#   <dump_path>/<Rule>/<test_name>/conformance_dump_env.cbor
-#   <dump_path>/<Rule>/<test_name>/conformance_dump_st.cbor
-#   <dump_path>/<Rule>/<test_name>/conformance_dump_sig.cbor
+# The ImpSpec framework only produces CBOR dump files when the Haskell ledger
+# implementation DIVERGES from the Agda formal spec.  Confirmed by oracle
+# research on SHA ebed62de1ebcd4b13512418d49d17802a193e2c1, function
+# `checkConformance` in:
+#   libs/cardano-ledger-conformance/src/Test/Cardano/Ledger/Conformance/ExecSpecRule/Core.hs
 #
-# This script mirrors that layout verbatim into the output tarball so that
-# `tests/conformance/src/upstream/ledger_rules_replay/mod.rs` can scan
-# subdirectories and decode each test case from its 4 files.
+# Logic:
+#   - Haskell result == Agda result  →  pure ()   (no dump)
+#   - Both fail                      →  pure ()   (no dump)
+#   - They diverge                   →  dump fires (writes 4 files to CONFORMANCE_CBOR_DUMP_PATH)
 #
-# ## Prerequisites
+# At the stable pinned SHA the reference implementation passes all its own
+# ImpSpec tests.  Therefore: running `CONFORMANCE_CBOR_DUMP_PATH=/path cabal
+# test cardano-ledger-conformance` produces ZERO dump files.
 #
-# This script requires a Haskell toolchain (GHC + cabal or Nix). The CI
-# workflow uses the cardano-ledger Nix flake for reproducibility:
+# This script uses the correct env-var mechanism (not the non-existent
+# `--dump-path` CLI flag).  At the pinned SHA the dump directory will be
+# empty; the stub-fallback below handles this gracefully.
 #
-#   nix develop github:IntersectMBO/cardano-ledger/<SHA> --command \
-#       cabal test cardano-ledger-conformance \
-#           --test-options '--dump-path ./dumps'
+# See HANDOFF.md for the full analysis and alternative corpus generation
+# approaches that the product owner must decide among.
 #
-# Without Nix, fall back to `haskell-actions/setup` in the workflow:
-#
-#   cabal update
-#   cabal test cardano-ledger-conformance \
-#       --test-options '--dump-path ./dumps'
-#
-# ## Output layout (4 files per test-case directory)
+# ## Output layout (4 files per test-case directory, when dumps are produced)
 #
 #   content/<Rule>/<test_name>/conformance_dump_ctx.cbor   — ExecContext
 #   content/<Rule>/<test_name>/conformance_dump_env.cbor   — Environment
@@ -41,14 +37,11 @@
 #
 # ## Current status
 #
-# This script is a stub — the Haskell build step is not yet automated in CI.
-# To generate a real corpus:
-#
-#   1. Install Nix (recommended) or GHC 9.6.x + cabal 3.10.x.
-#   2. Clone IntersectMBO/cardano-ledger at the pinned SHA.
-#   3. Run the ImpSpec test suite with the dump path set.
-#   4. Manually trigger `just regenerate-corpus-local` with the real dumps.
-#   5. Upload the resulting release and update manifest.toml.
+# This script is a stub. Phase 4 corpus generation requires a redesigned
+# approach because ImpSpec only dumps on divergence. See HANDOFF.md for
+# Option A (standalone Haskell fixture generator — recommended), Option B
+# (QuickCheck generator), Option C (Agda/MAlonzo direct), Option D
+# (hand-crafted vectors).
 #
 # The first real corpus run is expected to surface ledger bugs. Each failure
 # is tracked as a separate issue and added to SKIP_LIST in mod.rs.
@@ -129,18 +122,23 @@ DUMP_DIR="${WORK_DIR}/dumps"
 mkdir -p "${DUMP_DIR}"
 
 log "Running ImpSpec test suite with CONFORMANCE_CBOR_DUMP_PATH=${DUMP_DIR} ..."
+log "NOTE: At the stable pinned SHA the reference impl passes all its own ImpSpec tests."
+log "      Dumps only fire on Haskell/Agda divergences — expect ZERO files in ${DUMP_DIR}."
+log "      See HANDOFF.md for the Phase 4 redesign decision."
 if [[ $HAS_NIX -eq 1 ]]; then
     nix develop "${CLONE_DIR}" --command bash -c "
         cd '${CLONE_DIR}'
-        cabal test cardano-ledger-conformance \
-            --test-options '--dump-path ${DUMP_DIR}'
-    " || true  # non-zero exit expected when conformance tests fail (dumps are still written)
+        CONFORMANCE_CBOR_DUMP_PATH='${DUMP_DIR}' \
+            cabal test cardano-ledger-conformance \
+            --test-show-details=streaming
+    " || true  # non-zero exit OK; dumps are written only on divergence
 else
     (
         cd "${CLONE_DIR}"
         cabal update
-        cabal test cardano-ledger-conformance \
-            --test-options "--dump-path ${DUMP_DIR}"
+        CONFORMANCE_CBOR_DUMP_PATH="${DUMP_DIR}" \
+            cabal test cardano-ledger-conformance \
+            --test-show-details=streaming
     ) || true
 fi
 
@@ -198,15 +196,23 @@ done
 log "Captured ${TEST_CASE_COUNT} test cases across ${RULE_COUNT} rule(s)"
 
 if [[ $TEST_CASE_COUNT -eq 0 ]]; then
-    log "WARN: no 4-file test-case directories found under ${DUMP_DIR}."
-    log "Check that CONFORMANCE_CBOR_DUMP_PATH was honoured by the ImpSpec suite."
+    log "INFO: no 4-file test-case directories found under ${DUMP_DIR}."
+    log "This is EXPECTED at the stable pinned SHA: ImpSpec dumps only on Haskell/Agda"
+    log "divergences, which never occur at the validated reference implementation."
+    log "Phase 4 corpus generation requires a redesigned approach. See HANDOFF.md."
     cat > "${CONTENT_DIR}/README.txt" <<'EOF'
-ledger-rules — empty corpus
+ledger-rules — empty corpus (expected at stable pinned SHA)
 
-The ImpSpec test suite ran but produced no 4-file test-case directories.
-This means all conformance tests passed at the pinned cardano-ledger SHA,
-or CONFORMANCE_CBOR_DUMP_PATH was not set correctly.
-See capture-ledger-rules.sh.
+The ImpSpec test suite ran but produced no dump files.  This is expected:
+CONFORMANCE_CBOR_DUMP_PATH only fires when the Haskell ledger implementation
+diverges from the Agda formal spec.  At the stable pinned SHA the reference
+implementation passes all its own ImpSpec tests, so no dumps are produced.
+
+Phase 4 requires a redesigned capture approach.  See HANDOFF.md for options:
+  Option A: Standalone Haskell fixture generator (recommended)
+  Option B: QuickCheck-based fixture generator
+  Option C: Agda/MAlonzo direct invocation
+  Option D: Hand-crafted CBOR vectors
 EOF
     echo '{"__stub__": true}' > "${WORK_DIR}/hashes.json"
     tar -czf "${TARBALL}" -C "${CONTENT_DIR}" .
