@@ -72,12 +72,16 @@ def patch_cabal_file(path: str) -> None:
 
     ts_start = ts_match.start()
 
-    # Find the next top-level stanza after the test-suite (library, executable,
-    # another test-suite, benchmark, etc.) so we only search within the block.
-    next_stanza = re.search(
-        r'^\S', content[ts_start + 1:], re.MULTILINE
-    )
-    ts_end = (ts_start + 1 + next_stanza.start()) if next_stanza else len(content)
+    # Skip past the 'test-suite tests' line itself before searching for the next
+    # top-level stanza (library, executable, another test-suite, benchmark, etc.).
+    ts_line_end = content.find('\n', ts_start)
+    if ts_line_end == -1:
+        ts_line_end = len(content)
+    else:
+        ts_line_end += 1  # include the newline
+
+    next_stanza = re.search(r'^\S', content[ts_line_end:], re.MULTILINE)
+    ts_end = (ts_line_end + next_stanza.start()) if next_stanza else len(content)
     ts_block = content[ts_start:ts_end]
 
     # Idempotency checks.
@@ -86,24 +90,65 @@ def patch_cabal_file(path: str) -> None:
         return
 
     # Find 'build-depends:' inside the block.
-    bd_match = re.search(r'build-depends:', ts_block)
+    bd_match = re.search(r'\bbuild-depends:', ts_block)
     if not bd_match:
         print(f"[patch-impspec-core] WARNING: no build-depends in test-suite tests; skipping")
         return
 
-    # Find the first dependency line (comma-prefix style or bare name).
-    # Insert our additions right after the 'build-depends:' header line.
-    bd_end = ts_start + bd_match.end()  # absolute offset just after 'build-depends:'
+    # Find the end of the build-depends list by scanning lines after 'build-depends:'.
+    # The list ends at the first line that doesn't continue with a leading comma or
+    # indented package name — i.e. at the first blank line or a new field name.
+    bd_header_abs = ts_start + bd_match.start()
+    after_bd = content[bd_header_abs:]
 
-    # Build the insertion: two packages.
+    # Split into lines; the build-depends block is the header + continuation lines.
+    bd_lines = after_bd.split('\n')
+    # Line 0 is 'build-depends:...'
+    # Lines 1+ are continuation lines (leading whitespace + optional comma + name)
+    # A continuation line looks like: '      base', '    , other-pkg', etc.
+    last_bd_line_idx = 0
+    for i in range(1, len(bd_lines)):
+        line = bd_lines[i]
+        # Continuation: non-empty and starts with whitespace
+        if line and (line[0] == ' ' or line[0] == '\t'):
+            # Still a continuation if it looks like a dep line or is blank-ish
+            stripped = line.strip()
+            # Stop if this line is a new cabal field (e.g. 'hs-source-dirs:')
+            if stripped and re.match(r'^[a-z]', stripped) and ':' in stripped.split()[0]:
+                break
+            last_bd_line_idx = i
+        elif not line.strip():
+            # Blank line ends the build-depends
+            break
+        else:
+            break
+
+    # Absolute offset of end of the last build-depends continuation line.
+    insert_abs = bd_header_abs + sum(len(l) + 1 for l in bd_lines[:last_bd_line_idx + 1])
+    # -1 to position before the trailing newline of the last dep line
+    insert_abs -= 1  # just before the '\n' that ends the last dep line
+    insert_abs += 1  # after the last dep's text (end of line content)
+    # Actually, just track the exact byte offset:
+    # insert_abs = position right after the last character of the last dep line
+    # (before the newline), so we append "\n    , pkg" there.
+    offset = bd_header_abs
+    for i, line in enumerate(bd_lines):
+        if i == last_bd_line_idx + 1:
+            break
+        offset += len(line) + 1  # +1 for '\n'
+    # offset is now at the start of bd_lines[last_bd_line_idx + 1]
+    # Insert before that (i.e. after the newline of the last dep line)
+    insert_abs = offset
+
+    # Build the insertion: two packages appended after the last existing dep.
     to_add = ""
     if "filepath" not in ts_block:
-        to_add += "\n    , filepath"
+        to_add += "    , filepath\n"
     if "cardano-ledger-api" not in ts_block:
-        to_add += "\n    , cardano-ledger-api"
+        to_add += "    , cardano-ledger-api\n"
 
     if to_add:
-        content = content[:bd_end] + to_add + content[bd_end:]
+        content = content[:insert_abs] + to_add + content[insert_abs:]
 
     _write_if_changed(path, original, content)
 
