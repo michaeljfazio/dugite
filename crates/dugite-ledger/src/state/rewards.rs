@@ -554,11 +554,21 @@ impl LedgerState {
     pub(crate) fn apply_pending_reward_update(&mut self) {
         if let Some(rupd) = self.epochs.pending_reward_update.take() {
             // Apply reserves decrease (monetary expansion)
-            self.epochs.reserves.0 = self.epochs.reserves.0.saturating_sub(rupd.delta_reserves);
+            self.epochs.reserves.0 = self
+                .epochs
+                .reserves
+                .0
+                .checked_sub(rupd.delta_reserves)
+                .expect("RUPD delta_reserves exceeds reserves — ledger invariant broken");
 
             // Apply treasury increase (tau cut only; undistributed went to reserves
             // via delta_reserves above; per-reward unregistered → treasury below).
-            self.epochs.treasury.0 = self.epochs.treasury.0.saturating_add(rupd.delta_treasury);
+            self.epochs.treasury.0 = self
+                .epochs
+                .treasury
+                .0
+                .checked_add(rupd.delta_treasury)
+                .expect("RUPD delta_treasury overflows treasury u64");
 
             // Apply per-account rewards (matching Haskell's applyRUpdFiltered):
             // registered credentials → reward account; unregistered → treasury.
@@ -572,7 +582,12 @@ impl LedgerState {
                             .or_insert(Lovelace(0)) += *reward;
                         total_applied += reward.0;
                     } else {
-                        self.epochs.treasury.0 = self.epochs.treasury.0.saturating_add(reward.0);
+                        self.epochs.treasury.0 = self
+                            .epochs
+                            .treasury
+                            .0
+                            .checked_add(reward.0)
+                            .expect("treasury overflow on undistributed reward");
                         unregistered_total += reward.0;
                     }
                 }
@@ -671,8 +686,18 @@ impl LedgerState {
         let rupd =
             self.calculate_rewards_inner(&rupd_snapshot, &rupd_snapshot, self.utxo.epoch_fees.0);
         // Apply immediately (legacy behavior for test compatibility)
-        self.epochs.reserves.0 = self.epochs.reserves.0.saturating_sub(rupd.delta_reserves);
-        self.epochs.treasury.0 = self.epochs.treasury.0.saturating_add(rupd.delta_treasury);
+        self.epochs.reserves.0 = self
+            .epochs
+            .reserves
+            .0
+            .checked_sub(rupd.delta_reserves)
+            .expect("RUPD delta_reserves exceeds reserves — ledger invariant broken");
+        self.epochs.treasury.0 = self
+            .epochs
+            .treasury
+            .0
+            .checked_add(rupd.delta_treasury)
+            .expect("RUPD delta_treasury overflows treasury u64");
         for (cred_hash, reward) in &rupd.rewards {
             if reward.0 > 0 {
                 *Arc::make_mut(&mut self.certs.reward_accounts)

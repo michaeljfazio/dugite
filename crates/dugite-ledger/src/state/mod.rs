@@ -1362,7 +1362,12 @@ impl LedgerState {
         // Without this, monetary expansion (rho * reserves) is computed on too
         // large a reserves value, draining reserves too fast and overfilling
         // the treasury.
-        self.epochs.reserves.0 = self.epochs.reserves.0.saturating_sub(total_lovelace);
+        self.epochs.reserves.0 = self
+            .epochs
+            .reserves
+            .0
+            .checked_sub(total_lovelace)
+            .expect("genesis UTxO total exceeds maxLovelaceSupply — invariant broken");
 
         debug!(
             "Ledger: seeded {} genesis UTxOs ({} lovelace, reserves now {})",
