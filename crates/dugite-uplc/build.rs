@@ -1,23 +1,24 @@
 //! Build script that materialises per-test `#[test]` functions for the
 //! UPLC evaluation conformance corpus.
 //!
-//! When the `conformance` cargo feature is enabled, walks
-//! `tests/conformance/` (populated by
-//! `scripts/dev/download-plutus-conformance.sh`) and emits one test
-//! function per leaf directory containing a `*.uplc` file. The harness
-//! itself lives in `tests/conformance.rs`; this script only generates
-//! the entries it includes via
-//! `include!(concat!(env!("OUT_DIR"), "/generated_conformance_tests.rs"))`.
+//! When the `upstream-conformance` (or its alias `conformance`) cargo feature
+//! is enabled, walks the unified fixture root and emits one test function per
+//! leaf directory containing a `*.uplc` file. The harness itself lives in
+//! `tests/conformance.rs`; this script only generates the entries it includes
+//! via `include!(concat!(env!("OUT_DIR"), "/generated_conformance_tests.rs"))`.
 //!
-//! When the feature is off, emits an empty file so the include macro
-//! still compiles. We deliberately do NOT touch the test directory in
-//! that case so a default `cargo build` neither rebuilds on changes to
-//! the corpus nor requires the corpus to exist.
+//! **Corpus location** (searched in order):
+//!   1. `$DUGITE_UPSTREAM_FIXTURES_DIR/plutus/` — explicit override.
+//!   2. `<workspace_root>/tests/conformance/upstream/fixtures/plutus/` —
+//!      populated by `cargo xtask download-upstream-fixtures [--area plutus]`.
 //!
-//! Skip list: `tests/conformance_skip.txt`, one path per line (paths
-//! are relative to `tests/conformance/` and use forward slashes, e.g.
-//! `builtin/semantics/droplist/droplist-09`). Lines starting with `#`
-//! are comments.
+//! When the feature is off, emits an empty file so the include macro still
+//! compiles.
+//!
+//! Skip list: `tests/conformance_skip.txt`, one path per line (paths are
+//! relative to the corpus root and use forward slashes, e.g.
+//! `builtin/semantics/droplist/droplist-09`). Lines starting with `#` are
+//! comments.
 
 use std::collections::BTreeSet;
 use std::env;
@@ -30,7 +31,8 @@ fn main() {
     let out_dir = PathBuf::from(env::var("OUT_DIR").expect("OUT_DIR"));
     let out_file = out_dir.join("generated_conformance_tests.rs");
 
-    let conformance_enabled = env::var_os("CARGO_FEATURE_CONFORMANCE").is_some();
+    let conformance_enabled = env::var_os("CARGO_FEATURE_UPSTREAM_CONFORMANCE").is_some()
+        || env::var_os("CARGO_FEATURE_CONFORMANCE").is_some();
 
     if !conformance_enabled {
         fs::write(&out_file, "// conformance feature disabled\n")
@@ -38,7 +40,18 @@ fn main() {
         return;
     }
 
-    let corpus_root = crate_root.join("tests").join("conformance");
+    // Resolve corpus root: env override → workspace unified fixture root.
+    let corpus_root = if let Ok(dir) = env::var("DUGITE_UPSTREAM_FIXTURES_DIR") {
+        PathBuf::from(dir).join("plutus")
+    } else {
+        workspace_root(&crate_root)
+            .join("tests")
+            .join("conformance")
+            .join("upstream")
+            .join("fixtures")
+            .join("plutus")
+    };
+
     let skip_path = crate_root.join("tests").join("conformance_skip.txt");
 
     println!("cargo:rerun-if-changed={}", skip_path.display());
@@ -57,9 +70,10 @@ fn main() {
 #[test]
 fn conformance_corpus_missing() {
     eprintln!(
-        "tests/conformance/ is empty. Run `just uplc-conformance-fetch` (or \
-         scripts/dev/download-plutus-conformance.sh) to populate it from the \
-         latest stable IntersectMBO/plutus release, then re-run with \
+        "Plutus conformance corpus not found. Run \
+         `cargo xtask download-upstream-fixtures --area plutus` \
+         (or `just download-upstream-fixtures-area plutus`) to populate \
+         tests/conformance/upstream/fixtures/plutus/, then re-run with \
          `cargo test -p dugite-uplc --features conformance --test conformance`."
     );
 }
@@ -201,6 +215,24 @@ fn sanitise_test_name(rel_forward: &str) -> String {
         s.insert(0, '_');
     }
     s
+}
+
+/// Walk upward from `start` until we find a Cargo.toml containing `[workspace]`.
+fn workspace_root(start: &Path) -> PathBuf {
+    let mut dir = start.to_path_buf();
+    loop {
+        let candidate = dir.join("Cargo.toml");
+        if candidate.exists()
+            && fs::read_to_string(&candidate)
+                .map(|s| s.contains("[workspace]"))
+                .unwrap_or(false)
+        {
+            return dir;
+        }
+        if !dir.pop() {
+            panic!("workspace root not found from {}", start.display());
+        }
+    }
 }
 
 fn load_skip_list(path: &Path) -> BTreeSet<String> {

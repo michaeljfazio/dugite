@@ -1,0 +1,28 @@
+[package]
+name = "xtask"
+version.workspace = true
+edition.workspace = true
+publish = false
+description = "Dugite workspace task runner — download-upstream-fixtures binary"
+default-run = "xtask"
+
+[[bin]]
+name = "xtask"
+path = "src/bin/xtask.rs"
+
+[[bin]]
+name = "download-upstream-fixtures"
+path = "src/bin/download-upstream-fixtures.rs"
+
+[dependencies]
+toml    = { workspace = true }
+serde   = { workspace = true }
+reqwest = { version = "0.12", features = ["blocking", "rustls-tls"], default-features = false }
+flate2  = "1"
+tar     = { workspace = true }
+sha2    = { workspace = true }
+anyhow  = { workspace = true }
+clap    = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

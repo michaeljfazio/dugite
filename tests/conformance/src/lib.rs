@@ -24,3 +24,6 @@
 pub mod adapters;
 pub mod runner;
 pub mod schema;
+
+#[cfg(feature = "upstream-conformance")]
+pub mod upstream;

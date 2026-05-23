@@ -1,0 +1,43 @@
+# The dugite release this corpus pins to. Every upstream area
+# is pulled as an asset of this single release tag.
+#
+# See also: sources.toml (which upstream SHAs were used to produce this release)
+#
+# To adopt a new corpus:
+#   1. Edit sources.toml and trigger the regenerate-conformance-corpus workflow
+#   2. Update [release].tag below to the new conformance-corpus-v<timestamp> tag
+#   3. Run: just download-upstream-fixtures && just test-upstream
+#   4. Fix any test fallout, then PR the sources.toml + manifest.toml + code changes
+
+[release]
+repo = "michaeljfazio/dugite"
+# Updated to the first real corpus release once Phase 0 workflow runs.
+tag  = "conformance-corpus-v20260523-070720"
+
+[area.ouroboros-consensus]
+asset  = "ouroboros-consensus.tar.gz"
+target = "ouroboros-consensus"
+
+[area.cardano-ledger]
+asset  = "cardano-ledger.tar.gz"
+target = "cardano-ledger"
+
+[area.cardano-node]
+asset  = "cardano-node.tar.gz"
+target = "cardano-node"
+
+[area.plutus]
+asset  = "plutus.tar.gz"
+target = "plutus"
+
+[area.ledger-rules]
+asset  = "ledger-rules.tar.gz"
+target = "ledger-rules"
+
+[area.cardano-base]
+asset  = "cardano-base.tar.gz"
+target = "cardano-base"
+
+[area.mithril]
+asset  = "mithril.tar.gz"
+target = "mithril"
