@@ -47,6 +47,16 @@ fn cardano_node_genesis_decodes() {
     dugite_conformance::upstream::cardano_node::run_all_checks(&dir);
 }
 
+// ── cardano-ledger strict typed PParams ──────────────────────────────────────
+
+#[test]
+fn cardano_ledger_pparams_typed_decodes() {
+    let Some(dir) = fixtures::check_area("cardano-ledger") else {
+        return;
+    };
+    dugite_conformance::upstream::cardano_ledger_pparams_typed::run_all_checks(&dir);
+}
+
 // ── cardano-ledger CDDL validation ───────────────────────────────────────────
 
 #[test]
