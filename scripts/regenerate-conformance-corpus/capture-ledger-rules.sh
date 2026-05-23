@@ -1,47 +1,32 @@
 #!/usr/bin/env bash
-# Capture step for the ledger-rules area (Phase 4 — ImpSpec CBOR dump vectors).
+# Capture step for the ledger-rules area (Phase 4 — standalone Haskell fixture generator).
 #
-# ## IMPORTANT: ImpSpec dump semantics
+# ## Approach: dugite-fixture-gen (Option A)
 #
-# The ImpSpec framework only produces CBOR dump files when the Haskell ledger
-# implementation DIVERGES from the Agda formal spec.  Confirmed by oracle
-# research on SHA ebed62de1ebcd4b13512418d49d17802a193e2c1, function
-# `checkConformance` in:
-#   libs/cardano-ledger-conformance/src/Test/Cardano/Ledger/Conformance/ExecSpecRule/Core.hs
+# This script builds and runs `tools/ledger-fixture-gen/` — a small Haskell
+# executable that instantiates Conway STS rules with known inputs, runs the
+# Haskell STS transitions, and emits 4 CBOR files per test case.
 #
-# Logic:
-#   - Haskell result == Agda result  →  pure ()   (no dump)
-#   - Both fail                      →  pure ()   (no dump)
-#   - They diverge                   →  dump fires (writes 4 files to CONFORMANCE_CBOR_DUMP_PATH)
+# This replaces the ImpSpec approach (CONFORMANCE_CBOR_DUMP_PATH) which only
+# fires on Haskell/Agda divergences and produces ZERO files at a stable SHA.
+# Confirmed by oracle research on SHA ebed62de1ebcd4b13512418d49d17802a193e2c1.
 #
-# At the stable pinned SHA the reference implementation passes all its own
-# ImpSpec tests.  Therefore: running `CONFORMANCE_CBOR_DUMP_PATH=/path cabal
-# test cardano-ledger-conformance` produces ZERO dump files.
+# ## Generator build strategy
 #
-# This script uses the correct env-var mechanism (not the non-existent
-# `--dump-path` CLI flag).  At the pinned SHA the dump directory will be
-# empty; the stub-fallback below handles this gracefully.
+# The generator is compiled INSIDE the cardano-ledger workspace (cloned at the
+# pinned SHA) by adding it as a sub-package to cabal.project.  This guarantees
+# that all cardano-ledger-* dependency versions match exactly — no separate
+# cabal freeze file or version negotiation needed.
 #
-# See HANDOFF.md for the full analysis and alternative corpus generation
-# approaches that the product owner must decide among.
+# ## Output layout (4 files per test-case directory)
 #
-# ## Output layout (4 files per test-case directory, when dumps are produced)
+#   content/ConwayNEWEPOCH/<test_name>/conformance_dump_ctx.cbor   — CBOR null (0xF6)
+#   content/ConwayNEWEPOCH/<test_name>/conformance_dump_env.cbor   — CBOR null (0xF6)
+#   content/ConwayNEWEPOCH/<test_name>/conformance_dump_st.cbor    — NewEpochState array(7)
+#   content/ConwayNEWEPOCH/<test_name>/conformance_dump_sig.cbor   — EpochNo (CBOR uint)
 #
-#   content/<Rule>/<test_name>/conformance_dump_ctx.cbor   — ExecContext
-#   content/<Rule>/<test_name>/conformance_dump_env.cbor   — Environment
-#   content/<Rule>/<test_name>/conformance_dump_st.cbor    — State (NewEpochState array(7))
-#   content/<Rule>/<test_name>/conformance_dump_sig.cbor   — Signal
-#
-# Where <Rule> is the ledger rule name (e.g. ConwayNEWEPOCH, ConwayUTXO) and
-# <test_name> is the ImpSpec test scenario name.
-#
-# ## Current status
-#
-# This script is a stub. Phase 4 corpus generation requires a redesigned
-# approach because ImpSpec only dumps on divergence. See HANDOFF.md for
-# Option A (standalone Haskell fixture generator — recommended), Option B
-# (QuickCheck generator), Option C (Agda/MAlonzo direct), Option D
-# (hand-crafted vectors).
+# ctx/env are CBOR null (0xF6) because the NEWEPOCH rule uses () for both,
+# and Haskell's `EncCBOR ()` instance is `encodeNull`.
 #
 # The first real corpus run is expected to surface ledger bugs. Each failure
 # is tracked as a separate issue and added to SKIP_LIST in mod.rs.
@@ -82,22 +67,25 @@ if [[ $HAS_NIX -eq 0 && $HAS_CABAL -eq 0 ]]; then
     log "Producing placeholder tarball."
 
     cat > "${CONTENT_DIR}/README.txt" <<'EOF'
-ledger-rules — stub placeholder
+ledger-rules — stub placeholder (no Haskell toolchain found)
 
-This area requires a Haskell toolchain to populate. See:
-  scripts/regenerate-conformance-corpus/capture-ledger-rules.sh
+This area requires a Haskell toolchain (GHC 9.6.x + cabal 3.10.x) to populate.
+See: scripts/regenerate-conformance-corpus/capture-ledger-rules.sh
 
-To generate real ImpSpec CBOR vectors:
-  1. Install Nix (recommended) or GHC 9.6.x + cabal 3.10.x.
+To generate real CBOR conformance vectors:
+  1. Install GHC 9.6.x + cabal 3.10.x (or Nix).
   2. Run `just regenerate-corpus-local` from the workspace root.
   3. Update manifest.toml to point at the new release tag.
   4. Run `cargo xtask download-upstream-fixtures`.
 
+The generator (tools/ledger-fixture-gen/) builds as a sub-package inside
+the cloned cardano-ledger workspace and produces Conway NEWEPOCH fixtures.
+
 Vector format: 4 files per test-case directory
-  <Rule>/<test_name>/conformance_dump_ctx.cbor  — ExecContext
-  <Rule>/<test_name>/conformance_dump_env.cbor  — Environment
-  <Rule>/<test_name>/conformance_dump_st.cbor   — State (NewEpochState array(7))
-  <Rule>/<test_name>/conformance_dump_sig.cbor  — Signal
+  ConwayNEWEPOCH/<test_name>/conformance_dump_ctx.cbor  — CBOR null (0xF6, EncCBOR ())
+  ConwayNEWEPOCH/<test_name>/conformance_dump_env.cbor  — CBOR null (0xF6, EncCBOR ())
+  ConwayNEWEPOCH/<test_name>/conformance_dump_st.cbor   — NewEpochState array(7)
+  ConwayNEWEPOCH/<test_name>/conformance_dump_sig.cbor  — EpochNo (CBOR uint)
 
 The Phase 4 test module (ledger_rules_replay) will skip gracefully
 until real fixture directories are present (only the synthetic
@@ -118,34 +106,71 @@ git clone --quiet --depth=1 "https://github.com/IntersectMBO/cardano-ledger.git"
 git -C "${CLONE_DIR}" fetch --quiet --depth=1 origin "${SHA}"
 git -C "${CLONE_DIR}" checkout --quiet "${SHA}"
 
-DUMP_DIR="${WORK_DIR}/dumps"
-mkdir -p "${DUMP_DIR}"
+# ── Set up the Dugite fixture generator inside the cardano-ledger workspace ───
+#
+# We add the generator as a cabal sub-package inside the cloned cardano-ledger
+# workspace.  This guarantees that all cardano-ledger-* dependency versions
+# resolve automatically from the workspace's own cabal.project — no separate
+# freeze file or manual version pinning needed.
 
-log "Running ImpSpec test suite with CONFORMANCE_CBOR_DUMP_PATH=${DUMP_DIR} ..."
-log "NOTE: At the stable pinned SHA the reference impl passes all its own ImpSpec tests."
-log "      Dumps only fire on Haskell/Agda divergences — expect ZERO files in ${DUMP_DIR}."
-log "      See HANDOFF.md for the Phase 4 redesign decision."
+GENERATOR_DIR="${CLONE_DIR}/dugite-fixture-gen"
+mkdir -p "${GENERATOR_DIR}/src"
+log "Installing Dugite fixture generator into ${GENERATOR_DIR}..."
+
+# Locate our generator source files relative to the script.
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
+GENERATOR_SRC="${REPO_ROOT}/tools/ledger-fixture-gen"
+
+if [[ ! -f "${GENERATOR_SRC}/dugite-fixture-gen.cabal" ]]; then
+    log "ERROR: ${GENERATOR_SRC}/dugite-fixture-gen.cabal not found"
+    log "       tools/ledger-fixture-gen/ must be present in the repo"
+    exit 1
+fi
+
+cp "${GENERATOR_SRC}/dugite-fixture-gen.cabal" "${GENERATOR_DIR}/"
+cp "${GENERATOR_SRC}/src/Main.hs"              "${GENERATOR_DIR}/src/"
+
+# Add the generator to cardano-ledger's cabal.project.
+echo "packages: dugite-fixture-gen/" >> "${CLONE_DIR}/cabal.project"
+log "Added dugite-fixture-gen/ to cabal.project"
+
+# Build the generator using cabal (deps resolve against cardano-ledger's project).
+log "Building Dugite fixture generator (this resolves against cardano-ledger deps)..."
 if [[ $HAS_NIX -eq 1 ]]; then
     nix develop "${CLONE_DIR}" --command bash -c "
         cd '${CLONE_DIR}'
-        CONFORMANCE_CBOR_DUMP_PATH='${DUMP_DIR}' \
-            cabal test cardano-ledger-conformance \
-            --test-show-details=streaming
-    " || true  # non-zero exit OK; dumps are written only on divergence
+        cabal update
+        cabal build dugite-fixture-gen 2>&1 | tail -30
+    "
 else
     (
         cd "${CLONE_DIR}"
         cabal update
-        CONFORMANCE_CBOR_DUMP_PATH="${DUMP_DIR}" \
-            cabal test cardano-ledger-conformance \
-            --test-show-details=streaming
-    ) || true
+        cabal build dugite-fixture-gen 2>&1 | tail -30
+    )
+fi
+
+# Run the generator to produce CBOR fixture files.
+DUMP_DIR="${WORK_DIR}/dumps"
+mkdir -p "${DUMP_DIR}"
+log "Running Dugite fixture generator → ${DUMP_DIR}..."
+if [[ $HAS_NIX -eq 1 ]]; then
+    nix develop "${CLONE_DIR}" --command bash -c "
+        cd '${CLONE_DIR}'
+        cabal run dugite-fixture-gen -- --output-dir '${DUMP_DIR}'
+    "
+else
+    (
+        cd "${CLONE_DIR}"
+        cabal run dugite-fixture-gen -- --output-dir "${DUMP_DIR}"
+    )
 fi
 
 # ── Mirror 4-file test-case directories into content structure ────────────────
 #
-# The ImpSpec framework emits:
-#   <DUMP_DIR>/<Rule>/<test_name>/conformance_dump_{ctx,env,st,sig}.cbor
+# The generator writes:
+#   <DUMP_DIR>/ConwayNEWEPOCH/<test_name>/conformance_dump_{ctx,env,st,sig}.cbor
 #
 # We copy each 4-file test-case directory verbatim into CONTENT_DIR so the
 # Rust test module can scan subdirectories and find all 4 files.
@@ -196,27 +221,9 @@ done
 log "Captured ${TEST_CASE_COUNT} test cases across ${RULE_COUNT} rule(s)"
 
 if [[ $TEST_CASE_COUNT -eq 0 ]]; then
-    log "INFO: no 4-file test-case directories found under ${DUMP_DIR}."
-    log "This is EXPECTED at the stable pinned SHA: ImpSpec dumps only on Haskell/Agda"
-    log "divergences, which never occur at the validated reference implementation."
-    log "Phase 4 corpus generation requires a redesigned approach. See HANDOFF.md."
-    cat > "${CONTENT_DIR}/README.txt" <<'EOF'
-ledger-rules — empty corpus (expected at stable pinned SHA)
-
-The ImpSpec test suite ran but produced no dump files.  This is expected:
-CONFORMANCE_CBOR_DUMP_PATH only fires when the Haskell ledger implementation
-diverges from the Agda formal spec.  At the stable pinned SHA the reference
-implementation passes all its own ImpSpec tests, so no dumps are produced.
-
-Phase 4 requires a redesigned capture approach.  See HANDOFF.md for options:
-  Option A: Standalone Haskell fixture generator (recommended)
-  Option B: QuickCheck-based fixture generator
-  Option C: Agda/MAlonzo direct invocation
-  Option D: Hand-crafted CBOR vectors
-EOF
-    echo '{"__stub__": true}' > "${WORK_DIR}/hashes.json"
-    tar -czf "${TARBALL}" -C "${CONTENT_DIR}" .
-    exit 0
+    log "ERROR: generator ran but produced no 4-file test-case directories under ${DUMP_DIR}."
+    log "       Check the generator output above for compilation or runtime errors."
+    exit 1
 fi
 
 # ── Emit hashes (one entry per CBOR file) ────────────────────────────────────
