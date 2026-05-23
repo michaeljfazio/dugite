@@ -654,32 +654,24 @@ pub(super) fn check_script_data_hash(
                 }
             }
 
-            // Debug log when the intersection is empty despite having redeemers
+            // Per Haskell `Cardano.Ledger.Alonzo.UTxOW.scriptsNeeded` the
+            // language set is determined solely by the
+            // scriptsNeeded ∩ scriptsProvided hash intersection.  If a
+            // needed script-hash is missing from the provided set the tx is
+            // invalid (`MissingScriptWitnessesUTXOW`); there is no fallback
+            // path that ignores the hash check and trusts the on-chain
+            // `script_ref` tag.  Surface the empty-intersection case so a
+            // CBOR encoding bug elsewhere doesn't silently degrade to a
+            // wrong cost-model integrity hash.
             if !has_v1 && !has_v2 && !has_v3 && has_redeemers && !scripts_needed.is_empty() {
                 debug!(
                     needed_count = scripts_needed.len(),
                     provided_count = scripts_provided.len(),
                     needed = ?scripts_needed.iter().map(|h| h.to_hex()).collect::<Vec<_>>(),
                     provided = ?scripts_provided.keys().map(|h| h.to_hex()).collect::<Vec<_>>(),
-                    "scriptsNeeded/Provided intersection empty — falling back to ref input scan"
+                    "scriptsNeeded ∩ scriptsProvided is empty despite redeemers — \
+                     downstream script_data_hash check will reject the tx (issue #633)"
                 );
-            }
-
-            // Fallback: if we have redeemers but no languages were detected
-            // (script hash matching failed), scan reference inputs directly.
-            // This handles edge cases where our hash computation differs from
-            // the address hash (e.g., double-encoded scripts).
-            if !has_v1 && !has_v2 && !has_v3 && has_redeemers {
-                for ref_input in &body.reference_inputs {
-                    if let Some(utxo) = utxo_set.lookup(ref_input) {
-                        match &utxo.script_ref {
-                            Some(ScriptRef::PlutusV1(_)) => has_v1 = true,
-                            Some(ScriptRef::PlutusV2(_)) => has_v2 = true,
-                            Some(ScriptRef::PlutusV3(_)) => has_v3 = true,
-                            _ => {}
-                        }
-                    }
-                }
             }
 
             // Compute the expected script_data_hash. When raw tx CBOR is
