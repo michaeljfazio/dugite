@@ -118,11 +118,11 @@ log "Applying ImpSpec dump patch..."
 python3 "${PATCH_SCRIPT}" "${EXEC_SPEC_CORE}" "${IMP_CORE}"
 
 # ── Build the patched conformance test suite ──────────────────────────────────
-log "Building cardano-ledger-conformance:tests (this may take 30-45 min cold)..."
+log "Building cardano-ledger-conformance:test:tests (this may take 30-45 min cold)..."
 (
     cd "${CLONE_DIR}"
     cabal update
-    cabal build cardano-ledger-conformance:tests 2>&1
+    cabal build cardano-ledger-conformance:test:tests 2>&1
 )
 
 # ── Run the patched conformance tests to collect CBOR vectors ─────────────────
@@ -138,11 +138,11 @@ log "Building cardano-ledger-conformance:tests (this may take 30-45 min cold)...
 DUMP_DIR="${WORK_DIR}/dumps"
 mkdir -p "${DUMP_DIR}"
 
-log "Running cardano-ledger-conformance:tests → ${DUMP_DIR}..."
+log "Running cardano-ledger-conformance:test:tests → ${DUMP_DIR}..."
 (
     cd "${CLONE_DIR}"
     CONFORMANCE_CBOR_DUMP_PATH="${DUMP_DIR}" \
-    cabal test cardano-ledger-conformance:tests \
+    cabal test cardano-ledger-conformance:test:tests \
         --test-options "--quickcheck-tests 10 --num-threads 1" \
         2>&1
 ) || log "WARN: Some conformance tests may have reported failures (vectors are still collected)"
