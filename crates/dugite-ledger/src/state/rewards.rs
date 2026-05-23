@@ -415,6 +415,20 @@ pub fn compute_reward_update(
                     continue;
                 }
 
+                // Mirror Haskell `rewardOnePoolMember.prefilter`
+                // (eras/shelley/impl/.../Rewards.hs:262):
+                //   prefilter = hardforkBabbageForgoRewardPrefilter pv || hk ∈ addrsRew
+                //
+                // For pv ≤ 6 (Shelley-Alonzo), the member credential must be
+                // currently registered in the reward-accounts set or the
+                // computed reward is dropped at startStep time. For pv ≥ 7
+                // (Babbage onward, ledger errata 17.2) the prefilter is
+                // bypassed; routing of unregistered rewards happens at
+                // applyRUpd time (frTotalUnregistered → treasury).
+                if prev_protocol_version_major <= 6 && !reward_accounts.contains_key(cred_hash) {
+                    continue;
+                }
+
                 let member_stake = go
                     .stake_distribution
                     .get(cred_hash)

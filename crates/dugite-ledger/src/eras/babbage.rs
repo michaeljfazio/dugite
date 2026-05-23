@@ -182,24 +182,33 @@ impl EraRules for BabbageRules {
 
     /// Handle hard fork state transformations when entering Babbage.
     ///
-    /// Alonzo -> Babbage: bump the on-chain protocol version to (7, 0). New
-    /// Babbage features (reference inputs, inline datums, reference scripts,
-    /// collateral return) are additive and do not require existing state
-    /// changes; the transition from TPraos to Praos (VRF output representation
-    /// change) is handled at the consensus layer.
+    /// Alonzo -> Babbage: ledger-side translation. In cardano-node the actual
+    /// `ProtVer` bump to (7,0) is performed by the consensus Hard Fork
+    /// Combinator (HFC) tick layered ABOVE the ledger STS — see
+    /// `Cardano.Protocol.Crypto.Praos.Translation` and the HFC `Telescope`
+    /// machinery in `ouroboros-consensus-cardano`. The pre-Conway ledger PPUP
+    /// path (`ProposedPPUpdates` → `UPEC` → `NEWPP`) writes the new `ProtVer`
+    /// into `curPParams` at the epoch boundary, and `prevPParams` captures the
+    /// PRE-bump value (used by RUPD's `hardforkBabbageForgoRewardPrefilter`).
     ///
-    /// In cardano-node the Alonzo→Babbage era boundary is a hard fork.
-    /// `translateEra @BabbageEra @AlonzoEra` for `PParams` copies the old
-    /// `ProtVer` across unchanged; the actual bump to PV7 is performed by the
-    /// consensus Hard Fork Combinator in the era-crossing tick. Dugite has no
-    /// separate HFC layer — era transitions are dispatched entirely in the
-    /// ledger crate via `block.era`. So we replicate the HFC's PV write here
-    /// at the Alonzo→Babbage boundary. Without this, dugite enters Babbage
-    /// with `curPParams.protocol_version_major = 6` (Alonzo's intra-era PV6
-    /// bump) and any code path gated on `pv >= 7` (decentralization parameter
-    /// override, Babbage min_fee semantics, etc.) silently fails. Tracked as
-    /// issue #615 — the same class as the resolved Babbage→Conway PV9 bug
-    /// (issue #481, see `eras/conway.rs:835-856`).
+    /// Dugite must NOT write the new PV here. Doing so would race ahead of the
+    /// PPUP application path (`shelley.rs::process_epoch_transition` lines
+    /// 454–462 capture `old_proto_major` from `epochs.protocol_params` BEFORE
+    /// PPUP runs at line 510, then `prev_pp` is set from `old_proto_major` at
+    /// line 575–577). If `on_era_transition` (apply.rs Step 2) bumps PV before
+    /// `process_epoch_transition` (Step 3) runs, `old_proto_major` reads the
+    /// already-bumped value and `prev_pp.pv` ends up one boundary ahead of
+    /// Haskell's `prevPParamsEpochStateL`. That breaks the prev-pv predicate
+    /// used by Haskell's `hardforkBabbageForgoRewardPrefilter` and shifts the
+    /// first effective reward-distribution boundary by one epoch (root cause
+    /// of issue #626).
+    ///
+    /// After issue #624 the pre-Conway PPUP decoder correctly reads tx body
+    /// key 6 across all five pre-Conway era decoders, so the PPUP path drives
+    /// the PV bump exactly as in Haskell. This `on_era_transition` is now a
+    /// no-op for Babbage — the era enum advance happens via `apply.rs:801`
+    /// (`self.era = block.era`) and any state-shape changes are handled in
+    /// the per-tx Babbage decoders + apply path.
     fn on_era_transition(
         &self,
         from_era: Era,
@@ -208,25 +217,13 @@ impl EraRules for BabbageRules {
         _certs: &mut CertSubState,
         _gov: &mut GovSubState,
         _consensus: &mut ConsensusSubState,
-        epochs: &mut EpochSubState,
+        _epochs: &mut EpochSubState,
     ) -> Result<(), LedgerError> {
-        // Mirror cardano-node's HFC era-crossing tick: set the new era's
-        // initial PV. Guard by `ctx.era == Babbage` so we never clobber if
-        // dispatched for any other destination (defensive).
-        if ctx.era == Era::Babbage {
-            debug!(
-                "{:?} -> Babbage era transition: bumping protocol version to (7, 0)",
-                from_era
-            );
-            epochs.protocol_params.protocol_version_major = 7;
-            epochs.protocol_params.protocol_version_minor = 0;
-        } else {
-            debug!(
-                "BabbageRules::on_era_transition called with unexpected ctx.era={:?} \
-                 (from_era={:?}); leaving protocol version untouched",
-                ctx.era, from_era,
-            );
-        }
+        debug!(
+            "{:?} -> Babbage era transition (ctx.era={:?}): no ledger-side state \
+             mutation; PV bump driven by PPUP via UPEC/NEWPP",
+            from_era, ctx.era
+        );
         Ok(())
     }
 
@@ -766,7 +763,13 @@ mod tests {
     /// era-crossing tick in cardano-node — the same class as the resolved
     /// Babbage→Conway PV9 bug (issue #481). See issue #615.
     #[test]
-    fn test_on_era_transition_alonzo_to_babbage_sets_pv7() {
+    fn test_on_era_transition_alonzo_to_babbage_does_not_bump_pv() {
+        // After issue #626 fix: on_era_transition must NOT bump PV. Haskell's
+        // HFC tick happens at the consensus layer, not the ledger STS. The PV
+        // bump is driven by PPUP via UPEC/NEWPP at the same boundary, AFTER
+        // `prevPParams` is captured. Bumping here races ahead of that capture
+        // and breaks `hardforkBabbageForgoRewardPrefilter` semantics by one
+        // boundary.
         let rules = BabbageRules::new();
         let mut params = ProtocolParameters::mainnet_defaults();
         params.protocol_version_major = 6;
@@ -791,10 +794,8 @@ mod tests {
         );
         assert!(result.is_ok());
         assert_eq!(
-            epochs.protocol_params.protocol_version_major, 7,
-            "Alonzo->Babbage HFC translation must bump protocol_version_major to 7 \
-             (issue #615 — same class as #481). Without this any `pv >= 7` gate \
-             (decentralization parameter override, etc.) silently fails.",
+            epochs.protocol_params.protocol_version_major, 6,
+            "on_era_transition must NOT bump PV — PPUP via UPEC/NEWPP does that",
         );
         assert_eq!(epochs.protocol_params.protocol_version_minor, 0);
     }

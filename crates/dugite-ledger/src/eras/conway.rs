@@ -852,20 +852,19 @@ impl EraRules for ConwayRules {
         // bppProtocolVersion`); the actual bump to PV9 is performed by the
         // consensus Hard Fork Combinator in the era-crossing tick.
         //
-        // Dugite has no separate HFC layer — era transitions are dispatched
-        // entirely in the ledger crate via `block.era`.  So we replicate the
-        // HFC's PV write here at the Babbage→Conway boundary.  Without this,
-        // dugite enters Conway with `curPParams.protocol_version_major = 8`
-        // and the Conway-bootstrap branch (gated on `pv == 9`) never fires,
-        // causing the ratification of any preview-era ParameterChange that
-        // relies on bootstrap thresholds (typically a single CC vote with
-        // no DRep/SPO support) to silently fail.  Observed downstream effect
-        // on preview: at boundary 735→736 three sibling ParameterChange
-        // proposals stayed in the proposal pool unrefunded, leaving
-        // dugite -100K ADA in treasury and -100K ADA in the GO-snapshot
-        // active stake versus Koios — the residual drift tracked in #481.
-        epochs.protocol_params.protocol_version_major = 9;
-        epochs.protocol_params.protocol_version_minor = 0;
+        // Issue #626: do NOT bump PV here. Haskell's HFC tick reacts to a
+        // HardForkInitiation gov action that drives the PV bump (typically
+        // 8→9) via UPEC/NEWPP. The PV write happens via the gov-action
+        // enactment path, AFTER `prevPParams` is captured. Bumping in
+        // `on_era_transition` (which fires at apply.rs Step 2, before
+        // `process_epoch_transition`'s capture at Step 3) races ahead and
+        // leaves `prev_pp.pv` one boundary too high — breaking
+        // `hardforkBabbageForgoRewardPrefilter` semantics.
+        //
+        // Previously this was a workaround for the missing PPUP / gov-action
+        // decoder which has now been fixed via #624. The HardForkInitiation
+        // enactment path correctly drives the PV bump during normal
+        // ratification — no on_era_transition write needed.
 
         // Step 1: Purge pointer-based stake from stake distribution.
         // Setting ptr_stake_excluded = true causes stake_routing() in common.rs
@@ -2033,7 +2032,17 @@ mod tests {
     /// stake-snapshot drift versus Koios beginning at e736 and e738
     /// respectively.
     #[test]
-    fn test_on_era_transition_babbage_to_conway_sets_pv9() {
+    fn test_on_era_transition_babbage_to_conway_does_not_bump_pv() {
+        // After issue #626 fix: on_era_transition must NOT bump PV. Haskell's
+        // Babbage→Conway HFC tick is driven by a HardForkInitiation governance
+        // action ratified via the Conway-era governance pipeline (RATIFY →
+        // ENACT). The PV bump (typically 8→9) happens in `enactmentTransition`
+        // (`Conway/Rules/Enact.hs`) and is written into `curPParams` via
+        // `updateRewards`, AFTER `prevPParams` is captured. Bumping in
+        // `on_era_transition` (which fires at apply.rs Step 2, before
+        // `process_epoch_transition`'s capture at Step 3) races ahead and
+        // leaves `prev_pp.pv` one boundary too high — same class of bug as
+        // the Babbage on_era_transition workaround that was removed.
         let rules = ConwayRules::new();
         let mut params = ProtocolParameters::mainnet_defaults();
         params.protocol_version_major = 8;
@@ -2058,9 +2067,8 @@ mod tests {
         );
         assert!(result.is_ok());
         assert_eq!(
-            epochs.protocol_params.protocol_version_major, 9,
-            "Babbage→Conway translation must bump protocol_version_major to 9 \
-             so the Conway-bootstrap governance branch can fire (issue #481)",
+            epochs.protocol_params.protocol_version_major, 8,
+            "on_era_transition must NOT bump PV — HardForkInitiation gov action does that",
         );
         assert_eq!(
             epochs.protocol_params.protocol_version_minor, 0,
