@@ -230,7 +230,7 @@ impl EraRules for ShelleyRules {
             let rupd_pp = &epochs.prev_protocol_params;
             let rupd = crate::compute_reward_update(
                 rupd_pp,
-                epochs.prev_d,
+                &epochs.prev_d,
                 epochs.prev_protocol_version_major,
                 go_ref,
                 &epochs.snapshots.bprev_blocks_by_pool,
@@ -252,7 +252,7 @@ impl EraRules for ShelleyRules {
                     ctx.current_epoch.0,
                     new_epoch.0,
                     rupd_pp,
-                    epochs.prev_d,
+                    &epochs.prev_d,
                     epochs.prev_protocol_version_major,
                     epochs.reserves,
                     epochs.treasury,
@@ -451,12 +451,19 @@ impl EraRules for ShelleyRules {
             .retain(|_, epoch| *epoch > new_epoch);
 
         // Capture prevPParams BEFORE PPUP updates.
+        //
+        // Post-Babbage (PV >= 7) `d` is conceptually 0 (no overlay slots —
+        // Babbage drops `ppDG` from PParams). dugite carries a flat
+        // `ProtocolParameters` across all eras, so we synthesise the
+        // post-Babbage Rational zero here.  Pre-Babbage we keep the exact
+        // rational from PParams — never go through f64 (issue #629).
         let old_d = if epochs.protocol_params.protocol_version_major >= 7 {
-            0.0
+            dugite_primitives::transaction::Rational {
+                numerator: 0,
+                denominator: 1,
+            }
         } else {
-            let d_n = epochs.protocol_params.d.numerator as f64;
-            let d_d = epochs.protocol_params.d.denominator.max(1) as f64;
-            d_n / d_d
+            epochs.protocol_params.d.clone()
         };
         let old_proto_major = epochs.protocol_params.protocol_version_major;
         let old_params = epochs.protocol_params.clone();
@@ -995,7 +1002,10 @@ mod tests {
             protocol_params: ProtocolParameters::mainnet_defaults(),
             prev_protocol_params: ProtocolParameters::mainnet_defaults(),
             prev_protocol_version_major: 2,
-            prev_d: 1.0,
+            prev_d: dugite_primitives::transaction::Rational {
+                numerator: 1,
+                denominator: 1,
+            },
         }
     }
 
@@ -1687,7 +1697,10 @@ mod tests {
         let initial_treasury = epochs.treasury.0;
 
         // Set d < 0.8 so decentralisation allows pool rewards.
-        epochs.prev_d = 0.5;
+        epochs.prev_d = dugite_primitives::transaction::Rational {
+            numerator: 1,
+            denominator: 2,
+        };
 
         let result = rules.process_epoch_transition(
             EpochNo(6),

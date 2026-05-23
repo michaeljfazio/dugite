@@ -249,7 +249,7 @@ impl LedgerState {
                 {
                     let upcoming_rupd = crate::state::rewards::compute_reward_update(
                         &self.epochs.prev_protocol_params,
-                        self.epochs.prev_d,
+                        &self.epochs.prev_d,
                         self.epochs.prev_protocol_version_major,
                         self.epochs.snapshots.go.as_ref(),
                         &self.epochs.snapshots.bprev_blocks_by_pool,
@@ -855,7 +855,7 @@ impl LedgerState {
                 snapshots: self.epochs.snapshots.clone(),
                 protocol_params: self.epochs.protocol_params.clone(),
                 prev_protocol_params: self.epochs.prev_protocol_params.clone(),
-                prev_d: self.epochs.prev_d,
+                prev_d: self.epochs.prev_d.clone(),
                 prev_protocol_version_major: self.epochs.prev_protocol_version_major,
                 pending_pp_updates_cleared: self.epochs.pending_pp_updates.is_empty()
                     && self.epochs.future_pp_updates.is_empty(),

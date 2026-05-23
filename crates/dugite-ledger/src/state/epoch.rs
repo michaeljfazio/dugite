@@ -442,12 +442,16 @@ impl LedgerState {
         // NEWPP rule: prevPParams = old curPParams (before this boundary's PPUP).
         // The RUPD at the NEXT boundary will use prev_protocol_params for ALL
         // parameter values (rho, tau, a0, n_opt, active_slots_coeff, d, proto).
+        // Post-Babbage (PV >= 7) `d` is conceptually 0 (no overlay slots).
+        // Pre-Babbage we keep the exact rational from PParams — never go
+        // through f64 (issue #629).
         let old_d = if self.epochs.protocol_params.protocol_version_major >= 7 {
-            0.0
+            dugite_primitives::transaction::Rational {
+                numerator: 0,
+                denominator: 1,
+            }
         } else {
-            let d_n = self.epochs.protocol_params.d.numerator as f64;
-            let d_d = self.epochs.protocol_params.d.denominator.max(1) as f64;
-            d_n / d_d
+            self.epochs.protocol_params.d.clone()
         };
         let old_proto_major = self.epochs.protocol_params.protocol_version_major;
         let old_params = self.epochs.protocol_params.clone();
@@ -1044,7 +1048,10 @@ mod tests {
         // below maxSupply so (maxSupply - reserves) > 0.
         state.epochs.reserves = Lovelace(MAX_LOVELACE_SUPPLY / 2);
         // prev_d >= 0.8 → eta = 1 (full monetary expansion fires).
-        state.epochs.prev_d = 1.0;
+        state.epochs.prev_d = dugite_primitives::transaction::Rational {
+            numerator: 1,
+            denominator: 1,
+        };
 
         let pool_id = Hash28::from_bytes([0x01u8; 28]);
         let delegator_cred = Credential::VerificationKey(Hash28::from_bytes([0x42u8; 28]));
@@ -1213,7 +1220,10 @@ mod tests {
 
         // Give the state some circulation so pool rewards fire.
         state.epochs.reserves = Lovelace(MAX_LOVELACE_SUPPLY / 2);
-        state.epochs.prev_d = 1.0;
+        state.epochs.prev_d = dugite_primitives::transaction::Rational {
+            numerator: 1,
+            denominator: 1,
+        };
 
         let pool_id = Hash28::from_bytes([0xAAu8; 28]);
         // Use a specific credential for the pool reward account.

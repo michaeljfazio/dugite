@@ -1,23 +1,14 @@
 //! Flat wire format for LedgerState snapshot serialization.
 //!
-//! `LedgerStateSnapshot` preserves the **exact bincode field ordering** of
-//! the original monolithic `LedgerState` struct.  Bincode is positional: it
-//! encodes/decodes fields in declaration order with no field names in the
-//! wire format.  Adding, removing, or reordering fields silently corrupts
-//! existing snapshots.
+//! `LedgerStateSnapshot` is the bincode wire view of the runtime
+//! `LedgerState`.  Bincode is positional: it encodes/decodes fields in
+//! declaration order with no field names.  Any change to the struct's
+//! field types or ordering is a breaking format change — bump
+//! `LedgerState::SNAPSHOT_VERSION` so the loader rejects the old format
+//! and operators re-sync from chain.
 //!
-//! # CRITICAL INVARIANT
-//!
-//! **The field order in `LedgerStateSnapshot` MUST match the field order of
-//! `LedgerState` as it existed when snapshots were first written.**
-//!
-//! When `LedgerState` is restructured to use sub-state structs (Task 6),
-//! the in-memory layout will change but this struct stays frozen.  Snapshot
-//! save/load goes through `LedgerState -> LedgerStateSnapshot -> bincode`
-//! (and the reverse), keeping the on-disk format stable.
-//!
-//! Do NOT reorder, rename (in a way that changes position), or remove any
-//! field without a migration path.
+//! There is no migration path between versions.  Pre-1.0 dugite makes no
+//! snapshot back-compat guarantee.
 
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
@@ -25,14 +16,12 @@ use std::sync::Arc;
 use dugite_primitives::hash::{Hash28, Hash32};
 use dugite_primitives::protocol_params::ProtocolParameters;
 use dugite_primitives::time::EpochNo;
-use dugite_primitives::transaction::ProtocolParamUpdate;
+use dugite_primitives::transaction::{ProtocolParamUpdate, Rational};
 use dugite_primitives::value::Lovelace;
 use serde::{Deserialize, Serialize};
 
 use super::{
-    default_d_one, default_lovelace_zero, default_prev_proto_major, default_prev_protocol_params,
-    default_update_quorum, EpochSnapshots, GovernanceState, PendingRewardUpdate, PoolRegistration,
-    StakeDistributionState,
+    EpochSnapshots, GovernanceState, PendingRewardUpdate, PoolRegistration, StakeDistributionState,
 };
 use crate::plutus::SlotConfig;
 use crate::utxo::UtxoSet;
@@ -40,11 +29,11 @@ use crate::utxo_diff::DiffSeq;
 use dugite_primitives::block::Tip;
 use dugite_primitives::era::Era;
 
-/// Stable bincode wire format matching the original `LedgerState` field layout.
+/// Bincode wire view of `LedgerState`.
 ///
-/// Every field here mirrors the original `LedgerState` declaration order,
-/// including all `serde` attributes that affect deserialization defaults.
-/// See the module-level documentation for the invariant that MUST be upheld.
+/// Field order matters — bincode is positional.  Any structural change to
+/// this struct must be accompanied by a `LedgerState::SNAPSHOT_VERSION`
+/// bump so the loader rejects out-of-date on-disk snapshots.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LedgerStateSnapshot {
     /// Current UTxO set
@@ -61,28 +50,28 @@ pub struct LedgerStateSnapshot {
     /// Shelley epoch length in slots
     pub epoch_length: u64,
     /// Number of Byron epochs before the Shelley hard fork.
-    #[serde(default)]
     pub shelley_transition_epoch: u64,
     /// Byron epoch length in slots (10 * k). 0 = mainnet default (21600).
-    #[serde(default)]
     pub byron_epoch_length: u64,
     /// Current protocol parameters (curPParams in Haskell).
     pub protocol_params: ProtocolParameters,
     /// Previous epoch's protocol parameters (Haskell's prevPParams).
-    #[serde(default = "default_prev_protocol_params")]
     pub prev_protocol_params: ProtocolParameters,
-    /// Cached prev_d for backward compatibility and serde.
-    #[serde(default = "default_d_one")]
-    pub prev_d: f64,
-    /// Cached prev protocol major version for backward compatibility.
-    #[serde(default = "default_prev_proto_major")]
+    /// Decentralisation parameter from the previous epoch boundary.
+    ///
+    /// Stored as an exact `Rational` (was `f64` prior to v17 / issue #629).
+    /// Required for byte-exact Haskell reward calc on mainnet, where
+    /// `d ∈ {0, 0.05, …, 1.0}` cannot be represented losslessly in
+    /// IEEE-754 binary64.
+    pub prev_d: Rational,
+    /// Protocol major version captured from the previous epoch boundary
+    /// (Haskell's `prevPParams ^. ppProtocolVersionL.protocolVersionMajor`).
     pub prev_protocol_version_major: u64,
     /// Stake distribution
     pub stake_distribution: StakeDistributionState,
     /// Treasury balance
     pub treasury: Lovelace,
     /// Pending treasury donations (Conway `TreasuryDonation`).
-    #[serde(default = "default_lovelace_zero")]
     pub pending_donations: Lovelace,
     /// Reserves balance (ADA not yet in circulation)
     pub reserves: Lovelace,
@@ -91,7 +80,6 @@ pub struct LedgerStateSnapshot {
     /// Pool registrations: pool_id -> pool registration
     pub pool_params: Arc<HashMap<Hash28, PoolRegistration>>,
     /// Future pool parameters for re-registrations.
-    #[serde(default)]
     pub future_pool_params: HashMap<Hash28, PoolRegistration>,
     /// Pool retirements pending: pool -> retirement epoch.
     pub pending_retirements: HashMap<Hash28, EpochNo>,
@@ -100,10 +88,8 @@ pub struct LedgerStateSnapshot {
     /// Reward accounts: stake credential hash -> accumulated rewards
     pub reward_accounts: Arc<HashMap<Hash32, Lovelace>>,
     /// Pointer map: certificate pointers -> credential hashes.
-    #[serde(default)]
     pub pointer_map: HashMap<dugite_primitives::credentials::Pointer, Hash32>,
     /// Genesis delegates: genesis_key_hash -> (delegate_key_hash, vrf_key_hash).
-    #[serde(default)]
     pub genesis_delegates: HashMap<Hash28, (Hash28, Hash32)>,
     /// Fees collected in the current epoch
     pub epoch_fees: Lovelace,
@@ -124,26 +110,18 @@ pub struct LedgerStateSnapshot {
     /// Randomness stabilisation window: ceiling(4k/f).
     pub randomness_stabilisation_window: u64,
     /// Stability window: ceiling(3k/f).
-    #[serde(default)]
     pub stability_window_3kf: u64,
     /// Shelley genesis hash (used for initial nonce state)
     pub genesis_hash: Hash32,
-    // Legacy fields kept for serde backwards compatibility with existing snapshots
-    #[serde(default)]
     rolling_nonce: Hash32,
-    #[serde(default)]
     stability_window: u64,
-    #[serde(default)]
     first_block_hash_of_epoch: Option<Hash32>,
-    #[serde(default)]
     prev_epoch_first_block_hash: Option<Hash32>,
     /// Current protocol parameter update proposals (pre-Conway).
     pub pending_pp_updates: BTreeMap<EpochNo, Vec<(Hash32, ProtocolParamUpdate)>>,
     /// Future protocol parameter update proposals (pre-Conway).
-    #[serde(default)]
     pub future_pp_updates: BTreeMap<EpochNo, Vec<(Hash32, ProtocolParamUpdate)>>,
     /// Quorum for pre-Conway protocol parameter updates.
-    #[serde(default = "default_update_quorum")]
     pub update_quorum: u64,
     /// Conway governance state
     pub governance: Arc<GovernanceState>,
@@ -153,19 +131,15 @@ pub struct LedgerStateSnapshot {
     #[serde(skip)]
     pub needs_stake_rebuild: bool,
     /// Pointer-addressed UTxO stake: pointer -> coin amount.
-    #[serde(default)]
     pub ptr_stake: HashMap<dugite_primitives::credentials::Pointer, u64>,
     /// Whether pointer-addressed UTxO stake has been excluded from stake_distribution.
     #[serde(skip)]
     pub ptr_stake_excluded: bool,
-    /// Pending reward update retained for backward compatibility.
-    #[serde(default)]
+    /// Pending reward update (drained at the next epoch boundary).
     pub pending_reward_update: Option<PendingRewardUpdate>,
     /// Running total of all stake key deposits locked in the ledger (lovelace).
-    #[serde(default)]
     pub total_stake_key_deposits: u64,
     /// Script-type stake credentials.
-    #[serde(default)]
     pub script_stake_credentials: std::collections::HashSet<Hash32>,
     /// Per-block UTxO diffs for the last k blocks.
     #[serde(skip)]
@@ -174,13 +148,10 @@ pub struct LedgerStateSnapshot {
     #[serde(skip)]
     pub node_network: Option<dugite_primitives::network::NetworkId>,
     /// Operational certificate counters per pool.
-    #[serde(default)]
     pub opcert_counters: HashMap<Hash28, u64>,
     /// Per-credential deposit paid at stake key registration time (lovelace).
-    #[serde(default)]
     pub stake_key_deposits: HashMap<Hash32, u64>,
     /// Per-pool deposit paid at pool registration time (lovelace).
-    #[serde(default)]
     pub pool_deposits: HashMap<Hash28, u64>,
 }
 
@@ -233,7 +204,7 @@ impl From<&super::LedgerState> for LedgerStateSnapshot {
             protocol_params: s.epochs.protocol_params.clone(),
             prev_protocol_params: s.epochs.prev_protocol_params.clone(),
             prev_protocol_version_major: s.epochs.prev_protocol_version_major,
-            prev_d: s.epochs.prev_d,
+            prev_d: s.epochs.prev_d.clone(),
             // Coordination fields
             tip: s.tip.clone(),
             era: s.era,

@@ -296,8 +296,8 @@ pub struct EpochTransitionDelta {
     pub protocol_params: ProtocolParameters,
     /// Previous protocol parameters (swap during PPUP).
     pub prev_protocol_params: ProtocolParameters,
-    /// Updated prev_d value.
-    pub prev_d: f64,
+    /// Updated prev_d value (exact `Rational`; issue #629).
+    pub prev_d: dugite_primitives::transaction::Rational,
     /// Updated prev_protocol_version_major.
     pub prev_protocol_version_major: u64,
     /// Cleared pending PP updates (pre-Conway).
@@ -1015,7 +1015,7 @@ fn apply_epoch_transition_delta(state: &mut LedgerState, et: &EpochTransitionDel
     state.epochs.snapshots = et.snapshots.clone();
     state.epochs.protocol_params = et.protocol_params.clone();
     state.epochs.prev_protocol_params = et.prev_protocol_params.clone();
-    state.epochs.prev_d = et.prev_d;
+    state.epochs.prev_d = et.prev_d.clone();
     state.epochs.prev_protocol_version_major = et.prev_protocol_version_major;
     state.consensus.epoch_nonce = et.epoch_nonce;
     state.consensus.last_epoch_block_nonce = et.last_epoch_block_nonce;

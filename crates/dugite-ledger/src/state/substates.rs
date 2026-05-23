@@ -16,7 +16,7 @@ use std::sync::Arc;
 
 use dugite_primitives::hash::{Hash28, Hash32};
 use dugite_primitives::time::EpochNo;
-use dugite_primitives::transaction::ProtocolParamUpdate;
+use dugite_primitives::transaction::{ProtocolParamUpdate, Rational};
 use dugite_primitives::value::Lovelace;
 
 use crate::utxo::UtxoSet;
@@ -99,5 +99,9 @@ pub struct EpochSubState {
     pub protocol_params: ProtocolParameters,
     pub prev_protocol_params: ProtocolParameters,
     pub prev_protocol_version_major: u64,
-    pub prev_d: f64,
+    /// Decentralisation parameter captured at the previous epoch boundary
+    /// (Haskell's `prevPParams ^. ppDG`).  Stored as an exact `Rational` so
+    /// that `d >= 4/5` (overlay gate) and `(1 - d) * f * slotsPerEpoch`
+    /// (expected-blocks calc) are byte-exact with Haskell — see issue #629.
+    pub prev_d: Rational,
 }

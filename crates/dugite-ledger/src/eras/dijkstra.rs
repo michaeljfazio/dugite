@@ -850,7 +850,10 @@ mod tests {
             protocol_params: ProtocolParameters::mainnet_defaults(),
             prev_protocol_params: ProtocolParameters::mainnet_defaults(),
             prev_protocol_version_major: 11,
-            prev_d: 0.0,
+            prev_d: dugite_primitives::transaction::Rational {
+                numerator: 0,
+                denominator: 1,
+            },
         }
     }
 
@@ -1445,7 +1448,10 @@ mod tests {
                 protocol_params: ProtocolParameters::mainnet_defaults(),
                 prev_protocol_params: ProtocolParameters::mainnet_defaults(),
                 prev_protocol_version_major: 12,
-                prev_d: 0.0,
+                prev_d: dugite_primitives::transaction::Rational {
+                    numerator: 0,
+                    denominator: 1,
+                },
             };
             let params = ProtocolParameters::mainnet_defaults();
             let delegates: HashMap<Hash28, (Hash28, Hash32)> = HashMap::new();
@@ -1742,7 +1748,10 @@ mod tests {
                 protocol_params: ProtocolParameters::mainnet_defaults(),
                 prev_protocol_params: ProtocolParameters::mainnet_defaults(),
                 prev_protocol_version_major: 12,
-                prev_d: 0.0,
+                prev_d: dugite_primitives::transaction::Rational {
+                    numerator: 0,
+                    denominator: 1,
+                },
             };
             let params = ProtocolParameters::mainnet_defaults();
             let delegates: HashMap<Hash28, (Hash28, Hash32)> = HashMap::new();
@@ -1954,7 +1963,10 @@ mod tests {
                     protocol_params: ProtocolParameters::mainnet_defaults(),
                     prev_protocol_params: ProtocolParameters::mainnet_defaults(),
                     prev_protocol_version_major: 12,
-                    prev_d: 0.0,
+                    prev_d: dugite_primitives::transaction::Rational {
+                        numerator: 0,
+                        denominator: 1,
+                    },
                 };
                 (utxo, certs, gov, epochs)
             };
@@ -2346,7 +2358,10 @@ mod tests {
                     protocol_params: ProtocolParameters::mainnet_defaults(),
                     prev_protocol_params: ProtocolParameters::mainnet_defaults(),
                     prev_protocol_version_major: 12,
-                    prev_d: 0.0,
+                    prev_d: dugite_primitives::transaction::Rational {
+                        numerator: 0,
+                        denominator: 1,
+                    },
                 };
                 (utxo, certs, gov, epochs)
             };
@@ -2724,7 +2739,10 @@ mod tests {
                         protocol_params: ProtocolParameters::mainnet_defaults(),
                         prev_protocol_params: ProtocolParameters::mainnet_defaults(),
                         prev_protocol_version_major: 12,
-                        prev_d: 0.0,
+                        prev_d: dugite_primitives::transaction::Rational {
+                            numerator: 0,
+                            denominator: 1,
+                        },
                     },
                 )
             };

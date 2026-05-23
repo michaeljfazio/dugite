@@ -1232,7 +1232,10 @@ mod tests {
             protocol_params: ProtocolParameters::mainnet_defaults(),
             prev_protocol_params: ProtocolParameters::mainnet_defaults(),
             prev_protocol_version_major: 1,
-            prev_d: 1.0,
+            prev_d: dugite_primitives::transaction::Rational {
+                numerator: 1,
+                denominator: 1,
+            },
         }
     }
 

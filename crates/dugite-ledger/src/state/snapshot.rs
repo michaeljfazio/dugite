@@ -126,44 +126,16 @@ impl<'a, W: std::io::Write> std::io::Write for HashingWriter<'a, W> {
 impl LedgerState {
     /// Current snapshot format version.
     ///
-    /// # Bump checklist
+    /// Bincode is positional and not self-describing — any change to
+    /// `LedgerStateSnapshot` field types or order is a breaking format
+    /// change.  Bump this constant on every structural change and any
+    /// snapshot written by a prior binary will be quarantined on load
+    /// (see `load_snapshot`); operators rebuild from ImmutableDB chunks.
     ///
-    /// Bincode is positional and not self-describing — adding, removing, or
-    /// reordering any serialised field (including transitively, e.g. a new
-    /// field in `CostModels` or `ProtocolParameters`) silently shifts every
-    /// downstream byte boundary and renders prior snapshots undecodable.
-    ///
-    /// When bumping `SNAPSHOT_VERSION`:
-    ///
-    /// 1. **Document the structural change** in a `vN (issue #...)` line below
-    ///    so future debugging has a citation back to the PR.
-    /// 2. **Prefer migration over rejection.** If a `migrate_vN_to_vM()`
-    ///    shim is feasible (typically requires duplicating the prior
-    ///    `LedgerStateSnapshot` shape under a different module), wire it into
-    ///    `load_snapshot()` before the version-mismatch quarantine guard.
-    /// 3. **If migration is infeasible**, the existing quarantine path will
-    ///    fire (issue #609): the unreadable snapshot is renamed to
-    ///    `<name>.vNN-unreadable` and `load_snapshot` returns an error
-    ///    naming both versions. The caller is expected to rebuild the
-    ///    ledger by replaying ImmutableDB chunks — the on-disk ChainDB is
-    ///    not touched by the snapshot layer, so no chain data is lost.
-    /// 4. **Add a breaking-change note to the release process** alongside
-    ///    the bump so operators are warned that the first restart on the
-    ///    new binary will trigger a from-chain replay (minutes-to-hours
-    ///    depending on tip distance).
-    ///
-    /// # Version history
-    ///
-    /// * v16 (issue #475 Phase 5, issue #609 quarantine) — `CostModels`
-    ///   gained `plutus_v4: Option<Vec<i64>>` (Dijkstra cost-model slot 3).
-    ///   The new `Option` is serialised as a positional tag byte at the end
-    ///   of `CostModels`, which shifts every byte after `cost_models` in
-    ///   `protocol_params` (and `prev_protocol_params`) — v15 snapshots are
-    ///   unreadable. Prior to issue #609 the loader merely WARN-logged and
-    ///   then handed the v15 bytes to the v16 bincode decoder, which failed
-    ///   with `tag for enum is not valid, found 65`; the caller swallowed
-    ///   that error and silently re-synced from genesis.
-    pub(crate) const SNAPSHOT_VERSION: u8 = 16;
+    /// dugite is pre-1.0 and makes no snapshot back-compat guarantee:
+    /// there is no migration shim and no `serde(default)` fallbacks on
+    /// fields added after launch.
+    pub(crate) const SNAPSHOT_VERSION: u8 = 17;
 
     /// Save ledger state snapshot to disk using bincode serialization.
     ///
@@ -284,88 +256,40 @@ impl LedgerState {
             )));
         }
 
-        let data = if raw.len() >= 37 && &raw[..4] == b"DUGT" {
-            let fifth_byte = raw[4];
-            if fifth_byte > 0 && fifth_byte < 128 {
-                // Versioned format: DUGT + version(1) + checksum(32) + data
-                let version = fifth_byte;
-                if version > Self::SNAPSHOT_VERSION {
-                    return Err(LedgerError::EpochTransition(format!(
-                        "Unsupported snapshot version {version} (max supported: {}). \
-                         Delete the snapshot to re-sync from chain.",
-                        Self::SNAPSHOT_VERSION,
-                    )));
-                }
-                if version < Self::SNAPSHOT_VERSION {
-                    // Older version — bincode is positional and not
-                    // self-describing, so a bump that adds, removes, or
-                    // reorders any serialised field makes the prior layout
-                    // unreadable by the current decoder. Rather than fall
-                    // through to a guaranteed-to-fail bincode call (which
-                    // emits cryptic "tag for enum is not valid, found NN"
-                    // errors and triggers `init_fresh_ledger`, silently
-                    // dropping the operator's working state — issue #609),
-                    // we refuse the snapshot **before** attempting to
-                    // deserialise it.
-                    //
-                    // The caller is expected to rebuild ledger state by
-                    // replaying ImmutableDB chunks; the on-disk ChainDB is
-                    // not touched by this path, so no chain data is lost.
-                    // The quarantine rename below preserves the original
-                    // bytes for forensics and prevents the same unreadable
-                    // file from being retried on the next restart.
-                    quarantine_unreadable_snapshot(path, version);
-                    return Err(LedgerError::EpochTransition(format!(
-                        "Snapshot version {version} predates current snapshot \
-                         format version {}; the on-disk LedgerState layout is \
-                         not bincode-compatible across SNAPSHOT_VERSION bumps. \
-                         The unreadable snapshot has been quarantined; the \
-                         ledger will be rebuilt by replaying ImmutableDB chunks. \
-                         See issue #609.",
-                        Self::SNAPSHOT_VERSION,
-                    )));
-                }
-                debug!(version, "Loading versioned snapshot");
-                let stored_checksum = &raw[5..37];
-                let payload = &raw[37..];
-                let computed = dugite_primitives::hash::blake2b_256(payload);
-                if computed.as_bytes() != stored_checksum {
-                    return Err(LedgerError::EpochTransition(
-                        "Snapshot checksum mismatch — file may be corrupted".to_string(),
-                    ));
-                }
-                payload
-            } else {
-                // Legacy format with checksum but no version byte:
-                // DUGT + checksum(32) + data (5th byte is part of blake2b hash)
-                warn!("Loading legacy snapshot (no version byte) with checksum verification");
-                let stored_checksum = &raw[4..36];
-                let payload = &raw[36..];
-                let computed = dugite_primitives::hash::blake2b_256(payload);
-                if computed.as_bytes() != stored_checksum {
-                    return Err(LedgerError::EpochTransition(
-                        "Snapshot checksum mismatch — file may be corrupted".to_string(),
-                    ));
-                }
-                payload
-            }
-        } else if raw.len() >= 36 && &raw[..4] == b"DUGT" {
-            // Legacy format with checksum (exactly 36 bytes of header, rare edge case)
-            warn!("Loading legacy snapshot (no version byte) with checksum verification");
-            let stored_checksum = &raw[4..36];
-            let payload = &raw[36..];
-            let computed = dugite_primitives::hash::blake2b_256(payload);
-            if computed.as_bytes() != stored_checksum {
-                return Err(LedgerError::EpochTransition(
-                    "Snapshot checksum mismatch — file may be corrupted".to_string(),
-                ));
-            }
-            payload
-        } else {
-            // Legacy format: raw bincode without header (backwards compatible)
-            warn!("Loading legacy snapshot without checksum verification");
-            &raw
-        };
+        // Snapshot framing is `DUGT(4) + version(1) + checksum(32) + payload`.
+        // No back-compat: any other shape or mismatched version is rejected
+        // and quarantined so the caller can rebuild from ImmutableDB chunks.
+        if raw.len() < 37 || &raw[..4] != b"DUGT" {
+            return Err(LedgerError::EpochTransition(
+                "Snapshot is missing the DUGT framing header — delete the \
+                 snapshot to re-sync from chain"
+                    .to_string(),
+            ));
+        }
+        let version = raw[4];
+        if version != Self::SNAPSHOT_VERSION {
+            // Quarantine the file so the same unreadable bytes do not get
+            // retried on the next restart; ChainDB is untouched so the
+            // ledger will be rebuilt by replaying chunks.
+            quarantine_unreadable_snapshot(path, version);
+            return Err(LedgerError::EpochTransition(format!(
+                "Snapshot version {version} does not match the current \
+                 SNAPSHOT_VERSION {}. The unreadable snapshot has been \
+                 quarantined; the ledger will be rebuilt by replaying \
+                 ImmutableDB chunks.",
+                Self::SNAPSHOT_VERSION,
+            )));
+        }
+        let stored_checksum = &raw[5..37];
+        let payload = &raw[37..];
+        let computed = dugite_primitives::hash::blake2b_256(payload);
+        if computed.as_bytes() != stored_checksum {
+            return Err(LedgerError::EpochTransition(
+                "Snapshot checksum mismatch — file may be corrupted".to_string(),
+            ));
+        }
+        debug!(version, "Loading versioned snapshot");
+        let data = payload;
 
         // Use bincode options with size limit as defense-in-depth against
         // malicious payloads that encode enormous internal allocations.
@@ -402,36 +326,8 @@ impl LedgerState {
         // After that single rebuild, incremental tracking takes over.
         state.epochs.needs_stake_rebuild = true;
         // After loading a snapshot, the node is past genesis — RUPD should fire
-        // at the next epoch boundary. Old snapshots without this field will
-        // deserialize with rupd_ready=false (serde default), so set it here.
+        // at the next epoch boundary.
         state.epochs.snapshots.rupd_ready = true;
-        // Migration: populate per-credential deposit maps from current protocol
-        // parameters when loading snapshots written before per-credential deposit
-        // tracking was added (version < 12). This is an approximation that is
-        // correct for all networks where key_deposit/pool_deposit have never
-        // changed via governance.
-        if state.certs.stake_key_deposits.is_empty() && !state.certs.reward_accounts.is_empty() {
-            let deposit = state.epochs.protocol_params.key_deposit.0;
-            for cred_hash in state.certs.reward_accounts.keys() {
-                state.certs.stake_key_deposits.insert(*cred_hash, deposit);
-            }
-            debug!(
-                "Migrated {} stake key deposits from current key_deposit={}",
-                state.certs.stake_key_deposits.len(),
-                deposit,
-            );
-        }
-        if state.certs.pool_deposits.is_empty() && !state.certs.pool_params.is_empty() {
-            let deposit = state.epochs.protocol_params.pool_deposit.0;
-            for pool_id in state.certs.pool_params.keys() {
-                state.certs.pool_deposits.insert(*pool_id, deposit);
-            }
-            debug!(
-                "Migrated {} pool deposits from current pool_deposit={}",
-                state.certs.pool_deposits.len(),
-                deposit,
-            );
-        }
         debug!(
             "Snapshot loaded from {} ({:.1} MB, {} UTxOs, epoch {})",
             path.display(),
@@ -649,38 +545,29 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // 6. Legacy format loading: plain bincode (no DUGT header) must succeed
+    // 6. Header-less snapshots must be rejected (no back-compat path)
     // -----------------------------------------------------------------------
 
-    /// Write a snapshot in the legacy raw-bincode format (no `DUGT` header at
-    /// all) and verify that `load_snapshot` can still deserialise it.
-    ///
-    /// This exercises the third branch of `load_snapshot`: the plain-bincode
-    /// fallback that exists for backwards compatibility with very old snapshots.
+    /// A plain bincode-serialised snapshot without the `DUGT` framing header
+    /// must be rejected by `load_snapshot`. Pre-1.0 dugite makes no snapshot
+    /// back-compat guarantee; the legacy raw-bincode loader was removed
+    /// along with the rest of the snapshot back-compat machinery.
     #[test]
-    fn test_legacy_format_loading() {
+    fn test_unframed_snapshot_is_rejected() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("legacy-raw.bin");
 
         let mut state = LedgerState::new(ProtocolParameters::mainnet_defaults());
         state.epoch = EpochNo(3);
 
-        // Serialise via LedgerStateSnapshot (LedgerState no longer implements
-        // Serialize directly), which uses the same bincode encoder that the
-        // legacy path deserialises with.
         let snapshot = LedgerStateSnapshot::from(&state);
         let raw_bincode = bincode::serialize(&snapshot).unwrap();
-
-        // The file must NOT start with `DUGT` so the legacy path is taken.
-        // A plain bincode-serialised `LedgerStateSnapshot` starts with the u64
-        // field count or the first field value, never with the ASCII string "DUGT".
         std::fs::write(&path, &raw_bincode).unwrap();
 
-        let loaded = LedgerState::load_snapshot(&path).unwrap();
-        assert_eq!(
-            loaded.epoch,
-            EpochNo(3),
-            "epoch must be preserved through legacy raw-bincode load"
+        let err = LedgerState::load_snapshot(&path).unwrap_err();
+        assert!(
+            matches!(err, LedgerError::EpochTransition(_)),
+            "expected EpochTransition error, got {err:?}",
         );
     }
 
