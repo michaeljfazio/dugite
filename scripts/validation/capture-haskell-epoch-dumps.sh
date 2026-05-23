@@ -51,14 +51,9 @@ if [ -z "$SOCKET" ] || [ -z "$OUT_DIR" ] || [ -z "$NODE_CONFIG" ]; then
 fi
 
 mkdir -p "$OUT_DIR"
-# Named pipe (FIFO) instead of a regular file: the cli writes per-block
-# records into the pipe, the splitter reads them out and emits one
-# epoch_NNNNNN.json per epoch.  Nothing accumulates on disk.  Without
-# this, cn 11.0.1's per-block emission writes ~10 GB/min and saturates
-# the filesystem within minutes (observed 284 GB in 30 min).
-FIFO="$OUT_DIR/epoch-states.fifo"
-rm -f "$FIFO"
-mkfifo "$FIFO"
+JSONL="$OUT_DIR/epoch-states.jsonl"
+rm -f "$JSONL"
+touch "$JSONL"
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 SPLITTER="$SCRIPT_DIR/split-haskell-jsonl.py"
@@ -68,22 +63,48 @@ if [ ! -x "$SPLITTER" ] && [ ! -r "$SPLITTER" ]; then
     exit 3
 fi
 
-echo "[capture] cli=$CLI socket=$SOCKET magic=$MAGIC out=$OUT_DIR fifo=$FIFO"
+echo "[capture] cli=$CLI socket=$SOCKET magic=$MAGIC out=$OUT_DIR jsonl=$JSONL"
 
-# Start the splitter FIRST, reading from the FIFO (blocks until writer opens).
-python3 "$SPLITTER" --out-dir "$OUT_DIR" < "$FIFO" &
-SPLITTER_PID=$!
-
-# Now start the cli writer — opens the FIFO writer end, splitter unblocks.
+# cn 11.0.1's --out-file does NOT support FIFOs on macOS (withBinaryFile
+# fails with Device not configured) and emits per-block-applied records
+# (~10 GB/min).  Workaround: regular file + a truncation watcher that
+# resets the file every 60s once the splitter has consumed the buffered
+# tail.  `tail -F` handles truncation gracefully (continues from offset
+# 0 on the next append).
 "$CLI" debug log-epoch-state \
     --socket-path "$SOCKET" \
     --node-configuration-file "$NODE_CONFIG" \
-    --out-file "$FIFO" &
+    --out-file "$JSONL" &
 CLI_PID=$!
 
-trap 'kill $CLI_PID $SPLITTER_PID 2>/dev/null || true; rm -f "$FIFO"' EXIT INT TERM
+# Truncation watcher — periodically resets the JSONL to 0 bytes so it
+# never grows unbounded.  The splitter's tail -F sees the truncation
+# and continues following.
+(
+    while kill -0 "$CLI_PID" 2>/dev/null; do
+        sleep 60
+        : > "$JSONL"
+    done
+) &
+TRUNC_PID=$!
 
-wait "$CLI_PID"
-rc=$?
-echo "[capture] cli exited rc=$rc"
-exit "$rc"
+trap 'kill $CLI_PID $TRUNC_PID 2>/dev/null || true' EXIT INT TERM
+
+# Wait for the jsonl to have content (cli takes a few seconds to attach).
+TRIES=0
+while [ ! -s "$JSONL" ]; do
+    sleep 1
+    TRIES=$((TRIES + 1))
+    if [ "$TRIES" -gt 120 ]; then
+        echo "[capture] timed out waiting for $JSONL to receive data" >&2
+        kill "$CLI_PID" 2>/dev/null || true
+        exit 4
+    fi
+    if ! kill -0 "$CLI_PID" 2>/dev/null; then
+        echo "[capture] cli exited before any output" >&2
+        exit 5
+    fi
+done
+
+# Tail + split.  `tail -F` follows truncation cleanly.
+tail -n +1 -F "$JSONL" | python3 "$SPLITTER" --out-dir "$OUT_DIR"
