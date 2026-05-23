@@ -169,7 +169,11 @@ impl EraRules for ShelleyRules {
         // Step 0: Flush pending treasury donations.
         if utxo.pending_donations.0 > 0 {
             let flushed = utxo.pending_donations;
-            epochs.treasury.0 = epochs.treasury.0.saturating_add(flushed.0);
+            epochs.treasury.0 = epochs
+                .treasury
+                .0
+                .checked_add(flushed.0)
+                .expect("treasury overflow on pending-donations flush");
             utxo.pending_donations = Lovelace(0);
             debug!(
                 epoch = new_epoch.0,
@@ -180,8 +184,16 @@ impl EraRules for ShelleyRules {
 
         // Step 1: Apply pending reward update (backward compat for old snapshots).
         if let Some(rupd) = epochs.pending_reward_update.take() {
-            epochs.reserves.0 = epochs.reserves.0.saturating_sub(rupd.delta_reserves);
-            epochs.treasury.0 = epochs.treasury.0.saturating_add(rupd.delta_treasury);
+            epochs.reserves.0 = epochs
+                .reserves
+                .0
+                .checked_sub(rupd.delta_reserves)
+                .expect("RUPD delta_reserves exceeds reserves — ledger invariant broken");
+            epochs.treasury.0 = epochs
+                .treasury
+                .0
+                .checked_add(rupd.delta_treasury)
+                .expect("RUPD delta_treasury overflows treasury u64");
             for (cred_hash, reward) in &rupd.rewards {
                 if reward.0 > 0 {
                     if certs.reward_accounts.contains_key(cred_hash) {
@@ -189,7 +201,11 @@ impl EraRules for ShelleyRules {
                             .entry(*cred_hash)
                             .or_insert(Lovelace(0)) += *reward;
                     } else {
-                        epochs.treasury.0 = epochs.treasury.0.saturating_add(reward.0);
+                        epochs.treasury.0 = epochs
+                            .treasury
+                            .0
+                            .checked_add(reward.0)
+                            .expect("treasury overflow on undistributed reward");
                     }
                 }
             }
@@ -265,8 +281,16 @@ impl EraRules for ShelleyRules {
             }
 
             // Apply RUPD: adjust reserves and treasury
-            epochs.reserves.0 = epochs.reserves.0.saturating_sub(rupd.delta_reserves);
-            epochs.treasury.0 = epochs.treasury.0.saturating_add(rupd.delta_treasury);
+            epochs.reserves.0 = epochs
+                .reserves
+                .0
+                .checked_sub(rupd.delta_reserves)
+                .expect("RUPD delta_reserves exceeds reserves — ledger invariant broken");
+            epochs.treasury.0 = epochs
+                .treasury
+                .0
+                .checked_add(rupd.delta_treasury)
+                .expect("RUPD delta_treasury overflows treasury u64");
 
             // Distribute rewards to registered accounts; unregistered → treasury
             for (cred_hash, reward) in &rupd.rewards {
@@ -276,7 +300,11 @@ impl EraRules for ShelleyRules {
                             .entry(*cred_hash)
                             .or_insert(Lovelace(0)) += *reward;
                     } else {
-                        epochs.treasury.0 = epochs.treasury.0.saturating_add(reward.0);
+                        epochs.treasury.0 = epochs
+                            .treasury
+                            .0
+                            .checked_add(reward.0)
+                            .expect("treasury overflow on undistributed reward");
                     }
                 }
             }
@@ -432,7 +460,11 @@ impl EraRules for ShelleyRules {
                             .entry(op_key)
                             .or_insert(Lovelace(0)) += pool_deposit;
                     } else {
-                        epochs.treasury.0 = epochs.treasury.0.saturating_add(pool_deposit.0);
+                        epochs.treasury.0 = epochs
+                            .treasury
+                            .0
+                            .checked_add(pool_deposit.0)
+                            .expect("treasury overflow on pool deposit refund");
                     }
                     Arc::make_mut(&mut certs.delegations)
                         .retain(|_, delegated_pool| delegated_pool != pool_id);
