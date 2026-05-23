@@ -464,7 +464,7 @@ impl EraRules for ConwayRules {
             let rupd_pp = &epochs.prev_protocol_params;
             let rupd = crate::compute_reward_update(
                 rupd_pp,
-                epochs.prev_d,
+                &epochs.prev_d,
                 epochs.prev_protocol_version_major,
                 go_ref,
                 &epochs.snapshots.bprev_blocks_by_pool,
@@ -487,7 +487,7 @@ impl EraRules for ConwayRules {
                     ctx.current_epoch.0,
                     new_epoch.0,
                     rupd_pp,
-                    epochs.prev_d,
+                    &epochs.prev_d,
                     epochs.prev_protocol_version_major,
                     epochs.reserves,
                     epochs.treasury,
@@ -711,7 +711,12 @@ impl EraRules for ConwayRules {
         capture_governance_snapshots(ctx.current_epoch, epochs, certs, gov);
 
         // Capture prevPParams BEFORE any PP updates.
-        let old_d = 0.0; // Conway: d is always 0 (fully decentralized).
+        // Conway: d is always 0 (fully decentralized) — Conway has no
+        // overlay slots and PParams no longer carries `ppDG`.
+        let old_d = dugite_primitives::transaction::Rational {
+            numerator: 0,
+            denominator: 1,
+        };
         let old_proto_major = epochs.protocol_params.protocol_version_major;
         let old_params = epochs.protocol_params.clone();
 
@@ -1601,7 +1606,10 @@ fn make_empty_epoch_sub() -> EpochSubState {
         protocol_params: ProtocolParameters::mainnet_defaults(),
         prev_protocol_params: ProtocolParameters::mainnet_defaults(),
         prev_protocol_version_major: 9,
-        prev_d: 0.0,
+        prev_d: dugite_primitives::transaction::Rational {
+            numerator: 0,
+            denominator: 1,
+        },
     }
 }
 
@@ -1709,7 +1717,10 @@ mod tests {
             protocol_params: ProtocolParameters::mainnet_defaults(),
             prev_protocol_params: ProtocolParameters::mainnet_defaults(),
             prev_protocol_version_major: 9,
-            prev_d: 0.0,
+            prev_d: dugite_primitives::transaction::Rational {
+                numerator: 0,
+                denominator: 1,
+            },
         }
     }
 
