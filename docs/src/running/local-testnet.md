@@ -285,11 +285,10 @@ PASS/FAIL/SKIP into `tx-zoo/state/results.csv`.
   version every script that touches Plutus or governance will record FAIL
   with "ScriptFailed: requires protocol >= N" from cardano-cli or the dugite
   mempool.
-- `aiken` is **optional** — when missing, the zoo falls back to vendored
-  always-true Plutus binaries for V1/V2/V3. Three categories still need real
-  scripts (collateral, ref-scripts, inline-datum) and will run with the
-  vendored versions; only the negative-path "insufficient collateral" needs a
-  real V2 always-true (vendored).
+- The zoo uses vendored always-true Plutus binaries for V1/V2/V3 scripts.
+  Three categories (collateral, ref-scripts, inline-datum) run with these vendored
+  versions; only the negative-path "insufficient collateral" needs a real V2
+  always-true script (also vendored).
 
 ### Caveats
 

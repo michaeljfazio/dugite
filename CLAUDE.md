@@ -93,7 +93,7 @@ dugite-primitives (core types: hashes, blocks, txs, addresses, values, protocol 
 - 28-byte hash types (DRep keys, pool voter keys, required signers) must be padded to 32 bytes via `Hash28::to_hash32_padded()` — do not use `Hash<32>::from()` directly on 28-byte hashes
 
 ## Current Focus
-Soak testing on preview testnet (Sandstone Pool [SAND], pool ID 6954ec11cf7097a693721104139b96c54e7f3e2a8f9e7577630f7856). Automated restart cycles, transaction submission via `scripts/soak/varied-batch.sh` (driven by the 6h orchestrator at `scripts/soak/orchestrator-6h.sh`), Koios cross-validation. Stability and block production verification.
+v1.7.0 released. Current work: Byron-era block header decode hardening (issue #613) and epoch-diff cross-validation against cardano-node 11.0.1 on preview/preprod. UPLC CEK machine conformance is complete (all tests passing). Soak testing via Sandstone Pool [SAND] on both preview and preprod (pool IDs: preview `6954ec11cf7097a693721104139b96c54e7f3e2a8f9e7577630f7856`, preprod `pool1uju7fuqzv...nh0ch`). Preview testnet is at PV11 — requires connecting to peers running cardano-node 11.0.1+.
 
 ## Running the Node
 

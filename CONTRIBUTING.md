@@ -37,7 +37,7 @@ Key constraints:
 - **Dependency DAG**: No circular dependencies between crates
 - **Trait boundaries**: Cross-crate interactions via traits, not concrete types
 - **No unsafe**: All unsafe confined to `memmap2` I/O (storage crate only)
-- **Cardano wire format**: All encoding/decoding via pallas crates
+- **Cardano wire format**: All encoding/decoding via `dugite-serialization` (in-house multi-era CBOR decoder)
 
 ## Pull Request Process
 

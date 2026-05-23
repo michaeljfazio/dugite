@@ -30,7 +30,8 @@ The Cardano ecosystem benefits from client diversity. Running multiple independe
 - **Node-to-Client (N2C) protocol** — Unix domain socket server with LocalChainSync, LocalStateQuery, LocalTxSubmission, and LocalTxMonitor.
 - **cardano-cli compatible CLI** — Key generation, transaction building, signing, submission, queries, and governance commands.
 - **Prometheus metrics** — Real-time node metrics on port 12798.
-- **P2P networking** — Peer manager with cold/warm/hot lifecycle, DNS multi-resolution, ledger-based peer discovery, and inbound rate limiting.
+- **P2P networking** — Peer manager with cold/warm/hot lifecycle, DNS multi-resolution (A/AAAA/SRV), ledger-based peer discovery, and inbound rate limiting.
+- **ChainSync Jumping (CSJ)** — Phase A Ouroboros Genesis support: dynamic intersection discovery across multiple peers for faster tip-of-chain recovery.
 - **Mithril snapshot import** — Fast initial sync by importing a Mithril-certified snapshot.
 - **SIGHUP topology reload** — Update peer configuration without restarting the node.
 
