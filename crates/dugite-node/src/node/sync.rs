@@ -918,12 +918,20 @@ impl Node {
             })
             .collect();
 
-        // Refuse new blocks when disk space is fatally low to protect data integrity.
-        // The node stays alive so it can still serve queries.
-        if *self.disk_space_rx.borrow() == crate::disk_monitor::DiskSpaceLevel::Fatal {
+        // Disk-space back-pressure guard (issue #610).
+        //
+        // The disk monitor sets `ingestion_paused` when free space drops below
+        // PAUSE_THRESHOLD_BYTES (1 GB); it is cleared only after RECOVER_THRESHOLD_BYTES
+        // (5 GB) is sustained for 60 s.  Use the shared AtomicBool instead of the
+        // watch-channel level so this check and `apply_fetched_block` react to the
+        // same state machine and there is a single source of truth.
+        if self
+            .ingestion_paused
+            .load(std::sync::atomic::Ordering::Relaxed)
+        {
             error!(
-                "Disk space critically low — refusing to store {} blocks to protect data integrity",
-                blocks.len()
+                batch_size = blocks.len(),
+                "Disk ingestion paused — refusing to store block batch (disk space critically low)"
             );
             return 0;
         }

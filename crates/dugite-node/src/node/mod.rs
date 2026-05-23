@@ -288,6 +288,8 @@ pub struct NodeArgs {
     pub _shelley_cold_key: Option<PathBuf>,
     /// Prometheus metrics port (0 to disable)
     pub metrics_port: u16,
+    /// Make a metrics bind failure a fatal startup error (default: continue without metrics)
+    pub require_metrics: bool,
     /// Emit `cardano_node_metrics_*` compatibility aliases alongside native metrics
     pub compat_metrics: bool,
     /// Liveness threshold for the `/live` HTTP endpoint (seconds; 0 disables).
@@ -378,6 +380,8 @@ pub struct Node {
         Option<tokio::sync::broadcast::Sender<RollbackAnnouncement>>,
     /// Prometheus metrics port
     pub(crate) metrics_port: u16,
+    /// Make a metrics bind failure fatal (see `--require-metrics`)
+    pub(crate) require_metrics: bool,
     /// Expected Blake2b-256 hash of the Byron genesis block (from config or computed from file)
     pub(crate) expected_byron_genesis_hash: Option<dugite_primitives::hash::Hash32>,
     /// Expected Blake2b-256 hash of the Shelley genesis block (from config or computed from file)
@@ -489,6 +493,17 @@ pub struct Node {
     ///
     /// `AtomicBool` avoids any lock acquisition in the hot forge path.
     pub(crate) peer_intersection_established: Arc<std::sync::atomic::AtomicBool>,
+
+    /// Block ingestion back-pressure flag set by the disk monitor.
+    ///
+    /// Set to `true` when free space drops below `PAUSE_THRESHOLD_BYTES` (1 GB).
+    /// Cleared only after `RECOVER_THRESHOLD_BYTES` (5 GB) of free space is
+    /// sustained for 60 s.  Both `apply_fetched_block` and `process_forward_blocks`
+    /// check this flag before committing any block to ChainDB, so the database
+    /// cannot be written when the disk is critically low.
+    ///
+    /// `AtomicBool` (Relaxed ordering) avoids any lock acquisition on the hot path.
+    pub(crate) ingestion_paused: Arc<std::sync::atomic::AtomicBool>,
 }
 
 // ─── GsmActorParts ──────────────────────────────────────────────────────────
@@ -1726,6 +1741,7 @@ impl Node {
             block_announcement_tx: None,
             rollback_announcement_tx: None,
             metrics_port: args.metrics_port,
+            require_metrics: args.require_metrics,
             expected_byron_genesis_hash,
             expected_shelley_genesis_hash,
             genesis_validated: false,
@@ -1750,6 +1766,7 @@ impl Node {
             bg_snapshot_scheduler: SnapshotScheduler::new(),
             last_query_state_update: Instant::now(),
             peer_intersection_established: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            ingestion_paused: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         })
     }
 
@@ -1833,17 +1850,39 @@ impl Node {
         if self.metrics_port > 0 {
             let metrics = self.metrics.clone();
             let port = self.metrics_port;
+            let require_metrics = self.require_metrics;
             let metrics_shutdown_rx = shutdown_rx.clone();
-            tokio::spawn(async move {
-                if let Err(e) =
-                    crate::metrics::start_metrics_server(port, metrics, metrics_shutdown_rx).await
-                {
-                    error!(
-                        port,
-                        "Metrics server failed to start: {e} — node will continue without metrics"
-                    );
-                }
-            });
+
+            if require_metrics {
+                // --require-metrics: the bind phase must succeed before the node
+                // continues.  Bind synchronously (with retries); if it fails, bail
+                // out immediately with a fatal error rather than silently degrading.
+                let listener = crate::metrics::bind_metrics_listener(port)
+                    .await
+                    .map_err(|e| {
+                        anyhow::anyhow!(
+                            "Metrics server failed to bind on port {port} \
+                                 (--require-metrics was set): {e}"
+                        )
+                    })?;
+                // Bind succeeded — spawn the accept loop as a background task.
+                tokio::spawn(async move {
+                    crate::metrics::run_metrics_server(listener, metrics, metrics_shutdown_rx)
+                        .await;
+                });
+            } else {
+                tokio::spawn(async move {
+                    if let Err(e) =
+                        crate::metrics::start_metrics_server(port, metrics, metrics_shutdown_rx)
+                            .await
+                    {
+                        error!(
+                            port,
+                            "Metrics server failed to start: {e} — node will continue without metrics"
+                        );
+                    }
+                });
+            }
         }
 
         // Replay blocks from ChainDB if the ledger is behind storage.
@@ -1932,7 +1971,12 @@ impl Node {
 
         // SIGHUP handler is set up after peer_manager initialization below
 
-        // Start disk space monitor on the database volume
+        // Start disk space monitor on the database volume.
+        //
+        // The monitor writes to `self.ingestion_paused` (a shared AtomicBool)
+        // whenever free space crosses the PAUSE / RECOVER thresholds.  Both
+        // `apply_fetched_block` (live-tip path) and `process_forward_blocks`
+        // (bulk-sync path) check this flag before writing to ChainDB.
         {
             let (disk_level_tx, disk_level_rx) =
                 watch::channel(crate::disk_monitor::DiskSpaceLevel::Ok);
@@ -1940,12 +1984,14 @@ impl Node {
             let db_path = self.database_path.clone();
             let metrics = self.metrics.clone();
             let disk_shutdown_rx = shutdown_rx.clone();
+            let ingestion_paused = self.ingestion_paused.clone();
             tokio::spawn(async move {
                 crate::disk_monitor::start_disk_monitor(
                     db_path,
                     metrics,
                     disk_shutdown_rx,
                     disk_level_tx,
+                    ingestion_paused,
                 )
                 .await;
             });
@@ -3790,6 +3836,26 @@ impl Node {
             prev = %block.prev_hash().to_hex(),
             "Applying fetched block",
         );
+
+        // Disk-space back-pressure guard (issue #610).
+        //
+        // Refuse to write any block to ChainDB when the disk monitor has set
+        // the ingestion-paused flag.  The flag is set when free space drops
+        // below PAUSE_THRESHOLD_BYTES (1 GB) and cleared only after
+        // RECOVER_THRESHOLD_BYTES (5 GB) is sustained for 60 s, preventing
+        // database corruption on a nearly-full volume.  The node stays alive
+        // to serve N2C queries; it simply does not advance the chain until the
+        // operator frees space.
+        if self
+            .ingestion_paused
+            .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            debug!(
+                slot = block_slot.0,
+                "Disk ingestion paused — dropping block (disk space critically low)"
+            );
+            return;
+        }
 
         // Store in ChainDB via ChainSelQueue.
         // `fork_replayed` is set to true when the TriggeredFork path has already
