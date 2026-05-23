@@ -17,7 +17,11 @@ hex = { workspace = true }
 sha2 = { workspace = true }
 # Optional: only compiled when upstream-conformance feature is active.
 minicbor   = { workspace = true, optional = true }
-cddl       = { version = "0.10.5", optional = true }
+# Pin to anweiss/cddl main branch: range map keys (* N..M => rule) and array map
+# keys ({ + [k1, k2] => v }) were added in PR #536 (merged 2026-05-13), after the
+# last crates.io release (0.10.5, 2026-04-02).  Update to a crates.io version once
+# 0.10.6 is published.
+cddl = { git = "https://github.com/anweiss/cddl.git", branch = "main", optional = true }
 
 [features]
 upstream-conformance = ["dep:minicbor", "dep:cddl"]

@@ -527,8 +527,7 @@ dependencies = [
 [[package]]
 name = "cddl"
 version = "0.10.5"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "de674f6a75ba97c777b9d8a57edb9ff30dd238f4a99c2adcaee44198883da4d3"
+source = "git+https://github.com/anweiss/cddl.git?branch=main#c214c2313e4c99add5dce88453ec550401b9b5cd"
 dependencies = [
  "abnf_to_pest",
  "base16",
@@ -544,7 +543,7 @@ dependencies = [
  "csv",
  "data-encoding",
  "displaydoc",
- "fancy-regex 0.17.0",
+ "fancy-regex 0.18.0",
  "hex",
  "hexf-parse",
  "itertools 0.14.0",
@@ -1195,9 +1194,9 @@ dependencies = [
 
 [[package]]
 name = "data-encoding"
-version = "2.10.0"
+version = "2.11.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d7a1e2f27636f116493b8b860f5546edb47c8d8f8ea73e1d2a20be88e28d1fea"
+checksum = "a4ae5f15dda3c708c0ade84bfee31ccab44a3da4f88015ed22f63732abe300c8"
 
 [[package]]
 name = "deltae"
@@ -1867,9 +1866,9 @@ dependencies = [
 
 [[package]]
 name = "fancy-regex"
-version = "0.17.0"
+version = "0.18.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "72cf461f865c862bb7dc573f643dd6a2b6842f7c30b07882b56bd148cc2761b8"
+checksum = "e1e1dacd0d2082dfcf1351c4bdd566bbe89a2b263235a2b50058f1e130a47277"
 dependencies = [
  "bit-set 0.8.0",
  "regex-automata 0.4.14",

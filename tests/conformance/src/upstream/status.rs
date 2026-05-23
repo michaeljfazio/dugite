@@ -21,11 +21,10 @@ pub fn check_and_report() {
             root.display()
         );
     } else if present && !sentinel_ok {
-        let msg = format!(
-            "[upstream-conformance] Fixtures present but sentinel mismatch — \
-             manifest.toml changed since last download. \
-             Run: cargo xtask download-upstream-fixtures"
-        );
+        let msg = "[upstream-conformance] Fixtures present but sentinel mismatch — \
+                  manifest.toml changed since last download. \
+                  Run: cargo xtask download-upstream-fixtures"
+            .to_string();
         if require {
             panic!("{msg}");
         } else {
