@@ -108,7 +108,9 @@ jobs:
             build-essential
 
           # Build and install libblst from source (not in Ubuntu 24.04 apt repos).
-          BLST_VERSION="v0.3.11"
+          # cardano-crypto-class 2.3+ requires libblst>=0.3.14 via pkg-config.
+          # Use v0.3.14 (the minimum required by the cardano-ledger deps at the pinned SHA).
+          BLST_VERSION="v0.3.14"
           git clone --depth=1 --branch "${BLST_VERSION}" \
             https://github.com/supranational/blst.git /tmp/blst
           cd /tmp/blst
@@ -118,7 +120,7 @@ jobs:
           sudo install -m644 libblst.a           /usr/local/lib/
           # Create pkgconfig dir if it doesn't exist, then write the .pc file.
           sudo mkdir -p /usr/local/lib/pkgconfig
-          printf 'prefix=/usr/local\nexec_prefix=${prefix}\nlibdir=${exec_prefix}/lib\nincludedir=${prefix}/include\n\nName: libblst\nDescription: BLS12-381 signature library\nVersion: 0.3.11\nLibs: -L${libdir} -lblst\nCflags: -I${includedir}\n' | sudo tee /usr/local/lib/pkgconfig/libblst.pc > /dev/null
+          printf 'prefix=/usr/local\nexec_prefix=${prefix}\nlibdir=${exec_prefix}/lib\nincludedir=${prefix}/include\n\nName: libblst\nDescription: BLS12-381 signature library\nVersion: 0.3.14\nLibs: -L${libdir} -lblst\nCflags: -I${includedir}\n' | sudo tee /usr/local/lib/pkgconfig/libblst.pc > /dev/null
           sudo ldconfig
           cd -
 
