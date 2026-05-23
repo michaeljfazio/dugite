@@ -88,11 +88,26 @@ jobs:
         with:
           python-version: "3.11"
 
+      # ── System libraries required by cardano-ledger Haskell deps ─────────────
+      # cardano-crypto-class (transitive dep of cardano-ledger-core) requires:
+      #   libsodium-dev  — ECDSA/Ed25519/ChaCha20 primitives
+      #   libblst-dev    — BLS12-381 curve operations (Ubuntu 24.04 Noble has this)
+      #   libsecp256k1-dev — secp256k1 curve (required by cardano-crypto-praos)
+      #   pkg-config     — used by cabal to locate these libraries
+      # These match the packages installed by IntersectMBO/cardano-ledger's own CI.
+      - name: Install system libraries for Haskell build
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y --no-install-recommends \
+            pkg-config \
+            libsodium-dev \
+            libblst-dev \
+            libsecp256k1-dev
+
       # ── Haskell toolchain (required for ledger-rules corpus generation) ──────
       # GHC 9.6.5 + cabal 3.10.x matches IntersectMBO/cardano-ledger's CI matrix
       # at the pinned SHA. The first cold run takes ~45 minutes to build the
-      # cardano-ledger-conformance target; subsequent runs restore from cache in
-      # ~10 minutes.
+      # ledger deps; subsequent runs restore from cache in ~10 minutes.
       - name: Set up Haskell (GHC 9.6.5 + cabal 3.10.x)
         uses: haskell-actions/setup@v2
         id: setup-haskell
