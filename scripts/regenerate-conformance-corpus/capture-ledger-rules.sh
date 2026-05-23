@@ -117,6 +117,24 @@ IMP_CORE="${CLONE_DIR}/libs/cardano-ledger-conformance/test/Test/Cardano/Ledger/
 log "Applying ImpSpec dump patch..."
 python3 "${PATCH_SCRIPT}" "${EXEC_SPEC_CORE}" "${IMP_CORE}"
 
+# ── Disable external-libsodium-vrf to use standard libsodium ─────────────────
+#
+# cardano-crypto-praos links against `crypto_vrf_ietfdraft13_*` symbols which
+# are ONLY in IOHK's custom libsodium fork, NOT in the standard apt package.
+# The `-external-libsodium-vrf` flag (default ON) enables these batch-compat VRF
+# symbols.  Setting it to False falls back to the built-in VRF implementation,
+# which compiles against standard libsodium from Ubuntu 24.04 apt packages.
+#
+# This is exactly what cardano-ledger's own CI does via:
+#   "Configure to use libsodium: cat >> cabal.project.local sets
+#    package cardano-crypto-praos flags: -external-libsodium-vrf"
+# See: .github/workflows/haskell.yml at SHA ebed62de
+cat >> "${CLONE_DIR}/cabal.project.local" <<'CABAL_LOCAL'
+package cardano-crypto-praos
+  flags: -external-libsodium-vrf
+CABAL_LOCAL
+log "Disabled external-libsodium-vrf (use standard apt libsodium)"
+
 # ── Build the patched conformance test suite ──────────────────────────────────
 log "Building cardano-ledger-conformance:test:tests (this may take 30-45 min cold)..."
 (
