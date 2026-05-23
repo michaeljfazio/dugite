@@ -86,28 +86,27 @@ fn era_id_from_rule(rule: &str) -> u16 {
     }
 }
 
-/// Whether a rule's signal is a transaction CBOR blob.
+/// Whether a rule's signal is a full transaction CBOR blob (`Tx era`).
 ///
-/// Rules whose STS `Signal` type is `Tx era` (or a newtype thereof) have
-/// decodable transaction signals.  Rules captured via the ExecSpecRule hook
-/// (ENACT, GOV, GOVCERT) use non-Tx signals and are skipped.
+/// Only LEDGER and UTXO use `Tx era` as their ImpSpec signal. All other
+/// ExecSpecRule rules (ENACT, DELEG, GOVCERT, POOL, CERT, CERTS, GOV,
+/// RATIFY) use their own native STS signal types which are NOT full Tx:
 ///
 /// Signal types by rule (Haskell cardano-ledger, 2026-05-23):
 /// - NEWEPOCH → EpochNo (u64) — handled separately
-/// - LEDGER, UTXO, CERT, CERTS, DELEG, POOL, GOVCERT → Tx era
-/// - ENACT → EnactSignal era (not a Tx)
-/// - GOV → Tx era (technically the embedded Tx)
+/// - LEDGER → Tx era         — ImpSpec Imp/Core hook (tx submissions)
+/// - UTXO   → Tx era         — ExecSpecRule direct
+/// - POOL    → PoolCert       — array(2), NOT a full Tx
+/// - CERT    → TxCert era     — certificate, NOT a full Tx
+/// - CERTS   → Seq TxCert     — certificate seq, NOT a full Tx
+/// - DELEG   → ConwayDelegCert — delegation cert, NOT a full Tx
+/// - GOVCERT → ConwayGovCert  — governance cert, NOT a full Tx
+/// - GOV     → GovSignal era  — governance signal, NOT a full Tx
+/// - ENACT   → EnactSignal    — enactment signal, NOT a full Tx
+/// - RATIFY  → RatifySignal   — ratification signal, NOT a full Tx
 fn is_tx_signal_rule(rule: &str) -> bool {
     let upper = rule.to_uppercase();
-    // All these STS rules use Tx era as their Signal type.
-    matches!(true,
-        true if upper.contains("LEDGER")
-            || upper.contains("UTXO")
-            || upper.contains("CERT")   // CERT, CERTS, GOVCERT
-            || upper.contains("DELEG")
-            || upper.contains("POOL")
-            || upper.contains("GOV")    // GOV uses Tx as signal in ImpSpec
-    )
+    upper.contains("LEDGER") || upper.contains("UTXO")
 }
 
 /// Validate `vec` according to its rule and return the outcome.
@@ -115,14 +114,22 @@ fn is_tx_signal_rule(rule: &str) -> bool {
 /// The `era_id` used for tx decoding is derived from the rule name prefix.
 pub fn run_vector(vec: &ImpVector) -> RunOutcome {
     let rule = vec.rule.as_str();
+    let upper = rule.to_uppercase();
 
-    if rule.to_uppercase().contains("NEWEPOCH") {
+    if upper.contains("NEWEPOCH") {
         run_newepoch(vec)
     } else if is_tx_signal_rule(rule) {
         run_tx_signal(vec)
     } else {
+        // ExecSpecRule rules (POOL, CERT, CERTS, DELEG, GOVCERT, GOV, ENACT,
+        // RATIFY) use native STS signal types, not full Tx.  Decoding those
+        // signals requires per-rule CBOR decoders that are not yet implemented.
+        // Tracked: https://github.com/michaeljfazio/dugite/issues/640
         RunOutcome::Skipped {
-            reason: format!("no tx-signal handler for rule '{rule}' (ENACT or unknown)"),
+            reason: format!(
+                "rule '{rule}' uses a native STS signal (not Tx era) — \
+                 native signal decoder not yet implemented"
+            ),
         }
     }
 }
