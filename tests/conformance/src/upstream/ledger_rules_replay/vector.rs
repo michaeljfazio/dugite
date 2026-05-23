@@ -4,8 +4,8 @@
 //! set) produces **4 separate CBOR files per test case directory**:
 //!
 //! ```text
-//! conformance_dump_ctx.cbor   — ExecContext  (empty array `80` for NEWEPOCH)
-//! conformance_dump_env.cbor   — Environment  (empty array `80` for NEWEPOCH)
+//! conformance_dump_ctx.cbor   — ExecContext  (CBOR null `F6` for NEWEPOCH — EncCBOR () = encodeNull)
+//! conformance_dump_env.cbor   — Environment  (CBOR null `F6` for NEWEPOCH — EncCBOR () = encodeNull)
 //! conformance_dump_st.cbor    — State = NewEpochState as array(7)
 //! conformance_dump_sig.cbor   — Signal (u64 EpochNo for NEWEPOCH; tx CBOR for UTXO)
 //! ```

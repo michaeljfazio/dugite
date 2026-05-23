@@ -47,8 +47,8 @@
 //!
 //! ```text
 //! <fixtures>/ledger-rules/<Rule>/<test_name>/
-//!   conformance_dump_ctx.cbor   -- ExecContext (empty `80` for NEWEPOCH)
-//!   conformance_dump_env.cbor   -- Environment (empty `80` for NEWEPOCH)
+//!   conformance_dump_ctx.cbor   -- ExecContext (`F6` CBOR null for NEWEPOCH — EncCBOR () = encodeNull)
+//!   conformance_dump_env.cbor   -- Environment (`F6` CBOR null for NEWEPOCH — EncCBOR () = encodeNull)
 //!   conformance_dump_st.cbor    -- State (NewEpochState array(7))
 //!   conformance_dump_sig.cbor   -- Signal (u64 EpochNo for NEWEPOCH; tx CBOR for UTXO)
 //! ```
@@ -156,11 +156,16 @@ fn collect_test_case_dirs(rule_dir: &Path) -> Vec<std::path::PathBuf> {
 /// Directory layout:
 /// ```text
 /// dir/ConwayNEWEPOCH/test_minimal_epoch_advance/
-///   conformance_dump_ctx.cbor   — 0x80 (empty array)
-///   conformance_dump_env.cbor   — 0x80 (empty array)
+///   conformance_dump_ctx.cbor   — 0xF6 (CBOR null — Haskell `EncCBOR () = encodeNull`)
+///   conformance_dump_env.cbor   — 0xF6 (CBOR null — Haskell `EncCBOR () = encodeNull`)
 ///   conformance_dump_st.cbor    — NewEpochState array(7), EpochNo=0
 ///   conformance_dump_sig.cbor   — 0x01 (EpochNo = 1)
 /// ```
+///
+/// **Encoding note for ctx/env**: The Haskell `EncCBOR` instance for `()` is
+/// `encodeNull`, which emits the CBOR null byte `0xF6`.  The NEWEPOCH STS rule
+/// uses `()` for both its context and environment, so both files contain a
+/// single `0xF6` byte.  The earlier `0x80` (empty array) was incorrect.
 ///
 /// The state file is hand-encoded as raw CBOR bytes (each byte is annotated
 /// with its CBOR meaning in the inline comments).
@@ -170,9 +175,11 @@ pub fn create_minimal_newepoch_fixture(dir: &Path) {
         .join("test_minimal_epoch_advance");
     std::fs::create_dir_all(&test_dir).expect("create fixture dir");
 
-    // ctx and env: empty CBOR array (0x80)
+    // ctx and env: CBOR null (0xF6) — Haskell `EncCBOR () = encodeNull`
+    // NOT 0x80 (empty array): the NEWEPOCH context and environment are both
+    // the unit type `()`, which Haskell serializes as CBOR null, not empty array.
     for name in &["conformance_dump_ctx.cbor", "conformance_dump_env.cbor"] {
-        std::fs::write(test_dir.join(name), [0x80u8]).expect("write ctx/env");
+        std::fs::write(test_dir.join(name), [0xF6u8]).expect("write ctx/env");
     }
 
     // sig: CBOR uint(1) = 0x01
