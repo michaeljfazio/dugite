@@ -549,11 +549,11 @@ impl LedgerState {
                             match source {
                                 MIRSource::Reserves => {
                                     self.epochs.reserves.0 =
-                                        self.epochs.reserves.0.saturating_sub(total_distributed);
+                                        self.epochs.reserves.0.checked_sub(total_distributed).expect("reserves underflow during MIR/governance refund — ledger invariant broken");
                                 }
                                 MIRSource::Treasury => {
                                     self.epochs.treasury.0 =
-                                        self.epochs.treasury.0.saturating_sub(total_distributed);
+                                        self.epochs.treasury.0.checked_sub(total_distributed).expect("treasury underflow during MIR/governance refund — ledger invariant broken");
                                 }
                             }
                         }
@@ -567,9 +567,11 @@ impl LedgerState {
                                 // Move from reserves to treasury, capped at available
                                 let actual = (*coin).min(self.epochs.reserves.0);
                                 self.epochs.reserves.0 =
-                                    self.epochs.reserves.0.saturating_sub(actual);
+                                    self.epochs.reserves.0.checked_sub(actual).expect("reserves underflow during MIR/governance refund — ledger invariant broken");
                                 self.epochs.treasury.0 =
-                                    self.epochs.treasury.0.saturating_add(actual);
+                                    self.epochs.treasury.0.checked_add(actual).expect(
+                                        "treasury overflow during MIR/governance refund — u64",
+                                    );
                                 debug!(
                                     "MIR: transferred {} lovelace from reserves to treasury",
                                     actual
@@ -579,9 +581,11 @@ impl LedgerState {
                                 // Move from treasury to reserves, capped at available
                                 let actual = (*coin).min(self.epochs.treasury.0);
                                 self.epochs.treasury.0 =
-                                    self.epochs.treasury.0.saturating_sub(actual);
+                                    self.epochs.treasury.0.checked_sub(actual).expect("treasury underflow during MIR/governance refund — ledger invariant broken");
                                 self.epochs.reserves.0 =
-                                    self.epochs.reserves.0.saturating_add(actual);
+                                    self.epochs.reserves.0.checked_add(actual).expect(
+                                        "reserves overflow during MIR/governance refund — u64",
+                                    );
                                 debug!(
                                     "MIR: transferred {} lovelace from treasury to reserves",
                                     actual
@@ -1219,35 +1223,43 @@ impl LedgerState {
                             match source {
                                 MIRSource::Reserves => {
                                     self.epochs.reserves.0 =
-                                        self.epochs.reserves.0.saturating_sub(total_distributed);
+                                        self.epochs.reserves.0.checked_sub(total_distributed).expect("reserves underflow during MIR/governance refund — ledger invariant broken");
                                 }
                                 MIRSource::Treasury => {
                                     self.epochs.treasury.0 =
-                                        self.epochs.treasury.0.saturating_sub(total_distributed);
+                                        self.epochs.treasury.0.checked_sub(total_distributed).expect("treasury underflow during MIR/governance refund — ledger invariant broken");
                                 }
                             }
                         }
                     }
-                    MIRTarget::OtherAccountingPot(coin) => match source {
-                        MIRSource::Reserves => {
-                            let actual = (*coin).min(self.epochs.reserves.0);
-                            self.epochs.reserves.0 = self.epochs.reserves.0.saturating_sub(actual);
-                            self.epochs.treasury.0 = self.epochs.treasury.0.saturating_add(actual);
-                            debug!(
-                                "MIR: transferred {} lovelace from reserves to treasury",
-                                actual
-                            );
+                    MIRTarget::OtherAccountingPot(coin) => {
+                        match source {
+                            MIRSource::Reserves => {
+                                let actual = (*coin).min(self.epochs.reserves.0);
+                                self.epochs.reserves.0 = self.epochs.reserves.0.checked_sub(actual).expect("reserves underflow during MIR/governance refund — ledger invariant broken");
+                                self.epochs.treasury.0 =
+                                    self.epochs.treasury.0.checked_add(actual).expect(
+                                        "treasury overflow during MIR/governance refund — u64",
+                                    );
+                                debug!(
+                                    "MIR: transferred {} lovelace from reserves to treasury",
+                                    actual
+                                );
+                            }
+                            MIRSource::Treasury => {
+                                let actual = (*coin).min(self.epochs.treasury.0);
+                                self.epochs.treasury.0 = self.epochs.treasury.0.checked_sub(actual).expect("treasury underflow during MIR/governance refund — ledger invariant broken");
+                                self.epochs.reserves.0 =
+                                    self.epochs.reserves.0.checked_add(actual).expect(
+                                        "reserves overflow during MIR/governance refund — u64",
+                                    );
+                                debug!(
+                                    "MIR: transferred {} lovelace from treasury to reserves",
+                                    actual
+                                );
+                            }
                         }
-                        MIRSource::Treasury => {
-                            let actual = (*coin).min(self.epochs.treasury.0);
-                            self.epochs.treasury.0 = self.epochs.treasury.0.saturating_sub(actual);
-                            self.epochs.reserves.0 = self.epochs.reserves.0.saturating_add(actual);
-                            debug!(
-                                "MIR: transferred {} lovelace from treasury to reserves",
-                                actual
-                            );
-                        }
-                    },
+                    }
                 }
             }
         }

@@ -103,8 +103,18 @@ impl LedgerState {
             };
             let rupd =
                 self.calculate_rewards_full(&go_snapshot, &bprev, self.epochs.snapshots.ss_fee);
-            self.epochs.reserves.0 = self.epochs.reserves.0.saturating_sub(rupd.delta_reserves);
-            self.epochs.treasury.0 = self.epochs.treasury.0.saturating_add(rupd.delta_treasury);
+            self.epochs.reserves.0 = self
+                .epochs
+                .reserves
+                .0
+                .checked_sub(rupd.delta_reserves)
+                .expect("RUPD delta_reserves exceeds reserves — ledger invariant broken");
+            self.epochs.treasury.0 = self
+                .epochs
+                .treasury
+                .0
+                .checked_add(rupd.delta_treasury)
+                .expect("RUPD delta_treasury overflows treasury u64");
 
             // Apply per-account rewards, matching Haskell's applyRUpdFiltered:
             // rewards for REGISTERED credentials go to their reward accounts;
@@ -123,7 +133,12 @@ impl LedgerState {
                     } else {
                         // Unregistered credential: forward to treasury
                         // (matches Haskell's frTotalUnregistered in applyRUpd)
-                        self.epochs.treasury.0 = self.epochs.treasury.0.saturating_add(reward.0);
+                        self.epochs.treasury.0 = self
+                            .epochs
+                            .treasury
+                            .0
+                            .checked_add(reward.0)
+                            .expect("treasury overflow on undistributed reward");
                         unregistered_total += reward.0;
                     }
                 }
@@ -405,8 +420,12 @@ impl LedgerState {
                             .entry(op_key)
                             .or_insert(Lovelace(0)) += pool_deposit;
                     } else {
-                        self.epochs.treasury.0 =
-                            self.epochs.treasury.0.saturating_add(pool_deposit.0);
+                        self.epochs.treasury.0 = self
+                            .epochs
+                            .treasury
+                            .0
+                            .checked_add(pool_deposit.0)
+                            .expect("treasury overflow on pool deposit refund");
                         debug!(
                             "Pool {} deposit {} -> treasury (unregistered reward account)",
                             pool_id.to_hex(),
@@ -655,7 +674,12 @@ impl LedgerState {
         // Reference: Conway.Rules.Epoch, step ordering in the EPOCH STS rule.
         if self.utxo.pending_donations.0 > 0 {
             let flushed = self.utxo.pending_donations;
-            self.epochs.treasury.0 = self.epochs.treasury.0.saturating_add(flushed.0);
+            self.epochs.treasury.0 = self
+                .epochs
+                .treasury
+                .0
+                .checked_add(flushed.0)
+                .expect("treasury overflow on pending-donations flush");
             self.utxo.pending_donations = Lovelace(0);
             debug!(
                 epoch = new_epoch.0,
