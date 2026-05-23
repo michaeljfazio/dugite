@@ -31,7 +31,7 @@ pub fn compute_block_body_size_from_cbor(raw_cbor: &[u8]) -> Option<u64> {
     use crate::haskell_snapshot::cbor_utils::skip_cbor_value;
 
     // The wire format is a 2-element CBOR array: [era_tag, inner_block].
-    // Byron blocks use era_tag 0 (main) or 1 (EBB); Shelley+ use 2..6.
+    // Byron blocks use era_tag 0 (EBB) or 1 (main); Shelley+ use 2..8.
     if raw_cbor.is_empty() {
         return None;
     }

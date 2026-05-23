@@ -533,20 +533,21 @@ pub fn decode_byron_ebb_block(
     // field 2: body_proof (32-byte hash — skip)
     r.skip()?;
 
-    // field 3: consensus_data = [[epoch_id], difficulty]
-    //   epoch_id is a 1-element array [uint]
-    //   difficulty = [uint]
+    // field 3: consensus_data = [epoch :: uint, difficulty :: [uint]]
+    //
+    // Matches Haskell `ABoundaryConsensusData` in
+    // `cardano-ledger-byron/Cardano.Chain.Block.Boundary`:
+    //   ABoundaryConsensusData { boundaryEpoch :: EpochNumber,
+    //                            boundaryDifficulty :: ChainDifficulty }
+    // `ChainDifficulty` is itself encoded as `array(1) [uint]`, so the on-wire
+    // shape is `array(2) [uint(epoch), array(1)[uint(difficulty)]]`.
+    //
+    // Issue #613: this was previously decoded as `[array(1)[epoch], array(1)[difficulty]]`
+    // which doesn't match the real wire and broke every preprod EBB.
     let cons_arr = r.read_array_header()?;
     if !matches!(cons_arr, Some(2)) {
         return Err(SerializationError::CborDecode(format!(
             "byron ebb consensus_data: expected array(2), got {cons_arr:?}"
-        )));
-    }
-    // epoch_id = [uint]
-    let epoch_arr = r.read_array_header()?;
-    if !matches!(epoch_arr, Some(1)) {
-        return Err(SerializationError::CborDecode(format!(
-            "byron ebb epoch_id: expected array(1), got {epoch_arr:?}"
         )));
     }
     let epoch = r.read_uint()?;
@@ -770,11 +771,11 @@ mod tests {
 
     /// Build a minimal Byron EBB block CBOR (inner, without the outer envelope).
     ///
-    /// Structure:
+    /// Structure (post-issue #613 fix — matches Haskell wire):
     /// ```text
     /// [header, body, extra]
     /// header = [protocol_magic, prev_hash, body_proof, consensus_data, extra_data]
-    /// consensus_data = [[epoch], difficulty=[block_no]]
+    /// consensus_data = [epoch :: uint, difficulty=[block_no]]
     /// body = [] (empty stakeholder ids)
     /// extra = [] (empty attributes)
     /// ```
@@ -787,8 +788,8 @@ mod tests {
         let pm = cbor_uint(protocol_magic);
         let prev = cbor_bytes(prev_hash);
         let body_proof = cbor_bytes(&[0u8; 32]);
-        // consensus_data = [[epoch], [block_no]]
-        let epoch_arr = cbor_arr1(&cbor_uint(epoch));
+        // consensus_data = [epoch, [block_no]]
+        let epoch_arr = cbor_uint(epoch);
         let difficulty = cbor_arr1(&cbor_uint(block_no));
         let cons_data = cbor_arr2(&epoch_arr, &difficulty);
         // extra_data = ([],) — a 1-tuple of empty attributes

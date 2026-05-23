@@ -20,8 +20,8 @@
 //!
 //! | Tag | Era        | Notes                                              |
 //! |-----|------------|----------------------------------------------------|
-//! | 0   | Byron main | Full mainnet/preprod Byron blocks                  |
-//! | 1   | Byron EBB  | Epoch boundary blocks (no body, just boundary hash)|
+//! | 0   | Byron EBB  | Epoch boundary blocks (no body, just boundary hash)|
+//! | 1   | Byron main | Full mainnet/preprod Byron blocks                  |
 //! | 2   | Shelley    | First Praos era                                    |
 //! | 3   | Allegra    | Multi-asset scripts added                          |
 //! | 4   | Mary       | Native multi-asset                                 |
@@ -79,10 +79,22 @@ pub enum EraTag {
 
 impl EraTag {
     /// Parse a raw uint CBOR value into an `EraTag`.
+    ///
+    /// Byron tag mapping matches Haskell's `ABlockOrBoundary` `decodeListLen`
+    /// discriminator in `cardano-ledger-byron`:
+    ///
+    /// ```text
+    ///   0 -> ABOBBoundary   (EBB)
+    ///   1 -> ABOBBlock      (regular main block)
+    /// ```
+    ///
+    /// Prior to issue #613 the two were swapped here, causing every Byron
+    /// block on the wire to be routed to the wrong sub-decoder and silently
+    /// dropped (preprod genesis sync skipped Byron blocks 0..45).
     pub fn from_u64(n: u64) -> Self {
         match n {
-            0 => EraTag::ByronMain,
-            1 => EraTag::ByronEbb,
+            0 => EraTag::ByronEbb,
+            1 => EraTag::ByronMain,
             2 => EraTag::Shelley,
             3 => EraTag::Allegra,
             4 => EraTag::Mary,
@@ -97,8 +109,8 @@ impl EraTag {
     /// Return the raw u64 tag value.
     pub fn as_u64(self) -> u64 {
         match self {
-            EraTag::ByronMain => 0,
-            EraTag::ByronEbb => 1,
+            EraTag::ByronEbb => 0,
+            EraTag::ByronMain => 1,
             EraTag::Shelley => 2,
             EraTag::Allegra => 3,
             EraTag::Mary => 4,
@@ -127,8 +139,8 @@ impl EraTag {
 impl std::fmt::Display for EraTag {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            EraTag::ByronMain => write!(f, "ByronMain(0)"),
-            EraTag::ByronEbb => write!(f, "ByronEbb(1)"),
+            EraTag::ByronEbb => write!(f, "ByronEbb(0)"),
+            EraTag::ByronMain => write!(f, "ByronMain(1)"),
             EraTag::Shelley => write!(f, "Shelley(2)"),
             EraTag::Allegra => write!(f, "Allegra(3)"),
             EraTag::Mary => write!(f, "Mary(4)"),
@@ -297,8 +309,8 @@ mod tests {
     #[test]
     fn era_tag_from_u64_all_known() {
         let pairs: &[(u64, EraTag)] = &[
-            (0, EraTag::ByronMain),
-            (1, EraTag::ByronEbb),
+            (0, EraTag::ByronEbb),
+            (1, EraTag::ByronMain),
             (2, EraTag::Shelley),
             (3, EraTag::Allegra),
             (4, EraTag::Mary),
@@ -423,12 +435,23 @@ mod tests {
 
     #[test]
     fn envelope_byron_main() {
-        let inner = minimal_inner(0);
-        let cbor = make_envelope(0, &inner);
+        let inner = minimal_inner(1);
+        let cbor = make_envelope(1, &inner);
         let mut r = Reader::new(&cbor);
         let (era, inner_slice) = decode_block_envelope(&mut r).unwrap();
         assert_eq!(era, EraTag::ByronMain);
         assert_eq!(inner_slice, inner.as_slice());
+    }
+
+    /// Issue #613: storage tag 0 must route to EBB (Haskell's
+    /// `ABOBBoundary`), not main, so EBB blocks are decoded correctly.
+    #[test]
+    fn envelope_byron_ebb_storage_tag_is_zero() {
+        let inner = minimal_inner(0);
+        let cbor = make_envelope(0, &inner);
+        let mut r = Reader::new(&cbor);
+        let (era, _) = decode_block_envelope(&mut r).unwrap();
+        assert_eq!(era, EraTag::ByronEbb);
     }
 
     #[test]
