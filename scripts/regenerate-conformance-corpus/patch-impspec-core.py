@@ -39,11 +39,14 @@ import re
 # ──────────────────────────────────────────────────────────────────────────────
 
 def patch_cabal_file(path: str) -> None:
-    """Add 'filepath' and 'cardano-ledger-api' to the test-suite tests build-depends.
+    """Add 'filepath' and 'cardano-ledger-api:testlib' to the test-suite tests build-depends.
 
     The patched Imp/Core.hs imports:
       - System.FilePath  (package: filepath — a GHC boot pkg, but needs explicit listing)
-      - Test.Cardano.Ledger.Api.DebugTools  (package: cardano-ledger-api)
+      - Test.Cardano.Ledger.Api.DebugTools  (package: cardano-ledger-api:testlib)
+        writeCBOR lives in libs/cardano-ledger-api/testlib/Test/Cardano/Ledger/Api/DebugTools.hs
+        under the 'library testlib' (visibility: public) component of cardano-ledger-api.
+        Adding only 'cardano-ledger-api' (main lib) does NOT expose Test.* testlib modules.
 
     These are not in the test-suite's build-depends at the pinned SHA, so we
     patch the cabal file before running 'cabal build'.
@@ -85,7 +88,7 @@ def patch_cabal_file(path: str) -> None:
     ts_block = content[ts_start:ts_end]
 
     # Idempotency checks.
-    if "filepath" in ts_block and "cardano-ledger-api" in ts_block:
+    if "filepath" in ts_block and "cardano-ledger-api:testlib" in ts_block:
         print(f"[patch-impspec-core] NOTE: cabal deps already present; skipping cabal patch")
         return
 
@@ -148,11 +151,11 @@ def patch_cabal_file(path: str) -> None:
             to_add += f"{dep_indent}, filepath\n"
         else:
             to_add += f"{dep_indent}filepath,\n"
-    if "cardano-ledger-api" not in ts_block:
+    if "cardano-ledger-api:testlib" not in ts_block:
         if leading_comma_style:
-            to_add += f"{dep_indent}, cardano-ledger-api\n"
+            to_add += f"{dep_indent}, cardano-ledger-api:testlib\n"
         else:
-            to_add += f"{dep_indent}cardano-ledger-api,\n"
+            to_add += f"{dep_indent}cardano-ledger-api:testlib,\n"
 
     if to_add:
         content = content[:insert_abs] + to_add + content[insert_abs:]
