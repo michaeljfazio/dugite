@@ -248,6 +248,9 @@ fn purpose_to_script_info_v3(r: &ResolvedRedeemer) -> ScriptInfo {
         ScriptPurpose::Certifying(idx, c) => ScriptInfo::Certifying(*idx, c.clone()),
         ScriptPurpose::Voting(v) => ScriptInfo::Voting(v.clone()),
         ScriptPurpose::Proposing(idx, p) => ScriptInfo::Proposing(*idx, p.clone()),
+        // Dijkstra `DijkstraGuarding(ScriptHash)` — Sum 6.
+        // Issue #475 Phase 3.5.
+        ScriptPurpose::Guarding(h) => ScriptInfo::Guarding(*h),
     }
 }
 
@@ -377,6 +380,7 @@ mod tests {
             sub_transactions: vec![],
             account_balance_intervals: vec![],
             direct_deposits: ::std::collections::BTreeMap::new(),
+            guards: Vec::new(),
         };
         let ws = TransactionWitnessSet {
             vkey_witnesses: vec![],

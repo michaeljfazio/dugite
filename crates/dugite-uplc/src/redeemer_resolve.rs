@@ -103,6 +103,9 @@ pub fn resolve_redeemer(
             "resolve_redeemer: Propose redeemers not yet wired (tag {:?}, idx {})",
             r.tag, r.index
         ))),
+        // Dijkstra `DijkstraGuarding` — credential-based guard
+        // satisfied by a Plutus script.
+        RedeemerTag::Guarding => resolve_guarding(tx, r, resolved),
     }
 }
 
@@ -277,6 +280,49 @@ fn resolve_reward(
         script_bytes,
         language,
         purpose,
+        datum: None,
+        redeemer_data: r.data.clone(),
+        declared_ex_units: (r.ex_units.mem, r.ex_units.steps),
+    })
+}
+
+/// Dijkstra `DijkstraGuarding` redeemer — resolves the script
+/// dispatched by a credential-based guard at `tx.body.guards[index]`.
+///
+/// Only script-credential guards are valid targets for a Guarding
+/// redeemer; key-hash guards are satisfied by vkey signatures and never
+/// invoke a script. Per
+/// `Cardano.Ledger.Dijkstra.Scripts.DijkstraGuarding` (`Sum 6`) and the
+/// V3/V4 script-context emission in `populate_v3`. Issue #475 Phase 3.5.
+fn resolve_guarding(
+    tx: &Transaction,
+    r: &Redeemer,
+    resolved: &[(PrimTxIn, PrimTxOut, Vec<u8>)],
+) -> Result<ResolvedRedeemer, PhaseTwoError> {
+    let idx = r.index as usize;
+    let cred = tx.body.guards.get(idx).ok_or_else(|| {
+        PhaseTwoError::Internal(format!(
+            "guarding redeemer references guards[{idx}] but tx has {n}",
+            n = tx.body.guards.len()
+        ))
+    })?;
+    let script_hash = match cred {
+        PrimCred::Script(h) => h.0,
+        PrimCred::VerificationKey(_) => {
+            return Err(PhaseTwoError::Internal(format!(
+                "guarding redeemer #{idx}: guard credential is a key, not a script — \
+                 only Plutus / native-script guards admit a Guarding redeemer"
+            )));
+        }
+    };
+    let (script_bytes, language) = find_script_bytes(tx, resolved, &script_hash)?;
+    Ok(ResolvedRedeemer {
+        tag: r.tag.clone(),
+        index: r.index,
+        script_hash,
+        script_bytes,
+        language,
+        purpose: ScriptPurpose::Guarding(script_hash),
         datum: None,
         redeemer_data: r.data.clone(),
         declared_ex_units: (r.ex_units.mem, r.ex_units.steps),
@@ -519,6 +565,7 @@ mod tests {
             sub_transactions: vec![],
             account_balance_intervals: vec![],
             direct_deposits: ::std::collections::BTreeMap::new(),
+            guards: Vec::new(),
         }
     }
 
