@@ -482,6 +482,12 @@ impl EraRules for ShelleyRules {
             .pending_retirements
             .retain(|_, epoch| *epoch > new_epoch);
 
+        // MIR rule (Haskell EPOCH ordering: SNAP → POOLREAP → MIR → NEWPP).
+        // Drain pending `dsIRewards` map + pot-transfer accumulators into
+        // reward_accounts + reserves/treasury per
+        // `Cardano.Ledger.Shelley.Rules.Mir.applyMIR`.  See issue #631.
+        crate::state::certificates::apply_pending_mir(certs, epochs);
+
         // Capture prevPParams BEFORE PPUP updates.
         //
         // Post-Babbage (PV >= 7) `d` is conceptually 0 (no overlay slots —
@@ -1010,6 +1016,10 @@ mod tests {
                 stake_map: HashMap::new(),
             },
             script_stake_credentials: HashSet::new(),
+            pending_mir_reserves: std::collections::HashMap::new(),
+            pending_mir_treasury: std::collections::HashMap::new(),
+            pending_mir_delta_reserves: 0,
+            pending_mir_delta_treasury: 0,
         }
     }
 

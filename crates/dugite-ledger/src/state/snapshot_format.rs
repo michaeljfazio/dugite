@@ -141,6 +141,20 @@ pub struct LedgerStateSnapshot {
     pub total_stake_key_deposits: u64,
     /// Script-type stake credentials.
     pub script_stake_credentials: std::collections::HashSet<Hash32>,
+    /// Pending MIR reserves-sourced reward deltas (Haskell
+    /// `dsIRewards . irwdSrcReserves`; see issue #631).
+    pub pending_mir_reserves: HashMap<Hash32, i128>,
+    /// Pending MIR treasury-sourced reward deltas (Haskell
+    /// `dsIRewards . irwdSrcTreasury`).
+    pub pending_mir_treasury: HashMap<Hash32, i128>,
+    /// Pending pot-to-pot accumulator: reserves drained at the next epoch
+    /// boundary and routed to treasury (Haskell
+    /// `dsIRewards . deltaReserves`).
+    pub pending_mir_delta_reserves: i128,
+    /// Pending pot-to-pot accumulator: treasury drained at the next epoch
+    /// boundary and routed to reserves (Haskell
+    /// `dsIRewards . deltaTreasury`).
+    pub pending_mir_delta_treasury: i128,
     /// Per-block UTxO diffs for the last k blocks.
     #[serde(skip)]
     pub diff_seq: DiffSeq,
@@ -177,6 +191,10 @@ impl From<&super::LedgerState> for LedgerStateSnapshot {
             pointer_map: s.certs.pointer_map.clone(),
             stake_distribution: s.certs.stake_distribution.clone(),
             script_stake_credentials: s.certs.script_stake_credentials.clone(),
+            pending_mir_reserves: s.certs.pending_mir_reserves.clone(),
+            pending_mir_treasury: s.certs.pending_mir_treasury.clone(),
+            pending_mir_delta_reserves: s.certs.pending_mir_delta_reserves,
+            pending_mir_delta_treasury: s.certs.pending_mir_delta_treasury,
             // Gov sub-state
             governance: Arc::clone(&s.gov.governance),
             // Consensus sub-state
@@ -249,6 +267,10 @@ impl From<LedgerStateSnapshot> for super::LedgerState {
                 pointer_map: s.pointer_map,
                 stake_distribution: s.stake_distribution,
                 script_stake_credentials: s.script_stake_credentials,
+                pending_mir_reserves: s.pending_mir_reserves,
+                pending_mir_treasury: s.pending_mir_treasury,
+                pending_mir_delta_reserves: s.pending_mir_delta_reserves,
+                pending_mir_delta_treasury: s.pending_mir_delta_treasury,
             },
             gov: GovSubState {
                 governance: s.governance,

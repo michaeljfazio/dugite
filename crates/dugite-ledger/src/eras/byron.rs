@@ -1208,6 +1208,10 @@ mod tests {
                 stake_map: HashMap::new(),
             },
             script_stake_credentials: std::collections::HashSet::new(),
+            pending_mir_reserves: std::collections::HashMap::new(),
+            pending_mir_treasury: std::collections::HashMap::new(),
+            pending_mir_delta_reserves: 0,
+            pending_mir_delta_treasury: 0,
         }
     }
 

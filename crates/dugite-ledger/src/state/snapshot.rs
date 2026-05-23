@@ -135,7 +135,7 @@ impl LedgerState {
     /// dugite is pre-1.0 and makes no snapshot back-compat guarantee:
     /// there is no migration shim and no `serde(default)` fallbacks on
     /// fields added after launch.
-    pub(crate) const SNAPSHOT_VERSION: u8 = 17;
+    pub(crate) const SNAPSHOT_VERSION: u8 = 18;
 
     /// Save ledger state snapshot to disk using bincode serialization.
     ///

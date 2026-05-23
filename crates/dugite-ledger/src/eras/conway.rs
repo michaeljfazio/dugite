@@ -666,6 +666,13 @@ impl EraRules for ConwayRules {
             .pending_retirements
             .retain(|_, epoch| *epoch > new_epoch);
 
+        // MIR rule (Haskell EPOCH ordering: SNAP → POOLREAP → MIR → NEWPP).
+        // Conway has no MIR certs so the pending maps stay empty and this
+        // is a no-op; included only so a Babbage-loaded snapshot with
+        // pending MIR is drained on the first Conway-era boundary.  See
+        // issue #631.
+        crate::state::certificates::apply_pending_mir(certs, epochs);
+
         // === Step 3: DRep pulser completion ===
         // The DRep distribution (voting power) is computed live within
         // ratify_proposals_impl, matching Haskell's pulser completion that
@@ -1600,6 +1607,10 @@ fn make_empty_cert_sub() -> CertSubState {
             stake_map: HashMap::new(),
         },
         script_stake_credentials: HashSet::new(),
+        pending_mir_reserves: std::collections::HashMap::new(),
+        pending_mir_treasury: std::collections::HashMap::new(),
+        pending_mir_delta_reserves: 0,
+        pending_mir_delta_treasury: 0,
     }
 }
 
@@ -1707,6 +1718,10 @@ mod tests {
                 stake_map: HashMap::new(),
             },
             script_stake_credentials: HashSet::new(),
+            pending_mir_reserves: std::collections::HashMap::new(),
+            pending_mir_treasury: std::collections::HashMap::new(),
+            pending_mir_delta_reserves: 0,
+            pending_mir_delta_treasury: 0,
         }
     }
 

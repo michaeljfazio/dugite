@@ -4123,6 +4123,7 @@ fn test_mir_stake_credential_distribution() {
         source: MIRSource::Reserves,
         target: MIRTarget::StakeCredentials(vec![(cred.clone(), 1_000_000)]),
     });
+    crate::state::certificates::apply_pending_mir(&mut state.certs, &mut state.epochs);
     assert_eq!(
         state.certs.reward_accounts.get(&key),
         Some(&Lovelace(1_000_000))
@@ -4142,6 +4143,7 @@ fn test_mir_pot_transfer() {
         source: MIRSource::Reserves,
         target: MIRTarget::OtherAccountingPot(2_000_000),
     });
+    crate::state::certificates::apply_pending_mir(&mut state.certs, &mut state.epochs);
     assert_eq!(state.epochs.reserves, Lovelace(8_000_000));
     assert_eq!(state.epochs.treasury, Lovelace(7_000_000));
 
@@ -4150,6 +4152,7 @@ fn test_mir_pot_transfer() {
         source: MIRSource::Treasury,
         target: MIRTarget::OtherAccountingPot(3_000_000),
     });
+    crate::state::certificates::apply_pending_mir(&mut state.certs, &mut state.epochs);
     assert_eq!(state.epochs.reserves, Lovelace(11_000_000));
     assert_eq!(state.epochs.treasury, Lovelace(4_000_000));
 }
@@ -4915,6 +4918,7 @@ fn test_mir_stake_credentials_debits_reserves() {
             (cred2.clone(), 2_000_000),
         ]),
     });
+    crate::state::certificates::apply_pending_mir(&mut state.certs, &mut state.epochs);
 
     assert_eq!(state.certs.reward_accounts[&key1], Lovelace(3_000_000));
     assert_eq!(state.certs.reward_accounts[&key2], Lovelace(2_000_000));
@@ -4938,6 +4942,7 @@ fn test_mir_stake_credentials_debits_treasury() {
         source: MIRSource::Treasury,
         target: MIRTarget::StakeCredentials(vec![(cred.clone(), 7_000_000)]),
     });
+    crate::state::certificates::apply_pending_mir(&mut state.certs, &mut state.epochs);
 
     assert_eq!(state.certs.reward_accounts[&key], Lovelace(7_000_000));
     // Treasury should be debited
@@ -4946,9 +4951,11 @@ fn test_mir_stake_credentials_debits_treasury() {
 
 #[test]
 fn test_mir_compound_credential_and_pot_transfer() {
-    // Issue #16: When both credential distribution AND OtherAccountingPot transfer
-    // happen from the same source pot, the sequential operations must use saturating
-    // arithmetic to avoid underflow/overflow if the first operation depletes the pot.
+    // Per Haskell `applyMIR` MIR application is unconditional: any cert
+    // whose delta would underflow the source pot must have been rejected
+    // upstream by `validateMIRCert` (`InsufficientForInstantaneousRewards`).
+    // After issue #631 the apply path panics on such a scenario instead of
+    // silently capping at the available balance.
     let mut state = LedgerState::new(ProtocolParameters::mainnet_defaults());
     state.epochs.reserves = Lovelace(10_000_000);
     state.epochs.treasury = Lovelace(5_000_000);
@@ -4957,29 +4964,33 @@ fn test_mir_compound_credential_and_pot_transfer() {
     let key = credential_to_hash(&cred);
     state.process_certificate(&Certificate::StakeRegistration(cred.clone()));
 
-    // Step 1: MIR distributes 8M from reserves to credential (leaves 2M in reserves)
+    // 8M from reserves to credential, drained at the next epoch boundary.
     state.process_certificate(&Certificate::MoveInstantaneousRewards {
         source: MIRSource::Reserves,
         target: MIRTarget::StakeCredentials(vec![(cred.clone(), 8_000_000)]),
     });
+    crate::state::certificates::apply_pending_mir(&mut state.certs, &mut state.epochs);
     assert_eq!(state.epochs.reserves, Lovelace(2_000_000));
     assert_eq!(state.certs.reward_accounts[&key], Lovelace(8_000_000));
 
-    // Step 2: MIR pot transfer tries to move 5M from reserves to treasury,
-    // but only 2M remain. Should cap at available (2M), not panic/underflow.
+    // Now a 5M pot transfer with only 2M reserves: invalid per Haskell.
     state.process_certificate(&Certificate::MoveInstantaneousRewards {
         source: MIRSource::Reserves,
         target: MIRTarget::OtherAccountingPot(5_000_000),
     });
-    // Reserves fully drained (capped at 2M available)
-    assert_eq!(state.epochs.reserves, Lovelace(0));
-    // Treasury receives only the 2M that was actually available
-    assert_eq!(state.epochs.treasury, Lovelace(7_000_000));
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        crate::state::certificates::apply_pending_mir(&mut state.certs, &mut state.epochs)
+    }));
+    assert!(
+        result.is_err(),
+        "apply_pending_mir must panic when delta exceeds source pot"
+    );
 }
 
 #[test]
 fn test_mir_pot_transfer_exceeds_source_treasury() {
-    // Symmetric test: treasury pot transfer exceeding available balance
+    // Symmetric case for treasury → reserves pot transfer that exceeds
+    // available balance.
     let mut state = LedgerState::new(ProtocolParameters::mainnet_defaults());
     state.epochs.reserves = Lovelace(20_000_000);
     state.epochs.treasury = Lovelace(3_000_000);
@@ -4987,36 +4998,45 @@ fn test_mir_pot_transfer_exceeds_source_treasury() {
     let cred = Credential::VerificationKey(Hash28::from_bytes([0xff; 28]));
     state.process_certificate(&Certificate::StakeRegistration(cred.clone()));
 
-    // Distribute 2M from treasury to credential (leaves 1M)
     state.process_certificate(&Certificate::MoveInstantaneousRewards {
         source: MIRSource::Treasury,
         target: MIRTarget::StakeCredentials(vec![(cred.clone(), 2_000_000)]),
     });
+    crate::state::certificates::apply_pending_mir(&mut state.certs, &mut state.epochs);
     assert_eq!(state.epochs.treasury, Lovelace(1_000_000));
 
-    // Try to transfer 10M from treasury to reserves, but only 1M available
     state.process_certificate(&Certificate::MoveInstantaneousRewards {
         source: MIRSource::Treasury,
         target: MIRTarget::OtherAccountingPot(10_000_000),
     });
-    assert_eq!(state.epochs.treasury, Lovelace(0));
-    assert_eq!(state.epochs.reserves, Lovelace(21_000_000));
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        crate::state::certificates::apply_pending_mir(&mut state.certs, &mut state.epochs)
+    }));
+    assert!(
+        result.is_err(),
+        "apply_pending_mir must panic when treasury delta exceeds source pot"
+    );
 }
 
 #[test]
 fn test_mir_pot_transfer_zero_source() {
-    // Edge case: pot transfer when source is already zero
+    // Edge case: a pot transfer from an already-empty source pot is an
+    // invariant violation per Haskell and panics on apply.
     let mut state = LedgerState::new(ProtocolParameters::mainnet_defaults());
     state.epochs.reserves = Lovelace(0);
     state.epochs.treasury = Lovelace(5_000_000);
 
-    // Should be a no-op, not panic
     state.process_certificate(&Certificate::MoveInstantaneousRewards {
         source: MIRSource::Reserves,
         target: MIRTarget::OtherAccountingPot(1_000_000),
     });
-    assert_eq!(state.epochs.reserves, Lovelace(0));
-    assert_eq!(state.epochs.treasury, Lovelace(5_000_000));
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        crate::state::certificates::apply_pending_mir(&mut state.certs, &mut state.epochs)
+    }));
+    assert!(
+        result.is_err(),
+        "apply_pending_mir must panic on pot transfer from empty source"
+    );
 }
 
 #[test]

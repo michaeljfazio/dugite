@@ -1,5 +1,5 @@
 mod apply;
-mod certificates;
+pub(crate) mod certificates;
 mod epoch;
 #[cfg(feature = "epoch-state-debug")]
 pub mod epoch_state_debug;
@@ -607,6 +607,10 @@ impl LedgerState {
                 pointer_map: HashMap::new(),
                 stake_distribution: StakeDistributionState::default(),
                 script_stake_credentials: std::collections::HashSet::new(),
+                pending_mir_reserves: std::collections::HashMap::new(),
+                pending_mir_treasury: std::collections::HashMap::new(),
+                pending_mir_delta_reserves: 0,
+                pending_mir_delta_treasury: 0,
             },
             gov: GovSubState {
                 governance: Arc::new(GovernanceState::default()),
@@ -939,6 +943,10 @@ impl LedgerState {
                 pointer_map: HashMap::new(), // Conway era: pointers excluded
                 stake_distribution: StakeDistributionState { stake_map },
                 script_stake_credentials,
+                pending_mir_reserves: HashMap::new(),
+                pending_mir_treasury: HashMap::new(),
+                pending_mir_delta_reserves: 0,
+                pending_mir_delta_treasury: 0,
             },
             gov: GovSubState {
                 governance: Arc::new(gov),

@@ -813,6 +813,10 @@ mod tests {
                 stake_map: HashMap::new(),
             },
             script_stake_credentials: HashSet::new(),
+            pending_mir_reserves: std::collections::HashMap::new(),
+            pending_mir_treasury: std::collections::HashMap::new(),
+            pending_mir_delta_reserves: 0,
+            pending_mir_delta_treasury: 0,
         }
     }
     fn make_gov_sub() -> GovSubState {
@@ -1431,6 +1435,10 @@ mod tests {
                     stake_map: HashMap::new(),
                 },
                 script_stake_credentials: HashSet::new(),
+                pending_mir_reserves: std::collections::HashMap::new(),
+                pending_mir_treasury: std::collections::HashMap::new(),
+                pending_mir_delta_reserves: 0,
+                pending_mir_delta_treasury: 0,
             };
             // Reach back into the parent `tests` module for fixture helpers.
             let mut gov = super::make_gov_sub();
@@ -1733,6 +1741,10 @@ mod tests {
                     stake_map: HashMap::new(),
                 },
                 script_stake_credentials: HashSet::new(),
+                pending_mir_reserves: std::collections::HashMap::new(),
+                pending_mir_treasury: std::collections::HashMap::new(),
+                pending_mir_delta_reserves: 0,
+                pending_mir_delta_treasury: 0,
             };
             let mut epochs = EpochSubState {
                 snapshots: crate::state::EpochSnapshots::default(),
@@ -1947,6 +1959,10 @@ mod tests {
                         stake_map: HashMap::new(),
                     },
                     script_stake_credentials: HashSet::new(),
+                    pending_mir_reserves: std::collections::HashMap::new(),
+                    pending_mir_treasury: std::collections::HashMap::new(),
+                    pending_mir_delta_reserves: 0,
+                    pending_mir_delta_treasury: 0,
                 };
                 let gov = super::make_gov_sub();
                 let epochs = EpochSubState {
@@ -2342,6 +2358,10 @@ mod tests {
                         stake_map: HashMap::new(),
                     },
                     script_stake_credentials: HashSet::new(),
+                    pending_mir_reserves: std::collections::HashMap::new(),
+                    pending_mir_treasury: std::collections::HashMap::new(),
+                    pending_mir_delta_reserves: 0,
+                    pending_mir_delta_treasury: 0,
                 };
                 let gov = super::make_gov_sub();
                 let epochs = EpochSubState {
@@ -2721,6 +2741,10 @@ mod tests {
                             stake_map: HashMap::new(),
                         },
                         script_stake_credentials: HashSet::new(),
+                        pending_mir_reserves: std::collections::HashMap::new(),
+                        pending_mir_treasury: std::collections::HashMap::new(),
+                        pending_mir_delta_reserves: 0,
+                        pending_mir_delta_treasury: 0,
                     },
                     GovSubState {
                         governance: Arc::new(crate::state::GovernanceState::default()),

@@ -457,6 +457,14 @@ impl LedgerState {
             .pending_retirements
             .retain(|_, epoch| *epoch > new_epoch);
 
+        // MIR rule (Haskell EPOCH ordering: SNAP → POOLREAP → MIR → NEWPP).
+        // Drain the pending `dsIRewards` map and pot-transfer accumulators
+        // into reward_accounts + reserves/treasury per
+        // `Cardano.Ledger.Shelley.Rules.Mir.applyMIR`.  Pre-Conway only —
+        // Conway never produces MIR certs so the pending maps stay empty
+        // and this is a no-op.  See issue #631.
+        super::certificates::apply_pending_mir(&mut self.certs, &mut self.epochs);
+
         // Capture prevPParams BEFORE PPUP updates curPP, matching Haskell's
         // NEWPP rule: prevPParams = old curPParams (before this boundary's PPUP).
         // The RUPD at the NEXT boundary will use prev_protocol_params for ALL
