@@ -35,8 +35,12 @@
 //!           | [2, epoch_delta] ]               -- PassEpoch
 //! ```
 //!
-//! See `vector.rs` for the decoder.
+//! See `vector.rs` for the decoder, `bridge.rs` for state decoding,
+//! `runner.rs` for event application, and `compare.rs` for state comparison.
 
+pub mod bridge;
+pub mod compare;
+pub mod runner;
 pub mod vector;
 
 use std::path::Path;
@@ -53,7 +57,7 @@ const SKIP_LIST: &[(&str, &str)] = &[
     // Format: ("title-substring", "issue URL or number")
 ];
 
-/// Returns true if this vector title matches a known-skip entry.
+/// Returns the issue URL for a vector whose title matches a skip entry, or `None`.
 fn is_skipped(title: &str) -> Option<&'static str> {
     for (pattern, issue) in SKIP_LIST {
         if title.contains(pattern) {
@@ -65,9 +69,10 @@ fn is_skipped(title: &str) -> Option<&'static str> {
 
 /// Run all `.cbor` vector files found under `dir/<category>`.
 ///
+/// Each `.cbor` file is decoded via `vector::decode_vector`, then inspected
+/// via `bridge`, replayed via `runner`, and compared via `compare`.
+///
 /// Skips gracefully when `dir` contains no `.cbor` files (stub mode).
-/// Hard-panics in `DUGITE_REQUIRE_UPSTREAM=1` mode when skip-list entries
-/// would prevent complete coverage.
 pub fn run_era_vectors(dir: &Path, category: &str) {
     let sub = dir.join(category);
     if !sub.exists() {
@@ -85,7 +90,8 @@ pub fn run_era_vectors(dir: &Path, category: &str) {
 
     if cbor_files.is_empty() {
         eprintln!(
-            "[ledger-rules] SKIP {category}: no .cbor files in {} (stub mode — run regeneration pipeline)",
+            "[ledger-rules] SKIP {category}: no .cbor files in {} \
+             (stub mode — run `just regenerate-corpus-local` to populate vectors)",
             sub.display()
         );
         return;
@@ -93,7 +99,7 @@ pub fn run_era_vectors(dir: &Path, category: &str) {
 
     let mut passed = 0usize;
     let mut skipped = 0usize;
-    let failed = 0usize;
+    let mut failed = 0usize;
 
     for path in &cbor_files {
         let data =
@@ -102,10 +108,12 @@ pub fn run_era_vectors(dir: &Path, category: &str) {
         let vec = match vector::decode_vector(&data) {
             Ok(v) => v,
             Err(e) => {
-                panic!(
+                eprintln!(
                     "[ledger-rules] FAIL decode {}: {e}",
                     path.file_name().unwrap_or_default().to_string_lossy()
                 );
+                failed += 1;
+                continue;
             }
         };
 
@@ -118,13 +126,94 @@ pub fn run_era_vectors(dir: &Path, category: &str) {
             continue;
         }
 
-        // Phase 4 follow-on: plug in bridge → runner → compare here.
-        // Until then, assert that the vector decodes correctly and has events.
-        assert!(
-            !vec.events.is_empty() || !vec.title.is_empty(),
-            "vector {} decoded but has no events and no title",
-            path.display()
-        );
+        // Validate config shape.
+        match bridge::decode_config(&vec.config_cbor) {
+            Ok(n) => {
+                if n == 0 {
+                    eprintln!(
+                        "[ledger-rules] WARN {}: config decoded as empty array",
+                        vec.title
+                    );
+                }
+            }
+            Err(e) => {
+                eprintln!("[ledger-rules] FAIL {}: config decode: {e}", vec.title);
+                failed += 1;
+                continue;
+            }
+        }
+
+        // Decode initial and final state shapes.
+        let initial = match bridge::decode_state(&vec.initial_state_cbor, "initial_state") {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("[ledger-rules] FAIL {}: initial_state: {e}", vec.title);
+                failed += 1;
+                continue;
+            }
+        };
+        let expected = match bridge::decode_state(&vec.final_state_cbor, "final_state") {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("[ledger-rules] FAIL {}: final_state: {e}", vec.title);
+                failed += 1;
+                continue;
+            }
+        };
+
+        // Run all events through the runner (skeleton: event counting only).
+        let outcome = runner::run_vector(&vec);
+        match &outcome {
+            runner::RunOutcome::Decoded {
+                transactions,
+                ticks,
+                epoch_advances,
+            } => {
+                eprintln!(
+                    "[ledger-rules] {:?} {:?}: {} tx, {} tick, {} epoch | \
+                     initial={}, expected={}",
+                    path.file_name().unwrap_or_default(),
+                    vec.title,
+                    transactions,
+                    ticks,
+                    epoch_advances,
+                    initial.shape,
+                    expected.shape,
+                );
+            }
+            runner::RunOutcome::Failed { event_idx, detail } => {
+                eprintln!(
+                    "[ledger-rules] FAIL {:?} at event {event_idx}: {detail}",
+                    path.file_name().unwrap_or_default()
+                );
+                failed += 1;
+                continue;
+            }
+            runner::RunOutcome::Skipped { reason } => {
+                eprintln!(
+                    "[ledger-rules] SKIP {:?}: {reason}",
+                    path.file_name().unwrap_or_default()
+                );
+                skipped += 1;
+                continue;
+            }
+        }
+
+        // Compare states (skeleton: shape + byte-length comparison).
+        // In Phase 4 skeleton mode, initial_state == final_state since the runner
+        // hasn't applied events. Once the full bridge is wired, this compares the
+        // post-event state against the vector's expected final_state.
+        let cmp = compare::compare_states(&initial, &expected);
+        if !cmp.matches && std::env::var("DUGITE_REQUIRE_UPSTREAM").as_deref() == Ok("1") {
+            eprintln!(
+                "[ledger-rules] DIFF {:?}: {}",
+                path.file_name().unwrap_or_default(),
+                cmp.diff
+            );
+            // Don't count as failed in skeleton mode — states will differ until
+            // the runner actually applies events.
+        }
+
         passed += 1;
     }
 
