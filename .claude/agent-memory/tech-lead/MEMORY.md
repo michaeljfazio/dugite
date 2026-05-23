@@ -4,6 +4,7 @@
 - [Dijkstra era rules dispatch (#462)](issue-462-dijkstra-era-rules.md) — Conway alias removed; DijkstraRules delegates to Conway plus identity translateEraDijkstra
 
 ## Critical Invariants & Bug Patterns
+- [Issue #609 snapshot version quarantine](issue-609-snapshot-version-quarantine.md) — SNAPSHOT_VERSION bump silently wiped ledger snapshot (cryptic bincode "tag for enum is not valid" → init_fresh_ledger → from-genesis re-sync); fix: fail-fast version guard + rename to `<name>.bin.vNN-unreadable` so quarantined file is preserved AND not retried; ChainDB untouched; bump checklist updated
 - [Forge connectivity gate (Bug C)](forge-connectivity-gate-bug-c.md) — forge before peers connect → self-forged fork → Bug-A disconnect loop → permanent stall; fix: AtomicBool + hot_peer_count gate in try_forge_block_at; flag set after Bug-A guard in chainsync_client_task (9d30beaf2)
 - [Live apply path skips LedgerSeq delta push (Bug B)](node-live-apply-no-ledgerseq-delta.md) — apply_fetched_block uses apply_block (no delta), LedgerSeq empty, fork rollback fails → clear_volatile → StoreButDontChange forever; fix: use apply_block_with_delta + push in apply_fetched_block and fork replay loop
 - [ChainSync at_tip rollback stall](chainsync-at-tip-rollback-stall.md) — at_tip not reset on MsgRollBackward → pipeline freeze → bearer closed; fix: at_tip=false in MsgRollBackward arm (5abaf2687)
