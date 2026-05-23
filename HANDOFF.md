@@ -2,7 +2,7 @@
 
 **Date:** 2026-05-23  
 **Branch:** `worktree-ledger-state-verification-2026-05-23`  
-**Last commit:** `12966ff4f`  
+**Last commit:** `67e624135`  
 **Spec:** `docs/superpowers/specs/2026-05-23-upstream-conformance-testing-design.md`
 
 ---
@@ -35,22 +35,21 @@ Level 1-3 validation (structural + schema + semantic) on 4 existing fallback fix
 
 Full STM multi-signature verification (Level 4) is a documented follow-on requiring `mithril-stm` dependency.
 
-### Phase 4 — ImpSpec Replay: Blocked 🛑
+### Phase 4 — ImpSpec Replay: Partial ⚠️
+
+The vector format has been corrected (4 files per test directory, matching real ImpSpec output). A synthetic `ConwayNEWEPOCH/test_minimal_epoch_advance` fixture validates the core NEWEPOCH invariant: `signal_epoch > initial_epoch`. The runner dispatches on rule name (NEWEPOCH → epoch invariant, UTXO → tx CBOR decode). 17/17 conformance tests pass including this fixture.
+
+**Remaining blocker:** Full state apply (`apply_tx`, `apply_epoch`) requires the NewEpochState bridge (see below).
+
+### Phase 4 — Remaining Blocker 🛑
 
 ---
 
-## Phase 4 Blocker (True Blocker per halt condition b)
+## Phase 4 Remaining Blocker (True Blocker per halt condition b)
 
-### Blocker 1: Vector format mismatch
+### Blocker 1: Vector format mismatch — FIXED ✅
 
-The design spec describes a 5-element CBOR envelope:
-```
-[config(arr[13]), initial_state(arr[7]), final_state(arr[7]), events(arr[N]), title(str)]
-```
-
-**This format does not match what cardano-ledger actually produces.** Confirmed by cardano-ledger-oracle research against `libs/cardano-ledger-conformance/src/Test/Cardano/Ledger/Conformance/ExecSpecRule/Core.hs`.
-
-The actual ImpSpec conformance dump (triggered when `CONFORMANCE_CBOR_DUMP_PATH` is set and a test diverges) writes **4 separate CBOR files** per test case:
+The design spec described a 5-element CBOR envelope (since corrected). The actual ImpSpec conformance dump writes **4 separate CBOR files** per test case (confirmed by oracle, code now matches):
 
 | File | Type | CBOR encoding |
 |------|------|---------------|
