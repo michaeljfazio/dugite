@@ -76,7 +76,7 @@ find_and_copy() {
     while IFS= read -r -d '' f; do
         dest_name="${dest_prefix}$(basename "$f")"
         cp "$f" "${CONTENT_DIR}/${dest_name}"
-        ((FIXTURE_COUNT++))
+        FIXTURE_COUNT=$((FIXTURE_COUNT + 1))
         log "Copied: ${dest_name}"
     done < <(find "$src_dir" -name "$pattern" -type f -print0 2>/dev/null)
 }

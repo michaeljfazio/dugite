@@ -86,7 +86,7 @@ VRF_COUNT=0
 for f in "${VECTORS_SRC}"/vrf*; do
     [[ -f "$f" ]] || continue
     cp "$f" "${CONTENT_DIR}/"
-    ((VRF_COUNT++))
+    VRF_COUNT=$((VRF_COUNT + 1))
     log "Copied: $(basename "$f")"
 done
 
