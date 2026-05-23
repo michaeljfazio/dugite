@@ -1,5 +1,11 @@
 # Nightly Benchmark Results — 2026-05-19
 
+> **Note:** This benchmark log was captured on 2026-05-19, before the pallas and aiken
+> dependencies were removed from the workspace. The build output below reflects the
+> dependency set at that time. Current builds no longer include pallas or aiken.
+> The benchmark numbers themselves remain valid as they measure storage and CBOR
+> throughput, which are unaffected by that dependency change.
+
 Machine: GitHub Actions ubuntu-latest
 Branch: main (0b606a6)
 

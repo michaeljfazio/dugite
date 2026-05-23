@@ -21,6 +21,7 @@ dugite-node run [OPTIONS]
 | `--port` | `3001` | TCP port for N2N (node-to-node) connections |
 | `--host-addr` | `0.0.0.0` | Host address to bind to |
 | `--metrics-port` | `12798` | Prometheus metrics port (set to `0` to disable) |
+| `--consensus-mode` | `praos` | Consensus mode: `praos` (default) or `genesis` (Ouroboros Genesis with GSM) |
 | `--shelley-kes-key` | | Path to the KES signing key (enables block production) |
 | `--shelley-vrf-key` | | Path to the VRF signing key (enables block production) |
 | `--shelley-operational-certificate` | | Path to the operational certificate (enables block production) |

@@ -52,6 +52,10 @@ dugite-node run \
 
 ## Connecting to Preview Testnet
 
+> **Note:** Preview testnet is at Protocol Version 11 (PV11). Peers running
+> cardano-node 10.x will reject the connection with a version mismatch. Use
+> cardano-node 11.0.1+ for any preview peer or soak rig.
+
 Create a `config-preview.json`:
 
 ```json
