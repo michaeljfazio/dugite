@@ -92,6 +92,7 @@ jobs:
         run: chmod +x scripts/regenerate-conformance-corpus/*.sh
 
       - name: Run regeneration pipeline
+        id: regenerate
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GH_REPO: ${{ github.repository }}
@@ -102,18 +103,16 @@ jobs:
             ARGS+=(--area "${INPUT_AREA}")
           fi
           bash scripts/regenerate-conformance-corpus/regenerate.sh "${ARGS[@]}"
+          # Capture the release tag from the tarballs directory name for the verify step.
+          RELEASE_TAG="$(ls target/conformance-corpus/ | sort | tail -1)"
+          echo "release_tag=${RELEASE_TAG}" >> "${GITHUB_OUTPUT}"
 
       - name: Verify release assets
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GH_REPO: ${{ github.repository }}
+          LATEST_TAG: ${{ steps.regenerate.outputs.release_tag }}
         run: |
-          # Find the most-recently-created conformance-corpus release and check it has
-          # all 7 area tarballs plus corpus-manifest.json.
-          LATEST_TAG="$(gh release list --repo "${GH_REPO}" \
-              --json tagName,createdAt \
-              --jq '[.[] | select(.tagName | startswith("conformance-corpus-"))] | sort_by(.createdAt) | last | .tagName')"
-
           echo "Verifying release: ${LATEST_TAG}"
 
           ASSETS="$(gh release view "${LATEST_TAG}" --repo "${GH_REPO}" --json assets --jq '[.assets[].name]')"
