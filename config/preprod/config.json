@@ -15,5 +15,6 @@
   "ShelleyGenesisHash": "162d29c4e1cf6b8a84f2d692e67a3ac6bc7851bc3e6e4afe64d15778bed8bd86",
   "AlonzoGenesisFile": "alonzo-genesis.json",
   "ConwayGenesisFile": "conway-genesis.json",
-  "MinSeverity": "Info"
+  "MinSeverity": "Info",
+  "MetricsPort": 12799
 }

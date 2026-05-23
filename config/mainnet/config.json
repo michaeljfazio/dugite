@@ -27,5 +27,6 @@
     "TraceForge": true,
     "TraceMempool": true
   },
-  "MinSeverity": "Info"
+  "MinSeverity": "Info",
+  "MetricsPort": 12800
 }
