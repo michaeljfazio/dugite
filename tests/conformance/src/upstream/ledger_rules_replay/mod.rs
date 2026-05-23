@@ -274,10 +274,18 @@ pub fn run_all_checks(dir: &Path) {
             runner::RunOutcome::NewEpochValidated {
                 initial_epoch,
                 signal_epoch,
+                treasury,
+                reserves,
             } => {
+                let acct = match (treasury, reserves) {
+                    (Some(t), Some(r)) => {
+                        format!(" treasury={t} reserves={r}")
+                    }
+                    _ => String::new(),
+                };
                 eprintln!(
-                    "[ledger-rules] PASS {label} rule={}: NEWEPOCH {initial_epoch} → {signal_epoch} \
-                     (state shape: {})",
+                    "[ledger-rules] PASS {label} rule={}: NEWEPOCH {initial_epoch} → {signal_epoch}\
+                     {acct} (state shape: {})",
                     vec.rule, state.shape
                 );
                 passed += 1;

@@ -28,7 +28,7 @@
 use dugite_serialization::decode_transaction;
 
 use crate::upstream::ledger_rules_replay::{
-    bridge::{decode_epoch_no, decode_initial_epoch_no},
+    bridge::{decode_epoch_no, decode_initial_epoch_no, decode_new_epoch_state},
     vector::ImpVector,
 };
 
@@ -39,6 +39,11 @@ pub enum RunOutcome {
     NewEpochValidated {
         initial_epoch: u64,
         signal_epoch: u64,
+        /// Initial treasury (lovelace) from AccountState, or `None` if
+        /// structural decode of the full NewEpochState failed.
+        treasury: Option<u64>,
+        /// Initial reserves (lovelace) from AccountState.
+        reserves: Option<u64>,
     },
     /// UTXO signal decoded successfully as a transaction.
     UtxoDecoded { era_id: u16, tx_bytes: usize },
@@ -94,6 +99,12 @@ pub fn run_vector(vec: &ImpVector) -> RunOutcome {
 ///
 /// The signal for NEWEPOCH is a bare CBOR u64 (target epoch number).
 /// The initial epoch number is field [0] of the NewEpochState `array(7)`.
+///
+/// Additionally, `decode_new_epoch_state` is called on the state blob to
+/// extract treasury + reserves from `AccountState`.  A failure here does NOT
+/// fail the test — only the epoch-invariant check is gating.  The
+/// treasury/reserves are included in the PASS message for diagnostic value
+/// when real ImpSpec fixtures arrive.
 fn run_newepoch(vec: &ImpVector) -> RunOutcome {
     let initial_epoch = match decode_initial_epoch_no(&vec.st_cbor) {
         Ok(n) => n,
@@ -122,9 +133,21 @@ fn run_newepoch(vec: &ImpVector) -> RunOutcome {
         };
     }
 
+    // Best-effort: decode the full NewEpochState to extract treasury/reserves.
+    // Failure here is non-fatal — the epoch-invariant is the gating check.
+    let (treasury, reserves) = match decode_new_epoch_state(&vec.st_cbor) {
+        Ok(nes) => (Some(nes.treasury), Some(nes.reserves)),
+        Err(e) => {
+            eprintln!("[ledger-rules] WARN decode_new_epoch_state (non-fatal): {e}");
+            (None, None)
+        }
+    };
+
     RunOutcome::NewEpochValidated {
         initial_epoch,
         signal_epoch,
+        treasury,
+        reserves,
     }
 }
 
