@@ -122,6 +122,7 @@ fn unique_tx_from_counter(n: u32) -> Transaction {
             sub_transactions: vec![],
             account_balance_intervals: vec![],
             direct_deposits: BTreeMap::new(),
+            guards: Vec::new(),
         },
         witness_set: empty_witness_set(),
         is_valid: true,

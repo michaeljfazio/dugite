@@ -633,6 +633,7 @@ mod tests {
                 sub_transactions: vec![],
                 account_balance_intervals: vec![],
                 direct_deposits: BTreeMap::new(),
+                guards: Vec::new(),
             },
             witness_set: dugite_primitives::transaction::TransactionWitnessSet {
                 vkey_witnesses: vec![],
