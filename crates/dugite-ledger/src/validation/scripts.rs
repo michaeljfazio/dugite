@@ -10,6 +10,7 @@
 
 use std::collections::{HashMap, HashSet};
 
+use dugite_primitives::credentials::Credential;
 use dugite_primitives::hash::{Hash28, Hash32};
 use dugite_primitives::protocol_params::ProtocolParameters;
 use dugite_primitives::time::SlotNo;
@@ -32,28 +33,62 @@ use super::ValidationError;
 ///
 /// This is the canonical recursive evaluator matching the Cardano ledger
 /// specification for native scripts (Shelley multi-sig and Mary timelocks).
+///
+/// **Dijkstra `RequireGuard`**: the per-tx `guards` set is NOT visible to
+/// this entry point — pre-Dijkstra callers never see a `RequireGuard`
+/// node, and Dijkstra-aware callers must use
+/// [`evaluate_native_script_with_guards`] instead. A `RequireGuard`
+/// encountered here is conservatively rejected (`false`) rather than
+/// silently treated as satisfied; this is the defensive choice that
+/// guarantees no false positives at apply time. Issue #475 Phase 3.5.
 pub fn evaluate_native_script(
     script: &NativeScript,
     signers: &HashSet<Hash32>,
     current_slot: SlotNo,
 ) -> bool {
+    evaluate_native_script_with_guards(script, signers, current_slot, &HashSet::new())
+}
+
+/// Dijkstra-aware native script evaluator. Identical to
+/// [`evaluate_native_script`] for all pre-Dijkstra constructors, plus
+/// support for `RequireGuard(cred)` which is satisfied iff
+/// `cred ∈ satisfied_guards`.
+///
+/// Mirrors upstream `evalDijkstraNativeScript`:
+///
+/// ```haskell
+/// RequireGuard cred -> cred `OSet.member` guards
+/// ```
+///
+/// `satisfied_guards` is the post-witness-check projection: the subset
+/// of the tx's declared `guards` (TxBody key 14) that the Dijkstra
+/// witness pipeline has confirmed as satisfied. Issue #475 Phase 3.5.
+pub fn evaluate_native_script_with_guards(
+    script: &NativeScript,
+    signers: &HashSet<Hash32>,
+    current_slot: SlotNo,
+    satisfied_guards: &HashSet<Credential>,
+) -> bool {
     match script {
         NativeScript::ScriptPubkey(keyhash) => signers.contains(keyhash),
-        NativeScript::ScriptAll(scripts) => scripts
-            .iter()
-            .all(|s| evaluate_native_script(s, signers, current_slot)),
-        NativeScript::ScriptAny(scripts) => scripts
-            .iter()
-            .any(|s| evaluate_native_script(s, signers, current_slot)),
+        NativeScript::ScriptAll(scripts) => scripts.iter().all(|s| {
+            evaluate_native_script_with_guards(s, signers, current_slot, satisfied_guards)
+        }),
+        NativeScript::ScriptAny(scripts) => scripts.iter().any(|s| {
+            evaluate_native_script_with_guards(s, signers, current_slot, satisfied_guards)
+        }),
         NativeScript::ScriptNOfK(n, scripts) => {
             let count = scripts
                 .iter()
-                .filter(|s| evaluate_native_script(s, signers, current_slot))
+                .filter(|s| {
+                    evaluate_native_script_with_guards(s, signers, current_slot, satisfied_guards)
+                })
                 .count();
             count >= *n as usize
         }
         NativeScript::InvalidBefore(slot) => current_slot >= *slot,
         NativeScript::InvalidHereafter(slot) => current_slot < *slot,
+        NativeScript::RequireGuard(cred) => satisfied_guards.contains(cred),
     }
 }
 
@@ -69,7 +104,7 @@ pub fn evaluate_native_script(
 /// - `0x02` — Plutus V2
 /// - `0x03` — Plutus V3
 /// - `0x04` — Plutus V4 (Dijkstra, issue #475 Phase 5)
-pub(super) fn compute_script_ref_hash(script_ref: &ScriptRef) -> Hash28 {
+pub(crate) fn compute_script_ref_hash(script_ref: &ScriptRef) -> Hash28 {
     match script_ref {
         ScriptRef::NativeScript(ns) => {
             let script_cbor = dugite_serialization::encode_native_script(ns);

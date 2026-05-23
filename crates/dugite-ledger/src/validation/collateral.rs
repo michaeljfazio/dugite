@@ -221,6 +221,9 @@ fn check_redeemer_indices(tx: &Transaction, errors: &mut Vec<ValidationError>) {
     // is NOT renumbered to skip non-governed proposals — it is the raw position.
     let propose_count = body.proposal_procedures.len();
 
+    // Dijkstra `Guarding` redeemer indexes into `tx.body.guards` (TxBody
+    // key 14). Issue #475 Phase 3.5.
+    let guard_count = body.guards.len();
     for redeemer in &tx.witness_set.redeemers {
         let (max, tag_name) = match redeemer.tag {
             RedeemerTag::Spend => (input_count, "Spend"),
@@ -229,6 +232,7 @@ fn check_redeemer_indices(tx: &Transaction, errors: &mut Vec<ValidationError>) {
             RedeemerTag::Reward => (withdrawal_count, "Reward"),
             RedeemerTag::Vote => (vote_voter_count, "Vote"),
             RedeemerTag::Propose => (propose_count, "Propose"),
+            RedeemerTag::Guarding => (guard_count, "Guarding"),
         };
         if redeemer.index as usize >= max {
             errors.push(ValidationError::RedeemerIndexOutOfRange {
@@ -632,9 +636,21 @@ pub(crate) fn check_extra_redeemers(
         }
     }
 
+    // Guarding: script-credential guards (TxBody key 14, Dijkstra+).
+    // Only Script-typed guards admit a Plutus Guarding redeemer; key-hash
+    // guards are satisfied by vkey signatures (no redeemer). Tag byte 6
+    // matches `Cardano.Ledger.Dijkstra.Scripts.DijkstraPlutusPurpose`
+    // (`DijkstraGuarding`, `Sum 6`). Issue #475 Phase 3.5.
+    for (idx, cred) in body.guards.iter().enumerate() {
+        if matches!(cred, Credential::Script(_)) {
+            valid_purposes.insert((6, idx as u32));
+        }
+    }
+
     // Check each redeemer against valid purposes.
     // Tag bytes match the Cardano CDDL redeemer_tag encoding:
-    //   0=spend, 1=mint, 2=cert, 3=reward, 4=vote, 5=propose.
+    //   0=spend, 1=mint, 2=cert, 3=reward, 4=vote, 5=propose,
+    //   6=guarding (Dijkstra+).
     for redeemer in &tx.witness_set.redeemers {
         let tag_byte = match redeemer.tag {
             RedeemerTag::Spend => 0u8,
@@ -643,6 +659,7 @@ pub(crate) fn check_extra_redeemers(
             RedeemerTag::Reward => 3u8,
             RedeemerTag::Vote => 4u8,
             RedeemerTag::Propose => 5u8,
+            RedeemerTag::Guarding => 6u8,
         };
         if !valid_purposes.contains(&(tag_byte, redeemer.index)) {
             errors.push(ValidationError::ExtraRedeemer {
@@ -1058,6 +1075,7 @@ mod tests {
                 sub_transactions: vec![],
                 account_balance_intervals: vec![],
                 direct_deposits: ::std::collections::BTreeMap::new(),
+                guards: Vec::new(),
             },
             // Include a V2 script so `has_plutus_scripts()` is satisfied when
             // the full validate_transaction path is exercised.  For direct
@@ -1594,6 +1612,7 @@ mod tests {
                 sub_transactions: vec![],
                 account_balance_intervals: vec![],
                 direct_deposits: ::std::collections::BTreeMap::new(),
+                guards: Vec::new(),
             },
             witness_set: TransactionWitnessSet {
                 vkey_witnesses: vec![],
@@ -1694,6 +1713,7 @@ mod tests {
                 sub_transactions: vec![],
                 account_balance_intervals: vec![],
                 direct_deposits: ::std::collections::BTreeMap::new(),
+                guards: Vec::new(),
             },
             witness_set: TransactionWitnessSet {
                 vkey_witnesses: vec![],

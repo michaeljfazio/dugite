@@ -27,6 +27,9 @@ pub mod withdrawals;
 mod tests;
 
 pub use scripts::evaluate_native_script;
+// Dijkstra-aware native script evaluator + script-hash helper used by the
+// Phase 3.5 guard-witness check in `eras::dijkstra`. Issue #475.
+pub(crate) use scripts::{compute_script_ref_hash, evaluate_native_script_with_guards};
 // Re-exported for use by the block-application layer (block-level ref script
 // size check in state/apply.rs — Haskell's `conwayBbodyTransition`).
 pub(crate) use scripts::script_ref_byte_size;

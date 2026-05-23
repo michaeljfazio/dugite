@@ -138,6 +138,24 @@ impl EraRules for DijkstraRules {
         //    accounts are treated as having a balance of 0, matching upstream.
         check_account_balance_intervals(tx, certs)?;
 
+        // 0a) Dijkstra witness predicate `MissingGuardWitness`
+        //     (issue #475 Phase 3.5).
+        //
+        //     TxBody key 14 — `guards` — declares a set of stake
+        //     credentials each of which must be additionally authorised
+        //     by the tx. Authorisation is satisfied either:
+        //       - VerificationKey credential: a matching vkey signature
+        //         (key-hash present in the tx's vkey witness set).
+        //       - Script credential: a script in the witness set (native
+        //         or Plutus) whose hash matches the credential AND which
+        //         itself successfully evaluates.
+        //
+        //     This check runs BEFORE any state mutation so a missing
+        //     guard rejects the entire tx with no UTxO side-effects.
+        //     Conway-shaped Dijkstra txs (no guards declared) pay no cost
+        //     here — the loop is empty.
+        check_guard_witnesses(tx, ctx)?;
+
         // 0b) UTXOS predicate `DirectDepositToUnregisteredAccount`
         //     (issue #475 Phase 3.4).
         //
@@ -332,11 +350,19 @@ impl EraRules for DijkstraRules {
         certs: &CertSubState,
         gov: &GovSubState,
     ) -> HashSet<Hash28> {
-        // Conway witness rules apply. New Dijkstra purposes (`Guarding`,
-        // credential-based guards on TxBody key 14) extend this set; that
-        // extension lands together with the wire decoder (issue #462
-        // Phase 3.5 / #466).
-        self.conway().required_witnesses(tx, ctx, utxo, certs, gov)
+        // Conway witness rules apply, plus the Dijkstra credential-based
+        // guards (TxBody key 14, issue #475 Phase 3.5). For each
+        // `Credential::VerificationKey` entry in `tx.body.guards` the
+        // matching keyhash must appear in the witness set; script-typed
+        // guards are satisfied by a matching native or Plutus script and
+        // are validated through `check_guard_witnesses` at apply time.
+        let mut witnesses = self.conway().required_witnesses(tx, ctx, utxo, certs, gov);
+        for cred in &tx.body.guards {
+            if let dugite_primitives::credentials::Credential::VerificationKey(h) = cred {
+                witnesses.insert(*h);
+            }
+        }
+        witnesses
     }
 }
 
@@ -429,6 +455,142 @@ fn apply_sub_transactions(tx: &Transaction, utxo: &mut UtxoSubState) -> UtxoDiff
 }
 
 // ---------------------------------------------------------------------------
+// Credential-based guards predicate (Phase 3.5)
+// ---------------------------------------------------------------------------
+
+/// Verify every declared `guards` entry (TxBody key 14, Dijkstra+) is
+/// satisfied by the surrounding witness set.
+///
+/// Mirrors the Dijkstra witness rule extension in
+/// `Cardano.Ledger.Dijkstra.Rules.Utxow` — each guard credential must be
+/// authorised by one of:
+///
+/// - **Key-hash guard** (`Credential::VerificationKey`): a matching vkey
+///   signature in `witness_set.vkey_witnesses`. The witness's vkey is
+///   blake2b-224 hashed to derive the key-hash and compared against the
+///   guard hash. Bootstrap witnesses are NOT eligible — guards admit
+///   only the Shelley-style Ed25519 key witnesses.
+///
+/// - **Script-hash guard** (`Credential::Script`): a script in the
+///   witness set (native or Plutus V1-V4) whose hash matches the guard.
+///   The script-hash discipline uses the canonical
+///   `blake2b_224(type_tag || script_bytes)` for native scripts and
+///   `blake2b_224(0x0N || flat_program)` for Plutus VN scripts. Each
+///   eligible Plutus script is considered satisfied here from a
+///   *witness-presence* standpoint; the actual UPLC evaluation +
+///   `Constr 0` return-value check is the responsibility of phase-2
+///   evaluation, which keys off the `Guarding` redeemer (tag 6). Native
+///   scripts are evaluated inline using the same signer set the rest of
+///   the Phase-1 witness pipeline derives.
+///
+/// **Failure mode**: returns `LedgerError::InvalidTransaction("MissingGuardWitness: ...")`
+/// containing the offending credential so the block-application path can
+/// surface it via the usual `BlockTxValidationFailed` envelope.
+fn check_guard_witnesses(tx: &Transaction, ctx: &RuleContext) -> Result<(), LedgerError> {
+    use crate::validation::{compute_script_ref_hash, evaluate_native_script_with_guards};
+    use dugite_primitives::credentials::Credential;
+    use dugite_primitives::transaction::{NativeScript, ScriptRef};
+    use std::collections::{HashMap, HashSet};
+
+    if tx.body.guards.is_empty() {
+        return Ok(());
+    }
+
+    let ws = &tx.witness_set;
+
+    // ── Key-hash satisfaction set ──────────────────────────────────────
+    // Derive each vkey witness's 28-byte key hash. We deliberately drop
+    // malformed entries (non-32-byte vkeys) so they cannot satisfy a
+    // guard by accident; the witness-malformedness predicate elsewhere
+    // is the one that rejects such txs at the appropriate phase.
+    let signed: HashSet<Hash28> = ws
+        .vkey_witnesses
+        .iter()
+        .filter(|w| w.vkey.len() == 32)
+        .map(|w| dugite_primitives::hash::blake2b_224(&w.vkey))
+        .collect();
+    // For native-script evaluation we use the padded `Hash32` form the
+    // existing evaluator expects.
+    let signed_h32: HashSet<dugite_primitives::hash::Hash<32>> =
+        signed.iter().map(|h| h.to_hash32_padded()).collect();
+
+    // ── Script-hash satisfaction map ───────────────────────────────────
+    // For each script the tx makes available (native + Plutus V1-V4),
+    // index it by its 28-byte hash so a Script-typed guard can look it
+    // up. Native scripts are kept verbatim so we can re-evaluate them
+    // recursively (a RequireGuard inside a guarded native script must
+    // resolve against the *currently-satisfied* guard set).
+    let mut native_scripts_by_hash: HashMap<Hash28, &NativeScript> = HashMap::new();
+    for ns in &ws.native_scripts {
+        let sr = ScriptRef::NativeScript(ns.clone());
+        native_scripts_by_hash.insert(compute_script_ref_hash(&sr), ns);
+    }
+    let mut plutus_script_hashes: HashSet<Hash28> = HashSet::new();
+    for s in &ws.plutus_v1_scripts {
+        plutus_script_hashes.insert(compute_script_ref_hash(&ScriptRef::PlutusV1(s.clone())));
+    }
+    for s in &ws.plutus_v2_scripts {
+        plutus_script_hashes.insert(compute_script_ref_hash(&ScriptRef::PlutusV2(s.clone())));
+    }
+    for s in &ws.plutus_v3_scripts {
+        plutus_script_hashes.insert(compute_script_ref_hash(&ScriptRef::PlutusV3(s.clone())));
+    }
+
+    // The declared-guards set: a `RequireGuard(c)` native script node
+    // is satisfied iff `c` is present here. This matches upstream
+    // `evalDijkstraNativeScript`:
+    //
+    //   RequireGuard cred -> cred `OSet.member` guards
+    //
+    // where `guards` is the tx's `OSet (Credential Guard)` (TxBody key
+    // 14), NOT a "satisfied" subset. The script-credential satisfaction
+    // chain is therefore mutually-recursive among declared guards: a
+    // script-guard `sh` whose script body is `RequireGuard(c)` is
+    // satisfied iff `c` is also declared as a guard (which in turn must
+    // be satisfied by its own witness — vkey signature or script
+    // presence — in this same pass).
+    let declared_guards: HashSet<Credential> = tx.body.guards.iter().cloned().collect();
+    let current_slot = dugite_primitives::time::SlotNo(ctx.current_slot);
+
+    for cred in &tx.body.guards {
+        let ok = match cred {
+            Credential::VerificationKey(h) => signed.contains(h),
+            Credential::Script(sh) => {
+                // Try native first — evaluate it recursively. Script
+                // hashes for native scripts are 28 bytes; the
+                // ScriptHash newtype is `Hash<28>`.
+                let hash28: Hash28 = *sh;
+                if let Some(ns) = native_scripts_by_hash.get(&hash28) {
+                    evaluate_native_script_with_guards(
+                        ns,
+                        &signed_h32,
+                        current_slot,
+                        &declared_guards,
+                    )
+                } else if plutus_script_hashes.contains(&hash28) {
+                    // Plutus presence is sufficient for the witness-set
+                    // check at this layer; the actual UPLC evaluation
+                    // is handled by Phase 2 via the `Guarding` redeemer.
+                    // Missing-redeemer / extra-redeemer is caught by
+                    // `check_redeemer_purposes` in collateral.rs.
+                    true
+                } else {
+                    false
+                }
+            }
+        };
+        if !ok {
+            return Err(LedgerError::InvalidTransaction(format!(
+                "MissingGuardWitness: guard credential {cred:?} not satisfied \
+                 (key-hash guards need a matching vkey signature; script-hash \
+                 guards need a matching native or Plutus script in the witness set)"
+            )));
+        }
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
 // AccountBalanceOutOfRange predicate (Phase 3.3)
 // ---------------------------------------------------------------------------
 
@@ -512,9 +674,7 @@ fn check_account_balance_intervals(
 /// Returns `None` for any input that is not exactly 29 bytes — Dijkstra
 /// upstream rejects such bodies at the decoder stage, so this fallback is
 /// defensive only.
-fn reward_account_bytes_to_typed_hash32(
-    bytes: &[u8],
-) -> Option<dugite_primitives::hash::Hash<32>> {
+fn reward_account_bytes_to_typed_hash32(bytes: &[u8]) -> Option<dugite_primitives::hash::Hash<32>> {
     if bytes.len() != 29 {
         return None;
     }
@@ -1225,6 +1385,7 @@ mod tests {
                 sub_transactions: vec![sub_a.clone(), sub_b.clone()],
                 account_balance_intervals: vec![],
                 direct_deposits: ::std::collections::BTreeMap::new(),
+                guards: Vec::new(),
             };
             let parent_hash = Hash32::from_bytes([0xDE; 32]);
             let parent_tx = Transaction {
@@ -1476,6 +1637,7 @@ mod tests {
                 sub_transactions: vec![],
                 account_balance_intervals: vec![],
                 direct_deposits: ::std::collections::BTreeMap::new(),
+                guards: Vec::new(),
             };
 
             // Per CIP-0167 the author-supplied `is_valid` is irrelevant on the
@@ -1822,6 +1984,7 @@ mod tests {
                         sub_transactions: vec![],
                         account_balance_intervals: intervals,
                         direct_deposits: BTreeMap::new(),
+                        guards: Vec::new(),
                     },
                     witness_set: TransactionWitnessSet {
                         vkey_witnesses: vec![],
@@ -2211,6 +2374,7 @@ mod tests {
                     sub_transactions: vec![],
                     account_balance_intervals: vec![],
                     direct_deposits: deposits,
+                    guards: Vec::new(),
                 },
                 witness_set: TransactionWitnessSet {
                     vkey_witnesses: vec![],
@@ -2395,11 +2559,328 @@ mod tests {
         /// Adds native script tag 6 `RequireGuard` + Plutus purpose
         /// `Guarding` (redeemer tag 6).
         ///
-        /// Issue: #462 Phase 3.5 (blocked on #466).
+        /// Asserts (Issue #475 Phase 3.5):
+        ///   1. **Key-hash guard satisfied**: a Dijkstra tx whose
+        ///      `guards` includes a `Credential::VerificationKey(kh)`
+        ///      and whose witness set carries a matching vkey witness is
+        ///      accepted (`apply_valid_tx` returns Ok).
+        ///   2. **Script-hash guard satisfied via `RequireGuard`**: a
+        ///      Dijkstra tx whose `guards` includes a
+        ///      `Credential::Script(sh)` and whose witness set carries a
+        ///      native script `RequireGuard(KeyHashCred)` that hashes to
+        ///      `sh` (and whose inner credential is itself signed) is
+        ///      accepted.
+        ///   3. **Missing key-hash guard witness rejected**: dropping the
+        ///      vkey witness from case 1 makes `apply_valid_tx` return
+        ///      `LedgerError::InvalidTransaction("MissingGuardWitness: ...")`.
+        ///   4. **Missing script-hash guard witness rejected**: dropping
+        ///      the native script from case 2 (script_hash unresolvable
+        ///      in the witness set) also rejects with `MissingGuardWitness`.
         #[test]
-        #[ignore = "Dijkstra credential-based guards — see issue #462 Phase 3.5"]
         fn credential_guards_witness_and_evaluation() {
-            unimplemented!();
+            use super::super::*;
+            use crate::eras::EraRules;
+            use crate::state::{BlockValidationMode, StakeDistributionState};
+            use crate::utxo::UtxoSet;
+            use crate::utxo_diff::DiffSeq;
+            use crate::validation::compute_script_ref_hash;
+            use dugite_primitives::address::Address;
+            use dugite_primitives::credentials::Credential;
+            use dugite_primitives::era::Era;
+            use dugite_primitives::hash::{blake2b_224, Hash28, Hash32};
+            use dugite_primitives::protocol_params::ProtocolParameters;
+            use dugite_primitives::time::EpochNo;
+            use dugite_primitives::transaction::{
+                NativeScript, OutputDatum, ScriptRef, Transaction, TransactionBody,
+                TransactionInput, TransactionOutput, TransactionWitnessSet, VKeyWitness,
+            };
+            use dugite_primitives::value::{Lovelace, Value};
+            use std::collections::{BTreeMap, HashMap, HashSet};
+            use std::sync::Arc;
+
+            // ── deterministic fixtures ─────────────────────────────────
+            // VK guard credential: derive its key-hash from a fixed vkey
+            // so the witness check is byte-exact.
+            let vkey_bytes: [u8; 32] = [0x7A; 32];
+            let vk_kh: Hash28 = blake2b_224(&vkey_bytes);
+            let vk_cred = Credential::VerificationKey(vk_kh);
+
+            // A second vkey (different bytes → different key-hash) so we
+            // can prove the RequireGuard inner-credential check resolves
+            // an *additional* signer, distinct from the script-hash itself.
+            let inner_vkey_bytes: [u8; 32] = [0x55; 32];
+            let inner_vk_kh: Hash28 = blake2b_224(&inner_vkey_bytes);
+
+            // Script guard credential: hash a native script
+            // RequireGuard(inner_vk_kh) and use its hash as the guard's
+            // script credential. The witness must then carry both the
+            // native script AND the inner vkey for the guard to
+            // evaluate as satisfied.
+            let guard_native_script = NativeScript::ScriptAll(vec![NativeScript::RequireGuard(
+                Credential::VerificationKey(inner_vk_kh),
+            )]);
+            let script_hash: Hash28 =
+                compute_script_ref_hash(&ScriptRef::NativeScript(guard_native_script.clone()));
+            let script_cred = Credential::Script(script_hash);
+
+            // Tx skeleton: one input, one output, both at a key-locked
+            // address (no spend witness needed beyond the parent vkey).
+            let payment_kh = Hash28::from_bytes([0xAA; 28]);
+            let mut addr_bytes = vec![0x61_u8]; // enterprise + key
+            addr_bytes.extend_from_slice(payment_kh.as_bytes());
+            let addr = Address::from_bytes(&addr_bytes).expect("enterprise addr");
+            let make_output = |coin: u64| TransactionOutput {
+                address: addr.clone(),
+                value: Value::lovelace(coin),
+                datum: OutputDatum::None,
+                script_ref: None,
+                is_legacy: true,
+                raw_cbor: None,
+            };
+            let parent_in = TransactionInput {
+                transaction_id: Hash32::from_bytes([0xEE; 32]),
+                index: 0,
+            };
+            let in_out = make_output(10_000_000);
+            let out_out = make_output(7_000_000);
+
+            // Vkey witness builders.
+            let outer_vkey_witness = VKeyWitness {
+                vkey: vkey_bytes.to_vec(),
+                signature: vec![0u8; 64],
+            };
+            let inner_vkey_witness = VKeyWitness {
+                vkey: inner_vkey_bytes.to_vec(),
+                signature: vec![0u8; 64],
+            };
+
+            // Shared protocol-params + delegates fixture.
+            let params = ProtocolParameters::mainnet_defaults();
+            let delegates: HashMap<Hash28, (Hash28, Hash32)> = HashMap::new();
+            let make_ctx = || RuleContext {
+                params: &params,
+                current_slot: 2_000_000,
+                current_epoch: EpochNo(700),
+                era: Era::Dijkstra,
+                slot_config: None,
+                node_network: None,
+                genesis_delegates: &delegates,
+                update_quorum: 5,
+                epoch_length: 432_000,
+                shelley_transition_epoch: 0,
+                byron_epoch_length: 21_600,
+                stability_window: 129_600,
+                stability_window_3kf: 129_600,
+                randomness_stabilisation_window: 129_600,
+                tx_index: 0,
+                conway_genesis: None,
+            };
+
+            // Fresh shell state.
+            let build_state = || {
+                let mut utxo_set = UtxoSet::new();
+                utxo_set.insert(parent_in.clone(), in_out.clone());
+                (
+                    UtxoSubState {
+                        utxo_set,
+                        diff_seq: DiffSeq::new(),
+                        epoch_fees: Lovelace(0),
+                        pending_donations: Lovelace(0),
+                    },
+                    CertSubState {
+                        delegations: Arc::new(HashMap::new()),
+                        pool_params: Arc::new(HashMap::new()),
+                        future_pool_params: HashMap::new(),
+                        pending_retirements: HashMap::new(),
+                        reward_accounts: Arc::new(HashMap::new()),
+                        stake_key_deposits: HashMap::new(),
+                        pool_deposits: HashMap::new(),
+                        total_stake_key_deposits: 0,
+                        pointer_map: HashMap::new(),
+                        stake_distribution: StakeDistributionState {
+                            stake_map: HashMap::new(),
+                        },
+                        script_stake_credentials: HashSet::new(),
+                    },
+                    GovSubState {
+                        governance: Arc::new(crate::state::GovernanceState::default()),
+                    },
+                    EpochSubState {
+                        snapshots: crate::state::EpochSnapshots::default(),
+                        treasury: Lovelace(0),
+                        reserves: Lovelace(0),
+                        pending_reward_update: None,
+                        pending_pp_updates: BTreeMap::new(),
+                        future_pp_updates: BTreeMap::new(),
+                        needs_stake_rebuild: false,
+                        ptr_stake: HashMap::new(),
+                        ptr_stake_excluded: true,
+                        protocol_params: ProtocolParameters::mainnet_defaults(),
+                        prev_protocol_params: ProtocolParameters::mainnet_defaults(),
+                        prev_protocol_version_major: 12,
+                        prev_d: 0.0,
+                    },
+                )
+            };
+
+            // Tx builder parameterised over which guards to declare and
+            // which witnesses to attach.
+            let make_tx = |guards: Vec<Credential>,
+                           vkey_witnesses: Vec<VKeyWitness>,
+                           native_scripts: Vec<NativeScript>|
+             -> Transaction {
+                Transaction {
+                    era: Era::Dijkstra,
+                    hash: Hash32::from_bytes([0xDE; 32]),
+                    body: TransactionBody {
+                        inputs: vec![parent_in.clone()],
+                        outputs: vec![out_out.clone()],
+                        fee: Lovelace(0),
+                        ttl: None,
+                        certificates: vec![],
+                        withdrawals: BTreeMap::new(),
+                        auxiliary_data_hash: None,
+                        validity_interval_start: None,
+                        mint: BTreeMap::new(),
+                        script_data_hash: None,
+                        collateral: vec![],
+                        required_signers: vec![],
+                        network_id: None,
+                        collateral_return: None,
+                        total_collateral: None,
+                        reference_inputs: vec![],
+                        update: None,
+                        voting_procedures: BTreeMap::new(),
+                        proposal_procedures: vec![],
+                        treasury_value: None,
+                        donation: None,
+                        sub_transactions: vec![],
+                        account_balance_intervals: vec![],
+                        direct_deposits: BTreeMap::new(),
+                        guards,
+                    },
+                    witness_set: TransactionWitnessSet {
+                        vkey_witnesses,
+                        native_scripts,
+                        bootstrap_witnesses: vec![],
+                        plutus_v1_scripts: vec![],
+                        plutus_v2_scripts: vec![],
+                        plutus_v3_scripts: vec![],
+                        plutus_data: vec![],
+                        redeemers: vec![],
+                        raw_redeemers_cbor: None,
+                        raw_plutus_data_cbor: None,
+                        original_script_data_hash: None,
+                    },
+                    is_valid: true,
+                    auxiliary_data: None,
+                    raw_cbor: None,
+                    raw_body_cbor: None,
+                    raw_witness_cbor: None,
+                }
+            };
+
+            let rules = DijkstraRules::new();
+
+            // ── Case 1: key-hash guard + matching vkey witness → OK ───
+            {
+                let (mut utxo, mut certs, mut gov, mut epochs) = build_state();
+                let tx = make_tx(
+                    vec![vk_cred.clone()],
+                    vec![outer_vkey_witness.clone()],
+                    vec![],
+                );
+                rules
+                    .apply_valid_tx(
+                        &tx,
+                        BlockValidationMode::ApplyOnly,
+                        &make_ctx(),
+                        &mut utxo,
+                        &mut certs,
+                        &mut gov,
+                        &mut epochs,
+                    )
+                    .expect("VK-guard with matching vkey witness must apply");
+            }
+
+            // ── Case 2: script-hash guard + RequireGuard native + inner vkey → OK ──
+            //
+            // Realistic Dijkstra tx with TWO guards: the inner VK guard
+            // is the credential the RequireGuard native script delegates
+            // to; the script guard wraps it. Mirrors
+            // `evalDijkstraNativeScript` which checks `cred ∈ guards`
+            // against the tx's declared OSet — so the inner VK MUST also
+            // be declared as a guard for the RequireGuard node to
+            // evaluate true.
+            {
+                let (mut utxo, mut certs, mut gov, mut epochs) = build_state();
+                let inner_vk_cred = Credential::VerificationKey(inner_vk_kh);
+                let tx = make_tx(
+                    vec![script_cred.clone(), inner_vk_cred.clone()],
+                    vec![inner_vkey_witness.clone()],
+                    vec![guard_native_script.clone()],
+                );
+                rules
+                    .apply_valid_tx(
+                        &tx,
+                        BlockValidationMode::ApplyOnly,
+                        &make_ctx(),
+                        &mut utxo,
+                        &mut certs,
+                        &mut gov,
+                        &mut epochs,
+                    )
+                    .expect("Script-guard with matching RequireGuard native + inner VK guard must apply");
+            }
+
+            // ── Case 3: key-hash guard but NO vkey witness → REJECT ──
+            {
+                let (mut utxo, mut certs, mut gov, mut epochs) = build_state();
+                let tx = make_tx(vec![vk_cred.clone()], vec![], vec![]);
+                let err = rules
+                    .apply_valid_tx(
+                        &tx,
+                        BlockValidationMode::ApplyOnly,
+                        &make_ctx(),
+                        &mut utxo,
+                        &mut certs,
+                        &mut gov,
+                        &mut epochs,
+                    )
+                    .expect_err("missing vkey for VK-guard must reject");
+                let msg = format!("{err}");
+                assert!(
+                    msg.contains("MissingGuardWitness"),
+                    "expected MissingGuardWitness, got: {msg}"
+                );
+            }
+
+            // ── Case 4: script-hash guard but NO matching script → REJECT ──
+            {
+                let (mut utxo, mut certs, mut gov, mut epochs) = build_state();
+                let inner_vk_cred = Credential::VerificationKey(inner_vk_kh);
+                let tx = make_tx(
+                    vec![script_cred.clone(), inner_vk_cred.clone()],
+                    vec![inner_vkey_witness.clone()],
+                    vec![], // script intentionally omitted
+                );
+                let err = rules
+                    .apply_valid_tx(
+                        &tx,
+                        BlockValidationMode::ApplyOnly,
+                        &make_ctx(),
+                        &mut utxo,
+                        &mut certs,
+                        &mut gov,
+                        &mut epochs,
+                    )
+                    .expect_err("missing script for Script-guard must reject");
+                let msg = format!("{err}");
+                assert!(
+                    msg.contains("MissingGuardWitness"),
+                    "expected MissingGuardWitness, got: {msg}"
+                );
+            }
         }
 
         /// PlutusV4 — script-language tag `4`, hash prefix `\x04`,

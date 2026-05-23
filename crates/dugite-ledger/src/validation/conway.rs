@@ -908,6 +908,7 @@ mod tests {
             sub_transactions: vec![],
             account_balance_intervals: vec![],
             direct_deposits: ::std::collections::BTreeMap::new(),
+            guards: Vec::new(),
         }
     }
 
