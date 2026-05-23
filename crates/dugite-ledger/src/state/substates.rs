@@ -50,6 +50,24 @@ pub struct CertSubState {
     pub pointer_map: HashMap<dugite_primitives::credentials::Pointer, Hash32>,
     pub stake_distribution: StakeDistributionState,
     pub script_stake_credentials: HashSet<Hash32>,
+    /// Pending MIR per-credential reward deltas sourced from the reserves
+    /// pot (Haskell `dsIRewards . irwdSrcReserves` — half of
+    /// `InstantaneousRewards`).  Accumulated by MIR-cert apply during
+    /// LEDGER STS and drained at the next epoch boundary by `applyMIR`;
+    /// never credited directly to `reward_accounts` while a tx is
+    /// processing.  Pre-Conway only; Conway removes MIR certs entirely.
+    pub pending_mir_reserves: HashMap<Hash32, i128>,
+    /// Pending MIR per-credential reward deltas sourced from the treasury
+    /// pot (Haskell `dsIRewards . irwdSrcTreasury`).
+    pub pending_mir_treasury: HashMap<Hash32, i128>,
+    /// Pending pot-to-pot transfer accumulator (Haskell
+    /// `dsIRewards . deltaReserves`): reserves drained at the next epoch
+    /// boundary and routed to treasury.
+    pub pending_mir_delta_reserves: i128,
+    /// Pending pot-to-pot transfer accumulator (Haskell
+    /// `dsIRewards . deltaTreasury`): treasury drained at the next epoch
+    /// boundary and routed to reserves.
+    pub pending_mir_delta_treasury: i128,
 }
 
 /// Governance state: proposals, votes, DReps, committee.
