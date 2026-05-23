@@ -1,28 +1,28 @@
-//! Integration test: era-boundary protocol-version bumps (issue #615).
+//! Integration test: era-boundary protocol-version bumps (issue #615, #626).
 //!
-//! In cardano-node the Hard Fork Combinator (HFC) era-crossing tick writes the
-//! new era's initial protocol version into `curPParams`. Dugite has no
-//! separate HFC layer — era transitions are dispatched entirely in the ledger
-//! crate via `block.era`, so each era's `on_era_transition` must replicate the
-//! HFC's PV write.
+//! In cardano-node the Hard Fork Combinator (HFC) era-crossing tick reacts to
+//! the `protocolVersion` field of `curPParams`. For Byron→Shelley→…→Alonzo,
+//! the HFC is configured to fire at specific epochs and writes the era's
+//! initial PV. For Alonzo→Babbage and Babbage→Conway, the PV bump is driven
+//! by an on-chain ParameterChange (pre-Conway: PPUP; Conway+: gov action),
+//! and the HFC reacts to the bumped PV.
 //!
-//! This test walks a synthetic chain from Byron through Conway and asserts
-//! that `epochs.protocol_params.protocol_version_major` matches the canonical
-//! "first-block-of-each-era" PV at each boundary:
+//! Dugite mirrors this exactly:
+//!  - Byron→Alonzo `on_era_transition` writes initial PV (1/2/3/4/5).
+//!  - Babbage/Conway `on_era_transition` is a no-op — PPUP / HardForkInit
+//!    drives the PV bump via `process_epoch_transition`'s PPUP path. Bumping
+//!    in `on_era_transition` would race ahead of `prevPParams` capture and
+//!    break `hardforkBabbageForgoRewardPrefilter` (issue #626).
 //!
-//! | Era      | PV at HFC activation |
-//! |----------|----------------------|
+//! | Era      | First-block PV (after this transition) |
+//! |----------|----------------------------------------|
 //! | Byron    | 1 (`mainnet_defaults` seeds at 1) |
-//! | Shelley  | 2                    |
-//! | Allegra  | 3                    |
-//! | Mary     | 4                    |
-//! | Alonzo   | 5                    |
-//! | Babbage  | 7                    |
-//! | Conway   | 9                    |
-//!
-//! (Mary→Alonzo lands at 5; the intra-era PV6 / PV8 / PV10 bumps are
-//! subsequent ParameterChange proposals and continue to flow through the
-//! normal PPUP path — we do not test those here.)
+//! | Shelley  | 2                                |
+//! | Allegra  | 3                                |
+//! | Mary     | 4                                |
+//! | Alonzo   | 5                                |
+//! | Babbage  | unchanged (PPUP drives the 6→7) |
+//! | Conway   | unchanged (HardForkInit drives 8→9) |
 //!
 //! Reference: cardano-ledger wiki, "First Block of Each Era".
 
@@ -211,8 +211,11 @@ fn era_boundary_pv_cascade_matches_haskell() {
         (Era::Allegra, 300, 3, 3, 3),
         (Era::Mary, 400, 4, 4, 4),
         (Era::Alonzo, 500, 5, 5, 5),
-        (Era::Babbage, 600, 6, 7, 7),
-        (Era::Conway, 700, 7, 9, 9),
+        // Babbage/Conway on_era_transition is a no-op for PV — bumps come
+        // via PPUP / HardForkInitiation (issue #626). With no PPUP applied
+        // in this synthetic test, curPParams.pv stays at 5 (Alonzo's).
+        (Era::Babbage, 600, 6, 5, 5),
+        (Era::Conway, 700, 7, 5, 5),
     ];
 
     for (era, slot, block_no, header_pv, expected_pv) in steps {

@@ -69,18 +69,6 @@ fn default_update_quorum() -> u64 {
     5 // Mainnet default: 5 out of 7 genesis delegates
 }
 
-fn default_d_one() -> f64 {
-    1.0 // Genesis default: d=1 (fully federated)
-}
-
-fn default_prev_proto_major() -> u64 {
-    6 // Genesis default: Alonzo (proto 6)
-}
-
-fn default_prev_protocol_params() -> ProtocolParameters {
-    ProtocolParameters::mainnet_defaults()
-}
-
 /// The complete ledger state, decomposed into component sub-states for granular borrowing.
 ///
 /// Serialization goes through `LedgerStateSnapshot` (see `snapshot_format.rs`).
@@ -288,14 +276,12 @@ pub struct GovernanceState {
     /// Populated from CommitteeHotAuth and CommitteeColdResign certificates when the cold
     /// credential is a Credential::Script variant.  Used to correctly set cold_credential_type
     /// in GetCommitteeState responses without changing the Hash32-keyed committee maps.
-    #[serde(default)]
     pub script_committee_credentials: std::collections::HashSet<Hash32>,
     /// Script-type hot committee credentials (hot_credential_type = 1 for N2C queries).
     /// Populated from CommitteeHotAuth certificates when the hot credential is a
     /// Credential::Script variant.  Maps cold_credential_hash -> hot_credential_hash for
     /// script hot keys, so a re-authorization with a key hot key correctly removes the entry.
     /// Used to correctly set hot_credential_type in GetCommitteeState responses.
-    #[serde(default)]
     pub script_committee_hot_credentials: std::collections::HashSet<Hash32>,
     /// Active governance proposals indexed by GovActionId
     pub proposals: BTreeMap<GovActionId, ProposalState>,
@@ -306,18 +292,12 @@ pub struct GovernanceState {
     /// Per Haskell `pRoots :: GovRelation PRoot`.  Each of the 4 purposes tracks the
     /// last enacted `GovActionId` (the root) and proposals whose `prev_action_id`
     /// matches that root.  Used for O(1) sibling lookups during enactment.
-    ///
-    /// `serde(default)` for backward compatibility with pre-forest snapshots.
-    #[serde(default)]
     pub proposal_roots: GovRelation<PRoot>,
     /// Proposal forest graph: parent-child edges per governance purpose for non-root proposals.
     ///
     /// Per Haskell `pGraph :: GovRelation PGraph`.  Proposals deeper than one level
     /// (i.e. their `prev_action_id` points to another proposal rather than the enacted
     /// root) are tracked here.  Used for O(k) descendant collection during removal.
-    ///
-    /// `serde(default)` for backward compatibility with pre-forest snapshots.
-    #[serde(default)]
     pub proposal_graph: GovRelation<PGraph>,
     /// Total DRep registrations count (including deregistered)
     pub drep_registration_count: u64,
@@ -326,29 +306,20 @@ pub struct GovernanceState {
     /// Current constitution (set by NewConstitution governance action)
     pub constitution: Option<Constitution>,
     /// Whether the committee is in a no-confidence state (dissolved by NoConfidence action)
-    #[serde(default)]
     pub no_confidence: bool,
     /// Committee quorum threshold (from genesis or UpdateCommittee action)
     /// This is the fraction of active CC members that must vote Yes to approve.
-    #[serde(default)]
     pub committee_threshold: Option<Rational>,
     /// Last enacted governance action IDs per purpose (for prev_action_id chain validation).
     /// Matches Haskell's `GovRelation StrictMaybe` / `ensPrevGovActionIds`.
-    #[serde(default)]
     pub enacted_pparam_update: Option<GovActionId>,
-    #[serde(default)]
     pub enacted_hard_fork: Option<GovActionId>,
-    #[serde(default)]
     pub enacted_committee: Option<GovActionId>,
-    #[serde(default)]
     pub enacted_constitution: Option<GovActionId>,
     /// Last ratification results (from most recent epoch transition).
     /// Used by GetRatifyState (N2C query tag 32).
-    #[serde(default)]
     pub last_ratified: Vec<(GovActionId, ProposalState)>,
-    #[serde(default)]
     pub last_expired: Vec<GovActionId>,
-    #[serde(default)]
     pub last_ratify_delayed: bool,
     /// Number of "dormant epochs" accumulated since the start of the Conway era.
     ///
@@ -358,8 +329,6 @@ pub struct GovernanceState {
     /// baked into `DRepRegistration::drep_expiry` at registration/vote time via
     /// `compute_drep_expiry()`, so it is NOT subtracted again at activity-check time.
     ///
-    /// `serde(default)` ensures backward compatibility with existing ledger snapshots.
-    #[serde(default)]
     pub num_dormant_epochs: u64,
     /// DRep voting power snapshot captured at each epoch boundary (the "mark" snapshot).
     ///
@@ -372,16 +341,12 @@ pub struct GovernanceState {
     /// affecting in-flight governance ratification.
     ///
     /// Populated by `process_epoch_transition` at each epoch boundary.
-    /// `serde(default)` ensures backward compatibility with existing ledger snapshots.
-    #[serde(default)]
     pub drep_distribution_snapshot: HashMap<Hash32, u64>,
     /// Snapshot of total `AlwaysNoConfidence`-delegated stake at the last epoch boundary.
     /// Companion to `drep_distribution_snapshot`.
-    #[serde(default)]
     pub drep_snapshot_no_confidence: u64,
     /// Snapshot of total `AlwaysAbstain`-delegated stake at the last epoch boundary.
     /// Companion to `drep_distribution_snapshot`.
-    #[serde(default)]
     pub drep_snapshot_abstain: u64,
     /// Frozen ratification snapshot from the previous epoch boundary.
     ///
@@ -393,7 +358,6 @@ pub struct GovernanceState {
     ///
     /// `None` at genesis or when loading a snapshot that predates this field —
     /// `ratify_proposals()` falls back to live state in that case.
-    #[serde(default)]
     pub ratification_snapshot: Option<RatificationSnapshot>,
 }
 
@@ -432,7 +396,6 @@ pub struct RatificationSnapshot {
     /// Used by `default_spo_vote()` during ratification to determine the
     /// implicit vote for non-voting SPOs, matching Haskell's
     /// `dpDefaultDRepVoteDelegs` captured in the DRep pulser.
-    #[serde(default)]
     pub vote_delegations: HashMap<Hash32, DRep>,
 }
 
@@ -450,16 +413,10 @@ pub struct DRepRegistration {
     ///   PV <  10: `current_epoch + drep_activity` (bootstrap, dormant ignored)
     ///
     /// A DRep is expired (inactive) when `current_epoch > drep_expiry`.
-    #[serde(alias = "last_active_epoch")]
     pub drep_expiry: EpochNo,
     /// Whether this DRep is currently active (per CIP-1694 activity tracking).
     /// Inactive DReps remain registered but are excluded from voting power calculations.
-    #[serde(default = "default_drep_active")]
     pub active: bool,
-}
-
-fn default_drep_active() -> bool {
-    true
 }
 
 impl GovernanceState {
@@ -515,7 +472,6 @@ pub struct EpochSnapshots {
     /// Snapshot from two epochs ago ("go") — used for reward distribution
     pub go: Option<StakeSnapshot>,
     /// Fee pot for the next RUPD (Haskell's `ssFee`).
-    #[serde(default = "default_lovelace_zero")]
     pub ss_fee: Lovelace,
     /// Block production from the previous epoch (Haskell's `nesBprev`).
     ///
@@ -523,16 +479,13 @@ pub struct EpochSnapshots {
     /// counters are reset. The RUPD uses bprev for pool reward allocation.
     /// Separate from the snapshot rotation (bprev is from 1 epoch ago,
     /// while GO stake data is from 2 epochs ago).
-    #[serde(default)]
     pub bprev_block_count: u64,
-    #[serde(default)]
     pub bprev_blocks_by_pool: Arc<HashMap<Hash28, u64>>,
     /// Legacy field — RUPD now fires unconditionally at every epoch
     /// boundary (Issue #438: Haskell's `applyRUpd` runs at boundary 0→1
     /// with `ssFee = 0` from `emptySnapShots`, draining the genesis
     /// monetary-expansion tau cut from reserves to treasury).  Kept for
     /// snapshot wire-format compatibility.
-    #[serde(default)]
     pub rupd_ready: bool,
 }
 
@@ -550,11 +503,6 @@ impl Default for EpochSnapshots {
     }
 }
 
-/// Serde default helper for `Lovelace(0)` in snapshot fields.
-fn default_lovelace_zero() -> Lovelace {
-    Lovelace(0)
-}
-
 /// A snapshot of the stake distribution at an epoch boundary.
 /// Uses `Arc` for large HashMaps to avoid deep-cloning during epoch rotation.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -567,19 +515,15 @@ pub struct StakeSnapshot {
     /// pool_id -> pool parameters at snapshot time
     pub pool_params: Arc<HashMap<Hash28, PoolRegistration>>,
     /// Individual stake per credential (for reward distribution and pledge verification)
-    #[serde(default)]
     pub stake_distribution: Arc<HashMap<Hash32, Lovelace>>,
     /// Fee pot from the epoch this snapshot was captured (Haskell's _feeSS).
     /// Used by `calculate_rewards` (via the set snapshot) for RUPD deltaT1.
-    #[serde(default = "default_lovelace_zero")]
     pub epoch_fees: Lovelace,
     /// Total blocks produced in the epoch this snapshot was captured.
     /// Used for eta = actual_blocks / expected_blocks in reward calculation.
-    #[serde(default)]
     pub epoch_block_count: u64,
     /// Per-pool block production in the epoch this snapshot was captured.
     /// Used for apparent performance in reward calculation.
-    #[serde(default)]
     pub epoch_blocks_by_pool: Arc<HashMap<Hash28, u64>>,
 }
 
@@ -608,19 +552,14 @@ pub struct PoolRegistration {
     pub margin_numerator: u64,
     pub margin_denominator: u64,
     /// Reward account for pool operator rewards
-    #[serde(default)]
     pub reward_account: Vec<u8>,
     /// Pool owner stake key hashes
-    #[serde(default)]
     pub owners: Vec<Hash28>,
     /// Relay endpoints declared by the pool operator
-    #[serde(default)]
     pub relays: Vec<Relay>,
     /// Pool metadata URL
-    #[serde(default)]
     pub metadata_url: Option<String>,
     /// Pool metadata hash
-    #[serde(default)]
     pub metadata_hash: Option<Hash32>,
 }
 
@@ -699,7 +638,10 @@ impl LedgerState {
                 protocol_params: params.clone(),
                 prev_protocol_params: params,
                 prev_protocol_version_major: 6, // Genesis: Alonzo (proto 6)
-                prev_d: 1.0,                    // Genesis: d=1
+                prev_d: dugite_primitives::transaction::Rational {
+                    numerator: 1,
+                    denominator: 1,
+                }, // Genesis: d=1
             },
             tip: Tip::origin(),
             era: Era::Conway,
@@ -745,8 +687,11 @@ impl LedgerState {
         let cur_pparams = hs.new_epoch_state.cur_pparams.clone();
         let prev_pparams = hs.new_epoch_state.prev_pparams.clone();
         // In Conway (proto >= 9), d = 0 (fully decentralized). The prev_d
-        // field is a legacy cache; safe to set to 0.0 for Conway snapshots.
-        let prev_d = 0.0;
+        // field is a legacy cache; safe to set to 0/1 for Conway snapshots.
+        let prev_d = dugite_primitives::transaction::Rational {
+            numerator: 0,
+            denominator: 1,
+        };
         let prev_protocol_version_major = prev_pparams.protocol_version_major;
 
         // ── Delegations: (tag, Hash28) → Hash32 key, Hash28 pool value ──

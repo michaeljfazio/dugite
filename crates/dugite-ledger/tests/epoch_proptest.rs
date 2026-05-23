@@ -134,9 +134,9 @@ proptest! {
         let ss_fee = state.epochs.snapshots.ss_fee.0;
 
         // `prev_d` determines whether `eta = 1` or a performance ratio.
-        // `LedgerState::new` sets `prev_d = 1.0`, so the generated states
+        // `LedgerState::new` sets `prev_d = 1/1`, so the generated states
         // always take the `d >= 0.8` branch.
-        let prev_d = state.epochs.prev_d;
+        let prev_d = state.epochs.prev_d.clone();
 
         // Use `prev_protocol_params` for `rho` and `tau`, matching Haskell's
         // `startStep` which reads from `prevPParams`.
@@ -149,7 +149,11 @@ proptest! {
         // ── Step 1: Compute expected reward pot ───────────────────────────────
 
         // monetary expansion (delta_R1 in Haskell nomenclature)
-        let expansion: u64 = if prev_d >= 0.8 {
+        // d >= 4/5  ⟺  5 * d_num >= 4 * d_den (exact rational; issue #629).
+        let d_num = prev_d.numerator as i128;
+        let d_den = prev_d.denominator.max(1) as i128;
+        let prev_d_ge_4_5 = 5 * d_num >= 4 * d_den;
+        let expansion: u64 = if prev_d_ge_4_5 {
             // eta = 1: full expansion
             // floor(rho * reserves) — use u128 to avoid overflow on large reserves
             let reserves = state.epochs.reserves.0;

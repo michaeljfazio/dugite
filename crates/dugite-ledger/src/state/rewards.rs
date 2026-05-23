@@ -135,7 +135,7 @@ impl Rat {
 #[allow(clippy::too_many_arguments)]
 pub fn compute_reward_update(
     params: &ProtocolParameters,
-    prev_d: f64,
+    prev_d: &dugite_primitives::transaction::Rational,
     prev_protocol_version_major: u64,
     go_snapshot: Option<&StakeSnapshot>,
     bprev_blocks_by_pool: &HashMap<Hash28, u64>,
@@ -167,33 +167,47 @@ pub fn compute_reward_update(
     let tau_num = pp.tau.numerator as i128;
     let tau_den = pp.tau.denominator.max(1) as i128;
 
-    let d = prev_d;
     let actual_blocks: u64 = bprev_blocks_by_pool.values().sum();
     let epoch_fees = ss_fee.0;
 
     let rho = Rat::from_i128(rho_num, rho_den);
 
-    let expansion = if d >= 0.8 {
+    // d is an exact Rational from prev_pparams.d (Haskell `prevPParams ^. ppDG`,
+    // a `UnitInterval` = bounded `Rational`).  Issue #629 replaced the prior
+    // f64 path; gate and expected-blocks math are now byte-exact with
+    // Haskell `Cardano.Ledger.Shelley.LedgerState.PulsingReward.startStep`.
+    let d_num = prev_d.numerator as i128;
+    let d_den = prev_d.denominator.max(1) as i128;
+
+    // Overlay gate: `d >= 4/5` in exact Rational (Haskell `d >= 0.8`).
+    // 4/5 ≤ d_num/d_den  ⟺  4 * d_den ≤ 5 * d_num.
+    let d_ge_4_5 = 5 * d_num >= 4 * d_den;
+
+    let expansion = if d_ge_4_5 {
+        // Full monetary expansion: floor(rho * reserves).
         rho.mul(&Rat::from_i128(reserves.0 as i128, 1)).floor_u64()
     } else {
         let (f_num, f_den) = pp.active_slot_coeff_rational();
 
-        let d_den = 1_000_000_000u128;
-        let d_num = (d * d_den as f64).round() as u128;
-        let one_minus_d_num = d_den.saturating_sub(d_num);
-
-        let numerator = one_minus_d_num * f_num as u128 * epoch_length as u128;
-        let denominator = d_den * f_den as u128;
-
-        let raw_expected_blocks = (numerator / denominator) as u64;
+        // expectedBlocks = floor((1 - d) * f * slotsPerEpoch), in exact
+        // Rational arithmetic — multiply first, floor once at the very end.
+        let one_minus_d_num = d_den - d_num;
+        let one_minus_d = Rat::from_i128(one_minus_d_num, d_den);
+        let f = Rat::from_i128(f_num as i128, f_den as i128);
+        let slots = Rat::from_i128(epoch_length as i128, 1);
+        let raw_expected_blocks = one_minus_d.mul(&f).mul(&slots).floor_u64();
         if raw_expected_blocks == 0 {
             warn!(
-                "expected_blocks rounded to 0 (d={d}, f_num={f_num}, f_den={f_den}, \
+                "expected_blocks rounded to 0 (d={}/{}, f_num={f_num}, f_den={f_den}, \
                  epoch_length={epoch_length}), clamping to 1",
+                d_num, d_den,
             );
         }
         let expected_blocks = raw_expected_blocks.max(1);
 
+        // Haskell: eta = blocksMade % expectedBlocks; deltaR1 = floor(min(1, eta) * rho * reserves).
+        // Capping actual_blocks at expected_blocks first is equivalent to
+        // `min(1, eta)` because effective_blocks/expected_blocks <= 1.
         let effective_blocks = actual_blocks.min(expected_blocks);
         rho.mul(&Rat::from_i128(reserves.0 as i128, 1))
             .mul(&Rat::from_i128(
@@ -366,13 +380,14 @@ pub fn compute_reward_update(
             self_delegated,
             pledge = pool_reg.pledge.0,
             n_opt,
-            d,
+            d_num = d_num as i64,
+            d_den = d_den as i64,
             "Per-pool reward input"
         );
 
         let pool_reward = if pool_active_stake.0 == 0 {
             0u64
-        } else if d >= 0.8 {
+        } else if d_ge_4_5 {
             max_pool
         } else if blocks_made == 0 {
             0u64
@@ -412,6 +427,20 @@ pub fn compute_reward_update(
         if let Some(delegators) = delegators_by_pool.get(pool_id) {
             for cred_hash in delegators {
                 if owner_set.contains(cred_hash) {
+                    continue;
+                }
+
+                // Mirror Haskell `rewardOnePoolMember.prefilter`
+                // (eras/shelley/impl/.../Rewards.hs:262):
+                //   prefilter = hardforkBabbageForgoRewardPrefilter pv || hk ∈ addrsRew
+                //
+                // For pv ≤ 6 (Shelley-Alonzo), the member credential must be
+                // currently registered in the reward-accounts set or the
+                // computed reward is dropped at startStep time. For pv ≥ 7
+                // (Babbage onward, ledger errata 17.2) the prefilter is
+                // bypassed; routing of unregistered rewards happens at
+                // applyRUpd time (frTotalUnregistered → treasury).
+                if prev_protocol_version_major <= 6 && !reward_accounts.contains_key(cred_hash) {
                     continue;
                 }
 
@@ -617,7 +646,7 @@ impl LedgerState {
     ) -> PendingRewardUpdate {
         compute_reward_update(
             &self.epochs.prev_protocol_params,
-            self.epochs.prev_d,
+            &self.epochs.prev_d,
             self.epochs.prev_protocol_version_major,
             Some(stake_snapshot),
             &block_snapshot.epoch_blocks_by_pool,
@@ -1066,11 +1095,15 @@ mod tests {
         let bprev_blocks_by_pool = std::collections::HashMap::new();
         let reward_accounts = std::collections::HashMap::new();
 
+        let zero_d = dugite_primitives::transaction::Rational {
+            numerator: 0,
+            denominator: 1,
+        };
         let rupd = super::compute_reward_update(
             &params,
-            0.0,  // prev_d
-            8,    // prev_protocol_version_major (Conway)
-            None, // no GO snapshot
+            &zero_d, // prev_d
+            8,       // prev_protocol_version_major (Conway)
+            None,    // no GO snapshot
             &bprev_blocks_by_pool,
             dugite_primitives::value::Lovelace(0), // ss_fee
             dugite_primitives::value::Lovelace(0), // reserves
