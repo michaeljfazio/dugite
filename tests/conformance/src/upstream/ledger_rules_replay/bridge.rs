@@ -21,10 +21,8 @@
 //!    NewEpochState, which is the current epoch number before the transition.
 //!
 //! 5. `decode_new_epoch_state(st_cbor)` — structurally decodes the full
-//!    `array(7)` NewEpochState, extracting: EpochNo, BlocksMade counts,
-//!    AccountState (treasury + reserves), StrictMaybe shape, PoolDistr entry
-//!    count, and stashedAVVM shape. LedgerState, Snapshots, and NonMyopic
-//!    sub-fields are recorded as raw CBOR byte ranges (stub — Phase 4 follow-on).
+//!    `array(7)` NewEpochState, including all three previously-stubbed
+//!    sub-trees: LedgerState, Snapshots, and NonMyopic.
 //!
 //! ## NewEpochState array(7) field layout (Haskell / cardano-ledger)
 //!
@@ -34,13 +32,26 @@
 //! [2] nesBcur    :: BlocksMade           map pool_keyhash → u64
 //! [3] nesEs       :: EpochState          array(4)
 //!     [3.0] AccountState  :: [treasury: Coin, reserves: Coin]   array(2) u64s
-//!     [3.1] LedgerState   :: <sub-tree, skipped — stub>
-//!     [3.2] EpochSnapshots:: <sub-tree, skipped — stub>
-//!     [3.3] NonMyopic     :: <sub-tree, skipped — stub>
+//!     [3.1] LedgerState   :: array(2) = [CertState (complex), UTxOState array(6)]
+//!           UTxOState = [utxo_map, deposited_coin, fees_coin, gov_state, instant_stake, donation]
+//!     [3.2] EpochSnapshots:: array(4) = [mark, set, go (each SnapShot array(2|3)), fee_coin]
+//!     [3.3] NonMyopic     :: array(2) = [likelihoods_map, reward_pot_coin]
 //! [4] nesRu       :: StrictMaybe PulsingRewUpdate  array(0)=Nothing | array(1)=Just
 //! [5] nesPd       :: PoolDistr           map (with rational total stake)
 //! [6] stashedAVVM :: ()                  array(0) in Conway (always empty)
 //! ```
+//!
+//! ## Source references (Haskell cardano-ledger, queried 2026-05-23)
+//!
+//! - `LedgerState` encoding: `eras/shelley/impl/src/Cardano/Ledger/Shelley/LedgerState/Types.hs`
+//!   → `encCBOR LedgerState` → `encodeListLen 2 <> encCBOR lsCertState <> encCBOR lsUTxOState`
+//! - `UTxOState` encoding: same file → `encCBOR UTxOState` → `encodeListLen 6`
+//! - `SnapShots` encoding: `libs/cardano-ledger-core/src/Cardano/Ledger/State/SnapShots.hs`
+//!   → `encCBOR SnapShots` → `encodeListLen 4` (ssStakeMarkPoolDistr NOT serialized)
+//! - `SnapShot` encoding: same file → `encCBOR SnapShot` → `encodeListLen 2` (new format);
+//!   decoder accepts 2 (new) or 3 (old: Stake + Delegations + PoolsMap)
+//! - `NonMyopic` encoding: `eras/shelley/impl/src/Cardano/Ledger/Shelley/PoolRank.hs`
+//!   → `encCBOR NonMyopic` → `encodeListLen 2 <> encCBOR likelihoodsNM <> encCBOR rewardPotNM`
 //!
 //! ## Future work (Phase 4 follow-on)
 //!
@@ -50,13 +61,86 @@
 
 use minicbor::data::Type;
 
+// ── DecodedLedgerState, DecodedSnapshots, DecodedNonMyopic ───────────────────
+
+/// Structural decode of a `LedgerState` sub-tree (field[3.1] of EpochState).
+///
+/// Haskell encoding (from `Types.hs`):
+/// ```text
+/// encCBOR LedgerState = encodeListLen 2 <> encCBOR lsCertState <> encCBOR lsUTxOState
+/// ```
+/// Note: CertState is encoded FIRST (for intern sharing), UTxOState is second.
+///
+/// UTxOState (array(6)):
+/// ```text
+/// [utxo_map, deposited_coin, fees_coin, gov_state, instant_stake, donation_coin]
+/// ```
+#[derive(Debug, Default)]
+pub struct DecodedLedgerState {
+    /// Number of UTxO entries in the `utxosUtxo` map (field[3.1.1.0]).
+    pub utxo_count: Option<u64>,
+    /// Deposit pot in lovelace (`utxosDeposited`, field[3.1.1.1]).
+    pub deposited: Option<u64>,
+    /// Fee pot in lovelace (`utxosFees`, field[3.1.1.2]).
+    pub fees: Option<u64>,
+    /// Donation in lovelace (`utxosDonation`, field[3.1.1.5]).
+    pub donation: Option<u64>,
+    /// Raw CBOR byte length of the full LedgerState blob (for diagnostics).
+    pub cbor_len: usize,
+}
+
+/// Structural decode of the `SnapShots` sub-tree (field[3.2] of EpochState).
+///
+/// Haskell encoding (from `SnapShots.hs`):
+/// ```text
+/// encCBOR SnapShots = encodeListLen 4
+///   <> encCBOR ssStakeMark   -- mark (array(2))
+///   <> encCBOR ssStakeSet    -- set  (array(2))
+///   <> encCBOR ssStakeGo     -- go   (array(2))
+///   <> encCBOR ssFee         -- fee  (Coin / u64)
+/// ```
+/// Note: `ssStakeMarkPoolDistr` is intentionally NOT serialized.
+/// Each `SnapShot` is array(2) in the new format; array(3) in the old format.
+#[derive(Debug, Default)]
+pub struct DecodedSnapshots {
+    /// Number of snapshot items decoded (should be 4: mark, set, go, fee).
+    pub field_count: u64,
+    /// Number of stake pools in the mark snapshot.
+    pub mark_pool_count: Option<u64>,
+    /// Number of stake pools in the set snapshot.
+    pub set_pool_count: Option<u64>,
+    /// Number of stake pools in the go snapshot.
+    pub go_pool_count: Option<u64>,
+    /// Fee snapshot (Coin / lovelace).
+    pub fee: Option<u64>,
+    /// Raw CBOR byte length of the full SnapShots blob (for diagnostics).
+    pub cbor_len: usize,
+}
+
+/// Structural decode of the `NonMyopic` sub-tree (field[3.3] of EpochState).
+///
+/// Haskell encoding (from `PoolRank.hs`):
+/// ```text
+/// encCBOR NonMyopic = encodeListLen 2
+///   <> encCBOR likelihoodsNM   -- VMap pool_id → Likelihood (map)
+///   <> encCBOR rewardPotNM     -- Coin (u64)
+/// ```
+#[derive(Debug, Default)]
+pub struct DecodedNonMyopic {
+    /// Number of entries in the likelihoods map.
+    pub likelihood_count: Option<u64>,
+    /// Reward pot in lovelace (`rewardPotNM`).
+    pub reward_pot: Option<u64>,
+    /// Raw CBOR byte length of the full NonMyopic blob (for diagnostics).
+    pub cbor_len: usize,
+}
+
 // ── DecodedNewEpochState ──────────────────────────────────────────────────────
 
 /// Structural decode of a NewEpochState `array(7)` blob.
 ///
-/// Fields that require deep sub-tree mapping (LedgerState, Snapshots,
-/// NonMyopic) are recorded only as their raw byte length.  All other fields
-/// are fully decoded.
+/// All seven fields are decoded, including the three previously-stubbed
+/// sub-trees: LedgerState, Snapshots, and NonMyopic.
 ///
 /// This struct is returned by [`decode_new_epoch_state`].
 #[derive(Debug)]
@@ -71,12 +155,12 @@ pub struct DecodedNewEpochState {
     pub treasury: u64,
     /// field[3.0] — AccountState reserves (lovelace).
     pub reserves: u64,
-    /// field[3.1] — LedgerState: raw CBOR byte length (sub-tree skipped).
-    pub ledger_state_cbor_len: usize,
-    /// field[3.2] — EpochSnapshots: raw CBOR byte length (sub-tree skipped).
-    pub snapshots_cbor_len: usize,
-    /// field[3.3] — NonMyopic: raw CBOR byte length (sub-tree skipped).
-    pub nonmyopic_cbor_len: usize,
+    /// field[3.1] — LedgerState: UTxO count, deposit pot, fees, donation.
+    pub ledger_state: DecodedLedgerState,
+    /// field[3.2] — EpochSnapshots: mark/set/go pool counts and fee.
+    pub snapshots: DecodedSnapshots,
+    /// field[3.3] — NonMyopic: likelihoods map count and reward pot.
+    pub nonmyopic: DecodedNonMyopic,
     /// field[4] — StrictMaybe shape: `None` for Nothing (array(0)), `Some(n)` for Just (array(1)).
     pub pulsing_rew_update: StrictMaybe,
     /// field[5] — PoolDistr: number of entries in the map.
@@ -99,8 +183,9 @@ pub enum StrictMaybe {
 /// Returns a [`DecodedNewEpochState`] on success, or an error string describing
 /// the first decode failure.
 ///
-/// The three large sub-trees (LedgerState, Snapshots, NonMyopic) are skipped
-/// via `minicbor::Decoder::skip()` and recorded only as byte lengths.
+/// All seven fields are decoded structurally, including LedgerState, Snapshots,
+/// and NonMyopic sub-trees.  Deep sub-fields that are not needed for invariant
+/// checking (CertState, GovState, InstantStake) are consumed via `skip()`.
 pub fn decode_new_epoch_state(st_cbor: &[u8]) -> Result<DecodedNewEpochState, String> {
     if st_cbor.is_empty() {
         return Err("st_cbor is empty".to_string());
@@ -164,23 +249,45 @@ pub fn decode_new_epoch_state(st_cbor: &[u8]) -> Result<DecodedNewEpochState, St
     let treasury = decode_u64(&mut dec, "field[3.0] treasury")?;
     let reserves = decode_u64(&mut dec, "field[3.0] reserves")?;
 
-    // ── field[3.1] LedgerState (skip — stub) ─────────────────────────────────
+    // ── field[3.1] LedgerState array(2): [CertState, UTxOState] ─────────────
     let before_ls = dec.position();
-    dec.skip()
-        .map_err(|e| format!("field[3.1] LedgerState skip: {e}"))?;
-    let ledger_state_cbor_len = dec.position() - before_ls;
+    let ledger_state =
+        decode_ledger_state(&mut dec, "field[3.1] LedgerState").unwrap_or_else(|e| {
+            // Non-fatal: if we cannot structurally decode the LedgerState
+            // (e.g. novel format in a future era), record the error and
+            // continue.  The epoch-invariant check is the gating check.
+            eprintln!("[bridge] WARN LedgerState decode (non-fatal): {e}");
+            DecodedLedgerState::default()
+        });
+    let ls_cbor_len = dec.position() - before_ls;
+    let ledger_state = DecodedLedgerState {
+        cbor_len: ls_cbor_len,
+        ..ledger_state
+    };
 
-    // ── field[3.2] EpochSnapshots (skip — stub) ───────────────────────────────
+    // ── field[3.2] EpochSnapshots array(4): [mark, set, go, fee] ────────────
     let before_snap = dec.position();
-    dec.skip()
-        .map_err(|e| format!("field[3.2] Snapshots skip: {e}"))?;
-    let snapshots_cbor_len = dec.position() - before_snap;
+    let snapshots = decode_snapshots(&mut dec, "field[3.2] SnapShots").unwrap_or_else(|e| {
+        eprintln!("[bridge] WARN SnapShots decode (non-fatal): {e}");
+        DecodedSnapshots::default()
+    });
+    let snap_cbor_len = dec.position() - before_snap;
+    let snapshots = DecodedSnapshots {
+        cbor_len: snap_cbor_len,
+        ..snapshots
+    };
 
-    // ── field[3.3] NonMyopic (skip — stub) ────────────────────────────────────
+    // ── field[3.3] NonMyopic array(2): [likelihoods_map, reward_pot] ─────────
     let before_nm = dec.position();
-    dec.skip()
-        .map_err(|e| format!("field[3.3] NonMyopic skip: {e}"))?;
-    let nonmyopic_cbor_len = dec.position() - before_nm;
+    let nonmyopic = decode_nonmyopic(&mut dec, "field[3.3] NonMyopic").unwrap_or_else(|e| {
+        eprintln!("[bridge] WARN NonMyopic decode (non-fatal): {e}");
+        DecodedNonMyopic::default()
+    });
+    let nm_cbor_len = dec.position() - before_nm;
+    let nonmyopic = DecodedNonMyopic {
+        cbor_len: nm_cbor_len,
+        ..nonmyopic
+    };
 
     // ── field[4] StrictMaybe PulsingRewUpdate ─────────────────────────────────
     let pulsing_rew_update = decode_strict_maybe(&mut dec, "field[4] StrictMaybe")?;
@@ -197,9 +304,9 @@ pub fn decode_new_epoch_state(st_cbor: &[u8]) -> Result<DecodedNewEpochState, St
         blocks_cur_count,
         treasury,
         reserves,
-        ledger_state_cbor_len,
-        snapshots_cbor_len,
-        nonmyopic_cbor_len,
+        ledger_state,
+        snapshots,
+        nonmyopic,
         pulsing_rew_update,
         pool_distr_count,
         stashed_avvm_len,
@@ -348,6 +455,209 @@ fn decode_stashed_avvm(
         }
         other => Err(format!("{label}: expected array, got {other:?}")),
     }
+}
+
+/// Decode a `LedgerState` `array(2)` sub-tree.
+///
+/// Haskell encoding order: `[CertState, UTxOState]` (CertState first for intern sharing).
+///
+/// UTxOState is `array(6)`:
+///   `[utxo_map, deposited_coin, fees_coin, gov_state, instant_stake, donation_coin]`
+///
+/// CertState is a complex sub-tree that we skip entirely.
+fn decode_ledger_state(
+    dec: &mut minicbor::Decoder<'_>,
+    label: &str,
+) -> Result<DecodedLedgerState, String> {
+    match dec
+        .array()
+        .map_err(|e| format!("{label} array header: {e}"))?
+    {
+        Some(2) => {}
+        Some(n) => return Err(format!("{label}: expected array(2), got array({n})")),
+        None => {
+            return Err(format!(
+                "{label}: expected definite array(2), got indefinite"
+            ))
+        }
+    }
+
+    // Sub-field [0]: CertState — complex (DState + PState + VState); skip entirely.
+    dec.skip()
+        .map_err(|e| format!("{label} CertState skip: {e}"))?;
+
+    // Sub-field [1]: UTxOState array(6):
+    //   [utxo_map, deposited_coin, fees_coin, gov_state, instant_stake, donation_coin]
+    match dec
+        .array()
+        .map_err(|e| format!("{label} UTxOState array header: {e}"))?
+    {
+        Some(6) => {}
+        Some(n) => {
+            return Err(format!(
+                "{label} UTxOState: expected array(6), got array({n})"
+            ))
+        }
+        None => {
+            return Err(format!(
+                "{label} UTxOState: expected definite array(6), got indefinite"
+            ))
+        }
+    }
+
+    // [1.0] utxo_map: map txin → txout
+    let utxo_count = Some(decode_map_count(dec, &format!("{label} UTxO map"))?);
+
+    // [1.1] deposited_coin
+    let deposited = Some(decode_u64(dec, &format!("{label} deposited"))?);
+
+    // [1.2] fees_coin
+    let fees = Some(decode_u64(dec, &format!("{label} fees"))?);
+
+    // [1.3] gov_state (GovState — complex Conway gov state); skip entirely.
+    dec.skip()
+        .map_err(|e| format!("{label} GovState skip: {e}"))?;
+
+    // [1.4] instant_stake — skip entirely.
+    dec.skip()
+        .map_err(|e| format!("{label} InstantStake skip: {e}"))?;
+
+    // [1.5] donation_coin
+    let donation = Some(decode_u64(dec, &format!("{label} donation"))?);
+
+    Ok(DecodedLedgerState {
+        utxo_count,
+        deposited,
+        fees,
+        donation,
+        cbor_len: 0, // filled in by caller
+    })
+}
+
+/// Decode a `SnapShots` `array(4)` sub-tree.
+///
+/// Haskell encoding:
+/// ```text
+/// encodeListLen 4 <> encCBOR ssStakeMark <> encCBOR ssStakeSet <> encCBOR ssStakeGo <> encCBOR ssFee
+/// ```
+/// Note: `ssStakeMarkPoolDistr` is intentionally NOT serialized.
+///
+/// Each `SnapShot` is `array(2)` (new format) or `array(3)` (old format).
+/// New: `[ActiveStake, StakePoolsMap]`; Old: `[Stake, Delegations, StakePoolsMap]`.
+/// We only need the pool count, which is the last map in each snapshot.
+fn decode_snapshots(
+    dec: &mut minicbor::Decoder<'_>,
+    label: &str,
+) -> Result<DecodedSnapshots, String> {
+    match dec
+        .array()
+        .map_err(|e| format!("{label} array header: {e}"))?
+    {
+        Some(4) => {}
+        Some(n) => return Err(format!("{label}: expected array(4), got array({n})")),
+        None => {
+            return Err(format!(
+                "{label}: expected definite array(4), got indefinite"
+            ))
+        }
+    }
+
+    let mark_pool_count = decode_snapshot_pool_count(dec, &format!("{label}[mark]")).ok();
+    let set_pool_count = decode_snapshot_pool_count(dec, &format!("{label}[set]")).ok();
+    let go_pool_count = decode_snapshot_pool_count(dec, &format!("{label}[go]")).ok();
+
+    // ssFee: Coin (u64)
+    let fee = decode_u64(dec, &format!("{label} fee")).ok();
+
+    Ok(DecodedSnapshots {
+        field_count: 4,
+        mark_pool_count,
+        set_pool_count,
+        go_pool_count,
+        fee,
+        cbor_len: 0, // filled in by caller
+    })
+}
+
+/// Decode a single `SnapShot` and return the number of stake pools in its map.
+///
+/// SnapShot is `array(2)` or `array(3)`:
+/// - New (2): `[ActiveStake, StakePoolsSnapShotMap]`
+/// - Old (3): `[Stake, Delegations, StakePoolsSnapShotMap]`
+///
+/// We skip leading fields and count entries in the final StakePoolsSnapShotMap.
+fn decode_snapshot_pool_count(dec: &mut minicbor::Decoder<'_>, label: &str) -> Result<u64, String> {
+    let n = match dec
+        .array()
+        .map_err(|e| format!("{label} SnapShot array header: {e}"))?
+    {
+        Some(n) => n,
+        None => {
+            return Err(format!(
+                "{label}: expected definite array for SnapShot, got indefinite"
+            ))
+        }
+    };
+
+    match n {
+        2 => {
+            // New format: [ActiveStake, StakePoolsMap]
+            // ActiveStake is a complex VMap; skip it.
+            dec.skip()
+                .map_err(|e| format!("{label} ActiveStake skip: {e}"))?;
+        }
+        3 => {
+            // Old format: [Stake, Delegations, StakePoolsMap]
+            dec.skip().map_err(|e| format!("{label} Stake skip: {e}"))?;
+            dec.skip()
+                .map_err(|e| format!("{label} Delegations skip: {e}"))?;
+        }
+        _ => {
+            return Err(format!(
+                "{label}: expected SnapShot array(2) or array(3), got array({n})"
+            ))
+        }
+    }
+
+    // StakePoolsSnapShotMap: map pool_id → StakePoolSnapShot
+    let pool_count = decode_map_count(dec, &format!("{label} StakePools map"))?;
+    Ok(pool_count)
+}
+
+/// Decode a `NonMyopic` `array(2)` sub-tree.
+///
+/// Haskell encoding:
+/// ```text
+/// encodeListLen 2 <> encCBOR likelihoodsNM <> encCBOR rewardPotNM
+/// ```
+fn decode_nonmyopic(
+    dec: &mut minicbor::Decoder<'_>,
+    label: &str,
+) -> Result<DecodedNonMyopic, String> {
+    match dec
+        .array()
+        .map_err(|e| format!("{label} array header: {e}"))?
+    {
+        Some(2) => {}
+        Some(n) => return Err(format!("{label}: expected array(2), got array({n})")),
+        None => {
+            return Err(format!(
+                "{label}: expected definite array(2), got indefinite"
+            ))
+        }
+    }
+
+    // [0] likelihoodsNM: VMap pool_id → Likelihood (map)
+    let likelihood_count = Some(decode_map_count(dec, &format!("{label} likelihoods map"))?);
+
+    // [1] rewardPotNM: Coin (u64)
+    let reward_pot = Some(decode_u64(dec, &format!("{label} rewardPot"))?);
+
+    Ok(DecodedNonMyopic {
+        likelihood_count,
+        reward_pot,
+        cbor_len: 0, // filled in by caller
+    })
 }
 
 /// A partially-decoded ledger state blob.

@@ -44,6 +44,10 @@ pub enum RunOutcome {
         treasury: Option<u64>,
         /// Initial reserves (lovelace) from AccountState.
         reserves: Option<u64>,
+        /// UTxO entry count from the initial LedgerState.
+        utxo_count: Option<u64>,
+        /// PoolDistr entry count from field[5] of the initial NewEpochState.
+        pool_count: Option<u64>,
     },
     /// UTXO signal decoded successfully as a transaction.
     UtxoDecoded { era_id: u16, tx_bytes: usize },
@@ -133,13 +137,18 @@ fn run_newepoch(vec: &ImpVector) -> RunOutcome {
         };
     }
 
-    // Best-effort: decode the full NewEpochState to extract treasury/reserves.
+    // Best-effort: decode the full NewEpochState for diagnostic fields.
     // Failure here is non-fatal — the epoch-invariant is the gating check.
-    let (treasury, reserves) = match decode_new_epoch_state(&vec.st_cbor) {
-        Ok(nes) => (Some(nes.treasury), Some(nes.reserves)),
+    let (treasury, reserves, utxo_count, pool_count) = match decode_new_epoch_state(&vec.st_cbor) {
+        Ok(nes) => (
+            Some(nes.treasury),
+            Some(nes.reserves),
+            nes.ledger_state.utxo_count,
+            Some(nes.pool_distr_count),
+        ),
         Err(e) => {
             eprintln!("[ledger-rules] WARN decode_new_epoch_state (non-fatal): {e}");
-            (None, None)
+            (None, None, None, None)
         }
     };
 
@@ -148,6 +157,8 @@ fn run_newepoch(vec: &ImpVector) -> RunOutcome {
         signal_epoch,
         treasury,
         reserves,
+        utxo_count,
+        pool_count,
     }
 }
 
