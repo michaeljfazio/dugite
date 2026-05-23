@@ -502,11 +502,15 @@ pub fn capture(
         scalars: Scalars {
             reserves: state.epochs.reserves.0,
             treasury: state.epochs.treasury.0,
-            // Bug 1 fix: `state.utxo.epoch_fees` is reset to 0 by
-            // `process_epoch_transition` before this dump fires; read the
-            // snapshotted just-closed-epoch fee pot from `ss_fee`
-            // (Haskell's `currentEpochState.esLState.utxoState.fees`).
-            fees: state.epochs.snapshots.ss_fee.0,
+            // #615f: the dump now fires PRE-boundary (see apply.rs), so
+            // `state.utxo.epoch_fees` is the live accumulator for the
+            // just-ending epoch — exactly matching Haskell's
+            // `currentEpochState.esLState.utxoState.fees` at the last block
+            // of epoch N.  (Prior to #615f the dump fired post-boundary
+            // where `utxo.epoch_fees` had been zeroed, so #615c switched
+            // to `snapshots.ss_fee` — that's the previous epoch's fees,
+            // and gave a one-epoch off-by-one against Haskell.)
+            fees: state.utxo.epoch_fees.0,
             // Bug 2 fix: Haskell reports `utxoState.deposited` which is
             // the COMBINED stake-key + pool-registration deposit total.
             // Stake-key portion is `total_stake_key_deposits` (3 keys × 2
@@ -712,9 +716,12 @@ mod tests {
         assert_eq!(dump.protocol_version.major, 10);
         assert_eq!(dump.scalars.reserves, 10_000_000);
         assert_eq!(dump.scalars.treasury, 20_000);
-        // Bug 1: fees come from snapshot `ss_fee` (123) not the
-        // post-boundary-reset `utxo.epoch_fees` (999_999).
-        assert_eq!(dump.scalars.fees, 123);
+        // #615f: fees come from the LIVE `utxo.epoch_fees` (999_999), not
+        // the snapshotted `ss_fee` (which is the PREVIOUS epoch's fees).
+        // The dump now fires PRE-boundary (apply.rs), so `utxo.epoch_fees`
+        // is the just-ending epoch's running fee total — matching Haskell's
+        // `utxoState.fees` at the last block of epoch N.
+        assert_eq!(dump.scalars.fees, 999_999);
         assert_eq!(dump.pools.registered, 1);
         assert_eq!(dump.pools.retiring, 1);
         assert_eq!(dump.pools.retired_this_epoch, 1);
@@ -722,17 +729,17 @@ mod tests {
         assert_eq!(dump.governance.cc_threshold_den, 1);
     }
 
-    /// Bug 1: `scalars.fees` must read from the snapshot `ss_fee`, not
-    /// `utxo.epoch_fees` (which `process_epoch_transition` zeroes
-    /// before the dump fires).
+    /// #615f: `scalars.fees` must read from the LIVE `utxo.epoch_fees`
+    /// (the running accumulator for the just-ending epoch) — matching
+    /// Haskell's `utxoState.fees` at end of epoch N.  `ss_fee` is the
+    /// PREVIOUS epoch's fees and was the wrong source (#615c regression).
     #[test]
-    fn capture_reads_fees_from_ss_fee_not_live_epoch_fees() {
+    fn capture_reads_fees_from_live_utxo_epoch_fees() {
         let mut state = make_state();
-        // Simulate the post-boundary state: handler has reset
-        // `utxo.epoch_fees` but `ss_fee` retains the just-closed epoch's
-        // total.
-        state.utxo.epoch_fees = Lovelace(0);
-        state.epochs.snapshots.ss_fee = Lovelace(7_777_777);
+        state.utxo.epoch_fees = Lovelace(7_777_777);
+        // `ss_fee` is the previous epoch's snapshotted fees — should be
+        // IGNORED by the dump because the dump now fires pre-boundary.
+        state.epochs.snapshots.ss_fee = Lovelace(0);
         let dump = capture(&state, 5, 10, None);
         assert_eq!(dump.scalars.fees, 7_777_777);
     }
