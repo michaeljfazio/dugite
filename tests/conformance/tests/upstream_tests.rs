@@ -69,3 +69,33 @@ fn cardano_ledger_cddl_validates() {
     };
     dugite_conformance::upstream::cardano_ledger_cddl::run_all_checks(&ledger_dir, &ouroboros_dir);
 }
+
+// ── ledger-rules ImpSpec replay (Phase 4) ────────────────────────────────────
+
+#[test]
+fn ledger_rules_imp_spec_replay() {
+    let Some(dir) = fixtures::check_area("ledger-rules") else {
+        return;
+    };
+    dugite_conformance::upstream::ledger_rules_replay::run_all_checks(&dir);
+}
+
+// ── cardano-base VRF/KES crypto vectors (Phase 5) ────────────────────────────
+
+#[test]
+fn cardano_base_crypto_vectors() {
+    let Some(dir) = fixtures::check_area("cardano-base") else {
+        return;
+    };
+    dugite_conformance::upstream::cardano_base::run_all_checks(&dir);
+}
+
+// ── Mithril certificate fixtures (Phase 6) ───────────────────────────────────
+
+#[test]
+fn mithril_certificate_fixtures() {
+    let Some(dir) = fixtures::check_area("mithril") else {
+        return;
+    };
+    dugite_conformance::upstream::mithril::run_all_checks(&dir);
+}
