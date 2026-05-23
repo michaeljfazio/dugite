@@ -12,9 +12,10 @@ import           Cardano.Ledger.Binary
 -- cardano-ledger-core
 import           Cardano.Ledger.BaseTypes
   ( EpochNo (..), ShelleyBase, Globals (..)
-  , mkActiveSlotCoeff, unsafeBoundRational
+  , mkActiveSlotCoeff, boundRational
   , Network (..), EpochSize (..)
   )
+import           Data.Maybe ( fromJust )
 import           Cardano.Ledger.Core    ( eraProtVerLow )
 
 -- cardano-ledger-conway
@@ -73,7 +74,7 @@ dugiteGlobals = Globals
   , maxKESEvo                     = 62
   , quorum                        = 5
   , maxLovelaceSupply             = 45_000_000_000_000_000
-  , activeSlotCoeff               = mkActiveSlotCoeff . unsafeBoundRational $ 0.05
+  , activeSlotCoeff               = mkActiveSlotCoeff . fromJust . boundRational $ 0.05
   , networkId                     = Mainnet
   , systemStart                   = SystemStart $ posixSecondsToUTCTime 1506203091
   }
