@@ -1,9 +1,13 @@
 #!/usr/bin/env bash
 # Capture step for the plutus area.
 #
-# Downloads the plutus-conformance.tar.gz release asset from IntersectMBO/plutus
-# at the tag specified in sources.toml and repackages it as plutus.tar.gz.
-# Upstream naming: plutus-conformance.tar.gz → republished as: plutus.tar.gz
+# Downloads the IntersectMBO/plutus source tarball at the tag in sources.toml,
+# extracts plutus-conformance/test-cases/uplc/evaluation/, and repackages
+# that subtree as plutus.tar.gz.
+#
+# The upstream project does not ship a pre-built plutus-conformance.tar.gz
+# release asset — the conformance vectors live inside the source archive at:
+#   plutus-<TAG>/plutus-conformance/test-cases/uplc/evaluation/
 #
 # Produces:
 #   <work-dir>/hashes.json
@@ -45,26 +49,33 @@ EOF
 }
 
 TAG="$(parse_val plutus tag)"
-UPSTREAM_ASSET="$(parse_val plutus release_asset)"
-log "Tag: ${TAG}, asset: ${UPSTREAM_ASSET}"
+log "Tag: ${TAG}"
 
-DOWNLOAD_URL="https://github.com/IntersectMBO/plutus/releases/download/${TAG}/${UPSTREAM_ASSET}"
+SOURCE_URL="https://github.com/IntersectMBO/plutus/archive/refs/tags/${TAG}.tar.gz"
 CONTENT_DIR="${WORK_DIR}/content"
-UPSTREAM_TARBALL="${WORK_DIR}/upstream.tar.gz"
-mkdir -p "${CONTENT_DIR}"
+UPSTREAM_TARBALL="${WORK_DIR}/plutus-src.tar.gz"
+EXTRACT_DIR="${WORK_DIR}/extract"
+mkdir -p "${CONTENT_DIR}" "${EXTRACT_DIR}"
 
-log "Downloading ${DOWNLOAD_URL}..."
-CURL_ARGS=(-L -o "${UPSTREAM_TARBALL}")
+log "Downloading ${SOURCE_URL}..."
+CURL_ARGS=(-fL --progress-bar -o "${UPSTREAM_TARBALL}")
 if [[ -n "${GITHUB_TOKEN:-}" ]]; then
     CURL_ARGS+=(-H "Authorization: Bearer ${GITHUB_TOKEN}")
 fi
-curl "${CURL_ARGS[@]}" "${DOWNLOAD_URL}"
+curl "${CURL_ARGS[@]}" "${SOURCE_URL}"
 
-log "Extracting..."
-tar -xzf "${UPSTREAM_TARBALL}" -C "${CONTENT_DIR}"
+# The archive root is plutus-<TAG>/
+SUBDIR="plutus-${TAG}/plutus-conformance/test-cases/uplc/evaluation"
+log "Extracting ${SUBDIR}..."
+tar -xzf "${UPSTREAM_TARBALL}" -C "${EXTRACT_DIR}" "${SUBDIR}" 2>/dev/null \
+    || { echo "[capture-plutus] ERROR: archive did not contain ${SUBDIR}" >&2; exit 1; }
+
+# Copy the contents of evaluation/ into content/
+# so the top-level dirs are 'builtin', 'example', 'term', ...
+cp -R "${EXTRACT_DIR}/${SUBDIR}/." "${CONTENT_DIR}/"
 
 COUNT="$(find "${CONTENT_DIR}" -type f | wc -l | tr -d ' ')"
-log "Extracted ${COUNT} files"
+log "Collected ${COUNT} files"
 
 python3 - "${CONTENT_DIR}" > "${WORK_DIR}/hashes.json" <<'EOF'
 import sys, os, hashlib, json

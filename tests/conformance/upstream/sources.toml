@@ -17,9 +17,11 @@ repo = "IntersectMBO/cardano-node"
 sha  = "9c20173514507050308bb5f2d67ac30cb0963ac9"
 
 [plutus]
-repo          = "IntersectMBO/plutus"
-tag           = "1.65.0.0"
-release_asset = "plutus-conformance.tar.gz"
+# Conformance vectors live inside the source tarball at:
+#   plutus-<TAG>/plutus-conformance/test-cases/uplc/evaluation/
+# The capture script downloads the source archive (not a release asset).
+repo = "IntersectMBO/plutus"
+tag  = "1.65.0.0"
 
 [ledger-rules]
 # This area builds cardano-ledger + runs ImpSpec with CONFORMANCE_CBOR_DUMP_PATH.
