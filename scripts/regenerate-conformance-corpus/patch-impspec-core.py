@@ -95,57 +95,64 @@ def patch_cabal_file(path: str) -> None:
         print(f"[patch-impspec-core] WARNING: no build-depends in test-suite tests; skipping")
         return
 
-    # Find the end of the build-depends list by scanning lines after 'build-depends:'.
-    # The list ends at the first line that doesn't continue with a leading comma or
-    # indented package name — i.e. at the first blank line or a new field name.
-    bd_header_abs = ts_start + bd_match.start()
-    after_bd = content[bd_header_abs:]
+    # Find the end of the build-depends list using INDENTATION.
+    # The 'build-depends:' header is at some indent level; continuation dep lines
+    # are MORE indented.  A new cabal field has the SAME or LESS indent level.
+    # A blank line also terminates the block.
+    #
+    # NOTE: we must NOT use a "contains colon" heuristic here because sub-library
+    # deps like "cardano-ledger-conway:{cardano-ledger-conway, testlib}," contain
+    # colons and would be misidentified as new fields.
+    bd_word_abs = ts_start + bd_match.start()
+    # Find the start of the line containing 'build-depends:' so we can measure
+    # the true column-0 indentation of the header.
+    line_start = content.rfind('\n', 0, bd_word_abs)
+    bd_line_abs = (line_start + 1) if line_start >= 0 else 0
 
-    # Split into lines; the build-depends block is the header + continuation lines.
+    after_bd = content[bd_line_abs:]
     bd_lines = after_bd.split('\n')
-    # Line 0 is 'build-depends:...'
-    # Lines 1+ are continuation lines (leading whitespace + optional comma + name)
-    # A continuation line looks like: '      base', '    , other-pkg', etc.
+
+    # The header line is "  build-depends:" (indented); measure from column 0.
+    bd_header_indent = len(bd_lines[0]) - len(bd_lines[0].lstrip())
+
     last_bd_line_idx = 0
     for i in range(1, len(bd_lines)):
         line = bd_lines[i]
-        # Continuation: non-empty and starts with whitespace
-        if line and (line[0] == ' ' or line[0] == '\t'):
-            # Still a continuation if it looks like a dep line or is blank-ish
-            stripped = line.strip()
-            # Stop if this line is a new cabal field (e.g. 'hs-source-dirs:')
-            if stripped and re.match(r'^[a-z]', stripped) and ':' in stripped.split()[0]:
-                break
-            last_bd_line_idx = i
-        elif not line.strip():
-            # Blank line ends the build-depends
+        if not line.strip():
+            # Blank line terminates the block.
             break
-        else:
+        line_indent = len(line) - len(line.lstrip())
+        if line_indent <= bd_header_indent:
+            # Same or less indent = a new cabal field, not a dep continuation.
             break
+        last_bd_line_idx = i
 
-    # Absolute offset of end of the last build-depends continuation line.
-    insert_abs = bd_header_abs + sum(len(l) + 1 for l in bd_lines[:last_bd_line_idx + 1])
-    # -1 to position before the trailing newline of the last dep line
-    insert_abs -= 1  # just before the '\n' that ends the last dep line
-    insert_abs += 1  # after the last dep's text (end of line content)
-    # Actually, just track the exact byte offset:
-    # insert_abs = position right after the last character of the last dep line
-    # (before the newline), so we append "\n    , pkg" there.
-    offset = bd_header_abs
-    for i, line in enumerate(bd_lines):
-        if i == last_bd_line_idx + 1:
-            break
-        offset += len(line) + 1  # +1 for '\n'
-    # offset is now at the start of bd_lines[last_bd_line_idx + 1]
-    # Insert before that (i.e. after the newline of the last dep line)
-    insert_abs = offset
+    # Detect whether deps use trailing-comma ("dep,") or leading-comma (", dep") style
+    # by examining the first continuation line after the 'build-depends:' header.
+    leading_comma_style = (
+        len(bd_lines) > 1 and bd_lines[1].lstrip().startswith(',')
+    )
+
+    # Compute the insert position: right after the last dep line's newline.
+    insert_abs = bd_line_abs
+    for i in range(last_bd_line_idx + 1):
+        insert_abs += len(bd_lines[i]) + 1  # +1 for '\n'
+
+    # Infer the dep line indent from the first existing dep line.
+    dep_indent = " " * (len(bd_lines[1]) - len(bd_lines[1].lstrip())) if len(bd_lines) > 1 else "    "
 
     # Build the insertion: two packages appended after the last existing dep.
     to_add = ""
     if "filepath" not in ts_block:
-        to_add += "    , filepath\n"
+        if leading_comma_style:
+            to_add += f"{dep_indent}, filepath\n"
+        else:
+            to_add += f"{dep_indent}filepath,\n"
     if "cardano-ledger-api" not in ts_block:
-        to_add += "    , cardano-ledger-api\n"
+        if leading_comma_style:
+            to_add += f"{dep_indent}, cardano-ledger-api\n"
+        else:
+            to_add += f"{dep_indent}cardano-ledger-api,\n"
 
     if to_add:
         content = content[:insert_abs] + to_add + content[insert_abs:]
