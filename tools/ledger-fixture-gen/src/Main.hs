@@ -1,5 +1,6 @@
 {-# LANGUAGE DataKinds           #-}
 {-# LANGUAGE FlexibleContexts    #-}
+{-# LANGUAGE NumericUnderscores  #-}
 {-# LANGUAGE ScopedTypeVariables #-}
 {-# LANGUAGE TypeApplications    #-}
 module Main where
@@ -18,15 +19,17 @@ import           Cardano.Ledger.Core    ( eraProtVerLow )
 
 -- cardano-ledger-conway
 import           Cardano.Ledger.Conway  ( ConwayEra )
--- Import the instance declarations so applySTS can find the Conway NEWEPOCH rule.
-import           Cardano.Ledger.Conway.Rules ()
+-- Import the ConwayNEWEPOCH STS type and its instances.
+-- The () imports pull in the STS instance declarations for all Conway rules.
+import           Cardano.Ledger.Conway.Rules
+  ( ConwayNEWEPOCH )
 
 -- cardano-ledger-shelley: NewEpochState type
 import           Cardano.Ledger.Shelley.LedgerState ( NewEpochState )
 
 -- small-steps: STS machinery
 import           Control.State.Transition.Extended
-  ( TRC (..), applySTS, AssertionPolicy (..) )
+  ( TRC (..), applySTS )
 
 -- Monad plumbing for ShelleyBase
 import           Control.Monad.Reader  ( runReaderT )
@@ -42,7 +45,7 @@ import           System.Environment    ( getArgs )
 import           System.FilePath       ( (</>) )
 
 -- cardano-slotting
-import           Cardano.Slotting.Time ( SystemStart (..), mkSlotLength )
+import           Cardano.Slotting.Time      ( SystemStart (..), mkSlotLength )
 import           Cardano.Slotting.EpochInfo ( fixedEpochInfo )
 
 -- time
@@ -87,18 +90,6 @@ conwayVersion = eraProtVerLow @ConwayEra
 encodeFile :: EncCBOR a => FilePath -> a -> IO ()
 encodeFile path x = BS.writeFile path $ serialize' conwayVersion x
 
--- ---------------------------------------------------------------------------
--- NEWEPOCH STS type
---
--- The Conway NEWEPOCH STS rule is parameterised by era:
---   data ConwayNEWEPOCH era
---
--- The import `Cardano.Ledger.Conway.Rules ()` brings in the necessary
--- `STS (ConwayNEWEPOCH ConwayEra)` instance.  The type itself is typically
--- re-exported from Cardano.Ledger.Conway.Rules.  If "not in scope", try:
---   import Cardano.Ledger.Conway.Rules.NewEpoch (ConwayNEWEPOCH)
--- ---------------------------------------------------------------------------
-import Cardano.Ledger.Conway.Rules ( ConwayNEWEPOCH )
 
 -- ---------------------------------------------------------------------------
 -- Fixture generation helpers
@@ -117,26 +108,27 @@ applyNewEpoch st epochNo =
 
 -- | Generate one test-case directory with 4 CBOR files.
 --
--- Haskell `EncCBOR ()` = `encodeNull` = `0xF6`.
--- Both ctx and env for NEWEPOCH are `()`, so both files get `0xF6`.
+-- ctx and env for NEWEPOCH are both (), which Haskell serializes as
+-- CBOR null (0xF6) via `EncCBOR () = encodeNull`.
 generateNewEpochVector
-  :: FilePath            -- ^ Output root directory
-  -> String              -- ^ Test name (becomes sub-directory name)
+  :: FilePath                 -- ^ Output root directory
+  -> String                   -- ^ Test name (sub-directory name)
   -> NewEpochState ConwayEra  -- ^ Initial state (before STS transition)
-  -> EpochNo             -- ^ Signal (target epoch)
+  -> EpochNo                  -- ^ Signal (target epoch)
   -> IO ()
 generateNewEpochVector outDir testName st sig = do
   let dir = outDir </> "ConwayNEWEPOCH" </> testName
   createDirectoryIfMissing True dir
-  -- ctx = ()  → CBOR null (0xF6).  EncCBOR () = encodeNull.
+  -- ctx = ()  -> CBOR null (0xF6).  EncCBOR () = encodeNull.
   encodeFile (dir </> "conformance_dump_ctx.cbor") ()
-  -- env = ()  → CBOR null (0xF6).
+  -- env = ()  -> CBOR null (0xF6).
   encodeFile (dir </> "conformance_dump_env.cbor") ()
-  -- st  = initial NewEpochState (before the epoch transition).
+  -- st = initial NewEpochState (before the epoch transition).
   encodeFile (dir </> "conformance_dump_st.cbor")  st
   -- sig = EpochNo (CBOR uint).
   encodeFile (dir </> "conformance_dump_sig.cbor") sig
   putStrLn $ "  [ok] ConwayNEWEPOCH/" ++ testName
+
 
 -- ---------------------------------------------------------------------------
 -- Test cases
@@ -163,14 +155,14 @@ main = do
         ["--output-dir", d] -> d
         _                   -> "."
 
-  putStrLn $ "Generating Conway conformance fixtures → " ++ outDir
+  putStrLn $ "Generating Conway conformance fixtures -> " ++ outDir
 
   let st0 = def :: NewEpochState ConwayEra
 
-  -- Test case 1: epoch 0 → 1 (simplest transition from `def` state).
+  -- Test case 1: epoch 0 -> 1 (simplest transition from `def` state).
   generateNewEpochVector outDir "test_epoch_0_to_1" st0 (EpochNo 1)
 
-  -- Test case 2: apply 0→1 first, then generate fixtures for 1→2.
+  -- Test case 2: apply 0->1 first, then generate fixtures for 1->2.
   st1 <- case applyNewEpoch st0 (EpochNo 1) of
     Left err -> do
       putStrLn $ "  [warn] could not advance to epoch 1: " ++ err
@@ -178,7 +170,7 @@ main = do
     Right s  -> return s
   generateNewEpochVector outDir "test_epoch_1_to_2" st1 (EpochNo 2)
 
-  -- Test case 3: advance to epoch 4 step-by-step, then generate 4→5.
+  -- Test case 3: advance to epoch 4 step-by-step, then generate 4->5.
   st4 <- advanceEpochs st0 [EpochNo 1, EpochNo 2, EpochNo 3, EpochNo 4]
   generateNewEpochVector outDir "test_epoch_4_to_5" st4 (EpochNo 5)
 
