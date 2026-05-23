@@ -204,9 +204,31 @@ def _count_snapshot_pools(record: Any, snapshot: str) -> int | None:
 
 
 def _count_utxo(record: Any) -> int | None:
+    """Return the UTxO count from a Haskell `cardano-cli debug log-epoch-state`
+    record, or `None` when the count cannot be derived.
+
+    Bug 4 (#615): `cardano-cli debug log-epoch-state` emits the UTxO map
+    as an empty object `{}` even when the live UTxO set is populated --
+    the field is intentionally not enumerable in the public CLI output.
+    Returning `len({}) == 0` from this function masked that as a real
+    `0`, producing a 100-vs-0 divergence against dugite which DOES emit
+    the true count.
+
+    Fix: when the `utxo` field is empty AND the alternative `utxosUtxo`
+    path is not enumerable either, return `None`.  This causes the diff
+    tool to mark the field "uncoverable" rather than report a false
+    divergence.  A non-empty `utxo` or `utxosUtxo` map is honoured as
+    before -- some fixtures and reduced dumps DO populate one or the
+    other.
+    """
     utxo = _resolve(record, "currentEpochState.esLState.utxoState.utxo")
-    if isinstance(utxo, dict):
+    if isinstance(utxo, dict) and len(utxo) > 0:
         return len(utxo)
+    utxos_utxo = _resolve(record, "currentEpochState.esLState.utxoState.utxosUtxo")
+    if isinstance(utxos_utxo, dict) and len(utxos_utxo) > 0:
+        return len(utxos_utxo)
+    # Neither path is enumerable -- treat as "Haskell schema gap, not
+    # divergence" (Bug 4 of #615).
     return None
 
 
