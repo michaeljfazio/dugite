@@ -57,6 +57,22 @@ const SKIP_LIST: &[(&str, &str)] = &[
     // Format: ("title-substring", "issue URL or number")
 ];
 
+/// Map an ImpSpec category name to a Cardano HFC era_id for tx decoding.
+///
+/// cardano-ledger ImpSpec uses these directory names (see capture-ledger-rules.sh).
+/// Unmapped categories return `None` and skip tx decoding for that era.
+fn era_id_from_category(category: &str) -> Option<u16> {
+    match category {
+        "ShelleyImpSpec" => Some(1),
+        "AllegraImpSpec" => Some(2),
+        "MaryImpSpec" => Some(3),
+        "AlonzoImpSpec" => Some(4),
+        "BabbageImpSpec" => Some(5),
+        "ConwayImpSpec_-_Version_10" => Some(6),
+        _ => None,
+    }
+}
+
 /// Returns the issue URL for a vector whose title matches a skip entry, or `None`.
 fn is_skipped(title: &str) -> Option<&'static str> {
     for (pattern, issue) in SKIP_LIST {
@@ -70,10 +86,12 @@ fn is_skipped(title: &str) -> Option<&'static str> {
 /// Run all `.cbor` vector files found under `dir/<category>`.
 ///
 /// Each `.cbor` file is decoded via `vector::decode_vector`, then inspected
-/// via `bridge`, replayed via `runner`, and compared via `compare`.
+/// via `bridge`, replayed via `runner` (which calls `decode_transaction` on
+/// every Transaction event), and compared via `compare`.
 ///
 /// Skips gracefully when `dir` contains no `.cbor` files (stub mode).
 pub fn run_era_vectors(dir: &Path, category: &str) {
+    let era_id = era_id_from_category(category);
     let sub = dir.join(category);
     if !sub.exists() {
         eprintln!(
@@ -161,8 +179,9 @@ pub fn run_era_vectors(dir: &Path, category: &str) {
             }
         };
 
-        // Run all events through the runner (skeleton: event counting only).
-        let outcome = runner::run_vector(&vec);
+        // Run all events through the runner (tx CBOR deserialization + event counting).
+        let era = era_id.unwrap_or(6); // default Conway if category unmapped
+        let outcome = runner::run_vector(&vec, era);
         match &outcome {
             runner::RunOutcome::Decoded {
                 transactions,

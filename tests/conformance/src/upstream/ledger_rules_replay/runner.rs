@@ -1,28 +1,31 @@
 //! Phase 4 — Runner: apply ImpSpec events and collect outcomes.
 //!
-//! ## Current state (Phase 4 skeleton)
+//! ## Current validation (Phase 4)
 //!
-//! The runner validates that every event in a vector decodes correctly and
-//! records which event types appear. The actual ledger calls
-//! (`Ledger::apply_tx`, `Ledger::apply_tick`, `Ledger::apply_epoch`) are
-//! wired up as Phase 4 follow-on work once the CBOR bridge from
-//! `bridge.rs` is complete enough to produce Dugite's internal types.
+//! For each vector the runner:
+//! 1. Parses every `Transaction` event's `tx_cbor` bytes using
+//!    `dugite_serialization::decode_transaction` (real tx deserialization).
+//! 2. Checks `expected_valid == true` transactions decode without error.
+//! 3. Counts PassTick and PassEpoch events for diagnostic output.
 //!
-//! ## Phase 4 follow-on
+//! ## Phase 4 follow-on: full ledger replay
 //!
-//! Replace `RunOutcome::Decoded` with full ledger execution:
-//! 1. Use `bridge::decode_state` to initialise a `LedgerState`.
-//! 2. For each `ImpEvent::Transaction`: call `dugite_ledger::apply_tx`.
-//! 3. For each `ImpEvent::PassTick`: advance the slot clock.
-//! 4. For each `ImpEvent::PassEpoch`: trigger epoch-boundary logic.
-//! 5. Return the resulting state for `compare.rs`.
+//! Full ledger execution (apply_tx / apply_tick / apply_epoch) requires:
+//! 1. A `LedgerState::from_cbor(imp_spec_format)` bridge for the `arr[7]`
+//!    NewEpochState encoding (tracked as a separate ledger bridge task).
+//! 2. Actual ImpSpec fixture files (requires Haskell toolchain to generate).
+//!
+//! Until both are available, the runner provides the deepest validation
+//! achievable: real CBOR deserialization of every transaction in the vector.
+
+use dugite_serialization::decode_transaction;
 
 use crate::upstream::ledger_rules_replay::vector::{ImpEvent, ImpVector};
 
 /// Outcome of replaying one ImpSpec vector through the runner.
 #[derive(Debug)]
 pub enum RunOutcome {
-    /// All events decoded successfully; full ledger replay pending Phase 4 follow-on.
+    /// All tx events deserialized; full ledger replay pending Phase 4 follow-on.
     Decoded {
         transactions: usize,
         ticks: usize,
@@ -30,22 +33,41 @@ pub enum RunOutcome {
     },
     /// Vector was skipped (e.g., known-broken scenario in SKIP_LIST).
     Skipped { reason: String },
-    /// A ledger error occurred at event `event_idx`.
+    /// A deserialize error occurred at event `event_idx`.
     Failed { event_idx: usize, detail: String },
 }
 
 /// Apply every event in `vec` and return the run outcome.
 ///
-/// In Phase 4 skeleton mode this validates event decoding only. Full ledger
-/// replay is wired in the follow-on once `bridge.rs` produces typed state.
-pub fn run_vector(vec: &ImpVector) -> RunOutcome {
+/// `era_id` is the Cardano HFC era number (1=Shelley, 2=Allegra, 3=Mary,
+/// 4=Alonzo, 5=Babbage, 6=Conway) and determines which CBOR decoder is used
+/// for Transaction events.
+pub fn run_vector(vec: &ImpVector, era_id: u16) -> RunOutcome {
     let mut txs = 0usize;
     let mut ticks = 0usize;
     let mut epochs = 0usize;
 
-    for event in &vec.events {
+    for (i, event) in vec.events.iter().enumerate() {
         match event {
-            ImpEvent::Transaction { .. } => txs += 1,
+            ImpEvent::Transaction {
+                tx_cbor,
+                expected_valid,
+                ..
+            } => {
+                txs += 1;
+                if *expected_valid {
+                    // Transactions the ImpSpec marks as valid must parse cleanly.
+                    if let Err(e) = decode_transaction(era_id, tx_cbor) {
+                        return RunOutcome::Failed {
+                            event_idx: i,
+                            detail: format!(
+                                "tx decode failed (era_id={era_id}, {} bytes): {e}",
+                                tx_cbor.len()
+                            ),
+                        };
+                    }
+                }
+            }
             ImpEvent::PassTick { .. } => ticks += 1,
             ImpEvent::PassEpoch { .. } => epochs += 1,
         }

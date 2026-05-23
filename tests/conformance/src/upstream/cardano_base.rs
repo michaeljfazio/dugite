@@ -42,6 +42,7 @@
 use std::collections::HashMap;
 use std::path::Path;
 
+use dugite_crypto::kes::{kes_evolve_to_period, kes_keygen, kes_sign_bytes, kes_verify_bytes};
 use dugite_crypto::vrf::{generate_vrf_keypair_from_secret, generate_vrf_proof, verify_vrf_proof};
 
 /// Parsed VRF test vector from a cardano-crypto-praos test_vectors/ file.
@@ -295,6 +296,60 @@ fn validate_v03_vector(vec: &VrfVector, label: &str) {
     eprintln!("[cardano-base] PASS {label}: keypair + prove + verify all match");
 }
 
+/// KES property-based validation using dugite-crypto's KES API.
+///
+/// cardano-base uses property-based testing for KES and publishes no static
+/// vector files. This function exercises the same properties (keygen →
+/// sign → evolve → sign → verify) with deterministic inputs so that any
+/// regression in dugite-crypto's Sum6KES implementation is caught here.
+fn run_kes_property_check() {
+    // Property 1: keygen + sign(period=0) + verify.
+    let seed = [0x42u8; 32];
+    let (sk0, pk) = kes_keygen(&seed).expect("[cardano-base] KES: kes_keygen failed");
+
+    let msg0 = b"Cardano KES period-0 test message";
+    let (sig0_bytes, period0) =
+        kes_sign_bytes(&sk0, msg0).expect("[cardano-base] KES: sign period 0 failed");
+    assert_eq!(period0, 0, "[cardano-base] KES: initial period must be 0");
+    kes_verify_bytes(&pk, 0, &sig0_bytes, msg0)
+        .expect("[cardano-base] KES: verify period 0 failed");
+
+    // Property 2: evolve to period 5 → sign → verify with original pk.
+    let sk5 = kes_evolve_to_period(&sk0, 5).expect("[cardano-base] KES: evolve to period 5 failed");
+    let msg5 = b"Cardano KES period-5 test message";
+    let (sig5_bytes, period5) =
+        kes_sign_bytes(&sk5, msg5).expect("[cardano-base] KES: sign period 5 failed");
+    assert_eq!(
+        period5, 5,
+        "[cardano-base] KES: period after evolve must be 5"
+    );
+    kes_verify_bytes(&pk, 5, &sig5_bytes, msg5)
+        .expect("[cardano-base] KES: verify period 5 with original pk failed");
+
+    // Property 3: period-5 sig must not verify at wrong period or with wrong message.
+    assert!(
+        kes_verify_bytes(&pk, 0, &sig5_bytes, msg5).is_err(),
+        "[cardano-base] KES: period-5 sig must not verify at period 0"
+    );
+    assert!(
+        kes_verify_bytes(&pk, 5, &sig5_bytes, b"wrong message").is_err(),
+        "[cardano-base] KES: period-5 sig must not verify wrong message"
+    );
+
+    // Property 4: different seeds produce different public keys.
+    let seed2 = [0xabu8; 32];
+    let (_, pk2) = kes_keygen(&seed2).expect("[cardano-base] KES: second kes_keygen failed");
+    assert_ne!(
+        pk, pk2,
+        "[cardano-base] KES: different seeds must yield different public keys"
+    );
+
+    eprintln!(
+        "[cardano-base] KES property check PASS: \
+         keygen + sign(p=0) + evolve(p=5) + sign + verify all correct"
+    );
+}
+
 fn has_only_readme(dir: &Path) -> bool {
     let files = walkdir(dir);
     files.len() == 1
@@ -306,15 +361,20 @@ fn has_only_readme(dir: &Path) -> bool {
 }
 
 pub fn run_all_checks(dir: &Path) {
+    // KES property check runs unconditionally — it exercises the KES API with
+    // deterministic inputs, mirroring cardano-base's property-based KES tests.
+    // (cardano-base publishes no static KES vector files; property-testing is
+    // the authoritative validation approach for KES in the Haskell ecosystem.)
+    run_kes_property_check();
+
     if has_only_readme(dir) {
         eprintln!(
-            "[cardano-base] SKIP: fixture area is stub placeholder at {} \
+            "[cardano-base] VRF: fixture area is stub placeholder at {} \
              — run the corpus regeneration pipeline to populate Phase 5 VRF vectors.\n\
              Activation steps:\n\
              1. `just regenerate-corpus-local` (or trigger the GH workflow)\n\
              2. Update manifest.toml to the new release tag\n\
-             3. `cargo xtask download-upstream-fixtures`\n\
-             Note: KES has no static test vectors (property-based only).",
+             3. `cargo xtask download-upstream-fixtures`",
             dir.display()
         );
         return;
