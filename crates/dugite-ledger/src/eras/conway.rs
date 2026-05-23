@@ -178,11 +178,11 @@ impl EraRules for ConwayRules {
     /// 2. **validateRefScriptSize** -- total ref script size <= maxRefScriptSizePerTx.
     ///    (Stub: checked during tx validation, not during apply.)
     /// 3. **validateWithdrawalsDelegated** (PV >= 10) -- all withdrawal KeyHash
-    ///    accounts must be DRep-delegated.
-    ///    (Stub: requires PV10 which is not yet active.)
-    /// 4. **testIncompleteAndMissingWithdrawals** (PV >= 10) -- withdrawals drain
-    ///    accounts exactly.
-    ///    (Stub: requires PV10 which is not yet active.)
+    ///    accounts must be DRep-delegated. Fires unconditionally on every
+    ///    block apply per Haskell.
+    /// 4. **testIncompleteAndMissingWithdrawals** (PV >= 10) -- withdrawals
+    ///    drain accounts exactly. Fires unconditionally on every block
+    ///    apply per Haskell.
     /// 5. **updateDormantDRepExpiries / updateVotingDRepExpiries** -- update DRep
     ///    last-active epoch for voting DReps in this transaction.
     /// 6. **drainAccounts** -- apply withdrawals to balances (same as Shelley).
@@ -194,7 +194,7 @@ impl EraRules for ConwayRules {
     fn apply_valid_tx(
         &self,
         tx: &Transaction,
-        mode: BlockValidationMode,
+        _mode: BlockValidationMode,
         ctx: &RuleContext,
         utxo: &mut UtxoSubState,
         certs: &mut CertSubState,
@@ -229,82 +229,64 @@ impl EraRules for ConwayRules {
         // Reference script size validation is performed during Phase-1 validation,
         // not during apply. The tiered fee check lives in validation/conway.rs.
 
-        // Steps 3 & 4: PV10 withdrawal checks — ValidateAll mode only.
+        // Steps 3 & 4: PV10 withdrawal checks.
         //
+        // Per Haskell `Cardano.Ledger.Conway.Rules.Ledger.conwayWithdrawals`,
         // `validateWithdrawalsDelegated` (step 3) and
-        // `testIncompleteAndMissingWithdrawals` (step 4) are Phase-1 mempool /
-        // UTXOW-witness checks that are also enforced by Haskell's LEDGER STS
-        // during block application.  However, Haskell's reward balance at the
-        // point of application is byte-exact with its own prior RUPD computation.
-        // Dugite's reward accumulation diverges by a small amount (a few thousand
-        // lovelace) on some testnets due to rounding differences across many
-        // epoch boundaries — enough to trigger the exact-match check on a
-        // historical on-chain transaction that was legitimately accepted.
-        //
-        // Strategy: enforce these checks only when processing NEW blocks
-        // (ValidateAll mode, i.e. live sync, mempool admission, and forged
-        // blocks).  Skip them in ApplyOnly mode (historical chunk-replay from
-        // ImmutableDB).  The block was already accepted on-chain; re-applying it
-        // cannot produce a different ledger transition — the drain at step 6
-        // unconditionally zeros the balance regardless of the declared amount.
-        //
-        // Issue #503: preprod chunk-replay at slot 76554214 failed with
-        // WithdrawalAmountMismatch (balance 4,127,037 vs on-chain 4,130,764)
-        // caused by a 3,727-lovelace cumulative reward divergence from preprod's
-        // protocol parameter history.  Gating on ValidateAll resolves the stall
-        // without relaxing live-block validation.
-        if mode == BlockValidationMode::ValidateAll {
-            // Step 3: validateWithdrawalsDelegated (PV >= 10).
-            // When protocol version 10 is active, verify that all withdrawal
-            // KeyHash accounts have a DRep delegation in gov.governance.vote_delegations.
-            if ctx.params.protocol_version_major >= 10 {
-                for reward_account in tx.body.withdrawals.keys() {
-                    if reward_account.len() >= 29 {
-                        // Bit 4 of header: 0 = key credential, 1 = script credential.
-                        // Reward address headers: 0xe0/0xe1 = key, 0xf0/0xf1 = script.
-                        let is_script = reward_account[0] & 0x10 != 0;
-                        if !is_script {
-                            let key = common::reward_account_to_hash(reward_account);
-                            if !gov.governance.vote_delegations.contains_key(&key) {
-                                return Err(LedgerError::BlockTxValidationFailed {
-                                    slot: ctx.current_slot,
-                                    tx_hash: tx.hash.to_hex(),
-                                    errors: format!(
-                                        "WithdrawalNotDelegated: key-hash credential {} \
-                                         has no DRep delegation (PV10 requirement)",
-                                        key.to_hex()
-                                    ),
-                                });
-                            }
+        // `testIncompleteAndMissingWithdrawals` (step 4) fire UNCONDITIONALLY
+        // on every block apply — there is no mode gate in Haskell.  Reward
+        // balances at the point of application are byte-exact with the
+        // prior RUPD; #629 closed the f64→Rational gap that previously
+        // caused dugite's reward accumulation to drift by a few thousand
+        // lovelace on long-horizon replays and made these checks
+        // false-positive in `ApplyOnly` mode.
+        if ctx.params.protocol_version_major >= 10 {
+            // Step 3: validateWithdrawalsDelegated.
+            // Verify that all key-hash withdrawal accounts have a DRep
+            // delegation in gov.governance.vote_delegations.
+            for reward_account in tx.body.withdrawals.keys() {
+                if reward_account.len() >= 29 {
+                    // Bit 4 of header: 0 = key credential, 1 = script credential.
+                    // Reward address headers: 0xe0/0xe1 = key, 0xf0/0xf1 = script.
+                    let is_script = reward_account[0] & 0x10 != 0;
+                    if !is_script {
+                        let key = common::reward_account_to_hash(reward_account);
+                        if !gov.governance.vote_delegations.contains_key(&key) {
+                            return Err(LedgerError::BlockTxValidationFailed {
+                                slot: ctx.current_slot,
+                                tx_hash: tx.hash.to_hex(),
+                                errors: format!(
+                                    "WithdrawalNotDelegated: key-hash credential {} \
+                                     has no DRep delegation (PV10 requirement)",
+                                    key.to_hex()
+                                ),
+                            });
                         }
                     }
                 }
             }
 
-            // Step 4: testIncompleteAndMissingWithdrawals (PV >= 10).
-            // When protocol version 10 is active, verify withdrawal amounts
-            // exactly match reward balances.
-            if ctx.params.protocol_version_major >= 10 {
-                for (reward_account, amount) in &tx.body.withdrawals {
-                    let key = common::reward_account_to_hash(reward_account);
-                    let balance = certs
-                        .reward_accounts
-                        .get(&key)
-                        .copied()
-                        .unwrap_or(Lovelace(0));
-                    if *amount != balance {
-                        return Err(LedgerError::BlockTxValidationFailed {
-                            slot: ctx.current_slot,
-                            tx_hash: tx.hash.to_hex(),
-                            errors: format!(
-                                "WithdrawalAmountMismatch: withdrawal {} != reward balance {} \
-                                 for account {} (PV10 requirement)",
-                                amount.0,
-                                balance.0,
-                                key.to_hex()
-                            ),
-                        });
-                    }
+            // Step 4: testIncompleteAndMissingWithdrawals.
+            // Verify withdrawal amounts exactly match reward balances.
+            for (reward_account, amount) in &tx.body.withdrawals {
+                let key = common::reward_account_to_hash(reward_account);
+                let balance = certs
+                    .reward_accounts
+                    .get(&key)
+                    .copied()
+                    .unwrap_or(Lovelace(0));
+                if *amount != balance {
+                    return Err(LedgerError::BlockTxValidationFailed {
+                        slot: ctx.current_slot,
+                        tx_hash: tx.hash.to_hex(),
+                        errors: format!(
+                            "WithdrawalAmountMismatch: withdrawal {} != reward balance {} \
+                             for account {} (PV10 requirement)",
+                            amount.0,
+                            balance.0,
+                            key.to_hex()
+                        ),
+                    });
                 }
             }
         }
@@ -3390,13 +3372,15 @@ mod tests {
     }
 
     /// Issue #503 regression: ApplyOnly (chunk-replay) must skip the PV10
-    /// amount-mismatch check even when reward balance != withdrawal amount.
+    /// PV10 amount-mismatch check fires in ApplyOnly mode too (#634).
     ///
-    /// Preprod chunk-replay failed at slot 76554214 with WithdrawalAmountMismatch
-    /// (balance 4,127,037 vs on-chain 4,130,764) because dugite's cumulative
-    /// reward balance diverged by 3,727 lovelace from Haskell's.  The block was
-    /// accepted on-chain; re-applying it must not re-validate Phase-1 mempool
-    /// checks that depend on exact balance equality.
+    /// Before #629 fixed the f64→Rational reward calc gap, preprod
+    /// chunk-replay failed at slot 76554214 with WithdrawalAmountMismatch
+    /// (balance 4,127,037 vs on-chain 4,130,764) — a 3,727-lovelace
+    /// cumulative reward divergence that the `ApplyOnly` gate masked.
+    /// With #629 reward accumulation is byte-exact, so the check is now
+    /// unconditional per Haskell `conwayWithdrawals`; a genuine mismatch
+    /// is a real error, not a workaround target.
     #[test]
     fn test_pv10_withdrawal_amount_mismatch_apply_only_succeeds() {
         let rules = ConwayRules::new();
@@ -3437,7 +3421,7 @@ mod tests {
             1_000_000,
         );
 
-        // ApplyOnly mode: must succeed regardless of balance mismatch.
+        // ApplyOnly mode no longer masks the mismatch (#634).
         let result = rules.apply_valid_tx(
             &tx,
             BlockValidationMode::ApplyOnly,
@@ -3447,9 +3431,12 @@ mod tests {
             &mut gov,
             &mut epochs,
         );
+        let err = result
+            .expect_err("ApplyOnly must fail with WithdrawalAmountMismatch per Haskell (#634)");
+        let msg = format!("{err:?}");
         assert!(
-            result.is_ok(),
-            "ApplyOnly must skip PV10 amount check (issue #503): {result:?}"
+            msg.contains("WithdrawalAmountMismatch"),
+            "expected WithdrawalAmountMismatch, got: {msg}",
         );
     }
 
@@ -3571,7 +3558,11 @@ mod tests {
         );
     }
 
-    /// Verify that ApplyOnly mode skips the PV10 delegation check too.
+    /// Verify the PV10 delegation check fires in ApplyOnly mode too (#634).
+    ///
+    /// Per Haskell `conwayWithdrawals` this predicate is unconditional —
+    /// any historical block whose witness drained an undelegated key-hash
+    /// account is invalid and must be rejected on replay.
     #[test]
     fn test_pv10_withdrawal_undelegated_apply_only_succeeds() {
         let rules = ConwayRules::new();
@@ -3586,7 +3577,7 @@ mod tests {
         let mut certs = make_cert_sub();
         Arc::make_mut(&mut certs.reward_accounts).insert(cred_hash, Lovelace(400_000));
 
-        // No DRep delegation — but ApplyOnly should skip the check.
+        // No DRep delegation — must be rejected unconditionally per Haskell.
         let mut gov = make_gov_sub();
         let mut epochs = make_epoch_sub();
 
@@ -3615,9 +3606,12 @@ mod tests {
             &mut gov,
             &mut epochs,
         );
+        let err =
+            result.expect_err("ApplyOnly must fail with WithdrawalNotDelegated per Haskell (#634)");
+        let msg = format!("{err:?}");
         assert!(
-            result.is_ok(),
-            "ApplyOnly must skip PV10 delegation check for historical blocks: {result:?}"
+            msg.contains("WithdrawalNotDelegated"),
+            "expected WithdrawalNotDelegated, got: {msg}",
         );
     }
 
