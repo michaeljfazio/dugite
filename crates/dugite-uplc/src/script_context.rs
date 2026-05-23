@@ -212,6 +212,11 @@ pub enum ScriptPurpose {
     Certifying(u64, TxCert),
     Voting(Voter),
     Proposing(u64, ProposalProcedure),
+    /// Dijkstra (PV12+) — `DijkstraGuarding(ScriptHash)`. The payload is
+    /// the hash of the script credential being guarded (matches
+    /// `Cardano.Ledger.Dijkstra.Scripts.DijkstraGuarding`, `Sum 6`).
+    /// Issue #475 Phase 3.5.
+    Guarding(ScriptHash),
 }
 
 /// V3 `ScriptInfo` — the per-purpose payload at the top of the
@@ -228,6 +233,9 @@ pub enum ScriptInfo {
     Certifying(u64, TxCert),
     Voting(Voter),
     Proposing(u64, ProposalProcedure),
+    /// Dijkstra (PV12+) — `DijkstraGuarding(ScriptHash)`. Issue #475
+    /// Phase 3.5.
+    Guarding(ScriptHash),
 }
 
 /// Certificates — opaque to the validator beyond their Data encoding.
@@ -444,6 +452,9 @@ impl ScriptPurpose {
             ScriptPurpose::Proposing(i, p) => {
                 data_constr(5, vec![data_i((*i).into()), p.0.clone()])
             }
+            // Dijkstra `DijkstraGuarding(ScriptHash)` — Sum 6.
+            // Issue #475 Phase 3.5.
+            ScriptPurpose::Guarding(h) => data_constr(6, vec![data_bs28(h)]),
         }
     }
 }
@@ -463,6 +474,11 @@ impl ScriptInfo {
             ScriptInfo::Certifying(i, c) => data_constr(3, vec![data_i((*i).into()), c.0.clone()]),
             ScriptInfo::Voting(v) => data_constr(4, vec![v.to_data()]),
             ScriptInfo::Proposing(i, p) => data_constr(5, vec![data_i((*i).into()), p.0.clone()]),
+            // Dijkstra `DijkstraGuarding(ScriptHash)` — Sum 6. The
+            // populator emits this for any Plutus V3 / V4 script invoked
+            // through a credential-based guard at TxBody key 14.
+            // Issue #475 Phase 3.5.
+            ScriptInfo::Guarding(h) => data_constr(6, vec![data_bs28(h)]),
         }
     }
 }
