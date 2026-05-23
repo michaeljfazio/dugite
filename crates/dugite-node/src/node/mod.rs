@@ -3213,13 +3213,31 @@ impl Node {
         // running as a responder (it has a listen socket to share). When
         // diffusion mode is InitiatorOnly there is no listen port to pair
         // against, so we leave outbound on ephemeral source ports.
-        // `connect_from` falls back to ephemeral on bind failure, so this is
-        // safe on platforms without working SO_REUSEPORT semantics.
-        if self.config.diffusion_mode == crate::config::DiffusionMode::InitiatorAndResponder {
+        //
+        // ALSO skip pairing when the listen IP is a loopback address —
+        // `bind(127.0.0.1:P)` then `connect()` to a public-internet host
+        // fails with `EADDRNOTAVAIL` because the loopback source is not
+        // routable to the destination, and outbound peer establishment
+        // would silently fail for every public peer (issue #608).  An
+        // unspecified bind (`0.0.0.0` / `::`) is fine: the kernel picks a
+        // routable source IP per-destination at connect time.
+        //
+        // `connect_from` now ALSO falls back to ephemeral on connect failure
+        // (not just bind), so this is a defence-in-depth guard rather than
+        // the only safety net.
+        let listen_ip_is_loopback = self.listen_addr.ip().is_loopback();
+        if self.config.diffusion_mode == crate::config::DiffusionMode::InitiatorAndResponder
+            && !listen_ip_is_loopback
+        {
             lifecycle.set_local_listen_addr(self.listen_addr);
             info!(
                 listen = %self.listen_addr,
                 "outbound source-port pairing enabled (matches Haskell configureOutboundSocket)"
+            );
+        } else if listen_ip_is_loopback {
+            info!(
+                listen = %self.listen_addr,
+                "outbound source-port pairing disabled (listen IP is loopback; outbound will use ephemeral source)"
             );
         }
         self.connection_lifecycle = Some(lifecycle);
