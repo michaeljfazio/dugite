@@ -111,7 +111,11 @@ parser = []
 # into `tests/conformance/`. The harness consumes the textual .uplc files
 # via the first-party `parser` feature — no third-party UPLC parser is
 # linked in.
-conformance = ["parser"]
+# upstream-conformance is the canonical name for Phase 1+ (unified fixture root).
+# conformance is kept as an alias so existing `--features conformance` invocations
+# keep working without modification.
+upstream-conformance = ["parser"]
+conformance = ["upstream-conformance"]
 
 [lib]
 name = "dugite_uplc"

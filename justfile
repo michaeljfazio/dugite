@@ -252,18 +252,32 @@ dual-decode-soak NETWORK="preview" MAX_BLOCKS="0" *FLAGS="":
 dual-decode-report DIR="./dual_decode_mismatches":
     python3 ./scripts/validation/dual-decode-report.py {{DIR}}
 
+# ─── Upstream conformance corpus ─────────────────────────────────────────────
+
+# Download all upstream conformance fixture areas from the pinned dugite release.
+# See tests/conformance/upstream/manifest.toml for the release tag.
+download-upstream-fixtures:
+    cargo xtask download-upstream-fixtures
+
+# Download a single upstream conformance fixture area.
+download-upstream-fixtures-area AREA:
+    cargo xtask download-upstream-fixtures --area {{AREA}}
+
+# Run the full upstream conformance test suite (all areas, REQUIRE mode).
+test-upstream:
+    DUGITE_REQUIRE_UPSTREAM=1 cargo nextest run -p dugite-uplc --features upstream-conformance --test conformance
+    DUGITE_REQUIRE_UPSTREAM=1 cargo nextest run -p dugite-conformance --features upstream-conformance --test upstream_tests
+
+# Run the regeneration pipeline locally (produces tarballs in target/conformance-corpus/).
+regenerate-corpus-local:
+    bash scripts/regenerate-conformance-corpus/regenerate.sh --local
+
 # ─── UPLC conformance ────────────────────────────────────────────────────────
 
-# Download the official UPLC evaluation test vectors from the latest
-# stable IntersectMBO/plutus release. Override with
-#   PLUTUS_VERSION=1.65.0.0 just uplc-conformance-fetch
-uplc-conformance-fetch:
-    ./scripts/dev/download-plutus-conformance.sh
-
-# Run the UPLC conformance test suite (requires the corpus to have
-# been fetched). Runs the full corpus — no filters.
+# Run the UPLC conformance test suite (requires the corpus to have been fetched).
+# Uses the unified fixture root (tests/conformance/upstream/fixtures/plutus/).
 uplc-conformance:
-    cargo nextest run -p dugite-uplc --features conformance --test conformance
+    cargo nextest run -p dugite-uplc --features upstream-conformance --test conformance
 
 # ─── Dev / release ───────────────────────────────────────────────────────────
 

@@ -47,11 +47,14 @@ CLONE_DIR="${WORK_DIR}/clone"
 CONTENT_DIR="${WORK_DIR}/content"
 mkdir -p "${CLONE_DIR}" "${CONTENT_DIR}"
 
-log "Cloning cardano-ledger..."
-git clone --no-checkout --filter=blob:none \
+log "Cloning cardano-ledger (shallow)..."
+git clone --depth=1 \
     "https://github.com/IntersectMBO/cardano-ledger.git" "${CLONE_DIR}"
-git -C "${CLONE_DIR}" fetch --depth=1 origin "${SHA}"
-git -C "${CLONE_DIR}" checkout "${SHA}"
+if ! git -C "${CLONE_DIR}" rev-parse --verify "${SHA}^{commit}" >/dev/null 2>&1; then
+    log "SHA not at tip, fetching..."
+    git -C "${CLONE_DIR}" fetch --depth=1 origin "${SHA}"
+    git -C "${CLONE_DIR}" checkout "${SHA}"
+fi
 
 # Collect curated file subsets:
 # 1. CDDL schemas (conway.cddl and ancestors)

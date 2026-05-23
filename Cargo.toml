@@ -1,5 +1,25 @@
 [workspace]
+default-members = [
+    "crates/dugite-primitives",
+    "crates/dugite-crypto",
+    "crates/dugite-serialization",
+    "crates/dugite-network",
+    "crates/dugite-consensus",
+    "crates/dugite-ledger",
+    "crates/dugite-mempool",
+    "crates/dugite-storage",
+    "crates/dugite-node",
+    "crates/dugite-cli",
+    "crates/dugite-lsm",
+    "crates/dugite-integration-tests",
+    "crates/dugite-monitor",
+    "crates/dugite-config",
+    "crates/dugite-uplc",
+    "tests/conformance",
+    "tests/golden",
+]
 members = [
+    "xtask",
     "crates/dugite-primitives",
     "crates/dugite-crypto",
     "crates/dugite-serialization",
