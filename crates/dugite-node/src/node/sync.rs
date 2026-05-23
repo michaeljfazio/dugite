@@ -2639,12 +2639,29 @@ impl Node {
 /// 1. HFC-wrapped: `[era_tag, tag24(header_bytes)]` — from Haskell peers
 /// 2. Full block CBOR — from Dugite peers
 ///
-/// In both cases, the block header hash is `blake2b_256(header_cbor)`.
-/// For HFC-wrapped headers, the hash is computed over the entire wrapped
-/// envelope, matching how Haskell computes it.
+/// For Shelley+ HFC-wrapped headers, the hash is `blake2b_256(inner_bytes)`
+/// (the bytes inside the tag24 wrap), matching how Haskell computes it.
+///
+/// For Byron HFC-wrapped headers, the wire form is
+/// `[0, [[isEbb, size], tag24(bstr(byron_header))]]` and the hash is
+/// `blake2b_256([0x82, isEbb, byron_header])` — see `byron_main_header_hash`
+/// / `byron_ebb_header_hash` in dugite-serialization.
 fn extract_hash_from_header(header_cbor: &[u8]) -> [u8; 32] {
-    // The N2N ChainSync protocol sends headers as HFC-wrapped:
-    //   [era_tag, tag24(inner_header_bytes)]
+    // Byron HFC wrap: [0, [[isEbb_u8, size_uint], tag24(bytes(byron_header))]]
+    if let Some((is_ebb, byron_header_bytes)) = unwrap_byron_n2n_header(header_cbor) {
+        // Byron header hash = blake2b_256(cbor([isEbb_u8, byron_header])).
+        // That CBOR encodes as `array(2) ++ uint(isEbb) ++ byron_header_bytes`.
+        let mut buf = Vec::with_capacity(2 + byron_header_bytes.len());
+        buf.push(0x82); // array(2)
+        buf.push(is_ebb); // uint 0 (EBB) or 1 (main)
+        buf.extend_from_slice(byron_header_bytes);
+        let hash = dugite_primitives::hash::blake2b_256(&buf);
+        let mut arr = [0u8; 32];
+        arr.copy_from_slice(hash.as_ref());
+        return arr;
+    }
+
+    // Shelley+ HFC wrap: [era_tag(uint), tag24(bytes(inner_header))]
     // The Cardano block hash is blake2b_256 of the INNER header bytes
     // (the bytes inside tag24), NOT the outer wrapper. Hashing the wrapper
     // produces wrong hashes that BlockFetch cannot find.
@@ -2655,15 +2672,28 @@ fn extract_hash_from_header(header_cbor: &[u8]) -> [u8; 32] {
     arr
 }
 
-/// Unwrap an HFC-wrapped header to get the inner header bytes.
+/// Unwrap a Shelley+ HFC-wrapped header to get the inner header bytes.
 ///
-/// N2N ChainSync headers are wrapped as `[era_tag, tag24(inner_bytes)]`.
-/// Returns the inner bytes, or `None` if the CBOR is not in HFC format.
+/// N2N ChainSync headers for Shelley+ are wrapped as
+/// `[era_tag(uint), tag24(inner_bytes)]`.  Returns the inner bytes, or `None`
+/// if the CBOR is not in that format (e.g. a Byron HFC wrap, which has a
+/// nested array instead of a uint era tag — see [`unwrap_byron_n2n_header`]).
 fn unwrap_hfc_header(header_cbor: &[u8]) -> Option<&[u8]> {
     use minicbor::Decoder;
     let mut dec = Decoder::new(header_cbor);
     let arr_len = dec.array().ok()?;
     if arr_len != Some(2) {
+        return None;
+    }
+    // The first element MUST be a uint for the Shelley+ wrap.  Reject any
+    // other type (notably array, which indicates the Byron wrap).
+    if !matches!(
+        dec.datatype().ok()?,
+        minicbor::data::Type::U8
+            | minicbor::data::Type::U16
+            | minicbor::data::Type::U32
+            | minicbor::data::Type::U64
+    ) {
         return None;
     }
     let _era_tag = dec.u64().ok()?;
@@ -2674,31 +2704,108 @@ fn unwrap_hfc_header(header_cbor: &[u8]) -> Option<&[u8]> {
     dec.bytes().ok()
 }
 
-/// Extract the slot number from a wrapped header CBOR.
+/// Unwrap a Byron N2N header from its HFC + `ABoundaryOrRegular` wrappers.
 ///
-/// The N2N ChainSync protocol sends headers as `[era_tag, tag24(header_bytes)]`.
-/// For Shelley+ eras, the header body contains the slot as the second field.
-/// For Byron, the slot is in a different position. This function attempts a
-/// best-effort extraction without full deserialization.
+/// The Byron N2N wire form sent by `cardano-node` is:
 ///
-/// Returns `None` if the header CBOR cannot be parsed.
-/// Extract slot from a raw (unwrapped) header CBOR.
+/// ```text
+///   array(2)
+///     uint(0)                                 // HFC era index for Byron
+///     array(2)
+///       array(2) [ uint(isEbb), uint(size) ]  // ABoundaryOrRegular tag + ann. size
+///       tag(24)(bytes(byron_header_cbor))
+/// ```
 ///
-/// The `header_cbor` is the raw Shelley+ header bytes AFTER HFC unwrapping
-/// (i.e., the bytes inside `tag24` from `[era_id, tag24(bytes)]`).
-///
-/// For Shelley+ headers: `[header_body, body_signature]` where
-/// `header_body = [block_number, slot, ...]`.
-fn extract_slot_from_wrapped_header(header_cbor: &[u8]) -> Option<u64> {
+/// Returns `Some((isEbb, byron_header_bytes))` on success.  Both EBB
+/// (`isEbb == 0`) and main-block (`isEbb == 1`) headers are accepted.
+fn unwrap_byron_n2n_header(header_cbor: &[u8]) -> Option<(u8, &[u8])> {
     use minicbor::Decoder;
-
     let mut dec = Decoder::new(header_cbor);
 
-    // First, try to parse as a raw Shelley+ header (already unwrapped).
+    // Outer: array(2) [era_id=0, payload]
+    if dec.array().ok()? != Some(2) {
+        return None;
+    }
+    // era_id must be uint(0) (Byron). Reject any other type so we never
+    // mistake a Shelley+ wrap for a Byron one.
+    if !matches!(
+        dec.datatype().ok()?,
+        minicbor::data::Type::U8
+            | minicbor::data::Type::U16
+            | minicbor::data::Type::U32
+            | minicbor::data::Type::U64
+    ) {
+        return None;
+    }
+    let era_id = dec.u64().ok()?;
+    if era_id != 0 {
+        return None;
+    }
+
+    // Payload: array(2) [ [isEbb, size], tag24(bytes(...)) ]
+    if dec.array().ok()? != Some(2) {
+        return None;
+    }
+    // [isEbb, size]
+    if dec.array().ok()? != Some(2) {
+        return None;
+    }
+    let is_ebb_u64 = dec.u64().ok()?;
+    if is_ebb_u64 > 1 {
+        return None;
+    }
+    let _size = dec.u64().ok()?; // annotation-size hint; not load-bearing
+                                 // tag24(bytes(byron_header_cbor))
+    let tag = dec.tag().ok()?;
+    if tag != minicbor::data::Tag::new(24) {
+        return None;
+    }
+    let inner = dec.bytes().ok()?;
+    Some((is_ebb_u64 as u8, inner))
+}
+
+/// Extract the slot number from a wrapped header CBOR.
+///
+/// The N2N ChainSync protocol sends headers wrapped by the Hard-Fork
+/// Combinator.  Three layouts are supported here:
+///
+/// 1. **Shelley+ HFC wrap**: `[era_id(uint), tag24(bytes(inner_header))]`
+///    where `inner_header = [header_body, body_signature, ...]` and
+///    `header_body = [block_number, slot, ...]`.
+/// 2. **Byron HFC wrap** (sent by `cardano-node` for pre-Shelley blocks):
+///    `[0, [[isEbb, size], tag24(bytes(byron_header))]]`.  EBB and main-block
+///    headers are decoded by [`decode_byron_header_slot`].
+/// 3. **Raw Shelley+ header** (already unwrapped) — kept for back-compat with
+///    the legacy `chain_sync_loop` code path.
+///
+/// `byron_epoch_length` is used for Byron slot computation; `0` selects the
+/// mainnet formula (`epoch * 21_600 + rel_slot`).
+///
+/// Returns `None` if the header CBOR cannot be parsed.
+fn extract_slot_from_wrapped_header(header_cbor: &[u8], byron_epoch_length: u64) -> Option<u64> {
+    use minicbor::Decoder;
+
+    // 1. Byron HFC wrap — check first because its outer shape can collide
+    //    with the raw-header fallback below.
+    if let Some((is_ebb, byron_header_bytes)) = unwrap_byron_n2n_header(header_cbor) {
+        return decode_byron_header_slot(byron_header_bytes, is_ebb, byron_epoch_length);
+    }
+
+    // 2. Shelley+ HFC wrap: [era_tag(uint), tag24(bytes(inner_header))]
+    if let Some(inner_bytes) = unwrap_hfc_header(header_cbor) {
+        let mut inner = Decoder::new(inner_bytes);
+        let _ = inner.array().ok()?;
+        let _ = inner.array().ok()?;
+        let _block_number = inner.u64().ok()?;
+        let slot = inner.u64().ok()?;
+        return Some(slot);
+    }
+
+    // 3. Raw Shelley+ header (legacy path) — already unwrapped.
     // Structure: array(2+) [header_body, body_signature, ...]
     // header_body: array(N) [block_number, slot, ...]
+    let mut dec = Decoder::new(header_cbor);
     if let Ok(Some(_outer_len)) = dec.array() {
-        // Try header_body array
         if let Ok(Some(_body_len)) = dec.array() {
             let _block_number = dec.u64().ok()?;
             let slot = dec.u64().ok()?;
@@ -2706,32 +2813,82 @@ fn extract_slot_from_wrapped_header(header_cbor: &[u8]) -> Option<u64> {
         }
     }
 
-    // If that fails, try the HFC-wrapped format [era_tag, tag24(inner)]
-    // (for compatibility with the old chain_sync_loop code path).
-    let mut dec = Decoder::new(header_cbor);
-    let arr_len = dec.array().ok()?;
-    if arr_len == Some(2) {
-        let era_tag = dec.u64().ok()?;
-        let tag = dec.tag().ok()?;
-        if tag == minicbor::data::Tag::new(24) {
-            let inner_bytes = dec.bytes().ok()?;
-            let mut inner = Decoder::new(inner_bytes);
-
-            if era_tag == 0 {
-                // Byron — complex, return None for now
-                return None;
-            } else {
-                // Shelley+ inner
-                let _ = inner.array().ok()?;
-                let _ = inner.array().ok()?;
-                let _block_number = inner.u64().ok()?;
-                let slot = inner.u64().ok()?;
-                return Some(slot);
-            }
-        }
-    }
-
     None
+}
+
+/// Mainnet Byron epoch length in slots used when `byron_epoch_length == 0`.
+/// Matches the mainnet formula `(epoch * 432_000) / 20 = epoch * 21_600`.
+const MAINNET_BYRON_SLOTS_PER_EPOCH: u64 = 21_600;
+
+/// Decode the slot number from a raw Byron header CBOR.
+///
+/// `byron_header_cbor` is the array(5) header
+/// `[protocol_magic, prev_hash, body_proof, consensus_data, extra_data]`
+/// extracted from the Byron HFC + `ABoundaryOrRegular` wrappers.
+///
+/// * EBB (`is_ebb == 0`): `consensus_data = [uint(epoch), array(1)[difficulty]]`
+///   (matching Haskell `ABoundaryConsensusData`), slot = `epoch * epoch_length`.
+/// * Main block (`is_ebb == 1`):
+///   `consensus_data = [array(2)[epoch, rel_slot], issuer, array(1)[difficulty], block_sig]`,
+///   slot = `epoch * epoch_length + rel_slot`.
+///
+/// `byron_epoch_length == 0` selects the mainnet formula
+/// (`epoch * 21_600 + rel_slot`, derived from `(epoch * 432_000) / 20`).
+fn decode_byron_header_slot(
+    byron_header_cbor: &[u8],
+    is_ebb: u8,
+    byron_epoch_length: u64,
+) -> Option<u64> {
+    use minicbor::Decoder;
+
+    let mut dec = Decoder::new(byron_header_cbor);
+    // header = array(5) [protocol_magic, prev_hash, body_proof, consensus_data, extra_data]
+    if dec.array().ok()? != Some(5) {
+        return None;
+    }
+    let _protocol_magic = dec.u64().ok()?;
+    dec.skip().ok()?; // prev_hash
+    dec.skip().ok()?; // body_proof
+
+    // consensus_data
+    let (epoch, rel_slot) = match is_ebb {
+        0 => {
+            // EBB: consensus_data = [uint(epoch), array(1)[difficulty]]
+            if dec.array().ok()? != Some(2) {
+                return None;
+            }
+            let epoch = dec.u64().ok()?;
+            (epoch, 0u64)
+        }
+        1 => {
+            // Main: consensus_data =
+            //   [array(2)[epoch, rel_slot], issuer, array(1)[difficulty], block_sig]
+            if dec.array().ok()? != Some(4) {
+                return None;
+            }
+            if dec.array().ok()? != Some(2) {
+                return None;
+            }
+            let epoch = dec.u64().ok()?;
+            let rel_slot = dec.u64().ok()?;
+            (epoch, rel_slot)
+        }
+        _ => return None,
+    };
+
+    if byron_epoch_length > 0 {
+        Some(
+            epoch
+                .checked_mul(byron_epoch_length)?
+                .checked_add(rel_slot)?,
+        )
+    } else {
+        Some(
+            epoch
+                .checked_mul(MAINNET_BYRON_SLOTS_PER_EPOCH)?
+                .checked_add(rel_slot)?,
+        )
+    }
 }
 
 /// Convert a `dugite_primitives::block::Point` to a network `codec::Point`.
@@ -3516,7 +3673,10 @@ pub async fn chainsync_client_task(
                         // peer to inject an arbitrary slot value into pipeline
                         // scheduling and epoch-boundary logic.  An undecodable header
                         // is a protocol violation → disconnect.
-                        let slot = match extract_slot_from_wrapped_header(&header) {
+                        let slot = match extract_slot_from_wrapped_header(
+                            &header,
+                            byron_epoch_length,
+                        ) {
                             Some(s) => s,
                             None => {
                                 return Err(anyhow::anyhow!(
@@ -3941,8 +4101,8 @@ mod chainsync_task_tests {
     /// Verify extract_slot_from_wrapped_header returns None for invalid CBOR.
     #[test]
     fn test_extract_slot_invalid_cbor() {
-        assert_eq!(extract_slot_from_wrapped_header(&[]), None);
-        assert_eq!(extract_slot_from_wrapped_header(&[0x00]), None);
+        assert_eq!(extract_slot_from_wrapped_header(&[], 0), None);
+        assert_eq!(extract_slot_from_wrapped_header(&[0x00], 0), None);
     }
 
     /// Verifies `should_refill_pipeline` enforces hysteresis-gated
@@ -4168,7 +4328,7 @@ mod chainsync_task_tests {
         enc.tag(minicbor::data::Tag::new(24)).unwrap();
         enc.bytes(&inner_buf).unwrap();
 
-        assert_eq!(extract_slot_from_wrapped_header(&buf), Some(12345));
+        assert_eq!(extract_slot_from_wrapped_header(&buf, 0), Some(12345));
     }
 
     // -----------------------------------------------------------------------
@@ -5255,7 +5415,7 @@ mod additional_sync_tests {
         // signature
         enc.bytes(&[0u8; 64]).unwrap();
 
-        assert_eq!(extract_slot_from_wrapped_header(&buf), Some(77777));
+        assert_eq!(extract_slot_from_wrapped_header(&buf, 0), Some(77777));
     }
 
     /// HFC-wrapped Shelley header: slot extracted from inner bytes.
@@ -5281,22 +5441,166 @@ mod additional_sync_tests {
         enc2.tag(minicbor::data::Tag::new(24)).unwrap();
         enc2.bytes(&inner).unwrap();
 
-        assert_eq!(extract_slot_from_wrapped_header(&outer), Some(54321));
+        assert_eq!(extract_slot_from_wrapped_header(&outer, 0), Some(54321));
     }
 
     /// Empty input returns None (no panic).
     #[test]
     fn extract_slot_empty_returns_none() {
-        assert_eq!(extract_slot_from_wrapped_header(&[]), None);
+        assert_eq!(extract_slot_from_wrapped_header(&[], 0), None);
     }
 
     /// Random garbage returns None (no panic).
     #[test]
     fn extract_slot_garbage_returns_none() {
         assert_eq!(
-            extract_slot_from_wrapped_header(&[0xDE, 0xAD, 0xBE, 0xEF]),
+            extract_slot_from_wrapped_header(&[0xDE, 0xAD, 0xBE, 0xEF], 0),
             None
         );
+    }
+
+    // ── Byron HFC-wrapped header support (issue #613) ────────────────────────
+    //
+    // Real on-wire bytes captured from cardano-node preprod relay
+    // (3.139.241.28:3001) on 2026-05-23.  This is the Byron-genesis EBB at
+    // slot 0 — len=87 — that the post-#539 strict check rejected.
+    const PREPROD_GENESIS_EBB_HFC_WIRE_HEX: &str = "82008282001853d818584c\
+        85015820d4b8de7a11d929a323373cbab6c1a9bdc931beffff11db111cf9d57356ee\
+        19375820afc0da64183bf2664f3d4eec7238d524ba607faeeab24fc100eb861dba69\
+        971b8200810081a0";
+
+    fn hex_decode(s: &str) -> Vec<u8> {
+        let s: String = s.chars().filter(|c| !c.is_whitespace()).collect();
+        let mut out = Vec::with_capacity(s.len() / 2);
+        let bytes = s.as_bytes();
+        let mut i = 0;
+        while i + 1 < bytes.len() {
+            let hi = (bytes[i] as char).to_digit(16).unwrap();
+            let lo = (bytes[i + 1] as char).to_digit(16).unwrap();
+            out.push(((hi << 4) | lo) as u8);
+            i += 2;
+        }
+        out
+    }
+
+    /// Regression for issue #613: the preprod Byron-genesis EBB header
+    /// arrives wrapped as `[0, [[0, size], tag24(bstr(ebb_header))]]`.  The
+    /// extractor MUST decode it (was returning None → all 8 peers
+    /// disconnected within 30 s of preprod from-genesis sync).
+    #[test]
+    fn extract_slot_byron_ebb_genesis_real_wire_ok() {
+        let wire = hex_decode(PREPROD_GENESIS_EBB_HFC_WIRE_HEX);
+        assert_eq!(wire.len(), 87, "captured len differs from observed");
+        // Preprod genesis EBB is at epoch 0 → slot 0 regardless of formula.
+        assert_eq!(extract_slot_from_wrapped_header(&wire, 0), Some(0));
+        // Custom byron_epoch_length (preprod / preview) still gives slot 0.
+        assert_eq!(extract_slot_from_wrapped_header(&wire, 21_600), Some(0));
+    }
+
+    /// Hash MUST match the Byron EBB hash formula
+    /// `blake2b_256([0x82, 0x00, ebb_header])`, not `blake2b_256(wire)`.
+    /// Without this, BlockFetch cannot match the header against the block we
+    /// download.
+    ///
+    /// Cross-checked against a live preprod from-genesis sync after this fix
+    /// landed: block 0 is logged as
+    /// `9ad7ff320c9cf74e0f5ee78d22a85ce42bb0a487d0506bf60cfb5a91ea4497d2`,
+    /// the well-known preprod Byron genesis EBB hash.
+    #[test]
+    fn extract_hash_byron_ebb_real_wire_matches_byron_formula() {
+        use dugite_primitives::hash::blake2b_256;
+        let wire = hex_decode(PREPROD_GENESIS_EBB_HFC_WIRE_HEX);
+
+        const PREPROD_BYRON_GENESIS_EBB_HASH: &str =
+            "9ad7ff320c9cf74e0f5ee78d22a85ce42bb0a487d0506bf60cfb5a91ea4497d2";
+
+        let got = extract_hash_from_header(&wire);
+        let got_hex: String = got.iter().map(|b| format!("{b:02x}")).collect();
+        assert_eq!(got_hex, PREPROD_BYRON_GENESIS_EBB_HASH);
+
+        // Sanity: this is NOT the hash of the wrapper bytes (regression
+        // guard — easy mistake to make).
+        let wrapper_hash = blake2b_256(&wire);
+        let wrapper_arr: [u8; 32] = wrapper_hash.as_ref().try_into().unwrap();
+        assert_ne!(got, wrapper_arr);
+    }
+
+    /// Synthetic Byron main-block header: slot = epoch*epoch_len + rel_slot.
+    #[test]
+    fn extract_slot_byron_main_header_synthetic() {
+        use minicbor::Encoder;
+
+        // Build a Byron main-block header:
+        //   array(5) [magic, prev_hash, body_proof, consensus_data, extra_data]
+        //   consensus_data = [[epoch, rel_slot], issuer_skip, [diff], block_sig_skip]
+        let mut hdr = Vec::new();
+        {
+            let mut e = Encoder::new(&mut hdr);
+            e.array(5).unwrap();
+            e.u64(764824073).unwrap(); // protocol_magic (mainnet)
+            e.bytes(&[0u8; 32]).unwrap(); // prev_hash
+            e.bytes(&[0u8; 32]).unwrap(); // body_proof
+            e.array(4).unwrap(); // consensus_data
+            e.array(2).unwrap();
+            e.u64(7).unwrap(); // epoch
+            e.u64(123).unwrap(); // rel_slot
+            e.bytes(&[0u8; 64]).unwrap(); // issuer
+            e.array(1).unwrap();
+            e.u64(0).unwrap(); // difficulty
+            e.bytes(&[0u8; 64]).unwrap(); // block_sig
+            e.map(0).unwrap(); // extra_data
+        }
+
+        // Wrap as Byron N2N: [0, [[1, size], tag24(bytes(hdr))]]
+        let mut wire = Vec::new();
+        {
+            let mut e = Encoder::new(&mut wire);
+            e.array(2).unwrap();
+            e.u64(0).unwrap(); // era_id Byron
+            e.array(2).unwrap();
+            e.array(2).unwrap();
+            e.u64(1).unwrap(); // isEbb = 1 (main)
+            e.u64(hdr.len() as u64).unwrap(); // size hint
+            e.tag(minicbor::data::Tag::new(24)).unwrap();
+            e.bytes(&hdr).unwrap();
+        }
+
+        // Mainnet formula: 7 * 21600 + 123 = 151323
+        assert_eq!(
+            extract_slot_from_wrapped_header(&wire, 0),
+            Some(7 * 21_600 + 123)
+        );
+        // Custom formula: 7 * 200 + 123 = 1523
+        assert_eq!(
+            extract_slot_from_wrapped_header(&wire, 200),
+            Some(7 * 200 + 123)
+        );
+    }
+
+    /// Reject a malformed `isEbb` discriminator (> 1).
+    #[test]
+    fn extract_slot_byron_invalid_isebb_returns_none() {
+        use minicbor::Encoder;
+        let mut wire = Vec::new();
+        let mut e = Encoder::new(&mut wire);
+        e.array(2).unwrap();
+        e.u64(0).unwrap(); // era_id Byron
+        e.array(2).unwrap();
+        e.array(2).unwrap();
+        e.u64(2).unwrap(); // isEbb = 2 (invalid)
+        e.u64(10).unwrap();
+        e.tag(minicbor::data::Tag::new(24)).unwrap();
+        e.bytes(&[0xff; 4]).unwrap();
+        assert_eq!(extract_slot_from_wrapped_header(&wire, 0), None);
+    }
+
+    /// `unwrap_hfc_header` must NOT match a Byron-wrapped header (its first
+    /// element is an array, not a uint era tag).  Without this guard the
+    /// Shelley+ decode path would mis-fire on Byron wires.
+    #[test]
+    fn unwrap_hfc_header_rejects_byron_wrap() {
+        let wire = hex_decode(PREPROD_GENESIS_EBB_HFC_WIRE_HEX);
+        assert!(unwrap_hfc_header(&wire).is_none());
     }
 }
 
