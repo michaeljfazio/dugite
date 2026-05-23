@@ -110,5 +110,5 @@ echo
 echo "===== Both nodes launched ====="
 echo "Relay log: $RELAY_LOG (PID $RELAY_PID)"
 echo "BP log:    $BP_LOG (wrapper PID $BP_WRAPPER_PID)"
-echo "Dugite metrics: http://localhost:12798/metrics"
+echo "Dugite metrics: http://localhost:12797/metrics"
 echo "Cardano metrics: http://127.0.0.1:12799/metrics"

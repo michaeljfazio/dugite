@@ -32,8 +32,8 @@ SNAPSHOT_INTERVAL=${SNAPSHOT_INTERVAL:-120}    # 2 min
 SYNC_CHECK_INTERVAL=${SYNC_CHECK_INTERVAL:-300} # 5 min
 TX_INTERVAL=${TX_INTERVAL:-1800}               # 30 min
 LOG_TAIL_INTERVAL=${LOG_TAIL_INTERVAL:-60}     # 1 min
-DUGITE_METRICS=${DUGITE_METRICS:-http://localhost:12798/metrics}
-HASKELL_METRICS=${HASKELL_METRICS:-http://127.0.0.1:12797/metrics}
+DUGITE_METRICS=${DUGITE_METRICS:-http://localhost:12797/metrics}
+HASKELL_METRICS=${HASKELL_METRICS:-http://127.0.0.1:12799/metrics}
 KOIOS_BASE=${KOIOS_BASE:-https://preview.koios.rest/api/v1}
 BARE_BP=${BARE_BP:-0}   # set 1 to disable relay-side monitoring (bare-BP mode)
 # Issue #508 absolute tip-age threshold (seconds). Once sync_progress hits

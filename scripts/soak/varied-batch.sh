@@ -32,7 +32,9 @@ trap 'rm -rf "$TMP_DIR"' EXIT
 emit() { printf "[soak-varied] %s\n" "$*"; }
 
 # Current slot + TTL.
-CURRENT_SLOT=$(curl -s --max-time 3 http://localhost:12798/metrics 2>/dev/null \
+# DUGITE_METRICS can be overridden for non-default ports (e.g. BP on 12797).
+DUGITE_METRICS_URL=${DUGITE_METRICS:-http://localhost:12797/metrics}
+CURRENT_SLOT=$(curl -s --max-time 3 "$DUGITE_METRICS_URL" 2>/dev/null \
     | awk '$1=="dugite_slot_number" {print int($2); exit}')
 if [[ -z "${CURRENT_SLOT:-}" || "$CURRENT_SLOT" == "0" ]]; then
     CURRENT_SLOT=$("$CLI" query tip --socket-path "$SOCKET" --testnet-magic $MAGIC 2>/dev/null \
@@ -238,7 +240,7 @@ EOF
 # Mempool peek for any of the submitted txids (best-effort).
 # ------------------------------------------------------------------
 sleep 2
-MEMPOOL_CNT=$(curl -s --max-time 3 http://localhost:12798/metrics 2>/dev/null \
+MEMPOOL_CNT=$(curl -s --max-time 3 "$DUGITE_METRICS_URL" 2>/dev/null \
     | awk '$1=="dugite_mempool_tx_count" {print $2; exit}')
 emit "mempool tx_count after submit=${MEMPOOL_CNT:-?}  submitted_ids=${#SUBMITTED_TXIDS[@]}"
 

@@ -68,7 +68,7 @@ echo "Starting Dugite block producer (mainnet)..."
 echo "Pool keys: $KEY_DIR"
 echo "Database:  ./db-mainnet"
 echo "Socket:    ./node.sock"
-echo "Metrics:   http://localhost:12798/metrics"
+echo "Metrics:   http://localhost:12800/metrics"
 
 if [[ -n "$LOGFILE" ]]; then
     echo "Logging to: $LOGFILE"

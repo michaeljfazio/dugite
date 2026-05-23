@@ -74,6 +74,6 @@ done
 echo
 echo "===== Bare BP launched ====="
 echo "BP log:      $BP_LOG (wrapper PID $BP_WRAPPER_PID)"
-echo "Dugite metrics: http://localhost:12798/metrics"
+echo "Dugite metrics: http://localhost:12797/metrics"
 echo "Topology:    bp-bare-topology.json"
 echo "Peers:       public preview bootstrap + on-chain ledger peers"

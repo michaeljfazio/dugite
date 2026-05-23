@@ -12,7 +12,7 @@ set -uo pipefail
 cd "$(dirname "$0")/../.."
 
 REPORT_LINK="./logs/soak-6h/orchestrator.current.log"
-DUGITE_METRICS=${DUGITE_METRICS:-http://localhost:12798/metrics}
+DUGITE_METRICS=${DUGITE_METRICS:-http://localhost:12797/metrics}
 HASKELL_METRICS=${HASKELL_METRICS:-http://127.0.0.1:12799/metrics}
 
 echo "=== SOAK 6H STATUS ($(date '+%Y-%m-%d %H:%M:%S')) ==="

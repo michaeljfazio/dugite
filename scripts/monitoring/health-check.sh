@@ -5,8 +5,8 @@ set -uo pipefail
 cd "$(dirname "$0")/../.."
 
 CLI="./target/release/dugite-cli"
-DUGITE_METRICS="http://localhost:12798/metrics"
-RELAY_METRICS="http://127.0.0.1:12797/metrics"
+DUGITE_METRICS="http://localhost:12797/metrics"
+RELAY_METRICS="http://127.0.0.1:12799/metrics"
 LOG_DIR="./logs/bp-pair"
 BP_PID_FILE="$LOG_DIR/bp.pid"
 RELAY_PID_FILE="$LOG_DIR/relay.pid"

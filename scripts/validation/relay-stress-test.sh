@@ -13,7 +13,7 @@ SOCKET="./relay.sock"
 MAGIC=2
 ADDR=$(cat ./keys/payment.addr)
 SKEY="./keys/payment.skey"
-RELAY_METRICS="http://localhost:12798/metrics"
+RELAY_METRICS="http://localhost:12796/metrics"
 FEE=180000
 WORK_DIR="/tmp/relay-stress-test"
 

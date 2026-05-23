@@ -6,7 +6,7 @@
 #
 # Ports (non-conflicting with Dugite defaults):
 #   Node listen:       3002   (Dugite uses 3001)
-#   Prometheus legacy: 12799  (Dugite uses 12798)
+#   Prometheus legacy: 12799  (Dugite relay uses 12796; Dugite BP uses 12797)
 #   Prometheus tracer: 12797  (haskell-preview-config.json PrometheusSimple suffix)
 #   Socket:            ./haskell-node.sock
 #
