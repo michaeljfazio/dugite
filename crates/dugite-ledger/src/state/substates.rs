@@ -85,6 +85,12 @@ pub struct EpochSubState {
     pub treasury: Lovelace,
     pub reserves: Lovelace,
     pub pending_reward_update: Option<PendingRewardUpdate>,
+    /// Reward update that was consumed by the most recent epoch-boundary
+    /// handler.  Populated by the boundary handler immediately AFTER it
+    /// `take()`s `pending_reward_update`, so debug dumpers (run AFTER
+    /// `process_epoch_transition`) can still report the just-applied
+    /// rupd.  Never read by ledger logic — feature-gate consumers only.
+    pub last_applied_rupd: Option<PendingRewardUpdate>,
     pub pending_pp_updates: BTreeMap<EpochNo, Vec<(Hash32, ProtocolParamUpdate)>>,
     pub future_pp_updates: BTreeMap<EpochNo, Vec<(Hash32, ProtocolParamUpdate)>>,
     pub needs_stake_rebuild: bool,
