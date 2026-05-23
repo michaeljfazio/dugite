@@ -4052,9 +4052,25 @@ mod tests {
                 let payload_conn = Arc::clone(&payload_srv);
                 let ranges_conn = Arc::clone(&ranges_srv);
                 tokio::spawn(async move {
-                    let mut buf = vec![0u8; 4096];
-                    let n = stream.read(&mut buf).await.unwrap_or(0);
-                    let req = std::str::from_utf8(&buf[..n]).unwrap_or("");
+                    // Read until we have all HTTP headers (ends with \r\n\r\n).
+                    // A single read() can miss the Range header when TCP
+                    // delivers the request in multiple segments on a busy CI.
+                    let mut raw: Vec<u8> = Vec::with_capacity(512);
+                    loop {
+                        let mut tmp = [0u8; 512];
+                        let n = stream.read(&mut tmp).await.unwrap_or(0);
+                        if n == 0 {
+                            break;
+                        }
+                        raw.extend_from_slice(&tmp[..n]);
+                        if raw.windows(4).any(|w| w == b"\r\n\r\n") {
+                            break;
+                        }
+                        if raw.len() > 8192 {
+                            break;
+                        }
+                    }
+                    let req = std::str::from_utf8(&raw).unwrap_or("");
 
                     let is_head = req.starts_with("HEAD ");
                     let range_header = req

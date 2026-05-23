@@ -448,34 +448,35 @@ mod tests {
         let (disk_level_tx, mut disk_level_rx) = watch::channel(DiskSpaceLevel::Ok);
         let ingestion_paused = Arc::new(AtomicBool::new(false));
 
-        // Spawn the monitor on the current directory (always has space)
+        // Spawn the monitor on the current directory.
         let db_path = std::path::PathBuf::from(".");
         let paused_clone = ingestion_paused.clone();
         tokio::spawn(async move {
             start_disk_monitor(db_path, metrics, shutdown_rx, disk_level_tx, paused_clone).await;
         });
 
-        // Wait for the first check to publish a level
+        // Wait for the first check to publish a level.
         tokio::time::timeout(Duration::from_secs(5), disk_level_rx.changed())
             .await
             .expect("timed out waiting for disk level update")
             .expect("watch channel closed unexpectedly");
 
-        // On any dev machine, the level should be Ok (plenty of space)
+        // The disk level is environment-dependent (CI runners may have < 10 GB free).
+        // Assert consistency: pausing only triggers below PAUSE_THRESHOLD_BYTES (1 GB).
+        // Warning (2-10 GB) and Ok (>10 GB) are both well above the pause threshold.
         let level = *disk_level_rx.borrow();
-        assert_eq!(
-            level,
-            DiskSpaceLevel::Ok,
-            "expected Ok disk level on dev machine, got {level:?}"
-        );
+        let paused = ingestion_paused.load(Ordering::Relaxed);
+        match level {
+            DiskSpaceLevel::Ok | DiskSpaceLevel::Warning => {
+                // Both levels have >= 2 GB free — well above the 1 GB pause threshold.
+                assert!(!paused, "ingestion_paused should be false at {level:?} level");
+            }
+            DiskSpaceLevel::Critical | DiskSpaceLevel::Fatal => {
+                // Disk genuinely low in this environment — skip the paused assertion.
+            }
+        }
 
-        // Ingestion should NOT be paused on a healthy dev machine
-        assert!(
-            !ingestion_paused.load(Ordering::Relaxed),
-            "ingestion_paused should be false when disk has plenty of space"
-        );
-
-        // Shutdown the monitor
+        // Shutdown the monitor.
         shutdown_tx.send(true).ok();
     }
 
