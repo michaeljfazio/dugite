@@ -14,6 +14,7 @@ import           Cardano.Ledger.BaseTypes
   ( EpochNo (..), ShelleyBase, Globals (..)
   , mkActiveSlotCoeff, boundRational
   , Network (..), EpochSize (..)
+  , unsafeNonZero
   )
 import           Data.Maybe ( fromJust )
 import           Cardano.Ledger.Core    ( eraProtVerLow )
@@ -70,7 +71,7 @@ dugiteGlobals = Globals
   , slotsPerKESPeriod             = 129600
   , stabilityWindow               = 25920
   , randomnessStabilisationWindow = 25920
-  , securityParameter             = 2160
+  , securityParameter             = unsafeNonZero 2160
   , maxKESEvo                     = 62
   , quorum                        = 5
   , maxLovelaceSupply             = 45_000_000_000_000_000
