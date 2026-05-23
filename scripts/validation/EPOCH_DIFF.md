@@ -124,37 +124,85 @@ The Haskell `cardano-cli debug log-epoch-state` output exposes a
 nested record; the normalizer flattens it to the canonical schema.
 Maintained in `scripts/validation/normalize-epoch-dump.py`.
 
-Known mismatches that the **normalizer must paper over**:
+### cn 11.0.1 emission-shape limitation (issue #612)
 
-- **`nonce.eta_lj`** — Haskell field name is `lastEpochBlockNonce` /
-  `nesPd._labNonce` depending on era; dugite calls it `lab_nonce`.
-- **`scalars.deposits_drep`** — Haskell totals the DRep deposit from
-  `vsDReps.drepDeposit`; dugite sums `governance.dreps[*].deposit`.
-- **`scalars.deposits_proposal`** — Haskell uses `proposalsDeposits`;
-  dugite sums `proposals[*].procedure.deposit`.
-- **`governance.committee_hash`** — *Synthetic*.  Haskell's actual
-  `committeeHash` is the Blake2b of the canonical CBOR of the
-  `Committee` value, which dugite does not currently materialise at
-  dump time.  Both sides therefore emit a SHA3-256 over the same
-  canonical input list (sorted cold-key + hot-key + expiry triples +
-  threshold).  Structural equality holds — i.e. if both sides agree
-  on membership and threshold, the hashes match.  Use the
-  tolerance config to whitelist this field if you only want bit-exact
-  comparisons elsewhere.
-- **`utxo.asset_count`** — counts distinct `(policy_id, asset_name)`
-  occurrences across UTxOs.  Haskell exposes the same total via
-  `utxoStateUtxo` enumeration; the normalizer must walk the same
-  way.  Skippable via `DUGITE_EPOCH_STATE_DUMP_SKIP_ASSETS=1`.
+`cardano-cli debug log-epoch-state` in cardano-node 11.0.1 emits only
+the **`currentEpochState`** subset of `NewEpochState`, plus a small
+sidecar (`rewardUpdate`, `currentEpochBlocks`, `currentStakeDistribution`,
+`priorBlocks`, `currentEpoch`).  The top level looks like:
 
-Fields with **no Haskell equivalent** (set to a sentinel by the
-normalizer, ignored by the diff tool):
-- `pp_future` — dugite emits this best-effort; Haskell only surfaces
-  the *queued* `ProtocolParamUpdate` rather than a full materialised
-  `ProtocolParameters`.
+```
+{
+  "currentEpoch": N,
+  "currentEpochBlocks": { ... },
+  "currentEpochState": {
+    "esChainAccountState": { "reserves", "treasury" },
+    "esLState": {
+      "delegationState": { "dstate": {...}, "pstate": {...} },
+      "utxoState": { "deposited", "fees", "ppups", "stake", "utxo" }
+    },
+    "esNonMyopic": {...},
+    "esSnapshots": { "pstakeMark", "pstakeSet", "pstakeGo", "feeSS" }
+  },
+  "currentStakeDistribution": {...},
+  "priorBlocks": {...},
+  "rewardUpdate": { "deltaT", "deltaR", "deltaF", "rs", "nonMyopic" }
+}
+```
 
-Fields with **no dugite equivalent**:
+There is **no** `chainDepState` (Praos nonce), **no** `utxosGovState`
+(Conway governance), **no** `era` label, and `utxoState.ppups`
+contains Haskell-shape `PParams` that don't line up field-for-field
+with dugite's `ProtocolParameters` serde.
+
+The normalizer projects this subset into canonical form and emits
+`null` for any canonical leaf cn cannot supply.  These nulls are
+matched against `HASKELL_UNCOVERABLE` in the diff tool and reported
+under a separate "Haskell-uncoverable fields" section, **excluded
+from the real-divergence count**.
+
+#### Canonical fields the cn 11.0.1 dump cannot supply
+
+| Canonical path                       | Reason                                                                       |
+| ------------------------------------ | ---------------------------------------------------------------------------- |
+| `nonce.eta_v`                        | Lives on `chainDepState.csProtocol.prtclState.evolvingNonce`, not in dump.   |
+| `nonce.eta_c`                        | `chainDepState.csProtocol.prtclState.candidateNonce`, not in dump.           |
+| `nonce.eta_h`                        | `chainDepState.csTickn.ticknStateEpochNonce`, not in dump.                   |
+| `nonce.eta_lj`                       | `chainDepState.csTickn.ticknStateLastEpochBlockNonce`, not in dump.          |
+| `governance.*` (all subfields)       | cn dump still emits pre-Conway `ppups`, never `utxosGovState`.               |
+| `pp_current`, `pp_previous`, `pp_future` | cn emits camelCase Haskell `PParams`; no field-by-field mapping to dugite's `ProtocolParameters` serde. |
+| `era`                                | Not in cn dump (only `protocol_version.major` is reachable via `ppups.curPParams`). |
+| `scalars.deposits_drep`              | Conway-only; cn dump has no DRep deposit field.                              |
+| `scalars.deposits_proposal`          | Conway-only; cn dump has no proposal-deposit field.                          |
+| `utxo.asset_count`                   | Needs a full UTxO walk; cn dump only stages an empty `utxo: {}` at this point. |
+
+#### Fields the normalizer **can** map (and how)
+
+| Canonical path                        | cn dump source                                                            |
+| ------------------------------------- | ------------------------------------------------------------------------- |
+| `epoch`                               | `currentEpoch`                                                            |
+| `scalars.reserves` / `scalars.treasury` | `currentEpochState.esChainAccountState.{reserves,treasury}`              |
+| `scalars.fees`                        | `currentEpochState.esLState.utxoState.fees`                              |
+| `scalars.deposits_stake`              | `currentEpochState.esLState.utxoState.deposited`                          |
+| `protocol_version.{major,minor}`      | `currentEpochState.esLState.utxoState.ppups.curPParams.protocolVersion.*` |
+| `utxo.count`                          | `len(currentEpochState.esLState.utxoState.utxo)`                          |
+| `stake_snapshot.{mark,set,go}.total_active_stake` | Sum `swdStake` across `esSnapshots.pstake*.activeStake` entries |
+| `stake_snapshot.{mark,set,go}.pool_count`         | `len(esSnapshots.pstake*.stakePoolsSnapShot)`                    |
+| `pools.registered`                    | `len(delegationState.pstate.stakePools)`                                  |
+| `pools.retiring`                      | `len(delegationState.pstate.retiring)`                                    |
+| `rewards.total_distributed`           | Sum `rewardAmount` across `rewardUpdate.rs[*][*].rewardAmount`            |
+
+### Other normalizer notes
+
+- **`governance.committee_hash`** — *Synthetic*.  Even when both
+  sides emit it, the dugite-side value is a SHA3-256 over a
+  canonical input list, not a Blake2b over CBOR `Committee` (which
+  dugite does not materialise at dump time).  The diff tool already
+  demotes this field to `info` severity by default.
+
+### Fields with **no dugite equivalent**
 - (none currently — extend the dugite dumper or the normalizer's
-  "ignored" list when adding new canonical fields.)
+  `HASKELL_UNCOVERABLE` list when adding new canonical fields.)
 
 ---
 
