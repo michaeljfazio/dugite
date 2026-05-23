@@ -64,7 +64,7 @@ For installation, configuration, networks, monitoring, block-producer setup, and
 
 ## Architecture
 
-Dugite is a 14-crate Cargo workspace built on [pallas](https://github.com/txpipe/pallas) 1.0.0-alpha.5 for Cardano wire-format compatibility. Three binaries: `dugite-node` (the node), `dugite-cli` (cardano-cli compatible), `dugite-monitor` and `dugite-config` (TUIs).
+Dugite is a 15-crate Cargo workspace with an in-house multi-era CBOR decoder and UPLC CEK machine for full Cardano wire-format compatibility. Four binaries: `dugite-node` (the node), `dugite-cli` (cardano-cli compatible), `dugite-monitor` and `dugite-config` (TUIs).
 
 ```mermaid
 graph TD
@@ -89,6 +89,7 @@ graph TD
     LEDGER --> CRYPTO
     LEDGER --> SER
     LEDGER --> LSM[dugite-lsm]
+    LEDGER --> UPLC[dugite-uplc]
     STORE --> PRIM
     STORE --> SER
     POOL --> PRIM

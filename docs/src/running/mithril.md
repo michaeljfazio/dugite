@@ -11,7 +11,7 @@ The import process:
 1. Queries the Mithril aggregator for the latest available snapshot
 2. Downloads the snapshot archive (compressed with zstandard)
 3. Extracts the cardano-node chunk files
-4. Parses each block using the pallas CBOR decoder
+4. Parses each block using Dugite's in-house multi-era CBOR decoder
 5. Bulk-imports blocks into Dugite's ImmutableDB (append-only chunk files)
 
 ## Usage

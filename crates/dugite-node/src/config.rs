@@ -258,8 +258,7 @@ pub struct NodeConfig {
     /// `--metrics-port` takes precedence over this field; the CLI flag
     /// `--no-metrics` forces the port to 0 regardless of this value.
     /// If neither the CLI flag nor this field is present the node falls back
-    /// to the Dugite default of 12796 (avoids collision with cardano-node's
-    /// 12798 when both nodes are co-located on the same host).
+    /// to 12798, matching cardano-node's default.
     #[serde(default)]
     pub metrics_port: Option<u16>,
 
@@ -991,7 +990,7 @@ mod tests {
     #[test]
     fn test_default_config_has_no_metrics_port() {
         // When the field is absent from the config file the operator gets None,
-        // and the node binary falls back to the Dugite default of 12796.
+        // and the node binary falls back to 12798 (matching cardano-node's default).
         let config = NodeConfig::default();
         assert!(config.metrics_port.is_none());
     }
@@ -1040,13 +1039,13 @@ mod tests {
     //   1. --no-metrics  → 0
     //   2. --metrics-port → explicit CLI value
     //   3. config MetricsPort → site-wide default from file
-    //   4. 12796 (Dugite default — avoids collision with cardano-node's 12798)
+    //   4. 12798 (matches cardano-node's default)
     //
     // We test the rule table here using plain functions that mirror the
     // logic in run_node() so the tests stay fast and do not require spawning
     // an actual server.
 
-    const DUGITE_DEFAULT_METRICS_PORT: u16 = 12796;
+    const DUGITE_DEFAULT_METRICS_PORT: u16 = 12798;
 
     fn resolve_metrics_port(no_metrics: bool, cli: Option<u16>, config: Option<u16>) -> u16 {
         if no_metrics {
@@ -1075,10 +1074,8 @@ mod tests {
     }
 
     #[test]
-    fn test_resolve_falls_back_to_default_12796() {
-        // Dugite default is 12796, not 12798, to avoid collision with
-        // cardano-node when both are co-located on the same host.
-        assert_eq!(resolve_metrics_port(false, None, None), 12796);
+    fn test_resolve_falls_back_to_default_12798() {
+        assert_eq!(resolve_metrics_port(false, None, None), 12798);
     }
 
     #[test]
@@ -1094,20 +1091,10 @@ mod tests {
     }
 
     #[test]
-    fn test_default_metrics_port_does_not_collide_with_cardano_node() {
-        // cardano-node defaults to 12798. Dugite must default to a different
-        // port so that co-located deployments (dugite-node + cardano-node on
-        // the same host) do not collide.  Port 12796 is dugite's relay default;
-        // 12797 is used for block producers (config/bp-pair/dugite-bp.config.json).
-        const CN_DEFAULT: u16 = 12798;
-        assert_ne!(
-            DUGITE_DEFAULT_METRICS_PORT, CN_DEFAULT,
-            "Dugite default metrics port must not equal cardano-node's 12798"
-        );
-        assert_eq!(
-            DUGITE_DEFAULT_METRICS_PORT, 12796,
-            "Dugite default metrics port must be 12796"
-        );
+    fn test_default_metrics_port_matches_cardano_node() {
+        // Dugite defaults to 12798, matching cardano-node. When co-locating
+        // multiple nodes, operators must assign distinct ports via CLI flags.
+        assert_eq!(DUGITE_DEFAULT_METRICS_PORT, 12798);
     }
 
     // ── DiffusionMode config field ──────────────────────────────────────────

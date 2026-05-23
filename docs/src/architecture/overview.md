@@ -8,7 +8,7 @@ Dugite is organized as a 14-crate Cargo workspace. Each crate has a focused resp
 |-------|-------------|
 | `dugite-primitives` | Core types: hashes, blocks, transactions, addresses, values, protocol parameters (Byron through Conway) |
 | `dugite-crypto` | Ed25519 keys, VRF, KES, text envelope format |
-| `dugite-serialization` | CBOR encoding/decoding for Cardano wire format via pallas |
+| `dugite-serialization` | In-house multi-era CBOR encoding/decoding for Cardano wire format |
 | `dugite-lsm` | Pure Rust LSM-tree engine with WAL, compaction, bloom filters, and snapshots |
 | `dugite-network` | Ouroboros mini-protocols (ChainSync, BlockFetch, TxSubmission, KeepAlive), N2N client/server, N2C server, multi-peer block fetch pool |
 | `dugite-consensus` | Ouroboros Praos, chain selection, epoch transitions, slot leader checks |
@@ -19,6 +19,7 @@ Dugite is organized as a 14-crate Cargo workspace. Each crate has a focused resp
 | `dugite-cli` | cardano-cli compatible CLI (38+ subcommands) |
 | `dugite-monitor` | Terminal monitoring dashboard (ratatui-based, real-time metrics via Prometheus polling) |
 | `dugite-config` | Interactive TUI configuration editor with tree navigation, inline editing, type validation, and diff view |
+| `dugite-uplc` | In-house UPLC CEK machine for Plutus V1/V2/V3 script evaluation |
 | `dugite-integration-tests` | End-to-end integration tests across the workspace |
 
 ## Crate Dependency Graph
@@ -46,6 +47,7 @@ graph TD
     LEDGER --> CRYPTO
     LEDGER --> SER
     LEDGER --> LSM[dugite-lsm]
+    LEDGER --> UPLC[dugite-uplc]
     STORE --> PRIM
     STORE --> SER
     POOL --> PRIM
@@ -55,23 +57,11 @@ graph TD
 
 ## Key Dependencies
 
-Dugite leverages the [pallas](https://github.com/txpipe/pallas) family of crates (v1.0.0-alpha.5) for Cardano wire-format compatibility:
-
-- **pallas-network** — Ouroboros multiplexer and handshake
-- **pallas-codec** — CBOR encoding/decoding
-- **pallas-primitives** — Cardano primitive types
-- **pallas-traverse** — Multi-era block traversal
-- **pallas-crypto** — Cryptographic primitives
-- **pallas-addresses** — Address parsing and construction
-
-Other key dependencies:
-
 - **tokio** — Async runtime
 - **dugite-lsm** — Pure Rust LSM tree for the on-disk UTxO set (UTxO-HD)
 - **minicbor** — CBOR encoding for custom types
 - **ed25519-dalek** — Ed25519 signatures
 - **blake2b_simd** — SIMD-accelerated Blake2b hashing
-- **uplc** — Plutus CEK machine for script evaluation
 - **clap** — CLI argument parsing
 - **tracing** — Structured logging
 
@@ -81,12 +71,12 @@ Other key dependencies:
 
 All code must compile with `RUSTFLAGS="-D warnings"` and pass `cargo clippy --all-targets -- -D warnings`. This is enforced by CI.
 
-### Pallas Interoperability
+### Wire-Format Compatibility
 
-Dugite uses pallas for network protocol handling and block deserialization, ensuring wire-format compatibility with cardano-node. Internal types (in `dugite-primitives`) are converted from pallas types during deserialization.
+Dugite uses an in-house multi-era CBOR decoder (`dugite-serialization`) for all block and transaction deserialization, ensuring exact wire-format compatibility with cardano-node. Internal types (`dugite-primitives`) are populated directly from the decoded CBOR.
 
-Key conversion patterns:
-- `Transaction.hash` is set during deserialization from `pallas tx.hash()`
+Key patterns:
+- `Transaction.hash` is `blake2b_256(raw_body_cbor)` over bytes captured by `KeepRaw::parse_with` during decode
 - `ChainSyncEvent::RollForward` uses `Box<Block>` to avoid large enum variant size
 - Invalid transactions (`is_valid: false`) are skipped during `apply_block`
 - Pool IDs are `Hash28` (Blake2b-224), not `Hash32`

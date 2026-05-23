@@ -43,13 +43,6 @@ These are the primary libraries that Dugite directly depends on:
 
 | Crate | Version | License | Description |
 |-------|---------|---------|-------------|
-| [pallas-codec](https://github.com/txpipe/pallas) | 1.0.0-alpha.5 | Apache-2.0 | Pallas common CBOR encoding interface and utilities |
-| [pallas-crypto](https://github.com/txpipe/pallas) | 1.0.0-alpha.5 | Apache-2.0 | Cryptographic primitives for Cardano |
-| [pallas-primitives](https://github.com/txpipe/pallas) | 1.0.0-alpha.5 | Apache-2.0 | Ledger primitives and cbor codec for the different Cardano eras |
-| [pallas-traverse](https://github.com/txpipe/pallas) | 1.0.0-alpha.5 | Apache-2.0 | Utilities to traverse over multi-era block data |
-| [pallas-addresses](https://github.com/txpipe/pallas) | 1.0.0-alpha.5 | Apache-2.0 | Ergonomic library to work with different Cardano addresses |
-| [pallas-network](https://github.com/txpipe/pallas) | 1.0.0-alpha.5 | Apache-2.0 | Ouroboros networking stack using async IO |
-| [uplc](https://github.com/aiken-lang/aiken) | 1.1.21 | Apache-2.0 | Utilities for working with Untyped Plutus Core |
 | [tokio](https://github.com/tokio-rs/tokio) | 1.50.0 | MIT | An event-driven, non-blocking I/O platform for writing asynchronous I/O
 backe... |
 | [hyper](https://github.com/hyperium/hyper) | 1.8.1 | MIT | A protective and efficient HTTP library for all. |
@@ -279,12 +272,6 @@ Complete list of all third-party crates used by Dugite, sorted alphabetically.
 | [once_cell_polyfill](https://github.com/polyfill-rs/once_cell_polyfill) | 1.70.2 | MIT OR Apache-2.0 |
 | [oorandom](https://hg.sr.ht/~icefox/oorandom) | 11.1.5 | MIT |
 | [opaque-debug](https://github.com/RustCrypto/utils) | 0.3.1 | MIT OR Apache-2.0 |
-| [pallas-addresses](https://github.com/txpipe/pallas) | 1.0.0-alpha.5 | Apache-2.0 |
-| [pallas-codec](https://github.com/txpipe/pallas) | 1.0.0-alpha.5 | Apache-2.0 |
-| [pallas-crypto](https://github.com/txpipe/pallas) | 1.0.0-alpha.5 | Apache-2.0 |
-| [pallas-network](https://github.com/txpipe/pallas) | 1.0.0-alpha.5 | Apache-2.0 |
-| [pallas-primitives](https://github.com/txpipe/pallas) | 1.0.0-alpha.5 | Apache-2.0 |
-| [pallas-traverse](https://github.com/txpipe/pallas) | 1.0.0-alpha.5 | Apache-2.0 |
 | [parking_lot](https://github.com/Amanieu/parking_lot) | 0.12.5 | MIT OR Apache-2.0 |
 | [parking_lot_core](https://github.com/Amanieu/parking_lot) | 0.9.12 | MIT OR Apache-2.0 |
 | [paste](https://github.com/dtolnay/paste) | 1.0.15 | MIT OR Apache-2.0 |
@@ -415,7 +402,6 @@ Complete list of all third-party crates used by Dugite, sorted alphabetically.
 | [unicode-width](https://github.com/unicode-rs/unicode-width) | 0.2.2 | MIT OR Apache-2.0 |
 | [unicode-xid](https://github.com/unicode-rs/unicode-xid) | 0.2.6 | MIT OR Apache-2.0 |
 | [untrusted](https://github.com/briansmith/untrusted) | 0.9.0 | ISC |
-| [uplc](https://github.com/aiken-lang/aiken) | 1.1.21 | Apache-2.0 |
 | [url](https://github.com/servo/rust-url) | 2.5.8 | MIT OR Apache-2.0 |
 | [utf8_iter](https://github.com/hsivonen/utf8_iter) | 1.0.4 | Apache-2.0 OR MIT |
 | [utf8parse](https://github.com/alacritty/vte) | 0.2.2 | Apache-2.0 OR MIT |
