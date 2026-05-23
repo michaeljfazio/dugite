@@ -86,19 +86,43 @@ fn era_id_from_rule(rule: &str) -> u16 {
     }
 }
 
+/// Whether a rule's signal is a transaction CBOR blob.
+///
+/// Rules whose STS `Signal` type is `Tx era` (or a newtype thereof) have
+/// decodable transaction signals.  Rules captured via the ExecSpecRule hook
+/// (ENACT, GOV, GOVCERT) use non-Tx signals and are skipped.
+///
+/// Signal types by rule (Haskell cardano-ledger, 2026-05-23):
+/// - NEWEPOCH → EpochNo (u64) — handled separately
+/// - LEDGER, UTXO, CERT, CERTS, DELEG, POOL, GOVCERT → Tx era
+/// - ENACT → EnactSignal era (not a Tx)
+/// - GOV → Tx era (technically the embedded Tx)
+fn is_tx_signal_rule(rule: &str) -> bool {
+    let upper = rule.to_uppercase();
+    // All these STS rules use Tx era as their Signal type.
+    matches!(true,
+        true if upper.contains("LEDGER")
+            || upper.contains("UTXO")
+            || upper.contains("CERT")   // CERT, CERTS, GOVCERT
+            || upper.contains("DELEG")
+            || upper.contains("POOL")
+            || upper.contains("GOV")    // GOV uses Tx as signal in ImpSpec
+    )
+}
+
 /// Validate `vec` according to its rule and return the outcome.
 ///
-/// The `era_id` used for UTXO tx decoding is derived from the rule name.
+/// The `era_id` used for tx decoding is derived from the rule name prefix.
 pub fn run_vector(vec: &ImpVector) -> RunOutcome {
     let rule = vec.rule.as_str();
 
-    if rule.contains("NEWEPOCH") || rule.contains("NewEpoch") {
+    if rule.to_uppercase().contains("NEWEPOCH") {
         run_newepoch(vec)
-    } else if rule.contains("UTXO") || rule.contains("Utxo") {
-        run_utxo(vec)
+    } else if is_tx_signal_rule(rule) {
+        run_tx_signal(vec)
     } else {
         RunOutcome::Skipped {
-            reason: format!("no handler for rule '{rule}'"),
+            reason: format!("no tx-signal handler for rule '{rule}' (ENACT or unknown)"),
         }
     }
 }
@@ -201,7 +225,7 @@ fn run_newepoch(vec: &ImpVector) -> RunOutcome {
 }
 
 /// Validate a UTXO vector by decoding the signal as a transaction.
-fn run_utxo(vec: &ImpVector) -> RunOutcome {
+fn run_tx_signal(vec: &ImpVector) -> RunOutcome {
     let era_id = era_id_from_rule(&vec.rule);
     match decode_transaction(era_id, &vec.sig_cbor) {
         Ok(_tx) => RunOutcome::UtxoDecoded {
@@ -210,7 +234,8 @@ fn run_utxo(vec: &ImpVector) -> RunOutcome {
         },
         Err(e) => RunOutcome::Failed {
             detail: format!(
-                "UTXO sig tx decode failed (era_id={era_id}, {} bytes): {e}",
+                "tx-signal decode failed (rule={}, era_id={era_id}, {} bytes): {e}",
+                vec.rule,
                 vec.sig_cbor.len()
             ),
         },
