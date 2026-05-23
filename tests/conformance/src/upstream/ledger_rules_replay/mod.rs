@@ -4,53 +4,32 @@
 //! ledger engine and compares the resulting state against the expected state
 //! encoded in each vector directory.
 //!
-//! ## Status — corpus generation is blocked by design
+//! ## Corpus generation: patched ImpSpec (official Haskell test vectors)
 //!
-//! There are currently NO real ImpSpec CBOR vectors.
+//! The corpus is produced by patching the official cardano-ledger ImpSpec
+//! conformance machinery to dump ALL test cases when `CONFORMANCE_CBOR_DUMP_PATH`
+//! is set (not just Haskell/Agda divergences).
 //!
-//! The ImpSpec dump mechanism (`CONFORMANCE_CBOR_DUMP_PATH`) fires ONLY when
-//! the Haskell ledger implementation diverges from the Agda formal spec.
-//! Confirmed by oracle research on SHA `ebed62de1ebcd4b13512418d49d17802a193e2c1`,
-//! function `checkConformance` in
-//! `libs/cardano-ledger-conformance/src/Test/Cardano/Ledger/Conformance/ExecSpecRule/Core.hs`:
+//! Two ImpSpec files are patched by `patch-impspec-core.py`:
 //!
-//! ```haskell
-//! case (implResNorm, agdaResNorm) of
-//!     (Right agda, Right impl)
-//!       | agda == impl -> pure ()   -- MATCH: no dump
-//!     (Left _, Left _) -> pure ()   -- BOTH FAIL: no dump
-//!     (agda, impl) -> do            -- DIVERGENCE ONLY: dump fires
-//!       ...
-//!       CONFORMANCE_CBOR_DUMP_PATH → dumpCbor ...
-//! ```
+//! 1. **`ExecSpecRule/Core.hs` — `testConformance`** (QuickCheck path)
+//!    — captures ENACT, DELEG, GOVCERT, POOL, CERT, CERTS, GOV
 //!
-//! Because the reference implementation at any stable pinned SHA passes all of
-//! its own ImpSpec tests, running `CONFORMANCE_CBOR_DUMP_PATH=/path cabal test
-//! cardano-ledger-conformance` produces ZERO dump files.  ImpSpec is a
-//! divergence detector between Haskell STS and Agda MAlonzo, not a fixture
-//! generator.
+//! 2. **`Imp/Core.hs` — `conformanceHook`** (hook path)
+//!    — captures NEWEPOCH (epoch boundaries) and LEDGER (tx submissions)
 //!
-//! Phase 4 requires a redesigned capture approach.  See `HANDOFF.md` for the
-//! full analysis and alternative options (standalone Haskell generator,
-//! QuickCheck-based generator, Agda/MAlonzo direct invocation, or hand-crafted
-//! vectors).
+//! The inputs come from ImpSpec's constrained-generator framework (authoritative).
+//! The expected outputs (`st_out`) are the Haskell STS results (authoritative).
 //!
-//! ## What IS implemented (ready for real vectors)
-//!
-//! - 4-file vector format: `vector.rs` reads `conformance_dump_{ctx,env,st,sig}.cbor`
-//! - Full NewEpochState structural bridge: `bridge.rs` decodes all 7 fields
-//! - Runner: NEWEPOCH epoch-invariant check + UTXO tx decode
-//! - Synthetic fixture: `ConwayNEWEPOCH/test_minimal_epoch_advance` exercises decode path
-//! - SKIP_LIST: empty (no pending entries — no corpus vectors exist yet)
-//!
-//! ## Vector format (4 files per test-case directory)
+//! ## Vector format (5 files per test-case directory; st_out is optional)
 //!
 //! ```text
 //! <fixtures>/ledger-rules/<Rule>/<test_name>/
-//!   conformance_dump_ctx.cbor   -- ExecContext (`F6` CBOR null for NEWEPOCH — EncCBOR () = encodeNull)
-//!   conformance_dump_env.cbor   -- Environment (`F6` CBOR null for NEWEPOCH — EncCBOR () = encodeNull)
-//!   conformance_dump_st.cbor    -- State (NewEpochState array(7))
-//!   conformance_dump_sig.cbor   -- Signal (u64 EpochNo for NEWEPOCH; tx CBOR for UTXO)
+//!   conformance_dump_ctx.cbor     -- ExecContext (0xF6 CBOR null for NEWEPOCH)
+//!   conformance_dump_env.cbor     -- Environment (0xF6 CBOR null for NEWEPOCH)
+//!   conformance_dump_st.cbor      -- State (NewEpochState array(7))
+//!   conformance_dump_sig.cbor     -- Signal (EpochNo for NEWEPOCH; tx CBOR for LEDGER)
+//!   conformance_dump_st_out.cbor  -- Haskell expected final state (absent when STS rejects)
 //! ```
 //!
 //! Each test-case directory under a rule directory is decoded as one `ImpVector`.
@@ -73,18 +52,11 @@ use std::path::Path;
 ///
 /// ## Current state
 ///
-/// This list is empty because there are no real ImpSpec CBOR vectors yet.
+/// This list is empty — vectors are produced by the patched ImpSpec approach
+/// (`patch-impspec-core.py`) and all current NEWEPOCH/LEDGER tests pass or
+/// are skipped (for rules without a handler).
 ///
-/// The ImpSpec dump mechanism fires ONLY when the Haskell ledger implementation
-/// diverges from the Agda formal spec — which never happens at the pinned SHA
-/// since that SHA is the validated reference implementation.  Running
-/// `CONFORMANCE_CBOR_DUMP_PATH=/path cabal test cardano-ledger-conformance`
-/// produces ZERO dump files.
-///
-/// Phase 4 requires a redesigned capture approach. See `HANDOFF.md` for the
-/// full analysis and product-owner decision required.
-///
-/// When real vectors exist, per-rule entries follow this format:
+/// Per-rule entries follow this format when a divergence is found:
 /// ```
 /// ("ConwayNEWEPOCH", "https://github.com/michaeljfazio/dugite/issues/NNN"),
 /// ```

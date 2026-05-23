@@ -2,7 +2,7 @@
 
 **Date:** 2026-05-23
 **Branch:** `worktree-ledger-state-verification-2026-05-23`
-**Status:** Option A implemented — Haskell fixture generator compiled, CI in progress
+**Status:** Patched ImpSpec approach implemented — CI triggered
 
 ---
 
@@ -14,7 +14,7 @@
 | 1 — Foundation (xtask + manifest + test wiring) | Complete | `cargo xtask download-upstream-fixtures`, UPLC corpus migrated |
 | 2 — CDDL validation | Complete | Conway tx validated against `conway.cddl` |
 | 3 — Typed PParams | Complete | `HaskellPParams<Era>` + `TryFrom` impls |
-| 4 — ImpSpec replay | Infrastructure complete + generator implemented; awaiting first successful CI run | See below |
+| 4 — ImpSpec replay | Patched ImpSpec approach ready; awaiting first CI run | See below |
 | 5 — VRF/KES crypto vectors | Functional | 7 v03 vectors validated, KES property check passes |
 | 6 — Mithril certificate fixtures | Functional | Level 1-3 validation on 4 fixtures |
 
@@ -24,85 +24,65 @@ All CI gates: `cargo nextest run --workspace` passes (6132 tests, 13 skipped).
 
 ## Phase 4 Status
 
-### What changed from the HALT state
+### Design: Patched ImpSpec (official Haskell test vectors)
 
-The Phase 4 halt was caused by the ImpSpec dump mechanism only firing on Haskell/Agda divergences
-(confirmed by oracle research on SHA `ebed62de1ebcd4b13512418d49d17802a193e2c1`). Running
-`CONFORMANCE_CBOR_DUMP_PATH=/path cabal test cardano-ledger-conformance` at any stable SHA
-produces ZERO dump files.
+The Phase 4 design originally assumed ImpSpec would dump CBOR files for all
+test cases. Oracle research confirmed ImpSpec only dumps on Haskell/Agda
+**divergences** — which never happen at a stable pinned SHA.
 
-**Option A (standalone Haskell fixture generator) is now implemented:**
+A custom standalone Haskell generator was considered but rejected: generating
+our own expected outputs doesn't prove conformance if the test scenarios
+aren't from the official suite.
 
-- `tools/ledger-fixture-gen/` — Haskell executable that instantiates `def :: NewEpochState ConwayEra`,
-  applies the Conway NEWEPOCH STS rule via `applySTS`, and writes 5 CBOR files per test case
-- `scripts/regenerate-conformance-corpus/capture-ledger-rules.sh` — clones cardano-ledger at the
-  pinned SHA, installs the generator as a sub-package, builds with cabal (deps auto-resolved from the
-  cardano-ledger workspace), runs the generator
-- `.github/workflows/regenerate-conformance-corpus.yml` — installs GHC 9.6.5 + cabal 3.10.3.0,
-  libsodium, libsecp256k1, libblst (built from source — not in Ubuntu 24.04 apt repos)
+**Current approach: patch the official ImpSpec conformance hooks to dump ALL
+test cases when `CONFORMANCE_CBOR_DUMP_PATH` is set.**
+
+Two ImpSpec files are patched by `scripts/regenerate-conformance-corpus/patch-impspec-core.py`:
+
+1. **`ExecSpecRule/Core.hs` — `testConformance`** (QuickCheck property tests)
+   - Rules captured: ENACT, DELEG, GOVCERT, POOL, CERT, CERTS, GOV
+   - Uses official constrained-generator framework for inputs
+   - Haskell STS result is the authoritative expected output
+
+2. **`Imp/Core.hs` — `conformanceHook`** (hook-based ImpSpec tests)
+   - Rules captured: NEWEPOCH (every epoch boundary), LEDGER (every tx submission)
+   - Inputs are real ImpSpec-generated Cardano states
+   - `st_out` is the Haskell STS post-transition state
 
 ### Vector format (5 files per test-case directory)
 
 ```text
-<fixtures>/ledger-rules/ConwayNEWEPOCH/<test_name>/
-  conformance_dump_ctx.cbor     — CBOR null (0xF6): EncCBOR () = encodeNull
-  conformance_dump_env.cbor     — CBOR null (0xF6): EncCBOR () = encodeNull
-  conformance_dump_st.cbor      — NewEpochState array(7), initial state (before transition)
-  conformance_dump_sig.cbor     — EpochNo (CBOR uint), target epoch signal
-  conformance_dump_st_out.cbor  — NewEpochState array(7), Haskell expected final state
-                                  (omitted if STS rejects the transition: signal <= initial)
+<fixtures>/ledger-rules/<Rule>/<test_name>/
+  conformance_dump_ctx.cbor     — ExecContext (CBOR null 0xF6 for NEWEPOCH)
+  conformance_dump_env.cbor     — Environment (CBOR null 0xF6 for NEWEPOCH)
+  conformance_dump_st.cbor      — initial state (NewEpochState array(7))
+  conformance_dump_sig.cbor     — signal (EpochNo for NEWEPOCH; tx CBOR for LEDGER)
+  conformance_dump_st_out.cbor  — Haskell expected final state (absent when STS rejects)
 ```
-
-`st_out` is optional: our `vector.rs` reads it as `Option<Vec<u8>>`. When present (real Haskell
-vectors), the runner verifies that `st_out.nesEL == signal_epoch`. When absent (synthetic fixture
-or no-op transitions), `final_state_validated = false` in the PASS message.
-
-### Generated test cases (5 total from the Haskell generator)
-
-| Test name | Initial epoch | Signal epoch | STS result |
-|-----------|--------------|--------------|------------|
-| `test_epoch_0_to_1` | 0 | 1 | Advance (st_out present) |
-| `test_epoch_1_to_2` | 1 | 2 | Advance (st_out present) |
-| `test_epoch_4_to_5` | 4 | 5 | Advance (st_out present) |
-| `test_epoch_0_to_100` | 0 | 100 | Advance far (st_out present) |
-| `test_epoch_0_same` | 0 | 0 | No-op (st_out = same state; Rust runner returns Skipped) |
 
 ### Rust runner behavior
 
-- **Advancing transitions** (`signal > initial`): validates epoch invariant + `st_out` epoch if present → PASS
-- **No-op transitions** (`signal <= initial`): returns `Skipped` (valid Haskell no-op, not yet validated)
-- **UTXO rules**: decodes signal as tx CBOR via `dugite_serialization::decode_transaction` → PASS/FAIL
-- **Unknown rules**: `Skipped` (no handler yet)
+- **NEWEPOCH advancing** (`signal_epoch > initial_epoch`): validates epoch invariant
+  + verifies `st_out` final epoch equals signal → PASS
+- **NEWEPOCH no-op** (`signal <= initial_epoch`): → Skipped
+- **LEDGER/UTXO rules**: decodes signal as tx CBOR → PASS/FAIL
+- **Unknown rules** (ENACT, DELEG, etc.): → Skipped (no handler yet)
 
 ---
 
-## Current CI Run State (as of 2026-05-23 ~13:12Z)
+## Key File Index
 
-CI run **26333304437** is in progress on branch `worktree-ledger-state-verification-2026-05-23`
-at commit `646af9c74` (the `unsafeBoundRational` fix — last Haskell compile fix before the `st_out`
-feature was added in `1d1ca810b`).
-
-### Prior CI failures and their fixes
-
-| Run | Duration | Error | Fixed in |
-|-----|----------|-------|---------|
-| 26332108912 | 31s | Script not executable | 42ba1c348 |
-| 26332132126 | 3m | Missing libsodium/libblst | 42ba1c348 |
-| 26332229260 | 24m | NumericUnderscores + import order | 2fdc6a2ac |
-| 26332762741 | 24m | `unsafeBoundRational` not exported | 646af9c74 |
-| **26333304437** | **in progress** | *Should succeed with all fixes applied* | — |
-
-### Expected CI outcome for run 26333304437
-
-The cabal dependency tree is being built now (~15-20 min of the ~40 min total). If successful:
-- `ledger-rules.tar.gz` will be published as a non-stub asset
-- `corpus-manifest.json` will show `"stub": false, "file_count": N` for ledger-rules
-- 4 test cases will be in the corpus (without `st_out` — the 5th-file feature landed in 1d1ca810b)
-
-### Next CI run needed (for full 5-file vectors)
-
-After run 26333304437 succeeds, trigger another run on HEAD (`1d1ca810b`) to get vectors WITH
-`st_out`. Or update manifest.toml to whichever tag 26333304437 produced.
+| File | Role |
+|------|------|
+| `scripts/regenerate-conformance-corpus/patch-impspec-core.py` | Python patch: modifies ExecSpecRule/Core.hs + Imp/Core.hs |
+| `scripts/regenerate-conformance-corpus/capture-ledger-rules.sh` | CI capture: clone → patch → build → run → collect |
+| `.github/workflows/regenerate-conformance-corpus.yml` | CI workflow: GHC 9.6.5 + libblst + cabal cache |
+| `tests/conformance/src/upstream/ledger_rules_replay/mod.rs` | Test runner entry point, SKIP_LIST (currently empty) |
+| `tests/conformance/src/upstream/ledger_rules_replay/vector.rs` | 5-file vector reader (st_out is optional) |
+| `tests/conformance/src/upstream/ledger_rules_replay/runner.rs` | Rule dispatch: NEWEPOCH + UTXO |
+| `tests/conformance/src/upstream/ledger_rules_replay/bridge.rs` | NewEpochState CBOR decoder (all 7 fields) |
+| `tests/conformance/upstream/manifest.toml` | Points to current corpus release tag |
+| `tests/conformance/upstream/sources.toml` | Pinned cardano-ledger SHA (`ebed62de`) |
 
 ---
 
@@ -121,7 +101,7 @@ gh release download <NEW_TAG> --repo michaeljfazio/dugite --pattern corpus-manif
   python3 -c "import sys,json; d=json.load(sys.stdin); lr=d['areas']['ledger-rules']; print('stub:', lr.get('stub'), 'count:', lr.get('file_count'))"
 ```
 
-Should show `stub: False count: N` (N >= 4).
+Should show `stub: False count: N` (N >= 10 expected from NEWEPOCH hooks alone).
 
 ### 3. Update manifest.toml
 
@@ -144,56 +124,40 @@ DUGITE_REQUIRE_UPSTREAM=1 cargo nextest run -p dugite-conformance
 
 ### 6. Process results
 
-If any tests fail:
-- The failure will include the rule name (e.g. `ConwayNEWEPOCH`) and detail
+If any NEWEPOCH or LEDGER tests fail:
+- The failure will include the rule name and detail
 - File a GitHub issue for each failing rule
 - Add to SKIP_LIST in `tests/conformance/src/upstream/ledger_rules_replay/mod.rs`:
   ```rust
-  ("ConwayNEWEPOCH", "https://github.com/michaeljfazio/dugite/issues/NNN"),
+  ("NEWEPOCH", "https://github.com/michaeljfazio/dugite/issues/NNN"),
   ```
 
-If all tests pass: SKIP_LIST stays empty — Phase 4 is complete.
-
-### 7. Trigger a second CI run for 5-file vectors
-
-After first success, trigger:
-```bash
-gh workflow run regenerate-conformance-corpus.yml \
-  --ref worktree-ledger-state-verification-2026-05-23 \
-  --repo michaeljfazio/dugite
-```
-
-This run uses HEAD at `1d1ca810b` which writes `st_out` files. The `st_out` enables the
-`final_state_validated` check in the runner (verifies post-transition epoch matches signal).
+If all tests pass (or only non-handled rules are skipped): SKIP_LIST stays empty.
 
 ---
 
-## Haskell Compilation Notes (for future debugging)
+## ImpSpec Patch Details
 
-All errors surfaced during CI runs at the pinned SHA `ebed62de`:
+### `patch-impspec-core.py` changes to `ExecSpecRule/Core.hs`
 
-1. **NumericUnderscores** — `45_000_000_000_000_000` requires `{-# LANGUAGE NumericUnderscores #-}` in GHC 9.6.5
-2. **Import order** — Haskell imports must precede all top-level definitions (no imports inside `where`)
-3. **`unsafeBoundRational` not exported** — use `fromJust . boundRational` (same pattern as cardano-ledger internals)
-4. **libblst** — not in Ubuntu 24.04 apt repos; must be built from `supranational/blst` v0.3.14
-5. **`data-default` vs `data-default-class`** — the cardano-ledger workspace uses `data-default-class` for `Default`
+- New imports: `Data.IORef`, `System.IO.Unsafe`, `Control.Monad.IO.Class`, `symbolVal`
+- Global counter: `conformanceDumpCounter :: IORef Int`
+- `testConformance` patched: before calling `checkConformance`, dumps 5 files to
+  `$CONFORMANCE_CBOR_DUMP_PATH/<ruleName>/test_<N>/` for every QuickCheck iteration
 
----
+### `patch-impspec-core.py` changes to `Imp/Core.hs`
 
-## Key File Index
+- New imports: `IORef`, `writeCBOR`, `createDirectoryIfMissing`, `lookupEnv`, `System.FilePath`
+- Global counter: `hookDumpCounter :: IORef Int`
+- `conformanceHook` patched: prepends dump block before the existing `impAnn` call.
+  Dumps 5 files for every NEWEPOCH epoch boundary and LEDGER tx submission.
 
-| File | Role |
-|------|------|
-| `tools/ledger-fixture-gen/src/Main.hs` | Haskell generator: def state → applySTS → 5 CBOR files |
-| `tools/ledger-fixture-gen/dugite-fixture-gen.cabal` | Cabal package for the generator |
-| `scripts/regenerate-conformance-corpus/capture-ledger-rules.sh` | CI capture script: clone → install → build → run |
-| `.github/workflows/regenerate-conformance-corpus.yml` | CI workflow: GHC setup + libblst + cabal cache |
-| `tests/conformance/src/upstream/ledger_rules_replay/mod.rs` | Test runner entry point, SKIP_LIST (currently empty) |
-| `tests/conformance/src/upstream/ledger_rules_replay/vector.rs` | 5-file vector reader |
-| `tests/conformance/src/upstream/ledger_rules_replay/runner.rs` | Rule dispatch: NEWEPOCH + UTXO |
-| `tests/conformance/src/upstream/ledger_rules_replay/bridge.rs` | NewEpochState CBOR decoder (all 7 fields) |
-| `tests/conformance/upstream/manifest.toml` | Points to current corpus release tag |
-| `tests/conformance/upstream/sources.toml` | Pinned cardano-ledger SHA (`ebed62de`) |
+### Why the patches work
+
+- `ForAllExecTypes EncCBOR rule era` is part of `ExecSpecRule rule era` — all env/state/signal types have CBOR instances
+- `EncCBOR (ExecContext rule era)` is also required by `ExecSpecRule` — ctx is encodable
+- `eraProtVerLow @era` is available via `Cardano.Ledger.Core`
+- `ImpM t` (the Imp monad) has `MonadIO` — all UnliftIO functions work directly
 
 ---
 
@@ -205,7 +169,7 @@ All errors surfaced during CI runs at the pinned SHA `ebed62de`:
 | `EpochState` | `array(4)` | same file |
 | `LedgerState` | `array(2)` = `[CertState, UTxOState]` | same file |
 | `UTxOState` | `array(6)` = `[utxo_map, deposited, fees, gov_state, instant_stake, donation]` | same file |
-| `SnapShots` | `array(4)` = `[mark, set, go, fee]` (ssStakeMarkPoolDistr NOT serialized) | `libs/cardano-ledger-core/src/Cardano/Ledger/State/SnapShots.hs` |
+| `SnapShots` | `array(4)` = `[mark, set, go, fee]` | `libs/cardano-ledger-core/src/Cardano/Ledger/State/SnapShots.hs` |
 | `NonMyopic` | `array(2)` = `[likelihoods_map, reward_pot]` | `eras/shelley/impl/src/Cardano/Ledger/Shelley/PoolRank.hs` |
 | `EncCBOR ()` | `0xF6` (CBOR null) | `cardano-ledger-binary` — `encodeNull` |
 | `EpochNo` | bare CBOR uint | `Cardano.Ledger.BaseTypes` |

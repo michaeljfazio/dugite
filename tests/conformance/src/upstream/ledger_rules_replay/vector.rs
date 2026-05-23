@@ -1,8 +1,8 @@
 //! CBOR decode for ImpSpec dump vectors.
 //!
-//! The dugite-fixture-gen Haskell generator produces **5 separate CBOR files
-//! per test case directory** (the original 4 ImpSpec files plus the expected
-//! final state):
+//! The patched ImpSpec conformance hooks produce **5 separate CBOR files
+//! per test case directory** (the 4 ImpSpec inputs plus the expected
+//! Haskell final state):
 //!
 //! ```text
 //! conformance_dump_ctx.cbor     — ExecContext  (CBOR null `F6` for NEWEPOCH — EncCBOR () = encodeNull)
