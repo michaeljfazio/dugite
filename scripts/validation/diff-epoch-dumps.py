@@ -8,15 +8,23 @@ Usage:
         --from-epoch 1 --to-epoch 10 \\
         [--tolerance-config tolerance.yaml] \\
         [--report-json report.json] \\
-        [--report-md   report.md]
+        [--report-md   report.md] \\
+        [--strict]
 
 Produces a human-readable report with:
-  - Per-epoch divergence count
+  - Per-epoch divergence count (real divergences only)
   - Top-10 most-divergent fields
   - Class buckets (rewards / governance / stake / utxo / nonce / pp / era)
+  - Separate "Haskell-uncoverable" section for fields cn 11.0.1's
+    `debug log-epoch-state` cannot supply (see EPOCH_DIFF.md and
+    issue #612).
 
-Exit code 0 iff no `severity = high` divergences are flagged after
-tolerance is applied.
+Exit semantics:
+  - Default: exit 0 iff no `severity = high` divergences are flagged.
+    `info` (including all `haskell-uncoverable`) does not fail the
+    run.
+  - `--strict`: exit 0 iff there are no diffs at all of severity
+    `high` or `medium`.  Still ignores `info` / `haskell-uncoverable`.
 """
 
 from __future__ import annotations
@@ -40,6 +48,7 @@ _NORM = importlib.util.module_from_spec(_SPEC)
 _SPEC.loader.exec_module(_NORM)
 normalize_haskell = _NORM.normalize_haskell  # type: ignore[attr-defined]
 normalize_dugite = _NORM.normalize_dugite  # type: ignore[attr-defined]
+is_haskell_uncoverable = _NORM.is_haskell_uncoverable  # type: ignore[attr-defined]
 
 
 # Severity / bucket classification keyed by top-level canonical field.
@@ -142,6 +151,34 @@ def diff_records(
             continue
         if within_tolerance(k, h_val, d_val, tolerance):
             continue
+
+        # Haskell-side null / missing on an uncoverable field →
+        # downgrade to `info` with a tag so the report can bucket
+        # it separately.  Any of three signals indicates "cn cannot
+        # cover this":
+        #   1. The field path (or a prefix of it) is in the
+        #      uncoverable list AND the Haskell value is the `null`
+        #      sentinel emitted by the normalizer.
+        #   2. The field path is in the uncoverable list AND the
+        #      Haskell value is `<MISSING>` because the dugite-side
+        #      walked into a nested dict (e.g. `pp_current.*`) that
+        #      the Haskell side stamped as `None` at the parent.
+        if is_haskell_uncoverable(k) and (
+            h_val is None or h_val == "<MISSING>"
+        ):
+            out.append(
+                {
+                    "epoch": epoch,
+                    "field_path": k,
+                    "haskell_value": h_val,
+                    "dugite_value": d_val,
+                    "bucket": classify(k),
+                    "severity": "info",
+                    "tag": "haskell-uncoverable",
+                }
+            )
+            continue
+
         severity = "high"
         # Demote a few classes to "info" by default: synthetic fields
         # and Haskell-side-missing structural defaults.
@@ -179,50 +216,68 @@ def load_dump(dir_: Path, epoch: int, source: str) -> dict | None:
 # ── Reporting ─────────────────────────────────────────────────────────
 
 
+def _is_uncoverable_record(r: dict) -> bool:
+    return r.get("tag") == "haskell-uncoverable"
+
+
 def render_markdown(records: list[dict], from_e: int, to_e: int) -> str:
-    by_epoch: dict[int, int] = defaultdict(int)
-    by_bucket: dict[str, int] = defaultdict(int)
-    by_field: dict[str, int] = defaultdict(int)
+    # Real divergences = high/medium severity, excluding
+    # haskell-uncoverable.
+    real_by_epoch: dict[int, int] = defaultdict(int)
+    real_by_bucket: dict[str, int] = defaultdict(int)
+    real_by_field: dict[str, int] = defaultdict(int)
+    uncov_by_field: dict[str, int] = defaultdict(int)
+    info_other: int = 0
+
     for r in records:
-        if r["severity"] == "info":
+        if _is_uncoverable_record(r):
+            uncov_by_field[r["field_path"]] += 1
             continue
-        by_epoch[r["epoch"]] += 1
-        by_bucket[r["bucket"]] += 1
-        by_field[r["field_path"]] += 1
+        if r["severity"] == "info":
+            info_other += 1
+            continue
+        real_by_epoch[r["epoch"]] += 1
+        real_by_bucket[r["bucket"]] += 1
+        real_by_field[r["field_path"]] += 1
 
     lines: list[str] = []
     lines.append(f"# Epoch ledger-state diff report (epochs {from_e}..{to_e})")
     lines.append("")
-    lines.append(f"Total non-info divergences: **{sum(by_epoch.values())}**")
+    lines.append(f"Total real divergences: **{sum(real_by_epoch.values())}**")
+    lines.append(
+        f"Total Haskell-uncoverable fields (cn 11.0.1 `log-epoch-state` cannot supply): "
+        f"**{sum(uncov_by_field.values())}**"
+    )
+    lines.append(f"Other info-level diffs: **{info_other}**")
     lines.append("")
-    lines.append("## Per-epoch divergence count")
+    lines.append("## Per-epoch real divergence count")
     lines.append("")
     lines.append("| Epoch | Diffs |")
     lines.append("| ----: | ----: |")
     for e in range(from_e, to_e + 1):
-        lines.append(f"| {e} | {by_epoch.get(e, 0)} |")
+        lines.append(f"| {e} | {real_by_epoch.get(e, 0)} |")
     lines.append("")
-    lines.append("## Top-10 most-divergent fields")
+    lines.append("## Top-10 most-divergent real fields")
     lines.append("")
     lines.append("| Field | Count |")
     lines.append("| --- | ---: |")
-    for field, count in sorted(by_field.items(), key=lambda x: -x[1])[:10]:
+    for field, count in sorted(real_by_field.items(), key=lambda x: -x[1])[:10]:
         lines.append(f"| `{field}` | {count} |")
     lines.append("")
-    lines.append("## Bucket totals")
+    lines.append("## Real-divergence bucket totals")
     lines.append("")
     lines.append("| Bucket | Diffs |")
     lines.append("| --- | ---: |")
-    for bucket, count in sorted(by_bucket.items(), key=lambda x: -x[1]):
+    for bucket, count in sorted(real_by_bucket.items(), key=lambda x: -x[1]):
         lines.append(f"| {bucket} | {count} |")
     lines.append("")
-    lines.append("## Sample divergences (first 50)")
+    lines.append("## Sample real divergences (first 50)")
     lines.append("")
     lines.append("| Epoch | Field | Haskell | Dugite | Bucket |")
     lines.append("| ---: | --- | --- | --- | --- |")
     shown = 0
     for r in records:
-        if r["severity"] == "info":
+        if r["severity"] == "info" or _is_uncoverable_record(r):
             continue
         if shown >= 50:
             break
@@ -237,19 +292,45 @@ def render_markdown(records: list[dict], from_e: int, to_e: int) -> str:
         )
         shown += 1
     lines.append("")
+    lines.append("## Haskell-uncoverable fields (informational)")
+    lines.append("")
+    lines.append(
+        "These canonical fields are emitted as `null` by the Haskell "
+        "normalizer because cn 11.0.1's `cardano-cli debug log-epoch-state` "
+        "outputs only the `currentEpochState` subset of `NewEpochState`. "
+        "They are excluded from the real-divergence count above. See "
+        "[`EPOCH_DIFF.md`](EPOCH_DIFF.md) and issue "
+        "[#612](https://github.com/michaeljfazio/dugite/issues/612) "
+        "for the cn emission-shape limitation."
+    )
+    lines.append("")
+    if uncov_by_field:
+        lines.append("| Field | Occurrences |")
+        lines.append("| --- | ---: |")
+        for field, count in sorted(uncov_by_field.items(), key=lambda x: -x[1]):
+            lines.append(f"| `{field}` | {count} |")
+    else:
+        lines.append("_None encountered in this run._")
+    lines.append("")
     return "\n".join(lines)
 
 
 def render_json(records: list[dict], from_e: int, to_e: int) -> str:
-    by_bucket: Counter[str] = Counter()
+    real_by_bucket: Counter[str] = Counter()
+    uncov_by_field: Counter[str] = Counter()
     for r in records:
+        if _is_uncoverable_record(r):
+            uncov_by_field[r["field_path"]] += 1
+            continue
         if r["severity"] != "info":
-            by_bucket[r["bucket"]] += 1
+            real_by_bucket[r["bucket"]] += 1
     summary = {
         "from_epoch": from_e,
         "to_epoch": to_e,
-        "total_diffs": sum(by_bucket.values()),
-        "by_bucket": dict(by_bucket),
+        "total_diffs": sum(real_by_bucket.values()),
+        "by_bucket": dict(real_by_bucket),
+        "haskell_uncoverable_count": sum(uncov_by_field.values()),
+        "haskell_uncoverable_by_field": dict(uncov_by_field),
         "diffs": records,
     }
     return json.dumps(summary, indent=2)
@@ -272,11 +353,20 @@ def main() -> int:
         action="store_true",
         help="treat missing per-epoch files as a warning rather than an error",
     )
+    ap.add_argument(
+        "--strict",
+        action="store_true",
+        help=(
+            "fail on any non-info divergence; default fails only on "
+            "severity=high.  Both modes ignore haskell-uncoverable "
+            "fields (cn 11.0.1 dump-shape limitation, see #612)."
+        ),
+    )
     args = ap.parse_args()
 
     tolerance = load_tolerance(args.tolerance_config)
     all_diffs: list[dict] = []
-    high_count = 0
+    fail_count = 0
 
     for epoch in range(args.from_epoch, args.to_epoch + 1):
         h = load_dump(args.haskell_dir, epoch, "haskell")
@@ -291,7 +381,13 @@ def main() -> int:
                 return 3
         diffs = diff_records(epoch, h, d, tolerance)
         all_diffs.extend(diffs)
-        high_count += sum(1 for r in diffs if r["severity"] == "high")
+        for r in diffs:
+            if _is_uncoverable_record(r):
+                continue
+            if r["severity"] == "high":
+                fail_count += 1
+            elif args.strict and r["severity"] != "info":
+                fail_count += 1
 
     md = render_markdown(all_diffs, args.from_epoch, args.to_epoch)
     js = render_json(all_diffs, args.from_epoch, args.to_epoch)
@@ -304,7 +400,7 @@ def main() -> int:
     if not args.report_md and not args.report_json:
         print(md)
 
-    return 0 if high_count == 0 else 1
+    return 0 if fail_count == 0 else 1
 
 
 if __name__ == "__main__":
