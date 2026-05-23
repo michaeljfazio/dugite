@@ -1974,7 +1974,7 @@ fn read_protocol_param_update(
     Ok(ppu)
 }
 
-fn read_cost_models(r: &mut Reader<'_>) -> Result<CostModels, SerializationError> {
+pub(crate) fn read_cost_models(r: &mut Reader<'_>) -> Result<CostModels, SerializationError> {
     let mut plutus_v1 = None;
     let mut plutus_v2 = None;
     let mut plutus_v3 = None;
@@ -2002,7 +2002,7 @@ fn read_cost_models(r: &mut Reader<'_>) -> Result<CostModels, SerializationError
     })
 }
 
-fn read_ex_unit_prices(r: &mut Reader<'_>) -> Result<ExUnitPrices, SerializationError> {
+pub(crate) fn read_ex_unit_prices(r: &mut Reader<'_>) -> Result<ExUnitPrices, SerializationError> {
     // ex_unit_prices = [mem_price, step_price] — both are rationals
     let arr_len = r.read_array_header()?;
     if !matches!(arr_len, Some(2)) {
@@ -2024,7 +2024,7 @@ fn read_ex_unit_prices(r: &mut Reader<'_>) -> Result<ExUnitPrices, Serialization
     })
 }
 
-fn read_ex_units(r: &mut Reader<'_>) -> Result<ExUnits, SerializationError> {
+pub(crate) fn read_ex_units(r: &mut Reader<'_>) -> Result<ExUnits, SerializationError> {
     let arr_len = r.read_array_header()?;
     if !matches!(arr_len, Some(2)) {
         return Err(SerializationError::CborDecode(format!(

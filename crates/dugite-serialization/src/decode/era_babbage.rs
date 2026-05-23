@@ -384,6 +384,7 @@ fn decode_babbage_tx_body(r: &mut Reader<'_>) -> Result<TransactionBody, Seriali
     let mut collateral_return: Option<TransactionOutput> = None;
     let mut total_collateral: Option<Lovelace> = None;
     let mut reference_inputs: Vec<TransactionInput> = Vec::new();
+    let mut update: Option<dugite_primitives::transaction::UpdateProposal> = None;
 
     let map_len = r.read_map_header()?;
     let n_entries = match map_len {
@@ -436,7 +437,13 @@ fn decode_babbage_tx_body(r: &mut Reader<'_>) -> Result<TransactionBody, Seriali
                 }
             }
             6 => {
-                r.skip()?; // update proposals
+                // update = [proposed_protocol_parameter_updates, epoch]
+                // Decoded so the boundary handler can apply pre-Conway PPUPs
+                // (Babbage retained the legacy PPUP path until Conway).
+                // See `era_shelley::read_pre_conway_update_proposal` and #624.
+                update = Some(crate::decode::era_shelley::read_pre_conway_update_proposal(
+                    r,
+                )?);
             }
             7 => {
                 auxiliary_data_hash = Some(read_hash32(r)?);
@@ -499,7 +506,7 @@ fn decode_babbage_tx_body(r: &mut Reader<'_>) -> Result<TransactionBody, Seriali
         collateral_return,
         total_collateral,
         reference_inputs,
-        update: None,
+        update,
         voting_procedures: BTreeMap::new(),
         proposal_procedures: Vec::new(),
         treasury_value: None,

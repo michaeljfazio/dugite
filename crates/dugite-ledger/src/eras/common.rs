@@ -562,26 +562,36 @@ pub(crate) fn drain_withdrawal_accounts(tx: &Transaction, certs: &mut CertSubSta
 ///    of `prev_hash` bytes (castHash is a type-level reinterpret, no rehash).
 ///
 /// 4. **epoch_blocks_by_pool** and **epoch_block_count** are incremented.
-///    Block counting respects the overlay schedule: when `d >= 0.8` (federated
-///    era) or in Babbage+ (`d = 0` by definition for proto >= 7), the overlay
-///    parameter controls whether blocks count toward pool rewards.
+///    Block counting follows Haskell `incrBlocks`: a block is counted toward
+///    its pool's `BlocksMade` only when it is NOT an overlay slot — i.e.,
+///    `!isOverlaySlot(firstSlotOfCurrentEpoch, d, blockSlot)`. With `d=0`
+///    every slot is a Praos slot (always counted). With `d=1` every slot is
+///    an overlay slot (never counted toward pool rewards). For intermediate
+///    `d` the schedule alternates per Haskell `step(s) < step(s+1)` where
+///    `step(x) = ⌈x * d_num / d_den⌉`.
 ///
 /// # Parameters
 ///
 /// * `header` -- the block header with VRF output and issuer vkey.
 /// * `block_slot` -- the slot of the block being processed.
-/// * `current_epoch_first_slot_of_next` -- first slot of the next epoch,
-///   used to determine if we are inside the stability window.
+/// * `first_slot_of_current_epoch` -- first slot of the CURRENT epoch
+///   (used by `isOverlaySlot`).
+/// * `first_slot_of_next_epoch` -- first slot of the next epoch
+///   (used to determine if we are inside the stability window).
 /// * `stability_window` -- the number of slots before epoch end where
 ///   candidate_nonce freezes (3k/f for Babbage, 4k/f for Conway+).
-/// * `d_value` -- the decentralization parameter (0.0 for Babbage+).
+/// * `d_num`, `d_den` -- the decentralization parameter `d` as a rational
+///   (`numerator / denominator`). For Babbage+ d is `(0, 1)` by definition.
 /// * `consensus` -- mutable consensus sub-state.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn compute_shelley_nonce(
     header: &BlockHeader,
     block_slot: u64,
+    first_slot_of_current_epoch: u64,
     first_slot_of_next_epoch: u64,
     stability_window: u64,
-    d_value: f64,
+    d_num: u64,
+    d_den: u64,
     consensus: &mut ConsensusSubState,
 ) {
     // Update evolving nonce if nonce_vrf_output is present.
@@ -607,16 +617,47 @@ pub(crate) fn compute_shelley_nonce(
 
     // Track block production by pool (issuer vkey hash).
     //
-    // Matches Haskell's `incrBlocks`: only non-overlay blocks are counted
-    // in BlocksMade. When d >= 0.8 (federated era), blocks should NOT be
-    // counted toward pool rewards.
-    if d_value < 0.8 && !header.issuer_vkey.is_empty() {
+    // Mirrors Haskell `incrBlocks` (eras/shelley/impl/src/Cardano/Ledger/
+    // Shelley/BlockBody/Internal.hs): non-overlay blocks count, overlay
+    // blocks do not.
+    let is_overlay = is_overlay_slot(first_slot_of_current_epoch, block_slot, d_num, d_den);
+    if !is_overlay && !header.issuer_vkey.is_empty() {
         let pool_id = blake2b_224(&header.issuer_vkey);
         *Arc::make_mut(&mut consensus.epoch_blocks_by_pool)
             .entry(pool_id)
             .or_insert(0) += 1;
     }
     consensus.epoch_block_count += 1;
+}
+
+/// Mirrors Haskell `isOverlaySlot` from `libs/cardano-ledger-core/src/Cardano/Ledger/Slot.hs`:
+///
+/// ```haskell
+/// isOverlaySlot firstSlotNo dval slot = step s < step (s + 1)
+///   where
+///     s    = fromIntegral $ slot -* firstSlotNo
+///     d    = unboundRational dval
+///     step x = ceiling (x * d)
+/// ```
+///
+/// Returns `true` when `block_slot` falls in an overlay slot (genesis-delegate
+/// scheduled, not a Praos pool slot). With `d=0` returns `false` for every
+/// slot; with `d=1` returns `true` for every slot.
+pub(crate) fn is_overlay_slot(first_slot: u64, block_slot: u64, d_num: u64, d_den: u64) -> bool {
+    // Fast paths matching Haskell behaviour exactly.
+    if d_num == 0 {
+        return false; // d = 0 → no slot is overlay (pure Praos)
+    }
+    if d_den == 0 || d_num >= d_den {
+        return true; // d ≥ 1 → every slot is overlay (pure federated)
+    }
+    let s = block_slot.saturating_sub(first_slot);
+    // step(x) = ⌈x * d_num / d_den⌉ in integer arithmetic.
+    let step = |x: u64| -> u128 {
+        let num = (x as u128) * (d_num as u128);
+        num.div_ceil(d_den as u128)
+    };
+    step(s) < step(s + 1)
 }
 
 // ============================================================================
@@ -1241,7 +1282,8 @@ mod tests {
 
         let header = make_header(vec![1u8; 64], Hash32::from_bytes([2u8; 32]), vec![3u8; 32]);
 
-        compute_shelley_nonce(&header, 100, 43200, 1000, 0.0, &mut consensus);
+        // d = (0, 1) = full Praos → block IS counted.
+        compute_shelley_nonce(&header, 100, 0, 43200, 1000, 0, 1, &mut consensus);
 
         assert_ne!(consensus.evolving_nonce, initial_evolving);
         assert_eq!(consensus.candidate_nonce, consensus.evolving_nonce);
@@ -1259,7 +1301,7 @@ mod tests {
         let header = make_header(vec![4u8; 64], Hash32::from_bytes([5u8; 32]), vec![6u8; 32]);
 
         // 42500 + 1000 = 43500 >= 43200 -> inside stability window
-        compute_shelley_nonce(&header, 42500, 43200, 1000, 0.0, &mut consensus);
+        compute_shelley_nonce(&header, 42500, 0, 43200, 1000, 0, 1, &mut consensus);
 
         assert_ne!(consensus.evolving_nonce, ZERO32);
         assert_eq!(consensus.candidate_nonce, initial_candidate);
@@ -1271,8 +1313,8 @@ mod tests {
 
         let header = make_header(vec![7u8; 64], Hash32::from_bytes([8u8; 32]), vec![9u8; 32]);
 
-        // d = 0.9 >= 0.8 -> overlay -> pool blocks not counted
-        compute_shelley_nonce(&header, 500, 43200, 1000, 0.9, &mut consensus);
+        // d = (1, 1) = full federated → every slot is overlay → pool blocks NOT counted.
+        compute_shelley_nonce(&header, 500, 0, 43200, 1000, 1, 1, &mut consensus);
 
         assert_eq!(consensus.epoch_block_count, 1);
         assert!(consensus.epoch_blocks_by_pool.is_empty());
@@ -1285,11 +1327,47 @@ mod tests {
 
         let header = make_header(vec![], Hash32::from_bytes([10u8; 32]), vec![]);
 
-        compute_shelley_nonce(&header, 100, 43200, 1000, 0.0, &mut consensus);
+        compute_shelley_nonce(&header, 100, 0, 43200, 1000, 0, 1, &mut consensus);
 
         assert_eq!(consensus.evolving_nonce, initial_evolving);
         assert_eq!(consensus.lab_nonce, header.prev_hash);
         assert_eq!(consensus.epoch_block_count, 1);
+    }
+
+    #[test]
+    fn test_is_overlay_slot_d_zero_never_overlay() {
+        // d = 0 → every slot is non-overlay (Praos).
+        for slot in [0u64, 1, 10, 100, 1000, 21600] {
+            assert!(
+                !is_overlay_slot(0, slot, 0, 1),
+                "slot {slot} should not be overlay at d=0"
+            );
+        }
+    }
+
+    #[test]
+    fn test_is_overlay_slot_d_one_always_overlay() {
+        // d = 1 → every slot is overlay (federated).
+        for slot in [0u64, 1, 10, 100, 1000, 21600] {
+            assert!(
+                is_overlay_slot(0, slot, 1, 1),
+                "slot {slot} should be overlay at d=1"
+            );
+        }
+    }
+
+    #[test]
+    fn test_is_overlay_slot_d_half_alternates_correctly() {
+        // d = 1/2 → matches Haskell `step(s) < step(s+1)` where
+        // step(x) = ⌈x/2⌉. Sequence step(0..5) = 0,1,1,2,2,3 → overlay at
+        // s where step(s) < step(s+1): s=0 (0<1), s=2 (1<2), s=4 (2<3), …
+        let d_num = 1;
+        let d_den = 2;
+        let expected = [true, false, true, false, true, false];
+        for (i, &want) in expected.iter().enumerate() {
+            let got = is_overlay_slot(0, i as u64, d_num, d_den);
+            assert_eq!(got, want, "slot {i} d=1/2 expected overlay={want}");
+        }
     }
 
     // -----------------------------------------------------------------------

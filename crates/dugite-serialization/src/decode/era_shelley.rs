@@ -79,7 +79,8 @@
 //! Both Full and Minimal modes are supported. In Minimal mode, the witness set is
 //! skipped entirely (empty `TransactionWitnessSet`). Auxiliary data is always parsed.
 
-use crate::decode::helpers::{read_hash32, read_lovelace};
+use crate::decode::era_conway::{read_cost_models, read_ex_unit_prices, read_ex_units};
+use crate::decode::helpers::{read_hash28, read_hash32, read_lovelace};
 use crate::decode::raw::KeepRaw;
 use crate::decode::reader::Reader;
 use crate::error::SerializationError;
@@ -91,8 +92,9 @@ use dugite_primitives::hash::{blake2b_256, Hash28, Hash32};
 use dugite_primitives::time::{BlockNo, SlotNo};
 use dugite_primitives::transaction::{
     AuxiliaryData, BootstrapWitness, Certificate, MIRSource, MIRTarget, NativeScript, OutputDatum,
-    PoolMetadata, PoolParams, Rational, Transaction, TransactionBody, TransactionInput,
-    TransactionMetadatum, TransactionOutput, TransactionWitnessSet, VKeyWitness,
+    PoolMetadata, PoolParams, ProtocolParamUpdate, Rational, Transaction, TransactionBody,
+    TransactionInput, TransactionMetadatum, TransactionOutput, TransactionWitnessSet,
+    UpdateProposal, VKeyWitness,
 };
 use dugite_primitives::value::{AssetName, Lovelace, Value};
 use minicbor::data::Type;
@@ -433,9 +435,15 @@ fn decode_shelley_tx_body(r: &mut Reader<'_>) -> Result<TransactionBody, Seriali
                 withdrawals = read_withdrawals(r)?;
             }
             6 => {
-                // update proposals — skip for Shelley compatibility
-                r.skip()?;
-                update = None; // TODO(M4a-2): decode Shelley update proposals if needed
+                // update = [ proposed_protocol_parameter_updates, epoch ]
+                // Decoded so the boundary handler can apply pre-Conway PPUPs
+                // (Shelley-Babbage). Without this, the d=0 PPUP that takes
+                // preview's d from 1→0 at boundary 1→2 is silently dropped,
+                // and every subsequent reward calculation is wrong because
+                // `isOverlaySlot` returns true for every slot under d=1
+                // → no blocks ever attribute to pools → bprev=0 at every
+                // boundary. Tracked as issue #624 (root cause of #621).
+                update = Some(read_pre_conway_update_proposal(r)?);
             }
             7 => {
                 // auxiliary_data_hash
@@ -1177,6 +1185,165 @@ pub(crate) fn decode_shelley_tx_standalone(cbor: &[u8]) -> Result<Transaction, S
 }
 
 // ============================================================================
+// Pre-Conway PPUP decoder (shared with Alonzo, Babbage; Allegra/Mary inherit
+// via decode_alonzo_family_block which now also wires it up)
+// ============================================================================
+
+/// Decode a pre-Conway `update` field from a tx body:
+///
+/// ```text
+/// update = [ proposed_protocol_parameter_updates, epoch ]
+/// proposed_protocol_parameter_updates = { * genesishash => protocol_param_update }
+/// ```
+///
+/// `genesishash` is a 28-byte blake2b_224 hash of a genesis delegate's vkey.
+/// We pad to 32 bytes via [`Hash28::to_hash32_padded`] for storage as
+/// `Hash32` in `UpdateProposal::proposed_updates`.
+pub(crate) fn read_pre_conway_update_proposal(
+    r: &mut Reader<'_>,
+) -> Result<UpdateProposal, SerializationError> {
+    let arr_len = r.read_array_header()?;
+    if !matches!(arr_len, Some(2)) {
+        return Err(SerializationError::CborDecode(format!(
+            "pre-conway update: expected array(2), got {arr_len:?}"
+        )));
+    }
+    let proposed_updates = r.read_map(
+        |r| {
+            let h28 = read_hash28(r)?;
+            Ok(h28.to_hash32_padded())
+        },
+        read_pre_conway_protocol_param_update,
+    )?;
+    let epoch = r.read_uint()?;
+    Ok(UpdateProposal {
+        proposed_updates,
+        epoch,
+    })
+}
+
+/// Decode a pre-Conway `protocol_param_update` map covering the union of
+/// Shelley/Allegra/Mary/Alonzo/Babbage key sets (keys 0–24).
+///
+/// Cross-referenced against Haskell:
+///   `eras/shelley/impl/src/Cardano/Ledger/Shelley/PParams.hs`
+///   `eras/alonzo/impl/src/Cardano/Ledger/Alonzo/PParams.hs`
+///   `eras/babbage/impl/src/Cardano/Ledger/Babbage/PParams.hs`
+///
+/// Keys:
+/// - 0: minfee A (uint)
+/// - 1: minfee B (uint)
+/// - 2: max block body size (uint)
+/// - 3: max tx size (uint)
+/// - 4: max block header size (uint)
+/// - 5: key deposit (coin)
+/// - 6: pool deposit (coin)
+/// - 7: e_max (uint)
+/// - 8: n_opt (uint)
+/// - 9: a0 (nonnegative_interval = tag 30 rational)
+/// - 10: rho (unit_interval = tag 30 rational)
+/// - 11: tau (unit_interval = tag 30 rational)
+/// - 12: d (unit_interval = tag 30 rational) — Shelley-Alonzo
+/// - 13: extra_entropy (nonce) — currently skipped (deprecated in Babbage+)
+/// - 14: [protocol_version_major, protocol_version_minor]
+/// - 15: min_utxo_value (coin) — Shelley-Mary only, skipped (legacy)
+/// - 16: min pool cost (coin) — Alonzo+
+/// - 17: ada per utxo word (Alonzo) / coins per utxo byte (Babbage) — same wire shape
+/// - 18: cost models
+/// - 19: ex unit prices
+/// - 20: max tx ex units
+/// - 21: max block ex units
+/// - 22: max value size (uint)
+/// - 23: collateral percentage (uint)
+/// - 24: max collateral inputs (uint)
+///
+/// Unknown keys are skipped (forward compatibility).
+pub(crate) fn read_pre_conway_protocol_param_update(
+    r: &mut Reader<'_>,
+) -> Result<ProtocolParamUpdate, SerializationError> {
+    let mut ppu = ProtocolParamUpdate::default();
+    let map_len = r.read_map_header()?;
+    let n = map_len.unwrap_or(0) as usize;
+    for _ in 0..n {
+        let key = r.read_uint()?;
+        match key {
+            0 => ppu.min_fee_a = Some(r.read_uint()?),
+            1 => ppu.min_fee_b = Some(r.read_uint()?),
+            2 => ppu.max_block_body_size = Some(r.read_uint()?),
+            3 => ppu.max_tx_size = Some(r.read_uint()?),
+            4 => ppu.max_block_header_size = Some(r.read_uint()?),
+            5 => ppu.key_deposit = Some(read_lovelace(r)?),
+            6 => ppu.pool_deposit = Some(read_lovelace(r)?),
+            7 => ppu.e_max = Some(r.read_uint()?),
+            8 => ppu.n_opt = Some(r.read_uint()?),
+            9 => {
+                let rat = r.read_rational()?;
+                ppu.a0 = Some(Rational {
+                    numerator: rat.numerator,
+                    denominator: rat.denominator,
+                });
+            }
+            10 => {
+                let rat = r.read_rational()?;
+                ppu.rho = Some(Rational {
+                    numerator: rat.numerator,
+                    denominator: rat.denominator,
+                });
+            }
+            11 => {
+                let rat = r.read_rational()?;
+                ppu.tau = Some(Rational {
+                    numerator: rat.numerator,
+                    denominator: rat.denominator,
+                });
+            }
+            12 => {
+                let rat = r.read_rational()?;
+                ppu.d = Some(Rational {
+                    numerator: rat.numerator,
+                    denominator: rat.denominator,
+                });
+            }
+            13 => {
+                // extra_entropy (nonce): not tracked by dugite (deprecated
+                // Babbage onward and never observed materially affecting
+                // ledger state).
+                r.skip()?;
+            }
+            14 => {
+                // [protocol_version_major, protocol_version_minor]
+                let arr_len = r.read_array_header()?;
+                if !matches!(arr_len, Some(2)) {
+                    return Err(SerializationError::CborDecode(format!(
+                        "protocol_version: expected array(2), got {arr_len:?}"
+                    )));
+                }
+                ppu.protocol_version_major = Some(r.read_uint()?);
+                ppu.protocol_version_minor = Some(r.read_uint()?);
+            }
+            15 => {
+                // min_utxo_value (Shelley-Mary only) — not stored by dugite
+                // (replaced by ada_per_utxo_byte in Alonzo+).
+                r.skip()?;
+            }
+            16 => ppu.min_pool_cost = Some(read_lovelace(r)?),
+            17 => ppu.ada_per_utxo_byte = Some(read_lovelace(r)?),
+            18 => ppu.cost_models = Some(read_cost_models(r)?),
+            19 => ppu.execution_costs = Some(read_ex_unit_prices(r)?),
+            20 => ppu.max_tx_ex_units = Some(read_ex_units(r)?),
+            21 => ppu.max_block_ex_units = Some(read_ex_units(r)?),
+            22 => ppu.max_val_size = Some(r.read_uint()?),
+            23 => ppu.collateral_percentage = Some(r.read_uint()?),
+            24 => ppu.max_collateral_inputs = Some(r.read_uint()?),
+            _ => {
+                r.skip()?;
+            }
+        }
+    }
+    Ok(ppu)
+}
+
+// ============================================================================
 // Tests
 // ============================================================================
 
@@ -1750,13 +1917,61 @@ mod tests {
     }
 
     #[test]
-    fn shelley_body_key_6_update_proposal_skipped() {
-        // key 6 = update proposals (just skip)
+    fn shelley_body_key_6_update_proposal_empty() {
+        // key 6 = update = [ { } , 0 ] — empty proposal map targeting epoch 0.
+        // After #624 we decode this rather than skip; the result is a
+        // Some(UpdateProposal{ proposed_updates: [], epoch: 0 }).
         let mut extra = Vec::new();
         extra.extend(cbor_uint(6));
-        extra.push(0xa0); // empty map placeholder for update
+        extra.push(0x82); // array(2)
+        extra.push(0xa0); // empty map (proposed_updates)
+        extra.push(0x00); // uint 0 (target epoch)
         let block = decode_shelley_block(&shelley_block_with_tx_body(&extra, 1)).unwrap();
-        assert!(block.transactions[0].body.update.is_none());
+        let up = block.transactions[0]
+            .body
+            .update
+            .as_ref()
+            .expect("update set");
+        assert_eq!(up.proposed_updates.len(), 0);
+        assert_eq!(up.epoch, 0);
+    }
+
+    #[test]
+    fn shelley_body_key_6_update_proposal_with_d_zero() {
+        // Real-shape PPUP: one genesis delegate proposes { d: 0/1 } for epoch 2.
+        //   update = [ { delegate_hash(28) => { 12: tag30 [0, 1] } }, 2 ]
+        let mut extra = Vec::new();
+        extra.extend(cbor_uint(6));
+        extra.push(0x82); // array(2)
+                          // proposed_updates: map of 1 entry
+        extra.push(0xa1); // map(1)
+                          // key: 28-byte hash (genesis delegate cold key hash)
+        extra.push(0x58); // bytes(uint8 length)
+        extra.push(28);
+        extra.extend([0xaau8; 28]);
+        // value: param_update map with key 12 → tag30 [0,1]
+        extra.push(0xa1); // map(1)
+        extra.push(0x0c); // uint 12
+        extra.push(0xd8); // tag prefix (2-byte form)
+        extra.push(30); // tag 30
+        extra.push(0x82); // array(2)
+        extra.push(0x00); // 0
+        extra.push(0x01); // 1
+                          // target epoch
+        extra.push(0x02);
+
+        let block = decode_shelley_block(&shelley_block_with_tx_body(&extra, 1)).unwrap();
+        let up = block.transactions[0]
+            .body
+            .update
+            .as_ref()
+            .expect("update set");
+        assert_eq!(up.epoch, 2);
+        assert_eq!(up.proposed_updates.len(), 1);
+        let (_hash, ppu) = &up.proposed_updates[0];
+        let d = ppu.d.as_ref().expect("d set");
+        assert_eq!(d.numerator, 0);
+        assert_eq!(d.denominator, 1);
     }
 
     #[test]

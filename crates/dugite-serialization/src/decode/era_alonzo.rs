@@ -62,6 +62,7 @@
 //! `tx_index` in the tx_bodies/witnesses arrays has `is_valid = false`:
 //! its collateral inputs are consumed; regular inputs/outputs are skipped.
 
+use crate::decode::era_shelley::read_pre_conway_update_proposal;
 use crate::decode::helpers::{read_hash28, read_hash32, read_lovelace, read_network_id};
 use crate::decode::raw::KeepRaw;
 use crate::decode::reader::Reader;
@@ -384,6 +385,7 @@ pub(crate) fn decode_alonzo_tx_body(
     let mut collateral: Vec<TransactionInput> = Vec::new();
     let mut required_signers: Vec<Hash32> = Vec::new();
     let mut network_id: Option<u8> = None;
+    let mut update: Option<dugite_primitives::transaction::UpdateProposal> = None;
 
     let map_len = r.read_map_header()?;
     let n_entries = match map_len {
@@ -426,8 +428,10 @@ pub(crate) fn decode_alonzo_tx_body(
                 withdrawals = read_withdrawals(r)?;
             }
             6 => {
-                // Update proposals — skip
-                r.skip()?;
+                // update = [proposed_protocol_parameter_updates, epoch]
+                // Decoded so the boundary handler can apply pre-Conway PPUPs.
+                // See `era_shelley::read_pre_conway_update_proposal` and #624.
+                update = Some(read_pre_conway_update_proposal(r)?);
             }
             7 => {
                 auxiliary_data_hash = Some(read_hash32(r)?);
@@ -482,7 +486,7 @@ pub(crate) fn decode_alonzo_tx_body(
         collateral_return: None,      // Babbage+
         total_collateral: None,       // Babbage+
         reference_inputs: Vec::new(), // Babbage+
-        update: None,
+        update,
         voting_procedures: BTreeMap::new(), // Conway+
         proposal_procedures: Vec::new(),    // Conway+
         treasury_value: None,

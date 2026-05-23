@@ -754,25 +754,25 @@ impl EraRules for ConwayRules {
         ctx: &RuleContext,
         consensus: &mut ConsensusSubState,
     ) {
-        let first_slot_of_next_epoch = ctx
+        let first_slot_of_current_epoch = ctx
             .current_epoch
             .0
-            .saturating_add(1)
             .saturating_mul(ctx.epoch_length)
             .saturating_add(
                 ctx.shelley_transition_epoch
                     .saturating_mul(ctx.byron_epoch_length),
             );
+        let first_slot_of_next_epoch = first_slot_of_current_epoch.saturating_add(ctx.epoch_length);
 
-        // Conway (proto >= 9): d is always 0 (fully decentralized).
-        let d_value = 0.0;
-
+        // Conway (proto >= 9): d is always (0, 1) (fully decentralized).
         common::compute_shelley_nonce(
             header,
             ctx.current_slot,
+            first_slot_of_current_epoch,
             first_slot_of_next_epoch,
             ctx.stability_window,
-            d_value,
+            0u64,
+            1u64,
             consensus,
         );
     }
