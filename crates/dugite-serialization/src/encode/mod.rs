@@ -235,6 +235,7 @@ mod tests {
             sub_transactions: vec![],
             account_balance_intervals: vec![],
             direct_deposits: BTreeMap::new(),
+            guards: Vec::new(),
         };
 
         let encoded = encode_transaction_body(&body);
@@ -281,6 +282,7 @@ mod tests {
             sub_transactions: vec![],
             account_balance_intervals: vec![],
             direct_deposits: BTreeMap::new(),
+            guards: Vec::new(),
         };
 
         // Hash should be deterministic
@@ -333,6 +335,7 @@ mod tests {
                 sub_transactions: vec![],
                 account_balance_intervals: vec![],
                 direct_deposits: BTreeMap::new(),
+                guards: Vec::new(),
             },
             witness_set: TransactionWitnessSet {
                 vkey_witnesses: vec![],

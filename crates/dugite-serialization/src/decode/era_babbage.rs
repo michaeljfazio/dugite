@@ -510,6 +510,7 @@ fn decode_babbage_tx_body(r: &mut Reader<'_>) -> Result<TransactionBody, Seriali
         sub_transactions: Vec::new(),
         account_balance_intervals: Vec::new(),
         direct_deposits: BTreeMap::new(),
+        guards: Vec::new(), // Dijkstra+
     })
 }
 

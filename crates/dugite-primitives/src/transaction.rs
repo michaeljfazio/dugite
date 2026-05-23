@@ -100,6 +100,24 @@ pub enum NativeScript {
     ScriptNOfK(u32, Vec<NativeScript>),
     InvalidBefore(SlotNo),
     InvalidHereafter(SlotNo),
+    /// Dijkstra (PV12+) only: native-script tag 6 `RequireGuard` —
+    /// composes a credential-based guard inside a native script.
+    ///
+    /// Wire shape (per `Cardano.Ledger.Dijkstra.Scripts.DijkstraRequireGuard`):
+    /// `array(2) [uint 6, credential]` where `credential` is the standard
+    /// `[type, hash28]` Conway encoding (0 = key-hash, 1 = script-hash).
+    ///
+    /// Semantics: this script succeeds iff the named credential is satisfied
+    /// by the surrounding tx — either by a matching vkey signature in the
+    /// witness set (for `Credential::VerificationKey`) or by a matching
+    /// script invocation in the witness set (for `Credential::Script`).
+    /// It is the script-level analogue of TxBody key 14 (`guards`) and is
+    /// only valid in Dijkstra+ era native scripts.
+    ///
+    /// See issue #475 Phase 3.5 / cardano-ledger
+    /// `eras/dijkstra/impl/src/Cardano/Ledger/Dijkstra/Scripts.hs`
+    /// (`DijkstraRequireGuard` constructor, `Sum 6`).
+    RequireGuard(Credential),
 }
 
 /// Plutus data (arbitrary structured data for smart contracts).
@@ -126,6 +144,15 @@ pub enum RedeemerTag {
     Reward,
     Vote,
     Propose,
+    /// Dijkstra (PV12+) only: redeemer tag 6 `Guarding`.
+    ///
+    /// Tags a Plutus script invocation whose purpose is to satisfy a
+    /// credential-based guard from TxBody key 14 (`guards`). Per
+    /// `Cardano.Ledger.Dijkstra.Scripts.DijkstraPlutusPurpose`
+    /// (`DijkstraGuarding`, `Sum 6`).
+    ///
+    /// See issue #475 Phase 3.5.
+    Guarding,
 }
 
 /// Redeemer for Plutus script execution
@@ -737,6 +764,7 @@ impl Transaction {
                 sub_transactions: vec![],
                 account_balance_intervals: vec![],
                 direct_deposits: BTreeMap::new(),
+                guards: vec![],
             },
             witness_set: TransactionWitnessSet {
                 vkey_witnesses: vec![],
@@ -839,6 +867,31 @@ pub struct TransactionBody {
     /// and `Cardano/Ledger/Dijkstra/Rules.hs` (UTXOS).
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub direct_deposits: BTreeMap<Vec<u8>, Lovelace>,
+    /// Dijkstra (PV12+) only: credential-based guards (TxBody key 14).
+    ///
+    /// In Conway, key 14 was `required_signers: set<addr_keyhash>` —
+    /// 28-byte key hashes only. In Dijkstra the same key index is
+    /// **semantically upgraded** to `guards: OSet (Credential Guard)` per
+    /// `eras/dijkstra/impl/src/Cardano/Ledger/Dijkstra/TxBody.hs`. Each
+    /// guard is a stake [`Credential`] (key-hash or script-hash) that the
+    /// tx must additionally satisfy, and is checked through the new
+    /// Dijkstra witness rule (see `dugite_ledger::eras::dijkstra`).
+    ///
+    /// Backward compatibility: upstream's `decodeGuards` accepts BOTH the
+    /// bare 28-byte key-hash form (legacy Conway shape) and the full
+    /// `[type, hash28]` credential form. The bare form decodes to
+    /// `Credential::VerificationKey`. Our decoder mirrors this so Dijkstra
+    /// tx bodies that carry only key-hash guards round-trip cleanly.
+    ///
+    /// `required_signers` on this struct is preserved as the in-memory
+    /// projection of the *legacy* key-hash subset — it stays populated on
+    /// pre-Dijkstra era txs and on Dijkstra txs whose guards happen to be
+    /// all key-hashes, so downstream consumers (CLI, mempool, witness
+    /// builder) keep working without era branching.
+    ///
+    /// See issue #475 Phase 3.5.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub guards: Vec<Credential>,
 }
 
 impl Default for TransactionBody {
@@ -868,6 +921,7 @@ impl Default for TransactionBody {
             sub_transactions: Vec::new(),
             account_balance_intervals: Vec::new(),
             direct_deposits: BTreeMap::new(),
+            guards: Vec::new(),
         }
     }
 }

@@ -288,6 +288,7 @@ fn decode_byron_tx(
         sub_transactions: Vec::new(),
         account_balance_intervals: Vec::new(),
         direct_deposits: BTreeMap::new(),
+        guards: Vec::new(), // Dijkstra+
     };
 
     Ok(Transaction {

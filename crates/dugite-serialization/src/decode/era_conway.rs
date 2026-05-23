@@ -432,6 +432,20 @@ fn decode_conway_tx_body(r: &mut Reader<'_>) -> Result<TransactionBody, Serializ
     let mut script_data_hash: Option<Hash32> = None;
     let mut collateral: Vec<TransactionInput> = Vec::new();
     let mut required_signers: Vec<Hash32> = Vec::new();
+    // Dijkstra TxBody key 14 — guards (issue #475 Phase 3.5).
+    //
+    // Conway:  key 14 = required_signers : set<addr_keyhash>
+    // Dijkstra: key 14 = guards          : OSet (Credential Guard)
+    //
+    // The decoder accepts both wire shapes per upstream's `decodeGuards`:
+    // - bare bstr(28)               -> Credential::VerificationKey (legacy)
+    // - array(2) [type, hash28]     -> full Credential (Dijkstra)
+    //
+    // `required_signers` is still populated with the key-hash subset so all
+    // Conway-era consumers (CLI tx builder, mempool, witness validator)
+    // keep working unchanged. The full credential list is surfaced through
+    // `TransactionBody.guards` for Dijkstra+ era validation.
+    let mut guards: Vec<Credential> = Vec::new();
     let mut network_id: Option<u8> = None;
     let mut collateral_return: Option<TransactionOutput> = None;
     let mut total_collateral: Option<Lovelace> = None;
@@ -526,11 +540,37 @@ fn decode_conway_tx_body(r: &mut Reader<'_>) -> Result<TransactionBody, Serializ
                 collateral = r.read_set(read_tx_input)?;
             }
             14 => {
-                // required_signers: set<addr_keyhash> — stored as padded Hash32
-                required_signers = r.read_set(|r| {
-                    let h28 = read_hash28(r)?;
-                    Ok(h28.to_hash32_padded())
+                // Conway:  required_signers : set<addr_keyhash>
+                // Dijkstra: guards          : OSet (Credential Guard)
+                //
+                // Per upstream `decodeGuards` (Cardano.Ledger.Dijkstra.TxBody),
+                // each element may be either:
+                //   - bare bstr(28)        => Credential::VerificationKey
+                //   - array(2)[type, h28]  => full Credential
+                // Both shapes coexist in the same set (the type peek is per
+                // element, not per set). Required_signers stays populated with
+                // the key-hash subset for Conway-shaped callers; the full
+                // credential list is surfaced through `guards` for Dijkstra+
+                // witness validation. Issue #475 Phase 3.5.
+                let parsed: Vec<Credential> = r.read_set(|r| {
+                    let ty = r.peek_major()?;
+                    match ty {
+                        Type::Array | Type::ArrayIndef => read_stake_credential(r),
+                        Type::Bytes | Type::BytesIndef => {
+                            let h28 = read_hash28(r)?;
+                            Ok(Credential::VerificationKey(h28))
+                        }
+                        other => Err(SerializationError::CborDecode(format!(
+                            "guards (TxBody key 14): expected bstr or array, got {other:?}"
+                        ))),
+                    }
                 })?;
+                for cred in &parsed {
+                    if let Credential::VerificationKey(h28) = cred {
+                        required_signers.push(h28.to_hash32_padded());
+                    }
+                }
+                guards = parsed;
             }
             15 => {
                 // network_id
@@ -632,6 +672,10 @@ fn decode_conway_tx_body(r: &mut Reader<'_>) -> Result<TransactionBody, Serializ
         sub_transactions,          // Dijkstra+ only; empty for Conway-shaped bodies
         account_balance_intervals, // Dijkstra+ only; empty for Conway-shaped bodies
         direct_deposits,           // Dijkstra+ only; empty for Conway-shaped bodies
+        guards,                    // Dijkstra+ guards; for Conway-shaped bodies this
+                                   // contains the key-hash-only subset (every entry
+                                   // is a Credential::VerificationKey) so callers
+                                   // can iterate uniformly.
     })
 }
 
@@ -2249,6 +2293,10 @@ fn read_redeemer_tag(r: &mut Reader<'_>) -> Result<RedeemerTag, SerializationErr
         3 => Ok(RedeemerTag::Reward),
         4 => Ok(RedeemerTag::Vote),
         5 => Ok(RedeemerTag::Propose),
+        // Dijkstra (PV12+): tag 6 = `Guarding` per
+        // `Cardano.Ledger.Dijkstra.Scripts.DijkstraPlutusPurpose`
+        // (`DijkstraGuarding`, Sum 6). Issue #475 Phase 3.5.
+        6 => Ok(RedeemerTag::Guarding),
         other => Err(SerializationError::CborDecode(format!(
             "redeemer_tag: unknown value {other}"
         ))),
@@ -2292,6 +2340,16 @@ fn read_native_script(r: &mut Reader<'_>) -> Result<NativeScript, SerializationE
         5 => {
             let slot = r.read_uint()?;
             Ok(NativeScript::InvalidHereafter(SlotNo(slot)))
+        }
+        6 => {
+            // Dijkstra (PV12+) only: `DijkstraRequireGuard credential`
+            // wire shape per
+            // `Cardano.Ledger.Dijkstra.Scripts.DijkstraRequireGuard`:
+            //   array(2) [uint 6, credential]
+            // where `credential = [type, hash28]` (0 = key, 1 = script).
+            // Issue #475 Phase 3.5.
+            let cred = read_stake_credential(r)?;
+            Ok(NativeScript::RequireGuard(cred))
         }
         other => Err(SerializationError::CborDecode(format!(
             "native_script: unknown type {other}"
