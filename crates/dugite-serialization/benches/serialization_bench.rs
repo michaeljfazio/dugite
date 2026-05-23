@@ -90,6 +90,7 @@ fn make_realistic_transaction() -> Transaction {
             sub_transactions: vec![],
             account_balance_intervals: vec![],
             direct_deposits: ::std::collections::BTreeMap::new(),
+            guards: Vec::new(),
         },
         witness_set: TransactionWitnessSet {
             vkey_witnesses: vec![

@@ -88,6 +88,18 @@ pub fn encode_native_script(script: &NativeScript) -> Vec<u8> {
             buf.extend(encode_uint(slot.0));
             buf
         }
+        NativeScript::RequireGuard(cred) => {
+            // Dijkstra (PV12+): tag 6 = DijkstraRequireGuard credential.
+            //
+            // Wire shape: `array(2) [uint 6, credential]` where
+            // `credential = [type, hash28]` (the standard Conway encoding).
+            // See `Cardano.Ledger.Dijkstra.Scripts.DijkstraRequireGuard`
+            // (`Sum DijkstraRequireGuard 6`). Issue #475 Phase 3.5.
+            let mut buf = encode_array_header(2);
+            buf.extend(encode_uint(6));
+            buf.extend(super::certificate::encode_credential(cred));
+            buf
+        }
     }
 }
 
@@ -100,6 +112,8 @@ pub(crate) fn encode_redeemer_tag(tag: &RedeemerTag) -> Vec<u8> {
         RedeemerTag::Reward => 3,
         RedeemerTag::Vote => 4,
         RedeemerTag::Propose => 5,
+        // Dijkstra (PV12+) only — `DijkstraGuarding`. Issue #475 Phase 3.5.
+        RedeemerTag::Guarding => 6,
     })
 }
 
