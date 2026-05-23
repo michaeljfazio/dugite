@@ -116,19 +116,9 @@ jobs:
           sudo install -m644 bindings/blst.h    /usr/local/include/
           sudo install -m644 bindings/blst_aux.h /usr/local/include/
           sudo install -m644 libblst.a           /usr/local/lib/
-          # Create pkg-config file so cabal can find it.
-          sudo tee /usr/local/lib/pkgconfig/libblst.pc > /dev/null <<'PCEOF'
-          prefix=/usr/local
-          exec_prefix=${prefix}
-          libdir=${exec_prefix}/lib
-          includedir=${prefix}/include
-
-          Name: libblst
-          Description: BLS12-381 signature library
-          Version: 0.3.11
-          Libs: -L${libdir} -lblst
-          Cflags: -I${includedir}
-          PCEOF
+          # Create pkgconfig dir if it doesn't exist, then write the .pc file.
+          sudo mkdir -p /usr/local/lib/pkgconfig
+          printf 'prefix=/usr/local\nexec_prefix=${prefix}\nlibdir=${exec_prefix}/lib\nincludedir=${prefix}/include\n\nName: libblst\nDescription: BLS12-381 signature library\nVersion: 0.3.11\nLibs: -L${libdir} -lblst\nCflags: -I${includedir}\n' | sudo tee /usr/local/lib/pkgconfig/libblst.pc > /dev/null
           sudo ldconfig
           cd -
 
