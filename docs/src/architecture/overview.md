@@ -1,6 +1,6 @@
 # Architecture Overview
 
-Dugite is organized as a 14-crate Cargo workspace. Each crate has a focused responsibility and well-defined dependencies.
+Dugite is organized as a 15-crate Cargo workspace. Each crate has a focused responsibility and well-defined dependencies.
 
 ## Crate Workspace
 

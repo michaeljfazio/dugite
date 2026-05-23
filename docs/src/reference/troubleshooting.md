@@ -42,7 +42,9 @@ Only use `--release` when running against a live network.
 
 **Error:** `Handshake failed: version mismatch`
 
-This usually means the peer does not support the protocol version Dugite is requesting (V14+). Ensure you are connecting to an up-to-date cardano-node (version 10.x+).
+This usually means the peer does not support the protocol version Dugite is requesting (V14+). Ensure you are connecting to an up-to-date cardano-node:
+- **Mainnet / Preprod:** cardano-node 10.x+ required
+- **Preview:** cardano-node 11.0.1+ required (preview is at Protocol Version 11; peers running 10.x will reject the handshake)
 
 ## Socket Issues
 
