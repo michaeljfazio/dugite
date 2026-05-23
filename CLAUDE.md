@@ -122,3 +122,59 @@ Network magic: Mainnet=764824073, Preview=2, Preprod=1
 - `config/bp-pair/` — Sandstone preview BP-pair soak rig (dugite-bp + dugite-relay + haskell-relay).
 - `config/monitoring/` — Grafana dashboard, Prometheus scrape + alert rules.
 - `scripts/run/`, `scripts/soak/`, `scripts/monitoring/`, `scripts/validation/`, `scripts/mithril/`, `scripts/dev/` — see `just --list` for the entry points.
+
+## Upstream Conformance Testing
+
+Dugite maintains byte-exact alignment with upstream Cardano implementations
+via a republished corpus. Every upstream artefact flows through a single
+pipeline (`scripts/regenerate-conformance-corpus/`) and is published as a
+dugite GitHub release pinned in `tests/conformance/upstream/manifest.toml`.
+
+### Daily workflow
+
+```bash
+# Download all upstream fixture areas (reads manifest.toml for the release tag)
+just download-upstream-fixtures
+
+# Run the full UPLC + upstream golden test suite
+just test-upstream
+
+# Run a single area
+cargo xtask download-upstream-fixtures --area ledger-rules
+DUGITE_REQUIRE_UPSTREAM=1 cargo nextest run -p dugite-conformance \
+  --features upstream-conformance --test upstream_tests
+```
+
+### Seven fixture areas
+
+| Area | Source | Content |
+|------|--------|---------|
+| `ouroboros-consensus` | IntersectMBO/ouroboros-consensus | Block/header golden files per era |
+| `cardano-ledger` | IntersectMBO/cardano-ledger | Genesis JSON, CDDL schema, golden txs |
+| `cardano-node` | IntersectMBO/cardano-node | Genesis spec files |
+| `plutus` | IntersectMBO/plutus | 999 UPLC evaluation test cases |
+| `ledger-rules` | ImpSpec dump of cardano-ledger | CBOR ImpSpec vectors (NEWEPOCH + LEDGER) |
+| `cardano-base` | IntersectMBO/cardano-base | VRF v03 crypto test vectors |
+| `mithril` | input-output-hk/mithril | Certificate fixture JSON |
+
+### Refreshing the corpus
+
+1. Edit `tests/conformance/upstream/sources.toml` to bump a pin.
+2. Trigger `.github/workflows/regenerate-conformance-corpus.yml` (manual dispatch or weekly auto).
+3. Update `[release].tag` in `tests/conformance/upstream/manifest.toml`.
+4. Run `just download-upstream-fixtures && just test-upstream`.
+5. Commit `sources.toml` + `manifest.toml` + any code changes.
+
+The `ledger-rules` area builds cardano-ledger from source (GHC 9.6.5 +
+cabal 3.10.x, ~35 min cold, ~5 min cached) and runs the official ImpSpec
+conformance suite with `CONFORMANCE_CBOR_DUMP_PATH` set to capture every
+test vector. Phase 4 acceptance: `SKIP_LIST` in
+`tests/conformance/src/upstream/ledger_rules_replay/mod.rs` is empty or
+every entry has a tracking issue.
+
+### CI
+
+The `upstream-conformance` job in `.github/workflows/ci.yml` runs both the
+UPLC and upstream golden suites with `DUGITE_REQUIRE_UPSTREAM=1`. Fixture
+cache is keyed on `manifest.toml` content hash; bumping the tag invalidates
+the cache automatically.
