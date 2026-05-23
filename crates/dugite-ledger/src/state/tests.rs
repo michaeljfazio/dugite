@@ -3243,8 +3243,10 @@ fn test_snapshot_within_size_limit_loads_normally() {
 }
 
 #[test]
-fn test_snapshot_legacy_format_without_version_byte() {
-    // Build a legacy-format snapshot: DUGT(4) + checksum(32) + data (no version byte)
+fn test_snapshot_legacy_format_without_version_byte_is_rejected() {
+    // Pre-1.0 snapshots without a version byte have no back-compat path;
+    // `load_snapshot` must reject them up front rather than silently
+    // attempting to deserialise stale bytes.
     let dir = tempfile::tempdir().unwrap();
     let snapshot_path = dir.path().join("legacy-snapshot.bin");
 
@@ -3259,24 +3261,7 @@ fn test_snapshot_legacy_format_without_version_byte() {
     legacy.extend_from_slice(&data);
     std::fs::write(&snapshot_path, &legacy).unwrap();
 
-    // load_snapshot should handle the legacy format (5th byte is a hash byte,
-    // which will typically be >= 128 or 0, triggering the legacy path)
-    // If it happens to be in the version range, it would fail checksum —
-    // either way, we verify it loads or fails gracefully.
-    let result = LedgerState::load_snapshot(&snapshot_path);
-    // The legacy format should load successfully when the 5th byte (first hash byte)
-    // is outside the version range [1, 128), which is the common case.
-    // If the hash starts with a byte in [1, 128), the versioned path would be taken
-    // and the checksum would fail, which is also acceptable (corruption-detected).
-    if checksum.as_bytes()[0] == 0 || checksum.as_bytes()[0] >= 128 {
-        // Legacy path taken — should succeed
-        let loaded = result.unwrap();
-        assert_eq!(loaded.epoch, state.epoch);
-    } else {
-        // Extremely unlikely but possible: first hash byte looks like a version.
-        // The versioned-format checksum check would fail, giving a checksum error.
-        assert!(result.is_err());
-    }
+    assert!(LedgerState::load_snapshot(&snapshot_path).is_err());
 }
 
 #[test]
@@ -3289,10 +3274,10 @@ fn test_snapshot_rejects_unknown_version() {
     let data = bincode::serialize(&snap).unwrap();
     let checksum = dugite_primitives::hash::blake2b_256(&data);
 
-    // Write a snapshot with version 99 (unsupported)
+    // Write a snapshot with version 99 (does not match the current version)
     let mut future = Vec::new();
     future.extend_from_slice(b"DUGT");
-    future.push(99u8); // future version
+    future.push(99u8);
     future.extend_from_slice(checksum.as_bytes());
     future.extend_from_slice(&data);
     std::fs::write(&snapshot_path, &future).unwrap();
@@ -3301,8 +3286,9 @@ fn test_snapshot_rejects_unknown_version() {
     assert!(result.is_err());
     let err_msg = format!("{}", result.unwrap_err());
     assert!(
-        err_msg.contains("Unsupported snapshot version 99"),
-        "Expected version error, got: {err_msg}"
+        err_msg.contains("Snapshot version 99")
+            && err_msg.contains("does not match the current SNAPSHOT_VERSION"),
+        "Expected version-mismatch error, got: {err_msg}"
     );
 }
 
@@ -3321,15 +3307,24 @@ fn test_oversized_snapshot_rejected() {
     // Test 1: Verify the constant is 10 GiB
     assert_eq!(MAX_SNAPSHOT_SIZE, 10 * 1024 * 1024 * 1024);
 
-    // Test 2: Craft a payload whose bincode-encoded length field claims
-    // a huge Vec, which bincode::options().with_limit() should reject.
-    let mut legacy_malicious = Vec::new();
+    // Test 2: Craft a framed payload whose bincode-encoded length field
+    // claims a huge Vec; bincode::options().with_limit() must reject it.
+    // The payload is wrapped in the standard `DUGT + version + checksum`
+    // header so the loader proceeds past the framing check before the
+    // bincode size-limit fires.
+    let mut payload = Vec::new();
     let huge_len: u64 = 20 * 1024 * 1024 * 1024; // 20 GiB
-    legacy_malicious.extend_from_slice(&huge_len.to_le_bytes());
-    legacy_malicious.extend_from_slice(&[0u8; 100]);
+    payload.extend_from_slice(&huge_len.to_le_bytes());
+    payload.extend_from_slice(&[0u8; 100]);
+
+    let mut framed = Vec::new();
+    framed.extend_from_slice(b"DUGT");
+    framed.push(LedgerState::SNAPSHOT_VERSION);
+    framed.extend_from_slice(dugite_primitives::hash::blake2b_256(&payload).as_bytes());
+    framed.extend_from_slice(&payload);
 
     let malicious_path = dir.path().join("malicious-snapshot.bin");
-    std::fs::write(&malicious_path, &legacy_malicious).unwrap();
+    std::fs::write(&malicious_path, &framed).unwrap();
 
     let result = LedgerState::load_snapshot(&malicious_path);
     assert!(result.is_err(), "Malicious snapshot should be rejected");
@@ -12818,8 +12813,11 @@ fn test_reward_cross_validation_epoch_1239() {
     state.epoch_length = EPOCH_LENGTH;
 
     // Conway (proto >= 7): d = 0 (ppDG returns minBound = 0).
-    // Without this, prev_d defaults to 1.0 which bypasses the eta calculation.
-    state.epochs.prev_d = 0.0;
+    // Without this, prev_d defaults to 1/1 which bypasses the eta calculation.
+    state.epochs.prev_d = dugite_primitives::transaction::Rational {
+        numerator: 0,
+        denominator: 1,
+    };
 
     // ---- Build the go snapshot for epoch 1239 ----
     //
@@ -15343,50 +15341,10 @@ fn test_snapshot_roundtrip_preserves_deposit_maps() {
     assert_eq!(loaded.certs.pool_deposits.get(&pool_id), Some(&500_000_000));
 }
 
-/// Snapshot migration populates deposit maps from params × credentials.
-#[test]
-fn test_snapshot_migration_populates_deposit_maps() {
-    let mut params = ProtocolParameters::mainnet_defaults();
-    params.key_deposit = Lovelace(2_000_000);
-    params.pool_deposit = Lovelace(500_000_000);
-    let mut state = LedgerState::new(params);
-
-    // Simulate a pre-v12 snapshot: registered credentials but empty deposit maps.
-    let cred_hash = Credential::VerificationKey(Hash28::from_bytes([0xDE; 28])).to_typed_hash32();
-    Arc::make_mut(&mut state.certs.reward_accounts).insert(cred_hash, Lovelace(0));
-    let pool_id = Hash28::from_bytes([0x66; 28]);
-    Arc::make_mut(&mut state.certs.pool_params).insert(
-        pool_id,
-        PoolRegistration {
-            pool_id,
-            vrf_keyhash: dugite_primitives::hash::Hash32::ZERO,
-            pledge: Lovelace(0),
-            cost: Lovelace(340_000_000),
-            margin_numerator: 1,
-            margin_denominator: 100,
-            reward_account: vec![0xe0; 29],
-            owners: vec![pool_id],
-            relays: vec![],
-            metadata_url: None,
-            metadata_hash: None,
-        },
-    );
-    // Ensure deposit maps are empty (simulating old snapshot)
-    assert!(state.certs.stake_key_deposits.is_empty());
-    assert!(state.certs.pool_deposits.is_empty());
-
-    let dir = tempfile::tempdir().unwrap();
-    let snapshot_path = dir.path().join("migration_test.snap");
-    state.save_snapshot(&snapshot_path).unwrap();
-    let loaded = LedgerState::load_snapshot(&snapshot_path).unwrap();
-
-    // Migration should have populated maps from current params
-    assert_eq!(
-        loaded.certs.stake_key_deposits.get(&cred_hash),
-        Some(&2_000_000)
-    );
-    assert_eq!(loaded.certs.pool_deposits.get(&pool_id), Some(&500_000_000));
-}
+// Removed: `test_snapshot_migration_populates_deposit_maps` exercised the
+// pre-v12 deposit-map migration shim in `load_snapshot`. That back-compat
+// path was removed along with the rest of the snapshot back-compat
+// machinery; pre-1.0 dugite no longer migrates between snapshot versions.
 
 // ─── finalize_genesis_state regression tests ──────────────────────────────────
 //

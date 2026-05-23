@@ -357,7 +357,10 @@ fn make_empty_epoch_sub() -> EpochSubState {
         protocol_params: ProtocolParameters::mainnet_defaults(),
         prev_protocol_params: ProtocolParameters::mainnet_defaults(),
         prev_protocol_version_major: 5,
-        prev_d: 0.0,
+        prev_d: dugite_primitives::transaction::Rational {
+            numerator: 0,
+            denominator: 1,
+        },
     }
 }
 
@@ -463,7 +466,10 @@ mod tests {
             protocol_params: ProtocolParameters::mainnet_defaults(),
             prev_protocol_params: ProtocolParameters::mainnet_defaults(),
             prev_protocol_version_major: 5,
-            prev_d: 0.0,
+            prev_d: dugite_primitives::transaction::Rational {
+                numerator: 0,
+                denominator: 1,
+            },
         }
     }
 
