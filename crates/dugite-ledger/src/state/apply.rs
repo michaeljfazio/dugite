@@ -228,6 +228,46 @@ impl LedgerState {
                     conway_genesis: self.conway_genesis_init.as_ref(),
                     tx_index: 0,
                 };
+                // #615f: per-epoch-boundary full-state dump fires BEFORE
+                // process_epoch_transition so it captures the END of the
+                // just-ending epoch (matching Haskell's `currentEpoch=N`
+                // last-block-of-N emission).  The post-boundary dump used
+                // to label as `next_epoch` but reflected start-of-N+1
+                // state, which is an OFF-BY-ONE relative to Haskell's
+                // splitter (which takes last-per-epoch).
+                //
+                // We compute the upcoming RUPD here (without applying it)
+                // so the dumper can expose `rewards.total_distributed`
+                // as the rewards ABOUT TO BE applied at this boundary —
+                // mirroring Haskell's `rewardUpdate` JSON field which
+                // shows the queued (un-applied) RUPD.
+                //
+                // The boundary handler then runs and computes the same
+                // RUPD again — compute_reward_update is pure, so this
+                // double-compute is wasteful but byte-exact correct.
+                #[cfg(feature = "epoch-state-debug")]
+                {
+                    let upcoming_rupd = crate::state::rewards::compute_reward_update(
+                        &self.epochs.prev_protocol_params,
+                        self.epochs.prev_d,
+                        self.epochs.prev_protocol_version_major,
+                        self.epochs.snapshots.go.as_ref(),
+                        &self.epochs.snapshots.bprev_blocks_by_pool,
+                        self.epochs.snapshots.ss_fee,
+                        self.epochs.reserves,
+                        self.epochs.treasury,
+                        &self.certs.reward_accounts,
+                        self.epoch_length,
+                        self.shelley_transition_epoch,
+                    );
+                    crate::state::epoch_state_debug::maybe_dump(
+                        self,
+                        self.epoch.0,
+                        block.slot().0,
+                        Some(&upcoming_rupd),
+                    );
+                }
+
                 epoch_rules.process_epoch_transition(
                     next_epoch,
                     &epoch_ctx,
@@ -238,27 +278,6 @@ impl LedgerState {
                     &mut self.consensus,
                 )?;
                 self.epoch = next_epoch;
-
-                // Tasks #21/#22/#23: per-epoch-boundary full-state dump.
-                // No-op unless the crate is built with `--features
-                // epoch-state-debug` AND `DUGITE_EPOCH_STATE_DUMP=<dir>`
-                // is set at runtime.  Called immediately after the
-                // boundary handler so reward/treasury/reserve scalars
-                // reflect the post-boundary state, matching what
-                // `cardano-cli debug log-epoch-state` would emit on the
-                // Haskell side.
-                #[cfg(feature = "epoch-state-debug")]
-                crate::state::epoch_state_debug::maybe_dump(
-                    self,
-                    next_epoch.0,
-                    block.slot().0,
-                    // `pending_reward_update` was take()-d by the boundary
-                    // handler before this dump fires, so passing it here
-                    // always yielded None (Bug 3).  Pass `None` so the
-                    // dumper falls through to `last_applied_rupd`, which
-                    // the handler populated during the boundary.
-                    None,
-                );
             }
         }
 
