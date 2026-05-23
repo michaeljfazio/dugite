@@ -179,7 +179,7 @@ def patch_exec_spec_rule_core(path: str) -> None:
         _die(path, "Could not find 'import UnliftIO.Environment (lookupEnv)'")
     new_imports = (
         "import Control.Monad.IO.Class (liftIO)\n"
-        "import Data.IORef (IORef, modifyIORef', newIORef, readIORef)\n"
+        "import Data.IORef (IORef, atomicModifyIORef', newIORef)\n"
         "import System.IO.Unsafe (unsafePerformIO)\n"
     )
     content = content.replace(sentinel, sentinel + new_imports, 1)
@@ -236,9 +236,7 @@ def patch_exec_spec_rule_core(path: str) -> None:
         "  mbyCborDumpPath <- lookupEnv \"CONFORMANCE_CBOR_DUMP_PATH\"\n"
         "  case mbyCborDumpPath of\n"
         "    Just basePath -> do\n"
-        "      n <- liftIO $ do\n"
-        "        modifyIORef' conformanceDumpCounter (+ 1)\n"
-        "        readIORef conformanceDumpCounter\n"
+        "      n <- liftIO $ atomicModifyIORef' conformanceDumpCounter (\\i -> (i + 1, i + 1))\n"
         "      let ruleName = symbolVal (Proxy @rule)\n"
         "          testDir = basePath </> ruleName </> (\"test_\" ++ show n)\n"
         "      createDirectoryIfMissing True testDir\n"

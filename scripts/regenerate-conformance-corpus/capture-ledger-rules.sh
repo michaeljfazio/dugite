@@ -148,10 +148,15 @@ log "Building cardano-ledger-conformance:test:tests (this may take 30-45 min col
 # ── Run the patched conformance tests to collect CBOR vectors ─────────────────
 #
 # CONFORMANCE_CBOR_DUMP_PATH: triggers both patched hooks to emit CBOR files.
-# --quickcheck-tests 10: limits QuickCheck iterations per property to 10 so
+#
+# Test framework: the conformance test suite uses hspec via ledgerTestMain /
+# impSpecMainWithConfig (NOT tasty).  tasty flags like '--quickcheck-tests' and
+# '--num-threads' are NOT valid — hspec uses '--qc-max-success' and does not
+# accept '--num-threads'.  Thread safety is handled at the source level: both
+# IORef counters (conformanceDumpCounter + hookDumpCounter) use atomicModifyIORef'.
+#
+# --qc-max-success 10: limits hspec-quickcheck iterations per property to 10 so
 #   the run completes within CI's 120 minute budget.
-# --num-threads 1: sequential execution ensures the global IORef counter gives
-#   unique names (the counter is designed for single-threaded use).
 # || true: don't abort if some tests report divergence failures — the files
 #   are already written.  Build failures are caught by 'cabal build' above.
 
@@ -163,7 +168,7 @@ log "Running cardano-ledger-conformance:test:tests → ${DUMP_DIR}..."
     cd "${CLONE_DIR}"
     CONFORMANCE_CBOR_DUMP_PATH="${DUMP_DIR}" \
     cabal test cardano-ledger-conformance:test:tests \
-        --test-options "--quickcheck-tests 10 --num-threads 1" \
+        --test-options "--qc-max-success 10" \
         2>&1
 ) || log "WARN: Some conformance tests may have reported failures (vectors are still collected)"
 
