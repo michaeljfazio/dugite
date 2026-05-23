@@ -118,7 +118,8 @@ fn parse_vrf_vector_file(text: &str, path: &Path) -> Option<VrfVector> {
             path.file_name().unwrap_or_default().to_string_lossy()
         )
     });
-    let alpha = if alpha_hex.is_empty() {
+    // Some vectors use the word "empty" for zero-length alpha (e.g., vrf_ver03_standard_10).
+    let alpha = if alpha_hex.is_empty() || alpha_hex == "empty" {
         vec![]
     } else {
         hex::decode(&alpha_hex).unwrap_or_else(|e| {
@@ -151,16 +152,19 @@ fn parse_vrf_vector_file(text: &str, path: &Path) -> Option<VrfVector> {
     })
 }
 
-/// Run VRF cross-validation against all `vrf*.txt` files in `dir`.
+/// Run VRF cross-validation against all `vrf*` files in `dir`.
+///
+/// Accepts files with or without a `.txt` extension: cardano-base stores
+/// its test vectors as bare files (e.g., `vrf_ver03_generated_1`) with no
+/// extension, matching the git-committed names in the upstream repo.
 fn run_vrf_vectors(dir: &Path) {
     let vrf_files: Vec<_> = walkdir(dir)
         .into_iter()
         .filter(|p| {
-            p.extension().and_then(|e| e.to_str()) == Some("txt")
-                && p.file_name()
-                    .and_then(|n| n.to_str())
-                    .map(|n| n.starts_with("vrf"))
-                    .unwrap_or(false)
+            p.file_name()
+                .and_then(|n| n.to_str())
+                .map(|n| n.starts_with("vrf"))
+                .unwrap_or(false)
         })
         .collect();
 
@@ -191,7 +195,8 @@ fn run_vrf_vectors(dir: &Path) {
         };
 
         // v13 batch-compatible: proof is 128 bytes; dugite-crypto only implements v03 (80 bytes).
-        if vec.ver == "13" || vec.pi.len() == 128 {
+        // ver field may be "13" or "ietfdraft13" depending on the file format.
+        if vec.ver.contains("13") || vec.pi.len() == 128 {
             eprintln!(
                 "[cardano-base] SKIP {label}: v13 batch-compatible (128-byte proof); \
                  dugite-crypto implements v03 only"

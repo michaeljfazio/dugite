@@ -5,9 +5,9 @@
 # copies the VRF crypto test-vector files from:
 #   cardano-crypto-praos/test_vectors/
 #
-# Each file is a single VRF test vector in key:value format:
+# Each file is a single VRF test vector in key:value format (no .txt extension):
 #   vrf: <identifier>
-#   ver: 03        # or 13 (batch-compatible; dugite skips these)
+#   ver: ietfdraft03   # or ietfdraft13 (batch-compatible; dugite skips these)
 #   ciphersuite: ECVRF-ED25519-SHA512-ELL2
 #   sk: <32-byte-seed-hex>
 #   pk: <32-byte-pubkey-hex>
@@ -81,7 +81,9 @@ if [[ ! -d "${VECTORS_SRC}" ]]; then
 fi
 
 VRF_COUNT=0
-for f in "${VECTORS_SRC}"/vrf*.txt; do
+# cardano-base stores vector files without any extension (e.g., vrf_ver03_generated_1).
+# The glob matches all files whose name starts with "vrf" regardless of extension.
+for f in "${VECTORS_SRC}"/vrf*; do
     [[ -f "$f" ]] || continue
     cp "$f" "${CONTENT_DIR}/"
     ((VRF_COUNT++))
@@ -99,7 +101,8 @@ fi
 HASHES_FILE="${WORK_DIR}/hashes.json"
 echo "{" > "${HASHES_FILE}"
 first=1
-for f in "${CONTENT_DIR}"/*.txt; do
+# Hash all files matching vrf* (no extension required).
+for f in "${CONTENT_DIR}"/vrf*; do
     [[ -f "$f" ]] || continue
     hash=$(sha256sum "$f" | awk '{print $1}')
     name=$(basename "$f")
