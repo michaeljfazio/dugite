@@ -554,9 +554,7 @@ mod tests {
     /// minimal modes must decode it cleanly.
     #[test]
     fn decode_babbage_block_with_indefinite_tx_bodies_array_roundtrips() {
-        let cbor = include_bytes!(
-            "../../tests/fixtures/babbage_indef_tx_bodies_block33760.cbor"
-        );
+        let cbor = include_bytes!("../../tests/fixtures/babbage_indef_tx_bodies_block33760.cbor");
         let block = decode_block(cbor, 21600, false)
             .expect("real Babbage block with indef tx_bodies must decode (full mode)");
         assert_eq!(block.block_number().0, 33760);
