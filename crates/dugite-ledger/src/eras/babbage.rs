@@ -333,6 +333,10 @@ fn make_empty_cert_sub() -> CertSubState {
             stake_map: HashMap::new(),
         },
         script_stake_credentials: HashSet::new(),
+        pending_mir_reserves: std::collections::HashMap::new(),
+        pending_mir_treasury: std::collections::HashMap::new(),
+        pending_mir_delta_reserves: 0,
+        pending_mir_delta_treasury: 0,
     }
 }
 
@@ -437,6 +441,10 @@ mod tests {
                 stake_map: HashMap::new(),
             },
             script_stake_credentials: HashSet::new(),
+            pending_mir_reserves: std::collections::HashMap::new(),
+            pending_mir_treasury: std::collections::HashMap::new(),
+            pending_mir_delta_reserves: 0,
+            pending_mir_delta_treasury: 0,
         }
     }
 

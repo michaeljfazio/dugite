@@ -56,11 +56,12 @@ fn snapshot_format_hash_stability() {
     // This hash was computed from the current LedgerStateSnapshot layout.
     // If this changes, existing snapshot files become unreadable.
     //
-    // Last update: SNAPSHOT_VERSION 16 → 17 (issue #629) — `prev_d`
-    // changed from `f64` (8 bytes) to `Rational { numerator: u64,
-    // denominator: u64 }` (16 bytes), shifting every byte after the
-    // `prev_protocol_params` block in the bincode stream.
-    const EXPECTED_HASH: &str = "cd02b0b4d223ea934b0595440a400169c88a947b0f8a84d5832291db18711af4";
+    // Last update: SNAPSHOT_VERSION 17 → 18 (issue #631) — `CertSubState`
+    // gained four pending-MIR fields (`pending_mir_reserves`,
+    // `pending_mir_treasury`, `pending_mir_delta_reserves`,
+    // `pending_mir_delta_treasury`) so MIR-cert effects accumulate per
+    // Haskell `dsIRewards` and drain at the next epoch boundary.
+    const EXPECTED_HASH: &str = "ced0d4b9701568bd4697d2caeaf7971018638bda0c88b84e61ad89415820c575";
 
     if EXPECTED_HASH == "COMPUTE_ON_FIRST_RUN" {
         panic!(

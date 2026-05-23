@@ -29,6 +29,89 @@ pub(crate) fn is_conway_only_certificate(cert: &Certificate) -> bool {
     )
 }
 
+/// Drain the pending MIR (`dsIRewards`) map and apply it to reward
+/// accounts and pots per Haskell `Cardano.Ledger.Shelley.Rules.Mir.applyMIR`.
+///
+/// Called at every epoch boundary AFTER SNAP/POOLREAP and BEFORE NEWPP
+/// (matching the Haskell EPOCH STS sequence).  In Conway+ MIR certs
+/// are no longer reachable, so the pending maps stay empty and the
+/// function is a no-op.
+///
+/// Per Haskell:
+/// 1. For each (cred, delta) in `dsIRewards.irwdSrcReserves` /
+///    `dsIRewards.irwdSrcTreasury`: credit `reward_accounts[cred] += delta`,
+///    debit the source pot for the sum of all deltas (positive deltas
+///    debit the pot, negative deltas refund into it).
+/// 2. For each `deltaReserves` / `deltaTreasury` accumulator: move the
+///    coin between pots.
+/// 3. Empty all pending maps and zero the accumulators.
+pub(crate) fn apply_pending_mir(
+    certs: &mut super::substates::CertSubState,
+    epochs: &mut super::substates::EpochSubState,
+) {
+    // ── 1. Per-credential MIR distributions ─────────────────────────
+    for (src, pending) in [
+        ("reserves", std::mem::take(&mut certs.pending_mir_reserves)),
+        ("treasury", std::mem::take(&mut certs.pending_mir_treasury)),
+    ] {
+        if pending.is_empty() {
+            continue;
+        }
+        let mut net_pot_debit: i128 = 0;
+        for (cred, delta) in pending {
+            let entry = Arc::make_mut(&mut certs.reward_accounts)
+                .entry(cred)
+                .or_insert(Lovelace(0));
+            let new_balance = entry.0 as i128 + delta;
+            if new_balance < 0 {
+                panic!(
+                    "MIR: credential {} underflows reward balance ({} + {} < 0) — invariant broken",
+                    cred.to_hex(),
+                    entry.0,
+                    delta,
+                );
+            }
+            entry.0 = new_balance as u64;
+            net_pot_debit += delta;
+        }
+        match src {
+            "reserves" => {
+                epochs.reserves.0 = (epochs.reserves.0 as i128 - net_pot_debit)
+                    .try_into()
+                    .expect("MIR reserves debit underflows reserves — invariant broken");
+            }
+            "treasury" => {
+                epochs.treasury.0 = (epochs.treasury.0 as i128 - net_pot_debit)
+                    .try_into()
+                    .expect("MIR treasury debit underflows treasury — invariant broken");
+            }
+            _ => unreachable!(),
+        }
+    }
+
+    // ── 2. Pot-to-pot transfers ─────────────────────────────────────
+    let dr = std::mem::take(&mut certs.pending_mir_delta_reserves);
+    let dt = std::mem::take(&mut certs.pending_mir_delta_treasury);
+    if dr != 0 {
+        // reserves -> treasury
+        epochs.reserves.0 = (epochs.reserves.0 as i128 - dr)
+            .try_into()
+            .expect("MIR deltaReserves underflows reserves — invariant broken");
+        epochs.treasury.0 = (epochs.treasury.0 as i128 + dr)
+            .try_into()
+            .expect("MIR deltaReserves overflows treasury u64");
+    }
+    if dt != 0 {
+        // treasury -> reserves
+        epochs.treasury.0 = (epochs.treasury.0 as i128 - dt)
+            .try_into()
+            .expect("MIR deltaTreasury underflows treasury — invariant broken");
+        epochs.reserves.0 = (epochs.reserves.0 as i128 + dt)
+            .try_into()
+            .expect("MIR deltaTreasury overflows reserves u64");
+    }
+}
+
 impl LedgerState {
     /// Process a certificate with pointer tracking for Pointer address resolution.
     ///
@@ -521,74 +604,47 @@ impl LedgerState {
                 );
             }
             Certificate::MoveInstantaneousRewards { source, target } => {
-                // MIR: transfer funds between reserves/treasury or distribute to stake credentials
+                // Per Haskell `Cardano.Ledger.Shelley.Rules.Mir.applyMIRCert`
+                // MIR certs do NOT credit reward_accounts or move pots during
+                // LEDGER STS — they accumulate into the `InstantaneousRewards`
+                // (`dsIRewards`) pending-delta map on `DState`. The actual
+                // application happens at the next epoch boundary via the
+                // MIR sub-rule of EPOCH.  See issue #631.
                 match target {
                     MIRTarget::StakeCredentials(creds) => {
-                        let mut total_distributed: u64 = 0;
+                        let pending = match source {
+                            MIRSource::Reserves => &mut self.certs.pending_mir_reserves,
+                            MIRSource::Treasury => &mut self.certs.pending_mir_treasury,
+                        };
                         for (cred, amount) in creds {
                             let key = credential_to_hash(cred);
-                            let entry = Arc::make_mut(&mut self.certs.reward_accounts)
-                                .entry(key)
-                                .or_insert(Lovelace(0));
-                            if *amount >= 0 {
-                                let amt = *amount as u64;
-                                entry.0 = entry.0.saturating_add(amt);
-                                total_distributed = total_distributed.saturating_add(amt);
-                            } else {
-                                entry.0 = entry.0.saturating_sub(amount.unsigned_abs());
-                            }
+                            let entry = pending.entry(key).or_insert(0i128);
+                            *entry += *amount as i128;
                             debug!(
-                                "MIR: distributed {} lovelace from {:?} to {}",
+                                "MIR: pending {} lovelace from {:?} to {}",
                                 amount,
                                 source,
                                 key.to_hex()
                             );
                         }
-                        // Debit the source pot for the total positive amount distributed
-                        if total_distributed > 0 {
-                            match source {
-                                MIRSource::Reserves => {
-                                    self.epochs.reserves.0 =
-                                        self.epochs.reserves.0.checked_sub(total_distributed).expect("reserves underflow during MIR/governance refund — ledger invariant broken");
-                                }
-                                MIRSource::Treasury => {
-                                    self.epochs.treasury.0 =
-                                        self.epochs.treasury.0.checked_sub(total_distributed).expect("treasury underflow during MIR/governance refund — ledger invariant broken");
-                                }
-                            }
-                        }
                     }
                     MIRTarget::OtherAccountingPot(coin) => {
-                        // Transfer between reserves and treasury
-                        // Use saturating arithmetic to handle compound MIR operations
-                        // where credential distributions and pot transfers interact
+                        // Pot-to-pot transfer: accumulate the delta, apply at
+                        // epoch boundary.  Per Haskell `dsIRewards . deltaReserves`
+                        // / `deltaTreasury`.
                         match source {
                             MIRSource::Reserves => {
-                                // Move from reserves to treasury, capped at available
-                                let actual = (*coin).min(self.epochs.reserves.0);
-                                self.epochs.reserves.0 =
-                                    self.epochs.reserves.0.checked_sub(actual).expect("reserves underflow during MIR/governance refund — ledger invariant broken");
-                                self.epochs.treasury.0 =
-                                    self.epochs.treasury.0.checked_add(actual).expect(
-                                        "treasury overflow during MIR/governance refund — u64",
-                                    );
+                                self.certs.pending_mir_delta_reserves += *coin as i128;
                                 debug!(
-                                    "MIR: transferred {} lovelace from reserves to treasury",
-                                    actual
+                                    "MIR: pending {} lovelace pot-transfer reserves -> treasury",
+                                    coin
                                 );
                             }
                             MIRSource::Treasury => {
-                                // Move from treasury to reserves, capped at available
-                                let actual = (*coin).min(self.epochs.treasury.0);
-                                self.epochs.treasury.0 =
-                                    self.epochs.treasury.0.checked_sub(actual).expect("treasury underflow during MIR/governance refund — ledger invariant broken");
-                                self.epochs.reserves.0 =
-                                    self.epochs.reserves.0.checked_add(actual).expect(
-                                        "reserves overflow during MIR/governance refund — u64",
-                                    );
+                                self.certs.pending_mir_delta_treasury += *coin as i128;
                                 debug!(
-                                    "MIR: transferred {} lovelace from treasury to reserves",
-                                    actual
+                                    "MIR: pending {} lovelace pot-transfer treasury -> reserves",
+                                    coin
                                 );
                             }
                         }
@@ -1196,70 +1252,30 @@ impl LedgerState {
                 );
             }
             Certificate::MoveInstantaneousRewards { source, target } => {
-                // MIR — no delta changes recorded (pre-Conway, not replayed via deltas).
+                // MIR: accumulate into the pending dsIRewards map per
+                // Haskell `applyMIRCert` (see issue #631).  Drained at the
+                // next epoch boundary by `apply_pending_mir`.  Pre-Conway
+                // only — Conway removes MIR certs entirely.
                 match target {
                     MIRTarget::StakeCredentials(creds) => {
-                        let mut total_distributed: u64 = 0;
+                        let pending = match source {
+                            MIRSource::Reserves => &mut self.certs.pending_mir_reserves,
+                            MIRSource::Treasury => &mut self.certs.pending_mir_treasury,
+                        };
                         for (cred, amount) in creds {
                             let key = credential_to_hash(cred);
-                            let entry = Arc::make_mut(&mut self.certs.reward_accounts)
-                                .entry(key)
-                                .or_insert(Lovelace(0));
-                            if *amount >= 0 {
-                                let amt = *amount as u64;
-                                entry.0 = entry.0.saturating_add(amt);
-                                total_distributed = total_distributed.saturating_add(amt);
-                            } else {
-                                entry.0 = entry.0.saturating_sub(amount.unsigned_abs());
-                            }
-                            debug!(
-                                "MIR: distributed {} lovelace from {:?} to {}",
-                                amount,
-                                source,
-                                key.to_hex()
-                            );
-                        }
-                        if total_distributed > 0 {
-                            match source {
-                                MIRSource::Reserves => {
-                                    self.epochs.reserves.0 =
-                                        self.epochs.reserves.0.checked_sub(total_distributed).expect("reserves underflow during MIR/governance refund — ledger invariant broken");
-                                }
-                                MIRSource::Treasury => {
-                                    self.epochs.treasury.0 =
-                                        self.epochs.treasury.0.checked_sub(total_distributed).expect("treasury underflow during MIR/governance refund — ledger invariant broken");
-                                }
-                            }
+                            let entry = pending.entry(key).or_insert(0i128);
+                            *entry += *amount as i128;
                         }
                     }
-                    MIRTarget::OtherAccountingPot(coin) => {
-                        match source {
-                            MIRSource::Reserves => {
-                                let actual = (*coin).min(self.epochs.reserves.0);
-                                self.epochs.reserves.0 = self.epochs.reserves.0.checked_sub(actual).expect("reserves underflow during MIR/governance refund — ledger invariant broken");
-                                self.epochs.treasury.0 =
-                                    self.epochs.treasury.0.checked_add(actual).expect(
-                                        "treasury overflow during MIR/governance refund — u64",
-                                    );
-                                debug!(
-                                    "MIR: transferred {} lovelace from reserves to treasury",
-                                    actual
-                                );
-                            }
-                            MIRSource::Treasury => {
-                                let actual = (*coin).min(self.epochs.treasury.0);
-                                self.epochs.treasury.0 = self.epochs.treasury.0.checked_sub(actual).expect("treasury underflow during MIR/governance refund — ledger invariant broken");
-                                self.epochs.reserves.0 =
-                                    self.epochs.reserves.0.checked_add(actual).expect(
-                                        "reserves overflow during MIR/governance refund — u64",
-                                    );
-                                debug!(
-                                    "MIR: transferred {} lovelace from treasury to reserves",
-                                    actual
-                                );
-                            }
+                    MIRTarget::OtherAccountingPot(coin) => match source {
+                        MIRSource::Reserves => {
+                            self.certs.pending_mir_delta_reserves += *coin as i128;
                         }
-                    }
+                        MIRSource::Treasury => {
+                            self.certs.pending_mir_delta_treasury += *coin as i128;
+                        }
+                    },
                 }
             }
         }
@@ -2227,6 +2243,7 @@ mod tests {
             source: MIRSource::Reserves,
             target: MIRTarget::StakeCredentials(vec![(cred, amount)]),
         });
+        super::apply_pending_mir(&mut state.certs, &mut state.epochs);
 
         let balance = state
             .certs
@@ -2266,6 +2283,7 @@ mod tests {
             source: MIRSource::Treasury,
             target: MIRTarget::StakeCredentials(vec![(cred, amount)]),
         });
+        super::apply_pending_mir(&mut state.certs, &mut state.epochs);
 
         let balance = state
             .certs
@@ -2300,6 +2318,7 @@ mod tests {
             source: MIRSource::Reserves,
             target: MIRTarget::OtherAccountingPot(3_000_000_000),
         });
+        super::apply_pending_mir(&mut state.certs, &mut state.epochs);
 
         assert_eq!(
             state.epochs.reserves.0, 7_000_000_000,
@@ -2327,6 +2346,7 @@ mod tests {
             source: MIRSource::Treasury,
             target: MIRTarget::OtherAccountingPot(2_000_000_000),
         });
+        super::apply_pending_mir(&mut state.certs, &mut state.epochs);
 
         assert_eq!(
             state.epochs.treasury.0, 6_000_000_000,
@@ -2350,19 +2370,21 @@ mod tests {
         state.epochs.reserves.0 = 1_000_000;
         state.epochs.treasury.0 = 0;
 
-        // Try to move 5B from a 1M reserve — should be capped at 1M.
+        // Try to move 5B from a 1M reserve.  Per Haskell `applyMIR` the
+        // pot debit is unconditional — a value that exceeds the source pot
+        // would have already been rejected upstream by `validateMIRCert`
+        // (`InsufficientForInstantaneousRewards`), so reaching apply with
+        // an over-source coin is an invariant violation and panics.
         state.process_certificate(&Certificate::MoveInstantaneousRewards {
             source: MIRSource::Reserves,
             target: MIRTarget::OtherAccountingPot(5_000_000_000),
         });
-
-        assert_eq!(
-            state.epochs.reserves.0, 0,
-            "Reserves capped: can't go below 0"
-        );
-        assert_eq!(
-            state.epochs.treasury.0, 1_000_000,
-            "Only actual reserves transferred to treasury"
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            super::apply_pending_mir(&mut state.certs, &mut state.epochs)
+        }));
+        assert!(
+            result.is_err(),
+            "apply_pending_mir must panic on a delta that exceeds the source pot"
         );
     }
 
