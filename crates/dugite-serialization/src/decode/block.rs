@@ -540,4 +540,32 @@ mod tests {
             "minimal synthetic Dijkstra block must fail to decode"
         );
     }
+
+    /// Regression for #615e: cn 11.0.1 encodes Babbage `tx_bodies`,
+    /// `tx_witness_sets` and `invalid_transactions` as INDEFINITE-length
+    /// CBOR arrays on preview / preprod.  The pre-fix decoder used
+    /// `read_array_header()?.unwrap_or(0)` which silently returned 0 on
+    /// indef, then read the next field from inside the indef array and
+    /// failed with "expected array, got map" — disconnecting every preview
+    /// peer ~30 s into from-genesis sync and stalling at block 33739.
+    ///
+    /// Fixture: real on-wire Babbage block #33760 at slot 678345 captured
+    /// from preview peer 18.117.34.199:3001 on 2026-05-23.  Both full and
+    /// minimal modes must decode it cleanly.
+    #[test]
+    fn decode_babbage_block_with_indefinite_tx_bodies_array_roundtrips() {
+        let cbor = include_bytes!("../../tests/fixtures/babbage_indef_tx_bodies_block33760.cbor");
+        let block = decode_block(cbor, 21600, false)
+            .expect("real Babbage block with indef tx_bodies must decode (full mode)");
+        assert_eq!(block.block_number().0, 33760);
+        assert_eq!(block.slot().0, 678345);
+        assert_eq!(block.era, dugite_primitives::era::Era::Babbage);
+        // The block has 25 stake-registration txs.
+        assert_eq!(block.transactions.len(), 25);
+
+        let block_min = decode_block(cbor, 21600, true)
+            .expect("real Babbage block with indef tx_bodies must decode (minimal mode)");
+        assert_eq!(block_min.block_number().0, 33760);
+        assert_eq!(block_min.slot().0, 678345);
+    }
 }
