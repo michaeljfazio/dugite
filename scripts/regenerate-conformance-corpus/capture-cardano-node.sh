@@ -47,11 +47,14 @@ CLONE_DIR="${WORK_DIR}/clone"
 CONTENT_DIR="${WORK_DIR}/content"
 mkdir -p "${CLONE_DIR}" "${CONTENT_DIR}"
 
-log "Cloning cardano-node..."
-git clone --no-checkout --filter=blob:none \
+log "Cloning cardano-node (shallow)..."
+git clone --depth=1 \
     "https://github.com/IntersectMBO/cardano-node.git" "${CLONE_DIR}"
-git -C "${CLONE_DIR}" fetch --depth=1 origin "${SHA}"
-git -C "${CLONE_DIR}" checkout "${SHA}"
+if ! git -C "${CLONE_DIR}" rev-parse --verify "${SHA}^{commit}" >/dev/null 2>&1; then
+    log "SHA not at tip, fetching..."
+    git -C "${CLONE_DIR}" fetch --depth=1 origin "${SHA}"
+    git -C "${CLONE_DIR}" checkout "${SHA}"
+fi
 
 # Collect genesis spec files used by conformance tests
 for genesis_name in alonzo-genesis conway-genesis shelley-genesis byron-genesis; do

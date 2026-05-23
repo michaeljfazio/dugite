@@ -1,12 +1,23 @@
 #!/usr/bin/env bash
 # Capture step for the ouroboros-consensus area.
 #
-# Clones IntersectMBO/ouroboros-consensus at the SHA from sources.toml,
-# copies the conformance golden files, and packages them as ouroboros-consensus.tar.gz.
+# Clones IntersectMBO/ouroboros-consensus at the SHA from sources.toml
+# (shallow clone, full working tree — no blob filter), copies the
+# conformance golden files, and packages them as ouroboros-consensus.tar.gz.
+#
+# Golden files live under ouroboros-consensus-cardano/golden/ with no
+# file extension (raw binary). We capture:
+#   golden/cardano/CardanoNodeToNodeVersion*/Block_*
+#   golden/cardano/CardanoNodeToNodeVersion*/Header_*
+#   golden/cardano/CardanoNodeToNodeVersion*/GenTx_*
+#   golden/cardano/CardanoNodeToNodeVersion*/GenTxId_*
+#   golden/byron/*/Block_*
+#   golden/byron/*/Header_*
+#   golden/byron/*/GenTx*
 #
 # Produces:
-#   <work-dir>/hashes.json       — file_name → sha256 map (consumed by orchestrator)
-#   <tarball>                    — the area tarball
+#   <work-dir>/hashes.json
+#   <tarball>
 
 set -euo pipefail
 
@@ -46,26 +57,34 @@ CLONE_DIR="${WORK_DIR}/clone"
 CONTENT_DIR="${WORK_DIR}/content"
 mkdir -p "${CLONE_DIR}" "${CONTENT_DIR}"
 
-# Clone at pinned SHA (shallow + deepen to reach the target commit)
-log "Cloning ouroboros-consensus..."
-git clone --no-checkout --filter=blob:none \
+# Use depth=1 shallow clone (full working tree, no blob filter).
+# We cannot use --filter=blob:none because we need the actual file content.
+log "Cloning ouroboros-consensus (shallow)..."
+git clone --depth=1 \
     "https://github.com/IntersectMBO/ouroboros-consensus.git" "${CLONE_DIR}"
-git -C "${CLONE_DIR}" fetch --depth=1 origin "${SHA}"
-git -C "${CLONE_DIR}" checkout "${SHA}"
 
-# Locate conformance golden files.
-# ouroboros-consensus ships block/header/gentx golden files under:
-#   ouroboros-consensus-cardano/test/Test/Consensus/Cardano/Golden/
-# and serialisation roundtrip fixtures under various test trees.
-find "${CLONE_DIR}" \( \
-    -path "*/Golden/Block_*" \
-    -o -path "*/Golden/Header_*" \
-    -o -path "*/Golden/GenTx_*" \
-    -o -path "*/Golden/GenTxId_*" \
-    -o -name "*.golden" \
-    \) -type f | while read -r f; do
-    # Preserve relative path from clone root
-    rel="${f#${CLONE_DIR}/}"
+# The SHA might not be on the default branch tip.
+# If the shallow clone doesn't have the exact SHA, fetch it.
+if ! git -C "${CLONE_DIR}" rev-parse --verify "${SHA}^{commit}" >/dev/null 2>&1; then
+    log "SHA not at tip, fetching..."
+    git -C "${CLONE_DIR}" fetch --depth=1 origin "${SHA}"
+    git -C "${CLONE_DIR}" checkout "${SHA}"
+fi
+
+GOLDEN_DIR="${CLONE_DIR}/ouroboros-consensus-cardano/golden"
+[[ -d "${GOLDEN_DIR}" ]] || { log "ERROR: golden dir not found at ${GOLDEN_DIR}"; exit 1; }
+
+# Copy golden files matching our conformance patterns (no file extension).
+# Patterns: Block_*, Header_*, GenTx_*, GenTxId_* under golden/cardano/ and golden/byron/
+find "${GOLDEN_DIR}" -type f \( \
+    -name "Block_*" \
+    -o -name "Header_*" \
+    -o -name "GenTx_*" \
+    -o -name "GenTxId_*" \
+    -o -name "GenTx" \
+    -o -name "GenTxId" \
+    \) | while read -r f; do
+    rel="${f#${GOLDEN_DIR}/}"
     dest="${CONTENT_DIR}/${rel}"
     mkdir -p "$(dirname "${dest}")"
     cp "${f}" "${dest}"
@@ -73,6 +92,8 @@ done
 
 COUNT="$(find "${CONTENT_DIR}" -type f | wc -l | tr -d ' ')"
 log "Collected ${COUNT} golden files"
+
+[[ "${COUNT}" -gt 0 ]] || { log "ERROR: No golden files collected — check path patterns"; exit 1; }
 
 # Generate hashes.json
 python3 - "${CONTENT_DIR}" > "${WORK_DIR}/hashes.json" <<'EOF'
@@ -88,6 +109,5 @@ for root, _, files in os.walk(base):
 print(json.dumps(hashes, indent=2))
 EOF
 
-# Package
 tar -czf "${TARBALL}" -C "${CONTENT_DIR}" .
 log "Tarball written: ${TARBALL}"
