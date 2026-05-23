@@ -127,6 +127,7 @@ Tests passing is **not sufficient evidence.** Past mistakes (see `references/got
 - **`references/gotchas.md`** — accumulated pitfalls from past investigations (#438 saga, #615a-i, #481, #485-D2). Read before starting any investigation to avoid re-discovering known traps.
 - **`references/source-precedence.md`** — exact query patterns for `cardano-haskell-oracle` / `cardano-ledger-oracle`, and how to cite their output in PRs.
 - **`references/dump-schema.md`** — canonical schema fields, `HASKELL_UNCOVERABLE` list, mapping from cn 11.0.1 emission shape.
+- **`references/era-rules/`** — pre-built deep era-by-era Haskell ledger reference (~2,750 lines across 7 files: shelley-core, shelley-rewards, shelley-certs, alonzo, babbage, conway, dijkstra). **Read these BEFORE querying `cardano-haskell-oracle` live** — they cover most ledger-rule questions already with verbatim Haskell source + permalinks + Rust translation notes. See `references/era-rules/INDEX.md`.
 
 ## Anti-patterns (do not do these)
 
