@@ -218,13 +218,13 @@ pub fn compute_reward_update(
 
     let total_stake = MAX_LOVELACE_SUPPLY.saturating_sub(reserves.0);
     if total_stake == 0 {
-        // No pools can distribute, so undistributed = reward_pot.
-        // Haskell: deltaT = treasury_cut + undistributed, deltaR = expansion.
-        // expansion = treasury_cut + reward_pot - epoch_fees
-        //           = treasury_cut + (total_rewards_available - treasury_cut) - epoch_fees
-        //           = total_rewards_available - epoch_fees
-        let delta_treasury = total_rewards_available; // treasury_cut + reward_pot
-        let delta_reserves = total_rewards_available.saturating_sub(epoch_fees); // expansion
+        // #615b: Haskell's RewardUpdate carries only treasury_cut in deltaT;
+        // the undistributed portion of reward_pot is refunded to reserves via
+        // deltaR = -expansion + undistributed. With distributed=0, undistributed
+        // = reward_pot, so delta_reserves (the unsigned subtract) is
+        // expansion - reward_pot = treasury_cut - epoch_fees.
+        let delta_treasury = treasury_cut;
+        let delta_reserves = treasury_cut.saturating_sub(epoch_fees);
         return PendingRewardUpdate {
             delta_reserves,
             delta_treasury,
@@ -238,14 +238,13 @@ pub fn compute_reward_update(
     // tau cut to treasury — only the per-pool distribution loop is skipped
     // because there are no pools to distribute to.  Match that behaviour.
     //
-    // Issue #485-D2 fix: undistributed = reward_pot (all of it, since distributed=0).
-    // Haskell: deltaT = treasury_cut + undistributed, deltaR = expansion.
+    // #615b: undistributed (=reward_pot when distributed=0) goes to reserves
+    // via RewardUpdate.deltaR, NOT treasury.
     let go = match go_snapshot {
         Some(s) => s,
         None => {
-            // distributed=0, undistributed=reward_pot
-            let delta_treasury = total_rewards_available; // treasury_cut + reward_pot
-            let delta_reserves = total_rewards_available.saturating_sub(epoch_fees); // expansion
+            let delta_treasury = treasury_cut;
+            let delta_reserves = treasury_cut.saturating_sub(epoch_fees);
             return PendingRewardUpdate {
                 delta_reserves,
                 delta_treasury,
@@ -265,9 +264,9 @@ pub fn compute_reward_update(
             go.pool_params.len(),
             go.pool_stake.len()
         );
-        // distributed=0, undistributed=reward_pot
-        let delta_treasury = total_rewards_available; // treasury_cut + reward_pot
-        let delta_reserves = total_rewards_available.saturating_sub(epoch_fees); // expansion
+        // #615b: distributed=0, undistributed=reward_pot → reserves (not treasury).
+        let delta_treasury = treasury_cut;
+        let delta_reserves = treasury_cut.saturating_sub(epoch_fees);
         return PendingRewardUpdate {
             delta_reserves,
             delta_treasury,
@@ -456,21 +455,37 @@ pub fn compute_reward_update(
 
     let undistributed = reward_pot.saturating_sub(total_distributed);
 
-    // Issue #485-D2: Haskell's completeStep adds undistributed rewards to treasury
-    // (deltaT = treasury_cut + undistributed). Previously dugite only credited
-    // treasury_cut, leaving undistributed silently in reserves instead of moving it
-    // to treasury, causing a cumulative 15B-lovelace treasury deficit on preview.
+    // #615b: Haskell's `RewardUpdate` carries `deltaT = treasury_cut` only.
+    // The undistributed portion of `reward_pot` (rewards never computed because
+    // of below-pledge / zero-block / zero-stake pools) is refunded to RESERVES
+    // via deltaR (not added to treasury). See `applyRUpdFiltered` in
+    // eras/shelley/impl/src/Cardano/Ledger/Shelley/LedgerState/IncrementalStake.hs
+    // and `completeStep` in eras/shelley/impl/src/Cardano/Ledger/Shelley/LedgerState/PulsingReward.hs.
     //
-    // Conservation check (Haskell RUPD):
-    //   deltaT = treasury_cut + undistributed
-    //   deltaR = expansion  = treasury_cut + distributed + undistributed - epoch_fees
-    //          = (treasury_cut + undistributed) + distributed - epoch_fees
-    //          = delta_treasury + total_distributed - epoch_fees
+    // The earlier #485-D2 fix mis-attributed undistributed to treasury based
+    // on a misreading of completeStep — that hand-off only carries `deltaT1`
+    // (the tau cut). The separate `frTotalUnregistered` adjustment (rewards
+    // computed into rs'' for credentials that were deregistered between
+    // snapshot and apply) IS routed to treasury, but that happens at apply
+    // time in `apply_pending_reward_update` — see the unregistered→treasury
+    // branch of the per-reward loop.
     //
-    // Six-pot: -deltaR + deltaT + distributed - epoch_fees = 0 ✓
-    let delta_treasury = treasury_cut.saturating_add(undistributed);
-    // delta_reserves = expansion = delta_treasury + distributed - epoch_fees
-    let delta_reserves = delta_treasury
+    // Conservation (Haskell RUPD):
+    //   deltaT = treasury_cut
+    //   deltaR (Haskell signed: applied to reserves) = -expansion + undistributed
+    //   ⇒ dugite delta_reserves (unsigned subtract from reserves)
+    //     = expansion - undistributed
+    //     = (treasury_cut + reward_pot - epoch_fees) - undistributed
+    //     = treasury_cut + (reward_pot - undistributed) - epoch_fees
+    //     = treasury_cut + total_distributed - epoch_fees ✓
+    //
+    // Six-pot: -delta_reserves + delta_treasury + total_distributed + undistributed
+    //        − epoch_fees = -(expansion - undistributed) + treasury_cut
+    //                       + total_distributed + undistributed - epoch_fees
+    //                     = -expansion + treasury_cut + reward_pot - epoch_fees
+    //                     = 0 ✓  (since expansion = treasury_cut + reward_pot - epoch_fees)
+    let delta_treasury = treasury_cut;
+    let delta_reserves = treasury_cut
         .saturating_add(total_distributed)
         .saturating_sub(epoch_fees);
 
@@ -512,7 +527,8 @@ impl LedgerState {
             // Apply reserves decrease (monetary expansion)
             self.epochs.reserves.0 = self.epochs.reserves.0.saturating_sub(rupd.delta_reserves);
 
-            // Apply treasury increase (tau cut + undistributed)
+            // Apply treasury increase (tau cut only; undistributed went to reserves
+            // via delta_reserves above; per-reward unregistered → treasury below).
             self.epochs.treasury.0 = self.epochs.treasury.0.saturating_add(rupd.delta_treasury);
 
             // Apply per-account rewards (matching Haskell's applyRUpdFiltered):

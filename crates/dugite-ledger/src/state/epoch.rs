@@ -1174,11 +1174,17 @@ mod tests {
         // With prev_d = 1.0 (>= 0.8): eta = 1, expansion = floor(rho * reserves).
         // rho = 3/1000, so expansion = floor(3/1000 * 45_000_000_000_000_000) = 135_000_000_000_000.
         // With no pools: distributed=0, undistributed=reward_pot.
-        // Haskell: deltaT = treasury_cut + undistributed = expansion + fees = expansion (fees=0).
-        //          deltaR = expansion.
-        let expansion = 135_000_000_000_000u64;
-        let expected_delta_treasury = expansion; // treasury_cut + undistributed = expansion + fees
-        let expected_delta_reserves = expansion; // deltaR = expansion (Haskell)
+        // #615b — Haskell RewardUpdate:
+        //   deltaT = treasury_cut = floor(tau * (expansion + fees))    (tau = 2/10)
+        //   deltaR = -expansion + undistributed                        (signed; refunds reward_pot)
+        //   |change to reserves| = expansion - undistributed
+        //                        = expansion - reward_pot
+        //                        = treasury_cut + fees                 (fees=0 here)
+        // So both treasury and reserves move by treasury_cut alone.
+        let _expansion = 135_000_000_000_000u64; // floor(0.003 * MAX)
+        let treasury_cut = 27_000_000_000_000u64; // floor(0.2 * expansion)
+        let expected_delta_treasury = treasury_cut;
+        let expected_delta_reserves = treasury_cut;
 
         let treasury_before = state.epochs.treasury;
         let reserves_before = state.epochs.reserves;
@@ -1188,12 +1194,12 @@ mod tests {
         assert_eq!(
             state.epochs.treasury.0,
             treasury_before.0 + expected_delta_treasury,
-            "treasury should increase by expansion (treasury_cut + undistributed) when no pools"
+            "treasury should increase by treasury_cut only (#615b)"
         );
         assert_eq!(
             state.epochs.reserves.0,
             reserves_before.0 - expected_delta_reserves,
-            "reserves should decrease by expansion (Haskell deltaR)"
+            "reserves should decrease by treasury_cut (expansion refunded back as undistributed) (#615b)"
         );
     }
 
