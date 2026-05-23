@@ -112,30 +112,26 @@ fn decode_babbage_block_mode(
     };
 
     // -------------------------------------------------------------------------
-    // 2. tx_bodies
+    // 2. tx_bodies (definite OR indefinite-length array — cn 11.0.1 uses
+    //    indef on preview/preprod for Babbage; legacy mainnet uses definite).
     // -------------------------------------------------------------------------
-    let tx_count = r.read_array_header()?.unwrap_or(0) as usize;
-    let alloc_cap = r.safe_alloc_capacity(tx_count as u64);
-    let mut raw_bodies: Vec<Vec<u8>> = Vec::with_capacity(alloc_cap);
-    let mut parsed_bodies: Vec<TransactionBody> = Vec::with_capacity(alloc_cap);
-
-    for _ in 0..tx_count {
-        let body = KeepRaw::parse_with(&mut r, |r| decode_babbage_tx_body(r))?;
+    let mut raw_bodies: Vec<Vec<u8>> = Vec::new();
+    let mut parsed_bodies: Vec<TransactionBody> = Vec::new();
+    r.for_each_array_item(|r| {
+        let body = KeepRaw::parse_with(r, decode_babbage_tx_body)?;
         raw_bodies.push(body.raw.to_vec());
         parsed_bodies.push(body.value);
-    }
+        Ok(())
+    })?;
 
     // -------------------------------------------------------------------------
-    // 3. tx_witness_sets
+    // 3. tx_witness_sets (definite OR indefinite)
     // -------------------------------------------------------------------------
-    let witness_count = r.read_array_header()?.unwrap_or(0) as usize;
-    let ws_alloc_cap = r.safe_alloc_capacity(witness_count as u64);
-    let mut raw_witnesses: Vec<Vec<u8>> = Vec::with_capacity(ws_alloc_cap);
-    let mut parsed_witnesses: Vec<Option<TransactionWitnessSet>> = Vec::with_capacity(ws_alloc_cap);
-
-    for _ in 0..witness_count {
+    let mut raw_witnesses: Vec<Vec<u8>> = Vec::new();
+    let mut parsed_witnesses: Vec<Option<TransactionWitnessSet>> = Vec::new();
+    r.for_each_array_item(|r| {
         if mode == DecodeMode::Full {
-            let ws = KeepRaw::parse_with(&mut r, |r| decode_babbage_witness_set(r))?;
+            let ws = KeepRaw::parse_with(r, decode_babbage_witness_set)?;
             raw_witnesses.push(ws.raw.to_vec());
             parsed_witnesses.push(Some(ws.value));
         } else {
@@ -144,7 +140,8 @@ fn decode_babbage_block_mode(
             raw_witnesses.push(r.slice_from(ws_start).to_vec());
             parsed_witnesses.push(None);
         }
-    }
+        Ok(())
+    })?;
 
     // -------------------------------------------------------------------------
     // 4. auxiliary_data_set
@@ -152,14 +149,14 @@ fn decode_babbage_block_mode(
     let aux_map = decode_alonzo_aux_data_map(&mut r)?;
 
     // -------------------------------------------------------------------------
-    // 5. invalid_transactions
+    // 5. invalid_transactions (definite OR indefinite)
     // -------------------------------------------------------------------------
     let mut invalid_tx_set: std::collections::HashSet<usize> = std::collections::HashSet::new();
-    let inv_count = r.read_array_header()?.unwrap_or(0) as usize;
-    for _ in 0..inv_count {
+    r.for_each_array_item(|r| {
         let idx = r.read_uint()? as usize;
         invalid_tx_set.insert(idx);
-    }
+        Ok(())
+    })?;
 
     // -------------------------------------------------------------------------
     // Build transactions
