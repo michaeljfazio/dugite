@@ -84,7 +84,7 @@ The governor maintains six independent target counts:
 
 | Target | Default |
 |---|---|
-| Known peers | 100 |
+| Known peers | 85 |
 | Established peers | 40 |
 | Active peers | 15 |
 | Known big-ledger peers | 15 |
