@@ -43,7 +43,7 @@ network:
 # -- Prometheus metrics
 metrics:
   enabled: true
-  port: 12798
+  port: 12796
   serviceMonitor:
     # -- Create a ServiceMonitor for Prometheus Operator
     enabled: false

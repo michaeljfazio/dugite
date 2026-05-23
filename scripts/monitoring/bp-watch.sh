@@ -10,7 +10,7 @@ while sleep 120; do
   if ! kill -0 "$PID" 2>/dev/null; then
     echo "[$(date -u +%H:%M:%SZ)] EVENT proc_dead pid=$PID"; break
   fi
-  m=$(curl -fsS --max-time 10 http://127.0.0.1:12798/metrics 2>/dev/null) || { echo "[$(date -u +%H:%M:%SZ)] EVENT metrics_unreachable"; continue; }
+  m=$(curl -fsS --max-time 10 http://127.0.0.1:12797/metrics 2>/dev/null) || { echo "[$(date -u +%H:%M:%SZ)] EVENT metrics_unreachable"; continue; }
   slot=$(awk '/^dugite_slot_number /{print int($2)}' <<<"$m")
   age=$(awk '/^dugite_tip_age_seconds /{print int($2)}' <<<"$m")
   conn=$(awk '/^dugite_peers_connected /{print int($2)}' <<<"$m")

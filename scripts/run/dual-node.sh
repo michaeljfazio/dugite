@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # Run a relay + block producer pair on the Cardano preview testnet.
 #
-# Relay  : port 3001, metrics 12798, db ./db-preview-relay, socket ./relay.sock
-# BP     : port 3002, metrics 12799, db ./db-preview,       socket ./bp.sock
+# Relay  : port 3001, metrics 12796, db ./db-preview-relay, socket ./relay.sock
+# BP     : port 3002, metrics 12797, db ./db-preview,       socket ./bp.sock
 #
 # Logs are written to ./logs/relay.log and ./logs/bp.log
 # Tail them with:
@@ -54,7 +54,7 @@ echo "Starting relay node..."
 echo "  Port    : 3001"
 echo "  DB      : ./db-preview-relay"
 echo "  Socket  : ./relay.sock"
-echo "  Metrics : http://localhost:12798/metrics"
+echo "  Metrics : http://localhost:12796/metrics"
 echo "  Log     : $RELAY_LOG"
 
 "$BIN" run \
@@ -80,7 +80,7 @@ echo "Starting block producer..."
 echo "  Port    : 3002"
 echo "  DB      : ./db-preview"
 echo "  Socket  : ./bp.sock"
-echo "  Metrics : http://localhost:12799/metrics"
+echo "  Metrics : http://localhost:12797/metrics"
 echo "  Log     : $BP_LOG"
 
 "$BIN" run \

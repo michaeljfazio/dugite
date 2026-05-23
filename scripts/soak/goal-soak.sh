@@ -21,9 +21,9 @@ NETWORK="${1:?usage: $0 <preview|preprod|mainnet> [minutes]}"
 SOAK_MINUTES="${2:-30}"
 
 case "$NETWORK" in
-    preview) MAGIC=2;          PORT=3001; METRICS=12798; KOIOS_TIP="https://preview.koios.rest/api/v1/tip" ;;
-    preprod) MAGIC=1;          PORT=3001; METRICS=12798; KOIOS_TIP="https://preprod.koios.rest/api/v1/tip" ;;
-    mainnet) MAGIC=764824073;  PORT=3001; METRICS=12798; KOIOS_TIP="https://api.koios.rest/api/v1/tip" ;;
+    preview) MAGIC=2;          PORT=3001; METRICS=12796; KOIOS_TIP="https://preview.koios.rest/api/v1/tip" ;;
+    preprod) MAGIC=1;          PORT=3001; METRICS=12799; KOIOS_TIP="https://preprod.koios.rest/api/v1/tip" ;;
+    mainnet) MAGIC=764824073;  PORT=3001; METRICS=12800; KOIOS_TIP="https://api.koios.rest/api/v1/tip" ;;
     *) echo "Unknown network: $NETWORK"; exit 2 ;;
 esac
 

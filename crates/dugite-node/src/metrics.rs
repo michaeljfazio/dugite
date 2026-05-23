@@ -2962,4 +2962,52 @@ mod tests {
         shutdown_tx.send(true).ok();
         let _ = server_handle.await;
     }
+
+    // ── Port-collision guard ────────────────────────────────────────────────
+    //
+    // Verify that all dugite_* metric names are present in the Prometheus
+    // output, confirming that the namespace does not accidentally use the
+    // cardano_node_* prefix (which would collide with cardano-node when
+    // compat-metrics is not enabled).  Also documents the port convention:
+    //   Dugite relay   → 12796  (config/{preview,preprod,mainnet}/config.json)
+    //   Dugite BP      → 12797  (config/bp-pair/dugite-bp.config.json)
+    //   cardano-node   → 12798  (Haskell default; never used by dugite)
+
+    #[test]
+    fn test_prometheus_output_uses_dugite_namespace() {
+        // The default metrics output must use dugite_* names, not cardano_*.
+        // When --compat-metrics is NOT set, zero cardano_node_metrics_* lines
+        // should appear.  This ensures that co-located cardano-node (12798)
+        // and dugite-node (12796/12797) have distinct metric namespaces and
+        // curl http://127.0.0.1:12796/metrics never returns cn metrics.
+        let metrics = NodeMetrics::new();
+        metrics.set_slot(999);
+        metrics
+            .blocks_forged
+            .store(3, std::sync::atomic::Ordering::Relaxed);
+
+        let output = metrics.to_prometheus();
+
+        // Must have dugite_* names.
+        assert!(
+            output.contains("dugite_slot_number 999"),
+            "dugite_slot_number must be present in default output"
+        );
+        assert!(
+            output.contains("dugite_blocks_forged_total 3"),
+            "dugite_blocks_forged_total must be present"
+        );
+
+        // Must NOT have cardano_node_metrics_* lines when compat_metrics is off.
+        assert!(
+            !metrics
+                .compat_metrics
+                .load(std::sync::atomic::Ordering::Relaxed),
+            "compat_metrics must be false by default"
+        );
+        assert!(
+            !output.contains("cardano_node_metrics_"),
+            "cardano_node_metrics_* lines must not appear unless --compat-metrics is set"
+        );
+    }
 }

@@ -1372,8 +1372,8 @@ async fn run_node(args: RunArgs, log_handle: Option<logging::LogHandle>) -> Resu
     //   1. --no-metrics flag → 0 (disabled), takes highest precedence
     //   2. --metrics-port <PORT> CLI arg → explicit operator override
     //   3. MetricsPort field in config JSON → site-wide default from config file
-    //   4. Cardano-node default: 12798
-    const DEFAULT_METRICS_PORT: u16 = 12798;
+    //   4. Dugite default: 12796 (avoids collision with cardano-node's 12798)
+    const DEFAULT_METRICS_PORT: u16 = 12796;
     let effective_metrics_port: u16 = if args.no_metrics {
         0
     } else if let Some(cli_port) = args.metrics_port {
