@@ -193,6 +193,13 @@ impl EraRules for ShelleyRules {
                     }
                 }
             }
+            // Capture for post-boundary debug dumpers (see
+            // `epoch_state_debug::maybe_dump`).  Mirror in Conway path.
+            epochs.last_applied_rupd = Some(rupd);
+        } else {
+            // Clear any stale entry from a previous boundary so dumpers do
+            // not double-report.
+            epochs.last_applied_rupd = None;
         }
 
         // Step 2: Compute and apply RUPD using GO snapshot + bprev + ss_fee.
@@ -973,6 +980,7 @@ mod tests {
             treasury: Lovelace(0),
             reserves: Lovelace(0),
             pending_reward_update: None,
+            last_applied_rupd: None,
             pending_pp_updates: BTreeMap::new(),
             future_pp_updates: BTreeMap::new(),
             needs_stake_rebuild: false,

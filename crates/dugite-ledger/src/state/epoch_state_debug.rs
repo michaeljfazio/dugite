@@ -459,14 +459,19 @@ fn utxo_summary(state: &LedgerState) -> UtxoSummary {
 /// - `state`: the live ledger state just after the boundary handler ran.
 /// - `epoch_to`: the epoch label of the newly entered epoch.
 /// - `slot`: the slot the boundary fired at (usually first slot of the new epoch).
-/// - `rupd`: the reward update that was just applied (Some) or None if
-///   pre-boundary.
+/// - `rupd_override`: optional explicit reward update to use instead of
+///   `state.epochs.last_applied_rupd`.  Tests pass this directly;
+///   production callers pass `None` to fall through to
+///   `last_applied_rupd` (Bug 3 fix — `pending_reward_update` has
+///   already been `take()`-d by the boundary handler at the time the
+///   dump fires).
 pub fn capture(
     state: &LedgerState,
     epoch_to: u64,
     slot: u64,
-    rupd: Option<&super::PendingRewardUpdate>,
+    rupd_override: Option<&super::PendingRewardUpdate>,
 ) -> EpochStateDump {
+    let rupd = rupd_override.or(state.epochs.last_applied_rupd.as_ref());
     let cur_pp = &state.epochs.protocol_params;
     let prev_pp = &state.epochs.prev_protocol_params;
     let future_pp = next_future_pp(&state.epochs, EpochNo(epoch_to));
@@ -497,8 +502,19 @@ pub fn capture(
         scalars: Scalars {
             reserves: state.epochs.reserves.0,
             treasury: state.epochs.treasury.0,
-            fees: state.utxo.epoch_fees.0,
-            deposits_stake: state.certs.total_stake_key_deposits,
+            // Bug 1 fix: `state.utxo.epoch_fees` is reset to 0 by
+            // `process_epoch_transition` before this dump fires; read the
+            // snapshotted just-closed-epoch fee pot from `ss_fee`
+            // (Haskell's `currentEpochState.esLState.utxoState.fees`).
+            fees: state.epochs.snapshots.ss_fee.0,
+            // Bug 2 fix: Haskell reports `utxoState.deposited` which is
+            // the COMBINED stake-key + pool-registration deposit total.
+            // Stake-key portion is `total_stake_key_deposits` (3 keys × 2
+            // ADA mainnet); pool portion is `registered pools × pool_deposit`.
+            deposits_stake: state.certs.total_stake_key_deposits.saturating_add(
+                (state.certs.pool_params.len() as u64)
+                    .saturating_mul(state.epochs.protocol_params.pool_deposit.0),
+            ),
             deposits_drep: drep_deposit_total,
             deposits_proposal: proposal_deposit_total,
         },
@@ -587,16 +603,22 @@ pub fn write(dump: &EpochStateDump, dir: &Path) -> io::Result<PathBuf> {
 /// no-op.  Designed to be called once per epoch boundary, immediately
 /// after the boundary's RUPD has been applied so reward/treasury/reserve
 /// scalars reflect the new state.
+///
+/// `rupd_override` is normally `None` in production: `capture` will fall
+/// through to `state.epochs.last_applied_rupd`, which the boundary
+/// handler populated immediately after consuming
+/// `pending_reward_update`.  Tests / call sites that have a fresh handle
+/// to the just-applied rupd may pass it explicitly.
 pub fn maybe_dump(
     state: &LedgerState,
     epoch_to: u64,
     slot: u64,
-    rupd: Option<&super::PendingRewardUpdate>,
+    rupd_override: Option<&super::PendingRewardUpdate>,
 ) {
     let Some(dir) = output_dir() else {
         return;
     };
-    let dump = capture(state, epoch_to, slot, rupd);
+    let dump = capture(state, epoch_to, slot, rupd_override);
     match write(&dump, &dir) {
         Ok(path) => tracing::info!(
             ?path,
@@ -649,7 +671,11 @@ mod tests {
         s.epoch = EpochNo(42);
         s.epochs.reserves = Lovelace(10_000_000);
         s.epochs.treasury = Lovelace(20_000);
-        s.utxo.epoch_fees = Lovelace(123);
+        // Live (post-boundary, reset to 0 by handler) and snapshotted
+        // (just-closed-epoch) fee pots, distinct so Bug 1 regressions
+        // would show.
+        s.utxo.epoch_fees = Lovelace(999_999);
+        s.epochs.snapshots.ss_fee = Lovelace(123);
         s.epochs.protocol_params.protocol_version_major = 10;
         s.epochs.protocol_params.protocol_version_minor = 0;
         // Fabricate a pool registration so `pools.registered` ≠ 0.
@@ -686,12 +712,125 @@ mod tests {
         assert_eq!(dump.protocol_version.major, 10);
         assert_eq!(dump.scalars.reserves, 10_000_000);
         assert_eq!(dump.scalars.treasury, 20_000);
+        // Bug 1: fees come from snapshot `ss_fee` (123) not the
+        // post-boundary-reset `utxo.epoch_fees` (999_999).
         assert_eq!(dump.scalars.fees, 123);
         assert_eq!(dump.pools.registered, 1);
         assert_eq!(dump.pools.retiring, 1);
         assert_eq!(dump.pools.retired_this_epoch, 1);
         assert_eq!(dump.rewards.total_distributed, 0);
         assert_eq!(dump.governance.cc_threshold_den, 1);
+    }
+
+    /// Bug 1: `scalars.fees` must read from the snapshot `ss_fee`, not
+    /// `utxo.epoch_fees` (which `process_epoch_transition` zeroes
+    /// before the dump fires).
+    #[test]
+    fn capture_reads_fees_from_ss_fee_not_live_epoch_fees() {
+        let mut state = make_state();
+        // Simulate the post-boundary state: handler has reset
+        // `utxo.epoch_fees` but `ss_fee` retains the just-closed epoch's
+        // total.
+        state.utxo.epoch_fees = Lovelace(0);
+        state.epochs.snapshots.ss_fee = Lovelace(7_777_777);
+        let dump = capture(&state, 5, 10, None);
+        assert_eq!(dump.scalars.fees, 7_777_777);
+    }
+
+    /// Bug 2: `scalars.deposits_stake` must include BOTH stake-key
+    /// deposits AND pool-registration deposits, matching Haskell's
+    /// `utxoState.deposited`.
+    #[test]
+    fn capture_combines_stake_key_and_pool_deposits() {
+        let mut state = make_state();
+        // Preview epoch-1 scenario: 3 stake keys × 2 ADA + 3 pools × 500 ADA.
+        state.certs.total_stake_key_deposits = 3 * 2_000_000;
+        state.epochs.protocol_params.pool_deposit = Lovelace(500_000_000);
+        // Add two extra pools so the count is 3 total.
+        let mut pmap: HashMap<Hash28, PoolRegistration> = (*state.certs.pool_params).clone();
+        for b in [0x10u8, 0x11] {
+            let pid = h28(b);
+            pmap.insert(
+                pid,
+                PoolRegistration {
+                    pool_id: pid,
+                    vrf_keyhash: h32(0xee),
+                    pledge: Lovelace(0),
+                    cost: Lovelace(340_000_000),
+                    margin_numerator: 1,
+                    margin_denominator: 20,
+                    reward_account: vec![0xe0; 29],
+                    owners: vec![h28(0xbb)],
+                    relays: vec![],
+                    metadata_url: None,
+                    metadata_hash: None,
+                },
+            );
+        }
+        state.certs.pool_params = Arc::new(pmap);
+        let dump = capture(&state, 1, 0, None);
+        // Expected: 3 × 500_000_000 + 3 × 2_000_000 = 1_506_000_000
+        assert_eq!(dump.scalars.deposits_stake, 1_506_000_000);
+    }
+
+    /// Bug 3: when the production caller passes `None` for the rupd
+    /// override, the dumper falls through to `last_applied_rupd`
+    /// (which the boundary handler populated immediately after
+    /// `take()`-ing `pending_reward_update`).
+    #[test]
+    fn capture_falls_through_to_last_applied_rupd() {
+        let mut state = make_state();
+        let pool_id = h28(0xaa);
+        let cred_a = h32(0x01);
+        let mut deleg: HashMap<Hash32, Hash28> = HashMap::new();
+        deleg.insert(cred_a, pool_id);
+        state.epochs.snapshots.go = Some(StakeSnapshot {
+            epoch: EpochNo(40),
+            delegations: Arc::new(deleg),
+            pool_stake: HashMap::new(),
+            pool_params: Arc::new(HashMap::new()),
+            stake_distribution: Arc::new(HashMap::new()),
+            epoch_fees: Lovelace(0),
+            epoch_block_count: 0,
+            epoch_blocks_by_pool: Arc::new(HashMap::new()),
+        });
+        let mut rewards = HashMap::new();
+        rewards.insert(cred_a, Lovelace(42));
+        // Production sequence: boundary handler takes() pending_reward_update
+        // then stores it into `last_applied_rupd` so post-boundary
+        // dumpers can still see it.
+        state.epochs.pending_reward_update = None;
+        state.epochs.last_applied_rupd = Some(PendingRewardUpdate {
+            rewards,
+            delta_treasury: 0,
+            delta_reserves: 42,
+        });
+        let dump = capture(&state, 42, 432_000, None);
+        assert_eq!(dump.rewards.total_distributed, 42);
+        assert_eq!(dump.rewards.per_pool_top20.len(), 1);
+    }
+
+    /// Bug 3 corollary: if both `last_applied_rupd` and an explicit
+    /// override are present, the explicit override wins.  Lets future
+    /// callers that have the freshly-taken rupd in hand bypass the
+    /// indirection.
+    #[test]
+    fn capture_override_takes_precedence_over_last_applied() {
+        let mut state = make_state();
+        state.epochs.last_applied_rupd = Some(PendingRewardUpdate {
+            rewards: HashMap::new(),
+            delta_treasury: 0,
+            delta_reserves: 1,
+        });
+        let mut rewards = HashMap::new();
+        rewards.insert(h32(0x99), Lovelace(7));
+        let override_rupd = PendingRewardUpdate {
+            rewards,
+            delta_treasury: 0,
+            delta_reserves: 7,
+        };
+        let dump = capture(&state, 42, 432_000, Some(&override_rupd));
+        assert_eq!(dump.rewards.total_distributed, 7);
     }
 
     #[test]

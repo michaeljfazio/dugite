@@ -252,7 +252,12 @@ impl LedgerState {
                     self,
                     next_epoch.0,
                     block.slot().0,
-                    self.epochs.pending_reward_update.as_ref(),
+                    // `pending_reward_update` was take()-d by the boundary
+                    // handler before this dump fires, so passing it here
+                    // always yielded None (Bug 3).  Pass `None` so the
+                    // dumper falls through to `last_applied_rupd`, which
+                    // the handler populated during the boundary.
+                    None,
                 );
             }
         }

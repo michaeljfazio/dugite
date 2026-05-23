@@ -300,6 +300,10 @@ impl From<LedgerStateSnapshot> for super::LedgerState {
                 treasury: s.treasury,
                 reserves: s.reserves,
                 pending_reward_update: s.pending_reward_update,
+                // Not persisted to ledger snapshots — this is a
+                // post-boundary debug-dump aid only.  Recomputed on the
+                // next epoch boundary.
+                last_applied_rupd: None,
                 pending_pp_updates: s.pending_pp_updates,
                 future_pp_updates: s.future_pp_updates,
                 needs_stake_rebuild: s.needs_stake_rebuild,
