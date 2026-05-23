@@ -1,0 +1,44 @@
+cabal-version:      3.0
+name:               dugite-fixture-gen
+version:            0.1.0
+synopsis:           Generates Conway ledger STS conformance fixtures for Dugite
+description:
+    Standalone executable that produces CBOR-encoded Conway ledger
+    STS test vectors (4 files per test case) for use in Dugite's
+    Phase 4 upstream conformance testing.
+
+    Unlike ImpSpec (which only dumps on Haskell/Agda divergences),
+    this generator produces test vectors from known valid STS transitions.
+    It instantiates Conway NewEpochState with `def`, runs the NEWEPOCH STS
+    rule via `applySTS`, and serializes the initial state + signal as CBOR.
+
+    Each test case directory contains:
+      conformance_dump_ctx.cbor   -- unit () encoded as CBOR null (0xF6)
+      conformance_dump_env.cbor   -- unit () encoded as CBOR null (0xF6)
+      conformance_dump_st.cbor    -- NewEpochState (initial, before transition)
+      conformance_dump_sig.cbor   -- EpochNo signal (CBOR uint)
+
+license:            Apache-2.0
+author:             Dugite contributors
+build-type:         Simple
+
+executable dugite-fixture-gen
+  main-is:          Main.hs
+  hs-source-dirs:   src
+  default-language: Haskell2010
+  ghc-options:      -Wall -Wno-unused-imports -Wno-unused-do-bind
+  build-depends:
+      base               >= 4.18 && < 5
+    , bytestring
+    , containers
+    , data-default-class
+    , mtl
+    , directory
+    , filepath
+    , time
+    , cardano-ledger-binary
+    , cardano-ledger-core
+    , cardano-ledger-shelley
+    , cardano-ledger-conway
+    , small-steps
+    , cardano-slotting
