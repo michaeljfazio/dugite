@@ -230,6 +230,7 @@ fn test_apply_block_with_transaction() {
             sub_transactions: vec![],
             account_balance_intervals: vec![],
             direct_deposits: ::std::collections::BTreeMap::new(),
+            guards: Vec::new(),
         },
         witness_set: TransactionWitnessSet {
             vkey_witnesses: vec![],
@@ -318,6 +319,7 @@ fn test_apply_block_skips_invalid_tx() {
             sub_transactions: vec![],
             account_balance_intervals: vec![],
             direct_deposits: ::std::collections::BTreeMap::new(),
+            guards: Vec::new(),
         },
         witness_set: TransactionWitnessSet {
             vkey_witnesses: vec![],
@@ -622,6 +624,7 @@ fn test_fee_accumulation() {
             sub_transactions: vec![],
             account_balance_intervals: vec![],
             direct_deposits: ::std::collections::BTreeMap::new(),
+            guards: Vec::new(),
         },
         witness_set: TransactionWitnessSet {
             vkey_witnesses: vec![],
@@ -1971,6 +1974,7 @@ fn test_treasury_donation() {
             sub_transactions: vec![],
             account_balance_intervals: vec![],
             direct_deposits: ::std::collections::BTreeMap::new(),
+            guards: Vec::new(),
         },
         witness_set: TransactionWitnessSet {
             vkey_witnesses: vec![],
@@ -3974,6 +3978,7 @@ fn test_utxo_stake_distribution_tracking() {
             sub_transactions: vec![],
             account_balance_intervals: vec![],
             direct_deposits: ::std::collections::BTreeMap::new(),
+            guards: Vec::new(),
         },
         witness_set: TransactionWitnessSet {
             vkey_witnesses: vec![],
@@ -4680,6 +4685,7 @@ fn test_invalid_tx_uses_collateral_for_fees_not_declared_fee() {
             sub_transactions: vec![],
             account_balance_intervals: vec![],
             direct_deposits: ::std::collections::BTreeMap::new(),
+            guards: Vec::new(),
         },
         witness_set: TransactionWitnessSet {
             vkey_witnesses: vec![],
@@ -4776,6 +4782,7 @@ fn test_invalid_tx_collateral_with_return() {
             sub_transactions: vec![],
             account_balance_intervals: vec![],
             direct_deposits: ::std::collections::BTreeMap::new(),
+            guards: Vec::new(),
         },
         witness_set: TransactionWitnessSet {
             vkey_witnesses: vec![],
@@ -4860,6 +4867,7 @@ fn test_invalid_tx_total_collateral_field() {
             sub_transactions: vec![],
             account_balance_intervals: vec![],
             direct_deposits: ::std::collections::BTreeMap::new(),
+            guards: Vec::new(),
         },
         witness_set: TransactionWitnessSet {
             vkey_witnesses: vec![],
@@ -10594,6 +10602,7 @@ fn make_delegation_block(
             sub_transactions: vec![],
             account_balance_intervals: vec![],
             direct_deposits: ::std::collections::BTreeMap::new(),
+            guards: Vec::new(),
         },
         witness_set: TransactionWitnessSet {
             vkey_witnesses: vec![],
@@ -10674,6 +10683,7 @@ fn make_pool_registration_block(
             sub_transactions: vec![],
             account_balance_intervals: vec![],
             direct_deposits: ::std::collections::BTreeMap::new(),
+            guards: Vec::new(),
         },
         witness_set: TransactionWitnessSet {
             vkey_witnesses: vec![],
@@ -11939,6 +11949,7 @@ fn make_invalid_tx_with_collateral(
             sub_transactions: vec![],
             account_balance_intervals: vec![],
             direct_deposits: ::std::collections::BTreeMap::new(),
+            guards: Vec::new(),
         },
         witness_set: TransactionWitnessSet {
             vkey_witnesses: vec![],
@@ -13043,6 +13054,7 @@ fn make_simple_tx(
             sub_transactions: vec![],
             account_balance_intervals: vec![],
             direct_deposits: ::std::collections::BTreeMap::new(),
+            guards: Vec::new(),
         },
         witness_set: TransactionWitnessSet {
             vkey_witnesses: vec![],
@@ -13137,6 +13149,7 @@ fn make_tx_with_treasury(
             sub_transactions: vec![],
             account_balance_intervals: vec![],
             direct_deposits: ::std::collections::BTreeMap::new(),
+            guards: Vec::new(),
         },
         witness_set: TransactionWitnessSet {
             vkey_witnesses: vec![],
@@ -13199,6 +13212,7 @@ fn make_tx_with_committee_hot_auth(
             sub_transactions: vec![],
             account_balance_intervals: vec![],
             direct_deposits: ::std::collections::BTreeMap::new(),
+            guards: Vec::new(),
         },
         witness_set: TransactionWitnessSet {
             vkey_witnesses: vec![],
@@ -13515,6 +13529,7 @@ fn make_tx_with_redeemers(tx_hash_byte: u8, mem: u64, steps: u64) -> Transaction
             sub_transactions: vec![],
             account_balance_intervals: vec![],
             direct_deposits: ::std::collections::BTreeMap::new(),
+            guards: Vec::new(),
         },
         witness_set: TransactionWitnessSet {
             vkey_witnesses: vec![],
@@ -13811,6 +13826,7 @@ fn make_invalid_tx_with_col_return(
             sub_transactions: vec![],
             account_balance_intervals: vec![],
             direct_deposits: ::std::collections::BTreeMap::new(),
+            guards: Vec::new(),
         },
         witness_set: TransactionWitnessSet {
             vkey_witnesses: vec![],
@@ -14290,6 +14306,7 @@ fn test_treasury_donation_accumulates_correctly() {
             sub_transactions: vec![],
             account_balance_intervals: vec![],
             direct_deposits: ::std::collections::BTreeMap::new(),
+            guards: Vec::new(),
         },
         witness_set: TransactionWitnessSet {
             vkey_witnesses: vec![],
@@ -14940,6 +14957,7 @@ fn make_donation_tx(state: &mut LedgerState, unique_id: u8, donation_lovelace: u
             sub_transactions: vec![],
             account_balance_intervals: vec![],
             direct_deposits: ::std::collections::BTreeMap::new(),
+            guards: Vec::new(),
         },
         witness_set: TransactionWitnessSet {
             vkey_witnesses: vec![],
