@@ -1,0 +1,48 @@
+//! Upstream conformance test suite.
+//!
+//! Run with:
+//!   DUGITE_REQUIRE_UPSTREAM=1 cargo nextest run -p dugite-conformance \
+//!     --features upstream-conformance --test upstream_tests
+//!
+//! In development (without DUGITE_REQUIRE_UPSTREAM) the tests silently skip
+//! when fixtures are not present. CI sets DUGITE_REQUIRE_UPSTREAM=1, making
+//! missing fixtures a hard failure.
+
+use dugite_conformance::upstream::{fixtures, status};
+
+// ── Status banner (always runs) ───────────────────────────────────────────────
+
+#[test]
+fn upstream_fixtures_status() {
+    status::check_and_report();
+}
+
+// ── ouroboros-consensus ───────────────────────────────────────────────────────
+
+#[test]
+fn ouroboros_consensus_golden_decodes() {
+    let Some(dir) = fixtures::check_area("ouroboros-consensus") else {
+        return;
+    };
+    dugite_conformance::upstream::ouroboros_consensus::run_all_checks(&dir);
+}
+
+// ── cardano-ledger ────────────────────────────────────────────────────────────
+
+#[test]
+fn cardano_ledger_golden_decodes() {
+    let Some(dir) = fixtures::check_area("cardano-ledger") else {
+        return;
+    };
+    dugite_conformance::upstream::cardano_ledger::run_all_checks(&dir);
+}
+
+// ── cardano-node ──────────────────────────────────────────────────────────────
+
+#[test]
+fn cardano_node_genesis_decodes() {
+    let Some(dir) = fixtures::check_area("cardano-node") else {
+        return;
+    };
+    dugite_conformance::upstream::cardano_node::run_all_checks(&dir);
+}

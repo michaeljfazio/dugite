@@ -20,9 +20,13 @@ checkpoints.json
 .claude/worktrees/
 .DS_Store
 
-# UPLC conformance test corpus — downloaded on demand from the Plutus
-# repository by scripts/dev/download-plutus-conformance.sh. Not vendored
-# (would balloon the repo and mask drift from upstream).
+# Upstream conformance corpus fixtures — downloaded on demand via
+# `cargo xtask download-upstream-fixtures` (or `just download-upstream-fixtures`).
+# Not vendored: would balloon the repo and mask drift from upstream.
+/tests/conformance/upstream/fixtures/
+
+# Legacy UPLC-only path; kept for existing checkouts until Phase 1 migration
+# removes the old conformance download script.
 /crates/dugite-uplc/tests/conformance/
 
 # Nix
