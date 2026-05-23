@@ -4,6 +4,11 @@ version.workspace = true
 edition.workspace = true
 publish = false
 description = "Dugite workspace task runner — download-upstream-fixtures binary"
+default-run = "xtask"
+
+[[bin]]
+name = "xtask"
+path = "src/bin/xtask.rs"
 
 [[bin]]
 name = "download-upstream-fixtures"

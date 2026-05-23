@@ -8,11 +8,17 @@ use super::fixtures;
 
 /// Strip CBOR tag 24 (embedded CBOR bytes) from a consensus Block_<Era> golden.
 /// Returns the inner byte string contents.
+///
+/// Tag 24 encoding: `d8 18` (major 6 additional 24) followed by a CBOR bstr
+/// whose payload is the embedded CBOR. The bstr header byte (bytes[2]) encodes
+/// major type 2 (bstr) combined with the additional-info field; the additional-
+/// info field selects short/one-byte/two-byte/four-byte length encoding.
 pub fn unwrap_tag24(bytes: &[u8]) -> Vec<u8> {
-    // Tag 24 is encoded as D8 18 (major 6, additional 24) followed by a
-    // bstr payload containing the embedded CBOR.
     if bytes.len() >= 3 && bytes[0] == 0xd8 && bytes[1] == 0x18 {
-        let (payload_start, len) = match bytes[2] {
+        // bytes[2] is the full CBOR bstr byte: major_type (bits 7-5) | additional (bits 4-0)
+        // Major type for bstr is 2 (0b010xxxxx = 0x40-0x5F range for bstr headers).
+        let additional = bytes[2] & 0x1f;
+        let (payload_start, len) = match additional {
             n if n < 0x18 => (3, n as usize),
             0x18 => {
                 if bytes.len() < 4 {
@@ -33,6 +39,15 @@ pub fn unwrap_tag24(bytes: &[u8]) -> Vec<u8> {
                 (
                     7,
                     u32::from_be_bytes([bytes[3], bytes[4], bytes[5], bytes[6]]) as usize,
+                )
+            }
+            0x1b => {
+                if bytes.len() < 11 {
+                    return bytes.to_vec();
+                }
+                (
+                    11,
+                    u64::from_be_bytes(bytes[3..11].try_into().unwrap()) as usize,
                 )
             }
             _ => return bytes.to_vec(),

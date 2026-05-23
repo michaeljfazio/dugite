@@ -23,7 +23,7 @@
 //! exercised here — parser, flat round-trip, CEK machine, readback —
 //! is first-party dugite-uplc code.
 
-#![cfg(feature = "conformance")]
+#![cfg(any(feature = "conformance", feature = "upstream-conformance"))]
 #![allow(clippy::expect_used, clippy::unwrap_used, clippy::panic)]
 // When the conformance corpus is not downloaded, build.rs emits a single
 // sentinel `#[test]` that doesn't reference any of the helpers below.

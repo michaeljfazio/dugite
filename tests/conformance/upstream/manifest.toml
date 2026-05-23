@@ -12,7 +12,7 @@
 [release]
 repo = "michaeljfazio/dugite"
 # Updated to the first real corpus release once Phase 0 workflow runs.
-tag  = "conformance-corpus-v00000000-000000"
+tag  = "conformance-corpus-v20260523-070720"
 
 [area.ouroboros-consensus]
 asset  = "ouroboros-consensus.tar.gz"
