@@ -595,33 +595,34 @@ impl EraRules for ShelleyRules {
         ctx: &RuleContext,
         consensus: &mut ConsensusSubState,
     ) {
-        // Compute the first slot of the next epoch for stability window check.
-        let first_slot_of_next_epoch = ctx
+        // Compute first slots of current and next epochs.
+        let first_slot_of_current_epoch = ctx
             .current_epoch
             .0
-            .saturating_add(1)
             .saturating_mul(ctx.epoch_length)
             .saturating_add(
                 ctx.shelley_transition_epoch
                     .saturating_mul(ctx.byron_epoch_length),
             );
+        let first_slot_of_next_epoch = first_slot_of_current_epoch.saturating_add(ctx.epoch_length);
 
-        // Compute the d value for the block counting overlay check.
-        let d_value = if ctx.params.protocol_version_major >= 7 {
-            0.0
+        // For Babbage+ (proto >= 7), Haskell forces d=0 (full Praos).
+        // Pre-Babbage uses the current pparams d as a rational.
+        let (d_num, d_den) = if ctx.params.protocol_version_major >= 7 {
+            (0u64, 1u64)
         } else {
-            let d_n = ctx.params.d.numerator as f64;
-            let d_d = ctx.params.d.denominator.max(1) as f64;
-            d_n / d_d
+            (ctx.params.d.numerator, ctx.params.d.denominator.max(1))
         };
 
         // Shelley through Mary use 3k/f stability window (not 4k/f).
         common::compute_shelley_nonce(
             header,
             ctx.current_slot,
+            first_slot_of_current_epoch,
             first_slot_of_next_epoch,
             ctx.stability_window_3kf,
-            d_value,
+            d_num,
+            d_den,
             consensus,
         );
     }
