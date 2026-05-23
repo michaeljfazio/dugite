@@ -202,17 +202,26 @@ impl EraRules for ConwayRules {
         epochs: &mut EpochSubState,
     ) -> Result<UtxoDiff, LedgerError> {
         // Step 1: validateTreasuryValue.
-        // If the transaction declares a treasury value, verify it matches.
-        // During apply-only (sync from chain), we skip this check since the
-        // block producer already validated it.
+        // Per Haskell `Cardano.Ledger.Conway.Rules.Utxo` — `validateTreasuryValue`
+        // raises `MismatchedTreasuryValue` predicate failure when the
+        // transaction's declared `currentTreasuryValue` (CBOR key 21) does not
+        // equal the actual treasury. Fires UNCONDITIONALLY in both live and
+        // historical block application — there is no mode gate in Haskell.
+        //
+        // Previously dugite logged this and continued (an "apply-only not
+        // fatal" workaround for the non-byte-exact reward calc bug). Now that
+        // preview reward calc is byte-exact (issue #626 fixed), the check
+        // should fire unconditionally.
         if let Some(declared_treasury) = tx.body.treasury_value {
             if declared_treasury != epochs.treasury {
-                debug!(
-                    tx_hash = %tx.hash.to_hex(),
-                    declared = declared_treasury.0,
-                    actual = epochs.treasury.0,
-                    "Conway: treasury value mismatch (apply-only, not fatal)"
-                );
+                return Err(LedgerError::BlockTxValidationFailed {
+                    slot: ctx.current_slot,
+                    tx_hash: tx.hash.to_hex(),
+                    errors: format!(
+                        "MismatchedTreasuryValue: declared {} != actual {}",
+                        declared_treasury.0, epochs.treasury.0
+                    ),
+                });
             }
         }
 
