@@ -237,11 +237,11 @@ for rule_dir in "${DUMP_DIR}"/*/; do
             fi
         done
 
-        ((TEST_CASE_COUNT++))
+        TEST_CASE_COUNT=$((TEST_CASE_COUNT + 1))
         rule_found=1
     done
 
-    [[ $rule_found -eq 1 ]] && ((RULE_COUNT++))
+    [[ $rule_found -eq 1 ]] && { RULE_COUNT=$((RULE_COUNT + 1)); }
 done
 
 log "Captured ${TEST_CASE_COUNT} test cases across ${RULE_COUNT} rule(s)"
