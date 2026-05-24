@@ -264,20 +264,54 @@ download-upstream-fixtures-area AREA:
     cargo xtask download-upstream-fixtures --area {{AREA}}
 
 # Run the full upstream conformance test suite (all areas, REQUIRE mode).
-test-upstream:
-    DUGITE_REQUIRE_UPSTREAM=1 cargo nextest run -p dugite-uplc --features upstream-conformance --test conformance
-    DUGITE_REQUIRE_UPSTREAM=1 cargo nextest run -p dugite-conformance --features upstream-conformance --test upstream_tests
+# Aggregates every per-area `conformance-*` recipe below.
+test-upstream: conformance-uplc conformance-cardano-base conformance-cardano-ledger conformance-cardano-node conformance-ledger-rules conformance-mithril conformance-ouroboros-consensus conformance-status
 
 # Run the regeneration pipeline locally (produces tarballs in target/conformance-corpus/).
 regenerate-corpus-local:
     bash scripts/regenerate-conformance-corpus/regenerate.sh --local
 
-# ─── UPLC conformance ────────────────────────────────────────────────────────
+# ─── Per-area conformance recipes ────────────────────────────────────────────
+#
+# Each recipe runs a single upstream-conformance test area in REQUIRE mode
+# (fails if the fixture is missing rather than skipping).  Run them individually
+# while iterating on a specific area; run `just test-upstream` for the full
+# suite.  All require `just download-upstream-fixtures` to have been run first.
 
-# Run the UPLC conformance test suite (requires the corpus to have been fetched).
-# Uses the unified fixture root (tests/conformance/upstream/fixtures/plutus/).
-uplc-conformance:
-    cargo nextest run -p dugite-uplc --features upstream-conformance --test conformance
+# UPLC: 999 plutus-core evaluation vectors from IntersectMBO/plutus.
+conformance-uplc:
+    DUGITE_REQUIRE_UPSTREAM=1 cargo nextest run -p dugite-uplc --features upstream-conformance --test conformance
+
+# Alias for `conformance-uplc` — kept for backwards compatibility.
+uplc-conformance: conformance-uplc
+
+# cardano-base: VRF v03 (PraosBatchCompatVRF) test vectors.
+conformance-cardano-base:
+    DUGITE_REQUIRE_UPSTREAM=1 cargo nextest run -p dugite-conformance --features upstream-conformance --test upstream_tests -E 'test(cardano_base_vrf_checks)'
+
+# cardano-ledger: golden block/tx decode + CDDL/PParams round-trips.
+conformance-cardano-ledger:
+    DUGITE_REQUIRE_UPSTREAM=1 cargo nextest run -p dugite-conformance --features upstream-conformance --test upstream_tests -E 'test(cardano_ledger_golden_decodes)'
+
+# cardano-node: genesis-spec JSON decode (Byron + Shelley + Alonzo + Conway).
+conformance-cardano-node:
+    DUGITE_REQUIRE_UPSTREAM=1 cargo nextest run -p dugite-conformance --features upstream-conformance --test upstream_tests -E 'test(cardano_node_genesis_decodes)'
+
+# ledger-rules: ImpSpec NEWEPOCH + LEDGER CBOR replay (the largest area; multi-minute).
+conformance-ledger-rules:
+    DUGITE_REQUIRE_UPSTREAM=1 cargo nextest run -p dugite-conformance --features upstream-conformance --test upstream_tests -E 'test(ledger_rules_imp_spec_replay)'
+
+# mithril: certificate fixture verification.
+conformance-mithril:
+    DUGITE_REQUIRE_UPSTREAM=1 cargo nextest run -p dugite-conformance --features upstream-conformance --test upstream_tests -E 'test(mithril_certificate_checks)'
+
+# ouroboros-consensus: per-era golden block/header decode round-trips.
+conformance-ouroboros-consensus:
+    DUGITE_REQUIRE_UPSTREAM=1 cargo nextest run -p dugite-conformance --features upstream-conformance --test upstream_tests -E 'test(ouroboros_consensus_golden_decodes)'
+
+# Meta: verify every required fixture file is present at the manifest-pinned tag.
+conformance-status:
+    DUGITE_REQUIRE_UPSTREAM=1 cargo nextest run -p dugite-conformance --features upstream-conformance --test upstream_tests -E 'test(upstream_fixtures_status)'
 
 # ─── Dev / release ───────────────────────────────────────────────────────────
 
