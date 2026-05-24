@@ -119,6 +119,7 @@ byteorder = "1"
 derive_more = { version = "2", features = ["display", "from"] }
 dashmap = "6"
 parking_lot = "0.12"
+arc-swap = "1"
 num-bigint = { version = "0.4", features = ["serde"] }
 num-rational = "0.4"
 num-traits = "0.2"

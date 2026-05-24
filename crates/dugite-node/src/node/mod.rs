@@ -13,6 +13,7 @@ pub(crate) mod block_fetch_logic;
 #[allow(dead_code)] // networking rewrite module, wired in soon
 pub(crate) mod connection_lifecycle;
 pub(crate) mod epoch;
+pub(crate) mod ledger_view;
 pub(crate) mod n2c_query;
 pub(crate) mod networking;
 #[allow(dead_code)] // networking rewrite module, wired in soon
@@ -324,6 +325,14 @@ pub struct Node {
     pub(crate) topology: Topology,
     pub(crate) chain_db: Arc<RwLock<ChainDB>>,
     pub(crate) ledger_state: Arc<RwLock<LedgerState>>,
+    /// Lock-free read-only view of stable ledger state, published by the
+    /// apply path after each successful advance (issue #651 P2 / #652 P0).
+    /// Use [`Node::view`] to load atomically without taking the
+    /// `ledger_state` `RwLock`. Strict readers (forge VRF leader check at
+    /// precise tip, mempool revalidation against the new tip) must continue
+    /// to acquire `ledger_state.read().await` — those paths are not on the
+    /// contention surface.
+    pub(crate) ledger_view: Arc<arc_swap::ArcSwap<ledger_view::LedgerView>>,
     /// Volatile delta window for O(1) rollback.
     ///
     /// Kept in sync with `ledger_state`: after each `apply_block_with_delta`,
@@ -1277,6 +1286,15 @@ impl Node {
             ),
         ));
 
+        // Issue #651 P2 / #652 P0 — build the initial lock-free read view
+        // from the freshly-loaded ledger BEFORE wrapping it in the
+        // `RwLock` (Node::new is sync; we can't `await` on the lock here).
+        // Subsequent publishes happen at the end of each successful apply
+        // path via `publish_ledger_view`.
+        let ledger_view = Arc::new(arc_swap::ArcSwap::from_pointee(
+            ledger_view::LedgerView::from_state(&ledger),
+        ));
+
         let ledger_state = Arc::new(RwLock::new(ledger));
 
         let mut consensus = if let Some(ref genesis) = shelley_genesis {
@@ -1701,6 +1719,7 @@ impl Node {
             topology: args.topology,
             chain_db,
             ledger_state,
+            ledger_view,
             ledger_seq,
             consensus,
             mempool,
@@ -1768,6 +1787,41 @@ impl Node {
             peer_intersection_established: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             ingestion_paused: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         })
+    }
+
+    // ─── Lock-free ledger view (issue #651 P2 / #652 P0) ─────────────────────
+
+    /// Load the most recently published [`ledger_view::LedgerView`]
+    /// without taking the `ledger_state` `RwLock`. Returns an `Arc` that
+    /// extends the view's lifetime past any subsequent publish, so the
+    /// caller observes a stable snapshot.
+    ///
+    /// Staleness: up to one apply step (block / rollback / epoch
+    /// transition). Strict readers must keep using
+    /// `ledger_state.read().await`.
+    #[allow(dead_code)] // wired in by per-call-site migration follow-ups
+    pub fn view(&self) -> Arc<ledger_view::LedgerView> {
+        self.ledger_view.load_full()
+    }
+
+    /// Publish a fresh `LedgerView` from `ls`, replacing the previous
+    /// view. Called from every successful apply path while the
+    /// `ledger_state` write lock is still held (cheapest publish: no
+    /// extra lock acquisition; the view captures the just-applied state).
+    /// The actual store is a single atomic pointer swap.
+    pub(crate) fn publish_ledger_view(&self, ls: &LedgerState) {
+        self.ledger_view
+            .store(Arc::new(ledger_view::LedgerView::from_state(ls)));
+    }
+
+    /// Convenience: re-publish the view by taking the read lock and
+    /// constructing from current state. Used by call sites that no
+    /// longer hold the write lock when they want to refresh the view
+    /// (e.g. after `post_block_apply_updates` has run).
+    #[allow(dead_code)] // wired in by per-call-site migration follow-ups
+    pub(crate) async fn publish_view_now(&self) {
+        let ls = self.ledger_state.read().await;
+        self.publish_ledger_view(&ls);
     }
 
     // ─── run() ───────────────────────────────────────────────────────────────
@@ -4032,6 +4086,8 @@ impl Node {
                                             let mut ls = self.ledger_state.write().await;
                                             match ls.apply_block_with_delta(&fork_block, validation_mode) {
                                                 Ok(delta) => {
+                                                    // Publish view post-apply (#651 P2 / #652 P0).
+                                                    self.publish_ledger_view(&ls);
                                                     // Propagate era transitions discovered during fork replay.
                                                     if let Some((prev_era, new_era, epoch)) =
                                                         ls.pending_era_transition.take()
@@ -4286,6 +4342,10 @@ impl Node {
             let mut ls = self.ledger_state.write().await;
             match ls.apply_block_with_delta(&block, validation_mode) {
                 Ok(delta) => {
+                    // Publish the lock-free read view immediately after
+                    // apply (issue #651 P2 / #652 P0) — readers see the
+                    // new tip without acquiring the ledger lock.
+                    self.publish_ledger_view(&ls);
                     // Consume pending era transition and propagate to the HFC state machine.
                     if let Some((prev_era, new_era, epoch)) = ls.pending_era_transition.take() {
                         let mut eh = self.era_history.write().await;
@@ -4424,13 +4484,17 @@ impl Node {
         self.metrics.set_block_number(block_number.0);
         self.metrics.set_slot(block_slot.0);
         {
-            let ls = self.ledger_state.read().await;
-            // Era-aware tip-age (see Node::slot_to_wallclock_ms).
+            // Lock-free read from the published view (#651 P2 / #652 P0).
+            // The apply path just published this view from the same
+            // LedgerState that the previous `ledger_state.read().await`
+            // would have observed — staleness window is the single
+            // atomic store between apply and this load.
+            let view = self.view();
             let slot_time_ms = self
-                .slot_to_wallclock_ms(block_slot.0, &ls.slot_config)
+                .slot_to_wallclock_ms(block_slot.0, &view.slot_config)
                 .await;
             self.metrics.set_tip_slot_time_ms(slot_time_ms);
-            self.metrics.set_epoch(ls.epoch.0);
+            self.metrics.set_epoch(view.epoch.0);
         }
         self.metrics.refresh_sync_progress(block_slot.0);
 
@@ -4987,6 +5051,9 @@ impl Node {
     ) -> LedgerState {
         let mut ledger = LedgerState::new(protocol_params.clone());
         if let Some(genesis) = shelley_genesis {
+            // Must run BEFORE seed_genesis_utxos so reserves init from the
+            // genesis cap (devnets use 60B, mainnet/preview/preprod 45B).
+            ledger.set_max_lovelace_supply(genesis.max_lovelace_supply);
             ledger.set_epoch_length(genesis.epoch_length, genesis.security_param);
             ledger.set_slot_config(genesis.slot_config());
             ledger.set_update_quorum(genesis.update_quorum);
@@ -6027,6 +6094,8 @@ impl Node {
                                             .apply_block_with_delta(&fork_block, validation_mode)
                                         {
                                             Ok(delta) => {
+                                                // Publish view post-apply (#651 P2 / #652 P0).
+                                                self.publish_ledger_view(&ls);
                                                 if let Some((prev_era, new_era, epoch)) =
                                                     ls.pending_era_transition.take()
                                                 {
@@ -6117,7 +6186,11 @@ impl Node {
                 let forged_delta = {
                     let mut ls = self.ledger_state.write().await;
                     match ls.apply_block_with_delta(&block, BlockValidationMode::ValidateAll) {
-                        Ok(delta) => delta,
+                        Ok(delta) => {
+                            // Publish view post-apply (#651 P2 / #652 P0).
+                            self.publish_ledger_view(&ls);
+                            delta
+                        }
                         Err(e) => {
                             // Haskell: TraceForgedInvalidBlock (Error) — own block failed validation.
                             error!(
