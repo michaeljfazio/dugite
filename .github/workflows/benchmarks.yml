@@ -55,75 +55,99 @@ jobs:
       # saves the run as the `nightly` baseline that the next run's default
       # invocation compares against. Running twice (default + save-baseline)
       # doubled job runtime and was pushing us past the 6h runner cap.
+      #
+      # `run_bench` strips cargo build chatter (Updating/Downloading/Compiling/
+      # Finished/Fresh lines) and ANSI escape sequences from the captured
+      # output so the markdown report contains only the criterion measurement
+      # lines that humans actually read. Full output is kept in *.full.txt
+      # for debugging.
+      - name: Define output filter
+        run: |
+          cat > /tmp/filter-bench-output.sh <<'EOF'
+          #!/usr/bin/env bash
+          # Strip ANSI escapes, drop cargo build noise, keep criterion output.
+          sed -E 's/\x1B\[[0-9;]*[A-Za-z]//g' \
+            | grep -vE '^\s*(Updating|Downloading|Downloaded|Compiling|Fresh|Finished|Running|Locking|Blocking|Adding|Removing|warning:|note:)' \
+            | grep -vE '^\s*-->\s' \
+            | grep -vE '^\s*=\s*(help|note):' \
+            | grep -vE '^\s*\|' \
+            | cat -s
+          EOF
+          chmod +x /tmp/filter-bench-output.sh
+
       - name: Run storage benchmarks
         run: |
-          cargo bench -p dugite-storage --bench storage_bench -- --save-baseline nightly 2>&1 | tee storage_bench.txt || true
+          cargo bench -p dugite-storage --bench storage_bench --color never -- --save-baseline nightly --color never 2>&1 \
+            | tee storage_bench.full.txt | /tmp/filter-bench-output.sh > storage_bench.txt || true
 
       - name: Run UTxO benchmarks
         run: |
-          cargo bench -p dugite-ledger --bench utxo_bench -- --save-baseline nightly 2>&1 | tee utxo_bench.txt || true
+          cargo bench -p dugite-ledger --bench utxo_bench --color never -- --save-baseline nightly --color never 2>&1 \
+            | tee utxo_bench.full.txt | /tmp/filter-bench-output.sh > utxo_bench.txt || true
 
       - name: Run network benchmarks
         run: |
-          cargo bench -p dugite-network --bench network_bench -- --save-baseline nightly 2>&1 | tee network_bench.txt || true
+          cargo bench -p dugite-network --bench network_bench --color never -- --save-baseline nightly --color never 2>&1 \
+            | tee network_bench.full.txt | /tmp/filter-bench-output.sh > network_bench.txt || true
 
       - name: Run consensus benchmarks
         run: |
-          cargo bench -p dugite-consensus --bench consensus_bench -- --save-baseline nightly 2>&1 | tee consensus_bench.txt || true
+          cargo bench -p dugite-consensus --bench consensus_bench --color never -- --save-baseline nightly --color never 2>&1 \
+            | tee consensus_bench.full.txt | /tmp/filter-bench-output.sh > consensus_bench.txt || true
 
       - name: Run LSM benchmarks
         run: |
-          cargo bench -p dugite-lsm --bench lsm_bench -- --save-baseline nightly 2>&1 | tee lsm_bench.txt || true
+          cargo bench -p dugite-lsm --bench lsm_bench --color never -- --save-baseline nightly --color never 2>&1 \
+            | tee lsm_bench.full.txt | /tmp/filter-bench-output.sh > lsm_bench.txt || true
 
       - name: Run LSM large-scale stress tests
         run: |
-          cargo test -p dugite-lsm --features large-tests --release -- mainnet_scale 2>&1 | tee lsm_stress.txt || true
+          cargo test -p dugite-lsm --features large-tests --release --color never -- mainnet_scale --nocapture 2>&1 \
+            | tee lsm_stress.full.txt | /tmp/filter-bench-output.sh > lsm_stress.txt || true
 
       - name: Generate benchmark report
         run: |
           DATE=$(date -u +%Y-%m-%d)
+          SHORT_SHA=$(git rev-parse --short HEAD)
           mkdir -p benches
           REPORT="benches/${DATE}-nightly.md"
-          echo "# Nightly Benchmark Results — ${DATE}" > "$REPORT"
-          echo "" >> "$REPORT"
-          echo "Machine: GitHub Actions ubuntu-latest" >> "$REPORT"
-          echo "Branch: main ($(git rev-parse --short HEAD))" >> "$REPORT"
-          echo "" >> "$REPORT"
-          echo "## Storage Benchmarks" >> "$REPORT"
-          echo '```' >> "$REPORT"
-          cat storage_bench.txt >> "$REPORT" 2>/dev/null || echo "No results" >> "$REPORT"
-          echo '```' >> "$REPORT"
-          echo "" >> "$REPORT"
-          echo "## UTxO Benchmarks" >> "$REPORT"
-          echo '```' >> "$REPORT"
-          cat utxo_bench.txt >> "$REPORT" 2>/dev/null || echo "No results" >> "$REPORT"
-          echo '```' >> "$REPORT"
-          echo "" >> "$REPORT"
-          echo "## Network Benchmarks" >> "$REPORT"
-          echo '```' >> "$REPORT"
-          cat network_bench.txt >> "$REPORT" 2>/dev/null || echo "No results" >> "$REPORT"
-          echo '```' >> "$REPORT"
-          echo "" >> "$REPORT"
-          echo "## Consensus Benchmarks" >> "$REPORT"
-          echo '```' >> "$REPORT"
-          cat consensus_bench.txt >> "$REPORT" 2>/dev/null || echo "No results" >> "$REPORT"
-          echo '```' >> "$REPORT"
-          echo "" >> "$REPORT"
-          echo "## LSM Benchmarks" >> "$REPORT"
-          echo '```' >> "$REPORT"
-          cat lsm_bench.txt >> "$REPORT" 2>/dev/null || echo "No results" >> "$REPORT"
-          echo '```' >> "$REPORT"
-          echo "" >> "$REPORT"
-          echo "## LSM Stress Tests" >> "$REPORT"
-          echo '```' >> "$REPORT"
-          cat lsm_stress.txt >> "$REPORT" 2>/dev/null || echo "No results" >> "$REPORT"
-          echo '```' >> "$REPORT"
+
+          emit_section() {
+            local title="$1" file="$2"
+            printf '## %s\n\n' "$title" >> "$REPORT"
+            if [ -f "$file" ] && [ -s "$file" ]; then
+              printf '<details>\n<summary>Raw measurements</summary>\n\n```\n' >> "$REPORT"
+              cat "$file" >> "$REPORT"
+              printf '\n```\n\n</details>\n\n' >> "$REPORT"
+            else
+              printf '_No results captured. See the run log for build errors._\n\n' >> "$REPORT"
+            fi
+          }
+
+          {
+            printf '# Nightly Benchmark Results — %s\n\n' "$DATE"
+            printf 'Captured on **%s** from commit [`%s`](https://github.com/MichaelJFazio/dugite/commit/%s) on `main` (GitHub Actions `ubuntu-latest`).\n\n' \
+              "$DATE" "$SHORT_SHA" "$SHORT_SHA"
+            printf '> **Interactive reports**, including per-benchmark detail pages and historical trend lines, are published at <https://michaeljfazio.github.io/dugite/benchmarks/>. Each section below also links directly to its interactive report.\n\n'
+            printf '> The collapsed _Raw measurements_ blocks contain the filtered `cargo bench` output (cargo build chatter and ANSI escapes are stripped). Full unfiltered logs are uploaded as the `benchmark-results-${{ github.run_number }}` workflow artifact.\n\n'
+            printf -- '---\n\n'
+          } > "$REPORT"
+
+          emit_section "Storage" storage_bench.txt
+          emit_section "UTxO (ledger)" utxo_bench.txt
+          emit_section "Network" network_bench.txt
+          emit_section "Consensus" consensus_bench.txt
+          emit_section "LSM" lsm_bench.txt
+          emit_section "LSM stress tests" lsm_stress.txt
 
       - name: Upload benchmark results as artifact
         uses: actions/upload-artifact@v7
         with:
           name: benchmark-results-${{ github.run_number }}
-          path: benches/*-nightly.md
+          path: |
+            benches/*-nightly.md
+            *_bench.full.txt
+            lsm_stress.full.txt
           retention-days: 90
 
       - name: Copy results to docs and commit
