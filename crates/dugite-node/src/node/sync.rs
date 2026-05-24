@@ -2833,6 +2833,112 @@ fn extract_slot_from_wrapped_header(header_cbor: &[u8], byron_epoch_length: u64)
 /// Matches the mainnet formula `(epoch * 432_000) / 20 = epoch * 21_600`.
 const MAINNET_BYRON_SLOTS_PER_EPOCH: u64 = 21_600;
 
+// ───────────────────────────────────────────────────────────────────────────
+// Issue #654 — eager forecast-horizon check + watch-channel backpressure
+// ───────────────────────────────────────────────────────────────────────────
+
+/// Hard upper bound on how long a chainsync receive task will park waiting
+/// for the ledger tip to advance enough to forecast a received header
+/// (#654 / #652 C4). When this elapses the peer is disconnected with
+/// `ForecastSuspensionTimeout`. 60s is a balance between giving the apply
+/// path time to catch up under realistic bulk-sync load and not hanging
+/// the receive loop indefinitely if our node is wedged.
+pub(crate) const FORECAST_PARK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Cheap structural predicate: returns `true` if `header_cbor` is the
+/// Byron N2N HFC wrap (era tag 0 with the `ABoundaryOrRegular` payload
+/// shape). Inverse of "is this a Shelley+ HFC-wrapped header".
+fn is_byron_wrapped_header(header_cbor: &[u8]) -> bool {
+    unwrap_byron_n2n_header(header_cbor).is_some()
+}
+
+/// Run the forecast check for an incoming header's slot against the
+/// lock-free `LedgerView`. If the slot is within `[at, max_for)`
+/// (`max_for = tip + 1 + stability_window`), return `Ok(())` immediately.
+/// Otherwise, park on `tip_rx.changed()` until either:
+///
+/// - the ledger tip advances enough that the slot is now in range
+///   (return `Ok(())`);
+/// - the chainsync task is cancelled (return `Ok(())` so the cancel
+///   propagates through the normal exit path);
+/// - the hard timeout [`FORECAST_PARK_TIMEOUT`] elapses
+///   (return `Err` so the caller disconnects with a labelled reason).
+///
+/// The stability window is picked per era: the Conway
+/// `randomness_stabilisation_window` if set on the view, falling back to
+/// the pre-Conway `stability_window_3kf`.
+pub(crate) async fn forecast_park_or_disconnect(
+    peer_addr: &SocketAddr,
+    header_slot: u64,
+    ledger_view: &Arc<arc_swap::ArcSwap<super::ledger_view::LedgerView>>,
+    tip_rx: &mut watch::Receiver<u64>,
+    cancel: &CancellationToken,
+) -> anyhow::Result<()> {
+    use dugite_consensus::forecast::forecast_for;
+    use dugite_primitives::time::SlotNo;
+
+    let park_started = std::time::Instant::now();
+    let mut wakes: u32 = 0;
+    loop {
+        let view = ledger_view.load();
+        let stability_window = if view.randomness_stabilisation_window > 0 {
+            view.randomness_stabilisation_window
+        } else {
+            view.stability_window_3kf
+        };
+        match forecast_for(
+            view.last_applied_slot,
+            stability_window,
+            SlotNo(header_slot),
+        ) {
+            Ok(()) => return Ok(()),
+            Err(out) => {
+                let elapsed = park_started.elapsed();
+                if elapsed >= FORECAST_PARK_TIMEOUT {
+                    return Err(anyhow::anyhow!(
+                        "ChainSync: {peer_addr} header slot {} beyond forecast horizon \
+                         (tip {:?}, max_for {}) — exceeded {:?} suspension; disconnecting",
+                        header_slot,
+                        out.at,
+                        out.max_for.0,
+                        FORECAST_PARK_TIMEOUT
+                    ));
+                }
+                debug!(
+                    %peer_addr,
+                    header_slot,
+                    tip = ?out.at,
+                    max_for = out.max_for.0,
+                    wakes,
+                    "ChainSync: header beyond forecast horizon; parking on tip advance"
+                );
+                let remaining = FORECAST_PARK_TIMEOUT - elapsed;
+                tokio::select! {
+                    biased;
+                    _ = cancel.cancelled() => return Ok(()),
+                    res = tip_rx.changed() => {
+                        if res.is_err() {
+                            // Sender dropped → node shutdown path. Let the
+                            // outer cancel handling take over.
+                            return Ok(());
+                        }
+                        wakes = wakes.saturating_add(1);
+                        // Loop and re-check.
+                    }
+                    _ = tokio::time::sleep(remaining) => {
+                        return Err(anyhow::anyhow!(
+                            "ChainSync: {peer_addr} header slot {} beyond forecast horizon \
+                             after {:?} suspension; disconnecting",
+                            header_slot,
+                            FORECAST_PARK_TIMEOUT
+                        ));
+                    }
+                }
+            }
+        }
+    }
+}
+
 /// Decode the slot number from a raw Byron header CBOR.
 ///
 /// `byron_header_cbor` is the array(5) header
@@ -3189,6 +3295,14 @@ pub async fn chainsync_client_task(
     candidate_chains: Arc<RwLock<HashMap<SocketAddr, CandidateChainState>>>,
     chain_db: Arc<RwLock<dugite_storage::ChainDB>>,
     ledger_state: Arc<RwLock<dugite_ledger::LedgerState>>,
+    // Issue #654 — lock-free read view of stable ledger state and a watch
+    // channel that fires on every tip advance. The receive loop uses the
+    // view to look up the per-call stability window without parking on
+    // `ledger_state`, and parks on `tip_rx.changed()` when an incoming
+    // header lies beyond the current forecast horizon (matches the
+    // wake-on-tip-advance design in #652 C4).
+    ledger_view: Arc<arc_swap::ArcSwap<super::ledger_view::LedgerView>>,
+    mut ledger_tip_rx: watch::Receiver<u64>,
     byron_epoch_length: u64,
     // Ouroboros security parameter k (number of blocks before finality).
     // Mainnet: 2160, Preview: 432.  Rollbacks deeper than k blocks indicate
@@ -3701,6 +3815,34 @@ pub async fn chainsync_client_task(
                             }
                         };
 
+                        // Issue #654 — eager forecast-horizon check (Phase 1 of #652).
+                        // If the header's slot lies beyond the ledger's current
+                        // forecast window (`tip + 1 + stability_window`), park on
+                        // the tip-advance watch channel and retry. Mirrors the
+                        // wake-on-tip-advance design in #652 C4.
+                        //
+                        // Defense in depth: this is purely additive; body apply
+                        // continues to re-validate every header against the live
+                        // ledger state. The eager check just gives us earlier
+                        // detection of an adversarial peer sending headers from
+                        // far enough in the future that we couldn't possibly
+                        // validate them, without burning CPU on each one.
+                        //
+                        // Byron headers are skipped: forecast horizon doesn't
+                        // apply to PBFT (Byron) the same way it applies to Praos,
+                        // and Byron is at most ~1 day of mainnet — the missed
+                        // fan-out is negligible during bulk sync.
+                        if !is_byron_wrapped_header(&header) {
+                            forecast_park_or_disconnect(
+                                &peer_addr,
+                                slot,
+                                &ledger_view,
+                                &mut ledger_tip_rx,
+                                &cancel,
+                            )
+                            .await?;
+                        }
+
                         // Update candidate chain state.
                         //
                         // The captured `pending_count` (post-prune) feeds
@@ -4094,6 +4236,133 @@ pub async fn chainsync_client_task(
     );
 
     Ok(())
+}
+
+#[cfg(test)]
+mod forecast_park_tests {
+    use super::*;
+    use crate::node::ledger_view::LedgerView;
+    use dugite_ledger::LedgerState;
+    use dugite_primitives::protocol_params::ProtocolParameters;
+    use dugite_primitives::time::SlotNo;
+    use std::time::Duration;
+
+    /// Build a fresh `LedgerView` published into an `ArcSwap`, with the
+    /// supplied tip slot + stability window. Used by the forecast tests to
+    /// drive the helper without needing a full `Node`.
+    fn make_view_swap(tip_slot: u64, stability_window: u64) -> Arc<arc_swap::ArcSwap<LedgerView>> {
+        let mut state = LedgerState::new(ProtocolParameters::mainnet_defaults());
+        state.tip.point = if tip_slot == 0 {
+            dugite_primitives::block::Point::Origin
+        } else {
+            dugite_primitives::block::Point::Specific(
+                SlotNo(tip_slot),
+                dugite_primitives::hash::Hash32::ZERO,
+            )
+        };
+        state.randomness_stabilisation_window = stability_window;
+        let view = LedgerView::from_state(&state);
+        Arc::new(arc_swap::ArcSwap::from_pointee(view))
+    }
+
+    /// Issue #654: a header well within the forecast horizon returns Ok
+    /// without parking.
+    #[tokio::test]
+    async fn forecast_within_horizon_returns_ok_immediately() {
+        let view = make_view_swap(1_000, 100); // max_for = 1001 + 100 = 1101
+        let (_tx, mut rx) = watch::channel(1_000u64);
+        let cancel = CancellationToken::new();
+        let peer: SocketAddr = "127.0.0.1:3001".parse().unwrap();
+
+        let start = std::time::Instant::now();
+        forecast_park_or_disconnect(&peer, 1_050, &view, &mut rx, &cancel)
+            .await
+            .expect("slot 1050 is within [1000, 1101)");
+        // Should be near-instant, certainly <500ms.
+        assert!(start.elapsed() < Duration::from_millis(500));
+    }
+
+    /// Issue #654: a header past the horizon parks until the tip advances
+    /// enough to bring it into range, then returns Ok.
+    #[tokio::test]
+    async fn forecast_parks_then_wakes_on_tip_advance() {
+        // tip=1000, sw=100 → max_for=1101 → slot 1500 is outside.
+        let view = make_view_swap(1_000, 100);
+        let (tx, mut rx) = watch::channel(1_000u64);
+        let cancel = CancellationToken::new();
+        let peer: SocketAddr = "127.0.0.1:3001".parse().unwrap();
+        let view_for_writer = Arc::clone(&view);
+
+        // After 100ms: advance the tip to slot 1500 so max_for = 1601 and
+        // slot 1500 becomes valid.
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            let mut state = LedgerState::new(ProtocolParameters::mainnet_defaults());
+            state.tip.point = dugite_primitives::block::Point::Specific(
+                SlotNo(1_500),
+                dugite_primitives::hash::Hash32::ZERO,
+            );
+            state.randomness_stabilisation_window = 100;
+            view_for_writer.store(Arc::new(LedgerView::from_state(&state)));
+            let _ = tx.send(1_500);
+        });
+
+        let start = std::time::Instant::now();
+        forecast_park_or_disconnect(&peer, 1_500, &view, &mut rx, &cancel)
+            .await
+            .expect("park should wake and succeed after tip advance");
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed >= Duration::from_millis(80) && elapsed < Duration::from_secs(2),
+            "expected ~100ms park, got {elapsed:?}"
+        );
+    }
+
+    /// Issue #654: cancellation while parked returns `Ok(())` so the outer
+    /// cancel handling can propagate.
+    #[tokio::test]
+    async fn forecast_park_returns_ok_on_cancel() {
+        let view = make_view_swap(1_000, 100);
+        let (_tx, mut rx) = watch::channel(1_000u64);
+        let cancel = CancellationToken::new();
+        let peer: SocketAddr = "127.0.0.1:3001".parse().unwrap();
+        let cancel_clone = cancel.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            cancel_clone.cancel();
+        });
+
+        // Header slot 2000 is way outside; only cancel can break us out
+        // (other than the 60s timeout we don't want to wait for).
+        forecast_park_or_disconnect(&peer, 2_000, &view, &mut rx, &cancel)
+            .await
+            .expect("cancel must short-circuit to Ok");
+    }
+
+    /// Issue #654: Byron headers bypass the forecast check entirely
+    /// (PBFT doesn't use Praos forecast semantics).
+    #[test]
+    fn is_byron_wrapped_header_distinguishes_byron_from_shelley() {
+        use minicbor::Encoder;
+        // Shelley+ HFC wrap: [era_tag(uint), tag24(bytes)]
+        let mut shelley = Vec::new();
+        let mut enc = Encoder::new(&mut shelley);
+        enc.array(2).unwrap();
+        enc.u64(6).unwrap(); // Babbage era
+        enc.tag(minicbor::data::Tag::new(24)).unwrap();
+        enc.bytes(b"inner").unwrap();
+        assert!(
+            !is_byron_wrapped_header(&shelley),
+            "Shelley+ wrap must NOT be classified as Byron"
+        );
+
+        // Byron N2N wrap is array(2) with era_id=0 + complex payload.
+        // We don't need to construct a fully-valid one for this predicate
+        // test — just verify the negative path; `unwrap_byron_n2n_header`
+        // has its own positive-path coverage elsewhere.
+        let not_byron: &[u8] = &[];
+        assert!(!is_byron_wrapped_header(not_byron));
+    }
 }
 
 #[cfg(test)]

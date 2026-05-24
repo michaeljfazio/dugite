@@ -262,6 +262,17 @@ pub struct ConnectionLifecycleManager {
     /// Shared LedgerState — protocol tasks read ledger tip for intersection.
     ledger_state: Arc<RwLock<LedgerState>>,
 
+    /// Lock-free read view of stable ledger state (#651 P2 / #652 P0).
+    /// Cloned into each chainsync task for forecast-horizon checks etc.
+    ledger_view: Arc<arc_swap::ArcSwap<super::ledger_view::LedgerView>>,
+
+    /// Watch channel firing on every ledger tip advance (#654 — Phase 1
+    /// of the eager-validation back-pressure design). Cloned into each
+    /// chainsync task so its receive loop can park on
+    /// `tip_rx.changed().await` when an incoming header lies beyond the
+    /// forecast horizon, and wake exactly when the tip catches up.
+    ledger_tip_slot_tx: tokio::sync::watch::Sender<u64>,
+
     /// Byron epoch length in slots (needed for era-aware slot calculations).
     byron_epoch_length: u64,
 
@@ -412,6 +423,8 @@ impl ConnectionLifecycleManager {
         block_announcement_tx: broadcast::Sender<BlockAnnouncement>,
         chain_db: Arc<RwLock<ChainDB>>,
         ledger_state: Arc<RwLock<LedgerState>>,
+        ledger_view: Arc<arc_swap::ArcSwap<super::ledger_view::LedgerView>>,
+        ledger_tip_slot_tx: tokio::sync::watch::Sender<u64>,
         byron_epoch_length: u64,
         security_param: u64,
         active_slots_coeff: f64,
@@ -436,6 +449,8 @@ impl ConnectionLifecycleManager {
             block_announcement_tx,
             chain_db,
             ledger_state,
+            ledger_view,
+            ledger_tip_slot_tx,
             byron_epoch_length,
             security_param,
             active_slots_coeff,
@@ -1113,6 +1128,8 @@ impl ConnectionLifecycleManager {
         let candidate_chains = self.candidate_chains.clone();
         let chain_db = self.chain_db.clone();
         let ledger_state = self.ledger_state.clone();
+        let ledger_view = self.ledger_view.clone();
+        let ledger_tip_rx = self.ledger_tip_slot_tx.subscribe();
         let byron_epoch_length = self.byron_epoch_length;
         let security_param = self.security_param;
         let active_slots_coeff = self.active_slots_coeff;
@@ -1130,6 +1147,8 @@ impl ConnectionLifecycleManager {
                     candidate_chains,
                     chain_db,
                     ledger_state,
+                    ledger_view,
+                    ledger_tip_rx,
                     byron_epoch_length,
                     security_param,
                     active_slots_coeff,
@@ -2005,6 +2024,10 @@ impl ConnectionLifecycleManager {
             chain_db: Arc::new(RwLock::new(chain_db)),
         });
 
+        let ledger_view = Arc::new(arc_swap::ArcSwap::from_pointee(
+            super::ledger_view::LedgerView::from_state(&ledger_state),
+        ));
+        let (ledger_tip_slot_tx, _initial_rx) = tokio::sync::watch::channel(0u64);
         let ledger_arc = Arc::new(RwLock::new(ledger_state));
 
         // chain_db was moved into block_provider; open a separate one for the
@@ -2021,6 +2044,8 @@ impl ConnectionLifecycleManager {
             block_announcement_tx,
             Arc::new(RwLock::new(chain_db2)),
             ledger_arc,
+            ledger_view,
+            ledger_tip_slot_tx,
             432_000,
             2160,
             0.05,
@@ -2065,6 +2090,10 @@ impl ConnectionLifecycleManager {
             chain_db: Arc::new(RwLock::new(chain_db)),
         });
 
+        let ledger_view = Arc::new(arc_swap::ArcSwap::from_pointee(
+            super::ledger_view::LedgerView::from_state(&ledger_state),
+        ));
+        let (ledger_tip_slot_tx, _initial_rx) = tokio::sync::watch::channel(0u64);
         let ledger_arc = Arc::new(RwLock::new(ledger_state));
 
         let tmp2 = tempfile::tempdir().expect("tempdir2");
@@ -2079,6 +2108,8 @@ impl ConnectionLifecycleManager {
             block_announcement_tx,
             Arc::new(RwLock::new(chain_db2)),
             ledger_arc,
+            ledger_view,
+            ledger_tip_slot_tx,
             432_000,
             2160,
             0.05,

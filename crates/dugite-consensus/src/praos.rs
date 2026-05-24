@@ -186,6 +186,12 @@ pub const ACTIVE_SLOT_COEFF: f64 = 0.05;
 pub const SECURITY_PARAM: u64 = 2160;
 
 /// Ouroboros Praos consensus engine
+///
+/// `Clone` is supported so per-peer eager validation (issue #654 /
+/// `validate_header_full_with_counters`) can clone the engine with its
+/// own isolated `opcert_counters` map without contaminating the
+/// authoritative state owned by the body-apply path.
+#[derive(Clone)]
 pub struct OuroborosPraos {
     /// Active slot coefficient (f64 for backward compat / logging)
     pub active_slot_coeff: f64,
@@ -914,6 +920,58 @@ impl OuroborosPraos {
         );
 
         Ok(())
+    }
+
+    /// Eager per-peer header validation variant of [`Self::validate_header_full`]
+    /// (issue #654 — Phase 1 of #652).
+    ///
+    /// Runs identical validation logic but writes opcert-counter updates to
+    /// the caller-supplied `peer_counters` map instead of `self.opcert_counters`.
+    /// This is the foundational piece for per-peer chain-dep state isolation
+    /// described in #652 C1: per-peer validation must NOT leak into the
+    /// global authoritative state owned by the body-apply path. The receive
+    /// task calls this against its per-peer `eager_opcert_counters`; on a
+    /// fork-switch that abandons the peer's prefix, the per-peer state is
+    /// reset without affecting anything else.
+    ///
+    /// Implementation: clone `self`, swap its `opcert_counters` with
+    /// `peer_counters` (`std::mem::take`), run validation, swap back. The
+    /// clone is O(struct size) — a few hundred bytes plus the counter
+    /// map's allocation — and there's no nested clone of the map because
+    /// `mem::take` moves rather than copies.
+    ///
+    /// Read-only against `self`: `self.opcert_counters` is restored to its
+    /// original empty state at the end (the original counters live in the
+    /// clone which is dropped); `self.tip`, `self.checkpoints` etc are
+    /// observed via Clone but never mutated externally.
+    #[allow(clippy::too_many_arguments)]
+    pub fn validate_header_full_with_counters(
+        &self,
+        peer_counters: &mut HashMap<Hash28, u64>,
+        header: &BlockHeader,
+        current_slot: SlotNo,
+        issuer_info: Option<&BlockIssuerInfo>,
+        overlay_ctx: Option<&OverlayContext>,
+        mode: ValidationMode,
+        ledger_pv_major: Option<u64>,
+        ledger_tip_slot: Option<SlotNo>,
+    ) -> Result<(), ConsensusError> {
+        let mut temp = self.clone();
+        temp.opcert_counters = std::mem::take(peer_counters);
+        let result = temp.validate_header_full(
+            header,
+            current_slot,
+            issuer_info,
+            overlay_ctx,
+            mode,
+            ledger_pv_major,
+            ledger_tip_slot,
+        );
+        // Restore the (possibly-updated) counters to the caller's map.
+        // Mutations made during validation (opcert seen-counter bumps)
+        // persist on the per-peer map; the global `self` is untouched.
+        *peer_counters = std::mem::take(&mut temp.opcert_counters);
+        result
     }
 
     /// Validate that the block header's `body_hash` field matches the
@@ -1912,6 +1970,123 @@ mod tests {
         assert_eq!(praos.tip, Tip::origin());
         assert!((praos.active_slot_coeff - 0.05).abs() < f64::EPSILON);
         assert_eq!(praos.security_param, 2160);
+    }
+
+    // ── Issue #654: validate_header_full_with_counters per-peer isolation ──
+
+    /// `validate_header_full_with_counters` must NOT write back to
+    /// `self.opcert_counters`. Mutations during validation are recorded
+    /// on the supplied per-peer map only.
+    ///
+    /// Bug class this prevents (#652 C1): peer A advancing pool P's
+    /// counter on a fork must not poison peer B's perfectly-valid
+    /// header on a different chain.
+    #[test]
+    fn validate_header_full_with_counters_does_not_mutate_self() {
+        let mut praos = OuroborosPraos::new(11);
+        praos.set_strict_verification(false); // non-strict: VRF/KES tolerated for header crafted with dummy keys
+        let header = make_valid_header(100);
+        let issuer = make_issuer_info(&header);
+
+        // Seed the global counter map with a known value for a different
+        // pool than the header's issuer — observable canary.
+        let canary_pool = dugite_primitives::hash::Hash28::from_bytes([0xAAu8; 28]);
+        praos.opcert_counters.insert(canary_pool, 99);
+        let global_before = praos.opcert_counters.clone();
+
+        // Per-peer counter map starts empty.
+        let mut peer_counters: HashMap<Hash28, u64> = HashMap::new();
+
+        let _ = praos.validate_header_full_with_counters(
+            &mut peer_counters,
+            &header,
+            SlotNo(200),
+            Some(&issuer),
+            None,
+            ValidationMode::Replay, // skip VRF/KES crypto; we test state isolation
+            Some(9),
+            Some(SlotNo(50)),
+        );
+
+        // Global counters MUST be byte-identical (only canary entry).
+        assert_eq!(
+            praos.opcert_counters, global_before,
+            "self.opcert_counters must not be mutated by per-peer validation"
+        );
+        // Canary specifically still present and unchanged.
+        assert_eq!(
+            praos.opcert_counters.get(&canary_pool),
+            Some(&99),
+            "canary entry on global map must be untouched"
+        );
+
+        // Per-peer counters MAY have been updated for the header's issuer
+        // (we don't assert the specific value because that depends on the
+        // header's opcert sequence number, but we assert non-emptiness when
+        // the header was non-trivial).
+        let issuer_pool_id = dugite_primitives::hash::blake2b_224(&header.issuer_vkey);
+        // Replay mode + non-strict: even if validation succeeded, opcert
+        // counter bookkeeping ran. The header's seq=0, so peer_counters
+        // gets the pool→0 entry.
+        assert_eq!(
+            peer_counters.get(&issuer_pool_id),
+            Some(&0),
+            "per-peer counters must record the validated header's issuer"
+        );
+    }
+
+    /// Subsequent calls with the same per-peer map carry state forward —
+    /// counter monotonicity is enforced against the peer's own history.
+    #[test]
+    fn validate_header_full_with_counters_carries_state_across_calls() {
+        let mut praos = OuroborosPraos::new(11);
+        praos.set_strict_verification(false);
+        let mut peer_counters: HashMap<Hash28, u64> = HashMap::new();
+
+        // First header: seq=0
+        let mut h1 = make_valid_header(100);
+        h1.operational_cert.sequence_number = 0;
+        let issuer1 = make_issuer_info(&h1);
+        praos
+            .validate_header_full_with_counters(
+                &mut peer_counters,
+                &h1,
+                SlotNo(200),
+                Some(&issuer1),
+                None,
+                ValidationMode::Replay,
+                Some(9),
+                Some(SlotNo(50)),
+            )
+            .expect("first header must validate");
+        let pool_id = dugite_primitives::hash::blake2b_224(&h1.issuer_vkey);
+        assert_eq!(peer_counters.get(&pool_id), Some(&0));
+
+        // Second header from same pool with seq=1 (monotonic). Per-peer
+        // counter advances; global counter unchanged.
+        let mut h2 = make_valid_header(101);
+        h2.operational_cert.sequence_number = 1;
+        praos
+            .validate_header_full_with_counters(
+                &mut peer_counters,
+                &h2,
+                SlotNo(200),
+                Some(&issuer1),
+                None,
+                ValidationMode::Replay,
+                Some(9),
+                Some(SlotNo(50)),
+            )
+            .expect("second monotonic header must validate");
+        assert_eq!(
+            peer_counters.get(&pool_id),
+            Some(&1),
+            "per-peer counter must advance with monotonic opcert"
+        );
+        assert!(
+            praos.opcert_counters.is_empty(),
+            "global counters must remain pristine across multiple per-peer calls"
+        );
     }
 
     #[test]

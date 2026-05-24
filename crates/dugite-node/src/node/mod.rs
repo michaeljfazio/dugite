@@ -333,6 +333,12 @@ pub struct Node {
     /// to acquire `ledger_state.read().await` — those paths are not on the
     /// contention surface.
     pub(crate) ledger_view: Arc<arc_swap::ArcSwap<ledger_view::LedgerView>>,
+    /// Watch channel publishing the ledger tip slot after every successful
+    /// apply (issue #654 — wake-on-tip-advance back-pressure for eager
+    /// per-peer header validation). Senders are the apply paths; receivers
+    /// are per-peer chainsync tasks parking on forecast-horizon exhaustion.
+    /// Payload is `tip.point.slot()` flattened to `u64` (origin → 0).
+    pub(crate) ledger_tip_slot_tx: tokio::sync::watch::Sender<u64>,
     /// Volatile delta window for O(1) rollback.
     ///
     /// Kept in sync with `ledger_state`: after each `apply_block_with_delta`,
@@ -1294,6 +1300,11 @@ impl Node {
         let ledger_view = Arc::new(arc_swap::ArcSwap::from_pointee(
             ledger_view::LedgerView::from_state(&ledger),
         ));
+        // Issue #654 — watch channel for per-peer eager-validation
+        // back-pressure: peers parked on forecast-horizon exhaustion wake
+        // when this changes.
+        let initial_tip_slot = ledger.tip.point.slot().map(|s| s.0).unwrap_or(0);
+        let (ledger_tip_slot_tx, _initial_rx) = tokio::sync::watch::channel(initial_tip_slot);
 
         let ledger_state = Arc::new(RwLock::new(ledger));
 
@@ -1720,6 +1731,7 @@ impl Node {
             chain_db,
             ledger_state,
             ledger_view,
+            ledger_tip_slot_tx,
             ledger_seq,
             consensus,
             mempool,
@@ -1809,9 +1821,19 @@ impl Node {
     /// `ledger_state` write lock is still held (cheapest publish: no
     /// extra lock acquisition; the view captures the just-applied state).
     /// The actual store is a single atomic pointer swap.
+    ///
+    /// Also publishes the new tip slot on `ledger_tip_slot_tx` (issue
+    /// #654) so per-peer chainsync tasks parked on forecast-horizon
+    /// exhaustion wake. `watch::send` is no-op + lock-free when the
+    /// value is unchanged, so back-to-back publishes at the same slot
+    /// have negligible cost.
     pub(crate) fn publish_ledger_view(&self, ls: &LedgerState) {
+        let new_tip_slot = ls.tip.point.slot().map(|s| s.0).unwrap_or(0);
         self.ledger_view
             .store(Arc::new(ledger_view::LedgerView::from_state(ls)));
+        // `send` returns Err only when there are zero receivers — that's
+        // fine, we don't care if no one is listening yet.
+        let _ = self.ledger_tip_slot_tx.send(new_tip_slot);
     }
 
     /// Convenience: re-publish the view by taking the read lock and
@@ -3243,6 +3265,8 @@ impl Node {
                 .clone(),
             self.chain_db.clone(),
             self.ledger_state.clone(),
+            self.ledger_view.clone(),
+            self.ledger_tip_slot_tx.clone(),
             self.byron_epoch_length,
             security_param,
             active_slots_coeff,
