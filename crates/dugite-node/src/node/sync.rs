@@ -2852,6 +2852,132 @@ fn is_byron_wrapped_header(header_cbor: &[u8]) -> bool {
     unwrap_byron_n2n_header(header_cbor).is_some()
 }
 
+/// Extract the HFC era tag from a Shelley+ wrapped header CBOR.
+/// `[era_tag(uint), tag(24)(bytes(inner_header))]` → `Some(era_tag)`.
+/// Returns `None` for Byron wraps (which have a nested array where the
+/// uint would be) and for malformed CBOR.
+fn extract_era_tag_from_wrapped_header(header_cbor: &[u8]) -> Option<u64> {
+    use minicbor::Decoder;
+    let mut dec = Decoder::new(header_cbor);
+    let arr_len = dec.array().ok()?;
+    if arr_len != Some(2) {
+        return None;
+    }
+    if !matches!(
+        dec.datatype().ok()?,
+        minicbor::data::Type::U8
+            | minicbor::data::Type::U16
+            | minicbor::data::Type::U32
+            | minicbor::data::Type::U64
+    ) {
+        return None;
+    }
+    dec.u64().ok()
+}
+
+/// Issue #654 P1.b — eager per-peer header validation hook.
+///
+/// Called from the MsgRollForward integration site after slot extraction,
+/// Byron skip, and forecast back-pressure. Decodes the wrapped header into
+/// a [`BlockHeader`], looks up the issuer pool in the lock-free
+/// [`super::ledger_view::LedgerView`]'s `set` snapshot, and runs the full
+/// Praos validation against `peer_counters` via
+/// `validate_header_full_with_counters` (clone-and-swap so the global
+/// `OuroborosPraos.opcert_counters` is not touched — #652 C1).
+///
+/// Returns:
+/// - `Ok(true)`  — header passed eager validation; caller proceeds to
+///   `pending_headers.push`.
+/// - `Ok(false)` — eager validation was deliberately SKIPPED (pre-Babbage
+///   era where overlay context is needed but unavailable, or no `set`
+///   snapshot yet on a fresh node). Caller proceeds with the existing
+///   path; defense in depth keeps body-apply validation authoritative.
+/// - `Err(_)`    — header failed validation. Caller propagates to
+///   disconnect the peer with a labelled reason.
+///
+/// Defense in depth: the apply path continues to fully re-validate every
+/// header against the live ledger state. This hook is the earlier
+/// signal that flags bad headers within ~100 ms of receive, before they
+/// reach BlockFetch + apply.
+pub(crate) fn eager_validate_header(
+    peer_addr: &SocketAddr,
+    header_cbor: &[u8],
+    header_slot: u64,
+    consensus_seed: &dugite_consensus::praos::OuroborosPraos,
+    ledger_view: &super::ledger_view::LedgerView,
+    peer_counters: &mut HashMap<dugite_primitives::hash::Hash28, u64>,
+) -> Result<bool, dugite_consensus::ConsensusError> {
+    // Phase 1 simplification: only eager-validate Conway+ headers. Earlier
+    // Shelley/Allegra/Mary/Alonzo/Babbage headers require overlay schedule
+    // context (BFT delegate slots when d > 0) which Phase 1 does not
+    // construct from the LedgerView. Conway+ has d == 0, so no overlay.
+    let era_tag = match extract_era_tag_from_wrapped_header(header_cbor) {
+        Some(t) => t,
+        None => return Ok(false), // malformed envelope — let body apply catch it
+    };
+    if era_tag < 7 {
+        return Ok(false);
+    }
+
+    // Decode the header. Anything that fails here is malformed CBOR — let
+    // the caller treat that as a structural error (return Err so we
+    // disconnect with a labelled reason).
+    let header = dugite_serialization::decode_wrapped_block_header(header_cbor).map_err(|e| {
+        tracing::warn!(%peer_addr, slot = header_slot, "ChainSync eager: header decode failed: {e}");
+        dugite_consensus::ConsensusError::InvalidBlock(format!("eager header decode: {e}"))
+    })?;
+
+    // Look up the issuer pool in the SET snapshot — the active
+    // distribution for the current epoch's leader election (Cardano
+    // mark/set/go rule, #652 C2).
+    let pool_id = dugite_primitives::hash::blake2b_224(&header.issuer_vkey);
+    let issuer_info = match ledger_view.snapshots.set.as_ref() {
+        Some(set_snap) => set_snap.pool_stake.get(&pool_id).map(|pool_stake| {
+            let total_active_stake: u64 = set_snap.pool_stake.values().map(|l| l.0).sum();
+            // Pool's registered VRF key hash — look up in the snapshot's
+            // pool_params (the active map at the set boundary).
+            let vrf_keyhash = set_snap
+                .pool_params
+                .get(&pool_id)
+                .map(|p| p.vrf_keyhash)
+                .unwrap_or(dugite_primitives::hash::Hash32::ZERO);
+            dugite_consensus::praos::BlockIssuerInfo {
+                vrf_keyhash,
+                pool_stake: pool_stake.0,
+                total_active_stake,
+            }
+        }),
+        None => None,
+    };
+
+    // Forecast horizon was already checked by `forecast_park_or_disconnect`
+    // at this site; pass the same `last_applied_slot` so any further
+    // forecast checks inside `validate_header_full` are consistent.
+    let ledger_tip = ledger_view.last_applied_slot;
+    let ledger_pv = Some(ledger_view.protocol_params.protocol_version_major);
+
+    // current_slot for eager validation: the receiving node's wall-clock
+    // slot is not trivially available here, but the header's own slot
+    // bounds the maximum legitimate `current_slot` (we only care about
+    // the FutureBlock check — header.slot > current_slot — which can be
+    // ignored eagerly because chainsync messages from a peer ahead of us
+    // are normal; let body apply re-check against the wall-clock slot).
+    // Pass `header.slot` so the FutureBlock check trivially passes.
+    let current_slot = header.slot;
+
+    consensus_seed.validate_header_full_with_counters(
+        peer_counters,
+        &header,
+        current_slot,
+        issuer_info.as_ref(),
+        None, // overlay_ctx — Conway+ d=0, no overlay schedule needed
+        dugite_consensus::ValidationMode::Replay,
+        ledger_pv,
+        ledger_tip,
+    )?;
+    Ok(true)
+}
+
 /// Run the forecast check for an incoming header's slot against the
 /// lock-free `LedgerView`. If the slot is within `[at, max_for)`
 /// (`max_for = tip + 1 + stability_window`), return `Ok(())` immediately.
@@ -3303,6 +3429,11 @@ pub async fn chainsync_client_task(
     // wake-on-tip-advance design in #652 C4).
     ledger_view: Arc<arc_swap::ArcSwap<super::ledger_view::LedgerView>>,
     mut ledger_tip_rx: watch::Receiver<u64>,
+    // Issue #654 P1.b — seed Praos engine cloned per-call via
+    // `validate_header_full_with_counters` (per-peer counter override,
+    // see #652 C1). Read-only inside the task; the global Praos engine
+    // is owned exclusively by the body-apply path on `Node`.
+    consensus_seed: Arc<dugite_consensus::praos::OuroborosPraos>,
     byron_epoch_length: u64,
     // Ouroboros security parameter k (number of blocks before finality).
     // Mainnet: 2160, Preview: 432.  Rollbacks deeper than k blocks indicate
@@ -3620,6 +3751,7 @@ pub async fn chainsync_client_task(
                     .unwrap_or([0u8; 32]),
                 tip_block_number: 0,
                 pending_headers: Vec::new(),
+                ..Default::default()
             },
         );
     }
@@ -3843,6 +3975,39 @@ pub async fn chainsync_client_task(
                             .await?;
                         }
 
+                        // Issue #654 P1.b — eager per-peer header
+                        // validation (full VRF/KES/opcert + envelope +
+                        // forecast). Defense in depth: this is purely
+                        // additive; body apply continues to re-validate.
+                        // Phase 1 scope: only Conway+ (era_tag >= 7).
+                        // Early eras + Byron are skipped silently.
+                        if !is_byron_wrapped_header(&header) {
+                            let view_arc = ledger_view.load();
+                            // We need access to the per-peer counter
+                            // map, which lives inside CandidateChainState.
+                            // Take the chains write lock briefly to run
+                            // the eager call. (The window here is short:
+                            // bounded by Praos crypto, ~ms.)
+                            let mut chains = candidate_chains.write().await;
+                            let entry = chains.entry(peer_addr).or_default();
+                            match eager_validate_header(
+                                &peer_addr,
+                                &header,
+                                slot,
+                                &consensus_seed,
+                                &view_arc,
+                                &mut entry.eager_opcert_counters,
+                            ) {
+                                Ok(_skipped_or_passed) => {}
+                                Err(e) => {
+                                    return Err(anyhow::anyhow!(
+                                        "ChainSync: {peer_addr} eager header validation failed at slot {slot}: {e}"
+                                    ));
+                                }
+                            }
+                            drop(chains);
+                        }
+
                         // Update candidate chain state.
                         //
                         // The captured `pending_count` (post-prune) feeds
@@ -3856,6 +4021,7 @@ pub async fn chainsync_client_task(
                                     tip_hash: [0u8; 32],
                                     tip_block_number: 0,
                                     pending_headers: Vec::new(),
+                                    ..Default::default()
                                 }
                             });
                             entry.tip_slot = tip_slot;
@@ -4072,6 +4238,19 @@ pub async fn chainsync_client_task(
                                 entry.tip_slot = tip_slot;
                                 entry.tip_hash = tip_hash;
                                 entry.tip_block_number = tip_block_number;
+                                // Issue #654 P1.b — reset per-peer eager
+                                // op-cert counters on rollback. Phase 1
+                                // simplification of #652 C5: rather than
+                                // maintain a rewindable per-peer
+                                // candidate-state history, we drop the
+                                // counters entirely. Worst case: the
+                                // next batch of headers on the peer's
+                                // post-rollback chain re-establishes
+                                // counters from the seed map (empty),
+                                // which is what the global apply-time
+                                // validator also does for unseen pools.
+                                // Body apply remains the source of truth.
+                                entry.eager_opcert_counters.clear();
                                 entry.pending_headers.len()
                             } else {
                                 0
@@ -4337,6 +4516,126 @@ mod forecast_park_tests {
         forecast_park_or_disconnect(&peer, 2_000, &view, &mut rx, &cancel)
             .await
             .expect("cancel must short-circuit to Ok");
+    }
+
+    /// Issue #654 P1.b: `extract_era_tag_from_wrapped_header` reads the
+    /// HFC era tag from a valid Shelley+ wrap.
+    #[test]
+    fn extract_era_tag_reads_shelley_plus_wrap() {
+        use minicbor::Encoder;
+        for tag in [2u64, 3, 4, 5, 6, 7, 8] {
+            let mut buf = Vec::new();
+            let mut enc = Encoder::new(&mut buf);
+            enc.array(2).unwrap();
+            enc.u64(tag).unwrap();
+            enc.tag(minicbor::data::Tag::new(24)).unwrap();
+            enc.bytes(b"inner").unwrap();
+            assert_eq!(
+                extract_era_tag_from_wrapped_header(&buf),
+                Some(tag),
+                "era_tag {tag} should round-trip"
+            );
+        }
+    }
+
+    /// Byron N2N wrap returns None — its first element is a nested array,
+    /// not a uint.
+    #[test]
+    fn extract_era_tag_rejects_byron_wrap() {
+        use minicbor::Encoder;
+        let mut buf = Vec::new();
+        let mut enc = Encoder::new(&mut buf);
+        enc.array(2).unwrap();
+        enc.array(2).unwrap(); // nested array (byron payload shape) — NOT a uint
+        enc.u64(0).unwrap();
+        enc.u64(100).unwrap();
+        enc.tag(minicbor::data::Tag::new(24)).unwrap();
+        enc.bytes(b"byron-inner").unwrap();
+        assert_eq!(extract_era_tag_from_wrapped_header(&buf), None);
+    }
+
+    /// Issue #654 P1.b: `eager_validate_header` returns `Ok(false)`
+    /// (skip) for pre-Conway era tags so the existing path takes over.
+    #[test]
+    fn eager_validate_header_skips_pre_conway_eras() {
+        use minicbor::Encoder;
+        use std::collections::HashMap;
+
+        let consensus = dugite_consensus::praos::OuroborosPraos::new(11);
+        let state = dugite_ledger::LedgerState::new(
+            dugite_primitives::protocol_params::ProtocolParameters::mainnet_defaults(),
+        );
+        let view = crate::node::ledger_view::LedgerView::from_state(&state);
+        let peer: SocketAddr = "127.0.0.1:3001".parse().unwrap();
+
+        for tag in [2u64, 3, 4, 5, 6] {
+            // Use a header CBOR that would NOT validate (empty inner) — we
+            // assert the function returns Ok(false) BEFORE attempting any
+            // decode, proving the era gate fires first.
+            let mut buf = Vec::new();
+            let mut enc = Encoder::new(&mut buf);
+            enc.array(2).unwrap();
+            enc.u64(tag).unwrap();
+            enc.tag(minicbor::data::Tag::new(24)).unwrap();
+            enc.bytes(b"x").unwrap();
+
+            let mut counters = HashMap::new();
+            let result = eager_validate_header(&peer, &buf, 0, &consensus, &view, &mut counters);
+            assert!(
+                matches!(result, Ok(false)),
+                "era_tag {tag} should skip eager validation (got {result:?})"
+            );
+            assert!(counters.is_empty(), "skip must not mutate peer counters");
+        }
+    }
+
+    /// Issue #654 P1.b: malformed envelope (non-uint where era tag goes)
+    /// returns `Ok(false)` — body apply will catch it as a decode failure.
+    #[test]
+    fn eager_validate_header_skips_malformed_envelope() {
+        use std::collections::HashMap;
+        let consensus = dugite_consensus::praos::OuroborosPraos::new(11);
+        let state = dugite_ledger::LedgerState::new(
+            dugite_primitives::protocol_params::ProtocolParameters::mainnet_defaults(),
+        );
+        let view = crate::node::ledger_view::LedgerView::from_state(&state);
+        let peer: SocketAddr = "127.0.0.1:3001".parse().unwrap();
+        let mut counters = HashMap::new();
+
+        let result =
+            eager_validate_header(&peer, &[0xff, 0x00], 0, &consensus, &view, &mut counters);
+        assert!(matches!(result, Ok(false)));
+    }
+
+    /// Issue #654 P1.b: Conway header CBOR that fails to decode returns
+    /// `Err`, so the caller disconnects the peer with a labelled reason.
+    /// (The valid-header round-trip is exercised via the integration
+    /// path; here we just confirm the Err path fires.)
+    #[test]
+    fn eager_validate_header_errors_on_undecodable_conway_header() {
+        use minicbor::Encoder;
+        use std::collections::HashMap;
+
+        let consensus = dugite_consensus::praos::OuroborosPraos::new(11);
+        let state = dugite_ledger::LedgerState::new(
+            dugite_primitives::protocol_params::ProtocolParameters::mainnet_defaults(),
+        );
+        let view = crate::node::ledger_view::LedgerView::from_state(&state);
+        let peer: SocketAddr = "127.0.0.1:3001".parse().unwrap();
+
+        // Build a Conway-tagged (era_tag=7) wrap whose inner bytes are
+        // not a valid Conway header — the decoder must return Err and
+        // eager_validate_header must propagate.
+        let mut buf = Vec::new();
+        let mut enc = Encoder::new(&mut buf);
+        enc.array(2).unwrap();
+        enc.u64(7).unwrap();
+        enc.tag(minicbor::data::Tag::new(24)).unwrap();
+        enc.bytes(b"garbage").unwrap();
+
+        let mut counters = HashMap::new();
+        let result = eager_validate_header(&peer, &buf, 0, &consensus, &view, &mut counters);
+        assert!(result.is_err(), "undecodable Conway header must Err");
     }
 
     /// Issue #654: Byron headers bypass the forecast check entirely

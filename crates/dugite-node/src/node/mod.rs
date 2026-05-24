@@ -3267,6 +3267,14 @@ impl Node {
             self.ledger_state.clone(),
             self.ledger_view.clone(),
             self.ledger_tip_slot_tx.clone(),
+            // Issue #654 P1.b — read-only seed Praos engine for the
+            // per-peer eager-validation path. `Node.consensus` is mutated
+            // by the body-apply path only; per-peer state isolation is
+            // enforced by `validate_header_full_with_counters`'s
+            // clone-and-swap. Snapshot via Arc::new + clone — the seed
+            // does not need to track Node.consensus.update_tip() because
+            // validate_header_full uses its parameters, not `self.tip`.
+            Arc::new(self.consensus.clone()),
             self.byron_epoch_length,
             security_param,
             active_slots_coeff,

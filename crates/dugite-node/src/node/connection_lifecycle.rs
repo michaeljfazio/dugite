@@ -81,7 +81,7 @@ use crate::metrics::NodeMetrics;
 /// BlockFetch decision task to determine which blocks to fetch and from which
 /// peers. This is the coordination point between ChainSync and BlockFetch,
 /// matching the Haskell `FetchClientRegistry` / `FetchDecisionPolicy` pattern.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct CandidateChainState {
     /// Slot of the peer's reported tip.
     pub tip_slot: u64,
@@ -95,6 +95,16 @@ pub struct CandidateChainState {
     /// The BlockFetch decision task consumes entries from this list when it
     /// schedules fetch requests.
     pub pending_headers: Vec<PendingHeader>,
+    /// Per-peer eager-validation op-cert counter map (issue #654 P1.b).
+    ///
+    /// Updated by the per-peer eager-validation call at MsgRollForward
+    /// (`OuroborosPraos::validate_header_full_with_counters`). Per-peer
+    /// state isolation per #652 C1: the global authoritative
+    /// `OuroborosPraos.opcert_counters` is owned by the body-apply path
+    /// and never written here. Reset on MsgRollBackward (Phase 1
+    /// simplification of #652 C5 — full per-peer history rewind comes
+    /// in a follow-up phase).
+    pub eager_opcert_counters: std::collections::HashMap<dugite_primitives::hash::Hash28, u64>,
 }
 
 /// A block header received via ChainSync, pending BlockFetch download.
@@ -273,6 +283,12 @@ pub struct ConnectionLifecycleManager {
     /// forecast horizon, and wake exactly when the tip catches up.
     ledger_tip_slot_tx: tokio::sync::watch::Sender<u64>,
 
+    /// Read-only seed Praos engine cloned per-call inside each chainsync
+    /// task for eager per-peer header validation (issue #654 P1.b).
+    /// Per-peer mutation of opcert counters is isolated via
+    /// `validate_header_full_with_counters` (clone-and-swap).
+    consensus_seed: Arc<dugite_consensus::praos::OuroborosPraos>,
+
     /// Byron epoch length in slots (needed for era-aware slot calculations).
     byron_epoch_length: u64,
 
@@ -425,6 +441,7 @@ impl ConnectionLifecycleManager {
         ledger_state: Arc<RwLock<LedgerState>>,
         ledger_view: Arc<arc_swap::ArcSwap<super::ledger_view::LedgerView>>,
         ledger_tip_slot_tx: tokio::sync::watch::Sender<u64>,
+        consensus_seed: Arc<dugite_consensus::praos::OuroborosPraos>,
         byron_epoch_length: u64,
         security_param: u64,
         active_slots_coeff: f64,
@@ -451,6 +468,7 @@ impl ConnectionLifecycleManager {
             ledger_state,
             ledger_view,
             ledger_tip_slot_tx,
+            consensus_seed,
             byron_epoch_length,
             security_param,
             active_slots_coeff,
@@ -1130,6 +1148,7 @@ impl ConnectionLifecycleManager {
         let ledger_state = self.ledger_state.clone();
         let ledger_view = self.ledger_view.clone();
         let ledger_tip_rx = self.ledger_tip_slot_tx.subscribe();
+        let consensus_seed = self.consensus_seed.clone();
         let byron_epoch_length = self.byron_epoch_length;
         let security_param = self.security_param;
         let active_slots_coeff = self.active_slots_coeff;
@@ -1149,6 +1168,7 @@ impl ConnectionLifecycleManager {
                     ledger_state,
                     ledger_view,
                     ledger_tip_rx,
+                    consensus_seed,
                     byron_epoch_length,
                     security_param,
                     active_slots_coeff,
@@ -2046,6 +2066,7 @@ impl ConnectionLifecycleManager {
             ledger_arc,
             ledger_view,
             ledger_tip_slot_tx,
+            Arc::new(dugite_consensus::praos::OuroborosPraos::new(10)),
             432_000,
             2160,
             0.05,
@@ -2110,6 +2131,7 @@ impl ConnectionLifecycleManager {
             ledger_arc,
             ledger_view,
             ledger_tip_slot_tx,
+            Arc::new(dugite_consensus::praos::OuroborosPraos::new(10)),
             432_000,
             2160,
             0.05,
@@ -2206,6 +2228,7 @@ mod tests {
                 hash: [0xAB; 32],
                 header_cbor: vec![0x82, 0x01],
             }],
+            ..Default::default()
         };
 
         let cloned = state.clone();
@@ -2840,6 +2863,7 @@ mod tests {
                 hash: [0x77; 32],
                 header_cbor: vec![0x01, 0x02],
             }],
+            ..Default::default()
         };
         let cloned = state.clone();
         assert_eq!(cloned.tip_slot, 9999);
@@ -2857,6 +2881,7 @@ mod tests {
             tip_hash: [0u8; 32],
             tip_block_number: 0,
             pending_headers: vec![],
+            ..Default::default()
         };
         assert!(state.pending_headers.is_empty());
     }

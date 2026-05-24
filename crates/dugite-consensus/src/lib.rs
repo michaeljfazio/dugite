@@ -21,7 +21,7 @@ pub use peras_wire::{
     decode_bound, decode_era_params, encode_bound, encode_era_params, BoundWire, EraParamsWire,
     PerasWireError,
 };
-pub use praos::{CryptoVerificationParams, OuroborosPraos, ValidationMode};
+pub use praos::{ConsensusError, CryptoVerificationParams, OuroborosPraos, ValidationMode};
 pub use slot_leader::{compute_leader_schedule, LeaderSlot};
 
 /// Compute the stability window in slots: `ceil(3 * k / f)`.
