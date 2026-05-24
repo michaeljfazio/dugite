@@ -8,7 +8,7 @@
 //! when fixtures are not present. CI sets DUGITE_REQUIRE_UPSTREAM=1, making
 //! missing fixtures a hard failure.
 
-use dugite_conformance::upstream::{fixtures, status};
+use dugite_conformance::upstream::{fixtures, ledger_rules_replay, status};
 
 // ── Status banner (always runs) ───────────────────────────────────────────────
 
@@ -45,4 +45,14 @@ fn cardano_node_genesis_decodes() {
         return;
     };
     dugite_conformance::upstream::cardano_node::run_all_checks(&dir);
+}
+
+// ── ledger-rules ImpSpec replay (Phase 4) ────────────────────────────────────
+
+#[test]
+fn ledger_rules_imp_spec_replay() {
+    let Some(dir) = fixtures::check_area("ledger-rules") else {
+        return;
+    };
+    ledger_rules_replay::run_all_checks(&dir);
 }
