@@ -176,6 +176,40 @@ impl SnapshotPolicy {
 
 // ─── Snapshot helpers ────────────────────────────────────────────────────────
 
+/// Remove old epoch snapshots in `database_path`, keeping only the `keep`
+/// most recent. Free function so it is reachable from a `spawn_blocking`
+/// task without `&Node` (issue #649 — Phase B of the offloaded snapshot
+/// write).
+pub(crate) fn prune_old_snapshots_in_dir(database_path: &std::path::Path, keep: usize) {
+    let mut snapshots: Vec<(u64, PathBuf)> = Vec::new();
+    if let Ok(entries) = std::fs::read_dir(database_path) {
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let name_str = name.to_string_lossy();
+            if let Some(rest) = name_str.strip_prefix("ledger-snapshot-epoch") {
+                if let Some(epoch_str) = rest.strip_suffix(".bin") {
+                    // Handle both "5" (legacy) and "5-slot12345" (new) formats.
+                    let epoch_part = epoch_str.split("-slot").next().unwrap_or(epoch_str);
+                    if let Ok(epoch) = epoch_part.parse::<u64>() {
+                        snapshots.push((epoch, entry.path()));
+                    }
+                }
+            }
+        }
+    }
+    if snapshots.len() > keep {
+        snapshots.sort_by_key(|(epoch, _)| *epoch);
+        let to_remove = snapshots.len() - keep;
+        for (epoch, path) in snapshots.into_iter().take(to_remove) {
+            if let Err(e) = std::fs::remove_file(&path) {
+                warn!(epoch, "Failed to remove old snapshot: {e}");
+            } else {
+                debug!(epoch, "Pruned old ledger snapshot");
+            }
+        }
+    }
+}
+
 /// Update `latest_path` to reference the same inode as `epoch_path` via a
 /// hardlink (issue #648).
 ///
@@ -221,75 +255,82 @@ impl Node {
     /// cardano-lsm has no WAL — without this flush, all UTxO data is lost
     /// on restart.
     pub async fn save_ledger_snapshot(&self) {
-        let mut ls = self.ledger_state.write().await;
-        let epoch = ls.epoch.0;
+        // Phase A — under the `LedgerState` write lock (issue #649). Keep
+        // this short: LSM flush + opcert/diff bookkeeping + cheap clone of
+        // the bincode wire view (Arc::clone for the big shared maps).
+        // Once the `LedgerStateSnapshot` is constructed it captures a
+        // point-in-time consistent view; the lock can be dropped and the
+        // CPU + disk-bound write moves to a `spawn_blocking` worker.
+        let (snapshot, epoch, slot, utxo_count) = {
+            let mut ls = self.ledger_state.write().await;
+            let epoch = ls.epoch.0;
 
-        // Copy opcert counters from consensus into ledger state for snapshot persistence.
-        // Consensus is the runtime owner; ledger state is the persistence vehicle.
-        ls.consensus.opcert_counters = self.consensus.opcert_counters().clone();
+            // Copy opcert counters from consensus into ledger state for
+            // snapshot persistence. Consensus is the runtime owner; ledger
+            // state is the persistence vehicle.
+            ls.consensus.opcert_counters = self.consensus.opcert_counters().clone();
 
-        // Free DiffSeq memory before snapshot — diffs are not persisted
-        // (#[serde(skip)]) and clearing here reclaims memory immediately.
-        ls.utxo.diff_seq.clear();
+            // Free DiffSeq memory before snapshot — diffs are not
+            // persisted (#[serde(skip)]) and clearing here reclaims
+            // memory immediately.
+            ls.utxo.diff_seq.clear();
 
-        // Flush UTxO store to disk FIRST (cardano-lsm has no WAL)
-        if let Err(e) = ls.save_utxo_snapshot() {
-            error!("Failed to save UTxO store snapshot: {e}");
-        }
-
-        // Save epoch-numbered snapshot for rollback safety.
-        // Filename includes slot for fast enumeration without deserialization.
-        let slot = ls.tip.point.slot().map(|s| s.0).unwrap_or(0);
-        let epoch_path = self
-            .database_path
-            .join(format!("ledger-snapshot-epoch{epoch}-slot{slot}.bin"));
-        if let Err(e) = ls.save_snapshot(&epoch_path) {
-            error!("Failed to save ledger snapshot: {e}");
-            return;
-        }
-
-        // Update "latest" via hardlink (issue #648) — same inode, no double
-        // disk write, lock released seconds earlier on multi-hundred-MB
-        // ledger state. See `link_latest_snapshot` for atomicity/crash notes.
-        let latest_path = self.database_path.join("ledger-snapshot.bin");
-        if let Err(e) = link_latest_snapshot(&epoch_path, &latest_path) {
-            error!("Failed to hardlink latest ledger snapshot: {e}");
-        }
-
-        drop(ls);
-
-        // Prune old snapshots — keep only the configured maximum
-        self.prune_old_snapshots(self.snapshot_policy.max_snapshots + 1);
-    }
-
-    /// Remove old epoch snapshots, keeping only the N most recent.
-    pub fn prune_old_snapshots(&self, keep: usize) {
-        let mut snapshots: Vec<(u64, PathBuf)> = Vec::new();
-        if let Ok(entries) = std::fs::read_dir(&self.database_path) {
-            for entry in entries.flatten() {
-                let name = entry.file_name();
-                let name_str = name.to_string_lossy();
-                if let Some(rest) = name_str.strip_prefix("ledger-snapshot-epoch") {
-                    if let Some(epoch_str) = rest.strip_suffix(".bin") {
-                        // Handle both "5" (legacy) and "5-slot12345" (new) formats.
-                        let epoch_part = epoch_str.split("-slot").next().unwrap_or(epoch_str);
-                        if let Ok(epoch) = epoch_part.parse::<u64>() {
-                            snapshots.push((epoch, entry.path()));
-                        }
-                    }
-                }
+            // Flush UTxO store to disk FIRST (cardano-lsm has no WAL).
+            // MUST stay under the lock: `LsmTree::save_snapshot` takes
+            // `&mut self` and concurrent flush is not supported.
+            if let Err(e) = ls.save_utxo_snapshot() {
+                error!("Failed to save UTxO store snapshot: {e}");
             }
-        }
-        if snapshots.len() > keep {
-            snapshots.sort_by_key(|(epoch, _)| *epoch);
-            let to_remove = snapshots.len() - keep;
-            for (epoch, path) in snapshots.into_iter().take(to_remove) {
-                if let Err(e) = std::fs::remove_file(&path) {
-                    warn!(epoch, "Failed to remove old snapshot: {e}");
-                } else {
-                    debug!(epoch, "Pruned old ledger snapshot");
-                }
+
+            let slot = ls.tip.point.slot().map(|s| s.0).unwrap_or(0);
+            let utxo_count = ls.utxo.utxo_set.len();
+            // Cheap snapshot view: Arc::clone for the big shared maps
+            // (delegations, pool_params, reward_accounts, governance,
+            // epoch_blocks_by_pool); HashMap::clone for the bounded ones.
+            // For the LSM backend `utxo_set` is empty in the snapshot —
+            // UTxOs are persisted via the LSM SST flush above.
+            let snapshot = dugite_ledger::LedgerStateSnapshot::from(&*ls);
+            (snapshot, epoch, slot, utxo_count)
+            // ── LOCK RELEASED HERE ──
+        };
+
+        let database_path = self.database_path.clone();
+        let max_snapshots = self.snapshot_policy.max_snapshots + 1;
+        let epoch_path = database_path.join(format!("ledger-snapshot-epoch{epoch}-slot{slot}.bin"));
+        let latest_path = database_path.join("ledger-snapshot.bin");
+
+        // Phase B — off the tokio worker pool. Bincode walk + hashing +
+        // buffered disk write + atomic rename + latest.bin hardlink +
+        // prune. None of this needs the ledger lock; running it on a
+        // tokio worker would otherwise pin one core for the duration
+        // (multi-second on preview/preprod-scale state) and stall every
+        // co-scheduled task.
+        let join_result = tokio::task::spawn_blocking(move || -> Result<u64, String> {
+            let bytes =
+                dugite_ledger::LedgerState::write_snapshot_view_to_path(&snapshot, &epoch_path)
+                    .map_err(|e| format!("write snapshot: {e}"))?;
+            if let Err(e) = link_latest_snapshot(&epoch_path, &latest_path) {
+                // Non-fatal: epoch-N snapshot is on disk; startup will
+                // enumerate it via `find_best_snapshot_for_rollback` if
+                // `latest.bin` is missing.
+                error!("Failed to hardlink latest ledger snapshot: {e}");
             }
+            prune_old_snapshots_in_dir(&database_path, max_snapshots);
+            Ok(bytes)
+        })
+        .await;
+
+        match join_result {
+            Ok(Ok(bytes)) => {
+                tracing::info!(
+                    "Snapshot     saved (epoch={}, {} UTxOs, {:.1} MB)",
+                    epoch,
+                    utxo_count,
+                    bytes as f64 / 1_048_576.0,
+                );
+            }
+            Ok(Err(e)) => error!("Failed to save ledger snapshot: {e}"),
+            Err(join_err) => error!("Snapshot task panicked: {join_err}"),
         }
     }
 
@@ -776,6 +817,84 @@ mod tests {
         let latest_path = tmp.path().join("ledger-snapshot.bin");
         let err = link_latest_snapshot(&epoch_path, &latest_path).unwrap_err();
         assert_eq!(err.kind(), std::io::ErrorKind::NotFound);
+    }
+
+    // ── Issue #649: prune_old_snapshots_in_dir tests ─────────────────────
+
+    /// Free-function prune (callable from `spawn_blocking`) must remove
+    /// the oldest epoch snapshots while keeping the most recent `keep`.
+    /// The legacy `epoch{N}.bin` and current `epoch{N}-slot{S}.bin` name
+    /// formats must both be recognised.
+    #[test]
+    fn test_prune_old_snapshots_in_dir_keeps_n_most_recent() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+
+        // Create 5 snapshots in mixed name formats.
+        for (epoch, slot) in [(1u64, 100u64), (2, 200), (3, 300), (4, 400), (5, 500)] {
+            let p = dir.join(format!("ledger-snapshot-epoch{epoch}-slot{slot}.bin"));
+            std::fs::write(&p, b"x").unwrap();
+        }
+        // Legacy format (no slot)
+        let legacy = dir.join("ledger-snapshot-epoch0.bin");
+        std::fs::write(&legacy, b"legacy").unwrap();
+        // Unrelated file (must survive).
+        let latest = dir.join("ledger-snapshot.bin");
+        std::fs::write(&latest, b"latest").unwrap();
+        let other = dir.join("ledger-snapshot.tmp");
+        std::fs::write(&other, b"junk").unwrap();
+
+        // Keep 3 most recent — epochs 3, 4, 5 survive; 0, 1, 2 are deleted.
+        prune_old_snapshots_in_dir(dir, 3);
+
+        assert!(!legacy.exists(), "legacy epoch 0 must be pruned");
+        assert!(
+            !dir.join("ledger-snapshot-epoch1-slot100.bin").exists(),
+            "epoch 1 must be pruned"
+        );
+        assert!(
+            !dir.join("ledger-snapshot-epoch2-slot200.bin").exists(),
+            "epoch 2 must be pruned"
+        );
+        assert!(
+            dir.join("ledger-snapshot-epoch3-slot300.bin").exists(),
+            "epoch 3 must survive"
+        );
+        assert!(
+            dir.join("ledger-snapshot-epoch4-slot400.bin").exists(),
+            "epoch 4 must survive"
+        );
+        assert!(
+            dir.join("ledger-snapshot-epoch5-slot500.bin").exists(),
+            "epoch 5 must survive"
+        );
+        assert!(latest.exists(), "ledger-snapshot.bin must not be touched");
+        assert!(other.exists(), "unrelated files must not be touched");
+    }
+
+    /// When fewer snapshots exist than the keep threshold, no files are removed.
+    #[test]
+    fn test_prune_old_snapshots_in_dir_keeps_all_when_below_threshold() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        for (epoch, slot) in [(1u64, 100u64), (2, 200)] {
+            std::fs::write(
+                dir.join(format!("ledger-snapshot-epoch{epoch}-slot{slot}.bin")),
+                b"x",
+            )
+            .unwrap();
+        }
+        prune_old_snapshots_in_dir(dir, 5);
+        assert!(dir.join("ledger-snapshot-epoch1-slot100.bin").exists());
+        assert!(dir.join("ledger-snapshot-epoch2-slot200.bin").exists());
+    }
+
+    /// Non-existent directory must not panic.
+    #[test]
+    fn test_prune_old_snapshots_in_dir_missing_dir_is_noop() {
+        let tmp = tempfile::tempdir().unwrap();
+        let missing = tmp.path().join("nope");
+        prune_old_snapshots_in_dir(&missing, 3); // must not panic
     }
 
     #[test]

@@ -15,7 +15,7 @@ pub use plutus::{evaluate_plutus_scripts, PlutusError, SlotConfig};
 pub use state::Rat;
 pub use state::{
     compute_reward_update, BlockValidationMode, CertSubState, ConsensusSubState, EpochSubState,
-    GovSubState, LedgerState, UtxoSubState,
+    GovSubState, LedgerState, LedgerStateSnapshot, UtxoSubState,
 };
 pub use utxo::{CompositeUtxoView, UtxoLookup, UtxoSet};
 pub use utxo_diff::{DiffSeq, UtxoDiff};
