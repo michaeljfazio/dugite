@@ -89,26 +89,49 @@ pub fn eval_resolved_redeemer(
     // 2. Build the per-version ScriptContext as Data.
     let ctx_data = build_script_context(tx, resolved, r, slot_config)?;
 
-    // 3. Pre-apply the args. V1/V2 take three; V3 takes one (the
-    //    ctx already carries redeemer + script_info inside).
+    // 3. Pre-apply the args. V3 takes one (ctx); V1/V2 takes three for
+    //    a Spend redeemer (datum, redeemer, ctx) and two for
+    //    Mint/Cert/Reward redeemers (redeemer, ctx) — the latter have
+    //    no datum. Cf. Haskell `Plutus.V1.Ledger.Api`:
+    //      * spending policy:  `\datum redeemer ctx -> ()`
+    //      * minting policy / cert / reward script: `\redeemer ctx -> ()`
     let applied_term = match r.language {
         ScriptLanguage::PlutusV1 | ScriptLanguage::PlutusV2 => {
-            let datum = r.datum.as_ref().ok_or_else(|| {
-                PhaseTwoError::Internal(
-                    "eval_resolved_redeemer: V1/V2 spend redeemer missing datum".to_string(),
-                )
-            })?;
-            let datum_term = data_const_term(plutus_data_to_data(datum));
+            use dugite_primitives::transaction::RedeemerTag;
             let redeemer_term = data_const_term(plutus_data_to_data(&r.redeemer_data));
             let ctx_term = data_const_term(ctx_data);
-            // script(datum)(redeemer)(ctx)
-            Term::App(
-                Box::new(Term::App(
-                    Box::new(Term::App(Box::new(term), Box::new(datum_term))),
-                    Box::new(redeemer_term),
-                )),
-                Box::new(ctx_term),
-            )
+            match r.tag {
+                RedeemerTag::Spend => {
+                    let datum = r.datum.as_ref().ok_or_else(|| {
+                        PhaseTwoError::Internal(
+                            "eval_resolved_redeemer: V1/V2 spend redeemer missing datum"
+                                .to_string(),
+                        )
+                    })?;
+                    let datum_term = data_const_term(plutus_data_to_data(datum));
+                    // script(datum)(redeemer)(ctx)
+                    Term::App(
+                        Box::new(Term::App(
+                            Box::new(Term::App(Box::new(term), Box::new(datum_term))),
+                            Box::new(redeemer_term),
+                        )),
+                        Box::new(ctx_term),
+                    )
+                }
+                RedeemerTag::Mint | RedeemerTag::Cert | RedeemerTag::Reward => {
+                    // script(redeemer)(ctx)
+                    Term::App(
+                        Box::new(Term::App(Box::new(term), Box::new(redeemer_term))),
+                        Box::new(ctx_term),
+                    )
+                }
+                RedeemerTag::Vote | RedeemerTag::Propose | RedeemerTag::Guarding => {
+                    return Err(PhaseTwoError::Internal(format!(
+                        "eval_resolved_redeemer: tag {:?} is not valid for V1/V2",
+                        r.tag
+                    )));
+                }
+            }
         }
         ScriptLanguage::PlutusV3 => {
             let ctx_term = data_const_term(ctx_data);
@@ -121,38 +144,39 @@ pub fn eval_resolved_redeemer(
     let value = evaluate_with_budget(applied_term, &mut tracker)
         .map_err(PhaseTwoError::ScriptEvaluationFailed)?;
 
-    // 5. Convert the Value back to a Term for inspection. The CEK's
-    //    Value::Const wraps a Constant; other Value variants
-    //    (Lambda / Delay) cannot appear at the final reduction step
-    //    of a well-formed script — cardano-node treats them as
-    //    Error. We surface `Term::Error` in those cases so the
-    //    classification below (success/failure) treats them
-    //    uniformly.
+    // 5. Classify the CEK result.
+    //
+    //    Reaching this point means `evaluate_with_budget` returned `Ok` —
+    //    i.e. the CEK machine produced a value without raising
+    //    `Term::Error`. The shape of that value matters by language:
+    //
+    //    * V3 (Conway): result MUST be `Const(Unit)`. Anything else
+    //      (Lambda / Delay / non-Unit constant) is a phase-2 failure.
+    //      Cf. Haskell `Plutus.V3.Ledger.Api.evaluateScriptCounting`.
+    //    * V1 / V2: success = CEK didn't raise `Error`. The result may
+    //      be a Lambda or Delay value — e.g. the canonical IOG
+    //      `always-true-v1` vendored fixture
+    //      (cborHex `4e4d01000033222220051200120011`) reduces to a
+    //      `Delay(Lam(Var 1))` after the 3-arg pre-application, and
+    //      cardano-node accepts it. Cf. Haskell `Plutus.V1.Ledger.Api`
+    //      / `Plutus.V2.Ledger.Api.evaluateScriptCounting`, which
+    //      only fail on `CekFailure`.
+    //
+    //    `result_term` is preserved for V3's shape check; for V1/V2 it
+    //    is forced to `Term::Error` only when the CEK actually raised
+    //    Error (which would already have surfaced as `Err` above, but
+    //    we keep the down-conversion defensively).
     let result_term = match value {
         crate::machine::Value::Const(c) => Term::Const(c),
-        // Lambdas / Delays at the top level mean the script returned a
-        // partially-applied term — that's a Plutus-side bug, treat as
-        // an Error result so callers reject the tx.
         _ => Term::Error,
     };
 
-    // 6. V3-specific check: result MUST be `Const(Unit)`. V1/V2 accept
-    //    any non-Error term.
-    match r.language {
-        ScriptLanguage::PlutusV3 => {
-            if !matches!(&result_term, Term::Const(Constant::Unit)) {
-                return Err(PhaseTwoError::Internal(format!(
-                    "V3 script returned non-Unit value: {result_term:?}"
-                )));
-            }
-        }
-        ScriptLanguage::PlutusV1 | ScriptLanguage::PlutusV2 => {
-            if matches!(&result_term, Term::Error) {
-                return Err(PhaseTwoError::Internal(
-                    "V1/V2 script reduced to Term::Error".to_string(),
-                ));
-            }
-        }
+    if matches!(r.language, ScriptLanguage::PlutusV3)
+        && !matches!(&result_term, Term::Const(Constant::Unit))
+    {
+        return Err(PhaseTwoError::Internal(format!(
+            "V3 script returned non-Unit value: {result_term:?}"
+        )));
     }
 
     Ok(RedeemerEvalOutcome {
