@@ -392,9 +392,7 @@ fn decode_pool_distr_count(dec: &mut minicbor::Decoder<'_>, label: &str) -> Resu
             // Pre-Conway bare map
             decode_map_count(dec, label)
         }
-        other => Err(format!(
-            "{label}: expected map or array(2), got {other:?}"
-        )),
+        other => Err(format!("{label}: expected map or array(2), got {other:?}")),
     }
 }
 
