@@ -90,6 +90,15 @@ struct LogArgs {
     /// Number of days to retain log files (default: 7)
     #[arg(long, default_value = "7")]
     log_retention_days: u64,
+
+    /// Channel-full policy for the non-blocking stdout writer (issue #650).
+    ///
+    /// `drop` (default) — under flood the producer keeps going and dropped
+    /// lines are counted; matches `tracing_appender` upstream default.
+    /// `block` — producer parks until the worker drains; lossless, but
+    /// re-introduces the blocking behavior on the hot path.
+    #[arg(long, default_value = "drop")]
+    stdout_overflow: String,
 }
 
 #[derive(clap::Args, Debug)]
@@ -328,6 +337,11 @@ fn build_logging_opts(log: &LogArgs) -> Result<logging::LoggingOpts> {
         .parse()
         .map_err(|e: String| anyhow::anyhow!(e))?;
 
+    let stdout_overflow: logging::LogOverflow = log
+        .stdout_overflow
+        .parse()
+        .map_err(|e: String| anyhow::anyhow!(e))?;
+
     Ok(logging::LoggingOpts {
         outputs,
         format,
@@ -336,6 +350,7 @@ fn build_logging_opts(log: &LogArgs) -> Result<logging::LoggingOpts> {
         rotation,
         no_color: log.log_no_color,
         _log_retention_days: log.log_retention_days,
+        stdout_overflow,
     })
 }
 
@@ -489,6 +504,11 @@ async fn run_dump_snapshot(args: DumpSnapshotArgs) -> Result<()> {
 
     // Initialize fresh ledger state from genesis params
     let mut ledger = dugite_ledger::LedgerState::new(protocol_params);
+    if let Some(ref sg) = shelley_genesis_opt {
+        // Must run BEFORE any seed_genesis_utxos call below so reserves
+        // init from the genesis cap (devnets may use 60B, mainnet/preview/preprod 45B).
+        ledger.set_max_lovelace_supply(sg.max_lovelace_supply);
+    }
 
     // Seed Conway genesis committee members and threshold (required for governance
     // ratification — without these, check_cc_approval returns false and no
