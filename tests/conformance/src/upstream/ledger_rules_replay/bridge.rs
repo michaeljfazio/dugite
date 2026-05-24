@@ -53,6 +53,27 @@
 //! - `NonMyopic` encoding: `eras/shelley/impl/src/Cardano/Ledger/Shelley/PoolRank.hs`
 //!   → `encCBOR NonMyopic` → `encodeListLen 2 <> encCBOR likelihoodsNM <> encCBOR rewardPotNM`
 //!
+//! ## Native STS signal decoders (Phase 4 native-signal extension)
+//!
+//! For the 8 non-Tx rules (POOL, CERT, CERTS, DELEG, GOVCERT, GOV, ENACT, RATIFY)
+//! the signal is NOT a full `Tx era`.  The actual on-wire CBOR encoding (from
+//! patched cardano-ledger ImpSpec output, verified 2026-05-24) is:
+//!
+//! **TxCert / STS rule signals**: a flat CBOR array whose first element is a uint
+//! discriminator tag.  Observed tag values in the real ImpSpec corpus:
+//!
+//! | Rule    | Observed tags       | Interpretation |
+//! |---------|---------------------|----------------|
+//! | POOL    | 0 (PoolReg), 1 (PoolRetire) | PoolCert |
+//! | DELEG   | 7–12                | ConwayDelegCert |
+//! | GOVCERT | 14–18               | ConwayGovCert |
+//! | CERT    | any of the above + more | TxCert (all variants) |
+//!
+//! **CERTS**: definite CBOR array of TxCert elements (each element is a TxCert as above).
+//! **GOV**: `[map, set_or_array, list]` — VotingProcedures map + OSet + ProposalProcedures.
+//! **ENACT**: `[GovActionId, GovAction]` — array(2) where GovActionId is array(2)[bstr(32), uint].
+//! **RATIFY**: definite array of GovActionState elements, each array(7).
+//!
 //! ## Future work (Phase 4 follow-on)
 //!
 //! Once `dugite-ledger` exposes a public deserialization API for
@@ -292,8 +313,9 @@ pub fn decode_new_epoch_state(st_cbor: &[u8]) -> Result<DecodedNewEpochState, St
     // ── field[4] StrictMaybe PulsingRewUpdate ─────────────────────────────────
     let pulsing_rew_update = decode_strict_maybe(&mut dec, "field[4] StrictMaybe")?;
 
-    // ── field[5] PoolDistr map ─────────────────────────────────────────────────
-    let pool_distr_count = decode_map_count(&mut dec, "field[5] PoolDistr")?;
+    // ── field[5] PoolDistr ────────────────────────────────────────────────────
+    // Pre-Conway: bare map.  Conway: array(2)[map, CompactCoin].
+    let pool_distr_count = decode_pool_distr_count(&mut dec, "field[5] PoolDistr")?;
 
     // ── field[6] stashedAVVM — array(0) in Conway ─────────────────────────────
     let stashed_avvm_len = decode_stashed_avvm(&mut dec, "field[6] stashedAVVM")?;
@@ -333,6 +355,49 @@ fn decode_u64(dec: &mut minicbor::Decoder<'_>, label: &str) -> Result<u64, Strin
 /// For indefinite maps, consumes all key-value pairs and returns the count.
 /// Does not decode the map entries — just counts them (for BlocksMade and
 /// PoolDistr which may have arbitrary pool key hashes as keys).
+/// Decode a PoolDistr field, handling both wire formats:
+/// - Pre-Conway: bare CBOR map.
+/// - Conway: `array(2)[map, CompactCoin]` (`encodeListLen 2 <> encCBOR map <> encCBOR total`).
+///
+/// Returns the number of pool entries in the map.
+fn decode_pool_distr_count(dec: &mut minicbor::Decoder<'_>, label: &str) -> Result<u64, String> {
+    match dec
+        .datatype()
+        .map_err(|e| format!("{label} peek type: {e}"))?
+    {
+        Type::Array => {
+            // Conway encoding: array(2)[map, CompactCoin]
+            match dec
+                .array()
+                .map_err(|e| format!("{label} array header: {e}"))?
+            {
+                Some(2) => {}
+                Some(n) => {
+                    return Err(format!(
+                        "{label}: Conway PoolDistr should be array(2), got array({n})"
+                    ))
+                }
+                None => {
+                    return Err(format!(
+                        "{label}: Conway PoolDistr should be definite array(2)"
+                    ))
+                }
+            }
+            let count = decode_map_count(dec, &format!("{label} inner map"))?;
+            dec.skip()
+                .map_err(|e| format!("{label} CompactCoin skip: {e}"))?;
+            Ok(count)
+        }
+        Type::Map => {
+            // Pre-Conway bare map
+            decode_map_count(dec, label)
+        }
+        other => Err(format!(
+            "{label}: expected map or array(2), got {other:?}"
+        )),
+    }
+}
+
 fn decode_map_count(dec: &mut minicbor::Decoder<'_>, label: &str) -> Result<u64, String> {
     match dec.map().map_err(|e| format!("{label} map header: {e}"))? {
         Some(n) => {
@@ -757,5 +822,417 @@ fn top_level_shape(cbor: &[u8], label: &str) -> Result<String, String> {
             }
         }
         other => Ok(format!("{other:?}")),
+    }
+}
+
+// ── Native STS signal decoders ────────────────────────────────────────────────
+//
+// The ImpSpec corpus uses rule-specific signal types for POOL, CERT, CERTS,
+// DELEG, GOVCERT, GOV, ENACT, and RATIFY — none of these are full `Tx era`
+// blobs.  The decoders below provide structural validation matching the actual
+// on-wire encoding observed in the real ImpSpec corpus (verified 2026-05-24).
+//
+// Tag values (from the real corpus):
+//   POOL:    [0, pool_params_list]       = PoolRegistration
+//            [1, pool_id_bstr28, epoch]  = PoolRetirement
+//   DELEG:   tags 7–12  (ConwayDelegCert variants)
+//   GOVCERT: tags 14–18 (ConwayGovCert variants)
+//   CERT:    any tag seen in POOL ∪ DELEG ∪ GOVCERT (plus additional variants)
+//
+// The encoding for GOV, ENACT, and RATIFY differs from TxCert:
+//   GOV:    [map, set/array, list]   (VotingProcedures, OSet, ProposalProcedures)
+//   ENACT:  [[bstr(32), uint], govaction] — array(2)
+//   RATIFY: array of array(7)
+
+/// Validate a raw CBOR blob as a single TxCert signal.
+///
+/// The ImpSpec TxCert signal is a flat CBOR array whose first element is a
+/// uint discriminator tag.  We do not validate the tag range here — that is
+/// done in the per-rule wrappers (`decode_pool_signal`, etc.).
+///
+/// Returns the leading uint tag on success.
+pub fn decode_tx_cert_tag(cbor: &[u8]) -> Result<u64, String> {
+    if cbor.is_empty() {
+        return Err("TxCert signal: empty CBOR".to_string());
+    }
+    let mut dec = minicbor::Decoder::new(cbor);
+
+    // Must be a definite array.
+    let n = match dec
+        .array()
+        .map_err(|e| format!("TxCert: array header: {e}"))?
+    {
+        Some(n) => n,
+        None => return Err("TxCert: expected definite array, got indefinite".to_string()),
+    };
+
+    if n == 0 {
+        return Err("TxCert: empty array (no tag field)".to_string());
+    }
+
+    // First element is the uint discriminator tag.
+    match dec
+        .datatype()
+        .map_err(|e| format!("TxCert: tag datatype: {e}"))?
+    {
+        Type::U8 | Type::U16 | Type::U32 | Type::U64 => {
+            dec.u64().map_err(|e| format!("TxCert: tag decode: {e}"))
+        }
+        other => Err(format!(
+            "TxCert: expected uint tag as first array element, got {other:?}"
+        )),
+    }
+}
+
+/// Validate a POOL signal: `[0, pool_params_list]` or `[1, pool_id, epoch]`.
+///
+/// Observed POOL tags in the real corpus: 0 (PoolRegistration), 1 (PoolRetirement).
+pub fn decode_pool_signal(cbor: &[u8]) -> Result<u64, String> {
+    let tag = decode_tx_cert_tag(cbor)?;
+    // Tags 0 and 1 are the only valid POOL cert tags observed in the real corpus.
+    if tag == 0 || tag == 1 {
+        Ok(tag)
+    } else {
+        Err(format!(
+            "POOL signal: unexpected tag {tag} (expected 0=PoolReg or 1=PoolRetire)"
+        ))
+    }
+}
+
+/// Validate a DELEG signal: a ConwayDelegCert with tags 7–12.
+///
+/// Observed DELEG tags in the real corpus: 7, 8, 9, 11, 12.
+pub fn decode_deleg_signal(cbor: &[u8]) -> Result<u64, String> {
+    let tag = decode_tx_cert_tag(cbor)?;
+    // All observed DELEG tags are in the range 7–12.  We allow any value in
+    // that range — specific variants not yet observed in the corpus (e.g. 10)
+    // may appear in future fixture generations.
+    if (7..=12).contains(&tag) {
+        Ok(tag)
+    } else {
+        Err(format!(
+            "DELEG signal: unexpected tag {tag} (expected 7–12 for ConwayDelegCert)"
+        ))
+    }
+}
+
+/// Validate a GOVCERT signal: a ConwayGovCert with tags 14–18.
+///
+/// Observed GOVCERT tags in the real corpus: 14, 15, 16, 18.
+pub fn decode_govcert_signal(cbor: &[u8]) -> Result<u64, String> {
+    let tag = decode_tx_cert_tag(cbor)?;
+    // All observed GOVCERT tags are in the range 14–18.
+    if (14..=18).contains(&tag) {
+        Ok(tag)
+    } else {
+        Err(format!(
+            "GOVCERT signal: unexpected tag {tag} (expected 14–18 for ConwayGovCert)"
+        ))
+    }
+}
+
+/// Validate a CERT signal: any TxCert variant.
+///
+/// CERT is the union of POOL, DELEG, and GOVCERT, so any valid tag is accepted.
+/// Observed CERT tags in the real corpus: 3, 7, 8, 11, 12, 18.
+pub fn decode_cert_signal(cbor: &[u8]) -> Result<u64, String> {
+    // Any uint tag is valid for CERT — it is the superset of all cert variants.
+    decode_tx_cert_tag(cbor)
+}
+
+/// Validate a CERTS signal: a definite CBOR array of TxCert elements.
+///
+/// Returns the count of TxCert elements (may be 0 for empty sequences).
+pub fn decode_certs_signal_count(cbor: &[u8]) -> Result<usize, String> {
+    if cbor.is_empty() {
+        return Err("CERTS signal: empty CBOR".to_string());
+    }
+    let mut dec = minicbor::Decoder::new(cbor);
+
+    // Outer: definite array of TxCert elements.
+    let n = match dec
+        .array()
+        .map_err(|e| format!("CERTS: outer array header: {e}"))?
+    {
+        Some(n) => n,
+        None => return Err("CERTS signal: expected definite array, got indefinite".to_string()),
+    };
+
+    // Validate each element as a TxCert (flat array with uint tag).
+    for i in 0..n {
+        // Each TxCert is itself a definite array.
+        let elem_len = match dec
+            .array()
+            .map_err(|e| format!("CERTS element[{i}]: array header: {e}"))?
+        {
+            Some(len) => len,
+            None => {
+                return Err(format!(
+                    "CERTS element[{i}]: expected definite array, got indefinite"
+                ))
+            }
+        };
+        if elem_len == 0 {
+            return Err(format!("CERTS element[{i}]: empty TxCert array (no tag)"));
+        }
+        // First element must be a uint tag.
+        match dec
+            .datatype()
+            .map_err(|e| format!("CERTS element[{i}] tag datatype: {e}"))?
+        {
+            Type::U8 | Type::U16 | Type::U32 | Type::U64 => {
+                dec.u64()
+                    .map_err(|e| format!("CERTS element[{i}] tag: {e}"))?;
+            }
+            other => {
+                return Err(format!(
+                    "CERTS element[{i}]: expected uint tag, got {other:?}"
+                ))
+            }
+        }
+        // Skip remaining fields of the TxCert.
+        for j in 1..elem_len {
+            dec.skip()
+                .map_err(|e| format!("CERTS element[{i}] field[{j}]: {e}"))?;
+        }
+    }
+
+    Ok(n as usize)
+}
+
+/// Validate a GOV signal: `[VotingProcedures, OSet, ProposalProcedures]`.
+///
+/// The GOV signal is `GovSignal era` encoded as a 3-element definite array.
+/// Based on the real ImpSpec corpus (verified 2026-05-24):
+///   [0] VotingProcedures — a CBOR map
+///   [1] OSet             — a CBOR set (OSet ProposalProcedure)
+///   [2] ProposalProcedures — a CBOR array of proposal procedures
+///
+/// The third field in the real corpus is an array, not a Coin uint.
+/// We validate the outer shape (array(3)) and that field[0] is a map;
+/// fields [1] and [2] are skipped entirely.
+pub fn decode_gov_signal_shape(cbor: &[u8]) -> Result<(), String> {
+    if cbor.is_empty() {
+        return Err("GOV signal: empty CBOR".to_string());
+    }
+    let mut dec = minicbor::Decoder::new(cbor);
+
+    // Outer: definite array(3).
+    match dec
+        .array()
+        .map_err(|e| format!("GOV: outer array header: {e}"))?
+    {
+        Some(3) => {}
+        Some(n) => return Err(format!("GOV signal: expected array(3), got array({n})")),
+        None => return Err("GOV signal: expected definite array(3), got indefinite".to_string()),
+    }
+
+    // [0] VotingProcedures — must be a map (possibly empty).
+    match dec
+        .datatype()
+        .map_err(|e| format!("GOV field[0] datatype: {e}"))?
+    {
+        Type::Map => {
+            dec.skip()
+                .map_err(|e| format!("GOV field[0] VotingProcedures skip: {e}"))?;
+        }
+        other => {
+            return Err(format!(
+                "GOV field[0]: expected map (VotingProcedures), got {other:?}"
+            ))
+        }
+    }
+
+    // [1] OSet ProposalProcedure — may be a CBOR set or tagged array.
+    //     Skip entirely.
+    dec.skip()
+        .map_err(|e| format!("GOV field[1] OSet skip: {e}"))?;
+
+    // [2] ProposalProcedures — in the real corpus this is an array (not a Coin).
+    //     Accept any encoding — skip entirely.
+    dec.skip()
+        .map_err(|e| format!("GOV field[2] ProposalProcedures skip: {e}"))?;
+
+    Ok(())
+}
+
+/// Validate an ENACT signal: `[GovActionId, GovAction]`.
+///
+/// The ENACT signal is `EnactSignal era` = `(GovActionId, GovAction)`.
+/// On wire it is a 2-element definite array:
+///   [0] GovActionId — array(2)[bstr(32), uint]
+///   [1] GovAction   — array with leading uint tag
+pub fn decode_enact_signal_shape(cbor: &[u8]) -> Result<(), String> {
+    if cbor.is_empty() {
+        return Err("ENACT signal: empty CBOR".to_string());
+    }
+    let mut dec = minicbor::Decoder::new(cbor);
+
+    // Outer: definite array(2).
+    match dec
+        .array()
+        .map_err(|e| format!("ENACT: outer array header: {e}"))?
+    {
+        Some(2) => {}
+        Some(n) => return Err(format!("ENACT signal: expected array(2), got array({n})")),
+        None => return Err("ENACT signal: expected definite array(2), got indefinite".to_string()),
+    }
+
+    // [0] GovActionId — must be array(2)[bstr(32), uint].
+    match dec
+        .array()
+        .map_err(|e| format!("ENACT field[0] GovActionId array header: {e}"))?
+    {
+        Some(2) => {}
+        Some(n) => {
+            return Err(format!(
+                "ENACT field[0] GovActionId: expected array(2), got array({n})"
+            ))
+        }
+        None => {
+            return Err(
+                "ENACT field[0] GovActionId: expected definite array(2), got indefinite"
+                    .to_string(),
+            )
+        }
+    }
+    // [0.0] tx hash bstr(32)
+    match dec
+        .datatype()
+        .map_err(|e| format!("ENACT GovActionId[0] datatype: {e}"))?
+    {
+        Type::Bytes => {
+            let bs = dec
+                .bytes()
+                .map_err(|e| format!("ENACT GovActionId[0] bytes: {e}"))?;
+            if bs.len() != 32 {
+                return Err(format!(
+                    "ENACT GovActionId[0]: expected 32-byte tx hash, got {} bytes",
+                    bs.len()
+                ));
+            }
+        }
+        other => {
+            return Err(format!(
+                "ENACT GovActionId[0]: expected bstr(32) tx hash, got {other:?}"
+            ))
+        }
+    }
+    // [0.1] action index (uint)
+    match dec
+        .datatype()
+        .map_err(|e| format!("ENACT GovActionId[1] datatype: {e}"))?
+    {
+        Type::U8 | Type::U16 | Type::U32 | Type::U64 => {
+            dec.skip()
+                .map_err(|e| format!("ENACT GovActionId[1] index skip: {e}"))?;
+        }
+        other => {
+            return Err(format!(
+                "ENACT GovActionId[1]: expected uint action index, got {other:?}"
+            ))
+        }
+    }
+
+    // [1] GovAction — skip entirely (complex, many variants).
+    dec.skip()
+        .map_err(|e| format!("ENACT field[1] GovAction skip: {e}"))?;
+
+    Ok(())
+}
+
+/// Validate a RATIFY signal: an array of `GovActionState` elements.
+///
+/// Each `GovActionState` is encoded as `array(7)`.  An empty RATIFY signal
+/// (no proposals to ratify) is encoded as `array(0)` = `0x80`.  Large
+/// signals may use an indefinite-length outer array (`0x9f...0xff`).
+///
+/// Returns the number of `GovActionState` elements (may be 0).
+pub fn decode_ratify_signal_count(cbor: &[u8]) -> Result<usize, String> {
+    if cbor.is_empty() {
+        return Err("RATIFY signal: empty CBOR".to_string());
+    }
+    let mut dec = minicbor::Decoder::new(cbor);
+
+    // Outer: definite or indefinite array of GovActionState elements.
+    let definite_len = dec
+        .array()
+        .map_err(|e| format!("RATIFY: outer array header: {e}"))?;
+
+    match definite_len {
+        Some(n) => {
+            // Definite array: validate each element is array(7).
+            for i in 0..n {
+                match dec
+                    .array()
+                    .map_err(|e| format!("RATIFY element[{i}]: array header: {e}"))?
+                {
+                    Some(7) => {
+                        for j in 0..7u64 {
+                            dec.skip()
+                                .map_err(|e| format!("RATIFY element[{i}] field[{j}]: {e}"))?;
+                        }
+                    }
+                    Some(m) => {
+                        return Err(format!(
+                            "RATIFY element[{i}]: expected array(7) GovActionState, got array({m})"
+                        ))
+                    }
+                    None => {
+                        return Err(format!(
+                            "RATIFY element[{i}]: expected definite array(7), got indefinite"
+                        ))
+                    }
+                }
+            }
+            Ok(n as usize)
+        }
+        None => {
+            // Indefinite array: walk until break, counting elements.
+            let mut count = 0usize;
+            loop {
+                match dec
+                    .datatype()
+                    .map_err(|e| format!("RATIFY indef: datatype at element {count}: {e}"))?
+                {
+                    Type::Break => {
+                        dec.skip().map_err(|e| format!("RATIFY indef break: {e}"))?;
+                        break;
+                    }
+                    Type::Array => {
+                        // Each element must be array(7).
+                        match dec
+                            .array()
+                            .map_err(|e| format!("RATIFY element[{count}]: array header: {e}"))?
+                        {
+                            Some(7) => {
+                                for j in 0..7u64 {
+                                    dec.skip().map_err(|e| {
+                                        format!("RATIFY element[{count}] field[{j}]: {e}")
+                                    })?;
+                                }
+                            }
+                            Some(m) => {
+                                return Err(format!(
+                                    "RATIFY element[{count}]: expected array(7) GovActionState, got array({m})"
+                                ))
+                            }
+                            None => {
+                                return Err(format!(
+                                    "RATIFY element[{count}]: expected definite array(7), got indefinite"
+                                ))
+                            }
+                        }
+                    }
+                    other => {
+                        return Err(format!(
+                            "RATIFY indef element[{count}]: expected array or break, got {other:?}"
+                        ))
+                    }
+                }
+                count += 1;
+            }
+            Ok(count)
+        }
     }
 }

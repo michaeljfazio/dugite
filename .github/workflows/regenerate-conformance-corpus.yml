@@ -1,6 +1,11 @@
 name: Regenerate Conformance Corpus
 
 on:
+  schedule:
+    # Weekly Sunday 02:00 UTC — keeps corpus current with upstream cardano-ledger HEAD.
+    # The cabal store cache (keyed on GHC version + sources.toml SHA) avoids full
+    # cold rebuilds; only changed packages are recompiled.
+    - cron: "0 2 * * 0"
   workflow_dispatch:
     inputs:
       area:

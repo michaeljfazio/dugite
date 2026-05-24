@@ -61,30 +61,30 @@ CONTENT_DIR="${WORK_DIR}/content"
 mkdir -p "${CONTENT_DIR}"
 
 # ── Copy certificate fixture files ────────────────────────────────────────────
-# Search for JSON test fixture files across mithril test directories.
-# The mithril aggregator-client and mithril-client crates contain test data
-# used for certificate chain verification.
+# mithril-test-lab/mithril-aggregator-fake/default_data/ contains static API
+# response fixtures used by the fake aggregator for integration testing.
+# These are real mithril certificate/snapshot JSON files with all required fields.
+#
+# Certificate-bearing files (Level 2/3 validation):
+#   certificates-list.json   — array of certificate summaries (has hash field)
+#   certificates.json        — single certificate detail (has hash + beacon + created_at)
+#
+# Copy all files from default_data/ — non-certificate files are accepted by
+# the Phase 6 validator's "no identifier" graceful path.
 
 FIXTURE_COUNT=0
-find_and_copy() {
-    local src_dir="$1"
-    local pattern="$2"
-    local dest_prefix="$3"
-    if [[ ! -d "$src_dir" ]]; then
-        return
-    fi
+DEFAULT_DATA_DIR="${CLONE_DIR}/mithril-test-lab/mithril-aggregator-fake/default_data"
+
+if [[ -d "${DEFAULT_DATA_DIR}" ]]; then
     while IFS= read -r -d '' f; do
-        dest_name="${dest_prefix}$(basename "$f")"
+        dest_name="$(basename "$f")"
         cp "$f" "${CONTENT_DIR}/${dest_name}"
         FIXTURE_COUNT=$((FIXTURE_COUNT + 1))
         log "Copied: ${dest_name}"
-    done < <(find "$src_dir" -name "$pattern" -type f -print0 2>/dev/null)
-}
-
-# mithril-aggregator test fixtures
-find_and_copy "${CLONE_DIR}/mithril-aggregator/tests" "*.json"     "aggregator-"
-find_and_copy "${CLONE_DIR}/mithril-client/tests"     "*.json"     "client-"
-find_and_copy "${CLONE_DIR}/mithril-common/tests"     "*.json"     "common-"
+    done < <(find "${DEFAULT_DATA_DIR}" -maxdepth 1 -name "*.json" -type f -print0 2>/dev/null)
+else
+    log "WARN: default_data directory not found at ${DEFAULT_DATA_DIR}"
+fi
 
 # Limit to the first 20 files to keep the tarball small.
 # If more are needed, raise this limit in a future corpus refresh.

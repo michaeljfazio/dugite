@@ -52,9 +52,8 @@ use std::path::Path;
 ///
 /// ## Current state
 ///
-/// This list is empty — vectors are produced by the patched ImpSpec approach
-/// (`patch-impspec-core.py`) and all current NEWEPOCH/LEDGER tests pass or
-/// are skipped (for rules without a handler).
+/// This list is empty — all NEWEPOCH/LEDGER/POOL/CERT/CERTS/DELEG/GOVCERT/
+/// GOV/ENACT/RATIFY vectors pass their structural decode checks.
 ///
 /// Per-rule entries follow this format when a divergence is found:
 /// ```
@@ -308,6 +307,16 @@ pub fn run_all_checks(dir: &Path) {
                     "[ledger-rules] PASS {label} rule={}: UTXO tx decoded \
                      (era_id={era_id}, {tx_bytes} bytes, state shape: {})",
                     vec.rule, state.shape
+                );
+                passed += 1;
+            }
+            runner::RunOutcome::NativeSigDecoded {
+                rule_tag,
+                sig_bytes,
+            } => {
+                eprintln!(
+                    "[ledger-rules] PASS {label} rule={}: {rule_tag} signal decoded ({sig_bytes} bytes)",
+                    vec.rule
                 );
                 passed += 1;
             }

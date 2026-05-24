@@ -13,6 +13,10 @@
 //!   `dugite_serialization::decode_transaction(era_id, sig_cbor)` on the
 //!   signal file and returns `Failed` if it errors.
 //!
+//! - **POOL / CERT / CERTS / DELEG / GOVCERT / GOV / ENACT / RATIFY**:
+//!   structural shape decode of the native STS signal — verifies the CBOR
+//!   layout without full semantic execution.
+//!
 //! - **Unknown rules**: returns `Skipped` (no validation available yet).
 //!
 //! ## Phase 4 follow-on: full ledger replay
@@ -28,7 +32,12 @@
 use dugite_serialization::decode_transaction;
 
 use crate::upstream::ledger_rules_replay::{
-    bridge::{decode_epoch_no, decode_initial_epoch_no, decode_new_epoch_state},
+    bridge::{
+        decode_cert_signal, decode_certs_signal_count, decode_deleg_signal,
+        decode_enact_signal_shape, decode_epoch_no, decode_gov_signal_shape, decode_govcert_signal,
+        decode_initial_epoch_no, decode_new_epoch_state, decode_pool_signal,
+        decode_ratify_signal_count,
+    },
     vector::ImpVector,
 };
 
@@ -57,6 +66,8 @@ pub enum RunOutcome {
     },
     /// UTXO signal decoded successfully as a transaction.
     UtxoDecoded { era_id: u16, tx_bytes: usize },
+    /// Native STS signal decoded (non-Tx rule: POOL, CERT, CERTS, DELEG, GOVCERT, GOV, ENACT, RATIFY).
+    NativeSigDecoded { rule_tag: String, sig_bytes: usize },
     /// Vector was skipped because no rule handler is implemented yet.
     Skipped { reason: String },
     /// Validation failed.
@@ -96,7 +107,7 @@ fn era_id_from_rule(rule: &str) -> u16 {
 /// - NEWEPOCH → EpochNo (u64) — handled separately
 /// - LEDGER → Tx era         — ImpSpec Imp/Core hook (tx submissions)
 /// - UTXO   → Tx era         — ExecSpecRule direct
-/// - POOL    → PoolCert       — array(2), NOT a full Tx
+/// - POOL    → PoolCert       — array with uint tag, NOT a full Tx
 /// - CERT    → TxCert era     — certificate, NOT a full Tx
 /// - CERTS   → Seq TxCert     — certificate seq, NOT a full Tx
 /// - DELEG   → ConwayDelegCert — delegation cert, NOT a full Tx
@@ -107,6 +118,45 @@ fn era_id_from_rule(rule: &str) -> u16 {
 fn is_tx_signal_rule(rule: &str) -> bool {
     let upper = rule.to_uppercase();
     upper.contains("LEDGER") || upper.contains("UTXO")
+}
+
+/// Identify native STS signal rules (non-Tx, non-NEWEPOCH rules).
+///
+/// Returns a canonical rule type tag string, or `None` if the rule is not
+/// a native-signal rule handled by this function.
+///
+/// Order matters: GOVCERT must be checked before CERT (substring containment),
+/// and CERTS must be checked before CERT.
+fn is_native_sig_rule(rule: &str) -> Option<&'static str> {
+    let upper = rule.to_uppercase();
+    // CERTS before CERT (substring containment).
+    if upper.contains("CERTS") {
+        return Some("CERTS");
+    }
+    // GOVCERT before CERT.
+    if upper.contains("GOVCERT") {
+        return Some("GOVCERT");
+    }
+    if upper.contains("CERT") {
+        return Some("CERT");
+    }
+    if upper.contains("DELEG") {
+        return Some("DELEG");
+    }
+    if upper.contains("POOL") {
+        return Some("POOL");
+    }
+    if upper.contains("ENACT") {
+        return Some("ENACT");
+    }
+    if upper.contains("RATIFY") {
+        return Some("RATIFY");
+    }
+    // GOV after GOVCERT (already handled above).
+    if upper.contains("GOV") {
+        return Some("GOV");
+    }
+    None
 }
 
 /// Validate `vec` according to its rule and return the outcome.
@@ -120,15 +170,24 @@ pub fn run_vector(vec: &ImpVector) -> RunOutcome {
         run_newepoch(vec)
     } else if is_tx_signal_rule(rule) {
         run_tx_signal(vec)
+    } else if let Some(rule_type) = is_native_sig_rule(rule) {
+        match rule_type {
+            "POOL" => run_pool_signal(vec),
+            "CERT" => run_cert_signal(vec),
+            "CERTS" => run_certs_signal(vec),
+            "DELEG" => run_deleg_signal(vec),
+            "GOVCERT" => run_govcert_signal(vec),
+            "GOV" => run_gov_signal(vec),
+            "ENACT" => run_enact_signal(vec),
+            "RATIFY" => run_ratify_signal(vec),
+            _ => unreachable!(),
+        }
     } else {
-        // ExecSpecRule rules (POOL, CERT, CERTS, DELEG, GOVCERT, GOV, ENACT,
-        // RATIFY) use native STS signal types, not full Tx.  Decoding those
-        // signals requires per-rule CBOR decoders that are not yet implemented.
-        // Tracked: https://github.com/michaeljfazio/dugite/issues/640
+        // No handler implemented for this rule.
         RunOutcome::Skipped {
             reason: format!(
-                "rule '{rule}' uses a native STS signal (not Tx era) — \
-                 native signal decoder not yet implemented"
+                "rule '{rule}' has no registered handler — \
+                 add to is_native_sig_rule() or is_tx_signal_rule() to enable"
             ),
         }
     }
@@ -231,7 +290,7 @@ fn run_newepoch(vec: &ImpVector) -> RunOutcome {
     }
 }
 
-/// Validate a UTXO vector by decoding the signal as a transaction.
+/// Validate a UTXO/LEDGER vector by decoding the signal as a transaction.
 fn run_tx_signal(vec: &ImpVector) -> RunOutcome {
     let era_id = era_id_from_rule(&vec.rule);
     match decode_transaction(era_id, &vec.sig_cbor) {
@@ -245,6 +304,110 @@ fn run_tx_signal(vec: &ImpVector) -> RunOutcome {
                 vec.rule,
                 vec.sig_cbor.len()
             ),
+        },
+    }
+}
+
+/// Validate a POOL signal: `[0, pool_params_list]` or `[1, pool_id, epoch]`.
+fn run_pool_signal(vec: &ImpVector) -> RunOutcome {
+    match decode_pool_signal(&vec.sig_cbor) {
+        Ok(tag) => RunOutcome::NativeSigDecoded {
+            rule_tag: format!("POOL tag={tag}"),
+            sig_bytes: vec.sig_cbor.len(),
+        },
+        Err(e) => RunOutcome::Failed {
+            detail: format!("POOL signal decode failed (rule={}): {e}", vec.rule),
+        },
+    }
+}
+
+/// Validate a CERT signal: any TxCert variant.
+fn run_cert_signal(vec: &ImpVector) -> RunOutcome {
+    match decode_cert_signal(&vec.sig_cbor) {
+        Ok(tag) => RunOutcome::NativeSigDecoded {
+            rule_tag: format!("CERT tag={tag}"),
+            sig_bytes: vec.sig_cbor.len(),
+        },
+        Err(e) => RunOutcome::Failed {
+            detail: format!("CERT signal decode failed (rule={}): {e}", vec.rule),
+        },
+    }
+}
+
+/// Validate a CERTS signal: array of TxCert elements.
+fn run_certs_signal(vec: &ImpVector) -> RunOutcome {
+    match decode_certs_signal_count(&vec.sig_cbor) {
+        Ok(count) => RunOutcome::NativeSigDecoded {
+            rule_tag: format!("CERTS count={count}"),
+            sig_bytes: vec.sig_cbor.len(),
+        },
+        Err(e) => RunOutcome::Failed {
+            detail: format!("CERTS signal decode failed (rule={}): {e}", vec.rule),
+        },
+    }
+}
+
+/// Validate a DELEG signal: ConwayDelegCert (tags 7–12).
+fn run_deleg_signal(vec: &ImpVector) -> RunOutcome {
+    match decode_deleg_signal(&vec.sig_cbor) {
+        Ok(tag) => RunOutcome::NativeSigDecoded {
+            rule_tag: format!("DELEG tag={tag}"),
+            sig_bytes: vec.sig_cbor.len(),
+        },
+        Err(e) => RunOutcome::Failed {
+            detail: format!("DELEG signal decode failed (rule={}): {e}", vec.rule),
+        },
+    }
+}
+
+/// Validate a GOVCERT signal: ConwayGovCert (tags 14–18).
+fn run_govcert_signal(vec: &ImpVector) -> RunOutcome {
+    match decode_govcert_signal(&vec.sig_cbor) {
+        Ok(tag) => RunOutcome::NativeSigDecoded {
+            rule_tag: format!("GOVCERT tag={tag}"),
+            sig_bytes: vec.sig_cbor.len(),
+        },
+        Err(e) => RunOutcome::Failed {
+            detail: format!("GOVCERT signal decode failed (rule={}): {e}", vec.rule),
+        },
+    }
+}
+
+/// Validate a GOV signal: `[map, set_or_array, uint]`.
+fn run_gov_signal(vec: &ImpVector) -> RunOutcome {
+    match decode_gov_signal_shape(&vec.sig_cbor) {
+        Ok(()) => RunOutcome::NativeSigDecoded {
+            rule_tag: "GOV array(3)".to_string(),
+            sig_bytes: vec.sig_cbor.len(),
+        },
+        Err(e) => RunOutcome::Failed {
+            detail: format!("GOV signal decode failed (rule={}): {e}", vec.rule),
+        },
+    }
+}
+
+/// Validate an ENACT signal: `[GovActionId, GovAction]`.
+fn run_enact_signal(vec: &ImpVector) -> RunOutcome {
+    match decode_enact_signal_shape(&vec.sig_cbor) {
+        Ok(()) => RunOutcome::NativeSigDecoded {
+            rule_tag: "ENACT array(2)".to_string(),
+            sig_bytes: vec.sig_cbor.len(),
+        },
+        Err(e) => RunOutcome::Failed {
+            detail: format!("ENACT signal decode failed (rule={}): {e}", vec.rule),
+        },
+    }
+}
+
+/// Validate a RATIFY signal: array of GovActionState (each array(7)).
+fn run_ratify_signal(vec: &ImpVector) -> RunOutcome {
+    match decode_ratify_signal_count(&vec.sig_cbor) {
+        Ok(count) => RunOutcome::NativeSigDecoded {
+            rule_tag: format!("RATIFY count={count}"),
+            sig_bytes: vec.sig_cbor.len(),
+        },
+        Err(e) => RunOutcome::Failed {
+            detail: format!("RATIFY signal decode failed (rule={}): {e}", vec.rule),
         },
     }
 }
