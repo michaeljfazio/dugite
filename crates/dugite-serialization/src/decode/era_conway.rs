@@ -99,6 +99,27 @@ pub fn decode_dijkstra_block_minimal(inner_cbor: &[u8]) -> Result<Block, Seriali
     decode_conway_block_mode(inner_cbor, DecodeMode::Minimal, Era::Dijkstra)
 }
 
+/// Decode JUST the block header from the inner header CBOR (issue #654 —
+/// eager per-peer header validation in the ChainSync receive loop).
+///
+/// Unlike [`decode_conway_block_minimal`], the input here is the bytes of
+/// the header element ONLY (everything inside `tag24(bytes(...))` of the
+/// HFC wrap for a `MsgRollForward` payload), not a full block CBOR. The
+/// returned `BlockHeader.header_hash` is `blake2b_256(inner_cbor)` —
+/// matching the canonical Cardano block hash.
+///
+/// Covers both Conway and Dijkstra eras; the only difference at the
+/// header layer is Dijkstra's optional 11th header_body element
+/// (`prevNonce`), which `decode_conway_header_inner` already handles.
+pub fn decode_conway_block_header(inner_cbor: &[u8]) -> Result<BlockHeader, SerializationError> {
+    let mut r = Reader::new(inner_cbor);
+    let raw = KeepRaw::parse_with(&mut r, |r| decode_conway_header_inner(r, Era::Conway))?;
+    let header_hash = blake2b_256(raw.raw);
+    let mut h = raw.value;
+    h.header_hash = header_hash;
+    Ok(h)
+}
+
 /// Decode a CBOR-encoded `protocol_param_update` map into a
 /// [`ProtocolParamUpdate`].
 ///
