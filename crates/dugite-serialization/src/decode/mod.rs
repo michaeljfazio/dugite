@@ -113,6 +113,88 @@ pub fn decode_block_minimal_with_byron_epoch_length(
     Ok(blk)
 }
 
+/// Decode JUST the block header from an HFC-wrapped N2N ChainSync header
+/// CBOR (issue #654 — eager per-peer header validation in the ChainSync
+/// receive loop).
+///
+/// Input format is the `MsgRollForward` payload's header bytes:
+/// `[era_tag(uint), tag(24)(bytes(inner_header))]` for Shelley+ eras.
+///
+/// Returns the decoded [`BlockHeader`] with `header_hash` set to
+/// `blake2b_256(inner_header_bytes)` — the canonical Cardano block hash
+/// for Shelley+ eras. **Byron headers are intentionally NOT supported**
+/// (return `Err`): the eager-validation path that owns this decoder
+/// (#652 C8) is PBFT-unaware and skips Byron headers via a separate
+/// predicate before dispatching here.
+///
+/// Cost: one CBOR walk + one Blake2b-256 over the inner header bytes.
+/// Substantially cheaper than `decode_block_minimal` which walks the
+/// entire block body + every transaction body.
+pub fn decode_wrapped_block_header(
+    wrapped_cbor: &[u8],
+) -> Result<dugite_primitives::block::BlockHeader, SerializationError> {
+    use minicbor::Decoder;
+
+    // Outer wrap: [era_tag(uint), tag24(bytes(inner_header))]
+    let mut dec = Decoder::new(wrapped_cbor);
+    let arr_len = dec
+        .array()
+        .map_err(|e| SerializationError::CborDecode(format!("wrapped header outer: {e}")))?;
+    if arr_len != Some(2) {
+        return Err(SerializationError::CborDecode(format!(
+            "wrapped header: expected outer array(2), got {arr_len:?}"
+        )));
+    }
+    // First element must be a uint — Byron wraps it as a nested array
+    // which we reject here so callers can fall back to a Byron-specific
+    // path.
+    let dt = dec
+        .datatype()
+        .map_err(|e| SerializationError::CborDecode(format!("wrapped header tag type: {e}")))?;
+    if !matches!(
+        dt,
+        minicbor::data::Type::U8
+            | minicbor::data::Type::U16
+            | minicbor::data::Type::U32
+            | minicbor::data::Type::U64
+    ) {
+        return Err(SerializationError::CborDecode(format!(
+            "wrapped header: era tag is not a uint (got {dt:?}) — \
+             Byron headers are not supported by this decoder"
+        )));
+    }
+    let era_tag = dec
+        .u64()
+        .map_err(|e| SerializationError::CborDecode(format!("wrapped header era_tag: {e}")))?;
+    let tag = dec
+        .tag()
+        .map_err(|e| SerializationError::CborDecode(format!("wrapped header tag: {e}")))?;
+    if tag != minicbor::data::Tag::new(24) {
+        return Err(SerializationError::CborDecode(format!(
+            "wrapped header: expected tag(24), got {tag:?}"
+        )));
+    }
+    let inner = dec
+        .bytes()
+        .map_err(|e| SerializationError::CborDecode(format!("wrapped header inner bytes: {e}")))?;
+
+    // Dispatch by era tag. Mapping matches `decode_block`:
+    //   2 Shelley, 3 Allegra, 4 Mary, 5 Alonzo, 6 Babbage,
+    //   7 Conway, 8 Dijkstra.
+    match era_tag {
+        2 => era_shelley::decode_shelley_block_header(inner),
+        3..=5 => era_alonzo::decode_alonzo_block_header(inner),
+        6 => era_babbage::decode_babbage_block_header(inner),
+        7 | 8 => era_conway::decode_conway_block_header(inner),
+        0 | 1 => Err(SerializationError::CborDecode(format!(
+            "wrapped header: Byron era_tag {era_tag} unsupported by decode_wrapped_block_header"
+        ))),
+        n => Err(SerializationError::CborDecode(format!(
+            "wrapped header: unknown era_tag {n}"
+        ))),
+    }
+}
+
 /// Decode a transaction CBOR for a specific era.
 ///
 /// `era_id` follows the Cardano HFC convention:
@@ -251,6 +333,183 @@ mod tests {
         let raw = hex::decode(cbor.trim()).unwrap();
         let blk = decode_block_minimal(&raw).expect("minimal-mode decode");
         assert!(blk.raw_cbor.is_some(), "raw_cbor must be preserved");
+    }
+
+    // ── Issue #654: decode_wrapped_block_header (eager validation) ────────
+
+    /// Extract the inner-header bytes from a full block test vector by
+    /// walking the outer envelope + the first array element of the
+    /// inner block (`[header, tx_bodies, ...]`).
+    fn extract_inner_header_bytes_from_block_vector(full_block_cbor: &[u8]) -> Vec<u8> {
+        // Outer wrap is [era_tag(uint), inner_block_array]. We want the bytes
+        // of the FIRST element of the inner_block_array — the header.
+        // For Shelley+ blocks the inner_block is just an array, not a
+        // tag24-wrapped bytes — different shape from a `MsgRollForward`
+        // header payload but we only need the inner header bytes here.
+        use minicbor::Decoder;
+        let mut d = Decoder::new(full_block_cbor);
+        assert_eq!(d.array().unwrap(), Some(2), "outer wrap must be array(2)");
+        let _era_tag = d.u64().unwrap();
+        // Now positioned at the inner block array. Record start, walk into it.
+        let inner_block_start = d.position();
+        let inner_arr = d.array().unwrap();
+        assert!(inner_arr.is_some(), "inner block must be array");
+        // First element is the header. Record its start, then skip it to
+        // discover its end.
+        let header_start = d.position();
+        d.skip().unwrap();
+        let header_end = d.position();
+        let _ = inner_block_start; // (only used for documentation)
+        full_block_cbor[header_start..header_end].to_vec()
+    }
+
+    /// Wrap inner-header bytes into the N2N `MsgRollForward` payload shape
+    /// `[era_tag(uint), tag(24)(bytes(inner))]` — the form the chainsync
+    /// receive loop sees on the wire.
+    fn wrap_inner_header(era_tag: u64, inner: &[u8]) -> Vec<u8> {
+        use minicbor::Encoder;
+        let mut out = Vec::new();
+        let mut enc = Encoder::new(&mut out);
+        enc.array(2).unwrap();
+        enc.u64(era_tag).unwrap();
+        enc.tag(minicbor::data::Tag::new(24)).unwrap();
+        enc.bytes(inner).unwrap();
+        out
+    }
+
+    /// Round-trip a Conway block's header through
+    /// `decode_wrapped_block_header` and assert the slot + header_hash
+    /// match what `decode_block` produces for the full block.
+    #[test]
+    fn decode_wrapped_block_header_roundtrips_conway_vector() {
+        let cbor = std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/test_vectors/conway.hex"
+        ))
+        .unwrap();
+        let full_block = hex::decode(cbor.trim()).unwrap();
+        let block = decode_block_minimal(&full_block).expect("full block decode");
+
+        let inner = extract_inner_header_bytes_from_block_vector(&full_block);
+        let wrapped = wrap_inner_header(7, &inner);
+        let header = decode_wrapped_block_header(&wrapped).expect("wrapped header decode");
+
+        assert_eq!(
+            header.slot, block.header.slot,
+            "slot must match the full-block decode"
+        );
+        assert_eq!(
+            header.header_hash, block.header.header_hash,
+            "header_hash must match the full-block decode"
+        );
+        assert_eq!(
+            header.block_number, block.header.block_number,
+            "block_number must match"
+        );
+    }
+
+    /// Round-trip a Babbage block's header.
+    #[test]
+    fn decode_wrapped_block_header_roundtrips_babbage_vector() {
+        let cbor = std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/test_vectors/babbage.hex"
+        ))
+        .unwrap();
+        let full_block = hex::decode(cbor.trim()).unwrap();
+        let block = decode_block_minimal(&full_block).expect("full block decode");
+
+        let inner = extract_inner_header_bytes_from_block_vector(&full_block);
+        let wrapped = wrap_inner_header(6, &inner);
+        let header = decode_wrapped_block_header(&wrapped).expect("wrapped header decode");
+
+        assert_eq!(header.slot, block.header.slot);
+        assert_eq!(header.header_hash, block.header.header_hash);
+    }
+
+    /// Round-trip a Shelley block's header.
+    #[test]
+    fn decode_wrapped_block_header_roundtrips_shelley_vector() {
+        let cbor = std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/test_vectors/shelley.hex"
+        ))
+        .unwrap();
+        let full_block = hex::decode(cbor.trim()).unwrap();
+        let block = decode_block_minimal(&full_block).expect("full block decode");
+
+        let inner = extract_inner_header_bytes_from_block_vector(&full_block);
+        let wrapped = wrap_inner_header(2, &inner);
+        let header = decode_wrapped_block_header(&wrapped).expect("wrapped header decode");
+
+        assert_eq!(header.slot, block.header.slot);
+        assert_eq!(header.header_hash, block.header.header_hash);
+    }
+
+    /// Round-trip an Alonzo (Mary-shaped) block's header.
+    #[test]
+    fn decode_wrapped_block_header_roundtrips_mary_vector() {
+        let cbor = std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/test_vectors/mary.hex"
+        ))
+        .unwrap();
+        let full_block = hex::decode(cbor.trim()).unwrap();
+        let block = decode_block_minimal(&full_block).expect("full block decode");
+
+        let inner = extract_inner_header_bytes_from_block_vector(&full_block);
+        // Mary's HFC era tag is 4 → routes through decode_alonzo_block_header.
+        let wrapped = wrap_inner_header(4, &inner);
+        let header = decode_wrapped_block_header(&wrapped).expect("wrapped header decode");
+
+        assert_eq!(header.slot, block.header.slot);
+        assert_eq!(header.header_hash, block.header.header_hash);
+    }
+
+    /// Byron era_tags (0, 1) are rejected so the caller can route them to a
+    /// PBFT-aware path instead of attempting Praos validation.
+    #[test]
+    fn decode_wrapped_block_header_rejects_byron_era_tags() {
+        for byron_tag in [0u64, 1] {
+            let wrapped = wrap_inner_header(byron_tag, b"dummy");
+            let err = decode_wrapped_block_header(&wrapped).unwrap_err();
+            let SerializationError::CborDecode(msg) = err else {
+                panic!("expected CborDecode for byron tag {byron_tag}");
+            };
+            assert!(msg.contains("Byron"));
+        }
+    }
+
+    /// Unknown era_tags are rejected with a structured error rather than
+    /// being silently routed to one of the known decoders.
+    #[test]
+    fn decode_wrapped_block_header_rejects_unknown_era_tag() {
+        let wrapped = wrap_inner_header(99, b"dummy");
+        let err = decode_wrapped_block_header(&wrapped).unwrap_err();
+        let SerializationError::CborDecode(msg) = err else {
+            panic!("expected CborDecode for unknown era");
+        };
+        assert!(msg.contains("unknown era_tag"));
+    }
+
+    /// Malformed outer wrap (wrong tag) is rejected.
+    #[test]
+    fn decode_wrapped_block_header_rejects_wrong_tag() {
+        use minicbor::Encoder;
+        let mut out = Vec::new();
+        let mut enc = Encoder::new(&mut out);
+        enc.array(2).unwrap();
+        enc.u64(7).unwrap();
+        // tag(99) instead of tag(24)
+        enc.tag(minicbor::data::Tag::new(99)).unwrap();
+        enc.bytes(b"inner").unwrap();
+        assert!(decode_wrapped_block_header(&out).is_err());
+    }
+
+    /// Empty input is rejected, not panicking.
+    #[test]
+    fn decode_wrapped_block_header_rejects_empty_input() {
+        assert!(decode_wrapped_block_header(&[]).is_err());
     }
 
     #[test]

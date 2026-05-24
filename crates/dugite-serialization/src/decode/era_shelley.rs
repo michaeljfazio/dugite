@@ -130,6 +130,18 @@ pub fn decode_shelley_block_minimal(inner_cbor: &[u8]) -> Result<Block, Serializ
     decode_shelley_block_mode(inner_cbor, DecodeMode::Minimal)
 }
 
+/// Decode JUST the block header from the inner header CBOR (issue #654 —
+/// eager per-peer header validation in the ChainSync receive loop). See
+/// `era_conway::decode_conway_block_header` for the contract.
+pub fn decode_shelley_block_header(inner_cbor: &[u8]) -> Result<BlockHeader, SerializationError> {
+    let mut r = Reader::new(inner_cbor);
+    let raw = KeepRaw::parse_with(&mut r, decode_shelley_header_inner)?;
+    let header_hash = blake2b_256(raw.raw);
+    let mut h = raw.value;
+    h.header_hash = header_hash;
+    Ok(h)
+}
+
 // ============================================================================
 // Block decoder
 // ============================================================================
