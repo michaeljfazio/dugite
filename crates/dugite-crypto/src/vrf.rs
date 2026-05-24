@@ -2331,4 +2331,177 @@ mod tests {
     fn test_vrf_wrong_proof_size() {
         assert!(verify_vrf_proof(&[0u8; 32], &[0u8; 40], &[]).is_err());
     }
+
+    // ---- PraosBatchCompatVRF (v13 / ietfdraft13) ----
+    //
+    // Vectors below come from `IntersectMBO/cardano-base` test corpus
+    // (`vrf_ver13_standard_10` / `vrf_ver13_standard_11`). They are byte-exact
+    // copies of upstream so the v13 hot path stays exercised without depending
+    // on the optional `dugite-conformance` upstream-fixture pipeline.
+    const V13_STD10_SK: &str = "9d61b19deffd5a60ba844af492ec2cc44449c5697b326919703bac031cae7f60";
+    const V13_STD10_PK: &str = "d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a";
+    const V13_STD10_PI: &str = "7d9c633ffeee27349264cf5c667579fc583b4bda63ab71d001f89c10003ab46f\
+         762f5c178b68f0cddcc1157918edf45ec334ac8e8286601a3256c3bbf858edd9\
+         4652eba1c4612e6fce762977a59420b451e12964adbe4fbecd58a7aeff5860af\
+         cafa73589b023d14311c331a9ad15ff2fb37831e00f0acaa6d73bc9997b06501";
+    const V13_STD10_BETA: &str = "9d574bf9b8302ec0fc1e21c3ec5368269527b87b462ce36dab2d14ccf80c53cc\
+         cf6758f058c5b1c856b116388152bbe509ee3b9ecfe63d93c3b4346c1fbc6c54";
+
+    const V13_STD11_PK: &str = "3d4017c3e843895a92b70aa74d1b7ebc9c982ccf2ec4968cc0cd55f12af4660c";
+    const V13_STD11_ALPHA: &str = "72";
+    const V13_STD11_PI: &str = "47b327393ff2dd81336f8a2ef10339112401253b3c714eeda879f12c509072ef\
+         8ec26e77b8cb3114dd2265fe1564a4efb40d109aa3312536d93dfe3d8d80a061\
+         fe799eb5770b4e3a5a27d22518bb631db183c8316bb552155f442c62a47d1c8b\
+         d60e93908f93df1623ad78a86a028d6bc064dbfc75a6a57379ef855dc6733801";
+    const V13_STD11_BETA: &str = "38561d6b77b71d30eb97a062168ae12b667ce5c28caccdf76bc88e093e463598\
+         7cd96814ce55b4689b3dd2947f80e59aac7b7675f8083865b46c89b2ce9cc735";
+
+    fn h(s: &str) -> Vec<u8> {
+        hex::decode(s).expect("valid hex")
+    }
+
+    #[test]
+    fn test_vrf_v13_verify_empty_alpha() {
+        let pk = h(V13_STD10_PK);
+        let pi = h(V13_STD10_PI);
+        let beta = h(V13_STD10_BETA);
+        let out = verify_vrf_proof_v13(&pk, &pi, &[]).expect("v13 verify");
+        assert_eq!(&out[..], &beta[..]);
+    }
+
+    #[test]
+    fn test_vrf_v13_verify_nonempty_alpha() {
+        let pk = h(V13_STD11_PK);
+        let pi = h(V13_STD11_PI);
+        let alpha = h(V13_STD11_ALPHA);
+        let beta = h(V13_STD11_BETA);
+        let out = verify_vrf_proof_v13(&pk, &pi, &alpha).expect("v13 verify");
+        assert_eq!(&out[..], &beta[..]);
+    }
+
+    #[test]
+    fn test_vrf_v13_generate_matches_vector() {
+        let sk_bytes = h(V13_STD10_SK);
+        let mut sk = [0u8; 32];
+        sk.copy_from_slice(&sk_bytes);
+        let (pi, beta) = generate_vrf_proof_v13(&sk, &[]).expect("v13 sign");
+        assert_eq!(&pi[..], h(V13_STD10_PI).as_slice());
+        assert_eq!(&beta[..], h(V13_STD10_BETA).as_slice());
+    }
+
+    #[test]
+    fn test_vrf_v13_generate_then_verify_roundtrip() {
+        let kp = generate_vrf_keypair();
+        let seed = b"slot-2025-05-24-hello";
+        let (pi, beta) = generate_vrf_proof_v13(&kp.secret_key, seed).unwrap();
+        assert_eq!(pi.len(), 128);
+        assert_eq!(beta.len(), 64);
+        let verified = verify_vrf_proof_v13(&kp.public_key, &pi, seed).unwrap();
+        assert_eq!(verified, beta);
+    }
+
+    #[test]
+    fn test_vrf_v13_wrong_key_size() {
+        assert!(verify_vrf_proof_v13(&[0u8; 16], &[0u8; 128], &[]).is_err());
+    }
+
+    #[test]
+    fn test_vrf_v13_wrong_proof_size() {
+        assert!(verify_vrf_proof_v13(&[0u8; 32], &[0u8; 80], &[]).is_err());
+    }
+
+    #[test]
+    fn test_vrf_v13_tampered_proof_fails() {
+        let pk = h(V13_STD10_PK);
+        let mut pi = h(V13_STD10_PI);
+        // Flip a single bit inside the response scalar (last 32 bytes).
+        let last = pi.len() - 1;
+        pi[last] ^= 0x01;
+        assert!(verify_vrf_proof_v13(&pk, &pi, &[]).is_err());
+    }
+
+    #[test]
+    fn test_vrf_v13_wrong_alpha_fails() {
+        let pk = h(V13_STD10_PK);
+        let pi = h(V13_STD10_PI);
+        // STD10 was signed with empty alpha; verifying against a non-empty
+        // input must fail (hash_to_curve diverges).
+        assert!(verify_vrf_proof_v13(&pk, &pi, b"not-empty").is_err());
+    }
+
+    #[test]
+    fn test_vrf_v13_wrong_pk_fails() {
+        // Swap pk → STD11's; pi/beta still belong to STD10.
+        let pk = h(V13_STD11_PK);
+        let pi = h(V13_STD10_PI);
+        assert!(verify_vrf_proof_v13(&pk, &pi, &[]).is_err());
+    }
+
+    #[test]
+    fn test_vrf_v13_proof_length_off_by_one() {
+        let pk = h(V13_STD10_PK);
+        let mut pi = h(V13_STD10_PI);
+        pi.pop();
+        assert!(verify_vrf_proof_v13(&pk, &pi, &[]).is_err());
+    }
+
+    #[test]
+    fn test_vrf_v13_seed_sensitivity() {
+        // Different seeds with the same sk must produce different (pi, beta).
+        let kp = generate_vrf_keypair_from_secret(&[7u8; 32]);
+        let (pi_a, beta_a) = generate_vrf_proof_v13(&kp.secret_key, b"slot-1").unwrap();
+        let (pi_b, beta_b) = generate_vrf_proof_v13(&kp.secret_key, b"slot-2").unwrap();
+        assert_ne!(pi_a, pi_b);
+        assert_ne!(beta_a, beta_b);
+    }
+
+    #[test]
+    fn test_vrf_v03_v13_share_key_derivation() {
+        // v03 and v13 use the same sk → pk derivation. The proofs differ
+        // (different ciphersuite + Elligator2 vs RFC8032 hash-to-curve) but
+        // the public key in both standard vectors with the same sk matches.
+        let sk_bytes = h(V13_STD10_SK);
+        let mut sk = [0u8; 32];
+        sk.copy_from_slice(&sk_bytes);
+        let kp = generate_vrf_keypair_from_secret(&sk);
+        assert_eq!(&kp.public_key[..], h(V13_STD10_PK).as_slice());
+    }
+
+    // ---- Leader-check edge cases (active_slot_log fast path) ----
+
+    #[test]
+    fn test_check_leader_value_rational_zero_stake() {
+        // Zero relative stake → never elected even with full f.
+        assert!(!check_leader_value_full_rational(&[0xffu8; 32], 0, 1, 1, 2,));
+    }
+
+    #[test]
+    fn test_check_leader_value_rational_full_stake_high_f() {
+        // 100% stake with f=1/2: even a fairly large VRF output should win.
+        // (cn behaviour: `1 - (1 - f)^σ` = 1/2 here, so leader if vrf < 1/2)
+        let mut vrf = [0u8; 32];
+        vrf[0] = 0x10; // small value, well below 1/2
+        assert!(check_leader_value_full_rational(&vrf, 1, 1, 1, 2));
+    }
+
+    #[test]
+    fn test_check_leader_value_cached_matches_uncached() {
+        let log = compute_active_slot_log(1, 20).expect("f=1/20 in (0,1]");
+        let vrf = [0u8; 32];
+        let elected_cached = check_leader_value_full_rational_cached(&vrf, 1, 1, &log);
+        let elected_plain = check_leader_value_full_rational(&vrf, 1, 1, 1, 20);
+        assert_eq!(elected_cached, elected_plain);
+    }
+
+    #[test]
+    fn test_compute_active_slot_log_boundary_returns_none() {
+        // Per the doc-comment on `compute_active_slot_log`, both edge values
+        // collapse to None: f_num=0 (never elected) and f_num>=f_den
+        // (always elected). The caller handles each as a hot-path constant.
+        assert!(compute_active_slot_log(0, 1).is_none()); // f=0
+        assert!(compute_active_slot_log(1, 1).is_none()); // f=1
+        assert!(compute_active_slot_log(2, 1).is_none()); // f>1
+                                                          // A normal Praos value (preview/preprod/mainnet: f = 1/20) returns Some.
+        assert!(compute_active_slot_log(1, 20).is_some());
+    }
 }
