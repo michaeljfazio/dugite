@@ -749,13 +749,21 @@ mod tests {
     /// Bug 2: `scalars.deposits_stake` must include BOTH stake-key
     /// deposits AND pool-registration deposits, matching Haskell's
     /// `utxoState.deposited`.
+    ///
+    /// Critically, pool deposits are tracked PER-POOL at registration time
+    /// (via `certs.pool_deposits`), NOT as `pool_params.len() × curPParams.pool_deposit`.
+    /// This test verifies that the dump uses the historical deposit map even when
+    /// `pool_deposit` has since changed (e.g. via PPUP).
     #[test]
     fn capture_combines_stake_key_and_pool_deposits() {
         let mut state = make_state();
-        // Preview epoch-1 scenario: 3 stake keys × 2 ADA + 3 pools × 500 ADA.
+        // 3 stake keys × 2 ADA.
         state.certs.total_stake_key_deposits = 3 * 2_000_000;
-        state.epochs.protocol_params.pool_deposit = Lovelace(500_000_000);
-        // Add two extra pools so the count is 3 total.
+        // Current pool_deposit param = 600 ADA (changed via PPUP from the original 500 ADA).
+        // The dump MUST use historical per-pool values, not this current param.
+        state.epochs.protocol_params.pool_deposit = Lovelace(600_000_000);
+        // Pool 0xaa (from make_state) registered at 400 ADA (older pool_deposit).
+        // Pools 0x10 and 0x11 registered later at 500 ADA.
         let mut pmap: HashMap<Hash28, PoolRegistration> = (*state.certs.pool_params).clone();
         for b in [0x10u8, 0x11] {
             let pid = h28(b);
@@ -777,9 +785,16 @@ mod tests {
             );
         }
         state.certs.pool_params = Arc::new(pmap);
+        // Populate pool_deposits with PER-POOL historical deposit amounts.
+        state.certs.pool_deposits.insert(h28(0xaa), 400_000_000);
+        state.certs.pool_deposits.insert(h28(0x10), 500_000_000);
+        state.certs.pool_deposits.insert(h28(0x11), 500_000_000);
         let dump = capture(&state, 1, 0, None);
-        // Expected: 3 × 500_000_000 + 3 × 2_000_000 = 1_506_000_000
-        assert_eq!(dump.scalars.deposits_stake, 1_506_000_000);
+        // Expected: (400 + 500 + 500) ADA pool deposits + 3 × 2 ADA stake-key deposits
+        // = 1_400_000_000 + 6_000_000 = 1_406_000_000.
+        // Old formula (pool_params.len() × pool_deposit) would give 3 × 600_000_000 + 6_000_000
+        // = 1_806_000_000 — wrong because it ignores historical deposit amounts.
+        assert_eq!(dump.scalars.deposits_stake, 1_406_000_000);
     }
 
     /// Bug 3: when the production caller passes `None` for the rupd
