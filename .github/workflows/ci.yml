@@ -144,8 +144,39 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-coverage-
 
+      - name: Cache upstream conformance fixtures
+        uses: actions/cache@v5
+        with:
+          path: tests/conformance/upstream/fixtures
+          key: upstream-fixtures-${{ hashFiles('tests/conformance/upstream/manifest.toml') }}
+
+      - name: Download upstream conformance fixtures
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: cargo xtask download-upstream-fixtures
+
+      # Run the conformance suite alongside the rest of the workspace so the
+      # lines it covers in `dugite-crypto` (v13 VRF), `dugite-uplc` (builtins,
+      # populate paths) and `dugite-serialization` (era CBOR decoders) count
+      # toward the reported numbers — they're real tests, just gated on
+      # upstream fixtures. `--exclude-from-report` keeps the conformance crate
+      # itself out of the percentage (it is pure test scaffolding).
+      #
+      # Pure binary entrypoints and the ratatui TUI render layers are excluded
+      # via `--ignore-filename-regex` because they aren't reachable from
+      # `cargo test` and dragging them through the denominator distorts the
+      # picture without representing real risk.
       - name: Generate code coverage
-        run: cargo llvm-cov --all-features --workspace --exclude dugite-integration-tests --exclude dugite-conformance --lcov --output-path lcov.info
+        env:
+          DUGITE_REQUIRE_UPSTREAM: "1"
+        run: |
+          cargo llvm-cov \
+            --all-features \
+            --workspace \
+            --exclude dugite-integration-tests \
+            --exclude-from-report dugite-conformance \
+            --ignore-filename-regex '(src/main\.rs|/ui\.rs|/bin/capture_)' \
+            --lcov --output-path lcov.info
 
       - name: Upload coverage to Codecov
         uses: codecov/codecov-action@v6
