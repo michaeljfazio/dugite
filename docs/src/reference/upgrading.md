@@ -42,11 +42,7 @@ sudo cp target/release/dugite-node target/release/dugite-cli \
          /usr/local/bin/
 ```
 
-**Container:**
-
-```bash
-docker pull ghcr.io/michaeljfazio/dugite:latest
-```
+**Container:** *(coming soon — [#507](https://github.com/michaeljfazio/dugite/issues/507))*
 
 ### 3. Clear Ledger Snapshots (if the snapshot format changed)
 

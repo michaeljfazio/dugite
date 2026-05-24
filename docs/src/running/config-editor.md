@@ -157,7 +157,7 @@ dugite-config init --out-file "$CONFIG" \
 dugite-config set "$CONFIG" EnableP2P true
 dugite-config set "$CONFIG" DiffusionMode InitiatorAndResponder
 dugite-config set "$CONFIG" TargetNumberOfActivePeers 15
-dugite-config set "$CONFIG" TargetNumberOfEstablishedPeers 40
+dugite-config set "$CONFIG" TargetNumberOfEstablishedPeers 30
 dugite-config set "$CONFIG" TargetNumberOfKnownPeers 85
 dugite-config validate "$CONFIG"
 ```

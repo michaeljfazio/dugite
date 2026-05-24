@@ -1,5 +1,7 @@
 # Kubernetes Deployment
 
+> **Note:** The Dugite container image is not yet published to a registry ([#507](https://github.com/michaeljfazio/dugite/issues/507)). The Helm chart and instructions below describe the target deployment model; they will be fully operational once the image is available.
+
 Dugite includes a Helm chart for deploying to Kubernetes as either a **relay node** or a **block producer**.
 
 ## Prerequisites
