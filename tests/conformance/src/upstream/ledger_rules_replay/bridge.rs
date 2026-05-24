@@ -65,7 +65,7 @@
 //! | Rule    | Observed tags       | Interpretation |
 //! |---------|---------------------|----------------|
 //! | POOL    | 0 (PoolReg), 1 (PoolRetire) | PoolCert |
-//! | DELEG   | 7–12                | ConwayDelegCert |
+//! | DELEG   | 2, 7–13             | Shelley StakeDelegation + ConwayDelegCert (7–12) + ConwayRegDelegCert DelegStakeVote (13) |
 //! | GOVCERT | 14–18               | ConwayGovCert |
 //! | CERT    | any of the above + more | TxCert (all variants) |
 //!
@@ -897,19 +897,30 @@ pub fn decode_pool_signal(cbor: &[u8]) -> Result<u64, String> {
     }
 }
 
-/// Validate a DELEG signal: a ConwayDelegCert with tags 7–12.
+/// Validate a DELEG signal: a delegation certificate (pre-Conway or Conway).
 ///
-/// Observed DELEG tags in the real corpus: 7, 8, 9, 11, 12.
+/// Valid DELEG tags:
+///   2          — Shelley `StakeDelegation` (backwards-compat in Conway)
+///   7–13       — Conway delegation certs:
+///                  7  ConwayRegCert
+///                  8  ConwayUnRegCert
+///                  9  ConwayDelegCert DelegVote
+///                  10 ConwayDelegCert DelegStakeVote
+///                  11 ConwayRegDelegCert DelegStake
+///                  12 ConwayRegDelegCert DelegVote
+///                  13 ConwayRegDelegCert DelegStakeVote (reg + pool + DRep)
+///
+/// Observed in corpus: 2, 7, 8, 9, 11, 12, 13.
 pub fn decode_deleg_signal(cbor: &[u8]) -> Result<u64, String> {
     let tag = decode_tx_cert_tag(cbor)?;
-    // All observed DELEG tags are in the range 7–12.  We allow any value in
-    // that range — specific variants not yet observed in the corpus (e.g. 10)
-    // may appear in future fixture generations.
-    if (7..=12).contains(&tag) {
+    // Tag 2: Shelley StakeDelegation — backwards-compat path exercised by ImpSpec.
+    // Tags 7–13: Conway delegation cert variants (13 = RegDelegCert DelegStakeVote,
+    // added to Conway after the original 7–12 range was documented).
+    if tag == 2 || (7..=13).contains(&tag) {
         Ok(tag)
     } else {
         Err(format!(
-            "DELEG signal: unexpected tag {tag} (expected 7–12 for ConwayDelegCert)"
+            "DELEG signal: unexpected tag {tag} (expected 2 or 7–13 for delegation cert)"
         ))
     }
 }

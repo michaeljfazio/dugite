@@ -347,7 +347,7 @@ fn run_certs_signal(vec: &ImpVector) -> RunOutcome {
     }
 }
 
-/// Validate a DELEG signal: ConwayDelegCert (tags 7–12).
+/// Validate a DELEG signal: StakeDelegation (tag 2) or ConwayDelegCert (tags 7–13).
 fn run_deleg_signal(vec: &ImpVector) -> RunOutcome {
     match decode_deleg_signal(&vec.sig_cbor) {
         Ok(tag) => RunOutcome::NativeSigDecoded {
