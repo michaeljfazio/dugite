@@ -8,7 +8,7 @@
 //! when fixtures are not present. CI sets DUGITE_REQUIRE_UPSTREAM=1, making
 //! missing fixtures a hard failure.
 
-use dugite_conformance::upstream::{fixtures, ledger_rules_replay, status};
+use dugite_conformance::upstream::{cardano_base, fixtures, ledger_rules_replay, mithril, status};
 
 // ── Status banner (always runs) ───────────────────────────────────────────────
 
@@ -45,6 +45,26 @@ fn cardano_node_genesis_decodes() {
         return;
     };
     dugite_conformance::upstream::cardano_node::run_all_checks(&dir);
+}
+
+// ── cardano-base VRF/KES crypto (Phase 5) ────────────────────────────────────
+
+#[test]
+fn cardano_base_vrf_checks() {
+    let Some(dir) = fixtures::check_area("cardano-base") else {
+        return;
+    };
+    cardano_base::run_all_checks(&dir);
+}
+
+// ── Mithril certificate fixtures (Phase 6) ───────────────────────────────────
+
+#[test]
+fn mithril_certificate_checks() {
+    let Some(dir) = fixtures::check_area("mithril") else {
+        return;
+    };
+    mithril::run_all_checks(&dir);
 }
 
 // ── ledger-rules ImpSpec replay (Phase 4) ────────────────────────────────────
