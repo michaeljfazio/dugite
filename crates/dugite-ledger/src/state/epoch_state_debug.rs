@@ -511,13 +511,14 @@ pub fn capture(
             // to `snapshots.ss_fee` — that's the previous epoch's fees,
             // and gave a one-epoch off-by-one against Haskell.)
             fees: state.utxo.epoch_fees.0,
-            // Bug 2 fix: Haskell reports `utxoState.deposited` which is
-            // the COMBINED stake-key + pool-registration deposit total.
-            // Stake-key portion is `total_stake_key_deposits` (3 keys × 2
-            // ADA mainnet); pool portion is `registered pools × pool_deposit`.
+            // Haskell reports `utxoState.deposited` which is the COMBINED
+            // stake-key + pool deposit total. Pool deposits are tracked per-pool
+            // (with the deposit value at registration time) in `certs.pool_deposits`.
+            // Using the per-pool map rather than `pool_params.len() × pool_deposit`
+            // ensures correctness when pool_deposit changed via PPUP after some pools
+            // were registered.
             deposits_stake: state.certs.total_stake_key_deposits.saturating_add(
-                (state.certs.pool_params.len() as u64)
-                    .saturating_mul(state.epochs.protocol_params.pool_deposit.0),
+                state.certs.pool_deposits.values().sum::<u64>(),
             ),
             deposits_drep: drep_deposit_total,
             deposits_proposal: proposal_deposit_total,
