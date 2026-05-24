@@ -1400,4 +1400,239 @@ mod tests {
     fn num_bytes_as_num_words_nine() {
         assert_eq!(num_bytes_as_num_words(9), 2);
     }
+
+    // ─── CostingFun::eval — every variant ────────────────────────────────
+    //
+    // The cost-model dispatcher is a wide match. The upstream UPLC corpus
+    // drives most arms via `builtinCostModelE.json`, but several variants are
+    // only used by a handful of builtins and easily go uncovered when those
+    // builtins aren't in the corpus's hot set. These tests pin every arm of
+    // `CostingFun::eval` with a known input/output so the cost-model dispatch
+    // stays exercised even if a builtin is later moved to a different shape.
+
+    #[test]
+    fn costingfun_constant() {
+        let f = CostingFun::Constant(42);
+        assert_eq!(f.eval(0, 0, 0), 42);
+        assert_eq!(f.eval(100, 100, 100), 42); // ignores args
+    }
+
+    #[test]
+    fn costingfun_linear_axes() {
+        let f = lin1(5, 3);
+        // Each axis uses the corresponding arg.
+        assert_eq!(CostingFun::LinearInX(f).eval(7, 99, 99), 5 + 3 * 7);
+        assert_eq!(CostingFun::LinearInY(f).eval(99, 7, 99), 5 + 3 * 7);
+        assert_eq!(CostingFun::LinearInZ(f).eval(99, 99, 7), 5 + 3 * 7);
+    }
+
+    #[test]
+    fn costingfun_added_and_multiplied_and_min_max() {
+        let f = lin1(10, 2);
+        assert_eq!(CostingFun::AddedSizes(f).eval(3, 4, 0), 10 + 2 * 7);
+        assert_eq!(CostingFun::MultipliedSizes(f).eval(3, 4, 0), 10 + 2 * 12);
+        assert_eq!(CostingFun::MinSize(f).eval(3, 4, 0), 10 + 2 * 3);
+        assert_eq!(CostingFun::MaxSize(f).eval(3, 4, 0), 10 + 2 * 4);
+    }
+
+    #[test]
+    fn costingfun_subtracted_sizes_clamps_to_minimum() {
+        let p = SubtractedSizesP {
+            intercept: 100,
+            slope: 5,
+            minimum: 200,
+        };
+        // 100 + 5*(10-2) = 140 < minimum 200 → clamp.
+        assert_eq!(CostingFun::SubtractedSizes(p).eval(10, 2, 0), 200);
+        // 100 + 5*(50-2) = 340 > minimum → no clamp.
+        assert_eq!(CostingFun::SubtractedSizes(p).eval(50, 2, 0), 340);
+    }
+
+    #[test]
+    fn costingfun_quadratic_axes() {
+        let q = quad1(1, 2, 3);
+        // c0 + c1*x + c2*x^2 = 1 + 2*4 + 3*16 = 57
+        assert_eq!(
+            CostingFun::QuadraticInX(q).eval(4, 0, 0),
+            1 + 2 * 4 + 3 * 16
+        );
+        assert_eq!(
+            CostingFun::QuadraticInY(q).eval(0, 4, 0),
+            1 + 2 * 4 + 3 * 16
+        );
+        assert_eq!(
+            CostingFun::QuadraticInZ(q).eval(0, 0, 4),
+            1 + 2 * 4 + 3 * 16
+        );
+    }
+
+    #[test]
+    fn costingfun_linear_on_diagonal_off_and_on() {
+        let p = DiagLinearP {
+            constant: 999,
+            intercept: 10,
+            slope: 5,
+        };
+        // On-diagonal: x == y → intercept + slope*x.
+        assert_eq!(CostingFun::LinearOnDiagonal(p).eval(3, 3, 0), 10 + 5 * 3);
+        // Off-diagonal: any x != y → constant.
+        assert_eq!(CostingFun::LinearOnDiagonal(p).eval(3, 4, 0), 999);
+        assert_eq!(CostingFun::LinearOnDiagonal(p).eval(0, 1, 0), 999);
+    }
+
+    #[test]
+    fn costingfun_const_above_diagonal_above_uses_model() {
+        // QuadXY with minimum 0 so we can read the bare polynomial.
+        let q = QuadXY {
+            c00: 1,
+            c10: 1,
+            c01: 1,
+            c20: 1,
+            c11: 1,
+            c02: 1,
+            minimum: 0,
+        };
+        let p = ConstAboveDiagP {
+            constant: 7777,
+            model: q,
+        };
+        // Below diagonal: x < y → constant.
+        assert_eq!(CostingFun::ConstAboveDiagonal(p).eval(1, 5, 0), 7777);
+        // On/above diagonal: x >= y → model(x,y).
+        // model(2, 2) = 1 + 2 + 2 + 4 + 4 + 4 = 17
+        assert_eq!(CostingFun::ConstAboveDiagonal(p).eval(2, 2, 0), 17);
+    }
+
+    #[test]
+    fn costingfun_above_and_below_diagonal_runs_with_sorted_pair() {
+        let q = QuadXY {
+            c00: 0,
+            c10: 1,
+            c01: 0,
+            c20: 0,
+            c11: 0,
+            c02: 0,
+            minimum: 0,
+        };
+        let p = AboveBelowDiagP { model: q };
+        // model(max, min) — c10 multiplies max.
+        // eval(2, 5): max=5 → 5; eval(5, 2): max=5 → 5. Symmetric.
+        assert_eq!(CostingFun::AboveAndBelowDiagonal(p).eval(2, 5, 0), 5);
+        assert_eq!(CostingFun::AboveAndBelowDiagonal(p).eval(5, 2, 0), 5);
+    }
+
+    #[test]
+    fn costingfun_const_above_diagonal_lin_xy() {
+        let p = ConstAboveDiagLinXYP {
+            constant: 99,
+            intercept: 10,
+            slope1: 2,
+            slope2: 3,
+        };
+        // Below diagonal: x < y → constant.
+        assert_eq!(CostingFun::ConstAboveDiagonalLinearXY(p).eval(1, 2, 0), 99);
+        // On/above diagonal: 10 + 2*x + 3*y.
+        assert_eq!(
+            CostingFun::ConstAboveDiagonalLinearXY(p).eval(5, 5, 0),
+            10 + 2 * 5 + 3 * 5
+        );
+        assert_eq!(
+            CostingFun::ConstAboveDiagonalLinearXY(p).eval(10, 2, 0),
+            10 + 2 * 10 + 3 * 2
+        );
+    }
+
+    #[test]
+    fn costingfun_with_interaction_xy() {
+        // c00 + c10*x + c01*y + c11*x*y
+        let p = InteractionXYP {
+            c00: 1,
+            c01: 2,
+            c10: 3,
+            c11: 4,
+        };
+        // (x=2, y=3): 1 + 3*2 + 2*3 + 4*2*3 = 1 + 6 + 6 + 24 = 37
+        assert_eq!(CostingFun::WithInteractionXY(p).eval(2, 3, 0), 37);
+    }
+
+    #[test]
+    fn costingfun_linear_yz_and_max_yz() {
+        let yz = LinearYZP {
+            intercept: 10,
+            slope1: 2,
+            slope2: 3,
+        };
+        // intercept + 2*y + 3*z (ignores x)
+        assert_eq!(CostingFun::LinearYZ(yz).eval(999, 4, 5), 10 + 2 * 4 + 3 * 5);
+        let f = lin1(1, 7);
+        // linear in max(y, z) — ignores x.
+        assert_eq!(CostingFun::LinearMaxYZ(f).eval(999, 3, 5), 1 + 7 * 5);
+        assert_eq!(CostingFun::LinearMaxYZ(f).eval(999, 5, 3), 1 + 7 * 5);
+    }
+
+    #[test]
+    fn costingfun_literal_in_y_or_linear_in_z_branches() {
+        // Used by writeBits: if width_y == 0 → linear_in_z; else → return y.
+        let f = lin1(100, 50);
+        // y == 0: take the linear-in-z branch.
+        assert_eq!(
+            CostingFun::LiteralInYOrLinearInZ(f).eval(0, 0, 4),
+            100 + 50 * 4
+        );
+        // y != 0: return y directly (z is irrelevant).
+        assert_eq!(CostingFun::LiteralInYOrLinearInZ(f).eval(0, 17, 999), 17);
+    }
+
+    #[test]
+    fn costingfun_exp_mod_with_and_without_penalty() {
+        let p = ExpModP {
+            coefficient00: 100,
+            coefficient11: 1,
+            coefficient12: 1,
+        };
+        // cost0 = 100 + 1*ee*mm + 1*ee*mm^2  (with ee=2, mm=3): 100 + 6 + 18 = 124.
+        // aa <= mm (aa=2, mm=3): no penalty.
+        assert_eq!(CostingFun::ExpModCost(p).eval(2, 2, 3), 124);
+        // aa > mm: 50% penalty → cost0 + cost0/2 = 124 + 62 = 186.
+        assert_eq!(CostingFun::ExpModCost(p).eval(10, 2, 3), 186);
+    }
+
+    // ─── Saturation guards on Linear1 / Quadratic1 ───────────────────────
+    //
+    // These guard against panics on extreme inputs — the Haskell reference
+    // saturates at Word64::MAX; we saturate at i64::MAX.
+
+    #[test]
+    fn costingfun_linear_saturates_instead_of_panicking() {
+        let f = lin1(0, i64::MAX);
+        // intercept=0, slope*x where slope*x overflows → i64::MAX.
+        assert_eq!(CostingFun::LinearInX(f).eval(2, 0, 0), i64::MAX);
+    }
+
+    #[test]
+    fn costingfun_constant_pair_evaluates_to_expected_budget() {
+        let pair = CostPair::constant(11, 22);
+        let b = pair.eval(0, 0, 0);
+        assert_eq!(b.cpu, 11);
+        assert_eq!(b.mem, 22);
+    }
+
+    // ─── memory_usage_integer ─────────────────────────────────────────────
+
+    #[test]
+    fn memory_usage_integer_zero_and_small() {
+        assert_eq!(memory_usage_integer(&BigInt::from(0)), 1);
+        assert_eq!(memory_usage_integer(&BigInt::from(1)), 1);
+        assert_eq!(memory_usage_integer(&BigInt::from(-1)), 1);
+    }
+
+    #[test]
+    fn memory_usage_integer_word_boundaries() {
+        // 2^63 - 1 fits in 1 word (bits=63).
+        let n = BigInt::from(i64::MAX);
+        assert_eq!(memory_usage_integer(&n), 1);
+        // 2^64 needs 2 words.
+        let n2 = BigInt::from(u64::MAX) + BigInt::from(1);
+        assert_eq!(memory_usage_integer(&n2), 2);
+    }
 }
