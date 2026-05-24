@@ -29,10 +29,6 @@ on:
         required: false
         default: ""
 
-  schedule:
-    # Weekly on Sunday at 06:00 UTC
-    - cron: "0 6 * * 0"
-
   push:
     branches:
       - main
