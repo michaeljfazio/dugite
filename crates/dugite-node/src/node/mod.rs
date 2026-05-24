@@ -4116,7 +4116,11 @@ impl Node {
                                         // acquiring ledger_seq (same invariant as Fix A).
                                         let fork_delta = {
                                             let mut ls = self.ledger_state.write().await;
-                                            match ls.apply_block_with_delta(&fork_block, validation_mode) {
+                                            // Issue #653 — relief-worker scheduling.
+                                            let apply_result = tokio::task::block_in_place(|| {
+                                                ls.apply_block_with_delta(&fork_block, validation_mode)
+                                            });
+                                            match apply_result {
                                                 Ok(delta) => {
                                                     // Publish view post-apply (#651 P2 / #652 P0).
                                                     self.publish_ledger_view(&ls);
@@ -4372,7 +4376,15 @@ impl Node {
         // starts), so there is no risk of double-pushing the same block.
         let delta = {
             let mut ls = self.ledger_state.write().await;
-            match ls.apply_block_with_delta(&block, validation_mode) {
+            // Issue #653 — wrap the CPU-bound apply in `block_in_place`
+            // so the multi-thread tokio runtime spawns relief workers
+            // for the duration. Without this, every block apply pins
+            // one worker for the full Phase-1/Phase-2 validation and
+            // UTxO/cert/gov update window, leaving the work-stealing
+            // pool unable to fan out runnable tasks elsewhere.
+            let apply_result =
+                tokio::task::block_in_place(|| ls.apply_block_with_delta(&block, validation_mode));
+            match apply_result {
                 Ok(delta) => {
                     // Publish the lock-free read view immediately after
                     // apply (issue #651 P2 / #652 P0) — readers see the
@@ -6122,9 +6134,11 @@ impl Node {
                                     // tracks forged-path fork replay blocks too.
                                     let forge_fork_delta = {
                                         let mut ls = self.ledger_state.write().await;
-                                        match ls
-                                            .apply_block_with_delta(&fork_block, validation_mode)
-                                        {
+                                        // Issue #653 — relief-worker scheduling.
+                                        let apply_result = tokio::task::block_in_place(|| {
+                                            ls.apply_block_with_delta(&fork_block, validation_mode)
+                                        });
+                                        match apply_result {
                                             Ok(delta) => {
                                                 // Publish view post-apply (#651 P2 / #652 P0).
                                                 self.publish_ledger_view(&ls);
@@ -6217,7 +6231,11 @@ impl Node {
                 // forged blocks too, enabling seq-based rollback on the next fork.
                 let forged_delta = {
                     let mut ls = self.ledger_state.write().await;
-                    match ls.apply_block_with_delta(&block, BlockValidationMode::ValidateAll) {
+                    // Issue #653 — relief-worker scheduling.
+                    let apply_result = tokio::task::block_in_place(|| {
+                        ls.apply_block_with_delta(&block, BlockValidationMode::ValidateAll)
+                    });
+                    match apply_result {
                         Ok(delta) => {
                             // Publish view post-apply (#651 P2 / #652 P0).
                             self.publish_ledger_view(&ls);

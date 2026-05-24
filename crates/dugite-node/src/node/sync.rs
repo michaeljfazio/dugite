@@ -1284,7 +1284,11 @@ impl Node {
                 } else {
                     BlockValidationMode::ApplyOnly
                 };
-                match ls.apply_block_with_delta(block, ledger_mode) {
+                // Issue #653 — relief-worker scheduling around the
+                // CPU-bound per-block apply inside the bulk batch loop.
+                let apply_result =
+                    tokio::task::block_in_place(|| ls.apply_block_with_delta(block, ledger_mode));
+                match apply_result {
                     Ok(delta) => {
                         collected_deltas.push(delta);
                     }
