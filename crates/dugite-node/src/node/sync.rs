@@ -348,6 +348,10 @@ impl Node {
                         }
                     }
                 }
+                // Publish view after gap-bridge replay (#651 P2 / #652 P0).
+                if replayed > 0 {
+                    self.publish_ledger_view(&ls);
+                }
                 info!(
                     ledger_slot,
                     rollback_slot, replayed, "Gap-bridge: advanced ledger to meet rollback target"
@@ -369,6 +373,8 @@ impl Node {
             let mut ls = self.ledger_state.write().await;
             let mut seq = self.ledger_seq.write().await;
             if let Some(n) = ls.rollback_via_seq(&mut seq, rollback_point) {
+                // Publish view after rollback (#651 P2 / #652 P0).
+                self.publish_ledger_view(&ls);
                 info!(
                     rollback_slot,
                     rolled_back_blocks = n,
@@ -558,6 +564,8 @@ impl Node {
                                 }
                             }
                         }
+                        // Publish view after snapshot-load + replay (#651 P2 / #652 P0).
+                        self.publish_ledger_view(&ls);
                         info!(
                             snapshot_slot,
                             rollback_slot,
@@ -1305,6 +1313,11 @@ impl Node {
                 }
                 applied_count += 1;
             }
+            // Publish lock-free read view after the batch (#651 P2 / #652 P0)
+            // so readers see the new tip without taking the ledger lock.
+            if applied_count > 0 {
+                self.publish_ledger_view(&ls);
+            }
         }
 
         // Push collected deltas to LedgerSeq (after releasing ledger_state lock).
@@ -1640,7 +1653,8 @@ impl Node {
         }
 
         {
-            let current_epoch = self.ledger_state.read().await.epoch.0;
+            // Lock-free epoch read via the published view (#651 P2).
+            let current_epoch = self.view().epoch.0;
             if current_epoch > *last_snapshot_epoch {
                 // Count ALL epoch transitions (batches may span multiple epochs)
                 let epochs_crossed = (current_epoch - *last_snapshot_epoch) as u32;
@@ -1958,10 +1972,8 @@ impl Node {
         }
 
         let db_tip = self.chain_db.read().await.get_tip();
-        let ledger_slot = {
-            let ls = self.ledger_state.read().await;
-            ls.tip.point.slot().map(|s| s.0).unwrap_or(0)
-        };
+        // Lock-free tip-slot read via the published view (#651 P2).
+        let ledger_slot = self.view().tip_slot();
         let db_tip_slot = db_tip.point.slot().map(|s| s.0).unwrap_or(0);
 
         if db_tip_slot <= ledger_slot {
@@ -2456,11 +2468,12 @@ impl Node {
                 ledger_slot = start_slot,
                 db_tip_slot = end_slot,
                 blocks_behind = {
-                    // Rough estimate — block_number not available until we replay
+                    // Rough estimate — block_number not available until we replay.
+                    // Lock-free read via the published view (#651 P2).
                     db_tip
                         .block_number
                         .0
-                        .saturating_sub(self.ledger_state.read().await.tip.block_number.0)
+                        .saturating_sub(self.view().tip.block_number.0)
                 },
                 "Replaying ledger from ChainDB (slot-based)",
             );
