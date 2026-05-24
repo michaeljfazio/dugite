@@ -20,9 +20,9 @@
 //!
 //! ## Version support
 //!
-//! Dugite-crypto implements ECVRF-ED25519-SHA512-Elligator2 draft-03 (v03),
-//! matching Cardano's Ouroboros Praos usage. v13 batch-compatible vectors are
-//! skipped with a diagnostic message (different proof format: 128 bytes vs 80).
+//! Both v03 (draft-03, 80-byte proofs, Ouroboros Praos) and v13 (draft-13
+//! batch-compatible, 128-byte proofs, PraosBatchCompatVRF) are validated.
+//! v03 and v13 share the same key derivation (same sk → same pk).
 //!
 //! ## KES note
 //!
@@ -43,7 +43,10 @@ use std::collections::HashMap;
 use std::path::Path;
 
 use dugite_crypto::kes::{kes_evolve_to_period, kes_keygen, kes_sign_bytes, kes_verify_bytes};
-use dugite_crypto::vrf::{generate_vrf_keypair_from_secret, generate_vrf_proof, verify_vrf_proof};
+use dugite_crypto::vrf::{
+    generate_vrf_keypair_from_secret, generate_vrf_proof, generate_vrf_proof_v13, verify_vrf_proof,
+    verify_vrf_proof_v13,
+};
 
 /// Parsed VRF test vector from a cardano-crypto-praos test_vectors/ file.
 #[derive(Debug)]
@@ -179,7 +182,7 @@ fn run_vrf_vectors(dir: &Path) {
     }
 
     let mut validated_v03 = 0usize;
-    let mut skipped_v13 = 0usize;
+    let mut validated_v13 = 0usize;
 
     for path in &vrf_files {
         let text = std::fs::read_to_string(path)
@@ -194,14 +197,10 @@ fn run_vrf_vectors(dir: &Path) {
             continue;
         };
 
-        // v13 batch-compatible: proof is 128 bytes; dugite-crypto only implements v03 (80 bytes).
-        // ver field may be "13" or "ietfdraft13" depending on the file format.
+        // v13 batch-compatible: proof is 128 bytes; ver field may be "13" or "ietfdraft13".
         if vec.ver.contains("13") || vec.pi.len() == 128 {
-            eprintln!(
-                "[cardano-base] SKIP {label}: v13 batch-compatible (128-byte proof); \
-                 dugite-crypto implements v03 only"
-            );
-            skipped_v13 += 1;
+            validate_v13_vector(&vec, label);
+            validated_v13 += 1;
             continue;
         }
 
@@ -211,14 +210,14 @@ fn run_vrf_vectors(dir: &Path) {
 
     eprintln!(
         "[cardano-base] VRF: {validated_v03} v03 vector(s) validated, \
-         {skipped_v13} v13 skipped across {} file(s)",
+         {validated_v13} v13 vector(s) validated, across {} file(s)",
         vrf_files.len()
     );
 
-    // If we have vector files, at least some must be v03.
-    if !vrf_files.is_empty() && validated_v03 == 0 {
+    // If we have vector files, at least some must be v03 or v13.
+    if !vrf_files.is_empty() && validated_v03 == 0 && validated_v13 == 0 {
         panic!(
-            "[cardano-base] No v03 VRF vectors validated from {} files — \
+            "[cardano-base] No VRF vectors validated from {} files — \
              check vector file format",
             vrf_files.len()
         );
@@ -299,6 +298,82 @@ fn validate_v03_vector(vec: &VrfVector, label: &str) {
     );
 
     eprintln!("[cardano-base] PASS {label}: keypair + prove + verify all match");
+}
+
+/// Validate one VRF v13 (batch-compatible) vector:
+///
+/// 1. Keypair derivation: sk_seed → pk_derived must match pk_expected.
+/// 2. Proof generation: generate_vrf_proof_v13(sk_seed, alpha) → (pi, beta) must match expected.
+/// 3. Proof verification: verify_vrf_proof_v13(pk, pi_expected, alpha) → beta must match expected.
+fn validate_v13_vector(vec: &VrfVector, label: &str) {
+    assert!(
+        vec.sk_seed.len() == 32,
+        "[cardano-base] {label}: sk_seed must be 32 bytes, got {}",
+        vec.sk_seed.len()
+    );
+    let sk32: [u8; 32] = vec.sk_seed[..32].try_into().unwrap();
+
+    assert!(
+        vec.pk.len() == 32,
+        "[cardano-base] {label}: pk must be 32 bytes, got {}",
+        vec.pk.len()
+    );
+
+    assert!(
+        vec.pi.len() == 128,
+        "[cardano-base] {label}: v13 pi must be 128 bytes, got {}",
+        vec.pi.len()
+    );
+
+    assert!(
+        vec.beta.len() == 64,
+        "[cardano-base] {label}: beta must be 64 bytes, got {}",
+        vec.beta.len()
+    );
+
+    // 1 — Keypair derivation: derive pk from sk_seed, compare to expected pk.
+    let kp = generate_vrf_keypair_from_secret(&sk32);
+    assert_eq!(
+        kp.public_key.as_ref(),
+        vec.pk.as_slice(),
+        "[cardano-base] {label}: derived pk mismatch\n  got:      {}\n  expected: {}",
+        hex::encode(kp.public_key),
+        hex::encode(&vec.pk)
+    );
+
+    // 2 — Proof generation: generate_vrf_proof_v13(sk_seed, alpha) must match pi and beta.
+    let (pi_computed, beta_computed) = generate_vrf_proof_v13(&sk32, &vec.alpha)
+        .unwrap_or_else(|e| panic!("[cardano-base] {label}: v13 proof generation failed: {e}"));
+
+    assert_eq!(
+        &pi_computed[..],
+        vec.pi.as_slice(),
+        "[cardano-base] {label}: generated v13 proof (pi) mismatch\n  got:      {}\n  expected: {}",
+        hex::encode(pi_computed),
+        hex::encode(&vec.pi)
+    );
+
+    assert_eq!(
+        &beta_computed[..],
+        vec.beta.as_slice(),
+        "[cardano-base] {label}: generated v13 output (beta) mismatch\n  got:      {}\n  expected: {}",
+        hex::encode(beta_computed),
+        hex::encode(&vec.beta)
+    );
+
+    // 3 — Proof verification: verify_vrf_proof_v13(pk, pi_expected, alpha) → beta.
+    let beta_verified = verify_vrf_proof_v13(&vec.pk, &vec.pi, &vec.alpha)
+        .unwrap_or_else(|e| panic!("[cardano-base] {label}: v13 proof verification failed: {e}"));
+
+    assert_eq!(
+        &beta_verified[..],
+        vec.beta.as_slice(),
+        "[cardano-base] {label}: verified v13 output (beta) mismatch\n  got:      {}\n  expected: {}",
+        hex::encode(beta_verified),
+        hex::encode(&vec.beta)
+    );
+
+    eprintln!("[cardano-base] PASS {label}: v13 keypair + prove + verify all match");
 }
 
 /// KES property-based validation using dugite-crypto's KES API.

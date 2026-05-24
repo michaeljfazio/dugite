@@ -1726,6 +1726,466 @@ pub fn generate_vrf_proof(
     Ok((proof_bytes, output))
 }
 
+// ─── VRF v13 (PraosBatchCompatVRF) internals ───────────────────────────────
+//
+// Hash-to-curve for ECVRF draft-13 batch-compatible uses RFC 9380
+// expand_message_xmd with SHA-512, NOT the simple SHA-512-then-first-32-bytes
+// used by draft-03. DST = "ECVRF_edwards25519_XMD:SHA-512_ELL2_NU_\x04".
+// Input message = pk_bytes (32) || alpha (variable).
+//
+// Reference: cardano-crypto-praos cbits/vrf13_batchcompat/prove.c +
+//            cbits/private/core_h2c.c + cbits/private/ed25519_ref10.c.
+
+/// RFC 9380 §5.3.1 expand_message_xmd using SHA-512.
+fn expand_message_xmd_sha512(msg: &[u8], dst: &[u8], len_in_bytes: usize) -> Vec<u8> {
+    use sha2::Digest as _;
+    // SHA-512 parameters
+    const B_BYTES: usize = 64; // hash output size
+    const R_BYTES: usize = 128; // block size (Z_pad length)
+
+    let ell = len_in_bytes.div_ceil(B_BYTES);
+    assert!(ell <= 255 && len_in_bytes <= 65535 && dst.len() <= 255);
+
+    // DST_prime = DST || I2OSP(|DST|, 1)
+    let dst_len_byte = dst.len() as u8;
+    let lib_str = [(len_in_bytes >> 8) as u8, (len_in_bytes & 0xff) as u8];
+
+    // b_0 = H(Z_pad || msg || I2OSP(len,2) || I2OSP(0,1) || DST_prime)
+    let b0: [u8; 64] = {
+        let mut h = sha2::Sha512::new();
+        h.update([0u8; R_BYTES]);
+        h.update(msg);
+        h.update(lib_str);
+        h.update([0u8]); // counter 0
+        h.update(dst);
+        h.update([dst_len_byte]);
+        h.finalize().into()
+    };
+
+    // b_1 = H(b_0 || I2OSP(1,1) || DST_prime)
+    let b1: [u8; 64] = {
+        let mut h = sha2::Sha512::new();
+        h.update(b0);
+        h.update([1u8]);
+        h.update(dst);
+        h.update([dst_len_byte]);
+        h.finalize().into()
+    };
+
+    let mut out = b1.to_vec();
+    let mut b_prev = b1;
+
+    for i in 2u8..=(ell as u8) {
+        // b_i = H(strxor(b_(i-1), b_0) || I2OSP(i,1) || DST_prime)
+        let xored: [u8; 64] = std::array::from_fn(|j| b_prev[j] ^ b0[j]);
+        let bi: [u8; 64] = {
+            let mut h = sha2::Sha512::new();
+            h.update(xored);
+            h.update([i]);
+            h.update(dst);
+            h.update([dst_len_byte]);
+            h.finalize().into()
+        };
+        out.extend_from_slice(&bi);
+        b_prev = bi;
+    }
+
+    out.truncate(len_in_bytes);
+    out
+}
+
+// ─── GF(2^255-19) helpers using dashu_int::UBig for v13 hash-to-curve ──────
+// These are for correctness (conformance tests), not for production use.
+
+fn v13_fe_mul(a: &dashu_int::UBig, b: &dashu_int::UBig, p: &dashu_int::UBig) -> dashu_int::UBig {
+    (a * b) % p
+}
+
+fn v13_fe_neg(a: &dashu_int::UBig, p: &dashu_int::UBig) -> dashu_int::UBig {
+    let r = a % p;
+    if r == dashu_int::UBig::ZERO {
+        dashu_int::UBig::ZERO
+    } else {
+        p - r
+    }
+}
+
+fn v13_fe_add(a: &dashu_int::UBig, b: &dashu_int::UBig, p: &dashu_int::UBig) -> dashu_int::UBig {
+    (a + b) % p
+}
+
+fn v13_fe_sub(a: &dashu_int::UBig, b: &dashu_int::UBig, p: &dashu_int::UBig) -> dashu_int::UBig {
+    let b_r = b % p;
+    let a_r = a % p;
+    if a_r >= b_r {
+        (a_r - b_r) % p
+    } else {
+        (p + a_r - b_r) % p
+    }
+}
+
+fn v13_fe_pow(
+    base: &dashu_int::UBig,
+    exp: &dashu_int::UBig,
+    p: &dashu_int::UBig,
+) -> dashu_int::UBig {
+    let mut result = dashu_int::UBig::ONE;
+    let mut base = base % p;
+    let mut e = exp.clone();
+    while e > dashu_int::UBig::ZERO {
+        if &e & &dashu_int::UBig::ONE != dashu_int::UBig::ZERO {
+            result = result * &base % p;
+        }
+        e >>= 1usize;
+        base = &base * &base % p;
+    }
+    result
+}
+
+fn v13_fe_invert(a: &dashu_int::UBig, p: &dashu_int::UBig) -> dashu_int::UBig {
+    let exp = p - &dashu_int::UBig::from(2u32);
+    v13_fe_pow(a, &exp, p)
+}
+
+fn v13_fe_is_square(a: &dashu_int::UBig, p: &dashu_int::UBig) -> bool {
+    if *a == dashu_int::UBig::ZERO || a % p == dashu_int::UBig::ZERO {
+        return true;
+    }
+    let exp = (p - &dashu_int::UBig::ONE) >> 1usize;
+    v13_fe_pow(a, &exp, p) == dashu_int::UBig::ONE
+}
+
+// For p ≡ 5 (mod 8): sqrt via a^((p+3)/8), possibly * sqrt(-1).
+// Does NOT check is_square — caller must ensure a is a square.
+fn v13_fe_sqrt(a: &dashu_int::UBig, p: &dashu_int::UBig) -> dashu_int::UBig {
+    // (p+3)/8 = (2^255 - 16)/8 = 2^252 - 2
+    let exp = (dashu_int::UBig::ONE << 252usize) - &dashu_int::UBig::from(2u32);
+    let v = v13_fe_pow(a, &exp, p);
+    // Check if v^2 == a mod p
+    if &v * &v % p == a % p {
+        v
+    } else {
+        // Multiply by sqrt(-1) = 2^((p-1)/4) mod p
+        let sqrt_m1_exp = (p - &dashu_int::UBig::ONE) >> 2usize;
+        let sqrt_m1 = v13_fe_pow(&dashu_int::UBig::from(2u32), &sqrt_m1_exp, p);
+        v13_fe_mul(&sqrt_m1, &v, p)
+    }
+}
+
+fn v13_fe_parity(a: &dashu_int::UBig, p: &dashu_int::UBig) -> u8 {
+    let r = a % p;
+    let b = r.to_le_bytes();
+    if b.is_empty() {
+        0
+    } else {
+        b[0] & 1
+    }
+}
+
+fn v13_ubig_to_bytes32(n: &dashu_int::UBig) -> [u8; 32] {
+    let b = n.to_le_bytes();
+    let mut arr = [0u8; 32];
+    let len = b.len().min(32);
+    arr[..len].copy_from_slice(&b[..len]);
+    arr
+}
+
+/// Elligator2 on Curve25519 (RFC 9380 §6.7.1, simplified Montgomery form).
+///
+/// Returns `(x_montgomery, notsquare)` where `notsquare` is true when gx1 was
+/// not a quadratic residue (the x2 branch was taken).
+fn v13_elligator2_x25519(u: &dashu_int::UBig, p: &dashu_int::UBig) -> (dashu_int::UBig, bool) {
+    let a = dashu_int::UBig::from(486662u64); // Curve25519 Montgomery A
+
+    // tv1 = 2 * u^2
+    let u_sq = v13_fe_mul(u, u, p);
+    let tv1_raw = v13_fe_mul(&dashu_int::UBig::from(2u32), &u_sq, p);
+
+    // e1 = tv1 == -1 (p-1)
+    let p_m1 = p - &dashu_int::UBig::ONE;
+    let tv1 = if tv1_raw == p_m1 {
+        dashu_int::UBig::ZERO
+    } else {
+        tv1_raw
+    };
+
+    // x1 = -A / (1 + tv1)
+    let denom = v13_fe_add(&dashu_int::UBig::ONE, &tv1, p);
+    let denom_inv = v13_fe_invert(&denom, p);
+    let x1 = v13_fe_mul(&v13_fe_neg(&a, p), &denom_inv, p);
+
+    // gx1 = x1^3 + A*x1^2 + x1
+    let x1_sq = v13_fe_mul(&x1, &x1, p);
+    let x1_cu = v13_fe_mul(&x1_sq, &x1, p);
+    let gx1 = v13_fe_add(&v13_fe_add(&x1_cu, &v13_fe_mul(&a, &x1_sq, p), p), &x1, p);
+
+    // x2 = -x1 - A
+    let x2 = v13_fe_sub(&v13_fe_neg(&x1, p), &a, p);
+
+    // gx2 = tv1 * gx1
+    let gx2 = v13_fe_mul(&tv1, &gx1, p);
+
+    let gx1_is_sq = v13_fe_is_square(&gx1, p);
+    let _ = gx2; // gx2 used only for determining y below; not needed for x
+
+    if gx1_is_sq {
+        (x1, false) // notsquare=false
+    } else {
+        (x2, true) // notsquare=true
+    }
+}
+
+/// Hash-to-curve for ECVRF draft-13 batch-compatible.
+///
+/// Implements the exact algorithm used by cardano-base PraosBatchCompatVRF:
+/// expand_message_xmd(SHA-512, pk||alpha, DST, 48) → byte-reverse → reduce64 →
+/// Elligator2 on Curve25519 → Montgomery-to-Edwards birational map → ×cofactor.
+fn hash_to_curve_v13(
+    pk_bytes: &[u8; 32],
+    seed: &[u8],
+) -> curve25519_dalek_fork::edwards::EdwardsPoint {
+    use curve25519_dalek_fork::montgomery::MontgomeryPoint;
+    use dashu_int::UBig;
+
+    // DST = "ECVRF_edwards25519_XMD:SHA-512_ELL2_NU_\x04" (40 bytes)
+    const DST: &[u8] = b"ECVRF_edwards25519_XMD:SHA-512_ELL2_NU_\x04";
+
+    // Message = pk || alpha
+    let mut msg = Vec::with_capacity(32 + seed.len());
+    msg.extend_from_slice(pk_bytes);
+    msg.extend_from_slice(seed);
+
+    // expand_message_xmd → 48 bytes big-endian
+    let h_be = expand_message_xmd_sha512(&msg, DST, 48);
+
+    // Byte-reverse to little-endian + zero-pad to 64 bytes
+    let mut h_le = [0u8; 64];
+    for j in 0..48 {
+        h_le[j] = h_be[47 - j];
+    }
+
+    // Reduce mod p = 2^255 - 19 as a 512-bit LE integer
+    let p: UBig = (UBig::ONE << 255usize) - UBig::from(19u32);
+    let n = UBig::from_le_bytes(&h_le);
+    let u = n % &p;
+
+    // Elligator2 → x_montgomery, notsquare flag
+    let (x_mont, notsquare) = v13_elligator2_x25519(&u, &p);
+
+    // y_sign_target = notsquare ^ 1 = !notsquare (matches C: y_sign = notsquare ^ 1)
+    let y_sign_target = (!notsquare) as u8; // 1 = want odd parity, 0 = want even
+
+    // Compute gx = x_mont^3 + A*x_mont^2 + x_mont on Curve25519
+    let a_mont = UBig::from(486662u64);
+    let x_sq = v13_fe_mul(&x_mont, &x_mont, &p);
+    let x_cu = v13_fe_mul(&x_sq, &x_mont, &p);
+    let gx = v13_fe_add(
+        &v13_fe_add(&x_cu, &v13_fe_mul(&a_mont, &x_sq, &p), &p),
+        &x_mont,
+        &p,
+    );
+
+    // y_candidate = sqrt(gx)
+    let y_cand = v13_fe_sqrt(&gx, &p);
+
+    // Adjust y parity to match y_sign_target
+    let y_parity = v13_fe_parity(&y_cand, &p);
+    let y_mont = if y_parity != y_sign_target {
+        v13_fe_neg(&y_cand, &p)
+    } else {
+        y_cand
+    };
+
+    // Edwards X sign via birational map: X_ed = sqrt(-486664) * x_mont / y_mont
+    // sqrt(-486664) = sqrt(p - 486664)
+    let neg_486664 = &p - UBig::from(486664u64);
+    let sqrt_neg_486664 = v13_fe_sqrt(&neg_486664, &p);
+
+    let x_ed_num = v13_fe_mul(&sqrt_neg_486664, &x_mont, &p);
+    let x_ed = v13_fe_mul(&x_ed_num, &v13_fe_invert(&y_mont, &p), &p);
+    let edwards_x_sign = v13_fe_parity(&x_ed, &p);
+
+    // Build MontgomeryPoint and convert to EdwardsPoint
+    MontgomeryPoint(v13_ubig_to_bytes32(&x_mont))
+        .to_edwards(edwards_x_sign)
+        .expect("v13 Elligator2 produced invalid Montgomery point")
+        .mul_by_cofactor()
+}
+
+/// Verify a VRF proof (v13 batch-compatible) and return the 64-byte VRF output.
+///
+/// Implements PraosBatchCompatVRF (ECVRF-ED25519-SHA512-Elligator2 draft-13 batch-compat).
+/// Proof format: `[gamma(32) || U(32) || V(32) || response(32)] = 128 bytes`.
+///
+/// - `vrf_vkey`: 32-byte VRF verification key
+/// - `proof_bytes`: 128-byte VRF proof
+/// - `seed`: the VRF input
+pub fn verify_vrf_proof_v13(
+    vrf_vkey: &[u8],
+    proof_bytes: &[u8],
+    seed: &[u8],
+) -> Result<[u8; 64], VrfError> {
+    use curve25519_dalek_fork::edwards::{CompressedEdwardsY, EdwardsPoint};
+    use curve25519_dalek_fork::scalar::Scalar;
+    use curve25519_dalek_fork::traits::VartimeMultiscalarMul;
+    use sha2::Digest as _;
+    use std::ops::Neg;
+
+    if vrf_vkey.len() != 32 {
+        return Err(VrfError::InvalidPublicKey);
+    }
+    if proof_bytes.len() != 128 {
+        return Err(VrfError::InvalidProof(format!(
+            "expected 128 bytes, got {}",
+            proof_bytes.len()
+        )));
+    }
+
+    let pk_bytes: [u8; 32] = vrf_vkey.try_into().unwrap();
+
+    // Parse proof: [gamma(32) || U(32) || V(32) || response(32)]
+    let gamma = CompressedEdwardsY::from_slice(&proof_bytes[..32])
+        .decompress()
+        .ok_or(VrfError::InvalidProof("gamma decompress failed".into()))?;
+    let u_point = CompressedEdwardsY::from_slice(&proof_bytes[32..64])
+        .decompress()
+        .ok_or(VrfError::InvalidProof("U decompress failed".into()))?;
+    let v_point = CompressedEdwardsY::from_slice(&proof_bytes[64..96])
+        .decompress()
+        .ok_or(VrfError::InvalidProof("V decompress failed".into()))?;
+    let mut resp_bytes = [0u8; 32];
+    resp_bytes.copy_from_slice(&proof_bytes[96..]);
+    let response = Scalar::from_canonical_bytes(resp_bytes)
+        .ok_or(VrfError::InvalidProof("response not canonical".into()))?;
+
+    let decompressed_pk = CompressedEdwardsY::from_slice(&pk_bytes)
+        .decompress()
+        .ok_or(VrfError::InvalidPublicKey)?;
+    if decompressed_pk.is_small_order() {
+        return Err(VrfError::InvalidPublicKey);
+    }
+
+    // hash_to_curve: RFC 9380 expand_message_xmd + Elligator2 (v13 algorithm)
+    let h = hash_to_curve_v13(&pk_bytes, seed);
+    let compressed_h = h.compress();
+
+    // batch-compat challenge: SHA-512(0x04||0x02||Y||H||gamma||U||V||0x00)[..16]
+    // Y comes before H; no base point B; trailing 0x00 per RFC 9381 §5.4.3
+    let challenge = {
+        let mut hasher = sha2::Sha512::new();
+        hasher.update([0x04, 0x02]);
+        hasher.update(pk_bytes); // Y = public key
+        hasher.update(compressed_h.to_bytes());
+        hasher.update(gamma.compress().to_bytes());
+        hasher.update(u_point.compress().to_bytes());
+        hasher.update(v_point.compress().to_bytes());
+        hasher.update([0x00]);
+        let digest = hasher.finalize();
+        let mut scalar_bytes = [0u8; 32];
+        scalar_bytes[..16].copy_from_slice(&digest[..16]);
+        Scalar::from_bits(scalar_bytes)
+    };
+
+    // U' = response * G - challenge * PK
+    let u_check = EdwardsPoint::vartime_double_scalar_mul_basepoint(
+        &challenge.neg(),
+        &decompressed_pk,
+        &response,
+    );
+    // V' = response * H - challenge * gamma
+    let v_check = EdwardsPoint::vartime_multiscalar_mul(
+        [response, challenge.neg()].iter().copied(),
+        [h, gamma].iter().copied(),
+    );
+
+    if u_check != u_point || v_check != v_point {
+        return Err(VrfError::VerificationFailed);
+    }
+
+    // proof_to_hash: Sha512(0x04 || 0x03 || gamma_cofac || 0x00)
+    let gamma_cofac = gamma.mul_by_cofactor();
+    let mut hasher = sha2::Sha512::new();
+    hasher.update([0x04, 0x03]);
+    hasher.update(gamma_cofac.compress().to_bytes());
+    hasher.update([0x00u8]);
+    let mut output = [0u8; 64];
+    output.copy_from_slice(&hasher.finalize());
+    Ok(output)
+}
+
+/// Generate a VRF proof (v13 batch-compatible) for the given seed using a secret key.
+///
+/// Returns the 128-byte proof and 64-byte output.
+pub fn generate_vrf_proof_v13(
+    secret_key: &[u8; 32],
+    seed: &[u8],
+) -> Result<([u8; 128], [u8; 64]), VrfError> {
+    use curve25519_dalek_fork::scalar::Scalar;
+    use sha2::Digest as _;
+
+    let sk = SecretKey03::from_bytes(secret_key);
+    let (secret_scalar, secret_extension) = sk.extend();
+
+    // Derive pk from the scalar (same key derivation as v03)
+    let pk_point = secret_scalar * ED25519_BASEPOINT_POINT;
+    let pk_bytes = pk_point.compress().to_bytes();
+
+    // hash_to_curve: RFC 9380 expand_message_xmd + Elligator2 (v13 algorithm)
+    let h = hash_to_curve_v13(&pk_bytes, seed);
+    let compressed_h = h.compress();
+
+    let gamma = secret_scalar * h;
+
+    // nonce: Sha512(secret_extension || H) → wide scalar
+    let k = {
+        let mut nonce_input = [0u8; 64];
+        nonce_input[..32].copy_from_slice(&secret_extension);
+        nonce_input[32..].copy_from_slice(&compressed_h.to_bytes());
+        let hash: [u8; 64] = sha2::Sha512::digest(nonce_input).into();
+        Scalar::from_bytes_mod_order_wide(&hash)
+    };
+
+    let u_point = k * ED25519_BASEPOINT_POINT;
+    let v_point = k * h;
+
+    // batch-compat challenge: SHA-512(0x04||0x02||Y||H||gamma||U||V||0x00)[..16]
+    // Y comes before H; no base point B; trailing 0x00 per RFC 9381 §5.4.3
+    let challenge = {
+        let mut hasher = sha2::Sha512::new();
+        hasher.update([0x04, 0x02]);
+        hasher.update(pk_bytes); // Y = public key
+        hasher.update(compressed_h.to_bytes());
+        hasher.update(gamma.compress().to_bytes());
+        hasher.update(u_point.compress().to_bytes());
+        hasher.update(v_point.compress().to_bytes());
+        hasher.update([0x00]);
+        let digest = hasher.finalize();
+        let mut scalar_bytes = [0u8; 32];
+        scalar_bytes[..16].copy_from_slice(&digest[..16]);
+        Scalar::from_bits(scalar_bytes)
+    };
+
+    let response = k + challenge * secret_scalar;
+
+    // proof = [gamma(32) || U(32) || V(32) || response(32)]
+    let mut proof_bytes = [0u8; 128];
+    proof_bytes[..32].copy_from_slice(gamma.compress().as_bytes());
+    proof_bytes[32..64].copy_from_slice(u_point.compress().as_bytes());
+    proof_bytes[64..96].copy_from_slice(v_point.compress().as_bytes());
+    proof_bytes[96..].copy_from_slice(response.as_bytes());
+
+    // proof_to_hash: Sha512(0x04 || 0x03 || gamma_cofac || 0x00)
+    let gamma_cofac = gamma.mul_by_cofactor();
+    let mut hasher = sha2::Sha512::new();
+    hasher.update([0x04, 0x03]);
+    hasher.update(gamma_cofac.compress().to_bytes());
+    hasher.update([0x00u8]);
+    let mut output = [0u8; 64];
+    output.copy_from_slice(&hasher.finalize());
+
+    Ok((proof_bytes, output))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

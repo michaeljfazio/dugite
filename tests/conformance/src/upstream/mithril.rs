@@ -86,8 +86,11 @@ fn validate_list(val: &serde_json::Value, label: &str, path: &Path) {
         assert!(
             obj.contains_key("hash")
                 || obj.contains_key("certificate_hash")
-                || obj.contains_key("digest"),
-            "Mithril {label}[{i}] missing identifier field (hash / certificate_hash / digest)"
+                || obj.contains_key("digest")
+                || obj.contains_key("block_hash")
+                || obj.contains_key("transaction_hash"),
+            "Mithril {label}[{i}] missing identifier field \
+             (hash / certificate_hash / digest / block_hash / transaction_hash)"
         );
 
         // Level 2: common schema fields (warn if absent — fake aggregator fixtures
