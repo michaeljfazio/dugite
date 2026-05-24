@@ -517,9 +517,10 @@ pub fn capture(
             // Using the per-pool map rather than `pool_params.len() × pool_deposit`
             // ensures correctness when pool_deposit changed via PPUP after some pools
             // were registered.
-            deposits_stake: state.certs.total_stake_key_deposits.saturating_add(
-                state.certs.pool_deposits.values().sum::<u64>(),
-            ),
+            deposits_stake: state
+                .certs
+                .total_stake_key_deposits
+                .saturating_add(state.certs.pool_deposits.values().sum::<u64>()),
             deposits_drep: drep_deposit_total,
             deposits_proposal: proposal_deposit_total,
         },
