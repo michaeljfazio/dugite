@@ -1,64 +1,113 @@
-//! Upstream conformance tests for cardano-node genesis spec files.
+//! Upstream conformance tests for cardano-node fixture files.
 //!
-//! Verifies that Alonzo and Conway genesis JSON files parse correctly.
+//! Walks **every** file under `fixtures/cardano-node/**`. Each file in the
+//! current corpus pin is JSON (genesis specs, bench profiles, golden query
+//! outputs from cardano-testnet). We verify each one parses as a JSON value.
 
 use std::path::Path;
 
 use super::fixtures;
 
-fn check_genesis_json(dir: &Path, name: &str) {
-    let files: Vec<_> = fixtures::all_files(dir)
-        .into_iter()
-        .filter(|p| {
-            p.file_name()
-                .and_then(|n| n.to_str())
-                .map(|n| n == name || n.ends_with(&format!("-{name}")))
-                .unwrap_or(false)
-        })
-        .collect();
-
-    if files.is_empty() {
-        // Genesis files might be nested under mainnet/preview/preprod — also
-        // do a substring match on the path.
-        let fallback: Vec<_> = fixtures::all_files(dir)
-            .into_iter()
-            .filter(|p| {
-                p.to_str()
-                    .map(|s| s.contains(name.trim_end_matches(".json")))
-                    .unwrap_or(false)
-            })
-            .collect();
-        if fallback.is_empty() {
-            eprintln!("[cardano-node] {name} not found (may be OK for this upstream pin)");
-            return;
-        }
-        for f in &fallback {
-            let text = std::fs::read_to_string(f).expect("read genesis");
-            let _: serde_json::Value = serde_json::from_str(&text)
-                .unwrap_or_else(|e| panic!("{}: parse error: {e}", f.display()));
-        }
-        eprintln!(
-            "[cardano-node] {} ({} file(s) via path match)",
-            name,
-            fallback.len()
-        );
-        return;
-    }
-
-    for f in &files {
-        let text = std::fs::read_to_string(f).expect("read genesis");
-        let val: serde_json::Value = serde_json::from_str(&text)
-            .unwrap_or_else(|e| panic!("{}: parse error: {e}", f.display()));
-        let obj = val
-            .as_object()
-            .unwrap_or_else(|| panic!("{}: not an object", f.display()));
-        assert!(!obj.is_empty(), "{}: empty genesis object", f.display());
-    }
-    eprintln!("[cardano-node] {} ({} file(s))", name, files.len());
-}
-
-/// Run all cardano-node genesis spec checks.
+/// Run all cardano-node fixture checks.
+///
+/// The current corpus exposes:
+///   - bench/cardano-profile/data/test/<profile>/node-specs.json
+///   - cardano-testnet/.../golden/node_default_config.json
+///   - cardano-testnet/.../golden/queries/*.json
+///
+/// Every file is JSON; we parse-check each one.
 pub fn run_all_checks(dir: &Path) {
-    check_genesis_json(dir, "alonzo-genesis.json");
-    check_genesis_json(dir, "conway-genesis.json");
+    let files = fixtures::all_files(dir);
+    assert!(
+        !files.is_empty(),
+        "No fixture files found under {}.\nRun: cargo xtask download-upstream-fixtures",
+        dir.display()
+    );
+
+    let mut checked = 0usize;
+    let mut by_category: std::collections::BTreeMap<&'static str, usize> =
+        std::collections::BTreeMap::new();
+    let mut failures: Vec<(std::path::PathBuf, String)> = Vec::new();
+
+    for path in &files {
+        let ext = path
+            .extension()
+            .and_then(|e| e.to_str())
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+
+        if ext != "json" {
+            failures.push((
+                path.clone(),
+                format!("unexpected file type (extension: {ext:?}), expected .json"),
+            ));
+            continue;
+        }
+
+        let text = match std::fs::read_to_string(path) {
+            Ok(t) => t,
+            Err(e) => {
+                failures.push((path.clone(), format!("read error: {e}")));
+                continue;
+            }
+        };
+        let value: serde_json::Value = match serde_json::from_str(&text) {
+            Ok(v) => v,
+            Err(e) => {
+                failures.push((path.clone(), format!("JSON parse error: {e}")));
+                continue;
+            }
+        };
+
+        // Reject empty top-level objects/arrays — every fixture has content.
+        let non_empty = match &value {
+            serde_json::Value::Object(o) => !o.is_empty(),
+            serde_json::Value::Array(a) => !a.is_empty(),
+            serde_json::Value::Null => false,
+            _ => true,
+        };
+        if !non_empty {
+            failures.push((path.clone(), "empty JSON value".to_string()));
+            continue;
+        }
+
+        checked += 1;
+
+        // Categorize by top-level subdir for the summary line.
+        let rel = path.strip_prefix(dir).unwrap_or(path);
+        let category = rel
+            .components()
+            .next()
+            .and_then(|c| c.as_os_str().to_str())
+            .map(|s| match s {
+                "bench" => "bench/cardano-profile",
+                "cardano-testnet" => "cardano-testnet",
+                other => Box::leak(other.to_string().into_boxed_str()) as &'static str,
+            })
+            .unwrap_or("(root)");
+        *by_category.entry(category).or_insert(0) += 1;
+    }
+
+    if !failures.is_empty() {
+        let mut msg = format!(
+            "cardano-node: {} of {} fixtures failed validation:\n",
+            failures.len(),
+            files.len()
+        );
+        for (path, reason) in failures.iter().take(20) {
+            msg.push_str(&format!("  - {}: {}\n", path.display(), reason));
+        }
+        if failures.len() > 20 {
+            msg.push_str(&format!("  ... and {} more\n", failures.len() - 20));
+        }
+        panic!("{msg}");
+    }
+
+    eprintln!(
+        "[cardano-node] Validated {checked}/{} JSON fixtures",
+        files.len()
+    );
+    for (category, count) in &by_category {
+        eprintln!("[cardano-node]   {category}: {count}");
+    }
 }
