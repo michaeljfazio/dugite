@@ -644,10 +644,11 @@ impl VolatileDB {
         // G4: proactively compact the WAL if it has grown past the size cap.
         // This rewrites the WAL to contain only the current in-memory blocks,
         // dropping finalized entries that survived after flush_to_immutable.
+        // Routine maintenance — logged at `debug!` so it doesn't look alarming.
         if let Some(ref wal) = self.wal {
             match std::fs::metadata(&wal.path) {
                 Ok(meta) if meta.len() > WAL_MAX_SIZE_BYTES => {
-                    warn!(
+                    debug!(
                         wal_bytes = meta.len(),
                         cap_bytes = WAL_MAX_SIZE_BYTES,
                         "WAL size cap exceeded — compacting before next append"
