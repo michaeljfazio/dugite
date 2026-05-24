@@ -817,6 +817,7 @@ mod tests {
                     tip_hash: [0xAA; 32],
                     tip_block_number: 200,
                     pending_headers: vec![test_header(50), test_header(150)],
+                    ..Default::default()
                 },
             );
         }
@@ -858,6 +859,7 @@ mod tests {
                     tip_hash: [0xBB; 32],
                     tip_block_number: 100,
                     pending_headers: vec![test_header(50)],
+                    ..Default::default()
                 },
             );
         }
@@ -887,6 +889,7 @@ mod tests {
                     tip_hash: [0xCC; 32],
                     tip_block_number: 200,
                     pending_headers: vec![test_header(150)],
+                    ..Default::default()
                 },
             );
         }
