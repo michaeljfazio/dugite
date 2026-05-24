@@ -1,6 +1,6 @@
 # Installation
 
-Dugite can be installed from pre-built binaries, container images, or built from source.
+Dugite can be installed from pre-built binaries or built from source.
 
 ## Pre-built Binaries
 
@@ -10,8 +10,9 @@ Download the latest release from [GitHub Releases](https://github.com/michaeljfa
 |----------|-------------|----------|
 | Linux | x86_64 | `dugite-x86_64-linux.tar.gz` |
 | Linux | aarch64 | `dugite-aarch64-linux.tar.gz` |
-| macOS | x86_64 (Intel) | `dugite-x86_64-macos.tar.gz` |
 | macOS | Apple Silicon | `dugite-aarch64-macos.tar.gz` |
+
+> **Note:** macOS x86_64 (Intel) binaries are not published — GitHub's macOS runners are aarch64-only. Intel Mac users should [build from source](#building-from-source).
 
 ```bash
 # Example: download and extract for Linux x86_64
@@ -29,26 +30,9 @@ sha256sum -c SHA256SUMS.txt
 
 ## Container Image
 
-Multi-architecture container images (amd64 and arm64) are published to GitHub Container Registry:
+> **Coming soon:** Container images (ghcr.io/michaeljfazio/dugite) are not yet published. Track progress in [issue #507](https://github.com/michaeljfazio/dugite/issues/507). For now, use [pre-built binaries](#pre-built-binaries) or [build from source](#building-from-source).
 
-```bash
-docker pull ghcr.io/michaeljfazio/dugite:latest
-```
-
-The image uses a [distroless](https://github.com/GoogleContainerTools/distroless) base (`gcr.io/distroless/cc-debian12:nonroot`) for minimal attack surface — no shell, no package manager, runs as nonroot (UID 65532).
-
-Run the node:
-
-```bash
-docker run -d \
-  --name dugite \
-  -p 3001:3001 \
-  -p 12798:12798 \
-  -v dugite-data:/opt/dugite/db \
-  ghcr.io/michaeljfazio/dugite:latest
-```
-
-See [Kubernetes Deployment](./running/kubernetes.md) for production container deployments.
+See [Kubernetes Deployment](./running/kubernetes.md) for production container deployments once images are available.
 
 ## Building from Source
 

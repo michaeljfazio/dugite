@@ -25,7 +25,7 @@ The Cardano ecosystem benefits from client diversity. Running multiple independe
 - **Multi-era support** — Byron, Shelley, Allegra, Mary, Alonzo, Babbage, and Conway eras.
 - **Conway governance (CIP-1694)** — DRep registration, voting, proposals, constitutional committee, treasury withdrawals.
 - **Pipelined multi-peer sync** — Header collection from a primary peer with parallel block fetching from multiple peers.
-- **Plutus script execution** — Plutus V1/V2/V3 evaluation via the uplc CEK machine.
+- **Plutus script execution** — Plutus V1/V2/V3 evaluation via the in-house `dugite-uplc` CEK machine (fully conformant, all test vectors pass).
 - **Node-to-Node (N2N) protocol** — Full Ouroboros mini-protocol suite: ChainSync, BlockFetch, TxSubmission2, KeepAlive, PeerSharing.
 - **Node-to-Client (N2C) protocol** — Unix domain socket server with LocalChainSync, LocalStateQuery, LocalTxSubmission, and LocalTxMonitor.
 - **cardano-cli compatible CLI** — Key generation, transaction building, signing, submission, queries, and governance commands.
