@@ -314,7 +314,7 @@ The governor maintains six independent target counts (matching cardano-node defa
 | Target | Default | Description |
 |--------|---------|-------------|
 | `TargetNumberOfKnownPeers` | 85 | Total peers in the peer table (cold + warm + hot) |
-| `TargetNumberOfEstablishedPeers` | 40 | Warm + hot peers (TCP connected) |
+| `TargetNumberOfEstablishedPeers` | 30 | Warm + hot peers (TCP connected) |
 | `TargetNumberOfActivePeers` | 15 | Hot peers (fully syncing) |
 | `TargetNumberOfKnownBigLedgerPeers` | 15 | Known big ledger peers |
 | `TargetNumberOfEstablishedBigLedgerPeers` | 10 | Established big ledger peers |

@@ -43,7 +43,7 @@ The policy layer. Runs on a 30-second `tokio::interval` in `dugite-node`.
 | Established (warm+hot) target enforcement | Maintains established peer count |
 | Surplus reduction | Demote/disconnect lowest reputation, local-root protected |
 | Churn mechanism | 20% target reduction cycle at configurable intervals |
-| Default targets | active=15, established=40, known=85 (matching cardano-node) |
+| Default targets | active=15, established=30, known=85 (matching cardano-node) |
 
 ---
 
@@ -85,7 +85,7 @@ The governor maintains six independent target counts:
 | Target | Default |
 |---|---|
 | Known peers | 85 |
-| Established peers | 40 |
+| Established peers | 30 |
 | Active peers | 15 |
 | Known big-ledger peers | 15 |
 | Established big-ledger peers | 10 |

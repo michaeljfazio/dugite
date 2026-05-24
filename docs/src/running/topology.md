@@ -186,6 +186,14 @@ A relay node that maintains a connection to your block producer:
 }
 ```
 
+## DNS SRV Resolution
+
+When a hostname is specified in any `accessPoints` entry, Dugite queries DNS for SRV records at `_cardano._tcp.<host>` before falling back to A/AAAA lookup — matching the behaviour of the Haskell cardano-node. SRV records carry port, priority, and weight fields (RFC 2782); Dugite honours priority ordering and performs a weighted shuffle within equal-priority groups.
+
+If no SRV records exist (NXDOMAIN or empty answer), Dugite falls back to a direct A/AAAA lookup using the port specified in the topology entry.
+
+IPv4 and IPv6 addresses are both accepted; Dugite resolves A and AAAA records concurrently.
+
 ## SIGHUP Topology Reload
 
 Dugite supports live topology reloading. Send a `SIGHUP` signal to the running node process, and it will re-read the topology file and update the peer manager with the new configuration:
