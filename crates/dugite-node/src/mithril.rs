@@ -2764,6 +2764,10 @@ mod tests {
     use super::*;
     use ed25519_dalek::Signer;
 
+    // Env vars are process-global and `cargo test` runs tests in threads.
+    // Serialise all tests that call `set_var` / `remove_var` through this lock.
+    static MITHRIL_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     #[test]
     fn test_aggregator_url_mainnet() {
         assert_eq!(
@@ -4097,11 +4101,14 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let dest = dir.path().join("snapshot.tar.zst");
 
+        // Serialise env-var writes: cargo test runs tests in threads.
+        let _env_lock = MITHRIL_ENV_LOCK.lock().unwrap();
         // Force parallelism = 4 for a deterministic test.
         std::env::set_var("DUGITE_MITHRIL_DOWNLOAD_PARALLELISM", "4");
         let result =
             download_snapshot(&client, &format!("http://{addr}/snap"), &dest, SIZE as u64).await;
         std::env::remove_var("DUGITE_MITHRIL_DOWNLOAD_PARALLELISM");
+        drop(_env_lock);
         result.expect("parallel download should succeed");
 
         // Verify the assembled file.
@@ -4425,12 +4432,14 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let dest = dir.path().join("snapshot.tar.zst");
 
+        let _env_lock = MITHRIL_ENV_LOCK.lock().unwrap();
         // Force parallelism = 4 for a deterministic test.
         std::env::set_var("DUGITE_MITHRIL_DOWNLOAD_PARALLELISM", "4");
         std::env::remove_var("DUGITE_MITHRIL_FORCE_SEQUENTIAL");
         let result =
             download_snapshot(&client, &format!("http://{addr}/snap"), &dest, SIZE as u64).await;
         std::env::remove_var("DUGITE_MITHRIL_DOWNLOAD_PARALLELISM");
+        drop(_env_lock);
         result.expect("range-probe parallel download should succeed");
 
         // Output must match the source byte-for-byte.
@@ -4513,10 +4522,12 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let dest = dir.path().join("snapshot.tar.zst");
 
+        let _env_lock = MITHRIL_ENV_LOCK.lock().unwrap();
         std::env::set_var("DUGITE_MITHRIL_FORCE_SEQUENTIAL", "1");
         let result =
             download_snapshot(&client, &format!("http://{addr}/snap"), &dest, SIZE as u64).await;
         std::env::remove_var("DUGITE_MITHRIL_FORCE_SEQUENTIAL");
+        drop(_env_lock);
         result.expect("force-sequential download should succeed");
 
         let got = std::fs::read(&dest).unwrap();
