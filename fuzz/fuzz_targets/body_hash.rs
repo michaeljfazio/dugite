@@ -75,6 +75,7 @@ fuzz_target!(|data: &[u8]| {
         },
         protocol_version: ProtocolVersion { major: 9, minor: 0 },
         kes_signature: vec![0u8; 448],
+        prev_nonce: None,
     };
 
     // validate_block_body_hash must never panic.

@@ -99,6 +99,10 @@ fn build_tx(data: &[u8], seed: u8) -> Transaction {
             proposal_procedures: vec![],
             treasury_value: None,
             donation: None,
+            sub_transactions: vec![],
+            account_balance_intervals: vec![],
+            direct_deposits: std::collections::BTreeMap::new(),
+            guards: vec![],
         },
         witness_set: TransactionWitnessSet {
             vkey_witnesses: vec![],
@@ -188,6 +192,7 @@ fuzz_target!(|data: &[u8]| {
             kes_signature: vec![0u8; 448],
             nonce_vrf_output: vec![],
             nonce_vrf_proof: vec![],
+            prev_nonce: None,
         },
         transactions,
         era: Era::Conway,
