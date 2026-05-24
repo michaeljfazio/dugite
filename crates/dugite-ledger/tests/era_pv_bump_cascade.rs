@@ -1,30 +1,24 @@
-//! Integration test: era-boundary protocol-version bumps (issue #615, #626).
+//! Integration test: era-boundary protocol-version (PV) non-mutation (issues #615, #626, #630).
 //!
-//! In cardano-node the Hard Fork Combinator (HFC) era-crossing tick reacts to
-//! the `protocolVersion` field of `curPParams`. For Byron→Shelley→…→Alonzo,
-//! the HFC is configured to fire at specific epochs and writes the era's
-//! initial PV. For Alonzo→Babbage and Babbage→Conway, the PV bump is driven
-//! by an on-chain ParameterChange (pre-Conway: PPUP; Conway+: gov action),
-//! and the HFC reacts to the bumped PV.
+//! Haskell's HFC carry-forward semantics: `upgradeShelleyPParams`,
+//! `upgradeAllegraPParams`, `upgradeMaryPParams`, `upgradeAlonzoPParams`,
+//! `upgradeBabbagePParams` all carry `protocolVersion` forward verbatim via
+//! `coerce` (zero-cost type coercion). PV advances are driven exclusively by:
 //!
-//! Dugite mirrors this exactly:
-//!  - Byron→Alonzo `on_era_transition` writes initial PV (1/2/3/4/5).
-//!  - Babbage/Conway `on_era_transition` is a no-op — PPUP / HardForkInit
-//!    drives the PV bump via `process_epoch_transition`'s PPUP path. Bumping
-//!    in `on_era_transition` would race ahead of `prevPParams` capture and
-//!    break `hardforkBabbageForgoRewardPrefilter` (issue #626).
+//! - **Byron→Shelley**: PV from `shelley-genesis.json::protocolParams::protocolVersion`.
+//! - **Shelley/Allegra/Mary/Alonzo intra-era**: PPUP (pre-Conway protocol-update
+//!   proposals), decoded via tx body key 6 (fixed in #624).
+//! - **Alonzo→Babbage / Babbage→Conway**: PPUP / HardForkInitiation gov action.
 //!
-//! | Era      | First-block PV (after this transition) |
-//! |----------|----------------------------------------|
-//! | Byron    | 1 (`mainnet_defaults` seeds at 1) |
-//! | Shelley  | 2                                |
-//! | Allegra  | 3                                |
-//! | Mary     | 4                                |
-//! | Alonzo   | 5                                |
-//! | Babbage  | unchanged (PPUP drives the 6→7) |
-//! | Conway   | unchanged (HardForkInit drives 8→9) |
+//! `on_era_transition` for ALL eras is a NO-OP with respect to PV. Bumping
+//! there would race ahead of `prevPParams` capture and break
+//! `hardforkBabbageForgoRewardPrefilter` (root cause of #626).
 //!
-//! Reference: cardano-ledger wiki, "First Block of Each Era".
+//! This synthetic test exercises the full Byron→Conway cascade with no PPUP
+//! applied, so PV stays constant at whatever the genesis seeded. In production,
+//! PPUP proposals fired in each era drive the expected bumps.
+//!
+//! Reference: cardano-ledger Haskell source — `upgradeShelleyPParams` et al.
 
 use dugite_ledger::state::{BlockValidationMode, LedgerState};
 use dugite_primitives::address::{Address, ByronAddress, EnterpriseAddress};
@@ -180,55 +174,44 @@ fn apply_era_block(state: &mut LedgerState, era: Era, slot: u64, block_no: u64, 
 // Test
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Drive a synthetic from-genesis sequence Byron→Shelley→Allegra→Mary→Alonzo
-/// →Babbage→Conway and assert that `protocol_version_major` matches the
-/// canonical first-block-of-each-era PV at every boundary. Pre-#615 this
-/// regression test fails at the Shelley/Allegra/Mary/Alonzo/Babbage steps
-/// because dugite never bumped the PV outside Conway.
+/// Drive a synthetic Byron→Shelley→Allegra→Mary→Alonzo→Babbage→Conway sequence
+/// and assert that `on_era_transition` NEVER mutates `curPParams.protocol_version`.
+/// With no PPUP applied, PV stays constant at the genesis seed throughout.
+///
+/// Regression for issues #615, #626, #630.
 #[test]
-fn era_boundary_pv_cascade_matches_haskell() {
-    // Seed the ledger as if we are at Byron PV1.0. (`mainnet_defaults` ships
-    // a Conway-shaped ProtocolParameters with PV9 since it is what live nodes
-    // start from; for a from-genesis cascade we explicitly reset to PV1.0.)
+fn era_boundary_pv_cascade_not_mutated_by_on_era_transition() {
+    // Seed with PV=2 (matching what shelley-genesis.json ships on mainnet).
+    // All era transitions in this test must be no-ops for PV.
     let mut params = ProtocolParameters::mainnet_defaults();
-    params.protocol_version_major = 1;
+    params.protocol_version_major = 2;
     params.protocol_version_minor = 0;
     let mut state = LedgerState::new(params);
     state.tip.block_number = BlockNo(0);
     assert_eq!(
-        state.epochs.protocol_params.protocol_version_major, 1,
-        "Test prelude must seed PV1 (sanity)",
+        state.epochs.protocol_params.protocol_version_major, 2,
+        "Test prelude must seed PV2 (sanity)",
     );
 
-    // (era, slot, block_no, header_pv_major, expected_post_apply_pv_major)
-    //
-    // Slots are arbitrary but monotonically increasing so the apply loop's
-    // ordering checks succeed. We don't care about real epoch lengths — we're
-    // only exercising the era-boundary HFC PV bump.
+    // (era, slot, block_no, header_pv_major)
+    // expected_pv is always 2 — on_era_transition is a no-op for PV in all eras.
     let steps = [
-        (Era::Byron, 100, 1, 1, 1u64),
-        (Era::Shelley, 200, 2, 2, 2),
-        (Era::Allegra, 300, 3, 3, 3),
-        (Era::Mary, 400, 4, 4, 4),
-        (Era::Alonzo, 500, 5, 5, 5),
-        // Babbage/Conway on_era_transition is a no-op for PV — bumps come
-        // via PPUP / HardForkInitiation (issue #626). With no PPUP applied
-        // in this synthetic test, curPParams.pv stays at 5 (Alonzo's).
-        (Era::Babbage, 600, 6, 5, 5),
-        (Era::Conway, 700, 7, 5, 5),
+        (Era::Byron, 100, 1, 2),
+        (Era::Shelley, 200, 2, 2),
+        (Era::Allegra, 300, 3, 2),
+        (Era::Mary, 400, 4, 2),
+        (Era::Alonzo, 500, 5, 2),
+        (Era::Babbage, 600, 6, 2),
+        (Era::Conway, 700, 7, 2),
     ];
 
-    for (era, slot, block_no, header_pv, expected_pv) in steps {
+    for (era, slot, block_no, header_pv) in steps {
         apply_era_block(&mut state, era, slot, block_no, header_pv);
         assert_eq!(
-            state.epochs.protocol_params.protocol_version_major, expected_pv,
-            "After entering {:?} (block {}, slot {}), curPParams.protocol_version_major \
-             must be {} — mirrors cardano-node HFC era-crossing tick (issue #615)",
-            era, block_no, slot, expected_pv,
-        );
-        assert_eq!(
-            state.epochs.protocol_params.protocol_version_minor, 0,
-            "Initial minor PV at each era boundary is always 0 (issue #615)",
+            state.epochs.protocol_params.protocol_version_major, 2,
+            "After entering {:?} (block {}, slot {}): on_era_transition must NOT \
+             mutate curPParams.pv — PPUP drives all bumps (issues #626/#630)",
+            era, block_no, slot,
         );
         assert_eq!(state.era, era, "LedgerState.era must track block.era");
     }
