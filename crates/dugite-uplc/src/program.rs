@@ -171,4 +171,28 @@ mod tests {
         let back = Program::from_flat(&p.to_flat().unwrap()).unwrap();
         assert_eq!(back.version, (3, 4, 5));
     }
+
+    /// Canonical IOG always-true V1 validator (vendored by every cardano-node
+    /// integration test fixture). cborHex `4e4d01000033222220051200120011`
+    /// decomposes as: outer CBOR byte string of 14 bytes → inner CBOR byte
+    /// string of 13 bytes → flat-encoded UPLC program of 13 bytes.
+    /// Regression: dugite v1.7.0 inverted the filler convention and rejected
+    /// this with `filler must start with a 1 bit`.
+    #[test]
+    fn decodes_canonical_v1_always_true() {
+        let flat = [
+            0x01, 0x00, 0x00, 0x33, 0x22, 0x22, 0x20, 0x05, 0x12, 0x00, 0x12, 0x00, 0x11,
+        ];
+        let p = Program::from_flat(&flat).expect("canonical V1 always-true must decode");
+        assert_eq!(p.version, (1, 0, 0));
+    }
+
+    /// Canonical IOG always-true V2 validator. cborHex `49480100002221200101`
+    /// → outer 9-byte → inner 8-byte flat.
+    #[test]
+    fn decodes_canonical_v2_always_true() {
+        let flat = [0x01, 0x00, 0x00, 0x22, 0x21, 0x20, 0x01, 0x01];
+        let p = Program::from_flat(&flat).expect("canonical V2 always-true must decode");
+        assert_eq!(p.version, (1, 0, 0));
+    }
 }

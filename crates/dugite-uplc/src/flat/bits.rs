@@ -90,42 +90,24 @@ impl<'b> BitReader<'b> {
         Ok(out)
     }
 
-    /// Skip filler bits to the next byte boundary. The filler must
-    /// have the form `1 0*` — a single set bit followed by zero or
-    /// more zero bits up to the boundary. This is how the flat
-    /// encoder marks the end of bit-packed regions before a
-    /// byte-aligned payload (e.g. byte string chunks).
+    /// Consume the filler bits that pad the current byte. The filler
+    /// has the form `0* 1` — zero or more zero bits followed by a
+    /// terminating `1`. This matches Haskell `Flat`'s `dFiller`
+    /// (`while bit==0 { … }`) and Aiken's `flat-rs::filler`.
+    ///
+    /// Cap of 8 bits: a canonical writer pads with at most 7 zeros
+    /// before the terminating `1`. Reading more than 8 bits means the
+    /// input is malformed or the call site is wrong — bail rather
+    /// than looping into the next field.
     pub fn read_filler(&mut self) -> FlatResult<()> {
-        // Always at least one filler bit (the leading '1').
-        let mut saw_one = false;
-        loop {
-            let in_byte = self.bit_pos % 8;
-            if in_byte == 0 && saw_one {
-                // We've already consumed the '1' and any trailing
-                // '0's; we're now byte-aligned at the next boundary.
+        for _ in 0..8 {
+            if self.read_bit()? {
                 return Ok(());
             }
-            let bit = self.read_bit()?;
-            match (saw_one, bit) {
-                (false, true) => saw_one = true,
-                (false, false) => {
-                    return Err(UplcError::FlatDecode(
-                        "filler must start with a 1 bit".into(),
-                    ));
-                }
-                (true, false) => {
-                    // Trailing zero — keep consuming until byte aligned.
-                    if self.bit_pos.is_multiple_of(8) {
-                        return Ok(());
-                    }
-                }
-                (true, true) => {
-                    return Err(UplcError::FlatDecode(
-                        "filler may contain only one 1 bit".into(),
-                    ));
-                }
-            }
         }
+        Err(UplcError::FlatDecode(
+            "filler missing terminating 1 bit within 8 bits".into(),
+        ))
     }
 
     /// Read a flat-encoded `Natural` (unsigned arbitrary-precision
@@ -237,13 +219,20 @@ impl BitWriter {
         Ok(())
     }
 
-    /// Pad to the next byte boundary with the canonical `1 0*`
-    /// filler.
+    /// Pad to the next byte boundary with the canonical `0* 1`
+    /// filler — zeros fill the high bits of the current byte and the
+    /// LSB is set to `1`. Matches Haskell `Flat`'s `eFiller` and
+    /// Aiken's `flat-rs::filler` (`current_byte |= 1; next_word()`).
+    ///
+    /// If the writer is already byte-aligned a full byte `0000_0001`
+    /// is emitted; otherwise the remaining `8 - (bit_pos % 8)` bits
+    /// of the current byte become `0…01`.
     pub fn write_filler(&mut self) {
-        self.write_bit(true);
-        while !self.bit_pos.is_multiple_of(8) {
+        let remaining = 8 - (self.bit_pos % 8);
+        for _ in 0..(remaining - 1) {
             self.write_bit(false);
         }
+        self.write_bit(true);
     }
 
     /// Append a `Natural` as 7-bit chunks with continuation flags.
@@ -399,20 +388,62 @@ mod tests {
     }
 
     #[test]
-    fn filler_accepts_minimal() {
+    fn filler_accepts_minimal_aligned() {
+        // Byte-aligned start → write_filler emits one byte 0000_0001.
         let mut w = BitWriter::new();
         w.write_filler();
-        let bytes = w.bytes;
-        let mut r = BitReader::new(&bytes);
+        assert_eq!(w.bytes, vec![0b0000_0001]);
+        let mut r = BitReader::new(&w.bytes);
         r.read_filler().unwrap();
-        assert_eq!(r.bit_pos % 8, 0);
+        assert!(r.bit_pos.is_multiple_of(8));
     }
 
     #[test]
-    fn filler_rejects_no_leading_one() {
-        // A byte of all zeros — no leading 1 bit.
+    fn filler_accepts_partial_byte() {
+        // Write 3 body bits then filler. Expect `bbb0_0001`.
+        let mut w = BitWriter::new();
+        w.write_bit(true);
+        w.write_bit(false);
+        w.write_bit(true);
+        w.write_filler();
+        assert_eq!(w.bytes, vec![0b1010_0001]);
+        let mut r = BitReader::new(&w.bytes);
+        assert!(r.read_bit().unwrap());
+        assert!(!r.read_bit().unwrap());
+        assert!(r.read_bit().unwrap());
+        r.read_filler().unwrap();
+        assert!(r.bit_pos.is_multiple_of(8));
+    }
+
+    #[test]
+    fn filler_rejects_all_zero_byte() {
+        // A byte of all zeros — the terminating 1 never appears within
+        // the current byte (the spec guarantees it lives in the LSB).
         let bytes = vec![0u8];
         let mut r = BitReader::new(&bytes);
-        assert!(r.read_filler().is_err());
+        let err = r.read_filler().unwrap_err();
+        assert!(matches!(err, UplcError::FlatDecode(_)), "got {err:?}");
+    }
+
+    #[test]
+    fn filler_roundtrip_every_used_bits() {
+        // For each starting bit alignment 0..=7, write some body bits,
+        // call write_filler, then verify read_filler lands byte-aligned.
+        for used in 0u8..8 {
+            let mut w = BitWriter::new();
+            for _ in 0..used {
+                w.write_bit(false);
+            }
+            w.write_filler();
+            // The emitted byte sequence must be byte-aligned.
+            assert_eq!(w.bit_pos % 8, 0, "writer not byte-aligned (used={used})");
+            assert_eq!(w.bytes.len(), 1, "filler must occupy exactly one byte");
+            let mut r = BitReader::new(&w.bytes);
+            for _ in 0..used {
+                assert!(!r.read_bit().unwrap());
+            }
+            r.read_filler().unwrap();
+            assert!(r.bit_pos.is_multiple_of(8));
+        }
     }
 }
