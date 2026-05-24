@@ -410,6 +410,7 @@ mod tests {
             randomness_stabilisation_window: 129600,
             tx_index: 0,
             conway_genesis: None,
+            max_lovelace_supply: crate::state::MAX_LOVELACE_SUPPLY,
         }
     }
 

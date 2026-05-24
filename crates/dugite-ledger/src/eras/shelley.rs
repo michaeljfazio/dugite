@@ -256,6 +256,7 @@ impl EraRules for ShelleyRules {
                 &certs.reward_accounts,
                 ctx.epoch_length,
                 ctx.shelley_transition_epoch,
+                ctx.max_lovelace_supply,
             );
 
             // Issue #438/#471: per-boundary reward-debug dump.  No-op
@@ -948,6 +949,7 @@ mod tests {
             randomness_stabilisation_window: 129600,
             tx_index: 0,
             conway_genesis: None,
+            max_lovelace_supply: crate::state::MAX_LOVELACE_SUPPLY,
         }
     }
 

@@ -141,6 +141,12 @@ pub struct LedgerState {
     /// Conway genesis initialization data (needed by era-transition rules).
     /// Populated from conway-genesis.json at node startup; not persisted in snapshots.
     pub conway_genesis_init: Option<crate::eras::ConwayGenesisInit>,
+    /// Maximum total lovelace supply for the network (Haskell `Globals.maxLovelaceSupply`,
+    /// from `ShelleyGenesis.sgMaxLovelaceSupply`). Mainnet/preview/preprod all use
+    /// 45_000_000_000_000_000; custom devnets may differ. Used to (a) initialize
+    /// reserves at genesis and (b) derive `total_stake = max_lovelace_supply − reserves`
+    /// in the reward calculation.
+    pub max_lovelace_supply: u64,
 }
 
 /// Pending reward update matching Haskell's RUPD structure.
@@ -663,7 +669,19 @@ impl LedgerState {
             stability_window_3kf: 129600,            // 3k/f on mainnet: ceil(3*2160/0.05)
             security_param: 2160,
             conway_genesis_init: None,
+            max_lovelace_supply: MAX_LOVELACE_SUPPLY,
         }
+    }
+
+    /// Override the maximum lovelace supply (genesis `sgMaxLovelaceSupply`).
+    ///
+    /// Resets reserves to `max` so a subsequent `seed_genesis_utxos()` can
+    /// safely deduct the initial-fund distribution. MUST be called before
+    /// any UTxO seeding when the network uses a non-mainnet cap (devnets).
+    /// No-op semantics for mainnet/preview/preprod (all use 45B).
+    pub fn set_max_lovelace_supply(&mut self, max: u64) {
+        self.max_lovelace_supply = max;
+        self.epochs.reserves = Lovelace(max);
     }
 
     /// Create a `LedgerState` from a decoded Haskell `ExtLedgerState` snapshot.
@@ -998,6 +1016,7 @@ impl LedgerState {
             stability_window_3kf: 0,
             security_param: 0,         // Will be set by set_epoch_length()
             conway_genesis_init: None, // Will be set by caller
+            max_lovelace_supply: MAX_LOVELACE_SUPPLY,
         }
     }
 
@@ -1044,6 +1063,7 @@ impl LedgerState {
             stability_window_3kf: self.stability_window_3kf,
             security_param: self.security_param,
             conway_genesis_init: self.conway_genesis_init.clone(),
+            max_lovelace_supply: self.max_lovelace_supply,
         }
     }
 

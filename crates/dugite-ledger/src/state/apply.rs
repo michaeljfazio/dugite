@@ -72,6 +72,7 @@ impl LedgerState {
             randomness_stabilisation_window: self.randomness_stabilisation_window,
             tx_index,
             conway_genesis: self.conway_genesis_init.as_ref(),
+            max_lovelace_supply: self.max_lovelace_supply,
         }
     }
 
@@ -180,6 +181,7 @@ impl LedgerState {
                 randomness_stabilisation_window: self.randomness_stabilisation_window,
                 tx_index: 0,
                 conway_genesis: self.conway_genesis_init.as_ref(),
+                max_lovelace_supply: self.max_lovelace_supply,
             };
             transition_rules.on_era_transition(
                 self.era,
@@ -226,6 +228,7 @@ impl LedgerState {
                     stability_window_3kf: self.stability_window_3kf,
                     randomness_stabilisation_window: self.randomness_stabilisation_window,
                     conway_genesis: self.conway_genesis_init.as_ref(),
+                    max_lovelace_supply: self.max_lovelace_supply,
                     tx_index: 0,
                 };
                 // #615f: per-epoch-boundary full-state dump fires BEFORE
@@ -259,6 +262,7 @@ impl LedgerState {
                         &self.certs.reward_accounts,
                         self.epoch_length,
                         self.shelley_transition_epoch,
+                        self.max_lovelace_supply,
                     );
                     crate::state::epoch_state_debug::maybe_dump(
                         self,
@@ -432,6 +436,7 @@ impl LedgerState {
                 randomness_stabilisation_window: self.randomness_stabilisation_window,
                 tx_index: 0,
                 conway_genesis: self.conway_genesis_init.as_ref(),
+                max_lovelace_supply: self.max_lovelace_supply,
             };
             rules.validate_block_body(block, &body_ctx, &self.utxo)?;
         }
@@ -703,6 +708,7 @@ impl LedgerState {
                 randomness_stabilisation_window: self.randomness_stabilisation_window,
                 tx_index: tx_idx as u64,
                 conway_genesis: self.conway_genesis_init.as_ref(),
+                max_lovelace_supply: self.max_lovelace_supply,
             };
 
             if !tx.is_valid {
@@ -792,6 +798,7 @@ impl LedgerState {
                 randomness_stabilisation_window: self.randomness_stabilisation_window,
                 tx_index: 0,
                 conway_genesis: self.conway_genesis_init.as_ref(),
+                max_lovelace_supply: self.max_lovelace_supply,
             };
             rules.evolve_nonce(&block.header, &nonce_ctx, &mut self.consensus);
         }
