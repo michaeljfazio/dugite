@@ -440,6 +440,46 @@ fn has_only_readme(dir: &Path) -> bool {
             .unwrap_or(false)
 }
 
+/// Validate one cardano-base VRF vector file (parses + dispatches to
+/// `validate_v03_vector` or `validate_v13_vector` by version field /
+/// proof length).  Files that don't parse as a VRF vector are
+/// accepted as a "skip" (so e.g. README.txt next to vectors doesn't
+/// fail).  Exposed for `build.rs`-generated per-vector tests.
+///
+/// Returns `Ok(())` on success or skip.  On validation panic, captures
+/// the panic and returns it as `Err(String)`.
+pub fn check_one_file(path: &Path) -> Result<(), String> {
+    let label = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("(unknown)")
+        .to_string();
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let text = match std::fs::read_to_string(path) {
+            Ok(t) => t,
+            Err(e) => panic!("read {}: {e}", path.display()),
+        };
+        let Some(vec) = parse_vrf_vector_file(&text, path) else {
+            // Not a VRF vector file (e.g. README.txt) — accept.
+            return;
+        };
+        if vec.ver.contains("13") || vec.pi.len() == 128 {
+            validate_v13_vector(&vec, &label);
+        } else {
+            validate_v03_vector(&vec, &label);
+        }
+    }));
+    result.map_err(|panic_payload| {
+        if let Some(s) = panic_payload.downcast_ref::<&'static str>() {
+            (*s).to_string()
+        } else if let Some(s) = panic_payload.downcast_ref::<String>() {
+            s.clone()
+        } else {
+            "panic (no message)".to_string()
+        }
+    })
+}
+
 pub fn run_all_checks(dir: &Path) {
     // KES property check runs unconditionally — it exercises the KES API with
     // deterministic inputs, mirroring cardano-base's property-based KES tests.

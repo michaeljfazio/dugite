@@ -154,6 +154,29 @@ fn is_tag24_wrapped(path: &Path) -> bool {
     name.starts_with("Block_") && parent != "disk"
 }
 
+/// Validate one ouroboros-consensus golden fixture (well-formed CBOR,
+/// with carve-outs for tag-24 wrapping and the known-truncated
+/// Dijkstra `Block_<Era>` goldens).  Exposed so `build.rs`-generated
+/// per-vector tests can call it.
+pub fn check_one_file(path: &Path) -> Result<(), String> {
+    let bytes = std::fs::read(path).map_err(|e| format!("read error: {e}"))?;
+    let to_validate = if is_tag24_wrapped(path) {
+        let inner = unwrap_tag24(&bytes);
+        if inner.len() == bytes.len() && inner == bytes {
+            bytes.clone()
+        } else {
+            inner
+        }
+    } else {
+        bytes.clone()
+    };
+    if is_known_truncated_dijkstra_block(path) {
+        validate_dijkstra_block_relaxed(&to_validate)
+    } else {
+        validate_cbor(&to_validate)
+    }
+}
+
 /// Run all ouroboros-consensus golden decode checks.
 /// Called from the upstream_tests integration test binary.
 pub fn run_all_checks(dir: &Path) {
@@ -170,44 +193,13 @@ pub fn run_all_checks(dir: &Path) {
     let mut failures: Vec<(std::path::PathBuf, String)> = Vec::new();
 
     for path in &files {
-        let bytes = match std::fs::read(path) {
-            Ok(b) => b,
-            Err(e) => {
-                failures.push((path.clone(), format!("read error: {e}")));
-                continue;
-            }
-        };
-
-        let to_validate = if is_tag24_wrapped(path) {
-            let inner = unwrap_tag24(&bytes);
-            // If unwrapping didn't change anything, the file wasn't actually
-            // tag-24-wrapped — fall back to validating as-is.
-            if inner.len() == bytes.len() && inner == bytes {
-                bytes.clone()
-            } else {
-                inner
-            }
-        } else {
-            bytes.clone()
-        };
-
-        // Carve-out: upstream Block_Dijkstra goldens are truncated by 1 element.
-        let validation = if is_known_truncated_dijkstra_block(path) {
-            validate_dijkstra_block_relaxed(&to_validate)
-        } else {
-            validate_cbor(&to_validate)
-        };
-
-        match validation {
+        match check_one_file(path) {
             Ok(()) => {
                 checked += 1;
                 let category = path
                     .file_name()
                     .and_then(|n| n.to_str())
-                    .map(|n| {
-                        // Strip trailing `_<Era>` suffix to group: Block_Conway -> Block
-                        n.split('_').next().unwrap_or(n).to_string()
-                    })
+                    .map(|n| n.split('_').next().unwrap_or(n).to_string())
                     .unwrap_or_else(|| "unknown".to_string());
                 *by_category.entry(category).or_insert(0) += 1;
             }

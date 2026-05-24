@@ -3,6 +3,7 @@ name = "dugite-conformance"
 version.workspace = true
 edition.workspace = true
 description = "Formal ledger specification conformance tests for Dugite"
+build = "build.rs"
 
 [dependencies]
 dugite-primitives = { workspace = true }

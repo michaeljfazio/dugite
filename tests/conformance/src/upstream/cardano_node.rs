@@ -8,6 +8,35 @@ use std::path::Path;
 
 use super::fixtures;
 
+/// Validate one cardano-node fixture file.  Returns `Ok(())` if it
+/// parses as a non-empty JSON value, else a human-readable reason.
+/// Exposed so `build.rs`-generated per-vector tests can call it.
+pub fn check_one_file(path: &Path) -> Result<(), String> {
+    let ext = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    if ext != "json" {
+        return Err(format!(
+            "unexpected file type (extension: {ext:?}), expected .json"
+        ));
+    }
+    let text = std::fs::read_to_string(path).map_err(|e| format!("read error: {e}"))?;
+    let value: serde_json::Value =
+        serde_json::from_str(&text).map_err(|e| format!("JSON parse error: {e}"))?;
+    let non_empty = match &value {
+        serde_json::Value::Object(o) => !o.is_empty(),
+        serde_json::Value::Array(a) => !a.is_empty(),
+        serde_json::Value::Null => false,
+        _ => true,
+    };
+    if !non_empty {
+        return Err("empty JSON value".to_string());
+    }
+    Ok(())
+}
+
 /// Run all cardano-node fixture checks.
 ///
 /// The current corpus exposes:
@@ -30,62 +59,24 @@ pub fn run_all_checks(dir: &Path) {
     let mut failures: Vec<(std::path::PathBuf, String)> = Vec::new();
 
     for path in &files {
-        let ext = path
-            .extension()
-            .and_then(|e| e.to_str())
-            .unwrap_or_default()
-            .to_ascii_lowercase();
-
-        if ext != "json" {
-            failures.push((
-                path.clone(),
-                format!("unexpected file type (extension: {ext:?}), expected .json"),
-            ));
-            continue;
-        }
-
-        let text = match std::fs::read_to_string(path) {
-            Ok(t) => t,
-            Err(e) => {
-                failures.push((path.clone(), format!("read error: {e}")));
-                continue;
+        match check_one_file(path) {
+            Ok(()) => {
+                checked += 1;
+                let rel = path.strip_prefix(dir).unwrap_or(path);
+                let category = rel
+                    .components()
+                    .next()
+                    .and_then(|c| c.as_os_str().to_str())
+                    .map(|s| match s {
+                        "bench" => "bench/cardano-profile",
+                        "cardano-testnet" => "cardano-testnet",
+                        other => Box::leak(other.to_string().into_boxed_str()) as &'static str,
+                    })
+                    .unwrap_or("(root)");
+                *by_category.entry(category).or_insert(0) += 1;
             }
-        };
-        let value: serde_json::Value = match serde_json::from_str(&text) {
-            Ok(v) => v,
-            Err(e) => {
-                failures.push((path.clone(), format!("JSON parse error: {e}")));
-                continue;
-            }
-        };
-
-        // Reject empty top-level objects/arrays — every fixture has content.
-        let non_empty = match &value {
-            serde_json::Value::Object(o) => !o.is_empty(),
-            serde_json::Value::Array(a) => !a.is_empty(),
-            serde_json::Value::Null => false,
-            _ => true,
-        };
-        if !non_empty {
-            failures.push((path.clone(), "empty JSON value".to_string()));
-            continue;
+            Err(reason) => failures.push((path.clone(), reason)),
         }
-
-        checked += 1;
-
-        // Categorize by top-level subdir for the summary line.
-        let rel = path.strip_prefix(dir).unwrap_or(path);
-        let category = rel
-            .components()
-            .next()
-            .and_then(|c| c.as_os_str().to_str())
-            .map(|s| match s {
-                "bench" => "bench/cardano-profile",
-                "cardano-testnet" => "cardano-testnet",
-                other => Box::leak(other.to_string().into_boxed_str()) as &'static str,
-            })
-            .unwrap_or("(root)");
-        *by_category.entry(category).or_insert(0) += 1;
     }
 
     if !failures.is_empty() {

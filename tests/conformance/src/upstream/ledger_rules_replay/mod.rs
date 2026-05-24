@@ -197,6 +197,41 @@ pub fn create_minimal_newepoch_fixture(dir: &Path) {
 /// Skips gracefully when no test-case directories are found (stub mode),
 /// **except** when the synthetic fixture has been created (which always
 /// provides at least one test case).
+/// Outcome of validating one `test_N` vector directory.
+#[derive(Debug, PartialEq, Eq)]
+pub enum VectorOutcome {
+    /// Vector ran successfully.
+    Pass,
+    /// Vector was intentionally skipped (matches `SKIP_LIST` or the
+    /// runner returned `Skipped`).
+    Skip(String),
+    /// Vector failed validation.  String is a human-readable reason.
+    Fail(String),
+}
+
+/// Validate one ledger-rules `test_N` directory.  Returns the outcome
+/// so `build.rs`-generated per-vector tests can decide pass/skip/fail.
+/// Exposed for the per-vector test generation.
+pub fn check_one_test_dir(test_dir: &Path) -> VectorOutcome {
+    let vec = match vector::decode_vector(test_dir) {
+        Ok(v) => v,
+        Err(e) => return VectorOutcome::Fail(format!("decode: {e}")),
+    };
+    if let Some(issue) = is_skipped(&vec.rule) {
+        return VectorOutcome::Skip(format!("rule={} ({issue})", vec.rule));
+    }
+    if let Err(e) = bridge::decode_state(&vec.st_cbor, "st") {
+        return VectorOutcome::Fail(format!("st_cbor decode: {e}"));
+    }
+    match runner::run_vector(&vec) {
+        runner::RunOutcome::NewEpochValidated { .. }
+        | runner::RunOutcome::UtxoDecoded { .. }
+        | runner::RunOutcome::NativeSigDecoded { .. } => VectorOutcome::Pass,
+        runner::RunOutcome::Skipped { reason } => VectorOutcome::Skip(reason),
+        runner::RunOutcome::Failed { detail } => VectorOutcome::Fail(detail),
+    }
+}
+
 pub fn run_all_checks(dir: &Path) {
     // Ensure at least the synthetic NEWEPOCH fixture exists so the test suite
     // always has one real vector to exercise.
