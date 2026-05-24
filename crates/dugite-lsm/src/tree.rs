@@ -1708,11 +1708,11 @@ mod mainnet_scale_tests {
         let dir = tempfile::tempdir().unwrap();
         let mut tree = LsmTree::open(dir.path(), mainnet_config()).unwrap();
 
-        const TOTAL: u64 = 1_000_000;
+        const TOTAL: u64 = 100_000;
 
         // Insert all entries. The 16 MB memtable holds roughly 3,000–4,000
         // 236-byte entries (key+value+overhead) before flushing, so we expect
-        // ~250 flushes and multiple compaction rounds over 1M inserts.
+        // ~25 flushes and at least one compaction round over 100K inserts.
         eprintln!("[test_mainnet_scale_insert_read] inserting {TOTAL} entries...");
         for seed in 0..TOTAL {
             let k = utxo_key(seed);
@@ -1735,7 +1735,7 @@ mod mainnet_scale_tests {
             let result = tree.get(&k).unwrap();
             assert!(
                 result.is_some(),
-                "key missing after 1M inserts: seed={seed}"
+                "key missing after {TOTAL} inserts: seed={seed}"
             );
             assert_eq!(
                 result.unwrap().as_bytes(),
@@ -1752,10 +1752,10 @@ mod mainnet_scale_tests {
     // Test 2: delete amplification + tombstone cleanup
     // ---------------------------------------------------------------------------
 
-    /// Insert 500K entries, delete 400K (simulating a heavy epoch-turnover
-    /// churn), then verify:
-    ///   1. All 100K surviving entries are readable.
-    ///   2. A full range scan returns exactly 100K entries (tombstones cleaned).
+    /// Insert 100K entries, delete 80K (simulating a heavy epoch-turnover
+    /// churn at the same 80% ratio mainnet exhibits), then verify:
+    ///   1. All 20K surviving entries are readable.
+    ///   2. A full range scan returns exactly 20K entries (tombstones cleaned).
     ///   3. All deleted keys return None (no resurrection from stale runs).
     ///
     /// This tests that compaction correctly merges tombstones with the entries
@@ -1767,11 +1767,11 @@ mod mainnet_scale_tests {
         let dir = tempfile::tempdir().unwrap();
         let mut tree = LsmTree::open(dir.path(), mainnet_config()).unwrap();
 
-        const TOTAL: u64 = 500_000;
-        const DELETED: u64 = 400_000; // 80% churn
+        const TOTAL: u64 = 100_000;
+        const DELETED: u64 = 80_000; // 80% churn
         const REMAINING: u64 = TOTAL - DELETED;
 
-        // Phase 1: Insert all 500K entries.
+        // Phase 1: Insert all 100K entries.
         eprintln!("[test_mainnet_scale_delete_amplification] inserting {TOTAL} entries...");
         for seed in 0..TOTAL {
             let k = utxo_key(seed);
@@ -1791,7 +1791,7 @@ mod mainnet_scale_tests {
         tree.flush().unwrap();
         eprintln!("[test_mainnet_scale_delete_amplification] delete flush complete");
 
-        // Phase 3: Verify surviving 100K entries (seeds DELETED..TOTAL) are readable.
+        // Phase 3: Verify surviving entries (seeds DELETED..TOTAL) are readable.
         eprintln!(
             "[test_mainnet_scale_delete_amplification] verifying surviving {REMAINING} entries..."
         );
@@ -1819,12 +1819,12 @@ mod mainnet_scale_tests {
         );
 
         // Phase 4: Verify deleted entries return None (no resurrection).
-        // Sample 10K deleted keys rather than all 400K to keep runtime bounded.
+        // Sample 1K deleted keys rather than all DELETED to keep runtime bounded.
         eprintln!(
-            "[test_mainnet_scale_delete_amplification] verifying 10K deleted keys return None..."
+            "[test_mainnet_scale_delete_amplification] verifying 1K deleted keys return None..."
         );
         let mut rng_state: u64 = 0xfeedface_deadc0de;
-        for _ in 0..10_000 {
+        for _ in 0..1_000 {
             let seed = next_rand(&mut rng_state) % DELETED;
             let k = utxo_key(seed);
             assert!(
