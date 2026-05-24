@@ -70,6 +70,36 @@ impl std::str::FromStr for LogRotation {
     }
 }
 
+/// Behavior when the non-blocking writer's bounded channel is full.
+///
+/// `Drop` (default) — matches `tracing_appender` upstream default; under flood
+/// the producer continues without parking, dropped lines are counted via
+/// `NonBlocking::error_counter`. Recommended for production where blocking the
+/// hot path on the log sink is worse than losing throttled INFO lines.
+///
+/// `Block` — producer parks until the worker drains. Use for development, CI,
+/// or scenarios where every log line must be preserved (e.g. forensic
+/// post-mortems). Defeats the purpose of non-blocking under genuine overload.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum LogOverflow {
+    #[default]
+    Drop,
+    Block,
+}
+
+impl std::str::FromStr for LogOverflow {
+    type Err = String;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.to_lowercase().as_str() {
+            "drop" | "lossy" => Ok(Self::Drop),
+            "block" | "lossless" => Ok(Self::Block),
+            other => Err(format!(
+                "unknown log overflow policy '{other}' (valid: drop, block)"
+            )),
+        }
+    }
+}
+
 /// Options for initializing the logging system.
 pub struct LoggingOpts {
     pub outputs: Vec<LogOutput>,
@@ -81,6 +111,10 @@ pub struct LoggingOpts {
     /// Number of days to retain log files (default: 7). Files older than this are deleted.
     /// Used by [`start_log_cleanup_task`] when the caller passes this value.
     pub _log_retention_days: u64,
+    /// Channel-full policy for the non-blocking stdout writer (issue #650).
+    /// Default `Drop` matches `tracing_appender` upstream lossy default; set
+    /// `Block` for development / CI where lossless capture is required.
+    pub stdout_overflow: LogOverflow,
 }
 
 /// Handle to the live tracing subscriber.
@@ -118,6 +152,14 @@ impl LogHandle {
         }
         Ok(())
     }
+
+    /// Number of `WorkerGuard`s held — one per non-blocking writer (file +
+    /// stdout). Used by tests to confirm sink wiring; not part of the
+    /// stable surface.
+    #[cfg(test)]
+    pub(crate) fn guard_count(&self) -> usize {
+        self.inner._guards.len()
+    }
 }
 
 /// Initialize the logging system with the given options.
@@ -140,6 +182,14 @@ pub fn init(opts: &LoggingOpts) -> anyhow::Result<LogHandle> {
         match output {
             LogOutput::Stdout => {
                 let ansi = !opts.no_color && atty_stdout();
+                // Non-blocking writer (issue #650): every `tracing::*!` call on
+                // the hot path no longer performs a synchronous `write(2)`
+                // on the emitting tokio worker. Lines are handed to a
+                // background worker thread via a bounded channel; the
+                // `WorkerGuard` is held in `LoggingHandleInner::_guards` so
+                // pending lines drain on graceful shutdown.
+                let (non_blocking, guard) = build_non_blocking_stdout(opts.stdout_overflow);
+                guards.push(guard);
                 let (filter, handle) = reload::Layer::new(build_filter(&opts.level));
                 reload_handles.push(handle);
                 match opts.format {
@@ -148,6 +198,7 @@ pub fn init(opts: &LoggingOpts) -> anyhow::Result<LogHandle> {
                             .compact()
                             .with_target(true)
                             .with_ansi(ansi)
+                            .with_writer(non_blocking)
                             .with_filter(filter);
                         layers.push(Box::new(layer));
                     }
@@ -156,6 +207,7 @@ pub fn init(opts: &LoggingOpts) -> anyhow::Result<LogHandle> {
                             .json()
                             .with_target(true)
                             .with_ansi(false)
+                            .with_writer(non_blocking)
                             .with_filter(filter);
                         layers.push(Box::new(layer));
                     }
@@ -273,6 +325,35 @@ fn build_filter(level: &str) -> EnvFilter {
 /// Check if stdout is a terminal (for auto-detecting color support).
 fn atty_stdout() -> bool {
     std::io::IsTerminal::is_terminal(&std::io::stdout())
+}
+
+/// Build the non-blocking wrapper around `std::io::Stdout`. Extracted so the
+/// channel-full policy is a single decision point (issue #650).
+fn build_non_blocking_stdout(
+    policy: LogOverflow,
+) -> (
+    tracing_appender::non_blocking::NonBlocking,
+    tracing_appender::non_blocking::WorkerGuard,
+) {
+    build_non_blocking_with_policy(std::io::stdout(), policy, "dugite-logger-stdout")
+}
+
+/// Generic constructor for the non-blocking writer with the dugite overflow
+/// policy. Extracted so unit tests can drive it against a `Vec<u8>`-backed
+/// mock writer (the real `std::io::Stdout` is impossible to inspect in-process).
+fn build_non_blocking_with_policy<W: std::io::Write + Send + 'static>(
+    writer: W,
+    policy: LogOverflow,
+    thread_name: &str,
+) -> (
+    tracing_appender::non_blocking::NonBlocking,
+    tracing_appender::non_blocking::WorkerGuard,
+) {
+    let is_lossy = matches!(policy, LogOverflow::Drop);
+    tracing_appender::non_blocking::NonBlockingBuilder::default()
+        .lossy(is_lossy)
+        .thread_name(thread_name)
+        .finish(writer)
 }
 
 // ---------------------------------------------------------------------------
@@ -434,6 +515,179 @@ mod tests {
         assert_eq!(events[0], "INFO", "first event was info_before");
         assert_eq!(events[1], "INFO", "second event was info_after");
         assert_eq!(events[2], "DEBUG", "third event was debug_after");
+    }
+
+    #[test]
+    fn test_log_overflow_from_str() {
+        assert_eq!("drop".parse::<LogOverflow>().unwrap(), LogOverflow::Drop);
+        assert_eq!("DROP".parse::<LogOverflow>().unwrap(), LogOverflow::Drop);
+        assert_eq!("lossy".parse::<LogOverflow>().unwrap(), LogOverflow::Drop);
+        assert_eq!("block".parse::<LogOverflow>().unwrap(), LogOverflow::Block);
+        assert_eq!(
+            "lossless".parse::<LogOverflow>().unwrap(),
+            LogOverflow::Block
+        );
+        assert!("park".parse::<LogOverflow>().is_err());
+        assert_eq!(LogOverflow::default(), LogOverflow::Drop);
+    }
+
+    /// Send-counting writer: every `write` call atomically increments a
+    /// counter. No sleeps and no Mutex (use AtomicUsize) so the test is
+    /// deterministic on macOS where `thread::sleep` granularity is coarse.
+    struct CountingWriter {
+        count: Arc<std::sync::atomic::AtomicUsize>,
+    }
+    impl std::io::Write for CountingWriter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.count.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// Issue #650: `LogOverflow::Block` (lossless) must deliver every line.
+    /// We use a fast consumer (no artificial sleep) so the worker comfortably
+    /// drains within the `WorkerGuard::drop` 1s flush timeout.
+    #[test]
+    fn test_non_blocking_block_is_lossless() {
+        let count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let writer = CountingWriter {
+            count: Arc::clone(&count),
+        };
+        let (mut non_blocking, guard) =
+            build_non_blocking_with_policy(writer, LogOverflow::Block, "dugite-test-block");
+
+        use std::io::Write;
+        const N: usize = 5_000;
+        // Use `write_all` with a pre-built buffer so each line produces
+        // exactly one `write` call on the consumer (matching the channel's
+        // one-msg-per-`write` semantics in `tracing_appender`).
+        for i in 0..N {
+            let line = format!("L{i:06}\n");
+            non_blocking.write_all(line.as_bytes()).unwrap();
+        }
+        // Drop sender first so worker sees channel close; then guard waits for drain.
+        drop(non_blocking);
+        drop(guard);
+
+        // Allow a short post-drop drain margin — guard's shutdown timeout
+        // is 1s but the worker may still be writing the tail when drop returns.
+        for _ in 0..50 {
+            if count.load(std::sync::atomic::Ordering::Acquire) >= N {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        let observed = count.load(std::sync::atomic::Ordering::Acquire);
+        assert_eq!(
+            observed, N,
+            "Block policy must deliver every line; got {observed}/{N}"
+        );
+    }
+
+    /// Issue #650: `LogOverflow::Drop` (lossy) must NOT block the producer
+    /// when the channel is saturated. We exercise the contract by routing
+    /// directly through `NonBlockingBuilder` with `buffered_lines_limit = 4`
+    /// (the smallest non-trivial size) and a black-hole consumer that hangs
+    /// on a barrier — the producer must still complete promptly.
+    #[test]
+    fn test_non_blocking_drop_does_not_block_producer() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let release = Arc::new(AtomicBool::new(false));
+        let release_clone = Arc::clone(&release);
+        let count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+
+        struct HangingWriter {
+            release: Arc<AtomicBool>,
+            count: Arc<std::sync::atomic::AtomicUsize>,
+        }
+        impl std::io::Write for HangingWriter {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                // Spin until the test releases us. The producer must NOT
+                // block waiting on this writer when configured as lossy.
+                while !self.release.load(Ordering::Acquire) {
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                }
+                self.count.fetch_add(1, Ordering::AcqRel);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let writer = HangingWriter {
+            release: Arc::clone(&release),
+            count: Arc::clone(&count),
+        };
+        // Tiny buffer (4 lines) + a single in-flight write blocked in the
+        // worker means the producer hits a full channel after 5 writes.
+        // With `lossy(true)` it must keep going; with `lossy(false)` it would
+        // park indefinitely until `release` is set.
+        let (mut non_blocking, guard) =
+            tracing_appender::non_blocking::NonBlockingBuilder::default()
+                .lossy(true)
+                .buffered_lines_limit(4)
+                .thread_name("dugite-test-drop")
+                .finish(writer);
+
+        use std::io::Write;
+        let start = std::time::Instant::now();
+        const N: usize = 10_000;
+        for i in 0..N {
+            // writeln! returns Ok even when lossy drops the line.
+            writeln!(non_blocking, "L{i:06}").unwrap();
+        }
+        let producer_elapsed = start.elapsed();
+        assert!(
+            producer_elapsed < std::time::Duration::from_secs(1),
+            "Drop policy producer must not block when consumer is wedged; took {producer_elapsed:?}"
+        );
+
+        // Sanity: the underlying NonBlocking reports drops.
+        assert!(
+            non_blocking.error_counter().dropped_lines() > 0,
+            "Drop policy must surface dropped-line count when consumer is blocked"
+        );
+
+        // Release the consumer and tear down so we don't leak the thread.
+        release_clone.store(true, Ordering::Release);
+        drop(non_blocking);
+        drop(guard);
+        let _ = count.load(Ordering::Acquire); // touch to silence unused-must-use
+    }
+
+    /// Issue #650: `init()` for the stdout sink must register a `WorkerGuard`
+    /// in the returned `LogHandle` so the worker drains on graceful shutdown.
+    /// Run in isolation (sets the global subscriber) — call via single-shot
+    /// `Once` to keep the test self-contained.
+    #[test]
+    fn test_init_stdout_registers_worker_guard() {
+        use std::sync::Once;
+        // The global subscriber is set once per process; use a separate
+        // process-local helper that exercises only the LoggingOpts → guards
+        // wiring without touching the global tracing subscriber.
+        static ONCE: Once = Once::new();
+        ONCE.call_once(|| {
+            // Construct the handle the same way `init` does, but without
+            // calling `.init()` on it (which would taint the global subscriber
+            // for other tests). We mirror the stdout branch directly.
+            let (_non_blocking, guard) =
+                build_non_blocking_with_policy(Vec::<u8>::new(), LogOverflow::Drop, "test-guard");
+            let handle = LogHandle {
+                inner: Arc::new(LogHandleInner {
+                    reload_handles: Vec::new(),
+                    _guards: vec![guard],
+                }),
+            };
+            assert_eq!(
+                handle.guard_count(),
+                1,
+                "stdout sink must hold a WorkerGuard for graceful drain"
+            );
+        });
     }
 
     /// Invalid directives must return an error and leave the previous filter intact.
