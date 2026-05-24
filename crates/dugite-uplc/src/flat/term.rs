@@ -144,14 +144,40 @@ fn decode_term_depth(r: &mut BitReader<'_>, depth: usize) -> FlatResult<Term> {
             let id = BuiltinId::from_u8(raw)?;
             Ok(Term::Builtin(id))
         }
-        8 | 9 => Err(UplcError::FlatDecode(format!(
-            "term tag {tag} (Constr/Case) is reserved for UPLC \
-             program version 1.1.0+ and not yet wired"
-        ))),
+        8 => {
+            // Constr: varint(tag) + cons-list(term).  Matches Haskell
+            // `encodeTerm (Constr _ i ts) = encodeTermTag 8 <> encode i
+            //                                              <> encodeListWith encode ts`.
+            let ctag = r.read_natural_u64()?;
+            let args = decode_term_list(r, depth + 1)?;
+            Ok(Term::Constr { tag: ctag, args })
+        }
+        9 => {
+            // Case: scrutinee (term) + cons-list(term) branches.  Matches
+            // Haskell `encodeTerm (Case _ t ts) = encodeTermTag 9
+            //                                    <> encode t <> encodeListWith encode ts`.
+            let scrutinee = decode_term_depth(r, depth + 1)?;
+            let branches = decode_term_list(r, depth + 1)?;
+            Ok(Term::Case {
+                scrutinee: Box::new(scrutinee),
+                branches,
+            })
+        }
         _ => Err(UplcError::FlatDecode(format!(
             "unknown term tag {tag:#06b}"
         ))),
     }
+}
+
+/// Decode a `Flat`-encoded cons-list of terms.  Each element is prefixed
+/// by a `1` continuation bit; a `0` terminates the list.  Mirrors
+/// Haskell `decodeListWith decode`.
+fn decode_term_list(r: &mut BitReader<'_>, depth: usize) -> FlatResult<Vec<Term>> {
+    let mut out = Vec::new();
+    while r.read_bit()? {
+        out.push(decode_term_depth(r, depth)?);
+    }
+    Ok(out)
 }
 
 fn encode_term_depth(w: &mut BitWriter, t: &Term, depth: usize) -> FlatResult<()> {
@@ -203,14 +229,31 @@ fn encode_term_depth(w: &mut BitWriter, t: &Term, depth: usize) -> FlatResult<()
             }
             w.write_bits8(raw, BUILTIN_TAG_WIDTH)?;
         }
-        Term::Constr { .. } | Term::Case { .. } => {
-            return Err(UplcError::Encode(
-                "Term::Constr / Term::Case encoding is reserved for \
-                 UPLC program version 1.1.0+ and not yet wired"
-                    .into(),
-            ));
+        Term::Constr { tag, args } => {
+            w.write_bits8(8, TERM_TAG_WIDTH)?;
+            w.write_natural_u64(*tag)?;
+            encode_term_list(w, args, depth + 1)?;
+        }
+        Term::Case {
+            scrutinee,
+            branches,
+        } => {
+            w.write_bits8(9, TERM_TAG_WIDTH)?;
+            encode_term_depth(w, scrutinee, depth + 1)?;
+            encode_term_list(w, branches, depth + 1)?;
         }
     }
+    Ok(())
+}
+
+/// Encode a slice of terms as a `Flat` cons-list (each element prefixed
+/// by a `1` bit; terminator `0`).
+fn encode_term_list(w: &mut BitWriter, terms: &[Term], depth: usize) -> FlatResult<()> {
+    for t in terms {
+        w.write_bit(true);
+        encode_term_depth(w, t, depth)?;
+    }
+    w.write_bit(false);
     Ok(())
 }
 
