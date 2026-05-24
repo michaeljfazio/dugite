@@ -160,16 +160,47 @@ impl LedgerState {
     /// was multiple GB and contributed materially to the post-replay OOM
     /// that killed dugite-node on 32 GB hosts.
     pub fn save_snapshot(&self, path: &Path) -> Result<(), LedgerError> {
+        // Build the serde-friendly snapshot view (Arc::clone for the big
+        // shared maps, HashMap::clone for the rest) and delegate to the
+        // off-lock-friendly writer. Issue #649 (`save_ledger_snapshot` on
+        // the node side) takes the same `snapshot` view inside the lock and
+        // performs `write_snapshot_view_to_path` from a `spawn_blocking`
+        // task — see crates/dugite-node/src/node/epoch.rs.
+        let snapshot = super::snapshot_format::LedgerStateSnapshot::from(self);
+        let total_bytes = Self::write_snapshot_view_to_path(&snapshot, path)?;
+        info!(
+            "Snapshot     saved (epoch={}, {} UTxOs, {:.1} MB)",
+            self.epoch.0,
+            self.utxo.utxo_set.len(),
+            total_bytes as f64 / 1_048_576.0,
+        );
+        Ok(())
+    }
+
+    /// Serialise a `LedgerStateSnapshot` to `path` using the canonical
+    /// versioned format described above. Returns the total bytes written
+    /// (header + checksum + payload) so the caller can report metrics.
+    ///
+    /// **Issue #649** — this is the lock-free factor of [`Self::save_snapshot`].
+    /// `LedgerStateSnapshot` is `Send + 'static` (HashMaps + Arcs), so the
+    /// node's snapshot path captures the view inside its `LedgerState`
+    /// write lock and then hands it to `tokio::task::spawn_blocking` for
+    /// the disk-bound write, releasing the lock seconds earlier.
+    ///
+    /// Atomicity / crash safety is preserved unchanged: the payload is
+    /// streamed to `<path>.tmp` via `HashingWriter` (no full `Vec<u8>` in
+    /// memory — see #403), the checksum placeholder is rewritten by
+    /// seeking back to its offset, the file is flushed, and the `.tmp`
+    /// file is atomically renamed over `path`. A crash before the rename
+    /// leaves `path` untouched; a crash after leaves a consistent file.
+    pub fn write_snapshot_view_to_path(
+        snapshot: &super::snapshot_format::LedgerStateSnapshot,
+        path: &Path,
+    ) -> Result<u64, LedgerError> {
         use dugite_primitives::hash::Blake2b256Hasher;
         use std::io::{Seek, SeekFrom, Write};
 
         let tmp_path = path.with_extension("tmp");
-
-        // Build the serde-friendly snapshot view. For the LSM backend this is
-        // cheap (empty `utxo_set`); for the in-memory backend it still clones
-        // the UTxO `HashMap`, but that cost is bounded (#403 follow-up work
-        // can thread a borrowing wrapper through bincode if needed).
-        let snapshot = super::snapshot_format::LedgerStateSnapshot::from(self);
 
         let file = std::fs::File::create(&tmp_path)
             .map_err(|e| LedgerError::EpochTransition(format!("Failed to create snapshot: {e}")))?;
@@ -199,7 +230,7 @@ impl LedgerState {
             hasher: Blake2b256Hasher::new(),
             bytes_written: 0,
         };
-        bincode::serialize_into(&mut hashing_writer, &snapshot).map_err(|e| {
+        bincode::serialize_into(&mut hashing_writer, snapshot).map_err(|e| {
             LedgerError::EpochTransition(format!("Failed to serialize ledger state: {e}"))
         })?;
         let payload_bytes = hashing_writer.bytes_written;
@@ -226,13 +257,7 @@ impl LedgerState {
 
         std::fs::rename(&tmp_path, path)
             .map_err(|e| LedgerError::EpochTransition(format!("Failed to rename snapshot: {e}")))?;
-        info!(
-            "Snapshot     saved (epoch={}, {} UTxOs, {:.1} MB)",
-            self.epoch.0,
-            self.utxo.utxo_set.len(),
-            total_bytes as f64 / 1_048_576.0,
-        );
-        Ok(())
+        Ok(total_bytes)
     }
 
     /// Load ledger state snapshot from disk.
@@ -390,6 +415,61 @@ mod tests {
     // -----------------------------------------------------------------------
     // 1. Save/load roundtrip: verify that key fields survive serialisation
     // -----------------------------------------------------------------------
+
+    // ── Issue #649: write_snapshot_view_to_path tests ─────────────────
+
+    /// `write_snapshot_view_to_path` is the off-lock-friendly factor of
+    /// `save_snapshot`. Given a `LedgerStateSnapshot`, it must produce a
+    /// byte-identical on-disk file that `load_snapshot` can read back to
+    /// the same field values.
+    #[test]
+    fn test_write_snapshot_view_roundtrips_via_load() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("view-roundtrip.bin");
+
+        let mut state = LedgerState::new(ProtocolParameters::mainnet_defaults());
+        state.epoch = EpochNo(11);
+        state.epochs.treasury = Lovelace(123_456_789);
+        state.era = Era::Conway;
+
+        let view = LedgerStateSnapshot::from(&state);
+        let bytes = LedgerState::write_snapshot_view_to_path(&view, &path)
+            .expect("static write must succeed");
+        assert!(bytes > 0, "writer must report payload bytes written");
+
+        let loaded = LedgerState::load_snapshot(&path).unwrap();
+        assert_eq!(loaded.epoch, EpochNo(11));
+        assert_eq!(loaded.epochs.treasury, Lovelace(123_456_789));
+        assert_eq!(loaded.era, Era::Conway);
+    }
+
+    /// `save_snapshot(&self)` and `write_snapshot_view_to_path(&view)`
+    /// must produce byte-identical output when given the same logical
+    /// state. The whole point of factoring is for `save_ledger_snapshot`
+    /// on the node side to clone a `Snapshot` under the lock and drive
+    /// the disk write off the lock with no semantic change.
+    #[test]
+    fn test_write_view_byte_identical_to_save_snapshot() {
+        let dir = tempfile::tempdir().unwrap();
+        let p1 = dir.path().join("via-save.bin");
+        let p2 = dir.path().join("via-view.bin");
+
+        let mut state = LedgerState::new(ProtocolParameters::mainnet_defaults());
+        state.epoch = EpochNo(3);
+        state.epochs.treasury = Lovelace(999_999);
+        state.era = Era::Conway;
+
+        state.save_snapshot(&p1).unwrap();
+        let view = LedgerStateSnapshot::from(&state);
+        LedgerState::write_snapshot_view_to_path(&view, &p2).unwrap();
+
+        let bytes1 = std::fs::read(&p1).unwrap();
+        let bytes2 = std::fs::read(&p2).unwrap();
+        assert_eq!(
+            bytes1, bytes2,
+            "static write must produce byte-identical output to save_snapshot"
+        );
+    }
 
     /// Save a `LedgerState` with recognisable field values, load it back, and
     /// verify that `epoch`, `treasury`, and `era` are preserved exactly.
