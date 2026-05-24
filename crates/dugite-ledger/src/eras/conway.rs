@@ -472,6 +472,7 @@ impl EraRules for ConwayRules {
                 &certs.reward_accounts,
                 ctx.epoch_length,
                 ctx.shelley_transition_epoch,
+                ctx.max_lovelace_supply,
             );
 
             // Issue #438/#471: per-boundary reward-debug dump.  No-op
@@ -1687,6 +1688,7 @@ mod tests {
             randomness_stabilisation_window: 129600,
             tx_index: 0,
             conway_genesis: None,
+            max_lovelace_supply: crate::state::MAX_LOVELACE_SUPPLY,
         }
     }
 
@@ -2786,6 +2788,7 @@ mod tests {
             randomness_stabilisation_window: 129600,
             tx_index: 0,
             conway_genesis: Some(&genesis),
+            max_lovelace_supply: crate::state::MAX_LOVELACE_SUPPLY,
         };
 
         let mut utxo = make_utxo_sub(vec![]);
@@ -2864,6 +2867,7 @@ mod tests {
             randomness_stabilisation_window: 129600,
             tx_index: 0,
             conway_genesis: Some(&genesis),
+            max_lovelace_supply: crate::state::MAX_LOVELACE_SUPPLY,
         };
 
         let mut utxo = make_utxo_sub(vec![]);
@@ -2945,6 +2949,7 @@ mod tests {
             randomness_stabilisation_window: 129600,
             tx_index: 0,
             conway_genesis: Some(&genesis),
+            max_lovelace_supply: crate::state::MAX_LOVELACE_SUPPLY,
         };
 
         let mut utxo = make_utxo_sub(vec![]);
@@ -3058,6 +3063,7 @@ mod tests {
             randomness_stabilisation_window: 129600,
             tx_index: 0,
             conway_genesis: Some(&genesis),
+            max_lovelace_supply: crate::state::MAX_LOVELACE_SUPPLY,
         };
 
         // Build a Conway-era ledger sub-state with governance that diverges

@@ -1,4 +1,4 @@
-use super::{LedgerState, PendingRewardUpdate, StakeSnapshot, MAX_LOVELACE_SUPPLY};
+use super::{LedgerState, PendingRewardUpdate, StakeSnapshot};
 use dugite_primitives::hash::{Hash28, Hash32};
 use dugite_primitives::protocol_params::ProtocolParameters;
 use dugite_primitives::value::Lovelace;
@@ -145,6 +145,7 @@ pub fn compute_reward_update(
     reward_accounts: &HashMap<Hash32, Lovelace>,
     epoch_length: u64,
     _shelley_transition_epoch: u64,
+    max_lovelace_supply: u64,
 ) -> PendingRewardUpdate {
     // Issue #438 fix: compute expansion + treasury_cut BEFORE checking go.
     //
@@ -230,7 +231,7 @@ pub fn compute_reward_update(
 
     let reward_pot = total_rewards_available - treasury_cut;
 
-    let total_stake = MAX_LOVELACE_SUPPLY.saturating_sub(reserves.0);
+    let total_stake = max_lovelace_supply.saturating_sub(reserves.0);
     if total_stake == 0 {
         // #615b: Haskell's RewardUpdate carries only treasury_cut in deltaT;
         // the undistributed portion of reward_pot is refunded to reserves via
@@ -671,6 +672,7 @@ impl LedgerState {
             &self.certs.reward_accounts,
             self.epoch_length,
             self.shelley_transition_epoch,
+            self.max_lovelace_supply,
         )
     }
 
@@ -1136,6 +1138,7 @@ mod tests {
             &reward_accounts,
             86400, // epoch_length
             0,     // shelley_transition_epoch
+            super::super::MAX_LOVELACE_SUPPLY,
         );
 
         assert!(

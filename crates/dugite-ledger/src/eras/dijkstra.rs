@@ -883,6 +883,7 @@ mod tests {
             randomness_stabilisation_window: 129_600,
             tx_index: 0,
             conway_genesis: genesis,
+            max_lovelace_supply: crate::state::MAX_LOVELACE_SUPPLY,
         }
     }
 
@@ -1480,6 +1481,7 @@ mod tests {
                 randomness_stabilisation_window: 129_600,
                 tx_index: 0,
                 conway_genesis: None,
+                max_lovelace_supply: crate::state::MAX_LOVELACE_SUPPLY,
             };
 
             // ---- apply ----------------------------------------------
@@ -1784,6 +1786,7 @@ mod tests {
                 randomness_stabilisation_window: 129_600,
                 tx_index: 0,
                 conway_genesis: None,
+                max_lovelace_supply: crate::state::MAX_LOVELACE_SUPPLY,
             };
 
             // Use the decoded tx (era=Dijkstra, raw_body_cbor populated).
@@ -2057,6 +2060,7 @@ mod tests {
                 randomness_stabilisation_window: 129_600,
                 tx_index: 0,
                 conway_genesis: None,
+                max_lovelace_supply: crate::state::MAX_LOVELACE_SUPPLY,
             };
 
             let rules = DijkstraRules::new();
@@ -2455,6 +2459,7 @@ mod tests {
                 randomness_stabilisation_window: 129_600,
                 tx_index: 0,
                 conway_genesis: None,
+                max_lovelace_supply: crate::state::MAX_LOVELACE_SUPPLY,
             };
 
             let rules = DijkstraRules::new();
@@ -2714,6 +2719,7 @@ mod tests {
                 randomness_stabilisation_window: 129_600,
                 tx_index: 0,
                 conway_genesis: None,
+                max_lovelace_supply: crate::state::MAX_LOVELACE_SUPPLY,
             };
 
             // Fresh shell state.

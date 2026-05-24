@@ -66,6 +66,10 @@ pub struct RuleContext<'a> {
     pub tx_index: u64,
     /// Conway genesis initialization data (needed by era-transition rules).
     pub conway_genesis: Option<&'a ConwayGenesisInit>,
+    /// Maximum lovelace supply (Haskell `Globals.maxLovelaceSupply`). Threaded
+    /// from `LedgerState.max_lovelace_supply` so reward calculations use the
+    /// genesis-derived cap, not the mainnet constant.
+    pub max_lovelace_supply: u64,
 }
 
 /// Era-specific ledger rules.
