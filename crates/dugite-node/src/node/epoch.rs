@@ -174,6 +174,43 @@ impl SnapshotPolicy {
     }
 }
 
+// ─── Snapshot helpers ────────────────────────────────────────────────────────
+
+/// Update `latest_path` to reference the same inode as `epoch_path` via a
+/// hardlink (issue #648).
+///
+/// Replaces the previous `fs::copy(epoch, latest)` which wrote the same
+/// ~100 MB – 1 GB of ledger state to disk twice per snapshot AND held the
+/// global `RwLock<LedgerState>` write lock for the duration of the copy.
+///
+/// Atomicity / crash-safety:
+/// - `remove_file` + `hard_link` is not a single syscall, but the only
+///   reader of `latest.bin` is the startup path (`load_snapshot`), and the
+///   only writer is the (serialised) snapshot task — no concurrent-reader
+///   window exists.
+/// - If the process crashes between the two calls, `latest.bin` may be
+///   missing on restart. `find_best_snapshot_for_rollback` then enumerates
+///   `ledger-snapshot-epoch*.bin` and uses the most recent canonical one —
+///   the existing fallback path.
+/// - On a fresh database where `latest.bin` doesn't yet exist, the
+///   `remove_file` returns `NotFound` and we ignore it.
+///
+/// Filesystem requirement: `hard_link` requires both paths on the same
+/// filesystem; trivially satisfied because both live under `database_path`.
+pub(crate) fn link_latest_snapshot(
+    epoch_path: &std::path::Path,
+    latest_path: &std::path::Path,
+) -> std::io::Result<()> {
+    // Remove any existing latest.bin first; `hard_link` fails if the target
+    // exists. NotFound is benign (first snapshot on a fresh database).
+    match std::fs::remove_file(latest_path) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e),
+    }
+    std::fs::hard_link(epoch_path, latest_path)
+}
+
 // ─── Node impl: snapshot persistence ─────────────────────────────────────────
 
 impl Node {
@@ -211,10 +248,12 @@ impl Node {
             return;
         }
 
-        // Copy to "latest" for fast startup (avoids double-serializing ~1 GB)
+        // Update "latest" via hardlink (issue #648) — same inode, no double
+        // disk write, lock released seconds earlier on multi-hundred-MB
+        // ledger state. See `link_latest_snapshot` for atomicity/crash notes.
         let latest_path = self.database_path.join("ledger-snapshot.bin");
-        if let Err(e) = std::fs::copy(&epoch_path, &latest_path) {
-            error!("Failed to copy latest ledger snapshot: {e}");
+        if let Err(e) = link_latest_snapshot(&epoch_path, &latest_path) {
+            error!("Failed to hardlink latest ledger snapshot: {e}");
         }
 
         drop(ls);
@@ -643,6 +682,100 @@ mod tests {
             vec![(Era::Babbage, 365), (Era::Conway, 517)],
             "mainnet table must match on-chain HF history; Dijkstra not yet proposed"
         );
+    }
+
+    // ── Issue #648: link_latest_snapshot tests ────────────────────────────
+
+    /// `link_latest_snapshot` must point `latest_path` at the exact same
+    /// inode as `epoch_path` — no double-write, identical bytes.
+    #[test]
+    fn test_link_latest_snapshot_creates_hardlink() {
+        let tmp = tempfile::tempdir().unwrap();
+        let epoch_path = tmp.path().join("ledger-snapshot-epoch5-slot12345.bin");
+        let latest_path = tmp.path().join("ledger-snapshot.bin");
+        std::fs::write(&epoch_path, b"some serialised ledger bytes").unwrap();
+
+        link_latest_snapshot(&epoch_path, &latest_path)
+            .expect("hardlink should succeed on a clean target");
+
+        // Same content.
+        assert_eq!(
+            std::fs::read(&epoch_path).unwrap(),
+            std::fs::read(&latest_path).unwrap(),
+            "latest must read back the same bytes as epoch"
+        );
+
+        // Same inode (Unix); on Windows the equivalent assertion is that
+        // hard_link succeeded, which already throws above.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            let a = std::fs::metadata(&epoch_path).unwrap();
+            let b = std::fs::metadata(&latest_path).unwrap();
+            assert_eq!(a.ino(), b.ino(), "epoch and latest must share an inode");
+            assert_eq!(a.dev(), b.dev(), "epoch and latest must share a device");
+        }
+    }
+
+    /// `link_latest_snapshot` must atomically replace any existing
+    /// `latest_path`. After a second snapshot, `latest_path` references
+    /// the NEW epoch file; the OLD epoch file remains independently
+    /// readable via its own filename.
+    #[test]
+    fn test_link_latest_snapshot_replaces_existing_latest() {
+        let tmp = tempfile::tempdir().unwrap();
+        let epoch_a = tmp.path().join("ledger-snapshot-epoch5-slot100.bin");
+        let epoch_b = tmp.path().join("ledger-snapshot-epoch6-slot200.bin");
+        let latest_path = tmp.path().join("ledger-snapshot.bin");
+
+        // First snapshot.
+        std::fs::write(&epoch_a, b"snapshot at epoch 5").unwrap();
+        link_latest_snapshot(&epoch_a, &latest_path).unwrap();
+        assert_eq!(std::fs::read(&latest_path).unwrap(), b"snapshot at epoch 5");
+
+        // Second snapshot — latest must now point at epoch_b, not epoch_a.
+        std::fs::write(&epoch_b, b"snapshot at epoch 6 (different bytes)").unwrap();
+        link_latest_snapshot(&epoch_b, &latest_path)
+            .expect("hardlink should succeed even when target exists");
+        assert_eq!(
+            std::fs::read(&latest_path).unwrap(),
+            b"snapshot at epoch 6 (different bytes)",
+            "latest must reflect the new epoch file after re-link"
+        );
+
+        // Old epoch file still readable independently — its inode survives
+        // because hardlinks are independent name->inode references.
+        assert_eq!(
+            std::fs::read(&epoch_a).unwrap(),
+            b"snapshot at epoch 5",
+            "old epoch file must still exist (rollback path)"
+        );
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            let latest = std::fs::metadata(&latest_path).unwrap();
+            let b_meta = std::fs::metadata(&epoch_b).unwrap();
+            let a_meta = std::fs::metadata(&epoch_a).unwrap();
+            assert_eq!(latest.ino(), b_meta.ino(), "latest now shares b's inode");
+            assert_ne!(
+                latest.ino(),
+                a_meta.ino(),
+                "latest must NOT still share a's inode"
+            );
+        }
+    }
+
+    /// If the epoch file does not exist, `link_latest_snapshot` returns an
+    /// `Err` so callers can surface a structured error rather than silently
+    /// leaving `latest` stale.
+    #[test]
+    fn test_link_latest_snapshot_missing_source_errors() {
+        let tmp = tempfile::tempdir().unwrap();
+        let epoch_path = tmp.path().join("does-not-exist.bin");
+        let latest_path = tmp.path().join("ledger-snapshot.bin");
+        let err = link_latest_snapshot(&epoch_path, &latest_path).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::NotFound);
     }
 
     #[test]
