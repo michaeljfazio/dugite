@@ -51,7 +51,7 @@ The storage layer is pure Rust with no system dependencies. cardano-lsm (used fo
 
 ## Architecture
 
-14-crate Cargo workspace under `crates/`. Dependency flow:
+15-crate Cargo workspace under `crates/`. Dependency flow:
 
 ```
 dugite-node (binary: main node, config, pipelined sync, Mithril import, block forging)
@@ -68,6 +68,8 @@ dugite-config (binary: interactive TUI configuration editor with tree navigation
 dugite-serialization (CBOR encode/decode — in-house multi-era decoder + minicbor)
 dugite-crypto (Ed25519, VRF, KES, text envelope)
 dugite-primitives (core types: hashes, blocks, txs, addresses, values, protocol params, all eras)
+dugite-uplc (in-house UPLC CEK machine; 100% conformant as of v1.7.0)
+dugite-lsm (LSM-tree on-disk storage for UTxO-HD)
 ```
 
 ### Key Traits & Abstractions
