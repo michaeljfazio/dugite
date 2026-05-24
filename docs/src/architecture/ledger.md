@@ -37,7 +37,7 @@ flowchart TD
     ET --> TXS
     TXS --> P1[Phase-1 Validation<br/>Structural + witness checks]
     P1 --> P2{Plutus scripts?}
-    P2 -->|Yes| EVAL[Phase-2 Evaluation<br/>uplc CEK machine]
+    P2 -->|Yes| EVAL[Phase-2 Evaluation<br/>dugite-uplc CEK machine]
     P2 -->|No| APPLY[Apply UTxO changes]
     EVAL --> APPLY
     APPLY --> CERT[Process certificates]
@@ -78,7 +78,7 @@ For transactions containing Plutus scripts (V1/V2/V3):
 1. **Script data hash** — Matches the hash of redeemers + datums + cost models
 2. **Collateral** — Sufficient collateral provided (150% of estimated fees in Conway)
 3. **Execution units** — Each redeemer's CPU and memory within budget
-4. **Script evaluation** — Each script is executed via the uplc CEK machine with the appropriate cost model
+4. **Script evaluation** — Each script is executed via the dugite-uplc CEK machine with the appropriate cost model
 5. **Block budget** — Total execution units across all transactions do not exceed block limits
 
 Scripts are evaluated in parallel using rayon when the `parallel-verification` feature is enabled (default).
