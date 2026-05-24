@@ -349,6 +349,32 @@ fn run_node_crate_fallback_fixtures() {
     eprintln!("[mithril] fallback: {checked} node-crate fixture(s) validated (Levels 1-3)");
 }
 
+/// Validate one mithril fixture file (JSON with category-specific
+/// Level-1..3 checks if the filename matches `*list*` or `*detail*`).
+/// Exposed for `build.rs`-generated per-vector tests.
+///
+/// Returns `Ok(())` on success. On failure, panics via the helpers'
+/// existing assertions — captured and converted to a `String` by the
+/// caller using `std::panic::catch_unwind`.
+pub fn check_one_file(path: &Path) -> Result<(), String> {
+    let label = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("(unknown)");
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        check_mithril_json(path, label);
+    }));
+    result.map_err(|panic_payload| {
+        if let Some(s) = panic_payload.downcast_ref::<&'static str>() {
+            (*s).to_string()
+        } else if let Some(s) = panic_payload.downcast_ref::<String>() {
+            s.clone()
+        } else {
+            "panic in check_mithril_json (no message)".to_string()
+        }
+    })
+}
+
 pub fn run_all_checks(dir: &Path) {
     if has_only_readme(dir) {
         eprintln!(

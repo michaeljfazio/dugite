@@ -41,6 +41,54 @@ fn check_pparams_json(path: &Path, era: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// Validate one cardano-ledger fixture file. Dispatches by extension:
+/// .cddl → non-empty text; .json → parses as a non-empty object; .cbor
+/// or .bin → non-empty bytes. Other extensions are accepted as long as
+/// the file is non-empty. Exposed for `build.rs`-generated per-vector
+/// tests.
+pub fn check_one_file(path: &Path) -> Result<(), String> {
+    let ext = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    match ext.as_str() {
+        "cddl" => {
+            let text = std::fs::read_to_string(path).map_err(|e| format!("read: {e}"))?;
+            if text.is_empty() {
+                return Err("empty CDDL file".to_string());
+            }
+        }
+        "json" => {
+            let text = std::fs::read_to_string(path).map_err(|e| format!("read: {e}"))?;
+            let val: serde_json::Value =
+                serde_json::from_str(&text).map_err(|e| format!("JSON parse: {e}"))?;
+            let non_empty = match &val {
+                serde_json::Value::Object(o) => !o.is_empty(),
+                serde_json::Value::Array(a) => !a.is_empty(),
+                serde_json::Value::Null => false,
+                _ => true,
+            };
+            if !non_empty {
+                return Err("empty JSON value".to_string());
+            }
+        }
+        "cbor" | "bin" => {
+            let bytes = std::fs::read(path).map_err(|e| format!("read: {e}"))?;
+            if bytes.is_empty() {
+                return Err("empty CBOR/bin file".to_string());
+            }
+        }
+        _ => {
+            let bytes = std::fs::read(path).map_err(|e| format!("read: {e}"))?;
+            if bytes.is_empty() {
+                return Err(format!("empty file (unknown extension {ext:?})"));
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Run all cardano-ledger golden decode checks.
 pub fn run_all_checks(dir: &Path) {
     let mut checked = 0usize;
