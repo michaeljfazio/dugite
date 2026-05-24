@@ -173,20 +173,18 @@ MsgQueryReply      = [3, versionTable]
 ; Keys are encoded in ascending order.
 versionTable = { * versionNumber => versionData }
 
-; N2N version numbers (V14=14, V15=15, V16=16, ...)
+; N2N version numbers implemented by Dugite (V14=14, V15=15)
 ; Note: N2N does NOT set bit-15. Only N2C uses bit-15.
-versionNumber = 14 / 15 / 16
+; V16 (adds perasSupport) is defined in the Peras spec but not yet implemented.
+versionNumber = 14 / 15
 
 ; Version data for V14/V15: 4-element array
 versionData_v14 = [networkMagic, initiatorOnly, peerSharing, query]
-; Version data for V16+: 5-element array (adds perasSupport)
-versionData_v16 = [networkMagic, initiatorOnly, peerSharing, query, perasSupport]
 
 networkMagic = uint .size 4   ; word32 (mainnet=764824073, preview=2, preprod=1)
 initiatorOnly = bool           ; true=InitiatorOnly, false=InitiatorAndResponder
 peerSharing   = 0 / 1          ; 0=Disabled, 1=Enabled
 query         = bool
-perasSupport  = bool
 
 refuseReason
   = [0, [* versionNumber]]           ; VersionMismatch

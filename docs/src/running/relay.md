@@ -167,10 +167,10 @@ Dugite exposes Prometheus metrics on port 12798 by default. Key metrics to watch
 
 | Metric | What it tells you |
 |--------|-------------------|
-| `peers_connected` | Number of active peer connections. Should be > 0 at all times |
-| `sync_progress_percent` | Sync progress (10000 = 100%). Must be at 100% for the BP to produce blocks |
-| `blocks_received` | Total blocks received from peers. Should increase steadily |
-| `slot_number` | Current slot. Compare against network tip to verify sync |
+| `dugite_peers_connected` | Number of active peer connections. Should be > 0 at all times |
+| `dugite_sync_progress_percent` | Sync progress (10000 = 100%). Must be at 100% for the BP to produce blocks |
+| `dugite_blocks_received_total` | Total blocks received from peers. Should increase steadily |
+| `dugite_slot_number` | Current slot. Compare against network tip to verify sync |
 
 ```bash
 curl -s http://localhost:12798/metrics | grep -E "peers_connected|sync_progress"

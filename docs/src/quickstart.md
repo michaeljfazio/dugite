@@ -12,11 +12,7 @@ tar xzf dugite-x86_64-linux.tar.gz
 sudo mv dugite-node dugite-cli dugite-monitor dugite-config /usr/local/bin/
 ```
 
-**Option B: Container image**
-
-```bash
-docker pull ghcr.io/michaeljfazio/dugite:latest
-```
+**Option B: Container image** *(coming soon — [#507](https://github.com/michaeljfazio/dugite/issues/507))*
 
 **Option C: Build from source**
 
@@ -56,17 +52,6 @@ Or via the top-level [justfile](./development.md):
 
 ```bash
 just run-relay preview
-```
-
-Or with Docker:
-
-```bash
-docker run -d \
-  --name dugite \
-  -p 3001:3001 \
-  -p 12798:12798 \
-  -v dugite-data:/opt/dugite/db \
-  ghcr.io/michaeljfazio/dugite:latest
 ```
 
 The node will:

@@ -354,6 +354,6 @@ graph TB
 
 4. **Verify block production**
    - Confirm sync progress is 100% on all nodes
-   - Check `peers_connected` metrics on relays and BP
-   - Monitor `blocks_forged` metric on the BP after epoch transition
+   - Check `dugite_peers_connected` metrics on relays and BP
+   - Monitor `dugite_blocks_forged_total` metric on the BP after epoch transition
    - Set up [monitoring](./monitoring.md) and KES rotation reminders

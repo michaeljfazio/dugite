@@ -22,7 +22,7 @@ The configuration file uses PascalCase keys (matching the cardano-node conventio
   "ConwayGenesisFile": "conway-genesis.json",
   "TargetNumberOfRootPeers": 60,
   "TargetNumberOfActivePeers": 15,
-  "TargetNumberOfEstablishedPeers": 40,
+  "TargetNumberOfEstablishedPeers": 30,
   "TargetNumberOfKnownPeers": 85,
   "TargetNumberOfActiveBigLedgerPeers": 5,
   "TargetNumberOfEstablishedBigLedgerPeers": 10,
@@ -78,9 +78,9 @@ These parameters control the P2P peer governor's target counts, matching the car
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
 | `TargetNumberOfRootPeers` | integer | 60 | Target number of root peers (bootstrap + local + public roots) |
-| `TargetNumberOfActivePeers` | integer | 15 | Target number of active (hot) peers — fully syncing with ChainSync + BlockFetch |
-| `TargetNumberOfEstablishedPeers` | integer | 40 | Target number of established (warm) peers — TCP connected, keepalive running |
-| `TargetNumberOfKnownPeers` | integer | 85 | Target number of known (cold) peers in the peer table |
+| `TargetNumberOfActivePeers` | integer | 20 | Target number of active (hot) peers — fully syncing with ChainSync + BlockFetch |
+| `TargetNumberOfEstablishedPeers` | integer | 30 | Target number of established (warm) peers — TCP connected, keepalive running |
+| `TargetNumberOfKnownPeers` | integer | 150 | Target number of known (cold) peers in the peer table |
 | `TargetNumberOfActiveBigLedgerPeers` | integer | 5 | Target number of active big ledger peers (high-stake SPOs, prioritised during sync) |
 | `TargetNumberOfEstablishedBigLedgerPeers` | integer | 10 | Target number of established big ledger peers |
 | `TargetNumberOfKnownBigLedgerPeers` | integer | 15 | Target number of known big ledger peers |
