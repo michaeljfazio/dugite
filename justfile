@@ -273,10 +273,13 @@ regenerate-corpus-local:
 
 # ─── Per-area conformance recipes ────────────────────────────────────────────
 #
-# Each recipe runs a single upstream-conformance test area in REQUIRE mode
-# (fails if the fixture is missing rather than skipping).  Run them individually
-# while iterating on a specific area; run `just test-upstream` for the full
-# suite.  All require `just download-upstream-fixtures` to have been run first.
+# Each recipe runs every per-vector test for one fixture area in REQUIRE mode
+# (fails on missing fixtures rather than skipping).  Per-vector tests are
+# generated at build time by `tests/conformance/build.rs` — one #[test] per
+# leaf fixture (or `test_N/` directory for ledger-rules) — so a failure
+# reports the exact vector that broke.  Run them individually while iterating
+# on a specific area; run `just test-upstream` for the full suite.  All
+# require `just download-upstream-fixtures` first.
 
 # UPLC: 999 plutus-core evaluation vectors from IntersectMBO/plutus.
 conformance-uplc:
@@ -285,29 +288,30 @@ conformance-uplc:
 # Alias for `conformance-uplc` — kept for backwards compatibility.
 uplc-conformance: conformance-uplc
 
-# cardano-base: VRF v03 (PraosBatchCompatVRF) test vectors.
+# cardano-base: VRF v03 / v13 test vectors (`vrf*.txt` files).
 conformance-cardano-base:
-    DUGITE_REQUIRE_UPSTREAM=1 cargo nextest run -p dugite-conformance --features upstream-conformance --test upstream_tests -E 'test(cardano_base_vrf_checks)'
+    DUGITE_REQUIRE_UPSTREAM=1 cargo nextest run -p dugite-conformance --features upstream-conformance --test upstream_tests -E 'test(/^upstream_cardano_base_/) + test(cardano_base_vrf_checks)'
 
 # cardano-ledger: golden block/tx decode + CDDL/PParams round-trips.
 conformance-cardano-ledger:
-    DUGITE_REQUIRE_UPSTREAM=1 cargo nextest run -p dugite-conformance --features upstream-conformance --test upstream_tests -E 'test(cardano_ledger_golden_decodes)'
+    DUGITE_REQUIRE_UPSTREAM=1 cargo nextest run -p dugite-conformance --features upstream-conformance --test upstream_tests -E 'test(/^upstream_cardano_ledger_/) + test(cardano_ledger_golden_decodes)'
 
 # cardano-node: genesis-spec JSON decode (Byron + Shelley + Alonzo + Conway).
 conformance-cardano-node:
-    DUGITE_REQUIRE_UPSTREAM=1 cargo nextest run -p dugite-conformance --features upstream-conformance --test upstream_tests -E 'test(cardano_node_genesis_decodes)'
+    DUGITE_REQUIRE_UPSTREAM=1 cargo nextest run -p dugite-conformance --features upstream-conformance --test upstream_tests -E 'test(/^upstream_cardano_node_/) + test(cardano_node_genesis_decodes)'
 
-# ledger-rules: ImpSpec NEWEPOCH + LEDGER CBOR replay (the largest area; multi-minute).
+# ledger-rules: ImpSpec replay — 5,678 vectors across CERT, CERTS,
+# ConwayNEWEPOCH, DELEG, ENACT, GOV, GOVCERT, LEDGER, NEWEPOCH, POOL.
 conformance-ledger-rules:
-    DUGITE_REQUIRE_UPSTREAM=1 cargo nextest run -p dugite-conformance --features upstream-conformance --test upstream_tests -E 'test(ledger_rules_imp_spec_replay)'
+    DUGITE_REQUIRE_UPSTREAM=1 cargo nextest run -p dugite-conformance --features upstream-conformance --test upstream_tests -E 'test(/^upstream_ledger_rules_/) + test(ledger_rules_imp_spec_replay)'
 
 # mithril: certificate fixture verification.
 conformance-mithril:
-    DUGITE_REQUIRE_UPSTREAM=1 cargo nextest run -p dugite-conformance --features upstream-conformance --test upstream_tests -E 'test(mithril_certificate_checks)'
+    DUGITE_REQUIRE_UPSTREAM=1 cargo nextest run -p dugite-conformance --features upstream-conformance --test upstream_tests -E 'test(/^upstream_mithril_/) + test(mithril_certificate_checks)'
 
 # ouroboros-consensus: per-era golden block/header decode round-trips.
 conformance-ouroboros-consensus:
-    DUGITE_REQUIRE_UPSTREAM=1 cargo nextest run -p dugite-conformance --features upstream-conformance --test upstream_tests -E 'test(ouroboros_consensus_golden_decodes)'
+    DUGITE_REQUIRE_UPSTREAM=1 cargo nextest run -p dugite-conformance --features upstream-conformance --test upstream_tests -E 'test(/^upstream_ouroboros_consensus_/) + test(ouroboros_consensus_golden_decodes)'
 
 # Meta: verify every required fixture file is present at the manifest-pinned tag.
 conformance-status:
