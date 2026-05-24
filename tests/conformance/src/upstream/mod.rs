@@ -1,5 +1,7 @@
 pub mod cardano_ledger;
 pub mod cardano_node;
 pub mod fixtures;
+#[cfg(feature = "upstream-conformance")]
+pub mod ledger_rules_replay;
 pub mod ouroboros_consensus;
 pub mod status;
