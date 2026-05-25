@@ -89,7 +89,7 @@ scripts/regenerate-conformance-corpus/
 
 .cargo/config.toml                        ← `xtask` alias
 .gitignore                                ← entry for tests/conformance/upstream/fixtures/
-justfile                                  ← `download-upstream-fixtures` + `test-upstream` + `regenerate-corpus-local` recipes
+justfile                                  ← `download-upstream-fixtures` + `test-conformance` + `regenerate-corpus-local` recipes
 ```
 
 ### Two-file pin model
@@ -261,7 +261,7 @@ The job:
 2. Trigger the workflow manually (or wait for the next scheduled run).
 3. Workflow produces a new release `conformance-corpus-v<timestamp>` on the dugite repo.
 4. Edit `manifest.toml`: update `[release].tag` to the new release tag.
-5. Run `just download-upstream-fixtures` → `just test-upstream` locally.
+5. Run `just download-upstream-fixtures` → `just test-conformance` locally.
 6. Fix any test fallout (ledger code adaptations, etc.).
 7. Commit `sources.toml` + `manifest.toml` + any code changes. PR diff is small and reviewable.
 
@@ -547,7 +547,7 @@ download-upstream-fixtures:
 download-upstream-fixtures-area AREA:
     cargo xtask download-upstream-fixtures --area {{AREA}}
 
-test-upstream:
+test-conformance:
     DUGITE_REQUIRE_UPSTREAM=1 cargo nextest run -p dugite-uplc --features upstream-conformance --test conformance
     DUGITE_REQUIRE_UPSTREAM=1 cargo nextest run -p dugite-conformance --features upstream-conformance --test upstream_tests
 
@@ -648,7 +648,7 @@ Phase 0 is complete when:
 
 Phase 1 is complete when:
 - `cargo xtask download-upstream-fixtures` populates all Phase-1 fixture subdirs and writes the sentinel.
-- `DUGITE_REQUIRE_UPSTREAM=1 just test-upstream` passes Phase-1 tests on CI and locally.
+- `DUGITE_REQUIRE_UPSTREAM=1 just test-conformance` passes Phase-1 tests on CI and locally.
 - `scripts/dev/download-plutus-conformance.sh` is deleted.
 - `crates/dugite-uplc/tests/conformance/` is removed; UPLC tests read from the unified fixture root.
 - `cargo build --workspace` passes (xtask compiles cleanly).

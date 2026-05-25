@@ -139,7 +139,7 @@ dugite GitHub release pinned in `tests/conformance/upstream/manifest.toml`.
 just download-upstream-fixtures
 
 # Run the full UPLC + upstream golden test suite
-just test-upstream
+just test-conformance
 
 # Run a single area
 cargo xtask download-upstream-fixtures --area ledger-rules
@@ -164,7 +164,7 @@ DUGITE_REQUIRE_UPSTREAM=1 cargo nextest run -p dugite-conformance \
 1. Edit `tests/conformance/upstream/sources.toml` to bump a pin.
 2. Trigger `.github/workflows/regenerate-conformance-corpus.yml` (manual dispatch or weekly auto).
 3. Update `[release].tag` in `tests/conformance/upstream/manifest.toml`.
-4. Run `just download-upstream-fixtures && just test-upstream`.
+4. Run `just download-upstream-fixtures && just test-conformance`.
 5. Commit `sources.toml` + `manifest.toml` + any code changes.
 
 The `ledger-rules` area builds cardano-ledger from source (GHC 9.6.5 +

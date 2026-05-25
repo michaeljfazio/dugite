@@ -102,7 +102,7 @@ Append the following content to `docs/src/reference/conformance.md` (after the S
 
 ```bash
 just download-upstream-fixtures
-just conformance-uplc
+just test-conformance-uplc
 ```
 
 ### ouroboros-consensus
@@ -117,7 +117,7 @@ just conformance-uplc
 
 ```bash
 just download-upstream-fixtures
-just conformance-ouroboros-consensus
+just test-conformance-ouroboros-consensus
 ```
 
 ### cardano-ledger
@@ -132,7 +132,7 @@ just conformance-ouroboros-consensus
 
 ```bash
 just download-upstream-fixtures
-just conformance-cardano-ledger
+just test-conformance-cardano-ledger
 ```
 
 ### cardano-node
@@ -147,7 +147,7 @@ just conformance-cardano-ledger
 
 ```bash
 just download-upstream-fixtures
-just conformance-cardano-node
+just test-conformance-cardano-node
 ```
 
 ### ledger-rules (ImpSpec)
@@ -162,7 +162,7 @@ just conformance-cardano-node
 
 ```bash
 just download-upstream-fixtures
-just conformance-ledger-rules
+just test-conformance-ledger-rules
 ```
 
 ### cardano-base
@@ -177,7 +177,7 @@ just conformance-ledger-rules
 
 ```bash
 just download-upstream-fixtures
-just conformance-cardano-base
+just test-conformance-cardano-base
 ```
 
 ### mithril
@@ -192,7 +192,7 @@ just conformance-cardano-base
 
 ```bash
 just download-upstream-fixtures
-just conformance-mithril
+just test-conformance-mithril
 ```
 ````
 
@@ -229,7 +229,7 @@ To adopt a new upstream version:
 1. Edit `tests/conformance/upstream/sources.toml`, bumping the SHA (or tag for the `plutus` area) of the area you want to refresh.
 2. Trigger the `regenerate-conformance-corpus` workflow on GitHub (manual dispatch, or wait for the weekly automatic run). It produces a new dugite release tagged `conformance-corpus-v<timestamp>` with the seven tarballs attached.
 3. Update `[release].tag` in `tests/conformance/upstream/manifest.toml` to point at the new release tag.
-4. Run `just download-upstream-fixtures && just test-upstream` locally.
+4. Run `just download-upstream-fixtures && just test-conformance` locally.
 5. Fix any test fallout, then commit the `sources.toml` + `manifest.toml` updates together with the code changes.
 
 ## See also

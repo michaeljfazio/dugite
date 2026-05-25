@@ -114,7 +114,7 @@ evidence pair adjacent:
 
 6. **Updating the corpus** (~80 words). Procedure: edit `sources.toml` →
    trigger the regenerate workflow → bump `[release].tag` in `manifest.toml`
-   → `just download-upstream-fixtures && just test-upstream` → commit
+   → `just download-upstream-fixtures && just test-conformance` → commit
    `sources.toml` + `manifest.toml`.
 
 7. **See also** — link to the wiki `Protocol-Compliance` page (feature-level
