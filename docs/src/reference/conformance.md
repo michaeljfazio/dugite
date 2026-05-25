@@ -148,3 +148,25 @@ just test-conformance-cardano-base
 just download-upstream-fixtures
 just test-conformance-mithril
 ```
+
+## CI integration
+
+The `upstream-conformance` job in `.github/workflows/ci.yml` runs both the UPLC suite and the upstream tests with the `DUGITE_REQUIRE_UPSTREAM=1` environment variable set. This variable makes a missing fixture a hard failure rather than a silent skip — the gate exists specifically to stop the suite from quietly degrading to a no-op when something is wrong with the fixture cache or download.
+
+Fixture tarballs are cached on the CI runner, keyed by the SHA-256 content hash of `tests/conformance/upstream/manifest.toml`. Bumping `[release].tag` in that file invalidates the cache automatically; no separate cache-bust step is needed.
+
+## Updating the corpus
+
+To adopt a new upstream version:
+
+1. Edit `tests/conformance/upstream/sources.toml`, bumping the SHA (or tag for the `plutus` area) of the area you want to refresh.
+2. Trigger the `regenerate-conformance-corpus` workflow on GitHub (manual dispatch, or wait for the weekly automatic run). It produces a new dugite release tagged `conformance-corpus-v<timestamp>` with the seven tarballs attached.
+3. Update `[release].tag` in `tests/conformance/upstream/manifest.toml` to point at the new release tag.
+4. Run `just download-upstream-fixtures && just test-conformance` locally.
+5. Fix any test fallout, then commit the `sources.toml` + `manifest.toml` updates together with the code changes.
+
+## See also
+
+- [Benchmarks](./benchmarks.md) — performance evidence.
+- Wiki [Protocol Compliance](https://github.com/michaeljfazio/dugite/wiki/Protocol-Compliance) — feature-by-feature compatibility catalogue.
+- Wiki [Known Issues](https://github.com/michaeljfazio/dugite/wiki/Known-Issues) — open gaps and follow-ups.
