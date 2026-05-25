@@ -630,3 +630,96 @@ async fn follow_tip_intersect_with_no_match_skips_reset() {
     drop(stream);
     server.stop().await;
 }
+
+#[tokio::test]
+async fn follow_tip_apply_event_carries_native_bytes_when_block_resolves() {
+    use dugite_rpc::proto::v1beta::sync::sync_service_client::SyncServiceClient;
+    use dugite_rpc::proto::v1beta::sync::{follow_tip_response, FollowTipRequest};
+    use tokio_stream::StreamExt;
+
+    // Mock chain contains a block at hash byte 0x77 → block_by_hash
+    // succeeds; FollowTip should populate native_bytes from the CBOR.
+    let server = TestServer::start(SyncMock::new(vec![entry(700, 0x77, 7)])).await;
+    let publisher = server.tip_feed.publisher();
+    let mut client = SyncServiceClient::new(server.channel().await);
+    let stream = client
+        .follow_tip(FollowTipRequest {
+            intersect: vec![],
+            field_mask: None,
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    let mut stream = stream;
+
+    let mut h = [0u8; 32];
+    h[0] = 0x77;
+    publisher.announce_apply(TipInfo {
+        slot: 700,
+        hash: h,
+        block_number: 7,
+        era: Era::Conway,
+    });
+
+    let msg = stream.next().await.expect("apply msg").unwrap();
+    match msg.action.expect("action") {
+        follow_tip_response::Action::Apply(envelope) => {
+            assert_eq!(
+                envelope.native_bytes,
+                vec![0xDE, 0xAD, 0x77],
+                "FollowTip apply should carry the block's native_bytes"
+            );
+        }
+        other => panic!("expected apply, got {other:?}"),
+    }
+    drop(stream);
+    server.stop().await;
+}
+
+#[tokio::test]
+async fn follow_tip_apply_event_native_bytes_empty_when_block_missing() {
+    use dugite_rpc::proto::v1beta::sync::sync_service_client::SyncServiceClient;
+    use dugite_rpc::proto::v1beta::sync::{follow_tip_response, FollowTipRequest};
+    use tokio_stream::StreamExt;
+
+    // Mock chain has only block 0x77; we fire an apply for 0x99 which
+    // isn't in the mock → resolver logs WARN and emits empty envelope.
+    let server = TestServer::start(SyncMock::new(vec![entry(700, 0x77, 7)])).await;
+    let publisher = server.tip_feed.publisher();
+    let mut client = SyncServiceClient::new(server.channel().await);
+    let stream = client
+        .follow_tip(FollowTipRequest {
+            intersect: vec![],
+            field_mask: None,
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    let mut stream = stream;
+
+    let mut h = [0u8; 32];
+    h[0] = 0x99;
+    publisher.announce_apply(TipInfo {
+        slot: 999,
+        hash: h,
+        block_number: 9,
+        era: Era::Conway,
+    });
+
+    let msg = stream.next().await.expect("apply msg").unwrap();
+    match msg.action.expect("action") {
+        follow_tip_response::Action::Apply(envelope) => {
+            assert!(
+                envelope.native_bytes.is_empty(),
+                "missing block → empty native_bytes (degraded but stream stays alive)"
+            );
+            // tip BlockRef still carries metadata so the client can
+            // FetchBlock with the hash + slot.
+            let tip = msg.tip.expect("tip metadata");
+            assert_eq!(tip.slot, 999);
+        }
+        other => panic!("expected apply, got {other:?}"),
+    }
+    drop(stream);
+    server.stop().await;
+}
