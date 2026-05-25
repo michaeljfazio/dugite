@@ -24,7 +24,9 @@ use anyhow::{Context, Result};
 use serde_json::Value;
 use tempfile::NamedTempFile;
 
-use crate::schema::KNOWN_PARAMS;
+use crate::path::path_to_json_pointer;
+use crate::schema::ParamType;
+use crate::schema::{SubParamDef, KNOWN_PARAMS};
 
 // ---------------------------------------------------------------------------
 // Flat key-value entry (the TUI's working unit)
@@ -53,7 +55,6 @@ pub struct ConfigEntry {
     /// synthesised during `inject_schema_defaults`. Empty for non-Object
     /// entries and for sub-keys that were present in the on-disk file.
     /// Used by `save_config` to decide which synthetic leaves to prune.
-    #[allow(dead_code)]
     pub synthetic_paths: std::collections::HashSet<String>,
 }
 
@@ -141,6 +142,60 @@ impl ConfigEntry {
 }
 
 // ---------------------------------------------------------------------------
+// Object sub-field hydration
+// ---------------------------------------------------------------------------
+
+/// Recursively ensure every schema-known leaf in `fields` is present in
+/// `value`. Records every inserted path in `synthetic_paths`. The pointer
+/// strings recorded use RFC 6901 form (see `path::path_to_json_pointer`).
+///
+/// Pre-condition: `value` is a `Value::Object` (or `Value::Null`, which is
+/// promoted to an empty object before walking).
+pub(crate) fn hydrate_object(
+    value: &mut Value,
+    fields: &[SubParamDef],
+    path: &mut Vec<String>,
+    synthetic_paths: &mut std::collections::HashSet<String>,
+) {
+    if value.is_null() {
+        *value = Value::Object(serde_json::Map::new());
+    }
+    let Some(map) = value.as_object_mut() else {
+        return; // Type mismatch — leave the user's value alone.
+    };
+
+    for sub in fields {
+        path.push(sub.key.to_string());
+
+        match &sub.param_type {
+            ParamType::Object {
+                fields: inner_fields,
+            } => {
+                // Create the nested object if absent and record it as synthetic.
+                let inserted = !map.contains_key(sub.key);
+                let entry = map
+                    .entry(sub.key.to_string())
+                    .or_insert_with(|| Value::Object(serde_json::Map::new()));
+                if inserted {
+                    synthetic_paths.insert(path_to_json_pointer(path));
+                }
+                hydrate_object(entry, inner_fields, path, synthetic_paths);
+            }
+            _ => {
+                if !map.contains_key(sub.key) {
+                    if let Some(default_value) = sub.default_as_json() {
+                        map.insert(sub.key.to_string(), default_value);
+                        synthetic_paths.insert(path_to_json_pointer(path));
+                    }
+                }
+            }
+        }
+
+        path.pop();
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Loaded config
 // ---------------------------------------------------------------------------
 
@@ -178,6 +233,8 @@ impl LoadedConfig {
     /// Parameters whose schema default cannot be represented (no default
     /// available for the parameter's type) are skipped.
     pub fn inject_schema_defaults(&mut self) {
+        // Pass 1 — append synthetic top-level entries for every schema key not
+        // already present in the file.
         let present: HashSet<String> = self.entries.iter().map(|e| e.key.clone()).collect();
         for def in KNOWN_PARAMS {
             if present.contains(def.key) {
@@ -189,8 +246,27 @@ impl LoadedConfig {
                     value,
                     modified: false,
                     present_in_file: false,
-                    synthetic_paths: std::collections::HashSet::new(),
+                    synthetic_paths: HashSet::new(),
                 });
+            }
+        }
+
+        // Pass 2 — for every entry whose schema is `ParamType::Object`, recursively
+        // hydrate each missing leaf and record the path in `synthetic_paths`.
+        let lookup: std::collections::HashMap<&str, &'static crate::schema::ParamDef> =
+            KNOWN_PARAMS.iter().map(|d| (d.key, d)).collect();
+        for entry in self.entries.iter_mut() {
+            let Some(def) = lookup.get(entry.key.as_str()).copied() else {
+                continue;
+            };
+            if let ParamType::Object { fields } = &def.param_type {
+                let mut path: Vec<String> = Vec::new();
+                hydrate_object(
+                    &mut entry.value,
+                    fields,
+                    &mut path,
+                    &mut entry.synthetic_paths,
+                );
             }
         }
     }
@@ -633,5 +709,113 @@ mod tests {
         let f = write_temp(r#"{"EnableP2P": true}"#);
         let config = load_config(f.path()).unwrap();
         assert!(config.entries[0].synthetic_paths.is_empty());
+    }
+
+    #[test]
+    fn test_inject_hydrates_object_subfields_when_object_empty() {
+        use crate::schema::{ParamType, Reloadability, SubParamDef};
+        const FIELDS: &[SubParamDef] = &[
+            SubParamDef {
+                key: "a",
+                param_type: ParamType::U64 { min: 0, max: 100 },
+                default: "7",
+                description: "",
+                tuning_hint: "",
+                reloadability: Reloadability::Restart,
+            },
+            SubParamDef {
+                key: "b",
+                param_type: ParamType::Bool,
+                default: "true",
+                description: "",
+                tuning_hint: "",
+                reloadability: Reloadability::Restart,
+            },
+        ];
+
+        let mut value = serde_json::json!({});
+        let mut paths: std::collections::HashSet<String> = std::collections::HashSet::new();
+        hydrate_object(&mut value, FIELDS, &mut Vec::new(), &mut paths);
+
+        assert_eq!(value, serde_json::json!({ "a": 7, "b": true }));
+        assert!(paths.contains("/a"));
+        assert!(paths.contains("/b"));
+        assert_eq!(paths.len(), 2);
+    }
+
+    #[test]
+    fn test_inject_object_subfields_idempotent() {
+        use crate::schema::{ParamType, Reloadability, SubParamDef};
+        const FIELDS: &[SubParamDef] = &[SubParamDef {
+            key: "a",
+            param_type: ParamType::U64 { min: 0, max: 100 },
+            default: "7",
+            description: "",
+            tuning_hint: "",
+            reloadability: Reloadability::Restart,
+        }];
+
+        let mut value = serde_json::json!({});
+        let mut paths: std::collections::HashSet<String> = std::collections::HashSet::new();
+        hydrate_object(&mut value, FIELDS, &mut Vec::new(), &mut paths);
+        hydrate_object(&mut value, FIELDS, &mut Vec::new(), &mut paths);
+
+        assert_eq!(value, serde_json::json!({ "a": 7 }));
+        assert_eq!(paths.len(), 1);
+    }
+
+    #[test]
+    fn test_inject_does_not_hydrate_present_subkey() {
+        use crate::schema::{ParamType, Reloadability, SubParamDef};
+        const FIELDS: &[SubParamDef] = &[SubParamDef {
+            key: "a",
+            param_type: ParamType::U64 { min: 0, max: 100 },
+            default: "7",
+            description: "",
+            tuning_hint: "",
+            reloadability: Reloadability::Restart,
+        }];
+
+        let mut value = serde_json::json!({ "a": 42 });
+        let mut paths: std::collections::HashSet<String> = std::collections::HashSet::new();
+        hydrate_object(&mut value, FIELDS, &mut Vec::new(), &mut paths);
+
+        assert_eq!(value, serde_json::json!({ "a": 42 }));
+        assert!(
+            paths.is_empty(),
+            "user-provided value must not be synthetic"
+        );
+    }
+
+    #[test]
+    fn test_inject_recurses_into_nested_object() {
+        use crate::schema::{ParamType, Reloadability, SubParamDef};
+        const INNER: &[SubParamDef] = &[SubParamDef {
+            key: "y",
+            param_type: ParamType::Bool,
+            default: "true",
+            description: "",
+            tuning_hint: "",
+            reloadability: Reloadability::Restart,
+        }];
+        const OUTER: &[SubParamDef] = &[SubParamDef {
+            key: "inner",
+            param_type: ParamType::Object { fields: INNER },
+            default: "",
+            description: "",
+            tuning_hint: "",
+            reloadability: Reloadability::Restart,
+        }];
+
+        let mut value = serde_json::json!({});
+        let mut paths: std::collections::HashSet<String> = std::collections::HashSet::new();
+        hydrate_object(&mut value, OUTER, &mut Vec::new(), &mut paths);
+
+        assert_eq!(value, serde_json::json!({ "inner": { "y": true } }));
+        assert!(
+            paths.contains("/inner"),
+            "intermediate object node is synthetic"
+        );
+        assert!(paths.contains("/inner/y"));
     }
 }
