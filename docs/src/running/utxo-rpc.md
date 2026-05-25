@@ -51,12 +51,13 @@ in-tree at `crates/dugite-rpc/proto/VERSION`.
 | `QueryService` | `ReadUtxos` | ✅ implemented |
 | `QueryService` | `ReadGenesis` | ✅ implemented (minimum-viable envelope) |
 | `QueryService` | `ReadEraSummary` | ✅ implemented |
-| `QueryService` | `SearchUtxos` / `ReadData` / `ReadTx` / `ReadState` | ⏳ M2.B follow-up |
+| `QueryService` | `SearchUtxos` | ✅ implemented for `exact_address` / `payment_part` / `asset` predicates; other variants return `UNIMPLEMENTED` |
+| `QueryService` | `ReadData` / `ReadTx` / `ReadState` | ⏳ follow-up |
 | `SubmitService` | `SubmitTx` | ✅ implemented |
 | `SubmitService` | `ReadMempool` | ✅ implemented |
 | `SubmitService` | `WaitForTx` (stream) | ✅ implemented |
 | `SubmitService` | `WatchMempool` (stream) | ✅ implemented |
-| `SubmitService` | `EvalTx` | ⏳ follow-up — needs non-committing UPLC helper |
+| `SubmitService` | `EvalTx` | ✅ implemented (per-redeemer `ex_units` / Plutus traces returned as zeros — full plumbing follow-up) |
 | `WatchService` | `WatchTx` (stream) | ✅ implemented (match-all in v1; pattern filtering follow-up) |
 
 ## Configuration
@@ -175,16 +176,19 @@ updated, or vice versa) are caught by code review against the diff.
 
 ## Limitations
 
-* `EvalTx` (Plutus dry-run) returns `UNIMPLEMENTED` until a non-
-  committing UPLC evaluation helper lands.
-* Cert / governance / script / Plutus-witness / metadatum fields on
-  `Tx` are populated minimally in M1.B; full mapping is the M2.B
-  follow-up.
-* `SearchUtxos` returns `UNIMPLEMENTED` pending the in-ledger
-  payment-credential and asset indexes.
-* `FollowTip` apply events carry tip metadata only; the full
-  `AnyChainBlock.native_bytes` requires an async block fetch per
-  event — clients should `FetchBlock` with `tip.hash` for the bytes.
+* `EvalTx` runs the tx through the standard Phase-1 + Phase-2 validator,
+  but the per-redeemer `ex_units` / Plutus traces on the response are
+  currently zeros — full plumbing of the CEK machine's metering output
+  into the response message is a follow-up.
+* `SearchUtxos` supports the `exact_address`, `payment_part`, and
+  `asset` predicates; `delegation_part`, composite (`AND`/`OR`)
+  predicates and the address-pattern shorthand return
+  `UNIMPLEMENTED`.
+* `QueryService.ReadData` / `ReadTx` / `ReadState` return
+  `UNIMPLEMENTED`.
+* `FollowTip` apply events carry `AnyChainBlock.native_bytes` (the
+  raw block CBOR); clients that only need tip metadata can ignore
+  the payload.
 
 ## See also
 
