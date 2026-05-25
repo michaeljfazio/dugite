@@ -493,13 +493,15 @@ impl<'b> Reader<'b> {
                     .map_err(|e| SerializationError::CborDecode(format!("bigint tag: {e}")))?;
                 match tag_val.as_u64() {
                     TAG_BIGNUM_POS => {
-                        let bytes = self.read_bytes()?;
-                        Ok(BigInt::from_bytes_be(num_bigint::Sign::Plus, bytes))
+                        // CBOR §3.4.3 + Cardano `bounded_bytes`: bignum
+                        // mantissa may be indefinite-length. See #673.
+                        let bytes = self.read_bytes_owned()?;
+                        Ok(BigInt::from_bytes_be(num_bigint::Sign::Plus, &bytes))
                     }
                     TAG_BIGNUM_NEG => {
-                        let bytes = self.read_bytes()?;
+                        let bytes = self.read_bytes_owned()?;
                         // value = -1 - n  where n = BigInt::from_bytes_be(+, bytes)
-                        let magnitude = BigInt::from_bytes_be(num_bigint::Sign::Plus, bytes);
+                        let magnitude = BigInt::from_bytes_be(num_bigint::Sign::Plus, &bytes);
                         Ok(-BigInt::from(1) - magnitude)
                     }
                     other => Err(SerializationError::CborDecode(format!(

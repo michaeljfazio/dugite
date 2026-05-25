@@ -599,6 +599,33 @@ mod tests {
     /// 17,764,772 (chunk 04112 entry 40). Block size 16577 bytes;
     /// contains a Plutus tx with embedded PlutusData containing a
     /// bignum encoded as `tag(2) 0x5f ... 0xff`.
+    /// Regression for #673 (Bug A2 / preprod variant): the Conway
+    /// PlutusData decoder dispatches bignum (tag(2)/tag(3)) via
+    /// `Reader::read_bigint()`, which itself used `read_bytes()` and
+    /// rejected indef-length mantissas. Distinct from the alonzo
+    /// PlutusData path (which has its own bignum arm); fixed by
+    /// switching `read_bigint()` to `read_bytes_owned()`.
+    ///
+    /// Fixture: real on-disk Conway block at preprod slot 70806465
+    /// (chunk 03278 entry 57). 13098 bytes; contains a Plutus tx
+    /// with a `PlutusData::Integer` encoded as `tag(2) 0x5f ... 0xff`.
+    #[test]
+    fn decode_conway_block_with_indefinite_bignum_via_read_bigint_roundtrips() {
+        let cbor = include_bytes!(
+            "../../tests/fixtures/conway_indef_bignum_via_read_bigint_block_70806465.cbor"
+        );
+        // Preprod Byron epoch length = 21600 slots.
+        let block = decode_block(cbor, 21600, false)
+            .expect("real Conway block with indef bignum via read_bigint must decode (full)");
+        assert_eq!(block.slot().0, 70806465);
+        assert_eq!(block.era, dugite_primitives::era::Era::Conway);
+
+        let block_min = decode_block(cbor, 21600, true)
+            .expect("real Conway block with indef bignum via read_bigint must decode (min)");
+        assert_eq!(block_min.slot().0, 70806465);
+        assert_eq!(block.transactions.len(), block_min.transactions.len());
+    }
+
     #[test]
     fn decode_babbage_block_with_indefinite_bignum_bytes_roundtrips() {
         let cbor =
