@@ -261,6 +261,10 @@ _zoo_anchor_seed() {
         [update-committee]='{"@context":{},"hashAlgorithm":"blake2b-256","body":{"title":"tx-zoo cc","abstract":"cc","motivation":"cc","rationale":"cc","references":[]}}'
         [new-constitution]='{"@context":{},"hashAlgorithm":"blake2b-256","body":{"title":"tx-zoo constitution","abstract":"cn","motivation":"cn","rationale":"cn","references":[]}}'
         [constitution-body]='{"@context":{},"hashAlgorithm":"blake2b-256","body":{"text":"tx-zoo constitution body","articles":[]}}'
+        [gov-proposal]='{"@context":{},"hashAlgorithm":"blake2b-256","body":{"title":"tx-zoo gov-lifecycle proposal","abstract":"minFeeA+1","motivation":"lifecycle","rationale":"lifecycle","references":[]}}'
+        [drep-vote]='{"@context":{},"hashAlgorithm":"blake2b-256","body":{"title":"tx-zoo drep vote","comment":"yes","references":[]}}'
+        [spo-vote]='{"@context":{},"hashAlgorithm":"blake2b-256","body":{"title":"tx-zoo spo vote","comment":"yes","references":[]}}'
+        [cc-vote]='{"@context":{},"hashAlgorithm":"blake2b-256","body":{"title":"tx-zoo cc vote","comment":"yes","references":[]}}'
     )
     for f in "${!anchors[@]}"; do
         printf '%s' "${anchors[$f]}" > "$ZOO_ANCHOR_DIR/$f.json"
