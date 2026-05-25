@@ -30,6 +30,8 @@ pub mod masking;
 pub mod mempool_feed;
 pub mod metrics;
 pub mod proto;
+pub mod server;
+pub mod services;
 pub mod stream;
 pub mod tip_feed;
 
@@ -41,4 +43,5 @@ pub use context::{
 pub use error::RpcError;
 pub use mempool_feed::{MempoolEvent, MempoolFeed, MempoolRemoveReason};
 pub use metrics::{noop_metrics, NoopMetrics, RpcMetricsSink, SharedMetrics};
+pub use server::{RpcServer, RpcServerHandle};
 pub use tip_feed::{TipFeed, TipPublisher, TipRollback};
