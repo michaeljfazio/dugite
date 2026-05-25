@@ -1776,6 +1776,7 @@ dependencies = [
  "bytes",
  "dugite-mempool",
  "dugite-primitives",
+ "dugite-serialization",
  "futures",
  "hex",
  "prost",
