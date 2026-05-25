@@ -2046,4 +2046,57 @@ mod tests {
             _ => panic!("Rpc must be Object"),
         }
     }
+
+    #[test]
+    fn every_object_param_has_non_empty_fields() {
+        for def in KNOWN_PARAMS {
+            if let ParamType::Object { fields } = &def.param_type {
+                assert!(
+                    !fields.is_empty(),
+                    "Object param '{}' has empty fields — populate sub-schema",
+                    def.key
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn every_subfield_default_is_parseable() {
+        fn walk(parent_path: &str, fields: &[SubParamDef]) {
+            for sub in fields {
+                let path = format!("{parent_path}.{}", sub.key);
+
+                // Empty default is the explicit "no hydration" signal for numeric /
+                // Bool / Enum types — skip.
+                if sub.default.is_empty()
+                    && matches!(
+                        sub.param_type,
+                        ParamType::U64 { .. }
+                            | ParamType::F64 { .. }
+                            | ParamType::Bool
+                            | ParamType::Enum { .. }
+                    )
+                {
+                    continue;
+                }
+
+                assert!(
+                    sub.default_as_json().is_some(),
+                    "sub-field {path} has unparseable default '{}'",
+                    sub.default,
+                );
+
+                // Recurse into nested Objects.
+                if let ParamType::Object { fields: inner } = &sub.param_type {
+                    walk(&path, inner);
+                }
+            }
+        }
+
+        for def in KNOWN_PARAMS {
+            if let ParamType::Object { fields } = &def.param_type {
+                walk(def.key, fields);
+            }
+        }
+    }
 }
