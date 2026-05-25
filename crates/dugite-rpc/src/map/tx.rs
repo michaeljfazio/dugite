@@ -63,11 +63,13 @@ pub fn tx_to_proto(tx: &Transaction) -> pb::Tx {
         successful: tx.is_valid,
         auxiliary: aux_to_proto(tx),
         hash: hash_bytes(&tx.hash),
-        // Governance action proposals + votes → cardano.GovernanceAction
-        // mapping is its own large module (7 action variants + Voter +
-        // VotingProcedure); deferred to a follow-up.
-        proposals: Vec::new(),
-        votes: Vec::new(),
+        proposals: tx
+            .body
+            .proposal_procedures
+            .iter()
+            .map(crate::map::governance::proposal_to_proto)
+            .collect(),
+        votes: crate::map::governance::votes_to_proto(&tx.body.voting_procedures),
     }
 }
 
