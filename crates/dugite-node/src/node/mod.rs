@@ -2234,7 +2234,11 @@ impl Node {
             let n2c_max_connections = self.config.max_n2c_connections.max(1);
             let n2c_semaphore = Arc::new(Semaphore::new(n2c_max_connections));
 
+            // Clone the validator so the spawn move closure doesn't consume
+            // it — the RPC startup block below needs the same Arc (#672 M3).
+            let n2c_tx_validator_for_spawn = n2c_tx_validator.clone();
             tokio::spawn(async move {
+                let n2c_tx_validator = n2c_tx_validator_for_spawn;
                 let mut shutdown = n2c_shutdown_rx;
                 // Track spawned connection handlers so we can abort them on
                 // shutdown — otherwise they block indefinitely waiting for
@@ -2844,6 +2848,7 @@ impl Node {
                 self.chain_db.clone(),
                 self.ledger_state.clone(),
                 self.mempool.clone(),
+                n2c_tx_validator.clone() as Arc<dyn dugite_network::TxValidator>,
             ));
             let (tip_feed, tip_publisher) = crate::rpc_adapter::build_tip_feed();
             // Spawn forwarder: subscribes to the node-side TipBroadcaster
