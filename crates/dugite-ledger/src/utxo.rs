@@ -227,6 +227,31 @@ impl UtxoSet {
         self.utxos.get(input).cloned()
     }
 
+    /// List every `(input, output)` pair whose output address matches
+    /// `addr`. Issue #672 — `QueryService.SearchUtxos` follow-up.
+    ///
+    /// Honours the secondary `address_index` when present (rebuilt via
+    /// `rebuild_address_index()` after snapshot load). Returns an empty
+    /// Vec when indexing was disabled at load time.
+    pub fn outputs_for_address(
+        &self,
+        addr: &Address,
+    ) -> Vec<(TransactionInput, TransactionOutput)> {
+        if let Some(ref store) = self.store {
+            return store.outputs_for_address(addr);
+        }
+        let Some(inputs) = self.address_index.get(addr) else {
+            return Vec::new();
+        };
+        let mut out = Vec::with_capacity(inputs.len());
+        for input in inputs {
+            if let Some(output) = self.utxos.get(input).cloned() {
+                out.push((input.clone(), output));
+            }
+        }
+        out
+    }
+
     /// Insert a new UTxO
     pub fn insert(&mut self, input: TransactionInput, output: TransactionOutput) {
         if let Some(ref mut store) = self.store {

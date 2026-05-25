@@ -355,10 +355,10 @@ async fn read_era_summary_returns_summaries() {
     server.stop().await;
 }
 
-// ─── Unimplemented methods (M2.B coverage) ───────────────────────────────
+// ─── SearchUtxos by exact address ─────────────────────────────────────────
 
 #[tokio::test]
-async fn search_utxos_returns_unimplemented_in_m2a() {
+async fn search_utxos_empty_predicate_returns_unimplemented() {
     use dugite_rpc::proto::v1beta::query::query_service_client::QueryServiceClient;
     use dugite_rpc::proto::v1beta::query::SearchUtxosRequest;
 
@@ -369,5 +369,45 @@ async fn search_utxos_returns_unimplemented_in_m2a() {
         .await
         .unwrap_err();
     assert_eq!(status.code(), tonic::Code::Unimplemented);
+    server.stop().await;
+}
+
+#[tokio::test]
+async fn search_utxos_payment_part_pattern_returns_unimplemented() {
+    use dugite_rpc::proto::v1beta::cardano::{AddressPattern, TxOutputPattern};
+    use dugite_rpc::proto::v1beta::query::query_service_client::QueryServiceClient;
+    use dugite_rpc::proto::v1beta::query::{
+        any_utxo_pattern, AnyUtxoPattern, SearchUtxosRequest, UtxoPredicate,
+    };
+
+    let server = TestServer::start(make_mock()).await;
+    let mut client = QueryServiceClient::new(server.channel().await);
+    let status = client
+        .search_utxos(SearchUtxosRequest {
+            predicate: Some(UtxoPredicate {
+                r#match: Some(AnyUtxoPattern {
+                    utxo_pattern: Some(any_utxo_pattern::UtxoPattern::Cardano(TxOutputPattern {
+                        address: Some(AddressPattern {
+                            exact_address: None,
+                            payment_part: Some(vec![0xAA; 28]),
+                            delegation_part: None,
+                        }),
+                        asset: None,
+                    })),
+                }),
+                not: vec![],
+                all_of: vec![],
+                any_of: vec![],
+            }),
+            field_mask: None,
+            max_items: None,
+            start_token: None,
+        })
+        .await
+        .unwrap_err();
+    // payment_part patterns aren't supported yet — service should
+    // signal that explicitly.
+    assert_eq!(status.code(), tonic::Code::Unimplemented);
+    assert!(status.message().contains("exact_address"));
     server.stop().await;
 }

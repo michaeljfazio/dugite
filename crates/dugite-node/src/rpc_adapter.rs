@@ -204,10 +204,19 @@ impl LedgerContext for NodeRpcAdapter {
         Ok(out)
     }
 
-    async fn utxos_by_address(&self, _addr: &Address) -> Result<Vec<UtxoSnapshot>, RpcError> {
-        Err(RpcError::Unimplemented(
-            "LedgerContext::utxos_by_address (M2.B — needs UtxoSet::outputs_for_address accessor)",
-        ))
+    async fn utxos_by_address(&self, addr: &Address) -> Result<Vec<UtxoSnapshot>, RpcError> {
+        let ledger = self.ledger_state.read().await;
+        Ok(ledger
+            .utxo
+            .utxo_set
+            .outputs_for_address(addr)
+            .into_iter()
+            .map(|(input, output)| UtxoSnapshot {
+                ref_: input,
+                output,
+                slot: None,
+            })
+            .collect())
     }
 
     async fn utxos_by_payment_credential(
