@@ -18,14 +18,34 @@ use tonic::{Request, Response, Status};
 
 use super::ServiceState;
 use crate::proto::{v1alpha, v1beta};
-use crate::SubmitOutcome;
+use crate::{EvalOutcome, SubmitOutcome};
 
 const SERVICE_LABEL: &str = "submit";
-const EVAL_UNIMPL: &str =
-    "EvalTx requires a non-committing UPLC evaluation helper; deferred follow-up";
 
 /// Conway-era CBOR tag the spec uses for txs at PV9+ today.
 const DEFAULT_ERA_ID: u16 = 6;
+
+/// Build the v1beta TxEval envelope from an [`EvalOutcome`].
+fn eval_outcome_to_proto_beta(outcome: EvalOutcome) -> v1beta::cardano::TxEval {
+    v1beta::cardano::TxEval {
+        fee: Some(crate::map::common::coin_bigint(outcome.fee)),
+        ex_units: Some(v1beta::cardano::ExUnits {
+            steps: 0,
+            memory: 0,
+        }),
+        errors: outcome
+            .error
+            .into_iter()
+            .map(|msg| v1beta::cardano::EvalReport {
+                msg,
+                purpose: v1beta::cardano::RedeemerPurpose::Unspecified as i32,
+                index: 0,
+            })
+            .collect(),
+        traces: Vec::new(),
+        redeemers: Vec::new(),
+    }
+}
 
 fn extract_raw_tx_beta(req_tx: &Option<v1beta::submit::AnyChainTx>) -> Option<&[u8]> {
     req_tx
@@ -62,9 +82,21 @@ impl SubmitSvcAlpha {
 impl v1alpha::submit::submit_service_server::SubmitService for SubmitSvcAlpha {
     async fn eval_tx(
         &self,
-        _request: Request<v1alpha::submit::EvalTxRequest>,
+        request: Request<v1alpha::submit::EvalTxRequest>,
     ) -> Result<Response<v1alpha::submit::EvalTxResponse>, Status> {
-        Err(Status::unimplemented(EVAL_UNIMPL))
+        let req = request.into_inner();
+        let raw = extract_raw_tx_alpha(&req.tx)
+            .ok_or_else(|| Status::invalid_argument("EvalTxRequest.tx.raw is required"))?;
+        let outcome = self.state.context.eval_tx(DEFAULT_ERA_ID, raw).await;
+        let beta = eval_outcome_to_proto_beta(outcome);
+        use prost::Message;
+        let alpha = v1alpha::cardano::TxEval::decode(beta.encode_to_vec().as_slice())
+            .expect("v1alpha TxEval subset-compatible with v1beta");
+        Ok(Response::new(v1alpha::submit::EvalTxResponse {
+            report: Some(v1alpha::submit::AnyChainEval {
+                chain: Some(v1alpha::submit::any_chain_eval::Chain::Cardano(alpha)),
+            }),
+        }))
     }
 
     async fn submit_tx(
@@ -236,9 +268,18 @@ impl SubmitSvcBeta {
 impl v1beta::submit::submit_service_server::SubmitService for SubmitSvcBeta {
     async fn eval_tx(
         &self,
-        _request: Request<v1beta::submit::EvalTxRequest>,
+        request: Request<v1beta::submit::EvalTxRequest>,
     ) -> Result<Response<v1beta::submit::EvalTxResponse>, Status> {
-        Err(Status::unimplemented(EVAL_UNIMPL))
+        let req = request.into_inner();
+        let raw = extract_raw_tx_beta(&req.tx)
+            .ok_or_else(|| Status::invalid_argument("EvalTxRequest.tx.raw is required"))?;
+        let outcome = self.state.context.eval_tx(DEFAULT_ERA_ID, raw).await;
+        let beta = eval_outcome_to_proto_beta(outcome);
+        Ok(Response::new(v1beta::submit::EvalTxResponse {
+            report: Some(v1beta::submit::AnyChainEval {
+                chain: Some(v1beta::submit::any_chain_eval::Chain::Cardano(beta)),
+            }),
+        }))
     }
 
     async fn submit_tx(

@@ -111,6 +111,12 @@ impl LedgerContext for QueryMock {
     async fn submit_tx(&self, _: u16, _: &[u8]) -> SubmitOutcome {
         SubmitOutcome::Rejected { reason: "".into() }
     }
+    async fn eval_tx(&self, _: u16, _: &[u8]) -> dugite_rpc::EvalOutcome {
+        dugite_rpc::EvalOutcome {
+            fee: 0,
+            error: Some("".into()),
+        }
+    }
     async fn mempool_snapshot(&self) -> Result<Vec<RawTx>, RpcError> {
         Err(RpcError::Unimplemented(""))
     }
