@@ -9,3 +9,4 @@ pub mod config_reload;
 pub mod csj_orchestrator;
 pub mod forge;
 pub mod gsm;
+pub mod verify_snapshot;

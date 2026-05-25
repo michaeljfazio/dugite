@@ -29,6 +29,8 @@ dugite-node mithril-import \
 | `--network-magic` | `764824073` | Network magic (764824073=mainnet, 2=preview, 1=preprod) |
 | `--database-path` | `db` | Path to the database directory |
 | `--temp-dir` | system temp | Temporary directory for download and extraction |
+| `--include-ancillary` | `true` | Download and import the Mithril ancillary archive (Haskell ledger state at the immutable tip). When enabled, bootstrap drops from multi-hour to ~15 minutes. Pass `--no-include-ancillary` to disable. See [Mithril Ancillary — Trust Model](./mithril-ancillary.md). |
+| `--allow-stale-pparams` | `false` | Continue even if ancillary download fails — falls back to genesis-default protocol parameters at the imported tip (issue #335). NOT recommended for production. |
 
 ### Examples
 
