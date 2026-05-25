@@ -498,19 +498,40 @@ impl LedgerState {
                 let has_redeemers = !tx.witness_set.redeemers.is_empty();
 
                 if tx.is_valid {
-                    // Conway LEDGERS: treasury value check
+                    // Conway LEDGERS: treasury value check.
+                    //
+                    // Haskell `Cardano.Ledger.Conway.Rules.Ledger.hs:364,442` checks
+                    // `declared == actual` where `actual = ChainAccountState.casTreasury`
+                    // (frozen at block entry, constant intra-block — every tx in the
+                    // block compares against the SAME pre-block treasury value).
+                    //
+                    // Issue #678: the previous self-correction
+                    // (`self.epochs.treasury = declared_treasury`) silently masked
+                    // upstream treasury-calculation drift during live sync. Removing
+                    // the snap exposes the underlying divergence — the
+                    // MismatchedTreasuryValue WARN now points at a real per-epoch
+                    // accounting bug that must be fixed in the treasury update path,
+                    // not papered over here. Same masking-removed pattern as
+                    // #438 / #481 / #624 / #626.
                     if self.epochs.protocol_params.protocol_version_major >= 9 {
                         if let Some(declared_treasury) = tx.body.treasury_value {
                             if declared_treasury.0 != self.epochs.treasury.0 {
+                                let delta =
+                                    declared_treasury.0.saturating_sub(self.epochs.treasury.0)
+                                        as i128
+                                        - self.epochs.treasury.0.saturating_sub(declared_treasury.0)
+                                            as i128;
                                 warn!(
                                     tx_hash = %tx.hash.to_hex(),
                                     slot = block.slot().0,
                                     declared = declared_treasury.0,
-                                    ledger = self.epochs.treasury.0,
-                                    "TreasuryValueMismatch on confirmed block — \
-                                     trusting on-chain consensus (treasury will self-correct)"
+                                    actual = self.epochs.treasury.0,
+                                    delta_lovelace = delta,
+                                    "TreasuryValueMismatch — dugite's treasury differs \
+                                     from on-chain declared value (issue #678). \
+                                     The self-correction was removed; treasury \
+                                     accumulates over epoch boundaries from this point."
                                 );
-                                self.epochs.treasury = declared_treasury;
                             }
                         }
                     }
