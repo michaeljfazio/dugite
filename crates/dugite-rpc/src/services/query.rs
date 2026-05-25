@@ -32,14 +32,26 @@ const UNIMPL: &str = "M2.B — full mapping required";
 /// address set.
 const SEARCH_UTXOS_HARD_CAP: usize = 5_000;
 
-/// Extract an exact-address match from a v1beta SearchUtxos predicate
-/// if and only if the predicate boils down to a single
-/// `match.cardano.address.exact_address` lookup. Anything more complex
-/// (asset patterns, `payment_part` / `delegation_part`, `not` / `all_of`
-/// / `any_of` composition) yields `None`, and the service surfaces
-/// UNIMPLEMENTED so clients see a clear signal instead of silently
-/// truncated results.
-fn predicate_exact_address(p: Option<&v1beta::query::UtxoPredicate>) -> Option<Vec<u8>> {
+/// Resolved SearchUtxos predicate — exactly one of these shapes today.
+#[derive(Debug)]
+enum SearchUtxoSelector {
+    /// `match.cardano.address.exact_address = <bytes>`
+    ExactAddress(Vec<u8>),
+    /// `match.cardano.address.payment_part = <bytes>` (28-byte hash)
+    PaymentCredential(Vec<u8>),
+    /// `match.cardano.asset.{policy_id, asset_name?}`
+    Asset {
+        policy_id: Vec<u8>,
+        asset_name: Option<Vec<u8>>,
+    },
+}
+
+/// Resolve a v1beta SearchUtxos predicate into one of the supported
+/// selector shapes. Anything more complex (composite predicates,
+/// delegation_part, mixed address+asset patterns) yields `None`; the
+/// service surfaces UNIMPLEMENTED with a descriptive message rather
+/// than returning silently truncated results.
+fn resolve_predicate(p: Option<&v1beta::query::UtxoPredicate>) -> Option<SearchUtxoSelector> {
     let p = p?;
     if !p.not.is_empty() || !p.all_of.is_empty() || !p.any_of.is_empty() {
         return None;
@@ -47,40 +59,102 @@ fn predicate_exact_address(p: Option<&v1beta::query::UtxoPredicate>) -> Option<V
     let any = p.r#match.as_ref()?;
     let utxo_pattern = any.utxo_pattern.as_ref()?;
     let v1beta::query::any_utxo_pattern::UtxoPattern::Cardano(out_pattern) = utxo_pattern;
-    if out_pattern.asset.is_some() {
+
+    // Combined address + asset patterns aren't supported.
+    let has_addr = out_pattern.address.is_some();
+    let has_asset = out_pattern.asset.is_some();
+    if has_addr && has_asset {
         return None;
     }
-    let addr = out_pattern.address.as_ref()?;
-    if addr.payment_part.is_some() || addr.delegation_part.is_some() {
+
+    if let Some(addr) = out_pattern.address.as_ref() {
+        // exact_address takes priority; payment_part falls through if
+        // not set; delegation_part isn't supported.
+        if addr.delegation_part.is_some() {
+            return None;
+        }
+        if let Some(b) = &addr.exact_address {
+            return Some(SearchUtxoSelector::ExactAddress(b.clone()));
+        }
+        if let Some(p_part) = &addr.payment_part {
+            return Some(SearchUtxoSelector::PaymentCredential(p_part.clone()));
+        }
         return None;
     }
-    addr.exact_address.clone()
+    if let Some(asset) = out_pattern.asset.as_ref() {
+        let policy_id = asset.policy_id.clone()?;
+        let asset_name = asset.asset_name.clone();
+        return Some(SearchUtxoSelector::Asset {
+            policy_id,
+            asset_name,
+        });
+    }
+    None
 }
 
 async fn search_utxos_response_beta(
     ctx: &std::sync::Arc<dyn LedgerContext>,
     request: v1beta::query::SearchUtxosRequest,
 ) -> Result<v1beta::query::SearchUtxosResponse, Status> {
-    let Some(exact_addr_bytes) = predicate_exact_address(request.predicate.as_ref()) else {
-        return Err(Status::unimplemented(
-            "SearchUtxos: only `predicate.match.cardano.address.exact_address` is \
-             supported in this build. Payment-credential / delegation / asset / \
-             composite (not/all_of/any_of) patterns are deferred to a follow-up.",
-        ));
-    };
+    let selector = resolve_predicate(request.predicate.as_ref()).ok_or_else(|| {
+        Status::unimplemented(
+            "SearchUtxos: supported predicates are `match.cardano.address.exact_address`, \
+             `match.cardano.address.payment_part`, and `match.cardano.asset.{policy_id, \
+             asset_name}`. Delegation patterns, composite predicates (not/all_of/any_of), \
+             and mixed address+asset patterns are deferred to a follow-up.",
+        )
+    })?;
 
-    let parsed_addr = dugite_primitives::address::Address::from_bytes(&exact_addr_bytes)
-        .map_err(|e| Status::invalid_argument(format!("exact_address bytes invalid: {e}")))?;
-
-    let mut snaps = ctx
-        .utxos_by_address(&parsed_addr)
-        .await
-        .map_err(Status::from)?;
     let cap = request
         .max_items
         .map(|n| (n as usize).min(SEARCH_UTXOS_HARD_CAP))
         .unwrap_or(SEARCH_UTXOS_HARD_CAP)
         .max(1);
+
+    let mut snaps = match selector {
+        SearchUtxoSelector::ExactAddress(bytes) => {
+            let parsed_addr =
+                dugite_primitives::address::Address::from_bytes(&bytes).map_err(|e| {
+                    Status::invalid_argument(format!("exact_address bytes invalid: {e}"))
+                })?;
+            ctx.utxos_by_address(&parsed_addr)
+                .await
+                .map_err(Status::from)?
+        }
+        SearchUtxoSelector::PaymentCredential(bytes) => {
+            if bytes.len() != 28 && bytes.len() != 32 {
+                return Err(Status::invalid_argument(format!(
+                    "payment_part must be 28 or 32 bytes, got {}",
+                    bytes.len()
+                )));
+            }
+            let mut padded = [0u8; 32];
+            let copy_len = bytes.len().min(32);
+            padded[..copy_len].copy_from_slice(&bytes[..copy_len]);
+            let h32 = dugite_primitives::hash::Hash32::from_bytes(padded);
+            ctx.utxos_by_payment_credential(&h32)
+                .await
+                .map_err(Status::from)?
+        }
+        SearchUtxoSelector::Asset {
+            policy_id,
+            asset_name,
+        } => {
+            if policy_id.len() < 28 {
+                return Err(Status::invalid_argument(format!(
+                    "asset policy_id must be 28 bytes, got {}",
+                    policy_id.len()
+                )));
+            }
+            let mut padded = [0u8; 32];
+            padded[..28].copy_from_slice(&policy_id[..28]);
+            let h32 = dugite_primitives::hash::Hash32::from_bytes(padded);
+            ctx.utxos_by_asset(&h32, asset_name.as_deref())
+                .await
+                .map_err(Status::from)?
+        }
+    };
+
     if snaps.len() > cap {
         snaps.truncate(cap);
     }
