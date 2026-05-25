@@ -302,22 +302,22 @@ fn decode_alonzo_header_inner(r: &mut Reader<'_>) -> Result<BlockHeader, Seriali
     let block_number = r.read_uint()?;
     let slot = r.read_uint()?;
     let prev_hash = read_optional_hash32(r)?;
-    let issuer_vkey = r.read_bytes()?.to_vec();
-    let vrf_vkey = r.read_bytes()?.to_vec();
+    let issuer_vkey = r.read_bytes_owned()?;
+    let vrf_vkey = r.read_bytes_owned()?;
     let (nonce_output, nonce_proof) = read_vrf_cert(r)?;
     // Alonzo uses `leader_vrf` field (not `nonce_vrf`) as the VRF result.
     // The consensus leader check uses leader_vrf.0 (64-byte output).
     let (leader_output, leader_proof) = read_vrf_cert(r)?;
     let body_size = r.read_uint()?;
     let body_hash = read_hash32(r)?;
-    let op_hot_vkey = r.read_bytes()?.to_vec();
+    let op_hot_vkey = r.read_bytes_owned()?;
     let op_seq_number = r.read_uint()?;
     let op_kes_period = r.read_uint()?;
-    let op_sigma = r.read_bytes()?.to_vec();
+    let op_sigma = r.read_bytes_owned()?;
     let protocol_major = r.read_uint()?;
     let protocol_minor = r.read_uint()?;
 
-    let kes_signature = r.read_bytes()?.to_vec();
+    let kes_signature = r.read_bytes_owned()?;
 
     Ok(BlockHeader {
         header_hash: Hash32::ZERO,
@@ -367,8 +367,8 @@ fn read_vrf_cert(r: &mut Reader<'_>) -> Result<(Vec<u8>, Vec<u8>), Serialization
             "vrf_cert: expected array(2), got {arr_len:?}"
         )));
     }
-    let output = r.read_bytes()?.to_vec();
-    let proof = r.read_bytes()?.to_vec();
+    let output = r.read_bytes_owned()?;
+    let proof = r.read_bytes_owned()?;
     Ok((output, proof))
 }
 
@@ -545,7 +545,7 @@ fn read_alonzo_tx_output(
         }
     };
 
-    let addr_bytes = r.read_bytes()?.to_vec();
+    let addr_bytes = r.read_bytes_owned()?;
     let address = Address::from_bytes(&addr_bytes)
         .map_err(|e| SerializationError::InvalidData(format!("alonzo output address: {e}")))?;
 
@@ -613,7 +613,7 @@ fn read_multiasset_map_u64(
         |r| {
             let asset_entries = r.read_map(
                 |r| {
-                    let name_bytes = r.read_bytes()?.to_vec();
+                    let name_bytes = r.read_bytes_owned()?;
                     AssetName::new(name_bytes).map_err(|_| {
                         SerializationError::CborDecode("multiasset: asset name too long".into())
                     })
@@ -654,7 +654,7 @@ fn read_mint_map(
             // value: { asset_name => signed_int }
             let asset_entries = r.read_map(
                 |r| {
-                    let name_bytes = r.read_bytes()?.to_vec();
+                    let name_bytes = r.read_bytes_owned()?;
                     AssetName::new(name_bytes).map_err(|_| {
                         SerializationError::CborDecode("mint: asset name too long".into())
                     })
@@ -678,10 +678,7 @@ fn read_mint_map(
 fn read_withdrawals(r: &mut Reader<'_>) -> Result<BTreeMap<Vec<u8>, Lovelace>, SerializationError> {
     // Withdrawals: { reward_account_bytes => coin }
     // Map may be definite or indefinite length.
-    let entries = r.read_map(
-        |r| Ok(r.read_bytes()?.to_vec()),
-        |r| Ok(Lovelace(r.read_uint()?)),
-    )?;
+    let entries = r.read_map(|r| r.read_bytes_owned(), |r| Ok(Lovelace(r.read_uint()?)))?;
     let mut result = BTreeMap::new();
     for (k, v) in entries {
         result.insert(k, v);
@@ -775,12 +772,13 @@ fn read_pool_params(r: &mut Reader<'_>) -> Result<PoolParams, SerializationError
     let pledge = read_lovelace(r)?;
     let cost = read_lovelace(r)?;
     let margin = r.read_rational()?;
-    let reward_account = r.read_bytes()?.to_vec();
+    let reward_account = r.read_bytes_owned()?;
     let pool_owners: Vec<Hash28> = r.read_set(|r| read_hash28_cert(r))?;
-    let relays_count = r.read_array_header()?.unwrap_or(0) as usize;
-    for _ in 0..relays_count {
+    // relays: definite OR indefinite-length array — see #673 / era_shelley.rs.
+    r.for_each_array_item(|r| {
         r.skip()?;
-    }
+        Ok(())
+    })?;
     let pool_metadata = read_pool_metadata(r)?;
 
     Ok(PoolParams {
@@ -934,8 +932,8 @@ pub(crate) fn decode_alonzo_witness_set(
                             "vkeywitness: expected array(2)".into(),
                         ));
                     }
-                    let vkey = r.read_bytes()?.to_vec();
-                    let signature = r.read_bytes()?.to_vec();
+                    let vkey = r.read_bytes_owned()?;
+                    let signature = r.read_bytes_owned()?;
                     Ok(VKeyWitness { vkey, signature })
                 })?;
             }
@@ -950,10 +948,10 @@ pub(crate) fn decode_alonzo_witness_set(
                             "bootstrap_witness: expected array(4)".into(),
                         ));
                     }
-                    let vkey = r.read_bytes()?.to_vec();
-                    let sig = r.read_bytes()?.to_vec();
-                    let chain_code = r.read_bytes()?.to_vec();
-                    let attrs = r.read_bytes()?.to_vec();
+                    let vkey = r.read_bytes_owned()?;
+                    let sig = r.read_bytes_owned()?;
+                    let chain_code = r.read_bytes_owned()?;
+                    let attrs = r.read_bytes_owned()?;
                     Ok(BootstrapWitness {
                         vkey,
                         signature: sig,
@@ -964,7 +962,7 @@ pub(crate) fn decode_alonzo_witness_set(
             }
             3 => {
                 // plutus_v1_scripts: [* bytes]
-                plutus_v1_scripts = r.read_array(|r| Ok(r.read_bytes()?.to_vec()))?;
+                plutus_v1_scripts = r.read_array(|r| r.read_bytes_owned())?;
             }
             4 => {
                 // plutus_data: [* plutus_data]
@@ -1123,14 +1121,17 @@ pub(crate) fn read_plutus_data(r: &mut Reader<'_>) -> Result<PlutusData, Seriali
             match tag_n {
                 2 => {
                     // Positive bignum: tag was already consumed, just read bytes.
-                    let bytes = r.read_bytes()?;
-                    let val = BigInt::from_bytes_be(num_bigint::Sign::Plus, bytes);
+                    // CBOR §3.4.3 + Cardano `bounded_bytes`: the mantissa may
+                    // be encoded as indefinite-length chunks. Use the
+                    // chunked-aware reader (#673).
+                    let bytes = r.read_bytes_owned()?;
+                    let val = BigInt::from_bytes_be(num_bigint::Sign::Plus, &bytes);
                     Ok(PlutusData::Integer(val))
                 }
                 3 => {
                     // Negative bignum: tag was already consumed, just read bytes.
-                    let bytes = r.read_bytes()?;
-                    let n = BigInt::from_bytes_be(num_bigint::Sign::Plus, bytes);
+                    let bytes = r.read_bytes_owned()?;
+                    let n = BigInt::from_bytes_be(num_bigint::Sign::Plus, &bytes);
                     Ok(PlutusData::Integer(-BigInt::from(1) - n))
                 }
                 121..=127 => {
@@ -1179,7 +1180,7 @@ pub(crate) fn read_plutus_data(r: &mut Reader<'_>) -> Result<PlutusData, Seriali
             Ok(PlutusData::Integer(BigInt::from(v)))
         }
         Type::Bytes => {
-            let bytes = r.read_bytes()?.to_vec();
+            let bytes = r.read_bytes_owned()?;
             Ok(PlutusData::Bytes(bytes))
         }
         Type::BytesIndef => {
@@ -1213,17 +1214,24 @@ fn read_tag_value(r: &mut Reader<'_>) -> Result<u64, SerializationError> {
 // ============================================================================
 
 /// Decode the auxiliary_data_set map: `{ tx_index => auxiliary_data }`.
+///
+/// Handles both definite- and indefinite-length CBOR maps. cn 11.0.1 emits
+/// indefinite-length aux_data_set on preview / preprod for Babbage blocks
+/// containing CIP-20 transaction messages (issue #673 — sibling of #615e
+/// which fixed tx_bodies/tx_witness_sets/invalid_transactions but missed
+/// the aux_data_set map). Using `read_map_header()?.unwrap_or(0)` silently
+/// treated the indef variant as empty and left the `0xff` break byte for
+/// the next decoder, which then failed with "expected array, got u8".
 pub(crate) fn decode_alonzo_aux_data_map(
     r: &mut Reader<'_>,
 ) -> Result<BTreeMap<u32, AuxiliaryData>, SerializationError> {
     let mut result = BTreeMap::new();
-    let n = r.read_map_header()?;
-    let count = n.unwrap_or(0) as usize;
-    for _ in 0..count {
+    r.for_each_map_entry(|r| {
         let tx_idx = r.read_uint()? as u32;
         let aux = decode_alonzo_auxiliary_data(r)?;
         result.insert(tx_idx, aux);
-    }
+        Ok(())
+    })?;
     Ok(result)
 }
 
@@ -1264,30 +1272,36 @@ pub(crate) fn decode_alonzo_auxiliary_data(
             // PostAlonzo: tag(259) { ... }
             // Consume the tag (any value accepted; cardano uses 259)
             let _ = aux_r.read_tag()?;
-            // Now we have a map
-            let n = aux_r.read_map_header()?.unwrap_or(0) as usize;
-            for _ in 0..n {
-                let k = aux_r.read_uint()?;
+            // Now we have a map — handle BOTH definite and indefinite
+            // length (sibling of #673 — cn 11.0.1 emits indef-length on
+            // preview for some Babbage blocks).
+            aux_r.for_each_map_entry(|r| {
+                let k = r.read_uint()?;
                 match k {
                     0 => {
-                        metadata = decode_metadata_map(&mut aux_r)?;
+                        metadata = decode_metadata_map(r)?;
                     }
                     1 => {
                         // native scripts — skip for now
-                        aux_r.skip()?;
+                        r.skip()?;
                     }
                     2 => {
-                        // plutus_v1_scripts
-                        let count = aux_r.read_array_header()?.unwrap_or(0) as usize;
-                        for _ in 0..count {
-                            plutus_v1_scripts.push(aux_r.read_bytes()?.to_vec());
-                        }
+                        // plutus_v1_scripts (array of byte strings).
+                        // Use for_each_array_item so indefinite-length
+                        // arrays don't silently truncate.
+                        let mut local = Vec::new();
+                        r.for_each_array_item(|r| {
+                            local.push(r.read_bytes_owned()?);
+                            Ok(())
+                        })?;
+                        plutus_v1_scripts.extend(local);
                     }
                     _ => {
-                        aux_r.skip()?;
+                        r.skip()?;
                     }
                 }
-            }
+                Ok(())
+            })?;
         }
         _ => {
             // Unknown format — return raw bytes only
@@ -1307,14 +1321,14 @@ pub(crate) fn decode_alonzo_auxiliary_data(
 fn decode_metadata_map(
     r: &mut Reader<'_>,
 ) -> Result<BTreeMap<u64, TransactionMetadatum>, SerializationError> {
+    // Handle both definite- and indefinite-length CBOR maps — see #673.
     let mut result = BTreeMap::new();
-    let n = r.read_map_header()?;
-    let count = n.unwrap_or(0) as usize;
-    for _ in 0..count {
+    r.for_each_map_entry(|r| {
         let label = r.read_uint()?;
         let value = read_metadatum(r)?;
         result.insert(label, value);
-    }
+        Ok(())
+    })?;
     Ok(result)
 }
 
@@ -1338,7 +1352,7 @@ fn read_metadatum(r: &mut Reader<'_>) -> Result<TransactionMetadatum, Serializat
             Ok(TransactionMetadatum::Int(v))
         }
         Type::Bytes => {
-            let bytes = r.read_bytes()?.to_vec();
+            let bytes = r.read_bytes_owned()?;
             Ok(TransactionMetadatum::Bytes(bytes))
         }
         Type::BytesIndef => {

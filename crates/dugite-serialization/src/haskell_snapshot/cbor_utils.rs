@@ -355,9 +355,18 @@ pub fn decode_null(data: &[u8]) -> Result<(bool, usize), SerializationError> {
 /// Maximum nesting depth for `skip_cbor_value`.
 ///
 /// D10 / audit #544: a deeply-nested indefinite CBOR (e.g. 1000 nested arrays) would
-/// exhaust the stack via unbounded recursion.  We cap at 64 levels — sufficient for
-/// any legitimate Cardano ledger state structure — and return an error beyond that.
-const CBOR_SKIP_MAX_DEPTH: usize = 64;
+/// exhaust the stack via unbounded recursion. We cap nesting and return an error beyond
+/// the cap.
+///
+/// **Cap revised from 64 → 1024 in #673** after preview chunk replay surfaced legitimate
+/// Babbage blocks containing PlutusData values nested past 64 levels (real DeFi protocol
+/// validators on preview ~slot 17.76M). Haskell cborg imposes no depth limit at all —
+/// it relies on GHC's native stack (8 MB default ≈ several thousand levels). 1024 is
+/// still a hard adversarial bound but accepts all production data Haskell accepts.
+///
+/// See also `decode_bounded::MAX_METADATA_DEPTH` (64) which is a SEPARATE, spec-bounded
+/// limit for tx metadata and is left unchanged.
+const CBOR_SKIP_MAX_DEPTH: usize = 1024;
 
 /// Skip over any single CBOR value, returning the number of bytes consumed.
 ///
@@ -907,16 +916,41 @@ mod cap_tests {
 
     #[test]
     fn skip_cbor_value_deeply_nested_rejected() {
-        // Build 80 nested array(1) wrappers — exceeds CBOR_SKIP_MAX_DEPTH=64.
-        let depth = 80usize;
-        let mut data = vec![0x81u8; depth];
-        // innermost value
-        data.push(0x00);
-        let err = skip_cbor_value(&data).unwrap_err();
+        // Build CBOR_SKIP_MAX_DEPTH+16 nested array(1) wrappers — exceeds the
+        // cap. The depth was raised from 64 → 1024 in #673 after preview
+        // chunk replay surfaced legitimate Babbage blocks with PlutusData
+        // nesting past 64 levels. Haskell cborg has no nesting limit at all.
+        //
+        // The recursion limit guard is what we're testing, so we run on a
+        // worker thread with a generous stack (the depth check fires before
+        // we overflow, but the Rust recursion still walks ~1040 frames
+        // first; default 2 MB stack is tight on macOS).
+        let handle = std::thread::Builder::new()
+            .stack_size(16 * 1024 * 1024)
+            .spawn(|| {
+                let depth = CBOR_SKIP_MAX_DEPTH + 16;
+                let mut data = vec![0x81u8; depth];
+                data.push(0x00);
+                skip_cbor_value(&data)
+            })
+            .unwrap();
+        let err = handle.join().unwrap().unwrap_err();
         let SerializationError::CborDecode(msg) = err else {
             panic!("expected CborDecode");
         };
         assert!(msg.contains("CBOR nesting depth exceeds limit"));
+    }
+
+    /// Regression for #673: a PlutusData nesting depth of 80 (real preview
+    /// Babbage blocks) must be ACCEPTED, not rejected. Pre-fix limit of 64
+    /// erroneously rejected legitimate on-chain data.
+    #[test]
+    fn skip_cbor_value_accepts_80_levels_of_nesting() {
+        let depth = 80usize;
+        let mut data = vec![0x81u8; depth];
+        data.push(0x00);
+        let consumed = skip_cbor_value(&data).expect("80 levels must be accepted post-#673");
+        assert_eq!(consumed, depth + 1);
     }
 
     // ── decode_uint / decode_int / decode_bigint_or_uint ────────────────────

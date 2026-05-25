@@ -304,9 +304,9 @@ fn decode_conway_header_inner(
     // 2: prev_hash (32-byte bytes or null)
     let prev_hash = read_optional_hash32(r)?;
     // 3: issuer_vkey (32 bytes)
-    let issuer_vkey = r.read_bytes()?.to_vec();
+    let issuer_vkey = r.read_bytes_owned()?;
     // 4: vrf_vkey (32 bytes)
-    let vrf_vkey = r.read_bytes()?.to_vec();
+    let vrf_vkey = r.read_bytes_owned()?;
     // 5: vrf_result = [output_bytes, proof_bytes] (single combined Praos cert)
     let (vrf_output, vrf_proof) = read_vrf_cert(r)?;
     // 6: block_body_size
@@ -334,7 +334,7 @@ fn decode_conway_header_inner(
     };
 
     // KES signature (second element of outer array)
-    let kes_signature = r.read_bytes()?.to_vec();
+    let kes_signature = r.read_bytes_owned()?;
 
     Ok(BlockHeader {
         header_hash: Hash32::ZERO, // filled in by caller after blake2b_256(raw)
@@ -399,8 +399,8 @@ fn read_vrf_cert(r: &mut Reader<'_>) -> Result<(Vec<u8>, Vec<u8>), Serialization
             "vrf_cert: expected array(2), got {arr_len:?}"
         )));
     }
-    let output = r.read_bytes()?.to_vec();
-    let proof = r.read_bytes()?.to_vec();
+    let output = r.read_bytes_owned()?;
+    let proof = r.read_bytes_owned()?;
     Ok((output, proof))
 }
 
@@ -412,10 +412,10 @@ fn read_operational_cert(r: &mut Reader<'_>) -> Result<OperationalCert, Serializ
             "operational_cert: expected array(4), got {arr_len:?}"
         )));
     }
-    let hot_vkey = r.read_bytes()?.to_vec();
+    let hot_vkey = r.read_bytes_owned()?;
     let sequence_number = r.read_uint()?;
     let kes_period = r.read_uint()?;
-    let sigma = r.read_bytes()?.to_vec();
+    let sigma = r.read_bytes_owned()?;
     Ok(OperationalCert {
         hot_vkey,
         sequence_number,
@@ -993,7 +993,7 @@ fn read_legacy_tx_output(r: &mut Reader<'_>) -> Result<TransactionOutput, Serial
             )));
         }
     };
-    let addr_bytes = r.read_bytes()?.to_vec();
+    let addr_bytes = r.read_bytes_owned()?;
     let address = Address::from_bytes(&addr_bytes)
         .map_err(|e| SerializationError::InvalidData(format!("output address: {e}")))?;
     let value = read_value(r)?;
@@ -1023,7 +1023,7 @@ fn read_map_tx_output(r: &mut Reader<'_>) -> Result<TransactionOutput, Serializa
         let key = r.read_uint()?;
         match key {
             0 => {
-                address_bytes = Some(r.read_bytes()?.to_vec());
+                address_bytes = Some(r.read_bytes_owned()?);
             }
             1 => {
                 value = Some(read_value(r)?);
@@ -1105,7 +1105,7 @@ fn read_multiasset_map_u64(
             // Inner asset map — also use read_map to handle indefinite lengths.
             let asset_pairs = r.read_map(
                 |r| {
-                    let name_bytes = r.read_bytes()?.to_vec();
+                    let name_bytes = r.read_bytes_owned()?;
                     AssetName::new(name_bytes).map_err(|_| {
                         SerializationError::CborDecode("multiasset: asset name too long".into())
                     })
@@ -1136,7 +1136,7 @@ fn read_mint_map(
             // Inner asset map — also use read_map to handle indefinite lengths.
             let asset_pairs = r.read_map(
                 |r| {
-                    let name_bytes = r.read_bytes()?.to_vec();
+                    let name_bytes = r.read_bytes_owned()?;
                     AssetName::new(name_bytes).map_err(|_| {
                         SerializationError::CborDecode("mint: asset name too long".into())
                     })
@@ -1151,10 +1151,7 @@ fn read_mint_map(
 
 fn read_withdrawals(r: &mut Reader<'_>) -> Result<BTreeMap<Vec<u8>, Lovelace>, SerializationError> {
     // Use read_map to handle both definite- and indefinite-length maps.
-    let pairs = r.read_map(
-        |r| Ok(r.read_bytes()?.to_vec()),
-        |r| r.read_uint().map(Lovelace),
-    )?;
+    let pairs = r.read_map(|r| r.read_bytes_owned(), |r| r.read_uint().map(Lovelace))?;
     Ok(pairs.into_iter().collect())
 }
 
@@ -1221,21 +1218,21 @@ fn read_script_ref(
             Ok(ScriptRef::NativeScript(ns))
         }
         1 => {
-            let script_bytes = sr.read_bytes()?.to_vec();
+            let script_bytes = sr.read_bytes_owned()?;
             Ok(ScriptRef::PlutusV1(script_bytes))
         }
         2 => {
-            let script_bytes = sr.read_bytes()?.to_vec();
+            let script_bytes = sr.read_bytes_owned()?;
             Ok(ScriptRef::PlutusV2(script_bytes))
         }
         3 => {
-            let script_bytes = sr.read_bytes()?.to_vec();
+            let script_bytes = sr.read_bytes_owned()?;
             Ok(ScriptRef::PlutusV3(script_bytes))
         }
         4 => {
             // PlutusV4: Dijkstra language tag 4. Wire shape identical to V3 —
             // `bstr(flat_program)`. Cost-model slot 3 (issue #475 Phase 5).
-            let script_bytes = sr.read_bytes()?.to_vec();
+            let script_bytes = sr.read_bytes_owned()?;
             Ok(ScriptRef::PlutusV4(script_bytes))
         }
         other => Err(SerializationError::CborDecode(format!(
@@ -1535,12 +1532,13 @@ fn read_pool_params(r: &mut Reader<'_>) -> Result<PoolParams, SerializationError
     let pledge = read_lovelace(r)?;
     let cost = read_lovelace(r)?;
     let margin = r.read_rational()?;
-    let reward_account = r.read_bytes()?.to_vec();
+    let reward_account = r.read_bytes_owned()?;
     let pool_owners: Vec<Hash28> = r.read_set(|r| read_hash28_cert(r))?;
-    let relays_count = r.read_array_header()?.unwrap_or(0) as usize;
-    for _ in 0..relays_count {
+    // relays: definite OR indefinite-length array — see #673 / era_shelley.rs.
+    r.for_each_array_item(|r| {
         r.skip()?;
-    }
+        Ok(())
+    })?;
     let pool_metadata = read_pool_metadata(r)?;
     Ok(PoolParams {
         operator,
@@ -1746,7 +1744,7 @@ fn read_proposal_procedure(r: &mut Reader<'_>) -> Result<ProposalProcedure, Seri
         )));
     }
     let deposit = read_lovelace(r)?;
-    let return_addr = r.read_bytes()?.to_vec();
+    let return_addr = r.read_bytes_owned()?;
     let gov_action = read_gov_action(r)?;
     let anchor = read_anchor(r)?;
     Ok(ProposalProcedure {
@@ -1807,7 +1805,7 @@ fn read_gov_action(r: &mut Reader<'_>) -> Result<GovAction, SerializationError> 
         }
         2 => {
             // TreasuryWithdrawals
-            let pairs = r.read_map(|r| Ok(r.read_bytes()?.to_vec()), |r| read_lovelace(r))?;
+            let pairs = r.read_map(|r| r.read_bytes_owned(), |r| read_lovelace(r))?;
             let withdrawals: BTreeMap<Vec<u8>, Lovelace> = pairs.into_iter().collect();
             let policy_hash = read_optional_hash28_gov(r)?;
             Ok(GovAction::TreasuryWithdrawals {
@@ -2158,8 +2156,8 @@ fn decode_conway_witness_set(
                             "vkeywitness: expected array(2)".into(),
                         ));
                     }
-                    let vkey = r.read_bytes()?.to_vec();
-                    let signature = r.read_bytes()?.to_vec();
+                    let vkey = r.read_bytes_owned()?;
+                    let signature = r.read_bytes_owned()?;
                     Ok(VKeyWitness { vkey, signature })
                 })?;
             }
@@ -2176,10 +2174,10 @@ fn decode_conway_witness_set(
                             "bootstrap_witness: expected array(4)".into(),
                         ));
                     }
-                    let vkey = r.read_bytes()?.to_vec();
-                    let sig = r.read_bytes()?.to_vec();
-                    let chain_code = r.read_bytes()?.to_vec();
-                    let attrs = r.read_bytes()?.to_vec();
+                    let vkey = r.read_bytes_owned()?;
+                    let sig = r.read_bytes_owned()?;
+                    let chain_code = r.read_bytes_owned()?;
+                    let attrs = r.read_bytes_owned()?;
                     Ok(BootstrapWitness {
                         vkey,
                         signature: sig,
@@ -2190,7 +2188,7 @@ fn decode_conway_witness_set(
             }
             3 => {
                 // plutus_v1_scripts: nonempty_set<plutus_v1_script> — tag(258) in Conway
-                plutus_v1_scripts = r.read_set(|r| Ok(r.read_bytes()?.to_vec()))?;
+                plutus_v1_scripts = r.read_set(|r| r.read_bytes_owned())?;
             }
             4 => {
                 // plutus_data: nonempty_set<plutus_data> — may be tag(258) on mainnet
@@ -2208,11 +2206,11 @@ fn decode_conway_witness_set(
             }
             6 => {
                 // plutus_v2_scripts: nonempty_set<plutus_v2_script> — tag(258) in Conway
-                plutus_v2_scripts = r.read_set(|r| Ok(r.read_bytes()?.to_vec()))?;
+                plutus_v2_scripts = r.read_set(|r| r.read_bytes_owned())?;
             }
             7 => {
                 // plutus_v3_scripts: nonempty_set<plutus_v3_script> — tag(258) in Conway
-                plutus_v3_scripts = r.read_set(|r| Ok(r.read_bytes()?.to_vec()))?;
+                plutus_v3_scripts = r.read_set(|r| r.read_bytes_owned())?;
             }
             _ => {
                 r.skip()?;
@@ -2541,19 +2539,19 @@ fn decode_auxiliary_data(r: &mut Reader<'_>) -> Result<AuxiliaryData, Serializat
                                 }
                                 2 => {
                                     let _ = aux_r.read_array(|r| {
-                                        v1.push(r.read_bytes()?.to_vec());
+                                        v1.push(r.read_bytes_owned()?);
                                         Ok(())
                                     });
                                 }
                                 3 => {
                                     let _ = aux_r.read_array(|r| {
-                                        v2.push(r.read_bytes()?.to_vec());
+                                        v2.push(r.read_bytes_owned()?);
                                         Ok(())
                                     });
                                 }
                                 4 => {
                                     let _ = aux_r.read_array(|r| {
-                                        v3.push(r.read_bytes()?.to_vec());
+                                        v3.push(r.read_bytes_owned()?);
                                         Ok(())
                                     });
                                 }
@@ -2613,7 +2611,7 @@ fn read_metadatum(r: &mut Reader<'_>) -> Result<TransactionMetadatum, Serializat
             Ok(TransactionMetadatum::Int(v))
         }
         Type::Bytes => {
-            let bytes = r.read_bytes()?.to_vec();
+            let bytes = r.read_bytes_owned()?;
             Ok(TransactionMetadatum::Bytes(bytes))
         }
         Type::String => {
