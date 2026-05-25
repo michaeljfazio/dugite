@@ -473,7 +473,16 @@ pub struct NodeMetrics {
     /// locally but WILL be orphaned — every non-zero tick here is a
     /// propagation failure.
     pub forge_announce_no_subscribers: AtomicU64,
-    // Protocol error metrics
+    // Protocol error metrics.
+    //
+    // NOTE: `n2n_connections_total` and `n2c_connections_total` are bumped
+    // exclusively by the `ConnectionMetrics` bridge in `node/serve.rs`. That
+    // bridge is currently invoked only from unit tests — no production accept
+    // loop wires it up — so on a real node these gauges stay at 0. The active
+    // gauges below are populated by `update_peer_metrics` (lifecycle-derived)
+    // and `N2CConnectionMetrics` (test-only), respectively. Wiring the bridge
+    // into the real N2N / N2C accept paths is tracked separately; until then
+    // the *_total counters should NOT be surfaced in user-facing dashboards.
     pub n2n_connections_total: AtomicU64,
     pub n2c_connections_total: AtomicU64,
     pub n2n_connections_active: AtomicU64,
