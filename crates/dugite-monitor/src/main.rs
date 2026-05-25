@@ -29,6 +29,7 @@
 mod app;
 #[allow(dead_code)]
 mod disk;
+mod discover;
 mod layout;
 mod metrics;
 mod theme;
