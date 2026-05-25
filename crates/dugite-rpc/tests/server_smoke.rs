@@ -286,22 +286,24 @@ async fn submit_v1beta_eval_tx_returns_unimplemented() {
     server.stop().await;
 }
 
-// ── Watch v1beta ─────────────────────────────────────────────────────────
+// ── Watch v1beta — implemented as of M4; see watch_service.rs ───────────
+//
+// `WatchTx` is now implemented. The smoke test confirms the stream
+// connects without erroring; the richer correctness suite lives in
+// `tests/watch_service.rs`.
 
 #[tokio::test]
-async fn watch_v1beta_methods_return_unimplemented() {
+async fn watch_v1beta_stream_connects_without_error() {
     use dugite_rpc::proto::v1beta::watch::watch_service_client::WatchServiceClient;
     use dugite_rpc::proto::v1beta::watch::WatchTxRequest;
 
     let server = TestServer::start(true).await;
     let mut client = WatchServiceClient::new(server.channel().await);
-
-    let status = client
+    let stream = client
         .watch_tx(WatchTxRequest::default())
         .await
-        .unwrap_err();
-    assert_eq!(status.code(), tonic::Code::Unimplemented);
-
+        .expect("watch_tx subscribes");
+    drop(stream);
     server.stop().await;
 }
 
