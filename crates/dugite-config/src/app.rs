@@ -45,8 +45,6 @@ pub struct Item {
     /// Index into [`LoadedConfig::entries`] for this row's top-level entry.
     pub entry_idx: usize,
     /// Path inside the top-level entry's `Value`. Empty for top-level rows.
-    // Used by Tasks 7-13 (cursor visibility, editing, diff).
-    #[allow(dead_code)]
     pub path: Vec<String>,
     /// Resolved schema, if any.
     pub def: ItemDef,
@@ -55,12 +53,8 @@ pub struct Item {
     #[allow(dead_code)]
     pub depth: u8,
     /// True for Object rows (no inline edit; Enter toggles `expanded`).
-    // Used by Tasks 7-8 (cursor visibility, container expansion).
-    #[allow(dead_code)]
     pub is_container: bool,
     /// Only meaningful when `is_container`. Object rows start `false`.
-    // Used by Tasks 7-8.
-    #[allow(dead_code)]
     pub expanded: bool,
 }
 
@@ -208,6 +202,41 @@ impl App {
     // Cursor navigation
     // -----------------------------------------------------------------------
 
+    /// Return whether `item` should be cursor-addressable given the current
+    /// state of its ancestor container rows.
+    ///
+    /// An item is hidden iff some prefix of its `path` is a container row in the
+    /// same section whose `expanded == false`. Top-level rows (empty path) are
+    /// always visible (subject to their section's `expanded`, which is handled
+    /// elsewhere).
+    pub fn is_visible(&self, section_idx: usize, item_idx: usize) -> bool {
+        let section = &self.sections[section_idx];
+        let item = &section.items[item_idx];
+
+        if item.path.is_empty() {
+            return true;
+        }
+
+        for prefix_len in 0..item.path.len() {
+            let prefix = &item.path[..prefix_len];
+            for candidate in &section.items {
+                if candidate.entry_idx != item.entry_idx {
+                    continue;
+                }
+                if !candidate.is_container {
+                    continue;
+                }
+                if candidate.path.len() == prefix.len()
+                    && candidate.path[..] == prefix[..]
+                    && !candidate.expanded
+                {
+                    return false;
+                }
+            }
+        }
+        true
+    }
+
     /// Move the cursor to the previous visible row (vim `k` / arrow-up).
     pub fn cursor_up(&mut self) {
         if self.edit_mode != EditMode::None {
@@ -224,26 +253,34 @@ impl App {
             return;
         }
 
-        let (sec, item) = (self.cursor_section, self.cursor_item);
-
-        if item > 0 {
-            // Move up within the current section.
-            self.cursor_item -= 1;
-        } else if sec > 0 {
-            // Move to the last item of the previous section.
-            self.cursor_section -= 1;
-            // If the previous section is expanded, land on its last item;
-            // if collapsed, land on "item 0" (the header row).
-            let prev = &self.sections[self.cursor_section];
-            if prev.expanded && !prev.items.is_empty() {
-                self.cursor_item = prev.items.len() - 1;
+        let (mut sec, mut item) = (self.cursor_section, self.cursor_item);
+        loop {
+            if item > 0 {
+                item -= 1;
+            } else if sec > 0 {
+                // Move to the previous section.
+                sec -= 1;
+                // If the previous section is expanded, start from its last item;
+                // if collapsed, land on item 0 (the section header, always visible).
+                let prev = &self.sections[sec];
+                if prev.expanded && !prev.items.is_empty() {
+                    item = prev.items.len() - 1;
+                } else {
+                    // Collapsed section header is always visible.
+                    self.cursor_section = sec;
+                    self.cursor_item = 0;
+                    return;
+                }
             } else {
-                self.cursor_item = 0;
+                // Already at the very first row — nowhere to go.
+                return;
+            }
+            if self.is_visible(sec, item) {
+                self.cursor_section = sec;
+                self.cursor_item = item;
+                return;
             }
         }
-        // If the landed section is collapsed, cursor_item is always 0
-        // (the section header). This is fine — the section header is always
-        // visible even when collapsed.
     }
 
     /// Move the cursor to the next visible row (vim `j` / arrow-down).
@@ -262,17 +299,25 @@ impl App {
             return;
         }
 
-        let sec = self.cursor_section;
-        let expanded = self.sections[sec].expanded;
-        let item_count = self.sections[sec].items.len();
-
-        if expanded && self.cursor_item + 1 < item_count {
-            // Move down within the current expanded section.
-            self.cursor_item += 1;
-        } else if sec + 1 < self.sections.len() {
-            // Move to the first item of the next section.
-            self.cursor_section += 1;
-            self.cursor_item = 0;
+        let (mut sec, mut item) = (self.cursor_section, self.cursor_item);
+        let total_sections = self.sections.len();
+        loop {
+            let expanded = self.sections[sec].expanded;
+            let item_count = self.sections[sec].items.len();
+            if expanded && item + 1 < item_count {
+                item += 1;
+            } else if sec + 1 < total_sections {
+                sec += 1;
+                item = 0;
+            } else {
+                // No further row exists.
+                return;
+            }
+            if self.is_visible(sec, item) {
+                self.cursor_section = sec;
+                self.cursor_item = item;
+                return;
+            }
         }
     }
 
@@ -1207,5 +1252,28 @@ mod tests {
             }
         }
         assert!(found, "AcceptedConnectionsLimit header row not found");
+    }
+
+    #[test]
+    fn test_cursor_skips_rows_under_collapsed_container() {
+        let mut app = make_app(r#"{}"#);
+
+        // After build_sections every Object header is collapsed. The cursor must
+        // never land on a sub-row whose parent header is collapsed.
+        move_cursor_to_key(&mut app, "AcceptedConnectionsLimit");
+        let sec = app.cursor_section;
+        let item_idx_header = app.cursor_item;
+
+        app.cursor_down();
+        let new_item = &app.sections[app.cursor_section].items[app.cursor_item];
+        if app.cursor_section == sec {
+            let header_entry_idx = app.sections[sec].items[item_idx_header].entry_idx;
+            assert!(
+                new_item.path.is_empty() || new_item.entry_idx != header_entry_idx,
+                "cursor_down landed on a sub-row of the collapsed container at item {} (path = {:?})",
+                app.cursor_item,
+                new_item.path
+            );
+        }
     }
 }
