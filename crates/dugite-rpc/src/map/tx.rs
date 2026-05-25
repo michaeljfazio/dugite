@@ -17,15 +17,23 @@ use dugite_primitives::value::Value;
 
 /// Map one [`Transaction`] to its [`pb::Tx`] protobuf shape.
 ///
-/// `cert / witnesses / collateral / auxiliary.scripts / proposals /
-/// votes` are M2's mapping modules; until then they emit empty/default
-/// values. `successful` reflects `Transaction::is_valid` so clients can
-/// distinguish phase-2-failing txs without parsing the body themselves.
+/// As of the cert/script/plutus_data/metadatum mapping follow-up,
+/// every Tx field with a single-source-of-truth dugite type is
+/// populated: inputs / outputs / certificates / withdrawals / mint /
+/// reference_inputs / witnesses (vkey + scripts + plutus_data) /
+/// collateral / fee / validity / successful / auxiliary (metadata +
+/// scripts) / hash. `proposals` and `votes` (governance) need
+/// dedicated mapping modules and stay empty for now.
 pub fn tx_to_proto(tx: &Transaction) -> pb::Tx {
     pb::Tx {
         inputs: tx.body.inputs.iter().map(tx_input_to_proto).collect(),
         outputs: tx.body.outputs.iter().map(tx_output_to_proto).collect(),
-        certificates: Vec::new(), // M2
+        certificates: tx
+            .body
+            .certificates
+            .iter()
+            .map(crate::map::cert::certificate_to_proto)
+            .collect(),
         withdrawals: tx
             .body
             .withdrawals
@@ -33,8 +41,8 @@ pub fn tx_to_proto(tx: &Transaction) -> pb::Tx {
             .map(|(addr, qty)| pb::Withdrawal {
                 reward_account: addr.clone(),
                 coin: Some(coin_bigint(qty.0)),
-                // Plutus-redeemer wiring lands in M2 once the redeemer
-                // mapper covers WithdrawalPurpose.
+                // Redeemer linkage requires per-redeemer index ↔ withdrawal
+                // mapping (rdmr-purpose = Reward at index N); deferred.
                 redeemer: None,
             })
             .collect(),
@@ -45,7 +53,7 @@ pub fn tx_to_proto(tx: &Transaction) -> pb::Tx {
             .iter()
             .map(tx_input_to_proto)
             .collect(),
-        witnesses: None, // M2
+        witnesses: Some(witness_set_to_proto(tx)),
         collateral: collateral_to_proto(tx),
         fee: Some(coin_bigint(tx.body.fee.0)),
         validity: Some(pb::TxValidity {
@@ -55,8 +63,99 @@ pub fn tx_to_proto(tx: &Transaction) -> pb::Tx {
         successful: tx.is_valid,
         auxiliary: aux_to_proto(tx),
         hash: hash_bytes(&tx.hash),
-        proposals: Vec::new(), // M2
-        votes: Vec::new(),     // M2
+        // Governance action proposals + votes → cardano.GovernanceAction
+        // mapping is its own large module (7 action variants + Voter +
+        // VotingProcedure); deferred to a follow-up.
+        proposals: Vec::new(),
+        votes: Vec::new(),
+    }
+}
+
+fn witness_set_to_proto(tx: &Transaction) -> pb::WitnessSet {
+    let mut scripts: Vec<pb::Script> = Vec::new();
+    for ns in &tx.witness_set.native_scripts {
+        scripts.push(pb::Script {
+            script: Some(pb::script::Script::Native(
+                crate::map::script::native_script_to_proto(ns),
+            )),
+        });
+    }
+    for b in &tx.witness_set.plutus_v1_scripts {
+        scripts.push(pb::Script {
+            script: Some(pb::script::Script::PlutusV1(b.clone())),
+        });
+    }
+    for b in &tx.witness_set.plutus_v2_scripts {
+        scripts.push(pb::Script {
+            script: Some(pb::script::Script::PlutusV2(b.clone())),
+        });
+    }
+    for b in &tx.witness_set.plutus_v3_scripts {
+        scripts.push(pb::Script {
+            script: Some(pb::script::Script::PlutusV3(b.clone())),
+        });
+    }
+
+    pb::WitnessSet {
+        vkeywitness: tx
+            .witness_set
+            .vkey_witnesses
+            .iter()
+            .map(|w| pb::VKeyWitness {
+                vkey: w.vkey.clone(),
+                signature: w.signature.clone(),
+            })
+            .collect(),
+        script: scripts,
+        plutus_datums: tx
+            .witness_set
+            .plutus_data
+            .iter()
+            .map(crate::map::plutus_data::plutus_data_to_proto)
+            .collect(),
+        redeemers: tx
+            .witness_set
+            .redeemers
+            .iter()
+            .map(redeemer_to_proto)
+            .collect(),
+        bootstrap_witnesses: tx
+            .witness_set
+            .bootstrap_witnesses
+            .iter()
+            .map(|w| pb::BootstrapWitness {
+                vkey: w.vkey.clone(),
+                signature: w.signature.clone(),
+                chain_code: w.chain_code.clone(),
+                attributes: w.attributes.clone(),
+            })
+            .collect(),
+    }
+}
+
+fn redeemer_to_proto(r: &dugite_primitives::transaction::Redeemer) -> pb::Redeemer {
+    use dugite_primitives::transaction::RedeemerTag;
+    let purpose = match r.tag {
+        RedeemerTag::Spend => pb::RedeemerPurpose::Spend as i32,
+        RedeemerTag::Mint => pb::RedeemerPurpose::Mint as i32,
+        RedeemerTag::Cert => pb::RedeemerPurpose::Cert as i32,
+        RedeemerTag::Reward => pb::RedeemerPurpose::Reward as i32,
+        RedeemerTag::Vote => pb::RedeemerPurpose::Vote as i32,
+        RedeemerTag::Propose => pb::RedeemerPurpose::Propose as i32,
+        // Dijkstra-only Guarding tag — proto schema doesn't yet
+        // expose a dedicated purpose; map to UNSPECIFIED so clients
+        // can detect the unmapped case via a non-Plutus purpose.
+        RedeemerTag::Guarding => pb::RedeemerPurpose::Unspecified as i32,
+    };
+    pb::Redeemer {
+        purpose,
+        payload: Some(crate::map::plutus_data::plutus_data_to_proto(&r.data)),
+        index: r.index,
+        ex_units: Some(pb::ExUnits {
+            steps: r.ex_units.steps,
+            memory: r.ex_units.mem,
+        }),
+        original_cbor: Vec::new(),
     }
 }
 

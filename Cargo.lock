@@ -1779,6 +1779,7 @@ dependencies = [
  "dugite-serialization",
  "futures",
  "hex",
+ "num-bigint",
  "prost",
  "prost-build",
  "prost-types",
