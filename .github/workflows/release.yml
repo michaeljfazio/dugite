@@ -121,10 +121,70 @@ jobs:
             org.opencontainers.image.source=https://github.com/michaeljfazio/dugite
 
   # ──────────────────────────────────────────────
+  # Package + push the Helm chart as an OCI artifact
+  # to ghcr.io/michaeljfazio/charts. Runs after the
+  # container image is in place so the chart's
+  # appVersion always references a pullable image.
+  # ──────────────────────────────────────────────
+  publish-chart:
+    needs: [build-container]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install Helm
+        uses: azure/setup-helm@v4
+        with:
+          version: v3.16.3
+
+      - name: Extract version from tag
+        id: version
+        run: echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+
+      - name: Lint chart
+        run: helm lint charts/dugite-node
+
+      - name: Verify chart appVersion matches the release tag
+        run: |
+          declared=$(awk '/^appVersion:/{gsub(/"/,"",$2); print $2}' charts/dugite-node/Chart.yaml)
+          if [ "$declared" != "${{ steps.version.outputs.version }}" ]; then
+            echo "::error::Chart.yaml appVersion ($declared) != release tag (${{ steps.version.outputs.version }}). Bump charts/dugite-node/Chart.yaml before tagging." >&2
+            exit 1
+          fi
+
+      - name: Package chart
+        id: package
+        run: |
+          mkdir -p .chart-dist
+          helm package charts/dugite-node \
+            --app-version "${{ steps.version.outputs.version }}" \
+            --destination .chart-dist
+          pkg=$(ls .chart-dist/dugite-node-*.tgz)
+          echo "package=$pkg" >> "$GITHUB_OUTPUT"
+
+      - name: Log in to GitHub Container Registry
+        run: |
+          echo "${{ secrets.GITHUB_TOKEN }}" \
+            | helm registry login ${{ env.REGISTRY }} \
+                --username ${{ github.actor }} \
+                --password-stdin
+
+      - name: Push chart to OCI registry
+        run: |
+          helm push "${{ steps.package.outputs.package }}" \
+            oci://${{ env.REGISTRY }}/michaeljfazio/charts
+
+      - name: Upload chart as workflow artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: helm-chart
+          path: ${{ steps.package.outputs.package }}
+
+  # ──────────────────────────────────────────────
   # Create GitHub Release with binary assets
   # ──────────────────────────────────────────────
   create-release:
-    needs: [build-binaries]
+    needs: [build-binaries, publish-chart]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
@@ -138,7 +198,8 @@ jobs:
         run: |
           cd artifacts
           find . -name "*.tar.gz" -exec mv {} . \;
-          sha256sum *.tar.gz > SHA256SUMS.txt
+          find . -name "*.tgz" -exec mv {} . \;
+          sha256sum *.tar.gz *.tgz > SHA256SUMS.txt
 
       - name: Extract version from tag
         id: version
@@ -153,6 +214,7 @@ jobs:
           generate_release_notes: true
           files: |
             artifacts/*.tar.gz
+            artifacts/*.tgz
             artifacts/SHA256SUMS.txt
           body: |
             ## Container Image
@@ -162,6 +224,17 @@ jobs:
             ```
 
             Available for `linux/amd64` and `linux/arm64`.
+
+            ## Helm Chart
+
+            ```bash
+            helm install dugite-relay \
+              oci://ghcr.io/michaeljfazio/charts/dugite-node \
+              --version ${{ steps.version.outputs.version }} \
+              --set network.name=preview
+            ```
+
+            See [Kubernetes Deployment](https://michaeljfazio.github.io/dugite/running/kubernetes.html) for the full chart reference.
 
             ## Binary Downloads
 
