@@ -395,34 +395,48 @@ impl LedgerState {
                 Arc::make_mut(&mut self.gov.governance).drep_registration_count += 1;
                 debug!("DRep registered: {}", key.to_hex());
             }
-            Certificate::UnregDRep { credential, refund } => {
+            Certificate::UnregDRep {
+                credential,
+                refund: _,
+            } => {
+                // Per `Cardano.Ledger.Conway.Rules.GovCert` (`ConwayUnRegDRep`):
+                // the only state mutation is removing `cred` from `vsDReps` and
+                // clearing the DRep delegation field of every account that had
+                // delegated to this DRep.  The deposit refund is **NOT** credited
+                // to any reward account — it appears on the `consumed` side of
+                // the tx balance equation (via `conwayTotalRefundsTxCerts`) and
+                // is routed wherever the tx body's outputs send it.
+                //
+                // The previous implementation here unconditionally credited
+                // `reward_accounts[credential_hash] += deposit` and used
+                // `or_insert(Lovelace(0))` which fabricated a phantom reward
+                // account whenever the DRep credential was never separately
+                // registered as a stake credential. This violates the Conway
+                // GOVCERT semantics and inflates total ADA in the ledger state.
+                //
+                // (This `process_certificate` path is not currently invoked from
+                // the production block-apply pipeline — that path runs
+                // `apply_conway_cert` in `eras/conway.rs`, which has always
+                // matched Haskell. The fix here brings the legacy helper in line
+                // so any future caller can rely on identical semantics.)
+                //
+                // Permalink:
+                // https://github.com/IntersectMBO/cardano-ledger/blob/master/eras/conway/impl/src/Cardano/Ledger/Conway/Rules/GovCert.hs
                 let key = credential_to_hash(credential);
-                // Refund the DRep deposit to their reward account.
-                // Per the Haskell ledger spec (Conway DELEG rule), the deposit
-                // is returned to the credential's reward account upon
-                // unregistration.  If a refund amount is specified in the
-                // certificate it must match the recorded deposit (enforced by
-                // validation); we use the recorded deposit when available.
-                let deposit_amount = Arc::make_mut(&mut self.gov.governance)
-                    .dreps
-                    .remove(&key)
-                    .map(|reg| reg.deposit)
-                    .unwrap_or(*refund);
-                if deposit_amount.0 > 0 {
-                    // Credit the deposit back to the credential's reward account.
-                    // The reward account key is the same credential hash used for
-                    // DRep registration (Hash32 of the credential).
-                    *Arc::make_mut(&mut self.certs.reward_accounts)
-                        .entry(key)
-                        .or_insert(Lovelace(0)) += deposit_amount;
-                    debug!(
-                        "DRep deregistered: {}, deposit {} refunded to reward account",
-                        key.to_hex(),
-                        deposit_amount.0
-                    );
-                } else {
-                    debug!("DRep deregistered: {}", key.to_hex());
+                let drep_state = Arc::make_mut(&mut self.gov.governance).dreps.remove(&key);
+
+                // Clear the DRep delegation field for each delegator of this
+                // DRep.  Haskell's `clearDRepDelegations` uses `Map.adjust`,
+                // which is a no-op for absent keys — do not create entries.
+                if drep_state.is_some() {
+                    let drep_id_key = dugite_primitives::transaction::DRep::KeyHash(key);
+                    let drep_id_script =
+                        dugite_primitives::transaction::DRep::ScriptHash(*credential.to_hash());
+                    Arc::make_mut(&mut self.gov.governance)
+                        .vote_delegations
+                        .retain(|_, drep| drep != &drep_id_key && drep != &drep_id_script);
                 }
+                debug!("DRep deregistered: {}", key.to_hex());
             }
             Certificate::UpdateDRep { credential, anchor } => {
                 let key = credential_to_hash(credential);
@@ -1060,7 +1074,11 @@ mod tests {
     // -----------------------------------------------------------------------
 
     /// Deregistering a DRep must remove the entry from `governance.dreps` and
-    /// credit the deposit back to the credential's reward account.
+    /// MUST NOT touch any reward account balance. Per Haskell
+    /// `Cardano.Ledger.Conway.Rules.GovCert::ConwayUnRegDRep`, the deposit is
+    /// returned via the tx balance equation (`conwayTotalRefundsTxCerts` adds
+    /// it to the `consumed` side) — the GOVCERT rule itself only mutates the
+    /// DRep registry and clears DRep delegations of voters. Issue #685.
     #[test]
     fn test_drep_unregistration() {
         let mut state = make_state();
@@ -1074,8 +1092,14 @@ mod tests {
             deposit,
             anchor: None,
         });
-        // Also register as a stake key so the reward_accounts entry exists
+        // Also register as a stake key so the reward_accounts entry exists at zero.
         state.process_certificate(&Certificate::StakeRegistration(cred.clone()));
+        let before = state
+            .certs
+            .reward_accounts
+            .get(&key)
+            .copied()
+            .unwrap_or(Lovelace(0));
 
         // Deregister DRep
         state.process_certificate(&Certificate::UnregDRep {
@@ -1088,16 +1112,53 @@ mod tests {
             !state.gov.governance.dreps.contains_key(&key),
             "governance.dreps should not contain the deregistered DRep"
         );
-        // deposit must be refunded to reward account
-        let balance = state
+        // reward account balance must be UNCHANGED (the deposit goes back via
+        // the tx balance equation, not via the GOVCERT rule).
+        let after = state
             .certs
             .reward_accounts
             .get(&key)
             .copied()
             .unwrap_or(Lovelace(0));
         assert_eq!(
-            balance, deposit,
-            "deposit should be credited back to the DRep's reward account"
+            after, before,
+            "UnregDRep must NOT credit the DRep credential's reward account \
+             (Haskell GOVCERT rule does not touch dsAccounts)"
+        );
+    }
+
+    /// Regression for the phantom-reward-account bug: when the DRep credential
+    /// has no separately-registered stake account, UnregDRep must NOT create
+    /// one. Issue #685 — Haskell `Map.adjust` is a no-op on missing keys; our
+    /// previous `entry(...).or_insert(0)` fabricated a zero-balance phantom
+    /// account that polluted snapshot stake distributions.
+    #[test]
+    fn test_drep_unregistration_does_not_create_phantom_reward_account() {
+        let mut state = make_state();
+        let cred = test_credential();
+        let key = credential_to_hash(&cred);
+        let deposit = Lovelace(500_000_000);
+
+        // Register DRep WITHOUT a corresponding stake registration. No
+        // reward_accounts entry exists at this point.
+        state.process_certificate(&Certificate::RegDRep {
+            credential: cred.clone(),
+            deposit,
+            anchor: None,
+        });
+        assert!(
+            !state.certs.reward_accounts.contains_key(&key),
+            "precondition: no reward account before UnregDRep"
+        );
+
+        state.process_certificate(&Certificate::UnregDRep {
+            credential: cred,
+            refund: deposit,
+        });
+
+        assert!(
+            !state.certs.reward_accounts.contains_key(&key),
+            "UnregDRep must not fabricate a reward account entry"
         );
     }
 
