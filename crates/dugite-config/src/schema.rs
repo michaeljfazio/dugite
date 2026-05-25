@@ -928,6 +928,38 @@ pub static KNOWN_PARAMS: &[ParamDef] = &[
                       Raise delay (up to 30s) to slow down aggressive inbound peers.",
         reloadability: Reloadability::Restart,
     },
+    // --- Rpc section ------------------------------------------------------
+    //
+    // UTxO RPC (gRPC) server — issue #672. The full block is exposed as
+    // a read-only Object so operators can see what's configured at a
+    // glance; edits to sub-fields go through the config JSON directly.
+    // CLI flags --rpc-host / --rpc-port / --no-rpc override at startup.
+    ParamDef {
+        key: "Rpc",
+        section: "Rpc",
+        param_type: ParamType::Object,
+        // Empty object → server disabled. Operators opt in by setting
+        // "Enabled": true and tuning the remaining fields.
+        default: "{}",
+        description: "UTxO RPC (gRPC) server configuration. Sub-fields (all PascalCase): \
+                      'Enabled': bool (default false — server off unless explicitly enabled); \
+                      'ListenAddr': bind IP, default '127.0.0.1' (loopback only); \
+                      'Port': TCP port, default 50051; \
+                      'MaxConcurrentStreams': HTTP/2 streams/conn cap (default 64); \
+                      'StreamBufferSize': per-stream event buffer (default 256); \
+                      'ReflectionEnabled': bool, gRPC reflection (default true); \
+                      'WebEnabled': bool, accept gRPC-Web/HTTP1.1 (default false); \
+                      'AlphaEnabled': bool, expose v1alpha alongside v1beta (default true); \
+                      'Tls': { 'CertPath', 'KeyPath' } for optional TLS termination. \
+                      CLI flags --rpc-host / --rpc-port force-enable; --no-rpc force-disables.",
+        tuning_hint: "Default-disabled to keep the gRPC stack out of the runtime when \
+                      not needed. Enable for integrator/indexer workloads. Keep ListenAddr \
+                      as 127.0.0.1 unless you've terminated TLS at an upstream proxy or \
+                      enabled 'Tls' here directly — the loopback default protects against \
+                      exposing an unauthenticated TCP gRPC endpoint to the network. \
+                      Enable WebEnabled only when serving browser dApps directly.",
+        reloadability: Reloadability::Restart,
+    },
     // --- Storage section --------------------------------------------------
     ParamDef {
         key: "Storage",
@@ -985,6 +1017,7 @@ pub const SECTION_ORDER: &[&str] = &[
     "Advanced",
     "Diffusion",
     "Storage",
+    "Rpc",
 ];
 
 /// Return the display priority index of a section name (lower = earlier).
