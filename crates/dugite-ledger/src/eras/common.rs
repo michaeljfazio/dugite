@@ -621,11 +621,33 @@ pub(crate) fn compute_shelley_nonce(
     // Shelley/BlockBody/Internal.hs): non-overlay blocks count, overlay
     // blocks do not.
     let is_overlay = is_overlay_slot(first_slot_of_current_epoch, block_slot, d_num, d_den);
-    if !is_overlay && !header.issuer_vkey.is_empty() {
+    if !header.issuer_vkey.is_empty() {
         let pool_id = blake2b_224(&header.issuer_vkey);
-        *Arc::make_mut(&mut consensus.epoch_blocks_by_pool)
+        if !is_overlay {
+            *Arc::make_mut(&mut consensus.epoch_blocks_by_pool)
+                .entry(pool_id)
+                .or_insert(0) += 1;
+        }
+        // Track per-pool opcert counter (max-so-far). Haskell's
+        // `PraosState.ocertCounters` retains the highest `OperationalCert.
+        // sequence_number` observed per pool — used for replay-protection
+        // tie-breaking in chain selection (newer counter wins on
+        // same-pool / same-slot ties) and surfaced via N2C queries.
+        //
+        // Issue #670: without this update the from-genesis ledger
+        // diverges from the ancillary import on the `opcert_counters`
+        // field of `ConsensusSubState`, which is otherwise populated
+        // from `PraosState.opcert_counters` by `from_haskell_snapshot`.
+        let seq = header.operational_cert.sequence_number;
+        consensus
+            .opcert_counters
             .entry(pool_id)
-            .or_insert(0) += 1;
+            .and_modify(|cur| {
+                if seq > *cur {
+                    *cur = seq;
+                }
+            })
+            .or_insert(seq);
     }
     consensus.epoch_block_count += 1;
 }

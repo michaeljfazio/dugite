@@ -103,9 +103,18 @@ Each `<path>` may be either a `ledger-snapshot.bin` file or a database directory
 
 ### Acceptance status
 
-This harness must PASS for at least one preview boundary AND one preprod boundary before #670 is considered fully verified. As of issue #626 (residual +297K-ADA drift at preview boundary 3→4) the from-genesis replay does NOT match the Haskell ancillary at all boundaries; the harness consequently reports mismatches in pot fields (`treasury`, `reserves`, `epoch_fees`) for those affected boundaries.
+The harness must PASS for at least one preview boundary AND one preprod boundary before #670 is considered fully verified.
 
-Track the resolution of #626 (and any other open epoch-diff issues) before declaring #670's byte-exact gate satisfied.
+Prior to commits in 2026 Q2 (issues #438, #481, #624, #626, #678, #685) the from-genesis replay did not match the Haskell ancillary at all boundaries — the harness reported drift in pot fields (`treasury`, `reserves`, `epoch_fees`) cascading from a missing Babbage→Conway PPUP path that left the on-chain protocol version stuck at 8 in dugite while the canonical chain ran at 9. With those resolved, a preview-mainnet-style chunk replay through to the mithril anchor now reproduces the Haskell ledger byte-exact, including:
+
+- Pots (treasury, reserves, fees, deposits, donation)
+- All five Praos nonces
+- DRep + committee + proposal + vote state
+- Mark/set/go snapshots + ssFee
+- bprev block production counters
+- Stake distribution + per-credential deposits
+
+Any remaining open epoch-diff issue is a blocker for re-claiming the gate; consult the project tracker before signing off a new release that touches era-translation, governance enactment, or PPUP semantics.
 
 ## Code references
 
@@ -126,6 +135,8 @@ Track the resolution of #626 (and any other open epoch-diff issues) before decla
 
 - **#670** — This issue. Adds the explicit CLI flag, documents the trust model and operator-exposure decision, and ships the byte-exact verification harness.
 - **#335** — Stale genesis-default protocol parameters when ancillary was skipped (root cause for making ancillary default-on).
-- **#626** — Residual +297K-ADA drift at preview boundary 3→4 (blocks full PASS of the verification harness across all historical boundaries).
-- **#624** — Pre-Conway PPUP decoder fix that closed earlier boundary drifts and reduced #626's scope.
+- **#626** — Residual +297K-ADA drift at preview boundary 3→4 (resolved; PPUP timing aligned with Haskell HFC tick).
+- **#624** — Pre-Conway PPUP decoder fix that closed earlier boundary drifts.
+- **#678** — Conway treasury-value check incorrectly gated; resolved by mode-gating on `ValidateAll` to match Haskell `ApplySTSOpts.asoValidation`.
+- **#685** — Missing PPUP application at Babbage→Conway era boundary + `prev_pp` captured AFTER `ratify_proposals_impl`. Both fixed; replay now byte-exact through the originally-failing preview slot 76172461 and past.
 - **#516** — Single-use channel constraint workaround (unrelated to ancillary but referenced from the same lifecycle code).
