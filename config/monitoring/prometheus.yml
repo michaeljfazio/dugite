@@ -5,9 +5,30 @@ global:
 rule_files:
   - "prometheus-alerts.yml"
 
+# Scrape every well-known dugite-node metrics port so the dashboard works
+# regardless of which `just run-{bp,relay}-{network}` recipe is active.
+# Down targets cost nothing — they just show as "DOWN" in /targets.
+#
+# Port assignments come from scripts/run/{bp,relay}-{network}.sh:
+#   12796  preview  relay
+#   12797  preview  bp  (also used by scripts/run/dual-node.sh BP)
+#   12798  -        cardano-node default + dugite default
+#   12799  preprod  bp + relay
+#   12800  mainnet  bp + relay
+#
+# NOTE: on macOS with podman, `gvproxy` may bind 12799 on IPv6 at boot. That
+# squats `curl localhost:12799` from the host but does NOT affect scraping
+# from inside the prom container, which goes via host.docker.internal.
 scrape_configs:
   - job_name: "dugite"
     static_configs:
+      - targets: ["host.docker.internal:12796"]
+        labels: { role: "relay", network: "preview" }
+      - targets: ["host.docker.internal:12797"]
+        labels: { role: "bp", network: "preview" }
       - targets: ["host.docker.internal:12798"]
-        labels:
-          instance: "local"
+        labels: { role: "default", network: "any" }
+      - targets: ["host.docker.internal:12799"]
+        labels: { role: "node", network: "preprod" }
+      - targets: ["host.docker.internal:12800"]
+        labels: { role: "node", network: "mainnet" }

@@ -188,9 +188,9 @@ soak-status:
 
 # ─── Monitoring (Prometheus + Grafana) ───────────────────────────────────────
 
-# Start the local Prometheus + Grafana stack (Docker).
-monitor-start:
-    ./scripts/monitoring/start.sh
+# Start the local Prometheus + Grafana stack (Docker). Prometheus port defaults to 9090.
+monitor-start prometheus_port="9090":
+    PROMETHEUS_PORT={{prometheus_port}} ./scripts/monitoring/start.sh
 
 # Stop the monitoring stack.
 monitor-stop:

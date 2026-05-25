@@ -17,8 +17,8 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-PROJECT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
-CONFIG_DIR="$PROJECT_DIR/config"
+PROJECT_DIR="$(cd "$SCRIPT_DIR/../.." && pwd)"
+CONFIG_DIR="$PROJECT_DIR/config/monitoring"
 DATA_DIR="$PROJECT_DIR/.monitoring-data"
 
 PROMETHEUS_PORT="${PROMETHEUS_PORT:-9090}"
@@ -83,17 +83,32 @@ start_monitoring() {
         sleep 1
     done
 
-    # Configure Prometheus data source via Grafana API
+    # Configure Prometheus data source via Grafana API.
+    #
+    # We point Grafana at host.docker.internal:${PROMETHEUS_PORT} rather than
+    # the container name because podman's default network does NOT auto-resolve
+    # container names by --name (only by short hex ID). Hitting the published
+    # host port works on both docker-on-mac and podman.
     echo "Configuring Prometheus data source..."
-    curl -s -X POST "http://admin:admin@localhost:${GRAFANA_PORT}/api/datasources" \
-        -H "Content-Type: application/json" \
-        -d '{
-            "name": "Prometheus",
-            "type": "prometheus",
-            "url": "http://'"$PROMETHEUS_CONTAINER"':9090",
-            "access": "proxy",
-            "isDefault": true
-        }' > /dev/null 2>&1 || true
+    DS_URL="http://host.docker.internal:${PROMETHEUS_PORT}"
+    DS_BODY='{
+        "name": "Prometheus",
+        "type": "prometheus",
+        "url": "'"$DS_URL"'",
+        "access": "proxy",
+        "isDefault": true
+    }'
+    # Create or overwrite (PUT to /api/datasources/name/Prometheus updates
+    # if it exists; POST creates first time).
+    if curl -sf "http://admin:admin@localhost:${GRAFANA_PORT}/api/datasources/name/Prometheus" > /dev/null 2>&1; then
+        DS_ID=$(curl -s "http://admin:admin@localhost:${GRAFANA_PORT}/api/datasources/name/Prometheus" \
+            | python3 -c "import sys,json; print(json.load(sys.stdin)['id'])")
+        curl -s -X PUT "http://admin:admin@localhost:${GRAFANA_PORT}/api/datasources/${DS_ID}" \
+            -H "Content-Type: application/json" -d "$DS_BODY" > /dev/null 2>&1
+    else
+        curl -s -X POST "http://admin:admin@localhost:${GRAFANA_PORT}/api/datasources" \
+            -H "Content-Type: application/json" -d "$DS_BODY" > /dev/null 2>&1
+    fi || true
 
     # Get the datasource UID
     DS_UID=$(curl -s "http://admin:admin@localhost:${GRAFANA_PORT}/api/datasources/name/Prometheus" | python3 -c "import sys,json; print(json.load(sys.stdin).get('uid',''))" 2>/dev/null || echo "")
@@ -122,16 +137,16 @@ print(json.dumps(payload))
         echo "Warning: Could not determine datasource UID. Import the dashboard manually from Grafana UI."
     fi
 
-    # Link containers so Grafana can reach Prometheus by name
-    docker network connect bridge "$GRAFANA_CONTAINER" 2>/dev/null || true
-
     echo ""
     echo "=== Monitoring Stack Ready ==="
     echo "  Grafana:    http://localhost:${GRAFANA_PORT}  (admin/admin)"
     echo "  Prometheus: http://localhost:${PROMETHEUS_PORT}"
     echo "  Dashboard:  http://localhost:${GRAFANA_PORT}/d/dugite-node/dugite-node"
     echo ""
-    echo "Make sure dugite-node is running with --metrics-port ${DUGITE_METRICS_PORT}"
+    echo "Prometheus scrapes all standard dugite metrics ports:"
+    echo "  12796=preview/relay  12797=preview/bp  12798=default"
+    echo "  12799=preprod        12800=mainnet"
+    echo "Unused ports show DOWN at http://localhost:${PROMETHEUS_PORT}/targets — that's fine."
     echo "To stop: $0 stop"
 }
 
