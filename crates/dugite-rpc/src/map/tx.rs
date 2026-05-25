@@ -74,7 +74,7 @@ fn tx_input_to_proto(input: &TransactionInput) -> pb::TxInput {
     }
 }
 
-fn tx_output_to_proto(out: &TransactionOutput) -> pb::TxOutput {
+pub fn tx_output_to_proto(out: &TransactionOutput) -> pb::TxOutput {
     pb::TxOutput {
         address: out.address.to_bytes(),
         coin: Some(coin_bigint(out.value.coin.0)),
