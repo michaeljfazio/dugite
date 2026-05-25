@@ -27,23 +27,86 @@ const DEFAULT_ERA_ID: u16 = 6;
 
 /// Build the v1beta TxEval envelope from an [`EvalOutcome`].
 fn eval_outcome_to_proto_beta(outcome: EvalOutcome) -> v1beta::cardano::TxEval {
+    use crate::context::RedeemerPurpose;
+    fn map_purpose(p: RedeemerPurpose) -> i32 {
+        let proto = match p {
+            RedeemerPurpose::Unspecified => v1beta::cardano::RedeemerPurpose::Unspecified,
+            RedeemerPurpose::Spend => v1beta::cardano::RedeemerPurpose::Spend,
+            RedeemerPurpose::Mint => v1beta::cardano::RedeemerPurpose::Mint,
+            RedeemerPurpose::Cert => v1beta::cardano::RedeemerPurpose::Cert,
+            RedeemerPurpose::Reward => v1beta::cardano::RedeemerPurpose::Reward,
+            RedeemerPurpose::Vote => v1beta::cardano::RedeemerPurpose::Vote,
+            RedeemerPurpose::Propose => v1beta::cardano::RedeemerPurpose::Propose,
+        };
+        proto as i32
+    }
+
+    // Sum ex_units across every redeemer report.
+    let (total_steps, total_memory) = outcome.redeemers.iter().fold((0u64, 0u64), |(s, m), r| {
+        (
+            s.saturating_add(r.ex_units.0),
+            m.saturating_add(r.ex_units.1),
+        )
+    });
+
+    // Per-redeemer traces: one EvalReport per log line, so clients
+    // that paginate can correlate traces back to their redeemer via
+    // purpose + index.
+    let mut traces: Vec<v1beta::cardano::EvalReport> = Vec::new();
+    for r in &outcome.redeemers {
+        for line in &r.logs {
+            traces.push(v1beta::cardano::EvalReport {
+                msg: line.clone(),
+                purpose: map_purpose(r.purpose),
+                index: r.index,
+            });
+        }
+    }
+
+    // Per-redeemer errors: surface any redeemer-level `error` field
+    // alongside the tx-level error message (if any).
+    let mut errors: Vec<v1beta::cardano::EvalReport> = Vec::new();
+    if let Some(msg) = outcome.error.clone() {
+        errors.push(v1beta::cardano::EvalReport {
+            msg,
+            purpose: v1beta::cardano::RedeemerPurpose::Unspecified as i32,
+            index: 0,
+        });
+    }
+    for r in &outcome.redeemers {
+        if let Some(err) = &r.error {
+            errors.push(v1beta::cardano::EvalReport {
+                msg: err.clone(),
+                purpose: map_purpose(r.purpose),
+                index: r.index,
+            });
+        }
+    }
+
+    let redeemers: Vec<v1beta::cardano::Redeemer> = outcome
+        .redeemers
+        .iter()
+        .map(|r| v1beta::cardano::Redeemer {
+            purpose: map_purpose(r.purpose),
+            payload: None,
+            index: r.index,
+            ex_units: Some(v1beta::cardano::ExUnits {
+                steps: r.ex_units.0,
+                memory: r.ex_units.1,
+            }),
+            original_cbor: Vec::new(),
+        })
+        .collect();
+
     v1beta::cardano::TxEval {
         fee: Some(crate::map::common::coin_bigint(outcome.fee)),
         ex_units: Some(v1beta::cardano::ExUnits {
-            steps: 0,
-            memory: 0,
+            steps: total_steps,
+            memory: total_memory,
         }),
-        errors: outcome
-            .error
-            .into_iter()
-            .map(|msg| v1beta::cardano::EvalReport {
-                msg,
-                purpose: v1beta::cardano::RedeemerPurpose::Unspecified as i32,
-                index: 0,
-            })
-            .collect(),
-        traces: Vec::new(),
-        redeemers: Vec::new(),
+        errors,
+        traces,
+        redeemers,
     }
 }
 
