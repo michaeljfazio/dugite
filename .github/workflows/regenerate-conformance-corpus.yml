@@ -85,7 +85,7 @@ jobs:
           apply_override plutus              tag  "${PL_TAG}"
 
       - name: Set up Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v6
         with:
           python-version: "3.11"
 
