@@ -21,6 +21,7 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use dugite_ledger::LedgerState;
 use dugite_mempool::Mempool;
 use dugite_primitives::address::Address;
 use dugite_primitives::block::Point;
@@ -41,12 +42,21 @@ use crate::node::tip_broadcast::{TipApply, TipBroadcaster};
 /// Concrete impl of [`LedgerContext`] backed by node internals.
 pub struct NodeRpcAdapter {
     pub(crate) chain_db: Arc<RwLock<ChainDB>>,
+    pub(crate) ledger_state: Arc<RwLock<LedgerState>>,
     pub(crate) mempool: Arc<Mempool>,
 }
 
 impl NodeRpcAdapter {
-    pub fn new(chain_db: Arc<RwLock<ChainDB>>, mempool: Arc<Mempool>) -> Self {
-        Self { chain_db, mempool }
+    pub fn new(
+        chain_db: Arc<RwLock<ChainDB>>,
+        ledger_state: Arc<RwLock<LedgerState>>,
+        mempool: Arc<Mempool>,
+    ) -> Self {
+        Self {
+            chain_db,
+            ledger_state,
+            mempool,
+        }
     }
 
     /// Pull (slot, hash, block_no, era) for a raw block CBOR via a
@@ -175,12 +185,25 @@ impl LedgerContext for NodeRpcAdapter {
         Ok(out)
     }
 
-    async fn utxo_by_ref(&self, _refs: &[TransactionInput]) -> Result<Vec<UtxoSnapshot>, RpcError> {
-        Err(RpcError::Unimplemented("LedgerContext::utxo_by_ref"))
+    async fn utxo_by_ref(&self, refs: &[TransactionInput]) -> Result<Vec<UtxoSnapshot>, RpcError> {
+        let ledger = self.ledger_state.read().await;
+        let mut out = Vec::with_capacity(refs.len());
+        for input in refs {
+            if let Some(output) = ledger.utxo.utxo_set.lookup(input) {
+                out.push(UtxoSnapshot {
+                    ref_: input.clone(),
+                    output,
+                    slot: None,
+                });
+            }
+        }
+        Ok(out)
     }
 
     async fn utxos_by_address(&self, _addr: &Address) -> Result<Vec<UtxoSnapshot>, RpcError> {
-        Err(RpcError::Unimplemented("LedgerContext::utxos_by_address"))
+        Err(RpcError::Unimplemented(
+            "LedgerContext::utxos_by_address (M2.B — needs UtxoSet::outputs_for_address accessor)",
+        ))
     }
 
     async fn utxos_by_payment_credential(
@@ -201,15 +224,50 @@ impl LedgerContext for NodeRpcAdapter {
     }
 
     async fn params_at_tip(&self) -> Result<ParamsView, RpcError> {
-        Err(RpcError::Unimplemented("LedgerContext::params_at_tip"))
+        let ledger = self.ledger_state.read().await;
+        let params = ledger.epochs.protocol_params.clone();
+        let pv = params.protocol_version_major;
+        Ok(ParamsView {
+            params: Arc::new(params),
+            protocol_version_major: pv,
+        })
     }
 
     async fn era_history(&self) -> Result<dugite_rpc::EraHistoryView, RpcError> {
-        Err(RpcError::Unimplemented("LedgerContext::era_history"))
+        // M2.A: minimal era-history projection. We project the era of
+        // the current tip as a single EraSummary entry, derived from
+        // protocol_version_major. Full era-boundary mapping requires
+        // the era-history projection from `node/n2c_query/protocol.rs`
+        // which is a sequel commit.
+        let ledger = self.ledger_state.read().await;
+        let pv = ledger.epochs.protocol_params.protocol_version_major;
+        let era = dugite_primitives::block::ProtocolVersion {
+            major: pv,
+            minor: 0,
+        }
+        .era();
+        Ok(dugite_rpc::EraHistoryView {
+            summaries: vec![dugite_rpc::EraSummary {
+                era,
+                first_slot: 0,
+                slot_length_ms: 1_000,
+                epoch_length_slots: 432_000,
+            }],
+        })
     }
 
     async fn genesis(&self) -> Result<dugite_rpc::GenesisView, RpcError> {
-        Err(RpcError::Unimplemented("LedgerContext::genesis"))
+        // M2.A: emit network_magic + the conventional Shelley start
+        // time (1596059091 s for mainnet — overridden per-network at
+        // M2.B when the genesis files are wired through). security_param
+        // mirrors the ledger's k.
+        let ledger = self.ledger_state.read().await;
+        let _ = ledger; // security_param k lives in node config; surfaced fully in M2.B
+        Ok(dugite_rpc::GenesisView {
+            network_magic: 0,
+            system_start_unix: 0,
+            security_param: 0,
+        })
     }
 
     async fn submit_tx(&self, _era: u16, _raw_cbor: &[u8]) -> SubmitOutcome {

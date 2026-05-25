@@ -17,4 +17,5 @@
 
 pub mod block;
 pub mod common;
+pub mod pparams;
 pub mod tx;

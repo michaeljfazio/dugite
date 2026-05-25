@@ -2842,6 +2842,7 @@ impl Node {
         if let Some(rpc_cfg) = self.rpc_config.clone() {
             let adapter = Arc::new(crate::rpc_adapter::NodeRpcAdapter::new(
                 self.chain_db.clone(),
+                self.ledger_state.clone(),
                 self.mempool.clone(),
             ));
             let (tip_feed, tip_publisher) = crate::rpc_adapter::build_tip_feed();
