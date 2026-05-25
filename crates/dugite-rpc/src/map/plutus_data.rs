@@ -100,7 +100,6 @@ trait BigIntI64Ext {
 
 impl BigIntI64Ext for num_bigint::BigInt {
     fn to_signed_bytes_be_within_i64(&self) -> Option<i64> {
-        use std::convert::TryInto;
         let bytes = self.to_signed_bytes_be();
         if bytes.len() <= 8 {
             // Sign-extend up to 8 bytes.
