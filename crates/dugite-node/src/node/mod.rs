@@ -2110,6 +2110,33 @@ impl Node {
             });
         }
 
+        // Issue #672 M0.3: tx validator + slot config hoisted out of the N2C
+        // block so the forthcoming UTxO RPC SubmitService (M1+) can share the
+        // exact same validator instance + slot config as N2C
+        // LocalTxSubmission. SlotConfig is Copy and LedgerTxValidator is
+        // Arc'd, so the N2C block captures by clone on the consume side.
+        let n2c_slot_config = self
+            .shelley_genesis
+            .as_ref()
+            .map(|g| g.slot_config())
+            .unwrap_or(dugite_ledger::plutus::SlotConfig {
+                zero_time: 0,
+                zero_slot: 0,
+                slot_length: 1000,
+            });
+        let n2c_tx_validator = Arc::new(serve::LedgerTxValidator {
+            ledger: self.ledger_state.clone(),
+            slot_config: n2c_slot_config,
+            metrics: self.metrics.clone(),
+            mempool: Some(self.mempool.clone()),
+            network: if self.network_magic == dugite_primitives::network::NetworkId::Mainnet.magic()
+            {
+                dugite_primitives::network::NetworkId::Mainnet
+            } else {
+                dugite_primitives::network::NetworkId::Testnet
+            },
+        });
+
         // Start N2C server on Unix socket.
         //
         // Each accepted connection gets its own Mux and set of protocol tasks:
@@ -2129,29 +2156,6 @@ impl Node {
             // Build the block provider for LocalChainSync
             let n2c_block_provider = Arc::new(serve::ChainDBBlockProvider {
                 chain_db: self.chain_db.clone(),
-            });
-            // Build the tx validator for LocalTxSubmission
-            let n2c_slot_config = self
-                .shelley_genesis
-                .as_ref()
-                .map(|g| g.slot_config())
-                .unwrap_or(dugite_ledger::plutus::SlotConfig {
-                    zero_time: 0,
-                    zero_slot: 0,
-                    slot_length: 1000,
-                });
-            let n2c_tx_validator = Arc::new(serve::LedgerTxValidator {
-                ledger: self.ledger_state.clone(),
-                slot_config: n2c_slot_config,
-                metrics: self.metrics.clone(),
-                mempool: Some(self.mempool.clone()),
-                network: if self.network_magic
-                    == dugite_primitives::network::NetworkId::Mainnet.magic()
-                {
-                    dugite_primitives::network::NetworkId::Mainnet
-                } else {
-                    dugite_primitives::network::NetworkId::Testnet
-                },
             });
 
             // Remove stale socket file if it exists (e.g., from a previous unclean shutdown).
