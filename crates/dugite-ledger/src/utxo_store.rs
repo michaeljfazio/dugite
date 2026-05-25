@@ -211,6 +211,29 @@ impl UtxoStore {
         }
     }
 
+    /// List every `(input, output)` pair whose output address matches `addr`.
+    ///
+    /// Backed by the secondary `address_index` HashMap when indexing is
+    /// enabled; returns an empty Vec otherwise. The address index is
+    /// rebuilt from a fresh snapshot via `rebuild_address_index()`.
+    ///
+    /// Issue #672 — `QueryService.SearchUtxos` follow-up.
+    pub fn outputs_for_address(
+        &self,
+        addr: &Address,
+    ) -> Vec<(TransactionInput, TransactionOutput)> {
+        let Some(inputs) = self.address_index.get(addr) else {
+            return Vec::new();
+        };
+        let mut out = Vec::with_capacity(inputs.len());
+        for input in inputs {
+            if let Some(output) = self.lookup(input) {
+                out.push((input.clone(), output));
+            }
+        }
+        out
+    }
+
     /// Insert a new UTxO entry.
     ///
     /// # Panics
