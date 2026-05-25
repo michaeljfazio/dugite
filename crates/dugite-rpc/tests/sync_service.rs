@@ -175,6 +175,29 @@ impl LedgerContext for SyncMock {
     async fn submit_tx(&self, _: u16, _: &[u8]) -> SubmitOutcome {
         SubmitOutcome::Rejected { reason: "".into() }
     }
+    async fn eval_tx(&self, _: u16, _: &[u8]) -> dugite_rpc::EvalOutcome {
+        dugite_rpc::EvalOutcome {
+            fee: 0,
+            error: Some("".into()),
+            redeemers: Vec::new(),
+        }
+    }
+    async fn utxos_filter(
+        &self,
+        _: &(dyn for<'a> Fn(&'a UtxoSnapshot) -> bool + Send + Sync),
+        _: usize,
+    ) -> Result<Vec<UtxoSnapshot>, RpcError> {
+        Ok(Vec::new())
+    }
+    async fn datum_by_hash(&self, _: &Hash32) -> Result<Option<Vec<u8>>, RpcError> {
+        Ok(None)
+    }
+    async fn tx_by_hash(&self, _: &TransactionHash) -> Result<Option<RawTx>, RpcError> {
+        Ok(None)
+    }
+    async fn ledger_state(&self) -> Result<dugite_rpc::LedgerStateView, RpcError> {
+        Err(RpcError::Unimplemented(""))
+    }
     async fn mempool_snapshot(&self) -> Result<Vec<RawTx>, RpcError> {
         Err(RpcError::Unimplemented(""))
     }

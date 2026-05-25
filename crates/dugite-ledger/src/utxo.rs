@@ -252,6 +252,71 @@ impl UtxoSet {
         out
     }
 
+    /// List every `(input, output)` pair whose output address carries the
+    /// supplied payment credential. Capped at `max_items`. Issue #672 —
+    /// `QueryService.SearchUtxos` follow-up.
+    ///
+    /// Walks `address_index` keys filtering by `payment_credential()`.
+    /// Cost is O(distinct addresses) — acceptable for ad-hoc RPC
+    /// queries, not for hot paths. LSM store fallback returns empty
+    /// (the address_index inside UtxoStore is keyed by Address and
+    /// would need its own payment-credential secondary index for an
+    /// efficient lookup; deferred).
+    pub fn outputs_for_payment_credential(
+        &self,
+        cred: &dugite_primitives::credentials::Credential,
+        max_items: usize,
+    ) -> Vec<(TransactionInput, TransactionOutput)> {
+        if self.store.is_some() {
+            // LSM-store path: no payment-credential secondary index
+            // exists yet. Return empty rather than scanning the whole
+            // store. Tracked as a follow-up alongside an asset index.
+            return Vec::new();
+        }
+        let mut out: Vec<(TransactionInput, TransactionOutput)> = Vec::new();
+        for (addr, inputs) in &self.address_index {
+            if addr.payment_credential() != Some(cred) {
+                continue;
+            }
+            for input in inputs {
+                if out.len() >= max_items {
+                    return out;
+                }
+                if let Some(output) = self.utxos.get(input).cloned() {
+                    out.push((input.clone(), output));
+                }
+            }
+        }
+        out
+    }
+
+    /// Return every UTxO whose output value contains an asset matching
+    /// `(policy, asset_name?)`. Capped at `max_items` results.
+    ///
+    /// Unindexed full scan — O(N) over the in-memory UTxO set. LSM
+    /// store fallback returns empty (full scan would materialise
+    /// multi-GB of data; would need an asset secondary index).
+    pub fn outputs_for_asset(
+        &self,
+        policy: &dugite_primitives::hash::PolicyId,
+        asset_name: Option<&[u8]>,
+        max_items: usize,
+    ) -> Vec<(TransactionInput, TransactionOutput)> {
+        if self.store.is_some() {
+            return Vec::new();
+        }
+        let mut out: Vec<(TransactionInput, TransactionOutput)> = Vec::new();
+        for (input, output) in &self.utxos {
+            if out.len() >= max_items {
+                break;
+            }
+            if output_matches_asset(output, policy, asset_name) {
+                out.push((input.clone(), output.clone()));
+            }
+        }
+        out
+    }
+
     /// Insert a new UTxO
     pub fn insert(&mut self, input: TransactionInput, output: TransactionOutput) {
         if let Some(ref mut store) = self.store {
@@ -422,6 +487,22 @@ impl UtxoSet {
         for (k, v) in &self.utxos {
             f(k, v);
         }
+    }
+}
+
+/// Predicate: does the output's value contain at least one asset
+/// matching `(policy, asset_name?)`?
+pub(crate) fn output_matches_asset(
+    output: &TransactionOutput,
+    policy: &dugite_primitives::hash::PolicyId,
+    asset_name: Option<&[u8]>,
+) -> bool {
+    let Some(by_name) = output.value.multi_asset.get(policy) else {
+        return false;
+    };
+    match asset_name {
+        None => !by_name.is_empty(),
+        Some(name) => by_name.keys().any(|k| k.0.as_slice() == name),
     }
 }
 

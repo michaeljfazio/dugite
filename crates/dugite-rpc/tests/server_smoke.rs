@@ -86,6 +86,29 @@ impl LedgerContext for MockLedgerContext {
             reason: "mock::submit_tx not implemented".into(),
         }
     }
+    async fn eval_tx(&self, _: u16, _: &[u8]) -> dugite_rpc::EvalOutcome {
+        dugite_rpc::EvalOutcome {
+            fee: 0,
+            error: Some("mock::eval_tx not implemented".into()),
+            redeemers: Vec::new(),
+        }
+    }
+    async fn utxos_filter(
+        &self,
+        _: &(dyn for<'a> Fn(&'a UtxoSnapshot) -> bool + Send + Sync),
+        _: usize,
+    ) -> Result<Vec<UtxoSnapshot>, RpcError> {
+        Err(RpcError::Unimplemented("mock::utxos_filter"))
+    }
+    async fn datum_by_hash(&self, _: &Hash32) -> Result<Option<Vec<u8>>, RpcError> {
+        Ok(None)
+    }
+    async fn tx_by_hash(&self, _: &TransactionHash) -> Result<Option<RawTx>, RpcError> {
+        Ok(None)
+    }
+    async fn ledger_state(&self) -> Result<dugite_rpc::LedgerStateView, RpcError> {
+        Err(RpcError::Unimplemented("mock::ledger_state"))
+    }
     async fn mempool_snapshot(&self) -> Result<Vec<RawTx>, RpcError> {
         Err(RpcError::Unimplemented("mock::mempool_snapshot"))
     }
@@ -219,16 +242,18 @@ async fn sync_v1alpha_read_tip_propagates_mock_unimplemented() {
 // ── Query v1beta ─────────────────────────────────────────────────────────
 
 #[tokio::test]
-async fn query_v1beta_methods_return_unimplemented() {
+async fn query_v1beta_methods_propagate_mock_errors() {
     use dugite_rpc::proto::v1beta::query::query_service_client::QueryServiceClient;
     use dugite_rpc::proto::v1beta::query::{
-        ReadDataRequest, ReadEraSummaryRequest, ReadGenesisRequest, ReadParamsRequest,
-        ReadStateRequest, ReadTxRequest, ReadUtxosRequest, SearchUtxosRequest,
+        ReadEraSummaryRequest, ReadGenesisRequest, ReadParamsRequest, ReadStateRequest,
+        ReadUtxosRequest, SearchUtxosRequest,
     };
 
     let server = TestServer::start(true).await;
     let mut client = QueryServiceClient::new(server.channel().await);
 
+    // Methods whose context call returns Unimplemented in the mock —
+    // the gRPC wire status propagates verbatim.
     for status in [
         client
             .read_params(ReadParamsRequest::default())
@@ -238,15 +263,6 @@ async fn query_v1beta_methods_return_unimplemented() {
             .read_utxos(ReadUtxosRequest::default())
             .await
             .unwrap_err(),
-        client
-            .search_utxos(SearchUtxosRequest::default())
-            .await
-            .unwrap_err(),
-        client
-            .read_data(ReadDataRequest::default())
-            .await
-            .unwrap_err(),
-        client.read_tx(ReadTxRequest::default()).await.unwrap_err(),
         client
             .read_genesis(ReadGenesisRequest::default())
             .await
@@ -263,26 +279,33 @@ async fn query_v1beta_methods_return_unimplemented() {
         assert_eq!(status.code(), tonic::Code::Unimplemented);
     }
 
+    // SearchUtxos with a wildcard (no predicate / no leaf) is rejected
+    // by the service itself with UNIMPLEMENTED before ever touching the
+    // context — see `search_utxos_response_beta`.
+    let status = client
+        .search_utxos(SearchUtxosRequest::default())
+        .await
+        .unwrap_err();
+    assert_eq!(status.code(), tonic::Code::Unimplemented);
+
     server.stop().await;
 }
 
 // ── Submit v1beta ────────────────────────────────────────────────────────
 //
-// Submit methods are implemented as of M3; eval_tx is the only one that
-// still returns UNIMPLEMENTED (needs a non-committing UPLC helper).
-// SubmitTx with no `raw` field returns INVALID_ARGUMENT; the richer
+// All Submit methods are implemented as of the EvalTx follow-up. SubmitTx
+// / EvalTx with no `raw` field return INVALID_ARGUMENT; the richer
 // integration suite for SubmitService lives in submit_service.rs.
 
 #[tokio::test]
-async fn submit_v1beta_eval_tx_returns_unimplemented() {
+async fn submit_v1beta_eval_tx_with_empty_request_returns_invalid_argument() {
     use dugite_rpc::proto::v1beta::submit::submit_service_client::SubmitServiceClient;
     use dugite_rpc::proto::v1beta::submit::EvalTxRequest;
 
     let server = TestServer::start(true).await;
     let mut client = SubmitServiceClient::new(server.channel().await);
     let status = client.eval_tx(EvalTxRequest::default()).await.unwrap_err();
-    assert_eq!(status.code(), tonic::Code::Unimplemented);
-    assert!(status.message().contains("EvalTx"));
+    assert_eq!(status.code(), tonic::Code::InvalidArgument);
     server.stop().await;
 }
 

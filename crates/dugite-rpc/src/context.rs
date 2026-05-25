@@ -132,6 +132,59 @@ pub enum SubmitOutcome {
     Rejected { reason: String },
 }
 
+/// Outcome of a non-committing transaction evaluation (SubmitService.EvalTx).
+#[derive(Clone, Debug)]
+pub struct EvalOutcome {
+    /// The transaction's declared fee (in lovelace).
+    pub fee: u64,
+    /// `None` on successful evaluation; `Some(reason)` carries the
+    /// structured `TxValidationError` message on failure.
+    pub error: Option<String>,
+    /// Per-redeemer execution reports from the CEK machine. Empty when
+    /// the tx has no Plutus redeemers or when Phase-1 validation failed
+    /// before Phase-2 could run.
+    pub redeemers: Vec<RedeemerReport>,
+}
+
+/// Per-redeemer execution outcome from the CEK machine. Mirrors the
+/// fields needed to populate utxorpc `TxEval.redeemers` / `traces` /
+/// `errors`.
+#[derive(Clone, Debug)]
+pub struct RedeemerReport {
+    /// 0-based index of the redeemer within its purpose group.
+    pub index: u32,
+    /// Redeemer purpose tag (Spend / Mint / Cert / Reward / Vote / Propose).
+    pub purpose: RedeemerPurpose,
+    /// ExUnits consumed: `(cpu_steps, memory)`.
+    pub ex_units: (u64, u64),
+    /// `trace` builtin output captured during evaluation.
+    pub logs: Vec<String>,
+    /// `None` on success; carries the typed `PhaseTwoError` message on
+    /// per-redeemer failure.
+    pub error: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RedeemerPurpose {
+    Unspecified,
+    Spend,
+    Mint,
+    Cert,
+    Reward,
+    Vote,
+    Propose,
+}
+
+/// Minimum-viable ledger-state envelope returned by
+/// [`LedgerContext::ledger_state`]. Holds the epoch + the tip the
+/// snapshot was taken at.
+#[derive(Clone, Debug)]
+pub struct LedgerStateView {
+    pub tip: TipInfo,
+    pub epoch: u64,
+    pub slot_in_epoch: u64,
+}
+
 // ─── The trait ────────────────────────────────────────────────────────────
 
 /// The full API surface the RPC server uses to talk to the node.
@@ -186,6 +239,39 @@ pub trait LedgerContext: Send + Sync + 'static {
         name: Option<&[u8]>,
     ) -> Result<Vec<UtxoSnapshot>, RpcError>;
 
+    /// Predicate-based UTxO scan — invoked when the caller's
+    /// `UtxoPredicate` cannot be served by the address / payment-cred
+    /// / asset indexes (e.g. `delegation_part`, `not`, `all_of` /
+    /// `any_of` composites). Returns at most `cap` matches; impl is
+    /// expected to walk the in-memory UTxO map and apply `keep` to
+    /// each candidate.
+    ///
+    /// Returning `Err(Unimplemented)` is acceptable for backends that
+    /// cannot afford the full scan (e.g. the LSM store); the service
+    /// layer then surfaces UNIMPLEMENTED with a descriptive reason.
+    async fn utxos_filter(
+        &self,
+        keep: &(dyn for<'a> Fn(&'a UtxoSnapshot) -> bool + Send + Sync),
+        cap: usize,
+    ) -> Result<Vec<UtxoSnapshot>, RpcError>;
+
+    /// Fetch a datum by its 32-byte hash. Bounded scan: implementations
+    /// may walk the current UTxO set's inline datums plus a configurable
+    /// window of recent volatile blocks' witness data. Returns `None`
+    /// if not found inside the scan window.
+    async fn datum_by_hash(&self, hash: &Hash32) -> Result<Option<Vec<u8>>, RpcError>;
+
+    /// Fetch a transaction by its 32-byte hash. Bounded scan: checks
+    /// the mempool first, then walks the last N volatile blocks.
+    /// Returns `None` if not found inside the scan window.
+    async fn tx_by_hash(&self, hash: &TransactionHash) -> Result<Option<RawTx>, RpcError>;
+
+    /// Return a compact ledger-state snapshot envelope. The current
+    /// view is intentionally minimal (epoch + tip slot); richer queries
+    /// (stake-pool distribution, DRep delegation, etc.) are layered on
+    /// top once the underlying state projections stabilise.
+    async fn ledger_state(&self) -> Result<LedgerStateView, RpcError>;
+
     async fn params_at_tip(&self) -> Result<ParamsView, RpcError>;
 
     async fn era_history(&self) -> Result<EraHistoryView, RpcError>;
@@ -200,6 +286,11 @@ pub trait LedgerContext: Send + Sync + 'static {
     /// CBOR (`u16`, 0 = Byron, 1 = Shelley, …); the validator double-
     /// checks against the body shape.
     async fn submit_tx(&self, era: u16, raw_cbor: &[u8]) -> SubmitOutcome;
+
+    /// Non-committing Phase-1 + Phase-2 evaluation. Runs the same
+    /// validation pipeline as `submit_tx` but does NOT admit the tx
+    /// to the mempool — suitable for `SubmitService.EvalTx` dry-runs.
+    async fn eval_tx(&self, era: u16, raw_cbor: &[u8]) -> EvalOutcome;
 
     // ── mempool snapshot (live feed lives in MempoolFeed) ────────────────
 

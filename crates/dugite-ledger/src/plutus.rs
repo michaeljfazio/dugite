@@ -243,6 +243,105 @@ pub fn evaluate_plutus_scripts(
     }
 }
 
+/// Per-redeemer report extracted from a Phase-2 evaluation. Mirrors
+/// `dugite_uplc::phase_two::RedeemerResult` but lives in `dugite-ledger`
+/// so callers don't need to depend on the UPLC crate directly.
+#[derive(Debug, Clone)]
+pub struct RedeemerReport {
+    pub tag: dugite_primitives::transaction::RedeemerTag,
+    pub index: u32,
+    pub ex_units_cpu: u64,
+    pub ex_units_mem: u64,
+    pub logs: Vec<String>,
+}
+
+/// Run Phase-2 evaluation and surface per-redeemer reports.
+///
+/// Same semantics as [`evaluate_plutus_scripts`] (declared-budget
+/// enforcement, slot-config translation, panic-safe). The only
+/// difference is that this variant exposes the typed
+/// `dugite_uplc::phase_two::RedeemerResult` list back to the caller so
+/// `SubmitService.EvalTx` can populate per-redeemer
+/// `ex_units` / `traces` / `errors` fields on the wire.
+pub fn evaluate_plutus_scripts_with_reports(
+    tx: &Transaction,
+    utxo_set: &dyn UtxoLookup,
+    cost_models_cbor: Option<&[u8]>,
+    max_tx_ex_units: (u64, u64),
+    slot_config: &SlotConfig,
+) -> Result<Vec<RedeemerReport>, PlutusError> {
+    let owned_cbor: Vec<u8>;
+    let tx_cbor: &[u8] = match tx.raw_cbor.as_ref() {
+        Some(bytes) => bytes.as_slice(),
+        None => {
+            owned_cbor = dugite_serialization::encode_transaction(tx);
+            &owned_cbor
+        }
+    };
+
+    let mut utxo_pairs: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+    let all_inputs = tx.body.inputs.iter().chain(tx.body.reference_inputs.iter());
+    for input in all_inputs {
+        if let Some(output) = utxo_set.lookup(input) {
+            let output_cbor = match &output.raw_cbor {
+                Some(cbor) => cbor.clone(),
+                None => dugite_serialization::encode_transaction_output(&output),
+            };
+            utxo_pairs.push((encode_input_cbor(input), output_cbor));
+        }
+    }
+    for col_input in &tx.body.collateral {
+        if let Some(output) = utxo_set.lookup(col_input) {
+            let output_cbor = match &output.raw_cbor {
+                Some(cbor) => cbor.clone(),
+                None => dugite_serialization::encode_transaction_output(&output),
+            };
+            utxo_pairs.push((encode_input_cbor(col_input), output_cbor));
+        }
+    }
+
+    let dugite_slot_config = dugite_uplc::phase_two::SlotConfig {
+        network_start_unix_seconds: slot_config.zero_time / 1_000,
+        slot_zero_offset: slot_config.zero_slot,
+        slot_length_ms: slot_config.slot_length,
+    };
+    let eval_outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        dugite_uplc::phase_two::eval_phase_two_raw(
+            tx_cbor,
+            &utxo_pairs,
+            cost_models_cbor,
+            max_tx_ex_units,
+            dugite_slot_config,
+            false,
+            &mut (),
+        )
+    }));
+    let results = match eval_outcome {
+        Ok(Ok(r)) => r,
+        Ok(Err(e)) => {
+            return Err(PlutusError::EvalFailed(format!(
+                "eval_phase_two_raw error: {e}"
+            )));
+        }
+        Err(payload) => {
+            return Err(PlutusError::EvalFailed(format!(
+                "dugite-uplc panic on malformed script: {}",
+                panic_payload_to_string(&payload)
+            )));
+        }
+    };
+    Ok(results
+        .into_iter()
+        .map(|r| RedeemerReport {
+            tag: r.tag,
+            index: r.index,
+            ex_units_cpu: r.consumed.cpu.max(0) as u64,
+            ex_units_mem: r.consumed.mem.max(0) as u64,
+            logs: r.logs,
+        })
+        .collect())
+}
+
 /// Check if a transaction contains any Plutus scripts (in witnesses or reference inputs)
 pub fn has_plutus_scripts(tx: &Transaction) -> bool {
     !tx.witness_set.plutus_v1_scripts.is_empty()

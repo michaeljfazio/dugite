@@ -18,14 +18,97 @@ use tonic::{Request, Response, Status};
 
 use super::ServiceState;
 use crate::proto::{v1alpha, v1beta};
-use crate::SubmitOutcome;
+use crate::{EvalOutcome, SubmitOutcome};
 
 const SERVICE_LABEL: &str = "submit";
-const EVAL_UNIMPL: &str =
-    "EvalTx requires a non-committing UPLC evaluation helper; deferred follow-up";
 
 /// Conway-era CBOR tag the spec uses for txs at PV9+ today.
 const DEFAULT_ERA_ID: u16 = 6;
+
+/// Build the v1beta TxEval envelope from an [`EvalOutcome`].
+fn eval_outcome_to_proto_beta(outcome: EvalOutcome) -> v1beta::cardano::TxEval {
+    use crate::context::RedeemerPurpose;
+    fn map_purpose(p: RedeemerPurpose) -> i32 {
+        let proto = match p {
+            RedeemerPurpose::Unspecified => v1beta::cardano::RedeemerPurpose::Unspecified,
+            RedeemerPurpose::Spend => v1beta::cardano::RedeemerPurpose::Spend,
+            RedeemerPurpose::Mint => v1beta::cardano::RedeemerPurpose::Mint,
+            RedeemerPurpose::Cert => v1beta::cardano::RedeemerPurpose::Cert,
+            RedeemerPurpose::Reward => v1beta::cardano::RedeemerPurpose::Reward,
+            RedeemerPurpose::Vote => v1beta::cardano::RedeemerPurpose::Vote,
+            RedeemerPurpose::Propose => v1beta::cardano::RedeemerPurpose::Propose,
+        };
+        proto as i32
+    }
+
+    // Sum ex_units across every redeemer report.
+    let (total_steps, total_memory) = outcome.redeemers.iter().fold((0u64, 0u64), |(s, m), r| {
+        (
+            s.saturating_add(r.ex_units.0),
+            m.saturating_add(r.ex_units.1),
+        )
+    });
+
+    // Per-redeemer traces: one EvalReport per log line, so clients
+    // that paginate can correlate traces back to their redeemer via
+    // purpose + index.
+    let mut traces: Vec<v1beta::cardano::EvalReport> = Vec::new();
+    for r in &outcome.redeemers {
+        for line in &r.logs {
+            traces.push(v1beta::cardano::EvalReport {
+                msg: line.clone(),
+                purpose: map_purpose(r.purpose),
+                index: r.index,
+            });
+        }
+    }
+
+    // Per-redeemer errors: surface any redeemer-level `error` field
+    // alongside the tx-level error message (if any).
+    let mut errors: Vec<v1beta::cardano::EvalReport> = Vec::new();
+    if let Some(msg) = outcome.error.clone() {
+        errors.push(v1beta::cardano::EvalReport {
+            msg,
+            purpose: v1beta::cardano::RedeemerPurpose::Unspecified as i32,
+            index: 0,
+        });
+    }
+    for r in &outcome.redeemers {
+        if let Some(err) = &r.error {
+            errors.push(v1beta::cardano::EvalReport {
+                msg: err.clone(),
+                purpose: map_purpose(r.purpose),
+                index: r.index,
+            });
+        }
+    }
+
+    let redeemers: Vec<v1beta::cardano::Redeemer> = outcome
+        .redeemers
+        .iter()
+        .map(|r| v1beta::cardano::Redeemer {
+            purpose: map_purpose(r.purpose),
+            payload: None,
+            index: r.index,
+            ex_units: Some(v1beta::cardano::ExUnits {
+                steps: r.ex_units.0,
+                memory: r.ex_units.1,
+            }),
+            original_cbor: Vec::new(),
+        })
+        .collect();
+
+    v1beta::cardano::TxEval {
+        fee: Some(crate::map::common::coin_bigint(outcome.fee)),
+        ex_units: Some(v1beta::cardano::ExUnits {
+            steps: total_steps,
+            memory: total_memory,
+        }),
+        errors,
+        traces,
+        redeemers,
+    }
+}
 
 fn extract_raw_tx_beta(req_tx: &Option<v1beta::submit::AnyChainTx>) -> Option<&[u8]> {
     req_tx
@@ -62,9 +145,21 @@ impl SubmitSvcAlpha {
 impl v1alpha::submit::submit_service_server::SubmitService for SubmitSvcAlpha {
     async fn eval_tx(
         &self,
-        _request: Request<v1alpha::submit::EvalTxRequest>,
+        request: Request<v1alpha::submit::EvalTxRequest>,
     ) -> Result<Response<v1alpha::submit::EvalTxResponse>, Status> {
-        Err(Status::unimplemented(EVAL_UNIMPL))
+        let req = request.into_inner();
+        let raw = extract_raw_tx_alpha(&req.tx)
+            .ok_or_else(|| Status::invalid_argument("EvalTxRequest.tx.raw is required"))?;
+        let outcome = self.state.context.eval_tx(DEFAULT_ERA_ID, raw).await;
+        let beta = eval_outcome_to_proto_beta(outcome);
+        use prost::Message;
+        let alpha = v1alpha::cardano::TxEval::decode(beta.encode_to_vec().as_slice())
+            .expect("v1alpha TxEval subset-compatible with v1beta");
+        Ok(Response::new(v1alpha::submit::EvalTxResponse {
+            report: Some(v1alpha::submit::AnyChainEval {
+                chain: Some(v1alpha::submit::any_chain_eval::Chain::Cardano(alpha)),
+            }),
+        }))
     }
 
     async fn submit_tx(
@@ -236,9 +331,18 @@ impl SubmitSvcBeta {
 impl v1beta::submit::submit_service_server::SubmitService for SubmitSvcBeta {
     async fn eval_tx(
         &self,
-        _request: Request<v1beta::submit::EvalTxRequest>,
+        request: Request<v1beta::submit::EvalTxRequest>,
     ) -> Result<Response<v1beta::submit::EvalTxResponse>, Status> {
-        Err(Status::unimplemented(EVAL_UNIMPL))
+        let req = request.into_inner();
+        let raw = extract_raw_tx_beta(&req.tx)
+            .ok_or_else(|| Status::invalid_argument("EvalTxRequest.tx.raw is required"))?;
+        let outcome = self.state.context.eval_tx(DEFAULT_ERA_ID, raw).await;
+        let beta = eval_outcome_to_proto_beta(outcome);
+        Ok(Response::new(v1beta::submit::EvalTxResponse {
+            report: Some(v1beta::submit::AnyChainEval {
+                chain: Some(v1beta::submit::any_chain_eval::Chain::Cardano(beta)),
+            }),
+        }))
     }
 
     async fn submit_tx(

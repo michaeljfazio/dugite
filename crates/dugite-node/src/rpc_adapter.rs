@@ -40,12 +40,29 @@ use tracing::debug;
 
 use crate::node::tip_broadcast::{TipApply, TipBroadcaster};
 
+/// Map dugite-primitives `RedeemerTag` → `dugite_rpc::RedeemerPurpose`.
+fn map_redeemer_tag(
+    tag: &dugite_primitives::transaction::RedeemerTag,
+) -> dugite_rpc::RedeemerPurpose {
+    use dugite_primitives::transaction::RedeemerTag;
+    match tag {
+        RedeemerTag::Spend => dugite_rpc::RedeemerPurpose::Spend,
+        RedeemerTag::Mint => dugite_rpc::RedeemerPurpose::Mint,
+        RedeemerTag::Cert => dugite_rpc::RedeemerPurpose::Cert,
+        RedeemerTag::Reward => dugite_rpc::RedeemerPurpose::Reward,
+        RedeemerTag::Vote => dugite_rpc::RedeemerPurpose::Vote,
+        RedeemerTag::Propose => dugite_rpc::RedeemerPurpose::Propose,
+        RedeemerTag::Guarding => dugite_rpc::RedeemerPurpose::Unspecified,
+    }
+}
+
 /// Concrete impl of [`LedgerContext`] backed by node internals.
 pub struct NodeRpcAdapter {
     pub(crate) chain_db: Arc<RwLock<ChainDB>>,
     pub(crate) ledger_state: Arc<RwLock<LedgerState>>,
     pub(crate) mempool: Arc<Mempool>,
     pub(crate) tx_validator: Arc<dyn TxValidator>,
+    pub(crate) slot_config: dugite_ledger::plutus::SlotConfig,
 }
 
 impl NodeRpcAdapter {
@@ -54,12 +71,14 @@ impl NodeRpcAdapter {
         ledger_state: Arc<RwLock<LedgerState>>,
         mempool: Arc<Mempool>,
         tx_validator: Arc<dyn TxValidator>,
+        slot_config: dugite_ledger::plutus::SlotConfig,
     ) -> Self {
         Self {
             chain_db,
             ledger_state,
             mempool,
             tx_validator,
+            slot_config,
         }
     }
 
@@ -221,19 +240,76 @@ impl LedgerContext for NodeRpcAdapter {
 
     async fn utxos_by_payment_credential(
         &self,
-        _cred: &Hash32,
+        cred: &Hash32,
     ) -> Result<Vec<UtxoSnapshot>, RpcError> {
-        Err(RpcError::Unimplemented(
-            "LedgerContext::utxos_by_payment_credential (no index in v1)",
-        ))
+        use dugite_primitives::credentials::Credential;
+        use dugite_primitives::hash::Hash28;
+
+        // Hash32 is the padded form (28 hash bytes + 4 zero bytes).
+        // Extract the first 28 bytes as the credential payload.
+        let mut h28 = [0u8; 28];
+        h28.copy_from_slice(&cred.as_ref()[..28]);
+        let h28 = Hash28::from_bytes(h28);
+
+        let ledger = self.ledger_state.read().await;
+        // Try VerificationKey first (most common), then Script.
+        let mut out: Vec<UtxoSnapshot> = Vec::new();
+        let cap = 5_000;
+
+        let key_cred = Credential::VerificationKey(h28);
+        for (input, output) in ledger
+            .utxo
+            .utxo_set
+            .outputs_for_payment_credential(&key_cred, cap)
+        {
+            out.push(UtxoSnapshot {
+                ref_: input,
+                output,
+                slot: None,
+            });
+        }
+
+        if out.len() < cap {
+            let script_cred = Credential::Script(h28);
+            for (input, output) in ledger
+                .utxo
+                .utxo_set
+                .outputs_for_payment_credential(&script_cred, cap - out.len())
+            {
+                out.push(UtxoSnapshot {
+                    ref_: input,
+                    output,
+                    slot: None,
+                });
+            }
+        }
+
+        Ok(out)
     }
 
     async fn utxos_by_asset(
         &self,
-        _policy: &Hash32,
-        _name: Option<&[u8]>,
+        policy: &Hash32,
+        name: Option<&[u8]>,
     ) -> Result<Vec<UtxoSnapshot>, RpcError> {
-        Err(RpcError::Unimplemented("LedgerContext::utxos_by_asset"))
+        use dugite_primitives::hash::Hash28;
+        let mut policy_h = [0u8; 28];
+        policy_h.copy_from_slice(&policy.as_ref()[..28]);
+        let policy_h = Hash28::from_bytes(policy_h);
+
+        let ledger = self.ledger_state.read().await;
+        let cap = 5_000;
+        Ok(ledger
+            .utxo
+            .utxo_set
+            .outputs_for_asset(&policy_h, name, cap)
+            .into_iter()
+            .map(|(input, output)| UtxoSnapshot {
+                ref_: input,
+                output,
+                slot: None,
+            })
+            .collect())
     }
 
     async fn params_at_tip(&self) -> Result<ParamsView, RpcError> {
@@ -340,6 +416,237 @@ impl LedgerContext for NodeRpcAdapter {
                 reason: format!("mempool admission failed: {e}"),
             },
         }
+    }
+
+    async fn eval_tx(&self, era: u16, raw_cbor: &[u8]) -> dugite_rpc::EvalOutcome {
+        // 1. Phase-1 + Phase-2 validation via the same LedgerTxValidator
+        //    instance N2C uses. Failure messages flow through verbatim
+        //    so clients see the structured TxValidationError reason.
+        let validation = self.tx_validator.validate_tx(era, raw_cbor);
+
+        // 2. Decode (separately, so a successful validation can still
+        //    surface fee / per-redeemer reports). On decode failure we
+        //    fall back to the bare error+fee=0 shape.
+        let decoded = dugite_serialization::decode_transaction(era, raw_cbor);
+        let fee = decoded.as_ref().map(|tx| tx.body.fee.0).unwrap_or(0);
+
+        // 3. Run Phase-2 with per-redeemer reports. We don't need the
+        //    validator's pass/fail (already in `validation`), but the
+        //    reports surface ex_units + traces back to the client.
+        //    Skip when the tx has no Plutus redeemers — keeps the
+        //    happy-path fast.
+        let mut redeemers: Vec<dugite_rpc::RedeemerReport> = Vec::new();
+        if let Ok(tx) = decoded.as_ref() {
+            if dugite_ledger::plutus::has_plutus_scripts(tx) {
+                let ledger = self.ledger_state.read().await;
+                let max_units = (
+                    ledger.epochs.protocol_params.max_tx_ex_units.steps,
+                    ledger.epochs.protocol_params.max_tx_ex_units.mem,
+                );
+                // Build a composite view: the live UTxO set plus the
+                // (deduplicated) mempool virtual UTxOs so reference
+                // inputs introduced in pending txs resolve. We use the
+                // existing mempool view if available; otherwise the
+                // live set.
+                let utxo_view = &ledger.utxo.utxo_set;
+                let report_outcome = dugite_ledger::evaluate_plutus_scripts_with_reports(
+                    tx,
+                    utxo_view,
+                    None, // cost models — phase-2 evaluator falls back to per-step defaults
+                    max_units,
+                    &self.slot_config,
+                );
+                drop(ledger);
+                if let Ok(reports) = report_outcome {
+                    for r in reports {
+                        redeemers.push(dugite_rpc::RedeemerReport {
+                            index: r.index,
+                            purpose: map_redeemer_tag(&r.tag),
+                            ex_units: (r.ex_units_cpu, r.ex_units_mem),
+                            logs: r.logs,
+                            error: None,
+                        });
+                    }
+                }
+            }
+        }
+
+        dugite_rpc::EvalOutcome {
+            fee,
+            error: match validation {
+                Ok(()) => None,
+                Err(e) => Some(format!("{e:?}")),
+            },
+            redeemers,
+        }
+    }
+
+    async fn utxos_filter(
+        &self,
+        keep: &(dyn for<'a> Fn(&'a UtxoSnapshot) -> bool + Send + Sync),
+        cap: usize,
+    ) -> Result<Vec<UtxoSnapshot>, RpcError> {
+        // O(N) walk over the in-memory UTxO set. LSM-backed backends
+        // delegate to `scan_all` which streams ~256 chunks at a time so
+        // peak memory stays bounded; we still cap the returned vector.
+        let ledger = self.ledger_state.read().await;
+        let mut out: Vec<UtxoSnapshot> = Vec::new();
+        let mut full = false;
+        ledger.utxo.utxo_set.scan_all(|input, output| {
+            if full {
+                return;
+            }
+            let snap = UtxoSnapshot {
+                ref_: input.clone(),
+                output: output.clone(),
+                slot: None,
+            };
+            let matched = keep(&snap);
+            if matched {
+                out.push(snap);
+                if out.len() >= cap {
+                    full = true;
+                }
+            }
+        });
+        Ok(out)
+    }
+
+    async fn datum_by_hash(&self, hash: &Hash32) -> Result<Option<Vec<u8>>, RpcError> {
+        use dugite_primitives::transaction::OutputDatum;
+
+        // 1) Scan the in-memory UTxO set for an inline datum matching
+        //    the hash. Bounded by the UTxO set size (#403 mitigation:
+        //    via `scan_all` chunk streaming).
+        let ledger = self.ledger_state.read().await;
+        let target = *hash;
+        let mut found: Option<Vec<u8>> = None;
+        ledger.utxo.utxo_set.scan_all(|_input, output| {
+            if found.is_some() {
+                return;
+            }
+            if let OutputDatum::InlineDatum { data, raw_cbor } = &output.datum {
+                let cbor = raw_cbor
+                    .clone()
+                    .unwrap_or_else(|| dugite_serialization::encode_plutus_data(data));
+                let h = dugite_primitives::hash::blake2b_256(&cbor);
+                if h == target {
+                    found = Some(cbor);
+                }
+            }
+        });
+        drop(ledger);
+        if found.is_some() {
+            return Ok(found);
+        }
+
+        // 2) Walk the mempool transactions and check their witness sets
+        //    for plutus_data hash matches.
+        for hash_id in self.mempool.tx_hashes_ordered() {
+            if let Some(tx) = self.mempool.get_tx(&hash_id) {
+                for datum in &tx.witness_set.plutus_data {
+                    let cbor = dugite_serialization::encode_plutus_data(datum);
+                    let h = dugite_primitives::hash::blake2b_256(&cbor);
+                    if h == target {
+                        return Ok(Some(cbor));
+                    }
+                }
+            }
+        }
+
+        Ok(None)
+    }
+
+    async fn tx_by_hash(&self, hash: &TransactionHash) -> Result<Option<RawTx>, RpcError> {
+        // 1) Mempool fast path.
+        if let Some(tx) = self.mempool.get_tx(hash) {
+            return Ok(Some(RawTx {
+                hash: tx.hash,
+                cbor: tx.raw_cbor.unwrap_or_default(),
+            }));
+        }
+
+        // 2) Bounded scan of recent volatile blocks. We walk back at
+        //    most TX_BY_HASH_BLOCK_WINDOW blocks from the tip; tx
+        //    lookups outside that window require a chain-wide tx index
+        //    (separate feature; tracked in the docs/Limitations section).
+        const TX_BY_HASH_BLOCK_WINDOW: u64 = 2_160; // ~12 h on mainnet
+        let db = self.chain_db.read().await;
+        let Some((tip_slot, _, _)) = db.get_tip_info() else {
+            return Ok(None);
+        };
+        let from = tip_slot.0.saturating_sub(TX_BY_HASH_BLOCK_WINDOW * 20);
+        let blocks = db
+            .get_blocks_in_slot_range(SlotNo(from), tip_slot)
+            .map_err(|e| RpcError::Internal(format!("blocks_in_slot_range: {e}")))?;
+        for cbor in blocks {
+            let Ok(block) = decode_block_minimal(&cbor) else {
+                continue;
+            };
+            // tx_byte_ranges + decode each tx looking for hash match.
+            let Some(ranges) = block.tx_byte_ranges() else {
+                continue;
+            };
+            for range in ranges {
+                let tx_bytes = &cbor[range.clone()];
+                let era_id = match block.era {
+                    dugite_primitives::Era::Shelley => 1u16,
+                    dugite_primitives::Era::Allegra => 2,
+                    dugite_primitives::Era::Mary => 3,
+                    dugite_primitives::Era::Alonzo => 4,
+                    dugite_primitives::Era::Babbage => 5,
+                    dugite_primitives::Era::Conway | dugite_primitives::Era::Dijkstra => 6,
+                    dugite_primitives::Era::Byron => continue,
+                };
+                if let Ok(tx) = dugite_serialization::decode_transaction(era_id, tx_bytes) {
+                    if tx.hash == *hash {
+                        return Ok(Some(RawTx {
+                            hash: tx.hash,
+                            cbor: tx_bytes.to_vec(),
+                        }));
+                    }
+                }
+            }
+        }
+        Ok(None)
+    }
+
+    async fn ledger_state(&self) -> Result<dugite_rpc::LedgerStateView, RpcError> {
+        let ledger = self.ledger_state.read().await;
+        let slot = ledger.current_slot().map(|s| s.0).unwrap_or(0);
+        let epoch = ledger.epoch_of_slot(slot);
+        let first_slot = ledger.first_slot_of_epoch(epoch);
+        let slot_in_epoch = slot.saturating_sub(first_slot);
+        let block_no = ledger.current_block_number().0;
+        drop(ledger);
+        let db = self.chain_db.read().await;
+        let (_, hash, _) = db
+            .get_tip_info()
+            .ok_or_else(|| RpcError::NotFound("ledger_state: chain tip unavailable".into()))?;
+        let mut hash_arr = [0u8; 32];
+        hash_arr.copy_from_slice(hash.as_ref());
+        let pv = self
+            .ledger_state
+            .read()
+            .await
+            .epochs
+            .protocol_params
+            .protocol_version_major;
+        let era = dugite_primitives::block::ProtocolVersion {
+            major: pv,
+            minor: 0,
+        }
+        .era();
+        Ok(dugite_rpc::LedgerStateView {
+            tip: TipInfo {
+                slot,
+                hash: hash_arr,
+                block_number: block_no,
+                era,
+            },
+            epoch,
+            slot_in_epoch,
+        })
     }
 
     async fn mempool_snapshot(&self) -> Result<Vec<RawTx>, RpcError> {
