@@ -263,6 +263,40 @@ impl ParamDef {
 // Known parameter table
 // ---------------------------------------------------------------------------
 
+/// Sub-fields for AcceptedConnectionsLimit.
+const ACCEPTED_CONNECTIONS_LIMIT_FIELDS: &[SubParamDef] = &[
+    SubParamDef {
+        key: "hardLimit",
+        param_type: ParamType::U64 { min: 0, max: 65535 },
+        default: "512",
+        description: "Maximum concurrent inbound connections. New connections \
+                      are refused above this.",
+        tuning_hint: "Lower on memory-constrained relays. 512 is the cardano-node default.",
+        reloadability: Reloadability::Restart,
+    },
+    SubParamDef {
+        key: "softLimit",
+        param_type: ParamType::U64 { min: 0, max: 65535 },
+        default: "384",
+        description: "Threshold above which new inbound connections are progressively \
+                      delayed by up to `delay` seconds.",
+        tuning_hint: "Typically 75% of hardLimit.",
+        reloadability: Reloadability::Restart,
+    },
+    SubParamDef {
+        key: "delay",
+        param_type: ParamType::F64 {
+            min: 0.0,
+            max: 60.0,
+        },
+        default: "5.0",
+        description: "Maximum delay (seconds) applied to new connections above softLimit. \
+                      Linear ramp between softLimit and hardLimit.",
+        tuning_hint: "Raise (up to 30s) to slow down aggressive inbound peers.",
+        reloadability: Reloadability::Restart,
+    },
+];
+
 /// All known Cardano node configuration parameters, in section/display order.
 ///
 /// When a key from the loaded JSON file matches an entry here, its metadata is
@@ -972,8 +1006,10 @@ pub static KNOWN_PARAMS: &[ParamDef] = &[
     ParamDef {
         key: "AcceptedConnectionsLimit",
         section: "Diffusion",
-        param_type: ParamType::Object { fields: &[] },
-        default: "",
+        param_type: ParamType::Object {
+            fields: ACCEPTED_CONNECTIONS_LIMIT_FIELDS,
+        },
+        default: r#"{"hardLimit":512,"softLimit":384,"delay":5.0}"#,
         description: "Inbound connection admission limits. 'hardLimit' is the maximum \
                       concurrent inbound connections (new connections are refused above \
                       this). 'softLimit' is the threshold above which new connections \
@@ -1528,7 +1564,37 @@ mod tests {
         );
         let def = map["AcceptedConnectionsLimit"];
         assert_eq!(def.section, "Diffusion");
-        assert_eq!(def.param_type, ParamType::Object { fields: &[] });
+        match &def.param_type {
+            ParamType::Object { fields } => {
+                assert!(
+                    !fields.is_empty(),
+                    "AcceptedConnectionsLimit should have sub-fields"
+                );
+            }
+            _ => panic!("expected Object"),
+        }
+    }
+
+    #[test]
+    fn test_accepted_connections_limit_subschema() {
+        let def = KNOWN_PARAMS
+            .iter()
+            .find(|d| d.key == "AcceptedConnectionsLimit")
+            .expect("present");
+        match &def.param_type {
+            ParamType::Object { fields } => {
+                assert_eq!(fields.len(), 3, "expected 3 sub-fields");
+                let keys: Vec<&str> = fields.iter().map(|s| s.key).collect();
+                assert_eq!(keys, vec!["hardLimit", "softLimit", "delay"]);
+                assert!(matches!(fields[0].param_type, ParamType::U64 { .. }));
+                assert!(matches!(fields[1].param_type, ParamType::U64 { .. }));
+                assert!(matches!(fields[2].param_type, ParamType::F64 { .. }));
+                assert_eq!(fields[0].default, "512");
+                assert_eq!(fields[1].default, "384");
+                assert_eq!(fields[2].default, "5.0");
+            }
+            _ => panic!("expected Object"),
+        }
     }
 
     #[test]
