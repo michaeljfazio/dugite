@@ -177,93 +177,42 @@ async fn server_binds_loopback_only_by_default() {
     server.stop().await;
 }
 
-// ── Sync v1beta ──────────────────────────────────────────────────────────
+// ── Sync v1beta — implemented as of M1.B; see sync_service.rs ───────────
+//
+// `SyncService` is no longer the all-UNIMPLEMENTED stub it was in M1.A.
+// The detailed sync-method correctness suite lives in
+// `tests/sync_service.rs` with a richer `SyncMock`. Here we only retain
+// the scaffold smoke (ReadTip surfaces its trait error correctly).
 
 #[tokio::test]
-async fn sync_v1beta_methods_return_unimplemented() {
+async fn sync_v1beta_read_tip_propagates_mock_unimplemented() {
     use dugite_rpc::proto::v1beta::sync::sync_service_client::SyncServiceClient;
-    use dugite_rpc::proto::v1beta::sync::{
-        DumpHistoryRequest, FetchBlockRequest, FollowTipRequest, ReadTipRequest,
-    };
+    use dugite_rpc::proto::v1beta::sync::ReadTipRequest;
 
     let server = TestServer::start(true).await;
     let mut client = SyncServiceClient::new(server.channel().await);
-
-    let cases: Vec<(&str, tonic::Status)> = vec![
-        (
-            "fetch_block",
-            client
-                .fetch_block(FetchBlockRequest::default())
-                .await
-                .unwrap_err(),
-        ),
-        (
-            "dump_history",
-            client
-                .dump_history(DumpHistoryRequest::default())
-                .await
-                .unwrap_err(),
-        ),
-        (
-            "read_tip",
-            client
-                .read_tip(ReadTipRequest::default())
-                .await
-                .unwrap_err(),
-        ),
-        (
-            "follow_tip",
-            client
-                .follow_tip(FollowTipRequest::default())
-                .await
-                .unwrap_err(),
-        ),
-    ];
-
-    for (name, status) in cases {
-        assert_eq!(
-            status.code(),
-            tonic::Code::Unimplemented,
-            "{name} → expected UNIMPLEMENTED, got {status:?}"
-        );
-    }
-
+    let status = client
+        .read_tip(ReadTipRequest::default())
+        .await
+        .unwrap_err();
+    assert_eq!(status.code(), tonic::Code::Unimplemented);
     server.stop().await;
 }
 
 // ── Sync v1alpha ─────────────────────────────────────────────────────────
 
 #[tokio::test]
-async fn sync_v1alpha_methods_return_unimplemented() {
+async fn sync_v1alpha_read_tip_propagates_mock_unimplemented() {
     use dugite_rpc::proto::v1alpha::sync::sync_service_client::SyncServiceClient;
-    use dugite_rpc::proto::v1alpha::sync::{
-        DumpHistoryRequest, FetchBlockRequest, FollowTipRequest, ReadTipRequest,
-    };
+    use dugite_rpc::proto::v1alpha::sync::ReadTipRequest;
 
     let server = TestServer::start(true).await;
     let mut client = SyncServiceClient::new(server.channel().await);
-
-    let r1 = client
-        .fetch_block(FetchBlockRequest::default())
-        .await
-        .unwrap_err();
-    let r2 = client
-        .dump_history(DumpHistoryRequest::default())
-        .await
-        .unwrap_err();
-    let r3 = client
+    let status = client
         .read_tip(ReadTipRequest::default())
         .await
         .unwrap_err();
-    let r4 = client
-        .follow_tip(FollowTipRequest::default())
-        .await
-        .unwrap_err();
-
-    for s in [&r1, &r2, &r3, &r4] {
-        assert_eq!(s.code(), tonic::Code::Unimplemented);
-    }
-
+    assert_eq!(status.code(), tonic::Code::Unimplemented);
     server.stop().await;
 }
 
