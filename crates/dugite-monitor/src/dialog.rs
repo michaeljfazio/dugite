@@ -10,6 +10,10 @@ use std::time::Duration;
 
 use anyhow::{anyhow, Result};
 use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
+use crossterm::terminal::{
+    disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
+};
+use crossterm::ExecutableCommand;
 use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::prelude::*;
@@ -22,13 +26,28 @@ use crate::discover::DiscoveredNode;
 
 /// Show the selection dialog. Returns the chosen `metrics_url`, or
 /// `None` if the user quit (q / Esc / Ctrl-C).
-pub fn run(
-    terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
-    nodes: &[DiscoveredNode],
-) -> Result<Option<String>> {
+///
+/// Owns its own terminal lifecycle: enables raw mode + alternate
+/// screen on entry and tears them down on every exit path (including
+/// errors), so the caller does not need to wrap the call in cleanup
+/// boilerplate.
+pub fn run(nodes: &[DiscoveredNode]) -> Result<Option<String>> {
     if nodes.is_empty() {
         return Err(anyhow!("dialog::run called with empty node list"));
     }
+
+    enable_raw_mode()?;
+    io::stdout().execute(EnterAlternateScreen)?;
+    let result = run_inner(nodes);
+    let _ = disable_raw_mode();
+    let _ = io::stdout().execute(LeaveAlternateScreen);
+    result
+}
+
+fn run_inner(nodes: &[DiscoveredNode]) -> Result<Option<String>> {
+    let backend = CrosstermBackend::new(io::stdout());
+    let mut terminal = Terminal::new(backend)?;
+    terminal.clear()?;
 
     let mut cursor: usize = 0;
 

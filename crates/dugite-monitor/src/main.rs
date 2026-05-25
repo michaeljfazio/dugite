@@ -126,27 +126,15 @@ async fn main() -> Result<()> {
     // Store the database path so the Resources panel can query disk space.
     app.db_path = args.db_path.clone();
 
-    // Setup terminal in raw alternate-screen mode.
-    enable_raw_mode()?;
-    io::stdout().execute(EnterAlternateScreen)?;
-    let backend = CrosstermBackend::new(io::stdout());
-    let mut terminal = Terminal::new(backend)?;
-    terminal.clear()?;
-
-    // Resolve the metrics URL: explicit flag wins, otherwise discover.
-    let resolved = resolve_metrics_url(args.metrics_url.as_deref(), &mut terminal).await;
-    let resolution = match resolved {
-        Ok(Some(r)) => r,
-        Ok(None) => {
-            // User quit at the selection dialog. Restore terminal and exit 0.
-            disable_raw_mode()?;
-            io::stdout().execute(LeaveAlternateScreen)?;
+    // Resolve the metrics URL BEFORE entering raw mode so the discovery
+    // INFO logs surface cleanly on stderr. The multi-node selection
+    // dialog enters its own terminal session and tears it down before
+    // returning.
+    let resolution = match resolve_metrics_url(args.metrics_url.as_deref()).await? {
+        Some(r) => r,
+        None => {
+            // User quit at the selection dialog.
             return Ok(());
-        }
-        Err(e) => {
-            disable_raw_mode()?;
-            io::stdout().execute(LeaveAlternateScreen)?;
-            return Err(e);
         }
     };
 
@@ -156,6 +144,13 @@ async fn main() -> Result<()> {
             app.db_path = p.display().to_string();
         }
     }
+
+    // Setup terminal in raw alternate-screen mode for the main dashboard.
+    enable_raw_mode()?;
+    io::stdout().execute(EnterAlternateScreen)?;
+    let backend = CrosstermBackend::new(io::stdout());
+    let mut terminal = Terminal::new(backend)?;
+    terminal.clear()?;
 
     // Fetch initial metrics before the first render so the UI is not blank.
     let snapshot = fetch_metrics(&resolution.metrics_url).await;
@@ -179,10 +174,7 @@ struct ResolvedNode {
 
 /// Resolve which dugite-node to attach to. Returns `Ok(Some(...))` to
 /// proceed, `Ok(None)` if the user quit at the selection dialog.
-async fn resolve_metrics_url(
-    flag: Option<&str>,
-    terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
-) -> Result<Option<ResolvedNode>> {
+async fn resolve_metrics_url(flag: Option<&str>) -> Result<Option<ResolvedNode>> {
     // Explicit non-empty flag bypasses discovery.
     if let Some(url) = flag {
         if !url.is_empty() {
@@ -218,7 +210,7 @@ async fn resolve_metrics_url(
             }))
         }
         _ => {
-            let chosen_url = match dialog::run(terminal, &nodes)? {
+            let chosen_url = match dialog::run(&nodes)? {
                 Some(u) => u,
                 None => return Ok(None),
             };
