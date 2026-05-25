@@ -21,7 +21,7 @@ pub fn aux_data_to_proto(aux: &AuxiliaryData) -> pb::AuxData {
         scripts: aux
             .native_scripts
             .iter()
-            .map(|ns| crate::map::script::native_script_to_proto(ns))
+            .map(crate::map::script::native_script_to_proto)
             .map(|ns| pb::Script {
                 script: Some(pb::script::Script::Native(ns)),
             })
