@@ -11,6 +11,7 @@ mod mithril;
 mod node;
 mod startup;
 mod topology;
+mod verify_snapshot;
 
 use anyhow::Result;
 use clap::Parser;
@@ -35,6 +36,30 @@ enum Command {
     DumpSnapshot(DumpSnapshotArgs),
     /// Database inspection and maintenance tools
     Db(DbArgs),
+    /// Compare two ledger snapshots for byte-exact semantic equality
+    /// (acceptance harness for issue #670 — Mithril ancillary import).
+    ///
+    /// Walks every field of the persistent `LedgerStateSnapshot` and
+    /// reports mismatches per-field. HashMaps are compared by content
+    /// (not by serialised byte order). Use to verify that an
+    /// ancillary-imported state equals the state produced by a
+    /// from-genesis replay to the same chain tip.
+    VerifyLedgerSnapshot(VerifyLedgerSnapshotArgs),
+}
+
+#[derive(clap::Args, Debug)]
+struct VerifyLedgerSnapshotArgs {
+    /// First snapshot to compare. May be a `ledger-snapshot.bin` file
+    /// or a database directory containing one.
+    #[arg(long)]
+    left: PathBuf,
+
+    /// Second snapshot to compare. Same format as `--left`.
+    #[arg(long)]
+    right: PathBuf,
+
+    #[command(flatten)]
+    log: LogArgs,
 }
 
 #[derive(clap::Args, Debug)]
@@ -304,6 +329,38 @@ struct MithrilImportArgs {
     #[arg(long)]
     allow_stale_pparams: bool,
 
+    /// Download and import the Mithril ancillary archive (Haskell ledger
+    /// state at the immutable tip). When enabled (default), the imported
+    /// state replaces the chain-from-genesis replay — bootstrap time
+    /// drops from multi-hour to ~15 minutes.
+    ///
+    /// Pass `--no-include-ancillary` to skip the ancillary download and
+    /// rely solely on chunk-by-chunk block replay. This is the
+    /// pre-#670 behaviour and is intended for operators who want
+    /// dugite to derive the ledger state entirely from its own
+    /// validator rather than trusting the Mithril-certified Haskell
+    /// snapshot. Trust model and operator-exposure decision are
+    /// documented in `docs/src/operations/mithril-ancillary.md`.
+    ///
+    /// Default: `true`. The flag is named so `--include-ancillary` and
+    /// `--no-include-ancillary` both work via clap's standard negation.
+    #[arg(
+        long,
+        default_value_t = true,
+        action = clap::ArgAction::Set,
+        num_args = 0..=1,
+        default_missing_value = "true",
+        require_equals = false,
+    )]
+    include_ancillary: bool,
+
+    /// Skip the ancillary download even when `--include-ancillary` would
+    /// otherwise enable it. Equivalent to `--include-ancillary=false`.
+    /// Provided as a convenience alias because the negated form reads
+    /// more naturally in scripts.
+    #[arg(long, conflicts_with = "include_ancillary")]
+    no_include_ancillary: bool,
+
     #[command(flatten)]
     log: LogArgs,
 }
@@ -403,6 +460,7 @@ async fn main() -> Result<()> {
         Command::MithrilImport(ref args) => Some(&args.log),
         Command::DumpSnapshot(ref args) => Some(&args.log),
         Command::Db(_) => None,
+        Command::VerifyLedgerSnapshot(ref args) => Some(&args.log),
     };
     let log_handle = if let Some(log_args) = log_args {
         Some(logging::init(&build_logging_opts(log_args)?)?)
@@ -415,7 +473,23 @@ async fn main() -> Result<()> {
         Command::MithrilImport(args) => run_mithril_import(args).await,
         Command::DumpSnapshot(args) => run_dump_snapshot(args).await,
         Command::Db(args) => run_db_command(args).await,
+        Command::VerifyLedgerSnapshot(args) => run_verify_ledger_snapshot(args).await,
     }
+}
+
+/// Compare two ledger snapshots for byte-exact semantic equality (#670).
+async fn run_verify_ledger_snapshot(args: VerifyLedgerSnapshotArgs) -> Result<()> {
+    info!(
+        left = %args.left.display(),
+        right = %args.right.display(),
+        "Comparing ledger snapshots"
+    );
+    let report = verify_snapshot::verify_snapshots(&args.left, &args.right)?;
+    let n = report.print();
+    if n > 0 {
+        anyhow::bail!("{n} field(s) differ — see report above");
+    }
+    Ok(())
 }
 
 /// Replay blocks from ImmutableDB and dump ledger state at epoch boundaries.
@@ -1369,6 +1443,19 @@ async fn run_mithril_import(args: MithrilImportArgs) -> Result<()> {
         "Starting Mithril snapshot import for network magic {}",
         args.network_magic
     );
+
+    // `--no-include-ancillary` is a convenience alias for
+    // `--include-ancillary=false`. They are `conflicts_with` so at most
+    // one is set — combine them into the final boolean here.
+    let include_ancillary = args.include_ancillary && !args.no_include_ancillary;
+
+    if !include_ancillary {
+        info!(
+            "Ancillary archive download disabled by --no-include-ancillary; \
+             ledger state will be derived entirely from chunk-by-chunk replay"
+        );
+    }
+
     mithril::import_snapshot(
         args.network_magic,
         &args.database_path,
@@ -1376,6 +1463,7 @@ async fn run_mithril_import(args: MithrilImportArgs) -> Result<()> {
         args.mithril_genesis_vkey.as_deref(),
         args.skip_certificate_verification,
         args.allow_stale_pparams,
+        include_ancillary,
     )
     .await
 }

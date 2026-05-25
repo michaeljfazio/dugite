@@ -208,6 +208,7 @@ pub async fn import_snapshot(
     genesis_vkey_override: Option<&str>,
     skip_verification: bool,
     allow_stale_pparams: bool,
+    include_ancillary: bool,
 ) -> Result<()> {
     let aggregator = aggregator_url(network_magic);
     info!(aggregator = %aggregator, "Fetching latest Mithril snapshot");
@@ -423,110 +424,129 @@ pub async fn import_snapshot(
     // so that Task 11 (Node::new) can deserialise it directly, skipping the full
     // block-replay path.  Ancillary download is NON-FATAL: if it fails the node
     // falls back to full replay from genesis (original behaviour).
-    info!("Downloading ancillary archive (Haskell ledger state)...");
-    let main_immutable = latest.beacon.immutable_file_number;
-    match download_ancillary(
-        aggregator,
-        network_magic,
-        database_path,
-        &work_dir,
-        Some(main_immutable),
-    )
-    .await
-    {
-        Ok(ancillary_dir) => {
-            // Move ledger/ to database_path/haskell-ledger/
-            let haskell_ledger_dir = database_path.join("haskell-ledger");
-            if haskell_ledger_dir.exists() {
-                if let Err(e) = fs::remove_dir_all(&haskell_ledger_dir) {
-                    warn!(error = %e, "Failed to remove old haskell-ledger directory");
-                }
-            }
-
-            let ancillary_ledger = ancillary_dir.join("ledger");
-            if ancillary_ledger.exists() {
-                // Prefer rename (zero-copy, same filesystem); fall back to recursive
-                // copy when the temp dir and database live on different mounts.
-                if let Err(e) = fs::rename(&ancillary_ledger, &haskell_ledger_dir) {
-                    warn!(error = %e, "rename of ledger/ failed, falling back to copy");
-                    copy_dir_recursive(&ancillary_ledger, &haskell_ledger_dir)?;
-                    fs::remove_dir_all(&ancillary_ledger)?;
-                }
-                info!(
-                    path = %haskell_ledger_dir.display(),
-                    "Haskell ledger state saved"
-                );
-            } else {
-                warn!(
-                    path = %ancillary_dir.display(),
-                    "Ancillary archive extracted but contained no ledger/ directory"
-                );
-            }
-
-            // Also absorb the next-immutable trio (the partial chunk at the tip)
-            // if the ancillary archive included one.
-            let ancillary_immutable = ancillary_dir.join("immutable");
-            if ancillary_immutable.exists() {
-                let immutable_dest = database_path.join("immutable");
-                fs::create_dir_all(&immutable_dest)?;
-                let mut moved = 0u32;
-                for entry in fs::read_dir(&ancillary_immutable)
-                    .into_iter()
-                    .flatten()
-                    .flatten()
-                {
-                    let dest = immutable_dest.join(entry.file_name());
-                    if let Err(e) = fs::rename(entry.path(), &dest) {
-                        // Cross-filesystem fallback
-                        if let Err(e2) = fs::copy(entry.path(), &dest) {
-                            warn!(
-                                error = %e,
-                                copy_error = %e2,
-                                "Failed to move ancillary immutable file"
-                            );
-                        } else {
-                            let _ = fs::remove_file(entry.path());
-                            moved += 1;
-                        }
-                    } else {
-                        moved += 1;
+    //
+    // Gated on `include_ancillary` (issue #670 acceptance criterion): when the
+    // operator passes `--no-include-ancillary`, the ancillary download is
+    // skipped entirely and the node will derive ledger state from chunk-by-chunk
+    // replay. This is the only way to verify a from-genesis replay against the
+    // Haskell-certified state, so the verification harness uses it implicitly.
+    if include_ancillary {
+        info!("Downloading ancillary archive (Haskell ledger state)...");
+        let main_immutable = latest.beacon.immutable_file_number;
+        match download_ancillary(
+            aggregator,
+            network_magic,
+            database_path,
+            &work_dir,
+            Some(main_immutable),
+        )
+        .await
+        {
+            Ok(ancillary_dir) => {
+                // Move ledger/ to database_path/haskell-ledger/
+                let haskell_ledger_dir = database_path.join("haskell-ledger");
+                if haskell_ledger_dir.exists() {
+                    if let Err(e) = fs::remove_dir_all(&haskell_ledger_dir) {
+                        warn!(error = %e, "Failed to remove old haskell-ledger directory");
                     }
                 }
-                if moved > 0 {
-                    info!(files = moved, "Moved ancillary immutable files");
+
+                let ancillary_ledger = ancillary_dir.join("ledger");
+                if ancillary_ledger.exists() {
+                    // Prefer rename (zero-copy, same filesystem); fall back to recursive
+                    // copy when the temp dir and database live on different mounts.
+                    if let Err(e) = fs::rename(&ancillary_ledger, &haskell_ledger_dir) {
+                        warn!(error = %e, "rename of ledger/ failed, falling back to copy");
+                        copy_dir_recursive(&ancillary_ledger, &haskell_ledger_dir)?;
+                        fs::remove_dir_all(&ancillary_ledger)?;
+                    }
+                    info!(
+                        path = %haskell_ledger_dir.display(),
+                        "Haskell ledger state saved"
+                    );
+                } else {
+                    warn!(
+                        path = %ancillary_dir.display(),
+                        "Ancillary archive extracted but contained no ledger/ directory"
+                    );
+                }
+
+                // Also absorb the next-immutable trio (the partial chunk at the tip)
+                // if the ancillary archive included one.
+                let ancillary_immutable = ancillary_dir.join("immutable");
+                if ancillary_immutable.exists() {
+                    let immutable_dest = database_path.join("immutable");
+                    fs::create_dir_all(&immutable_dest)?;
+                    let mut moved = 0u32;
+                    for entry in fs::read_dir(&ancillary_immutable)
+                        .into_iter()
+                        .flatten()
+                        .flatten()
+                    {
+                        let dest = immutable_dest.join(entry.file_name());
+                        if let Err(e) = fs::rename(entry.path(), &dest) {
+                            // Cross-filesystem fallback
+                            if let Err(e2) = fs::copy(entry.path(), &dest) {
+                                warn!(
+                                    error = %e,
+                                    copy_error = %e2,
+                                    "Failed to move ancillary immutable file"
+                                );
+                            } else {
+                                let _ = fs::remove_file(entry.path());
+                                moved += 1;
+                            }
+                        } else {
+                            moved += 1;
+                        }
+                    }
+                    if moved > 0 {
+                        info!(files = moved, "Moved ancillary immutable files");
+                    }
+                }
+
+                // Clean up the ancillary extract directory (ledger/ was renamed above;
+                // any remaining artefacts can be removed).
+                if let Err(e) = fs::remove_dir_all(&ancillary_dir) {
+                    warn!(error = %e, "Failed to remove ancillary extract directory");
                 }
             }
-
-            // Clean up the ancillary extract directory (ledger/ was renamed above;
-            // any remaining artefacts can be removed).
-            if let Err(e) = fs::remove_dir_all(&ancillary_dir) {
-                warn!(error = %e, "Failed to remove ancillary extract directory");
+            Err(e) => {
+                // Without the ancillary archive there is no live ledger state to
+                // restore, which means the node would fall back to genesis-default
+                // protocol parameters at the imported tip (issue #335: stale
+                // protocol_version_major, min_pool_cost, …).  Surface this as a
+                // hard error unless the caller opted in to the stale-PParams path.
+                if allow_stale_pparams {
+                    warn!(
+                        error = %e,
+                        "Ancillary download failed — proceeding with genesis-default \
+                         protocol parameters because --allow-stale-pparams was set. \
+                         Querying protocol-parameters will return stale values until \
+                         the chain is replayed from genesis."
+                    );
+                } else {
+                    return Err(anyhow::anyhow!(
+                        "Ancillary download failed: {e:#}. Without the ancillary \
+                         archive the imported ledger state would use genesis-default \
+                         protocol parameters (issue #335). Re-run with \
+                         --allow-stale-pparams to override (NOT recommended for \
+                         production)."
+                    ));
+                }
             }
         }
-        Err(e) => {
-            // Without the ancillary archive there is no live ledger state to
-            // restore, which means the node would fall back to genesis-default
-            // protocol parameters at the imported tip (issue #335: stale
-            // protocol_version_major, min_pool_cost, …).  Surface this as a
-            // hard error unless the caller opted in to the stale-PParams path.
-            if allow_stale_pparams {
-                warn!(
-                    error = %e,
-                    "Ancillary download failed — proceeding with genesis-default \
-                     protocol parameters because --allow-stale-pparams was set. \
-                     Querying protocol-parameters will return stale values until \
-                     the chain is replayed from genesis."
-                );
-            } else {
-                return Err(anyhow::anyhow!(
-                    "Ancillary download failed: {e:#}. Without the ancillary \
-                     archive the imported ledger state would use genesis-default \
-                     protocol parameters (issue #335). Re-run with \
-                     --allow-stale-pparams to override (NOT recommended for \
-                     production)."
-                ));
-            }
-        }
+    } else {
+        // `--no-include-ancillary` requested: skip ancillary entirely. The
+        // imported chain has only the certified immutable chunks; ledger
+        // state will be derived from a chain-from-genesis replay on the
+        // next `dugite-node run`. This is the byte-exact verification path
+        // for issue #670 acceptance.
+        info!(
+            "Ancillary archive download skipped (--no-include-ancillary); \
+             the next `dugite-node run` will derive ledger state by replaying \
+             the certified chunks from genesis"
+        );
     }
 
     // Step 7c: Clear stale UTxO store and ledger snapshots.
