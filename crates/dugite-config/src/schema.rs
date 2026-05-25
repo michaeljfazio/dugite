@@ -53,9 +53,10 @@ pub enum ParamType {
     Enum { values: &'static [&'static str] },
     /// A file-system path (stored as a JSON string, shown with a path icon).
     Path,
-    /// A nested JSON object displayed as read-only (edit sub-fields in the
-    /// config file directly). The value is always valid; validation is a no-op.
-    Object,
+    /// A nested JSON object with a fixed sub-schema. Empty `fields` means the
+    /// schema does not yet model any sub-key (object is treated as opaque and
+    /// edited as a single read-only row, same as before this feature).
+    Object { fields: &'static [SubParamDef] },
 }
 
 impl ParamType {
@@ -68,7 +69,7 @@ impl ParamType {
             ParamType::String => "string",
             ParamType::Enum { .. } => "enum",
             ParamType::Path => "path",
-            ParamType::Object => "object",
+            ParamType::Object { .. } => "object",
         }
     }
 
@@ -116,7 +117,7 @@ impl ParamType {
                     ))
                 }
             }
-            ParamType::Object => Ok(()),
+            ParamType::Object { .. } => Ok(()),
         }
     }
 }
@@ -144,6 +145,79 @@ impl Reloadability {
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// Sub-parameter definition (for fields inside an Object param)
+// ---------------------------------------------------------------------------
+
+/// A single field inside a [`ParamType::Object`].
+///
+/// Identical in shape to [`ParamDef`] except for the missing `section` field —
+/// sub-fields live under their parent's section.
+///
+/// A sub-field's `default` follows the same rules as `ParamDef::default`. An
+/// empty string for a numeric / Bool / Enum leaf signals "no schema default"
+/// (the leaf is not hydrated and only appears in the tree if present in the
+/// on-disk file). For String / Path leaves, an empty default is a valid empty
+/// string.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SubParamDef {
+    pub key: &'static str,
+    pub param_type: ParamType,
+    pub default: &'static str,
+    pub description: &'static str,
+    pub tuning_hint: &'static str,
+    pub reloadability: Reloadability,
+}
+
+impl SubParamDef {
+    /// Parse the sub-field's default into a JSON value matching its type, or
+    /// `None` if the default string cannot be parsed (numeric / Bool / Enum
+    /// with `default: ""`).
+    pub fn default_as_json(&self) -> Option<Value> {
+        parse_default_as_json(&self.param_type, self.default)
+    }
+}
+
+/// Parse a default-string into a JSON value matching `param_type`. Returns
+/// `None` for unparseable numeric/Bool/Enum defaults (e.g. empty string on a
+/// numeric type, which the schema uses to mean "no schema default"). For
+/// Object types, recursively synthesises a `Value::Object` from `fields`.
+pub(crate) fn parse_default_as_json(param_type: &ParamType, default: &str) -> Option<Value> {
+    match param_type {
+        ParamType::Bool => default.parse::<bool>().ok().map(Value::Bool),
+        ParamType::U64 { .. } => default
+            .parse::<u64>()
+            .ok()
+            .map(|n| Value::Number(serde_json::Number::from(n))),
+        ParamType::F64 { .. } => default
+            .parse::<f64>()
+            .ok()
+            .and_then(serde_json::Number::from_f64)
+            .map(Value::Number),
+        ParamType::String | ParamType::Path | ParamType::Enum { .. } => {
+            Some(Value::String(default.to_string()))
+        }
+        ParamType::Object { fields } => Some(object_default(fields)),
+    }
+}
+
+/// Recursively synthesise a `Value::Object` from a list of sub-field defaults.
+/// Leaves with no parseable default (e.g. numeric with `default: ""`) are
+/// omitted from the result.
+pub(crate) fn object_default(fields: &[SubParamDef]) -> Value {
+    let mut map = serde_json::Map::new();
+    for sub in fields {
+        if let Some(v) = sub.default_as_json() {
+            map.insert(sub.key.to_string(), v);
+        }
+    }
+    Value::Object(map)
+}
+
+// ---------------------------------------------------------------------------
+// Parameter definition
+// ---------------------------------------------------------------------------
 
 /// A single known configuration parameter.
 #[derive(Debug, Clone)]
@@ -181,30 +255,212 @@ impl ParamDef {
     /// [`crate::config::save_config`] to decide whether a synthetic entry has
     /// drifted from its default (and therefore needs to be persisted).
     pub fn default_as_json(&self) -> Option<Value> {
-        match &self.param_type {
-            ParamType::Bool => self.default.parse::<bool>().ok().map(Value::Bool),
-            ParamType::U64 { .. } => self
-                .default
-                .parse::<u64>()
-                .ok()
-                .map(|n| Value::Number(serde_json::Number::from(n))),
-            ParamType::F64 { .. } => self
-                .default
-                .parse::<f64>()
-                .ok()
-                .and_then(serde_json::Number::from_f64)
-                .map(Value::Number),
-            ParamType::String | ParamType::Path | ParamType::Enum { .. } => {
-                Some(Value::String(self.default.to_string()))
-            }
-            ParamType::Object => serde_json::from_str(self.default).ok(),
-        }
+        parse_default_as_json(&self.param_type, self.default)
     }
 }
 
 // ---------------------------------------------------------------------------
 // Known parameter table
 // ---------------------------------------------------------------------------
+
+/// Sub-fields for AcceptedConnectionsLimit.
+const ACCEPTED_CONNECTIONS_LIMIT_FIELDS: &[SubParamDef] = &[
+    SubParamDef {
+        key: "hardLimit",
+        param_type: ParamType::U64 { min: 0, max: 65535 },
+        default: "512",
+        description: "Maximum concurrent inbound connections. New connections \
+                      are refused above this.",
+        tuning_hint: "Lower on memory-constrained relays. 512 is the cardano-node default.",
+        reloadability: Reloadability::Restart,
+    },
+    SubParamDef {
+        key: "softLimit",
+        param_type: ParamType::U64 { min: 0, max: 65535 },
+        default: "384",
+        description: "Threshold above which new inbound connections are progressively \
+                      delayed by up to `delay` seconds.",
+        tuning_hint: "Typically 75% of hardLimit.",
+        reloadability: Reloadability::Restart,
+    },
+    SubParamDef {
+        key: "delay",
+        param_type: ParamType::F64 {
+            min: 0.0,
+            max: 60.0,
+        },
+        default: "5.0",
+        description: "Maximum delay (seconds) applied to new connections above softLimit. \
+                      Linear ramp between softLimit and hardLimit.",
+        tuning_hint: "Raise (up to 30s) to slow down aggressive inbound peers.",
+        reloadability: Reloadability::Restart,
+    },
+];
+
+/// Sub-fields for Rpc.Tls (nested object).
+const RPC_TLS_FIELDS: &[SubParamDef] = &[
+    SubParamDef {
+        key: "CertPath",
+        param_type: ParamType::Path,
+        default: "",
+        description: "Path to TLS certificate PEM file. Empty = TLS disabled.",
+        tuning_hint: "Required if exposing the RPC port off-loopback.",
+        reloadability: Reloadability::Restart,
+    },
+    SubParamDef {
+        key: "KeyPath",
+        param_type: ParamType::Path,
+        default: "",
+        description: "Path to TLS private key PEM file.",
+        tuning_hint: "Required if CertPath is set.",
+        reloadability: Reloadability::Restart,
+    },
+];
+
+/// Sub-fields for Rpc.
+const RPC_FIELDS: &[SubParamDef] = &[
+    SubParamDef {
+        key: "Enabled",
+        param_type: ParamType::Bool,
+        default: "false",
+        description: "Master switch for the gRPC server. CLI --rpc-host/--rpc-port \
+                      force-enable; --no-rpc force-disable.",
+        tuning_hint: "Leave off unless serving an integrator/indexer.",
+        reloadability: Reloadability::Restart,
+    },
+    SubParamDef {
+        key: "ListenAddr",
+        param_type: ParamType::String,
+        default: "127.0.0.1",
+        description: "Bind IP. 127.0.0.1 (default) keeps the endpoint on loopback.",
+        tuning_hint: "Only expose off-loopback with TLS configured.",
+        reloadability: Reloadability::Restart,
+    },
+    SubParamDef {
+        key: "Port",
+        param_type: ParamType::U64 { min: 1, max: 65535 },
+        default: "50051",
+        description: "TCP port for gRPC traffic.",
+        tuning_hint: "Default 50051 is the gRPC convention.",
+        reloadability: Reloadability::Restart,
+    },
+    SubParamDef {
+        key: "MaxConcurrentStreams",
+        param_type: ParamType::U64 { min: 1, max: 4096 },
+        default: "64",
+        description: "HTTP/2 streams-per-connection cap.",
+        tuning_hint: "Raise for clients that fan out many subscriptions.",
+        reloadability: Reloadability::Restart,
+    },
+    SubParamDef {
+        key: "StreamBufferSize",
+        param_type: ParamType::U64 { min: 1, max: 65536 },
+        default: "256",
+        description: "Per-stream server-side event buffer size.",
+        tuning_hint: "Increase if clients see overflow under heavy load.",
+        reloadability: Reloadability::Restart,
+    },
+    SubParamDef {
+        key: "ReflectionEnabled",
+        param_type: ParamType::Bool,
+        default: "true",
+        description: "Enable gRPC reflection (useful for grpcurl, evans, etc).",
+        tuning_hint: "Disable for hardened deployments.",
+        reloadability: Reloadability::Restart,
+    },
+    SubParamDef {
+        key: "WebEnabled",
+        param_type: ParamType::Bool,
+        default: "false",
+        description: "Accept gRPC-Web / HTTP1.1 traffic in addition to native HTTP/2.",
+        tuning_hint: "Enable only when serving browser dApps directly.",
+        reloadability: Reloadability::Restart,
+    },
+    SubParamDef {
+        key: "AlphaEnabled",
+        param_type: ParamType::Bool,
+        default: "true",
+        description: "Expose v1alpha endpoints alongside v1beta.",
+        tuning_hint: "Disable once all integrators have moved to v1beta.",
+        reloadability: Reloadability::Restart,
+    },
+    SubParamDef {
+        key: "Tls",
+        param_type: ParamType::Object {
+            fields: RPC_TLS_FIELDS,
+        },
+        default: "",
+        description: "Optional TLS termination — set both CertPath and KeyPath.",
+        tuning_hint: "Required when binding off-loopback.",
+        reloadability: Reloadability::Restart,
+    },
+];
+
+const STORAGE_FIELDS: &[SubParamDef] = &[
+    SubParamDef {
+        key: "profile",
+        param_type: ParamType::Enum {
+            values: &["ultra-memory", "high-memory", "low-memory", "minimal"],
+        },
+        default: "high-memory",
+        description: "Preset memory profile. Sets memtable / cache defaults below \
+                      unless they are individually overridden.",
+        tuning_hint: "Match to host RAM: 'high-memory' for 16GB, 'low-memory' for 8GB.",
+        reloadability: Reloadability::Restart,
+    },
+    SubParamDef {
+        key: "immutableIndexType",
+        param_type: ParamType::Enum {
+            values: &["mmap", "in-memory"],
+        },
+        default: "mmap",
+        description: "Storage strategy for the ImmutableDB block index.",
+        tuning_hint: "'mmap' is the default; 'in-memory' uses more RAM but is slightly faster.",
+        reloadability: Reloadability::Restart,
+    },
+    SubParamDef {
+        key: "mmapLoadFactor",
+        param_type: ParamType::F64 { min: 0.0, max: 1.0 },
+        default: "0.7",
+        description: "Hash-table load factor for the mmap immutable index.",
+        tuning_hint: "Lower → more memory, faster lookup. 0.7 is the cardano-node default.",
+        reloadability: Reloadability::Restart,
+    },
+    SubParamDef {
+        key: "utxoBackend",
+        param_type: ParamType::Enum {
+            values: &["lsm", "in-memory"],
+        },
+        default: "lsm",
+        description: "UTxO-HD storage backend.",
+        tuning_hint: "Production deployments should use 'lsm'.",
+        reloadability: Reloadability::Restart,
+    },
+    SubParamDef {
+        key: "utxoMemtableSizeMb",
+        param_type: ParamType::U64 { min: 1, max: 65536 },
+        default: "",
+        description: "LSM memtable size in MB. Empty → derived from profile.",
+        tuning_hint: "Override to tune flush cadence vs memory headroom.",
+        reloadability: Reloadability::Restart,
+    },
+    SubParamDef {
+        key: "utxoBlockCacheSizeMb",
+        param_type: ParamType::U64 { min: 1, max: 65536 },
+        default: "",
+        description: "LSM block-cache size in MB. Empty → derived from profile.",
+        tuning_hint: "Larger cache → fewer disk reads, more RSS.",
+        reloadability: Reloadability::Restart,
+    },
+    SubParamDef {
+        key: "utxoBloomFilterBits",
+        param_type: ParamType::U64 { min: 1, max: 32 },
+        default: "10",
+        description: "Bloom-filter bits per key in the LSM SSTables.",
+        tuning_hint: "10 ≈ 1% false-positive rate. Increase if profile shows high disk reads.",
+        reloadability: Reloadability::Restart,
+    },
+];
 
 /// All known Cardano node configuration parameters, in section/display order.
 ///
@@ -915,7 +1171,9 @@ pub static KNOWN_PARAMS: &[ParamDef] = &[
     ParamDef {
         key: "AcceptedConnectionsLimit",
         section: "Diffusion",
-        param_type: ParamType::Object,
+        param_type: ParamType::Object {
+            fields: ACCEPTED_CONNECTIONS_LIMIT_FIELDS,
+        },
         default: r#"{"hardLimit":512,"softLimit":384,"delay":5.0}"#,
         description: "Inbound connection admission limits. 'hardLimit' is the maximum \
                       concurrent inbound connections (new connections are refused above \
@@ -937,10 +1195,10 @@ pub static KNOWN_PARAMS: &[ParamDef] = &[
     ParamDef {
         key: "Rpc",
         section: "Rpc",
-        param_type: ParamType::Object,
+        param_type: ParamType::Object { fields: RPC_FIELDS },
         // Empty object → server disabled. Operators opt in by setting
         // "Enabled": true and tuning the remaining fields.
-        default: "{}",
+        default: "",
         description: "UTxO RPC (gRPC) server configuration. Sub-fields (all PascalCase): \
                       'Enabled': bool (default false — server off unless explicitly enabled); \
                       'ListenAddr': bind IP, default '127.0.0.1' (loopback only); \
@@ -964,8 +1222,10 @@ pub static KNOWN_PARAMS: &[ParamDef] = &[
     ParamDef {
         key: "Storage",
         section: "Storage",
-        param_type: ParamType::Object,
-        default: r#"{"profile":"high-memory"}"#,
+        param_type: ParamType::Object {
+            fields: STORAGE_FIELDS,
+        },
+        default: "",
         description: "Storage subsystem configuration. Sub-fields (all optional): \
                       'profile': preset profile name ('ultra-memory', 'high-memory', \
                       'low-memory', 'minimal'); \
@@ -1259,7 +1519,7 @@ mod tests {
 
     #[test]
     fn test_param_type_validate_object_always_ok() {
-        let t = ParamType::Object;
+        let t = ParamType::Object { fields: &[] };
         assert!(t.validate("").is_ok());
         assert!(t.validate("anything").is_ok());
     }
@@ -1320,12 +1580,19 @@ mod tests {
             .unwrap();
         assert_eq!(v, Value::String("Info".into()));
 
-        // Object default parses to JSON object.
+        // Object default synthesises from sub-field defaults; leaves with empty
+        // default (utxoMemtableSizeMb, utxoBlockCacheSizeMb) are omitted.
         let v = lookup.get("Storage").unwrap().default_as_json().unwrap();
         assert!(v.as_object().is_some());
         assert_eq!(
-            v.as_object().unwrap().get("profile"),
-            Some(&Value::String("high-memory".into()))
+            v,
+            serde_json::json!({
+                "profile": "high-memory",
+                "immutableIndexType": "mmap",
+                "mmapLoadFactor": 0.7,
+                "utxoBackend": "lsm",
+                "utxoBloomFilterBits": 10
+            })
         );
     }
 
@@ -1360,7 +1627,7 @@ mod tests {
         assert_eq!(ParamType::String.label(), "string");
         assert_eq!(ParamType::Enum { values: &["a"] }.label(), "enum");
         assert_eq!(ParamType::Path.label(), "path");
-        assert_eq!(ParamType::Object.label(), "object");
+        assert_eq!(ParamType::Object { fields: &[] }.label(), "object");
     }
 
     #[test]
@@ -1473,7 +1740,37 @@ mod tests {
         );
         let def = map["AcceptedConnectionsLimit"];
         assert_eq!(def.section, "Diffusion");
-        assert_eq!(def.param_type, ParamType::Object);
+        match &def.param_type {
+            ParamType::Object { fields } => {
+                assert!(
+                    !fields.is_empty(),
+                    "AcceptedConnectionsLimit should have sub-fields"
+                );
+            }
+            _ => panic!("expected Object"),
+        }
+    }
+
+    #[test]
+    fn test_accepted_connections_limit_subschema() {
+        let def = KNOWN_PARAMS
+            .iter()
+            .find(|d| d.key == "AcceptedConnectionsLimit")
+            .expect("present");
+        match &def.param_type {
+            ParamType::Object { fields } => {
+                assert_eq!(fields.len(), 3, "expected 3 sub-fields");
+                let keys: Vec<&str> = fields.iter().map(|s| s.key).collect();
+                assert_eq!(keys, vec!["hardLimit", "softLimit", "delay"]);
+                assert!(matches!(fields[0].param_type, ParamType::U64 { .. }));
+                assert!(matches!(fields[1].param_type, ParamType::U64 { .. }));
+                assert!(matches!(fields[2].param_type, ParamType::F64 { .. }));
+                assert_eq!(fields[0].default, "512");
+                assert_eq!(fields[1].default, "384");
+                assert_eq!(fields[2].default, "5.0");
+            }
+            _ => panic!("expected Object"),
+        }
     }
 
     #[test]
@@ -1482,7 +1779,48 @@ mod tests {
         assert!(map.contains_key("Storage"), "Storage must be in schema");
         let def = map["Storage"];
         assert_eq!(def.section, "Storage");
-        assert_eq!(def.param_type, ParamType::Object);
+        match &def.param_type {
+            ParamType::Object { fields } => {
+                assert!(!fields.is_empty(), "Storage should have sub-fields");
+            }
+            _ => panic!("expected Object"),
+        }
+    }
+
+    #[test]
+    fn test_storage_subschema() {
+        let def = KNOWN_PARAMS
+            .iter()
+            .find(|d| d.key == "Storage")
+            .expect("present");
+        match &def.param_type {
+            ParamType::Object { fields } => {
+                let keys: Vec<&str> = fields.iter().map(|s| s.key).collect();
+                assert_eq!(
+                    keys,
+                    vec![
+                        "profile",
+                        "immutableIndexType",
+                        "mmapLoadFactor",
+                        "utxoBackend",
+                        "utxoMemtableSizeMb",
+                        "utxoBlockCacheSizeMb",
+                        "utxoBloomFilterBits",
+                    ]
+                );
+                // utxoMemtableSizeMb has no schema default.
+                let memtable = fields
+                    .iter()
+                    .find(|s| s.key == "utxoMemtableSizeMb")
+                    .unwrap();
+                assert_eq!(memtable.default, "");
+                assert!(
+                    memtable.default_as_json().is_none(),
+                    "U64 with empty default → no hydration"
+                );
+            }
+            _ => panic!("Storage must be Object"),
+        }
     }
 
     // ── network_defaults correctness ───────────────────────────────────────
@@ -1622,6 +1960,143 @@ mod tests {
                 def.key,
                 def.section
             );
+        }
+    }
+
+    #[test]
+    fn test_subparam_default_as_json_recurses() {
+        // Build a nested sub-schema by hand: outer { "x": u64=1, "inner": object { "y": bool=true } }.
+        const INNER: &[SubParamDef] = &[SubParamDef {
+            key: "y",
+            param_type: ParamType::Bool,
+            default: "true",
+            description: "",
+            tuning_hint: "",
+            reloadability: Reloadability::Restart,
+        }];
+        const OUTER: &[SubParamDef] = &[
+            SubParamDef {
+                key: "x",
+                param_type: ParamType::U64 { min: 0, max: 10 },
+                default: "1",
+                description: "",
+                tuning_hint: "",
+                reloadability: Reloadability::Restart,
+            },
+            SubParamDef {
+                key: "inner",
+                param_type: ParamType::Object { fields: INNER },
+                default: "",
+                description: "",
+                tuning_hint: "",
+                reloadability: Reloadability::Restart,
+            },
+        ];
+
+        let outer = ParamDef {
+            key: "Outer",
+            section: "Test",
+            param_type: ParamType::Object { fields: OUTER },
+            default: "",
+            description: "",
+            tuning_hint: "",
+            reloadability: Reloadability::Restart,
+        };
+
+        let v = outer.default_as_json().expect("object default");
+        let obj = v.as_object().expect("object");
+        assert_eq!(obj["x"], serde_json::json!(1));
+        assert_eq!(obj["inner"], serde_json::json!({ "y": true }));
+    }
+
+    #[test]
+    fn test_rpc_subschema_with_tls() {
+        let def = KNOWN_PARAMS
+            .iter()
+            .find(|d| d.key == "Rpc")
+            .expect("present");
+        match &def.param_type {
+            ParamType::Object { fields } => {
+                let keys: Vec<&str> = fields.iter().map(|s| s.key).collect();
+                assert_eq!(
+                    keys,
+                    vec![
+                        "Enabled",
+                        "ListenAddr",
+                        "Port",
+                        "MaxConcurrentStreams",
+                        "StreamBufferSize",
+                        "ReflectionEnabled",
+                        "WebEnabled",
+                        "AlphaEnabled",
+                        "Tls",
+                    ]
+                );
+
+                let tls = fields.iter().find(|s| s.key == "Tls").unwrap();
+                match &tls.param_type {
+                    ParamType::Object { fields: tls_fields } => {
+                        let tls_keys: Vec<&str> = tls_fields.iter().map(|s| s.key).collect();
+                        assert_eq!(tls_keys, vec!["CertPath", "KeyPath"]);
+                        assert!(matches!(tls_fields[0].param_type, ParamType::Path));
+                    }
+                    _ => panic!("Tls must be an Object"),
+                }
+            }
+            _ => panic!("Rpc must be Object"),
+        }
+    }
+
+    #[test]
+    fn every_object_param_has_non_empty_fields() {
+        for def in KNOWN_PARAMS {
+            if let ParamType::Object { fields } = &def.param_type {
+                assert!(
+                    !fields.is_empty(),
+                    "Object param '{}' has empty fields — populate sub-schema",
+                    def.key
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn every_subfield_default_is_parseable() {
+        fn walk(parent_path: &str, fields: &[SubParamDef]) {
+            for sub in fields {
+                let path = format!("{parent_path}.{}", sub.key);
+
+                // Empty default is the explicit "no hydration" signal for numeric /
+                // Bool / Enum types — skip.
+                if sub.default.is_empty()
+                    && matches!(
+                        sub.param_type,
+                        ParamType::U64 { .. }
+                            | ParamType::F64 { .. }
+                            | ParamType::Bool
+                            | ParamType::Enum { .. }
+                    )
+                {
+                    continue;
+                }
+
+                assert!(
+                    sub.default_as_json().is_some(),
+                    "sub-field {path} has unparseable default '{}'",
+                    sub.default,
+                );
+
+                // Recurse into nested Objects.
+                if let ParamType::Object { fields: inner } = &sub.param_type {
+                    walk(&path, inner);
+                }
+            }
+        }
+
+        for def in KNOWN_PARAMS {
+            if let ParamType::Object { fields } = &def.param_type {
+                walk(def.key, fields);
+            }
         }
     }
 }

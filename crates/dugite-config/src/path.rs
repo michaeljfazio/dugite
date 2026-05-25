@@ -8,7 +8,6 @@
 /// - An empty path yields `""` (the whole document).
 /// - Otherwise each segment is escaped (`~` → `~0`, `/` → `~1`) and prefixed
 ///   with `/`.
-#[allow(dead_code)]
 pub fn path_to_json_pointer(path: &[String]) -> String {
     let mut out = String::new();
     for seg in path {
@@ -18,7 +17,6 @@ pub fn path_to_json_pointer(path: &[String]) -> String {
     out
 }
 
-#[allow(dead_code)]
 fn escape_segment(seg: &str) -> String {
     // Replace `~` first, otherwise `/` → `~1` would in turn be re-encoded.
     seg.replace('~', "~0").replace('/', "~1")

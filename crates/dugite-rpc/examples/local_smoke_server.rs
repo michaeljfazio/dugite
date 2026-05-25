@@ -66,10 +66,7 @@ impl LedgerContext for DemoContext {
     async fn utxos_by_address(&self, _: &Address) -> Result<Vec<UtxoSnapshot>, RpcError> {
         Ok(Vec::new())
     }
-    async fn utxos_by_payment_credential(
-        &self,
-        _: &Hash32,
-    ) -> Result<Vec<UtxoSnapshot>, RpcError> {
+    async fn utxos_by_payment_credential(&self, _: &Hash32) -> Result<Vec<UtxoSnapshot>, RpcError> {
         Ok(Vec::new())
     }
     async fn utxos_by_asset(
