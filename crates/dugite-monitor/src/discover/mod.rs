@@ -92,7 +92,7 @@ async fn discover_inner() -> Vec<DiscoveredNode> {
     let outcomes = join_all(probes).await;
 
     let mut out = Vec::new();
-    for ((pid, _port, db_path), outcome) in candidates.into_iter().zip(outcomes.into_iter()) {
+    for ((pid, _port, db_path), outcome) in candidates.into_iter().zip(outcomes) {
         let Some(outcome) = outcome else {
             continue;
         };

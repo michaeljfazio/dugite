@@ -12,10 +12,16 @@
 //! # Usage
 //!
 //! ```bash
-//! dugite-monitor                                         # defaults
-//! dugite-monitor --metrics-url http://host:12798/metrics # custom endpoint
+//! dugite-monitor                                         # auto-discover running dugite-node
+//! dugite-monitor --metrics-url http://host:12798/metrics # explicit endpoint (skip discovery)
 //! dugite-monitor --network-magic 2                       # preview testnet epoch length
 //! ```
+//!
+//! When `--metrics-url` is omitted, dugite-monitor enumerates running
+//! `dugite-node` processes via `sysinfo` + `netstat2` and probes their
+//! `/metrics` endpoints. If exactly one node is found it attaches
+//! silently; if multiple are found a selection dialog is shown; if
+//! none are found it falls back to `http://localhost:12798/metrics`.
 //!
 //! # Key bindings
 //!
@@ -27,9 +33,10 @@
 //! | h / ?    | Toggle help overlay             |
 
 mod app;
+mod dialog;
+mod discover;
 #[allow(dead_code)]
 mod disk;
-mod discover;
 mod layout;
 mod metrics;
 mod theme;
@@ -65,8 +72,13 @@ const POLL_INTERVAL: Duration = Duration::from_secs(1);
 )]
 struct Args {
     /// URL of the Dugite Prometheus metrics endpoint.
-    #[arg(long, default_value = DEFAULT_METRICS_URL)]
-    metrics_url: String,
+    ///
+    /// When omitted, dugite-monitor discovers running `dugite-node`
+    /// processes and auto-attaches. If multiple are found a selection
+    /// dialog appears. If none are found, falls back to
+    /// `http://localhost:12798/metrics`.
+    #[arg(long)]
+    metrics_url: Option<String>,
 
     /// Network magic for epoch length calculation.
     ///
@@ -92,6 +104,17 @@ struct Args {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // Initialise tracing so discovery INFO/WARN logs surface on stderr
+    // (stdout is owned by the terminal). EnvFilter respects RUST_LOG
+    // and defaults to "info".
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+        )
+        .with_writer(std::io::stderr)
+        .try_init();
+
     let args = Args::parse();
     let mut app = App::new();
 
@@ -110,17 +133,108 @@ async fn main() -> Result<()> {
     let mut terminal = Terminal::new(backend)?;
     terminal.clear()?;
 
+    // Resolve the metrics URL: explicit flag wins, otherwise discover.
+    let resolved = resolve_metrics_url(args.metrics_url.as_deref(), &mut terminal).await;
+    let resolution = match resolved {
+        Ok(Some(r)) => r,
+        Ok(None) => {
+            // User quit at the selection dialog. Restore terminal and exit 0.
+            disable_raw_mode()?;
+            io::stdout().execute(LeaveAlternateScreen)?;
+            return Ok(());
+        }
+        Err(e) => {
+            disable_raw_mode()?;
+            io::stdout().execute(LeaveAlternateScreen)?;
+            return Err(e);
+        }
+    };
+
+    // Inherit the discovered --database-path if the CLI did not supply one.
+    if app.db_path.is_empty() {
+        if let Some(p) = resolution.db_path {
+            app.db_path = p.display().to_string();
+        }
+    }
+
     // Fetch initial metrics before the first render so the UI is not blank.
-    let snapshot = fetch_metrics(&args.metrics_url).await;
+    let snapshot = fetch_metrics(&resolution.metrics_url).await;
     app.update_metrics(snapshot);
 
-    let result = run_loop(&mut terminal, &mut app, &args.metrics_url).await;
+    let result = run_loop(&mut terminal, &mut app, &resolution.metrics_url).await;
 
     // Restore terminal on exit.
     disable_raw_mode()?;
     io::stdout().execute(LeaveAlternateScreen)?;
 
     result
+}
+
+/// Outcome of resolving how to reach a dugite-node.
+struct ResolvedNode {
+    metrics_url: String,
+    /// `--database-path` captured during discovery, if any.
+    db_path: Option<std::path::PathBuf>,
+}
+
+/// Resolve which dugite-node to attach to. Returns `Ok(Some(...))` to
+/// proceed, `Ok(None)` if the user quit at the selection dialog.
+async fn resolve_metrics_url(
+    flag: Option<&str>,
+    terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
+) -> Result<Option<ResolvedNode>> {
+    // Explicit non-empty flag bypasses discovery.
+    if let Some(url) = flag {
+        if !url.is_empty() {
+            return Ok(Some(ResolvedNode {
+                metrics_url: url.to_string(),
+                db_path: None,
+            }));
+        }
+    }
+
+    let nodes = discover::discover_nodes().await;
+    match nodes.len() {
+        0 => {
+            tracing::info!(
+                "no dugite-node process found, using default {}",
+                DEFAULT_METRICS_URL
+            );
+            Ok(Some(ResolvedNode {
+                metrics_url: DEFAULT_METRICS_URL.to_string(),
+                db_path: None,
+            }))
+        }
+        1 => {
+            let node = nodes.into_iter().next().unwrap();
+            tracing::info!(
+                pid = node.pid,
+                url = %node.metrics_url,
+                "auto-attached to single dugite-node"
+            );
+            Ok(Some(ResolvedNode {
+                metrics_url: node.metrics_url,
+                db_path: node.db_path,
+            }))
+        }
+        _ => {
+            let chosen_url = match dialog::run(terminal, &nodes)? {
+                Some(u) => u,
+                None => return Ok(None),
+            };
+            let chosen = nodes.into_iter().find(|n| n.metrics_url == chosen_url);
+            Ok(Some(match chosen {
+                Some(n) => ResolvedNode {
+                    metrics_url: n.metrics_url,
+                    db_path: n.db_path,
+                },
+                None => ResolvedNode {
+                    metrics_url: chosen_url,
+                    db_path: None,
+                },
+            }))
+        }
+    }
 }
 
 /// Main event loop: renders each frame, handles keyboard input, and periodically

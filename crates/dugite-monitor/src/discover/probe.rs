@@ -214,15 +214,14 @@ cardano_node_metrics_blockNum_int 12345678
                 };
                 let io = TokioIo::new(stream);
                 tokio::spawn(async move {
-                    let svc =
-                        service_fn(move |_req: Request<hyper::body::Incoming>| async move {
-                            Ok::<_, Infallible>(
-                                Response::builder()
-                                    .status(status)
-                                    .body(Full::new(Bytes::from(body)))
-                                    .unwrap(),
-                            )
-                        });
+                    let svc = service_fn(move |_req: Request<hyper::body::Incoming>| async move {
+                        Ok::<_, Infallible>(
+                            Response::builder()
+                                .status(status)
+                                .body(Full::new(Bytes::from(body)))
+                                .unwrap(),
+                        )
+                    });
                     let _ = http1::Builder::new().serve_connection(io, svc).await;
                 });
             }
@@ -243,16 +242,15 @@ cardano_node_metrics_blockNum_int 12345678
                 };
                 let io = TokioIo::new(stream);
                 tokio::spawn(async move {
-                    let svc =
-                        service_fn(|_req: Request<hyper::body::Incoming>| async move {
-                            tokio::time::sleep(Duration::from_secs(2)).await;
-                            Ok::<_, Infallible>(
-                                Response::builder()
-                                    .status(StatusCode::OK)
-                                    .body(Full::new(Bytes::from(DUGITE_BODY)))
-                                    .unwrap(),
-                            )
-                        });
+                    let svc = service_fn(|_req: Request<hyper::body::Incoming>| async move {
+                        tokio::time::sleep(Duration::from_secs(2)).await;
+                        Ok::<_, Infallible>(
+                            Response::builder()
+                                .status(StatusCode::OK)
+                                .body(Full::new(Bytes::from(DUGITE_BODY)))
+                                .unwrap(),
+                        )
+                    });
                     let _ = http1::Builder::new().serve_connection(io, svc).await;
                 });
             }
