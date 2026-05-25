@@ -21,5 +21,11 @@ spec:
       targetPort: metrics
       protocol: TCP
     {{- end }}
+    {{- if and .Values.rpc .Values.rpc.enabled .Values.rpc.service }}
+    - name: rpc
+      port: {{ .Values.rpc.port | default 50051 }}
+      targetPort: rpc
+      protocol: TCP
+    {{- end }}
   selector:
     {{- include "dugite-node.selectorLabels" . | nindent 4 }}

@@ -26,4 +26,10 @@ spec:
         - port: {{ .Values.metrics.port }}
           protocol: TCP
     {{- end }}
+    # Allow UTxO RPC from anywhere in the cluster when exposed via Service
+    {{- if and .Values.rpc .Values.rpc.enabled .Values.rpc.service }}
+    - ports:
+        - port: {{ .Values.rpc.port | default 50051 }}
+          protocol: TCP
+    {{- end }}
 {{- end }}
