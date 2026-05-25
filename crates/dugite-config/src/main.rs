@@ -37,6 +37,7 @@ mod app;
 mod config;
 mod diff;
 mod discover;
+mod path;
 mod schema;
 mod search;
 mod selector;
