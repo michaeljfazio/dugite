@@ -20,6 +20,10 @@ dugite-lsm = { path = "../crates/dugite-lsm" }
 dugite-crypto = { path = "../crates/dugite-crypto" }
 dugite-consensus = { path = "../crates/dugite-consensus" }
 dugite-storage = { path = "../crates/dugite-storage" }
+# In-house UPLC implementation — the decoder/evaluator that runs in production.
+# This is the target the new fuzz_dugite_uplc_* binaries exercise; the upstream
+# aiken `uplc` dep below is kept around for the upstream-bug-surface targets.
+dugite-uplc = { path = "../crates/dugite-uplc" }
 # Direct uplc dep surfaces eval_phase_two_raw, Program::from_cbor/from_flat,
 # uplc::plutus_data, and apply_params_to_script for Plutus Phase-4 fuzz targets.
 uplc = { git = "https://github.com/aiken-lang/aiken.git", rev = "6806d52211fbb469ae13aa0e0290aeb6b9b3e8cf" }
@@ -283,4 +287,29 @@ doc = false
 [[bin]]
 name = "fuzz_tx_metadata_decode"
 path = "fuzz_targets/tx_metadata_decode.rs"
+doc = false
+
+# In-house dugite-uplc Program decoder (production phase-2 script entry).
+# Distinct from fuzz_plutus_script_decode, which exercises the upstream
+# Aiken `uplc` crate — that is NOT the decoder dugite runs in production.
+[[bin]]
+name = "fuzz_dugite_uplc_program_decode"
+path = "fuzz_targets/dugite_uplc_program_decode.rs"
+doc = false
+
+# In-house dugite-uplc Data::from_cbor decoder (datums, redeemers, inline
+# datums). Distinct from fuzz_plutus_data_decode which routes through the
+# upstream Aiken `uplc::plutus_data`.
+[[bin]]
+name = "fuzz_dugite_uplc_data_decode"
+path = "fuzz_targets/dugite_uplc_data_decode.rs"
+doc = false
+
+# Byron-era block decode (issue #613). Wraps fuzzer bytes in a Byron era
+# envelope so mutation exercises decode_byron_main_block /
+# decode_byron_ebb_block specifically — random mutation through decode_block
+# would otherwise converge on the richer Shelley+ tags.
+[[bin]]
+name = "fuzz_byron_block_decode"
+path = "fuzz_targets/byron_block_decode.rs"
 doc = false

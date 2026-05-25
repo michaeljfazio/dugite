@@ -629,6 +629,7 @@ dependencies = [
  "dugite-primitives",
  "dugite-serialization",
  "dugite-storage",
+ "dugite-uplc",
  "libfuzzer-sys",
  "minicbor 0.25.1",
  "tempfile",

@@ -18,8 +18,9 @@ pub use decode::cbor_helpers::{
 };
 pub use decode::{
     decode_block, decode_block_minimal, decode_block_minimal_with_byron_epoch_length,
-    decode_block_with_byron_epoch_length, decode_transaction, decode_transaction_input,
-    decode_transaction_output, decode_wrapped_block_header,
+    decode_block_with_byron_epoch_length, decode_byron_ebb_block, decode_byron_main_block,
+    decode_transaction, decode_transaction_input, decode_transaction_output,
+    decode_wrapped_block_header,
 };
 
 // Helper exposed by the existing in-house pipeline; used by mithril chunk-file
