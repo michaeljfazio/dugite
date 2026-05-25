@@ -505,32 +505,32 @@ impl App {
         }
 
         // Build an iterator of (section_idx, item_idx, key, description, tuning_hint).
-        let lookup = build_lookup();
-        let iter = self.sections.iter().enumerate().flat_map(|(sec_idx, sec)| {
-            sec.items
-                .iter()
-                .enumerate()
-                .map(move |(item_idx, item)| (sec_idx, item_idx, item))
-        });
-
-        // We can't capture `self.config` inside the iterator directly because
-        // `self` is borrowed mutably.  Collect the item tuples first.
-        let tuples: Vec<(usize, usize, String, String, String)> = iter
-            .map(|(sec_idx, item_idx, item)| {
+        // Own the dotted-key strings so they live as long as the do_search call.
+        let mut owned: Vec<(usize, usize, String, &'static str, &'static str)> = Vec::new();
+        for (sec_idx, section) in self.sections.iter().enumerate() {
+            for (item_idx, item) in section.items.iter().enumerate() {
                 let entry = &self.config.entries[item.entry_idx];
-                let def = lookup.get(entry.key.as_str()).copied();
-                let key = entry.key.clone();
-                let description = def.map(|d| d.description).unwrap_or("").to_string();
-                let tuning_hint = def.map(|d| d.tuning_hint).unwrap_or("").to_string();
-                (sec_idx, item_idx, key, description, tuning_hint)
-            })
-            .collect();
+                // Build dotted display key: "ParentKey" for top-level rows,
+                // "ParentKey.sub.leaf" for sub-rows.
+                let mut key_text = entry.key.clone();
+                for seg in &item.path {
+                    key_text.push('.');
+                    key_text.push_str(seg);
+                }
+                let (desc, hint) = match &item.def {
+                    ItemDef::Top(d) => (d.description, d.tuning_hint),
+                    ItemDef::Sub(s) => (s.description, s.tuning_hint),
+                    ItemDef::Unknown => ("", ""),
+                };
+                owned.push((sec_idx, item_idx, key_text, desc, hint));
+            }
+        }
 
         let results = do_search(
             &self.search_query,
-            tuples
+            owned
                 .iter()
-                .map(|(si, ii, k, d, h)| (*si, *ii, k.as_str(), d.as_str(), h.as_str())),
+                .map(|(si, ii, k, d, h)| (*si, *ii, k.as_str(), *d, *h)),
         );
 
         self.filtered_items = results
@@ -1320,6 +1320,27 @@ mod tests {
                 new_item.path
             );
         }
+    }
+
+    #[test]
+    fn test_search_matches_subleaf_by_dotted_key() {
+        let mut app = make_app(r#"{}"#);
+        app.enter_search();
+        app.search_type_char('h');
+        app.search_type_char('a');
+        app.search_type_char('r');
+        app.search_type_char('d');
+
+        // "hardLimit" sub-leaf of AcceptedConnectionsLimit must be in filtered_items.
+        let found = app.filtered_items.iter().any(|(sec, idx)| {
+            let item = &app.sections[*sec].items[*idx];
+            item.path == vec!["hardLimit".to_string()]
+                && app.config.entries[item.entry_idx].key == "AcceptedConnectionsLimit"
+        });
+        assert!(
+            found,
+            "search 'hard' must surface AcceptedConnectionsLimit.hardLimit"
+        );
     }
 
     #[test]
