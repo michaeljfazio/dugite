@@ -15,6 +15,7 @@ default-members = [
     "crates/dugite-monitor",
     "crates/dugite-config",
     "crates/dugite-uplc",
+    "crates/dugite-rpc",
     "tests/conformance",
     "tests/golden",
 ]
@@ -35,6 +36,7 @@ members = [
     "crates/dugite-monitor",
     "crates/dugite-config",
     "crates/dugite-uplc",
+    "crates/dugite-rpc",
     "tests/conformance",
     "tests/golden",
 ]
@@ -62,6 +64,7 @@ dugite-cli = { path = "crates/dugite-cli" }
 dugite-lsm = { path = "crates/dugite-lsm" }
 dugite-monitor = { path = "crates/dugite-monitor" }
 dugite-uplc = { path = "crates/dugite-uplc" }
+dugite-rpc = { path = "crates/dugite-rpc" }
 
 # Terminal UI
 ratatui = "0.30"
@@ -86,8 +89,23 @@ rand_chacha = "0.9"
 # Async runtime
 tokio = { version = "1", features = ["full"] }
 tokio-util = { version = "0.7", features = ["codec", "io"] }
+tokio-stream = { version = "0.1", features = ["net"] }
 futures = "0.3"
 async-trait = "0.1"
+
+# UTxO RPC (gRPC) — see crates/dugite-rpc. The proto files are vendored at
+# crates/dugite-rpc/proto/ (pinned to utxorpc/spec; refresh via
+# `just bump-utxorpc-spec`). `dugite-rpc` is the ONLY workspace crate that
+# depends on tonic/prost — dugite-node consumes the RPC server as an opaque
+# library, keeping the gRPC stack out of the node binary's transitive graph
+# when the RPC server is disabled.
+tonic = { version = "0.12", features = ["transport", "tls", "gzip"] }
+tonic-web = "0.12"
+tonic-reflection = "0.12"
+prost = "0.13"
+prost-types = "0.13"
+tonic-build = { version = "0.12", features = ["prost"] }
+prost-build = "0.13"
 
 # Networking
 tokio-tungstenite = "0.24"

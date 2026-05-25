@@ -1,0 +1,49 @@
+[package]
+name = "dugite-rpc"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Native UTxO RPC (gRPC) server for dugite-node — issue #672"
+
+[dependencies]
+# gRPC runtime. We generate prost/tonic stubs ourselves at build time from
+# vendored .proto files under `proto/` (pinned via `proto/VERSION` to
+# `utxorpc/spec` at a specific tag). This keeps spec version bytes-exact
+# and avoids drift between the published utxorpc-spec Rust crate and the
+# spec tag — the same "depend on upstream specs, not upstream Rust crates"
+# ethos used for the in-house multi-era CBOR decoder and the in-house UPLC
+# CEK machine.
+tonic = { workspace = true }
+tonic-web = { workspace = true }
+tonic-reflection = { workspace = true }
+prost = { workspace = true }
+prost-types = { workspace = true }
+
+# Async + runtime glue.
+tokio = { workspace = true }
+tokio-stream = { workspace = true }
+tokio-util = { workspace = true }
+futures = { workspace = true }
+async-trait = { workspace = true }
+
+# Workspace types we expose / accept across the LedgerContext trait surface.
+dugite-primitives = { workspace = true }
+dugite-mempool = { workspace = true }
+
+# Diagnostics + error plumbing.
+tracing = { workspace = true }
+thiserror = { workspace = true }
+
+# Misc utilities.
+bytes = { workspace = true }
+hex = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+[build-dependencies]
+tonic-build = { workspace = true }
+prost-build = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
