@@ -13,12 +13,30 @@ rustup install nightly
 
 ## Available Targets
 
-| Target | Description | Input |
-|--------|-------------|-------|
-| `fuzz_decode_block` | CBOR block deserialization | Raw bytes fed to `decode_block()` |
-| `fuzz_decode_transaction` | CBOR transaction deserialization (all eras) | Raw bytes fed to `decode_transaction()` |
-| `fuzz_mux_segment` | Ouroboros multiplexer segment parsing | Raw bytes fed to `Segment::decode()` |
-| `fuzz_nonce_update` | Evolving nonce blake2b computation | Arbitrary-length bytes simulating VRF output |
+The current target list is the authoritative source — run
+
+```bash
+cargo +nightly fuzz list
+```
+
+to enumerate all fuzz binaries. Highlights:
+
+| Target | Description |
+|--------|-------------|
+| `fuzz_decode_block` | Multi-era CBOR block deserialization |
+| `fuzz_byron_block_decode` | Byron-era block decoder (issue #613) — calls `decode_byron_main_block` / `decode_byron_ebb_block` directly |
+| `fuzz_decode_transaction` | CBOR transaction deserialization (all eras) |
+| `fuzz_dugite_uplc_program_decode` | In-house UPLC `Program::{from_cbor, from_flat}` + flat-encoding round-trip |
+| `fuzz_dugite_uplc_data_decode` | In-house `PlutusData::from_cbor` + CBOR round-trip identity |
+| `fuzz_plutus_data_decode` | Upstream Aiken `uplc::plutus_data` (sanity-check) |
+| `fuzz_plutus_script_decode` | Upstream Aiken `Program::from_cbor` / `from_flat` — **CI-excluded** (upstream panics in `pallas_codec` and `uplc::tx`) |
+| `fuzz_body_hash` | `validate_block_body_hash` round-trip + invariant checks |
+| `fuzz_nonce_update` | Evolving nonce blake2b computation |
+
+> ⚠️ The in-house `fuzz_dugite_uplc_*` targets are the **production** path
+> for phase-2 validation. The upstream `fuzz_plutus_*` targets exercise
+> the Aiken `uplc` crate only and are useful for parity checking, not
+> for catching dugite DoS surface.
 
 ## Running a Target
 

@@ -70,6 +70,12 @@ use dugite_primitives::transaction::{Transaction, TransactionInput, TransactionO
 /// Conway keys 0-33 and Dijkstra keys 34-37 are all handled.
 pub use era_conway::ppu_from_cbor;
 
+/// Decode a Byron main-chain block from its inner CBOR (post envelope strip).
+/// Re-exported so fuzz harnesses and external tooling (Mithril chunk
+/// inspection, era-specific replay) can call the Byron path directly without
+/// constructing a full envelope.
+pub use era_byron::{decode_byron_ebb_block, decode_byron_main_block};
+
 // ---------------------------------------------------------------------------
 // Public API — every block-level decode routes through the in-house decoder
 // ---------------------------------------------------------------------------
