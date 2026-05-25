@@ -22,9 +22,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!("cargo:rerun-if-changed={}", p.display());
     }
 
-    let out_dir: PathBuf = std::env::var_os("OUT_DIR")
-        .ok_or("OUT_DIR not set")?
-        .into();
+    let out_dir: PathBuf = std::env::var_os("OUT_DIR").ok_or("OUT_DIR not set")?.into();
     let descriptor_path = out_dir.join("utxorpc_descriptor.bin");
 
     tonic_build::configure()
