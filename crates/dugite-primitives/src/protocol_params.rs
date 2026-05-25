@@ -54,7 +54,7 @@ impl std::fmt::Display for CoinPerByte {
 /// Complete protocol parameters (Conway era and forward; identical wire shape
 /// in Dijkstra apart from the four new ref-script tier keys 34-37 which are
 /// tracked under #462 Phase 4).
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ProtocolParameters {
     /// Linear coefficient of the minimum-fee formula:
     /// `fee = min_fee_a × tx_size_bytes + min_fee_b`.
