@@ -372,6 +372,13 @@ pub struct NodeMetrics {
     pub transactions_received: AtomicU64,
     pub transactions_validated: AtomicU64,
     pub transactions_rejected: AtomicU64,
+    /// Cumulative number of fetched blocks rejected by the ledger apply step.
+    /// Incremented on every `LedgerError` from `apply_block_with_delta` in
+    /// the live-tip path.  A non-zero, rising value is an operator-actionable
+    /// signal that the chain has stalled and the failing block must be
+    /// investigated (#669); without it the warn-and-return handler is
+    /// indistinguishable from a network silence.
+    pub block_apply_failures: AtomicU64,
     pub peers_connected: AtomicU64,
     pub peers_outbound: AtomicU64,
     pub peers_inbound: AtomicU64,
@@ -641,6 +648,7 @@ impl NodeMetrics {
             transactions_received: AtomicU64::new(0),
             transactions_validated: AtomicU64::new(0),
             transactions_rejected: AtomicU64::new(0),
+            block_apply_failures: AtomicU64::new(0),
             peers_connected: AtomicU64::new(0),
             peers_outbound: AtomicU64::new(0),
             peers_inbound: AtomicU64::new(0),
@@ -1273,6 +1281,13 @@ impl NodeMetrics {
                 "dugite_rollback_count_total",
                 "Total number of chain rollbacks",
                 &self.rollback_count,
+            ),
+            (
+                "dugite_block_apply_failures_total",
+                "Fetched blocks rejected by the ledger apply step (#669). \
+                 A rising value means the chain has stalled at the offending block; \
+                 inspect logs for the structured ERROR with peer and tx context.",
+                &self.block_apply_failures,
             ),
             (
                 "dugite_blocks_forged_total",
