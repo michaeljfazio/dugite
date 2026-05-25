@@ -404,14 +404,22 @@ pub(crate) fn apply_shelley_cert(
     gov: &mut GovSubState,
 ) {
     // Populate pointer_map for registration certificates.
-    if let Certificate::StakeRegistration(credential) = cert {
-        let key = credential_to_hash(credential);
-        let pointer = Pointer {
-            slot,
-            tx_index,
-            cert_index: cert_index as u64,
-        };
-        certs.pointer_map.insert(pointer, key);
+    //
+    // Pointer addresses (StakeRefPtr) are a pre-Conway construct. Haskell's
+    // `Cardano.Ledger.Conway.State.Stake` drops `dsPtrs` at the Babbage→
+    // Conway TranslateEra step and any subsequent `StakeRegistration` in
+    // Conway+ does NOT re-populate it. Mirror that here so a from-genesis
+    // replay matches an ancillary import byte-exact (#670).
+    if epochs.protocol_params.protocol_version_major < 9 {
+        if let Certificate::StakeRegistration(credential) = cert {
+            let key = credential_to_hash(credential);
+            let pointer = Pointer {
+                slot,
+                tx_index,
+                cert_index: cert_index as u64,
+            };
+            certs.pointer_map.insert(pointer, key);
+        }
     }
 
     match cert {
@@ -1347,6 +1355,56 @@ mod tests {
 
         assert_eq!(consensus.epoch_block_count, 1);
         assert!(consensus.epoch_blocks_by_pool.is_empty());
+    }
+
+    /// Issue #670: per-pool opcert counter must track the max
+    /// `OperationalCert.sequence_number` observed across all blocks from
+    /// that pool. Mirrors Haskell `PraosState.ocertCounters`. Without this
+    /// the from-genesis replay diverges from the ancillary import on the
+    /// `consensus.opcert_counters` field of `ConsensusSubState`.
+    #[test]
+    fn test_compute_shelley_nonce_tracks_opcert_max() {
+        let mut consensus = empty_consensus_sub();
+        let vkey = vec![0xABu8; 64];
+        let pool_id = blake2b_224(&vkey);
+
+        // First block: opcert seq = 5
+        // make_header(nonce_vrf_output, prev_hash, issuer_vkey)
+        let mut h = make_header(
+            vec![1u8; 32],
+            Hash32::from_bytes([2u8; 32]),
+            vkey.clone(),
+        );
+        h.operational_cert.sequence_number = 5;
+        compute_shelley_nonce(&h, 100, 0, 43200, 1000, 0, 1, &mut consensus);
+        assert_eq!(consensus.opcert_counters.get(&pool_id), Some(&5));
+
+        // Newer block from same pool: seq = 9 → must update to max
+        h.operational_cert.sequence_number = 9;
+        compute_shelley_nonce(&h, 200, 0, 43200, 1000, 0, 1, &mut consensus);
+        assert_eq!(consensus.opcert_counters.get(&pool_id), Some(&9));
+
+        // Older block (out-of-order replay or KES-rotation edge): seq = 7
+        // must NOT decrement the counter.
+        h.operational_cert.sequence_number = 7;
+        compute_shelley_nonce(&h, 300, 0, 43200, 1000, 0, 1, &mut consensus);
+        assert_eq!(
+            consensus.opcert_counters.get(&pool_id),
+            Some(&9),
+            "out-of-order opcert must not decrement the per-pool max"
+        );
+
+        // Overlay block (d=1/1) still updates opcert (block production
+        // doesn't count toward BlocksMade, but the opcert was still used
+        // to sign the header).
+        let vkey2 = vec![0xCDu8; 64];
+        let pool2_id = blake2b_224(&vkey2);
+        let mut h2 = make_header(vec![3u8; 32], Hash32::from_bytes([4u8; 32]), vkey2);
+        h2.operational_cert.sequence_number = 1;
+        compute_shelley_nonce(&h2, 400, 0, 43200, 1000, 1, 1, &mut consensus);
+        assert_eq!(consensus.opcert_counters.get(&pool2_id), Some(&1));
+        // Overlay block must not be counted toward BlocksMade.
+        assert!(consensus.epoch_blocks_by_pool.get(&pool2_id).is_none());
     }
 
     #[test]
