@@ -23,4 +23,16 @@
 
 #![deny(rust_2018_idioms)]
 
+pub mod config;
+pub mod context;
+pub mod error;
+pub mod metrics;
 pub mod proto;
+
+pub use config::{RpcConfig, RpcTlsConfig};
+pub use context::{
+    EraHistoryView, EraSummary, GenesisView, LedgerContext, ParamsView, RawBlock, RawTx,
+    SubmitOutcome, TipInfo, UtxoSnapshot,
+};
+pub use error::RpcError;
+pub use metrics::{noop_metrics, NoopMetrics, RpcMetricsSink, SharedMetrics};
