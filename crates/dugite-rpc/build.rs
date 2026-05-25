@@ -27,9 +27,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     tonic_build::configure()
         .build_server(true)
-        // No client codegen — dev-deps pull `utxorpc` Rust SDK when a
-        // client is needed for tests.
-        .build_client(false)
+        // Client codegen enabled so our own integration tests can drive
+        // the server without pulling in the upstream `utxorpc` Rust SDK
+        // (which carries the v1alpha+v1beta types we already generate
+        // ourselves). The generated client types end up under
+        // `*_service_client` modules in OUT_DIR; only consumers that
+        // import them pay the per-call client-codec cost.
+        .build_client(true)
         .file_descriptor_set_path(&descriptor_path)
         .compile_protos(&proto_files, &[proto_root.as_path()])?;
 

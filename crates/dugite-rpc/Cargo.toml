@@ -47,3 +47,7 @@ prost-build = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
+# Reflection client for the server smoke test — pairs with the server-side
+# tonic-reflection registration to confirm the descriptor set is wire-
+# discoverable.
+tonic-reflection = { workspace = true }

@@ -1695,6 +1695,7 @@ version = "1.7.0"
 dependencies = [
  "anyhow",
  "arc-swap",
+ "async-trait",
  "base64 0.22.1",
  "bech32",
  "bs58",
@@ -1707,6 +1708,7 @@ dependencies = [
  "dugite-mempool",
  "dugite-network",
  "dugite-primitives",
+ "dugite-rpc",
  "dugite-serialization",
  "dugite-storage",
  "ed25519-dalek",
