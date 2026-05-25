@@ -324,6 +324,14 @@ impl N2CClient {
         self.send_shelley_query(5).await
     }
 
+    /// Query the set of registered stake pool IDs
+    /// (`GetStakePools` -- Shelley query tag 16).
+    ///
+    /// Returns raw MsgResult CBOR payload: `tag(258) Set<KeyHash 28>`.
+    pub async fn query_stake_pools(&mut self) -> Result<Vec<u8>, NetworkError> {
+        self.send_shelley_query(16).await
+    }
+
     /// Query non-myopic member rewards
     /// (`GetNonMyopicMemberRewards` -- Shelley query tag 2).
     ///
@@ -417,6 +425,57 @@ impl N2CClient {
     /// Returns raw MsgResult CBOR payload.
     pub async fn query_drep_state(&mut self) -> Result<Vec<u8>, NetworkError> {
         self.send_shelley_query(25).await
+    }
+
+    /// Query DRep stake distribution (`GetDRepStakeDistr` -- Shelley query tag 26).
+    ///
+    /// `dreps` is the set to query. Each entry is `(drep_type, hash_opt)` where
+    /// `drep_type` is 0=keyHash, 1=scriptHash, 2=alwaysAbstain, 3=alwaysNoConfidence.
+    /// For the abstain/no-confidence variants `hash_opt` is `None`.
+    ///
+    /// An empty `dreps` slice returns the full distribution (the dugite server
+    /// ignores the filter and always returns all entries).
+    ///
+    /// Returns raw MsgResult CBOR payload (`Map<DRep, Coin>`).
+    pub async fn query_drep_stake_distr(
+        &mut self,
+        dreps: &[(u8, Option<Vec<u8>>)],
+    ) -> Result<Vec<u8>, NetworkError> {
+        // Inner: array(2)[26, tag(258) Set<DRep>]
+        let mut inner = Vec::new();
+        let mut enc = minicbor::Encoder::new(&mut inner);
+        enc.array(2).map_err(cbor_err)?;
+        enc.u32(26).map_err(cbor_err)?; // GetDRepStakeDistr
+        enc.tag(minicbor::data::Tag::new(258)).map_err(cbor_err)?;
+        enc.array(dreps.len() as u64).map_err(cbor_err)?;
+        for (drep_type, hash_opt) in dreps {
+            match (*drep_type, hash_opt) {
+                (0, Some(hash)) | (1, Some(hash)) => {
+                    enc.array(2).map_err(cbor_err)?;
+                    enc.u32(*drep_type as u32).map_err(cbor_err)?;
+                    enc.bytes(hash).map_err(cbor_err)?;
+                }
+                (2, _) | (3, _) => {
+                    enc.array(1).map_err(cbor_err)?;
+                    enc.u32(*drep_type as u32).map_err(cbor_err)?;
+                }
+                _ => {
+                    return Err(NetworkError::Protocol(
+                        crate::error::ProtocolError::CborDecode {
+                            protocol: "LocalStateQuery",
+                            reason: format!(
+                                "invalid DRep selector: type={}, hash_present={}",
+                                drep_type,
+                                hash_opt.is_some()
+                            ),
+                        },
+                    ));
+                }
+            }
+        }
+        let buf = encode_conway_block_query(&inner)?;
+        self.send_query(buf).await?;
+        self.recv_query().await
     }
 
     /// Query constitution (`GetConstitution` -- Shelley query tag 23).

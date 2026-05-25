@@ -87,14 +87,64 @@ enum QuerySubcommand {
         #[arg(long)]
         out_file: Option<PathBuf>,
     },
-    /// Query DRep state (Conway era)
+    /// Query DRep state (Conway era).
+    ///
+    /// Matches `cardano-cli conway query drep-state`. Exactly one DRep
+    /// selector (`--all-dreps`, `--drep-key-hash`, `--drep-script-hash`,
+    /// `--drep-verification-key`, or `--drep-verification-key-file`) is
+    /// required.
     DrepState {
-        #[arg(long)]
+        /// Query for all DReps.
+        #[arg(
+            long,
+            conflicts_with_all = [
+                "drep_key_hash",
+                "drep_script_hash",
+                "drep_verification_key",
+                "drep_verification_key_file",
+            ],
+        )]
+        all_dreps: bool,
+        /// Filter by DRep key hash (28-byte blake2b-224 hex).
+        #[arg(long, value_name = "HASH")]
         drep_key_hash: Option<String>,
+        /// Filter by DRep script hash (28-byte hex).
+        #[arg(long, value_name = "HASH", conflicts_with = "drep_key_hash")]
+        drep_script_hash: Option<String>,
+        /// Derive the DRep key hash from a verification key hex string.
+        #[arg(
+            long,
+            value_name = "STRING",
+            conflicts_with_all = ["drep_key_hash", "drep_script_hash"],
+        )]
+        drep_verification_key: Option<String>,
+        /// Derive the DRep key hash from a verification key text-envelope file.
+        #[arg(
+            long,
+            value_name = "FILEPATH",
+            conflicts_with_all = [
+                "drep_key_hash",
+                "drep_script_hash",
+                "drep_verification_key",
+            ],
+        )]
+        drep_verification_key_file: Option<PathBuf>,
+        /// Include each DRep's delegated stake in the response.
+        #[arg(long)]
+        include_stake: bool,
         #[arg(long, default_value = "node.sock")]
         socket_path: PathBuf,
         #[arg(long)]
         testnet_magic: Option<u64>,
+        /// Format output as JSON (the cardano-cli default).
+        #[arg(long, conflicts_with = "output_yaml")]
+        output_json: bool,
+        /// Format output as YAML.
+        #[arg(long)]
+        output_yaml: bool,
+        /// Optional output file. Default is stdout.
+        #[arg(long, value_name = "FILEPATH")]
+        out_file: Option<PathBuf>,
     },
     /// Query committee state (Conway era)
     CommitteeState {
@@ -116,12 +166,28 @@ enum QuerySubcommand {
         #[arg(long)]
         testnet_magic: Option<u64>,
     },
-    /// Query registered stake pools
+    /// Query registered stake pools.
+    ///
+    /// Matches `cardano-cli conway query stake-pools`. Returns the set of
+    /// currently-registered pool IDs (one bech32 `pool1…` per element) as a
+    /// JSON array sorted by hash bytes.
     StakePools {
         #[arg(long, default_value = "node.sock")]
         socket_path: PathBuf,
         #[arg(long)]
         testnet_magic: Option<u64>,
+        /// Format output as JSON (the cardano-cli default).
+        #[arg(long, conflicts_with_all = ["output_text", "output_yaml"])]
+        output_json: bool,
+        /// Format output as newline-separated text (one bech32 per line).
+        #[arg(long, conflicts_with = "output_yaml")]
+        output_text: bool,
+        /// Format output as YAML.
+        #[arg(long)]
+        output_yaml: bool,
+        /// Optional output file. Default is stdout.
+        #[arg(long, value_name = "FILEPATH")]
+        out_file: Option<PathBuf>,
     },
     /// Query expected (non-myopic) member rewards for hypothetical delegator stakes.
     ///
@@ -454,6 +520,165 @@ async fn connect_and_acquire(
 async fn release_and_done(client: &mut dugite_network::N2CClient) {
     client.release().await.ok();
     client.done().await.ok();
+}
+
+// ── DRep state CBOR helpers ─────────────────────────────────────────────────
+
+/// One DRep entry parsed from a `GetDRepState` response.
+struct DRepEntry {
+    /// 0 = keyHash, 1 = scriptHash.
+    cred_type: u8,
+    /// 28-byte credential hash.
+    hash: Vec<u8>,
+    /// DRep deposit in lovelace.
+    deposit: u64,
+    /// Activity expiry epoch.
+    expiry_epoch: u64,
+    /// Optional anchor: (url, data_hash_bytes).
+    anchor: Option<(String, Vec<u8>)>,
+}
+
+/// Strip the LocalStateQuery MsgResult + HFC era wrappers off a query response,
+/// returning the decoder positioned at the inner payload.
+fn enter_msg_result<'a>(raw: &'a [u8]) -> Result<minicbor::Decoder<'a>> {
+    let mut decoder = minicbor::Decoder::new(raw);
+    let _ = decoder.array();
+    let tag = decoder.u32().unwrap_or(999);
+    if tag != 4 {
+        anyhow::bail!("Expected MsgResult tag 4, got {tag}");
+    }
+    let pos = decoder.position();
+    if let Ok(Some(2)) = decoder.array() {
+        let _ = decoder.u64(); // HFC success tag (1)
+    } else if let Ok(Some(1)) = {
+        decoder.set_position(pos);
+        decoder.array()
+    } {
+        // single-arm wrapper, already consumed
+    } else {
+        decoder.set_position(pos);
+    }
+    Ok(decoder)
+}
+
+/// Parse the `GetDRepState` (tag 25) response into a vec of [`DRepEntry`].
+///
+/// Wire format: `Map<Credential, DRepState>` where:
+/// - `Credential = array(2)[type, hash(28)]`
+/// - `DRepState = array(4)[expiry_epoch, maybe_anchor, deposit, delegators]`
+/// - `maybe_anchor = array(0) | array(1)[Anchor]` and `Anchor = array(2)[url, hash(32)]`
+fn parse_drep_state(raw: &[u8]) -> Result<Vec<DRepEntry>> {
+    let mut decoder = enter_msg_result(raw)?;
+    let map_len = decoder.map().unwrap_or(Some(0)).unwrap_or(0);
+    let mut out = Vec::with_capacity(map_len as usize);
+    for _ in 0..map_len {
+        let _ = decoder.array(); // Credential array(2)
+        let cred_type = decoder.u8().unwrap_or(0);
+        let hash = decoder.bytes().unwrap_or(&[]).to_vec();
+
+        let _ = decoder.array(); // DRepState array(4)
+        let expiry_epoch = decoder.u64().unwrap_or(0);
+        let anchor_len = decoder.array().unwrap_or(Some(0)).unwrap_or(0);
+        let anchor = if anchor_len == 1 {
+            let _ = decoder.array(); // Anchor [url, hash]
+            let url = decoder.str().map(|s| s.to_string()).unwrap_or_default();
+            let hash_bytes = decoder.bytes().unwrap_or(&[]).to_vec();
+            Some((url, hash_bytes))
+        } else {
+            None
+        };
+        let deposit = decoder.u64().unwrap_or(0);
+        decoder.skip().ok(); // delegators set
+
+        out.push(DRepEntry {
+            cred_type,
+            hash,
+            deposit,
+            expiry_epoch,
+            anchor,
+        });
+    }
+    Ok(out)
+}
+
+/// Parse the `GetDRepStakeDistr` (tag 26) response into a map keyed by
+/// `(cred_type, hash)`.
+///
+/// Wire format: `Map<DRep, Coin>` where:
+/// - `DRep = array(2)[type, hash(28)]` for key/script DReps
+/// - `DRep = array(1)[2|3]` for alwaysAbstain / alwaysNoConfidence
+fn parse_drep_stake_distr(raw: &[u8]) -> Result<std::collections::BTreeMap<(u8, Vec<u8>), u64>> {
+    let mut decoder = enter_msg_result(raw)?;
+    let map_len = decoder.map().unwrap_or(Some(0)).unwrap_or(0);
+    let mut out = std::collections::BTreeMap::new();
+    for _ in 0..map_len {
+        let arr_len = decoder.array().unwrap_or(Some(0)).unwrap_or(0);
+        let drep_type = decoder.u8().unwrap_or(0);
+        if arr_len == 2 {
+            let hash = decoder.bytes().unwrap_or(&[]).to_vec();
+            let stake = decoder.u64().unwrap_or(0);
+            out.insert((drep_type, hash), stake);
+        } else {
+            // alwaysAbstain (2) / alwaysNoConfidence (3): no hash
+            let stake = decoder.u64().unwrap_or(0);
+            out.insert((drep_type, Vec::new()), stake);
+        }
+    }
+    Ok(out)
+}
+
+/// Parse the `GetStakePools` (tag 16) response into a vec of 28-byte pool hashes.
+///
+/// Wire format: `tag(258) ++ array(N) [bytes(28)...]`. The optional set-tag (258)
+/// may or may not be present depending on era encoding; both shapes are accepted.
+fn parse_stake_pools_set(raw: &[u8]) -> Result<Vec<Vec<u8>>> {
+    let mut decoder = enter_msg_result(raw)?;
+    // Optional set-tag (258) — peek and consume if present.
+    let pos = decoder.position();
+    if let Ok(tag) = decoder.tag() {
+        if tag.as_u64() != 258 {
+            decoder.set_position(pos);
+        }
+    } else {
+        decoder.set_position(pos);
+    }
+    let arr_len = decoder.array().unwrap_or(Some(0)).unwrap_or(0);
+    let mut out = Vec::with_capacity(arr_len as usize);
+    for _ in 0..arr_len {
+        out.push(decoder.bytes().unwrap_or(&[]).to_vec());
+    }
+    Ok(out)
+}
+
+/// Load a 28-byte DRep key hash from a `DRepVerificationKey_ed25519` text-envelope
+/// file. The envelope's `cborHex` field is `0x5820 ++ <32-byte vkey>`; the hash
+/// is blake2b-224 of the raw key bytes.
+fn load_drep_key_hash_from_envelope(path: &std::path::Path) -> Result<Vec<u8>> {
+    let content = std::fs::read_to_string(path)?;
+    let env: serde_json::Value = serde_json::from_str(&content)?;
+    let cbor_hex = env
+        .get("cborHex")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| anyhow::anyhow!("missing cborHex in {}", path.display()))?;
+    let cbor_bytes = hex::decode(cbor_hex.trim())
+        .map_err(|e| anyhow::anyhow!("bad cborHex in {}: {e}", path.display()))?;
+    // 32-byte vkey is CBOR-wrapped as `0x5820 ++ raw32`; strip the 2-byte prefix.
+    let key_bytes: &[u8] =
+        if cbor_bytes.len() == 34 && cbor_bytes[0] == 0x58 && cbor_bytes[1] == 0x20 {
+            &cbor_bytes[2..]
+        } else {
+            &cbor_bytes
+        };
+    if key_bytes.len() != 32 {
+        anyhow::bail!(
+            "expected 32-byte verification key in {}, got {} bytes",
+            path.display(),
+            key_bytes.len()
+        );
+    }
+    Ok(dugite_primitives::hash::blake2b_224(key_bytes)
+        .as_bytes()
+        .to_vec())
 }
 
 // ── Task 2: Protocol State CBOR Parser ──────────────────────────────────────
@@ -990,21 +1215,26 @@ impl QueryCmd {
                 };
 
                 // Epoch slot position.
-                // Epoch length: Preview=86400 (1 day), Preprod/Mainnet=432000 (5 days).
-                // Compute slot-in-epoch from (slot - byron_slots) % epoch_length.
-                // Byron: mainnet 21600 epochs × 21600 slots/epoch = 466560000 slots total.
-                // For simplicity we use the well-known epoch-length per network.
-                let epoch_length: u64 = match testnet_magic {
-                    Some(2) => 86400,  // Preview
-                    Some(1) => 432000, // Preprod
-                    _ => 432000,       // Mainnet (and others)
+                //
+                // Shelley+ slots elapsed since the Byron→Shelley boundary go
+                // through `(slot - byron_slots) % shelley_epoch_length`. Byron
+                // ran 21,600 slots per epoch for `byron_epochs` epochs, so the
+                // boundary slot is `byron_epochs × 21_600`.
+                //
+                // - mainnet:  208 Byron epochs → 4,492,800 slot offset; Shelley
+                //             epoch length 432,000 (5 days @ 1s).
+                // - preprod:    4 Byron epochs →    86,400 slot offset; Shelley
+                //             epoch length 432,000.
+                // - preview:    0 Byron epochs (pure Shelley from genesis);
+                //             Shelley epoch length  86,400 (1 day).
+                let (byron_offset, epoch_length): (u64, u64) = match testnet_magic {
+                    Some(2) => (0, 86400),        // Preview
+                    Some(1) => (86_400, 432_000), // Preprod
+                    _ => (4_492_800, 432_000),    // Mainnet (and other 432k networks)
                 };
-                // Byron offset in slots (only mainnet has Byron blocks in current tip).
-                // We derive slot-in-epoch from tip.slot and the known epoch number.
-                // epoch_length * epoch gives the slot at start of epoch (approximately).
-                // Use the simple modular formula which holds once we are in Shelley+.
+                let shelley_relative = tip.slot.saturating_sub(byron_offset);
                 let slot_in_epoch = if epoch_length > 0 {
-                    tip.slot % epoch_length
+                    shelley_relative % epoch_length
                 } else {
                     0
                 };
@@ -1539,103 +1769,155 @@ impl QueryCmd {
                 Ok(())
             }
             QuerySubcommand::DrepState {
+                all_dreps,
                 drep_key_hash,
+                drep_script_hash,
+                drep_verification_key,
+                drep_verification_key_file,
+                include_stake,
                 socket_path,
                 testnet_magic,
+                output_json: _output_json,
+                output_yaml,
+                out_file,
             } => {
+                // ── Resolve selector → (kind, optional 28-byte hash filter) ─
+                // kind: 0 = keyHash, 1 = scriptHash, None = no type filter (all).
+                let (filter_kind, filter_hash): (Option<u8>, Option<Vec<u8>>) = if all_dreps {
+                    (None, None)
+                } else if let Some(hex_str) = drep_key_hash.as_ref() {
+                    let bytes = hex::decode(hex_str.trim())
+                        .map_err(|e| anyhow::anyhow!("--drep-key-hash must be 28-byte hex: {e}"))?;
+                    if bytes.len() != 28 {
+                        anyhow::bail!("--drep-key-hash must be 28 bytes (got {})", bytes.len());
+                    }
+                    (Some(0), Some(bytes))
+                } else if let Some(hex_str) = drep_script_hash.as_ref() {
+                    let bytes = hex::decode(hex_str.trim()).map_err(|e| {
+                        anyhow::anyhow!("--drep-script-hash must be 28-byte hex: {e}")
+                    })?;
+                    if bytes.len() != 28 {
+                        anyhow::bail!("--drep-script-hash must be 28 bytes (got {})", bytes.len());
+                    }
+                    (Some(1), Some(bytes))
+                } else if let Some(vk_hex) = drep_verification_key.as_ref() {
+                    let vk_bytes = hex::decode(vk_hex.trim())
+                        .map_err(|e| anyhow::anyhow!("--drep-verification-key must be hex: {e}"))?;
+                    if vk_bytes.len() != 32 {
+                        anyhow::bail!(
+                            "--drep-verification-key must be 32 bytes (got {})",
+                            vk_bytes.len()
+                        );
+                    }
+                    let hash = dugite_primitives::hash::blake2b_224(&vk_bytes)
+                        .as_bytes()
+                        .to_vec();
+                    (Some(0), Some(hash))
+                } else if let Some(path) = drep_verification_key_file.as_ref() {
+                    let hash = load_drep_key_hash_from_envelope(path)?;
+                    (Some(0), Some(hash))
+                } else {
+                    anyhow::bail!(
+                        "missing DRep selector: pass --all-dreps, --drep-key-hash, \
+                         --drep-script-hash, --drep-verification-key, or \
+                         --drep-verification-key-file"
+                    );
+                };
+
+                if output_yaml {
+                    anyhow::bail!("--output-yaml is not yet supported (JSON only)");
+                }
+
                 let mut client = connect_and_acquire(&socket_path, testnet_magic).await?;
 
-                let raw = client
+                let raw_state = client
                     .query_drep_state()
                     .await
                     .map_err(|e| anyhow::anyhow!("Failed to query DRep state: {e}"))?;
 
-                release_and_done(&mut client).await;
-
-                // Parse MsgResult [4, array[map{...}]]
-                let mut decoder = minicbor::Decoder::new(&raw);
-                let _ = decoder.array();
-                let tag = decoder.u32().unwrap_or(999);
-                if tag != 4 {
-                    anyhow::bail!("Expected MsgResult tag 4, got {tag}");
-                }
-
-                // Strip HFC wrapper
-                let pos = decoder.position();
-                if let Ok(Some(2)) = decoder.array() {
-                    let _ = decoder.u64(); // consume HFC success tag (1)
-                } else if let Ok(Some(1)) = {
-                    decoder.set_position(pos);
-                    decoder.array()
-                } {
-                    // consumed wrapper
+                let stake_map: std::collections::BTreeMap<(u8, Vec<u8>), u64> = if include_stake {
+                    let raw_stake = client.query_drep_stake_distr(&[]).await.map_err(|e| {
+                        anyhow::anyhow!("Failed to query DRep stake distribution: {e}")
+                    })?;
+                    parse_drep_stake_distr(&raw_stake)?
                 } else {
-                    decoder.set_position(pos);
-                }
-
-                // Parse Map<Credential, DRepState>
-                // Credential: [type, hash(28)], DRepState: array(4) [expiry, maybe_anchor, deposit, delegators]
-                let map_len = decoder.map().unwrap_or(Some(0)).unwrap_or(0);
-                // Each entry: (cip0129_id, hex_hash, deposit, anchor_url, expiry_epoch)
-                let mut dreps: Vec<(String, String, u64, String, u64)> = Vec::new();
-
-                for _ in 0..map_len {
-                    // Key: Credential array(2) [type, hash]
-                    let _ = decoder.array();
-                    // Credential type: 0 = key hash, 1 = script hash
-                    let cred_type = decoder.u8().unwrap_or(0);
-                    let hash_bytes = decoder.bytes().unwrap_or(&[]).to_vec();
-                    let hex_hash = hex::encode(&hash_bytes);
-
-                    // Encode as CIP-0129 bech32 identifier (drep1 / drep_script1)
-                    let cip0129_id =
-                        dugite_primitives::encode_drep_from_cbor(cred_type, &hash_bytes)
-                            .unwrap_or_else(|_| hex_hash.clone());
-
-                    // Value: DRepState array(4)
-                    let _ = decoder.array();
-                    let expiry_epoch = decoder.u64().unwrap_or(0);
-                    // maybe_anchor: array(0)=None, array(1)=[anchor]
-                    let anchor_len = decoder.array().unwrap_or(Some(0)).unwrap_or(0);
-                    let mut anchor = String::new();
-                    if anchor_len == 1 {
-                        let _ = decoder.array(); // Anchor [url, hash]
-                        anchor = decoder.str().map(|s| s.to_string()).unwrap_or_default();
-                        decoder.skip().ok(); // skip hash
-                    }
-                    let deposit = decoder.u64().unwrap_or(0);
-                    decoder.skip().ok(); // skip delegators set
-
-                    dreps.push((cip0129_id, hex_hash, deposit, anchor, expiry_epoch));
-                }
-
-                // Filter by key hash if provided — match against either the hex hash or the bech32 id
-                let filtered: Vec<_> = if let Some(ref hash) = drep_key_hash {
-                    dreps
-                        .iter()
-                        .filter(|(id, hex, _, _, _)| hex.contains(hash) || id.contains(hash))
-                        .collect()
-                } else {
-                    dreps.iter().collect()
+                    std::collections::BTreeMap::new()
                 };
 
-                println!("DRep State (Conway)");
-                println!("===================");
-                println!("Total DReps: {}", dreps.len());
+                release_and_done(&mut client).await;
 
-                if !filtered.is_empty() {
-                    // CIP-0129 identifiers are at most ~63 chars; use 66-char column.
-                    println!(
-                        "\n{:<66} {:>16} {:>8}",
-                        "DRep ID (CIP-0129)", "Deposit (ADA)", "Epoch"
-                    );
-                    println!("{}", "-".repeat(92));
-                    for (cip0129_id, _hex, deposit, anchor, epoch) in &filtered {
-                        let deposit_ada = *deposit / 1_000_000;
-                        println!("{cip0129_id:<66} {deposit_ada:>16} {epoch:>8}");
-                        if !anchor.is_empty() {
-                            println!("  Anchor: {anchor}");
+                let mut dreps = parse_drep_state(&raw_state)?;
+
+                // Match cardano-cli ordering: Haskell's derived `Ord Credential`
+                // sorts `ScriptHashObj` (cred_type=1) before `KeyHashObj`
+                // (cred_type=0), then by hash bytes.
+                dreps.sort_by(|a, b| {
+                    let ord_a = match a.cred_type {
+                        1 => 0u8,
+                        _ => 1,
+                    };
+                    let ord_b = match b.cred_type {
+                        1 => 0u8,
+                        _ => 1,
+                    };
+                    ord_a.cmp(&ord_b).then_with(|| a.hash.cmp(&b.hash))
+                });
+
+                let entries: Vec<serde_json::Value> = dreps
+                    .iter()
+                    .filter(|d| match (filter_kind, &filter_hash) {
+                        (None, _) => true,
+                        (Some(k), Some(h)) => d.cred_type == k && d.hash == *h,
+                        // Selector demanded a type but parsing produced no hash — shouldn't happen.
+                        _ => false,
+                    })
+                    .map(|d| {
+                        let cred_key = if d.cred_type == 0 {
+                            "keyHash"
+                        } else {
+                            "scriptHash"
+                        };
+                        let anchor_json = match &d.anchor {
+                            Some((url, hash)) => serde_json::json!({
+                                "dataHash": hex::encode(hash),
+                                "url": url,
+                            }),
+                            None => serde_json::Value::Null,
+                        };
+                        // Match cardano-cli: omit `stake` entirely when --include-stake is
+                        // not set; otherwise emit the resolved value (or null if missing).
+                        let mut state_obj = serde_json::Map::new();
+                        state_obj.insert("anchor".into(), anchor_json);
+                        state_obj.insert("deposit".into(), serde_json::json!(d.deposit));
+                        state_obj.insert("expiry".into(), serde_json::json!(d.expiry_epoch));
+                        if include_stake {
+                            let v = stake_map
+                                .get(&(d.cred_type, d.hash.clone()))
+                                .map(|s| serde_json::json!(s))
+                                .unwrap_or(serde_json::Value::Null);
+                            state_obj.insert("stake".into(), v);
                         }
+                        serde_json::json!([
+                            { cred_key: hex::encode(&d.hash) },
+                            serde_json::Value::Object(state_obj),
+                        ])
+                    })
+                    .collect();
+
+                let out = serde_json::Value::Array(entries);
+                // Match cardano-cli: 4-space indent, no trailing newline.
+                let mut buf = Vec::new();
+                let formatter = serde_json::ser::PrettyFormatter::with_indent(b"    ");
+                let mut ser = serde_json::Serializer::with_formatter(&mut buf, formatter);
+                serde::Serialize::serialize(&out, &mut ser)?;
+                let rendered = String::from_utf8(buf)?;
+                match out_file {
+                    Some(path) => std::fs::write(&path, &rendered)?,
+                    None => {
+                        use std::io::Write;
+                        let stdout = std::io::stdout();
+                        let mut handle = stdout.lock();
+                        handle.write_all(rendered.as_bytes())?;
                     }
                 }
 
@@ -1845,72 +2127,72 @@ impl QueryCmd {
             QuerySubcommand::StakePools {
                 socket_path,
                 testnet_magic,
+                output_json: _output_json,
+                output_text,
+                output_yaml,
+                out_file,
             } => {
-                let mut client = connect_and_acquire(&socket_path, testnet_magic).await?;
+                if output_yaml {
+                    anyhow::bail!(
+                        "--output-yaml is not yet supported (use --output-json or --output-text)"
+                    );
+                }
 
+                let mut client = connect_and_acquire(&socket_path, testnet_magic).await?;
                 let raw = client
-                    .query_stake_distribution()
+                    .query_stake_pools()
                     .await
                     .map_err(|e| anyhow::anyhow!("Failed to query stake pools: {e}"))?;
-
                 release_and_done(&mut client).await;
 
-                // Parse MsgResult [4, [Map<pool_hash, [ratio, vrf_hash]>]]
-                let mut decoder = minicbor::Decoder::new(&raw);
-                let _ = decoder.array();
-                let tag = decoder.u32().unwrap_or(999);
-                if tag != 4 {
-                    anyhow::bail!("Expected MsgResult tag 4, got {tag}");
-                }
-                // Strip HFC wrapper
-                let pos = decoder.position();
-                if let Ok(Some(2)) = decoder.array() {
-                    let _ = decoder.u64(); // consume HFC success tag (1)
-                } else if let Ok(Some(1)) = {
-                    decoder.set_position(pos);
-                    decoder.array()
-                } {
-                    // consumed wrapper
+                let mut pool_ids = parse_stake_pools_set(&raw)?;
+
+                // Match cardano-cli ordering: Haskell `Set KeyHash` sorts by
+                // the raw hash bytes, then renders each as bech32 `pool1…`.
+                // Sorting by the bech32 string does NOT match because bech32's
+                // 5-bit repacking can reorder adjacent byte values.
+                pool_ids.sort();
+                let hrp =
+                    bech32::Hrp::parse("pool").map_err(|e| anyhow::anyhow!("pool hrp: {e}"))?;
+                let bech32_ids: Vec<String> = pool_ids
+                    .iter()
+                    .map(|h| {
+                        bech32::encode::<bech32::Bech32>(hrp, h)
+                            .map_err(|e| anyhow::anyhow!("encode pool bech32: {e}"))
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+
+                let rendered = if output_text {
+                    // Plain newline-separated bech32 IDs (cardano-cli --output-text).
+                    let mut s = bech32_ids.join("\n");
+                    s.push('\n');
+                    s
                 } else {
-                    decoder.set_position(pos);
+                    // JSON array (default). Match cardano-cli: 4-space indent,
+                    // no trailing newline.
+                    let value = serde_json::Value::Array(
+                        bech32_ids
+                            .into_iter()
+                            .map(serde_json::Value::String)
+                            .collect(),
+                    );
+                    let mut buf = Vec::new();
+                    let formatter = serde_json::ser::PrettyFormatter::with_indent(b"    ");
+                    let mut ser = serde_json::Serializer::with_formatter(&mut buf, formatter);
+                    serde::Serialize::serialize(&value, &mut ser)?;
+                    String::from_utf8(buf)?
+                };
+
+                match out_file {
+                    Some(path) => std::fs::write(&path, &rendered)?,
+                    None => {
+                        use std::io::Write;
+                        let stdout = std::io::stdout();
+                        let mut handle = stdout.lock();
+                        handle.write_all(rendered.as_bytes())?;
+                    }
                 }
 
-                struct PoolInfo {
-                    pool_id: String,
-                    stake_num: u64,
-                    stake_den: u64,
-                }
-                let mut pools = Vec::new();
-                // Map<pool_hash(28), [tag(30)[num,den], vrf_hash(32)]>
-                let map_len = decoder.map().unwrap_or(Some(0)).unwrap_or(0);
-                for _ in 0..map_len {
-                    let pool_id = hex::encode(decoder.bytes().unwrap_or(&[]));
-                    let _ = decoder.array(); // array(2)
-                                             // Stake ratio: tag(30)[num, den]
-                    let _ = decoder.tag(); // tag(30)
-                    let _ = decoder.array(); // [num, den]
-                    let stake_num = decoder.u64().unwrap_or(0);
-                    let stake_den = decoder.u64().unwrap_or(1);
-                    // VRF hash
-                    let _vrf = decoder.bytes().unwrap_or(&[]);
-                    pools.push(PoolInfo {
-                        pool_id,
-                        stake_num,
-                        stake_den,
-                    });
-                }
-
-                println!("{:<58} {:>12}", "PoolId", "Stake");
-                println!("{}", "-".repeat(72));
-                for p in &pools {
-                    let stake_frac = if p.stake_den > 0 {
-                        p.stake_num as f64 / p.stake_den as f64
-                    } else {
-                        0.0
-                    };
-                    println!("{:<58} {:>11.6}%", p.pool_id, stake_frac * 100.0);
-                }
-                println!("\nTotal pools: {}", pools.len());
                 Ok(())
             }
             QuerySubcommand::NonMyopicMemberRewards {
