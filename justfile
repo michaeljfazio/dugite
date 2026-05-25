@@ -1,8 +1,8 @@
 # Dugite task runner. Install: https://github.com/casey/just
 #
-# Recipes are grouped: build & dev, run a network, local devnet, soak,
-# monitoring, validation, mithril, dev/release. Run `just` (or `just --list`)
-# to see them all.
+# Recipes are grouped: build & dev, run a network, local devnet,
+# preview soak, monitoring, validation rigs, dual-decode, upstream
+# conformance, dev/release. Run `just` (or `just --list`) to see them all.
 
 set shell := ["bash", "-cu"]
 set positional-arguments := true
@@ -81,8 +81,7 @@ devnet-verify:
 devnet-stop:
     ./testnet/local-devnet/stop.sh
 
-# Generate a release report from the most recent evidence directory.
-# Usage: just devnet-report [TAG]
+# Generate a release report from the most recent evidence directory (optional TAG).
 devnet-report TAG="":
     #!/usr/bin/env bash
     set -euo pipefail
@@ -241,54 +240,50 @@ dual-decode-smoke:
       --features dugite-serialization/pallas-shadow-decode \
       --no-fail-fast
 
-# Run the dual-decode soak on NETWORK (preview|preprod|mainnet|devnet).
-# Pass MAX_BLOCKS as second arg to limit blocks applied (0 = unlimited).
-# Accepts extra flags: --with-mithril
+# Run the dual-decode soak (NETWORK ∈ preview|preprod|mainnet|devnet; MAX_BLOCKS=0 is unlimited; FLAGS e.g. --with-mithril).
 dual-decode-soak NETWORK="preview" MAX_BLOCKS="0" *FLAGS="":
     ./scripts/validation/dual-decode-soak.sh {{NETWORK}} {{MAX_BLOCKS}} {{FLAGS}}
 
-# Summarise mismatch artefacts in DIR (default ./dual_decode_mismatches/).
-# Exits 0 if clean, 1 if mismatches present.
+# Summarise dual-decode mismatch artefacts (exit 0 = clean, 1 = mismatches found).
 dual-decode-report DIR="./dual_decode_mismatches":
     python3 ./scripts/validation/dual-decode-report.py {{DIR}}
 
-# ─── Upstream conformance corpus ─────────────────────────────────────────────
+# ─── Upstream conformance ────────────────────────────────────────────────────
+#
+# Corpus republished from upstream Cardano repositories.  Pinned tag lives in
+# tests/conformance/upstream/manifest.toml.  Workflow: download → run.
 
-# Download all upstream conformance fixture areas from the pinned dugite release.
-# See tests/conformance/upstream/manifest.toml for the release tag.
+# Download every upstream fixture area at the pinned release tag.
 download-upstream-fixtures:
     cargo xtask download-upstream-fixtures
 
-# Download a single upstream conformance fixture area.
+# Download a single fixture area for iteration (e.g. plutus, ledger-rules, mithril).
 download-upstream-fixtures-area AREA:
     cargo xtask download-upstream-fixtures --area {{AREA}}
 
-# Run the full upstream conformance test suite (all areas, REQUIRE mode).
-# Aggregates every per-area `conformance-*` recipe below.
-test-upstream: conformance-uplc conformance-cardano-base conformance-cardano-ledger conformance-cardano-node conformance-ledger-rules conformance-mithril conformance-ouroboros-consensus conformance-status
+# Run the full upstream conformance suite (UPLC + upstream_tests; reports real 0 skipped).
+test-upstream: conformance-uplc conformance-upstream
 
-# Run the regeneration pipeline locally (produces tarballs in target/conformance-corpus/).
-regenerate-corpus-local:
-    bash scripts/regenerate-conformance-corpus/regenerate.sh --local
-
-# ─── Per-area conformance recipes ────────────────────────────────────────────
-#
-# Each recipe runs every per-vector test for one fixture area in REQUIRE mode
-# (fails on missing fixtures rather than skipping).  Per-vector tests are
-# generated at build time by `tests/conformance/build.rs` — one #[test] per
-# leaf fixture (or `test_N/` directory for ledger-rules) — so a failure
-# reports the exact vector that broke.  Run them individually while iterating
-# on a specific area; run `just test-upstream` for the full suite.  All
-# require `just download-upstream-fixtures` first.
-
-# UPLC: 999 plutus-core evaluation vectors from IntersectMBO/plutus.
+# UPLC: 999 plutus-core evaluation vectors (IntersectMBO/plutus).
 conformance-uplc:
     DUGITE_REQUIRE_UPSTREAM=1 cargo nextest run -p dugite-uplc --features upstream-conformance --test conformance
 
-# Alias for `conformance-uplc` — kept for backwards compatibility.
-uplc-conformance: conformance-uplc
+# Every upstream golden test (cardano-base, cardano-ledger, cardano-node, ledger-rules, mithril, ouroboros-consensus, fixtures-status) in one binary.
+conformance-upstream:
+    DUGITE_REQUIRE_UPSTREAM=1 cargo nextest run -p dugite-conformance --features upstream-conformance --test upstream_tests
 
-# cardano-base: VRF v03 / v13 test vectors (`vrf*.txt` files).
+# Regenerate the conformance corpus tarballs locally (target/conformance-corpus/).
+regenerate-corpus-local:
+    bash scripts/regenerate-conformance-corpus/regenerate.sh --local
+
+# ─── Conformance per-area filters (iteration only) ───────────────────────────
+#
+# Each recipe filters the `upstream_tests` binary to one area's tests.  The
+# "N skipped" line nextest prints here is the count of tests for OTHER areas
+# that the filter excluded — NOT a coverage gap.  Use `conformance-upstream`
+# (or `test-upstream`) for the unfiltered run that reports 0 skipped.
+
+# cardano-base: VRF v03 / v13 test vectors (`vrf*.txt`).
 conformance-cardano-base:
     DUGITE_REQUIRE_UPSTREAM=1 cargo nextest run -p dugite-conformance --features upstream-conformance --test upstream_tests -E 'test(/^upstream_cardano_base_/) + test(cardano_base_vrf_checks)'
 
@@ -300,8 +295,7 @@ conformance-cardano-ledger:
 conformance-cardano-node:
     DUGITE_REQUIRE_UPSTREAM=1 cargo nextest run -p dugite-conformance --features upstream-conformance --test upstream_tests -E 'test(/^upstream_cardano_node_/) + test(cardano_node_genesis_decodes)'
 
-# ledger-rules: ImpSpec replay — 5,678 vectors across CERT, CERTS,
-# ConwayNEWEPOCH, DELEG, ENACT, GOV, GOVCERT, LEDGER, NEWEPOCH, POOL.
+# ledger-rules: ImpSpec replay across all Conway STS rules (~5,678 vectors).
 conformance-ledger-rules:
     DUGITE_REQUIRE_UPSTREAM=1 cargo nextest run -p dugite-conformance --features upstream-conformance --test upstream_tests -E 'test(/^upstream_ledger_rules_/) + test(ledger_rules_imp_spec_replay)'
 
@@ -313,7 +307,7 @@ conformance-mithril:
 conformance-ouroboros-consensus:
     DUGITE_REQUIRE_UPSTREAM=1 cargo nextest run -p dugite-conformance --features upstream-conformance --test upstream_tests -E 'test(/^upstream_ouroboros_consensus_/) + test(ouroboros_consensus_golden_decodes)'
 
-# Meta: verify every required fixture file is present at the manifest-pinned tag.
+# fixtures-status: verify every required fixture file is present at the manifest-pinned release tag.
 conformance-status:
     DUGITE_REQUIRE_UPSTREAM=1 cargo nextest run -p dugite-conformance --features upstream-conformance --test upstream_tests -E 'test(upstream_fixtures_status)'
 
