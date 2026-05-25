@@ -16,6 +16,10 @@
 //! genesis / patterns / metadatum / asset.
 
 pub mod block;
+pub mod cert;
 pub mod common;
+pub mod metadatum;
+pub mod plutus_data;
 pub mod pparams;
+pub mod script;
 pub mod tx;
