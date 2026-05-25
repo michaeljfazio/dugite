@@ -21,7 +21,7 @@ sysinfo = { version = "0.39", default-features = false, features = ["system"] }
 tempfile = { workspace = true }
 
 [target.'cfg(unix)'.dependencies]
-nix = { version = "0.30", features = ["signal"] }
+nix = { version = "0.31", features = ["signal"] }
 
 [dev-dependencies]
 dugite-node = { workspace = true }
