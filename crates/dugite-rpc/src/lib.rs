@@ -26,6 +26,7 @@
 pub mod config;
 pub mod context;
 pub mod error;
+pub mod map;
 pub mod masking;
 pub mod mempool_feed;
 pub mod metrics;

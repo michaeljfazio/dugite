@@ -30,6 +30,10 @@ async-trait = { workspace = true }
 # Workspace types we expose / accept across the LedgerContext trait surface.
 dugite-primitives = { workspace = true }
 dugite-mempool = { workspace = true }
+# Used by SyncService to decode the raw block CBOR into the parsed
+# `AnyChainBlock.chain.cardano` envelope. The native_bytes path stays
+# decoder-free.
+dugite-serialization = { workspace = true }
 
 # Diagnostics + error plumbing.
 tracing = { workspace = true }
