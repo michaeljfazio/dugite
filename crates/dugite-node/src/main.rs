@@ -9,6 +9,7 @@ mod logging;
 mod metrics;
 mod mithril;
 mod node;
+mod rpc_adapter;
 mod startup;
 mod topology;
 mod verify_snapshot;
@@ -177,6 +178,28 @@ struct RunArgs {
     /// failure rather than a silent degradation.
     #[arg(long)]
     require_metrics: bool,
+
+    /// UTxO RPC (gRPC) server bind address (issue #672).
+    ///
+    /// Overrides the `Rpc.ListenAddr` value from the config file. Defaults
+    /// to `127.0.0.1` when the server is enabled.
+    #[arg(long)]
+    rpc_host: Option<String>,
+
+    /// UTxO RPC (gRPC) server port (issue #672).
+    ///
+    /// Overrides the `Rpc.Port` value from the config file. Implies
+    /// enabling the RPC server. Defaults to `50051` when set via the
+    /// config file. Pass `--no-rpc` to disable.
+    #[arg(long)]
+    rpc_port: Option<u16>,
+
+    /// Disable the UTxO RPC (gRPC) server entirely (issue #672).
+    ///
+    /// Takes precedence over `--rpc-host`, `--rpc-port`, and the
+    /// `Rpc.Enabled` config-file field.
+    #[arg(long)]
+    no_rpc: bool,
 
     /// Also emit `cardano_node_metrics_*` compatibility aliases in the Prometheus
     /// output alongside the native `dugite_*` metrics.
@@ -1505,6 +1528,29 @@ async fn run_node(args: RunArgs, log_handle: Option<logging::LogHandle>) -> Resu
         node_config.metrics_port.unwrap_or(DEFAULT_METRICS_PORT)
     };
 
+    // Resolve effective UTxO RPC config (#672 M1.A). See
+    // config::resolve_rpc for the precedence table.
+    let rpc_config = config::resolve_rpc(
+        args.no_rpc,
+        args.rpc_host.as_deref(),
+        args.rpc_port,
+        node_config.rpc.as_ref(),
+    )
+    .map_err(|e| anyhow::anyhow!("invalid RPC config: {e}"))?;
+    if let Some(ref rc) = rpc_config {
+        info!(
+            bind = %rc.bind,
+            port = rc.port,
+            reflection = rc.reflection_enabled,
+            web = rc.web_enabled,
+            alpha = rc.alpha_enabled,
+            tls = rc.tls.is_some(),
+            "UTxO RPC (gRPC) server enabled"
+        );
+    } else {
+        info!("UTxO RPC (gRPC) server disabled");
+    }
+
     // Load topology
     let topology = topology::Topology::load(&args.topology)?;
     let all_peers = topology.all_peers();
@@ -1589,6 +1635,7 @@ async fn run_node(args: RunArgs, log_handle: Option<logging::LogHandle>) -> Resu
         shelley_vrf_key: args.shelley_vrf_key,
         shelley_operational_certificate: args.shelley_operational_certificate,
         _shelley_cold_key: args.shelley_cold_key,
+        rpc_config,
         metrics_port: effective_metrics_port,
         require_metrics: args.require_metrics,
         compat_metrics: args.compat_metrics,

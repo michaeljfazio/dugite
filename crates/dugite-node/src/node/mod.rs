@@ -288,6 +288,8 @@ pub struct NodeArgs {
     pub shelley_operational_certificate: Option<PathBuf>,
     /// Path to cold signing key (accepted for cardano-node compatibility)
     pub _shelley_cold_key: Option<PathBuf>,
+    /// UTxO RPC server configuration (None = disabled) — issue #672.
+    pub rpc_config: Option<dugite_rpc::RpcConfig>,
     /// Prometheus metrics port (0 to disable)
     pub metrics_port: u16,
     /// Make a metrics bind failure a fatal startup error (default: continue without metrics)
@@ -423,6 +425,8 @@ pub struct Node {
     /// in additively from the same send sites; consumed by external RPC.
     /// `None` until `run()` initialises it alongside the announcement channels.
     pub(crate) tip_broadcaster: Option<Arc<tip_broadcast::TipBroadcaster>>,
+    /// UTxO RPC server configuration — `None` if disabled (default).
+    pub(crate) rpc_config: Option<dugite_rpc::RpcConfig>,
     /// Prometheus metrics port
     pub(crate) metrics_port: u16,
     /// Make a metrics bind failure fatal (see `--require-metrics`)
@@ -1807,6 +1811,7 @@ impl Node {
             block_announcement_tx: None,
             rollback_announcement_tx: None,
             tip_broadcaster: None,
+            rpc_config: args.rpc_config,
             metrics_port: args.metrics_port,
             require_metrics: args.require_metrics,
             expected_byron_genesis_hash,
@@ -2825,6 +2830,72 @@ impl Node {
             self.rollback_announcement_tx = Some(rollback_ann_tx);
             self.tip_broadcaster = Some(Arc::new(tip_broadcast::TipBroadcaster::new()));
         }
+
+        // ─── UTxO RPC server (#672 M1.A) ───────────────────────────────────
+        //
+        // Starts here so the tip_broadcaster + mempool feeds are both
+        // guaranteed initialised (the broadcaster fallback above ensures
+        // it). Gated entirely on RpcConfig.is_some() — when the operator
+        // hasn't enabled RPC the gRPC stack and listener are never
+        // touched. Service stubs return UNIMPLEMENTED in M1.A; M1.B+
+        // fills SyncService / QueryService / SubmitService / WatchService.
+        if let Some(rpc_cfg) = self.rpc_config.clone() {
+            let adapter = Arc::new(crate::rpc_adapter::NodeRpcAdapter::new(
+                self.mempool.clone(),
+            ));
+            let (tip_feed, tip_publisher) = crate::rpc_adapter::build_tip_feed();
+            // Spawn forwarder: subscribes to the node-side TipBroadcaster
+            // and republishes into the dugite-rpc TipPublisher. Keeps the
+            // RPC crate dep-free of dugite-node.
+            let broadcaster = self
+                .tip_broadcaster
+                .clone()
+                .expect("tip_broadcaster initialised by the fallback above");
+            let _tip_forwarder = crate::rpc_adapter::spawn_tip_forwarder(
+                broadcaster,
+                tip_publisher,
+                shutdown_rx.clone(),
+            );
+            let mempool_feed = dugite_rpc::MempoolFeed::new(self.mempool.tx_events());
+            let rpc_shutdown_rx = shutdown_rx.clone();
+            let rpc_cfg_arc = Arc::new(rpc_cfg);
+            match dugite_rpc::RpcServer::start(
+                rpc_cfg_arc.clone(),
+                adapter,
+                tip_feed,
+                mempool_feed,
+                dugite_rpc::noop_metrics(),
+                rpc_shutdown_rx,
+            )
+            .await
+            {
+                Ok(handle) => {
+                    info!(
+                        local_addr = %handle.local_addr,
+                        "dugite-rpc: UTxO RPC server bound and accepting connections",
+                    );
+                    // We deliberately drop the handle here — the server
+                    // task is rooted by tokio's task tree and shuts down
+                    // cooperatively when shutdown_rx fires. M1.B may
+                    // promote this to a Node field if graceful
+                    // drain-on-error becomes useful.
+                }
+                Err(e) => {
+                    error!(
+                        bind = %rpc_cfg_arc.bind,
+                        port = rpc_cfg_arc.port,
+                        error = %e,
+                        "dugite-rpc: RPC server failed to start"
+                    );
+                    return Err(anyhow::anyhow!(
+                        "RPC server bind failed on {}:{}: {e}",
+                        rpc_cfg_arc.bind,
+                        rpc_cfg_arc.port
+                    ));
+                }
+            }
+        }
+
         // Channel for the N2N listener to send accepted+handshaked connections
         // to the main run loop for lifecycle manager registration.
         let (inbound_accept_tx, mut inbound_accept_rx) = tokio::sync::mpsc::channel::<

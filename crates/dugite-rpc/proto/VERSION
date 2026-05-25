@@ -1,0 +1,13 @@
+source       = "https://github.com/utxorpc/spec"
+tag          = "v0.19.2"
+commit       = "4ef539ab4a47418e6666600ba83a145682779995"
+fetched_at   = "2026-05-25"
+
+# Vendored subset: Cardano chain only (v1alpha + v1beta of cardano, sync,
+# query, submit, watch). Bitcoin and Handshake .proto are intentionally
+# omitted — Dugite is a Cardano-only node and the unused codegen would add
+# build cost without consumer.
+#
+# Refresh via: just bump-utxorpc-spec <tag>
+# Provenance: this file is the single source of truth for spec pinning;
+# bumping spec without bumping this file (or vice versa) is a CI failure.
