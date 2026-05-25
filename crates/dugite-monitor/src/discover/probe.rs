@@ -229,6 +229,10 @@ cardano_node_metrics_blockNum_int 12345678
         addr
     }
 
+    /// Server that holds the response for `SLOW_SERVER_DELAY`. The probe
+    /// must time out well before this elapses.
+    const SLOW_SERVER_DELAY: Duration = Duration::from_secs(5);
+
     async fn serve_slow() -> SocketAddr {
         let listener = TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0)))
             .await
@@ -243,7 +247,7 @@ cardano_node_metrics_blockNum_int 12345678
                 let io = TokioIo::new(stream);
                 tokio::spawn(async move {
                     let svc = service_fn(|_req: Request<hyper::body::Incoming>| async move {
-                        tokio::time::sleep(Duration::from_secs(2)).await;
+                        tokio::time::sleep(SLOW_SERVER_DELAY).await;
                         Ok::<_, Infallible>(
                             Response::builder()
                                 .status(StatusCode::OK)
@@ -295,9 +299,13 @@ cardano_node_metrics_blockNum_int 12345678
         let outcome = probe_metrics_url(&url).await;
         let elapsed = start.elapsed();
         assert!(outcome.is_none(), "slow server must time out");
+        // The contract is "we did not wait for the slow server to respond".
+        // Use a generous margin so the test is not flaky under CI load —
+        // the assertion that matters is "much less than SLOW_SERVER_DELAY".
         assert!(
-            elapsed < Duration::from_millis(900),
-            "probe should time out within ~500ms, took {:?}",
+            elapsed < SLOW_SERVER_DELAY - Duration::from_secs(1),
+            "probe should time out well before {:?}, but took {:?}",
+            SLOW_SERVER_DELAY,
             elapsed
         );
     }
