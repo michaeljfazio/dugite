@@ -396,6 +396,72 @@ const RPC_FIELDS: &[SubParamDef] = &[
     },
 ];
 
+const STORAGE_FIELDS: &[SubParamDef] = &[
+    SubParamDef {
+        key: "profile",
+        param_type: ParamType::Enum {
+            values: &["ultra-memory", "high-memory", "low-memory", "minimal"],
+        },
+        default: "high-memory",
+        description: "Preset memory profile. Sets memtable / cache defaults below \
+                      unless they are individually overridden.",
+        tuning_hint: "Match to host RAM: 'high-memory' for 16GB, 'low-memory' for 8GB.",
+        reloadability: Reloadability::Restart,
+    },
+    SubParamDef {
+        key: "immutableIndexType",
+        param_type: ParamType::Enum {
+            values: &["mmap", "in-memory"],
+        },
+        default: "mmap",
+        description: "Storage strategy for the ImmutableDB block index.",
+        tuning_hint: "'mmap' is the default; 'in-memory' uses more RAM but is slightly faster.",
+        reloadability: Reloadability::Restart,
+    },
+    SubParamDef {
+        key: "mmapLoadFactor",
+        param_type: ParamType::F64 { min: 0.0, max: 1.0 },
+        default: "0.7",
+        description: "Hash-table load factor for the mmap immutable index.",
+        tuning_hint: "Lower → more memory, faster lookup. 0.7 is the cardano-node default.",
+        reloadability: Reloadability::Restart,
+    },
+    SubParamDef {
+        key: "utxoBackend",
+        param_type: ParamType::Enum {
+            values: &["lsm", "in-memory"],
+        },
+        default: "lsm",
+        description: "UTxO-HD storage backend.",
+        tuning_hint: "Production deployments should use 'lsm'.",
+        reloadability: Reloadability::Restart,
+    },
+    SubParamDef {
+        key: "utxoMemtableSizeMb",
+        param_type: ParamType::U64 { min: 1, max: 65536 },
+        default: "",
+        description: "LSM memtable size in MB. Empty → derived from profile.",
+        tuning_hint: "Override to tune flush cadence vs memory headroom.",
+        reloadability: Reloadability::Restart,
+    },
+    SubParamDef {
+        key: "utxoBlockCacheSizeMb",
+        param_type: ParamType::U64 { min: 1, max: 65536 },
+        default: "",
+        description: "LSM block-cache size in MB. Empty → derived from profile.",
+        tuning_hint: "Larger cache → fewer disk reads, more RSS.",
+        reloadability: Reloadability::Restart,
+    },
+    SubParamDef {
+        key: "utxoBloomFilterBits",
+        param_type: ParamType::U64 { min: 1, max: 32 },
+        default: "10",
+        description: "Bloom-filter bits per key in the LSM SSTables.",
+        tuning_hint: "10 ≈ 1% false-positive rate. Increase if profile shows high disk reads.",
+        reloadability: Reloadability::Restart,
+    },
+];
+
 /// All known Cardano node configuration parameters, in section/display order.
 ///
 /// When a key from the loaded JSON file matches an entry here, its metadata is
@@ -1156,7 +1222,9 @@ pub static KNOWN_PARAMS: &[ParamDef] = &[
     ParamDef {
         key: "Storage",
         section: "Storage",
-        param_type: ParamType::Object { fields: &[] },
+        param_type: ParamType::Object {
+            fields: STORAGE_FIELDS,
+        },
         default: "",
         description: "Storage subsystem configuration. Sub-fields (all optional): \
                       'profile': preset profile name ('ultra-memory', 'high-memory', \
@@ -1512,11 +1580,20 @@ mod tests {
             .unwrap();
         assert_eq!(v, Value::String("Info".into()));
 
-        // Object default synthesises an empty JSON object (fields: &[] — sub-schemas
-        // are populated in Tasks 14–16).
+        // Object default synthesises from sub-field defaults; leaves with empty
+        // default (utxoMemtableSizeMb, utxoBlockCacheSizeMb) are omitted.
         let v = lookup.get("Storage").unwrap().default_as_json().unwrap();
         assert!(v.as_object().is_some());
-        assert_eq!(v, serde_json::json!({}));
+        assert_eq!(
+            v,
+            serde_json::json!({
+                "profile": "high-memory",
+                "immutableIndexType": "mmap",
+                "mmapLoadFactor": 0.7,
+                "utxoBackend": "lsm",
+                "utxoBloomFilterBits": 10
+            })
+        );
     }
 
     #[test]
@@ -1702,7 +1779,48 @@ mod tests {
         assert!(map.contains_key("Storage"), "Storage must be in schema");
         let def = map["Storage"];
         assert_eq!(def.section, "Storage");
-        assert_eq!(def.param_type, ParamType::Object { fields: &[] });
+        match &def.param_type {
+            ParamType::Object { fields } => {
+                assert!(!fields.is_empty(), "Storage should have sub-fields");
+            }
+            _ => panic!("expected Object"),
+        }
+    }
+
+    #[test]
+    fn test_storage_subschema() {
+        let def = KNOWN_PARAMS
+            .iter()
+            .find(|d| d.key == "Storage")
+            .expect("present");
+        match &def.param_type {
+            ParamType::Object { fields } => {
+                let keys: Vec<&str> = fields.iter().map(|s| s.key).collect();
+                assert_eq!(
+                    keys,
+                    vec![
+                        "profile",
+                        "immutableIndexType",
+                        "mmapLoadFactor",
+                        "utxoBackend",
+                        "utxoMemtableSizeMb",
+                        "utxoBlockCacheSizeMb",
+                        "utxoBloomFilterBits",
+                    ]
+                );
+                // utxoMemtableSizeMb has no schema default.
+                let memtable = fields
+                    .iter()
+                    .find(|s| s.key == "utxoMemtableSizeMb")
+                    .unwrap();
+                assert_eq!(memtable.default, "");
+                assert!(
+                    memtable.default_as_json().is_none(),
+                    "U64 with empty default → no hydration"
+                );
+            }
+            _ => panic!("Storage must be Object"),
+        }
     }
 
     // ── network_defaults correctness ───────────────────────────────────────
