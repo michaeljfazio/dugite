@@ -370,31 +370,32 @@ impl App {
         }
 
         // Existing per-leaf dispatch (Bool toggle / Enum cycle / Typing buffer).
-        let entry = &self.config.entries[item.entry_idx];
+        let entry_idx = item.entry_idx;
         let def = item.def;
 
         match def.param_type() {
             Some(ParamType::Bool) => {
                 // Instant toggle — no typing buffer needed.
-                let idx = item.entry_idx;
-                if let Err(e) = self.config.entries[idx].toggle_bool() {
+                let path = item.path.clone();
+                if let Err(e) = self.config.entries[entry_idx].toggle_bool_at(&path) {
                     self.feedback = Some(format!("Toggle failed: {e}"));
                 } else {
-                    let new_val = self.config.entries[idx].display_value();
+                    let new_val = self.config.entries[entry_idx].display_value_at(&path);
                     self.feedback = Some(format!("Set to {new_val}"));
                 }
             }
             Some(ParamType::Enum { values }) => {
                 // Instant cycle through enum choices.
                 let choices: Vec<&str> = values.to_vec();
-                let idx = item.entry_idx;
-                self.config.entries[idx].cycle_enum(&choices);
-                let new_val = self.config.entries[idx].display_value();
+                let path = item.path.clone();
+                self.config.entries[entry_idx].cycle_enum_at(&path, &choices);
+                let new_val = self.config.entries[entry_idx].display_value_at(&path);
                 self.feedback = Some(format!("Set to {new_val}"));
             }
             _ => {
-                // Open typing buffer pre-filled with current value.
-                let current = entry.display_value();
+                // Open typing buffer pre-filled with current value at the path
+                // (or top-level value if path is empty).
+                let current = self.config.entries[entry_idx].display_value_at(&item.path);
                 self.edit_mode = EditMode::Typing {
                     buffer: current,
                     error: None,
@@ -435,6 +436,7 @@ impl App {
         };
         let def = item.def;
         let entry_idx = item.entry_idx;
+        let item_path = item.path.clone();
 
         if let Some(pt) = def.param_type() {
             if let Err(msg) = pt.validate(&raw) {
@@ -446,8 +448,8 @@ impl App {
             }
         }
 
-        // Apply the edit.
-        if let Err(e) = self.config.entries[entry_idx].apply_edit(&raw) {
+        // Apply the edit at the item's path inside the entry.
+        if let Err(e) = self.config.entries[entry_idx].apply_edit_at(&item_path, &raw) {
             if let EditMode::Typing { error, .. } = &mut self.edit_mode {
                 *error = Some(e.to_string());
             }
@@ -1318,5 +1320,66 @@ mod tests {
                 new_item.path
             );
         }
+    }
+
+    #[test]
+    fn test_subleaf_edit_writes_through_pointer_and_clears_synthetic() {
+        let mut app = make_app(r#"{}"#);
+
+        // Find hardLimit sub-leaf row.
+        let mut located: Option<(usize, usize)> = None;
+        let mut header_idx: Option<usize> = None;
+        let mut section_idx: Option<usize> = None;
+        for (sec_idx, section) in app.sections.iter().enumerate() {
+            for (item_idx, item) in section.items.iter().enumerate() {
+                if app.config.entries[item.entry_idx].key == "AcceptedConnectionsLimit" {
+                    if item.path.is_empty() {
+                        header_idx = Some(item_idx);
+                        section_idx = Some(sec_idx);
+                    } else if item.path == vec!["hardLimit".to_string()] {
+                        located = Some((sec_idx, item_idx));
+                    }
+                }
+            }
+        }
+        let (sec, leaf_idx) = located.expect("hardLimit row must exist");
+        let hdr = header_idx.expect("header row");
+        let hdr_sec = section_idx.expect("section");
+        assert_eq!(
+            sec, hdr_sec,
+            "leaf and header should be in the same section"
+        );
+
+        // Force the container open so the cursor can land on the sub-leaf.
+        app.sections[hdr_sec].items[hdr].expanded = true;
+        app.cursor_section = sec;
+        app.cursor_item = leaf_idx;
+
+        // Open buffer, type the new value, confirm.
+        app.begin_edit();
+        assert!(matches!(app.edit_mode, EditMode::Typing { .. }));
+        if let EditMode::Typing { buffer, .. } = &mut app.edit_mode {
+            buffer.clear();
+            buffer.push_str("1024");
+        }
+        app.confirm_edit();
+
+        // Locate the parent entry and check the value.
+        let parent = app
+            .config
+            .entries
+            .iter()
+            .find(|e| e.key == "AcceptedConnectionsLimit")
+            .expect("parent entry exists");
+        assert_eq!(
+            parent.value.pointer("/hardLimit"),
+            Some(&serde_json::json!(1024)),
+            "edited value should be written at /hardLimit"
+        );
+        assert!(parent.modified, "parent entry must be marked modified");
+        assert!(
+            !parent.synthetic_paths.contains("/hardLimit"),
+            "touched leaf must no longer be synthetic"
+        );
     }
 }

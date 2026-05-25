@@ -139,6 +139,111 @@ impl ConfigEntry {
         self.value = Value::String(next.to_string());
         self.modified = true;
     }
+
+    /// Apply a string edit at the given path inside this entry's value, using
+    /// the existing-value's type to choose a parse strategy (same rules as
+    /// [`apply_edit`]). When `path` is empty, behaves identically to
+    /// `apply_edit`.
+    ///
+    /// On success, marks the entry `modified` and removes the path's pointer
+    /// from `synthetic_paths`.
+    pub fn apply_edit_at(&mut self, path: &[String], raw: &str) -> Result<()> {
+        if path.is_empty() {
+            return self.apply_edit(raw);
+        }
+        let pointer = crate::path::path_to_json_pointer(path);
+        let slot = self
+            .value
+            .pointer_mut(&pointer)
+            .with_context(|| format!("no value at '{pointer}'"))?;
+        let new_value = match slot {
+            Value::Bool(_) => raw
+                .parse::<bool>()
+                .map(Value::Bool)
+                .with_context(|| format!("'{raw}' is not a valid boolean"))?,
+            Value::Number(_) => {
+                if let Ok(i) = raw.parse::<i64>() {
+                    Value::Number(serde_json::Number::from(i))
+                } else if let Ok(f) = raw.parse::<f64>() {
+                    Value::Number(
+                        serde_json::Number::from_f64(f)
+                            .with_context(|| format!("'{raw}' is not finite"))?,
+                    )
+                } else {
+                    anyhow::bail!("'{raw}' is not a valid number")
+                }
+            }
+            Value::String(_) => Value::String(raw.to_string()),
+            _ => Value::String(raw.to_string()),
+        };
+        *slot = new_value;
+        self.modified = true;
+        self.synthetic_paths.remove(&pointer);
+        Ok(())
+    }
+
+    /// Toggle a boolean at the given path. Empty path operates on the whole entry.
+    pub fn toggle_bool_at(&mut self, path: &[String]) -> Result<()> {
+        if path.is_empty() {
+            return self.toggle_bool();
+        }
+        let pointer = crate::path::path_to_json_pointer(path);
+        let slot = self
+            .value
+            .pointer_mut(&pointer)
+            .with_context(|| format!("no value at '{pointer}'"))?;
+        match slot {
+            Value::Bool(b) => {
+                *slot = Value::Bool(!*b);
+                self.modified = true;
+                self.synthetic_paths.remove(&pointer);
+                Ok(())
+            }
+            _ => anyhow::bail!("cannot toggle non-boolean at '{pointer}'"),
+        }
+    }
+
+    /// Cycle an enum value at the given path through `choices`.
+    pub fn cycle_enum_at(&mut self, path: &[String], choices: &[&str]) {
+        if path.is_empty() {
+            return self.cycle_enum(choices);
+        }
+        if choices.is_empty() {
+            return;
+        }
+        let pointer = crate::path::path_to_json_pointer(path);
+        let Some(slot) = self.value.pointer_mut(&pointer) else {
+            return;
+        };
+        let current = match slot {
+            Value::String(s) => s.clone(),
+            ref other => other.to_string(),
+        };
+        let next = choices
+            .iter()
+            .position(|c| *c == current.as_str())
+            .map(|i| choices[(i + 1) % choices.len()])
+            .unwrap_or(choices[0]);
+        *slot = Value::String(next.to_string());
+        self.modified = true;
+        self.synthetic_paths.remove(&pointer);
+    }
+
+    /// Return a display string for the value at the given path. Empty path
+    /// returns the same as `display_value`.
+    pub fn display_value_at(&self, path: &[String]) -> String {
+        if path.is_empty() {
+            return self.display_value();
+        }
+        let pointer = crate::path::path_to_json_pointer(path);
+        match self.value.pointer(&pointer) {
+            Some(Value::Bool(b)) => b.to_string(),
+            Some(Value::Number(n)) => n.to_string(),
+            Some(Value::String(s)) => s.clone(),
+            Some(other) => other.to_string(),
+            None => String::new(),
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
