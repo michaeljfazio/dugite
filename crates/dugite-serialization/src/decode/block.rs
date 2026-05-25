@@ -568,4 +568,67 @@ mod tests {
         assert_eq!(block_min.block_number().0, 33760);
         assert_eq!(block_min.slot().0, 678345);
     }
+
+    /// Regression for #673: cn 11.0.1 emits indefinite-length
+    /// `aux_data_set` and inner CIP-20 metadata maps on preview /
+    /// preprod for Babbage blocks containing CIP-20 transaction
+    /// messages. The pre-fix decoder used `read_map_header()?.unwrap_or(0)`
+    /// in `decode_alonzo_aux_data_map` and `decode_metadata_map`, which
+    /// silently returned 0 on indef-length, leaving the `0xff` break
+    /// byte for the next decoder to misinterpret as a CBOR header.
+    /// This made the chunk-replay path bomb at preview slot ~5.94M
+    /// with `array header: unexpected type u8`.
+    ///
+    /// Fixture: real on-disk Babbage block #284393 at preview slot
+    /// 5940834 (chunk 01375 entry 38), captured 2026-05-25 from the
+    /// Mithril preview snapshot at immutable file 26162. Block size
+    /// 28997 bytes; contains 21 transactions, several of which carry
+    /// CIP-20 "msg" metadata at label 674 with emoji+joke payloads
+    /// encoded using indef-length CBOR maps.
+    /// Regression for #673 (Bug A): cn 11.0.1 emits PlutusData `big_uint`
+    /// / `big_nint` mantissas as INDEFINITE-length byte strings on
+    /// preview / preprod, per the CBOR `bounded_bytes` spec which
+    /// explicitly permits indef chunks (cborg `decodeTerm` handles
+    /// `TypeBytesIndef`). The pre-fix `read_bytes()` call for the
+    /// bignum mantissa rejected indef bytes with
+    /// "bytes: unexpected type indefinite bytes". This blocked the
+    /// from-genesis preview replay at slot 17,764,789 with a cascade
+    /// of "Block does not connect to tip" failures.
+    ///
+    /// Fixture: real on-disk Babbage block #783580 at preview slot
+    /// 17,764,772 (chunk 04112 entry 40). Block size 16577 bytes;
+    /// contains a Plutus tx with embedded PlutusData containing a
+    /// bignum encoded as `tag(2) 0x5f ... 0xff`.
+    #[test]
+    fn decode_babbage_block_with_indefinite_bignum_bytes_roundtrips() {
+        let cbor =
+            include_bytes!("../../tests/fixtures/babbage_indef_bignum_bytes_block_17764772.cbor");
+        let block = decode_block(cbor, 4320, false)
+            .expect("real Babbage block with indef bignum bytes must decode (full mode)");
+        assert_eq!(block.slot().0, 17764772);
+        assert_eq!(block.era, dugite_primitives::era::Era::Babbage);
+
+        let block_min = decode_block(cbor, 4320, true)
+            .expect("real Babbage block with indef bignum bytes must decode (minimal mode)");
+        assert_eq!(block_min.slot().0, 17764772);
+        assert_eq!(block.transactions.len(), block_min.transactions.len());
+    }
+
+    #[test]
+    fn decode_babbage_block_with_indefinite_aux_data_map_roundtrips() {
+        let cbor = include_bytes!("../../tests/fixtures/babbage_indef_aux_data_block_5940834.cbor");
+
+        // Preview Byron epoch length = 4320 slots.
+        let block = decode_block(cbor, 4320, false)
+            .expect("real Babbage block with indef aux_data_set must decode (full mode)");
+        assert_eq!(block.slot().0, 5940834);
+        assert_eq!(block.era, dugite_primitives::era::Era::Babbage);
+
+        let block_min = decode_block(cbor, 4320, true)
+            .expect("real Babbage block with indef aux_data_set must decode (minimal mode)");
+        assert_eq!(block_min.slot().0, 5940834);
+        assert_eq!(block_min.era, dugite_primitives::era::Era::Babbage);
+        // The two decode modes must produce the same transaction count.
+        assert_eq!(block.transactions.len(), block_min.transactions.len());
+    }
 }

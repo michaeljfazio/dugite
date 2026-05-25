@@ -255,9 +255,9 @@ fn decode_babbage_header_inner(r: &mut Reader<'_>) -> Result<BlockHeader, Serial
     // 2: prev_hash
     let prev_hash = read_optional_hash32(r)?;
     // 3: issuer_vkey (32 bytes)
-    let issuer_vkey = r.read_bytes()?.to_vec();
+    let issuer_vkey = r.read_bytes_owned()?;
     // 4: vrf_vkey (32 bytes)
-    let vrf_vkey = r.read_bytes()?.to_vec();
+    let vrf_vkey = r.read_bytes_owned()?;
     // 5: vrf_result = [output_bytes(64), proof_bytes(80)]
     //    Babbage has a SINGLE vrf_result (no separate nonce/leader split).
     let (vrf_output, vrf_proof) = read_vrf_result(r)?;
@@ -271,7 +271,7 @@ fn decode_babbage_header_inner(r: &mut Reader<'_>) -> Result<BlockHeader, Serial
     let (protocol_major, protocol_minor) = read_protocol_version(r)?;
 
     // KES signature (second element of outer array)
-    let kes_signature = r.read_bytes()?.to_vec();
+    let kes_signature = r.read_bytes_owned()?;
 
     Ok(BlockHeader {
         header_hash: Hash32::ZERO,
@@ -330,8 +330,8 @@ fn read_vrf_result(r: &mut Reader<'_>) -> Result<(Vec<u8>, Vec<u8>), Serializati
             "babbage vrf_result: expected array(2), got {arr_len:?}"
         )));
     }
-    let output = r.read_bytes()?.to_vec();
-    let proof = r.read_bytes()?.to_vec();
+    let output = r.read_bytes_owned()?;
+    let proof = r.read_bytes_owned()?;
     Ok((output, proof))
 }
 
@@ -345,10 +345,10 @@ fn read_operational_cert(
             "babbage operational_cert: expected array(4), got {arr_len:?}"
         )));
     }
-    let hot_vkey = r.read_bytes()?.to_vec();
+    let hot_vkey = r.read_bytes_owned()?;
     let seq_number = r.read_uint()?;
     let kes_period = r.read_uint()?;
-    let sigma = r.read_bytes()?.to_vec();
+    let sigma = r.read_bytes_owned()?;
     Ok((hot_vkey, seq_number, kes_period, sigma))
 }
 
@@ -440,10 +440,8 @@ fn decode_babbage_tx_body(r: &mut Reader<'_>) -> Result<TransactionBody, Seriali
             5 => {
                 // withdrawals: { reward_account_bytes => coin }
                 // Map may be definite or indefinite length.
-                let entries = r.read_map(
-                    |r| Ok(r.read_bytes()?.to_vec()),
-                    |r| Ok(Lovelace(r.read_uint()?)),
-                )?;
+                let entries =
+                    r.read_map(|r| r.read_bytes_owned(), |r| Ok(Lovelace(r.read_uint()?)))?;
                 for (account, coin) in entries {
                     withdrawals.insert(account, coin);
                 }
@@ -566,7 +564,7 @@ fn read_babbage_mint_map(
         |r| {
             let asset_entries = r.read_map(
                 |r| {
-                    let name_bytes = r.read_bytes()?.to_vec();
+                    let name_bytes = r.read_bytes_owned()?;
                     AssetName::new(name_bytes).map_err(|_| {
                         SerializationError::CborDecode("mint: asset name too long".into())
                     })
@@ -626,7 +624,7 @@ fn read_babbage_legacy_output(r: &mut Reader<'_>) -> Result<TransactionOutput, S
         }
     };
 
-    let addr_bytes = r.read_bytes()?.to_vec();
+    let addr_bytes = r.read_bytes_owned()?;
     let address = Address::from_bytes(&addr_bytes)
         .map_err(|e| SerializationError::InvalidData(format!("babbage output address: {e}")))?;
 
@@ -688,7 +686,7 @@ fn read_babbage_map_output(r: &mut Reader<'_>) -> Result<TransactionOutput, Seri
         let key = r.read_uint()?;
         match key {
             0 => {
-                let addr_bytes = r.read_bytes()?.to_vec();
+                let addr_bytes = r.read_bytes_owned()?;
                 address = Some(Address::from_bytes(&addr_bytes).map_err(|e| {
                     SerializationError::InvalidData(format!("babbage map output address: {e}"))
                 })?);
@@ -789,15 +787,15 @@ fn read_script_ref(r: &mut Reader<'_>) -> Result<ScriptRef, SerializationError> 
             Ok(ScriptRef::NativeScript(ns))
         }
         1 => {
-            let script_bytes = inner_r.read_bytes()?.to_vec();
+            let script_bytes = inner_r.read_bytes_owned()?;
             Ok(ScriptRef::PlutusV1(script_bytes))
         }
         2 => {
-            let script_bytes = inner_r.read_bytes()?.to_vec();
+            let script_bytes = inner_r.read_bytes_owned()?;
             Ok(ScriptRef::PlutusV2(script_bytes))
         }
         3 => {
-            let script_bytes = inner_r.read_bytes()?.to_vec();
+            let script_bytes = inner_r.read_bytes_owned()?;
             Ok(ScriptRef::PlutusV3(script_bytes))
         }
         other => Err(SerializationError::CborDecode(format!(
@@ -856,8 +854,8 @@ fn decode_babbage_witness_set(
                             "vkeywitness: expected array(2)".into(),
                         ));
                     }
-                    let vkey = r.read_bytes()?.to_vec();
-                    let signature = r.read_bytes()?.to_vec();
+                    let vkey = r.read_bytes_owned()?;
+                    let signature = r.read_bytes_owned()?;
                     Ok(VKeyWitness { vkey, signature })
                 })?;
             }
@@ -873,10 +871,10 @@ fn decode_babbage_witness_set(
                             "bootstrap_witness: expected array(4)".into(),
                         ));
                     }
-                    let vkey = r.read_bytes()?.to_vec();
-                    let sig = r.read_bytes()?.to_vec();
-                    let chain_code = r.read_bytes()?.to_vec();
-                    let attrs = r.read_bytes()?.to_vec();
+                    let vkey = r.read_bytes_owned()?;
+                    let sig = r.read_bytes_owned()?;
+                    let chain_code = r.read_bytes_owned()?;
+                    let attrs = r.read_bytes_owned()?;
                     Ok(BootstrapWitness {
                         vkey,
                         signature: sig,
@@ -886,7 +884,7 @@ fn decode_babbage_witness_set(
                 })?;
             }
             3 => {
-                plutus_v1_scripts = r.read_array(|r| Ok(r.read_bytes()?.to_vec()))?;
+                plutus_v1_scripts = r.read_array(|r| r.read_bytes_owned())?;
             }
             4 => {
                 let pd_start = r.position();
@@ -902,7 +900,7 @@ fn decode_babbage_witness_set(
             }
             6 => {
                 // plutus_v2_scripts (Babbage+)
-                plutus_v2_scripts = r.read_array(|r| Ok(r.read_bytes()?.to_vec()))?;
+                plutus_v2_scripts = r.read_array(|r| r.read_bytes_owned())?;
             }
             _ => {
                 r.skip()?;

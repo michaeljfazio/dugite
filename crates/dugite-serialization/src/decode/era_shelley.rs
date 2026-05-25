@@ -296,9 +296,9 @@ fn decode_shelley_header_inner(r: &mut Reader<'_>) -> Result<BlockHeader, Serial
     // 2: prev_hash (32-byte bytestring or null)
     let prev_hash = read_optional_hash32(r)?;
     // 3: issuer_vkey (32 bytes)
-    let issuer_vkey = r.read_bytes()?.to_vec();
+    let issuer_vkey = r.read_bytes_owned()?;
     // 4: vrf_vkey (32 bytes)
-    let vrf_vkey = r.read_bytes()?.to_vec();
+    let vrf_vkey = r.read_bytes_owned()?;
     // 5: nonce_vrf_cert = [output_bytes(64), proof_bytes(80)]
     let (nonce_output, nonce_proof) = read_vrf_cert(r)?;
     // 6: leader_vrf_cert = [output_bytes(64), proof_bytes(80)]
@@ -308,20 +308,20 @@ fn decode_shelley_header_inner(r: &mut Reader<'_>) -> Result<BlockHeader, Serial
     // 8: block_body_hash (32 bytes)
     let body_hash = read_hash32(r)?;
     // 9: op_cert_hot_vkey (32 bytes)
-    let op_hot_vkey = r.read_bytes()?.to_vec();
+    let op_hot_vkey = r.read_bytes_owned()?;
     // 10: op_cert_sequence_number
     let op_seq_number = r.read_uint()?;
     // 11: op_cert_kes_period
     let op_kes_period = r.read_uint()?;
     // 12: op_cert_sigma (64 bytes)
-    let op_sigma = r.read_bytes()?.to_vec();
+    let op_sigma = r.read_bytes_owned()?;
     // 13: protocol_major
     let protocol_major = r.read_uint()?;
     // 14: protocol_minor
     let protocol_minor = r.read_uint()?;
 
     // KES signature (second element of outer array)
-    let kes_signature = r.read_bytes()?.to_vec();
+    let kes_signature = r.read_bytes_owned()?;
 
     // header_hash will be filled in by the caller after computing blake2b_256(raw)
     Ok(BlockHeader {
@@ -374,8 +374,8 @@ fn read_vrf_cert(r: &mut Reader<'_>) -> Result<(Vec<u8>, Vec<u8>), Serialization
             "vrf_cert: expected array(2), got {arr_len:?}"
         )));
     }
-    let output = r.read_bytes()?.to_vec();
-    let proof = r.read_bytes()?.to_vec();
+    let output = r.read_bytes_owned()?;
+    let proof = r.read_bytes_owned()?;
     Ok((output, proof))
 }
 
@@ -530,7 +530,7 @@ fn read_shelley_tx_output(r: &mut Reader<'_>) -> Result<TransactionOutput, Seria
     let n = arr_len.unwrap();
 
     // Address bytes
-    let addr_bytes = r.read_bytes()?.to_vec();
+    let addr_bytes = r.read_bytes_owned()?;
     let address = Address::from_bytes(&addr_bytes)
         .map_err(|e| SerializationError::InvalidData(format!("shelley output address: {e}")))?;
 
@@ -606,7 +606,7 @@ fn read_multiasset_map_u64(
         let an = r.read_map_header()?;
         let asset_count = an.unwrap_or(0) as usize;
         for _ in 0..asset_count {
-            let name_bytes = r.read_bytes()?.to_vec();
+            let name_bytes = r.read_bytes_owned()?;
             let qty = r.read_uint()?;
             let asset_name = AssetName::new(name_bytes).map_err(|_| {
                 SerializationError::CborDecode("multiasset: asset name too long".into())
@@ -624,7 +624,7 @@ fn read_withdrawals(r: &mut Reader<'_>) -> Result<BTreeMap<Vec<u8>, Lovelace>, S
     let n = r.read_map_header()?;
     let count = n.unwrap_or(0) as usize;
     for _ in 0..count {
-        let account = r.read_bytes()?.to_vec();
+        let account = r.read_bytes_owned()?;
         let coin = Lovelace(r.read_uint()?);
         result.insert(account, coin);
     }
@@ -760,14 +760,25 @@ fn read_pool_params(r: &mut Reader<'_>) -> Result<PoolParams, SerializationError
     let cost = read_lovelace(r)?;
     // margin: unit_interval = tag(30)[numerator, denominator]
     let margin = r.read_rational()?;
-    let reward_account = r.read_bytes()?.to_vec();
+    let reward_account = r.read_bytes_owned()?;
     // pool_owners: set of addr_keyhash (28 bytes each)
     let pool_owners: Vec<Hash28> = r.read_set(|r| read_hash28_cert(r))?;
-    // relays: array of relay structs
-    let relays_count = r.read_array_header()?.unwrap_or(0) as usize;
-    for _ in 0..relays_count {
+    // relays: array of relay structs (definite OR indefinite-length).
+    //
+    // #673: cn 11.0.1 emits indefinite-length relay arrays on preview /
+    // preprod for some pool registration certificates. The pre-fix
+    // `read_array_header()?.unwrap_or(0)` returned 0 for indef-length,
+    // silently leaving every relay element in the stream; the next
+    // decoder (read_pool_metadata) then read the first relay
+    // `single_host_addr = (0, port, ipv4, ipv6)` (array(4)) and failed
+    // with "pool_metadata: expected array(2) or null, got Some(4)".
+    //
+    // Mirrors Haskell `instance DecCBOR (StrictSeq StakePoolRelay)` →
+    // `decodeSeq decCBOR` → `decodeListLenOrIndef` (handles both).
+    r.for_each_array_item(|r| {
         r.skip()?; // TODO(M4a-2): decode relay structs
-    }
+        Ok(())
+    })?;
     // pool_metadata: null or [url, hash]
     let pool_metadata = read_pool_metadata(r)?;
 
@@ -903,8 +914,8 @@ fn decode_shelley_witness_set(
                             "vkeywitness: expected array(2)".into(),
                         ));
                     }
-                    let vkey = r.read_bytes()?.to_vec();
-                    let signature = r.read_bytes()?.to_vec();
+                    let vkey = r.read_bytes_owned()?;
+                    let signature = r.read_bytes_owned()?;
                     Ok(VKeyWitness { vkey, signature })
                 })?;
             }
@@ -921,10 +932,10 @@ fn decode_shelley_witness_set(
                             "bootstrap_witness: expected array(4)".into(),
                         ));
                     }
-                    let vkey = r.read_bytes()?.to_vec();
-                    let sig = r.read_bytes()?.to_vec();
-                    let chain_code = r.read_bytes()?.to_vec();
-                    let attrs = r.read_bytes()?.to_vec();
+                    let vkey = r.read_bytes_owned()?;
+                    let sig = r.read_bytes_owned()?;
+                    let chain_code = r.read_bytes_owned()?;
+                    let attrs = r.read_bytes_owned()?;
                     Ok(BootstrapWitness {
                         vkey,
                         signature: sig,
@@ -1076,14 +1087,16 @@ fn decode_auxiliary_data(r: &mut Reader<'_>) -> Result<AuxiliaryData, Serializat
 fn decode_metadata_map(
     r: &mut Reader<'_>,
 ) -> Result<BTreeMap<u64, TransactionMetadatum>, SerializationError> {
+    // Handle both definite- and indefinite-length CBOR maps. cn 11.0.1
+    // emits indef-length metadata maps on preview / preprod for some
+    // CIP-20 message transactions — see #673.
     let mut result = BTreeMap::new();
-    let n = r.read_map_header()?;
-    let count = n.unwrap_or(0) as usize;
-    for _ in 0..count {
+    r.for_each_map_entry(|r| {
         let label = r.read_uint()?;
         let value = read_metadatum(r)?;
         result.insert(label, value);
-    }
+        Ok(())
+    })?;
     Ok(result)
 }
 
@@ -1107,7 +1120,7 @@ fn read_metadatum(r: &mut Reader<'_>) -> Result<TransactionMetadatum, Serializat
             Ok(TransactionMetadatum::Int(v))
         }
         Type::Bytes => {
-            let bytes = r.read_bytes()?.to_vec();
+            let bytes = r.read_bytes_owned()?;
             Ok(TransactionMetadatum::Bytes(bytes))
         }
         Type::String => {
