@@ -796,8 +796,11 @@ impl LedgerState {
         // the on-the-wire snapshot pool_params then carry empty owners which
         // fails dugite's pledge check at `compute_reward_update`, silently
         // dropping 99.9% of rewards.  Issue #668.
-        let mark_snapshot =
-            convert_stake_snapshot(&hs.new_epoch_state.snapshots.mark, hs.epoch, &pool_params_map);
+        let mark_snapshot = convert_stake_snapshot(
+            &hs.new_epoch_state.snapshots.mark,
+            hs.epoch,
+            &pool_params_map,
+        );
         let set_snapshot = convert_stake_snapshot(
             &hs.new_epoch_state.snapshots.set,
             EpochNo(hs.epoch.0.saturating_sub(1)),

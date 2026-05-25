@@ -16603,7 +16603,11 @@ fn test_from_haskell_snapshot_backfills_snapshot_pool_owners_issue_668() {
             vec![owner_a, owner_b],
             "{name}: owners must be backfilled from live psStakePools after Mithril ancillary import"
         );
-        assert_eq!(snap_reg.relays.len(), 1, "{name}: relays must be backfilled");
+        assert_eq!(
+            snap_reg.relays.len(),
+            1,
+            "{name}: relays must be backfilled"
+        );
         assert!(
             snap_reg.metadata_url.is_some(),
             "{name}: metadata must be backfilled"
