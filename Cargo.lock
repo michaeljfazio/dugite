@@ -1603,6 +1603,7 @@ dependencies = [
  "minicbor 0.26.5",
  "mithril-client",
  "num-bigint",
+ "parking_lot",
  "proptest",
  "rand 0.9.4",
  "rayon",
