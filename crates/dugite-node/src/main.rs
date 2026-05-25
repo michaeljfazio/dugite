@@ -59,6 +59,11 @@ struct VerifyLedgerSnapshotArgs {
     #[arg(long)]
     right: PathBuf,
 
+    /// Print side-by-side scalar overview before reporting diffs.
+    /// Useful for triage when the diff fields require context.
+    #[arg(long)]
+    verbose: bool,
+
     #[command(flatten)]
     log: LogArgs,
 }
@@ -507,6 +512,9 @@ async fn run_verify_ledger_snapshot(args: VerifyLedgerSnapshotArgs) -> Result<()
         right = %args.right.display(),
         "Comparing ledger snapshots"
     );
+    if args.verbose {
+        verify_snapshot::print_scalar_overview(&args.left, &args.right)?;
+    }
     let report = verify_snapshot::verify_snapshots(&args.left, &args.right)?;
     let n = report.print();
     if n > 0 {

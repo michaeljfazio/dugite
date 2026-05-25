@@ -133,7 +133,16 @@ pub struct LedgerStateSnapshot {
     /// Pointer-addressed UTxO stake: pointer -> coin amount.
     pub ptr_stake: HashMap<dugite_primitives::credentials::Pointer, u64>,
     /// Whether pointer-addressed UTxO stake has been excluded from stake_distribution.
-    #[serde(skip)]
+    ///
+    /// Persisted across snapshot reloads because the value is set ONCE at
+    /// the Babbage→Conway era transition (`ConwayRules::on_era_transition`)
+    /// and gates the live `stake_routing` decision for every subsequent
+    /// block apply. Issue #670: previously this field carried
+    /// `#[serde(skip)]` and silently reverted to `false` on every snapshot
+    /// reload, which mis-routed pointer-addressed UTxO stake into
+    /// `epochs.ptr_stake` (Haskell `ConwayInstantStake` carries no
+    /// `sisPtrStake` field) — a divergence on the verify-ledger-snapshot
+    /// gate against the ancillary import.
     pub ptr_stake_excluded: bool,
     /// Pending reward update (drained at the next epoch boundary).
     pub pending_reward_update: Option<PendingRewardUpdate>,

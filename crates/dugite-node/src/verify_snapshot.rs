@@ -67,6 +67,144 @@ impl DiffReport {
     }
 }
 
+/// Print a side-by-side overview of the two snapshots' scalar fields and
+/// collection sizes. Useful for triage when the diff report alone lacks
+/// the context to interpret what is happening (e.g. tip alignment,
+/// state-coverage counts, governance/snapshot rollover position).
+pub fn print_scalar_overview(left_path: &Path, right_path: &Path) -> Result<()> {
+    let l = LedgerState::load_snapshot(&resolve_snapshot_path(left_path)?)
+        .with_context(|| format!("loading left {}", left_path.display()))?;
+    let r = LedgerState::load_snapshot(&resolve_snapshot_path(right_path)?)
+        .with_context(|| format!("loading right {}", right_path.display()))?;
+    let row = |k: &str, lv: String, rv: String| {
+        let marker = if lv == rv { "✓" } else { "≠" };
+        println!("  {marker} {k:30} L={lv:>30} R={rv:>30}");
+    };
+    println!("\n=== snapshot scalar overview ===");
+    row("era", format!("{:?}", l.era), format!("{:?}", r.era));
+    row("epoch", l.epoch.0.to_string(), r.epoch.0.to_string());
+    row(
+        "tip_slot",
+        l.tip.point.slot().map(|s| s.0.to_string()).unwrap_or_default(),
+        r.tip.point.slot().map(|s| s.0.to_string()).unwrap_or_default(),
+    );
+    row(
+        "tip_block",
+        l.tip.block_number.0.to_string(),
+        r.tip.block_number.0.to_string(),
+    );
+    row(
+        "tip_hash",
+        l.tip.point.hash().map(|h| h.to_hex()).unwrap_or_default(),
+        r.tip.point.hash().map(|h| h.to_hex()).unwrap_or_default(),
+    );
+    row(
+        "treasury",
+        l.epochs.treasury.0.to_string(),
+        r.epochs.treasury.0.to_string(),
+    );
+    row(
+        "reserves",
+        l.epochs.reserves.0.to_string(),
+        r.epochs.reserves.0.to_string(),
+    );
+    row(
+        "epoch_fees",
+        l.utxo.epoch_fees.0.to_string(),
+        r.utxo.epoch_fees.0.to_string(),
+    );
+    row(
+        "pending_donations",
+        l.utxo.pending_donations.0.to_string(),
+        r.utxo.pending_donations.0.to_string(),
+    );
+    row(
+        "pool_params.len",
+        l.certs.pool_params.len().to_string(),
+        r.certs.pool_params.len().to_string(),
+    );
+    row(
+        "dreps.len",
+        l.gov.governance.dreps.len().to_string(),
+        r.gov.governance.dreps.len().to_string(),
+    );
+    row(
+        "proposals.len",
+        l.gov.governance.proposals.len().to_string(),
+        r.gov.governance.proposals.len().to_string(),
+    );
+    row(
+        "delegations.len",
+        l.certs.delegations.len().to_string(),
+        r.certs.delegations.len().to_string(),
+    );
+    row(
+        "reward_accounts.len",
+        l.certs.reward_accounts.len().to_string(),
+        r.certs.reward_accounts.len().to_string(),
+    );
+    row(
+        "stake_map.len",
+        l.certs.stake_distribution.stake_map.len().to_string(),
+        r.certs.stake_distribution.stake_map.len().to_string(),
+    );
+    row(
+        "pointer_map.len",
+        l.certs.pointer_map.len().to_string(),
+        r.certs.pointer_map.len().to_string(),
+    );
+    row(
+        "ptr_stake.len",
+        l.epochs.ptr_stake.len().to_string(),
+        r.epochs.ptr_stake.len().to_string(),
+    );
+    row(
+        "ptr_stake_excluded",
+        l.epochs.ptr_stake_excluded.to_string(),
+        r.epochs.ptr_stake_excluded.to_string(),
+    );
+    row(
+        "opcert_counters.len",
+        l.consensus.opcert_counters.len().to_string(),
+        r.consensus.opcert_counters.len().to_string(),
+    );
+    row(
+        "epoch_blocks_by_pool.len",
+        l.consensus.epoch_blocks_by_pool.len().to_string(),
+        r.consensus.epoch_blocks_by_pool.len().to_string(),
+    );
+    row(
+        "epoch_block_count",
+        l.consensus.epoch_block_count.to_string(),
+        r.consensus.epoch_block_count.to_string(),
+    );
+    row(
+        "pv",
+        format!(
+            "{}.{}",
+            l.epochs.protocol_params.protocol_version_major,
+            l.epochs.protocol_params.protocol_version_minor
+        ),
+        format!(
+            "{}.{}",
+            r.epochs.protocol_params.protocol_version_major,
+            r.epochs.protocol_params.protocol_version_minor
+        ),
+    );
+    row(
+        "prev_pv_major",
+        l.epochs.prev_protocol_version_major.to_string(),
+        r.epochs.prev_protocol_version_major.to_string(),
+    );
+    row(
+        "utxo_set.len",
+        l.utxo.utxo_set.len().to_string(),
+        r.utxo.utxo_set.len().to_string(),
+    );
+    println!();
+    Ok(())
+}
+
 /// Load and compare two ledger snapshots at the given paths.
 ///
 /// Each `path` must point either to a `ledger-snapshot.bin` file or to a
