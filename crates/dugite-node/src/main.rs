@@ -227,6 +227,21 @@ struct RunArgs {
     #[arg(long)]
     validate_all_blocks: bool,
 
+    /// Issue #655 P2.b — skip apply-time `validate_header_full` for
+    /// headers that already passed eager per-peer validation against the
+    /// same ledger view's epoch. Default OFF; operators turn it on only
+    /// after Phase 1 has been soaked for 7+ days on preview AND preprod
+    /// with no unexpected disconnect storms (the original #655
+    /// acceptance criteria).
+    ///
+    /// SAFETY: enabling this skips the apply-time re-check that's been
+    /// the source-of-truth for header validity since v1.0. The eager
+    /// pass already covered the same crypto against the same snapshot
+    /// pointer, but any bug in the eager path becomes silently
+    /// load-bearing. Leave OFF until soak passes.
+    #[arg(long, default_value = "false")]
+    skip_eagerly_validated_header_crypto: bool,
+
     /// Path to the Dijkstra-era genesis JSON file.
     ///
     /// Overrides the JSON config field `DijkstraGenesisFile`. The file is
@@ -1498,6 +1513,7 @@ async fn run_node(args: RunArgs, log_handle: Option<logging::LogHandle>) -> Resu
         storage_config,
         consensus_mode,
         validate_all_blocks: args.validate_all_blocks,
+        skip_eagerly_validated_header_crypto: args.skip_eagerly_validated_header_crypto,
         log_handle,
     })?;
 

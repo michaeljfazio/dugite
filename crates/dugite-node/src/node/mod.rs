@@ -311,6 +311,14 @@ pub struct NodeArgs {
     pub consensus_mode: String,
     /// Force ValidateAll mode on every block (paranoid/auditing mode)
     pub validate_all_blocks: bool,
+    /// Issue #655 P2.b — skip apply-time `validate_header_full` for
+    /// headers that already passed eager per-peer validation against
+    /// the same ledger view's epoch. Default OFF until Phase 1 has
+    /// been soaked for 7+ days on preview AND preprod with no
+    /// unexpected disconnect storms (the original #655 acceptance
+    /// criteria). When OFF, body apply continues to fully re-validate
+    /// every header — defense in depth, identical to today.
+    pub skip_eagerly_validated_header_crypto: bool,
     /// Handle to the live tracing subscriber.  When present, the SIGHUP handler
     /// re-reads the node config's `LogDirective` and applies it via
     /// `LogHandle::reload`, enabling per-subsystem trace verbosity changes
@@ -339,6 +347,20 @@ pub struct Node {
     /// are per-peer chainsync tasks parking on forecast-horizon exhaustion.
     /// Payload is `tip.point.slot()` flattened to `u64` (origin → 0).
     pub(crate) ledger_tip_slot_tx: tokio::sync::watch::Sender<u64>,
+    /// Eagerly-validated header hashes (issue #655 P2.b): block hash →
+    /// epoch at which eager validation succeeded. Populated by the
+    /// chainsync receive task on a successful pass through
+    /// `eager_validate_header`. Consumed by the apply-time validator at
+    /// `process_forward_blocks` — when the
+    /// `skip_eagerly_validated_header_crypto` config flag is enabled
+    /// AND `current_epoch == recorded_epoch`, the apply-time
+    /// `validate_header_full` re-check is skipped (the eager pass
+    /// already covered the same crypto against the same snapshot
+    /// pointer). Flag defaults OFF — operators turn it on after
+    /// Phase 1 has soaked clean. Entries are removed on hit AND on
+    /// stale-epoch skip to keep the map bounded.
+    pub(crate) eagerly_validated_headers:
+        Arc<parking_lot::Mutex<HashMap<dugite_primitives::hash::Hash32, u64>>>,
     /// Volatile delta window for O(1) rollback.
     ///
     /// Kept in sync with `ledger_state`: after each `apply_block_with_delta`,
@@ -413,6 +435,8 @@ pub struct Node {
     pub(crate) consensus_mode: String,
     /// Force full Phase-2 Plutus validation on all blocks
     pub(crate) validate_all_blocks: bool,
+    /// Issue #655 P2.b — see `NodeConfig::skip_eagerly_validated_header_crypto`.
+    pub(crate) skip_eagerly_validated_header_crypto: bool,
     /// Watch receiver for current disk space level, updated by disk monitor
     pub(crate) disk_space_rx: watch::Receiver<crate::disk_monitor::DiskSpaceLevel>,
     /// GSM event sender — produces events for the GSM actor.
@@ -1305,6 +1329,8 @@ impl Node {
         // when this changes.
         let initial_tip_slot = ledger.tip.point.slot().map(|s| s.0).unwrap_or(0);
         let (ledger_tip_slot_tx, _initial_rx) = tokio::sync::watch::channel(initial_tip_slot);
+        // Issue #655 P2.b — eager-validated header bookkeeping.
+        let eagerly_validated_headers = Arc::new(parking_lot::Mutex::new(HashMap::new()));
 
         let ledger_state = Arc::new(RwLock::new(ledger));
 
@@ -1732,6 +1758,7 @@ impl Node {
             ledger_state,
             ledger_view,
             ledger_tip_slot_tx,
+            eagerly_validated_headers,
             ledger_seq,
             consensus,
             mempool,
@@ -1779,6 +1806,7 @@ impl Node {
             live_epoch_transitions: 0,
             consensus_mode: args.consensus_mode,
             validate_all_blocks: args.validate_all_blocks,
+            skip_eagerly_validated_header_crypto: args.skip_eagerly_validated_header_crypto,
             disk_space_rx: watch::channel(crate::disk_monitor::DiskSpaceLevel::Ok).1,
             gsm_event_tx,
             gsm_snapshot_rx,
@@ -3275,6 +3303,8 @@ impl Node {
             // does not need to track Node.consensus.update_tip() because
             // validate_header_full uses its parameters, not `self.tip`.
             Arc::new(self.consensus.clone()),
+            // Issue #655 P2.b — shared apply-time bookkeeping map.
+            self.eagerly_validated_headers.clone(),
             self.byron_epoch_length,
             security_param,
             active_slots_coeff,

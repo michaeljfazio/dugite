@@ -884,6 +884,43 @@ impl Node {
                     .or_else(|| ls.tip.point.slot())
                     .unwrap_or(block.slot());
 
+                // Issue #655 P2.b — if this header was eagerly
+                // validated against the same epoch, AND the operator
+                // has enabled the flag, skip the apply-time re-check.
+                // The eager pass already covered the same crypto
+                // against the same snapshot pointer. Otherwise (default,
+                // and any stale-epoch entry), fall through to the
+                // authoritative re-check below.
+                // Issue #655 P2.b — apply-time skip decision.
+                let current_epoch = ls.epoch.0;
+                let recorded_epoch = if self.skip_eagerly_validated_header_crypto {
+                    // Only acquire the lock when the feature is on —
+                    // zero-cost when off.
+                    self.eagerly_validated_headers
+                        .lock()
+                        .get(block.hash())
+                        .copied()
+                } else {
+                    None
+                };
+                let (skip_for_eager, should_remove) = decide_skip_apply_header_crypto(
+                    self.skip_eagerly_validated_header_crypto,
+                    current_epoch,
+                    recorded_epoch,
+                );
+                if should_remove {
+                    self.eagerly_validated_headers.lock().remove(block.hash());
+                }
+                if skip_for_eager {
+                    tracing::trace!(
+                        slot = block.slot().0,
+                        epoch = current_epoch,
+                        "issue #655: skipping apply-time validate_header_full \
+                         (eager pass already validated against same epoch)"
+                    );
+                    continue;
+                }
+
                 if let Err(e) = self.consensus.validate_header_full(
                     &header_with_nonce,
                     current_slot_for_check,
@@ -2879,6 +2916,39 @@ fn extract_era_tag_from_wrapped_header(header_cbor: &[u8]) -> Option<u64> {
     dec.u64().ok()
 }
 
+/// Issue #655 P2.b — decide whether the apply-time
+/// `validate_header_full` re-check can be safely skipped because the
+/// header passed eager per-peer validation against the same epoch.
+///
+/// Inputs: feature flag, current epoch at apply time, optional
+/// `(hash, recorded_epoch)` entry the eager path inserted. Returns
+/// `(skip?, remove_from_map?)`:
+///
+/// - flag off → never skip, never remove (the map is irrelevant).
+/// - flag on, no entry → never skip, never remove (block didn't go
+///   through the eager path — Byron, pre-Conway, or eager skip).
+/// - flag on, entry at same epoch → SKIP and remove (eager pass
+///   already covered the same crypto against the same snapshot).
+/// - flag on, entry at stale epoch → DO NOT skip, but DO remove
+///   (snapshot pointer may have changed; re-validate, and cull the
+///   stale entry to bound memory).
+///
+/// Pure function so the truth table is independently testable.
+pub(crate) fn decide_skip_apply_header_crypto(
+    flag_enabled: bool,
+    current_epoch: u64,
+    recorded_epoch_for_hash: Option<u64>,
+) -> (bool, bool) {
+    if !flag_enabled {
+        return (false, false);
+    }
+    match recorded_epoch_for_hash {
+        Some(epoch) if epoch == current_epoch => (true, true),
+        Some(_stale) => (false, true),
+        None => (false, false),
+    }
+}
+
 /// Issue #654 P1.b — eager per-peer header validation hook.
 ///
 /// Called from the MsgRollForward integration site after slot extraction,
@@ -3438,6 +3508,13 @@ pub async fn chainsync_client_task(
     // see #652 C1). Read-only inside the task; the global Praos engine
     // is owned exclusively by the body-apply path on `Node`.
     consensus_seed: Arc<dugite_consensus::praos::OuroborosPraos>,
+    // Issue #655 P2.b — shared map of header hashes that passed eager
+    // validation, keyed by epoch at validation time. Apply path may
+    // skip the apply-time crypto re-check when the flag is enabled and
+    // the entry matches the current epoch. Inserted here on success.
+    eagerly_validated_headers: Arc<
+        parking_lot::Mutex<HashMap<dugite_primitives::hash::Hash32, u64>>,
+    >,
     byron_epoch_length: u64,
     // Ouroboros security parameter k (number of blocks before finality).
     // Mainnet: 2160, Preview: 432.  Rollbacks deeper than k blocks indicate
@@ -4002,7 +4079,28 @@ pub async fn chainsync_client_task(
                                 &view_arc,
                                 &mut entry.eager_opcert_counters,
                             ) {
-                                Ok(_skipped_or_passed) => {}
+                                Ok(true) => {
+                                    // Issue #655 P2.b — record this hash
+                                    // as eagerly validated at the view's
+                                    // current epoch. Apply path may
+                                    // consult the map when its flag is
+                                    // enabled. The view's epoch and the
+                                    // epoch used inside the eager call
+                                    // are the same: both load the same
+                                    // ArcSwap pointer.
+                                    let view_epoch = view_arc.epoch.0;
+                                    eagerly_validated_headers
+                                        .lock()
+                                        .insert(
+                                            dugite_primitives::hash::Hash32::from_bytes(hash),
+                                            view_epoch,
+                                        );
+                                }
+                                Ok(false) => {
+                                    // Deliberate skip (Byron, pre-Conway era, or
+                                    // malformed envelope). No bookkeeping entry —
+                                    // apply path will validate normally.
+                                }
                                 Err(e) => {
                                     return Err(anyhow::anyhow!(
                                         "ChainSync: {peer_addr} eager header validation failed at slot {slot}: {e}"
@@ -4640,6 +4738,55 @@ mod forecast_park_tests {
         let mut counters = HashMap::new();
         let result = eager_validate_header(&peer, &buf, 0, &consensus, &view, &mut counters);
         assert!(result.is_err(), "undecodable Conway header must Err");
+    }
+
+    #[test]
+    fn skip_decision_flag_off_never_skips_never_removes() {
+        assert_eq!(
+            decide_skip_apply_header_crypto(false, 10, Some(10)),
+            (false, false)
+        );
+        assert_eq!(
+            decide_skip_apply_header_crypto(false, 10, Some(9)),
+            (false, false)
+        );
+        assert_eq!(
+            decide_skip_apply_header_crypto(false, 10, None),
+            (false, false)
+        );
+    }
+
+    #[test]
+    fn skip_decision_flag_on_same_epoch_skips_and_removes() {
+        assert_eq!(
+            decide_skip_apply_header_crypto(true, 10, Some(10)),
+            (true, true)
+        );
+        assert_eq!(
+            decide_skip_apply_header_crypto(true, 0, Some(0)),
+            (true, true)
+        );
+    }
+
+    #[test]
+    fn skip_decision_flag_on_stale_epoch_revalidates_but_cleans_up() {
+        // Header was eagerly validated at epoch 9 but ledger has since
+        // transitioned to epoch 10 — snapshot pointer may differ, must
+        // re-validate. Still cull the stale map entry to bound memory.
+        assert_eq!(
+            decide_skip_apply_header_crypto(true, 10, Some(9)),
+            (false, true)
+        );
+    }
+
+    #[test]
+    fn skip_decision_flag_on_no_entry_revalidates() {
+        // Header never went through eager validation (Byron, pre-Conway,
+        // or eager validation returned Ok(false) for any other reason).
+        assert_eq!(
+            decide_skip_apply_header_crypto(true, 10, None),
+            (false, false)
+        );
     }
 
     /// Issue #654: Byron headers bypass the forecast check entirely

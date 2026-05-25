@@ -289,6 +289,14 @@ pub struct ConnectionLifecycleManager {
     /// `validate_header_full_with_counters` (clone-and-swap).
     consensus_seed: Arc<dugite_consensus::praos::OuroborosPraos>,
 
+    /// Issue #655 P2.b — shared map of header hashes that passed eager
+    /// validation, keyed by epoch at validation time. Inserted by the
+    /// chainsync receive task on a successful pass through
+    /// `eager_validate_header`; consumed by the apply-time validator
+    /// when `NodeConfig::skip_eagerly_validated_header_crypto` is on.
+    eagerly_validated_headers:
+        Arc<parking_lot::Mutex<HashMap<dugite_primitives::hash::Hash32, u64>>>,
+
     /// Byron epoch length in slots (needed for era-aware slot calculations).
     byron_epoch_length: u64,
 
@@ -442,6 +450,9 @@ impl ConnectionLifecycleManager {
         ledger_view: Arc<arc_swap::ArcSwap<super::ledger_view::LedgerView>>,
         ledger_tip_slot_tx: tokio::sync::watch::Sender<u64>,
         consensus_seed: Arc<dugite_consensus::praos::OuroborosPraos>,
+        eagerly_validated_headers: Arc<
+            parking_lot::Mutex<HashMap<dugite_primitives::hash::Hash32, u64>>,
+        >,
         byron_epoch_length: u64,
         security_param: u64,
         active_slots_coeff: f64,
@@ -469,6 +480,7 @@ impl ConnectionLifecycleManager {
             ledger_view,
             ledger_tip_slot_tx,
             consensus_seed,
+            eagerly_validated_headers,
             byron_epoch_length,
             security_param,
             active_slots_coeff,
@@ -1149,6 +1161,7 @@ impl ConnectionLifecycleManager {
         let ledger_view = self.ledger_view.clone();
         let ledger_tip_rx = self.ledger_tip_slot_tx.subscribe();
         let consensus_seed = self.consensus_seed.clone();
+        let eagerly_validated_headers = self.eagerly_validated_headers.clone();
         let byron_epoch_length = self.byron_epoch_length;
         let security_param = self.security_param;
         let active_slots_coeff = self.active_slots_coeff;
@@ -1169,6 +1182,7 @@ impl ConnectionLifecycleManager {
                     ledger_view,
                     ledger_tip_rx,
                     consensus_seed,
+                    eagerly_validated_headers,
                     byron_epoch_length,
                     security_param,
                     active_slots_coeff,
@@ -2067,6 +2081,7 @@ impl ConnectionLifecycleManager {
             ledger_view,
             ledger_tip_slot_tx,
             Arc::new(dugite_consensus::praos::OuroborosPraos::new(10)),
+            Arc::new(parking_lot::Mutex::new(HashMap::new())),
             432_000,
             2160,
             0.05,
@@ -2132,6 +2147,7 @@ impl ConnectionLifecycleManager {
             ledger_view,
             ledger_tip_slot_tx,
             Arc::new(dugite_consensus::praos::OuroborosPraos::new(10)),
+            Arc::new(parking_lot::Mutex::new(HashMap::new())),
             432_000,
             2160,
             0.05,
