@@ -21,73 +21,73 @@ use tonic::{Request, Response, Status};
 use super::ServiceState;
 use crate::context::LedgerContext;
 use crate::map::block::block_ref_from_tip;
+use crate::map::patterns::matches_utxo_predicate;
 use crate::map::pparams::pparams_to_proto;
 use crate::map::tx::tx_output_to_proto;
 use crate::proto::{v1alpha, v1beta};
-
-const UNIMPL: &str = "M2.B — full mapping required";
 
 /// Hard cap on UTxOs returned per SearchUtxos request — protects the
 /// node from runaway scans when an unindexed pattern matches a large
 /// address set.
 const SEARCH_UTXOS_HARD_CAP: usize = 5_000;
 
-/// Resolved SearchUtxos predicate — exactly one of these shapes today.
+/// Index-friendly seed for a `SearchUtxos` predicate. We pre-filter
+/// using whichever leaf selector we can find inside the predicate
+/// (preferring the most selective: exact_address → payment_part →
+/// asset). The full predicate is then re-applied as a post-filter so
+/// composite / `not` / `delegation_part` patterns still produce
+/// byte-exact-spec results.
 #[derive(Debug)]
-enum SearchUtxoSelector {
-    /// `match.cardano.address.exact_address = <bytes>`
+enum IndexSeed {
+    /// Walk the entire in-memory UTxO set with the matcher.
+    FullScan,
     ExactAddress(Vec<u8>),
-    /// `match.cardano.address.payment_part = <bytes>` (28-byte hash)
     PaymentCredential(Vec<u8>),
-    /// `match.cardano.asset.{policy_id, asset_name?}`
     Asset {
         policy_id: Vec<u8>,
         asset_name: Option<Vec<u8>>,
     },
 }
 
-/// Resolve a v1beta SearchUtxos predicate into one of the supported
-/// selector shapes. Anything more complex (composite predicates,
-/// delegation_part, mixed address+asset patterns) yields `None`; the
-/// service surfaces UNIMPLEMENTED with a descriptive message rather
-/// than returning silently truncated results.
-fn resolve_predicate(p: Option<&v1beta::query::UtxoPredicate>) -> Option<SearchUtxoSelector> {
-    let p = p?;
-    if !p.not.is_empty() || !p.all_of.is_empty() || !p.any_of.is_empty() {
-        return None;
+/// Walk `predicate` to find the first selector we can drive an index
+/// off — `exact_address` first, then `payment_part`, then `asset`. We
+/// only descend into `match` and `all_of` (predicates that require
+/// every sub-pattern to hold). `any_of` / `not` skip seeding.
+fn pick_index_seed(p: Option<&v1beta::query::UtxoPredicate>) -> IndexSeed {
+    let Some(p) = p else {
+        return IndexSeed::FullScan;
+    };
+    if let Some(seed) = seed_from_pattern(p.r#match.as_ref()) {
+        return seed;
     }
-    let any = p.r#match.as_ref()?;
-    let utxo_pattern = any.utxo_pattern.as_ref()?;
-    let v1beta::query::any_utxo_pattern::UtxoPattern::Cardano(out_pattern) = utxo_pattern;
-
-    // Combined address + asset patterns aren't supported.
-    let has_addr = out_pattern.address.is_some();
-    let has_asset = out_pattern.asset.is_some();
-    if has_addr && has_asset {
-        return None;
-    }
-
-    if let Some(addr) = out_pattern.address.as_ref() {
-        // exact_address takes priority; payment_part falls through if
-        // not set; delegation_part isn't supported.
-        if addr.delegation_part.is_some() {
-            return None;
+    for sub in &p.all_of {
+        let seed = pick_index_seed(Some(sub));
+        if !matches!(seed, IndexSeed::FullScan) {
+            return seed;
         }
+    }
+    IndexSeed::FullScan
+}
+
+fn seed_from_pattern(any: Option<&v1beta::query::AnyUtxoPattern>) -> Option<IndexSeed> {
+    let any = any?;
+    let v1beta::query::any_utxo_pattern::UtxoPattern::Cardano(out_pat) =
+        any.utxo_pattern.as_ref()?;
+    if let Some(addr) = out_pat.address.as_ref() {
         if let Some(b) = &addr.exact_address {
-            return Some(SearchUtxoSelector::ExactAddress(b.clone()));
+            return Some(IndexSeed::ExactAddress(b.clone()));
         }
         if let Some(p_part) = &addr.payment_part {
-            return Some(SearchUtxoSelector::PaymentCredential(p_part.clone()));
+            return Some(IndexSeed::PaymentCredential(p_part.clone()));
         }
-        return None;
     }
-    if let Some(asset) = out_pattern.asset.as_ref() {
-        let policy_id = asset.policy_id.clone()?;
-        let asset_name = asset.asset_name.clone();
-        return Some(SearchUtxoSelector::Asset {
-            policy_id,
-            asset_name,
-        });
+    if let Some(asset) = out_pat.asset.as_ref() {
+        if let Some(policy_id) = &asset.policy_id {
+            return Some(IndexSeed::Asset {
+                policy_id: policy_id.clone(),
+                asset_name: asset.asset_name.clone(),
+            });
+        }
     }
     None
 }
@@ -96,23 +96,48 @@ async fn search_utxos_response_beta(
     ctx: &std::sync::Arc<dyn LedgerContext>,
     request: v1beta::query::SearchUtxosRequest,
 ) -> Result<v1beta::query::SearchUtxosResponse, Status> {
-    let selector = resolve_predicate(request.predicate.as_ref()).ok_or_else(|| {
-        Status::unimplemented(
-            "SearchUtxos: supported predicates are `match.cardano.address.exact_address`, \
-             `match.cardano.address.payment_part`, and `match.cardano.asset.{policy_id, \
-             asset_name}`. Delegation patterns, composite predicates (not/all_of/any_of), \
-             and mixed address+asset patterns are deferred to a follow-up.",
-        )
-    })?;
-
     let cap = request
         .max_items
         .map(|n| (n as usize).min(SEARCH_UTXOS_HARD_CAP))
         .unwrap_or(SEARCH_UTXOS_HARD_CAP)
         .max(1);
 
-    let mut snaps = match selector {
-        SearchUtxoSelector::ExactAddress(bytes) => {
+    let predicate = request.predicate.clone();
+    let seed = pick_index_seed(predicate.as_ref());
+
+    // Reject an unbounded full-scan with no usable index. Callers that
+    // *want* the full scan should supply a wildcard `delegation_part` /
+    // `not` predicate — the matcher will still apply it as a post-
+    // filter, but at least there's a signal it's a deliberate choice.
+    let predicate_is_wildcard = predicate
+        .as_ref()
+        .map(|p| {
+            p.r#match.is_none() && p.not.is_empty() && p.all_of.is_empty() && p.any_of.is_empty()
+        })
+        .unwrap_or(true);
+    if matches!(seed, IndexSeed::FullScan) && predicate_is_wildcard {
+        return Err(Status::unimplemented(
+            "SearchUtxos with no predicate is rejected (would return the whole UTxO set). \
+             Supply at least one address / payment_part / delegation_part / asset / composite \
+             predicate.",
+        ));
+    }
+
+    let mut snaps: Vec<_> = match seed {
+        IndexSeed::FullScan => {
+            // Unindexed predicate (delegation_part / has_certificate / etc.)
+            // — walk the in-memory UTxO set with the matcher.
+            let predicate_owned = predicate.clone();
+            ctx.utxos_filter(
+                &move |snap: &crate::UtxoSnapshot| {
+                    matches_utxo_predicate(predicate_owned.as_ref(), &snap.output)
+                },
+                cap,
+            )
+            .await
+            .map_err(Status::from)?
+        }
+        IndexSeed::ExactAddress(bytes) => {
             let parsed_addr =
                 dugite_primitives::address::Address::from_bytes(&bytes).map_err(|e| {
                     Status::invalid_argument(format!("exact_address bytes invalid: {e}"))
@@ -121,7 +146,7 @@ async fn search_utxos_response_beta(
                 .await
                 .map_err(Status::from)?
         }
-        SearchUtxoSelector::PaymentCredential(bytes) => {
+        IndexSeed::PaymentCredential(bytes) => {
             if bytes.len() != 28 && bytes.len() != 32 {
                 return Err(Status::invalid_argument(format!(
                     "payment_part must be 28 or 32 bytes, got {}",
@@ -136,7 +161,7 @@ async fn search_utxos_response_beta(
                 .await
                 .map_err(Status::from)?
         }
-        SearchUtxoSelector::Asset {
+        IndexSeed::Asset {
             policy_id,
             asset_name,
         } => {
@@ -155,6 +180,10 @@ async fn search_utxos_response_beta(
         }
     };
 
+    // Post-filter: enforce the full predicate (composite / not /
+    // delegation_part / mixed addr+asset). The index seed is the
+    // best-effort starting set; correctness comes from the matcher.
+    snaps.retain(|snap| matches_utxo_predicate(predicate.as_ref(), &snap.output));
     if snaps.len() > cap {
         snaps.truncate(cap);
     }
@@ -285,6 +314,102 @@ async fn read_genesis_response_beta(
         config: Some(v1beta::query::read_genesis_response::Config::Cardano(
             cardano,
         )),
+    })
+}
+
+async fn read_data_response_beta(
+    ctx: &std::sync::Arc<dyn LedgerContext>,
+    keys: Vec<Vec<u8>>,
+) -> Result<v1beta::query::ReadDataResponse, Status> {
+    let ledger_tip = ledger_tip_chain_point(ctx).await?;
+    let mut values: Vec<v1beta::query::AnyChainDatum> = Vec::with_capacity(keys.len());
+    for key in keys {
+        if key.len() != 32 {
+            return Err(Status::invalid_argument(format!(
+                "datum hash must be 32 bytes, got {}",
+                key.len()
+            )));
+        }
+        let mut arr = [0u8; 32];
+        arr.copy_from_slice(&key);
+        let hash = dugite_primitives::hash::Hash32::from_bytes(arr);
+        let Some(cbor) = ctx.datum_by_hash(&hash).await.map_err(Status::from)? else {
+            continue;
+        };
+        // Datum CBOR is surfaced raw via `native_bytes`. The
+        // `parsed_state.cardano` projection is left unset — clients
+        // that need it can re-decode locally with any
+        // `utxorpc.v1beta.cardano.PlutusData`-aware library.
+        values.push(v1beta::query::AnyChainDatum {
+            native_bytes: cbor,
+            key,
+            parsed_state: None,
+        });
+    }
+    Ok(v1beta::query::ReadDataResponse {
+        values,
+        ledger_tip: Some(ledger_tip),
+    })
+}
+
+async fn read_tx_response_beta(
+    ctx: &std::sync::Arc<dyn LedgerContext>,
+    hash_bytes: Vec<u8>,
+) -> Result<v1beta::query::ReadTxResponse, Status> {
+    if hash_bytes.len() != 32 {
+        return Err(Status::invalid_argument(format!(
+            "tx hash must be 32 bytes, got {}",
+            hash_bytes.len()
+        )));
+    }
+    let mut arr = [0u8; 32];
+    arr.copy_from_slice(&hash_bytes);
+    let hash = dugite_primitives::hash::Hash32::from_bytes(arr);
+    let ledger_tip = ledger_tip_chain_point(ctx).await?;
+    let Some(raw) = ctx.tx_by_hash(&hash).await.map_err(Status::from)? else {
+        return Err(Status::not_found(format!(
+            "tx {} not found in mempool or recent volatile blocks",
+            hex::encode(hash_bytes)
+        )));
+    };
+    // Decode with the Conway era id — same default the rest of the
+    // service uses. Falls back to native_bytes-only on decode failure.
+    let cardano_tx = match dugite_serialization::decode_transaction(6, &raw.cbor) {
+        Ok(tx) => Some(crate::map::tx::tx_to_proto(&tx)),
+        Err(_) => None,
+    };
+    Ok(v1beta::query::ReadTxResponse {
+        tx: Some(v1beta::query::AnyChainTx {
+            native_bytes: raw.cbor,
+            chain: cardano_tx.map(v1beta::query::any_chain_tx::Chain::Cardano),
+            block_ref: None,
+        }),
+        ledger_tip: Some(ledger_tip),
+    })
+}
+
+async fn read_state_response_beta(
+    ctx: &std::sync::Arc<dyn LedgerContext>,
+) -> Result<v1beta::query::ReadStateResponse, Status> {
+    let state = ctx.ledger_state().await.map_err(Status::from)?;
+    let ledger_tip = v1beta::query::ChainPoint {
+        slot: state.tip.slot,
+        hash: state.tip.hash.to_vec(),
+        height: state.tip.block_number,
+        timestamp: 0,
+    };
+    // The cardano sub-message in `AnyChainStateData` is left empty —
+    // we surface the epoch / slot snapshot purely via the
+    // `ledger_tip` field. Richer per-query state projections (stake-
+    // pool distribution, DRep info, etc.) layer on top of this stub
+    // once the dedicated chain-specific queries are wired.
+    Ok(v1beta::query::ReadStateResponse {
+        result: Some(v1beta::query::AnyChainStateData {
+            result: Some(v1beta::query::any_chain_state_data::Result::Cardano(
+                v1beta::cardano::StateData::default(),
+            )),
+        }),
+        ledger_tip: Some(ledger_tip),
     })
 }
 
@@ -433,16 +558,26 @@ impl v1alpha::query::query_service_server::QueryService for QuerySvcAlpha {
 
     async fn read_data(
         &self,
-        _request: Request<v1alpha::query::ReadDataRequest>,
+        request: Request<v1alpha::query::ReadDataRequest>,
     ) -> Result<Response<v1alpha::query::ReadDataResponse>, Status> {
-        Err(Status::unimplemented(UNIMPL))
+        let beta = read_data_response_beta(&self.state.context, request.into_inner().keys).await?;
+        use prost::Message;
+        let bytes = beta.encode_to_vec();
+        let alpha = v1alpha::query::ReadDataResponse::decode(bytes.as_slice())
+            .expect("v1alpha ReadDataResponse subset-compatible with v1beta");
+        Ok(Response::new(alpha))
     }
 
     async fn read_tx(
         &self,
-        _request: Request<v1alpha::query::ReadTxRequest>,
+        request: Request<v1alpha::query::ReadTxRequest>,
     ) -> Result<Response<v1alpha::query::ReadTxResponse>, Status> {
-        Err(Status::unimplemented(UNIMPL))
+        let beta = read_tx_response_beta(&self.state.context, request.into_inner().hash).await?;
+        use prost::Message;
+        let bytes = beta.encode_to_vec();
+        let alpha = v1alpha::query::ReadTxResponse::decode(bytes.as_slice())
+            .expect("v1alpha ReadTxResponse subset-compatible with v1beta");
+        Ok(Response::new(alpha))
     }
 
     async fn read_genesis(
@@ -534,16 +669,20 @@ impl v1beta::query::query_service_server::QueryService for QuerySvcBeta {
 
     async fn read_data(
         &self,
-        _request: Request<v1beta::query::ReadDataRequest>,
+        request: Request<v1beta::query::ReadDataRequest>,
     ) -> Result<Response<v1beta::query::ReadDataResponse>, Status> {
-        Err(Status::unimplemented(UNIMPL))
+        Ok(Response::new(
+            read_data_response_beta(&self.state.context, request.into_inner().keys).await?,
+        ))
     }
 
     async fn read_tx(
         &self,
-        _request: Request<v1beta::query::ReadTxRequest>,
+        request: Request<v1beta::query::ReadTxRequest>,
     ) -> Result<Response<v1beta::query::ReadTxResponse>, Status> {
-        Err(Status::unimplemented(UNIMPL))
+        Ok(Response::new(
+            read_tx_response_beta(&self.state.context, request.into_inner().hash).await?,
+        ))
     }
 
     async fn read_genesis(
@@ -569,6 +708,8 @@ impl v1beta::query::query_service_server::QueryService for QuerySvcBeta {
         &self,
         _request: Request<v1beta::query::ReadStateRequest>,
     ) -> Result<Response<v1beta::query::ReadStateResponse>, Status> {
-        Err(Status::unimplemented(UNIMPL))
+        Ok(Response::new(
+            read_state_response_beta(&self.state.context).await?,
+        ))
     }
 }

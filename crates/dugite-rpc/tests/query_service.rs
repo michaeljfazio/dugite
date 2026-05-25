@@ -115,7 +115,50 @@ impl LedgerContext for QueryMock {
         dugite_rpc::EvalOutcome {
             fee: 0,
             error: Some("".into()),
+            redeemers: Vec::new(),
         }
+    }
+    async fn utxos_filter(
+        &self,
+        keep: &(dyn for<'a> Fn(&'a UtxoSnapshot) -> bool + Send + Sync),
+        cap: usize,
+    ) -> Result<Vec<UtxoSnapshot>, RpcError> {
+        let mut out = Vec::new();
+        for ((tx_hash, idx), output) in &self.utxos {
+            if out.len() >= cap {
+                break;
+            }
+            let snap = UtxoSnapshot {
+                ref_: TransactionInput {
+                    transaction_id: *tx_hash,
+                    index: *idx,
+                },
+                output: output.clone(),
+                slot: None,
+            };
+            if keep(&snap) {
+                out.push(snap);
+            }
+        }
+        Ok(out)
+    }
+    async fn datum_by_hash(&self, _: &Hash32) -> Result<Option<Vec<u8>>, RpcError> {
+        Ok(None)
+    }
+    async fn tx_by_hash(&self, _: &TransactionHash) -> Result<Option<RawTx>, RpcError> {
+        Ok(None)
+    }
+    async fn ledger_state(&self) -> Result<dugite_rpc::LedgerStateView, RpcError> {
+        Ok(dugite_rpc::LedgerStateView {
+            tip: TipInfo {
+                slot: self.tip_slot,
+                hash: self.tip_hash,
+                block_number: self.tip_block_no,
+                era: Era::Conway,
+            },
+            epoch: 0,
+            slot_in_epoch: 0,
+        })
     }
     async fn mempool_snapshot(&self) -> Result<Vec<RawTx>, RpcError> {
         Err(RpcError::Unimplemented(""))
@@ -422,7 +465,7 @@ async fn search_utxos_payment_part_pattern_succeeds_with_empty_result() {
 }
 
 #[tokio::test]
-async fn search_utxos_delegation_part_returns_unimplemented() {
+async fn search_utxos_delegation_part_returns_empty_via_filter() {
     use dugite_rpc::proto::v1beta::cardano::{AddressPattern, TxOutputPattern};
     use dugite_rpc::proto::v1beta::query::query_service_client::QueryServiceClient;
     use dugite_rpc::proto::v1beta::query::{
@@ -431,7 +474,10 @@ async fn search_utxos_delegation_part_returns_unimplemented() {
 
     let server = TestServer::start(make_mock()).await;
     let mut client = QueryServiceClient::new(server.channel().await);
-    let status = client
+    // QueryMock returns its in-memory UTxOs via `utxos_filter`; none
+    // carry the requested stake credential, so the response is empty
+    // (no longer UNIMPLEMENTED).
+    let resp = client
         .search_utxos(SearchUtxosRequest {
             predicate: Some(UtxoPredicate {
                 r#match: Some(AnyUtxoPattern {
@@ -453,8 +499,9 @@ async fn search_utxos_delegation_part_returns_unimplemented() {
             start_token: None,
         })
         .await
-        .unwrap_err();
-    assert_eq!(status.code(), tonic::Code::Unimplemented);
+        .unwrap()
+        .into_inner();
+    assert!(resp.items.is_empty());
     server.stop().await;
 }
 

@@ -20,6 +20,7 @@ pub mod cert;
 pub mod common;
 pub mod governance;
 pub mod metadatum;
+pub mod patterns;
 pub mod plutus_data;
 pub mod pparams;
 pub mod script;
