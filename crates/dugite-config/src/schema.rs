@@ -53,9 +53,10 @@ pub enum ParamType {
     Enum { values: &'static [&'static str] },
     /// A file-system path (stored as a JSON string, shown with a path icon).
     Path,
-    /// A nested JSON object displayed as read-only (edit sub-fields in the
-    /// config file directly). The value is always valid; validation is a no-op.
-    Object,
+    /// A nested JSON object with a fixed sub-schema. Empty `fields` means the
+    /// schema does not yet model any sub-key (object is treated as opaque and
+    /// edited as a single read-only row, same as before this feature).
+    Object { fields: &'static [SubParamDef] },
 }
 
 impl ParamType {
@@ -68,7 +69,7 @@ impl ParamType {
             ParamType::String => "string",
             ParamType::Enum { .. } => "enum",
             ParamType::Path => "path",
-            ParamType::Object => "object",
+            ParamType::Object { .. } => "object",
         }
     }
 
@@ -116,7 +117,7 @@ impl ParamType {
                     ))
                 }
             }
-            ParamType::Object => Ok(()),
+            ParamType::Object { .. } => Ok(()),
         }
     }
 }
@@ -144,6 +145,73 @@ impl Reloadability {
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// Sub-parameter definition (for fields inside an Object param)
+// ---------------------------------------------------------------------------
+
+/// A single field inside a [`ParamType::Object`].
+///
+/// Identical in shape to [`ParamDef`] except for the missing `section` field —
+/// sub-fields live under their parent's section.
+///
+/// A sub-field's `default` follows the same rules as `ParamDef::default`. An
+/// empty string for a numeric / Bool / Enum leaf signals "no schema default"
+/// (the leaf is not hydrated and only appears in the tree if present in the
+/// on-disk file). For String / Path leaves, an empty default is a valid empty
+/// string.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SubParamDef {
+    pub key: &'static str,
+    pub param_type: ParamType,
+    pub default: &'static str,
+    pub description: &'static str,
+    pub tuning_hint: &'static str,
+    pub reloadability: Reloadability,
+}
+
+impl SubParamDef {
+    /// Parse the sub-field's default into a JSON value matching its type, or
+    /// `None` if the default string cannot be parsed (numeric / Bool / Enum
+    /// with `default: ""`).
+    pub fn default_as_json(&self) -> Option<Value> {
+        match &self.param_type {
+            ParamType::Bool => self.default.parse::<bool>().ok().map(Value::Bool),
+            ParamType::U64 { .. } => self
+                .default
+                .parse::<u64>()
+                .ok()
+                .map(|n| Value::Number(serde_json::Number::from(n))),
+            ParamType::F64 { .. } => self
+                .default
+                .parse::<f64>()
+                .ok()
+                .and_then(serde_json::Number::from_f64)
+                .map(Value::Number),
+            ParamType::String | ParamType::Path | ParamType::Enum { .. } => {
+                Some(Value::String(self.default.to_string()))
+            }
+            ParamType::Object { fields } => Some(object_default(fields)),
+        }
+    }
+}
+
+/// Recursively synthesise a `Value::Object` from a list of sub-field defaults.
+/// Leaves with no parseable default (e.g. numeric with `default: ""`) are
+/// omitted from the result.
+pub(crate) fn object_default(fields: &[SubParamDef]) -> Value {
+    let mut map = serde_json::Map::new();
+    for sub in fields {
+        if let Some(v) = sub.default_as_json() {
+            map.insert(sub.key.to_string(), v);
+        }
+    }
+    Value::Object(map)
+}
+
+// ---------------------------------------------------------------------------
+// Parameter definition
+// ---------------------------------------------------------------------------
 
 /// A single known configuration parameter.
 #[derive(Debug, Clone)]
@@ -197,7 +265,7 @@ impl ParamDef {
             ParamType::String | ParamType::Path | ParamType::Enum { .. } => {
                 Some(Value::String(self.default.to_string()))
             }
-            ParamType::Object => serde_json::from_str(self.default).ok(),
+            ParamType::Object { fields } => Some(object_default(fields)),
         }
     }
 }
@@ -915,8 +983,8 @@ pub static KNOWN_PARAMS: &[ParamDef] = &[
     ParamDef {
         key: "AcceptedConnectionsLimit",
         section: "Diffusion",
-        param_type: ParamType::Object,
-        default: r#"{"hardLimit":512,"softLimit":384,"delay":5.0}"#,
+        param_type: ParamType::Object { fields: &[] },
+        default: "",
         description: "Inbound connection admission limits. 'hardLimit' is the maximum \
                       concurrent inbound connections (new connections are refused above \
                       this). 'softLimit' is the threshold above which new connections \
@@ -937,10 +1005,10 @@ pub static KNOWN_PARAMS: &[ParamDef] = &[
     ParamDef {
         key: "Rpc",
         section: "Rpc",
-        param_type: ParamType::Object,
+        param_type: ParamType::Object { fields: &[] },
         // Empty object → server disabled. Operators opt in by setting
         // "Enabled": true and tuning the remaining fields.
-        default: "{}",
+        default: "",
         description: "UTxO RPC (gRPC) server configuration. Sub-fields (all PascalCase): \
                       'Enabled': bool (default false — server off unless explicitly enabled); \
                       'ListenAddr': bind IP, default '127.0.0.1' (loopback only); \
@@ -964,8 +1032,8 @@ pub static KNOWN_PARAMS: &[ParamDef] = &[
     ParamDef {
         key: "Storage",
         section: "Storage",
-        param_type: ParamType::Object,
-        default: r#"{"profile":"high-memory"}"#,
+        param_type: ParamType::Object { fields: &[] },
+        default: "",
         description: "Storage subsystem configuration. Sub-fields (all optional): \
                       'profile': preset profile name ('ultra-memory', 'high-memory', \
                       'low-memory', 'minimal'); \
@@ -1259,7 +1327,7 @@ mod tests {
 
     #[test]
     fn test_param_type_validate_object_always_ok() {
-        let t = ParamType::Object;
+        let t = ParamType::Object { fields: &[] };
         assert!(t.validate("").is_ok());
         assert!(t.validate("anything").is_ok());
     }
@@ -1320,13 +1388,11 @@ mod tests {
             .unwrap();
         assert_eq!(v, Value::String("Info".into()));
 
-        // Object default parses to JSON object.
+        // Object default synthesises an empty JSON object (fields: &[] — sub-schemas
+        // are populated in Tasks 14–16).
         let v = lookup.get("Storage").unwrap().default_as_json().unwrap();
         assert!(v.as_object().is_some());
-        assert_eq!(
-            v.as_object().unwrap().get("profile"),
-            Some(&Value::String("high-memory".into()))
-        );
+        assert_eq!(v, serde_json::json!({}));
     }
 
     #[test]
@@ -1360,7 +1426,7 @@ mod tests {
         assert_eq!(ParamType::String.label(), "string");
         assert_eq!(ParamType::Enum { values: &["a"] }.label(), "enum");
         assert_eq!(ParamType::Path.label(), "path");
-        assert_eq!(ParamType::Object.label(), "object");
+        assert_eq!(ParamType::Object { fields: &[] }.label(), "object");
     }
 
     #[test]
@@ -1473,7 +1539,7 @@ mod tests {
         );
         let def = map["AcceptedConnectionsLimit"];
         assert_eq!(def.section, "Diffusion");
-        assert_eq!(def.param_type, ParamType::Object);
+        assert_eq!(def.param_type, ParamType::Object { fields: &[] });
     }
 
     #[test]
@@ -1482,7 +1548,7 @@ mod tests {
         assert!(map.contains_key("Storage"), "Storage must be in schema");
         let def = map["Storage"];
         assert_eq!(def.section, "Storage");
-        assert_eq!(def.param_type, ParamType::Object);
+        assert_eq!(def.param_type, ParamType::Object { fields: &[] });
     }
 
     // ── network_defaults correctness ───────────────────────────────────────
@@ -1623,5 +1689,51 @@ mod tests {
                 def.section
             );
         }
+    }
+
+    #[test]
+    fn test_subparam_default_as_json_recurses() {
+        // Build a nested sub-schema by hand: outer { "x": u64=1, "inner": object { "y": bool=true } }.
+        const INNER: &[SubParamDef] = &[SubParamDef {
+            key: "y",
+            param_type: ParamType::Bool,
+            default: "true",
+            description: "",
+            tuning_hint: "",
+            reloadability: Reloadability::Restart,
+        }];
+        const OUTER: &[SubParamDef] = &[
+            SubParamDef {
+                key: "x",
+                param_type: ParamType::U64 { min: 0, max: 10 },
+                default: "1",
+                description: "",
+                tuning_hint: "",
+                reloadability: Reloadability::Restart,
+            },
+            SubParamDef {
+                key: "inner",
+                param_type: ParamType::Object { fields: INNER },
+                default: "",
+                description: "",
+                tuning_hint: "",
+                reloadability: Reloadability::Restart,
+            },
+        ];
+
+        let outer = ParamDef {
+            key: "Outer",
+            section: "Test",
+            param_type: ParamType::Object { fields: OUTER },
+            default: "",
+            description: "",
+            tuning_hint: "",
+            reloadability: Reloadability::Restart,
+        };
+
+        let v = outer.default_as_json().expect("object default");
+        let obj = v.as_object().expect("object");
+        assert_eq!(obj["x"], serde_json::json!(1));
+        assert_eq!(obj["inner"], serde_json::json!({ "y": true }));
     }
 }
