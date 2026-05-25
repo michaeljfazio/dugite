@@ -30,6 +30,7 @@
 //! | q / Esc  | Quit                            |
 //! | t        | Cycle theme                     |
 //! | r        | Force-refresh metrics           |
+//! | s        | Switch to a different node      |
 //! | h / ?    | Toggle help overlay             |
 
 mod app;
@@ -129,8 +130,9 @@ async fn main() -> Result<()> {
     // Resolve the metrics URL BEFORE entering raw mode so the discovery
     // INFO logs surface cleanly on stderr. The multi-node selection
     // dialog enters its own terminal session and tears it down before
-    // returning.
-    let resolution = match resolve_metrics_url(args.metrics_url.as_deref()).await? {
+    // returning. The dialog is themed using the app's default theme so
+    // it matches the dashboard look once we launch the main UI.
+    let resolution = match resolve_metrics_url(args.metrics_url.as_deref(), app.theme()).await? {
         Some(r) => r,
         None => {
             // User quit at the selection dialog.
@@ -156,7 +158,8 @@ async fn main() -> Result<()> {
     let snapshot = fetch_metrics(&resolution.metrics_url).await;
     app.update_metrics(snapshot);
 
-    let result = run_loop(&mut terminal, &mut app, &resolution.metrics_url).await;
+    let mut metrics_url = resolution.metrics_url;
+    let result = run_loop(&mut terminal, &mut app, &mut metrics_url).await;
 
     // Restore terminal on exit.
     disable_raw_mode()?;
@@ -174,7 +177,10 @@ struct ResolvedNode {
 
 /// Resolve which dugite-node to attach to. Returns `Ok(Some(...))` to
 /// proceed, `Ok(None)` if the user quit at the selection dialog.
-async fn resolve_metrics_url(flag: Option<&str>) -> Result<Option<ResolvedNode>> {
+async fn resolve_metrics_url(
+    flag: Option<&str>,
+    theme: &theme::Theme,
+) -> Result<Option<ResolvedNode>> {
     // Explicit non-empty flag bypasses discovery.
     if let Some(url) = flag {
         if !url.is_empty() {
@@ -210,7 +216,7 @@ async fn resolve_metrics_url(flag: Option<&str>) -> Result<Option<ResolvedNode>>
             }))
         }
         _ => {
-            let chosen_url = match dialog::run(&nodes)? {
+            let chosen_url = match dialog::run(&nodes, theme)? {
                 Some(u) => u,
                 None => return Ok(None),
             };
@@ -234,7 +240,7 @@ async fn resolve_metrics_url(flag: Option<&str>) -> Result<Option<ResolvedNode>>
 async fn run_loop(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
     app: &mut App,
-    metrics_url: &str,
+    metrics_url: &mut String,
 ) -> Result<()> {
     let mut last_fetch = tokio::time::Instant::now();
 
@@ -272,6 +278,18 @@ async fn run_loop(
                             app.update_metrics(snapshot);
                             last_fetch = tokio::time::Instant::now();
                         }
+                        KeyCode::Char('s') => {
+                            // Discover running dugite-node processes and let the
+                            // user pick one to attach to. Reuses the existing
+                            // terminal so the dashboard is restored automatically
+                            // on the next draw cycle.
+                            if let Some(chosen) = switch_node(terminal, app).await? {
+                                *metrics_url = chosen;
+                                let snapshot = fetch_metrics(metrics_url).await;
+                                app.update_metrics(snapshot);
+                                last_fetch = tokio::time::Instant::now();
+                            }
+                        }
                         KeyCode::Char('h') | KeyCode::Char('?') => {
                             app.toggle_help();
                         }
@@ -292,4 +310,32 @@ async fn run_loop(
             last_fetch = tokio::time::Instant::now();
         }
     }
+}
+
+/// Re-run discovery from inside the main loop, then present the themed
+/// selection dialog. Returns the chosen `metrics_url`, or `None` if the
+/// user dismissed without choosing (or no nodes were found).
+///
+/// Side-effect: when a node is selected, the dashboard's `db_path` is
+/// refreshed from the discovery result so the Resources panel shows disk
+/// usage for the newly-attached node.
+async fn switch_node(
+    terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
+    app: &mut App,
+) -> Result<Option<String>> {
+    let nodes = discover::discover_nodes().await;
+    let theme = app.theme();
+    let chosen = dialog::select_with_terminal(terminal, &nodes, theme)?;
+    if let Some(url) = chosen.as_deref() {
+        if let Some(node) = nodes.iter().find(|n| n.metrics_url == url) {
+            if let Some(p) = &node.db_path {
+                app.db_path = p.display().to_string();
+            }
+        }
+    }
+    // The dialog overlay leaves whatever it last painted on screen until
+    // the next render. Force a clear so the dashboard repaints cleanly
+    // beneath the spot where the modal was sitting.
+    terminal.clear()?;
+    Ok(chosen)
 }

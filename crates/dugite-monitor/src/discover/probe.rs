@@ -92,7 +92,10 @@ pub(crate) fn parse_discovered_fields(body: &str) -> DiscoveredFields {
                 out.tip_slot = Some(value as u64);
             }
             "dugite_sync_progress_percent" => {
-                out.sync_progress_percent = Some(value);
+                // The node emits this as a fixed-point integer in [0, 10000]
+                // where 10000 represents 100.00 %. Normalise to a real
+                // percentage for downstream consumers (the selection dialog).
+                out.sync_progress_percent = Some(value / 100.0);
             }
             _ => {}
         }
@@ -126,13 +129,16 @@ mod tests {
 
     #[test]
     fn parse_discovered_fields_complete_body() {
+        // The node emits `dugite_sync_progress_percent` as a fixed-point
+        // integer in [0, 10000] (10000 == 100.00 %). The parser must
+        // divide by 100 so downstream callers get a real percentage.
         let body = "\
 # HELP dugite_network_magic Network magic
 dugite_network_magic 2
 dugite_is_block_producer 1
 dugite_protocol_major_version 11
 dugite_slot_number 111661041
-dugite_sync_progress_percent 100.0
+dugite_sync_progress_percent 10000
 ";
         let fields = parse_discovered_fields(body);
         assert_eq!(fields.network, Some(Network::Preview));
@@ -140,6 +146,14 @@ dugite_sync_progress_percent 100.0
         assert_eq!(fields.protocol_major_version, Some(11));
         assert_eq!(fields.tip_slot, Some(111_661_041));
         assert_eq!(fields.sync_progress_percent, Some(100.0));
+    }
+
+    #[test]
+    fn parse_discovered_fields_partial_sync_progress() {
+        // 9982 fixed-point should normalise to 99.82 %.
+        let body = "dugite_network_magic 2\ndugite_sync_progress_percent 9982\n";
+        let fields = parse_discovered_fields(body);
+        assert_eq!(fields.sync_progress_percent, Some(99.82));
     }
 
     #[test]
@@ -193,7 +207,7 @@ dugite_network_magic 2
 dugite_is_block_producer 0
 dugite_protocol_major_version 11
 dugite_slot_number 111661041
-dugite_sync_progress_percent 100.0
+dugite_sync_progress_percent 10000
 ";
 
     const CARDANO_NODE_BODY: &str = "\

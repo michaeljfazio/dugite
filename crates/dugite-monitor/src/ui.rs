@@ -1459,6 +1459,8 @@ fn render_footer(frame: &mut Frame, app: &App, theme: &Theme, area: Rect) {
         Span::styled(" Theme  ", Style::default().fg(theme.muted)),
         key_span("[r]", theme),
         Span::styled(" Refresh  ", Style::default().fg(theme.muted)),
+        key_span("[s]", theme),
+        Span::styled(" Switch  ", Style::default().fg(theme.muted)),
         key_span("[h]", theme),
         Span::styled(" Help  ", Style::default().fg(theme.muted)),
         Span::styled("\u{2502} ", Style::default().fg(theme.border)),
@@ -1483,7 +1485,7 @@ fn render_footer(frame: &mut Frame, app: &App, theme: &Theme, area: Rect) {
 
 fn render_help_overlay(frame: &mut Frame, theme: &Theme, area: Rect) {
     let overlay_width: u16 = 60;
-    let overlay_height: u16 = 20;
+    let overlay_height: u16 = 21;
 
     let x = area.x + area.width.saturating_sub(overlay_width) / 2;
     let y = area.y + area.height.saturating_sub(overlay_height) / 2;
@@ -1520,6 +1522,7 @@ fn render_help_overlay(frame: &mut Frame, theme: &Theme, area: Rect) {
         help_kv("q / Esc", "Quit", theme),
         help_kv("t", "Cycle theme (7 built-in themes)", theme),
         help_kv("r", "Force-refresh metrics now", theme),
+        help_kv("s", "Switch to a different running node", theme),
         help_kv("h / ?", "Toggle this help overlay", theme),
         Line::default(),
         Line::from(Span::styled(
