@@ -18,6 +18,7 @@
 - [Mithril Ancillary — Trust Model](./running/mithril-ancillary.md)
 - [Logging](./running/logging.md)
 - [Monitoring](./running/monitoring.md)
+- [UTxO RPC (gRPC) Server](./running/utxo-rpc.md)
 - [Relay Node](./running/relay.md)
 - [Block Producer](./running/block-producer.md)
 - [Local Testnet](./running/local-testnet.md)

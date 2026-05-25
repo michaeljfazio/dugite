@@ -253,6 +253,11 @@ dual-decode-report DIR="./dual_decode_mismatches":
 # Corpus republished from upstream Cardano repositories.  Pinned tag lives in
 # tests/conformance/upstream/manifest.toml.  Workflow: download → run.
 
+# Refresh vendored utxorpc/spec proto files to a specific upstream tag.
+# Usage: just bump-utxorpc-spec v0.19.2
+bump-utxorpc-spec TAG:
+    bash scripts/dev/bump-utxorpc-spec.sh {{TAG}}
+
 # Download every upstream fixture area at the pinned release tag.
 download-upstream-fixtures:
     cargo xtask download-upstream-fixtures
