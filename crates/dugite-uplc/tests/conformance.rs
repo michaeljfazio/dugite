@@ -280,5 +280,5 @@ fn quote_term(term: Term, env: &Env, depth: u64) -> Result<Term, String> {
 // Include the per-test-vector `#[test]` functions emitted by build.rs.
 // When the conformance feature is enabled but the corpus is not yet
 // downloaded, this file contains a single sentinel `#[test]` that
-// prints a hint pointing at `just uplc-conformance-fetch`.
+// prints a hint pointing at `just download-upstream-fixtures`.
 include!(concat!(env!("OUT_DIR"), "/generated_conformance_tests.rs"));
