@@ -21,6 +21,7 @@ pub(crate) mod peer_connection;
 pub(crate) mod query;
 pub(crate) mod serve;
 pub(crate) mod sync;
+pub mod tip_broadcast;
 
 use anyhow::Result;
 use std::collections::HashMap;
@@ -415,6 +416,13 @@ pub struct Node {
     /// Broadcast sender for notifying connected peers of chain rollbacks
     pub(crate) rollback_announcement_tx:
         Option<tokio::sync::broadcast::Sender<RollbackAnnouncement>>,
+    /// Payload-bearing tip event broadcaster — issue #672 M0.1.
+    ///
+    /// Sibling channel pair carrying `TipApply` / `TipRollback` events with
+    /// richer payloads (era) than the existing announcement channels. Fanned
+    /// in additively from the same send sites; consumed by external RPC.
+    /// `None` until `run()` initialises it alongside the announcement channels.
+    pub(crate) tip_broadcaster: Option<Arc<tip_broadcast::TipBroadcaster>>,
     /// Prometheus metrics port
     pub(crate) metrics_port: u16,
     /// Make a metrics bind failure fatal (see `--require-metrics`)
@@ -1798,6 +1806,7 @@ impl Node {
             block_producer,
             block_announcement_tx: None,
             rollback_announcement_tx: None,
+            tip_broadcaster: None,
             metrics_port: args.metrics_port,
             require_metrics: args.require_metrics,
             expected_byron_genesis_hash,
@@ -2101,6 +2110,33 @@ impl Node {
             });
         }
 
+        // Issue #672 M0.3: tx validator + slot config hoisted out of the N2C
+        // block so the forthcoming UTxO RPC SubmitService (M1+) can share the
+        // exact same validator instance + slot config as N2C
+        // LocalTxSubmission. SlotConfig is Copy and LedgerTxValidator is
+        // Arc'd, so the N2C block captures by clone on the consume side.
+        let n2c_slot_config = self
+            .shelley_genesis
+            .as_ref()
+            .map(|g| g.slot_config())
+            .unwrap_or(dugite_ledger::plutus::SlotConfig {
+                zero_time: 0,
+                zero_slot: 0,
+                slot_length: 1000,
+            });
+        let n2c_tx_validator = Arc::new(serve::LedgerTxValidator {
+            ledger: self.ledger_state.clone(),
+            slot_config: n2c_slot_config,
+            metrics: self.metrics.clone(),
+            mempool: Some(self.mempool.clone()),
+            network: if self.network_magic == dugite_primitives::network::NetworkId::Mainnet.magic()
+            {
+                dugite_primitives::network::NetworkId::Mainnet
+            } else {
+                dugite_primitives::network::NetworkId::Testnet
+            },
+        });
+
         // Start N2C server on Unix socket.
         //
         // Each accepted connection gets its own Mux and set of protocol tasks:
@@ -2120,29 +2156,6 @@ impl Node {
             // Build the block provider for LocalChainSync
             let n2c_block_provider = Arc::new(serve::ChainDBBlockProvider {
                 chain_db: self.chain_db.clone(),
-            });
-            // Build the tx validator for LocalTxSubmission
-            let n2c_slot_config = self
-                .shelley_genesis
-                .as_ref()
-                .map(|g| g.slot_config())
-                .unwrap_or(dugite_ledger::plutus::SlotConfig {
-                    zero_time: 0,
-                    zero_slot: 0,
-                    slot_length: 1000,
-                });
-            let n2c_tx_validator = Arc::new(serve::LedgerTxValidator {
-                ledger: self.ledger_state.clone(),
-                slot_config: n2c_slot_config,
-                metrics: self.metrics.clone(),
-                mempool: Some(self.mempool.clone()),
-                network: if self.network_magic
-                    == dugite_primitives::network::NetworkId::Mainnet.magic()
-                {
-                    dugite_primitives::network::NetworkId::Mainnet
-                } else {
-                    dugite_primitives::network::NetworkId::Testnet
-                },
             });
 
             // Remove stale socket file if it exists (e.g., from a previous unclean shutdown).
@@ -2205,6 +2218,7 @@ impl Node {
                 tokio::sync::broadcast::channel::<RollbackAnnouncement>(ROLLBACK_ANN_CHANNEL_CAP);
             self.block_announcement_tx = Some(block_ann_tx.clone());
             self.rollback_announcement_tx = Some(rollback_ann_tx.clone());
+            self.tip_broadcaster = Some(Arc::new(tip_broadcast::TipBroadcaster::new()));
             let n2c_block_ann_tx = block_ann_tx;
             let n2c_rollback_ann_tx = rollback_ann_tx;
             // C4 + G3: bound the number of concurrent N2C connections.
@@ -2809,6 +2823,7 @@ impl Node {
                 tokio::sync::broadcast::channel::<RollbackAnnouncement>(ROLLBACK_ANN_CHANNEL_CAP);
             self.block_announcement_tx = Some(block_ann_tx);
             self.rollback_announcement_tx = Some(rollback_ann_tx);
+            self.tip_broadcaster = Some(Arc::new(tip_broadcast::TipBroadcaster::new()));
         }
         // Channel for the N2N listener to send accepted+handshaked connections
         // to the main run loop for lifecycle manager registration.
@@ -4238,6 +4253,14 @@ impl Node {
                                                 hash: hash_bytes,
                                                 block_number: fork_block_no.0,
                                             });
+                                            if let Some(ref tb) = self.tip_broadcaster {
+                                                tb.announce_apply(tip_broadcast::TipApply {
+                                                    slot: fork_slot.0,
+                                                    hash: hash_bytes,
+                                                    block_number: fork_block_no.0,
+                                                    era: fork_block.era,
+                                                });
+                                            }
                                         }
                                         // Stash this block as the most recent
                                         // successful apply.  Subsequent
@@ -4522,6 +4545,14 @@ impl Node {
                 hash: hash_bytes,
                 block_number: block_number.0,
             });
+            if let Some(ref tb) = self.tip_broadcaster {
+                tb.announce_apply(tip_broadcast::TipApply {
+                    slot: block_slot.0,
+                    hash: hash_bytes,
+                    block_number: block_number.0,
+                    era: block.era,
+                });
+            }
             debug!(
                 slot = block_slot.0,
                 block = block_number.0,
@@ -4604,7 +4635,8 @@ impl Node {
         //    used to do inline.
         let confirmed: Vec<_> = block.transactions.iter().map(|tx| tx.hash).collect();
         if !confirmed.is_empty() {
-            self.mempool.remove_txs(&confirmed);
+            self.mempool
+                .remove_txs_with_reason(&confirmed, dugite_mempool::MempoolRemoveReason::Mined);
         }
         if !self.mempool.is_empty() {
             let consumed_inputs: std::collections::HashSet<_> = block
@@ -6253,6 +6285,14 @@ impl Node {
                                             hash: hash_bytes,
                                             block_number: fork_block_no.0,
                                         });
+                                        if let Some(ref tb) = self.tip_broadcaster {
+                                            tb.announce_apply(tip_broadcast::TipApply {
+                                                slot: fork_slot.0,
+                                                hash: hash_bytes,
+                                                block_number: fork_block_no.0,
+                                                era: fork_block.era,
+                                            });
+                                        }
                                     }
                                 }
                                 !replay_failed
@@ -6324,7 +6364,10 @@ impl Node {
                             let bad_tx_hashes: Vec<_> =
                                 block.transactions.iter().map(|tx| tx.hash).collect();
                             if !bad_tx_hashes.is_empty() {
-                                self.mempool.remove_txs(&bad_tx_hashes);
+                                self.mempool.remove_txs_with_reason(
+                                    &bad_tx_hashes,
+                                    dugite_mempool::MempoolRemoveReason::Evicted,
+                                );
                                 error!(
                                     target: "forge",
                                     count = bad_tx_hashes.len(),
@@ -6405,6 +6448,14 @@ impl Node {
                         hash: hash_bytes,
                         block_number: block_number.0,
                     });
+                    if let Some(ref tb) = self.tip_broadcaster {
+                        tb.announce_apply(tip_broadcast::TipApply {
+                            slot: next_slot.0,
+                            hash: hash_bytes,
+                            block_number: block_number.0,
+                            era: block.era,
+                        });
+                    }
 
                     if subscribers == 0 {
                         warn!(

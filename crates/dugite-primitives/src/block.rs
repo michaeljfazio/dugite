@@ -196,6 +196,72 @@ impl Block {
             block_number: self.header.block_number,
         }
     }
+
+    /// Per-transaction CBOR-body byte ranges within [`Block::raw_cbor`] —
+    /// issue #672 M0.4.
+    ///
+    /// For each transaction `tx` in [`Block::transactions`], returns the
+    /// `Range<usize>` such that `block.raw_cbor[range]` is byte-equal to
+    /// `tx.raw_body_cbor`. This is the prerequisite for the forthcoming
+    /// UTxO RPC mapper that wants to populate utxorpc `Tx.native_bytes`
+    /// without re-encoding.
+    ///
+    /// # Behaviour
+    ///
+    /// - Returns `None` if [`Block::raw_cbor`] is `None` or if any
+    ///   transaction lacks `raw_body_cbor`.
+    /// - Returns `None` if any transaction body cannot be located within
+    ///   the block CBOR (which indicates upstream decoder drift — the
+    ///   invariant `tx.raw_body_cbor` ⊆ `block.raw_cbor` is expected).
+    /// - Uses a left-to-right moving cursor so that two transactions with
+    ///   identical body bytes (a body-hash collision — practically
+    ///   impossible) would map to distinct ranges.
+    ///
+    /// # Implementation
+    ///
+    /// Substring search via [`slice::windows`]. Cardano blocks are bounded
+    /// (~72 KB on mainnet) so the O(n·m) cost is acceptable; per-call
+    /// runtime stays well under one millisecond. A future decoder-side
+    /// capture path (Path B in the M0 design) can replace this if
+    /// profiling shows the search is hot for RPC consumers.
+    ///
+    /// # Note on full-tx ranges
+    ///
+    /// Cardano blocks store transactions in parallel arrays
+    /// (`transaction_bodies`, `transaction_witness_sets`,
+    /// `auxiliary_data_set`, `invalid_transactions`) rather than as a
+    /// single contiguous per-tx CBOR. Therefore only the BODY range is
+    /// recoverable from `block.raw_cbor`. Consumers wanting the wire-
+    /// format whole-tx CBOR (`[body, witness_set, valid?, aux?]`) must
+    /// re-assemble from `tx.raw_body_cbor` / `tx.raw_witness_cbor` /
+    /// `tx.is_valid` / `tx.auxiliary_data` — that re-assembly lives in
+    /// `dugite-rpc::map::tx`, not here.
+    pub fn tx_byte_ranges(&self) -> Option<Vec<std::ops::Range<usize>>> {
+        let block_cbor: &[u8] = self.raw_cbor.as_deref()?;
+        let mut ranges: Vec<std::ops::Range<usize>> = Vec::with_capacity(self.transactions.len());
+        let mut cursor: usize = 0;
+
+        for tx in &self.transactions {
+            let body_cbor: &[u8] = tx.raw_body_cbor.as_deref()?;
+            if body_cbor.is_empty() {
+                // An empty body is malformed but we report a degenerate
+                // zero-length range at the cursor rather than failing the
+                // whole call — protects RPC consumers from a single bad tx.
+                ranges.push(cursor..cursor);
+                continue;
+            }
+            let haystack = block_cbor.get(cursor..)?;
+            let offset = haystack
+                .windows(body_cbor.len())
+                .position(|w| w == body_cbor)?;
+            let start = cursor + offset;
+            let end = start + body_cbor.len();
+            ranges.push(start..end);
+            cursor = end;
+        }
+
+        Some(ranges)
+    }
 }
 
 /// Chain tip information
@@ -522,5 +588,108 @@ mod tests {
         let json = serde_json::to_string(&tip).unwrap();
         let tip2: Tip = serde_json::from_str(&json).unwrap();
         assert_eq!(tip, tip2);
+    }
+
+    // ========== tx_byte_ranges (#672 M0.4) ==========
+
+    /// Helper: build a Block where `raw_cbor` is a synthetic byte sequence
+    /// composed of `leading || body_1 || gap_1 || body_2 || ... || trailing`,
+    /// and the constituent transactions have `raw_body_cbor` set to each
+    /// `body_i`. Mirrors the post-decode invariant that `tx.raw_body_cbor`
+    /// is a verbatim slice of `block.raw_cbor`.
+    fn synth_block_with_bodies(bodies: &[Vec<u8>], gap: &[u8]) -> Block {
+        let mut raw = Vec::new();
+        raw.extend_from_slice(b"\x83\x05"); // arbitrary leading bytes (not parsed)
+        for (i, body) in bodies.iter().enumerate() {
+            raw.extend_from_slice(body);
+            if i + 1 < bodies.len() {
+                raw.extend_from_slice(gap);
+            }
+        }
+        raw.extend_from_slice(b"\xFF\xFF"); // arbitrary trailing bytes
+
+        let transactions: Vec<Transaction> = bodies
+            .iter()
+            .enumerate()
+            .map(|(i, body)| {
+                let mut tx = Transaction::empty_with_hash(Hash::from_bytes([i as u8; 32]));
+                tx.raw_body_cbor = Some(body.clone());
+                tx
+            })
+            .collect();
+
+        Block {
+            header: test_header(1, 1),
+            transactions,
+            era: Era::Conway,
+            raw_cbor: Some(raw),
+        }
+    }
+
+    #[test]
+    fn tx_byte_ranges_locates_each_body_in_block_cbor() {
+        let bodies = vec![
+            vec![0xA1, 0x01, 0x02, 0x03],
+            vec![0xB2, 0x04, 0x05],
+            vec![0xC3, 0x06, 0x07, 0x08, 0x09],
+        ];
+        let block = synth_block_with_bodies(&bodies, &[0x00, 0x00]);
+        let raw_cbor = block.raw_cbor.as_deref().unwrap();
+
+        let ranges = block.tx_byte_ranges().expect("ranges");
+
+        assert_eq!(ranges.len(), bodies.len());
+        for (range, body) in ranges.iter().zip(bodies.iter()) {
+            assert_eq!(&raw_cbor[range.clone()], body.as_slice());
+        }
+    }
+
+    #[test]
+    fn tx_byte_ranges_returns_none_when_block_cbor_missing() {
+        let mut block = synth_block_with_bodies(&[vec![0x01, 0x02]], &[]);
+        block.raw_cbor = None;
+        assert!(block.tx_byte_ranges().is_none());
+    }
+
+    #[test]
+    fn tx_byte_ranges_returns_none_when_any_body_cbor_missing() {
+        let mut block = synth_block_with_bodies(&[vec![0x01, 0x02]], &[]);
+        block.transactions[0].raw_body_cbor = None;
+        assert!(block.tx_byte_ranges().is_none());
+    }
+
+    #[test]
+    fn tx_byte_ranges_handles_duplicate_bodies_via_moving_cursor() {
+        // Two identical bodies — confirms ranges are distinct and ordered.
+        let body = vec![0xDE, 0xAD, 0xBE, 0xEF];
+        let bodies = vec![body.clone(), body.clone()];
+        let block = synth_block_with_bodies(&bodies, &[0xAA]);
+        let ranges = block.tx_byte_ranges().expect("ranges");
+
+        assert_eq!(ranges.len(), 2);
+        assert!(ranges[0].end <= ranges[1].start, "ranges must be ordered");
+        let raw = block.raw_cbor.as_deref().unwrap();
+        assert_eq!(&raw[ranges[0].clone()], body.as_slice());
+        assert_eq!(&raw[ranges[1].clone()], body.as_slice());
+    }
+
+    #[test]
+    fn tx_byte_ranges_returns_none_when_body_not_in_block_cbor() {
+        let mut block = synth_block_with_bodies(&[vec![0x01, 0x02]], &[]);
+        // Corrupt: body cbor doesn't actually appear in the block cbor.
+        block.transactions[0].raw_body_cbor = Some(vec![0xFE, 0xED, 0xFA, 0xCE]);
+        assert!(block.tx_byte_ranges().is_none());
+    }
+
+    #[test]
+    fn tx_byte_ranges_empty_block_returns_empty_vec() {
+        let block = Block {
+            header: test_header(1, 1),
+            transactions: vec![],
+            era: Era::Conway,
+            raw_cbor: Some(vec![0x80]),
+        };
+        let ranges = block.tx_byte_ranges().expect("ranges");
+        assert!(ranges.is_empty());
     }
 }
