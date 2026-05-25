@@ -196,6 +196,64 @@ pub(crate) fn hydrate_object(
 }
 
 // ---------------------------------------------------------------------------
+// Synthetic-default prune walker
+// ---------------------------------------------------------------------------
+
+/// Walk `value` against `fields`, removing any leaf at a path in
+/// `synthetic_paths` whose value equals the schema default. Cascade-prune any
+/// sub-object that becomes empty AND whose path is itself in
+/// `synthetic_paths` (i.e. the parent object was also synthetically created).
+///
+/// Unknown sub-keys (present in `value` but absent from `fields`) are left
+/// untouched.
+pub(crate) fn prune_synthetic_defaults(
+    value: &mut Value,
+    fields: &[SubParamDef],
+    path: &mut Vec<String>,
+    synthetic_paths: &std::collections::HashSet<String>,
+) {
+    let Some(map) = value.as_object_mut() else {
+        return;
+    };
+
+    for sub in fields {
+        path.push(sub.key.to_string());
+        let pointer = path_to_json_pointer(path);
+
+        match &sub.param_type {
+            ParamType::Object {
+                fields: inner_fields,
+            } => {
+                if let Some(child) = map.get_mut(sub.key) {
+                    prune_synthetic_defaults(child, inner_fields, path, synthetic_paths);
+                    // After child-pruning, drop the now-empty synthetic parent.
+                    if synthetic_paths.contains(&pointer) {
+                        if let Some(child_map) = child.as_object() {
+                            if child_map.is_empty() {
+                                map.remove(sub.key);
+                            }
+                        }
+                    }
+                }
+            }
+            _ => {
+                if synthetic_paths.contains(&pointer) {
+                    if let Some(current) = map.get(sub.key) {
+                        if let Some(default_value) = sub.default_as_json() {
+                            if current == &default_value {
+                                map.remove(sub.key);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        path.pop();
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Loaded config
 // ---------------------------------------------------------------------------
 
@@ -335,20 +393,34 @@ pub fn save_config(config: &mut LoadedConfig) -> Result<()> {
 
     // Step 2 — rebuild JSON object in entry order, skipping synthetic entries
     // that still hold the schema default (keeps the file's diff minimal).
+    let lookup: std::collections::HashMap<&str, &'static crate::schema::ParamDef> =
+        KNOWN_PARAMS.iter().map(|d| (d.key, d)).collect();
     let schema_defaults: std::collections::HashMap<&str, Value> = KNOWN_PARAMS
         .iter()
         .filter_map(|d| d.default_as_json().map(|v| (d.key, v)))
         .collect();
+
     let mut obj = serde_json::Map::new();
     for entry in &config.entries {
+        // Per-Object sub-field prune (operates on a clone — entry stays hydrated
+        // so the UI keeps its current view after save).
+        let mut emit_value = entry.value.clone();
+        if let Some(def) = lookup.get(entry.key.as_str()).copied() {
+            if let ParamType::Object { fields } = &def.param_type {
+                let mut p: Vec<String> = Vec::new();
+                prune_synthetic_defaults(&mut emit_value, fields, &mut p, &entry.synthetic_paths);
+            }
+        }
+
+        // Top-level synthetic+default prune (existing behaviour).
         if !entry.present_in_file {
             if let Some(default) = schema_defaults.get(entry.key.as_str()) {
-                if &entry.value == default {
+                if &emit_value == default {
                     continue;
                 }
             }
         }
-        obj.insert(entry.key.clone(), entry.value.clone());
+        obj.insert(entry.key.clone(), emit_value);
     }
     let json = Value::Object(obj);
 
@@ -817,5 +889,113 @@ mod tests {
             "intermediate object node is synthetic"
         );
         assert!(paths.contains("/inner/y"));
+    }
+
+    #[test]
+    fn test_save_prunes_synthetic_default_subleaf() {
+        use crate::schema::{ParamType, Reloadability, SubParamDef};
+        use std::collections::HashSet;
+
+        const FIELDS: &[SubParamDef] = &[
+            SubParamDef {
+                key: "a",
+                param_type: ParamType::U64 { min: 0, max: 100 },
+                default: "7",
+                description: "",
+                tuning_hint: "",
+                reloadability: Reloadability::Restart,
+            },
+            SubParamDef {
+                key: "b",
+                param_type: ParamType::U64 { min: 0, max: 100 },
+                default: "9",
+                description: "",
+                tuning_hint: "",
+                reloadability: Reloadability::Restart,
+            },
+        ];
+
+        let mut value = serde_json::json!({ "a": 7, "b": 42 });
+        let paths: HashSet<String> = ["/a", "/b"].iter().map(|s| s.to_string()).collect();
+        prune_synthetic_defaults(&mut value, FIELDS, &mut Vec::new(), &paths);
+
+        // 'a' is synthetic + still default → pruned. 'b' is synthetic but not default → kept.
+        assert_eq!(value, serde_json::json!({ "b": 42 }));
+    }
+
+    #[test]
+    fn test_save_prunes_keeps_user_set_leaf_even_if_at_default() {
+        use crate::schema::{ParamType, Reloadability, SubParamDef};
+
+        const FIELDS: &[SubParamDef] = &[SubParamDef {
+            key: "a",
+            param_type: ParamType::U64 { min: 0, max: 100 },
+            default: "7",
+            description: "",
+            tuning_hint: "",
+            reloadability: Reloadability::Restart,
+        }];
+
+        // Value equals default, but path is NOT in synthetic_paths → user touched
+        // it (or it was in the original file). Must be retained.
+        let mut value = serde_json::json!({ "a": 7 });
+        let paths = std::collections::HashSet::new();
+        prune_synthetic_defaults(&mut value, FIELDS, &mut Vec::new(), &paths);
+
+        assert_eq!(value, serde_json::json!({ "a": 7 }));
+    }
+
+    #[test]
+    fn test_save_prunes_nested_empty_object() {
+        use crate::schema::{ParamType, Reloadability, SubParamDef};
+        use std::collections::HashSet;
+
+        const INNER: &[SubParamDef] = &[SubParamDef {
+            key: "y",
+            param_type: ParamType::Bool,
+            default: "true",
+            description: "",
+            tuning_hint: "",
+            reloadability: Reloadability::Restart,
+        }];
+        const OUTER: &[SubParamDef] = &[SubParamDef {
+            key: "inner",
+            param_type: ParamType::Object { fields: INNER },
+            default: "",
+            description: "",
+            tuning_hint: "",
+            reloadability: Reloadability::Restart,
+        }];
+
+        let mut value = serde_json::json!({ "inner": { "y": true } });
+        let paths: HashSet<String> = ["/inner", "/inner/y"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        prune_synthetic_defaults(&mut value, OUTER, &mut Vec::new(), &paths);
+
+        // Inner y is synthetic + default → pruned. Inner is now empty + synthetic → pruned too.
+        assert_eq!(value, serde_json::json!({}));
+    }
+
+    #[test]
+    fn test_save_prunes_keeps_unknown_subkey() {
+        use crate::schema::{ParamType, Reloadability, SubParamDef};
+        use std::collections::HashSet;
+
+        const FIELDS: &[SubParamDef] = &[SubParamDef {
+            key: "a",
+            param_type: ParamType::U64 { min: 0, max: 100 },
+            default: "7",
+            description: "",
+            tuning_hint: "",
+            reloadability: Reloadability::Restart,
+        }];
+
+        let mut value = serde_json::json!({ "a": 7, "NewFeature": "preserve me" });
+        let paths: HashSet<String> = ["/a"].iter().map(|s| s.to_string()).collect();
+        prune_synthetic_defaults(&mut value, FIELDS, &mut Vec::new(), &paths);
+
+        assert_eq!(value, serde_json::json!({ "NewFeature": "preserve me" }));
     }
 }
