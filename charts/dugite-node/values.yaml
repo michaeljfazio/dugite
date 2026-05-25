@@ -1,54 +1,86 @@
-# -- Node role: "relay" or "producer"
+# -- Node role: "relay" or "producer".
+# Producer mode wires KES/VRF/opcert from `producer.*` and enables a
+# restrictive NetworkPolicy (see `networkPolicy` below).
 role: relay
 
-# -- Container image settings
+# -- Container image settings.
+# The release workflow publishes multi-arch images (linux/amd64 + linux/arm64)
+# to `ghcr.io/michaeljfazio/dugite` for every tagged release.
 image:
   repository: ghcr.io/michaeljfazio/dugite
-  tag: ""  # Defaults to Chart appVersion
+  tag: ""  # Defaults to Chart appVersion (1.7.0)
   pullPolicy: IfNotPresent
 
 imagePullSecrets: []
 nameOverride: ""
 fullnameOverride: ""
 
-# -- Number of replicas (typically 1 per node)
+# -- Number of replicas. Keep at 1 — a Cardano node owns its on-disk ChainDB
+# exclusively and the workload is not horizontally scalable.
 replicaCount: 1
 
 # -- Unix socket path for N2C (local client) connections.
-# Exposed inside the pod via the /ipc emptyDir volume.
+# Exposed inside the pod via the /ipc emptyDir volume, shared with sidecars
+# that need to run `dugite-cli`.
 socketPath: /ipc/node.sock
 
 # -- Cardano network configuration
 network:
   # -- Network name: mainnet, preview, or preprod
   name: preview
-  # -- Network magic (auto-set from network.name if not specified)
+  # -- Network magic (auto-derived from `network.name` when null).
   # mainnet=764824073, preview=2, preprod=1
   magic: null
   # -- Node-to-node port
   port: 3001
-  # -- Host address to bind
+  # -- Host address to bind for N2N
   hostAddr: "0.0.0.0"
-  # -- Peer sharing policy: NoPeerSharing, PeerSharingPrivate, PeerSharingPublic
-  peerSharing: PeerSharingPublic
-  # -- Peer target counts
+  # -- Diffusion mode: "InitiatorAndResponder" (relay, default) or
+  # "InitiatorOnly" (block producer behind NAT — outbound only).
+  diffusionMode: InitiatorAndResponder
+  # -- Peer sharing — set to `true` (relay default), `false` (BP default),
+  # or null (auto: enabled for relays, disabled when producer keys present).
+  peerSharing: null
+  # -- Peer target counts (mirror cardano-node defaults)
   targetRootPeers: 60
   targetActivePeers: 20
-  targetEstablishedPeers: 40
-  targetKnownPeers: 100
+  targetEstablishedPeers: 30
+  targetKnownPeers: 150
   targetActiveBigLedgerPeers: 5
   targetEstablishedBigLedgerPeers: 10
   targetKnownBigLedgerPeers: 15
 
-# -- Prometheus metrics
+# -- Prometheus metrics server
 metrics:
   enabled: true
+  # -- Metrics port. Default 12796 — chosen so dugite can coexist with
+  # cardano-node (12798) on the same host.
   port: 12796
+  # -- Also emit `cardano_node_metrics_*` aliases alongside native
+  # `dugite_*` metrics. Lets existing cardano-node Grafana dashboards
+  # work without modification. See `--compat-metrics`.
+  compat: false
+  # -- Make a metrics bind failure a fatal startup error
+  # (mirrors `--require-metrics`).
+  require: false
   serviceMonitor:
     # -- Create a ServiceMonitor for Prometheus Operator
     enabled: false
     interval: 30s
     labels: {}
+
+# -- UTxO RPC (gRPC) server — issue #672.
+# When enabled, exposes the v1beta UTxO RPC API on a separate port.
+# CLI flags `--rpc-host` / `--rpc-port` are wired through; `--no-rpc`
+# is always honoured when `enabled: false`.
+rpc:
+  enabled: false
+  port: 50051
+  # -- Bind address inside the pod. Default 127.0.0.1 hides RPC from
+  # other pods; set to 0.0.0.0 to expose via the Service.
+  host: "127.0.0.1"
+  # -- Expose RPC via the Service when enabled.
+  service: false
 
 # -- Topology configuration
 topology:
@@ -70,13 +102,19 @@ topology:
         - address: preview-node.play.dev.cardano.org
           port: 3001
       advertise: false
-  # -- Slot after which to use ledger-based peer discovery
+  # -- Slot after which to use ledger-based peer discovery.
+  # mainnet=0, preview=102729600, preprod=76723200.
   useLedgerAfterSlot: 102729600
 
 # -- Mithril snapshot import for fast initial sync
 mithril:
-  # -- Enable Mithril snapshot import on first startup
+  # -- Enable Mithril snapshot import on first startup. Idempotent — the
+  # init container skips if blocks already exist on the PVC.
   enabled: true
+  # -- Download the Mithril ancillary archive (Haskell ledger state at the
+  # immutable tip) — drops bootstrap time from multi-hour replay to ~15min.
+  # See docs/src/operations/mithril-ancillary.md for the trust model.
+  includeAncillary: true
 
 # -- Logging configuration
 logging:
@@ -84,8 +122,12 @@ logging:
   minSeverity: Info
   # -- RUST_LOG filter string for fine-grained control
   rustLog: "info"
+  # -- Log format: text (human-readable) or json (structured for log shippers)
+  format: text
+  # -- Disable ANSI colors (recommended in container stdout)
+  noColor: true
 
-# -- Peer governor tuning (advanced)
+# -- Peer governor tuning (advanced — match cardano-node defaults)
 peerGovernor:
   # -- Churn interval during normal operation (seconds, default 3300 = 55 min)
   churnIntervalNormalSecs: 3300
@@ -96,28 +138,43 @@ peerGovernor:
   # -- Failure count before hot peer demotion (default 5)
   errorDemotionThreshold: 5
 
-# -- Ledger replay configuration
+# -- Ledger / sync configuration
 ledger:
-  # -- Max blocks to replay from storage (0 = skip, empty = unlimited)
+  # -- Max blocks to replay from storage (env DUGITE_REPLAY_LIMIT).
+  # null = unlimited.
   replayLimit: null
-  # -- Pipeline depth for chain sync
+  # -- Pipelined ChainSync depth (env DUGITE_PIPELINE_DEPTH).
+  # 300 is the in-house default; the chart picks a slightly lower value
+  # to keep memory pressure predictable on tighter pod limits.
   pipelineDepth: 150
-  # -- Max concurrent block fetchers during bulk sync
-  maxConcurrencyBulkSync: 2
-  # -- Max concurrent block fetchers near tip
-  maxConcurrencyDeadline: 4
-  # -- Ledger snapshot interval in minutes (0 = disabled)
-  snapshotInterval: 72
+
+# -- Storage profile: ultra-memory (32GB), high-memory (16GB, default),
+# low-memory (8GB), or minimal (4GB). Tune alongside `resources.limits.memory`.
+storageProfile: high-memory
+
+# -- Consensus mode override: "praos" (default) or "genesis".
+# When set, the value is passed via `--consensus-mode` (#535 — the JSON
+# config field is not yet wired through to the runtime gate).
+consensusMode: ""
+
+# -- Liveness threshold in seconds — /live returns 503 when no block has
+# been applied within this window. Default 600s. Set to 0 to disable.
+# Mirrors the `--liveness-threshold-secs` CLI flag.
+livenessThresholdSecs: 600
+
+# -- Signal ProtVer 11 0 in forged block headers (advertise readiness for
+# the next protocol version). Must remain false on mainnet.
+experimentalHardForksEnabled: false
 
 # -- Block producer configuration (only used when role=producer)
 producer:
-  # -- KES signing key (base64-encoded content or reference to secret)
+  # -- KES signing key (base64-encoded content; chart will b64 it again into a Secret)
   kesKey: ""
   # -- VRF signing key
   vrfKey: ""
   # -- Operational certificate
   operationalCertificate: ""
-  # -- Existing Kubernetes secret containing producer keys
+  # -- Existing Kubernetes secret containing producer keys.
   # Must have keys: kes.skey, vrf.skey, node.cert
   existingSecret: ""
 
@@ -128,7 +185,8 @@ persistence:
   storageClass: ""
   accessMode: ReadWriteOnce
   # -- Preview snapshot: ~16 GiB; preprod: ~50 GiB; mainnet: 150+ GiB.
-  # Resize before deploying to mainnet — 100 GiB is a safe mainnet minimum.
+  # Resize before deploying to mainnet — 200 GiB is a safe mainnet minimum
+  # once Conway-era state and the LSM UTxO backend are accounted for.
   size: 100Gi
   # -- Existing PVC to use
   existingClaim: ""
@@ -162,7 +220,9 @@ podSecurityContext:
   seccompProfile:
     type: RuntimeDefault
 
-# -- Container security context
+# -- Container security context.
+# `readOnlyRootFilesystem: true` is safe because the chart mounts writable
+# volumes at /data/db, /ipc, and /tmp.
 securityContext:
   allowPrivilegeEscalation: false
   readOnlyRootFilesystem: true
@@ -198,7 +258,8 @@ podLabels: {}
 
 # -- Liveness probe.
 # Uses the dedicated /live endpoint (separate from /metrics).
-# /live returns 503 when no block has been applied within liveness_threshold_secs (default 600s).
+# /live returns 503 when no block has been applied within
+# `livenessThresholdSecs` (default 600s).
 # Probes are automatically disabled when metrics.enabled=false.
 livenessProbe:
   httpGet:

@@ -1,7 +1,9 @@
 {{/*
   Network-specific node configuration.
   Genesis files are bundled in the container image at /opt/dugite/config/.
-  The config file references genesis files using absolute paths to the image's config dir.
+  The config file references genesis files using absolute paths to the image's
+  config dir, so the bundled config/{mainnet,preview,preprod}/*.json files are
+  the source of truth for the per-network genesis hashes.
 */}}
 apiVersion: v1
 kind: ConfigMap
@@ -14,29 +16,42 @@ data:
     {
       "Network": {{ if eq .Values.network.name "mainnet" }}"Mainnet"{{ else }}"Testnet"{{ end }},
       "NetworkMagic": {{ include "dugite-node.networkMagic" . }},
+      "Protocol": "Cardano",
       "RequiresNetworkMagic": {{ if eq .Values.network.name "mainnet" }}"RequiresNoMagic"{{ else }}"RequiresMagic"{{ end }},
-      "EnableP2P": true,
-      "PeerSharing": {{ .Values.network.peerSharing | default "PeerSharingPublic" | quote }},
+      "DiffusionMode": {{ .Values.network.diffusionMode | default "InitiatorAndResponder" | quote }},
+      {{- if ne (toString .Values.network.peerSharing) "<nil>" }}
+      "PeerSharing": {{ .Values.network.peerSharing }},
+      {{- end }}
       "TargetNumberOfRootPeers": {{ .Values.network.targetRootPeers | default 60 }},
       "TargetNumberOfActivePeers": {{ .Values.network.targetActivePeers | default 20 }},
-      "TargetNumberOfEstablishedPeers": {{ .Values.network.targetEstablishedPeers | default 40 }},
-      "TargetNumberOfKnownPeers": {{ .Values.network.targetKnownPeers | default 100 }},
+      "TargetNumberOfEstablishedPeers": {{ .Values.network.targetEstablishedPeers | default 30 }},
+      "TargetNumberOfKnownPeers": {{ .Values.network.targetKnownPeers | default 150 }},
       "TargetNumberOfActiveBigLedgerPeers": {{ .Values.network.targetActiveBigLedgerPeers | default 5 }},
       "TargetNumberOfEstablishedBigLedgerPeers": {{ .Values.network.targetEstablishedBigLedgerPeers | default 10 }},
       "TargetNumberOfKnownBigLedgerPeers": {{ .Values.network.targetKnownBigLedgerPeers | default 15 }},
-      "Protocol": "Cardano",
       "ByronGenesisFile": "/opt/dugite/config/{{ .Values.network.name }}/byron-genesis.json",
       "ShelleyGenesisFile": "/opt/dugite/config/{{ .Values.network.name }}/shelley-genesis.json",
       "AlonzoGenesisFile": "/opt/dugite/config/{{ .Values.network.name }}/alonzo-genesis.json",
       "ConwayGenesisFile": "/opt/dugite/config/{{ .Values.network.name }}/conway-genesis.json",
       "MinSeverity": {{ .Values.logging.minSeverity | default "Info" | quote }},
+      {{- if .Values.logging.rustLog }}
+      "LogDirective": {{ .Values.logging.rustLog | quote }},
+      {{- end }}
+      {{- if .Values.experimentalHardForksEnabled }}
+      "ExperimentalHardForksEnabled": true,
+      {{- end }}
       {{- if .Values.peerGovernor }}
       "ChurnIntervalNormalSecs": {{ .Values.peerGovernor.churnIntervalNormalSecs | default 3300 }},
       "ChurnIntervalSyncSecs": {{ .Values.peerGovernor.churnIntervalSyncSecs | default 900 }},
       "StallDemotionCycles": {{ .Values.peerGovernor.stallDemotionCycles | default 6 }},
       "ErrorDemotionThreshold": {{ .Values.peerGovernor.errorDemotionThreshold | default 5 }},
       {{- end }}
-      "MaxConcurrencyBulkSync": {{ .Values.ledger.maxConcurrencyBulkSync | default 2 }},
-      "MaxConcurrencyDeadline": {{ .Values.ledger.maxConcurrencyDeadline | default 4 }},
-      "SnapshotInterval": {{ .Values.ledger.snapshotInterval | default 72 }}
+      {{- if and .Values.rpc .Values.rpc.enabled }}
+      "Rpc": {
+        "Enabled": true,
+        "ListenAddr": {{ .Values.rpc.host | default "127.0.0.1" | quote }},
+        "Port": {{ .Values.rpc.port | default 50051 }}
+      },
+      {{- end }}
+      "MetricsPort": {{ .Values.metrics.port | default 12796 }}
     }

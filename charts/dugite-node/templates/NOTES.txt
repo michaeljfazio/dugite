@@ -41,3 +41,9 @@ Dugite Node deployed as {{ .Values.role }} on {{ .Values.network.name }}!
     kubectl port-forward svc/{{ include "dugite-node.fullname" . }} {{ .Values.metrics.port }}:{{ .Values.metrics.port }}
     curl http://localhost:{{ .Values.metrics.port }}/metrics
   {{- end }}
+  {{- if and .Values.rpc .Values.rpc.enabled .Values.rpc.service }}
+
+  UTxO RPC (gRPC) is exposed on port {{ .Values.rpc.port | default 50051 }}:
+    kubectl port-forward svc/{{ include "dugite-node.fullname" . }} {{ .Values.rpc.port | default 50051 }}:{{ .Values.rpc.port | default 50051 }}
+    grpcurl -plaintext localhost:{{ .Values.rpc.port | default 50051 }} list
+  {{- end }}

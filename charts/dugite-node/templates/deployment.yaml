@@ -36,6 +36,7 @@ spec:
       initContainers:
         - name: mithril-import
           image: "{{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
           securityContext:
             {{- toYaml .Values.securityContext | nindent 12 }}
           command:
@@ -48,6 +49,13 @@ spec:
             - /data/db
             - --temp-dir
             - /tmp/mithril
+            {{- if hasKey .Values.mithril "includeAncillary" }}
+            {{- if .Values.mithril.includeAncillary }}
+            - --include-ancillary
+            {{- else }}
+            - --no-include-ancillary
+            {{- end }}
+            {{- end }}
           volumeMounts:
             - name: data
               mountPath: /data/db
@@ -59,6 +67,7 @@ spec:
       containers:
         - name: {{ .Chart.Name }}
           image: "{{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
           securityContext:
             {{- toYaml .Values.securityContext | nindent 12 }}
           args:
@@ -78,9 +87,41 @@ spec:
             {{- if .Values.metrics.enabled }}
             - --metrics-port
             - {{ .Values.metrics.port | quote }}
+            {{- if .Values.metrics.compat }}
+            - --compat-metrics
+            {{- end }}
+            {{- if .Values.metrics.require }}
+            - --require-metrics
+            {{- end }}
             {{- else }}
-            - --metrics-port
-            - "0"
+            - --no-metrics
+            {{- end }}
+            {{- if and .Values.rpc .Values.rpc.enabled }}
+            - --rpc-host
+            - {{ .Values.rpc.host | default "127.0.0.1" | quote }}
+            - --rpc-port
+            - {{ .Values.rpc.port | default 50051 | quote }}
+            {{- else }}
+            - --no-rpc
+            {{- end }}
+            {{- if .Values.storageProfile }}
+            - --storage-profile
+            - {{ .Values.storageProfile | quote }}
+            {{- end }}
+            {{- if .Values.consensusMode }}
+            - --consensus-mode
+            - {{ .Values.consensusMode | quote }}
+            {{- end }}
+            {{- if hasKey .Values "livenessThresholdSecs" }}
+            - --liveness-threshold-secs
+            - {{ .Values.livenessThresholdSecs | quote }}
+            {{- end }}
+            {{- if .Values.logging.format }}
+            - --log-format
+            - {{ .Values.logging.format | quote }}
+            {{- end }}
+            {{- if .Values.logging.noColor }}
+            - --log-no-color
             {{- end }}
             {{- if eq .Values.role "producer" }}
             - --shelley-kes-key
@@ -108,6 +149,11 @@ spec:
             {{- if .Values.metrics.enabled }}
             - name: metrics
               containerPort: {{ .Values.metrics.port }}
+              protocol: TCP
+            {{- end }}
+            {{- if and .Values.rpc .Values.rpc.enabled }}
+            - name: rpc
+              containerPort: {{ .Values.rpc.port | default 50051 }}
               protocol: TCP
             {{- end }}
           {{- if and .Values.metrics.enabled .Values.livenessProbe }}
