@@ -991,7 +991,7 @@ impl EraRules for ConwayRules {
         from_era: Era,
         ctx: &RuleContext,
         utxo: &mut UtxoSubState,
-        _certs: &mut CertSubState,
+        certs: &mut CertSubState,
         gov: &mut GovSubState,
         _consensus: &mut ConsensusSubState,
         epochs: &mut EpochSubState,
@@ -1068,6 +1068,24 @@ impl EraRules for ConwayRules {
             );
         }
         epochs.ptr_stake_excluded = true;
+
+        // Issue #670: also discard the pointer→credential resolution map.
+        // Haskell's `TranslateEra Babbage→Conway` for `DState` carries the
+        // unified accounts forward but drops the legacy `dsPtrs` mapping
+        // (pointer addresses are not modelled in Conway). dugite's
+        // `from_haskell_snapshot` adapter mirrors this with
+        // `pointer_map: HashMap::new()`; the live era-transition path
+        // must do the same so a from-genesis replay matches an
+        // ancillary-import byte-exact on `CertSubState::pointer_map`.
+        if !certs.pointer_map.is_empty() {
+            let pointer_count = certs.pointer_map.len();
+            certs.pointer_map.clear();
+            tracing::info!(
+                pointer_count,
+                "Conway: cleared pointer→credential resolution map \
+                 (Haskell TranslateEra drops dsPtrs at the era boundary)"
+            );
+        }
 
         // Step 5: Reset utxosDonation to 0.
         utxo.pending_donations = Lovelace(0);
