@@ -4631,7 +4631,8 @@ impl Node {
         //    used to do inline.
         let confirmed: Vec<_> = block.transactions.iter().map(|tx| tx.hash).collect();
         if !confirmed.is_empty() {
-            self.mempool.remove_txs(&confirmed);
+            self.mempool
+                .remove_txs_with_reason(&confirmed, dugite_mempool::MempoolRemoveReason::Mined);
         }
         if !self.mempool.is_empty() {
             let consumed_inputs: std::collections::HashSet<_> = block
@@ -6359,7 +6360,10 @@ impl Node {
                             let bad_tx_hashes: Vec<_> =
                                 block.transactions.iter().map(|tx| tx.hash).collect();
                             if !bad_tx_hashes.is_empty() {
-                                self.mempool.remove_txs(&bad_tx_hashes);
+                                self.mempool.remove_txs_with_reason(
+                                    &bad_tx_hashes,
+                                    dugite_mempool::MempoolRemoveReason::Evicted,
+                                );
                                 error!(
                                     target: "forge",
                                     count = bad_tx_hashes.len(),

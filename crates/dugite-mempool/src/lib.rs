@@ -7,6 +7,7 @@ use parking_lot::{Mutex, RwLock};
 use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
+use tokio::sync::broadcast;
 use tracing::{debug, info, trace, warn};
 
 /// Maximum number of entries the `order` VecDeque may hold, including tombstoned
@@ -53,6 +54,57 @@ impl Default for MempoolConfig {
             max_ref_scripts_bytes: 1_048_576, // 1 MB
         }
     }
+}
+
+/// Capacity of the `MempoolEvent` broadcast channel — issue #672 M0.2.
+///
+/// A subscriber that lags by more than this many events receives
+/// `RecvError::Lagged` and is responsible for re-syncing via
+/// [`Mempool::snapshot`] or equivalent. 4096 covers a multi-second burst
+/// of admissions/evictions at sustainable mempool churn rates without
+/// triggering lag on cooperative subscribers.
+const TX_EVENT_CHANNEL_CAP: usize = 4096;
+
+/// Why a transaction was removed from the mempool — issue #672 M0.2.
+///
+/// Distinguishes block inclusion (`Mined`) from forced eviction (`Evicted`,
+/// e.g. TTL expiry, input conflict with a new block, post-rollback
+/// revalidation) and explicit caller-driven removal (`Manual`).
+///
+/// Cascaded descendant removals — txs that were spending the virtual UTxO
+/// outputs of a removed parent — are always reported as `Evicted`: the
+/// child itself was not directly requested for removal and is not on-chain.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MempoolRemoveReason {
+    /// Removed because included in an applied block.
+    Mined,
+    /// Removed for any other involuntary reason: TTL expiry, input conflict,
+    /// post-rollback revalidation, cascade after a parent removal, etc.
+    Evicted,
+    /// Removed via an explicit caller request that does not match
+    /// `Mined`/`Evicted` (e.g. a test or operator-driven removal).
+    Manual,
+}
+
+/// Mempool change event published on the `tx_events` broadcast channel —
+/// issue #672 M0.2.
+///
+/// Subscribers should treat the channel as best-effort and re-sync via
+/// [`Mempool::snapshot`] / [`Mempool::contains`] on `RecvError::Lagged`.
+#[derive(Clone, Debug)]
+pub enum MempoolEvent {
+    Added {
+        tx_hash: TransactionHash,
+        /// Full transaction CBOR as captured during decode. `None` if the
+        /// transaction was admitted via a path that did not retain raw
+        /// bytes (in practice this should not happen for txs entering via
+        /// N2N/N2C admission — both paths preserve the original CBOR).
+        raw_cbor: Option<Vec<u8>>,
+    },
+    Removed {
+        tx_hash: TransactionHash,
+        reason: MempoolRemoveReason,
+    },
 }
 
 /// Origin of a transaction submission — used for dual-FIFO fairness.
@@ -208,6 +260,13 @@ pub struct Mempool {
     /// Notifies waiting TxSubmission2 clients when new transactions arrive.
     /// Uses `notify_waiters()` so all blocked peers wake simultaneously.
     tx_notify: Arc<tokio::sync::Notify>,
+    /// Payload-bearing mempool change events — issue #672 M0.2.
+    ///
+    /// Sibling channel to `tx_notify`: `tx_notify` is wake-only (used by
+    /// the in-tree TxSubmission2 client), while `tx_events` carries
+    /// [`MempoolEvent`] payloads suitable for external RPC consumers (the
+    /// forthcoming `dugite-rpc` WatchService).
+    tx_events: broadcast::Sender<MempoolEvent>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -270,6 +329,7 @@ impl Mempool {
             remote_fifo: Mutex::new(()),
             all_fifo: Mutex::new(()),
             tx_notify: Arc::new(tokio::sync::Notify::new()),
+            tx_events: broadcast::channel(TX_EVENT_CHANNEL_CAP).0,
         }
     }
 
@@ -277,6 +337,19 @@ impl Mempool {
     /// TxSubmission2 clients await this to replace busy-wait polling.
     pub fn tx_notify(&self) -> Arc<tokio::sync::Notify> {
         self.tx_notify.clone()
+    }
+
+    /// Returns a clone of the [`MempoolEvent`] broadcast sender —
+    /// issue #672 M0.2.
+    ///
+    /// Callers obtain a receiver via `.subscribe()`. Subscribers must handle
+    /// `RecvError::Lagged` themselves (re-sync via [`snapshot`] /
+    /// [`contains`]); the mempool does not back-pressure publish.
+    ///
+    /// [`snapshot`]: Self::snapshot
+    /// [`contains`]: Self::contains
+    pub fn tx_events(&self) -> broadcast::Sender<MempoolEvent> {
+        self.tx_events.clone()
     }
 
     /// Add a transaction to the mempool.
@@ -553,6 +626,15 @@ impl Mempool {
         // Wake all TxSubmission2 clients waiting for new transactions.
         self.tx_notify.notify_waiters();
 
+        // Issue #672 M0.2: publish a payload-bearing MempoolEvent::Added so
+        // external RPC consumers (WatchMempool / WatchTx) can react. Send
+        // errors mean no subscribers, which is the normal case when no RPC
+        // server is attached.
+        let _ = self.tx_events.send(MempoolEvent::Added {
+            tx_hash,
+            raw_cbor: tx.raw_cbor.clone(),
+        });
+
         Ok(MempoolAddResult::Added)
     }
 
@@ -665,8 +747,24 @@ impl Mempool {
     ///    handled without recursion.
     ///
     /// Returns only the directly-removed transaction (not the cascaded ones).
+    ///
+    /// Publishes a `MempoolEvent::Removed { reason: Manual }`. Use
+    /// [`remove_tx_with_reason`](Self::remove_tx_with_reason) to attach a
+    /// more specific reason (`Mined` for block sweep, `Evicted` for
+    /// involuntary removal). Cascaded descendant removals always publish
+    /// `Evicted` regardless of the direct removal's reason.
     pub fn remove_tx(&self, tx_hash: &TransactionHash) -> Option<Transaction> {
-        self.remove_tx_inner(tx_hash, true)
+        self.remove_tx_inner(tx_hash, true, MempoolRemoveReason::Manual)
+    }
+
+    /// Like [`remove_tx`](Self::remove_tx) but tags the published
+    /// [`MempoolEvent::Removed`] with a specific reason — issue #672 M0.2.
+    pub fn remove_tx_with_reason(
+        &self,
+        tx_hash: &TransactionHash,
+        reason: MempoolRemoveReason,
+    ) -> Option<Transaction> {
+        self.remove_tx_inner(tx_hash, true, reason)
     }
 
     /// Inner removal logic.
@@ -674,7 +772,15 @@ impl Mempool {
     /// `cascade` controls whether dependent transactions are recursively removed.
     /// It is always `true` for external callers; the flag exists to prevent
     /// double-cascade during the BFS loop below.
-    fn remove_tx_inner(&self, tx_hash: &TransactionHash, cascade: bool) -> Option<Transaction> {
+    ///
+    /// `reason` tags the `MempoolEvent::Removed` published on success.
+    /// Cascaded descendants always publish `Evicted`.
+    fn remove_tx_inner(
+        &self,
+        tx_hash: &TransactionHash,
+        cascade: bool,
+        reason: MempoolRemoveReason,
+    ) -> Option<Transaction> {
         let (_, entry) = match self.txs.remove(tx_hash) {
             Some(pair) => pair,
             None => {
@@ -722,6 +828,13 @@ impl Mempool {
         );
 
         let removed_tx = entry.tx;
+
+        // Issue #672 M0.2: publish the direct removal before cascading so
+        // subscribers observe the causal parent-then-children order.
+        let _ = self.tx_events.send(MempoolEvent::Removed {
+            tx_hash: *tx_hash,
+            reason,
+        });
 
         if cascade {
             // G7: BFS cascade — collect ALL descendant hashes first, then do a
@@ -788,6 +901,16 @@ impl Mempool {
                             remaining = self.tx_count.load(Ordering::Relaxed),
                             "Mempool: cascade-removed dependent transaction"
                         );
+
+                        // Issue #672 M0.2: a cascaded descendant was not
+                        // mined — its only reason for leaving the mempool
+                        // is loss of the virtual-UTxO parent dependency,
+                        // so tag as Evicted regardless of the direct
+                        // removal's reason.
+                        let _ = self.tx_events.send(MempoolEvent::Removed {
+                            tx_hash: *child_hash,
+                            reason: MempoolRemoveReason::Evicted,
+                        });
                     }
                 }
 
@@ -815,16 +938,31 @@ impl Mempool {
         Some(removed_tx)
     }
 
-    /// Remove multiple transactions (batch removal after block)
+    /// Remove multiple transactions (batch removal after block).
+    ///
+    /// Publishes `MempoolEvent::Removed { reason: Manual }` for each direct
+    /// removal. Use [`remove_txs_with_reason`](Self::remove_txs_with_reason)
+    /// to attach a specific reason (e.g. `Mined` for block sweep).
     pub fn remove_txs(&self, tx_hashes: &[TransactionHash]) {
+        self.remove_txs_with_reason(tx_hashes, MempoolRemoveReason::Manual)
+    }
+
+    /// Like [`remove_txs`](Self::remove_txs) but tags each published
+    /// [`MempoolEvent::Removed`] with `reason` — issue #672 M0.2.
+    pub fn remove_txs_with_reason(
+        &self,
+        tx_hashes: &[TransactionHash],
+        reason: MempoolRemoveReason,
+    ) {
         if !tx_hashes.is_empty() {
             debug!(
                 count = tx_hashes.len(),
+                ?reason,
                 "Mempool: batch removing transactions"
             );
         }
         for hash in tx_hashes {
-            self.remove_tx(hash);
+            self.remove_tx_with_reason(hash, reason);
         }
     }
 
@@ -1098,7 +1236,7 @@ impl Mempool {
 
         let count = expired.len();
         for hash in &expired {
-            self.remove_tx(hash);
+            self.remove_tx_with_reason(hash, MempoolRemoveReason::Evicted);
         }
         if count > 0 {
             info!(
@@ -1180,7 +1318,7 @@ impl Mempool {
             .collect();
 
         for hash in &conflicting {
-            self.remove_tx(hash);
+            self.remove_tx_with_reason(hash, MempoolRemoveReason::Evicted);
         }
         if !conflicting.is_empty() {
             debug!(
@@ -1210,7 +1348,7 @@ impl Mempool {
         for hash in hashes {
             let valid = self.txs.get(&hash).map(|entry| is_valid(&entry.tx));
             if valid == Some(false) {
-                self.remove_tx(&hash);
+                self.remove_tx_with_reason(&hash, MempoolRemoveReason::Evicted);
                 removed.push(hash);
             }
         }
@@ -1238,6 +1376,13 @@ impl Mempool {
         for hash in &order {
             if let Some((_, entry)) = self.txs.remove(hash) {
                 txs.push(entry.tx);
+                // Issue #672 M0.2: each drained tx is involuntarily removed
+                // (rollback handling); subscribers see Evicted. Callers that
+                // re-admit the drained txs will subsequently observe Added.
+                let _ = self.tx_events.send(MempoolEvent::Removed {
+                    tx_hash: *hash,
+                    reason: MempoolRemoveReason::Evicted,
+                });
             }
         }
         self.fee_index.write().clear();
@@ -4846,5 +4991,134 @@ mod tests {
         }
         assert_eq!(mempool.virtual_utxo_count(), 0);
         assert_eq!(mempool.claimed_inputs_count(), 0);
+    }
+
+    // ─── tx_events broadcast (issue #672 M0.2) ────────────────────────────
+
+    /// `Added` fires on successful admission and carries the tx's raw CBOR
+    /// when populated. `Removed` fires on direct removal with the supplied
+    /// reason.
+    #[tokio::test]
+    async fn tx_events_added_then_removed_with_reason() {
+        let mempool = Mempool::new(MempoolConfig::default());
+        let mut events = mempool.tx_events().subscribe();
+
+        let mut tx = make_dummy_tx();
+        let hash = Hash32::from_bytes([7u8; 32]);
+        tx.hash = hash;
+        // Populate raw_cbor so we can verify the event carries it.
+        tx.raw_cbor = Some(vec![0xA5, 0xA5, 0xA5]);
+
+        mempool.add_tx(hash, tx, 200).expect("admit");
+
+        match events.recv().await.expect("Added") {
+            MempoolEvent::Added { tx_hash, raw_cbor } => {
+                assert_eq!(tx_hash, hash);
+                assert_eq!(raw_cbor.as_deref(), Some(&[0xA5, 0xA5, 0xA5][..]));
+            }
+            other => panic!("expected Added, got {other:?}"),
+        }
+
+        mempool.remove_tx_with_reason(&hash, MempoolRemoveReason::Mined);
+
+        match events.recv().await.expect("Removed") {
+            MempoolEvent::Removed { tx_hash, reason } => {
+                assert_eq!(tx_hash, hash);
+                assert_eq!(reason, MempoolRemoveReason::Mined);
+            }
+            other => panic!("expected Removed, got {other:?}"),
+        }
+    }
+
+    /// A direct `remove_tx_with_reason(parent, Mined)` causes cascade-removed
+    /// children to publish `Evicted` (their dependency went away — they were
+    /// not mined themselves).
+    #[tokio::test]
+    async fn tx_events_cascade_descendants_are_evicted_not_mined() {
+        let mempool = Mempool::new(MempoolConfig::default());
+
+        // Build parent → child via the virtual UTxO chain.
+        let mut parent = make_dummy_tx();
+        let parent_hash = Hash32::from_bytes([10u8; 32]);
+        parent.hash = parent_hash;
+        mempool
+            .add_tx(parent_hash, parent.clone(), 200)
+            .expect("admit parent");
+
+        let mut child = make_dummy_tx();
+        let child_hash = Hash32::from_bytes([11u8; 32]);
+        child.hash = child_hash;
+        // Child spends one of parent's outputs (virtual UTxO).
+        child.body.inputs = vec![TransactionInput {
+            transaction_id: parent_hash,
+            index: 0,
+        }];
+        mempool.add_tx(child_hash, child, 200).expect("admit child");
+
+        // Subscribe AFTER admissions so only removal events show up.
+        let mut events = mempool.tx_events().subscribe();
+
+        mempool.remove_tx_with_reason(&parent_hash, MempoolRemoveReason::Mined);
+
+        // Direct removal first → Mined.
+        match events.recv().await.expect("Removed parent") {
+            MempoolEvent::Removed { tx_hash, reason } => {
+                assert_eq!(tx_hash, parent_hash);
+                assert_eq!(reason, MempoolRemoveReason::Mined);
+            }
+            other => panic!("expected Removed(parent), got {other:?}"),
+        }
+        // Cascaded child → Evicted (NOT Mined).
+        match events.recv().await.expect("Removed child") {
+            MempoolEvent::Removed { tx_hash, reason } => {
+                assert_eq!(tx_hash, child_hash);
+                assert_eq!(reason, MempoolRemoveReason::Evicted);
+            }
+            other => panic!("expected Removed(child), got {other:?}"),
+        }
+    }
+
+    /// `remove_txs_with_reason(hashes, Mined)` reports each direct removal
+    /// with that reason — the block-apply path in node/mod.rs depends on
+    /// this so WatchTx can distinguish inclusion from eviction.
+    #[tokio::test]
+    async fn tx_events_remove_txs_with_reason_propagates() {
+        let mempool = Mempool::new(MempoolConfig::default());
+
+        let mut hashes = Vec::new();
+        for i in 0..3 {
+            let mut tx = make_dummy_tx();
+            let h = Hash32::from_bytes([(50 + i) as u8; 32]);
+            tx.hash = h;
+            mempool.add_tx(h, tx, 200).expect("admit");
+            hashes.push(h);
+        }
+
+        let mut events = mempool.tx_events().subscribe();
+
+        mempool.remove_txs_with_reason(&hashes, MempoolRemoveReason::Mined);
+
+        for expected_hash in &hashes {
+            match events.recv().await.expect("Removed") {
+                MempoolEvent::Removed { tx_hash, reason } => {
+                    assert_eq!(&tx_hash, expected_hash);
+                    assert_eq!(reason, MempoolRemoveReason::Mined);
+                }
+                other => panic!("expected Removed, got {other:?}"),
+            }
+        }
+    }
+
+    /// No-subscriber publish is silently dropped — does not panic, does not
+    /// affect normal mempool operation.
+    #[tokio::test]
+    async fn tx_events_no_subscribers_is_not_an_error() {
+        let mempool = Mempool::new(MempoolConfig::default());
+        let mut tx = make_dummy_tx();
+        let hash = Hash32::from_bytes([99u8; 32]);
+        tx.hash = hash;
+        mempool.add_tx(hash, tx, 200).expect("admit");
+        mempool.remove_tx_with_reason(&hash, MempoolRemoveReason::Manual);
+        assert!(!mempool.contains(&hash));
     }
 }
