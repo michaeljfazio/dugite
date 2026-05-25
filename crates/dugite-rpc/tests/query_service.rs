@@ -74,14 +74,16 @@ impl LedgerContext for QueryMock {
         Err(RpcError::Unimplemented(""))
     }
     async fn utxos_by_payment_credential(&self, _: &Hash32) -> Result<Vec<UtxoSnapshot>, RpcError> {
-        Err(RpcError::Unimplemented(""))
+        // QueryMock holds no payment-credential index; empty is the
+        // correct "no matches" response for the supported-pattern path.
+        Ok(Vec::new())
     }
     async fn utxos_by_asset(
         &self,
         _: &Hash32,
         _: Option<&[u8]>,
     ) -> Result<Vec<UtxoSnapshot>, RpcError> {
-        Err(RpcError::Unimplemented(""))
+        Ok(Vec::new())
     }
     async fn params_at_tip(&self) -> Result<ParamsView, RpcError> {
         Ok(ParamsView {
@@ -373,7 +375,7 @@ async fn search_utxos_empty_predicate_returns_unimplemented() {
 }
 
 #[tokio::test]
-async fn search_utxos_payment_part_pattern_returns_unimplemented() {
+async fn search_utxos_payment_part_pattern_succeeds_with_empty_result() {
     use dugite_rpc::proto::v1beta::cardano::{AddressPattern, TxOutputPattern};
     use dugite_rpc::proto::v1beta::query::query_service_client::QueryServiceClient;
     use dugite_rpc::proto::v1beta::query::{
@@ -382,7 +384,7 @@ async fn search_utxos_payment_part_pattern_returns_unimplemented() {
 
     let server = TestServer::start(make_mock()).await;
     let mut client = QueryServiceClient::new(server.channel().await);
-    let status = client
+    let resp = client
         .search_utxos(SearchUtxosRequest {
             predicate: Some(UtxoPredicate {
                 r#match: Some(AnyUtxoPattern {
@@ -404,10 +406,85 @@ async fn search_utxos_payment_part_pattern_returns_unimplemented() {
             start_token: None,
         })
         .await
+        .unwrap()
+        .into_inner();
+    // QueryMock has no UTxOs for this credential so the result is
+    // empty, but the service signals it's a supported pattern by
+    // returning OK rather than UNIMPLEMENTED.
+    assert!(resp.items.is_empty());
+    server.stop().await;
+}
+
+#[tokio::test]
+async fn search_utxos_delegation_part_returns_unimplemented() {
+    use dugite_rpc::proto::v1beta::cardano::{AddressPattern, TxOutputPattern};
+    use dugite_rpc::proto::v1beta::query::query_service_client::QueryServiceClient;
+    use dugite_rpc::proto::v1beta::query::{
+        any_utxo_pattern, AnyUtxoPattern, SearchUtxosRequest, UtxoPredicate,
+    };
+
+    let server = TestServer::start(make_mock()).await;
+    let mut client = QueryServiceClient::new(server.channel().await);
+    let status = client
+        .search_utxos(SearchUtxosRequest {
+            predicate: Some(UtxoPredicate {
+                r#match: Some(AnyUtxoPattern {
+                    utxo_pattern: Some(any_utxo_pattern::UtxoPattern::Cardano(TxOutputPattern {
+                        address: Some(AddressPattern {
+                            exact_address: None,
+                            payment_part: None,
+                            delegation_part: Some(vec![0xBB; 28]),
+                        }),
+                        asset: None,
+                    })),
+                }),
+                not: vec![],
+                all_of: vec![],
+                any_of: vec![],
+            }),
+            field_mask: None,
+            max_items: None,
+            start_token: None,
+        })
+        .await
         .unwrap_err();
-    // payment_part patterns aren't supported yet — service should
-    // signal that explicitly.
     assert_eq!(status.code(), tonic::Code::Unimplemented);
-    assert!(status.message().contains("exact_address"));
+    server.stop().await;
+}
+
+#[tokio::test]
+async fn search_utxos_asset_policy_returns_empty_when_no_matching_utxo() {
+    use dugite_rpc::proto::v1beta::cardano::{AssetPattern, TxOutputPattern};
+    use dugite_rpc::proto::v1beta::query::query_service_client::QueryServiceClient;
+    use dugite_rpc::proto::v1beta::query::{
+        any_utxo_pattern, AnyUtxoPattern, SearchUtxosRequest, UtxoPredicate,
+    };
+
+    let server = TestServer::start(make_mock()).await;
+    let mut client = QueryServiceClient::new(server.channel().await);
+    let resp = client
+        .search_utxos(SearchUtxosRequest {
+            predicate: Some(UtxoPredicate {
+                r#match: Some(AnyUtxoPattern {
+                    utxo_pattern: Some(any_utxo_pattern::UtxoPattern::Cardano(TxOutputPattern {
+                        address: None,
+                        asset: Some(AssetPattern {
+                            policy_id: Some(vec![0xCC; 28]),
+                            asset_name: None,
+                        }),
+                    })),
+                }),
+                not: vec![],
+                all_of: vec![],
+                any_of: vec![],
+            }),
+            field_mask: None,
+            max_items: None,
+            start_token: None,
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(resp.items.is_empty());
     server.stop().await;
 }

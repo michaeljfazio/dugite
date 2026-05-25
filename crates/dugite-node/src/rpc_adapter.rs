@@ -221,19 +221,76 @@ impl LedgerContext for NodeRpcAdapter {
 
     async fn utxos_by_payment_credential(
         &self,
-        _cred: &Hash32,
+        cred: &Hash32,
     ) -> Result<Vec<UtxoSnapshot>, RpcError> {
-        Err(RpcError::Unimplemented(
-            "LedgerContext::utxos_by_payment_credential (no index in v1)",
-        ))
+        use dugite_primitives::credentials::Credential;
+        use dugite_primitives::hash::Hash28;
+
+        // Hash32 is the padded form (28 hash bytes + 4 zero bytes).
+        // Extract the first 28 bytes as the credential payload.
+        let mut h28 = [0u8; 28];
+        h28.copy_from_slice(&cred.as_ref()[..28]);
+        let h28 = Hash28::from_bytes(h28);
+
+        let ledger = self.ledger_state.read().await;
+        // Try VerificationKey first (most common), then Script.
+        let mut out: Vec<UtxoSnapshot> = Vec::new();
+        let cap = 5_000;
+
+        let key_cred = Credential::VerificationKey(h28);
+        for (input, output) in ledger
+            .utxo
+            .utxo_set
+            .outputs_for_payment_credential(&key_cred, cap)
+        {
+            out.push(UtxoSnapshot {
+                ref_: input,
+                output,
+                slot: None,
+            });
+        }
+
+        if out.len() < cap {
+            let script_cred = Credential::Script(h28);
+            for (input, output) in ledger
+                .utxo
+                .utxo_set
+                .outputs_for_payment_credential(&script_cred, cap - out.len())
+            {
+                out.push(UtxoSnapshot {
+                    ref_: input,
+                    output,
+                    slot: None,
+                });
+            }
+        }
+
+        Ok(out)
     }
 
     async fn utxos_by_asset(
         &self,
-        _policy: &Hash32,
-        _name: Option<&[u8]>,
+        policy: &Hash32,
+        name: Option<&[u8]>,
     ) -> Result<Vec<UtxoSnapshot>, RpcError> {
-        Err(RpcError::Unimplemented("LedgerContext::utxos_by_asset"))
+        use dugite_primitives::hash::Hash28;
+        let mut policy_h = [0u8; 28];
+        policy_h.copy_from_slice(&policy.as_ref()[..28]);
+        let policy_h = Hash28::from_bytes(policy_h);
+
+        let ledger = self.ledger_state.read().await;
+        let cap = 5_000;
+        Ok(ledger
+            .utxo
+            .utxo_set
+            .outputs_for_asset(&policy_h, name, cap)
+            .into_iter()
+            .map(|(input, output)| UtxoSnapshot {
+                ref_: input,
+                output,
+                slot: None,
+            })
+            .collect())
     }
 
     async fn params_at_tip(&self) -> Result<ParamsView, RpcError> {
