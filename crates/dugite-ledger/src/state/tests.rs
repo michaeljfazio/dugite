@@ -16475,3 +16475,138 @@ fn test_from_haskell_snapshot_live_preview_committee_issue_485() {
         "genesis member ff9babf2… must remain in committee_expiration"
     );
 }
+
+// ────────────────────────────────────────────────────────────────────────────
+// Issue #668 — Mithril ancillary import backfills snapshot pool owners.
+//
+// cardano-node ≥ 11.0.1 uses the new `StakePoolSnapShot` wire layout that
+// OMITS owners/relays/metadata (they live in `psStakePools` per Haskell
+// ledger architecture).  Before the fix, `convert_stake_snapshot` propagated
+// empty owners into dugite's mark/set/go snapshots, which made the pledge
+// check at `compute_reward_update` fail for every pool — silently routing
+// ~99.9% of the reward pot to undistributed for the first three boundaries
+// after import and breaking the first withdrawal that hit an under-credited
+// reward account (preview block 4313405, WithdrawalAmountMismatch).
+//
+// This test injects a Haskell ancillary state with a pool that:
+//   - has owners + relays + metadata populated in `pstate.stake_pools`
+//   - has owners = [] in `snapshots.{mark,set,go}.pool_params`
+// and asserts that after `from_haskell_snapshot` the snapshot pool_reg
+// owners list is backfilled from the live registration.
+// ────────────────────────────────────────────────────────────────────────────
+#[test]
+fn test_from_haskell_snapshot_backfills_snapshot_pool_owners_issue_668() {
+    use dugite_serialization::haskell_snapshot::types::{
+        HaskellRelay, HaskellSnapShotPool, HaskellStakePoolState,
+    };
+
+    let cur = ProtocolParameters::mainnet_defaults();
+    let prev = ProtocolParameters::mainnet_defaults();
+    let mut hs = dugite_serialization::haskell_snapshot::minimal_haskell_state_for_test(
+        cur.clone(),
+        prev.clone(),
+    );
+
+    let pool_id = Hash28::from_bytes([0x4b; 28]);
+    let owner_a = Hash28::from_bytes([0xe2; 28]);
+    let owner_b = Hash28::from_bytes([0xee; 28]);
+    let reward_account = {
+        let mut v = vec![0xe0];
+        v.extend_from_slice(&[0x11; 28]);
+        v
+    };
+
+    // `pstate.stake_pools` carries the full registration with owners + relays
+    // + metadata (this is what dugite loads into certs.pool_params).
+    hs.new_epoch_state.cert_state.pstate.stake_pools.insert(
+        pool_id,
+        HaskellStakePoolState {
+            vrf_hash: Hash32::from_bytes([0x83; 32]),
+            pledge: 5_000_000_000,
+            cost: 340_000_000,
+            margin_num: 7,
+            margin_den: 100,
+            reward_account: reward_account.clone(),
+            owners: vec![owner_a, owner_b],
+            relays: vec![HaskellRelay::SingleHostAddr(
+                Some(3001),
+                Some([65, 21, 198, 152]),
+                None,
+            )],
+            metadata: Some((
+                "https://example.test/pool.json".to_string(),
+                Hash32::from_bytes([0x48; 32]),
+            )),
+            deposit: 500_000_000,
+        },
+    );
+
+    // Snapshot pool_params: owners/relays/metadata OMITTED, matching the
+    // cardano-node ≥ 11.0.1 `StakePoolSnapShot` wire format.  Every snapshot
+    // gets the same stripped entry so we can verify the backfill applies to
+    // mark / set / go uniformly.
+    let stripped = || HaskellSnapShotPool {
+        vrf_hash: Hash32::from_bytes([0x83; 32]),
+        pledge: 5_000_000_000,
+        cost: 340_000_000,
+        margin_num: 7,
+        margin_den: 100,
+        reward_account: reward_account.clone(),
+        owners: vec![],
+        relays: vec![],
+        metadata: None,
+    };
+    hs.new_epoch_state
+        .snapshots
+        .mark
+        .pool_params
+        .insert(pool_id, stripped());
+    hs.new_epoch_state
+        .snapshots
+        .set
+        .pool_params
+        .insert(pool_id, stripped());
+    hs.new_epoch_state
+        .snapshots
+        .go
+        .pool_params
+        .insert(pool_id, stripped());
+
+    let state = LedgerState::from_haskell_snapshot(&hs);
+
+    // Live certs must still carry the full registration.
+    let live = state
+        .certs
+        .pool_params
+        .get(&pool_id)
+        .expect("live pool reg must be present");
+    assert_eq!(live.owners, vec![owner_a, owner_b]);
+    assert_eq!(live.relays.len(), 1);
+    assert!(live.metadata_url.is_some());
+
+    // The critical invariant: every snapshot's pool_reg.owners must be the
+    // SAME as the live registration.  This is what `compute_reward_update`
+    // reads when running the pledge check at boundary E → E+1, and is the
+    // root cause of issue #668 when missing.
+    for (name, snap) in [
+        ("mark", state.epochs.snapshots.mark.as_ref()),
+        ("set", state.epochs.snapshots.set.as_ref()),
+        ("go", state.epochs.snapshots.go.as_ref()),
+    ] {
+        let snap = snap.unwrap_or_else(|| panic!("{name} snapshot must be Some"));
+        let snap_reg = snap
+            .pool_params
+            .get(&pool_id)
+            .unwrap_or_else(|| panic!("{name}: pool {pool_id:?} must be present in pool_params"));
+        assert_eq!(
+            snap_reg.owners,
+            vec![owner_a, owner_b],
+            "{name}: owners must be backfilled from live psStakePools after Mithril ancillary import"
+        );
+        assert_eq!(snap_reg.relays.len(), 1, "{name}: relays must be backfilled");
+        assert!(
+            snap_reg.metadata_url.is_some(),
+            "{name}: metadata must be backfilled"
+        );
+    }
+}
