@@ -313,6 +313,10 @@ fn build_list_items(app: &App, panel_width: u16) -> Vec<ListItem<'static>> {
 
         // --- Parameter rows ---
         for (item_idx, item) in section.items.iter().enumerate() {
+            if !app.is_visible(sec_idx, item_idx) {
+                continue;
+            }
+
             let is_selected = sec_idx == app.cursor_section && item_idx == app.cursor_item;
             let is_cursor = flat_row == cursor_flat && is_selected;
 
@@ -320,12 +324,12 @@ fn build_list_items(app: &App, panel_width: u16) -> Vec<ListItem<'static>> {
             let display_value = if is_selected && app.is_typing() {
                 app.typing_buffer().to_string()
             } else {
-                entry.display_value()
+                entry.display_value_at(&item.path)
             };
 
             let row = render_item_row(
                 entry,
-                legacy_def(item),
+                item,
                 &display_value,
                 is_cursor,
                 is_selected && app.is_typing(),
@@ -361,11 +365,14 @@ fn build_search_items(app: &App, w: usize) -> Vec<ListItem<'static>> {
         let display_value = if is_cursor && app.is_typing() {
             app.typing_buffer().to_string()
         } else {
-            entry.display_value()
+            entry.display_value_at(&item.path)
         };
 
-        // Compute highlight ranges for the key.
-        let key_ranges = highlight_ranges(&app.search_query, &entry.key);
+        // Compute highlight ranges for the key segment that is shown.
+        // For sub-rows the last path segment is displayed; for top-level rows,
+        // entry.key is used. Match ranges are relative to that segment.
+        let display_key: &str = item.path.last().map(|s| s.as_str()).unwrap_or(&entry.key);
+        let key_ranges = highlight_ranges(&app.search_query, display_key);
 
         // Prepend a section tag in muted text for context.
         items.push(ListItem::new(Line::from(Span::styled(
@@ -375,7 +382,7 @@ fn build_search_items(app: &App, w: usize) -> Vec<ListItem<'static>> {
 
         let row = render_item_row(
             entry,
-            legacy_def(item),
+            item,
             &display_value,
             is_cursor,
             is_cursor && app.is_typing(),
@@ -413,34 +420,57 @@ fn render_section_header(section: &Section, is_cursor: bool, width: usize) -> Li
 /// Render a single parameter row, with optional search highlight ranges.
 fn render_item_row(
     entry: &ConfigEntry,
-    def: Option<&ParamDef>,
+    item: &Item,
     display_value: &str,
     is_cursor: bool,
     is_typing: bool,
     key_ranges: &[(usize, usize)],
     width: usize,
 ) -> ListItem<'static> {
+    use crate::app::ItemDef;
+
     // Reloadability indicator prefix (e.g. "[H] " or "[R] ", empty for unknown).
     // We store the owned string so the &str slice lives long enough.
-    let reload_indicator_owned: String = def
-        .map(|d| format!("{} ", d.reloadability.indicator()))
+    let reload_indicator_owned: String = item
+        .def
+        .reloadability()
+        .map(|r| format!("{} ", r.indicator()))
         .unwrap_or_default();
-    let reload_color = match def.map(|d| d.reloadability) {
+    let reload_color = match item.def.reloadability() {
         Some(Reloadability::Hot) => C_RELOAD_HOT,
         Some(Reloadability::Restart) => C_RELOAD_RESTART,
         None => C_MUTED,
     };
     let reload_indicator: &str = &reload_indicator_owned;
 
-    // Key label (2-space indent, without indicator — indicator is a separate span).
-    let key_label = format!("  {}", entry.key);
+    // Depth-aware indent: 2 base spaces + 2 spaces per depth level.
+    let indent: String = " ".repeat(2 + 2 * (item.depth as usize));
 
-    // Entries surfaced from the schema but absent from the file are rendered
-    // muted with a "(default)" tag so the operator can tell at a glance which
-    // values are pinned in the file vs. inherited from the schema default.
-    // Once the user edits a synthetic entry, `modified` takes precedence.
-    let is_default_only = !entry.present_in_file && !entry.modified;
-    let raw_value = if is_default_only {
+    // Container glyph for expand/collapse.
+    let container_glyph = if item.is_container {
+        if item.expanded {
+            "▾ "
+        } else {
+            "▸ "
+        }
+    } else {
+        ""
+    };
+
+    // Row's display key: last path segment for sub-rows, entry.key for top-level.
+    let row_key: &str = if let Some(last) = item.path.last() {
+        last.as_str()
+    } else {
+        entry.key.as_str()
+    };
+    let key_label = format!("{indent}{container_glyph}{row_key}");
+
+    // Container rows show no value column.
+    // The "(default)" tag only applies to top-level rows (path.is_empty()).
+    let is_default_only = !entry.present_in_file && !entry.modified && item.path.is_empty();
+    let raw_value = if item.is_container {
+        String::new()
+    } else if is_default_only {
         format!("{display_value} (default)")
     } else {
         display_value.to_string()
@@ -454,7 +484,12 @@ fn render_item_row(
     } else if is_default_only {
         C_MUTED
     } else {
-        value_color_for(def, display_value)
+        let param_type = match &item.def {
+            ItemDef::Top(d) => Some(&d.param_type),
+            ItemDef::Sub(s) => Some(&s.param_type),
+            ItemDef::Unknown => None,
+        };
+        value_color_for(param_type, display_value)
     };
 
     // Modified indicator.
@@ -535,9 +570,9 @@ fn render_item_row(
         }
     } else {
         // Build a highlighted key with match ranges marked in amber.
-        // `key_display` includes the 2-space indent; highlight ranges are
-        // relative to `entry.key` (no indent), so offset by 2.
-        let indent_offset = 2usize; // "  " prefix length
+        // `key_display` includes the indent + container glyph; highlight ranges are
+        // relative to `row_key` (no indent), so offset by the prefix length.
+        let indent_offset = indent.len() + container_glyph.len();
         let mut spans: Vec<Span<'static>> = Vec::new();
 
         // Prepend reloadability indicator before the key spans.
@@ -614,8 +649,8 @@ fn render_item_row(
 }
 
 /// Pick a color for the displayed value based on type and content.
-fn value_color_for(def: Option<&ParamDef>, value: &str) -> Color {
-    match def.map(|d| &d.param_type) {
+fn value_color_for(param_type: Option<&ParamType>, value: &str) -> Color {
+    match param_type {
         Some(ParamType::Bool) => {
             if value == "true" {
                 C_SUCCESS
@@ -1038,29 +1073,26 @@ fn cursor_to_flat(app: &App) -> usize {
     let mut flat = 0usize;
     for (sec_idx, section) in app.sections.iter().enumerate() {
         if sec_idx == app.cursor_section {
-            // cursor_item 0 = section header (flat_row = flat)
-            // cursor_item 1+ = child items (flat_row = flat + 1 + cursor_item - 1)
-            //                                         = flat + cursor_item
-            // Wait — app uses cursor_item=0 for the first CHILD, not the header.
-            // The section header is implicit: when cursor is on a section,
-            // the header gets highlighted at flat_row, and items start at flat_row+1.
-            //
-            // Actually checking render_section_header vs parameter rows:
-            // - Section header rendered at flat_row, then flat_row += 1
-            // - Item 0 rendered at the NEXT flat_row
-            //
-            // So cursor_item=0 → first child item → needs flat + 1
-            // But cursor on collapsed section also has cursor_item=0 → header
+            // Cursor is in this section. Count only visible items before cursor_item.
             if section.expanded && !section.items.is_empty() {
-                // Cursor is on child item: +1 for header, +cursor_item for offset
-                return flat + 1 + app.cursor_item;
+                // +1 for section header row, then count visible items up to cursor_item.
+                flat += 1;
+                for item_idx in 0..app.cursor_item {
+                    if app.is_visible(sec_idx, item_idx) {
+                        flat += 1;
+                    }
+                }
             }
-            // Cursor is on section header (collapsed or empty)
+            // If collapsed (or empty), cursor is on the header itself.
             return flat;
         }
         flat += 1; // section header
         if section.expanded {
-            flat += section.items.len();
+            for item_idx in 0..section.items.len() {
+                if app.is_visible(sec_idx, item_idx) {
+                    flat += 1;
+                }
+            }
         }
     }
     flat

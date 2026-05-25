@@ -49,8 +49,6 @@ pub struct Item {
     /// Resolved schema, if any.
     pub def: ItemDef,
     /// Nesting depth (0 = top-level). Drives left-padding in the UI.
-    // Used by Task 11 (UI rendering with depth indent).
-    #[allow(dead_code)]
     pub depth: u8,
     /// True for Object rows (no inline edit; Enter toggles `expanded`).
     pub is_container: bool,
@@ -81,8 +79,6 @@ impl ItemDef {
     }
 
     /// Return the leaf's reloadability, if any.
-    // Used by Task 11 (UI rendering of sub-rows).
-    #[allow(dead_code)]
     pub fn reloadability(&self) -> Option<crate::schema::Reloadability> {
         match self {
             ItemDef::Top(def) => Some(def.reloadability),
