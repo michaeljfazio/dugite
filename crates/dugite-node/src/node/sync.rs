@@ -2197,7 +2197,19 @@ impl Node {
                         }
                     }
                     Err(e) => {
-                        warn!("Failed to decode block during chunk replay: {e}");
+                        // #680 diagnostic: dump exact slice characteristics
+                        // so we can compare against the probe_block tool.
+                        let first16: String = cbor
+                            .iter()
+                            .take(24)
+                            .map(|b| format!("{b:02x}"))
+                            .collect::<Vec<_>>()
+                            .join(" ");
+                        warn!(
+                            "Failed to decode block during chunk replay: {e} \
+                             (slice_len={} first24={first16})",
+                            cbor.len()
+                        );
                     }
                 }
                 Ok(())
