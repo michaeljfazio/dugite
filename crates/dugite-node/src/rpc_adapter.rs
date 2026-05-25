@@ -399,6 +399,29 @@ impl LedgerContext for NodeRpcAdapter {
         }
     }
 
+    async fn eval_tx(&self, era: u16, raw_cbor: &[u8]) -> dugite_rpc::EvalOutcome {
+        // Phase-1 + Phase-2 validation via the same LedgerTxValidator
+        // instance N2C uses. Failure messages flow through verbatim so
+        // clients see the structured TxValidationError reason.
+        let validation = self.tx_validator.validate_tx(era, raw_cbor);
+
+        // Decode separately to extract the fee for the response. If the
+        // decode fails, we can still report the validation error and
+        // leave fee = 0.
+        let fee = match dugite_serialization::decode_transaction(era, raw_cbor) {
+            Ok(tx) => tx.body.fee.0,
+            Err(_) => 0,
+        };
+
+        dugite_rpc::EvalOutcome {
+            fee,
+            error: match validation {
+                Ok(()) => None,
+                Err(e) => Some(format!("{e:?}")),
+            },
+        }
+    }
+
     async fn mempool_snapshot(&self) -> Result<Vec<RawTx>, RpcError> {
         let hashes = self.mempool.tx_hashes_ordered();
         let mut out = Vec::with_capacity(hashes.len());
