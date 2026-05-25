@@ -297,6 +297,105 @@ const ACCEPTED_CONNECTIONS_LIMIT_FIELDS: &[SubParamDef] = &[
     },
 ];
 
+/// Sub-fields for Rpc.Tls (nested object).
+const RPC_TLS_FIELDS: &[SubParamDef] = &[
+    SubParamDef {
+        key: "CertPath",
+        param_type: ParamType::Path,
+        default: "",
+        description: "Path to TLS certificate PEM file. Empty = TLS disabled.",
+        tuning_hint: "Required if exposing the RPC port off-loopback.",
+        reloadability: Reloadability::Restart,
+    },
+    SubParamDef {
+        key: "KeyPath",
+        param_type: ParamType::Path,
+        default: "",
+        description: "Path to TLS private key PEM file.",
+        tuning_hint: "Required if CertPath is set.",
+        reloadability: Reloadability::Restart,
+    },
+];
+
+/// Sub-fields for Rpc.
+const RPC_FIELDS: &[SubParamDef] = &[
+    SubParamDef {
+        key: "Enabled",
+        param_type: ParamType::Bool,
+        default: "false",
+        description: "Master switch for the gRPC server. CLI --rpc-host/--rpc-port \
+                      force-enable; --no-rpc force-disable.",
+        tuning_hint: "Leave off unless serving an integrator/indexer.",
+        reloadability: Reloadability::Restart,
+    },
+    SubParamDef {
+        key: "ListenAddr",
+        param_type: ParamType::String,
+        default: "127.0.0.1",
+        description: "Bind IP. 127.0.0.1 (default) keeps the endpoint on loopback.",
+        tuning_hint: "Only expose off-loopback with TLS configured.",
+        reloadability: Reloadability::Restart,
+    },
+    SubParamDef {
+        key: "Port",
+        param_type: ParamType::U64 { min: 1, max: 65535 },
+        default: "50051",
+        description: "TCP port for gRPC traffic.",
+        tuning_hint: "Default 50051 is the gRPC convention.",
+        reloadability: Reloadability::Restart,
+    },
+    SubParamDef {
+        key: "MaxConcurrentStreams",
+        param_type: ParamType::U64 { min: 1, max: 4096 },
+        default: "64",
+        description: "HTTP/2 streams-per-connection cap.",
+        tuning_hint: "Raise for clients that fan out many subscriptions.",
+        reloadability: Reloadability::Restart,
+    },
+    SubParamDef {
+        key: "StreamBufferSize",
+        param_type: ParamType::U64 { min: 1, max: 65536 },
+        default: "256",
+        description: "Per-stream server-side event buffer size.",
+        tuning_hint: "Increase if clients see overflow under heavy load.",
+        reloadability: Reloadability::Restart,
+    },
+    SubParamDef {
+        key: "ReflectionEnabled",
+        param_type: ParamType::Bool,
+        default: "true",
+        description: "Enable gRPC reflection (useful for grpcurl, evans, etc).",
+        tuning_hint: "Disable for hardened deployments.",
+        reloadability: Reloadability::Restart,
+    },
+    SubParamDef {
+        key: "WebEnabled",
+        param_type: ParamType::Bool,
+        default: "false",
+        description: "Accept gRPC-Web / HTTP1.1 traffic in addition to native HTTP/2.",
+        tuning_hint: "Enable only when serving browser dApps directly.",
+        reloadability: Reloadability::Restart,
+    },
+    SubParamDef {
+        key: "AlphaEnabled",
+        param_type: ParamType::Bool,
+        default: "true",
+        description: "Expose v1alpha endpoints alongside v1beta.",
+        tuning_hint: "Disable once all integrators have moved to v1beta.",
+        reloadability: Reloadability::Restart,
+    },
+    SubParamDef {
+        key: "Tls",
+        param_type: ParamType::Object {
+            fields: RPC_TLS_FIELDS,
+        },
+        default: "",
+        description: "Optional TLS termination — set both CertPath and KeyPath.",
+        tuning_hint: "Required when binding off-loopback.",
+        reloadability: Reloadability::Restart,
+    },
+];
+
 /// All known Cardano node configuration parameters, in section/display order.
 ///
 /// When a key from the loaded JSON file matches an entry here, its metadata is
@@ -1030,7 +1129,7 @@ pub static KNOWN_PARAMS: &[ParamDef] = &[
     ParamDef {
         key: "Rpc",
         section: "Rpc",
-        param_type: ParamType::Object { fields: &[] },
+        param_type: ParamType::Object { fields: RPC_FIELDS },
         // Empty object → server disabled. Operators opt in by setting
         // "Enabled": true and tuning the remaining fields.
         default: "",
@@ -1790,5 +1889,43 @@ mod tests {
         let obj = v.as_object().expect("object");
         assert_eq!(obj["x"], serde_json::json!(1));
         assert_eq!(obj["inner"], serde_json::json!({ "y": true }));
+    }
+
+    #[test]
+    fn test_rpc_subschema_with_tls() {
+        let def = KNOWN_PARAMS
+            .iter()
+            .find(|d| d.key == "Rpc")
+            .expect("present");
+        match &def.param_type {
+            ParamType::Object { fields } => {
+                let keys: Vec<&str> = fields.iter().map(|s| s.key).collect();
+                assert_eq!(
+                    keys,
+                    vec![
+                        "Enabled",
+                        "ListenAddr",
+                        "Port",
+                        "MaxConcurrentStreams",
+                        "StreamBufferSize",
+                        "ReflectionEnabled",
+                        "WebEnabled",
+                        "AlphaEnabled",
+                        "Tls",
+                    ]
+                );
+
+                let tls = fields.iter().find(|s| s.key == "Tls").unwrap();
+                match &tls.param_type {
+                    ParamType::Object { fields: tls_fields } => {
+                        let tls_keys: Vec<&str> = tls_fields.iter().map(|s| s.key).collect();
+                        assert_eq!(tls_keys, vec!["CertPath", "KeyPath"]);
+                        assert!(matches!(tls_fields[0].param_type, ParamType::Path));
+                    }
+                    _ => panic!("Tls must be an Object"),
+                }
+            }
+            _ => panic!("Rpc must be Object"),
+        }
     }
 }
