@@ -351,9 +351,25 @@ impl App {
         if self.edit_mode != EditMode::None {
             return;
         }
-        let Some(item) = self.selected_item() else {
+        let Some(item) = self.selected_item().cloned() else {
             return;
         };
+
+        // Container row → toggle expansion, no typing buffer.
+        if item.is_container {
+            let sec = self.cursor_section;
+            let i = self.cursor_item;
+            let cur = self.sections[sec].items[i].expanded;
+            self.sections[sec].items[i].expanded = !cur;
+            self.feedback = Some(if !cur {
+                format!("Expanded '{}'", self.config.entries[item.entry_idx].key)
+            } else {
+                format!("Collapsed '{}'", self.config.entries[item.entry_idx].key)
+            });
+            return;
+        }
+
+        // Existing per-leaf dispatch (Bool toggle / Enum cycle / Typing buffer).
         let entry = &self.config.entries[item.entry_idx];
         let def = item.def;
 
@@ -1252,6 +1268,33 @@ mod tests {
             }
         }
         assert!(found, "AcceptedConnectionsLimit header row not found");
+    }
+
+    #[test]
+    fn test_begin_edit_on_container_toggles_expansion() {
+        let mut app = make_app(r#"{}"#);
+        move_cursor_to_key(&mut app, "AcceptedConnectionsLimit");
+
+        // Initially collapsed.
+        let initial = app.sections[app.cursor_section].items[app.cursor_item].expanded;
+        assert!(!initial, "Object rows start collapsed");
+
+        app.begin_edit();
+        assert!(
+            app.sections[app.cursor_section].items[app.cursor_item].expanded,
+            "begin_edit on container must expand it"
+        );
+        assert_eq!(
+            app.edit_mode,
+            EditMode::None,
+            "no typing buffer should open"
+        );
+
+        app.begin_edit();
+        assert!(
+            !app.sections[app.cursor_section].items[app.cursor_item].expanded,
+            "second begin_edit must collapse"
+        );
     }
 
     #[test]
