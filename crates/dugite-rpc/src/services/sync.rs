@@ -33,11 +33,12 @@ use tonic::{Request, Response, Status};
 use tracing::warn;
 
 use super::ServiceState;
-use crate::context::{LedgerContext, RawBlock};
+use crate::context::{LedgerContext, RawBlock, TipInfo};
 use crate::error::RpcError;
 use crate::map::block::{any_chain_block, block_ref_from_raw, block_ref_from_tip};
 use crate::proto::{v1alpha, v1beta};
-use crate::stream::spawn_broadcast_fan_out;
+use crate::tip_feed::TipRollback;
+use tokio::sync::broadcast;
 
 const SERVICE_LABEL: &str = "sync";
 
@@ -134,6 +135,152 @@ fn point_to_block_ref(point: &Point) -> (u64, Vec<u8>) {
         Point::Origin => (0, Vec::new()),
         Point::Specific(slot, hash) => (slot.0, hash.as_ref().to_vec()),
     }
+}
+
+/// Resolve a [`TipApply`] event into a v1beta `AnyChainBlock` envelope.
+///
+/// Loads the block CBOR via `LedgerContext::block_by_hash` so streaming
+/// clients receive `native_bytes` + a parsed Cardano `Block` per apply
+/// event — no second `FetchBlock` round-trip required. Logs at WARN if
+/// the lookup or decode fails; falls back to an empty envelope so the
+/// stream stays alive (clients can still see the `tip` BlockRef and
+/// follow up with `FetchBlock`).
+async fn resolve_apply_block(
+    ctx: &Arc<dyn LedgerContext>,
+    tip: &TipInfo,
+) -> v1beta::sync::AnyChainBlock {
+    let mut arr = [0u8; 32];
+    arr.copy_from_slice(&tip.hash);
+    let h = Hash32::from_bytes(arr);
+    match ctx.block_by_hash(&h).await {
+        Ok(Some(raw)) => {
+            let parsed = parse_block(&raw);
+            any_chain_block(&raw, parsed.as_ref())
+        }
+        Ok(None) => {
+            warn!(
+                slot = tip.slot,
+                hash = %hex::encode(tip.hash),
+                "FollowTip: tip block not found in ChainDB; emitting envelope without native_bytes"
+            );
+            v1beta::sync::AnyChainBlock {
+                native_bytes: Vec::new(),
+                chain: None,
+            }
+        }
+        Err(e) => {
+            warn!(
+                slot = tip.slot,
+                hash = %hex::encode(tip.hash),
+                error = ?e,
+                "FollowTip: block_by_hash failed; emitting envelope without native_bytes"
+            );
+            v1beta::sync::AnyChainBlock {
+                native_bytes: Vec::new(),
+                chain: None,
+            }
+        }
+    }
+}
+
+fn recode_block_alpha_envelope(beta: v1beta::sync::AnyChainBlock) -> v1alpha::sync::AnyChainBlock {
+    v1alpha::sync::AnyChainBlock {
+        native_bytes: beta.native_bytes,
+        chain: beta.chain.map(|c| match c {
+            v1beta::sync::any_chain_block::Chain::Cardano(b) => {
+                v1alpha::sync::any_chain_block::Chain::Cardano(recode_block_to_alpha(b))
+            }
+        }),
+    }
+}
+
+/// Spawn the FollowTip stream task — shared between v1alpha and v1beta.
+/// Emits v1beta responses; callers re-encode to v1alpha at the boundary
+/// via `recode_block_alpha_envelope` + a wrapping FollowTipResponse.
+async fn spawn_follow_tip_stream_beta(
+    ctx: Arc<dyn LedgerContext>,
+    buffer: usize,
+    intersection: Option<Point>,
+    mut apply_rx: broadcast::Receiver<TipInfo>,
+    mut rollback_rx: broadcast::Receiver<TipRollback>,
+) -> mpsc::Receiver<Result<v1beta::sync::FollowTipResponse, Status>> {
+    let (tx, rx) = mpsc::channel(buffer);
+    if let Some(point) = intersection {
+        let (slot, hash) = point_to_block_ref(&point);
+        let _ = tx
+            .send(Ok(v1beta::sync::FollowTipResponse {
+                action: Some(v1beta::sync::follow_tip_response::Action::Reset(
+                    v1beta::sync::BlockRef {
+                        slot,
+                        hash,
+                        height: 0,
+                        timestamp: 0,
+                    },
+                )),
+                tip: None,
+            }))
+            .await;
+    }
+    tokio::spawn(async move {
+        loop {
+            tokio::select! {
+                applied = apply_rx.recv() => {
+                    match applied {
+                        Ok(tip) => {
+                            let envelope = resolve_apply_block(&ctx, &tip).await;
+                            let resp = v1beta::sync::FollowTipResponse {
+                                action: Some(v1beta::sync::follow_tip_response::Action::Apply(envelope)),
+                                tip: Some(v1beta::sync::BlockRef {
+                                    slot: tip.slot,
+                                    hash: tip.hash.to_vec(),
+                                    height: tip.block_number,
+                                    timestamp: 0,
+                                }),
+                            };
+                            if tx.send(Ok(resp)).await.is_err() {
+                                break;
+                            }
+                        }
+                        Err(broadcast::error::RecvError::Lagged(n)) => {
+                            warn!(
+                                lagged = n,
+                                "FollowTip: apply broadcast lagged; client may have missed blocks"
+                            );
+                            let _ = tx
+                                .send(Err(Status::resource_exhausted(format!(
+                                    "subscriber lagged by {n} apply events; reconnect and resync"
+                                ))))
+                                .await;
+                            break;
+                        }
+                        Err(broadcast::error::RecvError::Closed) => break,
+                    }
+                }
+                rb = rollback_rx.recv() => {
+                    match rb {
+                        Ok(ev) => {
+                            if tx.send(Ok(v1beta::sync::FollowTipResponse {
+                                action: Some(v1beta::sync::follow_tip_response::Action::Reset(
+                                    v1beta::sync::BlockRef {
+                                        slot: ev.slot,
+                                        hash: ev.hash.to_vec(),
+                                        height: 0,
+                                        timestamp: 0,
+                                    },
+                                )),
+                                tip: None,
+                            })).await.is_err() {
+                                break;
+                            }
+                        }
+                        Err(broadcast::error::RecvError::Closed) => break,
+                        Err(broadcast::error::RecvError::Lagged(_)) => {}
+                    }
+                }
+            }
+        }
+    });
+    rx
 }
 
 // ─── v1alpha ──────────────────────────────────────────────────────────────
@@ -248,81 +395,55 @@ impl v1alpha::sync::sync_service_server::SyncService for SyncSvcAlpha {
             .await
             .map_err(Status::from)?;
 
-        let (mut stream, _) = spawn_broadcast_fan_out::<_, v1alpha::sync::FollowTipResponse, _>(
-            apply_rx,
+        let beta_rx = spawn_follow_tip_stream_beta(
+            self.state.context.clone(),
             self.state.config.stream_buffer,
-            SERVICE_LABEL,
-            "follow_tip",
-            move |tip| {
-                Some(v1alpha::sync::FollowTipResponse {
-                    action: Some(v1alpha::sync::follow_tip_response::Action::Apply(
-                        v1alpha::sync::AnyChainBlock {
-                            native_bytes: Vec::new(),
-                            chain: None,
-                        },
-                    )),
-                    tip: Some(v1alpha::sync::BlockRef {
-                        slot: tip.slot,
-                        hash: tip.hash.to_vec(),
-                        height: tip.block_number,
-                        timestamp: 0,
-                    }),
-                })
-            },
-        );
+            intersection,
+            apply_rx,
+            rollback_rx,
+        )
+        .await;
 
+        // Re-pipe v1beta → v1alpha responses for this stream.
         let (tx, rx) = mpsc::channel(self.state.config.stream_buffer);
-        if let Some(point) = intersection {
-            let (slot, hash) = point_to_block_ref(&point);
-            let _ = tx
-                .send(Ok(v1alpha::sync::FollowTipResponse {
-                    action: Some(v1alpha::sync::follow_tip_response::Action::Reset(
-                        v1alpha::sync::BlockRef {
-                            slot,
-                            hash,
-                            height: 0,
-                            timestamp: 0,
-                        },
-                    )),
-                    tip: None,
-                }))
-                .await;
-        }
         tokio::spawn(async move {
-            let mut rollback_rx = rollback_rx;
-            loop {
-                tokio::select! {
-                    next = futures::StreamExt::next(&mut stream) => {
-                        match next {
-                            Some(item) => if tx.send(item).await.is_err() { break; },
-                            None => break,
+            let mut beta_rx = beta_rx;
+            while let Some(item) = beta_rx.recv().await {
+                let alpha = item.map(|b| v1alpha::sync::FollowTipResponse {
+                    action: b.action.map(|a| match a {
+                        v1beta::sync::follow_tip_response::Action::Apply(blk) => {
+                            v1alpha::sync::follow_tip_response::Action::Apply(
+                                recode_block_alpha_envelope(blk),
+                            )
                         }
-                    }
-                    rb = rollback_rx.recv() => {
-                        match rb {
-                            Ok(ev) => {
-                                if tx.send(Ok(v1alpha::sync::FollowTipResponse {
-                                    action: Some(v1alpha::sync::follow_tip_response::Action::Reset(
-                                        v1alpha::sync::BlockRef {
-                                            slot: ev.slot,
-                                            hash: ev.hash.to_vec(),
-                                            height: 0,
-                                            timestamp: 0,
-                                        },
-                                    )),
-                                    tip: None,
-                                })).await.is_err() {
-                                    break;
-                                }
-                            }
-                            Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
-                            Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
+                        v1beta::sync::follow_tip_response::Action::Undo(blk) => {
+                            v1alpha::sync::follow_tip_response::Action::Undo(
+                                recode_block_alpha_envelope(blk),
+                            )
                         }
-                    }
+                        v1beta::sync::follow_tip_response::Action::Reset(r) => {
+                            v1alpha::sync::follow_tip_response::Action::Reset(
+                                v1alpha::sync::BlockRef {
+                                    slot: r.slot,
+                                    hash: r.hash,
+                                    height: r.height,
+                                    timestamp: r.timestamp,
+                                },
+                            )
+                        }
+                    }),
+                    tip: b.tip.map(|t| v1alpha::sync::BlockRef {
+                        slot: t.slot,
+                        hash: t.hash,
+                        height: t.height,
+                        timestamp: t.timestamp,
+                    }),
+                });
+                if tx.send(alpha).await.is_err() {
+                    break;
                 }
             }
         });
-
         Ok(Response::new(ReceiverStream::new(rx)))
     }
 
@@ -422,80 +543,14 @@ impl v1beta::sync::sync_service_server::SyncService for SyncSvcBeta {
             .await
             .map_err(Status::from)?;
 
-        let (mut stream, _) = spawn_broadcast_fan_out::<_, v1beta::sync::FollowTipResponse, _>(
-            apply_rx,
+        let rx = spawn_follow_tip_stream_beta(
+            self.state.context.clone(),
             self.state.config.stream_buffer,
-            SERVICE_LABEL,
-            "follow_tip",
-            move |tip| {
-                Some(v1beta::sync::FollowTipResponse {
-                    action: Some(v1beta::sync::follow_tip_response::Action::Apply(
-                        v1beta::sync::AnyChainBlock {
-                            native_bytes: Vec::new(),
-                            chain: None,
-                        },
-                    )),
-                    tip: Some(v1beta::sync::BlockRef {
-                        slot: tip.slot,
-                        hash: tip.hash.to_vec(),
-                        height: tip.block_number,
-                        timestamp: 0,
-                    }),
-                })
-            },
-        );
-
-        let (tx, rx) = mpsc::channel(self.state.config.stream_buffer);
-        if let Some(point) = intersection {
-            let (slot, hash) = point_to_block_ref(&point);
-            let _ = tx
-                .send(Ok(v1beta::sync::FollowTipResponse {
-                    action: Some(v1beta::sync::follow_tip_response::Action::Reset(
-                        v1beta::sync::BlockRef {
-                            slot,
-                            hash,
-                            height: 0,
-                            timestamp: 0,
-                        },
-                    )),
-                    tip: None,
-                }))
-                .await;
-        }
-        tokio::spawn(async move {
-            let mut rollback_rx = rollback_rx;
-            loop {
-                tokio::select! {
-                    next = futures::StreamExt::next(&mut stream) => {
-                        match next {
-                            Some(item) => if tx.send(item).await.is_err() { break; },
-                            None => break,
-                        }
-                    }
-                    rb = rollback_rx.recv() => {
-                        match rb {
-                            Ok(ev) => {
-                                if tx.send(Ok(v1beta::sync::FollowTipResponse {
-                                    action: Some(v1beta::sync::follow_tip_response::Action::Reset(
-                                        v1beta::sync::BlockRef {
-                                            slot: ev.slot,
-                                            hash: ev.hash.to_vec(),
-                                            height: 0,
-                                            timestamp: 0,
-                                        },
-                                    )),
-                                    tip: None,
-                                })).await.is_err() {
-                                    break;
-                                }
-                            }
-                            Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
-                            Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
-                        }
-                    }
-                }
-            }
-        });
+            intersection,
+            apply_rx,
+            rollback_rx,
+        )
+        .await;
 
         Ok(Response::new(ReceiverStream::new(rx)))
     }
