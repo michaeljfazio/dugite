@@ -11,7 +11,16 @@ Dugite ships a Helm chart at `charts/dugite-node/` for deploying to Kubernetes a
 
 ## Quick Start
 
-Deploy a relay node on the preview testnet:
+The chart is published as an OCI artifact on every tagged release. Install directly from the registry:
+
+```bash
+helm install dugite-relay \
+  oci://ghcr.io/michaeljfazio/charts/dugite-node \
+  --version 0.4.0 \
+  --set network.name=preview
+```
+
+Or install from a local checkout:
 
 ```bash
 helm install dugite-relay ./charts/dugite-node \
