@@ -702,112 +702,204 @@ fn build_description_content(app: &App) -> Vec<Line<'static>> {
     let entry = &app.config.entries[item.entry_idx];
     let mut lines: Vec<Line<'static>> = Vec::new();
 
-    // Key name.
+    // Dotted display key (entry.key + path joined by '.').
+    let mut display_key = entry.key.clone();
+    for seg in &item.path {
+        display_key.push('.');
+        display_key.push_str(seg);
+    }
+
     lines.push(Line::from(vec![
         Span::styled("Key:  ", Style::default().fg(C_MUTED)),
         Span::styled(
-            entry.key.clone(),
+            display_key,
             Style::default().fg(C_ACCENT).add_modifier(Modifier::BOLD),
         ),
     ]));
 
-    if let Some(def) = legacy_def(item) {
-        // Type row.
-        lines.push(Line::from(vec![
-            Span::styled("Type: ", Style::default().fg(C_MUTED)),
-            Span::styled(def.param_type.label(), Style::default().fg(C_FG)),
-        ]));
+    // Pull description / default / hint / param_type / reloadability from the
+    // resolved schema (Top OR Sub). Unknown rows take the fallback branch.
+    enum SchemaInfo {
+        Known {
+            param_type: &'static ParamType,
+            default: &'static str,
+            description: &'static str,
+            tuning_hint: &'static str,
+            reloadability: Reloadability,
+        },
+        Unknown,
+    }
+    let info = match &item.def {
+        ItemDef::Top(d) => SchemaInfo::Known {
+            param_type: &d.param_type,
+            default: d.default,
+            description: d.description,
+            tuning_hint: d.tuning_hint,
+            reloadability: d.reloadability,
+        },
+        ItemDef::Sub(s) => SchemaInfo::Known {
+            param_type: &s.param_type,
+            default: s.default,
+            description: s.description,
+            tuning_hint: s.tuning_hint,
+            reloadability: s.reloadability,
+        },
+        ItemDef::Unknown => SchemaInfo::Unknown,
+    };
 
-        // Enum values (if applicable).
-        if let ParamType::Enum { values } = &def.param_type {
-            let choices = values.join(" | ");
+    match info {
+        SchemaInfo::Known {
+            param_type,
+            default,
+            description,
+            tuning_hint,
+            reloadability,
+        } => {
+            // Type row.
             lines.push(Line::from(vec![
-                Span::styled("      ", Style::default()),
-                Span::styled(choices, Style::default().fg(Color::Rgb(200, 200, 255))),
+                Span::styled("Type: ", Style::default().fg(C_MUTED)),
+                Span::styled(param_type.label(), Style::default().fg(C_FG)),
             ]));
-        }
 
-        // U64 range (if applicable).
-        if let ParamType::U64 { min, max } = &def.param_type {
-            lines.push(Line::from(vec![
-                Span::styled("Range:", Style::default().fg(C_MUTED)),
-                Span::styled(
-                    format!(" {min}..{max}"),
-                    Style::default().fg(Color::Rgb(255, 200, 100)),
+            // Enum values (if applicable).
+            if let ParamType::Enum { values } = param_type {
+                let choices = values.join(" | ");
+                lines.push(Line::from(vec![
+                    Span::styled("      ", Style::default()),
+                    Span::styled(choices, Style::default().fg(Color::Rgb(200, 200, 255))),
+                ]));
+            }
+
+            // U64 range (if applicable).
+            if let ParamType::U64 { min, max } = param_type {
+                lines.push(Line::from(vec![
+                    Span::styled("Range:", Style::default().fg(C_MUTED)),
+                    Span::styled(
+                        format!(" {min}..{max}"),
+                        Style::default().fg(Color::Rgb(255, 200, 100)),
+                    ),
+                ]));
+            }
+
+            // Default value — for Object containers derive a compact JSON
+            // representation from fields' defaults since the schema-level
+            // `default` string may be empty for container rows.
+            let default_text: String = if matches!(param_type, ParamType::Object { .. }) {
+                if let Some(v) = item.def.param_type().and_then(|pt| match pt {
+                    ParamType::Object { fields } => Some(serde_json::Value::Object(
+                        fields
+                            .iter()
+                            .filter_map(|s| s.default_as_json().map(|d| (s.key.to_string(), d)))
+                            .collect(),
+                    )),
+                    _ => None,
+                }) {
+                    v.to_string()
+                } else {
+                    default.to_string()
+                }
+            } else {
+                default.to_string()
+            };
+            if !default_text.is_empty() {
+                lines.push(Line::from(vec![
+                    Span::styled("Def:  ", Style::default().fg(C_MUTED)),
+                    Span::styled(default_text, Style::default().fg(C_MUTED)),
+                ]));
+            }
+
+            // Reloadability indicator.
+            let (reload_label, reload_col, reload_desc) = match reloadability {
+                Reloadability::Hot => (
+                    "[H] Hot-reloadable",
+                    C_RELOAD_HOT,
+                    "SIGHUP applies this change without restart",
                 ),
-            ]));
-        }
-
-        // Default value.
-        if !def.default.is_empty() {
+                Reloadability::Restart => (
+                    "[R] Restart required",
+                    C_RELOAD_RESTART,
+                    "Node must be restarted for this change to take effect",
+                ),
+            };
             lines.push(Line::from(vec![
-                Span::styled("Def:  ", Style::default().fg(C_MUTED)),
-                Span::styled(def.default, Style::default().fg(C_MUTED)),
+                Span::styled(
+                    reload_label,
+                    Style::default().fg(reload_col).add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(format!(" — {reload_desc}"), Style::default().fg(C_MUTED)),
             ]));
-        }
 
-        // Reloadability indicator.
-        let (reload_label, reload_col, reload_desc) = match def.reloadability {
-            Reloadability::Hot => (
-                "[H] Hot-reloadable",
-                C_RELOAD_HOT,
-                "SIGHUP applies this change without restart",
-            ),
-            Reloadability::Restart => (
-                "[R] Restart required",
-                C_RELOAD_RESTART,
-                "Node must be restarted for this change to take effect",
-            ),
-        };
-        lines.push(Line::from(vec![
-            Span::styled(
-                reload_label,
-                Style::default().fg(reload_col).add_modifier(Modifier::BOLD),
-            ),
-            Span::styled(format!(" — {reload_desc}"), Style::default().fg(C_MUTED)),
-        ]));
+            // Container hint (for Object rows the action is expand/collapse, not edit).
+            if item.is_container {
+                lines.push(Line::from(""));
+                lines.push(Line::from(Span::styled(
+                    "Container — press Enter to expand / collapse.",
+                    Style::default().fg(C_MUTED).add_modifier(Modifier::ITALIC),
+                )));
+            }
 
-        // Separator.
-        lines.push(Line::from(""));
-
-        // Description text (word-wrap is handled by Paragraph::wrap).
-        lines.push(Line::from(Span::styled(
-            def.description,
-            Style::default().fg(C_FG),
-        )));
-
-        // Tuning hint (shown only when non-empty).
-        if !def.tuning_hint.is_empty() {
             lines.push(Line::from(""));
+
+            // Description text (word-wrap is handled by Paragraph::wrap).
             lines.push(Line::from(Span::styled(
-                "Hint:",
-                Style::default().fg(C_HINT).add_modifier(Modifier::BOLD),
+                description,
+                Style::default().fg(C_FG),
             )));
-            lines.push(Line::from(Span::styled(
-                def.tuning_hint,
-                Style::default().fg(C_HINT),
-            )));
+
+            // Tuning hint (shown only when non-empty).
+            if !tuning_hint.is_empty() {
+                lines.push(Line::from(""));
+                lines.push(Line::from(Span::styled(
+                    "Hint:",
+                    Style::default().fg(C_HINT).add_modifier(Modifier::BOLD),
+                )));
+                lines.push(Line::from(Span::styled(
+                    tuning_hint,
+                    Style::default().fg(C_HINT),
+                )));
+            }
         }
-    } else {
-        // Unknown key.
-        lines.push(Line::from(vec![
-            Span::styled("Type: ", Style::default().fg(C_MUTED)),
-            Span::styled("unknown (raw JSON)", Style::default().fg(C_MUTED)),
-        ]));
-        lines.push(Line::from(""));
-        lines.push(Line::from(Span::styled(
-            "This key is not in the known parameter schema. \
-             It will be preserved as-is and is editable as a plain string.",
-            Style::default().fg(C_MUTED),
-        )));
+        SchemaInfo::Unknown => {
+            let (label, body) = if item.path.is_empty() {
+                (
+                    "unknown (raw JSON)",
+                    "This key is not in the known parameter schema. \
+                     It will be preserved as-is and is editable as a plain string.",
+                )
+            } else {
+                (
+                    "unknown sub-field (raw JSON)",
+                    "This sub-key is not documented in dugite-config's schema. \
+                     It is preserved verbatim and edited as raw JSON.",
+                )
+            };
+            lines.push(Line::from(vec![
+                Span::styled("Type: ", Style::default().fg(C_MUTED)),
+                Span::styled(label, Style::default().fg(C_MUTED)),
+            ]));
+            lines.push(Line::from(""));
+            lines.push(Line::from(Span::styled(body, Style::default().fg(C_MUTED))));
+        }
     }
 
-    // Current value (with edit buffer if typing).
+    // Current value (with edit buffer if typing). For sub-leaves, display the
+    // value at the row's path; for containers, show a compact JSON object.
     lines.push(Line::from(""));
     let current = if app.is_typing() {
         format!("{}_", app.typing_buffer()) // cursor blink indicator
+    } else if item.is_container {
+        let pointer = crate::path::path_to_json_pointer(&item.path);
+        let v = if pointer.is_empty() {
+            &entry.value
+        } else {
+            entry
+                .value
+                .pointer(&pointer)
+                .unwrap_or(&serde_json::Value::Null)
+        };
+        v.to_string()
     } else {
-        entry.display_value()
+        entry.display_value_at(&item.path)
     };
     lines.push(Line::from(vec![
         Span::styled("Value:", Style::default().fg(C_MUTED)),
@@ -832,14 +924,18 @@ fn build_description_content(app: &App) -> Vec<Line<'static>> {
         )));
     }
 
-    // Section tag.
+    // Section tag — derive from the top-level entry's schema.
     lines.push(Line::from(""));
-    let section_name = legacy_def(item)
-        .map(|d| d.section)
-        .unwrap_or(SECTION_UNKNOWN);
+    let section_name = legacy_def(item).map(|d| d.section).unwrap_or_else(|| {
+        // For sub-leaves we still want the parent's section.
+        let parent_def = crate::schema::build_lookup()
+            .get(entry.key.as_str())
+            .copied();
+        parent_def.map(|d| d.section).unwrap_or(SECTION_UNKNOWN)
+    });
     lines.push(Line::from(vec![
         Span::styled("Section: ", Style::default().fg(C_MUTED)),
-        Span::styled(section_name, Style::default().fg(C_MUTED)),
+        Span::styled(section_name.to_string(), Style::default().fg(C_MUTED)),
     ]));
 
     lines
