@@ -4436,10 +4436,37 @@ impl Node {
                     delta
                 }
                 Err(e) => {
-                    warn!(
+                    // Issue #669 — surface this as a hard operator-actionable
+                    // signal.  The earlier `warn! + return` was indistinguishable
+                    // from a silent network gap: the chain stops advancing but
+                    // there's no metric increment and no error-level entry, so
+                    // monitoring sees only the absence of further "Chain extended"
+                    // lines.  An apply failure on a fetched block is always one
+                    // of:
+                    //   (a) a dugite bug (the network accepts the block; we
+                    //       mis-validate).  Loud ERROR + metric so the operator
+                    //       files an issue instead of mistaking it for upstream
+                    //       silence.  See #668 for the canonical case.
+                    //   (b) a peer feeding bad data.  Same loud signal; the peer
+                    //       is implicitly throttled by the existing fetch-rate
+                    //       controls and follow-up work (#669) will add explicit
+                    //       per-peer disqualification on apply failure.
+                    self.metrics
+                        .block_apply_failures
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    error!(
+                        peer = %fetched.peer,
                         slot = block_slot.0,
                         block = block_number.0,
-                        "Fetched block failed ledger apply: {e}"
+                        hash = %block_hash.to_hex(),
+                        prev = %block.prev_hash().to_hex(),
+                        txs = block.transactions.len(),
+                        "Fetched block failed ledger apply: {e} \
+                         — chain advance halted at this block. \
+                         Investigate the validation error above; the same \
+                         block will be re-fetched from this and other peers \
+                         and will keep failing until the underlying issue is \
+                         resolved."
                     );
                     return;
                 }
