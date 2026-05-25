@@ -41,11 +41,21 @@ use ratatui::{
     Frame,
 };
 
-use crate::app::{App, Section};
+use crate::app::{App, Item, ItemDef, Section};
 use crate::config::ConfigEntry;
 use crate::diff::DiffEntry;
 use crate::schema::{ParamDef, ParamType, Reloadability, SECTION_UNKNOWN};
 use crate::search::highlight_ranges;
+
+/// Compatibility shim: return the top-level `ParamDef` for an item, or `None`
+/// for sub-rows and unknown keys.  All pre-Task-12 rendering code routes
+/// through this so the UI behaviour for top-level rows is unchanged.
+fn legacy_def(item: &Item) -> Option<&'static ParamDef> {
+    match item.def {
+        ItemDef::Top(d) => Some(d),
+        _ => None,
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Color palette (hard-coded Slate theme matching dugite-monitor)
@@ -315,7 +325,7 @@ fn build_list_items(app: &App, panel_width: u16) -> Vec<ListItem<'static>> {
 
             let row = render_item_row(
                 entry,
-                item.def,
+                legacy_def(item),
                 &display_value,
                 is_cursor,
                 is_selected && app.is_typing(),
@@ -365,7 +375,7 @@ fn build_search_items(app: &App, w: usize) -> Vec<ListItem<'static>> {
 
         let row = render_item_row(
             entry,
-            item.def,
+            legacy_def(item),
             &display_value,
             is_cursor,
             is_cursor && app.is_typing(),
@@ -666,7 +676,7 @@ fn build_description_content(app: &App) -> Vec<Line<'static>> {
         ),
     ]));
 
-    if let Some(def) = item.def {
+    if let Some(def) = legacy_def(item) {
         // Type row.
         lines.push(Line::from(vec![
             Span::styled("Type: ", Style::default().fg(C_MUTED)),
@@ -789,7 +799,9 @@ fn build_description_content(app: &App) -> Vec<Line<'static>> {
 
     // Section tag.
     lines.push(Line::from(""));
-    let section_name = item.def.map(|d| d.section).unwrap_or(SECTION_UNKNOWN);
+    let section_name = legacy_def(item)
+        .map(|d| d.section)
+        .unwrap_or(SECTION_UNKNOWN);
     lines.push(Line::from(vec![
         Span::styled("Section: ", Style::default().fg(C_MUTED)),
         Span::styled(section_name, Style::default().fg(C_MUTED)),

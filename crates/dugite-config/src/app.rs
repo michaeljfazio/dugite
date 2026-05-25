@@ -24,23 +24,78 @@
 
 use std::collections::HashMap;
 
+use serde_json::Value;
+
 use crate::config::{ConfigEntry, LoadedConfig};
 use crate::diff::OriginalValues;
 use crate::schema::{
-    build_lookup, section_priority, ParamDef, ParamType, KNOWN_PARAMS, SECTION_UNKNOWN,
+    build_lookup, section_priority, ParamDef, ParamType, SubParamDef, KNOWN_PARAMS, SECTION_UNKNOWN,
 };
 
 // ---------------------------------------------------------------------------
 // Section / item model
 // ---------------------------------------------------------------------------
 
-/// A single parameter row in the left-panel tree.
-#[derive(Debug)]
+/// A single row in the left-panel tree.
+///
+/// A row addresses either a whole top-level entry (`path.is_empty()`) or a
+/// sub-field inside an Object entry (e.g. `path = ["Tls", "CertPath"]`).
+#[derive(Debug, Clone)]
 pub struct Item {
-    /// Index into [`LoadedConfig::entries`] for this item.
+    /// Index into [`LoadedConfig::entries`] for this row's top-level entry.
     pub entry_idx: usize,
-    /// The resolved parameter definition, if the key is known.
-    pub def: Option<&'static ParamDef>,
+    /// Path inside the top-level entry's `Value`. Empty for top-level rows.
+    // Used by Tasks 7-13 (cursor visibility, editing, diff).
+    #[allow(dead_code)]
+    pub path: Vec<String>,
+    /// Resolved schema, if any.
+    pub def: ItemDef,
+    /// Nesting depth (0 = top-level). Drives left-padding in the UI.
+    // Used by Task 11 (UI rendering with depth indent).
+    #[allow(dead_code)]
+    pub depth: u8,
+    /// True for Object rows (no inline edit; Enter toggles `expanded`).
+    // Used by Tasks 7-8 (cursor visibility, container expansion).
+    #[allow(dead_code)]
+    pub is_container: bool,
+    /// Only meaningful when `is_container`. Object rows start `false`.
+    // Used by Tasks 7-8.
+    #[allow(dead_code)]
+    pub expanded: bool,
+}
+
+/// Resolved schema for an [`Item`].
+#[derive(Debug, Clone, Copy)]
+pub enum ItemDef {
+    /// Top-level entry with a `ParamDef`.
+    Top(&'static crate::schema::ParamDef),
+    /// Sub-leaf inside an Object entry.
+    Sub(&'static crate::schema::SubParamDef),
+    /// No schema available — either a top-level Unknown key or an unknown
+    /// sub-key under a known Object.
+    Unknown,
+}
+
+impl ItemDef {
+    /// Return the leaf's `ParamType`, if any.
+    pub fn param_type(&self) -> Option<&'static crate::schema::ParamType> {
+        match self {
+            ItemDef::Top(def) => Some(&def.param_type),
+            ItemDef::Sub(sub) => Some(&sub.param_type),
+            ItemDef::Unknown => None,
+        }
+    }
+
+    /// Return the leaf's reloadability, if any.
+    // Used by Task 11 (UI rendering of sub-rows).
+    #[allow(dead_code)]
+    pub fn reloadability(&self) -> Option<crate::schema::Reloadability> {
+        match self {
+            ItemDef::Top(def) => Some(def.reloadability),
+            ItemDef::Sub(sub) => Some(sub.reloadability),
+            ItemDef::Unknown => None,
+        }
+    }
 }
 
 /// A logical group of parameters shown as a collapsible section in the tree.
@@ -257,7 +312,7 @@ impl App {
         let entry = &self.config.entries[item.entry_idx];
         let def = item.def;
 
-        match def.map(|d| &d.param_type) {
+        match def.param_type() {
             Some(ParamType::Bool) => {
                 // Instant toggle — no typing buffer needed.
                 let idx = item.entry_idx;
@@ -320,8 +375,8 @@ impl App {
         let def = item.def;
         let entry_idx = item.entry_idx;
 
-        if let Some(def) = def {
-            if let Err(msg) = def.param_type.validate(&raw) {
+        if let Some(pt) = def.param_type() {
+            if let Err(msg) = pt.validate(&raw) {
                 // Store the error in the buffer — stays in edit mode.
                 if let EditMode::Typing { error, .. } = &mut self.edit_mode {
                     *error = Some(msg);
@@ -643,47 +698,64 @@ impl App {
 ///
 /// Steps:
 /// 1. For each entry, look up its section via the schema lookup table.
-/// 2. Group entries by section name.
-/// 3. Sort sections by canonical priority.
+/// 2. Emit a top-level row for the entry.
+/// 3. For Object entries, walk the sub-schema depth-first and emit sub-rows.
+/// 4. Group rows by section name, sort by schema order, sort sections by priority.
 fn build_sections(
     config: &LoadedConfig,
     lookup: &HashMap<&'static str, &'static ParamDef>,
 ) -> Vec<Section> {
-    // Map section name -> list of items (collected unordered, sorted below).
     let mut section_map: HashMap<String, Vec<Item>> = HashMap::new();
 
     for (entry_idx, entry) in config.entries.iter().enumerate() {
-        let def = lookup.get(entry.key.as_str()).copied();
-        let section_name = def
+        let def_opt = lookup.get(entry.key.as_str()).copied();
+        let section_name = def_opt
             .map(|d| d.section.to_string())
             .unwrap_or_else(|| SECTION_UNKNOWN.to_string());
+        let items_for_section = section_map.entry(section_name).or_default();
 
-        section_map
-            .entry(section_name)
-            .or_default()
-            .push(Item { entry_idx, def });
+        // Emit the top-level row.
+        let top_def = def_opt.map(ItemDef::Top).unwrap_or(ItemDef::Unknown);
+        let is_object = matches!(
+            def_opt.map(|d| &d.param_type),
+            Some(ParamType::Object { .. })
+        );
+        items_for_section.push(Item {
+            entry_idx,
+            path: Vec::new(),
+            def: top_def,
+            depth: 0,
+            is_container: is_object,
+            expanded: false,
+        });
+
+        // For Object entries, walk the sub-schema and unknown sub-keys.
+        if let Some(def) = def_opt {
+            if let ParamType::Object { fields } = &def.param_type {
+                let mut path: Vec<String> = Vec::new();
+                walk_object_rows(
+                    entry_idx,
+                    &entry.value,
+                    fields,
+                    1,
+                    &mut path,
+                    items_for_section,
+                );
+            }
+        }
     }
 
-    // Sort items within each section by their position in `KNOWN_PARAMS`.
-    // This keeps the in-TUI order stable regardless of where the key appeared
-    // in the source file or whether the entry is synthetic. Unknown keys (no
-    // schema entry) sort after all known ones, keyed alphabetically.
+    // Cluster items by parent entry to keep sub-rows immediately after their
+    // parent, then sort the clusters by schema order.
     let schema_order: HashMap<&str, usize> = KNOWN_PARAMS
         .iter()
         .enumerate()
         .map(|(i, d)| (d.key, i))
         .collect();
     for items in section_map.values_mut() {
-        items.sort_by(|a, b| {
-            let key_a = config.entries[a.entry_idx].key.as_str();
-            let key_b = config.entries[b.entry_idx].key.as_str();
-            let pa = schema_order.get(key_a).copied().unwrap_or(usize::MAX);
-            let pb = schema_order.get(key_b).copied().unwrap_or(usize::MAX);
-            pa.cmp(&pb).then(key_a.cmp(key_b))
-        });
+        sort_items_by_schema(items, config, &schema_order);
     }
 
-    // Sort sections by priority, then alphabetically within the same priority.
     let mut names: Vec<String> = section_map.keys().cloned().collect();
     names.sort_by(|a, b| {
         let pa = section_priority(a.as_str());
@@ -699,6 +771,103 @@ fn build_sections(
             expanded: true,
         })
         .collect()
+}
+
+/// Append rows for every schema-known sub-field of `value` plus any unknown
+/// sub-keys present in the file, in schema order then alphabetical for
+/// unknowns.
+fn walk_object_rows(
+    entry_idx: usize,
+    value: &Value,
+    fields: &'static [SubParamDef],
+    depth: u8,
+    path: &mut Vec<String>,
+    out: &mut Vec<Item>,
+) {
+    let map = match value.as_object() {
+        Some(m) => m,
+        None => return,
+    };
+
+    // Schema-known sub-fields first, in declared order.
+    for sub in fields {
+        path.push(sub.key.to_string());
+
+        match &sub.param_type {
+            ParamType::Object {
+                fields: inner_fields,
+            } => {
+                out.push(Item {
+                    entry_idx,
+                    path: path.clone(),
+                    def: ItemDef::Sub(sub),
+                    depth,
+                    is_container: true,
+                    expanded: false,
+                });
+                if let Some(child) = map.get(sub.key) {
+                    walk_object_rows(entry_idx, child, inner_fields, depth + 1, path, out);
+                }
+            }
+            _ => {
+                out.push(Item {
+                    entry_idx,
+                    path: path.clone(),
+                    def: ItemDef::Sub(sub),
+                    depth,
+                    is_container: false,
+                    expanded: false,
+                });
+            }
+        }
+
+        path.pop();
+    }
+
+    // Then unknown sub-keys (present in file but absent from schema), alpha order.
+    let known: std::collections::HashSet<&str> = fields.iter().map(|s| s.key).collect();
+    let mut unknown_keys: Vec<&String> =
+        map.keys().filter(|k| !known.contains(k.as_str())).collect();
+    unknown_keys.sort();
+    for k in unknown_keys {
+        path.push(k.clone());
+        out.push(Item {
+            entry_idx,
+            path: path.clone(),
+            def: ItemDef::Unknown,
+            depth,
+            is_container: false, // even if value is an Object — no schema for it
+            expanded: false,
+        });
+        path.pop();
+    }
+}
+
+fn sort_items_by_schema(
+    items: &mut Vec<Item>,
+    config: &LoadedConfig,
+    schema_order: &HashMap<&str, usize>,
+) {
+    let mut clusters: HashMap<usize, Vec<Item>> = HashMap::new();
+    let mut order: Vec<usize> = Vec::new();
+    for item in items.drain(..) {
+        if !clusters.contains_key(&item.entry_idx) {
+            order.push(item.entry_idx);
+        }
+        clusters.entry(item.entry_idx).or_default().push(item);
+    }
+
+    order.sort_by(|a, b| {
+        let key_a = config.entries[*a].key.as_str();
+        let key_b = config.entries[*b].key.as_str();
+        let pa = schema_order.get(key_a).copied().unwrap_or(usize::MAX);
+        let pb = schema_order.get(key_b).copied().unwrap_or(usize::MAX);
+        pa.cmp(&pb).then(key_a.cmp(key_b))
+    });
+
+    for idx in order {
+        items.extend(clusters.remove(&idx).unwrap_or_default());
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1004,5 +1173,39 @@ mod tests {
             fb.contains("invalid PID") || fb.contains("SIGHUP skipped"),
             "Expected feedback about invalid PID, got: '{fb}'"
         );
+    }
+
+    #[test]
+    fn test_build_sections_emits_object_header_with_default_state() {
+        use crate::schema::KNOWN_PARAMS;
+        let app = make_app(r#"{}"#);
+
+        // Verify all current ParamType::Object entries default-collapsed.
+        let any_object = KNOWN_PARAMS.iter().any(|d| {
+            matches!(
+                &d.param_type,
+                crate::schema::ParamType::Object { fields: _ }
+            )
+        });
+        assert!(
+            any_object,
+            "test premise: at least one Object exists in schema"
+        );
+
+        // Locate the AcceptedConnectionsLimit header row and confirm its flags.
+        let mut found = false;
+        for section in &app.sections {
+            for item in &section.items {
+                if app.config.entries[item.entry_idx].key == "AcceptedConnectionsLimit"
+                    && item.path.is_empty()
+                {
+                    assert!(item.is_container, "Object row must be a container");
+                    assert!(!item.expanded, "Object rows start collapsed");
+                    assert_eq!(item.depth, 0, "top-level row depth must be 0");
+                    found = true;
+                }
+            }
+        }
+        assert!(found, "AcceptedConnectionsLimit header row not found");
     }
 }
