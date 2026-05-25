@@ -46,13 +46,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Err("pool id must be 28 bytes".into());
     }
 
-    let cred28 = Hash28::from_bytes(
-        <[u8; 28]>::try_from(cred_bytes.as_slice()).expect("cred is 28 bytes"),
-    );
+    let cred28 =
+        Hash28::from_bytes(<[u8; 28]>::try_from(cred_bytes.as_slice()).expect("cred is 28 bytes"));
     let cred32_key = cred28.to_hash32_padded();
-    let pool_id = Hash28::from_bytes(
-        <[u8; 28]>::try_from(pool_bytes.as_slice()).expect("pool is 28 bytes"),
-    );
+    let pool_id =
+        Hash28::from_bytes(<[u8; 28]>::try_from(pool_bytes.as_slice()).expect("pool is 28 bytes"));
 
     println!("Loading snapshot: {}", snapshot_path.display());
     let state = LedgerState::load_snapshot(&snapshot_path)?;
@@ -122,22 +120,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cur_blocks = state.consensus.epoch_blocks_by_pool.get(&pool_id).copied();
     println!("consensus.epoch_blocks_by_pool[pool]: {:?}", cur_blocks);
 
-    fn dump_snap(
-        name: &str,
-        snap: Option<&StakeSnapshot>,
-        cred: &Hash32,
-        pool: &Hash28,
-    ) {
+    fn dump_snap(name: &str, snap: Option<&StakeSnapshot>, cred: &Hash32, pool: &Hash28) {
         match snap {
             None => println!("{:>5}: <None>", name),
             Some(s) => {
                 let pool_stake = s.pool_stake.get(pool).copied();
                 let pool_in_params = s.pool_params.contains_key(pool);
-                let delegators_count = s
-                    .delegations
-                    .iter()
-                    .filter(|(_, p)| *p == pool)
-                    .count();
+                let delegators_count = s.delegations.iter().filter(|(_, p)| *p == pool).count();
                 let our_deleg = s.delegations.get(cred);
                 let our_stake = s.stake_distribution.get(cred).copied();
                 println!(
@@ -161,7 +150,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     for owner in &pool_reg.owners {
                         let owner_h32 = owner.to_hash32_padded();
                         let owner_deleg = s.delegations.get(&owner_h32);
-                        let owner_st = s.stake_distribution.get(&owner_h32).map(|l| l.0).unwrap_or(0);
+                        let owner_st = s
+                            .stake_distribution
+                            .get(&owner_h32)
+                            .map(|l| l.0)
+                            .unwrap_or(0);
                         let in_this_pool = owner_deleg == Some(pool);
                         println!(
                             "       owner_h32={} delegated_to_this_pool={} stake_in_snap={}",
@@ -183,9 +176,24 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     println!("\n=== Stake snapshots (mark/set/go) ===");
-    dump_snap("mark", state.epochs.snapshots.mark.as_ref(), &cred32_key, &pool_id);
-    dump_snap("set", state.epochs.snapshots.set.as_ref(), &cred32_key, &pool_id);
-    dump_snap("go", state.epochs.snapshots.go.as_ref(), &cred32_key, &pool_id);
+    dump_snap(
+        "mark",
+        state.epochs.snapshots.mark.as_ref(),
+        &cred32_key,
+        &pool_id,
+    );
+    dump_snap(
+        "set",
+        state.epochs.snapshots.set.as_ref(),
+        &cred32_key,
+        &pool_id,
+    );
+    dump_snap(
+        "go",
+        state.epochs.snapshots.go.as_ref(),
+        &cred32_key,
+        &pool_id,
+    );
 
     println!("\n=== Aggregate bprev ===");
     {
@@ -222,14 +230,21 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             .filter(|p| p.owners.is_empty())
             .count();
         let certs_total = state.certs.pool_params.len();
-        println!("certs.pool_params: {}/{} pools have no owners", certs_no_owners, certs_total);
+        println!(
+            "certs.pool_params: {}/{} pools have no owners",
+            certs_no_owners, certs_total
+        );
         for (name, snap) in [
             ("mark", state.epochs.snapshots.mark.as_ref()),
             ("set", state.epochs.snapshots.set.as_ref()),
             ("go", state.epochs.snapshots.go.as_ref()),
         ] {
             if let Some(s) = snap {
-                let no_owners = s.pool_params.values().filter(|p| p.owners.is_empty()).count();
+                let no_owners = s
+                    .pool_params
+                    .values()
+                    .filter(|p| p.owners.is_empty())
+                    .count();
                 let total = s.pool_params.len();
                 println!("{}: {}/{} pools have no owners", name, no_owners, total);
             }

@@ -71,9 +71,9 @@ fn cek_reaches_body_no_var_lookup_failure() {
         Box::new(Term::Const(Constant::Data(stub_ctx))),
     );
 
-    let err = dugite_uplc::machine::step::evaluate(applied)
-        .err()
-        .expect("stub ctx is too thin to satisfy unConstrData/headList — expect a builtin error");
+    let err = dugite_uplc::machine::step::evaluate(applied).expect_err(
+        "stub ctx is too thin to satisfy unConstrData/headList — expect a builtin error",
+    );
     let msg = format!("{err:?}");
     assert!(
         !msg.contains("De Bruijn"),
