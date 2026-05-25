@@ -21,6 +21,7 @@ pub(crate) mod peer_connection;
 pub(crate) mod query;
 pub(crate) mod serve;
 pub(crate) mod sync;
+pub mod tip_broadcast;
 
 use anyhow::Result;
 use std::collections::HashMap;
@@ -415,6 +416,13 @@ pub struct Node {
     /// Broadcast sender for notifying connected peers of chain rollbacks
     pub(crate) rollback_announcement_tx:
         Option<tokio::sync::broadcast::Sender<RollbackAnnouncement>>,
+    /// Payload-bearing tip event broadcaster — issue #672 M0.1.
+    ///
+    /// Sibling channel pair carrying `TipApply` / `TipRollback` events with
+    /// richer payloads (era) than the existing announcement channels. Fanned
+    /// in additively from the same send sites; consumed by external RPC.
+    /// `None` until `run()` initialises it alongside the announcement channels.
+    pub(crate) tip_broadcaster: Option<Arc<tip_broadcast::TipBroadcaster>>,
     /// Prometheus metrics port
     pub(crate) metrics_port: u16,
     /// Make a metrics bind failure fatal (see `--require-metrics`)
@@ -1798,6 +1806,7 @@ impl Node {
             block_producer,
             block_announcement_tx: None,
             rollback_announcement_tx: None,
+            tip_broadcaster: None,
             metrics_port: args.metrics_port,
             require_metrics: args.require_metrics,
             expected_byron_genesis_hash,
@@ -2205,6 +2214,7 @@ impl Node {
                 tokio::sync::broadcast::channel::<RollbackAnnouncement>(ROLLBACK_ANN_CHANNEL_CAP);
             self.block_announcement_tx = Some(block_ann_tx.clone());
             self.rollback_announcement_tx = Some(rollback_ann_tx.clone());
+            self.tip_broadcaster = Some(Arc::new(tip_broadcast::TipBroadcaster::new()));
             let n2c_block_ann_tx = block_ann_tx;
             let n2c_rollback_ann_tx = rollback_ann_tx;
             // C4 + G3: bound the number of concurrent N2C connections.
@@ -2809,6 +2819,7 @@ impl Node {
                 tokio::sync::broadcast::channel::<RollbackAnnouncement>(ROLLBACK_ANN_CHANNEL_CAP);
             self.block_announcement_tx = Some(block_ann_tx);
             self.rollback_announcement_tx = Some(rollback_ann_tx);
+            self.tip_broadcaster = Some(Arc::new(tip_broadcast::TipBroadcaster::new()));
         }
         // Channel for the N2N listener to send accepted+handshaked connections
         // to the main run loop for lifecycle manager registration.
@@ -4238,6 +4249,14 @@ impl Node {
                                                 hash: hash_bytes,
                                                 block_number: fork_block_no.0,
                                             });
+                                            if let Some(ref tb) = self.tip_broadcaster {
+                                                tb.announce_apply(tip_broadcast::TipApply {
+                                                    slot: fork_slot.0,
+                                                    hash: hash_bytes,
+                                                    block_number: fork_block_no.0,
+                                                    era: fork_block.era,
+                                                });
+                                            }
                                         }
                                         // Stash this block as the most recent
                                         // successful apply.  Subsequent
@@ -4522,6 +4541,14 @@ impl Node {
                 hash: hash_bytes,
                 block_number: block_number.0,
             });
+            if let Some(ref tb) = self.tip_broadcaster {
+                tb.announce_apply(tip_broadcast::TipApply {
+                    slot: block_slot.0,
+                    hash: hash_bytes,
+                    block_number: block_number.0,
+                    era: block.era,
+                });
+            }
             debug!(
                 slot = block_slot.0,
                 block = block_number.0,
@@ -6253,6 +6280,14 @@ impl Node {
                                             hash: hash_bytes,
                                             block_number: fork_block_no.0,
                                         });
+                                        if let Some(ref tb) = self.tip_broadcaster {
+                                            tb.announce_apply(tip_broadcast::TipApply {
+                                                slot: fork_slot.0,
+                                                hash: hash_bytes,
+                                                block_number: fork_block_no.0,
+                                                era: fork_block.era,
+                                            });
+                                        }
                                     }
                                 }
                                 !replay_failed
@@ -6405,6 +6440,14 @@ impl Node {
                         hash: hash_bytes,
                         block_number: block_number.0,
                     });
+                    if let Some(ref tb) = self.tip_broadcaster {
+                        tb.announce_apply(tip_broadcast::TipApply {
+                            slot: next_slot.0,
+                            hash: hash_bytes,
+                            block_number: block_number.0,
+                            era: block.era,
+                        });
+                    }
 
                     if subscribers == 0 {
                         warn!(
