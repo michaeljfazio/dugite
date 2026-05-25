@@ -8988,25 +8988,28 @@ fn make_conway_state_with_treasury(treasury: u64) -> LedgerState {
 }
 
 /// Conway LEDGERS rule: when a transaction body declares `currentTreasuryValue`
-/// (field 19) and the value does not match the ledger's treasury balance, the
-/// block must be rejected.
+/// and the value does not match the ledger's treasury balance, the apply
+/// path emits a warning but does NOT silently self-correct the treasury.
+///
+/// Issue #678: the prior self-correction (`epochs.treasury = declared`) was
+/// masking upstream treasury-calculation drift during live sync. The
+/// MismatchedTreasuryValue WARN now points at a real per-epoch accounting
+/// bug. The legacy ValidateAll path keeps `epochs.treasury` untouched so the
+/// underlying divergence is visible.
 #[test]
-fn test_treasury_value_mismatch_corrects_treasury() {
-    // Ledger treasury = 1_000_000 lovelace
+fn test_treasury_value_mismatch_does_not_self_correct() {
     let mut state = make_conway_state_with_treasury(1_000_000);
 
-    // Build a transaction that declares treasury_value = 9_999 (wrong)
     let mut tx = Transaction::empty_with_hash(Hash32::from_bytes([1u8; 32]));
     tx.is_valid = true;
     tx.body.treasury_value = Some(Lovelace(9_999));
 
     let block = make_test_block(1, 1, Hash32::ZERO, vec![tx]);
-    // On confirmed blocks, treasury mismatch is a warning — the ledger
-    // self-corrects by adopting the on-chain declared value.
     let _result = state.apply_block(&block, BlockValidationMode::ValidateAll);
     assert_eq!(
-        state.epochs.treasury.0, 9_999,
-        "Treasury must be corrected to match the on-chain declared value"
+        state.epochs.treasury.0, 1_000_000,
+        "Treasury must NOT be silently self-corrected; the divergence \
+         should remain visible via the WARN log per #678"
     );
 }
 
@@ -10006,11 +10009,13 @@ fn test_treasury_value_mismatch_corrects_and_applies() {
     tx.body.fee = Lovelace(1_000_000);
 
     let block = make_test_block(1, 1, Hash32::ZERO, vec![tx]);
-    // Treasury mismatch is now a warning — block is applied and treasury corrected.
+    // Treasury mismatch is logged as WARN but does NOT trigger silent
+    // self-correction (issue #678). The actual treasury value is preserved
+    // so the underlying ledger-calculation drift remains visible.
     let _result = state.apply_block(&block, BlockValidationMode::ValidateAll);
     assert_eq!(
-        state.epochs.treasury.0, 999_999_999_999,
-        "Treasury must be corrected to the on-chain declared value"
+        state.epochs.treasury.0, 500_000_000_000,
+        "Treasury must NOT be silently self-corrected per #678"
     );
 }
 
@@ -13291,26 +13296,23 @@ fn test_treasury_mismatch_does_not_abort_apply_block() {
 
     let block = make_test_block(1000, 100, Hash32::ZERO, vec![tx]);
 
-    // Use ValidateAll — this is the mode that triggers the treasury check and
-    // was the exact code path that caused the cascade failure at slot 107229218.
-    state
-        .apply_block(&block, BlockValidationMode::ValidateAll)
-        .expect("TreasuryValueMismatch must not abort apply_block for confirmed blocks");
-
-    // Block output MUST be in UTxO set.
-    let produced = TransactionInput {
-        transaction_id: Hash32::from_bytes([0xB0u8; 32]),
-        index: 0,
-    };
+    // Per #678: the Conway era-rules path in `conway.rs::apply_valid_tx`
+    // hard-fails on treasury mismatch (matching Haskell
+    // `Cardano.Ledger.Conway.Rules.Ledger.hs:442` MismatchedTreasuryValue),
+    // and the legacy apply.rs:500 path no longer silently self-corrects.
+    // ValidateAll mode now correctly rejects the block.
+    let result = state.apply_block(&block, BlockValidationMode::ValidateAll);
     assert!(
-        state.utxo.utxo_set.contains(&produced),
-        "Block output must be inserted despite treasury mismatch"
+        matches!(result, Err(LedgerError::BlockTxValidationFailed { ref errors, .. })
+            if errors.contains("MismatchedTreasuryValue")),
+        "ValidateAll must reject treasury mismatch (no silent correction) per #678; \
+         got: {result:?}"
     );
 
-    // Treasury MUST be corrected to the declared value.
+    // Treasury must NOT be silently self-corrected.
     assert_eq!(
-        state.epochs.treasury.0, declared_treasury.0,
-        "state.epochs.treasury must self-correct to the declared on-chain value"
+        state.epochs.treasury.0, 0,
+        "state.epochs.treasury must NOT silently self-correct per #678"
     );
 }
 
@@ -13347,38 +13349,29 @@ fn test_treasury_mismatch_no_cascade_in_downstream_block() {
         Lovelace(99_000_000_000), // wrong treasury
     );
     let block_a = make_test_block(1000, 100, Hash32::ZERO, vec![tx_a]);
-    state
-        .apply_block(&block_a, BlockValidationMode::ValidateAll)
-        .expect("Block A must apply despite treasury mismatch");
-
+    // Per #678: ValidateAll now correctly rejects treasury mismatches —
+    // there is no longer a silent self-correction that hides the
+    // underlying ledger-calculation drift. The block is rejected; tx_a's
+    // outputs are NOT inserted.
+    let result_a = state.apply_block(&block_a, BlockValidationMode::ValidateAll);
+    assert!(
+        matches!(result_a, Err(LedgerError::BlockTxValidationFailed { ref errors, .. })
+            if errors.contains("MismatchedTreasuryValue")),
+        "Block A must be rejected on treasury mismatch (no silent correction); \
+         got: {result_a:?}"
+    );
     let output_a = TransactionInput {
         transaction_id: Hash32::from_bytes([0xC1u8; 32]),
         index: 0,
     };
     assert!(
-        state.utxo.utxo_set.contains(&output_a),
-        "output_a must be in UTxO set after Block A"
-    );
-
-    // Block B: spend output_a — must NOT get InputNotFound.
-    let block_a_hash = Hash32::from_bytes([100u8; 32]); // header_hash from make_test_block
-    let tx_b = make_simple_tx(
-        0xC2,
-        vec![output_a.clone()],
-        vec![make_lovelace_output(9_600_000)],
-    );
-    let block_b = make_test_block(1001, 101, block_a_hash, vec![tx_b]);
-    state
-        .apply_block(&block_b, BlockValidationMode::ApplyOnly)
-        .expect(
-            "Block B must apply — output_a must be visible (no cascade from treasury mismatch)",
-        );
-
-    // output_a must be consumed.
-    assert!(
         !state.utxo.utxo_set.contains(&output_a),
-        "output_a must be consumed by Block B"
+        "output_a must NOT be in UTxO set when Block A is rejected"
     );
+
+    // The "no cascade" property is preserved because Block A doesn't apply
+    // at all — there's nothing to cascade from. Downstream blocks that
+    // reference rejected outputs would correctly fail Phase-1 InputNotFound.
 }
 
 /// Regression: UnelectedCommitteeMember must NOT abort apply_block for
