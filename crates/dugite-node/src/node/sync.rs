@@ -184,19 +184,25 @@ impl Node {
     /// LocalChainSync server subscribe to this channel and translate the
     /// announcement into `MsgRollBackward` messages for their downstream peers.
     pub async fn notify_rollback(&self, rollback_point: &Point) {
-        if let Some(ref tx) = self.rollback_announcement_tx {
-            let rb_slot = rollback_point.slot().map(|s| s.0).unwrap_or(0);
-            let rb_hash = rollback_point
-                .hash()
-                .map(|h| {
-                    let bytes: &[u8] = h.as_ref();
-                    let mut arr = [0u8; 32];
-                    arr.copy_from_slice(bytes);
-                    arr
-                })
-                .unwrap_or([0u8; 32]);
+        let rb_slot = rollback_point.slot().map(|s| s.0).unwrap_or(0);
+        let rb_hash = rollback_point
+            .hash()
+            .map(|h| {
+                let bytes: &[u8] = h.as_ref();
+                let mut arr = [0u8; 32];
+                arr.copy_from_slice(bytes);
+                arr
+            })
+            .unwrap_or([0u8; 32]);
 
+        if let Some(ref tx) = self.rollback_announcement_tx {
             let _ = tx.send(RollbackAnnouncement {
+                slot: rb_slot,
+                hash: rb_hash,
+            });
+        }
+        if let Some(ref tb) = self.tip_broadcaster {
+            tb.announce_rollback(crate::node::tip_broadcast::TipRollback {
                 slot: rb_slot,
                 hash: rb_hash,
             });
