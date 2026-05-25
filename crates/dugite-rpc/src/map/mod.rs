@@ -18,6 +18,7 @@
 pub mod block;
 pub mod cert;
 pub mod common;
+pub mod governance;
 pub mod metadatum;
 pub mod plutus_data;
 pub mod pparams;
