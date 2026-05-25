@@ -175,24 +175,30 @@ impl SubParamDef {
     /// `None` if the default string cannot be parsed (numeric / Bool / Enum
     /// with `default: ""`).
     pub fn default_as_json(&self) -> Option<Value> {
-        match &self.param_type {
-            ParamType::Bool => self.default.parse::<bool>().ok().map(Value::Bool),
-            ParamType::U64 { .. } => self
-                .default
-                .parse::<u64>()
-                .ok()
-                .map(|n| Value::Number(serde_json::Number::from(n))),
-            ParamType::F64 { .. } => self
-                .default
-                .parse::<f64>()
-                .ok()
-                .and_then(serde_json::Number::from_f64)
-                .map(Value::Number),
-            ParamType::String | ParamType::Path | ParamType::Enum { .. } => {
-                Some(Value::String(self.default.to_string()))
-            }
-            ParamType::Object { fields } => Some(object_default(fields)),
+        parse_default_as_json(&self.param_type, self.default)
+    }
+}
+
+/// Parse a default-string into a JSON value matching `param_type`. Returns
+/// `None` for unparseable numeric/Bool/Enum defaults (e.g. empty string on a
+/// numeric type, which the schema uses to mean "no schema default"). For
+/// Object types, recursively synthesises a `Value::Object` from `fields`.
+pub(crate) fn parse_default_as_json(param_type: &ParamType, default: &str) -> Option<Value> {
+    match param_type {
+        ParamType::Bool => default.parse::<bool>().ok().map(Value::Bool),
+        ParamType::U64 { .. } => default
+            .parse::<u64>()
+            .ok()
+            .map(|n| Value::Number(serde_json::Number::from(n))),
+        ParamType::F64 { .. } => default
+            .parse::<f64>()
+            .ok()
+            .and_then(serde_json::Number::from_f64)
+            .map(Value::Number),
+        ParamType::String | ParamType::Path | ParamType::Enum { .. } => {
+            Some(Value::String(default.to_string()))
         }
+        ParamType::Object { fields } => Some(object_default(fields)),
     }
 }
 
@@ -249,24 +255,7 @@ impl ParamDef {
     /// [`crate::config::save_config`] to decide whether a synthetic entry has
     /// drifted from its default (and therefore needs to be persisted).
     pub fn default_as_json(&self) -> Option<Value> {
-        match &self.param_type {
-            ParamType::Bool => self.default.parse::<bool>().ok().map(Value::Bool),
-            ParamType::U64 { .. } => self
-                .default
-                .parse::<u64>()
-                .ok()
-                .map(|n| Value::Number(serde_json::Number::from(n))),
-            ParamType::F64 { .. } => self
-                .default
-                .parse::<f64>()
-                .ok()
-                .and_then(serde_json::Number::from_f64)
-                .map(Value::Number),
-            ParamType::String | ParamType::Path | ParamType::Enum { .. } => {
-                Some(Value::String(self.default.to_string()))
-            }
-            ParamType::Object { fields } => Some(object_default(fields)),
-        }
+        parse_default_as_json(&self.param_type, self.default)
     }
 }
 
