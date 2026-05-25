@@ -166,10 +166,7 @@ pub trait LedgerContext: Send + Sync + 'static {
 
     // ── ledger / UTxO ────────────────────────────────────────────────────
 
-    async fn utxo_by_ref(
-        &self,
-        refs: &[TransactionInput],
-    ) -> Result<Vec<UtxoSnapshot>, RpcError>;
+    async fn utxo_by_ref(&self, refs: &[TransactionInput]) -> Result<Vec<UtxoSnapshot>, RpcError>;
 
     async fn utxos_by_address(&self, addr: &Address) -> Result<Vec<UtxoSnapshot>, RpcError>;
 

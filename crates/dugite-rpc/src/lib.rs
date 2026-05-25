@@ -26,8 +26,12 @@
 pub mod config;
 pub mod context;
 pub mod error;
+pub mod masking;
+pub mod mempool_feed;
 pub mod metrics;
 pub mod proto;
+pub mod stream;
+pub mod tip_feed;
 
 pub use config::{RpcConfig, RpcTlsConfig};
 pub use context::{
@@ -35,4 +39,6 @@ pub use context::{
     SubmitOutcome, TipInfo, UtxoSnapshot,
 };
 pub use error::RpcError;
+pub use mempool_feed::{MempoolEvent, MempoolFeed, MempoolRemoveReason};
 pub use metrics::{noop_metrics, NoopMetrics, RpcMetricsSink, SharedMetrics};
+pub use tip_feed::{TipFeed, TipPublisher, TipRollback};
