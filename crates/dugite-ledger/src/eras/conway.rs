@@ -44,7 +44,7 @@ use dugite_primitives::hash::{blake2b_256, Hash28, Hash32};
 use dugite_primitives::time::EpochNo;
 use dugite_primitives::transaction::{Certificate, GovActionId, Transaction, Voter};
 use dugite_primitives::value::Lovelace;
-use tracing::debug;
+use tracing::{debug, warn};
 
 use super::common;
 use super::{EraRules, RuleContext};
@@ -173,8 +173,10 @@ impl EraRules for ConwayRules {
     ///
     /// Implements the Conway 9-step LEDGER pipeline:
     ///
-    /// 1. **validateTreasuryValue** -- if tx sets currentTreasuryValue, verify
-    ///    it matches the actual treasury balance.
+    /// 1. **validateTreasuryValue** -- if tx sets currentTreasuryValue,
+    ///    verify it matches the actual treasury balance. Gated on
+    ///    `BlockValidationMode::ValidateAll` per Haskell — replay
+    ///    (`reapplySTS` / `ValidateNone`) skips the check.
     /// 2. **validateRefScriptSize** -- total ref script size <= maxRefScriptSizePerTx.
     ///    (Stub: checked during tx validation, not during apply.)
     /// 3. **validateWithdrawalsDelegated** (PV >= 10) -- all withdrawal KeyHash
@@ -194,7 +196,7 @@ impl EraRules for ConwayRules {
     fn apply_valid_tx(
         &self,
         tx: &Transaction,
-        _mode: BlockValidationMode,
+        mode: BlockValidationMode,
         ctx: &RuleContext,
         utxo: &mut UtxoSubState,
         certs: &mut CertSubState,
@@ -202,26 +204,61 @@ impl EraRules for ConwayRules {
         epochs: &mut EpochSubState,
     ) -> Result<UtxoDiff, LedgerError> {
         // Step 1: validateTreasuryValue.
-        // Per Haskell `Cardano.Ledger.Conway.Rules.Utxo` — `validateTreasuryValue`
-        // raises `MismatchedTreasuryValue` predicate failure when the
-        // transaction's declared `currentTreasuryValue` (CBOR key 21) does not
-        // equal the actual treasury. Fires UNCONDITIONALLY in both live and
-        // historical block application — there is no mode gate in Haskell.
         //
-        // Previously dugite logged this and continued (an "apply-only not
-        // fatal" workaround for the non-byte-exact reward calc bug). Now that
-        // preview reward calc is byte-exact (issue #626 fixed), the check
-        // should fire unconditionally.
+        // Per Haskell `Cardano.Ledger.Conway.Rules.Ledger.validateTreasuryValue`
+        // (eras/conway/impl/src/Cardano/Ledger/Conway/Rules/Ledger.hs:364), the
+        // tx body's optional `currentTreasuryValue` (CBOR key 21) is compared
+        // against the actual `ChainAccountState.casTreasury` via
+        // `failureUnless`, producing the `ConwayTreasuryValueMismatch`
+        // predicate failure on mismatch.
+        //
+        // Critically, this failure is gated by the STS `ValidationPolicy`:
+        //   - `ValidateAll`  (live `tickThenApply`)   — check fires, block rejected on mismatch.
+        //   - `ValidateNone` (replay `tickThenReapply`/`reapplySTS`)
+        //                                              — check is SKIPPED entirely.
+        //
+        // The consensus layer uses `reapplySTS` (ValidateNone) for any block
+        // that is already in the ImmutableDB: ChainDB replay, Mithril import,
+        // rollback replay, self-forged blocks. Those blocks are trusted by
+        // construction — they were validated when first received. dugite's
+        // equivalent is `BlockValidationMode::ApplyOnly`.
+        //
+        // Issue #678: previously this check ran unconditionally, which broke
+        // from-genesis preview replay at slot 76172461 (a TreasuryDonation tx
+        // declaring `currentTreasuryValue = 5216453806026839`). Even with a
+        // hypothetical per-epoch accounting drift in dugite, Haskell would
+        // not reject the replay. The check is now correctly gated on
+        // `ValidateAll`; in `ApplyOnly` mode we WARN so any underlying drift
+        // is still surfaced for follow-up investigation without halting sync.
         if let Some(declared_treasury) = tx.body.treasury_value {
             if declared_treasury != epochs.treasury {
-                return Err(LedgerError::BlockTxValidationFailed {
-                    slot: ctx.current_slot,
-                    tx_hash: tx.hash.to_hex(),
-                    errors: format!(
-                        "MismatchedTreasuryValue: declared {} != actual {}",
-                        declared_treasury.0, epochs.treasury.0
-                    ),
-                });
+                match mode {
+                    BlockValidationMode::ValidateAll => {
+                        return Err(LedgerError::BlockTxValidationFailed {
+                            slot: ctx.current_slot,
+                            tx_hash: tx.hash.to_hex(),
+                            errors: format!(
+                                "MismatchedTreasuryValue: declared {} != actual {}",
+                                declared_treasury.0, epochs.treasury.0
+                            ),
+                        });
+                    }
+                    BlockValidationMode::ApplyOnly => {
+                        let declared = declared_treasury.0 as i128;
+                        let actual = epochs.treasury.0 as i128;
+                        warn!(
+                            tx_hash = %tx.hash.to_hex(),
+                            slot = ctx.current_slot,
+                            declared = declared_treasury.0,
+                            actual = epochs.treasury.0,
+                            delta_lovelace = actual - declared,
+                            "TreasuryValueMismatch in ApplyOnly mode (issue #678) — \
+                             Haskell skips this check under ValidateNone, so replay \
+                             continues. A non-zero delta indicates a real per-epoch \
+                             treasury accounting divergence to investigate."
+                        );
+                    }
+                }
             }
         }
 
@@ -1980,6 +2017,132 @@ mod tests {
         assert!(result.is_ok());
         // Donation should be accumulated in pending_donations.
         assert_eq!(utxo.pending_donations.0, 300_000);
+    }
+
+    /// Issue #678: a Conway tx declaring `currentTreasuryValue` that does NOT
+    /// match `casTreasury` must fail HARD in `ValidateAll` mode. This mirrors
+    /// Haskell's `validateTreasuryValue` under `ApplySTSOpts { asoValidation =
+    /// ValidateAll }` (live `tickThenApply` path).
+    #[test]
+    fn test_apply_valid_tx_treasury_mismatch_validate_all_fails() {
+        let rules = ConwayRules::new();
+        let params = ProtocolParameters::mainnet_defaults();
+        let ctx = make_conway_ctx(&params);
+
+        let key_hash = Hash28::from_bytes([0x42; 28]);
+        let addr = make_enterprise_address(key_hash);
+        let input = make_input(0xAB, 0);
+        let spent_output = make_output(addr.clone(), 10_000_000);
+        let mut utxo = make_utxo_sub(vec![(input.clone(), spent_output)]);
+        let mut certs = make_cert_sub();
+        let mut gov = make_gov_sub();
+        let mut epochs = make_epoch_sub();
+        epochs.treasury = Lovelace(5_216_453_823_257_770);
+
+        let new_output = make_output(addr, 9_700_000);
+        let mut tx = make_tx(0x01, vec![input], vec![new_output], 100_000);
+        // Declared treasury intentionally differs from epochs.treasury by 17.23 ADA.
+        tx.body.treasury_value = Some(Lovelace(5_216_453_806_026_839));
+
+        let result = rules.apply_valid_tx(
+            &tx,
+            BlockValidationMode::ValidateAll,
+            &ctx,
+            &mut utxo,
+            &mut certs,
+            &mut gov,
+            &mut epochs,
+        );
+        let err = result.expect_err("ValidateAll must reject treasury mismatch");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("MismatchedTreasuryValue"),
+            "expected MismatchedTreasuryValue, got: {msg}"
+        );
+    }
+
+    /// Issue #678: in `ApplyOnly` mode (= Haskell `reapplySTS` /
+    /// `ValidateNone`), a `currentTreasuryValue` mismatch must NOT block
+    /// block application. Replay of blocks already in the ImmutableDB —
+    /// including Mithril import, rollback replay, self-forged blocks, and
+    /// from-genesis chunk replay — proceeds normally. This was the
+    /// regression that halted preview replay at slot 76172461.
+    #[test]
+    fn test_apply_valid_tx_treasury_mismatch_apply_only_succeeds() {
+        let rules = ConwayRules::new();
+        let params = ProtocolParameters::mainnet_defaults();
+        let ctx = make_conway_ctx(&params);
+
+        let key_hash = Hash28::from_bytes([0x42; 28]);
+        let addr = make_enterprise_address(key_hash);
+        let input = make_input(0xAB, 0);
+        let spent_output = make_output(addr.clone(), 10_000_000);
+        let mut utxo = make_utxo_sub(vec![(input.clone(), spent_output)]);
+        let mut certs = make_cert_sub();
+        let mut gov = make_gov_sub();
+        let mut epochs = make_epoch_sub();
+        epochs.treasury = Lovelace(5_216_453_823_257_770);
+
+        let new_output = make_output(addr, 9_700_000);
+        let mut tx = make_tx(0x02, vec![input], vec![new_output], 100_000);
+        tx.body.treasury_value = Some(Lovelace(5_216_453_806_026_839));
+
+        let result = rules.apply_valid_tx(
+            &tx,
+            BlockValidationMode::ApplyOnly,
+            &ctx,
+            &mut utxo,
+            &mut certs,
+            &mut gov,
+            &mut epochs,
+        );
+        assert!(
+            result.is_ok(),
+            "ApplyOnly must skip MismatchedTreasuryValue (replay parity \
+             with Haskell reapplySTS): {result:?}"
+        );
+        // Treasury is NOT mutated by the check — dugite's value stands.
+        assert_eq!(epochs.treasury.0, 5_216_453_823_257_770);
+    }
+
+    /// Byte-exact match: when the declared value equals `casTreasury`, both
+    /// modes accept the tx without error.
+    #[test]
+    fn test_apply_valid_tx_treasury_match_both_modes_succeed() {
+        let rules = ConwayRules::new();
+        let params = ProtocolParameters::mainnet_defaults();
+        let ctx = make_conway_ctx(&params);
+
+        let key_hash = Hash28::from_bytes([0x42; 28]);
+        let addr = make_enterprise_address(key_hash);
+
+        for mode in [
+            BlockValidationMode::ValidateAll,
+            BlockValidationMode::ApplyOnly,
+        ] {
+            let input = make_input(0xAC, 0);
+            let spent_output = make_output(addr.clone(), 10_000_000);
+            let mut utxo = make_utxo_sub(vec![(input.clone(), spent_output)]);
+            let mut certs = make_cert_sub();
+            let mut gov = make_gov_sub();
+            let mut epochs = make_epoch_sub();
+            epochs.treasury = Lovelace(5_216_453_806_026_839);
+
+            let new_output = make_output(addr.clone(), 9_700_000);
+            let mut tx = make_tx(0x03, vec![input], vec![new_output], 100_000);
+            tx.body.treasury_value = Some(Lovelace(5_216_453_806_026_839));
+
+            let result = rules.apply_valid_tx(
+                &tx,
+                mode,
+                &ctx,
+                &mut utxo,
+                &mut certs,
+                &mut gov,
+                &mut epochs,
+            );
+            assert!(result.is_ok(), "mode={mode:?}: {result:?}");
+        }
     }
 
     /// Apply an invalid Conway transaction with collateral return.
