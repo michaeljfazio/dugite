@@ -49,6 +49,12 @@ pub struct ConfigEntry {
     /// Synthetic entries are only persisted when their value differs from
     /// the schema default.
     pub present_in_file: bool,
+    /// For Object entries: JSON-pointer paths (e.g. "/Tls/CertPath") that were
+    /// synthesised during `inject_schema_defaults`. Empty for non-Object
+    /// entries and for sub-keys that were present in the on-disk file.
+    /// Used by `save_config` to decide which synthetic leaves to prune.
+    #[allow(dead_code)]
+    pub synthetic_paths: std::collections::HashSet<String>,
 }
 
 impl ConfigEntry {
@@ -183,6 +189,7 @@ impl LoadedConfig {
                     value,
                     modified: false,
                     present_in_file: false,
+                    synthetic_paths: std::collections::HashSet::new(),
                 });
             }
         }
@@ -221,6 +228,7 @@ pub fn load_config(path: &Path) -> Result<LoadedConfig> {
             value: v.clone(),
             modified: false,
             present_in_file: true,
+            synthetic_paths: std::collections::HashSet::new(),
         })
         .collect();
 
@@ -363,6 +371,7 @@ mod tests {
             value: Value::Bool(true),
             modified: false,
             present_in_file: true,
+            synthetic_paths: HashSet::new(),
         };
         assert_eq!(entry.display_value(), "true");
 
@@ -380,6 +389,7 @@ mod tests {
             value: Value::Bool(true),
             modified: false,
             present_in_file: true,
+            synthetic_paths: HashSet::new(),
         };
         entry.apply_edit("false").unwrap();
         assert_eq!(entry.value, Value::Bool(false));
@@ -393,6 +403,7 @@ mod tests {
             value: Value::Number(1.into()),
             modified: false,
             present_in_file: true,
+            synthetic_paths: HashSet::new(),
         };
         entry.apply_edit("99").unwrap();
         assert_eq!(entry.value, Value::Number(99.into()));
@@ -406,6 +417,7 @@ mod tests {
             value: Value::String("old".into()),
             modified: false,
             present_in_file: true,
+            synthetic_paths: HashSet::new(),
         };
         entry.apply_edit("new").unwrap();
         assert_eq!(entry.value, Value::String("new".into()));
@@ -419,6 +431,7 @@ mod tests {
             value: Value::Bool(false),
             modified: false,
             present_in_file: true,
+            synthetic_paths: HashSet::new(),
         };
         entry.toggle_bool().unwrap();
         assert_eq!(entry.value, Value::Bool(true));
@@ -432,6 +445,7 @@ mod tests {
             value: Value::Number(1.into()),
             modified: false,
             present_in_file: true,
+            synthetic_paths: HashSet::new(),
         };
         assert!(entry.toggle_bool().is_err());
     }
@@ -444,6 +458,7 @@ mod tests {
             value: Value::String("A".into()),
             modified: false,
             present_in_file: true,
+            synthetic_paths: HashSet::new(),
         };
         entry.cycle_enum(&choices);
         assert_eq!(entry.display_value(), "B");
@@ -611,5 +626,12 @@ mod tests {
         let bak = PathBuf::from(format!("{}.bak", path.display()));
         let _ = std::fs::remove_file(&bak);
         drop(persist);
+    }
+
+    #[test]
+    fn test_config_entry_has_empty_synthetic_paths_by_default() {
+        let f = write_temp(r#"{"EnableP2P": true}"#);
+        let config = load_config(f.path()).unwrap();
+        assert!(config.entries[0].synthetic_paths.is_empty());
     }
 }

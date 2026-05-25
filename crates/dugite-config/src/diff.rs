@@ -94,11 +94,13 @@ mod tests {
     use serde_json::Value;
 
     fn make_entry(key: &str, value: Value, modified: bool) -> ConfigEntry {
+        use std::collections::HashSet;
         ConfigEntry {
             key: key.to_string(),
             value,
             modified,
             present_in_file: true,
+            synthetic_paths: HashSet::new(),
         }
     }
 
