@@ -155,7 +155,7 @@ pub struct LedgerState {
 /// - Per-account rewards to credit
 /// - Treasury increase (tau cut + undistributed)
 /// - Reserves decrease (monetary expansion)
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct PendingRewardUpdate {
     /// Rewards to add to each registered stake credential's reward account.
     pub rewards: HashMap<Hash32, Lovelace>,
@@ -256,7 +256,7 @@ impl<T: Default> GovRelation<T> {
 }
 
 /// Conway-era governance state (CIP-1694)
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct GovernanceState {
     /// Registered DReps: credential -> DRepState.
     ///
@@ -373,7 +373,7 @@ pub struct GovernanceState {
 /// submitted during epoch E are not considered until the following boundary.
 /// Analogous to Haskell's `DRepPulsingState` snapshot fields (`dpProposals`,
 /// `dpCommitteeState`, `dpEnactState`, etc.).
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct RatificationSnapshot {
     /// Proposals active at snapshot time.
     pub proposals: BTreeMap<GovActionId, ProposalState>,
@@ -406,7 +406,7 @@ pub struct RatificationSnapshot {
 }
 
 /// Registration state for a DRep
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct DRepRegistration {
     pub credential: Credential,
     pub deposit: Lovelace,
@@ -445,7 +445,7 @@ impl GovernanceState {
 }
 
 /// State of a governance proposal
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ProposalState {
     pub procedure: ProposalProcedure,
     pub proposed_epoch: EpochNo,
@@ -455,7 +455,7 @@ pub struct ProposalState {
     pub abstain_votes: u64,
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct StakeDistributionState {
     pub stake_map: HashMap<Hash32, Lovelace>,
 }
@@ -469,7 +469,7 @@ pub struct StakeDistributionState {
 /// (not None) — Haskell uses `emptySnapShots` at genesis. The `ss_fee`
 /// field is separate from individual snapshots, matching Haskell's `ssFee`
 /// which is set by the SNAP rule at each epoch boundary.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct EpochSnapshots {
     /// Snapshot from the most recent epoch boundary ("mark")
     pub mark: Option<StakeSnapshot>,
@@ -511,7 +511,7 @@ impl Default for EpochSnapshots {
 
 /// A snapshot of the stake distribution at an epoch boundary.
 /// Uses `Arc` for large HashMaps to avoid deep-cloning during epoch rotation.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct StakeSnapshot {
     pub epoch: EpochNo,
     /// stake credential hash -> pool_id delegation
@@ -549,7 +549,7 @@ impl StakeSnapshot {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct PoolRegistration {
     pub pool_id: Hash28,
     pub vrf_keyhash: Hash32,
