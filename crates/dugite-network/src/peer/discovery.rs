@@ -69,33 +69,49 @@ pub struct HickoryDnsResolver {
 
 impl HickoryDnsResolver {
     /// Build a resolver from the system configuration.
-    pub fn new() -> Result<Self, hickory_resolver::ResolveError> {
+    pub fn new() -> Result<Self, hickory_resolver::net::NetError> {
         let resolver = hickory_resolver::TokioResolver::builder_tokio()?.build();
-        Ok(Self { inner: resolver })
+        Ok(Self { inner: resolver? })
     }
 }
 
 #[async_trait::async_trait]
 impl DnsResolver for HickoryDnsResolver {
     async fn srv_lookup(&self, host: &str) -> Result<Vec<SrvRecord>, String> {
+        use hickory_resolver::proto::rr::RData;
+
         let srv_name = format!("_cardano._tcp.{host}");
         match self.inner.srv_lookup(srv_name.as_str()).await {
             Ok(lookup) => {
-                let mut records: Vec<SrvRecord> = Vec::new();
-                for srv in lookup.iter() {
-                    let target = srv.target().to_string();
-                    // Strip the trailing dot that hickory appends to FQDN names.
-                    let target = target.trim_end_matches('.').to_string();
-                    // Collect any glue IPs bundled in the additional section.
-                    let ips: Vec<IpAddr> = lookup.ip_iter().collect();
-                    records.push(SrvRecord {
-                        priority: srv.priority(),
-                        weight: srv.weight(),
-                        port: srv.port(),
-                        target,
-                        ips,
-                    });
-                }
+                // hickory 0.26 returns a generic `Lookup` rather than the typed
+                // `SrvLookup` shape from 0.25 — pull SRV rdata out of the answer
+                // section and collect any glue A/AAAA records from additionals.
+                let glue_ips: Vec<IpAddr> = lookup
+                    .additionals()
+                    .iter()
+                    .filter_map(|r| match &r.data {
+                        RData::A(a) => Some(IpAddr::V4(a.0)),
+                        RData::AAAA(a) => Some(IpAddr::V6(a.0)),
+                        _ => None,
+                    })
+                    .collect();
+                let records: Vec<SrvRecord> = lookup
+                    .answers()
+                    .iter()
+                    .filter_map(|r| match &r.data {
+                        RData::SRV(srv) => {
+                            let target = srv.target.to_string().trim_end_matches('.').to_string();
+                            Some(SrvRecord {
+                                priority: srv.priority,
+                                weight: srv.weight,
+                                port: srv.port,
+                                target,
+                                ips: glue_ips.clone(),
+                            })
+                        }
+                        _ => None,
+                    })
+                    .collect();
                 Ok(records)
             }
             Err(e) => {
@@ -322,20 +338,33 @@ pub async fn resolve_dns(hostname: &str, port: u16) -> Vec<SocketAddr> {
 /// For each `(host, port)` pair: tries `_cardano._tcp.<host>` SRV first,
 /// falls back to A/AAAA. Direct IP addresses bypass DNS entirely.
 pub async fn resolve_topology_relays(relays: &[(String, u16)]) -> Vec<SocketAddr> {
-    match HickoryDnsResolver::new() {
-        Ok(resolver) => {
-            let mut addrs = Vec::new();
-            for (host, port) in relays {
-                let resolved = resolve_with_srv(&resolver, host, *port).await;
-                addrs.extend(resolved);
-            }
-            addrs
+    // Build the system resolver lazily — only when a non-IP host needs DNS.
+    // Lets literal-IP topologies (and unit tests using them) succeed even
+    // when the system resolver cannot be initialised (e.g. unparseable
+    // /etc/resolv.conf in a sandboxed test environment).
+    let mut resolver: Option<HickoryDnsResolver> = None;
+    let mut addrs = Vec::new();
+    for (host, port) in relays {
+        if let Ok(ip) = host.parse::<IpAddr>() {
+            addrs.push(SocketAddr::new(ip, *port));
+            continue;
         }
-        Err(e) => {
-            tracing::warn!(error = %e, "failed to create DNS resolver");
-            vec![]
-        }
+        let dns = match resolver {
+            Some(ref r) => r,
+            None => match HickoryDnsResolver::new() {
+                Ok(r) => {
+                    resolver = Some(r);
+                    resolver.as_ref().unwrap()
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, host = host.as_str(), "failed to create DNS resolver");
+                    continue;
+                }
+            },
+        };
+        addrs.extend(resolve_with_srv(dns, host, *port).await);
     }
+    addrs
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
