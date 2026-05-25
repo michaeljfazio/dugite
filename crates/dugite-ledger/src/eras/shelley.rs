@@ -823,7 +823,7 @@ fn reward_account_to_hash(reward_account: &[u8]) -> Hash32 {
 ///
 /// Each field in the update, if `Some`, overrides the corresponding field
 /// in the protocol parameters.
-fn apply_pp_update(
+pub(crate) fn apply_pp_update(
     params: &mut ProtocolParameters,
     update: &dugite_primitives::transaction::ProtocolParamUpdate,
 ) {

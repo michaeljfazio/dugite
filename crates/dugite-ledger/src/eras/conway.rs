@@ -416,6 +416,118 @@ impl EraRules for ConwayRules {
         let bprev_block_count = consensus.epoch_block_count;
         let bprev_blocks_by_pool = Arc::clone(&consensus.epoch_blocks_by_pool);
 
+        // === Capture prevPParams BEFORE any PP updates ===
+        //
+        // Per Haskell `Cardano.Ledger.Conway.Rules.Epoch`, the new epoch's
+        // `cgsPrevPParamsL` is set to `curPParams` BEFORE governance enactment
+        // (`enactStateTransition`) updates `curPParams`. dugite previously
+        // captured `old_proto_major` AFTER `ratify_proposals_impl` (line 779),
+        // which read the POST-enactment value and caused `prev_pp_major` to
+        // race ahead of Haskell by one boundary — silently breaking the RUPD
+        // `prevPParams` semantic for boundaries that enact a ParameterChange
+        // or HardForkInitiation. Issue #685.
+        //
+        // Conway: d is always 0 (fully decentralized) — Conway has no overlay
+        // slots and PParams no longer carries `ppDG`.
+        let old_d = dugite_primitives::transaction::Rational {
+            numerator: 0,
+            denominator: 1,
+        };
+        let old_proto_major = epochs.protocol_params.protocol_version_major;
+        let old_params = epochs.protocol_params.clone();
+
+        // === Apply pre-Conway PPUP (era-crossing edge case) ===
+        //
+        // The Babbage→Conway HFC translation does NOT itself bump the
+        // on-chain protocol version. The PV bump from 8 to 9 is carried by
+        // the same Babbage-era `Update_Proposal` (TxBody key 6 PPUP) that
+        // triggered the era boundary in the first place — its `protVer`
+        // field encodes the target PV (`(9, 0)` on preview epoch 645).
+        //
+        // The shelley/babbage `process_epoch_transition` applies this PPUP
+        // from `pending_pp_updates[new_epoch - 1]`. But the orchestrator
+        // dispatches by `block.era`, so the first Conway block triggers
+        // Conway's `process_epoch_transition` for the era-crossing boundary,
+        // which previously did NOT process the legacy PPUP — leaving PV
+        // stuck at 8 and breaking the Conway bootstrap-period semantics
+        // (`protocol_version_major == 9` gate in governance/ratification).
+        // That in turn caused the boundary-735→736 ParameterChange to never
+        // ratify, dropping its 100K-ADA proposal-deposit refund and
+        // cascading into the +17.23 ADA preview-epoch-881 treasury drift
+        // reported in #685.
+        //
+        // After Conway era starts no further pre-Conway PPUP proposals can
+        // be submitted (Conway TxBody silently drops key 6), so this block
+        // is effectively a no-op on every Conway boundary except the
+        // era-crossing one. Issue #685.
+        let lookup_epoch = EpochNo(new_epoch.0.saturating_sub(1));
+        if let Some(proposals) = epochs.pending_pp_updates.remove(&lookup_epoch) {
+            let mut proposer_set: HashSet<Hash32> = HashSet::with_capacity(proposals.len());
+            for (genesis_hash, _) in &proposals {
+                proposer_set.insert(*genesis_hash);
+            }
+            let distinct_proposers = proposer_set.len() as u64;
+
+            if distinct_proposers >= ctx.update_quorum {
+                let mut merged = dugite_primitives::transaction::ProtocolParamUpdate::default();
+                for (_, ppu) in &proposals {
+                    macro_rules! merge_field {
+                        ($field:ident) => {
+                            if ppu.$field.is_some() {
+                                merged.$field = ppu.$field.clone();
+                            }
+                        };
+                    }
+                    merge_field!(min_fee_a);
+                    merge_field!(min_fee_b);
+                    merge_field!(max_block_body_size);
+                    merge_field!(max_tx_size);
+                    merge_field!(max_block_header_size);
+                    merge_field!(key_deposit);
+                    merge_field!(pool_deposit);
+                    merge_field!(e_max);
+                    merge_field!(n_opt);
+                    merge_field!(a0);
+                    merge_field!(rho);
+                    merge_field!(tau);
+                    merge_field!(d);
+                    merge_field!(min_pool_cost);
+                    merge_field!(ada_per_utxo_byte);
+                    merge_field!(cost_models);
+                    merge_field!(execution_costs);
+                    merge_field!(max_tx_ex_units);
+                    merge_field!(max_block_ex_units);
+                    merge_field!(max_val_size);
+                    merge_field!(collateral_percentage);
+                    merge_field!(max_collateral_inputs);
+                    merge_field!(protocol_version_major);
+                    merge_field!(protocol_version_minor);
+                }
+                super::shelley::apply_pp_update(&mut epochs.protocol_params, &merged);
+                debug!(
+                    epoch = new_epoch.0,
+                    proposers = distinct_proposers,
+                    new_pv_major = epochs.protocol_params.protocol_version_major,
+                    "Pre-Conway PPUP applied at Conway epoch boundary (era-crossing edge case)"
+                );
+            }
+        }
+        // Clean up past-epoch proposals.
+        epochs
+            .pending_pp_updates
+            .retain(|epoch, _| *epoch >= lookup_epoch);
+        // Promote future proposals -> current (matches shelley.rs behaviour).
+        if !epochs.future_pp_updates.is_empty() {
+            let promoted = std::mem::take(&mut epochs.future_pp_updates);
+            for (epoch, proposals) in promoted {
+                epochs
+                    .pending_pp_updates
+                    .entry(epoch)
+                    .or_default()
+                    .extend(proposals);
+            }
+        }
+
         // === Step 1: SNAP (snapshot rotation) ===
         // Flush pending treasury donations BEFORE snapshot.
         if utxo.pending_donations.0 > 0 {
@@ -769,19 +881,14 @@ impl EraRules for ConwayRules {
         // (before self.epoch = new_epoch).
         capture_governance_snapshots(ctx.current_epoch, epochs, certs, gov);
 
-        // Capture prevPParams BEFORE any PP updates.
-        // Conway: d is always 0 (fully decentralized) — Conway has no
-        // overlay slots and PParams no longer carries `ppDG`.
-        let old_d = dugite_primitives::transaction::Rational {
-            numerator: 0,
-            denominator: 1,
-        };
-        let old_proto_major = epochs.protocol_params.protocol_version_major;
-        let old_params = epochs.protocol_params.clone();
-
-        // Conway does NOT use pre-Conway PPUP proposals. Protocol parameter
-        // changes are enacted through governance actions (ParameterChange).
-        // The PP update from governance enactment would happen in Step 5 above.
+        // prevPParams was already captured at the top of this function
+        // (BEFORE pre-Conway PPUP application and BEFORE
+        // `ratify_proposals_impl` enactment), so `old_d` / `old_proto_major`
+        // / `old_params` are bound in this scope.  Per Haskell
+        // `Cardano.Ledger.Conway.Rules.Epoch`, `cgsPrevPParamsL` is set from
+        // `curPParams` BEFORE `enactStateTransition` updates it — the
+        // capture position is load-bearing for byte-exact RUPD math at
+        // boundaries that enact a ParameterChange / HardForkInitiation.
 
         // Compute new epoch nonce (TICKN rule).
         let candidate = consensus.candidate_nonce;
