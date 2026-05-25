@@ -23,6 +23,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use dugite_ledger::LedgerState;
 use dugite_mempool::Mempool;
+use dugite_network::TxValidator;
 use dugite_primitives::address::Address;
 use dugite_primitives::block::Point;
 use dugite_primitives::hash::{Hash32, TransactionHash};
@@ -44,6 +45,7 @@ pub struct NodeRpcAdapter {
     pub(crate) chain_db: Arc<RwLock<ChainDB>>,
     pub(crate) ledger_state: Arc<RwLock<LedgerState>>,
     pub(crate) mempool: Arc<Mempool>,
+    pub(crate) tx_validator: Arc<dyn TxValidator>,
 }
 
 impl NodeRpcAdapter {
@@ -51,11 +53,13 @@ impl NodeRpcAdapter {
         chain_db: Arc<RwLock<ChainDB>>,
         ledger_state: Arc<RwLock<LedgerState>>,
         mempool: Arc<Mempool>,
+        tx_validator: Arc<dyn TxValidator>,
     ) -> Self {
         Self {
             chain_db,
             ledger_state,
             mempool,
+            tx_validator,
         }
     }
 
@@ -270,14 +274,77 @@ impl LedgerContext for NodeRpcAdapter {
         })
     }
 
-    async fn submit_tx(&self, _era: u16, _raw_cbor: &[u8]) -> SubmitOutcome {
-        SubmitOutcome::Rejected {
-            reason: "M1.B stub — submit_tx not implemented yet (M3)".to_string(),
+    async fn submit_tx(&self, era: u16, raw_cbor: &[u8]) -> SubmitOutcome {
+        // 1. Phase-1 + Phase-2 validation (mirrors N2C LocalTxSubmission).
+        if let Err(e) = self.tx_validator.validate_tx(era, raw_cbor) {
+            return SubmitOutcome::Rejected {
+                reason: format!("{e:?}"),
+            };
+        }
+
+        // 2. Decode tx to extract hash + body for mempool admission.
+        let tx = match dugite_serialization::decode_transaction(era, raw_cbor) {
+            Ok(t) => t,
+            Err(e) => {
+                return SubmitOutcome::Rejected {
+                    reason: format!("decode failed: {e}"),
+                };
+            }
+        };
+
+        let size_bytes = raw_cbor.len();
+        let tx_hash = tx.hash;
+        let fee = tx.body.fee;
+        let (ex_mem, ex_steps) = {
+            let mut m: u64 = 0;
+            let mut s: u64 = 0;
+            for r in &tx.witness_set.redeemers {
+                m = m.saturating_add(r.ex_units.mem);
+                s = s.saturating_add(r.ex_units.steps);
+            }
+            (m, s)
+        };
+        let ref_scripts_bytes = tx
+            .witness_set
+            .plutus_v1_scripts
+            .iter()
+            .map(|s| s.len())
+            .chain(tx.witness_set.plutus_v2_scripts.iter().map(|s| s.len()))
+            .chain(tx.witness_set.plutus_v3_scripts.iter().map(|s| s.len()))
+            .sum();
+
+        // 3. Admit to mempool.
+        let admit_result = self.mempool.add_tx_full(
+            tx_hash,
+            tx,
+            size_bytes,
+            fee,
+            ex_mem,
+            ex_steps,
+            ref_scripts_bytes,
+            dugite_mempool::TxOrigin::Local,
+        );
+
+        match admit_result {
+            Ok(_) => SubmitOutcome::Accepted { hash: tx_hash },
+            Err(e) => SubmitOutcome::Rejected {
+                reason: format!("mempool admission failed: {e}"),
+            },
         }
     }
 
     async fn mempool_snapshot(&self) -> Result<Vec<RawTx>, RpcError> {
-        Err(RpcError::Unimplemented("LedgerContext::mempool_snapshot"))
+        let hashes = self.mempool.tx_hashes_ordered();
+        let mut out = Vec::with_capacity(hashes.len());
+        for hash in hashes {
+            if let Some(tx) = self.mempool.get_tx(&hash) {
+                out.push(RawTx {
+                    hash: tx.hash,
+                    cbor: tx.raw_cbor.unwrap_or_default(),
+                });
+            }
+        }
+        Ok(out)
     }
 
     async fn mempool_contains(&self, hash: &TransactionHash) -> bool {

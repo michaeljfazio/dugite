@@ -267,43 +267,22 @@ async fn query_v1beta_methods_return_unimplemented() {
 }
 
 // ── Submit v1beta ────────────────────────────────────────────────────────
+//
+// Submit methods are implemented as of M3; eval_tx is the only one that
+// still returns UNIMPLEMENTED (needs a non-committing UPLC helper).
+// SubmitTx with no `raw` field returns INVALID_ARGUMENT; the richer
+// integration suite for SubmitService lives in submit_service.rs.
 
 #[tokio::test]
-async fn submit_v1beta_methods_return_unimplemented() {
+async fn submit_v1beta_eval_tx_returns_unimplemented() {
     use dugite_rpc::proto::v1beta::submit::submit_service_client::SubmitServiceClient;
-    use dugite_rpc::proto::v1beta::submit::{
-        EvalTxRequest, ReadMempoolRequest, SubmitTxRequest, WaitForTxRequest, WatchMempoolRequest,
-    };
+    use dugite_rpc::proto::v1beta::submit::EvalTxRequest;
 
     let server = TestServer::start(true).await;
     let mut client = SubmitServiceClient::new(server.channel().await);
-
-    let eval = client.eval_tx(EvalTxRequest::default()).await.unwrap_err();
-    // EvalTx carries a different message but same code.
-    assert_eq!(eval.code(), tonic::Code::Unimplemented);
-    assert!(eval.message().contains("EvalTx"));
-
-    for status in [
-        client
-            .submit_tx(SubmitTxRequest::default())
-            .await
-            .unwrap_err(),
-        client
-            .wait_for_tx(WaitForTxRequest::default())
-            .await
-            .unwrap_err(),
-        client
-            .read_mempool(ReadMempoolRequest::default())
-            .await
-            .unwrap_err(),
-        client
-            .watch_mempool(WatchMempoolRequest::default())
-            .await
-            .unwrap_err(),
-    ] {
-        assert_eq!(status.code(), tonic::Code::Unimplemented);
-    }
-
+    let status = client.eval_tx(EvalTxRequest::default()).await.unwrap_err();
+    assert_eq!(status.code(), tonic::Code::Unimplemented);
+    assert!(status.message().contains("EvalTx"));
     server.stop().await;
 }
 
