@@ -26,6 +26,8 @@ dugite-consensus = { workspace = true }
 dugite-ledger = { workspace = true }
 dugite-mempool = { workspace = true }
 dugite-storage = { workspace = true }
+dugite-rpc = { workspace = true }
+async-trait = { workspace = true }
 tokio = { workspace = true }
 futures = { workspace = true }
 clap = { workspace = true }

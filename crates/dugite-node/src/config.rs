@@ -53,6 +53,83 @@ pub fn resolve_consensus_mode(
     }
 }
 
+/// Resolve the effective UTxO RPC config from CLI + JSON config —
+/// issue #672.
+///
+/// Precedence (highest first):
+///   1. `--no-rpc` → server disabled (returns `None`).
+///   2. `--rpc-host` / `--rpc-port` set → server enabled, CLI values
+///      override config values.
+///   3. `config.rpc.enabled` true → server enabled with the config-file
+///      values.
+///   4. Otherwise → server disabled (returns `None`).
+///
+/// Returns the constructed `dugite_rpc::RpcConfig` ready to hand to
+/// [`dugite_rpc::RpcServer::start`], or `None` if the server should not
+/// start.
+pub fn resolve_rpc(
+    no_rpc: bool,
+    cli_host: Option<&str>,
+    cli_port: Option<u16>,
+    config: Option<&RpcConfigJson>,
+) -> Result<Option<dugite_rpc::RpcConfig>, String> {
+    if no_rpc {
+        return Ok(None);
+    }
+
+    // CLI presence forces enable; otherwise fall back to config.enabled.
+    let cli_present = cli_host.is_some() || cli_port.is_some();
+    let cfg_enabled = config.map(|c| c.enabled).unwrap_or(false);
+    if !cli_present && !cfg_enabled {
+        return Ok(None);
+    }
+
+    let mut out = dugite_rpc::RpcConfig::default();
+
+    if let Some(cfg) = config {
+        if let Some(ref addr) = cfg.listen_addr {
+            out.bind = addr
+                .parse::<std::net::IpAddr>()
+                .map_err(|e| format!("Rpc.ListenAddr is not a valid IP address: {e}"))?;
+        }
+        if let Some(p) = cfg.port {
+            out.port = p;
+        }
+        if let Some(n) = cfg.max_concurrent_streams {
+            out.max_concurrent_streams = n;
+        }
+        if let Some(n) = cfg.stream_buffer_size {
+            out.stream_buffer = n;
+        }
+        if let Some(b) = cfg.reflection_enabled {
+            out.reflection_enabled = b;
+        }
+        if let Some(b) = cfg.web_enabled {
+            out.web_enabled = b;
+        }
+        if let Some(b) = cfg.alpha_enabled {
+            out.alpha_enabled = b;
+        }
+        if let Some(ref tls) = cfg.tls {
+            out.tls = Some(dugite_rpc::RpcTlsConfig {
+                cert_path: tls.cert_path.clone(),
+                key_path: tls.key_path.clone(),
+            });
+        }
+    }
+
+    if let Some(host) = cli_host {
+        out.bind = host
+            .parse::<std::net::IpAddr>()
+            .map_err(|e| format!("--rpc-host is not a valid IP address: {e}"))?;
+    }
+    if let Some(port) = cli_port {
+        out.port = port;
+    }
+
+    Ok(Some(out))
+}
+
 /// Inbound connection limits (matches Haskell AcceptedConnectionsLimit).
 ///
 /// Haskell's hand-written `FromJSON` instance uses short keys (`hardLimit`,
@@ -266,6 +343,15 @@ pub struct NodeConfig {
     #[serde(default)]
     pub storage: Option<StorageConfigJson>,
 
+    /// UTxO RPC (gRPC) server configuration — issue #672.
+    ///
+    /// `None` (or absent) leaves the RPC server disabled. When present
+    /// the `Enabled` field gates startup; CLI flags `--no-rpc`,
+    /// `--rpc-host`, `--rpc-port` override. See `resolve_rpc()` for the
+    /// full precedence table.
+    #[serde(default)]
+    pub rpc: Option<RpcConfigJson>,
+
     /// Governor churn interval during normal (caught-up) operation, in seconds.
     ///
     /// Controls how often the governor rotates a random subset of peers to
@@ -392,7 +478,53 @@ pub struct Protocol {
     pub requires_network_magic: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+/// UTxO RPC server configuration — issue #672.
+///
+/// Mirrors `dugite_rpc::RpcConfig` for the JSON wire format with
+/// PascalCase keys to match the surrounding cardano-node-style config.
+/// `Enabled` defaults to `false` so an `Rpc` block present in the file
+/// must opt-in to start the server.
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "PascalCase")]
+pub struct RpcConfigJson {
+    /// Whether to start the RPC server. Overridden by `--rpc-port`/
+    /// `--rpc-host` (forces on) and `--no-rpc` (forces off).
+    #[serde(default)]
+    pub enabled: bool,
+    /// IP address to bind. Defaults to `127.0.0.1` (loopback only).
+    #[serde(default)]
+    pub listen_addr: Option<String>,
+    /// TCP port. Defaults to `dugite_rpc::config::DEFAULT_RPC_PORT` (50051).
+    #[serde(default)]
+    pub port: Option<u16>,
+    /// Maximum concurrent HTTP/2 streams per connection.
+    #[serde(default)]
+    pub max_concurrent_streams: Option<u32>,
+    /// Per-stream buffer size (events).
+    #[serde(default)]
+    pub stream_buffer_size: Option<usize>,
+    /// Expose gRPC reflection. Defaults to true.
+    #[serde(default)]
+    pub reflection_enabled: Option<bool>,
+    /// Accept gRPC-Web (HTTP/1.1). Defaults to false.
+    #[serde(default)]
+    pub web_enabled: Option<bool>,
+    /// Expose v1alpha services in addition to v1beta. Defaults to true.
+    #[serde(default)]
+    pub alpha_enabled: Option<bool>,
+    /// Optional TLS termination.
+    #[serde(default)]
+    pub tls: Option<RpcTlsConfigJson>,
+}
+
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "PascalCase")]
+pub struct RpcTlsConfigJson {
+    pub cert_path: std::path::PathBuf,
+    pub key_path: std::path::PathBuf,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, Default)]
 #[serde(rename_all = "PascalCase")]
 pub struct TraceOptions {
     #[serde(default)]
@@ -846,6 +978,7 @@ impl Default for NodeConfig {
             log_directive: None,
             metrics_port: None,
             storage: None,
+            rpc: None,
             churn_interval_normal_secs: default_churn_interval_normal_secs(),
             churn_interval_sync_secs: default_churn_interval_sync_secs(),
             stall_demotion_cycles: default_stall_demotion_cycles(),
@@ -1089,6 +1222,100 @@ mod tests {
         // Setting MetricsPort=0 in the config file should also disable the server.
         assert_eq!(resolve_metrics_port(false, None, Some(0)), 0);
     }
+
+    // ── RPC config resolution (#672 M1.A) ────────────────────────────────────
+
+    fn empty_rpc_json(enabled: bool) -> RpcConfigJson {
+        RpcConfigJson {
+            enabled,
+            listen_addr: None,
+            port: None,
+            max_concurrent_streams: None,
+            stream_buffer_size: None,
+            reflection_enabled: None,
+            web_enabled: None,
+            alpha_enabled: None,
+            tls: None,
+        }
+    }
+
+    #[test]
+    fn rpc_resolve_no_rpc_flag_wins_over_all() {
+        let cfg = empty_rpc_json(true);
+        let out = resolve_rpc(true, Some("0.0.0.0"), Some(9999), Some(&cfg)).expect("resolve");
+        assert!(out.is_none(), "--no-rpc must disable regardless");
+    }
+
+    #[test]
+    fn rpc_resolve_returns_none_when_disabled_and_no_cli() {
+        let cfg = empty_rpc_json(false);
+        let out = resolve_rpc(false, None, None, Some(&cfg)).expect("resolve");
+        assert!(out.is_none());
+        let out2 = resolve_rpc(false, None, None, None).expect("resolve");
+        assert!(out2.is_none());
+    }
+
+    #[test]
+    fn rpc_resolve_cli_port_alone_enables_server() {
+        let out = resolve_rpc(false, None, Some(7777), None)
+            .expect("resolve")
+            .expect("Some(config)");
+        assert_eq!(out.port, 7777);
+        assert_eq!(out.bind, std::net::IpAddr::from([127, 0, 0, 1]));
+    }
+
+    #[test]
+    fn rpc_resolve_cli_host_alone_enables_server() {
+        let out = resolve_rpc(false, Some("0.0.0.0"), None, None)
+            .expect("resolve")
+            .expect("Some(config)");
+        assert_eq!(out.port, dugite_rpc::config::DEFAULT_RPC_PORT);
+        assert_eq!(out.bind, std::net::IpAddr::from([0, 0, 0, 0]));
+    }
+
+    #[test]
+    fn rpc_resolve_cli_overrides_config() {
+        let mut cfg = empty_rpc_json(true);
+        cfg.port = Some(1000);
+        cfg.listen_addr = Some("10.0.0.1".into());
+        let out = resolve_rpc(false, Some("0.0.0.0"), Some(2000), Some(&cfg))
+            .expect("resolve")
+            .expect("Some(config)");
+        assert_eq!(out.port, 2000);
+        assert_eq!(out.bind, std::net::IpAddr::from([0, 0, 0, 0]));
+    }
+
+    #[test]
+    fn rpc_resolve_config_only_uses_config_values() {
+        let mut cfg = empty_rpc_json(true);
+        cfg.port = Some(54321);
+        cfg.listen_addr = Some("192.168.1.10".into());
+        cfg.web_enabled = Some(true);
+        cfg.alpha_enabled = Some(false);
+        let out = resolve_rpc(false, None, None, Some(&cfg))
+            .expect("resolve")
+            .expect("Some(config)");
+        assert_eq!(out.port, 54321);
+        assert_eq!(out.bind, std::net::IpAddr::from([192, 168, 1, 10]));
+        assert!(out.web_enabled);
+        assert!(!out.alpha_enabled);
+    }
+
+    #[test]
+    fn rpc_resolve_rejects_malformed_addr() {
+        let mut cfg = empty_rpc_json(true);
+        cfg.listen_addr = Some("not-an-ip".into());
+        let err = resolve_rpc(false, None, None, Some(&cfg)).unwrap_err();
+        assert!(err.to_lowercase().contains("rpc.listenaddr") || err.contains("IP"));
+    }
+
+    #[test]
+    fn rpc_resolve_rejects_malformed_cli_host() {
+        let err = resolve_rpc(false, Some("not-an-ip"), Some(1), None).unwrap_err();
+        assert!(err.to_lowercase().contains("rpc-host") || err.contains("IP"));
+    }
+
+    // ── existing metrics tests follow ────────────────────────────────────────
 
     #[test]
     fn test_default_metrics_port_matches_cardano_node() {
