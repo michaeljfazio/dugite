@@ -788,14 +788,25 @@ impl LedgerState {
         let epoch_block_count: u64 = epoch_blocks_by_pool.values().sum();
 
         // ── Stake snapshots ──────────────────────────────────────────────
-        let mark_snapshot = convert_stake_snapshot(&hs.new_epoch_state.snapshots.mark, hs.epoch);
+        //
+        // Backfill snapshot pool_params owners/relays/metadata from the
+        // live `psStakePools` registrations (`pool_params_map`).  cardano-node
+        // ≥ 11.0.1 uses the `StakePoolSnapShot` wire layout that omits owners
+        // entirely (they live in `psStakePools` per Haskell architecture);
+        // the on-the-wire snapshot pool_params then carry empty owners which
+        // fails dugite's pledge check at `compute_reward_update`, silently
+        // dropping 99.9% of rewards.  Issue #668.
+        let mark_snapshot =
+            convert_stake_snapshot(&hs.new_epoch_state.snapshots.mark, hs.epoch, &pool_params_map);
         let set_snapshot = convert_stake_snapshot(
             &hs.new_epoch_state.snapshots.set,
             EpochNo(hs.epoch.0.saturating_sub(1)),
+            &pool_params_map,
         );
         let go_snapshot = convert_stake_snapshot(
             &hs.new_epoch_state.snapshots.go,
             EpochNo(hs.epoch.0.saturating_sub(2)),
+            &pool_params_map,
         );
 
         // bprev = previous epoch's block production (used by RUPD)
@@ -1735,9 +1746,20 @@ fn convert_pool_registration(
 }
 
 /// Convert a Haskell `HaskellSnapShot` to dugite's `StakeSnapshot`.
+///
+/// `live_pool_params` is the live `psStakePools` registry, used to backfill
+/// owners / relays / metadata that the cardano-node ≥ 11.0.1
+/// `StakePoolSnapShot` wire format omits.  Per Haskell architecture the
+/// snapshot's `_poolParams` carries the FULL `PoolParams` (owners included);
+/// the wire encoding drops fields that are identical to `psStakePools` at
+/// capture time, on the understanding that they are restored on load.  Issue
+/// #668 — without this restore the pledge check at
+/// `compute_reward_update` fails for every pool and ~99.9% of rewards are
+/// silently routed to reserves/treasury instead of credited.
 fn convert_stake_snapshot(
     snap: &dugite_serialization::haskell_snapshot::types::HaskellSnapShot,
     epoch: EpochNo,
+    live_pool_params: &HashMap<Hash28, PoolRegistration>,
 ) -> StakeSnapshot {
     let mut delegations = HashMap::new();
     let mut stake_distribution = HashMap::new();
@@ -1758,10 +1780,24 @@ fn convert_stake_snapshot(
         }
     }
 
-    // Convert pool params within the snapshot
+    // Convert pool params within the snapshot, restoring owners / relays /
+    // metadata from `live_pool_params` when the wire encoding omitted them.
     let mut snapshot_pool_params = HashMap::new();
     for (pool_id, pool) in &snap.pool_params {
-        snapshot_pool_params.insert(*pool_id, convert_snapshot_pool_registration(*pool_id, pool));
+        let mut reg = convert_snapshot_pool_registration(*pool_id, pool);
+        if reg.owners.is_empty() {
+            if let Some(live) = live_pool_params.get(pool_id) {
+                reg.owners = live.owners.clone();
+                if reg.relays.is_empty() {
+                    reg.relays = live.relays.clone();
+                }
+                if reg.metadata_url.is_none() {
+                    reg.metadata_url = live.metadata_url.clone();
+                    reg.metadata_hash = live.metadata_hash;
+                }
+            }
+        }
+        snapshot_pool_params.insert(*pool_id, reg);
     }
 
     StakeSnapshot {
