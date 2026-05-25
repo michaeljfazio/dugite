@@ -10,7 +10,10 @@ pub mod utxo_diff;
 pub mod utxo_store;
 pub mod validation;
 
-pub use plutus::{evaluate_plutus_scripts, PlutusError, SlotConfig};
+pub use plutus::{
+    evaluate_plutus_scripts, evaluate_plutus_scripts_with_reports, PlutusError, RedeemerReport,
+    SlotConfig,
+};
 #[doc(hidden)]
 pub use state::Rat;
 pub use state::{

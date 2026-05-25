@@ -51,14 +51,16 @@ in-tree at `crates/dugite-rpc/proto/VERSION`.
 | `QueryService` | `ReadUtxos` | ✅ implemented |
 | `QueryService` | `ReadGenesis` | ✅ implemented (minimum-viable envelope) |
 | `QueryService` | `ReadEraSummary` | ✅ implemented |
-| `QueryService` | `SearchUtxos` | ✅ implemented for `exact_address` / `payment_part` / `asset` predicates; other variants return `UNIMPLEMENTED` |
-| `QueryService` | `ReadData` / `ReadTx` / `ReadState` | ⏳ follow-up |
+| `QueryService` | `SearchUtxos` | ✅ implemented (`exact_address` / `payment_part` / `delegation_part` / `asset` plus `not` / `all_of` / `any_of` composites) |
+| `QueryService` | `ReadData` | ✅ implemented (bounded scan: live inline datums + mempool tx witness sets) |
+| `QueryService` | `ReadTx` | ✅ implemented (bounded scan: mempool + last ~43 200 slots of VolatileDB) |
+| `QueryService` | `ReadState` | ✅ implemented (minimum-viable envelope: epoch + tip slot) |
 | `SubmitService` | `SubmitTx` | ✅ implemented |
 | `SubmitService` | `ReadMempool` | ✅ implemented |
 | `SubmitService` | `WaitForTx` (stream) | ✅ implemented |
 | `SubmitService` | `WatchMempool` (stream) | ✅ implemented |
-| `SubmitService` | `EvalTx` | ✅ implemented (per-redeemer `ex_units` / Plutus traces returned as zeros — full plumbing follow-up) |
-| `WatchService` | `WatchTx` (stream) | ✅ implemented (match-all in v1; pattern filtering follow-up) |
+| `SubmitService` | `EvalTx` | ✅ implemented (per-redeemer `ex_units` + Plutus traces) |
+| `WatchService` | `WatchTx` (stream) | ✅ implemented (full `TxPredicate` filtering: address / asset / mint / `not` / `all_of` / `any_of`) |
 
 ## Configuration
 
@@ -176,16 +178,32 @@ updated, or vice versa) are caught by code review against the diff.
 
 ## Limitations
 
-* `EvalTx` runs the tx through the standard Phase-1 + Phase-2 validator,
-  but the per-redeemer `ex_units` / Plutus traces on the response are
-  currently zeros — full plumbing of the CEK machine's metering output
-  into the response message is a follow-up.
-* `SearchUtxos` supports the `exact_address`, `payment_part`, and
-  `asset` predicates; `delegation_part`, composite (`AND`/`OR`)
-  predicates and the address-pattern shorthand return
-  `UNIMPLEMENTED`.
-* `QueryService.ReadData` / `ReadTx` / `ReadState` return
-  `UNIMPLEMENTED`.
+* `SearchUtxos` with a fully-wildcard predicate (no `match` /
+  combinators) is rejected with `UNIMPLEMENTED`: dugite refuses to
+  materialise the entire UTxO set in a single response. Supply at
+  least one selector (address / payment_part / delegation_part /
+  asset / composite) so the result set is bounded.
+* `ReadTx` walks at most the last ~43 200 slots of `VolatileDB`. A
+  chain-wide tx index would extend the lookup window to immutable
+  history; not built today.
+* `ReadData` scans the live UTxO set's inline datums and the
+  mempool's witness-set datums. Witness-set datums from immutable
+  blocks are not retained — clients that need them should consult
+  the originating tx via `ReadTx`.
+* `ReadState`'s `AnyChainStateData.cardano` is currently empty: the
+  endpoint returns the ledger tip + epoch only. Per-query state
+  projections (stake-pool distribution, DRep info) land on top of
+  this stub.
+* `EvalTx`'s per-redeemer `ex_units` are CEK-machine consumed
+  values, not declared. Cost-model overrides are not yet read from
+  protocol params — the CEK falls back to per-step defaults, which
+  is *conservative* (over-approximates) and therefore safe for
+  fee-estimation use cases but may diverge slightly from cardano-node
+  on the high end.
+* `WatchTx` filters on tx output fields (`produces` / `has_address`
+  / `moves_asset`) and minting (`mints_asset`) — but not on
+  *resolved* inputs (`consumes` / `has_certificate`) since those
+  require live UTxO lookups against pending mempool txs.
 * `FollowTip` apply events carry `AnyChainBlock.native_bytes` (the
   raw block CBOR); clients that only need tip metadata can ignore
   the payload.

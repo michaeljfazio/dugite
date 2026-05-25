@@ -91,6 +91,15 @@ pub struct RedeemerResult {
     /// The ExUnits consumed (cpu, mem). Matches the units the ledger
     /// charges as part of script-execution fees.
     pub consumed: ExBudget,
+    /// Redeemer tag identifying which purpose group this redeemer
+    /// belongs to (Spend / Mint / Cert / Reward / Vote / Propose).
+    pub tag: dugite_primitives::transaction::RedeemerTag,
+    /// 0-based index of the redeemer within its purpose group.
+    pub index: u32,
+    /// `trace` builtin output captured during evaluation. Surfaces
+    /// `Plutus.Trace` messages back to the caller (used by
+    /// `SubmitService.EvalTx.traces`).
+    pub logs: Vec<String>,
 }
 
 /// All failure modes the phase-2 evaluator can surface to the
@@ -241,6 +250,9 @@ pub fn eval_phase_two_raw<O: RedeemerObserver>(
         results.push(RedeemerResult {
             redeemer_cbor: redeemer_proxy_cbor,
             consumed: outcome.consumed,
+            tag: resolved_r.tag.clone(),
+            index: resolved_r.index,
+            logs: outcome.logs,
         });
     }
     Ok(results)

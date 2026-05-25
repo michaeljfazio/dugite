@@ -18,6 +18,7 @@ use tonic::{Request, Response, Status};
 use tracing::warn;
 
 use super::ServiceState;
+use crate::map::patterns::matches_tx_predicate;
 use crate::map::tx::tx_to_proto;
 use crate::proto::{v1alpha, v1beta};
 
@@ -43,11 +44,21 @@ impl v1alpha::watch::watch_service_server::WatchService for WatchSvcAlpha {
 
     async fn watch_tx(
         &self,
-        _request: Request<v1alpha::watch::WatchTxRequest>,
+        request: Request<v1alpha::watch::WatchTxRequest>,
     ) -> Result<Response<Self::WatchTxStream>, Status> {
         self.state.metrics.stream_started(SERVICE_LABEL, "watch_tx");
         let mut events = self.state.mempool_feed.subscribe();
         let (tx, rx) = mpsc::channel(self.state.config.stream_buffer);
+        // Recode the v1alpha predicate to v1beta — they share the same
+        // shape at v0.19.2, so prost re-encoding round-trips exactly.
+        let predicate_beta: Option<v1beta::watch::TxPredicate> = {
+            use prost::Message;
+            request
+                .into_inner()
+                .predicate
+                .map(|p| p.encode_to_vec())
+                .and_then(|b| v1beta::watch::TxPredicate::decode(b.as_slice()).ok())
+        };
         tokio::spawn(async move {
             loop {
                 match events.recv().await {
@@ -66,6 +77,9 @@ impl v1alpha::watch::watch_service_server::WatchService for WatchSvcAlpha {
                                 continue;
                             }
                         };
+                        if !matches_tx_predicate(predicate_beta.as_ref(), &decoded) {
+                            continue;
+                        }
                         let beta_tx = tx_to_proto(&decoded);
                         use prost::Message;
                         let alpha_tx =
@@ -110,11 +124,12 @@ impl v1beta::watch::watch_service_server::WatchService for WatchSvcBeta {
 
     async fn watch_tx(
         &self,
-        _request: Request<v1beta::watch::WatchTxRequest>,
+        request: Request<v1beta::watch::WatchTxRequest>,
     ) -> Result<Response<Self::WatchTxStream>, Status> {
         self.state.metrics.stream_started(SERVICE_LABEL, "watch_tx");
         let mut events = self.state.mempool_feed.subscribe();
         let (tx, rx) = mpsc::channel(self.state.config.stream_buffer);
+        let predicate_beta = request.into_inner().predicate;
         tokio::spawn(async move {
             loop {
                 match events.recv().await {
@@ -133,6 +148,9 @@ impl v1beta::watch::watch_service_server::WatchService for WatchSvcBeta {
                                 continue;
                             }
                         };
+                        if !matches_tx_predicate(predicate_beta.as_ref(), &decoded) {
+                            continue;
+                        }
                         let beta_tx = tx_to_proto(&decoded);
                         let item = v1beta::watch::AnyChainTx {
                             chain: Some(v1beta::watch::any_chain_tx::Chain::Cardano(beta_tx)),

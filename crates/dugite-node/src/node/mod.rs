@@ -2849,6 +2849,7 @@ impl Node {
                 self.ledger_state.clone(),
                 self.mempool.clone(),
                 n2c_tx_validator.clone() as Arc<dyn dugite_network::TxValidator>,
+                n2c_slot_config,
             ));
             let (tip_feed, tip_publisher) = crate::rpc_adapter::build_tip_feed();
             // Spawn forwarder: subscribes to the node-side TipBroadcaster
