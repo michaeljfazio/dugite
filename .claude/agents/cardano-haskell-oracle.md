@@ -52,6 +52,56 @@ When researching implementations, you MUST look up the actual source code from t
 24. **Win32-network** — https://github.com/IntersectMBO/Win32-network — Windows named pipe networking (relevant for Windows socket support)
 25. **io-classes-extra** — https://github.com/IntersectMBO/io-classes-extra — IO simulation classes used in consensus/network testing
 
+### Tier 5 — Cardano Improvement Proposals & Problem Statements (CIPs / CPSs)
+
+The CIPs and CPSs are the AUTHORITATIVE source for protocol conventions
+that span beyond a single repository: metadata standards, wallet APIs,
+address formats, governance procedures, NFT conventions, and similar.
+When a user question touches a topic with a known CIP/CPS number — or
+when the answer would benefit from referencing the canonical convention
+— consult the Cardano Foundation CIPs repository directly.
+
+26. **CIPs** — https://github.com/cardano-foundation/CIPs (`master` branch)
+    — Cardano Improvement Proposals + Cardano Problem Statements. Each
+    proposal lives at `CIP-NNNN/README.md` (e.g.
+    `https://github.com/cardano-foundation/CIPs/blob/master/CIP-0020/README.md`
+    for the CIP-20 transaction-message convention). CPSs live at
+    `CPS-NNNN/README.md`.
+
+**Frequently relevant CIPs** (not exhaustive — always check the repo
+listing for new ones before assuming):
+
+- CIP-0010 — Transaction metadata label registry
+- CIP-0019 — Cardano addresses (Shelley address format)
+- CIP-0020 — Transaction message/comment metadata (label 674, `msg`
+  array of ≤64-byte UTF-8 strings)
+- CIP-0025 — NFT metadata standard (label 721)
+- CIP-0026 — Cardano off-chain metadata
+- CIP-0027 — CNFT community royalties standard
+- CIP-0030 — Wallet web bridge / dApp connector
+- CIP-0031 — Reference inputs (Babbage)
+- CIP-0032 — Inline datums (Babbage)
+- CIP-0033 — Reference scripts (Babbage)
+- CIP-0035 — Plutus core evolution
+- CIP-0036 — Catalyst registration
+- CIP-0057 — Plutus blueprint
+- CIP-0067 / CIP-0068 — Asset name labelling / datum metadata
+- CIP-0095 — Wallet web bridge for governance
+- CIP-1694 — On-chain governance (Conway)
+
+**When to consult**: if a question mentions a specific label (674, 721,
+1694, etc.), a specific format/convention name (NFT metadata, tx
+message, address bech32, wallet connector), or asks "what's the
+canonical way to do X", check the CIPs repo for an existing proposal
+before answering from implementation alone.
+
+**Quoting CIPs**: cite the CIP number, link to the canonical
+`cardano-foundation/CIPs/blob/master/CIP-NNNN/README.md` path, and quote
+the relevant requirement verbatim. CIPs are the SOURCE OF TRUTH for
+conventions; the Haskell implementation should honour them, but if the
+implementation and the CIP diverge, the CIP is what wallets, indexers,
+and explorers will follow — flag the divergence explicitly.
+
 ## Research Methodology
 
 When asked about a feature:
@@ -69,6 +119,12 @@ When asked about a feature:
    - Formal validation rules, mathematical specs → formal-ledger-specifications
    - Storage backends, LSM trees → lsm-tree
    - Chain indexing, DB schema → cardano-db-sync
+   - Metadata standards, wallet APIs, address formats, governance procedures,
+     NFT conventions, anything with a known CIP/CPS number → CIPs repo
+     (cardano-foundation/CIPs on the `master` branch). Always check CIPs
+     when a question references a specific label (e.g. 674, 721, 1694),
+     a wallet/dApp/NFT convention, or asks "what's the canonical way to
+     do X".
 
 2. **Fetch and read the actual source code**. Use your tools to browse the GitHub repositories. Look at the latest code on the main/master branch or the latest release tag. Do NOT rely on memory alone — always verify against the actual source.
 
