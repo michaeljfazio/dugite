@@ -6,6 +6,8 @@ Dugite provides two complementary monitoring tools: a terminal dashboard (`dugit
 
 `dugite-monitor` is a standalone binary that renders a real-time status dashboard in the terminal by polling the node's Prometheus endpoint. It requires no external infrastructure and works over SSH.
 
+![dugite-monitor TUI walkthrough](../assets/dugite-monitor.gif)
+
 ```bash
 # Monitor a local node (default: http://localhost:12798/metrics)
 dugite-monitor

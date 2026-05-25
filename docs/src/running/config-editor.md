@@ -2,6 +2,8 @@
 
 `dugite-config` is a standalone TUI tool for creating and editing Dugite configuration files interactively. It provides a full-screen terminal interface with tree navigation, inline editing, type validation, and a diff view — no need to remember field names or look up valid ranges.
 
+![dugite-config TUI walkthrough](../assets/dugite-config.gif)
+
 ## Installation
 
 `dugite-config` is built as part of the standard workspace:
