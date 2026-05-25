@@ -132,6 +132,16 @@ pub enum SubmitOutcome {
     Rejected { reason: String },
 }
 
+/// Outcome of a non-committing transaction evaluation (SubmitService.EvalTx).
+#[derive(Clone, Debug)]
+pub struct EvalOutcome {
+    /// The transaction's declared fee (in lovelace).
+    pub fee: u64,
+    /// `None` on successful evaluation; `Some(reason)` carries the
+    /// structured `TxValidationError` message on failure.
+    pub error: Option<String>,
+}
+
 // ─── The trait ────────────────────────────────────────────────────────────
 
 /// The full API surface the RPC server uses to talk to the node.
@@ -200,6 +210,11 @@ pub trait LedgerContext: Send + Sync + 'static {
     /// CBOR (`u16`, 0 = Byron, 1 = Shelley, …); the validator double-
     /// checks against the body shape.
     async fn submit_tx(&self, era: u16, raw_cbor: &[u8]) -> SubmitOutcome;
+
+    /// Non-committing Phase-1 + Phase-2 evaluation. Runs the same
+    /// validation pipeline as `submit_tx` but does NOT admit the tx
+    /// to the mempool — suitable for `SubmitService.EvalTx` dry-runs.
+    async fn eval_tx(&self, era: u16, raw_cbor: &[u8]) -> EvalOutcome;
 
     // ── mempool snapshot (live feed lives in MempoolFeed) ────────────────
 
