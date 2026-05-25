@@ -636,6 +636,7 @@ fn run_set(key: &str, value: &str, path: &Path) -> Result<()> {
                 value: seed_value,
                 modified: false,
                 present_in_file: true,
+                synthetic_paths: std::collections::HashSet::new(),
             });
             loaded.entries.len() - 1
         }
