@@ -67,6 +67,35 @@ impl DiffReport {
     }
 }
 
+/// Print the first N pool_params entries that differ between the two
+/// snapshots. Useful for triaging the structural shape of the divergence
+/// when `pool_params: value_mismatches=605` alone doesn't show what field
+/// inside `PoolRegistration` actually differs.
+pub fn print_first_pool_param_diffs(left_path: &Path, right_path: &Path, limit: usize) -> Result<()> {
+    let l = LedgerState::load_snapshot(&resolve_snapshot_path(left_path)?)
+        .with_context(|| format!("loading left {}", left_path.display()))?;
+    let r = LedgerState::load_snapshot(&resolve_snapshot_path(right_path)?)
+        .with_context(|| format!("loading right {}", right_path.display()))?;
+    println!("\n=== first {limit} pool_params diffs ===");
+    let mut emitted = 0;
+    let mut common_keys: Vec<_> = l.certs.pool_params.keys().collect();
+    common_keys.sort();
+    for k in common_keys {
+        if emitted >= limit {
+            break;
+        }
+        let lv = l.certs.pool_params.get(k);
+        let rv = r.certs.pool_params.get(k);
+        if lv != rv {
+            println!("  pool {}", k.to_hex());
+            println!("    LEFT  = {:#?}", lv);
+            println!("    RIGHT = {:#?}", rv);
+            emitted += 1;
+        }
+    }
+    Ok(())
+}
+
 /// Print a side-by-side overview of the two snapshots' scalar fields and
 /// collection sizes. Useful for triage when the diff report alone lacks
 /// the context to interpret what is happening (e.g. tip alignment,

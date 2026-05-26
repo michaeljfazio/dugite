@@ -92,7 +92,7 @@ use dugite_primitives::hash::{blake2b_256, Hash28, Hash32};
 use dugite_primitives::time::{BlockNo, SlotNo};
 use dugite_primitives::transaction::{
     AuxiliaryData, BootstrapWitness, Certificate, MIRSource, MIRTarget, NativeScript, OutputDatum,
-    PoolMetadata, PoolParams, ProtocolParamUpdate, Rational, Transaction, TransactionBody,
+    PoolMetadata, PoolParams, ProtocolParamUpdate, Rational, Relay, Transaction, TransactionBody,
     TransactionInput, TransactionMetadatum, TransactionOutput, TransactionWitnessSet,
     UpdateProposal, VKeyWitness,
 };
@@ -775,8 +775,18 @@ fn read_pool_params(r: &mut Reader<'_>) -> Result<PoolParams, SerializationError
     //
     // Mirrors Haskell `instance DecCBOR (StrictSeq StakePoolRelay)` →
     // `decodeSeq decCBOR` → `decodeListLenOrIndef` (handles both).
+    //
+    // Issue #670: the relays MUST be decoded into `Relay` values (not
+    // just skipped) so that `pool_params` in the from-genesis ledger
+    // state matches the Mithril-ancillary import byte-exact. The
+    // ancillary path populates relays from `HaskellStakePoolState`
+    // (`PoolRegistration.relays`); skipping the relay decode here left
+    // the from-genesis path with `relays: []` for every pool and the
+    // verify-ledger-snapshot harness reported `pool_params:
+    // value_mismatches=605` on preview epoch 1308.
+    let mut relays: Vec<Relay> = Vec::new();
     r.for_each_array_item(|r| {
-        r.skip()?; // TODO(M4a-2): decode relay structs
+        relays.push(read_relay(r)?);
         Ok(())
     })?;
     // pool_metadata: null or [url, hash]
@@ -793,9 +803,113 @@ fn read_pool_params(r: &mut Reader<'_>) -> Result<PoolParams, SerializationError
         },
         reward_account,
         pool_owners,
-        relays: Vec::new(), // TODO(M4a-2): decode relay structs
+        relays,
         pool_metadata,
     })
+}
+
+/// Decode a single CBOR relay structure per the Shelley+ CDDL:
+///
+/// ```cddl
+/// relay =
+///   [  single_host_addr   // 0
+///   // single_host_name   // 1
+///   // multi_host_name    // 2
+///   ]
+///
+/// single_host_addr = [0, port / null, ipv4 / null, ipv6 / null]
+/// single_host_name = [1, port / null, dns_name]
+/// multi_host_name  = [2, dns_name]
+/// ```
+///
+/// Used by both Shelley/Babbage and Conway pool-registration decoders.
+pub(crate) fn read_relay(r: &mut Reader<'_>) -> Result<Relay, SerializationError> {
+    let arr_len = r.read_array_header()?;
+    let tag = r.read_uint()?;
+    match tag {
+        0 => {
+            // single_host_addr: [0, port?, ipv4?, ipv6?]
+            let port = read_opt_port(r)?;
+            let ipv4 = read_opt_ipv4(r)?;
+            let ipv6 = read_opt_ipv6(r)?;
+            if matches!(arr_len, Some(n) if n != 4) {
+                return Err(SerializationError::CborDecode(format!(
+                    "single_host_addr: expected array(4), got array({:?})",
+                    arr_len
+                )));
+            }
+            Ok(Relay::SingleHostAddr { port, ipv4, ipv6 })
+        }
+        1 => {
+            // single_host_name: [1, port?, dns_name]
+            let port = read_opt_port(r)?;
+            let dns_name = r.read_str()?.to_string();
+            if matches!(arr_len, Some(n) if n != 3) {
+                return Err(SerializationError::CborDecode(format!(
+                    "single_host_name: expected array(3), got array({:?})",
+                    arr_len
+                )));
+            }
+            Ok(Relay::SingleHostName { port, dns_name })
+        }
+        2 => {
+            // multi_host_name: [2, dns_name]
+            let dns_name = r.read_str()?.to_string();
+            if matches!(arr_len, Some(n) if n != 2) {
+                return Err(SerializationError::CborDecode(format!(
+                    "multi_host_name: expected array(2), got array({:?})",
+                    arr_len
+                )));
+            }
+            Ok(Relay::MultiHostName { dns_name })
+        }
+        other => Err(SerializationError::CborDecode(format!(
+            "relay: unknown tag {other}"
+        ))),
+    }
+}
+
+fn read_opt_port(r: &mut Reader<'_>) -> Result<Option<u16>, SerializationError> {
+    if r.peek_major()? == Type::Null {
+        r.read_null()?;
+        return Ok(None);
+    }
+    let v = r.read_uint()?;
+    Ok(Some(v as u16))
+}
+
+fn read_opt_ipv4(r: &mut Reader<'_>) -> Result<Option<[u8; 4]>, SerializationError> {
+    if r.peek_major()? == Type::Null {
+        r.read_null()?;
+        return Ok(None);
+    }
+    let bytes = r.read_bytes()?;
+    if bytes.len() != 4 {
+        return Err(SerializationError::CborDecode(format!(
+            "ipv4: expected 4 bytes, got {}",
+            bytes.len()
+        )));
+    }
+    let mut a = [0u8; 4];
+    a.copy_from_slice(bytes);
+    Ok(Some(a))
+}
+
+fn read_opt_ipv6(r: &mut Reader<'_>) -> Result<Option<[u8; 16]>, SerializationError> {
+    if r.peek_major()? == Type::Null {
+        r.read_null()?;
+        return Ok(None);
+    }
+    let bytes = r.read_bytes()?;
+    if bytes.len() != 16 {
+        return Err(SerializationError::CborDecode(format!(
+            "ipv6: expected 16 bytes, got {}",
+            bytes.len()
+        )));
+    }
+    let mut a = [0u8; 16];
+    a.copy_from_slice(bytes);
+    Ok(Some(a))
 }
 
 fn read_pool_metadata(r: &mut Reader<'_>) -> Result<Option<PoolMetadata>, SerializationError> {

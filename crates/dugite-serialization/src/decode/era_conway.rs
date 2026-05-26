@@ -1535,8 +1535,16 @@ fn read_pool_params(r: &mut Reader<'_>) -> Result<PoolParams, SerializationError
     let reward_account = r.read_bytes_owned()?;
     let pool_owners: Vec<Hash28> = r.read_set(|r| read_hash28_cert(r))?;
     // relays: definite OR indefinite-length array — see #673 / era_shelley.rs.
+    //
+    // Issue #670: decode relays into `Relay` values (not skip) so the
+    // from-genesis ledger state matches the Mithril ancillary import
+    // byte-exact on `pool_params`.  See era_shelley::read_relay for the
+    // CDDL.  Without this the verify-ledger-snapshot harness reported
+    // `pool_params: value_mismatches=605` against the ancillary on
+    // preview epoch 1308.
+    let mut relays: Vec<dugite_primitives::transaction::Relay> = Vec::new();
     r.for_each_array_item(|r| {
-        r.skip()?;
+        relays.push(super::era_shelley::read_relay(r)?);
         Ok(())
     })?;
     let pool_metadata = read_pool_metadata(r)?;
@@ -1551,7 +1559,7 @@ fn read_pool_params(r: &mut Reader<'_>) -> Result<PoolParams, SerializationError
         },
         reward_account,
         pool_owners,
-        relays: Vec::new(),
+        relays,
         pool_metadata,
     })
 }
