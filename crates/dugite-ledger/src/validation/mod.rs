@@ -2455,12 +2455,21 @@ pub fn validate_transaction_with_pools(
     // `cardano-ledger-shelley:Cardano.Ledger.Shelley.Rules.Pool`.
     // ------------------------------------------------------------------
     if let Some(pools) = registered_pools {
-        let mut live: std::collections::HashSet<Hash28> = pools.clone();
+        // Previously this cloned the entire `pools` set (~683 entries on
+        // preview at epoch 1309) on every transaction — a deep allocation
+        // + memcpy in the per-tx validation hot path.  Track only the
+        // delta: pool IDs newly registered within THIS tx.  A typical tx
+        // has zero pool-registration certs, so this set is almost always
+        // empty.  Membership check becomes
+        // `pools.contains(target) || new_pools.contains(target)` —
+        // O(1) on both sides.
+        let mut new_pools: std::collections::HashSet<Hash28> =
+            std::collections::HashSet::new();
         for cert in &tx.body.certificates {
-            // Pool registration adds to the live set BEFORE we check
+            // Pool registration adds to the per-tx delta BEFORE we check
             // subsequent delegations/retirements in this tx.
             if let dugite_primitives::transaction::Certificate::PoolRegistration(params) = cert {
-                live.insert(params.operator);
+                new_pools.insert(params.operator);
                 continue;
             }
 
@@ -2485,7 +2494,7 @@ pub fn validate_transaction_with_pools(
                 _ => None,
             };
             if let Some(pool_id) = opt_target {
-                if !live.contains(&pool_id) {
+                if !pools.contains(&pool_id) && !new_pools.contains(&pool_id) {
                     errors.push(ValidationError::DelegateePoolNotRegistered {
                         pool_id: pool_id.to_hex(),
                     });
