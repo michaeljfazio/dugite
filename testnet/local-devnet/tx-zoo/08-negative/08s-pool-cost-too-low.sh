@@ -39,15 +39,19 @@ MIN_POOL_COST=$(cardano-cli conway query protocol-parameters \
     --socket-path "$ZOO_SOCKET" \
     --output-json 2>/dev/null | jq -r '.minPoolCost // 340000000')
 
-# Register pool with cost=1 (way below minPoolCost)
+# Register pool with cost=1 (way below minPoolCost). cardano-cli requires
+# `StakeVerificationKey` (not `GenesisUTxOVerificationKey`) for the
+# reward-account and owner fields, so use wallet-a's stake key.
+WA_STAKE_VKEY="$ZOO_KEYS/wallet-a/stake.vkey"
+[ -s "$WA_STAKE_VKEY" ] || { zoo_record "$NAME" SKIP "" "no-wallet-a-stake-key (run --setup first)"; exit 0; }
 cardano-cli conway stake-pool registration-certificate \
     --cold-verification-key-file  "$POOL_COLD_VKEY" \
     --vrf-verification-key-file   "$POOL_VRF_VKEY" \
     --pool-pledge  0 \
     --pool-cost    1 \
     --pool-margin  0 \
-    --pool-reward-account-verification-key-file "$ZOO_PAY_VKEY" \
-    --pool-owner-stake-verification-key-file    "$ZOO_PAY_VKEY" \
+    --pool-reward-account-verification-key-file "$WA_STAKE_VKEY" \
+    --pool-owner-stake-verification-key-file    "$WA_STAKE_VKEY" \
     --testnet-magic "$LD_MAGIC" \
     --out-file "$POOL_REG" >/dev/null 2>&1 || \
 { zoo_record "$NAME" SKIP "" "registration-certificate-failed"; exit 0; }

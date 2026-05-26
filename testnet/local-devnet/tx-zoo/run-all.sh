@@ -97,9 +97,14 @@ zoo_require_devnet
 "$SCRIPT_DIR/lib/build-plutus.sh"
 "$SCRIPT_DIR/lib/keygen.sh"
 
-# Reset the results CSV for this run (preserve old logs/built artifacts).
+# Reset the results CSV for this run, and truncate per-script logs so the
+# next debugger sees only output from THIS invocation (run-all redirects
+# stderr with `>>`, so stale errors from prior runs would otherwise
+# accumulate and mask the current failure).
 > "$ZOO_RESULTS_CSV"
 echo "ts,name,status,txid,detail" > "$ZOO_RESULTS_CSV"
+mkdir -p "$ZOO_LOGS"
+find "$ZOO_LOGS" -maxdepth 1 -name '*.log' -type f -exec sh -c ': > "$1"' _ {} \; 2>/dev/null || true
 
 # cardano-cli 11.0 fetches --anchor-url / --metadata-url / --drep-metadata-url
 # at build time and validates the downloaded content against the supplied hash.

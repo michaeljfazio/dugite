@@ -43,6 +43,22 @@ else
     # search. Without this 3rd-arg the wait always times out as
     # `reg-not-incl` even when the tx is forged 1-2 slots later.
     zoo_wait_inclusion "$REG_TXID" 60 "$ADDR" || { zoo_record "$NAME" FAIL "$REG_TXID" "reg-not-incl"; exit 1; }
+    # Inclusion of the change UTxO does not guarantee the DRep entry is yet
+    # observable via `query drep-state` — dugite's N2C query reads a separate
+    # ledger-view snapshot that lags the chain by up to a slot after a block
+    # is applied (#TBD). cardano-cli's `transaction build` queries drep-state
+    # to compute the dereg refund; if the just-registered DRep is missing it
+    # builds with refund=0, producing a tx whose change output is short by
+    # the deposit amount and which then fails ValueNotConservedUTxO on
+    # submit. Poll until drep-state observes the new entry before proceeding.
+    for _ in $(seq 1 30); do
+        N=$(cardano-cli conway query drep-state \
+                --testnet-magic "$LD_MAGIC" --socket-path "$ZOO_SOCKET" \
+                --drep-key-hash "$DREP_KH" 2>/dev/null \
+              | jq -r 'length' 2>/dev/null || echo 0)
+        [ "$N" -ge 1 ] && break
+        sleep 1
+    done
 fi
 
 CERT="$ZOO_BUILT/$NAME.cert"

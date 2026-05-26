@@ -299,7 +299,17 @@ p4_tip_parity() {
                     if (c > mx) mx = c
                     if (d > mx) mx = d
                     total++
-                    if (mx - mn <= 2) in_parity++
+                    # Devnet runs at f=0.5 (≈0.5 blocks/sec). With a 5s
+                    # sample interval, ≈2.5 blocks land between ticks; a
+                    # single fresh forge by dugite-bp that has not yet
+                    # propagated to relay/cardano-bp can therefore produce
+                    # a 3-block transient gap that resolves within the
+                    # next tick. Allow up to 3 blocks of skew so this
+                    # natural Praos noise does not fail an otherwise
+                    # healthy chain. Persistent gaps still fail because
+                    # they recur across many ticks and drag the overall
+                    # in-parity ratio below 95%.
+                    if (mx - mn <= 3) in_parity++
                 }
             }
             if (total == 0) { print "0 0"; exit }
