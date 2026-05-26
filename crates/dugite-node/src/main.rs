@@ -64,6 +64,11 @@ struct VerifyLedgerSnapshotArgs {
     #[arg(long)]
     verbose: bool,
 
+    /// Print the first N pool_params entries that differ. Surfaces
+    /// the structural shape of the divergence inside `PoolRegistration`.
+    #[arg(long, default_value_t = 0)]
+    show_pool_diffs: usize,
+
     #[command(flatten)]
     log: LogArgs,
 }
@@ -514,6 +519,13 @@ async fn run_verify_ledger_snapshot(args: VerifyLedgerSnapshotArgs) -> Result<()
     );
     if args.verbose {
         verify_snapshot::print_scalar_overview(&args.left, &args.right)?;
+    }
+    if args.show_pool_diffs > 0 {
+        verify_snapshot::print_first_pool_param_diffs(
+            &args.left,
+            &args.right,
+            args.show_pool_diffs,
+        )?;
     }
     let report = verify_snapshot::verify_snapshots(&args.left, &args.right)?;
     let n = report.print();
