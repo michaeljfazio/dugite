@@ -29,13 +29,13 @@ fuzz_target!(|data: &[u8]| {
 
     // Also verify a hand-crafted deeply-nested indefinite array returns Err.
     //
-    // CBOR_SKIP_MAX_DEPTH = 64, checked as `depth > CBOR_SKIP_MAX_DEPTH`. The
-    // outer call uses depth=0 so up to depth=64 (65 nesting levels) is
-    // permitted; the 66th nesting level (depth=65) is rejected. We test
-    // significantly past that bound (80 levels) to be robust against future
-    // tweaks to the constant.
+    // CBOR_SKIP_MAX_DEPTH = 1024 (raised from 64 in #673), checked as
+    // `depth > CBOR_SKIP_MAX_DEPTH`. The outer call uses depth=0 so up to
+    // depth=1024 (1025 nesting levels) is permitted; the 1026th nesting level
+    // (depth=1025) is rejected. We test significantly past that bound to be
+    // robust against future tweaks to the constant.
     if !data.is_empty() && data[0] == 0x01 {
-        let levels = 80usize;
+        let levels = 1100usize;
         let mut nested = vec![0x9fu8; levels];
         nested.extend(vec![0xffu8; levels]);
         let result = skip_cbor_value(&nested);

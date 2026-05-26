@@ -98,8 +98,30 @@ jobs:
       # Without an explicit override it asks for x86_64-unknown-linux-musl, which
       # the GNU nightly toolchain doesn't ship and sanitizer can't use anyway
       # (musl static libc is incompatible with -Zsanitizer=address). See #492.
+      #
+      # rss_limit_mb is raised from the libFuzzer default (2048) to 12288 (12 GB):
+      #   - The default cargo-fuzz build enables AddressSanitizer, which roughly
+      #     doubles to triples the program's RSS via its shadow memory.
+      #   - Over a 1-hour run libFuzzer accumulates a corpus (held in memory)
+      #     and a feature/coverage map; combined with glibc's high-water-mark
+      #     RSS behaviour the process slowly creeps upward. Successive caps of
+      #     2048 → 5120 → 6144 each got pierced by ~1-10 MB about an hour into
+      #     the run by a different heavy decoder target (encode_roundtrip,
+      #     dugite_uplc_program_decode). The growth is slow but unbounded
+      #     enough to defeat any tight ceiling.
+      # ubuntu-24.04 hosted runners have 16 GB RAM, so 12 GB leaves ~4 GB for
+      # the OS, the artifact-upload step, and any concurrent matrix jobs the
+      # runner may co-host.
+      #
+      # max_len bounds the size of any single generated input to 4 KiB. The
+      # default cargo-fuzz max_len is 4 KiB; we previously raised it to 16 KiB
+      # then 8 KiB. After observing that nothing about Cardano wire-format
+      # decoding genuinely needs > 4 KiB of input to exercise the surface
+      # (transaction bodies, block headers, witness sets all fit comfortably),
+      # restore the default cap. This meaningfully shrinks the in-memory
+      # corpus size at 1-hour scale.
       - name: Run fuzzer (1 hour)
-        run: cargo +nightly fuzz run fuzz_${{ matrix.target }} --target x86_64-unknown-linux-gnu -- -max_total_time=3600
+        run: cargo +nightly fuzz run fuzz_${{ matrix.target }} --target x86_64-unknown-linux-gnu -- -max_total_time=3600 -rss_limit_mb=12288 -max_len=4096
 
       - name: Upload corpus
         if: always()

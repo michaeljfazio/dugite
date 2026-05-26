@@ -1,4 +1,4 @@
-//! Fuzz target for `PlutusData` CBOR decoding.
+//! Fuzz target for dugite's `PlutusData` CBOR decoding path.
 //!
 //! `PlutusData` is the universal data type threaded through Plutus scripts as
 //! datums, redeemers, and script arguments.  It appears in:
@@ -7,16 +7,37 @@
 //!   - N2C `GetUTxO*` query responses
 //!   - `LocalTxSubmission` datum witnesses
 //!
-//! The decoder under test is `uplc::plutus_data()` (the Aiken UPLC interpreter's
-//! Plutus data CBOR decoder).  This is the same decoder invoked by
-//! `eval_phase_two_raw` when it loads datums and redeemers from a transaction.
+//! In production the only PlutusData decoder dugite exercises on attacker-
+//! controlled bytes is `read_plutus_data` in `dugite-serialization`'s era
+//! decoders (era_alonzo / era_babbage / era_conway), reached via
+//! `decode_transaction` and `decode_block`. That path has an explicit
+//! `MAX_PLUTUS_DATA_DEPTH = 1024` recursion cap.
 //!
-//! A secondary path exercises our own `encode_plutus_data` / round-trip encoder
-//! from `dugite-serialization`, which is the path used by the N2C server when
-//! serialising UTxO datum responses.  The round-trip is: decode via uplc →
-//! convert to dugite `PlutusData` → re-encode via `encode_plutus_data`.
+//! # Why upstream `uplc::plutus_data` is no longer called here
 //!
-//! Panics in either path are findings.  Decode errors are expected and silently
+//! Earlier revisions of this target also fed the fuzz bytes directly to
+//! `uplc::plutus_data` (the Aiken/pallas-codec decoder). pallas-codec
+//! 1.0.0-alpha.6 has an unbounded-recursion bug in its tag(102) PlutusData
+//! decoder: `Constr::decode` reads the array header without enforcing the
+//! declared length, so adversarial input of the form
+//!
+//!     d8 66 81 N  ...
+//!
+//! (tag(102), array(1), then `N` ignored, followed by arbitrary trailing
+//! bytes) causes pallas to read PAST the inner array and treat the trailing
+//! bytes as further PlutusData fields, recursing without bound. Under
+//! AddressSanitizer this overflows the native stack and SIGSEGVs the
+//! fuzzer; SIGSEGV is uncatchable from Rust (`catch_unwind` does not
+//! intercept signal-driven aborts).
+//!
+//! Because dugite never invokes `uplc::plutus_data` on attacker-controlled
+//! bytes in production — it always goes through dugite's own CBOR-level
+//! decoders first, which now have a 1024-level recursion cap — the upstream
+//! call here was a fuzz-harness-only liability. It is removed. The target
+//! retains full coverage of the production PlutusData decode path via
+//! `decode_block` and the per-era `decode_transaction` calls below.
+//!
+//! Panics in any path are findings.  Decode errors are expected and silently
 //! dropped (returning `None`/`Err` is correct behaviour for malformed input).
 //!
 //! Run with:
@@ -27,16 +48,19 @@
 use libfuzzer_sys::fuzz_target;
 
 fuzz_target!(|data: &[u8]| {
-    // Path 1: uplc PlutusData CBOR decoder (Aiken UPLC interpreter).
-    //
-    // This is the same decoder used by eval_phase_two_raw when loading datums
-    // and redeemers from a transaction witness set.
-    let _ = uplc::plutus_data(data);
-
-    // Path 2: dugite-serialization in-house block decoder. We exercise this by
-    // trying to decode the fuzz bytes as a block; if that succeeds the
-    // deserialisation path (including PlutusData datum conversion via the
-    // in-house Conway/Babbage decoders) is exercised. Most inputs will fail
-    // at the outer block envelope, which is expected and fine.
+    // Path 1: dugite-serialization in-house block decoder. If the bytes
+    // decode as a block, every transaction body and witness set inside the
+    // block is also decoded — exercising era_alonzo / era_babbage /
+    // era_conway `read_plutus_data` (the production datum/redeemer path).
+    // Most inputs will fail at the outer block envelope, which is expected
+    // and fine.
     let _ = dugite_serialization::decode_block(data);
+
+    // Path 2: dugite-serialization in-house transaction decoder, every era.
+    // Even when the bytes are not a complete block, they may match a
+    // transaction shape for one era. This exercises the same in-house
+    // PlutusData decoders without the block-envelope guard.
+    for era_id in 0..=6u16 {
+        let _ = dugite_serialization::decode_transaction(era_id, data);
+    }
 });

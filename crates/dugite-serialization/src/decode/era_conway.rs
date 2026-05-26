@@ -2397,6 +2397,25 @@ fn read_native_script(r: &mut Reader<'_>) -> Result<NativeScript, SerializationE
 /// - Integer: uint or negative int or tag(2/3) bignum
 /// - Bytes: bytestring (possibly indefinite-length)
 pub(crate) fn read_plutus_data(r: &mut Reader<'_>) -> Result<PlutusData, SerializationError> {
+    read_plutus_data_depth(r, 0)
+}
+
+/// Maximum nesting depth for `read_plutus_data` (Conway era).
+///
+/// See the `MAX_PLUTUS_DATA_DEPTH` constant in `era_alonzo.rs` for the
+/// rationale; the same limit applies to the Conway decoder because the
+/// recursive grammar is identical.
+const MAX_PLUTUS_DATA_DEPTH: usize = 1024;
+
+fn read_plutus_data_depth(
+    r: &mut Reader<'_>,
+    depth: usize,
+) -> Result<PlutusData, SerializationError> {
+    if depth > MAX_PLUTUS_DATA_DEPTH {
+        return Err(SerializationError::CborDecode(format!(
+            "plutus_data nesting depth exceeds limit ({MAX_PLUTUS_DATA_DEPTH})"
+        )));
+    }
     let ty = r.peek_major()?;
     match ty {
         Type::Tag => {
@@ -2412,13 +2431,13 @@ pub(crate) fn read_plutus_data(r: &mut Reader<'_>) -> Result<PlutusData, Seriali
                 121..=127 => {
                     // Alternative 0..=6: tag(121+n) [* plutus_data]
                     r.read_tag()?; // consume tag
-                    let fields = r.read_array(read_plutus_data)?;
+                    let fields = r.read_array(|r| read_plutus_data_depth(r, depth + 1))?;
                     Ok(PlutusData::Constr(tag_val - 121, fields))
                 }
                 1280..=1400 => {
                     // Alternative 7+: tag(1280+n) [* plutus_data]
                     r.read_tag()?; // consume tag
-                    let fields = r.read_array(read_plutus_data)?;
+                    let fields = r.read_array(|r| read_plutus_data_depth(r, depth + 1))?;
                     Ok(PlutusData::Constr(tag_val - 1280 + 7, fields))
                 }
                 102 => {
@@ -2431,7 +2450,7 @@ pub(crate) fn read_plutus_data(r: &mut Reader<'_>) -> Result<PlutusData, Seriali
                         )));
                     }
                     let alt = r.read_uint()?;
-                    let fields = r.read_array(read_plutus_data)?;
+                    let fields = r.read_array(|r| read_plutus_data_depth(r, depth + 1))?;
                     Ok(PlutusData::Constr(alt, fields))
                 }
                 _ => {
@@ -2446,11 +2465,14 @@ pub(crate) fn read_plutus_data(r: &mut Reader<'_>) -> Result<PlutusData, Seriali
         Type::Map | Type::MapIndef => {
             // Both definite-length and indefinite-length maps are valid PlutusData.
             // read_map() handles both via the None => loop {} branch.
-            let entries = r.read_map(read_plutus_data, read_plutus_data)?;
+            let entries = r.read_map(
+                |r| read_plutus_data_depth(r, depth + 1),
+                |r| read_plutus_data_depth(r, depth + 1),
+            )?;
             Ok(PlutusData::Map(entries))
         }
         Type::Array | Type::ArrayIndef => {
-            let items = r.read_array(read_plutus_data)?;
+            let items = r.read_array(|r| read_plutus_data_depth(r, depth + 1))?;
             Ok(PlutusData::List(items))
         }
         Type::U8
