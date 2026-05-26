@@ -559,11 +559,11 @@ pub fn diff_snapshots(left: &LedgerStateSnapshot, right: &LedgerStateSnapshot) -
     );
 
     // ── Stake distribution + pointer stake ──────────────────────────
-    cmp_pretty(
+    diff_map(
         &mut diffs,
-        "stake_distribution",
-        &left.stake_distribution,
-        &right.stake_distribution,
+        "stake_distribution.stake_map",
+        &left.stake_distribution.stake_map,
+        &right.stake_distribution.stake_map,
     );
     diff_map(&mut diffs, "ptr_stake", &left.ptr_stake, &right.ptr_stake);
 
