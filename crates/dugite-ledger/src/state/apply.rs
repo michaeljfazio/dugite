@@ -485,7 +485,14 @@ impl LedgerState {
             block_committee_member_keys,
             block_committee_resigned_keys,
             block_vote_delegation_keys,
-            block_active_proposals,
+            // `block_active_proposals` is `mut` so we can update it after each
+            // proposal-containing tx.  Haskell's `LEDGER` rule processes txs
+            // sequentially with updating state, so a vote in tx[j] on a proposal
+            // submitted by tx[i] (i < j) in the same block is valid — after tx[i]
+            // applies, the proposal is in `vsProposals` and tx[j] can reference it.
+            // Without this update dugite logs spurious `GovActionsDoNotExist`
+            // warnings for cross-tx same-block proposal+vote patterns.
+            mut block_active_proposals,
             block_committee_authorized_hot_keys,
             block_committee_authorized_elected_hot_keys,
             block_stake_key_deposits_arc,
@@ -905,6 +912,47 @@ impl LedgerState {
                     &mut self.epochs,
                 )?;
                 block_diff.merge(&diff);
+
+                // ── Step 8b-post: Update block_active_proposals ───────────
+                //
+                // After a proposal-containing tx is applied, `self.gov.governance.proposals`
+                // now includes the new proposal(s).  Update `block_active_proposals` so
+                // that a subsequent tx in the same block that votes on this proposal can
+                // resolve it — mirroring Haskell's sequential `LEDGER` rule state updates.
+                //
+                // This is the cross-tx same-block case: tx[i] proposes, tx[j] (j>i) votes.
+                // Haskell accepts because by the time tx[j] is processed, `vsProposals`
+                // already contains tx[i]'s proposal.  Without this update dugite logs
+                // a spurious `GovActionsDoNotExist` warning for tx[j] and trusts on-chain
+                // consensus (which is correct, but the warning is misleading).
+                //
+                // Only rebuild when the tx actually has proposals; avoid the
+                // `Arc::unwrap_or_clone` cost for the common case (no proposals).
+                if mode == BlockValidationMode::ValidateAll
+                    && !tx.body.proposal_procedures.is_empty()
+                {
+                    let mut updated_proposals =
+                        std::sync::Arc::unwrap_or_clone(block_active_proposals);
+                    for (idx, _) in tx.body.proposal_procedures.iter().enumerate() {
+                        let id = dugite_primitives::transaction::GovActionId {
+                            transaction_id: tx.hash,
+                            action_index: idx as u32,
+                        };
+                        if let Some(state) = self.gov.governance.proposals.get(&id) {
+                            updated_proposals.insert(
+                                id,
+                                crate::validation::ActiveProposal {
+                                    gov_action: state.procedure.gov_action.clone(),
+                                    return_addr: state.procedure.return_addr.clone(),
+                                    deposit: state.procedure.deposit,
+                                    expires_after_epoch: state.expires_epoch,
+                                    proposed_in_epoch: state.proposed_epoch,
+                                },
+                            );
+                        }
+                    }
+                    block_active_proposals = std::sync::Arc::new(updated_proposals);
+                }
 
                 // ── Step 8c: Pre-Conway PP update proposals ───────────────
                 //
