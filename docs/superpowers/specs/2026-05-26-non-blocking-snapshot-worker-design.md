@@ -95,26 +95,41 @@ Phase A holds the ledger write lock while it:
 4. Builds `LedgerStateSnapshot::from(&*ls)`. Per
    `crates/dugite-ledger/src/state/snapshot_format.rs:183`, this is:
    - **Cheap (Arc::clone, O(1)):** `delegations`, `pool_params`,
-     `reward_accounts`, `governance`, `epoch_blocks_by_pool`.
-   - **Expensive (deep `.clone()`):** `stake_distribution`,
-     `snapshots: EpochSnapshots` (mark/set/go: 3× ~1M entries),
-     `pointer_map`, `script_stake_credentials`, `genesis_delegates`,
-     `pending_pp_updates`, `future_pp_updates`, `pending_retirements`,
-     `future_pool_params`, `protocol_params`, `prev_protocol_params`,
-     and the various `pending_mir_*` maps. Most are small; the
-     biggest is `EpochSnapshots` (hundreds of MB on mainnet).
+     `reward_accounts`, `governance`, `epoch_blocks_by_pool`. Also
+     `snapshots: EpochSnapshots` — every large map inside its
+     `StakeSnapshot` (`delegations`, `pool_params`,
+     `stake_distribution`) is itself `Arc<HashMap<…>>`, so
+     `EpochSnapshots::clone()` is mostly Arc-clones.
+   - **Expensive deep `.clone()` (~1M mainnet entries each):**
+     - `stake_distribution.stake_map: HashMap<Hash32, Lovelace>`
+       — ~64 MB / ~200 ms
+     - `stake_key_deposits: HashMap<Hash32, u64>` — ~40 MB /
+       ~150 ms
+   - **Small deep clones** (few-K to few-thousand entries each,
+     each clone sub-ms): `pool_deposits`, `pointer_map`,
+     `script_stake_credentials`, `genesis_delegates`,
+     `pending_pp_updates`, `future_pp_updates`,
+     `pending_retirements`, `future_pool_params`, the
+     `pending_mir_*` maps, `opcert_counters`, and the two
+     `ProtocolParameters` structs (large struct but constant size,
+     ~10–50 KB).
    - **In-memory-backend only foot-gun:** `utxo_set: s.utxo.utxo_set.clone()`
      is a multi-GB deep clone if the LSM store is not attached.
      Production always attaches LSM, so this is empty in practice.
      A `debug_assert!(s.utxo.utxo_set.has_store(), …)` guards this
      in the view builder.
 
-The deep-cloned HashMaps are also the **memory peak** during the
-write window: the worker holds the cloned maps until the bincode
-walk completes (5–15 s on mainnet at the disk-bound write rate).
-This is **identical to today's #649 `spawn_blocking` path** — not
-a regression — but worth quantifying. Expected peak: 200–500 MB
-extra residency for the worker's view on mainnet.
+Total Phase-A deep-clone budget on mainnet: ~350–500 ms (the two
+big stake-credential maps dominate). Combined with the LSM flush
+(~1–2 s under churn) the realistic apply pause is **~1.5–2.5 s**
+on mainnet at-tip — down from 5–15 s today.
+
+Memory peak during the write window: the worker holds the cloned
+maps until the bincode walk completes (5–15 s on mainnet at the
+disk-bound write rate). Expected peak: ~100–150 MB extra residency
+for the worker's view on mainnet (the two big maps). This is
+**identical to today's #649 `spawn_blocking` path** — not a
+regression.
 
 `Arc::clone` view IS a point-in-time snapshot because
 `crates/dugite-ledger/src/ledger_seq.rs` uses `Arc::make_mut` for
@@ -260,58 +275,84 @@ returns the function completes immediately and apply continues.
 
 #### 3. Caller-side scheduler integration (correctness-critical)
 
-Each at-tip call site replaces:
+Two distinct scheduler types are used at-tip and each needs the
+same skip-aware treatment:
 
-```rust
-if scheduler.maybe_snapshot_check(...) {
-    self.save_ledger_snapshot().await;
-    scheduler.record_snapshot_taken(epoch);
-}
-```
+| Scheduler | Defined in | Used at | Reset API |
+|---|---|---|---|
+| `Node.bg_snapshot_scheduler: SnapshotScheduler` | `crates/dugite-storage/src/background.rs:363` | `sync.rs:1494–1502` (per-batch), `mod.rs:4810–4817` (per-block) | `record_snapshot_taken(epoch)` |
+| `Node.snapshot_policy: SnapshotPolicy` | `crates/dugite-node/src/node/epoch.rs:108` | `sync.rs:1745–1748` (epoch boundary, time-based) | `snapshot_taken()` |
 
-with:
+Both at-tip call sites become:
 
 ```rust
 if scheduler.maybe_snapshot_check(...) {
     match self.try_snapshot_async().await {
         SnapshotEnqueue::Enqueued => {
-            scheduler.record_snapshot_taken(epoch);
+            scheduler.record_snapshot_taken(epoch);  // or .snapshot_taken()
         }
         SnapshotEnqueue::Skipped | SnapshotEnqueue::Closed => {
             // Don't record — let the scheduler retry on the
-            // next block. Otherwise the 2000-block interval
-            // (`DEFAULT_SNAPSHOT_INTERVAL`) would delay the next
-            // attempt by ~11 h on mainnet.
+            // next block / next check. Resetting the counter on
+            // skip would delay the next attempt by the full
+            // interval (~11 h on mainnet for the block scheduler).
         }
     }
 }
 ```
 
 This is the key correctness fix: skipping a save **must not** reset
-the scheduler's `blocks_since_snapshot` counter, or the next attempt
-would be delayed by the full interval.
+the scheduler's interval counter, or the next attempt would be
+delayed by the full interval.
+
+The four exact replacement sites:
+- `sync.rs:1499` — `bg_snapshot_scheduler.maybe_snapshot_check` →
+  on `Enqueued`, `record_snapshot_taken(current_epoch)`.
+- `sync.rs:1746` — `snapshot_policy.should_snapshot_normal()` →
+  on `Enqueued`, `snapshot_policy.snapshot_taken()`.
+- `mod.rs:4814` — `bg_snapshot_scheduler.maybe_snapshot_check` →
+  on `Enqueued`, `record_snapshot_taken(current_epoch)`.
+- `sync.rs:2185, 2614` — bulk-replay local `snapshot_policy`:
+  delete entire `should_snapshot_bulk()` blocks (covered in §4).
 
 #### 4. Bulk replay (strict Haskell match)
 
-Two replay paths exist and they have different async/sync flavors:
+**Both replay paths already perform an end-of-replay save block.**
+We do not add code — we only **delete** the per-50K-block inline
+saves inside the loops.
 
-- **`crates/dugite-node/src/node/sync.rs:2150`** — chunk-file replay.
-  Inside `try_for_each_chunk_block` which is a synchronous closure
-  running on the current OS thread. Uses `ledger_state.blocking_write()`.
-  - Drop the `should_snapshot_bulk` save inside the loop.
-  - After the loop exits but **still inside the sync closure's
-    enclosing function**, call `ls.save_snapshot(&snapshot_path)`
-    synchronously using a single `blocking_write()` acquisition.
-    This produces one snapshot artefact for the entire replay.
+- **`crates/dugite-node/src/node/sync.rs:2185–2197`** —
+  `replay_from_chunk_files`. The body runs inside
+  `tokio::task::spawn_blocking` (a sync closure with cloned
+  `ledger_state: Arc<RwLock<LedgerState>>`). Uses
+  `ledger_state.blocking_write()` per block.
+  - **Delete** the `if snapshot_policy.should_snapshot_bulk()
+    { … }` block at lines 2185–2197.
+  - **Keep** the existing post-replay save block at lines
+    2275–2289 (`save_utxo_snapshot` + `save_snapshot(&snapshot_path)`
+    writing directly to `ledger-snapshot.bin`).
 
-- **`crates/dugite-node/src/node/sync.rs:2611`** — LSM replay from
-  ChainDB. Inside an `async fn`. Uses `.write().await`.
-  - Drop the `should_snapshot_bulk` save inside the loop.
-  - After the loop, `self.save_ledger_snapshot().await` once.
+- **`crates/dugite-node/src/node/sync.rs:2614–2630`** —
+  `replay_from_lsm`. Async fn, uses `.write().await`.
+  - **Delete** the `if self.snapshot_policy.should_snapshot_bulk()
+    { … }` block at lines 2614–2630.
+  - **Keep** the existing post-replay save block at lines
+    2697–2710 (same direct-write pattern).
 
-Why blocking save at end of replay is acceptable: replay is finished,
-no apply is pending, no other lock contender; we want the snapshot
-durable before forward sync starts.
+The `snapshot_policy: SnapshotPolicy::new(security_param)` *local*
+inside `replay_from_chunk_files` is no longer needed; remove its
+`record_blocks(1)` call and the `should_snapshot_bulk()` check.
+The `record_blocks` calls on `self.snapshot_policy` inside
+`replay_from_lsm` can also be removed for the same reason.
+
+Why the existing end-of-replay save block is acceptable as the
+single replay save: replay is finished, no apply is pending, no
+other lock contender, and the existing code path already writes
+both the UTxO LSM SST and the bincode `ledger-snapshot.bin`
+before returning. The lack of an epoch-N snapshot artefact at
+that boundary is acceptable: `find_best_snapshot_for_rollback`
+falls back to `latest.bin` when no epoch-tagged snapshot
+qualifies (`crates/dugite-node/src/node/epoch.rs:432`).
 
 #### 5. Shutdown sequence (race-free)
 
