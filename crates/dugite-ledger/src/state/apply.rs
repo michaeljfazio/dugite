@@ -22,9 +22,7 @@ use crate::eras::{EraRules, EraRulesImpl, RuleContext};
 use crate::ledger_seq::{BlockFieldsDelta, LedgerDelta};
 use crate::plutus::evaluate_plutus_scripts;
 use crate::utxo_diff::UtxoDiff;
-use crate::validation::{
-    calculate_ref_script_size, validate_transaction_with_pools, ValidationError,
-};
+use crate::validation::{calculate_ref_script_size, ValidationError};
 use dugite_primitives::block::{Block, Point};
 use dugite_primitives::era::Era;
 use dugite_primitives::time::EpochNo;
@@ -614,25 +612,88 @@ impl LedgerState {
                         .keys()
                         .copied()
                         .collect();
-                    let result = validate_transaction_with_pools(
+                    // Conway GOV-rule snapshots — required for the
+                    // `VotersDoNotExist` / `GovActionsDoNotExist` /
+                    // `DisallowedVoters` / `VotingOnExpiredGovAction` /
+                    // `UnelectedCommitteeVoters` predicates to fire at
+                    // block-apply time.  Without these the apply path
+                    // accepts blocks containing votes whose action has
+                    // just been ratified-and-removed at the epoch
+                    // boundary — exactly the divergence with cardano-node
+                    // that produced the slot-800 `GovActionsDoNotExist`
+                    // chain stall on the local devnet.
+                    let active_proposals: std::collections::HashMap<
+                        dugite_primitives::transaction::GovActionId,
+                        crate::validation::ActiveProposal,
+                    > = self
+                        .gov
+                        .governance
+                        .proposals
+                        .iter()
+                        .map(|(id, state)| {
+                            (
+                                id.clone(),
+                                crate::validation::ActiveProposal {
+                                    gov_action: state.procedure.gov_action.clone(),
+                                    return_addr: state.procedure.return_addr.clone(),
+                                    deposit: state.procedure.deposit,
+                                    expires_after_epoch: state.expires_epoch,
+                                    proposed_in_epoch: state.proposed_epoch,
+                                },
+                            )
+                        })
+                        .collect();
+                    let committee_authorized_hot_keys: std::collections::HashSet<
+                        dugite_primitives::hash::Hash32,
+                    > = self
+                        .gov
+                        .governance
+                        .committee_hot_keys
+                        .values()
+                        .copied()
+                        .collect();
+                    let committee_authorized_elected_hot_keys: std::collections::HashSet<
+                        dugite_primitives::hash::Hash32,
+                    > = self
+                        .gov
+                        .governance
+                        .committee_hot_keys
+                        .iter()
+                        .filter(|(cold, _)| {
+                            self.gov.governance.committee_expiration.contains_key(*cold)
+                        })
+                        .map(|(_, hot)| *hot)
+                        .collect();
+                    let mut ctx = crate::validation::ValidationContext::new()
+                        .with_active_proposals(active_proposals)
+                        .with_committee_authorized_hot_keys(committee_authorized_hot_keys)
+                        .with_committee_authorized_elected_hot_keys(
+                            committee_authorized_elected_hot_keys,
+                        )
+                        .with_pools(registered_pool_ids.clone())
+                        .with_dreps(registered_drep_ids.clone())
+                        .with_vrf_keys(registered_vrf_keys.clone())
+                        .with_committee_members(committee_member_keys.clone())
+                        .with_committee_resigned(committee_resigned_keys.clone())
+                        .with_treasury(self.epochs.treasury.0)
+                        .with_reward_accounts((*self.certs.reward_accounts).clone())
+                        .with_epoch(self.epoch.0)
+                        .with_stake_key_deposits(self.certs.stake_key_deposits.clone())
+                        .with_vote_delegations(vote_delegation_keys.clone());
+                    if let Some(net) = self.node_network {
+                        ctx = ctx.with_network(net);
+                    }
+                    if let Some(h) = constitution_script_hash {
+                        ctx = ctx.with_constitution_script_hash(h);
+                    }
+                    let result = crate::validation::validate_transaction_with_context(
                         tx,
                         &self.utxo.utxo_set,
                         &self.epochs.protocol_params,
                         block.slot().0,
                         tx_size,
                         Some(&self.slot_config),
-                        Some(&registered_pool_ids),
-                        Some(self.epochs.treasury.0),
-                        Some(&self.certs.reward_accounts),
-                        Some(self.epoch.0),
-                        Some(&registered_drep_ids),
-                        Some(&registered_vrf_keys),
-                        self.node_network,
-                        Some(&committee_member_keys),
-                        Some(&committee_resigned_keys),
-                        Some(&self.certs.stake_key_deposits),
-                        constitution_script_hash,
-                        Some(&vote_delegation_keys),
+                        ctx,
                     );
                     if let Err(errors) = result {
                         let has_script_failure = errors
