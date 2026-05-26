@@ -342,7 +342,13 @@ fn build_governance_validation_state(
         .governance
         .committee_hot_keys
         .iter()
-        .filter(|(cold, _)| ledger.gov.governance.committee_expiration.contains_key(*cold))
+        .filter(|(cold, _)| {
+            ledger
+                .gov
+                .governance
+                .committee_expiration
+                .contains_key(*cold)
+        })
         .map(|(_, hot)| *hot)
         .collect();
     (

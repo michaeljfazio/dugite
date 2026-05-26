@@ -364,10 +364,7 @@ impl ValidationContext {
         self
     }
 
-    pub fn with_committee_authorized_elected_hot_keys(
-        mut self,
-        hot_keys: HashSet<Hash32>,
-    ) -> Self {
+    pub fn with_committee_authorized_elected_hot_keys(mut self, hot_keys: HashSet<Hash32>) -> Self {
         self.committee_authorized_elected_hot_keys = Some(Arc::new(hot_keys));
         self
     }
@@ -1851,7 +1848,9 @@ pub fn validate_transaction_with_context(
                 }
             }
             if !missing.is_empty() {
-                extra_errors.push(ValidationError::GovActionsDoNotExist { action_ids: missing });
+                extra_errors.push(ValidationError::GovActionsDoNotExist {
+                    action_ids: missing,
+                });
             }
         }
 
@@ -2463,8 +2462,7 @@ pub fn validate_transaction_with_pools(
         // empty.  Membership check becomes
         // `pools.contains(target) || new_pools.contains(target)` —
         // O(1) on both sides.
-        let mut new_pools: std::collections::HashSet<Hash28> =
-            std::collections::HashSet::new();
+        let mut new_pools: std::collections::HashSet<Hash28> = std::collections::HashSet::new();
         for cert in &tx.body.certificates {
             // Pool registration adds to the per-tx delta BEFORE we check
             // subsequent delegations/retirements in this tx.

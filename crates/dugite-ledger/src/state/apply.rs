@@ -577,18 +577,16 @@ impl LedgerState {
                 .values()
                 .copied()
                 .collect();
-            let committee_authorized_elected_hot_keys: HashSet<
-                dugite_primitives::hash::Hash32,
-            > = self
-                .gov
-                .governance
-                .committee_hot_keys
-                .iter()
-                .filter(|(cold, _)| {
-                    self.gov.governance.committee_expiration.contains_key(*cold)
-                })
-                .map(|(_, hot)| *hot)
-                .collect();
+            let committee_authorized_elected_hot_keys: HashSet<dugite_primitives::hash::Hash32> =
+                self.gov
+                    .governance
+                    .committee_hot_keys
+                    .iter()
+                    .filter(|(cold, _)| {
+                        self.gov.governance.committee_expiration.contains_key(*cold)
+                    })
+                    .map(|(_, hot)| *hot)
+                    .collect();
             let constitution_script_hash = self
                 .gov
                 .governance
@@ -760,9 +758,7 @@ impl LedgerState {
                             &block_committee_resigned_keys,
                         ))
                         .with_treasury(self.epochs.treasury.0)
-                        .with_reward_accounts_arc(std::sync::Arc::clone(
-                            &block_reward_accounts_arc,
-                        ))
+                        .with_reward_accounts_arc(std::sync::Arc::clone(&block_reward_accounts_arc))
                         .with_epoch(self.epoch.0)
                         .with_stake_key_deposits_arc(std::sync::Arc::clone(
                             &block_stake_key_deposits_arc,
