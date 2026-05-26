@@ -1547,6 +1547,17 @@ impl Node {
             // This catches chained txs whose parents were removed: their inputs
             // no longer exist in the UTxO set and mempool virtual UTxO.
             let ls = self.ledger_state.read().await;
+            // Snapshot the currently-active gov action ids so we can drop any
+            // mempool tx whose votes reference a `GovActionId` that no longer
+            // exists in the proposals registry — typically because the action
+            // was ratified-and-removed at the most-recent epoch boundary, or
+            // expired. Without this, dugite's forge picks up such votes and
+            // the resulting block is rejected by cardano-node with
+            // `ConwayGovFailure (GovActionsDoNotExist …)`, stalling the
+            // chain on every downstream Haskell observer.
+            let active_action_ids: std::collections::HashSet<
+                dugite_primitives::transaction::GovActionId,
+            > = ls.gov.governance.proposals.keys().cloned().collect();
             self.mempool.revalidate_all(|tx| {
                 // Reject if any input was consumed by the new block
                 if tx
@@ -1570,6 +1581,29 @@ impl Node {
                         && self.mempool.lookup_virtual_utxo(input).is_none()
                     {
                         return false;
+                    }
+                }
+                // Reject if any vote references a gov action that no longer
+                // exists. Same-tx proposals are admissible by definition (the
+                // action enters the registry as part of this tx's apply step).
+                if !tx.body.voting_procedures.is_empty() {
+                    // Compute same-tx local action ids once per candidate.
+                    let local_action_ids: std::collections::HashSet<
+                        dugite_primitives::transaction::GovActionId,
+                    > = (0..tx.body.proposal_procedures.len())
+                        .map(|idx| dugite_primitives::transaction::GovActionId {
+                            transaction_id: tx.hash,
+                            action_index: idx as u32,
+                        })
+                        .collect();
+                    for (_voter, votes) in &tx.body.voting_procedures {
+                        for action_id in votes.keys() {
+                            if !active_action_ids.contains(action_id)
+                                && !local_action_ids.contains(action_id)
+                            {
+                                return false;
+                            }
+                        }
                     }
                 }
                 true

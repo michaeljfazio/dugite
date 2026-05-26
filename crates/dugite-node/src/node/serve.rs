@@ -285,6 +285,7 @@ fn build_governance_validation_state(
     std::collections::HashSet<dugite_primitives::hash::Hash32>,
     std::collections::HashSet<dugite_primitives::hash::Hash32>,
     std::collections::HashSet<dugite_primitives::hash::Hash32>,
+    std::collections::HashSet<dugite_primitives::hash::Hash32>,
 ) {
     let active_proposals = ledger
         .gov
@@ -304,7 +305,7 @@ fn build_governance_validation_state(
             )
         })
         .collect();
-    let committee_hot_keys = ledger
+    let committee_hot_keys: std::collections::HashSet<dugite_primitives::hash::Hash32> = ledger
         .gov
         .governance
         .committee_hot_keys
@@ -329,11 +330,26 @@ fn build_governance_validation_state(
         .keys()
         .copied()
         .collect();
+    // `authorizedElectedHotCommitteeCredentials` in Haskell:
+    //   intersection of csCommitteeCreds (cold→hot, post-resignation) and
+    //   the enacted-committee cold-key set (committee_expiration here).
+    // Used by the PV >= 11 `UnelectedCommitteeVoters` predicate.
+    let committee_authorized_elected_hot_keys: std::collections::HashSet<
+        dugite_primitives::hash::Hash32,
+    > = ledger
+        .gov
+        .governance
+        .committee_hot_keys
+        .iter()
+        .filter(|(cold, _)| ledger.gov.governance.committee_expiration.contains_key(*cold))
+        .map(|(_, hot)| *hot)
+        .collect();
     (
         active_proposals,
         committee_hot_keys,
         committee_members,
         committee_resigned,
+        committee_authorized_elected_hot_keys,
     )
 }
 
@@ -388,13 +404,19 @@ impl TxValidator for LedgerTxValidator {
         //
         // Mirrors Haskell's GovEnv exposing both `proposals` and
         // `authorizedHotCommitteeCredentials` to the GOV rule.
-        let (active_proposals, committee_hot_keys, committee_members, committee_resigned) =
-            build_governance_validation_state(&ledger);
+        let (
+            active_proposals,
+            committee_hot_keys,
+            committee_members,
+            committee_resigned,
+            committee_authorized_elected_hot_keys,
+        ) = build_governance_validation_state(&ledger);
 
         let context = dugite_ledger::validation::ValidationContext::new()
             .with_pools(registered_pool_ids)
             .with_active_proposals(active_proposals)
             .with_committee_authorized_hot_keys(committee_hot_keys)
+            .with_committee_authorized_elected_hot_keys(committee_authorized_elected_hot_keys)
             .with_committee_members(committee_members)
             .with_committee_resigned(committee_resigned)
             .with_network(self.network);
@@ -719,6 +741,12 @@ pub(crate) fn convert_validation_error(
         },
         VE::VotersDoNotExist { voters } => TxValidationError::ScriptFailed {
             reason: format!("VotersDoNotExist: {voters:?}"),
+        },
+        VE::GovActionsDoNotExist { action_ids } => TxValidationError::ScriptFailed {
+            reason: format!("GovActionsDoNotExist: {action_ids:?}"),
+        },
+        VE::UnelectedCommitteeVoters { hot_keys } => TxValidationError::ScriptFailed {
+            reason: format!("UnelectedCommitteeVoters: {hot_keys:?}"),
         },
         VE::VotingOnExpiredGovAction { expired_votes } => TxValidationError::ScriptFailed {
             reason: format!("VotingOnExpiredGovAction: {expired_votes:?}"),
