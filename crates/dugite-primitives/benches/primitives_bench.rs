@@ -97,9 +97,9 @@ fn bench_blake2b_batch(c: &mut Criterion) {
 }
 
 criterion_group!(
-    benches,
+    primitives_benches,
     bench_blake2b_256,
     bench_blake2b_224,
     bench_blake2b_batch
 );
-criterion_main!(benches);
+criterion_main!(primitives_benches);
