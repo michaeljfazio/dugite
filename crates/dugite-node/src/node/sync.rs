@@ -1596,7 +1596,7 @@ impl Node {
                             action_index: idx as u32,
                         })
                         .collect();
-                    for (_voter, votes) in &tx.body.voting_procedures {
+                    for votes in tx.body.voting_procedures.values() {
                         for action_id in votes.keys() {
                             if !active_action_ids.contains(action_id)
                                 && !local_action_ids.contains(action_id)

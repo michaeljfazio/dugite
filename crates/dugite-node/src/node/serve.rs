@@ -275,6 +275,7 @@ impl UtxoQueryProvider for LedgerUtxoProvider {
 ///
 /// Mirrors Haskell's `GovEnv` exposing both `proposals` and
 /// `authorizedHotCommitteeCredentials` to the GOV rule.
+#[allow(clippy::type_complexity)]
 fn build_governance_validation_state(
     ledger: &LedgerState,
 ) -> (
@@ -1025,7 +1026,8 @@ mod tests {
             gov.committee_hot_keys.insert(cold_cred, hot_cred);
         }
 
-        let (active, hot_keys, _members, _resigned) = build_governance_validation_state(&ledger);
+        let (active, hot_keys, _members, _resigned, _authorized_elected) =
+            build_governance_validation_state(&ledger);
 
         // Proposal projection: every ActiveProposal field must mirror the
         // ProposalState/ProposalProcedure source.
@@ -1052,11 +1054,13 @@ mod tests {
     #[test]
     fn build_governance_validation_state_empty_for_fresh_ledger() {
         let ledger = LedgerState::new(ProtocolParameters::mainnet_defaults());
-        let (active, hot_keys, members, resigned) = build_governance_validation_state(&ledger);
+        let (active, hot_keys, members, resigned, authorized_elected) =
+            build_governance_validation_state(&ledger);
         assert!(active.is_empty());
         assert!(hot_keys.is_empty());
         assert!(members.is_empty());
         assert!(resigned.is_empty());
+        assert!(authorized_elected.is_empty());
     }
 
     // ─── convert_validation_error ────────────────────────────────────────────

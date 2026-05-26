@@ -1736,8 +1736,7 @@ pub fn validate_transaction_with_context(
                 action_index: idx as u32,
             });
         }
-        if context.active_proposals.is_some() {
-            let active = context.active_proposals.as_ref().unwrap();
+        if let Some(active) = context.active_proposals.as_ref() {
             let mut missing: Vec<GovActionId> = Vec::new();
             let mut seen: HashSet<GovActionId> = HashSet::new();
             for (voter, votes) in &tx.body.voting_procedures {

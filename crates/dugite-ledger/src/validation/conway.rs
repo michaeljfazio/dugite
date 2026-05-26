@@ -1822,15 +1822,31 @@ mod tests {
 
     #[test]
     fn test_voter_authority_spo_on_parameter_change_allowed_at_phase1() {
-        // ParameterChange voter-authority pre-check allows SPO. The per-group
-        // threshold check at ratification time will set NoVotingAllowed for
-        // non-security-group changes — that is a separate concern.
-        let action = GovAction::ParameterChange {
+        // D-5: SPO is only allowed to vote on ParameterChange if the update
+        // touches at least one SecurityGroup-relevant field (Haskell
+        // `votingStakePoolThresholdInternal` returns `NoVotingAllowed` for
+        // non-security-group changes, which the GOV rule surfaces as
+        // DisallowedVoters at Phase-1, not just at ratification time).
+        //
+        // Empty update (no SecurityGroup fields) → SPO is disallowed.
+        let empty_action = GovAction::ParameterChange {
             prev_action_id: None,
             protocol_param_update: Box::default(),
             policy_hash: None,
         };
-        assert!(!is_voter_disallowed(&spo_voter(), &action));
+        assert!(is_voter_disallowed(&spo_voter(), &empty_action));
+
+        // ParameterChange touching a SecurityGroup field (min_fee_a = key 0)
+        // → SPO is allowed.
+        let security_action = GovAction::ParameterChange {
+            prev_action_id: None,
+            protocol_param_update: Box::new(dugite_primitives::transaction::ProtocolParamUpdate {
+                min_fee_a: Some(44),
+                ..Default::default()
+            }),
+            policy_hash: None,
+        };
+        assert!(!is_voter_disallowed(&spo_voter(), &security_action));
     }
 
     // ---------------------------------------------------------------------------
