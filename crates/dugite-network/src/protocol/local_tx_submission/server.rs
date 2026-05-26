@@ -103,9 +103,9 @@ impl LocalTxSubmissionServer {
                                 if tag.as_u64() != 24 {
                                     // Non-24 tag — reject with structured error instead of
                                     // dropping the connection.
-                                    tracing::debug!(
+                                    tracing::warn!(
                                         tag = tag.as_u64(),
-                                        "LocalTxSubmission: unexpected CBOR tag (expected 24 or none)"
+                                        "N2C tx rejected: unexpected CBOR tag in tx payload (expected tag(24) or raw bytes)"
                                     );
                                     // Build a MsgRejectTx with a decode-failure reason
                                     let apply_tx_err = super::encode::encode_apply_tx_err(
@@ -173,7 +173,7 @@ impl LocalTxSubmissionServer {
                                     // Mempool admitted the tx failed after validator Ok.
                                     // Send MsgRejectTx with a generic mempool-full reason.
                                     stats.rejected += 1;
-                                    tracing::debug!(era_id, %reason, "local tx: mempool add failed after validator Ok");
+                                    tracing::warn!(era_id, %reason, "N2C tx rejected: mempool add failed after validator Ok (duplicate or full)");
                                     let apply_tx_err = super::encode::encode_apply_tx_err(
                                         &crate::TxValidationError::Other(
                                             "mempool full or duplicate".to_string(),
@@ -192,7 +192,7 @@ impl LocalTxSubmissionServer {
                         }
                         Err(e) => {
                             stats.rejected += 1;
-                            tracing::debug!(era_id, reason = %format!("{e:?}"), "local tx rejected");
+                            tracing::warn!(era_id, reason = %format!("{e:?}"), "N2C tx rejected: validation failed");
 
                             // Send MsgRejectTx = [2, ApplyTxErr]
                             // where ApplyTxErr = [[era_id, [failure_0, ...]]]

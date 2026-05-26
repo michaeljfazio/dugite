@@ -1416,6 +1416,7 @@ fn decode_conway_pred_failure(decoder: &mut minicbor::Decoder<'_>) -> Option<Str
     let tag = decoder.u8().ok()?;
     match tag {
         1 => decode_conway_utxow_failure(decoder),
+        3 => decode_conway_gov_failure(decoder),
         7 => {
             let text = decoder.str().ok()?;
             Some(text.to_string())
@@ -1460,6 +1461,133 @@ fn decode_conway_pred_failure(decoder: &mut minicbor::Decoder<'_>) -> Option<Str
             Some(format!("ConwayLedgerPredFailure(tag={other})"))
         }
     }
+}
+
+/// Decode `ConwayGovPredFailure` (Ledger tag 3 = ConwayGovFailure).
+///
+/// Wire shape: `array(N+1)[gov_tag, payload_items...]`
+///
+/// Inner tags:
+///   0  = GovActionsDoNotExist   → [GovActionId, ...]
+///   5  = DisallowedVoters       → [(Voter, GovActionId), ...]
+///   9  = VotingOnExpiredGovAction → [(Voter, GovActionId), ...]
+///   14 = VotersDoNotExist       → [Voter, ...]
+///   16 = ProposalReturnAccountDoesNotExist → return_addr_bytes
+///   18 = UnelectedCommitteeVoters → [Credential, ...]
+fn decode_conway_gov_failure(decoder: &mut minicbor::Decoder<'_>) -> Option<String> {
+    let _ = decoder.array().ok()?;
+    let gov_tag = decoder.u8().ok()?;
+    match gov_tag {
+        // Tag 0: GovActionsDoNotExist — [GovActionId, ...]
+        0 => {
+            let n = decoder.array().ok().flatten().unwrap_or(0);
+            let mut ids: Vec<String> = Vec::new();
+            for _ in 0..n {
+                if let Some(id) = decode_gov_action_id(decoder) {
+                    ids.push(id);
+                } else {
+                    let _ = decoder.skip();
+                }
+            }
+            Some(format!("GovActionsDoNotExist({})", ids.join(",")))
+        }
+        // Tag 5: DisallowedVoters — [(Voter, GovActionId), ...]
+        5 => {
+            let n = decoder.array().ok().flatten().unwrap_or(0);
+            let mut parts: Vec<String> = Vec::new();
+            for _ in 0..n {
+                let _ = decoder.array().ok()?; // pair array
+                let voter = decode_voter_str(decoder).unwrap_or_else(|| {
+                    let _ = decoder.skip();
+                    "?voter".to_string()
+                });
+                let action = decode_gov_action_id(decoder).unwrap_or_else(|| {
+                    let _ = decoder.skip();
+                    "?action".to_string()
+                });
+                parts.push(format!("{voter}@{action}"));
+            }
+            Some(format!("DisallowedVoters({})", parts.join(",")))
+        }
+        // Tag 9: VotingOnExpiredGovAction — [(Voter, GovActionId), ...]
+        9 => {
+            let n = decoder.array().ok().flatten().unwrap_or(0);
+            let mut parts: Vec<String> = Vec::new();
+            for _ in 0..n {
+                let _ = decoder.array().ok()?;
+                let voter = decode_voter_str(decoder).unwrap_or_else(|| {
+                    let _ = decoder.skip();
+                    "?voter".to_string()
+                });
+                let action = decode_gov_action_id(decoder).unwrap_or_else(|| {
+                    let _ = decoder.skip();
+                    "?action".to_string()
+                });
+                parts.push(format!("{voter}@{action}"));
+            }
+            Some(format!("VotingOnExpiredGovAction({})", parts.join(",")))
+        }
+        // Tag 14: VotersDoNotExist — [Voter, ...]
+        14 => {
+            let n = decoder.array().ok().flatten().unwrap_or(0);
+            let mut voters: Vec<String> = Vec::new();
+            for _ in 0..n {
+                voters.push(decode_voter_str(decoder).unwrap_or_else(|| {
+                    let _ = decoder.skip();
+                    "?voter".to_string()
+                }));
+            }
+            Some(format!("VotersDoNotExist({})", voters.join(",")))
+        }
+        // Tag 16: ProposalReturnAccountDoesNotExist — bytes
+        16 => {
+            let addr = decoder.bytes().ok()?;
+            Some(format!(
+                "ProposalReturnAccountDoesNotExist({})",
+                hex::encode(addr)
+            ))
+        }
+        // Tag 18: UnelectedCommitteeVoters — [Credential, ...]
+        18 => {
+            let n = decoder.array().ok().flatten().unwrap_or(0);
+            let mut creds: Vec<String> = Vec::new();
+            for _ in 0..n {
+                let _ = decoder.array().ok()?;
+                let disc = decoder.u8().ok().unwrap_or(99);
+                let hash = decoder.bytes().ok().unwrap_or(&[]);
+                creds.push(format!("{}:{}", disc, hex::encode(hash)));
+            }
+            Some(format!("UnelectedCommitteeVoters({})", creds.join(",")))
+        }
+        other => {
+            let _ = decoder.skip();
+            Some(format!("ConwayGovPredFailure(tag={other})"))
+        }
+    }
+}
+
+/// Decode a `GovActionId` from the CBOR stream: `array(2)[txhash_bytes, action_idx]`.
+fn decode_gov_action_id(decoder: &mut minicbor::Decoder<'_>) -> Option<String> {
+    let _ = decoder.array().ok()?;
+    let hash = decoder.bytes().ok()?;
+    let idx = decoder.u32().ok()?;
+    Some(format!("{}#{}", hex::encode(hash), idx))
+}
+
+/// Decode a `Voter` from the CBOR stream: `array(2)[disc, hash28_bytes]`.
+fn decode_voter_str(decoder: &mut minicbor::Decoder<'_>) -> Option<String> {
+    let _ = decoder.array().ok()?;
+    let disc = decoder.u8().ok()?;
+    let hash = decoder.bytes().ok()?;
+    let kind = match disc {
+        0 => "CC-key",
+        1 => "CC-script",
+        2 => "DRep-key",
+        3 => "DRep-script",
+        4 => "SPO",
+        _ => "?",
+    };
+    Some(format!("{kind}:{}", hex::encode(hash)))
 }
 
 /// Decode `ConwayUtxowPredFailure` which wraps `UtxoFailure`.

@@ -419,8 +419,16 @@ impl TxValidator for LedgerTxValidator {
             committee_authorized_elected_hot_keys,
         ) = build_governance_validation_state(&ledger);
 
+        // Populate the DRep registry so `VotersDoNotExist` checks reject DRep
+        // votes from credentials not yet registered on-chain.  Without this,
+        // the N2C path silently admitted invalid DRep votes (the lenient default
+        // for `registered_dreps = None` skips the check entirely).
+        let registered_drep_ids: std::collections::HashSet<dugite_primitives::hash::Hash32> =
+            ledger.gov.governance.dreps.keys().copied().collect();
+
         let context = dugite_ledger::validation::ValidationContext::new()
             .with_pools(registered_pool_ids)
+            .with_dreps(registered_drep_ids)
             .with_active_proposals(active_proposals)
             .with_committee_authorized_hot_keys(committee_hot_keys)
             .with_committee_authorized_elected_hot_keys(committee_authorized_elected_hot_keys)
@@ -454,6 +462,35 @@ impl TxValidator for LedgerTxValidator {
             }
         })
     }
+}
+
+/// Convert a `dugite_primitives::transaction::Voter` into the `(disc, credential_hex)`
+/// wire representation used by the GOV predicate failure CBOR encoder.
+///
+/// Wire discriminators match the Conway CDDL `voter` encoding:
+///   0 = CC key, 1 = CC script, 2 = DRep key, 3 = DRep script, 4 = SPO (key only)
+fn voter_to_disc_hex(voter: &dugite_primitives::transaction::Voter) -> (u8, String) {
+    use dugite_primitives::credentials::Credential;
+    use dugite_primitives::transaction::Voter;
+    match voter {
+        Voter::ConstitutionalCommittee(Credential::VerificationKey(h)) => {
+            (0u8, hex::encode(&h.as_bytes()[..28]))
+        }
+        Voter::ConstitutionalCommittee(Credential::Script(h)) => {
+            (1u8, hex::encode(&h.as_bytes()[..28]))
+        }
+        Voter::DRep(Credential::VerificationKey(h)) => (2u8, hex::encode(&h.as_bytes()[..28])),
+        Voter::DRep(Credential::Script(h)) => (3u8, hex::encode(&h.as_bytes()[..28])),
+        Voter::StakePool(h32) => {
+            // Pool voter: 28 bytes stored in the first 28 bytes of Hash32
+            (4u8, hex::encode(&h32.as_bytes()[..28]))
+        }
+    }
+}
+
+/// Convert a `GovActionId` to `"<txhash>#<action_index>"` string.
+fn gov_action_id_to_string(id: &dugite_primitives::transaction::GovActionId) -> String {
+    format!("{}#{}", id.transaction_id.to_hex(), id.action_index)
 }
 
 /// Convert a ledger `ValidationError` into the network-facing `TxValidationError`.
@@ -743,24 +780,50 @@ pub(crate) fn convert_validation_error(
         VE::MalformedProposal { reason } => TxValidationError::ScriptFailed {
             reason: format!("Governance proposal rejected: malformed PParamsUpdate ({reason})"),
         },
-        VE::DisallowedVoters { violations } => TxValidationError::ScriptFailed {
-            reason: format!("DisallowedVoters: {violations:?}"),
+        VE::DisallowedVoters { violations } => TxValidationError::DisallowedVoters {
+            violations: violations
+                .iter()
+                .map(|(voter, action_id)| {
+                    let (disc, cred_hex) = voter_to_disc_hex(voter);
+                    (disc, cred_hex, gov_action_id_to_string(action_id))
+                })
+                .collect(),
         },
-        VE::VotersDoNotExist { voters } => TxValidationError::ScriptFailed {
-            reason: format!("VotersDoNotExist: {voters:?}"),
+        VE::VotersDoNotExist { voters } => TxValidationError::VotersDoNotExist {
+            voters: voters.iter().map(voter_to_disc_hex).collect(),
         },
-        VE::GovActionsDoNotExist { action_ids } => TxValidationError::ScriptFailed {
-            reason: format!("GovActionsDoNotExist: {action_ids:?}"),
+        VE::GovActionsDoNotExist { action_ids } => TxValidationError::GovActionsDoNotExist {
+            action_ids: action_ids.iter().map(gov_action_id_to_string).collect(),
         },
-        VE::UnelectedCommitteeVoters { hot_keys } => TxValidationError::ScriptFailed {
-            reason: format!("UnelectedCommitteeVoters: {hot_keys:?}"),
+        VE::UnelectedCommitteeVoters { hot_keys } => TxValidationError::UnelectedCommitteeVoters {
+            // hot_keys are Hash32 (typed: byte 28 = 0x00 key, 0x01 script).
+            // Map each to (disc, credential_hex) where disc=0 for key, 1 for script,
+            // and the credential is the first 28 bytes (the actual hash).
+            hot_credentials: hot_keys
+                .iter()
+                .map(|h| {
+                    let bytes = h.as_bytes();
+                    let disc = if bytes[28] == 0x01 { 1u8 } else { 0u8 };
+                    (disc, hex::encode(&bytes[..28]))
+                })
+                .collect(),
         },
-        VE::VotingOnExpiredGovAction { expired_votes } => TxValidationError::ScriptFailed {
-            reason: format!("VotingOnExpiredGovAction: {expired_votes:?}"),
-        },
-        VE::ProposalReturnAccountDoesNotExist { bad_addrs } => TxValidationError::ScriptFailed {
-            reason: format!("ProposalReturnAccountDoesNotExist: {bad_addrs:?}"),
-        },
+        VE::VotingOnExpiredGovAction { expired_votes } => {
+            TxValidationError::VotingOnExpiredGovAction {
+                expired_votes: expired_votes
+                    .iter()
+                    .map(|(voter, action_id, _expires, _current)| {
+                        let (disc, cred_hex) = voter_to_disc_hex(voter);
+                        (disc, cred_hex, gov_action_id_to_string(action_id))
+                    })
+                    .collect(),
+            }
+        }
+        VE::ProposalReturnAccountDoesNotExist { bad_addrs } => {
+            TxValidationError::ProposalReturnAccountDoesNotExist {
+                bad_addrs: bad_addrs.clone(),
+            }
+        }
         VE::ProposalProcedureNetworkIdMismatch {
             expected,
             mismatched,
@@ -1183,11 +1246,6 @@ mod tests {
                 declared: 1,
                 expected: 100_000_000_000,
             },
-            VE::DisallowedVoters { violations: vec![] },
-            VE::VotersDoNotExist { voters: vec![] },
-            VE::VotingOnExpiredGovAction {
-                expired_votes: vec![],
-            },
             VE::ExtraRedeemer {
                 tag: "Spend".to_string(),
                 index: 0,
@@ -1200,6 +1258,56 @@ mod tests {
                 "Conway predicate did not collapse to ScriptFailed: {mapped:?}"
             );
         }
+    }
+
+    /// GOV predicate failures now produce dedicated `TxValidationError` variants
+    /// (not `ScriptFailed`) so that the CBOR encoder can emit structured
+    /// `ConwayGovPredFailure` wire format instead of a generic `ConwayMempoolFailure`.
+    #[test]
+    fn convert_validation_error_maps_gov_predicates_to_dedicated_variants() {
+        use dugite_ledger::validation::ValidationError as VE;
+
+        let mapped = convert_validation_error(VE::DisallowedVoters { violations: vec![] });
+        assert!(
+            matches!(mapped, TxValidationError::DisallowedVoters { .. }),
+            "DisallowedVoters must map to DisallowedVoters variant, got {mapped:?}"
+        );
+
+        let mapped = convert_validation_error(VE::VotersDoNotExist { voters: vec![] });
+        assert!(
+            matches!(mapped, TxValidationError::VotersDoNotExist { .. }),
+            "VotersDoNotExist must map to VotersDoNotExist variant, got {mapped:?}"
+        );
+
+        let mapped = convert_validation_error(VE::VotingOnExpiredGovAction {
+            expired_votes: vec![],
+        });
+        assert!(
+            matches!(mapped, TxValidationError::VotingOnExpiredGovAction { .. }),
+            "VotingOnExpiredGovAction must map to dedicated variant, got {mapped:?}"
+        );
+
+        let mapped = convert_validation_error(VE::GovActionsDoNotExist { action_ids: vec![] });
+        assert!(
+            matches!(mapped, TxValidationError::GovActionsDoNotExist { .. }),
+            "GovActionsDoNotExist must map to dedicated variant, got {mapped:?}"
+        );
+
+        let mapped =
+            convert_validation_error(VE::ProposalReturnAccountDoesNotExist { bad_addrs: vec![] });
+        assert!(
+            matches!(
+                mapped,
+                TxValidationError::ProposalReturnAccountDoesNotExist { .. }
+            ),
+            "ProposalReturnAccountDoesNotExist must map to dedicated variant, got {mapped:?}"
+        );
+
+        let mapped = convert_validation_error(VE::UnelectedCommitteeVoters { hot_keys: vec![] });
+        assert!(
+            matches!(mapped, TxValidationError::UnelectedCommitteeVoters { .. }),
+            "UnelectedCommitteeVoters must map to dedicated variant, got {mapped:?}"
+        );
     }
 
     #[test]

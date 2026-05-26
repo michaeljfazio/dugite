@@ -417,6 +417,129 @@ fn encode_conway_ledger_pred_failure(enc: &mut Encoder<&mut Vec<u8>>, err: &TxVa
             }
         }
 
+        // ── Conway GOV predicate failures: Ledger(3) → ConwayGovPredFailure ──
+
+        // Ledger tag 3 (ConwayGovFailure): array(2)[3, ConwayGovPredFailure]
+        //
+        // ConwayGovPredFailure inner tags (distinct from Ledger tags 1-9):
+        //   0  = GovActionsDoNotExist          [govActionId, ...]
+        //   5  = DisallowedVoters               [(voter, govActionId), ...]
+        //   9  = VotingOnExpiredGovAction        [(voter, govActionId), ...]
+        //   14 = VotersDoNotExist               [voter, ...]
+        //   16 = ProposalReturnAccountDoesNotExist  return_addr_bytes
+        //   18 = UnelectedCommitteeVoters        [credential, ...]
+        //
+        // GovActionId CBOR:   array(2)[txhash_bytes_32, action_index_uint]
+        // Voter CBOR:         array(2)[disc, hash28_bytes]
+        //   disc 0=CC key, 1=CC script, 2=DRep key, 3=DRep script, 4=SPO
+        // Credential CBOR:    array(2)[disc, hash28_bytes]
+        //   disc 0=key, 1=script
+
+        // Tag 0: GovActionsDoNotExist
+        TxValidationError::GovActionsDoNotExist { action_ids } => {
+            encode_gov_failure(enc, 0, |enc| {
+                let parsed: Vec<([u8; 32], u32)> = action_ids
+                    .iter()
+                    .filter_map(|s| parse_tx_input(s))
+                    .collect();
+                enc.array(parsed.len() as u64).expect("infallible");
+                for (hash, idx) in &parsed {
+                    enc.array(2).expect("infallible");
+                    enc.bytes(hash).expect("infallible");
+                    enc.u32(*idx).expect("infallible");
+                }
+            });
+        }
+
+        // Tag 5: DisallowedVoters
+        TxValidationError::DisallowedVoters { violations } => {
+            encode_gov_failure(enc, 5, |enc| {
+                enc.array(violations.len() as u64).expect("infallible");
+                for (voter_disc, cred_hex, action_id) in violations {
+                    if let (Some(cred_bytes), Some((hash, idx))) =
+                        (parse_hex_28(cred_hex), parse_tx_input(action_id))
+                    {
+                        // Each element: [(voter), (govActionId)]  → array(2)
+                        enc.array(2).expect("infallible");
+                        // voter: array(2)[disc, hash28_bytes]
+                        enc.array(2).expect("infallible");
+                        enc.u8(*voter_disc).expect("infallible");
+                        enc.bytes(&cred_bytes).expect("infallible");
+                        // govActionId: array(2)[txhash_32, action_idx]
+                        enc.array(2).expect("infallible");
+                        enc.bytes(&hash).expect("infallible");
+                        enc.u32(idx).expect("infallible");
+                    }
+                }
+            });
+        }
+
+        // Tag 9: VotingOnExpiredGovAction
+        TxValidationError::VotingOnExpiredGovAction { expired_votes } => {
+            encode_gov_failure(enc, 9, |enc| {
+                enc.array(expired_votes.len() as u64).expect("infallible");
+                for (voter_disc, cred_hex, action_id) in expired_votes {
+                    if let (Some(cred_bytes), Some((hash, idx))) =
+                        (parse_hex_28(cred_hex), parse_tx_input(action_id))
+                    {
+                        enc.array(2).expect("infallible");
+                        enc.array(2).expect("infallible");
+                        enc.u8(*voter_disc).expect("infallible");
+                        enc.bytes(&cred_bytes).expect("infallible");
+                        enc.array(2).expect("infallible");
+                        enc.bytes(&hash).expect("infallible");
+                        enc.u32(idx).expect("infallible");
+                    }
+                }
+            });
+        }
+
+        // Tag 14: VotersDoNotExist
+        TxValidationError::VotersDoNotExist { voters } => {
+            encode_gov_failure(enc, 14, |enc| {
+                enc.array(voters.len() as u64).expect("infallible");
+                for (voter_disc, cred_hex) in voters {
+                    if let Some(cred_bytes) = parse_hex_28(cred_hex) {
+                        enc.array(2).expect("infallible");
+                        enc.u8(*voter_disc).expect("infallible");
+                        enc.bytes(&cred_bytes).expect("infallible");
+                    }
+                }
+            });
+        }
+
+        // Tag 16: ProposalReturnAccountDoesNotExist
+        // Wire shape: array(2)[16, return_addr_bytes]
+        // bad_addrs typically has exactly one entry (one bad return address per proposal).
+        TxValidationError::ProposalReturnAccountDoesNotExist { bad_addrs } => {
+            if let Some(first_hex) = bad_addrs.first() {
+                let addr_bytes =
+                    parse_hex_bytes(first_hex).unwrap_or_else(|| first_hex.as_bytes().to_vec());
+                encode_gov_failure(enc, 16, |enc| {
+                    enc.bytes(&addr_bytes).expect("infallible");
+                });
+            } else {
+                encode_mempool_fallback(
+                    enc,
+                    "ProposalReturnAccountDoesNotExist: no return address",
+                );
+            }
+        }
+
+        // Tag 18: UnelectedCommitteeVoters
+        TxValidationError::UnelectedCommitteeVoters { hot_credentials } => {
+            encode_gov_failure(enc, 18, |enc| {
+                enc.array(hot_credentials.len() as u64).expect("infallible");
+                for (disc, cred_hex) in hot_credentials {
+                    if let Some(cred_bytes) = parse_hex_28(cred_hex) {
+                        enc.array(2).expect("infallible");
+                        enc.u8(*disc).expect("infallible");
+                        enc.bytes(&cred_bytes).expect("infallible");
+                    }
+                }
+            });
+        }
+
         // ── Fallback for all unmapped variants ──
         // ConwayMempoolFailure (Ledger tag 7): [7, "descriptive text"]
         //
@@ -515,6 +638,38 @@ fn encode_mempool_fallback(enc: &mut Encoder<&mut Vec<u8>>, text: &str) {
     enc.str(text).expect("infallible");
 }
 
+/// Encode a `ConwayGovPredFailure` wrapped in the Ledger `ConwayGovFailure` nesting:
+/// `array(2)[3, array(2)[gov_tag, payload]]`
+///
+/// Used for governance-level errors that go through Ledger tag 3 rather than
+/// the UTxO/Utxow path (Ledger tag 1).
+///
+/// The closure `encode_payload` writes the payload items for the specific
+/// `ConwayGovPredFailure` variant.  The array wrapping and tag are written here.
+fn encode_gov_failure(
+    enc: &mut Encoder<&mut Vec<u8>>,
+    gov_tag: u8,
+    encode_payload: impl FnOnce(&mut Encoder<&mut Vec<u8>>),
+) {
+    // Count the payload items that will be written by the closure.
+    let mut payload_buf = Vec::new();
+    let mut payload_enc = Encoder::new(&mut payload_buf);
+    encode_payload(&mut payload_enc);
+    let payload_count = count_cbor_items(&payload_buf);
+
+    // ConwayLedgerPredFailure: array(2)[3, conway_gov_payload]
+    enc.array(2).expect("infallible");
+    enc.u8(3).expect("infallible"); // Ledger tag 3: ConwayGovFailure
+
+    // ConwayGovPredFailure: array(N+1)[gov_tag, payload_items...]
+    enc.array((payload_count + 1) as u64).expect("infallible");
+    enc.u8(gov_tag).expect("infallible");
+
+    // Write the pre-encoded payload bytes directly
+    let writer = enc.writer_mut();
+    writer.extend_from_slice(&payload_buf);
+}
+
 // ── Parsing helpers ──
 
 /// Parse a transaction input string in the format `"hex_txhash#index"` into
@@ -543,6 +698,18 @@ fn parse_hex_bytes(s: &str) -> Option<Vec<u8>> {
         .step_by(2)
         .map(|i| u8::from_str_radix(&s[i..i + 2], 16).ok())
         .collect()
+}
+
+/// Parse a hex string into exactly 28 raw bytes.
+/// Returns `None` if the string does not decode to exactly 28 bytes.
+fn parse_hex_28(s: &str) -> Option<[u8; 28]> {
+    let bytes = parse_hex_bytes(s)?;
+    if bytes.len() != 28 {
+        return None;
+    }
+    let mut arr = [0u8; 28];
+    arr.copy_from_slice(&bytes);
+    Some(arr)
 }
 
 /// Count the number of top-level CBOR data items in a byte buffer.
@@ -1316,6 +1483,326 @@ mod tests {
         assert!(
             reason.contains("expected=222"),
             "expected not 222: {reason}"
+        );
+    }
+
+    // ── Issue #???  Conway GOV predicate failure CBOR encoding (Ledger tag 3) ──
+
+    /// CBOR golden: `GovActionsDoNotExist` (Ledger tag 3, GOV tag 0).
+    ///
+    /// Wire: `array(2)[3, array(2)[0, [array(2)[txhash_32, action_idx], ...]]]`
+    #[test]
+    fn test_encode_gov_actions_do_not_exist_golden() {
+        let hash_hex = "ab".repeat(32);
+        let action_id = format!("{hash_hex}#3");
+        let err = TxValidationError::GovActionsDoNotExist {
+            action_ids: vec![action_id.clone()],
+        };
+        let bytes = encode_apply_tx_err(&err, 6);
+
+        let (era, n) = decode_outer(&bytes);
+        assert_eq!(era, 6);
+        assert_eq!(n, 1);
+
+        let mut dec = Decoder::new(&bytes);
+        let _ = dec.array().unwrap();
+        let _ = dec.array().unwrap();
+        let _ = dec.u16().unwrap();
+        let _ = dec.array().unwrap();
+
+        // ConwayLedgerPredFailure: array(2)[3, ...]
+        assert_eq!(dec.array().unwrap(), Some(2));
+        assert_eq!(dec.u8().unwrap(), 3, "Ledger tag 3 = ConwayGovFailure");
+
+        // ConwayGovPredFailure: array(2)[0, [GovActionId,...]]
+        assert_eq!(dec.array().unwrap(), Some(2));
+        assert_eq!(dec.u8().unwrap(), 0, "GOV tag 0 = GovActionsDoNotExist");
+
+        // array(1)[GovActionId]
+        assert_eq!(dec.array().unwrap(), Some(1));
+        // GovActionId: array(2)[txhash_32, action_idx]
+        assert_eq!(dec.array().unwrap(), Some(2));
+        let hash_bytes = dec.bytes().unwrap();
+        assert_eq!(hash_bytes, &[0xabu8; 32][..]);
+        assert_eq!(dec.u32().unwrap(), 3);
+    }
+
+    /// Round-trip: `GovActionsDoNotExist` → encode → decode via n2c_client.
+    #[test]
+    fn test_roundtrip_gov_actions_do_not_exist() {
+        let hash_hex = "cd".repeat(32);
+        let action_id = format!("{hash_hex}#0");
+        let err = TxValidationError::GovActionsDoNotExist {
+            action_ids: vec![action_id.clone()],
+        };
+        let bytes = encode_apply_tx_err(&err, 6);
+        let mut dec = Decoder::new(&bytes);
+        let reason = crate::n2c_client::decode_reject_reason(&mut dec).unwrap();
+        assert!(
+            reason.contains("GovActionsDoNotExist"),
+            "must name variant, got: {reason}"
+        );
+        assert!(
+            reason.contains("cdcdcd"),
+            "must include hash fragment, got: {reason}"
+        );
+    }
+
+    /// CBOR golden: `DisallowedVoters` (Ledger tag 3, GOV tag 5).
+    ///
+    /// Wire: `array(2)[3, array(2)[5, [array(2)[ voter, govActionId ], ...]]]`
+    /// where voter = `array(2)[disc, hash28]`.
+    #[test]
+    fn test_encode_disallowed_voters_golden() {
+        let cred_hex = "aa".repeat(28);
+        let hash_hex = "bb".repeat(32);
+        let action_id = format!("{hash_hex}#1");
+        let err = TxValidationError::DisallowedVoters {
+            // disc 2 = DRep key
+            violations: vec![(2u8, cred_hex.clone(), action_id.clone())],
+        };
+        let bytes = encode_apply_tx_err(&err, 6);
+
+        let mut dec = Decoder::new(&bytes);
+        let _ = dec.array().unwrap();
+        let _ = dec.array().unwrap();
+        let _ = dec.u16().unwrap();
+        let _ = dec.array().unwrap();
+
+        assert_eq!(dec.array().unwrap(), Some(2));
+        assert_eq!(dec.u8().unwrap(), 3, "Ledger tag 3");
+        assert_eq!(dec.array().unwrap(), Some(2));
+        assert_eq!(dec.u8().unwrap(), 5, "GOV tag 5 = DisallowedVoters");
+
+        // array(1)[(voter, govActionId)]
+        assert_eq!(dec.array().unwrap(), Some(1));
+        // pair
+        assert_eq!(dec.array().unwrap(), Some(2));
+        // voter: array(2)[2, cred_hash28]
+        assert_eq!(dec.array().unwrap(), Some(2));
+        assert_eq!(dec.u8().unwrap(), 2, "DRep-key disc");
+        let cred_bytes = dec.bytes().unwrap();
+        assert_eq!(cred_bytes, &[0xaau8; 28][..]);
+        // govActionId: array(2)[hash32, idx]
+        assert_eq!(dec.array().unwrap(), Some(2));
+        let hash_bytes = dec.bytes().unwrap();
+        assert_eq!(hash_bytes, &[0xbbu8; 32][..]);
+        assert_eq!(dec.u32().unwrap(), 1);
+    }
+
+    /// Round-trip: `DisallowedVoters` → encode → decode via n2c_client.
+    #[test]
+    fn test_roundtrip_disallowed_voters() {
+        let cred_hex = "11".repeat(28);
+        let hash_hex = "22".repeat(32);
+        let action_id = format!("{hash_hex}#0");
+        let err = TxValidationError::DisallowedVoters {
+            violations: vec![(4u8, cred_hex.clone(), action_id)], // disc 4 = SPO
+        };
+        let bytes = encode_apply_tx_err(&err, 6);
+        let mut dec = Decoder::new(&bytes);
+        let reason = crate::n2c_client::decode_reject_reason(&mut dec).unwrap();
+        assert!(
+            reason.contains("DisallowedVoters"),
+            "must name variant, got: {reason}"
+        );
+    }
+
+    /// CBOR golden: `VotersDoNotExist` (Ledger tag 3, GOV tag 14).
+    ///
+    /// Wire: `array(2)[3, array(2)[14, [voter, ...]]]`
+    #[test]
+    fn test_encode_voters_do_not_exist_golden() {
+        let cred_hex = "cc".repeat(28);
+        let err = TxValidationError::VotersDoNotExist {
+            // disc 0 = CC key
+            voters: vec![(0u8, cred_hex.clone())],
+        };
+        let bytes = encode_apply_tx_err(&err, 6);
+
+        let mut dec = Decoder::new(&bytes);
+        let _ = dec.array().unwrap();
+        let _ = dec.array().unwrap();
+        let _ = dec.u16().unwrap();
+        let _ = dec.array().unwrap();
+
+        assert_eq!(dec.array().unwrap(), Some(2));
+        assert_eq!(dec.u8().unwrap(), 3, "Ledger tag 3");
+        assert_eq!(dec.array().unwrap(), Some(2));
+        assert_eq!(dec.u8().unwrap(), 14, "GOV tag 14 = VotersDoNotExist");
+
+        assert_eq!(dec.array().unwrap(), Some(1));
+        // voter: array(2)[0, hash28]
+        assert_eq!(dec.array().unwrap(), Some(2));
+        assert_eq!(dec.u8().unwrap(), 0, "CC-key disc");
+        let cred_bytes = dec.bytes().unwrap();
+        assert_eq!(cred_bytes, &[0xccu8; 28][..]);
+    }
+
+    /// Round-trip: `VotersDoNotExist` → encode → decode via n2c_client.
+    #[test]
+    fn test_roundtrip_voters_do_not_exist() {
+        let cred_hex = "dd".repeat(28);
+        let err = TxValidationError::VotersDoNotExist {
+            voters: vec![(2u8, cred_hex.clone())], // disc 2 = DRep key
+        };
+        let bytes = encode_apply_tx_err(&err, 6);
+        let mut dec = Decoder::new(&bytes);
+        let reason = crate::n2c_client::decode_reject_reason(&mut dec).unwrap();
+        assert!(
+            reason.contains("VotersDoNotExist"),
+            "must name variant, got: {reason}"
+        );
+        assert!(
+            reason.contains("DRep-key"),
+            "must decode DRep-key disc, got: {reason}"
+        );
+    }
+
+    /// CBOR golden: `VotingOnExpiredGovAction` (Ledger tag 3, GOV tag 9).
+    #[test]
+    fn test_encode_voting_on_expired_gov_action_golden() {
+        let cred_hex = "ee".repeat(28);
+        let hash_hex = "ff".repeat(32);
+        let action_id = format!("{hash_hex}#2");
+        let err = TxValidationError::VotingOnExpiredGovAction {
+            expired_votes: vec![(4u8, cred_hex.clone(), action_id)], // disc 4 = SPO
+        };
+        let bytes = encode_apply_tx_err(&err, 6);
+
+        let mut dec = Decoder::new(&bytes);
+        let _ = dec.array().unwrap();
+        let _ = dec.array().unwrap();
+        let _ = dec.u16().unwrap();
+        let _ = dec.array().unwrap();
+
+        assert_eq!(dec.array().unwrap(), Some(2));
+        assert_eq!(dec.u8().unwrap(), 3, "Ledger tag 3");
+        assert_eq!(dec.array().unwrap(), Some(2));
+        assert_eq!(dec.u8().unwrap(), 9, "GOV tag 9 = VotingOnExpiredGovAction");
+
+        assert_eq!(dec.array().unwrap(), Some(1));
+        assert_eq!(dec.array().unwrap(), Some(2));
+        // voter: array(2)[4, hash28]
+        assert_eq!(dec.array().unwrap(), Some(2));
+        assert_eq!(dec.u8().unwrap(), 4, "SPO disc");
+        let cred_bytes = dec.bytes().unwrap();
+        assert_eq!(cred_bytes, &[0xeeu8; 28][..]);
+        // govActionId
+        assert_eq!(dec.array().unwrap(), Some(2));
+        let hash_bytes = dec.bytes().unwrap();
+        assert_eq!(hash_bytes, &[0xffu8; 32][..]);
+        assert_eq!(dec.u32().unwrap(), 2);
+    }
+
+    /// CBOR golden: `ProposalReturnAccountDoesNotExist` (Ledger tag 3, GOV tag 16).
+    ///
+    /// Wire: `array(2)[3, array(2)[16, return_addr_bytes]]`
+    #[test]
+    fn test_encode_proposal_return_account_does_not_exist_golden() {
+        let addr_bytes: Vec<u8> = std::iter::once(0xe0)
+            .chain(std::iter::repeat_n(0x55, 28))
+            .collect();
+        let addr_hex = hex::encode(&addr_bytes);
+        let err = TxValidationError::ProposalReturnAccountDoesNotExist {
+            bad_addrs: vec![addr_hex.clone()],
+        };
+        let bytes = encode_apply_tx_err(&err, 6);
+
+        let mut dec = Decoder::new(&bytes);
+        let _ = dec.array().unwrap();
+        let _ = dec.array().unwrap();
+        let _ = dec.u16().unwrap();
+        let _ = dec.array().unwrap();
+
+        assert_eq!(dec.array().unwrap(), Some(2));
+        assert_eq!(dec.u8().unwrap(), 3, "Ledger tag 3");
+        assert_eq!(dec.array().unwrap(), Some(2));
+        assert_eq!(
+            dec.u8().unwrap(),
+            16,
+            "GOV tag 16 = ProposalReturnAccountDoesNotExist"
+        );
+
+        let decoded_addr = dec.bytes().unwrap();
+        assert_eq!(decoded_addr, addr_bytes.as_slice());
+    }
+
+    /// Round-trip: `ProposalReturnAccountDoesNotExist` → encode → decode.
+    #[test]
+    fn test_roundtrip_proposal_return_account_does_not_exist() {
+        let addr_bytes: Vec<u8> = std::iter::once(0xe1)
+            .chain(std::iter::repeat_n(0x66, 28))
+            .collect();
+        let addr_hex = hex::encode(&addr_bytes);
+        let err = TxValidationError::ProposalReturnAccountDoesNotExist {
+            bad_addrs: vec![addr_hex.clone()],
+        };
+        let bytes = encode_apply_tx_err(&err, 6);
+        let mut dec = Decoder::new(&bytes);
+        let reason = crate::n2c_client::decode_reject_reason(&mut dec).unwrap();
+        assert!(
+            reason.contains("ProposalReturnAccountDoesNotExist"),
+            "must name variant, got: {reason}"
+        );
+        assert!(
+            reason.contains(&addr_hex),
+            "must include addr hex, got: {reason}"
+        );
+    }
+
+    /// CBOR golden: `UnelectedCommitteeVoters` (Ledger tag 3, GOV tag 18).
+    ///
+    /// Wire: `array(2)[3, array(2)[18, [Credential, ...]]]`
+    /// where Credential = `array(2)[disc, hash28]`.
+    #[test]
+    fn test_encode_unelected_committee_voters_golden() {
+        let cred_hex = "77".repeat(28);
+        let err = TxValidationError::UnelectedCommitteeVoters {
+            hot_credentials: vec![(0u8, cred_hex.clone())], // disc 0 = key
+        };
+        let bytes = encode_apply_tx_err(&err, 6);
+
+        let mut dec = Decoder::new(&bytes);
+        let _ = dec.array().unwrap();
+        let _ = dec.array().unwrap();
+        let _ = dec.u16().unwrap();
+        let _ = dec.array().unwrap();
+
+        assert_eq!(dec.array().unwrap(), Some(2));
+        assert_eq!(dec.u8().unwrap(), 3, "Ledger tag 3");
+        assert_eq!(dec.array().unwrap(), Some(2));
+        assert_eq!(
+            dec.u8().unwrap(),
+            18,
+            "GOV tag 18 = UnelectedCommitteeVoters"
+        );
+
+        assert_eq!(dec.array().unwrap(), Some(1));
+        // Credential: array(2)[0, hash28]
+        assert_eq!(dec.array().unwrap(), Some(2));
+        assert_eq!(dec.u8().unwrap(), 0, "key disc");
+        let cred_bytes = dec.bytes().unwrap();
+        assert_eq!(cred_bytes, &[0x77u8; 28][..]);
+    }
+
+    /// Round-trip: `UnelectedCommitteeVoters` → encode → decode via n2c_client.
+    #[test]
+    fn test_roundtrip_unelected_committee_voters() {
+        let cred_hex = "88".repeat(28);
+        let err = TxValidationError::UnelectedCommitteeVoters {
+            hot_credentials: vec![(1u8, cred_hex.clone())], // disc 1 = script
+        };
+        let bytes = encode_apply_tx_err(&err, 6);
+        let mut dec = Decoder::new(&bytes);
+        let reason = crate::n2c_client::decode_reject_reason(&mut dec).unwrap();
+        assert!(
+            reason.contains("UnelectedCommitteeVoters"),
+            "must name variant, got: {reason}"
+        );
+        assert!(
+            reason.contains("1:"),
+            "must decode script disc=1, got: {reason}"
         );
     }
 }
