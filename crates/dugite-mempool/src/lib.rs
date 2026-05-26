@@ -1056,13 +1056,19 @@ impl Mempool {
                 continue;
             }
             if let Some(entry) = self.txs.get(tx_hash) {
-                // TTL guard at forge-slot. If ttl is set and ttl < forge_slot,
-                // including this tx would produce a block that fails Phase-1
-                // validation on every conforming peer — skip it. We do NOT
-                // `break` because later txs in the FIFO may have larger TTLs
-                // (TTL is set client-side, not monotonic with arrival order).
+                // TTL guard at forge-slot. Haskell `inInterval`
+                // (`Cardano.Ledger.Shelley.Rules.Utxo`): the tx is valid only
+                // when `slot < invalidHereafter`.  Equality is OUT of the
+                // interval, so a tx with `ttl == forge_slot` would produce a
+                // block that fails Phase-1 with
+                // `OutsideValidityIntervalUTxO`.  Use `tx_ttl <= slot` to
+                // skip the tx when it has already expired AT the forge slot,
+                // matching the corrected phase1 check `current_slot >= ttl`.
+                // We do NOT `break` because later txs in the FIFO may have
+                // larger TTLs (TTL is set client-side, not monotonic with
+                // arrival order).
                 if let (Some(slot), Some(tx_ttl)) = (forge_slot, entry.tx.body.ttl) {
-                    if tx_ttl.0 < slot.0 {
+                    if tx_ttl.0 <= slot.0 {
                         continue;
                     }
                 }
@@ -1686,6 +1692,43 @@ mod tests {
         );
 
         assert_eq!(selected.len(), 1, "TTL-expired tx must be excluded");
+        assert_eq!(
+            selected[0].body.inputs[0].index, tx_fresh.body.inputs[0].index,
+            "the surviving tx must be the one with ttl > forge_slot"
+        );
+    }
+
+    /// Forge-time TTL filter: a tx with `ttl == forge_slot` must NOT be
+    /// selected.  Haskell `inInterval` (`Cardano.Ledger.Shelley.Rules.Utxo`)
+    /// uses the half-open interval `slot < invalidHereafter`, so a tx whose
+    /// TTL equals the forge slot is already OUT of its validity interval and
+    /// the resulting block fails Phase-1 with `OutsideValidityIntervalUTxO`.
+    #[test]
+    fn get_txs_for_block_excludes_tx_with_ttl_equal_to_forge_slot() {
+        let mempool = Mempool::new(default_config());
+        let tx_boundary = make_dummy_tx_with_ttl(150); // ttl == forge_slot
+        let tx_fresh = make_dummy_tx_with_ttl(151); // strictly above forge slot
+        mempool
+            .add_tx(tx_boundary.hash, tx_boundary.clone(), 200)
+            .unwrap();
+        mempool
+            .add_tx(tx_fresh.hash, tx_fresh.clone(), 200)
+            .unwrap();
+
+        let forge_slot = Some(dugite_primitives::time::SlotNo(150));
+        let selected = mempool.get_txs_for_block_with_ex_units_at(
+            500,
+            16_000_000,
+            u64::MAX,
+            u64::MAX,
+            forge_slot,
+        );
+
+        assert_eq!(
+            selected.len(),
+            1,
+            "tx with ttl == forge_slot must be excluded (Haskell `slot < invalidHereafter`)"
+        );
         assert_eq!(
             selected[0].body.inputs[0].index, tx_fresh.body.inputs[0].index,
             "the surviving tx must be the one with ttl > forge_slot"
