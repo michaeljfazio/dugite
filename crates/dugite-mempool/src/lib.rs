@@ -799,8 +799,10 @@ impl Mempool {
             self.claimed_inputs.remove(input);
         }
 
-        // Remove this tx's outputs from the virtual UTxO.  Any dependent txs
-        // that spend these outputs will be cascade-removed next.
+        // Remove this tx's outputs from the virtual UTxO.
+        // For Evicted/Manual removals the cascade below will evict dependent txs.
+        // For Mined removals, dependent txs remain valid (their inputs now resolve
+        // against the confirmed on-chain UTxO set); the cascade is skipped below.
         for (index, _output) in entry.tx.body.outputs.iter().enumerate() {
             let virt_input = TransactionInput {
                 transaction_id: *tx_hash,
@@ -842,6 +844,25 @@ impl Mempool {
             // acquiring those write locks O(N) times for a chain of N dependents.
             // This reduces the worst-case cost from O(N log N) write-locks to a
             // single O(N log N) BTreeSet batch + 2 lock acquisitions.
+            //
+            // Mined-cascade fix: when a tx is included in a block (Mined),
+            // its outputs move from virtual_utxo to the confirmed on-chain
+            // UTxO set (apply_block_with_delta has already run by this point).
+            // Children that spent those virtual outputs are still valid because
+            // their inputs now resolve against the ledger utxo_set.
+            // Cascade-evicting them would prevent chained transactions from
+            // landing on-chain — this was the root cause of the 01h-tx-chain
+            // test failure.
+            //
+            // For Evicted / Manual removals the outputs disappear entirely;
+            // children become unresolvable and must be evicted via cascade.
+            if reason == MempoolRemoveReason::Mined {
+                // Clean up the dependents entry so future cascade walks do not
+                // follow a stale edge to this (already-confirmed) tx.  The
+                // children remain in the mempool with their virtual_utxo intact.
+                self.dependents.write().remove(tx_hash);
+                return Some(removed_tx);
+            }
             let mut all_children: Vec<TransactionHash> = Vec::new();
             let mut bfs: Vec<TransactionHash> = {
                 let mut dep_map = self.dependents.write();
@@ -4512,6 +4533,153 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
+    // Mined-cascade fix: children survive when parent is confirmed on-chain
+    // (regression tests for the 01h-tx-chain.sh race — chained-tx handling)
+    // -----------------------------------------------------------------------
+    //
+    // When a tx is removed with MempoolRemoveReason::Mined its outputs move
+    // from the virtual UTxO set to the confirmed on-chain UTxO set.  Children
+    // that spent those virtual outputs remain valid because their inputs now
+    // resolve against the ledger utxo_set.  The previous unconditional cascade
+    // evicted them, preventing 3-tx chains from ever landing fully on-chain.
+
+    /// Mined parent: direct child must NOT be cascade-evicted.
+    #[test]
+    fn test_mined_parent_child_survives() {
+        let mempool = Mempool::new(default_config());
+
+        let (tx1, hash1) = make_tx_with_outputs(&[3_000_000]);
+        mempool.add_tx(hash1, tx1, 200).unwrap();
+
+        let tx2 = make_tx_spending_virtual(hash1, 0);
+        let hash2 = tx2.hash;
+        mempool.add_tx(hash2, tx2, 200).unwrap();
+
+        assert_eq!(mempool.len(), 2);
+        assert!(mempool.dependents.read().contains_key(&hash1));
+
+        // Mine tx1 — its output is now on-chain.
+        mempool.remove_tx_with_reason(&hash1, MempoolRemoveReason::Mined);
+
+        assert_eq!(
+            mempool.len(),
+            1,
+            "tx2 must survive when its virtual parent is mined"
+        );
+        assert!(mempool.contains(&hash2), "tx2 must still be in the mempool");
+
+        // tx1's virtual outputs are gone (moved to on-chain UTxO); tx2's still present.
+        assert_eq!(
+            mempool.virtual_utxo_count(),
+            1,
+            "only tx2's output should remain in virtual UTxO"
+        );
+        assert!(
+            mempool
+                .lookup_virtual_utxo(&TransactionInput {
+                    transaction_id: hash1,
+                    index: 0
+                })
+                .is_none(),
+            "tx1's virtual output should be gone (now on-chain)"
+        );
+        assert!(
+            mempool
+                .lookup_virtual_utxo(&TransactionInput {
+                    transaction_id: hash2,
+                    index: 0
+                })
+                .is_some(),
+            "tx2's virtual output must still be in virtual UTxO for tx3"
+        );
+
+        // Dependency map entry for the mined tx1 must be cleaned up.
+        assert!(
+            !mempool.dependents.read().contains_key(&hash1),
+            "dependents entry for mined tx1 must be removed"
+        );
+    }
+
+    /// 3-tx chain: tx1 mined → tx2 and tx3 both survive in the mempool.
+    ///
+    /// This is the exact scenario from 01h-tx-chain.sh:
+    ///   tx1 (mined) → tx2 (depends on tx1's virtual out) → tx3 (depends on tx2's virtual out)
+    ///
+    /// After tx1 is mined: tx2 stays (its input now on-chain), tx3 stays (its
+    /// input is tx2's virtual output, which is still present).
+    #[test]
+    fn test_mined_chain_three_txs_middle_and_tail_survive() {
+        let mempool = Mempool::new(default_config());
+
+        let (tx1, hash1) = make_tx_with_outputs(&[4_000_000]);
+        mempool.add_tx(hash1, tx1, 200).unwrap();
+
+        let tx2 = make_tx_spending_virtual(hash1, 0);
+        let hash2 = tx2.hash;
+        mempool.add_tx(hash2, tx2, 200).unwrap();
+
+        let tx3 = make_tx_spending_virtual(hash2, 0);
+        let hash3 = tx3.hash;
+        mempool.add_tx(hash3, tx3, 200).unwrap();
+
+        assert_eq!(mempool.len(), 3);
+
+        // Mine tx1.
+        mempool.remove_tx_with_reason(&hash1, MempoolRemoveReason::Mined);
+
+        assert_eq!(
+            mempool.len(),
+            2,
+            "tx2 and tx3 must survive after tx1 is mined"
+        );
+        assert!(
+            mempool.contains(&hash2),
+            "tx2 must be in the mempool after tx1 is mined"
+        );
+        assert!(
+            mempool.contains(&hash3),
+            "tx3 must be in the mempool after tx1 is mined"
+        );
+
+        // tx2's virtual output (which tx3 needs) must still be present.
+        assert!(
+            mempool
+                .lookup_virtual_utxo(&TransactionInput {
+                    transaction_id: hash2,
+                    index: 0
+                })
+                .is_some(),
+            "tx2's virtual output must survive for tx3 to remain valid"
+        );
+    }
+
+    /// Evicted parent still cascade-removes its children (fix is scoped to Mined only).
+    #[test]
+    fn test_evicted_parent_still_cascades() {
+        let mempool = Mempool::new(default_config());
+
+        let (tx1, hash1) = make_tx_with_outputs(&[3_000_000]);
+        mempool.add_tx(hash1, tx1, 200).unwrap();
+
+        let tx2 = make_tx_spending_virtual(hash1, 0);
+        let hash2 = tx2.hash;
+        mempool.add_tx(hash2, tx2, 200).unwrap();
+
+        assert_eq!(mempool.len(), 2);
+
+        // Evict tx1 (e.g. TTL expiry / input conflict) — cascade must still fire.
+        mempool.remove_tx_with_reason(&hash1, MempoolRemoveReason::Evicted);
+
+        assert_eq!(
+            mempool.len(),
+            0,
+            "tx2 must be cascade-evicted when parent is evicted (not mined)"
+        );
+        assert_eq!(mempool.virtual_utxo_count(), 0);
+        assert_eq!(mempool.claimed_inputs_count(), 0);
+    }
+
+    // -----------------------------------------------------------------------
     // Epoch re-validation integration tests (issue #311)
     //
     // These tests verify that mempool transactions are correctly evicted when
@@ -5073,11 +5241,15 @@ mod tests {
         }
     }
 
-    /// A direct `remove_tx_with_reason(parent, Mined)` causes cascade-removed
-    /// children to publish `Evicted` (their dependency went away — they were
-    /// not mined themselves).
+    /// When a parent is removed with `Mined` reason its dependent child must
+    /// NOT be cascade-evicted: the parent's outputs have moved from the
+    /// virtual UTxO set to the confirmed on-chain UTxO set, so the child's
+    /// input is still resolvable and the child remains a valid pending tx.
+    ///
+    /// Only a single `Removed { Mined }` event should be published — no
+    /// follow-up `Removed { Evicted }` for the child.
     #[tokio::test]
-    async fn tx_events_cascade_descendants_are_evicted_not_mined() {
+    async fn tx_events_mined_parent_does_not_cascade_child() {
         let mempool = Mempool::new(MempoolConfig::default());
 
         // Build parent → child via the virtual UTxO chain.
@@ -5103,22 +5275,33 @@ mod tests {
 
         mempool.remove_tx_with_reason(&parent_hash, MempoolRemoveReason::Mined);
 
-        // Direct removal first → Mined.
+        // Only the direct removal event (Mined) should be published.
         match events.recv().await.expect("Removed parent") {
             MempoolEvent::Removed { tx_hash, reason } => {
                 assert_eq!(tx_hash, parent_hash);
                 assert_eq!(reason, MempoolRemoveReason::Mined);
             }
-            other => panic!("expected Removed(parent), got {other:?}"),
+            other => panic!("expected Removed(parent, Mined), got {other:?}"),
         }
-        // Cascaded child → Evicted (NOT Mined).
-        match events.recv().await.expect("Removed child") {
-            MempoolEvent::Removed { tx_hash, reason } => {
-                assert_eq!(tx_hash, child_hash);
-                assert_eq!(reason, MempoolRemoveReason::Evicted);
-            }
-            other => panic!("expected Removed(child), got {other:?}"),
-        }
+
+        // The child must still be in the mempool — its input now resolves
+        // against the confirmed on-chain UTxO set, not the virtual set.
+        assert!(
+            mempool.contains(&child_hash),
+            "child must remain in mempool after parent is mined"
+        );
+        assert_eq!(
+            mempool.len(),
+            1,
+            "only parent was removed; child must survive"
+        );
+
+        // No cascade Evicted event should have been published.
+        // Use try_recv to verify the channel has no pending event.
+        assert!(
+            events.try_recv().is_err(),
+            "no Evicted event for child — cascade must not fire on Mined"
+        );
     }
 
     /// `remove_txs_with_reason(hashes, Mined)` reports each direct removal
