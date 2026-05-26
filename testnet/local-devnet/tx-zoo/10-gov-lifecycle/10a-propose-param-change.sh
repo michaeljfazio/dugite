@@ -6,6 +6,14 @@
 # On success, writes $ZOO_STATE/gov-lifecycle/proposal.actionid and
 # expected-min-fee-a so downstream 10b/10c/10d/10e scripts can vote on the
 # action and assert its enactment.
+#
+# On re-run (Round 2+): reads the previously enacted action ID from
+# $ZOO_STATE/gov-lifecycle/enacted.actionid and supplies it as
+# --prev-governance-action-tx-id.  Per Conway/CIP-1694, once a ParameterChange
+# proposal has been enacted, all subsequent ParameterChange proposals must
+# reference the most recently enacted one as their prev_action_id (the "lineal
+# chain" invariant enforced by proposalsAddAction in cardano-ledger Proposals.hs).
+# Without it the proposal is rejected at submission (InvalidPrevGovActionId).
 set -euo pipefail
 . "$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/lib/tx-zoo-common.sh"
 
@@ -22,6 +30,23 @@ NEW_MIN_FEE_A=$((CURRENT_MIN_FEE_A + 1))
 GOV_STATE="$ZOO_STATE/gov-lifecycle"
 mkdir -p "$GOV_STATE"
 
+# Build prev-action-id args.  On first run there is no enacted action, so no
+# --prev-governance-action-tx-id flag is needed.  On subsequent runs we must
+# supply the previously enacted action ID so the new proposal correctly chains
+# from the enacted root of the ParameterChange purpose tree.
+PREV_ACTION_ARGS=()
+ENACTED_ACTIONID_FILE="$GOV_STATE/enacted.actionid"
+if [ -f "$ENACTED_ACTIONID_FILE" ]; then
+    PREV_ACTIONID=$(cat "$ENACTED_ACTIONID_FILE")
+    PREV_TX="${PREV_ACTIONID%%#*}"
+    PREV_IDX="${PREV_ACTIONID##*#}"
+    log_info "10a: chaining from previously enacted action ${PREV_TX}#${PREV_IDX}"
+    PREV_ACTION_ARGS=(
+        --prev-governance-action-tx-id "$PREV_TX"
+        --prev-governance-action-index "$PREV_IDX"
+    )
+fi
+
 ACTION="$ZOO_BUILT/$NAME.action"
 cardano-cli conway governance action create-protocol-parameters-update \
     --testnet \
@@ -30,6 +55,7 @@ cardano-cli conway governance action create-protocol-parameters-update \
     --anchor-url  "$(zoo_anchor_url gov-proposal)" \
     --anchor-data-hash "$(zoo_anchor_hash gov-proposal)" \
     --min-fee-linear "$NEW_MIN_FEE_A" \
+    "${PREV_ACTION_ARGS[@]}" \
     --out-file "$ACTION"
 
 UTXO=$(zoo_largest_utxo "$ADDR") || { zoo_record "$NAME" FAIL "" "no-utxo"; exit 1; }
