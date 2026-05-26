@@ -1181,6 +1181,61 @@ mod tests {
         assert_ne!(state.tip, dugite_primitives::block::Tip::origin());
     }
 
+    /// Issue #670: apply_block of a Conway+ block must update
+    /// `consensus.opcert_counters` with the per-pool max
+    /// `OperationalCert.sequence_number`. Mirrors
+    /// `Haskell PraosState.ocertCounters`. Without this update the
+    /// from-genesis ledger diverges from the ancillary import on the
+    /// `opcert_counters` field of `ConsensusSubState` (verify-ledger-snapshot
+    /// shows `L=0 R=467` on preview epoch-1308 snapshots).
+    #[test]
+    fn test_apply_block_tracks_opcert_counters() {
+        let mut state = LedgerState::new(ProtocolParameters::mainnet_defaults());
+
+        let input = TransactionInput {
+            transaction_id: Hash32::from_bytes([0x77u8; 32]),
+            index: 0,
+        };
+        seed_utxo(&mut state, input.clone(), make_output(5_000_000));
+
+        let output = make_output(4_500_000);
+        let tx = make_simple_tx(0x78, vec![input.clone()], vec![output], 500_000);
+        let mut block = make_test_block(Era::Conway, 1_000, 1, 9, 0, vec![tx]);
+        // Issuer vkey + non-zero opcert sequence number
+        block.header.issuer_vkey = vec![0xAA; 32];
+        block.header.operational_cert.sequence_number = 42;
+
+        let pool_id =
+            dugite_primitives::hash::blake2b_224(&block.header.issuer_vkey);
+
+        state
+            .apply_block(&block, BlockValidationMode::ApplyOnly)
+            .expect("Conway block must apply");
+
+        assert_eq!(
+            state.consensus.opcert_counters.get(&pool_id).copied(),
+            Some(42),
+            "apply_block must record OperationalCert.sequence_number in \
+             consensus.opcert_counters via compute_shelley_nonce"
+        );
+
+        // Newer opcert seq → counter advances. Second block must chain
+        // off block #1 — its `prev_hash` must equal block #1's
+        // `header_hash`.
+        let prev_hash = block.header.header_hash;
+        let mut block2 = make_test_block(Era::Conway, 1_020, 2, 9, 0, vec![]);
+        block2.header.prev_hash = prev_hash;
+        block2.header.issuer_vkey = vec![0xAA; 32];
+        block2.header.operational_cert.sequence_number = 99;
+        state
+            .apply_block(&block2, BlockValidationMode::ApplyOnly)
+            .expect("Conway block must apply");
+        assert_eq!(
+            state.consensus.opcert_counters.get(&pool_id).copied(),
+            Some(99)
+        );
+    }
+
     // ── Test 2: Shelley+ block with one valid tx ──────────────────────────────
 
     #[test]

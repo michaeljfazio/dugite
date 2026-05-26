@@ -2547,7 +2547,10 @@ impl Node {
                     current_slot, "Shutdown requested during LSM replay, saving snapshot"
                 );
                 let mut ls = self.ledger_state.write().await;
-                ls.consensus.opcert_counters = self.consensus.opcert_counters().clone();
+                merge_opcert_counters_from_praos(
+                    &mut ls.consensus.opcert_counters,
+                    self.consensus.opcert_counters(),
+                );
                 if let Err(e) = ls.save_snapshot(&snapshot_path) {
                     warn!("Failed to save snapshot on shutdown: {e}");
                 }
@@ -2616,8 +2619,10 @@ impl Node {
                                 // bulk snapshot has correct pool_stake values using the
                                 // current incremental stake_distribution.
                                 ls.recompute_snapshot_pool_stakes();
-                                ls.consensus.opcert_counters =
-                                    self.consensus.opcert_counters().clone();
+                                merge_opcert_counters_from_praos(
+                                    &mut ls.consensus.opcert_counters,
+                                    self.consensus.opcert_counters(),
+                                );
                                 if let Err(e) = ls.save_snapshot(&snapshot_path) {
                                     warn!("Failed to save ledger snapshot during replay: {e}");
                                 }
@@ -2692,7 +2697,10 @@ impl Node {
         // Save final snapshot after replay (write lock to flush UTxO store — no WAL)
         {
             let mut ls = self.ledger_state.write().await;
-            ls.consensus.opcert_counters = self.consensus.opcert_counters().clone();
+            merge_opcert_counters_from_praos(
+                &mut ls.consensus.opcert_counters,
+                self.consensus.opcert_counters(),
+            );
             if let Err(e) = ls.save_utxo_snapshot() {
                 error!("Failed to save UTxO store after replay: {e}");
             }
@@ -2718,6 +2726,44 @@ impl Node {
 /// `[0, [[isEbb, size], tag24(bstr(byron_header))]]` and the hash is
 /// `blake2b_256([0x82, isEbb, byron_header])` — see `byron_main_header_hash`
 /// / `byron_ebb_header_hash` in dugite-serialization.
+/// Merge per-pool opcert counters from the `PraosValidator`'s in-memory
+/// state into the `LedgerState`'s persisted map, taking the per-pool max.
+///
+/// Two sources feed this map:
+///
+/// 1. **`compute_shelley_nonce`** (issue #670) — runs inside
+///    `ls.apply_block(..)` and records the issuing pool's
+///    `OperationalCert.sequence_number` for every block applied (chunk
+///    replay, LSM replay, live apply).  This is the from-genesis
+///    canonical source.
+/// 2. **`PraosValidator.check_opcert_counter`** — runs during live
+///    header validation only.  Updates the validator's own in-memory
+///    map for replay-protection tie-breaking.
+///
+/// On snapshot save we merge the validator's view INTO the ledger's so
+/// the persisted snapshot reflects the higher of the two sources per
+/// pool.  The previous behaviour (`ls.consensus.opcert_counters =
+/// self.consensus.opcert_counters().clone()`) clobbered the
+/// per-apply-populated map with the validator's (which is empty during
+/// pure replay), silently zeroing the field on every from-genesis save
+/// and producing the `len 0 vs 467` divergence the
+/// verify-ledger-snapshot harness reports against a Mithril ancillary.
+fn merge_opcert_counters_from_praos(
+    ledger: &mut std::collections::HashMap<dugite_primitives::hash::Hash28, u64>,
+    praos: &std::collections::HashMap<dugite_primitives::hash::Hash28, u64>,
+) {
+    for (pool_id, seq) in praos {
+        ledger
+            .entry(*pool_id)
+            .and_modify(|cur| {
+                if *seq > *cur {
+                    *cur = *seq;
+                }
+            })
+            .or_insert(*seq);
+    }
+}
+
 fn extract_hash_from_header(header_cbor: &[u8]) -> [u8; 32] {
     // Byron HFC wrap: [0, [[isEbb_u8, size_uint], tag24(bytes(byron_header))]]
     if let Some((is_ebb, byron_header_bytes)) = unwrap_byron_n2n_header(header_cbor) {
