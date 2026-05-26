@@ -647,23 +647,128 @@ impl Node {
         }
 
         // 3. Re-validate mempool transactions against the rolled-back ledger state.
-        // Drain all pending txs, then re-validate each against the updated UTxO set.
+        //
+        // `drain_all` clears the mempool completely (virtual UTxO set, dependency
+        // graph, claimed inputs) before we re-examine each pending tx against the
+        // rolled-back ledger.  After a rollback the UTxO set has changed, so a
+        // clean slate avoids stale virtual-UTxO entries from rolled-back txs
+        // corrupting the dependency graph.
+        //
+        // GOVERNANCE INVARIANT: use `validate_transaction_with_context` (not
+        // `validate_transaction`) so that vote transactions whose referenced
+        // `GovActionId` was rolled back (the proposal block was orphaned) are
+        // correctly evicted rather than re-admitted.  The previous bare
+        // `validate_transaction` call omitted the governance context, allowing
+        // stale votes to re-enter the mempool.  dugite-bp then forged those votes
+        // into the next block, which cardano-node correctly rejected with
+        // `ConwayGovFailure (GovActionsDoNotExist …)`.
+        //
+        // Mirrors the governance check in `apply_fetched_block` (below) and
+        // `post_block_apply_updates` (mod.rs), which already build `active_proposals`
+        // from the live ledger state for the same purpose.
         let pending_txs = self.mempool.drain_all();
         let pending_count = pending_txs.len();
         if pending_count > 0 {
             let ledger = self.ledger_state.read().await;
             let current_slot = ledger.tip.point.slot().map(|s| s.0).unwrap_or(0);
             let slot_config = ledger.slot_config;
+
+            // Build governance context from the rolled-back ledger state so that
+            // votes referencing proposals that were rolled back are rejected.
+            // Matches `build_governance_validation_state` in serve.rs but
+            // inlined here to avoid a cross-module dependency on that private fn.
+            let active_proposals: std::collections::HashMap<
+                dugite_primitives::transaction::GovActionId,
+                dugite_ledger::validation::ActiveProposal,
+            > = ledger
+                .gov
+                .governance
+                .proposals
+                .iter()
+                .map(|(id, state)| {
+                    (
+                        id.clone(),
+                        dugite_ledger::validation::ActiveProposal {
+                            gov_action: state.procedure.gov_action.clone(),
+                            return_addr: state.procedure.return_addr.clone(),
+                            deposit: state.procedure.deposit,
+                            expires_after_epoch: state.expires_epoch,
+                            proposed_in_epoch: state.proposed_epoch,
+                        },
+                    )
+                })
+                .collect();
+            let committee_hot_keys: std::collections::HashSet<dugite_primitives::hash::Hash32> =
+                ledger
+                    .gov
+                    .governance
+                    .committee_hot_keys
+                    .values()
+                    .copied()
+                    .collect();
+            let committee_members: std::collections::HashSet<dugite_primitives::hash::Hash32> =
+                ledger
+                    .gov
+                    .governance
+                    .committee_expiration
+                    .keys()
+                    .copied()
+                    .collect();
+            let committee_resigned: std::collections::HashSet<dugite_primitives::hash::Hash32> =
+                ledger
+                    .gov
+                    .governance
+                    .committee_resigned
+                    .keys()
+                    .copied()
+                    .collect();
+            let committee_authorized_elected_hot_keys: std::collections::HashSet<
+                dugite_primitives::hash::Hash32,
+            > = ledger
+                .gov
+                .governance
+                .committee_hot_keys
+                .iter()
+                .filter(|(cold, _)| {
+                    ledger
+                        .gov
+                        .governance
+                        .committee_expiration
+                        .contains_key(*cold)
+                })
+                .map(|(_, hot)| *hot)
+                .collect();
+            let registered_pool_ids: std::collections::HashSet<dugite_primitives::hash::Hash28> =
+                ledger.certs.pool_params.keys().copied().collect();
+            let registered_drep_ids: std::collections::HashSet<dugite_primitives::hash::Hash32> =
+                ledger.gov.governance.dreps.keys().copied().collect();
+            let node_network = ledger.node_network;
+
             let mut revalidated = 0u64;
+            let mut evicted = 0u64;
             for tx in pending_txs {
                 let tx_size = tx.raw_cbor.as_ref().map(|b| b.len() as u64).unwrap_or(0);
-                if dugite_ledger::validation::validate_transaction(
+                let mut ctx = dugite_ledger::validation::ValidationContext::new()
+                    .with_active_proposals(active_proposals.clone())
+                    .with_committee_authorized_hot_keys(committee_hot_keys.clone())
+                    .with_committee_authorized_elected_hot_keys(
+                        committee_authorized_elected_hot_keys.clone(),
+                    )
+                    .with_committee_members(committee_members.clone())
+                    .with_committee_resigned(committee_resigned.clone())
+                    .with_pools(registered_pool_ids.clone())
+                    .with_dreps(registered_drep_ids.clone());
+                if let Some(net) = node_network {
+                    ctx = ctx.with_network(net);
+                }
+                if dugite_ledger::validation::validate_transaction_with_context(
                     &tx,
                     &ledger.utxo.utxo_set,
                     &ledger.epochs.protocol_params,
                     current_slot,
                     tx_size,
                     Some(&slot_config),
+                    ctx,
                 )
                 .is_ok()
                 {
@@ -672,11 +777,17 @@ impl Node {
                     let fee = tx.body.fee;
                     let _ = self.mempool.add_tx_with_fee(hash, tx, size, fee);
                     revalidated += 1;
+                } else {
+                    evicted += 1;
+                    debug!(
+                        tx_hash = %tx.hash.to_hex(),
+                        "Rollback re-validation: evicted mempool tx (failed gov/phase1 check)"
+                    );
                 }
             }
             info!(
                 total = pending_count,
-                revalidated, "Re-validated mempool txs after rollback"
+                revalidated, evicted, "Re-validated mempool txs after rollback"
             );
         }
 

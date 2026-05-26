@@ -15215,6 +15215,304 @@ mod tests {
         // must never appear for a non-Plutus tx.
     }
 
+    // -------------------------------------------------------------------------
+    // GovActionsDoNotExist integration tests
+    //
+    // Per Haskell `conwayGovTransition` step 5 (Gov.hs line 605):
+    //   `failOnNonEmpty unknownGovActionIds (injectFailure . GovActionsDoNotExist)`
+    //
+    // A vote that references a `GovActionId` not in:
+    //   - the same tx's `proposal_procedures` (local proposal), OR
+    //   - the `active_proposals` context map (on-chain proposals)
+    // must be rejected with `GovActionsDoNotExist`.
+    //
+    // The root-cause bug (2026-05-27): after a rollback the mempool re-validation
+    // path used `validate_transaction` (no governance context), so vote txs
+    // whose referenced proposals were rolled back could re-enter the mempool.
+    // The next forged block containing such a vote was rejected by cardano-node
+    // with `ConwayGovFailure (GovActionsDoNotExist …)`.  These tests pin the
+    // predicate behaviour to guard against regressions.
+    // -------------------------------------------------------------------------
+
+    /// A registered DRep votes on a GovActionId that exists in neither the
+    /// local proposals nor `active_proposals`.  With `active_proposals` provided
+    /// (non-None), the check must fire and return `GovActionsDoNotExist`
+    /// containing the missing id.
+    #[test]
+    fn test_gov_actions_do_not_exist_fires_for_unknown_action_id() {
+        let params = conway_pparams_pv10();
+        let utxo_set = UtxoSet::new();
+
+        // Vote references an action that is not on-chain and not in this tx.
+        let missing_id = GovActionId {
+            transaction_id: Hash32::from_bytes([0xCC; 32]),
+            action_index: 0,
+        };
+        let drep_voter = drep_voter_for_test();
+        let drep_hash = match &drep_voter {
+            Voter::DRep(cred) => cred.to_hash().to_hash32_padded(),
+            _ => unreachable!(),
+        };
+        let mut registered_dreps: std::collections::HashSet<Hash32> =
+            std::collections::HashSet::new();
+        registered_dreps.insert(drep_hash);
+
+        let mut votes = BTreeMap::new();
+        votes.insert(missing_id.clone(), yes_vote());
+        let mut voting_procedures = BTreeMap::new();
+        voting_procedures.insert(drep_voter, votes);
+
+        // No proposals in tx; active_proposals is an empty (non-None) map.
+        let tx = make_gov_tx(vec![], voting_procedures);
+        let context = ValidationContext::new()
+            .with_active_proposals(HashMap::new())
+            .with_dreps(registered_dreps);
+        let result =
+            validate_transaction_with_context(&tx, &utxo_set, &params, 100, 500, None, context);
+
+        let errors = result.expect_err("expected GovActionsDoNotExist predicate to fire");
+        let missing = errors
+            .iter()
+            .find_map(|e| match e {
+                ValidationError::GovActionsDoNotExist { action_ids } => Some(action_ids),
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("GovActionsDoNotExist not in error set: {errors:?}"));
+        assert!(
+            missing.contains(&missing_id),
+            "GovActionsDoNotExist payload must contain the missing action id, got: {missing:?}"
+        );
+    }
+
+    /// A registered DRep votes on a GovActionId that exists in `active_proposals`
+    /// (on-chain).  The vote must NOT produce `GovActionsDoNotExist`.
+    #[test]
+    fn test_gov_actions_do_not_exist_does_not_fire_for_active_proposal() {
+        let params = conway_pparams_pv10();
+        let utxo_set = UtxoSet::new();
+
+        let active_id = GovActionId {
+            transaction_id: Hash32::from_bytes([0x99; 32]),
+            action_index: 0,
+        };
+        let active_proposal = ActiveProposal {
+            gov_action: GovAction::InfoAction,
+            return_addr: vec![0xe0; 29],
+            deposit: Lovelace(1_000_000_000),
+            expires_after_epoch: EpochNo(500),
+            proposed_in_epoch: EpochNo(490),
+        };
+        let mut active_proposals: HashMap<GovActionId, ActiveProposal> = HashMap::new();
+        active_proposals.insert(active_id.clone(), active_proposal);
+
+        let drep_voter = drep_voter_for_test();
+        let drep_hash = match &drep_voter {
+            Voter::DRep(cred) => cred.to_hash().to_hash32_padded(),
+            _ => unreachable!(),
+        };
+        let mut registered_dreps: std::collections::HashSet<Hash32> =
+            std::collections::HashSet::new();
+        registered_dreps.insert(drep_hash);
+
+        let mut votes = BTreeMap::new();
+        votes.insert(active_id.clone(), yes_vote());
+        let mut voting_procedures = BTreeMap::new();
+        voting_procedures.insert(drep_voter, votes);
+
+        let tx = make_gov_tx(vec![], voting_procedures);
+        let context = ValidationContext::new()
+            .with_active_proposals(active_proposals)
+            .with_dreps(registered_dreps);
+        let result =
+            validate_transaction_with_context(&tx, &utxo_set, &params, 100, 500, None, context);
+
+        // May fail with other errors (NoInputs, etc.) but must not contain
+        // GovActionsDoNotExist.
+        if let Err(errors) = result {
+            assert!(
+                !errors
+                    .iter()
+                    .any(|e| matches!(e, ValidationError::GovActionsDoNotExist { .. })),
+                "GovActionsDoNotExist must not fire when action is in active_proposals; \
+                 got: {errors:?}"
+            );
+        }
+    }
+
+    /// A DRep votes on a GovActionId submitted in the SAME transaction
+    /// (same-tx proposal).  Even when `active_proposals` is empty (non-None),
+    /// the vote must NOT produce `GovActionsDoNotExist` — Haskell's
+    /// `processProposal` runs before the voter-partition loop, so by the time
+    /// the vote is checked the proposal is already in `proposals`.
+    #[test]
+    fn test_gov_actions_do_not_exist_does_not_fire_for_same_tx_proposal() {
+        let params = conway_pparams_pv10();
+        let utxo_set = UtxoSet::new();
+
+        // make_gov_tx sets tx.hash = [0xAB; 32].  Local action id = (0xAB..., 0).
+        let local_id = GovActionId {
+            transaction_id: Hash32::from_bytes([0xAB; 32]),
+            action_index: 0,
+        };
+        let drep_voter = drep_voter_for_test();
+        let drep_hash = match &drep_voter {
+            Voter::DRep(cred) => cred.to_hash().to_hash32_padded(),
+            _ => unreachable!(),
+        };
+        let mut registered_dreps: std::collections::HashSet<Hash32> =
+            std::collections::HashSet::new();
+        registered_dreps.insert(drep_hash);
+
+        let mut votes = BTreeMap::new();
+        votes.insert(local_id.clone(), yes_vote());
+        let mut voting_procedures = BTreeMap::new();
+        voting_procedures.insert(drep_voter, votes);
+
+        // Tx includes the proposal — local_id belongs to this tx.
+        let tx = make_gov_tx(vec![info_proposal()], voting_procedures);
+        debug_assert_eq!(
+            tx.hash, local_id.transaction_id,
+            "make_gov_tx tx.hash must equal local_id.transaction_id"
+        );
+
+        // active_proposals is non-None but empty — the check wiring runs.
+        let context = ValidationContext::new()
+            .with_active_proposals(HashMap::new())
+            .with_dreps(registered_dreps);
+        let result =
+            validate_transaction_with_context(&tx, &utxo_set, &params, 100, 500, None, context);
+
+        if let Err(errors) = result {
+            assert!(
+                !errors
+                    .iter()
+                    .any(|e| matches!(e, ValidationError::GovActionsDoNotExist { .. })),
+                "GovActionsDoNotExist must not fire for a same-tx local proposal; \
+                 got: {errors:?}"
+            );
+        }
+    }
+
+    /// When `active_proposals` is None (not provided), the
+    /// `GovActionsDoNotExist` check is silently skipped (lenient default).
+    /// This ensures callers without ledger context do not see false positives
+    /// for votes on proposals that exist on-chain but were not plumbed in.
+    #[test]
+    fn test_gov_actions_do_not_exist_skipped_when_active_proposals_none() {
+        let params = conway_pparams_pv10();
+        let utxo_set = UtxoSet::new();
+
+        let missing_id = GovActionId {
+            transaction_id: Hash32::from_bytes([0xBB; 32]),
+            action_index: 0,
+        };
+        let drep_voter = drep_voter_for_test();
+        let drep_hash = match &drep_voter {
+            Voter::DRep(cred) => cred.to_hash().to_hash32_padded(),
+            _ => unreachable!(),
+        };
+        let mut registered_dreps: std::collections::HashSet<Hash32> =
+            std::collections::HashSet::new();
+        registered_dreps.insert(drep_hash);
+
+        let mut votes = BTreeMap::new();
+        votes.insert(missing_id.clone(), yes_vote());
+        let mut voting_procedures = BTreeMap::new();
+        voting_procedures.insert(drep_voter, votes);
+
+        let tx = make_gov_tx(vec![], voting_procedures);
+
+        // No `with_active_proposals` call — context.active_proposals = None.
+        let context = ValidationContext::new().with_dreps(registered_dreps);
+        let result =
+            validate_transaction_with_context(&tx, &utxo_set, &params, 100, 500, None, context);
+
+        if let Err(errors) = result {
+            assert!(
+                !errors
+                    .iter()
+                    .any(|e| matches!(e, ValidationError::GovActionsDoNotExist { .. })),
+                "GovActionsDoNotExist must be skipped when active_proposals is None; \
+                 got: {errors:?}"
+            );
+        }
+    }
+
+    /// Regression test: after a rollback, a vote tx whose referenced proposal
+    /// is no longer on-chain must be rejected by the governance predicate.
+    /// This simulates the exact mempool re-validation scenario fixed in
+    /// `handle_rollback_inner` (sync.rs): validate_transaction_with_context
+    /// is called with an `active_proposals` map that OMITS the rolled-back
+    /// proposal — the vote must be rejected with `GovActionsDoNotExist`.
+    #[test]
+    fn test_gov_actions_do_not_exist_rejects_vote_after_rollback() {
+        // Post-rollback state: active_proposals contains only the unrelated
+        // proposal; the proposal that was in the rolled-back block is gone.
+        let params = conway_pparams_pv10();
+        let utxo_set = UtxoSet::new();
+
+        // The rolled-back proposal — no longer in active_proposals after rollback.
+        let rolled_back_id = GovActionId {
+            transaction_id: Hash32::from_bytes([0x01; 32]),
+            action_index: 0,
+        };
+        // An unrelated on-chain proposal that survived the rollback.
+        let surviving_id = GovActionId {
+            transaction_id: Hash32::from_bytes([0x02; 32]),
+            action_index: 0,
+        };
+        let surviving_proposal = ActiveProposal {
+            gov_action: GovAction::InfoAction,
+            return_addr: vec![0xe0; 29],
+            deposit: Lovelace(1_000_000_000),
+            expires_after_epoch: EpochNo(100),
+            proposed_in_epoch: EpochNo(95),
+        };
+        // Post-rollback active_proposals: only the surviving proposal is present.
+        let mut post_rollback_proposals: HashMap<GovActionId, ActiveProposal> = HashMap::new();
+        post_rollback_proposals.insert(surviving_id.clone(), surviving_proposal);
+
+        let drep_voter = drep_voter_for_test();
+        let drep_hash = match &drep_voter {
+            Voter::DRep(cred) => cred.to_hash().to_hash32_padded(),
+            _ => unreachable!(),
+        };
+        let mut registered_dreps: std::collections::HashSet<Hash32> =
+            std::collections::HashSet::new();
+        registered_dreps.insert(drep_hash);
+
+        // Vote tx references the rolled-back proposal — should be rejected.
+        let mut votes = BTreeMap::new();
+        votes.insert(rolled_back_id.clone(), yes_vote());
+        let mut voting_procedures = BTreeMap::new();
+        voting_procedures.insert(drep_voter, votes);
+
+        let tx = make_gov_tx(vec![], voting_procedures);
+
+        // Simulate what handle_rollback_inner does after fix:
+        // validate_transaction_with_context with post-rollback active_proposals.
+        let context = ValidationContext::new()
+            .with_active_proposals(post_rollback_proposals)
+            .with_dreps(registered_dreps);
+        let result =
+            validate_transaction_with_context(&tx, &utxo_set, &params, 100, 500, None, context);
+
+        let errors = result.expect_err(
+            "expected GovActionsDoNotExist: vote on rolled-back proposal must be rejected",
+        );
+        let missing = errors
+            .iter()
+            .find_map(|e| match e {
+                ValidationError::GovActionsDoNotExist { action_ids } => Some(action_ids),
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("GovActionsDoNotExist not in error set: {errors:?}"));
+        assert!(
+            missing.contains(&rolled_back_id),
+            "GovActionsDoNotExist payload must contain the rolled-back id, got: {missing:?}"
+        );
+    }
+
     /// `IsValidTagMismatch` is a proper `ValidationError` variant and can be
     /// constructed and matched as expected.  This guards the variant definition
     /// against refactoring that accidentally removes it or changes its fields.
