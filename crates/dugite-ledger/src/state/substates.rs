@@ -44,7 +44,16 @@ pub struct CertSubState {
     pub future_pool_params: HashMap<Hash28, PoolRegistration>,
     pub pending_retirements: HashMap<Hash28, EpochNo>,
     pub reward_accounts: Arc<HashMap<Hash32, Lovelace>>,
-    pub stake_key_deposits: HashMap<Hash32, u64>,
+    /// Per-credential stake-key deposit balances.
+    ///
+    /// Wrapped in `Arc` so the per-block ValidationContext build can share the
+    /// map via `Arc::clone` (refcount bump) instead of deep-cloning ~90 k
+    /// entries on Conway+ preview.  Mutations go through `Arc::make_mut`,
+    /// which is O(1) when the refcount is 1 (the apply path's normal case)
+    /// and triggers a one-shot CoW clone only when a reader view is also
+    /// holding a reference — same pattern as `reward_accounts` /
+    /// `delegations` / `pool_params`.
+    pub stake_key_deposits: Arc<HashMap<Hash32, u64>>,
     pub pool_deposits: HashMap<Hash28, u64>,
     pub total_stake_key_deposits: u64,
     pub pointer_map: HashMap<dugite_primitives::credentials::Pointer, Hash32>,

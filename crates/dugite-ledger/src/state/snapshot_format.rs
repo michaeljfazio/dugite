@@ -173,7 +173,7 @@ pub struct LedgerStateSnapshot {
     /// Operational certificate counters per pool.
     pub opcert_counters: HashMap<Hash28, u64>,
     /// Per-credential deposit paid at stake key registration time (lovelace).
-    pub stake_key_deposits: HashMap<Hash32, u64>,
+    pub stake_key_deposits: Arc<HashMap<Hash32, u64>>,
     /// Per-pool deposit paid at pool registration time (lovelace).
     pub pool_deposits: HashMap<Hash28, u64>,
 }
@@ -194,7 +194,7 @@ impl From<&super::LedgerState> for LedgerStateSnapshot {
             future_pool_params: s.certs.future_pool_params.clone(),
             pending_retirements: s.certs.pending_retirements.clone(),
             reward_accounts: Arc::clone(&s.certs.reward_accounts),
-            stake_key_deposits: s.certs.stake_key_deposits.clone(),
+            stake_key_deposits: Arc::clone(&s.certs.stake_key_deposits),
             pool_deposits: s.certs.pool_deposits.clone(),
             total_stake_key_deposits: s.certs.total_stake_key_deposits,
             pointer_map: s.certs.pointer_map.clone(),

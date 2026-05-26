@@ -595,12 +595,10 @@ impl LedgerState {
                 .constitution
                 .as_ref()
                 .and_then(|c| c.script_hash);
-            // `stake_key_deposits` is owned by `certs`; wrap a clone in `Arc`
-            // ONCE per block.  Reading from `self.certs.stake_key_deposits`
-                // every tx (as the old code did) iterated the entire map and
-            // deep-cloned each entry — at the per-tx ValidationContext build
-            // — which is exactly the hot path we are removing.
-            let stake_key_deposits_arc = Arc::new(self.certs.stake_key_deposits.clone());
+            // `stake_key_deposits` is already `Arc<HashMap<...>>` on the
+            // ledger state (as of the second perf pass); share the existing
+            // Arc directly — no deep clone of the ~90 k-entry map.
+            let stake_key_deposits_arc = Arc::clone(&self.certs.stake_key_deposits);
             (
                 Arc::new(pools),
                 Arc::new(dreps),
