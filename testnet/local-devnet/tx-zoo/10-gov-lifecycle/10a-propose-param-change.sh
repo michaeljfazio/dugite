@@ -43,11 +43,14 @@ GOV_STATE_JSON=$(cardano-cli conway query gov-state \
     --socket-path   "$ZOO_SOCKET" 2>/dev/null || true)
 
 if [ -n "$GOV_STATE_JSON" ]; then
-    # Try to extract prevGovActionIds.PParamUpdate from enactState.
-    # cardano-cli gov-state JSON shape: .enactState.prevGovActionIds.PParamUpdate
-    # which is either null or {"txId": "...", "govActionIx": N}
+    # cardano-cli 11 emits prevGovActionIds under
+    # .nextRatifyState.nextEnactState.prevGovActionIds.PParamUpdate
+    # (Conway gov-state shape). Older cardano-cli used .enactState. Try both
+    # paths for forward/back compatibility. Value is either null or
+    # {"txId": "...", "govActionIx": N}. -c keeps the object compact so the
+    # subsequent jq calls can read txId/govActionIx fields.
     ENACTED_RAW=$(echo "$GOV_STATE_JSON" | \
-        jq -r '(.enactState.prevGovActionIds.PParamUpdate // null)' 2>/dev/null || true)
+        jq -c '(.nextRatifyState.nextEnactState.prevGovActionIds.PParamUpdate // .enactState.prevGovActionIds.PParamUpdate // null)' 2>/dev/null || true)
     if [ -n "$ENACTED_RAW" ] && [ "$ENACTED_RAW" != "null" ]; then
         PREV_TX=$(echo "$ENACTED_RAW" | jq -r '.txId')
         PREV_IDX=$(echo "$ENACTED_RAW" | jq -r '.govActionIx')
