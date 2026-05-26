@@ -2429,18 +2429,38 @@ impl Node {
             // Uses SRV-first resolution: tries `_cardano._tcp.<host>` SRV records
             // first (Haskell cardano-node behaviour), falls back to A/AAAA on
             // the original hostname if no SRV records exist.
-            use dugite_network::peer::discovery::{resolve_with_srv, HickoryDnsResolver};
-            let dns_resolver = match HickoryDnsResolver::new() {
-                Ok(r) => r,
+            use dugite_network::peer::discovery::{
+                resolve_with_srv, DnsResolver, HickoryDnsResolver, NoopDnsResolver,
+            };
+            // SRV/A/AAAA resolution is a "best effort" startup step.  If the
+            // system resolver is misconfigured (malformed `/etc/resolv.conf`,
+            // unusual nameserver entry, transient DHCP/VPN state change — on
+            // macOS the published IPv6 link-local nameserver `fe80::…%en0`
+            // is rejected by hickory with `invalid IP address syntax`),
+            // `HickoryDnsResolver::new()` returns Err.  Previously this
+            // caused the entire node-startup function to `return Ok(())`
+            // early, exiting the process cleanly with no chainsync /
+            // blockfetch server ever bound — devnet-validate boots would
+            // fail with "Socket … did not become ready within 120s" and no
+            // panic to diagnose.  Fall back to a no-op resolver instead:
+            // the literal-IP fast path in `resolve_with_srv` still
+            // resolves devnet's `127.0.0.1` peers, and ledger-peer
+            // discovery populates further peers from chain state.
+            let dns_resolver: Box<dyn DnsResolver> = match HickoryDnsResolver::new() {
+                Ok(r) => Box::new(r),
                 Err(e) => {
-                    warn!("Failed to create DNS resolver: {e}");
-                    return Ok(());
+                    warn!(
+                        error = %e,
+                        "Failed to create DNS resolver — falling back to NoopDnsResolver; \
+                         literal-IP peers still resolved, hostname peers require chain-state discovery"
+                    );
+                    Box::new(NoopDnsResolver)
                 }
             };
 
             let mut resolved_peers: Vec<std::net::SocketAddr> = Vec::new();
             for peer in &detailed_peers {
-                let addrs = resolve_with_srv(&dns_resolver, &peer.address, peer.port).await;
+                let addrs = resolve_with_srv(dns_resolver.as_ref(), &peer.address, peer.port).await;
                 if addrs.is_empty() {
                     warn!(
                         address = %peer.address,
@@ -2473,7 +2493,8 @@ impl Node {
                 });
                 let mut group_addrs = Vec::new();
                 for ap in &group.access_points {
-                    let addrs = resolve_with_srv(&dns_resolver, &ap.address, ap.port).await;
+                    let addrs =
+                        resolve_with_srv(dns_resolver.as_ref(), &ap.address, ap.port).await;
                     if addrs.is_empty() {
                         warn!(
                             address = %ap.address,
