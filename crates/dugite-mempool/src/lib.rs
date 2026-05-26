@@ -1090,11 +1090,31 @@ impl Mempool {
                 // arrival order).
                 if let (Some(slot), Some(tx_ttl)) = (forge_slot, entry.tx.body.ttl) {
                     if tx_ttl.0 <= slot.0 {
+                        // WARN: tx will be skipped from every block going
+                        // forward until evicted by the TTL-sweep task.
+                        // Logged at WARN so operators can detect mempool
+                        // accumulation of stale txs (e.g. submitted against
+                        // a slot that has already passed).
+                        warn!(
+                            target: "forge",
+                            tx   = %tx_hash,
+                            ttl  = tx_ttl.0,
+                            slot = slot.0,
+                            "TraceForgeDropTtlExpired: tx dropped from block (TTL expired at forge slot)",
+                        );
                         continue;
                     }
                 }
                 if total_size + entry.size_bytes > max_size {
                     // Block is full by size — stop (strict prefix, no skipping)
+                    debug!(
+                        target: "forge",
+                        tx        = %tx_hash,
+                        tx_bytes  = entry.size_bytes,
+                        used      = total_size,
+                        max       = max_size,
+                        "TraceForgeBlockFull: block body size limit reached, remaining txs not included",
+                    );
                     break;
                 }
 
@@ -1105,6 +1125,17 @@ impl Mempool {
                     || total_ex_steps.saturating_add(tx_steps) > max_block_ex_steps
                 {
                     // Adding this tx would exceed block ExUnit budget — stop
+                    debug!(
+                        target: "forge",
+                        tx             = %tx_hash,
+                        tx_ex_mem      = tx_mem,
+                        tx_ex_steps    = tx_steps,
+                        block_ex_mem   = total_ex_mem,
+                        block_ex_steps = total_ex_steps,
+                        max_ex_mem     = max_block_ex_mem,
+                        max_ex_steps   = max_block_ex_steps,
+                        "TraceForgeBlockExUnitsLimit: block ExUnit budget reached, remaining txs not included",
+                    );
                     break;
                 }
 
@@ -5346,5 +5377,329 @@ mod tests {
         mempool.add_tx(hash, tx, 200).expect("admit");
         mempool.remove_tx_with_reason(&hash, MempoolRemoveReason::Manual);
         assert!(!mempool.contains(&hash));
+    }
+
+    // ─── Certificate-bearing tx: mempool admit → forge include ───────────────
+    //
+    // These tests exercise the mempool admit → get_txs_for_block path for
+    // every Conway governance / staking certificate class that appeared in the
+    // 2026-05-26 devnet-validate-extended failure set:
+    //   05c UnregDRep, 05d VoteDelegation, 04e PoolRegistration,
+    //   04f PoolRetirement, 05g CommitteeHotAuth, 05h CommitteeColdResign.
+    //
+    // The mempool performs NO ledger validation of certificates — that is done
+    // by the Phase-1 validator before admission (LedgerTxValidator).  These
+    // tests therefore exercise the STRUCTURAL path: a well-formed tx carrying
+    // certificate fields is admitted, retained, and returned by the forge
+    // selection loop.  The certificate bytes do NOT affect any mempool ordering
+    // or eviction logic; a regression at the primitive level (e.g. a cert
+    // variant that fails serialization or panics on clone) would surface here.
+
+    fn make_cert_tx(cert: Certificate, id_byte: u8) -> Transaction {
+        let mut tx = make_dummy_tx();
+        let mut h = [0u8; 32];
+        h[0] = 0xCC;
+        h[1] = id_byte;
+        tx.hash = Hash32::from_bytes(h);
+        tx.body.inputs[0].transaction_id = Hash32::from_bytes({
+            let mut b = [0u8; 32];
+            b[0] = 0xDD;
+            b[1] = id_byte;
+            b
+        });
+        tx.body.certificates = vec![cert];
+        // Stake key witnesses are required for cert-bearing txs on-chain but
+        // the mempool does not verify them — wire in a placeholder so the
+        // clone path is exercised.
+        tx.witness_set.vkey_witnesses = vec![VKeyWitness {
+            vkey: vec![0u8; 32],
+            signature: vec![0u8; 64],
+        }];
+        tx
+    }
+
+    fn make_key_hash28(b: u8) -> dugite_primitives::hash::Hash28 {
+        dugite_primitives::hash::Hash28::from_bytes([b; 28])
+    }
+
+    fn make_key_hash32(b: u8) -> Hash32 {
+        Hash32::from_bytes([b; 32])
+    }
+
+    fn make_key_credential(b: u8) -> dugite_primitives::credentials::Credential {
+        dugite_primitives::credentials::Credential::VerificationKey(make_key_hash28(b))
+    }
+
+    fn make_pool_params(operator_byte: u8) -> PoolParams {
+        PoolParams {
+            operator: make_key_hash28(operator_byte),
+            vrf_keyhash: make_key_hash32(operator_byte),
+            pledge: Lovelace(1_000_000),
+            cost: Lovelace(170_000_000),
+            margin: Rational {
+                numerator: 5,
+                denominator: 100,
+            },
+            // reward_account is raw address bytes on-chain (e.g. an enterprise
+            // stake key address).  For mempool tests an arbitrary non-empty
+            // byte slice suffices — the mempool does not validate address format.
+            reward_account: vec![0u8; 29],
+            pool_owners: vec![make_key_hash28(operator_byte)],
+            relays: vec![],
+            pool_metadata: None,
+        }
+    }
+
+    /// UnregDRep (cert tag 17) — 05c-drep-deregister scenario.
+    #[test]
+    fn cert_tx_unreg_drep_admitted_and_forged() {
+        let mempool = Mempool::new(default_config());
+        let cert = Certificate::UnregDRep {
+            credential: make_key_credential(0x01),
+            refund: Lovelace(500_000_000),
+        };
+        let tx = make_cert_tx(cert, 0x01);
+        let hash = tx.hash;
+        mempool
+            .add_tx(hash, tx, 500)
+            .expect("UnregDRep tx must be admitted");
+        assert!(mempool.contains(&hash), "mempool must retain UnregDRep tx");
+
+        let selected =
+            mempool.get_txs_for_block_with_ex_units_at(500, 16_000_000, u64::MAX, u64::MAX, None);
+
+        assert_eq!(selected.len(), 1, "UnregDRep tx must be returned for forge");
+        assert!(
+            matches!(
+                &selected[0].body.certificates[0],
+                Certificate::UnregDRep { .. }
+            ),
+            "selected tx must carry the UnregDRep cert"
+        );
+    }
+
+    /// VoteDelegation (cert tag 9) — 05d-vote-deleg-drep scenario.
+    #[test]
+    fn cert_tx_vote_delegation_admitted_and_forged() {
+        let mempool = Mempool::new(default_config());
+        let cert = Certificate::VoteDelegation {
+            credential: make_key_credential(0x02),
+            drep: DRep::KeyHash(make_key_hash28(0xAB).to_hash32_padded()),
+        };
+        let tx = make_cert_tx(cert, 0x02);
+        let hash = tx.hash;
+        mempool
+            .add_tx(hash, tx, 500)
+            .expect("VoteDelegation tx must be admitted");
+        assert!(mempool.contains(&hash));
+
+        let selected =
+            mempool.get_txs_for_block_with_ex_units_at(500, 16_000_000, u64::MAX, u64::MAX, None);
+
+        assert_eq!(
+            selected.len(),
+            1,
+            "VoteDelegation tx must be returned for forge"
+        );
+        assert!(
+            matches!(
+                &selected[0].body.certificates[0],
+                Certificate::VoteDelegation { .. }
+            ),
+            "selected tx must carry the VoteDelegation cert"
+        );
+    }
+
+    /// PoolRegistration (cert tag 3) — 04e-pool-register scenario.
+    #[test]
+    fn cert_tx_pool_registration_admitted_and_forged() {
+        let mempool = Mempool::new(default_config());
+        let cert = Certificate::PoolRegistration(make_pool_params(0x03));
+        let tx = make_cert_tx(cert, 0x03);
+        let hash = tx.hash;
+        mempool
+            .add_tx(hash, tx, 500)
+            .expect("PoolRegistration tx must be admitted");
+        assert!(mempool.contains(&hash));
+
+        let selected =
+            mempool.get_txs_for_block_with_ex_units_at(500, 16_000_000, u64::MAX, u64::MAX, None);
+
+        assert_eq!(
+            selected.len(),
+            1,
+            "PoolRegistration tx must be returned for forge"
+        );
+        assert!(
+            matches!(
+                &selected[0].body.certificates[0],
+                Certificate::PoolRegistration(_)
+            ),
+            "selected tx must carry the PoolRegistration cert"
+        );
+    }
+
+    /// PoolRetirement (cert tag 4) — 04f-pool-retire scenario.
+    #[test]
+    fn cert_tx_pool_retirement_admitted_and_forged() {
+        let mempool = Mempool::new(default_config());
+        let cert = Certificate::PoolRetirement {
+            pool_hash: make_key_hash28(0x05),
+            epoch: 42,
+        };
+        let tx = make_cert_tx(cert, 0x05);
+        let hash = tx.hash;
+        mempool
+            .add_tx(hash, tx, 500)
+            .expect("PoolRetirement tx must be admitted");
+        assert!(mempool.contains(&hash));
+
+        let selected =
+            mempool.get_txs_for_block_with_ex_units_at(500, 16_000_000, u64::MAX, u64::MAX, None);
+
+        assert_eq!(
+            selected.len(),
+            1,
+            "PoolRetirement tx must be returned for forge"
+        );
+        assert!(
+            matches!(
+                &selected[0].body.certificates[0],
+                Certificate::PoolRetirement { .. }
+            ),
+            "selected tx must carry the PoolRetirement cert"
+        );
+    }
+
+    /// CommitteeHotAuth (cert tag 14) — 05g-cc-hot-key-authorization scenario.
+    #[test]
+    fn cert_tx_committee_hot_auth_admitted_and_forged() {
+        let mempool = Mempool::new(default_config());
+        let cert = Certificate::CommitteeHotAuth {
+            cold_credential: make_key_credential(0x06),
+            hot_credential: make_key_credential(0x07),
+        };
+        let tx = make_cert_tx(cert, 0x06);
+        let hash = tx.hash;
+        mempool
+            .add_tx(hash, tx, 500)
+            .expect("CommitteeHotAuth tx must be admitted");
+        assert!(mempool.contains(&hash));
+
+        let selected =
+            mempool.get_txs_for_block_with_ex_units_at(500, 16_000_000, u64::MAX, u64::MAX, None);
+
+        assert_eq!(
+            selected.len(),
+            1,
+            "CommitteeHotAuth tx must be returned for forge"
+        );
+        assert!(
+            matches!(
+                &selected[0].body.certificates[0],
+                Certificate::CommitteeHotAuth { .. }
+            ),
+            "selected tx must carry the CommitteeHotAuth cert"
+        );
+    }
+
+    /// CommitteeColdResign (cert tag 15) — 05h-cc-resign scenario.
+    #[test]
+    fn cert_tx_committee_cold_resign_admitted_and_forged() {
+        let mempool = Mempool::new(default_config());
+        let cert = Certificate::CommitteeColdResign {
+            cold_credential: make_key_credential(0x08),
+            anchor: None,
+        };
+        let tx = make_cert_tx(cert, 0x08);
+        let hash = tx.hash;
+        mempool
+            .add_tx(hash, tx, 500)
+            .expect("CommitteeColdResign tx must be admitted");
+        assert!(mempool.contains(&hash));
+
+        let selected =
+            mempool.get_txs_for_block_with_ex_units_at(500, 16_000_000, u64::MAX, u64::MAX, None);
+
+        assert_eq!(
+            selected.len(),
+            1,
+            "CommitteeColdResign tx must be returned for forge"
+        );
+        assert!(
+            matches!(
+                &selected[0].body.certificates[0],
+                Certificate::CommitteeColdResign { .. }
+            ),
+            "selected tx must carry the CommitteeColdResign cert"
+        );
+    }
+
+    /// Multi-cert tx: StakeDelegation + PoolRegistration in a single tx
+    /// (the pattern used by 04e-pool-register which submits both certs
+    /// together to avoid separate UTxO chaining).
+    #[test]
+    fn cert_tx_multi_cert_stake_deleg_plus_pool_reg_admitted_and_forged() {
+        let mempool = Mempool::new(default_config());
+        let mut tx = make_cert_tx(
+            Certificate::StakeDelegation {
+                credential: make_key_credential(0x09),
+                pool_hash: make_key_hash28(0x0A),
+            },
+            0x09,
+        );
+        // Append the second cert to the same tx body.
+        tx.body
+            .certificates
+            .push(Certificate::PoolRegistration(make_pool_params(0x0A)));
+        let hash = tx.hash;
+        mempool
+            .add_tx(hash, tx, 600)
+            .expect("multi-cert tx must be admitted");
+        assert!(mempool.contains(&hash));
+
+        let selected =
+            mempool.get_txs_for_block_with_ex_units_at(500, 16_000_000, u64::MAX, u64::MAX, None);
+
+        assert_eq!(
+            selected.len(),
+            1,
+            "multi-cert tx must be returned for forge"
+        );
+        assert_eq!(
+            selected[0].body.certificates.len(),
+            2,
+            "both certs must survive the mempool round-trip"
+        );
+    }
+
+    /// Cert txs are NOT excluded by a forge-slot TTL filter when they carry
+    /// no TTL.  A Conway governance cert tx typically has no explicit TTL set.
+    #[test]
+    fn cert_tx_no_ttl_included_at_any_forge_slot() {
+        let mempool = Mempool::new(default_config());
+        let cert = Certificate::UnregDRep {
+            credential: make_key_credential(0x10),
+            refund: Lovelace(500_000_000),
+        };
+        let tx = make_cert_tx(cert, 0x10);
+        assert!(tx.body.ttl.is_none(), "cert tx must have no TTL by default");
+        let hash = tx.hash;
+        mempool.add_tx(hash, tx, 500).expect("admit");
+
+        // Even with a very high forge slot, a cert tx with no TTL must be included.
+        let selected = mempool.get_txs_for_block_with_ex_units_at(
+            500,
+            16_000_000,
+            u64::MAX,
+            u64::MAX,
+            Some(dugite_primitives::time::SlotNo(u64::MAX / 2)),
+        );
+
+        assert_eq!(
+            selected.len(),
+            1,
+            "cert tx with no TTL must never be excluded by the TTL guard"
+        );
     }
 }
