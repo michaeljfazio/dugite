@@ -496,6 +496,7 @@ impl ChainSyncServer {
         channel: &mut MuxChannel,
         block_provider: &B,
     ) -> Result<bool, ProtocolError> {
+        let task_id = self as *const _ as usize;
         // ── Cursor revalidation (Bug J) ─────────────────────────────────────
         // Skip when the cursor is at Origin — the all-zero hash is by design
         // not a stored block, so `is_on_chain` would always be false and we'd
@@ -511,6 +512,7 @@ impl ChainSyncServer {
                 },
             };
             tracing::info!(
+                task_id,
                 cursor_slot = self.cursor_slot,
                 rewind_slot = rb.slot,
                 "chainsync server: cursor rolled off chain; \
@@ -523,11 +525,21 @@ impl ChainSyncServer {
         // When cursor_at_origin is true, use the inclusive `>=` lookup so that
         // a block at slot 0 is not skipped.  The strict `>` lookup would miss
         // it since cursor_slot is 0.
+        let lookup_start = std::time::Instant::now();
         let next_block = if self.cursor_at_origin {
             block_provider.get_block_at_or_after_slot(0)
         } else {
             block_provider.get_next_block_after_slot(self.cursor_slot)
         };
+        let lookup_elapsed = lookup_start.elapsed();
+        if lookup_elapsed.as_millis() > 50 {
+            tracing::warn!(
+                task_id,
+                cursor_slot = self.cursor_slot,
+                elapsed_ms = lookup_elapsed.as_millis() as u64,
+                "chainsync server: block_provider lookup slow"
+            );
+        }
 
         let Some((slot, hash, block_cbor)) = next_block else {
             return Ok(false);
@@ -549,7 +561,26 @@ impl ChainSyncServer {
             tip_hash: tip.hash,
             tip_block_number: tip.block_number,
         });
-        channel.send(response).await.map_err(ProtocolError::from)?;
+        let send_start = std::time::Instant::now();
+        let send_result = channel.send(response).await;
+        let send_elapsed = send_start.elapsed();
+        if send_elapsed.as_millis() > 100 {
+            tracing::warn!(
+                task_id,
+                cursor_slot = self.cursor_slot,
+                serve_slot = slot,
+                send_elapsed_ms = send_elapsed.as_millis() as u64,
+                ok = send_result.is_ok(),
+                "chainsync server: MsgRollForward send slow"
+            );
+        }
+        send_result.map_err(ProtocolError::from)?;
+        tracing::info!(
+            task_id,
+            cursor_slot = self.cursor_slot,
+            serve_slot = slot,
+            "chainsync server: served MsgRollForward"
+        );
 
         // Advance cursor and — critically — clear cursor_at_origin so the
         // next MsgRequestNext uses the strict `>` lookup and does not
