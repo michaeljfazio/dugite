@@ -459,6 +459,184 @@ impl LedgerState {
         let block_era = block.era;
         let cached_params = self.epochs.protocol_params.clone();
 
+        // ── Block-level validation registry snapshot ─────────────────────
+        //
+        // Phase-1 / Phase-2 validation needs read-only views of several
+        // ledger registries (pool params, DRep set, committee state,
+        // reward accounts, etc.).  These do NOT change during the tx
+        // loop — cert/gov apply is the LAST step per tx (see Step 8b
+        // below) and validation reads from the pre-tx snapshot, so we
+        // build each registry exactly ONCE per block and share it across
+        // every transaction via `Arc::clone` (O(1) refcount bump).
+        //
+        // Previously these were rebuilt from scratch per-tx (one
+        // `.keys().copied().collect()` per registry), and the
+        // ValidationContext deep-cloned every entry including the
+        // ~90 k-entry `reward_accounts` HashMap — ~400 k hash-table
+        // entries copied per block on Babbage/Conway preview.  That
+        // memcpy alone dominated block-apply time on a fast machine
+        // (100-200 ms / block ≈ ~2 blocks/sec end-to-end).  The
+        // hoist + Arc share collapses that to micro-seconds per block.
+        #[allow(clippy::type_complexity)]
+        let (
+            block_registered_pool_ids,
+            block_registered_drep_ids,
+            block_registered_vrf_keys,
+            block_committee_member_keys,
+            block_committee_resigned_keys,
+            block_vote_delegation_keys,
+            block_active_proposals,
+            block_committee_authorized_hot_keys,
+            block_committee_authorized_elected_hot_keys,
+            block_stake_key_deposits_arc,
+            block_constitution_script_hash,
+        ): (
+            std::sync::Arc<std::collections::HashSet<dugite_primitives::hash::Hash28>>,
+            std::sync::Arc<std::collections::HashSet<dugite_primitives::hash::Hash32>>,
+            std::sync::Arc<
+                std::collections::HashMap<
+                    dugite_primitives::hash::Hash32,
+                    dugite_primitives::hash::Hash28,
+                >,
+            >,
+            std::sync::Arc<std::collections::HashSet<dugite_primitives::hash::Hash32>>,
+            std::sync::Arc<std::collections::HashSet<dugite_primitives::hash::Hash32>>,
+            std::sync::Arc<std::collections::HashSet<dugite_primitives::hash::Hash32>>,
+            std::sync::Arc<
+                std::collections::HashMap<
+                    dugite_primitives::transaction::GovActionId,
+                    crate::validation::ActiveProposal,
+                >,
+            >,
+            std::sync::Arc<std::collections::HashSet<dugite_primitives::hash::Hash32>>,
+            std::sync::Arc<std::collections::HashSet<dugite_primitives::hash::Hash32>>,
+            std::sync::Arc<std::collections::HashMap<dugite_primitives::hash::Hash32, u64>>,
+            Option<dugite_primitives::hash::Hash28>,
+        ) = if mode == BlockValidationMode::ValidateAll {
+            use std::collections::{HashMap, HashSet};
+            use std::sync::Arc;
+            let pools: HashSet<dugite_primitives::hash::Hash28> =
+                self.certs.pool_params.keys().copied().collect();
+            let dreps: HashSet<dugite_primitives::hash::Hash32> =
+                self.gov.governance.dreps.keys().copied().collect();
+            let vrf_keys: HashMap<
+                dugite_primitives::hash::Hash32,
+                dugite_primitives::hash::Hash28,
+            > = self
+                .certs
+                .pool_params
+                .values()
+                .map(|reg| (reg.vrf_keyhash, reg.pool_id))
+                .collect();
+            let committee_members: HashSet<dugite_primitives::hash::Hash32> = self
+                .gov
+                .governance
+                .committee_expiration
+                .keys()
+                .copied()
+                .collect();
+            let committee_resigned: HashSet<dugite_primitives::hash::Hash32> = self
+                .gov
+                .governance
+                .committee_resigned
+                .keys()
+                .copied()
+                .collect();
+            let vote_delegations: HashSet<dugite_primitives::hash::Hash32> = self
+                .gov
+                .governance
+                .vote_delegations
+                .keys()
+                .copied()
+                .collect();
+            let active_proposals: HashMap<
+                dugite_primitives::transaction::GovActionId,
+                crate::validation::ActiveProposal,
+            > = self
+                .gov
+                .governance
+                .proposals
+                .iter()
+                .map(|(id, state)| {
+                    (
+                        id.clone(),
+                        crate::validation::ActiveProposal {
+                            gov_action: state.procedure.gov_action.clone(),
+                            return_addr: state.procedure.return_addr.clone(),
+                            deposit: state.procedure.deposit,
+                            expires_after_epoch: state.expires_epoch,
+                            proposed_in_epoch: state.proposed_epoch,
+                        },
+                    )
+                })
+                .collect();
+            let committee_authorized_hot_keys: HashSet<dugite_primitives::hash::Hash32> = self
+                .gov
+                .governance
+                .committee_hot_keys
+                .values()
+                .copied()
+                .collect();
+            let committee_authorized_elected_hot_keys: HashSet<
+                dugite_primitives::hash::Hash32,
+            > = self
+                .gov
+                .governance
+                .committee_hot_keys
+                .iter()
+                .filter(|(cold, _)| {
+                    self.gov.governance.committee_expiration.contains_key(*cold)
+                })
+                .map(|(_, hot)| *hot)
+                .collect();
+            let constitution_script_hash = self
+                .gov
+                .governance
+                .constitution
+                .as_ref()
+                .and_then(|c| c.script_hash);
+            // `stake_key_deposits` is owned by `certs`; wrap a clone in `Arc`
+            // ONCE per block.  Reading from `self.certs.stake_key_deposits`
+                // every tx (as the old code did) iterated the entire map and
+            // deep-cloned each entry — at the per-tx ValidationContext build
+            // — which is exactly the hot path we are removing.
+            let stake_key_deposits_arc = Arc::new(self.certs.stake_key_deposits.clone());
+            (
+                Arc::new(pools),
+                Arc::new(dreps),
+                Arc::new(vrf_keys),
+                Arc::new(committee_members),
+                Arc::new(committee_resigned),
+                Arc::new(vote_delegations),
+                Arc::new(active_proposals),
+                Arc::new(committee_authorized_hot_keys),
+                Arc::new(committee_authorized_elected_hot_keys),
+                stake_key_deposits_arc,
+                constitution_script_hash,
+            )
+        } else {
+            // ApplyOnly path doesn't enter the per-tx validation arm — we
+            // still need to satisfy the type, so populate with empty Arcs.
+            use std::collections::{HashMap, HashSet};
+            use std::sync::Arc;
+            (
+                Arc::new(HashSet::new()),
+                Arc::new(HashSet::new()),
+                Arc::new(HashMap::new()),
+                Arc::new(HashSet::new()),
+                Arc::new(HashSet::new()),
+                Arc::new(HashSet::new()),
+                Arc::new(HashMap::new()),
+                Arc::new(HashSet::new()),
+                Arc::new(HashSet::new()),
+                Arc::new(HashMap::new()),
+                None,
+            )
+        };
+        // `reward_accounts` is already `Arc<HashMap<...>>` on `certs`; just
+        // share the existing Arc — no deep clone of the ~90 k-entry map.
+        let block_reward_accounts_arc = std::sync::Arc::clone(&self.certs.reward_accounts);
+
         // ── Step 8: Per-transaction processing loop ───────────────────────
         for (tx_idx, tx) in block.transactions.iter().enumerate() {
             if !processed_tx_hashes.insert(tx.hash) {
@@ -562,128 +740,42 @@ impl LedgerState {
 
                     // Full Phase-1 + Phase-2 validation
                     let tx_size = tx.raw_cbor.as_ref().map_or(0, |c| c.len() as u64);
-                    let registered_pool_ids: std::collections::HashSet<
-                        dugite_primitives::hash::Hash28,
-                    > = self.certs.pool_params.keys().copied().collect();
-                    let registered_drep_ids: std::collections::HashSet<
-                        dugite_primitives::hash::Hash32,
-                    > = self.gov.governance.dreps.keys().copied().collect();
-                    let registered_vrf_keys: std::collections::HashMap<
-                        dugite_primitives::hash::Hash32,
-                        dugite_primitives::hash::Hash28,
-                    > = self
-                        .certs
-                        .pool_params
-                        .values()
-                        .map(|reg| (reg.vrf_keyhash, reg.pool_id))
-                        .collect();
-                    let committee_member_keys: std::collections::HashSet<
-                        dugite_primitives::hash::Hash32,
-                    > = self
-                        .gov
-                        .governance
-                        .committee_expiration
-                        .keys()
-                        .copied()
-                        .collect();
-                    let committee_resigned_keys: std::collections::HashSet<
-                        dugite_primitives::hash::Hash32,
-                    > = self
-                        .gov
-                        .governance
-                        .committee_resigned
-                        .keys()
-                        .copied()
-                        .collect();
-                    let constitution_script_hash = self
-                        .gov
-                        .governance
-                        .constitution
-                        .as_ref()
-                        .and_then(|c| c.script_hash);
-                    // Build the set of vote delegation credential hashes for the
-                    // ConwayWdrlNotDelegatedToDRep check (PV >= 10 only).
-                    let vote_delegation_keys: std::collections::HashSet<
-                        dugite_primitives::hash::Hash32,
-                    > = self
-                        .gov
-                        .governance
-                        .vote_delegations
-                        .keys()
-                        .copied()
-                        .collect();
-                    // Conway GOV-rule snapshots — required for the
-                    // `VotersDoNotExist` / `GovActionsDoNotExist` /
-                    // `DisallowedVoters` / `VotingOnExpiredGovAction` /
-                    // `UnelectedCommitteeVoters` predicates to fire at
-                    // block-apply time.  Without these the apply path
-                    // accepts blocks containing votes whose action has
-                    // just been ratified-and-removed at the epoch
-                    // boundary — exactly the divergence with cardano-node
-                    // that produced the slot-800 `GovActionsDoNotExist`
-                    // chain stall on the local devnet.
-                    let active_proposals: std::collections::HashMap<
-                        dugite_primitives::transaction::GovActionId,
-                        crate::validation::ActiveProposal,
-                    > = self
-                        .gov
-                        .governance
-                        .proposals
-                        .iter()
-                        .map(|(id, state)| {
-                            (
-                                id.clone(),
-                                crate::validation::ActiveProposal {
-                                    gov_action: state.procedure.gov_action.clone(),
-                                    return_addr: state.procedure.return_addr.clone(),
-                                    deposit: state.procedure.deposit,
-                                    expires_after_epoch: state.expires_epoch,
-                                    proposed_in_epoch: state.proposed_epoch,
-                                },
-                            )
-                        })
-                        .collect();
-                    let committee_authorized_hot_keys: std::collections::HashSet<
-                        dugite_primitives::hash::Hash32,
-                    > = self
-                        .gov
-                        .governance
-                        .committee_hot_keys
-                        .values()
-                        .copied()
-                        .collect();
-                    let committee_authorized_elected_hot_keys: std::collections::HashSet<
-                        dugite_primitives::hash::Hash32,
-                    > = self
-                        .gov
-                        .governance
-                        .committee_hot_keys
-                        .iter()
-                        .filter(|(cold, _)| {
-                            self.gov.governance.committee_expiration.contains_key(*cold)
-                        })
-                        .map(|(_, hot)| *hot)
-                        .collect();
+                    // All ValidationContext registries are pre-built once per
+                    // block above (see "Block-level validation registry
+                    // snapshot").  Per-tx construction is just `Arc::clone`
+                    // refcount bumps — no hash-table allocation or copying.
                     let mut ctx = crate::validation::ValidationContext::new()
-                        .with_active_proposals(active_proposals)
-                        .with_committee_authorized_hot_keys(committee_authorized_hot_keys)
-                        .with_committee_authorized_elected_hot_keys(
-                            committee_authorized_elected_hot_keys,
-                        )
-                        .with_pools(registered_pool_ids.clone())
-                        .with_dreps(registered_drep_ids.clone())
-                        .with_vrf_keys(registered_vrf_keys.clone())
-                        .with_committee_members(committee_member_keys.clone())
-                        .with_committee_resigned(committee_resigned_keys.clone())
+                        .with_active_proposals_arc(std::sync::Arc::clone(&block_active_proposals))
+                        .with_committee_authorized_hot_keys_arc(std::sync::Arc::clone(
+                            &block_committee_authorized_hot_keys,
+                        ))
+                        .with_committee_authorized_elected_hot_keys_arc(std::sync::Arc::clone(
+                            &block_committee_authorized_elected_hot_keys,
+                        ))
+                        .with_pools_arc(std::sync::Arc::clone(&block_registered_pool_ids))
+                        .with_dreps_arc(std::sync::Arc::clone(&block_registered_drep_ids))
+                        .with_vrf_keys_arc(std::sync::Arc::clone(&block_registered_vrf_keys))
+                        .with_committee_members_arc(std::sync::Arc::clone(
+                            &block_committee_member_keys,
+                        ))
+                        .with_committee_resigned_arc(std::sync::Arc::clone(
+                            &block_committee_resigned_keys,
+                        ))
                         .with_treasury(self.epochs.treasury.0)
-                        .with_reward_accounts((*self.certs.reward_accounts).clone())
+                        .with_reward_accounts_arc(std::sync::Arc::clone(
+                            &block_reward_accounts_arc,
+                        ))
                         .with_epoch(self.epoch.0)
-                        .with_stake_key_deposits(self.certs.stake_key_deposits.clone())
-                        .with_vote_delegations(vote_delegation_keys.clone());
+                        .with_stake_key_deposits_arc(std::sync::Arc::clone(
+                            &block_stake_key_deposits_arc,
+                        ))
+                        .with_vote_delegations_arc(std::sync::Arc::clone(
+                            &block_vote_delegation_keys,
+                        ));
                     if let Some(net) = self.node_network {
                         ctx = ctx.with_network(net);
                     }
-                    if let Some(h) = constitution_script_hash {
+                    if let Some(h) = block_constitution_script_hash {
                         ctx = ctx.with_constitution_script_hash(h);
                     }
                     let result = crate::validation::validate_transaction_with_context(
