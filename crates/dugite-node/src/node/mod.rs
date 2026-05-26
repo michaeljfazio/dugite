@@ -4627,6 +4627,19 @@ impl Node {
                     let is_era_transition = ls.pending_era_transition.is_some();
                     if at_tip || is_era_transition {
                         self.publish_ledger_view(&ls);
+                    } else {
+                        // We're catching up — skip the heavy LedgerView Arc
+                        // materialization (the whole point of the gate) but
+                        // we MUST still notify `ledger_tip_slot_tx`
+                        // subscribers, otherwise per-peer ChainSync tasks
+                        // parked on forecast-horizon exhaustion (#654)
+                        // never wake up.  In practice they hit the 60 s
+                        // suspension cap and disconnect, peers cycle
+                        // through `header slot N beyond forecast horizon
+                        // after 60s suspension; disconnecting`, and the
+                        // node stalls with zero hot peers — exactly the
+                        // regression observed before this branch added it.
+                        let _ = self.ledger_tip_slot_tx.send(local_tip);
                     }
                     // Consume pending era transition and propagate to the HFC state machine.
                     if let Some((prev_era, new_era, epoch)) = ls.pending_era_transition.take() {
