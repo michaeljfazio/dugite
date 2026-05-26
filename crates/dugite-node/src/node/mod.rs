@@ -4588,10 +4588,46 @@ impl Node {
                 tokio::task::block_in_place(|| ls.apply_block_with_delta(&block, validation_mode));
             match apply_result {
                 Ok(delta) => {
-                    // Publish the lock-free read view immediately after
-                    // apply (issue #651 P2 / #652 P0) — readers see the
-                    // new tip without acquiring the ledger lock.
-                    self.publish_ledger_view(&ls);
+                    // Publish the lock-free read view (issue #651 P2 / #652 P0)
+                    // — readers see the new tip without acquiring the ledger
+                    // lock.
+                    //
+                    // **Catch-up gate (#698).**  Publishing on every block
+                    // during from-genesis network sync was a major perf hit:
+                    // the LedgerView holds `Arc::clone(&certs.reward_accounts)`
+                    // and friends, so after the publish the source Arc's
+                    // refcount is 2.  The next block's first cert mutation
+                    // calls `Arc::make_mut(&mut certs.reward_accounts)` which
+                    // CoW-deep-clones the entire ~90 k-entry HashMap because
+                    // it sees refcount > 1.  Across the four Arc-shared maps
+                    // (reward_accounts, delegations, stake_key_deposits,
+                    // pool_params) that was ~14 MB of memcpy per block on
+                    // Babbage/Conway preview — far more than block apply
+                    // itself takes.
+                    //
+                    // No external reader is querying us while we're
+                    // catching up (we're behind tip, our view is stale
+                    // anyway), so we skip the publish until we're inside
+                    // the stability window of the peer-reported tip.  When
+                    // we *are* at tip, every block publishes — the same
+                    // behaviour as before — so latency-sensitive callers
+                    // (forging, RPC) see the live view.
+                    let peer_tip = self.metrics.get_peer_tip();
+                    let local_tip = block_slot.0;
+                    let stability_window = dugite_consensus::stability_window_slots(
+                        self.consensus.security_param,
+                        self.consensus.active_slot_coeff,
+                    );
+                    let at_tip =
+                        peer_tip == 0 || local_tip.saturating_add(stability_window) >= peer_tip;
+                    // Always publish on era / epoch transitions even during
+                    // catch-up so consumers that key off those (epoch
+                    // metrics, era history watchers) get a current view at
+                    // boundary blocks.
+                    let is_era_transition = ls.pending_era_transition.is_some();
+                    if at_tip || is_era_transition {
+                        self.publish_ledger_view(&ls);
+                    }
                     // Consume pending era transition and propagate to the HFC state machine.
                     if let Some((prev_era, new_era, epoch)) = ls.pending_era_transition.take() {
                         let mut eh = self.era_history.write().await;
