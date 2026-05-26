@@ -103,13 +103,17 @@ impl LedgerState {
 
         // --- Check 3: prev_action_id validation at submission ---
         //
-        // Per Haskell's GOV rule, `prevActionAsExpected` is checked at proposal submission
-        // (not only at ratification). The proposal's prev_action_id must either:
-        //   (a) match the last enacted action of the same purpose, or
-        //   (b) reference an active proposal already in the proposals map.
+        // Per Haskell `proposalsAddAction` (Proposals.hs), a proposal's prev_action_id
+        // must satisfy one of two conditions:
         //
-        // This mirrors `prevActionAsExpected` used in Ratify.hs but applied here at
-        // submission so invalid chains are dropped before they occupy governance state.
+        //   (a) prev_action_id = None  AND  enacted root for this purpose is also None
+        //       (genesis root — first ever proposal of this type)
+        //   (b) prev_action_id = Some(id)  AND  id matches the last enacted action of the
+        //       same purpose  OR  id is an active (in-flight) proposal
+        //
+        // Haskell: `parent == ps ^. pRootsL . govRelationL . prRootL` covers case (a);
+        // `SJust parentId <- parent, Map.member parentId graph` covers case (b).
+        // Anything else fires `InvalidPrevGovActionId` (tag 8).
         let prev_id = match &proposal.gov_action {
             GovAction::ParameterChange { prev_action_id, .. }
             | GovAction::HardForkInitiation { prev_action_id, .. }
@@ -118,22 +122,42 @@ impl LedgerState {
             | GovAction::NewConstitution { prev_action_id, .. } => prev_action_id.as_ref(),
             GovAction::TreasuryWithdrawals { .. } | GovAction::InfoAction => None,
         };
-        if let Some(prev) = prev_id {
-            // Allowed if: (a) it references the last enacted root of this purpose, OR
-            //             (b) it references an active (in-flight) proposal.
-            let valid_root =
-                prev_action_matches_enacted_root(&proposal.gov_action, prev, &self.gov.governance);
-            let in_flight = self.gov.governance.proposals.contains_key(prev);
-            if !valid_root && !in_flight {
-                debug!(
-                    tx = %tx_hash.to_hex(),
-                    action_index,
-                    prev_action = %prev.transaction_id.to_hex(),
-                    prev_index = prev.action_index,
-                    "InvalidPrevActionId: proposal's prev_action_id is neither an active proposal nor the last enacted action of this purpose"
+        match prev_id {
+            None => {
+                // Case (a): genesis root proposal. Valid only when no prior action of
+                // this purpose has been enacted. Per Haskell, SNothing only matches the
+                // purpose tree root when prRootL is also SNothing.
+                if !genesis_root_is_valid(&proposal.gov_action, &self.gov.governance) {
+                    debug!(
+                        tx = %tx_hash.to_hex(),
+                        action_index,
+                        action_type = ?std::mem::discriminant(&proposal.gov_action),
+                        "InvalidPrevGovActionId: genesis-root proposal (prev_action_id=None) \
+                         rejected because the purpose already has an enacted root"
+                    );
+                    return;
+                }
+            }
+            Some(prev) => {
+                // Case (b): Allowed if: (i) it references the last enacted root of this
+                // purpose, OR (ii) it references an active (in-flight) proposal.
+                let valid_root = prev_action_matches_enacted_root(
+                    &proposal.gov_action,
+                    prev,
+                    &self.gov.governance,
                 );
-                // Drop proposal — do not insert into active proposals
-                return;
+                let in_flight = self.gov.governance.proposals.contains_key(prev);
+                if !valid_root && !in_flight {
+                    debug!(
+                        tx = %tx_hash.to_hex(),
+                        action_index,
+                        prev_action = %prev.transaction_id.to_hex(),
+                        prev_index = prev.action_index,
+                        "InvalidPrevGovActionId: prev_action_id is neither an active \
+                         proposal nor the last enacted action of this purpose"
+                    );
+                    return;
+                }
             }
         }
 
@@ -399,8 +423,15 @@ impl LedgerState {
 
         // --- Check 3: prev_action_id validation at submission ---
         //
-        // The proposal's prev_action_id must either reference the last enacted action
-        // of the same purpose or an active (in-flight) proposal.
+        // Per Haskell `proposalsAddAction` (Proposals.hs), a proposal's prev_action_id
+        // must satisfy one of two conditions:
+        //
+        //   (a) prev_action_id = None  AND  enacted root for this purpose is also None
+        //       (genesis root — first ever proposal of this type)
+        //   (b) prev_action_id = Some(id)  AND  id matches the last enacted action of the
+        //       same purpose  OR  id is an active (in-flight) proposal
+        //
+        // Mirrors the identical check in `process_proposal`.
         let prev_id = match &proposal.gov_action {
             GovAction::ParameterChange { prev_action_id, .. }
             | GovAction::HardForkInitiation { prev_action_id, .. }
@@ -409,19 +440,37 @@ impl LedgerState {
             | GovAction::NewConstitution { prev_action_id, .. } => prev_action_id.as_ref(),
             GovAction::TreasuryWithdrawals { .. } | GovAction::InfoAction => None,
         };
-        if let Some(prev) = prev_id {
-            let valid_root =
-                prev_action_matches_enacted_root(&proposal.gov_action, prev, &self.gov.governance);
-            let in_flight = self.gov.governance.proposals.contains_key(prev);
-            if !valid_root && !in_flight {
-                debug!(
-                    tx = %tx_hash.to_hex(),
-                    action_index,
-                    prev_action = %prev.transaction_id.to_hex(),
-                    prev_index = prev.action_index,
-                    "InvalidPrevActionId: proposal's prev_action_id is neither an active proposal nor the last enacted action of this purpose"
+        match prev_id {
+            None => {
+                if !genesis_root_is_valid(&proposal.gov_action, &self.gov.governance) {
+                    debug!(
+                        tx = %tx_hash.to_hex(),
+                        action_index,
+                        action_type = ?std::mem::discriminant(&proposal.gov_action),
+                        "InvalidPrevGovActionId: genesis-root proposal (prev_action_id=None) \
+                         rejected because the purpose already has an enacted root"
+                    );
+                    return;
+                }
+            }
+            Some(prev) => {
+                let valid_root = prev_action_matches_enacted_root(
+                    &proposal.gov_action,
+                    prev,
+                    &self.gov.governance,
                 );
-                return;
+                let in_flight = self.gov.governance.proposals.contains_key(prev);
+                if !valid_root && !in_flight {
+                    debug!(
+                        tx = %tx_hash.to_hex(),
+                        action_index,
+                        prev_action = %prev.transaction_id.to_hex(),
+                        prev_index = prev.action_index,
+                        "InvalidPrevGovActionId: prev_action_id is neither an active \
+                         proposal nor the last enacted action of this purpose"
+                    );
+                    return;
+                }
             }
         }
 
@@ -3370,6 +3419,37 @@ fn update_enacted_root_local(
     }
 }
 
+/// Check whether a "genesis root" proposal (`prev_action_id = None`) is valid at
+/// submission time for the given governance action type.
+///
+/// Per Haskell `proposalsAddAction` (`Proposals.hs`):
+///   `parent == ps ^. pRootsL . govRelationL . prRootL`
+///
+/// When `prev_action_id = SNothing` (None), the check passes only when the
+/// purpose tree's current root is also `SNothing` (i.e. no proposal of this type
+/// has ever been enacted).  If the root is `SJust id` (already enacted once),
+/// the `SNothing` proposal has a stale parent and must be rejected with
+/// `InvalidPrevGovActionId`.
+///
+/// Returns `true` (valid) when the enacted root for the action's purpose is `None`.
+/// Returns `false` (invalid, must reject) when the enacted root is `Some(...)`.
+///
+/// `TreasuryWithdrawals` and `InfoAction` have no chain requirement — always `true`.
+fn genesis_root_is_valid(action: &GovAction, governance: &GovernanceState) -> bool {
+    let enacted_root = match action {
+        GovAction::ParameterChange { .. } => governance.enacted_pparam_update.as_ref(),
+        GovAction::HardForkInitiation { .. } => governance.enacted_hard_fork.as_ref(),
+        GovAction::NoConfidence { .. } | GovAction::UpdateCommittee { .. } => {
+            governance.enacted_committee.as_ref()
+        }
+        GovAction::NewConstitution { .. } => governance.enacted_constitution.as_ref(),
+        // No chain requirement for these types
+        GovAction::TreasuryWithdrawals { .. } | GovAction::InfoAction => return true,
+    };
+    // Valid only when no prior action of this purpose has been enacted
+    enacted_root.is_none()
+}
+
 /// Check whether a specific `prev_id` matches the last enacted action root for the
 /// given action's governance purpose.
 ///
@@ -5536,6 +5616,227 @@ mod tests {
             .find(|(v, _)| *v == Voter::DRep(drep_cred.clone()))
             .unwrap();
         assert_eq!(drep_vote_entry.1.vote, Vote::Yes);
+    }
+
+    // ========================================================================
+    // Sequential proposals — lineal chain invariant
+    // ========================================================================
+
+    /// A second ParameterChange proposal with `prev_action_id = None` must be
+    /// rejected at submission when a prior ParameterChange has already been
+    /// enacted.  Per Haskell `proposalsAddAction` (Proposals.hs): the genesis
+    /// root check (`parent == prRootL`) fails when the purpose tree root is
+    /// already `SJust id` (previously enacted action).
+    ///
+    /// This is the root cause of the devnet-validate Round 2 gov-lifecycle
+    /// failure: 10a submitted its second ParameterChange with no
+    /// --prev-governance-action-tx-id, producing a `prev_action_id = None`
+    /// proposal that passed submission in Dugite (old code) but then always
+    /// failed `prevActionAsExpected` at epoch-boundary ratification, timing out
+    /// the 10e enactment wait.
+    #[test]
+    fn test_sequential_param_change_requires_prev_action_id() {
+        let mut state = gov_test_state(10, 0);
+        // Set CC threshold to zero so it never blocks ratification
+        Arc::make_mut(&mut state.gov.governance).committee_threshold = Some(Rational {
+            numerator: 0,
+            denominator: 1,
+        });
+
+        // Round 1: submit and enact a ParameterChange with prev_action_id = None
+        let tx1 = Hash32::from_bytes([1u8; 32]);
+        let id1 = GovActionId {
+            transaction_id: tx1,
+            action_index: 0,
+        };
+        state.process_proposal(
+            &tx1,
+            0,
+            &ProposalProcedure {
+                deposit: Lovelace(100_000_000_000),
+                return_addr: vec![0u8; 29],
+                gov_action: GovAction::ParameterChange {
+                    prev_action_id: None,
+                    protocol_param_update: Box::new(ProtocolParamUpdate {
+                        n_opt: Some(500),
+                        ..Default::default()
+                    }),
+                    policy_hash: None,
+                },
+                anchor: make_anchor(),
+            },
+        );
+        assert!(
+            state.gov.governance.proposals.contains_key(&id1),
+            "first proposal should be admitted"
+        );
+
+        // Vote all DReps yes; epoch transition enacts it
+        for i in 0..10 {
+            drep_vote(&mut state, i, &id1, Vote::Yes);
+        }
+        state.process_epoch_transition(EpochNo(1));
+        assert!(
+            state.gov.governance.enacted_pparam_update.is_some(),
+            "first ParameterChange should be enacted after epoch boundary"
+        );
+        assert!(
+            !state.gov.governance.proposals.contains_key(&id1),
+            "enacted proposal should be removed from active set"
+        );
+
+        // Round 2: submit a second ParameterChange with prev_action_id = None (stale)
+        // This should now be REJECTED at submission (InvalidPrevGovActionId) because
+        // the purpose tree root is no longer SNothing — it's the enacted id1.
+        let tx2 = Hash32::from_bytes([2u8; 32]);
+        let id2 = GovActionId {
+            transaction_id: tx2,
+            action_index: 0,
+        };
+        state.process_proposal(
+            &tx2,
+            0,
+            &ProposalProcedure {
+                deposit: Lovelace(100_000_000_000),
+                return_addr: vec![0u8; 29],
+                gov_action: GovAction::ParameterChange {
+                    prev_action_id: None, // <-- missing the enacted root; must be rejected
+                    protocol_param_update: Box::new(ProtocolParamUpdate {
+                        n_opt: Some(501),
+                        ..Default::default()
+                    }),
+                    policy_hash: None,
+                },
+                anchor: make_anchor(),
+            },
+        );
+        assert!(
+            !state.gov.governance.proposals.contains_key(&id2),
+            "second ParameterChange with prev_action_id=None must be rejected at submission \
+             when an enacted root already exists (Haskell: InvalidPrevGovActionId)"
+        );
+
+        // Round 2 correct: submit with prev_action_id = Some(id1)
+        let tx3 = Hash32::from_bytes([3u8; 32]);
+        let id3 = GovActionId {
+            transaction_id: tx3,
+            action_index: 0,
+        };
+        state.process_proposal(
+            &tx3,
+            0,
+            &ProposalProcedure {
+                deposit: Lovelace(100_000_000_000),
+                return_addr: vec![0u8; 29],
+                gov_action: GovAction::ParameterChange {
+                    prev_action_id: Some(id1.clone()), // correctly references enacted root
+                    protocol_param_update: Box::new(ProtocolParamUpdate {
+                        n_opt: Some(501),
+                        ..Default::default()
+                    }),
+                    policy_hash: None,
+                },
+                anchor: make_anchor(),
+            },
+        );
+        assert!(
+            state.gov.governance.proposals.contains_key(&id3),
+            "second ParameterChange with prev_action_id=Some(enacted_id) must be admitted"
+        );
+
+        // Votes for id3 were cast AFTER the epoch 1 boundary, so they are captured
+        // in the epoch 2 snapshot (captured at epoch 2 boundary) and ratified at
+        // epoch 3 boundary.  Run a dry epoch 2 transition to capture the snapshot,
+        // then epoch 3 to ratify.
+        for i in 0..10 {
+            drep_vote(&mut state, i, &id3, Vote::Yes);
+        }
+        state.process_epoch_transition(EpochNo(2)); // captures snapshot with id3 + votes
+        state.process_epoch_transition(EpochNo(3)); // ratifies id3
+        assert_eq!(
+            state.gov.governance.enacted_pparam_update,
+            Some(id3),
+            "second ParameterChange should be enacted at epoch 3"
+        );
+    }
+
+    /// `genesis_root_is_valid` returns true only when no prior action of that
+    /// purpose has been enacted.
+    #[test]
+    fn test_genesis_root_is_valid() {
+        let mut gov = GovernanceState::default();
+
+        // At genesis all roots are None — genesis proposals are valid
+        assert!(genesis_root_is_valid(
+            &GovAction::ParameterChange {
+                prev_action_id: None,
+                protocol_param_update: Box::new(ProtocolParamUpdate::default()),
+                policy_hash: None,
+            },
+            &gov
+        ));
+        assert!(genesis_root_is_valid(
+            &GovAction::HardForkInitiation {
+                prev_action_id: None,
+                protocol_version: (10, 0)
+            },
+            &gov
+        ));
+        assert!(genesis_root_is_valid(
+            &GovAction::NoConfidence {
+                prev_action_id: None
+            },
+            &gov
+        ));
+
+        // TreasuryWithdrawals and InfoAction always valid (no chain)
+        assert!(genesis_root_is_valid(&GovAction::InfoAction, &gov));
+        assert!(genesis_root_is_valid(
+            &GovAction::TreasuryWithdrawals {
+                withdrawals: BTreeMap::new(),
+                policy_hash: None
+            },
+            &gov
+        ));
+
+        // After enactment, same genesis proposal is invalid
+        let enacted_id = GovActionId {
+            transaction_id: Hash32::from_bytes([42u8; 32]),
+            action_index: 0,
+        };
+        gov.enacted_pparam_update = Some(enacted_id.clone());
+        assert!(
+            !genesis_root_is_valid(
+                &GovAction::ParameterChange {
+                    prev_action_id: None,
+                    protocol_param_update: Box::new(ProtocolParamUpdate::default()),
+                    policy_hash: None,
+                },
+                &gov
+            ),
+            "ParameterChange with prev_action_id=None invalid once enacted_pparam_update is set"
+        );
+
+        // HardFork genesis still valid (different purpose)
+        assert!(genesis_root_is_valid(
+            &GovAction::HardForkInitiation {
+                prev_action_id: None,
+                protocol_version: (11, 0)
+            },
+            &gov
+        ));
+
+        // After committee enacted, NoConfidence genesis is invalid
+        gov.enacted_committee = Some(enacted_id);
+        assert!(
+            !genesis_root_is_valid(
+                &GovAction::NoConfidence {
+                    prev_action_id: None
+                },
+                &gov
+            ),
+            "NoConfidence with prev_action_id=None invalid once enacted_committee is set"
+        );
     }
 
     // ========================================================================

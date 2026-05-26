@@ -38,6 +38,12 @@ while [ "$ELAPSED" -lt "$MAX_WAIT_SEC" ]; do
             "enacted: minFeeA=${CURRENT_MIN_FEE_A} after ${ELAPSED}s"
         # Write marker for downstream assertion
         echo "enacted" > "$GOV_STATE/enacted"
+        # Record the enacted action ID so 10a can chain from it on re-run.
+        # Per Conway/CIP-1694 the lineal chain invariant requires subsequent
+        # ParameterChange proposals to reference the last enacted one.
+        if [ -f "$GOV_STATE/proposal.actionid" ]; then
+            cp "$GOV_STATE/proposal.actionid" "$GOV_STATE/enacted.actionid"
+        fi
         exit 0
     fi
 
@@ -65,6 +71,10 @@ CURRENT_MIN_FEE_A=$(cardano-cli conway query protocol-parameters \
 
 if [ "$CURRENT_MIN_FEE_A" = "$EXPECTED_MIN_FEE_A" ]; then
     zoo_record "$NAME" PASS "" "enacted (found at final check)"
+    echo "enacted" > "$GOV_STATE/enacted"
+    if [ -f "$GOV_STATE/proposal.actionid" ]; then
+        cp "$GOV_STATE/proposal.actionid" "$GOV_STATE/enacted.actionid"
+    fi
 else
     zoo_record "$NAME" FAIL "" \
         "NOT enacted after ${MAX_WAIT_SEC}s: current_minFeeA=${CURRENT_MIN_FEE_A} expected=${EXPECTED_MIN_FEE_A} pending=${PROPOSALS}"
