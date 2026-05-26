@@ -7,13 +7,14 @@
 # expected-min-fee-a so downstream 10b/10c/10d/10e scripts can vote on the
 # action and assert its enactment.
 #
-# On re-run (Round 2+): reads the previously enacted action ID from
-# $ZOO_STATE/gov-lifecycle/enacted.actionid and supplies it as
-# --prev-governance-action-tx-id.  Per Conway/CIP-1694, once a ParameterChange
-# proposal has been enacted, all subsequent ParameterChange proposals must
-# reference the most recently enacted one as their prev_action_id (the "lineal
-# chain" invariant enforced by proposalsAddAction in cardano-ledger Proposals.hs).
-# Without it the proposal is rejected at submission (InvalidPrevGovActionId).
+# prev_action_id resolution (lineal chain invariant):
+#   Per Conway/CIP-1694 and Haskell `proposalsAddAction`, a ParameterChange
+#   proposal's prev_action_id must reference the most recently enacted
+#   ParameterChange on the current chain — NOT a stale ID from a previous
+#   devnet boot.  We query the live gov-state from the chain to get the
+#   canonical enacted pparam root, ignoring any persisted cross-round file.
+#   If no ParameterChange has been enacted on this chain yet, no
+#   --prev-governance-action-tx-id flag is needed (genesis root).
 set -euo pipefail
 . "$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/lib/tx-zoo-common.sh"
 
@@ -30,21 +31,38 @@ NEW_MIN_FEE_A=$((CURRENT_MIN_FEE_A + 1))
 GOV_STATE="$ZOO_STATE/gov-lifecycle"
 mkdir -p "$GOV_STATE"
 
-# Build prev-action-id args.  On first run there is no enacted action, so no
-# --prev-governance-action-tx-id flag is needed.  On subsequent runs we must
-# supply the previously enacted action ID so the new proposal correctly chains
-# from the enacted root of the ParameterChange purpose tree.
+# Query the live chain for the currently enacted ParameterChange root.
+# Haskell's `proposalsAddAction` checks `Map.member parentId graph` where the
+# enacted root is the anchor of the purpose tree.  We extract it from
+# `enactState.prevGovActionIds.PParamUpdate` in the gov-state JSON.
+# This is robust against cross-round state pollution: if this is a fresh
+# chain (new devnet boot), PParamUpdate will be null and we omit the flag.
 PREV_ACTION_ARGS=()
-ENACTED_ACTIONID_FILE="$GOV_STATE/enacted.actionid"
-if [ -f "$ENACTED_ACTIONID_FILE" ]; then
-    PREV_ACTIONID=$(cat "$ENACTED_ACTIONID_FILE")
-    PREV_TX="${PREV_ACTIONID%%#*}"
-    PREV_IDX="${PREV_ACTIONID##*#}"
-    log_info "10a: chaining from previously enacted action ${PREV_TX}#${PREV_IDX}"
-    PREV_ACTION_ARGS=(
-        --prev-governance-action-tx-id "$PREV_TX"
-        --prev-governance-action-index "$PREV_IDX"
-    )
+GOV_STATE_JSON=$(cardano-cli conway query gov-state \
+    --testnet-magic "$LD_MAGIC" \
+    --socket-path   "$ZOO_SOCKET" 2>/dev/null || true)
+
+if [ -n "$GOV_STATE_JSON" ]; then
+    # Try to extract prevGovActionIds.PParamUpdate from enactState.
+    # cardano-cli gov-state JSON shape: .enactState.prevGovActionIds.PParamUpdate
+    # which is either null or {"txId": "...", "govActionIx": N}
+    ENACTED_RAW=$(echo "$GOV_STATE_JSON" | \
+        jq -r '(.enactState.prevGovActionIds.PParamUpdate // null)' 2>/dev/null || true)
+    if [ -n "$ENACTED_RAW" ] && [ "$ENACTED_RAW" != "null" ]; then
+        PREV_TX=$(echo "$ENACTED_RAW" | jq -r '.txId')
+        PREV_IDX=$(echo "$ENACTED_RAW" | jq -r '.govActionIx')
+        if [ -n "$PREV_TX" ] && [ "$PREV_TX" != "null" ]; then
+            log_info "10a: chaining from enacted ParameterChange on this chain: ${PREV_TX}#${PREV_IDX}"
+            PREV_ACTION_ARGS=(
+                --prev-governance-action-tx-id "$PREV_TX"
+                --prev-governance-action-index "$PREV_IDX"
+            )
+        fi
+    else
+        log_info "10a: no enacted ParameterChange on this chain — submitting genesis-root proposal"
+    fi
+else
+    log_info "10a: gov-state query failed (node may be starting) — submitting without prev_action_id"
 fi
 
 ACTION="$ZOO_BUILT/$NAME.action"
