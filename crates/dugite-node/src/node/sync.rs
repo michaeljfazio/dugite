@@ -3184,11 +3184,22 @@ pub(crate) async fn forecast_park_or_disconnect(
         } else {
             view.stability_window_3kf
         };
-        match forecast_for(
-            view.last_applied_slot,
-            stability_window,
-            SlotNo(header_slot),
-        ) {
+        // For the forecast-horizon check we prefer the **freshest** tip slot
+        // available — the watch-channel value updated on every block apply
+        // (issue #654) — rather than `view.last_applied_slot`, which during
+        // catch-up sync may lag behind because `publish_ledger_view` is
+        // throttled (#698 perf gate).  Without this, the chainsync client
+        // would wake on `tip_rx.changed()` but still see the stale
+        // LedgerView, re-park, and eventually hit the
+        // FORECAST_PARK_TIMEOUT cap — exactly the regression that follows
+        // the gate land.
+        let latest_tip_slot = *tip_rx.borrow();
+        let tip_slot_no = if latest_tip_slot > 0 {
+            Some(SlotNo(latest_tip_slot))
+        } else {
+            view.last_applied_slot
+        };
+        match forecast_for(tip_slot_no, stability_window, SlotNo(header_slot)) {
             Ok(()) => return Ok(()),
             Err(out) => {
                 let elapsed = park_started.elapsed();
