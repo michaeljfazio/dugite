@@ -62,6 +62,26 @@ pub trait DnsResolver: Send + Sync {
     async fn a_aaaa_lookup(&self, host: &str) -> Vec<IpAddr>;
 }
 
+/// Fallback resolver that always returns "no records".  Use this when the
+/// system DNS configuration cannot be parsed (e.g. macOS publishes an IPv6
+/// link-local nameserver `fe80::…%en0` that hickory rejects with
+/// `invalid IP address syntax`).  The literal-IP fast path in
+/// [`resolve_with_srv`] still works against this resolver, so devnet
+/// topologies that list peers by IP (e.g. `127.0.0.1`) keep functioning
+/// without DNS.
+pub struct NoopDnsResolver;
+
+#[async_trait::async_trait]
+impl DnsResolver for NoopDnsResolver {
+    async fn srv_lookup(&self, _host: &str) -> Result<Vec<SrvRecord>, String> {
+        Ok(vec![])
+    }
+
+    async fn a_aaaa_lookup(&self, _host: &str) -> Vec<IpAddr> {
+        vec![]
+    }
+}
+
 /// Production resolver backed by `hickory_resolver::TokioResolver`.
 pub struct HickoryDnsResolver {
     inner: hickory_resolver::TokioResolver,
