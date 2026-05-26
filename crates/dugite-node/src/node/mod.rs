@@ -20,6 +20,7 @@ pub(crate) mod networking;
 pub(crate) mod peer_connection;
 pub(crate) mod query;
 pub(crate) mod serve;
+pub(crate) mod snapshot_worker;
 pub(crate) mod sync;
 pub mod tip_broadcast;
 
@@ -555,6 +556,17 @@ pub struct Node {
     ///
     /// `AtomicBool` (Relaxed ordering) avoids any lock acquisition on the hot path.
     pub(crate) ingestion_paused: Arc<std::sync::atomic::AtomicBool>,
+
+    // ── Snapshot worker (issue #695) ─────────────────────────────────
+    /// Sender to the background snapshot worker task. `None` after
+    /// shutdown's drop-sender step; calls into `try_snapshot_async`
+    /// after that return `SnapshotEnqueue::Closed`.
+    pub(crate) snapshot_tx: Option<tokio::sync::mpsc::Sender<snapshot_worker::SnapshotRequest>>,
+
+    /// Join handle for the background snapshot worker. Taken at
+    /// shutdown so the synchronous final save can `.await` quiescence
+    /// before writing — see `Node::run`'s shutdown sequence.
+    pub(crate) snapshot_worker_handle: Option<tokio::task::JoinHandle<()>>,
 }
 
 // ─── GsmActorParts ──────────────────────────────────────────────────────────
@@ -1840,6 +1852,10 @@ impl Node {
             last_query_state_update: Instant::now(),
             peer_intersection_established: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             ingestion_paused: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            // Snapshot worker (issue #695): channel + handle are set
+            // in `Node::run` once the tokio runtime is active.
+            snapshot_tx: None,
+            snapshot_worker_handle: None,
         })
     }
 
@@ -1929,6 +1945,23 @@ impl Node {
                 let slot_time_ms = self.slot_to_wallclock_ms(slot.0, &ls.slot_config).await;
                 self.metrics.set_tip_slot_time_ms(slot_time_ms);
             }
+        }
+
+        // Spawn the background snapshot worker (issue #695). The worker
+        // owns the disk-bound bincode walk + atomic rename + prune that
+        // previously ran on the apply thread; apply now fires a single
+        // mpsc `try_send` and continues. Mirrors cardano-node's
+        // `ledgerDbTaskWatcher`. The worker exits when `snapshot_tx` is
+        // dropped at shutdown.
+        {
+            let max_snapshots = self.snapshot_policy.max_snapshots;
+            let (tx, handle) = snapshot_worker::spawn_snapshot_worker(
+                self.database_path.clone(),
+                max_snapshots,
+                self.metrics.clone(),
+            );
+            self.snapshot_tx = Some(tx);
+            self.snapshot_worker_handle = Some(handle);
         }
 
         // Setup shutdown signal (SIGINT + SIGTERM) early so the node can be
@@ -2493,8 +2526,7 @@ impl Node {
                 });
                 let mut group_addrs = Vec::new();
                 for ap in &group.access_points {
-                    let addrs =
-                        resolve_with_srv(dns_resolver.as_ref(), &ap.address, ap.port).await;
+                    let addrs = resolve_with_srv(dns_resolver.as_ref(), &ap.address, ap.port).await;
                     if addrs.is_empty() {
                         warn!(
                             address = %ap.address,
@@ -4028,6 +4060,23 @@ impl Node {
                     error!("Failed to persist ChainDB on shutdown: {e}");
                 }
             }
+            // Snapshot worker quiescence (issue #695). Drop the sender
+            // first so the worker's recv() returns None and it can
+            // exit, then await the handle (bounded by the outer 30s
+            // timeout) so any in-flight write completes before the
+            // synchronous final save fires. Without this ordering the
+            // synchronous save below could race the worker on
+            // epoch-N.bin and latest.bin.
+            self.snapshot_tx = None;
+            if let Some(handle) = self.snapshot_worker_handle.take() {
+                match tokio::time::timeout(std::time::Duration::from_secs(20), handle).await {
+                    Ok(Ok(())) => info!("snapshot worker quiesced"),
+                    Ok(Err(e)) => warn!(error = %e, "snapshot worker join errored"),
+                    Err(_) => warn!(
+                        "snapshot worker did not exit within 20s — proceeding to sync save anyway"
+                    ),
+                }
+            }
             self.save_ledger_snapshot().await;
         })
         .await;
@@ -4811,9 +4860,18 @@ impl Node {
             .bg_snapshot_scheduler
             .maybe_snapshot_check(current_epoch, block_number);
         if should_snapshot {
-            self.save_ledger_snapshot().await;
-            self.bg_snapshot_scheduler
-                .record_snapshot_taken(current_epoch);
+            // Issue #695: fire via the non-blocking worker so the
+            // apply path doesn't pause for the bincode walk. Only
+            // record on `Enqueued`; skipping leaves
+            // `blocks_since_snapshot` growing so the next block
+            // retries (cf. DEFAULT_SNAPSHOT_INTERVAL = 2000 blocks).
+            if matches!(
+                self.try_snapshot_async().await,
+                snapshot_worker::SnapshotEnqueue::Enqueued
+            ) {
+                self.bg_snapshot_scheduler
+                    .record_snapshot_taken(current_epoch);
+            }
         }
     }
 

@@ -26,7 +26,6 @@ use dugite_network::MuxChannel;
 use dugite_network::RollbackAnnouncement;
 use dugite_primitives::block::Point;
 
-use super::epoch::SnapshotPolicy;
 use super::Node;
 
 // ─── Genesis block validation (free function, used by tests) ─────────────────
@@ -1496,9 +1495,20 @@ impl Node {
                         .maybe_snapshot_check(current_epoch, block_no)
                 };
                 if should_snapshot {
-                    self.save_ledger_snapshot().await;
-                    self.bg_snapshot_scheduler
-                        .record_snapshot_taken(current_epoch);
+                    // Issue #695: fire-and-forget via the background
+                    // snapshot worker. Only record the scheduler as
+                    // having snapshotted on `Enqueued` — skipping
+                    // (`Skipped` / `Closed`) must leave the
+                    // blocks_since_snapshot counter growing so the
+                    // next block retriggers, otherwise we'd delay the
+                    // next attempt by the full interval.
+                    if matches!(
+                        self.try_snapshot_async().await,
+                        super::snapshot_worker::SnapshotEnqueue::Enqueued
+                    ) {
+                        self.bg_snapshot_scheduler
+                            .record_snapshot_taken(current_epoch);
+                    }
                 }
             }
         }
@@ -1743,8 +1753,15 @@ impl Node {
                     }
                 }
                 if self.snapshot_policy.should_snapshot_normal() {
-                    self.save_ledger_snapshot().await;
-                    self.snapshot_policy.snapshot_taken();
+                    // Issue #695: non-blocking trigger; only reset the
+                    // policy timer on `Enqueued` so a busy worker
+                    // doesn't delay the next attempt by `k*2` seconds.
+                    if matches!(
+                        self.try_snapshot_async().await,
+                        super::snapshot_worker::SnapshotEnqueue::Enqueued
+                    ) {
+                        self.snapshot_policy.snapshot_taken();
+                    }
                 }
                 *last_snapshot_epoch = current_epoch;
 
@@ -2095,7 +2112,10 @@ impl Node {
             let mut replayed = 0u64;
             let mut skipped = 0u64;
             let mut last_log = std::time::Instant::now();
-            let mut snapshot_policy = SnapshotPolicy::new(security_param);
+            // Issue #695: no mid-replay snapshot policy needed —
+            // chunk replay produces no intermediate snapshots; a
+            // single save fires after the loop exits.
+            let _ = security_param;
 
             // Get ledger tip slot so we can skip blocks already applied.
             let ledger_tip_slot = {
@@ -2154,7 +2174,6 @@ impl Node {
                             warn!(slot = block.slot().0, error = %e, "Ledger apply failed during replay");
                         }
                         replayed += 1;
-                        snapshot_policy.record_blocks(1);
 
                         if last_log.elapsed().as_secs() >= 5 {
                             let elapsed = start.elapsed().as_secs_f64();
@@ -2182,19 +2201,12 @@ impl Node {
                             last_log = std::time::Instant::now();
                         }
 
-                        if snapshot_policy.should_snapshot_bulk() {
-                            // Recompute snapshot pool_stake using the current incremental
-                            // stake_distribution before saving. This ensures mid-replay
-                            // bulk snapshots have correct pool_stake values even though
-                            // needs_stake_rebuild=false (no full UTxO scan at epoch boundaries).
-                            // The incremental stake_map is correct at this point since it is
-                            // maintained per-block during replay.
-                            ls_guard.recompute_snapshot_pool_stakes();
-                            if let Err(e) = ls_guard.save_snapshot(&snapshot_path) {
-                                warn!("Failed to save ledger snapshot during replay: {e}");
-                            }
-                            snapshot_policy.snapshot_taken();
-                        }
+                        // Issue #695: no snapshots during chunk-file
+                        // replay. Mirrors Haskell cardano-node, which
+                        // does not launch the snapshot background task
+                        // until `replayStartingWith` returns. The
+                        // existing post-loop save (below) writes a
+                        // single snapshot once replay completes.
                     }
                     Err(e) => {
                         // #680 diagnostic: dump exact slice characteristics
@@ -2583,7 +2595,6 @@ impl Node {
                             }
                             replayed += 1;
                             current_slot = next_slot.0;
-                            self.snapshot_policy.record_blocks(1);
 
                             if last_log.elapsed().as_secs() >= 5 {
                                 let elapsed = start.elapsed().as_secs_f64();
@@ -2611,23 +2622,12 @@ impl Node {
                                 last_log = std::time::Instant::now();
                             }
 
-                            if self.snapshot_policy.should_snapshot_bulk() {
-                                // Recompute snapshot pool_stake before saving. During LSM
-                                // replay with needs_stake_rebuild=false, epoch boundaries
-                                // use the incremental stake_map rather than a full UTxO scan.
-                                // Calling recompute_snapshot_pool_stakes() here ensures the
-                                // bulk snapshot has correct pool_stake values using the
-                                // current incremental stake_distribution.
-                                ls.recompute_snapshot_pool_stakes();
-                                merge_opcert_counters_from_praos(
-                                    &mut ls.consensus.opcert_counters,
-                                    self.consensus.opcert_counters(),
-                                );
-                                if let Err(e) = ls.save_snapshot(&snapshot_path) {
-                                    warn!("Failed to save ledger snapshot during replay: {e}");
-                                }
-                                self.snapshot_policy.snapshot_taken();
-                            }
+                            // Issue #695: no snapshots during LSM
+                            // replay. Mirrors Haskell behavior — the
+                            // background snapshot task is not active
+                            // during replay. The existing post-loop
+                            // save (below) produces a single snapshot
+                            // once replay completes.
                         }
                         Err(e) => {
                             warn!(

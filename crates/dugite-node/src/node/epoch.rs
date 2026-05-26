@@ -122,6 +122,7 @@ pub struct SnapshotPolicy {
 
 impl SnapshotPolicy {
     /// Create a new snapshot policy with defaults matching Haskell cardano-node.
+    #[allow(dead_code)] // referenced by epoch.rs unit tests
     pub fn new(security_param_k: u64) -> Self {
         SnapshotPolicy {
             normal_interval: std::time::Duration::from_secs(security_param_k * 2),
@@ -162,6 +163,11 @@ impl SnapshotPolicy {
     }
 
     /// Check if a snapshot should be taken during bulk sync (replay).
+    ///
+    /// Issue #695 removed the production callers of this method
+    /// (chunk-file + LSM replay no longer save mid-loop). Retained
+    /// for unit-test coverage of the policy's threshold semantics.
+    #[allow(dead_code)]
     pub fn should_snapshot_bulk(&self) -> bool {
         self.blocks_since_snapshot >= self.bulk_min_blocks
             && self.last_snapshot_time.elapsed() >= self.bulk_min_interval
@@ -331,6 +337,85 @@ impl Node {
             }
             Ok(Err(e)) => error!("Failed to save ledger snapshot: {e}"),
             Err(join_err) => error!("Snapshot task panicked: {join_err}"),
+        }
+    }
+
+    /// Non-blocking snapshot trigger (issue #695).
+    ///
+    /// Replaces every at-tip `save_ledger_snapshot().await` call site
+    /// on the apply hot path. Phase A (LSM flush + Arc::clone view
+    /// build) still holds the ledger write lock briefly — duration
+    /// unchanged from `save_ledger_snapshot`'s prep block. Phase B
+    /// (bincode walk + atomic rename + prune) is handed off to the
+    /// background snapshot worker via a bounded mpsc channel and the
+    /// apply path returns immediately.
+    ///
+    /// ## Returned [`super::snapshot_worker::SnapshotEnqueue`]
+    ///
+    /// - `Enqueued` — successfully sent to the worker. Caller should
+    ///   record the snapshot as taken on its scheduler.
+    /// - `Skipped` — worker was busy (channel full) or pre-flight
+    ///   capacity check failed. Caller must NOT record the snapshot
+    ///   as taken; the scheduler retries on the next block. Mirrors
+    ///   cardano-node's `SnapshotDelayRange` delay-gate skip.
+    /// - `Closed` — worker shutdown has begun; do not retry.
+    pub async fn try_snapshot_async(&self) -> super::snapshot_worker::SnapshotEnqueue {
+        use super::snapshot_worker::{has_capacity, SnapshotEnqueue, SnapshotRequest};
+
+        let Some(tx) = self.snapshot_tx.as_ref() else {
+            return SnapshotEnqueue::Closed;
+        };
+        // Pre-flight check: avoid the multi-hundred-ms HashMap clones
+        // in Phase A when the worker is busy. Without this guard a
+        // wedged disk would force every apply path to clone + discard.
+        if !has_capacity(tx) {
+            self.metrics.inc_snapshot_skipped_busy();
+            debug!("snapshot worker busy — skipping (pre-lock)");
+            return SnapshotEnqueue::Skipped;
+        }
+
+        // Phase A — under the ledger write lock. LSM flush (sub-second
+        // on preview, ~1–2 s on mainnet under churn) + Arc::clone
+        // view build (two big stake-credential HashMaps ≈ 350 ms on
+        // mainnet, everything else Arc::clone).
+        let req = {
+            let mut ls = self.ledger_state.write().await;
+            ls.consensus.opcert_counters = self.consensus.opcert_counters().clone();
+            ls.utxo.diff_seq.clear();
+            if let Err(e) = ls.save_utxo_snapshot() {
+                error!(error = %e, "LSM flush failed during snapshot");
+                self.metrics.inc_utxo_flush_failed();
+                // Proceed: in-memory utxo_set may be empty (LSM
+                // backend) so the view is structurally valid; the LSM
+                // SST on disk is the UTxO ground truth and may be
+                // stale by one save cycle.
+            }
+            SnapshotRequest {
+                view: dugite_ledger::LedgerStateSnapshot::from(&*ls),
+                epoch: ls.epoch.0,
+                slot: ls.tip.point.slot().map(|s| s.0).unwrap_or(0),
+                utxo_count: ls.utxo.utxo_set.len(),
+            }
+            // ── LOCK RELEASED HERE ──
+        };
+
+        match tx.try_send(req) {
+            Ok(()) => {
+                self.metrics.inc_snapshot_enqueued();
+                debug!("snapshot enqueued to worker");
+                SnapshotEnqueue::Enqueued
+            }
+            Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                // TOCTOU race vs pre-flight; benign — bounded to one
+                // view-build worth of work.
+                self.metrics.inc_snapshot_skipped_busy();
+                debug!("snapshot worker busy — skipping (post-lock)");
+                SnapshotEnqueue::Skipped
+            }
+            Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                warn!("snapshot worker channel closed — node shutting down");
+                SnapshotEnqueue::Closed
+            }
         }
     }
 

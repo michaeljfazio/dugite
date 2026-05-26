@@ -71,7 +71,11 @@ impl DiffReport {
 /// snapshots. Useful for triaging the structural shape of the divergence
 /// when `pool_params: value_mismatches=605` alone doesn't show what field
 /// inside `PoolRegistration` actually differs.
-pub fn print_first_pool_param_diffs(left_path: &Path, right_path: &Path, limit: usize) -> Result<()> {
+pub fn print_first_pool_param_diffs(
+    left_path: &Path,
+    right_path: &Path,
+    limit: usize,
+) -> Result<()> {
     let l = LedgerState::load_snapshot(&resolve_snapshot_path(left_path)?)
         .with_context(|| format!("loading left {}", left_path.display()))?;
     let r = LedgerState::load_snapshot(&resolve_snapshot_path(right_path)?)
@@ -114,8 +118,16 @@ pub fn print_scalar_overview(left_path: &Path, right_path: &Path) -> Result<()> 
     row("epoch", l.epoch.0.to_string(), r.epoch.0.to_string());
     row(
         "tip_slot",
-        l.tip.point.slot().map(|s| s.0.to_string()).unwrap_or_default(),
-        r.tip.point.slot().map(|s| s.0.to_string()).unwrap_or_default(),
+        l.tip
+            .point
+            .slot()
+            .map(|s| s.0.to_string())
+            .unwrap_or_default(),
+        r.tip
+            .point
+            .slot()
+            .map(|s| s.0.to_string())
+            .unwrap_or_default(),
     );
     row(
         "tip_block",
