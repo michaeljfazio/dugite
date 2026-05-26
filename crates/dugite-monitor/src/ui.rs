@@ -402,7 +402,7 @@ fn render_node_panel(frame: &mut Frame, app: &App, theme: &Theme, area: Rect) {
     // For recognised networks the label is unambiguous — drop the magic. Show
     // the raw magic only for Unknown networks where it is diagnostically useful.
     let network = match app.network {
-        Network::Unknown if network_magic > 0 => format!("magic {}", network_magic),
+        Network::Unknown if network_magic > 0 => format!("Unknown ({})", network_magic),
         _ => app.network.label().to_string(),
     };
     let version = env!("CARGO_PKG_VERSION");
