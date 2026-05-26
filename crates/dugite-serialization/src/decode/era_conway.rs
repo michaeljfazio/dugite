@@ -1743,7 +1743,9 @@ fn read_vote(r: &mut Reader<'_>) -> Result<Vote, SerializationError> {
     }
 }
 
-pub(crate) fn read_proposal_procedure(r: &mut Reader<'_>) -> Result<ProposalProcedure, SerializationError> {
+pub(crate) fn read_proposal_procedure(
+    r: &mut Reader<'_>,
+) -> Result<ProposalProcedure, SerializationError> {
     // proposal_procedure = [deposit, reward_account, gov_action, anchor]
     let arr_len = r.read_array_header()?;
     if !matches!(arr_len, Some(4)) {
@@ -1874,7 +1876,9 @@ fn read_optional_gov_action_id(
     Ok(Some(read_gov_action_id(r)?))
 }
 
-pub(crate) fn read_optional_hash28_gov(r: &mut Reader<'_>) -> Result<Option<Hash28>, SerializationError> {
+pub(crate) fn read_optional_hash28_gov(
+    r: &mut Reader<'_>,
+) -> Result<Option<Hash28>, SerializationError> {
     let ty = r.peek_major()?;
     if ty == Type::Null {
         r.read_null()?;
