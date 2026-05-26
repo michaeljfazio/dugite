@@ -1567,15 +1567,16 @@ impl ConnectionLifecycleManager {
             Box::pin(async move {
                 let mut server =
                     dugite_network::protocol::chainsync::server::ChainSyncServer::new();
+                info!(%addr, "chainsync server task spawned");
                 tokio::select! {
                     result = server.run(&mut channel, block_provider.as_ref(), announcement_rx, rollback_rx) => {
                         match result {
-                            Ok(()) => debug!(%addr, "chainsync server completed"),
-                            Err(e) => debug!(%addr, "chainsync server error: {e}"),
+                            Ok(()) => info!(%addr, "chainsync server task completed cleanly"),
+                            Err(e) => warn!(%addr, error = %e, "chainsync server task exited with error"),
                         }
                     }
                     _ = cancel.cancelled() => {
-                        debug!(%addr, "chainsync server cancelled");
+                        info!(%addr, "chainsync server task cancelled");
                     }
                 }
             })

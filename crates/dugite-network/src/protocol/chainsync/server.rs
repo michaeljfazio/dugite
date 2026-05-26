@@ -168,8 +168,24 @@ impl ChainSyncServer {
         mut announcement_rx: broadcast::Receiver<BlockAnnouncement>,
         mut rollback_rx: broadcast::Receiver<RollbackAnnouncement>,
     ) -> Result<(), ProtocolError> {
+        let task_id = self as *const _ as usize;
+        tracing::info!(task_id, "chainsync server: task started");
         loop {
-            let msg_bytes = channel.recv().await.map_err(ProtocolError::from)?;
+            tracing::debug!(
+                task_id,
+                cursor_slot = self.cursor_slot,
+                cursor_at_origin = self.cursor_at_origin,
+                "chainsync server: awaiting next client message"
+            );
+            let msg_bytes = channel.recv().await.map_err(|e| {
+                tracing::info!(
+                    task_id,
+                    error = %e,
+                    cursor_slot = self.cursor_slot,
+                    "chainsync server: channel.recv() failed — task exiting"
+                );
+                ProtocolError::from(e)
+            })?;
             let msg = decode_message(&msg_bytes).map_err(|e| ProtocolError::CborDecode {
                 protocol: "ChainSync",
                 reason: e,
@@ -312,13 +328,33 @@ impl ChainSyncServer {
         }
 
         // Try to find and serve the next block after our cursor.
+        let task_id = self as *const _ as usize;
+        let pre_lookup_cursor = self.cursor_slot;
         if self.try_serve_next_block(channel, block_provider).await? {
+            tracing::debug!(
+                task_id,
+                pre_lookup_cursor,
+                post_serve_cursor = self.cursor_slot,
+                "chainsync server: direct serve path produced a message"
+            );
             return Ok(());
         }
 
         // We're at the tip — send MsgAwaitReply and wait for announcement.
+        tracing::info!(
+            task_id,
+            cursor_slot = self.cursor_slot,
+            "chainsync server: no next block — sending MsgAwaitReply, entering StMustReply"
+        );
         let await_msg = encode_message(&ChainSyncMessage::MsgAwaitReply);
-        channel.send(await_msg).await.map_err(ProtocolError::from)?;
+        channel.send(await_msg).await.map_err(|e| {
+            tracing::warn!(
+                task_id,
+                error = %e,
+                "chainsync server: MsgAwaitReply send failed"
+            );
+            ProtocolError::from(e)
+        })?;
 
         // Wait for a block announcement OR rollback with a fixed timeout.
         // Haskell uses a timeout range of 135–911 seconds; we use 135s as the lower bound.
@@ -367,6 +403,11 @@ impl ChainSyncServer {
                 }
             }
             announcement = announcement_rx.recv() => {
+                tracing::info!(
+                    task_id,
+                    cursor_slot = self.cursor_slot,
+                    "chainsync server: woke from StMustReply on announcement"
+                );
                 match announcement {
                     Ok(_ann) => {
                         // The announcement is used only as a wake signal — the
@@ -413,9 +454,12 @@ impl ChainSyncServer {
                 }
             }
             _ = tokio::time::sleep(timeout) => {
-                // Timeout — poll whether a new block has arrived while we
-                // waited.  Re-uses the same cursor-aware helper as the
-                // announcement path so `cursor_at_origin` stays consistent.
+                tracing::warn!(
+                    task_id,
+                    cursor_slot = self.cursor_slot,
+                    timeout_seconds = timeout.as_secs(),
+                    "chainsync server: StMustReply timed out — re-polling block provider for next block"
+                );
                 self.try_serve_next_block(channel, block_provider).await?;
                 Ok(())
             }
