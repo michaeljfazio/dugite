@@ -1186,9 +1186,17 @@ pub(super) fn run_phase1_rules(
 
     // ------------------------------------------------------------------
     // Rule 7: TTL check
+    //
+    // Haskell `inInterval` (Cardano.Ledger.Shelley.Rules.Utxo): the tx is
+    // valid only when `slot < invalidHereafter`.  At `slot == invalidHereafter`
+    // the tx is OUT of its validity interval and the predicate fires.  Dugite
+    // previously used strict `>` here, which admitted a tx whose TTL equalled
+    // the current slot — cardano-node then rejected the resulting block with
+    // `OutsideValidityIntervalUTxO (… invalidHereafter = SJust S, current = S)`.
+    // Match Haskell exactly: `>=`.
     // ------------------------------------------------------------------
     if let Some(ttl) = body.ttl {
-        if current_slot > ttl.0 {
+        if current_slot >= ttl.0 {
             errors.push(ValidationError::TtlExpired {
                 current_slot,
                 ttl: ttl.0,
@@ -2520,25 +2528,27 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // Test 32 — Rule 7: TTL exactly at current_slot passes (slot == TTL is valid)
+    // Test 32 — Rule 7: TTL exactly at current_slot fails (slot >= TTL = invalid)
+    //
+    // Haskell `inInterval` (Cardano.Ledger.Shelley.Rules.Utxo): the tx is
+    // valid only when `slot < invalidHereafter`.  Equality is OUT of the
+    // interval, so dugite must emit `TtlExpired` at `slot == invalidHereafter`.
     // -----------------------------------------------------------------------
     #[test]
-    fn test_ttl_at_current_slot_passes() {
+    fn test_ttl_at_current_slot_fails() {
         let (utxo_set, mut tx, _) = make_valid_tx();
-        // TTL == current_slot should NOT produce TtlExpired (> not >=).
         tx.body.ttl = Some(SlotNo(100));
         let params = ProtocolParameters::mainnet_defaults();
         let result = validate_transaction(&tx, &utxo_set, &params, 100, 300, None);
         assert!(
-            result.is_ok()
-                || result
-                    .as_ref()
-                    .err()
-                    .map(|es| !es
-                        .iter()
-                        .any(|e| matches!(e, ValidationError::TtlExpired { .. })))
-                    .unwrap_or(true),
-            "TTL == current_slot must NOT produce TtlExpired, got {result:?}"
+            result
+                .as_ref()
+                .err()
+                .map(|es| es
+                    .iter()
+                    .any(|e| matches!(e, ValidationError::TtlExpired { .. })))
+                .unwrap_or(false),
+            "TTL == current_slot must produce TtlExpired (Haskell `slot < invalidHereafter`), got {result:?}"
         );
     }
 
