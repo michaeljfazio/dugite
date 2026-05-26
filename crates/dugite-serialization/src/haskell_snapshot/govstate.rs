@@ -395,9 +395,7 @@ const MAX_PROPOSALS: usize = 16384;
 /// Reuses `crates/dugite-serialization/src/decode/era_conway.rs` for the
 /// complex `ProposalProcedure` substructure (`Anchor`, `GovAction`,
 /// `gov_action_id`) so the tx-body and snapshot decoders stay aligned.
-pub fn decode_proposals(
-    data: &[u8],
-) -> Result<Vec<HaskellGovActionState>, SerializationError> {
+pub fn decode_proposals(data: &[u8]) -> Result<Vec<HaskellGovActionState>, SerializationError> {
     use crate::decode::reader::Reader;
 
     let mut r = Reader::new(data);
@@ -517,9 +515,15 @@ fn decode_gov_action_id(
     Ok(HaskellGovActionId { tx_hash, index })
 }
 
+/// Result row from [`decode_credential_vote_map`]: `((credential_tag,
+/// hash28), vote)` where `credential_tag` is `0` for key-credentials
+/// and `1` for script-credentials. Lifted into a `type` alias to
+/// silence clippy::type_complexity on the return type.
+type CredentialVoteRow = ((u8, Hash28), HaskellVote);
+
 fn decode_credential_vote_map(
     r: &mut crate::decode::reader::Reader<'_>,
-) -> Result<Vec<((u8, Hash28), HaskellVote)>, SerializationError> {
+) -> Result<Vec<CredentialVoteRow>, SerializationError> {
     let map_len = r.read_map_header()?;
     let len = map_len.ok_or_else(|| {
         SerializationError::CborDecode(
