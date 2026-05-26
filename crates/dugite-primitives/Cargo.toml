@@ -27,5 +27,5 @@ proptest = { workspace = true }
 criterion = { workspace = true }
 
 [[bench]]
-name = "hash_bench"
+name = "primitives_bench"
 harness = false

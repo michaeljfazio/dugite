@@ -117,10 +117,10 @@ fn bench_vrf_verify(c: &mut Criterion) {
 }
 
 criterion_group!(
-    benches,
+    crypto_benches,
     bench_ed25519_verify,
     bench_ed25519_batch_verify,
     bench_keyhash_from_vkey,
     bench_vrf_verify
 );
-criterion_main!(benches);
+criterion_main!(crypto_benches);

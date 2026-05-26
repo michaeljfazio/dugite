@@ -11,23 +11,52 @@ permissions:
   pages: write
   id-token: write
 
+concurrency:
+  group: nightly-benchmarks
+  cancel-in-progress: false
+
 env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  benchmarks:
+  # ---------------------------------------------------------------------------
+  # Matrix of per-crate bench binaries. Each bench runs in its own job so wall-
+  # clock is max(per-bench), not sum(per-bench). The previous monolithic job
+  # was hitting the GitHub-hosted 6h runner ceiling; splitting brings the full
+  # nightly down to roughly 50-55 minutes.
+  #
+  # Convention: matrix.name is the short slug (no `_bench` suffix). Output
+  # files use the slug (e.g. `ledger.txt`) so the report job can do a 1:1
+  # filename -> section mapping.
+  # ---------------------------------------------------------------------------
+  bench:
     runs-on: ubuntu-latest
-    # Keep within the 6h GitHub-hosted runner ceiling. Recent runs landed
-    # between 5h and 5h56m; capping at 5h25m fails fast (with usable logs +
-    # artifacts) instead of being silently killed at the 6h limit.
-    timeout-minutes: 325
-    if: github.ref == 'refs/heads/main'
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { name: storage,       crate: dugite-storage,       bench: storage_bench }
+          - { name: ledger,        crate: dugite-ledger,        bench: ledger_bench }
+          - { name: network,       crate: dugite-network,       bench: network_bench }
+          - { name: consensus,     crate: dugite-consensus,     bench: consensus_bench }
+          - { name: lsm,           crate: dugite-lsm,           bench: lsm_bench }
+          - { name: mempool,       crate: dugite-mempool,       bench: mempool_bench }
+          - { name: crypto,        crate: dugite-crypto,        bench: crypto_bench }
+          - { name: primitives,    crate: dugite-primitives,    bench: primitives_bench }
+          - { name: serialization, crate: dugite-serialization, bench: serialization_bench }
+          # lsm-stress runs `cargo test --features large-tests`, not `cargo
+          # bench`. Step branches on matrix.bench == "__stress__".
+          - { name: lsm-stress,    crate: dugite-lsm,           bench: __stress__ }
     steps:
       - uses: actions/checkout@v6
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
 
+      # Per-bench Cargo cache: independent caches stop one bench's target dir
+      # thrashing another's. Mirrors the per-target cache shape used in
+      # fuzz.yml.
       - name: Cache cargo registry and build
         uses: actions/cache@v5
         with:
@@ -35,37 +64,30 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: ${{ runner.os }}-bench-${{ hashFiles('**/Cargo.lock') }}
+          key: ${{ runner.os }}-bench-${{ matrix.name }}-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: |
-            ${{ runner.os }}-bench-
+            ${{ runner.os }}-bench-${{ matrix.name }}-
 
-      # Separate stable cache for Criterion baselines so that benchmark
-      # comparison reports ("change: +2.3%") persist across CI runs even
-      # when Cargo.lock changes.
+      # Per-bench Criterion baseline cache. No lockfile in the key so the
+      # `nightly` baseline persists across dep bumps and the run-to-run
+      # `change: +/-x%` line stays meaningful. Stress test produces no
+      # baseline.
       - name: Cache Criterion baselines
+        if: matrix.bench != '__stress__'
         uses: actions/cache@v5
         with:
           path: target/criterion
-          key: ${{ runner.os }}-criterion-baselines
+          key: ${{ runner.os }}-criterion-${{ matrix.name }}
           restore-keys: |
-            ${{ runner.os }}-criterion-baselines
+            ${{ runner.os }}-criterion-${{ matrix.name }}
 
-      # Each benchmark is run ONCE with `--save-baseline nightly`. Criterion
-      # both produces the HTML report (target/criterion/<name>/report/) AND
-      # saves the run as the `nightly` baseline that the next run's default
-      # invocation compares against. Running twice (default + save-baseline)
-      # doubled job runtime and was pushing us past the 6h runner cap.
-      #
-      # `run_bench` strips cargo build chatter (Updating/Downloading/Compiling/
-      # Finished/Fresh lines) and ANSI escape sequences from the captured
-      # output so the markdown report contains only the criterion measurement
-      # lines that humans actually read. Full output is kept in *.full.txt
-      # for debugging.
+      # Strip cargo build chatter and ANSI escapes from captured bench output
+      # so the markdown report contains only criterion measurement lines.
+      # Full unfiltered output stays in *.full.txt for debugging.
       - name: Define output filter
         run: |
           cat > /tmp/filter-bench-output.sh <<'EOF'
           #!/usr/bin/env bash
-          # Strip ANSI escapes, drop cargo build noise, keep criterion output.
           sed -E 's/\x1B\[[0-9;]*[A-Za-z]//g' \
             | grep -vE '^\s*(Updating|Downloading|Downloaded|Compiling|Fresh|Finished|Running|Locking|Blocking|Adding|Removing|warning:|note:)' \
             | grep -vE '^\s*-->\s' \
@@ -75,35 +97,70 @@ jobs:
           EOF
           chmod +x /tmp/filter-bench-output.sh
 
-      - name: Run storage benchmarks
+      # One `cargo bench` per matrix entry. `--save-baseline nightly` both
+      # produces the HTML report under target/criterion/<group>/ AND saves
+      # the run as the `nightly` baseline for the next run's comparison.
+      - name: Run benchmark
+        if: matrix.bench != '__stress__'
         run: |
-          cargo bench -p dugite-storage --bench storage_bench --color never -- --save-baseline nightly --color never 2>&1 \
-            | tee storage_bench.full.txt | /tmp/filter-bench-output.sh > storage_bench.txt || true
+          cargo bench -p ${{ matrix.crate }} --bench ${{ matrix.bench }} --color never -- --save-baseline nightly --color never 2>&1 \
+            | tee ${{ matrix.name }}.full.txt | /tmp/filter-bench-output.sh > ${{ matrix.name }}.txt || true
 
-      - name: Run UTxO benchmarks
-        run: |
-          cargo bench -p dugite-ledger --bench utxo_bench --color never -- --save-baseline nightly --color never 2>&1 \
-            | tee utxo_bench.full.txt | /tmp/filter-bench-output.sh > utxo_bench.txt || true
-
-      - name: Run network benchmarks
-        run: |
-          cargo bench -p dugite-network --bench network_bench --color never -- --save-baseline nightly --color never 2>&1 \
-            | tee network_bench.full.txt | /tmp/filter-bench-output.sh > network_bench.txt || true
-
-      - name: Run consensus benchmarks
-        run: |
-          cargo bench -p dugite-consensus --bench consensus_bench --color never -- --save-baseline nightly --color never 2>&1 \
-            | tee consensus_bench.full.txt | /tmp/filter-bench-output.sh > consensus_bench.txt || true
-
-      - name: Run LSM benchmarks
-        run: |
-          cargo bench -p dugite-lsm --bench lsm_bench --color never -- --save-baseline nightly --color never 2>&1 \
-            | tee lsm_bench.full.txt | /tmp/filter-bench-output.sh > lsm_bench.txt || true
-
-      - name: Run LSM large-scale stress tests
+      # The LSM mainnet-scale tests are `large-tests` integration tests, not
+      # Criterion benches. They produce no target/criterion/ tree.
+      - name: Run LSM mainnet-scale stress tests
+        if: matrix.bench == '__stress__'
         run: |
           cargo test -p dugite-lsm --features large-tests --release --color never -- mainnet_scale --nocapture 2>&1 \
-            | tee lsm_stress.full.txt | /tmp/filter-bench-output.sh > lsm_stress.txt || true
+            | tee ${{ matrix.name }}.full.txt | /tmp/filter-bench-output.sh > ${{ matrix.name }}.txt || true
+
+      - name: Upload bench artifact
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: bench-${{ matrix.name }}
+          path: |
+            ${{ matrix.name }}.txt
+            ${{ matrix.name }}.full.txt
+            target/criterion/
+          if-no-files-found: warn
+          retention-days: 30
+
+  # ---------------------------------------------------------------------------
+  # Aggregate report. Runs after all matrix entries (always(), so a partial
+  # bench failure still produces a report for the suites that did pass).
+  # Only commits to main and publishes Pages from the main branch.
+  # ---------------------------------------------------------------------------
+  report:
+    needs: bench
+    if: always() && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Download all bench artifacts
+        uses: actions/download-artifact@v7
+        with:
+          pattern: bench-*
+          path: ./_artifacts
+
+      # Reassemble the per-job criterion trees into one combined tree at
+      # ./target/criterion/ so the Pages publish step sees every suite.
+      # Each bench-<name>/target/criterion/* contains disjoint group names.
+      - name: Reassemble criterion tree and bench logs
+        run: |
+          mkdir -p target/criterion
+          for dir in _artifacts/bench-*; do
+            name=${dir#_artifacts/bench-}
+            [ -f "$dir/${name}.txt" ] && cp "$dir/${name}.txt" ./
+            [ -f "$dir/${name}.full.txt" ] && cp "$dir/${name}.full.txt" ./
+            if [ -d "$dir/target/criterion" ]; then
+              cp -R "$dir/target/criterion/." target/criterion/
+            fi
+          done
+          ls -la *.txt 2>/dev/null || true
+          ls -la target/criterion/ 2>/dev/null || true
 
       - name: Generate benchmark report
         run: |
@@ -133,21 +190,24 @@ jobs:
             printf -- '---\n\n'
           } > "$REPORT"
 
-          emit_section "Storage" storage_bench.txt
-          emit_section "UTxO (ledger)" utxo_bench.txt
-          emit_section "Network" network_bench.txt
-          emit_section "Consensus" consensus_bench.txt
-          emit_section "LSM" lsm_bench.txt
-          emit_section "LSM stress tests" lsm_stress.txt
+          emit_section "Storage"          storage.txt
+          emit_section "Ledger (UTxO)"    ledger.txt
+          emit_section "Network"          network.txt
+          emit_section "Consensus"        consensus.txt
+          emit_section "LSM"              lsm.txt
+          emit_section "Mempool"          mempool.txt
+          emit_section "Crypto"           crypto.txt
+          emit_section "Primitives"       primitives.txt
+          emit_section "Serialization"    serialization.txt
+          emit_section "LSM stress tests" lsm-stress.txt
 
-      - name: Upload benchmark results as artifact
+      - name: Upload aggregated benchmark report
         uses: actions/upload-artifact@v7
         with:
           name: benchmark-results-${{ github.run_number }}
           path: |
             benches/*-nightly.md
-            *_bench.full.txt
-            lsm_stress.full.txt
+            *.full.txt
           retention-days: 90
 
       - name: Copy results to docs and commit
@@ -174,14 +234,11 @@ jobs:
       - name: Publish Criterion HTML to GitHub Pages
         run: |
           if [ -d "target/criterion" ]; then
-            # Build mdBook docs first
             mkdir -p mdbook && curl -sSL https://github.com/rust-lang/mdBook/releases/download/v0.4.40/mdbook-v0.4.40-x86_64-unknown-linux-gnu.tar.gz | tar -xz -C mdbook
             export PATH="$(pwd)/mdbook:$PATH"
             mdbook build docs || true
-            # Copy Criterion HTML reports into the docs output
             mkdir -p docs/book/benchmarks
             cp -r target/criterion/* docs/book/benchmarks/ 2>/dev/null || true
-            # Add a redirect page
             cat > docs/book/benchmarks/index.html <<BENCHHTML
           <!DOCTYPE html>
           <html><head><title>Dugite Benchmarks</title></head>

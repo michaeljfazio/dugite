@@ -211,13 +211,13 @@ Run storage benchmarks with:
 cargo bench -p dugite-storage --bench storage_bench
 
 # UTxO store benchmarks (insert, lookup, apply_tx, LSM configs, scaling to 1M entries)
-cargo bench -p dugite-ledger --bench utxo_bench
+cargo bench -p dugite-ledger --bench ledger_bench
 
 # Crypto benchmarks (Ed25519, blake2b keyhash)
 cargo bench -p dugite-crypto --bench crypto_bench
 
 # Hash benchmarks (blake2b_256, blake2b_224, batch hashing)
-cargo bench -p dugite-primitives --bench hash_bench
+cargo bench -p dugite-primitives --bench primitives_bench
 ```
 
 Results are saved to `target/criterion/` with HTML reports. Baseline results are tracked in `benches/`.
