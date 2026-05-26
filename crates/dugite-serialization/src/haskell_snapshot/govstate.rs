@@ -401,22 +401,52 @@ pub fn decode_proposals(
     use crate::decode::reader::Reader;
 
     let mut r = Reader::new(data);
-    let arr_len = r.read_array_header()?;
-    let len = arr_len.ok_or_else(|| {
-        SerializationError::CborDecode(
-            "Proposals: expected definite-length array, got indefinite".into(),
-        )
-    })?;
-    if len as usize > MAX_PROPOSALS {
+
+    // ── Outer `array(2) [roots, omap]` wrapper ──────────────────────────
+    //
+    // Haskell encodes `Proposals` as a 2-tuple:
+    //   `encCBOR (toPrevGovActionIds pRoots, pProps)`
+    // so the wire format is `array(2) [roots, omap]`. Confirmed by the
+    // `cardano-haskell-oracle` against `Cardano.Ledger.Conway.Governance.
+    // Proposals.hs#L385`.
+    let outer_len = r.read_array_header()?;
+    if outer_len != Some(2) {
         return Err(SerializationError::CborDecode(format!(
-            "Proposals: {} entries exceeds bound {MAX_PROPOSALS} (allocation bomb?)",
-            len
+            "Proposals: expected outer array(2) [roots, omap], got {outer_len:?}"
         )));
     }
-    let mut out = Vec::with_capacity(len as usize);
-    for _ in 0..len {
-        out.push(decode_gov_action_state(&mut r)?);
+
+    // ── Element [0]: roots — `GovRelation StrictMaybe` = `array(4)` of
+    //                StrictMaybe<GovPurposeId>.  Decode + discard;
+    //                dugite rebuilds proposal-tree roots from the
+    //                `gov_action.prev_action_id` fields below.
+    let roots_len = r.read_array_header()?;
+    if roots_len != Some(4) {
+        return Err(SerializationError::CborDecode(format!(
+            "Proposals.roots: expected array(4), got {roots_len:?}"
+        )));
     }
+    for _ in 0..4 {
+        r.skip()?; // StrictMaybe<GovPurposeId> — array(0) or array(1)[id]
+    }
+
+    // ── Element [1]: omap — `StrictSeq<GovActionState>` ─────────────────
+    //
+    // Haskell's `variableListLen` emits a definite-length array if N ≤ 23
+    // and an indefinite-length array (`0x9f … 0xff`) otherwise; the
+    // `for_each_array_item` helper transparently handles both.
+    let mut out: Vec<HaskellGovActionState> = Vec::new();
+    let mut count = 0usize;
+    r.for_each_array_item(|r| {
+        if count >= MAX_PROPOSALS {
+            return Err(SerializationError::CborDecode(format!(
+                "Proposals: more than {MAX_PROPOSALS} entries (allocation bomb?)"
+            )));
+        }
+        out.push(decode_gov_action_state(r)?);
+        count += 1;
+        Ok(())
+    })?;
     Ok(out)
 }
 
