@@ -3435,7 +3435,7 @@ fn update_enacted_root_local(
 /// Returns `false` (invalid, must reject) when the enacted root is `Some(...)`.
 ///
 /// `TreasuryWithdrawals` and `InfoAction` have no chain requirement — always `true`.
-fn genesis_root_is_valid(action: &GovAction, governance: &GovernanceState) -> bool {
+pub(crate) fn genesis_root_is_valid(action: &GovAction, governance: &GovernanceState) -> bool {
     let enacted_root = match action {
         GovAction::ParameterChange { .. } => governance.enacted_pparam_update.as_ref(),
         GovAction::HardForkInitiation { .. } => governance.enacted_hard_fork.as_ref(),
@@ -3459,7 +3459,7 @@ fn genesis_root_is_valid(action: &GovAction, governance: &GovernanceState) -> bo
 /// Unlike `prev_action_as_expected` (which checks `action.prev_action_id == enacted_root`),
 /// this takes the candidate `prev_id` directly so callers can test it without having
 /// to reconstruct the action's own `prev_action_id`.
-fn prev_action_matches_enacted_root(
+pub(crate) fn prev_action_matches_enacted_root(
     action: &GovAction,
     prev_id: &GovActionId,
     governance: &GovernanceState,

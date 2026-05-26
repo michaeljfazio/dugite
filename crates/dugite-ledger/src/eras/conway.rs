@@ -50,7 +50,8 @@ use super::common;
 use super::{EraRules, RuleContext};
 use crate::state::governance::{
     capture_governance_snapshots, expire_committee_members, forest_add_proposal,
-    gov_action_purpose_tag, gov_action_raw_prev_id, ratify_proposals_impl, update_dormant_epochs,
+    genesis_root_is_valid, gov_action_purpose_tag, gov_action_raw_prev_id,
+    prev_action_matches_enacted_root, ratify_proposals_impl, update_dormant_epochs,
     update_drep_activity,
 };
 use crate::state::substates::*;
@@ -1715,11 +1716,75 @@ fn process_governance_votes_and_proposals(
     }
 
     // Process proposals.
+    //
+    // Per Haskell `proposalsAddAction` (Proposals.hs), each proposal's
+    // `prev_action_id` is validated before insertion:
+    //
+    //   (a) prev_action_id = None  AND  enacted root for this purpose is also None
+    //       (genesis root — first ever proposal of this type)
+    //   (b) prev_action_id = Some(id)  AND  id matches the last enacted root of the
+    //       same purpose  OR  id is an active (in-flight) proposal
+    //
+    // Anything else is `InvalidPrevGovActionId` (tag 8) — the proposal is dropped.
+    // This mirrors the identical check in `LedgerState::process_proposal` (governance.rs)
+    // and ensures that stale cross-round `prev_action_id` values (e.g. an id from a
+    // previous devnet boot) cannot sneak past the GOV rule via block-apply path.
     for (idx, proposal) in tx.body.proposal_procedures.iter().enumerate() {
         let action_id = GovActionId {
             transaction_id: tx.hash,
             action_index: idx as u32,
         };
+
+        // Extract the prev_action_id for lineal-chain-purpose actions.
+        let prev_id = match &proposal.gov_action {
+            dugite_primitives::transaction::GovAction::ParameterChange {
+                prev_action_id, ..
+            }
+            | dugite_primitives::transaction::GovAction::HardForkInitiation {
+                prev_action_id,
+                ..
+            }
+            | dugite_primitives::transaction::GovAction::NoConfidence { prev_action_id }
+            | dugite_primitives::transaction::GovAction::UpdateCommittee {
+                prev_action_id, ..
+            }
+            | dugite_primitives::transaction::GovAction::NewConstitution {
+                prev_action_id, ..
+            } => prev_action_id.as_ref(),
+            dugite_primitives::transaction::GovAction::TreasuryWithdrawals { .. }
+            | dugite_primitives::transaction::GovAction::InfoAction => None,
+        };
+
+        // Validate prev_action_id per Haskell `proposalsAddAction`.
+        let valid = match prev_id {
+            None => {
+                // Case (a): genesis root — valid only when no prior action of this purpose
+                // has been enacted (enacted root is None for this purpose).
+                genesis_root_is_valid(&proposal.gov_action, governance)
+            }
+            Some(prev) => {
+                // Case (b): prev must reference either the last enacted root for this
+                // purpose OR an active (in-flight) proposal.
+                let valid_root =
+                    prev_action_matches_enacted_root(&proposal.gov_action, prev, governance);
+                let in_flight = governance.proposals.contains_key(prev);
+                valid_root || in_flight
+            }
+        };
+
+        if !valid {
+            debug!(
+                tx = %tx.hash.to_hex(),
+                action_index = idx,
+                action_type = ?std::mem::discriminant(&proposal.gov_action),
+                prev_tx = prev_id.map(|p| p.transaction_id.to_hex()),
+                prev_index = prev_id.map(|p| p.action_index),
+                "InvalidPrevGovActionId (GOV rule): proposal dropped — prev_action_id is \
+                 neither a genesis root, the last enacted root, nor an active in-flight proposal"
+            );
+            continue;
+        }
+
         let gov_action_lifetime = epochs.protocol_params.gov_action_lifetime;
         let proposal_state = ProposalState {
             procedure: proposal.clone(),
@@ -4950,6 +5015,230 @@ mod tests {
             gov.governance.enacted_committee,
             Some(action_id_3.clone()),
             "enacted_committee must be proposal 3's ID after E+3"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // InvalidPrevGovActionId — GOV rule block-apply path (process_governance_votes_and_proposals)
+    //
+    // These tests exercise the production code path (ConwayRules::apply_valid_tx →
+    // process_governance_votes_and_proposals) rather than the LedgerState::process_proposal
+    // path used by the governance.rs tests.  The distinction matters: the block-apply path
+    // previously skipped all prev_action_id validation (see commit following b0a6da398),
+    // admitting proposals that would later silently fail ratification at every epoch
+    // boundary (the devnet-validate Round 2 gov-lifecycle 10e timeout).
+    // -----------------------------------------------------------------------
+
+    /// A proposal with `prev_action_id = Some(stale_id)` where `stale_id` does not
+    /// exist in the active proposals map AND does not match the enacted root must be
+    /// silently dropped by the GOV rule (InvalidPrevGovActionId).
+    ///
+    /// Repro: devnet Round 2 submits ParameterChange with prev=Round1's enacted ID,
+    /// but Round 2 is a fresh chain so that ID is not in the graph nor the enacted root.
+    /// Before the fix, `process_governance_votes_and_proposals` inserted it anyway.
+    #[test]
+    fn test_stale_prev_action_id_rejected_via_apply_path() {
+        use dugite_primitives::transaction::{GovAction, GovActionId};
+
+        let params = ProtocolParameters::mainnet_defaults();
+        let ctx = make_conway_ctx(&params);
+        let rules = ConwayRules::new();
+
+        let mut utxo = make_utxo_sub(vec![]);
+        let mut certs = make_cert_sub();
+        let mut gov = make_gov_sub();
+        let mut epochs = make_epoch_sub();
+        epochs.protocol_params = params.clone();
+
+        // The stale action ID references a tx/index that does NOT exist on this chain.
+        let stale_id = GovActionId {
+            transaction_id: Hash32::from_bytes([0xDE; 32]),
+            action_index: 0,
+        };
+        // No enacted root, no active proposals — stale_id is neither.
+
+        let proposal = ProposalProcedure {
+            deposit: Lovelace(100_000_000_000),
+            return_addr: vec![0u8; 29],
+            gov_action: GovAction::ParameterChange {
+                prev_action_id: Some(stale_id),
+                protocol_param_update: Box::new(
+                    dugite_primitives::transaction::ProtocolParamUpdate {
+                        n_opt: Some(500),
+                        ..Default::default()
+                    },
+                ),
+                policy_hash: None,
+            },
+            anchor: Anchor {
+                url: "https://test".to_string(),
+                data_hash: Hash32::ZERO,
+            },
+        };
+
+        let mut prop_tx = make_tx(0x50, vec![], vec![], 0);
+        prop_tx.body.proposal_procedures = vec![proposal];
+
+        rules
+            .apply_valid_tx(
+                &prop_tx,
+                BlockValidationMode::ApplyOnly,
+                &ctx,
+                &mut utxo,
+                &mut certs,
+                &mut gov,
+                &mut epochs,
+            )
+            .expect("apply_valid_tx must not error — GOV rule silently drops bad proposals");
+
+        let action_id = GovActionId {
+            transaction_id: prop_tx.hash,
+            action_index: 0,
+        };
+        assert!(
+            !gov.governance.proposals.contains_key(&action_id),
+            "proposal with stale prev_action_id must be rejected (InvalidPrevGovActionId) \
+             via the GOV rule block-apply path; proposals={:?}",
+            gov.governance.proposals.keys().collect::<Vec<_>>(),
+        );
+    }
+
+    /// A proposal with `prev_action_id = Some(enacted_id)` where `enacted_id` is the
+    /// last enacted root for its purpose must be ADMITTED by the GOV rule.
+    ///
+    /// This is the Round 2 happy-path: 10a reads the enacted action ID from
+    /// `enacted.actionid` and correctly chains from it.
+    #[test]
+    fn test_enacted_root_chained_action_admitted_via_apply_path() {
+        use dugite_primitives::transaction::{GovAction, GovActionId};
+
+        let params = ProtocolParameters::mainnet_defaults();
+        let ctx = make_conway_ctx(&params);
+        let rules = ConwayRules::new();
+
+        let mut utxo = make_utxo_sub(vec![]);
+        let mut certs = make_cert_sub();
+        let mut gov = make_gov_sub();
+        let mut epochs = make_epoch_sub();
+        epochs.protocol_params = params.clone();
+
+        // Simulate that a prior ParameterChange was enacted: set enacted_pparam_update.
+        let enacted_id = GovActionId {
+            transaction_id: Hash32::from_bytes([0xAB; 32]),
+            action_index: 0,
+        };
+        Arc::make_mut(&mut gov.governance).enacted_pparam_update = Some(enacted_id.clone());
+
+        // New proposal chains from the enacted root.
+        let proposal = ProposalProcedure {
+            deposit: Lovelace(100_000_000_000),
+            return_addr: vec![0u8; 29],
+            gov_action: GovAction::ParameterChange {
+                prev_action_id: Some(enacted_id.clone()),
+                protocol_param_update: Box::new(
+                    dugite_primitives::transaction::ProtocolParamUpdate {
+                        n_opt: Some(501),
+                        ..Default::default()
+                    },
+                ),
+                policy_hash: None,
+            },
+            anchor: Anchor {
+                url: "https://test".to_string(),
+                data_hash: Hash32::ZERO,
+            },
+        };
+
+        let mut prop_tx = make_tx(0x51, vec![], vec![], 0);
+        prop_tx.body.proposal_procedures = vec![proposal];
+
+        rules
+            .apply_valid_tx(
+                &prop_tx,
+                BlockValidationMode::ApplyOnly,
+                &ctx,
+                &mut utxo,
+                &mut certs,
+                &mut gov,
+                &mut epochs,
+            )
+            .expect("apply_valid_tx must not error");
+
+        let action_id = GovActionId {
+            transaction_id: prop_tx.hash,
+            action_index: 0,
+        };
+        assert!(
+            gov.governance.proposals.contains_key(&action_id),
+            "proposal with prev_action_id = enacted root must be admitted; \
+             proposals={:?}",
+            gov.governance.proposals.keys().collect::<Vec<_>>(),
+        );
+    }
+
+    /// A proposal with `prev_action_id = None` on a fresh chain (no enacted root)
+    /// must be ADMITTED as a genesis root proposal.
+    ///
+    /// Regression guard for b0a6da398's positive path: genesis-root proposals
+    /// are valid on a brand-new chain where nothing of that purpose has been enacted.
+    #[test]
+    fn test_genesis_proposal_admitted_when_no_enacted_root_via_apply_path() {
+        use dugite_primitives::transaction::{GovAction, GovActionId};
+
+        let params = ProtocolParameters::mainnet_defaults();
+        let ctx = make_conway_ctx(&params);
+        let rules = ConwayRules::new();
+
+        let mut utxo = make_utxo_sub(vec![]);
+        let mut certs = make_cert_sub();
+        let mut gov = make_gov_sub();
+        let mut epochs = make_epoch_sub();
+        epochs.protocol_params = params.clone();
+        // enacted_pparam_update is None (fresh chain) — genesis root proposal must be accepted.
+
+        let proposal = ProposalProcedure {
+            deposit: Lovelace(100_000_000_000),
+            return_addr: vec![0u8; 29],
+            gov_action: GovAction::ParameterChange {
+                prev_action_id: None, // genesis root
+                protocol_param_update: Box::new(
+                    dugite_primitives::transaction::ProtocolParamUpdate {
+                        n_opt: Some(500),
+                        ..Default::default()
+                    },
+                ),
+                policy_hash: None,
+            },
+            anchor: Anchor {
+                url: "https://test".to_string(),
+                data_hash: Hash32::ZERO,
+            },
+        };
+
+        let mut prop_tx = make_tx(0x52, vec![], vec![], 0);
+        prop_tx.body.proposal_procedures = vec![proposal];
+
+        rules
+            .apply_valid_tx(
+                &prop_tx,
+                BlockValidationMode::ApplyOnly,
+                &ctx,
+                &mut utxo,
+                &mut certs,
+                &mut gov,
+                &mut epochs,
+            )
+            .expect("apply_valid_tx must not error");
+
+        let action_id = GovActionId {
+            transaction_id: prop_tx.hash,
+            action_index: 0,
+        };
+        assert!(
+            gov.governance.proposals.contains_key(&action_id),
+            "genesis-root proposal (prev_action_id=None) must be admitted on a fresh chain; \
+             proposals={:?}",
+            gov.governance.proposals.keys().collect::<Vec<_>>(),
         );
     }
 }
