@@ -149,8 +149,7 @@ impl HickoryDnsResolver {
                      (Cloudflare + Google + Quad9). Hostnames will resolve via \
                      public resolvers and ignore local DNS configuration."
                 );
-                let provider =
-                    hickory_resolver::net::runtime::TokioRuntimeProvider::default();
+                let provider = hickory_resolver::net::runtime::TokioRuntimeProvider::default();
                 let inner = hickory_resolver::TokioResolver::builder_with_config(
                     public_dns_config(),
                     provider,
