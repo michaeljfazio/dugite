@@ -615,6 +615,27 @@ pub struct NodeMetrics {
     pub peer_governor_target_established_big: AtomicU64,
     /// Maximum number of known big-ledger peers.
     pub peer_governor_target_known_big: AtomicU64,
+    // ── Snapshot worker metrics (issue #695) ────────────────────────────
+    /// Total snapshot requests enqueued to the background worker. Bumps
+    /// once per successful `try_send` from `Node::try_snapshot_async`.
+    pub snapshot_enqueued_total: AtomicU64,
+    /// Total snapshot requests skipped because the worker was still
+    /// processing a prior request. A persistently rising value means the
+    /// disk cannot keep up with the snapshot cadence — the apply path
+    /// never blocks but on-disk durability falls behind.
+    pub snapshot_skipped_busy_total: AtomicU64,
+    /// Total snapshot writes that returned an error or panicked inside
+    /// the worker. Each one leaves the prior on-disk snapshot intact via
+    /// the `.tmp` + atomic-rename pattern.
+    pub snapshot_failed_total: AtomicU64,
+    /// Total LSM (UTxO store) flush failures observed during Phase A.
+    /// Surfaces a stale-UTxO-vs-fresh-ledger inconsistency window of one
+    /// save cycle.
+    pub utxo_flush_failed_total: AtomicU64,
+    /// 1 when the background snapshot worker task is running, 0 when it
+    /// has exited. Operator gauge — a drop to 0 outside of shutdown
+    /// means snapshots have stopped firing entirely.
+    pub snapshot_worker_alive: AtomicU64,
 }
 
 /// Plain-data view of the governance-related ledger state and Conway
@@ -762,7 +783,46 @@ impl NodeMetrics {
             peer_governor_target_active_big: AtomicU64::new(0),
             peer_governor_target_established_big: AtomicU64::new(0),
             peer_governor_target_known_big: AtomicU64::new(0),
+            // Snapshot worker (#695)
+            snapshot_enqueued_total: AtomicU64::new(0),
+            snapshot_skipped_busy_total: AtomicU64::new(0),
+            snapshot_failed_total: AtomicU64::new(0),
+            utxo_flush_failed_total: AtomicU64::new(0),
+            snapshot_worker_alive: AtomicU64::new(0),
         }
+    }
+
+    // ── Snapshot worker counters / gauges (issue #695) ──────────────────
+
+    /// Increment after a successful `try_send` to the snapshot worker.
+    pub fn inc_snapshot_enqueued(&self) {
+        self.snapshot_enqueued_total.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Increment when the worker channel was full and the save was
+    /// skipped (matches cardano-node's `SnapshotDelayRange` semantics).
+    pub fn inc_snapshot_skipped_busy(&self) {
+        self.snapshot_skipped_busy_total
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Increment when the worker returned an error or panicked while
+    /// writing a snapshot.
+    pub fn inc_snapshot_failed(&self) {
+        self.snapshot_failed_total.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Increment when `save_utxo_snapshot` (LSM memtable flush) fails
+    /// inside Phase A.
+    pub fn inc_utxo_flush_failed(&self) {
+        self.utxo_flush_failed_total.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Set the worker-alive gauge. Call with `true` when the worker
+    /// task starts, `false` when it exits.
+    pub fn set_snapshot_worker_alive(&self, alive: bool) {
+        self.snapshot_worker_alive
+            .store(u64::from(alive), Ordering::Relaxed);
     }
 
     /// Enable or disable `cardano_node_metrics_*` compatibility aliases.
@@ -1350,6 +1410,27 @@ impl NodeMetrics {
                 "Total N2C connections accepted",
                 &self.n2c_connections_total,
             ),
+            (
+                "dugite_snapshot_enqueued_total",
+                "Snapshot requests successfully enqueued to the background worker",
+                &self.snapshot_enqueued_total,
+            ),
+            (
+                "dugite_snapshot_skipped_busy_total",
+                "Snapshot requests skipped because the background worker was busy \
+                 (Haskell-aligned delay-gate semantics)",
+                &self.snapshot_skipped_busy_total,
+            ),
+            (
+                "dugite_snapshot_failed_total",
+                "Snapshot writes that returned an error or panicked inside the worker",
+                &self.snapshot_failed_total,
+            ),
+            (
+                "dugite_utxo_flush_failed_total",
+                "LSM (UTxO store) flush failures observed during Phase A of snapshot save",
+                &self.utxo_flush_failed_total,
+            ),
         ];
 
         // Gauges (can go up and down)
@@ -1663,6 +1744,11 @@ impl NodeMetrics {
                 "dugite_peer_sharing_enabled",
                 "1 when peer sharing mini-protocol is enabled, 0 when disabled",
                 &self.peer_sharing_enabled,
+            ),
+            (
+                "dugite_snapshot_worker_alive",
+                "1 when the background snapshot worker task is running, 0 when exited",
+                &self.snapshot_worker_alive,
             ),
         ];
 
