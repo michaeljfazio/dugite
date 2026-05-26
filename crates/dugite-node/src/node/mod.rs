@@ -4795,6 +4795,17 @@ impl Node {
                 .collect();
             let tip_slot = block_slot;
             let ls = self.ledger_state.read().await;
+            // Snapshot the currently-active gov action ids so we can drop any
+            // mempool tx whose votes reference a `GovActionId` that no longer
+            // exists in the proposals registry — typically because the action
+            // was ratified-and-removed at the most-recent epoch boundary, or
+            // expired. Mirrors the same check in `sync.rs::apply_fetched_block`
+            // so dugite-bp's own-forge path also drops stale votes. Without
+            // this, the next forged block carries a vote that cardano-node
+            // rejects with `ConwayGovFailure (GovActionsDoNotExist …)`.
+            let active_action_ids: std::collections::HashSet<
+                dugite_primitives::transaction::GovActionId,
+            > = ls.gov.governance.proposals.keys().cloned().collect();
             self.mempool.revalidate_all(|tx| {
                 if tx.body.inputs.iter().any(|i| consumed_inputs.contains(i)) {
                     return false;
@@ -4809,6 +4820,27 @@ impl Node {
                         && self.mempool.lookup_virtual_utxo(input).is_none()
                     {
                         return false;
+                    }
+                }
+                // Drop txs whose votes reference a removed/expired gov action.
+                // Same-tx proposals are admissible by definition.
+                if !tx.body.voting_procedures.is_empty() {
+                    let local_action_ids: std::collections::HashSet<
+                        dugite_primitives::transaction::GovActionId,
+                    > = (0..tx.body.proposal_procedures.len())
+                        .map(|idx| dugite_primitives::transaction::GovActionId {
+                            transaction_id: tx.hash,
+                            action_index: idx as u32,
+                        })
+                        .collect();
+                    for (_voter, votes) in &tx.body.voting_procedures {
+                        for action_id in votes.keys() {
+                            if !active_action_ids.contains(action_id)
+                                && !local_action_ids.contains(action_id)
+                            {
+                                return false;
+                            }
+                        }
                     }
                 }
                 true
