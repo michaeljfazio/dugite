@@ -120,10 +120,12 @@ From the oracle research summarised in the conversation:
    }
    ```
 
-   `try_snapshot_async` is **not** async — it briefly takes the
-   ledger lock then returns. The await on the ledger lock is the
-   only pause point, and the lock duration is exactly what it is
-   today for Phase A (LSM flush + view build).
+   `try_snapshot_async` is `async fn` because it awaits the ledger
+   `RwLock`, but it does **no I/O** of its own — once the view is
+   built and `try_send` returns, the function completes immediately.
+   The only pause point is the existing Phase-A lock acquisition,
+   whose duration is unchanged (LSM flush + Arc::clone view build,
+   already short).
 
 3. **Bulk replay** (strict Haskell match).
    - Delete the `should_snapshot_bulk` triggers in `sync.rs:2185` and
