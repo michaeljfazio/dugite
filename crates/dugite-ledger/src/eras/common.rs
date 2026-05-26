@@ -1184,12 +1184,44 @@ mod tests {
             certs.stake_key_deposits.get(&key),
             Some(&epochs.protocol_params.key_deposit.0)
         );
+        // Issue #670: `pointer_map` is a pre-Conway construct. With
+        // `protocol_version_major: 9` (mainnet_defaults) the gate at
+        // `apply_shelley_cert` skips the pointer-map insert, mirroring
+        // Haskell `ConwayInstantStake` which drops `dsPtrs` at the
+        // Babbage→Conway TranslateEra step. So the entry must NOT be
+        // present in Conway+ era state.
         let ptr = Pointer {
             slot: 100,
             tx_index: 0,
             cert_index: 0,
         };
-        assert_eq!(certs.pointer_map.get(&ptr), Some(&key));
+        assert_eq!(
+            certs.pointer_map.get(&ptr),
+            None,
+            "Conway+ (PV >= 9) must NOT insert into pointer_map"
+        );
+
+        // Verify pre-Conway path still populates the pointer_map by
+        // lowering PV to 8 (Babbage) and re-running the cert.
+        let mut certs_babbage = empty_cert_sub();
+        let mut epochs_babbage = empty_epoch_sub();
+        epochs_babbage.protocol_params.protocol_version_major = 8;
+        let mut gov_babbage = empty_gov_sub();
+        let mut tx_babbage = make_tx(Hash32::from_bytes([60u8; 32]), vec![], vec![], 0);
+        tx_babbage.body.certificates = vec![Certificate::StakeRegistration(cred)];
+        process_shelley_certs(
+            &tx_babbage,
+            100,
+            0,
+            &mut certs_babbage,
+            &epochs_babbage,
+            &mut gov_babbage,
+        );
+        assert_eq!(
+            certs_babbage.pointer_map.get(&ptr),
+            Some(&key),
+            "pre-Conway (PV < 9) must populate pointer_map"
+        );
     }
 
     #[test]

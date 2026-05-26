@@ -243,3 +243,44 @@ pub struct HaskellConstitution {
     pub anchor_hash: Hash32,
     pub script_hash: Option<Hash28>,
 }
+
+/// Decoded `GovActionState` from the Haskell `Proposals` CBOR.
+///
+/// Haskell stores the proposal state as
+/// `array(7) [gasId, gasCommitteeVotes, gasDRepVotes, gasStakePoolVotes,
+///             gasProposalProcedure, gasProposedIn, gasExpiresAfter]`.
+/// We retain the full procedure (deposit/return_addr/gov_action/anchor)
+/// plus the three vote maps and the proposed/expires epoch numbers.
+///
+/// Note: per Haskell, the per-voter `gas*Votes` maps store only
+/// `Vote` (`Yes` / `No` / `Abstain`) — the original `VotingProcedure.anchor`
+/// is intentionally discarded at the time the vote is recorded into
+/// `GovActionState`. dugite's `votes_by_action` map therefore receives
+/// `VotingProcedure { vote, anchor: None }` when imported from a Haskell
+/// snapshot; the from-genesis path retains anchors so this field still
+/// diverges by anchor presence. Tracked separately under #670 follow-up.
+#[derive(Debug)]
+pub struct HaskellGovActionState {
+    pub gas_id: HaskellGovActionId,
+    pub committee_votes: Vec<((u8, Hash28), HaskellVote)>,
+    pub drep_votes: Vec<((u8, Hash28), HaskellVote)>,
+    pub pool_votes: Vec<(Hash28, HaskellVote)>,
+    pub procedure: dugite_primitives::transaction::ProposalProcedure,
+    pub proposed_in: EpochNo,
+    pub expires_after: EpochNo,
+}
+
+/// GovActionId = `array(2) [tx_hash(32), gov_action_index(uint)]`.
+#[derive(Debug, Clone)]
+pub struct HaskellGovActionId {
+    pub tx_hash: Hash32,
+    pub index: u64,
+}
+
+/// Vote enum: `0 = No`, `1 = Yes`, `2 = Abstain`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HaskellVote {
+    No,
+    Yes,
+    Abstain,
+}

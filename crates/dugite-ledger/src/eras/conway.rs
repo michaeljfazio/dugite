@@ -682,7 +682,19 @@ impl EraRules for ConwayRules {
             epochs.last_applied_rupd = Some(rupd);
         }
 
+        // Issue #670: drain `utxo.epoch_fees` by the same `ssFee` that the
+        // RUPD just consumed. Mirrors Haskell `applyRUpd`'s
+        // `utxosFees -= ssFee` semantics so `utxosFees` is a multi-epoch
+        // running total. See `shelley.rs` for the full rationale; the
+        // reset to zero at the end of this function is removed below.
+        let ss_fee_drained = epochs.snapshots.ss_fee;
+        utxo.epoch_fees =
+            Lovelace(utxo.epoch_fees.0.saturating_sub(ss_fee_drained.0));
+
         // Rotate snapshots: go <- set <- mark, capture fees.
+        //
+        // SNAP captures `ssFee` from the post-applyRUpd `utxosFees`, which
+        // is `epoch_fees` after the drain above.
         let captured_fees = utxo.epoch_fees;
         epochs.snapshots.go = epochs.snapshots.set.take();
         epochs.snapshots.set = epochs.snapshots.mark.take();
@@ -917,7 +929,11 @@ impl EraRules for ConwayRules {
         epochs.prev_protocol_params = old_params;
 
         // Reset per-epoch accumulators.
-        utxo.epoch_fees = Lovelace(0);
+        //
+        // Issue #670: `utxo.epoch_fees` is NOT reset here — it was drained
+        // earlier by `ssFee` (matching Haskell `applyRUpd`'s
+        // `utxosFees -= ssFee` semantics). The residual carries forward as
+        // the multi-epoch running total Haskell tracks in `utxosFees`.
         Arc::make_mut(&mut consensus.epoch_blocks_by_pool).clear();
         consensus.epoch_block_count = 0;
 
@@ -2694,8 +2710,15 @@ mod tests {
         assert_eq!(utxo.pending_donations.0, 0);
         assert_eq!(epochs.treasury.0, 101_000_000);
 
-        // Epoch fees reset.
-        assert_eq!(utxo.epoch_fees.0, 0);
+        // Issue #670: `epoch_fees` mirrors Haskell `utxosFees` and is a
+        // multi-epoch running total — it is NOT reset at every boundary.
+        // applyRUpd drains it by the prior boundary's `ssFee` (zero here
+        // because `make_epoch_sub` has `ss_fee = Lovelace(0)`), so the
+        // 500_000 lovelace we seeded carries forward verbatim and is now
+        // also reflected in `epochs.snapshots.ss_fee` (the post-drain
+        // capture for the next RUPD's `startStep`).
+        assert_eq!(utxo.epoch_fees.0, 500_000);
+        assert_eq!(epochs.snapshots.ss_fee.0, 500_000);
 
         // Expired CC member RETAINED in the map (issue #433): Haskell ledger
         // keeps the entry and surfaces it as `MemberStatus=Expired` at query

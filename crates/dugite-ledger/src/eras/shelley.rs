@@ -316,7 +316,27 @@ impl EraRules for ShelleyRules {
             epochs.last_applied_rupd = Some(rupd);
         }
 
+        // Issue #670: drain `utxo.epoch_fees` by the same `ssFee` that the
+        // RUPD just consumed. Haskell `applyRUpd` does
+        // `lsUTxOStateL . utxosFeesL %~ (`addDeltaCoin` deltaF ru)` where
+        // `deltaF = -ssFee` (the snapshot fee captured at startStep). The
+        // residual stays in `utxosFees` and only the current `ssFee` portion
+        // leaves — `utxosFees` is therefore a multi-epoch running total, not
+        // a per-epoch counter. Mirror the drain here so dugite's
+        // `epoch_fees` reaches the same final value as the Haskell ancillary
+        // import at the same anchor (verify-ledger-snapshot field
+        // `epoch_fees`). The reset to zero at the end of the function is
+        // removed below.
+        let ss_fee_drained = epochs.snapshots.ss_fee;
+        utxo.epoch_fees =
+            Lovelace(utxo.epoch_fees.0.saturating_sub(ss_fee_drained.0));
+
         // Step 3: SNAP — rotate snapshots, capture fees, update bprev.
+        //
+        // Per Haskell SNAP rule: `ssFee = utxosFees` of the **post-applyRUpd**
+        // state. We already applied RUPD and drained above, so `epoch_fees`
+        // is the post-drain residual; capturing it here matches Haskell's
+        // ordering exactly.
         let captured_fees = utxo.epoch_fees;
         epochs.snapshots.go = epochs.snapshots.set.take();
         epochs.snapshots.set = epochs.snapshots.mark.take();
@@ -623,7 +643,11 @@ impl EraRules for ShelleyRules {
         epochs.prev_protocol_params = old_params;
 
         // Reset per-epoch accumulators.
-        utxo.epoch_fees = Lovelace(0);
+        //
+        // Issue #670: `utxo.epoch_fees` is NOT reset here — it was drained
+        // earlier by `ssFee` (matching Haskell `applyRUpd`'s
+        // `utxosFees -= ssFee` semantics). The residual carries forward as
+        // the multi-epoch running total Haskell tracks in `utxosFees`.
         Arc::make_mut(&mut consensus.epoch_blocks_by_pool).clear();
         consensus.epoch_block_count = 0;
 
@@ -1449,7 +1473,12 @@ mod tests {
         );
         assert!(result.is_ok());
 
-        assert_eq!(utxo.epoch_fees.0, 0);
+        // Issue #670: `epoch_fees` mirrors Haskell `utxosFees` (multi-epoch
+        // cumulative). applyRUpd drains by the prior `ssFee` (zero here
+        // since `make_epoch_sub` seeds it that way), so the 1_000_000
+        // lovelace carries forward and is also captured into the new
+        // `ssFee` for the next boundary's RUPD.
+        assert_eq!(utxo.epoch_fees.0, 1_000_000);
         assert_eq!(consensus.epoch_block_count, 0);
         assert!(epochs.snapshots.mark.is_some());
         assert_eq!(epochs.snapshots.ss_fee.0, 1_000_000);

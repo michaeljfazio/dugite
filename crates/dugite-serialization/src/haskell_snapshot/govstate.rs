@@ -32,13 +32,16 @@
 use crate::error::SerializationError;
 use dugite_primitives::hash::Hash28;
 use dugite_primitives::protocol_params::ProtocolParameters;
+use dugite_primitives::time::EpochNo;
 
 use super::cbor_utils::{
     bounded_alloc_capacity, decode_array_len, decode_bytes, decode_credential, decode_hash32,
     decode_map_len, decode_rational, decode_text, decode_uint, skip_cbor_value,
 };
 use super::pparams::decode_pparams;
-use super::types::{HaskellConstitution, HaskellGovState};
+use super::types::{
+    HaskellConstitution, HaskellGovActionId, HaskellGovActionState, HaskellGovState, HaskellVote,
+};
 
 /// Maximum constitutional committee members we accept on snapshot decode.
 /// CIP-1694 caps the committee at `committeeMaxTermLength`-many members; the
@@ -358,6 +361,209 @@ pub struct HaskellCommittee {
 /// Returns `(HaskellCommittee, bytes_consumed)` so callers that decode within
 /// a larger CBOR stream can advance their cursor; production callers consume
 /// the whole `committee_raw` slice and ignore the length.
+/// Maximum proposals we accept on snapshot decode. CIP-1694 imposes no
+/// hard cap, but `govActionLifetime` × max-per-block bounds the practical
+/// maximum at low thousands. 16384 is generous headroom; we cap to
+/// prevent allocation-bomb attacks via tampered gov-state.
+const MAX_PROPOSALS: usize = 16384;
+
+/// Decode the Haskell `Proposals` raw CBOR captured from `proposals_raw`
+/// (position [0] of the `ConwayGovState array(7)` wrapper).
+///
+/// Haskell encodes `Proposals` via `encCBOR proposalsActions` where
+/// `proposalsActions :: Proposals era -> StrictSeq (GovActionState era)`.
+/// `StrictSeq` encodes as a CBOR list, so the raw bytes are
+/// `array(N) [gas_0, gas_1, …, gas_{N-1}]` where each `gas_i` is a
+/// `GovActionState` `array(7)`:
+///
+/// ```text
+/// GovActionState = array(7) [
+///   gas_id            : array(2) [tx_hash(32), gov_action_index(uint)]
+///   gas_committee_votes: { committee_credential => vote }
+///   gas_drep_votes     : { drep_credential => vote }
+///   gas_pool_votes     : { pool_key_hash(28) => vote }
+///   gas_proposal_proc  : array(4) [deposit, return_addr, gov_action, anchor]
+///   gas_proposed_in    : uint  (EpochNo)
+///   gas_expires_after  : uint  (EpochNo)
+/// ]
+///
+/// vote = uint  -- 0 = No, 1 = Yes, 2 = Abstain
+/// ```
+///
+/// Returns the decoded `GovActionState`s in the order they appeared in
+/// the CBOR (which is also the order Haskell tracks them via the OMap).
+/// Reuses `crates/dugite-serialization/src/decode/era_conway.rs` for the
+/// complex `ProposalProcedure` substructure (`Anchor`, `GovAction`,
+/// `gov_action_id`) so the tx-body and snapshot decoders stay aligned.
+pub fn decode_proposals(
+    data: &[u8],
+) -> Result<Vec<HaskellGovActionState>, SerializationError> {
+    use crate::decode::reader::Reader;
+
+    let mut r = Reader::new(data);
+    let arr_len = r.read_array_header()?;
+    let len = arr_len.ok_or_else(|| {
+        SerializationError::CborDecode(
+            "Proposals: expected definite-length array, got indefinite".into(),
+        )
+    })?;
+    if len as usize > MAX_PROPOSALS {
+        return Err(SerializationError::CborDecode(format!(
+            "Proposals: {} entries exceeds bound {MAX_PROPOSALS} (allocation bomb?)",
+            len
+        )));
+    }
+    let mut out = Vec::with_capacity(len as usize);
+    for _ in 0..len {
+        out.push(decode_gov_action_state(&mut r)?);
+    }
+    Ok(out)
+}
+
+fn decode_gov_action_state(
+    r: &mut crate::decode::reader::Reader<'_>,
+) -> Result<HaskellGovActionState, SerializationError> {
+    let arr_len = r.read_array_header()?;
+    if arr_len != Some(7) {
+        return Err(SerializationError::CborDecode(format!(
+            "GovActionState: expected array(7), got {arr_len:?}"
+        )));
+    }
+
+    // [0] gasId — array(2) [tx_hash(32), index(uint)]
+    let gas_id = decode_gov_action_id(r)?;
+
+    // [1] gasCommitteeVotes — Map (Credential 'HotCommitteeRole) Vote
+    let committee_votes = decode_credential_vote_map(r)?;
+
+    // [2] gasDRepVotes — Map (Credential 'DRepRole) Vote
+    let drep_votes = decode_credential_vote_map(r)?;
+
+    // [3] gasStakePoolVotes — Map (KeyHash 'StakePool) Vote
+    let pool_votes = decode_pool_vote_map(r)?;
+
+    // [4] gasProposalProcedure — array(4) [deposit, return_addr, gov_action, anchor]
+    // Mirrors the tx-body encoding; reuse the existing decoder.
+    let procedure = crate::decode::era_conway::read_proposal_procedure(r)?;
+
+    // [5] gasProposedIn — uint
+    let proposed_in = EpochNo(r.read_uint()?);
+
+    // [6] gasExpiresAfter — uint
+    let expires_after = EpochNo(r.read_uint()?);
+
+    Ok(HaskellGovActionState {
+        gas_id,
+        committee_votes,
+        drep_votes,
+        pool_votes,
+        procedure,
+        proposed_in,
+        expires_after,
+    })
+}
+
+fn decode_gov_action_id(
+    r: &mut crate::decode::reader::Reader<'_>,
+) -> Result<HaskellGovActionId, SerializationError> {
+    use dugite_primitives::hash::Hash32;
+    let arr_len = r.read_array_header()?;
+    if arr_len != Some(2) {
+        return Err(SerializationError::CborDecode(format!(
+            "GovActionId: expected array(2), got {arr_len:?}"
+        )));
+    }
+    let bytes = r.read_bytes()?;
+    if bytes.len() != 32 {
+        return Err(SerializationError::CborDecode(format!(
+            "GovActionId.tx_hash: expected 32 bytes, got {}",
+            bytes.len()
+        )));
+    }
+    let mut h = [0u8; 32];
+    h.copy_from_slice(bytes);
+    let tx_hash = Hash32::from_bytes(h);
+    let index = r.read_uint()?;
+    Ok(HaskellGovActionId { tx_hash, index })
+}
+
+fn decode_credential_vote_map(
+    r: &mut crate::decode::reader::Reader<'_>,
+) -> Result<Vec<((u8, Hash28), HaskellVote)>, SerializationError> {
+    let map_len = r.read_map_header()?;
+    let len = map_len.ok_or_else(|| {
+        SerializationError::CborDecode(
+            "credential→vote map: expected definite-length, got indefinite".into(),
+        )
+    })?;
+    let mut out = Vec::with_capacity(len as usize);
+    for _ in 0..len {
+        // Credential = array(2) [tag(0=key,1=script), hash28]
+        let arr_len = r.read_array_header()?;
+        if arr_len != Some(2) {
+            return Err(SerializationError::CborDecode(format!(
+                "credential: expected array(2), got {arr_len:?}"
+            )));
+        }
+        let tag = r.read_uint()? as u8;
+        let hash_bytes = r.read_bytes()?;
+        if hash_bytes.len() != 28 {
+            return Err(SerializationError::CborDecode(format!(
+                "credential hash: expected 28 bytes, got {}",
+                hash_bytes.len()
+            )));
+        }
+        let mut h = [0u8; 28];
+        h.copy_from_slice(hash_bytes);
+        let cred = Hash28::from_bytes(h);
+        let vote = decode_vote(r)?;
+        out.push(((tag, cred), vote));
+    }
+    Ok(out)
+}
+
+fn decode_pool_vote_map(
+    r: &mut crate::decode::reader::Reader<'_>,
+) -> Result<Vec<(Hash28, HaskellVote)>, SerializationError> {
+    let map_len = r.read_map_header()?;
+    let len = map_len.ok_or_else(|| {
+        SerializationError::CborDecode(
+            "pool→vote map: expected definite-length, got indefinite".into(),
+        )
+    })?;
+    let mut out = Vec::with_capacity(len as usize);
+    for _ in 0..len {
+        // KeyHash 'StakePool = bytes(28) — direct bytestring, no wrapper.
+        let hash_bytes = r.read_bytes()?;
+        if hash_bytes.len() != 28 {
+            return Err(SerializationError::CborDecode(format!(
+                "pool key hash: expected 28 bytes, got {}",
+                hash_bytes.len()
+            )));
+        }
+        let mut h = [0u8; 28];
+        h.copy_from_slice(hash_bytes);
+        let pool_id = Hash28::from_bytes(h);
+        let vote = decode_vote(r)?;
+        out.push((pool_id, vote));
+    }
+    Ok(out)
+}
+
+fn decode_vote(
+    r: &mut crate::decode::reader::Reader<'_>,
+) -> Result<HaskellVote, SerializationError> {
+    let v = r.read_uint()?;
+    match v {
+        0 => Ok(HaskellVote::No),
+        1 => Ok(HaskellVote::Yes),
+        2 => Ok(HaskellVote::Abstain),
+        other => Err(SerializationError::CborDecode(format!(
+            "vote: expected 0/1/2, got {other}"
+        ))),
+    }
+}
+
 pub fn decode_committee(data: &[u8]) -> Result<(HaskellCommittee, usize), SerializationError> {
     let mut off = 0;
 
