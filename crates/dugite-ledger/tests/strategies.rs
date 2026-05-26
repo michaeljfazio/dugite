@@ -614,7 +614,7 @@ pub fn arb_ledger_state(config: LedgerStateConfig) -> impl Strategy<Value = Ledg
                 state.certs.reward_accounts = Arc::new(reward_accounts.clone());
                 state.certs.delegations = Arc::new(delegations.clone());
                 state.certs.total_stake_key_deposits = (n_delegations as u64) * key_deposit;
-                state.certs.stake_key_deposits = stake_key_deposits;
+                state.certs.stake_key_deposits = std::sync::Arc::new(stake_key_deposits);
                 state.certs.stake_distribution = StakeDistributionState { stake_map };
 
                 // ── Mark / set / go snapshots ────────────────────────────────

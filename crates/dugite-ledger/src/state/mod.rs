@@ -607,7 +607,7 @@ impl LedgerState {
                 future_pool_params: HashMap::new(),
                 pending_retirements: HashMap::new(),
                 reward_accounts: Arc::new(HashMap::new()),
-                stake_key_deposits: HashMap::new(),
+                stake_key_deposits: Arc::new(HashMap::new()),
                 pool_deposits: HashMap::new(),
                 total_stake_key_deposits: 0,
                 pointer_map: HashMap::new(),
@@ -1088,7 +1088,7 @@ impl LedgerState {
                 future_pool_params,
                 pending_retirements,
                 reward_accounts: Arc::new(reward_accounts),
-                stake_key_deposits,
+                stake_key_deposits: Arc::new(stake_key_deposits),
                 pool_deposits,
                 total_stake_key_deposits,
                 pointer_map: HashMap::new(), // Conway era: pointers excluded

@@ -437,15 +437,13 @@ pub(crate) fn apply_shelley_cert(
                 certs.script_stake_credentials.insert(key);
             }
             certs.total_stake_key_deposits += epochs.protocol_params.key_deposit.0;
-            certs
-                .stake_key_deposits
+            Arc::make_mut(&mut certs.stake_key_deposits)
                 .insert(key, epochs.protocol_params.key_deposit.0);
             debug!("Stake key registered: {}", key.to_hex());
         }
         Certificate::StakeDeregistration(credential) => {
             let key = credential_to_hash(credential);
-            let stored_deposit = certs
-                .stake_key_deposits
+            let stored_deposit = Arc::make_mut(&mut certs.stake_key_deposits)
                 .remove(&key)
                 .unwrap_or(epochs.protocol_params.key_deposit.0);
             certs.total_stake_key_deposits = certs
@@ -791,7 +789,7 @@ mod tests {
             future_pool_params: HashMap::new(),
             pending_retirements: HashMap::new(),
             reward_accounts: Arc::new(HashMap::new()),
-            stake_key_deposits: HashMap::new(),
+            stake_key_deposits: Arc::new(HashMap::new()),
             pool_deposits: HashMap::new(),
             total_stake_key_deposits: 0,
             pointer_map: HashMap::new(),
@@ -1235,7 +1233,7 @@ mod tests {
 
         Arc::make_mut(&mut certs.reward_accounts).insert(key, Lovelace(500));
         Arc::make_mut(&mut certs.delegations).insert(key, Hash28::from_bytes([7u8; 28]));
-        certs.stake_key_deposits.insert(key, 2_000_000);
+        Arc::make_mut(&mut certs.stake_key_deposits).insert(key, 2_000_000);
         certs.total_stake_key_deposits = 2_000_000;
 
         let mut tx = make_tx(Hash32::from_bytes([51u8; 32]), vec![], vec![], 0);

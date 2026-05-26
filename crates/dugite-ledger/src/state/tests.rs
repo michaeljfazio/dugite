@@ -15342,7 +15342,7 @@ fn test_snapshot_roundtrip_preserves_deposit_maps() {
     let key = cred.to_typed_hash32();
     let pool_id = Hash28::from_bytes([0x55; 28]);
 
-    state.certs.stake_key_deposits.insert(key, 2_000_000);
+    std::sync::Arc::make_mut(&mut state.certs.stake_key_deposits).insert(key, 2_000_000);
     state.certs.pool_deposits.insert(pool_id, 500_000_000);
 
     let dir = tempfile::tempdir().unwrap();

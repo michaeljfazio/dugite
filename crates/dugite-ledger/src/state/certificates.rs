@@ -194,8 +194,7 @@ impl LedgerState {
                     self.certs.script_stake_credentials.insert(key);
                 }
                 self.certs.total_stake_key_deposits += self.epochs.protocol_params.key_deposit.0;
-                self.certs
-                    .stake_key_deposits
+                std::sync::Arc::make_mut(&mut self.certs.stake_key_deposits)
                     .insert(key, self.epochs.protocol_params.key_deposit.0);
                 debug!("Stake key registered: {}", key.to_hex());
             }
@@ -207,9 +206,7 @@ impl LedgerState {
                 // (rebuild_stake_distribution) sums ALL UTxOs by credential regardless
                 // of registration status.
                 // Use the stored deposit for correct refund when key_deposit changes.
-                let stored_deposit = self
-                    .certs
-                    .stake_key_deposits
+                let stored_deposit = std::sync::Arc::make_mut(&mut self.certs.stake_key_deposits)
                     .remove(&key)
                     .unwrap_or(self.epochs.protocol_params.key_deposit.0);
                 self.certs.total_stake_key_deposits = self
@@ -246,8 +243,7 @@ impl LedgerState {
                     self.certs.script_stake_credentials.insert(key);
                 }
                 self.certs.total_stake_key_deposits += self.epochs.protocol_params.key_deposit.0;
-                self.certs
-                    .stake_key_deposits
+                std::sync::Arc::make_mut(&mut self.certs.stake_key_deposits)
                     .insert(key, self.epochs.protocol_params.key_deposit.0);
                 debug!("Stake key registered (Conway): {}", key.to_hex());
             }
@@ -262,9 +258,7 @@ impl LedgerState {
                 // UTxOs may still exist at this credential.
                 let key = credential_to_hash(credential);
                 // Use the stored deposit for correct refund when key_deposit changes.
-                let stored_deposit = self
-                    .certs
-                    .stake_key_deposits
+                let stored_deposit = std::sync::Arc::make_mut(&mut self.certs.stake_key_deposits)
                     .remove(&key)
                     .unwrap_or(self.epochs.protocol_params.key_deposit.0);
                 self.certs.total_stake_key_deposits = self
@@ -367,8 +361,7 @@ impl LedgerState {
                     .or_insert(Lovelace(0));
                 Arc::make_mut(&mut self.certs.delegations).insert(key, *pool_hash);
                 self.certs.total_stake_key_deposits += self.epochs.protocol_params.key_deposit.0;
-                self.certs
-                    .stake_key_deposits
+                std::sync::Arc::make_mut(&mut self.certs.stake_key_deposits)
                     .insert(key, self.epochs.protocol_params.key_deposit.0);
                 if matches!(credential, Credential::Script(_)) {
                     self.certs.script_stake_credentials.insert(key);
@@ -542,8 +535,7 @@ impl LedgerState {
                     .vote_delegations
                     .insert(key, drep.clone());
                 self.certs.total_stake_key_deposits += self.epochs.protocol_params.key_deposit.0;
-                self.certs
-                    .stake_key_deposits
+                std::sync::Arc::make_mut(&mut self.certs.stake_key_deposits)
                     .insert(key, self.epochs.protocol_params.key_deposit.0);
                 if matches!(credential, Credential::Script(_)) {
                     self.certs.script_stake_credentials.insert(key);
@@ -572,8 +564,7 @@ impl LedgerState {
                     .vote_delegations
                     .insert(key, drep.clone());
                 self.certs.total_stake_key_deposits += self.epochs.protocol_params.key_deposit.0;
-                self.certs
-                    .stake_key_deposits
+                std::sync::Arc::make_mut(&mut self.certs.stake_key_deposits)
                     .insert(key, self.epochs.protocol_params.key_deposit.0);
                 if matches!(credential, Credential::Script(_)) {
                     self.certs.script_stake_credentials.insert(key);

@@ -1431,14 +1431,16 @@ fn apply_conway_cert(
                 certs.script_stake_credentials.insert(key);
             }
             certs.total_stake_key_deposits += deposit.0;
-            certs.stake_key_deposits.insert(key, deposit.0);
+            Arc::make_mut(&mut certs.stake_key_deposits).insert(key, deposit.0);
             debug!("Conway stake key registered: {}", key.to_hex());
         }
 
         // Conway stake deregistration with explicit refund (cert tag 8).
         Certificate::ConwayStakeDeregistration { credential, refund } => {
             let key = credential.to_typed_hash32();
-            let stored_deposit = certs.stake_key_deposits.remove(&key).unwrap_or(refund.0);
+            let stored_deposit = Arc::make_mut(&mut certs.stake_key_deposits)
+                .remove(&key)
+                .unwrap_or(refund.0);
             certs.total_stake_key_deposits = certs
                 .total_stake_key_deposits
                 .saturating_sub(stored_deposit);
@@ -1538,7 +1540,7 @@ fn apply_conway_cert(
                 certs.script_stake_credentials.insert(key);
             }
             certs.total_stake_key_deposits += deposit.0;
-            certs.stake_key_deposits.insert(key, deposit.0);
+            Arc::make_mut(&mut certs.stake_key_deposits).insert(key, deposit.0);
             // Delegate to pool.
             Arc::make_mut(&mut certs.delegations).insert(key, *pool_hash);
             debug!(
@@ -1569,7 +1571,7 @@ fn apply_conway_cert(
                 certs.script_stake_credentials.insert(key);
             }
             certs.total_stake_key_deposits += deposit.0;
-            certs.stake_key_deposits.insert(key, deposit.0);
+            Arc::make_mut(&mut certs.stake_key_deposits).insert(key, deposit.0);
             // Delegate to pool + DRep.
             Arc::make_mut(&mut certs.delegations).insert(key, *pool_hash);
             governance.vote_delegations.insert(key, drep.clone());
@@ -1600,7 +1602,7 @@ fn apply_conway_cert(
                 certs.script_stake_credentials.insert(key);
             }
             certs.total_stake_key_deposits += deposit.0;
-            certs.stake_key_deposits.insert(key, deposit.0);
+            Arc::make_mut(&mut certs.stake_key_deposits).insert(key, deposit.0);
             // Delegate vote.
             governance.vote_delegations.insert(key, drep.clone());
             debug!("VoteRegDeleg: {} + DRep", key.to_hex());
@@ -1777,7 +1779,7 @@ fn make_empty_cert_sub() -> CertSubState {
         future_pool_params: HashMap::new(),
         pending_retirements: HashMap::new(),
         reward_accounts: Arc::new(HashMap::new()),
-        stake_key_deposits: HashMap::new(),
+        stake_key_deposits: std::sync::Arc::new(HashMap::new()),
         pool_deposits: HashMap::new(),
         total_stake_key_deposits: 0,
         pointer_map: HashMap::new(),
@@ -1889,7 +1891,7 @@ mod tests {
             future_pool_params: HashMap::new(),
             pending_retirements: HashMap::new(),
             reward_accounts: Arc::new(HashMap::new()),
-            stake_key_deposits: HashMap::new(),
+            stake_key_deposits: std::sync::Arc::new(HashMap::new()),
             pool_deposits: HashMap::new(),
             total_stake_key_deposits: 0,
             pointer_map: HashMap::new(),
@@ -2978,7 +2980,7 @@ mod tests {
         // would be at the start of the suspect tx on-chain).
         Arc::make_mut(&mut certs.delegations).insert(key, pool_id);
         Arc::make_mut(&mut certs.reward_accounts).insert(key, Lovelace(0));
-        certs.stake_key_deposits.insert(key, 2_000_000);
+        Arc::make_mut(&mut certs.stake_key_deposits).insert(key, 2_000_000);
         certs.total_stake_key_deposits = 2_000_000;
         certs.script_stake_credentials.insert(key);
         certs
