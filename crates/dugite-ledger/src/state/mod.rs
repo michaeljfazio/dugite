@@ -969,20 +969,16 @@ impl LedgerState {
                     let mut yes: u64 = 0;
                     let mut no: u64 = 0;
                     let mut abstain: u64 = 0;
-                    let mut votes: Vec<(Voter, VotingProcedure)> =
-                        Vec::with_capacity(
-                            gas.committee_votes.len()
-                                + gas.drep_votes.len()
-                                + gas.pool_votes.len(),
-                        );
+                    let mut votes: Vec<(Voter, VotingProcedure)> = Vec::with_capacity(
+                        gas.committee_votes.len() + gas.drep_votes.len() + gas.pool_votes.len(),
+                    );
                     let to_vote = |v: HaskellVote| match v {
                         HaskellVote::No => Vote::No,
                         HaskellVote::Yes => Vote::Yes,
                         HaskellVote::Abstain => Vote::Abstain,
                     };
                     let tally =
-                        |v: HaskellVote, yes: &mut u64, no: &mut u64, abstain: &mut u64| match v
-                        {
+                        |v: HaskellVote, yes: &mut u64, no: &mut u64, abstain: &mut u64| match v {
                             HaskellVote::Yes => *yes += 1,
                             HaskellVote::No => *no += 1,
                             HaskellVote::Abstain => *abstain += 1,
