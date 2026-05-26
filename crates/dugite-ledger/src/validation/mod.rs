@@ -50,6 +50,7 @@ pub(crate) use collateral::plutus_script_version_map;
 pub(crate) use collateral::redeemer_script_version_map;
 
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 
 use dugite_primitives::hash::{Hash28, Hash32};
 use dugite_primitives::network::NetworkId;
@@ -91,9 +92,9 @@ pub struct ActiveProposal {
 
 #[derive(Default)]
 pub struct ValidationContext {
-    pub registered_pools: Option<HashSet<Hash28>>,
+    pub registered_pools: Option<Arc<HashSet<Hash28>>>,
     pub current_treasury: Option<u64>,
-    pub reward_accounts: Option<HashMap<Hash32, Lovelace>>,
+    pub reward_accounts: Option<Arc<HashMap<Hash32, Lovelace>>>,
     pub current_epoch: Option<u64>,
     /// Set of registered DRep credentials, keyed by
     /// [`Credential::to_typed_hash32`].  Byte 28 of the key encodes the
@@ -102,12 +103,12 @@ pub struct ValidationContext {
     /// credential and a script credential with the same 28-byte hash are
     /// treated as distinct DReps, matching the Haskell `KeyHashObj` /
     /// `ScriptHashObj` discrimination.
-    pub registered_dreps: Option<HashSet<Hash32>>,
-    pub registered_vrf_keys: Option<HashMap<Hash32, Hash28>>,
+    pub registered_dreps: Option<Arc<HashSet<Hash32>>>,
+    pub registered_vrf_keys: Option<Arc<HashMap<Hash32, Hash28>>>,
     pub node_network: Option<NetworkId>,
-    pub committee_members: Option<HashSet<Hash32>>,
-    pub committee_resigned: Option<HashSet<Hash32>>,
-    pub stake_key_deposits: Option<HashMap<Hash32, u64>>,
+    pub committee_members: Option<Arc<HashSet<Hash32>>>,
+    pub committee_resigned: Option<Arc<HashSet<Hash32>>>,
+    pub stake_key_deposits: Option<Arc<HashMap<Hash32, u64>>>,
     /// The constitution's guardrail script hash, if any.
     ///
     /// When `Some`, governance proposals of type `ParameterChange` or
@@ -116,7 +117,7 @@ pub struct ValidationContext {
     pub constitution_script_hash: Option<Hash28>,
     /// DRep vote delegations — keys are stake credential hashes of accounts
     /// that have delegated to any DRep (including AlwaysAbstain / AlwaysNoConfidence).
-    pub vote_delegations: Option<HashSet<Hash32>>,
+    pub vote_delegations: Option<Arc<HashSet<Hash32>>>,
     /// Map of currently active on-chain governance proposals, keyed by
     /// `GovActionId`.  When supplied, the validator uses this map to look up
     /// the [`ActiveProposal`] record for each `(voter, gov_action_id)` vote
@@ -129,7 +130,7 @@ pub struct ValidationContext {
     /// later GOV predicates (e.g. `VotingOnExpiredGovAction`,
     /// `ProposalReturnAccountDoesNotExist`) need the proposal's expiry
     /// epoch and return address, not just the action.
-    pub active_proposals: Option<HashMap<GovActionId, ActiveProposal>>,
+    pub active_proposals: Option<Arc<HashMap<GovActionId, ActiveProposal>>>,
     /// Hot credential hashes currently authorised by Constitutional Committee
     /// members (mirrors Haskell `authorizedHotCommitteeCredentials`).  Keys are
     /// stored as `credential.to_typed_hash32()` for symmetry with the
@@ -143,7 +144,7 @@ pub struct ValidationContext {
     /// `None`, the committee-hot-key membership check is skipped — i.e. a
     /// committee voter is treated as known.  This mirrors the lenient default
     /// used by `active_proposals`.
-    pub committee_authorized_hot_keys: Option<HashSet<Hash32>>,
+    pub committee_authorized_hot_keys: Option<Arc<HashSet<Hash32>>>,
     /// Subset of [`Self::committee_authorized_hot_keys`] whose backing cold
     /// credentials are in the **currently-enacted** committee
     /// (`committeeMembers electedCommittee` in Haskell).
@@ -156,7 +157,7 @@ pub struct ValidationContext {
     ///
     /// Reference: Haskell `authorizedElectedHotCommitteeCredentials` in
     /// `eras/conway/impl/src/Cardano/Ledger/CertState.hs`.
-    pub committee_authorized_elected_hot_keys: Option<HashSet<Hash32>>,
+    pub committee_authorized_elected_hot_keys: Option<Arc<HashSet<Hash32>>>,
     // ---------------------------------------------------------------------
     // MIR (Move Instantaneous Rewards) — Shelley–Babbage only.
     //
@@ -191,7 +192,7 @@ pub struct ValidationContext {
     /// `None` the predicate is silently skipped (lenient default —
     /// callers without `dsIRewards` plumbing must accept this partial
     /// limitation).
-    pub accumulated_mir_balances: Option<HashMap<Hash32, i64>>,
+    pub accumulated_mir_balances: Option<Arc<HashMap<Hash32, i64>>>,
     /// Set of currently registered genesis-delegate keys (`keysSet
     /// GenDelegs` in Haskell).  Used by the Shelley PPUP predicate
     /// `NonGenesisUpdatePPUP` to verify that every key in a pre-Conway
@@ -207,7 +208,7 @@ pub struct ValidationContext {
     ///
     /// Reference: Haskell `NonGenesisUpdatePPUP` in
     /// `eras/shelley/impl/src/Cardano/Ledger/Shelley/Rules/Ppup.hs`.
-    pub genesis_delegates: Option<HashSet<Hash28>>,
+    pub genesis_delegates: Option<Arc<HashSet<Hash28>>>,
 }
 
 impl ValidationContext {
@@ -215,7 +216,31 @@ impl ValidationContext {
         Self::default()
     }
 
+    // ── Owned `with_X` builders ──────────────────────────────────────────
+    //
+    // These accept owned `HashSet` / `HashMap` values and wrap them in an
+    // `Arc` internally.  They exist so the many call-sites in test code and
+    // n2c handlers that build ad-hoc validation contexts from owned data do
+    // not need to materialise Arcs themselves.  The hot path
+    // (per-tx validation inside `state::apply::apply_block`) MUST use the
+    // matching `with_X_arc` variants below, which take a pre-built `Arc`
+    // so that per-tx context construction is O(1) reference-count bumps
+    // instead of O(N) hash-table allocations + copies.
+    //
+    // Background: dugite previously rebuilt every registry set/map from
+    // scratch and deep-cloned `reward_accounts` (already `Arc<HashMap>` on
+    // the ledger state!) *for every transaction in every block*.  On
+    // Babbage/Conway preview blocks with ~4 txs and registries holding
+    // tens of thousands of reward accounts and DReps, that was ~400k
+    // hash-table entries copied per block — 100-200 ms of pure memcpy,
+    // dominating block apply throughput.
+
     pub fn with_pools(mut self, pools: HashSet<Hash28>) -> Self {
+        self.registered_pools = Some(Arc::new(pools));
+        self
+    }
+
+    pub fn with_pools_arc(mut self, pools: Arc<HashSet<Hash28>>) -> Self {
         self.registered_pools = Some(pools);
         self
     }
@@ -226,6 +251,11 @@ impl ValidationContext {
     }
 
     pub fn with_reward_accounts(mut self, accounts: HashMap<Hash32, Lovelace>) -> Self {
+        self.reward_accounts = Some(Arc::new(accounts));
+        self
+    }
+
+    pub fn with_reward_accounts_arc(mut self, accounts: Arc<HashMap<Hash32, Lovelace>>) -> Self {
         self.reward_accounts = Some(accounts);
         self
     }
@@ -236,11 +266,21 @@ impl ValidationContext {
     }
 
     pub fn with_dreps(mut self, dreps: HashSet<Hash32>) -> Self {
+        self.registered_dreps = Some(Arc::new(dreps));
+        self
+    }
+
+    pub fn with_dreps_arc(mut self, dreps: Arc<HashSet<Hash32>>) -> Self {
         self.registered_dreps = Some(dreps);
         self
     }
 
     pub fn with_vrf_keys(mut self, keys: HashMap<Hash32, Hash28>) -> Self {
+        self.registered_vrf_keys = Some(Arc::new(keys));
+        self
+    }
+
+    pub fn with_vrf_keys_arc(mut self, keys: Arc<HashMap<Hash32, Hash28>>) -> Self {
         self.registered_vrf_keys = Some(keys);
         self
     }
@@ -251,16 +291,31 @@ impl ValidationContext {
     }
 
     pub fn with_committee_members(mut self, members: HashSet<Hash32>) -> Self {
+        self.committee_members = Some(Arc::new(members));
+        self
+    }
+
+    pub fn with_committee_members_arc(mut self, members: Arc<HashSet<Hash32>>) -> Self {
         self.committee_members = Some(members);
         self
     }
 
     pub fn with_committee_resigned(mut self, resigned: HashSet<Hash32>) -> Self {
+        self.committee_resigned = Some(Arc::new(resigned));
+        self
+    }
+
+    pub fn with_committee_resigned_arc(mut self, resigned: Arc<HashSet<Hash32>>) -> Self {
         self.committee_resigned = Some(resigned);
         self
     }
 
     pub fn with_stake_key_deposits(mut self, deposits: HashMap<Hash32, u64>) -> Self {
+        self.stake_key_deposits = Some(Arc::new(deposits));
+        self
+    }
+
+    pub fn with_stake_key_deposits_arc(mut self, deposits: Arc<HashMap<Hash32, u64>>) -> Self {
         self.stake_key_deposits = Some(deposits);
         self
     }
@@ -271,6 +326,11 @@ impl ValidationContext {
     }
 
     pub fn with_vote_delegations(mut self, delegations: HashSet<Hash32>) -> Self {
+        self.vote_delegations = Some(Arc::new(delegations));
+        self
+    }
+
+    pub fn with_vote_delegations_arc(mut self, delegations: Arc<HashSet<Hash32>>) -> Self {
         self.vote_delegations = Some(delegations);
         self
     }
@@ -279,11 +339,27 @@ impl ValidationContext {
         mut self,
         proposals: HashMap<GovActionId, ActiveProposal>,
     ) -> Self {
+        self.active_proposals = Some(Arc::new(proposals));
+        self
+    }
+
+    pub fn with_active_proposals_arc(
+        mut self,
+        proposals: Arc<HashMap<GovActionId, ActiveProposal>>,
+    ) -> Self {
         self.active_proposals = Some(proposals);
         self
     }
 
     pub fn with_committee_authorized_hot_keys(mut self, hot_keys: HashSet<Hash32>) -> Self {
+        self.committee_authorized_hot_keys = Some(Arc::new(hot_keys));
+        self
+    }
+
+    pub fn with_committee_authorized_hot_keys_arc(
+        mut self,
+        hot_keys: Arc<HashSet<Hash32>>,
+    ) -> Self {
         self.committee_authorized_hot_keys = Some(hot_keys);
         self
     }
@@ -291,6 +367,14 @@ impl ValidationContext {
     pub fn with_committee_authorized_elected_hot_keys(
         mut self,
         hot_keys: HashSet<Hash32>,
+    ) -> Self {
+        self.committee_authorized_elected_hot_keys = Some(Arc::new(hot_keys));
+        self
+    }
+
+    pub fn with_committee_authorized_elected_hot_keys_arc(
+        mut self,
+        hot_keys: Arc<HashSet<Hash32>>,
     ) -> Self {
         self.committee_authorized_elected_hot_keys = Some(hot_keys);
         self
@@ -314,6 +398,14 @@ impl ValidationContext {
     /// Set the per-credential accumulated MIR rewards snapshot used by
     /// the Alonzo+ MIR `MIRProducesNegativeUpdate` predicate.
     pub fn with_accumulated_mir_balances(mut self, balances: HashMap<Hash32, i64>) -> Self {
+        self.accumulated_mir_balances = Some(Arc::new(balances));
+        self
+    }
+
+    pub fn with_accumulated_mir_balances_arc(
+        mut self,
+        balances: Arc<HashMap<Hash32, i64>>,
+    ) -> Self {
         self.accumulated_mir_balances = Some(balances);
         self
     }
@@ -355,7 +447,7 @@ impl ValidationContext {
     ) -> Self {
         // Conway+ has no MIR certs — accumulator is structurally empty.
         if ledger.epochs.protocol_params.protocol_version_major >= 9 {
-            self.accumulated_mir_balances = Some(HashMap::new());
+            self.accumulated_mir_balances = Some(Arc::new(HashMap::new()));
             return self;
         }
         // Pre-Conway: snapshot reward_accounts as best-effort i64 deltas.
@@ -369,13 +461,18 @@ impl ValidationContext {
                 (*cred_hash, i64::try_from(lovelace.0).unwrap_or(i64::MAX))
             })
             .collect();
-        self.accumulated_mir_balances = Some(snapshot);
+        self.accumulated_mir_balances = Some(Arc::new(snapshot));
         self
     }
 
     /// Set the set of registered genesis-delegate key hashes used by
     /// the Shelley PPUP `NonGenesisUpdatePPUP` predicate.
     pub fn with_genesis_delegates(mut self, keys: HashSet<Hash28>) -> Self {
+        self.genesis_delegates = Some(Arc::new(keys));
+        self
+    }
+
+    pub fn with_genesis_delegates_arc(mut self, keys: Arc<HashSet<Hash28>>) -> Self {
         self.genesis_delegates = Some(keys);
         self
     }
@@ -393,15 +490,15 @@ impl ValidationContext {
         committee_members: HashSet<Hash32>,
         committee_resigned: HashSet<Hash32>,
     ) -> Self {
-        self.registered_pools = Some(pools);
+        self.registered_pools = Some(Arc::new(pools));
         self.current_treasury = Some(treasury);
-        self.reward_accounts = Some(accounts);
+        self.reward_accounts = Some(Arc::new(accounts));
         self.current_epoch = Some(epoch);
-        self.registered_dreps = Some(dreps);
-        self.registered_vrf_keys = Some(vrf_keys);
+        self.registered_dreps = Some(Arc::new(dreps));
+        self.registered_vrf_keys = Some(Arc::new(vrf_keys));
         self.node_network = Some(network);
-        self.committee_members = Some(committee_members);
-        self.committee_resigned = Some(committee_resigned);
+        self.committee_members = Some(Arc::new(committee_members));
+        self.committee_resigned = Some(Arc::new(committee_resigned));
         self
     }
 }
@@ -1619,18 +1716,18 @@ pub fn validate_transaction_with_context(
         current_slot,
         tx_size,
         slot_config,
-        context.registered_pools.as_ref(),
+        context.registered_pools.as_deref(),
         context.current_treasury,
-        context.reward_accounts.as_ref(),
+        context.reward_accounts.as_deref(),
         context.current_epoch,
-        context.registered_dreps.as_ref(),
-        context.registered_vrf_keys.as_ref(),
+        context.registered_dreps.as_deref(),
+        context.registered_vrf_keys.as_deref(),
         context.node_network,
-        context.committee_members.as_ref(),
-        context.committee_resigned.as_ref(),
-        context.stake_key_deposits.as_ref(),
+        context.committee_members.as_deref(),
+        context.committee_resigned.as_deref(),
+        context.stake_key_deposits.as_deref(),
         context.constitution_script_hash,
-        context.vote_delegations.as_ref(),
+        context.vote_delegations.as_deref(),
     );
 
     // Conway GOV `VotersDoNotExist` and `DisallowedVoters` predicates.

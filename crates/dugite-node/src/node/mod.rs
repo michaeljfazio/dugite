@@ -4833,7 +4833,7 @@ impl Node {
                             action_index: idx as u32,
                         })
                         .collect();
-                    for (_voter, votes) in &tx.body.voting_procedures {
+                    for votes in tx.body.voting_procedures.values() {
                         for action_id in votes.keys() {
                             if !active_action_ids.contains(action_id)
                                 && !local_action_ids.contains(action_id)
@@ -6587,12 +6587,6 @@ impl Node {
                 {
                     let mut fragment = self.chain_fragment.write().await;
                     fragment.push(block.header.clone());
-                }
-
-                // Remove confirmed transactions from mempool
-                let confirmed: Vec<_> = block.transactions.iter().map(|tx| tx.hash).collect();
-                if !confirmed.is_empty() {
-                    self.mempool.remove_txs(&confirmed);
                 }
 
                 // Update consensus tip
