@@ -1205,8 +1205,7 @@ mod tests {
         block.header.issuer_vkey = vec![0xAA; 32];
         block.header.operational_cert.sequence_number = 42;
 
-        let pool_id =
-            dugite_primitives::hash::blake2b_224(&block.header.issuer_vkey);
+        let pool_id = dugite_primitives::hash::blake2b_224(&block.header.issuer_vkey);
 
         state
             .apply_block(&block, BlockValidationMode::ApplyOnly)

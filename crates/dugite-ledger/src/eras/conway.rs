@@ -688,8 +688,7 @@ impl EraRules for ConwayRules {
         // running total. See `shelley.rs` for the full rationale; the
         // reset to zero at the end of this function is removed below.
         let ss_fee_drained = epochs.snapshots.ss_fee;
-        utxo.epoch_fees =
-            Lovelace(utxo.epoch_fees.0.saturating_sub(ss_fee_drained.0));
+        utxo.epoch_fees = Lovelace(utxo.epoch_fees.0.saturating_sub(ss_fee_drained.0));
 
         // Rotate snapshots: go <- set <- mark, capture fees.
         //

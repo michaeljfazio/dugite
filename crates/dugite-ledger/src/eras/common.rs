@@ -1402,11 +1402,7 @@ mod tests {
 
         // First block: opcert seq = 5
         // make_header(nonce_vrf_output, prev_hash, issuer_vkey)
-        let mut h = make_header(
-            vec![1u8; 32],
-            Hash32::from_bytes([2u8; 32]),
-            vkey.clone(),
-        );
+        let mut h = make_header(vec![1u8; 32], Hash32::from_bytes([2u8; 32]), vkey.clone());
         h.operational_cert.sequence_number = 5;
         compute_shelley_nonce(&h, 100, 0, 43200, 1000, 0, 1, &mut consensus);
         assert_eq!(consensus.opcert_counters.get(&pool_id), Some(&5));
