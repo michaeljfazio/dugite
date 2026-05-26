@@ -38,4 +38,4 @@ cardano-cli conway transaction sign \
     --out-file      "$SIGNED" >/dev/null
 TXID=$(zoo_submit "$SIGNED") || { zoo_record "$NAME" FAIL "" "submit"; exit 1; }
 zoo_wait_all_observers "$TXID" 120 "$ADDR" && zoo_record "$NAME" PASS "$TXID" "retire_at=$RETIRE_EPOCH" \
-                              || zoo_record "$NAME" FAIL "$TXID" "not-included"
+                              || { zoo_record "$NAME" FAIL "$TXID" "not-included"; exit 1; }

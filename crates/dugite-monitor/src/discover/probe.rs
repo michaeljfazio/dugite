@@ -244,8 +244,9 @@ cardano_node_metrics_blockNum_int 12345678
     }
 
     /// Server that holds the response for `SLOW_SERVER_DELAY`. The probe
-    /// must time out well before this elapses.
-    const SLOW_SERVER_DELAY: Duration = Duration::from_secs(5);
+    /// must time out well before this elapses. 30 s gives plenty of room
+    /// even when the tokio scheduler is heavily loaded (6 000+ parallel tests).
+    const SLOW_SERVER_DELAY: Duration = Duration::from_secs(30);
 
     async fn serve_slow() -> SocketAddr {
         let listener = TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0)))
@@ -314,10 +315,13 @@ cardano_node_metrics_blockNum_int 12345678
         let elapsed = start.elapsed();
         assert!(outcome.is_none(), "slow server must time out");
         // The contract is "we did not wait for the slow server to respond".
-        // Use a generous margin so the test is not flaky under CI load —
-        // the assertion that matters is "much less than SLOW_SERVER_DELAY".
+        // Assert elapsed well below SLOW_SERVER_DELAY (30 s) so the test is
+        // not flaky under heavy parallel test-suite load (6 000+ tests).  We
+        // allow up to 10 s to absorb tokio scheduling jitter; the actual
+        // probe timeout is 500 ms, so any realistic schedule lag still
+        // satisfies this bound while the slow server is still sleeping.
         assert!(
-            elapsed < SLOW_SERVER_DELAY - Duration::from_secs(1),
+            elapsed < Duration::from_secs(10),
             "probe should time out well before {:?}, but took {:?}",
             SLOW_SERVER_DELAY,
             elapsed
