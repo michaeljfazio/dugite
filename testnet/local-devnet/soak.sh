@@ -8,7 +8,9 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 DURATION="${1:-1800}"
 TS="$(date -u +%Y%m%dT%H%M%SZ)"
-EVD="$LD_EVIDENCE/$TS"
+# Honour EVIDENCE_DIR if the caller (e.g. devnet-validate recipe) set it,
+# so the soak's evidence lands alongside the other suites' output.
+EVD="${EVIDENCE_DIR:-$LD_EVIDENCE/$TS}"
 mkdir -p "$EVD/logs"
 
 log_info "=== Soak starting (duration ${DURATION}s, evidence $EVD) ==="

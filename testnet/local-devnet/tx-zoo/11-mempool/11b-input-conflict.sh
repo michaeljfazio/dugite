@@ -44,8 +44,8 @@ cardano-cli conway transaction sign \
     --signing-key-file "$ZOO_PAY_SKEY" \
     --out-file         "$TX2" 2>/dev/null || { zoo_record "$NAME" SKIP "" "tx2-sign-failed"; exit 0; }
 
-TXID1=$(cardano-cli conway transaction txid --tx-file "$TX1" 2>/dev/null || echo "")
-TXID2=$(cardano-cli conway transaction txid --tx-file "$TX2" 2>/dev/null || echo "")
+TXID1=$(cardano-cli conway transaction txid --tx-file "$TX1" --output-text 2>/dev/null || echo "")
+TXID2=$(cardano-cli conway transaction txid --tx-file "$TX2" --output-text 2>/dev/null || echo "")
 
 # Submit tx1 first — should succeed
 if ! cardano-cli conway transaction submit \

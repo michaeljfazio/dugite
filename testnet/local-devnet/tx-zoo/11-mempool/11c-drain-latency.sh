@@ -50,7 +50,7 @@ for i in $(seq 1 "$BATCH"); do
         --signing-key-file "$ZOO_PAY_SKEY" \
         --out-file         "$TX_FILE" 2>/dev/null || { zoo_record "$NAME" SKIP "" "sign-failed-at-$i"; exit 0; }
 
-    TXID=$(cardano-cli conway transaction txid --tx-file "$TX_FILE" 2>/dev/null || echo "")
+    TXID=$(cardano-cli conway transaction txid --tx-file "$TX_FILE" --output-text 2>/dev/null || echo "")
     TXIDS+=("$TXID")
     TX_FILES+=("$TX_FILE")
     PREV_TXIN="${TXID}#0"
@@ -66,15 +66,19 @@ fi
 T_START=$(date +%s)
 SUBMITTED=0
 for i in $(seq 0 $((BATCH - 1))); do
-    if cardano-cli conway transaction submit \
+    # Use `if VAR=$(...)` so the assignment's exit status is consumed by the
+    # if-statement context and does NOT trigger `set -e` from the script's
+    # `set -euo pipefail`.
+    if SUBMIT_ERR=$(cardano-cli conway transaction submit \
             --testnet-magic "$LD_MAGIC" \
             --socket-path   "$ZOO_SOCKET" \
-            --tx-file       "${TX_FILES[$i]}" 2>/dev/null; then
+            --tx-file       "${TX_FILES[$i]}" 2>&1); then
         SUBMIT_TS+=("$(date +%s)")
         SUBMITTED=$(( SUBMITTED + 1 ))
     else
         SUBMIT_TS+=("0")
-        log_info "  tx $i submit failed (may be ok if chain broke)"
+        SUBMIT_ERR_SHORT=$(printf '%s' "$SUBMIT_ERR" | head -c 160 | tr '\n' ' ')
+        log_info "  tx $i submit failed: ${SUBMIT_ERR_SHORT}"
     fi
 done
 

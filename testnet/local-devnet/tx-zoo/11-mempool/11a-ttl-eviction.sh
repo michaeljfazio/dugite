@@ -15,8 +15,11 @@ TIP=$(zoo_tip_slot)
 FEE=200000
 SIGNED="$ZOO_BUILT/$NAME.signed"
 
-# TTL=current+2 ensures it expires quickly
-TTL=$((TIP + 2))
+# TTL=current+8 leaves enough margin for build/sign/submit to complete
+# before the wall-clock crosses TTL (each slot is 1s on the devnet, and
+# build/sign+IPC can take 1-2s under load), while still expiring quickly
+# enough that we can observe eviction within seconds.
+TTL=$((TIP + 8))
 
 cardano-cli conway transaction build-raw \
     --tx-in    "$TXIN" \
@@ -32,16 +35,18 @@ cardano-cli conway transaction sign \
     --out-file         "${SIGNED}.signed" 2>/dev/null || { zoo_record "$NAME" SKIP "" "sign-failed"; exit 0; }
 
 FINAL="${SIGNED}.signed"
-TXID=$(cardano-cli conway transaction txid --tx-file "$FINAL" 2>/dev/null || echo "")
+TXID=$(cardano-cli conway transaction txid --tx-file "$FINAL" --output-text 2>/dev/null || echo "")
 
-# Submit to mempool — it should be accepted initially
-if ! cardano-cli conway transaction submit \
+# Submit to mempool — it should be accepted initially.
+SUBMIT_ERR=$(cardano-cli conway transaction submit \
         --testnet-magic "$LD_MAGIC" \
         --socket-path   "$ZOO_SOCKET" \
-        --tx-file       "$FINAL" 2>/dev/null; then
-    zoo_record "$NAME" SKIP "" "submit-failed (tx may already be spent)"
+        --tx-file       "$FINAL" 2>&1) || {
+    # Trim the error to a single short line for the CSV row.
+    SUBMIT_ERR_SHORT=$(printf '%s' "$SUBMIT_ERR" | head -c 140 | tr '\n' ' ')
+    zoo_record "$NAME" SKIP "" "submit-failed: ${SUBMIT_ERR_SHORT}"
     exit 0
-fi
+}
 
 log_info "Submitted TTL=$TTL tx, waiting for expiry..."
 
