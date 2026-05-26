@@ -228,8 +228,13 @@ process_round() {
     # --- Epoch transitions ---
     local epoch_transitions="null"
     if [ -d "$logs_dir" ] && [ -f "$logs_dir/dugite-bp.log" ]; then
+        # `grep -c` always writes a count (0 on no match) AND exits 1 on
+        # zero matches; the previous `|| echo "null"` therefore appended a
+        # second value to stdout, producing the literal string `"0\nnull"`
+        # in the JSON and crashing the downstream `jq` parser.
         epoch_transitions=$(grep -ciE 'epoch transition|EpochTransition|epoch_transition' \
-            "$logs_dir/dugite-bp.log" 2>/dev/null || echo "null")
+            "$logs_dir/dugite-bp.log" 2>/dev/null || true)
+        [ -z "$epoch_transitions" ] && epoch_transitions="null"
     fi
 
     # --- Relative evidence path ---
