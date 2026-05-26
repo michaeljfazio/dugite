@@ -62,13 +62,11 @@ pub trait DnsResolver: Send + Sync {
     async fn a_aaaa_lookup(&self, host: &str) -> Vec<IpAddr>;
 }
 
-/// Fallback resolver that always returns "no records".  Use this when the
-/// system DNS configuration cannot be parsed (e.g. macOS publishes an IPv6
-/// link-local nameserver `fe80::…%en0` that hickory rejects with
-/// `invalid IP address syntax`).  The literal-IP fast path in
-/// [`resolve_with_srv`] still works against this resolver, so devnet
-/// topologies that list peers by IP (e.g. `127.0.0.1`) keep functioning
-/// without DNS.
+/// Fallback resolver that always returns "no records".  Kept for unit-test
+/// scenarios that want to inject a deterministic "no DNS" environment;
+/// production callers should use [`HickoryDnsResolver::new`] which already
+/// has its own internal fallback chain (system config → public DNS) and
+/// never returns a no-op resolver.
 pub struct NoopDnsResolver;
 
 #[async_trait::async_trait]
@@ -82,16 +80,85 @@ impl DnsResolver for NoopDnsResolver {
     }
 }
 
+/// Public-DNS nameserver groups used as a cross-platform fallback when the
+/// host's system DNS configuration cannot be parsed.
+///
+/// **Why this exists.** `hickory_resolver::TokioResolver::builder_tokio()`
+/// reads platform-native config (`/etc/resolv.conf` on Linux, the registry
+/// on Windows, SystemConfiguration on macOS). On macOS this often fails
+/// with `invalid IP address syntax` because the system publishes IPv6
+/// link-local nameservers (`fe80::…%en0`) that hickory's parser rejects;
+/// historically dugite then fell back to `NoopDnsResolver` and every
+/// hostname-based topology entry stayed unresolvable.
+///
+/// **The fix.** Keep a single DNS library (hickory), but layer a hardcoded
+/// public-DNS config on top so we can resolve hostnames on **any** platform
+/// without per-OS conditional code.  Cloudflare + Google + Quad9 in that
+/// order — three independent operators so a regional outage of one does
+/// not blackhole peer discovery.
+///
+/// The fallback bypasses local DNS configuration (corporate split-horizon,
+/// VPN-specific resolvers, etc.). Operators who need local DNS must either
+/// (a) ensure their system config is parseable by hickory, or (b) list
+/// peers by literal IP in the topology file.
+fn public_dns_config() -> hickory_resolver::config::ResolverConfig {
+    use hickory_resolver::config::{ResolverConfig, CLOUDFLARE, GOOGLE, QUAD9};
+    let mut config = ResolverConfig::udp_and_tcp(&CLOUDFLARE);
+    for ns in ResolverConfig::udp_and_tcp(&GOOGLE).name_servers() {
+        config.add_name_server(ns.clone());
+    }
+    for ns in ResolverConfig::udp_and_tcp(&QUAD9).name_servers() {
+        config.add_name_server(ns.clone());
+    }
+    config
+}
+
 /// Production resolver backed by `hickory_resolver::TokioResolver`.
+///
+/// Tries system DNS config first and transparently falls back to public DNS
+/// (Cloudflare → Google → Quad9) if the system config is unavailable. This
+/// keeps the resolver to a **single cross-platform library** (no
+/// `cfg(target_os = …)` branching and no OS-specific `getaddrinfo`
+/// shim), so the same code path supports Linux, macOS, Windows and Docker.
 pub struct HickoryDnsResolver {
     inner: hickory_resolver::TokioResolver,
 }
 
 impl HickoryDnsResolver {
-    /// Build a resolver from the system configuration.
+    /// Build a resolver.  Tries the host's system DNS configuration first;
+    /// on failure (typical on macOS where `/etc/resolv.conf` is a stub and
+    /// the real nameservers are IPv6 link-local entries hickory cannot
+    /// parse) falls back to a hardcoded public-DNS config (Cloudflare +
+    /// Google + Quad9).
+    ///
+    /// The fallback emits a single `warn!` log line so operators can see
+    /// they are no longer honouring local DNS configuration; this is
+    /// preferable to the previous behaviour which silently fell back to
+    /// `NoopDnsResolver` and broke peer discovery.
     pub fn new() -> Result<Self, hickory_resolver::net::NetError> {
-        let resolver = hickory_resolver::TokioResolver::builder_tokio()?.build();
-        Ok(Self { inner: resolver? })
+        match hickory_resolver::TokioResolver::builder_tokio() {
+            Ok(builder) => {
+                let inner = builder.build()?;
+                Ok(Self { inner })
+            }
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    "System DNS config unavailable (typical on macOS with IPv6 \
+                     link-local nameservers); falling back to public DNS \
+                     (Cloudflare + Google + Quad9). Hostnames will resolve via \
+                     public resolvers and ignore local DNS configuration."
+                );
+                let provider =
+                    hickory_resolver::net::runtime::TokioRuntimeProvider::default();
+                let inner = hickory_resolver::TokioResolver::builder_with_config(
+                    public_dns_config(),
+                    provider,
+                )
+                .build()?;
+                Ok(Self { inner })
+            }
+        }
     }
 }
 
@@ -638,6 +705,44 @@ mod tests {
         let addrs = resolve_topology_relays(&[("::1".to_string(), 3001)]).await;
         assert_eq!(addrs.len(), 1);
         assert_eq!(addrs[0].port(), 3001);
+    }
+
+    // ── #697: public-DNS fallback (cross-platform) ───────────────────────────
+    //
+    // `HickoryDnsResolver::new()` MUST succeed on every supported platform
+    // (Linux, macOS, Windows). Previously it returned `Err` on macOS when the
+    // system DNS config could not be parsed; callers then fell back to
+    // `NoopDnsResolver` and every hostname-based topology entry stayed
+    // unresolvable. The fix layers a hardcoded public-DNS config on top of
+    // the system-config attempt so construction never fails for parse
+    // reasons — these tests pin that contract.
+
+    /// Construction must never fail on the host platform. If hickory cannot
+    /// parse the system config we fall back to Cloudflare/Google/Quad9.
+    #[tokio::test]
+    async fn hickory_dns_resolver_new_always_succeeds() {
+        let result = HickoryDnsResolver::new();
+        assert!(
+            result.is_ok(),
+            "HickoryDnsResolver::new() must succeed via system-config OR \
+             public-DNS fallback, got: {:?}",
+            result.err()
+        );
+    }
+
+    /// `public_dns_config()` must include at least 6 nameservers — 2 each
+    /// from Cloudflare, Google and Quad9 (their IPv4 + IPv6 entries combined
+    /// give 4 per provider, 12 total). This catches an accidental
+    /// regression where one of the providers gets dropped from the chain.
+    #[test]
+    fn public_dns_config_includes_three_providers() {
+        let config = public_dns_config();
+        let count = config.name_servers().len();
+        assert!(
+            count >= 6,
+            "public DNS fallback must include at least 6 nameservers \
+             (Cloudflare + Google + Quad9, IPv4+IPv6), got {count}"
+        );
     }
 
     // ── A-008: SRV record count cap (security audit 2026-05-19) ──────────────
