@@ -341,6 +341,59 @@ pub enum TxValidationError {
         numerator: u64,
         denominator: u64,
     },
+
+    // ── Conway GOV predicate failures (Ledger tag 3) ──────────────────────
+    // These map to `ConwayLedgerPredFailure::ConwayGovFailure (ConwayGovPredFailure)`
+    // in Haskell wire format.  The inner GOV pred uses its own integer tags
+    // (0..18) distinct from the outer Ledger-level tags (1..9).
+    /// `GovActionsDoNotExist` (GOV tag 0): one or more votes reference a
+    /// `GovActionId` that is not in the active-proposal set.
+    ///
+    /// Each element is a hex-encoded tx-hash combined with the action index:
+    /// `"<txhash>#<index>"`.
+    GovActionsDoNotExist {
+        action_ids: Vec<String>,
+    },
+    /// `DisallowedVoters` (GOV tag 5): a voter type is not authorised for
+    /// the action type of the referenced governance action.
+    ///
+    /// Each element is `(<voter_hex>, "<txhash>#<index>")` where `voter_hex`
+    /// is the encoded wire discriminator + credential bytes (hex), matching
+    /// `Voter` CBOR wire format (disc 0-4, see `read_voter`).
+    DisallowedVoters {
+        /// Each `(voter_disc, credential_hex, action_id)` triple.
+        violations: Vec<(u8, String, String)>,
+    },
+    /// `VotersDoNotExist` (GOV tag 14): a voter is not in the corresponding
+    /// credential registry (DRep map, pool map, CC hot-key map).
+    VotersDoNotExist {
+        /// Each `(voter_disc, credential_hex)` pair.
+        voters: Vec<(u8, String)>,
+    },
+    /// `VotingOnExpiredGovAction` (GOV tag 9): a vote targets an action
+    /// whose `expiresAfterEpoch` has already passed.
+    ///
+    /// Elements mirror `DisallowedVoters`: `(voter_disc, credential_hex, action_id)`.
+    VotingOnExpiredGovAction {
+        expired_votes: Vec<(u8, String, String)>,
+    },
+    /// `ProposalReturnAccountDoesNotExist` (GOV tag 16): a proposal's
+    /// `return_addr` names a stake credential that is not registered.
+    ///
+    /// Each element is the hex-encoded raw reward-address bytes.
+    ProposalReturnAccountDoesNotExist {
+        bad_addrs: Vec<String>,
+    },
+    /// `UnelectedCommitteeVoters` (GOV tag 18): at PV >= 11, a
+    /// Constitutional Committee vote's hot credential is not backed by
+    /// an elected (non-resigned, non-expired) cold credential.
+    ///
+    /// Each element is `(disc, credential_hex)` matching Credential CBOR
+    /// wire format (0=key, 1=script).
+    UnelectedCommitteeVoters {
+        hot_credentials: Vec<(u8, String)>,
+    },
+
     /// Multiple validation errors collected.
     Multiple(Vec<TxValidationError>),
     /// Catch-all for other validation failures.
