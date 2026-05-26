@@ -56,12 +56,11 @@ fn snapshot_format_hash_stability() {
     // This hash was computed from the current LedgerStateSnapshot layout.
     // If this changes, existing snapshot files become unreadable.
     //
-    // Last update: SNAPSHOT_VERSION 17 → 18 (issue #631) — `CertSubState`
-    // gained four pending-MIR fields (`pending_mir_reserves`,
-    // `pending_mir_treasury`, `pending_mir_delta_reserves`,
-    // `pending_mir_delta_treasury`) so MIR-cert effects accumulate per
-    // Haskell `dsIRewards` and drain at the next epoch boundary.
-    const EXPECTED_HASH: &str = "ced0d4b9701568bd4697d2caeaf7971018638bda0c88b84e61ad89415820c575";
+    // Last update: SNAPSHOT_VERSION 18 → 19 (issue #670) — `ptr_stake_excluded`
+    // is no longer `#[serde(skip)]`; the field now round-trips through the
+    // serialised snapshot so reloading a Conway-era ledger does not silently
+    // revert pointer-stake exclusion back to `false`.
+    const EXPECTED_HASH: &str = "e0f8fc75409f3f41380b8f8a2d54a87100dde5b2956a5141bf54f3d473612dc1";
 
     if EXPECTED_HASH == "COMPUTE_ON_FIRST_RUN" {
         panic!(

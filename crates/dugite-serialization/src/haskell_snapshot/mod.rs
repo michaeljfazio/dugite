@@ -7,7 +7,7 @@ pub mod snapshots;
 pub mod types;
 
 pub use certstate::decode_certstate;
-pub use govstate::decode_govstate;
+pub use govstate::{decode_govstate, decode_proposals};
 pub use pparams::{decode_cost_models, decode_min_fee_ref_script, decode_pparams};
 pub use praos::decode_praos_state;
 pub use snapshots::decode_snapshots;

@@ -1500,7 +1500,7 @@ fn read_optional_anchor(r: &mut Reader<'_>) -> Result<Option<Anchor>, Serializat
     Ok(Some(read_anchor(r)?))
 }
 
-fn read_anchor(r: &mut Reader<'_>) -> Result<Anchor, SerializationError> {
+pub(crate) fn read_anchor(r: &mut Reader<'_>) -> Result<Anchor, SerializationError> {
     // anchor = [url : text, anchor_data_hash : $hash32]
     // Conway CDDL: url = text (CBOR major type 3).
     // Some implementations may encode the URL as bytes (major type 2); handle both
@@ -1702,7 +1702,7 @@ fn read_voter(r: &mut Reader<'_>) -> Result<Voter, SerializationError> {
     }
 }
 
-fn read_gov_action_id(r: &mut Reader<'_>) -> Result<GovActionId, SerializationError> {
+pub(crate) fn read_gov_action_id(r: &mut Reader<'_>) -> Result<GovActionId, SerializationError> {
     // gov_action_id = [transaction_id, gov_action_index]
     let arr_len = r.read_array_header()?;
     if !matches!(arr_len, Some(2)) {
@@ -1743,7 +1743,7 @@ fn read_vote(r: &mut Reader<'_>) -> Result<Vote, SerializationError> {
     }
 }
 
-fn read_proposal_procedure(r: &mut Reader<'_>) -> Result<ProposalProcedure, SerializationError> {
+pub(crate) fn read_proposal_procedure(r: &mut Reader<'_>) -> Result<ProposalProcedure, SerializationError> {
     // proposal_procedure = [deposit, reward_account, gov_action, anchor]
     let arr_len = r.read_array_header()?;
     if !matches!(arr_len, Some(4)) {
@@ -1874,7 +1874,7 @@ fn read_optional_gov_action_id(
     Ok(Some(read_gov_action_id(r)?))
 }
 
-fn read_optional_hash28_gov(r: &mut Reader<'_>) -> Result<Option<Hash28>, SerializationError> {
+pub(crate) fn read_optional_hash28_gov(r: &mut Reader<'_>) -> Result<Option<Hash28>, SerializationError> {
     let ty = r.peek_major()?;
     if ty == Type::Null {
         r.read_null()?;

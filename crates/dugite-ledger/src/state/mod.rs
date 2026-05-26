@@ -934,6 +934,129 @@ impl LedgerState {
             });
         }
 
+        // ── Proposals (issue #670) ──────────────────────────────────────
+        //
+        // Haskell stores active governance proposals in `gov_state.proposals_raw`
+        // as a CBOR list of `GovActionState` records. dugite mirrors this
+        // verbatim in `gov.proposals` (an `OMap GovActionId ProposalState`).
+        // Each `GovActionState` carries:
+        //   * the full `ProposalProcedure` (deposit, return_addr, gov_action,
+        //     anchor)
+        //   * the per-voter `gas{Committee,DRep,StakePool}Votes` maps —
+        //     tallied here into `(yes_votes, no_votes, abstain_votes)` and
+        //     also expanded into `gov.votes_by_action` for parity with the
+        //     from-genesis replay path.
+        //   * `gasProposedIn` and `gasExpiresAfter` epoch numbers.
+        //
+        // Without this decode the imported ledger had `proposals.len() = 0`
+        // and `governance` diverged from the from-genesis ledger by the
+        // full proposal-state payload (~5.7 MB on preview epoch 1308).
+        match dugite_serialization::haskell_snapshot::decode_proposals(
+            &hs.new_epoch_state.gov_state.proposals_raw,
+        ) {
+            Ok(haskell_proposals) => {
+                use dugite_primitives::transaction::{Vote, Voter, VotingProcedure};
+                use dugite_serialization::haskell_snapshot::types::HaskellVote;
+
+                let proposal_count = haskell_proposals.len();
+                for gas in haskell_proposals {
+                    let action_id = GovActionId {
+                        transaction_id: gas.gas_id.tx_hash,
+                        action_index: gas.gas_id.index as u32,
+                    };
+
+                    // Tally votes + build votes_by_action.
+                    let mut yes: u64 = 0;
+                    let mut no: u64 = 0;
+                    let mut abstain: u64 = 0;
+                    let mut votes: Vec<(Voter, VotingProcedure)> =
+                        Vec::with_capacity(
+                            gas.committee_votes.len()
+                                + gas.drep_votes.len()
+                                + gas.pool_votes.len(),
+                        );
+                    let to_vote = |v: HaskellVote| match v {
+                        HaskellVote::No => Vote::No,
+                        HaskellVote::Yes => Vote::Yes,
+                        HaskellVote::Abstain => Vote::Abstain,
+                    };
+                    let tally =
+                        |v: HaskellVote, yes: &mut u64, no: &mut u64, abstain: &mut u64| match v
+                        {
+                            HaskellVote::Yes => *yes += 1,
+                            HaskellVote::No => *no += 1,
+                            HaskellVote::Abstain => *abstain += 1,
+                        };
+                    let to_credential = |tag: u8, h: Hash28| -> Credential {
+                        if tag == 0 {
+                            Credential::VerificationKey(h)
+                        } else {
+                            Credential::Script(h)
+                        }
+                    };
+                    for ((tag, hash28), v) in &gas.committee_votes {
+                        tally(*v, &mut yes, &mut no, &mut abstain);
+                        votes.push((
+                            Voter::ConstitutionalCommittee(to_credential(*tag, *hash28)),
+                            VotingProcedure {
+                                vote: to_vote(*v),
+                                anchor: None,
+                            },
+                        ));
+                    }
+                    for ((tag, hash28), v) in &gas.drep_votes {
+                        tally(*v, &mut yes, &mut no, &mut abstain);
+                        votes.push((
+                            Voter::DRep(to_credential(*tag, *hash28)),
+                            VotingProcedure {
+                                vote: to_vote(*v),
+                                anchor: None,
+                            },
+                        ));
+                    }
+                    for (pool_id, v) in &gas.pool_votes {
+                        tally(*v, &mut yes, &mut no, &mut abstain);
+                        // Voter::StakePool key is the 32-byte typed credential
+                        // (28-byte key hash zero-padded to 32 with type-byte 0
+                        // at position 28). Pool keys are key credentials, so
+                        // the type-byte stays 0 and `to_hash32_padded` suffices.
+                        votes.push((
+                            Voter::StakePool(pool_id.to_hash32_padded()),
+                            VotingProcedure {
+                                vote: to_vote(*v),
+                                anchor: None,
+                            },
+                        ));
+                    }
+
+                    let state = ProposalState {
+                        procedure: gas.procedure,
+                        proposed_epoch: gas.proposed_in,
+                        expires_epoch: gas.expires_after,
+                        yes_votes: yes,
+                        no_votes: no,
+                        abstain_votes: abstain,
+                    };
+                    gov.proposals.insert(action_id.clone(), state);
+                    if !votes.is_empty() {
+                        gov.votes_by_action.insert(action_id, votes);
+                    }
+                }
+                info!(
+                    proposal_count,
+                    "Loaded active governance proposals from Haskell snapshot"
+                );
+            }
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    "Failed to decode proposals_raw from Haskell snapshot; \
+                     gov.proposals left empty (ratification/enactment will be \
+                     incorrect until the next from-genesis sync)"
+                );
+            }
+        }
+
         // ── Build stake distribution from mark snapshot ──────────────────
         // The "instant stake" from Haskell is the authoritative source.
         let mut stake_map = HashMap::new();
