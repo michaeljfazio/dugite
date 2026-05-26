@@ -88,9 +88,16 @@ const MAINNET_BYRON_SLOT_LENGTH: u64 = 20;
 ///
 /// Matches `compute_absolute_slot_within_era(epoch, slot, 432000, 20)`:
 /// `(epoch * 432000) / 20 + slot = epoch * 21600 + slot`.
+///
+/// Returns `u64::MAX` on overflow rather than panicking under debug overflow
+/// checks — an adversarial Byron block can encode `epoch = u64::MAX` and
+/// would otherwise abort the process. Real-world Byron epoch numbers are
+/// bounded by a few hundred so saturation cannot affect production decoding.
 #[inline]
 fn mainnet_absolute_slot(epoch: u64, rel_slot: u64) -> u64 {
-    epoch * (MAINNET_BYRON_EPOCH_LENGTH / MAINNET_BYRON_SLOT_LENGTH) + rel_slot
+    epoch
+        .saturating_mul(MAINNET_BYRON_EPOCH_LENGTH / MAINNET_BYRON_SLOT_LENGTH)
+        .saturating_add(rel_slot)
 }
 
 // ============================================================================
@@ -448,7 +455,16 @@ pub fn decode_byron_main_block(
     // Compute slot
     // -------------------------------------------------------------------------
     let slot = if byron_epoch_length > 0 {
-        SlotNo(epoch * byron_epoch_length + rel_slot)
+        // Saturating arithmetic: an adversarial Byron block can encode
+        // arbitrary u64 values for `epoch`/`rel_slot`, and the fuzz target
+        // is built with debug overflow checks; plain `*` / `+` would abort
+        // the process. Production Byron epoch numbers are bounded by a few
+        // hundred so saturation never affects valid blocks.
+        SlotNo(
+            epoch
+                .saturating_mul(byron_epoch_length)
+                .saturating_add(rel_slot),
+        )
     } else {
         SlotNo(mainnet_absolute_slot(epoch, rel_slot))
     };
@@ -579,7 +595,10 @@ pub fn decode_byron_ebb_block(
 
     // EBBs use slot 0 of their epoch.
     let slot = if byron_epoch_length > 0 {
-        SlotNo(epoch * byron_epoch_length)
+        // Saturating: see the matching note in `decode_byron_main_block` —
+        // adversarial inputs may encode huge `epoch` values that overflow
+        // `u64::MAX` under debug arithmetic.
+        SlotNo(epoch.saturating_mul(byron_epoch_length))
     } else {
         SlotNo(mainnet_absolute_slot(epoch, 0))
     };

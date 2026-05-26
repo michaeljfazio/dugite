@@ -1112,6 +1112,33 @@ fn read_ex_units(r: &mut Reader<'_>) -> Result<ExUnits, SerializationError> {
 ///   / bounded_bytes              ; bytes (possibly indefinite-length)
 /// ```
 pub(crate) fn read_plutus_data(r: &mut Reader<'_>) -> Result<PlutusData, SerializationError> {
+    read_plutus_data_depth(r, 0)
+}
+
+/// Maximum nesting depth for `read_plutus_data`.
+///
+/// Adversarial transactions can encode arbitrarily deep PlutusData via nested
+/// constructors, arrays, and maps. Each level consumes a frame of native stack
+/// (~3 KiB at -C opt-level=3, much larger under AddressSanitizer); without a
+/// cap a fuzz-generated input of a few KiB of repeated `0x9f` (indef array)
+/// bytes overflows the stack and SIGABRTs the decoder.
+///
+/// The cap matches `haskell_snapshot::cbor_utils::CBOR_SKIP_MAX_DEPTH` (1024)
+/// so any structure the skip helper accepts is also accepted here. Haskell's
+/// `cardano-ledger` PlutusData decoder relies on GHC's native stack and
+/// imposes no explicit limit, but in practice never approaches anywhere near
+/// this depth on real-world data. See #673 for the equivalent rationale.
+const MAX_PLUTUS_DATA_DEPTH: usize = 1024;
+
+fn read_plutus_data_depth(
+    r: &mut Reader<'_>,
+    depth: usize,
+) -> Result<PlutusData, SerializationError> {
+    if depth > MAX_PLUTUS_DATA_DEPTH {
+        return Err(SerializationError::CborDecode(format!(
+            "plutus_data nesting depth exceeds limit ({MAX_PLUTUS_DATA_DEPTH})"
+        )));
+    }
     let ty = r.peek_major()?;
     match ty {
         Type::Tag => {
@@ -1137,13 +1164,13 @@ pub(crate) fn read_plutus_data(r: &mut Reader<'_>) -> Result<PlutusData, Seriali
                 121..=127 => {
                     // Constr alternative 0..6: tag = 121 + N
                     let constructor = tag_n - 121;
-                    let fields = r.read_array(|r| read_plutus_data(r))?;
+                    let fields = r.read_array(|r| read_plutus_data_depth(r, depth + 1))?;
                     Ok(PlutusData::Constr(constructor, fields))
                 }
                 1280..=1400 => {
                     // Constr alternative 7..127: tag = 1280 + (N - 7)
                     let constructor = tag_n - 1280 + 7;
-                    let fields = r.read_array(|r| read_plutus_data(r))?;
+                    let fields = r.read_array(|r| read_plutus_data_depth(r, depth + 1))?;
                     Ok(PlutusData::Constr(constructor, fields))
                 }
                 102 => {
@@ -1155,7 +1182,7 @@ pub(crate) fn read_plutus_data(r: &mut Reader<'_>) -> Result<PlutusData, Seriali
                         )));
                     }
                     let constructor = r.read_uint()?;
-                    let fields = r.read_array(|r| read_plutus_data(r))?;
+                    let fields = r.read_array(|r| read_plutus_data_depth(r, depth + 1))?;
                     Ok(PlutusData::Constr(constructor, fields))
                 }
                 other => Err(SerializationError::CborDecode(format!(
@@ -1164,11 +1191,14 @@ pub(crate) fn read_plutus_data(r: &mut Reader<'_>) -> Result<PlutusData, Seriali
             }
         }
         Type::Map | Type::MapIndef => {
-            let pairs = r.read_map(|r| read_plutus_data(r), |r| read_plutus_data(r))?;
+            let pairs = r.read_map(
+                |r| read_plutus_data_depth(r, depth + 1),
+                |r| read_plutus_data_depth(r, depth + 1),
+            )?;
             Ok(PlutusData::Map(pairs))
         }
         Type::Array | Type::ArrayIndef => {
-            let items = r.read_array(|r| read_plutus_data(r))?;
+            let items = r.read_array(|r| read_plutus_data_depth(r, depth + 1))?;
             Ok(PlutusData::List(items))
         }
         Type::U8 | Type::U16 | Type::U32 | Type::U64 => {
