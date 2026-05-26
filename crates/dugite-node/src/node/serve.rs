@@ -875,6 +875,20 @@ pub(crate) fn convert_validation_error(
         VE::InvalidRewardAccount(msg) => TxValidationError::ScriptFailed {
             reason: format!("InvalidRewardAccount: {msg}"),
         },
+        VE::DelegateeDRepNotRegistered { drep_id } => TxValidationError::ScriptFailed {
+            reason: format!(
+                "Vote delegation rejected: target DRep {drep_id} is not registered \
+                 (DelegateeDRepNotRegisteredDELEG)"
+            ),
+        },
+        VE::StakeKeyNotRegisteredForDelegation { credential_hash } => {
+            TxValidationError::ScriptFailed {
+                reason: format!(
+                    "Delegation rejected: stake credential {credential_hash} is not registered \
+                     (StakeKeyNotRegisteredDELEG)"
+                ),
+            }
+        }
     }
 }
 

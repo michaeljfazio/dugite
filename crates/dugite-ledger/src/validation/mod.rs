@@ -1148,6 +1148,55 @@ pub enum ValidationError {
         /// Hex-encoded pool ID (Hash28).
         pool_id: String,
     },
+    /// Haskell `DelegateeDRepNotRegisteredDELEG`: a vote-delegation certificate
+    /// names a specific DRep credential that is not currently registered in
+    /// `dsUnified` / `vState.dsDReps`.
+    ///
+    /// Covers all delegation certificate variants that delegate to a specific
+    /// DRep (not AlwaysAbstain or AlwaysNoConfidence):
+    ///   - `VoteDelegation`     (tag 9 )
+    ///   - `StakeVoteDelegation`(tag 13)
+    ///   - `RegStakeVoteDeleg`  (tag 14)
+    ///   - `VoteRegDeleg`       (tag 15)
+    ///
+    /// `AlwaysAbstain` and `AlwaysNoConfidence` DRep targets are exempt —
+    /// they are built-in synthetic DReps with no registry entry.
+    ///
+    /// Reference: Haskell `DelegateeDRepNotRegisteredDELEG` in
+    /// `cardano-ledger-conway:Cardano.Ledger.Conway.Rules.Deleg`.
+    #[error(
+        "Vote delegation rejected: target DRep {drep_id} is not registered \
+         (DelegateeDRepNotRegisteredDELEG)"
+    )]
+    DelegateeDRepNotRegistered {
+        /// Hex-encoded DRep credential hash (typed-hash32, zero-padded to 32 bytes).
+        drep_id: String,
+    },
+    /// Haskell `StakeKeyNotRegisteredDELEG`: a delegation certificate references
+    /// a stake credential that is not registered in the ledger's reward-accounts
+    /// map (`dsUnified`).
+    ///
+    /// Covers delegation certificate variants that require the stake credential
+    /// to be registered BEFORE the cert is processed:
+    ///   - `StakeDelegation`     (tag 2 ) — pure pool delegation
+    ///   - `VoteDelegation`      (tag 9 ) — pure DRep delegation
+    ///   - `StakeVoteDelegation` (tag 13) — pool + DRep delegation
+    ///
+    /// The combined registration+delegation certs (`RegStakeDeleg` tag 11,
+    /// `RegStakeVoteDeleg` tag 14, `VoteRegDeleg` tag 15) are EXEMPT because
+    /// they register the credential atomically as part of the same cert — they
+    /// fire `StakeKeyRegisteredDELEG` if the key is ALREADY registered.
+    ///
+    /// Reference: Haskell `StakeKeyNotRegisteredDELEG` in
+    /// `cardano-ledger-shelley:Cardano.Ledger.Shelley.Rules.Deleg`.
+    #[error(
+        "Delegation rejected: stake credential {credential_hash} is not registered \
+         (StakeKeyNotRegisteredDELEG)"
+    )]
+    StakeKeyNotRegisteredForDelegation {
+        /// Hex-encoded credential hash (typed-hash32, zero-padded to 32 bytes).
+        credential_hash: String,
+    },
     /// Haskell `ConwayDRepAlreadyRegistered`: a `RegDRep` certificate names a
     /// DRep credential that is already present in the DRep registry.
     ///
@@ -2495,6 +2544,166 @@ pub fn validate_transaction_with_pools(
                 if !pools.contains(&pool_id) && !new_pools.contains(&pool_id) {
                     errors.push(ValidationError::DelegateePoolNotRegistered {
                         pool_id: pool_id.to_hex(),
+                    });
+                }
+            }
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // DelegateeDRepNotRegisteredDELEG (Conway DELEG rule, PV >= 9)
+    //
+    // A vote-delegation certificate that points to a specific DRep
+    // (KeyHash or ScriptHash) is rejected when that DRep credential is
+    // not present in `vState.dsDReps`.  The synthetic targets
+    // `AlwaysAbstain` and `AlwaysNoConfidence` are exempt — they are
+    // built-in and have no registry entry.
+    //
+    // This check applies to certs that include a DRep delegation target:
+    //   * `VoteDelegation`      (tag  9)
+    //   * `StakeVoteDelegation` (tag 13)
+    //   * `RegStakeVoteDeleg`   (tag 14)
+    //   * `VoteRegDeleg`        (tag 15)
+    //
+    // Haskell semantics (Conway DELEG rule): certs are applied left-to-right
+    // against the evolving CertState.  A `RegDRep` cert earlier in the same
+    // tx inserts the credential into `vsDReps` before the delegation cert is
+    // evaluated, so the checks below honour the same sequential semantics
+    // (tracking a per-tx `new_dreps` delta set).
+    //
+    // This check is only enforced in Conway (protocol >= 9) and when
+    // `registered_dreps` is provided.
+    //
+    // Reference: Haskell `DelegateeDRepNotRegisteredDELEG` in
+    // `cardano-ledger-conway:Cardano.Ledger.Conway.Rules.Deleg`.
+    // ------------------------------------------------------------------
+    if params.protocol_version_major >= 9 {
+        if let Some(dreps) = registered_dreps {
+            // Track DRep credentials registered within THIS tx (RegDRep cert
+            // preceding a VoteDelegation in the same tx is valid).
+            let mut new_dreps: std::collections::HashSet<dugite_primitives::hash::Hash32> =
+                std::collections::HashSet::new();
+            for cert in &tx.body.certificates {
+                // A RegDRep cert expands the per-tx set before delegation checks.
+                if let dugite_primitives::transaction::Certificate::RegDRep { credential, .. } =
+                    cert
+                {
+                    new_dreps.insert(credential.to_typed_hash32());
+                    continue;
+                }
+                // Extract the DRep target from certs that carry one.
+                let opt_drep: Option<&dugite_primitives::transaction::DRep> = match cert {
+                    dugite_primitives::transaction::Certificate::VoteDelegation {
+                        drep, ..
+                    } => Some(drep),
+                    dugite_primitives::transaction::Certificate::StakeVoteDelegation {
+                        drep,
+                        ..
+                    } => Some(drep),
+                    dugite_primitives::transaction::Certificate::RegStakeVoteDeleg {
+                        drep, ..
+                    } => Some(drep),
+                    dugite_primitives::transaction::Certificate::VoteRegDeleg { drep, .. } => {
+                        Some(drep)
+                    }
+                    _ => None,
+                };
+                if let Some(drep_target) = opt_drep {
+                    // `credential_hash32()` returns None for the synthetic
+                    // pseudo-DReps (Abstain, NoConfidence) and Some for
+                    // KeyHash/ScriptHash — exactly the split we need.
+                    if let Some(drep_key) = drep_target.credential_hash32() {
+                        if !dreps.contains(&drep_key) && !new_dreps.contains(&drep_key) {
+                            errors.push(ValidationError::DelegateeDRepNotRegistered {
+                                drep_id: drep_key.to_hex(),
+                            });
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // StakeKeyNotRegisteredDELEG (Shelley DELEG rule, all eras)
+    //
+    // A delegation certificate that delegates on behalf of a stake
+    // credential requires that credential to be registered in the ledger
+    // (i.e. present in the reward-accounts map / `dsUnified`).  Without
+    // this check, a transaction can nominate an arbitrary stake credential
+    // as the delegator — the CERTS rule would fail to find the account,
+    // but dugite would silently skip the error and forge the block anyway.
+    //
+    // Covered cert variants (pure delegation — stake key must already exist):
+    //   * `StakeDelegation`     (tag  2) — pool delegation
+    //   * `VoteDelegation`      (tag  9) — DRep delegation
+    //   * `StakeVoteDelegation` (tag 13) — pool + DRep delegation
+    //
+    // Combined registration+delegation certs (`RegStakeDeleg` tag 11,
+    // `RegStakeVoteDeleg` tag 14, `VoteRegDeleg` tag 15) are EXEMPT because
+    // they register the credential atomically — they fire
+    // `StakeKeyRegisteredDELEG` (above) if the key is ALREADY registered.
+    //
+    // This check is only enforced when `reward_accounts` is provided
+    // (block-apply / mempool context with full ledger state).
+    //
+    // Reference: Haskell `StakeKeyNotRegisteredDELEG` in
+    // `cardano-ledger-shelley:Cardano.Ledger.Shelley.Rules.Deleg`.
+    // ------------------------------------------------------------------
+    if let Some(accounts) = reward_accounts {
+        // Track stake credentials registered within THIS tx via
+        // StakeRegistration / ConwayStakeRegistration / Reg* combo certs,
+        // so that a same-tx register-then-delegate sequence is accepted.
+        let mut new_stake_keys: std::collections::HashSet<dugite_primitives::hash::Hash32> =
+            std::collections::HashSet::new();
+        for cert in &tx.body.certificates {
+            // Collect credentials registered by pure or combo registration certs.
+            let opt_reg_cred: Option<&dugite_primitives::credentials::Credential> = match cert {
+                dugite_primitives::transaction::Certificate::StakeRegistration(c) => Some(c),
+                dugite_primitives::transaction::Certificate::ConwayStakeRegistration {
+                    credential: c,
+                    ..
+                } => Some(c),
+                // Reg* combo certs register + delegate atomically, so they
+                // also expand the per-tx registered-key set.
+                dugite_primitives::transaction::Certificate::RegStakeDeleg {
+                    credential: c,
+                    ..
+                } => Some(c),
+                dugite_primitives::transaction::Certificate::RegStakeVoteDeleg {
+                    credential: c,
+                    ..
+                } => Some(c),
+                dugite_primitives::transaction::Certificate::VoteRegDeleg {
+                    credential: c, ..
+                } => Some(c),
+                _ => None,
+            };
+            if let Some(cred) = opt_reg_cred {
+                new_stake_keys.insert(cred.to_typed_hash32());
+                // Don't `continue` here — we still need to check delegation
+                // certs later in the loop.
+            }
+
+            // Extract the stake credential from pure-delegation certs.
+            let opt_deleg_cred: Option<&dugite_primitives::credentials::Credential> = match cert {
+                dugite_primitives::transaction::Certificate::StakeDelegation {
+                    credential, ..
+                } => Some(credential),
+                dugite_primitives::transaction::Certificate::VoteDelegation {
+                    credential, ..
+                } => Some(credential),
+                dugite_primitives::transaction::Certificate::StakeVoteDelegation {
+                    credential,
+                    ..
+                } => Some(credential),
+                _ => None,
+            };
+            if let Some(credential) = opt_deleg_cred {
+                let key = credential.to_typed_hash32();
+                if !accounts.contains_key(&key) && !new_stake_keys.contains(&key) {
+                    errors.push(ValidationError::StakeKeyNotRegisteredForDelegation {
+                        credential_hash: key.to_hex(),
                     });
                 }
             }
