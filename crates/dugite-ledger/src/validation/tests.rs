@@ -9543,6 +9543,629 @@ mod tests {
     }
 
     // ---------------------------------------------------------------------------
+    // DelegateeDRepNotRegisteredDELEG
+    //
+    // Haskell `DelegateeDRepNotRegisteredDELEG` — vote-delegation certs that
+    // target a specific KeyHash/ScriptHash DRep must be rejected when that DRep
+    // is not in the registered-DRep set.  AlwaysAbstain/NoConfidence are exempt.
+    //
+    // Reference: Haskell `DelegateeDRepNotRegisteredDELEG` in
+    // `cardano-ledger-conway:Cardano.Ledger.Conway.Rules.Deleg`.
+    // ---------------------------------------------------------------------------
+
+    /// Helper: build a vote-delegation transaction for the given cert.
+    fn make_vote_deleg_tx(utxo_set: &mut UtxoSet, cert: Certificate) -> Transaction {
+        let input = TransactionInput {
+            transaction_id: Hash32::from_bytes([0xDDu8; 32]),
+            index: 0,
+        };
+        utxo_set.insert(
+            input.clone(),
+            TransactionOutput {
+                address: Address::Byron(ByronAddress {
+                    payload: vec![0u8; 32],
+                }),
+                value: Value::lovelace(10_000_000),
+                datum: OutputDatum::None,
+                script_ref: None,
+                is_legacy: false,
+                raw_cbor: None,
+            },
+        );
+        let mut tx = make_simple_tx(input, 9_800_000, 200_000);
+        tx.body.certificates.push(cert);
+        tx
+    }
+
+    /// Helper: build a registered reward-accounts map containing a stake credential.
+    fn make_reward_accounts_with_cred(
+        cred_bytes: [u8; 28],
+    ) -> std::collections::HashMap<Hash32, Lovelace> {
+        use dugite_primitives::credentials::Credential;
+        let cred = Credential::VerificationKey(Hash28::from_bytes(cred_bytes));
+        let key = cred.to_typed_hash32();
+        let mut accounts = std::collections::HashMap::new();
+        accounts.insert(key, Lovelace(0));
+        accounts
+    }
+
+    #[test]
+    fn test_vote_deleg_to_unregistered_drep_rejected() {
+        // VoteDelegation to an unregistered DRep must produce
+        // DelegateeDRepNotRegistered in Conway era.
+        let drep_cred_bytes = [0x40u8; 28];
+        let stake_cred_bytes = [0x41u8; 28];
+        let mut params = ProtocolParameters::mainnet_defaults();
+        params.protocol_version_major = 9; // Conway
+
+        let drep_hash = Hash28::from_bytes(drep_cred_bytes).to_hash32_padded();
+        // DRep target as a KeyHash DRep
+        let drep = DRep::KeyHash(drep_hash);
+        let stake_cred = dugite_primitives::credentials::Credential::VerificationKey(
+            Hash28::from_bytes(stake_cred_bytes),
+        );
+
+        let mut utxo_set = UtxoSet::new();
+        let tx = make_vote_deleg_tx(
+            &mut utxo_set,
+            Certificate::VoteDelegation {
+                credential: stake_cred.clone(),
+                drep,
+            },
+        );
+
+        // registered_dreps is empty — drep is NOT registered
+        let registered_dreps: std::collections::HashSet<Hash32> = std::collections::HashSet::new();
+        // Stake credential is registered in reward accounts
+        let reward_accounts = make_reward_accounts_with_cred(stake_cred_bytes);
+
+        let result = validate_transaction_with_pools(
+            &tx,
+            &utxo_set,
+            &params,
+            100,
+            300,
+            None,
+            None,
+            None,
+            Some(&reward_accounts),
+            None,
+            Some(&registered_dreps),
+            None, // registered_vrf_keys
+            None, // node_network
+            None, // committee_members
+            None, // committee_resigned
+            None, // stake_key_deposits
+            None, // constitution_script_hash
+            None, // vote_delegations
+        );
+
+        assert!(
+            result.is_err(),
+            "Expected DelegateeDRepNotRegistered for VoteDelegation to unregistered DRep; got Ok"
+        );
+        let errors = result.unwrap_err();
+        assert!(
+            errors
+                .iter()
+                .any(|e| matches!(e, ValidationError::DelegateeDRepNotRegistered { .. })),
+            "Expected DelegateeDRepNotRegistered; got: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn test_vote_deleg_to_registered_drep_accepted() {
+        // VoteDelegation to a registered DRep must not produce
+        // DelegateeDRepNotRegistered.
+        let drep_cred_bytes = [0x42u8; 28];
+        let stake_cred_bytes = [0x43u8; 28];
+        let mut params = ProtocolParameters::mainnet_defaults();
+        params.protocol_version_major = 9; // Conway
+
+        let drep_hash = Hash28::from_bytes(drep_cred_bytes).to_hash32_padded();
+        let drep = DRep::KeyHash(drep_hash);
+        let stake_cred = dugite_primitives::credentials::Credential::VerificationKey(
+            Hash28::from_bytes(stake_cred_bytes),
+        );
+
+        let mut utxo_set = UtxoSet::new();
+        let tx = make_vote_deleg_tx(
+            &mut utxo_set,
+            Certificate::VoteDelegation {
+                credential: stake_cred.clone(),
+                drep,
+            },
+        );
+
+        // registered_dreps contains the target DRep
+        let mut registered_dreps: std::collections::HashSet<Hash32> =
+            std::collections::HashSet::new();
+        registered_dreps.insert(drep_hash);
+        let reward_accounts = make_reward_accounts_with_cred(stake_cred_bytes);
+
+        let result = validate_transaction_with_pools(
+            &tx,
+            &utxo_set,
+            &params,
+            100,
+            300,
+            None,
+            None,
+            None,
+            Some(&reward_accounts),
+            None,
+            Some(&registered_dreps),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+
+        let has_drep_err = matches!(&result, Err(errors) if errors.iter().any(|e| {
+            matches!(e, ValidationError::DelegateeDRepNotRegistered { .. })
+        }));
+        assert!(
+            !has_drep_err,
+            "Expected no DelegateeDRepNotRegistered for registered DRep; got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn test_vote_deleg_always_abstain_exempt_from_drep_check() {
+        // VoteDelegation to AlwaysAbstain (synthetic DRep) must not require
+        // a registry entry — AlwaysAbstain is always valid.
+        let stake_cred_bytes = [0x44u8; 28];
+        let mut params = ProtocolParameters::mainnet_defaults();
+        params.protocol_version_major = 9; // Conway
+        let stake_cred = dugite_primitives::credentials::Credential::VerificationKey(
+            Hash28::from_bytes(stake_cred_bytes),
+        );
+
+        let mut utxo_set = UtxoSet::new();
+        let tx = make_vote_deleg_tx(
+            &mut utxo_set,
+            Certificate::VoteDelegation {
+                credential: stake_cred.clone(),
+                drep: DRep::Abstain,
+            },
+        );
+
+        // registered_dreps is empty — but AlwaysAbstain doesn't need an entry
+        let registered_dreps: std::collections::HashSet<Hash32> = std::collections::HashSet::new();
+        let reward_accounts = make_reward_accounts_with_cred(stake_cred_bytes);
+
+        let result = validate_transaction_with_pools(
+            &tx,
+            &utxo_set,
+            &params,
+            100,
+            300,
+            None,
+            None,
+            None,
+            Some(&reward_accounts),
+            None,
+            Some(&registered_dreps),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+
+        let has_drep_err = matches!(&result, Err(errors) if errors.iter().any(|e| {
+            matches!(e, ValidationError::DelegateeDRepNotRegistered { .. })
+        }));
+        assert!(
+            !has_drep_err,
+            "AlwaysAbstain DRep target must be exempt from DelegateeDRepNotRegistered; got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn test_vote_deleg_same_tx_drep_reg_then_delegate_accepted() {
+        // A transaction that first registers a DRep (RegDRep cert) and then
+        // delegates to it (VoteDelegation cert) in the same tx must be accepted.
+        // This mirrors Haskell's sequential CERTS semantics.
+        let drep_cred_bytes = [0x45u8; 28];
+        let stake_cred_bytes = [0x46u8; 28];
+        let mut params = ProtocolParameters::mainnet_defaults();
+        params.protocol_version_major = 9; // Conway
+
+        let drep_cred = dugite_primitives::credentials::Credential::VerificationKey(
+            Hash28::from_bytes(drep_cred_bytes),
+        );
+        let drep_hash = Hash28::from_bytes(drep_cred_bytes).to_hash32_padded();
+        let stake_cred = dugite_primitives::credentials::Credential::VerificationKey(
+            Hash28::from_bytes(stake_cred_bytes),
+        );
+
+        let input = TransactionInput {
+            transaction_id: Hash32::from_bytes([0xEEu8; 32]),
+            index: 0,
+        };
+        let deposit = params.drep_deposit.0;
+        let mut utxo_set = UtxoSet::new();
+        utxo_set.insert(
+            input.clone(),
+            TransactionOutput {
+                address: Address::Byron(ByronAddress {
+                    payload: vec![0u8; 32],
+                }),
+                value: Value::lovelace(1_000_000_000),
+                datum: OutputDatum::None,
+                script_ref: None,
+                is_legacy: false,
+                raw_cbor: None,
+            },
+        );
+        let fee = 200_000u64;
+        let output = 1_000_000_000u64 - fee - deposit;
+        let mut tx = make_simple_tx(input, output, fee);
+        // First cert: register the DRep
+        tx.body.certificates.push(Certificate::RegDRep {
+            credential: drep_cred,
+            deposit: Lovelace(deposit),
+            anchor: None,
+        });
+        // Second cert: delegate to the just-registered DRep
+        tx.body.certificates.push(Certificate::VoteDelegation {
+            credential: stake_cred.clone(),
+            drep: DRep::KeyHash(drep_hash),
+        });
+
+        // Pre-tx registered_dreps is empty (DRep doesn't exist yet), but
+        // the RegDRep cert in this tx should make the VoteDelegation valid.
+        let registered_dreps: std::collections::HashSet<Hash32> = std::collections::HashSet::new();
+        let reward_accounts = make_reward_accounts_with_cred(stake_cred_bytes);
+
+        let result = validate_transaction_with_pools(
+            &tx,
+            &utxo_set,
+            &params,
+            100,
+            1000,
+            None,
+            None,
+            None,
+            Some(&reward_accounts),
+            None,
+            Some(&registered_dreps),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+
+        let has_drep_err = matches!(&result, Err(errors) if errors.iter().any(|e| {
+            matches!(e, ValidationError::DelegateeDRepNotRegistered { .. })
+        }));
+        assert!(
+            !has_drep_err,
+            "RegDRep in same tx must satisfy VoteDelegation DRep check; got: {result:?}"
+        );
+    }
+
+    // ---------------------------------------------------------------------------
+    // StakeKeyNotRegisteredDELEG
+    //
+    // Haskell `StakeKeyNotRegisteredDELEG` — delegation certs (StakeDelegation,
+    // VoteDelegation, StakeVoteDelegation) require the stake credential to be
+    // registered.  Combined reg+deleg certs (RegStakeDeleg, RegStakeVoteDeleg,
+    // VoteRegDeleg) are exempt — they register the key atomically.
+    //
+    // Reference: Haskell `StakeKeyNotRegisteredDELEG` in
+    // `cardano-ledger-shelley:Cardano.Ledger.Shelley.Rules.Deleg`.
+    // ---------------------------------------------------------------------------
+
+    #[test]
+    fn test_stake_deleg_unregistered_stake_key_rejected() {
+        // StakeDelegation with an unregistered stake credential must produce
+        // StakeKeyNotRegisteredForDelegation.
+        let pool_id = Hash28::from_bytes([0x50u8; 28]);
+        let stake_cred_bytes = [0x51u8; 28];
+        let stake_cred = dugite_primitives::credentials::Credential::VerificationKey(
+            Hash28::from_bytes(stake_cred_bytes),
+        );
+        let mut params = ProtocolParameters::mainnet_defaults();
+        params.protocol_version_major = 9; // Conway
+
+        let mut utxo_set = UtxoSet::new();
+        let tx = make_deleg_tx(
+            &mut utxo_set,
+            Certificate::StakeDelegation {
+                credential: stake_cred,
+                pool_hash: pool_id,
+            },
+        );
+
+        // Pool is registered (so DelegateePoolNotRegistered doesn't fire)
+        let mut registered_pools: std::collections::HashSet<Hash28> = HashSet::new();
+        registered_pools.insert(pool_id);
+        // reward_accounts is provided but does NOT contain the stake credential
+        let reward_accounts: std::collections::HashMap<Hash32, Lovelace> =
+            std::collections::HashMap::new();
+
+        let result = validate_transaction_with_pools(
+            &tx,
+            &utxo_set,
+            &params,
+            100,
+            300,
+            None,
+            Some(&registered_pools),
+            None,
+            Some(&reward_accounts),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+
+        assert!(
+            result.is_err(),
+            "Expected StakeKeyNotRegisteredForDelegation for unregistered stake key; got Ok"
+        );
+        let errors = result.unwrap_err();
+        assert!(
+            errors.iter().any(|e| matches!(
+                e,
+                ValidationError::StakeKeyNotRegisteredForDelegation { .. }
+            )),
+            "Expected StakeKeyNotRegisteredForDelegation; got: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn test_stake_deleg_registered_stake_key_accepted() {
+        // StakeDelegation with a registered stake credential must not produce
+        // StakeKeyNotRegisteredForDelegation.
+        let pool_id = Hash28::from_bytes([0x52u8; 28]);
+        let stake_cred_bytes = [0x53u8; 28];
+        let stake_cred = dugite_primitives::credentials::Credential::VerificationKey(
+            Hash28::from_bytes(stake_cred_bytes),
+        );
+        let mut params = ProtocolParameters::mainnet_defaults();
+        params.protocol_version_major = 9; // Conway
+
+        let mut utxo_set = UtxoSet::new();
+        let tx = make_deleg_tx(
+            &mut utxo_set,
+            Certificate::StakeDelegation {
+                credential: stake_cred,
+                pool_hash: pool_id,
+            },
+        );
+
+        // Pool registered
+        let mut registered_pools: std::collections::HashSet<Hash28> = HashSet::new();
+        registered_pools.insert(pool_id);
+        // Stake credential IS in reward_accounts
+        let reward_accounts = make_reward_accounts_with_cred(stake_cred_bytes);
+
+        let result = validate_transaction_with_pools(
+            &tx,
+            &utxo_set,
+            &params,
+            100,
+            300,
+            None,
+            Some(&registered_pools),
+            None,
+            Some(&reward_accounts),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+
+        let has_stake_err = matches!(&result, Err(errors) if errors.iter().any(|e| {
+            matches!(e, ValidationError::StakeKeyNotRegisteredForDelegation { .. })
+        }));
+        assert!(
+            !has_stake_err,
+            "Expected no StakeKeyNotRegisteredForDelegation for registered stake key; got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn test_vote_deleg_unregistered_stake_key_rejected() {
+        // VoteDelegation with an unregistered stake credential must produce
+        // StakeKeyNotRegisteredForDelegation.
+        let stake_cred_bytes = [0x54u8; 28];
+        let drep_cred_bytes = [0x55u8; 28];
+        let stake_cred = dugite_primitives::credentials::Credential::VerificationKey(
+            Hash28::from_bytes(stake_cred_bytes),
+        );
+        let drep_hash = Hash28::from_bytes(drep_cred_bytes).to_hash32_padded();
+        let mut params = ProtocolParameters::mainnet_defaults();
+        params.protocol_version_major = 9; // Conway
+
+        let mut utxo_set = UtxoSet::new();
+        let tx = make_vote_deleg_tx(
+            &mut utxo_set,
+            Certificate::VoteDelegation {
+                credential: stake_cred,
+                drep: DRep::KeyHash(drep_hash),
+            },
+        );
+
+        // DRep IS registered (so DelegateeDRepNotRegistered doesn't fire)
+        let mut registered_dreps: std::collections::HashSet<Hash32> =
+            std::collections::HashSet::new();
+        registered_dreps.insert(drep_hash);
+        // reward_accounts is provided but stake credential is NOT in it
+        let reward_accounts: std::collections::HashMap<Hash32, Lovelace> =
+            std::collections::HashMap::new();
+
+        let result = validate_transaction_with_pools(
+            &tx,
+            &utxo_set,
+            &params,
+            100,
+            300,
+            None,
+            None,
+            None,
+            Some(&reward_accounts),
+            None,
+            Some(&registered_dreps),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+
+        assert!(
+            result.is_err(),
+            "Expected StakeKeyNotRegisteredForDelegation for VoteDelegation with unregistered stake key; got Ok"
+        );
+        let errors = result.unwrap_err();
+        assert!(
+            errors.iter().any(|e| matches!(
+                e,
+                ValidationError::StakeKeyNotRegisteredForDelegation { .. }
+            )),
+            "Expected StakeKeyNotRegisteredForDelegation; got: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn test_reg_stake_deleg_exempt_from_stake_key_not_registered() {
+        // RegStakeDeleg (combined register+delegate cert, tag 11) must NOT
+        // fire StakeKeyNotRegisteredForDelegation even when the stake
+        // credential is not pre-registered — it registers atomically.
+        let pool_id = Hash28::from_bytes([0x56u8; 28]);
+        let stake_cred_bytes = [0x57u8; 28];
+        let stake_cred = dugite_primitives::credentials::Credential::VerificationKey(
+            Hash28::from_bytes(stake_cred_bytes),
+        );
+        let mut params = ProtocolParameters::mainnet_defaults();
+        params.protocol_version_major = 9; // Conway
+
+        let deposit = params.key_deposit.0;
+        let input = TransactionInput {
+            transaction_id: Hash32::from_bytes([0xFFu8; 32]),
+            index: 0,
+        };
+        let mut utxo_set = UtxoSet::new();
+        utxo_set.insert(
+            input.clone(),
+            TransactionOutput {
+                address: Address::Byron(ByronAddress {
+                    payload: vec![0u8; 32],
+                }),
+                value: Value::lovelace(10_000_000),
+                datum: OutputDatum::None,
+                script_ref: None,
+                is_legacy: false,
+                raw_cbor: None,
+            },
+        );
+        let fee = 200_000u64;
+        let output = 10_000_000u64 - fee - deposit;
+        let mut tx = make_simple_tx(input, output, fee);
+        tx.body.certificates.push(Certificate::RegStakeDeleg {
+            credential: stake_cred,
+            pool_hash: pool_id,
+            deposit: Lovelace(deposit),
+        });
+
+        // Pool registered
+        let mut registered_pools: std::collections::HashSet<Hash28> = HashSet::new();
+        registered_pools.insert(pool_id);
+        // reward_accounts does NOT contain the stake credential (unregistered)
+        let reward_accounts: std::collections::HashMap<Hash32, Lovelace> =
+            std::collections::HashMap::new();
+
+        let result = validate_transaction_with_pools(
+            &tx,
+            &utxo_set,
+            &params,
+            100,
+            300,
+            None,
+            Some(&registered_pools),
+            None,
+            Some(&reward_accounts),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+
+        let has_stake_err = matches!(&result, Err(errors) if errors.iter().any(|e| {
+            matches!(e, ValidationError::StakeKeyNotRegisteredForDelegation { .. })
+        }));
+        assert!(
+            !has_stake_err,
+            "RegStakeDeleg must be exempt from StakeKeyNotRegisteredForDelegation; got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn test_stake_not_registered_check_skipped_when_no_reward_accounts() {
+        // When reward_accounts is None (structural validation mode), the
+        // StakeKeyNotRegisteredForDelegation check must be skipped.
+        let pool_id = Hash28::from_bytes([0x58u8; 28]);
+        let stake_cred = dugite_primitives::credentials::Credential::VerificationKey(
+            Hash28::from_bytes([0x59u8; 28]),
+        );
+        let mut params = ProtocolParameters::mainnet_defaults();
+        params.protocol_version_major = 9;
+
+        let mut utxo_set = UtxoSet::new();
+        let tx = make_deleg_tx(
+            &mut utxo_set,
+            Certificate::StakeDelegation {
+                credential: stake_cred,
+                pool_hash: pool_id,
+            },
+        );
+
+        // reward_accounts = None → check must be skipped
+        let result = validate_transaction_with_pools(
+            &tx, &utxo_set, &params, 100, 300, None, None, // registered_pools = None
+            None, None, // reward_accounts = None → check skipped
+            None, None, None, None, None, None, None, None, None,
+        );
+
+        let has_stake_err = matches!(&result, Err(errors) if errors.iter().any(|e| {
+            matches!(e, ValidationError::StakeKeyNotRegisteredForDelegation { .. })
+        }));
+        assert!(
+            !has_stake_err,
+            "StakeKeyNotRegisteredForDelegation must be skipped when reward_accounts is None; got: {result:?}"
+        );
+    }
+
+    // ---------------------------------------------------------------------------
     // DRep re-registration: DRepAlreadyRegistered
     //
     // Haskell `ConwayDRepAlreadyRegistered` — RegDRep certificate naming a
