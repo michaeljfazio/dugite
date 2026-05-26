@@ -375,12 +375,54 @@ pub(super) fn is_voter_disallowed(voter: &Voter, action: &GovAction) -> bool {
         // SPO is forbidden on NewConstitution and TreasuryWithdrawals.
         (Voter::StakePool(_), GovAction::NewConstitution { .. }) => true,
         (Voter::StakePool(_), GovAction::TreasuryWithdrawals { .. }) => true,
+        // SPO on ParameterChange: allowed only when the embedded PParamsUpdate
+        // touches at least one SecurityGroup-relevant field. Haskell's
+        // `votingStakePoolThresholdInternal` (Conway/Governance/Internal.hs
+        // L388-L393) returns `NoVotingAllowed` for ParameterChange updates
+        // that touch no SecurityGroup field, which surfaces as
+        // `DisallowedVoters` from the GOV rule.
+        //
+        // SecurityGroup field set (cardano-ledger Conway/PParams.hs L643-L709):
+        //   keys 0 (minFeeA), 1 (minFeeB), 2 (maxBBSize), 3 (maxTxSize),
+        //   4 (maxBHSize), 17 (coinsPerUTxOByte), 21 (maxBlockExUnits),
+        //   22 (maxValSize), 30 (govActionDeposit),
+        //   33 (minFeeRefScriptCostPerByte).
+        (
+            Voter::StakePool(_),
+            GovAction::ParameterChange {
+                protocol_param_update,
+                ..
+            },
+        ) => !ppu_is_security_group_relevant(protocol_param_update),
         // Constitutional Committee is forbidden on NoConfidence and UpdateCommittee.
         (Voter::ConstitutionalCommittee(_), GovAction::NoConfidence { .. }) => true,
         (Voter::ConstitutionalCommittee(_), GovAction::UpdateCommittee { .. }) => true,
         // All other (voter, action) combinations are permitted at this layer.
         _ => false,
     }
+}
+
+/// Returns `true` when at least one field in the given `ProtocolParamUpdate`
+/// belongs to the Conway SecurityGroup (`PPGroups _ SecurityGroup` in
+/// `eras/conway/impl/src/Cardano/Ledger/Conway/PParams.hs` L643-L709). Used
+/// by [`is_voter_disallowed`] to decide whether SPOs may vote on a given
+/// `ParameterChange` action.
+///
+/// The check mirrors Haskell's `any isSecurityRelevant (modifiedPPGroups ppu)`
+/// — a single `Some(_)` (i.e. `SJust`) in any SecurityGroup field is enough.
+pub(super) fn ppu_is_security_group_relevant(
+    ppu: &dugite_primitives::transaction::ProtocolParamUpdate,
+) -> bool {
+    ppu.min_fee_a.is_some()                          // key 0
+        || ppu.min_fee_b.is_some()                   // key 1
+        || ppu.max_block_body_size.is_some()         // key 2
+        || ppu.max_tx_size.is_some()                 // key 3
+        || ppu.max_block_header_size.is_some()       // key 4
+        || ppu.ada_per_utxo_byte.is_some()           // key 17 (coinsPerUTxOByte)
+        || ppu.max_block_ex_units.is_some()          // key 21
+        || ppu.max_val_size.is_some()                // key 22
+        || ppu.gov_action_deposit.is_some()          // key 30
+        || ppu.min_fee_ref_script_cost_per_byte.is_some() // key 33
 }
 
 /// Returns `true` when the given voter is unknown to the ledger, i.e. its

@@ -144,6 +144,19 @@ pub struct ValidationContext {
     /// committee voter is treated as known.  This mirrors the lenient default
     /// used by `active_proposals`.
     pub committee_authorized_hot_keys: Option<HashSet<Hash32>>,
+    /// Subset of [`Self::committee_authorized_hot_keys`] whose backing cold
+    /// credentials are in the **currently-enacted** committee
+    /// (`committeeMembers electedCommittee` in Haskell).
+    ///
+    /// At PV >= 11, Conway's `UnelectedCommitteeVoters` predicate fires for
+    /// any CC vote whose hot credential is in `committee_authorized_hot_keys`
+    /// but NOT in this set — i.e. authorised by the registry but no longer
+    /// backed by an elected cold credential.  When `None` the predicate is
+    /// silently skipped (lenient default).
+    ///
+    /// Reference: Haskell `authorizedElectedHotCommitteeCredentials` in
+    /// `eras/conway/impl/src/Cardano/Ledger/CertState.hs`.
+    pub committee_authorized_elected_hot_keys: Option<HashSet<Hash32>>,
     // ---------------------------------------------------------------------
     // MIR (Move Instantaneous Rewards) — Shelley–Babbage only.
     //
@@ -272,6 +285,14 @@ impl ValidationContext {
 
     pub fn with_committee_authorized_hot_keys(mut self, hot_keys: HashSet<Hash32>) -> Self {
         self.committee_authorized_hot_keys = Some(hot_keys);
+        self
+    }
+
+    pub fn with_committee_authorized_elected_hot_keys(
+        mut self,
+        hot_keys: HashSet<Hash32>,
+    ) -> Self {
+        self.committee_authorized_elected_hot_keys = Some(hot_keys);
         self
     }
 
@@ -640,6 +661,47 @@ pub enum ValidationError {
     /// (mirroring Haskell's `NonEmpty` shape).
     #[error("VotersDoNotExist: {voters:?}")]
     VotersDoNotExist { voters: Vec<Voter> },
+    /// Conway GOV rule: one or more votes in the transaction's
+    /// `voting_procedures` reference a `GovActionId` that does not exist
+    /// in the active-proposal set (either it was never proposed, already
+    /// ratified+enacted, expired, or dropped at the prior epoch boundary).
+    ///
+    /// This is the "votes for ratified/expired/never-proposed actions"
+    /// guard.  Without it dugite's mempool admits — and forge picks up —
+    /// votes whose action has just been removed from the proposals
+    /// registry at an epoch-boundary tick.  Haskell rejects the
+    /// resulting block with the same `GovActionsDoNotExist` predicate,
+    /// causing chain-divergence stalls between dugite forgers and
+    /// cardano-node validators.
+    ///
+    /// Same-tx proposals are exempt: a vote inside a transaction that
+    /// also carries the proposal procedure for the referenced id is
+    /// valid by definition (the action enters the registry as part of
+    /// the same apply step).
+    ///
+    /// Reference: Haskell `GovActionsDoNotExist` in
+    /// `eras/conway/impl/src/Cardano/Ledger/Conway/Rules/Gov.hs`
+    /// (`checkGovActionsExist`).
+    #[error("GovActionsDoNotExist: {action_ids:?}")]
+    GovActionsDoNotExist { action_ids: Vec<GovActionId> },
+    /// Conway GOV rule (PV >= 11 only): one or more `ConstitutionalCommittee`
+    /// votes carry a hot credential whose backing cold credential is NOT in
+    /// the currently-enacted committee.  At PV <= 10 this predicate is
+    /// silenced — only `VotersDoNotExist` fires for unauthorised CC voters.
+    ///
+    /// Haskell defines this as: a CC vote is rejected when its hot credential
+    /// is not in `authorizedElectedHotCommitteeCredentials = csCommitteeCreds
+    /// ∩ keys (committeeMembers electedCommittee)`.  At PV >= 11 BOTH
+    /// `UnelectedCommitteeVoters` AND `VotersDoNotExist` fire for the same
+    /// voter (Haskell `GovSpec.hs:757-758`).
+    ///
+    /// All offending hot credentials are aggregated into a single
+    /// `NonEmpty`-shaped error.
+    ///
+    /// Reference: Haskell `unelectedCommitteeVoters` in
+    /// `eras/conway/impl/src/Cardano/Ledger/Conway/Rules/Gov.hs` L649-L661.
+    #[error("UnelectedCommitteeVoters: {hot_keys:?}")]
+    UnelectedCommitteeVoters { hot_keys: Vec<Hash32> },
     /// A voter is voting against a governance action whose `expires_after_epoch`
     /// is strictly less than the current epoch.
     ///
@@ -1584,6 +1646,43 @@ pub fn validate_transaction_with_context(
     let mut extra_errors: Vec<ValidationError> = Vec::new();
     if params.protocol_version_major >= 9 && !tx.body.voting_procedures.is_empty() {
         // -------------------------------------------------------------------
+        // UnelectedCommitteeVoters (PV >= 11): every CC vote whose hot
+        // credential is NOT in `authorizedElectedHotCommitteeCredentials`
+        // is reported here, BEFORE `VotersDoNotExist`. At PV >= 11 BOTH
+        // predicates fire for the same voter when the cold credential
+        // was authorised but its backing election has been removed.
+        //
+        // Reference: Haskell `unelectedCommitteeVoters` in
+        // `eras/conway/impl/src/Cardano/Ledger/Conway/Rules/Gov.hs`.
+        // -------------------------------------------------------------------
+        if params.protocol_version_major >= 11 {
+            if let Some(elected) = context.committee_authorized_elected_hot_keys.as_ref() {
+                let mut unelected_hot: Vec<Hash32> = Vec::new();
+                let mut seen: HashSet<Hash32> = HashSet::new();
+                for (voter, vp_map) in tx.body.voting_procedures.iter() {
+                    if vp_map.is_empty() {
+                        continue;
+                    }
+                    if let Voter::ConstitutionalCommittee(hot) = voter {
+                        let hot_key = hot.to_typed_hash32();
+                        if seen.contains(&hot_key) {
+                            continue;
+                        }
+                        if !elected.contains(&hot_key) {
+                            unelected_hot.push(hot_key);
+                            seen.insert(hot_key);
+                        }
+                    }
+                }
+                if !unelected_hot.is_empty() {
+                    extra_errors.push(ValidationError::UnelectedCommitteeVoters {
+                        hot_keys: unelected_hot,
+                    });
+                }
+            }
+        }
+
+        // -------------------------------------------------------------------
         // VotersDoNotExist: every voter whose credential / pool ID is not in
         // the corresponding registry.  Empty `vp_map`s are skipped — Haskell
         // does the same partition over the keys of the voting-procedures map,
@@ -1608,6 +1707,56 @@ pub fn validate_transaction_with_context(
             extra_errors.push(ValidationError::VotersDoNotExist {
                 voters: unknown_voters,
             });
+        }
+
+        // -------------------------------------------------------------------
+        // GovActionsDoNotExist: every vote must reference a `GovActionId`
+        // that exists either in the same tx's `proposal_procedures` (a
+        // local proposal — admissible by definition) or in the
+        // `active_proposals` map captured from current ledger state.
+        //
+        // Without this check dugite admits votes whose action has just
+        // been ratified-and-removed at the previous epoch boundary; the
+        // forge picks them up, and Haskell rejects the resulting block
+        // with `ConwayGovFailure (GovActionsDoNotExist …)` — exactly the
+        // chain-stall we observed at slot 800 on the devnet.
+        //
+        // The check is silently skipped when `active_proposals` is None
+        // (the same lenient default we use for `committee_authorized_hot_keys`
+        // etc.) so callers without ledger plumbing don't see false
+        // positives.  Votes that reference voters already flagged as
+        // unknown skip this check — Haskell partitions unknown voters
+        // out before the action-existence check, matching the
+        // VotersDoNotExist > GovActionsDoNotExist precedence.
+        // -------------------------------------------------------------------
+        let mut local_action_ids: HashSet<GovActionId> = HashSet::new();
+        for (idx, _proposal) in tx.body.proposal_procedures.iter().enumerate() {
+            local_action_ids.insert(GovActionId {
+                transaction_id: tx.hash,
+                action_index: idx as u32,
+            });
+        }
+        if context.active_proposals.is_some() {
+            let active = context.active_proposals.as_ref().unwrap();
+            let mut missing: Vec<GovActionId> = Vec::new();
+            let mut seen: HashSet<GovActionId> = HashSet::new();
+            for (voter, votes) in &tx.body.voting_procedures {
+                if unknown_voter_set.contains(voter) {
+                    continue;
+                }
+                for action_id in votes.keys() {
+                    if seen.contains(action_id) {
+                        continue;
+                    }
+                    if !local_action_ids.contains(action_id) && !active.contains_key(action_id) {
+                        missing.push(action_id.clone());
+                        seen.insert(action_id.clone());
+                    }
+                }
+            }
+            if !missing.is_empty() {
+                extra_errors.push(ValidationError::GovActionsDoNotExist { action_ids: missing });
+            }
         }
 
         // -------------------------------------------------------------------
@@ -1638,51 +1787,24 @@ pub fn validate_transaction_with_context(
             local_proposals.insert(id, &proposal.gov_action);
         }
 
-        // Aggregate every disallowed (voter, action_id) pair into one error,
-        // mirroring Haskell's NonEmpty predicate-failure shape.
-        let mut violations: Vec<(Voter, GovActionId)> = Vec::new();
-        for (voter, votes) in &tx.body.voting_procedures {
-            if unknown_voter_set.contains(voter) {
-                continue;
-            }
-            for action_id in votes.keys() {
-                let action: Option<&GovAction> =
-                    local_proposals.get(action_id).copied().or_else(|| {
-                        context
-                            .active_proposals
-                            .as_ref()
-                            .and_then(|m| m.get(action_id))
-                            .map(|ap| &ap.gov_action)
-                    });
-
-                let Some(action) = action else {
-                    // Vote references an unknown GovAction; this is a
-                    // different predicate failure (GovActionsDoNotExist),
-                    // not DisallowedVoters.  Skip silently here.
-                    continue;
-                };
-
-                if conway::is_voter_disallowed(voter, action) {
-                    violations.push((voter.clone(), action_id.clone()));
-                }
-            }
-        }
-        if !violations.is_empty() {
-            extra_errors.push(ValidationError::DisallowedVoters { violations });
-        }
-
         // -------------------------------------------------------------------
         // VotingOnExpiredGovAction: a vote against an action whose
         // `expires_after_epoch` is strictly less than `current_epoch` is
         // rejected.  Boundary case (`current_epoch == expires_after_epoch`)
         // is allowed — Haskell `checkVotesAreNotForExpiredActions`.
         //
-        // Precedence (Haskell `internVoter` partitions unknown voters out
-        // first; the authority and expiry checks then apply only to known
-        // voters):
+        // Precedence (matches Haskell `conwayGovTransition` step ordering —
+        // see `Cardano.Ledger.Conway.Rules.Gov`):
         //
-        //   VotersDoNotExist  >  DisallowedVoters
+        //   VotersDoNotExist  >  GovActionsDoNotExist
         //                     >  VotingOnExpiredGovAction
+        //                     >  DisallowedVoters
+        //
+        // The dugite ordering previously placed `DisallowedVoters` *before*
+        // `VotingOnExpiredGovAction`, which is the opposite of Haskell's
+        // canonical ordering and would surface the wrong predicate first
+        // when both fire on the same (voter, action) pair.  Swapped to
+        // match cardano-haskell-oracle deep-dive findings (D-2).
         //
         // Concretely: we skip voters already in `unknown_voter_set` so a
         // single voter is never reported under multiple predicates here.
@@ -1728,6 +1850,55 @@ pub fn validate_transaction_with_context(
         }
         if !expired_votes.is_empty() {
             extra_errors.push(ValidationError::VotingOnExpiredGovAction { expired_votes });
+        }
+
+        // -------------------------------------------------------------------
+        // DisallowedVoters: voter type is not authorised for the action type.
+        //
+        // For every (voter, gov_action_id) pair in `voting_procedures`, look up
+        // the referenced GovAction and reject the vote if the voter type is
+        // not authorised for that action type (Haskell `checkVotersAreValid` /
+        // `is{Committee,DRep,StakePool}VotingAllowed`).
+        //
+        // The GovAction is looked up first against proposals submitted in the
+        // same transaction, then against the optional `active_proposals` map
+        // provided by the caller (typically the on-chain governance state).
+        // Votes that do not resolve to any known action are ignored here —
+        // that's a different predicate (`GovActionsDoNotExist`) handled above.
+        //
+        // Voters already in `unknown_voter_set` are skipped so they don't
+        // appear in BOTH `VotersDoNotExist` and `DisallowedVoters` (Haskell
+        // partitions unknowns out before the authority check).
+        // -------------------------------------------------------------------
+        let mut violations: Vec<(Voter, GovActionId)> = Vec::new();
+        for (voter, votes) in &tx.body.voting_procedures {
+            if unknown_voter_set.contains(voter) {
+                continue;
+            }
+            for action_id in votes.keys() {
+                let action: Option<&GovAction> =
+                    local_proposals.get(action_id).copied().or_else(|| {
+                        context
+                            .active_proposals
+                            .as_ref()
+                            .and_then(|m| m.get(action_id))
+                            .map(|ap| &ap.gov_action)
+                    });
+
+                let Some(action) = action else {
+                    // Vote references an unknown GovAction; this is a
+                    // different predicate failure (GovActionsDoNotExist),
+                    // emitted above.  Skip silently here.
+                    continue;
+                };
+
+                if conway::is_voter_disallowed(voter, action) {
+                    violations.push((voter.clone(), action_id.clone()));
+                }
+            }
+        }
+        if !violations.is_empty() {
+            extra_errors.push(ValidationError::DisallowedVoters { violations });
         }
     }
 
