@@ -76,6 +76,12 @@ fn lcg_next(state: &mut u64) -> u64 {
 
 fn populate_chaindb(path: &std::path::Path, count: u64) -> (ChainDB, Vec<Hash32>) {
     let mut db = ChainDB::open(path).unwrap();
+    // VolatileDB WAL per-write fsync is on by default (at-tip durability
+    // semantics). For a throwaway bench tempdir this only adds ~10 ms of
+    // syscall latency per `add_block`, which on the GHA runner alone was
+    // pushing the 100K-block populate over 60 minutes and timing out the
+    // storage matrix job. Skip it — the bench DB is never recovered from.
+    db.set_volatile_wal_sync_per_write(false);
     let mut hashes = Vec::with_capacity(count as usize);
     for i in 0..count {
         let hash = make_hash(i);
@@ -98,6 +104,7 @@ fn populate_chaindb_with_config(
     config: &ImmutableConfig,
 ) -> (ChainDB, Vec<Hash32>) {
     let mut db = ChainDB::open_with_config(path, config, SECURITY_PARAM_K as usize).unwrap();
+    db.set_volatile_wal_sync_per_write(false); // see populate_chaindb()
     let mut hashes = Vec::with_capacity(count as usize);
     for i in 0..count {
         let hash = make_hash(i);
