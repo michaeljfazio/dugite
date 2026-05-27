@@ -1,0 +1,506 @@
+<!DOCTYPE HTML>
+<html lang="en" class="light" dir="ltr">
+    <head>
+        <!-- Book generated using mdBook -->
+        <meta charset="UTF-8">
+        <title>Local Testnet - Dugite Documentation</title>
+
+
+        <!-- Custom HTML head -->
+        
+        <meta name="description" content="">
+        <meta name="viewport" content="width=device-width, initial-scale=1">
+        <meta name="theme-color" content="#ffffff">
+
+        <link rel="icon" href="../favicon.svg">
+        <link rel="shortcut icon" href="../favicon.png">
+        <link rel="stylesheet" href="../css/variables.css">
+        <link rel="stylesheet" href="../css/general.css">
+        <link rel="stylesheet" href="../css/chrome.css">
+        <link rel="stylesheet" href="../css/print.css" media="print">
+
+        <!-- Fonts -->
+        <link rel="stylesheet" href="../FontAwesome/css/font-awesome.css">
+        <link rel="stylesheet" href="../fonts/fonts.css">
+
+        <!-- Highlight.js Stylesheets -->
+        <link rel="stylesheet" href="../highlight.css">
+        <link rel="stylesheet" href="../tomorrow-night.css">
+        <link rel="stylesheet" href="../ayu-highlight.css">
+
+        <!-- Custom theme stylesheets -->
+
+    </head>
+    <body class="sidebar-visible no-js">
+    <div id="body-container">
+        <!-- Provide site root to javascript -->
+        <script>
+            var path_to_root = "../";
+            var default_theme = window.matchMedia("(prefers-color-scheme: dark)").matches ? "navy" : "light";
+        </script>
+
+        <!-- Work around some values being stored in localStorage wrapped in quotes -->
+        <script>
+            try {
+                var theme = localStorage.getItem('mdbook-theme');
+                var sidebar = localStorage.getItem('mdbook-sidebar');
+
+                if (theme.startsWith('"') && theme.endsWith('"')) {
+                    localStorage.setItem('mdbook-theme', theme.slice(1, theme.length - 1));
+                }
+
+                if (sidebar.startsWith('"') && sidebar.endsWith('"')) {
+                    localStorage.setItem('mdbook-sidebar', sidebar.slice(1, sidebar.length - 1));
+                }
+            } catch (e) { }
+        </script>
+
+        <!-- Set the theme before any content is loaded, prevents flash -->
+        <script>
+            var theme;
+            try { theme = localStorage.getItem('mdbook-theme'); } catch(e) { }
+            if (theme === null || theme === undefined) { theme = default_theme; }
+            var html = document.querySelector('html');
+            html.classList.remove('light')
+            html.classList.add(theme);
+            var body = document.querySelector('body');
+            body.classList.remove('no-js')
+            body.classList.add('js');
+        </script>
+
+        <input type="checkbox" id="sidebar-toggle-anchor" class="hidden">
+
+        <!-- Hide / unhide sidebar before it is displayed -->
+        <script>
+            var body = document.querySelector('body');
+            var sidebar = null;
+            var sidebar_toggle = document.getElementById("sidebar-toggle-anchor");
+            if (document.body.clientWidth >= 1080) {
+                try { sidebar = localStorage.getItem('mdbook-sidebar'); } catch(e) { }
+                sidebar = sidebar || 'visible';
+            } else {
+                sidebar = 'hidden';
+            }
+            sidebar_toggle.checked = sidebar === 'visible';
+            body.classList.remove('sidebar-visible');
+            body.classList.add("sidebar-" + sidebar);
+        </script>
+
+        <nav id="sidebar" class="sidebar" aria-label="Table of contents">
+            <div class="sidebar-scrollbox">
+                <ol class="chapter"><li class="chapter-item expanded affix "><a href="../introduction.html">Introduction</a></li><li class="chapter-item expanded affix "><li class="part-title">Getting Started</li><li class="chapter-item expanded "><a href="../installation.html"><strong aria-hidden="true">1.</strong> Installation</a></li><li class="chapter-item expanded "><a href="../quickstart.html"><strong aria-hidden="true">2.</strong> Quick Start</a></li><li class="chapter-item expanded "><a href="../development.html"><strong aria-hidden="true">3.</strong> Development</a></li><li class="chapter-item expanded affix "><li class="part-title">Running a Node</li><li class="chapter-item expanded "><a href="../running/configuration.html"><strong aria-hidden="true">4.</strong> Configuration</a></li><li class="chapter-item expanded "><a href="../running/config-editor.html"><strong aria-hidden="true">5.</strong> Configuration Editor (dugite-config)</a></li><li class="chapter-item expanded "><a href="../running/topology.html"><strong aria-hidden="true">6.</strong> Topology</a></li><li class="chapter-item expanded "><a href="../running/networks.html"><strong aria-hidden="true">7.</strong> Networks</a></li><li class="chapter-item expanded "><a href="../running/mithril.html"><strong aria-hidden="true">8.</strong> Mithril Snapshot Import</a></li><li class="chapter-item expanded "><a href="../running/mithril-ancillary.html"><strong aria-hidden="true">9.</strong> Mithril Ancillary — Trust Model</a></li><li class="chapter-item expanded "><a href="../running/logging.html"><strong aria-hidden="true">10.</strong> Logging</a></li><li class="chapter-item expanded "><a href="../running/monitoring.html"><strong aria-hidden="true">11.</strong> Monitoring</a></li><li class="chapter-item expanded "><a href="../running/utxo-rpc.html"><strong aria-hidden="true">12.</strong> UTxO RPC (gRPC) Server</a></li><li class="chapter-item expanded "><a href="../running/relay.html"><strong aria-hidden="true">13.</strong> Relay Node</a></li><li class="chapter-item expanded "><a href="../running/block-producer.html"><strong aria-hidden="true">14.</strong> Block Producer</a></li><li class="chapter-item expanded "><a href="../running/local-testnet.html" class="active"><strong aria-hidden="true">15.</strong> Local Testnet</a></li><li class="chapter-item expanded "><a href="../running/kubernetes.html"><strong aria-hidden="true">16.</strong> Kubernetes Deployment</a></li><li class="chapter-item expanded affix "><li class="part-title">CLI Reference</li><li class="chapter-item expanded "><a href="../cli/overview.html"><strong aria-hidden="true">17.</strong> Overview</a></li><li class="chapter-item expanded "><a href="../cli/dugite-node.html"><strong aria-hidden="true">18.</strong> dugite-node</a></li><li class="chapter-item expanded "><a href="../cli/key-generation.html"><strong aria-hidden="true">19.</strong> Key Generation</a></li><li class="chapter-item expanded "><a href="../cli/transactions.html"><strong aria-hidden="true">20.</strong> Transactions</a></li><li class="chapter-item expanded "><a href="../cli/queries.html"><strong aria-hidden="true">21.</strong> Queries</a></li><li class="chapter-item expanded "><a href="../cli/stake-address.html"><strong aria-hidden="true">22.</strong> Stake Address</a></li><li class="chapter-item expanded "><a href="../cli/stake-pool.html"><strong aria-hidden="true">23.</strong> Stake Pool</a></li><li class="chapter-item expanded "><a href="../cli/node-commands.html"><strong aria-hidden="true">24.</strong> Node Commands</a></li><li class="chapter-item expanded "><a href="../cli/governance.html"><strong aria-hidden="true">25.</strong> Governance</a></li><li class="chapter-item expanded affix "><li class="part-title">Architecture</li><li class="chapter-item expanded "><a href="../architecture/overview.html"><strong aria-hidden="true">26.</strong> Overview</a></li><li class="chapter-item expanded "><a href="../architecture/sync-pipeline.html"><strong aria-hidden="true">27.</strong> Sync Pipeline</a></li><li class="chapter-item expanded "><a href="../architecture/storage.html"><strong aria-hidden="true">28.</strong> Storage</a></li><li class="chapter-item expanded "><a href="../architecture/ledger.html"><strong aria-hidden="true">29.</strong> Ledger</a></li><li class="chapter-item expanded "><a href="../architecture/consensus.html"><strong aria-hidden="true">30.</strong> Consensus</a></li><li class="chapter-item expanded "><a href="../architecture/networking.html"><strong aria-hidden="true">31.</strong> Networking</a></li><li class="chapter-item expanded "><a href="../architecture/p2p-governor.html"><strong aria-hidden="true">32.</strong> P2P Governor</a></li><li class="chapter-item expanded "><a href="../architecture/genesis-support.html"><strong aria-hidden="true">33.</strong> Genesis Support</a></li><li class="chapter-item expanded affix "><li class="part-title">Reference</li><li class="chapter-item expanded "><a href="../reference/protocol-parameters.html"><strong aria-hidden="true">34.</strong> Protocol Parameters</a></li><li class="chapter-item expanded "><a href="../reference/mini-protocols.html"><strong aria-hidden="true">35.</strong> Mini-Protocol Reference</a></li><li class="chapter-item expanded "><a href="../reference/upgrading.html"><strong aria-hidden="true">36.</strong> Upgrading</a></li><li class="chapter-item expanded "><a href="../reference/conformance.html"><strong aria-hidden="true">37.</strong> Conformance Test Suite</a></li><li class="chapter-item expanded "><a href="../reference/benchmarks.html"><strong aria-hidden="true">38.</strong> Benchmarks</a></li><li class="chapter-item expanded "><a href="../reference/third-party-licenses.html"><strong aria-hidden="true">39.</strong> Third-Party Licenses</a></li><li class="chapter-item expanded "><a href="../reference/troubleshooting.html"><strong aria-hidden="true">40.</strong> Troubleshooting</a></li></ol>
+            </div>
+            <div id="sidebar-resize-handle" class="sidebar-resize-handle">
+                <div class="sidebar-resize-indicator"></div>
+            </div>
+        </nav>
+
+        <!-- Track and set sidebar scroll position -->
+        <script>
+            var sidebarScrollbox = document.querySelector('#sidebar .sidebar-scrollbox');
+            sidebarScrollbox.addEventListener('click', function(e) {
+                if (e.target.tagName === 'A') {
+                    sessionStorage.setItem('sidebar-scroll', sidebarScrollbox.scrollTop);
+                }
+            }, { passive: true });
+            var sidebarScrollTop = sessionStorage.getItem('sidebar-scroll');
+            sessionStorage.removeItem('sidebar-scroll');
+            if (sidebarScrollTop) {
+                // preserve sidebar scroll position when navigating via links within sidebar
+                sidebarScrollbox.scrollTop = sidebarScrollTop;
+            } else {
+                // scroll sidebar to current active section when navigating via "next/previous chapter" buttons
+                var activeSection = document.querySelector('#sidebar .active');
+                if (activeSection) {
+                    activeSection.scrollIntoView({ block: 'center' });
+                }
+            }
+        </script>
+
+        <div id="page-wrapper" class="page-wrapper">
+
+            <div class="page">
+                                <div id="menu-bar-hover-placeholder"></div>
+                <div id="menu-bar" class="menu-bar sticky">
+                    <div class="left-buttons">
+                        <label id="sidebar-toggle" class="icon-button" for="sidebar-toggle-anchor" title="Toggle Table of Contents" aria-label="Toggle Table of Contents" aria-controls="sidebar">
+                            <i class="fa fa-bars"></i>
+                        </label>
+                        <button id="theme-toggle" class="icon-button" type="button" title="Change theme" aria-label="Change theme" aria-haspopup="true" aria-expanded="false" aria-controls="theme-list">
+                            <i class="fa fa-paint-brush"></i>
+                        </button>
+                        <ul id="theme-list" class="theme-popup" aria-label="Themes" role="menu">
+                            <li role="none"><button role="menuitem" class="theme" id="light">Light</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="rust">Rust</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="coal">Coal</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="navy">Navy</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="ayu">Ayu</button></li>
+                        </ul>
+                        <button id="search-toggle" class="icon-button" type="button" title="Search. (Shortkey: s)" aria-label="Toggle Searchbar" aria-expanded="false" aria-keyshortcuts="S" aria-controls="searchbar">
+                            <i class="fa fa-search"></i>
+                        </button>
+                    </div>
+
+                    <h1 class="menu-title">Dugite Documentation</h1>
+
+                    <div class="right-buttons">
+                        <a href="../print.html" title="Print this book" aria-label="Print this book">
+                            <i id="print-button" class="fa fa-print"></i>
+                        </a>
+                        <a href="https://github.com/michaeljfazio/dugite" title="Git repository" aria-label="Git repository">
+                            <i id="git-repository-button" class="fa fa-github"></i>
+                        </a>
+                        <a href="https://github.com/michaeljfazio/dugite/edit/main/docs/src/running/local-testnet.md" title="Suggest an edit" aria-label="Suggest an edit">
+                            <i id="git-edit-button" class="fa fa-edit"></i>
+                        </a>
+
+                    </div>
+                </div>
+
+                <div id="search-wrapper" class="hidden">
+                    <form id="searchbar-outer" class="searchbar-outer">
+                        <input type="search" id="searchbar" name="searchbar" placeholder="Search this book ..." aria-controls="searchresults-outer" aria-describedby="searchresults-header">
+                    </form>
+                    <div id="searchresults-outer" class="searchresults-outer hidden">
+                        <div id="searchresults-header" class="searchresults-header"></div>
+                        <ul id="searchresults">
+                        </ul>
+                    </div>
+                </div>
+
+                <!-- Apply ARIA attributes after the sidebar and the sidebar toggle button are added to the DOM -->
+                <script>
+                    document.getElementById('sidebar-toggle').setAttribute('aria-expanded', sidebar === 'visible');
+                    document.getElementById('sidebar').setAttribute('aria-hidden', sidebar !== 'visible');
+                    Array.from(document.querySelectorAll('#sidebar a')).forEach(function(link) {
+                        link.setAttribute('tabIndex', sidebar === 'visible' ? 0 : -1);
+                    });
+                </script>
+
+                <div id="content" class="content">
+                    <main>
+                        <h1 id="local-testnet"><a class="header" href="#local-testnet">Local Testnet</a></h1>
+<p>A 3-node loopback testnet for verifying dugite block production and diffusion
+against the Haskell reference implementation. One dugite block producer, one
+dugite relay, and one cardano-node validator (relay role), all on the same
+machine, all on the loopback interface — the cardano-node connects through
+the dugite relay.</p>
+<h2 id="what-this-is"><a class="header" href="#what-this-is">What this is</a></h2>
+<pre><code class="language-mermaid">graph LR
+  dbp[dugite-bp&lt;br/&gt;N2N 3001&lt;br/&gt;metrics 12798&lt;br/&gt;pool1 — sole forger] &lt;--&gt; dr[dugite-relay&lt;br/&gt;N2N 3002&lt;br/&gt;metrics 12799&lt;br/&gt;hub]
+  dr &lt;--&gt; cbp[cardano-node&lt;br/&gt;N2N 3003&lt;br/&gt;validator only]
+</code></pre>
+<p>dugite-bp is the <strong>sole block producer</strong>. cardano-node runs as a passive
+validator (no forging keys passed) and chainsync+blockfetches every block
+forged by dugite-bp, applying each one through the Haskell ledger. This
+gives us byte-exact cross-validation of dugite's forged blocks against the
+reference implementation with <strong>zero risk of asymmetric forks</strong> (no two
+forgers competing for the same height).</p>
+<p>The chain boots into Conway PV10 from a fresh genesis with a single
+forging pool (pool1, 100% of active stake; pool2's keys exist but its
+stake is 0), 1-second slots, <code>activeSlotsCoeff = 0.2</code>, <code>epochLength = 200</code>,
+and <code>securityParam = 10</code>. Blocks are minted every ~5 seconds on average
+and an epoch elapses every ~3.3 minutes, so the 30-minute soak crosses
+~9 epoch boundaries (enough for reward distribution to complete before
+the soak ends).</p>
+<blockquote>
+<p><strong>Historical note:</strong> prior to 2026-05-18, cardano-node also ran as a
+forger (pool2, equal stake) for symmetric multi-forger cross-validation.
+That topology produced an asymmetric-fork class that no per-tx test
+could survive: the slower side's leader-slot timer fired before
+propagation completed and each pool ended up on its own short chain
+permanently (first-seen tiebreaker, equal lengths). Making
+cardano-node a validator eliminates that class entirely while
+preserving the cross-validation we actually rely on (does cardano-node
+accept every dugite block byte-for-byte?).</p>
+</blockquote>
+<h2 id="prerequisites"><a class="header" href="#prerequisites">Prerequisites</a></h2>
+<ul>
+<li><code>cardano-node</code> &gt;= 11.0.1 and <code>cardano-cli</code> &gt;= 11.0.0 on <code>$PATH</code></li>
+<li><code>target/release/dugite-node</code> built (<code>cargo build --release</code> from the repo root)</li>
+<li><code>jq</code> for JSON manipulation</li>
+<li>~2 GB of free disk for the soak</li>
+<li><strong>macOS:</strong> the system-builtin <code>caffeinate</code> (used to suppress App Nap during the soak). This dependency is macOS-only; on Linux the soak runs unwrapped.</li>
+</ul>
+<p>The setup script's prereq check will refuse to run if any of these are missing.</p>
+<h2 id="one-time-setup"><a class="header" href="#one-time-setup">One-time setup</a></h2>
+<pre><code class="language-bash">./testnet/local-devnet/setup.sh
+</code></pre>
+<p>This generates a fresh genesis (4 files: byron, shelley, alonzo, conway),
+key sets for two stake pools, four stake delegators, three genesis keys, and
+one UTxO funding key. All output lands under <code>testnet/local-devnet/genesis/</code>,
+<code>testnet/local-devnet/keys/</code>, and <code>testnet/local-devnet/config/</code> (rendered
+configs). Generated keys and genesis files are gitignored.</p>
+<p>Expected output ends with:</p>
+<pre><code>[INFO]  All configs + topologies rendered to testnet/local-devnet/config/
+[INFO]  Setup complete. Next: ./run.sh
+</code></pre>
+<p>The genesis start time is set to "now + 30 seconds." Re-run <code>setup.sh</code> if more
+than ~5 minutes pass before you call <code>run.sh</code> (the start-time freshness check
+will refuse to start a stale chain).</p>
+<h2 id="running-the-network"><a class="header" href="#running-the-network">Running the network</a></h2>
+<pre><code class="language-bash">./testnet/local-devnet/run.sh
+</code></pre>
+<p>This starts the three nodes in the background (caffeinate-wrapped on macOS),
+records PIDs to <code>state/&lt;node&gt;.pid</code>, sends logs to <code>logs/&lt;node&gt;.log</code>, and
+exposes N2C sockets at:</p>
+<ul>
+<li><code>testnet/local-devnet/state/dugite-relay.sock</code></li>
+<li><code>testnet/local-devnet/state/dugite-bp.sock</code></li>
+<li><code>testnet/local-devnet/state/cardano-bp.sock</code></li>
+</ul>
+<p>You can query each socket with <code>cardano-cli</code> (or <code>dugite-cli</code>, which speaks
+the same N2C protocol):</p>
+<pre><code class="language-bash">cardano-cli query tip \
+  --testnet-magic 42 \
+  --socket-path testnet/local-devnet/state/dugite-bp.sock
+</code></pre>
+<p>To stop the network:</p>
+<pre><code class="language-bash">./testnet/local-devnet/stop.sh
+</code></pre>
+<p>This sends SIGTERM, waits 5 seconds, then SIGKILL if needed. DBs and logs
+are preserved in <code>state/</code> and <code>logs/</code>.</p>
+<h2 id="running-the-soak-test"><a class="header" href="#running-the-soak-test">Running the soak test</a></h2>
+<pre><code class="language-bash">./testnet/local-devnet/soak.sh         # default: 1800s (30 minutes)
+./testnet/local-devnet/soak.sh 300     # 5-minute smoke test
+</code></pre>
+<p>The soak runs three concurrent samplers while it's alive:</p>
+<ul>
+<li><strong>tip-sampler</strong> — every 5 seconds, queries <code>tip</code> on each socket and appends
+<code>(ts, node, slot, block_no, hash, era)</code> rows to <code>tip-samples.csv</code>.</li>
+<li><strong>block-recorder</strong> — tails the three node logs and writes one row per first-
+sight of each block, with observer, forge/recv flag, slot, hash, and (for
+forge events) the issuer's vkey.</li>
+<li><strong>tx-injector</strong> — at T+2 min, T+10 min, and T+20 min, submits 5 self-transfer
+payment transactions to each of the 3 sockets (15 per wave, 45 total) and
+records each submission's txid and return code.</li>
+</ul>
+<p>Evidence lands in <code>testnet/local-devnet/evidence/&lt;timestamp&gt;/</code>. A heartbeat
+line is printed every 30 seconds with current tips from all three nodes.</p>
+<h2 id="verifying-results"><a class="header" href="#verifying-results">Verifying results</a></h2>
+<p>After the soak finishes, <code>soak.sh</code> does not automatically run verify — run it
+manually:</p>
+<pre><code class="language-bash">./testnet/local-devnet/verify.sh testnet/local-devnet/evidence/&lt;timestamp&gt;/
+</code></pre>
+<p>The verifier evaluates four pass/fail predicates and writes
+<code>evidence/&lt;timestamp&gt;/report.md</code>. Predicates:</p>
+<div class="table-wrapper"><table><thead><tr><th>#</th><th>Predicate</th><th>Pass condition</th></tr></thead><tbody>
+<tr><td>1</td><td><strong>Block forge cross-check</strong></td><td>Every confirmed (slot, hash) pair is seen by all three observers in <code>blocks.csv</code>. (Most-recent 10 blocks are excluded from the check to allow rollback grace.)</td></tr>
+<tr><td>2</td><td><strong>Per-BP forge attribution</strong></td><td>dugite-bp forged &gt;= 3 blocks; cardano-node forged 0 (it's a validator). Expected ~360 by dugite-bp at f=0.2, σ=1.0 — failure at 3 is a real wiring bug, not a slot-lottery flake. Any forge events attributed to a non-dugite-bp issuer are a setup error.</td></tr>
+<tr><td>3</td><td><strong>Transaction inclusion round-trip</strong></td><td>Every submitted tx has <code>submit_rc=0</code> and (when run with the devnet up) appears in all three nodes' UTxO sets at the genesis payment address.</td></tr>
+<tr><td>4</td><td><strong>Tip parity over time</strong></td><td>At &gt;=95% of 5-second ticks (excluding the first 60s warmup), all three nodes report tips within 2 blocks of each other.</td></tr>
+</tbody></table>
+</div>
+<p>The <code>report.md</code> includes a metadata snapshot (versions, genesis hashes, magic),
+counts (block events, tx submissions, tip samples), a forge-attribution
+breakdown, and a per-predicate result table.</p>
+<p>You can also self-test the verifier (without a real soak) using committed
+test fixtures:</p>
+<pre><code class="language-bash">./testnet/local-devnet/verify.sh --self-test
+</code></pre>
+<h2 id="topology--port-reference"><a class="header" href="#topology--port-reference">Topology &amp; port reference</a></h2>
+<div class="table-wrapper"><table><thead><tr><th>Process</th><th>N2N</th><th>Metrics</th><th>Socket</th><th>Config</th><th>Topology</th></tr></thead><tbody>
+<tr><td><code>dugite-bp</code> (pool1, sole forger)</td><td>3001</td><td>12798</td><td><code>dugite-bp.sock</code></td><td><code>dugite-bp.config.json</code></td><td><code>dugite-bp.topology.json</code></td></tr>
+<tr><td><code>dugite-relay</code> (hub)</td><td>3002</td><td>12799</td><td><code>dugite-relay.sock</code></td><td><code>dugite-relay.config.json</code></td><td><code>dugite-relay.topology.json</code></td></tr>
+<tr><td><code>cardano-node</code> (validator)</td><td>3003</td><td>—</td><td><code>cardano-bp.sock</code></td><td><code>cardano-bp.config.json</code></td><td><code>cardano-bp.topology.json</code></td></tr>
+</tbody></table>
+</div>
+<p>The devnet uses the standard Cardano N2N port (3001) for <code>dugite-bp</code> and
+single-digit increments for the relay (3002) and the Haskell BP (3003). The
+metrics ports follow the same convention: <code>dugite-bp</code> keeps the well-known
+Prometheus default (12798), the relay exposes 12799. If a public-network
+soak is running on the same host it must be stopped before the devnet boots,
+since both processes would otherwise bind 3001/12798.</p>
+<h3 id="monitoring-with-dugite-monitor"><a class="header" href="#monitoring-with-dugite-monitor">Monitoring with <code>dugite-monitor</code></a></h3>
+<p>Because <code>dugite-bp</code> runs on the default metrics port (12798), the bundled
+TUI monitor connects with no overrides. In a separate terminal once the
+devnet is up:</p>
+<pre><code class="language-bash">./target/release/dugite-monitor
+</code></pre>
+<p>To inspect the relay instead of the BP, point the monitor at its metrics
+port:</p>
+<pre><code class="language-bash">./target/release/dugite-monitor --metrics-url http://localhost:12799/metrics
+</code></pre>
+<p>The <code>cardano-node</code> validator does not expose a Prometheus endpoint in this
+devnet (its EKG/Prometheus exporters are disabled to keep the configuration
+minimal and avoid port collisions).</p>
+<h2 id="configuration-reference"><a class="header" href="#configuration-reference">Configuration reference</a></h2>
+<p>The genesis is generated by <code>cardano-cli conway genesis create-testnet-data</code>
+with two override fragments committed under <code>config/spec/</code>. Only fields that
+differ from cardano-cli's defaults are listed below.</p>
+<p><code>config/spec/shelley-spec.json</code>:</p>
+<div class="table-wrapper"><table><thead><tr><th>field</th><th>value</th><th>purpose</th></tr></thead><tbody>
+<tr><td><code>slotLength</code></td><td><code>1.0</code></td><td>1-second slot duration</td></tr>
+<tr><td><code>activeSlotsCoeff</code></td><td><code>0.2</code></td><td>f = 0.2; ~5s expected block time</td></tr>
+<tr><td><code>epochLength</code></td><td><code>200</code></td><td>~3.3 minutes per epoch -&gt; ~9 epoch transitions in the 30-min soak. The Praos lower bound is <code>3k/f = 150</code> slots; we stay safely above that while keeping reward/governance cycles short enough for tx-zoo.</td></tr>
+<tr><td><code>securityParam</code></td><td><code>10</code></td><td>small k -&gt; fast immutability (3k/f ~= 150 slots)</td></tr>
+<tr><td><code>updateQuorum</code></td><td><code>2</code></td><td>matches the 3 genesis keys (2-of-3)</td></tr>
+<tr><td><code>maxLovelaceSupply</code></td><td><code>60_000_000_000_000_000</code></td><td>60 B ADA, mainnet-shaped</td></tr>
+<tr><td><code>networkMagic</code></td><td><code>42</code></td><td>local devnet magic</td></tr>
+</tbody></table>
+</div>
+<p><code>config/spec/conway-spec.json</code> carries Conway governance parameters; for a
+30-min run with no proposals only the protocol version matters. PV is set
+to 10.0 so the chain boots straight into Conway.</p>
+<h2 id="troubleshooting"><a class="header" href="#troubleshooting">Troubleshooting</a></h2>
+<ul>
+<li><strong><code>ERROR: cardano-cli x.y.z &lt; 11.0.0 required</code></strong> — install a newer cardano-cli; see prerequisites.</li>
+<li><strong><code>ERROR: Port 3001 is in use</code></strong> — another devnet (or the public soak rig) is using a port. Run <code>./stop.sh</code> or <code>lsof -iTCP:3001</code>.</li>
+<li><strong><code>Genesis is N seconds old (&gt;300s). Re-run ./setup.sh</code></strong> — the start time has drifted; re-run setup.</li>
+<li><strong>Tips not advancing after <code>run.sh</code></strong> — check <code>logs/&lt;node&gt;.log</code> for the failing node. Most common cause is a KES key path mismatch (re-run <code>setup.sh</code>).</li>
+<li><strong>Soak hangs on macOS</strong> — confirm <code>caffeinate</code> is wrapping the dugite processes via <code>ps auxw | grep caffeinate</code>. App Nap can freeze dugite for tens of minutes without it.</li>
+<li><strong><code>dugite-monitor</code> shows no data</strong> — confirm the BP is exposing metrics on 12798 with <code>curl -s localhost:12798/metrics | head</code>. If empty, the BP either failed to start or its config doesn't have the Prometheus exporter enabled (the devnet template enables it by default).</li>
+</ul>
+<h2 id="what-this-validates"><a class="header" href="#what-this-validates">What this validates</a></h2>
+<ul>
+<li>Dugite block production end-to-end (forge -&gt; adopt -&gt; diffuse)</li>
+<li>Dugite relay's ChainSync/BlockFetch serving (Rust -&gt; Haskell validator)</li>
+<li>Dugite N2N peer connection lifecycle on loopback</li>
+<li>Dugite N2C local-socket tx submission, query tip, query utxo</li>
+<li>Byte-exact acceptance of every dugite-forged block by cardano-node 11.0.1+
+(the Haskell ledger applies each block; any header / body / Conway
+predicate mismatch surfaces as a <code>ChainDB.AddBlockValidation.InvalidBlock</code>
+trace in <code>logs/cardano-bp.log</code>)</li>
+</ul>
+<h2 id="what-this-does-not-validate"><a class="header" href="#what-this-does-not-validate">What this does NOT validate</a></h2>
+<ul>
+<li>Byron-era code paths (chain boots in Conway)</li>
+<li>Hard-fork combinator era transitions (none occur during the soak)</li>
+<li>Multi-relay diffusion topologies (single hub)</li>
+<li>Plutus phase-2 / governance enactment (no proposals or scripts in the soak; the tx-zoo covers governance under a separate driver)</li>
+<li>Symmetric multi-forger chain selection (cardano-node is a validator here, not a forger — see "Historical note" at top)</li>
+<li>Mainnet-scale peer counts, NAT/firewall behaviour, or BGP-level routing</li>
+<li>Mithril snapshot import (covered by other tests)</li>
+</ul>
+<h2 id="transaction-validation-tx-zoo"><a class="header" href="#transaction-validation-tx-zoo">Transaction validation (tx-zoo)</a></h2>
+<p>In addition to the soak (which exercises block production + diffusion under a
+steady-state load of identical self-payments), the devnet ships with a
+<strong>transaction zoo</strong> that exercises the full Conway tx surface against the same
+3-node hub. Use this when you want to verify that the dugite mempool, forger,
+and validator accept every transaction class that mainnet allows.</p>
+<pre><code class="language-bash">./testnet/local-devnet/tx-zoo/run-all.sh --setup    # one-time: keys + Plutus binaries
+./testnet/local-devnet/tx-zoo/run-all.sh            # run everything
+./testnet/local-devnet/tx-zoo/run-all.sh 03-plutus  # one category
+./testnet/local-devnet/tx-zoo/run-all.sh --summary  # totals from the last run
+</code></pre>
+<p>The zoo covers 8 categories (59 scripts total): bookkeeping (simple-pay,
+multi-output, metadata CIP-20/CIP-25, validity intervals, required signers,
+treasury donation, tx chaining), native scripts (all/any/atLeast policies,
+time-locked, burns, pay-to-script, spend-from-script), Plutus V1/V2/V3
+(spend, mint, inline datums, reference scripts, reference inputs, datum-hash
+reveal, collateral consumption), stake operations (register, delegate,
+combined certs, deregister, pool register/retire, reward withdrawal),
+governance certificates (DRep register/update/deregister, vote-delegation to
+DRep + always-abstain + always-no-confidence, CC hot-key authorisation,
+CC resignation), proposals (Info, ParameterChange, HardForkInitiation,
+TreasuryWithdrawal, NoConfidence, UpdateCommittee, NewConstitution), voting
+(DRep + SPO + CC yes/no/abstain), and negative paths (min-utxo violation,
+fee-too-low, expired TTL, insufficient collateral). Each script submits
+through the dugite relay socket and waits for inclusion at that same socket
+to guarantee diffusion + validation on the dugite path before recording
+PASS/FAIL/SKIP into <code>tx-zoo/state/results.csv</code>.</p>
+<h3 id="requirements"><a class="header" href="#requirements">Requirements</a></h3>
+<ul>
+<li>The devnet must be up via <code>./run.sh</code> (the zoo refuses to start without all 3
+sockets).</li>
+<li>The Conway genesis must boot at protocol version &gt;= 10 so Plutus V1/V2/V3
+and Conway-only certs are admissible. The committed <code>shelley-spec.json</code>
+already sets <code>protocolVersion.major = 10</code>; if you fork the spec to a lower
+version every script that touches Plutus or governance will record FAIL
+with "ScriptFailed: requires protocol &gt;= N" from cardano-cli or the dugite
+mempool.</li>
+<li>The zoo uses vendored always-true Plutus binaries for V1/V2/V3 scripts.
+Three categories (collateral, ref-scripts, inline-datum) run with these vendored
+versions; only the negative-path "insufficient collateral" needs a real V2
+always-true script (also vendored).</li>
+</ul>
+<h3 id="caveats"><a class="header" href="#caveats">Caveats</a></h3>
+<ul>
+<li><strong><code>not-included</code> failures</strong>: the zoo uses a single shared funding wallet
+(the genesis UTxO key) and runs scripts in lexical order. Each test
+consumes the largest UTxO at that wallet, so concurrent runs against the
+same socket will race. If you see intermittent <code>not-included</code> in
+<code>results.csv</code> for a tx that was added to the mempool, check that no other
+client is submitting to the same socket — the zoo expects exclusive access.</li>
+<li><strong>Rewards warmup</strong>: <code>reward-withdrawal</code> cannot succeed until the delegated
+stake earns rewards, which requires at least two epoch boundaries after
+delegation. On the 200-slot epoch this means the script SKIPs for the
+first ~7 minutes after a fresh devnet boot. The script records SKIP with
+reason <code>no-rewards</code> rather than failing.</li>
+</ul>
+<h3 id="seated-cc-member"><a class="header" href="#seated-cc-member">Seated CC member</a></h3>
+<p><code>cardano-cli conway genesis create-testnet-data</code> emits an empty
+Constitutional Committee (<code>members={}, threshold=0</code>), which would make the
+CC hot-key auth, CC resignation, and CC voting scripts non-runnable. To
+provide full governance coverage out of the box, <code>setup.sh</code> generates a CC
+cold/hot key pair at <code>keys/cc-1/</code> and post-processes the generated
+<code>conway-genesis.json</code> to seat that member with a 1-of-1 threshold and a
+long expiry term (epoch 1000). <code>tx-zoo/lib/keygen.sh</code> then reuses those
+same keys, so <code>05g-cc-hot-key-authorization</code>, <code>05h-cc-resign</code>,
+<code>07f-cc-vote-yes</code>, and <code>07g-cc-vote-no</code> operate on a genuine seated member
+rather than an orphan keypair.</p>
+<p>If you fork <code>setup.sh</code> or generate genesis through any other path, ensure
+the resulting <code>conway-genesis.json</code> has a non-empty <code>committee.members</code>
+map and a <code>threshold</code> matching that membership; otherwise those four
+scripts will auto-SKIP with reason <code>empty-committee</code> / <code>cc-not-authorized</code>.</p>
+<p>Results are appended to <code>tx-zoo/state/results.csv</code> (one row per script with
+ts, name, status, txid, detail) and the per-script stderr lives under
+<code>tx-zoo/state/logs/&lt;name&gt;.log</code>. After a failed run, re-run a single category
+or script directly:</p>
+<pre><code class="language-bash">./testnet/local-devnet/tx-zoo/03-plutus/03a-spend-v1.sh
+</code></pre>
+<hr />
+<p>Tracking: see the GitHub issue linked from
+<a href="https://github.com/michaeljfazio/dugite/blob/main/docs/superpowers/specs/2026-05-16-local-testnet-design.md"><code>docs/superpowers/specs/2026-05-16-local-testnet-design.md</code></a>.</p>
+
+                    </main>
+
+                    <nav class="nav-wrapper" aria-label="Page navigation">
+                        <!-- Mobile navigation buttons -->
+                            <a rel="prev" href="../running/block-producer.html" class="mobile-nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
+                                <i class="fa fa-angle-left"></i>
+                            </a>
+
+                            <a rel="next prefetch" href="../running/kubernetes.html" class="mobile-nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
+                                <i class="fa fa-angle-right"></i>
+                            </a>
+
+                        <div style="clear: both"></div>
+                    </nav>
+                </div>
+            </div>
+
+            <nav class="nav-wide-wrapper" aria-label="Page navigation">
+                    <a rel="prev" href="../running/block-producer.html" class="nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
+                        <i class="fa fa-angle-left"></i>
+                    </a>
+
+                    <a rel="next prefetch" href="../running/kubernetes.html" class="nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
+                        <i class="fa fa-angle-right"></i>
+                    </a>
+            </nav>
+
+        </div>
+
+
+
+
+        <script>
+            window.playground_copyable = true;
+        </script>
+
+
+        <script src="../elasticlunr.min.js"></script>
+        <script src="../mark.min.js"></script>
+        <script src="../searcher.js"></script>
+
+        <script src="../clipboard.min.js"></script>
+        <script src="../highlight.js"></script>
+        <script src="../book.js"></script>
+
+        <!-- Custom JS scripts -->
+
+
+    </div>
+    </body>
+</html>

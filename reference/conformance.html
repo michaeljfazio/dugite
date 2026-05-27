@@ -1,0 +1,344 @@
+<!DOCTYPE HTML>
+<html lang="en" class="light" dir="ltr">
+    <head>
+        <!-- Book generated using mdBook -->
+        <meta charset="UTF-8">
+        <title>Conformance Test Suite - Dugite Documentation</title>
+
+
+        <!-- Custom HTML head -->
+        
+        <meta name="description" content="">
+        <meta name="viewport" content="width=device-width, initial-scale=1">
+        <meta name="theme-color" content="#ffffff">
+
+        <link rel="icon" href="../favicon.svg">
+        <link rel="shortcut icon" href="../favicon.png">
+        <link rel="stylesheet" href="../css/variables.css">
+        <link rel="stylesheet" href="../css/general.css">
+        <link rel="stylesheet" href="../css/chrome.css">
+        <link rel="stylesheet" href="../css/print.css" media="print">
+
+        <!-- Fonts -->
+        <link rel="stylesheet" href="../FontAwesome/css/font-awesome.css">
+        <link rel="stylesheet" href="../fonts/fonts.css">
+
+        <!-- Highlight.js Stylesheets -->
+        <link rel="stylesheet" href="../highlight.css">
+        <link rel="stylesheet" href="../tomorrow-night.css">
+        <link rel="stylesheet" href="../ayu-highlight.css">
+
+        <!-- Custom theme stylesheets -->
+
+    </head>
+    <body class="sidebar-visible no-js">
+    <div id="body-container">
+        <!-- Provide site root to javascript -->
+        <script>
+            var path_to_root = "../";
+            var default_theme = window.matchMedia("(prefers-color-scheme: dark)").matches ? "navy" : "light";
+        </script>
+
+        <!-- Work around some values being stored in localStorage wrapped in quotes -->
+        <script>
+            try {
+                var theme = localStorage.getItem('mdbook-theme');
+                var sidebar = localStorage.getItem('mdbook-sidebar');
+
+                if (theme.startsWith('"') && theme.endsWith('"')) {
+                    localStorage.setItem('mdbook-theme', theme.slice(1, theme.length - 1));
+                }
+
+                if (sidebar.startsWith('"') && sidebar.endsWith('"')) {
+                    localStorage.setItem('mdbook-sidebar', sidebar.slice(1, sidebar.length - 1));
+                }
+            } catch (e) { }
+        </script>
+
+        <!-- Set the theme before any content is loaded, prevents flash -->
+        <script>
+            var theme;
+            try { theme = localStorage.getItem('mdbook-theme'); } catch(e) { }
+            if (theme === null || theme === undefined) { theme = default_theme; }
+            var html = document.querySelector('html');
+            html.classList.remove('light')
+            html.classList.add(theme);
+            var body = document.querySelector('body');
+            body.classList.remove('no-js')
+            body.classList.add('js');
+        </script>
+
+        <input type="checkbox" id="sidebar-toggle-anchor" class="hidden">
+
+        <!-- Hide / unhide sidebar before it is displayed -->
+        <script>
+            var body = document.querySelector('body');
+            var sidebar = null;
+            var sidebar_toggle = document.getElementById("sidebar-toggle-anchor");
+            if (document.body.clientWidth >= 1080) {
+                try { sidebar = localStorage.getItem('mdbook-sidebar'); } catch(e) { }
+                sidebar = sidebar || 'visible';
+            } else {
+                sidebar = 'hidden';
+            }
+            sidebar_toggle.checked = sidebar === 'visible';
+            body.classList.remove('sidebar-visible');
+            body.classList.add("sidebar-" + sidebar);
+        </script>
+
+        <nav id="sidebar" class="sidebar" aria-label="Table of contents">
+            <div class="sidebar-scrollbox">
+                <ol class="chapter"><li class="chapter-item expanded affix "><a href="../introduction.html">Introduction</a></li><li class="chapter-item expanded affix "><li class="part-title">Getting Started</li><li class="chapter-item expanded "><a href="../installation.html"><strong aria-hidden="true">1.</strong> Installation</a></li><li class="chapter-item expanded "><a href="../quickstart.html"><strong aria-hidden="true">2.</strong> Quick Start</a></li><li class="chapter-item expanded "><a href="../development.html"><strong aria-hidden="true">3.</strong> Development</a></li><li class="chapter-item expanded affix "><li class="part-title">Running a Node</li><li class="chapter-item expanded "><a href="../running/configuration.html"><strong aria-hidden="true">4.</strong> Configuration</a></li><li class="chapter-item expanded "><a href="../running/config-editor.html"><strong aria-hidden="true">5.</strong> Configuration Editor (dugite-config)</a></li><li class="chapter-item expanded "><a href="../running/topology.html"><strong aria-hidden="true">6.</strong> Topology</a></li><li class="chapter-item expanded "><a href="../running/networks.html"><strong aria-hidden="true">7.</strong> Networks</a></li><li class="chapter-item expanded "><a href="../running/mithril.html"><strong aria-hidden="true">8.</strong> Mithril Snapshot Import</a></li><li class="chapter-item expanded "><a href="../running/mithril-ancillary.html"><strong aria-hidden="true">9.</strong> Mithril Ancillary — Trust Model</a></li><li class="chapter-item expanded "><a href="../running/logging.html"><strong aria-hidden="true">10.</strong> Logging</a></li><li class="chapter-item expanded "><a href="../running/monitoring.html"><strong aria-hidden="true">11.</strong> Monitoring</a></li><li class="chapter-item expanded "><a href="../running/utxo-rpc.html"><strong aria-hidden="true">12.</strong> UTxO RPC (gRPC) Server</a></li><li class="chapter-item expanded "><a href="../running/relay.html"><strong aria-hidden="true">13.</strong> Relay Node</a></li><li class="chapter-item expanded "><a href="../running/block-producer.html"><strong aria-hidden="true">14.</strong> Block Producer</a></li><li class="chapter-item expanded "><a href="../running/local-testnet.html"><strong aria-hidden="true">15.</strong> Local Testnet</a></li><li class="chapter-item expanded "><a href="../running/kubernetes.html"><strong aria-hidden="true">16.</strong> Kubernetes Deployment</a></li><li class="chapter-item expanded affix "><li class="part-title">CLI Reference</li><li class="chapter-item expanded "><a href="../cli/overview.html"><strong aria-hidden="true">17.</strong> Overview</a></li><li class="chapter-item expanded "><a href="../cli/dugite-node.html"><strong aria-hidden="true">18.</strong> dugite-node</a></li><li class="chapter-item expanded "><a href="../cli/key-generation.html"><strong aria-hidden="true">19.</strong> Key Generation</a></li><li class="chapter-item expanded "><a href="../cli/transactions.html"><strong aria-hidden="true">20.</strong> Transactions</a></li><li class="chapter-item expanded "><a href="../cli/queries.html"><strong aria-hidden="true">21.</strong> Queries</a></li><li class="chapter-item expanded "><a href="../cli/stake-address.html"><strong aria-hidden="true">22.</strong> Stake Address</a></li><li class="chapter-item expanded "><a href="../cli/stake-pool.html"><strong aria-hidden="true">23.</strong> Stake Pool</a></li><li class="chapter-item expanded "><a href="../cli/node-commands.html"><strong aria-hidden="true">24.</strong> Node Commands</a></li><li class="chapter-item expanded "><a href="../cli/governance.html"><strong aria-hidden="true">25.</strong> Governance</a></li><li class="chapter-item expanded affix "><li class="part-title">Architecture</li><li class="chapter-item expanded "><a href="../architecture/overview.html"><strong aria-hidden="true">26.</strong> Overview</a></li><li class="chapter-item expanded "><a href="../architecture/sync-pipeline.html"><strong aria-hidden="true">27.</strong> Sync Pipeline</a></li><li class="chapter-item expanded "><a href="../architecture/storage.html"><strong aria-hidden="true">28.</strong> Storage</a></li><li class="chapter-item expanded "><a href="../architecture/ledger.html"><strong aria-hidden="true">29.</strong> Ledger</a></li><li class="chapter-item expanded "><a href="../architecture/consensus.html"><strong aria-hidden="true">30.</strong> Consensus</a></li><li class="chapter-item expanded "><a href="../architecture/networking.html"><strong aria-hidden="true">31.</strong> Networking</a></li><li class="chapter-item expanded "><a href="../architecture/p2p-governor.html"><strong aria-hidden="true">32.</strong> P2P Governor</a></li><li class="chapter-item expanded "><a href="../architecture/genesis-support.html"><strong aria-hidden="true">33.</strong> Genesis Support</a></li><li class="chapter-item expanded affix "><li class="part-title">Reference</li><li class="chapter-item expanded "><a href="../reference/protocol-parameters.html"><strong aria-hidden="true">34.</strong> Protocol Parameters</a></li><li class="chapter-item expanded "><a href="../reference/mini-protocols.html"><strong aria-hidden="true">35.</strong> Mini-Protocol Reference</a></li><li class="chapter-item expanded "><a href="../reference/upgrading.html"><strong aria-hidden="true">36.</strong> Upgrading</a></li><li class="chapter-item expanded "><a href="../reference/conformance.html" class="active"><strong aria-hidden="true">37.</strong> Conformance Test Suite</a></li><li class="chapter-item expanded "><a href="../reference/benchmarks.html"><strong aria-hidden="true">38.</strong> Benchmarks</a></li><li class="chapter-item expanded "><a href="../reference/third-party-licenses.html"><strong aria-hidden="true">39.</strong> Third-Party Licenses</a></li><li class="chapter-item expanded "><a href="../reference/troubleshooting.html"><strong aria-hidden="true">40.</strong> Troubleshooting</a></li></ol>
+            </div>
+            <div id="sidebar-resize-handle" class="sidebar-resize-handle">
+                <div class="sidebar-resize-indicator"></div>
+            </div>
+        </nav>
+
+        <!-- Track and set sidebar scroll position -->
+        <script>
+            var sidebarScrollbox = document.querySelector('#sidebar .sidebar-scrollbox');
+            sidebarScrollbox.addEventListener('click', function(e) {
+                if (e.target.tagName === 'A') {
+                    sessionStorage.setItem('sidebar-scroll', sidebarScrollbox.scrollTop);
+                }
+            }, { passive: true });
+            var sidebarScrollTop = sessionStorage.getItem('sidebar-scroll');
+            sessionStorage.removeItem('sidebar-scroll');
+            if (sidebarScrollTop) {
+                // preserve sidebar scroll position when navigating via links within sidebar
+                sidebarScrollbox.scrollTop = sidebarScrollTop;
+            } else {
+                // scroll sidebar to current active section when navigating via "next/previous chapter" buttons
+                var activeSection = document.querySelector('#sidebar .active');
+                if (activeSection) {
+                    activeSection.scrollIntoView({ block: 'center' });
+                }
+            }
+        </script>
+
+        <div id="page-wrapper" class="page-wrapper">
+
+            <div class="page">
+                                <div id="menu-bar-hover-placeholder"></div>
+                <div id="menu-bar" class="menu-bar sticky">
+                    <div class="left-buttons">
+                        <label id="sidebar-toggle" class="icon-button" for="sidebar-toggle-anchor" title="Toggle Table of Contents" aria-label="Toggle Table of Contents" aria-controls="sidebar">
+                            <i class="fa fa-bars"></i>
+                        </label>
+                        <button id="theme-toggle" class="icon-button" type="button" title="Change theme" aria-label="Change theme" aria-haspopup="true" aria-expanded="false" aria-controls="theme-list">
+                            <i class="fa fa-paint-brush"></i>
+                        </button>
+                        <ul id="theme-list" class="theme-popup" aria-label="Themes" role="menu">
+                            <li role="none"><button role="menuitem" class="theme" id="light">Light</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="rust">Rust</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="coal">Coal</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="navy">Navy</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="ayu">Ayu</button></li>
+                        </ul>
+                        <button id="search-toggle" class="icon-button" type="button" title="Search. (Shortkey: s)" aria-label="Toggle Searchbar" aria-expanded="false" aria-keyshortcuts="S" aria-controls="searchbar">
+                            <i class="fa fa-search"></i>
+                        </button>
+                    </div>
+
+                    <h1 class="menu-title">Dugite Documentation</h1>
+
+                    <div class="right-buttons">
+                        <a href="../print.html" title="Print this book" aria-label="Print this book">
+                            <i id="print-button" class="fa fa-print"></i>
+                        </a>
+                        <a href="https://github.com/michaeljfazio/dugite" title="Git repository" aria-label="Git repository">
+                            <i id="git-repository-button" class="fa fa-github"></i>
+                        </a>
+                        <a href="https://github.com/michaeljfazio/dugite/edit/main/docs/src/reference/conformance.md" title="Suggest an edit" aria-label="Suggest an edit">
+                            <i id="git-edit-button" class="fa fa-edit"></i>
+                        </a>
+
+                    </div>
+                </div>
+
+                <div id="search-wrapper" class="hidden">
+                    <form id="searchbar-outer" class="searchbar-outer">
+                        <input type="search" id="searchbar" name="searchbar" placeholder="Search this book ..." aria-controls="searchresults-outer" aria-describedby="searchresults-header">
+                    </form>
+                    <div id="searchresults-outer" class="searchresults-outer hidden">
+                        <div id="searchresults-header" class="searchresults-header"></div>
+                        <ul id="searchresults">
+                        </ul>
+                    </div>
+                </div>
+
+                <!-- Apply ARIA attributes after the sidebar and the sidebar toggle button are added to the DOM -->
+                <script>
+                    document.getElementById('sidebar-toggle').setAttribute('aria-expanded', sidebar === 'visible');
+                    document.getElementById('sidebar').setAttribute('aria-hidden', sidebar !== 'visible');
+                    Array.from(document.querySelectorAll('#sidebar a')).forEach(function(link) {
+                        link.setAttribute('tabIndex', sidebar === 'visible' ? 0 : -1);
+                    });
+                </script>
+
+                <div id="content" class="content">
+                    <main>
+                        <h1 id="conformance-test-suite"><a class="header" href="#conformance-test-suite">Conformance Test Suite</a></h1>
+<p>Dugite's correctness story rests on three layers:</p>
+<ol>
+<li><strong>Conformance</strong> — byte-exact alignment vs upstream Cardano artefacts, verified by replay. This page.</li>
+<li><strong>Feature compatibility</strong> — what protocol features the node implements. See the wiki <a href="https://github.com/michaeljfazio/dugite/wiki/Protocol-Compliance">Protocol Compliance</a> page.</li>
+<li><strong>Operational soak testing</strong> — sustained behaviour on live testnets (preview, preprod) and the local devnet.</li>
+</ol>
+<p>This page documents the conformance suite: where the upstream fixtures come from, what each area validates, and how to replay any of them locally.</p>
+<h2 id="the-corpus-model"><a class="header" href="#the-corpus-model">The corpus model</a></h2>
+<pre><code>upstream repos (SHA-pinned in sources.toml)
+       │
+       ▼
+regenerate-conformance-corpus workflow
+       │  produces 7 tarballs
+       ▼
+dugite GitHub release (tag pinned in manifest.toml)
+       │
+       ▼
+just download-upstream-fixtures
+       │
+       ▼
+dugite-conformance test harness (DUGITE_REQUIRE_UPSTREAM=1)
+</code></pre>
+<p>Upstream sources are pinned by commit SHA (or tag) in <code>tests/conformance/upstream/sources.toml</code>. The <code>regenerate-conformance-corpus</code> workflow consumes those pins, materialises the seven fixture areas into tarballs, and publishes them as assets of a single dugite GitHub release. Consumers (CI and local developers alike) then pin to that <em>release tag</em> via <code>tests/conformance/upstream/manifest.toml</code>, so a single fetch lands every fixture area at a known good combination. Tarballs are cached by content hash of <code>manifest.toml</code>, so bumping the tag invalidates the cache automatically.</p>
+<p>This two-level pinning separates "what upstream version we test against" (<code>sources.toml</code>, only changes when we want to bump) from "what corpus the test run consumed" (<code>manifest.toml</code>, deterministic and cacheable).</p>
+<h2 id="status"><a class="header" href="#status">Status</a></h2>
+<div class="table-wrapper"><table><thead><tr><th>Area</th><th>Source</th><th>Coverage</th><th>Status</th></tr></thead><tbody>
+<tr><td>UPLC (Plutus)</td><td>IntersectMBO/plutus</td><td>999 evaluation cases</td><td>100% — skip list empty</td></tr>
+<tr><td>ouroboros-consensus</td><td>IntersectMBO/ouroboros-consensus</td><td>Block / header golden files per era</td><td>passing</td></tr>
+<tr><td>cardano-ledger</td><td>IntersectMBO/cardano-ledger</td><td>Genesis JSON, CDDL schema, golden transactions</td><td>passing</td></tr>
+<tr><td>cardano-node</td><td>IntersectMBO/cardano-node</td><td>Genesis spec files</td><td>passing</td></tr>
+<tr><td>ledger-rules (ImpSpec)</td><td>IntersectMBO/cardano-ledger</td><td>CBOR NEWEPOCH + LEDGER vectors from ImpSpec</td><td>passing — <code>SKIP_LIST</code> empty</td></tr>
+<tr><td>cardano-base</td><td>IntersectMBO/cardano-base</td><td>VRF v03 crypto test vectors</td><td>passing</td></tr>
+<tr><td>mithril</td><td>input-output-hk/mithril</td><td>Certificate fixture JSON</td><td>passing</td></tr>
+</tbody></table>
+</div>
+<h2 id="per-area-detail"><a class="header" href="#per-area-detail">Per-area detail</a></h2>
+<h3 id="uplc-plutus"><a class="header" href="#uplc-plutus">UPLC (Plutus)</a></h3>
+<p><strong>Source:</strong> <a href="https://github.com/IntersectMBO/plutus">IntersectMBO/plutus</a>, pinned to tag <code>1.65.0.0</code> in <code>sources.toml</code>.</p>
+<p><strong>What's validated:</strong> 999 evaluation test cases from <code>plutus-conformance/test-cases/uplc/evaluation/</code>. Each test case provides a UPLC program and the expected result (a term, a budget exhaustion, or a specific runtime error). The dugite-uplc CEK machine evaluates each program and the harness compares term-for-term, budget-for-budget against the expected output.</p>
+<p><strong>Status:</strong> 100% passing. The skip list is empty as of v1.7.0. The harness covers normalisation by evaluation (NbE) readback, per-builtin cost model wiring, CIP-122 bit ordering, BLS LE scalar handling with null augmentation, and BIP-340 <code>verify_raw</code> semantics (not the SHA-256-wrapped <code>verify</code>).</p>
+<p><strong>Replay locally:</strong></p>
+<pre><code class="language-bash">just download-upstream-fixtures
+just test-conformance-uplc
+</code></pre>
+<h3 id="ouroboros-consensus"><a class="header" href="#ouroboros-consensus">ouroboros-consensus</a></h3>
+<p><strong>Source:</strong> <a href="https://github.com/IntersectMBO/ouroboros-consensus">IntersectMBO/ouroboros-consensus</a>, SHA-pinned in <code>sources.toml</code>.</p>
+<p><strong>What's validated:</strong> Era-tagged golden files for Cardano blocks and headers. The harness exercises the in-house multi-era CBOR decoder against fixtures captured directly from the upstream Haskell encoders, asserting round-trip and structural equivalence per era.</p>
+<p><strong>Status:</strong> passing across all eras (Byron, Shelley, Allegra, Mary, Alonzo, Babbage, Conway).</p>
+<p><strong>Replay locally:</strong></p>
+<pre><code class="language-bash">just download-upstream-fixtures
+just test-conformance-ouroboros-consensus
+</code></pre>
+<h3 id="cardano-ledger"><a class="header" href="#cardano-ledger">cardano-ledger</a></h3>
+<p><strong>Source:</strong> <a href="https://github.com/IntersectMBO/cardano-ledger">IntersectMBO/cardano-ledger</a>, SHA-pinned in <code>sources.toml</code>.</p>
+<p><strong>What's validated:</strong> Three classes of fixture. Genesis JSON for each era is parsed and structurally compared. The CDDL schema is loaded and exercised against representative documents. Golden transaction CBOR is decoded and asserted for byte-equality on re-encode.</p>
+<p><strong>Status:</strong> passing.</p>
+<p><strong>Replay locally:</strong></p>
+<pre><code class="language-bash">just download-upstream-fixtures
+just test-conformance-cardano-ledger
+</code></pre>
+<h3 id="cardano-node"><a class="header" href="#cardano-node">cardano-node</a></h3>
+<p><strong>Source:</strong> <a href="https://github.com/IntersectMBO/cardano-node">IntersectMBO/cardano-node</a>, SHA-pinned in <code>sources.toml</code>.</p>
+<p><strong>What's validated:</strong> Genesis spec files (<code>shelley-genesis.json</code>, <code>alonzo-genesis.json</code>, <code>conway-genesis.json</code> and their Byron counterpart). The harness asserts that dugite parses each spec into its internal genesis types and that the resulting types preserve every documented field.</p>
+<p><strong>Status:</strong> passing.</p>
+<p><strong>Replay locally:</strong></p>
+<pre><code class="language-bash">just download-upstream-fixtures
+just test-conformance-cardano-node
+</code></pre>
+<h3 id="ledger-rules-impspec"><a class="header" href="#ledger-rules-impspec">ledger-rules (ImpSpec)</a></h3>
+<p><strong>Source:</strong> <a href="https://github.com/IntersectMBO/cardano-ledger">IntersectMBO/cardano-ledger</a> ImpSpec, SHA-pinned in <code>sources.toml</code>. The corpus regeneration pipeline builds cardano-ledger from source (GHC 9.6.5 + cabal 3.10.x, ≈35 min cold / 5 min cached) and runs the upstream ImpSpec conformance suite with <code>CONFORMANCE_CBOR_DUMP_PATH</code> set to capture every test vector as CBOR.</p>
+<p><strong>What's validated:</strong> Two STS-rule families — NEWEPOCH (epoch-boundary transitions) and LEDGER (transaction application). The harness replays each captured CBOR vector through the corresponding dugite ledger code path and compares the resulting state byte-for-byte.</p>
+<p><strong>Status:</strong> passing. <code>SKIP_LIST</code> in <code>tests/conformance/src/upstream/ledger_rules_replay/mod.rs</code> is empty.</p>
+<p><strong>Replay locally:</strong></p>
+<pre><code class="language-bash">just download-upstream-fixtures
+just test-conformance-ledger-rules
+</code></pre>
+<h3 id="cardano-base"><a class="header" href="#cardano-base">cardano-base</a></h3>
+<p><strong>Source:</strong> <a href="https://github.com/IntersectMBO/cardano-base">IntersectMBO/cardano-base</a>, SHA-pinned in <code>sources.toml</code>.</p>
+<p><strong>What's validated:</strong> VRF v03 test vectors. Each vector ships an input message, a signing key, an expected proof, and an expected output hash. The harness exercises the dugite VRF implementation against every vector and asserts byte-equality on both the proof and the output, which is what guarantees Praos-compatible leader election.</p>
+<p><strong>Status:</strong> passing.</p>
+<p><strong>Replay locally:</strong></p>
+<pre><code class="language-bash">just download-upstream-fixtures
+just test-conformance-cardano-base
+</code></pre>
+<h3 id="mithril"><a class="header" href="#mithril">mithril</a></h3>
+<p><strong>Source:</strong> <a href="https://github.com/input-output-hk/mithril">input-output-hk/mithril</a>, SHA-pinned in <code>sources.toml</code>.</p>
+<p><strong>What's validated:</strong> Mithril certificate fixture JSON. The harness loads each certificate, verifies the aggregate signature, and asserts structural equivalence against the upstream-captured form.</p>
+<p><strong>Status:</strong> passing.</p>
+<p><strong>Replay locally:</strong></p>
+<pre><code class="language-bash">just download-upstream-fixtures
+just test-conformance-mithril
+</code></pre>
+<h2 id="ci-integration"><a class="header" href="#ci-integration">CI integration</a></h2>
+<p>The <code>upstream-conformance</code> job in <code>.github/workflows/ci.yml</code> runs both the UPLC suite and the upstream tests with the <code>DUGITE_REQUIRE_UPSTREAM=1</code> environment variable set. This variable makes a missing fixture a hard failure rather than a silent skip — the gate exists specifically to stop the suite from quietly degrading to a no-op when something is wrong with the fixture cache or download.</p>
+<p>Fixture tarballs are cached on the CI runner, keyed by the SHA-256 content hash of <code>tests/conformance/upstream/manifest.toml</code>. Bumping <code>[release].tag</code> in that file invalidates the cache automatically; no separate cache-bust step is needed.</p>
+<h2 id="updating-the-corpus"><a class="header" href="#updating-the-corpus">Updating the corpus</a></h2>
+<p>To adopt a new upstream version:</p>
+<ol>
+<li>Edit <code>tests/conformance/upstream/sources.toml</code>, bumping the SHA (or tag for the <code>plutus</code> area) of the area you want to refresh.</li>
+<li>Trigger the <code>regenerate-conformance-corpus</code> workflow on GitHub (manual dispatch, or wait for the weekly automatic run). It produces a new dugite release tagged <code>conformance-corpus-v&lt;timestamp&gt;</code> with the seven tarballs attached.</li>
+<li>Update <code>[release].tag</code> in <code>tests/conformance/upstream/manifest.toml</code> to point at the new release tag.</li>
+<li>Run <code>just download-upstream-fixtures &amp;&amp; just test-conformance</code> locally.</li>
+<li>Fix any test fallout, then commit the <code>sources.toml</code> + <code>manifest.toml</code> updates together with the code changes.</li>
+</ol>
+<h2 id="see-also"><a class="header" href="#see-also">See also</a></h2>
+<ul>
+<li><a href="./benchmarks.html">Benchmarks</a> — performance evidence.</li>
+<li>Wiki <a href="https://github.com/michaeljfazio/dugite/wiki/Protocol-Compliance">Protocol Compliance</a> — feature-by-feature compatibility catalogue.</li>
+<li>Wiki <a href="https://github.com/michaeljfazio/dugite/wiki/Known-Issues">Known Issues</a> — open gaps and follow-ups.</li>
+</ul>
+
+                    </main>
+
+                    <nav class="nav-wrapper" aria-label="Page navigation">
+                        <!-- Mobile navigation buttons -->
+                            <a rel="prev" href="../reference/upgrading.html" class="mobile-nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
+                                <i class="fa fa-angle-left"></i>
+                            </a>
+
+                            <a rel="next prefetch" href="../reference/benchmarks.html" class="mobile-nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
+                                <i class="fa fa-angle-right"></i>
+                            </a>
+
+                        <div style="clear: both"></div>
+                    </nav>
+                </div>
+            </div>
+
+            <nav class="nav-wide-wrapper" aria-label="Page navigation">
+                    <a rel="prev" href="../reference/upgrading.html" class="nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
+                        <i class="fa fa-angle-left"></i>
+                    </a>
+
+                    <a rel="next prefetch" href="../reference/benchmarks.html" class="nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
+                        <i class="fa fa-angle-right"></i>
+                    </a>
+            </nav>
+
+        </div>
+
+
+
+
+        <script>
+            window.playground_copyable = true;
+        </script>
+
+
+        <script src="../elasticlunr.min.js"></script>
+        <script src="../mark.min.js"></script>
+        <script src="../searcher.js"></script>
+
+        <script src="../clipboard.min.js"></script>
+        <script src="../highlight.js"></script>
+        <script src="../book.js"></script>
+
+        <!-- Custom JS scripts -->
+
+
+    </div>
+    </body>
+</html>
