@@ -54,13 +54,34 @@ use dugite_network::{MuxError, TcpBearer};
 /// as data is consumed, so this limit correctly represents current buffered bytes —
 /// not total bytes ever received.
 ///
-/// With 10 protocols × N peers × 4MB = 40MB per peer at worst, this is a large
-/// reduction from the prior 64MB per channel (640MB per peer).
+/// Per-protocol byte limits are now derived from the Haskell
+/// `network-mux` `maximumIngressQueue` formula (see
+/// `cardano-diffusion/lib/Cardano/Network/NodeToNode.hs`):
+/// `addSafetyMargin (pipelining * frame_size)`.  See the per-protocol
+/// constants below; the default (used for handshake/keepalive/peersharing
+/// where Haskell does not publish a specific limit) is conservative.
 ///
 /// A-006 (security audit 2026-05-19): the prior 64MB limit enabled a slow-reader
 /// attack where a peer could accumulate 640MB of ingress buffer before triggering
-/// IngressQueueOverrun.  Reduced to match Haskell's limit.
-const DEFAULT_INGRESS_LIMIT: usize = 4 * 1024 * 1024; // 4 MB (matches Haskell ingressQueueSize)
+/// IngressQueueOverrun.  Per-protocol limits below cap this for slow-reader
+/// scenarios while matching Haskell's published throughput targets.
+const DEFAULT_INGRESS_LIMIT: usize = 4 * 1024 * 1024; // 4 MB (handshake/keepalive/peersharing)
+
+/// ChainSync ingress queue limit — matches Haskell
+/// `chainSyncProtocolLimits = addSafetyMargin (300 * 1400)` ≈ 462 KB.
+/// Bumped to 512 KB for round-number alignment + small headroom.
+const CHAINSYNC_INGRESS_LIMIT: usize = 512 * 1024;
+
+/// BlockFetch ingress queue limit — matches Haskell
+/// `blockFetchProtocolLimits = max(10 * 2 MiB, 100 * 90112) * 1.1` ≈ 22 MB.
+/// Bumped to 24 MB for headroom on era transitions where block bodies grow.
+/// dugite's previous default of 4 MB caused back-pressure stalls during
+/// bulk catch-up (issue #701).
+const BLOCKFETCH_INGRESS_LIMIT: usize = 24 * 1024 * 1024;
+
+/// TxSubmission ingress queue limit — matches Haskell
+/// `txSubmissionProtocolLimits = addSafetyMargin (100 * 65540)` ≈ 7.2 MB.
+const TXSUBMISSION_INGRESS_LIMIT: usize = 8 * 1024 * 1024;
 
 /// Timeout for graceful protocol task shutdown (seconds).
 ///
@@ -278,17 +299,17 @@ impl PeerConnection {
         let chainsync_client_ch = mux.subscribe(
             PROTOCOL_N2N_CHAINSYNC,
             Direction::InitiatorDir,
-            DEFAULT_INGRESS_LIMIT,
+            CHAINSYNC_INGRESS_LIMIT,
         );
         let blockfetch_client_ch = mux.subscribe(
             PROTOCOL_N2N_BLOCKFETCH,
             Direction::InitiatorDir,
-            DEFAULT_INGRESS_LIMIT,
+            BLOCKFETCH_INGRESS_LIMIT,
         );
         let txsubmission_client_ch = mux.subscribe(
             PROTOCOL_N2N_TXSUBMISSION,
             Direction::InitiatorDir,
-            DEFAULT_INGRESS_LIMIT,
+            TXSUBMISSION_INGRESS_LIMIT,
         );
         let keepalive_client_ch = mux.subscribe(
             PROTOCOL_N2N_KEEPALIVE,
@@ -313,17 +334,17 @@ impl PeerConnection {
         let cs_srv = mux.subscribe(
             PROTOCOL_N2N_CHAINSYNC,
             Direction::ResponderDir,
-            DEFAULT_INGRESS_LIMIT,
+            CHAINSYNC_INGRESS_LIMIT,
         );
         let bf_srv = mux.subscribe(
             PROTOCOL_N2N_BLOCKFETCH,
             Direction::ResponderDir,
-            DEFAULT_INGRESS_LIMIT,
+            BLOCKFETCH_INGRESS_LIMIT,
         );
         let tx_srv = mux.subscribe(
             PROTOCOL_N2N_TXSUBMISSION,
             Direction::ResponderDir,
-            DEFAULT_INGRESS_LIMIT,
+            TXSUBMISSION_INGRESS_LIMIT,
         );
         let ka_srv = mux.subscribe(
             PROTOCOL_N2N_KEEPALIVE,
