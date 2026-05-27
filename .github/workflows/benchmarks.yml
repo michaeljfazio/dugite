@@ -100,19 +100,41 @@ jobs:
       # One `cargo bench` per matrix entry. `--save-baseline nightly` both
       # produces the HTML report under target/criterion/<group>/ AND saves
       # the run as the `nightly` baseline for the next run's comparison.
+      #
+      # Output is written line-buffered to `.full.txt` via `stdbuf -oL` and
+      # `tee`, so that even if this step is cancelled by `timeout-minutes`
+      # we still have a full transcript on disk. The filtered `.txt` is
+      # produced in a separate `if: always()` step below.
       - name: Run benchmark
         if: matrix.bench != '__stress__'
         run: |
-          cargo bench -p ${{ matrix.crate }} --bench ${{ matrix.bench }} --color never -- --save-baseline nightly --color never 2>&1 \
-            | tee ${{ matrix.name }}.full.txt | /tmp/filter-bench-output.sh > ${{ matrix.name }}.txt || true
+          set +e
+          stdbuf -oL -eL cargo bench -p ${{ matrix.crate }} --bench ${{ matrix.bench }} --color never -- --save-baseline nightly --color never 2>&1 \
+            | stdbuf -oL tee ${{ matrix.name }}.full.txt
+          exit 0
 
       # The LSM mainnet-scale tests are `large-tests` integration tests, not
       # Criterion benches. They produce no target/criterion/ tree.
       - name: Run LSM mainnet-scale stress tests
         if: matrix.bench == '__stress__'
         run: |
-          cargo test -p dugite-lsm --features large-tests --release --color never -- mainnet_scale --nocapture 2>&1 \
-            | tee ${{ matrix.name }}.full.txt | /tmp/filter-bench-output.sh > ${{ matrix.name }}.txt || true
+          set +e
+          stdbuf -oL -eL cargo test -p dugite-lsm --features large-tests --release --color never -- mainnet_scale --nocapture 2>&1 \
+            | stdbuf -oL tee ${{ matrix.name }}.full.txt
+          exit 0
+
+      # Filter the full transcript into the markdown-ready `.txt`. Runs even
+      # if the bench step was cancelled or failed, so the aggregate report
+      # always has measurement lines for whatever did complete.
+      - name: Filter bench output
+        if: always()
+        run: |
+          if [ -f ${{ matrix.name }}.full.txt ]; then
+            /tmp/filter-bench-output.sh < ${{ matrix.name }}.full.txt > ${{ matrix.name }}.txt || true
+          else
+            printf 'No output captured. The bench step did not produce a full.txt transcript.\n' > ${{ matrix.name }}.txt
+          fi
+          echo "--- ${{ matrix.name }}.txt size: $(wc -c < ${{ matrix.name }}.txt) bytes"
 
       - name: Upload bench artifact
         if: always()
@@ -171,13 +193,22 @@ jobs:
 
           emit_section() {
             local title="$1" file="$2"
+            local full="${file%.txt}.full.txt"
             printf '## %s\n\n' "$title" >> "$REPORT"
             if [ -f "$file" ] && [ -s "$file" ]; then
               printf '<details>\n<summary>Raw measurements</summary>\n\n```\n' >> "$REPORT"
               cat "$file" >> "$REPORT"
               printf '\n```\n\n</details>\n\n' >> "$REPORT"
+            elif [ -f "$full" ] && [ -s "$full" ]; then
+              # Filtered output is empty (likely cancelled by job timeout);
+              # surface the tail of the unfiltered transcript so the report
+              # at least shows what the bench was working on when it died.
+              printf '_Filtered measurements were not captured — the job was likely cancelled by `timeout-minutes` before completing. Tail of the unfiltered transcript:_\n\n' >> "$REPORT"
+              printf '<details>\n<summary>Tail of full transcript</summary>\n\n```\n' >> "$REPORT"
+              tail -n 80 "$full" >> "$REPORT"
+              printf '\n```\n\n</details>\n\n' >> "$REPORT"
             else
-              printf '_No results captured. See the run log for build errors._\n\n' >> "$REPORT"
+              printf '_No results captured. The bench step produced no output (likely a build failure — check the workflow run log)._\n\n' >> "$REPORT"
             fi
           }
 

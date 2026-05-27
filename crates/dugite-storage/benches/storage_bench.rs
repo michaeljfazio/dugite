@@ -12,7 +12,7 @@
 //! HTML: target/criterion/report/index.html
 
 use criterion::{criterion_group, criterion_main, BatchSize, BenchmarkId, Criterion};
-use dugite_primitives::hash::Hash32;
+use dugite_primitives::hash::{BlockHeaderHash, Hash32};
 use dugite_primitives::time::{BlockNo, SlotNo};
 use std::hint::black_box;
 
@@ -76,6 +76,12 @@ fn lcg_next(state: &mut u64) -> u64 {
 
 fn populate_chaindb(path: &std::path::Path, count: u64) -> (ChainDB, Vec<Hash32>) {
     let mut db = ChainDB::open(path).unwrap();
+    // VolatileDB WAL per-write fsync is on by default (at-tip durability
+    // semantics). For a throwaway bench tempdir this only adds ~10 ms of
+    // syscall latency per `add_block`, which on the GHA runner alone was
+    // pushing the 100K-block populate over 60 minutes and timing out the
+    // storage matrix job. Skip it — the bench DB is never recovered from.
+    db.set_volatile_wal_sync_per_write(false);
     let mut hashes = Vec::with_capacity(count as usize);
     for i in 0..count {
         let hash = make_hash(i);
@@ -92,12 +98,40 @@ fn populate_chaindb(path: &std::path::Path, count: u64) -> (ChainDB, Vec<Hash32>
     (db, hashes)
 }
 
+/// Bulk populate via `put_blocks_batch`, writing straight to ImmutableDB.
+///
+/// Use this for read-side benches that don't care whether blocks live in
+/// VolatileDB vs ImmutableDB. Bypassing the VolatileDB WAL avoids the
+/// `compact_wal` thrash that kicks in once in-memory volatile > ~20K
+/// blocks (cap is 400 MiB / 20 KB = ~20 480 blocks): every subsequent
+/// `add_block` triggers a full WAL rewrite, blowing the 90-min CI
+/// budget for 100 K-block populate alone.
+fn populate_chaindb_bulk(path: &std::path::Path, count: u64) -> (ChainDB, Vec<BlockHeaderHash>) {
+    let mut db = ChainDB::open(path).unwrap();
+    let hashes: Vec<BlockHeaderHash> = (0..count).map(make_hash).collect();
+    let data = vec![0u8; BLOCK_SIZE];
+    let batch: Vec<(SlotNo, &BlockHeaderHash, BlockNo, &[u8], bool)> = (0..count)
+        .map(|i| {
+            (
+                SlotNo(i + 1),
+                &hashes[i as usize],
+                BlockNo(i + 1),
+                data.as_slice(),
+                false,
+            )
+        })
+        .collect();
+    db.put_blocks_batch(&batch).unwrap();
+    (db, hashes)
+}
+
 fn populate_chaindb_with_config(
     path: &std::path::Path,
     count: u64,
     config: &ImmutableConfig,
 ) -> (ChainDB, Vec<Hash32>) {
     let mut db = ChainDB::open_with_config(path, config, SECURITY_PARAM_K as usize).unwrap();
+    db.set_volatile_wal_sync_per_write(false); // see populate_chaindb()
     let mut hashes = Vec::with_capacity(count as usize);
     for i in 0..count {
         let hash = make_hash(i);
@@ -179,92 +213,78 @@ fn bench_chaindb_sequential_insert(c: &mut Criterion) {
 fn bench_chaindb_random_read(c: &mut Criterion) {
     let mut group = c.benchmark_group("chaindb/random_read");
 
-    // Test with 10K and 100K block databases
+    // Test with 10K and 100K block databases.
+    //
+    // The DB is populated ONCE per size outside `b.iter` and shared across all
+    // Criterion iterations. Rebuilding a 100K-block ChainDB (~2GB) per sample
+    // was the dominant cost of the nightly storage suite (>90min job timeout);
+    // this is a pure-read benchmark, so the populated DB is safe to reuse.
     for &db_size in &[10_000u64, 100_000] {
         let lookup_hashes = random_lookup_hashes(NUM_LOOKUPS, db_size);
         let label = format!("{db_size}blks");
+        let dir = tempfile::tempdir().unwrap();
+        let (db, _) = populate_chaindb_bulk(dir.path(), db_size);
 
         group.bench_function(BenchmarkId::new("by_hash", &label), |b| {
-            b.iter_batched(
-                || {
-                    let dir = tempfile::tempdir().unwrap();
-                    let (db, _) = populate_chaindb(dir.path(), db_size);
-                    (dir, db, lookup_hashes.clone())
-                },
-                |(_dir, db, hashes)| {
-                    for hash in &hashes {
-                        let result = db.get_block(hash).unwrap();
-                        assert!(result.is_some());
-                    }
-                },
-                BatchSize::PerIteration,
-            );
+            b.iter(|| {
+                for hash in &lookup_hashes {
+                    let result = db.get_block(hash).unwrap();
+                    assert!(result.is_some());
+                }
+            });
         });
+
+        drop(db);
+        drop(dir);
     }
 
     group.finish();
 }
 
 fn bench_chaindb_tip_query(c: &mut Criterion) {
+    let dir = tempfile::tempdir().unwrap();
+    let (db, _) = populate_chaindb_bulk(dir.path(), NUM_BLOCKS);
+
     c.bench_function("chaindb/tip_query", |b| {
-        b.iter_batched(
-            || {
-                let dir = tempfile::tempdir().unwrap();
-                let (db, _) = populate_chaindb(dir.path(), NUM_BLOCKS);
-                (dir, db)
-            },
-            |(_dir, db)| {
-                for _ in 0..NUM_LOOKUPS {
-                    let tip = db.get_tip_info();
-                    assert!(tip.is_some());
-                }
-            },
-            BatchSize::PerIteration,
-        );
+        b.iter(|| {
+            for _ in 0..NUM_LOOKUPS {
+                let tip = db.get_tip_info();
+                assert!(tip.is_some());
+            }
+        });
     });
 }
 
 fn bench_chaindb_has_block(c: &mut Criterion) {
     let lookup_hashes = random_lookup_hashes(NUM_LOOKUPS, NUM_BLOCKS);
+    let dir = tempfile::tempdir().unwrap();
+    let (db, _) = populate_chaindb_bulk(dir.path(), NUM_BLOCKS);
 
     c.bench_function("chaindb/has_block", |b| {
-        b.iter_batched(
-            || {
-                let dir = tempfile::tempdir().unwrap();
-                let (db, _) = populate_chaindb(dir.path(), NUM_BLOCKS);
-                (dir, db, lookup_hashes.clone())
-            },
-            |(_dir, db, hashes)| {
-                for hash in &hashes {
-                    assert!(db.has_block(hash));
-                }
-            },
-            BatchSize::PerIteration,
-        );
+        b.iter(|| {
+            for hash in &lookup_hashes {
+                assert!(db.has_block(hash));
+            }
+        });
     });
 }
 
 fn bench_chaindb_slot_range_query(c: &mut Criterion) {
+    let dir = tempfile::tempdir().unwrap();
+    let (db, _) = populate_chaindb_bulk(dir.path(), NUM_BLOCKS);
+
     c.bench_function("chaindb/slot_range_100", |b| {
-        b.iter_batched(
-            || {
-                let dir = tempfile::tempdir().unwrap();
-                let (db, _) = populate_chaindb(dir.path(), NUM_BLOCKS);
-                (dir, db)
-            },
-            |(_dir, db)| {
-                // Query 100-block windows at random positions
-                let mut rng = 42u64;
-                for _ in 0..10 {
-                    let start = (lcg_next(&mut rng) % (NUM_BLOCKS - 100)) + 1;
-                    let blocks = db
-                        .get_blocks_in_slot_range(SlotNo(start), SlotNo(start + 100))
-                        .unwrap();
-                    black_box(blocks.len());
-                }
-            },
-            BatchSize::PerIteration,
-        );
+        b.iter(|| {
+            // Query 100-block windows at random positions
+            let mut rng = 42u64;
+            for _ in 0..10 {
+                let start = (lcg_next(&mut rng) % (NUM_BLOCKS - 100)) + 1;
+                let blocks = db
+                    .get_blocks_in_slot_range(SlotNo(start), SlotNo(start + 100))
+                    .unwrap();
+                black_box(blocks.len());
+            }
+        });
     });
 }
 
@@ -977,7 +997,12 @@ fn bench_chaindb_scaling_insert(c: &mut Criterion) {
     let mut group = c.benchmark_group("scaling/chaindb_insert");
     group.sample_size(10);
 
-    let chaindb_sizes: &[u64] = &[10_000, 50_000, 100_000];
+    // Capped at 10K because populate_chaindb past ~20K blocks (= 400 MiB
+    // / 20 KB) triggers per-add WAL compaction in VolatileDB: every
+    // subsequent `add_block` rewrites the entire WAL file, producing O(N²)
+    // write amplification that dominates the measurement and blows the
+    // 90-min CI budget. Local sweeps can extend this list manually.
+    let chaindb_sizes: &[u64] = &[10_000];
 
     for &size in chaindb_sizes {
         group.bench_with_input(BenchmarkId::new("default_20kb", size), &size, |b, &size| {
