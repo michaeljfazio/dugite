@@ -12,7 +12,7 @@
 //! HTML: target/criterion/report/index.html
 
 use criterion::{criterion_group, criterion_main, BatchSize, BenchmarkId, Criterion};
-use dugite_primitives::hash::Hash32;
+use dugite_primitives::hash::{BlockHeaderHash, Hash32};
 use dugite_primitives::time::{BlockNo, SlotNo};
 use std::hint::black_box;
 
@@ -95,6 +95,33 @@ fn populate_chaindb(path: &std::path::Path, count: u64) -> (ChainDB, Vec<Hash32>
             .unwrap();
         hashes.push(hash);
     }
+    (db, hashes)
+}
+
+/// Bulk populate via `put_blocks_batch`, writing straight to ImmutableDB.
+///
+/// Use this for read-side benches that don't care whether blocks live in
+/// VolatileDB vs ImmutableDB. Bypassing the VolatileDB WAL avoids the
+/// `compact_wal` thrash that kicks in once in-memory volatile > ~20K
+/// blocks (cap is 400 MiB / 20 KB = ~20 480 blocks): every subsequent
+/// `add_block` triggers a full WAL rewrite, blowing the 90-min CI
+/// budget for 100 K-block populate alone.
+fn populate_chaindb_bulk(path: &std::path::Path, count: u64) -> (ChainDB, Vec<BlockHeaderHash>) {
+    let mut db = ChainDB::open(path).unwrap();
+    let hashes: Vec<BlockHeaderHash> = (0..count).map(make_hash).collect();
+    let data = vec![0u8; BLOCK_SIZE];
+    let batch: Vec<(SlotNo, &BlockHeaderHash, BlockNo, &[u8], bool)> = (0..count)
+        .map(|i| {
+            (
+                SlotNo(i + 1),
+                &hashes[i as usize],
+                BlockNo(i + 1),
+                data.as_slice(),
+                false,
+            )
+        })
+        .collect();
+    db.put_blocks_batch(&batch).unwrap();
     (db, hashes)
 }
 
@@ -196,7 +223,7 @@ fn bench_chaindb_random_read(c: &mut Criterion) {
         let lookup_hashes = random_lookup_hashes(NUM_LOOKUPS, db_size);
         let label = format!("{db_size}blks");
         let dir = tempfile::tempdir().unwrap();
-        let (db, _) = populate_chaindb(dir.path(), db_size);
+        let (db, _) = populate_chaindb_bulk(dir.path(), db_size);
 
         group.bench_function(BenchmarkId::new("by_hash", &label), |b| {
             b.iter(|| {
@@ -216,7 +243,7 @@ fn bench_chaindb_random_read(c: &mut Criterion) {
 
 fn bench_chaindb_tip_query(c: &mut Criterion) {
     let dir = tempfile::tempdir().unwrap();
-    let (db, _) = populate_chaindb(dir.path(), NUM_BLOCKS);
+    let (db, _) = populate_chaindb_bulk(dir.path(), NUM_BLOCKS);
 
     c.bench_function("chaindb/tip_query", |b| {
         b.iter(|| {
@@ -231,7 +258,7 @@ fn bench_chaindb_tip_query(c: &mut Criterion) {
 fn bench_chaindb_has_block(c: &mut Criterion) {
     let lookup_hashes = random_lookup_hashes(NUM_LOOKUPS, NUM_BLOCKS);
     let dir = tempfile::tempdir().unwrap();
-    let (db, _) = populate_chaindb(dir.path(), NUM_BLOCKS);
+    let (db, _) = populate_chaindb_bulk(dir.path(), NUM_BLOCKS);
 
     c.bench_function("chaindb/has_block", |b| {
         b.iter(|| {
@@ -244,7 +271,7 @@ fn bench_chaindb_has_block(c: &mut Criterion) {
 
 fn bench_chaindb_slot_range_query(c: &mut Criterion) {
     let dir = tempfile::tempdir().unwrap();
-    let (db, _) = populate_chaindb(dir.path(), NUM_BLOCKS);
+    let (db, _) = populate_chaindb_bulk(dir.path(), NUM_BLOCKS);
 
     c.bench_function("chaindb/slot_range_100", |b| {
         b.iter(|| {
@@ -970,7 +997,12 @@ fn bench_chaindb_scaling_insert(c: &mut Criterion) {
     let mut group = c.benchmark_group("scaling/chaindb_insert");
     group.sample_size(10);
 
-    let chaindb_sizes: &[u64] = &[10_000, 50_000, 100_000];
+    // Capped at 10K because populate_chaindb past ~20K blocks (= 400 MiB
+    // / 20 KB) triggers per-add WAL compaction in VolatileDB: every
+    // subsequent `add_block` rewrites the entire WAL file, producing O(N²)
+    // write amplification that dominates the measurement and blows the
+    // 90-min CI budget. Local sweeps can extend this list manually.
+    let chaindb_sizes: &[u64] = &[10_000];
 
     for &size in chaindb_sizes {
         group.bench_with_input(BenchmarkId::new("default_20kb", size), &size, |b, &size| {
