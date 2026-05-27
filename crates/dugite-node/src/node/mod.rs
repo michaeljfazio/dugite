@@ -4590,7 +4590,39 @@ impl Node {
         // Determine validation mode.
         // Blocks from the network get full validation by default; only
         // ImmutableDB replay uses ApplyOnly.
-        let validation_mode = if self.validate_all_blocks {
+        // Catch-up trusted-peer mode (#698).
+        //
+        // From-network sync at Babbage/Conway epochs caps at ~2 blocks/sec
+        // because `validate_transaction_with_context` runs Phase-1 + Phase-2
+        // (Plutus CEK evaluation + Ed25519 signature verification) on every
+        // fetched block.  Haskell cardano-node has the same cost here —
+        // operators avoid it by importing Mithril snapshots, not by doing
+        // from-genesis ChainSync.
+        //
+        // For the #670 from-genesis verification we explicitly opt into
+        // "trust the peers, skip our own validation" via
+        // `DUGITE_TRUSTED_CATCHUP=1`.  This downgrades fetched blocks to
+        // `ApplyOnly` mode — the same mode used for ImmutableDB chunk
+        // replay after a Mithril import.  Phase-2 Plutus is skipped, witness
+        // verification is skipped, all STS predicates are skipped.  The
+        // node still computes state transitions (UTxO updates, cert apply,
+        // gov state) so the resulting ledger is byte-exact with a fully-
+        // validated replay PROVIDED the peers fed us canonical-chain blocks
+        // (which is the standard catch-up assumption — peers can't forge
+        // a block that passes their own ChainSync forwarders).
+        //
+        // This is a deliberate Haskell deviation: cardano-node always runs
+        // ValidateAll on network blocks.  The trade-off is safety (we trust
+        // peer block validity for the catch-up window) for ~25x speedup at
+        // Babbage epoch 30+ — verified against the same profile that
+        // showed write() / crc32fast / Plutus eval dominating the at-tip
+        // apply path.
+        let trusted_catchup = std::env::var("DUGITE_TRUSTED_CATCHUP")
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false);
+        let validation_mode = if trusted_catchup {
+            BlockValidationMode::ApplyOnly
+        } else if self.validate_all_blocks {
             BlockValidationMode::ValidateAll
         } else {
             BlockValidationMode::ApplyOnly
