@@ -459,6 +459,34 @@ impl LedgerState {
         let block_era = block.era;
         let cached_params = self.epochs.protocol_params.clone();
 
+        // ── Per-block timing instrumentation (#698) ──────────────────────
+        //
+        // Enable with `DUGITE_BLOCK_APPLY_TIMING=1`.  Records cumulative
+        // time spent in each major step of the per-tx loop and emits one
+        // `info!` log line per block summarising the breakdown.  Used to
+        // identify which step (validation, era-rule apply, diff merge) is
+        // the dominant cost at any given epoch / state size.
+        let timing_enabled = std::env::var("DUGITE_BLOCK_APPLY_TIMING")
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false);
+        let block_start = if timing_enabled {
+            Some(std::time::Instant::now())
+        } else {
+            None
+        };
+        let mut t_registry_build = std::time::Duration::ZERO;
+        let mut t_validate = std::time::Duration::ZERO;
+        let mut t_apply = std::time::Duration::ZERO;
+        let mut t_diff_merge = std::time::Duration::ZERO;
+        let mut t_ctx_build = std::time::Duration::ZERO;
+        let mut tx_count: usize = 0;
+        let mut tx_valid_count: usize = 0;
+        let mut tx_input_count: usize = 0;
+        let mut tx_output_count: usize = 0;
+        let mut tx_witness_count: usize = 0;
+        let mut tx_redeemer_count: usize = 0;
+        let registry_start = std::time::Instant::now();
+
         // ── Block-level validation registry snapshot ─────────────────────
         //
         // Phase-1 / Phase-2 validation needs read-only views of several
@@ -640,6 +668,10 @@ impl LedgerState {
         // share the existing Arc — no deep clone of the ~90 k-entry map.
         let block_reward_accounts_arc = std::sync::Arc::clone(&self.certs.reward_accounts);
 
+        if timing_enabled {
+            t_registry_build = registry_start.elapsed();
+        }
+
         // ── Step 8: Per-transaction processing loop ───────────────────────
         for (tx_idx, tx) in block.transactions.iter().enumerate() {
             if !processed_tx_hashes.insert(tx.hash) {
@@ -649,6 +681,17 @@ impl LedgerState {
                     "Duplicate transaction hash in block, skipping"
                 );
                 continue;
+            }
+            if timing_enabled {
+                tx_count += 1;
+                if tx.is_valid {
+                    tx_valid_count += 1;
+                }
+                tx_input_count += tx.body.inputs.len();
+                tx_output_count += tx.body.outputs.len();
+                tx_witness_count += tx.witness_set.vkey_witnesses.len()
+                    + tx.witness_set.bootstrap_witnesses.len();
+                tx_redeemer_count += tx.witness_set.redeemers.len();
             }
 
             // ── Step 8a: Phase-1 + Phase-2 validation (ValidateAll only) ──
@@ -747,6 +790,11 @@ impl LedgerState {
                     // block above (see "Block-level validation registry
                     // snapshot").  Per-tx construction is just `Arc::clone`
                     // refcount bumps — no hash-table allocation or copying.
+                    let ctx_start = if timing_enabled {
+                        Some(std::time::Instant::now())
+                    } else {
+                        None
+                    };
                     let mut ctx = crate::validation::ValidationContext::new()
                         .with_active_proposals_arc(std::sync::Arc::clone(&block_active_proposals))
                         .with_committee_authorized_hot_keys_arc(std::sync::Arc::clone(
@@ -779,6 +827,14 @@ impl LedgerState {
                     if let Some(h) = block_constitution_script_hash {
                         ctx = ctx.with_constitution_script_hash(h);
                     }
+                    if let Some(start) = ctx_start {
+                        t_ctx_build += start.elapsed();
+                    }
+                    let validate_start = if timing_enabled {
+                        Some(std::time::Instant::now())
+                    } else {
+                        None
+                    };
                     let result = crate::validation::validate_transaction_with_context(
                         tx,
                         &self.utxo.utxo_set,
@@ -788,6 +844,9 @@ impl LedgerState {
                         Some(&self.slot_config),
                         ctx,
                     );
+                    if let Some(start) = validate_start {
+                        t_validate += start.elapsed();
+                    }
                     if let Err(errors) = result {
                         let has_script_failure = errors
                             .iter()
@@ -886,6 +945,11 @@ impl LedgerState {
                 max_lovelace_supply: self.max_lovelace_supply,
             };
 
+            let apply_start = if timing_enabled {
+                Some(std::time::Instant::now())
+            } else {
+                None
+            };
             if !tx.is_valid {
                 // Invalid transaction: consume collateral via era rules.
                 let diff = rules.apply_invalid_tx(
@@ -896,7 +960,18 @@ impl LedgerState {
                     &mut self.certs,
                     &mut self.epochs,
                 )?;
+                if let Some(start) = apply_start {
+                    t_apply += start.elapsed();
+                }
+                let merge_start = if timing_enabled {
+                    Some(std::time::Instant::now())
+                } else {
+                    None
+                };
                 block_diff.merge(&diff);
+                if let Some(start) = merge_start {
+                    t_diff_merge += start.elapsed();
+                }
             } else {
                 // Valid transaction: full LEDGER rule pipeline via era rules.
                 // The era rules handle: drain withdrawals, process certificates,
@@ -911,7 +986,18 @@ impl LedgerState {
                     &mut self.gov,
                     &mut self.epochs,
                 )?;
+                if let Some(start) = apply_start {
+                    t_apply += start.elapsed();
+                }
+                let merge_start = if timing_enabled {
+                    Some(std::time::Instant::now())
+                } else {
+                    None
+                };
                 block_diff.merge(&diff);
+                if let Some(start) = merge_start {
+                    t_diff_merge += start.elapsed();
+                }
 
                 // ── Step 8b-post: Update block_active_proposals ───────────
                 //
@@ -1036,6 +1122,37 @@ impl LedgerState {
             era = ?self.era,
             "Ledger: block applied successfully"
         );
+
+        if let Some(start) = block_start {
+            let total = start.elapsed();
+            let accounted = t_registry_build
+                + t_ctx_build
+                + t_validate
+                + t_apply
+                + t_diff_merge;
+            let other = total.saturating_sub(accounted);
+            tracing::info!(
+                target: "dugite_ledger::apply::timing",
+                slot = block.slot().0,
+                block_no = block.block_number().0,
+                era = ?self.era,
+                txs = tx_count,
+                valid_txs = tx_valid_count,
+                inputs = tx_input_count,
+                outputs = tx_output_count,
+                witnesses = tx_witness_count,
+                redeemers = tx_redeemer_count,
+                total_us = total.as_micros() as u64,
+                registry_us = t_registry_build.as_micros() as u64,
+                ctx_build_us = t_ctx_build.as_micros() as u64,
+                validate_us = t_validate.as_micros() as u64,
+                apply_us = t_apply.as_micros() as u64,
+                merge_us = t_diff_merge.as_micros() as u64,
+                other_us = other.as_micros() as u64,
+                utxo_count = self.utxo.utxo_set.len(),
+                "block apply timing"
+            );
+        }
 
         Ok(())
     }
