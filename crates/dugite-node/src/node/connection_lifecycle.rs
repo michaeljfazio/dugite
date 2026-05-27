@@ -1276,7 +1276,7 @@ impl ConnectionLifecycleManager {
                 let phase_offset = {
                     let mut h = std::collections::hash_map::DefaultHasher::new();
                     addr.hash(&mut h);
-                    std::time::Duration::from_millis((h.finish() % 200) as u64)
+                    std::time::Duration::from_millis(h.finish() % 200)
                 };
                 let mut poll_ticker = tokio::time::interval_at(
                     tokio::time::Instant::now() + phase_offset,

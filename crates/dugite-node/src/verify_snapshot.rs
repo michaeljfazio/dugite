@@ -566,8 +566,8 @@ pub fn diff_snapshots(left: &LedgerStateSnapshot, right: &LedgerStateSnapshot) -
     cmp_pretty(
         &mut diffs,
         "governance",
-        &*left.governance,
-        &*right.governance,
+        &left.governance,
+        &right.governance,
     );
 
     // ── Stake distribution + pointer stake ──────────────────────────
