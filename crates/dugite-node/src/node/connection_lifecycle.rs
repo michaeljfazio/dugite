@@ -1259,13 +1259,29 @@ impl ConnectionLifecycleManager {
                 //
                 // At 2 s this introduced a ~50 blk/s ceiling at full
                 // batch utilisation (100 blocks/range ÷ 2 s) — way below
-                // the network-bandwidth ceiling, leaving sync CPU-idle
-                // for most of every second.  200 ms restores the prior
+                // the network-bandwidth ceiling.  200 ms restores
                 // throughput while keeping the fairness/rotation
-                // guarantee.  CPU cost: 50 hot peers × 5 wakeups/s = 250
-                // CAS attempts/s, negligible on Apple Silicon.
-                let mut poll_ticker =
-                    tokio::time::interval(std::time::Duration::from_millis(200));
+                // guarantee.
+                //
+                // **Phase offset (#702 follow-up)**: workers that spawn
+                // together all tick at the same wall-clock instant, so the
+                // worker with the lowest CAS latency always wins the
+                // `active_fetcher` race — observed live as only 2 of 16
+                // peers participating in BlockFetch despite all being
+                // connected and ChainSync-active.  Offset each worker's
+                // ticker start by a deterministic-but-distinct amount
+                // derived from the peer SocketAddr hash so the 16 workers
+                // spread evenly across the 200 ms interval, giving every
+                // peer a fair claim window.
+                let phase_offset = {
+                    let mut h = std::collections::hash_map::DefaultHasher::new();
+                    addr.hash(&mut h);
+                    std::time::Duration::from_millis((h.finish() % 200) as u64)
+                };
+                let mut poll_ticker = tokio::time::interval_at(
+                    tokio::time::Instant::now() + phase_offset,
+                    std::time::Duration::from_millis(200),
+                );
                 poll_ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
                 loop {
