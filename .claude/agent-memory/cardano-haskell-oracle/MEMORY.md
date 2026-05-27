@@ -92,6 +92,10 @@
 ## Fork Resolution / Chain Selection
 - [fork-resolution-chainsel.md](fork-resolution-chainsel.md) — Complete ChainSel algorithm: addBlock flow, preferAnchoredCandidate, Praos tiebreaker, rollback, tentative follower, candidate storage
 
+## Conway GOV Rule Deep Dive
+- [conway-gov-rule-deep-dive.md](conway-gov-rule-deep-dive.md) — All 19 ConwayGovPredFailure variants with CBOR tags, exact predicate ordering (UnelectedCC→proposals loop→VotersDoNotExist→GovActionsDoNotExist→Expired→Disallowed), same-tx votes, voter matrix, ppuWellFormed, epoch-boundary removal timing, reapplyTx skips lblStatic only (GOV checks DO run on revalidation), 8 dugite divergences
+- Full reference doc (source-cited, dugite divergences D-1…D-8): `.claude/skills/haskell-ledger-cross-validation/references/era-rules/conway-gov-rules.md`
+
 ## Topic Files
 - [pparams-group-classification.md](pparams-group-classification.md) - Conway PP group classification (Network/Economic/Technical/Gov/Security), threshold combination logic
 - [conway-validation-rules.md](conway-validation-rules.md) - Complete validation rules, predicate failures, reward formula, epoch transition order
