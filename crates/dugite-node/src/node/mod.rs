@@ -528,6 +528,13 @@ pub struct Node {
     /// 38k reward accounts) stalls the apply loop for every single block.
     last_query_state_update: Instant,
 
+    /// Wall-clock of the last `sync_volatile_wal()` call.  Used by
+    /// `process_forward_blocks` to bound the in-catch-up WAL loss window by
+    /// fsyncing every ~1 s when `volatile_wal_sync_at_tip == false`.  When
+    /// the WAL is in at-tip mode every write already fsyncs, so this
+    /// timestamp is unused.
+    last_volatile_wal_sync: Instant,
+
     /// Forge gate: true once any peer has returned a non-Origin MsgIntersectFound.
     ///
     /// Prevents the block producer from forging before ChainSync has established
@@ -556,6 +563,15 @@ pub struct Node {
     ///
     /// `AtomicBool` (Relaxed ordering) avoids any lock acquisition on the hot path.
     pub(crate) ingestion_paused: Arc<std::sync::atomic::AtomicBool>,
+
+    // ── Volatile WAL durability mode (catch-up vs at-tip) ────────────────
+    /// Tracks whether the VolatileDB WAL is currently in per-write fsync
+    /// mode (`true` — at-tip durability) or batched mode (`false` — catch-up
+    /// speed).  Initialised to `true` to match the storage-layer default.
+    /// `process_forward_blocks` flips this on each transition between
+    /// `strict_verification() == true` and `false` to avoid taking the
+    /// ChainDB write lock when the mode hasn't changed.
+    pub(crate) volatile_wal_sync_at_tip: Arc<std::sync::atomic::AtomicBool>,
 
     // ── Snapshot worker (issue #695) ─────────────────────────────────
     /// Sender to the background snapshot worker task. `None` after
@@ -1889,8 +1905,10 @@ impl Node {
             gc_scheduler: GcScheduler::new(),
             bg_snapshot_scheduler: SnapshotScheduler::new(),
             last_query_state_update: Instant::now(),
+            last_volatile_wal_sync: Instant::now(),
             peer_intersection_established: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             ingestion_paused: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            volatile_wal_sync_at_tip: Arc::new(std::sync::atomic::AtomicBool::new(true)),
             // Snapshot worker (issue #695): channel + handle are set
             // in `Node::run` once the tokio runtime is active.
             snapshot_tx: None,
@@ -4192,6 +4210,53 @@ impl Node {
                 "Disk ingestion paused — dropping block (disk space critically low)"
             );
             return;
+        }
+
+        // Auto-switch VolatileDB WAL durability mode based on at-tip state.
+        //
+        // During catch-up, blocks below the k-depth window are speculative
+        // and re-fetchable from peers; per-block fsync is wall-clock-dominant
+        // on macOS APFS (~50–400 ms per call) and crushes throughput.  At
+        // tip, every write must be durable before the next so the producer
+        // can adopt the chain head safely.
+        //
+        // Same at-tip definition as `publish_ledger_view`: peer_tip == 0
+        // (no peer yet) OR local_tip + stability_window ≥ peer_tip.
+        let peer_tip = self.metrics.get_peer_tip();
+        let local_tip = block_slot.0;
+        let stability_window = dugite_consensus::stability_window_slots(
+            self.consensus.security_param,
+            self.consensus.active_slot_coeff,
+        );
+        let at_tip = peer_tip == 0 || local_tip.saturating_add(stability_window) >= peer_tip;
+        let prev_at_tip = self
+            .volatile_wal_sync_at_tip
+            .load(std::sync::atomic::Ordering::Relaxed);
+        if prev_at_tip != at_tip {
+            let mut db = self.chain_db.write().await;
+            if let Err(e) = db.sync_volatile_wal() {
+                warn!(error = %e, "VolatileDB WAL pre-transition fsync failed");
+            }
+            db.set_volatile_wal_sync_per_write(at_tip);
+            drop(db);
+            self.volatile_wal_sync_at_tip
+                .store(at_tip, std::sync::atomic::Ordering::Relaxed);
+            info!(
+                at_tip,
+                local_tip,
+                peer_tip,
+                stability_window,
+                "VolatileDB WAL mode switched (per-write fsync = at_tip)"
+            );
+        }
+        // Periodic VolatileDB WAL fsync while in catch-up mode (bounds the
+        // loss window to ~1 s when sync_per_write is disabled).
+        if !at_tip && self.last_volatile_wal_sync.elapsed() >= std::time::Duration::from_secs(1) {
+            let mut db = self.chain_db.write().await;
+            if let Err(e) = db.sync_volatile_wal() {
+                warn!(error = %e, "VolatileDB WAL periodic fsync failed");
+            }
+            self.last_volatile_wal_sync = std::time::Instant::now();
         }
 
         // Store in ChainDB via ChainSelQueue.

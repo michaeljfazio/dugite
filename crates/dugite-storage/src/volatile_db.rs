@@ -81,6 +81,13 @@ const WAL_MAX_SIZE_BYTES: u64 = 400 * 1024 * 1024; // 400 MiB
 struct WalWriter {
     file: BufWriter<File>,
     path: PathBuf,
+    /// When `true` (default), every `append()` calls `sync_data()` so each
+    /// block is durable before the call returns.  When `false`, the buffered
+    /// bytes are still flushed to the OS but `sync_data()` is skipped — used
+    /// during catch-up sync where blocks below the volatile k-window are
+    /// re-fetchable from peers if the node crashes.  Pair with a periodic
+    /// `sync_data()` (every few seconds) to bound the loss window.
+    sync_per_write: bool,
 }
 
 impl WalWriter {
@@ -90,7 +97,19 @@ impl WalWriter {
         Ok(WalWriter {
             file: BufWriter::new(file),
             path: path.to_path_buf(),
+            sync_per_write: true,
         })
+    }
+
+    /// Force an `fsync` of the WAL file regardless of `sync_per_write`.
+    ///
+    /// Used by the periodic background sync task to bound the loss window
+    /// when `sync_per_write` is `false`, and on transitions back to at-tip
+    /// operation to make all buffered blocks durable before the WAL switches
+    /// back to per-write fsync.
+    fn force_sync(&mut self) -> io::Result<()> {
+        self.file.flush()?;
+        self.file.get_ref().sync_data()
     }
 
     /// Append a WAL entry and sync to disk.
@@ -138,7 +157,9 @@ impl WalWriter {
         self.file.write_all(cbor)?;
         self.file.write_all(&crc.to_be_bytes())?;
         self.file.flush()?;
-        self.file.get_ref().sync_data()?;
+        if self.sync_per_write {
+            self.file.get_ref().sync_data()?;
+        }
         Ok(())
     }
 
@@ -616,6 +637,35 @@ impl VolatileDB {
         }
 
         Ok(db)
+    }
+
+    /// Control whether every WAL append issues an `fsync` (`sync_data`).
+    ///
+    /// When `true` (default), each block write is durable before the call
+    /// returns — the safe behaviour for at-tip operation.  When `false`, the
+    /// bytes are still flushed to the OS page cache but the per-block
+    /// `sync_data()` is skipped — used during catch-up sync where blocks
+    /// below the k-depth window are speculative and can be re-fetched from
+    /// peers if the node crashes.  A separate periodic `sync_wal()` call
+    /// must be used to bound the loss window in that mode.
+    ///
+    /// No-op when the WAL is not open (e.g. ephemeral in-memory VolatileDB).
+    pub fn set_wal_sync_per_write(&mut self, sync: bool) {
+        if let Some(ref mut wal) = self.wal {
+            wal.sync_per_write = sync;
+        }
+    }
+
+    /// Force an `fsync` of the WAL, flushing any blocks written since the
+    /// last sync to disk.  Pair with `set_wal_sync_per_write(false)` to bound
+    /// the loss window during catch-up sync.
+    ///
+    /// No-op when the WAL is not open.
+    pub fn sync_wal(&mut self) -> io::Result<()> {
+        if let Some(ref mut wal) = self.wal {
+            wal.force_sync()?;
+        }
+        Ok(())
     }
 
     /// Add a block to the volatile store.

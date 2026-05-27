@@ -846,6 +846,39 @@ impl Node {
             ValidationMode::Replay
         };
 
+        // Auto-switch VolatileDB WAL durability mode based on at-tip state.
+        //
+        // During catch-up sync (`strict == false`) the VolatileDB WAL fsyncs
+        // are pure throughput tax: blocks below the k-depth window are
+        // re-fetchable from peers if the node crashes.  At tip
+        // (`strict == true`) every write must be durable before the next is
+        // appended so the producer can adopt the chain head safely.
+        //
+        // We track the last-set state on `self.volatile_wal_sync_at_tip`
+        // to avoid taking the ChainDB write lock on the hot path when the
+        // mode hasn't changed.
+        let desired_sync_at_tip = strict;
+        let prev_sync_at_tip = self
+            .volatile_wal_sync_at_tip
+            .load(std::sync::atomic::Ordering::Relaxed);
+        if prev_sync_at_tip != desired_sync_at_tip {
+            let mut db = self.chain_db.write().await;
+            // Flush any blocks accumulated under the previous mode before
+            // flipping — when transitioning from catch-up → at-tip this
+            // makes the buffered tail durable; the reverse direction is
+            // a no-op fsync, harmless.
+            if let Err(e) = db.sync_volatile_wal() {
+                warn!(error = %e, "VolatileDB WAL pre-transition fsync failed");
+            }
+            db.set_volatile_wal_sync_per_write(desired_sync_at_tip);
+            self.volatile_wal_sync_at_tip
+                .store(desired_sync_at_tip, std::sync::atomic::Ordering::Relaxed);
+            info!(
+                at_tip = desired_sync_at_tip,
+                "VolatileDB WAL mode switched (per-write fsync = at_tip)"
+            );
+        }
+
         // Issue #545 E1: compute the wall-clock slot ONCE before the header
         // validation loop.  `validate_header_full` checks `header.slot >
         // current_slot`; the old code passed `block.slot()` as current_slot,
@@ -1483,6 +1516,25 @@ impl Node {
             for delta in collected_deltas {
                 seq.push(delta);
             }
+        }
+
+        // Periodic VolatileDB WAL fsync while in catch-up mode.
+        //
+        // When `set_volatile_wal_sync_per_write(false)` is active each
+        // `add_block` skips the per-block fsync.  Force a sync every ~1 s
+        // so a crash mid-catch-up loses at most ~1 s of progress (which is
+        // re-fetched from peers anyway).  No-op when at-tip — there
+        // `sync_per_write == true` already makes every block durable.
+        if !self
+            .volatile_wal_sync_at_tip
+            .load(std::sync::atomic::Ordering::Relaxed)
+            && self.last_volatile_wal_sync.elapsed() >= std::time::Duration::from_secs(1)
+        {
+            let mut db = self.chain_db.write().await;
+            if let Err(e) = db.sync_volatile_wal() {
+                warn!(error = %e, "VolatileDB WAL periodic fsync failed");
+            }
+            self.last_volatile_wal_sync = std::time::Instant::now();
         }
 
         // ── Phase 3: Update chain fragment for all applied blocks ────────────
