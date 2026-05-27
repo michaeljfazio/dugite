@@ -2552,8 +2552,7 @@ mod tests {
         for h in &[h2, h4] {
             fetched_hashes.insert(*h);
         }
-        let drained =
-            select_headers_to_fetch(&pending, |h| known.contains(h), &fetched_hashes);
+        let drained = select_headers_to_fetch(&pending, |h| known.contains(h), &fetched_hashes);
         assert!(
             drained.is_empty(),
             "all headers delivered — no more work to schedule"

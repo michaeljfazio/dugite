@@ -4853,8 +4853,7 @@ impl Node {
                         // catch-up duration (issue: cosmetic but very
                         // misleading).
                         self.metrics.set_epoch(ls.epoch.0);
-                        self.metrics
-                            .set_utxo_count(ls.utxo.utxo_set.len() as u64);
+                        self.metrics.set_utxo_count(ls.utxo.utxo_set.len() as u64);
                         let _ = self.ledger_tip_slot_tx.send(local_tip);
                     }
                     // Consume pending era transition and propagate to the HFC state machine.
