@@ -1331,6 +1331,19 @@ impl Node {
                     );
                 }
             }
+        } else {
+            // In-memory UTxO backend (default).  Faster catch-up apply path
+            // but the UTxO set lives in the process RSS.  At preview scale
+            // (~3M entries) this is fine on any modern dev box; at mainnet
+            // scale (~15M entries × ~10 KB) it will exhaust 32 GB systems
+            // long before reaching tip.  Operators running mainnet must
+            // pass `--utxo-backend lsm` (or set `utxo_backend = "lsm"` in
+            // the storage config JSON) to enable the on-disk LSM store.
+            warn!(
+                "UTxO backend = in-memory (default). RAM scales linearly with UTxO set size. \
+                 For mainnet, restart with `--utxo-backend lsm`. Restarts require reloading \
+                 the latest ledger snapshot (or from-genesis replay if none exists)."
+            );
         }
 
         // After attaching the UTxO store, rebuild stake distribution and snapshot

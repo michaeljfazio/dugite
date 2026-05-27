@@ -1,32 +1,54 @@
 //! Storage configuration types and profiles.
 //!
 //! Operators choose a preset (`high-memory`, `low-memory`) or individually
-//! tune parameters. Both profiles use memory-mapped block indexes by default
+//! tune parameters. All profiles use memory-mapped block indexes by default
 //! (benchmarks show 3-4x faster lookups and 4x faster open at scale vs
 //! in-memory HashMap).
 //!
-//! Four profiles are available, sized to maximize available memory:
+//! Four profiles are available, sized against **free RAM** on common host
+//! hardware (not total physical RAM).  The top tier (`ultra-memory`) targets
+//! a 32 GB free-RAM workstation/server and leaves ~10 GB headroom for the
+//! rest of the node (ledger state, OS page cache competing with the
+//! ImmutableDB mmap, networking, process overhead).  Each lower tier
+//! halves the budget:
 //!
-//! | Profile | Target | Memtable | Cache | Expected RSS |
-//! |---------|--------|----------|-------|-------------|
-//! | `minimal` | 4GB | 256MB | 2GB | ~3GB |
-//! | `low-memory` | 8GB | 512MB | 5GB | ~6.5GB |
-//! | `high-memory` | 16GB | 1GB | 12GB | ~14GB |
-//! | `ultra-memory` | 32GB | 2GB | 24GB | ~27GB |
+//! | Profile        | Target free RAM | Memtable | Cache | Expected LSM RSS | Total RSS |
+//! |----------------|-----------------|----------|-------|------------------|-----------|
+//! | `minimal`      | ~4 GB           | 256 MB   | 1.5 GB | ~1.8 GB          | ~3 GB     |
+//! | `low-memory`   | ~8 GB           | 512 MB   | 4 GB   | ~4.5 GB          | ~7 GB     |
+//! | `high-memory`  | ~16 GB (default)| 1 GB     | 8 GB   | ~9 GB            | ~14 GB    |
+//! | `ultra-memory` | ~32 GB          | 2 GB     | 16 GB  | ~18 GB           | ~24 GB    |
 
 use serde::{Deserialize, Serialize};
 
 /// Storage profile preset.
+///
+/// Sets the LSM memtable / block-cache sizing for the on-disk UTxO store
+/// (the default backend).  Pass `--utxo-backend in-memory` to switch to
+/// the in-memory HashMap backend — faster catch-up but RAM scales with
+/// the UTxO set size; not viable for mainnet.
+///
+/// Tiers target the **free RAM** available on common host hardware, not
+/// total physical RAM.  The top tier (UltraMemory) assumes ~32 GB free —
+/// a high-end workstation or dedicated server — and leaves ~10 GB
+/// headroom for ledger state (`~4–6 GB`), OS page cache (which competes
+/// with ImmutableDB mmap), networking, and process overhead.  Each tier
+/// halves the budget.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum StorageProfile {
-    /// 32GB+ systems: 2GB memtable, 24GB cache (~27GB RSS)
+    /// ~32 GB free RAM: 2 GB memtable, 16 GB cache (~18 GB LSM RSS,
+    /// ~24 GB total node RSS).  High-end workstation or dedicated server.
     UltraMemory,
-    /// 16GB systems (default): 1GB memtable, 12GB cache (~14GB RSS)
+    /// ~16 GB free RAM (default): 1 GB memtable, 8 GB cache
+    /// (~9 GB LSM RSS, ~14 GB total).  Common dev box / mid-tier deploy.
     HighMemory,
-    /// 8GB systems: 512MB memtable, 5GB cache (~6.5GB RSS)
+    /// ~8 GB free RAM: 512 MB memtable, 4 GB cache
+    /// (~4.5 GB LSM RSS, ~7 GB total).  Smaller VMs / older laptops.
     LowMemory,
-    /// 4GB systems: 256MB memtable, 2GB cache (~3GB RSS)
+    /// ~4 GB free RAM: 256 MB memtable, 1.5 GB cache
+    /// (~1.8 GB LSM RSS, ~3 GB total).  Constrained containers; expect
+    /// reduced query/sync performance.
     Minimal,
 }
 
@@ -42,25 +64,25 @@ impl StorageProfile {
             StorageProfile::UltraMemory => UtxoConfig {
                 backend: UtxoBackend::Lsm,
                 memtable_size_mb: 2048,
-                block_cache_size_mb: 24576,
+                block_cache_size_mb: 16384,
                 bloom_filter_bits_per_key: 10,
             },
             StorageProfile::HighMemory => UtxoConfig {
                 backend: UtxoBackend::Lsm,
                 memtable_size_mb: 1024,
-                block_cache_size_mb: 12288,
+                block_cache_size_mb: 8192,
                 bloom_filter_bits_per_key: 10,
             },
             StorageProfile::LowMemory => UtxoConfig {
                 backend: UtxoBackend::Lsm,
                 memtable_size_mb: 512,
-                block_cache_size_mb: 5120,
+                block_cache_size_mb: 4096,
                 bloom_filter_bits_per_key: 10,
             },
             StorageProfile::Minimal => UtxoConfig {
                 backend: UtxoBackend::Lsm,
                 memtable_size_mb: 256,
-                block_cache_size_mb: 2048,
+                block_cache_size_mb: 1536,
                 bloom_filter_bits_per_key: 10,
             },
         };
@@ -172,7 +194,7 @@ impl Default for UtxoConfig {
         UtxoConfig {
             backend: UtxoBackend::InMemory,
             memtable_size_mb: 512,
-            block_cache_size_mb: 5120,
+            block_cache_size_mb: 4096,
             bloom_filter_bits_per_key: 10,
         }
     }
@@ -182,9 +204,13 @@ impl Default for UtxoConfig {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum UtxoBackend {
-    /// In-memory HashMap (default, current behavior).
+    /// In-memory HashMap.  Faster catch-up apply (no LSM lookups) but RSS
+    /// scales linearly with the UTxO set size — preview ~3 GB, mainnet
+    /// ~150 GB at full set.  Restart requires reloading the latest ledger
+    /// snapshot or from-genesis replay.
     InMemory,
-    /// On-disk LSM tree via cardano-lsm.
+    /// On-disk LSM tree via cardano-lsm.  Default — durable, paged, scales
+    /// to mainnet.
     Lsm,
 }
 
@@ -295,7 +321,7 @@ mod tests {
         assert_eq!(config.immutable.index_type, BlockIndexType::Mmap);
         assert_eq!(config.utxo.backend, UtxoBackend::Lsm);
         assert_eq!(config.utxo.memtable_size_mb, 2048);
-        assert_eq!(config.utxo.block_cache_size_mb, 24576);
+        assert_eq!(config.utxo.block_cache_size_mb, 16384);
         assert_eq!(config.utxo.bloom_filter_bits_per_key, 10);
     }
 
@@ -305,7 +331,7 @@ mod tests {
         assert_eq!(config.immutable.index_type, BlockIndexType::Mmap);
         assert_eq!(config.utxo.backend, UtxoBackend::Lsm);
         assert_eq!(config.utxo.memtable_size_mb, 1024);
-        assert_eq!(config.utxo.block_cache_size_mb, 12288);
+        assert_eq!(config.utxo.block_cache_size_mb, 8192);
         assert_eq!(config.utxo.bloom_filter_bits_per_key, 10);
     }
 
@@ -315,7 +341,7 @@ mod tests {
         assert_eq!(config.immutable.index_type, BlockIndexType::Mmap);
         assert_eq!(config.utxo.backend, UtxoBackend::Lsm);
         assert_eq!(config.utxo.memtable_size_mb, 512);
-        assert_eq!(config.utxo.block_cache_size_mb, 5120);
+        assert_eq!(config.utxo.block_cache_size_mb, 4096);
     }
 
     #[test]
@@ -324,7 +350,7 @@ mod tests {
         assert_eq!(config.immutable.index_type, BlockIndexType::Mmap);
         assert_eq!(config.utxo.backend, UtxoBackend::Lsm);
         assert_eq!(config.utxo.memtable_size_mb, 256);
-        assert_eq!(config.utxo.block_cache_size_mb, 2048);
+        assert_eq!(config.utxo.block_cache_size_mb, 1536);
     }
 
     #[test]
@@ -416,7 +442,7 @@ mod tests {
         assert_eq!(config.immutable.index_type, BlockIndexType::Mmap);
         assert_eq!(config.utxo.memtable_size_mb, 96);
         // Unchanged from profile
-        assert_eq!(config.utxo.block_cache_size_mb, 12288);
+        assert_eq!(config.utxo.block_cache_size_mb, 8192);
     }
 
     #[test]
@@ -462,7 +488,7 @@ mod tests {
         assert_eq!(config.immutable.index_type, BlockIndexType::Mmap);
         assert_eq!(config.utxo.backend, UtxoBackend::Lsm);
         assert_eq!(config.utxo.memtable_size_mb, 1024);
-        assert_eq!(config.utxo.block_cache_size_mb, 12288);
+        assert_eq!(config.utxo.block_cache_size_mb, 8192);
     }
 
     #[test]
@@ -479,7 +505,7 @@ mod tests {
         let config = UtxoConfig::default();
         assert_eq!(config.backend, UtxoBackend::InMemory);
         assert_eq!(config.memtable_size_mb, 512);
-        assert_eq!(config.block_cache_size_mb, 5120);
+        assert_eq!(config.block_cache_size_mb, 4096);
         assert_eq!(config.bloom_filter_bits_per_key, 10);
     }
 
@@ -506,7 +532,7 @@ mod tests {
         .unwrap();
         assert_eq!(config.immutable.index_type, BlockIndexType::Mmap);
         assert_eq!(config.utxo.memtable_size_mb, 512);
-        assert_eq!(config.utxo.block_cache_size_mb, 5120);
+        assert_eq!(config.utxo.block_cache_size_mb, 4096);
     }
 
     #[test]
@@ -589,7 +615,7 @@ mod tests {
         // Unchanged from HighMemory profile
         assert_eq!(config.immutable.index_type, BlockIndexType::Mmap);
         assert_eq!(config.utxo.backend, UtxoBackend::Lsm);
-        assert_eq!(config.utxo.block_cache_size_mb, 12288);
+        assert_eq!(config.utxo.block_cache_size_mb, 8192);
         assert_eq!(config.utxo.bloom_filter_bits_per_key, 10);
     }
 
