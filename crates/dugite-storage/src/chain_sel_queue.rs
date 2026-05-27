@@ -412,37 +412,15 @@ async fn process_add_block(
     // are present; otherwise fall back to the legacy strict-greater rule so
     // tests using synthetic CBOR keep their existing semantics (Bug D, #497).
     //
-    // **Skip fork-switch when the new block extended the selected chain
-    // naturally.**  In that case the just-added block IS the new canonical
-    // tip — any fork tip that lives "above" it (e.g. a successor block that
-    // arrived out-of-order earlier and was held as an orphan) will be
-    // picked up when the NEXT block arrives and triggers chain selection
-    // again.  Running fork-switch here is unsafe: the apply path is still
-    // one block behind selected_chain (it applies block_N+1 only after
-    // `process_add_block` returns), so a `TriggeredFork` with
-    // intersection == just-added block would direct the ledger to roll
-    // back to a slot ahead of where it actually is, which fails and stalls.
-    //
-    // This mirrors Haskell `chainSelectionForBlock` (`ChainSel.hs`): the
-    // `TryAddToCurrentChain` branch extends the candidate through the
-    // successor index but applies the whole prefix-plus-suffix in a single
-    // `switchTo` call.  Dugite's equivalent is to let the next block — the
-    // one that fails to extend naturally — trigger a `switch_to_fork` whose
-    // apply list will contain everything from the divergence point forward.
-    if extended_tip {
-        let db = chain_db.read().await;
-        if let Some((tip_slot, tip_hash, tip_block_no)) = db.get_tip_info() {
-            return AddBlockResult::AddedAsTip {
-                tip_slot,
-                tip_hash,
-                tip_block_no,
-            };
-        }
-        // get_tip_info returned None despite a successful add: storage
-        // inconsistency.  Fall through to the StoredAsFork return so the
-        // apply path doesn't advance the ledger on bogus state.
-    }
-
+    // Fork-selection runs unconditionally so out-of-order arrivals are
+    // recovered as soon as the missing ancestor lands and a `switch_to_fork`
+    // can succeed.  When the just-added block itself extended the chain
+    // (`extended_tip == true`), `TriggeredFork.intersection_slot` will be
+    // at or AHEAD of the ledger tip — `apply_fetched_block` /
+    // `handle_ledger_rollback` already implement the
+    // "rollback target ahead of ledger → walk forward through ChainDB"
+    // path (sync.rs:303-356) so the ledger catches up to the intersection
+    // before the new fork's apply list is replayed.
     {
         let mut db = chain_db.write().await;
 
