@@ -1231,13 +1231,52 @@ impl Node {
                 utxo_cfg.block_cache_size_mb,
                 utxo_cfg.bloom_filter_bits_per_key,
             ) {
-                Ok(store) => {
+                Ok(mut store) => {
                     info!(
                         path = %utxo_path.display(),
                         memtable_mb = utxo_cfg.memtable_size_mb,
                         cache_mb = utxo_cfg.block_cache_size_mb,
                         "UTxO store attached (LSM)"
                     );
+                    // Catch-up sync optimization (#698): when the env var
+                    // `DUGITE_LSM_WAL_DURING_SYNC=0` is set, disable LSM WAL
+                    // writes during from-genesis / deep catch-up replay.
+                    //
+                    // The LSM WAL fires three `write()` syscalls per UTxO
+                    // insert/delete (length prefix, payload, CRC).  On
+                    // Babbage/Conway preview blocks (~5 LSM ops per tx ×
+                    // 4-10 txs/block) that's 60-150 syscalls per block —
+                    // and the macOS profile shows `write()` as the #1
+                    // non-idle samples during catch-up replay.
+                    //
+                    // Without WAL the memtable still flushes to disk as
+                    // SST files at the configured cadence (1 GB by
+                    // default).  Crash recovery during sync: re-sync the
+                    // ~minutes of un-flushed work, no consensus risk.
+                    // The `set_wal_enabled(false)` is the same pattern
+                    // used by `cargo bench -p dugite-lsm` for bulk-load
+                    // benchmarks, and the LSM API docstring explicitly
+                    // calls out catch-up sync as the intended use.
+                    //
+                    // **Operators MUST re-enable WAL before at-tip
+                    // operation** by unsetting this env var and restarting
+                    // (or once the auto-detect-at-tip path is wired,
+                    // which the live-tip apply loop already does via the
+                    // `at_tip` predicate from the publish_ledger_view
+                    // gate — extending that gate to flip WAL state is the
+                    // next step).
+                    if std::env::var("DUGITE_LSM_WAL_DURING_SYNC")
+                        .map(|v| v == "0" || v.eq_ignore_ascii_case("false"))
+                        .unwrap_or(false)
+                    {
+                        store.set_wal_enabled(false);
+                        warn!(
+                            "DUGITE_LSM_WAL_DURING_SYNC=0 — LSM WAL DISABLED for catch-up. \
+                             Crash during sync will lose UTxO inserts since the last memtable \
+                             flush (~minutes). Unset this env var and restart before going \
+                             at-tip / producing blocks."
+                        );
+                    }
                     // attach_utxo_store calls rebuild_address_index() which populates
                     // the in-memory count from the LSM. Read the count AFTER attach
                     // to avoid a false-zero from the freshly-opened store (count starts
