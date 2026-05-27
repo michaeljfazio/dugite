@@ -689,8 +689,8 @@ impl LedgerState {
                 }
                 tx_input_count += tx.body.inputs.len();
                 tx_output_count += tx.body.outputs.len();
-                tx_witness_count += tx.witness_set.vkey_witnesses.len()
-                    + tx.witness_set.bootstrap_witnesses.len();
+                tx_witness_count +=
+                    tx.witness_set.vkey_witnesses.len() + tx.witness_set.bootstrap_witnesses.len();
                 tx_redeemer_count += tx.witness_set.redeemers.len();
             }
 
@@ -1125,11 +1125,7 @@ impl LedgerState {
 
         if let Some(start) = block_start {
             let total = start.elapsed();
-            let accounted = t_registry_build
-                + t_ctx_build
-                + t_validate
-                + t_apply
-                + t_diff_merge;
+            let accounted = t_registry_build + t_ctx_build + t_validate + t_apply + t_diff_merge;
             let other = total.saturating_sub(accounted);
             tracing::info!(
                 target: "dugite_ledger::apply::timing",
