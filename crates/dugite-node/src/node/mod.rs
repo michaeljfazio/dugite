@@ -5030,17 +5030,20 @@ impl Node {
         self.metrics.set_block_number(block_number.0);
         self.metrics.set_slot(block_slot.0);
         {
-            // Lock-free read from the published view (#651 P2 / #652 P0).
-            // The apply path just published this view from the same
-            // LedgerState that the previous `ledger_state.read().await`
-            // would have observed — staleness window is the single
-            // atomic store between apply and this load.
+            // `self.view()` is only refreshed by `publish_ledger_view`, which
+            // is gated on at-tip during catch-up sync (see 4832-4847).  Reading
+            // `view.epoch` here would overwrite the catch-up metric write
+            // (4855) with the stale view value, leaving Prometheus stuck at
+            // the boot-time epoch.  Use `view` only for `slot_config`
+            // (immutable for the era and safe to read stale); take a quick
+            // read-lock on the live ledger state for the epoch atomic.
             let view = self.view();
             let slot_time_ms = self
                 .slot_to_wallclock_ms(block_slot.0, &view.slot_config)
                 .await;
             self.metrics.set_tip_slot_time_ms(slot_time_ms);
-            self.metrics.set_epoch(view.epoch.0);
+            let live_epoch = self.ledger_state.read().await.epoch.0;
+            self.metrics.set_epoch(live_epoch);
         }
         self.metrics.refresh_sync_progress(block_slot.0);
 
