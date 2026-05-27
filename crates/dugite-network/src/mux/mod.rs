@@ -36,19 +36,26 @@ use crate::error::MuxError;
 pub use channel::MuxChannel;
 pub use segment::{Direction, SduHeader, HEADER_SIZE};
 
-/// Default ingress channel capacity (number of byte chunks buffered).
 /// Per-protocol ingress channel capacity (number of byte chunks buffered).
 ///
-/// This must be large enough to absorb pipelined ChainSync MsgRequestNext
-/// bursts (default pipeline depth 300) without blocking the ingress task.
-/// If the ingress task blocks on a full channel, ALL other protocols on the
-/// same mux (KeepAlive, BlockFetch) are starved because the ingress task
-/// cannot read further data from the bearer.
+/// This must be large enough to absorb the largest expected protocol burst
+/// without blocking the ingress task — if it blocks, ALL other protocols
+/// on the same mux (KeepAlive, ChainSync, BlockFetch) are starved because
+/// the ingress task cannot read further data from the bearer.
 ///
-/// Haskell's network-mux uses a byte-count buffer (maximumIngressQueue ~1MB)
-/// rather than an item-count channel, so it can absorb large bursts. We use
-/// an item-count channel, so capacity must exceed the maximum pipeline depth.
-const INGRESS_CHANNEL_CAPACITY: usize = 512;
+/// Haskell's network-mux uses a byte-count buffer (`maximumIngressQueue`)
+/// rather than an item-count channel:
+/// * ChainSync — 462 KB (300 × 1400 × 1.1)
+/// * BlockFetch — ~22 MB (`max(10 × 2 MiB, 100 × 88 KiB) × 1.1`)
+/// * TxSubmission — 7.2 MB
+///
+/// dugite enforces the byte cap separately via `ingress_limit` /
+/// `bytes_in_flight` on each subscribed channel; this constant is the
+/// **item-count** ceiling.  Sized to comfortably cover BlockFetch's
+/// per-block frame count: with ~12 KB SDUs the 24 MB byte limit fits in
+/// ~2 000 items, so 4 096 leaves headroom for fragmented frames and
+/// pipelined ChainSync bursts (default pipeline depth 300).
+const INGRESS_CHANNEL_CAPACITY: usize = 4096;
 
 /// Ouroboros multiplexer. Owns the bearer and coordinates ingress/egress tasks.
 ///

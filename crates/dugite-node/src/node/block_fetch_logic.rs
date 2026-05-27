@@ -41,20 +41,19 @@ use dugite_storage::ChainDB;
 
 use super::connection_lifecycle::{CandidateChainState, FetchedBlock, PendingHeader};
 
-/// Default decision interval for Praos consensus (100ms).
+/// Default decision interval for Praos consensus (10 ms — matches
+/// `bfcDecisionLoopIntervalPraos = 0.01` in Haskell's
+/// `ouroboros-network/cardano-diffusion/lib/Cardano/Network/Diffusion/Configuration.hs`).
 ///
-/// Haskell's `blockFetchDecisionLoopInterval` is STM-reactive — it wakes on
-/// candidate-chain state changes and the 10ms constant there is just a poll
-/// floor.  Our implementation is purely timer-driven; running it at 10ms
-/// burns ~5-10% CPU on a 50-hot-peer at-tip node just acquiring the
-/// candidate-chains read lock and iterating empty `pending_headers`.  100ms
-/// is well below any realistic per-peer fetch latency and has no observable
-/// throughput impact during bulk sync (RTT to public preview peers
-/// dominates).
+/// The decision loop refills per-peer in-flight request queues, detects
+/// stalled peers, and re-evaluates fetch mode (BulkSync vs Deadline).  At
+/// 10× this cadence (the previous 100 ms value) dugite reacted 10× more
+/// slowly to delivered blocks during catch-up, capping the throughput
+/// floor.  CPU cost at 10 ms with 50 hot peers is ~5% on Apple Silicon;
+/// acceptable given the throughput gain.  Issue #701.
 ///
-/// Matches Haskell's `blockFetchDecisionLoopInterval` for Praos.
-/// Genesis mode uses 40ms instead.
-const PRAOS_DECISION_INTERVAL: Duration = Duration::from_millis(100);
+/// Genesis mode uses 40 ms instead.
+const PRAOS_DECISION_INTERVAL: Duration = Duration::from_millis(10);
 
 /// Default decision interval for Genesis consensus (40ms).
 ///
