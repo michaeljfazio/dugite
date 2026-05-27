@@ -1556,12 +1556,14 @@ impl ConnectionLifecycleManager {
                             for h in &received_hashes {
                                 fetched_hashes.insert(*h);
                             }
-                            if received_hashes.len() < headers_to_fetch.len() {
-                                debug!(
+                            let short_batched =
+                                received_hashes.len() < headers_to_fetch.len();
+                            if short_batched {
+                                info!(
                                     %addr,
                                     requested = headers_to_fetch.len(),
                                     received = received_hashes.len(),
-                                    "BlockFetch: peer short-batched; missing headers will be re-requested"
+                                    "BlockFetch: peer short-batched; releasing fetcher so another peer can supply missing blocks"
                                 );
                             }
 
@@ -1570,6 +1572,32 @@ impl ConnectionLifecycleManager {
                             // Cross-worker dedup uses the applied ChainDB tip.
                             // max_fetched_slot caused sync stalls by jumping to
                             // the chain tip and filtering out all gap blocks.
+
+                            // Release `active_fetcher` after every batch so
+                            // other peers' workers get a fair chance to claim
+                            // it on their next poll tick.  Previously the
+                            // current worker held the lock across iterations,
+                            // which monopolised fetching from a single peer:
+                            // if that peer didn't have a specific block in its
+                            // chain (or refused to serve it after multiple
+                            // re-requests), no other peer could ever fetch it,
+                            // and sync stalled indefinitely with the same
+                            // peer cycling failed retries.
+                            //
+                            // This mirrors Haskell `BlockFetch.Decision`:
+                            // every decision-loop tick (`bfcDecisionLoopIntervalPraos
+                            // = 10ms`) reconsiders which peer to fetch from,
+                            // so a peer that fails to deliver loses its slot
+                            // to a peer that will.  Dugite's analog is one
+                            // worker per peer + the shared `active_fetcher`
+                            // atomic; releasing here every batch gives the
+                            // same rotation effect.  See issue #702.
+                            let _ = active_fetcher.compare_exchange(
+                                my_id,
+                                0,
+                                std::sync::atomic::Ordering::SeqCst,
+                                std::sync::atomic::Ordering::SeqCst,
+                            );
                         }
                     }
                 }
