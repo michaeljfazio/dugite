@@ -1251,11 +1251,21 @@ impl ConnectionLifecycleManager {
 
                 info!(%addr, "blockfetch worker started (waiting for turn)");
 
-                // Liveness fallback only; real fetch dispatch is event-driven
-                // via the `fetch_senders` mpsc.  500ms × 50 hot peers was ~100
-                // wakeups/sec of CAS-and-park work.  2s makes that 25/sec with
-                // no impact on active fetch latency.
-                let mut poll_ticker = tokio::time::interval(std::time::Duration::from_millis(2000));
+                // Per-peer worker poll cadence.  After commit a1490cb5f the
+                // `active_fetcher` lock is released at the end of every batch,
+                // so the gap between two consecutive BlockFetch ranges is
+                // bounded by this interval (whichever peer's ticker fires
+                // first wins the next contest).
+                //
+                // At 2 s this introduced a ~50 blk/s ceiling at full
+                // batch utilisation (100 blocks/range ÷ 2 s) — way below
+                // the network-bandwidth ceiling, leaving sync CPU-idle
+                // for most of every second.  200 ms restores the prior
+                // throughput while keeping the fairness/rotation
+                // guarantee.  CPU cost: 50 hot peers × 5 wakeups/s = 250
+                // CAS attempts/s, negligible on Apple Silicon.
+                let mut poll_ticker =
+                    tokio::time::interval(std::time::Duration::from_millis(200));
                 poll_ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
                 loop {
