@@ -331,6 +331,22 @@ impl ChainDB {
         self.volatile.clear();
     }
 
+    /// Control whether every VolatileDB WAL append issues an `fsync`.
+    ///
+    /// See [`VolatileDB::set_wal_sync_per_write`].  Wired into the at-tip
+    /// detector so durability follows the standard cardano-node model:
+    /// per-block fsync at tip, periodic batched fsync during catch-up.
+    pub fn set_volatile_wal_sync_per_write(&mut self, sync: bool) {
+        self.volatile.set_wal_sync_per_write(sync);
+    }
+
+    /// Force an `fsync` of the VolatileDB WAL.  See
+    /// [`VolatileDB::sync_wal`] — pair with `set_volatile_wal_sync_per_write(false)`
+    /// from a periodic background task during catch-up.
+    pub fn sync_volatile_wal(&mut self) -> std::io::Result<()> {
+        self.volatile.sync_wal()
+    }
+
     /// Get the current chain tip (higher of volatile and immutable).
     pub fn get_tip(&self) -> Tip {
         let vol_tip = self.volatile.get_tip().map(|(slot, hash, block_no)| Tip {
