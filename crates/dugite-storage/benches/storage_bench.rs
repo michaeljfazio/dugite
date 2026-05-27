@@ -179,92 +179,78 @@ fn bench_chaindb_sequential_insert(c: &mut Criterion) {
 fn bench_chaindb_random_read(c: &mut Criterion) {
     let mut group = c.benchmark_group("chaindb/random_read");
 
-    // Test with 10K and 100K block databases
+    // Test with 10K and 100K block databases.
+    //
+    // The DB is populated ONCE per size outside `b.iter` and shared across all
+    // Criterion iterations. Rebuilding a 100K-block ChainDB (~2GB) per sample
+    // was the dominant cost of the nightly storage suite (>90min job timeout);
+    // this is a pure-read benchmark, so the populated DB is safe to reuse.
     for &db_size in &[10_000u64, 100_000] {
         let lookup_hashes = random_lookup_hashes(NUM_LOOKUPS, db_size);
         let label = format!("{db_size}blks");
+        let dir = tempfile::tempdir().unwrap();
+        let (db, _) = populate_chaindb(dir.path(), db_size);
 
         group.bench_function(BenchmarkId::new("by_hash", &label), |b| {
-            b.iter_batched(
-                || {
-                    let dir = tempfile::tempdir().unwrap();
-                    let (db, _) = populate_chaindb(dir.path(), db_size);
-                    (dir, db, lookup_hashes.clone())
-                },
-                |(_dir, db, hashes)| {
-                    for hash in &hashes {
-                        let result = db.get_block(hash).unwrap();
-                        assert!(result.is_some());
-                    }
-                },
-                BatchSize::PerIteration,
-            );
+            b.iter(|| {
+                for hash in &lookup_hashes {
+                    let result = db.get_block(hash).unwrap();
+                    assert!(result.is_some());
+                }
+            });
         });
+
+        drop(db);
+        drop(dir);
     }
 
     group.finish();
 }
 
 fn bench_chaindb_tip_query(c: &mut Criterion) {
+    let dir = tempfile::tempdir().unwrap();
+    let (db, _) = populate_chaindb(dir.path(), NUM_BLOCKS);
+
     c.bench_function("chaindb/tip_query", |b| {
-        b.iter_batched(
-            || {
-                let dir = tempfile::tempdir().unwrap();
-                let (db, _) = populate_chaindb(dir.path(), NUM_BLOCKS);
-                (dir, db)
-            },
-            |(_dir, db)| {
-                for _ in 0..NUM_LOOKUPS {
-                    let tip = db.get_tip_info();
-                    assert!(tip.is_some());
-                }
-            },
-            BatchSize::PerIteration,
-        );
+        b.iter(|| {
+            for _ in 0..NUM_LOOKUPS {
+                let tip = db.get_tip_info();
+                assert!(tip.is_some());
+            }
+        });
     });
 }
 
 fn bench_chaindb_has_block(c: &mut Criterion) {
     let lookup_hashes = random_lookup_hashes(NUM_LOOKUPS, NUM_BLOCKS);
+    let dir = tempfile::tempdir().unwrap();
+    let (db, _) = populate_chaindb(dir.path(), NUM_BLOCKS);
 
     c.bench_function("chaindb/has_block", |b| {
-        b.iter_batched(
-            || {
-                let dir = tempfile::tempdir().unwrap();
-                let (db, _) = populate_chaindb(dir.path(), NUM_BLOCKS);
-                (dir, db, lookup_hashes.clone())
-            },
-            |(_dir, db, hashes)| {
-                for hash in &hashes {
-                    assert!(db.has_block(hash));
-                }
-            },
-            BatchSize::PerIteration,
-        );
+        b.iter(|| {
+            for hash in &lookup_hashes {
+                assert!(db.has_block(hash));
+            }
+        });
     });
 }
 
 fn bench_chaindb_slot_range_query(c: &mut Criterion) {
+    let dir = tempfile::tempdir().unwrap();
+    let (db, _) = populate_chaindb(dir.path(), NUM_BLOCKS);
+
     c.bench_function("chaindb/slot_range_100", |b| {
-        b.iter_batched(
-            || {
-                let dir = tempfile::tempdir().unwrap();
-                let (db, _) = populate_chaindb(dir.path(), NUM_BLOCKS);
-                (dir, db)
-            },
-            |(_dir, db)| {
-                // Query 100-block windows at random positions
-                let mut rng = 42u64;
-                for _ in 0..10 {
-                    let start = (lcg_next(&mut rng) % (NUM_BLOCKS - 100)) + 1;
-                    let blocks = db
-                        .get_blocks_in_slot_range(SlotNo(start), SlotNo(start + 100))
-                        .unwrap();
-                    black_box(blocks.len());
-                }
-            },
-            BatchSize::PerIteration,
-        );
+        b.iter(|| {
+            // Query 100-block windows at random positions
+            let mut rng = 42u64;
+            for _ in 0..10 {
+                let start = (lcg_next(&mut rng) % (NUM_BLOCKS - 100)) + 1;
+                let blocks = db
+                    .get_blocks_in_slot_range(SlotNo(start), SlotNo(start + 100))
+                    .unwrap();
+                black_box(blocks.len());
+            }
+        });
     });
 }
 
