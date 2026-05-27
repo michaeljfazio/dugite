@@ -1388,6 +1388,13 @@ impl ConnectionLifecycleManager {
                             };
 
                             debug!(%addr, ranges = ranges.len(), headers = headers_to_fetch.len(), "BlockFetch: fetching in batched ranges");
+
+                            // Track the hashes of blocks the peer actually delivered
+                            // via `MsgBlock`.  Used below to update `fetched_hashes`
+                            // selectively — see the comment near the loop end.
+                            let mut received_hashes: std::collections::HashSet<[u8; 32]> =
+                                std::collections::HashSet::new();
+
                             for (from, to) in ranges {
                                 let peer = addr;
                                 let range_to_slot = match &to {
@@ -1432,6 +1439,13 @@ impl ConnectionLifecycleManager {
                                                         tip_hash: [0u8; 32],
                                                         tip_block_number: 0,
                                                     });
+                                                    // Will be promoted to `received_hashes`
+                                                    // below after we drain `decoded_blocks`
+                                                    // (we can't borrow the outer set inside
+                                                    // this `FnMut` closure without making it
+                                                    // explicit; doing the bookkeeping after
+                                                    // `fetch_range` returns is equivalent and
+                                                    // avoids the borrow gymnastics).
                                                 }
                                                 Err(e) => {
                                                     warn!(%addr, "block decode error: {e}");
@@ -1491,8 +1505,16 @@ impl ConnectionLifecycleManager {
                                 // Send all blocks collected for this range using
                                 // `.send().await` — which correctly yields to the
                                 // scheduler instead of blocking the thread.
+                                //
+                                // Promote each delivered block's hash into the
+                                // received-set BEFORE handing the value off to the
+                                // channel (`fetched` is moved, so we capture the
+                                // hash first).  See the post-loop dedup comment
+                                // below for why this matters.
                                 for fetched in decoded_blocks {
                                     let slot = fetched.block.slot().0;
+                                    received_hashes
+                                        .insert(*fetched.block.header.header_hash.as_bytes());
                                     if let Err(e) = fetched_blocks_tx.send(fetched).await {
                                         warn!(%addr, slot, "send to run loop failed (channel closed): {e}");
                                         // Channel closed means the run loop exited.
@@ -1503,11 +1525,44 @@ impl ConnectionLifecycleManager {
                                 }
                             }
 
-                            // Record all fetched hashes in the per-worker dedup set
-                            // so subsequent iterations of this worker's loop skip
-                            // them without consulting the candidate_chains lock.
-                            for h in &headers_to_fetch {
-                                fetched_hashes.insert(h.hash);
+                            // Per-worker dedup: only mark hashes for blocks the peer
+                            // actually delivered via `MsgBlock`.
+                            //
+                            // BUG (#702): the previous code unconditionally inserted
+                            // EVERY hash in `headers_to_fetch` into `fetched_hashes`,
+                            // even ones for which the peer sent no `MsgBlock`
+                            // (e.g. when `MsgBatchDone` arrives early with fewer
+                            // blocks than requested).  Those undelivered hashes were
+                            // permanently marked "fetched", so the worker never
+                            // re-requested them — every downstream block became an
+                            // orphan in VolatileDB (`fork unreachable —
+                            // StoreButDontChange`), and the apply path stalled at
+                            // the predecessor of the first missing block while
+                            // peers kept advancing past the forecast horizon and
+                            // disconnecting.  Reproduced as a deterministic stall on
+                            // ~1-in-3 from-genesis preview runs.
+                            //
+                            // The Haskell reference (BlockFetch.Decision) tracks
+                            // per-peer "in-flight" by request, not by header, but
+                            // crucially never marks a block as fetched until the
+                            // body arrives via `MsgBlock` — so a peer that
+                            // short-batches always sees the un-delivered headers
+                            // re-requested on the next decision tick.
+                            //
+                            // The next loop iteration will rebuild
+                            // `headers_to_fetch` from `state.pending_headers` minus
+                            // `fetched_hashes` and `has_block`, picking up exactly
+                            // the missing blocks for re-request.
+                            for h in &received_hashes {
+                                fetched_hashes.insert(*h);
+                            }
+                            if received_hashes.len() < headers_to_fetch.len() {
+                                debug!(
+                                    %addr,
+                                    requested = headers_to_fetch.len(),
+                                    received = received_hashes.len(),
+                                    "BlockFetch: peer short-batched; missing headers will be re-requested"
+                                );
                             }
 
                             // Note: we do NOT update max_fetched_slot here.
@@ -2338,6 +2393,145 @@ mod tests {
         let out = select_headers_to_fetch(&pending, |h| known.contains(h), &fetched);
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].hash, [0xBB; 32]);
+    }
+
+    /// Regression test for issue #702: when a peer short-batches a
+    /// BlockFetch request (responds `MsgBatchDone` before delivering every
+    /// requested block), the missing headers MUST be eligible for
+    /// re-request on the next decision tick.
+    ///
+    /// The bug fixed in 2026-05-27 was that `fetched_hashes` was
+    /// unconditionally populated with every hash in `headers_to_fetch`,
+    /// independent of whether the body actually arrived as `MsgBlock`.  That
+    /// permanently masked the un-delivered blocks from `select_headers_to_fetch`
+    /// and stalled the sync at the first missing block — every subsequent
+    /// block sat in VolatileDB as a `StoreButDontChange` orphan.
+    ///
+    /// The fix is to only promote actually-received hashes into
+    /// `fetched_hashes`.  This test simulates that flow:
+    ///   1. Worker requests headers [h1..h5].
+    ///   2. Peer delivers only {h1, h3, h5} (h2 and h4 short-batched).
+    ///   3. Worker inserts ONLY {h1, h3, h5} into `fetched_hashes`.
+    ///   4. Next `select_headers_to_fetch` call must return [h2, h4].
+    #[test]
+    fn select_headers_to_fetch_re_requests_short_batched_blocks() {
+        use std::collections::HashSet;
+
+        let h1 = [0x01; 32];
+        let h2 = [0x02; 32];
+        let h3 = [0x03; 32];
+        let h4 = [0x04; 32];
+        let h5 = [0x05; 32];
+
+        let pending = vec![
+            PendingHeader {
+                slot: 10,
+                hash: h1,
+                header_cbor: vec![],
+            },
+            PendingHeader {
+                slot: 11,
+                hash: h2,
+                header_cbor: vec![],
+            },
+            PendingHeader {
+                slot: 12,
+                hash: h3,
+                header_cbor: vec![],
+            },
+            PendingHeader {
+                slot: 13,
+                hash: h4,
+                header_cbor: vec![],
+            },
+            PendingHeader {
+                slot: 14,
+                hash: h5,
+                header_cbor: vec![],
+            },
+        ];
+        let known: HashSet<[u8; 32]> = HashSet::new();
+
+        // Step 1 — first decision tick: all 5 selected for download.
+        let mut fetched_hashes: HashSet<[u8; 32]> = HashSet::new();
+        let to_fetch = select_headers_to_fetch(&pending, |h| known.contains(h), &fetched_hashes);
+        assert_eq!(to_fetch.len(), 5, "expected all 5 headers on first tick");
+
+        // Step 2 — peer delivers only h1, h3, h5; promote ONLY those to
+        // `fetched_hashes`, matching the post-fix worker behaviour.
+        let received: HashSet<[u8; 32]> = HashSet::from([h1, h3, h5]);
+        for h in &received {
+            fetched_hashes.insert(*h);
+        }
+
+        // Step 3 — next decision tick: h2 and h4 must reappear.
+        let next = select_headers_to_fetch(&pending, |h| known.contains(h), &fetched_hashes);
+        let next_hashes: HashSet<[u8; 32]> = next.iter().map(|h| h.hash).collect();
+        assert_eq!(
+            next_hashes,
+            HashSet::from([h2, h4]),
+            "short-batched headers must be re-requested on the next tick"
+        );
+
+        // Step 4 — exhaustive delivery on the second pass: everything
+        // marked fetched, next tick returns empty (no rerequest churn).
+        for h in &[h2, h4] {
+            fetched_hashes.insert(*h);
+        }
+        let drained =
+            select_headers_to_fetch(&pending, |h| known.contains(h), &fetched_hashes);
+        assert!(
+            drained.is_empty(),
+            "all headers delivered — no more work to schedule"
+        );
+    }
+
+    /// Demonstrate the previous buggy behaviour to make sure future
+    /// refactors don't reintroduce it: marking ALL requested hashes (not
+    /// just delivered ones) leaves the missing blocks permanently masked.
+    #[test]
+    fn buggy_mark_all_requested_strands_short_batched_blocks() {
+        use std::collections::HashSet;
+
+        let h1 = [0x01; 32];
+        let h2 = [0x02; 32];
+        let h3 = [0x03; 32];
+
+        let pending = vec![
+            PendingHeader {
+                slot: 10,
+                hash: h1,
+                header_cbor: vec![],
+            },
+            PendingHeader {
+                slot: 11,
+                hash: h2,
+                header_cbor: vec![],
+            },
+            PendingHeader {
+                slot: 12,
+                hash: h3,
+                header_cbor: vec![],
+            },
+        ];
+        let known: HashSet<[u8; 32]> = HashSet::new();
+
+        // Simulate the OLD bug: mark all `headers_to_fetch` as fetched even
+        // though the peer only delivered h1.
+        let mut fetched_hashes: HashSet<[u8; 32]> = HashSet::new();
+        let to_fetch = select_headers_to_fetch(&pending, |h| known.contains(h), &fetched_hashes);
+        assert_eq!(to_fetch.len(), 3);
+        for h in &to_fetch {
+            fetched_hashes.insert(h.hash); // bug: insert requested, not received
+        }
+
+        // Under the buggy logic, the next tick yields no work even though
+        // h2 and h3 never arrived — the stall reproducer.
+        let next = select_headers_to_fetch(&pending, |h| known.contains(h), &fetched_hashes);
+        assert!(
+            next.is_empty(),
+            "buggy code strands h2 and h3 — this assertion documents the regression class"
+        );
     }
 
     /// Verify FetchedBlock can be constructed.
