@@ -76,25 +76,38 @@ pub struct LedgerStateSnapshot {
     /// Reserves balance (ADA not yet in circulation)
     pub reserves: Lovelace,
     /// Delegation state: credential_hash -> pool_id
-    pub delegations: Arc<HashMap<Hash32, Hash28>>,
+    ///
+    /// **OWNED, not Arc-shared.**  Earlier versions stored
+    /// `Arc<HashMap<…>>` here, which made the snapshot view share the
+    /// live LedgerState's Arc.  During the ~0.5–1 s window between
+    /// view-build and snapshot-file-write completion, every block apply
+    /// that touched this map via `Arc::make_mut` paid a CoW deep-clone
+    /// of the entire ~100 k-entry HashMap because refcount was 2.
+    /// Across the six Arc-shared maps the per-block cost climbed to
+    /// ~460 ms steady-state once the chain reached epoch 25-ish on
+    /// preview — observed as the "rate collapse at block 119k" symptom
+    /// across multiple runs.  See #702.
+    pub delegations: HashMap<Hash32, Hash28>,
     /// Pool registrations: pool_id -> pool registration
-    pub pool_params: Arc<HashMap<Hash28, PoolRegistration>>,
+    pub pool_params: HashMap<Hash28, PoolRegistration>,
     /// Future pool parameters for re-registrations.
     pub future_pool_params: HashMap<Hash28, PoolRegistration>,
     /// Pool retirements pending: pool -> retirement epoch.
     pub pending_retirements: HashMap<Hash28, EpochNo>,
     /// Stake snapshots for the Cardano "mark/set/go" snapshot model
     pub snapshots: EpochSnapshots,
-    /// Reward accounts: stake credential hash -> accumulated rewards
-    pub reward_accounts: Arc<HashMap<Hash32, Lovelace>>,
+    /// Reward accounts: stake credential hash -> accumulated rewards.
+    /// **OWNED, not Arc-shared** — see comment on `delegations`.
+    pub reward_accounts: HashMap<Hash32, Lovelace>,
     /// Pointer map: certificate pointers -> credential hashes.
     pub pointer_map: HashMap<dugite_primitives::credentials::Pointer, Hash32>,
     /// Genesis delegates: genesis_key_hash -> (delegate_key_hash, vrf_key_hash).
     pub genesis_delegates: HashMap<Hash28, (Hash28, Hash32)>,
     /// Fees collected in the current epoch
     pub epoch_fees: Lovelace,
-    /// Number of blocks produced by each pool in the current epoch
-    pub epoch_blocks_by_pool: Arc<HashMap<Hash28, u64>>,
+    /// Number of blocks produced by each pool in the current epoch.
+    /// **OWNED, not Arc-shared** — see comment on `delegations`.
+    pub epoch_blocks_by_pool: HashMap<Hash28, u64>,
     /// Total blocks in the current epoch
     pub epoch_block_count: u64,
     /// Evolving nonce (eta_v): accumulated hash of ALL VRF outputs.
@@ -123,8 +136,9 @@ pub struct LedgerStateSnapshot {
     pub future_pp_updates: BTreeMap<EpochNo, Vec<(Hash32, ProtocolParamUpdate)>>,
     /// Quorum for pre-Conway protocol parameter updates.
     pub update_quorum: u64,
-    /// Conway governance state
-    pub governance: Arc<GovernanceState>,
+    /// Conway governance state.
+    /// **OWNED, not Arc-shared** — see comment on `delegations`.
+    pub governance: GovernanceState,
     /// Slot configuration for Plutus time conversion
     pub slot_config: SlotConfig,
     /// Whether stake distribution needs a full rebuild after snapshot load.
@@ -173,7 +187,8 @@ pub struct LedgerStateSnapshot {
     /// Operational certificate counters per pool.
     pub opcert_counters: HashMap<Hash28, u64>,
     /// Per-credential deposit paid at stake key registration time (lovelace).
-    pub stake_key_deposits: Arc<HashMap<Hash32, u64>>,
+    /// **OWNED, not Arc-shared** — see comment on `delegations`.
+    pub stake_key_deposits: HashMap<Hash32, u64>,
     /// Per-pool deposit paid at pool registration time (lovelace).
     pub pool_deposits: HashMap<Hash28, u64>,
 }
@@ -188,13 +203,29 @@ impl From<&super::LedgerState> for LedgerStateSnapshot {
             diff_seq: s.utxo.diff_seq.clone(),
             epoch_fees: s.utxo.epoch_fees,
             pending_donations: s.utxo.pending_donations,
-            // Cert sub-state
-            delegations: Arc::clone(&s.certs.delegations),
-            pool_params: Arc::clone(&s.certs.pool_params),
+            // Cert sub-state.
+            //
+            // Deep-clone the Arc-shared HashMaps so the snapshot view
+            // **owns** its data — the source Arc's refcount stays at 1
+            // and the live LedgerState's subsequent `Arc::make_mut`
+            // calls in `apply_delta_to_state` stay O(1) in-place
+            // mutations.  Previously these were `Arc::clone` (shared),
+            // which forced every block apply during the
+            // ~0.5-1 s snapshot I/O window to CoW-deep-clone the
+            // whole HashMap (10-30 MB each × 6 maps), producing the
+            // 460 ms per-block ceiling at epoch 25+.
+            //
+            // Memory cost: one-time deep clone at view-build time.
+            // At preview's ~100 k delegation entries that's ~10 MB
+            // per map = ~60 MB total transient (held inside
+            // `spawn_blocking` until file write completes), then dropped.
+            // Negligible compared to the per-block savings.
+            delegations: (*s.certs.delegations).clone(),
+            pool_params: (*s.certs.pool_params).clone(),
             future_pool_params: s.certs.future_pool_params.clone(),
             pending_retirements: s.certs.pending_retirements.clone(),
-            reward_accounts: Arc::clone(&s.certs.reward_accounts),
-            stake_key_deposits: Arc::clone(&s.certs.stake_key_deposits),
+            reward_accounts: (*s.certs.reward_accounts).clone(),
+            stake_key_deposits: (*s.certs.stake_key_deposits).clone(),
             pool_deposits: s.certs.pool_deposits.clone(),
             total_stake_key_deposits: s.certs.total_stake_key_deposits,
             pointer_map: s.certs.pointer_map.clone(),
@@ -204,8 +235,8 @@ impl From<&super::LedgerState> for LedgerStateSnapshot {
             pending_mir_treasury: s.certs.pending_mir_treasury.clone(),
             pending_mir_delta_reserves: s.certs.pending_mir_delta_reserves,
             pending_mir_delta_treasury: s.certs.pending_mir_delta_treasury,
-            // Gov sub-state
-            governance: Arc::clone(&s.gov.governance),
+            // Gov sub-state — owned, see comment above.
+            governance: (*s.gov.governance).clone(),
             // Consensus sub-state
             evolving_nonce: s.consensus.evolving_nonce,
             candidate_nonce: s.consensus.candidate_nonce,
@@ -215,7 +246,8 @@ impl From<&super::LedgerState> for LedgerStateSnapshot {
             rolling_nonce: s.consensus.rolling_nonce,
             first_block_hash_of_epoch: s.consensus.first_block_hash_of_epoch,
             prev_epoch_first_block_hash: s.consensus.prev_epoch_first_block_hash,
-            epoch_blocks_by_pool: Arc::clone(&s.consensus.epoch_blocks_by_pool),
+            // Owned, see comment on `delegations`.
+            epoch_blocks_by_pool: (*s.consensus.epoch_blocks_by_pool).clone(),
             epoch_block_count: s.consensus.epoch_block_count,
             opcert_counters: s.consensus.opcert_counters.clone(),
             // Epoch sub-state
@@ -265,12 +297,15 @@ impl From<LedgerStateSnapshot> for super::LedgerState {
                 pending_donations: s.pending_donations,
             },
             certs: CertSubState {
-                delegations: s.delegations,
-                pool_params: s.pool_params,
+                // Snapshot view owns its data (no Arc); wrap into Arc
+                // on the way back into LedgerState to restore the
+                // copy-on-write semantics the apply path expects.
+                delegations: Arc::new(s.delegations),
+                pool_params: Arc::new(s.pool_params),
                 future_pool_params: s.future_pool_params,
                 pending_retirements: s.pending_retirements,
-                reward_accounts: s.reward_accounts,
-                stake_key_deposits: s.stake_key_deposits,
+                reward_accounts: Arc::new(s.reward_accounts),
+                stake_key_deposits: Arc::new(s.stake_key_deposits),
                 pool_deposits: s.pool_deposits,
                 total_stake_key_deposits: s.total_stake_key_deposits,
                 pointer_map: s.pointer_map,
@@ -282,7 +317,7 @@ impl From<LedgerStateSnapshot> for super::LedgerState {
                 pending_mir_delta_treasury: s.pending_mir_delta_treasury,
             },
             gov: GovSubState {
-                governance: s.governance,
+                governance: Arc::new(s.governance),
             },
             consensus: ConsensusSubState {
                 evolving_nonce: s.evolving_nonce,
@@ -293,7 +328,7 @@ impl From<LedgerStateSnapshot> for super::LedgerState {
                 rolling_nonce: s.rolling_nonce,
                 first_block_hash_of_epoch: s.first_block_hash_of_epoch,
                 prev_epoch_first_block_hash: s.prev_epoch_first_block_hash,
-                epoch_blocks_by_pool: s.epoch_blocks_by_pool,
+                epoch_blocks_by_pool: Arc::new(s.epoch_blocks_by_pool),
                 epoch_block_count: s.epoch_block_count,
                 opcert_counters: s.opcert_counters,
             },
