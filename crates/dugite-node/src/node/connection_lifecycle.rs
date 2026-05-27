@@ -1624,6 +1624,26 @@ impl ConnectionLifecycleManager {
                                 std::sync::atomic::Ordering::SeqCst,
                                 std::sync::atomic::Ordering::SeqCst,
                             );
+
+                            // Explicit yield so the SAME peer's worker
+                            // doesn't immediately re-claim on the next
+                            // poll-ticker tick (a deterministic phase
+                            // offset still produces a deterministic
+                            // "who ticks first after release" outcome
+                            // — observed live as 18.117.34.199 winning
+                            // every contest for ~4 consecutive batches
+                            // while 15 other peers' workers stalled).
+                            //
+                            // Sleep ONE full poll cycle so every other
+                            // peer's worker definitely fires at least
+                            // one tick during this window and gets a
+                            // fair shot at `active_fetcher`.  Net
+                            // throughput is unaffected once all peers
+                            // participate — the apply pipeline is
+                            // bottlenecked at ~75-100 blk/s post-snapshot-fix
+                            // regardless of how many peers contribute.
+                            tokio::time::sleep(std::time::Duration::from_millis(200))
+                                .await;
                         }
                     }
                 }
