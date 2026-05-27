@@ -371,6 +371,14 @@ pub struct SnapshotScheduler {
     shutdown_requested: bool,
     /// Total number of snapshots taken.
     snapshots_taken: u64,
+    /// When `true`, only fire snapshots at epoch boundaries (or on shutdown);
+    /// the block-interval trigger is suppressed.  This mirrors the
+    /// Haskell node's catch-up behaviour: snapshot I/O is wasted work during
+    /// rapid catch-up because (a) the next epoch boundary is usually closer
+    /// than the snapshot would be worth, and (b) the snapshot itself stalls
+    /// the apply loop.  Toggle this with [`Self::set_catchup_mode`] based on
+    /// the at-tip detector.
+    catchup_mode: bool,
 }
 
 impl SnapshotScheduler {
@@ -387,7 +395,25 @@ impl SnapshotScheduler {
             last_snapshot_epoch: None,
             shutdown_requested: false,
             snapshots_taken: 0,
+            catchup_mode: false,
         }
+    }
+
+    /// Enable or disable catch-up mode.
+    ///
+    /// In catch-up mode the block-interval snapshot trigger is suppressed;
+    /// only epoch-boundary and shutdown triggers fire.  See
+    /// [`Self::catchup_mode`] for rationale.  Returns `true` if the mode
+    /// changed (caller may want to log the transition).
+    pub fn set_catchup_mode(&mut self, catchup: bool) -> bool {
+        let changed = self.catchup_mode != catchup;
+        self.catchup_mode = catchup;
+        changed
+    }
+
+    /// Whether the scheduler is currently in catch-up mode.
+    pub fn is_catchup_mode(&self) -> bool {
+        self.catchup_mode
     }
 
     /// Record that one block has been applied and check whether a snapshot
@@ -421,7 +447,12 @@ impl SnapshotScheduler {
             None => true, // First snapshot always triggers at epoch boundary
             Some(last) => current_epoch > last,
         };
-        let interval_reached = self.blocks_since_snapshot >= self.snapshot_interval;
+        // In catch-up mode the block-interval trigger is suppressed: snapshots
+        // only fire at epoch boundaries (or shutdown).  The block counter
+        // still ticks so that the first batch after switching back to at-tip
+        // can immediately retry without waiting another interval.
+        let interval_reached =
+            !self.catchup_mode && self.blocks_since_snapshot >= self.snapshot_interval;
         let shutdown = self.shutdown_requested;
 
         let should_snapshot = epoch_boundary || interval_reached || shutdown;
@@ -493,7 +524,10 @@ impl SnapshotScheduler {
             None => true,
             Some(last) => current_epoch > last,
         };
-        let interval_reached = self.blocks_since_snapshot >= self.snapshot_interval;
+        // In catch-up mode the block-interval trigger is suppressed; see the
+        // corresponding gate in [`Self::maybe_snapshot`].
+        let interval_reached =
+            !self.catchup_mode && self.blocks_since_snapshot >= self.snapshot_interval;
         let shutdown = self.shutdown_requested;
 
         epoch_boundary || interval_reached || shutdown
@@ -823,6 +857,71 @@ mod tests {
         });
         assert!(triggered, "should trigger at block interval");
         assert_eq!(snapshots, 2);
+    }
+
+    /// Catch-up mode suppresses the block-interval trigger but preserves the
+    /// epoch-boundary trigger and the shutdown trigger.
+    #[test]
+    fn snapshot_scheduler_catchup_mode_suppresses_block_interval() {
+        let interval = 5u64;
+        let mut sched = SnapshotScheduler::with_interval(interval);
+        assert!(!sched.is_catchup_mode());
+        assert!(sched.set_catchup_mode(true));
+        assert!(sched.is_catchup_mode());
+        // A second call with the same value should report no change.
+        assert!(!sched.set_catchup_mode(true));
+
+        let mut snapshots = 0usize;
+        let epoch = EpochNo(0);
+
+        // First call: epoch_boundary still fires (last_snapshot_epoch == None
+        // is treated as an epoch boundary).  Catch-up mode only gates the
+        // block-interval trigger.
+        let triggered = sched.maybe_snapshot(epoch, BlockNo(1), &mut || {
+            snapshots += 1;
+            Ok(())
+        });
+        assert!(triggered, "first call should trigger via epoch boundary");
+        assert_eq!(snapshots, 1);
+
+        // Run well past the configured interval without any epoch change —
+        // catch-up mode must keep returning false.
+        for i in 2..(interval * 5) {
+            let triggered = sched.maybe_snapshot(epoch, BlockNo(i), &mut || {
+                snapshots += 1;
+                Ok(())
+            });
+            assert!(
+                !triggered,
+                "block-interval trigger must be suppressed in catch-up mode"
+            );
+        }
+        assert_eq!(snapshots, 1);
+
+        // Epoch boundary still fires.
+        let triggered = sched.maybe_snapshot(EpochNo(1), BlockNo(100), &mut || {
+            snapshots += 1;
+            Ok(())
+        });
+        assert!(triggered, "epoch boundary must still fire in catch-up mode");
+        assert_eq!(snapshots, 2);
+
+        // Switching back to at-tip restores the block-interval trigger; the
+        // counter has been ticking through the suppression window so the
+        // next interval point should fire immediately if it has been hit.
+        sched.set_catchup_mode(false);
+        // Burn through up to interval more blocks within the same epoch.
+        for i in 101..(101 + interval) {
+            let _ = sched.maybe_snapshot(EpochNo(1), BlockNo(i), &mut || {
+                snapshots += 1;
+                Ok(())
+            });
+        }
+        assert!(
+            snapshots >= 3,
+            "interval trigger should fire within {} blocks of returning to at-tip",
+            interval
+        );
     }
 
     /// Test that the scheduler triggers at epoch boundaries regardless of

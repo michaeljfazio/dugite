@@ -4248,6 +4248,21 @@ impl Node {
                 stability_window,
                 "VolatileDB WAL mode switched (per-write fsync = at_tip)"
             );
+
+            // Match the snapshot scheduler to the at-tip mode.  During
+            // catch-up only epoch-boundary snapshots fire — the
+            // block-interval trigger (every 2 000 blocks) is wasted I/O
+            // because the next epoch boundary is usually closer than the
+            // would-be interval point and snapshotting stalls the apply
+            // loop.  This mirrors cardano-node's behaviour where the
+            // 10-minute snapshot rate-limit effectively caps catch-up
+            // snapshots to one per epoch or two.
+            if self.bg_snapshot_scheduler.set_catchup_mode(!at_tip) {
+                info!(
+                    catchup_mode = !at_tip,
+                    "Snapshot scheduler mode switched (catch-up suppresses block-interval trigger)"
+                );
+            }
         }
         // Periodic VolatileDB WAL fsync while in catch-up mode (bounds the
         // loss window to ~1 s when sync_per_write is disabled).
