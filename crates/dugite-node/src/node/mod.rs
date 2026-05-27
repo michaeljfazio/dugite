@@ -4276,6 +4276,26 @@ impl Node {
                     "Snapshot scheduler mode switched (catch-up suppresses block-interval trigger)"
                 );
             }
+
+            // Match LedgerSeq's checkpoint behaviour to the at-tip mode.
+            //
+            // During catch-up the checkpoint Arc-clones inflate the anchor
+            // substates' refcounts, forcing `advance_anchor` →
+            // `Arc::make_mut` to CoW-deep-clone every mutated HashMap on
+            // each push.  At preview's ~130 k-entry maps that was the
+            // 480 ms per-block ceiling at epoch 25+.  Skipping the
+            // checkpoint inserts during catch-up keeps the anchor's Arc
+            // refcount at 1, so `make_mut` stays in-place.  Rollback
+            // acceleration is restored once we cross back to at-tip.
+            {
+                let mut seq = self.ledger_seq.write().await;
+                if seq.set_catchup_mode(!at_tip) {
+                    info!(
+                        catchup_mode = !at_tip,
+                        "LedgerSeq mode switched (catch-up suppresses checkpoint Arc fan-out)"
+                    );
+                }
+            }
         }
         // Periodic VolatileDB WAL fsync while in catch-up mode (bounds the
         // loss window to ~1 s when sync_per_write is disabled).

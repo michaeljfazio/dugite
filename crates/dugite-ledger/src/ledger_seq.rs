@@ -432,6 +432,25 @@ pub struct LedgerSeq {
 
     /// Security parameter k: maximum number of volatile deltas retained.
     k: u64,
+
+    /// When `true`, [`Self::push`] skips checkpoint creation.
+    ///
+    /// Checkpoints exist to accelerate rollback reconstruction — they hold
+    /// Arc'd clones of the anchor's substates so a fork-switch can recover
+    /// in O(checkpoint_interval) rather than O(k).  During catch-up sync
+    /// the node never rolls back deeply (every block from BlockFetch is
+    /// canonical-chain by the time it reaches `apply_block_with_delta`),
+    /// so the checkpoint Arc clones are pure overhead: every shared Arc
+    /// inflates the refcount, and the next `advance_anchor` →
+    /// `apply_delta_to_state` → `Arc::make_mut` triggers a CoW deep clone
+    /// of every mutated HashMap (10–30 MB each).  That was the ~480 ms
+    /// per-block ceiling observed at preview epoch 25+ across multiple
+    /// runs (#702).
+    ///
+    /// At-tip sets this to `false` so the original rollback acceleration
+    /// is restored.  Default `false` so existing callers without an
+    /// at-tip toggle keep their current behaviour.
+    catchup_mode: bool,
 }
 
 impl LedgerSeq {
@@ -456,7 +475,27 @@ impl LedgerSeq {
             checkpoints: BTreeMap::new(),
             checkpoint_interval,
             k,
+            catchup_mode: false,
         }
+    }
+
+    /// Enable or disable catch-up mode.
+    ///
+    /// In catch-up mode, [`Self::push`] does not create checkpoints — the
+    /// Arc-clone fan-out they create is wasted work because catch-up never
+    /// triggers a deep rollback.  See the field comment for the rationale.
+    /// Caller should flip this back to `false` once the node reaches tip.
+    ///
+    /// Returns `true` iff the mode actually changed.
+    pub fn set_catchup_mode(&mut self, catchup: bool) -> bool {
+        let changed = self.catchup_mode != catchup;
+        self.catchup_mode = catchup;
+        changed
+    }
+
+    /// Whether the sequence is in catch-up mode (checkpoints suppressed).
+    pub fn is_catchup_mode(&self) -> bool {
+        self.catchup_mode
     }
 
     /// Create a `LedgerSeq` with default settings (checkpoint every 100 blocks).
@@ -593,7 +632,13 @@ impl LedgerSeq {
 
         // Store a checkpoint every `checkpoint_interval` blocks.
         // Checkpoint is taken at indices checkpoint_interval-1, 2*(checkpoint_interval)-1, …
-        if (new_idx + 1).is_multiple_of(self.checkpoint_interval) {
+        //
+        // Skipped during catch-up mode because every checkpoint Arc-clone
+        // bumps the refcount on the anchor's substates, which forces the
+        // next `advance_anchor` → `apply_delta_to_state` → `Arc::make_mut`
+        // path to CoW-deep-clone any mutated HashMap.  See the field
+        // comment on `catchup_mode` for the full rationale (#702).
+        if !self.catchup_mode && (new_idx + 1).is_multiple_of(self.checkpoint_interval) {
             let cp = Box::new(self.state_at_index(new_idx));
             self.checkpoints.insert(new_idx, cp);
         }
