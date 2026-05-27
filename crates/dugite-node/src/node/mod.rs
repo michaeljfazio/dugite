@@ -4843,6 +4843,18 @@ impl Node {
                         // after 60s suspension; disconnecting`, and the
                         // node stalls with zero hot peers — exactly the
                         // regression observed before this branch added it.
+                        //
+                        // Also update the cheap epoch/utxo atomic metrics
+                        // directly from the live ledger state — without
+                        // this, monitoring shows `dugite_epoch_number` /
+                        // `dugite_utxo_count` frozen at whatever value the
+                        // last `publish_ledger_view` left behind, making
+                        // the node appear stuck at epoch N for the entire
+                        // catch-up duration (issue: cosmetic but very
+                        // misleading).
+                        self.metrics.set_epoch(ls.epoch.0);
+                        self.metrics
+                            .set_utxo_count(ls.utxo.utxo_set.len() as u64);
                         let _ = self.ledger_tip_slot_tx.send(local_tip);
                     }
                     // Consume pending era transition and propagate to the HFC state machine.
