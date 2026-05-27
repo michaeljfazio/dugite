@@ -4305,9 +4305,49 @@ impl Node {
                 )
                 .await;
             match result {
-                Some(dugite_storage::AddBlockResult::AddedAsTip { .. })
-                | Some(dugite_storage::AddBlockResult::StoredAsFork)
-                | Some(dugite_storage::AddBlockResult::AlreadyKnown) => true,
+                Some(dugite_storage::AddBlockResult::AddedAsTip { .. }) => true,
+                Some(dugite_storage::AddBlockResult::StoredAsFork) => {
+                    // The block did NOT extend `selected_chain` — it sits in
+                    // VolatileDB as a side-fork tip (or as an out-of-order
+                    // gap on the canonical chain) and is waiting for the
+                    // intervening blocks to arrive so a future
+                    // `switch_to_fork` can succeed.  Applying it to the
+                    // ledger now would diverge `ledger.tip` from
+                    // `VolatileDB.selected_chain.tip`, which is exactly the
+                    // catch-up stall pattern observed under concurrent
+                    // BlockFetch from multiple peers: every subsequent
+                    // block sees a "stale" selected_chain tip, marks itself
+                    // `StoredAsFork`, the divergence cascades, and the
+                    // forecast-horizon disconnect terminates sync.
+                    //
+                    // The block is durable in VolatileDB; chain selection
+                    // will re-evaluate `fork_tips` on the next
+                    // `process_add_block` call.  When the missing ancestors
+                    // arrive `switch_to_fork` will succeed and the
+                    // `TriggeredFork` arm below will roll the ledger
+                    // forward through them in one batch.
+                    trace!(
+                        slot = block_slot.0,
+                        block = block_number.0,
+                        hash = %block_hash.to_hex(),
+                        "StoredAsFork — block on side fork / out-of-order; skipping ledger apply"
+                    );
+                    return;
+                }
+                Some(dugite_storage::AddBlockResult::AlreadyKnown) => {
+                    // The block is already in VolatileDB or ImmutableDB and
+                    // was either applied previously (canonical) or rejected
+                    // as a stale fork.  Re-applying would either no-op or
+                    // diverge; either way the caller's apply path is the
+                    // wrong place to handle it.
+                    trace!(
+                        slot = block_slot.0,
+                        block = block_number.0,
+                        hash = %block_hash.to_hex(),
+                        "AlreadyKnown — block already in ChainDB; skipping ledger apply"
+                    );
+                    return;
+                }
                 Some(dugite_storage::AddBlockResult::TriggeredFork {
                     intersection_hash,
                     intersection_slot,
