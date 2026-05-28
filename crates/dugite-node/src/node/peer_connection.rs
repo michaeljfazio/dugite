@@ -152,12 +152,21 @@ pub struct PeerConnection {
     /// KeepAlive client channel (protocol 8).
     pub(crate) keepalive_client_channel: Option<MuxChannel>,
 
-    /// PeerSharing client channel (protocol 10). Reserved for future use.
-    /// In Haskell, PeerSharing responder starts on-demand when the remote peer
-    /// sends a MsgShareRequest. The initiator sends requests periodically from
-    /// the Governor. Currently subscribed but no task is spawned for it —
-    /// PeerSharing integration is tracked separately.
-    #[allow(dead_code)]
+    /// PeerSharing client channel (protocol 10).
+    ///
+    /// In Haskell, the PeerSharing initiator is part of the `Established`
+    /// mini-protocol bundle — it runs for the lifetime of the warm (or hotter)
+    /// connection and loops on a per-peer mailbox waiting for governor-driven
+    /// share requests.  In dugite we mirror this: when a connection is promoted
+    /// to warm, `take_peersharing_client_channel()` hands this channel to the
+    /// spawned `peersharing_client_task` which loops waiting for request amounts
+    /// from `ConnectionLifecycleManager::peersharing_request_txs`.  The task
+    /// terminates (and the channel is consumed) when the connection is torn down
+    /// or the cancellation token fires.
+    ///
+    /// Reference:
+    /// `ouroboros-network/lib/Ouroboros/Network/PeerSharing.hs` —
+    /// `peerSharingClient` / `PeerSharingController`.
     pub(crate) peersharing_client_channel: Option<MuxChannel>,
 
     // ── Server protocol channels ──
@@ -933,6 +942,16 @@ impl PeerConnection {
     /// Check if hot protocols are currently running.
     pub fn has_hot_protocols(&self) -> bool {
         !self.hot_tasks.is_empty()
+    }
+
+    /// Take the PeerSharing client channel for use by the peersharing client task.
+    ///
+    /// Returns `None` if the channel is unavailable (not subscribed on this
+    /// connection, or already taken by a running task).  For inbound connections
+    /// that were accepted with `initiator_only = true`, the initiator-direction
+    /// channels are `None` and this correctly returns `None`.
+    pub(crate) fn take_peersharing_client_channel(&mut self) -> Option<MuxChannel> {
+        self.peersharing_client_channel.take()
     }
 
     /// Check whether the hot client protocol channels are still available for use.
