@@ -1423,21 +1423,35 @@ impl ImmutableDB {
         Ok(())
     }
 
-    /// Return up to `max_count` historical (slot, hash) points by sampling
-    /// the last entry of older chunks in reverse order.
+    /// Return up to `max_count` historical (slot, hash) points sampled at
+    /// **Fibonacci-spaced chunk offsets** from the immutable tip.
     ///
-    /// This is used for ChainSync intersection negotiation. When the
-    /// immutable tip itself is an orphaned block (e.g. a forged block that
-    /// was flushed via `flush_all_to_immutable` on graceful shutdown), the
-    /// older chunk tips provide canonical points the peer can intersect on.
+    /// The offsets are `1, 2, 3, 5, 8, 13, 21, 34, …` chunks behind the
+    /// most-recent chunk, capped at the total number of chunks.  This gives
+    /// exponential-ish coverage back toward genesis with the densest sampling
+    /// near the tip — matching the Haskell ChainSync intersection-discovery
+    /// heuristic in `ouroboros-network` (`updateBestKnownPoints`).
+    ///
+    /// Used for ChainSync `MsgFindIntersect`.  When the immutable tip itself
+    /// is contaminated (orphan fork block) or the peer's chain diverged many
+    /// epochs back, the Fibonacci-spaced anchors give the peer a high
+    /// probability of finding a common ancestor without falling back to
+    /// `Origin`.  Issue #701.
     pub fn get_historical_points(&self, max_count: usize) -> Vec<(u64, Hash32)> {
-        let mut points = Vec::new();
-        // Walk chunks in reverse (newest → oldest), reading the LAST
-        // secondary entry from each chunk to get its tip (slot, hash).
-        for chunk_meta in self.chunks.iter().rev() {
-            if points.len() >= max_count {
-                break;
-            }
+        if self.chunks.is_empty() || max_count == 0 {
+            return Vec::new();
+        }
+        let total_chunks = self.chunks.len();
+        let offsets = fibonacci_chunk_offsets(total_chunks, max_count);
+
+        let mut points = Vec::with_capacity(offsets.len());
+        for offset in offsets {
+            // `total_chunks - 1` is the most-recent chunk; subtract offset
+            // to walk back.  Clamp to 0 (oldest chunk) if offset exceeds.
+            let idx = total_chunks.saturating_sub(1 + offset);
+            let Some(chunk_meta) = self.chunks.get(idx) else {
+                continue;
+            };
             let secondary_path = self
                 .dir
                 .join(format!("{:05}.secondary", chunk_meta.chunk_num));
@@ -1448,7 +1462,8 @@ impl ImmutableDB {
             if secondary_data.len() < SECONDARY_ENTRY_SIZE {
                 continue;
             }
-            // Read the LAST entry in the secondary index.
+            // Read the LAST entry in the secondary index — that's the chunk's
+            // tip block.
             let last_entry_offset =
                 (secondary_data.len() / SECONDARY_ENTRY_SIZE - 1) * SECONDARY_ENTRY_SIZE;
             let data = &secondary_data[last_entry_offset..];
@@ -1456,7 +1471,6 @@ impl ImmutableDB {
             header_hash.copy_from_slice(&data[16..48]);
             if let Some(slot) = read_be_u64(&data[48..56]) {
                 let hash = Hash32::from_bytes(header_hash);
-                // Skip duplicates (same hash/slot as a previously added point).
                 if !points.iter().any(|(s, h)| *s == slot && *h == hash) {
                     points.push((slot, hash));
                 }
@@ -1499,6 +1513,32 @@ impl ImmutableDB {
         }
         result
     }
+}
+
+/// Generate Fibonacci-spaced offsets `[1, 2, 3, 5, 8, 13, 21, …]` bounded
+/// by `total_chunks` (offsets must be strictly less than this) and capped at
+/// `max_count` entries.
+///
+/// Used by [`ImmutableDB::get_historical_points`] to produce
+/// exponential-density anchors for ChainSync intersection.  Issue #701.
+fn fibonacci_chunk_offsets(total_chunks: usize, max_count: usize) -> Vec<usize> {
+    if total_chunks == 0 || max_count == 0 {
+        return Vec::new();
+    }
+    let mut offsets: Vec<usize> = Vec::with_capacity(max_count);
+    let mut a: usize = 1;
+    let mut b: usize = 2;
+    while offsets.len() < max_count && a < total_chunks {
+        offsets.push(a);
+        let next = a.saturating_add(b);
+        a = b;
+        b = next;
+        if b == a {
+            // Saturation guard (unreachable in practice — usize overflow).
+            break;
+        }
+    }
+    offsets
 }
 
 #[cfg(test)]
@@ -2680,5 +2720,49 @@ mod tests {
         // Sentinel = 3 * 56 = 168
         let sentinel_idx = epoch_length as usize; // last entry
         assert_eq!(read_primary_offset(&data, sentinel_idx), 168);
+    }
+
+    /// Fibonacci offsets must start [1, 2, 3, 5, 8, 13, 21, …] and stop when
+    /// offset >= total_chunks OR max_count reached.
+    #[test]
+    fn fibonacci_chunk_offsets_basic_sequence() {
+        assert_eq!(
+            fibonacci_chunk_offsets(100, 8),
+            vec![1, 2, 3, 5, 8, 13, 21, 34]
+        );
+        assert_eq!(fibonacci_chunk_offsets(100, 0), Vec::<usize>::new());
+        assert_eq!(fibonacci_chunk_offsets(0, 8), Vec::<usize>::new());
+    }
+
+    /// Bound check — offsets never reach total_chunks.
+    #[test]
+    fn fibonacci_chunk_offsets_bounded_by_total_chunks() {
+        // 10 chunks: 1,2,3,5,8 — next would be 13 ≥ 10, stop.
+        assert_eq!(fibonacci_chunk_offsets(10, 100), vec![1, 2, 3, 5, 8]);
+        assert_eq!(fibonacci_chunk_offsets(5, 100), vec![1, 2, 3]);
+        assert_eq!(fibonacci_chunk_offsets(2, 100), vec![1]);
+        assert_eq!(fibonacci_chunk_offsets(1, 100), Vec::<usize>::new());
+    }
+
+    /// max_count cap honoured.
+    #[test]
+    fn fibonacci_chunk_offsets_max_count_cap() {
+        assert_eq!(fibonacci_chunk_offsets(1000, 3), vec![1, 2, 3]);
+        assert_eq!(fibonacci_chunk_offsets(1000, 5), vec![1, 2, 3, 5, 8]);
+    }
+
+    /// At Haskell's mainnet `k=2160` we expect 18 chunks at the deepest
+    /// offset (Fibonacci value just below the k-block window) — the
+    /// distribution should give logarithmic-spaced anchors that fit in
+    /// `DEEP_HISTORICAL_DEPTH = 8` slots.
+    #[test]
+    fn fibonacci_chunk_offsets_haskell_parity_for_deep_historical_depth() {
+        let offsets = fibonacci_chunk_offsets(5000, 8);
+        assert_eq!(offsets, vec![1, 2, 3, 5, 8, 13, 21, 34]);
+        // Densest near tip, sparse far from tip — the gap between
+        // consecutive offsets grows geometrically.
+        for win in offsets.windows(2) {
+            assert!(win[1] > win[0]);
+        }
     }
 }

@@ -16,10 +16,12 @@
 //!    and the `GcSchedule` type in `Background.hs`.
 //!
 //! 3. **[`SnapshotScheduler`]** — Decides when to persist the LedgerSeq anchor
-//!    state to disk.  Triggers after every epoch boundary, every N blocks
-//!    (configurable, default 2 000), or on graceful shutdown.  The actual
-//!    persistence is carried out by a caller-supplied callback so that this
-//!    module remains free of any `dugite-ledger` dependency.
+//!    state to disk.  Triggers on epoch boundary, slot-delta thresholds, or
+//!    graceful shutdown — mirroring Haskell's `defaultSnapshotPolicy` in
+//!    `LedgerDB/Snapshots.hs` (slot interval `k * 2`, rate limit 10 min,
+//!    jitter `[5 min, 10 min]`).  The actual persistence is carried out by a
+//!    caller-supplied callback so that this module remains free of any
+//!    `dugite-ledger` dependency.
 //!
 //! # Haskell references
 //!
@@ -42,6 +44,7 @@ use std::time::{Duration, Instant};
 
 use dugite_primitives::hash::Hash32;
 use dugite_primitives::time::{BlockNo, EpochNo, SlotNo};
+use rand::Rng;
 use tracing::{debug, info, trace, warn};
 
 use crate::chain_db::ChainDB;
@@ -58,12 +61,40 @@ use crate::chain_db::ChainDB;
 /// reading the block) time to finish before the entry disappears.
 pub const GC_DELAY: Duration = Duration::from_secs(60);
 
-/// Default number of blocks between automatic ledger snapshots.
+/// Default slot interval between automatic ledger snapshots.
 ///
-/// Matches Haskell's normal-sync snapshot interval.  During bulk-sync (> 50 000
-/// blocks in one session) the caller may override this to a lower value via
-/// [`SnapshotScheduler::with_interval`].
-pub const DEFAULT_SNAPSHOT_INTERVAL: u64 = 2_000;
+/// Matches Haskell's `defInterval = k * 2` from
+/// `ouroboros-consensus/.../LedgerDB/Snapshots.hs` (lines 589-650).  With
+/// mainnet/preprod `k = 2160` this is 4320 slots ≈ 72 minutes at 1 s slot
+/// length.  For preview (`k = 432`) the caller should override via
+/// [`SnapshotScheduler::with_slot_interval`] to 864 slots.
+///
+/// The slot-based trigger is era-stable — Haskell deliberately uses
+/// `k * 2` slots rather than a block count because block density varies
+/// across eras (Byron has high block density vs Conway).  Using a fixed
+/// block count would over-snapshot in Byron and under-snapshot in Conway.
+pub const DEFAULT_SNAPSHOT_SLOT_INTERVAL: u64 = 4_320;
+
+/// Hard floor on the wall-clock gap between consecutive snapshots.
+///
+/// Matches Haskell's `defRateLimit = secondsToDiffTime (10 * 60)` (10 min).
+/// Prevents the slot-trigger from firing too frequently if the wall clock
+/// somehow runs faster than slot time (e.g., during testnet fast-forward
+/// or after a wake-from-suspend slot catch-up).
+pub const DEFAULT_SNAPSHOT_RATE_LIMIT: Duration = Duration::from_secs(600);
+
+/// Lower bound of the jitter window applied after a slot-interval trigger.
+///
+/// Matches Haskell's `fiveMinutes = 5 * 60`.  Once the slot delta exceeds
+/// the interval, the actual snapshot fire time is deferred by a uniform
+/// random delay in `[DEFAULT_SNAPSHOT_JITTER_MIN, DEFAULT_SNAPSHOT_JITTER_MAX]`
+/// to spread snapshot I/O load across a population of nodes.
+pub const DEFAULT_SNAPSHOT_JITTER_MIN: Duration = Duration::from_secs(5 * 60);
+
+/// Upper bound of the jitter window applied after a slot-interval trigger.
+///
+/// Matches Haskell's `tenMinutes = 10 * 60`.
+pub const DEFAULT_SNAPSHOT_JITTER_MAX: Duration = Duration::from_secs(10 * 60);
 
 // ─────────────────────────────────────────────────────────────────────────────
 // CopyToImmutable
@@ -341,67 +372,116 @@ impl Default for GcScheduler {
 /// Triggers a snapshot when any of the following conditions are met:
 ///
 /// 1. **Epoch boundary** — the current epoch number is greater than the epoch
-///    at the last snapshot (each epoch boundary produces a new anchor point
-///    that is worth persisting).
-/// 2. **Block interval** — more than `snapshot_interval` blocks have been
-///    applied since the last snapshot.
-/// 3. **Graceful shutdown** — the caller invokes [`SnapshotScheduler::request_shutdown_snapshot`]
-///    to force an immediate snapshot regardless of counters.
+///    at the last snapshot.
+/// 2. **Slot interval** — the slot delta since the last snapshot exceeds
+///    `snapshot_slot_interval` (default `k * 2`).  Subject to the rate limit
+///    and jitter described below.
+/// 3. **Graceful shutdown** — [`SnapshotScheduler::request_shutdown_snapshot`]
+///    forces an immediate snapshot regardless of counters.
 ///
 /// The actual I/O is performed by a caller-supplied `save_fn` closure.  This
 /// keeps `dugite-storage` free of any `dugite-ledger` dependency.
 ///
 /// # Haskell reference
 ///
-/// Matches the snapshot policy in Haskell's `Background.hs`:
-/// * Normal mode: every 72 minutes (approximately 2 160 slots on mainnet ≈ 1 epoch).
-/// * Bulk-sync mode: every 50 000 blocks + 6 minutes.
-/// * Max 2 snapshots retained on disk (managed by the caller).
+/// Mirrors `defaultSnapshotPolicy` in
+/// `ouroboros-consensus/src/ouroboros-consensus/Ouroboros/Consensus/Storage/LedgerDB/Snapshots.hs`
+/// (lines 589-650):
 ///
-/// Dugite approximates the time-based policy with a block-count policy
-/// (default every 2 000 blocks) which is simpler and equally effective.
+/// * `defInterval = k * 2` slots (the slot-based trigger).
+/// * `defRateLimit = 600 s` (10 min hard floor between any two snapshots).
+/// * `[fiveMinutes, tenMinutes] = [300, 600] s` random jitter applied after
+///   the slot trigger fires, so that the actual write time is offset by a
+///   uniform random delay in that window.
+///
+/// The slot-based trigger is era-stable — Haskell uses `k * 2` slots rather
+/// than a block count because block density varies across eras.  Issue #701.
 pub struct SnapshotScheduler {
-    /// Number of blocks between automatic snapshots.
-    snapshot_interval: u64,
-    /// Number of blocks processed since the last snapshot.
-    blocks_since_snapshot: u64,
+    /// Slot interval between snapshot triggers (Haskell `defInterval = k * 2`).
+    snapshot_slot_interval: u64,
+    /// Hard floor on wall-clock duration between consecutive snapshots
+    /// (Haskell `defRateLimit = 10 min`).
+    rate_limit: Duration,
+    /// Lower bound of the post-trigger jitter window.
+    jitter_min: Duration,
+    /// Upper bound of the post-trigger jitter window.
+    jitter_max: Duration,
+    /// Slot number of the most recently completed snapshot.  `None` until the
+    /// first snapshot is taken — in which case the next call to
+    /// [`Self::maybe_snapshot_check`] computes the delta against an implicit
+    /// origin slot of `0`, causing the trigger to fire immediately at startup
+    /// (mirrors Haskell's "first snapshot fires as soon as possible").
+    last_snapshot_slot: Option<SlotNo>,
+    /// Wall-clock instant of the most recently completed snapshot.  Used to
+    /// enforce the rate limit.
+    last_snapshot_time: Option<Instant>,
     /// Epoch number at the time of the last snapshot.
     last_snapshot_epoch: Option<EpochNo>,
-    /// Immediately take a snapshot on the next `maybe_snapshot` call.
+    /// When the slot trigger fires, the scheduler defers the actual snapshot
+    /// to this deadline (uniform random in `[jitter_min, jitter_max]` after
+    /// the trigger time).  Cleared when the snapshot is recorded.  Mirrors
+    /// Haskell's deferred-fire pattern.
+    pending_deadline: Option<Instant>,
+    /// Immediately take a snapshot on the next call regardless of counters.
     shutdown_requested: bool,
     /// Total number of snapshots taken.
     snapshots_taken: u64,
     /// When `true`, only fire snapshots at epoch boundaries (or on shutdown);
-    /// the block-interval trigger is suppressed.  This mirrors the
-    /// Haskell node's catch-up behaviour: snapshot I/O is wasted work during
-    /// rapid catch-up because (a) the next epoch boundary is usually closer
-    /// than the snapshot would be worth, and (b) the snapshot itself stalls
-    /// the apply loop.  Toggle this with [`Self::set_catchup_mode`] based on
-    /// the at-tip detector.
+    /// the slot-interval trigger is suppressed.  Toggle via
+    /// [`Self::set_catchup_mode`] based on the at-tip detector.
     catchup_mode: bool,
+    /// Diagnostic — what kind of trigger caused the most-recent decision to
+    /// return `true`.  Used by [`Self::last_decision_reason`] for logging.
+    last_decision: LastDecision,
 }
 
 impl SnapshotScheduler {
-    /// Create a new scheduler with the default snapshot interval.
+    /// Create a new scheduler with the default mainnet/preprod slot interval
+    /// (4 320 slots = `k * 2` for `k = 2160`).  Preview callers (`k = 432`)
+    /// should use [`Self::with_slot_interval`] with `864`.
     pub fn new() -> Self {
-        Self::with_interval(DEFAULT_SNAPSHOT_INTERVAL)
+        Self::with_slot_interval(DEFAULT_SNAPSHOT_SLOT_INTERVAL)
     }
 
-    /// Create a new scheduler with a custom snapshot interval.
-    pub fn with_interval(snapshot_interval: u64) -> Self {
+    /// Create a new scheduler with a custom slot interval.
+    ///
+    /// Pass `2 * k` for byte-exact alignment with the Haskell node.  All
+    /// other policy parameters (rate limit, jitter) use the Haskell defaults.
+    pub fn with_slot_interval(snapshot_slot_interval: u64) -> Self {
         Self {
-            snapshot_interval,
-            blocks_since_snapshot: 0,
+            snapshot_slot_interval,
+            rate_limit: DEFAULT_SNAPSHOT_RATE_LIMIT,
+            jitter_min: DEFAULT_SNAPSHOT_JITTER_MIN,
+            jitter_max: DEFAULT_SNAPSHOT_JITTER_MAX,
+            last_snapshot_slot: None,
+            last_snapshot_time: None,
             last_snapshot_epoch: None,
+            pending_deadline: None,
             shutdown_requested: false,
             snapshots_taken: 0,
             catchup_mode: false,
+            last_decision: LastDecision::None,
         }
+    }
+
+    /// Override the rate-limit / jitter window — primarily for tests that need
+    /// deterministic firing without waiting 5+ minutes of real time.
+    #[doc(hidden)]
+    pub fn with_test_timing(
+        mut self,
+        rate_limit: Duration,
+        jitter_min: Duration,
+        jitter_max: Duration,
+    ) -> Self {
+        self.rate_limit = rate_limit;
+        self.jitter_min = jitter_min;
+        self.jitter_max = jitter_max;
+        self
     }
 
     /// Enable or disable catch-up mode.
     ///
-    /// In catch-up mode the block-interval snapshot trigger is suppressed;
+    /// In catch-up mode the slot-interval snapshot trigger is suppressed;
     /// only epoch-boundary and shutdown triggers fire.  See
     /// [`Self::catchup_mode`] for rationale.  Returns `true` if the mode
     /// changed (caller may want to log the transition).
@@ -416,73 +496,39 @@ impl SnapshotScheduler {
         self.catchup_mode
     }
 
-    /// Record that one block has been applied and check whether a snapshot
-    /// should be taken.
+    /// Slot interval between snapshot triggers.
+    pub fn snapshot_slot_interval(&self) -> u64 {
+        self.snapshot_slot_interval
+    }
+
+    /// One-shot combined check + save.
     ///
-    /// Call this after each block is appended to the selected chain.  If a
-    /// snapshot is warranted `save_fn` is invoked; on success the internal
-    /// counters are reset.
-    ///
-    /// # Parameters
-    ///
-    /// * `current_epoch` — The epoch number of the block that was just applied.
-    ///   Used to detect epoch-boundary triggers.
-    /// * `block_no` — Block number of the block just applied (for logging).
-    /// * `save_fn` — Closure that persists the LedgerSeq anchor state to disk.
-    ///   Returns `Ok(())` on success or an error description on failure.
-    ///   The closure is only called when a snapshot is actually warranted.
-    ///
-    /// # Returns
-    ///
-    /// `true` if a snapshot was (attempted to be) taken this call.
+    /// Most callers should use the split API
+    /// ([`Self::maybe_snapshot_check`] + [`Self::record_snapshot_taken`]) so
+    /// the borrow on the scheduler can be released across an async save call.
+    /// This convenience form is kept for test use and small synchronous
+    /// callers.
     pub fn maybe_snapshot(
         &mut self,
         current_epoch: EpochNo,
+        current_slot: SlotNo,
         block_no: BlockNo,
         save_fn: &mut dyn FnMut() -> Result<(), String>,
     ) -> bool {
-        self.blocks_since_snapshot += 1;
-
-        let epoch_boundary = match self.last_snapshot_epoch {
-            None => true, // First snapshot always triggers at epoch boundary
-            Some(last) => current_epoch > last,
-        };
-        // In catch-up mode the block-interval trigger is suppressed: snapshots
-        // only fire at epoch boundaries (or shutdown).  The block counter
-        // still ticks so that the first batch after switching back to at-tip
-        // can immediately retry without waiting another interval.
-        let interval_reached =
-            !self.catchup_mode && self.blocks_since_snapshot >= self.snapshot_interval;
-        let shutdown = self.shutdown_requested;
-
-        let should_snapshot = epoch_boundary || interval_reached || shutdown;
-
-        if !should_snapshot {
+        if !self.maybe_snapshot_check_at(current_epoch, current_slot, Instant::now()) {
             return false;
         }
-
-        let reason = if shutdown {
-            "graceful shutdown"
-        } else if epoch_boundary {
-            "epoch boundary"
-        } else {
-            "block interval"
-        };
-
+        let reason = self.last_decision_reason();
         info!(
             reason,
             block_no = block_no.0,
             epoch = current_epoch.0,
-            blocks_since_last = self.blocks_since_snapshot,
+            slot = current_slot.0,
             "SnapshotScheduler: saving ledger anchor snapshot"
         );
-
         match save_fn() {
             Ok(()) => {
-                self.blocks_since_snapshot = 0;
-                self.last_snapshot_epoch = Some(current_epoch);
-                self.shutdown_requested = false;
-                self.snapshots_taken += 1;
+                self.record_snapshot_taken_at(current_epoch, current_slot, Instant::now());
                 debug!(
                     snapshots_taken = self.snapshots_taken,
                     "SnapshotScheduler: snapshot saved successfully"
@@ -495,66 +541,164 @@ impl SnapshotScheduler {
                     block_no = block_no.0,
                     "SnapshotScheduler: snapshot save failed"
                 );
-                // Do not reset counters — retry next block.
                 false
             }
         }
     }
 
-    /// Check whether a snapshot *should* be taken at the current block without
+    /// Check whether a snapshot *should* be taken at the current slot without
     /// actually triggering the save.
     ///
-    /// This is a split version of [`maybe_snapshot`] for callers that need to
-    /// release the borrow on the scheduler before calling the (async) save
-    /// function, then call [`record_snapshot_taken`] afterwards.
+    /// This is the production entry point.  Returns `true` when:
     ///
-    /// The block counter is incremented on every call, matching [`maybe_snapshot`].
+    /// 1. `shutdown_requested` is set, or
+    /// 2. the current epoch is greater than the last-snapshot epoch (and the
+    ///    rate limit has elapsed), or
+    /// 3. the slot delta exceeds `snapshot_slot_interval`, the jittered
+    ///    deadline has elapsed, and the rate limit has elapsed.
     ///
-    /// # Returns
+    /// The first slot-interval trigger sets a deferred deadline (uniform
+    /// random in `[jitter_min, jitter_max]` from "now").  Subsequent calls
+    /// return `false` until that deadline elapses.  After firing, callers
+    /// MUST call [`Self::record_snapshot_taken`] to clear the pending state
+    /// and arm the next interval.
     ///
-    /// `true` when a snapshot is warranted (epoch boundary, interval reached,
-    /// or shutdown requested).
-    ///
-    /// [`maybe_snapshot`]: SnapshotScheduler::maybe_snapshot
-    /// [`record_snapshot_taken`]: SnapshotScheduler::record_snapshot_taken
-    pub fn maybe_snapshot_check(&mut self, current_epoch: EpochNo, _block_no: BlockNo) -> bool {
-        self.blocks_since_snapshot += 1;
+    /// `block_no` is logged for diagnostics; the firing decision is purely
+    /// slot- and clock-based.
+    pub fn maybe_snapshot_check(&mut self, current_epoch: EpochNo, current_slot: SlotNo) -> bool {
+        self.maybe_snapshot_check_at(current_epoch, current_slot, Instant::now())
+    }
 
+    /// Internal: same as [`Self::maybe_snapshot_check`] but accepts an
+    /// injected `Instant` for deterministic unit testing of the rate
+    /// limit and jitter window.
+    pub fn maybe_snapshot_check_at(
+        &mut self,
+        current_epoch: EpochNo,
+        current_slot: SlotNo,
+        now: Instant,
+    ) -> bool {
+        // 1. Shutdown — always fires immediately, no rate limit / jitter.
+        if self.shutdown_requested {
+            self.last_decision = LastDecision::Shutdown;
+            return true;
+        }
+
+        // Rate limit must be satisfied before any slot or epoch trigger can
+        // fire (matches Haskell `defRateLimit`).  Skip rate-limit on first
+        // snapshot.
+        let rate_limit_ok = self
+            .last_snapshot_time
+            .map(|t| now.saturating_duration_since(t) >= self.rate_limit)
+            .unwrap_or(true);
+
+        // 2. Epoch boundary.
         let epoch_boundary = match self.last_snapshot_epoch {
-            None => true,
+            None => true, // First snapshot always triggers
             Some(last) => current_epoch > last,
         };
-        // In catch-up mode the block-interval trigger is suppressed; see the
-        // corresponding gate in [`Self::maybe_snapshot`].
-        let interval_reached =
-            !self.catchup_mode && self.blocks_since_snapshot >= self.snapshot_interval;
-        let shutdown = self.shutdown_requested;
+        if epoch_boundary && rate_limit_ok {
+            self.last_decision = LastDecision::EpochBoundary;
+            // Epoch boundary clears any pending slot-trigger deadline — it
+            // supersedes the slower slot interval.
+            self.pending_deadline = None;
+            return true;
+        }
 
-        epoch_boundary || interval_reached || shutdown
+        // 3. Slot interval (suppressed in catch-up mode).
+        if self.catchup_mode {
+            return false;
+        }
+        let slot_delta = current_slot
+            .0
+            .saturating_sub(self.last_snapshot_slot.map(|s| s.0).unwrap_or(0));
+        if slot_delta < self.snapshot_slot_interval {
+            return false;
+        }
+
+        // Slot trigger conditions met — either set the deferred deadline or
+        // check whether it has elapsed.
+        match self.pending_deadline {
+            None => {
+                // Arm the deferred fire.
+                let jitter = self.draw_jitter();
+                let deadline = now + jitter;
+                self.pending_deadline = Some(deadline);
+                debug!(
+                    epoch = current_epoch.0,
+                    slot = current_slot.0,
+                    slot_delta,
+                    jitter_secs = jitter.as_secs(),
+                    "SnapshotScheduler: slot trigger fired, deferring snapshot",
+                );
+                false
+            }
+            Some(deadline) => {
+                if now >= deadline && rate_limit_ok {
+                    self.last_decision = LastDecision::SlotInterval;
+                    true
+                } else {
+                    false
+                }
+            }
+        }
+    }
+
+    /// Draw a uniform random jitter delay in `[jitter_min, jitter_max]`.
+    fn draw_jitter(&self) -> Duration {
+        if self.jitter_max <= self.jitter_min {
+            return self.jitter_min;
+        }
+        let span = self.jitter_max - self.jitter_min;
+        let span_micros = span.as_micros().min(u64::MAX as u128) as u64;
+        let mut rng = rand::rng();
+        let offset_micros = rng.random_range(0..=span_micros);
+        self.jitter_min + Duration::from_micros(offset_micros)
+    }
+
+    /// String describing the most recent firing decision (for logging).
+    fn last_decision_reason(&self) -> &'static str {
+        match self.last_decision {
+            LastDecision::Shutdown => "graceful shutdown",
+            LastDecision::EpochBoundary => "epoch boundary",
+            LastDecision::SlotInterval => "slot interval",
+            LastDecision::None => "unknown",
+        }
     }
 
     /// Record that a snapshot was successfully taken.
     ///
-    /// Resets the block counter and stores the epoch of the snapshot.
-    /// Call this immediately after the save completes successfully, paired
-    /// with a prior call to [`maybe_snapshot_check`] that returned `true`.
-    ///
-    /// [`maybe_snapshot_check`]: SnapshotScheduler::maybe_snapshot_check
-    pub fn record_snapshot_taken(&mut self, current_epoch: EpochNo) {
-        self.blocks_since_snapshot = 0;
+    /// Resets the slot/time/epoch anchors and clears the pending-deadline
+    /// state.  Pair with a prior [`Self::maybe_snapshot_check`] that returned
+    /// `true`.
+    pub fn record_snapshot_taken(&mut self, current_epoch: EpochNo, current_slot: SlotNo) {
+        self.record_snapshot_taken_at(current_epoch, current_slot, Instant::now());
+    }
+
+    /// Internal: same as [`Self::record_snapshot_taken`] with an injected
+    /// `Instant` for deterministic unit testing.
+    pub fn record_snapshot_taken_at(
+        &mut self,
+        current_epoch: EpochNo,
+        current_slot: SlotNo,
+        now: Instant,
+    ) {
+        self.last_snapshot_slot = Some(current_slot);
+        self.last_snapshot_time = Some(now);
         self.last_snapshot_epoch = Some(current_epoch);
+        self.pending_deadline = None;
         self.shutdown_requested = false;
         self.snapshots_taken += 1;
         debug!(
             snapshots_taken = self.snapshots_taken,
-            "SnapshotScheduler: snapshot recorded (split API)"
+            epoch = current_epoch.0,
+            slot = current_slot.0,
+            "SnapshotScheduler: snapshot recorded"
         );
     }
 
-    /// Force a snapshot on the next [`maybe_snapshot`] call regardless of
-    /// counters.  Call this when initiating a graceful shutdown.
-    ///
-    /// [`maybe_snapshot`]: SnapshotScheduler::maybe_snapshot
+    /// Force a snapshot on the next check call regardless of counters.
+    /// Call this when initiating a graceful shutdown.
     pub fn request_shutdown_snapshot(&mut self) {
         self.shutdown_requested = true;
     }
@@ -564,16 +708,25 @@ impl SnapshotScheduler {
         self.snapshots_taken
     }
 
-    /// Number of blocks applied since the last snapshot.
-    pub fn blocks_since_snapshot(&self) -> u64 {
-        self.blocks_since_snapshot
+    /// Slot of the most recently completed snapshot, if any.
+    pub fn last_snapshot_slot(&self) -> Option<SlotNo> {
+        self.last_snapshot_slot
     }
 
-    /// Reset the block counter to zero (e.g. after an external snapshot was
-    /// taken by another subsystem).
-    pub fn reset_counter(&mut self) {
-        self.blocks_since_snapshot = 0;
+    /// `true` while the scheduler is holding a deferred-fire deadline armed
+    /// (i.e. the slot trigger fired but the jitter delay has not yet
+    /// elapsed).
+    pub fn has_pending_deadline(&self) -> bool {
+        self.pending_deadline.is_some()
     }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LastDecision {
+    None,
+    Shutdown,
+    EpochBoundary,
+    SlotInterval,
 }
 
 impl Default for SnapshotScheduler {
@@ -821,218 +974,246 @@ mod tests {
         assert_eq!(scheduler.pending_count(), 1, "one pending entry remains");
     }
 
-    // ── SnapshotScheduler ────────────────────────────────────────────────────
+    // ── SnapshotScheduler (slot-based + jitter, #701) ───────────────────────
 
-    /// Test that the scheduler triggers at the configured block interval.
-    #[test]
-    fn snapshot_scheduler_triggers_at_interval() {
-        let interval = 5u64;
-        let mut sched = SnapshotScheduler::with_interval(interval);
-
-        let mut snapshots = 0usize;
-        let epoch = EpochNo(0);
-
-        // First call: epoch_boundary triggers (last_snapshot_epoch is None).
-        let triggered = sched.maybe_snapshot(epoch, BlockNo(1), &mut || {
-            snapshots += 1;
-            Ok(())
-        });
-        assert!(triggered, "first call should trigger (epoch boundary)");
-        assert_eq!(snapshots, 1);
-
-        // Next interval-1 calls: no trigger (same epoch, not enough blocks).
-        for i in 2..(interval + 1) {
-            let triggered = sched.maybe_snapshot(epoch, BlockNo(i), &mut || {
-                snapshots += 1;
-                Ok(())
-            });
-            assert!(!triggered, "should not trigger before interval");
-        }
-        assert_eq!(snapshots, 1);
-
-        // interval-th call: block count threshold hit.
-        let triggered = sched.maybe_snapshot(epoch, BlockNo(interval + 1), &mut || {
-            snapshots += 1;
-            Ok(())
-        });
-        assert!(triggered, "should trigger at block interval");
-        assert_eq!(snapshots, 2);
+    /// Helper — build a scheduler with deterministic timing for tests:
+    /// rate_limit = 0, jitter_min = jitter_max = 0.  This collapses the
+    /// jittered fire to "fire on the call that crosses the slot threshold,"
+    /// matching the old block-count behaviour while preserving the slot-based
+    /// trigger semantics.
+    fn test_scheduler(slot_interval: u64) -> SnapshotScheduler {
+        SnapshotScheduler::with_slot_interval(slot_interval).with_test_timing(
+            Duration::ZERO,
+            Duration::ZERO,
+            Duration::ZERO,
+        )
     }
 
-    /// Catch-up mode suppresses the block-interval trigger but preserves the
+    /// First call always fires (epoch-boundary semantics: no last snapshot).
+    #[test]
+    fn snapshot_scheduler_first_call_fires_via_epoch_boundary() {
+        let mut sched = test_scheduler(100);
+        let t0 = Instant::now();
+        let mut snapshots = 0usize;
+        let fired = sched.maybe_snapshot_check_at(EpochNo(0), SlotNo(1), t0);
+        assert!(fired, "first call always fires");
+        if fired {
+            sched.record_snapshot_taken_at(EpochNo(0), SlotNo(1), t0);
+            snapshots += 1;
+        }
+        assert_eq!(snapshots, 1);
+        assert_eq!(sched.snapshots_taken(), 1);
+        assert_eq!(sched.last_snapshot_slot(), Some(SlotNo(1)));
+    }
+
+    /// Slot-based trigger arms a deadline when
+    /// `current_slot - last_snapshot_slot >= interval`, and fires on the
+    /// next call after the deadline elapses.
+    ///
+    /// `test_scheduler` uses zero jitter, so the deadline elapses immediately
+    /// — the trigger fires on the very next call.
+    #[test]
+    fn snapshot_scheduler_slot_trigger_fires_at_interval() {
+        let mut sched = test_scheduler(100);
+        let t0 = Instant::now();
+
+        // First snapshot at slot 1.
+        assert!(sched.maybe_snapshot_check_at(EpochNo(0), SlotNo(1), t0));
+        sched.record_snapshot_taken_at(EpochNo(0), SlotNo(1), t0);
+
+        // Slot 50 — delta 49 < 100, no fire, no pending deadline.
+        assert!(!sched.maybe_snapshot_check_at(EpochNo(0), SlotNo(50), t0));
+        assert!(!sched.has_pending_deadline());
+
+        // Slot 101 — delta 100 == interval, ARMS a (zero-duration) deadline.
+        assert!(!sched.maybe_snapshot_check_at(EpochNo(0), SlotNo(101), t0));
+        assert!(sched.has_pending_deadline(), "deadline should be armed");
+
+        // Next call — deadline elapsed (zero duration), fires.
+        assert!(sched.maybe_snapshot_check_at(EpochNo(0), SlotNo(101), t0));
+        sched.record_snapshot_taken_at(EpochNo(0), SlotNo(101), t0);
+        assert!(!sched.has_pending_deadline());
+
+        // Slot 150 — delta 49 < 100, no fire.
+        assert!(!sched.maybe_snapshot_check_at(EpochNo(0), SlotNo(150), t0));
+    }
+
+    /// Epoch boundary fires regardless of slot delta.
+    #[test]
+    fn snapshot_scheduler_epoch_boundary_supersedes_slot_interval() {
+        let mut sched = test_scheduler(10_000);
+        let t0 = Instant::now();
+
+        assert!(sched.maybe_snapshot_check_at(EpochNo(0), SlotNo(1), t0));
+        sched.record_snapshot_taken_at(EpochNo(0), SlotNo(1), t0);
+
+        // Stay in epoch 0, slot delta 5 — no fire (interval is 10k).
+        assert!(!sched.maybe_snapshot_check_at(EpochNo(0), SlotNo(6), t0));
+
+        // Bump to epoch 1 — fires via epoch boundary even though slot delta < interval.
+        assert!(sched.maybe_snapshot_check_at(EpochNo(1), SlotNo(6), t0));
+    }
+
+    /// Catch-up mode suppresses the slot-interval trigger but preserves the
     /// epoch-boundary trigger and the shutdown trigger.
     #[test]
-    fn snapshot_scheduler_catchup_mode_suppresses_block_interval() {
-        let interval = 5u64;
-        let mut sched = SnapshotScheduler::with_interval(interval);
-        assert!(!sched.is_catchup_mode());
+    fn snapshot_scheduler_catchup_mode_suppresses_slot_interval() {
+        let mut sched = test_scheduler(100);
+        let t0 = Instant::now();
         assert!(sched.set_catchup_mode(true));
         assert!(sched.is_catchup_mode());
-        // A second call with the same value should report no change.
         assert!(!sched.set_catchup_mode(true));
 
-        let mut snapshots = 0usize;
-        let epoch = EpochNo(0);
+        // First call: epoch-boundary still fires.
+        assert!(sched.maybe_snapshot_check_at(EpochNo(0), SlotNo(1), t0));
+        sched.record_snapshot_taken_at(EpochNo(0), SlotNo(1), t0);
 
-        // First call: epoch_boundary still fires (last_snapshot_epoch == None
-        // is treated as an epoch boundary).  Catch-up mode only gates the
-        // block-interval trigger.
-        let triggered = sched.maybe_snapshot(epoch, BlockNo(1), &mut || {
-            snapshots += 1;
-            Ok(())
-        });
-        assert!(triggered, "first call should trigger via epoch boundary");
-        assert_eq!(snapshots, 1);
-
-        // Run well past the configured interval without any epoch change —
-        // catch-up mode must keep returning false.
-        for i in 2..(interval * 5) {
-            let triggered = sched.maybe_snapshot(epoch, BlockNo(i), &mut || {
-                snapshots += 1;
-                Ok(())
-            });
+        // Even far past the slot interval, no fire in catch-up mode.
+        for s in [200u64, 500, 1000, 5000] {
             assert!(
-                !triggered,
-                "block-interval trigger must be suppressed in catch-up mode"
+                !sched.maybe_snapshot_check_at(EpochNo(0), SlotNo(s), t0),
+                "slot {s}: slot trigger must be suppressed in catch-up mode"
             );
         }
-        assert_eq!(snapshots, 1);
 
         // Epoch boundary still fires.
-        let triggered = sched.maybe_snapshot(EpochNo(1), BlockNo(100), &mut || {
-            snapshots += 1;
-            Ok(())
-        });
-        assert!(triggered, "epoch boundary must still fire in catch-up mode");
-        assert_eq!(snapshots, 2);
-
-        // Switching back to at-tip restores the block-interval trigger; the
-        // counter has been ticking through the suppression window so the
-        // next interval point should fire immediately if it has been hit.
-        sched.set_catchup_mode(false);
-        // Burn through up to interval more blocks within the same epoch.
-        for i in 101..(101 + interval) {
-            let _ = sched.maybe_snapshot(EpochNo(1), BlockNo(i), &mut || {
-                snapshots += 1;
-                Ok(())
-            });
-        }
-        assert!(
-            snapshots >= 3,
-            "interval trigger should fire within {} blocks of returning to at-tip",
-            interval
-        );
+        assert!(sched.maybe_snapshot_check_at(EpochNo(1), SlotNo(10_000), t0));
     }
 
-    /// Test that the scheduler triggers at epoch boundaries regardless of
-    /// the block counter.
-    #[test]
-    fn snapshot_scheduler_triggers_at_epoch_boundary() {
-        let mut sched = SnapshotScheduler::with_interval(10_000);
-
-        let mut snapshots = 0usize;
-
-        // Epoch 0, block 1 — triggers because last_snapshot_epoch is None.
-        sched.maybe_snapshot(EpochNo(0), BlockNo(1), &mut || {
-            snapshots += 1;
-            Ok(())
-        });
-        assert_eq!(snapshots, 1);
-
-        // Epoch 0, blocks 2-5 — no trigger (same epoch, interval not reached).
-        for i in 2..=5 {
-            sched.maybe_snapshot(EpochNo(0), BlockNo(i), &mut || {
-                snapshots += 1;
-                Ok(())
-            });
-        }
-        assert_eq!(snapshots, 1, "no snapshot between epochs");
-
-        // Epoch 1, block 6 — triggers because epoch changed.
-        let triggered = sched.maybe_snapshot(EpochNo(1), BlockNo(6), &mut || {
-            snapshots += 1;
-            Ok(())
-        });
-        assert!(triggered, "epoch boundary should trigger snapshot");
-        assert_eq!(snapshots, 2);
-    }
-
-    /// Test that requesting a shutdown snapshot forces the next call.
+    /// Shutdown trigger fires regardless of any other constraint.
     #[test]
     fn snapshot_scheduler_shutdown_forces_snapshot() {
-        let mut sched = SnapshotScheduler::with_interval(10_000);
+        let mut sched = test_scheduler(10_000);
+        let t0 = Instant::now();
+        sched.maybe_snapshot_check_at(EpochNo(0), SlotNo(1), t0);
+        sched.record_snapshot_taken_at(EpochNo(0), SlotNo(1), t0);
 
-        // Advance past the initial epoch-boundary trigger.
-        let epoch = EpochNo(0);
-        sched.maybe_snapshot(epoch, BlockNo(1), &mut || Ok(()));
+        // No trigger before shutdown.
+        assert!(!sched.maybe_snapshot_check_at(EpochNo(0), SlotNo(2), t0));
 
-        // No snapshot expected mid-interval.
-        let triggered = sched.maybe_snapshot(epoch, BlockNo(2), &mut || {
-            panic!("should not be called");
-        });
-        assert!(!triggered);
-
-        // Request shutdown snapshot.
+        // Request shutdown — next call fires.
         sched.request_shutdown_snapshot();
+        assert!(sched.maybe_snapshot_check_at(EpochNo(0), SlotNo(3), t0));
+        sched.record_snapshot_taken_at(EpochNo(0), SlotNo(3), t0);
 
-        let mut snapshots = 0usize;
-        let triggered = sched.maybe_snapshot(epoch, BlockNo(3), &mut || {
-            snapshots += 1;
-            Ok(())
-        });
-        assert!(triggered, "shutdown snapshot must be taken");
-        assert_eq!(snapshots, 1);
-
-        // After shutdown snapshot, shutdown_requested is cleared.
-        let triggered = sched.maybe_snapshot(epoch, BlockNo(4), &mut || {
-            panic!("should not be called again immediately");
-        });
-        assert!(!triggered, "shutdown flag should be cleared after use");
+        // After record, shutdown flag is cleared and no immediate re-fire.
+        assert!(!sched.maybe_snapshot_check_at(EpochNo(0), SlotNo(4), t0));
     }
 
-    /// Test that the `snapshots_taken` counter is incremented correctly.
+    /// snapshots_taken counter increments correctly.
     #[test]
     fn snapshot_scheduler_counts_snapshots() {
-        let mut sched = SnapshotScheduler::with_interval(2);
+        let mut sched = test_scheduler(100);
+        let t0 = Instant::now();
         assert_eq!(sched.snapshots_taken(), 0);
 
-        let epoch = EpochNo(0);
-        // Block 1: epoch-boundary trigger.
-        sched.maybe_snapshot(epoch, BlockNo(1), &mut || Ok(()));
+        // First snapshot via epoch boundary.
+        sched.maybe_snapshot_check_at(EpochNo(0), SlotNo(1), t0);
+        sched.record_snapshot_taken_at(EpochNo(0), SlotNo(1), t0);
         assert_eq!(sched.snapshots_taken(), 1);
 
-        // Block 2: counter reset → blocks_since_snapshot = 1, no trigger.
-        sched.maybe_snapshot(epoch, BlockNo(2), &mut || Ok(()));
-        assert_eq!(sched.snapshots_taken(), 1);
-
-        // Block 3: blocks_since_snapshot = 2 → trigger.
-        sched.maybe_snapshot(epoch, BlockNo(3), &mut || Ok(()));
+        // Slot trigger requires two calls (arm + fire) even with zero jitter.
+        assert!(!sched.maybe_snapshot_check_at(EpochNo(0), SlotNo(101), t0));
+        assert!(sched.maybe_snapshot_check_at(EpochNo(0), SlotNo(101), t0));
+        sched.record_snapshot_taken_at(EpochNo(0), SlotNo(101), t0);
         assert_eq!(sched.snapshots_taken(), 2);
     }
 
-    /// Test that a failed save_fn does not reset the counters, allowing a
-    /// retry on the next call.
+    /// Jitter window — when configured, the slot trigger arms a pending
+    /// deadline and the check returns false until the deadline elapses.
+    /// This pins the Haskell deferred-fire semantics.
     #[test]
-    fn snapshot_scheduler_retry_on_error() {
-        let mut sched = SnapshotScheduler::with_interval(10_000);
+    fn snapshot_scheduler_slot_trigger_jitter_deferral() {
+        let mut sched = SnapshotScheduler::with_slot_interval(100).with_test_timing(
+            Duration::ZERO,
+            Duration::from_millis(100),
+            Duration::from_millis(100),
+        );
+        let t0 = Instant::now();
 
-        // First call fails.
-        let triggered =
-            sched.maybe_snapshot(EpochNo(0), BlockNo(1), &mut || Err("disk full".to_string()));
-        // It was attempted (returned false because save failed).
-        assert!(!triggered, "save failure → returns false");
-        assert_eq!(sched.snapshots_taken(), 0);
-        // Counter was NOT reset.
+        // First snapshot at slot 1 via epoch boundary (no deferral on epoch
+        // boundary).
+        assert!(sched.maybe_snapshot_check_at(EpochNo(0), SlotNo(1), t0));
+        sched.record_snapshot_taken_at(EpochNo(0), SlotNo(1), t0);
+
+        // Slot 101 crosses the interval — the first check should ARM a
+        // deferred deadline but NOT fire.
+        assert!(!sched.maybe_snapshot_check_at(EpochNo(0), SlotNo(101), t0));
         assert!(
-            sched.blocks_since_snapshot() >= 1,
-            "counter must not reset on error"
+            sched.has_pending_deadline(),
+            "slot trigger should arm a pending deadline"
         );
 
-        // Second call succeeds — epoch boundary still active (same epoch,
-        // last_snapshot_epoch is still None because the first attempt failed).
-        let triggered = sched.maybe_snapshot(EpochNo(0), BlockNo(2), &mut || Ok(()));
-        assert!(triggered, "retry on next block must succeed");
-        assert_eq!(sched.snapshots_taken(), 1);
+        // Same slot, same `now` — deadline still in the future.
+        assert!(!sched.maybe_snapshot_check_at(EpochNo(0), SlotNo(101), t0));
+
+        // 100 ms later — deadline elapsed, fires.
+        let t1 = t0 + Duration::from_millis(101);
+        assert!(sched.maybe_snapshot_check_at(EpochNo(0), SlotNo(101), t1));
+        sched.record_snapshot_taken_at(EpochNo(0), SlotNo(101), t1);
+        assert!(!sched.has_pending_deadline());
+    }
+
+    /// Rate limit — even when the slot interval has fired, the wall-clock
+    /// gap to the last snapshot must be at least `rate_limit`.
+    #[test]
+    fn snapshot_scheduler_respects_rate_limit() {
+        let mut sched = SnapshotScheduler::with_slot_interval(100).with_test_timing(
+            Duration::from_millis(500), // rate limit
+            Duration::ZERO,
+            Duration::ZERO,
+        );
+        let t0 = Instant::now();
+        sched.maybe_snapshot_check_at(EpochNo(0), SlotNo(1), t0);
+        sched.record_snapshot_taken_at(EpochNo(0), SlotNo(1), t0);
+
+        // Slot interval crossed, but only 100 ms after last snapshot — rate
+        // limit not satisfied.
+        let t1 = t0 + Duration::from_millis(100);
+        assert!(!sched.maybe_snapshot_check_at(EpochNo(0), SlotNo(101), t1));
+
+        // 600 ms after last snapshot — rate limit satisfied, fires.
+        let t2 = t0 + Duration::from_millis(600);
+        assert!(sched.maybe_snapshot_check_at(EpochNo(0), SlotNo(101), t2));
+    }
+
+    /// Constants — Haskell parity check.  These values are load-bearing for
+    /// production behaviour and must not regress silently.  See
+    /// `defaultSnapshotPolicy` in
+    /// `ouroboros-consensus/src/.../Snapshots.hs`.
+    #[test]
+    fn snapshot_scheduler_haskell_defaults_pinned() {
+        assert_eq!(
+            DEFAULT_SNAPSHOT_SLOT_INTERVAL, 4_320,
+            "defInterval = k*2 with k=2160"
+        );
+        assert_eq!(
+            DEFAULT_SNAPSHOT_RATE_LIMIT,
+            Duration::from_secs(600),
+            "defRateLimit = 10 min"
+        );
+        assert_eq!(
+            DEFAULT_SNAPSHOT_JITTER_MIN,
+            Duration::from_secs(5 * 60),
+            "fiveMinutes"
+        );
+        assert_eq!(
+            DEFAULT_SNAPSHOT_JITTER_MAX,
+            Duration::from_secs(10 * 60),
+            "tenMinutes"
+        );
+    }
+
+    /// Sanity: configured slot interval is exposed via the accessor.
+    #[test]
+    fn snapshot_scheduler_slot_interval_accessor() {
+        let sched = SnapshotScheduler::with_slot_interval(864);
+        assert_eq!(sched.snapshot_slot_interval(), 864);
+        let sched = SnapshotScheduler::new();
+        assert_eq!(
+            sched.snapshot_slot_interval(),
+            DEFAULT_SNAPSHOT_SLOT_INTERVAL
+        );
     }
 
     /// Test that GcScheduler::pending_count returns correct values.

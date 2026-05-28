@@ -132,6 +132,24 @@ pub struct RollbackAnnouncement {
     pub hash: [u8; 32],
 }
 
+/// Lower bound of the ChainSync `StMustReply` (`MsgAwaitReply`) timeout.
+///
+/// Matches Haskell's `minChainSyncTimeout = 601` seconds from
+/// `ouroboros-network/protocols/lib/Ouroboros/Network/Protocol/ChainSync/Codec.hs`.
+/// Each ChainSync server draws a uniform-random timeout in
+/// `[CHAINSYNC_MUST_REPLY_TIMEOUT_MIN, CHAINSYNC_MUST_REPLY_TIMEOUT_MAX]` at
+/// connection time and reuses it for every wait-at-tip cycle.  The randomized
+/// per-peer draw prevents synchronized re-poll storms across a population of
+/// peers and matches the [99.9-99.9999%] block-arrival window for f=0.05.
+/// Issue #701.
+pub const CHAINSYNC_MUST_REPLY_TIMEOUT_MIN: Duration = Duration::from_secs(601);
+
+/// Upper bound of the ChainSync `StMustReply` (`MsgAwaitReply`) timeout.
+///
+/// Matches Haskell's `maxChainSyncTimeout = 911` seconds (see
+/// [`CHAINSYNC_MUST_REPLY_TIMEOUT_MIN`]).  Issue #701.
+pub const CHAINSYNC_MUST_REPLY_TIMEOUT_MAX: Duration = Duration::from_secs(911);
+
 /// ChainSync server that serves headers to a single downstream peer.
 pub struct ChainSyncServer {
     /// Current cursor: the last point served to this peer.
@@ -142,17 +160,50 @@ pub struct ChainSyncServer {
     /// True when the cursor is at Origin — meaning no block has been served
     /// yet and we must include blocks at slot 0 (e.g. Byron genesis EBB).
     cursor_at_origin: bool,
+    /// Per-connection `StMustReply` timeout, drawn once at construction
+    /// uniformly from `[CHAINSYNC_MUST_REPLY_TIMEOUT_MIN, CHAINSYNC_MUST_REPLY_TIMEOUT_MAX]`.
+    /// Mirrors Haskell's per-connection timeout draw (#701).
+    must_reply_timeout: Duration,
 }
 
 impl ChainSyncServer {
     /// Create a new server with no cursor (must find intersection first).
+    ///
+    /// Draws a per-connection `StMustReply` timeout uniformly at random in
+    /// `[601 s, 911 s]` to match Haskell's `ouroboros-network` ChainSync
+    /// codec timeout policy.
     pub fn new() -> Self {
+        Self::new_with_timeout(Self::draw_must_reply_timeout())
+    }
+
+    /// Test/explicit-timeout constructor.  Production code should call
+    /// [`Self::new`] to get the random per-connection draw; tests use this to
+    /// pin the timeout to a known small value.
+    #[doc(hidden)]
+    pub fn new_with_timeout(must_reply_timeout: Duration) -> Self {
         Self {
             cursor_slot: 0,
             cursor_hash: [0; 32],
             cursor_initialized: false,
             cursor_at_origin: false,
+            must_reply_timeout,
         }
+    }
+
+    /// Draw a fresh `StMustReply` timeout uniformly in
+    /// `[CHAINSYNC_MUST_REPLY_TIMEOUT_MIN, CHAINSYNC_MUST_REPLY_TIMEOUT_MAX]`.
+    fn draw_must_reply_timeout() -> Duration {
+        use rand::Rng;
+        let span = CHAINSYNC_MUST_REPLY_TIMEOUT_MAX - CHAINSYNC_MUST_REPLY_TIMEOUT_MIN;
+        let span_ms = span.as_millis() as u64;
+        let mut rng = rand::rng();
+        let offset_ms = rng.random_range(0..=span_ms);
+        CHAINSYNC_MUST_REPLY_TIMEOUT_MIN + Duration::from_millis(offset_ms)
+    }
+
+    /// Configured `StMustReply` timeout (exposed for diagnostics / tests).
+    pub fn must_reply_timeout(&self) -> Duration {
+        self.must_reply_timeout
     }
 
     /// Run the ChainSync server loop.
@@ -356,9 +407,12 @@ impl ChainSyncServer {
             ProtocolError::from(e)
         })?;
 
-        // Wait for a block announcement OR rollback with a fixed timeout.
-        // Haskell uses a timeout range of 135–911 seconds; we use 135s as the lower bound.
-        let timeout = Duration::from_secs(135);
+        // Wait for a block announcement OR rollback.  Timeout is the
+        // per-connection random draw in [601 s, 911 s] — matches Haskell's
+        // `minChainSyncTimeout`/`maxChainSyncTimeout` for non-trustable peers
+        // and prevents re-poll synchronization across a population of peers.
+        // Issue #701.
+        let timeout = self.must_reply_timeout;
 
         // Bug J fix (2026-05-16): biased select so rollback_rx is always
         // checked first when both arms are ready.  Combined with the cursor
@@ -2031,6 +2085,56 @@ mod tests {
         assert!(
             result.is_err(),
             "era_tag=100 should produce an error, got: {result:?}"
+        );
+    }
+
+    /// Pin Haskell parity: per-server StMustReply timeout draw must fall in
+    /// `[601 s, 911 s]` (`minChainSyncTimeout`, `maxChainSyncTimeout`).
+    /// Issue #701.  This is a single-sample bound check on the value drawn at
+    /// `ChainSyncServer::new()`; the `draws_distinct_across_constructions`
+    /// test below verifies the randomization itself.
+    #[test]
+    fn must_reply_timeout_within_haskell_range() {
+        let s = ChainSyncServer::new();
+        let t = s.must_reply_timeout();
+        assert!(
+            t >= CHAINSYNC_MUST_REPLY_TIMEOUT_MIN && t <= CHAINSYNC_MUST_REPLY_TIMEOUT_MAX,
+            "timeout {t:?} not in [{:?}, {:?}]",
+            CHAINSYNC_MUST_REPLY_TIMEOUT_MIN,
+            CHAINSYNC_MUST_REPLY_TIMEOUT_MAX,
+        );
+    }
+
+    /// Haskell-parity constants pinned.
+    #[test]
+    fn must_reply_timeout_constants_pinned() {
+        assert_eq!(
+            CHAINSYNC_MUST_REPLY_TIMEOUT_MIN,
+            Duration::from_secs(601),
+            "Haskell minChainSyncTimeout"
+        );
+        assert_eq!(
+            CHAINSYNC_MUST_REPLY_TIMEOUT_MAX,
+            Duration::from_secs(911),
+            "Haskell maxChainSyncTimeout"
+        );
+    }
+
+    /// The per-connection draw must produce at least two distinct timeouts
+    /// across 64 constructions.  Statistically the probability of every
+    /// draw landing on the same millisecond out of 310 000 ms is
+    /// `(1/310_000)^63 ≈ 10^-350` — astronomical.  If this ever fails the
+    /// RNG is deterministic, which would synchronize re-poll storms across
+    /// the population.
+    #[test]
+    fn must_reply_timeout_draws_distinct_across_constructions() {
+        let mut seen: std::collections::HashSet<u128> = std::collections::HashSet::new();
+        for _ in 0..64 {
+            seen.insert(ChainSyncServer::new().must_reply_timeout().as_micros());
+        }
+        assert!(
+            seen.len() >= 2,
+            "must_reply_timeout draws all identical across 64 constructions: RNG is broken"
         );
     }
 
