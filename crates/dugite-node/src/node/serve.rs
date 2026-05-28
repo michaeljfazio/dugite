@@ -707,6 +707,25 @@ pub(crate) fn convert_validation_error(
                 "Pool retirement epoch {retirement_epoch} exceeds max (current {current_epoch} + e_max {e_max})"
             ),
         },
+        VE::PoolRetirementTooEarly {
+            retirement_epoch,
+            current_epoch,
+        } => TxValidationError::ScriptFailed {
+            reason: format!(
+                "Pool retirement epoch {retirement_epoch} must be strictly greater than \
+                 current_epoch {current_epoch} (StakePoolRetirementWrongEpochPOOL)"
+            ),
+        },
+        VE::WrongNetworkPool {
+            expected,
+            actual,
+            pool_id,
+        } => TxValidationError::ScriptFailed {
+            reason: format!(
+                "Pool {pool_id} reward account on wrong network: expected {expected:?}, \
+                 got {actual:?} (WrongNetworkPOOL)"
+            ),
+        },
         VE::StakeRegistrationDepositMismatch { declared, expected } => {
             TxValidationError::ScriptFailed {
                 reason: format!(
@@ -771,6 +790,28 @@ pub(crate) fn convert_validation_error(
             reason: format!(
                 "Malformed reference script(s) on tx outputs: {hashes:?} \
                  (MalformedReferenceScripts; PV gate or flat-decode failed)"
+            ),
+        },
+        VE::DisallowedVotesDuringBootstrap { violations } => TxValidationError::ScriptFailed {
+            reason: format!(
+                "Disallowed votes during Conway bootstrap (PV9): {} violation(s) — \
+                 DRep may only vote on InfoAction; Committee/StakePool only on \
+                 ParameterChange/HardForkInitiation/InfoAction (DisallowedVotesDuringBootstrap)",
+                violations.len()
+            ),
+        },
+        VE::TreasuryWithdrawalReturnAccountsDoNotExist { bad_addrs } => {
+            TxValidationError::ScriptFailed {
+                reason: format!(
+                    "TreasuryWithdrawals destination address(es) not registered: {bad_addrs:?} \
+                     (TreasuryWithdrawalReturnAccountsDoNotExist)"
+                ),
+            }
+        }
+        VE::InvalidMetadata { labels } => TxValidationError::ScriptFailed {
+            reason: format!(
+                "InvalidMetadata: oversize leaf at metadata label(s) {labels:?} \
+                 (Allegra+ enforces max 64 bytes per Bytes/Text leaf)"
             ),
         },
         VE::ProposalDepositIncorrect { declared, expected } => TxValidationError::ScriptFailed {

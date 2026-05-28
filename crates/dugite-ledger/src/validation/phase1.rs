@@ -206,6 +206,30 @@ pub(super) fn is_pool_metadata_hash_too_big(metadata_hash_bytes: &[u8], pv_major
 }
 
 // ---------------------------------------------------------------------------
+/// Recursively walk a `TransactionMetadatum` looking for `Bytes` or `Text`
+/// leaves that exceed `max_size_bytes` UTF-8 bytes. Mirrors Haskell's
+/// `decodeMetadatum` enforcement
+/// (`libs/cardano-ledger-core/src/Cardano/Ledger/Metadata.hs`) which fires
+/// on any oversize leaf at any depth.
+fn metadatum_has_oversize_leaf(
+    datum: &dugite_primitives::transaction::TransactionMetadatum,
+    max_size_bytes: usize,
+) -> bool {
+    use dugite_primitives::transaction::TransactionMetadatum as M;
+    match datum {
+        M::Int(_) => false,
+        M::Bytes(b) => b.len() > max_size_bytes,
+        M::Text(t) => t.len() > max_size_bytes,
+        M::List(items) => items
+            .iter()
+            .any(|i| metadatum_has_oversize_leaf(i, max_size_bytes)),
+        M::Map(entries) => entries.iter().any(|(k, v)| {
+            metadatum_has_oversize_leaf(k, max_size_bytes)
+                || metadatum_has_oversize_leaf(v, max_size_bytes)
+        }),
+    }
+}
+
 // Helper: Byron output attribute size cap (Haskell `OutputBootAddrAttrsTooBig`)
 // ---------------------------------------------------------------------------
 
@@ -613,17 +637,67 @@ pub(super) fn run_phase1_rules(
     }
 
     // ------------------------------------------------------------------
+    // Rule 1c.iii: Allegra+ metadata 64-byte size limit (InvalidMetadata)
+    //
+    // Per Haskell `decodeMetadatum` in
+    // `libs/cardano-ledger-core/src/Cardano/Ledger/Metadata.hs`, the
+    // decoder enforces a 64-byte cap on every `Bytes` and `Text` leaf
+    // when `dv > natVersion @2` (Allegra and later — Conway included):
+    //
+    // ```haskell
+    // when (checkSizes && Prim.sizeofByteArray ba > 64) $
+    //   decodeError "bytes .size (0..64): bytestring exceeds 64 bytes"
+    // when (checkSizes && TF.lengthWord8 x > 64) $
+    //   decodeError "text .size (0..64): text exceeds 64 bytes"
+    // ```
+    //
+    // Haskell enforces this at CBOR-decode time and the corresponding
+    // `InvalidMetadata` UTXOW predicate is essentially dead code
+    // (`validateTxAuxData _ _ = True` in Shelley). dugite's decoder
+    // currently accepts any size, so we mirror the enforcement at
+    // validation time. PV >= 3 means Allegra+ (decoder version > 2).
+    // ------------------------------------------------------------------
+    if params.protocol_version_major >= 3 {
+        if let Some(ref aux) = tx.auxiliary_data {
+            let mut bad_labels: Vec<u64> = Vec::new();
+            for (label, datum) in aux.metadata.iter() {
+                if metadatum_has_oversize_leaf(datum, 64) {
+                    bad_labels.push(*label);
+                }
+            }
+            if !bad_labels.is_empty() {
+                bad_labels.sort();
+                bad_labels.dedup();
+                errors.push(ValidationError::InvalidMetadata { labels: bad_labels });
+            }
+        }
+    }
+
+    // ------------------------------------------------------------------
     // Rule 1d: Era gating
     // ------------------------------------------------------------------
     super::conway::check_era_gating(params, body, errors);
 
     // ------------------------------------------------------------------
-    // Rule 1e: Pool retirement epoch <= current_epoch + e_max
+    // Rule 1e: Pool retirement epoch must satisfy currentEpoch < e <= currentEpoch + eMax
     //
-    // Per Haskell's POOL rule (Shelley spec, Figure 14): the announced
-    // retirement epoch must not exceed `cepoch + emax`. Skipped when
-    // `current_epoch` is not provided (e.g. mempool admission without
-    // epoch context).
+    // Per Haskell's POOL rule
+    // (`eras/shelley/impl/src/Cardano/Ledger/Shelley/Rules/Pool.hs`, lines 308-323):
+    //
+    // ```haskell
+    // (cEpoch < e && e <= limitEpoch)
+    //   ?! injectFailure (StakePoolRetirementWrongEpochPOOL
+    //        Mismatch{supplied=e, expected=cEpoch}     -- RelGT
+    //        Mismatch{supplied=e, expected=limitEpoch} -- RelLTEQ
+    //   )
+    // ```
+    //
+    // where `limitEpoch = cEpoch + eMax`. Lower bound is STRICT
+    // (retirement must be at least one epoch in the future). dugite
+    // historically only checked the upper bound — the lower bound
+    // check below catches `e <= cEpoch` (retirement scheduled in the
+    // past or current epoch). Skipped when `current_epoch` is not
+    // provided (mempool admission without epoch context).
     // ------------------------------------------------------------------
     if let Some(epoch) = current_epoch {
         for cert in &body.certificates {
@@ -639,6 +713,11 @@ pub(super) fn run_phase1_rules(
                         current_epoch: epoch,
                         e_max: params.e_max,
                         max_epoch,
+                    });
+                } else if *retirement_epoch <= epoch {
+                    errors.push(ValidationError::PoolRetirementTooEarly {
+                        retirement_epoch: *retirement_epoch,
+                        current_epoch: epoch,
                     });
                 }
             }
@@ -1138,6 +1217,42 @@ pub(super) fn run_phase1_rules(
                     });
                     // Report once per transaction to avoid flooding.
                     break;
+                }
+            }
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // Rule 5d-pool: Pool registration reward account must be on the
+    // node's configured network (Haskell `WrongNetworkPOOL`).
+    //
+    // Per Haskell `ShelleyPoolPredFailure::WrongNetworkPOOL` in
+    // `eras/shelley/impl/src/Cardano/Ledger/Shelley/Rules/Pool.hs`,
+    // gated on `hardforkAlonzoValidatePoolAccountAddressNetID pv`
+    // (active for PV >= 5). Fires when the network ID embedded in the
+    // pool registration's `account_address` (reward account) does not
+    // match the node's network. Bit 0 of the reward account header
+    // encodes the network: 0 = testnet, 1 = mainnet.
+    // ------------------------------------------------------------------
+    if let Some(expected_net) = node_network {
+        if params.protocol_version_major >= 5 {
+            for cert in &body.certificates {
+                if let Certificate::PoolRegistration(pool_params) = cert {
+                    if let Some(header) = pool_params.reward_account.first() {
+                        let network_bit = header & 0x01;
+                        let actual_net = if network_bit == 0 {
+                            dugite_primitives::network::NetworkId::Testnet
+                        } else {
+                            dugite_primitives::network::NetworkId::Mainnet
+                        };
+                        if actual_net != expected_net {
+                            errors.push(ValidationError::WrongNetworkPool {
+                                expected: expected_net,
+                                actual: actual_net,
+                                pool_id: pool_params.operator.to_hex(),
+                            });
+                        }
+                    }
                 }
             }
         }
@@ -4343,6 +4458,173 @@ mod tests {
                 .iter()
                 .any(|e| matches!(e, ValidationError::DRepIncorrectRefund { .. })),
             "unknown DRep must short-circuit refund check, got {errors:?}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Tests — POOL.3 lower bound (StakePoolRetirementWrongEpochPOOL)
+    //
+    // Mirrors Haskell `cEpoch < e && e <= limitEpoch` — retirement epoch
+    // must be STRICTLY in the future, and not exceed `cEpoch + eMax`.
+    // -----------------------------------------------------------------------
+
+    /// Retirement epoch <= current_epoch → PoolRetirementTooEarly fires.
+    #[test]
+    fn test_pool_retirement_too_early_rejected() {
+        let (utxo_set, mut tx, _) = make_valid_tx();
+        tx.body.certificates.push(Certificate::PoolRetirement {
+            pool_hash: Hash28::from_bytes([0xAB; 28]),
+            epoch: 100, // == current_epoch → fails strict lower bound
+        });
+        let params = ProtocolParameters::mainnet_defaults();
+        // current_epoch=100 supplied via validate_transaction_with_pools
+        let errors = validate_transaction_with_pools(
+            &tx,
+            &utxo_set,
+            &params,
+            100,
+            300,
+            None,
+            None,
+            None,
+            None,
+            Some(100),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .err()
+        .unwrap_or_default();
+        assert!(
+            errors
+                .iter()
+                .any(|e| matches!(e, ValidationError::PoolRetirementTooEarly { .. })),
+            "retirement_epoch == current_epoch must produce PoolRetirementTooEarly, got {errors:?}"
+        );
+    }
+
+    /// Retirement epoch > current_epoch and <= current_epoch + eMax → accepted.
+    #[test]
+    fn test_pool_retirement_valid_window_accepted() {
+        let (utxo_set, mut tx, _) = make_valid_tx();
+        tx.body.certificates.push(Certificate::PoolRetirement {
+            pool_hash: Hash28::from_bytes([0xAB; 28]),
+            epoch: 110, // strictly > current_epoch, within e_max
+        });
+        let params = ProtocolParameters::mainnet_defaults();
+        let errors = validate_transaction_with_pools(
+            &tx,
+            &utxo_set,
+            &params,
+            100,
+            300,
+            None,
+            None,
+            None,
+            None,
+            Some(100),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .err()
+        .unwrap_or_default();
+        assert!(
+            !errors.iter().any(|e| matches!(
+                e,
+                ValidationError::PoolRetirementTooEarly { .. }
+                    | ValidationError::PoolRetirementTooLate { .. }
+            )),
+            "valid retirement window must not produce PoolRetirementTooEarly/Late, got {errors:?}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Tests — Allegra+ InvalidMetadata (64-byte leaf limit)
+    // -----------------------------------------------------------------------
+
+    fn make_tx_with_metadata_text(text: String) -> (UtxoSet, Transaction) {
+        use dugite_primitives::transaction::{AuxiliaryData, TransactionMetadatum};
+        let (utxo_set, mut tx, _) = make_valid_tx();
+        let mut meta = ::std::collections::BTreeMap::new();
+        meta.insert(0u64, TransactionMetadatum::Text(text));
+        let aux = AuxiliaryData {
+            metadata: meta,
+            native_scripts: vec![],
+            plutus_v1_scripts: vec![],
+            plutus_v2_scripts: vec![],
+            plutus_v3_scripts: vec![],
+            raw_cbor: None,
+        };
+        // Add the aux_data_hash so the hash-presence predicate doesn't
+        // fire ahead of InvalidMetadata.
+        tx.body.auxiliary_data_hash = Some(Hash32::ZERO);
+        tx.auxiliary_data = Some(aux);
+        (utxo_set, tx)
+    }
+
+    /// Metadata text leaf > 64 bytes at Allegra+ → InvalidMetadata fires.
+    #[test]
+    fn test_invalid_metadata_oversize_text_rejected() {
+        let oversized = "a".repeat(65);
+        let (utxo_set, tx) = make_tx_with_metadata_text(oversized);
+        let mut params = ProtocolParameters::mainnet_defaults();
+        params.protocol_version_major = 9;
+        let errors = validate_transaction(&tx, &utxo_set, &params, 100, 300, None)
+            .err()
+            .unwrap_or_default();
+        assert!(
+            errors
+                .iter()
+                .any(|e| matches!(e, ValidationError::InvalidMetadata { .. })),
+            "65-byte metadata text must produce InvalidMetadata, got {errors:?}"
+        );
+    }
+
+    /// Metadata text leaf == 64 bytes at Allegra+ → accepted.
+    #[test]
+    fn test_invalid_metadata_64_byte_text_accepted() {
+        let exact = "a".repeat(64);
+        let (utxo_set, tx) = make_tx_with_metadata_text(exact);
+        let mut params = ProtocolParameters::mainnet_defaults();
+        params.protocol_version_major = 9;
+        let errors = validate_transaction(&tx, &utxo_set, &params, 100, 300, None)
+            .err()
+            .unwrap_or_default();
+        assert!(
+            !errors
+                .iter()
+                .any(|e| matches!(e, ValidationError::InvalidMetadata { .. })),
+            "64-byte metadata text must NOT produce InvalidMetadata, got {errors:?}"
+        );
+    }
+
+    /// At PV<3 (Shelley) the check is skipped (Haskell pre-Allegra
+    /// decoder version <= 2 didn't enforce the cap).
+    #[test]
+    fn test_invalid_metadata_skipped_at_shelley() {
+        let oversized = "a".repeat(100);
+        let (utxo_set, tx) = make_tx_with_metadata_text(oversized);
+        let mut params = ProtocolParameters::mainnet_defaults();
+        params.protocol_version_major = 2; // Shelley
+        let errors = validate_transaction(&tx, &utxo_set, &params, 100, 300, None)
+            .err()
+            .unwrap_or_default();
+        assert!(
+            !errors
+                .iter()
+                .any(|e| matches!(e, ValidationError::InvalidMetadata { .. })),
+            "Pre-Allegra (PV=2) must skip InvalidMetadata, got {errors:?}"
         );
     }
 
