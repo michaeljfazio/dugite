@@ -11,7 +11,13 @@
 #
 # Usage:
 #   health-probe.sh [--port 12798]              # dugite-bp prometheus
-#                   [--cardano-port 12800]      # cardano-bp prometheus
+#                   [--cardano-port 12800]      # cardano-bp prometheus (optional)
+#                   [--cardano-socket PATH]     # cardano-bp N2C socket — used to query tip
+#                                                 # when prometheus :12800 is unavailable
+#                                                 # (cardano-node 11.x with UseTraceDispatcher=true
+#                                                 # forwards metrics to external cardano-tracer
+#                                                 # process, so the built-in :12800 endpoint
+#                                                 # doesn't exist).
 #                   [--log logs/dugite-bp.log]
 #                   [--relay-log logs/dugite-relay.log]
 #                   [--cardano-log logs/cardano-bp.log]
@@ -33,6 +39,7 @@ set -euo pipefail
 
 PORT=12798
 CARDANO_PORT=12800
+CARDANO_SOCKET=""
 LOG=""
 RELAY_LOG=""
 CARDANO_LOG=""
@@ -45,6 +52,7 @@ while [ $# -gt 0 ]; do
     case "$1" in
         --port)            PORT="$2"; shift 2 ;;
         --cardano-port)    CARDANO_PORT="$2"; shift 2 ;;
+        --cardano-socket)  CARDANO_SOCKET="$2"; shift 2 ;;
         --log)             LOG="$2"; shift 2 ;;
         --relay-log)       RELAY_LOG="$2"; shift 2 ;;
         --cardano-log)     CARDANO_LOG="$2"; shift 2 ;;
@@ -70,6 +78,17 @@ auto_locate() {
 [ -z "$LOG" ]         && LOG="$(auto_locate dugite-bp.log)"
 [ -z "$RELAY_LOG" ]   && RELAY_LOG="$(auto_locate dugite-relay.log)"
 [ -z "$CARDANO_LOG" ] && CARDANO_LOG="$(auto_locate cardano-bp.log)"
+
+# Auto-locate cardano-bp N2C socket if --cardano-socket not passed. The devnet
+# places it under $TMPDIR/ld-$UID/ (per lib/common.sh).
+auto_locate_socket() {
+    local uid="${UID:-$(id -u)}"
+    for cand in "${TMPDIR:-/tmp}ld-$uid/cbp.sock" "/tmp/ld-$uid/cbp.sock" \
+                "testnet/local-devnet/state/cbp.sock" "../../testnet/local-devnet/state/cbp.sock"; do
+        if [ -S "$cand" ]; then printf '%s' "$cand"; return; fi
+    done
+}
+[ -z "$CARDANO_SOCKET" ] && CARDANO_SOCKET="$(auto_locate_socket)"
 
 # Thresholds — tighter on devnet, looser on public testnets.
 TIP_AGE_MAX=5
@@ -294,14 +313,38 @@ else
     info "no conn thrash (conn_total_delta=${DELTA_CONN_TOTAL}, peers_delta=${DELTA_PEERS})"
 fi
 
-# --- 11. Haskell-tip parity (cardano-bp Prometheus) ------------------------
+# --- 11. Haskell-tip parity ------------------------------------------------
+# Strategy:
+#   (a) Prefer cardano-bp Prometheus :CARDANO_PORT if reachable (legacy
+#       UseTraceDispatcher=false config). Yields a richer cross-check
+#       including connectedPeers.
+#   (b) Fall back to cardano-cli query tip on $CARDANO_SOCKET — always
+#       available when the devnet is running, regardless of tracer
+#       config. Cross-checks slot, block, epoch.
+#   (c) If neither is available, emit INFO and continue (treats Haskell
+#       parity as best-effort, not a hard gate).
 HASKELL_UP=0
-if curl -fs --max-time 3 "localhost:${CARDANO_PORT}/metrics" > "$CARDANO_SCRAPE" 2>/dev/null; then
-    HASKELL_UP=1
+HASKELL_VIA=""
+if curl -fs --max-time 3 "localhost:${CARDANO_PORT}/metrics" > "$CARDANO_SCRAPE" 2>/dev/null \
+   && grep -qE '^cardano_node_metrics_slotNum_int' "$CARDANO_SCRAPE"; then
+    HASKELL_UP=1; HASKELL_VIA="prometheus :${CARDANO_PORT}"
     H_SLOT=$(awk '$1=="cardano_node_metrics_slotNum_int"   {print $2; exit}' "$CARDANO_SCRAPE")
     H_BLOCK=$(awk '$1=="cardano_node_metrics_blockNum_int" {print $2; exit}' "$CARDANO_SCRAPE")
     H_EPOCH=$(awk '$1=="cardano_node_metrics_epoch_int"    {print $2; exit}' "$CARDANO_SCRAPE")
     H_PEERS=$(awk '$1=="cardano_node_metrics_connectedPeers_int" {print $2; exit}' "$CARDANO_SCRAPE")
+elif [ -n "$CARDANO_SOCKET" ] && [ -S "$CARDANO_SOCKET" ] && command -v cardano-cli >/dev/null 2>&1; then
+    NM="${LD_MAGIC:-42}"
+    TIP_JSON=$(cardano-cli query tip --testnet-magic "$NM" --socket-path "$CARDANO_SOCKET" 2>/dev/null || true)
+    if [ -n "$TIP_JSON" ]; then
+        HASKELL_UP=1; HASKELL_VIA="socket $CARDANO_SOCKET"
+        H_SLOT=$(echo "$TIP_JSON" | jq -r '.slot // empty')
+        H_BLOCK=$(echo "$TIP_JSON" | jq -r '.block // empty')
+        H_EPOCH=$(echo "$TIP_JSON" | jq -r '.epoch // empty')
+        H_PEERS=""   # not available via tip; skip the peer assertion in this mode
+    fi
+fi
+
+if [ "$HASKELL_UP" -eq 1 ]; then
     D_SLOT=$(toi "$SLOT_B")
     D_BLOCK=$(toi "$(metric dugite_block_number)")
     D_EPOCH=$(toi "$(metric dugite_epoch_number)")
@@ -312,17 +355,19 @@ if curl -fs --max-time 3 "localhost:${CARDANO_PORT}/metrics" > "$CARDANO_SCRAPE"
         SLOT_GAP=$(( D_SLOT > H_SLOT_I ? D_SLOT - H_SLOT_I : H_SLOT_I - D_SLOT ))
         BLOCK_GAP=$(( D_BLOCK > H_BLOCK_I ? D_BLOCK - H_BLOCK_I : H_BLOCK_I - D_BLOCK ))
         if [ "$SLOT_GAP" -le "$SLOT_PARITY" ] && [ "$BLOCK_GAP" -le 1 ] && [ "$D_EPOCH" -eq "$H_EPOCH_I" ]; then
-            ok "Haskell parity: dugite(slot=$D_SLOT block=$D_BLOCK epoch=$D_EPOCH) ≈ cardano-bp(slot=$H_SLOT_I block=$H_BLOCK_I epoch=$H_EPOCH_I)"
+            ok "Haskell parity via ${HASKELL_VIA}: dugite(slot=$D_SLOT block=$D_BLOCK epoch=$D_EPOCH) ≈ cardano-bp(slot=$H_SLOT_I block=$H_BLOCK_I epoch=$H_EPOCH_I)"
         else
-            fail "Haskell parity drift: slot_gap=$SLOT_GAP (≤$SLOT_PARITY) block_gap=$BLOCK_GAP (≤1) epoch_match=$([ "$D_EPOCH" -eq "$H_EPOCH_I" ] && echo yes || echo no)"
+            fail "Haskell parity drift via ${HASKELL_VIA}: slot_gap=$SLOT_GAP (≤$SLOT_PARITY) block_gap=$BLOCK_GAP (≤1) epoch_match=$([ "$D_EPOCH" -eq "$H_EPOCH_I" ] && echo yes || echo no)"
         fi
-        H_PEERS_INT=$(toi "${H_PEERS:-0}")
-        [ "$H_PEERS_INT" -ge 1 ] || fail "cardano-bp reports $H_PEERS_INT peers — not connected to dugite-relay"
+        if [ -n "$H_PEERS" ]; then
+            H_PEERS_INT=$(toi "${H_PEERS:-0}")
+            [ "$H_PEERS_INT" -ge 1 ] || fail "cardano-bp reports $H_PEERS_INT peers — not connected to dugite-relay"
+        fi
     else
-        info "cardano-bp :${CARDANO_PORT} returned no slot/block metrics (Haskell EKG not yet up?)"
+        info "Haskell tip query returned no slot/block (cardano-bp not yet caught up?)"
     fi
 else
-    info "cardano-bp prometheus :${CARDANO_PORT} unreachable — skipping Haskell parity check"
+    info "Haskell parity unavailable: prometheus :${CARDANO_PORT} not responding AND no cardano-bp socket — skipping check"
 fi
 
 # --- 12. Recent Haskell adoption (devnet only — BP role) -------------------
