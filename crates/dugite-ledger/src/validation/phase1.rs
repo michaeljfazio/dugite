@@ -1326,6 +1326,49 @@ pub(super) fn run_phase1_rules(
                 }
             }
         }
+
+        // Check each voting procedure has a matching witness for its voter
+        // credential. Mirrors Haskell `conwayWitsVKeyNeeded` for Conway-era:
+        // every voter in `votingProcedures` whose credential is a vkey hash
+        // contributes a required witness. Script-credential voters are
+        // already covered by the redeemer presence check in
+        // `collateral::check_script_redeemers`.
+        //
+        // Reference: Haskell `Cardano.Ledger.Conway.Tx.witsVKeyNeeded` —
+        // `getConwayWitsVKeyNeeded` unions input + withdrawal + cert + voter
+        // + proposal witness requirements before checking against the
+        // supplied witness set.
+        //
+        // Without this check, dugite admits a tx that has a voting
+        // procedure with a vkey-credential voter (DRep KeyHashObj, CC hot
+        // KeyHashObj) but no matching vkey witness; cardano-node rejects
+        // the resulting block with `ConwayUtxowFailure
+        // (MissingVKeyWitnessesUTXOW (NonEmptySet (fromList [...])))`.
+        // Round-1 retry surfaced this with block fb4da1990e86...@slot 645.
+        for voter in body.voting_procedures.keys() {
+            let required_keyhash: Option<Hash28> = match voter {
+                dugite_primitives::transaction::Voter::ConstitutionalCommittee(cred)
+                | dugite_primitives::transaction::Voter::DRep(cred) => match cred {
+                    Credential::VerificationKey(h) => Some(*h),
+                    Credential::Script(_) => None, // script voter — covered by redeemer check
+                },
+                // StakePool voters are pool-cold-key hashes. dugite stores
+                // them as Hash32 (28-byte hash padded — see memory note
+                // "28-byte hash types must be padded to 32 bytes"). The
+                // witness set uses Hash28, so unpad by taking the first 28
+                // bytes. Pool cold keys are always 28-byte BLAKE2b-224.
+                dugite_primitives::transaction::Voter::StakePool(pool_hash32) => {
+                    let mut buf = [0u8; 28];
+                    buf.copy_from_slice(&pool_hash32.0[..28]);
+                    Some(dugite_primitives::hash::Hash::<28>(buf))
+                }
+            };
+            if let Some(kh) = required_keyhash {
+                if !vkey_witness_hashes.contains(&kh) {
+                    errors.push(ValidationError::MissingCertificateWitness(kh.to_hex()));
+                }
+            }
+        }
     }
 
     // ------------------------------------------------------------------
