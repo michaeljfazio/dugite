@@ -112,12 +112,18 @@ const ROLLBACK_ANN_CHANNEL_CAP: usize = 256;
 
 /// BlockFetch → ledger-apply channel capacity.
 ///
-/// Reduced from 1000 to 128.  At 90 KB per block and 4 concurrent fetchers
-/// the old value allocated up to 4 × 1000 × 90 KB = 360 MB of in-flight
-/// blocks before ledger apply could process them.  128 caps this at ~46 MB
-/// while still providing adequate pipeline depth at typical apply throughput
-/// of 3–5 blocks/sec (G11).
-const FETCHED_BLOCKS_CHANNEL_CAP: usize = 128;
+/// Sized to absorb one full Byron-era apply round-trip without
+/// back-pressuring the BlockFetch worker, which now polls at the
+/// Haskell-aligned 10 ms cadence (see
+/// `connection_lifecycle::ConnectionLifecycleManager::make_blockfetch_task`
+/// :: `poll_ticker`).  Previously 128 entries (~12 ms of Byron throughput)
+/// pinned the worker on `fetched_blocks_tx.send().await` after every range
+/// completion, undoing the throughput win of the 10 ms cadence.
+///
+/// At 90 KB per Shelley+ block the worst-case memory footprint is ~90 MB.
+/// In Byron-era bulk sync (≤ 1 KiB blocks) it's ~1 MB.  Both are within the
+/// runtime budget.
+const FETCHED_BLOCKS_CHANNEL_CAP: usize = 1024;
 
 /// GSM event channel capacity (G12).
 ///
