@@ -365,6 +365,75 @@ impl EraHistory {
         Ok(entry.params.epoch_size)
     }
 
+    /// Compute the safe-zone horizon slot — the exclusive upper bound past
+    /// which slot-to-time translation throws `PastHorizon` in Haskell.
+    ///
+    /// Mirrors the Haskell formula in `Ouroboros.Consensus.HardFork.History
+    /// .Summary.summarize` for the last (open) era:
+    ///
+    /// ```haskell
+    /// hi = case eraSafeZone of
+    ///   UnsafeIndefiniteSafeZone -> EraUnbounded
+    ///   StandardSafeZone safeFromTip ->
+    ///     EraEnd
+    ///       . mkUpperBound params lo
+    ///       . slotToEpochBound params lo
+    ///       . addSlots safeFromTip
+    ///       $ max (next ledgerTip) (boundSlot lo)
+    /// ```
+    ///
+    /// The dugite translation:
+    ///
+    /// ```text
+    /// anchor    = max(ledger_tip_slot + 1, era_start_slot)
+    /// raw_hi    = anchor + safe_zone_slots
+    /// (q, r)    = (raw_hi - era_start_slot) divMod epoch_size
+    /// hi_epoch  = era_start_epoch + if r == 0 { q } else { q + 1 }
+    /// horizon   = era_start_slot + (hi_epoch - era_start_epoch) * epoch_size
+    /// ```
+    ///
+    /// A slot `s` is **past horizon** iff `s >= horizon` (strict less-than
+    /// is translatable). This matches Haskell `guard $ p b` where
+    /// `p = \end -> absSlot < boundSlot end`.
+    ///
+    /// Returns `None` only when `safe_zone == 0` (which we treat as
+    /// "unbounded — no horizon enforcement"). Returns `Some(horizon_slot)`
+    /// otherwise. The horizon for an era already-closed by a hard fork is
+    /// the era's explicit end bound (callers that want post-tip horizon
+    /// for the OPEN era should pass the latest ledger tip).
+    ///
+    /// Permalink reference (Haskell):
+    /// https://github.com/IntersectMBO/ouroboros-consensus/blob/main/ouroboros-consensus/src/ouroboros-consensus/Ouroboros/Consensus/HardFork/History/Summary.hs#L331
+    pub fn safe_zone_horizon_slot(&self, ledger_tip: SlotNo) -> Option<u64> {
+        // Look up the era containing `ledger_tip` (or fall back to the
+        // current/open era when the tip is in a previously-closed era
+        // and we're computing for what comes next).
+        let entry = match self.find_era_for_slot(ledger_tip.0) {
+            Ok(e) => e,
+            Err(_) => self.entries.last()?,
+        };
+        let safe_zone = entry.params.safe_zone;
+        if safe_zone == 0 {
+            return None;
+        }
+        let era_start_slot = entry.start.slot;
+        let era_start_epoch = entry.start.epoch;
+        let epoch_size = entry.params.epoch_size;
+        if epoch_size == 0 {
+            return None;
+        }
+        let anchor = std::cmp::max(ledger_tip.0.saturating_add(1), era_start_slot);
+        let raw_hi = anchor.saturating_add(safe_zone);
+        let slots_from_era_start = raw_hi.saturating_sub(era_start_slot);
+        let q = slots_from_era_start / epoch_size;
+        let r = slots_from_era_start % epoch_size;
+        let hi_epoch_offset = if r == 0 { q } else { q + 1 };
+        let hi_epoch = era_start_epoch.saturating_add(hi_epoch_offset);
+        let horizon = era_start_slot.saturating_add(hi_epoch_offset * epoch_size);
+        debug_assert_eq!(hi_epoch, era_start_epoch + hi_epoch_offset);
+        Some(horizon)
+    }
+
     // -----------------------------------------------------------------------
     // N2C export
     // -----------------------------------------------------------------------
@@ -1060,5 +1129,100 @@ mod tests {
         // Roundtrip
         let slot = eh.wallclock_to_slot(time, &system_start).unwrap();
         assert_eq!(slot, SlotNo(2501));
+    }
+
+    // -----------------------------------------------------------------------
+    // safe_zone_horizon_slot — mirrors Haskell `HardFork.History.Summary`
+    // -----------------------------------------------------------------------
+
+    /// Devnet-shaped EraHistory: instant Byron→Shelley at epoch 0, single open
+    /// Shelley-flavoured era with `epoch_size=400, slot_length=1s,
+    /// safe_zone=360` — identical to `config/spec/shelley-spec.json` for
+    /// the local devnet.
+    fn devnet_400_safe360() -> EraHistory {
+        let p = EraParams {
+            epoch_size: 400,
+            slot_length_ms: 1000,
+            safe_zone: 360,
+        };
+        EraHistory::from_genesis(p.clone(), p, 0, 120)
+    }
+
+    #[test]
+    fn test_safe_zone_horizon_matches_haskell_dump_at_tip_267() {
+        // Captured verbatim from cardano-node 11.0.1 PastHorizon error
+        // in evidence/round1-attempt1:
+        //   block 046d35638b... at slot=267, requested SlotNo 865,
+        //   eraEnd boundSlot = 800.
+        // dugite must compute horizon=800 for the same inputs.
+        let eh = devnet_400_safe360();
+        // The block was *forged* at slot 267, so the tip at validation time
+        // is the block's predecessor: slot 265. The Haskell `anchor` is
+        // `next ledgerTip = 265 + 1 = 266`. 266 + 360 = 626. Round up to
+        // next epoch boundary in an epoch_size=400 era: epoch 1 starts at
+        // slot 400, epoch 2 at slot 800. 626 is in epoch 1, so the
+        // horizon is the *next* boundary: slot 800.
+        let horizon = eh.safe_zone_horizon_slot(SlotNo(265)).unwrap();
+        assert_eq!(horizon, 800, "horizon must match the Haskell EraEnd");
+        // And the requested SlotNo 865 from the rejection MUST be past
+        // the horizon (>= 800).
+        assert!(865 >= horizon);
+    }
+
+    #[test]
+    fn test_safe_zone_horizon_at_origin() {
+        // Anchor = max(0+1, 0) = 1. 1 + 360 = 361. Round up: 361 is in
+        // epoch 0 (slots 0..399), so the next-boundary horizon is 400.
+        let eh = devnet_400_safe360();
+        assert_eq!(eh.safe_zone_horizon_slot(SlotNo(0)), Some(400));
+    }
+
+    #[test]
+    fn test_safe_zone_horizon_exact_epoch_boundary_input() {
+        // ledger_tip = 39: anchor = 40, 40 + 360 = 400. r == 0 → q = 1.
+        // hi_epoch_offset = 1 → horizon = 400. The Haskell formula gives
+        // the same: `divMod 400 400 = (1, 0)`, take `q` (not q+1).
+        let eh = devnet_400_safe360();
+        assert_eq!(eh.safe_zone_horizon_slot(SlotNo(39)), Some(400));
+    }
+
+    #[test]
+    fn test_safe_zone_horizon_slides_with_tip() {
+        // As the chain advances, the horizon slides forward but always
+        // rounds up to an epoch boundary. ledger_tip = 740 (deep in
+        // epoch 1): anchor = 741, +360 = 1101. Round to next boundary in
+        // epoch_size=400: 1200 (epoch 3 start).
+        let eh = devnet_400_safe360();
+        assert_eq!(eh.safe_zone_horizon_slot(SlotNo(740)), Some(1200));
+    }
+
+    #[test]
+    fn test_safe_zone_horizon_zero_safe_zone_returns_none() {
+        // safe_zone=0 → unbounded — no horizon enforcement.
+        let p = EraParams {
+            epoch_size: 400,
+            slot_length_ms: 1000,
+            safe_zone: 0,
+        };
+        let eh = EraHistory::from_genesis(p.clone(), p, 0, 120);
+        assert_eq!(eh.safe_zone_horizon_slot(SlotNo(100)), None);
+    }
+
+    #[test]
+    fn test_safe_zone_horizon_mainnet_proportions() {
+        // Mainnet Conway-shaped: epoch=432000, safe_zone = 3k/f = 3*2160/0.05
+        // = 129600. ledger_tip = 100_000_000 (deep into the chain). anchor =
+        // 100_000_001. +129600 = 100_129_601. Round up to next 432000-slot
+        // epoch boundary: (100_129_601 - shelley_start) / 432000.
+        // We use a simple custom EraHistory anchored at slot 0 to avoid
+        // hard-coding Byron — same arithmetic, smaller numbers.
+        let p = EraParams {
+            epoch_size: 432000,
+            slot_length_ms: 1000,
+            safe_zone: 129600,
+        };
+        let eh = EraHistory::from_genesis(p.clone(), p, 0, 4320);
+        // anchor=1, +129600 = 129601. r=129601, q=0, q+1=1. horizon = 432000.
+        assert_eq!(eh.safe_zone_horizon_slot(SlotNo(0)), Some(432000));
     }
 }
