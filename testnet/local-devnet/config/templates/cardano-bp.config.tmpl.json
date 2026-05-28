@@ -49,5 +49,10 @@
     "ChainDB.AddBlockEvent.AddedBlockToVolatileDB": { "severity": "Info" }
   },
   "TraceOptionMetricsPrefix": "cardano.node.metrics.",
-  "TraceOptionResourceFrequency": 1000
+  "TraceOptionResourceFrequency": 1000,
+  "hasPrometheus": [
+    "127.0.0.1",
+    12800
+  ],
+  "hasEKG": 12801
 }

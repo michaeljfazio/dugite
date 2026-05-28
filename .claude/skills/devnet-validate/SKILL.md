@@ -86,20 +86,24 @@ Goal: happy path. Fresh setup, all three nodes up, dugite-bp forges canonical bl
 
 ```bash
 cd testnet/local-devnet
+. ./lib/common.sh                   # exports LD_RELAY_SOCK, LD_CARDANO_BP_SOCK, LD_DUGITE_BP_SOCK
 ./setup.sh                          # ~30s — fresh genesis
 ./run.sh                            # ~5s — staggered start (relay → cardano → dugite-bp)
 sleep 30                            # let the chain advance past slot 0
 ./tx-zoo/run-all.sh --setup         # ~20s — keys + plutus binaries (one-time per setup)
 ./tx-zoo/run-all.sh                 # ~3-5 min — all 59 tx scripts (submitted via dugite-relay socket)
 # Bidirectional parity — re-run a representative subset against the Haskell socket
-# (catches accept-set asymmetry; see references/test-methodology.md "parity oracle")
-ZOO_SOCKET="$LD_CARDANO_BP_SOCK" ./tx-zoo/run-all.sh 01-bookkeeping 04-stake 06-proposals 08-negative
+# (catches accept-set asymmetry; see references/test-methodology.md "parity oracle").
+# The wrapper sources lib/common.sh, snapshots results.csv after each batch, and
+# writes evidence/<ts>/parity-matrix.csv with OFFDIAG count + non-zero exit on drift.
+../../.claude/skills/devnet-validate/scripts/bidirectional-parity.sh \
+    01-bookkeeping 04-stake 06-proposals 08-negative
 ./tx-zoo/09-cli-parity/run.sh       # ~1 min — 22 LSQ parity checks; writes cli-parity.csv
 ./tx-zoo/cross-validate-cli.sh      # ~1 min — dugite-cli ↔ cardano-cli submit parity
 ./protocols/run.sh                  # ~2 min — adversarial N2N framing; writes n2n-trace.csv
 ./soak.sh 120                       # 2 min idle evidence
 ./verify.sh evidence/$(ls -t evidence | head -1)
-.claude/skills/devnet-validate/scripts/analyze-evidence.sh evidence/$(ls -t evidence | head -1)
+../../.claude/skills/devnet-validate/scripts/analyze-evidence.sh evidence/$(ls -t evidence | head -1)
 ./stop.sh
 ```
 
@@ -108,30 +112,33 @@ While the soak runs, sample monitoring in another shell. Two complementary scrip
 ```bash
 # (a) Fast one-shot health verdict — recommended every ≤60s during a soak. Implements
 # the 14-step decision procedure in references/health.md. Exits non-zero on any anomaly.
-.claude/skills/devnet-validate/scripts/health-probe.sh --verbose
+# When invoked from inside testnet/local-devnet/ the log auto-locate works without args;
+# from anywhere else, pass --log / --relay-log / --cardano-log explicitly.
+../../.claude/skills/devnet-validate/scripts/health-probe.sh --verbose
 
 # (b) Comprehensive metric audit — run once after warmup AND once at end-of-round. Validates
 # all ~70 metrics dugite-monitor consumes plus cross-node + Haskell parity. Use --verbose to
 # see each assertion pass. Hard-fails on any invariant violation.
-.claude/skills/devnet-validate/scripts/metric-audit.sh --verbose
+../../.claude/skills/devnet-validate/scripts/metric-audit.sh --verbose
 
 # Raw streams (fall back when the probe isn't enough):
 curl -s localhost:12798/metrics | grep -E '^dugite_(tip|block|slot|peers|forge|chainsync)'
 tail -F logs/dugite-bp.log    | grep -E 'forge|reject|ERROR|stale'
-tail -F logs/cardano-bp.log   | grep -E 'TraceAdoptedBlock|TraceForgedInvalidBlock|MempoolAccepted|mismatched|timeout'
+# cardano-node 11.x uses new-tracer namespace; match both legacy + new names.
+tail -F logs/cardano-bp.log   | grep -E 'AddedToCurrentChain|AddBlockValidation\.InvalidBlock|Forge\.Loop\.ForgedInvalidBlock|TraceAdoptedBlock|TraceForgedInvalidBlock|Mempool\.AddedTx|MempoolAccepted|mismatched|timeout'
 ```
 
 **Round 1 PASSES iff** all of:
 - `tx-zoo/state/results.csv` shows ≥58/59 PASS (one V3 spend may fail without `aiken` — see `references/tx-coverage.md`)
 - `verify.sh` reports 4/4 predicates pass
-- Zero `TraceForgedInvalidBlock` in `logs/cardano-bp.log`
+- Zero invalid-block events in `logs/cardano-bp.log` (match BOTH legacy `TraceForgedInvalidBlock` and cardano-node 11.x `ChainDB.AddBlockEvent.AddBlockValidation.InvalidBlock` / `Forge.Loop.ForgedInvalidBlock`)
 - `dugite_tip_age_seconds` stays <5 throughout the soak
 - `health-probe.sh` returns HEALTHY at end-of-round AND at every ≤60s sample during the soak (network throughput + Haskell-tip parity included)
 - `metric-audit.sh` exits 0 at end-of-round (all ~30 metric assertions pass: completeness, arithmetic invariants, counter monotonicity, BP↔relay parity, Haskell parity, range checks)
 - `analyze-evidence.sh` reports no anomalies
 - `evidence/<ts>/cli-parity.csv` has zero DIVERGENT rows that are not filed as known-divergence issues
 - `evidence/<ts>/n2n-trace.csv` has zero PANIC or SILENT_SKIP rows
-- Bidirectional parity (08-negatives + the representative 01/04/06 subset re-run via `ZOO_SOCKET=$LD_CARDANO_BP_SOCK`) shows zero off-diagonal cells in `tx-zoo/state/results.csv` — every tx is classified identically by dugite and Haskell regardless of submit socket
+- Bidirectional parity wrapper (`bidirectional-parity.sh 01-bookkeeping 04-stake 06-proposals 08-negative`) exits 0 — every script is classified identically across both sockets in `evidence/<ts>/parity-matrix.csv` (zero `OFFDIAG` rows)
 - `tx-zoo/state/cross-validate.csv` shows PASS for every representative tx submitted through `dugite-cli`
 
 ### Round 2 — Epoch-boundary stress (~7 min)
