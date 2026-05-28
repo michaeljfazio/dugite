@@ -201,6 +201,15 @@ pub fn withdrawal_to_plutus(
 /// `validity_interval_start` / `ttl`, both of which post-date the
 /// network start) but rejecting it explicitly keeps us panic-free.
 pub fn slot_to_posix_ms(slot: u64, sc: &SlotConfig) -> Result<i64, PhaseTwoError> {
+    // Mirror Haskell `Ouroboros.Consensus.HardFork.History.Qry.guardEnd`:
+    // a slot `s` is past the horizon iff `s >= boundSlot eraEnd`. When
+    // `safe_zone_horizon_slot` is `None`, the era is treated as unbounded
+    // (mirrors `EraEnd EraUnbounded` / `UnsafeIndefiniteSafeZone`).
+    if let Some(horizon) = sc.safe_zone_horizon_slot {
+        if slot >= horizon {
+            return Err(PhaseTwoError::TimeTranslationPastHorizon { slot, horizon });
+        }
+    }
     let rel = slot.checked_sub(sc.slot_zero_offset).ok_or_else(|| {
         PhaseTwoError::Internal(format!(
             "slot {slot} < slot_zero_offset {}",
@@ -726,6 +735,7 @@ mod tests {
             network_start_unix_seconds: 1_666_656_000,
             slot_zero_offset: 0,
             slot_length_ms: 1_000,
+            safe_zone_horizon_slot: None,
         }
     }
 
@@ -750,6 +760,7 @@ mod tests {
             network_start_unix_seconds: 0,
             slot_zero_offset: 1_000,
             slot_length_ms: 1_000,
+            safe_zone_horizon_slot: None,
         };
         let err = slot_to_posix_ms(500, &sc).unwrap_err();
         assert!(matches!(err, PhaseTwoError::Internal(_)));
@@ -770,6 +781,89 @@ mod tests {
         assert_eq!(r.lower, Some(slot_to_posix_ms(10, &sc).unwrap()));
         assert_eq!(r.upper, Some(slot_to_posix_ms(20, &sc).unwrap()));
         assert!(r.upper.unwrap() > r.lower.unwrap());
+    }
+
+    // ────────────────────────────────────────────────────────────
+    // Safe-zone horizon enforcement (mirrors Haskell PastHorizon)
+    // ────────────────────────────────────────────────────────────
+
+    #[test]
+    fn slot_to_posix_ms_rejects_at_horizon_boundary() {
+        // Mirrors the exact predicate `slot < horizon`: the horizon itself
+        // is the exclusive upper bound — `slot == horizon` is past horizon.
+        let mut sc = preview_slot_config();
+        sc.safe_zone_horizon_slot = Some(800);
+        let err = slot_to_posix_ms(800, &sc).unwrap_err();
+        match err {
+            PhaseTwoError::TimeTranslationPastHorizon { slot, horizon } => {
+                assert_eq!(slot, 800);
+                assert_eq!(horizon, 800);
+            }
+            other => panic!("expected TimeTranslationPastHorizon, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn slot_to_posix_ms_rejects_past_horizon() {
+        // The exact regression case from Round 1 evidence:
+        // requested SlotNo 865, era end (horizon) at SlotNo 800.
+        let mut sc = preview_slot_config();
+        sc.safe_zone_horizon_slot = Some(800);
+        let err = slot_to_posix_ms(865, &sc).unwrap_err();
+        assert!(matches!(
+            err,
+            PhaseTwoError::TimeTranslationPastHorizon {
+                slot: 865,
+                horizon: 800,
+            }
+        ));
+    }
+
+    #[test]
+    fn slot_to_posix_ms_accepts_slot_below_horizon() {
+        let mut sc = preview_slot_config();
+        sc.safe_zone_horizon_slot = Some(800);
+        // 799 < 800 → translatable.
+        assert!(slot_to_posix_ms(799, &sc).is_ok());
+        // 0 < 800 → translatable (origin).
+        assert!(slot_to_posix_ms(0, &sc).is_ok());
+    }
+
+    #[test]
+    fn slot_to_posix_ms_unbounded_horizon_accepts_far_future() {
+        // `safe_zone_horizon_slot: None` mirrors Haskell `EraUnbounded`
+        // / `UnsafeIndefiniteSafeZone`. No upper bound is enforced — but
+        // production callers MUST set it; only tests rely on this.
+        let sc = preview_slot_config();
+        assert!(sc.safe_zone_horizon_slot.is_none());
+        // A "far future" slot well past any reasonable horizon but small
+        // enough not to trigger the i128→i64 overflow guard in
+        // slot_to_posix_ms — proves the horizon check is the gating
+        // predicate, not numeric range.
+        assert!(slot_to_posix_ms(1_000_000_000, &sc).is_ok());
+    }
+
+    #[test]
+    fn valid_range_to_posix_propagates_horizon_error() {
+        // Phase-2 `transValidityInterval` translates BOTH bounds; the
+        // error from the upper bound must propagate unchanged.
+        let mut sc = preview_slot_config();
+        sc.safe_zone_horizon_slot = Some(800);
+        // Lower 100 is fine, upper 865 is past horizon.
+        let err = valid_range_to_posix(Some(100), Some(865), &sc).unwrap_err();
+        assert!(matches!(
+            err,
+            PhaseTwoError::TimeTranslationPastHorizon {
+                slot: 865,
+                horizon: 800,
+            }
+        ));
+        // Symmetric: a past-horizon LOWER bound also errors.
+        let err = valid_range_to_posix(Some(900), Some(950), &sc).unwrap_err();
+        assert!(matches!(
+            err,
+            PhaseTwoError::TimeTranslationPastHorizon { .. }
+        ));
     }
 
     // ────────────────────────────────────────────────────────────

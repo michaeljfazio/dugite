@@ -2250,6 +2250,12 @@ impl Node {
                 zero_time: 0,
                 zero_slot: 0,
                 slot_length: 1000,
+                // Per-tx horizon is plumbed in `LedgerTxValidator::validate`
+                // before each `evaluate_plutus_scripts` call from the live
+                // EraHistory; this fallback SlotConfig is only used when
+                // shelley_genesis is None (very early boot) where no Plutus
+                // tx can be admitted yet.
+                safe_zone_horizon_slot: None,
             });
         let n2c_tx_validator = Arc::new(serve::LedgerTxValidator {
             ledger: self.ledger_state.clone(),
@@ -2262,6 +2268,7 @@ impl Node {
             } else {
                 dugite_primitives::network::NetworkId::Testnet
             },
+            era_history: self.era_history.clone(),
         });
 
         // Start N2C server on Unix socket.
@@ -3500,6 +3507,12 @@ impl Node {
                 zero_time: 0,
                 zero_slot: 0,
                 slot_length: 1000,
+                // Per-tx horizon is plumbed in `LedgerTxValidator::validate`
+                // before each `evaluate_plutus_scripts` call from the live
+                // EraHistory; this fallback SlotConfig is only used when
+                // shelley_genesis is None (very early boot) where no Plutus
+                // tx can be admitted yet.
+                safe_zone_horizon_slot: None,
             });
         let n2n_tx_validator: Arc<dyn dugite_network::TxValidator> =
             Arc::new(serve::LedgerTxValidator {
@@ -3507,6 +3520,7 @@ impl Node {
                 slot_config: n2n_slot_config,
                 metrics: self.metrics.clone(),
                 mempool: Some(self.mempool.clone()),
+                era_history: self.era_history.clone(),
                 network: if self.network_magic
                     == dugite_primitives::network::NetworkId::Mainnet.magic()
                 {

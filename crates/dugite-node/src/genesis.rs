@@ -459,6 +459,12 @@ impl ShelleyGenesis {
             zero_time,
             zero_slot: 0,
             slot_length: slot_length_ms,
+            // Per-tx safe-zone horizon is injected by the tx validator
+            // (`LedgerTxValidator::validate`) using
+            // `EraHistory::safe_zone_horizon_slot(ledger_tip)` immediately
+            // before each `evaluate_plutus_scripts` call. The static
+            // SlotConfig built here has no per-tip knowledge.
+            safe_zone_horizon_slot: None,
         }
     }
 

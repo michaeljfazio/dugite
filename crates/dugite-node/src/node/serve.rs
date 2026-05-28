@@ -372,6 +372,13 @@ pub(crate) struct LedgerTxValidator {
     pub metrics: Arc<crate::metrics::NodeMetrics>,
     pub mempool: Option<Arc<dugite_mempool::Mempool>>,
     pub network: dugite_primitives::network::NetworkId,
+    /// Live era history. Used to compute the per-tx safe-zone horizon
+    /// (`EraHistory::safe_zone_horizon_slot(ledger_tip)`) that
+    /// dugite-uplc enforces during Plutus context translation, mirroring
+    /// Haskell `TimeTranslationPastHorizon`. See Round-1 audit finding
+    /// `audit-findings/2026-05-28-skill-self-audit.md` "DUGITE BUG
+    /// CAUGHT BY ROUND 1".
+    pub era_history: Arc<RwLock<dugite_consensus::EraHistory>>,
 }
 
 impl TxValidator for LedgerTxValidator {
@@ -436,13 +443,38 @@ impl TxValidator for LedgerTxValidator {
             .with_committee_resigned(committee_resigned)
             .with_network(self.network);
 
+        // Compute the per-tx safe-zone horizon and inject it into the
+        // SlotConfig so the Plutus context-builder rejects any tx whose
+        // validity interval translates past the era horizon. Mirrors
+        // Haskell `Alonzo.Plutus.TxInfo.transValidityInterval` →
+        // `TimeTranslationPastHorizon`. Round-1 P0 regression: without
+        // this, dugite admitted a tx with ttl=865 at chain tip 265 and
+        // cardano-bp permanently rejected the resulting block.
+        let per_tx_slot_config = match self.era_history.try_read() {
+            Ok(eh) => {
+                let horizon =
+                    eh.safe_zone_horizon_slot(dugite_primitives::time::SlotNo(current_slot));
+                let mut sc = self.slot_config;
+                if let Some(h) = horizon {
+                    sc.safe_zone_horizon_slot = Some(h);
+                }
+                sc
+            }
+            // Era history briefly contended (held by a writer applying a
+            // block). Fall back to the unbounded static SlotConfig — this
+            // is strictly more permissive, so it cannot newly admit a tx
+            // that the horizon-checking path would have rejected on the
+            // very next attempt.
+            Err(_) => self.slot_config,
+        };
+
         dugite_ledger::validation::validate_transaction_with_context(
             &tx,
             &utxo_view,
             &ledger.epochs.protocol_params,
             current_slot,
             tx_size,
-            Some(&self.slot_config),
+            Some(&per_tx_slot_config),
             context,
         )
         .map_err(|errors| {

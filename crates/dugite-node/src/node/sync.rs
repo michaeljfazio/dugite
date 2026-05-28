@@ -671,7 +671,22 @@ impl Node {
         if pending_count > 0 {
             let ledger = self.ledger_state.read().await;
             let current_slot = ledger.tip.point.slot().map(|s| s.0).unwrap_or(0);
-            let slot_config = ledger.slot_config;
+            // Inject the live safe-zone horizon into the SlotConfig so the
+            // post-rollback re-admission path also rejects past-horizon
+            // Plutus txs (mirrors Haskell `TimeTranslationPastHorizon`).
+            // Without this, a tx admitted before a rollback would silently
+            // be re-admitted to the mempool even if its validity bound now
+            // crosses the new horizon.
+            let slot_config = {
+                let mut sc = ledger.slot_config;
+                let eh = self.era_history.read().await;
+                if let Some(h) =
+                    eh.safe_zone_horizon_slot(dugite_primitives::time::SlotNo(current_slot))
+                {
+                    sc.safe_zone_horizon_slot = Some(h);
+                }
+                sc
+            };
 
             // Build governance context from the rolled-back ledger state so that
             // votes referencing proposals that were rolled back are rejected.
@@ -2011,7 +2026,24 @@ impl Node {
                         // cloning the potentially large UTxO map.
                         let new_params = ledger.epochs.protocol_params.clone();
                         let current_slot = ledger.tip.point.slot().map(|s| s.0).unwrap_or(0);
-                        let slot_config = ledger.slot_config;
+                        // Inject the per-tip safe-zone horizon so the
+                        // epoch-boundary mempool revalidation also rejects
+                        // any past-horizon Plutus tx (mirrors
+                        // `TimeTranslationPastHorizon`). Without this, an
+                        // epoch transition that *narrows* the horizon could
+                        // leave a now-invalid tx in the mempool that
+                        // dugite-bp would later forge into a Haskell-rejected
+                        // block.
+                        let slot_config = {
+                            let mut sc = ledger.slot_config;
+                            let eh = self.era_history.read().await;
+                            if let Some(h) = eh.safe_zone_horizon_slot(
+                                dugite_primitives::time::SlotNo(current_slot),
+                            ) {
+                                sc.safe_zone_horizon_slot = Some(h);
+                            }
+                            sc
+                        };
                         let utxo_ref = &ledger.utxo.utxo_set;
                         let evicted = self.mempool.revalidate_all(|tx| {
                             let tx_size = tx.raw_cbor.as_ref().map(|b| b.len() as u64).unwrap_or(0);

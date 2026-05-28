@@ -56,11 +56,15 @@ fn snapshot_format_hash_stability() {
     // This hash was computed from the current LedgerStateSnapshot layout.
     // If this changes, existing snapshot files become unreadable.
     //
-    // Last update: SNAPSHOT_VERSION 18 → 19 (issue #670) — `ptr_stake_excluded`
-    // is no longer `#[serde(skip)]`; the field now round-trips through the
-    // serialised snapshot so reloading a Conway-era ledger does not silently
-    // revert pointer-stake exclusion back to `false`.
-    const EXPECTED_HASH: &str = "e0f8fc75409f3f41380b8f8a2d54a87100dde5b2956a5141bf54f3d473612dc1";
+    // Last update: SNAPSHOT_VERSION 19 → 20 (P0 Plutus past-horizon fix,
+    // Round-1 self-audit 2026-05-28) — `SlotConfig` now carries an
+    // `Option<u64> safe_zone_horizon_slot` field used by the Plutus
+    // context-builder to reject past-horizon validity bounds (mirrors
+    // Haskell `TimeTranslationPastHorizon`). The field is `#[serde(default)]`
+    // so older snapshots load with `safe_zone_horizon_slot = None`
+    // (matching pre-fix unbounded semantics), but the bincode-positional
+    // hash necessarily changes.
+    const EXPECTED_HASH: &str = "72e84dd38d5590d429de2561f6fa0117406ee96a36a3725e37885e0ba064390a";
 
     if EXPECTED_HASH == "COMPUTE_ON_FIRST_RUN" {
         panic!(
