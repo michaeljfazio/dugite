@@ -1247,11 +1247,7 @@ mod tests {
             "Hot count drops immediately on mark_terminating"
         );
         assert!(
-            pm.inner
-                .get_peer(&addr)
-                .unwrap()
-                .state
-                .is_cooling_or_cold(),
+            pm.inner.get_peer(&addr).unwrap().state.is_cooling_or_cold(),
             "Cooling must satisfy is_cooling_or_cold for governor checks"
         );
 
