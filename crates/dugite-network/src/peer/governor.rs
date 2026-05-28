@@ -44,12 +44,22 @@ pub struct PeerTargets {
 
 impl Default for PeerTargets {
     fn default() -> Self {
+        // Production defaults — match Haskell `cardano-diffusion`'s
+        // `defaultDeadlineTargets` (lines in
+        // `cardano-diffusion/lib/Cardano/Network/Diffusion/Configuration.hs`).
+        // Previously dugite shipped `target_hot=5, target_warm=10` which is
+        // far below Haskell's `targetNumberOfActivePeers=20,
+        // targetNumberOfEstablishedPeers=30`.  The low cap caused
+        // `aboveTargetOther` to fire continuously whenever any inbound
+        // promoted peer pushed `hot_count > 5` — driving the OOM-on-churn
+        // class of bugs documented in #703.
         Self {
-            target_warm: 10,
-            target_hot: 5,
-            max_cold: 100,
-            target_warm_big_ledger: 0,
-            target_hot_big_ledger: 0,
+            target_warm: 30,
+            target_hot: 20,
+            max_cold: 150,
+            // Big-ledger active peers (Haskell `targetNumberOfActiveBigLedgerPeers = 5`).
+            target_warm_big_ledger: 5,
+            target_hot_big_ledger: 5,
         }
     }
 }
@@ -82,9 +92,14 @@ impl Default for GovernorConfig {
     fn default() -> Self {
         Self {
             targets: PeerTargets::default(),
-            hot_churn_interval: Duration::from_secs(600), // 10 minutes
-            cold_churn_interval: Duration::from_secs(900), // 15 minutes
-            warm_churn_interval: Duration::from_secs(600), // 10 minutes
+            // Haskell `defaultDeadlineChurnInterval = 3300 s` + jitter of up
+            // to 600 s.  3300 s = 55 min.  Using the lower bound here for
+            // determinism; #703 fix B adds jitter via inbound maturation.
+            // Previously this was 600 s — 5.5× more aggressive than Haskell,
+            // contributing to the demote-promote-demote loop in #703.
+            hot_churn_interval: Duration::from_secs(3300), // 55 minutes (Haskell default)
+            cold_churn_interval: Duration::from_secs(900),
+            warm_churn_interval: Duration::from_secs(600),
             // 5 minutes — matches Haskell's `policyPeerShareActivationDelay`.
             // Long enough to prevent the 4-second flap loop reproduced in
             // issue #671 but short enough that legitimately-churned peers
@@ -256,7 +271,7 @@ impl Governor {
         local_root_groups: &[LocalRootGroupTarget],
     ) -> Vec<GovernorAction> {
         let empty: HashSet<SocketAddr> = HashSet::new();
-        self.compute_actions_with_blp(peer_manager, local_root_groups, &empty)
+        self.compute_actions_with_blp(peer_manager, local_root_groups, &empty, &empty)
     }
 
     /// Like [`compute_actions`] but with explicit knowledge of which peers
@@ -268,11 +283,21 @@ impl Governor {
     /// BLP minimums apply IN ADDITION to aggregate targets. A peer that's
     /// both a BLP and a local-root member is handled by the local-root pass
     /// first (highest priority), then the BLP pass tops up if needed.
+    ///
+    /// `fresh_inbound` is the set of inbound-duplex peers that have been
+    /// connected for less than `inboundMaturePeerDelay = 15 min` (Haskell's
+    /// `InboundGovernor.inboundMaturePeerDelay`).  These peers stay in the
+    /// Warm state but are EXCLUDED from `Warm→Hot` promotion candidates and
+    /// from BLP / non-BLP hot fill paths.  Issue #703 fix B.  Without this,
+    /// every inbound connect that completes handshake is immediately
+    /// promoted to Hot, exceeding `target_hot` and triggering
+    /// `aboveTargetOther` demotions that drove the at-tip OOM.
     pub fn compute_actions_with_blp(
         &mut self,
         peer_manager: &PeerManager,
         local_root_groups: &[LocalRootGroupTarget],
         big_ledger_peers: &HashSet<SocketAddr>,
+        fresh_inbound: &HashSet<SocketAddr>,
     ) -> Vec<GovernorAction> {
         use rand::seq::IndexedRandom;
 
@@ -496,6 +521,11 @@ impl Governor {
                     if self.in_cooldown(&addr, now) {
                         continue;
                     }
+                    // Skip immature inbound peers — must complete the
+                    // 15-min `inboundMaturePeerDelay` before promotion.  #703 fix B.
+                    if fresh_inbound.contains(&addr) {
+                        continue;
+                    }
                     actions.push(GovernorAction::PromoteToHot(addr));
                     self.in_progress_promote_warm.insert(addr);
                     already_promoted.insert(addr);
@@ -570,6 +600,11 @@ impl Governor {
                 }
                 // Skip peers in post-demote cooldown — see #671.
                 if self.in_cooldown(&addr, now) {
+                    continue;
+                }
+                // Skip immature inbound peers — must complete the
+                // 15-min `inboundMaturePeerDelay` before promotion.  #703 fix B.
+                if fresh_inbound.contains(&addr) {
                     continue;
                 }
                 actions.push(GovernorAction::PromoteToHot(addr));
@@ -679,7 +714,8 @@ impl Governor {
             if let Some(churn_in) = select_best_warm(peer_manager) {
                 // Don't promote a peer that's in cooldown — picking another
                 // candidate keeps the churn cycle productive.
-                if !self.in_cooldown(&churn_in, now) {
+                // Also skip immature inbound peers (#703 fix B).
+                if !self.in_cooldown(&churn_in, now) && !fresh_inbound.contains(&churn_in) {
                     actions.push(GovernorAction::PromoteToHot(churn_in));
                 }
             }
@@ -781,6 +817,105 @@ mod tests {
             .filter(|a| matches!(a, GovernorAction::PromoteToWarm(_)))
             .count();
         assert_eq!(promote_warm_count, 3);
+    }
+
+    /// #703 fix B regression lock: warm peers in the fresh_inbound filter
+    /// are NOT selected for Warm→Hot promotion even when hot_count is
+    /// below target_hot.  Without this, every inbound-promoted-to-warm
+    /// peer would immediately be re-promoted to hot, driving the at-tip
+    /// OOM cycle.
+    #[test]
+    fn fresh_inbound_excluded_from_warm_to_hot() {
+        let mut pm = PeerManager::new();
+        for i in 0..3u16 {
+            pm.add_peer(test_addr(3000 + i), PeerSource::Dns);
+            pm.promote_to_warm(&test_addr(3000 + i));
+        }
+        // Mark all three peers as fresh inbound — none should be eligible.
+        let mut fresh: HashSet<SocketAddr> = HashSet::new();
+        for i in 0..3u16 {
+            fresh.insert(test_addr(3000 + i));
+        }
+
+        let config = GovernorConfig {
+            targets: PeerTargets {
+                target_warm: 3,
+                target_hot: 3,
+                max_cold: 100,
+                ..Default::default()
+            },
+            hot_churn_interval: Duration::from_secs(3600),
+            cold_churn_interval: Duration::from_secs(3600),
+            warm_churn_interval: Duration::from_secs(3600),
+            demote_cooldown: Duration::from_secs(3600),
+        };
+        let mut gov = Governor::new(config);
+
+        let actions = gov.compute_actions_with_blp(&pm, &[], &HashSet::new(), &fresh);
+        let promote_hot_count = actions
+            .iter()
+            .filter(|a| matches!(a, GovernorAction::PromoteToHot(_)))
+            .count();
+        assert_eq!(
+            promote_hot_count, 0,
+            "fresh-inbound peers must not be promoted to hot"
+        );
+    }
+
+    /// Once a peer matures out of the fresh-inbound set, the Warm→Hot
+    /// promotion proceeds normally.
+    #[test]
+    fn matured_inbound_eligible_for_warm_to_hot() {
+        let mut pm = PeerManager::new();
+        for i in 0..3u16 {
+            pm.add_peer(test_addr(3000 + i), PeerSource::Dns);
+            pm.promote_to_warm(&test_addr(3000 + i));
+        }
+        // Empty fresh set = all peers matured.
+        let fresh: HashSet<SocketAddr> = HashSet::new();
+
+        let config = GovernorConfig {
+            targets: PeerTargets {
+                target_warm: 3,
+                target_hot: 3,
+                max_cold: 100,
+                ..Default::default()
+            },
+            hot_churn_interval: Duration::from_secs(3600),
+            cold_churn_interval: Duration::from_secs(3600),
+            warm_churn_interval: Duration::from_secs(3600),
+            demote_cooldown: Duration::from_secs(3600),
+        };
+        let mut gov = Governor::new(config);
+
+        let actions = gov.compute_actions_with_blp(&pm, &[], &HashSet::new(), &fresh);
+        let promote_hot_count = actions
+            .iter()
+            .filter(|a| matches!(a, GovernorAction::PromoteToHot(_)))
+            .count();
+        assert_eq!(promote_hot_count, 3);
+    }
+
+    /// #703 fix C: production defaults must match Haskell
+    /// `defaultDeadlineTargets`.  This pins target_hot=20, target_warm=30,
+    /// hot_churn_interval=3300s.
+    #[test]
+    fn peer_targets_haskell_defaults_pinned() {
+        let t = PeerTargets::default();
+        assert_eq!(t.target_hot, 20, "Haskell targetNumberOfActivePeers");
+        assert_eq!(t.target_warm, 30, "Haskell targetNumberOfEstablishedPeers");
+        assert_eq!(
+            t.target_hot_big_ledger, 5,
+            "Haskell targetNumberOfActiveBigLedgerPeers"
+        );
+        assert_eq!(t.max_cold, 150);
+
+        let cfg = GovernorConfig::default();
+        assert_eq!(
+            cfg.hot_churn_interval,
+            Duration::from_secs(3300),
+            "Haskell defaultDeadlineChurnInterval (lower bound)"
+        );
     }
 
     #[test]
@@ -1639,7 +1774,8 @@ mod tests {
         };
         let mut gov = Governor::new(config);
         let blp_set: HashSet<SocketAddr> = blp_addrs.iter().copied().collect();
-        let actions = gov.compute_actions_with_blp(&pm, &[], &blp_set);
+        let actions =
+            gov.compute_actions_with_blp(&pm, &[], &blp_set, &::std::collections::HashSet::new());
 
         let promoted_warm: Vec<SocketAddr> = actions
             .iter()
@@ -1687,7 +1823,8 @@ mod tests {
         };
         let mut gov = Governor::new(config);
         let blp_set: HashSet<SocketAddr> = blp_addrs.iter().copied().collect();
-        let actions = gov.compute_actions_with_blp(&pm, &[], &blp_set);
+        let actions =
+            gov.compute_actions_with_blp(&pm, &[], &blp_set, &::std::collections::HashSet::new());
 
         let promoted_hot: Vec<SocketAddr> = actions
             .iter()
@@ -1729,7 +1866,7 @@ mod tests {
             demote_cooldown: Duration::from_secs(3600),
         };
         let mut gov = Governor::new(config);
-        let actions = gov.compute_actions_with_blp(&pm, &[], &HashSet::new());
+        let actions = gov.compute_actions_with_blp(&pm, &[], &HashSet::new(), &HashSet::new());
 
         let promoted_warm = actions
             .iter()
@@ -1823,7 +1960,8 @@ mod tests {
         };
         let mut gov = Governor::new(config);
 
-        let actions = gov.compute_actions_with_blp(&pm, &[], &blp_set);
+        let actions =
+            gov.compute_actions_with_blp(&pm, &[], &blp_set, &::std::collections::HashSet::new());
 
         let demotes: Vec<_> = actions
             .iter()
@@ -1885,7 +2023,8 @@ mod tests {
         let mut gov = Governor::new(config);
 
         // Tick 1: BLP promotes 5 (hot=20), aboveTargetOther demotes 5 non-BLPs.
-        let actions = gov.compute_actions_with_blp(&pm, &[], &blp_set);
+        let actions =
+            gov.compute_actions_with_blp(&pm, &[], &blp_set, &::std::collections::HashSet::new());
         let blp_promotes = actions
             .iter()
             .filter(|a| matches!(a, GovernorAction::PromoteToHot(addr) if blp_set.contains(addr)))
@@ -1931,7 +2070,8 @@ mod tests {
         // Tick 2: cooldown blocks the demoted peers from reconnecting.
         // Governor should NOT emit any cold→warm promotion for them, and
         // should NOT emit any demote (hot is back at target).
-        let actions2 = gov.compute_actions_with_blp(&pm, &[], &blp_set);
+        let actions2 =
+            gov.compute_actions_with_blp(&pm, &[], &blp_set, &::std::collections::HashSet::new());
         let bad_reconnects = actions2
             .iter()
             .filter(|a| match a {
@@ -1993,7 +2133,12 @@ mod tests {
 
         let mut total_demotes = 0usize;
         for tick in 0..30 {
-            let actions = gov.compute_actions_with_blp(&pm, &[], &blp_set);
+            let actions = gov.compute_actions_with_blp(
+                &pm,
+                &[],
+                &blp_set,
+                &::std::collections::HashSet::new(),
+            );
             let demotes = actions
                 .iter()
                 .filter(|a| matches!(a, GovernorAction::DemoteToWarm(_)))
@@ -2051,7 +2196,8 @@ mod tests {
         let mut gov = Governor::new(config);
 
         // Tick 1: governor sees 16 hot, target 15 — demote one.
-        let actions = gov.compute_actions_with_blp(&pm, &[], &blp_set);
+        let actions =
+            gov.compute_actions_with_blp(&pm, &[], &blp_set, &::std::collections::HashSet::new());
         let victims: Vec<SocketAddr> = actions
             .iter()
             .filter_map(|a| match a {
@@ -2068,7 +2214,8 @@ mod tests {
         // Tick 2: governor sees only 15 hot. belowTargetOther cold→warm
         // would normally reconnect the cold peer to satisfy target_warm.
         // The cooldown filter MUST prevent that.
-        let actions2 = gov.compute_actions_with_blp(&pm, &[], &blp_set);
+        let actions2 =
+            gov.compute_actions_with_blp(&pm, &[], &blp_set, &::std::collections::HashSet::new());
         let victim_reconnects: Vec<_> = actions2
             .iter()
             .filter(|a| matches!(a, GovernorAction::PromoteToWarm(addr) if *addr == victim))
@@ -2138,7 +2285,12 @@ mod tests {
 
         let mut total_demotes = 0usize;
         for _ in 0..1000 {
-            let actions = gov.compute_actions_with_blp(&pm, &[], &blp_set);
+            let actions = gov.compute_actions_with_blp(
+                &pm,
+                &[],
+                &blp_set,
+                &::std::collections::HashSet::new(),
+            );
             // Mirror lifecycle: apply promotions, treat DemoteToWarm as
             // Cold (the #516 single-use-channel workaround).
             for action in &actions {

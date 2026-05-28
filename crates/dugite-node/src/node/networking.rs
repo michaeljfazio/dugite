@@ -310,11 +310,27 @@ pub struct NodePeerManager {
     local_root_groups: Vec<LocalRootGroupInfo>,
     /// Set of big ledger peer addresses.
     big_ledger_peers: std::collections::HashSet<SocketAddr>,
+    /// Inbound-duplex peers awaiting `inboundMaturePeerDelay`.
+    ///
+    /// Mirrors Haskell's `freshDuplexPeers` (OrdPSQ keyed by `(SocketAddr,
+    /// arrival_time)`).  Peers are inserted on the first inbound `Duplex`
+    /// handshake and removed once 15 minutes have elapsed.  While in this
+    /// set, the governor excludes them from `Warm→Hot` promotion candidates
+    /// to prevent the at-tip OOM cycle (#703).  Outbound-initiated peers do
+    /// NOT enter this set — they go straight through the maturation window.
+    fresh_inbound: HashMap<SocketAddr, std::time::Instant>,
     /// Optional GSM event sender — when set, `peer_disconnected()` emits
     /// `GsmEvent::PeerDisconnected` so the GSM actor can update its peer
     /// tracking (LoE, GDD). `None` when GSM is not wired (e.g. in tests).
     gsm_event_tx: Option<tokio::sync::mpsc::Sender<crate::gsm::GsmEvent>>,
 }
+
+/// Maturation delay applied to inbound-duplex peers before they become
+/// eligible for `Warm→Hot` promotion by the outbound peer-selection
+/// governor.  Matches Haskell `inboundMaturePeerDelay = 15 * 60` in
+/// `ouroboros-network/framework/lib/Ouroboros/Network/InboundGovernor.hs`
+/// (#703 fix B).
+pub const INBOUND_MATURE_PEER_DELAY: std::time::Duration = std::time::Duration::from_secs(15 * 60);
 
 impl NodePeerManager {
     /// Create a new node peer manager with the given configuration.
@@ -326,8 +342,53 @@ impl NodePeerManager {
             local_addr: None,
             local_root_groups: Vec::new(),
             big_ledger_peers: std::collections::HashSet::new(),
+            fresh_inbound: HashMap::new(),
             gsm_event_tx: None,
         }
+    }
+
+    /// Set of inbound peers still within the `inboundMaturePeerDelay` window,
+    /// computed against `now`.  This is a read-only filter — matured entries
+    /// remain in the underlying map but are excluded from the returned set
+    /// (they are cleared on `peer_disconnected`, so the map size is bounded
+    /// by the connected-peer count).
+    ///
+    /// Used by the governor to exclude immature peers from `Warm→Hot`
+    /// promotion.  O(N) where N = number of in-flight inbound peers,
+    /// bounded by the established-peer cap.  Issue #703 fix B.
+    pub fn fresh_inbound_set(
+        &self,
+        now: std::time::Instant,
+    ) -> std::collections::HashSet<SocketAddr> {
+        self.fresh_inbound
+            .iter()
+            .filter_map(|(addr, &arrival)| {
+                if now.duration_since(arrival) < INBOUND_MATURE_PEER_DELAY {
+                    Some(*addr)
+                } else {
+                    None
+                }
+            })
+            .collect()
+    }
+
+    /// Drop matured entries from the fresh-inbound map (optional GC pass).
+    /// `peer_disconnected` already clears entries when peers leave, so this
+    /// is mainly useful for long-running connections.  Exposed for tests
+    /// and operator-driven introspection.
+    #[allow(dead_code)]
+    pub fn gc_fresh_inbound(&mut self, now: std::time::Instant) -> usize {
+        let before = self.fresh_inbound.len();
+        self.fresh_inbound
+            .retain(|_, &mut arrival| now.duration_since(arrival) < INBOUND_MATURE_PEER_DELAY);
+        before - self.fresh_inbound.len()
+    }
+
+    /// Read-only count of in-flight (still-immature) inbound peers — for
+    /// diagnostics + metrics.
+    #[allow(dead_code)]
+    pub fn fresh_inbound_count(&self) -> usize {
+        self.fresh_inbound.len()
     }
 
     /// Set the GSM event sender so `peer_disconnected()` emits events.
@@ -470,6 +531,24 @@ impl NodePeerManager {
             ConnectionDirection::Inbound => ConnectionState::InboundIdle(DataFlow::Duplex),
         };
         self.conn_states.insert(*addr, state);
+        // Track inbound-duplex arrival for the maturation gate (#703 fix B).
+        // Outbound peers always enter via known-topology / ledger / DNS
+        // sources, so they have already had time to be evaluated.  Inbound
+        // peers can arrive from anywhere on the public internet and need
+        // the 15-min cooling-off before becoming eligible for hot
+        // promotion.  Local-root inbound peers are exempt — the topology
+        // file is the operator's trusted whitelist and hot_valency must be
+        // honoured immediately.
+        if direction == ConnectionDirection::Inbound
+            && !self
+                .local_root_groups
+                .iter()
+                .any(|g| g.addrs.iter().any(|a| a == addr))
+        {
+            self.fresh_inbound
+                .entry(*addr)
+                .or_insert_with(std::time::Instant::now);
+        }
     }
 
     /// Mark a peer as disconnected.
@@ -480,6 +559,9 @@ impl NodePeerManager {
     pub fn peer_disconnected(&mut self, addr: &SocketAddr) {
         self.inner.demote_to_cold(addr);
         self.conn_states.remove(addr);
+        // Clear any fresh-inbound tracking — if they reconnect we restart
+        // the maturation window cleanly.
+        self.fresh_inbound.remove(addr);
         // Notify the GSM actor so it can deregister the peer from density tracking.
         if let Some(ref tx) = self.gsm_event_tx {
             if let Err(e) = tx.try_send(crate::gsm::GsmEvent::PeerDisconnected { addr: *addr }) {
@@ -1007,5 +1089,90 @@ mod tests {
         assert!(ips.contains(&"127.0.0.1".parse::<IpAddr>().unwrap()));
         assert!(ips.contains(&"8.8.8.8".parse::<IpAddr>().unwrap()));
         assert_eq!(ips.len(), 2);
+    }
+
+    /// #703 fix B — inbound connection marks the peer as fresh-inbound and
+    /// `fresh_inbound_set` reports it during the maturation window.
+    #[test]
+    fn inbound_peer_marked_fresh_within_window() {
+        let mut pm = NodePeerManager::new(PeerManagerConfig::default());
+        let addr: SocketAddr = "203.0.113.5:3001".parse().unwrap();
+        pm.peer_connected(&addr, ConnectionDirection::Inbound);
+        assert_eq!(pm.fresh_inbound_count(), 1);
+
+        // 14:59 — still fresh.
+        let now = std::time::Instant::now();
+        let fresh = pm.fresh_inbound_set(now + std::time::Duration::from_secs(14 * 60 + 59));
+        assert!(fresh.contains(&addr));
+    }
+
+    /// After the maturation window passes, the peer is no longer reported
+    /// as fresh (filtered out at query time).
+    #[test]
+    fn inbound_peer_matures_after_15_minutes() {
+        let mut pm = NodePeerManager::new(PeerManagerConfig::default());
+        let addr: SocketAddr = "203.0.113.5:3001".parse().unwrap();
+        pm.peer_connected(&addr, ConnectionDirection::Inbound);
+
+        // 15:01 — matured.
+        let now = std::time::Instant::now();
+        let fresh = pm.fresh_inbound_set(now + std::time::Duration::from_secs(15 * 60 + 1));
+        assert!(!fresh.contains(&addr));
+    }
+
+    /// Outbound peers MUST NOT enter the maturation window — they come from
+    /// known topology / ledger / DNS sources and have already been vetted.
+    #[test]
+    fn outbound_peer_not_marked_fresh() {
+        let mut pm = NodePeerManager::new(PeerManagerConfig::default());
+        let addr: SocketAddr = "203.0.113.5:3001".parse().unwrap();
+        pm.peer_connected(&addr, ConnectionDirection::Outbound);
+        assert_eq!(pm.fresh_inbound_count(), 0);
+    }
+
+    /// Local root inbound peers are exempt — the topology file is the
+    /// operator's trusted whitelist and hot_valency must be honoured
+    /// immediately.
+    #[test]
+    fn inbound_local_root_peer_exempt_from_maturation() {
+        let mut pm = NodePeerManager::new(PeerManagerConfig::default());
+        let addr: SocketAddr = "10.0.0.1:3001".parse().unwrap();
+        pm.add_local_root_group(LocalRootGroupInfo {
+            name: "bp".into(),
+            addrs: vec![addr],
+            hot_valency: 1,
+            warm_valency: 1,
+            diffusion_mode: None,
+            behind_firewall: false,
+            advertise: false,
+        });
+        pm.peer_connected(&addr, ConnectionDirection::Inbound);
+        assert_eq!(
+            pm.fresh_inbound_count(),
+            0,
+            "local-root inbound must skip maturation gate"
+        );
+    }
+
+    /// `peer_disconnected` cleans up the fresh-inbound entry so a reconnect
+    /// restarts the maturation window from zero.
+    #[test]
+    fn disconnect_clears_fresh_inbound() {
+        let mut pm = NodePeerManager::new(PeerManagerConfig::default());
+        let addr: SocketAddr = "203.0.113.5:3001".parse().unwrap();
+        pm.peer_connected(&addr, ConnectionDirection::Inbound);
+        assert_eq!(pm.fresh_inbound_count(), 1);
+        pm.peer_disconnected(&addr);
+        assert_eq!(pm.fresh_inbound_count(), 0);
+    }
+
+    /// Haskell parity: maturation delay is exactly 15 min.
+    #[test]
+    fn inbound_mature_peer_delay_pinned() {
+        assert_eq!(
+            INBOUND_MATURE_PEER_DELAY,
+            std::time::Duration::from_secs(15 * 60),
+            "Haskell InboundGovernor.inboundMaturePeerDelay"
+        );
     }
 }

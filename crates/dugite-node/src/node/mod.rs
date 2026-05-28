@@ -3863,10 +3863,12 @@ impl Node {
                             })
                             .collect();
                         let big_ledger = pm.big_ledger_peers().clone();
+                        let fresh_inbound = pm.fresh_inbound_set(std::time::Instant::now());
                         governor.compute_actions_with_blp(
                             &pm.inner,
                             &local_root_targets,
                             &big_ledger,
+                            &fresh_inbound,
                         )
                     };
 
