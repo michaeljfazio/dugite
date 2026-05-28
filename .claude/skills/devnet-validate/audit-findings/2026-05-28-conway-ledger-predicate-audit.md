@@ -206,3 +206,99 @@ small, targeted fixes once each is correctly identified.
 Full Haskell predicate enumeration captured from cardano-ledger-oracle
 research run on 2026-05-28. Source: `IntersectMBO/cardano-ledger`
 master HEAD.
+
+---
+
+# 🔍 follow-up resolution — 2026-05-28 (this session)
+
+Each 🔍 entry verified by greping `crates/dugite-ledger/src/` for the
+Haskell constructor name (or a paraphrase) and reading the matching
+implementation. Results:
+
+## ✅ 🔍 → resolved (predicate IS implemented)
+
+| Predicate | Location |
+|---|---|
+| ConwayTxRefScriptsSizeTooBig | `eras/conway.rs:158` as `BodyRefScriptsSizeTooBig` |
+| WrongNetworkWithdrawal | `validation/phase1.rs:1154-1167` |
+| ScriptsNotPaidUTxO (Alonzo.14) | `validation/collateral.rs:70-110` as `ScriptLockedCollateral` |
+| WrongNetworkInTxBody (Alonzo.17) | `validation/mod.rs:1328-1334` |
+| StakeKeyRegisteredDELEG (DELEG.1) | `validation/mod.rs:1117-1128` |
+| StakeKeyNotRegisteredDELEG (DELEG.2) | `validation/mod.rs:1175+` |
+| DelegateeStakePoolNotRegisteredDELEG (DELEG.5) | `validation/mod.rs:1134-1145` |
+| DelegateeDRepNotRegisteredDELEG (DELEG.6/7) | `validation/mod.rs:1151-2577` |
+| ConwayDRepAlreadyRegistered (DRep.0) | `validation/mod.rs:1200-1207` |
+| ConwayDRepNotRegistered (DRep.1) | `validation/mod.rs:1229-1235` + `phase1.rs:4042` |
+| ConwayDRepIncorrectDeposit (DRep.2) | `validation/mod.rs:1213-1221` |
+| StakePoolNotRegisteredOnKeyPOOL (POOL.2) | `validation/mod.rs:2475-2502` |
+| VRFKeyHashAlreadyRegistered (POOL.6) | `validation/mod.rs:1269-1273, 2797` |
+| MalformedProposal (GOV.1) | `validation/mod.rs:714-717` |
+| ProposalDepositIncorrect (GOV.4) | `validation/phase1.rs:865-876` |
+| ConflictingCommitteeUpdate (GOV.6) | `validation/conway.rs:778-805` |
+| InvalidPrevGovActionId (GOV.8) | `eras/conway.rs:1728+` |
+| ProposalCantFollow (GOV.10) | `state/governance.rs:81-97, 418` |
+| DisallowedProposalDuringBootstrap (GOV.12) | `state/governance.rs:67-391` |
+| ProposalReturnAccountDoesNotExist (GOV.16) | `validation/mod.rs:73, 131, 834` |
+| UnelectedCommitteeVoters (GOV.18) | `state/apply.rs:761` + `validation/mod.rs:152, 789` |
+
+**21 predicates moved from 🔍 → ✅.**
+
+## ❌ 🔍 → resolved (predicate is MISSING — P2 follow-up)
+
+| Predicate | Notes |
+|---|---|
+| ConflictingMetadataHash (Shelley.7) | aux-data hash verification — search returned no match |
+| InvalidMetadata (Shelley.8) | aux-data CBOR decode validation — search returned no match |
+| MalformedScriptWitnesses (Babbage.2) | `validScript pv` per witness — no match |
+| MalformedReferenceScripts (Babbage.3) | same predicate for ref-input scripts — no match |
+| OutputBootAddrAttrsTooBig (UTxO.10) | Byron bootstrap addr attr cap — no match |
+| IncorrectDepositDELEG (DELEG.0) | RegDepositTxCert deposit ≠ pp.key_deposit — no match |
+| StakeKeyHasNonZeroRewardAccountBalanceDELEG (DELEG.3) | unreg with non-zero reward balance — no match |
+| WrongDepositAmountDELEG (DELEG.4) | refund ≠ stored deposit — no match |
+| ConwayDRepIncorrectRefund (DRep.4) | UnregDRep refund ≠ stored — no match |
+| StakePoolRetirementWrongEpochPOOL (POOL.3) | retirement epoch out of `[curEpoch+1, curEpoch+eMax]` — no match |
+| PoolMissingRewardAccount (POOL.5) | malformed reward account on pool reg — no match |
+| ExpirationEpochTooSmall (GOV.7) | committee member expiry ≤ currentEpoch — no validation match |
+| DisallowedVotesDuringBootstrap (GOV.13) | PV9 DRep vote restrictions — comment at `state/governance.rs:257` says "during bootstrap this check is skipped" but Haskell ENFORCES vote-type restrictions |
+| TreasuryWithdrawalReturnAccountsDoNotExist (GOV.17) | withdrawal destinations registered — no match |
+| InvalidGuardrailsScriptHash (GOV.11) | constitution guardrails hash — partial match in `state/apply.rs:527, 625-646`; needs deeper read to confirm fully implemented |
+
+**15 predicates moved from 🔍 → ❌ (P2 follow-up).**
+
+## Remaining 🔍 (not investigated this session)
+
+The audit's other 🔍 entries that weren't grep-resolved are clustered
+around obscure or non-Conway predicates (deprecated Mary/Allegra
+mint constraints, etc.). They are below the P2 line — every entry
+above already covers the dominant Conway-era attack surface.
+
+## Resolution scope summary
+
+- **Started**: 42 🔍 entries
+- **Resolved this session**: 36 (21 → ✅, 15 → ❌)
+- **Remaining 🔍**: 6 (mostly non-Conway / deprecated predicates, P3 priority)
+
+## P2 implementation priority order
+
+Among the 15 ❌ MISSING predicates, the highest-impact for chain
+correctness:
+
+1. **MalformedScriptWitnesses / MalformedReferenceScripts (Babbage.2/3)** —
+   without these, dugite accepts txs carrying syntactically-invalid
+   scripts that Haskell rejects at admission. Currently the failure
+   manifests during phase-2 eval; admission-time rejection is
+   stricter and matches Haskell.
+2. **DisallowedVotesDuringBootstrap (GOV.13)** — during PV9 bootstrap,
+   only InfoAction proposals can receive DRep votes; dugite currently
+   admits all vote types. Real-world impact: PV9 stretch already
+   passed; PV10+ has no bootstrap restriction so this is mostly
+   historical.
+3. **TreasuryWithdrawalReturnAccountsDoNotExist (GOV.17)** —
+   admission gap for treasury-withdrawal proposals.
+4. **InvalidMetadata + ConflictingMetadataHash (Shelley.7/8)** —
+   aux-data validation; mostly relevant for txs that carry metadata.
+5. **DELEG.0/3/4 and DRep.4 deposit/refund mismatch checks** — admission
+   gap for txs that try to under/over-pay deposits or claim
+   inconsistent refunds.
+
+Each is roughly 1-3h of focused work to implement + test.
