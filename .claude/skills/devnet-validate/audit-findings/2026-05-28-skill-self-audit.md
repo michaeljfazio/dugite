@@ -181,6 +181,71 @@ The probe should at minimum **read** every one of these and assert sanity (non-n
 
 ## A8 (P1) — Dugite peer-state counters diverge from Haskell `cardano-node` semantics
 
+**Status: PARTIALLY RESOLVED 2026-05-28**
+
+After re-verification against the canonical Haskell source via the
+`cardano-haskell-oracle`, the three divergences in this section
+reduce to **ONE real bug** and **TWO false-positives**:
+
+### Divergence 1 (missing `PeerCooling`) — REAL — IMPLEMENTED
+
+Added to dugite in commit `<this commit>`:
+- new `PeerState::Cooling` variant (between `Cold` and `Warm`)
+- `demote_to_cooling()` for the canonical Hot/Warm → Cooling transition
+- `cooling_to_cold()` for the TerminatingState → TerminatedState analogue
+- `demote_to_cold()` preserved as fast-path (also accepts `Cooling → Cold`)
+- `is_cooling_or_cold()` helper for Haskell's `updateUnlessCoolingOrCold`
+- 3 unit tests verifying re-promotion is blocked during Cooling, only
+  valid sources for the transition fire, and the cooling → cold completion
+  unblocks future promotions
+
+Follow-up wiring to call `demote_to_cooling()` at every disconnect site
+(instead of the current `demote_to_cold()`) and to fire `cooling_to_cold()`
+on connection-manager `TerminatedState` events is a separate change.
+The state machine is now ready for those callers.
+
+### Divergence 2 (peer-counter overlap) — FALSE POSITIVE
+
+Verified via `cardano-haskell-oracle` against
+`ouroboros-network/framework/lib/Ouroboros/Network/ConnectionManager/Core.hs`
+lines 208–221. Haskell's `connectionStateToCounters` for
+`DuplexState`:
+
+```haskell
+DuplexState {}                        -> fullDuplexConn
+                                       <> duplexConn
+                                       <> inboundConn
+                                       <> outboundConn
+```
+
+A single `DuplexState` connection DOES contribute to ALL of
+`fullDuplexConns=1, duplexConns=1, inboundConns=1, outboundConns=1`
+simultaneously, regardless of `Provenance`. Dugite's behavior in
+`crates/dugite-network/src/connection/state.rs:183-189` is correct.
+The audit's claim of "double-counted" is wrong; this is the
+Haskell-canonical model.
+
+### Divergence 3 (hot/warm/cold dedup by peeraddr) — FALSE POSITIVE
+
+Verified via `cardano-haskell-oracle` against
+`Ouroboros.Network.PeerSelection.Governor.Types` line 634:
+`activePeers :: !(Set peeraddr)` where `peeraddr` is the full
+`RemoteAddress`/`SockAddr` (IP + port), not just IP. Dugite's
+`HashMap<SocketAddr, PeerInfo>` already keys by `SocketAddr` (IP +
+port). The audit's claim of double-counting was based on a
+misunderstanding of `peeraddr`'s definition. Dugite is Haskell-faithful.
+
+### A8 conclusion
+
+Original audit P1 reduced to one real change (PeerCooling, now implemented).
+The two "false-positive" divergences should NOT trigger any code change — the
+existing dugite behavior IS the canonical Haskell behavior. The 2026-05-28
+verify against the live Haskell source closes the loop.
+
+---
+
+
+
 Verified against ouroboros-network `Ouroboros.Network.PeerSelection.Types` + `Ouroboros.Network.ConnectionManager.Types` via the cardano-haskell-oracle.
 
 ### Divergence 1: missing `PeerCooling` state

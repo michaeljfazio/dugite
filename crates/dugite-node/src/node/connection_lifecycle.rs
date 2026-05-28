@@ -3997,8 +3997,8 @@ mod tests {
     /// `numKnownPeers < targetNumberOfKnownPeers && not (Set.null availableForPeerShare)`.
     #[test]
     fn governor_emits_peer_share_request_when_cold_pool_low() {
-        use dugite_network::peer::governor::{GovernorAction, GovernorConfig, PeerTargets};
-        use dugite_network::peer::manager::{PeerManager, PeerSource, PeerState};
+        use dugite_network::peer::governor::{GovernorAction, PeerTargets};
+        use dugite_network::peer::manager::{PeerManager, PeerSource};
         use std::time::Duration;
 
         let mut pm = PeerManager::new();
@@ -4032,9 +4032,7 @@ mod tests {
         );
         // The request should target our warm peer.
         assert!(
-            actions
-                .iter()
-                .any(|a| *a == GovernorAction::PeerShareRequest(warm_addr)),
+            actions.contains(&GovernorAction::PeerShareRequest(warm_addr)),
             "PeerShareRequest must target the warm peer with peer_sharing=true"
         );
     }

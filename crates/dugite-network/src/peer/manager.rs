@@ -13,14 +13,44 @@ use std::net::SocketAddr;
 use std::time::{Duration, Instant};
 
 /// Peer temperature state (Ouroboros peer lifecycle).
+///
+/// Mirrors Haskell's `PeerStatus` from
+/// `ouroboros-network/lib/Ouroboros/Network/PeerSelection/Types.hs`:
+///
+/// ```haskell
+/// data PeerStatus =
+///       PeerCold
+///     | PeerCooling
+///     -- ^ Peer is in cold state but its connection still lingers.
+///     -- The PeerCooling -> PeerCold transition is an outbound-governor
+///     -- reflection of TerminatingSt -> TerminatedSt (our version of TCP TimeWait).
+///     | PeerWarm
+///     | PeerHot
+/// ```
+///
+/// Ordering matters: `Cold < Cooling < Warm < Hot`. `updateUnlessCoolingOrCold`
+/// checks treat `Cooling` like `Cold` for promotion eligibility.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum PeerState {
     /// Known but not connected — candidate for promotion.
     Cold,
+    /// Peer in cold state but its connection still lingers
+    /// (governor's analogue of the connection manager's `TerminatingState`,
+    /// our outbound version of TCP `TIME_WAIT`). Not eligible for re-promotion
+    /// until the transition to `Cold` lands.
+    Cooling,
     /// TCP connection established, keepalive running, not yet syncing.
     Warm,
     /// Fully active — running ChainSync, BlockFetch, TxSubmission2.
     Hot,
+}
+
+impl PeerState {
+    /// Whether the peer is in a transition state that must NOT be re-promoted.
+    /// Mirrors Haskell's `updateUnlessCoolingOrCold` `(<=)` check.
+    pub fn is_cooling_or_cold(&self) -> bool {
+        matches!(self, PeerState::Cold | PeerState::Cooling)
+    }
 }
 
 /// EWMA smoothing factor (0-1). Higher = more weight on recent measurements.
@@ -233,9 +263,55 @@ impl PeerManager {
     }
 
     /// Demote a peer from warm → cold.
+    ///
+    /// Per Haskell convention (`Ouroboros.Network.PeerSelection.Governor`),
+    /// the canonical transition out of `PeerWarm` / `PeerHot` is via
+    /// `PeerCooling` (mirrors `TerminatingState` in the connection manager,
+    /// the outbound governor's version of TCP `TIME_WAIT`).
+    /// `demote_to_cold` is kept as the direct transition for callers that
+    /// know the connection is fully torn down (e.g. peer-pruning, fatal
+    /// errors). Use `demote_to_cooling` for the normal disconnect path so
+    /// the governor doesn't re-promote a peer whose connection is still
+    /// terminating.
     pub fn demote_to_cold(&mut self, addr: &SocketAddr) -> bool {
         if let Some(peer) = self.peers.get_mut(addr) {
+            if peer.state == PeerState::Warm
+                || peer.state == PeerState::Hot
+                || peer.state == PeerState::Cooling
+            {
+                peer.state = PeerState::Cold;
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Demote a peer from warm/hot → cooling.
+    ///
+    /// Cooling is the outbound governor's analogue of the connection
+    /// manager's `TerminatingState`. While in cooling, the governor must
+    /// not re-promote the peer (`updateUnlessCoolingOrCold`). The
+    /// `Cooling → Cold` transition fires once the underlying TCP
+    /// teardown completes — typically driven by a `cooling_to_cold` call
+    /// from the connection manager on `TerminatedState`.
+    pub fn demote_to_cooling(&mut self, addr: &SocketAddr) -> bool {
+        if let Some(peer) = self.peers.get_mut(addr) {
             if peer.state == PeerState::Warm || peer.state == PeerState::Hot {
+                peer.state = PeerState::Cooling;
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Complete the Cooling → Cold transition.
+    ///
+    /// Called from the connection manager when the underlying TCP
+    /// connection reaches `TerminatedState`. Idempotent — a no-op for
+    /// peers that are not currently in `Cooling`.
+    pub fn cooling_to_cold(&mut self, addr: &SocketAddr) -> bool {
+        if let Some(peer) = self.peers.get_mut(addr) {
+            if peer.state == PeerState::Cooling {
                 peer.state = PeerState::Cold;
                 return true;
             }
@@ -355,6 +431,78 @@ mod tests {
 
         // Can't promote cold directly to hot
         assert!(!pm.promote_to_hot(&addr));
+    }
+
+    #[test]
+    fn cooling_state_blocks_repromotion() {
+        // Mirrors Haskell `updateUnlessCoolingOrCold`: governor must not
+        // promote a peer while it is in `Cooling` (TerminatingState
+        // analogue). The path is hot/warm → cooling → cold, with the
+        // final cooling_to_cold gated on the connection manager event.
+        let mut pm = PeerManager::new();
+        let addr = test_addr(3001);
+        pm.add_peer(addr, PeerSource::Topology);
+        pm.promote_to_warm(&addr);
+        pm.promote_to_hot(&addr);
+
+        // Hot → Cooling (canonical disconnect path).
+        assert!(pm.demote_to_cooling(&addr));
+        assert_eq!(pm.count_by_state(PeerState::Cooling), 1);
+        assert_eq!(pm.count_by_state(PeerState::Hot), 0);
+        assert!(
+            pm.get_peer(&addr).unwrap().state.is_cooling_or_cold(),
+            "Cooling must satisfy is_cooling_or_cold for governor checks"
+        );
+
+        // Governor must NOT be able to re-promote from Cooling.
+        assert!(
+            !pm.promote_to_warm(&addr),
+            "Cooling peer must not be re-promoted to Warm directly"
+        );
+        assert!(
+            !pm.promote_to_hot(&addr),
+            "Cooling peer must not be re-promoted to Hot directly"
+        );
+
+        // Connection manager event: Cooling → Cold.
+        assert!(pm.cooling_to_cold(&addr));
+        assert_eq!(pm.count_by_state(PeerState::Cold), 1);
+        assert_eq!(pm.count_by_state(PeerState::Cooling), 0);
+
+        // Now re-promotion is allowed.
+        assert!(pm.promote_to_warm(&addr));
+        assert_eq!(pm.count_by_state(PeerState::Warm), 1);
+    }
+
+    #[test]
+    fn demote_to_cooling_only_from_warm_or_hot() {
+        let mut pm = PeerManager::new();
+        let addr = test_addr(3002);
+        pm.add_peer(addr, PeerSource::Topology);
+
+        // Cold → Cooling is NOT allowed (no live connection to terminate).
+        assert!(!pm.demote_to_cooling(&addr));
+        assert_eq!(pm.count_by_state(PeerState::Cold), 1);
+
+        // Cooling → Cooling is a no-op.
+        pm.promote_to_warm(&addr);
+        assert!(pm.demote_to_cooling(&addr));
+        assert!(!pm.demote_to_cooling(&addr));
+    }
+
+    #[test]
+    fn demote_to_cold_accepts_cooling_for_fast_teardown() {
+        // demote_to_cold preserved as fast-path for callers that know
+        // the connection is fully torn down (peer-pruning, fatal errors).
+        let mut pm = PeerManager::new();
+        let addr = test_addr(3003);
+        pm.add_peer(addr, PeerSource::Topology);
+        pm.promote_to_warm(&addr);
+        pm.demote_to_cooling(&addr);
+
+        // Cooling → Cold via demote_to_cold also works.
+        assert!(pm.demote_to_cold(&addr));
+        assert_eq!(pm.count_by_state(PeerState::Cold), 1);
     }
 
     #[test]
