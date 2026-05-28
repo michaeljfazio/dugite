@@ -533,7 +533,7 @@ pub use protocol::txsubmission::client::{TxSource, TxSubmissionClient};
 pub use protocol::txsubmission::server::TxSubmissionServer;
 pub use protocol::txsubmission::TxIdAndSize;
 
-pub use peer::manager::{PeerInfo, PeerManager, PeerSource, PeerState};
+pub use peer::manager::{PeerInfo, PeerManager, PeerSource, PeerState, PEER_LATENCY_DEFAULT_MS};
 pub use peer::{Governor, GovernorConfig, PeerTargets};
 
 pub use connection::manager::ConnectionManagerConfig;
