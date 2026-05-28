@@ -1365,7 +1365,47 @@ impl LedgerState {
                 let pool = s.pool_stake.get(pool_id).map(|stake| stake.0).unwrap_or(0);
                 (pool, total)
             }
-            None => (0, 0),
+            None => {
+                // Genesis / cold-start fallback: no SNAP rotation has populated
+                // `set`/`mark` yet. Compute pool distribution from live
+                // delegations + stake/reward balances. This mirrors Haskell's
+                // genesis `nesPd` (computed from `sgsPools`) which is a
+                // SEPARATE field from `esSnapshots` and is used for leader
+                // election in epoch 0 even though `ssStakeGo/Set/Mark` are
+                // all `mempty`. Without this fallback, leaving the snapshots
+                // unseeded at genesis would silence forge-eligibility in
+                // epoch 0 — but pre-seeding them (the prior approach) leaks
+                // the genesis stake into `ssStakeGo` at boundary 1→2 via
+                // SNAP rotation and causes the RUPD per-pool distribution to
+                // mis-fire ~22 ADA at boundary 1→2 vs Haskell's 0.
+                let mut pool_stake: HashMap<dugite_primitives::hash::Hash28, u64> =
+                    HashMap::with_capacity(self.certs.pool_params.len());
+                for (cred_hash, delegated_pool) in self.certs.delegations.iter() {
+                    if !self.certs.pool_params.contains_key(delegated_pool) {
+                        continue;
+                    }
+                    let utxo_stake = self
+                        .certs
+                        .stake_distribution
+                        .stake_map
+                        .get(cred_hash)
+                        .map(|l| l.0)
+                        .unwrap_or(0);
+                    let reward_balance = self
+                        .certs
+                        .reward_accounts
+                        .get(cred_hash)
+                        .map(|l| l.0)
+                        .unwrap_or(0);
+                    let total_for_cred = utxo_stake.saturating_add(reward_balance);
+                    if total_for_cred > 0 {
+                        *pool_stake.entry(*delegated_pool).or_insert(0) += total_for_cred;
+                    }
+                }
+                let total: u64 = pool_stake.values().sum();
+                let pool = pool_stake.get(pool_id).copied().unwrap_or(0);
+                (pool, total)
+            }
         }
     }
 
@@ -1590,6 +1630,15 @@ impl LedgerState {
     /// populate both `mark` and `set` with the same genesis-derived data —
     /// the first SNAP rotation at epoch 0→1 preserves the same pool stake
     /// into `go`, matching Haskell's observable behaviour on a quiet devnet.
+    ///
+    /// **Conway-from-genesis caveat**: on chains that boot directly in
+    /// Conway (e.g. the local devnet at PV10+), this pre-fill is wrong: the
+    /// genesis snapshot rotates into `ssStakeGo` at boundary 0→1 and causes
+    /// the RUPD per-pool distribution at boundary 1→2 to mis-fire. The
+    /// genesis bootstrap in `dugite-node::main` therefore clears these
+    /// snapshots back to `None` for Conway-from-genesis chains, after which
+    /// the forge falls back to `pool_distribution_for_slot`'s live-state
+    /// branch.
     ///
     /// No-op on Mithril-restored state, where snapshots are already loaded
     /// from the Haskell snapshot file.

@@ -5864,6 +5864,60 @@ impl Node {
         // No-op on the Mithril-restore path (snapshots already loaded).
         ledger.finalize_genesis_state();
 
+        // === Conway-from-genesis correction ===
+        //
+        // For chains that boot directly in Conway (e.g. local devnet at
+        // PV10+), the historical genesis init is wrong in two ways and
+        // would otherwise compound into a ~3.6T-lovelace per-boundary
+        // ledger divergence vs the Haskell reference (see
+        // .claude/skills/devnet-validate/audit-findings/
+        // 2026-05-28-round2-rupd-divergence.md):
+        //
+        // 1. `LedgerState::new` defaults `prev_d = 1/1` (Shelley overlay
+        //    convention). Conway always has `d = 0`, so at boundary 0→1
+        //    `compute_reward_update` would take the overlay branch and
+        //    drain `floor(rho * reserves)` from reserves to treasury
+        //    immediately. Haskell with the correct `prev_d = 0/1` enters
+        //    the non-overlay branch and sees `bprev_total_blocks = 0`
+        //    (no preceding epoch), producing `expansion = 0`. Override
+        //    `prev_d` to Conway's invariant.
+        //
+        // 2. `finalize_genesis_state` pre-fills `snapshots.mark` and
+        //    `snapshots.set` with the genesis stake distribution so the
+        //    forge can find pool stake in epoch 0. On Conway-from-genesis,
+        //    that pre-filled snapshot rotates into `ssStakeGo` at
+        //    boundary 0→1 (Haskell's `ssStakeGo` stays `mempty` for the
+        //    first few boundaries because resetStakeDistribution only
+        //    fills the SEPARATE `nesPd` field, not `esSnapshots`).
+        //    Dugite's RUPD then mis-distributes ~22 ADA in per-pool
+        //    rewards at boundary 1→2 vs Haskell's 0. Clear the
+        //    pre-filled snapshots; the forge falls back to
+        //    `pool_distribution_for_slot`'s live-state branch which
+        //    computes pool stake directly from `certs.delegations` +
+        //    UTxO + reward balances.
+        //
+        // Both Byron-genesis chains (mainnet/preview/preprod) and the
+        // Mithril-restore path are unaffected: they either never reach
+        // Conway during the harmful boundary 0→1 window, or load
+        // snapshots from the Haskell snapshot file which is already
+        // correct for the chain's current state.
+        let conway_from_genesis = ledger.epochs.protocol_params.protocol_version_major >= 9;
+        if conway_from_genesis {
+            ledger.epochs.prev_d = dugite_primitives::transaction::Rational {
+                numerator: 0,
+                denominator: 1,
+            };
+            ledger.epochs.prev_protocol_version_major =
+                ledger.epochs.protocol_params.protocol_version_major;
+            ledger.epochs.snapshots.mark = None;
+            ledger.epochs.snapshots.set = None;
+            info!(
+                pv = ledger.epochs.protocol_params.protocol_version_major,
+                "Conway-from-genesis: cleared genesis snapshot pre-fill and \
+                 set prev_d=0/1 for Haskell-faithful RUPD timing"
+            );
+        }
+
         ledger
     }
 }
@@ -6955,6 +7009,20 @@ impl Node {
                         Ok(delta) => {
                             // Publish view post-apply (#651 P2 / #652 P0).
                             self.publish_ledger_view(&ls);
+                            // Refresh governance gauges (incl. treasury /
+                            // reserves) so Prometheus reflects the
+                            // post-boundary ledger state immediately. The
+                            // bulk-sync apply path does this at sync.rs:1818;
+                            // the forge path must do the same or the
+                            // dugite_treasury_lovelace / dugite_reserves_lovelace
+                            // atomics stay stale across every epoch boundary
+                            // crossed by a locally-forged block (the BP
+                            // typically forges the boundary block itself in
+                            // single-BP devnets, so this metric path is the
+                            // ONLY one that ever updates the gauge in that
+                            // topology).
+                            self.metrics
+                                .set_governance_snapshot(&governance_snapshot_from_ledger(&ls));
                             delta
                         }
                         Err(e) => {
