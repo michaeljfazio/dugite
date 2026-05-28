@@ -750,6 +750,17 @@ pub(crate) fn convert_validation_error(
                  drep_deposit parameter {expected} (ConwayDRepIncorrectDeposit)"
             ),
         },
+        VE::DRepIncorrectRefund {
+            credential_hash,
+            declared,
+            expected,
+        } => TxValidationError::ScriptFailed {
+            reason: format!(
+                "DRep unregistration rejected: declared refund {declared} does not match \
+                 stored deposit {expected} for credential {credential_hash} \
+                 (ConwayDRepIncorrectRefund)"
+            ),
+        },
         VE::ProposalDepositIncorrect { declared, expected } => TxValidationError::ScriptFailed {
             reason: format!(
                 "Governance proposal rejected: declared deposit {declared} does not match \

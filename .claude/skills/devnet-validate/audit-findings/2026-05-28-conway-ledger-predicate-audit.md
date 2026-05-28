@@ -252,9 +252,6 @@ implementation. Results:
 | MalformedScriptWitnesses (Babbage.2) | `validScript pv` per witness — no match |
 | MalformedReferenceScripts (Babbage.3) | same predicate for ref-input scripts — no match |
 | OutputBootAddrAttrsTooBig (UTxO.10) | Byron bootstrap addr attr cap — no match |
-| IncorrectDepositDELEG (DELEG.0) | RegDepositTxCert deposit ≠ pp.key_deposit — no match |
-| StakeKeyHasNonZeroRewardAccountBalanceDELEG (DELEG.3) | unreg with non-zero reward balance — no match |
-| WrongDepositAmountDELEG (DELEG.4) | refund ≠ stored deposit — no match |
 | ConwayDRepIncorrectRefund (DRep.4) | UnregDRep refund ≠ stored — no match |
 | StakePoolRetirementWrongEpochPOOL (POOL.3) | retirement epoch out of `[curEpoch+1, curEpoch+eMax]` — no match |
 | PoolMissingRewardAccount (POOL.5) | malformed reward account on pool reg — no match |
@@ -263,7 +260,21 @@ implementation. Results:
 | TreasuryWithdrawalReturnAccountsDoNotExist (GOV.17) | withdrawal destinations registered — no match |
 | InvalidGuardrailsScriptHash (GOV.11) | constitution guardrails hash — partial match in `state/apply.rs:527, 625-646`; needs deeper read to confirm fully implemented |
 
-**15 predicates moved from 🔍 → ❌ (P2 follow-up).**
+**12 predicates moved from 🔍 → ❌ (P2 follow-up).**
+
+### Corrections to earlier ❌ markings (2026-05-28 session continued)
+
+Three predicates initially marked ❌ in this audit are ACTUALLY implemented
+under paraphrased names — the earlier grep missed them because it searched
+for the Haskell constructor name verbatim:
+
+| Predicate | Actual location | Dugite error name |
+|---|---|---|
+| IncorrectDepositDELEG (DELEG.0) | `validation/phase1.rs:655-666` (Rule 1f) | `StakeRegistrationDepositMismatch` |
+| StakeKeyHasNonZeroAccountBalanceDELEG (DELEG.3) | `validation/mod.rs:2373-2409` | `StakeKeyHasNonZeroBalance` |
+| WrongDepositAmountDELEG (DELEG.4) | `validation/phase1.rs:685-700` (Rule 1g) | `StakeDeregistrationRefundMismatch` |
+
+So the final tally is **24 → ✅** and **12 → ❌**, not 21/15.
 
 ## Remaining 🔍 (not investigated this session)
 
