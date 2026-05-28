@@ -141,9 +141,9 @@ tail -F logs/cardano-bp.log   | grep -E 'AddedToCurrentChain|AddBlockValidation\
 - Bidirectional parity wrapper (`bidirectional-parity.sh 01-bookkeeping 04-stake 06-proposals 08-negative`) exits 0 — every script is classified identically across both sockets in `evidence/<ts>/parity-matrix.csv` (zero `OFFDIAG` rows)
 - `tx-zoo/state/cross-validate.csv` shows PASS for every representative tx submitted through `dugite-cli`
 
-### Round 2 — Epoch-boundary stress (~7 min)
+### Round 2 — Epoch-boundary stress (~15 min)
 
-Goal: catch bugs that only manifest at epoch transitions — RUPD, snapshot rotation, KES rollover, leader-schedule recompute. With `epochLength=400`, a 7-min round crosses one boundary.
+Goal: catch bugs that only manifest at epoch transitions — RUPD, snapshot rotation, KES rollover, leader-schedule recompute, and the **first reward-pot movement** (treasury↑ / reserves↓). With `epochLength=400`, `k=60`, `f=0.5`, the Praos randomness-stabilisation anchor is `4k/f = 480 > 400`, so RUPD is computed in epoch *N* and applied at boundary *N+1 → N+2*. The first RUPD therefore lands at boundary **1→2 (slot 800)**, not 0→1. A 15-min soak crosses both boundaries with margin so the pot movement can be observed and byte-exactly cross-validated against Haskell.
 
 ```bash
 cd testnet/local-devnet
@@ -152,26 +152,41 @@ cd testnet/local-devnet
 sleep 30
 ./tx-zoo/run-all.sh --setup
 
-# Submit a constant tx trickle so the boundary fires under load
+# Submit a constant tx trickle so the boundaries fire under load (and produce fees)
 ( while true; do
     ./tx-zoo/01-bookkeeping/01a-simple-pay.sh >/dev/null 2>&1
     sleep 20
   done ) &
 TRICKLE=$!
 
-./soak.sh 420                       # 7 min — covers one full epoch
+./soak.sh 900                       # 15 min — covers boundaries 0→1 AND 1→2 (first RUPD)
 kill $TRICKLE 2>/dev/null
+
+# Pot-movement parity check at end (must be post-boundary 1→2, i.e. epoch >= 2)
+DBP_T=$(curl -s localhost:12798/metrics | awk '/^dugite_treasury_lovelace /{print $2}')
+DBP_R=$(curl -s localhost:12798/metrics | awk '/^dugite_reserves_lovelace /{print $2}')
+HSK=$(cardano-cli query ledger-state --testnet-magic 42 --socket-path "/tmp/ld-$UID/cbp.sock" \
+        | jq '.stateBefore.esChainAccountState // .esChainAccountState')
+HSK_T=$(echo "$HSK" | jq -r .treasury)
+HSK_R=$(echo "$HSK" | jq -r .reserves)
+echo "dugite treasury=$DBP_T reserves=$DBP_R"
+echo "haskell treasury=$HSK_T reserves=$HSK_R"
+[ "$DBP_T" = "$HSK_T" ] && [ "$DBP_R" = "$HSK_R" ] || { echo "POT PARITY FAIL"; exit 1; }
+[ "$DBP_T" -gt 0 ] || { echo "RUPD DIDN'T APPLY: treasury still 0 after boundary 1→2"; exit 1; }
+
 ./verify.sh evidence/$(ls -t evidence | head -1)
 .claude/skills/devnet-validate/scripts/analyze-evidence.sh evidence/$(ls -t evidence | head -1)
 ./stop.sh
 ```
 
 **Round 2 PASSES iff** Round 1 criteria still hold, AND:
-- `logs/dugite-bp.log` shows ≥1 `epoch transition` or `EpochTransition` event
-- `logs/cardano-bp.log` shows `TraceAdoptedBlock` for at least 5 post-boundary blocks
+- Final tip epoch ≥ 2 (boundary 1→2 was crossed) — query via `cardano-cli query tip --testnet-magic 42 --socket-path /tmp/ld-$UID/dbp.sock`
+- `logs/cardano-bp.log` shows `TraceAdoptedBlock` for at least 5 post-boundary blocks (per boundary)
 - No `RUPD`, `pulser`, `reward calculation` errors in `logs/dugite-bp.log`
 - `analyze-evidence.sh` chain-density proxy (canonical blocks ÷ slots) stays within ±20% of `activeSlotsCoeff` (0.5 on devnet)
-- `dugite_treasury_lovelace` increases and `dugite_reserves_lovelace` decreases across the boundary (RUPD applied)
+- After boundary 1→2: `dugite_treasury_lovelace > 0` AND `dugite_reserves_lovelace < genesis_reserves` (RUPD applied)
+- `dugite_treasury_lovelace` **byte-exactly equals** `cardano-bp.esChainAccountState.treasury` AND `dugite_reserves_lovelace` **byte-exactly equals** `cardano-bp.esChainAccountState.reserves` (the only acceptable ledger semantic per `feedback_haskell_byte_exact_only`)
+- Boundary 0→1 having `treasury=0, reserves=genesis` is **expected and correct** on this devnet (RUPD anchor `4k/f=480 > epoch_len=400`); the pot-movement check applies post-1→2 only
 
 ### Round 3 — Restart resilience (~5 min)
 
