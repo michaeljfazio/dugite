@@ -1169,6 +1169,7 @@ impl ConnectionLifecycleManager {
         let gsm_event_tx = self.gsm_event_tx.clone();
         let peer_intersection_established = self.peer_intersection_established.clone();
         let peer_failure_tx = self.peer_failure_tx.clone();
+        let peer_manager = self.peer_manager_for_servers.clone();
 
         Box::new(move |channel, cancel| {
             Box::pin(async move {
@@ -1190,6 +1191,7 @@ impl ConnectionLifecycleManager {
                     cancel.clone(),
                     gsm_event_tx,
                     peer_intersection_established,
+                    peer_manager,
                 )
                 .await;
                 // Report any non-cancel failure to the peer manager so the

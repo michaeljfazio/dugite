@@ -319,6 +319,18 @@ pub struct NodePeerManager {
     /// to prevent the at-tip OOM cycle (#703).  Outbound-initiated peers do
     /// NOT enter this set — they go straight through the maturation window.
     fresh_inbound: HashMap<SocketAddr, std::time::Instant>,
+    /// Per-peer record of recent rollback-below-immutable witnesses.
+    ///
+    /// When a peer's `MsgRollBackward` targets a slot older than our
+    /// ImmutableDB tip, either the peer is stale/lying OR our local chain
+    /// has diverged from the canonical network chain (Ouroboros k-block
+    /// finality says one of these must be true).
+    ///
+    /// Each entry stores `(timestamp, rollback_slot, immutable_slot)`.  The
+    /// run-loop polls `divergence_witness_count(now, window)` to detect a
+    /// multi-peer divergence consensus and surface a clear operator error.
+    /// Issue #699.
+    rollback_below_immutable_witnesses: HashMap<SocketAddr, (std::time::Instant, u64, u64)>,
     /// Optional GSM event sender — when set, `peer_disconnected()` emits
     /// `GsmEvent::PeerDisconnected` so the GSM actor can update its peer
     /// tracking (LoE, GDD). `None` when GSM is not wired (e.g. in tests).
@@ -343,6 +355,7 @@ impl NodePeerManager {
             local_root_groups: Vec::new(),
             big_ledger_peers: std::collections::HashSet::new(),
             fresh_inbound: HashMap::new(),
+            rollback_below_immutable_witnesses: HashMap::new(),
             gsm_event_tx: None,
         }
     }
@@ -370,6 +383,57 @@ impl NodePeerManager {
                 }
             })
             .collect()
+    }
+
+    /// Record that `peer` offered a `MsgRollBackward` targeting a slot older
+    /// than our ImmutableDB tip.  Used by the run-loop to detect a
+    /// multi-peer divergence consensus.  Issue #699.
+    pub fn record_rollback_below_immutable(
+        &mut self,
+        peer: SocketAddr,
+        rollback_slot: u64,
+        immutable_slot: u64,
+    ) {
+        self.rollback_below_immutable_witnesses.insert(
+            peer,
+            (std::time::Instant::now(), rollback_slot, immutable_slot),
+        );
+    }
+
+    /// Number of DISTINCT peers that have witnessed a rollback-below-immutable
+    /// event in the last `window` duration.
+    ///
+    /// If this reaches the divergence-witness threshold (typically 3-5), the
+    /// node has likely diverged from the canonical chain.  Operator action
+    /// required: wipe the DB and re-sync from genesis, OR import a fresh
+    /// Mithril snapshot.  Issue #699.
+    pub fn divergence_witness_count(
+        &self,
+        now: std::time::Instant,
+        window: std::time::Duration,
+    ) -> usize {
+        self.rollback_below_immutable_witnesses
+            .values()
+            .filter(|(t, _, _)| now.duration_since(*t) < window)
+            .count()
+    }
+
+    /// Drop divergence witnesses older than `window` (housekeeping).
+    /// Issue #699.
+    pub fn gc_divergence_witnesses(
+        &mut self,
+        now: std::time::Instant,
+        window: std::time::Duration,
+    ) {
+        self.rollback_below_immutable_witnesses
+            .retain(|_, (t, _, _)| now.duration_since(*t) < window);
+    }
+
+    /// Read-only iterator over divergence witnesses for diagnostics.
+    pub fn divergence_witnesses(
+        &self,
+    ) -> impl Iterator<Item = (&SocketAddr, &(std::time::Instant, u64, u64))> {
+        self.rollback_below_immutable_witnesses.iter()
     }
 
     /// Drop matured entries from the fresh-inbound map (optional GC pass).
@@ -1174,5 +1238,89 @@ mod tests {
             std::time::Duration::from_secs(15 * 60),
             "Haskell InboundGovernor.inboundMaturePeerDelay"
         );
+    }
+
+    /// #699 — recording rollback-below-immutable from a single peer counts as 1.
+    #[test]
+    fn divergence_witness_single_peer_counts_once() {
+        let mut pm = NodePeerManager::new(PeerManagerConfig::default());
+        let a: SocketAddr = "10.0.0.1:3001".parse().unwrap();
+        pm.record_rollback_below_immutable(a, 4_500_000, 7_500_000);
+        let n = pm.divergence_witness_count(
+            std::time::Instant::now(),
+            std::time::Duration::from_secs(60),
+        );
+        assert_eq!(n, 1);
+    }
+
+    /// Multiple peers reporting divergence are counted as distinct witnesses.
+    #[test]
+    fn divergence_witness_counts_distinct_peers() {
+        let mut pm = NodePeerManager::new(PeerManagerConfig::default());
+        for i in 1..=5u16 {
+            let a: SocketAddr = format!("10.0.0.{i}:3001").parse().unwrap();
+            pm.record_rollback_below_immutable(a, 4_500_000, 7_500_000);
+        }
+        let n = pm.divergence_witness_count(
+            std::time::Instant::now(),
+            std::time::Duration::from_secs(60),
+        );
+        assert_eq!(n, 5);
+    }
+
+    /// Repeated reports from the same peer don't inflate the count.
+    #[test]
+    fn divergence_witness_idempotent_per_peer() {
+        let mut pm = NodePeerManager::new(PeerManagerConfig::default());
+        let a: SocketAddr = "10.0.0.1:3001".parse().unwrap();
+        for _ in 0..10 {
+            pm.record_rollback_below_immutable(a, 4_500_000, 7_500_000);
+        }
+        let n = pm.divergence_witness_count(
+            std::time::Instant::now(),
+            std::time::Duration::from_secs(60),
+        );
+        assert_eq!(n, 1);
+    }
+
+    /// Stale witnesses (outside the window) are not counted.
+    #[test]
+    fn divergence_witness_window_excludes_stale_entries() {
+        let mut pm = NodePeerManager::new(PeerManagerConfig::default());
+        let a: SocketAddr = "10.0.0.1:3001".parse().unwrap();
+        pm.record_rollback_below_immutable(a, 4_500_000, 7_500_000);
+
+        // Query 10 minutes later — still inside a 15-min window.
+        let now = std::time::Instant::now();
+        let n = pm.divergence_witness_count(
+            now + std::time::Duration::from_secs(10 * 60),
+            std::time::Duration::from_secs(15 * 60),
+        );
+        assert_eq!(n, 1);
+
+        // 20 minutes later — outside.
+        let n = pm.divergence_witness_count(
+            now + std::time::Duration::from_secs(20 * 60),
+            std::time::Duration::from_secs(15 * 60),
+        );
+        assert_eq!(n, 0);
+    }
+
+    /// `gc_divergence_witnesses` drops stale entries.
+    #[test]
+    fn divergence_witness_gc() {
+        let mut pm = NodePeerManager::new(PeerManagerConfig::default());
+        for i in 1..=3u16 {
+            let a: SocketAddr = format!("10.0.0.{i}:3001").parse().unwrap();
+            pm.record_rollback_below_immutable(a, 4_500_000, 7_500_000);
+        }
+        assert_eq!(pm.rollback_below_immutable_witnesses.len(), 3);
+
+        let now = std::time::Instant::now();
+        pm.gc_divergence_witnesses(
+            now + std::time::Duration::from_secs(20 * 60),
+            std::time::Duration::from_secs(15 * 60),
+        );
+        assert_eq!(pm.rollback_below_immutable_witnesses.len(), 0);
     }
 }
