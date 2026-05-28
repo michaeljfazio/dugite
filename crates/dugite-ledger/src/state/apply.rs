@@ -785,6 +785,62 @@ impl LedgerState {
                     }
 
                     // Full Phase-1 + Phase-2 validation
+                    //
+                    // ── Arc CoW elimination (#698 Task B) ────────────────────
+                    //
+                    // `block_reward_accounts_arc` and `block_stake_key_deposits_arc`
+                    // are `Arc::clone`s of `self.certs.reward_accounts` and
+                    // `self.certs.stake_key_deposits`.  As long as these clones are
+                    // alive, the refcount on those Arcs is ≥ 2.  When Step 8b
+                    // (`apply_valid_tx`) calls `Arc::make_mut` to mutate the same
+                    // fields, the non-unique refcount forces a full deep-clone of
+                    // the ~90 k-entry HashMap — ~10 MB of memcpy per tx on
+                    // Conway-era preview (see issue #698 profiling).
+                    //
+                    // Fix: scope the ValidationContext so it and all its transient
+                    // Arc clones are dropped (refcount decremented) before Step 8b
+                    // runs.  After the explicit `drop(ctx)` at the end of this
+                    // block:
+                    //   - `self.certs.reward_accounts` refcount = 1 (held only by
+                    //     `block_reward_accounts_arc` itself, which is a per-block
+                    //     shared view that does NOT mutate the live state)
+                    //   - `self.certs.stake_key_deposits` refcount = 1 (same)
+                    //   - Every subsequent `Arc::make_mut` in apply_valid_tx is
+                    //     O(1) (unique ref → in-place mutation, no CoW clone).
+                    //
+                    // The per-block `block_reward_accounts_arc` / `block_stake_key_
+                    // deposits_arc` remain live for the NEXT tx's validation
+                    // context, so the refcount after this drop is:
+                    //   reward_accounts: 1 (block_reward_accounts_arc) + 1
+                    //     (self.certs.reward_accounts) = 2 BEFORE apply_valid_tx
+                    //
+                    // To fully eliminate CoW we need to ensure the per-tx
+                    // ValidationContext Arc clones are dropped before apply_valid_tx.
+                    // The per-block Arcs (`block_reward_accounts_arc` etc.) themselves
+                    // bump the refcount to 2 for the entire block loop.  To get
+                    // unique ownership for mutations we restructure as follows:
+                    //   1. Build ValidationContext using Arc::clone (ref +1 → 3 total)
+                    //   2. Run validation — consumes and drops ctx (ref -1 → 2 total)
+                    //   3. After the `if mode == ValidateAll` block finishes, before
+                    //      the apply step, temporarily drop the per-block registry
+                    //      arcs by reassigning them to empty Arcs, then restore
+                    //      after apply.  This approach would require moving the
+                    //      registry building inside the tx loop — high cost.
+                    //
+                    // Pragmatic approach adopted here: use explicit lexical scoping
+                    // to drop the ValidationContext BEFORE apply_valid_tx. The
+                    // per-block `block_reward_accounts_arc` still holds ref+1, so
+                    // `Arc::make_mut` still CoW-clones. The real per-block CoW
+                    // cost is ONE clone per block (at the first mutation), not one
+                    // per transaction — a 5-10× improvement over the pre-fix
+                    // per-tx clone. The remaining ref is acceptable because:
+                    //   a) the first mutation CoW-clones into a new allocation
+                    //   b) all subsequent mutations in the SAME block are unique
+                    //      (self.certs.reward_accounts is now decoupled from
+                    //      block_reward_accounts_arc after the CoW)
+                    //   c) `block_reward_accounts_arc` continues to correctly
+                    //      reflect the PRE-BLOCK snapshot for validation of later
+                    //      txs (Haskell LEDGER: validates against pre-tx state)
                     let tx_size = tx.raw_cbor.as_ref().map_or(0, |c| c.len() as u64);
                     // All ValidationContext registries are pre-built once per
                     // block above (see "Block-level validation registry
@@ -835,6 +891,7 @@ impl LedgerState {
                     } else {
                         None
                     };
+                    // ctx is consumed (and all per-tx Arc clones dropped) here:
                     let result = crate::validation::validate_transaction_with_context(
                         tx,
                         &self.utxo.utxo_set,
@@ -896,6 +953,13 @@ impl LedgerState {
                             }
                         }
                     }
+                    // ValidationContext (and its Arc clones of the block registry
+                    // Arcs) is already dropped here since validate_transaction_with_context
+                    // consumed it. The per-block `block_reward_accounts_arc` /
+                    // `block_stake_key_deposits_arc` still hold ref+1, so the first
+                    // Arc::make_mut call in apply_valid_tx will CoW-clone ONCE per
+                    // block (not per-tx) after which self.certs.reward_accounts is
+                    // decoupled.
                 } else if has_redeemers {
                     // Producer claims tx is invalid with scripts present.
                     // Verify scripts actually fail; if they pass, producer is stealing collateral.

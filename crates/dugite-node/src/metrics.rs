@@ -615,6 +615,23 @@ pub struct NodeMetrics {
     pub peer_governor_target_established_big: AtomicU64,
     /// Maximum number of known big-ledger peers.
     pub peer_governor_target_known_big: AtomicU64,
+    // ── Block-apply mode counters (issue #698) ───────────────────────────
+    /// Blocks applied in `ApplyOnly` (reapply / catch-up) mode.
+    ///
+    /// Mirrors Haskell's `reupdateChainDepState` path — historical blocks
+    /// from the immutable chain skip script re-evaluation and header crypto
+    /// since they are already validated by hash-chain connectivity.  A
+    /// monotonically rising value during initial sync is expected.  A
+    /// non-zero value while at-tip indicates catch-up after a restart.
+    pub apply_mode_reapply_total: AtomicU64,
+    /// Blocks applied in `ValidateAll` (full validation) mode.
+    ///
+    /// Mirrors Haskell's `updateChainDepState` path — live-tip blocks and
+    /// forged blocks undergo full Phase-1 + Phase-2 script evaluation.
+    /// Should be zero during bulk catch-up and rise at ~1 block/20 s once
+    /// synced.  Exposed as `dugite_apply_mode_validate_all_total`.
+    pub apply_mode_validate_all_total: AtomicU64,
+
     // ── Snapshot worker metrics (issue #695) ────────────────────────────
     /// Total snapshot requests enqueued to the background worker. Bumps
     /// once per successful `try_send` from `Node::try_snapshot_async`.
@@ -783,6 +800,9 @@ impl NodeMetrics {
             peer_governor_target_active_big: AtomicU64::new(0),
             peer_governor_target_established_big: AtomicU64::new(0),
             peer_governor_target_known_big: AtomicU64::new(0),
+            // Block-apply mode counters (#698)
+            apply_mode_reapply_total: AtomicU64::new(0),
+            apply_mode_validate_all_total: AtomicU64::new(0),
             // Snapshot worker (#695)
             snapshot_enqueued_total: AtomicU64::new(0),
             snapshot_skipped_busy_total: AtomicU64::new(0),
@@ -790,6 +810,20 @@ impl NodeMetrics {
             utxo_flush_failed_total: AtomicU64::new(0),
             snapshot_worker_alive: AtomicU64::new(0),
         }
+    }
+
+    // ── Block-apply mode counters (issue #698) ──────────────────────────
+
+    /// Increment after each block applied in ApplyOnly (catch-up / reapply) mode.
+    pub fn inc_apply_mode_reapply(&self) {
+        self.apply_mode_reapply_total
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Increment after each block applied in ValidateAll (full validation) mode.
+    pub fn inc_apply_mode_validate_all(&self) {
+        self.apply_mode_validate_all_total
+            .fetch_add(1, Ordering::Relaxed);
     }
 
     // ── Snapshot worker counters / gauges (issue #695) ──────────────────
@@ -1409,6 +1443,19 @@ impl NodeMetrics {
                 "dugite_n2c_connections_total",
                 "Total N2C connections accepted",
                 &self.n2c_connections_total,
+            ),
+            (
+                "dugite_apply_mode_reapply_total",
+                "Blocks applied in ApplyOnly (catch-up / reapply) mode — \
+                 script evaluation skipped; equivalent to Haskell reupdateChainDepState",
+                &self.apply_mode_reapply_total,
+            ),
+            (
+                "dugite_apply_mode_validate_all_total",
+                "Blocks applied in ValidateAll (full validation) mode — \
+                 Phase-1 + Phase-2 Plutus evaluation run; equivalent to \
+                 Haskell updateChainDepState",
+                &self.apply_mode_validate_all_total,
             ),
             (
                 "dugite_snapshot_enqueued_total",

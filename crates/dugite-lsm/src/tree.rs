@@ -393,20 +393,14 @@ impl LsmTree {
     /// is safer against any future optimisation that reorders within a batch.
     pub fn apply_batch(&mut self, inserts: &[(Key, Value)], deletes: &[Key]) -> Result<()> {
         // --- WAL logging ------------------------------------------------
-        // Write one WAL entry per operation when WAL is enabled. We cannot
-        // produce a single "batch" WAL record without changing the WAL
-        // format (which would break existing WAL replay), so we just loop.
-        // The per-operation WAL overhead is already gone when WAL is
-        // disabled during replay, which is the primary use-case for this
-        // method. When WAL is enabled (at-tip mode), the number of
-        // operations per block is small enough that individual entries are
-        // fine.
-        for (key, value) in inserts {
-            self.wal.log_insert(key, value)?;
-        }
-        for key in deletes {
-            self.wal.log_delete(key)?;
-        }
+        // Serialise all inserts + deletes into one contiguous buffer and
+        // flush once (WAL::log_batch).  This eliminates the per-entry
+        // flush() syscall cost that dominated at-tip apply time (~10 µs
+        // context switch × 300 entries/block ≈ 3 ms/block; see issue #698).
+        // Durability semantics are identical to the per-entry path: each
+        // entry still carries its own CRC and the replayer processes them
+        // individually.
+        self.wal.log_batch(inserts, deletes)?;
 
         // --- Memtable update -------------------------------------------
         // Apply all inserts then all deletes. In the memtable (BTreeMap)
@@ -933,6 +927,62 @@ mod tests {
             tree.get(&Key::from([2u8])).unwrap().unwrap().as_ref(),
             &[22u8]
         );
+    }
+
+    /// Verify that `apply_batch` with WAL enabled writes all entries to the
+    /// WAL in a single batch that can be fully replayed on re-open — this
+    /// validates the WAL::log_batch durability path (issue #698 Task C).
+    #[test]
+    fn test_apply_batch_wal_durability_replay() {
+        let dir = tempfile::tempdir().unwrap();
+
+        // Write entries via apply_batch with WAL enabled.
+        {
+            let config = LsmConfig {
+                wal_enabled: true,
+                memtable_size: 128 * 1024 * 1024, // large — no auto-flush
+                ..LsmConfig::default()
+            };
+            let mut tree = LsmTree::open(dir.path(), config).unwrap();
+
+            let inserts: Vec<(Key, Value)> = (0u8..20)
+                .map(|i| (Key::from([i]), Value::from([i + 100])))
+                .collect();
+            let deletes: Vec<Key> = (0u8..5).map(|i| Key::from([i])).collect();
+
+            // apply_batch uses log_batch internally.
+            tree.apply_batch(&inserts, &deletes).unwrap();
+            // Do NOT flush — we want to test WAL recovery.
+            // Tree is dropped here without explicit flush.
+        }
+
+        // Reopen the tree — WAL replay must recover all inserts and tombstones.
+        {
+            let config = LsmConfig {
+                wal_enabled: true,
+                memtable_size: 128 * 1024 * 1024,
+                ..LsmConfig::default()
+            };
+            let tree = LsmTree::open(dir.path(), config).unwrap();
+
+            // Keys 0-4 were deleted (tombstone in WAL replayed).
+            for i in 0u8..5 {
+                assert!(
+                    tree.get(&Key::from([i])).unwrap().is_none(),
+                    "key {i} should be deleted"
+                );
+            }
+            // Keys 5-19 were inserted.
+            for i in 5u8..20 {
+                let got = tree.get(&Key::from([i])).unwrap();
+                assert!(got.is_some(), "key {i} should exist after WAL replay");
+                assert_eq!(
+                    got.unwrap().as_ref(),
+                    &[i + 100],
+                    "value mismatch for key {i}"
+                );
+            }
+        }
     }
 
     #[test]

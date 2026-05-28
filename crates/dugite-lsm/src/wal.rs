@@ -97,6 +97,11 @@ impl WalWriter {
     }
 
     /// Append an insert operation to the WAL.
+    ///
+    /// Each call issues a `write_all` + `flush` for durability.  For bulk
+    /// block-level writes prefer [`log_batch`] which serialises all entries
+    /// into a single `write_all` + one `flush`, eliminating the per-entry
+    /// syscall overhead (~10 µs context-switch per flush on Linux).
     pub fn log_insert(&mut self, key: &Key, value: &Value) -> Result<()> {
         if !self.enabled {
             return Ok(());
@@ -129,6 +134,10 @@ impl WalWriter {
     }
 
     /// Append a delete operation to the WAL.
+    ///
+    /// Each call issues a `write_all` + `flush` for durability.  For bulk
+    /// block-level writes prefer [`log_batch`] which serialises all entries
+    /// into a single `write_all` + one `flush`.
     pub fn log_delete(&mut self, key: &Key) -> Result<()> {
         if !self.enabled {
             return Ok(());
@@ -153,6 +162,98 @@ impl WalWriter {
         writer.flush()?;
 
         self.segment_bytes += 4 + payload_len + 4;
+        Ok(())
+    }
+
+    /// Append a batch of insert and delete operations in a single `write_all` + `flush`.
+    ///
+    /// This is the preferred write path for block-level UTxO diffs.  Compared
+    /// to calling [`log_insert`] / [`log_delete`] per entry, batching amortises
+    /// the `flush()` syscall cost (≈10 µs context switch on Linux) across all
+    /// entries in the batch — a ~300-entry Babbage block pays one flush instead
+    /// of 300.
+    ///
+    /// ## Durability
+    ///
+    /// All entries are serialised into a single contiguous buffer and written
+    /// atomically via one `write_all` call followed by one `flush`.  A crash
+    /// between `write_all` and `flush` leaves a partial segment that the WAL
+    /// replayer skips via CRC mismatch — exactly the same recovery path as a
+    /// mid-entry crash in the single-entry path.  Within the batch the CRC is
+    /// per entry (not per batch) so the replayer recovers as many complete
+    /// entries as it can from the tail segment.
+    ///
+    /// ## Segment rotation
+    ///
+    /// Rotation is checked once before writing.  If the batch itself would
+    /// overflow the segment limit the write still proceeds — the segment is
+    /// allowed to exceed `max_segment_size` by at most one batch rather than
+    /// splitting a batch across two segments (which would complicate the
+    /// replayer).  The next single-entry write or batch will trigger rotation.
+    pub fn log_batch(&mut self, inserts: &[(Key, Value)], deletes: &[Key]) -> Result<()> {
+        if !self.enabled {
+            return Ok(());
+        }
+        if inserts.is_empty() && deletes.is_empty() {
+            return Ok(());
+        }
+
+        // Rotate before writing if the current segment is already full.
+        self.maybe_rotate()?;
+
+        // Pre-compute total buffer size: one framed entry per insert/delete.
+        //
+        // Insert entry:  4 (total_len) + payload_len + 4 (crc)
+        //   payload_len = 1 (op) + 2 (key_len) + key + 2 (value_len) + value
+        // Delete entry:  4 (total_len) + payload_len + 4 (crc)
+        //   payload_len = 1 (op) + 2 (key_len) + key
+        let mut total_bytes: usize = 0;
+        for (key, value) in inserts.iter() {
+            let payload_len = 1 + 2 + key.len() + 2 + value.len();
+            total_bytes += 4 + payload_len + 4;
+        }
+        for key in deletes.iter() {
+            let payload_len = 1 + 2 + key.len();
+            total_bytes += 4 + payload_len + 4;
+        }
+
+        let mut buf: Vec<u8> = Vec::with_capacity(total_bytes);
+
+        // Encode inserts.
+        for (key, value) in inserts.iter() {
+            let payload_len = 1 + 2 + key.len() + 2 + value.len();
+            // Build payload first for CRC.
+            let mut payload = Vec::with_capacity(payload_len);
+            payload.push(OP_INSERT);
+            payload.write_u16::<LittleEndian>(key.len() as u16)?;
+            payload.extend_from_slice(key.as_ref());
+            payload.write_u16::<LittleEndian>(value.len() as u16)?;
+            payload.extend_from_slice(value.as_ref());
+            let crc = crc32fast::hash(&payload);
+            buf.write_u32::<LittleEndian>(payload_len as u32)?;
+            buf.extend_from_slice(&payload);
+            buf.write_u32::<LittleEndian>(crc)?;
+        }
+
+        // Encode deletes.
+        for key in deletes.iter() {
+            let payload_len = 1 + 2 + key.len();
+            let mut payload = Vec::with_capacity(payload_len);
+            payload.push(OP_DELETE);
+            payload.write_u16::<LittleEndian>(key.len() as u16)?;
+            payload.extend_from_slice(key.as_ref());
+            let crc = crc32fast::hash(&payload);
+            buf.write_u32::<LittleEndian>(payload_len as u32)?;
+            buf.extend_from_slice(&payload);
+            buf.write_u32::<LittleEndian>(crc)?;
+        }
+
+        // Single write_all + flush — the key performance gain vs per-entry path.
+        let writer = self.writer.as_mut().unwrap();
+        writer.write_all(&buf)?;
+        writer.flush()?;
+
+        self.segment_bytes += buf.len();
         Ok(())
     }
 
@@ -363,6 +464,184 @@ fn open_segment(wal_dir: &Path, segment_num: u64) -> Result<BufWriter<File>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── log_batch tests ──────────────────────────────────────────────────
+
+    /// log_batch with inserts only: all entries replay correctly and
+    /// produce the same result as individual log_insert calls.
+    #[test]
+    fn test_wal_log_batch_inserts_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let wal_dir = dir.path().join("wal");
+
+        let inserts: Vec<(Key, Value)> = (0u8..5)
+            .map(|i| (Key::from([i]), Value::from([i * 10])))
+            .collect();
+
+        {
+            let mut writer = WalWriter::new(&wal_dir, 64 * 1024 * 1024, true).unwrap();
+            writer.log_batch(&inserts, &[]).unwrap();
+        }
+
+        let ops = replay_wal(&wal_dir).unwrap();
+        assert_eq!(ops.len(), 5);
+        for (idx, op) in ops.iter().enumerate() {
+            match op {
+                WalOp::Insert(k, v) => {
+                    assert_eq!(k.as_ref(), &[idx as u8]);
+                    assert_eq!(v.as_ref(), &[idx as u8 * 10]);
+                }
+                _ => panic!("expected insert at idx {idx}"),
+            }
+        }
+    }
+
+    /// log_batch with deletes only: tombstones replay correctly.
+    #[test]
+    fn test_wal_log_batch_deletes_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let wal_dir = dir.path().join("wal");
+
+        let deletes: Vec<Key> = (10u8..13).map(|i| Key::from([i])).collect();
+
+        {
+            let mut writer = WalWriter::new(&wal_dir, 64 * 1024 * 1024, true).unwrap();
+            writer.log_batch(&[], &deletes).unwrap();
+        }
+
+        let ops = replay_wal(&wal_dir).unwrap();
+        assert_eq!(ops.len(), 3);
+        for (idx, op) in ops.iter().enumerate() {
+            match op {
+                WalOp::Delete(k) => {
+                    assert_eq!(k.as_ref(), &[(10 + idx) as u8]);
+                }
+                _ => panic!("expected delete at idx {idx}"),
+            }
+        }
+    }
+
+    /// log_batch with mixed inserts and deletes: all entries present in
+    /// declaration order (inserts first, then deletes — matching encode order).
+    #[test]
+    fn test_wal_log_batch_mixed() {
+        let dir = tempfile::tempdir().unwrap();
+        let wal_dir = dir.path().join("wal");
+
+        let inserts = vec![
+            (Key::from([1u8]), Value::from([100u8])),
+            (Key::from([2u8]), Value::from([200u8])),
+        ];
+        let deletes = vec![Key::from([3u8]), Key::from([4u8])];
+
+        {
+            let mut writer = WalWriter::new(&wal_dir, 64 * 1024 * 1024, true).unwrap();
+            writer.log_batch(&inserts, &deletes).unwrap();
+        }
+
+        let ops = replay_wal(&wal_dir).unwrap();
+        assert_eq!(ops.len(), 4, "expected 2 inserts + 2 deletes");
+        // inserts are encoded first
+        match &ops[0] {
+            WalOp::Insert(k, v) => {
+                assert_eq!(k.as_ref(), &[1u8]);
+                assert_eq!(v.as_ref(), &[100u8]);
+            }
+            _ => panic!("ops[0] should be insert"),
+        }
+        match &ops[1] {
+            WalOp::Insert(k, v) => {
+                assert_eq!(k.as_ref(), &[2u8]);
+                assert_eq!(v.as_ref(), &[200u8]);
+            }
+            _ => panic!("ops[1] should be insert"),
+        }
+        match &ops[2] {
+            WalOp::Delete(k) => assert_eq!(k.as_ref(), &[3u8]),
+            _ => panic!("ops[2] should be delete"),
+        }
+        match &ops[3] {
+            WalOp::Delete(k) => assert_eq!(k.as_ref(), &[4u8]),
+            _ => panic!("ops[3] should be delete"),
+        }
+    }
+
+    /// log_batch on a disabled WAL is a no-op (no file created, returns Ok).
+    #[test]
+    fn test_wal_log_batch_disabled() {
+        let dir = tempfile::tempdir().unwrap();
+        let wal_dir = dir.path().join("wal");
+
+        let inserts = vec![(Key::from([1u8]), Value::from([99u8]))];
+        let mut writer = WalWriter::new(&wal_dir, 64 * 1024 * 1024, false).unwrap();
+        writer.log_batch(&inserts, &[]).unwrap();
+
+        // No WAL directory should be created when WAL is disabled.
+        assert!(!wal_dir.exists());
+    }
+
+    /// log_batch empty: no-op, no file created beyond the open segment.
+    #[test]
+    fn test_wal_log_batch_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        let wal_dir = dir.path().join("wal");
+
+        {
+            let mut writer = WalWriter::new(&wal_dir, 64 * 1024 * 1024, true).unwrap();
+            writer.log_batch(&[], &[]).unwrap();
+        }
+
+        // Replay should return 0 ops (empty batch is a no-op).
+        let ops = replay_wal(&wal_dir).unwrap();
+        assert!(ops.is_empty());
+    }
+
+    /// log_batch results are identical to individual log_insert / log_delete calls
+    /// (round-trip parity).
+    #[test]
+    fn test_wal_log_batch_parity_with_individual() {
+        let dir_batch = tempfile::tempdir().unwrap();
+        let dir_individual = tempfile::tempdir().unwrap();
+
+        let inserts: Vec<(Key, Value)> = (0u8..8)
+            .map(|i| (Key::from([i, i + 1]), Value::from(vec![i; 4])))
+            .collect();
+        let deletes: Vec<Key> = (8u8..11).map(|i| Key::from([i])).collect();
+
+        // Write via batch
+        {
+            let mut w = WalWriter::new(dir_batch.path(), 64 * 1024 * 1024, true).unwrap();
+            w.log_batch(&inserts, &deletes).unwrap();
+        }
+
+        // Write via individual calls
+        {
+            let mut w = WalWriter::new(dir_individual.path(), 64 * 1024 * 1024, true).unwrap();
+            for (k, v) in &inserts {
+                w.log_insert(k, v).unwrap();
+            }
+            for k in &deletes {
+                w.log_delete(k).unwrap();
+            }
+        }
+
+        let batch_ops = replay_wal(dir_batch.path()).unwrap();
+        let individual_ops = replay_wal(dir_individual.path()).unwrap();
+
+        assert_eq!(batch_ops.len(), individual_ops.len(), "op count must match");
+        for (b, i) in batch_ops.iter().zip(individual_ops.iter()) {
+            match (b, i) {
+                (WalOp::Insert(bk, bv), WalOp::Insert(ik, iv)) => {
+                    assert_eq!(bk.as_ref(), ik.as_ref(), "insert key mismatch");
+                    assert_eq!(bv.as_ref(), iv.as_ref(), "insert value mismatch");
+                }
+                (WalOp::Delete(bk), WalOp::Delete(ik)) => {
+                    assert_eq!(bk.as_ref(), ik.as_ref(), "delete key mismatch");
+                }
+                _ => panic!("op type mismatch between batch and individual"),
+            }
+        }
+    }
 
     #[test]
     fn test_wal_write_and_replay() {

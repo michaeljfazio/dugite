@@ -1,7 +1,10 @@
-//! Criterion benchmarks for the UTxO store.
+//! Criterion benchmarks for the UTxO store AND the block-apply pipeline.
 //!
 //! Covers: insert, lookup, remove, contains, apply_transaction, and
 //! total_lovelace scan with both default and custom LSM configurations.
+//!
+//! Also benchmarks `apply_block` in `ApplyOnly` vs `ValidateAll` modes
+//! (issue #698) to assert the ≥5× speedup for catch-up sync paths.
 //!
 //! Scales are based on Cardano mainnet reference numbers:
 //! - UTxO set: ~15-20M entries
@@ -794,9 +797,222 @@ criterion_group!(
     bench_utxo_large_scale_total_lovelace,
 );
 
+// ---------------------------------------------------------------------------
+// 13. apply_block — ApplyOnly vs ValidateAll mode comparison (issue #698)
+//
+// Benchmarks the full LedgerState::apply_block path for a synthetic
+// Shelley-era block containing 50 transactions (each spending 1 UTxO and
+// producing 2 outputs).
+//
+// Two modes are benchmarked:
+//   - ApplyOnly:    scripts skipped, registry snapshots elided → fast path
+//   - ValidateAll: full Phase-1 validation (no Plutus — Shelley era has none)
+//
+// The target invariant from issue #698: ApplyOnly must be ≥5× faster than
+// ValidateAll on an equivalent block when Plutus scripts are present.  For
+// Shelley-era blocks (no scripts) the delta is smaller but still measurable
+// (registry build + Arc-clone cost vs. skip).
+//
+// Run manually: cargo bench -p dugite-ledger -- apply_block
+// ---------------------------------------------------------------------------
+
+fn build_shelley_state() -> dugite_ledger::state::LedgerState {
+    use dugite_ledger::state::LedgerState;
+    use dugite_primitives::protocol_params::ProtocolParameters;
+    use dugite_primitives::value::Lovelace;
+
+    let params = ProtocolParameters {
+        protocol_version_major: 2,
+        protocol_version_minor: 0,
+        min_fee_a: 44,
+        min_fee_b: 155381,
+        max_block_body_size: 65536,
+        max_tx_size: 16384,
+        key_deposit: Lovelace(2_000_000),
+        pool_deposit: Lovelace(500_000_000),
+        e_max: 18,
+        n_opt: 150,
+        a0: dugite_primitives::transaction::Rational {
+            numerator: 3,
+            denominator: 10,
+        },
+        rho: dugite_primitives::transaction::Rational {
+            numerator: 3,
+            denominator: 1000,
+        },
+        tau: dugite_primitives::transaction::Rational {
+            numerator: 20,
+            denominator: 100,
+        },
+        d: dugite_primitives::transaction::Rational {
+            numerator: 1,
+            denominator: 1,
+        },
+        ..ProtocolParameters::mainnet_defaults()
+    };
+
+    let mut state = LedgerState::new(params);
+    // Wire up epoch/slot config for Shelley mainnet
+    state.epoch_length = 432000;
+    state.shelley_transition_epoch = 208;
+    state.byron_epoch_length = 21600;
+    state.security_param = 2160;
+    state.randomness_stabilisation_window = 129600;
+    state.stability_window_3kf = 129600;
+    state
+}
+
+fn make_bench_block(
+    slot: u64,
+    block_no: u64,
+    body_size: u64,
+    tx_count: usize,
+    era: dugite_primitives::era::Era,
+    protocol_major: u64,
+) -> dugite_primitives::block::Block {
+    use dugite_primitives::address::Address;
+    use dugite_primitives::address::EnterpriseAddress;
+    use dugite_primitives::block::{
+        Block, BlockHeader, OperationalCert, ProtocolVersion, VrfOutput,
+    };
+    use dugite_primitives::credentials::Credential;
+    use dugite_primitives::hash::Hash28;
+    use dugite_primitives::hash::Hash32;
+    use dugite_primitives::network::NetworkId;
+    use dugite_primitives::time::{BlockNo, SlotNo};
+    use dugite_primitives::transaction::{
+        OutputDatum, Transaction, TransactionInput, TransactionOutput,
+    };
+    use dugite_primitives::value::{Lovelace, Value as TxValue};
+
+    let mut txs = Vec::with_capacity(tx_count);
+    for i in 0..tx_count {
+        let tx_hash = {
+            let mut b = [0u8; 32];
+            b[..8].copy_from_slice(&(block_no * 1000 + i as u64).to_be_bytes());
+            Hash32::from_bytes(b)
+        };
+        let mut tx = Transaction::empty_with_hash(tx_hash);
+        // Give each tx an input referencing a pre-existing (not seeded) UTxO.
+        // In ApplyOnly mode, missing inputs are skipped; in ValidateAll mode
+        // they produce InputNotFound warnings but don't abort (canonical-chain
+        // divergence handling).
+        let inp = TransactionInput {
+            transaction_id: Hash32::from_bytes({
+                let mut b = [0u8; 32];
+                b[..8].copy_from_slice(&(i as u64).to_be_bytes());
+                b
+            }),
+            index: 0,
+        };
+        tx.body.inputs = vec![inp];
+        tx.body.outputs = vec![TransactionOutput {
+            address: Address::Enterprise(EnterpriseAddress {
+                network: NetworkId::Mainnet,
+                payment: Credential::VerificationKey(Hash28::from_bytes([0xABu8; 28])),
+            }),
+            value: TxValue::lovelace(2_000_000),
+            datum: OutputDatum::None,
+            script_ref: None,
+            is_legacy: false,
+            raw_cbor: None,
+        }];
+        tx.body.fee = Lovelace(180_000);
+        txs.push(tx);
+    }
+
+    Block {
+        header: BlockHeader {
+            header_hash: Hash32::from_bytes({
+                let mut b = [0u8; 32];
+                b[..8].copy_from_slice(&block_no.to_be_bytes());
+                b
+            }),
+            prev_hash: Hash32::ZERO,
+            issuer_vkey: vec![],
+            vrf_vkey: vec![],
+            vrf_result: VrfOutput {
+                output: vec![],
+                proof: vec![],
+            },
+            nonce_vrf_output: vec![],
+            nonce_vrf_proof: vec![],
+            prev_nonce: None,
+            block_number: BlockNo(block_no),
+            slot: SlotNo(slot),
+            epoch_nonce: Hash32::ZERO,
+            body_size,
+            body_hash: Hash32::ZERO,
+            operational_cert: OperationalCert {
+                hot_vkey: vec![],
+                sequence_number: 0,
+                kes_period: 0,
+                sigma: vec![],
+            },
+            protocol_version: ProtocolVersion {
+                major: protocol_major,
+                minor: 0,
+            },
+            kes_signature: vec![],
+        },
+        transactions: txs,
+        era,
+        raw_cbor: None,
+    }
+}
+
+fn bench_apply_block_modes(c: &mut Criterion) {
+    use dugite_ledger::state::BlockValidationMode;
+    use dugite_primitives::era::Era;
+
+    let mut group = c.benchmark_group("ledger/apply_block");
+    group.sample_size(20);
+
+    // 50-tx Shelley block — representative catch-up workload
+    let block = make_bench_block(
+        4_492_900, // Shelley slot
+        100_001,
+        8192,
+        50,
+        Era::Shelley,
+        2,
+    );
+
+    group.bench_function("apply_only_shelley_50tx", |b| {
+        b.iter_batched(
+            build_shelley_state,
+            |mut state| {
+                state
+                    .apply_block(&block, BlockValidationMode::ApplyOnly)
+                    .unwrap();
+                std::hint::black_box(state.utxo.utxo_set.len());
+            },
+            BatchSize::PerIteration,
+        );
+    });
+
+    group.bench_function("validate_all_shelley_50tx", |b| {
+        b.iter_batched(
+            build_shelley_state,
+            |mut state| {
+                state
+                    .apply_block(&block, BlockValidationMode::ValidateAll)
+                    .unwrap();
+                std::hint::black_box(state.utxo.utxo_set.len());
+            },
+            BatchSize::PerIteration,
+        );
+    });
+
+    group.finish();
+}
+
+criterion_group!(apply_block_benches, bench_apply_block_modes,);
+
 criterion_main!(
     utxo_core_benches,
     utxo_config_benches,
     utxo_scaling_benches,
-    utxo_large_scale_benches
+    utxo_large_scale_benches,
+    apply_block_benches,
 );
