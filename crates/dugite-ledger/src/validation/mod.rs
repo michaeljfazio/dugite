@@ -104,6 +104,14 @@ pub struct ValidationContext {
     /// treated as distinct DReps, matching the Haskell `KeyHashObj` /
     /// `ScriptHashObj` discrimination.
     pub registered_dreps: Option<Arc<HashSet<Hash32>>>,
+    /// Per-DRep stored deposit amount, keyed identically to
+    /// [`Self::registered_dreps`]. Required by the
+    /// `ConwayDRepIncorrectRefund` predicate (Conway GOVCERT rule): an
+    /// `UnregDRep` certificate carries an inline refund amount which must
+    /// equal the deposit paid at registration time. When `None`, the
+    /// refund-mismatch predicate is silently skipped (lenient default —
+    /// matches the convention used by `stake_key_deposits`).
+    pub drep_deposits: Option<Arc<HashMap<Hash32, u64>>>,
     pub registered_vrf_keys: Option<Arc<HashMap<Hash32, Hash28>>>,
     pub node_network: Option<NetworkId>,
     pub committee_members: Option<Arc<HashSet<Hash32>>>,
@@ -317,6 +325,16 @@ impl ValidationContext {
 
     pub fn with_stake_key_deposits_arc(mut self, deposits: Arc<HashMap<Hash32, u64>>) -> Self {
         self.stake_key_deposits = Some(deposits);
+        self
+    }
+
+    pub fn with_drep_deposits(mut self, deposits: HashMap<Hash32, u64>) -> Self {
+        self.drep_deposits = Some(Arc::new(deposits));
+        self
+    }
+
+    pub fn with_drep_deposits_arc(mut self, deposits: Arc<HashMap<Hash32, u64>>) -> Self {
+        self.drep_deposits = Some(deposits);
         self
     }
 
@@ -1242,6 +1260,42 @@ pub enum ValidationError {
         /// Hex-encoded DRep credential hash (zero-padded to 32 bytes).
         credential_hash: String,
     },
+    /// Haskell `ConwayDRepIncorrectRefund`: an `UnregDRep` certificate
+    /// carries a refund amount that does not match the deposit stored at
+    /// registration time.
+    ///
+    /// Per Haskell `conwayGovCertTransition` (Conway GOVCERT rule):
+    ///
+    /// ```haskell
+    /// ConwayUnRegDRep cred refund -> do
+    ///   let mDRepState = Map.lookup cred (certState ^. certVStateL . vsDRepsL)
+    ///       drepRefundMismatch = do
+    ///         drepState <- mDRepState
+    ///         let paidDeposit = drepState ^. drepDepositL
+    ///         guard (refund /= paidDeposit)
+    ///         pure paidDeposit
+    ///   isJust mDRepState ?! (injectFailure . ConwayDRepNotRegistered) cred
+    ///   failOnJust drepRefundMismatch $ injectFailure . ConwayDRepIncorrectRefund . Mismatch refund
+    /// ```
+    ///
+    /// `paidDeposit = drepState ^. drepDepositL` — the compact coin stored
+    /// when the DRep registered. Fires when `refund /= paidDeposit`.
+    ///
+    /// Reference: Haskell `ConwayDRepIncorrectRefund` in
+    /// `cardano-ledger-conway:Cardano.Ledger.Conway.Rules.GovCert`.
+    #[error(
+        "DRep unregistration rejected: declared refund {declared} does not match \
+         stored deposit {expected} for credential {credential_hash} \
+         (ConwayDRepIncorrectRefund)"
+    )]
+    DRepIncorrectRefund {
+        /// Hex-encoded DRep credential hash (zero-padded to 32 bytes).
+        credential_hash: String,
+        /// Refund amount declared in the `UnregDRep` certificate.
+        declared: u64,
+        /// Expected refund (deposit paid at registration time).
+        expected: u64,
+    },
     /// Haskell `ProposalDepositIncorrect`: a governance proposal declares a
     /// deposit amount that does not match the current `gov_action_deposit`
     /// protocol parameter.
@@ -1776,6 +1830,67 @@ pub fn validate_transaction_with_context(
         context.vote_delegations.as_deref(),
     );
 
+    // ------------------------------------------------------------------
+    // Conway GOVCERT: ConwayDRepIncorrectRefund
+    //
+    // An `UnregDRep` certificate carries an inline `refund` amount which
+    // must exactly equal the deposit paid at registration time (stored
+    // per-credential in [`ValidationContext::drep_deposits`]). Without this
+    // check, a malicious tx could withdraw arbitrary lovelace from the
+    // deposit pot by declaring a refund larger than the original deposit.
+    //
+    // Per Haskell `conwayGovCertTransition` (GOVCERT sub-rule of CERTS):
+    //
+    // ```haskell
+    // ConwayUnRegDRep cred refund -> do
+    //   let mDRepState = Map.lookup cred (certState ^. certVStateL . vsDRepsL)
+    //       drepRefundMismatch = do
+    //         drepState <- mDRepState
+    //         let paidDeposit = drepState ^. drepDepositL
+    //         guard (refund /= paidDeposit)
+    //         pure paidDeposit
+    //   isJust mDRepState ?! (injectFailure . ConwayDRepNotRegistered) cred
+    //   failOnJust drepRefundMismatch $
+    //     injectFailure . ConwayDRepIncorrectRefund . Mismatch refund
+    // ```
+    //
+    // We skip the refund check when the DRep is unknown (the
+    // `ConwayDRepNotRegistered` predicate has already fired in the inner
+    // `validate_transaction_with_pools` for that case). Silently skipped
+    // when `drep_deposits` is `None` (lenient default — mirrors the
+    // `stake_key_deposits` convention).
+    //
+    // Reference: Haskell `ConwayDRepIncorrectRefund` in
+    // `cardano-ledger-conway:Cardano.Ledger.Conway.Rules.GovCert`.
+    // ------------------------------------------------------------------
+    let mut extra_errors_pre: Vec<ValidationError> = Vec::new();
+    if let (Some(dreps), Some(deposits)) = (
+        context.registered_dreps.as_deref(),
+        context.drep_deposits.as_deref(),
+    ) {
+        for cert in &tx.body.certificates {
+            if let dugite_primitives::transaction::Certificate::UnregDRep { credential, refund } =
+                cert
+            {
+                let key = credential.to_typed_hash32();
+                if !dreps.contains(&key) {
+                    // Already flagged inside as DRepNotRegistered; skip
+                    // refund check (Haskell's `?!` short-circuit).
+                    continue;
+                }
+                if let Some(stored_deposit) = deposits.get(&key) {
+                    if refund.0 != *stored_deposit {
+                        extra_errors_pre.push(ValidationError::DRepIncorrectRefund {
+                            credential_hash: key.to_hex(),
+                            declared: refund.0,
+                            expected: *stored_deposit,
+                        });
+                    }
+                }
+            }
+        }
+    }
+
     // Conway GOV `VotersDoNotExist` and `DisallowedVoters` predicates.
     //
     // Both are PV >= 9 only and operate on `tx.body.voting_procedures`.
@@ -2273,6 +2388,10 @@ pub fn validate_transaction_with_context(
         }
     }
 
+    // Fold extra_errors_pre into extra_errors so the final match handles
+    // all three error sources uniformly.
+    extra_errors.append(&mut extra_errors_pre);
+
     match (pools_result, extra_errors.is_empty()) {
         (Ok(()), true) => Ok(()),
         (Ok(()), false) => Err(extra_errors),
@@ -2769,6 +2888,10 @@ pub fn validate_transaction_with_pools(
                 }
             }
         }
+
+        // (ConwayDRepIncorrectRefund predicate is enforced in
+        //  `validate_transaction_with_context` where `drep_deposits` is in
+        //  scope — see the comment block there.)
 
         // ------------------------------------------------------------------
         // DRep deposit amount validation (Haskell `ConwayDRepIncorrectDeposit`)

@@ -4167,6 +4167,185 @@ mod tests {
         );
     }
 
+    // -----------------------------------------------------------------------
+    // Tests — ConwayDRepIncorrectRefund (P2 follow-up)
+    //
+    // `UnregDRep` whose declared `refund` does not match the deposit stored
+    // at registration time must be rejected. Mirrors Haskell
+    // `conwayGovCertTransition` (GOVCERT). The check runs in
+    // `validate_transaction_with_context` (drep_deposits lives on the
+    // ValidationContext).
+    // -----------------------------------------------------------------------
+
+    /// Refund matches stored deposit → no DRepIncorrectRefund.
+    #[test]
+    fn test_unreg_drep_refund_matches_accepted() {
+        use crate::validation::{validate_transaction_with_context, ValidationContext};
+        let cred_hash = Hash28::from_bytes([0xDEu8; 28]);
+        let (utxo_set, mut tx, _) = make_valid_tx();
+        let stored_deposit = 500_000_000u64;
+        tx.body.certificates.push(Certificate::UnregDRep {
+            credential: Credential::VerificationKey(cred_hash),
+            refund: Lovelace(stored_deposit), // matches stored
+        });
+        let params = {
+            let mut p = ProtocolParameters::mainnet_defaults();
+            p.protocol_version_major = 9;
+            p
+        };
+        let credential = Credential::VerificationKey(cred_hash);
+        let key = credential.to_typed_hash32();
+        let mut dreps = std::collections::HashSet::new();
+        dreps.insert(key);
+        let mut deposits = std::collections::HashMap::new();
+        deposits.insert(key, stored_deposit);
+
+        let context = ValidationContext::new()
+            .with_dreps(dreps)
+            .with_drep_deposits(deposits);
+
+        let errors =
+            validate_transaction_with_context(&tx, &utxo_set, &params, 100, 300, None, context)
+                .err()
+                .unwrap_or_default();
+        assert!(
+            !errors
+                .iter()
+                .any(|e| matches!(e, ValidationError::DRepIncorrectRefund { .. })),
+            "matching refund must not produce DRepIncorrectRefund, got {errors:?}"
+        );
+    }
+
+    /// Refund != stored deposit → DRepIncorrectRefund fires.
+    #[test]
+    fn test_unreg_drep_refund_mismatch_rejected() {
+        use crate::validation::{validate_transaction_with_context, ValidationContext};
+        let cred_hash = Hash28::from_bytes([0xDEu8; 28]);
+        let (utxo_set, mut tx, _) = make_valid_tx();
+        let stored_deposit = 500_000_000u64;
+        let declared_refund = 999_999_999u64; // mismatch
+        tx.body.certificates.push(Certificate::UnregDRep {
+            credential: Credential::VerificationKey(cred_hash),
+            refund: Lovelace(declared_refund),
+        });
+        let params = {
+            let mut p = ProtocolParameters::mainnet_defaults();
+            p.protocol_version_major = 9;
+            p
+        };
+        let credential = Credential::VerificationKey(cred_hash);
+        let key = credential.to_typed_hash32();
+        let mut dreps = std::collections::HashSet::new();
+        dreps.insert(key);
+        let mut deposits = std::collections::HashMap::new();
+        deposits.insert(key, stored_deposit);
+
+        let context = ValidationContext::new()
+            .with_dreps(dreps)
+            .with_drep_deposits(deposits);
+
+        let errors =
+            validate_transaction_with_context(&tx, &utxo_set, &params, 100, 300, None, context)
+                .unwrap_err();
+
+        let found = errors.iter().any(|e| {
+            matches!(
+                e,
+                ValidationError::DRepIncorrectRefund {
+                    declared,
+                    expected,
+                    ..
+                }
+                if *declared == declared_refund && *expected == stored_deposit
+            )
+        });
+        assert!(
+            found,
+            "refund mismatch must produce DRepIncorrectRefund(declared={declared_refund}, \
+             expected={stored_deposit}), got {errors:?}"
+        );
+    }
+
+    /// `drep_deposits=None` → refund check skipped (lenient default).
+    #[test]
+    fn test_unreg_drep_refund_no_deposits_skipped() {
+        use crate::validation::{validate_transaction_with_context, ValidationContext};
+        let cred_hash = Hash28::from_bytes([0xDEu8; 28]);
+        let (utxo_set, mut tx, _) = make_valid_tx();
+        tx.body.certificates.push(Certificate::UnregDRep {
+            credential: Credential::VerificationKey(cred_hash),
+            refund: Lovelace(999_999_999), // would mismatch if checked
+        });
+        let params = {
+            let mut p = ProtocolParameters::mainnet_defaults();
+            p.protocol_version_major = 9;
+            p
+        };
+        let credential = Credential::VerificationKey(cred_hash);
+        let key = credential.to_typed_hash32();
+        let mut dreps = std::collections::HashSet::new();
+        dreps.insert(key);
+
+        // drep_deposits NOT supplied → predicate must be silently skipped
+        let context = ValidationContext::new().with_dreps(dreps);
+
+        let errors =
+            validate_transaction_with_context(&tx, &utxo_set, &params, 100, 300, None, context)
+                .err()
+                .unwrap_or_default();
+        assert!(
+            !errors
+                .iter()
+                .any(|e| matches!(e, ValidationError::DRepIncorrectRefund { .. })),
+            "drep_deposits=None must skip refund check, got {errors:?}"
+        );
+    }
+
+    /// Unknown DRep + refund mismatch → only DRepNotRegistered fires
+    /// (mirrors Haskell `?!` short-circuit before the refund check).
+    #[test]
+    fn test_unreg_drep_unknown_skips_refund_check() {
+        use crate::validation::{validate_transaction_with_context, ValidationContext};
+        let cred_hash = Hash28::from_bytes([0xDEu8; 28]);
+        let (utxo_set, mut tx, _) = make_valid_tx();
+        tx.body.certificates.push(Certificate::UnregDRep {
+            credential: Credential::VerificationKey(cred_hash),
+            refund: Lovelace(999_999_999),
+        });
+        let params = {
+            let mut p = ProtocolParameters::mainnet_defaults();
+            p.protocol_version_major = 9;
+            p
+        };
+        // DRep is NOT in registered_dreps; refund check should be skipped
+        // (DRepNotRegistered handles it).
+        let credential = Credential::VerificationKey(cred_hash);
+        let key = credential.to_typed_hash32();
+        let mut deposits = std::collections::HashMap::new();
+        deposits.insert(key, 500_000_000u64);
+
+        let context = ValidationContext::new()
+            .with_dreps(std::collections::HashSet::new()) // empty
+            .with_drep_deposits(deposits);
+
+        let errors =
+            validate_transaction_with_context(&tx, &utxo_set, &params, 100, 300, None, context)
+                .unwrap_err();
+
+        assert!(
+            errors
+                .iter()
+                .any(|e| matches!(e, ValidationError::DRepNotRegistered { .. })),
+            "expected DRepNotRegistered for unknown DRep, got {errors:?}"
+        );
+        assert!(
+            !errors
+                .iter()
+                .any(|e| matches!(e, ValidationError::DRepIncorrectRefund { .. })),
+            "unknown DRep must short-circuit refund check, got {errors:?}"
+        );
+    }
+
     /// `RegDRep` for an already-registered DRep must not produce `DRepNotRegistered`.
     /// (Regression: ensure the check only applies to `UnregDRep`.)
     #[test]
