@@ -22,9 +22,10 @@ socket2 = { workspace = true }
 num-bigint = { workspace = true }
 hex = { workspace = true }
 rand = { workspace = true }
+# Required for SwappableSender (non-poisoning mutex for MuxHandle::resubscribe).
+parking_lot = { workspace = true }
 
 [dev-dependencies]
-parking_lot = { workspace = true }
 tempfile = { workspace = true }
 tokio = { workspace = true, features = ["test-util"] }
 proptest = { workspace = true }

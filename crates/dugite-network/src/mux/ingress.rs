@@ -22,6 +22,7 @@
 //! task returns `IngressQueueOverrun` to disconnect the peer.
 
 use bytes::Bytes;
+use parking_lot::Mutex;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -30,6 +31,27 @@ use tokio::sync::mpsc;
 
 use crate::error::{BearerError, MuxError};
 use crate::mux::segment::{decode_header, Direction, HEADER_SIZE};
+
+/// An atomically swappable ingress sender.
+///
+/// Wraps `mpsc::Sender<Bytes>` in `Arc<Mutex<>>` so that `MuxHandle::resubscribe()`
+/// can atomically install a fresh receiver while the `IngressTask` is still running.
+/// When the ingress task tries `try_send` on a stale (closed) sender, it sees
+/// `TrySendError::Closed` and continues the loop unchanged — the TCP connection
+/// and mux task stay alive.
+///
+/// Used to implement Haskell's `deactivatePeerConnection` semantics: stop hot
+/// mini-protocol tasks without closing TCP or the mux bearer.
+pub type SwappableSender = Arc<Mutex<mpsc::Sender<Bytes>>>;
+
+/// Capacity of each per-protocol ingress mpsc channel (item count).
+///
+/// Sized to cover BlockFetch's per-block frame count: with ~12 KB SDUs the
+/// 24 MB byte limit fits in ~2000 items; 4096 leaves headroom for fragmented
+/// frames and pipelined ChainSync bursts (default pipeline depth 300).
+/// Used both in `Mux::subscribe()` and in `MuxHandle::resubscribe()` to
+/// create fresh channels of the same capacity.
+pub(crate) const INGRESS_CHANNEL_CAPACITY: usize = 4096;
 
 /// Reserved protocol ID that is silently discarded on ingress.
 const RESERVED_PROTOCOL_ID: u16 = 1;
@@ -56,8 +78,11 @@ const SDU_READ_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Per-protocol ingress channel registration.
 pub(crate) struct IngressRoute {
-    /// Sender to deliver byte chunks to the protocol's MuxChannel.
-    pub tx: mpsc::Sender<Bytes>,
+    /// Swappable sender to deliver byte chunks to the protocol's MuxChannel.
+    ///
+    /// Wrapped in `Arc<Mutex<>>` so `MuxHandle::resubscribe()` can atomically
+    /// install a fresh receiver without stopping the ingress task or closing TCP.
+    pub tx: SwappableSender,
     /// Maximum bytes allowed in this channel's queue before overrun.
     pub limit: usize,
     /// Shared byte counter between this ingress route and the corresponding
@@ -209,7 +234,13 @@ impl IngressTask {
                     //
                     // MuxChannel::recv() will decrement bytes_in_flight after
                     // consuming the chunk.
-                    match route.tx.try_send(Bytes::from(payload)) {
+                    // Lock the SwappableSender briefly to perform try_send.
+                    // `parking_lot::Mutex` is non-poisoning and lock is always brief
+                    // (try_send is non-blocking). `MuxHandle::resubscribe()` also
+                    // takes this lock to swap in a fresh sender — that swap is also
+                    // brief (single assignment + store).
+                    let send_result = route.tx.lock().try_send(Bytes::from(payload));
+                    match send_result {
                         Ok(()) => {} // delivered successfully
                         Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
                             // Channel full — protocol is not consuming fast enough.
@@ -224,7 +255,10 @@ impl IngressTask {
                             });
                         }
                         Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
-                            // Receiver dropped (protocol shut down) — undo counter.
+                            // Receiver dropped (protocol shut down or resubscribe() in
+                            // progress between old receiver drop and new sender install).
+                            // Undo counter and continue — the mux and TCP stay alive;
+                            // the next resubscribe() call will install a fresh sender.
                             route
                                 .bytes_in_flight
                                 .fetch_sub(payload_len, Ordering::Relaxed);
@@ -259,6 +293,11 @@ impl IngressTask {
 mod tests {
     use super::*;
 
+    /// Wrap a plain `mpsc::Sender` in a `SwappableSender` for test `IngressRoute` construction.
+    fn swappable(tx: mpsc::Sender<Bytes>) -> SwappableSender {
+        Arc::new(Mutex::new(tx))
+    }
+
     /// Build a raw SDU (header + payload) for testing.
     fn build_sdu(protocol_id: u16, direction: Direction, payload: &[u8]) -> Vec<u8> {
         use crate::mux::segment::encode_header;
@@ -283,7 +322,7 @@ mod tests {
         routes.insert(
             (2, Direction::ResponderDir),
             IngressRoute {
-                tx: tx2,
+                tx: swappable(tx2),
                 limit: 65536,
                 bytes_in_flight: Arc::new(AtomicUsize::new(0)),
             },
@@ -292,7 +331,7 @@ mod tests {
         routes.insert(
             (3, Direction::ResponderDir),
             IngressRoute {
-                tx: tx3,
+                tx: swappable(tx3),
                 limit: 65536,
                 bytes_in_flight: Arc::new(AtomicUsize::new(0)),
             },
@@ -351,7 +390,7 @@ mod tests {
         routes.insert(
             (2, Direction::ResponderDir),
             IngressRoute {
-                tx: tx2,
+                tx: swappable(tx2),
                 limit: 65536,
                 bytes_in_flight: Arc::new(AtomicUsize::new(0)),
             },
@@ -443,7 +482,7 @@ mod tests {
         routes.insert(
             (5, Direction::ResponderDir),
             IngressRoute {
-                tx,
+                tx: swappable(tx),
                 limit: 65536,
                 bytes_in_flight: Arc::new(AtomicUsize::new(0)),
             },
@@ -489,7 +528,7 @@ mod tests {
         routes.insert(
             (5, Direction::InitiatorDir),
             IngressRoute {
-                tx,
+                tx: swappable(tx),
                 limit: 65536,
                 bytes_in_flight: Arc::new(AtomicUsize::new(0)),
             },
@@ -571,7 +610,7 @@ mod tests {
         routes.insert(
             (2, Direction::ResponderDir),
             IngressRoute {
-                tx,
+                tx: swappable(tx),
                 limit: 2, // very small limit: 2 bytes
                 bytes_in_flight: Arc::new(AtomicUsize::new(0)),
             },
@@ -620,7 +659,7 @@ mod tests {
         routes.insert(
             (2, Direction::ResponderDir),
             IngressRoute {
-                tx: tx2,
+                tx: swappable(tx2),
                 limit: 65536,
                 bytes_in_flight: Arc::new(AtomicUsize::new(0)),
             },
@@ -667,7 +706,7 @@ mod tests {
         routes.insert(
             (2, Direction::ResponderDir),
             IngressRoute {
-                tx,
+                tx: swappable(tx),
                 limit: 65536,
                 bytes_in_flight: bytes_in_flight.clone(),
             },
@@ -722,7 +761,7 @@ mod tests {
         routes.insert(
             (2, Direction::ResponderDir),
             IngressRoute {
-                tx,
+                tx: swappable(tx),
                 limit: 65536,
                 bytes_in_flight: Arc::new(AtomicUsize::new(0)),
             },
@@ -773,7 +812,7 @@ mod tests {
         routes.insert(
             (2, Direction::ResponderDir),
             IngressRoute {
-                tx: tx2,
+                tx: swappable(tx2),
                 limit: 65536,
                 bytes_in_flight: Arc::new(AtomicUsize::new(0)),
             },

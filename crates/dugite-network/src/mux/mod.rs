@@ -23,6 +23,7 @@ pub mod egress;
 pub mod ingress;
 pub mod segment;
 
+use parking_lot::Mutex;
 use std::collections::HashMap;
 use std::sync::atomic::AtomicUsize;
 use std::sync::Arc;
@@ -32,30 +33,79 @@ use tokio::sync::mpsc;
 
 use crate::bearer::Bearer;
 use crate::error::MuxError;
+use crate::mux::ingress::SwappableSender;
 
 pub use channel::MuxChannel;
 pub use segment::{Direction, SduHeader, HEADER_SIZE};
 
-/// Per-protocol ingress channel capacity (number of byte chunks buffered).
+/// Re-subscription handle for Hot→Warm demotion without closing TCP.
 ///
-/// This must be large enough to absorb the largest expected protocol burst
-/// without blocking the ingress task — if it blocks, ALL other protocols
-/// on the same mux (KeepAlive, ChainSync, BlockFetch) are starved because
-/// the ingress task cannot read further data from the bearer.
+/// Mirrors Haskell's `deactivatePeerConnection` in
+/// `PeerStateActions.hs#L978`:  when hot mini-protocol tasks exit, the mux
+/// bearer stays alive.  `MuxHandle` provides `resubscribe()` to install
+/// fresh ingress receivers atomically via the running `IngressTask`'s
+/// `SwappableSender`s — no TCP teardown required.
 ///
-/// Haskell's network-mux uses a byte-count buffer (`maximumIngressQueue`)
-/// rather than an item-count channel:
-/// * ChainSync — 462 KB (300 × 1400 × 1.1)
-/// * BlockFetch — ~22 MB (`max(10 × 2 MiB, 100 × 88 KiB) × 1.1`)
-/// * TxSubmission — 7.2 MB
-///
-/// dugite enforces the byte cap separately via `ingress_limit` /
-/// `bytes_in_flight` on each subscribed channel; this constant is the
-/// **item-count** ceiling.  Sized to comfortably cover BlockFetch's
-/// per-block frame count: with ~12 KB SDUs the 24 MB byte limit fits in
-/// ~2 000 items, so 4 096 leaves headroom for fragmented frames and
-/// pipelined ChainSync bursts (default pipeline depth 300).
-const INGRESS_CHANNEL_CAPACITY: usize = 4096;
+/// Obtained via [`Mux::take_handle()`] BEFORE calling [`Mux::run()`].
+pub struct MuxHandle {
+    /// Per-(protocol_id, direction) swappable sender + ingress limit +
+    /// shared `bytes_in_flight` counter.
+    senders: HashMap<(u16, Direction), (SwappableSender, usize, Arc<AtomicUsize>)>,
+    /// Egress sender — cloned into fresh `MuxChannel` returned by `resubscribe()`.
+    egress_tx: mpsc::Sender<(u16, Direction, Bytes)>,
+}
+
+impl MuxHandle {
+    /// Create an empty handle that always returns `None` from `resubscribe()`.
+    ///
+    /// Used in unit tests and fake `PeerConnection` instances where there is
+    /// no real mux backing the channels.
+    pub fn empty() -> Self {
+        let (egress_tx, _) = mpsc::channel(1);
+        Self {
+            senders: HashMap::new(),
+            egress_tx,
+        }
+    }
+
+    /// Atomically install a fresh ingress receiver for the given
+    /// `(protocol_id, direction)` and return a new [`MuxChannel`].
+    ///
+    /// The running `IngressTask` will start delivering frames to the new
+    /// receiver immediately after the swap.  The `bytes_in_flight` counter
+    /// is reset to zero so the new receiver begins with a clean budget.
+    ///
+    /// Returns `None` if the protocol was not registered (e.g., this is an
+    /// inbound-only connection that didn't subscribe initiator-side hot
+    /// channels).
+    pub fn resubscribe(&self, protocol_id: u16, direction: Direction) -> Option<MuxChannel> {
+        let (swappable_tx, ingress_limit, bytes_in_flight) =
+            self.senders.get(&(protocol_id, direction))?;
+
+        // Create a fresh mpsc pair for the new task cycle.
+        let (new_tx, new_rx) = mpsc::channel::<Bytes>(ingress::INGRESS_CHANNEL_CAPACITY);
+
+        // Atomically swap the sender inside the running IngressTask.
+        // The lock is held only for the duration of the assignment — a few
+        // nanoseconds.  The IngressTask holds the same lock only during
+        // `try_send`, which is also non-blocking.
+        *swappable_tx.lock() = new_tx;
+
+        // Reset the byte counter so the new receiver starts with zero budget
+        // consumed.  SeqCst ordering ensures the IngressTask sees the reset
+        // before it attempts to enqueue the next frame.
+        bytes_in_flight.store(0, std::sync::atomic::Ordering::SeqCst);
+
+        Some(MuxChannel::new(
+            protocol_id,
+            direction,
+            self.egress_tx.clone(),
+            new_rx,
+            *ingress_limit,
+            Arc::clone(bytes_in_flight),
+        ))
+    }
+}
 
 /// Ouroboros multiplexer. Owns the bearer and coordinates ingress/egress tasks.
 ///
@@ -73,6 +123,12 @@ pub struct Mux<B: Bearer> {
     egress_rx: Option<mpsc::Receiver<(u16, Direction, Bytes)>>,
     /// Per-protocol ingress senders — consumed by the ingress task.
     ingress_routes: HashMap<(u16, Direction), ingress::IngressRoute>,
+    /// Re-subscription handle entries: populated by `subscribe()`, drained by `take_handle()`.
+    ///
+    /// Each entry mirrors the `IngressRoute`'s `SwappableSender` so that
+    /// `MuxHandle::resubscribe()` can atomically swap the sender after hot
+    /// protocol tasks exit.
+    handle_senders: HashMap<(u16, Direction), (SwappableSender, usize, Arc<AtomicUsize>)>,
 }
 
 impl<B: Bearer> Mux<B> {
@@ -89,6 +145,22 @@ impl<B: Bearer> Mux<B> {
             egress_tx,
             egress_rx: Some(egress_rx),
             ingress_routes: HashMap::new(),
+            handle_senders: HashMap::new(),
+        }
+    }
+
+    /// Take the re-subscription handle for use by the lifecycle manager.
+    ///
+    /// **Must be called BEFORE `run()`** — `run()` consumes `self` and moves
+    /// `ingress_routes` into `IngressTask`, making it inaccessible afterwards.
+    ///
+    /// The returned [`MuxHandle`] holds `Arc` references to the same
+    /// `SwappableSender`s that `IngressTask` will use.  After `take_handle()`
+    /// is called, the `handle_senders` map inside `Mux` is empty (drained).
+    pub fn take_handle(&mut self) -> MuxHandle {
+        MuxHandle {
+            senders: std::mem::take(&mut self.handle_senders),
+            egress_tx: self.egress_tx.clone(),
         }
     }
 
@@ -106,7 +178,11 @@ impl<B: Bearer> Mux<B> {
         direction: Direction,
         ingress_limit: usize,
     ) -> MuxChannel {
-        let (ingress_tx, ingress_rx) = mpsc::channel(INGRESS_CHANNEL_CAPACITY);
+        let (ingress_tx, ingress_rx) = mpsc::channel::<Bytes>(ingress::INGRESS_CHANNEL_CAPACITY);
+
+        // Wrap the sender in a SwappableSender so MuxHandle::resubscribe() can
+        // atomically install a fresh receiver after hot protocol tasks exit.
+        let swappable_tx: SwappableSender = Arc::new(Mutex::new(ingress_tx));
 
         // Shared byte-in-flight counter between the IngressRoute (producer side)
         // and the MuxChannel (consumer side). IngressTask increments it when
@@ -119,10 +195,17 @@ impl<B: Bearer> Mux<B> {
         self.ingress_routes.insert(
             (protocol_id, direction),
             ingress::IngressRoute {
-                tx: ingress_tx,
+                tx: Arc::clone(&swappable_tx),
                 limit: ingress_limit,
                 bytes_in_flight: Arc::clone(&bytes_in_flight),
             },
+        );
+
+        // Store a clone of the swappable sender + metadata in handle_senders
+        // so take_handle() can hand them to MuxHandle::resubscribe().
+        self.handle_senders.insert(
+            (protocol_id, direction),
+            (swappable_tx, ingress_limit, Arc::clone(&bytes_in_flight)),
         );
 
         MuxChannel::new(
@@ -471,7 +554,7 @@ mod tests {
     /// Verified at compile time: if the constant is lowered below 300,
     /// ChainSync pipelining will stall the ingress task.
     const _: () = assert!(
-        INGRESS_CHANNEL_CAPACITY > 300,
+        ingress::INGRESS_CHANNEL_CAPACITY > 300,
         "INGRESS_CHANNEL_CAPACITY must exceed default pipeline depth 300 \
          to prevent ingress stall under pipelining"
     );
