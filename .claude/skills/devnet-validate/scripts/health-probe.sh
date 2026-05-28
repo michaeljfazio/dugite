@@ -235,11 +235,16 @@ if [ "$IS_BP_INT" -eq 1 ]; then
         fail "forge_failures = ${FORGE_FAIL_INT} (must be 0)"
     fi
     # Leader-check delta from a per-port baseline file.
+    # Auto-detect process restart: if `leader_checks_total` decreased,
+    # the process was restarted and counters were reset — treat the
+    # current value as the new baseline rather than a regression.
     PREV_LC_FILE="$BASELINE_DIR/leader_checks-${PORT}"
     LC_NOW=$(toi "${LEADER_CHECKS:-0}")
     if [ -f "$PREV_LC_FILE" ]; then
         PREV_LC=$(toi "$(cat "$PREV_LC_FILE")")
-        if [ "$LC_NOW" -le "$PREV_LC" ]; then
+        if [ "$LC_NOW" -lt "$PREV_LC" ]; then
+            info "leader_checks went $PREV_LC → $LC_NOW — process restart detected, baseline reset"
+        elif [ "$LC_NOW" -le "$PREV_LC" ]; then
             fail "leader_checks did not advance since last probe ($PREV_LC → $LC_NOW) — forge scheduler dead"
         else
             info "leader_checks advanced $PREV_LC → $LC_NOW"
@@ -272,7 +277,15 @@ FORGE_BASE="$BASELINE_DIR/blocks_forged-${PORT}"
 FORGE_NOW=$(toi "$(metric dugite_blocks_forged_total)")
 FORGE_PREV=0
 [ -f "$FORGE_BASE" ] && FORGE_PREV=$(toi "$(cat "$FORGE_BASE")")
-DELTA_BLOCKS_FORGE=$((FORGE_NOW - FORGE_PREV))
+# Process-restart detection: counters reset to a lower value when the
+# node restarts; clamp DELTA_BLOCKS_FORGE to 0 in that case so the
+# subsequent net-stall predicate doesn't fire on a false negative.
+if [ "$FORGE_NOW" -lt "$FORGE_PREV" ]; then
+    info "blocks_forged went $FORGE_PREV → $FORGE_NOW — process restart detected"
+    DELTA_BLOCKS_FORGE=0
+else
+    DELTA_BLOCKS_FORGE=$((FORGE_NOW - FORGE_PREV))
+fi
 echo "$FORGE_NOW" > "$FORGE_BASE"
 
 NET_OK=1
