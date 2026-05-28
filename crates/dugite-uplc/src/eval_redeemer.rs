@@ -139,10 +139,34 @@ pub fn eval_resolved_redeemer(
         }
     };
 
-    // 4. Run the CEK machine with budget tracking.
+    // 4. Run the CEK machine with budget tracking and trace capture.
+    //
+    // `trace_log` collects strings emitted by the `Trace` builtin during
+    // script execution, in emission order. The Haskell reference surfaces
+    // these in `ValidationFailure logs` and in `cardano-cli`'s
+    // "Trace logs: ..." error output.  We populate `RedeemerEvalOutcome.logs`
+    // so callers (dugite-ledger Phase-2 error path and the CLI EvalTx
+    // response) can mirror that behaviour.
+    let mut trace_log: Vec<String> = Vec::new();
     let mut tracker = BudgetTracker::new(initial_budget);
-    let value = evaluate_with_budget(applied_term, &mut tracker)
-        .map_err(PhaseTwoError::ScriptEvaluationFailed)?;
+    let value = evaluate_with_budget(applied_term, &mut tracker, Some(&mut trace_log)).map_err(
+        |error| {
+            // If any trace strings were emitted before the error, surface
+            // them in the richer `ScriptEvaluationFailedWithLogs` variant
+            // so callers can render "Trace logs: [...]" before the error
+            // (matching Haskell `cardano-cli transaction submit` output).
+            // When no traces were emitted, use the simpler variant to keep
+            // the error message clean.
+            if trace_log.is_empty() {
+                PhaseTwoError::ScriptEvaluationFailed(error)
+            } else {
+                PhaseTwoError::ScriptEvaluationFailedWithLogs {
+                    error,
+                    logs: trace_log.clone(),
+                }
+            }
+        },
+    )?;
 
     // 5. Classify the CEK result.
     //
@@ -182,7 +206,7 @@ pub fn eval_resolved_redeemer(
     Ok(RedeemerEvalOutcome {
         consumed: tracker.consumed(),
         result_term,
-        logs: Vec::new(), // trace-string capture is a follow-up
+        logs: trace_log,
     })
 }
 
@@ -460,5 +484,309 @@ mod tests {
         .expect("V3 unit script runs");
         assert!(matches!(outcome.result_term, Term::Const(Constant::Unit)));
         assert!(outcome.consumed.cpu > 0);
+        // No trace calls in this script — logs must be empty.
+        assert!(outcome.logs.is_empty(), "no trace calls → empty logs");
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // Trace capture tests
+    //
+    // The Plutus `trace` builtin has Plutus type `all a. text -> a -> a`
+    // and requires 1 force before use (`arity = (1, 2)`). So the UPLC
+    // term shape is:
+    //
+    //   (force builtin(trace)) "msg" continuation
+    //
+    // We build minimal V3-compatible programs that call `trace` once (or
+    // multiple times) before returning `()` or before erroring, to verify:
+    //   1. Successful eval surfaces logged strings in `outcome.logs`.
+    //   2. Failed eval (error term) surfaces logs in the error variant.
+    // ─────────────────────────────────────────────────────────────────────
+
+    /// Build a V3 script that emits `msg` via `trace` then returns `()`.
+    /// Term shape:
+    ///   lam ctx.
+    ///     (force trace) "msg" ()
+    fn trace_then_unit_v3_script(msg: &str) -> Vec<u8> {
+        use crate::term::BuiltinId;
+        // (force builtin(trace)) "msg" (con unit ())
+        let trace_call = Term::App(
+            Box::new(Term::App(
+                Box::new(Term::Force(Box::new(Term::Builtin(BuiltinId::Trace)))),
+                Box::new(Term::Const(Constant::String(msg.to_string()))),
+            )),
+            Box::new(Term::Const(Constant::Unit)),
+        );
+        // Wrap in lam so the V3 single-arg calling convention is satisfied.
+        let program = Program {
+            version: (1, 0, 0),
+            term: Term::Lam(Box::new(trace_call)),
+        };
+        program.to_cbor().unwrap()
+    }
+
+    /// Build a V3 script that emits multiple trace messages in FIFO order
+    /// then returns `()`.
+    ///
+    /// The CEK machine evaluates arguments in applicative order (innermost
+    /// first). To get FIFO emission order `[first, second, third]`, we chain
+    /// the traces via sequential lambda application so each message is
+    /// evaluated as a function argument left-to-right:
+    ///
+    ///   lam ctx.
+    ///     (lam _.
+    ///       (lam _.
+    ///         ()
+    ///       ) ((force trace) "second" ())
+    ///     ) ((force trace) "first" ())
+    ///
+    /// Wait — that still evaluates "first" (the outer arg) before "second"
+    /// (the inner body's arg), which means:
+    ///   evaluation: outer arg "first" → outer body → inner arg "second" → ...
+    ///
+    /// Actually the right structure for `[first, second, third]` in FIFO is:
+    ///   (lam _ (lam _ (lam _ ()) trace("third")) trace("second")) trace("first")
+    ///
+    /// Because: evaluate outer arg trace("first") first, then enter body,
+    /// evaluate inner arg trace("second"), then evaluate innermost arg trace("third").
+    fn trace_triple_v3_script() -> Vec<u8> {
+        use crate::term::BuiltinId;
+        fn trace_call(msg: &str) -> Term {
+            Term::App(
+                Box::new(Term::App(
+                    Box::new(Term::Force(Box::new(Term::Builtin(BuiltinId::Trace)))),
+                    Box::new(Term::Const(Constant::String(msg.to_string()))),
+                )),
+                Box::new(Term::Const(Constant::Unit)),
+            )
+        }
+        // (lam _ (lam _ (lam _ ()) trace("third")) trace("second")) trace("first")
+        //   → evaluates trace("first") → enters body → evaluates trace("second")
+        //   → enters body → evaluates trace("third") → returns ()
+        let body = Term::App(
+            Box::new(Term::App(
+                Box::new(Term::App(
+                    Box::new(Term::Lam(Box::new(Term::Lam(Box::new(Term::Lam(
+                        Box::new(Term::Const(Constant::Unit)),
+                    )))))),
+                    Box::new(trace_call("first")),
+                )),
+                Box::new(trace_call("second")),
+            )),
+            Box::new(trace_call("third")),
+        );
+        let program = Program {
+            version: (1, 0, 0),
+            term: Term::Lam(Box::new(body)),
+        };
+        program.to_cbor().unwrap()
+    }
+
+    /// Build a V3 script that emits a trace message then errors.
+    ///
+    /// The trace must FIRE before the error. In applicative order the second
+    /// arg to trace is evaluated first (to get its value), so passing
+    /// `Term::Error` directly as the second arg causes the error before trace
+    /// fires. Instead we have trace return `()` and then error in the
+    /// continuation:
+    ///
+    ///   lam ctx.
+    ///     (lam _. error)             -- continuation: ignores the Unit, errors
+    ///       ((force trace) "msg" ()) -- evaluates trace first, returns ()
+    fn trace_then_error_v3_script(msg: &str) -> Vec<u8> {
+        use crate::term::BuiltinId;
+        // (force trace) "msg" () → fires trace, returns ()
+        let trace_call = Term::App(
+            Box::new(Term::App(
+                Box::new(Term::Force(Box::new(Term::Builtin(BuiltinId::Trace)))),
+                Box::new(Term::Const(Constant::String(msg.to_string()))),
+            )),
+            Box::new(Term::Const(Constant::Unit)),
+        );
+        // (lam _. error) trace_call → evaluates trace_call (fires trace),
+        //   binds result to _, then reduces body to error → ScriptError
+        let body = Term::App(
+            Box::new(Term::Lam(Box::new(Term::Error))),
+            Box::new(trace_call),
+        );
+        let program = Program {
+            version: (1, 0, 0),
+            term: Term::Lam(Box::new(body)),
+        };
+        program.to_cbor().unwrap()
+    }
+
+    /// Build a minimal V3 `ResolvedRedeemer` using the supplied script bytes.
+    /// Returns `(tx, resolved, resolved_redeemer)` ready for `eval_resolved_redeemer`.
+    #[allow(clippy::type_complexity)]
+    fn minimal_v3_setup(
+        script_cbor: Vec<u8>,
+    ) -> (
+        dugite_primitives::transaction::Transaction,
+        Vec<(
+            dugite_primitives::transaction::TransactionInput,
+            dugite_primitives::transaction::TransactionOutput,
+            Vec<u8>,
+        )>,
+        crate::redeemer_resolve::ResolvedRedeemer,
+    ) {
+        use dugite_primitives::address::{Address, EnterpriseAddress};
+        use dugite_primitives::credentials::Credential as PrimCred;
+        use dugite_primitives::era::Era;
+        use dugite_primitives::hash::Hash;
+        use dugite_primitives::network::NetworkId;
+        use dugite_primitives::transaction::{
+            ExUnits, OutputDatum as PrimOutputDatum, PlutusData as PrimPlutusData, Redeemer,
+            RedeemerTag, Transaction, TransactionBody, TransactionInput, TransactionOutput,
+            TransactionWitnessSet,
+        };
+        use dugite_primitives::value::{Lovelace, Value};
+        use std::collections::BTreeMap;
+
+        let inner = {
+            let mut d = minicbor::Decoder::new(&script_cbor);
+            d.bytes().unwrap().to_vec()
+        };
+        let mut buf = vec![3u8];
+        buf.extend_from_slice(&inner);
+        let script_hash = dugite_primitives::hash::blake2b_224(&buf).0;
+        let input = TransactionInput {
+            transaction_id: Hash::<32>([0xcc; 32]),
+            index: 0,
+        };
+        let spent_out = TransactionOutput {
+            address: Address::Enterprise(EnterpriseAddress {
+                network: NetworkId::Testnet,
+                payment: PrimCred::Script(Hash::<28>(script_hash)),
+            }),
+            value: Value::lovelace(1),
+            datum: PrimOutputDatum::None,
+            script_ref: None,
+            is_legacy: false,
+            raw_cbor: None,
+        };
+        let body = TransactionBody {
+            inputs: vec![input.clone()],
+            outputs: vec![],
+            fee: Lovelace(0),
+            ttl: None,
+            certificates: vec![],
+            withdrawals: BTreeMap::new(),
+            auxiliary_data_hash: None,
+            validity_interval_start: None,
+            mint: BTreeMap::new(),
+            script_data_hash: None,
+            collateral: vec![],
+            required_signers: vec![],
+            network_id: None,
+            collateral_return: None,
+            total_collateral: None,
+            reference_inputs: vec![],
+            update: None,
+            voting_procedures: BTreeMap::new(),
+            proposal_procedures: vec![],
+            treasury_value: None,
+            donation: None,
+            sub_transactions: vec![],
+            account_balance_intervals: vec![],
+            direct_deposits: BTreeMap::new(),
+            guards: Vec::new(),
+        };
+        let ws = TransactionWitnessSet {
+            vkey_witnesses: vec![],
+            native_scripts: vec![],
+            bootstrap_witnesses: vec![],
+            plutus_v1_scripts: vec![],
+            plutus_v2_scripts: vec![],
+            plutus_v3_scripts: vec![inner.clone()],
+            plutus_data: vec![],
+            redeemers: vec![Redeemer {
+                tag: RedeemerTag::Spend,
+                index: 0,
+                data: PrimPlutusData::Integer(BigInt::from(0)),
+                ex_units: ExUnits {
+                    mem: 1_000_000,
+                    steps: 100_000_000,
+                },
+            }],
+            raw_redeemers_cbor: None,
+            raw_plutus_data_cbor: None,
+            original_script_data_hash: None,
+        };
+        let tx = Transaction {
+            hash: Hash::<32>([0; 32]),
+            era: Era::Conway,
+            body,
+            witness_set: ws,
+            is_valid: true,
+            auxiliary_data: None,
+            raw_cbor: None,
+            raw_body_cbor: None,
+            raw_witness_cbor: None,
+        };
+        let resolved = vec![(input, spent_out, vec![])];
+        let resolved_redeemer = crate::redeemer_resolve::resolve_redeemers(&tx, &resolved)
+            .expect("redeemer resolves")
+            .into_iter()
+            .next()
+            .unwrap();
+        (tx, resolved, resolved_redeemer)
+    }
+
+    #[test]
+    fn trace_single_message_captured_in_logs() {
+        let script_cbor = trace_then_unit_v3_script("hello from plutus");
+        let (tx, resolved, r) = minimal_v3_setup(script_cbor);
+        let budget = ExBudget {
+            cpu: 100_000_000,
+            mem: 1_000_000,
+        };
+        let outcome = eval_resolved_redeemer(&tx, &resolved, &r, &slot_cfg(), budget, None)
+            .expect("trace+unit script should succeed");
+        assert_eq!(
+            outcome.logs,
+            vec!["hello from plutus"],
+            "single trace call must appear in logs"
+        );
+    }
+
+    #[test]
+    fn trace_multiple_messages_captured_in_fifo_order() {
+        let script_cbor = trace_triple_v3_script();
+        let (tx, resolved, r) = minimal_v3_setup(script_cbor);
+        let budget = ExBudget {
+            cpu: 100_000_000,
+            mem: 1_000_000,
+        };
+        let outcome = eval_resolved_redeemer(&tx, &resolved, &r, &slot_cfg(), budget, None)
+            .expect("triple-trace script should succeed");
+        assert_eq!(
+            outcome.logs,
+            vec!["first", "second", "third"],
+            "trace calls must appear in emission (FIFO) order"
+        );
+    }
+
+    #[test]
+    fn trace_before_error_surfaces_in_error_path() {
+        let script_cbor = trace_then_error_v3_script("pre-error trace");
+        let (tx, resolved, r) = minimal_v3_setup(script_cbor);
+        let budget = ExBudget {
+            cpu: 100_000_000,
+            mem: 1_000_000,
+        };
+        let err = eval_resolved_redeemer(&tx, &resolved, &r, &slot_cfg(), budget, None)
+            .expect_err("trace+error script must fail");
+        // The error variant must carry the trace log.
+        match err {
+            PhaseTwoError::ScriptEvaluationFailedWithLogs { logs, .. } => {
+                assert_eq!(
+                    logs,
+                    vec!["pre-error trace"],
+                    "trace emitted before error must appear in error logs"
+                );
+            }
+            other => panic!("expected ScriptEvaluationFailedWithLogs, got: {other:?}"),
+        }
     }
 }
