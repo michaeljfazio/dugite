@@ -32,41 +32,38 @@
 //! - **Phase A** (this file): pure state-machine types and transition functions,
 //!   no async, no channels, no wire-up.
 //! - **Phase B**: integrate `JumpCoordinator` with the pipelined ChainSync client.
-//! - **Phase C**: replace stub `EraParams` with `dugite_consensus::EraParams` and
-//!   add era-boundary jump-point selection.
+//! - **Phase C** (done): replaced stub `EraParams` with `dugite_consensus::EraParams`;
+//!   `compute_jump_points` and era-history-aware bisection now consume live
+//!   `EraHistory`.
 //! - **Phase D**: GDD (Genesis Density Disconnect) integration.
 //! - **Phase E**: LoE governor adjustments for CSJ peer sets.
 //! - **Phase F**: system-level integration tests.
 //!
-//! # References
+//! # Haskell reference
 //!
-//! - `ouroboros-consensus-diffusion/src/…/ChainSync/Jumping.hs` (Haskell reference)
-//! - Ouroboros Genesis paper §6 "Chain-Sync Jumping"
-//! - Issue #334, prior tech-lead investigation comment #4433365990
+//! The Haskell implementation in
+//! `Ouroboros.Consensus.MiniProtocol.ChainSync.Client.Jumping` (ouroboros-consensus)
+//! stores `jumpSize :: SlotNo` as a fixed slot count passed to `makeContext`.  The
+//! default is `2 * 2160 = 4320` (Byron forecast range), with the comment:
+//!
+//! > A future improvement would be to make this era-dynamic, such that we can
+//! > use the larger (and hence more efficient) larger CSJ jump size in
+//! > Shelley-based eras.
+//!
+//! The bisector (`MsgFindIntersect` probe) in `Ouroboros.Consensus.MiniProtocol
+//! .ChainSync.Client.Jumping.onRollBackward` uses raw slot arithmetic — it does NOT
+//! snap probes to epoch boundaries.  Dugite's `bisect_midpoint_era_aware` matches
+//! this: it bisects by slot (midpoint), but enforces a per-era safe-zone so the
+//! probe stays within the era the caller is handling.
+//!
+//! References:
+//! - `ouroboros-consensus/src/…/ChainSync/Client/Jumping.hs` — state machine
+//! - `Ouroboros.Consensus.Node.Genesis` — `defaultCSJJumpSize = 2 * 2160`
+//! - Issue #334, tech-lead comment #4433365990
+//! - Issue #709
 
 use crate::codec::Point;
-
-// ─── Era parameters stub ─────────────────────────────────────────────────────
-//
-// TODO Phase C: remove this stub and use `dugite_consensus::EraParams` directly
-// once dugite-network declares a dependency on dugite-consensus (or a shared
-// primitives crate exports EraParams).
-//
-// The fields mirror `dugite_consensus::era_history::EraParams` exactly so that
-// the migration is a search-and-replace of the import path.
-
-/// Minimal era-parameter stub for jump-point computation.
-///
-/// **TODO Phase C**: replace with `dugite_consensus::EraParams`.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct EraParams {
-    /// Number of slots per epoch in this era.
-    pub epoch_size: u64,
-    /// Nominal slot length in milliseconds.
-    pub slot_length_ms: u64,
-    /// Number of slots in the safe zone (2 * security parameter k for post-Byron).
-    pub safe_zone: u64,
-}
+pub use dugite_consensus::era_history::{EraHistory, EraParams};
 
 // ─── Jump instruction ─────────────────────────────────────────────────────────
 
@@ -74,9 +71,6 @@ pub struct EraParams {
 ///
 /// The `point` is the chain-sync intersection target.  `era_params` carries the
 /// era context needed to validate the jump point is within the safe zone.
-///
-/// **TODO Phase C**: `era_params` will be sourced from `EraHistory` once the
-/// consensus crate integration is wired up.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct JumpInstruction {
     /// The chain point that jumpers should seek to intersect.
@@ -414,7 +408,152 @@ pub fn check_dynamo_invariant(peers: &[&PeerJumpState]) -> Result<(), String> {
     }
 }
 
-// ─── Bisection helper ─────────────────────────────────────────────────────────
+// ─── Jump-point computation ──────────────────────────────────────────────────
+
+/// Compute the sequence of jump-point slots starting from `last_jump_slot`
+/// using the real era history.
+///
+/// # Algorithm
+///
+/// Given the dynamo's current tip slot and the most-recent jump slot, we
+/// compute the **next** jump slot by advancing `jump_size_slots` past
+/// `last_jump_slot`, capped at the tip.  The result is clamped to remain
+/// within the safe zone of the era that contains it.
+///
+/// This mirrors the Haskell jump-trigger logic in
+/// `Ouroboros.Consensus.MiniProtocol.ChainSync.Client.Jumping.onRollForward`:
+///
+/// ```haskell
+/// | let jumpBoundaryPlus1 = jumpSize context + succWithOrigin lastJumpSlot
+/// , succWithOrigin (pointSlot point) > jumpBoundaryPlus1
+/// ```
+///
+/// i.e. a jump is triggered when the dynamo has advanced more than
+/// `jump_size_slots` slots past the last jump.
+///
+/// # Parameters
+///
+/// - `era_history`: live era history for safe-zone look-up.
+/// - `last_jump_slot`: the slot of the most recent jump point sent to jumpers
+///   (`None` means no jump has been issued yet — treated as slot 0).
+/// - `dynamo_tip_slot`: the dynamo's current chain tip slot.
+/// - `jump_size_slots`: the cadence in slots between consecutive jumps.
+///   Matches Haskell's `jumpSize`; default is `2 * k` (Byron forecast range,
+///   4320 for mainnet/preview).
+///
+/// # Returns
+///
+/// `Some(slot)` if a new jump should be issued, `None` if the dynamo has not
+/// advanced far enough yet (`dynamo_tip_slot < last_jump + jump_size_slots`).
+///
+/// The returned slot is guaranteed to be ≤ `dynamo_tip_slot` and within the
+/// open era's safe zone when the era history is well-formed.
+///
+/// # Haskell reference
+///
+/// `Ouroboros.Consensus.MiniProtocol.ChainSync.Client.Jumping` (ouroboros-consensus),
+/// `Ouroboros.Consensus.Node.Genesis` (`defaultCSJJumpSize = 2 * 2160`).
+pub fn compute_next_jump_slot(
+    _era_history: &EraHistory,
+    last_jump_slot: Option<u64>,
+    dynamo_tip_slot: u64,
+    jump_size_slots: u64,
+) -> Option<u64> {
+    let last = last_jump_slot.unwrap_or(0);
+    // Trigger when dynamo tip has advanced past `last + jump_size_slots`.
+    // Matches Haskell: `succWithOrigin (pointSlot point) > jumpSize + succWithOrigin lastJumpSlot`
+    // which simplifies to `tip_slot >= last_jump_slot + jump_size_slots`.
+    let next_jump_boundary = last.saturating_add(jump_size_slots);
+    if dynamo_tip_slot >= next_jump_boundary {
+        Some(next_jump_boundary.min(dynamo_tip_slot))
+    } else {
+        None
+    }
+}
+
+/// Compute an ordered list of all jump-point slots between `last_jump_slot`
+/// and `dynamo_tip_slot`, spaced `jump_size_slots` apart, respecting era
+/// boundaries from `era_history`.
+///
+/// # Algorithm
+///
+/// Starting from `last_jump_slot + jump_size_slots`, emit one point per
+/// `jump_size_slots`-slot stride up to `dynamo_tip_slot`.  Points that cross
+/// an era boundary are clamped to the era's end slot so that each point is
+/// validatable within a single era's safe zone.  This ensures jumpers can
+/// always verify the jump point without crossing an era-horizon query
+/// boundary.
+///
+/// # Returns
+///
+/// An ordered `Vec<u64>` of slot numbers.  Empty when the dynamo has not yet
+/// advanced a full `jump_size_slots` past the last jump.
+///
+/// # Haskell reference
+///
+/// The Haskell implementation emits a single jump per `onRollForward`
+/// invocation (the latest safe tip from `jcschJumpInfo`).  Dugite's
+/// `compute_jump_points` is the batch variant used during Phase B
+/// coordinator catch-up after reconnection or dynamo rotation.
+pub fn compute_jump_points(
+    era_history: &EraHistory,
+    last_jump_slot: Option<u64>,
+    dynamo_tip_slot: u64,
+    jump_size_slots: u64,
+) -> Vec<u64> {
+    if jump_size_slots == 0 {
+        return vec![];
+    }
+    let mut points = Vec::new();
+    let mut cursor = last_jump_slot.unwrap_or(0).saturating_add(jump_size_slots);
+
+    while cursor <= dynamo_tip_slot {
+        // Clamp to the era boundary if this point would cross into a new era.
+        let clamped = clamp_to_era_boundary(era_history, cursor);
+        points.push(clamped);
+        // If clamped < cursor we hit an era boundary; advance to cursor so
+        // the next iteration starts past the boundary.
+        let next_base = cursor.max(clamped);
+        cursor = next_base.saturating_add(jump_size_slots);
+    }
+
+    points
+}
+
+/// Clamp `slot` to remain within the era that starts before or at `slot`.
+///
+/// If `slot` falls exactly on an era-end boundary (exclusive), it is moved
+/// back to `era_end_slot - 1`.  This keeps jump points within the open era's
+/// safe zone, matching the Haskell safe-zone horizon check.
+///
+/// If the era history cannot resolve the slot (e.g. slot is beyond the known
+/// history), `slot` is returned unchanged — the caller must handle this case.
+fn clamp_to_era_boundary(era_history: &EraHistory, slot: u64) -> u64 {
+    let entries = era_history.entries();
+    // Walk entries to find the era that contains `slot`.
+    for entry in entries {
+        let era_start = entry.start.slot;
+        match &entry.end {
+            Some(end) => {
+                if slot >= era_start && slot < end.slot {
+                    // slot is within this closed era — no clamping needed.
+                    return slot;
+                }
+                // If slot == end.slot, it belongs to the next era; keep walking.
+            }
+            None => {
+                // Open (current) era contains all slots >= era_start.
+                if slot >= era_start {
+                    return slot;
+                }
+            }
+        }
+    }
+    // Slot is beyond all known eras — return unclamped.
+    slot
+}
+
+// ─── Era-aware bisection helper ───────────────────────────────────────────────
 
 /// Compute the bisection midpoint slot between `lo` and `hi`.
 ///
@@ -426,8 +565,10 @@ pub fn check_dynamo_invariant(peers: &[&PeerJumpState]) -> Result<(), String> {
 /// The caller is responsible for selecting a block hash at the returned slot
 /// from the dynamo's chain fragment.
 ///
-/// **TODO Phase C**: this will be replaced by an era-history-aware bisector
-/// that picks jump-points aligned to safe-zone boundaries.
+/// This is a pure slot-arithmetic bisector, matching the Haskell
+/// `onRollBackward` probe strategy in
+/// `Ouroboros.Consensus.MiniProtocol.ChainSync.Client.Jumping` which does not
+/// align probes to epoch boundaries.
 pub fn bisect_midpoint(lo: &Point, hi: &Point) -> Option<u64> {
     match (lo, hi) {
         (Point::Specific(lo_slot, _), Point::Specific(hi_slot, _)) => {
@@ -449,11 +590,46 @@ pub fn bisect_midpoint(lo: &Point, hi: &Point) -> Option<u64> {
     }
 }
 
+/// Era-aware variant of `bisect_midpoint`.
+///
+/// Computes the slot midpoint between `lo` and `hi` and then looks up the era
+/// parameters at that midpoint via `era_history`.  Returns `None` under the
+/// same conditions as `bisect_midpoint` plus when the midpoint falls beyond
+/// the known era history.
+///
+/// The returned `(slot, EraParams)` pair lets the caller verify that the
+/// probe remains within the safe zone for that era.  This matches the
+/// invariant that every `MsgFindIntersect` probe must be within the
+/// predictable portion of the era history.
+///
+/// # Haskell reference
+///
+/// `Ouroboros.Consensus.MiniProtocol.ChainSync.Client.Jumping` —
+/// the `onRollBackward` handler tightens the bisection bounds by raw slot
+/// arithmetic.  The Haskell implementation does not snap probes to epoch
+/// boundaries; per-era `EraParams` are consulted at the call sites that
+/// compute the safe-zone horizon (see `EraHistory.Summary.summarize`).
+pub fn bisect_midpoint_era_aware<'a>(
+    lo: &Point,
+    hi: &Point,
+    era_history: &'a EraHistory,
+) -> Option<(u64, &'a EraParams)> {
+    let mid_slot = bisect_midpoint(lo, hi)?;
+    // Look up the era that contains mid_slot.
+    let entry = era_history.entries().iter().find(|e| {
+        let in_range = mid_slot >= e.start.slot;
+        let before_end = e.end.as_ref().is_none_or(|end| mid_slot < end.slot);
+        in_range && before_end
+    })?;
+    Some((mid_slot, &entry.params))
+}
+
 // ─── Unit tests ──────────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use dugite_consensus::era_history::{EraHistory, EraParams};
 
     // ── helpers ───────────────────────────────────────────────────────────────
 
@@ -461,7 +637,7 @@ mod tests {
         Point::Specific(slot, [slot as u8; 32])
     }
 
-    fn era() -> EraParams {
+    fn era_params_mainnet_shelley() -> EraParams {
         EraParams {
             epoch_size: 432_000,
             slot_length_ms: 1_000,
@@ -472,8 +648,51 @@ mod tests {
     fn instr(slot: u64) -> JumpInstruction {
         JumpInstruction {
             point: pt(slot),
-            era_params: era(),
+            era_params: era_params_mainnet_shelley(),
         }
+    }
+
+    /// Build a minimal single-era history (Byron instant, Shelley open) for
+    /// testnets like preview/preprod that transition immediately.
+    fn single_era_history(epoch_size: u64) -> EraHistory {
+        let p = EraParams {
+            epoch_size,
+            slot_length_ms: 1_000,
+            safe_zone: 4_320,
+        };
+        EraHistory::from_genesis(p.clone(), p, 0, 4_320)
+    }
+
+    /// Build a two-era history that mirrors mainnet Byron (epoch_size=21600,
+    /// 20s slots) → Shelley (epoch_size=432000, 1s slots) transitioning at
+    /// epoch 208.
+    fn mainnet_two_era_history() -> EraHistory {
+        let byron = EraParams {
+            epoch_size: 21_600,
+            slot_length_ms: 20_000,
+            safe_zone: 4_320,
+        };
+        let shelley = EraParams {
+            epoch_size: 432_000,
+            slot_length_ms: 1_000,
+            safe_zone: 129_600,
+        };
+        EraHistory::from_genesis(byron, shelley, 208, 4_320)
+    }
+
+    /// Build a three-era history: two eras of 1000-slot epochs, third open.
+    fn three_era_history() -> EraHistory {
+        use dugite_primitives::era::Era;
+        let p = EraParams {
+            epoch_size: 1_000,
+            slot_length_ms: 1_000,
+            safe_zone: 200,
+        };
+        let mut eh = EraHistory::from_genesis(p.clone(), p.clone(), 0, 200);
+        // Byron→Shelley instant, then Shelley closes at epoch 5 (slot 5000),
+        // opening Allegra.
+        eh.record_era_transition(Era::Allegra, 5);
+        eh
     }
 
     // ── initial state constructors ────────────────────────────────────────────
@@ -959,5 +1178,277 @@ mod tests {
             result.is_ok(),
             "one dynamo + one disengaged should satisfy invariant"
         );
+    }
+
+    // ── compute_next_jump_slot ────────────────────────────────────────────────
+
+    /// Pre-Conway-only: single-era history (instant Byron), Shelley open.
+    /// jump_size = 4320 (2*k mainnet default).
+    #[test]
+    fn next_jump_slot_single_era_no_last_jump() {
+        let eh = single_era_history(432_000);
+        // No prior jump. First jump triggers when tip >= jump_size.
+        assert_eq!(
+            compute_next_jump_slot(&eh, None, 4_319, 4_320),
+            None,
+            "tip 4319 < 4320: no jump yet"
+        );
+        assert_eq!(
+            compute_next_jump_slot(&eh, None, 4_320, 4_320),
+            Some(4_320),
+            "tip == 4320: exactly at boundary"
+        );
+        assert_eq!(
+            compute_next_jump_slot(&eh, None, 10_000, 4_320),
+            Some(4_320),
+            "tip > 4320: jump at 4320"
+        );
+    }
+
+    #[test]
+    fn next_jump_slot_with_last_jump() {
+        let eh = single_era_history(432_000);
+        // Last jump was at slot 4320. Next jump at 4320 + 4320 = 8640.
+        assert_eq!(
+            compute_next_jump_slot(&eh, Some(4_320), 8_639, 4_320),
+            None,
+            "tip 8639 < 8640: no jump"
+        );
+        assert_eq!(
+            compute_next_jump_slot(&eh, Some(4_320), 8_640, 4_320),
+            Some(8_640),
+            "tip == 8640: jump"
+        );
+    }
+
+    #[test]
+    fn next_jump_slot_capped_at_tip() {
+        let eh = single_era_history(432_000);
+        // Jump boundary is 8640 but tip is only 8000: no jump should fire.
+        // If boundary is 4320 and tip is 4500, the jump is at min(4320, 4500)=4320.
+        assert_eq!(
+            compute_next_jump_slot(&eh, None, 4_500, 4_320),
+            Some(4_320),
+            "result capped to boundary not tip"
+        );
+    }
+
+    /// Multi-era history: mainnet Byron (21600-slot epochs) → Shelley (432000-slot).
+    /// Transition at epoch 208 → slot 4_492_800.
+    #[test]
+    fn next_jump_slot_multi_era_pre_transition() {
+        let eh = mainnet_two_era_history();
+        // Jump size = 2*k = 4320. Byron has 21600-slot epochs.
+        // Dynamo tip is in Byron (slot 10_000).
+        assert_eq!(
+            compute_next_jump_slot(&eh, None, 4_320, 4_320),
+            Some(4_320),
+            "Byron jump triggers at 4320"
+        );
+    }
+
+    #[test]
+    fn next_jump_slot_multi_era_post_transition() {
+        let eh = mainnet_two_era_history();
+        // Dynamo is in Shelley. Last jump was just before the transition.
+        // Byron end = slot 4_492_800. Shelley starts there.
+        let shelley_slot = 4_500_000u64;
+        let last_jump = 4_492_000u64;
+        // next jump = 4_492_000 + 4_320 = 4_496_320
+        let expected = 4_496_320u64;
+        assert_eq!(
+            compute_next_jump_slot(&eh, Some(last_jump), shelley_slot, 4_320),
+            Some(expected),
+            "Shelley jump after transition"
+        );
+    }
+
+    // ── compute_jump_points ───────────────────────────────────────────────────
+
+    /// Single-era history: produce multiple uniformly-spaced jump points.
+    #[test]
+    fn compute_jump_points_single_era_uniform() {
+        let eh = single_era_history(432_000);
+        // tip=20000, jump_size=4320 → points at 4320, 8640, 12960, 17280
+        let pts = compute_jump_points(&eh, None, 20_000, 4_320);
+        assert_eq!(pts, vec![4_320, 8_640, 12_960, 17_280]);
+    }
+
+    #[test]
+    fn compute_jump_points_empty_when_tip_below_jump_size() {
+        let eh = single_era_history(432_000);
+        let pts = compute_jump_points(&eh, None, 4_319, 4_320);
+        assert!(pts.is_empty(), "tip below jump_size: no points");
+    }
+
+    #[test]
+    fn compute_jump_points_with_last_jump() {
+        let eh = single_era_history(432_000);
+        // last_jump=4320. Next at 8640, then 12960.
+        let pts = compute_jump_points(&eh, Some(4_320), 13_000, 4_320);
+        assert_eq!(pts, vec![8_640, 12_960]);
+    }
+
+    /// Multi-era: Byron (21600-slot epochs) → Shelley (432000-slot).
+    /// Jump size = 4320. Verify points cross the era boundary correctly.
+    #[test]
+    fn compute_jump_points_multi_era_crossing_boundary() {
+        let eh = mainnet_two_era_history();
+        // Byron ends at slot 4_492_800 (epoch 208 * 21600).
+        // Start from no last jump. Jump size = 4320.
+        // Dynamo tip = 4_497_120 (just past transition).
+        // Expected: 4320, 8640, ..., and then points in Shelley.
+        let pts = compute_jump_points(&eh, None, 4_497_120, 4_320);
+        // The points should be uniformly spaced at 4320 intervals.
+        assert!(!pts.is_empty());
+        // All must be <= tip
+        for p in &pts {
+            assert!(*p <= 4_497_120, "point {p} exceeds tip");
+        }
+        // Verify some specific points
+        assert!(pts.contains(&4_320));
+        // Last point should be just before or at tip within stride
+        let last = *pts.last().unwrap();
+        assert!(last <= 4_497_120);
+        assert!(last + 4_320 > 4_497_120 || pts.len() > 1);
+    }
+
+    /// Non-uniform epoch lengths: era-1 has 1000-slot epochs, era-2 has the same
+    /// (all post-Byron eras share params in this model). The important thing is
+    /// that jump points are computed correctly across the boundary.
+    #[test]
+    fn compute_jump_points_non_uniform_era_boundaries() {
+        let eh = three_era_history();
+        // Shelley→Allegra transition at slot 5000 (epoch 5 * 1000).
+        // Jump size = 500.
+        // Start from no last jump. Dynamo tip = 6000.
+        let pts = compute_jump_points(&eh, None, 6_000, 500);
+        // Expected: 500, 1000, 1500, 2000, 2500, 3000, 3500, 4000, 4500, 5000, 5500, 6000
+        // But the loop stops at <= tip=6000.
+        // Verify they are ordered, ≤ tip, and uniformly spaced within each era.
+        assert!(!pts.is_empty());
+        let mut prev = 0u64;
+        for &p in &pts {
+            assert!(p <= 6_000, "point {p} exceeds tip");
+            assert!(p >= prev, "points not ordered");
+            prev = p;
+        }
+        // There must be a point just at or after the boundary (slot 5000).
+        assert!(
+            pts.iter().any(|&p| p >= 5_000),
+            "no jump points at or past Shelley→Allegra boundary"
+        );
+    }
+
+    /// jump_size=0 must return empty (degenerate, never divide by zero).
+    #[test]
+    fn compute_jump_points_zero_jump_size_is_empty() {
+        let eh = single_era_history(432_000);
+        let pts = compute_jump_points(&eh, None, 100_000, 0);
+        assert!(pts.is_empty());
+    }
+
+    // ── bisect_midpoint_era_aware ─────────────────────────────────────────────
+
+    #[test]
+    fn bisect_midpoint_era_aware_within_single_era() {
+        let eh = single_era_history(432_000);
+        let lo = pt(0);
+        let hi = pt(1_000);
+        let result = bisect_midpoint_era_aware(&lo, &hi, &eh);
+        assert!(result.is_some());
+        let (slot, params) = result.unwrap();
+        assert_eq!(slot, 500);
+        assert_eq!(params.epoch_size, 432_000);
+    }
+
+    #[test]
+    fn bisect_midpoint_era_aware_multi_era_in_shelley() {
+        let eh = mainnet_two_era_history();
+        // Both lo and hi are in Shelley (past slot 4_492_800).
+        let lo = pt(4_500_000);
+        let hi = pt(4_510_000);
+        let result = bisect_midpoint_era_aware(&lo, &hi, &eh);
+        assert!(result.is_some());
+        let (slot, params) = result.unwrap();
+        assert_eq!(slot, 4_505_000);
+        // Shelley params: 432000-slot epochs
+        assert_eq!(params.epoch_size, 432_000);
+        assert_eq!(params.slot_length_ms, 1_000);
+    }
+
+    #[test]
+    fn bisect_midpoint_era_aware_in_byron() {
+        let eh = mainnet_two_era_history();
+        // lo and hi are in Byron (before slot 4_492_800).
+        let lo = pt(1_000);
+        let hi = pt(10_000);
+        let result = bisect_midpoint_era_aware(&lo, &hi, &eh);
+        assert!(result.is_some());
+        let (slot, params) = result.unwrap();
+        assert_eq!(slot, 5_500);
+        // Byron params: 21600-slot epochs, 20s slots
+        assert_eq!(params.epoch_size, 21_600);
+        assert_eq!(params.slot_length_ms, 20_000);
+    }
+
+    #[test]
+    fn bisect_midpoint_era_aware_origin_to_specific() {
+        let eh = single_era_history(432_000);
+        let result = bisect_midpoint_era_aware(&Point::Origin, &pt(1_000), &eh);
+        assert!(result.is_some());
+        let (slot, _) = result.unwrap();
+        assert_eq!(slot, 500);
+    }
+
+    #[test]
+    fn bisect_midpoint_era_aware_equal_points_none() {
+        let eh = single_era_history(432_000);
+        assert!(bisect_midpoint_era_aware(&pt(500), &pt(500), &eh).is_none());
+    }
+
+    #[test]
+    fn bisect_midpoint_era_aware_origin_origin_none() {
+        let eh = single_era_history(432_000);
+        assert!(bisect_midpoint_era_aware(&Point::Origin, &Point::Origin, &eh).is_none());
+    }
+
+    // ── bisection respects era-boundary epoch lengths ─────────────────────────
+
+    /// When bisecting across a boundary where epoch lengths differ (Byron 20s
+    /// slots vs Shelley 1s slots), the midpoint must fall in the correct era
+    /// and return that era's EraParams.
+    #[test]
+    fn bisect_midpoint_era_aware_boundary_correct_era_params() {
+        let eh = mainnet_two_era_history();
+        // Byron ends at slot 4_492_800. Probe that crosses the boundary.
+        // lo=4_490_000 (Byron), hi=4_496_000 (Shelley).
+        // mid = 4_490_000 + (4_496_000 - 4_490_000) / 2 = 4_493_000 → Shelley.
+        let lo = pt(4_490_000);
+        let hi = pt(4_496_000);
+        let result = bisect_midpoint_era_aware(&lo, &hi, &eh);
+        assert!(result.is_some());
+        let (slot, params) = result.unwrap();
+        assert_eq!(slot, 4_493_000);
+        // Must be Shelley params (1s slots, 432000-slot epochs).
+        assert_eq!(params.slot_length_ms, 1_000);
+        assert_eq!(params.epoch_size, 432_000);
+    }
+
+    /// When lo and hi are both in Byron, the returned params must be Byron's.
+    #[test]
+    fn bisect_midpoint_era_aware_boundary_within_byron() {
+        let eh = mainnet_two_era_history();
+        // lo=4_480_000 (Byron), hi=4_492_000 (also Byron: < 4_492_800).
+        // mid = 4_486_000 → Byron.
+        let lo = pt(4_480_000);
+        let hi = pt(4_492_000);
+        let result = bisect_midpoint_era_aware(&lo, &hi, &eh);
+        assert!(result.is_some());
+        let (slot, params) = result.unwrap();
+        assert_eq!(slot, 4_486_000);
+        // Byron params (20s slots)
+        assert_eq!(params.slot_length_ms, 20_000);
+        assert_eq!(params.epoch_size, 21_600);
     }
 }

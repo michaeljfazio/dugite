@@ -1670,6 +1670,7 @@ dependencies = [
  "byteorder",
  "bytes",
  "criterion",
+ "dugite-consensus",
  "dugite-crypto",
  "dugite-primitives",
  "dugite-serialization",
