@@ -772,7 +772,15 @@ impl Node {
                     .with_committee_members(committee_members.clone())
                     .with_committee_resigned(committee_resigned.clone())
                     .with_pools(registered_pool_ids.clone())
-                    .with_dreps(registered_drep_ids.clone());
+                    .with_dreps(registered_drep_ids.clone())
+                    // Post-rollback the reward-account map may have shrunk
+                    // (a rolled-back block's reward credit reverted). Pass
+                    // the live `reward_accounts` so the
+                    // `WithdrawalsNotInRewardsCERTS` check evicts any
+                    // mempool tx whose declared withdrawal no longer
+                    // matches the new balance. Same fix-pattern as
+                    // serve.rs:LedgerTxValidator.
+                    .with_reward_accounts_arc(std::sync::Arc::clone(&ledger.certs.reward_accounts));
                 if let Some(net) = node_network {
                     ctx = ctx.with_network(net);
                 }
