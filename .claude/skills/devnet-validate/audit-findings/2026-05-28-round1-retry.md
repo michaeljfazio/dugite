@@ -133,10 +133,83 @@ The two new skill additions this session both proved their worth:
 - The auto-restart-detection added in commit `60d3b0026` eliminated
   the false-SICK PROBE 1 events.
 
+## Round 1 attempt 3 — `WithdrawalsNotInRewards` RESOLVED, new bug surfaced
+
+After commit `779922596` (plumb reward_accounts), Round 1 attempt 3:
+
+| Predicate | Result |
+|---|---|
+| tx-zoo | 80 PASS / 0 FAIL / 3 SKIP |
+| 03-plutus rows | 12/12 PASS |
+| Health probes 1-9 (during tx-zoo + early bidir-parity) | **all HEALTHY** |
+| Haskell-tip parity | within 1 slot throughout the first 9 minutes |
+| Epoch boundary 0→1 | crossed cleanly |
+| `WithdrawalsNotInRewardsCERTS` recurrences | **0** ✓ |
+| `TimeTranslationPastHorizon` recurrences | **0** ✓ |
+| 09-cli-parity | PASS (16 EQUAL / 0 DIVERGENT-non-known / 4 ERROR-warning) |
+| cross-validate-cli | 7/7 PASS |
+| protocols/run.sh (adversarial N2N) | 7/7 PASS |
+| bidirectional-parity (08-negative, with per-batch isolation) | **PASS, 0 off-diagonal** ✓ |
+
+## Round 1 attempt 3 — NEW finding `MissingVKeyWitnessesUTXOW`
+
+At PROBE 10 (slot 658), a third class of dugite-vs-Haskell divergence
+surfaced. Block
+`fb4da1990e8663000e371f170900e98cb2d7cb215d439f45de7c60d16a266762`
+forged at slot 645 with 1 tx; Haskell rejected with:
+
+```
+ConwayUtxowFailure (MissingVKeyWitnessesUTXOW
+  (NonEmptySet (fromList [
+    KeyHash {unKeyHash = "b7ec15e8e167637991f151cb3a209171dc722e30f904f5f0310c5043"}
+  ])))
+```
+
+dugite admitted a tx that was missing a required vkey witness; Haskell
+rejected on block-apply. Tip-bifurcation: dugite continued to slot 781;
+cardano-bp stuck at slot 643 / block 320.
+
+**Hypothesis**: dugite's Phase-1 already has a `MissingRequiredSigner`
+predicate in `validation/mod.rs` and a `MissingVKeyWitnesses` predicate
+in `validation/phase1.rs`. The bug is likely one of:
+
+1. The check is gated on a predicate that doesn't cover all the
+   cases Haskell does (e.g. only checks `required_signers` field but
+   not the implied set of `inputs.addr.payment_key`, certificate
+   authorizing keys, withdrawal reward-account keys, etc.).
+2. The check sees ADDITIONAL keys provided by witnesses but doesn't
+   account for the boot key set from the genesis utxo wallet correctly.
+
+Tx came from the bidirectional-parity setup phase (per-batch funded
+key creation around 06:35:50–55Z; slot 645 = 06:35:54Z forge).
+
+**Reproduce**: run `bidirectional-parity.sh 08-negative` with the
+current devnet — it submits two genesis-funded sub-account creation
+txs, then per-batch tx-zoo --setup which creates many more wallet txs.
+One of these is the offender.
+
+## Pattern across attempts 1-3
+
+| Attempt | Bug class | Where dugite went wrong |
+|---|---|---|
+| 1 | `TimeTranslationPastHorizon` | Plutus context-builder didn't enforce safe-zone horizon |
+| 2 | `WithdrawalsNotInRewardsCERTS` | Mempool admission didn't pass `reward_accounts` into ValidationContext |
+| 3 | `MissingVKeyWitnessesUTXOW` | Witness-check predicate appears to differ from Haskell's exact required-key set |
+
+All three are the same architectural class: **dugite's mempool admission
+is incomplete relative to Haskell's `LEDGER` rule**. Each fix follows
+the same pattern — plumb the missing predicate data, mirror the
+Haskell rule byte-exact. The bug-cascade suggests there are likely 1-3
+more checks dugite is missing on edge cases. Each requires its own
+investigation + targeted fix iteration.
+
 ## Status
 
-- Round 1 baseline: **NOT YET PASSING**. Fails on
-  `WithdrawalsNotInRewardsCERTS` (new finding) and on the
-  bidirectional-parity test-design issue.
-- Decision point — see `dugite_node_validate_round1_status` in the
-  conversation.
+- Round 1 baseline (committed work): **PARTIAL PASS** —
+  P0 Plutus past-horizon RESOLVED, P0 WithdrawalsNotInRewards
+  RESOLVED, but a third P0 (`MissingVKeyWitnessesUTXOW`) surfaced and
+  is unfixed at session end.
+- The pattern of newly-discovered dugite-vs-Haskell mempool admission
+  gaps is systematic, not one-off. Recommend dedicated audit pass on
+  every Haskell `LEDGER` rule predicate vs dugite's
+  `validate_transaction_with_context`.
