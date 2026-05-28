@@ -3,7 +3,26 @@
 These items did not block Round 2 or Round 3 PASS but are worth a future
 focused investigation. They are listed in priority order.
 
-## P3-1: 22.14B-lovelace reserves diff at boundary 2→3
+## P3-1: 22.14B-lovelace reserves diff at boundary 2→3 — **RESOLVED 2026-05-28 in `0d79e7075`**
+
+Root cause: Conway-from-genesis init was clearing both `snapshots.mark`
+and `snapshots.set`, leaving `ssStakeGo` always empty in dugite. Haskell
+empirically distributes per-pool rewards at boundary 2→3 (20 stake
+credentials × 1,107,066,462 lovelace = exactly 22,141,329,240 lovelace,
+matching the residual to the byte).
+
+Fix: clear ONLY `snapshots.set`; keep `snapshots.mark` pre-fill. This
+matches Haskell's actual snapshot rotation pattern where mark is
+pre-populated at genesis. After 3 SNAP rotations the pre-filled mark
+arrives in go at boundary 2→3, producing the first per-pool reward
+distribution.
+
+Verification: all 3 measurable boundaries (0→1, 1→2, 2→3) now byte-exact
+with Haskell on BOTH treasury and reserves. r_diff=0 across the board.
+
+---
+
+## P3-1 (original): 22.14B-lovelace reserves diff at boundary 2→3
 
 **Observation**: After the Conway-from-genesis RUPD fix (`037c464ea`),
 boundary 0→1 and boundary 1→2 are byte-exact with Haskell on both
