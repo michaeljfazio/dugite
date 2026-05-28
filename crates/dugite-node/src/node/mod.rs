@@ -4858,6 +4858,12 @@ impl Node {
         } else {
             BlockValidationMode::ApplyOnly
         };
+        // Observability (#698): track how many live-tip blocks go through
+        // each mode so dashboards can distinguish full-validation from replay.
+        match validation_mode {
+            BlockValidationMode::ApplyOnly => self.metrics.inc_apply_mode_reapply(),
+            BlockValidationMode::ValidateAll => self.metrics.inc_apply_mode_validate_all(),
+        }
 
         // Apply to ledger state and collect the delta for LedgerSeq.
         //

@@ -1470,6 +1470,14 @@ impl Node {
                 } else {
                     BlockValidationMode::ApplyOnly
                 };
+                // Observability: track which mode each block was applied in
+                // so operators can verify catch-up is using the fast path
+                // (#698 — `dugite_apply_mode_reapply_total` vs
+                // `dugite_apply_mode_validate_all_total`).
+                match ledger_mode {
+                    BlockValidationMode::ApplyOnly => self.metrics.inc_apply_mode_reapply(),
+                    BlockValidationMode::ValidateAll => self.metrics.inc_apply_mode_validate_all(),
+                }
                 // Issue #653 — relief-worker scheduling around the
                 // CPU-bound per-block apply inside the bulk batch loop.
                 let apply_result =
