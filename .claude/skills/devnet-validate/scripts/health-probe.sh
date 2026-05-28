@@ -59,16 +59,17 @@ done
 
 mkdir -p "$BASELINE_DIR"
 
-# Auto-locate logs if not provided.
-if [ -z "$LOG" ] && [ -f testnet/local-devnet/logs/dugite-bp.log ]; then
-    LOG=testnet/local-devnet/logs/dugite-bp.log
-fi
-if [ -z "$RELAY_LOG" ] && [ -f testnet/local-devnet/logs/dugite-relay.log ]; then
-    RELAY_LOG=testnet/local-devnet/logs/dugite-relay.log
-fi
-if [ -z "$CARDANO_LOG" ] && [ -f testnet/local-devnet/logs/cardano-bp.log ]; then
-    CARDANO_LOG=testnet/local-devnet/logs/cardano-bp.log
-fi
+# Auto-locate logs if not provided. Try both possible cwds (repo root and
+# the devnet directory) so the probe works from either.
+auto_locate() {
+    local name="$1"
+    for cand in "testnet/local-devnet/logs/$name" "logs/$name" "../../testnet/local-devnet/logs/$name"; do
+        if [ -f "$cand" ]; then printf '%s' "$cand"; return; fi
+    done
+}
+[ -z "$LOG" ]         && LOG="$(auto_locate dugite-bp.log)"
+[ -z "$RELAY_LOG" ]   && RELAY_LOG="$(auto_locate dugite-relay.log)"
+[ -z "$CARDANO_LOG" ] && CARDANO_LOG="$(auto_locate cardano-bp.log)"
 
 # Thresholds — tighter on devnet, looser on public testnets.
 TIP_AGE_MAX=5
@@ -244,17 +245,36 @@ else
 fi
 
 # --- 9. Network throughput (delta-based) -----------------------------------
-# Net-stall = wall-clock advanced ≥1 slot in NET_WINDOW but blocks_received_total flat
-# AND we have a hot peer. On public testnets with slow blocks, relax: only fail
-# if chainsync_idle_seconds > 30 simultaneously.
+# Net-stall semantics depend on role. A relay receives blocks from peers, so
+# `blocks_received_total` should advance with the chain. A BP forges blocks, so
+# its own `blocks_received_total` is 0 by design; use `blocks_forged_total`
+# advance (from a per-probe baseline file) as the BP liveness signal instead.
+FORGE_BASE="$BASELINE_DIR/blocks_forged-${PORT}"
+FORGE_NOW=$(toi "$(metric dugite_blocks_forged_total)")
+FORGE_PREV=0
+[ -f "$FORGE_BASE" ] && FORGE_PREV=$(toi "$(cat "$FORGE_BASE")")
+DELTA_BLOCKS_FORGE=$((FORGE_NOW - FORGE_PREV))
+echo "$FORGE_NOW" > "$FORGE_BASE"
+
 NET_OK=1
-if [ "$SLOT_DELTA" -ge 1 ] && [ "$DELTA_BLOCKS_RX" -le 0 ] && [ "$HOT_INT" -ge 1 ]; then
-    if [ "$PUBLIC" -eq 0 ]; then
-        fail "net-stall: slot advanced by ${SLOT_DELTA} but blocks_received delta=0 with hot peer"
-        NET_OK=0
-    elif [ "$CSY_INT" -gt 30 ]; then
-        fail "net-stall: chainsync idle=${CSY_INT}s with no blocks received over ${NET_WINDOW}s"
-        NET_OK=0
+if [ "$IS_BP_INT" -eq 1 ]; then
+    # BP role: liveness = forging OR receiving (relay-side traffic if multi-stream).
+    if [ "$SLOT_DELTA" -ge 1 ] && [ "$DELTA_BLOCKS_FORGE" -le 0 ] && [ "$DELTA_BLOCKS_RX" -le 0 ] && [ "$HOT_INT" -ge 1 ]; then
+        if [ "$PUBLIC" -eq 0 ]; then
+            fail "BP forge-stall: slot advanced by ${SLOT_DELTA} but blocks_forged delta=0 AND blocks_received delta=0 with hot peer"
+            NET_OK=0
+        fi
+    fi
+else
+    # Relay/follower: liveness = receiving blocks from upstream.
+    if [ "$SLOT_DELTA" -ge 1 ] && [ "$DELTA_BLOCKS_RX" -le 0 ] && [ "$HOT_INT" -ge 1 ]; then
+        if [ "$PUBLIC" -eq 0 ]; then
+            fail "net-stall: slot advanced by ${SLOT_DELTA} but blocks_received delta=0 with hot peer"
+            NET_OK=0
+        elif [ "$CSY_INT" -gt 30 ]; then
+            fail "net-stall: chainsync idle=${CSY_INT}s with no blocks received over ${NET_WINDOW}s"
+            NET_OK=0
+        fi
     fi
 fi
 # Apply pipeline lag: if blocks arrive but aren't applied, the ledger thread is stuck.
@@ -307,10 +327,11 @@ fi
 
 # --- 12. Recent Haskell adoption (devnet only — BP role) -------------------
 # On devnet (σ=1.0, f=0.5) dugite-bp produces blocks every ~2s. cardano-bp
-# should log a TraceAdoptedBlock for each. On public testnets we don't enforce
-# this — forging is rare.
+# should log an adoption event for each. cardano-node 11.0.1+ uses the new
+# tracer namespace `ChainDB.AddBlockEvent.AddedToCurrentChain`; legacy
+# `TraceAdoptedBlock` predates 10.x. Match both for forward-compat.
 if [ "$IS_BP_INT" -eq 1 ] && [ "$PUBLIC" -eq 0 ] && [ -n "$CARDANO_LOG" ] && [ -f "$CARDANO_LOG" ]; then
-    ADOPT_NOW=$(grep -c 'TraceAdoptedBlock' "$CARDANO_LOG" || true)
+    ADOPT_NOW=$(grep -cE 'TraceAdoptedBlock|AddedToCurrentChain' "$CARDANO_LOG" || true)
     ADOPT_BASE="$BASELINE_DIR/adoptions-cardano-bp"
     if [ -f "$ADOPT_BASE" ]; then
         PREV=$(toi "$(cat "$ADOPT_BASE")")
@@ -333,7 +354,10 @@ LOG_TARGETS=""
 [ -n "$RELAY_LOG" ] && LOG_TARGETS="$LOG_TARGETS $RELAY_LOG"
 for f in $LOG_TARGETS; do
     [ -f "$f" ] || continue
-    ec=$(grep -ciE 'ERROR|panicked|stale intersection|KES sign failure' "$f" || true)
+    # Case-sensitive on the level keywords (tracing emits uppercase) so the
+    # case-insensitive substring `error=...` inside benign WARN/INFO lines
+    # doesn't match. Match leading whitespace to anchor the log level.
+    ec=$(grep -cE ' ERROR | panicked| stale intersection|KES sign failure' "$f" || true)
     base_file="$BASELINE_DIR/errors-$(basename "$f")"
     prev=0
     [ -f "$base_file" ] && prev=$(toi "$(cat "$base_file")")
@@ -341,7 +365,7 @@ for f in $LOG_TARGETS; do
     if [ "$new" -gt 0 ]; then
         fail "$(basename "$f"): $new new ERROR/panic/stale/KES lines since last probe"
         if [ "$VERBOSE" -eq 1 ]; then
-            grep -nE 'ERROR|panicked|stale intersection|KES sign failure' "$f" | tail -n 3 | sed 's/^/      /' >&2 || true
+            grep -nE ' ERROR | panicked| stale intersection|KES sign failure' "$f" | tail -n 3 | sed 's/^/      /' >&2 || true
         fi
     else
         info "$(basename "$f"): ${ec} cumulative ERROR/panic/stale (delta=0)"
@@ -369,11 +393,13 @@ done
 
 # --- 14. Cross-validation (cardano-bp.log) ---------------------------------
 if [ -n "$CARDANO_LOG" ] && [ -f "$CARDANO_LOG" ]; then
-    IFB=$(grep -c 'TraceForgedInvalidBlock' "$CARDANO_LOG" || true)
+    # cardano-node 11.0.1 uses new-tracer namespaces; match BOTH legacy and new
+    # names so this check works against any node version >=10.
+    IFB=$(grep -cE 'TraceForgedInvalidBlock|AddBlockValidation\.InvalidBlock|Forge\.Loop\.ForgedInvalidBlock' "$CARDANO_LOG" || true)
     if [ "$IFB" -eq 0 ]; then
-        ok "cardano-bp.log: zero TraceForgedInvalidBlock"
+        ok "cardano-bp.log: zero invalid-block events (legacy + new tracer)"
     else
-        fail "CRITICAL: cardano-bp.log has $IFB TraceForgedInvalidBlock entries — Haskell rejected a dugite-forged block"
+        fail "CRITICAL: cardano-bp.log has $IFB invalid-block events — Haskell rejected a dugite-forged block"
     fi
     # Mismatch / fetch-timeout / disconnect patterns — early-warning indicators.
     for pat in 'mismatched' 'BlockFetchClient.*timeout' 'ConnectionLost'; do

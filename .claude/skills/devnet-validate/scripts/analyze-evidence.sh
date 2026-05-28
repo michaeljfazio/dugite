@@ -96,16 +96,21 @@ declare -A ERR_COUNT WARN_COUNT
 for node in dugite-bp dugite-relay cardano-bp; do
     log="$LOG_DIR/$node.log"
     [ -f "$log" ] || continue
-    ec=$(grep -ciE 'ERROR|panicked|TraceForgedInvalidBlock' "$log" || true)
-    wc=$(grep -ciE 'WARN|stale intersection' "$log" || true)
+    # Case-sensitive match anchored to log-level position so the lowercase
+    # substring `error=...` in benign WARN/INFO lines doesn't match.
+    # cardano-node 11.0.1+ uses new-tracer namespaces — match both legacy
+    # `TraceForgedInvalidBlock` and new `AddBlockValidation.InvalidBlock` /
+    # `Forge.Loop.ForgedInvalidBlock`.
+    ec=$(grep -cE ' ERROR | panicked|TraceForgedInvalidBlock|AddBlockValidation\.InvalidBlock|Forge\.Loop\.ForgedInvalidBlock' "$log" || true)
+    wc=$(grep -cE ' WARN | stale intersection' "$log" || true)
     ERR_COUNT[$node]=$ec
     WARN_COUNT[$node]=$wc
     if [ "$ec" -gt 0 ]; then
-        # Forged-invalid is always fatal-class
-        if grep -q "TraceForgedInvalidBlock" "$log"; then
-            ANOMALIES+=("CRITICAL: TraceForgedInvalidBlock in $node.log — Haskell rejected a dugite-forged block")
+        # Forged-invalid is always fatal-class — flag whichever name appears.
+        if grep -qE 'TraceForgedInvalidBlock|AddBlockValidation\.InvalidBlock|Forge\.Loop\.ForgedInvalidBlock' "$log"; then
+            ANOMALIES+=("CRITICAL: invalid-block event in $node.log — Haskell rejected a dugite-forged block")
         fi
-        ANOMALIES+=("$node: $ec ERROR lines")
+        ANOMALIES+=("$node: $ec ERROR/invalid-block lines")
     fi
 done
 

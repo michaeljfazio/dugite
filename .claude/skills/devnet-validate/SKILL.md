@@ -103,10 +103,17 @@ ZOO_SOCKET="$LD_CARDANO_BP_SOCK" ./tx-zoo/run-all.sh 01-bookkeeping 04-stake 06-
 ./stop.sh
 ```
 
-While the soak runs, sample monitoring in another shell. The probe is the preferred entry point — it implements the 14-step decision procedure in `references/health.md` (covers liveness, peers, tip, apply/forge/snapshot pipelines, network throughput, connection thrash, Haskell-tip parity, recent Haskell adoption, log deltas, and cross-validation) and exits non-zero on any anomaly:
+While the soak runs, sample monitoring in another shell. Two complementary scripts:
+
 ```bash
-# One-shot health verdict (recommended every ≤60s during a soak, ≤10 min during long Ralph loops)
+# (a) Fast one-shot health verdict — recommended every ≤60s during a soak. Implements
+# the 14-step decision procedure in references/health.md. Exits non-zero on any anomaly.
 .claude/skills/devnet-validate/scripts/health-probe.sh --verbose
+
+# (b) Comprehensive metric audit — run once after warmup AND once at end-of-round. Validates
+# all ~70 metrics dugite-monitor consumes plus cross-node + Haskell parity. Use --verbose to
+# see each assertion pass. Hard-fails on any invariant violation.
+.claude/skills/devnet-validate/scripts/metric-audit.sh --verbose
 
 # Raw streams (fall back when the probe isn't enough):
 curl -s localhost:12798/metrics | grep -E '^dugite_(tip|block|slot|peers|forge|chainsync)'
@@ -120,6 +127,7 @@ tail -F logs/cardano-bp.log   | grep -E 'TraceAdoptedBlock|TraceForgedInvalidBlo
 - Zero `TraceForgedInvalidBlock` in `logs/cardano-bp.log`
 - `dugite_tip_age_seconds` stays <5 throughout the soak
 - `health-probe.sh` returns HEALTHY at end-of-round AND at every ≤60s sample during the soak (network throughput + Haskell-tip parity included)
+- `metric-audit.sh` exits 0 at end-of-round (all ~30 metric assertions pass: completeness, arithmetic invariants, counter monotonicity, BP↔relay parity, Haskell parity, range checks)
 - `analyze-evidence.sh` reports no anomalies
 - `evidence/<ts>/cli-parity.csv` has zero DIVERGENT rows that are not filed as known-divergence issues
 - `evidence/<ts>/n2n-trace.csv` has zero PANIC or SILENT_SKIP rows
@@ -139,7 +147,7 @@ sleep 30
 
 # Submit a constant tx trickle so the boundary fires under load
 ( while true; do
-    ./tx-zoo/01-bookkeeping/01a-send-lovelace.sh >/dev/null 2>&1
+    ./tx-zoo/01-bookkeeping/01a-simple-pay.sh >/dev/null 2>&1
     sleep 20
   done ) &
 TRICKLE=$!
@@ -239,6 +247,7 @@ If any round fails, stop. Do not run the next round. Bundle `logs/` + `evidence/
 ## Bundled scripts
 
 - `scripts/health-probe.sh` — one-shot runtime health verdict (process + Prometheus + wall-clock + peers + tip + apply + forge + snapshot + network deltas + connection thrash + Haskell-tip parity + recent Haskell adoption + log delta + cross-validation). Exits 0 = HEALTHY, non-zero = SICK with anomaly list. Use during soaks and Ralph loops; `--public` relaxes thresholds for public testnets.
+- `scripts/metric-audit.sh` — full metric validation pass. Reads every metric dugite-monitor consumes (~70 metrics) and runs assertions in 6 phases: (1) completeness — every dugite-monitor metric is exposed; (2) per-node arithmetic invariants (e.g. `peers_connected == peers_hot + peers_warm`, `peers_inbound + peers_outbound - conn_full_duplex == peers_connected`); (3) counter monotonicity over a 3s window; (4) BP↔relay cross-node consistency (block-number parity, forge↔receive balance, role assignment); (5) Haskell parity via `cardano-cli` socket query; (6) range checks on tip-age, mempool, disk, snapshot worker, ledger pots. Use after warmup to validate that every gauge the human operator inspects matches expectations.
 - `scripts/restart-dugite-bp.sh` — relaunch ONLY dugite-bp with the same flags `run.sh` used (Round 3)
 - `scripts/analyze-evidence.sh` — post-run anomaly scanner; converts an `evidence/<ts>/` directory into a plain-text anomaly report with exit-code gate
 - `scripts/generate-release-report.sh` — aggregates one or more evidence directories into `report.json` + `report.md`; suitable for release gates and trend tracking. See `schemas/report.v1.json` for the output schema.

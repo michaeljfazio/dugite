@@ -149,7 +149,7 @@ Each gap is a candidate script. Filing them as `08-negative` / `protocols/` / `c
 |---|---|---|---|
 | Idle (no tx) | Round 1 baseline | — | `./soak.sh 120` |
 | Single-tx waves | tx-zoo sequential | — | `./tx-zoo/run-all.sh` |
-| Sustained trickle (one tx every 20s) | Round 2 | catches boundary RUPD interactions | `tx-zoo/01a-send-lovelace.sh` loop |
+| Sustained trickle (one tx every 20s) | Round 2 | catches boundary RUPD interactions | `tx-zoo/01a-simple-pay.sh` loop |
 | Saturation (mempool full) | NOT in standard rounds — gap | should land for v1.8.0 | candidate `11-mempool/11d-saturation.sh` |
 | Concurrent burst (multiple paths simultaneously) | NOT TESTED — gap | catches mempool race conditions, double-spend rejection | candidate `11-mempool/11e-multi-source-burst.sh` |
 | Throughput sweep (block-size lattice) | extended preset (`sync/bulk-sync-throughput.sh`) | — | — |
@@ -195,7 +195,7 @@ Negative governance tests (gap):
 # Pre: ./run.sh up, wallets funded
 ( while true; do
     for sock in "$LD_RELAY_SOCK" "$LD_CARDANO_BP_SOCK"; do
-        ZOO_SOCKET="$sock" ./tx-zoo/01-bookkeeping/01a-send-lovelace.sh \
+        ZOO_SOCKET="$sock" ./tx-zoo/01-bookkeeping/01a-simple-pay.sh \
             >/dev/null 2>&1 &
     done
     wait
@@ -216,7 +216,7 @@ n_inblocks=$(grep -c TraceAdoptedBlock     logs/cardano-bp.log)
 # Predicates: zero double-spend acceptances; mempool count peaks then drains.
 for i in $(seq 1 100); do
     for sock in "$LD_DUGITE_BP_SOCK" "$LD_RELAY_SOCK" "$LD_CARDANO_BP_SOCK"; do
-        ZOO_SOCKET="$sock" ./tx-zoo/01-bookkeeping/01a-send-lovelace.sh \
+        ZOO_SOCKET="$sock" ./tx-zoo/01-bookkeeping/01a-simple-pay.sh \
             >/dev/null 2>&1 &
     done
 done
@@ -239,7 +239,7 @@ A new round dedicated to bad-actor inputs:
 ./chaos/inbound-syn-flood.sh                # listener resilience
 ./chaos/clock-skew.sh                       # future-slot rejection
 ./chaos/disk-full.sh                        # write-failure containment
-./tx-zoo/08-negative/run.sh                 # all 19 negative tx classes
+./tx-zoo/run-all.sh 08-negative             # all 19 negative tx classes (orchestrator runs the directory)
 # Replay + censorship + double-spend (when scripts exist):
 # ./tx-zoo/08-negative/08t-replay.sh
 # ./tx-zoo/08-negative/08u-double-spend-burst.sh

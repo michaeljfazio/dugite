@@ -14,7 +14,7 @@ A node is healthy at any instant iff all six questions answer **yes**:
 1. **Liveness** — Is wall-clock advancing in the node? (`dugite_slot_number` strictly increasing)
 2. **Connectivity** — Does it have at least one peer doing real work? (`dugite_peers_connected ≥ 1` AND `dugite_peers_hot ≥ 1` once past boot)
 3. **Chain progress** — Is the tip moving relative to wall clock? (`dugite_tip_age_seconds` bounded; `dugite_block_number` advancing as blocks arrive)
-4. **No regressions** — Are the "should always be zero" counters still zero? (`forge_failures`, `block_apply_failures`, `snapshot_failed`, `utxo_flush_failed`, plus zero `ERROR`/`panicked`/`TraceForgedInvalidBlock` lines)
+4. **No regressions** — Are the "should always be zero" counters still zero? (`forge_failures`, `block_apply_failures`, `snapshot_failed`, `utxo_flush_failed`, plus zero `ERROR`/`panicked` lines AND zero invalid-block events in `cardano-bp.log` — match BOTH legacy `TraceForgedInvalidBlock` and cardano-node 11.x `ChainDB.AddBlockEvent.AddBlockValidation.InvalidBlock` / `Forge.Loop.ForgedInvalidBlock`)
 5. **Network performance** — Are the mini-protocols carrying expected traffic? (block-reception rate, tx-reception rate, mux not idle for unhealthy intervals, no connection thrash)
 6. **Cross-validation parity** — Does the co-running Haskell node agree on tip, accept every dugite-forged block, and stay within one block of dugite's tip?
 
@@ -107,13 +107,13 @@ A healthy boundary crossing produces a brief, observable burst of activity, then
 | `dugite_tip_age_seconds` | May spike to `[5, 15]` for ≤1 slot, then recover |
 | `dugite_snapshot_skipped_busy_total` | May bump once (boundary triggers snapshot write) |
 | `dugite_block_apply_failures_total` | Stays 0 |
-| Haskell log `cardano-bp.log` | Multiple `TraceAdoptedBlock` post-boundary; no `TraceForgedInvalidBlock` |
+| Haskell log `cardano-bp.log` | Multiple `AddedToCurrentChain` (or legacy `TraceAdoptedBlock`) post-boundary; no `AddBlockValidation.InvalidBlock` / `Forge.Loop.ForgedInvalidBlock` (or legacy `TraceForgedInvalidBlock`) |
 
 **Boundary anomalies (any one is a fail):**
 - `RUPD`, `pulser`, `reward calculation` errors in `dugite-bp.log`
 - `dugite_treasury_lovelace` or `dugite_reserves_lovelace` diverge from Haskell dump (cross-check via `epoch-state-debug` feature or `cardano-cli debug log-epoch-state`)
 - `analyze-evidence.sh` chain-density proxy (canonical-blocks ÷ slots) drifts outside `f × (1 ± 20%)`
-- `TraceForgedInvalidBlock` for any post-boundary block — instant fail
+- Any invalid-block event (`AddBlockValidation.InvalidBlock` / `Forge.Loop.ForgedInvalidBlock` / legacy `TraceForgedInvalidBlock`) for any post-boundary block — instant fail
 - KES rollover during a <20-min run is unexpected; if `KESKeyExpiryEvent` appears, the genesis is misconfigured
 
 ### Phase R — Restart resilience

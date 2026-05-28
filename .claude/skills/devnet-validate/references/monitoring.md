@@ -73,17 +73,34 @@ These are the metric names actually emitted by dugite-node today. The skill's ea
 
 ### Peers and connections
 
+> **Haskell-canonical semantics** (per `ouroboros-network` `PeerSelection.Types` + `ConnectionManager.Types`):
+> - Four peer states: `PeerCold` / `PeerCooling` / `PeerWarm` / `PeerHot`. `PeerCooling` is a TIME_WAIT-analogue intermediate after a clean disconnect. **Dugite today has only Cold/Warm/Hot — missing `PeerCooling`** (audit-findings A8.div-1).
+> - Hot/Warm/Cold counts are over the `Set peeraddr` — UNIQUE addresses. **Dugite today counts per-direction peer entries**, so a Duplex peer is double-counted in hot/warm/cold (audit-findings A8.div-3). Empirically: a single Duplex neighbor shows as `hot=2` instead of `hot=1`.
+> - `connectionManager.inboundConns` / `.outboundConns` count each TCP connection ONCE by initiator `Provenance`. **Dugite today double-counts a `DuplexConn` in both gauges** (audit-findings A8.div-2). Empirically: relay with 2 unique peers and 1 DuplexConn shows `inbound=2, outbound=2`; Haskell would show `inbound + outbound = 2`.
+>
+> Dugite's gauges are usable today as-is but their arithmetic differs from Haskell. `metric-audit.sh` enforces the current dugite-arithmetic and emits an INFO when the Haskell-canonical arithmetic doesn't also hold.
+
 | Metric | Type | Healthy | Sick |
 |---|---|---|---|
 | `dugite_peers_connected` | gauge | ≥1 throughout (devnet=1 in each direction) | 0 for >5s → network thrash |
-| `dugite_peers_hot` | gauge | ≥1 (actively syncing) | 0 with `connected` ≥1 → peer stuck in warm state |
-| `dugite_peers_warm` / `_cold` | gauge | Devnet: warm ≤ 1, cold = 0 | Bouncing → connection thrash |
-| `dugite_peers_inbound` / `_outbound` / `_duplex` | gauge | Match topology expectations | — |
-| `dugite_conn_full_duplex` | gauge | ≥1 between dugite-bp ↔ dugite-relay | 0 → simultaneous-open or mux-table bug |
+| `dugite_peers_hot` | gauge | ≥1 (peers with ChainSync+BlockFetch+TxSubmission active). Note: dugite over-reports vs Haskell — see semantics box above | 0 with `connected` ≥1 → peer stuck in warm state |
+| `dugite_peers_warm` | gauge | Peers with only KeepAlive running (no block-diffusion protocols). Should approach 0 in steady state on a static devnet | Persistent non-zero with hot=0 → promotion stuck |
+| `dugite_peers_cold` | gauge | Devnet: 0 in steady state. Known-but-not-connected count | Bouncing → connection thrash |
+| `dugite_peers_inbound` / `_outbound` | gauge | Per-direction conn count. Dugite includes `DuplexConn` in both — Haskell counts by `Provenance` only (one side) | — |
+| `dugite_peers_duplex` | gauge | Count of `DataFlow::Duplex`-negotiated connections | — |
+| `dugite_conn_full_duplex` | gauge | Count of `ConnectionState::DuplexConn` (both sides active on one socket) — maps to Haskell `connectionManager.fullDuplexConns` | 0 in 3-node devnet is OK (sim-open opportunistic) |
 | `dugite_conn_terminating` | gauge | 0 in steady state | Persistent non-zero → connection cleanup leak |
 | `dugite_n2n_connections_active` | gauge | Equal to `peers_connected` after warmup | Drift → leaking conn-tracker entries |
 | `dugite_n2n_connections_total` | counter | Increments only on intentional restart | Steady climb → connection thrash / peer flapping |
 | `dugite_n2c_connections_active` | gauge | Bumps when tx-zoo runs cardano-cli; returns to 0 | Stuck >0 → N2C teardown bug |
+
+#### Expected hot-counts in the devnet topology (Haskell semantics)
+
+| Node | Neighbors | Haskell-canonical `peers_hot` | Dugite today (P1 — A8.div-3 fix pending) |
+|---|---:|---:|---:|
+| dugite-bp | 1 (relay) | 1 | 2 (peer counted per direction) |
+| dugite-relay | 2 (BP, cardano-bp) | 2 | 3 (one duplex neighbor double-counted) |
+| cardano-bp | 1 (relay) | 1 | n/a (Prometheus not exposed in devnet — A3) |
 
 ### Ledger / state
 
@@ -119,19 +136,23 @@ The node also emits `cardano_node_metrics_*` aliases (`slotNum_int`, `blockNum_i
 
 ## Key cardano-node trace patterns (cardano-bp.log)
 
-Cardano-node emits structured JSON traces by default. Grep these:
+Cardano-node 11.0.1 emits structured JSON traces via the new tracer (`cardano-tracer`). Every line is a JSON object with an `ns` (namespace) key — there are NO legacy `Trace*` prefixes in the message body. The table below maps the **legacy 10.x names** (which still appear in many older runbooks and Grafana dashboards) to the **actual 11.x namespaces** you grep for today.
 
-| Pattern | What it means |
-|---|---|
-| `TraceAdoptedBlock` | The Haskell ledger has applied a block — **proves dugite's block was accepted** |
-| `TraceForgedInvalidBlock` | **CRITICAL FAILURE**: dugite forged a block Haskell rejected |
-| `TraceDownloadedHeader` | A header arrived from the relay; should be followed by `TraceAdoptedBlock` for the same hash within a slot |
-| `TraceMempoolAccepted` | A tx submitted via cardano-cli passed Haskell's Phase-1 validation |
-| `TraceMempoolRejectedTx` | A tx was rejected — pair with `AddedTx`/`RemoveTxs` (memory: `reference_cardano_node_mempool_traces`) |
-| `ChainSync ... mismatched` / `BlockFetch ... mismatched` | Header/body mismatch — usually a CBOR encoding bug |
-| `KESKeyExpiryEvent` | KES rollover (we don't expect this in <20min runs) |
-| `BlockFetchClient ... timeout` | Body delivery stalled — relay or BP unresponsive |
-| `ConnectionLost` / `Disconnecting` | Peer churn; should be rare in a stable run |
+| Event | cardano-node 11.x namespace (`ns`) | Legacy 10.x name |
+|---|---|---|
+| Block adopted as new tip | `ChainDB.AddBlockEvent.AddedToCurrentChain` | `TraceAdoptedBlock` |
+| Block fails ledger validation | `ChainDB.AddBlockEvent.AddBlockValidation.InvalidBlock` (+ `Forge.Loop.ForgedInvalidBlock` on the forger) | `TraceForgedInvalidBlock` |
+| Block passes ledger validation | `ChainDB.AddBlockEvent.AddBlockValidation.ValidCandidate` | (no legacy equiv) |
+| Header arrived via ChainSync | `ChainSync.Client.DownloadedHeader` | `TraceDownloadedHeader` |
+| Block body fetched | `BlockFetch.Client.CompletedBlockFetch` | (subset of older legacy event) |
+| Body delivery timeout | `BlockFetch.Client.AcknowledgedFetchRequest` with delay > threshold | `BlockFetchClient ... timeout` |
+| Tx accepted into mempool | `Mempool.AddedTx` | `TraceMempoolAccepted` |
+| Tx rejected by mempool | `Mempool.RejectedTx` | `TraceMempoolRejectedTx` |
+| Header/body mismatch | `ChainSync.Client.RolledBack` paired with `*.mismatched` | `ChainSync ... mismatched` |
+| KES rollover | `Forge.Loop.KESKeyExpiry*` | `KESKeyExpiryEvent` |
+| Peer connection terminated | `Network.ConnectionManager.ConnectionLost` / `Disconnecting` | same |
+
+**Cross-validation grep**: always include BOTH names — `grep -E 'TraceForgedInvalidBlock|AddBlockValidation\.InvalidBlock|Forge\.Loop\.ForgedInvalidBlock'`. The bundled `scripts/health-probe.sh` and `scripts/analyze-evidence.sh` both do this. **Greping for the legacy names alone makes the predicate always-pass on 11.x logs — a P0 false-negative.**
 
 ## Key dugite log patterns (dugite-bp.log / dugite-relay.log)
 
@@ -155,10 +176,10 @@ Cardano-node emits structured JSON traces by default. Grep these:
 2. dugite-relay receives and adopts `B`.
 3. cardano-bp receives `B` from dugite-relay.
 4. cardano-bp's Haskell ledger applies `B`.
-   - SUCCESS → `TraceAdoptedBlock` in `cardano-bp.log`. **dugite-bp's block is byte-identical to what Haskell expects.**
-   - FAILURE → `TraceForgedInvalidBlock` with a reason. **dugite has a ledger or serialization bug.**
+   - SUCCESS → `ChainDB.AddBlockEvent.AddedToCurrentChain` (11.x) / `TraceAdoptedBlock` (legacy) in `cardano-bp.log`. **dugite-bp's block is byte-identical to what Haskell expects.**
+   - FAILURE → `ChainDB.AddBlockEvent.AddBlockValidation.InvalidBlock` (11.x) / `TraceForgedInvalidBlock` (legacy) with a reason. **dugite has a ledger or serialization bug.**
 
-If `cardano-bp` ever logs `TraceForgedInvalidBlock`, the round FAILS immediately. Capture:
+If `cardano-bp` ever logs an invalid-block event (either `ChainDB.AddBlockEvent.AddBlockValidation.InvalidBlock` on 11.x or `TraceForgedInvalidBlock` on legacy), the round FAILS immediately. Capture:
 - The block's slot, hash, era, body size
 - The exact `cardano-bp` reason string
 - The corresponding `dugite-bp.log` forge event
@@ -194,7 +215,7 @@ tail -F testnet/local-devnet/logs/dugite-bp.log \
 
 # Haskell adoption stream
 tail -F testnet/local-devnet/logs/cardano-bp.log \
-  | grep --line-buffered -E 'TraceAdoptedBlock|TraceForgedInvalidBlock|MempoolAccepted|mismatched|timeout|Error'
+  | grep --line-buffered -E 'TraceAdoptedBlock|AddedToCurrentChain|TraceForgedInvalidBlock|AddBlockValidation\.InvalidBlock|Mempool\.(Added|Rejected)Tx|MempoolAccepted|mismatched|timeout|Error'
 ```
 
 ## Boot-timing observations
