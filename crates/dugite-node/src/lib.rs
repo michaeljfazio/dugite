@@ -10,3 +10,17 @@ pub mod csj_orchestrator;
 pub mod forge;
 pub mod gsm;
 pub mod verify_snapshot;
+
+/// `peer_connection` module exposed for the `test-utils` integration-test
+/// feature so that `tests/lifecycle_invariants.rs` can construct fake
+/// `PeerConnection` instances to exercise Fix-A (Hot→Warm→Hot channel
+/// recovery) without a live N2N handshake.
+///
+/// Gated on `feature = "test-utils"` — not included in default or production
+/// builds.  The binary crate references the same source files via `mod node;`
+/// in `main.rs` as a separate compilation unit.
+#[cfg(feature = "test-utils")]
+pub mod node {
+    /// `PeerConnection` and its lifecycle types, exposed for integration tests.
+    pub mod peer_connection;
+}

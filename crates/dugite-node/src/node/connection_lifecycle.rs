@@ -917,42 +917,28 @@ impl ConnectionLifecycleManager {
         Ok(())
     }
 
-    /// Demote a hot peer to warm (close connection + disconnect).
+    /// Demote a hot peer to warm: stop hot protocol tasks, keep TCP + mux alive.
     ///
-    /// # Architecture divergence from Haskell
+    /// # Haskell Alignment: `deactivatePeerConnection` (Fix A, issue #703)
     ///
-    /// Haskell's `PeerStateActions` keeps the TCP connection alive across Hot→Warm
-    /// transitions, stopping only the hot mini-protocols and reusing the existing
-    /// mux connection for later re-promotion.
+    /// Mirrors Haskell's `PeerStateActions.deactivatePeerConnection` from
+    /// ouroboros-network (`PeerStateActions.hs` line 978). The Haskell implementation:
+    ///   1. Cancels hot mini-protocol responder bundles.
+    ///   2. Awaits graceful exit with `spsDeactivateTimeout` (5 seconds).
+    ///   3. Keeps the `MuxBearer` (TCP connection) alive for re-promotion.
     ///
-    /// Dugite cannot replicate this because `MuxChannel` is **single-use**: it wraps
-    /// an `mpsc::Receiver` that is moved into the hot protocol task when `start_hot_protocols`
-    /// is called.  When the task exits (either cleanly or via cancellation), the receiver
-    /// is dropped and the channel slot can never be reclaimed — `subscribe()` routes are
-    /// baked into `Mux::run()` at connection-open time and cannot be re-registered on a
-    /// running mux.
+    /// Fix A implements this via `PeerConnection::stop_hot_protocols_and_recover()`,
+    /// which:
+    ///   1. Cancels hot task `CancellationToken`s.
+    ///   2. Awaits task exit with `PROTOCOL_SHUTDOWN_TIMEOUT` (5 s).
+    ///   3. Calls `MuxHandle::resubscribe()` to install fresh ingress senders
+    ///      in the running `IngressTask` via `SwappableSender` — restoring all
+    ///      three hot client channels without touching the TCP bearer.
     ///
-    /// Attempting to re-promote a Hot→Warm-demoted peer on the same connection therefore
-    /// always fails with `PeerConnectionError::ChannelUnavailable("chainsync")`, producing
-    /// the churn loop observed in #516:
+    /// If recovery fails (timeout or empty `MuxHandle`), falls back to closing
+    /// the TCP connection; the governor reconnects on the next tick.
     ///
-    /// ```text
-    /// DemoteToWarm → channels consumed/dropped → peer is Warm
-    /// PromoteToHot → start_hot_protocols → chainsync_client_channel.take() = None → Err
-    /// handle_governor_action PromoteToHot failure → closes connection → peer is Cold
-    /// PromoteToWarm → reconnect → inline promote_to_hot → Success
-    /// next hot-churn DemoteToWarm → channels consumed → repeat forever
-    /// ```
-    ///
-    /// **Fix**: on Hot→Warm demotion we immediately close the entire TCP connection
-    /// (equivalent to a Warm→Cold transition at the connection layer).  The peer
-    /// manager is updated to cold via `peer_disconnected()`.  On the next governor tick,
-    /// a fresh TCP connection is established (`PromoteToWarm`) giving new `MuxChannel`
-    /// instances, and `PromoteToHot` succeeds.
-    ///
-    /// The observable difference is one extra reconnect latency (~RTT) per hot-churn
-    /// cycle, which is acceptable given that hot churn fires at most every 10 minutes
-    /// and mainnet tip-following nodes almost never trigger it.
+    /// See: <https://github.com/IntersectMBO/ouroboros-network/blob/main/ouroboros-network/lib/Ouroboros/Network/PeerSelection/PeerStateActions.hs#L978>
     ///
     /// # Errors
     ///
@@ -962,39 +948,63 @@ impl ConnectionLifecycleManager {
         addr: SocketAddr,
         peer_manager: &mut NodePeerManager,
     ) -> Result<(), LifecycleError> {
-        // Close ALL connections to this remote (covers duplex pairs).
-        let cids: Vec<ConnectionId> = self
-            .connections
-            .keys()
-            .filter(|c| c.remote == addr)
-            .copied()
-            .collect();
-        if cids.is_empty() {
-            return Err(LifecycleError::NotConnected(addr));
-        }
+        // Find the connection that has the hot protocol tasks — prefer outbound
+        // (same as promote_to_hot).
+        let cid = self
+            .find_outbound_cid(addr)
+            .or_else(|| self.find_any_cid(addr))
+            .ok_or(LifecycleError::NotConnected(addr))?;
 
-        info!(%addr, "demoting hot -> warm: closing connection (single-use channel constraint)");
+        info!(%cid, "demoting hot -> warm: stopping hot protocols (Fix A: keep TCP alive)");
 
-        // Mark as terminating before shutdown so metrics see an orderly exit.
-        peer_manager.mark_terminating(&addr);
+        // Attempt graceful stop + channel recovery on the existing connection.
+        let recovered = {
+            let conn = self.connections.get_mut(&cid).unwrap();
+            conn.stop_hot_protocols_and_recover().await
+        };
 
-        for cid in &cids {
-            if let Some(mut conn) = self.connections.remove(cid) {
-                conn.shutdown().await;
+        if recovered {
+            // Hot protocols stopped and channels recovered — connection stays warm.
+            // Clear only the ChainSync candidate state (no headers are streaming).
+            {
+                let mut chains = self.candidate_chains.write().await;
+                chains.remove(&addr);
             }
+
+            // Update peer manager: hot → warm (connection stays alive).
+            peer_manager.inner.demote_to_warm(&addr);
+
+            info!(%cid, "hot -> warm complete (TCP kept alive, channels recovered)");
+        } else {
+            // Recovery failed (timeout or no MuxHandle) — fall back to TCP close.
+            // The governor will reconnect on the next tick (Cold → Warm → Hot).
+            warn!(%cid, "hot -> warm: channel recovery failed, falling back to TCP close");
+
+            peer_manager.mark_terminating(&addr);
+
+            // Close ALL connections to this remote (covers duplex pairs).
+            let cids: Vec<ConnectionId> = self
+                .connections
+                .keys()
+                .filter(|c| c.remote == addr)
+                .copied()
+                .collect();
+            for close_cid in &cids {
+                if let Some(mut conn) = self.connections.remove(close_cid) {
+                    conn.shutdown().await;
+                }
+            }
+
+            {
+                let mut chains = self.candidate_chains.write().await;
+                chains.remove(&addr);
+            }
+
+            peer_manager.peer_disconnected(&addr);
+
+            info!(%addr, "hot -> warm fallback complete (connection closed; will reconnect)");
         }
 
-        // Clear candidate chain state for this peer (no longer syncing).
-        {
-            let mut chains = self.candidate_chains.write().await;
-            chains.remove(&addr);
-        }
-
-        // Update peer manager to cold (not warm) — a fresh connection is required
-        // before hot protocols can run again.
-        peer_manager.peer_disconnected(&addr);
-
-        info!(%addr, "hot -> warm complete (connection closed; will reconnect)");
         Ok(())
     }
 

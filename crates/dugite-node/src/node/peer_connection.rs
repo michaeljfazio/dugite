@@ -40,7 +40,7 @@ use dugite_network::handshake::n2n::N2NVersionData;
 use dugite_network::handshake::{run_n2n_handshake_client, run_n2n_handshake_server};
 use dugite_network::mux::channel::MuxChannel;
 use dugite_network::mux::segment::Direction;
-use dugite_network::mux::Mux;
+use dugite_network::mux::{Mux, MuxHandle};
 use dugite_network::protocol::{
     PROTOCOL_HANDSHAKE, PROTOCOL_N2N_BLOCKFETCH, PROTOCOL_N2N_CHAINSYNC, PROTOCOL_N2N_KEEPALIVE,
     PROTOCOL_N2N_PEERSHARING, PROTOCOL_N2N_TXSUBMISSION,
@@ -181,6 +181,15 @@ pub struct PeerConnection {
     // ── Mux lifecycle ──
     /// Handle to the spawned mux task. When this completes, the connection is dead.
     mux_handle: JoinHandle<Result<(), MuxError>>,
+
+    /// Re-subscription handle for Hot→Warm demotion without TCP close.
+    ///
+    /// Populated at connect/accept time. Used by `stop_hot_protocols_and_recover()` to
+    /// create fresh `MuxChannel` instances after hot protocol tasks have exited,
+    /// mirroring Haskell's `deactivatePeerConnection` which keeps the mux alive.
+    ///
+    /// Reference: <https://github.com/IntersectMBO/ouroboros-network/blob/main/ouroboros-network/lib/Ouroboros/Network/PeerSelection/PeerStateActions.hs#L978>
+    mux_resubscribe: MuxHandle,
 
     /// Top-level cancellation token for the entire connection.
     cancel: CancellationToken,
@@ -357,6 +366,10 @@ impl PeerConnection {
             DEFAULT_INGRESS_LIMIT,
         );
 
+        // Take the re-subscription handle BEFORE consuming the mux into run().
+        // This must happen after all subscribe() calls and before spawning run().
+        let mux_resubscribe = mux.take_handle();
+
         // Spawn mux task — runs until bearer closes or error.
         let cancel = CancellationToken::new();
         let mux_handle = tokio::spawn(async move { mux.run().await });
@@ -387,6 +400,7 @@ impl PeerConnection {
             keepalive_server_channel: Some(ka_srv),
             peersharing_server_channel: Some(ps_srv),
             mux_handle,
+            mux_resubscribe,
             cancel,
             warm_tasks: Vec::new(),
             hot_tasks: Vec::new(),
@@ -504,6 +518,9 @@ impl PeerConnection {
             (None, None, None, None, None)
         };
 
+        // Take the re-subscription handle BEFORE consuming the mux into run().
+        let mux_resubscribe = mux.take_handle();
+
         // Spawn mux task.
         let cancel = CancellationToken::new();
         let mux_handle = tokio::spawn(async move { mux.run().await });
@@ -534,6 +551,7 @@ impl PeerConnection {
             keepalive_server_channel: Some(keepalive_server_ch),
             peersharing_server_channel: Some(peersharing_server_ch),
             mux_handle,
+            mux_resubscribe,
             cancel,
             warm_tasks: Vec::new(),
             hot_tasks: Vec::new(),
@@ -642,6 +660,91 @@ impl PeerConnection {
     /// do not finish in time are forcibly aborted.
     pub async fn stop_hot_protocols(&mut self) {
         Self::stop_tasks(&mut self.hot_tasks, "hot", self.addr).await;
+    }
+
+    /// Stop hot-temperature protocol tasks and recover their channels.
+    ///
+    /// Mirrors Haskell's `deactivatePeerConnection` (link below): cancels the
+    /// hot mini-protocols via their cancellation tokens, awaits graceful exit
+    /// with `spsDeactivateTimeout = 5s`, then uses `MuxHandle::resubscribe()`
+    /// to atomically install fresh ingress receivers — keeping TCP+Mux alive.
+    ///
+    /// On success, `chainsync_client_channel`, `blockfetch_client_channel`, and
+    /// `txsubmission_client_channel` are `Some` again and `start_hot_protocols`
+    /// can be called immediately on the NEXT governor `PromoteToHot`.
+    ///
+    /// On timeout (task did not stop within 5 s), the task is forcibly aborted
+    /// and the channel for that slot is left as `None` — the caller must fall
+    /// back to full TCP close (matching Haskell's `Mux.stop pchMux` fallback).
+    ///
+    /// Reference:
+    /// <https://github.com/IntersectMBO/ouroboros-network/blob/main/ouroboros-network/lib/Ouroboros/Network/PeerSelection/PeerStateActions.hs#L978>
+    pub async fn stop_hot_protocols_and_recover(&mut self) -> bool {
+        // Signal cancellation to all hot tasks.
+        for (_, token) in &self.hot_tasks {
+            token.cancel();
+        }
+
+        // Await graceful shutdown with spsDeactivateTimeout (5 s).
+        // Must await each task individually so we can detect timeouts.
+        let mut all_stopped = true;
+        let drain = std::mem::take(&mut self.hot_tasks);
+        for (handle, _) in drain {
+            let abort_handle = handle.abort_handle();
+            match tokio::time::timeout(PROTOCOL_SHUTDOWN_TIMEOUT, handle).await {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => {
+                    warn!(addr = %self.addr, error = %e, "hot protocol task join error during deactivation");
+                }
+                Err(_) => {
+                    warn!(
+                        addr = %self.addr,
+                        "hot protocol task timed out during deactivation (spsDeactivateTimeout 5s), aborting"
+                    );
+                    abort_handle.abort();
+                    all_stopped = false;
+                }
+            }
+        }
+
+        if !all_stopped {
+            // Haskell fallback: if any task refused to stop, the connection is
+            // considered corrupt — caller must do a full TCP close.
+            warn!(addr = %self.addr, "hot protocol tasks did not stop cleanly — channel recovery skipped");
+            return false;
+        }
+
+        // Re-subscribe hot client channels via the running mux's swappable senders.
+        // This atomically installs new ingress receivers without touching TCP.
+        // Both outbound and inbound-duplex connections use InitiatorDir for client
+        // protocols (ChainSync/BlockFetch/TxSubmission are always client-side).
+        let dir = Direction::InitiatorDir;
+
+        let cs_ch = self
+            .mux_resubscribe
+            .resubscribe(PROTOCOL_N2N_CHAINSYNC, dir);
+        let bf_ch = self
+            .mux_resubscribe
+            .resubscribe(PROTOCOL_N2N_BLOCKFETCH, dir);
+        let tx_ch = self
+            .mux_resubscribe
+            .resubscribe(PROTOCOL_N2N_TXSUBMISSION, dir);
+
+        match (cs_ch, bf_ch, tx_ch) {
+            (Some(cs), Some(bf), Some(tx)) => {
+                self.chainsync_client_channel = Some(cs);
+                self.blockfetch_client_channel = Some(bf);
+                self.txsubmission_client_channel = Some(tx);
+                debug!(addr = %self.addr, "hot protocol channels recovered via mux resubscribe");
+                true
+            }
+            _ => {
+                // Defensive: channels not in the handle (e.g. inbound-only connection
+                // without client subscriptions). Caller falls back to TCP close.
+                warn!(addr = %self.addr, "mux resubscribe returned None for hot channels — falling back to TCP close");
+                false
+            }
+        }
     }
 
     /// Stop warm-temperature protocol tasks (KeepAlive).
@@ -886,14 +989,21 @@ impl From<MuxError> for PeerConnectionError {
     }
 }
 
-#[cfg(test)]
+/// Test-only and `test-utils`-feature helpers for constructing fake
+/// `PeerConnection` instances in unit and integration tests.
+///
+/// All methods in this block are excluded from production builds.  They are
+/// compiled when running `cargo test` (the crate's own unit tests) OR when
+/// the `test-utils` feature is enabled (integration tests in
+/// `tests/lifecycle_invariants.rs`).
+#[cfg(any(test, feature = "test-utils"))]
 impl PeerConnection {
     /// Create a minimal `PeerConnection` for use in unit tests.
     ///
     /// Spawns a no-op mux task so the `JoinHandle` is valid.  All protocol
     /// channels are `None`, and all task lists are empty.  The instance
     /// must be created inside a tokio runtime context (e.g. `#[tokio::test]`).
-    pub(crate) fn fake_for_test(addr: SocketAddr) -> Self {
+    pub fn fake_for_test(addr: SocketAddr) -> Self {
         let local_addr: SocketAddr = match addr {
             SocketAddr::V4(_) => "127.0.0.1:0".parse().unwrap(),
             SocketAddr::V6(_) => "[::1]:0".parse().unwrap(),
@@ -904,7 +1014,7 @@ impl PeerConnection {
     /// Variant of [`fake_for_test`] that also pins the `local_addr` and
     /// direction so tests can build distinct `ConnectionId`s for the same
     /// remote (e.g. an outbound + inbound duplex pair).
-    pub(crate) fn fake_for_test_with_local(
+    pub fn fake_for_test_with_local(
         addr: SocketAddr,
         local_addr: SocketAddr,
         direction: PeerConnectionDirection,
@@ -927,6 +1037,7 @@ impl PeerConnection {
             keepalive_server_channel: None,
             peersharing_server_channel: None,
             mux_handle,
+            mux_resubscribe: MuxHandle::empty(),
             cancel: tokio_util::sync::CancellationToken::new(),
             warm_tasks: Vec::new(),
             hot_tasks: Vec::new(),
@@ -942,7 +1053,7 @@ impl PeerConnection {
     /// will return `MuxError::BearerClosed` on the first actual `recv()`.
     ///
     /// Used by regression tests for the warm→hot promotion race (#516).
-    pub(crate) fn fake_with_hot_channels(addr: SocketAddr) -> Self {
+    pub fn fake_with_hot_channels(addr: SocketAddr) -> Self {
         use std::sync::atomic::AtomicUsize;
         use tokio::sync::mpsc;
 
@@ -987,6 +1098,59 @@ impl PeerConnection {
             keepalive_server_channel: None,
             peersharing_server_channel: None,
             mux_handle,
+            mux_resubscribe: MuxHandle::empty(),
+            cancel: tokio_util::sync::CancellationToken::new(),
+            warm_tasks: Vec::new(),
+            hot_tasks: Vec::new(),
+            server_tasks: Vec::new(),
+        }
+    }
+
+    /// Create a `PeerConnection` backed by caller-supplied channels and a real
+    /// `MuxHandle` for the `stop_hot_protocols_and_recover()` integration test.
+    ///
+    /// Used exclusively by `tests/lifecycle_invariants.rs` to construct a
+    /// connection from a manually-built mux (bypassing the N2N handshake) so
+    /// that `MuxHandle::resubscribe()` has real `SwappableSender` entries.
+    ///
+    /// # Parameters
+    ///
+    /// * `addr` — Nominal remote peer address (used for logging).
+    /// * `local_addr` — Local socket address.
+    /// * `direction` — `Outbound` for initiator-side connections.
+    /// * `cs_ch`, `bf_ch`, `tx_ch`, `ka_ch` — Pre-subscribed client channels.
+    /// * `mux_task` — `JoinHandle` for the spawned mux task.
+    /// * `mux_resubscribe` — `MuxHandle` taken from the same mux before `run()`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn fake_with_mux_resubscribe(
+        addr: SocketAddr,
+        local_addr: SocketAddr,
+        direction: PeerConnectionDirection,
+        cs_ch: MuxChannel,
+        bf_ch: MuxChannel,
+        tx_ch: MuxChannel,
+        ka_ch: MuxChannel,
+        mux_task: tokio::task::JoinHandle<Result<(), MuxError>>,
+        mux_resubscribe: MuxHandle,
+    ) -> Self {
+        Self {
+            addr,
+            local_addr,
+            direction,
+            version: 0,
+            network_magic: 0,
+            chainsync_client_channel: Some(cs_ch),
+            blockfetch_client_channel: Some(bf_ch),
+            txsubmission_client_channel: Some(tx_ch),
+            keepalive_client_channel: Some(ka_ch),
+            peersharing_client_channel: None,
+            chainsync_server_channel: None,
+            blockfetch_server_channel: None,
+            txsubmission_server_channel: None,
+            keepalive_server_channel: None,
+            peersharing_server_channel: None,
+            mux_handle: mux_task,
+            mux_resubscribe,
             cancel: tokio_util::sync::CancellationToken::new(),
             warm_tasks: Vec::new(),
             hot_tasks: Vec::new(),

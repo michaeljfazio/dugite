@@ -8,6 +8,9 @@ description = "Dugite Cardano node - main entry point"
 default = []
 io-uring = ["dugite-storage/io-uring"]
 journald = ["dep:tracing-journald"]
+# Expose internal test helpers (PeerConnection fake constructors, node module)
+# for integration tests.  Not intended for production use.
+test-utils = []
 
 [lib]
 name = "dugite_node"
@@ -73,3 +76,7 @@ libc = { workspace = true }
 tempfile = { workspace = true }
 proptest = { workspace = true }
 tokio = { workspace = true, features = ["test-util"] }
+
+[[test]]
+name = "lifecycle_invariants"
+required-features = ["test-utils"]
