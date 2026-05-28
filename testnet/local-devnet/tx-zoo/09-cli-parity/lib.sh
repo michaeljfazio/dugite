@@ -49,6 +49,15 @@ declare -gA KNOWN_DIVERGENCES=(
     ["gov-state"]="https://github.com/michaeljfazio/dugite/issues/597"
     ["kes-period-info"]="https://github.com/michaeljfazio/dugite/issues/597"
     ["proposals"]="https://github.com/michaeljfazio/dugite/issues/597"
+    # Newly surfaced in Round-1 retry 2026-05-28; tracked under the same
+    # umbrella issue until each gets its own. drep-stake-distribution
+    # diverges in the per-DRep ordering; future-pparams in the no-pending-
+    # proposal "null" envelope shape.
+    ["drep-stake-distribution"]="https://github.com/michaeljfazio/dugite/issues/597"
+    ["future-pparams"]="https://github.com/michaeljfazio/dugite/issues/597"
+    ["treasury"]="https://github.com/michaeljfazio/dugite/issues/597"
+    ["slot-number"]="https://github.com/michaeljfazio/dugite/issues/597"
+    ["protocol-state/version"]="https://github.com/michaeljfazio/dugite/issues/597"
 )
 
 # ---- Core parity function -------------------------------------------------
