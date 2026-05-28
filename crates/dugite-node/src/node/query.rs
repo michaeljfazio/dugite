@@ -212,7 +212,33 @@ impl Node {
             })
             .collect();
 
-        // Build DRep snapshots with delegator lookup
+        // Build DRep snapshots with delegator lookup.
+        //
+        // Previously this was an O(N_dreps × N_delegations) scan — for each
+        // DRep we filtered the entire `vote_delegations` map.  At preview
+        // epoch 29 (~200 DReps × ~10 000 delegations) that was ~2 M ops per
+        // snapshot rebuild, blocking `post_block_apply_updates` at 1 Hz.
+        // Issue #702.
+        //
+        // Invert the iteration: a single O(N_delegations) pass over the
+        // delegations map groups stake credentials by DRep hash; then the
+        // per-DRep lookup is O(1).  Total: O(N_dreps + N_delegations).
+        let mut delegators_by_drep: std::collections::HashMap<
+            dugite_primitives::hash::Hash32,
+            Vec<Vec<u8>>,
+        > = std::collections::HashMap::with_capacity(ls.gov.governance.dreps.len());
+        for (stake_cred, drep_target) in &ls.gov.governance.vote_delegations {
+            // `DRep::credential_hash32` covers both Key and Script credentials
+            // and matches the form used to key `dreps` (script-DRep delegators
+            // would be silently mis-matched by `Hash28::to_hash32_padded`).
+            if let Some(target_hash) = drep_target.credential_hash32() {
+                delegators_by_drep
+                    .entry(target_hash)
+                    .or_default()
+                    .push(hash32_padded_to_28_bytes(stake_cred));
+            }
+        }
+
         let drep_entries: Vec<DRepSnapshot> = ls
             .gov
             .governance
@@ -220,22 +246,7 @@ impl Node {
             .iter()
             .map(|(hash, drep)| {
                 let expiry = drep.registered_epoch.0 + ls.epochs.protocol_params.drep_activity;
-                // Collect stake credentials delegated to this DRep
-                let delegator_hashes: Vec<Vec<u8>> = ls
-                    .gov
-                    .governance
-                    .vote_delegations
-                    .iter()
-                    // Compare against the typed `Hash32` form `dreps` is keyed by
-                    // (`credential_to_hash` for both Key and Script credentials).
-                    // `Hash28::to_hash32_padded` lacks the script discriminator
-                    // and silently mis-matches script-DRep delegators — use
-                    // `DRep::credential_hash32` instead.
-                    .filter(|(_, d)| d.credential_hash32().is_some_and(|h32| h32 == *hash))
-                    // stake_cred is a Hash32 padded from a 28-byte key hash;
-                    // truncate to 28 bytes for N2C wire format.
-                    .map(|(stake_cred, _)| hash32_padded_to_28_bytes(stake_cred))
-                    .collect();
+                let delegator_hashes = delegators_by_drep.remove(hash).unwrap_or_default();
                 DRepSnapshot {
                     // DRep hash keys are Hash32 padded from 28-byte credential hashes.
                     credential_hash: hash32_padded_to_28_bytes(hash),
