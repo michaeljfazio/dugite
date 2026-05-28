@@ -1641,36 +1641,30 @@ impl Node {
 
             // --- snapshot scheduler ---
             // Check whether a snapshot should be taken.  Use the last applied
-            // block's epoch number to detect epoch-boundary triggers.
+            // block's epoch + slot for the firing decision (#701: slot-based
+            // trigger, not block-count).
             let last_applied = blocks.iter().rev().take(applied_count as usize).next();
             if let Some(last_block) = last_applied {
                 let current_epoch = {
                     let ls = self.ledger_state.read().await;
                     ls.epoch
                 };
-                let block_no = last_block.block_number();
-                // Clone self.bg_snapshot_scheduler to satisfy borrow checker
-                // (can't have mut borrow of self.bg_snapshot_scheduler while
-                //  also borrowing self.save_ledger_snapshot).  Use a flag
-                // pattern to avoid the double-borrow.
+                let block_slot = last_block.slot();
                 let should_snapshot = {
                     self.bg_snapshot_scheduler
-                        .maybe_snapshot_check(current_epoch, block_no)
+                        .maybe_snapshot_check(current_epoch, block_slot)
                 };
                 if should_snapshot {
                     // Issue #695: fire-and-forget via the background
-                    // snapshot worker. Only record the scheduler as
-                    // having snapshotted on `Enqueued` — skipping
-                    // (`Skipped` / `Closed`) must leave the
-                    // blocks_since_snapshot counter growing so the
-                    // next block retriggers, otherwise we'd delay the
-                    // next attempt by the full interval.
+                    // snapshot worker. Only record on `Enqueued`;
+                    // skipping leaves the pending-deadline state in
+                    // place so the next block retriggers.
                     if matches!(
                         self.try_snapshot_async().await,
                         super::snapshot_worker::SnapshotEnqueue::Enqueued
                     ) {
                         self.bg_snapshot_scheduler
-                            .record_snapshot_taken(current_epoch);
+                            .record_snapshot_taken(current_epoch, block_slot);
                     }
                 }
             }

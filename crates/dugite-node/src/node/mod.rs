@@ -1916,7 +1916,12 @@ impl Node {
             // 2160 (mainnet/preview/preprod all use k=2160).
             copy_to_immutable: CopyToImmutable::new(consensus_security_param as usize),
             gc_scheduler: GcScheduler::new(),
-            bg_snapshot_scheduler: SnapshotScheduler::new(),
+            // Slot-based snapshot interval = k * 2 (#701, Haskell defInterval).
+            // For mainnet/preprod k=2160 → 4320 slots ≈ 72 min.
+            // For preview k=432 → 864 slots ≈ 14 min.
+            bg_snapshot_scheduler: SnapshotScheduler::with_slot_interval(
+                consensus_security_param.saturating_mul(2),
+            ),
             last_query_state_update: Instant::now(),
             last_volatile_wal_sync: Instant::now(),
             peer_intersection_established: Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -5177,19 +5182,19 @@ impl Node {
         let current_epoch = self.ledger_state.read().await.epoch;
         let should_snapshot = self
             .bg_snapshot_scheduler
-            .maybe_snapshot_check(current_epoch, block_number);
+            .maybe_snapshot_check(current_epoch, block_slot);
         if should_snapshot {
             // Issue #695: fire via the non-blocking worker so the
             // apply path doesn't pause for the bincode walk. Only
-            // record on `Enqueued`; skipping leaves
-            // `blocks_since_snapshot` growing so the next block
-            // retries (cf. DEFAULT_SNAPSHOT_INTERVAL = 2000 blocks).
+            // record on `Enqueued`; skipping leaves the scheduler in
+            // its "pending deadline expired" state so the next block
+            // retries.
             if matches!(
                 self.try_snapshot_async().await,
                 snapshot_worker::SnapshotEnqueue::Enqueued
             ) {
                 self.bg_snapshot_scheduler
-                    .record_snapshot_taken(current_epoch);
+                    .record_snapshot_taken(current_epoch, block_slot);
             }
         }
     }
