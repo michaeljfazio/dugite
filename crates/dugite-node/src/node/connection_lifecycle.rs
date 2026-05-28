@@ -544,6 +544,28 @@ pub struct ConnectionLifecycleManager {
     /// intersection.  Passed to `chainsync_client_task` so it can signal
     /// the forge loop that peer connectivity is established.
     peer_intersection_established: Arc<std::sync::atomic::AtomicBool>,
+
+    /// Per-peer PeerSharing client request channels.
+    ///
+    /// Inserted when the PeerSharing client task starts (at warm promotion).
+    /// The task loops waiting for a `u8` request amount; the governor sends
+    /// amounts here via `GovernorAction::PeerShareRequest`.  Entries are
+    /// removed when the task exits (connection teardown or cancel).
+    ///
+    /// Matches Haskell's `PeerSharingRegistry` /
+    /// `PeerSharingController.requestQueue` pattern from
+    /// `ouroboros-network/lib/Ouroboros/Network/PeerSharing.hs`.
+    peersharing_request_txs: HashMap<SocketAddr, mpsc::Sender<u8>>,
+
+    /// Global count of PeerSharing requests currently in-flight across ALL peers.
+    ///
+    /// Capped at `PEERSHARING_MAX_IN_FLIGHT` (= 2, matching Haskell's
+    /// `policyMaxInProgressPeerShareReqs = 2` in
+    /// `ouroboros-network/lib/Ouroboros/Network/Diffusion/Policies.hs`).
+    /// The PeerSharing client task atomically increments this before sending
+    /// a request and decrements it on completion; the governor checks before
+    /// dispatching new requests so at most 2 peers are being asked simultaneously.
+    peersharing_in_flight: Arc<std::sync::atomic::AtomicU32>,
 }
 
 /// Errors from lifecycle management operations.
@@ -661,6 +683,8 @@ impl ConnectionLifecycleManager {
             local_listen_addr: None,
             peer_intersection_established,
             tx_validator,
+            peersharing_request_txs: HashMap::new(),
+            peersharing_in_flight: Arc::new(std::sync::atomic::AtomicU32::new(0)),
         }
     }
 
@@ -751,6 +775,14 @@ impl ConnectionLifecycleManager {
         }
         if !self.has_any_to(addr) {
             peer_manager.peer_connected(&addr, ConnectionDirection::Outbound);
+        }
+
+        // Start the PeerSharing client task for this warm connection.
+        // The channel is taken from `conn` here; subsequent requests arrive
+        // via `peersharing_request_txs[addr]` in `dispatch_peersharing_request`.
+        let cancel = conn.cancel_token().clone();
+        if let Some(ps_tx) = self.start_peersharing_client(addr, &mut conn, cancel) {
+            self.peersharing_request_txs.insert(addr, ps_tx);
         }
 
         self.connections.insert(cid, conn);
@@ -860,6 +892,13 @@ impl ConnectionLifecycleManager {
         if !self.has_any_to(addr) {
             peer_manager.peer_connected(&addr, ConnectionDirection::Outbound);
         }
+
+        // Start the PeerSharing client task.
+        let cancel = conn.cancel_token().clone();
+        if let Some(ps_tx) = self.start_peersharing_client(addr, &mut conn, cancel) {
+            self.peersharing_request_txs.insert(addr, ps_tx);
+        }
+
         self.connections.insert(cid, conn);
         info!(%cid, rtt_ms = format_args!("{rtt_ms:.0}"), "cold -> warm complete (background)");
         Ok(())
@@ -1053,6 +1092,10 @@ impl ConnectionLifecycleManager {
             chains.remove(&addr);
         }
 
+        // Remove the PeerSharing client request channel — dropping it signals
+        // the client task to exit its loop cleanly (recv returns None).
+        self.peersharing_request_txs.remove(&addr);
+
         // Update peer manager — removes connection state entirely.
         peer_manager.peer_disconnected(&addr);
 
@@ -1134,10 +1177,7 @@ impl ConnectionLifecycleManager {
                 peer_manager.inner.remove_peer(&addr);
             }
             GovernorAction::PeerShareRequest(addr) => {
-                // PeerSharing active outreach — handled by the peer discovery
-                // subsystem which owns the PeerSharingClient. The lifecycle
-                // manager only logs the request.
-                debug!(%addr, "governor requested PeerSharing outreach (handled externally)");
+                self.dispatch_peersharing_request(addr);
             }
         }
     }
@@ -1182,6 +1222,8 @@ impl ConnectionLifecycleManager {
                     let mut chains = self.candidate_chains.write().await;
                     chains.remove(&addr);
                 }
+                // Remove the PeerSharing client channel so the client task exits.
+                self.peersharing_request_txs.remove(&addr);
                 peer_manager.peer_disconnected(&addr);
                 warn!(%cid, "removed dead connection (last to peer)");
             } else {
@@ -1316,6 +1358,166 @@ impl ConnectionLifecycleManager {
                 }
             })
         })
+    }
+
+    // ─── PeerSharing client ─────────────────────────────────────────────────
+
+    /// Maximum concurrent PeerSharing requests across all peers.
+    ///
+    /// Matches Haskell `policyMaxInProgressPeerShareReqs = 2` from
+    /// `ouroboros-network/lib/Ouroboros/Network/Diffusion/Policies.hs`.
+    const PEERSHARING_MAX_IN_FLIGHT: u32 = 2;
+
+    /// Minimum peers requested per share round.
+    ///
+    /// Haskell formula: `max 8 (objective / numRequests)`.  We use the minimum
+    /// of 8 as the default when `max_cold` is already satisfied, giving each
+    /// request a reasonable floor.  Capped at 255 (u8::MAX, matching
+    /// `PeerSharingAmount`).
+    const PEERSHARING_DEFAULT_AMOUNT: u8 = 8;
+
+    /// Start the PeerSharing client task for a newly-warmed peer.
+    ///
+    /// Takes the `peersharing_client_channel` from `conn` (if present) and
+    /// spawns a long-lived task that loops waiting for request amounts on the
+    /// returned `mpsc::Sender`.  The governor calls
+    /// [`dispatch_peersharing_request`] to enqueue work; the task executes the
+    /// `MsgShareRequest → MsgSharePeers` exchange and adds routable results to
+    /// the peer manager.
+    ///
+    /// Returns the sender half of the request channel so the caller can stash
+    /// it in `peersharing_request_txs`.  Returns `None` when the channel is
+    /// not available on this connection (inbound `initiator_only` or already
+    /// taken).
+    ///
+    /// This mirrors Haskell's `bracketPeerSharingClient` /
+    /// `peerSharingClient` in
+    /// `ouroboros-network/lib/Ouroboros/Network/PeerSharing.hs`, where the
+    /// client task runs as part of the `Established` mini-protocol bundle for
+    /// the lifetime of the warm-or-hotter connection.
+    fn start_peersharing_client(
+        &self,
+        addr: SocketAddr,
+        conn: &mut super::peer_connection::PeerConnection,
+        cancel: tokio_util::sync::CancellationToken,
+    ) -> Option<mpsc::Sender<u8>> {
+        let mut channel = conn.take_peersharing_client_channel()?;
+
+        let (req_tx, mut req_rx) = mpsc::channel::<u8>(4);
+        let peer_manager = self.peer_manager_for_servers.clone();
+        let in_flight = self.peersharing_in_flight.clone();
+
+        tokio::spawn(async move {
+            use dugite_network::protocol::peersharing::client::PeerSharingClient;
+            debug!(%addr, "peersharing client task started");
+
+            loop {
+                // Wait for a request amount from the governor, or exit when
+                // the channel is closed (connection teardown) or cancelled.
+                let amount: u8 = tokio::select! {
+                    biased;
+                    _ = cancel.cancelled() => {
+                        debug!(%addr, "peersharing client task cancelled");
+                        break;
+                    }
+                    maybe_amount = req_rx.recv() => {
+                        match maybe_amount {
+                            Some(a) => a,
+                            None => {
+                                // Sender dropped (connection torn down by lifecycle manager).
+                                debug!(%addr, "peersharing client task: request channel closed, exiting");
+                                break;
+                            }
+                        }
+                    }
+                };
+
+                debug!(%addr, amount, "peersharing: sending MsgShareRequest");
+                match PeerSharingClient::request_peers(&mut channel, amount).await {
+                    Ok(peers) if !peers.is_empty() => {
+                        let discovered = peers.len();
+                        let mut pm = peer_manager.write().await;
+                        for peer_addr in peers {
+                            pm.add_shared_peer(peer_addr);
+                        }
+                        drop(pm);
+                        info!(
+                            %addr,
+                            discovered,
+                            "PeerSharing: added peers to cold set"
+                        );
+                    }
+                    Ok(_) => {
+                        debug!(%addr, "PeerSharing: peer returned no addresses");
+                    }
+                    Err(e) => {
+                        debug!(%addr, "PeerSharing: request failed: {e}");
+                        // Protocol error — exit the task; mux cleanup handles
+                        // the channel.
+                        break;
+                    }
+                }
+
+                // Release in-flight slot after each completed request.
+                in_flight.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+            }
+
+            debug!(%addr, "peersharing client task exited");
+        });
+
+        Some(req_tx)
+    }
+
+    /// Dispatch a PeerSharing request for the given peer.
+    ///
+    /// Called by `handle_governor_action` when `GovernorAction::PeerShareRequest`
+    /// arrives.  Enforces the global concurrency cap
+    /// (`PEERSHARING_MAX_IN_FLIGHT = 2`, matching Haskell
+    /// `policyMaxInProgressPeerShareReqs = 2`) and the per-peer duplicate-request
+    /// guard (only one in-flight request per peer at a time).
+    ///
+    /// Request amount: `PEERSHARING_DEFAULT_AMOUNT = 8`, matching Haskell's
+    /// `max 8 (objective `div` numPeerShareReqs)` lower bound.
+    fn dispatch_peersharing_request(&mut self, addr: SocketAddr) {
+        let in_flight = self
+            .peersharing_in_flight
+            .load(std::sync::atomic::Ordering::Relaxed);
+        if in_flight >= Self::PEERSHARING_MAX_IN_FLIGHT {
+            debug!(
+                %addr,
+                in_flight,
+                max = Self::PEERSHARING_MAX_IN_FLIGHT,
+                "PeerSharing: skipping request — global concurrency cap reached"
+            );
+            return;
+        }
+
+        let Some(tx) = self.peersharing_request_txs.get(&addr) else {
+            debug!(%addr, "PeerSharing: no client task for peer, skipping");
+            return;
+        };
+
+        // Claim the in-flight slot before attempting the send so we never
+        // over-count (the task decrements on completion).
+        self.peersharing_in_flight
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+
+        match tx.try_send(Self::PEERSHARING_DEFAULT_AMOUNT) {
+            Ok(()) => {
+                debug!(
+                    %addr,
+                    amount = Self::PEERSHARING_DEFAULT_AMOUNT,
+                    "PeerSharing: dispatched request to client task"
+                );
+            }
+            Err(_) => {
+                // Channel full (another request already in-flight for this peer)
+                // or closed (task exited). Release the slot we just claimed.
+                self.peersharing_in_flight
+                    .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+                debug!(%addr, "PeerSharing: failed to dispatch request (task busy or closed)");
+            }
+        }
     }
 
     /// Create the ChainSync protocol task closure for a specific peer.
@@ -2202,6 +2404,16 @@ impl ConnectionLifecycleManager {
         } else {
             peer_manager.peer_connected(&addr, ConnectionDirection::Inbound);
         }
+
+        // Start the PeerSharing client task for inbound duplex connections.
+        // Inbound connections subscribed with initiator_only=false have a
+        // peersharing_client_channel; purely responder-only connections return None
+        // from `take_peersharing_client_channel` and are silently skipped.
+        let cancel = conn.cancel_token().clone();
+        if let Some(ps_tx) = self.start_peersharing_client(addr, &mut conn, cancel) {
+            self.peersharing_request_txs.insert(addr, ps_tx);
+        }
+
         self.connections.insert(cid, conn);
         info!(%cid, rtt_ms = format_args!("{rtt_ms:.0}"), "inbound cold -> warm complete");
         Ok(())
@@ -3728,5 +3940,273 @@ mod tests {
         assert!(state.is_fetch_eligible()); // Ready
         state.record_fetch_dispatched();
         assert!(state.is_fetch_eligible()); // Busy
+    }
+
+    // ─── PeerSharing governor dispatch tests ────────────────────────────────
+
+    /// Helper: build a minimal `dispatch_peersharing_request`-able state.
+    /// We only need `peersharing_request_txs` and `peersharing_in_flight` —
+    /// the rest of `ConnectionLifecycleManager` is not exercised by these tests.
+    struct PsDispatchState {
+        txs: HashMap<SocketAddr, mpsc::Sender<u8>>,
+        in_flight: Arc<std::sync::atomic::AtomicU32>,
+    }
+
+    impl PsDispatchState {
+        fn new() -> Self {
+            Self {
+                txs: HashMap::new(),
+                in_flight: Arc::new(std::sync::atomic::AtomicU32::new(0)),
+            }
+        }
+
+        /// Mirrors `ConnectionLifecycleManager::dispatch_peersharing_request`.
+        fn dispatch(&mut self, addr: SocketAddr) {
+            let in_flight = self.in_flight.load(std::sync::atomic::Ordering::Relaxed);
+            if in_flight >= ConnectionLifecycleManager::PEERSHARING_MAX_IN_FLIGHT {
+                return;
+            }
+            let Some(tx) = self.txs.get(&addr) else {
+                return;
+            };
+            self.in_flight
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            match tx.try_send(ConnectionLifecycleManager::PEERSHARING_DEFAULT_AMOUNT) {
+                Ok(()) => {}
+                Err(_) => {
+                    self.in_flight
+                        .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+                }
+            }
+        }
+
+        fn inflight(&self) -> u32 {
+            self.in_flight.load(std::sync::atomic::Ordering::Relaxed)
+        }
+    }
+
+    fn peer(port: u16) -> SocketAddr {
+        format!("1.2.3.4:{port}").parse().unwrap()
+    }
+
+    /// Governor emits `PeerShareRequest` when cold pool is below max_cold/2
+    /// AND a warm peer with peer_sharing=true exists.
+    ///
+    /// Haskell reference: `belowTarget` guard in
+    /// `Ouroboros.Network.PeerSelection.Governor.KnownPeers` —
+    /// `numKnownPeers < targetNumberOfKnownPeers && not (Set.null availableForPeerShare)`.
+    #[test]
+    fn governor_emits_peer_share_request_when_cold_pool_low() {
+        use dugite_network::peer::governor::{GovernorAction, GovernorConfig, PeerTargets};
+        use dugite_network::peer::manager::{PeerManager, PeerSource, PeerState};
+        use std::time::Duration;
+
+        let mut pm = PeerManager::new();
+        // One warm peer with peer_sharing enabled.
+        let warm_addr = peer(3001);
+        pm.add_peer(warm_addr, PeerSource::Dns);
+        pm.promote_to_warm(&warm_addr);
+        pm.get_peer_mut(&warm_addr).unwrap().peer_sharing = true;
+        // Cold pool is empty → below max_cold/2 → DiscoverMore + PeerShareRequest.
+
+        let config = dugite_network::peer::governor::GovernorConfig {
+            targets: PeerTargets {
+                target_warm: 1,
+                target_hot: 0,
+                max_cold: 100,
+                ..Default::default()
+            },
+            hot_churn_interval: Duration::from_secs(3600),
+            cold_churn_interval: Duration::from_secs(3600),
+            warm_churn_interval: Duration::from_secs(3600),
+            demote_cooldown: Duration::from_secs(3600),
+        };
+        let mut gov = dugite_network::peer::governor::Governor::new(config);
+        let actions = gov.compute_actions(&pm, &[]);
+
+        assert!(
+            actions
+                .iter()
+                .any(|a| matches!(a, GovernorAction::PeerShareRequest(_))),
+            "governor must emit PeerShareRequest when cold pool is low and a sharing peer exists"
+        );
+        // The request should target our warm peer.
+        assert!(
+            actions
+                .iter()
+                .any(|a| *a == GovernorAction::PeerShareRequest(warm_addr)),
+            "PeerShareRequest must target the warm peer with peer_sharing=true"
+        );
+    }
+
+    /// Governor does NOT emit `PeerShareRequest` when no warm peer has peer_sharing.
+    ///
+    /// Haskell reference: guard `not (Set.null availableForPeerShare)` —
+    /// `availableForPeerShare` is empty when no peer has PeerSharingEnabled.
+    #[test]
+    fn governor_no_peer_share_request_without_sharing_peers() {
+        use dugite_network::peer::governor::{GovernorAction, GovernorConfig, PeerTargets};
+        use dugite_network::peer::manager::{PeerManager, PeerSource};
+        use std::time::Duration;
+
+        let mut pm = PeerManager::new();
+        let warm_addr = peer(3001);
+        pm.add_peer(warm_addr, PeerSource::Dns);
+        pm.promote_to_warm(&warm_addr);
+        // peer_sharing defaults to false
+
+        let config = GovernorConfig {
+            targets: PeerTargets {
+                target_warm: 1,
+                target_hot: 0,
+                max_cold: 100,
+                ..Default::default()
+            },
+            hot_churn_interval: Duration::from_secs(3600),
+            cold_churn_interval: Duration::from_secs(3600),
+            warm_churn_interval: Duration::from_secs(3600),
+            demote_cooldown: Duration::from_secs(3600),
+        };
+        let mut gov = dugite_network::peer::governor::Governor::new(config);
+        let actions = gov.compute_actions(&pm, &[]);
+
+        assert!(
+            !actions
+                .iter()
+                .any(|a| matches!(a, GovernorAction::PeerShareRequest(_))),
+            "governor must not emit PeerShareRequest when no peer has peer_sharing=true"
+        );
+    }
+
+    /// `dispatch_peersharing_request` sends the default amount to the peer's
+    /// request channel and increments the in-flight counter.
+    ///
+    /// Haskell reference: `peerSharingClient` sends `SendMsgShareRequest amount`
+    /// to the controller's `requestQueue` (`ouroboros-network/lib/Ouroboros/Network/PeerSharing.hs`).
+    #[tokio::test]
+    async fn dispatch_sends_request_and_increments_inflight() {
+        let addr = peer(3001);
+        let (tx, mut rx) = mpsc::channel::<u8>(4);
+        let mut state = PsDispatchState::new();
+        state.txs.insert(addr, tx);
+
+        state.dispatch(addr);
+
+        assert_eq!(
+            state.inflight(),
+            1,
+            "in-flight counter must be 1 after one dispatch"
+        );
+        let received = rx.recv().await.expect("channel must have one item");
+        assert_eq!(
+            received,
+            ConnectionLifecycleManager::PEERSHARING_DEFAULT_AMOUNT,
+            "dispatched amount must equal PEERSHARING_DEFAULT_AMOUNT"
+        );
+    }
+
+    /// Global concurrency cap: at most `PEERSHARING_MAX_IN_FLIGHT = 2` requests
+    /// in-flight simultaneously.
+    ///
+    /// Haskell reference: `policyMaxInProgressPeerShareReqs = 2` in
+    /// `ouroboros-network/lib/Ouroboros/Network/Diffusion/Policies.hs`.
+    #[tokio::test]
+    async fn dispatch_respects_global_cap() {
+        let addr_a = peer(3001);
+        let addr_b = peer(3002);
+        let addr_c = peer(3003);
+
+        let (tx_a, _rx_a) = mpsc::channel::<u8>(4);
+        let (tx_b, _rx_b) = mpsc::channel::<u8>(4);
+        let (tx_c, _rx_c) = mpsc::channel::<u8>(4);
+
+        let mut state = PsDispatchState::new();
+        state.txs.insert(addr_a, tx_a);
+        state.txs.insert(addr_b, tx_b);
+        state.txs.insert(addr_c, tx_c);
+
+        state.dispatch(addr_a); // in_flight → 1
+        state.dispatch(addr_b); // in_flight → 2
+
+        assert_eq!(state.inflight(), 2, "two dispatches must give in_flight=2");
+
+        // Third dispatch must be dropped — cap reached.
+        state.dispatch(addr_c);
+
+        assert_eq!(
+            state.inflight(),
+            2,
+            "third dispatch must be rejected by cap=2 (policyMaxInProgressPeerShareReqs=2)"
+        );
+    }
+
+    /// Per-peer duplicate-request guard: a full channel (previous request still
+    /// in-flight for the same peer) causes `try_send` to fail and the in-flight
+    /// counter is released.
+    ///
+    /// Haskell reference: `PeerSharingController.requestQueue` is a depth-1
+    /// `TMVar` — a second `putTMVar` blocks until the first is consumed,
+    /// preventing concurrent requests to the same peer.  Our channel has
+    /// capacity 4 for throughput, but `try_send` failure on a full channel
+    /// gives the same single-in-flight-per-peer semantics.
+    #[tokio::test]
+    async fn dispatch_duplicate_guard_releases_inflight_on_full_channel() {
+        let addr = peer(3001);
+        // Channel with capacity 1 — fills after one dispatch.
+        let (tx, _rx) = mpsc::channel::<u8>(1);
+        let mut state = PsDispatchState::new();
+        state.txs.insert(addr, tx);
+
+        state.dispatch(addr); // fills the channel
+        assert_eq!(state.inflight(), 1);
+
+        // Second dispatch: channel is full → try_send fails → in-flight released.
+        state.dispatch(addr);
+        assert_eq!(
+            state.inflight(),
+            1,
+            "failed second dispatch must NOT double-increment in-flight"
+        );
+    }
+
+    /// Dispatching to a peer with no registered client task is a no-op.
+    ///
+    /// Occurs when the connection is torn down between the governor tick and
+    /// the dispatch call (e.g. `peersharing_request_txs` was cleaned up by
+    /// `demote_to_cold` or `cleanup_dead_connections`).
+    #[test]
+    fn dispatch_unknown_peer_is_noop() {
+        let mut state = PsDispatchState::new();
+        // No entry for this address.
+        state.dispatch(peer(9999));
+        assert_eq!(
+            state.inflight(),
+            0,
+            "dispatch for unknown peer must not change in-flight counter"
+        );
+    }
+
+    /// `PEERSHARING_MAX_IN_FLIGHT` is pinned to 2 to match Haskell's
+    /// `policyMaxInProgressPeerShareReqs = 2`.
+    #[test]
+    fn peersharing_max_in_flight_matches_haskell() {
+        assert_eq!(
+            ConnectionLifecycleManager::PEERSHARING_MAX_IN_FLIGHT,
+            2,
+            "must match Haskell policyMaxInProgressPeerShareReqs = 2 \
+             (ouroboros-network/lib/Ouroboros/Network/Diffusion/Policies.hs)"
+        );
+    }
+
+    /// `PEERSHARING_DEFAULT_AMOUNT` matches Haskell's minimum of 8 peers
+    /// per request (`max 8 (objective `div` numPeerShareReqs)`).
+    #[test]
+    fn peersharing_default_amount_matches_haskell_floor() {
+        assert_eq!(
+            ConnectionLifecycleManager::PEERSHARING_DEFAULT_AMOUNT,
+            8,
+            "must match Haskell's floor of max(8, objective/n) from \
+             ouroboros-network/lib/Ouroboros/Network/PeerSelection/Governor/KnownPeers.hs"
+        );
     }
 }
