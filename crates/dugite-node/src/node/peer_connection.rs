@@ -157,6 +157,7 @@ pub struct PeerConnection {
     /// sends a MsgShareRequest. The initiator sends requests periodically from
     /// the Governor. Currently subscribed but no task is spawned for it —
     /// PeerSharing integration is tracked separately.
+    #[allow(dead_code)]
     pub(crate) peersharing_client_channel: Option<MuxChannel>,
 
     // ── Server protocol channels ──
