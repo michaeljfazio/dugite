@@ -5902,19 +5902,34 @@ impl Node {
         //    (no preceding epoch), producing `expansion = 0`. Override
         //    `prev_d` to Conway's invariant.
         //
-        // 2. `finalize_genesis_state` pre-fills `snapshots.mark` and
-        //    `snapshots.set` with the genesis stake distribution so the
-        //    forge can find pool stake in epoch 0. On Conway-from-genesis,
-        //    that pre-filled snapshot rotates into `ssStakeGo` at
-        //    boundary 0→1 (Haskell's `ssStakeGo` stays `mempty` for the
-        //    first few boundaries because resetStakeDistribution only
-        //    fills the SEPARATE `nesPd` field, not `esSnapshots`).
-        //    Dugite's RUPD then mis-distributes ~22 ADA in per-pool
-        //    rewards at boundary 1→2 vs Haskell's 0. Clear the
-        //    pre-filled snapshots; the forge falls back to
-        //    `pool_distribution_for_slot`'s live-state branch which
-        //    computes pool stake directly from `certs.delegations` +
-        //    UTxO + reward balances.
+        // 2. `finalize_genesis_state` pre-fills both `snapshots.mark`
+        //    AND `snapshots.set` with the genesis stake distribution so
+        //    the forge can find pool stake in epoch 0. The CORRECT
+        //    Haskell-matching shape (verified empirically against a
+        //    cardano-cli ledger-state dump at boundary 2→3) is:
+        //
+        //        mark = pre-fill (Haskell's instant stake at end of epoch 0)
+        //        set  = mempty
+        //        go   = mempty
+        //
+        //    With that, the SNAP rotations produce:
+        //        After NEWEPOCH 1: mark=new, set=pre-fill, go=mempty
+        //        After NEWEPOCH 2: mark=new2, set=end-of-0, go=pre-fill
+        //        After NEWEPOCH 3: mark=new3, set=end-of-1, go=end-of-0
+        //
+        //    The pulser in epoch 1 sees go=mempty (no distribution at
+        //    boundary 1→2). The pulser in epoch 2 sees go=pre-fill
+        //    (first non-empty: distributes ~22 ADA per delegator at
+        //    boundary 2→3 — matches Haskell byte-exact).
+        //
+        //    The Conway-from-genesis correction below CLEARS the SET
+        //    snapshot pre-fill but KEEPS the MARK pre-fill, which is
+        //    the minimal change from `finalize_genesis_state`'s default
+        //    (pre-fill both) to the Haskell-matching shape (pre-fill
+        //    mark only). Cleared the SET pre-fill: addresses the
+        //    boundary-1→2 over-distribution. Kept the MARK pre-fill:
+        //    addresses the boundary-2→3 under-distribution (the 22.14B
+        //    reserves diff observed in the 2026-05-28 session).
         //
         // Both Byron-genesis chains (mainnet/preview/preprod) and the
         // Mithril-restore path are unaffected: they either never reach
@@ -5929,7 +5944,9 @@ impl Node {
             };
             ledger.epochs.prev_protocol_version_major =
                 ledger.epochs.protocol_params.protocol_version_major;
-            ledger.epochs.snapshots.mark = None;
+            // Clear ONLY the `set` snapshot pre-fill; keep `mark` so the
+            // SNAP rotation produces the Haskell-matching pattern of
+            // first non-empty `go` at boundary 2→3 (not 1→2).
             ledger.epochs.snapshots.set = None;
             info!(
                 pv = ledger.epochs.protocol_params.protocol_version_major,
