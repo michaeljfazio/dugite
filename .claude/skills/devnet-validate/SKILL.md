@@ -84,11 +84,15 @@ sleep 30                            # let the chain advance past slot 0
 ./stop.sh
 ```
 
-While the soak runs, sample monitoring in another shell (see `references/monitoring.md`):
+While the soak runs, sample monitoring in another shell. The probe is the preferred entry point — it implements the 14-step decision procedure in `references/health.md` (covers liveness, peers, tip, apply/forge/snapshot pipelines, network throughput, connection thrash, Haskell-tip parity, recent Haskell adoption, log deltas, and cross-validation) and exits non-zero on any anomaly:
 ```bash
-curl -s localhost:12798/metrics | grep -E 'dugite_tip|dugite_chain_density|dugite_forge'
-tail -F logs/dugite-bp.log    | grep -E 'forge|reject|ERROR'
-tail -F logs/cardano-bp.log   | grep -E 'TraceAdoptedBlock|TraceForgedInvalidBlock|Error'
+# One-shot health verdict (recommended every ≤60s during a soak, ≤10 min during long Ralph loops)
+.claude/skills/devnet-validate/scripts/health-probe.sh --verbose
+
+# Raw streams (fall back when the probe isn't enough):
+curl -s localhost:12798/metrics | grep -E '^dugite_(tip|block|slot|peers|forge|chainsync)'
+tail -F logs/dugite-bp.log    | grep -E 'forge|reject|ERROR|stale'
+tail -F logs/cardano-bp.log   | grep -E 'TraceAdoptedBlock|TraceForgedInvalidBlock|MempoolAccepted|mismatched|timeout'
 ```
 
 **Round 1 PASSES iff** all of:
@@ -96,6 +100,7 @@ tail -F logs/cardano-bp.log   | grep -E 'TraceAdoptedBlock|TraceForgedInvalidBlo
 - `verify.sh` reports 4/4 predicates pass
 - Zero `TraceForgedInvalidBlock` in `logs/cardano-bp.log`
 - `dugite_tip_age_seconds` stays <5 throughout the soak
+- `health-probe.sh` returns HEALTHY at end-of-round AND at every ≤60s sample during the soak (network throughput + Haskell-tip parity included)
 - `analyze-evidence.sh` reports no anomalies
 - `evidence/<ts>/cli-parity.csv` has zero DIVERGENT rows that are not filed as known-divergence issues
 - `evidence/<ts>/n2n-trace.csv` has zero PANIC or SILENT_SKIP rows
@@ -129,7 +134,8 @@ kill $TRICKLE 2>/dev/null
 - `logs/dugite-bp.log` shows ≥1 `epoch transition` or `EpochTransition` event
 - `logs/cardano-bp.log` shows `TraceAdoptedBlock` for at least 5 post-boundary blocks
 - No `RUPD`, `pulser`, `reward calculation` errors in `logs/dugite-bp.log`
-- `dugite_chain_density` metric stays within ±20% of 0.5
+- `analyze-evidence.sh` chain-density proxy (canonical blocks ÷ slots) stays within ±20% of `activeSlotsCoeff` (0.5 on devnet)
+- `dugite_treasury_lovelace` increases and `dugite_reserves_lovelace` decreases across the boundary (RUPD applied)
 
 ### Round 3 — Restart resilience (~5 min)
 
@@ -157,6 +163,8 @@ TIP_AFTER=$(cardano-cli query tip --testnet-magic 42 --socket-path state/dugite-
 - After restart, dugite-bp's tip catches up within 60s (`TIP_AFTER > TIP_BEFORE`)
 - No persistent `stale intersection` warning past the catch-up window
 - `dugite_tip_age_seconds` returns to <5 within 60s of restart
+- `dugite_chainsync_idle_seconds` returns to <4 within 60s of restart
+- `health-probe.sh` reports HEALTHY 60s post-restart (also covers Haskell-tip parity + cardano-bp adoption resumed)
 - `verify.sh` p1 (forge cross-check) shows zero canonical blocks with missing observers
 
 If Round 3 stalls past 60s, suspect the stale-intersection bug (memory: `project_stale_intersection_when_peer_behind`). Capture logs + metrics + evidence and report.
@@ -199,14 +207,16 @@ If any round fails, stop. Do not run the next round. Bundle `logs/` + `evidence/
 
 ## Reference files (read on demand)
 
+- `references/health.md` — **start here for any runtime-health question**. Six-question health model, lifecycle phases (boot/catch-up/at-tip/boundary/restart), healthy ranges, network-performance signals, log-sampling cadence, Haskell cross-validation, and the 14-step evaluation procedure that `health-probe.sh` implements.
+- `references/monitoring.md` — authoritative catalog of dugite Prometheus metrics + log patterns (the "what does this name mean" lookup, verified against the actual code)
 - `references/parameters.md` — slot/epoch/security math, override mechanics, what the values mean
-- `references/monitoring.md` — log patterns, prometheus metric meanings, healthy-vs-sick examples
 - `references/tx-coverage.md` — tx-zoo categories, what each script proves, expected pass/fail
 - `references/cross-validation.md` — evidence file schemas, verify.sh predicate semantics
 - `references/troubleshooting.md` — every known gotcha (stale intersection, KES, ports, genesis staleness, App Nap)
 
 ## Bundled scripts
 
+- `scripts/health-probe.sh` — one-shot runtime health verdict (process + Prometheus + wall-clock + peers + tip + apply + forge + snapshot + network deltas + connection thrash + Haskell-tip parity + recent Haskell adoption + log delta + cross-validation). Exits 0 = HEALTHY, non-zero = SICK with anomaly list. Use during soaks and Ralph loops; `--public` relaxes thresholds for public testnets.
 - `scripts/restart-dugite-bp.sh` — relaunch ONLY dugite-bp with the same flags `run.sh` used (Round 3)
 - `scripts/analyze-evidence.sh` — post-run anomaly scanner; converts an `evidence/<ts>/` directory into a plain-text anomaly report with exit-code gate
 - `scripts/generate-release-report.sh` — aggregates one or more evidence directories into `report.json` + `report.md`; suitable for release gates and trend tracking. See `schemas/report.v1.json` for the output schema.
