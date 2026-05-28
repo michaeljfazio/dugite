@@ -1629,36 +1629,43 @@ impl ConnectionLifecycleManager {
 
                 info!(%addr, "blockfetch worker started (waiting for turn)");
 
-                // Per-peer worker poll cadence.  After commit a1490cb5f the
-                // `active_fetcher` lock is released at the end of every batch,
-                // so the gap between two consecutive BlockFetch ranges is
-                // bounded by this interval (whichever peer's ticker fires
-                // first wins the next contest).
+                // Per-peer worker poll cadence.
                 //
-                // At 2 s this introduced a ~50 blk/s ceiling at full
-                // batch utilisation (100 blocks/range ÷ 2 s) — way below
-                // the network-bandwidth ceiling.  200 ms restores
-                // throughput while keeping the fairness/rotation
-                // guarantee.
+                // After commit a1490cb5f the `active_fetcher` lock is
+                // released at the end of every batch, so the gap between two
+                // consecutive BlockFetch ranges is bounded by this interval
+                // (whichever peer's ticker fires first wins the next contest).
+                //
+                // Set to 10 ms to match Haskell's `bfcDecisionLoopIntervalPraos`
+                // from `cardano-diffusion/lib/Cardano/Network/Diffusion/Configuration.hs`.
+                // The previous value of 200 ms capped sustained Byron throughput
+                // at ~100 blk/s (verified live on mainnet: see
+                // `project_blockfetch_poll_interval_2026_05_28`) — well below
+                // the per-peer wire ceiling of ~1500 blk/s.  10 ms matches the
+                // Haskell decision-loop cadence so a batch that completes is
+                // immediately followed by the next without an idle gap.  CPU
+                // cost is bounded: each tick does a single `compare_exchange`
+                // + a brief `candidate_chains.read()` lock, ~tens of µs.  With
+                // 22 hot peers that's ~5% CPU on Apple Silicon under bulk sync
+                // — acceptable for the throughput gain.
                 //
                 // **Phase offset (#702 follow-up)**: workers that spawn
                 // together all tick at the same wall-clock instant, so the
                 // worker with the lowest CAS latency always wins the
-                // `active_fetcher` race — observed live as only 2 of 16
-                // peers participating in BlockFetch despite all being
-                // connected and ChainSync-active.  Offset each worker's
-                // ticker start by a deterministic-but-distinct amount
-                // derived from the peer SocketAddr hash so the 16 workers
-                // spread evenly across the 200 ms interval, giving every
-                // peer a fair claim window.
+                // `active_fetcher` race.  Offset each worker's ticker start
+                // by a deterministic-but-distinct amount derived from the
+                // peer SocketAddr hash so workers spread evenly across the
+                // interval, giving every peer a fair claim window.  At 10 ms
+                // the offset window is 0–10 ms — still enough to break ties
+                // on the same wall-clock instant.
                 let phase_offset = {
                     let mut h = std::collections::hash_map::DefaultHasher::new();
                     addr.hash(&mut h);
-                    std::time::Duration::from_millis(h.finish() % 200)
+                    std::time::Duration::from_millis(h.finish() % 10)
                 };
                 let mut poll_ticker = tokio::time::interval_at(
                     tokio::time::Instant::now() + phase_offset,
-                    std::time::Duration::from_millis(200),
+                    std::time::Duration::from_millis(10),
                 );
                 poll_ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
@@ -2030,24 +2037,18 @@ impl ConnectionLifecycleManager {
                             );
 
                             // Explicit yield so the SAME peer's worker
-                            // doesn't immediately re-claim on the next
-                            // poll-ticker tick (a deterministic phase
-                            // offset still produces a deterministic
-                            // "who ticks first after release" outcome
-                            // — observed live as 18.117.34.199 winning
-                            // every contest for ~4 consecutive batches
-                            // while 15 other peers' workers stalled).
-                            //
-                            // Sleep ONE full poll cycle so every other
-                            // peer's worker definitely fires at least
-                            // one tick during this window and gets a
-                            // fair shot at `active_fetcher`.  Net
-                            // throughput is unaffected once all peers
-                            // participate — the apply pipeline is
-                            // bottlenecked at ~75-100 blk/s post-snapshot-fix
-                            // regardless of how many peers contribute.
-                            tokio::time::sleep(std::time::Duration::from_millis(200))
-                                .await;
+                            // Yield once to the scheduler so that a
+                            // co-located worker that is already blocked on
+                            // `peer_rx.recv()` (or anywhere else) gets to
+                            // run before we re-enter the select! loop.
+                            // The previous 200 ms sleep here was the second
+                            // half of the throughput cap (alongside the
+                            // 200 ms poll interval) — see the long comment
+                            // on `poll_ticker` for the matching reasoning.
+                            // A `yield_now()` gives the same fairness
+                            // guarantee on the tokio runtime without
+                            // introducing wall-clock latency.
+                            tokio::task::yield_now().await;
                         }
                     }
                 }
