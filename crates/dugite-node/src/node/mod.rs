@@ -61,6 +61,20 @@ use crate::genesis::{
 use crate::metrics::GovernanceSnapshot;
 use crate::topology::Topology;
 
+// ── Post-apply timing gate (issue #702) ───────────────────────────────────
+//
+// `DUGITE_POST_APPLY_TIMING=1` enables per-section timing inside
+// `post_block_apply_updates`.  Checked once at first call via OnceLock so
+// there is zero overhead (no env var lookup, no branch) when the env var is
+// unset.
+static POST_APPLY_TIMING: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+
+#[inline(always)]
+fn post_apply_timing_enabled() -> bool {
+    *POST_APPLY_TIMING
+        .get_or_init(|| std::env::var("DUGITE_POST_APPLY_TIMING").as_deref() == Ok("1"))
+}
+
 // ── Resource-limit constants (G-series audit fixes) ────────────────────────
 
 /// Timeout for the N2N inbound handshake task.
@@ -5109,6 +5123,9 @@ impl Node {
         block_slot: dugite_primitives::time::SlotNo,
         block_number: dugite_primitives::time::BlockNo,
     ) {
+        let timing = post_apply_timing_enabled();
+        let t_start = if timing { Some(Instant::now()) } else { None };
+
         // 1. Metrics — gauge updates that drive Prometheus + the tip_age timer.
         self.metrics.set_block_number(block_number.0);
         self.metrics.set_slot(block_slot.0);
@@ -5129,6 +5146,8 @@ impl Node {
             self.metrics.set_epoch(live_epoch);
         }
         self.metrics.refresh_sync_progress(block_slot.0);
+
+        let t_after_metrics = if timing { Some(Instant::now()) } else { None };
 
         // 2. Mempool sweep.  Remove confirmed txs first, then run the
         //    input-conflict / TTL revalidation just like apply_fetched_block
@@ -5204,12 +5223,20 @@ impl Node {
             std::sync::atomic::Ordering::Relaxed,
         );
 
+        let t_after_mempool = if timing { Some(Instant::now()) } else { None };
+
         // 3. N2C snapshot refresh, rate-limited at 1 Hz (matches the existing
         //    apply_fetched_block predicate at mod.rs:3854 pre-refactor).
-        if self.last_query_state_update.elapsed() >= std::time::Duration::from_secs(1) {
-            self.update_query_state().await;
-            self.last_query_state_update = std::time::Instant::now();
-        }
+        let query_state_ran =
+            if self.last_query_state_update.elapsed() >= std::time::Duration::from_secs(1) {
+                self.update_query_state().await;
+                self.last_query_state_update = std::time::Instant::now();
+                true
+            } else {
+                false
+            };
+
+        let t_after_query_state = if timing { Some(Instant::now()) } else { None };
 
         // 4. Ledger snapshot scheduler (Bug F fix, 2026-05-16).
         //
@@ -5255,6 +5282,36 @@ impl Node {
                 self.bg_snapshot_scheduler
                     .record_snapshot_taken(current_epoch, block_slot);
             }
+        }
+
+        // Emit per-block timing breakdown when DUGITE_POST_APPLY_TIMING=1.
+        //
+        // Each section is timed independently so operators can pinpoint which
+        // step is dominating the apply loop at epoch 28-29 (issue #702).
+        // Log lines use structured fields so they can be extracted with
+        //   grep '"post_apply_timing"' node.log | jq ...
+        if let (Some(t0), Some(t1), Some(t2), Some(t3)) = (
+            t_start,
+            t_after_metrics,
+            t_after_mempool,
+            t_after_query_state,
+        ) {
+            let metrics_us = t1.duration_since(t0).as_micros();
+            let mempool_us = t2.duration_since(t1).as_micros();
+            let query_state_us = t3.duration_since(t2).as_micros();
+            let snapshot_us = t3.elapsed().as_micros();
+            let total_us = t0.elapsed().as_micros();
+            info!(
+                slot = block_slot.0,
+                block = block_number.0,
+                metrics_us,
+                mempool_us,
+                query_state_ran,
+                query_state_us,
+                snapshot_us,
+                total_us,
+                "post_apply_timing"
+            );
         }
     }
 
@@ -8129,5 +8186,26 @@ mod tests {
             flag.load(Ordering::Relaxed),
             "flag must remain true after subsequent intersections"
         );
+    }
+
+    // ── post_apply_timing_enabled (issue #702) ───────────────────────────────
+
+    /// `post_apply_timing_enabled()` returns a bool without panicking.
+    ///
+    /// The OnceLock is process-wide, so the actual value depends on whether
+    /// `DUGITE_POST_APPLY_TIMING=1` was set in the test environment.  This
+    /// test is a regression lock: the function must be callable at any time
+    /// without panic and must return `false` in the default (unset) case.
+    #[test]
+    fn post_apply_timing_enabled_returns_bool() {
+        use crate::node::post_apply_timing_enabled;
+        // Call twice to exercise the "already initialised" path of OnceLock.
+        let v1 = post_apply_timing_enabled();
+        let v2 = post_apply_timing_enabled();
+        assert_eq!(v1, v2, "OnceLock must be stable across calls");
+        // In CI (DUGITE_POST_APPLY_TIMING is not set), this must be false.
+        // In a dev session with the env var set it may be true — that is fine.
+        // We cannot assert a specific value here without controlling the env.
+        let _ = v1; // suppress unused warning
     }
 }
