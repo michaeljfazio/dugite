@@ -1,5 +1,22 @@
 # Round 2 — P0 RUPD divergence at boundary 1→2 (devnet k=40)
 
+**Status: RESOLVED 2026-05-28 in commit `037c464ea`**
+
+Root cause was two latent bugs in the Conway-from-genesis init path:
+1. `LedgerState::new` defaults `prev_d=1/1` (Shelley overlay convention) — Conway has d=0, so the overlay branch fired and mis-attributed 3.6T at boundary 0→1
+2. `finalize_genesis_state` pre-fills `snapshots.mark/set` with genesis stake — that snapshot rotates into `ssStakeGo` at boundary 1→2 and mis-distributes ~22 ADA in per-pool rewards
+
+Fix applied in `Node::init_ledger_state` (Conway-from-genesis only, PV >= 9):
+- override `prev_d = 0/1`, `prev_protocol_version_major = PV`
+- clear pre-filled `snapshots.mark`/`set` back to None
+- `pool_distribution_for_slot` now falls back to live-state when snapshots are None (so forge eligibility still works in epoch 0)
+- Forge path now refreshes governance metrics (was the cause of stale `dugite_treasury_lovelace`)
+
+Final Round 2 verification: byte-exact treasury + reserves parity vs Haskell at boundaries -1→0, 0→1, 1→2. All Round 2 PASS criteria green (verify.sh 5/5, analyze-evidence NO ANOMALIES, metric-audit 30/0 consistent, health-probe HEALTHY).
+
+---
+
+
 **Surfaced**: 2026-05-28 by Round 2 with `securityParam = 40` (so the Praos RUPD pulser `4k/f=320` fits the 400-slot epoch).
 
 **Latent**: this bug has existed in dugite for an unknown time. Previously hidden because:
