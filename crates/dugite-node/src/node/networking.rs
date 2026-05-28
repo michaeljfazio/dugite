@@ -620,8 +620,24 @@ impl NodePeerManager {
     /// Demotes the peer to cold and removes connection state. Also emits
     /// `GsmEvent::PeerDisconnected` to the GSM actor (if wired) so that
     /// the LoE and GDD peer tracking are updated.
+    ///
+    /// Mirrors Haskell's `ConnectionState::TerminatedState` transition.
+    /// On the governor side this is the `PeerCooling → PeerCold`
+    /// completion (matching `cooling_to_cold`). For paths that bypass
+    /// `mark_terminating` (e.g. remote-initiated TCP close detected by
+    /// `cleanup_dead_connections`, or peer-forget without prior
+    /// terminating), the underlying `demote_to_cold` accepts every
+    /// transition source (Warm/Hot/Cooling/Cold), so this is robust
+    /// against the entry path.
     pub fn peer_disconnected(&mut self, addr: &SocketAddr) {
-        self.inner.demote_to_cold(addr);
+        // Fast path: if the peer is in Cooling (mark_terminating was
+        // called first), this completes the Cooling → Cold transition
+        // cleanly. Otherwise (e.g. detected from cleanup_dead_connections
+        // without a prior governor-initiated mark_terminating),
+        // demote_to_cold handles Hot/Warm → Cold directly.
+        if !self.inner.cooling_to_cold(addr) {
+            self.inner.demote_to_cold(addr);
+        }
         self.conn_states.remove(addr);
         // Clear any fresh-inbound tracking — if they reconnect we restart
         // the maturation window cleanly.
@@ -715,11 +731,23 @@ impl NodePeerManager {
     ///
     /// Called before `conn.shutdown()` during demotion to cold or cleanup.
     /// The connection will be removed via `peer_disconnected()` after shutdown.
+    ///
+    /// Mirrors Haskell's `ConnectionState::TerminatingState` transition. The
+    /// outbound governor's analogue (`PeerStatus::PeerCooling`) is set
+    /// here on the `PeerManager` side so `updateUnlessCoolingOrCold`
+    /// blocks re-promotion while the shutdown is in flight. The
+    /// `PeerCooling → PeerCold` transition fires later in
+    /// `peer_disconnected`, which mirrors Haskell's
+    /// `TerminatingState → TerminatedState`.
     pub fn mark_terminating(&mut self, addr: &SocketAddr) {
         if self.conn_states.contains_key(addr) {
             self.conn_states
                 .insert(*addr, ConnectionState::TerminatingConn);
         }
+        // Hot/Warm → Cooling (governor view). No-op for peers that
+        // are already in Cold or Cooling (e.g. forget-peer path that
+        // hit a previously-failed cold peer).
+        self.inner.demote_to_cooling(addr);
     }
 
     /// Check if a connection is inbound (for directing state transitions).
@@ -1190,6 +1218,73 @@ mod tests {
         let now = std::time::Instant::now();
         let fresh = pm.fresh_inbound_set(now + std::time::Duration::from_secs(15 * 60 + 1));
         assert!(!fresh.contains(&addr));
+    }
+
+    /// Governor-initiated disconnect goes Hot/Warm → Cooling → Cold:
+    /// `mark_terminating` enters Cooling, `peer_disconnected` completes
+    /// the Cooling → Cold transition. Re-promotion is blocked while in
+    /// Cooling (mirrors Haskell `updateUnlessCoolingOrCold`).
+    #[test]
+    fn governor_disconnect_goes_through_cooling() {
+        use dugite_network::peer::manager::PeerState;
+        let mut pm = NodePeerManager::new(PeerManagerConfig::default());
+        let addr: SocketAddr = "203.0.113.5:3001".parse().unwrap();
+        pm.peer_connected(&addr, ConnectionDirection::Outbound);
+        // Warm → Hot to set up the canonical demotion path.
+        pm.inner.promote_to_hot(&addr);
+        assert_eq!(pm.hot_peer_count(), 1);
+
+        // Governor decides to disconnect → mark_terminating fires.
+        pm.mark_terminating(&addr);
+        assert_eq!(
+            pm.inner.count_by_state(PeerState::Cooling),
+            1,
+            "mark_terminating must demote Hot → Cooling"
+        );
+        assert_eq!(
+            pm.hot_peer_count(),
+            0,
+            "Hot count drops immediately on mark_terminating"
+        );
+        assert!(
+            pm.inner
+                .get_peer(&addr)
+                .unwrap()
+                .state
+                .is_cooling_or_cold(),
+            "Cooling must satisfy is_cooling_or_cold for governor checks"
+        );
+
+        // Connection torn down → peer_disconnected completes Cooling → Cold.
+        pm.peer_disconnected(&addr);
+        assert_eq!(
+            pm.inner.count_by_state(PeerState::Cold),
+            1,
+            "peer_disconnected must complete the Cooling → Cold transition"
+        );
+        assert_eq!(pm.inner.count_by_state(PeerState::Cooling), 0);
+    }
+
+    /// Remote-initiated disconnect (TCP RST detected by cleanup_dead_connections)
+    /// bypasses `mark_terminating` and lands directly in `peer_disconnected`.
+    /// `peer_disconnected` must still handle Warm/Hot → Cold via the
+    /// `demote_to_cold` fallback in that case (no prior Cooling state).
+    #[test]
+    fn remote_initiated_disconnect_skips_cooling_gracefully() {
+        use dugite_network::peer::manager::PeerState;
+        let mut pm = NodePeerManager::new(PeerManagerConfig::default());
+        let addr: SocketAddr = "203.0.113.5:3001".parse().unwrap();
+        pm.peer_connected(&addr, ConnectionDirection::Outbound);
+        pm.inner.promote_to_hot(&addr);
+
+        // No mark_terminating — connection died unexpectedly, detected at
+        // cleanup_dead_connections time.
+        pm.peer_disconnected(&addr);
+        assert_eq!(
+            pm.inner.count_by_state(PeerState::Cold),
+            1,
+            "Remote-initiated close must still land Cold"
+        );
     }
 
     /// Outbound peers MUST NOT enter the maturation window — they come from
