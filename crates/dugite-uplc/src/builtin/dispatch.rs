@@ -38,11 +38,15 @@ pub enum ForceOutcome {
 /// the budget the moment the denotation fires (mirrors the Haskell
 /// reference's `chargeAndRun` semantics — cost is charged BEFORE the
 /// denotation's computation, never after).
+///
+/// `trace_log` is threaded through to the denotation for the `Trace`
+/// builtin to append its string argument.
 pub fn force_builtin(
     id: BuiltinId,
     forces: u8,
     args: Vec<Value>,
     tracker: Option<&mut BudgetTracker>,
+    trace_log: Option<&mut Vec<String>>,
 ) -> Result<ForceOutcome, UplcError> {
     let (required_forces, required_arity) = arity_of(id);
     if forces < required_forces {
@@ -59,7 +63,7 @@ pub fn force_builtin(
                 let cost = BuiltinCosts::DEFAULT.charge_for_args(id, &[]);
                 t.charge(cost)?;
             }
-            let result = denote(id, vec![])?;
+            let result = denote(id, vec![], trace_log)?;
             return Ok(ForceOutcome::Done(result));
         }
         Ok(ForceOutcome::Pending(v))
@@ -74,12 +78,16 @@ pub fn force_builtin(
 ///
 /// When `tracker` is `Some`, the per-builtin cost is charged at
 /// saturation (see [`force_builtin`] for the same semantics).
+///
+/// `trace_log` is threaded through to the denotation for the `Trace`
+/// builtin to append its string argument.
 pub fn apply_builtin(
     id: BuiltinId,
     forces: u8,
     mut args: Vec<Value>,
     arg: Value,
     tracker: Option<&mut BudgetTracker>,
+    trace_log: Option<&mut Vec<String>>,
 ) -> Result<Value, UplcError> {
     let (required_forces, required_arity) = arity_of(id);
     if forces < required_forces {
@@ -119,7 +127,7 @@ pub fn apply_builtin(
         let cost = BuiltinCosts::DEFAULT.charge_for_args(id, &args);
         t.charge(cost)?;
     }
-    denote(id, args)
+    denote(id, args, trace_log)
 }
 
 /// Return a `'static str` identifier for the builtin (alias for the
@@ -142,7 +150,7 @@ mod tests {
     #[test]
     fn force_zero_force_builtin_returns_excess_on_first_force() {
         // AddInteger needs 0 forces. The first force is already excess.
-        match force_builtin(BuiltinId::AddInteger, 0, vec![], None).unwrap() {
+        match force_builtin(BuiltinId::AddInteger, 0, vec![], None, None).unwrap() {
             ForceOutcome::Excess => {}
             other => panic!("expected Excess, got {other:?}"),
         }
@@ -151,7 +159,7 @@ mod tests {
     #[test]
     fn force_one_force_builtin_becomes_pending_then_excess() {
         // IfThenElse needs 1 force.
-        let v1 = match force_builtin(BuiltinId::IfThenElse, 0, vec![], None).unwrap() {
+        let v1 = match force_builtin(BuiltinId::IfThenElse, 0, vec![], None, None).unwrap() {
             ForceOutcome::Pending(v) => v,
             other => panic!("expected Pending, got {other:?}"),
         };
@@ -163,7 +171,7 @@ mod tests {
             _ => panic!("expected Value::Builtin"),
         }
         // Forcing again is excess.
-        match force_builtin(BuiltinId::IfThenElse, 1, vec![], None).unwrap() {
+        match force_builtin(BuiltinId::IfThenElse, 1, vec![], None, None).unwrap() {
             ForceOutcome::Excess => {}
             other => panic!("expected Excess, got {other:?}"),
         }
@@ -173,14 +181,15 @@ mod tests {
     fn applying_before_forces_satisfied_errors() {
         // IfThenElse needs 1 force; applying an arg first is a
         // builtin-type error.
-        let err = apply_builtin(BuiltinId::IfThenElse, 0, vec![], int_val(1), None).unwrap_err();
+        let err =
+            apply_builtin(BuiltinId::IfThenElse, 0, vec![], int_val(1), None, None).unwrap_err();
         assert!(matches!(err, UplcError::BuiltinTypeError { .. }));
     }
 
     #[test]
     fn apply_under_arity_returns_partial() {
         // AddInteger arity (0, 2) — applying just one arg is still partial.
-        let v = apply_builtin(BuiltinId::AddInteger, 0, vec![], int_val(1), None).unwrap();
+        let v = apply_builtin(BuiltinId::AddInteger, 0, vec![], int_val(1), None, None).unwrap();
         match v {
             Value::Builtin { id, args, .. } => {
                 assert_eq!(id, BuiltinId::AddInteger);

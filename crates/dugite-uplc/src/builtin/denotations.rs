@@ -22,7 +22,17 @@ type ValueMap = BTreeMap<Vec<u8>, BTreeMap<Vec<u8>, i128>>;
 /// Saturated-application denotation. The CEK dispatcher calls this
 /// once both the force count and the value-argument count match the
 /// builtin's arity.
-pub fn denote(id: BuiltinId, args: Vec<Value>) -> Result<Value, UplcError> {
+///
+/// `trace_log` is an optional mutable reference to the caller's trace
+/// accumulator. When `Some`, the `Trace` builtin appends its first
+/// (string) argument here before returning the second. This mirrors
+/// the Haskell CEK `emit` mechanism (`traceDenotation text a = a <$
+/// emit text`, see `PlutusCore.Default.Builtins`).
+pub fn denote(
+    id: BuiltinId,
+    args: Vec<Value>,
+    trace_log: Option<&mut Vec<String>>,
+) -> Result<Value, UplcError> {
     use BuiltinId::*;
     match id {
         // ── Integer arithmetic (V1) ─────────────────────────────────
@@ -98,13 +108,29 @@ pub fn denote(id: BuiltinId, args: Vec<Value>) -> Result<Value, UplcError> {
             }
         }
 
-        // Trace: emit a log message (currently discarded — the CEK
-        // machine's `EvalResult.logs` will accumulate them once the
-        // tracer is wired) and return the second argument.
+        // Trace: emit a log message and return the second argument unchanged.
+        //
+        // Haskell reference: `traceDenotation text a = a <$ emit text`
+        // (`PlutusCore.Default.Builtins`, `PlutusCore.Builtin.Emitter`).
+        // The `Trace` builtin has Plutus type `all a. text -> a -> a`;
+        // the `emit` call appends to the CEK machine's internal log list.
+        // Logs are UTF-8 `Text` values, collected in emission order (FIFO).
+        //
+        // The caller threads `trace_log` in so the CEK dispatch layer can
+        // accumulate strings without needing a global side-channel.
         Trace => {
             let mut it = args.into_iter();
-            let _msg = it.next().ok_or_else(|| builtin_arity_mismatch(id))?;
+            let msg = it.next().ok_or_else(|| builtin_arity_mismatch(id))?;
             let rest = it.next().ok_or_else(|| builtin_arity_mismatch(id))?;
+            // Extract the string from the first arg; any non-String value is
+            // silently ignored (matches Haskell's `Text` expectation — the
+            // type system ensures it's always a String at the Plutus level,
+            // but we stay defensive here).
+            if let Some(log) = trace_log {
+                if let Value::Const(Constant::String(s)) = &msg {
+                    log.push(s.clone());
+                }
+            }
             Ok(rest)
         }
 
@@ -1729,7 +1755,15 @@ mod tests {
     }
 
     fn run(id: BuiltinId, args: Vec<Value>) -> Result<Value, UplcError> {
-        denote(id, args)
+        denote(id, args, None)
+    }
+
+    fn run_with_log(
+        id: BuiltinId,
+        args: Vec<Value>,
+        log: &mut Vec<String>,
+    ) -> Result<Value, UplcError> {
+        denote(id, args, Some(log))
     }
 
     // ── Integer arithmetic ─────────────────────────────────────────
@@ -1930,6 +1964,7 @@ mod tests {
 
     #[test]
     fn trace_returns_second_arg() {
+        // Trace still returns its second arg regardless of whether a log is provided.
         assert_eq!(
             run(
                 BuiltinId::Trace,
@@ -1938,6 +1973,74 @@ mod tests {
             .unwrap(),
             int(99)
         );
+    }
+
+    #[test]
+    fn trace_appends_string_to_log() {
+        let mut log: Vec<String> = Vec::new();
+        let result = run_with_log(
+            BuiltinId::Trace,
+            vec![
+                Value::Const(Constant::String("hello world".into())),
+                int(42),
+            ],
+            &mut log,
+        )
+        .unwrap();
+        assert_eq!(result, int(42), "trace must return its second argument");
+        assert_eq!(
+            log,
+            vec!["hello world"],
+            "trace must append the string to the log"
+        );
+    }
+
+    #[test]
+    fn trace_multiple_calls_ordered_fifo() {
+        // Simulate two sequential trace calls — logs must be in emission order.
+        let mut log: Vec<String> = Vec::new();
+        run_with_log(
+            BuiltinId::Trace,
+            vec![Value::Const(Constant::String("first".into())), int(1)],
+            &mut log,
+        )
+        .unwrap();
+        run_with_log(
+            BuiltinId::Trace,
+            vec![Value::Const(Constant::String("second".into())), int(2)],
+            &mut log,
+        )
+        .unwrap();
+        run_with_log(
+            BuiltinId::Trace,
+            vec![Value::Const(Constant::String("third".into())), int(3)],
+            &mut log,
+        )
+        .unwrap();
+        assert_eq!(log, vec!["first", "second", "third"]);
+    }
+
+    #[test]
+    fn trace_without_log_does_not_capture() {
+        // When trace_log is None the builtin must still succeed and return arg2,
+        // but nothing is captured — no panic, no error.
+        let result = run(
+            BuiltinId::Trace,
+            vec![Value::Const(Constant::String("discarded".into())), int(7)],
+        )
+        .unwrap();
+        assert_eq!(result, int(7));
+    }
+
+    #[test]
+    fn trace_non_string_first_arg_does_not_panic() {
+        // If the first arg is not a String (shouldn't happen in well-typed
+        // Plutus, but we must not panic defensively), the log remains empty
+        // and the second arg is still returned.
+        let mut log: Vec<String> = Vec::new();
+        let result = run_with_log(BuiltinId::Trace, vec![int(999), int(42)], &mut log).unwrap();
+        assert_eq!(result, int(42));
+        assert!(log.is_empty(), "non-String arg must not write to log");
     }
 
     #[test]
