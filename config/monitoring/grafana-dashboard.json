@@ -3418,10 +3418,28 @@
           },
           "expr": "dugite_n2c_connections_active",
           "legendFormat": "N2C active",
-          "refId": "A"
+          "refId": "B"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          },
+          "expr": "increase(dugite_n2n_connections_total[5m])",
+          "legendFormat": "N2N accepted/5m",
+          "refId": "C"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          },
+          "expr": "increase(dugite_n2c_connections_total[5m])",
+          "legendFormat": "N2C accepted/5m",
+          "refId": "D"
         }
       ],
-      "title": "N2N / N2C Active Connections",
+      "title": "N2N / N2C Active Connections & Accepted Rate",
       "type": "timeseries"
     },
     {
