@@ -21,9 +21,13 @@ mkdir -p "$ZOO_STATE" "$ZOO_KEYS" "$ZOO_BUILT" "$ZOO_LOGS"
 ZOO_SOCKET="${ZOO_SOCKET:-$LD_RELAY_SOCK}"
 
 # Default funding key — the genesis utxo key. tx-zoo scripts spend from this.
-ZOO_PAY_ADDR_FILE="$LD_KEYS/utxo/payment.addr"
-ZOO_PAY_SKEY="$LD_KEYS/utxo/payment.skey"
-ZOO_PAY_VKEY="$LD_KEYS/utxo/payment.vkey"
+# Overridable so the bidirectional-parity wrapper can give each batch its own
+# pre-funded payment key (so re-runs across sockets don't fight for the same
+# UTxO budget). When the override is set, the helper rules in this file just
+# follow it — no other state needs to change.
+ZOO_PAY_ADDR_FILE="${ZOO_PAY_ADDR_FILE:-$LD_KEYS/utxo/payment.addr}"
+ZOO_PAY_SKEY="${ZOO_PAY_SKEY:-$LD_KEYS/utxo/payment.skey}"
+ZOO_PAY_VKEY="${ZOO_PAY_VKEY:-$LD_KEYS/utxo/payment.vkey}"
 
 # ---- Logging shorthand ----
 zoo_info()  { printf '\033[0;36m[ZOO]\033[0m   %s\n' "$*" >&2; }
