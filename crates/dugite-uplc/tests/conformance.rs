@@ -88,7 +88,9 @@ fn run_conformance_test(
     // Counting mode mirrors `evaluateCekNoEmit` in counting mode: costs
     // accumulate with saturation but never block evaluation.
     let mut tracker = BudgetTracker::new_counting();
-    let eval = evaluate_with_budget(input_prog.term.clone(), &mut tracker);
+    // Conformance tests don't exercise trace output — pass `None` to
+    // discard any `trace` builtin emissions (mirrors `evaluateCekNoEmit`).
+    let eval = evaluate_with_budget(input_prog.term.clone(), &mut tracker, None);
 
     let value = match eval {
         Ok(v) => v,

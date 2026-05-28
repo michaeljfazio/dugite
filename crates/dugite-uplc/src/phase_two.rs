@@ -148,6 +148,17 @@ pub enum PhaseTwoError {
     /// CEK evaluation failed.
     #[error("script evaluation failed: {0}")]
     ScriptEvaluationFailed(#[from] crate::UplcError),
+    /// CEK evaluation failed and the script emitted trace strings before
+    /// the error. Mirrors the Haskell `ValidationFailure exUnits err logs`
+    /// constructor (`Cardano.Ledger.Alonzo.Plutus.Evaluate`).
+    /// Callers that display errors to users should render the logs as
+    /// "Trace logs: [...]" preceding the evaluation error (matching
+    /// `cardano-cli transaction submit` output).
+    #[error("script evaluation failed: {error}; trace logs: {logs:?}")]
+    ScriptEvaluationFailedWithLogs {
+        error: crate::UplcError,
+        logs: Vec<String>,
+    },
     /// Generic internal error.
     #[error("internal phase-2 error: {0}")]
     Internal(String),

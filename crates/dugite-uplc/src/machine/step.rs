@@ -20,7 +20,7 @@ pub fn evaluate(term: Term) -> Result<Value, UplcError> {
         kont: Kont::new(),
     };
     loop {
-        state = step(state, None)?;
+        state = step(state, None, None)?;
         if let State::Done(v) = state {
             return Ok(v);
         }
@@ -34,9 +34,16 @@ pub fn evaluate(term: Term) -> Result<Value, UplcError> {
 /// otherwise free.  Startup cost is charged once by
 /// `BudgetTracker::new`.  On success, `tracker.consumed()` reports the
 /// budget actually used.
+///
+/// `trace_log`, when `Some`, receives every string emitted by the
+/// `Trace` builtin during evaluation, in emission order (FIFO). This
+/// mirrors the Haskell CEK `emit` mechanism. Pass `None` to discard
+/// trace output (e.g. when running the conformance suite without log
+/// capture).
 pub fn evaluate_with_budget(
     term: Term,
     tracker: &mut crate::machine::cost::BudgetTracker,
+    mut trace_log: Option<&mut Vec<String>>,
 ) -> Result<Value, UplcError> {
     let mut state = State::Compute {
         term,
@@ -47,7 +54,7 @@ pub fn evaluate_with_budget(
         if let State::Compute { ref term, .. } = state {
             tracker.compute_step(term)?;
         }
-        state = step(state, Some(&mut *tracker))?;
+        state = step(state, Some(&mut *tracker), trace_log.as_deref_mut())?;
         if let State::Done(v) = state {
             tracker.flush()?;
             return Ok(v);
@@ -58,10 +65,11 @@ pub fn evaluate_with_budget(
 fn step(
     state: State,
     tracker: Option<&mut crate::machine::cost::BudgetTracker>,
+    trace_log: Option<&mut Vec<String>>,
 ) -> Result<State, UplcError> {
     match state {
         State::Compute { term, env, kont } => compute(term, env, kont),
-        State::Return { value, kont } => return_compute(value, kont, tracker),
+        State::Return { value, kont } => return_compute(value, kont, tracker, trace_log),
         State::Done(_) => Err(UplcError::Internal("step called on Done state".into())),
     }
 }
@@ -184,6 +192,7 @@ fn return_compute(
     value: Value,
     mut kont: Kont,
     tracker: Option<&mut crate::machine::cost::BudgetTracker>,
+    trace_log: Option<&mut Vec<String>>,
 ) -> Result<State, UplcError> {
     let frame = match kont.pop() {
         None => return Ok(State::Done(value)),
@@ -201,9 +210,9 @@ fn return_compute(
                 kont,
             })
         }
-        Frame::AwaitArg { function, .. } => apply(function, value, kont, tracker),
-        Frame::Force => force_value(value, kont, tracker),
-        Frame::ApplyValue { argument } => apply(value, argument, kont, tracker),
+        Frame::AwaitArg { function, .. } => apply(function, value, kont, tracker, trace_log),
+        Frame::Force => force_value(value, kont, tracker, trace_log),
+        Frame::ApplyValue { argument } => apply(value, argument, kont, tracker, trace_log),
         Frame::Constr {
             tag,
             mut pending,
@@ -364,6 +373,7 @@ fn apply(
     argument: Value,
     kont: Kont,
     tracker: Option<&mut crate::machine::cost::BudgetTracker>,
+    trace_log: Option<&mut Vec<String>>,
 ) -> Result<State, UplcError> {
     match function {
         Value::Lambda { body, env } => Ok(State::Compute {
@@ -372,7 +382,9 @@ fn apply(
             kont,
         }),
         Value::Builtin { id, forces, args } => {
-            let v = crate::builtin::dispatch::apply_builtin(id, forces, args, argument, tracker)?;
+            let v = crate::builtin::dispatch::apply_builtin(
+                id, forces, args, argument, tracker, trace_log,
+            )?;
             Ok(State::Return { value: v, kont })
         }
         Value::Const(_) | Value::Delay { .. } | Value::Constr { .. } => {
@@ -388,6 +400,7 @@ fn force_value(
     value: Value,
     kont: Kont,
     tracker: Option<&mut crate::machine::cost::BudgetTracker>,
+    trace_log: Option<&mut Vec<String>>,
 ) -> Result<State, UplcError> {
     match value {
         Value::Delay { body, env } => Ok(State::Compute {
@@ -397,7 +410,7 @@ fn force_value(
         }),
         Value::Builtin { id, forces, args } => {
             use crate::builtin::dispatch::{force_builtin, ForceOutcome};
-            match force_builtin(id, forces, args, tracker)? {
+            match force_builtin(id, forces, args, tracker, trace_log)? {
                 ForceOutcome::Pending(v) | ForceOutcome::Done(v) => {
                     Ok(State::Return { value: v, kont })
                 }

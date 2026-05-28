@@ -267,14 +267,30 @@ pub fn evaluate_plutus_scripts(
             Ok(())
         }
         Err(e) => {
+            // Surface trace logs in the error message when the script emitted
+            // `trace` strings before failing — mirrors `cardano-cli`'s
+            // "Trace logs: [...]" output (Haskell `evalTxExUnitsWithLogs`,
+            // `Cardano.Ledger.Alonzo.Plutus.Evaluate`).
+            let error_msg = match &e {
+                dugite_uplc::phase_two::PhaseTwoError::ScriptEvaluationFailedWithLogs {
+                    error,
+                    logs,
+                } => {
+                    let joined = logs
+                        .iter()
+                        .map(|s| format!("[{s}]"))
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    format!("eval_phase_two_raw error: {error}; Trace logs: {joined}")
+                }
+                _ => format!("eval_phase_two_raw error: {e}"),
+            };
             debug!(
                 tx_hash = %tx.hash.to_hex(),
-                error = %e,
+                error = %error_msg,
                 "Plutus evaluation error"
             );
-            Err(PlutusError::EvalFailed(format!(
-                "eval_phase_two_raw error: {e}"
-            )))
+            Err(PlutusError::EvalFailed(error_msg))
         }
     }
 }
