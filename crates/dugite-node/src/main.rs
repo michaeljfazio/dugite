@@ -373,7 +373,7 @@ struct MithrilImportArgs {
     /// dugite to derive the ledger state entirely from its own
     /// validator rather than trusting the Mithril-certified Haskell
     /// snapshot. Trust model and operator-exposure decision are
-    /// documented in `docs/src/operations/mithril-ancillary.md`.
+    /// documented in `docs/src/running/mithril-ancillary.md`.
     ///
     /// Default: `true`. The flag is named so `--include-ancillary` and
     /// `--no-include-ancillary` both work via clap's standard negation.
