@@ -761,6 +761,18 @@ pub(crate) fn convert_validation_error(
                  (ConwayDRepIncorrectRefund)"
             ),
         },
+        VE::MalformedScriptWitnesses { hashes } => TxValidationError::ScriptFailed {
+            reason: format!(
+                "Malformed script witness(es) in tx: {hashes:?} \
+                 (MalformedScriptWitnesses; PV gate or flat-decode failed)"
+            ),
+        },
+        VE::MalformedReferenceScripts { hashes } => TxValidationError::ScriptFailed {
+            reason: format!(
+                "Malformed reference script(s) on tx outputs: {hashes:?} \
+                 (MalformedReferenceScripts; PV gate or flat-decode failed)"
+            ),
+        },
         VE::ProposalDepositIncorrect { declared, expected } => TxValidationError::ScriptFailed {
             reason: format!(
                 "Governance proposal rejected: declared deposit {declared} does not match \

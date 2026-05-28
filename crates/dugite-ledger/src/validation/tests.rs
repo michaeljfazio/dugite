@@ -2494,10 +2494,21 @@ mod tests {
             transaction_id: Hash32::from_bytes([2u8; 32]),
             index: 0,
         };
-        // The Plutus V1 script in the witness set has bytes [0x01, 0x02, 0x03].
-        // Build a script-locked enterprise address whose payment credential hash
-        // equals the hash of that script so it is "needed" by the spend redeemer.
-        let plutus_script_bytes = vec![0x01u8, 0x02, 0x03];
+        // Plutus V1 script: minimal valid flat-encoded program
+        // `(program 1.0.0 (con integer 0))`. The `MalformedScriptWitnesses`
+        // predicate (Babbage+ UTXOW) now rejects garbage bytes at admission
+        // time, so the witness script must be flat-decodable. We construct
+        // a real minimal program rather than hardcoding magic bytes so the
+        // fixture survives any future flat-encoding tweak.
+        let plutus_script_bytes = {
+            let p = dugite_uplc::program::Program {
+                version: (1, 0, 0),
+                term: dugite_uplc::term::Term::Const(dugite_uplc::term::Constant::Integer(
+                    num_bigint::BigInt::from(0),
+                )),
+            };
+            p.to_flat().expect("flat-encode minimal Plutus program")
+        };
         let script_hash = dugite_primitives::hash::blake2b_224_tagged(1, &plutus_script_bytes);
         let script_address = Address::Enterprise(dugite_primitives::address::EnterpriseAddress {
             network: dugite_primitives::network::NetworkId::Mainnet,
@@ -2541,7 +2552,7 @@ mod tests {
                 steps: 100,
             },
         }];
-        let plutus_v1_scripts = vec![vec![0x01, 0x02, 0x03]];
+        let plutus_v1_scripts = vec![plutus_script_bytes.clone()];
         let params = ProtocolParameters::mainnet_defaults();
         let script_data_hash = dugite_serialization::compute_script_data_hash(
             &redeemers,

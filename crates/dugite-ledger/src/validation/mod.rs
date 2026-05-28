@@ -1026,6 +1026,38 @@ pub enum ValidationError {
     /// `cardano-ledger-shelley:Cardano.Ledger.Shelley.Rules.Utxow`.
     #[error("Extraneous script witness(es) not needed by transaction: {hashes:?}")]
     ExtraneousScriptWitness { hashes: Vec<String> },
+    /// Babbage+ UTXOW rule: one or more scripts in the witness set are
+    /// malformed for the current protocol version. Either the script's
+    /// bytes do not decode (failed `decodePlutusRunnable`) or the script
+    /// language is not yet supported at the current PV (e.g. PlutusV3 at
+    /// PV < 9).
+    ///
+    /// Per Haskell `validScript` (`eras/alonzo/impl/.../Scripts.hs`, line
+    /// 650):
+    ///
+    /// ```haskell
+    /// validScript pv script =
+    ///   case toPlutusScript script of
+    ///     Just plutusScript -> isValidPlutusScript (pvMajor pv) plutusScript
+    ///     Nothing -> case getNativeScript script of
+    ///       Just timelockScript -> deepseq timelockScript True
+    ///       Nothing -> error "Impossible"
+    /// ```
+    ///
+    /// Reference: Haskell `MalformedScriptWitnesses` in
+    /// `cardano-ledger-babbage:Cardano.Ledger.Babbage.Rules.Utxow`, line 260.
+    #[error("Malformed script witness(es) (MalformedScriptWitnesses): {hashes:?}")]
+    MalformedScriptWitnesses { hashes: Vec<String> },
+    /// Babbage+ UTXOW rule: one or more reference scripts attached to an
+    /// output PRODUCED by this transaction (`tx.body.outputs[].script_ref`
+    /// or `tx.body.collateral_return.script_ref`) are malformed for the
+    /// current protocol version. Same `validScript` predicate as
+    /// `MalformedScriptWitnesses` — only the source of scripts differs.
+    ///
+    /// Reference: Haskell `MalformedReferenceScripts` in
+    /// `cardano-ledger-babbage:Cardano.Ledger.Babbage.Rules.Utxow`, line 261.
+    #[error("Malformed reference script(s) on tx outputs (MalformedReferenceScripts): {hashes:?}")]
+    MalformedReferenceScripts { hashes: Vec<String> },
     /// Conway rule: the total byte size of all reference scripts reachable
     /// from a single transaction's inputs and reference inputs must not exceed
     /// 200 KiB (`ppMaxRefScriptSizePerTxG`).
@@ -3170,6 +3202,15 @@ pub fn validate_transaction_with_pools(
     // ppuWellFormed check for ParameterChange proposals (Conway GOV rule)
     conway::check_pparam_update_well_formed(params, &tx.body, &mut errors);
 
+    // Babbage+ UTXOW: every reference script attached to an output PRODUCED
+    // by this transaction must pass `validScript pv` — Plutus scripts must
+    // decode and their language must be supported at the current PV. This
+    // check runs UNCONDITIONALLY (not gated on `has_plutus_scripts`) because
+    // a tx can attach a malformed Plutus ref-script to an output without
+    // carrying any witness Plutus script of its own. Matches Haskell's
+    // `MalformedReferenceScripts` predicate.
+    scripts::check_malformed_reference_scripts(tx, params, &mut errors);
+
     // ------------------------------------------------------------------
     // Rules 11, 11b, 11c, 12 — Plutus-transaction-specific checks
     //
@@ -3201,6 +3242,16 @@ pub fn validate_transaction_with_pools(
         // Matches Haskell's `ExtraneousScriptWitnessesUTXOW` /
         // `babbageMissingScripts` check.
         scripts::check_extraneous_script_witnesses(tx, utxo_set, &mut errors);
+
+        // Babbage+ UTXOW: every script in the witness set must pass
+        // `validScript pv script` — Plutus scripts must decode and their
+        // language must be supported at the current PV; native scripts are
+        // trivially OK once decoded. Matches Haskell's
+        // `MalformedScriptWitnesses` predicate.
+        scripts::check_malformed_script_witnesses(tx, params, &mut errors);
+
+        // (MalformedReferenceScripts is enforced unconditionally above,
+        //  not just when the tx carries witness Plutus scripts.)
 
         // ------------------------------------------------------------------
         // Phase-2: Execute Plutus scripts when redeemers are present.
