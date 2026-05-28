@@ -61,6 +61,21 @@ done
 
 If `cardano-node` is older than 11.0.1, abort: PV10 conway-genesis rejects it. See `references/troubleshooting.md`.
 
+## Test methodology — coverage axes at a glance
+
+Before running rounds, understand what each round contributes to the overall coverage charter. The skill exercises six orthogonal axes (see `references/test-methodology.md` for the full catalogue):
+
+1. **Tx-type** — every Conway tx class (59 zoo scripts spanning bookkeeping, native, Plutus V1/V2/V3, stake, gov certs, gov proposals, voting) + the 19 phase-1 negatives.
+2. **Validity** — every positive class has a matched negative; both must be classified identically by dugite and Haskell.
+3. **Submit-path** — txs submitted to **every** N2C ingestion socket: `dugite-bp.sock`, `dugite-relay.sock`, `cardano-bp.sock` (override via `ZOO_SOCKET=...`), plus `dugite-cli` vs `cardano-cli` on each. Also the UTxO RPC gRPC `submit_tx` (when `--rpc-port` is enabled).
+4. **Propagation-direction** — observe each tx at every node (mempool + ledger), in both forward (dugite-bp → relay → cardano-bp) and reverse (cardano-bp → relay → dugite-bp) directions through the hub.
+5. **Actor** — good-actor inputs (zoo positives, cli parity) AND bad-actor inputs (zoo negatives, `protocols/` adversarial framing, `chaos/` failure injection, RPC oversized/replay/flood).
+6. **Workload** — quiescent (Round 1 soak), trickle (Round 2 boundary), restart (Round 3), saturation + concurrent-burst + adversarial (Round 4 — see methodology doc).
+
+The **bidirectional parity oracle** is the most important predicate this skill enforces: *for every transaction T, dugite and Haskell must reach the same accept/reject decision regardless of which node ingested it first.* Off-diagonal cells (one accepts, the other rejects) are P0 bugs. Run representative txs through `ZOO_SOCKET=$LD_RELAY_SOCK` AND `ZOO_SOCKET=$LD_CARDANO_BP_SOCK` and tabulate results into `evidence/<ts>/parity-matrix.csv`.
+
+In addition to tx and N2N coverage, the skill exercises **dugite-cli surface parity** (today `09-cli-parity/` covers 22 query subcommands — see methodology doc for the full surface and gaps) and **UTxO RPC gRPC coverage** (Query / Submit / Sync / Watch services across v1alpha + v1beta; RPC is currently not wired into the devnet `run.sh` — opening this gap is tracked in the coverage-debt checklist).
+
 ## Workflow — three rounds in under 20 minutes
 
 Use TodoWrite to track each round as `in_progress` / `completed`. Each round must end with `./stop.sh` and a fresh `./setup.sh` before the next.
@@ -75,8 +90,12 @@ cd testnet/local-devnet
 ./run.sh                            # ~5s — staggered start (relay → cardano → dugite-bp)
 sleep 30                            # let the chain advance past slot 0
 ./tx-zoo/run-all.sh --setup         # ~20s — keys + plutus binaries (one-time per setup)
-./tx-zoo/run-all.sh                 # ~3-5 min — all 59 tx scripts
+./tx-zoo/run-all.sh                 # ~3-5 min — all 59 tx scripts (submitted via dugite-relay socket)
+# Bidirectional parity — re-run a representative subset against the Haskell socket
+# (catches accept-set asymmetry; see references/test-methodology.md "parity oracle")
+ZOO_SOCKET="$LD_CARDANO_BP_SOCK" ./tx-zoo/run-all.sh 01-bookkeeping 04-stake 06-proposals 08-negative
 ./tx-zoo/09-cli-parity/run.sh       # ~1 min — 22 LSQ parity checks; writes cli-parity.csv
+./tx-zoo/cross-validate-cli.sh      # ~1 min — dugite-cli ↔ cardano-cli submit parity
 ./protocols/run.sh                  # ~2 min — adversarial N2N framing; writes n2n-trace.csv
 ./soak.sh 120                       # 2 min idle evidence
 ./verify.sh evidence/$(ls -t evidence | head -1)
@@ -104,6 +123,8 @@ tail -F logs/cardano-bp.log   | grep -E 'TraceAdoptedBlock|TraceForgedInvalidBlo
 - `analyze-evidence.sh` reports no anomalies
 - `evidence/<ts>/cli-parity.csv` has zero DIVERGENT rows that are not filed as known-divergence issues
 - `evidence/<ts>/n2n-trace.csv` has zero PANIC or SILENT_SKIP rows
+- Bidirectional parity (08-negatives + the representative 01/04/06 subset re-run via `ZOO_SOCKET=$LD_CARDANO_BP_SOCK`) shows zero off-diagonal cells in `tx-zoo/state/results.csv` — every tx is classified identically by dugite and Haskell regardless of submit socket
+- `tx-zoo/state/cross-validate.csv` shows PASS for every representative tx submitted through `dugite-cli`
 
 ### Round 2 — Epoch-boundary stress (~7 min)
 
@@ -207,6 +228,7 @@ If any round fails, stop. Do not run the next round. Bundle `logs/` + `evidence/
 
 ## Reference files (read on demand)
 
+- `references/test-methodology.md` — **start here for any coverage question**. Six orthogonal coverage axes (tx-type, validity, submit-path, propagation-direction, actor, workload), the bidirectional accept/reject parity oracle, full dugite-cli surface map, UTxO RPC (gRPC) coverage matrix, era / governance / stress recipes, and the running coverage-debt checklist.
 - `references/health.md` — **start here for any runtime-health question**. Six-question health model, lifecycle phases (boot/catch-up/at-tip/boundary/restart), healthy ranges, network-performance signals, log-sampling cadence, Haskell cross-validation, and the 14-step evaluation procedure that `health-probe.sh` implements.
 - `references/monitoring.md` — authoritative catalog of dugite Prometheus metrics + log patterns (the "what does this name mean" lookup, verified against the actual code)
 - `references/parameters.md` — slot/epoch/security math, override mechanics, what the values mean

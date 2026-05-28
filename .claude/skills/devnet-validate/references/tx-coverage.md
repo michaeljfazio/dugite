@@ -2,6 +2,8 @@
 
 The tx-zoo lives at `testnet/local-devnet/tx-zoo/`. It exercises every Conway-era transaction class dugite must accept and produce results identical to the Haskell node.
 
+> For the broader test-coverage charter (six orthogonal axes, parity oracle, dugite-cli surface map, UTxO RPC matrix, era / governance / stress / adversarial recipes), see `test-methodology.md`. This file is the **per-category catalogue**; the methodology doc is the **coverage strategy**.
+
 ## Coverage matrix
 
 | # | Category | Scripts | What it proves |
@@ -80,6 +82,20 @@ If a negative script reports FAIL, dugite has either:
 - Rejected it with a different error than Haskell (compat regression).
 
 Either way, do not declare the round PASS. Capture the script's `state/logs/<n>-*.stderr` and the corresponding `dugite-bp.log` lines.
+
+## Bidirectional submission (parity oracle)
+
+Every tx-zoo script honours `ZOO_SOCKET` to choose the N2C ingestion socket:
+
+```bash
+ZOO_SOCKET=$LD_DUGITE_BP_SOCK ./tx-zoo/<script>.sh   # path A: forger direct
+ZOO_SOCKET=$LD_RELAY_SOCK    ./tx-zoo/<script>.sh    # path B: relay-mediated (default)
+ZOO_SOCKET=$LD_CARDANO_BP_SOCK  ./tx-zoo/<script>.sh    # path C: Haskell-mediated (reverse mempool path)
+```
+
+The standard playbook runs path B for the full 59-script suite, then re-runs a balanced subset (01-bookkeeping, 04-stake, 06-proposals, 08-negative) via path C. Off-diagonal cells in the resulting accept/reject matrix (see `test-methodology.md` for the matrix) are P0 bugs — they prove a tx that dugite admits is rejected by Haskell (or vice versa). All 19 `08-negative` scripts must produce identical rejection reasons on both paths.
+
+For dugite-cli ↔ cardano-cli submit-layer parity (path D), use `cross-validate-cli.sh` — it submits one representative tx per category via dugite-cli to dugite-bp.sock and observes inclusion via cardano-cli on the relay socket. The two cli implementations must produce byte-identical signed-tx CBOR; a mismatch shows up as the wrong txid on inclusion.
 
 ## Suggested extensions (P2)
 
