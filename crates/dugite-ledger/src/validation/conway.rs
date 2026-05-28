@@ -368,6 +368,49 @@ pub(super) fn check_pparam_update_well_formed(
 /// Reference: Haskell `checkVotersAreValid` /
 /// `is{Committee,DRep,StakePool}VotingAllowed` in
 /// `Cardano.Ledger.Conway.Governance.Internal`.
+/// Returns `true` when the (voter, action) pair is rejected by the Conway
+/// bootstrap-phase voting restrictions.
+///
+/// Per Haskell `checkBootstrapVotes` in
+/// `eras/conway/impl/src/Cardano/Ledger/Conway/Rules/Gov.hs` (lines 378-391
+/// and `isBootstrapAction` at lines 633-639):
+///
+/// ```haskell
+/// checkBootstrapVotes pp votes
+///   | hardforkConwayBootstrapPhase (pp ^. ppProtocolVersionL) =
+///       checkDisallowedVotes votes DisallowedVotesDuringBootstrap $ \gas ->
+///         \case
+///           DRepVoter {} | gasAction gas == InfoAction -> True
+///           DRepVoter {} -> False
+///           _ -> isBootstrapAction $ gasAction gas
+///   | otherwise = pure ()
+///
+/// isBootstrapAction =
+///   \case
+///     ParameterChange {} -> True
+///     HardForkInitiation {} -> True
+///     InfoAction -> True
+///     _ -> False
+/// ```
+///
+/// `hardforkConwayBootstrapPhase pv = pvMajor pv < 10` — fires at PV9 only.
+/// Callers gate on `protocol_version_major == 9` before invoking.
+pub(super) fn is_bootstrap_vote_disallowed(voter: &Voter, action: &GovAction) -> bool {
+    let is_bootstrap_action = matches!(
+        action,
+        GovAction::ParameterChange { .. }
+            | GovAction::HardForkInitiation { .. }
+            | GovAction::InfoAction
+    );
+    match voter {
+        // DRepVoter: only InfoAction is allowed during bootstrap.
+        Voter::DRep(_) => !matches!(action, GovAction::InfoAction),
+        // Committee + StakePool voters: only bootstrap-class actions
+        // (ParameterChange / HardForkInitiation / InfoAction).
+        Voter::ConstitutionalCommittee(_) | Voter::StakePool(_) => !is_bootstrap_action,
+    }
+}
+
 pub(super) fn is_voter_disallowed(voter: &Voter, action: &GovAction) -> bool {
     match (voter, action) {
         // InfoAction: every voter type is allowed (NoVotingThreshold).

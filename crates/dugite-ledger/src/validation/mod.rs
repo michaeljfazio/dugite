@@ -754,6 +754,42 @@ pub enum ValidationError {
     DisallowedVoters {
         violations: Vec<(Voter, GovActionId)>,
     },
+    /// Conway bootstrap-phase (PV9) voting restriction.
+    ///
+    /// Per Haskell `checkBootstrapVotes` in
+    /// `eras/conway/impl/src/Cardano/Ledger/Conway/Rules/Gov.hs`,
+    /// lines 378-391:
+    /// - DRepVoter may only vote on `InfoAction`.
+    /// - CommitteeVoter / StakePoolVoter may only vote on
+    ///   `ParameterChange`, `HardForkInitiation`, or `InfoAction`.
+    ///
+    /// Fires only when `pvMajor < 10`
+    /// (`hardforkConwayBootstrapPhase`).
+    #[error("DisallowedVotesDuringBootstrap: {violations:?}")]
+    DisallowedVotesDuringBootstrap {
+        violations: Vec<(Voter, GovActionId)>,
+    },
+    /// Conway GOV rule: every TreasuryWithdrawals destination address
+    /// must be a registered staking credential.
+    ///
+    /// Per Haskell `processProposal` in
+    /// `eras/conway/impl/src/Cardano/Ledger/Conway/Rules/Gov.hs`,
+    /// lines 509-519. The lookup table is `DState.accountsL` (mapped
+    /// here to `ValidationContext::reward_accounts`).
+    #[error("TreasuryWithdrawalReturnAccountsDoNotExist: {bad_addrs:?}")]
+    TreasuryWithdrawalReturnAccountsDoNotExist { bad_addrs: Vec<String> },
+    /// Allegra+ Shelley UTXOW: a metadata leaf (`Bytes` or `Text`) at any
+    /// depth exceeds 64 bytes. Haskell enforces this at CBOR-decode time
+    /// (`decodeMetadatum` in `Cardano.Ledger.Metadata`), and the
+    /// `InvalidMetadata` predicate is dead code on the validation side.
+    /// dugite's decoder accepts arbitrary sizes, so we mirror Haskell's
+    /// constraint at the validation step. PV >= 3 means Allegra+
+    /// (decoder version > 2).
+    ///
+    /// Reference: Haskell `decodeMetadatum` in
+    /// `libs/cardano-ledger-core/src/Cardano/Ledger/Metadata.hs`.
+    #[error("InvalidMetadata (oversize leaf at labels {labels:?}; max 64 bytes per Bytes/Text)")]
+    InvalidMetadata { labels: Vec<u64> },
     /// Conway GOV rule: one or more voters in the transaction's
     /// `voting_procedures` are not registered / authorised, and therefore
     /// cannot vote on any governance action:
@@ -1082,6 +1118,38 @@ pub enum ValidationError {
         current_epoch: u64,
         e_max: u64,
         max_epoch: u64,
+    },
+    /// Pool retirement epoch is not strictly in the future.
+    ///
+    /// Per Haskell's POOL rule
+    /// (`eras/shelley/impl/src/Cardano/Ledger/Shelley/Rules/Pool.hs`, lines
+    /// 308-323), the retirement epoch must satisfy `currentEpoch < e`
+    /// (STRICT lower bound). A retirement scheduled for the current epoch
+    /// or earlier fires the first `Mismatch` arm of
+    /// `StakePoolRetirementWrongEpochPOOL`.
+    #[error(
+        "Pool retirement epoch {retirement_epoch} must be strictly greater than \
+         current_epoch={current_epoch} (StakePoolRetirementWrongEpochPOOL, RelGT arm)"
+    )]
+    PoolRetirementTooEarly {
+        retirement_epoch: u64,
+        current_epoch: u64,
+    },
+    /// Pool registration's reward account is on the wrong network.
+    ///
+    /// Per Haskell `ShelleyPoolPredFailure::WrongNetworkPOOL` in
+    /// `eras/shelley/impl/src/Cardano/Ledger/Shelley/Rules/Pool.hs`,
+    /// gated on `hardforkAlonzoValidatePoolAccountAddressNetID pv`
+    /// (PV >= 5). The network ID encoded in the pool's reward (account)
+    /// address must match the node's network ID.
+    #[error(
+        "Pool {pool_id} reward account on wrong network: expected {expected:?}, \
+         got {actual:?} (WrongNetworkPOOL)"
+    )]
+    WrongNetworkPool {
+        expected: dugite_primitives::network::NetworkId,
+        actual: dugite_primitives::network::NetworkId,
+        pool_id: String,
     },
     /// Conway `ConwayStakeRegistration` deposit does not match protocol parameter
     /// `key_deposit`.
@@ -2191,6 +2259,51 @@ pub fn validate_transaction_with_context(
         if !violations.is_empty() {
             extra_errors.push(ValidationError::DisallowedVoters { violations });
         }
+
+        // -------------------------------------------------------------------
+        // DisallowedVotesDuringBootstrap (Conway GOV rule, PV9 only).
+        //
+        // During the Conway bootstrap phase (`pvMajor < 10`), Haskell
+        // restricts voter types to a subset of governance actions:
+        // - DRepVoter: only `InfoAction`
+        // - CommitteeVoter / StakePoolVoter: only ParameterChange,
+        //   HardForkInitiation, or InfoAction (the "bootstrap actions").
+        //
+        // The check is gated on `params.protocol_version_major == 9` (PV10+
+        // ratifies all governance action types). Outside the bootstrap
+        // window the Haskell predicate is a `pure ()` no-op.
+        //
+        // Reference: Haskell `checkBootstrapVotes` in
+        // `eras/conway/impl/src/Cardano/Ledger/Conway/Rules/Gov.hs`,
+        // lines 378-391.
+        // -------------------------------------------------------------------
+        if params.protocol_version_major == 9 {
+            let mut bootstrap_violations: Vec<(Voter, GovActionId)> = Vec::new();
+            for (voter, votes) in tx.body.voting_procedures.iter() {
+                if unknown_voter_set.contains(voter) {
+                    continue;
+                }
+                for action_id in votes.keys() {
+                    let action: Option<&GovAction> =
+                        local_proposals.get(action_id).copied().or_else(|| {
+                            context
+                                .active_proposals
+                                .as_ref()
+                                .and_then(|m| m.get(action_id))
+                                .map(|ap| &ap.gov_action)
+                        });
+                    let Some(action) = action else { continue };
+                    if conway::is_bootstrap_vote_disallowed(voter, action) {
+                        bootstrap_violations.push((voter.clone(), action_id.clone()));
+                    }
+                }
+            }
+            if !bootstrap_violations.is_empty() {
+                extra_errors.push(ValidationError::DisallowedVotesDuringBootstrap {
+                    violations: bootstrap_violations,
+                });
+            }
+        }
     }
 
     // -------------------------------------------------------------------
@@ -2227,6 +2340,81 @@ pub fn validate_transaction_with_context(
         }
         if !bad_addrs.is_empty() {
             extra_errors.push(ValidationError::ProposalReturnAccountDoesNotExist { bad_addrs });
+        }
+
+        // -------------------------------------------------------------------
+        // TreasuryWithdrawalReturnAccountsDoNotExist (Conway GOV rule).
+        //
+        // For every TreasuryWithdrawals proposal action, each withdrawal
+        // DESTINATION address (the receiver of the lovelace, the keys of
+        // the withdrawals map) must have its credential registered in the
+        // DState accounts map. Unknown destinations would otherwise allow
+        // arbitrary lovelace to be drained from treasury to an unaccountable
+        // sink.
+        //
+        // Per Haskell `processProposal` in
+        // `eras/conway/impl/src/Cardano/Ledger/Conway/Rules/Gov.hs`,
+        // lines 509-519:
+        //
+        // ```haskell
+        // TreasuryWithdrawals withdrawals _ -> do
+        //   let nonRegisteredAccounts =
+        //         flip Map.filterWithKey withdrawals $ \withdrawalAddress _ ->
+        //           not $
+        //             isAccountRegistered
+        //               (withdrawalAddress ^. accountAddressCredentialL)
+        //               (certDState ^. accountsL)
+        //   failOnNonEmpty (Map.keys nonRegisteredAccounts)
+        //     (injectFailure . TreasuryWithdrawalReturnAccountsDoNotExist)
+        // ```
+        //
+        // The lookup table on dugite's side is
+        // `ValidationContext::reward_accounts` (Haskell `accountsL` —
+        // staking credential → account info). When `reward_accounts` is
+        // `None`, the predicate is silently skipped (lenient default).
+        // -------------------------------------------------------------------
+        if let Some(reward_accounts) = context.reward_accounts.as_deref() {
+            let mut bad_withdrawal_addrs: Vec<String> = Vec::new();
+            for proposal in &tx.body.proposal_procedures {
+                if let GovAction::TreasuryWithdrawals { withdrawals, .. } = &proposal.gov_action {
+                    for withdrawal_addr in withdrawals.keys() {
+                        // Reward addresses are 29 bytes: 1-byte header +
+                        // 28-byte credential hash. Header bit 4 (0x10):
+                        // 0=key credential, 1=script credential. We use
+                        // the 28-byte hash plus the type tag to form the
+                        // `Hash32` key used by reward_accounts (mirrors
+                        // `Credential::to_typed_hash32`).
+                        if withdrawal_addr.len() < 29 {
+                            // Malformed addr — leave to other predicates.
+                            continue;
+                        }
+                        let is_script = (withdrawal_addr[0] & 0x10) != 0;
+                        let tag: u8 = if is_script { 0x01 } else { 0x00 };
+                        let mut key_bytes = [0u8; 32];
+                        key_bytes[..28].copy_from_slice(&withdrawal_addr[1..29]);
+                        key_bytes[28] = tag;
+                        let key = dugite_primitives::hash::Hash::<32>::from_bytes(key_bytes);
+                        if !reward_accounts.contains_key(&key) {
+                            let addr_hex = withdrawal_addr.iter().fold(
+                                String::with_capacity(withdrawal_addr.len() * 2),
+                                |mut s, b| {
+                                    use std::fmt::Write;
+                                    let _ = write!(s, "{b:02x}");
+                                    s
+                                },
+                            );
+                            bad_withdrawal_addrs.push(addr_hex);
+                        }
+                    }
+                }
+            }
+            if !bad_withdrawal_addrs.is_empty() {
+                extra_errors.push(
+                    ValidationError::TreasuryWithdrawalReturnAccountsDoNotExist {
+                        bad_addrs: bad_withdrawal_addrs,
+                    },
+                );
+            }
         }
     }
 
