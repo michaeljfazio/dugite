@@ -8,6 +8,7 @@ description = "Ouroboros network mini-protocols for Dugite"
 dugite-primitives = { workspace = true }
 dugite-crypto = { workspace = true }
 dugite-serialization = { workspace = true }
+dugite-consensus = { workspace = true }
 tokio = { workspace = true }
 tokio-util = { workspace = true }
 futures = { workspace = true }
