@@ -167,6 +167,10 @@ pub struct PeerConnection {
     /// Reference:
     /// `ouroboros-network/lib/Ouroboros/Network/PeerSharing.hs` —
     /// `peerSharingClient` / `PeerSharingController`.
+    // Allow dead-code under `feature = "test-utils"` — the field is read by
+    // the binary's `connection_lifecycle` module, which is not exposed via
+    // the lib crate when `test-utils` re-exports `peer_connection`.
+    #[allow(dead_code)]
     pub(crate) peersharing_client_channel: Option<MuxChannel>,
 
     // ── Server protocol channels ──
@@ -950,6 +954,11 @@ impl PeerConnection {
     /// connection, or already taken by a running task).  For inbound connections
     /// that were accepted with `initiator_only = true`, the initiator-direction
     /// channels are `None` and this correctly returns `None`.
+    // Allow dead-code: only called from the binary's
+    // `connection_lifecycle.rs`, which is not part of the lib crate when
+    // built with `--all-features` (test-utils re-exports peer_connection
+    // only).
+    #[allow(dead_code)]
     pub(crate) fn take_peersharing_client_channel(&mut self) -> Option<MuxChannel> {
         self.peersharing_client_channel.take()
     }
