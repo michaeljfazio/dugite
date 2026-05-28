@@ -249,10 +249,10 @@ implementation. Results:
 |---|---|
 | ConflictingMetadataHash (Shelley.7) | aux-data hash verification — search returned no match |
 | InvalidMetadata (Shelley.8) | aux-data CBOR decode validation — search returned no match |
-| MalformedScriptWitnesses (Babbage.2) | `validScript pv` per witness — no match |
-| MalformedReferenceScripts (Babbage.3) | same predicate for ref-input scripts — no match |
+| ~~MalformedScriptWitnesses (Babbage.2)~~ | **FIXED** in `9ee6164d9` — `validation/scripts.rs::check_malformed_script_witnesses` |
+| ~~MalformedReferenceScripts (Babbage.3)~~ | **FIXED** in `9ee6164d9` — `validation/scripts.rs::check_malformed_reference_scripts` |
 | OutputBootAddrAttrsTooBig (UTxO.10) | Byron bootstrap addr attr cap — no match |
-| ConwayDRepIncorrectRefund (DRep.4) | UnregDRep refund ≠ stored — no match |
+| ~~ConwayDRepIncorrectRefund (DRep.4)~~ | **FIXED** in `9222c9387` — `validation/mod.rs::validate_transaction_with_context` |
 | StakePoolRetirementWrongEpochPOOL (POOL.3) | retirement epoch out of `[curEpoch+1, curEpoch+eMax]` — no match |
 | PoolMissingRewardAccount (POOL.5) | malformed reward account on pool reg — no match |
 | ExpirationEpochTooSmall (GOV.7) | committee member expiry ≤ currentEpoch — no validation match |
@@ -260,7 +260,7 @@ implementation. Results:
 | TreasuryWithdrawalReturnAccountsDoNotExist (GOV.17) | withdrawal destinations registered — no match |
 | InvalidGuardrailsScriptHash (GOV.11) | constitution guardrails hash — partial match in `state/apply.rs:527, 625-646`; needs deeper read to confirm fully implemented |
 
-**12 predicates moved from 🔍 → ❌ (P2 follow-up).**
+**12 predicates moved from 🔍 → ❌, 3 resolved this session → 9 remaining ❌ (P2 follow-up).**
 
 ### Corrections to earlier ❌ markings (2026-05-28 session continued)
 
