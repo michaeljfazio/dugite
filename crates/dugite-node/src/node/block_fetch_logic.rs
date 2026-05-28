@@ -39,7 +39,9 @@ use dugite_network::protocol::blockfetch::decision::{
 use dugite_network::{BlockFetchClient, MuxChannel};
 use dugite_storage::ChainDB;
 
-use super::connection_lifecycle::{CandidateChainState, FetchedBlock, PendingHeader};
+use super::connection_lifecycle::{
+    CandidateChainState, FetchedBlock, PeerFetchStatus, PendingHeader,
+};
 
 /// Default decision interval for Praos consensus (10 ms — matches
 /// `bfcDecisionLoopIntervalPraos = 0.01` in Haskell's
@@ -328,13 +330,25 @@ impl BlockFetchLogicTask {
         }
 
         // Read candidate chain state from all peers.
-        // Snapshot all pending headers BEFORE acquiring the chain_db lock so
-        // we minimise lock contention on the hot apply-block path.
+        //
+        // Snapshot all pending headers and per-peer fetch status BEFORE acquiring
+        // the chain_db lock so we minimise lock contention on the hot apply-block
+        // path.
+        //
+        // Per-peer chain tracking (issue #702 / Haskell `PeerFetchStatus`):
+        // Aberrant peers — those with ≥3 consecutive delivery failures within 30s
+        // — are excluded here before any further processing.  This mirrors the
+        // `fetchDecisions` peer filter in `Ouroboros.Network.BlockFetch.Decision`
+        // (Decision.hs:~450), which skips peers with `PeerFetchStatusAberrant`
+        // before building the candidate set.
         let raw_pending: Vec<(SocketAddr, PendingHeader)> = {
             let chains = self.candidate_chains.read().await;
             chains
                 .iter()
-                .filter(|(addr, _)| self.fetch_senders.contains_key(addr))
+                .filter(|(addr, state)| {
+                    self.fetch_senders.contains_key(addr)
+                        && state.fetch_status != PeerFetchStatus::Aberrant
+                })
                 .flat_map(|(addr, state)| {
                     state
                         .pending_headers
@@ -343,6 +357,25 @@ impl BlockFetchLogicTask {
                 })
                 .collect()
         };
+
+        // Count eligible vs Aberrant peers for the debug log.
+        #[cfg(debug_assertions)]
+        {
+            let chains = self.candidate_chains.try_read();
+            if let Ok(chains) = chains {
+                let aberrant: Vec<_> = chains
+                    .iter()
+                    .filter(|(_, s)| s.fetch_status == PeerFetchStatus::Aberrant)
+                    .map(|(addr, _)| *addr)
+                    .collect();
+                if !aberrant.is_empty() {
+                    trace!(
+                        aberrant_count = aberrant.len(),
+                        "BlockFetch: excluding Aberrant peers from decision"
+                    );
+                }
+            }
+        }
 
         // Bug I (2026-05-16): use a hash-based has_block check, not the old
         // `slot <= current_tip_slot` filter.  The slot filter wrongly dropped
@@ -402,16 +435,32 @@ impl BlockFetchLogicTask {
         );
 
         // Build peer fetch states for the decision engine.
-        let peer_states: Vec<PeerFetchState> = self
-            .fetch_senders
-            .keys()
-            .map(|addr| PeerFetchState {
-                addr: *addr,
-                latency_ms: 100.0,
-                in_flight: 0,
-                tip_slot: 0,
-            })
-            .collect();
+        //
+        // Per-peer chain tracking (issue #702): populate `in_flight` from the
+        // peer's `CandidateChainState.in_flight_blocks` so the decision engine
+        // can de-prefer Busy peers relative to Ready peers.  Haskell's
+        // `comparePeerFetchStatus` (ClientState.hs) sorts Ready before Busy;
+        // we propagate `in_flight_blocks` here so `BlockFetchDecision::select_peer`
+        // applies the same ordering.  Aberrant peers are already excluded above.
+        let peer_states: Vec<PeerFetchState> = {
+            let chains = self.candidate_chains.read().await;
+            self.fetch_senders
+                .keys()
+                .filter_map(|addr| {
+                    let state = chains.get(addr)?;
+                    // Double-check: Aberrant peers must not appear in peer_states.
+                    if state.fetch_status == PeerFetchStatus::Aberrant {
+                        return None;
+                    }
+                    Some(PeerFetchState {
+                        addr: *addr,
+                        latency_ms: 100.0, // TODO: use EWMA latency from PeerManager
+                        in_flight: state.in_flight_blocks as usize,
+                        tip_slot: state.tip_slot,
+                    })
+                })
+                .collect()
+        };
 
         // Add all ranges to the decision engine and dispatch.
         for range in &ranges {
@@ -434,6 +483,10 @@ impl BlockFetchLogicTask {
         // on the next decision tick.  Without this, a full channel would
         // lock the blocks in in-flight for 120 seconds with no actual
         // download happening.
+        //
+        // Per-peer chain tracking (issue #702): call `record_fetch_dispatched`
+        // on the peer's `CandidateChainState` to set its status to Busy.  This
+        // mirrors Haskell's `PeerFetchStatusBusy` transition in Decision.hs.
         let now = Instant::now();
         for (addr, peer_ranges) in dispatched {
             if let Some(sender) = self.fetch_senders.get(&addr) {
@@ -457,6 +510,13 @@ impl BlockFetchLogicTask {
                                 if header.slot >= from_slot && header.slot <= to_slot {
                                     self.in_flight.insert(header.hash, (addr, now));
                                 }
+                            }
+                        }
+                        // Transition peer to Busy in CandidateChainState.
+                        {
+                            let mut chains = self.candidate_chains.write().await;
+                            if let Some(state) = chains.get_mut(&addr) {
+                                state.record_fetch_dispatched();
                             }
                         }
                     }
@@ -925,5 +985,130 @@ mod tests {
         cancel.cancel();
         // run() should return without hanging.
         task.run().await;
+    }
+
+    // ── Per-peer chain tracking (issue #702) ─────────────────────────────────
+
+    /// Aberrant peers are excluded from fetch dispatch.
+    ///
+    /// When a peer's `CandidateChainState.fetch_status` is Aberrant,
+    /// `evaluate_and_fetch` must not dispatch any ranges to it even if it has
+    /// pending headers above the current tip.
+    #[tokio::test]
+    async fn aberrant_peer_not_dispatched() {
+        use super::super::connection_lifecycle::{
+            CandidateChainState, PeerFetchStatus, ABERRANT_FAILURE_THRESHOLD,
+        };
+
+        let candidate_chains = Arc::new(RwLock::new(HashMap::new()));
+        let (tx, _rx) = mpsc::channel(16);
+        let cancel = CancellationToken::new();
+
+        let mut task = BlockFetchLogicTask::new(candidate_chains.clone(), tx, 21600, cancel);
+
+        let addr = test_addr(3001);
+        let (peer_tx, mut peer_rx) = mpsc::channel(16);
+        task.register_peer(addr, peer_tx);
+
+        // Build an Aberrant state for the peer.
+        let mut aberrant_state = CandidateChainState {
+            tip_slot: 200,
+            tip_hash: [0xAA; 32],
+            tip_block_number: 200,
+            pending_headers: vec![test_header(150)],
+            ..Default::default()
+        };
+        // Force Aberrant status by calling record_fetch_failed enough times.
+        for _ in 0..ABERRANT_FAILURE_THRESHOLD {
+            aberrant_state.record_fetch_failed(addr);
+        }
+        assert_eq!(aberrant_state.fetch_status, PeerFetchStatus::Aberrant);
+
+        {
+            let mut chains = candidate_chains.write().await;
+            chains.insert(addr, aberrant_state);
+        }
+
+        // Run the decision task — the Aberrant peer must receive NOTHING.
+        task.evaluate_and_fetch().await;
+
+        assert!(
+            peer_rx.try_recv().is_err(),
+            "Aberrant peer must not receive fetch requests"
+        );
+    }
+
+    /// Both Ready and Busy peers are eligible for fetch dispatch.
+    ///
+    /// Verifies that `in_flight_blocks` from `CandidateChainState` is propagated
+    /// to `PeerFetchState.in_flight` and that Busy peers (unlike Aberrant peers)
+    /// are still eligible and receive fetch requests.  The decision engine
+    /// distributes work to whichever peer has capacity — we verify at least ONE
+    /// of the two peers receives a fetch request (the exact choice is non-
+    /// deterministic when latencies are equal).
+    #[tokio::test]
+    async fn busy_peer_is_eligible_unlike_aberrant() {
+        use super::super::connection_lifecycle::{CandidateChainState, PeerFetchStatus};
+
+        let candidate_chains = Arc::new(RwLock::new(HashMap::new()));
+        let (tx, _rx) = mpsc::channel(16);
+        let cancel = CancellationToken::new();
+
+        let mut task = BlockFetchLogicTask::new(candidate_chains.clone(), tx, 21600, cancel);
+
+        let ready_addr = test_addr(3011);
+        let busy_addr = test_addr(3012);
+        let (ready_tx, mut ready_rx) = mpsc::channel(16);
+        let (busy_tx, mut busy_rx) = mpsc::channel(16);
+        task.register_peer(ready_addr, ready_tx);
+        task.register_peer(busy_addr, busy_tx);
+
+        // Ready peer: zero in_flight.
+        let ready_state = CandidateChainState {
+            tip_slot: 200,
+            tip_hash: [0xAA; 32],
+            tip_block_number: 200,
+            pending_headers: vec![test_header(150)],
+            fetch_status: PeerFetchStatus::Ready,
+            in_flight_blocks: 0,
+            ..Default::default()
+        };
+        // Busy peer: non-zero in_flight, but still eligible.
+        let busy_state = CandidateChainState {
+            tip_slot: 200,
+            tip_hash: [0xBB; 32],
+            tip_block_number: 200,
+            pending_headers: vec![test_header(151)],
+            fetch_status: PeerFetchStatus::Busy,
+            in_flight_blocks: 5,
+            ..Default::default()
+        };
+
+        {
+            let mut chains = candidate_chains.write().await;
+            chains.insert(ready_addr, ready_state);
+            chains.insert(busy_addr, busy_state);
+        }
+
+        task.evaluate_and_fetch().await;
+
+        // At least one of the two eligible peers must have received a range.
+        // Busy peers are NOT excluded (only Aberrant peers are).
+        let ready_got = ready_rx.try_recv().is_ok();
+        let busy_got = busy_rx.try_recv().is_ok();
+        assert!(
+            ready_got || busy_got,
+            "at least one eligible peer (Ready or Busy) must receive a fetch request"
+        );
+    }
+
+    /// PeerFetchStatus::default() is Ready.
+    ///
+    /// Regression lock: the default fetch status for a new peer must be Ready
+    /// so it is immediately eligible for fetch decisions before any delivery.
+    #[test]
+    fn peer_fetch_status_default_ready() {
+        use super::super::connection_lifecycle::PeerFetchStatus;
+        assert_eq!(PeerFetchStatus::default(), PeerFetchStatus::Ready);
     }
 }

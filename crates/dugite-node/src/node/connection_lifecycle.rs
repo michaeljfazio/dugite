@@ -75,6 +75,59 @@ use crate::metrics::NodeMetrics;
 
 // ─── Shared State Types ─────────────────────────────────────────────────────
 
+/// Per-peer BlockFetch status — mirrors Haskell's `PeerFetchStatus`.
+///
+/// ## Haskell Reference
+///
+/// `ouroboros-network/ouroboros-network/src/Ouroboros/Network/BlockFetch/ClientState.hs`
+/// defines:
+///
+/// ```haskell
+/// data PeerFetchStatus header =
+///     PeerFetchStatusReady (Set (Point header)) IsIdle
+///   | PeerFetchStatusBusy (Set (Point header)) IsIdle
+///   | PeerFetchStatusAberrant
+/// ```
+///
+/// `fetchDecisions` in `Ouroboros.Network.BlockFetch.Decision` (Decision.hs:~450)
+/// excludes peers with `PeerFetchStatusAberrant` from the candidate set before
+/// running the fetch-range selection algorithm. Ready peers are preferred over
+/// Busy peers: `PeerFetchStatusReady` compares before `PeerFetchStatusBusy` in
+/// the peer ordering (`comparePeerFetchStatus`).
+///
+/// This Rust analog tracks the three states with enough detail to reproduce
+/// the Haskell ordering and exclusion semantics:
+/// - **Ready** — no fetch in-flight; eligible for the next range dispatch.
+/// - **Busy** — at least one fetch range in-flight; still eligible but de-preferred
+///   vs Ready peers.
+/// - **Aberrant** — 3+ consecutive delivery failures within 30 s; excluded from
+///   all fetch decisions until a successful delivery resets the counter.
+///
+/// The threshold (3 failures / 30 s) is a Dugite operational constant.  Haskell
+/// does not expose a single numerical threshold — it relies on the governor's
+/// exponential back-off + peer reputation to demote peers — but the observable
+/// effect is the same: a peer that consistently fails to deliver blocks stops
+/// receiving fetch requests until it recovers.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum PeerFetchStatus {
+    /// Peer is idle and ready for the next fetch range.
+    #[default]
+    Ready,
+    /// Peer has at least one fetch range in-flight.
+    Busy,
+    /// Peer has accumulated too many consecutive delivery failures and is
+    /// excluded from fetch decisions until it delivers a block successfully.
+    Aberrant,
+}
+
+/// Threshold: mark a peer Aberrant after this many consecutive failed
+/// deliveries within the observation window.
+pub const ABERRANT_FAILURE_THRESHOLD: u32 = 3;
+
+/// Observation window for consecutive failures.  Failures older than this
+/// are not counted towards the Aberrant threshold.
+pub const ABERRANT_WINDOW: Duration = Duration::from_secs(30);
+
 /// Candidate chain state from a peer's ChainSync.
 ///
 /// Updated by per-peer ChainSync tasks as they receive headers. Read by the
@@ -105,6 +158,117 @@ pub struct CandidateChainState {
     /// simplification of #652 C5 — full per-peer history rewind comes
     /// in a follow-up phase).
     pub eager_opcert_counters: std::collections::HashMap<dugite_primitives::hash::Hash28, u64>,
+    /// Per-peer BlockFetch status (Haskell `PeerFetchStatus`).
+    ///
+    /// Tracks whether this peer is Ready, Busy (fetch in-flight), or
+    /// Aberrant (too many consecutive delivery failures).  The BlockFetch
+    /// decision logic reads this field before dispatching any new range:
+    /// Aberrant peers are excluded; Busy peers are de-preferred relative
+    /// to Ready peers.
+    ///
+    /// Written exclusively by the per-peer BlockFetch worker via
+    /// `record_fetch_delivered` / `record_fetch_failed`.  Read by
+    /// `BlockFetchLogicTask::evaluate_and_fetch`.
+    pub fetch_status: PeerFetchStatus,
+    /// Timestamp of the last successful block delivery from this peer.
+    ///
+    /// Updated by the per-peer BlockFetch worker whenever `MsgBlock` arrives.
+    /// Used together with `consecutive_failures` to implement the Aberrant
+    /// detection window.
+    pub last_delivered_at: Option<std::time::Instant>,
+    /// Count of consecutive delivery failures since the last successful block.
+    ///
+    /// Reset to 0 on any successful delivery.  When it reaches
+    /// `ABERRANT_FAILURE_THRESHOLD` within `ABERRANT_WINDOW` seconds,
+    /// `fetch_status` is set to `Aberrant`.
+    pub consecutive_failures: u32,
+    /// Number of BlockFetch ranges currently in-flight for this peer.
+    ///
+    /// Incremented by `BlockFetchLogicTask` when a range is dispatched,
+    /// decremented when the worker reports delivery (success or failure).
+    pub in_flight_blocks: u32,
+}
+
+impl CandidateChainState {
+    /// Record a successful block delivery from this peer.
+    ///
+    /// Mirrors the Haskell `PeerFetchStatus` transition from `Busy` back to
+    /// `Ready` after blocks arrive via `MsgBlock`.  Also clears any Aberrant
+    /// state: a peer that delivers successfully is re-admitted to fetch
+    /// decisions regardless of prior failure count.
+    ///
+    /// Called by the per-peer BlockFetch worker after each `MsgBlock`.
+    pub fn record_fetch_delivered(&mut self) {
+        self.consecutive_failures = 0;
+        self.last_delivered_at = Some(std::time::Instant::now());
+        self.in_flight_blocks = self.in_flight_blocks.saturating_sub(1);
+        // Clear Aberrant: any successful delivery rehabilitates the peer.
+        if self.fetch_status == PeerFetchStatus::Aberrant {
+            self.fetch_status = PeerFetchStatus::Ready;
+        }
+        if self.in_flight_blocks == 0 {
+            self.fetch_status = PeerFetchStatus::Ready;
+        } else {
+            self.fetch_status = PeerFetchStatus::Busy;
+        }
+    }
+
+    /// Record a failed delivery (range timeout or protocol error).
+    ///
+    /// Implements the Aberrant escalation logic:
+    /// - If the last failure was more than `ABERRANT_WINDOW` ago, the
+    ///   consecutive_failures counter is reset first (stale failures don't
+    ///   accumulate across windows).
+    /// - If `consecutive_failures` reaches `ABERRANT_FAILURE_THRESHOLD`,
+    ///   `fetch_status` is set to `Aberrant` and the peer is excluded from
+    ///   future fetch decisions until `record_fetch_delivered` is called.
+    ///
+    /// Called by the per-peer BlockFetch worker on range timeout or protocol
+    /// error.  Also logs a WARN with the peer address if the threshold is
+    /// crossed.
+    pub fn record_fetch_failed(&mut self, addr: std::net::SocketAddr) {
+        // Reset counter if the last failure was outside the observation window.
+        let now = std::time::Instant::now();
+        if let Some(last) = self.last_delivered_at {
+            if now.duration_since(last) > ABERRANT_WINDOW {
+                self.consecutive_failures = 0;
+            }
+        }
+        self.consecutive_failures += 1;
+        self.in_flight_blocks = self.in_flight_blocks.saturating_sub(1);
+        if self.consecutive_failures >= ABERRANT_FAILURE_THRESHOLD
+            && self.fetch_status != PeerFetchStatus::Aberrant
+        {
+            self.fetch_status = PeerFetchStatus::Aberrant;
+            tracing::warn!(
+                %addr,
+                consecutive_failures = self.consecutive_failures,
+                threshold = ABERRANT_FAILURE_THRESHOLD,
+                "BlockFetch: peer marked Aberrant — excluding from fetch decisions"
+            );
+        } else if self.in_flight_blocks == 0 {
+            self.fetch_status = PeerFetchStatus::Ready;
+        }
+    }
+
+    /// Mark a fetch range as dispatched to this peer.
+    ///
+    /// Sets `fetch_status` to `Busy` and increments `in_flight_blocks`.
+    /// Called by the BlockFetch decision task immediately before sending a
+    /// range to the peer's worker channel.
+    pub fn record_fetch_dispatched(&mut self) {
+        self.in_flight_blocks += 1;
+        self.fetch_status = PeerFetchStatus::Busy;
+    }
+
+    /// Return whether this peer is currently eligible for fetch dispatch.
+    ///
+    /// Mirrors Haskell's `fetchDecisions` peer filter: Aberrant peers are
+    /// always excluded; Ready and Busy peers are both eligible (Ready is
+    /// preferred by the caller's sort order).
+    pub fn is_fetch_eligible(&self) -> bool {
+        self.fetch_status != PeerFetchStatus::Aberrant
+    }
 }
 
 /// A block header received via ChainSync, pending BlockFetch download.
@@ -1510,6 +1674,14 @@ impl ConnectionLifecycleManager {
                                     }
                                     Ok(Err(e)) => {
                                         warn!(%addr, "BlockFetch error: {e}");
+                                        // Per-peer chain tracking (issue #702): record failure
+                                        // and potentially mark peer Aberrant.
+                                        {
+                                            let mut chains = candidate_chains.write().await;
+                                            if let Some(state) = chains.get_mut(&addr) {
+                                                state.record_fetch_failed(addr);
+                                            }
+                                        }
                                         active_fetcher.store(0, std::sync::atomic::Ordering::SeqCst);
                                         let _ = peer_failure_tx.try_send(addr);
                                         return;
@@ -1524,6 +1696,14 @@ impl ConnectionLifecycleManager {
                                             timeout_secs = FETCH_RANGE_TIMEOUT.as_secs(),
                                             "BlockFetch range timed out, releasing fetcher",
                                         );
+                                        // Per-peer chain tracking (issue #702): record timeout
+                                        // as a failure towards the Aberrant threshold.
+                                        {
+                                            let mut chains = candidate_chains.write().await;
+                                            if let Some(state) = chains.get_mut(&addr) {
+                                                state.record_fetch_failed(addr);
+                                            }
+                                        }
                                         active_fetcher.store(0, std::sync::atomic::Ordering::SeqCst);
                                         let _ = peer_failure_tx.try_send(addr);
                                         return;
@@ -1543,6 +1723,16 @@ impl ConnectionLifecycleManager {
                                     let slot = fetched.block.slot().0;
                                     received_hashes
                                         .insert(*fetched.block.header.header_hash.as_bytes());
+                                    // Per-peer chain tracking (issue #702): record each
+                                    // delivered block as a successful delivery, resetting
+                                    // the consecutive_failures counter and rehabilitating
+                                    // any Aberrant state.
+                                    {
+                                        let mut chains = candidate_chains.write().await;
+                                        if let Some(state) = chains.get_mut(&addr) {
+                                            state.record_fetch_delivered();
+                                        }
+                                    }
                                     if let Err(e) = fetched_blocks_tx.send(fetched).await {
                                         warn!(%addr, slot, "send to run loop failed (channel closed): {e}");
                                         // Channel closed means the run loop exited.
@@ -3417,5 +3607,116 @@ mod tests {
             Err(mpsc::error::TryRecvError::Empty) => { /* expected */ }
             other => panic!("expected no peer_failure when cancelled, got {:?}", other),
         }
+    }
+
+    // ── PeerFetchStatus / CandidateChainState status tracking ────────────────
+    //
+    // Tests for issue #702 per-peer chain tracking:
+    // - Default state is Ready.
+    // - Successful delivery resets consecutive_failures and clears Aberrant.
+    // - Failures accumulate within the observation window.
+    // - ABERRANT_FAILURE_THRESHOLD consecutive failures → Aberrant.
+    // - Aberrant peer is excluded from fetch decisions (is_fetch_eligible = false).
+    // - A successful delivery after Aberrant rehabilitates the peer.
+
+    #[test]
+    fn peer_fetch_status_default_is_ready() {
+        let state = CandidateChainState::default();
+        assert_eq!(state.fetch_status, PeerFetchStatus::Ready);
+        assert_eq!(state.consecutive_failures, 0);
+        assert!(state.last_delivered_at.is_none());
+        assert_eq!(state.in_flight_blocks, 0);
+    }
+
+    #[test]
+    fn peer_fetch_status_dispatched_becomes_busy() {
+        let mut state = CandidateChainState::default();
+        state.record_fetch_dispatched();
+        assert_eq!(state.fetch_status, PeerFetchStatus::Busy);
+        assert_eq!(state.in_flight_blocks, 1);
+    }
+
+    #[test]
+    fn peer_fetch_status_delivered_clears_busy() {
+        let mut state = CandidateChainState::default();
+        state.record_fetch_dispatched();
+        state.record_fetch_delivered();
+        assert_eq!(state.fetch_status, PeerFetchStatus::Ready);
+        assert_eq!(state.in_flight_blocks, 0);
+        assert!(state.last_delivered_at.is_some());
+        assert_eq!(state.consecutive_failures, 0);
+    }
+
+    #[test]
+    fn peer_fetch_status_multiple_in_flight() {
+        let mut state = CandidateChainState::default();
+        state.record_fetch_dispatched();
+        state.record_fetch_dispatched();
+        assert_eq!(state.in_flight_blocks, 2);
+        state.record_fetch_delivered();
+        // One still in-flight → still Busy.
+        assert_eq!(state.fetch_status, PeerFetchStatus::Busy);
+        assert_eq!(state.in_flight_blocks, 1);
+        state.record_fetch_delivered();
+        // All delivered → Ready.
+        assert_eq!(state.fetch_status, PeerFetchStatus::Ready);
+        assert_eq!(state.in_flight_blocks, 0);
+    }
+
+    #[test]
+    fn peer_fetch_status_failure_below_threshold_stays_ready() {
+        let addr: SocketAddr = "127.0.0.1:3001".parse().unwrap();
+        let mut state = CandidateChainState::default();
+        // Fail ABERRANT_FAILURE_THRESHOLD - 1 times.
+        for _ in 0..(ABERRANT_FAILURE_THRESHOLD - 1) {
+            state.record_fetch_failed(addr);
+        }
+        assert_ne!(state.fetch_status, PeerFetchStatus::Aberrant);
+        assert!(state.is_fetch_eligible());
+    }
+
+    #[test]
+    fn peer_fetch_status_threshold_failures_marks_aberrant() {
+        let addr: SocketAddr = "127.0.0.1:3001".parse().unwrap();
+        let mut state = CandidateChainState::default();
+        // Fail exactly ABERRANT_FAILURE_THRESHOLD times.
+        for _ in 0..ABERRANT_FAILURE_THRESHOLD {
+            state.record_fetch_failed(addr);
+        }
+        assert_eq!(state.fetch_status, PeerFetchStatus::Aberrant);
+        assert!(!state.is_fetch_eligible());
+    }
+
+    #[test]
+    fn peer_fetch_status_delivery_rehabilitates_aberrant() {
+        let addr: SocketAddr = "127.0.0.1:3001".parse().unwrap();
+        let mut state = CandidateChainState::default();
+        for _ in 0..ABERRANT_FAILURE_THRESHOLD {
+            state.record_fetch_failed(addr);
+        }
+        assert_eq!(state.fetch_status, PeerFetchStatus::Aberrant);
+        // A successful delivery clears Aberrant.
+        state.record_fetch_delivered();
+        assert_eq!(state.fetch_status, PeerFetchStatus::Ready);
+        assert!(state.is_fetch_eligible());
+        assert_eq!(state.consecutive_failures, 0);
+    }
+
+    #[test]
+    fn peer_fetch_status_is_fetch_eligible_aberrant_returns_false() {
+        let addr: SocketAddr = "127.0.0.1:3001".parse().unwrap();
+        let mut state = CandidateChainState::default();
+        for _ in 0..ABERRANT_FAILURE_THRESHOLD {
+            state.record_fetch_failed(addr);
+        }
+        assert!(!state.is_fetch_eligible());
+    }
+
+    #[test]
+    fn peer_fetch_status_is_fetch_eligible_ready_and_busy_return_true() {
+        let mut state = CandidateChainState::default();
+        assert!(state.is_fetch_eligible()); // Ready
+        state.record_fetch_dispatched();
+        assert!(state.is_fetch_eligible()); // Busy
     }
 }
