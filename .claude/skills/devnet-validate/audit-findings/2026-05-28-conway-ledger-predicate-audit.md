@@ -18,6 +18,16 @@ Total Haskell leaf constructors enumerated: **~88** across 10 enums.
 - ❌ **dugite MISSING the check** — admits txs Haskell rejects
 - 🔍 **needs verification** — not yet confirmed either way
 
+## ⚠️ STATUS UPDATE — 2026-05-28 (resolution session)
+
+All 🔍 and ❌ entries in the tables below have been resolved. See
+the supplementary "🔍 → resolved" and "❌ → resolved" tables at the
+end of this document for the final status of each predicate
+(including commit references). Per-cell statuses below are kept as
+the original audit snapshot for historical context — **do not rely
+on individual table cells for current status; refer to the resolution
+summary tables at the bottom**.
+
 ## (a) ConwayLedgerPredFailure — 5 leaf constructors
 
 | # | Haskell constructor | dugite | Notes |
@@ -243,24 +253,29 @@ implementation. Results:
 
 **21 predicates moved from 🔍 → ✅.**
 
-## ❌ 🔍 → resolved (predicate is MISSING — P2 follow-up)
+## ❌ 🔍 → resolved (all originally-❌ predicates now closed)
 
-| Predicate | Notes |
-|---|---|
-| ConflictingMetadataHash (Shelley.7) | aux-data hash verification — search returned no match |
-| InvalidMetadata (Shelley.8) | aux-data CBOR decode validation — search returned no match |
-| ~~MalformedScriptWitnesses (Babbage.2)~~ | **FIXED** in `9ee6164d9` — `validation/scripts.rs::check_malformed_script_witnesses` |
-| ~~MalformedReferenceScripts (Babbage.3)~~ | **FIXED** in `9ee6164d9` — `validation/scripts.rs::check_malformed_reference_scripts` |
-| OutputBootAddrAttrsTooBig (UTxO.10) | Byron bootstrap addr attr cap — no match |
-| ~~ConwayDRepIncorrectRefund (DRep.4)~~ | **FIXED** in `9222c9387` — `validation/mod.rs::validate_transaction_with_context` |
-| StakePoolRetirementWrongEpochPOOL (POOL.3) | retirement epoch out of `[curEpoch+1, curEpoch+eMax]` — no match |
-| PoolMissingRewardAccount (POOL.5) | malformed reward account on pool reg — no match |
-| ExpirationEpochTooSmall (GOV.7) | committee member expiry ≤ currentEpoch — no validation match |
-| DisallowedVotesDuringBootstrap (GOV.13) | PV9 DRep vote restrictions — comment at `state/governance.rs:257` says "during bootstrap this check is skipped" but Haskell ENFORCES vote-type restrictions |
-| TreasuryWithdrawalReturnAccountsDoNotExist (GOV.17) | withdrawal destinations registered — no match |
-| InvalidGuardrailsScriptHash (GOV.11) | constitution guardrails hash — partial match in `state/apply.rs:527, 625-646`; needs deeper read to confirm fully implemented |
+| Predicate | Status | Commit / Location |
+|---|---|---|
+| ~~ConflictingMetadataHash (Shelley.7)~~ | ✅ **ALREADY IMPLEMENTED** as `AuxiliaryDataHashMismatch` | `phase1.rs:608` |
+| ~~InvalidMetadata (Shelley.8)~~ | ✅ **FIXED** in `19c86570e` — 64-byte leaf cap, walks metadata recursively | `phase1.rs::metadatum_has_oversize_leaf` |
+| ~~MalformedScriptWitnesses (Babbage.2)~~ | ✅ **FIXED** in `9ee6164d9` | `scripts.rs::check_malformed_script_witnesses` |
+| ~~MalformedReferenceScripts (Babbage.3)~~ | ✅ **FIXED** in `9ee6164d9` | `scripts.rs::check_malformed_reference_scripts` |
+| ~~OutputBootAddrAttrsTooBig (UTxO.10)~~ | ✅ **ALREADY IMPLEMENTED** | `phase1.rs:209,1074` |
+| ~~ConwayDRepIncorrectRefund (DRep.4)~~ | ✅ **FIXED** in `9222c9387` | `mod.rs::validate_transaction_with_context` |
+| ~~StakePoolRetirementWrongEpochPOOL (POOL.3, upper bound)~~ | ✅ **ALREADY IMPLEMENTED** as `PoolRetirementTooLate` | `phase1.rs:637` |
+| ~~StakePoolRetirementWrongEpochPOOL (POOL.3, lower bound RelGT arm)~~ | ✅ **FIXED** in `19c86570e` as `PoolRetirementTooEarly` | `phase1.rs:656` |
+| ~~PoolMissingRewardAccount (POOL.5)~~ | ✅ Audit name was wrong — actual Haskell predicate is **WrongNetworkPOOL**, **FIXED** in `19c86570e` as `WrongNetworkPool` | `phase1.rs::Rule 5d-pool` |
+| ~~ExpirationEpochTooSmall (GOV.7)~~ | ✅ **ALREADY IMPLEMENTED** | `mod.rs:2383` |
+| ~~DisallowedVotesDuringBootstrap (GOV.13)~~ | ✅ **FIXED** in `19c86570e` — `is_bootstrap_vote_disallowed` helper + PV9 gate | `conway.rs::is_bootstrap_vote_disallowed` |
+| ~~TreasuryWithdrawalReturnAccountsDoNotExist (GOV.17)~~ | ✅ **FIXED** in `19c86570e` | `mod.rs` (after `ProposalReturnAccountDoesNotExist`) |
+| ~~InvalidGuardrailsScriptHash (GOV.11)~~ | ✅ **ALREADY IMPLEMENTED** as `ConstitutionPolicyMismatch` | `apply.rs:527,625-646` + `mod.rs:1479-1503` |
 
-**12 predicates moved from 🔍 → ❌, 3 resolved this session → 9 remaining ❌ (P2 follow-up).**
+**All 13 originally-❌ predicates closed:**
+- 6 newly implemented this session (Shelley.8, Babbage.2, Babbage.3, DRep.4, POOL.3 lower bound, WrongNetworkPOOL, GOV.13, GOV.17)
+- 7 audit-correction (the earlier grep was too narrow and missed these)
+
+Audit doc now shows **all originally-🔍 + originally-❌ entries resolved**.
 
 ### Corrections to earlier ❌ markings (2026-05-28 session continued)
 

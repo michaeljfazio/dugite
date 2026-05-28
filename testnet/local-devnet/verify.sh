@@ -171,6 +171,24 @@ p2_per_bp_attribution() {
             printf 'pool1_forges\t%s\n' "$p1_forges"
             printf 'pool2_forges\t%s\n' "$p2_forges"
         } > "$(dirname "$blocks")/forge-attribution.tsv"
+    elif [ "${LD_P2_SMALL_STAKE_POOL2:-0}" = "1" ] \
+         && [ "$p1_forges" -ge 3 ] \
+         && [ "$p2_forges" -eq 0 ]; then
+        # Opt-in: multi-pool topology where the operator has declared
+        # pool2 as having a very small stake share (e.g. <10%) and
+        # accepts that pool2 may not win a leader lottery within the
+        # soak window. The Praos lottery is probabilistic:
+        # P(no forges in N slots | σ, f) = (1 - f*σ)^N. For σ=0.05,
+        # f=0.5, N=420: ~7e-6 — very rare. For σ=0.003: ~50% per
+        # round. Set `LD_P2_SMALL_STAKE_POOL2=1` when running a
+        # known-asymmetric topology so pool2=0 isn't flagged as a
+        # forge regression.
+        PREDICATE_PASS+=("p2:per-bp-attribution (multi-pool small-stake: pool1=$p1_forges, pool2=0 — LD_P2_SMALL_STAKE_POOL2=1)")
+        {
+            printf 'mode\tmulti-pool-skew\n'
+            printf 'pool1_forges\t%s\n' "$p1_forges"
+            printf 'pool2_forges\t%s\n' "$p2_forges"
+        } > "$(dirname "$blocks")/forge-attribution.tsv"
     else
         PREDICATE_FAIL+=("p2:per-bp-attribution (pool1=$p1_forges pool2=$p2_forges; need >=3 each)")
     fi
