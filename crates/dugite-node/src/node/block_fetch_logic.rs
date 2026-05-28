@@ -36,7 +36,7 @@ use dugite_network::codec::Point;
 use dugite_network::protocol::blockfetch::decision::{
     BlockFetchDecision, FetchRange, PeerFetchState,
 };
-use dugite_network::{BlockFetchClient, MuxChannel};
+use dugite_network::{BlockFetchClient, MuxChannel, PEER_LATENCY_DEFAULT_MS};
 use dugite_storage::ChainDB;
 
 use super::connection_lifecycle::{
@@ -162,6 +162,13 @@ pub struct BlockFetchLogicTask {
     /// and selects the optimal peer for each fetch.
     decision_engine: BlockFetchDecision,
 
+    /// Optional handle to the node peer manager, used to read per-peer EWMA
+    /// latency when building `PeerFetchState` for the decision engine.
+    ///
+    /// When `None` (unit tests that do not construct a real peer manager),
+    /// each peer falls back to [`PEER_LATENCY_DEFAULT_MS`].
+    peer_manager: Option<Arc<RwLock<super::networking::NodePeerManager>>>,
+
     /// Cancellation token for graceful shutdown.
     cancel: CancellationToken,
 }
@@ -175,17 +182,23 @@ impl BlockFetchLogicTask {
     /// * `fetched_blocks_tx` — Channel to send downloaded blocks to the run loop
     /// * `byron_epoch_length` — Byron epoch length for block deserialization
     /// * `cancel` — Cancellation token for graceful shutdown
+    ///
+    /// Peer latency defaults to [`PEER_LATENCY_DEFAULT_MS`] for all peers
+    /// (no real RTT data).  For production use, prefer
+    /// [`Self::new_with_chain_db`] or
+    /// [`Self::new_with_peer_manager`].
     pub fn new(
         candidate_chains: Arc<RwLock<HashMap<SocketAddr, CandidateChainState>>>,
         fetched_blocks_tx: mpsc::Sender<FetchedBlock>,
         byron_epoch_length: u64,
         cancel: CancellationToken,
     ) -> Self {
-        Self::new_with_chain_db(
+        Self::new_with_peer_manager(
             candidate_chains,
             fetched_blocks_tx,
             byron_epoch_length,
             cancel,
+            None,
             None,
         )
     }
@@ -205,6 +218,42 @@ impl BlockFetchLogicTask {
         cancel: CancellationToken,
         chain_db: Option<Arc<RwLock<ChainDB>>>,
     ) -> Self {
+        Self::new_with_peer_manager(
+            candidate_chains,
+            fetched_blocks_tx,
+            byron_epoch_length,
+            cancel,
+            chain_db,
+            None,
+        )
+    }
+
+    /// Full constructor that threads both a local ChainDB handle and a
+    /// [`NodePeerManager`] handle.
+    ///
+    /// The peer manager is queried once per decision tick (behind a
+    /// `read()` lock) to populate real EWMA latency values for each hot
+    /// peer.  Peers with no RTT sample yet fall back to
+    /// [`PEER_LATENCY_DEFAULT_MS`] (1 000 ms — matching Haskell's
+    /// `defaultGSV` g=500 ms × 2 for round-trip, from
+    /// `ouroboros-network/lib/Ouroboros/Network/DeltaQ.hs`).
+    ///
+    /// # Arguments
+    ///
+    /// * `candidate_chains` — Shared map of per-peer candidate chain state
+    /// * `fetched_blocks_tx` — Channel to send downloaded blocks to the run loop
+    /// * `byron_epoch_length` — Byron epoch length for block deserialization
+    /// * `cancel` — Cancellation token for graceful shutdown
+    /// * `chain_db` — Optional local chain store handle (skip already-stored blocks)
+    /// * `peer_manager` — Optional peer manager for EWMA latency lookup
+    pub fn new_with_peer_manager(
+        candidate_chains: Arc<RwLock<HashMap<SocketAddr, CandidateChainState>>>,
+        fetched_blocks_tx: mpsc::Sender<FetchedBlock>,
+        byron_epoch_length: u64,
+        cancel: CancellationToken,
+        chain_db: Option<Arc<RwLock<ChainDB>>>,
+        peer_manager: Option<Arc<RwLock<super::networking::NodePeerManager>>>,
+    ) -> Self {
         Self {
             candidate_chains,
             current_tip_slot: 0,
@@ -215,6 +264,7 @@ impl BlockFetchLogicTask {
             byron_epoch_length,
             in_flight: HashMap::new(),
             decision_engine: BlockFetchDecision::with_defaults(),
+            peer_manager,
             cancel,
         }
     }
@@ -442,6 +492,33 @@ impl BlockFetchLogicTask {
         // `comparePeerFetchStatus` (ClientState.hs) sorts Ready before Busy;
         // we propagate `in_flight_blocks` here so `BlockFetchDecision::select_peer`
         // applies the same ordering.  Aberrant peers are already excluded above.
+        //
+        // Issue #706: Populate latency_ms from PeerManager EWMA data rather than
+        // the previous hardcoded 100.0.  We snapshot the latency map under a
+        // short-lived read lock *before* acquiring the candidate_chains lock to
+        // avoid potential lock-ordering deadlocks.  Peers without a KeepAlive
+        // RTT sample yet fall back to PEER_LATENCY_DEFAULT_MS (1 000 ms), which
+        // matches Haskell's `defaultGSV` (g=500 ms × 2 for round-trip) from
+        // `ouroboros-network/lib/Ouroboros/Network/DeltaQ.hs`.
+        let latency_snapshot: HashMap<SocketAddr, f64> =
+            if let Some(pm_handle) = self.peer_manager.as_ref() {
+                let pm = pm_handle.read().await;
+                self.fetch_senders
+                    .keys()
+                    .map(|addr| {
+                        let lat = pm.peer_latency_ms(addr).unwrap_or(PEER_LATENCY_DEFAULT_MS);
+                        (*addr, lat)
+                    })
+                    .collect()
+            } else {
+                // No peer manager available (unit tests): seed all peers with
+                // the default.
+                self.fetch_senders
+                    .keys()
+                    .map(|addr| (*addr, PEER_LATENCY_DEFAULT_MS))
+                    .collect()
+            };
+
         let peer_states: Vec<PeerFetchState> = {
             let chains = self.candidate_chains.read().await;
             self.fetch_senders
@@ -452,9 +529,13 @@ impl BlockFetchLogicTask {
                     if state.fetch_status == PeerFetchStatus::Aberrant {
                         return None;
                     }
+                    let latency_ms = latency_snapshot
+                        .get(addr)
+                        .copied()
+                        .unwrap_or(PEER_LATENCY_DEFAULT_MS);
                     Some(PeerFetchState {
                         addr: *addr,
-                        latency_ms: 100.0, // TODO: use EWMA latency from PeerManager
+                        latency_ms,
                         in_flight: state.in_flight_blocks as usize,
                         tip_slot: state.tip_slot,
                     })
@@ -1110,5 +1191,96 @@ mod tests {
     fn peer_fetch_status_default_ready() {
         use super::super::connection_lifecycle::PeerFetchStatus;
         assert_eq!(PeerFetchStatus::default(), PeerFetchStatus::Ready);
+    }
+
+    // ── Issue #706: EWMA latency from PeerManager ────────────────────────────
+
+    /// Decision engine prefers lower-latency peer when in-flight counts tie.
+    ///
+    /// Two peers, same in_flight (0), different EWMA latency.  The decision
+    /// engine must dispatch the single queued range to the faster peer.
+    ///
+    /// This validates the fix for issue #706 via the `BlockFetchDecision`
+    /// engine directly (the decision layer is what `pump_decisions` calls,
+    /// so testing here gives deterministic, sync-friendly coverage).
+    #[test]
+    fn decision_engine_prefers_lower_latency_on_tied_in_flight() {
+        use dugite_network::protocol::blockfetch::decision::{BlockFetchDecision, PeerFetchState};
+
+        let slow_addr = test_addr(4001);
+        let fast_addr = test_addr(4002);
+
+        let mut engine = BlockFetchDecision::with_defaults();
+        engine.add_range(
+            Point::Specific(100, [0x10; 32]),
+            Point::Specific(200, [0x20; 32]),
+        );
+
+        // Both peers: zero in-flight (tie on capacity).
+        // Fast peer has 20 ms EWMA RTT; slow peer has 500 ms EWMA RTT.
+        let peers = vec![
+            PeerFetchState {
+                addr: slow_addr,
+                latency_ms: 500.0,
+                in_flight: 0,
+                tip_slot: 300,
+            },
+            PeerFetchState {
+                addr: fast_addr,
+                latency_ms: 20.0,
+                in_flight: 0,
+                tip_slot: 300,
+            },
+        ];
+
+        let (selected_addr, _range) = engine.select_peer(&peers).unwrap();
+        assert_eq!(
+            selected_addr, fast_addr,
+            "decision engine must prefer the lower-latency peer when in-flight counts tie"
+        );
+    }
+
+    /// When no PeerManager is provided the task falls back to PEER_LATENCY_DEFAULT_MS.
+    ///
+    /// Exercises the `peer_manager = None` path to ensure the fallback is
+    /// exercised in evaluate_and_fetch without panicking, and that the fetch
+    /// request is still dispatched correctly to the single peer.
+    #[tokio::test]
+    async fn ewma_fallback_to_default_when_no_peer_manager() {
+        let candidate_chains = Arc::new(RwLock::new(HashMap::new()));
+        let (tx, _rx) = mpsc::channel(16);
+        let cancel = CancellationToken::new();
+
+        // `new()` leaves peer_manager = None, exercising the default-latency path.
+        let mut task = BlockFetchLogicTask::new(candidate_chains.clone(), tx, 21600, cancel);
+
+        let addr = test_addr(5001);
+        let (peer_tx, mut peer_rx) = mpsc::channel(16);
+        task.register_peer(addr, peer_tx);
+
+        // Use a slot above 0 so it won't be filtered by the fallback slot check.
+        task.update_tip_slot(0);
+
+        {
+            let mut chains = candidate_chains.write().await;
+            chains.insert(
+                addr,
+                CandidateChainState {
+                    tip_slot: 300,
+                    tip_hash: [0xDE; 32],
+                    tip_block_number: 300,
+                    pending_headers: vec![test_header(250)],
+                    ..Default::default()
+                },
+            );
+        }
+
+        // Must dispatch without panicking even with no peer manager.
+        task.evaluate_and_fetch().await;
+
+        assert!(
+            peer_rx.try_recv().is_ok(),
+            "fetch request must be dispatched even when peer_manager is None (default latency path)"
+        );
     }
 }

@@ -45,6 +45,17 @@ const COLD_RETRY_MAX_EXP: u32 = 5;
 /// forgotten entirely. Matches Haskell `policyMaxConnectionRetries = 5`.
 pub const MAX_COLD_PEER_FAILURES: u32 = 5;
 
+/// Default EWMA latency seed (ms) for peers that have not yet produced a
+/// KeepAlive RTT sample.
+///
+/// Haskell's `defaultGSV` in `ouroboros-network/lib/Ouroboros/Network/DeltaQ.hs`
+/// uses `default_g = 500e-3` (500 ms one-way propagation delay).  Since
+/// dugite's EWMA tracks the full round-trip time (RTT = 2 × g), the
+/// equivalent seed is **1 000 ms**.  This ensures unmeasured peers are
+/// treated as high-latency until real KeepAlive data arrives, rather than
+/// being incorrectly preferred over peers with actual measurements.
+pub const PEER_LATENCY_DEFAULT_MS: f64 = 1_000.0;
+
 /// Information tracked for each known peer.
 #[derive(Debug, Clone)]
 pub struct PeerInfo {
@@ -286,6 +297,17 @@ impl PeerManager {
         for peer in self.peers.values_mut() {
             peer.decay_failures();
         }
+    }
+
+    /// Return the EWMA latency (ms) for a peer, or `None` if no RTT sample
+    /// has been recorded yet.
+    ///
+    /// Used by the BlockFetch decision engine to prefer lower-latency peers
+    /// when in-flight counts are equal.  Callers should fall back to a
+    /// reasonable seed (e.g. [`PEER_LATENCY_DEFAULT_MS`]) when this returns
+    /// `None`.
+    pub fn get_latency_ms(&self, addr: &SocketAddr) -> Option<f64> {
+        self.peers.get(addr).and_then(|p| p.latency_ms)
     }
 }
 
