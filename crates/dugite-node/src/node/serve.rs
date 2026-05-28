@@ -441,6 +441,16 @@ impl TxValidator for LedgerTxValidator {
             .with_committee_authorized_elected_hot_keys(committee_authorized_elected_hot_keys)
             .with_committee_members(committee_members)
             .with_committee_resigned(committee_resigned)
+            // Pass the live reward-accounts map (Arc::clone — refcount bump,
+            // not a deep copy) so the validator's
+            // `WithdrawalsNotInRewardsCERTS` / `ConwayIncompleteWithdrawals`
+            // checks fire at mempool admission. Round-1 retry surfaced a
+            // chain-divergence bug where dugite-relay admitted a 200K-ADA
+            // withdrawal for an account with insufficient rewards, dugite-bp
+            // forged the block, and cardano-bp rejected with
+            // `ConwayCertsFailure (WithdrawalsNotInRewardsCERTS ...)`.
+            // See audit-findings/2026-05-28-round1-retry.md.
+            .with_reward_accounts_arc(Arc::clone(&ledger.certs.reward_accounts))
             .with_network(self.network);
 
         // Compute the per-tx safe-zone horizon and inject it into the
