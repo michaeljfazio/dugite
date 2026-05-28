@@ -39,7 +39,7 @@ Do NOT invoke for unit tests (`just test`), public-testnet soak (`scripts/soak/`
 | `slotLength` | 1.0 s | Real-time slot pacing |
 | `epochLength` | 400 slots | ~6.7 min per epoch |
 | `activeSlotsCoeff` | 0.5 | ~200 expected blocks per epoch |
-| `securityParam` (k) | 60 | k=60, 3k/f = 360 ≤ 400 (stable) |
+| `securityParam` (k) | 40 | 3k/f=240 ≤ 400 (stable); 4k/f=320 ≤ 400 (RUPD pulser fits) |
 
 A 7-minute round crosses exactly one epoch boundary. See `references/parameters.md` for the math and how to override per-run.
 
@@ -143,7 +143,7 @@ tail -F logs/cardano-bp.log   | grep -E 'AddedToCurrentChain|AddBlockValidation\
 
 ### Round 2 — Epoch-boundary stress (~15 min)
 
-Goal: catch bugs that only manifest at epoch transitions — RUPD, snapshot rotation, KES rollover, leader-schedule recompute, and the **first reward-pot movement** (treasury↑ / reserves↓). With `epochLength=400`, `k=60`, `f=0.5`, the Praos randomness-stabilisation anchor is `4k/f = 480 > 400`, so RUPD is computed in epoch *N* and applied at boundary *N+1 → N+2*. The first RUPD therefore lands at boundary **1→2 (slot 800)**, not 0→1. A 15-min soak crosses both boundaries with margin so the pot movement can be observed and byte-exactly cross-validated against Haskell.
+Goal: catch bugs that only manifest at epoch transitions — RUPD, snapshot rotation, KES rollover, leader-schedule recompute, and the **first reward-pot movement** (treasury↑ / reserves↓). With `epochLength=400`, `k=40`, `f=0.5`, the Praos randomness-stabilisation anchor is `4k/f = 320 ≤ 400`, so the RUPD pulser starts at slot 320 of each epoch and finishes before the boundary. Rewards computed in epoch *N* are applied at boundary *N+1 → N+2*. The first non-zero RUPD therefore lands at boundary **1→2 (slot 800)**. A 15-min soak crosses both boundaries with margin so the pot movement can be observed and byte-exactly cross-validated against Haskell.
 
 ```bash
 cd testnet/local-devnet
@@ -186,7 +186,7 @@ echo "haskell treasury=$HSK_T reserves=$HSK_R"
 - `analyze-evidence.sh` chain-density proxy (canonical blocks ÷ slots) stays within ±20% of `activeSlotsCoeff` (0.5 on devnet)
 - After boundary 1→2: `dugite_treasury_lovelace > 0` AND `dugite_reserves_lovelace < genesis_reserves` (RUPD applied)
 - `dugite_treasury_lovelace` **byte-exactly equals** `cardano-bp.esChainAccountState.treasury` AND `dugite_reserves_lovelace` **byte-exactly equals** `cardano-bp.esChainAccountState.reserves` (the only acceptable ledger semantic per `feedback_haskell_byte_exact_only`)
-- Boundary 0→1 having `treasury=0, reserves=genesis` is **expected and correct** on this devnet (RUPD anchor `4k/f=480 > epoch_len=400`); the pot-movement check applies post-1→2 only
+- Boundary 0→1 having `treasury=0, reserves=genesis` is **expected and correct**: epoch 0's pulser runs (anchor `4k/f=320` fits inside `epoch_len=400`) but applies at boundary 1→2, not 0→1; the pot-movement check applies post-1→2 only
 
 ### Round 3 — Restart resilience (~5 min)
 

@@ -7,7 +7,7 @@
   "slotLength": 1.0,
   "epochLength": 400,
   "activeSlotsCoeff": 0.5,
-  "securityParam": 60,
+  "securityParam": 40,
   "updateQuorum": 2,
   "maxLovelaceSupply": 60000000000000000,
   "networkMagic": 42
@@ -22,16 +22,19 @@
 | `epochLength` | 400 slots | 400 s ≈ 6.67 min per epoch |
 | `activeSlotsCoeff` (f) | 0.5 | P(slot has leader) ≈ 0.5 |
 | Expected blocks/epoch | — | `epochLength × f` = 200 |
-| `securityParam` (k) | 60 | Max rollback window |
-| Stability check | — | `3k / f` = 360 ≤ `epochLength` = 400 ✓ |
+| `securityParam` (k) | 40 | Max rollback window |
+| Stability check | — | `3k / f` = 240 ≤ `epochLength` = 400 ✓ |
+| RUPD pulser check | — | `4k / f` = 320 ≤ `epochLength` = 400 ✓ |
 
-The Shelley genesis stability invariant is `3k/f ≤ epochLength` — each epoch must contain at least 3k active slots in expectation. Violating it makes epoch boundaries non-deterministic w.r.t. nonce evolution. Our defaults satisfy it with 10% headroom.
+The Shelley genesis stability invariant is `3k/f ≤ epochLength` — each epoch must contain at least 3k active slots in expectation. Violating it makes epoch boundaries non-deterministic w.r.t. nonce evolution.
+
+The Praos RUPD invariant is `4k/f ≤ epochLength` — the reward-update pulser starts at slot `4k/f` of each epoch and must complete before the epoch ends. If this fails, the pulser never runs and treasury/reserves stay at genesis values forever (both dugite and Haskell behave this way — chain stays valid but rewards never accumulate). `k=40` (vs. the original `k=60`) satisfies both invariants and lets Round 2 actually observe pot movement.
 
 ## Sizing a round
 
 - **One epoch boundary**: needs ≥ `epochLength × slotLength + ~30s buffer` = 430s (~7 min).
-- **One reward-update boundary**: occurs 4k/f slots into each epoch (= 480 slots here). Not reachable in a single-epoch round; appears in round 2 only via the next epoch's snapshot.
-- **Two epoch boundaries** (for snapshot rotation verification): ≥ 830s (~14 min). Reserve for ad-hoc deeper investigations, not the standard 3-round playbook.
+- **First RUPD application**: the pulser starts at slot 4k/f=320 of epoch N, finishes by slot 400, and the resulting reward update is *applied* at the boundary N+1 → N+2 (i.e. slot 800 with epoch_length=400). Round 2's 15-min soak crosses this.
+- **Two epoch boundaries** (for snapshot rotation verification + first RUPD application): ≥ 900s (~15 min). Standard for Round 2.
 
 ## Overriding per-run
 
