@@ -3618,12 +3618,13 @@ impl Node {
         // fetch ranges to per-peer BlockFetch workers.
         {
             let bf_cancel = tokio_util::sync::CancellationToken::new();
-            let mut bf_task = BlockFetchLogicTask::new_with_chain_db(
+            let mut bf_task = BlockFetchLogicTask::new_with_peer_manager(
                 candidate_chains.clone(),
                 fetched_blocks_tx,
                 self.byron_epoch_length,
                 bf_cancel.clone(),
                 Some(self.chain_db.clone()),
+                Some(self.peer_manager.clone()),
             );
             let bf_shutdown = shutdown_rx.clone();
             let bf_handle = tokio::spawn(async move {
