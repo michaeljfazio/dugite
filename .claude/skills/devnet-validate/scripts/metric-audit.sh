@@ -59,7 +59,7 @@ fi
 PASS=()
 FAIL=()
 
-ok()   { PASS+=("$1"); [ "$VERBOSE" -eq 1 ] && printf '  ✓ %s\n' "$1"; }
+ok()   { PASS+=("$1"); [ "$VERBOSE" -eq 1 ] && printf '  ✓ %s\n' "$1" || true; }
 fail() { FAIL+=("$1"); printf '  ✗ %s\n' "$1"; }
 info() { [ "$VERBOSE" -eq 1 ] && printf '  · %s\n' "$1" || true; }
 

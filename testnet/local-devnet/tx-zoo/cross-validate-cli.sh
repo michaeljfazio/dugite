@@ -215,9 +215,18 @@ xv_03_plutus_spend() {
         --change-address "$pay_addr" \
         --out-file "$spend_raw" >/dev/null 2> "$XV_LOGS/$name-spend-build.err" \
         || { xv_record "$name" FAIL "" "spend-build"; return 1; }
+    # The collateral input is picked from the genesis utxo address, so the
+    # spend tx requires a vkey witness for BOTH wallet-a's payment key
+    # (collateral change return + script context) AND the genesis payment
+    # key (which owns the collateral input). Without the genesis key, the
+    # tx fails `MissingVKeyWitnessesUTXOW` at admission (post the dugite
+    # collateral-witness fix in commit 0821af5d2; previously this slipped
+    # through dugite's mempool but cardano-bp rejected on apply).
     cardano-cli conway transaction sign \
         --testnet-magic "$LD_MAGIC" \
-        --tx-body-file "$spend_raw" --signing-key-file "$WA/payment.skey" \
+        --tx-body-file "$spend_raw" \
+        --signing-key-file "$WA/payment.skey" \
+        --signing-key-file "$ZOO_PAY_SKEY" \
         --out-file "$spend_signed" >/dev/null
 
     local spend_txid; spend_txid=$(xv_submit_dugite "$spend_signed") \
