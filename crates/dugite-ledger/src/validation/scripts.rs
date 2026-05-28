@@ -903,6 +903,149 @@ pub(super) fn check_extraneous_script_witnesses(
     }
 }
 
+/// Check that every script in the transaction's witness set is well-formed.
+///
+/// Mirrors Haskell's `MalformedScriptWitnesses` predicate from the Babbage
+/// UTXOW rule (`eras/babbage/impl/src/Cardano/Ledger/Babbage/Rules/Utxow.hs`,
+/// line 260):
+///
+/// ```haskell
+/// invalidScriptWits =
+///   Map.filter (not . validScript (pp ^. ppProtocolVersionL)) scriptWits
+/// failureOnNonEmptySet (Map.keysSet invalidScriptWits) MalformedScriptWitnesses
+/// ```
+///
+/// `validScript pv script` (Alonzo `Cardano.Ledger.Alonzo.Scripts`, line 650):
+/// - Native: `deepseq` (force to NF — trivially OK in Rust where decoding
+///   already produced a fully-evaluated struct, no laziness/thunks).
+/// - Plutus: `isValidPlutus pv plutusScript` —
+///   `isValidPlutus v = isRight . decodePlutusRunnable v`. The script's
+///   flat-encoded bytes must decode AND the language version must be
+///   supported at the given major protocol version.
+///
+/// PV gates for Plutus languages:
+/// - PlutusV1: PV >= 5 (Alonzo)
+/// - PlutusV2: PV >= 7 (Babbage)
+/// - PlutusV3: PV >= 9 (Conway)
+pub(super) fn check_malformed_script_witnesses(
+    tx: &Transaction,
+    params: &ProtocolParameters,
+    errors: &mut Vec<ValidationError>,
+) {
+    let pv = params.protocol_version_major;
+    let mut malformed: Vec<String> = Vec::new();
+
+    // Plutus V1 → PV5+
+    for s in &tx.witness_set.plutus_v1_scripts {
+        if pv < 5 || !plutus_script_decodes(s) {
+            malformed.push(dugite_primitives::hash::blake2b_224_tagged(1, s).to_hex());
+        }
+    }
+    // Plutus V2 → PV7+
+    for s in &tx.witness_set.plutus_v2_scripts {
+        if pv < 7 || !plutus_script_decodes(s) {
+            malformed.push(dugite_primitives::hash::blake2b_224_tagged(2, s).to_hex());
+        }
+    }
+    // Plutus V3 → PV9+
+    for s in &tx.witness_set.plutus_v3_scripts {
+        if pv < 9 || !plutus_script_decodes(s) {
+            malformed.push(dugite_primitives::hash::blake2b_224_tagged(3, s).to_hex());
+        }
+    }
+    // Native scripts: decoded successfully into our Rust enum — no thunks
+    // to force, so they trivially pass `deepseq`. Nothing to check here.
+
+    if !malformed.is_empty() {
+        malformed.sort();
+        errors.push(ValidationError::MalformedScriptWitnesses { hashes: malformed });
+    }
+}
+
+/// Check that every reference script attached to an output PRODUCED by this
+/// transaction is well-formed.
+///
+/// Mirrors Haskell `MalformedReferenceScripts` (Babbage UTXOW rule, same file
+/// as `MalformedScriptWitnesses`, line 261):
+///
+/// ```haskell
+/// rScripts = mapMaybe (strictMaybeToMaybe . view referenceScriptTxOutL) (toList txOuts)
+/// invalidRefScripts = filter (not . validScript (pp ^. ppProtocolVersionL)) rScripts
+/// invalidRefScriptHashes = Set.fromList $ map (hashScript @era) invalidRefScripts
+/// failureOnNonEmptySet invalidRefScriptHashes MalformedReferenceScripts
+/// ```
+///
+/// `txOuts = normalOuts <> foldMap singleton collateralReturn` — only outputs
+/// PRODUCED by this tx. Reference scripts on UTxOs referenced via
+/// `reference_inputs` were validated when the tx that created them was
+/// applied; not re-checked here.
+pub(super) fn check_malformed_reference_scripts(
+    tx: &Transaction,
+    params: &ProtocolParameters,
+    errors: &mut Vec<ValidationError>,
+) {
+    let pv = params.protocol_version_major;
+    let mut malformed: Vec<String> = Vec::new();
+
+    // Visit every output produced by this tx (normal outputs + collateral_return).
+    let mut outputs: Vec<&dugite_primitives::transaction::TransactionOutput> =
+        tx.body.outputs.iter().collect();
+    if let Some(ref cr) = tx.body.collateral_return {
+        outputs.push(cr);
+    }
+
+    for output in outputs {
+        let Some(ref script_ref) = output.script_ref else {
+            continue;
+        };
+        match script_ref {
+            ScriptRef::NativeScript(_) => {
+                // Decoded successfully into our enum → trivially OK.
+            }
+            ScriptRef::PlutusV1(bytes) => {
+                if pv < 5 || !plutus_script_decodes(bytes) {
+                    malformed.push(compute_script_ref_hash(script_ref).to_hex());
+                }
+            }
+            ScriptRef::PlutusV2(bytes) => {
+                if pv < 7 || !plutus_script_decodes(bytes) {
+                    malformed.push(compute_script_ref_hash(script_ref).to_hex());
+                }
+            }
+            ScriptRef::PlutusV3(bytes) => {
+                if pv < 9 || !plutus_script_decodes(bytes) {
+                    malformed.push(compute_script_ref_hash(script_ref).to_hex());
+                }
+            }
+            ScriptRef::PlutusV4(bytes) => {
+                // Dijkstra era; PV gate to be confirmed. Conservative: require
+                // PV >= 11 (post-Conway) AND decodes.
+                if pv < 11 || !plutus_script_decodes(bytes) {
+                    malformed.push(compute_script_ref_hash(script_ref).to_hex());
+                }
+            }
+        }
+    }
+
+    if !malformed.is_empty() {
+        malformed.sort();
+        malformed.dedup();
+        errors.push(ValidationError::MalformedReferenceScripts { hashes: malformed });
+    }
+}
+
+/// Try to decode a Plutus script's bytes via the same path used by phase-2
+/// evaluation: CBOR-wrapped flat first, falling back to raw flat. Returns
+/// `false` only when both decoders error.
+///
+/// Mirrors Haskell `decodePlutusRunnable v bs` — the flat decode is the
+/// "well-formedness" check. The cost-model / language-version semantic
+/// check is handled separately by the PV gate in the callers.
+fn plutus_script_decodes(bytes: &[u8]) -> bool {
+    dugite_uplc::program::Program::from_cbor(bytes).is_ok()
+        || dugite_uplc::program::Program::from_flat(bytes).is_ok()
+}
+
 /// Return `true` when the transaction has any Plutus scripts or redeemers.
 pub(super) fn has_plutus_scripts(tx: &Transaction) -> bool {
     !tx.witness_set.plutus_v1_scripts.is_empty()

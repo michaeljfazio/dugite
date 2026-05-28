@@ -4346,6 +4346,125 @@ mod tests {
         );
     }
 
+    // -----------------------------------------------------------------------
+    // Tests — MalformedScriptWitnesses / MalformedReferenceScripts (Babbage+)
+    //
+    // Witness-set and tx-output reference scripts must pass `validScript pv`
+    // — Plutus scripts must decode as flat UPLC AND their language version
+    // must be supported at the current PV.
+    // -----------------------------------------------------------------------
+
+    fn minimal_plutus_program_flat() -> Vec<u8> {
+        let p = dugite_uplc::program::Program {
+            version: (1, 0, 0),
+            term: dugite_uplc::term::Term::Const(dugite_uplc::term::Constant::Integer(
+                num_bigint::BigInt::from(0),
+            )),
+        };
+        p.to_flat().expect("flat-encode minimal Plutus program")
+    }
+
+    /// Garbage bytes in `witness_set.plutus_v1_scripts` → MalformedScriptWitnesses.
+    #[test]
+    fn test_malformed_plutus_v1_witness_rejected() {
+        let (utxo_set, mut tx, _) = make_valid_tx();
+        tx.witness_set
+            .plutus_v1_scripts
+            .push(vec![0xff, 0xee, 0xdd]);
+        let params = ProtocolParameters::mainnet_defaults();
+        let errors = validate_transaction(&tx, &utxo_set, &params, 100, 300, None)
+            .err()
+            .unwrap_or_default();
+        assert!(
+            errors
+                .iter()
+                .any(|e| matches!(e, ValidationError::MalformedScriptWitnesses { .. })),
+            "garbage Plutus V1 witness must produce MalformedScriptWitnesses, got {errors:?}"
+        );
+    }
+
+    /// Real flat-encoded Plutus V1 bytes at PV >= 5 → no MalformedScriptWitnesses.
+    #[test]
+    fn test_well_formed_plutus_v1_witness_accepted() {
+        let (utxo_set, mut tx, _) = make_valid_tx();
+        tx.witness_set
+            .plutus_v1_scripts
+            .push(minimal_plutus_program_flat());
+        let mut params = ProtocolParameters::mainnet_defaults();
+        params.protocol_version_major = 9;
+        let errors = validate_transaction(&tx, &utxo_set, &params, 100, 300, None)
+            .err()
+            .unwrap_or_default();
+        assert!(
+            !errors
+                .iter()
+                .any(|e| matches!(e, ValidationError::MalformedScriptWitnesses { .. })),
+            "well-formed Plutus V1 witness must not produce MalformedScriptWitnesses, got {errors:?}"
+        );
+    }
+
+    /// PlutusV3 script at PV < 9 → MalformedScriptWitnesses (language not yet supported).
+    #[test]
+    fn test_plutus_v3_witness_rejected_before_pv9() {
+        let (utxo_set, mut tx, _) = make_valid_tx();
+        // Even a well-formed V3 script is malformed at PV < 9 because the language
+        // is not yet enabled — matches `isValidPlutusScript (pvMajor pv)`.
+        tx.witness_set
+            .plutus_v3_scripts
+            .push(minimal_plutus_program_flat());
+        let mut params = ProtocolParameters::mainnet_defaults();
+        params.protocol_version_major = 8; // Babbage — V3 not yet allowed
+        let errors = validate_transaction(&tx, &utxo_set, &params, 100, 300, None)
+            .err()
+            .unwrap_or_default();
+        assert!(
+            errors
+                .iter()
+                .any(|e| matches!(e, ValidationError::MalformedScriptWitnesses { .. })),
+            "Plutus V3 witness at PV=8 must produce MalformedScriptWitnesses, got {errors:?}"
+        );
+    }
+
+    /// Garbage bytes in `output.script_ref::PlutusV2` → MalformedReferenceScripts.
+    #[test]
+    fn test_malformed_reference_script_rejected() {
+        use dugite_primitives::transaction::ScriptRef;
+        let (utxo_set, mut tx, _) = make_valid_tx();
+        // Attach a garbage Plutus V2 reference script to an output PRODUCED
+        // by this tx.
+        tx.body.outputs[0].script_ref = Some(ScriptRef::PlutusV2(vec![0xff, 0xee]));
+        let mut params = ProtocolParameters::mainnet_defaults();
+        params.protocol_version_major = 9; // V2 supported
+        let errors = validate_transaction(&tx, &utxo_set, &params, 100, 300, None)
+            .err()
+            .unwrap_or_default();
+        assert!(
+            errors
+                .iter()
+                .any(|e| matches!(e, ValidationError::MalformedReferenceScripts { .. })),
+            "garbage ref script must produce MalformedReferenceScripts, got {errors:?}"
+        );
+    }
+
+    /// Well-formed ref script at supported PV → no MalformedReferenceScripts.
+    #[test]
+    fn test_well_formed_reference_script_accepted() {
+        use dugite_primitives::transaction::ScriptRef;
+        let (utxo_set, mut tx, _) = make_valid_tx();
+        tx.body.outputs[0].script_ref = Some(ScriptRef::PlutusV2(minimal_plutus_program_flat()));
+        let mut params = ProtocolParameters::mainnet_defaults();
+        params.protocol_version_major = 9;
+        let errors = validate_transaction(&tx, &utxo_set, &params, 100, 300, None)
+            .err()
+            .unwrap_or_default();
+        assert!(
+            !errors
+                .iter()
+                .any(|e| matches!(e, ValidationError::MalformedReferenceScripts { .. })),
+            "well-formed ref script must not produce MalformedReferenceScripts, got {errors:?}"
+        );
+    }
+
     /// `RegDRep` for an already-registered DRep must not produce `DRepNotRegistered`.
     /// (Regression: ensure the check only applies to `UnregDRep`.)
     #[test]
