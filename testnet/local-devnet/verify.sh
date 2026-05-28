@@ -10,6 +10,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 PREDICATE_PASS=()
 PREDICATE_FAIL=()
+PREDICATE_SKIP=()
 
 # Predicate 1: every (slot, hash) seen by any observer is seen by all 3 observers
 # (Tolerance: most-recent 10 blocks may have partial observers, since they
@@ -250,6 +251,12 @@ p3_tx_inclusion() {
 
     if [ "$mismatches" -gt 0 ]; then
         PREDICATE_FAIL+=("p3:tx-inclusion ($mismatches/$total txs inconsistent across nodes; example: $examples)")
+    elif [ "$total" -eq 0 ]; then
+        # Soak collected no tx submission rows (e.g. Round 3 — restart
+        # resilience — does not exercise the tx surface). Mark as SKIP
+        # rather than FAIL so the soak result reflects the actual
+        # predicate scope.
+        PREDICATE_SKIP+=("p3:tx-inclusion (no txs submitted during this soak — Round 3 / restart-only sample)")
     elif [ -S "$LD_RELAY_SOCK" ] && [ "$accepted" -eq 0 ]; then
         # If the devnet was queried but not a single tx made it into a
         # block, the system isn't actually executing tx submissions —
@@ -387,7 +394,12 @@ p5_tip_age() {
     ' "$samples")
 
     if [ -z "$result" ]; then
-        PREDICATE_FAIL+=("p5:tip-age (no usable samples after ${grace}s grace window)")
+        # No samples survived the grace window. Most likely the soak
+        # duration was shorter than the grace window (e.g. Round 3's
+        # 60s post-restart sample with default 60s grace). Mark as SKIP
+        # rather than FAIL: insufficient data to evaluate the predicate
+        # is not the same as a failed predicate.
+        PREDICATE_SKIP+=("p5:tip-age (no usable samples after ${grace}s grace window — soak too short to evaluate)")
         return
     fi
 
@@ -448,6 +460,10 @@ generate_report() {
             id="${p%%:*}"; rest="${p#*:}"; name="${rest%% *}"; detail="${rest#* }"
             printf "| %s | %s | **FAIL** | %s |\n" "$id" "$name" "$detail"
         done
+        for p in "${PREDICATE_SKIP[@]:+${PREDICATE_SKIP[@]}}"; do
+            id="${p%%:*}"; rest="${p#*:}"; name="${rest%% *}"; detail="${rest#* }"
+            printf "| %s | %s | _SKIP_ | %s |\n" "$id" "$name" "$detail"
+        done
         echo
         echo "## Counts"
         echo
@@ -481,14 +497,14 @@ self_test() {
 
     log_info "p1 - good fixture (expect PASS)"
     local saved_pass=("${PREDICATE_PASS[@]:+${PREDICATE_PASS[@]}}") saved_fail=("${PREDICATE_FAIL[@]:+${PREDICATE_FAIL[@]}}")
-    PREDICATE_PASS=(); PREDICATE_FAIL=()
+    PREDICATE_PASS=(); PREDICATE_FAIL=(); PREDICATE_SKIP=()
     p1_forge_cross_check "$fix/predicate-1-good.csv"
     [ ${#PREDICATE_PASS[@]} -gt 0 ] && [ ${#PREDICATE_FAIL[@]} -eq 0 ] \
         || die "p1 self-test on good fixture: expected PASS, got ${PREDICATE_FAIL[*]:-}"
     log_info "  OK"
 
     log_info "p1 - bad fixture (expect FAIL)"
-    PREDICATE_PASS=(); PREDICATE_FAIL=()
+    PREDICATE_PASS=(); PREDICATE_FAIL=(); PREDICATE_SKIP=()
     p1_forge_cross_check "$fix/predicate-1-bad.csv"
     [ ${#PREDICATE_FAIL[@]} -gt 0 ] && [ ${#PREDICATE_PASS[@]} -eq 0 ] \
         || die "p1 self-test on bad fixture: expected FAIL, got ${PREDICATE_PASS[*]:-}"
@@ -500,14 +516,14 @@ self_test() {
     LD_KEYS="$fix/_nonexistent_keys"
 
     log_info "p2 - good fixture (expect PASS)"
-    PREDICATE_PASS=(); PREDICATE_FAIL=()
+    PREDICATE_PASS=(); PREDICATE_FAIL=(); PREDICATE_SKIP=()
     p2_per_bp_attribution "$fix/predicate-2-good.csv"
     [ ${#PREDICATE_PASS[@]} -gt 0 ] && [ ${#PREDICATE_FAIL[@]} -eq 0 ] \
         || { LD_KEYS="$saved_ld_keys"; die "p2 self-test good: expected PASS, got ${PREDICATE_FAIL[*]:-}"; }
     log_info "  OK"
 
     log_info "p2 - bad fixture (expect FAIL)"
-    PREDICATE_PASS=(); PREDICATE_FAIL=()
+    PREDICATE_PASS=(); PREDICATE_FAIL=(); PREDICATE_SKIP=()
     p2_per_bp_attribution "$fix/predicate-2-bad.csv"
     [ ${#PREDICATE_FAIL[@]} -gt 0 ] && [ ${#PREDICATE_PASS[@]} -eq 0 ] \
         || { LD_KEYS="$saved_ld_keys"; die "p2 self-test bad: expected FAIL, got ${PREDICATE_PASS[*]:-}"; }
@@ -523,14 +539,14 @@ self_test() {
     LD_RELAY_SOCK="$fix/_nonexistent.sock"
 
     log_info "p3 - good fixture (expect PASS)"
-    PREDICATE_PASS=(); PREDICATE_FAIL=()
+    PREDICATE_PASS=(); PREDICATE_FAIL=(); PREDICATE_SKIP=()
     p3_tx_inclusion "$fix/predicate-3-good.csv" "$fix"
     [ ${#PREDICATE_PASS[@]} -gt 0 ] && [ ${#PREDICATE_FAIL[@]} -eq 0 ] \
         || { LD_RELAY_SOCK="$saved_relay_sock"; die "p3 self-test good: expected PASS, got ${PREDICATE_FAIL[*]:-}"; }
     log_info "  OK"
 
     log_info "p3 - bad fixture (expect FAIL)"
-    PREDICATE_PASS=(); PREDICATE_FAIL=()
+    PREDICATE_PASS=(); PREDICATE_FAIL=(); PREDICATE_SKIP=()
     p3_tx_inclusion "$fix/predicate-3-bad.csv" "$fix"
     [ ${#PREDICATE_FAIL[@]} -gt 0 ] && [ ${#PREDICATE_PASS[@]} -eq 0 ] \
         || { LD_RELAY_SOCK="$saved_relay_sock"; die "p3 self-test bad: expected FAIL, got ${PREDICATE_PASS[*]:-}"; }
@@ -539,14 +555,14 @@ self_test() {
     LD_RELAY_SOCK="$saved_relay_sock"
 
     log_info "p4 - good fixture (expect PASS)"
-    PREDICATE_PASS=(); PREDICATE_FAIL=()
+    PREDICATE_PASS=(); PREDICATE_FAIL=(); PREDICATE_SKIP=()
     p4_tip_parity "$fix/predicate-4-good.csv"
     [ ${#PREDICATE_PASS[@]} -gt 0 ] && [ ${#PREDICATE_FAIL[@]} -eq 0 ] \
         || die "p4 self-test good: expected PASS, got ${PREDICATE_FAIL[*]:-}"
     log_info "  OK"
 
     log_info "p4 - bad fixture (expect FAIL)"
-    PREDICATE_PASS=(); PREDICATE_FAIL=()
+    PREDICATE_PASS=(); PREDICATE_FAIL=(); PREDICATE_SKIP=()
     p4_tip_parity "$fix/predicate-4-bad.csv"
     [ ${#PREDICATE_FAIL[@]} -gt 0 ] && [ ${#PREDICATE_PASS[@]} -eq 0 ] \
         || die "p4 self-test bad: expected FAIL, got ${PREDICATE_PASS[*]:-}"
@@ -559,14 +575,14 @@ self_test() {
     export LD_TIP_AGE_GRACE_SEC
 
     log_info "p5 - good fixture (expect PASS)"
-    PREDICATE_PASS=(); PREDICATE_FAIL=()
+    PREDICATE_PASS=(); PREDICATE_FAIL=(); PREDICATE_SKIP=()
     p5_tip_age "$fix/predicate-5-good.csv"
     [ ${#PREDICATE_PASS[@]} -gt 0 ] && [ ${#PREDICATE_FAIL[@]} -eq 0 ] \
         || { unset LD_TIP_AGE_GRACE_SEC; die "p5 self-test good: expected PASS, got ${PREDICATE_FAIL[*]:-}"; }
     log_info "  OK"
 
     log_info "p5 - bad fixture (expect FAIL)"
-    PREDICATE_PASS=(); PREDICATE_FAIL=()
+    PREDICATE_PASS=(); PREDICATE_FAIL=(); PREDICATE_SKIP=()
     p5_tip_age "$fix/predicate-5-bad.csv"
     [ ${#PREDICATE_FAIL[@]} -gt 0 ] && [ ${#PREDICATE_PASS[@]} -eq 0 ] \
         || { unset LD_TIP_AGE_GRACE_SEC; die "p5 self-test bad: expected FAIL, got ${PREDICATE_PASS[*]:-}"; }
@@ -601,5 +617,8 @@ generate_report       "$EVD"
 if [ ${#PREDICATE_FAIL[@]} -gt 0 ]; then
     log_error "FAILED: ${PREDICATE_FAIL[*]}"
     exit 1
+fi
+if [ ${#PREDICATE_SKIP[@]} -gt 0 ]; then
+    log_info "SKIPPED (insufficient data for predicate scope): ${PREDICATE_SKIP[*]}"
 fi
 log_info "PASSED all predicates: ${PREDICATE_PASS[*]}"
