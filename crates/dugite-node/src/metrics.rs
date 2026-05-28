@@ -402,6 +402,13 @@ pub struct NodeMetrics {
     pub slot_number: AtomicU64,
     pub block_number: AtomicU64,
     pub epoch_number: AtomicU64,
+    /// Currently-active protocol major version (drives the era label in
+    /// dugite-monitor: 1=Byron, 2=Shelley, 3=Allegra, 4=Mary, 5/6=Alonzo,
+    /// 7/8=Babbage, 9+=Conway).
+    pub protocol_version_major: AtomicU64,
+    /// Currently-active protocol minor version (paired with major; bumped
+    /// on intra-era parameter changes).
+    pub protocol_version_minor: AtomicU64,
     pub utxo_count: AtomicU64,
     pub mempool_tx_count: AtomicU64,
     pub mempool_tx_max: AtomicU64,
@@ -711,6 +718,8 @@ impl NodeMetrics {
             slot_number: AtomicU64::new(0),
             block_number: AtomicU64::new(0),
             epoch_number: AtomicU64::new(0),
+            protocol_version_major: AtomicU64::new(0),
+            protocol_version_minor: AtomicU64::new(0),
             utxo_count: AtomicU64::new(0),
             mempool_tx_count: AtomicU64::new(0),
             mempool_tx_max: AtomicU64::new(0),
@@ -996,6 +1005,14 @@ impl NodeMetrics {
 
     pub fn set_epoch(&self, epoch: u64) {
         self.epoch_number.store(epoch, Ordering::Relaxed);
+    }
+
+    /// Record the active protocol version. dugite-monitor maps the major
+    /// component to an era label, so this must be refreshed wherever
+    /// `set_epoch` is called and after every era transition.
+    pub fn set_protocol_version(&self, major: u64, minor: u64) {
+        self.protocol_version_major.store(major, Ordering::Relaxed);
+        self.protocol_version_minor.store(minor, Ordering::Relaxed);
     }
 
     pub fn set_sync_progress(&self, pct: f64) {
@@ -1568,6 +1585,16 @@ impl NodeMetrics {
                 "dugite_epoch_number",
                 "Current epoch number",
                 &self.epoch_number,
+            ),
+            (
+                "dugite_protocol_major_version",
+                "Active protocol major version (1=Byron, 2=Shelley, 3=Allegra, 4=Mary, 5/6=Alonzo, 7/8=Babbage, 9+=Conway)",
+                &self.protocol_version_major,
+            ),
+            (
+                "dugite_protocol_minor_version",
+                "Active protocol minor version (bumps on intra-era parameter updates)",
+                &self.protocol_version_minor,
             ),
             (
                 "dugite_utxo_count",

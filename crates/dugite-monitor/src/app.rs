@@ -787,49 +787,29 @@ impl App {
         self.metrics.get("dugite_sync_progress_percent") / 100.0
     }
 
-    /// Infer current era from the protocol major version metric.
+    /// Map the protocol major version metric to its era label.
     ///
-    /// Protocol versions:
-    ///   0-1: Byron, 2-3: Shelley, 4: Allegra, 5: Mary, 6: Alonzo, 7: Babbage, 8+: Conway
+    /// Canonical Cardano protocol-version history:
+    ///   1     → Byron
+    ///   2     → Shelley
+    ///   3     → Allegra
+    ///   4     → Mary
+    ///   5, 6  → Alonzo (intra-era bump at 6)
+    ///   7, 8  → Babbage (intra-era Vasil bump at 8)
+    ///   9+    → Conway
+    ///
+    /// Returns `"Unknown"` if the node has not yet exported
+    /// `dugite_protocol_major_version` — guessing an era from epoch number
+    /// silently misreports during from-genesis sync, so prefer honesty.
     pub fn current_era(&self) -> &'static str {
-        let major = self.metrics.get_u64("dugite_protocol_major_version");
-        // If the metric isn't exposed yet, fall back to epoch-based inference.
-        if major == 0 {
-            let epoch = self.metrics.get_u64("dugite_epoch_number");
-            return match self.network {
-                Network::Mainnet => {
-                    if epoch >= 394 {
-                        "Conway"
-                    } else if epoch >= 365 {
-                        "Babbage"
-                    } else {
-                        "Alonzo"
-                    }
-                }
-                Network::Preview => {
-                    if epoch >= 670 {
-                        "Conway"
-                    } else {
-                        "Babbage"
-                    }
-                }
-                Network::Preprod => {
-                    if epoch >= 160 {
-                        "Conway"
-                    } else {
-                        "Babbage"
-                    }
-                }
-                _ => "Conway",
-            };
-        }
-        match major {
-            0 | 1 => "Byron",
-            2 | 3 => "Shelley",
-            4 => "Allegra",
-            5 => "Mary",
-            6 => "Alonzo",
-            7 => "Babbage",
+        match self.metrics.get_u64("dugite_protocol_major_version") {
+            0 => "Unknown",
+            1 => "Byron",
+            2 => "Shelley",
+            3 => "Allegra",
+            4 => "Mary",
+            5 | 6 => "Alonzo",
+            7 | 8 => "Babbage",
             _ => "Conway",
         }
     }
@@ -1271,14 +1251,23 @@ mod tests {
     #[test]
     fn test_current_era_from_protocol_version() {
         let mut app = App::new();
-        app.metrics = make_snapshot(vec![("dugite_protocol_major_version", 9.0)]);
-        assert_eq!(app.current_era(), "Conway");
-
-        app.metrics = make_snapshot(vec![("dugite_protocol_major_version", 7.0)]);
-        assert_eq!(app.current_era(), "Babbage");
-
-        app.metrics = make_snapshot(vec![("dugite_protocol_major_version", 6.0)]);
-        assert_eq!(app.current_era(), "Alonzo");
+        for (pv, expected) in [
+            (0u64, "Unknown"),
+            (1, "Byron"),
+            (2, "Shelley"),
+            (3, "Allegra"),
+            (4, "Mary"),
+            (5, "Alonzo"),
+            (6, "Alonzo"),
+            (7, "Babbage"),
+            (8, "Babbage"),
+            (9, "Conway"),
+            (10, "Conway"),
+            (11, "Conway"),
+        ] {
+            app.metrics = make_snapshot(vec![("dugite_protocol_major_version", pv as f64)]);
+            assert_eq!(app.current_era(), expected, "PV {pv}");
+        }
     }
 
     #[test]

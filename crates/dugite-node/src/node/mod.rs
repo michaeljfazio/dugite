@@ -2015,6 +2015,10 @@ impl Node {
             // Initialize Prometheus metrics from loaded ledger state so they
             // are accurate immediately on startup (before any blocks arrive).
             self.metrics.set_epoch(ls.epoch.0);
+            self.metrics.set_protocol_version(
+                ls.epochs.protocol_params.protocol_version_major,
+                ls.epochs.protocol_params.protocol_version_minor,
+            );
             self.metrics.set_utxo_count(ls.utxo.utxo_set.len() as u64);
             self.metrics.set_mempool_count(self.mempool.len() as u64);
             self.metrics.set_mempool_max(self.mempool.capacity() as u64);
@@ -4674,6 +4678,10 @@ impl Node {
                                                 .await;
                                             self.metrics.set_tip_slot_time_ms(slot_time_ms);
                                             self.metrics.set_epoch(ls.epoch.0);
+                                            self.metrics.set_protocol_version(
+                                                ls.epochs.protocol_params.protocol_version_major,
+                                                ls.epochs.protocol_params.protocol_version_minor,
+                                            );
                                         }
                                         self.metrics.refresh_sync_progress(fork_slot.0);
                                         // Announce each fork block to downstream peers.
@@ -4972,6 +4980,10 @@ impl Node {
                         // catch-up duration (issue: cosmetic but very
                         // misleading).
                         self.metrics.set_epoch(ls.epoch.0);
+                        self.metrics.set_protocol_version(
+                            ls.epochs.protocol_params.protocol_version_major,
+                            ls.epochs.protocol_params.protocol_version_minor,
+                        );
                         self.metrics.set_utxo_count(ls.utxo.utxo_set.len() as u64);
                         let _ = self.ledger_tip_slot_tx.send(local_tip);
                     }
@@ -5163,8 +5175,16 @@ impl Node {
                 .slot_to_wallclock_ms(block_slot.0, &view.slot_config)
                 .await;
             self.metrics.set_tip_slot_time_ms(slot_time_ms);
-            let live_epoch = self.ledger_state.read().await.epoch.0;
+            let (live_epoch, pv_major, pv_minor) = {
+                let ls = self.ledger_state.read().await;
+                (
+                    ls.epoch.0,
+                    ls.epochs.protocol_params.protocol_version_major,
+                    ls.epochs.protocol_params.protocol_version_minor,
+                )
+            };
             self.metrics.set_epoch(live_epoch);
+            self.metrics.set_protocol_version(pv_major, pv_minor);
         }
         self.metrics.refresh_sync_progress(block_slot.0);
 
