@@ -47,13 +47,29 @@ use crate::machine::cost::ExBudget;
 use dugite_primitives::transaction::{Transaction, TransactionInput, TransactionOutput};
 
 /// Slot config — `(network_start_unix_seconds, slot_zero_offset,
-/// slot_length_ms)`. Mirrors the Cardano `SlotConfig` used to
-/// translate slots ↔ POSIX time for `txValidRange` in TxInfo.
+/// slot_length_ms, safe_zone_horizon_slot)`. Mirrors the Cardano
+/// `SlotConfig` used to translate slots ↔ POSIX time for
+/// `txValidRange` in TxInfo.
+///
+/// `safe_zone_horizon_slot` is the **exclusive** upper-bound slot past
+/// which slot→POSIX translation must fail with
+/// [`PhaseTwoError::TimeTranslationPastHorizon`]. Mirrors Haskell
+/// `Ouroboros.Consensus.HardFork.History.Qry.guardEnd`:
+/// `guard $ p b` where `p = \end -> absSlot < boundSlot end`.
+///
+/// `None` means **unbounded** (no horizon enforcement) — only safe to
+/// use for tests, never in production. The dugite-ledger caller is
+/// responsible for plumbing the correct horizon from `EraHistory
+/// ::safe_zone_horizon_slot(ledger_tip)`. See
+/// `crates/dugite-consensus/src/era_history.rs` for the canonical
+/// formula and `audit-findings/2026-05-28-skill-self-audit.md` for the
+/// Round-1 P0 regression this enforces against.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SlotConfig {
     pub network_start_unix_seconds: u64,
     pub slot_zero_offset: u64,
     pub slot_length_ms: u32,
+    pub safe_zone_horizon_slot: Option<u64>,
 }
 
 /// The "fully decoded" inputs to phase-2 evaluation. Constructed once at
@@ -135,6 +151,15 @@ pub enum PhaseTwoError {
     /// Generic internal error.
     #[error("internal phase-2 error: {0}")]
     Internal(String),
+    /// A slot in the tx's validity interval is past the era's safe-zone
+    /// horizon. Mirrors Haskell
+    /// `Alonzo.Plutus.TxInfo.TimeTranslationPastHorizon`. Produced by
+    /// `slot_to_posix_ms` when the supplied slot is `>= horizon`. Bubbles
+    /// up to dugite-ledger as a Phase-2 `BadTranslation`, causing the tx
+    /// to be rejected pre-mempool and pre-forge — matching the way
+    /// cardano-node would reject it at block-apply.
+    #[error("time translation past horizon: slot={slot} horizon={horizon}")]
+    TimeTranslationPastHorizon { slot: u64, horizon: u64 },
 }
 
 /// The redeemer trait callers implement to observe each redeemer
@@ -430,6 +455,7 @@ mod tests {
             network_start_unix_seconds: 1_596_491_091,
             slot_zero_offset: 4_492_800,
             slot_length_ms: 1_000,
+            safe_zone_horizon_slot: None,
         }
     }
 

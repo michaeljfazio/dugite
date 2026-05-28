@@ -218,6 +218,7 @@ mod tests {
             network_start_unix_seconds: 1_666_656_000,
             slot_zero_offset: 0,
             slot_length_ms: 1_000,
+            safe_zone_horizon_slot: None,
         }
     }
 

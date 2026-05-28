@@ -42,6 +42,22 @@ pub struct SlotConfig {
     pub zero_slot: u64,
     /// Slot length in milliseconds
     pub slot_length: u32,
+    /// Exclusive upper-bound slot past which slot→POSIX translation must
+    /// fail with `TimeTranslationPastHorizon`. `None` means unbounded
+    /// (only safe for tests; production callers MUST plumb the value
+    /// computed by `EraHistory::safe_zone_horizon_slot(ledger_tip)`).
+    ///
+    /// Mirrors Haskell `Ouroboros.Consensus.HardFork.History.Qry.guardEnd`:
+    /// `guard $ p b` where `p = \end -> absSlot < boundSlot end`.
+    ///
+    /// `#[serde(default)]` keeps wire/on-disk compatibility for any
+    /// historic `SlotConfig` blobs that predate this field — those
+    /// deserialize to `None` and the validation path then falls back to
+    /// the unbounded (pre-fix) semantics, which is exactly what they
+    /// had. Production code paths construct `SlotConfig` programmatically
+    /// and set the field explicitly.
+    #[serde(default)]
+    pub safe_zone_horizon_slot: Option<u64>,
 }
 
 impl Default for SlotConfig {
@@ -51,6 +67,7 @@ impl Default for SlotConfig {
             zero_time: 1_596_059_091_000, // Shelley start (mainnet)
             zero_slot: 4_492_800,         // First Shelley slot (mainnet)
             slot_length: 1_000,           // 1 second
+            safe_zone_horizon_slot: None,
         }
     }
 }
@@ -62,6 +79,7 @@ impl SlotConfig {
             zero_time: 1_666_656_000_000, // Preview genesis time
             zero_slot: 0,
             slot_length: 1_000,
+            safe_zone_horizon_slot: None,
         }
     }
 
@@ -71,7 +89,19 @@ impl SlotConfig {
             zero_time: 1_654_041_600_000, // Preprod genesis time
             zero_slot: 0,
             slot_length: 1_000,
+            safe_zone_horizon_slot: None,
         }
+    }
+
+    /// Return a new `SlotConfig` with the supplied safe-zone horizon
+    /// installed. Use this just before calling `evaluate_plutus_scripts`
+    /// to inject the value computed from the live ledger tip. Static
+    /// network configuration (zero_time, zero_slot, slot_length) is
+    /// untouched.
+    #[must_use]
+    pub fn with_safe_zone_horizon(mut self, horizon: u64) -> Self {
+        self.safe_zone_horizon_slot = Some(horizon);
+        self
     }
 }
 
@@ -192,6 +222,12 @@ pub fn evaluate_plutus_scripts(
         network_start_unix_seconds: slot_config.zero_time / 1_000,
         slot_zero_offset: slot_config.zero_slot,
         slot_length_ms: slot_config.slot_length,
+        // Plumb the safe-zone horizon into the inner evaluator so its
+        // `slot_to_posix_ms` rejects past-horizon validity bounds with
+        // `TimeTranslationPastHorizon`. When the caller leaves the field
+        // unset (tests, legacy on-disk SlotConfig), the evaluator falls
+        // back to its pre-fix unbounded semantics.
+        safe_zone_horizon_slot: slot_config.safe_zone_horizon_slot,
     };
     let eval_outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         dugite_uplc::phase_two::eval_phase_two_raw(
@@ -304,6 +340,12 @@ pub fn evaluate_plutus_scripts_with_reports(
         network_start_unix_seconds: slot_config.zero_time / 1_000,
         slot_zero_offset: slot_config.zero_slot,
         slot_length_ms: slot_config.slot_length,
+        // Plumb the safe-zone horizon into the inner evaluator so its
+        // `slot_to_posix_ms` rejects past-horizon validity bounds with
+        // `TimeTranslationPastHorizon`. When the caller leaves the field
+        // unset (tests, legacy on-disk SlotConfig), the evaluator falls
+        // back to its pre-fix unbounded semantics.
+        safe_zone_horizon_slot: slot_config.safe_zone_horizon_slot,
     };
     let eval_outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         dugite_uplc::phase_two::eval_phase_two_raw(
