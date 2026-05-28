@@ -408,15 +408,17 @@ fn centered_rect(want_w: u16, want_h: u16, r: Rect) -> Rect {
 }
 
 fn era_label(pv: Option<u64>) -> &'static str {
+    // Canonical Cardano protocol-version → era mapping
+    // (kept in sync with `App::current_era` in app.rs).
     match pv {
-        Some(0..=1) => "Byron",
-        Some(2..=3) => "Shelley",
-        Some(4) => "Allegra",
-        Some(5) => "Mary",
-        Some(6) => "Alonzo",
-        Some(7) => "Babbage",
+        Some(0) | None => "--",
+        Some(1) => "Byron",
+        Some(2) => "Shelley",
+        Some(3) => "Allegra",
+        Some(4) => "Mary",
+        Some(5 | 6) => "Alonzo",
+        Some(7 | 8) => "Babbage",
         Some(_) => "Conway",
-        None => "--",
     }
 }
 
@@ -478,12 +480,18 @@ mod tests {
 
     #[test]
     fn era_label_maps_major_versions() {
-        assert_eq!(era_label(Some(0)), "Byron");
+        assert_eq!(era_label(None), "--");
+        assert_eq!(era_label(Some(0)), "--");
         assert_eq!(era_label(Some(1)), "Byron");
         assert_eq!(era_label(Some(2)), "Shelley");
+        assert_eq!(era_label(Some(3)), "Allegra");
+        assert_eq!(era_label(Some(4)), "Mary");
+        assert_eq!(era_label(Some(5)), "Alonzo");
+        assert_eq!(era_label(Some(6)), "Alonzo");
         assert_eq!(era_label(Some(7)), "Babbage");
+        assert_eq!(era_label(Some(8)), "Babbage");
+        assert_eq!(era_label(Some(9)), "Conway");
         assert_eq!(era_label(Some(11)), "Conway");
-        assert_eq!(era_label(None), "--");
     }
 
     #[test]
