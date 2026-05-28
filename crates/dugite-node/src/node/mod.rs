@@ -3824,6 +3824,63 @@ impl Node {
 
                 // ── Governor evaluation (periodic, every 2s) ────────────
                 _ = governor_ticker.tick() => {
+                    // ── Divergence-witness check (#699) ───────────────────
+                    //
+                    // If `DIVERGENCE_PEER_THRESHOLD` distinct peers have all
+                    // offered a `MsgRollBackward` to a slot older than our
+                    // ImmutableDB tip within `DIVERGENCE_WINDOW`, then by
+                    // Ouroboros k-block finality our local chain has
+                    // diverged from the canonical network chain.  Without
+                    // an automated recovery (rollback_via_snapshot_replay)
+                    // we surface a clear operator error and shut down so
+                    // the operator can wipe + re-sync.
+                    {
+                        const DIVERGENCE_PEER_THRESHOLD: usize = 3;
+                        const DIVERGENCE_WINDOW: std::time::Duration =
+                            std::time::Duration::from_secs(300);
+                        let mut pm = peer_manager.write().await;
+                        let now = std::time::Instant::now();
+                        // GC stale witnesses first so the count reflects
+                        // recent events only.
+                        pm.gc_divergence_witnesses(now, DIVERGENCE_WINDOW);
+                        let witnesses = pm.divergence_witness_count(now, DIVERGENCE_WINDOW);
+                        if witnesses >= DIVERGENCE_PEER_THRESHOLD {
+                            // Snapshot the witness details for the error
+                            // message before dropping the lock.
+                            let witness_details: Vec<(SocketAddr, u64, u64)> = pm
+                                .divergence_witnesses()
+                                .map(|(addr, (_, r, i))| (*addr, *r, *i))
+                                .collect();
+                            drop(pm);
+                            tracing::error!(
+                                witness_count = witnesses,
+                                threshold = DIVERGENCE_PEER_THRESHOLD,
+                                window_secs = DIVERGENCE_WINDOW.as_secs(),
+                                witnesses = ?witness_details,
+                                "CHAIN DIVERGED FROM NETWORK — \
+                                 multiple peers have offered MsgRollBackward \
+                                 to a slot older than our ImmutableDB tip. \
+                                 By Ouroboros k-block finality, our local \
+                                 chain is no longer on the canonical fork. \
+                                 Operator action required: wipe the database \
+                                 directory and re-sync from genesis OR import \
+                                 a fresh Mithril snapshot. \
+                                 Shutting down to prevent further divergence (#699)."
+                            );
+                            // Returning Err propagates to `Node::run`'s
+                            // caller, which exits the process with non-zero
+                            // status.  Background tokio tasks are torn down
+                            // by their drop handlers / parent cancellation.
+                            return Err(anyhow::anyhow!(
+                                "Chain diverged from network — \
+                                 {witnesses} peers witnessed rollback below \
+                                 ImmutableDB tip in last \
+                                 {window_secs}s. Operator action required.",
+                                window_secs = DIVERGENCE_WINDOW.as_secs()
+                            ));
+                        }
+                    }
+
                     // ── Apply any pending RuntimeConfig update ───────────
                     //
                     // `has_changed()` returns true if the SIGHUP handler

@@ -3799,6 +3799,9 @@ pub async fn chainsync_client_task(
     // Shared flag: set to true on the first non-Origin MsgIntersectFound.
     // Allows the forge loop to gate on successful peer intersection.
     peer_intersection_established: Arc<std::sync::atomic::AtomicBool>,
+    // Shared peer-manager handle — used by the rollback-below-immutable
+    // guard (#699) to record divergence witnesses.
+    peer_manager: Arc<RwLock<super::networking::NodePeerManager>>,
 ) -> Result<()> {
     // ═══════════════════════════════════════════════════════════════════════
     // Phase 1: Build known points for intersection
@@ -4527,13 +4530,68 @@ pub async fn chainsync_client_task(
                         // `terminateAfterDrain RolledBackPastIntersection`.
                         let is_initial = initial_rollback;
                         {
+                            // Immutable-tip guard — applies to BOTH initial and
+                            // subsequent rollbacks.  A rollback to a slot older
+                            // than our ImmutableDB tip is protocol-impossible on
+                            // the canonical chain (Ouroboros k-block finality):
+                            // we have already committed those blocks to disk.
+                            // Such an offer means the peer is on a divergent
+                            // chain (or we are — see the divergence-witness
+                            // tracker in `NodePeerManager`).
+                            //
+                            // Issue #699 — previously the initial-rollback path
+                            // was exempted from this check, so a peer offering
+                            // a rollback to an ancestor far behind our
+                            // immutable tip was silently accepted as the
+                            // post-intersection rollback.  BlockFetch then
+                            // tried to fetch the peer's chain, chain-selection
+                            // refused to roll back (correct), and the node
+                            // stalled with no Chain extended log lines.
+                            let immutable_slot = chain_db
+                                .read()
+                                .await
+                                .get_immutable_tip_point()
+                                .and_then(|p| p.slot().map(|s| s.0))
+                                .unwrap_or(0);
+
+                            if immutable_slot > 0 && rollback_slot < immutable_slot {
+                                warn!(
+                                    %peer_addr,
+                                    rollback_slot,
+                                    immutable_slot,
+                                    is_initial,
+                                    "MsgRollBackward to point older than our \
+                                     ImmutableDB tip — peer is stale or divergent. \
+                                     Disconnecting (#699)."
+                                );
+                                // Record divergence-witness in the peer manager
+                                // so the run-loop can detect a multi-peer
+                                // divergence consensus and surface a clear
+                                // operator error.
+                                {
+                                    let mut pm = peer_manager.write().await;
+                                    pm.record_rollback_below_immutable(
+                                        peer_addr,
+                                        rollback_slot,
+                                        immutable_slot,
+                                    );
+                                }
+                                return Err(anyhow::anyhow!(
+                                    "Peer {peer_addr} requested rollback to slot \
+                                     {rollback_slot} (older than our ImmutableDB \
+                                     tip at slot {immutable_slot} — divergent chain \
+                                     or stale peer)"
+                                ));
+                            }
+
                             if initial_rollback {
                                 initial_rollback = false;
                                 debug!(
                                     %peer_addr,
                                     rollback_slot,
+                                    immutable_slot,
                                     "Skipping rollback depth check for initial \
-                                     post-intersection rollback",
+                                     post-intersection rollback (in-volatile-window)",
                                 );
                             } else {
                                 let chain_tip_slot = chain_db
