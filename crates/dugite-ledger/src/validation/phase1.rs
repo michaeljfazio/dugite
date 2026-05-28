@@ -1293,6 +1293,36 @@ pub(super) fn run_phase1_rules(
             }
         }
 
+        // Check each COLLATERAL input has a matching vkey witness. Mirrors
+        // Haskell `getConwayWitsVKeyNeeded` which unions the payment-key
+        // hashes from `collateralInputs` into the required witness set
+        // (alongside regular `inputs`). Collateral inputs are guaranteed
+        // VKey-locked by the `ScriptsNotPaidUTxO` predicate in
+        // `collateral::check_collateral`, so we only emit the vkey-witness
+        // requirement — script collateral is already rejected upstream.
+        //
+        // Without this check, dugite admits a Plutus tx that supplies a
+        // collateral input but omits the vkey witness for the collateral
+        // payment key; cardano-node rejects the resulting block with
+        // `ConwayUtxowFailure (MissingVKeyWitnessesUTXOW (NonEmptySet
+        // (fromList [KeyHash <payment-key>])))`. Round-1 attempt 4
+        // surfaced this on a cross-validate-cli `xv-03-plutus-spend-v3`
+        // tx (block f8212b3d...@slot 508).
+        for col_input in &body.collateral {
+            if let Some(utxo) = utxo_set.lookup(col_input) {
+                if let Some(Credential::VerificationKey(keyhash)) =
+                    utxo.address.payment_credential()
+                {
+                    if !vkey_witness_hashes.contains(keyhash) {
+                        errors.push(ValidationError::MissingInputWitness(keyhash.to_hex()));
+                    }
+                }
+                // Script-locked collateral is rejected by check_collateral
+                // (ScriptLockedCollateral); Byron/bootstrap collateral
+                // (no payment credential) is handled by Rule 14.
+            }
+        }
+
         // Check each withdrawal has a matching witness for its reward credential
         for reward_account_bytes in body.withdrawals.keys() {
             if let Some(cred) = extract_reward_credential(reward_account_bytes) {
