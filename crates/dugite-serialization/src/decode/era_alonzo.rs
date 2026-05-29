@@ -850,14 +850,10 @@ fn read_mir_cert(r: &mut Reader<'_>) -> Result<Certificate, SerializationError> 
     };
     let ty = r.peek_major()?;
     let target = match ty {
-        Type::Map => {
-            let mut creds = Vec::new();
-            let n = r.read_map_header()?.unwrap_or(0) as usize;
-            for _ in 0..n {
-                let cred = read_stake_credential(r)?;
-                let delta = r.read_int()? as i64;
-                creds.push((cred, delta));
-            }
+        Type::Map | Type::MapIndef => {
+            // Definite OR indefinite `{ stake_credential => delta_coin }` map
+            // (see era_shelley::read_mir_cert). read_map handles both.
+            let creds = r.read_map(read_stake_credential, |r| r.read_int().map(|d| d as i64))?;
             MIRTarget::StakeCredentials(creds)
         }
         Type::U8 | Type::U16 | Type::U32 | Type::U64 => {

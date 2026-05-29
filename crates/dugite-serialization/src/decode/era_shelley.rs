@@ -970,14 +970,14 @@ fn read_mir_cert(r: &mut Reader<'_>) -> Result<Certificate, SerializationError> 
     // target: map or coin
     let ty = r.peek_major()?;
     let target = match ty {
-        Type::Map => {
-            let mut creds = Vec::new();
-            let n = r.read_map_header()?.unwrap_or(0) as usize;
-            for _ in 0..n {
-                let cred = read_stake_credential(r)?;
-                let delta = r.read_int()? as i64;
-                creds.push((cred, delta));
-            }
+        Type::Map | Type::MapIndef => {
+            // `{ stake_credential => delta_coin }`, definite OR indefinite map.
+            // Mainnet's first Shelley MIR certs use an indefinite-length map;
+            // the previous `read_map_header().unwrap_or(0)` silently read zero
+            // entries for those and the indefinite type fell through to the
+            // error arm — blocking every Shelley block carrying a MIR cert.
+            // `read_map` handles both encodings.
+            let creds = r.read_map(read_stake_credential, |r| r.read_int().map(|d| d as i64))?;
             MIRTarget::StakeCredentials(creds)
         }
         Type::U8 | Type::U16 | Type::U32 | Type::U64 => {
@@ -1983,6 +1983,40 @@ mod tests {
                 target: MIRTarget::StakeCredentials(_),
             }
         ));
+    }
+
+    #[test]
+    fn shelley_mir_certificate_indefinite_map_target() {
+        // Mainnet's first Shelley MIR certs (epoch 208) encode the target as an
+        // INDEFINITE-length map `{ stake_credential => delta_coin }` (0xbf … 0xff).
+        // Regression for "mir target: expected map or uint, got indefinite map",
+        // which blocked the entire Byron→Shelley boundary on a from-genesis sync.
+        let mut cert = vec![0x82];
+        cert.extend(cbor_uint(6));
+        let mut mir = vec![0x82];
+        mir.extend(cbor_uint(0)); // source = Reserves
+        mir.push(0xbf); // target = INDEFINITE map
+        mir.push(0x82); // key: stake credential [0, hash28]
+        mir.extend(cbor_uint(0));
+        mir.extend(cbor_bytes(&[0x09; 28]));
+        mir.push(0x20); // value: delta = -1
+        mir.push(0xff); // break (end of indefinite map)
+        cert.extend(&mir);
+        let mut extra = Vec::new();
+        extra.extend(cbor_uint(4));
+        extra.push(0x81);
+        extra.extend(&cert);
+        let block = decode_shelley_block(&shelley_block_with_tx_body(&extra, 1)).unwrap();
+        match &block.transactions[0].body.certificates[0] {
+            Certificate::MoveInstantaneousRewards {
+                source: MIRSource::Reserves,
+                target: MIRTarget::StakeCredentials(creds),
+            } => {
+                assert_eq!(creds.len(), 1, "indefinite map must decode its 1 entry");
+                assert_eq!(creds[0].1, -1, "delta should be -1");
+            }
+            other => panic!("unexpected cert: {other:?}"),
+        }
     }
 
     #[test]

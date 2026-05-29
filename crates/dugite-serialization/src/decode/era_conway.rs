@@ -1618,7 +1618,7 @@ fn read_mir_cert(r: &mut Reader<'_>) -> Result<Certificate, SerializationError> 
     };
     let ty = r.peek_major()?;
     let target = match ty {
-        Type::Map => {
+        Type::Map | Type::MapIndef => {
             // Use read_map to handle both definite- and indefinite-length maps.
             let pairs = r.read_map(|r| read_stake_credential(r), |r| Ok(r.read_int()? as i64))?;
             MIRTarget::StakeCredentials(pairs)
