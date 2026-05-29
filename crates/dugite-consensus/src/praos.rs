@@ -1494,8 +1494,18 @@ impl OuroborosPraos {
             .ok_or(ConsensusError::InvalidKesSignature)?;
         let kes_period_offset = block_kes_period.saturating_sub(opcert.kes_period);
 
-        // Reconstruct the header body CBOR for verification
-        let header_body_cbor = dugite_serialization::encode_block_header_body(header);
+        // The KES signature signs the header body. Haskell verifies against
+        // `serialize'(pvMajor, body)`, which for a canonically-encoded block is
+        // byte-identical to the on-wire header-body bytes. Prefer the verbatim
+        // wire bytes captured at decode (`raw_header_body`) — this is correct for
+        // BOTH TPraos (Shelley–Alonzo, flat array(15), two VRF certs) and Praos
+        // (Babbage+, array(10), one VRF cert) without needing an era-specific
+        // byte-exact re-encoder. Fall back to re-encoding only for headers we
+        // forge ourselves (no wire bytes), where the Praos encoder is correct.
+        let header_body_cbor = match &header.raw_header_body {
+            Some(bytes) => bytes.clone(),
+            None => dugite_serialization::encode_block_header_body(header),
+        };
 
         // Parse the KES signature and verify against the hot verification key
         let mut hot_vkey = [0u8; 32];
@@ -1948,6 +1958,7 @@ mod tests {
             nonce_vrf_output: vec![],
             nonce_vrf_proof: vec![],
             prev_nonce: None,
+            raw_header_body: None,
             block_number: BlockNo(1),
             slot: SlotNo(slot),
             epoch_nonce: Hash32::ZERO,
@@ -4463,6 +4474,7 @@ mod tests {
             nonce_vrf_output: vec![],
             nonce_vrf_proof: vec![],
             prev_nonce: None,
+            raw_header_body: None,
         }
     }
 

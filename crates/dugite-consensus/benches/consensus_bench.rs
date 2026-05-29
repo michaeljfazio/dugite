@@ -75,6 +75,7 @@ fn make_header(block_no: u64, slot: u64, hash_seed: u64) -> BlockHeader {
         nonce_vrf_output: vec![0u8; 32],
         nonce_vrf_proof: vec![],
         prev_nonce: None,
+        raw_header_body: None,
     }
 }
 

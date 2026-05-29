@@ -494,6 +494,7 @@ pub fn decode_byron_main_block(
         nonce_vrf_output: Vec::new(),
         nonce_vrf_proof: Vec::new(),
         prev_nonce: None,
+        raw_header_body: None, // Byron (BFT) — no Praos KES
     };
 
     Ok(Block {
@@ -628,6 +629,7 @@ pub fn decode_byron_ebb_block(
         nonce_vrf_output: Vec::new(),
         nonce_vrf_proof: Vec::new(),
         prev_nonce: None,
+        raw_header_body: None, // Byron (BFT) — no Praos KES
     };
 
     Ok(Block {

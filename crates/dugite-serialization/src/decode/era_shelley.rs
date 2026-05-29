@@ -307,7 +307,10 @@ fn decode_shelley_header_inner(r: &mut Reader<'_>) -> Result<BlockHeader, Serial
         )));
     }
 
-    // header_body = array(15)
+    // header_body = array(15) — capture its raw bytes; this is exactly the
+    // message the KES signature signs (Haskell `serialize'(pvMajor, BHBody)`,
+    // byte-identical to the on-wire body for canonically-encoded blocks).
+    let body_start = r.position();
     let body_arr = r.read_array_header()?;
     if !matches!(body_arr, Some(15)) {
         return Err(SerializationError::CborDecode(format!(
@@ -346,6 +349,9 @@ fn decode_shelley_header_inner(r: &mut Reader<'_>) -> Result<BlockHeader, Serial
     // 14: protocol_minor
     let protocol_minor = r.read_uint()?;
 
+    // The header body spans from `body_start` to here (before the KES signature).
+    let raw_header_body = r.slice_from(body_start).to_vec();
+
     // KES signature (second element of outer array)
     let kes_signature = r.read_bytes_owned()?;
 
@@ -378,6 +384,7 @@ fn decode_shelley_header_inner(r: &mut Reader<'_>) -> Result<BlockHeader, Serial
         nonce_vrf_output: nonce_output,
         nonce_vrf_proof: nonce_proof,
         prev_nonce: None,
+        raw_header_body: Some(raw_header_body),
     })
 }
 

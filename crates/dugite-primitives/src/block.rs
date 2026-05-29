@@ -116,6 +116,24 @@ pub struct BlockHeader {
     /// `None` for all pre-Dijkstra eras (Byron through Conway).
     #[serde(default)]
     pub prev_nonce: Option<Hash32>,
+
+    /// Raw CBOR bytes of the header body (the first element of the wire
+    /// `[header_body, kes_signature]` array), captured verbatim during decode.
+    ///
+    /// This is the EXACT message the KES signature signs: Haskell verifies KES
+    /// over `serialize'(pvMajor, body)`, and for a canonically-encoded mainnet
+    /// block the on-wire header-body bytes ARE that serialization (a relay
+    /// cannot alter them without breaking the header hash). Using the wire bytes
+    /// avoids a byte-exact re-encoder for every era — critical because the
+    /// TPraos (Shelley–Alonzo) body is a flat `array(15)` with two VRF certs and
+    /// an inlined opcert/protver, whereas the Praos (Babbage+) body is an
+    /// `array(10)` with one VRF cert and a nested opcert.
+    ///
+    /// `None` for Byron (no Praos KES) and for headers dugite forges itself
+    /// (the forge path encodes + signs its own body); in those cases
+    /// `verify_kes_signature` falls back to `encode_block_header_body`.
+    #[serde(default)]
+    pub raw_header_body: Option<Vec<u8>>,
 }
 
 /// VRF output
@@ -327,6 +345,7 @@ mod tests {
             nonce_vrf_output: vec![],
             nonce_vrf_proof: vec![],
             prev_nonce: None,
+            raw_header_body: None,
         }
     }
 

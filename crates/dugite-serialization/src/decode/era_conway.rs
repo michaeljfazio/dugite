@@ -287,6 +287,8 @@ fn decode_conway_header_inner(
     // Conway header_body = array(10).
     // Dijkstra may add an optional 11th element: prevNonce (bytes(32) or null).
     // We accept array(10) or array(11) to handle both.
+    // Capture raw bytes (the KES-signed message) — includes the 11th element.
+    let body_start = r.position();
     let body_arr = r.read_array_header()?;
     let body_len = match body_arr {
         Some(n @ (10 | 11)) => n,
@@ -333,6 +335,8 @@ fn decode_conway_header_inner(
         None
     };
 
+    let raw_header_body = r.slice_from(body_start).to_vec();
+
     // KES signature (second element of outer array)
     let kes_signature = r.read_bytes_owned()?;
 
@@ -363,6 +367,7 @@ fn decode_conway_header_inner(
         },
         nonce_vrf_proof: Vec::new(), // Praos has no separate nonce proof
         prev_nonce,
+        raw_header_body: Some(raw_header_body),
     })
 }
 

@@ -291,7 +291,8 @@ fn decode_alonzo_header_inner(r: &mut Reader<'_>) -> Result<BlockHeader, Seriali
         )));
     }
 
-    // header_body = array(15)
+    // header_body = array(15) — capture raw bytes (the KES-signed message).
+    let body_start = r.position();
     let body_arr = r.read_array_header()?;
     if !matches!(body_arr, Some(15)) {
         return Err(SerializationError::CborDecode(format!(
@@ -316,6 +317,8 @@ fn decode_alonzo_header_inner(r: &mut Reader<'_>) -> Result<BlockHeader, Seriali
     let op_sigma = r.read_bytes_owned()?;
     let protocol_major = r.read_uint()?;
     let protocol_minor = r.read_uint()?;
+
+    let raw_header_body = r.slice_from(body_start).to_vec();
 
     let kes_signature = r.read_bytes_owned()?;
 
@@ -347,6 +350,7 @@ fn decode_alonzo_header_inner(r: &mut Reader<'_>) -> Result<BlockHeader, Seriali
         nonce_vrf_output: nonce_output,
         nonce_vrf_proof: nonce_proof,
         prev_nonce: None,
+        raw_header_body: Some(raw_header_body),
     })
 }
 

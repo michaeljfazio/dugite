@@ -289,6 +289,7 @@ mod tests {
             nonce_vrf_output: vec![],
             nonce_vrf_proof: vec![],
             prev_nonce: None,
+            raw_header_body: None,
         }
     }
 
