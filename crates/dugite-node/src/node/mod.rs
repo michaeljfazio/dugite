@@ -4608,10 +4608,15 @@ impl Node {
                     // is ordered oldest-first and every hash is already present in
                     // the VolatileDB (they were stored as part of the competing fork
                     // before chain selection switched the tip).
-                    let validation_mode = if self.validate_all_blocks {
-                        BlockValidationMode::ValidateAll
-                    } else {
+                    // Fork blocks come from peers too — full-validate by default
+                    // (cardano-node parity); DUGITE_TRUSTED_CATCHUP=1 opts out.
+                    let validation_mode = if std::env::var("DUGITE_TRUSTED_CATCHUP")
+                        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+                        .unwrap_or(false)
+                    {
                         BlockValidationMode::ApplyOnly
+                    } else {
+                        BlockValidationMode::ValidateAll
                     };
                     // Captures the last successfully-applied fork block so we
                     // can refresh post-apply state (N2C snapshot etc.) once
@@ -4952,27 +4957,28 @@ impl Node {
         // `ApplyOnly` mode — the same mode used for ImmutableDB chunk
         // replay after a Mithril import.  Phase-2 Plutus is skipped, witness
         // verification is skipped, all STS predicates are skipped.  The
-        // node still computes state transitions (UTxO updates, cert apply,
-        // gov state) so the resulting ledger is byte-exact with a fully-
-        // validated replay PROVIDED the peers fed us canonical-chain blocks
-        // (which is the standard catch-up assumption — peers can't forge
-        // a block that passes their own ChainSync forwarders).
+        // Ledger validation mode for a block fetched from a PEER.
         //
-        // This is a deliberate Haskell deviation: cardano-node always runs
-        // ValidateAll on network blocks.  The trade-off is safety (we trust
-        // peer block validity for the catch-up window) for ~25x speedup at
-        // Babbage epoch 30+ — verified against the same profile that
-        // showed write() / crc32fast / Plutus eval dominating the at-tip
-        // apply path.
+        // Default: ValidateAll — full Phase-1 (witnesses, value/fee, TTL, ref
+        // scripts) + Phase-2 (Plutus CEK) validation on EVERY network block,
+        // matching cardano-node. cardano-node never trusts peer blocks: it runs
+        // `STS.ValidateAll` on every block received from the network and only
+        // uses `ValidateNone`/reapply when replaying its OWN already-validated
+        // ImmutableDB. Reapplying without validation here is a consensus-safety
+        // bug — a peer could feed a structurally-valid but cryptographically/
+        // ledger-invalid block during catch-up and we would accept it, diverging
+        // from the canonical chain.
+        //
+        // `DUGITE_TRUSTED_CATCHUP=1` opts OUT into the old fast (UNSAFE) reapply
+        // behaviour for dev/profiling throughput runs only — it trusts peers and
+        // skips Plutus, ~25x faster at Babbage+ but NOT cardano-node-equivalent.
         let trusted_catchup = std::env::var("DUGITE_TRUSTED_CATCHUP")
             .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
             .unwrap_or(false);
         let validation_mode = if trusted_catchup {
             BlockValidationMode::ApplyOnly
-        } else if self.validate_all_blocks {
-            BlockValidationMode::ValidateAll
         } else {
-            BlockValidationMode::ApplyOnly
+            BlockValidationMode::ValidateAll
         };
         // Observability (#698): track how many live-tip blocks go through
         // each mode so dashboards can distinguish full-validation from replay.
@@ -7133,10 +7139,15 @@ impl Node {
                                 // (our forged block). The caller below runs the
                                 // normal own-block apply + announce path for the
                                 // last element, so we must not double-apply it here.
-                                let validation_mode = if self.validate_all_blocks {
-                                    BlockValidationMode::ValidateAll
-                                } else {
+                                // Full-validate by default (cardano-node parity);
+                                // DUGITE_TRUSTED_CATCHUP=1 opts out.
+                                let validation_mode = if std::env::var("DUGITE_TRUSTED_CATCHUP")
+                                    .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+                                    .unwrap_or(false)
+                                {
                                     BlockValidationMode::ApplyOnly
+                                } else {
+                                    BlockValidationMode::ValidateAll
                                 };
                                 let intermediate = &apply[..apply.len() - 1];
                                 let mut replay_failed = false;
