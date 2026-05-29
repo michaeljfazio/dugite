@@ -9,15 +9,29 @@
 //! to drive state transitions. It also enforces the Limit on Eagerness (LoE)
 //! and runs the Genesis Density Disconnector (GDD).
 //!
-//! ## LoE enforcement
+//! ## LoE semantics
 //!
-//! `compute_loe_slot()` returns the maximum immutable tip slot that block
-//! application should advance to:
-//! - **PreSyncing**: `Some(0)` — freeze the immutable tip at genesis.
+//! The Limit on Eagerness constrains chain **selection** — how far the selected
+//! chain may extend beyond the intersection of the current candidate fragments
+//! — NOT immutable finalisation. In `ouroboros-consensus`, `copyToImmutableDB`
+//! runs unconditionally on k-depth alone and is never gated by the LoE/GSM
+//! state; PreSyncing freezes the selected tip (so there is nothing new to
+//! finalise), but the flush mechanism itself is always live. dugite finalises
+//! k-deep in EVERY consensus mode (`flush_to_immutable_batch_retain`); the LoE
+//! must NOT gate the volatile→immutable flush (an earlier build did, which froze
+//! the immutable tip during Byron PreSyncing and grew the VolatileDB without
+//! bound).
+//!
+//! `compute_loe_slot()` reports the selection-eagerness ceiling for diagnostics
+//! and for future selection-side wiring (GDD trimming of candidate fragments):
+//! - **PreSyncing**: `Some(0)` — no eager selection until the HAA holds.
 //! - **Syncing**: `Some(min_intersection)` — the minimum intersection slot
-//!   across all tracked peers, ensuring the immutable tip cannot pass any
-//!   peer's fork point.
-//! - **CaughtUp**: `None` — no constraint; normal unconstrained flushing.
+//!   across all tracked peers.
+//! - **CaughtUp**: `None` — unconstrained.
+//!
+//! NOTE: dugite's live chain-selection path does not yet apply this LoE to
+//! candidate selection (the GDD selection-trimming is incomplete), so genesis
+//! mode currently selects + finalises like Praos (longest chain, k-final).
 //!
 //! ## GDD (Genesis Density Disconnector)
 //!
