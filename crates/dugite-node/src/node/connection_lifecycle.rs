@@ -2025,6 +2025,24 @@ impl ConnectionLifecycleManager {
                                                             warn!(%addr, path = %path.display(), bytes = block_cbor.len(), "dumped failing block CBOR");
                                                         }
                                                     }
+                                                    // Abort the range: NEVER store a block past an
+                                                    // undecodable one. A gap in the stored chain gets
+                                                    // flushed to the ImmutableDB and then cannot be
+                                                    // connected across on replay (observed: a decode bug
+                                                    // at the Byron→Shelley boundary corrupted the db this
+                                                    // way). Returning Err drops this range's collected
+                                                    // blocks and fails the peer; the selected tip stays at
+                                                    // the last good block and a restart recovers cleanly
+                                                    // from the snapshot. A block that fails to deserialise
+                                                    // is a hard peer fault.
+                                                    return Err(
+                                                        dugite_network::error::ProtocolError::CborDecode {
+                                                            protocol: "BlockFetch",
+                                                            reason: format!(
+                                                                "block deserialisation failed: {e}"
+                                                            ),
+                                                        },
+                                                    );
                                                 }
                                             }
                                             Ok(())
