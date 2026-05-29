@@ -62,20 +62,27 @@ const WAL_HEADER_SIZE_LEGACY: usize = 4 + 8 + 8 + 32 + 4; // 56 bytes
 /// WAL file name within the volatile directory.
 const WAL_FILENAME: &str = "volatile-wal.bin";
 
-/// Maximum WAL file size before a preemptive compact is triggered.
+/// Reclaimable-garbage slack tolerated in the WAL before a preemptive compact
+/// is triggered, measured ABOVE the live-set floor recorded at the last
+/// compaction (see `wal_size_floor`).
 ///
-/// At 90 KiB per Conway block and security parameter k = 2160, a full
-/// volatile window is ≈ 194 MiB.  Allow 2× headroom for fork blocks that
-/// live alongside the selected chain before GC, giving 400 MiB.
+/// This is NOT an absolute size cap.  `compact_wal()` rewrites the WAL to
+/// contain exactly the current in-memory volatile blocks, so the WAL can never
+/// shrink below the serialized live set.  With a large volatile retention
+/// (`DUGITE_VOLATILE_RETAIN`, default 10 000 blocks) that live set can itself
+/// exceed any fixed cap as block sizes grow — e.g. ~10 000 deep-Byron blocks
+/// serialize to >400 MiB.  An absolute `WAL > cap` trigger would then fire on
+/// EVERY append (compaction rewrites to ~live-set size, still > cap, so the
+/// next block recompacts the whole WAL) — observed as a sync collapse to
+/// ~2 blk/s at 99 % CPU once the WAL crossed 400 MiB mid-Byron.
 ///
-/// If the WAL on disk exceeds this threshold when a new block is added,
-/// `compact_wal()` is called before writing so that finalized blocks
-/// already removed from memory do not remain on disk indefinitely.
-///
-/// This guards against the G4 attack: a peer serving a crafted chain that
-/// stays just below the k-depth flush threshold can cause the WAL to grow
-/// without bound (ENOSPC → crash) unless we compact proactively.
-const WAL_MAX_SIZE_BYTES: u64 = 400 * 1024 * 1024; // 400 MiB
+/// Instead we compact only once the WAL has accumulated this much reclaimable
+/// garbage beyond the live-set floor, which bounds compaction to O(1) amortised
+/// (one rewrite per `WAL_COMPACTION_SLACK_BYTES` of appends) and the WAL to
+/// `floor + slack`.  This still guards the G4 unbounded-growth attack: a peer
+/// serving blocks that stay just below the k-depth flush threshold accumulates
+/// garbage that is reclaimed every slack window.
+const WAL_COMPACTION_SLACK_BYTES: u64 = 400 * 1024 * 1024; // 400 MiB
 
 /// Manages the write-ahead log file for crash recovery.
 struct WalWriter {
@@ -558,6 +565,13 @@ pub struct VolatileDB {
     /// Tip of the selected chain: (slot, hash, block_no).
     tip: Option<(u64, Hash32, u64)>,
     wal: Option<WalWriter>,
+    /// WAL byte size immediately after the most recent `compact_wal()` — the
+    /// irreducible serialized live-set size, below which compaction cannot
+    /// shrink the WAL.  A new compaction is triggered only once the WAL grows
+    /// past `wal_size_floor + WAL_COMPACTION_SLACK_BYTES`, so compaction can
+    /// never run on every append even when the live set exceeds a fixed cap.
+    /// 0 until the first compaction.
+    wal_size_floor: u64,
     /// Currently-selected chain fragment, ordered oldest to newest.
     selected_chain: Vec<Hash32>,
     /// Blocks scheduled for garbage collection (orphaned fork blocks).
@@ -583,6 +597,7 @@ impl VolatileDB {
             leaves: HashSet::new(),
             tip: None,
             wal: None,
+            wal_size_floor: 0,
             selected_chain: Vec::new(),
             gc_schedule: HashMap::new(),
             headers: HashMap::new(),
@@ -612,6 +627,7 @@ impl VolatileDB {
             leaves: HashSet::new(),
             tip: None,
             wal: None,
+            wal_size_floor: 0,
             selected_chain: Vec::new(),
             gc_schedule: HashMap::new(),
             headers: HashMap::new(),
@@ -688,9 +704,10 @@ impl VolatileDB {
     /// the WAL so that the successors map can be reconstructed accurately
     /// after a crash.
     ///
-    /// G4: If the WAL exceeds `WAL_MAX_SIZE_BYTES`, `compact_wal()` is called
-    /// before appending to prevent adversarial WAL growth (a peer serving a
-    /// crafted chain just below the k-depth flush threshold can cause the WAL
+    /// G4: If the WAL exceeds `wal_size_floor + WAL_COMPACTION_SLACK_BYTES`,
+    /// `compact_wal()` is called before appending to prevent adversarial WAL
+    /// growth (a peer serving a crafted chain just below the k-depth flush
+    /// threshold can cause the WAL
     /// to accumulate until ENOSPC).
     ///
     /// Returns `true` iff the block extended `selected_chain` (i.e. it
@@ -704,17 +721,26 @@ impl VolatileDB {
         prev_hash: Hash32,
         cbor: Vec<u8>,
     ) -> bool {
-        // G4: proactively compact the WAL if it has grown past the size cap.
-        // This rewrites the WAL to contain only the current in-memory blocks,
-        // dropping finalized entries that survived after flush_to_immutable.
-        // Routine maintenance — logged at `debug!` so it doesn't look alarming.
+        // G4: proactively compact the WAL once it has accumulated more than
+        // WAL_COMPACTION_SLACK_BYTES of reclaimable garbage ABOVE the live-set
+        // floor (the WAL size recorded at the last compaction). This rewrites
+        // the WAL to contain only the current in-memory blocks, dropping
+        // finalized entries that survived after flush_to_immutable. Triggering
+        // on slack-above-floor (rather than an absolute cap the live set can
+        // itself exceed) bounds compaction to O(1) amortised — see the
+        // `WAL_COMPACTION_SLACK_BYTES` doc for the per-block-recompaction
+        // collapse this avoids. Routine maintenance — logged at `debug!`.
         if let Some(ref wal) = self.wal {
+            let threshold = self
+                .wal_size_floor
+                .saturating_add(WAL_COMPACTION_SLACK_BYTES);
             match std::fs::metadata(&wal.path) {
-                Ok(meta) if meta.len() > WAL_MAX_SIZE_BYTES => {
+                Ok(meta) if meta.len() > threshold => {
                     debug!(
                         wal_bytes = meta.len(),
-                        cap_bytes = WAL_MAX_SIZE_BYTES,
-                        "WAL size cap exceeded — compacting before next append"
+                        floor_bytes = self.wal_size_floor,
+                        slack_bytes = WAL_COMPACTION_SLACK_BYTES,
+                        "WAL reclaimable-slack exceeded — compacting before next append"
                     );
                     self.compact_wal();
                 }
@@ -1192,6 +1218,7 @@ impl VolatileDB {
         self.gc_schedule.clear();
         self.headers.clear();
         self.tip = None;
+        self.wal_size_floor = 0;
 
         if let Some(ref mut wal) = self.wal {
             if let Err(e) = wal.truncate() {
@@ -1274,25 +1301,39 @@ impl VolatileDB {
     /// Calling this after each `flush_to_immutable` keeps crash-recovery time
     /// proportional to the volatile window size rather than the full sync history.
     pub fn compact_wal(&mut self) {
-        if let Some(ref mut wal) = self.wal {
-            let remaining: Vec<(u64, u64, Hash32, Hash32, Vec<u8>)> = self
-                .blocks
-                .iter()
-                .map(|(h, b)| (b.slot, b.block_no, *h, b.prev_hash, b.cbor.clone()))
-                .collect();
-            if let Err(e) = wal.rewrite(&remaining) {
-                warn!(
-                    error = %e,
-                    blocks = remaining.len(),
-                    "WAL: compact_wal rewrite failed"
-                );
-            } else {
-                debug!(
-                    blocks = remaining.len(),
-                    "WAL: compacted to {} volatile entries",
-                    remaining.len()
-                );
-            }
+        // Collect the live set first so `self.blocks` is not borrowed while we
+        // mutably borrow `self.wal` (and then assign `self.wal_size_floor`).
+        let remaining: Vec<(u64, u64, Hash32, Hash32, Vec<u8>)> = self
+            .blocks
+            .iter()
+            .map(|(h, b)| (b.slot, b.block_no, *h, b.prev_hash, b.cbor.clone()))
+            .collect();
+        let new_floor = match self.wal {
+            Some(ref mut wal) => match wal.rewrite(&remaining) {
+                Ok(()) => {
+                    debug!(
+                        blocks = remaining.len(),
+                        "WAL: compacted to {} volatile entries",
+                        remaining.len()
+                    );
+                    // The post-compaction WAL size is the irreducible live-set
+                    // floor; record it so the next compaction only fires after
+                    // another WAL_COMPACTION_SLACK_BYTES of appends.
+                    std::fs::metadata(&wal.path).map(|m| m.len()).ok()
+                }
+                Err(e) => {
+                    warn!(
+                        error = %e,
+                        blocks = remaining.len(),
+                        "WAL: compact_wal rewrite failed"
+                    );
+                    None
+                }
+            },
+            None => None,
+        };
+        if let Some(sz) = new_floor {
+            self.wal_size_floor = sz;
         }
     }
 
@@ -3393,7 +3434,7 @@ mod tests {
         );
     }
 
-    /// Verify that WAL_MAX_SIZE_BYTES is exposed (compile-time check) and that
+    /// Verify that WAL_COMPACTION_SLACK_BYTES is exposed (compile-time check) and that
     /// compact_wal is called before writing when the WAL exceeds the cap.
     ///
     /// We cannot easily create a 400 MiB WAL in a unit test, so we verify that
@@ -3422,6 +3463,67 @@ mod tests {
         assert!(
             db2.has_block(&hash),
             "block must survive compact + close + reopen"
+        );
+    }
+
+    /// Regression for the 2026-05-29 sync collapse: when the live volatile set
+    /// serializes to more than the old absolute WAL cap, compaction rewrote the
+    /// whole WAL on EVERY append (it could never shrink below the live set, so
+    /// `WAL > cap` stayed true). The slack-above-floor trigger must record the
+    /// post-compaction size as `wal_size_floor` and NOT recompact until the WAL
+    /// grows past `floor + WAL_COMPACTION_SLACK_BYTES`.
+    #[test]
+    fn test_wal_compaction_floor_avoids_per_block_recompaction() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let path = tmp.path();
+        let mut db = VolatileDB::open(path).expect("open");
+        let wal_path = path.join("volatile-wal.bin");
+
+        let mk = |i: u64| {
+            let mut h = [0u8; 32];
+            h[0..8].copy_from_slice(&i.to_be_bytes());
+            let mut prev = [0u8; 32];
+            if i > 0 {
+                prev[0..8].copy_from_slice(&(i - 1).to_be_bytes());
+            }
+            (Hash32::from_bytes(h), i * 1000, i, Hash32::from_bytes(prev))
+        };
+
+        for i in 0..10u64 {
+            let (h, slot, bn, prev) = mk(i);
+            db.add_block(h, slot, bn, prev, vec![0u8; 4096]);
+        }
+        // No compaction has run yet (WAL is far below floor(0) + slack).
+        assert_eq!(
+            db.wal_size_floor, 0,
+            "no compaction triggered for a tiny WAL"
+        );
+
+        // Explicit compaction records the live-set floor.
+        db.compact_wal();
+        let floor = db.wal_size_floor;
+        assert!(floor > 0, "floor recorded after compaction");
+        assert_eq!(
+            floor,
+            std::fs::metadata(&wal_path).unwrap().len(),
+            "floor must equal the post-compaction WAL file size"
+        );
+
+        // Many more appends stay far below floor + 400 MiB slack, so add_block
+        // must NOT recompact — the floor stays put. Under the old absolute-cap
+        // logic with a live set above the cap, this is exactly where every
+        // append recompacted the entire WAL.
+        for i in 10..200u64 {
+            let (h, slot, bn, prev) = mk(i);
+            db.add_block(h, slot, bn, prev, vec![0u8; 4096]);
+        }
+        assert_eq!(
+            db.wal_size_floor, floor,
+            "add_block must not recompact while WAL stays below floor + slack"
+        );
+        assert!(
+            std::fs::metadata(&wal_path).unwrap().len() > floor,
+            "WAL grew with appends but was not recompacted back to the floor"
         );
     }
 }
