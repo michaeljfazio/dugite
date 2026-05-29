@@ -829,6 +829,24 @@ impl App {
     /// `dugite_protocol_major_version` — guessing an era from epoch number
     /// silently misreports during from-genesis sync, so prefer honesty.
     pub fn current_era(&self) -> &'static str {
+        // Prefer the authoritative HFC era index (`dugite_era`), set from the
+        // applied block's era tag. The protocol-version-major mapping is wrong
+        // during Byron — the Shelley-shaped ledger reports major=2 throughout
+        // Byron, mislabelling it "Shelley". Fall back to PV only for older
+        // nodes that don't export `dugite_era`.
+        if self.metrics.has_metric("dugite_era") {
+            return match self.metrics.get_u64("dugite_era") {
+                0 => "Byron",
+                1 => "Shelley",
+                2 => "Allegra",
+                3 => "Mary",
+                4 => "Alonzo",
+                5 => "Babbage",
+                6 => "Conway",
+                7 => "Dijkstra",
+                _ => "Unknown",
+            };
+        }
         match self.metrics.get_u64("dugite_protocol_major_version") {
             0 => "Unknown",
             1 => "Byron",
@@ -1323,6 +1341,45 @@ mod tests {
             app.metrics = make_snapshot(vec![("dugite_protocol_major_version", pv as f64)]);
             assert_eq!(app.current_era(), expected, "PV {pv}");
         }
+    }
+
+    /// When the node exports the authoritative `dugite_era` HFC index, it MUST
+    /// take precedence over `dugite_protocol_major_version`. Regression for the
+    /// Byron-mislabelled-as-Shelley bug: at a Byron epoch the Shelley-shaped
+    /// ledger reports protocol major = 2, but era index 0 = Byron must win.
+    #[test]
+    fn test_current_era_prefers_hfc_era_index() {
+        let mut app = App::new();
+        for (era_idx, expected) in [
+            (0u64, "Byron"),
+            (1, "Shelley"),
+            (2, "Allegra"),
+            (3, "Mary"),
+            (4, "Alonzo"),
+            (5, "Babbage"),
+            (6, "Conway"),
+            (7, "Dijkstra"),
+        ] {
+            // Pair every era index with a contradictory PV major (2 = Shelley)
+            // to prove the era index — not the PV — drives the label.
+            app.metrics = make_snapshot(vec![
+                ("dugite_era", era_idx as f64),
+                ("dugite_protocol_major_version", 2.0),
+            ]);
+            assert_eq!(app.current_era(), expected, "era index {era_idx}");
+        }
+
+        // The specific reported bug: Byron block (era 0) while the ledger PV
+        // reads major 2 must display "Byron", not "Shelley".
+        app.metrics = make_snapshot(vec![
+            ("dugite_era", 0.0),
+            ("dugite_protocol_major_version", 2.0),
+        ]);
+        assert_eq!(
+            app.current_era(),
+            "Byron",
+            "Byron era must not be mislabelled Shelley from the ledger PV"
+        );
     }
 
     #[test]

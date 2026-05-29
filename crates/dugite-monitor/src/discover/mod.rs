@@ -33,6 +33,8 @@ pub struct DiscoveredNode {
     pub network: Option<Network>,
     pub is_block_producer: Option<bool>,
     pub protocol_major_version: Option<u64>,
+    /// HFC era index (`dugite_era`) — authoritative era, see `DiscoveredFields::era`.
+    pub era: Option<u64>,
     pub tip_slot: Option<u64>,
     pub sync_progress_percent: Option<f64>,
     pub db_path: Option<PathBuf>,
@@ -102,6 +104,7 @@ async fn discover_inner() -> Vec<DiscoveredNode> {
             network: outcome.fields.network,
             is_block_producer: outcome.fields.is_block_producer,
             protocol_major_version: outcome.fields.protocol_major_version,
+            era: outcome.fields.era,
             tip_slot: outcome.fields.tip_slot,
             sync_progress_percent: outcome.fields.sync_progress_percent,
             db_path,

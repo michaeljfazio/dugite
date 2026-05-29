@@ -200,7 +200,7 @@ fn draw_selection(frame: &mut Frame, nodes: &[DiscoveredNode], cursor: usize, th
             .map(|n| n.label().to_string())
             .unwrap_or_else(|| "--".to_string());
         let role = node.role_label();
-        let era = era_label(node.protocol_major_version);
+        let era = era_label(node.era, node.protocol_major_version);
         let tip = node
             .tip_slot
             .map_or_else(|| "--".to_string(), format_with_commas);
@@ -407,9 +407,24 @@ fn centered_rect(want_w: u16, want_h: u16, r: Rect) -> Rect {
     horizontal[1]
 }
 
-fn era_label(pv: Option<u64>) -> &'static str {
-    // Canonical Cardano protocol-version → era mapping
-    // (kept in sync with `App::current_era` in app.rs).
+fn era_label(era_index: Option<u64>, pv: Option<u64>) -> &'static str {
+    // Prefer the authoritative HFC era index (`dugite_era`); fall back to the
+    // protocol-version-major mapping only for older nodes that don't export it.
+    // The PV mapping is wrong during Byron (the Shelley-shaped ledger reports
+    // major 2 throughout Byron) — kept in sync with `App::current_era`.
+    if let Some(idx) = era_index {
+        return match idx {
+            0 => "Byron",
+            1 => "Shelley",
+            2 => "Allegra",
+            3 => "Mary",
+            4 => "Alonzo",
+            5 => "Babbage",
+            6 => "Conway",
+            7 => "Dijkstra",
+            _ => "--",
+        };
+    }
     match pv {
         Some(0) | None => "--",
         Some(1) => "Byron",
@@ -480,18 +495,33 @@ mod tests {
 
     #[test]
     fn era_label_maps_major_versions() {
-        assert_eq!(era_label(None), "--");
-        assert_eq!(era_label(Some(0)), "--");
-        assert_eq!(era_label(Some(1)), "Byron");
-        assert_eq!(era_label(Some(2)), "Shelley");
-        assert_eq!(era_label(Some(3)), "Allegra");
-        assert_eq!(era_label(Some(4)), "Mary");
-        assert_eq!(era_label(Some(5)), "Alonzo");
-        assert_eq!(era_label(Some(6)), "Alonzo");
-        assert_eq!(era_label(Some(7)), "Babbage");
-        assert_eq!(era_label(Some(8)), "Babbage");
-        assert_eq!(era_label(Some(9)), "Conway");
-        assert_eq!(era_label(Some(11)), "Conway");
+        // PV-major fallback (no HFC era index present).
+        assert_eq!(era_label(None, None), "--");
+        assert_eq!(era_label(None, Some(0)), "--");
+        assert_eq!(era_label(None, Some(1)), "Byron");
+        assert_eq!(era_label(None, Some(2)), "Shelley");
+        assert_eq!(era_label(None, Some(3)), "Allegra");
+        assert_eq!(era_label(None, Some(4)), "Mary");
+        assert_eq!(era_label(None, Some(5)), "Alonzo");
+        assert_eq!(era_label(None, Some(6)), "Alonzo");
+        assert_eq!(era_label(None, Some(7)), "Babbage");
+        assert_eq!(era_label(None, Some(8)), "Babbage");
+        assert_eq!(era_label(None, Some(9)), "Conway");
+        assert_eq!(era_label(None, Some(10)), "Conway");
+        assert_eq!(era_label(None, Some(11)), "Conway");
+    }
+
+    #[test]
+    fn era_label_prefers_hfc_era_index() {
+        // HFC era index wins over a contradictory PV major (2 = Shelley).
+        assert_eq!(era_label(Some(0), Some(2)), "Byron");
+        assert_eq!(era_label(Some(1), Some(2)), "Shelley");
+        assert_eq!(era_label(Some(2), Some(2)), "Allegra");
+        assert_eq!(era_label(Some(3), Some(2)), "Mary");
+        assert_eq!(era_label(Some(4), Some(2)), "Alonzo");
+        assert_eq!(era_label(Some(5), Some(2)), "Babbage");
+        assert_eq!(era_label(Some(6), Some(2)), "Conway");
+        assert_eq!(era_label(Some(7), Some(2)), "Dijkstra");
     }
 
     #[test]

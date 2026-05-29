@@ -14,6 +14,9 @@ pub(crate) struct DiscoveredFields {
     pub network: Option<Network>,
     pub is_block_producer: Option<bool>,
     pub protocol_major_version: Option<u64>,
+    /// HFC era index from `dugite_era` (authoritative era, independent of the
+    /// Shelley-shaped protocol-version major). 0=Byron .. 7=Dijkstra.
+    pub era: Option<u64>,
     pub tip_slot: Option<u64>,
     pub sync_progress_percent: Option<f64>,
 }
@@ -87,6 +90,9 @@ pub(crate) fn parse_discovered_fields(body: &str) -> DiscoveredFields {
             }
             "dugite_protocol_major_version" => {
                 out.protocol_major_version = Some(value as u64);
+            }
+            "dugite_era" => {
+                out.era = Some(value as u64);
             }
             "dugite_slot_number" => {
                 out.tip_slot = Some(value as u64);
