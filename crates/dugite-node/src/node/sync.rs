@@ -3646,24 +3646,43 @@ pub(crate) fn build_known_points(inp: &KnownPointsInputs) -> Vec<Point> {
         }
     };
 
-    // 1. ImmutableDB tip — unconditional, ALWAYS first. (Issue #552 fix.)
-    if let Some(imm) = inp.immutable_tip.clone() {
-        push_unique(&mut out, imm);
-    }
+    // Order matters: `MsgFindIntersect` returns the FIRST point in this list
+    // that is on the peer's chain, so the list MUST be NEWEST-FIRST for an
+    // up-to-date peer to intersect at OUR TIP.  If the immutable tip is listed
+    // first (as it was for issue #552), an up-to-date peer intersects at the
+    // immutable tip instead and then re-streams the entire volatile window
+    // (every block between the immutable tip and our real tip — up to the
+    // background-maintenance retention window, ~10 k blocks) which we already
+    // have.  That wasted re-stream drives `prune_already_known_pending_headers`
+    // (the #1 CPU consumer during bulk sync) and a peer reconnection churn.
+    // Issue #552 only requires the immutable tip to be PRESENT so a peer behind
+    // our ledger tip but ahead of our immutable tip can still find an
+    // intersection — it does NOT require it to be first.  A behind peer simply
+    // falls through the newer points it doesn't have and matches the immutable
+    // tip / deep-historical anchors lower in the list.
 
-    // 2. Ledger tip — usually equal to or above immutable tip; include unless
-    //    we have a divergent volatile chain (in which case the ledger tip is
-    //    still canonical — just don't trust the surrounding volatile blocks).
+    // 1. Ledger tip — our canonical applied tip; valid even when the
+    //    surrounding volatile chain is divergent.  An up-to-date peer matches
+    //    here and streams forward with no re-fetch of already-applied blocks.
     push_unique(&mut out, inp.ledger_tip.clone());
 
-    // 3. Volatile recent points — skipped when chain_diverged.
+    // 2. Volatile recent points (newest → older) — skipped when chain_diverged.
+    //    `get_chain_points` returns these newest-first; the tip itself dedupes
+    //    against the ledger tip above.
     if !inp.chain_diverged {
         for p in &inp.volatile_chain_points {
             push_unique(&mut out, p.clone());
         }
     }
 
-    // 4. Deep historical anchors from older ImmutableDB chunks.
+    // 3. ImmutableDB tip — unconditionally INCLUDED (issue #552), now after the
+    //    volatile window so it only serves as the fallback intersection for a
+    //    peer that is behind our volatile window.
+    if let Some(imm) = inp.immutable_tip.clone() {
+        push_unique(&mut out, imm);
+    }
+
+    // 4. Deep historical anchors from older ImmutableDB chunks (newest → oldest).
     for p in &inp.deep_historical {
         push_unique(&mut out, p.clone());
     }
@@ -5591,7 +5610,7 @@ mod chainsync_task_tests {
     }
 
     /// Immutable tip + ledger tip both present and distinct: both appear,
-    /// immutable tip first.
+    /// ledger tip first (newest-first ordering), immutable tip after.
     #[test]
     fn known_points_immutable_and_ledger_tip_distinct() {
         let imm = pt(100, 1);
@@ -5601,7 +5620,7 @@ mod chainsync_task_tests {
             immutable_tip: Some(imm.clone()),
             ..Default::default()
         });
-        assert_eq!(pts, vec![imm, ledger, Point::Origin]);
+        assert_eq!(pts, vec![ledger, imm, Point::Origin]);
     }
 
     /// When the immutable tip equals the ledger tip (no volatile blocks
@@ -5639,8 +5658,8 @@ mod chainsync_task_tests {
             chain_diverged: false,
         });
 
-        // Expected: [imm, ledger(=v0), v1, v2, deep0, deep1, Origin].
-        assert_eq!(pts, vec![imm, ledger, v1, v2, deep0, deep1, Point::Origin]);
+        // Newest-first: [ledger(=v0), v1, v2, imm, deep0, deep1, Origin].
+        assert_eq!(pts, vec![ledger, v1, v2, imm, deep0, deep1, Point::Origin]);
     }
 
     /// Acceptance condition for issue #552: when the local ledger is well
@@ -5864,21 +5883,39 @@ mod chainsync_task_tests {
         assert_eq!(intersection.unwrap(), &imm_pt);
     }
 
-    /// Ordering: immutable tip is always the FIRST non-Origin point when
-    /// non-Origin.  This matches Haskell's `chainSyncClientPipelined` anchor
-    /// preference (LedgerDB anchor first).
+    /// Ordering: the list is NEWEST-FIRST so an up-to-date peer intersects at
+    /// our tip (not the immutable tip, which would force a re-stream of the
+    /// whole volatile window).  `MsgFindIntersect` returns the first listed
+    /// point the peer has, so the newest point (the ledger tip) must come
+    /// first; the immutable tip is still present (issue #552) but lower in the
+    /// list as the behind-peer fallback.
     #[test]
-    fn known_points_immutable_tip_is_first() {
+    fn known_points_newest_first_ledger_tip_leads_immutable_present() {
         let imm = pt(1000, 10);
+        let ledger = pt(2000, 20);
         let pts = build_known_points(&KnownPointsInputs {
-            ledger_tip: pt(2000, 20),
+            ledger_tip: ledger.clone(),
             volatile_chain_points: vec![pt(1990, 30), pt(1980, 31)],
             immutable_tip: Some(imm.clone()),
             deep_historical: vec![pt(900, 40)],
             chain_diverged: false,
         });
-        // First non-Origin entry should be the immutable tip.
-        assert_eq!(pts[0], imm, "imm tip must be first: {pts:?}");
+        // First non-Origin entry is our newest point (the ledger tip).
+        assert_eq!(
+            pts[0], ledger,
+            "ledger tip must lead (newest-first): {pts:?}"
+        );
+        // Immutable tip is still offered (issue #552) — just not first.
+        assert!(
+            pts.contains(&imm),
+            "imm tip must still be present (#552): {pts:?}"
+        );
+        let ledger_idx = pts.iter().position(|p| p == &ledger).unwrap();
+        let imm_idx = pts.iter().position(|p| p == &imm).unwrap();
+        assert!(
+            ledger_idx < imm_idx,
+            "ledger tip must precede immutable tip: {pts:?}"
+        );
     }
 }
 
