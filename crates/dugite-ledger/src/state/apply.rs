@@ -378,8 +378,17 @@ impl LedgerState {
             }
             self.consensus.epoch_block_count += 1;
 
-            // Byron nonce: LAB nonce = prev_hash (OBFT, no VRF)
-            self.consensus.lab_nonce = block.header.prev_hash;
+            // Byron (PBFT/OBFT) does NOT maintain the TPraos `csLabNonce`: in
+            // Haskell the Byron ChainDepState has no nonce fields, and
+            // `translateChainDepStateByronToShelley` initialises `csLabNonce` to
+            // `NeutralNonce`. Keeping `lab_nonce` at NeutralNonce (ZERO) here is
+            // load-bearing: the first Shelley epoch-nonce TICKN (mainnet 207->208)
+            // copies `lab_nonce` into `last_epoch_block_nonce`, and if that holds a
+            // Byron prev-hash then η0(209) = candidate(208) ⭒ byron_hash instead of
+            // candidate(208) ⭒ NeutralNonce, breaking VRF on the first epoch-209
+            // block. The FIRST Shelley block is what first sets `lab_nonce` (see
+            // common.rs / shelley evolve_nonce).
+            self.consensus.lab_nonce = dugite_primitives::hash::Hash32::ZERO;
 
             self.tip = block.tip();
             if block.era > self.era {

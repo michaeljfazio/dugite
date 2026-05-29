@@ -552,6 +552,34 @@ pub(crate) fn drain_withdrawal_accounts(tx: &Transaction, certs: &mut CertSubSta
 // 5. compute_shelley_nonce
 // ============================================================================
 
+/// First absolute slot of a Shelley-or-later `epoch`, accounting for the Byron
+/// prefix. Mirrors `crate::state::LedgerState::first_slot_of_epoch` for the
+/// Shelley+ branch: `byron_slots + (epoch - shelley_transition_epoch) *
+/// shelley_epoch_length`, where `byron_slots = shelley_transition_epoch *
+/// byron_epoch_length`.
+///
+/// The era `evolve_nonce` functions previously inlined `epoch * epoch_length +
+/// byron_slots`, which is correct only when `shelley_transition_epoch == 0`
+/// (Byron-less testnets like preview). On mainnet (`shelley_transition_epoch =
+/// 208`) it overshot by `shelley_transition_epoch * shelley_epoch_length`, so
+/// `first_slot_of_next_epoch` landed far in the future and the candidate-nonce
+/// stability-window freeze never fired — corrupting the epoch nonce at the first
+/// Shelley boundary (breaking VRF) and also breaking `isOverlaySlot`. Always use
+/// this helper.
+pub(crate) fn first_slot_of_shelley_epoch(
+    epoch: u64,
+    shelley_transition_epoch: u64,
+    byron_epoch_length: u64,
+    shelley_epoch_length: u64,
+) -> u64 {
+    let byron_slots = shelley_transition_epoch.saturating_mul(byron_epoch_length);
+    byron_slots.saturating_add(
+        epoch
+            .saturating_sub(shelley_transition_epoch)
+            .saturating_mul(shelley_epoch_length),
+    )
+}
+
 /// Evolve nonce state after processing a Shelley+ block header.
 ///
 /// Implements Haskell's `reupdateChainDepState` nonce state machine:
