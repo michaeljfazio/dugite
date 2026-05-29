@@ -70,8 +70,9 @@ impl Widget for HeaderBar<'_> {
         // Render character by character with appropriate styling.
         let mut x = area.left();
 
-        // "dugite-monitor" logo.
-        let prefix = " dugite-monitor ";
+        // "Dugite" logo — kept consistent with the full-layout header
+        // (`render_header` in ui.rs), which also uses " Dugite ".
+        let prefix = " Dugite ";
         for ch in prefix.chars() {
             if x >= area.right() {
                 break;
@@ -230,11 +231,11 @@ mod tests {
         let area = Rect::new(0, 0, 120, 2);
         let mut buf = Buffer::empty(area);
         header.render(area, &mut buf);
-        // Verify the first line contains "dugite-monitor".
+        // Verify the first line contains the "Dugite" logo.
         let line1: String = (0..area.width)
             .map(|x| buf[(x, 0)].symbol().chars().next().unwrap_or(' '))
             .collect();
-        assert!(line1.contains("dugite-monitor"));
+        assert!(line1.contains("Dugite"));
     }
 
     #[test]
@@ -336,7 +337,7 @@ mod tests {
         let area = Rect::new(0, 0, 120, 2);
         let mut buf = Buffer::empty(area);
         header.render(area, &mut buf);
-        // The 't' in "dugite-monitor" at cell 1 (0-indexed) should have the accent color.
+        // The 'D' in the " Dugite " logo at cell 1 (0-indexed) should have the accent color.
         let cell = &buf[(1, 0)];
         assert_eq!(
             cell.fg, THEME_MONOKAI.accent,
