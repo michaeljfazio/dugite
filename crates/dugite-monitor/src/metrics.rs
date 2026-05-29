@@ -41,6 +41,14 @@ impl MetricsSnapshot {
     pub fn get_u64(&self, name: &str) -> u64 {
         self.get(name) as u64
     }
+
+    /// Whether the named metric was present in the last scrape.
+    ///
+    /// Distinguishes a genuine zero value from an absent metric (older nodes),
+    /// which `get`/`get_u64` cannot (both return 0).
+    pub fn has_metric(&self, name: &str) -> bool {
+        self.values.contains_key(name)
+    }
 }
 
 /// Parse Prometheus text exposition format into a `MetricsSnapshot`.

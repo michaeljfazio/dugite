@@ -549,9 +549,21 @@ impl App {
         }
 
         // Compute epoch progress.
+        //
+        // Prefer the node's era-aware `dugite_slot_in_epoch` gauge: a plain
+        // `slot % epoch_length` is wrong across the Byron/Shelley boundary
+        // (Shelley epochs do not start at slot 0, and the epoch length differs
+        // per era), which made the epoch number roll while the bar was only
+        // partway full.  Fall back to the modulo only for older nodes that do
+        // not export the gauge (sentinel 0 with slot 0 is indistinguishable, so
+        // we also require the gauge to be present via `has_metric`).
         let epoch_length = self.epoch_length_for_snapshot(&snapshot);
         let slot = snapshot.get_u64("dugite_slot_number");
-        let slot_in_epoch = slot % epoch_length.max(1);
+        let slot_in_epoch = if snapshot.has_metric("dugite_slot_in_epoch") {
+            snapshot.get_u64("dugite_slot_in_epoch")
+        } else {
+            slot % epoch_length.max(1)
+        };
         self.slot_in_epoch = slot_in_epoch;
         self.epoch_slots_remaining_inner(epoch_length, slot_in_epoch);
 
@@ -634,14 +646,20 @@ impl App {
         };
     }
 
-    /// Determine epoch length for a snapshot (override > metric > network default > 432,000).
+    /// Determine epoch length for a snapshot
+    /// (era-aware node metric > manual override > network default > 432,000).
+    ///
+    /// The node's `dugite_epoch_length` is era-aware and authoritative, so it
+    /// takes precedence over the network-default `epoch_length_override`
+    /// (which is the fixed Shelley length and would otherwise misreport the
+    /// Byron epoch length, rolling the epoch number at ~5 % progress).
     fn epoch_length_for_snapshot(&self, snapshot: &MetricsSnapshot) -> u64 {
-        if self.epoch_length_override > 0 {
-            return self.epoch_length_override;
-        }
         let metric = snapshot.get_u64("dugite_epoch_length");
         if metric > 0 {
             return metric;
+        }
+        if self.epoch_length_override > 0 {
+            return self.epoch_length_override;
         }
         let magic = snapshot.get_u64("dugite_network_magic");
         if magic > 0 {
@@ -651,14 +669,15 @@ impl App {
         432_000
     }
 
-    /// Get the effective epoch length using current state.
+    /// Get the effective epoch length using current state (era-aware node
+    /// metric first, then manual override, then network default).
     pub fn epoch_length(&self) -> u64 {
-        if self.epoch_length_override > 0 {
-            return self.epoch_length_override;
-        }
         let metric = self.metrics.get_u64("dugite_epoch_length");
         if metric > 0 {
             return metric;
+        }
+        if self.epoch_length_override > 0 {
+            return self.epoch_length_override;
         }
         self.network.epoch_length()
     }

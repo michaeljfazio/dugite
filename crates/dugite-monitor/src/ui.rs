@@ -285,6 +285,7 @@ fn render_compact_header(frame: &mut Frame, app: &App, theme: &Theme, area: Rect
         tip_age,
         uptime: App::format_uptime(uptime_secs),
         epoch_progress: app.epoch_progress_pct / 100.0,
+        consensus_genesis: app.metrics.get_u64("dugite_consensus_mode") == 1,
         // Use the NodeStatus-derived connectivity flag so that the HeaderBar
         // widget shows "Disconnected" whenever the node cannot be reached,
         // matching the behaviour of the standard (wide) header pill.

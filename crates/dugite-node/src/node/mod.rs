@@ -1783,6 +1783,7 @@ impl Node {
         let node_metrics = {
             let m = crate::metrics::NodeMetrics::new();
             m.set_network_magic(network_magic);
+            m.set_consensus_mode_genesis(args.consensus_mode == "genesis");
             m.set_compat_metrics(args.compat_metrics);
             m.liveness_threshold_secs.store(
                 args.liveness_threshold_secs,
@@ -5338,6 +5339,23 @@ impl Node {
             self.metrics.set_protocol_version(pv_major, pv_minor);
         }
         self.metrics.refresh_sync_progress(block_slot.0);
+
+        // Era-aware epoch-progress gauges (`dugite_epoch_length` +
+        // `dugite_slot_in_epoch`) for dugite-monitor.  The HFC era history is
+        // the authoritative slot↔epoch map across the Byron/Shelley boundary,
+        // so this reports the current era's epoch length (e.g. Byron 21600 vs
+        // Shelley 432000) and the correct in-epoch offset — fixing the monitor
+        // rolling the epoch number while the progress bar was only ~5% full.
+        // On a past-horizon error (should not happen for an already-applied
+        // slot) we leave the previous values in place.
+        {
+            let eh = self.era_history.read().await;
+            if let Ok((eh_epoch, slot_in_epoch)) = eh.slot_to_epoch(block_slot) {
+                if let Ok(epoch_len) = eh.epoch_size(eh_epoch) {
+                    self.metrics.set_epoch_progress(epoch_len, slot_in_epoch);
+                }
+            }
+        }
 
         let t_after_metrics = if timing { Some(Instant::now()) } else { None };
 

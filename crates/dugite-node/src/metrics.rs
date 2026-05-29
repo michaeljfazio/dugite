@@ -543,10 +543,25 @@ pub struct NodeMetrics {
     peak_mem_bytes: AtomicU64,
     /// Network magic number (764824073=mainnet, 2=preview, 1=preprod).
     pub network_magic: AtomicU64,
-    /// Slots per epoch from the active Shelley genesis. Exposed as
+    /// Slots per epoch for the CURRENT epoch (era-aware). Exposed as
     /// `dugite_epoch_length` so downstream tools (dugite-monitor, dashboards)
     /// can compute epoch progress and ETA without hard-coding network defaults.
+    ///
+    /// Refreshed every block from the HFC era history (`set_epoch_progress`),
+    /// so it correctly reports the Byron length (e.g. 21600) during Byron and
+    /// the Shelley length (e.g. 432000) afterwards — rather than a single
+    /// fixed value.  A fixed Shelley length made dugite-monitor's progress bar
+    /// roll the epoch number at ~5 % during Byron.
     pub epoch_length_slots: AtomicU64,
+    /// Offset of the current slot within the current epoch (era-aware), exposed
+    /// as `dugite_slot_in_epoch`.  Computed by the node via the HFC era history
+    /// so clients never have to re-derive the era boundaries (a plain
+    /// `slot % epoch_length` is wrong: Shelley epochs do not start at slot 0).
+    pub slot_in_epoch: AtomicU64,
+    /// Active consensus mode, exposed as `dugite_consensus_mode`
+    /// (0 = Praos, 1 = Ouroboros Genesis).  Set once at startup so dugite-monitor
+    /// can show whether the node is running with Genesis (LoE/GDD) protection.
+    pub consensus_mode_genesis: AtomicU64,
     /// Slot duration in milliseconds from the active Shelley genesis. Exposed
     /// as `dugite_slot_length_ms`. With this and `epoch_length_slots` clients
     /// can derive total epoch wall-clock time and remaining time precisely.
@@ -787,6 +802,8 @@ impl NodeMetrics {
             peak_mem_bytes: AtomicU64::new(0),
             network_magic: AtomicU64::new(0),
             epoch_length_slots: AtomicU64::new(0),
+            slot_in_epoch: AtomicU64::new(0),
+            consensus_mode_genesis: AtomicU64::new(0),
             slot_length_ms: AtomicU64::new(0),
             active_slots_coeff_x1000: AtomicU64::new(0),
             liveness_threshold_secs: AtomicU64::new(600),
@@ -1241,6 +1258,25 @@ impl NodeMetrics {
             (active_slots_coeff * 1000.0).round() as u64,
             Ordering::Relaxed,
         );
+    }
+
+    /// Refresh the era-aware epoch-progress gauges (`dugite_epoch_length` and
+    /// `dugite_slot_in_epoch`).  Called every block with values derived from the
+    /// HFC era history, so the reported epoch length tracks the active era and
+    /// the slot-in-epoch offset is correct across the Byron/Shelley boundary —
+    /// letting dugite-monitor render an accurate progress bar without re-deriving
+    /// the era schedule itself.
+    pub fn set_epoch_progress(&self, epoch_length_slots: u64, slot_in_epoch: u64) {
+        self.epoch_length_slots
+            .store(epoch_length_slots, Ordering::Relaxed);
+        self.slot_in_epoch.store(slot_in_epoch, Ordering::Relaxed);
+    }
+
+    /// Record the active consensus mode (`dugite_consensus_mode`: 0 = Praos,
+    /// 1 = Genesis).  Call once at startup.
+    pub fn set_consensus_mode_genesis(&self, genesis: bool) {
+        self.consensus_mode_genesis
+            .store(genesis as u64, Ordering::Relaxed);
     }
 
     /// Record P2P networking configuration state.
@@ -1788,8 +1824,18 @@ impl NodeMetrics {
             ),
             (
                 "dugite_epoch_length",
-                "Slots per epoch from the active Shelley genesis",
+                "Slots per epoch for the current epoch (era-aware: Byron vs Shelley+)",
                 &self.epoch_length_slots,
+            ),
+            (
+                "dugite_slot_in_epoch",
+                "Offset of the current slot within the current epoch (era-aware)",
+                &self.slot_in_epoch,
+            ),
+            (
+                "dugite_consensus_mode",
+                "Active consensus mode: 0=Praos, 1=Ouroboros Genesis",
+                &self.consensus_mode_genesis,
             ),
             (
                 "dugite_slot_length_ms",
