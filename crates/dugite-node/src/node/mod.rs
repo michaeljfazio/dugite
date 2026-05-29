@@ -3585,6 +3585,9 @@ impl Node {
             peer_manager.clone(),
             self.peer_intersection_established.clone(),
             n2n_tx_validator,
+            crate::node::connection_lifecycle::resolve_blockfetch_max_range(
+                self.config.blockfetch_max_range,
+            ),
         );
         // Enable outbound source-port pairing only when this node is also
         // running as a responder (it has a listen socket to share). When
