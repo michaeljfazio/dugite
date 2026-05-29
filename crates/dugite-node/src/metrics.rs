@@ -473,6 +473,14 @@ pub struct NodeMetrics {
     pub disk_total_bytes: AtomicU64,
     pub disk_used_bytes: AtomicU64,
     pub disk_available_bytes: AtomicU64,
+    // Sync-path Praos header validation (cardano-node updateChainDepState parity).
+    /// Shelley+ peer blocks whose full header crypto (VRF proof + leader
+    /// threshold + KES + opcert) was verified before entering VolatileDB.
+    pub header_full_validations_total: AtomicU64,
+    /// Shelley+ peer blocks REJECTED because full header validation failed.
+    /// Non-zero during honest sync indicates either an adversarial peer or a
+    /// dugite crypto-validation bug — investigate immediately.
+    pub header_validation_failures_total: AtomicU64,
     // Block production metrics
     pub leader_checks_total: AtomicU64,
     pub leader_checks_not_elected: AtomicU64,
@@ -776,6 +784,8 @@ impl NodeMetrics {
             disk_total_bytes: AtomicU64::new(0),
             disk_used_bytes: AtomicU64::new(0),
             disk_available_bytes: AtomicU64::new(0),
+            header_full_validations_total: AtomicU64::new(0),
+            header_validation_failures_total: AtomicU64::new(0),
             leader_checks_total: AtomicU64::new(0),
             leader_checks_not_elected: AtomicU64::new(0),
             forge_failures: AtomicU64::new(0),
@@ -1463,6 +1473,16 @@ impl NodeMetrics {
                 "dugite_blocks_forged_total",
                 "Total blocks forged by this node",
                 &self.blocks_forged,
+            ),
+            (
+                "dugite_header_full_validations_total",
+                "Shelley+ peer blocks whose full Praos header crypto was verified during sync",
+                &self.header_full_validations_total,
+            ),
+            (
+                "dugite_header_validation_failures_total",
+                "Shelley+ peer blocks rejected because full header validation failed",
+                &self.header_validation_failures_total,
             ),
             (
                 "dugite_leader_checks_total",

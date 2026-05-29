@@ -42,7 +42,9 @@ use crate::node::connection_lifecycle::{
 use crate::node::peer_connection::PeerConnection;
 
 use dugite_consensus::chain_fragment::ChainFragment;
+use dugite_consensus::praos::BlockIssuerInfo;
 use dugite_consensus::OuroborosPraos;
+use dugite_consensus::ValidationMode;
 use dugite_ledger::{BlockValidationMode, LedgerState};
 use dugite_mempool::{Mempool, MempoolConfig};
 use dugite_network::{Governor, GovernorConfig, PeerTargets, RollbackAnnouncement};
@@ -4366,6 +4368,140 @@ impl Node {
     /// 4. Announce to downstream peers
     ///
     /// Matches the flow previously handled inline in `chain_sync_loop()`.
+    /// Full Praos header validation for a Shelley-based block fetched from a
+    /// peer — cardano-node's `updateChainDepState`, run on EVERY network block
+    /// (as opposed to `reupdateChainDepState`/reapply, which is used only when
+    /// replaying our OWN already-validated ImmutableDB on restart).
+    ///
+    /// With `ValidationMode::Full` this verifies the VRF proof, the VRF leader
+    /// threshold (when a stake snapshot exists), the KES signature, and the
+    /// operational certificate. Byron (BFT) blocks have no Praos header crypto
+    /// and return `Ok` immediately — their delegation check runs on the ledger
+    /// path.
+    ///
+    /// Returns `Err(reason)` if the header is cryptographically invalid; the
+    /// caller drops the block so it never enters VolatileDB. During the
+    /// early-sync window (no `set` stake snapshot for the first ~3 Shelley
+    /// epochs) ONLY the leader-threshold check is skipped — VRF/KES/opcert
+    /// crypto still runs — mirroring Haskell's `MissingStake` handling.
+    ///
+    /// This is the exact per-block logic from `process_forward_blocks`, ported
+    /// to the live `apply_fetched_block` path (the former is no longer wired).
+    async fn validate_peer_header_full(
+        &mut self,
+        block: &dugite_primitives::block::Block,
+    ) -> Result<(), String> {
+        // Byron has no Praos header crypto — validated on the ledger path.
+        if !block.era.is_shelley_based() {
+            return Ok(());
+        }
+
+        // Haskell `getCurrentSlot` (wall clock) for the future-block guard.
+        let wall_clock_slot = self.current_wall_clock_slot().await;
+        let ls = self.ledger_state.read().await;
+
+        // Leader eligibility uses the "set" snapshot (previous-epoch stake).
+        let set_snapshot = ls.epochs.snapshots.set.as_ref();
+        let total_active_stake: u64 = set_snapshot
+            .map(|snap| snap.pool_stake.values().map(|s| s.0).sum())
+            .unwrap_or(0);
+
+        // Overlay (BFT) schedule context — only when d > 0 and pre-Babbage.
+        let overlay_ctx = if ls.epochs.protocol_params.protocol_version_major < 7
+            && ls.epochs.protocol_params.d.numerator > 0
+            && !ls.genesis_delegates.is_empty()
+        {
+            let epoch = ls.epoch_of_slot(block.slot().0);
+            let first_slot = ls.first_slot_of_epoch(epoch);
+            let genesis_keys: std::collections::BTreeSet<dugite_primitives::hash::Hash28> =
+                ls.genesis_delegates.keys().copied().collect();
+            Some(dugite_consensus::overlay::OverlayContext {
+                genesis_delegates: ls.genesis_delegates.clone(),
+                genesis_keys,
+                d: (
+                    ls.epochs.protocol_params.d.numerator,
+                    ls.epochs.protocol_params.d.denominator,
+                ),
+                first_slot_of_epoch: first_slot,
+            })
+        } else {
+            None
+        };
+
+        // The wire header carries no epoch nonce — inject it (TICKN-correct for
+        // a block that is the first of the next epoch).
+        let epoch_nonce = ls.epoch_nonce_for_slot(block.slot().0);
+        let mut header_with_nonce = block.header.clone();
+        header_with_nonce.epoch_nonce = epoch_nonce;
+
+        // Pool registration for VRF key binding + leader stake.
+        let pool_id = dugite_primitives::hash::blake2b_224(&block.header.issuer_vkey);
+        let issuer_info = if !block.header.issuer_vkey.is_empty() {
+            let pool_reg = set_snapshot
+                .and_then(|snap| snap.pool_params.get(&pool_id))
+                .or_else(|| ls.certs.pool_params.get(&pool_id));
+            pool_reg.map(|reg| {
+                if total_active_stake == 0 {
+                    // No stake snapshot yet (first ~3 epochs of Shelley sync):
+                    // VRF key binding + crypto still run; leader threshold is
+                    // skipped (stake = 1/1). Haskell uses `MissingStake` here.
+                    BlockIssuerInfo {
+                        vrf_keyhash: reg.vrf_keyhash,
+                        pool_stake: 1,
+                        total_active_stake: 1,
+                    }
+                } else {
+                    let pool_stake = set_snapshot
+                        .and_then(|snap| snap.pool_stake.get(&pool_id))
+                        .map(|s| s.0)
+                        .unwrap_or(0);
+                    BlockIssuerInfo {
+                        vrf_keyhash: reg.vrf_keyhash,
+                        pool_stake,
+                        total_active_stake,
+                    }
+                }
+            })
+        } else {
+            None
+        };
+
+        // Envelope checks (body/header size vs protocol params) — always fatal.
+        if let Err(e) = self.consensus.validate_envelope(
+            block.slot(),
+            block.header.body_size,
+            None,
+            ls.epochs.protocol_params.max_block_body_size,
+            ls.epochs.protocol_params.max_block_header_size,
+        ) {
+            return Err(format!("envelope check: {e}"));
+        }
+
+        let current_slot_for_check = wall_clock_slot
+            .or_else(|| ls.tip.point.slot())
+            .unwrap_or(block.slot());
+        let pv_major = ls.epochs.protocol_params.protocol_version_major;
+        let tip_slot = ls.tip.point.slot();
+
+        match self.consensus.validate_header_full(
+            &header_with_nonce,
+            current_slot_for_check,
+            issuer_info.as_ref(),
+            overlay_ctx.as_ref(),
+            ValidationMode::Full,
+            Some(pv_major),
+            tip_slot,
+        ) {
+            Ok(()) => {
+                self.metrics
+                    .header_full_validations_total
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                Ok(())
+            }
+            Err(e) => Err(e.to_string()),
+        }
+    }
+
     async fn apply_fetched_block(&mut self, fetched: FetchedBlock) {
         let block = fetched.block;
         let block_slot = block.slot();
@@ -4481,6 +4617,31 @@ impl Node {
                 warn!(error = %e, "VolatileDB WAL periodic fsync failed");
             }
             self.last_volatile_wal_sync = std::time::Instant::now();
+        }
+
+        // Full Praos header validation (cardano-node `updateChainDepState`
+        // parity): every Shelley+ block fetched from a peer is cryptographically
+        // verified (VRF proof + leader threshold + KES + opcert) BEFORE it is
+        // written to VolatileDB. A header that fails crypto is dropped here so
+        // it can never enter storage or the ledger. Byron (BFT) headers have no
+        // Praos crypto and are validated on the ledger apply path.
+        //
+        // This is the only chokepoint through which peer-fetched blocks pass
+        // (both `AddedAsTip` and `StoredAsFork`), so a single validation here
+        // covers the later TriggeredFork replay as well — fork blocks were
+        // already validated when they first arrived and were stored.
+        if let Err(reason) = self.validate_peer_header_full(&block).await {
+            warn!(
+                peer = %fetched.peer,
+                slot = block_slot.0,
+                block = block_number.0,
+                hash = %block_hash.to_hex(),
+                "Praos header validation FAILED — rejecting peer block: {reason}"
+            );
+            self.metrics
+                .header_validation_failures_total
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            return;
         }
 
         // Store in ChainDB via ChainSelQueue.
