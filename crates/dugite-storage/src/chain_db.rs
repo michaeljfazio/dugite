@@ -470,6 +470,7 @@ impl ChainDB {
                     nonce_vrf_output: Vec::new(),
                     nonce_vrf_proof: Vec::new(),
                     prev_nonce: None,
+                    raw_header_body: None,
                 }
             })
             .collect()

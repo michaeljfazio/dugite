@@ -327,6 +327,7 @@ pub fn forge_block(
         nonce_vrf_output,
         nonce_vrf_proof: vec![], // Praos blocks have single VRF, no separate nonce proof
         prev_nonce: None,
+        raw_header_body: None,
     };
 
     // Encode the header body for KES signing

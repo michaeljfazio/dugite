@@ -3408,6 +3408,7 @@ mod tests {
                 nonce_vrf_proof: vec![],
                 // Pre-Dijkstra: no prevNonce
                 prev_nonce: None,
+                raw_header_body: None,
             };
 
             // Conway/pre-Dijkstra headers: prev_nonce is None.

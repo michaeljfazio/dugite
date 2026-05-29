@@ -240,7 +240,9 @@ fn decode_babbage_header_inner(r: &mut Reader<'_>) -> Result<BlockHeader, Serial
         )));
     }
 
-    // header_body = array(10) — note: 10 elements in Babbage (not 15 like Shelley/Alonzo)
+    // header_body = array(10) — note: 10 elements in Babbage (not 15 like Shelley/Alonzo).
+    // Capture raw bytes (the KES-signed message).
+    let body_start = r.position();
     let body_arr = r.read_array_header()?;
     if !matches!(body_arr, Some(10)) {
         return Err(SerializationError::CborDecode(format!(
@@ -269,6 +271,8 @@ fn decode_babbage_header_inner(r: &mut Reader<'_>) -> Result<BlockHeader, Serial
     let (op_hot_vkey, op_seq_number, op_kes_period, op_sigma) = read_operational_cert(r)?;
     // 9: protocol_version = [major, minor]
     let (protocol_major, protocol_minor) = read_protocol_version(r)?;
+
+    let raw_header_body = r.slice_from(body_start).to_vec();
 
     // KES signature (second element of outer array)
     let kes_signature = r.read_bytes_owned()?;
@@ -309,6 +313,7 @@ fn decode_babbage_header_inner(r: &mut Reader<'_>) -> Result<BlockHeader, Serial
         // Babbage has no separate nonce VRF proof (single VRF certificate).
         nonce_vrf_proof: Vec::new(),
         prev_nonce: None,
+        raw_header_body: Some(raw_header_body),
     })
 }
 

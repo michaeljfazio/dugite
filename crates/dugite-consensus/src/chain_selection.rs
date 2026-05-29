@@ -1083,6 +1083,7 @@ mod tests {
             nonce_vrf_output: vec![],
             nonce_vrf_proof: vec![],
             prev_nonce: None,
+            raw_header_body: None,
         }
     }
 
@@ -2609,6 +2610,7 @@ mod tests {
             nonce_vrf_output: vec![],
             nonce_vrf_proof: vec![],
             prev_nonce: None,
+            raw_header_body: None,
             block_number: BlockNo(1),
             slot: SlotNo(slot),
             epoch_nonce: Hash32::ZERO,
@@ -2673,6 +2675,7 @@ mod tests {
             nonce_vrf_output: vec![],
             nonce_vrf_proof: vec![],
             prev_nonce: None,
+            raw_header_body: None,
             block_number: BlockNo(1),
             slot: SlotNo(slot),
             epoch_nonce: Hash32::ZERO,
