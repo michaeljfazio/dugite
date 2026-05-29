@@ -316,10 +316,10 @@ impl LedgerState {
         // multi-asset. Process via dedicated Byron path with per-tx sequential
         // application (earlier tx outputs visible to later txs in the same block).
         if block.era == Era::Byron {
-            let fee_policy = ByronFeePolicy {
-                min_fee_a: self.epochs.protocol_params.min_fee_a,
-                min_fee_b: self.epochs.protocol_params.min_fee_b,
-            };
+            // Byron fee policy is a network-wide genesis constant
+            // (a + ceiling(size*b), b an exact rational), not the Shelley integer
+            // params carried in `protocol_params`. See `ByronFeePolicy`.
+            let fee_policy = ByronFeePolicy::canonical();
             let byron_mode = match mode {
                 BlockValidationMode::ValidateAll => ByronApplyMode::ValidateAll,
                 BlockValidationMode::ApplyOnly => ByronApplyMode::ApplyOnly,
