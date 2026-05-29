@@ -4619,31 +4619,6 @@ impl Node {
             self.last_volatile_wal_sync = std::time::Instant::now();
         }
 
-        // Full Praos header validation (cardano-node `updateChainDepState`
-        // parity): every Shelley+ block fetched from a peer is cryptographically
-        // verified (VRF proof + leader threshold + KES + opcert) BEFORE it is
-        // written to VolatileDB. A header that fails crypto is dropped here so
-        // it can never enter storage or the ledger. Byron (BFT) headers have no
-        // Praos crypto and are validated on the ledger apply path.
-        //
-        // This is the only chokepoint through which peer-fetched blocks pass
-        // (both `AddedAsTip` and `StoredAsFork`), so a single validation here
-        // covers the later TriggeredFork replay as well — fork blocks were
-        // already validated when they first arrived and were stored.
-        if let Err(reason) = self.validate_peer_header_full(&block).await {
-            warn!(
-                peer = %fetched.peer,
-                slot = block_slot.0,
-                block = block_number.0,
-                hash = %block_hash.to_hex(),
-                "Praos header validation FAILED — rejecting peer block: {reason}"
-            );
-            self.metrics
-                .header_validation_failures_total
-                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            return;
-        }
-
         // Store in ChainDB via ChainSelQueue.
         // `fork_replayed` is set to true when the TriggeredFork path has already
         // applied all fork blocks to the ledger; in that case the single-block
@@ -4835,6 +4810,33 @@ impl Node {
                                                 .await;
                                                 break;
                                             }
+                                        }
+
+                                        // Full Praos header crypto on fork-replayed blocks too
+                                        // (cardano-node `updateChainDepState` parity). Each fork
+                                        // block extends the previously-applied one, so the ledger
+                                        // tip is its predecessor and the leader-schedule forecast
+                                        // is in range. No `ls` lock is held here, so the read-lock
+                                        // acquired by `validate_peer_header_full` is safe.
+                                        if let Err(reason) =
+                                            self.validate_peer_header_full(&fork_block).await
+                                        {
+                                            warn!(
+                                                slot = fork_slot.0,
+                                                block = fork_block_no.0,
+                                                "Fork replay: Praos header validation FAILED: {reason} \
+                                                 — abandoning fork (block marked invalid)"
+                                            );
+                                            self.metrics
+                                                .header_validation_failures_total
+                                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                            self.abandon_failed_fork(
+                                                fork_block.header.header_hash,
+                                                "fork replay: header validation failed",
+                                                &rollback_point,
+                                            )
+                                            .await;
+                                            break;
                                         }
 
                                         // Fix B (Bug B, 2026-05-16): use apply_block_with_delta
@@ -5097,6 +5099,35 @@ impl Node {
                 block = block_number.0,
                 "Block stored in ChainDB but skipping ledger apply (out of order)"
             );
+            return;
+        }
+
+        // Full Praos header validation (cardano-node `updateChainDepState`
+        // parity): cryptographically verify the header (VRF proof + leader
+        // threshold + KES + opcert) for every Shelley+ peer block BEFORE it is
+        // applied to the ledger. Byron (BFT) headers have no Praos crypto.
+        //
+        // This runs HERE — after the `connects_to_tip` gate — rather than at
+        // fetch time, because header validation requires a leader-schedule
+        // forecast and the forecast horizon is only ~one stability window ahead
+        // of the ledger tip. A block that extends the tip has its predecessor as
+        // the forecast anchor (one slot back), always in range; a far-ahead
+        // pipelined block fetched out of order is NOT forecastable from the tip
+        // (OutsideForecastRange) and must wait until the chain catches up to it.
+        // Validating in-order at apply time gives correct anchoring and matches
+        // Haskell, where the header is checked against the predecessor's
+        // forecast as the chain is extended.
+        if let Err(reason) = self.validate_peer_header_full(&block).await {
+            warn!(
+                peer = %fetched.peer,
+                slot = block_slot.0,
+                block = block_number.0,
+                hash = %block_hash.to_hex(),
+                "Praos header validation FAILED — rejecting peer block: {reason}"
+            );
+            self.metrics
+                .header_validation_failures_total
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             return;
         }
 
