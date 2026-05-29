@@ -544,6 +544,17 @@ pub struct VolatileDB {
     /// Using HashSet rather than Vec prevents duplicate entries and provides
     /// O(1) membership tests needed for fork enumeration.
     successors: HashMap<Hash32, HashSet<Hash32>>,
+    /// Leaf blocks: every block hash with no successors (children).
+    ///
+    /// Maintained incrementally on every insert/remove so `get_all_fork_tips`
+    /// can enumerate competing-fork tips in O(leaves) — almost always O(1)
+    /// during bulk sync (one leaf: the chain tip) — instead of scanning all
+    /// volatile blocks and building a full `selected_chain` membership set on
+    /// every block add.  A fork tip is exactly a leaf that is not the
+    /// selected-chain tip (the selected tip is the only on-chain leaf).
+    /// Invariant: `leaves == { h ∈ blocks : successors[h] is empty/absent }`,
+    /// verified by `debug_assert` in `get_all_fork_tips` and a proptest.
+    leaves: HashSet<Hash32>,
     /// Tip of the selected chain: (slot, hash, block_no).
     tip: Option<(u64, Hash32, u64)>,
     wal: Option<WalWriter>,
@@ -569,6 +580,7 @@ impl VolatileDB {
             slot_index: BTreeMap::new(),
             block_no_index: BTreeMap::new(),
             successors: HashMap::new(),
+            leaves: HashSet::new(),
             tip: None,
             wal: None,
             selected_chain: Vec::new(),
@@ -597,6 +609,7 @@ impl VolatileDB {
             slot_index: BTreeMap::new(),
             block_no_index: BTreeMap::new(),
             successors: HashMap::new(),
+            leaves: HashSet::new(),
             tip: None,
             wal: None,
             selected_chain: Vec::new(),
@@ -782,6 +795,14 @@ impl VolatileDB {
             },
         );
 
+        // Leaf-set maintenance (see `leaves` field): `prev_hash` just gained a
+        // child so it is no longer a leaf, and the new block is a leaf unless a
+        // child of it was already inserted out-of-order.
+        self.leaves.remove(&prev_hash);
+        if self.successors.get(&hash).is_none_or(|s| s.is_empty()) {
+            self.leaves.insert(hash);
+        }
+
         // Extend selected chain if this block connects to it
         let extends = match self.selected_chain.last() {
             Some(tip_hash) => prev_hash == *tip_hash,
@@ -866,6 +887,25 @@ impl VolatileDB {
         Some((block.slot, *hash, &block.cbor))
     }
 
+    /// Update the `leaves` set after a block `removed` (whose parent is
+    /// `removed_prev`) has been deleted from `blocks` and `successors`.
+    ///
+    /// MUST be called *after* the `successors` map has been updated to reflect
+    /// the removal, so the parent's recomputed leaf status is correct.  The
+    /// parent may have lost its last child and become a leaf again — but only
+    /// counts as a leaf if it is still resident in the volatile store.
+    fn note_leaf_removal(&mut self, removed: &Hash32, removed_prev: &Hash32) {
+        self.leaves.remove(removed);
+        if self.blocks.contains_key(removed_prev)
+            && self
+                .successors
+                .get(removed_prev)
+                .is_none_or(|s| s.is_empty())
+        {
+            self.leaves.insert(*removed_prev);
+        }
+    }
+
     /// Remove a specific block from all indexes.
     pub fn remove_block(&mut self, hash: &Hash32) {
         if let Some(block) = self.blocks.remove(hash) {
@@ -887,6 +927,7 @@ impl VolatileDB {
             self.selected_chain.retain(|h| h != hash);
             self.gc_schedule.remove(hash);
             self.headers.remove(hash);
+            self.note_leaf_removal(hash, &block.prev_hash);
         }
     }
 
@@ -925,6 +966,7 @@ impl VolatileDB {
                 }
                 self.gc_schedule.remove(hash);
                 self.headers.remove(hash);
+                self.note_leaf_removal(hash, &block.prev_hash);
             }
         }
 
@@ -968,6 +1010,7 @@ impl VolatileDB {
                                 self.successors.remove(&block.prev_hash);
                             }
                         }
+                        self.note_leaf_removal(&hash, &block.prev_hash);
                     }
                     self.gc_schedule.remove(&hash);
                     self.headers.remove(&hash);
@@ -1110,6 +1153,7 @@ impl VolatileDB {
                                 self.successors.remove(&block.prev_hash);
                             }
                         }
+                        self.note_leaf_removal(&hash, &block.prev_hash);
                     }
                     self.gc_schedule.remove(&hash);
                     self.headers.remove(&hash);
@@ -1143,6 +1187,7 @@ impl VolatileDB {
         self.slot_index.clear();
         self.block_no_index.clear();
         self.successors.clear();
+        self.leaves.clear();
         self.selected_chain.clear();
         self.gc_schedule.clear();
         self.headers.clear();
@@ -1348,24 +1393,43 @@ impl VolatileDB {
     /// Returns `(hash, block_no, slot)` tuples, one per competing tip.
     /// The list may be empty when there are no forks.
     pub fn get_all_fork_tips(&self) -> Vec<(Hash32, BlockNo, SlotNo)> {
-        // Build a fast-lookup set from the selected chain.
-        // Selected-chain blocks are NOT fork candidates.
-        let selected_set: std::collections::HashSet<&Hash32> = self.selected_chain.iter().collect();
-
-        self.blocks
+        // A fork tip is a leaf (no successors) that is NOT the current
+        // selected-chain tip.  The selected tip is the only leaf that lies on
+        // the selected chain (every earlier selected block has a successor —
+        // the next selected block), so excluding it from the maintained
+        // `leaves` set yields exactly the competing-fork tips.  This is
+        // O(leaves) — almost always O(1) during bulk sync — instead of the old
+        // O(volatile) scan + O(selected_chain) membership-set build that ran on
+        // every block add.
+        let selected_tip = self.selected_chain.last();
+        let result: Vec<(Hash32, BlockNo, SlotNo)> = self
+            .leaves
             .iter()
-            .filter(|(hash, _block)| {
-                // Condition 1: not on the selected chain.
-                if selected_set.contains(*hash) {
-                    return false;
-                }
-                // Condition 2: no successors (leaf in the DAG).
-                self.successors
-                    .get(*hash)
-                    .is_none_or(|succs| succs.is_empty())
+            .filter(|h| Some(*h) != selected_tip)
+            .filter_map(|h| {
+                self.blocks
+                    .get(h)
+                    .map(|b| (*h, BlockNo(b.block_no), SlotNo(b.slot)))
             })
-            .map(|(hash, block)| (*hash, BlockNo(block.block_no), SlotNo(block.slot)))
-            .collect()
+            .collect();
+
+        // Invariant guard (debug/test only): the incrementally-maintained
+        // `leaves` set must always equal the brute-force {blocks with no
+        // successors}, and the fork-tip result must match the old scan.
+        debug_assert!(
+            {
+                let brute: std::collections::HashSet<Hash32> = self
+                    .blocks
+                    .keys()
+                    .filter(|h| self.successors.get(*h).is_none_or(|s| s.is_empty()))
+                    .copied()
+                    .collect();
+                brute == self.leaves
+            },
+            "leaves set diverged from brute-force leaf computation"
+        );
+
+        result
     }
 
     /// Switch the selected chain to end at `new_tip_hash`.
@@ -1613,6 +1677,7 @@ impl VolatileDB {
                         }
                     }
                     self.headers.remove(hash);
+                    self.note_leaf_removal(hash, &block.prev_hash);
                 }
             }
         }
@@ -1650,6 +1715,83 @@ mod tests {
 
     fn h(byte: u8) -> Hash32 {
         Hash32::from_bytes([byte; 32])
+    }
+
+    /// The incrementally-maintained `leaves` set must always equal the
+    /// brute-force {blocks with no successors} across an arbitrary sequence of
+    /// adds, single/batch/slot removals and clears.  A deterministic LCG drives
+    /// the operation mix so failures are reproducible.  This guards every
+    /// `note_leaf_removal` call site and the `insert_block_internal`
+    /// maintenance; `get_all_fork_tips`'s own `debug_assert` additionally
+    /// guards the live sync paths in every other test.
+    #[test]
+    fn leaves_set_matches_bruteforce_under_random_ops() {
+        fn hn(n: u32) -> Hash32 {
+            let mut b = [0u8; 32];
+            b[0..4].copy_from_slice(&n.to_le_bytes());
+            b[4] = 0xAB; // keep distinct from the all-zero genesis sentinel
+            Hash32::from_bytes(b)
+        }
+        fn brute(db: &VolatileDB) -> std::collections::HashSet<Hash32> {
+            db.blocks
+                .keys()
+                .filter(|hh| db.successors.get(*hh).is_none_or(|s| s.is_empty()))
+                .copied()
+                .collect()
+        }
+        let mut rng: u64 = 0x1234_5678_9abc_def0;
+        let next = |rng: &mut u64| -> u32 {
+            *rng = rng
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            (*rng >> 33) as u32
+        };
+
+        let mut db = VolatileDB::new();
+        let mut counter: u32 = 1;
+
+        for step in 0..6000u32 {
+            let op = next(&mut rng) % 100;
+            let span = counter.max(1);
+            if op < 55 {
+                // Parent selection stresses leaf maintenance three ways:
+                //  - ZERO genesis sentinel (fresh root leaf),
+                //  - an already-added hash (normal in-order extension),
+                //  - a FUTURE, not-yet-added hash (out-of-order arrival: the
+                //    child lands before its parent — common when a fork is
+                //    streamed from a different peer; the parent, when later
+                //    added, must NOT be counted as a leaf since it already has
+                //    a successor).
+                let roll = next(&mut rng) % 8;
+                let prev = if roll == 0 {
+                    Hash32::ZERO
+                } else if roll == 1 {
+                    hn(counter + 1 + next(&mut rng) % 64) // future parent
+                } else {
+                    hn(1 + next(&mut rng) % span)
+                };
+                let hash = hn(counter);
+                let s = counter as u64;
+                db.add_block(hash, s, s, prev, vec![]);
+                counter += 1;
+            } else if op < 75 {
+                db.remove_block(&hn(1 + next(&mut rng) % span));
+            } else if op < 88 {
+                let k = 1 + next(&mut rng) % 6;
+                let subset: Vec<Hash32> = (0..k).map(|_| hn(1 + next(&mut rng) % span)).collect();
+                db.remove_blocks_by_hashes(&subset);
+            } else if op < 97 {
+                let slot = next(&mut rng) as u64 % (counter as u64 + 2);
+                db.remove_blocks_up_to_slot(slot);
+            } else {
+                db.clear();
+            }
+            assert_eq!(
+                brute(&db),
+                db.leaves,
+                "leaves diverged from brute-force at step {step} (counter={counter})"
+            );
+        }
     }
 
     // -----------------------------------------------------------------------

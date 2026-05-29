@@ -3753,6 +3753,16 @@ pub(crate) fn prune_already_known_pending_headers(
 /// `PENDING_HEADERS_RESUME`.
 pub(crate) const PENDING_HEADERS_PAUSE: usize = 10_000;
 
+/// How many headers may arrive between full `pending_headers` prunes on the
+/// MsgRollForward path.  Each header is still individually `has_block`-checked
+/// on arrival (O(1)); the full O(pending) prune that drains
+/// BlockFetch-completed entries runs only this often, turning the former
+/// O(N²)-per-batch per-header scan into amortised O(N).  Bounded well below the
+/// PAUSE/RESUME hysteresis gap so the transient over-count of not-yet-pruned
+/// (but already-fetched) entries cannot meaningfully perturb the backpressure
+/// gate.
+pub(crate) const PENDING_PRUNE_INTERVAL: u32 = 256;
+
 /// Resume refilling once `pending_headers` drops below this.  The gap
 /// between PAUSE and RESUME is hysteresis — without it, the pipeline
 /// would thrash on every fetched block.
@@ -4466,33 +4476,50 @@ pub async fn chainsync_client_task(
                             entry.tip_hash = tip_hash;
                             entry.tip_block_number = tip_block_number;
                             metrics.update_peer_tip(tip_slot);
-                            entry.pending_headers.push(PendingHeader {
-                                slot,
-                                hash,
-                                header_cbor: header,
-                            });
 
-                            // Prune headers we've already fetched and stored.
+                            // Queue this header for BlockFetch unless we already
+                            // have its block, and periodically drain headers that
+                            // BlockFetch has fetched+stored since the last prune.
                             //
-                            // Hash-based filter: drop only headers whose hash is
-                            // already present in the ChainDB.  A slot-based filter
-                            // is unsound after a peer rolls back below our applied
-                            // tip and switches to a competing fork — the new fork's
-                            // earliest headers may carry slots ≤ applied tip but
-                            // DIFFERENT hashes; dropping them breaks the parent
-                            // chain BlockFetch needs to walk back from the fork's
-                            // tip (regression observed 2026-04-26).
+                            // Hash-based filter: only headers whose hash is
+                            // already present in the ChainDB are skipped.  A
+                            // slot-based filter is unsound after a peer rolls back
+                            // below our applied tip and switches to a competing
+                            // fork — the new fork's earliest headers may carry
+                            // slots ≤ applied tip but DIFFERENT hashes; dropping
+                            // them breaks the parent chain BlockFetch needs to
+                            // walk back from the fork's tip (regression observed
+                            // 2026-04-26).  Matches Haskell: `theirFrag` retains
+                            // every header on the candidate fragment; BlockFetch
+                            // fetches everything not in `curChain`.
                             //
-                            // Matches Haskell: `theirFrag` retains every header on
-                            // the candidate fragment (anchored at the rollback /
-                            // intersection point); BlockFetch fetches everything
-                            // not in `curChain`.
+                            // Per-header we do a single O(1) `has_block` check on
+                            // the just-arrived header instead of re-scanning the
+                            // whole pending list (which sits near
+                            // PENDING_HEADERS_PAUSE during bulk sync) — that
+                            // per-header full scan was an O(N²)-per-batch hotspot.
+                            // A full prune runs only every PENDING_PRUNE_INTERVAL
+                            // headers; see `headers_since_prune`.
                             {
                                 let cdb = chain_db.read().await;
-                                prune_already_known_pending_headers(
-                                    &mut entry.pending_headers,
-                                    &cdb,
-                                );
+                                let already_have =
+                                    cdb.has_block(&dugite_primitives::hash::Hash32::from_bytes(hash));
+                                if !already_have {
+                                    entry.pending_headers.push(PendingHeader {
+                                        slot,
+                                        hash,
+                                        header_cbor: header,
+                                    });
+                                }
+                                entry.headers_since_prune =
+                                    entry.headers_since_prune.saturating_add(1);
+                                if entry.headers_since_prune >= PENDING_PRUNE_INTERVAL {
+                                    prune_already_known_pending_headers(
+                                        &mut entry.pending_headers,
+                                        &cdb,
+                                    );
+                                    entry.headers_since_prune = 0;
+                                }
                             }
                             entry.pending_headers.len()
                         };
