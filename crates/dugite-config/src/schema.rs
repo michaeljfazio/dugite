@@ -509,6 +509,24 @@ pub static KNOWN_PARAMS: &[ParamDef] = &[
         reloadability: Reloadability::Restart,
     },
     ParamDef {
+        key: "BlockFetchMaxRange",
+        section: "Network",
+        param_type: ParamType::U64 { min: 64, max: 2000 },
+        default: "2000",
+        description: "Maximum number of blocks pulled by a single BlockFetch \
+                      request range during bulk sync. The actual range is also \
+                      sized adaptively by an 8 MiB byte budget (so large Conway \
+                      blocks shrink it); this is the upper clamp. Capped at the \
+                      network MAX_BLOCKS_PER_FETCH (2000) DoS limit.",
+        tuning_hint: "Leave at the maximum (2000) for fastest from-genesis sync — \
+                      larger ranges amortise the per-request round-trip across more \
+                      blocks. Throughput gains are marginal above ~512 because the \
+                      byte budget already drives sizing; lower it only to bound \
+                      per-range memory on very constrained hosts. \
+                      DUGITE_BLOCKFETCH_MAX_RANGE overrides this at runtime.",
+        reloadability: Reloadability::Restart,
+    },
+    ParamDef {
         key: "DiffusionMode",
         section: "Network",
         param_type: ParamType::Enum {
