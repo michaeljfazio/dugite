@@ -1877,10 +1877,12 @@ impl Node {
         loop {
             tokio::task::yield_now().await;
             let mut db = self.chain_db.write().await;
-            let flush_result = match loe_limit {
-                None => db.flush_to_immutable_batch(FLUSH_BATCH_SIZE),
-                Some(loe_slot) => db.flush_to_immutable_loe_batch(loe_slot, FLUSH_BATCH_SIZE),
-            };
+            // Finalisation is always k-based, in every consensus mode — the
+            // Ouroboros Genesis LoE constrains chain SELECTION, never the
+            // immutable flush (see run_background_maintenance + the
+            // cardano-haskell-oracle cross-check). Gating this on loe_slot froze
+            // the immutable tip during Byron PreSyncing → unbounded VolatileDB.
+            let flush_result = db.flush_to_immutable_batch(FLUSH_BATCH_SIZE);
             match flush_result {
                 Ok(0) => break, // No more to flush
                 Ok(_flushed) => {

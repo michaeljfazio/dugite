@@ -5205,10 +5205,6 @@ impl Node {
         if std::env::var_os("DUGITE_NO_MAINT").is_some() {
             return;
         }
-        // LoE ceiling (Genesis mode): never finalise blocks beyond the ceiling.
-        // In Praos mode (genesis disabled) this is always `None`.
-        let loe_limit: Option<u64> = self.gsm_snapshot_rx.borrow().loe_slot;
-
         // Volatile retention window: how many recent blocks to keep resident in
         // VolatileDB before finalising to ImmutableDB.  This is deliberately far
         // larger than the protocol security parameter `k` (2160) — keeping extra
@@ -5247,10 +5243,17 @@ impl Node {
         loop {
             let flushed = {
                 let mut db = self.chain_db.write().await;
-                let result = match loe_limit {
-                    None => db.flush_to_immutable_batch_retain(retain_blocks, FLUSH_BATCH_SIZE),
-                    Some(loe_slot) => db.flush_to_immutable_loe_batch(loe_slot, FLUSH_BATCH_SIZE),
-                };
+                // Finalisation is k-based in EVERY consensus mode. The
+                // Ouroboros Genesis LoE constrains chain SELECTION (which tip we
+                // adopt), NOT immutable finalisation: in ouroboros-consensus
+                // `copyToImmutableDB` runs unconditionally whenever the chain is
+                // longer than its k-deep suffix, never gated by the LoE/GSM
+                // state. A previous build gated this flush on `loe_slot`, which
+                // (because PreSyncing pins the LoE at genesis during Byron, when
+                // no big-ledger peers exist) froze the immutable tip and let the
+                // VolatileDB grow without bound (observed 1.6M blocks → O(N) CPU
+                // storm → wedge ~epoch 208). Always flush k-deep.
+                let result = db.flush_to_immutable_batch_retain(retain_blocks, FLUSH_BATCH_SIZE);
                 match result {
                     Ok(n) => n,
                     Err(e) => {
