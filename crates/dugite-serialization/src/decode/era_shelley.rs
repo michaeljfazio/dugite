@@ -173,28 +173,53 @@ fn decode_shelley_block_mode(
     };
 
     // -------------------------------------------------------------------------
-    // 2. tx_bodies — definite-length array of KeepRaw<TransactionBody>
-    // -------------------------------------------------------------------------
-    let tx_count = r.read_array_header()?.unwrap_or(0) as usize;
-    let alloc_cap = r.safe_alloc_capacity(tx_count as u64);
+    // 2. tx_bodies — array of KeepRaw<TransactionBody>, DEFINITE OR INDEFINITE.
+    //
+    // Mainnet Shelley blocks encode tx_bodies as an indefinite-length array
+    // (`9f … ff`) in some blocks (e.g. epoch 223, block 4_813_942). The previous
+    // `read_array_header().unwrap_or(0)` treated indefinite (None) as zero txs,
+    // skipped every body, and then misread the first tx body (a map) as the
+    // witness array — "expected array, got map". Read until the break byte for
+    // the indefinite case.
+    let tx_count_hdr = r.read_array_header()?;
+    let alloc_cap = r.safe_alloc_capacity(tx_count_hdr.unwrap_or(0));
     let mut raw_bodies: Vec<Vec<u8>> = Vec::with_capacity(alloc_cap);
     let mut parsed_bodies: Vec<TransactionBody> = Vec::with_capacity(alloc_cap);
 
-    for _ in 0..tx_count {
+    let mut i = 0u64;
+    loop {
+        match tx_count_hdr {
+            Some(n) if i >= n => break,
+            None if r.peek_major()? == Type::Break => {
+                r.skip()?; // consume the indefinite-array break byte
+                break;
+            }
+            _ => {}
+        }
         let body = KeepRaw::parse_with(&mut r, |r| decode_shelley_tx_body(r))?;
         raw_bodies.push(body.raw.to_vec());
         parsed_bodies.push(body.value);
+        i += 1;
     }
 
     // -------------------------------------------------------------------------
-    // 3. tx_witness_sets — definite-length array of witness sets
+    // 3. tx_witness_sets — array of witness sets, DEFINITE OR INDEFINITE.
     // -------------------------------------------------------------------------
-    let witness_count = r.read_array_header()?.unwrap_or(0) as usize;
-    let ws_alloc_cap = r.safe_alloc_capacity(witness_count as u64);
+    let witness_count_hdr = r.read_array_header()?;
+    let ws_alloc_cap = r.safe_alloc_capacity(witness_count_hdr.unwrap_or(0));
     let mut raw_witnesses: Vec<Vec<u8>> = Vec::with_capacity(ws_alloc_cap);
     let mut parsed_witnesses: Vec<Option<TransactionWitnessSet>> = Vec::with_capacity(ws_alloc_cap);
 
-    for _ in 0..witness_count {
+    let mut j = 0u64;
+    loop {
+        match witness_count_hdr {
+            Some(n) if j >= n => break,
+            None if r.peek_major()? == Type::Break => {
+                r.skip()?;
+                break;
+            }
+            _ => {}
+        }
         if mode == DecodeMode::Full {
             let ws = KeepRaw::parse_with(&mut r, |r| decode_shelley_witness_set(r))?;
             raw_witnesses.push(ws.raw.to_vec());
@@ -205,6 +230,7 @@ fn decode_shelley_block_mode(
             raw_witnesses.push(r.slice_from(ws_start).to_vec());
             parsed_witnesses.push(None);
         }
+        j += 1;
     }
 
     // -------------------------------------------------------------------------

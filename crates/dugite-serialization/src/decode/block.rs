@@ -569,6 +569,31 @@ mod tests {
         assert_eq!(block_min.slot().0, 678345);
     }
 
+    /// Regression: some mainnet SHELLEY blocks encode tx_bodies (and the
+    /// witness array) as INDEFINITE-length arrays. `decode_shelley_block_mode`
+    /// used `read_array_header().unwrap_or(0)`, treating indefinite as 0 txs:
+    /// it skipped every body, then misread the first tx body (a map) as the
+    /// witness array — "array header: unexpected type map". This halted a
+    /// from-genesis mainnet sync at epoch 223, block 4_813_942. (The same bug
+    /// class was previously fixed for Babbage but not Shelley.)
+    ///
+    /// Fixture: real on-wire Shelley block 4_813_942 at slot 11_036_816
+    /// captured from a mainnet peer 2026-05-29 (36 txs, indefinite tx_bodies).
+    #[test]
+    fn decode_shelley_block_with_indefinite_tx_bodies_array_roundtrips() {
+        let cbor = include_bytes!("../../tests/fixtures/shelley_indef_txbodies_block.cbor");
+        let block = decode_block(cbor, 21600, false)
+            .expect("real Shelley block with indef tx_bodies must decode (full mode)");
+        assert_eq!(block.block_number().0, 4_813_942);
+        assert_eq!(block.slot().0, 11_036_816);
+        assert_eq!(block.era, dugite_primitives::era::Era::Shelley);
+        assert_eq!(block.transactions.len(), 36);
+
+        let block_min = decode_block(cbor, 21600, true)
+            .expect("real Shelley block with indef tx_bodies must decode (minimal mode)");
+        assert_eq!(block_min.transactions.len(), 36);
+    }
+
     /// Regression for #673: cn 11.0.1 emits indefinite-length
     /// `aux_data_set` and inner CIP-20 metadata maps on preview /
     /// preprod for Babbage blocks containing CIP-20 transaction
