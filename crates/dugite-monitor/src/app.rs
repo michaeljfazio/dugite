@@ -565,7 +565,13 @@ impl App {
             slot % epoch_length.max(1)
         };
         self.slot_in_epoch = slot_in_epoch;
-        self.epoch_slots_remaining_inner(epoch_length, slot_in_epoch);
+        // Era-aware slot length (Byron 20 000 ms, Shelley+ 1 000 ms). Default to
+        // 1 000 ms for older nodes that don't export it.
+        let slot_length_ms = match snapshot.get_u64("dugite_slot_length_ms") {
+            0 => 1000,
+            ms => ms,
+        };
+        self.epoch_slots_remaining_inner(epoch_length, slot_in_epoch, slot_length_ms);
 
         // Parse RTT histogram bands.
         self.rtt_bands = RttBands::from_snapshot(&snapshot);
@@ -636,9 +642,22 @@ impl App {
         self.node_status == NodeStatus::Offline && !self.metrics.values.is_empty()
     }
 
-    fn epoch_slots_remaining_inner(&mut self, epoch_length: u64, slot_in_epoch: u64) {
-        let remaining = epoch_length.saturating_sub(slot_in_epoch);
-        self.epoch_time_remaining_secs = remaining;
+    fn epoch_slots_remaining_inner(
+        &mut self,
+        epoch_length: u64,
+        slot_in_epoch: u64,
+        slot_length_ms: u64,
+    ) {
+        let remaining_slots = epoch_length.saturating_sub(slot_in_epoch);
+        // Convert remaining SLOTS to seconds using the era slot length. The old
+        // code stored slots directly as seconds, which is only correct for
+        // Shelley+ (1 s slots) and ran 20× short during Byron (20 s slots).
+        let slot_ms = if slot_length_ms == 0 {
+            1000
+        } else {
+            slot_length_ms
+        };
+        self.epoch_time_remaining_secs = remaining_slots.saturating_mul(slot_ms) / 1000;
         self.epoch_progress_pct = if epoch_length > 0 {
             (slot_in_epoch as f64 / epoch_length as f64) * 100.0
         } else {
@@ -1380,6 +1399,29 @@ mod tests {
             "Byron",
             "Byron era must not be mislabelled Shelley from the ledger PV"
         );
+    }
+
+    /// Epoch time-remaining must convert remaining SLOTS to seconds using the
+    /// era slot length — not store slots as seconds. Regression for the Byron
+    /// case where 20 s slots made the "~Nd Nh Nm remaining" label 20× too short.
+    #[test]
+    fn test_epoch_time_remaining_is_era_aware() {
+        let mut app = App::new();
+
+        // Shelley+: 1000 ms slots → seconds equal remaining slots.
+        app.epoch_slots_remaining_inner(432_000, 32_000, 1000);
+        assert_eq!(app.epoch_time_remaining_secs, 400_000);
+
+        // Byron: 20 000 ms slots → remaining slots × 20. A Byron epoch (21 600
+        // slots) and a Shelley epoch (432 000 slots) both last ~5 days, so the
+        // same fractional position yields the same wall-clock remaining.
+        app.epoch_slots_remaining_inner(21_600, 1_600, 20_000);
+        assert_eq!(app.epoch_time_remaining_secs, 20_000 * 20);
+        assert_eq!(app.epoch_time_remaining_secs, 400_000);
+
+        // Missing/zero slot length defaults to 1000 ms (1 s/slot).
+        app.epoch_slots_remaining_inner(100, 40, 0);
+        assert_eq!(app.epoch_time_remaining_secs, 60);
     }
 
     #[test]
