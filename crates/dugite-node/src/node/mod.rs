@@ -3827,6 +3827,25 @@ impl Node {
         let mut forge_ticker = tokio::time::interval(Duration::from_secs(1));
         forge_ticker.tick().await; // skip first immediate tick
 
+        // ChainDB maintenance ticker — drives the volatile→immutable copy and
+        // chain-fragment anchor advance during live sync (issue: from-genesis
+        // apply-rate collapse).  The live `apply_fetched_block` path stores
+        // every block in VolatileDB but never finalises k-deep blocks to
+        // ImmutableDB, so VolatileDB (and the push-only chain fragment) grow
+        // without bound.  `process_add_block` runs `get_all_fork_tips()` —
+        // O(volatile size) — on every block add, so unbounded VolatileDB turns
+        // per-block apply into O(N²): mainnet Byron sync decays from ~150 blk/s
+        // to ~2 blk/s as the volatile set passes ~100 k blocks (profiled:
+        // `get_all_fork_tips` = 30 % of the apply worker, RSS climbing past
+        // 700 MB, all resetting on restart).  Flushing here bounds VolatileDB
+        // to the k-block rollback window, mirroring Haskell's ChainDB
+        // Background `copyToImmutableDB`.  250 ms cadence keeps the volatile
+        // set within a few hundred blocks of k at multi-hundred-blk/s sync
+        // while decoupling the flush from the per-block apply latency.
+        let mut maintenance_ticker = tokio::time::interval(Duration::from_millis(250));
+        maintenance_ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        maintenance_ticker.tick().await; // skip first immediate tick
+
         info!("Main run loop entered");
         loop {
             tokio::select! {
@@ -3859,6 +3878,15 @@ impl Node {
                 // all routing decisions.
                 Some(fetched) = fetched_blocks_rx.recv() => {
                     self.apply_fetched_block(fetched).await;
+                }
+
+                // ── ChainDB maintenance (periodic) ───────────────────────
+                // Finalise k-deep volatile blocks to ImmutableDB and advance
+                // the chain-fragment anchor so neither grows unbounded during
+                // live sync.  See the `maintenance_ticker` declaration above
+                // for why this is the from-genesis apply-rate fix.
+                _ = maintenance_ticker.tick() => {
+                    self.run_background_maintenance().await;
                 }
 
                 // ── Governor evaluation (periodic, every 2s) ────────────
@@ -5114,10 +5142,13 @@ impl Node {
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
 
-        // Run background maintenance (copy-to-immutable, GC, snapshot).
-        // This matches the pattern from the old sync loop where these
-        // operations run after each block application.
-        self.run_background_maintenance().await;
+        // ChainDB maintenance (copy-to-immutable, GC, fragment-anchor advance)
+        // is driven by the main loop's `maintenance_ticker`, NOT inline here:
+        // each `flush_to_immutable_batch` ends in `remove_blocks_by_hashes`,
+        // which rewrites the VolatileDB WAL (O(volatile-window)).  Running that
+        // per block would replace the old O(N²) `get_all_fork_tips` cost with a
+        // per-block O(k) WAL rewrite.  Batching it on the 250 ms ticker keeps
+        // WAL rewrites to ~4/s while still bounding VolatileDB to the k window.
     }
 
     // ─── run_background_maintenance() ────────────────────────────────────────
@@ -5135,12 +5166,126 @@ impl Node {
     /// performed in process_forward_blocks() during sync. For blocks
     /// arriving via the new fetched_blocks channel, this is a placeholder
     /// that will be unified with process_forward_blocks() in Task 7.
+    /// Bound VolatileDB and the chain fragment to the k-block rollback window
+    /// during live sync.
+    ///
+    /// The live `apply_fetched_block` path stores every fetched block in
+    /// VolatileDB but never finalises k-deep blocks to ImmutableDB, and pushes
+    /// every header onto the chain fragment without ever trimming it (the
+    /// volatile→immutable copy + fragment advance lived only in the now-unwired
+    /// `process_forward_blocks`).  Both therefore grow without bound, and
+    /// `ChainSelQueue::process_add_block` runs `VolatileDB::get_all_fork_tips()`
+    /// — O(volatile size) — on every block add.  Unbounded VolatileDB turns
+    /// per-block apply into O(N²): mainnet Byron from-genesis sync decays from
+    /// ~150 blk/s to ~2 blk/s as the volatile set passes ~100 k blocks
+    /// (profiled: `get_all_fork_tips` = 30 % of the apply worker, RSS climbing
+    /// past 700 MB, all resetting on restart).
+    ///
+    /// This finalises k-deep volatile blocks to ImmutableDB in bounded batches,
+    /// GCs the removed blocks, and advances the chain-fragment anchor to the new
+    /// immutable tip — mirroring Haskell's ChainDB Background `copyToImmutableDB`.
+    /// Driven by the main loop's 250 ms `maintenance_ticker` so the WAL rewrite
+    /// inside `remove_blocks_by_hashes` is amortised across many blocks rather
+    /// than paid per block.  LedgerSeq is already self-bounded at k by
+    /// `LedgerSeq::push` (it advances its anchor on overflow), so it needs no
+    /// action here.
     async fn run_background_maintenance(&mut self) {
-        // Background maintenance (copy-to-immutable, GC, snapshot) is
-        // handled by the existing process_forward_blocks() code path.
-        // This method exists as a hook point for when the fetched-block
-        // pipeline is fully wired in. For now, the sync.rs chain_sync_loop
-        // continues to drive these operations.
+        // Bisection/diagnostic escape hatch: `DUGITE_NO_MAINT=1` disables the
+        // volatile→immutable maintenance entirely (reverts to the pre-fix
+        // unbounded-VolatileDB behaviour) so the maintenance can be isolated
+        // when triaging sync issues.
+        if std::env::var_os("DUGITE_NO_MAINT").is_some() {
+            return;
+        }
+        // LoE ceiling (Genesis mode): never finalise blocks beyond the ceiling.
+        // In Praos mode (genesis disabled) this is always `None`.
+        let loe_limit: Option<u64> = self.gsm_snapshot_rx.borrow().loe_slot;
+
+        // Volatile retention window: how many recent blocks to keep resident in
+        // VolatileDB before finalising to ImmutableDB.  This is deliberately far
+        // larger than the protocol security parameter `k` (2160) — keeping extra
+        // *already-finalised* blocks volatile is safe (it only costs memory) and
+        // it keeps the ImmutableDB tip trailing the active sync tip by a wide
+        // margin.  That margin is what prevents the immutable tip from advancing
+        // through the slot region where freshly-connected peers place their
+        // initial ChainSync intersection: during a from-genesis sync the tip
+        // races ahead while peers that connected early still hold a low
+        // intersection point, and if the immutable tip overtakes that point the
+        // peer is forced to re-intersect and re-stream already-known headers,
+        // which the BlockFetch pipeline drains to empty (the
+        // `prune_already_known_pending_headers` storm) and the sync stalls.  A
+        // window comfortably past the connection-storm settling point (~5 k
+        // blocks) avoids this entirely.  The O(window) per-block
+        // `get_all_fork_tips` scan at 10 k is ~0.6 ms — a >1000 blk/s ceiling,
+        // far above the sustained Byron apply rate.
+        let retain_blocks: u64 = std::env::var("DUGITE_VOLATILE_RETAIN")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(10_000)
+            .max(self.consensus.security_param);
+
+        // Flush k-deep volatile blocks to ImmutableDB in bounded batches,
+        // releasing the ChainDB write lock between batches so inbound ChainSync
+        // server reads (and the per-peer ChainSync client tasks) are not
+        // starved during a large catch-up flush.  Batch size 50 matches the
+        // value proven in the legacy `process_forward_blocks` path: a larger
+        // batch holds the ChainDB write lock long enough (ImmutableDB append +
+        // VolatileDB WAL rewrite) that peers time out their ChainSync idle
+        // timeout mid-flush and drop the connection — during the from-genesis
+        // peer-connection storm that churn could strand the header source and
+        // stall the sync.
+        const FLUSH_BATCH_SIZE: u64 = 50;
+        let mut total_flushed: u64 = 0;
+        loop {
+            let flushed = {
+                let mut db = self.chain_db.write().await;
+                let result = match loe_limit {
+                    None => db.flush_to_immutable_batch_retain(retain_blocks, FLUSH_BATCH_SIZE),
+                    Some(loe_slot) => db.flush_to_immutable_loe_batch(loe_slot, FLUSH_BATCH_SIZE),
+                };
+                match result {
+                    Ok(n) => n,
+                    Err(e) => {
+                        warn!(error = %e, "background-maintenance: flush to immutable failed");
+                        0
+                    }
+                }
+            };
+            total_flushed += flushed;
+            if flushed == 0 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+
+        if total_flushed == 0 {
+            return;
+        }
+
+        // GC volatile blocks whose deferred-removal delay has expired.
+        {
+            let mut db = self.chain_db.write().await;
+            db.gc_volatile();
+        }
+
+        // Advance the chain-fragment anchor to the new ImmutableDB tip so the
+        // fragment (push-only in the live apply path) is trimmed to the
+        // volatile window.  Points older than the immutable tip are served to
+        // downstream ChainSync peers from ImmutableDB historical anchors, not
+        // the fragment.
+        let imm_tip = {
+            let db = self.chain_db.read().await;
+            db.get_immutable_tip_point()
+        };
+        if let Some(anchor) = imm_tip {
+            let mut fragment = self.chain_fragment.write().await;
+            fragment.advance_anchor(anchor);
+        }
+
+        trace!(
+            flushed = total_flushed,
+            "background-maintenance: finalised volatile blocks to immutable"
+        );
     }
 
     /// Post-apply housekeeping shared by every code path that adopts a block

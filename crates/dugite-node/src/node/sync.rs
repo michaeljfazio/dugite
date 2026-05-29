@@ -4603,20 +4603,57 @@ pub async fn chainsync_client_task(
                                 .unwrap_or(0);
 
                             if immutable_slot > 0 && rollback_slot < immutable_slot {
+                                // A rollback below our immutable tip is only a
+                                // genuine divergence witness when it is BOTH a
+                                // mid-stream rollback (not the initial
+                                // post-intersection one) AND from a peer whose own
+                                // tip is at or beyond our immutable tip.  Two
+                                // benign cases must NOT be counted (they would
+                                // otherwise trip the multi-peer #699 shutdown):
+                                //
+                                //  1. peer_behind — the peer is still catching up
+                                //     (its tip is below our immutable tip); it
+                                //     simply cannot serve blocks we have finalised.
+                                //
+                                //  2. stale-initial — the peer's INITIAL
+                                //     intersection picked a point that was our tip
+                                //     when it connected, but the background
+                                //     copy-to-immutable maintenance advanced our
+                                //     immutable tip past that point before we
+                                //     processed the reply.  The peer is on the
+                                //     canonical chain (its tip is the network tip);
+                                //     it just needs to re-intersect, which it does
+                                //     on the next connection cycle against our
+                                //     current (advanced) known-points.
+                                //
+                                // Before catch-up advanced the immutable tip, the
+                                // tip stayed at genesis during sync so neither case
+                                // arose; counting them caused spurious #699
+                                // shutdowns on from-genesis sync.  See the "stale
+                                // chainsync intersection when peer behind" note.
+                                let peer_behind = tip_slot < immutable_slot;
+                                let genuine_divergence = !is_initial && !peer_behind;
                                 warn!(
                                     %peer_addr,
                                     rollback_slot,
                                     immutable_slot,
+                                    peer_tip_slot = tip_slot,
                                     is_initial,
+                                    peer_behind,
+                                    genuine_divergence,
                                     "MsgRollBackward to point older than our \
-                                     ImmutableDB tip — peer is stale or divergent. \
-                                     Disconnecting (#699)."
+                                     ImmutableDB tip — disconnecting peer. \
+                                     Counted as a divergence witness only for a \
+                                     mid-stream rollback from an up-to-date peer \
+                                     (#699)."
                                 );
                                 // Record divergence-witness in the peer manager
                                 // so the run-loop can detect a multi-peer
                                 // divergence consensus and surface a clear
-                                // operator error.
-                                {
+                                // operator error — but ONLY for genuine
+                                // divergences, so behind peers and stale initial
+                                // intersections cannot trigger a false shutdown.
+                                if genuine_divergence {
                                     let mut pm = peer_manager.write().await;
                                     pm.record_rollback_below_immutable(
                                         peer_addr,
@@ -4627,8 +4664,15 @@ pub async fn chainsync_client_task(
                                 return Err(anyhow::anyhow!(
                                     "Peer {peer_addr} requested rollback to slot \
                                      {rollback_slot} (older than our ImmutableDB \
-                                     tip at slot {immutable_slot} — divergent chain \
-                                     or stale peer)"
+                                     tip at slot {immutable_slot}; peer tip \
+                                     {tip_slot}, is_initial={is_initial} — {})",
+                                    if genuine_divergence {
+                                        "divergent chain"
+                                    } else if peer_behind {
+                                        "peer is behind us"
+                                    } else {
+                                        "stale initial intersection (we advanced)"
+                                    }
                                 ));
                             }
 

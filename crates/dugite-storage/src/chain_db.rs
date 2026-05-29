@@ -890,17 +890,38 @@ impl ChainDB {
     /// allows the caller to release the ChainDB write lock between batches,
     /// preventing read starvation for concurrent tasks (e.g. ChainSync server).
     pub fn flush_to_immutable_batch(&mut self, max_blocks: u64) -> Result<u64, ChainDBError> {
+        let k = self.security_param_k as u64;
+        self.flush_to_immutable_batch_retain(k, max_blocks)
+    }
+
+    /// Like [`flush_to_immutable_batch`] but retains `retain_blocks` of the most
+    /// recent volatile blocks instead of the protocol security parameter `k`.
+    ///
+    /// `retain_blocks` MUST be `>= k` so the in-memory volatile window always
+    /// covers the full k-block Ouroboros rollback window; values larger than `k`
+    /// simply keep extra already-finalised blocks resident.  The live-sync
+    /// background maintenance uses a window well above `k` so the ImmutableDB tip
+    /// trails the active sync tip by a wide margin — newly-connecting peers
+    /// intersect near our tip, far above the immutable tip, so advancing the
+    /// immutable tip during catch-up never collides with a peer's initial
+    /// intersection point (which would otherwise force a re-intersection storm
+    /// and stall the BlockFetch pipeline on already-known headers).
+    pub fn flush_to_immutable_batch_retain(
+        &mut self,
+        retain_blocks: u64,
+        max_blocks: u64,
+    ) -> Result<u64, ChainDBError> {
         let vol_tip = match self.volatile.get_tip() {
             Some(t) => t,
             None => return Ok(0),
         };
 
         let tip_block_no = vol_tip.2;
-        if tip_block_no <= self.security_param_k as u64 {
+        if tip_block_no <= retain_blocks {
             return Ok(0);
         }
 
-        let finalize_up_to_block_no = tip_block_no - self.security_param_k as u64;
+        let finalize_up_to_block_no = tip_block_no - retain_blocks;
         let start_block_no = self.last_flushed_block_no + 1;
 
         let mut to_finalize: Vec<(u64, Hash32, u64, Vec<u8>)> = Vec::new();
