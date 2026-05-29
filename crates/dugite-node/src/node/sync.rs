@@ -178,6 +178,38 @@ impl Node {
         }
     }
 
+    /// Update the time-based sync-progress metric.
+    ///
+    /// Progress = `(tip wall-clock time − genesis) / (now − genesis)`, the
+    /// cardano-node definition. The tip time is computed era-aware via
+    /// `slot_to_wallclock_ms` (Byron 20 s slots vs Shelley+ 1 s slots), so this
+    /// does NOT undercount Byron the way a raw `applied_slot / peer_tip_slot`
+    /// ratio did (which read ~1% at ~18% of the chain). `genesis` is the chain
+    /// system start (the shelley-genesis `system_start`, which on mainnet is the
+    /// Byron genesis time).
+    pub async fn update_sync_progress(
+        &self,
+        tip_slot: u64,
+        slot_config: &dugite_ledger::plutus::SlotConfig,
+    ) {
+        let Some(genesis_ms) = self
+            .shelley_genesis
+            .as_ref()
+            .and_then(|g| chrono::DateTime::parse_from_rfc3339(&g.system_start).ok())
+            .map(|t| t.timestamp_millis())
+        else {
+            // Genesis time unknown — leave the previous value rather than show a
+            // bogus percentage.
+            return;
+        };
+        let tip_ms = self.slot_to_wallclock_ms(tip_slot, slot_config).await as i64;
+        let now_ms = chrono::Utc::now().timestamp_millis();
+        self.metrics
+            .set_sync_progress(crate::metrics::compute_sync_progress(
+                tip_ms, genesis_ms, now_ms,
+            ));
+    }
+
     /// Notify connected N2N/N2C peers of a chain rollback by broadcasting a
     /// `RollbackAnnouncement`.  Both the N2N ChainSync server and the N2C
     /// LocalChainSync server subscribe to this channel and translate the

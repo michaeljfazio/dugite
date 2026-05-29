@@ -344,25 +344,25 @@ fn get_total_memory_bytes_impl() -> u64 {
     0
 }
 
-/// Compute sync progress as a percentage in `[0, 100]`.
+/// Compute sync progress as a percentage in `[0, 100]`, **time-based**.
 ///
-/// `applied_slot` is our local tip's slot number.  `peer_tip_slot` is the
-/// maximum tip slot reported by any peer (the network tip, as best we know
-/// it).  When `applied_slot >= peer_tip_slot` we are at or ahead of the
-/// known tip → 100%.  When `peer_tip_slot == 0` no peer has reported a
-/// tip yet — return 0% to make health checks correctly report "not
-/// synced" until a real measurement is available; this also avoids the
-/// pre-fix bug where `set_sync_progress(100.0)` was called unconditionally
-/// in block-apply paths, making dugite-monitor display 100% while the node
-/// was at <20% of the chain.
-pub fn compute_sync_progress(applied_slot: u64, peer_tip_slot: u64) -> f64 {
-    if peer_tip_slot == 0 {
-        return 0.0;
-    }
-    if applied_slot >= peer_tip_slot {
-        return 100.0;
-    }
-    (applied_slot as f64 / peer_tip_slot as f64) * 100.0
+/// All three arguments are wall-clock milliseconds (UNIX epoch):
+/// - `tip_time_ms` — the wall-clock time of the local tip's slot, converted
+///   era-aware (Byron 20 s slots vs Shelley+ 1 s slots) via the HFC era history.
+/// - `genesis_ms` — the chain's system start (Byron genesis).
+/// - `now_ms` — the current wall-clock time.
+///
+/// Progress is `(tip_time − genesis) / (now − genesis)`, matching cardano-node's
+/// definition (`Cardano.Slotting.Slot` / `getSyncPercentage` use tip-time vs
+/// now). A raw slot ratio (`applied_slot / peer_tip_slot`) is WRONG across the
+/// Byron→Shelley boundary: Byron's 4.49M slots are 20 s each (~2.85 yr) while
+/// Shelley+ slots are 1 s, so at ~18% of the chain in time the slot ratio reads
+/// only ~1.3% (the bug this replaces — dugite-monitor showed 1.2% at block
+/// ~2.3M where the chain is ~18% synced by time/block count).
+pub fn compute_sync_progress(tip_time_ms: i64, genesis_ms: i64, now_ms: i64) -> f64 {
+    let span = (now_ms - genesis_ms).max(1) as f64;
+    let elapsed = (tip_time_ms - genesis_ms).max(0) as f64;
+    ((elapsed / span) * 100.0).clamp(0.0, 100.0)
 }
 
 /// Node metrics for monitoring
@@ -1065,15 +1065,6 @@ impl NodeMetrics {
     /// Read the current maximum peer-reported tip slot.
     pub fn get_peer_tip(&self) -> u64 {
         self.max_peer_tip_slot.load(Ordering::Relaxed)
-    }
-
-    /// Recompute and store sync progress from our applied tip slot and the
-    /// peer-reported tip slot.  Use this instead of `set_sync_progress(100.0)`
-    /// in any block-apply path during sync — only the actual tip-following
-    /// case should report 100%.
-    pub fn refresh_sync_progress(&self, applied_slot: u64) {
-        let peer_tip = self.get_peer_tip();
-        self.set_sync_progress(compute_sync_progress(applied_slot, peer_tip));
     }
 
     pub fn set_utxo_count(&self, count: u64) {
@@ -2458,26 +2449,30 @@ mod tests {
     /// was at <20% of the chain.  The fix routes all block-apply paths
     /// through `refresh_sync_progress` → `compute_sync_progress`.
     #[test]
-    fn test_compute_sync_progress_during_bulk_sync() {
-        // Mid bulk sync: applied 25M / peer tip 122M → ~20.4%.
-        let pct = compute_sync_progress(25_462_569, 122_773_031);
-        assert!((20.0..21.0).contains(&pct), "expected ~20.7%, got {pct}");
+    fn test_compute_sync_progress_time_based() {
+        // Genesis at t=0; "now" at 273_000_000 s (~the chain's wall-clock age).
+        let genesis = 0i64;
+        let now = 273_000_000_000i64; // ms
+                                      // Tip at ~48.8M s into the chain (a Byron slot's wall-clock time):
+                                      // 48.8M / 273M ≈ 17.9% — NOT the ~1.3% a raw Byron slot ratio gives.
+        let tip = 48_800_000_000i64; // ms
+        let pct = compute_sync_progress(tip, genesis, now);
+        assert!(
+            (17.0..19.0).contains(&pct),
+            "expected ~17.9% by wall-clock time, got {pct}"
+        );
     }
 
     #[test]
-    fn test_compute_sync_progress_at_or_past_tip() {
-        // Equal slots → 100%.
-        assert_eq!(compute_sync_progress(100, 100), 100.0);
-        // Past tip (we just forged) → 100%.
-        assert_eq!(compute_sync_progress(105, 100), 100.0);
-    }
-
-    #[test]
-    fn test_compute_sync_progress_pre_peer_state() {
-        // No peer tip known yet → 0% (not 100%, which would falsely
-        // report "healthy" before the first ChainSync intersection).
-        assert_eq!(compute_sync_progress(0, 0), 0.0);
-        assert_eq!(compute_sync_progress(12345, 0), 0.0);
+    fn test_compute_sync_progress_at_tip_and_genesis() {
+        let genesis = 1_000i64;
+        let now = 273_000_000_000i64;
+        // Tip time == now → 100% (we are at the chain tip).
+        assert_eq!(compute_sync_progress(now, genesis, now), 100.0);
+        // Tip == genesis (no progress yet) → 0%.
+        assert_eq!(compute_sync_progress(genesis, genesis, now), 0.0);
+        // Tip ahead of now (clock skew / just forged) is clamped to 100%.
+        assert_eq!(compute_sync_progress(now + 5_000, genesis, now), 100.0);
     }
 
     #[test]
@@ -2492,23 +2487,6 @@ mod tests {
         // Larger tip wins.
         metrics.update_peer_tip(2_500);
         assert_eq!(metrics.get_peer_tip(), 2_500);
-    }
-
-    #[test]
-    fn test_refresh_sync_progress_during_bulk_sync() {
-        let metrics = NodeMetrics::new();
-        metrics.update_peer_tip(100);
-        metrics.refresh_sync_progress(25);
-        // 25/100 = 25% → stored as 2500 in the centi-percent gauge.
-        assert_eq!(metrics.sync_progress_pct.load(Ordering::Relaxed), 2500);
-    }
-
-    #[test]
-    fn test_refresh_sync_progress_at_tip() {
-        let metrics = NodeMetrics::new();
-        metrics.update_peer_tip(100);
-        metrics.refresh_sync_progress(100);
-        assert_eq!(metrics.sync_progress_pct.load(Ordering::Relaxed), 10_000);
     }
 
     #[test]
