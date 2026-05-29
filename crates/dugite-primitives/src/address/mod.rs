@@ -107,6 +107,46 @@ impl ByronAddress {
         let attrs_end = d.position();
         Some(attrs_end - attrs_start)
     }
+
+    /// Whether this is a Byron Redeem (AVVM) address — `addr_type == 2` in the
+    /// inner `[ root, attrs, addr_type ]` payload.
+    ///
+    /// AVVM voucher-redemption transactions spend ONLY redeem-address UTxOs and
+    /// are EXEMPT from the Byron minimum-fee rule: Haskell
+    /// `Cardano.Chain.UTxO.Validation.validateTxAux` sets `minFee = 0` when
+    /// `isRedeemUTxO` holds (all consumed UTxOs are at redeem addresses), so a
+    /// fee of 0 is valid for them. Returns `false` if the payload cannot be
+    /// decoded (caller treats that as "not redeem", i.e. fee is enforced).
+    pub fn is_redeem(&self) -> bool {
+        let inner_bytes: &[u8] = if self.payload.first() == Some(&0x82) {
+            let mut d = minicbor::Decoder::new(&self.payload);
+            if d.array().is_err() {
+                return false;
+            }
+            match d.tag() {
+                Ok(t) if t.as_u64() == 24 => {}
+                _ => return false,
+            }
+            match d.bytes() {
+                Ok(b) => b,
+                Err(_) => return false,
+            }
+        } else {
+            &self.payload
+        };
+        let mut d = minicbor::Decoder::new(inner_bytes);
+        if d.array().is_err() {
+            return false;
+        }
+        if d.bytes().is_err() {
+            return false; // root
+        }
+        if d.skip().is_err() {
+            return false; // attrs
+        }
+        // addr_type: 0 = PubKey, 1 = Script, 2 = Redeem.
+        matches!(d.u32(), Ok(2))
+    }
 }
 
 impl Address {
@@ -789,5 +829,64 @@ mod tests {
 
         let addr = ByronAddress { payload: outer };
         assert_eq!(addr.attributes_byte_size(), Some(1));
+    }
+
+    /// Build a Byron address payload `[ root(28B), attrs(empty), addr_type ]`,
+    /// optionally wrapped in the outer `[ array, tag(24), bstr ]` envelope.
+    fn byron_payload(addr_type: u32, wrapped: bool) -> Vec<u8> {
+        let mut inner = Vec::new();
+        let mut e = minicbor::Encoder::new(&mut inner);
+        e.array(3).unwrap();
+        e.bytes(&[0xABu8; 28]).unwrap();
+        e.map(0).unwrap();
+        e.u32(addr_type).unwrap();
+        if !wrapped {
+            return inner;
+        }
+        let mut outer = Vec::new();
+        let mut oe = minicbor::Encoder::new(&mut outer);
+        oe.array(2).unwrap();
+        oe.tag(minicbor::data::Tag::new(24)).unwrap();
+        oe.bytes(&inner).unwrap();
+        oe.u32(0).unwrap();
+        outer
+    }
+
+    #[test]
+    fn test_is_redeem_addr_type_2() {
+        // addr_type == 2 (Redeem/AVVM) -> true, in both inner-direct and wrapped forms.
+        assert!(ByronAddress {
+            payload: byron_payload(2, false)
+        }
+        .is_redeem());
+        assert!(ByronAddress {
+            payload: byron_payload(2, true)
+        }
+        .is_redeem());
+    }
+
+    #[test]
+    fn test_is_redeem_false_for_pubkey_and_script() {
+        // addr_type 0 (PubKey) and 1 (Script) are NOT redeem.
+        for t in [0u32, 1] {
+            assert!(!ByronAddress {
+                payload: byron_payload(t, false)
+            }
+            .is_redeem());
+            assert!(!ByronAddress {
+                payload: byron_payload(t, true)
+            }
+            .is_redeem());
+        }
+    }
+
+    #[test]
+    fn test_is_redeem_false_for_undecodable_payload() {
+        // Garbage / undecodable payload is treated as "not redeem" (fee enforced).
+        assert!(!ByronAddress {
+            payload: vec![0u8; 32]
+        }
+        .is_redeem());
+        assert!(!ByronAddress { payload: vec![] }.is_redeem());
     }
 }

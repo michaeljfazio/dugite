@@ -5,7 +5,7 @@
 ///
 /// - Inputs: `TxIn(TxId, index)` — simple UTxO set lookup, no scripts
 /// - Outputs: `TxOut(ByronAddress, Lovelace)` — no multi-asset, no datums
-/// - Fees: `fee = sum(inputs) - sum(outputs)`, must satisfy `fee >= min_fee_a * tx_size + min_fee_b`
+/// - Fees: `fee = sum(inputs) - sum(outputs)`, must satisfy `fee >= a + ceiling(size * b)`
 /// - No certificates, withdrawals, staking, Plutus scripts, or governance
 ///
 /// Byron transactions always succeed when structurally valid — there is no
@@ -37,7 +37,7 @@ pub enum ByronError {
     #[error("Value not conserved: inputs={inputs}, outputs={outputs}, fee={fee}")]
     ValueNotConserved { inputs: u64, outputs: u64, fee: u64 },
 
-    /// `fee < min_fee_a * tx_size + min_fee_b`
+    /// `fee < a + ceiling(size * b)` (and not exempt via the AVVM-redeem rule)
     #[error("Fee too small: minimum={minimum}, actual={actual}")]
     FeeTooSmall { minimum: u64, actual: u64 },
 
@@ -54,32 +54,80 @@ pub enum ByronError {
     ValueOverflow,
 }
 
-/// Byron fee policy extracted from genesis parameters.
+/// Byron fee policy: `minFee = a + ceiling(size * b)`.
 ///
-/// In Byron, the minimum fee is `min_fee_a * tx_size_bytes + min_fee_b` lovelace.
-/// The values come from the Byron genesis `blockVersionData.txFeePolicy`.
+/// Byron encodes the fee policy as
+/// `TxFeePolicy (TxFeePolicyTxSizeLinear (TxSizeLinear a b))` where `a :: Lovelace`
+/// is a constant summand and `b :: Rational` is the per-byte multiplier — note `b`
+/// is an EXACT rational, not an integer. Cross-validated byte-for-byte against
+/// cardano-ledger `Cardano.Chain.Common.TxSizeLinear.calculateTxSizeLinear`:
 ///
-/// The `ProtocolParameters` struct stores the Shelley-compatible projection of
-/// these values in `min_fee_a` and `min_fee_b`, which is reused here directly.
+/// ```haskell
+/// calculateTxSizeLinear (TxSizeLinear a b) sz =
+///   addLovelace a =<< flip scaleLovelaceRationalUp b <$> integerToLovelace sz
+/// -- scaleLovelaceRationalUp (Lovelace x) b = Lovelace $ ceiling (toRational x * b)
+/// ```
+///
+/// so `minFee = a + ceiling(size * b)` with CEILING rounding over exact rational
+/// arithmetic (NOT floor, NOT round-half, NOT integer truncation of `b`).
+/// <https://github.com/IntersectMBO/cardano-ledger/blob/d0e208885b8c7927aed758e003749fb3317612d3/eras/byron/ledger/impl/src/Cardano/Chain/Common/TxSizeLinear.hs#L55-L59>
+///
+/// The Byron genesis `blockVersionData.txFeePolicy` stores both values in Nano
+/// (10^-9) scale. mainnet, preprod and preview all share the same values:
+/// `summand = 155381000000000 / 1e9 = 155381` lovelace and
+/// `multiplier = 43946000000 / 1e9 = 21973/500` (43.946 exactly). We hold the
+/// multiplier as a reduced rational so the ceiling is computed with no precision
+/// loss. (cardano-node reads these from genesis; dugite does not yet parse the
+/// Byron `txFeePolicy`, so we pin the canonical network constants — these are the
+/// exact genesis values, not an approximation.)
 #[derive(Debug, Clone, Copy)]
 pub struct ByronFeePolicy {
-    /// Per-byte fee coefficient (lovelace per byte of serialized transaction)
-    pub min_fee_a: u64,
-    /// Constant fee component (lovelace, always charged regardless of tx size)
-    pub min_fee_b: u64,
+    /// Constant summand `a` (lovelace), always charged regardless of tx size.
+    pub summand: u64,
+    /// Per-byte multiplier `b` numerator (exact rational `mult_num / mult_den`).
+    pub mult_num: u64,
+    /// Per-byte multiplier `b` denominator.
+    pub mult_den: u64,
 }
 
 impl ByronFeePolicy {
-    /// Compute the minimum fee for a transaction of the given serialized byte length.
+    /// Canonical Byron `txFeePolicy` summand for the public Cardano networks.
+    pub const BYRON_SUMMAND: u64 = 155_381;
+    /// Canonical Byron multiplier numerator (`21973/500 = 43.946`).
+    pub const BYRON_MULT_NUM: u64 = 21_973;
+    /// Canonical Byron multiplier denominator.
+    pub const BYRON_MULT_DEN: u64 = 500;
+
+    /// The canonical Byron fee policy shared by mainnet/preprod/preview.
+    pub const fn canonical() -> Self {
+        ByronFeePolicy {
+            summand: Self::BYRON_SUMMAND,
+            mult_num: Self::BYRON_MULT_NUM,
+            mult_den: Self::BYRON_MULT_DEN,
+        }
+    }
+
+    /// Compute the minimum fee for a transaction of the given serialized byte
+    /// length: `a + ceiling(size * mult_num / mult_den)`.
     ///
-    /// Formula: `min_fee_a * tx_size_bytes + min_fee_b`
+    /// `size` MUST be the full `ATxAux` CBOR byte length (tx body + witnesses),
+    /// matching Haskell `validateTxAux`'s `txSize = BS.length txBytes` where
+    /// `txBytes` is the `ATxAux` annotation.
     ///
-    /// Returns `None` on overflow (impossible for realistic values but we defend
-    /// against corrupted genesis parameters).
+    /// Uses exact `u128` integer arithmetic for the ceiling division so the
+    /// result is identical to Haskell's `ceiling (toRational size * b)`. Returns
+    /// `None` on overflow or a zero denominator (defends against corrupt params).
     pub fn min_fee(&self, tx_size_bytes: u64) -> Option<u64> {
-        self.min_fee_a
-            .checked_mul(tx_size_bytes)
-            .and_then(|product| product.checked_add(self.min_fee_b))
+        let den = self.mult_den as u128;
+        if den == 0 {
+            return None;
+        }
+        // ceiling(size * num / den) == (size * num + den - 1) / den
+        let scaled = (tx_size_bytes as u128).checked_mul(self.mult_num as u128)?;
+        let ceil = scaled.checked_add(den - 1)? / den;
+        (self.summand as u128)
+            .checked_add(ceil)
+            .and_then(|v| u64::try_from(v).ok())
     }
 }
 
@@ -127,13 +175,24 @@ where
         return Err(ByronError::NoInputs);
     }
 
-    // Rule 2: resolve all inputs and accumulate their ADA value
+    // Rule 2: resolve all inputs and accumulate their ADA value.
+    //
+    // Also track whether EVERY consumed UTxO is at a Byron redeem (AVVM)
+    // address — Haskell `isRedeemUTxO`. When true, the minimum fee is 0
+    // (validateTxAux: `if isRedeemUTxO inputUTxO then mkKnownLovelace @0`),
+    // so AVVM voucher-redemption txs (which sweep the full balance with no
+    // fee) validate with fee == 0.
     let mut input_sum: u64 = 0;
+    let mut all_inputs_redeem = true;
     let mut consumed = Vec::with_capacity(tx.body.inputs.len());
     for input in &tx.body.inputs {
         let output = lookup_utxo(input).ok_or_else(|| {
             ByronError::InputNotFound(format!("{}#{}", input.transaction_id.to_hex(), input.index))
         })?;
+        all_inputs_redeem &= matches!(
+            &output.address,
+            dugite_primitives::address::Address::Byron(b) if b.is_redeem()
+        );
         // Sum only the coin component. Byron UTxOs are ADA-only; any multi-asset
         // entries (theoretically impossible in Byron but we are defensive) are ignored
         // for the purposes of value conservation — the multi-asset check on outputs
@@ -165,24 +224,39 @@ where
         produced.push((out_input, output.clone()));
     }
 
-    // Rule 4: value conservation — inputs == outputs + fee
-    let fee = tx.body.fee.0;
-    let expected_inputs = output_sum
-        .checked_add(fee)
-        .ok_or(ByronError::ValueOverflow)?;
-    if input_sum != expected_inputs {
-        return Err(ByronError::ValueNotConserved {
+    // Rule 4 + fee: the Byron fee is IMPLICIT — `inputs - outputs`. Byron
+    // transactions carry NO explicit fee field on the wire, so `tx.body.fee`
+    // is always 0 for a decoded Byron tx (the previous code read it directly,
+    // making the min-fee check see actual=0 and reject every fee-paying Byron
+    // tx under full validation). Value conservation = inputs must cover
+    // outputs; the surplus is the fee.
+    let fee = input_sum
+        .checked_sub(output_sum)
+        .ok_or(ByronError::ValueNotConserved {
             inputs: input_sum,
             outputs: output_sum,
-            fee,
-        });
-    }
+            fee: 0,
+        })?;
 
-    // Rule 5: minimum fee must be satisfied
-    let min_fee = fee_policy
-        .min_fee(tx_size_bytes)
-        .ok_or(ByronError::ValueOverflow)?;
+    // Rule 5: minimum fee must be satisfied. AVVM-redeem txs are exempt
+    // (minFee = 0) — Haskell `isRedeemUTxO` → `mkKnownLovelace @0`.
+    let min_fee = if all_inputs_redeem {
+        0
+    } else {
+        fee_policy
+            .min_fee(tx_size_bytes)
+            .ok_or(ByronError::ValueOverflow)?
+    };
     if fee < min_fee {
+        tracing::warn!(
+            tx = %tx.hash.to_hex(),
+            input_sum,
+            output_sum,
+            fee,
+            min_fee,
+            tx_size_bytes,
+            "Byron min-fee check failed — diagnostic (input/output sums)"
+        );
         return Err(ByronError::FeeTooSmall {
             minimum: min_fee,
             actual: fee,
@@ -412,11 +486,15 @@ impl EraRules for ByronRules {
         _gov: &mut GovSubState,
         _epochs: &mut EpochSubState,
     ) -> Result<UtxoDiff, LedgerError> {
-        let fee_policy = ByronFeePolicy {
-            min_fee_a: ctx.params.min_fee_a,
-            min_fee_b: ctx.params.min_fee_b,
-        };
+        // Byron fee policy is a network-wide genesis constant (a + ceiling(size*b),
+        // b an exact rational). It is NOT the Shelley integer projection carried in
+        // `ctx.params.min_fee_a/b`. See `ByronFeePolicy` for the Haskell cross-ref.
+        let fee_policy = ByronFeePolicy::canonical();
 
+        // NOTE: Haskell sizes the full `ATxAux` (tx body + witnesses); dugite's
+        // `raw_cbor` is the tx body only, so this is a (lenient) lower bound on the
+        // true size. Real historical blocks always pay >= the true minimum, so this
+        // never falsely rejects; full-ATxAux sizing is tracked for byte-exact parity.
         let tx_size_bytes = tx.raw_cbor.as_ref().map_or(0, |b| b.len() as u64);
         let mut diff = UtxoDiff::new();
 
@@ -566,14 +644,13 @@ impl EraRules for ByronRules {
         consensus.epoch_block_count += 1;
     }
 
-    /// Byron minimum fee: `min_fee_a * tx_size_bytes + min_fee_b`.
+    /// Byron minimum fee: `a + ceiling(size * b)` (canonical genesis policy).
     ///
-    /// Delegates to the existing `ByronFeePolicy` calculation.
-    fn min_fee(&self, tx: &Transaction, ctx: &RuleContext, _utxo: &UtxoSubState) -> u64 {
-        let policy = ByronFeePolicy {
-            min_fee_a: ctx.params.min_fee_a,
-            min_fee_b: ctx.params.min_fee_b,
-        };
+    /// Delegates to [`ByronFeePolicy::min_fee`]. `ctx` is unused because the
+    /// Byron fee policy is a network-wide genesis constant, not the Shelley
+    /// integer projection carried in `ctx.params`.
+    fn min_fee(&self, tx: &Transaction, _ctx: &RuleContext, _utxo: &UtxoSubState) -> u64 {
+        let policy = ByronFeePolicy::canonical();
         let tx_size = tx.raw_cbor.as_ref().map_or(0, |b| b.len() as u64);
         policy.min_fee(tx_size).unwrap_or(u64::MAX)
     }
@@ -653,16 +730,33 @@ mod tests {
     // Helpers
     // -----------------------------------------------------------------------
 
-    /// A fee policy matching the Shelley-projected Byron mainnet values.
-    const TEST_POLICY: ByronFeePolicy = ByronFeePolicy {
-        min_fee_a: 44,
-        min_fee_b: 155_381,
-    };
+    /// The canonical Byron mainnet/preprod/preview fee policy
+    /// (`155381 + ceiling(size * 21973/500)`).
+    const TEST_POLICY: ByronFeePolicy = ByronFeePolicy::canonical();
 
     fn make_byron_address(byte: u8) -> Address {
         Address::Byron(ByronAddress {
             payload: vec![byte; 32],
         })
+    }
+
+    /// Build a Byron address whose inner payload is the canonical
+    /// `[ root(28B), attrs(empty map), addr_type ]` array, so `is_redeem()`
+    /// decodes it. `addr_type`: 0 = PubKey, 1 = Script, 2 = Redeem (AVVM).
+    fn make_byron_typed_address(root_byte: u8, addr_type: u8) -> Address {
+        let mut payload = vec![0x83u8, 0x58, 0x1c]; // array(3), bytes(len=28)
+        payload.extend(std::iter::repeat_n(root_byte, 28));
+        payload.push(0xa0); // attrs: empty map
+        payload.push(addr_type); // CBOR uint 0..=23 == literal byte
+        Address::Byron(ByronAddress { payload })
+    }
+
+    fn make_redeem_address(root_byte: u8) -> Address {
+        make_byron_typed_address(root_byte, 0x02)
+    }
+
+    fn make_pubkey_byron_address(root_byte: u8) -> Address {
+        make_byron_typed_address(root_byte, 0x00)
     }
 
     fn make_output(address: Address, coin: u64) -> TransactionOutput {
@@ -761,7 +855,7 @@ mod tests {
     fn test_valid_byron_tx() {
         let input = make_input(0xAA, 0);
         let input_coin = 10_000_000u64; // 10 ADA
-                                        // min_fee(200) = 44 * 200 + 155_381 = 8_800 + 155_381 = 164_181 lovelace
+                                        // min_fee(200) = 155_381 + ceil(200 * 21973/500) = 164_171 lovelace
         let fee = TEST_POLICY.min_fee(200).unwrap();
         let output_coin = input_coin - fee;
 
@@ -784,6 +878,93 @@ mod tests {
         assert_eq!(effect.fee, Lovelace(fee));
         assert_eq!(effect.consumed.len(), 1);
         assert_eq!(effect.produced.len(), 1);
+    }
+
+    /// AVVM voucher-redemption: a tx whose inputs are ALL at redeem (AVVM)
+    /// addresses is exempt from the minimum fee (Haskell `isRedeemUTxO` =>
+    /// `minFee = mkKnownLovelace @0`), so it may sweep the full balance with a
+    /// zero fee. Cross-validated against cardano-ledger `validateTxAux`.
+    #[test]
+    fn test_avvm_redeem_inputs_are_fee_exempt() {
+        let in0 = make_input(0xAA, 0);
+        let in1 = make_input(0xAB, 1);
+        let utxo = utxo_map(vec![
+            (
+                in0.clone(),
+                make_output(make_redeem_address(0x11), 6_000_000),
+            ),
+            (
+                in1.clone(),
+                make_output(make_redeem_address(0x22), 4_000_000),
+            ),
+        ]);
+        // fee = inputs - outputs = 10 ADA - 10 ADA = 0.
+        let tx = make_tx(
+            0xCC,
+            vec![in0, in1],
+            vec![make_output(make_pubkey_byron_address(0x33), 10_000_000)],
+            0,
+        );
+
+        let result = validate_byron_tx(&tx, |i| utxo.get(i).cloned(), TEST_POLICY, 200);
+        assert!(
+            result.is_ok(),
+            "all-redeem tx with fee=0 must validate (minFee=0), got {result:?}"
+        );
+        assert_eq!(result.unwrap().fee, Lovelace(0));
+    }
+
+    /// A SINGLE non-redeem input breaks the exemption — `isRedeemUTxO` requires
+    /// EVERY input to be a redeem address — so the full min-fee is enforced and a
+    /// zero-fee tx is rejected.
+    #[test]
+    fn test_mixed_redeem_and_pubkey_inputs_require_fee() {
+        let in0 = make_input(0xAA, 0);
+        let in1 = make_input(0xAB, 1);
+        let utxo = utxo_map(vec![
+            (
+                in0.clone(),
+                make_output(make_redeem_address(0x11), 6_000_000),
+            ),
+            (
+                in1.clone(),
+                make_output(make_pubkey_byron_address(0x22), 4_000_000),
+            ),
+        ]);
+        let tx = make_tx(
+            0xCC,
+            vec![in0, in1],
+            vec![make_output(make_pubkey_byron_address(0x33), 10_000_000)],
+            0,
+        );
+
+        let result = validate_byron_tx(&tx, |i| utxo.get(i).cloned(), TEST_POLICY, 200);
+        assert!(
+            matches!(result, Err(ByronError::FeeTooSmall { .. })),
+            "mixed redeem/pubkey inputs with fee=0 must be rejected, got {result:?}"
+        );
+    }
+
+    /// All-regular (pubkey) inputs are NOT exempt: a zero-fee tx is rejected.
+    #[test]
+    fn test_pubkey_inputs_require_minimum_fee() {
+        let in0 = make_input(0xAA, 0);
+        let utxo = utxo_map(vec![(
+            in0.clone(),
+            make_output(make_pubkey_byron_address(0x11), 10_000_000),
+        )]);
+        let tx = make_tx(
+            0xCC,
+            vec![in0],
+            vec![make_output(make_pubkey_byron_address(0x33), 10_000_000)],
+            0,
+        );
+
+        let result = validate_byron_tx(&tx, |i| utxo.get(i).cloned(), TEST_POLICY, 200);
+        assert!(
+            matches!(result, Err(ByronError::FeeTooSmall { .. })),
+            "pubkey inputs with fee=0 must be rejected, got {result:?}"
+        );
     }
 
     /// A transaction whose inputs are not in the UTxO set returns `InputNotFound`.
@@ -838,14 +1019,16 @@ mod tests {
         );
     }
 
-    /// A transaction where `sum(inputs) != sum(outputs) + fee` is rejected.
+    /// A transaction whose outputs EXCEED its inputs is rejected with
+    /// `ValueNotConserved`. Byron fees are implicit (`fee = inputs - outputs`),
+    /// so non-conservation means `outputs > inputs` (the implicit fee would be
+    /// negative, i.e. the `checked_sub` underflows).
     #[test]
     fn test_value_not_conserved_returns_error() {
         let input = make_input(0xAA, 0);
         let input_coin = 10_000_000u64;
-        let fee = TEST_POLICY.min_fee(200).unwrap();
-        // Output retains the full input value — none is left for the fee
-        let output_coin = input_coin; // should be input_coin - fee
+        // Outputs exceed inputs by 1 ADA — impossible to conserve value.
+        let output_coin = input_coin + 1_000_000;
 
         let utxo = utxo_map(vec![(
             input.clone(),
@@ -856,7 +1039,7 @@ mod tests {
             0xBB,
             vec![input],
             vec![make_output(make_byron_address(0x02), output_coin)],
-            fee,
+            0,
         );
 
         let result = validate_byron_tx(&tx, |i| utxo.get(i).cloned(), TEST_POLICY, 200);
@@ -1092,17 +1275,34 @@ mod tests {
         assert!(utxo.contains_key(&out2), "tx2 output present");
     }
 
-    /// `ByronFeePolicy::min_fee` computes the correct values.
+    /// `ByronFeePolicy::min_fee` matches Haskell `calculateTxSizeLinear`:
+    /// `a + ceiling(size * b)` with `a = 155381`, `b = 21973/500` (43.946 exact)
+    /// and CEILING rounding over exact rational arithmetic. Cross-validated against
+    /// cardano-ledger `Cardano.Chain.Common.{TxSizeLinear,Lovelace}`.
     #[test]
     fn test_fee_policy_min_fee() {
-        let policy = ByronFeePolicy {
-            min_fee_a: 44,
-            min_fee_b: 155_381,
-        };
-        // 44 * 200 + 155_381 = 8_800 + 155_381 = 164_181
-        assert_eq!(policy.min_fee(200), Some(164_181));
-        // Zero-size tx — only the constant component
+        let policy = ByronFeePolicy::canonical();
+
+        // Zero-size tx — only the constant summand.
         assert_eq!(policy.min_fee(0), Some(155_381));
+
+        // size 200: 200 * 21973/500 = 8789.2 -> ceiling 8790; 155381 + 8790.
+        // (Integer-projection `44*200 + 155381 = 164181` would be WRONG by +10.)
+        assert_eq!(policy.min_fee(200), Some(164_171));
+
+        // size 500: an exact multiple of the denominator -> no rounding.
+        // 500 * 21973/500 = 21973 exactly; 155381 + 21973.
+        assert_eq!(policy.min_fee(500), Some(177_354));
+
+        // size 1: 21973/500 = 43.946 -> ceiling 44 (floor would give 43).
+        assert_eq!(policy.min_fee(1), Some(155_425));
+
+        // size 501: 501 * 21973/500 = 22016.946 -> ceiling 22017.
+        assert_eq!(policy.min_fee(501), Some(177_398));
+
+        // A redeem-input tx is exempt (min fee 0) — verified in the AVVM test;
+        // here we only confirm the linear formula. Overflow guard:
+        assert_eq!(policy.min_fee(u64::MAX), None);
     }
 
     // -----------------------------------------------------------------------
@@ -1418,8 +1618,8 @@ mod tests {
         let tx = make_tx(0xAA, vec![], vec![], 0);
         // tx has 200 bytes of raw_cbor
         let min = rules.min_fee(&tx, &ctx, &utxo);
-        // 44 * 200 + 155381 = 164181
-        assert_eq!(min, 164_181);
+        // 155381 + ceil(200 * 21973/500) = 155381 + 8790 = 164171 (Byron rational policy)
+        assert_eq!(min, 164_171);
     }
 
     /// Verify process_epoch_transition resets block counters.
@@ -1526,7 +1726,7 @@ mod tests {
 
         let tx = make_tx(0xAA, vec![], vec![], 0);
         let min = rules.min_fee(&tx, &ctx, &utxo);
-        assert_eq!(min, 164_181, "EraRulesImpl should forward to ByronRules");
+        assert_eq!(min, 164_171, "EraRulesImpl should forward to ByronRules");
     }
 
     /// Verify apply_valid_tx in ApplyOnly mode with missing inputs accumulates fees.
