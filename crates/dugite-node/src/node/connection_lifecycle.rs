@@ -71,27 +71,43 @@ const FETCH_RANGE_TIMEOUT: Duration = Duration::from_secs(60);
 const BLOCKFETCH_RANGE_BYTE_BUDGET: usize = 8 * 1024 * 1024;
 /// Lower bound on range size (so tiny-budget edge cases still amortise a little).
 const BLOCKFETCH_MIN_RANGE: usize = 64;
-/// Upper bound — strictly BELOW the network's `MAX_BLOCKS_PER_FETCH` DoS guard.
+/// Default + hard ceiling on range size — the network's `MAX_BLOCKS_PER_FETCH`
+/// per-batch DoS cap.
 ///
 /// `MsgRequestRange(from, to)` is inclusive of both endpoints, so a range built
 /// from `n` contiguous headers makes an honest peer stream exactly `n`
-/// `MsgBlock` messages.  The client guard
-/// (`BlockFetchClient::fetch_range`) rejects a batch the moment
-/// `block_count` *reaches* `MAX_BLOCKS_PER_FETCH` — i.e. it re-checks the cap
-/// before reading the trailing `MsgBatchDone` — so the largest batch an honest
-/// peer can deliver without tripping the guard is `MAX_BLOCKS_PER_FETCH - 1`.
-/// Requesting a full `MAX_BLOCKS_PER_FETCH`-block range therefore wrongly fails
-/// honest peers with `BoundsExceeded` (regression once the adaptive byte budget
-/// grew ranges to the cap for tiny Byron blocks).  Cap one below the guard, and
-/// derive it from the same constant so the two can never drift apart.
-const BLOCKFETCH_MAX_RANGE: usize =
-    dugite_network::protocol::blockfetch::client::MAX_BLOCKS_PER_FETCH - 1;
-// Compile-time guard: the range we request must stay strictly below the
-// client's per-batch DoS cap, or honest peers fulfilling a max-sized range get
-// wrongly disconnected with `BoundsExceeded`.
+/// `MsgBlock` messages.  `BlockFetchClient::fetch_range` permits exactly
+/// `MAX_BLOCKS_PER_FETCH` blocks per batch and rejects only the (MAX+1)th, so a
+/// request range up to the cap is delivered without tripping the guard.  The
+/// actual per-fetch range is sized adaptively (byte budget / running average
+/// block size) and clamped to `[BLOCKFETCH_MIN_RANGE, blockfetch_max_range()]`;
+/// `blockfetch_max_range()` reads the operator override and defaults to this
+/// ceiling.
+const BLOCKFETCH_MAX_RANGE: usize = dugite_network::protocol::blockfetch::client::MAX_BLOCKS_PER_FETCH;
+// Compile-time guard: the range we request must never exceed the client's
+// per-batch DoS cap, or honest peers fulfilling a max-sized range get wrongly
+// disconnected with `BoundsExceeded`.
 const _: () = assert!(
-    BLOCKFETCH_MAX_RANGE < dugite_network::protocol::blockfetch::client::MAX_BLOCKS_PER_FETCH
+    BLOCKFETCH_MAX_RANGE <= dugite_network::protocol::blockfetch::client::MAX_BLOCKS_PER_FETCH
 );
+
+/// Resolve the per-fetch maximum range size (block count).
+///
+/// Precedence: the `DUGITE_BLOCKFETCH_MAX_RANGE` environment variable overrides
+/// everything; otherwise the `blockfetch_max_range` config-file field
+/// (`config_value`, editable via dugite-config); otherwise the default — the
+/// maximum (`BLOCKFETCH_MAX_RANGE`).  Larger ranges amortise the request
+/// round-trip across more blocks (helps tiny-block Byron bulk sync).  The
+/// result is clamped to `[BLOCKFETCH_MIN_RANGE, BLOCKFETCH_MAX_RANGE]` so it can
+/// never exceed the network DoS cap.
+pub fn resolve_blockfetch_max_range(config_value: Option<usize>) -> usize {
+    std::env::var("DUGITE_BLOCKFETCH_MAX_RANGE")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .or(config_value)
+        .unwrap_or(BLOCKFETCH_MAX_RANGE)
+        .clamp(BLOCKFETCH_MIN_RANGE, BLOCKFETCH_MAX_RANGE)
+}
 /// Pessimistic (Conway-sized) initial block-size estimate, so the very first
 /// range — taken before any block size is known — stays small/safe and then
 /// adapts within a range or two.
@@ -548,6 +564,13 @@ pub struct ConnectionLifecycleManager {
     /// Used to skip duplicate fetches from other peers.
     max_fetched_slot: Arc<std::sync::atomic::AtomicU64>,
 
+    /// Resolved per-fetch maximum range size (block count), clamped to
+    /// `[BLOCKFETCH_MIN_RANGE, BLOCKFETCH_MAX_RANGE]`.  Set once at construction
+    /// from `DUGITE_BLOCKFETCH_MAX_RANGE` / the `blockfetch_max_range` config
+    /// field (see `resolve_blockfetch_max_range`); each BlockFetch worker uses
+    /// it as the upper clamp on the adaptive byte-budget range sizing.
+    blockfetch_max_range: usize,
+
     /// Prometheus metrics for recording peer latencies.
     metrics: Arc<NodeMetrics>,
 
@@ -710,6 +733,7 @@ impl ConnectionLifecycleManager {
         peer_manager_for_servers: Arc<RwLock<NodePeerManager>>,
         peer_intersection_established: Arc<std::sync::atomic::AtomicBool>,
         tx_validator: Arc<dyn TxValidator>,
+        blockfetch_max_range: usize,
     ) -> Self {
         Self {
             connections: HashMap::new(),
@@ -730,6 +754,7 @@ impl ConnectionLifecycleManager {
             active_slots_coeff,
             active_fetcher: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             max_fetched_slot: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            blockfetch_max_range,
             metrics,
             mempool,
             peer_failure_tx,
@@ -1662,6 +1687,8 @@ impl ConnectionLifecycleManager {
         let _max_fetched_slot = self.max_fetched_slot.clone();
         let metrics_clone = self.metrics.clone();
         let peer_failure_tx = self.peer_failure_tx.clone();
+        // Operator-tunable upper clamp on the adaptive fetch-range size.
+        let max_range = self.blockfetch_max_range;
 
         Box::new(move |mut channel, cancel| {
             Box::pin(async move {
@@ -1886,7 +1913,7 @@ impl ConnectionLifecycleManager {
                             // blocks — bounding the per-range decode buffer.
                             let range_size = (BLOCKFETCH_RANGE_BYTE_BUDGET
                                 / avg_block_bytes.max(1))
-                            .clamp(BLOCKFETCH_MIN_RANGE, BLOCKFETCH_MAX_RANGE);
+                            .clamp(BLOCKFETCH_MIN_RANGE, max_range);
                             let ranges: Vec<(CodecPoint, CodecPoint)> = {
                                 let mut result = Vec::new();
                                 let mut i = 0;
@@ -2765,6 +2792,7 @@ impl ConnectionLifecycleManager {
             peer_manager_for_servers,
             Arc::new(std::sync::atomic::AtomicBool::new(false)),
             Arc::new(NoOpTxValidator),
+            BLOCKFETCH_MAX_RANGE,
         )
     }
 
@@ -2831,6 +2859,7 @@ impl ConnectionLifecycleManager {
             peer_manager_for_servers,
             Arc::new(std::sync::atomic::AtomicBool::new(false)),
             Arc::new(NoOpTxValidator),
+            BLOCKFETCH_MAX_RANGE,
         );
         (lc, peer_failure_rx)
     }

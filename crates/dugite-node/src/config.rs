@@ -469,6 +469,18 @@ pub struct NodeConfig {
     /// accumulating unbounded JoinHandles in the N2C accept loop (G3).
     #[serde(default = "default_max_n2c_connections")]
     pub max_n2c_connections: usize,
+
+    /// Maximum blocks pulled by a single BlockFetch `MsgRequestRange` (bulk sync).
+    ///
+    /// A larger range amortises the request round-trip across more blocks,
+    /// which helps tiny-block Byron bulk sync; the actual range is still sized
+    /// adaptively by an 8 MiB byte budget so large Conway blocks shrink it.
+    /// `None` (the default) uses the maximum — the network `MAX_BLOCKS_PER_FETCH`
+    /// cap (2000).  Any value is clamped to `[64, 2000]` at use; it can never
+    /// exceed the network per-batch DoS cap.  The `DUGITE_BLOCKFETCH_MAX_RANGE`
+    /// environment variable overrides this field when set.
+    #[serde(default, rename = "BlockFetchMaxRange")]
+    pub blockfetch_max_range: Option<usize>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -1000,6 +1012,7 @@ impl Default for NodeConfig {
             chain_sync_idle_timeout: None,
             per_ip_rate_limit_n2n: default_per_ip_rate_limit_n2n(),
             max_n2c_connections: default_max_n2c_connections(),
+            blockfetch_max_range: None,
         }
     }
 }
