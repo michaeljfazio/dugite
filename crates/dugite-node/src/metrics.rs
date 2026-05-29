@@ -406,6 +406,15 @@ pub struct NodeMetrics {
     /// dugite-monitor: 1=Byron, 2=Shelley, 3=Allegra, 4=Mary, 5/6=Alonzo,
     /// 7/8=Babbage, 9+=Conway).
     pub protocol_version_major: AtomicU64,
+    /// Current ledger era as the hard-fork-combinator era index (0=Byron,
+    /// 1=Shelley, 2=Allegra, 3=Mary, 4=Alonzo, 5=Babbage, 6=Conway,
+    /// 7=Dijkstra).  This is the AUTHORITATIVE era signal: it comes from the
+    /// applied block's era tag, NOT from `protocol_version_major`.  During
+    /// Byron the Shelley-shaped ledger `protocol_params.protocol_version_major`
+    /// reads the Shelley-genesis value (2), so deriving the era from it
+    /// mislabels Byron blocks as "Shelley" — the HFC era index is the source of
+    /// truth (matches Haskell's `OneEraBlock`/telescope tag position).
+    pub era: AtomicU64,
     /// Currently-active protocol minor version (paired with major; bumped
     /// on intra-era parameter changes).
     pub protocol_version_minor: AtomicU64,
@@ -734,6 +743,7 @@ impl NodeMetrics {
             block_number: AtomicU64::new(0),
             epoch_number: AtomicU64::new(0),
             protocol_version_major: AtomicU64::new(0),
+            era: AtomicU64::new(0),
             protocol_version_minor: AtomicU64::new(0),
             utxo_count: AtomicU64::new(0),
             mempool_tx_count: AtomicU64::new(0),
@@ -1030,6 +1040,12 @@ impl NodeMetrics {
     pub fn set_protocol_version(&self, major: u64, minor: u64) {
         self.protocol_version_major.store(major, Ordering::Relaxed);
         self.protocol_version_minor.store(minor, Ordering::Relaxed);
+    }
+
+    /// Record the current ledger era from the applied block's HFC era index
+    /// (`Era::to_era_index`). Authoritative era signal — see the `era` field.
+    pub fn set_era(&self, era_index: u64) {
+        self.era.store(era_index, Ordering::Relaxed);
     }
 
     pub fn set_sync_progress(&self, pct: f64) {
@@ -1626,6 +1642,11 @@ impl NodeMetrics {
                 "dugite_protocol_major_version",
                 "Active protocol major version (1=Byron, 2=Shelley, 3=Allegra, 4=Mary, 5/6=Alonzo, 7/8=Babbage, 9+=Conway)",
                 &self.protocol_version_major,
+            ),
+            (
+                "dugite_era",
+                "Current ledger era as HFC era index from the applied block (0=Byron, 1=Shelley, 2=Allegra, 3=Mary, 4=Alonzo, 5=Babbage, 6=Conway, 7=Dijkstra). Authoritative era signal, independent of protocol_version_major.",
+                &self.era,
             ),
             (
                 "dugite_protocol_minor_version",
