@@ -71,8 +71,27 @@ const FETCH_RANGE_TIMEOUT: Duration = Duration::from_secs(60);
 const BLOCKFETCH_RANGE_BYTE_BUDGET: usize = 8 * 1024 * 1024;
 /// Lower bound on range size (so tiny-budget edge cases still amortise a little).
 const BLOCKFETCH_MIN_RANGE: usize = 64;
-/// Upper bound — the network's `MAX_BLOCKS_PER_FETCH` server/DoS cap.
-const BLOCKFETCH_MAX_RANGE: usize = 2000;
+/// Upper bound — strictly BELOW the network's `MAX_BLOCKS_PER_FETCH` DoS guard.
+///
+/// `MsgRequestRange(from, to)` is inclusive of both endpoints, so a range built
+/// from `n` contiguous headers makes an honest peer stream exactly `n`
+/// `MsgBlock` messages.  The client guard
+/// (`BlockFetchClient::fetch_range`) rejects a batch the moment
+/// `block_count` *reaches* `MAX_BLOCKS_PER_FETCH` — i.e. it re-checks the cap
+/// before reading the trailing `MsgBatchDone` — so the largest batch an honest
+/// peer can deliver without tripping the guard is `MAX_BLOCKS_PER_FETCH - 1`.
+/// Requesting a full `MAX_BLOCKS_PER_FETCH`-block range therefore wrongly fails
+/// honest peers with `BoundsExceeded` (regression once the adaptive byte budget
+/// grew ranges to the cap for tiny Byron blocks).  Cap one below the guard, and
+/// derive it from the same constant so the two can never drift apart.
+const BLOCKFETCH_MAX_RANGE: usize =
+    dugite_network::protocol::blockfetch::client::MAX_BLOCKS_PER_FETCH - 1;
+// Compile-time guard: the range we request must stay strictly below the
+// client's per-batch DoS cap, or honest peers fulfilling a max-sized range get
+// wrongly disconnected with `BoundsExceeded`.
+const _: () = assert!(
+    BLOCKFETCH_MAX_RANGE < dugite_network::protocol::blockfetch::client::MAX_BLOCKS_PER_FETCH
+);
 /// Pessimistic (Conway-sized) initial block-size estimate, so the very first
 /// range — taken before any block size is known — stays small/safe and then
 /// adapts within a range or two.
