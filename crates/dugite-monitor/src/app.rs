@@ -736,8 +736,12 @@ impl App {
     /// 3. **Replaying** — `blocks_applied_total == 0` AND progress > 0 AND
     ///    `tip_age > 300`.  The node is reading blocks back from its local
     ///    ImmutableDB chunk files; no peer blocks have been applied yet.
-    /// 4. **Stalled** — `tip_age > 300` (and we did not match Replaying above,
-    ///    meaning some peer blocks have been applied in the past).
+    /// 4. **Stalled** — `tip_age > 300` AND the block number is NOT advancing
+    ///    (and we did not match Replaying above, meaning some peer blocks have
+    ///    been applied in the past).  `tip_age` alone is NOT a stall signal:
+    ///    during a from-genesis / deep catch-up the tip is legitimately hours-
+    ///    to-years old while blocks stream in at full speed, so we additionally
+    ///    require that no progress is being made.
     /// 5. **Syncing** — catch-all: progress is advancing normally.
     pub fn sync_status(&self) -> SyncState {
         if self.node_status == NodeStatus::Offline {
@@ -757,7 +761,11 @@ impl App {
             // No peer blocks have been applied yet, but sync progress is
             // advancing — the node is replaying its local ImmutableDB.
             SyncState::Replaying
-        } else if tip_age > 300 && pct < 99.0 {
+        } else if tip_age > 300 && pct < 99.0 && !self.block_number_advancing {
+            // Old tip AND no forward progress between polls — a genuine stall.
+            // A node bulk-syncing from genesis has a huge tip_age but IS
+            // advancing, so it must read as Syncing, not Stalled (matches the
+            // CatchingUp vs Stuck split in `tip_state`).
             SyncState::Stalled
         } else {
             SyncState::Syncing
@@ -1051,7 +1059,9 @@ mod tests {
         assert!(!app.sync_status().is_stalled());
         assert!(!app.sync_status().is_replaying());
 
-        // Stalled (blocks have been applied in the past, but tip is old)
+        // Stalled (blocks applied in the past, tip is old, AND no forward
+        // progress between polls).
+        app.block_number_advancing = false;
         app.metrics = make_snapshot(vec![
             ("dugite_sync_progress_percent", 5000.0),
             ("dugite_tip_age_seconds", 600.0),
@@ -1061,6 +1071,30 @@ mod tests {
         assert!(!app.sync_status().is_synced());
         assert!(app.sync_status().is_stalled());
         assert!(!app.sync_status().is_replaying());
+
+        // Bulk sync from genesis: tip is legitimately ancient (years old) and
+        // progress is ~1 %, but the block number IS advancing — must read as
+        // Syncing, NOT Stalled.  Regression for the "Stalled 1.00%" mislabel.
+        app.block_number_advancing = true;
+        app.metrics = make_snapshot(vec![
+            ("dugite_sync_progress_percent", 100.0),  // 1.00 %
+            ("dugite_tip_age_seconds", 63_000_000.0), // ~2 years
+            ("dugite_blocks_applied_total", 1_000_000.0),
+        ]);
+        assert_eq!(
+            app.sync_status(),
+            SyncState::Syncing,
+            "advancing bulk sync with an old tip must be Syncing, not Stalled"
+        );
+        assert!(!app.sync_status().is_stalled());
+
+        // Same ancient tip but NO forward progress → a genuine stall.
+        app.block_number_advancing = false;
+        assert_eq!(
+            app.sync_status(),
+            SyncState::Stalled,
+            "old tip with no block advancement is a real stall"
+        );
     }
 
     #[test]
@@ -1098,7 +1132,9 @@ mod tests {
         );
 
         // Once blocks have been applied (replay finished, now syncing from peers)
-        // but tip age is still high — that is Stalled, not Replaying.
+        // but tip age is still high AND the block number is not advancing —
+        // that is Stalled, not Replaying.
+        app.block_number_advancing = false;
         app.metrics = make_snapshot(vec![
             ("dugite_sync_progress_percent", 9000.0),
             ("dugite_tip_age_seconds", 600.0),
