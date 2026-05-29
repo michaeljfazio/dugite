@@ -247,6 +247,18 @@ impl InvalidBlockCache {
     pub fn is_empty(&self) -> bool {
         self.entries.is_empty()
     }
+
+    /// Snapshot of all cached invalid-block hashes, for ancestry checks during
+    /// chain selection (Haskell `truncateRejectedBlocks`: a candidate whose
+    /// chain contains a known-invalid block must never be adopted).
+    ///
+    /// Includes any lazily-expired entries — that only ever over-rejects a
+    /// candidate (conservatively safe), and the entry is purged on the next
+    /// `get`. Callers should snapshot once and reuse; this is only consulted
+    /// when the cache is non-empty (i.e. after a fork-replay failure).
+    pub fn hash_set(&self) -> std::collections::HashSet<BlockHeaderHash> {
+        self.entries.keys().copied().collect()
+    }
 }
 
 impl Default for InvalidBlockCache {
@@ -353,7 +365,13 @@ async fn process_add_block(
     }
 
     // --- Step 2: Invalid-block cache check ---------------------------------
-    {
+    //
+    // Reject the arriving block if it is itself known-invalid, and snapshot the
+    // cache so Step 4 can refuse to adopt any fork whose ancestry contains a
+    // known-invalid block (Haskell `truncateRejectedBlocks`). The snapshot is
+    // `None` whenever the cache is empty — the normal case — so the ancestry
+    // check is a zero-cost no-op during healthy sync.
+    let invalid_snapshot: Option<std::collections::HashSet<Hash32>> = {
         let mut cache = invalid_cache.write().await;
         if let Some(reason) = cache.get(hash) {
             debug!(
@@ -363,7 +381,12 @@ async fn process_add_block(
             );
             return AddBlockResult::Invalid(reason.to_owned());
         }
-    }
+        if cache.is_empty() {
+            None
+        } else {
+            Some(cache.hash_set())
+        }
+    };
 
     // --- Step 3: Write to VolatileDB ---------------------------------------
     let extended_tip;
@@ -529,6 +552,25 @@ async fn process_add_block(
         };
 
         if let Some((fork_hash, fork_bn, fork_slot)) = best_fork {
+            // Haskell `truncateRejectedBlocks`: never adopt a candidate whose
+            // chain contains a known-invalid block (e.g. one that failed ledger
+            // application during a prior fork replay). Without this, a peer
+            // extending such a fork would make us re-adopt it, re-fail the
+            // replay, and roll back — an endless loop. Gated on a non-empty
+            // invalid cache, so this is a no-op during normal sync.
+            if invalid_snapshot
+                .as_ref()
+                .is_some_and(|inv| db.candidate_contains_invalid(&fork_hash, inv))
+            {
+                warn!(
+                    fork_hash = %fork_hash.to_hex(),
+                    fork_block_no = fork_bn.0,
+                    "chain_sel: candidate fork contains a known-invalid block — \
+                     refusing to adopt (StoreButDontChange)"
+                );
+                return AddBlockResult::StoredAsFork;
+            }
+
             info!(
                 fork_hash = %fork_hash.to_hex(),
                 fork_block_no = fork_bn.0,
@@ -1066,6 +1108,71 @@ mod tests {
         let db = chain_db.read().await;
         let tip = db.get_tip_info().expect("should have a tip");
         assert_eq!(tip.2 .0, 4, "tip block_no should be 4 (b4)");
+    }
+
+    /// A longer fork whose chain contains a KNOWN-INVALID block must NOT be
+    /// adopted (Haskell `truncateRejectedBlocks`). Regression for the
+    /// fork-replay-failure loop: after a bad fork block is marked invalid, a
+    /// peer extending that fork must not make us re-adopt (and re-fail) it.
+    #[tokio::test]
+    async fn test_chain_selection_refuses_fork_with_invalid_block() {
+        let dir = tempfile::tempdir().unwrap();
+        let chain_db = make_chain_db(dir.path());
+        let (handle, runner) = ChainSelHandle::new(Arc::clone(&chain_db));
+        let _runner = tokio::spawn(runner);
+
+        let common = Hash32::from_bytes([0xC0; 32]);
+        let a2 = Hash32::from_bytes([0xA2; 32]);
+        let a3 = Hash32::from_bytes([0xA3; 32]);
+        let b2 = Hash32::from_bytes([0xB2; 32]);
+        let b3 = Hash32::from_bytes([0xB3; 32]);
+        let b4 = Hash32::from_bytes([0xB4; 32]);
+
+        // Main chain common → a2 → a3 (tip block_no 3).
+        for (h, slot, bn, prev) in [
+            (common, 100u64, 1u64, Hash32::ZERO),
+            (a2, 200, 2, common),
+            (a3, 300, 3, a2),
+        ] {
+            handle
+                .submit_block(h, SlotNo(slot), BlockNo(bn), prev, fake_cbor(&h))
+                .await
+                .unwrap();
+        }
+        // Competing fork common → b2 → b3 (stored, not yet longer).
+        for (h, slot, bn, prev) in [(b2, 200u64, 2u64, common), (b3, 300, 3, b2)] {
+            let r = handle
+                .submit_block(h, SlotNo(slot), BlockNo(bn), prev, fake_cbor(&h))
+                .await
+                .unwrap();
+            assert_eq!(r, AddBlockResult::StoredAsFork, "{h:?}");
+        }
+
+        // Mark b3 invalid (as if its replay had failed).
+        handle
+            .invalid_cache
+            .write()
+            .await
+            .insert(b3, "test: forced invalid".to_string());
+
+        // b4 extends the fork to block_no 4 — strictly longer than a3 — so it
+        // WOULD normally trigger a switch. But the fork's chain contains the
+        // invalid b3, so chain selection must refuse it.
+        let r = handle
+            .submit_block(b4, SlotNo(400), BlockNo(4), b3, fake_cbor(&b4))
+            .await
+            .unwrap();
+        assert_eq!(
+            r,
+            AddBlockResult::StoredAsFork,
+            "fork containing invalid b3 must not be adopted, got: {r:?}"
+        );
+
+        // The selected tip must remain a3 (block_no 3) — no switch occurred.
+        let db = chain_db.read().await;
+        let tip = db.get_tip_info().expect("should have a tip");
+        assert_eq!(tip.1, a3, "tip must remain a3 (poisoned fork rejected)");
+        assert_eq!(tip.2 .0, 3, "tip block_no must remain 3");
     }
 
     /// Verify that equal-length chains do NOT trigger a fork switch.

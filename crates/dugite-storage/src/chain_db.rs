@@ -788,6 +788,17 @@ impl ChainDB {
             .switch_chain(new_tip_hash, immutable_anchor, self.security_param_k as u64)
     }
 
+    /// Whether the volatile chain ending at `tip_hash` contains a known-invalid
+    /// block (see `VolatileDB::candidate_contains_invalid`). Chain selection
+    /// uses this to refuse adopting a candidate whose ancestry is poisoned.
+    pub fn candidate_contains_invalid(
+        &self,
+        tip_hash: &BlockHeaderHash,
+        invalid: &std::collections::HashSet<BlockHeaderHash>,
+    ) -> bool {
+        self.volatile.candidate_contains_invalid(tip_hash, invalid)
+    }
+
     /// GC orphaned fork blocks from volatile. Returns count removed.
     pub fn gc_volatile(&mut self) -> usize {
         self.volatile.gc_orphaned_blocks()
