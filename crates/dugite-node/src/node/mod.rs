@@ -5363,7 +5363,12 @@ impl Node {
             let eh = self.era_history.read().await;
             if let Ok((eh_epoch, slot_in_epoch)) = eh.slot_to_epoch(block_slot) {
                 if let Ok(epoch_len) = eh.epoch_size(eh_epoch) {
-                    self.metrics.set_epoch_progress(epoch_len, slot_in_epoch);
+                    // Era-correct slot length (Byron 20 000 ms vs Shelley+ 1 000
+                    // ms) so the monitor's epoch time-remaining is right across
+                    // the Byron boundary. Fall back to 1 000 ms on past-horizon.
+                    let slot_len_ms = eh.epoch_slot_length_ms(eh_epoch).unwrap_or(1000);
+                    self.metrics
+                        .set_epoch_progress(epoch_len, slot_in_epoch, slot_len_ms);
                 }
             }
         }

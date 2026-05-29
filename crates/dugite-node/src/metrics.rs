@@ -1282,10 +1282,20 @@ impl NodeMetrics {
     /// the slot-in-epoch offset is correct across the Byron/Shelley boundary —
     /// letting dugite-monitor render an accurate progress bar without re-deriving
     /// the era schedule itself.
-    pub fn set_epoch_progress(&self, epoch_length_slots: u64, slot_in_epoch: u64) {
+    pub fn set_epoch_progress(
+        &self,
+        epoch_length_slots: u64,
+        slot_in_epoch: u64,
+        slot_length_ms: u64,
+    ) {
         self.epoch_length_slots
             .store(epoch_length_slots, Ordering::Relaxed);
         self.slot_in_epoch.store(slot_in_epoch, Ordering::Relaxed);
+        // Keep `dugite_slot_length_ms` era-aware (Byron 20 000 ms vs Shelley+
+        // 1 000 ms) — the startup `set_shelley_chain_params` value is the
+        // Shelley one, which is wrong during Byron and makes downstream
+        // slot→walltime / epoch-time-remaining calculations 20× too short.
+        self.slot_length_ms.store(slot_length_ms, Ordering::Relaxed);
     }
 
     /// Record the active consensus mode (`dugite_consensus_mode`: 0 = Praos,
