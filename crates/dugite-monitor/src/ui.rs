@@ -121,6 +121,11 @@ fn render_header(frame: &mut Frame, app: &App, theme: &Theme, area: Rect) {
     let uptime = App::format_uptime(uptime_secs);
     let era = app.current_era();
     let network = app.network.label();
+    let consensus_mode = if app.metrics.get_u64("dugite_consensus_mode") == 1 {
+        "Genesis"
+    } else {
+        "Praos"
+    };
 
     let is_offline = app.node_status == NodeStatus::Offline;
 
@@ -229,6 +234,10 @@ fn render_header(frame: &mut Frame, app: &App, theme: &Theme, area: Rect) {
         // Network.
         Span::styled("Net ", Style::default().fg(theme.muted)),
         Span::styled(network, Style::default().fg(theme.accent)),
+        sep_spaced(theme),
+        // Consensus mode (Praos vs Ouroboros Genesis).
+        Span::styled("Mode ", Style::default().fg(theme.muted)),
+        Span::styled(consensus_mode, Style::default().fg(theme.info)),
         sep_spaced(theme),
         // Tip age with colored indicator icon.  Bold when the state signals
         // a problem (Stale or Stuck) to draw the operator's attention.
