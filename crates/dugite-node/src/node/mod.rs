@@ -4313,6 +4313,47 @@ impl Node {
 
     // ─── apply_fetched_block() ──────────────────────────────────────────────
 
+    /// Abandon a fork whose replay failed (a body-hash mismatch or a ledger
+    /// apply error on a fork-replayed block).
+    ///
+    /// Matches Haskell `ChainSel.validateCandidate`: mark the offending block
+    /// invalid (so chain selection's `truncateRejectedBlocks` equivalent will
+    /// never re-adopt a candidate containing it) and leave the current chain
+    /// intact. dugite commits the VolatileDB switch before replay, so "leave
+    /// the current chain intact" here means rolling the VolatileDB selected
+    /// chain AND the ledger back to the fork's intersection — a valid common
+    /// ancestor. This replaces the old `clear_volatile()`, which discarded the
+    /// entire VolatileDB and forced a multi-hour ImmutableDB resync.
+    async fn abandon_failed_fork(
+        &self,
+        bad_hash: dugite_primitives::hash::Hash32,
+        reason: &str,
+        intersection: &dugite_primitives::block::Point,
+    ) {
+        if let Some(ref handle) = self.chain_sel_handle {
+            handle
+                .invalid_cache
+                .write()
+                .await
+                .insert(bad_hash, reason.to_string());
+        }
+        {
+            let mut db = self.chain_db.write().await;
+            if let Err(e) = db.rollback_to_point(intersection) {
+                error!(error = %e, "abandon_failed_fork: volatile rollback to intersection failed");
+            }
+        }
+        // Roll the ledger back to the intersection to stay consistent with the
+        // (now rolled-back) VolatileDB selected chain.
+        let _ = self.handle_ledger_rollback(intersection).await;
+        warn!(
+            bad = %bad_hash.to_hex(),
+            reason,
+            "Abandoned failed fork: marked block invalid and rolled back to the \
+             intersection (VolatileDB preserved — no resync)"
+        );
+    }
+
     /// Apply a block fetched by a per-peer BlockFetch worker to the ledger.
     ///
     /// This is the main integration point between the BlockFetch pipeline and
@@ -4618,12 +4659,14 @@ impl Node {
                                                     block = fork_block_no.0,
                                                     error = %e,
                                                     "Fork replay: body hash verification failed — \
-                                                     clearing volatile and resyncing"
+                                                     abandoning fork (block marked invalid)"
                                                 );
-                                                {
-                                                    let mut db = self.chain_db.write().await;
-                                                    db.clear_volatile();
-                                                }
+                                                self.abandon_failed_fork(
+                                                    fork_block.header.header_hash,
+                                                    "fork replay: body hash mismatch",
+                                                    &rollback_point,
+                                                )
+                                                .await;
                                                 break;
                                             }
                                         }
@@ -4668,13 +4711,17 @@ impl Node {
                                                         slot = fork_slot.0,
                                                         block = fork_block_no.0,
                                                         "Fork replay: ledger apply failed: {e} — \
-                                                         clearing volatile and resyncing"
+                                                         abandoning fork (block marked invalid)"
                                                     );
-                                                    // Drop the write lock before acquiring the write
-                                                    // lock on chain_db.
+                                                    // Release the ledger lock before abandon_failed_fork
+                                                    // (it re-acquires ledger + chain_db).
                                                     drop(ls);
-                                                    let mut db = self.chain_db.write().await;
-                                                    db.clear_volatile();
+                                                    self.abandon_failed_fork(
+                                                        fork_block.header.header_hash,
+                                                        "fork replay: ledger apply failed",
+                                                        &rollback_point,
+                                                    )
+                                                    .await;
                                                     return;
                                                 }
                                             }
@@ -7151,11 +7198,15 @@ impl Node {
                                                 slot = fork_slot.0,
                                                 block = fork_block_no.0,
                                                 "Forge fork replay: ledger apply failed: {e} — \
-                                                 clearing volatile and aborting forge"
+                                                 abandoning fork (block marked invalid)"
                                             );
                                                 drop(ls);
-                                                let mut db = self.chain_db.write().await;
-                                                db.clear_volatile();
+                                                self.abandon_failed_fork(
+                                                    fork_block.header.header_hash,
+                                                    "forge fork replay: ledger apply failed",
+                                                    &rollback_point,
+                                                )
+                                                .await;
                                                 replay_failed = true;
                                                 break;
                                             }

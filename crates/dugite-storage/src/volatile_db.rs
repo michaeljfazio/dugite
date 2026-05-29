@@ -1383,6 +1383,21 @@ impl VolatileDB {
     /// against degenerate cases such as `hash == prev_hash`.  In a valid
     /// Cardano chain, cycles cannot occur because block hashes are a
     /// cryptographic commitment to the block body including prev_hash.
+    /// Whether the volatile chain ending at `tip_hash` contains any block in
+    /// `invalid` (walking back through VolatileDB until the chain leaves the
+    /// volatile window). Used by chain selection to refuse adopting a candidate
+    /// whose ancestry includes a known-invalid block (Haskell
+    /// `truncateRejectedBlocks`). The check short-circuits on the first match
+    /// and only the volatile portion of the chain is walked.
+    pub fn candidate_contains_invalid(&self, tip_hash: &Hash32, invalid: &HashSet<Hash32>) -> bool {
+        if invalid.is_empty() {
+            return false;
+        }
+        self.walk_chain_back(tip_hash)
+            .iter()
+            .any(|h| invalid.contains(h))
+    }
+
     pub fn walk_chain_back(&self, tip_hash: &Hash32) -> Vec<Hash32> {
         let mut chain = Vec::new();
         let mut visited = HashSet::new();
@@ -2944,6 +2959,39 @@ mod tests {
         assert_eq!(
             plan.intersection_slot, 111,
             "intersection slot must be populated from VolatileDB.blocks[hash].slot"
+        );
+    }
+
+    /// `candidate_contains_invalid` walks the volatile chain back from a tip and
+    /// reports whether any block on it is in the invalid set (Haskell
+    /// `truncateRejectedBlocks` — chain selection must not adopt a candidate
+    /// whose ancestry contains a known-invalid block).
+    #[test]
+    fn test_candidate_contains_invalid() {
+        let mut db = VolatileDB::new();
+        // Chain h(1) → h(2) → h(3) off immutable anchor h(0).
+        db.add_block(h(1), 100, 10, h(0), b"b1".to_vec());
+        db.add_block(h(2), 200, 20, h(1), b"b2".to_vec());
+        db.add_block(h(3), 300, 30, h(2), b"b3".to_vec());
+
+        let empty: HashSet<Hash32> = HashSet::new();
+        assert!(
+            !db.candidate_contains_invalid(&h(3), &empty),
+            "an empty invalid set never matches"
+        );
+
+        let inv: HashSet<Hash32> = [h(2)].into_iter().collect();
+        assert!(
+            db.candidate_contains_invalid(&h(3), &inv),
+            "chain ending at h(3) contains the invalid block h(2)"
+        );
+        assert!(
+            db.candidate_contains_invalid(&h(2), &inv),
+            "the tip itself being invalid counts"
+        );
+        assert!(
+            !db.candidate_contains_invalid(&h(1), &inv),
+            "chain ending at h(1) does not reach h(2)"
         );
     }
 
