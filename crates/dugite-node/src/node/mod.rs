@@ -2040,7 +2040,7 @@ impl Node {
             if let Some(slot) = tip.point.slot() {
                 self.metrics.set_slot(slot.0);
                 self.metrics.set_block_number(tip.block_number.0);
-                self.metrics.refresh_sync_progress(slot.0);
+                self.update_sync_progress(slot.0, &ls.slot_config).await;
                 // Era-aware tip-age computation (see Node::slot_to_wallclock_ms).
                 let slot_time_ms = self.slot_to_wallclock_ms(slot.0, &ls.slot_config).await;
                 self.metrics.set_tip_slot_time_ms(slot_time_ms);
@@ -4772,7 +4772,11 @@ impl Node {
                                         // (not the Shelley-shaped ledger PV major).
                                         self.metrics
                                             .set_era(fork_block.era.to_era_index() as u64);
-                                        self.metrics.refresh_sync_progress(fork_slot.0);
+                                        self.update_sync_progress(
+                                            fork_slot.0,
+                                            &self.view().slot_config,
+                                        )
+                                        .await;
                                         // Announce each fork block to downstream peers.
                                         if let Some(ref tx) = self.block_announcement_tx {
                                             let mut hash_bytes = [0u8; 32];
@@ -5399,7 +5403,8 @@ impl Node {
         // ledger protocol-version major (which is Shelley-shaped and reads 2
         // even during Byron, mislabelling Byron blocks as "Shelley").
         self.metrics.set_era(block.era.to_era_index() as u64);
-        self.metrics.refresh_sync_progress(block_slot.0);
+        self.update_sync_progress(block_slot.0, &self.view().slot_config)
+            .await;
 
         // Era-aware epoch-progress gauges (`dugite_epoch_length` +
         // `dugite_slot_in_epoch`) for dugite-monitor.  The HFC era history is
