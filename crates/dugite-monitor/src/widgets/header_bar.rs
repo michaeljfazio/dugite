@@ -33,6 +33,8 @@ pub struct HeaderBar<'a> {
     pub uptime: String,
     /// Epoch progress as a fraction (0.0 – 1.0).
     pub epoch_progress: f64,
+    /// Active consensus mode: true = Ouroboros Genesis (LoE/GDD), false = Praos.
+    pub consensus_genesis: bool,
     /// Whether the node is connected to the metrics endpoint.
     pub connected: bool,
     /// Active theme for colors.
@@ -104,8 +106,16 @@ impl Widget for HeaderBar<'_> {
             x += 1;
         }
 
-        // Remaining segments: epoch, tip age, uptime.
+        // Remaining segments: consensus mode, epoch, tip age, uptime.
         let segments = [
+            format!(
+                "\u{2502} {} ",
+                if self.consensus_genesis {
+                    "Genesis"
+                } else {
+                    "Praos"
+                }
+            ),
             format!("\u{2502} Epoch {} ", self.epoch),
             format!("\u{2502} Tip: {}s ", self.tip_age),
             format!("\u{2502} Up: {} ", self.uptime),
@@ -208,6 +218,7 @@ mod tests {
             tip_age: 12,
             uptime: "1h 5m".to_string(),
             epoch_progress: 0.65,
+            consensus_genesis: false,
             connected,
             theme: &THEME_MONOKAI,
         }
