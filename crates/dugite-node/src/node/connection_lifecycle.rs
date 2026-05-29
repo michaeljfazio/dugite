@@ -80,10 +80,11 @@ const BLOCKFETCH_MIN_RANGE: usize = 64;
 /// `MAX_BLOCKS_PER_FETCH` blocks per batch and rejects only the (MAX+1)th, so a
 /// request range up to the cap is delivered without tripping the guard.  The
 /// actual per-fetch range is sized adaptively (byte budget / running average
-/// block size) and clamped to `[BLOCKFETCH_MIN_RANGE, blockfetch_max_range()]`;
-/// `blockfetch_max_range()` reads the operator override and defaults to this
-/// ceiling.
-const BLOCKFETCH_MAX_RANGE: usize = dugite_network::protocol::blockfetch::client::MAX_BLOCKS_PER_FETCH;
+/// block size) and clamped to `[BLOCKFETCH_MIN_RANGE,
+/// resolve_blockfetch_max_range()]`; `resolve_blockfetch_max_range()` reads the
+/// operator override (env / config) and defaults to this ceiling.
+const BLOCKFETCH_MAX_RANGE: usize =
+    dugite_network::protocol::blockfetch::client::MAX_BLOCKS_PER_FETCH;
 // Compile-time guard: the range we request must never exceed the client's
 // per-batch DoS cap, or honest peers fulfilling a max-sized range get wrongly
 // disconnected with `BoundsExceeded`.
