@@ -1072,17 +1072,19 @@ impl OuroborosPraos {
 
     /// Check and update the operational certificate sequence number for the block issuer.
     ///
-    /// Per the Haskell reference implementation (`doValidateKESSignature`), the opcert
-    /// counter must satisfy:
-    ///   m <= n <= m + 1
-    /// where m is the last seen counter and n is the new counter.
-    /// This means the counter can stay the same or increment by exactly 1.
-    /// Regression (n < m) and over-increment (n > m+1) are both rejected.
+    /// Per the Haskell TPraos OCERT rule (`Cardano.Protocol.TPraos.Rules.OCert.
+    /// ocertTransition`), the ONLY counter predicate is `m <= n`
+    /// (`CounterTooSmallOCERT` on regression). There is NO upper bound — the
+    /// "+1 per rotation" rule does NOT exist in block validation (it is only a
+    /// forge-path constraint). The stored value is updated to `n` (a high-water
+    /// mark), not `m + 1`.
     ///
-    /// For a pool's **first ever block** (no entry in `opcert_counters`), the Haskell node
-    /// initializes `currentIssueNo = Just 0`, meaning the first block must have counter 0
-    /// or 1. This only applies to pools that ARE in the stake distribution (`issuer_info`
-    /// is `Some`). Unknown pools during sync (no `issuer_info`) are handled leniently.
+    /// `m` is `currentIssueNo`: the tracked counter if present, else `0` for a
+    /// registered pool or genesis delegate (here signalled by `issuer_info` being
+    /// `Some`), else the issuer is unknown (Haskell `NoCounterForKeyHashOCERT`;
+    /// we stay lenient during sync). Because `m = 0` and the only check is
+    /// `0 <= n`, a pool's **first ever block** may carry ANY counter — it may have
+    /// re-issued its opcert several times before producing a block.
     fn check_opcert_counter(
         &mut self,
         header: &BlockHeader,
@@ -1095,8 +1097,31 @@ impl OuroborosPraos {
         let pool_id = dugite_primitives::hash::blake2b_224(&header.issuer_vkey);
         let n = header.operational_cert.sequence_number;
 
-        if let Some(&m) = self.opcert_counters.get(&pool_id) {
-            // Counter regression: n < m
+        // Haskell `currentIssueNo` (Cardano.Protocol.TPraos.OCert): the stored
+        // counter `m` for this issuer is the tracked value if present, else 0 for
+        // a registered pool or genesis delegate (signalled here by `issuer_info`
+        // being present), else the issuer is unknown.
+        //
+        // The TPraos OCERT rule (Cardano.Protocol.TPraos.Rules.OCert.ocertTransition)
+        // has EXACTLY ONE counter predicate: `m <= n` (`CounterTooSmallOCERT` on
+        // regression). There is NO upper bound — `n <= m + 1` does NOT exist in
+        // block validation; the "+1 per rotation" is only a forge-path constraint.
+        // A pool's first on-chain block may carry ANY counter (it may have re-issued
+        // its opcert several times before producing a block), so `0 <= n` always
+        // holds. Cross-validated against cardano-ledger; this previously wedged the
+        // mainnet sync at epoch 211 (first non-overlay pool block, counter 2).
+        let m = if let Some(&stored) = self.opcert_counters.get(&pool_id) {
+            Some(stored)
+        } else if issuer_info.is_some() {
+            Some(0u64)
+        } else {
+            // Unknown issuer (not in cs / stPools / genDelegs). Haskell fails with
+            // `NoCounterForKeyHashOCERT`; we stay lenient during sync (the stake
+            // snapshot may not be populated yet in the first ~3 Shelley epochs).
+            None
+        };
+
+        if let Some(m) = m {
             if n < m {
                 if self.strict_verification {
                     warn!(
@@ -1104,7 +1129,7 @@ impl OuroborosPraos {
                         pool = %pool_id,
                         got = n,
                         last_seen = m,
-                        "Praos: opcert counter regression"
+                        "Praos: opcert counter regression (CounterTooSmallOCERT)"
                     );
                     return Err(ConsensusError::OpcertSequenceRegression {
                         got: n,
@@ -1119,60 +1144,7 @@ impl OuroborosPraos {
                     "Praos: opcert counter regression (non-fatal during sync)"
                 );
             }
-            // Counter over-increment: n > m + 1 (using checked_add to prevent u64 wrap)
-            if m.checked_add(1).is_none_or(|m1| n > m1) {
-                if self.strict_verification {
-                    warn!(
-                        slot = header.slot.0,
-                        pool = %pool_id,
-                        got = n,
-                        last_seen = m,
-                        "Praos: opcert counter over-incremented (max +1 per rotation)"
-                    );
-                    return Err(ConsensusError::OpcertCounterOverIncremented {
-                        got: n,
-                        last_seen: m,
-                    });
-                }
-                debug!(
-                    slot = header.slot.0,
-                    pool = %pool_id,
-                    got = n,
-                    last_seen = m,
-                    "Praos: opcert counter over-incremented (non-fatal during sync)"
-                );
-            }
-        } else if issuer_info.is_some() {
-            // Pool is in the stake distribution but this is its first-ever block seen.
-            // Haskell initializes `currentIssueNo = Just 0` for pools in the stake
-            // distribution with no prior counter entry, so the first block must satisfy:
-            //   0 <= n <= 0 + 1  →  n ∈ {0, 1}
-            //
-            // This prevents a pool from starting with an arbitrarily large counter,
-            // which would allow replaying future opcerts without ever having them on-chain.
-            let m: u64 = 0;
-            if m.checked_add(1).is_none_or(|m1| n > m1) {
-                if self.strict_verification {
-                    warn!(
-                        slot = header.slot.0,
-                        pool = %pool_id,
-                        got = n,
-                        "Praos: opcert counter too large for first-seen pool (expected 0 or 1)"
-                    );
-                    return Err(ConsensusError::OpcertCounterOverIncremented {
-                        got: n,
-                        last_seen: m,
-                    });
-                }
-                debug!(
-                    slot = header.slot.0,
-                    pool = %pool_id,
-                    got = n,
-                    "Praos: first-seen pool has counter > 1 (non-fatal during sync)"
-                );
-            }
         }
-        // else: pool is unknown (no issuer_info) and not yet tracked — lenient during sync.
 
         // Update tracked counter (always update, even during sync, for tracking).
         // Hard cap prevents unbounded growth between epoch-boundary pruning cycles.
@@ -2743,8 +2715,15 @@ mod tests {
     }
 
     #[test]
-    fn test_opcert_counter_over_increment_strict() {
+    fn test_opcert_counter_jump_allowed_strict() {
+        // The TPraos OCERT rule has NO upper bound on the opcert counter — the only
+        // predicate is `m <= n` (CounterTooSmallOCERT on regression). A jump from 5
+        // to 7 by a known issuer is therefore valid. The "+1 per rotation" is a
+        // forge-path constraint, not block validation. Cross-validated against
+        // cardano-ledger Cardano.Protocol.TPraos.Rules.OCert. (Replay mode isolates
+        // the counter check from dummy-header VRF/KES crypto.)
         let mut praos = OuroborosPraos::new(11);
+        praos.set_strict_verification(true);
 
         let mut header1 = make_valid_header(100);
         header1.operational_cert.sequence_number = 5;
@@ -2755,15 +2734,13 @@ mod tests {
                 SlotNo(200),
                 Some(&info1),
                 None,
-                ValidationMode::Full,
+                ValidationMode::Replay,
                 Some(9),
-                None, // ledger_tip_slot
+                None,
             )
             .is_ok());
 
-        praos.set_strict_verification(true);
-
-        // Jump from 5 to 7 (over-increment, max allowed is +1)
+        // Jump from 5 to 7: allowed (no upper bound in TPraos OCERT).
         let mut header2 = make_valid_header(200);
         header2.operational_cert.sequence_number = 7;
         let info2 = make_issuer_info(&header2);
@@ -2772,19 +2749,13 @@ mod tests {
             SlotNo(300),
             Some(&info2),
             None,
-            ValidationMode::Full,
+            ValidationMode::Replay,
             Some(9),
-            None, // ledger_tip_slot
+            None,
         );
         assert!(
-            matches!(
-                result,
-                Err(ConsensusError::OpcertCounterOverIncremented {
-                    got: 7,
-                    last_seen: 5
-                })
-            ),
-            "Expected OpcertCounterOverIncremented, got: {result:?}"
+            result.is_ok(),
+            "counter jump 5->7 must be allowed (no upper bound in TPraos OCERT), got: {result:?}"
         );
     }
 
@@ -2896,10 +2867,13 @@ mod tests {
     }
 
     #[test]
-    fn test_first_seen_pool_counter_large_rejected_strict() {
-        // Pool in stake distribution, first block with counter=50 → rejected in strict mode.
-        // Haskell: currentIssueNo initialized to Just 0, so 50 > 0+1 is an over-increment.
-        // Use Replay mode to bypass dummy-data crypto failures and isolate counter logic.
+    fn test_first_seen_pool_counter_large_accepted_strict() {
+        // A registered pool's FIRST on-chain block may carry ANY counter: Haskell
+        // `currentIssueNo` returns `Just 0` for a first-seen registered pool and the
+        // only check is `0 <= n` (always true). The pool may have re-issued its
+        // opcert several times before producing a block. dugite previously rejected
+        // n > 1 here, wedging the mainnet sync at epoch 211 (first non-overlay pool
+        // block, counter 2). Replay mode isolates the counter check.
         let mut praos = OuroborosPraos::new(11);
         praos.set_strict_verification(true);
 
@@ -2914,17 +2888,11 @@ mod tests {
             None,
             ValidationMode::Replay,
             Some(9),
-            None, // ledger_tip_slot
+            None,
         );
         assert!(
-            matches!(
-                result,
-                Err(ConsensusError::OpcertCounterOverIncremented {
-                    got: 50,
-                    last_seen: 0
-                })
-            ),
-            "First-seen pool with counter=50 should be rejected, got: {result:?}"
+            result.is_ok(),
+            "first-seen registered pool with counter=50 must be accepted, got: {result:?}"
         );
     }
 
