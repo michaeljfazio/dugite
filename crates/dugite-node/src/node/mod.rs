@@ -4721,6 +4721,10 @@ impl Node {
                                                 ls.epochs.protocol_params.protocol_version_minor,
                                             );
                                         }
+                                        // Authoritative era from the fork block's HFC tag
+                                        // (not the Shelley-shaped ledger PV major).
+                                        self.metrics
+                                            .set_era(fork_block.era.to_era_index() as u64);
                                         self.metrics.refresh_sync_progress(fork_slot.0);
                                         // Announce each fork block to downstream peers.
                                         if let Some(ref tx) = self.block_announcement_tx {
@@ -5341,6 +5345,10 @@ impl Node {
             self.metrics.set_epoch(live_epoch);
             self.metrics.set_protocol_version(pv_major, pv_minor);
         }
+        // Authoritative era from the applied block's HFC era tag — NOT from the
+        // ledger protocol-version major (which is Shelley-shaped and reads 2
+        // even during Byron, mislabelling Byron blocks as "Shelley").
+        self.metrics.set_era(block.era.to_era_index() as u64);
         self.metrics.refresh_sync_progress(block_slot.0);
 
         // Era-aware epoch-progress gauges (`dugite_epoch_length` +
