@@ -629,10 +629,19 @@ impl EraRules for ByronRules {
         _ctx: &RuleContext,
         consensus: &mut ConsensusSubState,
     ) {
-        // lab_nonce = prevHashToNonce(block.prevHash)
-        // prevHashToNonce: GenesisHash -> NeutralNonce; BlockHash h -> Nonce(castHash h)
-        // castHash is a type cast only — no rehashing.
-        consensus.lab_nonce = header.prev_hash;
+        // Byron (PBFT) does NOT maintain the TPraos `csLabNonce`. In Haskell the
+        // Byron ChainDepState is `PBftState` (no nonce fields), and
+        // `translateChainDepStateByronToShelley` initialises `csLabNonce` and
+        // `ticknStatePrevHashNonce` to `NeutralNonce`. So `lab_nonce` must stay
+        // NeutralNonce (ZERO) through Byron — the FIRST Shelley block is what
+        // first sets it (see common.rs).
+        //
+        // Setting it to the Byron block's prev-hash here (as we used to) poisoned
+        // the first Shelley epoch-nonce TICKN: the 207->208 transition copied this
+        // Byron hash into `last_epoch_block_nonce`, so η0(209) was computed as
+        // `candidate(208) ⭒ byron_hash` instead of `candidate(208) ⭒ NeutralNonce
+        // = candidate(208)`, breaking VRF on the first block of epoch 209.
+        consensus.lab_nonce = dugite_primitives::hash::Hash32::ZERO;
 
         // Track block production by issuer key hash
         if !header.issuer_vkey.is_empty() {
@@ -1598,8 +1607,15 @@ mod tests {
 
         rules.evolve_nonce(&header, &ctx, &mut consensus);
 
-        // lab_nonce should be set to prev_hash
-        assert_eq!(consensus.lab_nonce, prev_hash, "lab_nonce = prev_hash");
+        // Byron keeps lab_nonce at NeutralNonce (ZERO): PBFT does not maintain the
+        // TPraos csLabNonce. Setting it to a Byron prev-hash would poison the first
+        // Shelley epoch-nonce TICKN (see apply.rs / byron::evolve_nonce).
+        let _ = prev_hash;
+        assert_eq!(
+            consensus.lab_nonce,
+            dugite_primitives::hash::Hash32::ZERO,
+            "Byron lab_nonce stays NeutralNonce"
+        );
 
         // Block count should be incremented
         assert_eq!(consensus.epoch_block_count, 1);

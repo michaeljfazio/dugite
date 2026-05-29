@@ -142,14 +142,12 @@ impl EraRules for BabbageRules {
         ctx: &RuleContext,
         consensus: &mut ConsensusSubState,
     ) {
-        let first_slot_of_current_epoch = ctx
-            .current_epoch
-            .0
-            .saturating_mul(ctx.epoch_length)
-            .saturating_add(
-                ctx.shelley_transition_epoch
-                    .saturating_mul(ctx.byron_epoch_length),
-            );
+        let first_slot_of_current_epoch = common::first_slot_of_shelley_epoch(
+            ctx.current_epoch.0,
+            ctx.shelley_transition_epoch,
+            ctx.byron_epoch_length,
+            ctx.epoch_length,
+        );
         let first_slot_of_next_epoch = first_slot_of_current_epoch.saturating_add(ctx.epoch_length);
 
         // Babbage (proto >= 7): d is always (0, 1) (fully decentralized).

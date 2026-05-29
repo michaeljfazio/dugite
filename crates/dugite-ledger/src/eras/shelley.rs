@@ -633,6 +633,17 @@ impl EraRules for ShelleyRules {
             blake2b_256(&nonce_input)
         };
 
+        // DIAGNOSTIC (#15 epoch-nonce debug): log the TICKN inputs + result so we
+        // can cross-validate the epoch nonce against the live mainnet value.
+        tracing::info!(
+            epoch = new_epoch.0,
+            candidate = %candidate.to_hex(),
+            prev_hash_nonce = %prev_hash_nonce.to_hex(),
+            lab_nonce = %consensus.lab_nonce.to_hex(),
+            epoch_nonce = %consensus.epoch_nonce.to_hex(),
+            "TICKN epoch nonce computed"
+        );
+
         // Update prevHashNonce to current labNonce for NEXT epoch.
         consensus.last_epoch_block_nonce = consensus.lab_nonce;
 
@@ -665,14 +676,12 @@ impl EraRules for ShelleyRules {
         consensus: &mut ConsensusSubState,
     ) {
         // Compute first slots of current and next epochs.
-        let first_slot_of_current_epoch = ctx
-            .current_epoch
-            .0
-            .saturating_mul(ctx.epoch_length)
-            .saturating_add(
-                ctx.shelley_transition_epoch
-                    .saturating_mul(ctx.byron_epoch_length),
-            );
+        let first_slot_of_current_epoch = common::first_slot_of_shelley_epoch(
+            ctx.current_epoch.0,
+            ctx.shelley_transition_epoch,
+            ctx.byron_epoch_length,
+            ctx.epoch_length,
+        );
         let first_slot_of_next_epoch = first_slot_of_current_epoch.saturating_add(ctx.epoch_length);
 
         // For Babbage+ (proto >= 7), Haskell forces d=0 (full Praos).
