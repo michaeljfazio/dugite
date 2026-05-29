@@ -365,6 +365,16 @@ impl EraHistory {
         Ok(entry.params.epoch_size)
     }
 
+    /// Return the slot length (milliseconds) for the given epoch's era.
+    ///
+    /// Era-dependent: Byron mainnet slots are 20 000 ms, Shelley-onwards slots
+    /// are 1 000 ms.  Used to translate a slot count into wall-clock time
+    /// correctly across the Byron/Shelley boundary.
+    pub fn epoch_slot_length_ms(&self, epoch: EpochNo) -> Result<u64, PastHorizonError> {
+        let entry = self.find_era_for_epoch(epoch.0)?;
+        Ok(entry.params.slot_length_ms)
+    }
+
     /// Compute the safe-zone horizon slot — the exclusive upper bound past
     /// which slot-to-time translation throws `PastHorizon` in Haskell.
     ///
