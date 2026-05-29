@@ -784,7 +784,8 @@ impl ChainDB {
         let immutable_anchor = self
             .immutable_tip
             .map(|(slot, hash, _block_no)| (hash, slot.0));
-        self.volatile.switch_chain(new_tip_hash, immutable_anchor)
+        self.volatile
+            .switch_chain(new_tip_hash, immutable_anchor, self.security_param_k as u64)
     }
 
     /// GC orphaned fork blocks from volatile. Returns count removed.

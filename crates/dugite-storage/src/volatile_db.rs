@@ -1448,10 +1448,27 @@ impl VolatileDB {
     /// `immutable_anchor` = `(hash, slot)` of the current ImmutableDB tip, or
     /// `None` if the ImmutableDB is empty.  When `None`, only VolatileDB
     /// intersections count.
+    /// `max_rollback` = the Ouroboros security parameter `k`.  A fork that
+    /// would require rolling back MORE than `k` blocks is refused
+    /// (`StoreButDontChange`).  This is the dugite analogue of Haskell's
+    /// k-capped `getCurrentChain`: in ouroboros-consensus the candidate
+    /// fragment is anchored at the immutable tip (== selected tip − k), so
+    /// `isReachable` can never return a `ChainDiff` whose `rollback` exceeds
+    /// `k`, and `LedgerDB.validateFork` treats a deeper rollback as
+    /// architecturally impossible (`error "rolling back past the immutable
+    /// tip"`).  Because dugite intentionally retains MORE than `k` blocks
+    /// resident in the VolatileDB (for serving + to keep the immutable tip
+    /// trailing the connection-storm settling point), the immutable-anchor
+    /// reachability check alone is NOT a `k` bound — without this explicit cap
+    /// chain selection could adopt a fork intersecting up to `retain_blocks`
+    /// (10 000) back, which the `k`-deep `LedgerSeq` then cannot roll back to,
+    /// forcing a catastrophic snapshot+genesis-replay (observed: a 10 629-block
+    /// rollback → ledger reset to genesis → unrecoverable stall).
     pub fn switch_chain(
         &mut self,
         new_tip_hash: &Hash32,
         immutable_anchor: Option<(Hash32, u64)>,
+        max_rollback: u64,
     ) -> Option<SwitchPlan> {
         let new_chain = self.walk_chain_back(new_tip_hash);
         if new_chain.is_empty() {
@@ -1565,6 +1582,25 @@ impl VolatileDB {
                 }
             }
         };
+
+        // Ouroboros k-finality: never adopt a fork requiring a rollback deeper
+        // than `k`.  Checked BEFORE any mutation of `selected_chain` /
+        // `gc_schedule` so a refused switch is a true no-op (StoreButDontChange).
+        // See the doc comment on this fn for why this explicit cap is required
+        // in dugite (VolatileDB retains > k blocks, unlike Haskell's k-capped
+        // getCurrentChain).
+        if rollback.len() as u64 > max_rollback {
+            warn!(
+                rollback_depth = rollback.len(),
+                max_rollback,
+                intersection_slot,
+                new_tip = %new_tip_hash,
+                new_tip_slot = self.blocks.get(new_tip_hash).map(|b| b.slot).unwrap_or(0),
+                "VolatileDB: fork requires rollback beyond k — refusing switch \
+                 (Ouroboros k-finality; Haskell treats deeper rollback as impossible)"
+            );
+            return None;
+        }
 
         let now = Instant::now();
         for h in &rollback {
@@ -2703,7 +2739,7 @@ mod tests {
         db.add_block(h(6), 400, 40, h(5), b"b6".to_vec());
 
         // Switch to the longer fork.
-        db.switch_chain(&h(6), None);
+        db.switch_chain(&h(6), None, u64::MAX);
 
         // After the switch, selected_chain = [h1, h4, h5, h6].
         // h3 has no successors and is NOT on selected_chain → fork tip.
@@ -2741,7 +2777,7 @@ mod tests {
         db.add_block(h(6), 400, 40, h(5), b"b6".to_vec());
 
         assert_eq!(db.get_tip(), Some((300, h(3), 30)));
-        let plan = db.switch_chain(&h(6), None).unwrap();
+        let plan = db.switch_chain(&h(6), None, u64::MAX).unwrap();
         assert_eq!(plan.intersection, h(1));
         assert_eq!(plan.rollback, vec![h(3), h(2)]);
         assert_eq!(plan.apply, vec![h(4), h(5), h(6)]);
@@ -2774,7 +2810,7 @@ mod tests {
         db.add_block(h(99), 400, 40, h(98), b"detached1".to_vec());
         db.add_block(h(100), 500, 50, h(99), b"detached2".to_vec());
 
-        let plan = db.switch_chain(&h(100), None);
+        let plan = db.switch_chain(&h(100), None, u64::MAX);
         assert!(
             plan.is_none(),
             "switch_chain must return None when the fork is unreachable \
@@ -2822,13 +2858,13 @@ mod tests {
 
         // Without immutable_anchor the fork is unreachable (current behaviour).
         assert!(
-            db.switch_chain(&h(12), None).is_none(),
+            db.switch_chain(&h(12), None, u64::MAX).is_none(),
             "without knowing the immutable anchor, fork stays unreachable"
         );
 
         // Passing the immutable anchor (h(0) at slot 50) allows the switch.
         let plan = db
-            .switch_chain(&h(12), Some((h(0), 50)))
+            .switch_chain(&h(12), Some((h(0), 50)), u64::MAX)
             .expect("fork is reachable via immutable-tip anchor");
         assert_eq!(plan.intersection, h(0), "intersection is the immutable tip");
         assert_eq!(plan.intersection_slot, 50);
@@ -2860,11 +2896,93 @@ mod tests {
         db.add_block(h(5), 333, 30, h(4), b"b-chain".to_vec());
         db.add_block(h(6), 444, 40, h(5), b"b-chain-tip".to_vec());
 
-        let plan = db.switch_chain(&h(6), None).expect("reachable fork");
+        let plan = db
+            .switch_chain(&h(6), None, u64::MAX)
+            .expect("reachable fork");
         assert_eq!(plan.intersection, h(1));
         assert_eq!(
             plan.intersection_slot, 111,
             "intersection slot must be populated from VolatileDB.blocks[hash].slot"
+        );
+    }
+
+    /// Ouroboros k-finality: `switch_chain` must REFUSE a fork whose adoption
+    /// would roll the selected chain back more than `k` (`max_rollback`)
+    /// blocks, and the refusal must be a true no-op (StoreButDontChange) —
+    /// `selected_chain` is left untouched.
+    ///
+    /// Regression test for the 2026-05-29 mainnet stall: a fork intersecting
+    /// 10 629 blocks back was adopted (k = 2160), the k-deep LedgerSeq could
+    /// not satisfy the rollback, and the snapshot+replay fallback reset the
+    /// ledger to genesis → unrecoverable.  Matches Haskell, where a candidate
+    /// requiring a rollback past the immutable tip (== selected tip − k) is
+    /// architecturally impossible.
+    #[test]
+    fn test_switch_chain_refuses_rollback_beyond_k() {
+        let mut db = VolatileDB::new();
+        // Selected chain off immutable anchor h(0): h(1)→h(2)→h(3)→h(4)→h(5).
+        db.add_block(h(1), 100, 10, h(0), b"s1".to_vec());
+        db.add_block(h(2), 200, 20, h(1), b"s2".to_vec());
+        db.add_block(h(3), 300, 30, h(2), b"s3".to_vec());
+        db.add_block(h(4), 400, 40, h(3), b"s4".to_vec());
+        db.add_block(h(5), 500, 50, h(4), b"s5".to_vec());
+        assert_eq!(db.get_tip(), Some((500, h(5), 50)));
+
+        // A strictly-longer fork branching off the intersection h(1):
+        // h(1)→h(20)→h(21)→h(22)→h(23)→h(24).  Adopting it rolls back
+        // {h5,h4,h3,h2} = 4 blocks.
+        db.add_block(h(20), 250, 21, h(1), b"f0".to_vec());
+        db.add_block(h(21), 350, 31, h(20), b"f1".to_vec());
+        db.add_block(h(22), 450, 41, h(21), b"f2".to_vec());
+        db.add_block(h(23), 550, 51, h(22), b"f3".to_vec());
+        db.add_block(h(24), 650, 61, h(23), b"f4".to_vec());
+
+        // k = 3 < rollback depth 4 → refuse, leaving the selected chain intact.
+        assert!(
+            db.switch_chain(&h(24), None, 3).is_none(),
+            "fork requiring a 4-block rollback must be refused when k = 3"
+        );
+        assert_eq!(
+            db.get_tip(),
+            Some((500, h(5), 50)),
+            "refused switch must be a no-op: selected tip unchanged"
+        );
+
+        // k = 4 == rollback depth 4 → permitted (Haskell allows rollback ≤ k).
+        let plan = db
+            .switch_chain(&h(24), None, 4)
+            .expect("rollback of exactly k must be permitted");
+        assert_eq!(plan.intersection, h(1));
+        assert_eq!(plan.rollback, vec![h(5), h(4), h(3), h(2)]);
+        assert_eq!(plan.apply, vec![h(20), h(21), h(22), h(23), h(24)]);
+        assert_eq!(db.get_tip(), Some((650, h(24), 61)));
+    }
+
+    /// The k-cap also applies to the immutable-anchor reachability case:
+    /// a fork that anchors at the immutable tip but whose adoption would roll
+    /// back the entire (> k) selected chain must be refused.
+    #[test]
+    fn test_switch_chain_refuses_full_volatile_rollback_beyond_k() {
+        let mut db = VolatileDB::new();
+        // Selected chain h(1)→h(2)→h(3) off immutable anchor h(0).
+        db.add_block(h(1), 100, 10, h(0), b"s1".to_vec());
+        db.add_block(h(2), 200, 20, h(1), b"s2".to_vec());
+        db.add_block(h(3), 300, 30, h(2), b"s3".to_vec());
+        // Fork sharing only the immutable anchor h(0): h(10)→h(11)→h(12)→h(13).
+        db.add_block(h(10), 150, 11, h(0), b"f1".to_vec());
+        db.add_block(h(11), 250, 21, h(10), b"f2".to_vec());
+        db.add_block(h(12), 350, 31, h(11), b"f3".to_vec());
+        db.add_block(h(13), 450, 41, h(12), b"f4".to_vec());
+
+        // Full-volatile rollback depth = 3 (entire selected chain). k = 2 → refuse.
+        assert!(
+            db.switch_chain(&h(13), Some((h(0), 50)), 2).is_none(),
+            "full-volatile rollback of 3 blocks must be refused when k = 2"
+        );
+        assert_eq!(
+            db.get_tip(),
+            Some((300, h(3), 30)),
+            "refused immutable-anchor switch must leave selected tip unchanged"
         );
     }
 
@@ -2879,7 +2997,7 @@ mod tests {
         assert!(db.has_block(&h(2)));
         assert!(db.has_block(&h(3)));
 
-        let plan = db.switch_chain(&h(3), None).unwrap();
+        let plan = db.switch_chain(&h(3), None, u64::MAX).unwrap();
         assert_eq!(plan.apply, vec![h(3)]);
         assert_eq!(db.get_tip(), Some((100, h(3), 10)));
         assert_eq!(db.len(), 3);
@@ -3190,7 +3308,7 @@ mod tests {
         );
 
         // Attempt switch — must return None (unreachable fork).
-        let plan = db.switch_chain(&fork_tip, None);
+        let plan = db.switch_chain(&fork_tip, None, u64::MAX);
         assert!(
             plan.is_none(),
             "switch_chain must return None for a deep detached fork \

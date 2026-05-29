@@ -569,6 +569,40 @@ impl Node {
                                 }
                             }
                         }
+                        // Defense-in-depth (2026-05-29): the replay loop above
+                        // breaks early on the first apply/decode error, which
+                        // can leave the ledger far below `rollback_slot` (worst
+                        // case: an epoch-0 snapshot whose replay broke
+                        // immediately leaves the ledger at genesis).  Returning
+                        // `true` here would tell the caller the ledger is at the
+                        // rollback point when it is not — the TriggeredFork
+                        // caller then applies fork blocks onto a wrong-tip ledger
+                        // ("does not connect to tip") and clears the VolatileDB,
+                        // an unrecoverable stall.  The primary defence is the
+                        // `k`-cap in `VolatileDB::switch_chain` (this snapshot
+                        // path is unreachable for in-window forks), but if we
+                        // ever land here without reaching the target, report
+                        // failure: the ledger now trails the chain, which the
+                        // `rollback_slot > ledger_slot` gap-bridge above replays
+                        // forward on the next event — recoverable, unlike
+                        // `clear_volatile`.
+                        let final_slot = ls.tip.point.slot().map(|s| s.0).unwrap_or(0);
+                        if final_slot < rollback_slot {
+                            // Publish whatever state we reached so downstream
+                            // views are consistent with the ledger.
+                            self.publish_ledger_view(&ls);
+                            warn!(
+                                snapshot_slot,
+                                rollback_slot,
+                                replayed,
+                                final_slot,
+                                "Snapshot rollback incomplete: ledger did not reach the \
+                                 rollback target (replay broke early). Reporting failure so \
+                                 the caller skips fork replay; the ledger trails the chain and \
+                                 will be replayed forward on the next event."
+                            );
+                            return false;
+                        }
                         // Publish view after snapshot-load + replay (#651 P2 / #652 P0).
                         self.publish_ledger_view(&ls);
                         info!(
