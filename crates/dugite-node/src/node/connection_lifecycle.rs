@@ -53,6 +53,31 @@ use std::time::Duration;
 /// reputation scoring and exponential backoff.
 const FETCH_RANGE_TIMEOUT: Duration = Duration::from_secs(60);
 
+// BlockFetch range sizing.
+//
+// A single `MsgRequestRange` streams every block between its endpoints, so the
+// request→`MsgStartBatch`→stream round-trip latency is paid once per range, not
+// per block.  Because the worker fetches ranges serially, a small range leaves
+// the link idle for a round-trip every `n` blocks — so larger ranges keep the
+// link saturated during bulk sync (empirically 100→512 doubled Byron
+// throughput).  But the worker buffers one range's decoded blocks before
+// forwarding them to the apply channel, so a fixed large block-count would
+// spike memory on big blocks (a 2000-block range of ~90 KB Conway blocks is
+// ~180 MB) — and dugite *does* sync from genesis through Conway (epoch-diff
+// harness).  So the range is sized by a BYTE BUDGET against a running average
+// of recently-seen block sizes: it auto-grows to the protocol cap for tiny
+// Byron blocks and shrinks for large Conway blocks, bounding the per-range
+// buffer to ~`BLOCKFETCH_RANGE_BYTE_BUDGET` in every era.
+const BLOCKFETCH_RANGE_BYTE_BUDGET: usize = 8 * 1024 * 1024;
+/// Lower bound on range size (so tiny-budget edge cases still amortise a little).
+const BLOCKFETCH_MIN_RANGE: usize = 64;
+/// Upper bound — the network's `MAX_BLOCKS_PER_FETCH` server/DoS cap.
+const BLOCKFETCH_MAX_RANGE: usize = 2000;
+/// Pessimistic (Conway-sized) initial block-size estimate, so the very first
+/// range — taken before any block size is known — stays small/safe and then
+/// adapts within a range or two.
+const BLOCKFETCH_INIT_AVG_BLOCK_BYTES: usize = 65_536;
+
 use tokio::sync::{broadcast, mpsc, RwLock};
 use tracing::{debug, info, warn};
 
@@ -148,6 +173,20 @@ pub struct CandidateChainState {
     /// The BlockFetch decision task consumes entries from this list when it
     /// schedules fetch requests.
     pub pending_headers: Vec<PendingHeader>,
+    /// Count of headers appended since the last *full* `pending_headers` prune.
+    ///
+    /// During bulk sync `pending_headers` sits near the `PENDING_HEADERS_PAUSE`
+    /// cap (~10 k), so running a full O(pending) `has_block` prune on every
+    /// arriving header is O(N²) per batch (it was the #1 sync-path CPU cost).
+    /// Each arriving header is cheaply checked individually (O(1)); a full
+    /// prune — which drains entries BlockFetch has fetched+stored since — is
+    /// then run only once per `PENDING_PRUNE_INTERVAL` headers.  This does not
+    /// change the steady-state `pending_headers` size (that is governed by
+    /// fetch lag, not prune cadence) and is safe because the BlockFetch
+    /// decision independently skips already-stored headers via its own
+    /// `has_block` filter, so a few transiently-stale entries are never
+    /// re-fetched.
+    pub headers_since_prune: u32,
     /// Per-peer eager-validation op-cert counter map (issue #654 P1.b).
     ///
     /// Updated by the per-peer eager-validation call at MsgRollForward
@@ -1607,6 +1646,34 @@ impl ConnectionLifecycleManager {
 
         Box::new(move |mut channel, cancel| {
             Box::pin(async move {
+                // RAII release for the single-fetcher slot.  The post-batch
+                // release (and the empty/no-headers releases) clear
+                // `active_fetcher` on the normal code paths, and the
+                // `cancel.cancelled()` arm clears it on graceful shutdown — but
+                // if this worker future is DROPPED mid-batch (peer demotion's
+                // "hot protocol tasks did not stop cleanly" abort path fires
+                // while we are awaiting block bodies) none of those run, and the
+                // slot is stranded on this dead peer's id.  No other peer can
+                // then claim it, so bulk sync stalls until this exact peer
+                // reconnects and re-adopts its matching id (observed as a
+                // multi-minute genesis-storm stall).  This guard releases the
+                // slot — and only if we still hold it (`compare_exchange` on our
+                // id) — whenever the holding scope unwinds, for ANY reason.
+                struct ActiveFetcherGuard {
+                    fetcher: std::sync::Arc<std::sync::atomic::AtomicU64>,
+                    id: u64,
+                }
+                impl Drop for ActiveFetcherGuard {
+                    fn drop(&mut self) {
+                        let _ = self.fetcher.compare_exchange(
+                            self.id,
+                            0,
+                            std::sync::atomic::Ordering::SeqCst,
+                            std::sync::atomic::Ordering::SeqCst,
+                        );
+                    }
+                }
+
                 // BlockFetch worker: fetches blocks from this peer's candidate_chains.
                 //
                 // CRITICAL: Only ONE worker fetches at a time (matching Haskell's
@@ -1626,6 +1693,11 @@ impl ConnectionLifecycleManager {
                 // skip any whose hash is already in this set.
                 let mut fetched_hashes: std::collections::HashSet<[u8; 32]> =
                     std::collections::HashSet::new();
+
+                // Running average of recently-seen raw block CBOR sizes, used to
+                // size each fetch range against `BLOCKFETCH_RANGE_BYTE_BUDGET`.
+                // Starts pessimistic (Conway-sized) so the first range is small.
+                let mut avg_block_bytes: usize = BLOCKFETCH_INIT_AVG_BLOCK_BYTES;
 
                 info!(%addr, "blockfetch worker started (waiting for turn)");
 
@@ -1706,6 +1778,18 @@ impl ConnectionLifecycleManager {
                                 continue;
                             }
 
+                            // We now hold the single-fetcher slot.  This guard
+                            // releases it on every exit from this loop iteration
+                            // — including a mid-batch task abort — so the slot is
+                            // never stranded on a dead peer (see the guard def).
+                            // It is idempotent with the explicit post-batch /
+                            // no-headers releases below (its `compare_exchange`
+                            // is a no-op once the slot has already been cleared).
+                            let _fetch_guard = ActiveFetcherGuard {
+                                fetcher: active_fetcher.clone(),
+                                id: my_id,
+                            };
+
                             // Build the list of headers to fetch from this peer.
                             //
                             // KEY INVARIANT: we do NOT drain `pending_headers`.
@@ -1777,13 +1861,23 @@ impl ConnectionLifecycleManager {
                             // Batch headers into ranges for efficient fetching.
                             // A single MsgRequestRange(from, to) fetches all blocks
                             // between two points, avoiding per-block round-trips.
+                            // Adaptive range size: byte budget / running average
+                            // block size, clamped to [MIN, MAX].  Large for tiny
+                            // Byron blocks (→ protocol cap), small for big Conway
+                            // blocks — bounding the per-range decode buffer.
+                            let range_size = (BLOCKFETCH_RANGE_BYTE_BUDGET
+                                / avg_block_bytes.max(1))
+                            .clamp(BLOCKFETCH_MIN_RANGE, BLOCKFETCH_MAX_RANGE);
                             let ranges: Vec<(CodecPoint, CodecPoint)> = {
                                 let mut result = Vec::new();
                                 let mut i = 0;
                                 while i < headers_to_fetch.len() {
                                     let start = i;
-                                    // Batch up to 100 consecutive headers per range
-                                    let end = (i + 100).min(headers_to_fetch.len()) - 1;
+                                    // Batch up to `range_size` consecutive headers
+                                    // per range to amortise the per-range request
+                                    // round-trip across many blocks.
+                                    let end =
+                                        (i + range_size).min(headers_to_fetch.len()) - 1;
                                     let from = CodecPoint::Specific(
                                         headers_to_fetch[start].slot,
                                         headers_to_fetch[start].hash,
@@ -1828,6 +1922,10 @@ impl ConnectionLifecycleManager {
                                 // sends outside the callback avoids the panic while
                                 // preserving ordering and backpressure.
                                 let mut decoded_blocks: Vec<FetchedBlock> = Vec::new();
+                                // Sum of raw CBOR sizes seen this range, used to
+                                // refresh `avg_block_bytes` for the next range's
+                                // byte-budget sizing.
+                                let mut range_bytes: usize = 0;
 
                                 let fetch_start = std::time::Instant::now();
                                 let fetch_result = tokio::time::timeout(
@@ -1837,6 +1935,7 @@ impl ConnectionLifecycleManager {
                                         from,
                                         to,
                                         |block_cbor| {
+                                            range_bytes += block_cbor.len();
                                             match dugite_serialization::decode_block_with_byron_epoch_length(
                                                 &block_cbor, bel,
                                             ) {
@@ -1889,7 +1988,12 @@ impl ConnectionLifecycleManager {
                                     Ok(Ok(count)) => {
                                         let fetch_ms = fetch_start.elapsed().as_secs_f64() * 1000.0;
                                         metrics_clone.record_block_fetch_latency(fetch_ms);
-                                        debug!(%addr, count, fetch_ms, "BlockFetch: range complete");
+                                        // Refresh the average block size for the
+                                        // next range's byte-budget sizing.
+                                        if let Some(avg) = range_bytes.checked_div(count) {
+                                            avg_block_bytes = avg.max(1);
+                                        }
+                                        debug!(%addr, count, fetch_ms, avg_block_bytes, "BlockFetch: range complete");
                                     }
                                     Ok(Err(e)) => {
                                         warn!(%addr, "BlockFetch error: {e}");
