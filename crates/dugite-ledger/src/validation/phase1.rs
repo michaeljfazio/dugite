@@ -303,9 +303,10 @@ fn verify_single_witness<W: HasWitnessFields>(
     // check without any cryptographic verification (D2/D9 class, audit #544;
     // same class as #537).
     //
-    // Bootstrap witnesses (Byron extended keys, 64-byte vkey) take the separate
-    // `verify_bootstrap_witnesses` path (#546 F1) and are never dispatched here —
-    // `HasWitnessFields` is intentionally not impl'd on `BootstrapWitness`.
+    // Bootstrap witnesses (Byron; 32-byte public_key + 32-byte chain_code) take
+    // the separate `verify_bootstrap_witnesses` path (#546 F1) and are never
+    // dispatched here — `HasWitnessFields` is intentionally not impl'd on
+    // `BootstrapWitness`.
     //
     // `expect_size` is the uniform helper from `size_check.rs`; all crypto-input
     // length checks in the validation layer go through it.
@@ -345,22 +346,32 @@ fn verify_single_witness<W: HasWitnessFields>(
 // ---------------------------------------------------------------------------
 // Bootstrap witness (Byron) verification — F1 security audit 2026-05-19 (#546)
 //
-// Wire format: bootstrap_witness = [vkey: bytes .size 64, sig: bytes .size 64,
-//                                   chain_code: bytes .size 32, attributes: bytes]
+// Wire format (Shelley CDDL `bootstrap_witness`):
+//   [ public_key : bytes .size 32   ; bwKey: raw Ed25519 public key
+//   , signature  : bytes .size 64   ; bwSignature: standard Ed25519 detached sig
+//   , chain_code : bytes .size 32   ; bwChainCode
+//   , attributes : bytes            ; bwAttributes (CBOR AddrAttributes)
+//   ]
 //
-// Byron "extended" Ed25519: 64 bytes = 32-byte scalar || 32-byte extension.
-// Signature verification uses only bytes 0..32 (the scalar / public key part).
+// `public_key` is the 32-byte Ed25519 key, NOT a 64-byte extended key. The
+// 64-byte Byron XPub is `public_key (32) || chain_code (32)` and is used ONLY
+// to derive the address root for the binding check — never for signature
+// verification.
 //
-// Haskell references:
-//   - `verifyDSIGN Ed25519DSIGN` (uses first 32 bytes of 64-byte extended key)
-//   - `checkBootstrap` (address-root binding check)
-//   - `bootstrapKeyHash` (root derivation)
+// Haskell references (IntersectMBO/cardano-ledger,
+// libs/cardano-ledger-core/src/Cardano/Ledger/Keys/Bootstrap.hs):
+//   - `verifyBootstrapWit` → `verifySignedDSIGN (bwKey w) txbodyHash (bwSig w)`
+//     where `bwKey` is the 32-byte `VKey` passed directly to Ed25519
+//     `crypto_sign_ed25519_verify_detached` (chain code unused).
+//   - `bootstrapWitKeyHash` → `blake2b_224(sha3_256(prefix || bwKey(32) ||
+//     bwChainCode(32) || bwAttributes))`, prefix `0x83 00 82 00 58 40` (the
+//     CBOR of `Address' (ATVerKey, VerKeyASD xpub, attrs)`).
 // ---------------------------------------------------------------------------
 
 /// Verify one Byron bootstrap witness (structural + signature check).
 ///
-/// Step 1: Pre-flight: vkey must be 64 bytes, sig 64 bytes, chain_code 32 bytes.
-/// Step 2: Ed25519 verify over `tx_hash_bytes` using `vkey[0..32]` as the scalar.
+/// Step 1: Pre-flight: vkey must be 32 bytes, sig 64 bytes, chain_code 32 bytes.
+/// Step 2: Ed25519 verify over `tx_hash_bytes` using the 32-byte `vkey` directly.
 ///
 /// Address binding (step 3) is handled by `check_bootstrap_address_binding`.
 fn verify_single_bootstrap_witness(
@@ -372,9 +383,10 @@ fn verify_single_bootstrap_witness(
     let chain_code = &bw.chain_code;
 
     // Pre-flight structural check — mirrors Haskell CBOR fixed-size decode.
-    if vkey.len() != 64 || sig.len() != 64 {
+    // `public_key` is 32 bytes (raw Ed25519 key); `signature` is 64 bytes.
+    if vkey.len() != 32 || sig.len() != 64 {
         return Some(ValidationError::InvalidWitnessSignature(format!(
-            "bootstrap: malformed witness: vkey={} bytes (expected 64), sig={} bytes (expected 64)",
+            "bootstrap: malformed witness: vkey={} bytes (expected 32), sig={} bytes (expected 64)",
             vkey.len(),
             sig.len(),
         )));
@@ -386,14 +398,14 @@ fn verify_single_bootstrap_witness(
         )));
     }
 
-    // Ed25519 verify using vkey[0..32] (the scalar part of the extended key).
-    let scalar_bytes = &vkey[..32];
-    match dugite_crypto::keys::PaymentVerificationKey::from_bytes(scalar_bytes) {
+    // Ed25519 verify using the 32-byte public key directly (the chain code is
+    // not part of signature verification — only address-root derivation).
+    match dugite_crypto::keys::PaymentVerificationKey::from_bytes(vkey) {
         Ok(vk) => {
             if vk.verify(tx_hash_bytes, sig).is_err() {
                 Some(ValidationError::InvalidWitnessSignature(format!(
                     "bootstrap:sig_invalid:{:02x?}",
-                    &scalar_bytes[..4]
+                    &vkey[..4]
                 )))
             } else {
                 None
@@ -401,7 +413,7 @@ fn verify_single_bootstrap_witness(
         }
         Err(_) => Some(ValidationError::InvalidWitnessSignature(format!(
             "bootstrap:invalid_scalar:{:02x?}",
-            &scalar_bytes[..4]
+            &vkey[..4]
         ))),
     }
 }
@@ -482,10 +494,18 @@ fn check_bootstrap_address_binding(
 
     for bw in &tx.witness_set.bootstrap_witnesses {
         // Only check structurally valid witnesses (others are caught by signature verifier).
-        if bw.vkey.len() != 64 || bw.signature.len() != 64 || bw.chain_code.len() != 32 {
+        if bw.vkey.len() != 32 || bw.signature.len() != 64 || bw.chain_code.len() != 32 {
             continue;
         }
-        let computed_root = match compute_bootstrap_root(&bw.vkey, &bw.attributes) {
+        // The Byron address root is derived from the 64-byte XPub =
+        // public_key (32) || chain_code (32).
+        let xpub: Vec<u8> = bw
+            .vkey
+            .iter()
+            .chain(bw.chain_code.iter())
+            .copied()
+            .collect();
+        let computed_root = match compute_bootstrap_root(&xpub, &bw.attributes) {
             Some(r) => r,
             None => {
                 errors.push(ValidationError::InvalidWitnessSignature(format!(
@@ -1682,8 +1702,8 @@ pub(super) fn run_phase1_rules(
     // `tx.hash` is always populated during deserialization.
     //
     // VKeyWitness: 32-byte Ed25519 key + 64-byte signature.
-    // BootstrapWitness (Byron): 64-byte extended key; separate verifier:
-    //   (a) verifies the signature using vkey[0..32] (scalar part), and
+    // BootstrapWitness (Byron): 32-byte public_key + 32-byte chain_code; separate verifier:
+    //   (a) verifies the signature using the 32-byte public_key directly, and
     //   (b) checks the address-binding (computed root vs Byron address root
     //       stored in the UTxO being spent).
     // ------------------------------------------------------------------
@@ -3948,11 +3968,13 @@ mod tests {
     // ------ Positive tests -------
 
     #[test]
-    fn test_bootstrap_witness_malformed_64byte_vkey_invalid_sig_rejected() {
-        // vkey=64 bytes (Byron extended), sig=64 bytes, but sig is all-zeros → fails Ed25519 verify.
-        // Address binding will also fail (root mismatch). Both → InvalidWitnessSignature.
-        let vkey64 = [0x55u8; 64]; // not a valid Ed25519 scalar but structurally well-sized
-        let root28 = compute_root_for_vkey64(&vkey64);
+    fn test_bootstrap_witness_valid_struct_invalid_sig_rejected() {
+        // Structurally valid witness (vkey=32, sig=64, chain_code=32) but the
+        // signature is all-zeros → fails Ed25519 verify. The XPub used for the
+        // address root is vkey(32) || chain_code(32) = [0x55; 64], so binding
+        // matches and the sig-verification failure is isolated.
+        let xpub64 = [0x55u8; 64];
+        let root28 = compute_root_for_vkey64(&xpub64);
         let (mut utxo_set, mut tx, _) = make_byron_utxo_tx_with_root(&root28);
         // Replace the UTxO's address with a Byron address whose root does NOT match
         // (to isolate the sig-verification path from the address-binding path).
@@ -3974,10 +3996,10 @@ mod tests {
             },
         );
         tx.witness_set.bootstrap_witnesses.push(BootstrapWitness {
-            vkey: vkey64.to_vec(),
-            signature: vec![0u8; 64], // invalid signature
-            chain_code: vec![0u8; 32],
-            attributes: vec![0xa0], // empty CBOR map
+            vkey: vec![0x55u8; 32],       // first 32 bytes of the XPub
+            signature: vec![0u8; 64],     // invalid signature
+            chain_code: vec![0x55u8; 32], // last 32 bytes of the XPub
+            attributes: vec![0xa0],       // empty CBOR map
         });
         let params = ProtocolParameters::mainnet_defaults();
         let errors = validate_transaction(&tx, &utxo_set, &params, 100, 300, None)
@@ -3987,18 +4009,49 @@ mod tests {
             errors
                 .iter()
                 .any(|e| matches!(e, ValidationError::InvalidWitnessSignature(_))),
-            "expected InvalidWitnessSignature for bad sig on 64-byte vkey, got {errors:?}"
+            "expected InvalidWitnessSignature for bad sig on valid-struct witness, got {errors:?}"
         );
     }
 
     // ------ Structural pre-flight: size checks -------
 
+    /// 32 bytes is the CORRECT `bootstrap_witness` `public_key` size (Shelley
+    /// CDDL `vkey = bytes .size 32`). A real Ed25519 signature over the tx-body
+    /// hash MUST verify with no error; a tampered signature MUST be rejected.
+    /// Cross-checks the Haskell `verifyBootstrapWit` semantics — the 32-byte
+    /// `bwKey` is passed directly to Ed25519 verification.
     #[test]
-    fn test_bootstrap_witness_32byte_vkey_rejected() {
-        // 32-byte vkey (Shelley format) in a bootstrap witness → must be rejected.
-        // Byron requires exactly 64-byte extended keys.
-        let errors = validate_with_bootstrap_witness(vec![0xAAu8; 32], vec![0u8; 64]);
-        assert_invalid_witness(&errors);
+    fn test_bootstrap_witness_valid_sig_accepted_tampered_rejected() {
+        let sk = dugite_crypto::keys::PaymentSigningKey::generate();
+        let vk = sk.verification_key().to_bytes().to_vec(); // 32 bytes
+        let tx_hash = [0x11u8; 32];
+        let sig = sk.sign(&tx_hash); // 64 bytes
+
+        let good = BootstrapWitness {
+            vkey: vk.clone(),
+            signature: sig.clone(),
+            chain_code: vec![0x07u8; 32],
+            attributes: vec![0xa0],
+        };
+        assert!(
+            super::verify_single_bootstrap_witness(&good, &tx_hash).is_none(),
+            "valid 32-byte-vkey bootstrap signature must verify"
+        );
+
+        // Tamper one signature byte → must be rejected (security: do not accept
+        // forged bootstrap witnesses).
+        let mut bad_sig = sig;
+        bad_sig[0] ^= 0x01;
+        let bad = BootstrapWitness {
+            vkey: vk,
+            signature: bad_sig,
+            chain_code: vec![0x07u8; 32],
+            attributes: vec![0xa0],
+        };
+        assert!(
+            super::verify_single_bootstrap_witness(&bad, &tx_hash).is_some(),
+            "tampered bootstrap signature must be rejected"
+        );
     }
 
     #[test]
@@ -4021,19 +4074,19 @@ mod tests {
 
     #[test]
     fn test_bootstrap_witness_63byte_sig_rejected() {
-        let errors = validate_with_bootstrap_witness(vec![0xAAu8; 64], vec![0u8; 63]);
+        let errors = validate_with_bootstrap_witness(vec![0xAAu8; 32], vec![0u8; 63]);
         assert_invalid_witness(&errors);
     }
 
     #[test]
     fn test_bootstrap_witness_65byte_sig_rejected() {
-        let errors = validate_with_bootstrap_witness(vec![0xAAu8; 64], vec![0u8; 65]);
+        let errors = validate_with_bootstrap_witness(vec![0xAAu8; 32], vec![0u8; 65]);
         assert_invalid_witness(&errors);
     }
 
     #[test]
     fn test_bootstrap_witness_0byte_sig_rejected() {
-        let errors = validate_with_bootstrap_witness(vec![0xAAu8; 64], vec![]);
+        let errors = validate_with_bootstrap_witness(vec![0xAAu8; 32], vec![]);
         assert_invalid_witness(&errors);
     }
 
@@ -4043,9 +4096,10 @@ mod tests {
         assert_invalid_witness(&errors);
     }
 
-    /// Length-lattice property: for all {vkey_len, sig_len} ≠ {64, 64},
-    /// a bootstrap witness must produce `InvalidWitnessSignature`.
-    /// Excludes {64, 64} which passes structural checks but fails sig verify.
+    /// Length-lattice property: across malformed sizes a bootstrap witness must
+    /// produce `InvalidWitnessSignature`. The structurally-valid size is
+    /// {vkey=32, sig=64}; here even that combination fails because the signature
+    /// bytes are all-zero (so Ed25519 verification fails), so every cell errors.
     #[test]
     fn test_bootstrap_witness_length_lattice_rejected() {
         for vkey_len in [0usize, 1, 16, 31, 32, 33, 48, 63, 65, 128] {
@@ -4063,12 +4117,12 @@ mod tests {
         }
     }
 
-    /// Chain-code length check: 64-byte vkey + 64-byte sig but 31-byte chain_code → rejected.
+    /// Chain-code length check: 32-byte vkey + 64-byte sig but 31-byte chain_code → rejected.
     #[test]
     fn test_bootstrap_witness_short_chain_code_rejected() {
         let (utxo_set, mut tx, _) = make_valid_tx();
         tx.witness_set.bootstrap_witnesses.push(BootstrapWitness {
-            vkey: vec![0xAAu8; 64],
+            vkey: vec![0xAAu8; 32],
             signature: vec![0u8; 64],
             chain_code: vec![0u8; 31], // wrong size
             attributes: vec![],
@@ -4092,9 +4146,9 @@ mod tests {
         let mismatch_root = [0u8; 28];
         let (mut utxo_set, mut tx, _) = make_byron_utxo_tx_with_root(&mismatch_root);
 
-        // Witness with a DIFFERENT computed root
-        let vkey64 = [0x42u8; 64];
-        let computed_root = compute_root_for_vkey64(&vkey64);
+        // Witness whose XPub (vkey || chain_code) derives a DIFFERENT root.
+        let xpub64 = [0x42u8; 64];
+        let computed_root = compute_root_for_vkey64(&xpub64);
         assert_ne!(
             computed_root, mismatch_root,
             "test setup: roots must differ"
@@ -4119,9 +4173,9 @@ mod tests {
             },
         );
         tx.witness_set.bootstrap_witnesses.push(BootstrapWitness {
-            vkey: vkey64.to_vec(),
-            signature: vec![0u8; 64], // sig fails too but binding is the point
-            chain_code: vec![0u8; 32],
+            vkey: vec![0x42u8; 32],       // first 32 bytes of the XPub
+            signature: vec![0u8; 64],     // sig fails too but binding is the point
+            chain_code: vec![0x42u8; 32], // last 32 bytes of the XPub
             attributes: vec![0xa0],
         });
         let params = ProtocolParameters::mainnet_defaults();
