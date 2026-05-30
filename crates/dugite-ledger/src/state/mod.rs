@@ -1518,6 +1518,44 @@ impl LedgerState {
         extra.unwrap_or(current)
     }
 
+    /// Forecast the active `maxBlockBodySize` for `target_epoch` while the
+    /// ledger is still in the current epoch.
+    ///
+    /// The Praos/TPraos envelope check (`maxBlockBodySize`) for the FIRST block
+    /// of epoch N+1 must use epoch N+1's value — the boundary PPUP that raises
+    /// it has *conceptually* already been enacted by the TICK that precedes
+    /// header/body validation in the Haskell reference (chainChecks runs over
+    /// the ticked ledger view). dugite validates the header before the epoch
+    /// transition mutates state, so without this forecast it would check the
+    /// boundary block against the OLD epoch's limit and wrongly reject it.
+    /// Concretely: mainnet raised `maxBlockBodySize` 65536→73728 at the
+    /// 305→306 boundary; the first epoch-306 block (6573513) has a 71271-byte
+    /// body and is valid only under 73728. Mirrors
+    /// [`Self::forecast_d_for_epoch`] (proposals keyed by `target_epoch - 1`,
+    /// genesis-key quorum, last-writer merge), without mutating state.
+    pub fn forecast_max_block_body_size_for_epoch(&self, target_epoch: u64) -> u64 {
+        let current = self.epochs.protocol_params.max_block_body_size;
+        if target_epoch != self.epoch.0.saturating_add(1) {
+            return current;
+        }
+        let lookup_epoch = EpochNo(target_epoch.saturating_sub(1));
+        let Some(proposals) = self.epochs.pending_pp_updates.get(&lookup_epoch) else {
+            return current;
+        };
+        let distinct: std::collections::HashSet<Hash32> =
+            proposals.iter().map(|(g, _)| *g).collect();
+        if (distinct.len() as u64) < self.update_quorum {
+            return current;
+        }
+        let mut v = None;
+        for (_, ppu) in proposals {
+            if ppu.max_block_body_size.is_some() {
+                v = ppu.max_block_body_size;
+            }
+        }
+        v.unwrap_or(current)
+    }
+
     /// Set the Shelley genesis hash.
     ///
     /// Initializes the Praos nonce state machine per Haskell's initialChainDepState
