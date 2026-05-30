@@ -72,6 +72,25 @@ pub struct FetchRange {
     pub to: Point,
 }
 
+impl FetchRange {
+    /// Inclusive `(from_slot, to_slot)` slot bounds of this range.
+    ///
+    /// [`Point::Origin`] maps to slot 0 on both ends.  Used by the decision
+    /// task to test whether a given header slot falls inside the range when
+    /// reserving / releasing the cross-peer in-flight hash set.
+    pub fn slot_bounds(&self) -> (u64, u64) {
+        let from = match &self.from {
+            Point::Origin => 0,
+            Point::Specific(s, _) => *s,
+        };
+        let to = match &self.to {
+            Point::Origin => 0,
+            Point::Specific(s, _) => *s,
+        };
+        (from, to)
+    }
+}
+
 // ─── BlockFetchDecision ──────────────────────────────────────────────────────
 
 /// Block fetch decision engine.
@@ -191,6 +210,25 @@ impl BlockFetchDecision {
             });
         }
         self.in_flight.retain(|_, v| !v.is_empty());
+    }
+
+    /// Release **all** per-peer in-flight capacity held by `peer` without
+    /// re-queuing the ranges.
+    ///
+    /// Used when a peer is purged from the fetch set (Aberrant escalation,
+    /// disconnect) and its outstanding ranges are being handled out-of-band by
+    /// the cross-peer in-flight hash union (which re-dispatches the genuine
+    /// gaps).  Unlike [`mark_failed`](Self::mark_failed) this does **not** push
+    /// the ranges back onto the queue — the caller has already arranged for
+    /// re-fetch via the cross-peer hash map, so re-queuing here would duplicate
+    /// the work.
+    pub fn release_peer(&mut self, peer: &SocketAddr) {
+        self.in_flight.remove(peer);
+    }
+
+    /// Number of in-flight ranges currently held by `peer`.
+    pub fn peer_in_flight_len(&self, peer: &SocketAddr) -> usize {
+        self.in_flight.get(peer).map_or(0, |v| v.len())
     }
 
     /// Number of ranges in the download queue.
@@ -499,6 +537,45 @@ mod tests {
         // Rollback to slot 50 — should remove the second range
         decision.rollback_to(&Point::Specific(50, [0x05; 32]));
         assert_eq!(decision.queue_len(), 1);
+    }
+
+    #[test]
+    fn slot_bounds_reports_inclusive_window() {
+        let range = FetchRange {
+            from: Point::Specific(100, [0x01; 32]),
+            to: Point::Specific(200, [0x02; 32]),
+        };
+        assert_eq!(range.slot_bounds(), (100, 200));
+
+        let origin = FetchRange {
+            from: Point::Origin,
+            to: Point::Specific(50, [0x03; 32]),
+        };
+        assert_eq!(origin.slot_bounds(), (0, 50));
+    }
+
+    #[test]
+    fn release_peer_drops_capacity_without_requeue() {
+        let mut decision = BlockFetchDecision::with_defaults();
+        decision.add_range(
+            Point::Specific(10, [0x01; 32]),
+            Point::Specific(20, [0x02; 32]),
+        );
+
+        let peers = vec![test_peer(3001, 50.0)];
+        let (addr, _range) = decision.select_peer(&peers).unwrap();
+        assert_eq!(decision.peer_in_flight_len(&addr), 1);
+        assert_eq!(decision.queue_len(), 0);
+
+        // release_peer drops the capacity but does NOT re-queue the range.
+        decision.release_peer(&addr);
+        assert_eq!(decision.peer_in_flight_len(&addr), 0);
+        assert_eq!(decision.total_in_flight(), 0);
+        assert_eq!(
+            decision.queue_len(),
+            0,
+            "release_peer must not re-queue (unlike mark_failed)"
+        );
     }
 
     #[test]
