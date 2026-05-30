@@ -1442,6 +1442,48 @@ impl LedgerState {
         self.consensus.epoch_nonce
     }
 
+    /// Forecast the decentralisation parameter `d` for `target_epoch` while the
+    /// ledger is still in the current epoch.
+    ///
+    /// Header validation of a block in epoch N+1 must use epoch N+1's `d`
+    /// (Haskell TICKF -> UPEC forecast: the LedgerView's `lvD` comes from the
+    /// TICKed `curPParams` after the pending protocol-parameter update is
+    /// enacted at the epoch boundary), NOT the un-ticked current `d`. The overlay
+    /// (OBFT) schedule that decides whether a slot is an overlay/silent/Praos
+    /// slot depends on `d`; using the wrong (higher, pre-decrease) `d` mis-counts
+    /// overlay slots and rejects the first valid Praos block of the new epoch.
+    ///
+    /// This applies the SAME enactment as `process_epoch_transition` (proposals
+    /// keyed by `target_epoch - 1`, requiring the genesis-key quorum, last-writer
+    /// merge) but without mutating state. Only forecasts ONE epoch ahead; for the
+    /// same epoch or anything further out it returns the current `d`.
+    pub fn forecast_d_for_epoch(
+        &self,
+        target_epoch: u64,
+    ) -> dugite_primitives::transaction::Rational {
+        let current_d = self.epochs.protocol_params.d.clone();
+        if target_epoch != self.epoch.0.saturating_add(1) {
+            return current_d;
+        }
+        let lookup_epoch = EpochNo(target_epoch.saturating_sub(1));
+        let Some(proposals) = self.epochs.pending_pp_updates.get(&lookup_epoch) else {
+            return current_d;
+        };
+        let distinct: std::collections::HashSet<Hash32> =
+            proposals.iter().map(|(g, _)| *g).collect();
+        if (distinct.len() as u64) < self.update_quorum {
+            return current_d;
+        }
+        // Last-writer merge over `d`, matching the merge_field! macro.
+        let mut d = None;
+        for (_, ppu) in proposals {
+            if ppu.d.is_some() {
+                d = ppu.d.clone();
+            }
+        }
+        d.unwrap_or(current_d)
+    }
+
     /// Set the Shelley genesis hash.
     ///
     /// Initializes the Praos nonce state machine per Haskell's initialChainDepState

@@ -697,7 +697,17 @@ impl OuroborosPraos {
 
                 match schedule_result {
                     Some(OBftSlot::NonActiveSlot) => {
-                        // Overlay slot with no assigned signer — no block allowed
+                        // Non-active (silent) overlay slot — no block is allowed
+                        // here. NB: `d` must be the BLOCK's epoch's value (the
+                        // caller forecasts it across the epoch boundary); using a
+                        // stale higher `d` would spuriously classify a Praos slot
+                        // as a silent overlay slot.
+                        debug!(
+                            slot = header.slot.0,
+                            offset = header.slot.0.saturating_sub(ctx.first_slot_of_epoch),
+                            d = %format!("{d_num}/{d_den}"),
+                            "Praos: block at non-active (silent) overlay slot"
+                        );
                         if self.strict_verification {
                             return Err(ConsensusError::NotActiveOverlaySlot {
                                 slot: header.slot.0,
