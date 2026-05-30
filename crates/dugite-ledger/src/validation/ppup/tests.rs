@@ -56,6 +56,7 @@ fn empty_ppu() -> ProtocolParamUpdate {
         max_collateral_inputs: None,
         min_fee_ref_script_cost_per_byte: None,
         d: None,
+        extra_entropy: None,
         protocol_version_major: None,
         protocol_version_minor: None,
         drep_deposit: None,

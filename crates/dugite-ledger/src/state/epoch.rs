@@ -717,24 +717,15 @@ impl LedgerState {
         );
 
         // Step 1: Compute new epoch nonce using OLD prevHashNonce (ηh).
-        // Uses Haskell's Nonce combine (⭒) with NeutralNonce (ZERO) as identity:
         //   epochNonce = candidate ⭒ prevHashNonce ⭒ extraEntropy
-        //   NeutralNonce ⭒ x = x;  x ⭒ NeutralNonce = x
-        //   Nonce(a) ⭒ Nonce(b) = Nonce(blake2b_256(a || b))
-        // extraEntropy is NeutralNonce on all real networks, so omitted.
-        let zero = dugite_primitives::hash::Hash32::ZERO;
-        self.consensus.epoch_nonce = if candidate == zero && prev_hash_nonce == zero {
-            zero
-        } else if candidate == zero {
-            prev_hash_nonce
-        } else if prev_hash_nonce == zero {
-            candidate // identity: candidate ⭒ NeutralNonce = candidate
-        } else {
-            let mut nonce_input = Vec::with_capacity(64);
-            nonce_input.extend_from_slice(candidate.as_bytes());
-            nonce_input.extend_from_slice(prev_hash_nonce.as_bytes());
-            dugite_primitives::hash::blake2b_256(&nonce_input)
-        };
+        // Nonce combine (⭒) treats NeutralNonce (ZERO) as the identity.
+        // extraEntropy is NeutralNonce on virtually every epoch, but mainnet
+        // injected a non-neutral value effective epoch 259 — it MUST be folded
+        // in (see `ConsensusSubState::extra_entropy`).
+        self.consensus.epoch_nonce = crate::eras::common::combine_nonce(
+            crate::eras::common::combine_nonce(candidate, prev_hash_nonce),
+            self.consensus.extra_entropy,
+        );
 
         // Step 2: NOW update prevHashNonce to current labNonce for NEXT epoch
         self.consensus.last_epoch_block_nonce = self.consensus.lab_nonce;

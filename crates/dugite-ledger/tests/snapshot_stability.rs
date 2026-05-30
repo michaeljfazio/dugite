@@ -56,15 +56,13 @@ fn snapshot_format_hash_stability() {
     // This hash was computed from the current LedgerStateSnapshot layout.
     // If this changes, existing snapshot files become unreadable.
     //
-    // Last update: SNAPSHOT_VERSION 19 → 20 (P0 Plutus past-horizon fix,
-    // Round-1 self-audit 2026-05-28) — `SlotConfig` now carries an
-    // `Option<u64> safe_zone_horizon_slot` field used by the Plutus
-    // context-builder to reject past-horizon validity bounds (mirrors
-    // Haskell `TimeTranslationPastHorizon`). The field is `#[serde(default)]`
-    // so older snapshots load with `safe_zone_horizon_slot = None`
-    // (matching pre-fix unbounded semantics), but the bincode-positional
-    // hash necessarily changes.
-    const EXPECTED_HASH: &str = "72e84dd38d5590d429de2561f6fa0117406ee96a36a3725e37885e0ba064390a";
+    // Last update: SNAPSHOT_VERSION 20 → 21 (extraEntropy TICKN fix,
+    // 2026-05-30) — `ConsensusSubState` now carries an `extra_entropy: Hash32`
+    // field (Shelley `ppExtraEntropy`, ZERO = NeutralNonce) folded into the
+    // epoch nonce. bincode is positional so the format hash necessarily
+    // changes; pre-existing snapshots are quarantined on load and operators
+    // re-sync (no `serde(default)` migration shim — see SNAPSHOT_VERSION docs).
+    const EXPECTED_HASH: &str = "eb80510ad9a325575a2450380ead02eaf5a99273b29ba848be5346b01018275b";
 
     if EXPECTED_HASH == "COMPUTE_ON_FIRST_RUN" {
         panic!(

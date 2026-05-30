@@ -24,7 +24,7 @@ use std::sync::Arc;
 use dugite_primitives::block::{Block, BlockHeader};
 use dugite_primitives::credentials::Credential;
 use dugite_primitives::era::Era;
-use dugite_primitives::hash::{blake2b_256, Hash28, Hash32};
+use dugite_primitives::hash::{Hash28, Hash32};
 use dugite_primitives::protocol_params::ProtocolParameters;
 use dugite_primitives::time::EpochNo;
 use dugite_primitives::transaction::{Certificate, Transaction};
@@ -559,6 +559,7 @@ impl EraRules for ShelleyRules {
                     merge_field!(rho);
                     merge_field!(tau);
                     merge_field!(d);
+                    merge_field!(extra_entropy);
                     merge_field!(min_pool_cost);
                     merge_field!(ada_per_utxo_byte);
                     merge_field!(cost_models);
@@ -573,6 +574,13 @@ impl EraRules for ShelleyRules {
                 }
                 // Apply the merged update to protocol params.
                 apply_pp_update(&mut epochs.protocol_params, &merged);
+                // ppExtraEntropy is consumed only by the epoch-nonce TICKN, so
+                // it lives in the consensus sub-state rather than
+                // ProtocolParameters. Sticky: only an update that carries the
+                // field changes it (Some(ZERO) explicitly resets to neutral).
+                if let Some(extra) = merged.extra_entropy {
+                    consensus.extra_entropy = extra;
+                }
                 debug!(
                     epoch = new_epoch.0,
                     proposers = distinct_proposers,
@@ -615,23 +623,18 @@ impl EraRules for ShelleyRules {
             );
         }
 
-        // Compute new epoch nonce (TICKN rule).
+        // Compute new epoch nonce (TICKN rule):
+        //   η0 = candidateNonce ⭒ prevHashNonce ⭒ extraEntropy
+        // (Haskell `Cardano.Protocol.TPraos.Rules.Tickn.tickTransition`).
+        // extraEntropy is NeutralNonce on virtually every epoch, but mainnet
+        // injected a non-neutral value effective epoch 259 — omitting it
+        // desynchronises the epoch nonce (and thus every VRF check) from there.
         let candidate = consensus.candidate_nonce;
         let prev_hash_nonce = consensus.last_epoch_block_nonce;
-
-        let zero = Hash32::ZERO;
-        consensus.epoch_nonce = if candidate == zero && prev_hash_nonce == zero {
-            zero
-        } else if candidate == zero {
-            prev_hash_nonce
-        } else if prev_hash_nonce == zero {
-            candidate
-        } else {
-            let mut nonce_input = Vec::with_capacity(64);
-            nonce_input.extend_from_slice(candidate.as_bytes());
-            nonce_input.extend_from_slice(prev_hash_nonce.as_bytes());
-            blake2b_256(&nonce_input)
-        };
+        consensus.epoch_nonce = super::common::combine_nonce(
+            super::common::combine_nonce(candidate, prev_hash_nonce),
+            consensus.extra_entropy,
+        );
 
         // DIAGNOSTIC (#15 epoch-nonce debug): log the TICKN inputs + result so we
         // can cross-validate the epoch nonce against the live mainnet value.
@@ -646,6 +649,9 @@ impl EraRules for ShelleyRules {
                 "{}/{}",
                 epochs.protocol_params.d.numerator, epochs.protocol_params.d.denominator
             ),
+            evolving = %consensus.evolving_nonce.to_hex(),
+            frozen = %(consensus.candidate_nonce != consensus.evolving_nonce),
+            extra_entropy = %consensus.extra_entropy.to_hex(),
             "TICKN epoch nonce computed"
         );
 
@@ -1060,6 +1066,7 @@ mod tests {
             epoch_nonce: Hash32::ZERO,
             lab_nonce: Hash32::ZERO,
             last_epoch_block_nonce: Hash32::ZERO,
+            extra_entropy: Hash32::ZERO,
             rolling_nonce: Hash32::ZERO,
             first_block_hash_of_epoch: None,
             prev_epoch_first_block_hash: None,
