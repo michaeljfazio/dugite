@@ -162,28 +162,53 @@ pub(crate) fn decode_alonzo_family_block(
     };
 
     // -------------------------------------------------------------------------
-    // 2. tx_bodies
-    // -------------------------------------------------------------------------
-    let tx_count = r.read_array_header()?.unwrap_or(0) as usize;
-    let alloc_cap = r.safe_alloc_capacity(tx_count as u64);
+    // 2. tx_bodies — array of KeepRaw<TransactionBody>, DEFINITE OR INDEFINITE.
+    //
+    // Mainnet blocks encode tx_bodies as an indefinite-length array (`9f … ff`)
+    // in some blocks (e.g. Allegra epoch 238, slot 17625607). The previous
+    // `read_array_header().unwrap_or(0)` treated indefinite (None) as zero txs,
+    // skipped every body, and then misread the first tx body (a map) as the
+    // witness array — "expected array, got map at position 1007". Read until the
+    // break byte for the indefinite case (matches the Shelley decoder fix).
+    let tx_count_hdr = r.read_array_header()?;
+    let alloc_cap = r.safe_alloc_capacity(tx_count_hdr.unwrap_or(0));
     let mut raw_bodies: Vec<Vec<u8>> = Vec::with_capacity(alloc_cap);
     let mut parsed_bodies: Vec<TransactionBody> = Vec::with_capacity(alloc_cap);
 
-    for _ in 0..tx_count {
+    let mut bi = 0u64;
+    loop {
+        match tx_count_hdr {
+            Some(n) if bi >= n => break,
+            None if r.peek_major()? == minicbor::data::Type::Break => {
+                r.skip()?; // consume the indefinite-array break byte
+                break;
+            }
+            _ => {}
+        }
         let body = KeepRaw::parse_with(&mut r, |r| decode_alonzo_tx_body(r, era))?;
         raw_bodies.push(body.raw.to_vec());
         parsed_bodies.push(body.value);
+        bi += 1;
     }
 
     // -------------------------------------------------------------------------
-    // 3. tx_witness_sets
+    // 3. tx_witness_sets — DEFINITE OR INDEFINITE.
     // -------------------------------------------------------------------------
-    let witness_count = r.read_array_header()?.unwrap_or(0) as usize;
-    let ws_alloc_cap = r.safe_alloc_capacity(witness_count as u64);
+    let witness_count_hdr = r.read_array_header()?;
+    let ws_alloc_cap = r.safe_alloc_capacity(witness_count_hdr.unwrap_or(0));
     let mut raw_witnesses: Vec<Vec<u8>> = Vec::with_capacity(ws_alloc_cap);
     let mut parsed_witnesses: Vec<Option<TransactionWitnessSet>> = Vec::with_capacity(ws_alloc_cap);
 
-    for _ in 0..witness_count {
+    let mut wi = 0u64;
+    loop {
+        match witness_count_hdr {
+            Some(n) if wi >= n => break,
+            None if r.peek_major()? == minicbor::data::Type::Break => {
+                r.skip()?;
+                break;
+            }
+            _ => {}
+        }
         if mode == DecodeMode::Full {
             let ws = KeepRaw::parse_with(&mut r, |r| decode_alonzo_witness_set(r, era))?;
             raw_witnesses.push(ws.raw.to_vec());
@@ -194,6 +219,7 @@ pub(crate) fn decode_alonzo_family_block(
             raw_witnesses.push(r.slice_from(ws_start).to_vec());
             parsed_witnesses.push(None);
         }
+        wi += 1;
     }
 
     // -------------------------------------------------------------------------
@@ -206,10 +232,21 @@ pub(crate) fn decode_alonzo_family_block(
     // -------------------------------------------------------------------------
     let mut invalid_tx_set: std::collections::HashSet<usize> = std::collections::HashSet::new();
     if has_invalid_txs {
-        let inv_count = r.read_array_header()?.unwrap_or(0) as usize;
-        for _ in 0..inv_count {
+        // DEFINITE OR INDEFINITE array of tx indices.
+        let inv_count_hdr = r.read_array_header()?;
+        let mut ii = 0u64;
+        loop {
+            match inv_count_hdr {
+                Some(n) if ii >= n => break,
+                None if r.peek_major()? == minicbor::data::Type::Break => {
+                    r.skip()?;
+                    break;
+                }
+                _ => {}
+            }
             let idx = r.read_uint()? as usize;
             invalid_tx_set.insert(idx);
+            ii += 1;
         }
     }
 
