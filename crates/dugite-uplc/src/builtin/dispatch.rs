@@ -10,7 +10,6 @@
 //! equals the builtin's required arity, the denotation fires.
 
 use crate::builtin::arity::arity_of;
-use crate::builtin::cost::BuiltinCosts;
 use crate::builtin::denotations::denote;
 use crate::machine::cost::BudgetTracker;
 use crate::machine::value::Value;
@@ -60,7 +59,7 @@ pub fn force_builtin(
         // final force fires the denotation immediately.
         if new_forces == required_forces && required_arity == 0 {
             if let Some(t) = tracker {
-                let cost = BuiltinCosts::DEFAULT.charge_for_args(id, &[]);
+                let cost = t.builtin_costs.charge_for_args(id, &[]);
                 t.charge(cost)?;
             }
             let result = denote(id, vec![], trace_log)?;
@@ -124,7 +123,7 @@ pub fn apply_builtin(
     // this order: chargeAndRun fires cost BEFORE the denotation), then
     // invoke the denotation.
     if let Some(t) = tracker {
-        let cost = BuiltinCosts::DEFAULT.charge_for_args(id, &args);
+        let cost = t.builtin_costs.charge_for_args(id, &args);
         t.charge(cost)?;
     }
     denote(id, args, trace_log)

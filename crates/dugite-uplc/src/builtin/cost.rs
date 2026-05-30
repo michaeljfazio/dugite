@@ -386,6 +386,35 @@ impl ConstAboveDiagLinXYP {
     }
 }
 
+/// `const_above_diagonal` with a `multiplied_sizes` sub-model. Used by the
+/// integer-division builtins (`divideInteger`/`modInteger`/`quotientInteger`/
+/// `remainderInteger`) in the **PlutusV1/V2** cost models, where the inner
+/// model is the one-variable-linear `multiplied_sizes` rather than the
+/// two-variable quadratic the latest default model uses.
+///
+/// Mirrors `ModelTwoArgumentsConstAboveDiagonal (ModelConstantOrTwoArguments c
+/// (ModelTwoArgumentsMultipliedSizes ...))` in IntersectMBO/plutus
+/// `CostingFun/Core.hs`: `if size1 < size2 then c else intercept + slope*(size1*size2)`.
+/// The diagonal test is **strictly** `<` (size1 < size2 → constant).
+#[derive(Debug, Clone, Copy)]
+pub struct ConstAboveDiagMulP {
+    /// Cost returned when arg1 size < arg2 size (= "below diagonal").
+    pub constant: i64,
+    pub intercept: i64,
+    pub slope: i64,
+}
+
+impl ConstAboveDiagMulP {
+    fn eval(self, x: i64, y: i64) -> i64 {
+        if x < y {
+            self.constant
+        } else {
+            self.intercept
+                .saturating_add(self.slope.saturating_mul(x.saturating_mul(y)))
+        }
+    }
+}
+
 /// Quadratic in x and y, with a minimum floor.
 ///
 /// Standard `c_ij = coefficient of x^i * y^j` convention (matches
@@ -515,6 +544,9 @@ pub enum CostingFun {
     AboveAndBelowDiagonal(AboveBelowDiagP),
     /// `const_above_diagonal` with a `linear_in_x_and_y` sub-model.
     ConstAboveDiagonalLinearXY(ConstAboveDiagLinXYP),
+    /// `const_above_diagonal` with a `multiplied_sizes` sub-model (PlutusV1/V2
+    /// integer division).
+    ConstAboveDiagonalMul(ConstAboveDiagMulP),
     /// `with_interaction_in_x_and_y`.
     WithInteractionXY(InteractionXYP),
     /// `linear_in_y_and_z` — `intercept + slope1*y + slope2*z`.
@@ -552,6 +584,7 @@ impl CostingFun {
             Self::ConstAboveDiagonal(p) => p.eval(x, y),
             Self::AboveAndBelowDiagonal(p) => p.eval(x, y),
             Self::ConstAboveDiagonalLinearXY(p) => p.eval(x, y),
+            Self::ConstAboveDiagonalMul(p) => p.eval(x, y),
             Self::WithInteractionXY(f) => f.eval(x, y),
             Self::LinearYZ(f) => f.eval(y, z),
             Self::LinearMaxYZ(f) => f.eval(y.max(z)),
@@ -631,17 +664,32 @@ const DIVMOD_SUBSIZE: SubtractedSizesP = SubtractedSizesP {
 /// The table is indexed by `BuiltinId` discriminant (which is `u8`).
 /// The `DEFAULT` constant is the reference cost-model the conformance
 /// corpus goldens are computed against.
+#[derive(Clone)]
 pub struct BuiltinCosts {
     table: [CostPair; 101],
 }
 
 impl std::fmt::Debug for BuiltinCosts {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("BuiltinCosts(DEFAULT)")
+        f.write_str("BuiltinCosts")
     }
 }
 
 impl BuiltinCosts {
+    /// Read the cost pair for a builtin (used by the cost-model applier to
+    /// reuse the default model's per-builtin *shape* while substituting
+    /// on-chain coefficients for shapes that are identical across Plutus
+    /// language versions).
+    pub fn cost_pair(&self, id: BuiltinId) -> CostPair {
+        self.table[id as usize]
+    }
+
+    /// Overwrite the cost pair for a builtin. Used by the cost-model applier
+    /// to install per-version on-chain coefficients.
+    pub fn set_cost_pair(&mut self, id: BuiltinId, pair: CostPair) {
+        self.table[id as usize] = pair;
+    }
+
     /// Look up the cost pair for the given builtin and compute the
     /// `ExBudget` from the argument sizes (x=arg1, y=arg2, z=arg3).
     pub fn cost_for(&self, id: BuiltinId, x: i64, y: i64, z: i64) -> ExBudget {
