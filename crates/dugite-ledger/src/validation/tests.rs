@@ -7614,9 +7614,16 @@ mod tests {
         })
     }
 
-    // Helper: compute datum hash = blake2b_256(CBOR(datum)).
+    // Helper: compute datum hash = blake2b_256(canonical Plutus CBOR(datum)).
+    // MUST use the canonical (indefinite-length-list, chunked-bytes) Plutus
+    // `Data` encoding that production `hash_plutus_datum` uses — not the
+    // definite-length `encode_plutus_data`, whose hash diverges for any datum
+    // with a non-empty list or long byte string.
     fn datum_hash_of(datum: &PlutusData) -> Hash32 {
-        let cbor = dugite_serialization::encode_plutus_data(datum);
+        let data = dugite_uplc::tx_info_populate::plutus_data_to_data(datum);
+        let cbor = data
+            .to_cbor()
+            .expect("Data::to_cbor is infallible for in-memory data");
         dugite_primitives::hash::blake2b_256(&cbor)
     }
 
