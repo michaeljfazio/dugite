@@ -254,22 +254,44 @@ pub fn eval_phase_two_raw<O: RedeemerObserver>(
         let redeemer_proxy_cbor = redeemer_data_translated.to_cbor().unwrap_or_default();
         observer.on_redeemer(&redeemer_proxy_cbor);
 
+        // Cap each script's CEK at the redeemer's DECLARED exUnits, exactly
+        // as cardano-node does: `evaluateScriptRestricting` runs the machine
+        // in `restricting (ExRestrictingBudget <declared exUnits>)` mode, so
+        // the script halts the instant it would exceed its declared budget
+        // (`CekOutOfExError`) — it is NOT run with `maxTxExUnits` and then
+        // compared after the fact. Running with the (much larger) tx-level
+        // budget let a script execute far past what cardano-node permits and
+        // allocate memory proportional to `maxTxExUnits` (issue #26: ~34 GB
+        // on one Alonzo script → swap thrash). `declared_ex_units` is
+        // `(mem, cpu)` from the wire; clamp into the tx-level ceiling as
+        // defense-in-depth (phase-1 `ExUnitsTooBigUTxO` already guarantees
+        // the per-tx sum ≤ maxTxExUnits, but we treat redeemer input as
+        // adversarial). Cf. IntersectMBO/plutus
+        // `PlutusLedgerApi.Common.Eval.evaluateScriptRestricting` and
+        // cardano-ledger `Cardano.Ledger.Plutus.Language.evaluatePlutusRunnable`.
+        let declared_mem = resolved_r.declared_ex_units.0 as i64;
+        let declared_cpu = resolved_r.declared_ex_units.1 as i64;
+        let redeemer_budget = crate::machine::ExBudget {
+            cpu: i64::try_from(resolved_r.declared_ex_units.1)
+                .unwrap_or(i64::MAX)
+                .min(initial_ex_budget.cpu),
+            mem: i64::try_from(resolved_r.declared_ex_units.0)
+                .unwrap_or(i64::MAX)
+                .min(initial_ex_budget.mem),
+        };
+
         let outcome = crate::eval_redeemer::eval_resolved_redeemer(
             &decoded.tx,
             &resolved_triples,
             resolved_r,
             &slot_config,
-            initial_ex_budget,
+            redeemer_budget,
             decoded.cost_models.as_ref(),
         )?;
 
-        // Enforce per-redeemer declared budget: cardano-node rejects the
-        // tx when the actual consumed cost exceeds what the redeemer
-        // declared. `declared_ex_units` is `(mem, cpu)` from the wire
-        // (matches `ExUnits { mem, steps }`); `outcome.consumed` is
-        // `(cpu, mem)` so we compare each dimension explicitly.
-        let declared_mem = resolved_r.declared_ex_units.0 as i64;
-        let declared_cpu = resolved_r.declared_ex_units.1 as i64;
+        // The restricting cap above already guarantees `consumed <= declared`
+        // on success; this post-hoc check is retained as defense-in-depth and
+        // to surface a precise error if a future change loosens the cap.
         if outcome.consumed.cpu > declared_cpu || outcome.consumed.mem > declared_mem {
             return Err(PhaseTwoError::Internal(format!(
                 "redeemer {tag:?}@{idx} consumed (cpu={}, mem={}) exceeds declared \
