@@ -1477,10 +1477,23 @@ pub(crate) fn read_pre_conway_protocol_param_update(
                 });
             }
             13 => {
-                // extra_entropy (nonce): not tracked by dugite (deprecated
-                // Babbage onward and never observed materially affecting
-                // ledger state).
-                r.skip()?;
+                // extra_entropy (Shelley Nonce). CBOR: [0] = NeutralNonce, or
+                // [1, bytes32] = Nonce(h). Folded into the epoch nonce at the
+                // TICKN rule (η0 = ηc ⭒ ηh ⭒ extraEntropy). Mainnet injected a
+                // one-time non-neutral value effective epoch 259 — dropping it
+                // here desynchronises every epoch nonce from that point on.
+                let arr = r.read_array_header()?;
+                let tag = r.read_uint()?;
+                ppu.extra_entropy = Some(match tag {
+                    0 => Hash32::ZERO,
+                    1 => read_hash32(r)?,
+                    other => {
+                        return Err(SerializationError::CborDecode(format!(
+                            "extra_entropy: invalid nonce tag {other} (expected 0 or 1)"
+                        )));
+                    }
+                });
+                let _ = arr;
             }
             14 => {
                 // [protocol_version_major, protocol_version_minor]
@@ -1576,6 +1589,37 @@ mod tests {
 
     fn cbor_null() -> Vec<u8> {
         vec![0xf6]
+    }
+
+    #[test]
+    fn pre_conway_pp_update_decodes_extra_entropy_key13() {
+        // map { 13: [1, <32 bytes>] } — a concrete (non-neutral) nonce.
+        let entropy = [0xABu8; 32];
+        let one = cbor_uint(1);
+        let bytes = cbor_bytes(&entropy);
+        let nonce_arr = cbor_arr(&[&one, &bytes]);
+        let mut cbor = vec![0xa1]; // map(1)
+        cbor.extend(cbor_uint(13));
+        cbor.extend(nonce_arr);
+        let mut r = Reader::new(&cbor);
+        let ppu = read_pre_conway_protocol_param_update(&mut r).unwrap();
+        assert_eq!(ppu.extra_entropy, Some(Hash32::from_bytes(entropy)));
+
+        // map { 13: [0] } — NeutralNonce decodes to ZERO.
+        let zero = cbor_uint(0);
+        let neutral = cbor_arr(&[&zero]);
+        let mut cbor2 = vec![0xa1];
+        cbor2.extend(cbor_uint(13));
+        cbor2.extend(neutral);
+        let mut r2 = Reader::new(&cbor2);
+        let ppu2 = read_pre_conway_protocol_param_update(&mut r2).unwrap();
+        assert_eq!(ppu2.extra_entropy, Some(Hash32::ZERO));
+
+        // Absent key 13 → None (not all updates carry it).
+        let empty = cbor_map0();
+        let mut r3 = Reader::new(&empty);
+        let ppu3 = read_pre_conway_protocol_param_update(&mut r3).unwrap();
+        assert_eq!(ppu3.extra_entropy, None);
     }
 
     /// Build a minimal Shelley block CBOR for testing (inner, after envelope stripping).

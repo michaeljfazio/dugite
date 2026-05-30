@@ -110,6 +110,28 @@ pub(crate) fn reward_account_to_hash(reward_account: &[u8]) -> Hash32 {
     Hash32::from_bytes(key_bytes)
 }
 
+/// Haskell `Nonce` combine operator (⭒), used to fold the epoch nonce.
+///
+/// `NeutralNonce` is represented as the all-zero `Hash32` and is the identity:
+///   * `NeutralNonce ⭒ x = x`
+///   * `x ⭒ NeutralNonce = x`
+///   * `Nonce(a) ⭒ Nonce(b) = Nonce(blake2b_256(a || b))`
+///
+/// Source: `cardano-ledger` `Cardano.Ledger.BaseTypes` `instance Semigroup Nonce`.
+pub(crate) fn combine_nonce(a: Hash32, b: Hash32) -> Hash32 {
+    let zero = Hash32::ZERO;
+    if a == zero {
+        b
+    } else if b == zero {
+        a
+    } else {
+        let mut buf = Vec::with_capacity(64);
+        buf.extend_from_slice(a.as_bytes());
+        buf.extend_from_slice(b.as_bytes());
+        blake2b_256(&buf)
+    }
+}
+
 // ============================================================================
 // 1. apply_utxo_changes
 // ============================================================================
@@ -642,6 +664,16 @@ pub(crate) fn compute_shelley_nonce(
         if block_slot.saturating_add(stability_window) < first_slot_of_next_epoch {
             consensus.candidate_nonce = consensus.evolving_nonce;
         }
+    } else {
+        // Every Shelley+ block carries a nonce VRF output; an empty one here
+        // would silently SKIP the ηv update, dropping a contribution and
+        // permanently diverging the randomness chain (Haskell folds ηv on every
+        // block). Flag it — this is a decode/extraction anomaly, not valid state.
+        tracing::warn!(
+            slot = block_slot,
+            issuer = %dugite_primitives::hash::blake2b_224(&header.issuer_vkey),
+            "Shelley+ block with EMPTY nonce_vrf_output — evolving-nonce update skipped"
+        );
     }
 
     // lab_nonce = prevHashToNonce(block.prevHash).
@@ -769,6 +801,55 @@ pub(crate) fn validate_block_ex_units(block: &Block, ctx: &RuleContext) -> Resul
 // ============================================================================
 
 #[cfg(test)]
+mod nonce_combine_tests {
+    use super::combine_nonce;
+    use dugite_primitives::hash::Hash32;
+
+    fn h(hex: &str) -> Hash32 {
+        Hash32::from_hex(hex).unwrap()
+    }
+
+    #[test]
+    fn neutral_nonce_is_identity() {
+        let z = Hash32::ZERO;
+        let x = h("d1340a9c1491f0face38d41fd5c82953d0eb48320d65e952414a0c5ebaf87587");
+        assert_eq!(combine_nonce(z, x), x, "NeutralNonce ⭒ x = x");
+        assert_eq!(combine_nonce(x, z), x, "x ⭒ NeutralNonce = x");
+        assert_eq!(
+            combine_nonce(z, z),
+            z,
+            "NeutralNonce ⭒ NeutralNonce = NeutralNonce"
+        );
+    }
+
+    /// Real mainnet vectors: the epoch-259 nonce only matches the on-chain
+    /// value when the one-time non-neutral `ppExtraEntropy` is folded in as the
+    /// third TICKN term. Guards against ever dropping it again.
+    /// η0_259 = candidate_258 ⭒ prevHashNonce_259 ⭒ extraEntropy
+    #[test]
+    fn mainnet_epoch_259_extra_entropy() {
+        let candidate_258 = h("d1340a9c1491f0face38d41fd5c82953d0eb48320d65e952414a0c5ebaf87587");
+        let prev_hash_nonce = h("ee91d679b0a6ce3015b894c575c799e971efac35c7a8cbdc2b3f579005e69abd");
+        let extra_entropy = h("d982e06fd33e7440b43cefad529b7ecafbaa255e38178ad4189a37e4ce9bf1fa");
+        let real_eta259 = h("0022cfa563a5328c4fb5c8017121329e964c26ade5d167b1bd9b2ec967772b60");
+
+        // Two-term (the pre-fix computation) is WRONG.
+        let two_term = combine_nonce(candidate_258, prev_hash_nonce);
+        assert_ne!(
+            two_term, real_eta259,
+            "dropping extraEntropy must NOT match"
+        );
+
+        // Three-term matches the on-chain epoch-259 nonce byte-for-byte.
+        let eta = combine_nonce(two_term, extra_entropy);
+        assert_eq!(
+            eta, real_eta259,
+            "candidate ⭒ prevHash ⭒ extraEntropy = η0_259"
+        );
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::state::substates::*;
@@ -872,6 +953,7 @@ mod tests {
             epoch_nonce: ZERO32,
             lab_nonce: ZERO32,
             last_epoch_block_nonce: ZERO32,
+            extra_entropy: ZERO32,
             rolling_nonce: ZERO32,
             first_block_hash_of_epoch: None,
             prev_epoch_first_block_hash: None,

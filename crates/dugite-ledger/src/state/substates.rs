@@ -93,6 +93,14 @@ pub struct ConsensusSubState {
     pub epoch_nonce: Hash32,
     pub lab_nonce: Hash32,
     pub last_epoch_block_nonce: Hash32,
+    /// Active extra entropy (Shelley `ppExtraEntropy`). `Hash32::ZERO` =
+    /// NeutralNonce (the value on virtually every epoch). Set via a pre-Conway
+    /// PP update (key 13) and folded into the epoch nonce at the TICKN rule:
+    /// `η0 = candidate ⭒ prevHashNonce ⭒ extraEntropy`. Sticky across epochs
+    /// until changed by another update. Lives here (rather than in
+    /// `ProtocolParameters`) because it is consumed only by the nonce
+    /// computation and must persist alongside the other consensus nonces.
+    pub extra_entropy: Hash32,
     pub rolling_nonce: Hash32,
     pub first_block_hash_of_epoch: Option<Hash32>,
     pub prev_epoch_first_block_hash: Option<Hash32>,

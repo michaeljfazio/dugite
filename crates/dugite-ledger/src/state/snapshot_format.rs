@@ -120,6 +120,10 @@ pub struct LedgerStateSnapshot {
     pub lab_nonce: Hash32,
     /// Snapshot of lab_nonce at epoch boundary.
     pub last_epoch_block_nonce: Hash32,
+    /// Active extra entropy (Shelley `ppExtraEntropy`); ZERO = NeutralNonce.
+    /// New field — SNAPSHOT_VERSION bumped so pre-existing snapshots are
+    /// rejected (bincode is positional; old data cannot supply this field).
+    pub extra_entropy: Hash32,
     /// Randomness stabilisation window: ceiling(4k/f).
     pub randomness_stabilisation_window: u64,
     /// Stability window: ceiling(3k/f).
@@ -243,6 +247,7 @@ impl From<&super::LedgerState> for LedgerStateSnapshot {
             epoch_nonce: s.consensus.epoch_nonce,
             lab_nonce: s.consensus.lab_nonce,
             last_epoch_block_nonce: s.consensus.last_epoch_block_nonce,
+            extra_entropy: s.consensus.extra_entropy,
             rolling_nonce: s.consensus.rolling_nonce,
             first_block_hash_of_epoch: s.consensus.first_block_hash_of_epoch,
             prev_epoch_first_block_hash: s.consensus.prev_epoch_first_block_hash,
@@ -325,6 +330,7 @@ impl From<LedgerStateSnapshot> for super::LedgerState {
                 epoch_nonce: s.epoch_nonce,
                 lab_nonce: s.lab_nonce,
                 last_epoch_block_nonce: s.last_epoch_block_nonce,
+                extra_entropy: s.extra_entropy,
                 rolling_nonce: s.rolling_nonce,
                 first_block_hash_of_epoch: s.first_block_hash_of_epoch,
                 prev_epoch_first_block_hash: s.prev_epoch_first_block_hash,

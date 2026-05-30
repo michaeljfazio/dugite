@@ -627,6 +627,7 @@ impl LedgerState {
                 epoch_nonce: Hash32::ZERO,
                 lab_nonce: Hash32::ZERO,
                 last_epoch_block_nonce: Hash32::ZERO,
+                extra_entropy: Hash32::ZERO,
                 rolling_nonce: Hash32::ZERO,
                 first_block_hash_of_epoch: None,
                 prev_epoch_first_block_hash: None,
@@ -1108,6 +1109,9 @@ impl LedgerState {
                 epoch_nonce: hs.praos_state.epoch_nonce,
                 lab_nonce: hs.praos_state.lab_nonce,
                 last_epoch_block_nonce: hs.praos_state.last_epoch_block_nonce,
+                // Haskell snapshots are imported for current-era (Conway) state
+                // where ppExtraEntropy was removed → always NeutralNonce.
+                extra_entropy: Hash32::ZERO,
                 rolling_nonce: Hash32::ZERO,
                 first_block_hash_of_epoch: None,
                 prev_epoch_first_block_hash: None,
@@ -1417,23 +1421,19 @@ impl LedgerState {
         }
         if block_epoch == self.epoch.0.saturating_add(1) {
             // Block is in the immediately following epoch.  Pre-compute the TICKN
-            // nonce: epochNonce' = candidate ⭒ lastEpochBlockNonce.
-            // This mirrors process_epoch_transition Step 1 exactly.
+            // nonce: epochNonce' = candidate ⭒ lastEpochBlockNonce ⭒ extraEntropy.
+            // This mirrors process_epoch_transition Step 1 exactly — including
+            // the extraEntropy term, which must be FORECAST from the pending PP
+            // update that will be enacted at the boundary (mainnet's one-time
+            // epoch-259 entropy is set this way). Omitting it would reject every
+            // valid first-of-epoch block whose VRF seed uses the new nonce.
             let candidate = self.consensus.candidate_nonce;
             let prev_hash_nonce = self.consensus.last_epoch_block_nonce;
-            let zero = Hash32::ZERO;
-            return if candidate == zero && prev_hash_nonce == zero {
-                zero
-            } else if candidate == zero {
-                prev_hash_nonce
-            } else if prev_hash_nonce == zero {
-                candidate
-            } else {
-                let mut buf = Vec::with_capacity(64);
-                buf.extend_from_slice(candidate.as_bytes());
-                buf.extend_from_slice(prev_hash_nonce.as_bytes());
-                dugite_primitives::hash::blake2b_256(&buf)
-            };
+            let extra = self.forecast_extra_entropy_for_epoch(block_epoch);
+            return crate::eras::common::combine_nonce(
+                crate::eras::common::combine_nonce(candidate, prev_hash_nonce),
+                extra,
+            );
         }
         // Block is more than one epoch ahead.  We cannot pre-compute the nonce
         // because the intermediate epochs' VRF contributions are unknown.
@@ -1482,6 +1482,40 @@ impl LedgerState {
             }
         }
         d.unwrap_or(current_d)
+    }
+
+    /// Forecast the active extra entropy (Shelley `ppExtraEntropy`) for
+    /// `target_epoch` while the ledger is still in the current epoch.
+    ///
+    /// Header validation of a block in epoch N+1 derives its VRF seed from
+    /// epoch N+1's nonce, which folds in the extraEntropy that the boundary
+    /// PPUP will enact. This mirrors `process_epoch_transition`'s enactment
+    /// (proposals keyed by `target_epoch - 1`, genesis-key quorum, last-writer
+    /// merge, sticky) without mutating state. Returns the current (sticky)
+    /// value for the same epoch, anything further out, or when no proposal
+    /// changes it.
+    pub fn forecast_extra_entropy_for_epoch(&self, target_epoch: u64) -> Hash32 {
+        let current = self.consensus.extra_entropy;
+        if target_epoch != self.epoch.0.saturating_add(1) {
+            return current;
+        }
+        let lookup_epoch = EpochNo(target_epoch.saturating_sub(1));
+        let Some(proposals) = self.epochs.pending_pp_updates.get(&lookup_epoch) else {
+            return current;
+        };
+        let distinct: std::collections::HashSet<Hash32> =
+            proposals.iter().map(|(g, _)| *g).collect();
+        if (distinct.len() as u64) < self.update_quorum {
+            return current;
+        }
+        // Last-writer merge over extra_entropy, matching the merge_field! macro.
+        let mut extra = None;
+        for (_, ppu) in proposals {
+            if ppu.extra_entropy.is_some() {
+                extra = ppu.extra_entropy;
+            }
+        }
+        extra.unwrap_or(current)
     }
 
     /// Set the Shelley genesis hash.

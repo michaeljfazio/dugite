@@ -547,6 +547,12 @@ pub struct ProtocolParamUpdate {
     pub min_fee_ref_script_cost_per_byte: Option<u64>,
     /// Decentralisation parameter (d). Deprecated since Babbage.
     pub d: Option<Rational>,
+    /// Extra entropy (Shelley `ppExtraEntropy` / nonce, PParamUpdate key 13).
+    /// Folded into the epoch nonce: η0 = ηc ⭒ ηh ⭒ extraEntropy. `None` = the
+    /// field was absent from this update; `Some(ZERO)` = explicit NeutralNonce;
+    /// `Some(h)` = a concrete entropy nonce. Mainnet set a one-time non-neutral
+    /// value effective epoch 259. Removed as a parameter in Conway.
+    pub extra_entropy: Option<Hash32>,
     // Protocol version (used in pre-Conway hard fork proposals)
     pub protocol_version_major: Option<u64>,
     pub protocol_version_minor: Option<u64>,

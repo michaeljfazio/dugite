@@ -1462,6 +1462,7 @@ mod tests {
             epoch_nonce: Hash32::ZERO,
             lab_nonce: Hash32::ZERO,
             last_epoch_block_nonce: Hash32::ZERO,
+            extra_entropy: Hash32::ZERO,
             rolling_nonce: Hash32::ZERO,
             first_block_hash_of_epoch: None,
             prev_epoch_first_block_hash: None,
