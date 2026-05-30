@@ -5136,6 +5136,26 @@ impl Node {
             self.metrics
                 .header_validation_failures_total
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+
+            // The block reached here as `AddedAsTip` (it connects to the ledger
+            // tip), so it is now the selected-chain tip with the ledger one block
+            // behind it. Simply returning would leave the ledger wedged behind an
+            // invalid tip — and an honest competing fork could never be adopted
+            // (this is exactly the Allegra-boundary wedge: a fork peer's invalid
+            // pv-too-high block sat as the tip while real peers were dropped at the
+            // forecast horizon). Mark the block invalid and roll the selected chain
+            // + ledger back to its parent so chain selection abandons it and adopts
+            // the best VALID fork — mirroring Haskell ChainSel's InvalidBlockCache.
+            let parent_point = {
+                let ls = self.ledger_state.read().await;
+                ls.tip.point.clone()
+            };
+            self.abandon_failed_fork(
+                block_hash,
+                "apply-time Praos header validation failed",
+                &parent_point,
+            )
+            .await;
             return;
         }
 

@@ -504,11 +504,23 @@ impl OuroborosPraos {
         // verification so wrong-length fields cannot silently bypass them.
         Self::check_header_field_sizes(header, self.strict_verification)?;
 
-        // Protocol version checks (Haskell's envelopeChecks):
-        // 1. ObsoleteNode: the ledger's current PV exceeds our node's max — we can't
-        //    validate blocks on this chain at all, the node must be upgraded.
-        // 2. HeaderProtVerTooHigh: the block header claims a PV more than one major
-        //    version ahead of the ledger — a valid block can only propose pv+1 at most.
+        // Protocol version check (Haskell `chainChecks` / `envelopeChecks`):
+        // ObsoleteNode — the LEDGER's enacted protocol-version major exceeds the
+        // node's max-supported major, so we can't validate this chain and must be
+        // upgraded. This is the ONLY protocol-version check in Haskell.
+        //
+        // The block HEADER's declared `bprotver` is NOT validated against the
+        // ledger pv (or `ledger_pv + 1`, or anything). It is purely the producing
+        // node's self-declared version — the hard-fork readiness signal — and may
+        // legitimately run AHEAD of the enacted ledger pv. Cross-validated against
+        // cardano-ledger `Cardano.Ledger.Chain.chainChecks` + consensus
+        // `Ouroboros.Consensus.Shelley.Protocol.{TPraos,Praos}.envelopeChecks`:
+        // chainChecks reads only the ledger PV (`ccProtocolVersion`), the header
+        // size, and the body size — never the header's `bprotver`. dugite
+        // previously rejected real blocks whose header pv ran ahead of the ledger
+        // (e.g. mainnet epoch 236 Allegra blocks carry header pv 4 while the
+        // enacted ledger pv is 3) — that `header_pv <= ledger_pv + 1` rule was
+        // fabricated and has been removed.
         if let Some(pv_major) = ledger_pv_major {
             if pv_major > self.max_major_prot_ver {
                 warn!(
@@ -520,21 +532,6 @@ impl OuroborosPraos {
                     chain_pv: pv_major,
                     node_max_pv: self.max_major_prot_ver,
                 });
-            }
-            if let Some(next_pv) = pv_major.checked_add(1) {
-                if header.protocol_version.major > next_pv {
-                    warn!(
-                        slot = header.slot.0,
-                        block_pv = header.protocol_version.major,
-                        ledger_pv = pv_major,
-                        max_allowed = next_pv,
-                        "Praos: block header protocol version too high"
-                    );
-                    return Err(ConsensusError::HeaderProtVerTooHigh {
-                        supplied: header.protocol_version.major,
-                        max_expected: next_pv,
-                    });
-                }
             }
         }
 
@@ -636,9 +633,11 @@ impl OuroborosPraos {
         // BFT-overlay VRF key binding, and opcert signature checks below).
         Self::check_header_field_sizes(header, self.strict_verification)?;
 
-        // 1b. Protocol version checks (Haskell's envelopeChecks):
-        // ObsoleteNode: ledger PV exceeds node max — node must be upgraded.
-        // HeaderProtVerTooHigh: block header PV more than one major version ahead of ledger.
+        // 1b. Protocol version check (Haskell `chainChecks`): ObsoleteNode only —
+        // the LEDGER's enacted PV major exceeds the node's max-supported major.
+        // The header's declared `bprotver` is NOT validated (it is the producer's
+        // self-declared HF-readiness signal and may run ahead of the ledger pv).
+        // See validate_header_full for the full cross-reference.
         if let Some(pv_major) = ledger_pv_major {
             if pv_major > self.max_major_prot_ver {
                 warn!(
@@ -650,21 +649,6 @@ impl OuroborosPraos {
                     chain_pv: pv_major,
                     node_max_pv: self.max_major_prot_ver,
                 });
-            }
-            if let Some(next_pv) = pv_major.checked_add(1) {
-                if header.protocol_version.major > next_pv {
-                    warn!(
-                        slot = header.slot.0,
-                        block_pv = header.protocol_version.major,
-                        ledger_pv = pv_major,
-                        max_allowed = next_pv,
-                        "Praos: block header protocol version too high"
-                    );
-                    return Err(ConsensusError::HeaderProtVerTooHigh {
-                        supplied: header.protocol_version.major,
-                        max_expected: next_pv,
-                    });
-                }
             }
         }
 
@@ -4210,47 +4194,31 @@ mod tests {
     }
 
     #[test]
-    fn test_header_prot_ver_too_high() {
-        let praos = OuroborosPraos::new(11);
+    fn test_header_protocol_version_not_checked_against_ledger() {
+        // The block header's declared `bprotver` is NEVER validated against the
+        // ledger pv (Haskell `chainChecks` only does ObsoleteNode on the LEDGER's
+        // pv + size checks). The header pv is the producer's self-declared
+        // HF-readiness signal and may run arbitrarily AHEAD of the enacted ledger
+        // pv. dugite previously rejected real blocks (e.g. mainnet epoch-236
+        // Allegra blocks carry header pv 4 while the enacted ledger pv is 3) via a
+        // fabricated `header_pv <= ledger_pv + 1` rule — now removed.
+        let praos = OuroborosPraos::new(11); // non-strict: VRF non-fatal for dummy header
         let header = make_valid_header(100);
         let ledger_pv = Some(9);
 
-        // Header PV 10 (ledger 9 + 1) → accepted (one-major-version bump allowed)
-        let mut header_ok = header.clone();
-        header_ok.protocol_version = dugite_primitives::block::ProtocolVersion {
-            major: 10,
-            minor: 0,
-        };
-        assert!(praos
-            .validate_header(&header_ok, SlotNo(200), ValidationMode::Full, ledger_pv)
-            .is_ok());
-
-        // Header PV 11 (ledger 9 + 2) → HeaderProtVerTooHigh
-        let mut header_bad = header.clone();
-        header_bad.protocol_version = dugite_primitives::block::ProtocolVersion {
-            major: 11,
-            minor: 0,
-        };
-        let result =
-            praos.validate_header(&header_bad, SlotNo(200), ValidationMode::Full, ledger_pv);
-        assert!(
-            matches!(
-                result,
-                Err(ConsensusError::HeaderProtVerTooHigh {
-                    supplied: 11,
-                    max_expected: 10
-                })
-            ),
-            "Expected HeaderProtVerTooHigh, got: {result:?}"
-        );
-
-        // Header PV 9 (same as ledger) → accepted
-        let mut header_same = header.clone();
-        header_same.protocol_version =
-            dugite_primitives::block::ProtocolVersion { major: 9, minor: 0 };
-        assert!(praos
-            .validate_header(&header_same, SlotNo(200), ValidationMode::Full, ledger_pv)
-            .is_ok());
+        for header_pv in [9u64, 10, 11] {
+            let mut h = header.clone();
+            h.protocol_version = dugite_primitives::block::ProtocolVersion {
+                major: header_pv,
+                minor: 0,
+            };
+            assert!(
+                praos
+                    .validate_header(&h, SlotNo(200), ValidationMode::Full, ledger_pv)
+                    .is_ok(),
+                "header pv {header_pv} (ledger pv 9) must NOT be rejected on protocol version"
+            );
+        }
     }
 
     #[test]
@@ -4682,17 +4650,18 @@ mod tests {
         assert!(b.is_ok(), "path B: expected Ok, got {b:?}");
     }
 
-    // Row 3: (11, 11, 13) → Err(HeaderProtVerTooHigh)  [header skips pv, invalid]
+    // Row 3: (11, 11, 13) → Ok  [the header's bprotver is NOT validated against
+    // the ledger pv — it may run arbitrarily ahead (HF-readiness signal)].
     #[test]
-    fn envelope_pv11_config_ledger11_header13_too_high() {
+    fn envelope_pv11_config_ledger11_header13_ok() {
         let (a, b) = run_envelope(11, 11, 13);
         assert!(
-            matches!(a, Err(ConsensusError::HeaderProtVerTooHigh { .. })),
-            "path A: expected HeaderProtVerTooHigh, got {a:?}"
+            a.is_ok(),
+            "path A: header pv ahead of ledger must be Ok, got {a:?}"
         );
         assert!(
-            matches!(b, Err(ConsensusError::HeaderProtVerTooHigh { .. })),
-            "path B: expected HeaderProtVerTooHigh, got {b:?}"
+            b.is_ok(),
+            "path B: header pv ahead of ledger must be Ok, got {b:?}"
         );
     }
 
@@ -4740,17 +4709,17 @@ mod tests {
         assert!(b.is_ok(), "path B: expected Ok, got {b:?}");
     }
 
-    // Row 8: (12, 12, 14) → Err(HeaderProtVerTooHigh)  [header skips two versions]
+    // Row 8: (12, 12, 14) → Ok  [header bprotver may skip versions; not validated].
     #[test]
-    fn envelope_pv12_config_ledger12_header14_too_high() {
+    fn envelope_pv12_config_ledger12_header14_ok() {
         let (a, b) = run_envelope(12, 12, 14);
         assert!(
-            matches!(a, Err(ConsensusError::HeaderProtVerTooHigh { .. })),
-            "path A: expected HeaderProtVerTooHigh, got {a:?}"
+            a.is_ok(),
+            "path A: header pv ahead of ledger must be Ok, got {a:?}"
         );
         assert!(
-            matches!(b, Err(ConsensusError::HeaderProtVerTooHigh { .. })),
-            "path B: expected HeaderProtVerTooHigh, got {b:?}"
+            b.is_ok(),
+            "path B: header pv ahead of ledger must be Ok, got {b:?}"
         );
     }
 
