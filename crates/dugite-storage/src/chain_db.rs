@@ -937,22 +937,21 @@ impl ChainDB {
         let finalize_up_to_block_no = tip_block_no - retain_blocks;
         let start_block_no = self.last_flushed_block_no + 1;
 
+        // Collect at most `max_blocks` candidates in O(batch) — NOT O(volatile
+        // size). Materialising the whole selected chain here once per 50-block
+        // batch is O(N^2) over a large catch-up backlog and stalls the run loop.
+        let candidates = self.volatile.selected_chain_entries_bounded(
+            start_block_no,
+            finalize_up_to_block_no,
+            max_blocks as usize,
+        );
         let mut to_finalize: Vec<(u64, Hash32, u64, Vec<u8>)> = Vec::new();
-        for (hash, slot, block_no, _prev_hash) in self.volatile.selected_chain_entries() {
-            if block_no < start_block_no {
-                continue;
-            }
-            if block_no > finalize_up_to_block_no {
-                break;
-            }
+        for (hash, slot, block_no, _prev_hash) in candidates {
             if self.immutable.has_block(&hash) {
                 continue;
             }
             if let Some(cbor) = self.volatile.get_block_cbor(&hash) {
                 to_finalize.push((slot, hash, block_no, cbor.to_vec()));
-            }
-            if to_finalize.len() as u64 >= max_blocks {
-                break;
             }
         }
 
