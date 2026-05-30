@@ -50,18 +50,35 @@ use super::ValidationError;
 /// Hash a plutus datum by CBOR-encoding it and applying blake2b-256.
 ///
 /// This mirrors Haskell's `hashData :: Data era -> DataHash (EraCrypto era)`
-/// which is `blake2b_256(to_cbor(data))`.  We use our own CBOR encoder so
-/// that the hash is computed from the canonical re-encoding rather than
-/// from the original wire bytes.
+/// which is `blake2b_256(to_cbor(data))`.
 ///
-/// For transactions received from the network the witness datums are always
-/// parsed through the in-house decoder before being stored in `plutus_data`, so
-/// re-encoding is safe.  Any encoding-detail differences (e.g.
-/// indefinite-length arrays) would also exist in the on-chain UTxO datum hash
-/// — but in practice datum hashes committed to UTxOs were produced by
-/// cardano-cli/cardano-node which use the same canonical encoding we produce.
+/// **The encoding MUST be the canonical Plutus `Data` form** that
+/// cardano-node/plutus produce — this is the encoding every on-chain datum
+/// hash was computed over (`IntersectMBO/plutus:PlutusCore/Data.hs`). Its
+/// salient, non-obvious rules:
+///
+///   - a **non-empty** `List`/`Constr`-fields array is **indefinite-length**
+///     (`0x9f … 0xff`), an empty one is definite `0x80` (cborg's
+///     `Serialise [a]` instance);
+///   - a byte string longer than 64 bytes is chunked into ≤64-byte segments
+///     wrapped in an indefinite-length byte string (`0x5f … 0xff`);
+///   - integers outside `[-2^64, 2^64)` use the bignum tag form.
+///
+/// `dugite_serialization::encode_plutus_data` emits **definite-length** arrays
+/// and a single un-chunked byte string, so its hash diverges from the
+/// on-chain hash for any datum containing a non-empty list or a long byte
+/// string (verified against mainnet datum `8b9604d4…`: on-chain bytes use
+/// `d8799f…ffff`, dugite's old encoder produced `d87984…`). We therefore
+/// delegate to the conformance-proven `dugite_uplc` `Data` encoder, which
+/// reproduces the canonical form byte-for-byte (it backs the `serialiseData`
+/// builtin and passes the full Plutus conformance suite).
 fn hash_plutus_datum(datum: &dugite_primitives::transaction::PlutusData) -> Hash32 {
-    let cbor = dugite_serialization::encode_plutus_data(datum);
+    let data = dugite_uplc::tx_info_populate::plutus_data_to_data(datum);
+    // `Data::to_cbor` only fails on a writer error, which cannot happen for an
+    // in-memory `Vec`; the fallback is unreachable but avoids an unwrap.
+    let cbor = data
+        .to_cbor()
+        .unwrap_or_else(|_| dugite_serialization::encode_plutus_data(datum));
     dugite_primitives::hash::blake2b_256(&cbor)
 }
 
@@ -251,6 +268,51 @@ mod tests {
         OutputDatum, PlutusData, Transaction, TransactionInput, TransactionOutput,
     };
     use dugite_primitives::value::Value;
+
+    /// Byte-exact cross-validation against authoritative mainnet data.
+    ///
+    /// Mainnet datum `8b9604d4…` (creation tx
+    /// `0e253dfe96521ab184e3c19d93f92c57f71a531ee36995335177a08e408abcc7`,
+    /// fetched from Koios `datum_info`) has the structure
+    /// `Constr(0, [Constr(0, [B(28), B(28), B("ADAX"), I(100)])])` and on-chain
+    /// CBOR `d8799fd8799f581c0f1d…8a0f581c0c78…3c5f4441444158 1864 ff ff` — note
+    /// the **indefinite-length** (`9f…ff`) Constr-field arrays. Its datum hash
+    /// MUST be reproduced exactly. dugite's old definite-length encoder produced
+    /// `dad1fe73…` instead, causing the Alonzo `MissingDatumWitness` /
+    /// `ExtraDatumWitness` sync divergence.
+    #[test]
+    fn test_datum_hash_matches_mainnet_indefinite_encoding() {
+        use num_bigint::BigInt;
+        let policy: Vec<u8> =
+            hex_to_bytes("0f1d8826255e871c201c91d40d9ea420369ff61b0475005cc2ad8a0f");
+        let asset: Vec<u8> =
+            hex_to_bytes("0c78f619e54a5d00e143f66181a2c500d0c394b38a10e86cd1a23c5f");
+        let name: Vec<u8> = hex_to_bytes("41444158"); // "ADAX"
+        let datum = PlutusData::Constr(
+            0,
+            vec![PlutusData::Constr(
+                0,
+                vec![
+                    PlutusData::Bytes(policy),
+                    PlutusData::Bytes(asset),
+                    PlutusData::Bytes(name),
+                    PlutusData::Integer(BigInt::from(100)),
+                ],
+            )],
+        );
+        let got = hash_plutus_datum(&datum).to_hex();
+        assert_eq!(
+            got, "8b9604d44ee907461ff45f5031da4a90241ecac5c99fd3b6d3b9c8219bd11ad5",
+            "datum hash must match the on-chain (indefinite-length) Plutus encoding"
+        );
+    }
+
+    fn hex_to_bytes(s: &str) -> Vec<u8> {
+        (0..s.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&s[i..i + 2], 16).unwrap())
+            .collect()
+    }
 
     // -----------------------------------------------------------------------
     // Test helpers
