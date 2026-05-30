@@ -1117,6 +1117,9 @@ impl OuroborosPraos {
 
         if let Some(m) = m {
             if n < m {
+                // CounterTooSmallOCERT — applies to BOTH TPraos and Praos
+                // (Cardano.Protocol.TPraos.Rules.OCert + Praos
+                // doValidateKESSignature both check `m <= n`).
                 if self.strict_verification {
                     warn!(
                         slot = header.slot.0,
@@ -1136,6 +1139,34 @@ impl OuroborosPraos {
                     got = n,
                     last_seen = m,
                     "Praos: opcert counter regression (non-fatal during sync)"
+                );
+            } else if header.protocol_version.major >= 7 && n > m.saturating_add(1) {
+                // CounterOverIncrementedOCERT — Praos ONLY (PV >= 7). The Praos
+                // consensus layer's `doValidateKESSignature` adds the upper
+                // bound `n <= m + 1`, but the TPraos `OCERT.ocertTransition`
+                // (Shelley–Alonzo, PV < 7) has no such check — a pool's first
+                // on-chain block there may carry any counter (it re-issued its
+                // opcert several times before forging; see the mainnet epoch-211
+                // counter-2 block). Gating on PV >= 7 keeps both eras byte-exact.
+                if self.strict_verification {
+                    warn!(
+                        slot = header.slot.0,
+                        pool = %pool_id,
+                        got = n,
+                        last_seen = m,
+                        "Praos: opcert counter over-incremented (CounterOverIncrementedOCERT)"
+                    );
+                    return Err(ConsensusError::OpcertCounterOverIncremented {
+                        got: n,
+                        last_seen: m,
+                    });
+                }
+                debug!(
+                    slot = header.slot.0,
+                    pool = %pool_id,
+                    got = n,
+                    last_seen = m,
+                    "Praos: opcert counter over-incremented (non-fatal during sync)"
                 );
             }
         }
@@ -2720,6 +2751,9 @@ mod tests {
         praos.set_strict_verification(true);
 
         let mut header1 = make_valid_header(100);
+        // TPraos era (PV < 7) — the no-upper-bound path. A Praos PV (>= 7)
+        // would correctly reject the 5->7 jump (see test_opcert_counter_tracking).
+        header1.protocol_version.major = 6;
         header1.operational_cert.sequence_number = 5;
         let info1 = make_issuer_info(&header1);
         assert!(praos
@@ -2736,6 +2770,7 @@ mod tests {
 
         // Jump from 5 to 7: allowed (no upper bound in TPraos OCERT).
         let mut header2 = make_valid_header(200);
+        header2.protocol_version.major = 6;
         header2.operational_cert.sequence_number = 7;
         let info2 = make_issuer_info(&header2);
         let result = praos.validate_header_full(
@@ -2872,6 +2907,10 @@ mod tests {
         praos.set_strict_verification(true);
 
         let mut header = make_valid_header(100);
+        // Shelley-era (TPraos, PV < 7), as at epoch 211 — the OCERT rule there
+        // has no upper bound, so a large first-seen counter is accepted. Under a
+        // Praos PV (>= 7) the same counter would be rejected as over-incremented.
+        header.protocol_version.major = 2;
         header.operational_cert.sequence_number = 50;
         let info = make_issuer_info(&header);
 
