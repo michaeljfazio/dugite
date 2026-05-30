@@ -1152,6 +1152,39 @@ pub(crate) fn read_plutus_data(r: &mut Reader<'_>) -> Result<PlutusData, Seriali
     read_plutus_data_depth(r, 0)
 }
 
+/// Recover the original CBOR byte span of each element in a preserved
+/// `plutus_data` witness array (`witness_set.raw_plutus_data_cbor`).
+///
+/// **Datum hashes are `blake2b256` over the *original* datum bytes** — Haskell
+/// memoises the raw CBOR (`MemoBytes`/`Data`) and hashes that, never a
+/// re-encoding. On-chain datums are frequently encoded in non-canonical forms
+/// that a structural re-encoder cannot reproduce: the general `Constr` form
+/// (CBOR tag 102) for small constructor indices, definite-length field arrays
+/// where the canonical form is indefinite, non-minimal integers, etc. Decoding
+/// such a datum to `PlutusData` and re-encoding yields a *different* hash, which
+/// breaks the `MissingDatumWitness` / `ExtraDatumWitness` Phase-1 checks (the
+/// recomputed hash matches neither the required input-datum hash nor the
+/// allowed set). This helper re-splits the preserved raw array into the exact
+/// per-element byte spans so the caller can hash each verbatim.
+///
+/// Returns `None` if `raw` does not parse as a `plutus_data` array (the caller
+/// then falls back to canonical re-encoding, which is correct for datums the
+/// node *constructs* itself — those have no original wire bytes). The spans are
+/// returned in array order, 1:1 with the decoded `witness_set.plutus_data`.
+pub fn plutus_data_element_spans(raw: &[u8]) -> Option<Vec<Vec<u8>>> {
+    let mut r = Reader::new(raw);
+    let mut spans: Vec<Vec<u8>> = Vec::new();
+    // The witness `plutus_data` field is a plain array pre-Conway and a
+    // tag-258 set in Conway; `read_set` consumes either form transparently.
+    let result: Result<Vec<()>, SerializationError> = r.read_set(|r| {
+        let start = r.position();
+        read_plutus_data(r)?;
+        spans.push(r.slice_from(start).to_vec());
+        Ok(())
+    });
+    result.ok().map(|_| spans)
+}
+
 /// Maximum nesting depth for `read_plutus_data`.
 ///
 /// Adversarial transactions can encode arbitrarily deep PlutusData via nested
@@ -1547,6 +1580,52 @@ pub(crate) fn decode_alonzo_tx_output_standalone(
 mod tests {
     use super::*;
     use dugite_primitives::era::Era;
+
+    fn hex(s: &str) -> Vec<u8> {
+        (0..s.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&s[i..i + 2], 16).unwrap())
+            .collect()
+    }
+
+    /// `plutus_data_element_spans` must return each datum's *original* bytes
+    /// verbatim, so the hash matches Haskell's `MemoBytes` hash even when the
+    /// datum is encoded non-canonically.
+    ///
+    /// Vector: mainnet datum `5ff23baed5…` (Koios `datum_info`), encoded with
+    /// the **general `Constr` form** (CBOR tag 102, `d866`) and a definite
+    /// 6-field array `86` for constructor index 0 — a form the canonical Plutus
+    /// encoder (tag 121, indefinite) would never produce. A definite outer
+    /// array of one element wraps it (`0x81`).
+    #[test]
+    fn test_plutus_data_element_spans_preserves_noncanonical_bytes() {
+        let datum = "d866820086581ca3250750af6227b5a7dc689de94c83728a9d1d4029cc232d4a46f81e1a041cdb40581c023cec350597bdf2a2b6945e62e0111d9808caf7a9353a2ab91e8beb50534f434945545932354c4d4239323332581c63a3bc3807c6a51f85570ad9a82ed46bdb96feeabae6c4aa0526d4ed181e";
+        let datum_bytes = hex(datum);
+        let mut array = vec![0x81u8]; // array(1)
+        array.extend_from_slice(&datum_bytes);
+
+        let spans = plutus_data_element_spans(&array).expect("spans");
+        assert_eq!(spans.len(), 1);
+        assert_eq!(
+            spans[0], datum_bytes,
+            "span must be the verbatim datum bytes"
+        );
+
+        let h = dugite_primitives::hash::blake2b_256(&spans[0]).to_hex();
+        assert_eq!(
+            h, "5ff23baed51ec22e9342ace92e6dd9976be5ded109575f58a8a2419f064818d0",
+            "hash of the original bytes must equal the on-chain datum hash"
+        );
+    }
+
+    /// Indefinite-array form and multiple elements split correctly.
+    #[test]
+    fn test_plutus_data_element_spans_indefinite_multi() {
+        // 9f 182a 43aabbcc ff  — indefinite array of [ I(42), B(aabbcc) ]
+        let raw = hex("9f182a43aabbccff");
+        let spans = plutus_data_element_spans(&raw).expect("spans");
+        assert_eq!(spans, vec![hex("182a"), hex("43aabbcc")]);
+    }
 
     // -----------------------------------------------------------------------
     // CBOR encoding helpers

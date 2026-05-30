@@ -70,6 +70,11 @@ use dugite_primitives::transaction::{Transaction, TransactionInput, TransactionO
 /// Conway keys 0-33 and Dijkstra keys 34-37 are all handled.
 pub use era_conway::ppu_from_cbor;
 
+/// Recover per-element original CBOR byte spans from a preserved `plutus_data`
+/// witness array, so datum hashes can be computed over the original bytes
+/// (matching Haskell `MemoBytes`) rather than a non-reproducible re-encoding.
+pub use era_alonzo::plutus_data_element_spans;
+
 /// Decode a Byron main-chain block from its inner CBOR (post envelope strip).
 /// Re-exported so fuzz harnesses and external tooling (Mithril chunk
 /// inspection, era-specific replay) can call the Byron path directly without
