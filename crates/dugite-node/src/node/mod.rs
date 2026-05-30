@@ -4475,11 +4475,20 @@ impl Node {
         };
 
         // Envelope checks (body/header size vs protocol params) — always fatal.
+        //
+        // Use the FORECAST `maxBlockBodySize` for `block_epoch`, not the
+        // un-ticked current value: the boundary PPUP that raises it is enacted
+        // by the TICK that (in the Haskell reference) precedes header/body
+        // validation, so the first block of epoch N+1 must be checked against
+        // epoch N+1's limit. Same reasoning as `forecast_d` above. Mainnet
+        // raised `maxBlockBodySize` 65536→73728 at the 305→306 boundary; the
+        // first epoch-306 block has a 71271-byte body and is valid only under
+        // 73728 — checking it against the stale 65536 wedged the sync.
         if let Err(e) = self.consensus.validate_envelope(
             block.slot(),
             block.header.body_size,
             None,
-            ls.epochs.protocol_params.max_block_body_size,
+            ls.forecast_max_block_body_size_for_epoch(block_epoch),
             ls.epochs.protocol_params.max_block_header_size,
         ) {
             return Err(format!("envelope check: {e}"));
