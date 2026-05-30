@@ -34,26 +34,52 @@ impl BlockFetchClient {
         channel: &mut MuxChannel,
         from: Point,
         to: Point,
+        on_block: F,
+    ) -> Result<usize, ProtocolError>
+    where
+        F: FnMut(Vec<u8>) -> Result<(), ProtocolError>,
+    {
+        // `fetch_range` is the non-pipelined composition of the two halves:
+        // send exactly one request, then receive exactly one batch response.
+        Self::send_range_request(channel, from, to).await?;
+        Self::recv_batch(channel, on_block).await
+    }
+
+    /// Send a single `MsgRequestRange(from, to)` — the **request half** of a
+    /// fetch.
+    ///
+    /// Split out from [`fetch_range`] so a caller can keep several range
+    /// requests in flight at once (request pipelining), overlapping each
+    /// range's network round-trip with the receipt/processing of earlier
+    /// ranges. The BlockFetch mini-protocol multiplexes responses in FIFO
+    /// request order, so the Nth `recv_batch` corresponds to the Nth
+    /// `send_range_request`. Mirrors Haskell `bfcMaxRequestsInflight`
+    /// pipelining in `Ouroboros.Network.BlockFetch.Client`.
+    pub async fn send_range_request(
+        channel: &mut MuxChannel,
+        from: Point,
+        to: Point,
+    ) -> Result<(), ProtocolError> {
+        let req = encode_message(&BlockFetchMessage::MsgRequestRange { from, to });
+        tracing::debug!("blockfetch: sending MsgRequestRange");
+        channel.send(req).await.map_err(ProtocolError::from)
+    }
+
+    /// Receive exactly one batch response — the **reply half** of a fetch:
+    /// `MsgStartBatch → MsgBlock* → MsgBatchDone`, or `MsgNoBlocks`.
+    ///
+    /// Returns the number of blocks streamed for this range (`0` for
+    /// `MsgNoBlocks`). Call once per outstanding `send_range_request`, in the
+    /// same order the requests were sent.
+    pub async fn recv_batch<F>(
+        channel: &mut MuxChannel,
         mut on_block: F,
     ) -> Result<usize, ProtocolError>
     where
         F: FnMut(Vec<u8>) -> Result<(), ProtocolError>,
     {
-        // Send MsgRequestRange
-        let req = encode_message(&BlockFetchMessage::MsgRequestRange {
-            from: from.clone(),
-            to: to.clone(),
-        });
-        tracing::debug!("blockfetch: sending MsgRequestRange");
-        channel.send(req).await.map_err(ProtocolError::from)?;
-        tracing::debug!("blockfetch: MsgRequestRange sent, waiting for response");
-
         // Receive MsgStartBatch or MsgNoBlocks
         let response_bytes = channel.recv().await.map_err(ProtocolError::from)?;
-        tracing::debug!(
-            bytes = response_bytes.len(),
-            "blockfetch: received response"
-        );
         let response = decode_message(&response_bytes).map_err(|e| ProtocolError::CborDecode {
             protocol: "BlockFetch",
             reason: e,
@@ -239,6 +265,103 @@ mod tests {
 
         let count = handle.await.unwrap().unwrap();
         assert_eq!(count, 0);
+    }
+
+    /// Request pipelining: a caller keeps a bounded window of range requests
+    /// in flight (`send_range_request`) and drains the responses in FIFO order
+    /// (`recv_batch`), refilling the window after each batch. The Nth batch
+    /// must correspond to the Nth request. This mirrors the BlockFetch
+    /// fetcher's sliding-window orchestration that overlaps each range's
+    /// round-trip with the processing of earlier ranges.
+    #[tokio::test]
+    async fn pipelined_requests_receive_batches_in_fifo_order() {
+        let (mut channel, mut egress_rx, ingress_tx) = make_test_channel();
+
+        let ranges = [
+            (Point::Specific(10, [1; 32]), Point::Specific(19, [2; 32])),
+            (Point::Specific(20, [3; 32]), Point::Specific(29, [4; 32])),
+            (Point::Specific(30, [5; 32]), Point::Specific(39, [6; 32])),
+        ];
+        let window = 2usize;
+
+        let client = tokio::spawn(async move {
+            let mut collected: Vec<Vec<u8>> = Vec::new();
+            let mut next = 0usize;
+            // Prime the window with up to `window` outstanding requests.
+            while next < ranges.len() && next < window {
+                BlockFetchClient::send_range_request(
+                    &mut channel,
+                    ranges[next].0.clone(),
+                    ranges[next].1.clone(),
+                )
+                .await
+                .unwrap();
+                next += 1;
+            }
+            // Drain one batch per range in order; refill the window after each.
+            for _ in 0..ranges.len() {
+                BlockFetchClient::recv_batch(&mut channel, |b| {
+                    collected.push(b);
+                    Ok(())
+                })
+                .await
+                .unwrap();
+                if next < ranges.len() {
+                    BlockFetchClient::send_range_request(
+                        &mut channel,
+                        ranges[next].0.clone(),
+                        ranges[next].1.clone(),
+                    )
+                    .await
+                    .unwrap();
+                    next += 1;
+                }
+            }
+            collected
+        });
+
+        // Server: read the two primed requests.
+        for _ in 0..window {
+            let (_, _, req) = egress_rx.recv().await.unwrap();
+            assert!(matches!(
+                decode_message(&req).unwrap(),
+                BlockFetchMessage::MsgRequestRange { .. }
+            ));
+        }
+        // Respond to range 0 (one block 0xA0).
+        for m in [
+            BlockFetchMessage::MsgStartBatch,
+            BlockFetchMessage::MsgBlock(vec![0xA0]),
+            BlockFetchMessage::MsgBatchDone,
+        ] {
+            ingress_tx
+                .send(Bytes::from(encode_message(&m)))
+                .await
+                .unwrap();
+        }
+        // The client refills the window → third request.
+        let (_, _, req3) = egress_rx.recv().await.unwrap();
+        assert!(matches!(
+            decode_message(&req3).unwrap(),
+            BlockFetchMessage::MsgRequestRange { .. }
+        ));
+        // Respond to ranges 1 and 2 (blocks 0xB0, 0xC0) in order.
+        for blk in [0xB0u8, 0xC0u8] {
+            for m in [
+                BlockFetchMessage::MsgStartBatch,
+                BlockFetchMessage::MsgBlock(vec![blk]),
+                BlockFetchMessage::MsgBatchDone,
+            ] {
+                ingress_tx
+                    .send(Bytes::from(encode_message(&m)))
+                    .await
+                    .unwrap();
+            }
+        }
+
+        let collected = client.await.unwrap();
+        // Blocks arrive in range order despite the pipelined requests.
+        assert_eq!(collected, vec![vec![0xA0], vec![0xB0], vec![0xC0]]);
     }
 
     /// B4: A peer streaming MsgBlock beyond MAX_BLOCKS_PER_FETCH must be disconnected.
