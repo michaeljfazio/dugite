@@ -641,6 +641,11 @@ impl EraRules for ShelleyRules {
             prev_hash_nonce = %prev_hash_nonce.to_hex(),
             lab_nonce = %consensus.lab_nonce.to_hex(),
             epoch_nonce = %consensus.epoch_nonce.to_hex(),
+            old_d = %format!("{}/{}", old_d.numerator, old_d.denominator),
+            new_d = %format!(
+                "{}/{}",
+                epochs.protocol_params.d.numerator, epochs.protocol_params.d.denominator
+            ),
             "TICKN epoch nonce computed"
         );
 

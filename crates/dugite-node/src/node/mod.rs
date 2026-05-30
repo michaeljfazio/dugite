@@ -4407,21 +4407,29 @@ impl Node {
             .unwrap_or(0);
 
         // Overlay (BFT) schedule context — only when d > 0 and pre-Babbage.
+        //
+        // The overlay schedule depends on the decentralisation parameter `d`, and
+        // a block in epoch N+1 must be validated with epoch N+1's `d` (Haskell
+        // TICKF/UPEC forecast — the LedgerView's d comes from the TICKed
+        // curPParams after the pending protocol-param update is enacted at the
+        // boundary). The ledger tip is still in epoch N here (the epoch
+        // transition runs at apply time, after this header check), so we forecast
+        // the target epoch's `d` rather than using the un-ticked current value.
+        // Using the higher pre-decrease `d` mis-counts overlay slots and rejects
+        // the first valid Praos block of the new epoch.
+        let block_epoch = ls.epoch_of_slot(block.slot().0);
+        let forecast_d = ls.forecast_d_for_epoch(block_epoch);
         let overlay_ctx = if ls.epochs.protocol_params.protocol_version_major < 7
-            && ls.epochs.protocol_params.d.numerator > 0
+            && forecast_d.numerator > 0
             && !ls.genesis_delegates.is_empty()
         {
-            let epoch = ls.epoch_of_slot(block.slot().0);
-            let first_slot = ls.first_slot_of_epoch(epoch);
+            let first_slot = ls.first_slot_of_epoch(block_epoch);
             let genesis_keys: std::collections::BTreeSet<dugite_primitives::hash::Hash28> =
                 ls.genesis_delegates.keys().copied().collect();
             Some(dugite_consensus::overlay::OverlayContext {
                 genesis_delegates: ls.genesis_delegates.clone(),
                 genesis_keys,
-                d: (
-                    ls.epochs.protocol_params.d.numerator,
-                    ls.epochs.protocol_params.d.denominator,
-                ),
+                d: (forecast_d.numerator, forecast_d.denominator),
                 first_slot_of_epoch: first_slot,
             })
         } else {
