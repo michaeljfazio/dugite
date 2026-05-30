@@ -223,12 +223,33 @@ pub(super) fn check_datum_witnesses(
     //   (a) check that required hashes are covered (missing datum check), and
     //   (b) check that no supplied hash is outside `needed` (extra datum check).
     // ------------------------------------------------------------------
-    let supplied_hashes: HashSet<DatumHash> = tx
+    // Datum hashes MUST be computed over each witness datum's **original** CBOR
+    // bytes — Haskell memoises the raw bytes (`MemoBytes`/`Data`) and hashes
+    // those, never a re-encoding. On-chain datums are frequently encoded
+    // non-canonically (general `Constr` tag-102 form for small indices,
+    // definite-length field arrays, non-minimal integers, …) that re-encoding
+    // cannot reproduce, so a structural re-hash diverges from the on-chain
+    // datum hash. Prefer the preserved per-element raw spans; fall back to a
+    // canonical re-encode only for datums with no original bytes (e.g. ones the
+    // node constructs itself).
+    let supplied_hashes: HashSet<DatumHash> = match tx
         .witness_set
-        .plutus_data
-        .iter()
-        .map(hash_plutus_datum)
-        .collect();
+        .raw_plutus_data_cbor
+        .as_deref()
+        .and_then(dugite_serialization::plutus_data_element_spans)
+        .filter(|spans| spans.len() == tx.witness_set.plutus_data.len())
+    {
+        Some(spans) => spans
+            .iter()
+            .map(|raw| dugite_primitives::hash::blake2b_256(raw))
+            .collect(),
+        None => tx
+            .witness_set
+            .plutus_data
+            .iter()
+            .map(hash_plutus_datum)
+            .collect(),
+    };
 
     // ------------------------------------------------------------------
     // Step 3 — Missing datum check.
@@ -312,6 +333,62 @@ mod tests {
             .step_by(2)
             .map(|i| u8::from_str_radix(&s[i..i + 2], 16).unwrap())
             .collect()
+    }
+
+    /// The supplied-datum hash set must be built from each witness datum's
+    /// **original** CBOR bytes, not a structural re-encoding.
+    ///
+    /// Vector: mainnet datum `5ff23baed5…` (creation tx
+    /// `e253…`-class, Koios `datum_info`) encoded in the general `Constr` form
+    /// (CBOR tag 102, `d866`) with a definite 6-field array for constructor
+    /// index 0 — the canonical Plutus encoder emits tag 121 + indefinite array,
+    /// which hashes differently. We deliberately put a *mismatched*
+    /// `PlutusData::Integer(0)` in `plutus_data`: if the supplied-hash logic
+    /// ever regresses to re-encoding `plutus_data`, the hash becomes
+    /// `hash(I 0)` and the test fails with Missing+Extra. Hashing the preserved
+    /// raw span reproduces the on-chain hash → no error.
+    #[test]
+    fn test_supplied_datum_hashed_over_original_noncanonical_bytes() {
+        use num_bigint::BigInt;
+        let datum_bytes = hex_to_bytes(
+            "d866820086581ca3250750af6227b5a7dc689de94c83728a9d1d4029cc232d4a46f81e\
+             1a041cdb40581c023cec350597bdf2a2b6945e62e0111d9808caf7a9353a2ab91e8beb\
+             50534f434945545932354c4d4239323332581c63a3bc3807c6a51f85570ad9a82ed46b\
+             db96feeabae6c4aa0526d4ed181e",
+        );
+        // On-chain datum hash = blake2b256 of the original bytes.
+        let onchain_hash = dugite_primitives::hash::blake2b_256(&datum_bytes);
+        assert_eq!(
+            onchain_hash.to_hex(),
+            "5ff23baed51ec22e9342ace92e6dd9976be5ded109575f58a8a2419f064818d0"
+        );
+
+        let (utxo_set, input) = make_utxo(script_output_with_datum_hash(onchain_hash));
+
+        // array(1) wrapping the datum — as stored in `raw_plutus_data_cbor`.
+        let mut raw_array = vec![0x81u8];
+        raw_array.extend_from_slice(&datum_bytes);
+
+        // Structural plutus_data deliberately mismatches the raw bytes.
+        let mut tx = make_tx(
+            vec![input],
+            vec![],
+            vec![],
+            vec![PlutusData::Integer(BigInt::from(0))],
+        );
+        tx.witness_set.raw_plutus_data_cbor = Some(raw_array);
+
+        let mut errors: Vec<ValidationError> = vec![];
+        check_datum_witnesses(
+            &tx,
+            &utxo_set,
+            &std::collections::HashMap::new(),
+            &mut errors,
+        );
+        assert!(
+            errors.is_empty(),
+            "datum hash must be computed over the original (tag-102) bytes; got: {errors:?}"
+        );
     }
 
     // -----------------------------------------------------------------------
