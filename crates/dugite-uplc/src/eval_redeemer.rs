@@ -60,20 +60,22 @@ pub struct RedeemerEvalOutcome {
 /// Evaluate a single resolved redeemer against the supplied tx +
 /// resolved-UTxO context. Returns the CEK outcome on success.
 ///
-/// `_cost_models` is currently accepted but not yet applied — the
-/// CEK machine charges its default per-step cost from `machine::cost`.
-/// The per-builtin cost-model wiring lands in a follow-on PR; until
-/// then `consumed` is conservative-but-not-byte-exact. Cardano-node
-/// validates only that the declared budget is sufficient, so a
-/// conservative (smaller) consumption will still pass for the same
-/// scripts cardano-node accepts.
+/// `cost_models` carries the per-Plutus-version flat cost-model arrays the
+/// ledger lifted from the block's protocol parameters. When the array for
+/// `r.language` is present and a byte-exact applier exists for that version,
+/// the CEK machine is charged with the **on-chain** per-step + per-builtin
+/// cost model (see [`crate::cost_apply`]); otherwise it falls back to the
+/// latest reference model in `machine::cost` / `builtin::cost`. Matching the
+/// on-chain model byte-exact is what makes `consumed` agree with cardano-node
+/// — both for pass/fail classification and for the memory bound (the CEK
+/// machine's only allocation limiter is the `ExBudget` memory dimension).
 pub fn eval_resolved_redeemer(
     tx: &Transaction,
     resolved: &[(PrimTxIn, PrimTxOut, Vec<u8>)],
     r: &ResolvedRedeemer,
     slot_config: &SlotConfig,
     initial_budget: ExBudget,
-    _cost_models: Option<&CostModels>,
+    cost_models: Option<&CostModels>,
 ) -> Result<RedeemerEvalOutcome, PhaseTwoError> {
     // 1. Decode script bytes → typed Term.
     //
@@ -148,7 +150,10 @@ pub fn eval_resolved_redeemer(
     // so callers (dugite-ledger Phase-2 error path and the CLI EvalTx
     // response) can mirror that behaviour.
     let mut trace_log: Vec<String> = Vec::new();
-    let mut tracker = BudgetTracker::new(initial_budget);
+    let mut tracker = match resolve_applied_costs(cost_models, r.language) {
+        Some(applied) => BudgetTracker::with_applied(initial_budget, applied),
+        None => BudgetTracker::new(initial_budget),
+    };
     let value = evaluate_with_budget(applied_term, &mut tracker, Some(&mut trace_log)).map_err(
         |error| {
             // If any trace strings were emitted before the error, surface
@@ -214,6 +219,39 @@ pub fn eval_resolved_redeemer(
 /// will pass into the script.
 fn data_const_term(d: crate::data::Data) -> Term {
     Term::Const(Constant::Data(d))
+}
+
+/// Resolve the on-chain cost model for `language` into a fully-applied
+/// [`crate::cost_apply::AppliedCosts`]. Returns `None` (→ fall back to the
+/// latest reference model) when no array was supplied for that version, the
+/// array is malformed, or no byte-exact applier exists for that version yet
+/// (PlutusV2/V3 land in follow-ups). Mirrors how `mkEvaluationContext`
+/// consumes the ledger's flat `[Int64]` per language in the Haskell node.
+fn resolve_applied_costs(
+    cost_models: Option<&CostModels>,
+    language: ScriptLanguage,
+) -> Option<crate::cost_apply::AppliedCosts> {
+    let cm = cost_models?;
+    match language {
+        ScriptLanguage::PlutusV1 => {
+            let params = cm.plutus_v1.as_deref()?;
+            match crate::cost_apply::apply_v1(params) {
+                Ok(applied) => Some(applied),
+                Err(e) => {
+                    tracing::warn!(
+                        error = %e,
+                        "PlutusV1 cost model could not be applied; \
+                         falling back to reference model"
+                    );
+                    None
+                }
+            }
+        }
+        // PlutusV2/V3 byte-exact appliers land in follow-up commits; until
+        // then these fall back to the latest reference model (the prior
+        // behaviour). No V2/V3 scripts exist before the Babbage/Conway eras.
+        ScriptLanguage::PlutusV2 | ScriptLanguage::PlutusV3 => None,
+    }
 }
 
 /// Decode the script bytes the wire / reference-input provides. Plutus

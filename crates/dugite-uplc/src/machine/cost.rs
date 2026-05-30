@@ -18,6 +18,8 @@
 //! exhaustion checks remain cheap.
 
 pub use super::ExBudget;
+use crate::builtin::cost::BuiltinCosts;
+use crate::cost_apply::AppliedCosts;
 use crate::term::Term;
 use crate::UplcError;
 
@@ -119,6 +121,10 @@ pub struct BudgetTracker {
     pub remaining: ExBudget,
     pub starting: ExBudget,
     pub costs: MachineCosts,
+    /// Per-builtin cost model. Defaults to [`BuiltinCosts::DEFAULT`]; the
+    /// phase-2 evaluator installs the on-chain per-version model via
+    /// [`BudgetTracker::with_applied`].
+    pub builtin_costs: BuiltinCosts,
     /// Charges accumulated since the last flush against `remaining`.
     pending: ExBudget,
     /// Compute steps accumulated since the last flush — when this
@@ -150,6 +156,7 @@ impl BudgetTracker {
             remaining: initial,
             starting: initial,
             costs,
+            builtin_costs: BuiltinCosts::DEFAULT.clone(),
             pending: ExBudget { cpu: 0, mem: 0 },
             pending_count: 0,
             counting: false,
@@ -165,6 +172,17 @@ impl BudgetTracker {
         } else {
             let _ = t.remaining.try_subtract(t.costs.startup);
         }
+        t
+    }
+
+    /// Construct a tracker with a fully-resolved on-chain cost model
+    /// ([`AppliedCosts`] = per-step [`MachineCosts`] + per-builtin
+    /// [`BuiltinCosts`]), as the phase-2 evaluator does for a given Plutus
+    /// language version. The startup cost is charged immediately from the
+    /// supplied machine model.
+    pub fn with_applied(initial: ExBudget, applied: AppliedCosts) -> Self {
+        let mut t = Self::with_costs(initial, applied.machine);
+        t.builtin_costs = applied.builtins;
         t
     }
 
@@ -184,6 +202,7 @@ impl BudgetTracker {
                 mem: i64::MAX,
             },
             costs,
+            builtin_costs: BuiltinCosts::DEFAULT.clone(),
             pending: ExBudget { cpu: 0, mem: 0 },
             pending_count: 0,
             counting: true,
