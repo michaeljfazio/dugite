@@ -1353,6 +1353,42 @@ impl VolatileDB {
             .collect()
     }
 
+    /// Bounded variant of [`selected_chain_entries`] for the immutable flush:
+    /// returns at most `max` entries whose `block_no` is in
+    /// `[start_block_no, finalize_up_to]`, iterating from the oldest end and
+    /// stopping as soon as `max` are collected or `finalize_up_to` is passed.
+    ///
+    /// This keeps `ChainDB::flush_to_immutable_batch_retain` O(batch) per call
+    /// instead of O(volatile_len). Once the volatile window is large (e.g. a
+    /// catch-up backlog of hundreds of thousands of blocks at the denser
+    /// Alonzo+ eras), materialising the entire selected chain on every 50-block
+    /// batch is O(N^2) and stalls the run loop for minutes — which freezes the
+    /// ledger tip and, via the forecast horizon, disconnects every peer.
+    pub fn selected_chain_entries_bounded(
+        &self,
+        start_block_no: u64,
+        finalize_up_to: u64,
+        max: usize,
+    ) -> Vec<(Hash32, u64, u64, Hash32)> {
+        let mut out = Vec::with_capacity(max.min(self.selected_chain.len()));
+        for hash in &self.selected_chain {
+            let Some(blk) = self.blocks.get(hash) else {
+                continue;
+            };
+            if blk.block_no < start_block_no {
+                continue;
+            }
+            if blk.block_no > finalize_up_to {
+                break;
+            }
+            out.push((*hash, blk.slot, blk.block_no, blk.prev_hash));
+            if out.len() >= max {
+                break;
+            }
+        }
+        out
+    }
+
     /// Get blocks in slot range [from, to] inclusive.
     pub fn get_blocks_in_slot_range(&self, from_slot: u64, to_slot: u64) -> Vec<(Hash32, &[u8])> {
         let mut result = Vec::new();
