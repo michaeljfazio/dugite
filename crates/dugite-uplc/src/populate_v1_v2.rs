@@ -59,7 +59,10 @@ pub fn populate_tx_info_v1(
     let signatories = required_signers_to_plutus_padded(&tx.body.required_signers);
     let dcert: Vec<TxCert> = certificates_to_plutus(&tx.body.certificates)?;
     let wdrl = withdrawals_to_plutus(&tx.body.withdrawals)?;
-    let data = datums_to_plutus(&tx.witness_set.plutus_data)?;
+    let data = datums_to_plutus(
+        &tx.witness_set.plutus_data,
+        tx.witness_set.raw_plutus_data_cbor.as_deref(),
+    )?;
     Ok(TxInfoV1 {
         inputs,
         outputs,
@@ -106,7 +109,10 @@ pub fn populate_tx_info_v2(
     let signatories = required_signers_to_plutus_padded(&tx.body.required_signers);
     let dcert: Vec<TxCert> = certificates_to_plutus(&tx.body.certificates)?;
     let wdrl = withdrawals_to_plutus(&tx.body.withdrawals)?;
-    let data = datums_to_plutus(&tx.witness_set.plutus_data)?;
+    let data = datums_to_plutus(
+        &tx.witness_set.plutus_data,
+        tx.witness_set.raw_plutus_data_cbor.as_deref(),
+    )?;
     Ok(TxInfoV2 {
         inputs,
         reference_inputs,

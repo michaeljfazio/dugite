@@ -481,7 +481,19 @@ fn datum_hash(data: &Data) -> Result<[u8; 32], PhaseTwoError> {
 
 /// Extract the witness-set's `plutus_data` list into the
 /// `Vec<([u8; 32], Data)>` shape TxInfoV3/V2 expose. Each entry is
-/// `(blake2b_256(canonical_cbor(d)), d)`.
+/// `(datum_hash(d), d)`.
+///
+/// Datum hashes **must** be computed over each witness datum's *original*
+/// CBOR bytes, never a re-encoding. Haskell memoises the raw bytes
+/// (`MemoBytes`/`Data`) and hashes those. On-chain datums are frequently
+/// non-canonical (general `Constr` tag-102 form for small indices,
+/// definite-length field arrays, non-minimal integers, …) that a structural
+/// re-encode cannot reproduce — so a re-hash diverges from the on-chain datum
+/// hash, and any script that does `findDatum`/`findDatumHash` over `txInfoData`
+/// silently fails to resolve the entry (an `error` with no trace). We therefore
+/// hash the preserved per-element raw spans, mirroring the Phase-1 datum-witness
+/// check in `dugite-ledger`; we fall back to a canonical re-encode only when no
+/// original bytes are available (e.g. datums the node constructs itself).
 ///
 /// Per CLAUDE.md / `lib.rs` §1, this never panics on malformed Data —
 /// the upstream CBOR decoder produced typed `PlutusData` values, so
@@ -489,11 +501,18 @@ fn datum_hash(data: &Data) -> Result<[u8; 32], PhaseTwoError> {
 /// itself, which we surface as `PhaseTwoError::Internal`.
 pub fn datums_to_plutus(
     plutus_data: &[PrimPlutusData],
+    raw_plutus_data_cbor: Option<&[u8]>,
 ) -> Result<Vec<([u8; 32], Data)>, PhaseTwoError> {
+    let spans = raw_plutus_data_cbor
+        .and_then(dugite_serialization::plutus_data_element_spans)
+        .filter(|spans| spans.len() == plutus_data.len());
     let mut out: Vec<([u8; 32], Data)> = Vec::with_capacity(plutus_data.len());
-    for d in plutus_data {
+    for (i, d) in plutus_data.iter().enumerate() {
         let translated = plutus_data_to_data(d);
-        let h = datum_hash(&translated)?;
+        let h = match &spans {
+            Some(spans) => dugite_primitives::hash::blake2b_256(&spans[i]).0,
+            None => datum_hash(&translated)?,
+        };
         out.push((h, translated));
     }
     Ok(out)
@@ -528,8 +547,55 @@ mod tests {
     use dugite_primitives::credentials::Pointer as PrimPointer;
     use dugite_primitives::hash::Hash;
     use dugite_primitives::network::NetworkId;
-    use dugite_primitives::transaction::{TransactionInput, Withdrawal};
+    use dugite_primitives::transaction::{PlutusData as PrimPD, TransactionInput, Withdrawal};
     use dugite_primitives::value::{AssetName, Lovelace};
+
+    /// `txInfoData` keys MUST be computed over each witness datum's *original*
+    /// CBOR bytes, never a re-encoding — otherwise a script that resolves a
+    /// datum by hash (`findDatum`) over `txInfoData` silently fails (an `error`
+    /// term with no trace). On-chain datums are routinely encoded in the
+    /// general `Constr` tag-102 form for small constructor indices, which a
+    /// canonical re-encode (compact tag-121+) cannot reproduce.
+    ///
+    /// Regression for the mainnet Alonzo no-trace "script returned Error term"
+    /// divergence: `Constr 1 []` stored as tag-102 (`d8 66 82 01 80`) must hash
+    /// to `blake2b256(d8668201_80)`, NOT `blake2b256(d87a80)` (the compact form).
+    #[test]
+    fn txinfo_data_hashed_over_original_tag102_bytes_not_reencode() {
+        use dugite_primitives::hash::blake2b_256;
+        // Witness plutus_data array = array(1) of one tag-102 `Constr 1 []`.
+        let tag102: [u8; 5] = [0xd8, 0x66, 0x82, 0x01, 0x80];
+        let mut raw = vec![0x81u8]; // array(1)
+        raw.extend_from_slice(&tag102);
+
+        // Typed value the decoder produces from the tag-102 form.
+        let datum = PrimPD::Constr(1, vec![]);
+
+        let out = datums_to_plutus(std::slice::from_ref(&datum), Some(&raw)).unwrap();
+        assert_eq!(out.len(), 1);
+
+        let original_hash = blake2b_256(&tag102).0;
+        let reencode_hash = blake2b_256(&[0xd8, 0x7a, 0x80]).0; // compact Constr 1 []
+        assert_ne!(
+            original_hash, reencode_hash,
+            "test premise: the two encodings must hash differently"
+        );
+        assert_eq!(
+            out[0].0, original_hash,
+            "txInfoData must key on the original tag-102 bytes"
+        );
+        assert_ne!(
+            out[0].0, reencode_hash,
+            "txInfoData must NOT re-encode the datum before hashing"
+        );
+
+        // With no original bytes available, fall back to the canonical re-encode.
+        let fb = datums_to_plutus(std::slice::from_ref(&datum), None).unwrap();
+        assert_eq!(
+            fb[0].0, reencode_hash,
+            "fallback path hashes the canonical re-encode"
+        );
+    }
 
     /// Encode a reward address as the 29-byte blob `Withdrawal.reward_account`
     /// expects: `header_byte | hash28`. Header bit 4 = is-script, bits 0-3 =
