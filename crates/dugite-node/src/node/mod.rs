@@ -422,6 +422,11 @@ pub struct Node {
     /// Byron epoch length in absolute slots (10 * k). For correct slot
     /// computation on non-mainnet networks.
     pub(crate) byron_epoch_length: u64,
+    /// Byron slot duration in milliseconds (20000 on mainnet/preprod, 1000 on
+    /// testnets that use 1-second Byron slots). Stored so that the Plutus
+    /// SlotConfig can be anchored at the Shelley hard-fork boundary in
+    /// `slot_config()` calls that happen after `new()` (e.g. in `run()`).
+    pub(crate) byron_slot_duration_ms: u64,
     pub(crate) shelley_genesis: Option<ShelleyGenesis>,
     /// HFC era history state machine — tracks era boundaries with slot/epoch/time
     /// arithmetic. Initialized from genesis configs and extended during sync as
@@ -877,6 +882,7 @@ impl Node {
                     shelley_genesis_hash,
                     network_magic,
                     byron_epoch_length,
+                    byron_slot_duration_ms,
                 ) {
                     Ok(()) => {
                         info!("Haskell ledger import complete; native snapshot saved");
@@ -902,9 +908,14 @@ impl Node {
             match LedgerState::load_snapshot(&snapshot_path) {
                 Ok(mut state) => {
                     // Re-apply genesis config in case it changed
+                    let ste = epoch::shelley_transition_epoch_for_magic(network_magic);
                     if let Some(ref genesis) = shelley_genesis {
                         state.set_epoch_length(genesis.epoch_length, genesis.security_param);
-                        state.set_slot_config(genesis.slot_config());
+                        state.set_slot_config(genesis.slot_config(
+                            ste,
+                            byron_epoch_length,
+                            byron_slot_duration_ms,
+                        ));
                         state.set_update_quorum(genesis.update_quorum);
                         let gen_deleg_entries = genesis.gen_delegs_entries();
                         if !gen_deleg_entries.is_empty() {
@@ -915,7 +926,6 @@ impl Node {
                             state.set_genesis_delegates(&gen_deleg_entries);
                         }
                     }
-                    let ste = epoch::shelley_transition_epoch_for_magic(network_magic);
                     state.set_shelley_transition(ste, byron_epoch_length);
                     if let Some(hash) = shelley_genesis_hash {
                         state.genesis_hash = hash;
@@ -1052,12 +1062,19 @@ impl Node {
                                                 // applied to the primary snapshot above, so the
                                                 // recovered state has correct epoch_length, slot
                                                 // config, shelley transition, and genesis_hash.
+                                                let ste = epoch::shelley_transition_epoch_for_magic(
+                                                    network_magic,
+                                                );
                                                 if let Some(ref genesis) = shelley_genesis {
                                                     alt.set_epoch_length(
                                                         genesis.epoch_length,
                                                         genesis.security_param,
                                                     );
-                                                    alt.set_slot_config(genesis.slot_config());
+                                                    alt.set_slot_config(genesis.slot_config(
+                                                        ste,
+                                                        byron_epoch_length,
+                                                        byron_slot_duration_ms,
+                                                    ));
                                                     alt.set_update_quorum(genesis.update_quorum);
                                                     let gen_deleg_entries =
                                                         genesis.gen_delegs_entries();
@@ -1067,9 +1084,6 @@ impl Node {
                                                         );
                                                     }
                                                 }
-                                                let ste = epoch::shelley_transition_epoch_for_magic(
-                                                    network_magic,
-                                                );
                                                 alt.set_shelley_transition(ste, byron_epoch_length);
                                                 if let Some(hash) = shelley_genesis_hash {
                                                     alt.genesis_hash = hash;
@@ -1144,6 +1158,7 @@ impl Node {
                                 &byron_genesis_utxos,
                                 network_magic,
                                 byron_epoch_length,
+                                byron_slot_duration_ms,
                             )
                         }
                     } // end canonicality check
@@ -1157,6 +1172,7 @@ impl Node {
                         &byron_genesis_utxos,
                         network_magic,
                         byron_epoch_length,
+                        byron_slot_duration_ms,
                     )
                 }
             }
@@ -1170,6 +1186,7 @@ impl Node {
                 &byron_genesis_utxos,
                 network_magic,
                 byron_epoch_length,
+                byron_slot_duration_ms,
             )
         };
         // Apply Conway genesis committee threshold and members if not already set
@@ -1895,6 +1912,7 @@ impl Node {
             listen_addr,
             network_magic,
             byron_epoch_length,
+            byron_slot_duration_ms,
             snapshot_policy: epoch::SnapshotPolicy::with_params(
                 shelley_genesis
                     .as_ref()
@@ -2258,7 +2276,10 @@ impl Node {
         let n2c_slot_config = self
             .shelley_genesis
             .as_ref()
-            .map(|g| g.slot_config())
+            .map(|g| {
+                let ste = epoch::shelley_transition_epoch_for_magic(self.network_magic);
+                g.slot_config(ste, self.byron_epoch_length, self.byron_slot_duration_ms)
+            })
             .unwrap_or(dugite_ledger::plutus::SlotConfig {
                 zero_time: 0,
                 zero_slot: 0,
@@ -3515,7 +3536,10 @@ impl Node {
         let n2n_slot_config = self
             .shelley_genesis
             .as_ref()
-            .map(|g| g.slot_config())
+            .map(|g| {
+                let ste = epoch::shelley_transition_epoch_for_magic(self.network_magic);
+                g.slot_config(ste, self.byron_epoch_length, self.byron_slot_duration_ms)
+            })
             .unwrap_or(dugite_ledger::plutus::SlotConfig {
                 zero_time: 0,
                 zero_slot: 0,
@@ -6096,6 +6120,7 @@ impl Node {
     /// The UTxO set from the tvar file is loaded into an in-memory `UtxoSet` inside
     /// the `LedgerState`. The normal startup code will migrate these entries to the
     /// on-disk LSM store when it calls `attach_utxo_store()`.
+    #[allow(clippy::too_many_arguments)]
     fn import_haskell_ledger_snapshot(
         snapshot_dir: &std::path::Path,
         native_snapshot_path: &std::path::Path,
@@ -6104,6 +6129,7 @@ impl Node {
         shelley_genesis_hash: Option<dugite_primitives::Hash32>,
         network_magic: u64,
         byron_epoch_length: u64,
+        byron_slot_duration_ms: u64,
     ) -> anyhow::Result<()> {
         use anyhow::Context;
         use dugite_primitives::address::Address;
@@ -6137,9 +6163,14 @@ impl Node {
         let mut state = LedgerState::from_haskell_snapshot(&hs);
 
         // Apply genesis-derived configuration (epoch length, slot config, etc.)
+        let shelley_transition = epoch::shelley_transition_epoch_for_magic(network_magic);
         if let Some(genesis) = shelley_genesis {
             state.set_epoch_length(genesis.epoch_length, genesis.security_param);
-            state.set_slot_config(genesis.slot_config());
+            state.set_slot_config(genesis.slot_config(
+                shelley_transition,
+                byron_epoch_length,
+                byron_slot_duration_ms,
+            ));
             state.set_update_quorum(genesis.update_quorum);
             let gen_deleg_entries = genesis.gen_delegs_entries();
             if !gen_deleg_entries.is_empty() {
@@ -6152,7 +6183,6 @@ impl Node {
         }
 
         // Apply hard-fork boundary and genesis hash
-        let shelley_transition = epoch::shelley_transition_epoch_for_magic(network_magic);
         state.set_shelley_transition(shelley_transition, byron_epoch_length);
         if let Some(hash) = shelley_genesis_hash {
             // Unlike set_genesis_hash() on a fresh state, we do NOT overwrite the
@@ -6295,14 +6325,20 @@ impl Node {
         byron_genesis_utxos: &[(Vec<u8>, u64)],
         network_magic: u64,
         byron_epoch_length: u64,
+        byron_slot_duration_ms: u64,
     ) -> LedgerState {
         let mut ledger = LedgerState::new(protocol_params.clone());
+        let shelley_transition_epoch = epoch::shelley_transition_epoch_for_magic(network_magic);
         if let Some(genesis) = shelley_genesis {
             // Must run BEFORE seed_genesis_utxos so reserves init from the
             // genesis cap (devnets use 60B, mainnet/preview/preprod 45B).
             ledger.set_max_lovelace_supply(genesis.max_lovelace_supply);
             ledger.set_epoch_length(genesis.epoch_length, genesis.security_param);
-            ledger.set_slot_config(genesis.slot_config());
+            ledger.set_slot_config(genesis.slot_config(
+                shelley_transition_epoch,
+                byron_epoch_length,
+                byron_slot_duration_ms,
+            ));
             ledger.set_update_quorum(genesis.update_quorum);
             let gen_deleg_entries = genesis.gen_delegs_entries();
             if !gen_deleg_entries.is_empty() {
@@ -6314,7 +6350,6 @@ impl Node {
             }
         }
         // Set Byron→Shelley transition boundary for correct HFC epoch numbering
-        let shelley_transition_epoch = epoch::shelley_transition_epoch_for_magic(network_magic);
         ledger.set_shelley_transition(shelley_transition_epoch, byron_epoch_length);
         if let Some(hash) = shelley_genesis_hash {
             ledger.set_genesis_hash(hash);
