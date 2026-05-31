@@ -32,7 +32,9 @@ use crate::state::LedgerError;
 use dugite_primitives::credentials::{Credential, Pointer};
 use dugite_primitives::hash::{blake2b_224, blake2b_256, Hash32};
 use dugite_primitives::time::EpochNo;
-use dugite_primitives::transaction::{Certificate, Transaction, TransactionInput};
+use dugite_primitives::transaction::{
+    Certificate, MIRSource, MIRTarget, Transaction, TransactionInput,
+};
 use dugite_primitives::value::Lovelace;
 use tracing::debug;
 
@@ -530,6 +532,65 @@ pub(crate) fn apply_shelley_cert(
             certs
                 .pending_retirements
                 .insert(*pool_hash, EpochNo(*epoch));
+        }
+        Certificate::MoveInstantaneousRewards { source, target } => {
+            // Per Haskell `Cardano.Ledger.Shelley.Rules.Deleg.hs` (`applyMIRCert`):
+            // MIR certs do NOT immediately debit pots or credit reward accounts.
+            // They accumulate into `InstantaneousRewards` (`dsIRewards`) during
+            // the epoch, and the actual transfer happens at the next epoch boundary
+            // via the MIR sub-rule of NEWEPOCH (called `apply_pending_mir` here).
+            //
+            // MIR is an `AtMostEra "Babbage"` construct (removed in Conway, PV >= 9).
+            // Guard here mirrors Haskell's era constraint — no-op in Conway+.
+            if epochs.protocol_params.protocol_version_major >= 9 {
+                return;
+            }
+            match target {
+                MIRTarget::StakeCredentials(creds) => {
+                    let pending = match source {
+                        MIRSource::Reserves => &mut certs.pending_mir_reserves,
+                        MIRSource::Treasury => &mut certs.pending_mir_treasury,
+                    };
+                    let mut total: i128 = 0;
+                    for (cred, amount) in creds {
+                        let key = credential_to_hash(cred);
+                        *pending.entry(key).or_insert(0i128) += *amount as i128;
+                        total += *amount as i128;
+                        debug!(
+                            "MIR: queuing {} lovelace from {:?} to {}",
+                            amount,
+                            source,
+                            key.to_hex()
+                        );
+                    }
+                    debug!(
+                        "MIR: total {} lovelace queued from {:?} to {} credentials",
+                        total,
+                        source,
+                        creds.len()
+                    );
+                }
+                MIRTarget::OtherAccountingPot(coin) => {
+                    // Pot-to-pot transfer accumulator.
+                    // Per Haskell `dsIRewards.deltaReserves` / `deltaTreasury`.
+                    match source {
+                        MIRSource::Reserves => {
+                            certs.pending_mir_delta_reserves += *coin as i128;
+                            debug!(
+                                "MIR: queuing pot-transfer {} lovelace reserves -> treasury",
+                                coin
+                            );
+                        }
+                        MIRSource::Treasury => {
+                            certs.pending_mir_delta_treasury += *coin as i128;
+                            debug!(
+                                "MIR: queuing pot-transfer {} lovelace treasury -> reserves",
+                                coin
+                            );
+                        }
+                    }
+                }
+            }
         }
         // Skip non-Shelley certificates -- they are handled by era-specific code.
         _ => {}

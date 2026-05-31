@@ -56,20 +56,25 @@ pub(crate) fn apply_pending_mir(
         }
         let mut net_pot_debit: i128 = 0;
         for (cred, delta) in pending {
-            let entry = Arc::make_mut(&mut certs.reward_accounts)
-                .entry(cred)
-                .or_insert(Lovelace(0));
-            let new_balance = entry.0 as i128 + delta;
-            if new_balance < 0 {
-                panic!(
-                    "MIR: credential {} underflows reward balance ({} + {} < 0) — invariant broken",
-                    cred.to_hex(),
-                    entry.0,
-                    delta,
-                );
+            // Haskell MIR rule: `irwdR = iRReserves `Map.intersection` accountsMap`
+            // Only credit registered accounts. Payments to deregistered credentials
+            // are silently dropped — the coin vanishes (NOT returned to the pot).
+            // See `Cardano.Ledger.Shelley.Rules.Mir.applyMIR` and shelley-certs.md §6.
+            let reward_accounts = Arc::make_mut(&mut certs.reward_accounts);
+            if let Some(entry) = reward_accounts.get_mut(&cred) {
+                let new_balance = entry.0 as i128 + delta;
+                if new_balance < 0 {
+                    panic!(
+                        "MIR: credential {} underflows reward balance ({} + {} < 0) — invariant broken",
+                        cred.to_hex(),
+                        entry.0,
+                        delta,
+                    );
+                }
+                entry.0 = new_balance as u64;
+                net_pot_debit += delta;
             }
-            entry.0 = new_balance as u64;
-            net_pot_debit += delta;
+            // Unregistered credential: coin silently vanishes per Haskell Map.intersection.
         }
         match src {
             "reserves" => {
