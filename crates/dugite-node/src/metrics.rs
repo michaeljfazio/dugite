@@ -933,6 +933,9 @@ impl NodeMetrics {
     }
 
     /// Record a per-block fetch latency observation.
+    ///
+    /// Used by the per-peer `blockfetch_worker` task and test harnesses.
+    #[allow(dead_code)]
     pub fn record_block_fetch_latency(&self, ms_per_block: f64) {
         self.peer_block_fetch_ms.observe(ms_per_block);
     }

@@ -35,7 +35,7 @@ use tokio::sync::{mpsc, watch, RwLock, Semaphore};
 use tokio::task::JoinHandle;
 use tracing::{debug, error, info, trace, warn};
 
-use crate::node::block_fetch_logic::BlockFetchLogicTask;
+use crate::node::block_fetch_logic::{BfPeerCmd, BlockFetchLogicTask};
 use crate::node::connection_lifecycle::{
     CandidateChainState, ConnectResult, ConnectionLifecycleManager, FetchedBlock, LifecycleError,
 };
@@ -3656,7 +3656,15 @@ impl Node {
         // Independent task matching Haskell's `blockFetchLogic` thread.
         // Reads candidate chain state from ChainSync tasks, dispatches
         // fetch ranges to per-peer BlockFetch workers.
+        //
+        // The `BfPeerCmd` channel connects the lifecycle manager (which
+        // promotes/demotes peers) to the decision task (which manages the
+        // per-peer fetch-range sender map).  Every hot-peer promotion sends
+        // `Register(addr, fetch_tx)` and every demote/disconnect sends
+        // `Deregister(addr)`.  Cap at 64 commands: with at most ~50 hot peers
+        // and rare churn, the channel is almost always near-empty.
         {
+            let (bf_peer_cmd_tx, bf_peer_cmd_rx) = tokio::sync::mpsc::channel::<BfPeerCmd>(64);
             let bf_cancel = tokio_util::sync::CancellationToken::new();
             let mut bf_task = BlockFetchLogicTask::new_with_peer_manager(
                 candidate_chains.clone(),
@@ -3666,6 +3674,14 @@ impl Node {
                 Some(self.chain_db.clone()),
                 Some(self.peer_manager.clone()),
             );
+            bf_task.set_peer_cmd_rx(bf_peer_cmd_rx);
+
+            // Wire the command sender into the lifecycle manager so it can
+            // register/deregister peers as they transition hot state.
+            if let Some(lc) = self.connection_lifecycle.as_mut() {
+                lc.set_bf_peer_cmd_tx(bf_peer_cmd_tx);
+            }
+
             let bf_shutdown = shutdown_rx.clone();
             let bf_handle = tokio::spawn(async move {
                 // Shut down the decision task when the node shuts down.

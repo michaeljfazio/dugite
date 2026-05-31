@@ -1,5 +1,8 @@
 # Tech Lead Agent Memory
 
+## Networking
+- [Multi-peer BlockFetch wiring 2026-06-01](multi-peer-blockfetch-wiring.md) — BfPeerCmd channel, per-peer-advertiser dispatch invariant, stale-in-flight benign residual; devnet: 100% tip-parity 25min soak
+
 ## Era Rules
 - [Dijkstra era rules dispatch (#462)](issue-462-dijkstra-era-rules.md) — Conway alias removed; DijkstraRules delegates to Conway plus identity translateEraDijkstra
 

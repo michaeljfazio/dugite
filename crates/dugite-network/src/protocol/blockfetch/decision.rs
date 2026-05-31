@@ -72,6 +72,23 @@ pub struct FetchRange {
     pub to: Point,
 }
 
+impl FetchRange {
+    /// Inclusive `(from_slot, to_slot)` slot bounds of this range.
+    ///
+    /// [`Point::Origin`] maps to slot 0 on both ends.
+    pub fn slot_bounds(&self) -> (u64, u64) {
+        let from = match &self.from {
+            Point::Origin => 0,
+            Point::Specific(s, _) => *s,
+        };
+        let to = match &self.to {
+            Point::Origin => 0,
+            Point::Specific(s, _) => *s,
+        };
+        (from, to)
+    }
+}
+
 // ─── BlockFetchDecision ──────────────────────────────────────────────────────
 
 /// Block fetch decision engine.

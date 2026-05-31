@@ -38,10 +38,13 @@
 //! that translates `GovernorAction` decisions into `PeerConnection` lifecycle calls.
 
 use std::collections::HashMap;
-use std::hash::{Hash, Hasher};
+use std::hash::Hash;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
+
+use super::block_fetch_logic::BfPeerCmd;
+use dugite_network::protocol::blockfetch::decision::FetchRange;
 
 /// Per-range fetch deadline: maximum time a single `BlockFetchClient::fetch_range()`
 /// call is allowed to run before being cancelled.
@@ -569,17 +572,6 @@ pub struct ConnectionLifecycleManager {
     /// Default: 0.05 (mainnet/preview).
     active_slots_coeff: f64,
 
-    /// Active BlockFetch peer flag.
-    ///
-    /// During bulk sync (matching Haskell's `bfcMaxConcurrencyBulkSync = 1`),
-    /// only ONE BlockFetch worker is active at a time. This atomic stores the
-    /// port number of the active peer (0 = none active). Workers compete for
-    /// this flag — the first to claim it becomes the sole fetcher.
-    active_fetcher: Arc<std::sync::atomic::AtomicU64>,
-    /// Highest slot that has been fetched or is being fetched.
-    /// Used to skip duplicate fetches from other peers.
-    max_fetched_slot: Arc<std::sync::atomic::AtomicU64>,
-
     /// Resolved per-fetch maximum range size (block count), clamped to
     /// `[BLOCKFETCH_MIN_RANGE, BLOCKFETCH_MAX_RANGE]`.  Set once at construction
     /// from `DUGITE_BLOCKFETCH_MAX_RANGE` / the `blockfetch_max_range` config
@@ -663,6 +655,19 @@ pub struct ConnectionLifecycleManager {
     /// a request and decrements it on completion; the governor checks before
     /// dispatching new requests so at most 2 peers are being asked simultaneously.
     peersharing_in_flight: Arc<std::sync::atomic::AtomicU32>,
+
+    /// Sender end of the `BfPeerCmd` channel that wires peer hot/cold
+    /// transitions to the `BlockFetchLogicTask`.
+    ///
+    /// When a peer is promoted to hot, `make_blockfetch_task` spawns the
+    /// `blockfetch_worker` and sends `BfPeerCmd::Register` here so the decision
+    /// task includes this peer in future fetch decisions.  On demote/disconnect,
+    /// `BfPeerCmd::Deregister` is sent so the decision task releases the peer's
+    /// in-flight blocks for re-fetch by another peer.
+    ///
+    /// `None` until `set_bf_peer_cmd_tx()` is called from `Node::run()` after
+    /// the `BlockFetchLogicTask` is spawned.
+    bf_peer_cmd_tx: Option<mpsc::Sender<BfPeerCmd>>,
 }
 
 /// Errors from lifecycle management operations.
@@ -768,8 +773,6 @@ impl ConnectionLifecycleManager {
             byron_epoch_length,
             security_param,
             active_slots_coeff,
-            active_fetcher: Arc::new(std::sync::atomic::AtomicU64::new(0)),
-            max_fetched_slot: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             blockfetch_max_range,
             metrics,
             mempool,
@@ -784,6 +787,7 @@ impl ConnectionLifecycleManager {
             tx_validator,
             peersharing_request_txs: HashMap::new(),
             peersharing_in_flight: Arc::new(std::sync::atomic::AtomicU32::new(0)),
+            bf_peer_cmd_tx: None,
         }
     }
 
@@ -791,6 +795,29 @@ impl ConnectionLifecycleManager {
     /// duplex-paired source-port binding. Call once after construction.
     pub fn set_local_listen_addr(&mut self, addr: SocketAddr) {
         self.local_listen_addr = Some(addr);
+    }
+
+    /// Wire the `BfPeerCmd` sender from the `BlockFetchLogicTask`.
+    ///
+    /// Called from `Node::run()` after the decision task is spawned so that
+    /// `make_blockfetch_task` can register/deregister peers with the decision
+    /// task when peers transition through hot state.
+    pub fn set_bf_peer_cmd_tx(&mut self, tx: mpsc::Sender<BfPeerCmd>) {
+        self.bf_peer_cmd_tx = Some(tx);
+    }
+
+    /// Send a `BfPeerCmd` to the decision task (fire-and-forget).
+    ///
+    /// Uses `try_send` because the command channel is amply buffered (64 slots)
+    /// and blocking the lifecycle manager on a full channel would stall the
+    /// governor loop.  A failed send is logged as a warning — it means the
+    /// decision task has already shut down (node teardown race).
+    fn send_bf_cmd(&self, cmd: BfPeerCmd) {
+        if let Some(tx) = self.bf_peer_cmd_tx.as_ref() {
+            if tx.try_send(cmd).is_err() {
+                debug!("bf_peer_cmd channel closed or full; decision task may have shut down");
+            }
+        }
     }
 
     // ─── Temperature Transitions ────────────────────────────────────────────
@@ -1108,6 +1135,9 @@ impl ConnectionLifecycleManager {
                 let mut chains = self.candidate_chains.write().await;
                 chains.remove(&addr);
             }
+            // Deregister from the multi-peer BlockFetch decision task so it
+            // releases in-flight blocks assigned to this peer for re-fetch.
+            self.send_bf_cmd(BfPeerCmd::Deregister(addr));
 
             // Update peer manager: hot → warm (connection stays alive).
             peer_manager.inner.demote_to_warm(&addr);
@@ -1137,6 +1167,8 @@ impl ConnectionLifecycleManager {
                 let mut chains = self.candidate_chains.write().await;
                 chains.remove(&addr);
             }
+            // Deregister from the multi-peer BlockFetch decision task.
+            self.send_bf_cmd(BfPeerCmd::Deregister(addr));
 
             peer_manager.peer_disconnected(&addr);
 
@@ -1190,6 +1222,9 @@ impl ConnectionLifecycleManager {
             let mut chains = self.candidate_chains.write().await;
             chains.remove(&addr);
         }
+
+        // Deregister from the multi-peer BlockFetch decision task.
+        self.send_bf_cmd(BfPeerCmd::Deregister(addr));
 
         // Remove the PeerSharing client request channel — dropping it signals
         // the client task to exit its loop cleanly (recv returns None).
@@ -1321,6 +1356,9 @@ impl ConnectionLifecycleManager {
                     let mut chains = self.candidate_chains.write().await;
                     chains.remove(&addr);
                 }
+                // Deregister from the multi-peer BlockFetch decision task so it
+                // releases any in-flight blocks assigned to this dead peer.
+                self.send_bf_cmd(BfPeerCmd::Deregister(addr));
                 // Remove the PeerSharing client channel so the client task exits.
                 self.peersharing_request_txs.remove(&addr);
                 peer_manager.peer_disconnected(&addr);
@@ -1687,622 +1725,48 @@ impl ConnectionLifecycleManager {
 
     /// Create the BlockFetch protocol task closure for a specific peer.
     ///
-    /// The BlockFetch client receives fetch requests from the BlockFetch
-    /// decision task and downloads full blocks from the peer. Downloaded
-    /// blocks are sent to the main run loop via `fetched_blocks_tx`.
+    /// Each hot peer gets its own `blockfetch_worker` which receives fetch-range
+    /// requests from the `BlockFetchLogicTask` via a dedicated mpsc channel.
+    /// The decision task (spawned independently in `Node::run()`) distributes
+    /// ranges across all registered hot peers in parallel, eliminating the
+    /// single-fetcher bottleneck.
     ///
-    /// Real implementation will be provided by Task 3.
+    /// # Wiring
+    ///
+    /// 1. We create a per-peer `(fetch_tx, fetch_rx)` channel pair.
+    /// 2. We send `BfPeerCmd::Register(addr, fetch_tx)` to the decision task so
+    ///    it can dispatch ranges to this peer.
+    /// 3. The `ProtocolTaskFn` closure runs `blockfetch_worker(channel, fetch_rx, …)`
+    ///    until the channel is closed (on deregister) or cancelled.
+    ///
+    /// On deregister (demote to warm/cold, or dead-connection cleanup), the caller
+    /// must send `BfPeerCmd::Deregister(addr)` to the decision task — this is done
+    /// in `demote_to_warm`, `demote_to_cold`, and `cleanup_dead_connections`.
     fn make_blockfetch_task(&self, addr: SocketAddr) -> ProtocolTaskFn {
         let fetched_blocks_tx = self.fetched_blocks_tx.clone();
-        let candidate_chains = self.candidate_chains.clone();
-        let chain_db = self.chain_db.clone();
         let bel = self.byron_epoch_length;
-        // Shared flag: only ONE BlockFetch worker is active at a time.
-        // Matches Haskell's bfcMaxConcurrencyBulkSync = 1.
-        let active_fetcher = self.active_fetcher.clone();
-        let _max_fetched_slot = self.max_fetched_slot.clone();
-        let metrics_clone = self.metrics.clone();
-        let peer_failure_tx = self.peer_failure_tx.clone();
-        // Operator-tunable upper clamp on the adaptive fetch-range size.
-        let max_range = self.blockfetch_max_range;
 
-        Box::new(move |mut channel, cancel| {
+        // Per-peer channel: the decision task sends Vec<FetchRange> here; the
+        // worker drains them and downloads blocks.  Cap at 16 — a deep buffer
+        // would queue large fetch backlogs from a fast decision loop against a
+        // slow peer, wasting latency.  try_send in the decision task handles
+        // full channels by re-dispatching to another peer on the next tick.
+        let (fetch_tx, fetch_rx) = tokio::sync::mpsc::channel::<Vec<FetchRange>>(16);
+
+        // Register this peer with the decision task so it can dispatch ranges
+        // to this worker immediately.  Fire-and-forget: if the decision task
+        // is not yet up (startup race) the channel has capacity and the
+        // Register will be drained on the first tick.
+        self.send_bf_cmd(BfPeerCmd::Register(addr, fetch_tx));
+
+        Box::new(move |channel, cancel| {
             Box::pin(async move {
-                // RAII release for the single-fetcher slot.  The post-batch
-                // release (and the empty/no-headers releases) clear
-                // `active_fetcher` on the normal code paths, and the
-                // `cancel.cancelled()` arm clears it on graceful shutdown — but
-                // if this worker future is DROPPED mid-batch (peer demotion's
-                // "hot protocol tasks did not stop cleanly" abort path fires
-                // while we are awaiting block bodies) none of those run, and the
-                // slot is stranded on this dead peer's id.  No other peer can
-                // then claim it, so bulk sync stalls until this exact peer
-                // reconnects and re-adopts its matching id (observed as a
-                // multi-minute genesis-storm stall).  This guard releases the
-                // slot — and only if we still hold it (`compare_exchange` on our
-                // id) — whenever the holding scope unwinds, for ANY reason.
-                struct ActiveFetcherGuard {
-                    fetcher: std::sync::Arc<std::sync::atomic::AtomicU64>,
-                    id: u64,
-                }
-                impl Drop for ActiveFetcherGuard {
-                    fn drop(&mut self) {
-                        let _ = self.fetcher.compare_exchange(
-                            self.id,
-                            0,
-                            std::sync::atomic::Ordering::SeqCst,
-                            std::sync::atomic::Ordering::SeqCst,
-                        );
-                    }
-                }
-
-                // BlockFetch worker: fetches blocks from this peer's candidate_chains.
-                //
-                // CRITICAL: Only ONE worker fetches at a time (matching Haskell's
-                // bfcMaxConcurrencyBulkSync = 1). Workers compete for the
-                // active_fetcher flag. The first to claim it becomes the sole
-                // fetcher; others poll periodically to check if they should
-                // take over (e.g., if the active fetcher's peer disconnects).
-                use dugite_network::codec::Point as CodecPoint;
-                use dugite_network::protocol::blockfetch::client::BlockFetchClient;
-
-                // Per-worker dedup set: tracks block hashes successfully downloaded
-                // in this worker's lifetime.  We do NOT drain `pending_headers` from
-                // `candidate_chains` because that would permanently lose headers if
-                // the connection drops mid-fetch (the ChainSync task will not
-                // re-populate already-streamed headers until a rollback, causing
-                // multi-minute sync stalls).  Instead we read headers in-place and
-                // skip any whose hash is already in this set.
-                let mut fetched_hashes: std::collections::HashSet<[u8; 32]> =
-                    std::collections::HashSet::new();
-
-                // Running average of recently-seen raw block CBOR sizes, used to
-                // size each fetch range against `BLOCKFETCH_RANGE_BYTE_BUDGET`.
-                // Starts pessimistic (Conway-sized) so the first range is small.
-                let mut avg_block_bytes: usize = BLOCKFETCH_INIT_AVG_BLOCK_BYTES;
-
-                info!(%addr, "blockfetch worker started (waiting for turn)");
-
-                // Per-peer worker poll cadence.
-                //
-                // After commit a1490cb5f the `active_fetcher` lock is
-                // released at the end of every batch, so the gap between two
-                // consecutive BlockFetch ranges is bounded by this interval
-                // (whichever peer's ticker fires first wins the next contest).
-                //
-                // Set to 10 ms to match Haskell's `bfcDecisionLoopIntervalPraos`
-                // from `cardano-diffusion/lib/Cardano/Network/Diffusion/Configuration.hs`.
-                // The previous value of 200 ms capped sustained Byron throughput
-                // at ~100 blk/s (verified live on mainnet: see
-                // `project_blockfetch_poll_interval_2026_05_28`) — well below
-                // the per-peer wire ceiling of ~1500 blk/s.  10 ms matches the
-                // Haskell decision-loop cadence so a batch that completes is
-                // immediately followed by the next without an idle gap.  CPU
-                // cost is bounded: each tick does a single `compare_exchange`
-                // + a brief `candidate_chains.read()` lock, ~tens of µs.  With
-                // 22 hot peers that's ~5% CPU on Apple Silicon under bulk sync
-                // — acceptable for the throughput gain.
-                //
-                // **Phase offset (#702 follow-up)**: workers that spawn
-                // together all tick at the same wall-clock instant, so the
-                // worker with the lowest CAS latency always wins the
-                // `active_fetcher` race.  Offset each worker's ticker start
-                // by a deterministic-but-distinct amount derived from the
-                // peer SocketAddr hash so workers spread evenly across the
-                // interval, giving every peer a fair claim window.  At 10 ms
-                // the offset window is 0–10 ms — still enough to break ties
-                // on the same wall-clock instant.
-                let phase_offset = {
-                    let mut h = std::collections::hash_map::DefaultHasher::new();
-                    addr.hash(&mut h);
-                    std::time::Duration::from_millis(h.finish() % 10)
-                };
-                let mut poll_ticker = tokio::time::interval_at(
-                    tokio::time::Instant::now() + phase_offset,
-                    std::time::Duration::from_millis(10),
-                );
-                poll_ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-
-                loop {
-                    tokio::select! {
-                        biased;
-                        _ = cancel.cancelled() => {
-                            // Release the active fetcher flag if we hold it.
-                            // Use hash of full SocketAddr (IP + port) for unique peer ID.
-                            let mut hasher = std::collections::hash_map::DefaultHasher::new();
-                            addr.hash(&mut hasher);
-                            let cancel_id = hasher.finish() | 1; // ensure non-zero
-                            let _ = active_fetcher.compare_exchange(
-                                cancel_id,
-                                0,
-                                std::sync::atomic::Ordering::SeqCst,
-                                std::sync::atomic::Ordering::SeqCst,
-                            );
-                            debug!(%addr, "blockfetch worker cancelled");
-                            break;
-                        }
-                        _ = poll_ticker.tick() => {
-                            // Only ONE worker fetches at a time to prevent duplicate
-                            // downloads (matching Haskell's bfcMaxConcurrencyBulkSync=1).
-                            let my_id: u64 = {
-                                let mut hasher = std::collections::hash_map::DefaultHasher::new();
-                                addr.hash(&mut hasher);
-                                hasher.finish() | 1
-                            };
-                            let claimed = active_fetcher.compare_exchange(
-                                0,
-                                my_id,
-                                std::sync::atomic::Ordering::SeqCst,
-                                std::sync::atomic::Ordering::SeqCst,
-                            ).is_ok();
-                            let current = active_fetcher.load(std::sync::atomic::Ordering::SeqCst);
-                            if !claimed && current != my_id {
-                                continue;
-                            }
-
-                            // We now hold the single-fetcher slot.  This guard
-                            // releases it on every exit from this loop iteration
-                            // — including a mid-batch task abort — so the slot is
-                            // never stranded on a dead peer (see the guard def).
-                            // It is idempotent with the explicit post-batch /
-                            // no-headers releases below (its `compare_exchange`
-                            // is a no-op once the slot has already been cleared).
-                            let _fetch_guard = ActiveFetcherGuard {
-                                fetcher: active_fetcher.clone(),
-                                id: my_id,
-                            };
-
-                            // Build the list of headers to fetch from this peer.
-                            //
-                            // KEY INVARIANT: we do NOT drain `pending_headers`.
-                            // Headers remain in `candidate_chains` so they survive
-                            // a mid-fetch connection drop.  Instead we skip any
-                            // header whose hash is already in `fetched_hashes`
-                            // (downloaded by this worker in an earlier iteration)
-                            // or whose hash is already in the ChainDB (already
-                            // stored, possibly on a divergent fork).
-                            //
-                            // FILTER BY HASH, NOT SLOT.
-                            //
-                            // A slot-based filter (`h.slot > applied_slot`) is unsound
-                            // for fork blocks delivered after `MsgRollBackward`.  When
-                            // a peer rolls back to slot R (R < applied_slot) and
-                            // begins streaming a competing fork, the fork's earliest
-                            // blocks may carry slots in the range (R, applied_slot].
-                            // Those headers MUST be fetched so `walk_chain_back` from
-                            // the fork's tip can reconstruct the ancestry through
-                            // VolatileDB and intersect either the selected chain or
-                            // the immutable anchor; otherwise chain_sel reports
-                            // `fork unreachable — StoreButDontChange` for every new
-                            // fork tip and the BP stalls on the abandoned fork
-                            // (observed live on preview 2026-04-26: peer rolled back
-                            // 1 block and grew a 9+ block fork; only the latest
-                            // headers passed the slot filter, leaving the parent gap
-                            // unfetched).
-                            //
-                            // Hash-based filtering (`!chain_db.has_block(h.hash)`)
-                            // matches Haskell `BlockFetch.Decision`: it fetches
-                            // every block on `theirFrag` not on `curChain`, regardless
-                            // of slot ordering.  Headers above the volatile-window
-                            // boundary are stored in VolatileDB on first fetch and
-                            // skipped afterwards by the per-worker `fetched_hashes`
-                            // set; headers that have already been flushed to
-                            // ImmutableDB are skipped by `has_block`.
-                            let headers_to_fetch = {
-                                let chains = candidate_chains.read().await;
-                                let cdb = chain_db.read().await;
-                                use dugite_primitives::hash::Hash32;
-                                if let Some(state) = chains.get(&addr) {
-                                    let filtered = select_headers_to_fetch(
-                                        &state.pending_headers,
-                                        |h| cdb.has_block(&Hash32::from_bytes(*h)),
-                                        &fetched_hashes,
-                                    );
-                                    if filtered.is_empty() {
-                                        active_fetcher.store(0, std::sync::atomic::Ordering::SeqCst);
-                                    }
-                                    filtered
-                                } else {
-                                    active_fetcher.store(0, std::sync::atomic::Ordering::SeqCst);
-                                    continue;
-                                }
-                            };
-
-                            if headers_to_fetch.is_empty() {
-                                continue;
-                            }
-
-                            info!(
-                                %addr,
-                                count = headers_to_fetch.len(),
-                                first_slot = headers_to_fetch.first().map(|h| h.slot).unwrap_or(0),
-                                last_slot = headers_to_fetch.last().map(|h| h.slot).unwrap_or(0),
-                                "BlockFetch: active fetcher, downloading blocks",
-                            );
-
-                            // Batch headers into ranges for efficient fetching.
-                            // A single MsgRequestRange(from, to) fetches all blocks
-                            // between two points, avoiding per-block round-trips.
-                            // Adaptive range size: byte budget / running average
-                            // block size, clamped to [MIN, MAX].  Large for tiny
-                            // Byron blocks (→ protocol cap), small for big Conway
-                            // blocks — bounding the per-range decode buffer.
-                            let range_size = (BLOCKFETCH_RANGE_BYTE_BUDGET
-                                / avg_block_bytes.max(1))
-                            .clamp(BLOCKFETCH_MIN_RANGE, max_range);
-                            let ranges: Vec<(CodecPoint, CodecPoint)> = {
-                                let mut result = Vec::new();
-                                let mut i = 0;
-                                while i < headers_to_fetch.len() {
-                                    let start = i;
-                                    // Batch up to `range_size` consecutive headers
-                                    // per range to amortise the per-range request
-                                    // round-trip across many blocks.
-                                    let end =
-                                        (i + range_size).min(headers_to_fetch.len()) - 1;
-                                    let from = CodecPoint::Specific(
-                                        headers_to_fetch[start].slot,
-                                        headers_to_fetch[start].hash,
-                                    );
-                                    let to = CodecPoint::Specific(
-                                        headers_to_fetch[end].slot,
-                                        headers_to_fetch[end].hash,
-                                    );
-                                    result.push((from, to));
-                                    i = end + 1;
-                                }
-                                result
-                            };
-
-                            debug!(%addr, ranges = ranges.len(), headers = headers_to_fetch.len(), "BlockFetch: fetching in batched ranges");
-
-                            // Track the hashes of blocks the peer actually delivered
-                            // via `MsgBlock`.  Used below to update `fetched_hashes`
-                            // selectively — see the comment near the loop end.
-                            let mut received_hashes: std::collections::HashSet<[u8; 32]> =
-                                std::collections::HashSet::new();
-
-                            // Request pipelining: keep up to `pipeline_window`
-                            // `MsgRequestRange` in flight at once so each range's
-                            // network round-trip overlaps the receipt + apply of
-                            // earlier ranges. The BlockFetch mini-protocol returns
-                            // batch responses in FIFO request order, so the Nth
-                            // `recv_batch` below corresponds to the Nth range.
-                            // Mirrors Haskell `bfcMaxRequestsInflight` pipelining.
-                            let pipeline_window =
-                                BLOCKFETCH_PIPELINE_WINDOW.min(ranges.len()).max(1);
-                            let mut next_req = 0usize;
-                            let mut prime_failed = false;
-                            while next_req < pipeline_window {
-                                let (from, to) = ranges[next_req].clone();
-                                match tokio::time::timeout(
-                                    FETCH_RANGE_TIMEOUT,
-                                    BlockFetchClient::send_range_request(&mut channel, from, to),
-                                )
-                                .await
-                                {
-                                    Ok(Ok(())) => next_req += 1,
-                                    _ => {
-                                        prime_failed = true;
-                                        break;
-                                    }
-                                }
-                            }
-                            if prime_failed {
-                                warn!(%addr, "BlockFetch: failed to send pipelined range request");
-                                {
-                                    let mut chains = candidate_chains.write().await;
-                                    if let Some(state) = chains.get_mut(&addr) {
-                                        state.record_fetch_failed(addr);
-                                    }
-                                }
-                                active_fetcher.store(0, std::sync::atomic::Ordering::SeqCst);
-                                let _ = peer_failure_tx.try_send(addr);
-                                return;
-                            }
-
-                            for range_idx in 0..ranges.len() {
-                                let peer = addr;
-                                let range_to_slot = match &ranges[range_idx].1 {
-                                    CodecPoint::Specific(s, _) => *s,
-                                    CodecPoint::Origin => 0,
-                                };
-
-                                // Collect decoded blocks in a local Vec inside the
-                                // sync callback, then send them via `.send().await`
-                                // after `fetch_range` returns.
-                                //
-                                // IMPORTANT: Do NOT call `tx.blocking_send()` inside
-                                // the callback.  `fetch_range` takes a *synchronous*
-                                // `FnMut` callback and calls it from within the tokio
-                                // async runtime.  `blocking_send` panics with
-                                // "Cannot block the current thread from within a
-                                // runtime" whenever the channel is full and it tries
-                                // to park the calling thread — exactly the crash we
-                                // observed.  Collecting into a Vec and awaiting the
-                                // sends outside the callback avoids the panic while
-                                // preserving ordering and backpressure.
-                                let mut decoded_blocks: Vec<FetchedBlock> = Vec::new();
-                                // Sum of raw CBOR sizes seen this range, used to
-                                // refresh `avg_block_bytes` for the next range's
-                                // byte-budget sizing.
-                                let mut range_bytes: usize = 0;
-
-                                let fetch_start = std::time::Instant::now();
-                                let fetch_result = tokio::time::timeout(
-                                    FETCH_RANGE_TIMEOUT,
-                                    BlockFetchClient::recv_batch(
-                                        &mut channel,
-                                        |block_cbor| {
-                                            range_bytes += block_cbor.len();
-                                            match dugite_serialization::decode_block_with_byron_epoch_length(
-                                                &block_cbor, bel,
-                                            ) {
-                                                Ok(block) => {
-                                                    let slot = block.slot().0;
-                                                    debug!(%addr, slot, block_no = block.block_number().0, "BlockFetch: block decoded");
-                                                    decoded_blocks.push(FetchedBlock {
-                                                        peer,
-                                                        block,
-                                                        tip_slot: range_to_slot,
-                                                        tip_hash: [0u8; 32],
-                                                        tip_block_number: 0,
-                                                    });
-                                                    // Will be promoted to `received_hashes`
-                                                    // below after we drain `decoded_blocks`
-                                                    // (we can't borrow the outer set inside
-                                                    // this `FnMut` closure without making it
-                                                    // explicit; doing the bookkeeping after
-                                                    // `fetch_range` returns is equivalent and
-                                                    // avoids the borrow gymnastics).
-                                                }
-                                                Err(e) => {
-                                                    warn!(%addr, "block decode error: {e}");
-                                                    // DEBUG: dump failing CBOR for offline analysis.
-                                                    // Always-on capture for repro of preprod PV11 decode bug.
-                                                    if let Ok(dump_dir) = std::env::var("DUGITE_DECODE_FAIL_DUMP") {
-                                                        let ts = std::time::SystemTime::now()
-                                                            .duration_since(std::time::UNIX_EPOCH)
-                                                            .map(|d| d.as_nanos())
-                                                            .unwrap_or(0);
-                                                        let len = block_cbor.len();
-                                                        let path = std::path::PathBuf::from(&dump_dir)
-                                                            .join(format!("decode_fail_{ts}_{len}.cbor"));
-                                                        if let Some(parent) = path.parent() {
-                                                            let _ = std::fs::create_dir_all(parent);
-                                                        }
-                                                        if let Err(write_err) = std::fs::write(&path, &block_cbor) {
-                                                            warn!(%addr, "failed to dump CBOR: {write_err}");
-                                                        } else {
-                                                            warn!(%addr, path = %path.display(), bytes = block_cbor.len(), "dumped failing block CBOR");
-                                                        }
-                                                    }
-                                                    // Abort the range: NEVER store a block past an
-                                                    // undecodable one. A gap in the stored chain gets
-                                                    // flushed to the ImmutableDB and then cannot be
-                                                    // connected across on replay (observed: a decode bug
-                                                    // at the Byron→Shelley boundary corrupted the db this
-                                                    // way). Returning Err drops this range's collected
-                                                    // blocks and fails the peer; the selected tip stays at
-                                                    // the last good block and a restart recovers cleanly
-                                                    // from the snapshot. A block that fails to deserialise
-                                                    // is a hard peer fault.
-                                                    return Err(
-                                                        dugite_network::error::ProtocolError::CborDecode {
-                                                            protocol: "BlockFetch",
-                                                            reason: format!(
-                                                                "block deserialisation failed: {e}"
-                                                            ),
-                                                        },
-                                                    );
-                                                }
-                                            }
-                                            Ok(())
-                                        },
-                                    ),
-                                ).await;
-                                match fetch_result {
-                                    Ok(Ok(count)) => {
-                                        let fetch_ms = fetch_start.elapsed().as_secs_f64() * 1000.0;
-                                        metrics_clone.record_block_fetch_latency(fetch_ms);
-                                        // Refresh the average block size for the
-                                        // next range's byte-budget sizing.
-                                        if let Some(avg) = range_bytes.checked_div(count) {
-                                            avg_block_bytes = avg.max(1);
-                                        }
-                                        debug!(%addr, count, fetch_ms, avg_block_bytes, "BlockFetch: range complete");
-                                    }
-                                    Ok(Err(e)) => {
-                                        warn!(%addr, "BlockFetch error: {e}");
-                                        // Per-peer chain tracking (issue #702): record failure
-                                        // and potentially mark peer Aberrant.
-                                        {
-                                            let mut chains = candidate_chains.write().await;
-                                            if let Some(state) = chains.get_mut(&addr) {
-                                                state.record_fetch_failed(addr);
-                                            }
-                                        }
-                                        active_fetcher.store(0, std::sync::atomic::Ordering::SeqCst);
-                                        let _ = peer_failure_tx.try_send(addr);
-                                        return;
-                                    }
-                                    Err(_elapsed) => {
-                                        // Fetch deadline exceeded — peer is stalled or
-                                        // TCP connection is half-open. Release active
-                                        // fetcher so another peer can take over, and
-                                        // report the failure for reputation scoring.
-                                        warn!(
-                                            %addr,
-                                            timeout_secs = FETCH_RANGE_TIMEOUT.as_secs(),
-                                            "BlockFetch range timed out, releasing fetcher",
-                                        );
-                                        // Per-peer chain tracking (issue #702): record timeout
-                                        // as a failure towards the Aberrant threshold.
-                                        {
-                                            let mut chains = candidate_chains.write().await;
-                                            if let Some(state) = chains.get_mut(&addr) {
-                                                state.record_fetch_failed(addr);
-                                            }
-                                        }
-                                        active_fetcher.store(0, std::sync::atomic::Ordering::SeqCst);
-                                        let _ = peer_failure_tx.try_send(addr);
-                                        return;
-                                    }
-                                }
-
-                                // Refill the pipeline window: request the next
-                                // not-yet-sent range NOW, so the peer is streaming
-                                // it while we forward this range's blocks to the
-                                // apply loop below. Keeps `pipeline_window` requests
-                                // outstanding at all times (until the tail).
-                                if next_req < ranges.len() {
-                                    let (from, to) = ranges[next_req].clone();
-                                    match tokio::time::timeout(
-                                        FETCH_RANGE_TIMEOUT,
-                                        BlockFetchClient::send_range_request(&mut channel, from, to),
-                                    )
-                                    .await
-                                    {
-                                        Ok(Ok(())) => next_req += 1,
-                                        _ => {
-                                            warn!(%addr, "BlockFetch: failed to send pipelined refill request");
-                                            {
-                                                let mut chains = candidate_chains.write().await;
-                                                if let Some(state) = chains.get_mut(&addr) {
-                                                    state.record_fetch_failed(addr);
-                                                }
-                                            }
-                                            active_fetcher
-                                                .store(0, std::sync::atomic::Ordering::SeqCst);
-                                            let _ = peer_failure_tx.try_send(addr);
-                                            return;
-                                        }
-                                    }
-                                }
-
-                                // Send all blocks collected for this range using
-                                // `.send().await` — which correctly yields to the
-                                // scheduler instead of blocking the thread.
-                                //
-                                // Promote each delivered block's hash into the
-                                // received-set BEFORE handing the value off to the
-                                // channel (`fetched` is moved, so we capture the
-                                // hash first).  See the post-loop dedup comment
-                                // below for why this matters.
-                                for fetched in decoded_blocks {
-                                    let slot = fetched.block.slot().0;
-                                    received_hashes
-                                        .insert(*fetched.block.header.header_hash.as_bytes());
-                                    // Per-peer chain tracking (issue #702): record each
-                                    // delivered block as a successful delivery, resetting
-                                    // the consecutive_failures counter and rehabilitating
-                                    // any Aberrant state.
-                                    {
-                                        let mut chains = candidate_chains.write().await;
-                                        if let Some(state) = chains.get_mut(&addr) {
-                                            state.record_fetch_delivered();
-                                        }
-                                    }
-                                    if let Err(e) = fetched_blocks_tx.send(fetched).await {
-                                        warn!(%addr, slot, "send to run loop failed (channel closed): {e}");
-                                        // Channel closed means the run loop exited.
-                                        // Release the active fetcher and stop.
-                                        active_fetcher.store(0, std::sync::atomic::Ordering::SeqCst);
-                                        return;
-                                    }
-                                }
-                            }
-
-                            // Per-worker dedup: only mark hashes for blocks the peer
-                            // actually delivered via `MsgBlock`.
-                            //
-                            // BUG (#702): the previous code unconditionally inserted
-                            // EVERY hash in `headers_to_fetch` into `fetched_hashes`,
-                            // even ones for which the peer sent no `MsgBlock`
-                            // (e.g. when `MsgBatchDone` arrives early with fewer
-                            // blocks than requested).  Those undelivered hashes were
-                            // permanently marked "fetched", so the worker never
-                            // re-requested them — every downstream block became an
-                            // orphan in VolatileDB (`fork unreachable —
-                            // StoreButDontChange`), and the apply path stalled at
-                            // the predecessor of the first missing block while
-                            // peers kept advancing past the forecast horizon and
-                            // disconnecting.  Reproduced as a deterministic stall on
-                            // ~1-in-3 from-genesis preview runs.
-                            //
-                            // The Haskell reference (BlockFetch.Decision) tracks
-                            // per-peer "in-flight" by request, not by header, but
-                            // crucially never marks a block as fetched until the
-                            // body arrives via `MsgBlock` — so a peer that
-                            // short-batches always sees the un-delivered headers
-                            // re-requested on the next decision tick.
-                            //
-                            // The next loop iteration will rebuild
-                            // `headers_to_fetch` from `state.pending_headers` minus
-                            // `fetched_hashes` and `has_block`, picking up exactly
-                            // the missing blocks for re-request.
-                            for h in &received_hashes {
-                                fetched_hashes.insert(*h);
-                            }
-                            let short_batched =
-                                received_hashes.len() < headers_to_fetch.len();
-                            if short_batched {
-                                info!(
-                                    %addr,
-                                    requested = headers_to_fetch.len(),
-                                    received = received_hashes.len(),
-                                    "BlockFetch: peer short-batched; releasing fetcher so another peer can supply missing blocks"
-                                );
-                            }
-
-                            // Note: we do NOT update max_fetched_slot here.
-                            // Per-worker dedup uses fetched_hashes (hash-based).
-                            // Cross-worker dedup uses the applied ChainDB tip.
-                            // max_fetched_slot caused sync stalls by jumping to
-                            // the chain tip and filtering out all gap blocks.
-
-                            // Release `active_fetcher` after every batch so
-                            // other peers' workers get a fair chance to claim
-                            // it on their next poll tick.  Previously the
-                            // current worker held the lock across iterations,
-                            // which monopolised fetching from a single peer:
-                            // if that peer didn't have a specific block in its
-                            // chain (or refused to serve it after multiple
-                            // re-requests), no other peer could ever fetch it,
-                            // and sync stalled indefinitely with the same
-                            // peer cycling failed retries.
-                            //
-                            // This mirrors Haskell `BlockFetch.Decision`:
-                            // every decision-loop tick (`bfcDecisionLoopIntervalPraos
-                            // = 10ms`) reconsiders which peer to fetch from,
-                            // so a peer that fails to deliver loses its slot
-                            // to a peer that will.  Dugite's analog is one
-                            // worker per peer + the shared `active_fetcher`
-                            // atomic; releasing here every batch gives the
-                            // same rotation effect.  See issue #702.
-                            let _ = active_fetcher.compare_exchange(
-                                my_id,
-                                0,
-                                std::sync::atomic::Ordering::SeqCst,
-                                std::sync::atomic::Ordering::SeqCst,
-                            );
-
-                            // Explicit yield so the SAME peer's worker
-                            // Yield once to the scheduler so that a
-                            // co-located worker that is already blocked on
-                            // `peer_rx.recv()` (or anywhere else) gets to
-                            // run before we re-enter the select! loop.
-                            // The previous 200 ms sleep here was the second
-                            // half of the throughput cap (alongside the
-                            // 200 ms poll interval) — see the long comment
-                            // on `poll_ticker` for the matching reasoning.
-                            // A `yield_now()` gives the same fairness
-                            // guarantee on the tokio runtime without
-                            // introducing wall-clock latency.
-                            tokio::task::yield_now().await;
-                        }
-                    }
-                }
+                use crate::node::block_fetch_logic::blockfetch_worker;
+                blockfetch_worker(channel, fetch_rx, fetched_blocks_tx, addr, bel, cancel).await;
+                // Intentional: no additional fallback logic. `blockfetch_worker` handles
+                // all lifecycle (cancelled, channel closed, protocol error). On exit the
+                // mux channel is dropped, which triggers dead-connection detection in the
+                // lifecycle manager and deregisters this peer from the decision task.
             })
         })
     }

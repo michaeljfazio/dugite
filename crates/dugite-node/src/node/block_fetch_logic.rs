@@ -30,18 +30,25 @@ use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, RwLock};
 use tokio::time::MissedTickBehavior;
 use tokio_util::sync::CancellationToken;
-use tracing::{debug, error, info, trace, warn};
+use tracing::{debug, error, info, warn};
 
 use dugite_network::codec::Point;
-use dugite_network::protocol::blockfetch::decision::{
-    BlockFetchDecision, FetchRange, PeerFetchState,
-};
-use dugite_network::{BlockFetchClient, MuxChannel, PEER_LATENCY_DEFAULT_MS};
+use dugite_network::protocol::blockfetch::decision::{BlockFetchDecision, FetchRange};
+use dugite_network::{BlockFetchClient, MuxChannel};
 use dugite_storage::ChainDB;
 
 use super::connection_lifecycle::{
     CandidateChainState, FetchedBlock, PeerFetchStatus, PendingHeader,
 };
+
+/// Commands sent from `ConnectionLifecycleManager` to the `BlockFetchLogicTask`
+/// to register or deregister peers as they transition through hot state.
+pub enum BfPeerCmd {
+    /// A peer was promoted to hot — register its fetch-range request channel.
+    Register(SocketAddr, mpsc::Sender<Vec<FetchRange>>),
+    /// A peer was demoted from hot or disconnected — release its in-flight state.
+    Deregister(SocketAddr),
+}
 
 /// Default decision interval for Praos consensus (10 ms — matches
 /// `bfcDecisionLoopIntervalPraos = 0.01` in Haskell's
@@ -171,6 +178,11 @@ pub struct BlockFetchLogicTask {
 
     /// Cancellation token for graceful shutdown.
     cancel: CancellationToken,
+
+    /// Inbound peer registration/deregistration commands from the connection
+    /// lifecycle manager.  Drained on each decision tick so peer list changes
+    /// are picked up without additional latency.
+    peer_cmd_rx: Option<mpsc::Receiver<BfPeerCmd>>,
 }
 
 impl BlockFetchLogicTask {
@@ -266,7 +278,16 @@ impl BlockFetchLogicTask {
             decision_engine: BlockFetchDecision::with_defaults(),
             peer_manager,
             cancel,
+            peer_cmd_rx: None,
         }
+    }
+
+    /// Attach a peer command receiver.
+    ///
+    /// Call this before `run()` to wire up the `BfPeerCmd` channel that
+    /// `ConnectionLifecycleManager` uses to register/deregister peers.
+    pub fn set_peer_cmd_rx(&mut self, rx: mpsc::Receiver<BfPeerCmd>) {
+        self.peer_cmd_rx = Some(rx);
     }
 
     /// Set the decision interval.
@@ -337,12 +358,44 @@ impl BlockFetchLogicTask {
         loop {
             tokio::select! {
                 _ = ticker.tick() => {
+                    // Drain peer registration/deregistration commands first so
+                    // that newly-promoted peers are included in this tick's
+                    // fetch decisions without waiting for the next interval.
+                    self.drain_peer_cmds();
                     self.evaluate_and_fetch().await;
                 }
                 _ = self.cancel.cancelled() => {
                     info!("block fetch decision task shutting down");
                     break;
                 }
+            }
+        }
+    }
+
+    /// Drain all pending `BfPeerCmd` messages from the command channel.
+    ///
+    /// Called at the start of each decision tick so peer promotions/demotions
+    /// from the connection lifecycle manager are processed promptly.
+    fn drain_peer_cmds(&mut self) {
+        // Collect commands into a temporary Vec to satisfy the borrow checker:
+        // `try_recv` requires &mut rx (part of self) while `register_peer` /
+        // `deregister_peer` also need &mut self. Collecting first, then
+        // processing, avoids the simultaneous mutable borrow.
+        let cmds: Vec<BfPeerCmd> = {
+            let rx = match self.peer_cmd_rx.as_mut() {
+                Some(rx) => rx,
+                None => return,
+            };
+            let mut cmds = Vec::new();
+            while let Ok(cmd) = rx.try_recv() {
+                cmds.push(cmd);
+            }
+            cmds
+        };
+        for cmd in cmds {
+            match cmd {
+                BfPeerCmd::Register(addr, tx) => self.register_peer(addr, tx),
+                BfPeerCmd::Deregister(addr) => self.deregister_peer(&addr),
             }
         }
     }
@@ -408,22 +461,18 @@ impl BlockFetchLogicTask {
                 .collect()
         };
 
-        // Count eligible vs Aberrant peers for the debug log.
+        // Count eligible vs Aberrant peers for the debug log (debug builds only).
         #[cfg(debug_assertions)]
-        {
-            let chains = self.candidate_chains.try_read();
-            if let Ok(chains) = chains {
-                let aberrant: Vec<_> = chains
-                    .iter()
-                    .filter(|(_, s)| s.fetch_status == PeerFetchStatus::Aberrant)
-                    .map(|(addr, _)| *addr)
-                    .collect();
-                if !aberrant.is_empty() {
-                    trace!(
-                        aberrant_count = aberrant.len(),
-                        "BlockFetch: excluding Aberrant peers from decision"
-                    );
-                }
+        if let Ok(chains) = self.candidate_chains.try_read() {
+            let aberrant_count = chains
+                .values()
+                .filter(|s| s.fetch_status == PeerFetchStatus::Aberrant)
+                .count();
+            if aberrant_count > 0 {
+                debug!(
+                    aberrant_count,
+                    "BlockFetch: excluding Aberrant peers from decision"
+                );
             }
         }
 
@@ -468,153 +517,90 @@ impl BlockFetchLogicTask {
             return;
         }
 
-        // Sort headers by slot so we batch consecutive ranges.
-        new_headers.sort_by_key(|(_, h)| h.slot);
+        // CORRECTNESS INVARIANT: Each fetch range must be dispatched to the peer
+        // that ADVERTISED those headers via ChainSync.
+        //
+        // Why: The BlockFetch server on peer A only serves blocks it has in its
+        // ChainDB.  If the decision task sends a range for blocks that were
+        // announced by peer A to peer B's blockfetch_worker, peer B's server
+        // returns MsgNoBlocks (or MsgStartBatch with 0 blocks) because it may
+        // not have those blocks.  The in_flight entries then timeout after 60s,
+        // stalling sync permanently.
+        //
+        // Haskell alignment: the Haskell BlockFetch decision logic (`fetchDecisions`
+        // in `Ouroboros.Network.BlockFetch.Decision`) maintains per-peer candidate
+        // chains and dispatches fetch requests ONLY to the peer that advertised the
+        // block via ChainSync — it never cross-peer-dispatches.  The "best peer"
+        // selection is for choosing AMONG peers when multiple peers all have the
+        // same block (e.g., a block announced simultaneously by 5 hot peers).
+        //
+        // Our current decision engine doesn't track per-block peer affinity.  As a
+        // correct first approximation: dispatch each peer's headers back to that same
+        // peer.  Cross-peer deduplication is handled by the in_flight hash map:
+        // once a block is in-flight from peer A, other peers' matching headers are
+        // filtered out by `in_flight.contains_key(hash)` above, so no duplicate
+        // fetch occurs.
+        //
+        // Parallelism is achieved by running multiple per-peer workers simultaneously
+        // — peer A fetches its 100 headers while peer B concurrently fetches its 100
+        // headers, delivering up to N× the single-peer throughput.
 
-        // Batch consecutive headers into fetch ranges.
-        let ranges = batch_headers_into_ranges(&new_headers);
-
-        if ranges.is_empty() {
-            return;
+        // Group new_headers by advertising peer.
+        let mut per_peer_headers: HashMap<SocketAddr, Vec<&PendingHeader>> = HashMap::new();
+        for (addr, header) in &new_headers {
+            per_peer_headers.entry(*addr).or_default().push(header);
         }
 
-        trace!(
-            range_count = ranges.len(),
-            header_count = new_headers.len(),
-            "dispatching fetch ranges"
-        );
-
-        // Build peer fetch states for the decision engine.
-        //
-        // Per-peer chain tracking (issue #702): populate `in_flight` from the
-        // peer's `CandidateChainState.in_flight_blocks` so the decision engine
-        // can de-prefer Busy peers relative to Ready peers.  Haskell's
-        // `comparePeerFetchStatus` (ClientState.hs) sorts Ready before Busy;
-        // we propagate `in_flight_blocks` here so `BlockFetchDecision::select_peer`
-        // applies the same ordering.  Aberrant peers are already excluded above.
-        //
-        // Issue #706: Populate latency_ms from PeerManager EWMA data rather than
-        // the previous hardcoded 100.0.  We snapshot the latency map under a
-        // short-lived read lock *before* acquiring the candidate_chains lock to
-        // avoid potential lock-ordering deadlocks.  Peers without a KeepAlive
-        // RTT sample yet fall back to PEER_LATENCY_DEFAULT_MS (1 000 ms), which
-        // matches Haskell's `defaultGSV` (g=500 ms × 2 for round-trip) from
-        // `ouroboros-network/lib/Ouroboros/Network/DeltaQ.hs`.
-        let latency_snapshot: HashMap<SocketAddr, f64> =
-            if let Some(pm_handle) = self.peer_manager.as_ref() {
-                let pm = pm_handle.read().await;
-                self.fetch_senders
-                    .keys()
-                    .map(|addr| {
-                        let lat = pm.peer_latency_ms(addr).unwrap_or(PEER_LATENCY_DEFAULT_MS);
-                        (*addr, lat)
-                    })
-                    .collect()
-            } else {
-                // No peer manager available (unit tests): seed all peers with
-                // the default.
-                self.fetch_senders
-                    .keys()
-                    .map(|addr| (*addr, PEER_LATENCY_DEFAULT_MS))
-                    .collect()
+        let now = Instant::now();
+        for (addr, peer_headers) in per_peer_headers {
+            let sender = match self.fetch_senders.get(&addr) {
+                Some(s) => s,
+                None => continue,
             };
 
-        let peer_states: Vec<PeerFetchState> = {
-            let chains = self.candidate_chains.read().await;
-            self.fetch_senders
-                .keys()
-                .filter_map(|addr| {
-                    let state = chains.get(addr)?;
-                    // Double-check: Aberrant peers must not appear in peer_states.
-                    if state.fetch_status == PeerFetchStatus::Aberrant {
-                        return None;
-                    }
-                    let latency_ms = latency_snapshot
-                        .get(addr)
-                        .copied()
-                        .unwrap_or(PEER_LATENCY_DEFAULT_MS);
-                    Some(PeerFetchState {
-                        addr: *addr,
-                        latency_ms,
-                        in_flight: state.in_flight_blocks as usize,
-                        tip_slot: state.tip_slot,
-                    })
-                })
-                .collect()
-        };
+            // Sort this peer's headers by slot for consecutive batching.
+            let mut sorted = peer_headers;
+            sorted.sort_by_key(|h| h.slot);
 
-        // Add all ranges to the decision engine and dispatch.
-        for range in &ranges {
-            self.decision_engine
-                .add_range(range.from.clone(), range.to.clone());
-        }
+            // Build fetch ranges from this peer's consecutive headers.
+            let peer_ranges = batch_peer_headers_into_ranges(&sorted);
+            if peer_ranges.is_empty() {
+                continue;
+            }
 
-        // Select peers and dispatch ranges.
-        let mut dispatched: HashMap<SocketAddr, Vec<FetchRange>> = HashMap::new();
-
-        while let Some((peer, range)) = self.decision_engine.select_peer(&peer_states) {
-            dispatched.entry(peer).or_default().push(range);
-        }
-
-        // Send fetch requests to each peer's worker.
-        //
-        // In-flight tracking is only updated AFTER a successful dispatch.
-        // If the peer's channel is full, the blocks are NOT marked as
-        // in-flight, allowing them to be dispatched to a different peer
-        // on the next decision tick.  Without this, a full channel would
-        // lock the blocks in in-flight for 120 seconds with no actual
-        // download happening.
-        //
-        // Per-peer chain tracking (issue #702): call `record_fetch_dispatched`
-        // on the peer's `CandidateChainState` to set its status to Busy.  This
-        // mirrors Haskell's `PeerFetchStatusBusy` transition in Decision.hs.
-        let now = Instant::now();
-        for (addr, peer_ranges) in dispatched {
-            if let Some(sender) = self.fetch_senders.get(&addr) {
-                let range_count = peer_ranges.len();
-                match sender.try_send(peer_ranges.clone()) {
-                    Ok(()) => {
-                        debug!(%addr, range_count, "dispatched fetch ranges to peer");
-                        // Mark ALL blocks in the successfully dispatched ranges
-                        // as in-flight so they aren't re-dispatched on the next
-                        // decision tick.
-                        for range in &peer_ranges {
-                            let from_slot = match &range.from {
-                                Point::Specific(s, _) => *s,
-                                Point::Origin => 0,
-                            };
-                            let to_slot = match &range.to {
-                                Point::Specific(s, _) => *s,
-                                Point::Origin => 0,
-                            };
-                            for (_, header) in &new_headers {
-                                if header.slot >= from_slot && header.slot <= to_slot {
-                                    self.in_flight.insert(header.hash, (addr, now));
-                                }
-                            }
-                        }
-                        // Transition peer to Busy in CandidateChainState.
-                        {
-                            let mut chains = self.candidate_chains.write().await;
-                            if let Some(state) = chains.get_mut(&addr) {
-                                state.record_fetch_dispatched();
+            let range_count = peer_ranges.len();
+            match sender.try_send(peer_ranges.clone()) {
+                Ok(()) => {
+                    debug!(%addr, range_count, "dispatched fetch ranges to peer");
+                    // Mark all dispatched block hashes as in-flight.
+                    for range in &peer_ranges {
+                        let (from_slot, to_slot) = range.slot_bounds();
+                        for header in &sorted {
+                            if header.slot >= from_slot && header.slot <= to_slot {
+                                self.in_flight.insert(header.hash, (addr, now));
                             }
                         }
                     }
-                    Err(mpsc::error::TrySendError::Full(_)) => {
-                        // Channel full — do NOT mark as in-flight.  The blocks
-                        // will be re-dispatched to a different peer on the next
-                        // decision tick.
-                        debug!(
-                            %addr,
-                            range_count,
-                            "peer fetch channel full, will retry on another peer"
-                        );
+                    // Transition peer to Busy in CandidateChainState.
+                    {
+                        let mut chains = self.candidate_chains.write().await;
+                        if let Some(state) = chains.get_mut(&addr) {
+                            state.record_fetch_dispatched();
+                        }
                     }
-                    Err(mpsc::error::TrySendError::Closed(_)) => {
-                        warn!(%addr, "peer fetch channel closed, deregistering");
-                        self.fetch_senders.remove(&addr);
-                    }
+                }
+                Err(mpsc::error::TrySendError::Full(_)) => {
+                    // Worker channel full — do NOT mark as in-flight.  The ranges
+                    // will be re-dispatched on the next decision tick (10 ms).
+                    debug!(
+                        %addr,
+                        range_count,
+                        "peer fetch channel full, will retry next tick"
+                    );
+                }
+                Err(mpsc::error::TrySendError::Closed(_)) => {
+                    warn!(%addr, "peer fetch channel closed, deregistering");
+                    self.fetch_senders.remove(&addr);
                 }
             }
         }
@@ -637,22 +623,46 @@ impl BlockFetchLogicTask {
 /// (Praos slots are sparse) and do NOT require splitting into separate ranges.
 ///
 /// The input must be sorted by slot (ascending).
+/// Test helper: batch `(addr, header)` pairs into ranges using the same logic as
+/// `batch_peer_headers_into_ranges`.  The `addr` field is ignored (tests use a
+/// single peer per call).
+#[cfg(test)]
 fn batch_headers_into_ranges(headers: &[(SocketAddr, PendingHeader)]) -> Vec<FetchRange> {
+    let refs: Vec<&PendingHeader> = headers.iter().map(|(_, h)| h).collect();
+    batch_peer_headers_into_ranges(&refs)
+}
+
+/// Batch a single peer's sorted headers into fetch ranges.
+///
+/// Takes a slice of `&PendingHeader` (already sorted by slot) and groups them
+/// into `FetchRange` entries of up to `MAX_BATCH_SIZE` each.  The BlockFetch
+/// `MsgRequestRange(from, to)` protocol is inclusive of both endpoints, and the
+/// server streams every block on the chain between those two points.  Slot gaps
+/// are normal in Cardano (Praos sparse slots) and do NOT require splitting.
+///
+/// # Why per-peer rather than cross-peer batching
+///
+/// A fetch range is issued to ONE peer.  Mixing headers from peer A and peer B
+/// into a single range would require either: (a) sending it to both (duplicate
+/// work), or (b) sending it to only one of them, which may not have ALL the
+/// blocks in the range (`MsgNoBlocks`).  Per-peer batching guarantees that
+/// every range is issued to a peer that has advertised ALL the blocks in it
+/// via ChainSync, so the server can always fulfil the request.
+fn batch_peer_headers_into_ranges(headers: &[&PendingHeader]) -> Vec<FetchRange> {
     if headers.is_empty() {
         return Vec::new();
     }
 
     let mut ranges = Vec::new();
-    let mut batch_start = &headers[0].1;
-    let mut batch_end = &headers[0].1;
+    let mut batch_start = headers[0];
+    let mut batch_end = headers[0];
     let mut batch_count = 1usize;
 
-    for (_, header) in headers.iter().skip(1) {
+    for header in headers.iter().skip(1) {
         if batch_count < MAX_BATCH_SIZE {
             batch_end = header;
             batch_count += 1;
         } else {
-            // Flush the current batch — hit size limit.
             ranges.push(FetchRange {
                 from: Point::Specific(batch_start.slot, batch_start.hash),
                 to: Point::Specific(batch_end.slot, batch_end.hash),
@@ -663,7 +673,6 @@ fn batch_headers_into_ranges(headers: &[(SocketAddr, PendingHeader)]) -> Vec<Fet
         }
     }
 
-    // Flush the final batch.
     ranges.push(FetchRange {
         from: Point::Specific(batch_start.slot, batch_start.hash),
         to: Point::Specific(batch_end.slot, batch_end.hash),
