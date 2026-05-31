@@ -34,9 +34,10 @@
 //! | 3   | Unit                    | (no bits)                               |
 //! | 4   | Bool                    | 1 bit                                   |
 //!
-//! Compound tags (5=List, 6=Pair, 7=Apply, 8=Data) and the BLS atomic
-//! tags (9/10/11) are deferred to a follow-on commit alongside the
-//! universe-tag recursion machinery.
+//! Compound tags (5=List, 6=Pair, 8=Data) use the Apply connector (7)
+//! and are fully supported. BLS atomic tags (9/10/11) are not wired
+//! for the flat constant payload (BLS constants do not appear in
+//! flat-encoded scripts).
 //!
 //! ## Defensive properties
 //!
@@ -51,6 +52,7 @@
 
 use super::bits::{BitReader, BitWriter};
 use super::{FlatResult, FLAT_MAX_DEPTH};
+use crate::data::Data;
 use crate::term::{BuiltinId, Constant, Term, TypeTag};
 use crate::UplcError;
 
@@ -104,6 +106,16 @@ fn decode_term_depth(r: &mut BitReader<'_>, depth: usize) -> FlatResult<Term> {
             "term depth limit exceeded ({FLAT_MAX_DEPTH})"
         )));
     }
+    // Deeply-nested scripts (large DeFi validators can exceed 500 levels) can
+    // overflow the OS thread stack under default nextest / tokio thread sizes.
+    // `stacker::maybe_grow` transparently extends the stack when the remaining
+    // guard zone falls below 128 KiB, so we never crash and never need to know
+    // the script's actual depth. The depth counter above still guards against
+    // adversarial inputs that try to exhaust the heap via unbounded allocation.
+    stacker::maybe_grow(128 * 1024, 1024 * 1024, || decode_term_inner(r, depth))
+}
+
+fn decode_term_inner(r: &mut BitReader<'_>, depth: usize) -> FlatResult<Term> {
     let tag = r.read_bits8(TERM_TAG_WIDTH)?;
     match tag {
         0 => {
@@ -258,94 +270,195 @@ fn encode_term_list(w: &mut BitWriter, terms: &[Term], depth: usize) -> FlatResu
 }
 
 // ---------------------------------------------------------------------------
-// Constant codec — universe-tag list (single-atom subset only)
+// Constant codec — universe-tag list (full DefaultUni support)
 // ---------------------------------------------------------------------------
 
-/// Universe-tag list, decoded into a [`TypeTag`]. The Haskell
-/// encoding is a cons-bit-prefixed list of 4-bit atomic tags; we
-/// currently only accept single-atom shapes (Integer, ByteString,
-/// String, Unit, Bool). Compound shapes (List/Pair/Apply/Data) and
-/// the BLS atomic shapes are rejected with a typed error and will
-/// be wired in a follow-on commit.
+/// Read a flat-encoded cons-list of 4-bit universe-tag atoms and return
+/// the full [`TypeTag`]. This is the authoritative type-tag decoder.
+///
+/// ## Haskell flat encoding for DefaultUni
+///
+/// The Plutus `DefaultUni` type is serialised as a *flat cons-list* of
+/// 4-bit atom tags (each preceded by a `1` continuation bit; a `0` bit
+/// terminates the list). The atom alphabet is:
+///
+/// | atom | constructor        | wire role                          |
+/// |------|--------------------|------------------------------------|
+/// |  0   | `DefaultUniInt`    | Integer                            |
+/// |  1   | `DefaultUniBS`     | ByteString                         |
+/// |  2   | `DefaultUniStr`    | String                             |
+/// |  3   | `DefaultUniUnit`   | Unit                               |
+/// |  4   | `DefaultUniBool`   | Bool                               |
+/// |  5   | `DefaultUniProtoList` | type-constructor for List       |
+/// |  6   | `DefaultUniProtoPair` | type-constructor for Pair       |
+/// |  7   | `DefaultUniApply`  | type-application (connector)       |
+/// |  8   | `DefaultUniData`   | Data (CBOR-encoded PlutusData)     |
+/// |  9   | `DefaultUniBls12_381_G1_Element` | BLS12-381 G1        |
+/// | 10   | `DefaultUniBls12_381_G2_Element` | BLS12-381 G2        |
+/// | 11   | `DefaultUniBls12_381_MlResult`   | BLS12-381 MlResult |
+///
+/// Compound type atom sequences:
+///
+/// * `List(a)` → `[1-bit][5][1-bit][7][…type-a…][0-bit]`
+/// * `Pair(a,b)` → `[1-bit][6][1-bit][7][…a…][1-bit][7][…b…][0-bit]`
+/// * `Data`      → `[1-bit][8][0-bit]`
+///
+/// The Apply atom (7) is a "connector" and carries no type information
+/// by itself — it signals that the next atom(s) are the argument to the
+/// preceding type constructor.
+///
+/// Reference: `IntersectMBO/plutus`, `plutus-core/plutus-core/src/
+/// PlutusCore/Default/Uni.hs` (`encodeUni` / `decodeUni`).
 fn decode_type_tag(r: &mut BitReader<'_>) -> FlatResult<TypeTag> {
-    // First cons bit must be 1 — empty type lists are invalid.
-    let cons = r.read_bit()?;
-    if !cons {
+    // Read the cons-list of atoms into a flat Vec.
+    // Each element: 1-bit cons (must be 1), 4-bit atom; terminated by 0 bit.
+    let atoms = read_atom_list(r)?;
+    if atoms.is_empty() {
         return Err(UplcError::FlatDecode("empty universe-tag list".into()));
     }
-    let atom = r.read_bits8(CONST_TAG_WIDTH)?;
-    let tag = match atom {
-        0 => TypeTag::Integer,
-        1 => TypeTag::ByteString,
-        2 => TypeTag::String,
-        3 => TypeTag::Unit,
-        4 => TypeTag::Bool,
-        5..=8 => {
-            return Err(UplcError::FlatDecode(format!(
-                "compound universe tag {atom} (List/Pair/Apply/Data) \
-                 not yet wired"
-            )));
-        }
-        9..=11 => {
-            return Err(UplcError::FlatDecode(format!(
-                "BLS12-381 atomic tag {atom} not yet wired (and BLS \
-                 constants cannot appear in flat-encoded scripts per \
-                 Haskell reference)"
-            )));
-        }
-        _ => {
-            return Err(UplcError::FlatDecode(format!(
-                "unknown universe tag {atom:#06b}"
-            )));
-        }
-    };
-    // Terminator cons bit must be 0 (single-atom shape).
-    let term = r.read_bit()?;
-    if term {
-        return Err(UplcError::FlatDecode(
-            "compound universe-tag lists (extra cons bit set) are \
-             not yet wired"
-                .into(),
-        ));
+    // Parse the atom sequence into a TypeTag.
+    let (tag, consumed) = parse_type_from_atoms(&atoms, 0)?;
+    if consumed != atoms.len() {
+        return Err(UplcError::FlatDecode(format!(
+            "universe-tag list has {} leftover atoms after parsing type",
+            atoms.len() - consumed
+        )));
     }
     Ok(tag)
 }
 
+/// Read the raw cons-list of 4-bit type atoms from the bit stream.
+fn read_atom_list(r: &mut BitReader<'_>) -> FlatResult<Vec<u8>> {
+    // Cap at a safe maximum — no real Plutus type uses more than a handful
+    // of atoms, and this guards against adversarial infinite loops.
+    const MAX_TYPE_ATOMS: usize = 64;
+    let mut atoms = Vec::new();
+    while r.read_bit()? {
+        if atoms.len() >= MAX_TYPE_ATOMS {
+            return Err(UplcError::FlatDecode(format!(
+                "universe-tag list exceeds {MAX_TYPE_ATOMS} atoms"
+            )));
+        }
+        atoms.push(r.read_bits8(CONST_TAG_WIDTH)?);
+    }
+    Ok(atoms)
+}
+
+/// Parse a single [`TypeTag`] from a flat slice of 4-bit atoms starting at
+/// `pos`. Returns `(tag, next_pos)`.
+///
+/// The grammar (recursive):
+/// ```text
+/// type := atom           -- for atoms 0..=4 and 8..=11 (atomic)
+///       | [5][7][type]   -- List(type)
+///       | [6][7][type][7][type]  -- Pair(type, type)
+/// ```
+fn parse_type_from_atoms(atoms: &[u8], pos: usize) -> FlatResult<(TypeTag, usize)> {
+    let atom = *atoms
+        .get(pos)
+        .ok_or_else(|| UplcError::FlatDecode("unexpected end of universe-tag atom list".into()))?;
+    match atom {
+        0 => Ok((TypeTag::Integer, pos + 1)),
+        1 => Ok((TypeTag::ByteString, pos + 1)),
+        2 => Ok((TypeTag::String, pos + 1)),
+        3 => Ok((TypeTag::Unit, pos + 1)),
+        4 => Ok((TypeTag::Bool, pos + 1)),
+        5 => {
+            // List — expect Apply (7) then element type.
+            let next = *atoms
+                .get(pos + 1)
+                .ok_or_else(|| UplcError::FlatDecode("ProtoList: missing Apply atom".into()))?;
+            if next != 7 {
+                return Err(UplcError::FlatDecode(format!(
+                    "ProtoList: expected Apply(7), got {next}"
+                )));
+            }
+            let (elem, after) = parse_type_from_atoms(atoms, pos + 2)?;
+            Ok((TypeTag::List(Box::new(elem)), after))
+        }
+        6 => {
+            // Pair — expect Apply(7) + first type, Apply(7) + second type.
+            let a1 = *atoms.get(pos + 1).ok_or_else(|| {
+                UplcError::FlatDecode("ProtoPair: missing first Apply atom".into())
+            })?;
+            if a1 != 7 {
+                return Err(UplcError::FlatDecode(format!(
+                    "ProtoPair: expected Apply(7) before first type, got {a1}"
+                )));
+            }
+            let (ta, after_a) = parse_type_from_atoms(atoms, pos + 2)?;
+            let a2 = *atoms.get(after_a).ok_or_else(|| {
+                UplcError::FlatDecode("ProtoPair: missing second Apply atom".into())
+            })?;
+            if a2 != 7 {
+                return Err(UplcError::FlatDecode(format!(
+                    "ProtoPair: expected Apply(7) before second type, got {a2}"
+                )));
+            }
+            let (tb, after_b) = parse_type_from_atoms(atoms, after_a + 1)?;
+            Ok((TypeTag::Pair(Box::new(ta), Box::new(tb)), after_b))
+        }
+        7 => Err(UplcError::FlatDecode(
+            "Apply atom (7) encountered outside of List/Pair context".into(),
+        )),
+        8 => Ok((TypeTag::Data, pos + 1)),
+        9 => Ok((TypeTag::Bls12_381G1Element, pos + 1)),
+        10 => Ok((TypeTag::Bls12_381G2Element, pos + 1)),
+        11 => Ok((TypeTag::Bls12_381MlResult, pos + 1)),
+        _ => Err(UplcError::FlatDecode(format!(
+            "unknown universe tag atom {atom:#06b}"
+        ))),
+    }
+}
+
+/// Encode a full [`TypeTag`] as a flat cons-list of 4-bit atoms.
+///
+/// The atom sequence for compound types:
+/// - `List(a)` → `[1-cons][5][1-cons][7][…atoms for a…][0-term]`
+/// - `Pair(a,b)` → `[1-cons][6][1-cons][7][…a atoms…][1-cons][7][…b atoms…][0-term]`
+/// - `Data` → `[1-cons][8][0-term]`
 fn encode_type_tag(w: &mut BitWriter, t: &TypeTag) -> FlatResult<()> {
-    let atom: u8 = match t {
-        TypeTag::Integer => 0,
-        TypeTag::ByteString => 1,
-        TypeTag::String => 2,
-        TypeTag::Unit => 3,
-        TypeTag::Bool => 4,
-        TypeTag::Data => {
-            return Err(UplcError::Encode(
-                "TypeTag::Data flat encoding not yet wired".into(),
-            ));
+    // Collect all atoms for this type tag, then write them as a cons-list.
+    let mut atoms: Vec<u8> = Vec::new();
+    collect_type_atoms(t, &mut atoms)?;
+    for &atom in &atoms {
+        w.write_bit(true); // cons-bit: element follows
+        w.write_bits8(atom, CONST_TAG_WIDTH)?;
+    }
+    w.write_bit(false); // list terminator
+    Ok(())
+}
+
+/// Recursively collect the flat 4-bit atom sequence for a type.
+fn collect_type_atoms(t: &TypeTag, atoms: &mut Vec<u8>) -> FlatResult<()> {
+    match t {
+        TypeTag::Integer => atoms.push(0),
+        TypeTag::ByteString => atoms.push(1),
+        TypeTag::String => atoms.push(2),
+        TypeTag::Unit => atoms.push(3),
+        TypeTag::Bool => atoms.push(4),
+        TypeTag::List(elem) => {
+            atoms.push(5); // ProtoList
+            atoms.push(7); // Apply
+            collect_type_atoms(elem, atoms)?;
         }
-        TypeTag::List(_) | TypeTag::Pair(_, _) => {
-            return Err(UplcError::Encode(
-                "compound universe-tag encoding (List/Pair) not yet \
-                 wired"
-                    .into(),
-            ));
+        TypeTag::Pair(a, b) => {
+            atoms.push(6); // ProtoPair
+            atoms.push(7); // Apply
+            collect_type_atoms(a, atoms)?;
+            atoms.push(7); // Apply
+            collect_type_atoms(b, atoms)?;
         }
-        TypeTag::Bls12_381G1Element | TypeTag::Bls12_381G2Element | TypeTag::Bls12_381MlResult => {
-            return Err(UplcError::Encode(
-                "BLS12-381 atomic tags not allowed in flat constant \
-                 encoding (per Haskell reference)"
-                    .into(),
-            ));
-        }
+        TypeTag::Data => atoms.push(8),
+        TypeTag::Bls12_381G1Element => atoms.push(9),
+        TypeTag::Bls12_381G2Element => atoms.push(10),
+        TypeTag::Bls12_381MlResult => atoms.push(11),
         TypeTag::Array(_) | TypeTag::Value => {
             return Err(UplcError::Encode(
                 "Array / Value flat encoding not yet wired".into(),
             ));
         }
-    };
-    w.write_bit(true); // cons-bit: one atom follows
-    w.write_bits8(atom, CONST_TAG_WIDTH)?;
-    w.write_bit(false); // terminator
+    }
     Ok(())
 }
 
@@ -356,17 +469,15 @@ fn constant_type_tag(c: &Constant) -> FlatResult<TypeTag> {
         Constant::String(_) => Ok(TypeTag::String),
         Constant::Unit => Ok(TypeTag::Unit),
         Constant::Bool(_) => Ok(TypeTag::Bool),
-        Constant::ProtoList { .. } | Constant::ProtoPair { .. } => Err(UplcError::Encode(
-            "ProtoList / ProtoPair flat encoding not yet wired".into(),
+        Constant::ProtoList { elem_type, .. } => Ok(TypeTag::List(Box::new(elem_type.clone()))),
+        Constant::ProtoPair { a_type, b_type, .. } => Ok(TypeTag::Pair(
+            Box::new(a_type.clone()),
+            Box::new(b_type.clone()),
         )),
-        Constant::Data(_) => Err(UplcError::Encode("Data flat encoding not yet wired".into())),
-        Constant::Bls12_381G1Element(_)
-        | Constant::Bls12_381G2Element(_)
-        | Constant::Bls12_381MlResult(_) => Err(UplcError::Encode(
-            "BLS12-381 constants cannot appear in flat-encoded \
-             scripts per Haskell reference"
-                .into(),
-        )),
+        Constant::Data(_) => Ok(TypeTag::Data),
+        Constant::Bls12_381G1Element(_) => Ok(TypeTag::Bls12_381G1Element),
+        Constant::Bls12_381G2Element(_) => Ok(TypeTag::Bls12_381G2Element),
+        Constant::Bls12_381MlResult(_) => Ok(TypeTag::Bls12_381MlResult),
         Constant::Array { .. } | Constant::Value(_) => Err(UplcError::Encode(
             "Array / Value constants cannot appear in flat-encoded \
              scripts (flat codec not yet wired for PV1.1.0 types)"
@@ -379,11 +490,11 @@ fn decode_constant_value(r: &mut BitReader<'_>, tag: &TypeTag) -> FlatResult<Con
     match tag {
         TypeTag::Integer => {
             // Haskell `Flat Integer` is zig-zag of a Natural with
-            // arbitrary-width 7-bit chunks. Our `read_integer_i64` is
-            // the i64-bounded subset; arbitrary-precision support
-            // arrives with the bignum codec in a follow-on commit.
-            let v = r.read_integer_i64()?;
-            Ok(Constant::Integer(BigInt::from(v)))
+            // arbitrary-width 7-bit chunks. Real Plutus scripts can carry
+            // arbitrary-precision integers (e.g., large nonces or amounts),
+            // so we use the arbitrary-precision path.
+            let v = read_integer_bigint(r)?;
+            Ok(Constant::Integer(v))
         }
         TypeTag::ByteString => {
             let bs = r.read_bytestring()?;
@@ -401,10 +512,43 @@ fn decode_constant_value(r: &mut BitReader<'_>, tag: &TypeTag) -> FlatResult<Con
             let b = r.read_bit()?;
             Ok(Constant::Bool(b))
         }
-        TypeTag::Data
-        | TypeTag::List(_)
-        | TypeTag::Pair(_, _)
-        | TypeTag::Bls12_381G1Element
+        TypeTag::Data => {
+            // Data is encoded as a flat bytestring containing the CBOR-encoded
+            // PlutusData value.  Read the raw bytes, then CBOR-decode them
+            // into a `crate::data::Data` value.
+            let raw = r.read_bytestring()?;
+            let d = Data::from_cbor(&raw).map_err(|e| {
+                UplcError::FlatDecode(format!("Data constant: CBOR decode failed: {e}"))
+            })?;
+            Ok(Constant::Data(d))
+        }
+        TypeTag::List(elem_type) => {
+            // A list constant is a flat cons-list: each element is preceded
+            // by a 1-continuation bit; a 0 bit terminates.
+            // Each element value is decoded recursively with the element type.
+            let mut elements = Vec::new();
+            while r.read_bit()? {
+                let elem = decode_constant_value(r, elem_type)?;
+                elements.push(elem);
+            }
+            Ok(Constant::ProtoList {
+                elem_type: (**elem_type).clone(),
+                elements,
+            })
+        }
+        TypeTag::Pair(a_type, b_type) => {
+            // A pair constant is just the two element values back-to-back
+            // (no separator bits).
+            let a = decode_constant_value(r, a_type)?;
+            let b = decode_constant_value(r, b_type)?;
+            Ok(Constant::ProtoPair {
+                a_type: (**a_type).clone(),
+                b_type: (**b_type).clone(),
+                a: Box::new(a),
+                b: Box::new(b),
+            })
+        }
+        TypeTag::Bls12_381G1Element
         | TypeTag::Bls12_381G2Element
         | TypeTag::Bls12_381MlResult
         | TypeTag::Array(_)
@@ -417,10 +561,8 @@ fn decode_constant_value(r: &mut BitReader<'_>, tag: &TypeTag) -> FlatResult<Con
 fn encode_constant_value(w: &mut BitWriter, c: &Constant) -> FlatResult<()> {
     match c {
         Constant::Integer(n) => {
-            // i64-bounded subset for now. Arbitrary-precision via the
-            // `Flat Integer` rule arrives in the follow-on commit.
-            let v: i64 = bigint_to_i64(n)?;
-            w.write_integer_i64(v)?;
+            // Full arbitrary-precision integer encoding (zig-zag + Natural).
+            write_integer_bigint(w, n)?;
         }
         Constant::ByteString(bs) => {
             w.write_bytestring(bs)?;
@@ -434,12 +576,29 @@ fn encode_constant_value(w: &mut BitWriter, c: &Constant) -> FlatResult<()> {
         Constant::Bool(b) => {
             w.write_bit(*b);
         }
-        Constant::ProtoList { .. } | Constant::ProtoPair { .. } | Constant::Data(_) => {
-            return Err(UplcError::Encode(
-                "ProtoList / ProtoPair / Data flat encoding not yet \
-                 wired"
-                    .into(),
-            ));
+        Constant::Data(d) => {
+            // Data is encoded as a bytestring containing the CBOR of the value.
+            let raw = d.to_cbor().map_err(|e| {
+                UplcError::Encode(format!("Data constant: CBOR encode failed: {e}"))
+            })?;
+            w.write_bytestring(&raw)?;
+        }
+        Constant::ProtoList {
+            elem_type,
+            elements,
+        } => {
+            // Cons-list: each element preceded by 1-bit, terminated by 0-bit.
+            for elem in elements {
+                w.write_bit(true);
+                encode_constant_value(w, elem)?;
+            }
+            w.write_bit(false);
+            let _ = elem_type; // used in type tag, not value encoding
+        }
+        Constant::ProtoPair { a, b, .. } => {
+            // Two values back-to-back.
+            encode_constant_value(w, a)?;
+            encode_constant_value(w, b)?;
         }
         Constant::Bls12_381G1Element(_)
         | Constant::Bls12_381G2Element(_)
@@ -457,6 +616,79 @@ fn encode_constant_value(w: &mut BitWriter, c: &Constant) -> FlatResult<()> {
         }
     }
     Ok(())
+}
+
+/// Encode an arbitrary-precision integer into the flat bit stream.
+///
+/// Applies zig-zag encoding (n>=0 → 2n; n<0 → 2|n|-1) then encodes the
+/// resulting Natural as chunked 7-bit groups (LSB first, cont bit first).
+fn write_integer_bigint(w: &mut BitWriter, n: &BigInt) -> FlatResult<()> {
+    use num_traits::Zero;
+    // Zig-zag encode to a non-negative Natural.
+    let zigzag: BigInt = if n.sign() != Sign::Minus {
+        // non-negative: 2n
+        n << 1
+    } else {
+        // negative: 2|n| - 1 = (-n * 2) - 1
+        ((-n) << 1) - 1u64
+    };
+    // Encode the Natural as chunked 7-bit groups (LSB-first).
+    let mut remaining = zigzag;
+    loop {
+        let chunk: u8 = (remaining.iter_u64_digits().next().unwrap_or(0) & 0x7f) as u8;
+        remaining >>= 7;
+        let more = !remaining.is_zero();
+        w.write_bit(more);
+        w.write_bits8(chunk, 7)?;
+        if !more {
+            break;
+        }
+    }
+    Ok(())
+}
+
+/// Read an arbitrary-precision integer from the flat bit stream.
+///
+/// The Haskell `Flat Integer` encoding is zig-zag over a `Natural`:
+/// - Non-negative n → encoded as `2n`
+/// - Negative n → encoded as `2|n| - 1`
+///
+/// The Natural itself is encoded as chunked 7-bit groups (LSB first),
+/// each prefixed by a 1-bit continuation flag (1=more, 0=last).
+///
+/// This is the full arbitrary-precision implementation: each chunk is
+/// accumulated into a `BigInt`. Scripts with large integer constants
+/// (big nonces, hash values, etc.) need this path.
+fn read_integer_bigint(r: &mut BitReader<'_>) -> FlatResult<BigInt> {
+    // Read Natural (unsigned arbitrary-precision integer) as a BigInt.
+    // Each iteration: 1 cont bit + 7 data bits (LSB first across chunks).
+    let mut value = BigInt::from(0u64);
+    let mut shift: u32 = 0;
+    loop {
+        let more = r.read_bit()?;
+        let chunk = r.read_bits8(7)? as u64;
+        if shift > 0 {
+            value += BigInt::from(chunk) << shift;
+        } else {
+            value = BigInt::from(chunk);
+        }
+        if !more {
+            break;
+        }
+        shift = shift
+            .checked_add(7)
+            .ok_or_else(|| UplcError::FlatDecode("Integer natural varint shift overflow".into()))?;
+    }
+    // Zig-zag decode: even → non-negative, odd → negative.
+    let decoded = if value.bit(0) {
+        // odd: -(value + 1) / 2
+        let shifted: BigInt = (value + 1u64) >> 1;
+        -shifted
+    } else {
+        // even: value / 2
+        value >> 1
+    };
+    Ok(decoded)
 }
 
 /// Convert a [`BigInt`] to `i64`, rejecting out-of-range values with
