@@ -32,11 +32,12 @@ use crate::phase_two::{PhaseTwoError, SlotConfig};
 use crate::populate_gov::{
     certificates_to_plutus, proposals_to_plutus, voting_procedures_to_plutus,
 };
-use crate::script_context::TxInfoV3;
+use crate::script_context::{Credential, TxInfoV3};
 use crate::tx_info_populate::{
-    datums_to_plutus, inputs_to_txininfos, mint_to_plutus, output_to_plutus,
+    credential_to_plutus, datums_to_plutus, inputs_to_txininfos, mint_to_plutus, output_to_plutus,
     required_signers_to_plutus_padded, sort_inputs, tx_hash_to_array, valid_range_to_posix,
 };
+use dugite_primitives::address::Address as PrimAddress;
 use dugite_primitives::transaction::{
     Transaction as PrimTransaction, TransactionInput as PrimTxIn, TransactionOutput as PrimTxOut,
 };
@@ -80,19 +81,32 @@ pub fn populate_tx_info_v3(
     )?;
     let votes = voting_procedures_to_plutus(&tx.body.voting_procedures);
     let proposal_procedures = proposals_to_plutus(&tx.body.proposal_procedures)?;
-    // `certificates` are observable from `TxInfo.txCerts` (V3-only) and
-    // wired below as part of the V3 builder, but `TxInfoV3` itself does
-    // not currently expose a `certificates` field — the Haskell V3
-    // reference moves certs to be observed via redeemer purpose
-    // (`ScriptPurpose::Certifying(idx, TxCert)`). We still translate
-    // them here so the per-redeemer path can pick them up by index in
-    // UPLC-9 part 4. The translation is currently dropped on the
-    // floor with a single tracing line for visibility.
-    let _txcerts = certificates_to_plutus(&tx.body.certificates)?;
-    tracing::trace!(
-        count = _txcerts.len(),
-        "populate_tx_info_v3: certs translated"
-    );
+    // Translate certificates into the V3 TxCert list (field 5 of txInfoV3).
+    let certs = certificates_to_plutus(&tx.body.certificates)?;
+    tracing::trace!(count = certs.len(), "populate_tx_info_v3: certs translated");
+    // Translate withdrawals into the V3 wdrl map (field 6 of txInfoV3).
+    // V3 key type is `Credential` DIRECTLY — NOT wrapped in StakingHash as V1/V2 did.
+    // `tx.body.withdrawals` is a BTreeMap<Vec<u8>, Lovelace> keyed by 29-byte
+    // reward-account blobs in lex order (canonical CBOR map order). Iteration
+    // over BTreeMap is in key order, so the resulting Vec preserves that order.
+    let wdrl = {
+        let mut out: Vec<(Credential, BigInt)> = Vec::with_capacity(tx.body.withdrawals.len());
+        for (reward_account, amount) in &tx.body.withdrawals {
+            let addr = PrimAddress::from_bytes(reward_account).map_err(|e| {
+                PhaseTwoError::Internal(format!("populate_tx_info_v3: wdrl reward_account: {e}"))
+            })?;
+            let stake = match addr {
+                PrimAddress::Reward(r) => r.stake,
+                other => {
+                    return Err(PhaseTwoError::Internal(format!(
+                        "populate_tx_info_v3: wdrl expected Reward address, got {other:?}"
+                    )));
+                }
+            };
+            out.push((credential_to_plutus(&stake), BigInt::from(amount.0)));
+        }
+        out
+    };
 
     Ok(TxInfoV3 {
         inputs,
@@ -100,9 +114,11 @@ pub fn populate_tx_info_v3(
         outputs,
         fee: BigInt::from(tx.body.fee.0),
         mint,
+        certs,
+        wdrl,
         valid_range,
         signatories,
-        // Filled by UPLC-9 part 3f (redeemers map).
+        // TODO(task-13f): redeemers map not yet populated — wired as empty Vec.
         redeemers: Vec::new(),
         datums,
         txid: tx_hash_to_array(&tx.hash),
@@ -241,10 +257,12 @@ mod tests {
         assert!(info.inputs.is_empty());
         assert!(info.reference_inputs.is_empty());
         assert!(info.outputs.is_empty());
+        assert!(info.certs.is_empty());
+        assert!(info.wdrl.is_empty());
         assert!(info.datums.is_empty());
-        assert!(info.redeemers.is_empty()); // deferred to part 3f
-        assert!(info.votes.is_empty()); // deferred to part 3e
-        assert!(info.proposal_procedures.is_empty()); // deferred to part 3e
+        assert!(info.redeemers.is_empty()); // TODO(task-13f): deferred
+        assert!(info.votes.is_empty());
+        assert!(info.proposal_procedures.is_empty());
         assert_eq!(info.current_treasury, None);
         assert_eq!(info.treasury_donation, None);
         assert_eq!(info.valid_range.lower, None);
@@ -386,6 +404,124 @@ mod tests {
     // ────────────────────────────────────────────────────────────
     // Error propagation
     // ────────────────────────────────────────────────────────────
+
+    // ────────────────────────────────────────────────────────────
+    // certs + wdrl (task #13)
+    // ────────────────────────────────────────────────────────────
+
+    #[test]
+    fn populate_tx_info_v3_translates_stake_deregistration_cert() {
+        use dugite_primitives::credentials::Credential as PrimCred;
+        use dugite_primitives::transaction::Certificate;
+        let mut body = minimal_tx_body(vec![], vec![], 1);
+        body.certificates = vec![Certificate::StakeDeregistration(PrimCred::VerificationKey(
+            h28(0xcc),
+        ))];
+        let tx = build_tx(body, empty_witness_set());
+        let info = populate_tx_info_v3(&tx, &[], &slot_cfg()).unwrap();
+        // Should have exactly 1 cert
+        assert_eq!(info.certs.len(), 1);
+        // TxCertUnRegStaking = Constr 1 [cred, Maybe Lovelace]
+        let crate::script_context::TxCert(ref d) = info.certs[0];
+        let crate::data::Data::Constr(tag, ref fields) = d else {
+            panic!("cert must be Constr; got {d:?}");
+        };
+        assert_eq!(
+            *tag, 1u64,
+            "StakeDeregistration -> TxCertUnRegStaking (Constr 1)"
+        );
+        assert_eq!(fields.len(), 2, "must have credential + Maybe");
+        // credential = PubKeyCredential([0xcc;28]) = Constr 0 [B28]
+        assert!(
+            matches!(&fields[0], crate::data::Data::Constr(0, inner) if inner.len() == 1),
+            "credential must be Constr 0 [B28]; got {:?}",
+            fields[0]
+        );
+        // deposit field = None (pre-Conway StakeDeregistration has no deposit) = Constr 1 []
+        assert_eq!(
+            fields[1],
+            crate::data::Data::Constr(1, vec![]),
+            "pre-Conway StakeDeregistration deposit must be None (Constr 1 [])"
+        );
+    }
+
+    #[test]
+    fn populate_tx_info_v3_translates_withdrawal_with_pubkey_credential() {
+        use dugite_primitives::value::Lovelace;
+        // Reward address blob: header 0xe0 (mainnet key-stake) || [0x77; 28]
+        let mut reward_addr = vec![0xe0u8];
+        reward_addr.extend_from_slice(&[0x77u8; 28]);
+
+        let mut body = minimal_tx_body(vec![], vec![], 1);
+        body.withdrawals
+            .insert(reward_addr.clone(), Lovelace(333_000));
+        let tx = build_tx(body, empty_witness_set());
+        let info = populate_tx_info_v3(&tx, &[], &slot_cfg()).unwrap();
+
+        assert_eq!(info.wdrl.len(), 1, "must have 1 withdrawal entry");
+        let (cred, amt) = &info.wdrl[0];
+        // V3 key: Credential directly, NOT StakingHash-wrapped
+        assert!(
+            matches!(cred, crate::script_context::Credential::PubKey(h) if *h == [0x77u8; 28]),
+            "wdrl key must be PubKeyCredential([0x77;28]); got {cred:?}"
+        );
+        assert_eq!(*amt, BigInt::from(333_000u64));
+    }
+
+    #[test]
+    fn populate_tx_info_v3_translates_withdrawal_with_script_credential() {
+        use dugite_primitives::value::Lovelace;
+        // Reward address blob: header 0xf0 (mainnet script-stake) || [0x88; 28]
+        let mut reward_addr = vec![0xf0u8];
+        reward_addr.extend_from_slice(&[0x88u8; 28]);
+
+        let mut body = minimal_tx_body(vec![], vec![], 1);
+        body.withdrawals
+            .insert(reward_addr.clone(), Lovelace(111_000));
+        let tx = build_tx(body, empty_witness_set());
+        let info = populate_tx_info_v3(&tx, &[], &slot_cfg()).unwrap();
+
+        assert_eq!(info.wdrl.len(), 1);
+        let (cred, amt) = &info.wdrl[0];
+        assert!(
+            matches!(cred, crate::script_context::Credential::Script(h) if *h == [0x88u8; 28]),
+            "wdrl key must be ScriptCredential([0x88;28]); got {cred:?}"
+        );
+        assert_eq!(*amt, BigInt::from(111_000u64));
+    }
+
+    #[test]
+    fn populate_tx_info_v3_wdrl_preserves_btreemap_key_order() {
+        use dugite_primitives::value::Lovelace;
+        // Two reward accounts with different key bytes — BTreeMap orders by
+        // raw byte lex order of the 29-byte reward-account blob.
+        let mut addr_lo = vec![0xe0u8]; // key-stake mainnet
+        addr_lo.extend_from_slice(&[0x10u8; 28]); // smaller bytes
+        let mut addr_hi = vec![0xe0u8];
+        addr_hi.extend_from_slice(&[0x20u8; 28]); // larger bytes
+
+        let mut body = minimal_tx_body(vec![], vec![], 1);
+        // Insert in reverse order — BTreeMap will sort them
+        body.withdrawals.insert(addr_hi.clone(), Lovelace(200_000));
+        body.withdrawals.insert(addr_lo.clone(), Lovelace(100_000));
+        let tx = build_tx(body, empty_witness_set());
+        let info = populate_tx_info_v3(&tx, &[], &slot_cfg()).unwrap();
+
+        assert_eq!(info.wdrl.len(), 2);
+        // BTreeMap iterates in key order: addr_lo (0x10) < addr_hi (0x20)
+        assert!(
+            matches!(&info.wdrl[0].0, crate::script_context::Credential::PubKey(h) if *h == [0x10u8; 28]),
+            "first wdrl entry must be 0x10 (smaller key); got {:?}",
+            info.wdrl[0].0
+        );
+        assert_eq!(info.wdrl[0].1, BigInt::from(100_000u64));
+        assert!(
+            matches!(&info.wdrl[1].0, crate::script_context::Credential::PubKey(h) if *h == [0x20u8; 28]),
+            "second wdrl entry must be 0x20 (larger key); got {:?}",
+            info.wdrl[1].0
+        );
+        assert_eq!(info.wdrl[1].1, BigInt::from(200_000u64));
+    }
 
     #[test]
     fn populate_tx_info_v3_surfaces_missing_input() {

@@ -58,6 +58,8 @@ pub fn build_v3_skeleton(inputs: BuildV3Inputs) -> TxInfoV3 {
         outputs: Vec::new(),
         fee: BigInt::from(inputs.fee_lovelace),
         mint: PlutusValue::default(),
+        certs: Vec::new(),
+        wdrl: Vec::new(),
         valid_range: inputs.valid_range,
         signatories: inputs.signatories,
         redeemers: Vec::new(),
