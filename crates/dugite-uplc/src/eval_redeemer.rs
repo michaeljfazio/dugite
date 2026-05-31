@@ -254,16 +254,28 @@ fn resolve_applied_costs(
     }
 }
 
-/// Decode the script bytes the wire / reference-input provides. Plutus
-/// scripts on chain are encoded as a CBOR byte-string holding the
-/// flat program; we try CBOR-wrapped first, then fall back to raw
-/// flat. Returns the first decoder to succeed.
+/// Decode the script bytes the wire / reference-input provides.
+///
+/// On-chain Plutus scripts are CBOR-encoded byte-strings holding the
+/// flat-encoded program (`from_cbor` handles this). Raw flat bytes
+/// (no CBOR wrapper) are accepted as a fallback for scripts that were
+/// extracted from the inner byte-string by an upstream decoder.
+///
+/// If the outer byte looks like a CBOR byte-string (major type 2) and
+/// `from_cbor` fails, we propagate that error directly — the bytes are
+/// structurally CBOR and it makes no sense to re-attempt as raw flat.
 fn decode_script_bytes(bytes: &[u8]) -> Result<Program, PhaseTwoError> {
-    // Cardano typically double-wraps: outer CBOR bstr holds an inner
-    // CBOR bstr holding flat. Try inner-only first.
-    if let Ok(p) = Program::from_cbor(bytes) {
-        return Ok(p);
+    // CBOR major-type 2 (byte-string) = 0x40-0x5f (short) or 0x58/0x59/0x5a/0x5b (extended).
+    let looks_like_cbor_bytes = bytes.first().is_some_and(|&b| b >> 5 == 2);
+
+    if looks_like_cbor_bytes {
+        // Bytes are CBOR-wrapped — decode once and propagate any error.
+        return Program::from_cbor(bytes).map_err(|e| {
+            PhaseTwoError::Internal(format!("eval_resolved_redeemer: script decode: {e}"))
+        });
     }
+
+    // Raw flat bytes (already unwrapped by the caller / serialization layer).
     Program::from_flat(bytes)
         .map_err(|e| PhaseTwoError::Internal(format!("eval_resolved_redeemer: script decode: {e}")))
 }

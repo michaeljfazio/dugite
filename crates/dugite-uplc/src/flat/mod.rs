@@ -52,17 +52,19 @@ pub mod decode;
 pub mod encode;
 pub mod term;
 
-/// Maximum recursion depth for the flat decoder. The on-chain script
-/// size limit is ~16 KiB; real Plutus scripts rarely exceed depth 32.
-/// The cap protects against stack-exhaustion attacks (decoder recursion
-/// is one frame per level) and is set well below the OS thread stack
-/// budget so even pathological adversarial inputs cannot smash the
-/// stack before the depth check fires.
+/// Maximum recursion depth for the flat decoder.
 ///
-/// 256 is generous: it's an order of magnitude past any observed real
-/// script and ~16x below the smallest Rust default thread stack
-/// (the test runner's `nextest` default is 2 MiB).
-pub const FLAT_MAX_DEPTH: usize = 256;
+/// Haskell's flat decoder imposes NO depth cap — validity is bounded only by
+/// the on-chain script-size limit (16 KiB). With at least 4 bits consumed per
+/// tree-level the theoretical maximum depth for a 16 KiB script is
+/// 16 × 1024 × 8 / 4 = 32 768, so a cap below that can reject a valid-but-deep
+/// script that cardano-node accepts (a phase-2 conformance/liveness risk —
+/// observed as the Alonzo "filler missing"/"term depth limit" divergence). We
+/// therefore set the cap at the true 16 KiB ceiling. Stack exhaustion is no
+/// longer the cap's concern: `stacker::maybe_grow` (see `decode_term_depth`)
+/// transparently extends the OS stack at the recursion site, so heap/stack stay
+/// bounded by the script size regardless of depth.
+pub const FLAT_MAX_DEPTH: usize = 32768;
 
 /// Result alias for flat decode/encode operations.
 pub type FlatResult<T> = Result<T, crate::UplcError>;

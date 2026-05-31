@@ -309,6 +309,26 @@ fn data_constr(tag: u64, fields: Vec<Data>) -> Data {
     Data::Constr(tag, fields)
 }
 
+/// Encode a 32-byte hash as `TxId = Constr 0 [B bytes32]`.
+///
+/// The Haskell `TxId` newtype is serialised with
+/// `makeIsDataSchemaIndexed ''TxId [('TxId, 0)]`, so scripts
+/// navigate it with `unConstrData` then read the inner bytes.
+fn data_txid(b: &[u8; 32]) -> Data {
+    data_constr(0, vec![data_bs32(b)])
+}
+
+/// Encode an ADA-only fee as a Plutus `Value`.
+///
+/// `txInfoFee :: Value` — schema: `Map [(B[], Map [(B[], I lovelace)])]`
+/// Empty bytestring = adaSymbol; empty bytestring = adaToken.
+fn data_ada_value(lovelace: BigInt) -> Data {
+    data_map(vec![(
+        Data::B(Vec::new()),
+        data_map(vec![(Data::B(Vec::new()), data_i(lovelace))]),
+    )])
+}
+
 impl Credential {
     pub fn to_data(&self) -> Data {
         match self {
@@ -346,8 +366,16 @@ impl Address {
 
 impl PlutusValue {
     pub fn to_data(&self) -> Data {
-        // Plutus Value = Map PolicyId (Map AssetName Integer). Ada is
-        // policy = "" with asset "".
+        // Plutus Value = Map CurrencySymbol (Map TokenName Integer).
+        //
+        // Critical: the CurrencySymbol (PolicyId) for Ada is the EMPTY
+        // bytestring b"", NOT 28 zero bytes.  Haskell defines:
+        //   adaSymbol = CurrencySymbol mempty  -- CurrencySymbol ""
+        // Scripts that inspect value by policy look up b"" for Ada; if
+        // we emit the 28-zero-byte key they silently find nothing.
+        //
+        // For native-token policies, the CurrencySymbol IS the 28-byte
+        // policy-id script hash (so `data_bs28` is correct for those).
         data_map(
             self.policies
                 .iter()
@@ -356,7 +384,15 @@ impl PlutusValue {
                         .iter()
                         .map(|(name, amt)| (Data::B(name.clone()), data_i(amt.clone())))
                         .collect();
-                    (data_bs28(policy), data_map(entries))
+                    // ADA policy ([0u8;28]) is a sentinel value in `value_to_plutus`.
+                    // Emit it as the EMPTY bytestring (b"") to match the Haskell
+                    // `adaSymbol = CurrencySymbol mempty` convention.
+                    let key = if policy == &[0u8; 28] {
+                        Data::B(Vec::new())
+                    } else {
+                        data_bs28(policy)
+                    };
+                    (key, data_map(entries))
                 })
                 .collect(),
         )
@@ -365,7 +401,14 @@ impl PlutusValue {
 
 impl TxOutRef {
     pub fn to_data(&self) -> Data {
-        data_constr(0, vec![data_bs32(&self.tx_id), data_i(self.idx.into())])
+        // Schema: `TxOutRef = Constr 0 [TxId, Integer]`
+        //         `TxId     = Constr 0 [B bytes32]`      (newtype wrapper)
+        //
+        // The TxId is NOT bare bytes — it is itself a Constr 0 [B bytes32].
+        // Haskell: `makeIsDataSchemaIndexed ''TxId [('TxId, 0)]`
+        // Scripts navigate it via `unConstrData` before reading the inner bytes.
+        let tx_id_data = data_constr(0, vec![data_bs32(&self.tx_id)]);
+        data_constr(0, vec![tx_id_data, data_i(self.idx.into())])
     }
 }
 
@@ -380,6 +423,28 @@ impl OutputDatum {
 }
 
 impl TxOut {
+    /// V1 TxOut schema: `Constr 0 [Address, Value, Maybe DatumHash]`
+    ///
+    /// V1 does not have inline datums or reference scripts.
+    /// `datum` field for V1: `OutputDatum::None` → `Nothing = Constr 1 []`,
+    ///                       `OutputDatum::Hash(h)` → `Just h = Constr 0 [B32]`.
+    /// `OutputDatum::Inline` should not appear in V1 — treated as None.
+    pub fn to_data_v1(&self) -> Data {
+        let datum_hash = match &self.datum {
+            OutputDatum::None => data_constr(1, vec![]), // Nothing
+            OutputDatum::Hash(h) => data_constr(0, vec![data_bs32(h)]), // Just (DatumHash h)
+            OutputDatum::Inline(_) => data_constr(1, vec![]), // V1 sees no inline datums
+        };
+        data_constr(
+            0,
+            vec![self.address.to_data(), self.value.to_data(), datum_hash],
+        )
+    }
+
+    /// V2/V3 TxOut schema: `Constr 0 [Address, Value, OutputDatum, Maybe ScriptHash]`
+    ///
+    /// `OutputDatum`: None=Constr0[], Hash=Constr1[B32], Inline=Constr2[datum].
+    /// Reference-script: Nothing=Constr1[], Just h=Constr0[B28].
     pub fn to_data(&self) -> Data {
         let ref_script = match &self.reference_script {
             None => data_constr(1, vec![]),
@@ -398,6 +463,12 @@ impl TxOut {
 }
 
 impl TxInInfo {
+    /// V1 encoding: `Constr 0 [TxOutRef, TxOut_v1]`.
+    pub fn to_data_v1(&self) -> Data {
+        data_constr(0, vec![self.out_ref.to_data(), self.resolved.to_data_v1()])
+    }
+
+    /// V2/V3 encoding: `Constr 0 [TxOutRef, TxOut_v2]`.
     pub fn to_data(&self) -> Data {
         data_constr(0, vec![self.out_ref.to_data(), self.resolved.to_data()])
     }
@@ -405,11 +476,58 @@ impl TxInInfo {
 
 impl PosixTimeRange {
     pub fn to_data(&self) -> Data {
-        let bound = |x: Option<i64>| match x {
-            None => data_constr(0, vec![]), // NegInf / PosInf
-            Some(t) => data_constr(1, vec![data_i(t.into()), data_constr(1, vec![])]),
+        // Plutus `Interval POSIXTime` is encoded as:
+        //   Interval (LowerBound (Extended POSIXTime) Bool)
+        //            (UpperBound (Extended POSIXTime) Bool)
+        //
+        // PlutusTx Data encoding of each constructor:
+        //
+        //   Extended:
+        //     NegInf      = Constr 0 []
+        //     Finite t    = Constr 1 [I(t)]       -- ONE field, just the value
+        //     PosInf      = Constr 2 []
+        //
+        //   Bool:
+        //     False       = Constr 0 []
+        //     True        = Constr 1 []
+        //
+        //   LowerBound ext closed = Constr 0 [ext.to_data(), bool.to_data()]
+        //   UpperBound ext closed = Constr 0 [ext.to_data(), bool.to_data()]
+        //   Interval   lb  ub    = Constr 0 [lb.to_data(), ub.to_data()]
+        //
+        // Translating cardano-ledger's `transValidityInterval`:
+        //   validity_start = None     => LowerBound NegInf True
+        //   validity_start = Some(ms) => LowerBound (Finite ms) True  -- closed lower
+        //   ttl = None                => UpperBound PosInf True
+        //   ttl = Some(ms)            => UpperBound (Finite ms) False -- open upper
+        //
+        // Reference:
+        //   IntersectMBO/cardano-ledger: eras/alonzo/impl/.../TxInfo.hs
+        //   `transValidityInterval` / `transVITime`
+
+        let data_false = data_constr(0, vec![]); // Bool False = Constr 0 []
+        let data_true = data_constr(1, vec![]); // Bool True  = Constr 1 []
+
+        // lower bound: None => NegInf, closed (True); Some => Finite ms, closed (True)
+        let lower_ext = match self.lower {
+            None => data_constr(0, vec![]), // NegInf = Constr 0 []
+            Some(t) => data_constr(1, vec![data_i(t.into())]), // Finite t = Constr 1 [I(t)]
         };
-        data_constr(0, vec![bound(self.lower), bound(self.upper)])
+        let lower_bound = data_constr(0, vec![lower_ext, data_true.clone()]);
+
+        // upper bound: None => PosInf, closed (True); Some => Finite ms, open (False)
+        let upper_ext = match self.upper {
+            None => data_constr(2, vec![]), // PosInf = Constr 2 []
+            Some(t) => data_constr(1, vec![data_i(t.into())]), // Finite t = Constr 1 [I(t)]
+        };
+        let upper_closed = if self.upper.is_none() {
+            data_true // PosInf bound is closed (True)
+        } else {
+            data_false // Finite upper bound is open (False) — half-open interval [a, b)
+        };
+        let upper_bound = data_constr(0, vec![upper_ext, upper_closed]);
+
+        data_constr(0, vec![lower_bound, upper_bound])
     }
 }
 
@@ -435,7 +553,10 @@ impl Voter {
 
 impl GovActionId {
     pub fn to_data(&self) -> Data {
-        data_constr(0, vec![data_bs32(&self.tx_id), data_i(self.idx.into())])
+        // V3 schema: `GovActionId = Constr 0 [TxId, Integer]`
+        // `TxId = Constr 0 [B bytes32]` — same wrapping as TxOutRef.
+        let tx_id_data = data_constr(0, vec![data_bs32(&self.tx_id)]);
+        data_constr(0, vec![tx_id_data, data_i(self.idx.into())])
     }
 }
 
@@ -497,6 +618,11 @@ impl TxInfoV3 {
                         .collect(),
                 ),
                 data_list(self.outputs.iter().map(TxOut::to_data).collect()),
+                // V3 `txInfoFee :: Lovelace` is a newtype over Integer with a
+                // newtype-derived ToData — it serialises as a BARE `I lovelace`,
+                // NOT a Value map (unlike V1/V2 `txInfoFee :: Value`). Adversarial
+                // review caught the previous attempt wrongly applying the
+                // V1/V2 ada-Value encoding here.
                 data_i(self.fee.clone()),
                 self.mint.to_data(),
                 data_list(self.signatories.iter().map(data_bs28).collect()),
@@ -512,7 +638,8 @@ impl TxInfoV3 {
                         .map(|(h, d)| (data_bs32(h), d.clone()))
                         .collect(),
                 ),
-                data_bs32(&self.txid),
+                // txInfoId :: TxId = Constr 0 [B bytes32]
+                data_constr(0, vec![data_bs32(&self.txid)]),
                 data_list(
                     self.votes
                         .iter()
@@ -567,14 +694,29 @@ impl ScriptContextV3 {
 
 impl TxInfoV1 {
     pub fn to_data(&self) -> Data {
+        // V1 TxInfo (Alonzo-era) field order — 10 fields, Constr 0:
+        //   [inputs, outputs, fee, mint, dcert, wdrl, validRange,
+        //    signatories, data, id]
+        //
+        // Key V1 vs V2 differences:
+        //   - inputs/outputs use V1 TxOut shape (3 fields, no ref_script)
+        //   - fee :: Value  (NOT Integer) = Map[(b"", Map[(b"", I lovelace)])]
+        //   - wdrl :: [(StakingCredential, Integer)]  = List[Constr 0 [cred, amt]]
+        //     (V1 uses AssocList not AssocMap; schema: `[(StakingCredential, Integer)]`)
+        //   - data :: [(DatumHash, Datum)] = List[Constr 0 [B32, datum]]
+        //   - id :: TxId = Constr 0 [B bytes32]
         data_constr(
             0,
             vec![
-                data_list(self.inputs.iter().map(TxInInfo::to_data).collect()),
-                data_list(self.outputs.iter().map(TxOut::to_data).collect()),
-                data_i(self.fee.clone()),
+                data_list(self.inputs.iter().map(TxInInfo::to_data_v1).collect()),
+                data_list(self.outputs.iter().map(TxOut::to_data_v1).collect()),
+                // fee :: Value — ADA-only map, NOT bare Integer
+                data_ada_value(self.fee.clone()),
                 self.mint.to_data(),
                 data_list(self.dcert.iter().map(|c| c.0.clone()).collect()),
+                // V1 wdrl :: [(StakingCredential, Integer)] — AssocList, not Map.
+                // Encoded as List[Constr 0 [cred.to_data(), I(amt)]].
+                // Reference: PlutusLedgerApi/V1/Contexts.hs TxInfo definition.
                 data_list(
                     self.wdrl
                         .iter()
@@ -585,13 +727,16 @@ impl TxInfoV1 {
                 ),
                 self.valid_range.to_data(),
                 data_list(self.signatories.iter().map(data_bs28).collect()),
-                data_map(
+                // V1 data :: [(DatumHash, Datum)] — AssocList, not Map.
+                // Encoded as List[Constr 0 [B32(hash), datum]].
+                data_list(
                     self.data
                         .iter()
-                        .map(|(h, d)| (data_bs32(h), d.clone()))
+                        .map(|(h, d)| data_constr(0, vec![data_bs32(h), d.clone()]))
                         .collect(),
                 ),
-                data_bs32(&self.txid),
+                // id :: TxId = Constr 0 [B bytes32]
+                data_txid(&self.txid),
             ],
         )
     }
@@ -605,6 +750,17 @@ impl ScriptContextV1 {
 
 impl TxInfoV2 {
     pub fn to_data(&self) -> Data {
+        // V2 TxInfo (Babbage-era) field order — 12 fields, Constr 0:
+        //   [inputs, refInputs, outputs, fee, mint, dcert, wdrl,
+        //    validRange, signatories, redeemers, data, id]
+        //
+        // Key V2 differences from V1:
+        //   - Has reference_inputs
+        //   - fee :: Value (same as V1: Map, not bare Integer)
+        //   - wdrl :: Map StakingCredential Integer (AssocMap → Data::Map)
+        //   - data :: Map DatumHash Datum (AssocMap → Data::Map)
+        //   - Has redeemers Map
+        //   - id :: TxId = Constr 0 [B bytes32]
         data_constr(
             0,
             vec![
@@ -616,32 +772,36 @@ impl TxInfoV2 {
                         .collect(),
                 ),
                 data_list(self.outputs.iter().map(TxOut::to_data).collect()),
-                data_i(self.fee.clone()),
+                // fee :: Value — ADA-only map, NOT bare Integer
+                data_ada_value(self.fee.clone()),
                 self.mint.to_data(),
                 data_list(self.dcert.iter().map(|c| c.0.clone()).collect()),
-                data_list(
+                // V2 wdrl :: Map StakingCredential Integer — Data::Map.
+                // Reference: PlutusLedgerApi/V2/Contexts.hs TxInfo.txInfoWdrl.
+                data_map(
                     self.wdrl
                         .iter()
-                        .map(|(cred, amt)| {
-                            data_constr(0, vec![cred.to_data(), data_i(amt.clone())])
-                        })
+                        .map(|(cred, amt)| (cred.to_data(), data_i(amt.clone())))
                         .collect(),
                 ),
                 self.valid_range.to_data(),
                 data_list(self.signatories.iter().map(data_bs28).collect()),
+                // V2 redeemers :: Map ScriptPurpose Redeemer — Data::Map.
                 data_map(
                     self.redeemers
                         .iter()
                         .map(|(p, d)| (p.to_data(), d.clone()))
                         .collect(),
                 ),
+                // V2 data :: Map DatumHash Datum — Data::Map.
                 data_map(
                     self.data
                         .iter()
                         .map(|(h, d)| (data_bs32(h), d.clone()))
                         .collect(),
                 ),
-                data_bs32(&self.txid),
+                // id :: TxId = Constr 0 [B bytes32]
+                data_txid(&self.txid),
             ],
         )
     }
@@ -696,18 +856,38 @@ mod tests {
     }
 
     #[test]
-    fn tx_out_ref_encodes_as_constr_0_with_id_and_idx() {
+    fn tx_out_ref_encodes_as_constr_0_with_txid_wrapper_and_idx() {
+        // TxOutRef = Constr 0 [TxId, Integer]
+        // TxId     = Constr 0 [B bytes32]   (newtype — NOT bare bytes)
         let r = TxOutRef {
             tx_id: [7u8; 32],
             idx: 3,
         };
-        if let Data::Constr(0, fields) = r.to_data() {
-            assert_eq!(fields.len(), 2);
-            assert!(matches!(&fields[0], Data::B(b) if b.len() == 32));
-            assert!(matches!(&fields[1], Data::I(i) if i == &BigInt::from(3)));
-        } else {
-            panic!("expected Constr 0");
-        }
+        let d = r.to_data();
+        let Data::Constr(0, ref fields) = d else {
+            panic!("TxOutRef must be Constr 0; got {d:?}");
+        };
+        assert_eq!(
+            fields.len(),
+            2,
+            "TxOutRef must have 2 fields (TxId, Integer)"
+        );
+        // fields[0] must be TxId = Constr 0 [B bytes32]
+        let Data::Constr(0, ref id_fields) = fields[0] else {
+            panic!("TxId must be Constr 0; got {:?}", fields[0]);
+        };
+        assert_eq!(id_fields.len(), 1, "TxId has 1 inner field (the raw bytes)");
+        assert!(
+            matches!(&id_fields[0], Data::B(b) if b.len() == 32 && b.iter().all(|&x| x == 7)),
+            "TxId inner bytes must be the 32 hash bytes; got {:?}",
+            id_fields[0]
+        );
+        // fields[1] must be the index
+        assert!(
+            matches!(&fields[1], Data::I(i) if i == &BigInt::from(3)),
+            "TxOutRef idx field must be I(3); got {:?}",
+            fields[1]
+        );
     }
 
     #[test]

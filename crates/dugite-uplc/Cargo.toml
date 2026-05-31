@@ -58,6 +58,11 @@ num-traits = { workspace = true }
 # (not pallas-codec) to keep dugite-uplc free of the pallas dependency chain.
 minicbor = { workspace = true }
 
+# Stack growth for deeply-nested UPLC term decoding. Real-world DeFi scripts
+# can exceed 500 nesting levels; `stacker::maybe_grow` extends the OS stack
+# transparently without changing the recursion structure of the decoder.
+stacker = "0.1"
+
 # Logging.
 tracing = { workspace = true }
 
