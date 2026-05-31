@@ -58,8 +58,8 @@
 use dugite_uplc::data::Data;
 use dugite_uplc::script_context::Address;
 use dugite_uplc::script_context::{
-    Credential, OutputDatum, PlutusValue, PosixTimeRange, ScriptContextV1, ScriptPurpose,
-    StakingCredential, TxInfoV1, TxInfoV2, TxInfoV3, TxOut, TxOutRef,
+    Credential, GovActionId, OutputDatum, PlutusValue, PosixTimeRange, ScriptContextV1,
+    ScriptPurpose, StakingCredential, TxInInfo, TxInfoV1, TxInfoV2, TxInfoV3, TxOut, TxOutRef,
 };
 use num_bigint::BigInt;
 
@@ -424,6 +424,8 @@ fn minimal_txinfo_v3() -> TxInfoV3 {
         outputs: vec![],
         fee: BigInt::from(0u64),
         mint: PlutusValue::default(),
+        certs: vec![],
+        wdrl: vec![],
         valid_range: PosixTimeRange {
             lower: None,
             upper: None,
@@ -676,6 +678,96 @@ fn txoutref_txid_is_not_bare_bytes() {
         "TxId field must NOT be bare bytes (Bug E regression); got {:?}",
         outer[0]
     );
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// V3 bare-txid: V3 `TxId = newtype … deriving newtype ToData` → BARE B(32)
+// everywhere (txInfoId, TxOutRef.txId, GovActionId.txId), unlike V1/V2's
+// `Constr 0 [B32]` wrapper. Routing the V3 path through the wrapped form broke
+// every V3 spending/governance validator at the first unConstrData.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// `TxOutRef::to_data_v3` must embed the txid as BARE `B(32)`:
+/// `Constr 0 [B(32), I idx]` — NOT the V1/V2 `Constr 0 [Constr 0 [B32], I idx]`.
+#[test]
+fn txoutref_v3_txid_is_bare_bytes() {
+    let r = TxOutRef {
+        tx_id: [0xcd; 32],
+        idx: 3,
+    };
+    let Data::Constr(0, ref outer) = r.to_data_v3() else {
+        panic!("V3 TxOutRef must be Constr 0");
+    };
+    assert_eq!(outer.len(), 2);
+    assert!(
+        matches!(&outer[0], Data::B(b) if b.len() == 32),
+        "V3 TxOutRef txid must be BARE B(32); got {:?}",
+        outer[0]
+    );
+    assert!(matches!(&outer[1], Data::I(i) if i == &BigInt::from(3u64)));
+}
+
+/// The V3 `TxInfo.inputs` path (`TxInInfo::to_data_v3`) must embed the bare-txid
+/// V3 TxOutRef, NOT the wrapped V1/V2 one.
+#[test]
+fn v3_txininfo_embeds_bare_txid_outref() {
+    let info = {
+        let mut i = minimal_txinfo_v3();
+        i.inputs = vec![TxInInfo {
+            out_ref: TxOutRef {
+                tx_id: [0x01; 32],
+                idx: 0,
+            },
+            resolved: TxOut {
+                address: Address {
+                    payment: Credential::PubKey([0x02; 28]),
+                    staking: None,
+                },
+                value: PlutusValue::default(),
+                datum: OutputDatum::None,
+                reference_script: None,
+            },
+        }];
+        i
+    };
+    let Data::Constr(0, ref fields) = info.to_data() else {
+        panic!("TxInfoV3 must be Constr 0");
+    };
+    // field[0] = inputs : List[TxInInfo]
+    let Data::List(ref inputs) = fields[0] else {
+        panic!("inputs must be a List");
+    };
+    let Data::Constr(0, ref txininfo) = inputs[0] else {
+        panic!("TxInInfo must be Constr 0");
+    };
+    // txininfo[0] = TxOutRef = Constr 0 [B32 BARE, I idx]
+    let Data::Constr(0, ref outref) = txininfo[0] else {
+        panic!("TxOutRef must be Constr 0");
+    };
+    assert!(
+        matches!(&outref[0], Data::B(b) if b.len() == 32),
+        "V3 TxInInfo's TxOutRef txid must be BARE B(32), not Constr-wrapped; got {:?}",
+        outref[0]
+    );
+}
+
+/// `GovActionId::to_data` (V3 votes map) must embed the bare-txid form.
+#[test]
+fn gov_action_id_v3_txid_is_bare_bytes() {
+    let g = GovActionId {
+        tx_id: [0x09; 32],
+        idx: 1,
+    };
+    let Data::Constr(0, ref outer) = g.to_data() else {
+        panic!("GovActionId must be Constr 0");
+    };
+    assert_eq!(outer.len(), 2);
+    assert!(
+        matches!(&outer[0], Data::B(b) if b.len() == 32),
+        "V3 GovActionId txid must be BARE B(32); got {:?}",
+        outer[0]
+    );
+    assert!(matches!(&outer[1], Data::I(i) if i == &BigInt::from(1u64)));
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
