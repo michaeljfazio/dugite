@@ -565,24 +565,28 @@ async fn run_dump_snapshot(args: DumpSnapshotArgs) -> Result<()> {
 
     let mut byron_epoch_length: u64 = 0;
     let mut byron_slot_duration_ms: u64 = 20_000; // default 20s; overridden by Byron genesis
-    let mut byron_initial_funds: u64 = 0;
+                                                  // Genesis UTxO entries (address bytes + lovelace), mirroring the running-node path.
+                                                  // These are needed so that unredeemed AVVM UTxOs remain in the UTxO set through
+                                                  // Byron replay and are correctly purged by `returnRedeemAddrsToReserves` at the
+                                                  // Shelley→Allegra boundary (epoch 236 on mainnet, ~299M ADA returned to reserves).
+    let mut byron_genesis_utxos: Vec<(Vec<u8>, u64)> = Vec::new();
     if let Some(ref genesis_path) = node_config.byron_genesis_file {
         let genesis_path = config_dir.join(genesis_path);
         if let Ok((genesis, _hash)) = genesis::ByronGenesis::load_with_hash(&genesis_path) {
             let k = genesis.security_param();
             byron_epoch_length = 10 * k;
             byron_slot_duration_ms = genesis.slot_duration_ms();
-            // Sum initial fund distribution (nonAvvmBalances + avvmDistr)
-            // These funds are distributed at genesis and must be subtracted
-            // from reserves to match the Haskell reference implementation.
-            byron_initial_funds = genesis.initial_utxos().iter().map(|e| e.lovelace).sum();
+            let utxos = genesis.initial_utxos();
+            let total: u64 = utxos.iter().map(|e| e.lovelace).sum();
             info!(
                 k,
                 epoch_len = byron_epoch_length,
                 slot_duration_ms = byron_slot_duration_ms,
-                initial_funds = byron_initial_funds,
+                avvm_count = utxos.len(),
+                initial_funds = total,
                 "Byron genesis loaded"
             );
+            byron_genesis_utxos = utxos.into_iter().map(|e| (e.address, e.lovelace)).collect();
         }
     }
 
@@ -727,18 +731,22 @@ async fn run_dump_snapshot(args: DumpSnapshotArgs) -> Result<()> {
     if let Some(ref sg) = shelley_genesis_opt {
         ledger.set_epoch_length(sg.epoch_length, sg.security_param);
         ledger.update_quorum = sg.update_quorum;
-        // reserves = maxLovelaceSupply - initial fund distribution (Byron genesis)
-        // The Byron nonAvvmBalances are distributed at genesis and enter
-        // circulation immediately, reducing the reserve pool.
-        ledger.epochs.reserves = dugite_primitives::value::Lovelace(
-            sg.max_lovelace_supply.saturating_sub(byron_initial_funds),
-        );
-        info!(
-            max_supply = sg.max_lovelace_supply,
-            initial_funds = byron_initial_funds,
-            reserves = ledger.epochs.reserves.0,
-            "Reserves initialized (maxSupply - initialFunds)"
-        );
+        // Seed Byron genesis UTxOs via seed_genesis_utxos (which deducts from reserves).
+        // reserves = maxLovelaceSupply - Σ(genesis UTxO lovelace)
+        //
+        // This mirrors the running-node path (Node::init_ledger_state) and is required
+        // for `returnRedeemAddrsToReserves` at the Shelley→Allegra boundary to work:
+        // unredeemed AVVM UTxOs must be in the live UTxO set so the scan finds them.
+        // set_max_lovelace_supply() (called above) already reset reserves to max;
+        // seed_genesis_utxos() subtracts the total from reserves.
+        if !byron_genesis_utxos.is_empty() {
+            ledger.seed_genesis_utxos(&byron_genesis_utxos);
+            info!(
+                count = byron_genesis_utxos.len(),
+                reserves = ledger.epochs.reserves.0,
+                "Byron genesis UTxOs seeded (AVVM + nonAvvm); reserves reduced"
+            );
+        }
     }
 
     // Seed the nonce state machine from the Shelley genesis hash (matching
@@ -748,13 +756,6 @@ async fn run_dump_snapshot(args: DumpSnapshotArgs) -> Result<()> {
     if let Some(hash) = shelley_genesis_hash {
         ledger.set_genesis_hash(hash);
     }
-
-    // NOTE: Byron genesis UTxOs are NOT seeded here (unlike the running node).
-    // The genesis transaction's inputs will show "not found" warnings but
-    // outputs are still created. This produces the correct Shelley UTxO set
-    // because the Byron inputs are consumed by the genesis transaction.
-    // Seeding would require matching the exact tx_hash derivation used by
-    // the Haskell node's Byron UTxO format, which is complex.
 
     // Set the Shelley transition epoch and Byron epoch length.
     // On preview/preprod (no Byron era), transition = 0 and blocks start

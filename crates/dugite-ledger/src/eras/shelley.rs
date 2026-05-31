@@ -21,15 +21,16 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
+use dugite_primitives::address::Address;
 use dugite_primitives::block::{Block, BlockHeader};
 use dugite_primitives::credentials::Credential;
 use dugite_primitives::era::Era;
 use dugite_primitives::hash::{Hash28, Hash32};
 use dugite_primitives::protocol_params::ProtocolParameters;
 use dugite_primitives::time::EpochNo;
-use dugite_primitives::transaction::{Certificate, Transaction};
+use dugite_primitives::transaction::{Certificate, Transaction, TransactionInput};
 use dugite_primitives::value::Lovelace;
-use tracing::debug;
+use tracing::{debug, info};
 
 use super::common;
 use super::{EraRules, RuleContext};
@@ -48,6 +49,77 @@ impl ShelleyRules {
     pub fn new() -> Self {
         ShelleyRules
     }
+}
+
+// ---------------------------------------------------------------------------
+// Shelley → Allegra hard-fork state transformation
+// ---------------------------------------------------------------------------
+
+/// Implements `returnRedeemAddrsToReserves` from
+/// `Cardano.Ledger.Allegra.Translation` (cardano-ledger).
+///
+/// Scans every live UTxO entry.  Any entry whose address is a Byron
+/// bootstrap address with `addr_type == 2` (AVVM / ATRedeem) is removed
+/// from the UTxO set and its coin is accumulated into reserves.
+///
+/// Haskell reference (verbatim):
+/// ```haskell
+/// returnRedeemAddrsToReserves es = es { esChainAccountState = acnt'
+///                                     , esLState = ls' }
+///   where
+///     UTxO utxo = utxosUtxo us
+///     (redeemers, nonredeemers) =
+///       Map.partition
+///         (maybe False isBootstrapRedeemer . view bootAddrTxOutF)
+///         utxo
+///     acnt' = acnt { casReserves = casReserves acnt <+> sumCoinUTxO (UTxO redeemers) }
+///     us'   = us   { utxosUtxo   = UTxO nonredeemers }
+/// ```
+///
+/// `isBootstrapRedeemer addr = addrType addr == ATRedeem`
+/// (`Cardano.Chain.Common.AddrType` — value `2` in the CBOR encoding).
+///
+/// `sumCoinUTxO` sums the `coin` field only (lovelace); multi-asset UTxOs
+/// did not exist in the Shelley era so this is equivalent to summing the
+/// entire value.
+fn return_redeem_addrs_to_reserves(utxo: &mut UtxoSubState, epochs: &mut EpochSubState) {
+    // Phase 1: scan the full UTxO set and collect every redeem-address input.
+    // We cannot mutate the UTxO set while scanning (borrow-checker), so we
+    // collect the inputs first, then remove in a second pass.
+    let mut redeem_inputs: Vec<TransactionInput> = Vec::new();
+    let mut redeem_coin: u64 = 0;
+
+    utxo.utxo_set.scan_all(|input, output| {
+        let is_redeem = matches!(&output.address, Address::Byron(b) if b.is_redeem());
+        if is_redeem {
+            redeem_inputs.push(input.clone());
+            // sumCoinUTxO: add the coin (lovelace) component only.
+            // All Shelley-era outputs are ADA-only so value.coin == full value.
+            redeem_coin = redeem_coin.saturating_add(output.value.coin.0);
+        }
+    });
+
+    let redeem_count = redeem_inputs.len();
+
+    // Phase 2: remove them from the UTxO set.
+    for input in &redeem_inputs {
+        utxo.utxo_set.remove(input);
+    }
+
+    // Phase 3: credit the total coin to reserves.
+    // Haskell: casReserves acnt <+> sumCoinUTxO (UTxO redeemers)
+    // `<+>` is `Coin` addition (saturating).
+    epochs.reserves = Lovelace(epochs.reserves.0.saturating_add(redeem_coin));
+
+    let redeem_ada = redeem_coin / 1_000_000;
+    info!(
+        redeem_utxo_count = redeem_count,
+        redeem_coin_lovelace = redeem_coin,
+        redeem_coin_ada = redeem_ada,
+        reserves_after = epochs.reserves.0,
+        "Shelley→Allegra: returnRedeemAddrsToReserves — purged AVVM redeem UTxOs, \
+         credited coin to reserves",
+    );
 }
 
 impl EraRules for ShelleyRules {
@@ -729,33 +801,56 @@ impl EraRules for ShelleyRules {
             .unwrap_or(u64::MAX)
     }
 
-    /// No-op era transition for Shelley/Allegra/Mary.
+    /// Era transition handler for Shelley/Allegra/Mary boundaries.
     ///
-    /// Haskell's `upgradeShelleyPParams`, `upgradeAllegraPParams`, and
-    /// `upgradeMaryPParams` carry `protocolVersion` forward verbatim via `coerce`
-    /// (zero-cost type coercion). PV advances for these eras are driven by PPUP
-    /// (protocol parameter update proposals) voted on within each era, not by the
-    /// era transition itself. The initial PV for Byron→Shelley comes from
-    /// `shelley-genesis.json::protocolParams::protocolVersion` (loaded at startup
-    /// via `genesis.rs::apply_to_protocol_params`), and all subsequent bumps go
-    /// through the PPUP path (correctly decoded since #624).
+    /// **Shelley → Allegra (`from_era == Shelley, ctx.era == Allegra`)**
     ///
-    /// Dugite has no separate HFC consensus layer; era transitions are detected via
-    /// `block.era`. Byron→Shelley staking state (genesis delegates, initial funds)
-    /// is already initialised during `LedgerState` construction — no additional
-    /// state transformation is needed at this boundary.
+    /// Implements `returnRedeemAddrsToReserves` from
+    /// `Cardano.Ledger.Allegra.Translation` (cardano-ledger):
     ///
-    /// Mirrors the Babbage fix from commit `a09b7ce47` (issue #626). Closes #630.
+    /// ```haskell
+    /// returnRedeemAddrsToReserves es = es { esChainAccountState = acnt'
+    ///                                     , esLState = ls' }
+    ///   where
+    ///     UTxO utxo = utxosUtxo us
+    ///     (redeemers, nonredeemers) =
+    ///       Map.partition (maybe False isBootstrapRedeemer . view bootAddrTxOutF) utxo
+    ///     acnt' = acnt { casReserves = casReserves acnt <+> sumCoinUTxO (UTxO redeemers) }
+    ///     us'   = us   { utxosUtxo   = UTxO nonredeemers }
+    /// ```
+    ///
+    /// `isBootstrapRedeemer` = the TxOut's address is a Byron `BootstrapAddress`
+    /// whose inner `addr_type` field is `2` (ATRedeem / AVVM voucher-redemption
+    /// address).  All such UTxOs are removed from the live set and their coin
+    /// (lovelace only — multi-asset did not exist in Shelley) is added to reserves.
+    ///
+    /// This runs exactly ONCE at the Shelley→Allegra hard fork. On mainnet
+    /// this purges the remaining unredeemed AVVM vouchers (~299 M ADA) and
+    /// adds them back to reserves.
+    ///
+    /// **All other boundaries (Byron→Shelley, Allegra→Mary)**
+    ///
+    /// PV carry-forward is a no-op: `upgradeXxxPParams` in Haskell does a
+    /// zero-cost `coerce`; PV bumps are driven by PPUP proposals, not by the
+    /// era transition itself.  Byron→Shelley staking state (genesis delegates,
+    /// initial funds) is already initialised during `LedgerState` construction.
     fn on_era_transition(
         &self,
         from_era: Era,
         ctx: &RuleContext,
-        _utxo: &mut UtxoSubState,
+        utxo: &mut UtxoSubState,
         _certs: &mut CertSubState,
         _gov: &mut GovSubState,
         _consensus: &mut ConsensusSubState,
-        _epochs: &mut EpochSubState,
+        epochs: &mut EpochSubState,
     ) -> Result<(), LedgerError> {
+        // Shelley → Allegra: returnRedeemAddrsToReserves
+        // Haskell: Cardano.Ledger.Allegra.Translation (TranslateEra AllegraEra ShelleyEra)
+        if from_era == Era::Shelley && ctx.era == Era::Allegra {
+            return_redeem_addrs_to_reserves(utxo, epochs);
+            return Ok(());
+        }
+
         debug!(
             "{:?} -> {:?} era transition (ctx.era={:?}): no ledger-side state \
              mutation; PV carry-forward is a no-op, PPUP drives all bumps",
@@ -1795,5 +1890,230 @@ mod tests {
             initial_treasury,
             epochs.treasury.0
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // returnRedeemAddrsToReserves tests (Shelley → Allegra transition)
+    // -----------------------------------------------------------------------
+
+    /// Build a minimal Byron address payload in the outer wire format
+    /// (`array(2)[tag(24, bstr(inner)), crc32]`).
+    ///
+    /// `addr_type`: 0 = PubKey, 1 = Script, 2 = Redeem (ATRedeem/AVVM).
+    fn make_byron_payload(addr_type: u32) -> Vec<u8> {
+        // Inner: array(3)[bstr(28), map(0), u32(addr_type)]
+        let mut inner = Vec::new();
+        let mut e = minicbor::Encoder::new(&mut inner);
+        e.array(3).unwrap();
+        e.bytes(&[0xABu8; 28]).unwrap(); // 28-byte root hash (synthetic)
+        e.map(0).unwrap(); // empty attributes (mainnet)
+        e.u32(addr_type).unwrap();
+
+        // Outer: array(2)[tag(24, bstr(inner)), crc32_placeholder]
+        let mut outer = Vec::new();
+        let mut oe = minicbor::Encoder::new(&mut outer);
+        oe.array(2).unwrap();
+        oe.tag(minicbor::data::Tag::new(24)).unwrap();
+        oe.bytes(&inner).unwrap();
+        oe.u32(0xDEAD_BEEFu32).unwrap(); // CRC not checked in is_redeem()
+        outer
+    }
+
+    fn make_byron_output(addr_type: u32, lovelace: u64) -> TransactionOutput {
+        use dugite_primitives::address::ByronAddress;
+        TransactionOutput {
+            address: Address::Byron(ByronAddress {
+                payload: make_byron_payload(addr_type),
+            }),
+            value: Value::lovelace(lovelace),
+            datum: OutputDatum::None,
+            script_ref: None,
+            is_legacy: false,
+            raw_cbor: None,
+        }
+    }
+
+    fn make_redeem_input(tx_id: u8, index: u32) -> TransactionInput {
+        use dugite_primitives::hash::Hash32;
+        TransactionInput {
+            transaction_id: Hash32::from_bytes([tx_id; 32]),
+            index,
+        }
+    }
+
+    /// Shelley → Allegra transition purges AVVM (redeem) UTxOs from the UTxO
+    /// set and credits their coin to reserves.
+    ///
+    /// Haskell: `Cardano.Ledger.Allegra.Translation.returnRedeemAddrsToReserves`
+    #[test]
+    fn test_shelley_to_allegra_purges_redeem_utxos_and_credits_reserves() {
+        let rules = ShelleyRules::new();
+        let params = ProtocolParameters::mainnet_defaults();
+        let mut ctx = make_shelley_ctx(&params);
+        ctx.era = Era::Allegra;
+
+        // UTxO set:
+        //   - 2 × redeem (AVVM, addr_type=2), 100 ADA each
+        //   - 1 × PubKey (addr_type=0), 500 ADA  — must survive
+        let redeem_1 = (
+            make_redeem_input(0x01, 0),
+            make_byron_output(2, 100_000_000),
+        );
+        let redeem_2 = (
+            make_redeem_input(0x02, 0),
+            make_byron_output(2, 100_000_000),
+        );
+        let pubkey = (
+            make_redeem_input(0x03, 0),
+            make_byron_output(0, 500_000_000),
+        );
+        let mut utxo = make_utxo_sub(vec![redeem_1.clone(), redeem_2.clone(), pubkey.clone()]);
+        let mut certs = make_cert_sub();
+        let mut gov = make_gov_sub();
+        let mut epochs = make_epoch_sub();
+        epochs.reserves = Lovelace(1_000_000_000_000); // 1M ADA baseline
+        let mut consensus = make_consensus_sub();
+
+        let result = rules.on_era_transition(
+            Era::Shelley,
+            &ctx,
+            &mut utxo,
+            &mut certs,
+            &mut gov,
+            &mut consensus,
+            &mut epochs,
+        );
+        assert!(result.is_ok(), "on_era_transition must not error");
+
+        // Only the PubKey UTxO survives.
+        assert_eq!(
+            utxo.utxo_set.len(),
+            1,
+            "only the non-redeem UTxO should remain"
+        );
+        assert!(
+            utxo.utxo_set.lookup(&pubkey.0).is_some(),
+            "PubKey UTxO must survive"
+        );
+        assert!(
+            utxo.utxo_set.lookup(&redeem_1.0).is_none(),
+            "redeem UTxO 1 must be purged"
+        );
+        assert!(
+            utxo.utxo_set.lookup(&redeem_2.0).is_none(),
+            "redeem UTxO 2 must be purged"
+        );
+
+        // Reserves: 1_000_000_000_000 + 200_000_000 (two × 100 ADA).
+        assert_eq!(
+            epochs.reserves.0, 1_000_200_000_000,
+            "reserves must be credited with sumCoinUTxO of redeem entries"
+        );
+    }
+
+    /// Non-redeem Byron addresses (PubKey addr_type=0, Script addr_type=1) are
+    /// NOT purged by returnRedeemAddrsToReserves.
+    #[test]
+    fn test_shelley_to_allegra_preserves_non_redeem_byron_utxos() {
+        let rules = ShelleyRules::new();
+        let params = ProtocolParameters::mainnet_defaults();
+        let mut ctx = make_shelley_ctx(&params);
+        ctx.era = Era::Allegra;
+
+        let pubkey_utxo = (make_redeem_input(0x10, 0), make_byron_output(0, 50_000_000));
+        let script_utxo = (make_redeem_input(0x11, 0), make_byron_output(1, 75_000_000));
+        let mut utxo = make_utxo_sub(vec![pubkey_utxo.clone(), script_utxo.clone()]);
+        let mut certs = make_cert_sub();
+        let mut gov = make_gov_sub();
+        let mut epochs = make_epoch_sub();
+        epochs.reserves = Lovelace(0);
+        let mut consensus = make_consensus_sub();
+
+        let result = rules.on_era_transition(
+            Era::Shelley,
+            &ctx,
+            &mut utxo,
+            &mut certs,
+            &mut gov,
+            &mut consensus,
+            &mut epochs,
+        );
+        assert!(result.is_ok());
+
+        // All entries survive — none are redeem type.
+        assert_eq!(utxo.utxo_set.len(), 2);
+        assert_eq!(
+            epochs.reserves.0, 0,
+            "reserves unchanged when no redeem UTxOs present"
+        );
+    }
+
+    /// When the UTxO set is empty the transition is a no-op.
+    #[test]
+    fn test_shelley_to_allegra_empty_utxo_is_noop() {
+        let rules = ShelleyRules::new();
+        let params = ProtocolParameters::mainnet_defaults();
+        let mut ctx = make_shelley_ctx(&params);
+        ctx.era = Era::Allegra;
+
+        let mut utxo = make_utxo_sub(vec![]);
+        let mut certs = make_cert_sub();
+        let mut gov = make_gov_sub();
+        let mut epochs = make_epoch_sub();
+        epochs.reserves = Lovelace(42_000_000_000_000);
+        let mut consensus = make_consensus_sub();
+
+        let result = rules.on_era_transition(
+            Era::Shelley,
+            &ctx,
+            &mut utxo,
+            &mut certs,
+            &mut gov,
+            &mut consensus,
+            &mut epochs,
+        );
+        assert!(result.is_ok());
+        assert_eq!(utxo.utxo_set.len(), 0);
+        assert_eq!(epochs.reserves.0, 42_000_000_000_000, "reserves unchanged");
+    }
+
+    /// Allegra → Mary transition must NOT invoke returnRedeemAddrsToReserves.
+    /// (This is a guard: the purge only fires at Shelley→Allegra.)
+    #[test]
+    fn test_allegra_to_mary_does_not_purge_redeem_utxos() {
+        let rules = ShelleyRules::new();
+        let params = ProtocolParameters::mainnet_defaults();
+        let mut ctx = make_shelley_ctx(&params);
+        ctx.era = Era::Mary;
+
+        let redeem = (
+            make_redeem_input(0x20, 0),
+            make_byron_output(2, 100_000_000),
+        );
+        let mut utxo = make_utxo_sub(vec![redeem.clone()]);
+        let mut certs = make_cert_sub();
+        let mut gov = make_gov_sub();
+        let mut epochs = make_epoch_sub();
+        epochs.reserves = Lovelace(0);
+        let mut consensus = make_consensus_sub();
+
+        let result = rules.on_era_transition(
+            Era::Allegra,
+            &ctx,
+            &mut utxo,
+            &mut certs,
+            &mut gov,
+            &mut consensus,
+            &mut epochs,
+        );
+        assert!(result.is_ok());
+
+        // Redeem UTxO must still be present — purge only happens at Shelley→Allegra.
+        assert_eq!(
+            utxo.utxo_set.len(),
+            1,
+            "Allegra→Mary must NOT purge redeem UTxOs"
+        );
+        assert_eq!(epochs.reserves.0, 0, "reserves must be unchanged");
     }
 }
