@@ -24,7 +24,7 @@
 
 use crate::phase_two::PhaseTwoError;
 use crate::script_context::ScriptPurpose;
-use crate::tx_info_populate::script_ref_hash;
+use crate::tx_info_populate::{script_ref_hash, sort_inputs};
 use dugite_primitives::credentials::Credential as PrimCred;
 use dugite_primitives::transaction::{
     PlutusData as PrimPlutusData, Redeemer, RedeemerTag, ScriptRef as PrimScriptRef, Transaction,
@@ -119,7 +119,17 @@ fn resolve_spend(
     r: &Redeemer,
 ) -> Result<ResolvedRedeemer, PhaseTwoError> {
     let idx = r.index as usize;
-    let input = tx.body.inputs.get(idx).ok_or_else(|| {
+    // cardano-ledger's `alonzoRedeemerPointer` / `conwayRedeemerPointer`
+    // resolve a `Spending` redeemer index into `Set.elemAt idx (txBody ^.
+    // inputsTxBodyL)` — i.e. the i-th element of the inputs treated as an
+    // **ascending `Ord TxIn` sorted set** (TxId raw bytes, then TxIx
+    // numerically). The on-wire CBOR `array` is an unordered multiset from
+    // the Plutus ledger's perspective; indexing into wire order produces the
+    // wrong input when the on-chain encoding order differs from the sorted
+    // order — the confirmed Alonzo mainnet divergence (tx
+    // 4a3b78c246f30425754966396d10ffcba0b9cc8b97c6d3f9f54d8c6d30154422).
+    let sorted_inputs = sort_inputs(&tx.body.inputs);
+    let input = sorted_inputs.get(idx).ok_or_else(|| {
         PhaseTwoError::Internal(format!(
             "spend redeemer references inputs[{idx}] but tx has {n} inputs",
             n = tx.body.inputs.len()
@@ -842,6 +852,104 @@ mod tests {
         let tx = build_tx(minimal_body(), ws);
         let err = resolve_redeemers(&tx, &[]).unwrap_err();
         assert!(matches!(err, PhaseTwoError::Internal(_)));
+    }
+
+    /// Regression test for the Alonzo mainnet Spend redeemer sort-order bug.
+    ///
+    /// cardano-ledger's `alonzoRedeemerPointer` resolves a `Spending idx`
+    /// redeemer into `Set.elemAt idx (txBody ^. inputsTxBodyL)` — the i-th
+    /// element of the inputs treated as a **sorted `Set TxIn`** (ascending by
+    /// TxId raw bytes then TxIx). The on-wire CBOR array order must NOT be
+    /// used for redeemer index resolution.
+    ///
+    /// Ground-truth vector (mainnet tx
+    /// 4a3b78c246f30425754966396d10ffcba0b9cc8b97c6d3f9f54d8c6d30154422):
+    ///  - input_a: tx_id 0xfb…#0  (script-locked), wire-position 0, sorted-position 1
+    ///  - input_b: tx_id 0xf9…#1  (key-locked),    wire-position 1, sorted-position 0
+    ///
+    /// Redeemer Spend index=1 must resolve to input_a (sorted[1]) — the
+    /// script-locked output. Under the old wire-order code it resolved to
+    /// input_b (wire[1]) — the key-locked output — producing "spent output's
+    /// address is not script-locked".
+    ///
+    /// This test deliberately sets tx_id of the script-locked input to 0xfb
+    /// and the key-locked input to 0xf9, so 0xf9 < 0xfb and the wire order
+    /// (script first) is opposite to the sorted order (key first). The test
+    /// would FAIL with the old `tx.body.inputs.get(idx)` wire-order code.
+    #[test]
+    fn spend_redeemer_index_uses_sorted_input_set_not_wire_order() {
+        // Script bytes for V3 (simplest hash surface).
+        let script_bytes: Vec<u8> = vec![0xde, 0xad, 0xbe, 0xef];
+        let script_hash = {
+            let mut buf = vec![3u8];
+            buf.extend_from_slice(&script_bytes);
+            dugite_primitives::hash::blake2b_224(&buf).0
+        };
+
+        // input_a: tx_id 0xfb…#0 — script-locked (this is the valid spend target).
+        // In sorted Ord order this is SECOND (0xfb > 0xf9).
+        let input_a = TransactionInput {
+            transaction_id: Hash::<32>([0xfb; 32]),
+            index: 0,
+        };
+        let spent_out_a = enterprise_script_output(script_hash, 5_000_000);
+
+        // input_b: tx_id 0xf9…#1 — key-locked (NOT a valid spend target for Plutus).
+        // In sorted Ord order this is FIRST (0xf9 < 0xfb).
+        let input_b = TransactionInput {
+            transaction_id: Hash::<32>([0xf9; 32]),
+            index: 1,
+        };
+        let spent_out_b = TransactionOutput {
+            address: PrimAddress::Enterprise(EnterpriseAddress {
+                network: NetworkId::Testnet,
+                payment: PrimCred::VerificationKey(h28(0x55)),
+            }),
+            value: Value::lovelace(2_000_000),
+            datum: PrimOutputDatum::None,
+            script_ref: None,
+            is_legacy: false,
+            raw_cbor: None,
+        };
+
+        // Wire order: [input_a(0xfb#0), input_b(0xf9#1)]
+        // Sorted order: [input_b(0xf9#1), input_a(0xfb#0)]   ← 0xf9 < 0xfb
+        // Redeemer Spend index=1 → sorted[1] = input_a (script-locked). Correct.
+        // Old code: wire[1] = input_b (key-locked) → "not script-locked" error. Wrong.
+        let mut body = minimal_body();
+        body.inputs = vec![input_a.clone(), input_b.clone()];
+        let mut ws = empty_witness();
+        ws.plutus_v3_scripts = vec![script_bytes];
+        ws.redeemers = vec![Redeemer {
+            tag: RedeemerTag::Spend,
+            index: 1, // sorted[1] = input_a (0xfb); wire[1] = input_b (0xf9)
+            data: PrimPlutusData::Integer(num_bigint::BigInt::from(0)),
+            ex_units: ExUnits { mem: 1, steps: 1 },
+        }];
+        let tx = build_tx(body, ws);
+        let resolved = vec![
+            (input_a.clone(), spent_out_a, vec![]),
+            (input_b.clone(), spent_out_b, vec![]),
+        ];
+
+        let r = resolve_redeemers(&tx, &resolved)
+            .expect("spend redeemer must resolve to the script-locked sorted[1] input");
+        assert_eq!(r.len(), 1);
+        assert_eq!(r[0].script_hash, script_hash);
+
+        // The ScriptPurpose must carry the outref of the SORTED input_a (0xfb#0),
+        // not the wire-order input_b (0xf9#1).
+        match &r[0].purpose {
+            ScriptPurpose::Spending(outref) => {
+                assert_eq!(
+                    outref.tx_id, [0xfbu8; 32],
+                    "Spending purpose must reference sorted[1]=input_a (0xfb…), \
+                     not wire[1]=input_b (0xf9…) — wire-order bug"
+                );
+                assert_eq!(outref.idx, 0);
+            }
+            other => panic!("expected ScriptPurpose::Spending, got {other:?}"),
+        }
     }
 
     // ────────────────────────────────────────────────────────────

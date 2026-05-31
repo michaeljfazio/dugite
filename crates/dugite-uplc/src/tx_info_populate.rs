@@ -391,10 +391,37 @@ pub fn input_to_txininfo(
     )))
 }
 
-/// Resolve a `Vec` of inputs into a `Vec<TxInInfo>` preserving the
-/// input order — Plutus validators observe inputs in the order they
-/// appear in the tx body (post-canonical-sort, which has already
-/// happened by the time we see the decoded inputs).
+/// Sort a slice of inputs into the canonical `Set TxIn` order that
+/// cardano-ledger uses for `inputsTxBodyL`, `refInputsTxBodyL`, etc.
+///
+/// Haskell's `Ord TxIn` compares `TxId` (the raw 32 hash bytes,
+/// big-endian memcmp) then `TxIx` (Word16, numeric). Rust's derived
+/// `Ord` on [`PrimTxIn`] does exactly this: `transaction_id: Hash<32>`
+/// is compared via `[u8; 32]`'s lexicographic byte order, then
+/// `index: u32` numerically. Using `.sort()` on a Vec<PrimTxIn>
+/// therefore produces byte-exact alignment with
+/// `Set.lookupIndex`/`Set.elemAt` in the Haskell ledger.
+///
+/// This sort must be applied before any redeemer-index lookup
+/// (`alonzoRedeemerPointer` / `conwayRedeemerPointer`) and before
+/// building `txInfoInputs` / `txInfoReferenceInputs` in the Plutus
+/// `ScriptContext`.
+pub fn sort_inputs(inputs: &[PrimTxIn]) -> Vec<PrimTxIn> {
+    let mut sorted = inputs.to_vec();
+    sorted.sort();
+    sorted
+}
+
+/// Resolve a slice of inputs **in the order given** into a
+/// `Vec<TxInInfo>`.
+///
+/// **Call site responsibility:** callers that construct `txInfoInputs`
+/// or `txInfoReferenceInputs` (i.e., all three `populate_tx_info_vN`
+/// functions) must pass a sorted slice produced by [`sort_inputs`].
+/// The sorted order is the canonical `Set TxIn` order that Haskell's
+/// `inputsTxBodyL` presents, and is required for Plutus `Spending`
+/// redeemer index resolution to be byte-exact with cardano-ledger's
+/// `alonzoRedeemerPointer` / `conwayRedeemerPointer`.
 pub fn inputs_to_txininfos(
     inputs: &[PrimTxIn],
     resolved: &[(PrimTxIn, PrimTxOut, Vec<u8>)],
@@ -1141,14 +1168,17 @@ mod tests {
         assert!(msg.contains("@9"), "got: {msg}");
     }
 
+    /// Verifies that `inputs_to_txininfos` preserves the order of the slice it
+    /// receives. Callers (populate_tx_info_v1/v2/v3) must sort the slice first
+    /// via [`sort_inputs`]; this test confirms the function itself is pass-through.
     #[test]
-    fn inputs_to_txininfos_preserves_input_order() {
+    fn inputs_to_txininfos_preserves_caller_order() {
         let resolved = vec![
             resolved_entry(0xaa, 0, 1),
             resolved_entry(0xbb, 0, 2),
             resolved_entry(0xcc, 0, 3),
         ];
-        // Request inputs in a deliberately un-sorted order.
+        // Caller-supplied order (unsorted): cc, aa, bb.
         let inputs = vec![
             PrimTxIn {
                 transaction_id: h32(0xcc),
@@ -1173,7 +1203,73 @@ mod tests {
                 _ => unreachable!(),
             })
             .collect();
+        // cc=3, aa=1, bb=2 — caller order preserved.
         assert_eq!(coins, vec![3, 1, 2]);
+    }
+
+    /// Regression test for the Alonzo spend-redeemer sort-order bug.
+    ///
+    /// `sort_inputs` must return inputs in ascending `Ord TxIn` order:
+    /// (TxId raw bytes lex, then TxIx numeric). This matches Haskell's
+    /// `Set TxIn` which is what `txInfoInputs` / redeemer index resolution use.
+    ///
+    /// Vector mirrors the confirmed mainnet tx ground-truth:
+    ///  wire[0]=0xfb#0, wire[1]=0xf9#1  →  sorted[0]=0xf9#1, sorted[1]=0xfb#0
+    /// (since 0xf9 < 0xfb byte-lexicographically).
+    #[test]
+    fn sort_inputs_orders_by_txid_bytes_then_index() {
+        // input_a: 0xfb…#0 — wire-first, but sorted-SECOND (0xfb > 0xf9).
+        let input_a = PrimTxIn {
+            transaction_id: h32(0xfb),
+            index: 0,
+        };
+        // input_b: 0xf9…#1 — wire-second, but sorted-FIRST (0xf9 < 0xfb).
+        let input_b = PrimTxIn {
+            transaction_id: h32(0xf9),
+            index: 1,
+        };
+        // Wire order: [input_a, input_b].
+        let wire = vec![input_a.clone(), input_b.clone()];
+        let sorted = sort_inputs(&wire);
+
+        // sorted[0] must be the 0xf9 entry (smaller TxId), sorted[1] the 0xfb entry.
+        assert_eq!(
+            sorted[0].transaction_id.0, [0xf9u8; 32],
+            "sorted[0] must be 0xf9 (smaller TxId)"
+        );
+        assert_eq!(sorted[0].index, 1);
+        assert_eq!(
+            sorted[1].transaction_id.0, [0xfbu8; 32],
+            "sorted[1] must be 0xfb (larger TxId)"
+        );
+        assert_eq!(sorted[1].index, 0);
+
+        // Redeemer Spend index=1 must now resolve to sorted[1]=0xfb#0, not wire[1]=0xf9#1.
+        // (The full end-to-end is pinned in redeemer_resolve::tests::
+        //  spend_redeemer_index_uses_sorted_input_set_not_wire_order.)
+    }
+
+    /// Same-TxId entries sort by index numerically (TxIx = Word16 numeric order).
+    #[test]
+    fn sort_inputs_same_txid_ordered_by_index() {
+        let inputs = vec![
+            PrimTxIn {
+                transaction_id: h32(0xaa),
+                index: 5,
+            },
+            PrimTxIn {
+                transaction_id: h32(0xaa),
+                index: 0,
+            },
+            PrimTxIn {
+                transaction_id: h32(0xaa),
+                index: 2,
+            },
+        ];
+        let sorted = sort_inputs(&inputs);
+        assert_eq!(sorted[0].index, 0);
+        assert_eq!(sorted[1].index, 2);
+        assert_eq!(sorted[2].index, 5);
     }
 
     #[test]
