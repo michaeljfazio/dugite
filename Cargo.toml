@@ -105,7 +105,7 @@ tonic-reflection = "0.12"
 prost = "0.13"
 prost-types = "0.13"
 tonic-build = { version = "0.12", features = ["prost"] }
-prost-build = "0.13"
+prost-build = "0.14"
 
 # Networking
 tokio-tungstenite = "0.24"
