@@ -4719,6 +4719,71 @@ mod tests {
         );
     }
 
+    /// Era gate: `MalformedScriptWitnesses` is a Babbage+ (PV>=7) predicate and
+    /// does NOT exist in the Alonzo UTXOW rule. The same garbage V1 witness that
+    /// is rejected at PV7 must NOT be flagged at PV6 (Alonzo) — mainnet tx
+    /// 61073ad8… class, where a well-formed-on-chain V1 script was wrongly
+    /// rejected during Alonzo sync.
+    #[test]
+    fn test_malformed_script_witnesses_gated_to_babbage() {
+        let (utxo_set, mut tx, _) = make_valid_tx();
+        tx.witness_set
+            .plutus_v1_scripts
+            .push(vec![0xff, 0xee, 0xdd]);
+
+        let mut alonzo = ProtocolParameters::mainnet_defaults();
+        alonzo.protocol_version_major = 6; // Alonzo
+        let alonzo_errors = validate_transaction(&tx, &utxo_set, &alonzo, 100, 300, None)
+            .err()
+            .unwrap_or_default();
+        assert!(
+            !alonzo_errors
+                .iter()
+                .any(|e| matches!(e, ValidationError::MalformedScriptWitnesses { .. })),
+            "Alonzo (PV6) must NOT run the Babbage-only MalformedScriptWitnesses check, got {alonzo_errors:?}"
+        );
+
+        let mut babbage = ProtocolParameters::mainnet_defaults();
+        babbage.protocol_version_major = 7; // Babbage
+        let babbage_errors = validate_transaction(&tx, &utxo_set, &babbage, 100, 300, None)
+            .err()
+            .unwrap_or_default();
+        assert!(
+            babbage_errors
+                .iter()
+                .any(|e| matches!(e, ValidationError::MalformedScriptWitnesses { .. })),
+            "Babbage (PV7) must run the check and reject the garbage V1 witness, got {babbage_errors:?}"
+        );
+    }
+
+    /// A zero-amount withdrawal must NOT be rejected in ANY era — cardano-ledger
+    /// has no `wdrlNotZero` predicate; the only rule is amount==balance
+    /// (`isSubmapOfUM`), which accepts `0 == 0`. Mainnet Alonzo tx fc7ca745…
+    /// carried a 0-lovelace withdrawal and was accepted on-chain.
+    #[test]
+    fn test_zero_amount_withdrawal_accepted_all_eras() {
+        let mut reward_account = vec![0xe1u8]; // mainnet VKey-staking reward account
+        reward_account.extend_from_slice(&[0x09u8; 28]);
+        for pv in [2u64, 5, 6, 7, 9] {
+            let (utxo_set, mut tx, _) = make_valid_tx();
+            tx.body.withdrawals.insert(
+                reward_account.clone(),
+                dugite_primitives::value::Lovelace(0),
+            );
+            let mut params = ProtocolParameters::mainnet_defaults();
+            params.protocol_version_major = pv;
+            let errors = validate_transaction(&tx, &utxo_set, &params, 100, 300, None)
+                .err()
+                .unwrap_or_default();
+            assert!(
+                !errors
+                    .iter()
+                    .any(|e| matches!(e, ValidationError::ZeroWithdrawal { .. })),
+                "PV{pv}: a zero-amount withdrawal must not produce ZeroWithdrawal; got {errors:?}"
+            );
+        }
+    }
+
     /// Real flat-encoded Plutus V1 bytes at PV >= 5 → no MalformedScriptWitnesses.
     #[test]
     fn test_well_formed_plutus_v1_witness_accepted() {

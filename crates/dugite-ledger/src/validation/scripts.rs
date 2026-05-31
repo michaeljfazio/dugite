@@ -933,6 +933,17 @@ pub(super) fn check_malformed_script_witnesses(
     errors: &mut Vec<ValidationError>,
 ) {
     let pv = params.protocol_version_major;
+
+    // Era gate: `MalformedScriptWitnesses` is part of the BABBAGE UTXOW rule
+    // (`validateScriptsWellFormedTxOuts`, babbage.md:192 "Adds check: …") and
+    // every later era. It does NOT exist in the Alonzo UTXOW transition
+    // (`alonzoStyleWitness`). Running it pre-Babbage wrongly rejects on-chain
+    // Alonzo PlutusV1 witnesses. Babbage begins at PV7 (Vasil). Mirror
+    // cardano-ledger: the predicate is gated by era, not just the PV of the
+    // script language.
+    if pv < 7 {
+        return;
+    }
     let mut malformed: Vec<String> = Vec::new();
 
     // Plutus V1 → PV5+
@@ -985,6 +996,15 @@ pub(super) fn check_malformed_reference_scripts(
     errors: &mut Vec<ValidationError>,
 ) {
     let pv = params.protocol_version_major;
+
+    // Era gate: `MalformedReferenceScripts` is introduced by the BABBAGE UTXOW
+    // rule (`validateScriptsWellFormedTxOuts`, babbage.md:192) alongside
+    // `MalformedScriptWitnesses`; it does not exist in Alonzo. Reference scripts
+    // in outputs are themselves a Babbage feature, but gate explicitly to mirror
+    // cardano-ledger. Babbage begins at PV7.
+    if pv < 7 {
+        return;
+    }
     let mut malformed: Vec<String> = Vec::new();
 
     // Visit every output produced by this tx (normal outputs + collateral_return).

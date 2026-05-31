@@ -8870,6 +8870,89 @@ mod tests {
         );
     }
 
+    /// A stake credential whose reward account is fully withdrawn in the SAME
+    /// tx must NOT trigger `StakeKeyHasNonZeroBalance` — the LEDGER rule drains
+    /// the account before the dereg predicate runs, in ALL eras (mainnet Alonzo
+    /// tx ca2f5ba3… class). Covers legacy tag-1 dereg at Alonzo (PV6) and Conway
+    /// (PV9), plus Conway `ConwayStakeDeregistration` (tag 8).
+    #[test]
+    fn test_stake_dereg_with_same_tx_withdrawal_accepted() {
+        let cred_bytes = [0x02u8; 28];
+        // Mainnet VKey-staking reward account: header 0xe1 + 28-byte hash.
+        let mut reward_account = vec![0xe1u8];
+        reward_account.extend_from_slice(&cred_bytes);
+
+        let scenarios: Vec<(u64, Certificate)> = vec![
+            (
+                6, // Alonzo
+                Certificate::StakeDeregistration(
+                    dugite_primitives::credentials::Credential::VerificationKey(
+                        Hash28::from_bytes(cred_bytes),
+                    ),
+                ),
+            ),
+            (
+                9, // Conway — legacy tag-1 dereg still decodes in Conway
+                Certificate::StakeDeregistration(
+                    dugite_primitives::credentials::Credential::VerificationKey(
+                        Hash28::from_bytes(cred_bytes),
+                    ),
+                ),
+            ),
+            (
+                9, // Conway — tag-8 ConwayStakeDeregistration
+                Certificate::ConwayStakeDeregistration {
+                    credential: dugite_primitives::credentials::Credential::VerificationKey(
+                        Hash28::from_bytes(cred_bytes),
+                    ),
+                    refund: Lovelace(2_000_000),
+                },
+            ),
+        ];
+
+        for (pv, cert) in scenarios {
+            let mut params = ProtocolParameters::mainnet_defaults();
+            params.protocol_version_major = pv;
+            let key_deposit = params.key_deposit.0;
+
+            let mut utxo_set = UtxoSet::new();
+            let mut tx = make_dereg_tx(&mut utxo_set, cert, key_deposit);
+            // Withdraw the full reward balance of the same credential in this tx.
+            tx.body
+                .withdrawals
+                .insert(reward_account.clone(), Lovelace(500_000));
+            let reward_accounts = make_reward_accounts(cred_bytes, 500_000);
+
+            let result = validate_transaction_with_pools(
+                &tx,
+                &utxo_set,
+                &params,
+                100,
+                300,
+                None,
+                None,
+                None,
+                Some(&reward_accounts),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            );
+            let errors = result.err().unwrap_or_default();
+            assert!(
+                !errors
+                    .iter()
+                    .any(|e| matches!(e, ValidationError::StakeKeyHasNonZeroBalance { .. })),
+                "PV{pv}: same-tx withdraw+deregister must NOT produce StakeKeyHasNonZeroBalance; got: {errors:?}"
+            );
+        }
+    }
+
     #[test]
     fn test_stake_dereg_no_reward_accounts_skips_balance_check() {
         // When reward_accounts is None (e.g. simple mempool structural check),
