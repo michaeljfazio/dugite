@@ -82,6 +82,34 @@ impl ShelleyRules {
 /// `sumCoinUTxO` sums the `coin` field only (lovelace); multi-asset UTxOs
 /// did not exist in the Shelley era so this is equivalent to summing the
 /// entire value.
+/// Byron→Shelley reserves initialisation: `reserves = maxLovelaceSupply −
+/// sumCoinUTxO(liveByronUTxO)` (Haskell `Cardano.Ledger.Shelley.API
+/// .ByronTranslation`). Recomputes reserves from the live UTxO at the fork so
+/// the Byron-era burned transaction fees (removed from the UTxO, credited
+/// nowhere) are reflected — the bootstrap path's `max − Σ(genesis avvmDistr)`
+/// init misses them. At the fork treasury/rewards/deposits are all 0.
+fn recompute_shelley_initial_reserves(
+    utxo: &mut UtxoSubState,
+    epochs: &mut EpochSubState,
+    max_lovelace_supply: u64,
+) {
+    let mut utxo_sum: u64 = 0;
+    utxo.utxo_set.scan_all(|_input, output| {
+        // Shelley-era outputs are ADA-only; coin == full value.
+        utxo_sum = utxo_sum.saturating_add(output.value.coin.0);
+    });
+    let new_reserves = max_lovelace_supply.saturating_sub(utxo_sum);
+    let old_reserves = epochs.reserves.0;
+    epochs.reserves = Lovelace(new_reserves);
+    info!(
+        utxo_sum,
+        old_reserves,
+        new_reserves,
+        delta_lovelace = new_reserves as i128 - old_reserves as i128,
+        "Byron->Shelley: reserves = maxLovelaceSupply - sumCoinUTxO(liveByronUTxO)"
+    );
+}
+
 fn return_redeem_addrs_to_reserves(utxo: &mut UtxoSubState, epochs: &mut EpochSubState) {
     // Phase 1: scan the full UTxO set and collect every redeem-address input.
     // We cannot mutate the UTxO set while scanning (borrow-checker), so we
@@ -856,6 +884,26 @@ impl EraRules for ShelleyRules {
         _consensus: &mut ConsensusSubState,
         epochs: &mut EpochSubState,
     ) -> Result<(), LedgerError> {
+        // Byron → Shelley: initialise Shelley reserves from the LIVE Byron UTxO.
+        // Haskell (Cardano.Ledger.Shelley.API.ByronTranslation,
+        // translateToShelleyLedgerStateFromUtxo):
+        //   reserves = word64ToCoin maxLovelaceSupply <-> sumCoinUTxO utxoShelley
+        // where utxoShelley is the live Byron UTxO at the fork (NOT the genesis
+        // distribution). The from-genesis bootstrap path initialises reserves as
+        // `max - Σ(byron genesis avvmDistr)` BEFORE replaying Byron, which does
+        // not account for the Byron transaction fees BURNED over the Byron era
+        // (Byron fees are removed from the UTxO and credited nowhere). Recompute
+        // from the live UTxO so reserves matches Haskell exactly (treasury,
+        // rewards and deposits are all 0 at the fork). The unredeemed AVVM redeem
+        // UTxOs are still in the UTxO here (they move to reserves only at the
+        // Shelley→Allegra boundary, below), so they are correctly counted against
+        // reserves now. On the Mithril-import path this branch never fires (the
+        // node starts post-Byron with Haskell-correct reserves).
+        if from_era == Era::Byron && ctx.era == Era::Shelley {
+            recompute_shelley_initial_reserves(utxo, epochs, ctx.max_lovelace_supply);
+            return Ok(());
+        }
+
         // Shelley → Allegra: returnRedeemAddrsToReserves
         // Haskell: Cardano.Ledger.Allegra.Translation (TranslateEra AllegraEra ShelleyEra)
         if from_era == Era::Shelley && ctx.era == Era::Allegra {
