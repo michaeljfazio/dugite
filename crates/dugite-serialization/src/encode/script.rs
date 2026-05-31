@@ -219,16 +219,23 @@ pub fn compute_script_data_hash(
         preimage.extend(&redeemers_buf);
     }
 
-    // 2. Datums: use raw CBOR when available, otherwise re-encode
-    if let Some(raw) = raw_datums_cbor {
-        preimage.extend_from_slice(raw);
-    } else if !plutus_data.is_empty() {
-        let mut datums_buf = encode_tag(258);
-        datums_buf.extend(encode_array_header(plutus_data.len()));
-        for d in plutus_data {
-            datums_buf.extend(encode_plutus_data(d));
+    // 2. Datums: per Haskell `SafeToHash (ScriptIntegrity era)` the datums term
+    //    is OMITTED when the TxDats set is empty
+    //    (`dBytes = if null (d ^. unTxDatsL) then mempty else originalBytes d`),
+    //    even if the wire carried an empty `plutus_data` array (`0x80`). Gate the
+    //    whole datums term on a non-empty decoded set; an empty set contributes
+    //    nothing to the preimage.
+    if !plutus_data.is_empty() {
+        if let Some(raw) = raw_datums_cbor {
+            preimage.extend_from_slice(raw);
+        } else {
+            let mut datums_buf = encode_tag(258);
+            datums_buf.extend(encode_array_header(plutus_data.len()));
+            for d in plutus_data {
+                datums_buf.extend(encode_plutus_data(d));
+            }
+            preimage.extend(&datums_buf);
         }
-        preimage.extend(&datums_buf);
     }
 
     // 3. Encode language views (cost models for languages used in the transaction)
@@ -275,9 +282,17 @@ pub fn compute_script_data_hash_from_cbor(
         preimage.push(0xa0); // empty CBOR map
     }
 
-    // 2. Datums: prefer raw wire-CBOR; absent when the tx has no plutus_data.
-    if let Some(raw) = ws.raw_plutus_data_cbor.as_deref() {
-        preimage.extend_from_slice(raw);
+    // 2. Datums: per Haskell `SafeToHash (ScriptIntegrity era)`,
+    //    `dBytes = if null (d ^. unTxDatsL) then mempty else originalBytes d`.
+    //    The datums term is OMITTED whenever the decoded TxDats set is empty,
+    //    even if the witness set serialized an empty `plutus_data` array (`0x80`)
+    //    on the wire. Gating on raw-bytes presence wrongly included that `0x80`
+    //    and broke the hash for Alonzo mint/spend txs whose scripts take no
+    //    datum (mainnet script_data_hash mismatch class).
+    if !ws.plutus_data.is_empty() {
+        if let Some(raw) = ws.raw_plutus_data_cbor.as_deref() {
+            preimage.extend_from_slice(raw);
+        }
     }
 
     // 3. Language views derived from the supplied cost models.
@@ -412,6 +427,61 @@ mod tests {
     // `test_script_data_hash_from_real_tx` already covers the only
     // invariant that matters: the hash matches the declared
     // `script_data_hash` field of the witness set on a real tx.
+
+    /// Per Haskell `SafeToHash (ScriptIntegrity era)`
+    /// (`dBytes = if null (d ^. unTxDatsL) then mempty else originalBytes d`),
+    /// an empty witness datums set contributes NOTHING to the script_data_hash
+    /// preimage — even when the wire carried an empty `plutus_data` array
+    /// (`0x80`). So the hash computed with an empty `0x80` raw-datums blob must
+    /// equal the hash computed with no datums at all (mainnet Alonzo tx
+    /// c1dd5612… script_data_hash mismatch class).
+    #[test]
+    fn script_data_hash_omits_empty_datums() {
+        use dugite_primitives::transaction::{ExUnits, PlutusData, Redeemer, RedeemerTag};
+        let redeemers = vec![Redeemer {
+            tag: RedeemerTag::Spend,
+            index: 0,
+            data: PlutusData::Integer(num_bigint::BigInt::from(0)),
+            ex_units: ExUnits {
+                mem: 1000,
+                steps: 2000,
+            },
+        }];
+        let cm = CostModels {
+            plutus_v1: Some(vec![1i64; 166]),
+            plutus_v2: None,
+            plutus_v3: None,
+            plutus_v4: None,
+        };
+        let empty: Vec<PlutusData> = vec![];
+
+        // raw datums = empty array 0x80 vs absent: must hash identically.
+        let with_0x80 = compute_script_data_hash(
+            &redeemers,
+            &empty,
+            &cm,
+            true,
+            false,
+            false,
+            None,
+            Some(&[0x80]),
+        );
+        let with_none =
+            compute_script_data_hash(&redeemers, &empty, &cm, true, false, false, None, None);
+        assert_eq!(
+            with_0x80, with_none,
+            "empty plutus_data (0x80) must be omitted from the script_data_hash preimage"
+        );
+
+        // Sanity: a non-empty datum DOES change the hash.
+        let one = vec![PlutusData::Integer(num_bigint::BigInt::from(7))];
+        let with_datum =
+            compute_script_data_hash(&redeemers, &one, &cm, true, false, false, None, None);
+        assert_ne!(
+            with_datum, with_none,
+            "a non-empty datum must contribute to the script_data_hash"
+        );
+    }
 
     // ── ScriptRef variant tags ───────────────────────────────────────────────
 
@@ -705,6 +775,7 @@ mod tests {
 
     #[test]
     fn compute_script_data_hash_raw_inputs_passthrough() {
+        use dugite_primitives::transaction::PlutusData;
         let cm = CostModels {
             plutus_v1: None,
             plutus_v2: None,
@@ -712,10 +783,13 @@ mod tests {
             plutus_v4: None,
         };
         let raw_red = [0xa1, 0x82, 0x00, 0x00, 0x82, 0x80, 0x82, 0x07, 0x0b];
-        let raw_dat = [0x80];
+
+        // Non-empty datums set: the raw datums wire bytes pass through verbatim.
+        let raw_dat = [0x81, 0x00]; // array(1)[ 0 ]
+        let datums = vec![PlutusData::Integer(num_bigint::BigInt::from(0))];
         let h1 = compute_script_data_hash(
             &[],
-            &[],
+            &datums,
             &cm,
             false,
             false,
@@ -723,11 +797,27 @@ mod tests {
             Some(&raw_red),
             Some(&raw_dat),
         );
-        // Manually compute: preimage = raw_red || raw_dat || encode_language_views()
         let mut preimage = raw_red.to_vec();
         preimage.extend_from_slice(&raw_dat);
         preimage.extend(encode_language_views(&cm, false, false, false));
         assert_eq!(h1, dugite_primitives::hash::blake2b_256(&preimage));
+
+        // Empty datums set: the raw `0x80` empty-array blob is OMITTED, even
+        // though it is present on the wire (Haskell `SafeToHash (ScriptIntegrity
+        // era)`: `if null (d ^. unTxDatsL) then mempty`).
+        let h2 = compute_script_data_hash(
+            &[],
+            &[],
+            &cm,
+            false,
+            false,
+            false,
+            Some(&raw_red),
+            Some(&[0x80]),
+        );
+        let mut preimage2 = raw_red.to_vec();
+        preimage2.extend(encode_language_views(&cm, false, false, false));
+        assert_eq!(h2, dugite_primitives::hash::blake2b_256(&preimage2));
     }
 
     #[test]
