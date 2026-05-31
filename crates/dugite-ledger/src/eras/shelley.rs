@@ -303,7 +303,19 @@ impl EraRules for ShelleyRules {
         // treasury, which compounded geometrically into +4.887M ADA
         // reserves excess by preview epoch 1269 and a +25K-lovelace per-pool
         // reward overshoot at every subsequent boundary.
-        {
+        // Skip the RUPD at the Byron→Shelley hard fork (entering the FIRST
+        // Shelley epoch). Haskell creates the first `RewardUpdate` mid-epoch
+        // (startStep) DURING the first Shelley epoch and applies it at the NEXT
+        // boundary — never at the fork itself, where the Shelley reward
+        // machinery does not yet exist. Firing it here drains a spurious extra
+        // tau cut (≈8.3M ADA on mainnet) from reserves to treasury, doubling the
+        // first-epoch treasury (observed: ep209 treasury 16.66M vs Koios 8.33M).
+        // Networks that genesis directly in Shelley (preview/devnet,
+        // shelley_transition_epoch == 0) never match a real boundary here, so
+        // their genesis 0→1 RUPD (issue #438) is unaffected.
+        let is_byron_to_shelley_fork =
+            ctx.shelley_transition_epoch > 0 && new_epoch.0 == ctx.shelley_transition_epoch;
+        if !is_byron_to_shelley_fork {
             let go_ref = epochs.snapshots.go.as_ref();
             // Issue #438: RUPD uses Haskell's `prevPParams` (= the protocol
             // parameters that were active in the PREVIOUS epoch), NOT
