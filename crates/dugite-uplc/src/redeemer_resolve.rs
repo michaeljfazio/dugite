@@ -479,15 +479,36 @@ fn resolve_spend_datum(
     match &spent_output.datum {
         PrimOutputDatum::InlineDatum { data, .. } => Ok(data.clone()),
         PrimOutputDatum::DatumHash(h) => {
-            for d in &tx.witness_set.plutus_data {
-                // Hash via the in-house `Data::to_cbor` to match what the
-                // ledger's `script_data_hash` computation uses.
-                let translated = crate::tx_info_populate::plutus_data_to_data(d);
-                let cbor = translated.to_cbor().map_err(|e| {
-                    PhaseTwoError::Internal(format!("resolve_spend_datum: to_cbor: {e}"))
-                })?;
-                if blake2b_256(&cbor).0 == h.0 {
-                    return Ok(d.clone());
+            // A datum hash is `blake2b_256` over the witness datum's ORIGINAL
+            // CBOR bytes (Haskell hashes the memoised raw bytes). Many on-chain
+            // datums are encoded non-canonically (e.g. the general `Constr`
+            // tag-102 form for small indices) and do NOT round-trip through a
+            // re-encode, so re-encoding each witness datum and hashing it fails
+            // to match — the "datum not found" phase-2 divergence. Match against
+            // the preserved per-element raw spans first (same fix as the phase-1
+            // datum-witness check); fall back to a canonical re-encode only when
+            // no raw bytes exist (datums the node constructs itself).
+            let spans = tx
+                .witness_set
+                .raw_plutus_data_cbor
+                .as_deref()
+                .and_then(dugite_serialization::plutus_data_element_spans)
+                .filter(|s| s.len() == tx.witness_set.plutus_data.len());
+            if let Some(spans) = spans {
+                for (i, raw) in spans.iter().enumerate() {
+                    if blake2b_256(raw).0 == h.0 {
+                        return Ok(tx.witness_set.plutus_data[i].clone());
+                    }
+                }
+            } else {
+                for d in &tx.witness_set.plutus_data {
+                    let translated = crate::tx_info_populate::plutus_data_to_data(d);
+                    let cbor = translated.to_cbor().map_err(|e| {
+                        PhaseTwoError::Internal(format!("resolve_spend_datum: to_cbor: {e}"))
+                    })?;
+                    if blake2b_256(&cbor).0 == h.0 {
+                        return Ok(d.clone());
+                    }
                 }
             }
             Err(PhaseTwoError::MissingDatum {
@@ -597,6 +618,77 @@ mod tests {
             raw_body_cbor: None,
             raw_witness_cbor: None,
         }
+    }
+
+    fn hexd(s: &str) -> Vec<u8> {
+        (0..s.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&s[i..i + 2], 16).unwrap())
+            .collect()
+    }
+
+    /// A datum hash is over the witness datum's ORIGINAL CBOR bytes, so phase-2
+    /// datum resolution must match those — not a re-encode. Vector: mainnet
+    /// datum `5ff23baed5…` encoded in the general `Constr` form (CBOR tag 102,
+    /// `d866`) which re-encodes (canonically, tag 121) to a DIFFERENT hash. With
+    /// the preserved raw spans it resolves; the re-encode fallback (no raw bytes)
+    /// must NOT match. This is the phase-2 analogue of the phase-1 datum-witness
+    /// fix and clears the "datum not found" divergence sub-class.
+    #[test]
+    fn resolve_spend_datum_matches_original_noncanonical_bytes() {
+        use dugite_primitives::hash::blake2b_256;
+        use dugite_primitives::transaction::{OutputDatum as PrimOutputDatum, PlutusData as PD};
+        use num_bigint::BigInt;
+
+        let original = hexd(
+            "d866820086581ca3250750af6227b5a7dc689de94c83728a9d1d4029cc232d4a46f81e\
+             1a041cdb40581c023cec350597bdf2a2b6945e62e0111d9808caf7a9353a2ab91e8beb\
+             50534f434945545932354c4d4239323332581c63a3bc3807c6a51f85570ad9a82ed46b\
+             db96feeabae6c4aa0526d4ed181e",
+        );
+        let datum_hash = Hash::<32>(blake2b_256(&original).0);
+        // Structural form of the same datum (re-encodes to tag-121, different hash).
+        let datum = PD::Constr(
+            0,
+            vec![
+                PD::Bytes(hexd(
+                    "a3250750af6227b5a7dc689de94c83728a9d1d4029cc232d4a46f81e",
+                )),
+                PD::Integer(BigInt::from(0x041cdb40u32)),
+                PD::Bytes(hexd(
+                    "023cec350597bdf2a2b6945e62e0111d9808caf7a9353a2ab91e8beb",
+                )),
+                PD::Bytes(hexd("534f434945545932354c4d4239323332")),
+                PD::Bytes(hexd(
+                    "63a3bc3807c6a51f85570ad9a82ed46bdb96feeabae6c4aa0526d4ed",
+                )),
+                PD::Integer(BigInt::from(0x1eu32)),
+            ],
+        );
+
+        let mut out = enterprise_script_output([0xAA; 28], 5_000_000);
+        out.datum = PrimOutputDatum::DatumHash(datum_hash);
+
+        // With preserved raw spans → resolves by original bytes.
+        let mut ws = empty_witness();
+        ws.plutus_data = vec![datum.clone()];
+        let mut raw_array = vec![0x81u8]; // array(1)
+        raw_array.extend_from_slice(&original);
+        ws.raw_plutus_data_cbor = Some(raw_array);
+        let tx = build_tx(minimal_body(), ws);
+        let resolved =
+            resolve_spend_datum(&tx, &out, &[0xAA; 28]).expect("datum must resolve via raw spans");
+        assert_eq!(resolved, datum);
+
+        // Without raw bytes → the canonical re-encode (tag-121) cannot match.
+        let mut ws2 = empty_witness();
+        ws2.plutus_data = vec![datum];
+        ws2.raw_plutus_data_cbor = None;
+        let tx2 = build_tx(minimal_body(), ws2);
+        assert!(
+            resolve_spend_datum(&tx2, &out, &[0xAA; 28]).is_err(),
+            "re-encode fallback must not match a non-canonically-encoded datum hash"
+        );
     }
 
     fn plutus_v3_script_with_hash(bytes: &[u8]) -> [u8; 28] {
