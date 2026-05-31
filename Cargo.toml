@@ -100,7 +100,7 @@ async-trait = "0.1"
 # library, keeping the gRPC stack out of the node binary's transitive graph
 # when the RPC server is disabled.
 tonic = { version = "0.12", features = ["transport", "tls", "gzip"] }
-tonic-web = "0.12"
+tonic-web = "0.14"
 tonic-reflection = "0.12"
 prost = "0.13"
 prost-types = "0.13"
