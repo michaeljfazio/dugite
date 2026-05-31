@@ -1161,7 +1161,10 @@ pub enum ValidationError {
          expected key_deposit={expected}"
     )]
     StakeRegistrationDepositMismatch { declared: u64, expected: u64 },
-    /// Haskell `wdrlNotZero`: withdrawals with a zero amount are rejected.
+    /// Retained for the N2C error-mapping API (`node/serve.rs`) but no longer
+    /// constructed: cardano-ledger has no zero-amount withdrawal predicate in
+    /// any era — a zero withdrawal of a registered zero-balance account is valid
+    /// (`isSubmapOfUM` accepts `0 == 0`).
     #[error("Zero withdrawal amount for reward account: {account}")]
     ZeroWithdrawal { account: String },
     /// Combined CERTS-rule withdrawal failure (PV ≤ 10).
@@ -2726,6 +2729,26 @@ pub fn validate_transaction_with_pools(
     // same predicate for both certificate variants.
     // ------------------------------------------------------------------
     if let Some(accounts) = reward_accounts {
+        // The LEDGER rule applies the same-tx withdrawal drain to the account
+        // map BEFORE the DELEG/CERT sub-rules run, so a stake credential whose
+        // reward account is fully withdrawn in the SAME tx has a zero balance by
+        // the time the dereg `rewardCoin == Just mempty` predicate is evaluated.
+        // A withdrawal MUST drain its account to exactly zero (Haskell
+        // `testIncompleteAndMissingWithdrawals`), so any credential appearing in
+        // this tx's withdrawals is zero-balance for the dereg check. This holds
+        // in ALL eras: Shelley `LEDGER` drains before `DELEGS`
+        // (`certState & certDStateL.accountsL %~ drainAccounts withdrawals`);
+        // Conway drains in `Certs.hs` (PV9/10) and in `Ledger.hs` (PV11+), both
+        // before `ConwayUnRegCert` reads the (already-drained) accounts map.
+        // Without this, a same-tx withdraw+deregister (legacy tag-1 or Conway
+        // tag-8) is wrongly rejected (mainnet Alonzo tx ca2f5ba3… class).
+        let withdrawn_in_tx: HashSet<Hash32> = tx
+            .body
+            .withdrawals
+            .keys()
+            .filter_map(|ra| phase1::extract_reward_credential(ra))
+            .map(|cred| cred.to_typed_hash32())
+            .collect();
         for cert in &tx.body.certificates {
             let opt_credential: Option<&dugite_primitives::credentials::Credential> = match cert {
                 dugite_primitives::transaction::Certificate::StakeDeregistration(cred) => {
@@ -2743,6 +2766,10 @@ pub fn validate_transaction_with_pools(
                 // credentials with the same 28-byte hash do not collide
                 // (Haskell `Credential 'Staking`).
                 let key = credential.to_typed_hash32();
+                if withdrawn_in_tx.contains(&key) {
+                    // Same-tx withdrawal already drained this account to zero.
+                    continue;
+                }
                 if let Some(balance) = accounts.get(&key) {
                     if balance.0 > 0 {
                         errors.push(ValidationError::StakeKeyHasNonZeroBalance {
@@ -3225,34 +3252,29 @@ pub fn validate_transaction_with_pools(
     }
 
     // ------------------------------------------------------------------
-    // Withdrawal validation (Haskell `wdrlNotZero` + balance check)
+    // Withdrawal validation.
     //
-    // - Zero-amount withdrawals are rejected in Shelley–Babbage (proto < 9).
-    //   In Conway (proto >= 9), zero-amount withdrawals are valid — they
-    //   allow "touching" a reward account for DRep activity tracking.
-    // - When `reward_accounts` is provided (block application mode),
-    //   each withdrawal amount must exactly match the on-chain reward
-    //   balance, and the account must be registered.
+    // There is NO "zero-amount withdrawal is invalid" predicate in
+    // cardano-ledger in ANY era. The ONLY withdrawal balance rule is that each
+    // withdrawal amount must EQUAL the account's current reward balance, so a
+    // zero withdrawal of a registered zero-balance account is valid in every
+    // era. The previous `wdrlNotZero` gate (reject amount==0 pre-Conway) was
+    // fabricated and wrongly rejected on-chain Alonzo txs (mainnet tx
+    // fc7ca745… class).
+    //
+    // Haskell, DELEGS `Empty` case
+    // (`eras/shelley/impl/src/Cardano/Ledger/Shelley/Rules/Delegs.hs`):
+    //   validateZeroRewards dState (Withdrawals wdrls) network =
+    //     failureUnless (isSubmapOfUM wdrls (rewards dState)) ...
+    // `isSubmapOfUM` is pure amount==balance equality (`coin1 == fromCompact
+    // coin2`), which accepts a 0==0 pair. The amount-equals-balance /
+    // account-registered check below (`withdrawals_that_do_not_drain_accounts`,
+    // the `isSubmapOfUM` equivalent, block-application mode only) is the
+    // complete and correct, era-invariant rule.
+    //
+    // (`ValidationError::ZeroWithdrawal` is retained for the N2C
+    // `serve.rs` error-mapping API but is no longer constructed.)
     // ------------------------------------------------------------------
-    let conway_or_later = params.protocol_version_major >= 9;
-    for (reward_account_bytes, amount) in &tx.body.withdrawals {
-        // Format the reward account as a hex string for error messages.
-        let account_hex = reward_account_bytes.iter().fold(
-            String::with_capacity(reward_account_bytes.len() * 2),
-            |mut s, b| {
-                use std::fmt::Write;
-                let _ = write!(s, "{b:02x}");
-                s
-            },
-        );
-        // Conway relaxed the wdrlNotZero predicate — zero withdrawals are
-        // now valid (used for DRep activity / reward account touching).
-        if amount.0 == 0 && !conway_or_later {
-            errors.push(ValidationError::ZeroWithdrawal {
-                account: account_hex,
-            });
-        }
-    }
 
     // ------------------------------------------------------------------
     // Conway `WithdrawalsNotInRewardsCERTS` (PV ≤ 10) — split into
